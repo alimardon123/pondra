@@ -31,6 +31,7 @@ mod fsum;
 mod hot;
 mod intervals;
 mod layout;
+mod learned;
 mod iceberg;
 mod inbox;
 mod kafka;

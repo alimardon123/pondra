@@ -4988,7 +4988,8 @@ def plans():
     whatever their literals, the plan's shape (`plan_id`), the commit it read at (its answer again with
     `AT (VERSION => n)`), the tables it read and those it changed, and for a query with joins how many
     times their rows were off what the planner expected (`misestimate`); ten times off, a query keeps
-    its plan though fast."""
+    its plan though fast. Part 2: what a query `learned` (a table's filter 2× or more off what was
+    expected), and `pondra.learned`, each fact as last seen."""
     lake = new_lake()
     a = Node(lake, A.port, env={"PONDRA_LEARN_MS": "0"}).start()
     q = lambda s: sql(A.port, s)
@@ -5038,6 +5039,21 @@ def plans():
             and (one[0].get("misestimate") if one else 0) is None
         checks["…ten times off: its plan kept, though fast"] = j.get("misestimate") is not None and (j.get("misestimate") < 10 or ("expected_rows=" in (j.get("plan") or "") and "output_rows=" in j.get("plan")))
         checks["a join's plan is another plan"] = j.get("plan_id") not in (None, one[0].get("plan_id") if one else None)
+        # What it learned (part 2): the customers' filter keeps 1% of them, where the planner expected far more
+        facts = json.loads(j.get("learned") or "[]")
+        seen["learned"] = facts
+        paris = {"object": "customers", "kind": "filter", "about": "city = 'Paris' AND country = 'FR'"}
+        checks["a filter the planner misjudged is learned: its table, its conditions, the share expected and the share kept"] = len(facts) == 1 \
+            and {k: facts[0].get(k) for k in paris} == paris and facts[0].get("actual") == 0.01 and facts[0].get("expected") >= 0.02
+        q("SELECT count(*) AS n FROM orders WHERE id >= 0 -- p-right")
+        q("SELECT id FROM customers WHERE country = 'FR' AND city = 'Paris' LIMIT 5 -- p-limit")
+        right, limited = until_rows("p-right"), until_rows("p-limit")
+        seen["not learned"] = [r.get("learned") for r in right + limited]
+        checks["nothing learned from a filter estimated well, or one a LIMIT stopped"] = len(right) == len(limited) == 1 and right[0].get("learned") is None and limited[0].get("learned") is None
+        learned = q("SELECT * FROM pondra.learned")
+        seen["pondra.learned"] = learned
+        checks["pondra.learned: each fact once, as last seen, with the runs that saw it"] = len(learned) == 1 and {k: learned[0].get(k) for k in paris} == paris \
+            and learned[0].get("runs") >= 2 and learned[0].get("actual") == 0.01 and learned[0].get("updated_at") is not None
         # The commit it read at: its answer again, after more rows came
         n = q("SELECT count(*) AS n FROM orders -- p-version")[0]["n"]
         at = until_rows("p-version")

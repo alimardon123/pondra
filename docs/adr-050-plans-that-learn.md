@@ -1,6 +1,6 @@
 # ADR-050 (proposed): Every plan as estimated and as it ran, and a lake that learns from its runs
 
-**Date:** 2026-10-03 · **Status:** proposed; part 1 built (expected rows in every plan, the history's new columns) · **Asked:** Alimardon, 2026-10-03 23:33
+**Date:** 2026-10-03 · **Status:** proposed; part 1 built (expected rows in every plan, the history's new columns); part 2's facts kept and shown (`learned`, `pondra.learned`), not yet used by the planner · **Asked:** Alimardon, 2026-10-03 23:33
 ("estimated and actual plans kept in the history, adaptive execution, and the platform learning
 from them so it needs less maintenance") · **Builds on:** ADR-048 (`pondra.history`), ADR-020
 (`guard.rs`: a query spreads when it pays, learned from its own times), round 32's join order from
@@ -130,14 +130,20 @@ it pays: the console's pages for 20 minutes (invariant 171), remembered answers 
 
 ### 3. The lake learns, and every node learns the same
 
-After a query of 100 ms or more runs (`PONDRA_LEARN_MS`), its node compares each scan's, filter's and
-join's rows with what the planner expected, and sends the leader those off by 2× or more, once a
-second. Faster queries teach nothing worth the cost.
+After a query of 100 ms or more runs (`PONDRA_LEARN_MS`), its node compares each filter's,
+join's and exchange's rows with what the planner expected, and keeps those off by 2× or more over
+1,000 rows or more as **facts**. Faster queries teach nothing worth the cost. A filter whose rows a
+join, a top-N, a min/max or a limit may have cut as they ran (dynamic filters, an early stop) is
+passed over: its rows say nothing of the filter.
 
-The leader keeps them as **facts**, catalog entries under a prefix of their own (`l/`, invariant 104),
-in at most one commit a second, quiet (invariant 224: they change no answer, so remembered answers
-stay). Every node holds them through the commit stream, as it holds the catalog. At most 20,000; the
-least recently used go first, and a table's go with it.
+A query's facts are a part of its history row (`learned`), so they are kept the way the history is:
+written by the node's writer off the statement's path, exactly once, in quiet commits (invariant 224:
+they change no answer, so remembered answers stay), and gone after `PONDRA_HISTORY_DAYS` unless runs
+see them again. (The first design had them as catalog entries under `l/`, written by the leader; the
+history already is a store every node reads that is durable, quiet and expiring, so a second one would
+only add a kind of request and a catalog prefix. Built so in part 2.) `pondra.learned` is each fact as
+last seen, and how many runs saw it; the history's rule holds, so anyone but an admin sees what their
+own statements learned.
 
 | Fact | Kept as | Used by |
 |---|---|---|
@@ -151,12 +157,20 @@ SELECT * FROM pondra.learned WHERE object = 'customers';
 ```
 
 ```
-object     kind    about                                   expected   actual   runs  updated_at
-customers  filter  country = 'FR' AND city = 'Paris'      0.0015%    1.07%    14    2026-10-03 23:10
-customers  join    orders.customer_id = customers.id      1.0        1.0      14    2026-10-03 23:10
+object     kind    about                               expected   actual   runs  updated_at
+customers  filter  city = 'Paris' AND country = 'FR'   0.2        0.01     14    2026-10-03 23:10
+customers  join    customers.id = orders.customer_id   1.0        1.0      14    2026-10-03 23:10
 ```
 
-- **The planner takes a fact in place of its estimate** where one fits. The join order trusts counts
+A filter is known by its table and its conditions as one text (`about`): each `column op value`, `IN`,
+`LIKE` and `IS [NOT] NULL`, sorted, joined by AND, read the same from the plan the planner made and
+the one that ran, so the planner asks for what it is about to estimate in the words it was learned
+in (`learned::about`). Its `expected` and `actual` are shares of the rows it read, so they hold as the
+table grows. Part 2 learns filters; joins' fan-outs and exchanges' bytes come with their use.
+
+- **The planner takes a fact in place of its estimate** where one fits (`optimize::size`, at a filter
+  over a table: `learned::share(table, predicate)`, from each node's copy of the facts, read from the
+  history again when its rows move). The join order trusts counts
   more than bounds: where every input's size is learned its margin drops from 2 to 1.2.
 - **Every node plans alike** (invariant 27): a spread query's coordinator sends the facts it planned
   with in each slice, as a slice carries its file listing (`Slice::ext`), so a node whose commit
@@ -272,8 +286,9 @@ part is a small surface another part can plug into (principle 9):
 1. **Plans you can trust** (no new syntax): expected rows in every plan, `EXPLAIN ANALYZE` as it
    runs, history's columns, a spread query's plan kept. `history.rs` and `server.rs` in this thread;
    the `spmd.rs` part to the main thread as paste-ready text.
-2. **Facts** (`pondra.learned` the only new name): used by the join order and the spread guard
-   (`optimize.rs`, `guard.rs`: the main thread).
+2. **Facts** (`pondra.learned` the only new name): kept in the history and shown (`learned.rs`, this
+   thread, built); used by the join order and the spread guard (`optimize.rs`, `guard.rs`: the main
+   thread, with the gates).
 3. **Adapting between steps** (`spmd.rs`: the main thread).
 4. **Maintenance where the reads are, advice, `CLUSTER BY AUTO`** (`tier.rs`; the names through
    the SQL review thread). An AI advisor, near 1.0, plugs in as another source of advice (§7).
