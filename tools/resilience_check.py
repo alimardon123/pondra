@@ -225,9 +225,12 @@ class Bucketed:
         self.proxies = [Faulty(upstream, sign=keys) for _ in range(3)]  # (a real bucket: each request signed again for it)
         base = {**base, "PONDRA_TRACE_START": "1", **(env or {})}  # (a new leader's steps, in its log)
         each = lambda i: {k: v.format(i=i) if isinstance(v, str) else v for k, v in flags.items()}  # ("{i}": the node's number)
-        self.nodes = [Node(lake, (port or a.port) + i, env={**base, "AWS_ENDPOINT": self.proxies[i].url}, **each(i)).start() for i in range(3)]
+        # (AWS_ENDPOINT_URL too: object_store reads either, and CI sets it to the bucket for the AWS CLI)
+        self.nodes = [Node(lake, (port or a.port) + i, env={**base, "AWS_ENDPOINT": self.proxies[i].url, "AWS_ENDPOINT_URL": self.proxies[i].url}, **each(i)).start() for i in range(3)]
         first = until(lambda: one_leader(self.nodes), 60)
         check("three nodes on the bucket, one leader", first)
+        # (a node that went round its proxy would pass every check below untouched by any fault)
+        check("every node reaches the bucket through its own proxy", all(p.counts for p in self.proxies), [p.counts for p in self.proxies])
         until(lambda: call(first.port, "POST", "/tables/events", json.dumps([["producer", "Utf8"], ["seq", "Int64"], ["i", "Int64"]]).encode()), 30)
         until(lambda: all(call(nd.port, "POST", "/sql", b"SELECT count(*) FROM events") is not None for nd in self.nodes), 30)
         self.timeline = Timeline(self.nodes)
