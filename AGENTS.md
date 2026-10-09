@@ -44,7 +44,12 @@ The owner's design principles, which every change must respect:
    a part with one job behind a small surface — a registry entry (`register.*` in the console, a
    kind of object, a door, a format), not a branch threaded through other code — and works the
    same from the UI, SQL, the clients and the HTTP API. Prefer a shape a new tool can plug into
-   over one that has to be edited to admit it.
+   over one that has to be edited to admit it. The owner, 2026-10-09: everything, in the code and in
+   the product, is flexible and easy to change and maintain. Each thing is defined once (one
+   registry, one table of names, one check at every door), so a change made in that one place
+   applies everywhere, with no copies to chase. Users customize and extend the whole product
+   (their own objects, functions, settings, extensions) as fully as the core does. Reliability,
+   simplicity, performance and efficiency stay the bar, and every review holds a change to this.
 
 ## Layout
 
