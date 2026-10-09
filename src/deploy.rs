@@ -223,6 +223,8 @@ fn first_line(sql: &str) -> String { sql.trim().lines().next().unwrap_or_default
 
 /// What a statement in `objects/` makes, and its name inside the database. None: nothing (a
 /// comment alone).
+const SHARES: &str = "shares and recipients are each environment's: prod's never reach its branches, so a partner's token never reaches dev; make and grant them in the database (CREATE SHARE …)";
+
 fn head(sql: &str) -> Result<Option<(Kind, String)>> {
     let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else { bail!("not SQL the plan can read") };
     let solid: Vec<&Token> = tokens.iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
@@ -235,7 +237,10 @@ fn head(sql: &str) -> Result<Option<(Kind, String)>> {
     };
     let mut i = 0;
     match word(0).as_str() {
-        "grant" => return Ok(Some((Kind::Grant, sql.trim().trim_end_matches(';')[5..].split_whitespace().collect::<Vec<_>>().join(" ")))), // (named by what it grants: `SELECT ON TABLE t TO analyst`)
+        "grant" => {
+            ensure!(!(0..solid.len()).any(|i| matches!((word(i).as_str(), word(i + 1).as_str()), ("on", "share") | ("to", "recipient"))), "{SHARES}");
+            return Ok(Some((Kind::Grant, sql.trim().trim_end_matches(';')[5..].split_whitespace().collect::<Vec<_>>().join(" ")))); // (named by what it grants: `SELECT ON TABLE t TO analyst`)
+        }
         "create" => i += 1,
         "attach" => bail!("an attached lake or catalog is each environment's: [env.prod] attach.events = {{ type = \"kafka\", url = \"…\" }} in pondra.toml"),
         _ => bail!("objects/ holds what objects are (CREATE …, GRANT …); rows and one-off changes go in migrations/"),
@@ -262,6 +267,7 @@ fn head(sql: &str) -> Result<Option<(Kind, String)>> {
         ("macro", _) => Kind::Macro,
         ("procedure", _) => Kind::Procedure,
         ("task", _) => Kind::Task,
+        ("share" | "recipient", _) => bail!("{SHARES}"),
         ("user", _) => bail!("users are each environment's: a project makes roles (CREATE ROLE analyst), and an environment's admin grants them (GRANT analyst TO ann)"),
         (w, _) => bail!("CREATE {}: a project declares schemas, tables, views, materialized views, functions, macros, procedures, tasks, secrets, roles and grants", w.to_uppercase()),
     };
@@ -1053,6 +1059,9 @@ mod tests {
         assert_eq!(h("GRANT SELECT ON TABLE t TO analyst").0, Kind::Grant);
         assert!(head("INSERT INTO t VALUES (1)").unwrap_err().to_string().contains("migrations/"));
         assert!(head("CREATE USER ann").unwrap_err().to_string().contains("environment's"));
+        assert!(head("CREATE SHARE acme").unwrap_err().to_string().contains("shares and recipients"));
+        assert!(head("CREATE RECIPIENT acme_corp").unwrap_err().to_string().contains("shares and recipients"));
+        assert!(head("GRANT SELECT ON SHARE acme TO RECIPIENT acme_corp").unwrap_err().to_string().contains("shares and recipients"));
         assert!(head("CREATE TABLE prod.sales.orders (id INT)").unwrap_err().to_string().contains("without their database"));
         assert!(head("-- only a comment").unwrap().is_none());
     }

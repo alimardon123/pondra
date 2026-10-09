@@ -182,6 +182,8 @@ def environments_check(bin, work, port, root):
     dev.q("ALTER DATABASE dev REFRESH")  # (none named: every table dev took from prod that prod still has)
     checks["…none named, every table dev took from prod that prod still has (prod dropped k: dev keeps its own)"] = \
         rows(dev, kv) == now_kv and rows(dev, every) == now_rows and rows(dev, keyed) == own_k
+    checks["…and no REFRESH brings prod's shares or recipients, though prod shares the table it brought"] = \
+        rows(dev, shared) == [(0, 0)] and rows(prod, shared) == [(1, 1)]
     checks["REFRESH refused by name: a database that isn't a branch, a table its base doesn't have"] = \
         "isn't a branch" in refused(prod, "ALTER DATABASE prod REFRESH sales.orders") and "isn't a table" in refused(prod, "ALTER DATABASE dev REFRESH k")
     dev_rows = rows(dev, every)

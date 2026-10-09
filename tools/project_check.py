@@ -176,6 +176,19 @@ def project_check(bin, work, port):
     p = call("POST", "/db/prod/plan", {"files": other})
     checks["another project declaring this one's view: refused, naming its owner"] = any("project sales's" in r for r in p["plan"]["refused"])
 
+    # Shares and recipients are each database's own: a plan never drops prod's, and a project can't
+    # declare them (a branch would carry a partner's grant into dev).
+    for sql in ["CREATE SHARE acme", "ALTER SHARE acme ADD TABLE sales.orders", "CREATE RECIPIENT acme_corp", "GRANT SELECT ON SHARE acme TO RECIPIENT acme_corp"]:
+        q("prod", sql)
+    pruned = pondra("plan", "--env", "prod", "--prune")
+    try:
+        call("POST", "/db/prod/plan", {"files": {**files, "objects/share.sql": "CREATE SHARE acme;\nGRANT SELECT ON SHARE acme TO RECIPIENT acme_corp;\n"}, "env": "prod"})
+        declared = ""
+    except RuntimeError as e:
+        declared = str(e)
+    checks["prod's shares and recipients: never in a plan, even pruning; a project declaring one refused by name"] = \
+        "acme" not in pruned and "shares and recipients are each environment's" in declared and rows("prod", "SELECT count(*) FROM pondra.shares") == [(1,)]
+
     # Export, then deploy the export into an empty database: it exports the same.
     out_dir = os.path.join(work, "exported")
     pondra("export", out_dir, "--env", "prod")
@@ -185,7 +198,8 @@ def project_check(bin, work, port):
     r = subprocess.run([bin, "deploy", "--env", "empty", "--project", out_dir], env=env, capture_output=True, text=True, timeout=300)
     again = call("GET", "/db/empty/export")
     same = {k: v for k, v in again.items() if k != "pondra.toml"} == {k: v for k, v in exported.items() if k.startswith("objects")}
-    checks["pondra export of prod, deployed into an empty database, exports the same"] = r.returncode == 0 and same and "objects/sales/orders.sql" in exported
+    checks["pondra export of prod, deployed into an empty database, exports the same (no share or recipient)"] = r.returncode == 0 and same and "objects/sales/orders.sql" in exported \
+        and not any("acme" in v for v in exported.values())
     if not same:
         checks["(export differs)"] = sorted(set(exported.items()) ^ set(again.items()))[:6]
 
