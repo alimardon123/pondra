@@ -1763,6 +1763,13 @@ Iceberg snapshot cleanup). Any change to replication or recovery: `users` and `f
 
 Practical notes for an agent working here:
 
+- **How a thread works (the owner, 2026-10-09).** Its Opus designs, plans, orchestrates and reviews;
+  coding and small tasks go to Haiku workers with clear, specific instructions (the files, the
+  change, the check to run), and the thread reviews every result against its plan, and checks the
+  work itself, before it lands. A Fable worker only as an advisor, on a genuinely hard call. At most
+  two or three threads at once. Planned work, a robust core and the APIs come first and the UI at
+  the end, so build APIs flexible and reliable enough that a UI is easy to build and fix. Fast and
+  token-lean, still well tested, reviewed and bug free.
 - Never rebuild the binary while a test suite is running (tests exec `argv[0]` when a node restarts).
 - Test runs delete their lakes when they exit (`harness.new_lake`; `--keep` or `PONDRA_KEEP=1`
   keeps them). The owner's R2 free tier is 10 GB: after R2 runs, `tools/clean_bucket.py --bucket
