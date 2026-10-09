@@ -278,6 +278,13 @@ class Bucketed:
         # stays undrained however long we wait.
         ok = until(drained, 240)
         info["the log after the faults (s, rows still in it)"] = left[:3] + ["…"] + left[-6:] if len(left) > 10 else left
+        if not ok:  # (a round that sees nothing to tier, or a count gone wrong? CHECKPOINT tiers every table's log)
+            lead = one_leader(nodes) or nodes[0]
+            try:
+                info["undrained: CHECKPOINT on the leader"] = call(lead.port, "POST", "/sql", b"CHECKPOINT", timeout=300)
+            except Exception as e:
+                info["undrained: CHECKPOINT on the leader"] = repr(e)[:300]
+            info["undrained: then"] = {k: (stats(lead) or {}).get(k) for k in ("hwm", "commits", "untiered_rows")}
         check("the log drains into files once the bucket is well", ok, stats(one_leader(nodes) or nodes[0]))
 
     def close(self):
