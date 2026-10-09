@@ -483,9 +483,10 @@ async fn expectations(lake: &Lake, name: &str, source: &str, planned: &str, meta
     Ok(())
 }
 
-/// A row an expectation or a table's CHECK refuses (Postgres's `check_violation`, 23514).
+/// A row an expectation or a table's CHECK refuses (Postgres's `check_violation`, 23514), or a value
+/// its column's enum doesn't list (22P02): its words, and its SQLSTATE.
 #[derive(Debug)]
-pub struct Violation(pub String);
+pub struct Violation(pub String, pub &'static str);
 
 impl std::fmt::Display for Violation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
@@ -526,7 +527,7 @@ fn expected(view: &str, v: &View, rows: RecordBatch, filling: bool) -> Result<(R
             continue;
         }
         if e.on == OnViolation::Fail && !filling {
-            return Err(anyhow::Error::new(Violation(format!("new row for relation \"{view}\" violates check constraint \"{}\": CHECK ({})", e.name, e.check))));
+            return Err(anyhow::Error::new(Violation(format!("new row for relation \"{view}\" violates check constraint \"{}\": CHECK ({})", e.name, e.check), "23514")));
         }
         if e.on != OnViolation::Keep {
             keep.iter_mut().zip(bad.values().iter()).for_each(|(k, b)| *k &= !b);

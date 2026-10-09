@@ -28,7 +28,8 @@ registry since: sequences and identity columns (`harness.py sequences`: three no
 once, a leader killed, every value once), `CREATE INDEX` kept as an object (nothing built), and
 `UNIQUE` checked by the leader for every SQL write (`harness.py constraints`: three nodes inserting
 the same 40 values at once, 40 go in, 80 refused with 23505), with `NOT ENFORCED` keys kept as
-facts. `CREATE TYPE … AS ENUM` is next.
+facts; and enum types, `CREATE TYPE … AS ENUM` and `ENUM('a', 'b')` columns, held as text with their
+labels checked at every door (`harness.py enums`: 8 of 8).
 
 **100,000 random queries** (`tools/random_sql.py --seed 3434`, D2): each against DuckDB 1.5.5 on
 one node, every tenth spread over three, 42,826 split three ways by a condition. The first run

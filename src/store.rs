@@ -129,6 +129,10 @@ pub struct TableMeta {
     /// (`constraints.rs`, ADR-057): an enforced UNIQUE has every write checked on the leader.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraints: Vec<crate::constraints::Constraint>,
+    /// Enum columns, by stored name: their labels, and the type they are of (`types.rs`). Every
+    /// door refuses a value its column's labels don't list.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub enums: BTreeMap<String, crate::types::Enum>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ext: Option<crate::ext::Spec>,
@@ -207,6 +211,7 @@ impl TableMeta {
             defaults: self.defaults.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, e)| (n(c), e.clone())).collect(),
             identity: self.identity.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, i)| (n(c), i.clone())).collect(),
             constraints: self.constraints.iter().map(|c| c.named(&n)).collect(),
+            enums: self.enums.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, e)| (n(c), e.clone())).collect(),
             names: BTreeMap::new(),
             dropped: vec![],
             ..self.clone()

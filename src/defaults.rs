@@ -13,11 +13,12 @@ use datafusion::prelude::SessionContext;
 pub fn check(meta: &TableMeta, table: &str, rows: &RecordBatch) -> Result<()> { check_named(meta, table, rows, true) }
 
 fn check_named(meta: &TableMeta, table: &str, rows: &RecordBatch, sql_names: bool) -> Result<()> {
-    if (meta.not_null.is_empty() && meta.checks.is_empty()) || rows.num_rows() == 0 {
+    if (meta.not_null.is_empty() && meta.checks.is_empty() && meta.enums.is_empty()) || rows.num_rows() == 0 {
         return Ok(());
     }
     let deleted = rows.column_by_name("_deleted").and_then(|d| d.as_boolean_opt().cloned());
     let marker = |i: usize| deleted.as_ref().is_some_and(|d| d.is_valid(i) && d.value(i));
+    crate::types::check(meta, rows, sql_names, &marker)?; // (an enum's labels)
     if !meta.checks.is_empty() {
         // (under SQL's names, every column there: one a write leaves out is NULL, which passes)
         let named = match sql_names || !meta.mapped() {
@@ -31,7 +32,7 @@ fn check_named(meta: &TableMeta, table: &str, rows: &RecordBatch, sql_names: boo
         for (name, c) in &meta.checks {
             let bad = breaking(&all, c)?;
             if (0..bad.len()).any(|i| bad.value(i) && !marker(i)) {
-                return Err(anyhow::Error::new(crate::views::Violation(format!("new row for relation \"{table}\" violates check constraint \"{name}\": CHECK ({c})"))));
+                return Err(anyhow::Error::new(crate::views::Violation(format!("new row for relation \"{table}\" violates check constraint \"{name}\": CHECK ({c})"), "23514")));
             }
         }
     }
@@ -71,7 +72,7 @@ pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
 /// A bulk INSERT's rows (under their stored names), checked as they stream into files.
 pub fn checked(rows: datafusion::execution::SendableRecordBatchStream, meta: &Option<TableMeta>, table: &str) -> datafusion::execution::SendableRecordBatchStream {
     use futures::StreamExt;
-    let Some(meta) = meta.clone().filter(|m| !m.not_null.is_empty() || !m.checks.is_empty()) else { return rows };
+    let Some(meta) = meta.clone().filter(|m| !m.not_null.is_empty() || !m.checks.is_empty() || !m.enums.is_empty()) else { return rows };
     let (schema, table) = (rows.schema(), table.to_string());
     let checked = rows.map(move |b| {
         let b = b?;

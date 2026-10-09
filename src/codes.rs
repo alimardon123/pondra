@@ -7,8 +7,8 @@
 
 /// The SQLSTATE of an error.
 pub fn of(e: &anyhow::Error) -> &'static str {
-    if crate::views::refused(e) {
-        return "23514"; // check_violation (a table's CHECK, a view's expectation)
+    if let Some(v) = e.chain().find_map(|c| c.downcast_ref::<crate::views::Violation>()) {
+        return v.1; // check_violation (a table's CHECK, a view's expectation), or an enum's invalid_text_representation
     }
     if let Some(c) = e.chain().find_map(|c| c.downcast_ref::<Coded>()) {
         return c.0;
@@ -48,10 +48,12 @@ fn by_words(text: &str) -> &'static str {
         _ if has("invalid function") || has("function") && (has("not found") || has("does not exist")) || has("no function ") => "42883", // undefined_function
         _ if has("table '") && has("not found") || has("no table ") || has("no table or view") || has("relation") && has("does not exist") => "42P01", // undefined_table
         _ if has("no schema ") || has("schema") && has("does not exist") => "3F000",            // invalid_schema_name
+        _ if has("type \"") && has("does not exist") => "42704",                                // undefined_object (`types.rs`)
+        _ if has("because column") && has("uses it") => "2BP01",                                // dependent_objects_still_exist (DROP TYPE)
         _ if has("already exists") || has("exists already") => "42P07",                        // duplicate_table
         _ if has("divide by zero") || has("division by zero") => "22012",                       // division_by_zero
         _ if has("overflow") || has("out of range") => "22003",                                 // numeric_value_out_of_range
-        _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") => "22P02", // invalid_text_representation
+        _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
         _ if has("can't reach the bucket") => "57P03",                                         // cannot_connect_now (a leader cut off: ask another node)
         _ if has("error sending request") => "58030",                                           // io_error (the bucket or another node didn't answer: try again)
         _ if has("statement timeout") || has("canceling statement") || has("timed out") => "57014", // query_canceled
@@ -106,6 +108,9 @@ mod tests {
         assert_eq!(of("permission denied: INSERT on t (GRANT INSERT ON t TO ann)"), "42501");
         assert_eq!(of("Invalid function 'nope'.\nDid you mean 'now'?"), "42883");
         assert_eq!(of("table t already exists"), "42P07");
+        assert_eq!(of("External error: invalid input value for enum mood: \"angry\" (its labels: 'sad', 'ok')"), "22P02"); // (a bulk INSERT's stream)
+        assert_eq!(of("type \"mood\" does not exist"), "42704");
+        assert_eq!(of("cannot drop type mood because column t.m uses it"), "2BP01");
         assert_eq!(of(crate::cluster::CUT_OFF_SAYS), "57P03");
         assert_eq!(of("error sending request for url (http://10.0.0.2:8080/cluster/commit)"), "58030");
         assert_eq!(of("cannot insert a non-DEFAULT value into column \"id\" of t: it is an identity column defined as GENERATED ALWAYS"), "428C9");
@@ -114,6 +119,7 @@ mod tests {
         assert_eq!(of("relation \"s\" does not exist"), "42P01");
         assert_eq!(of("something else"), "XX000");
         assert_eq!(super::of(&super::coded("40001", "could not serialize access due to concurrent update")), "40001");
-        assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("new row for relation \"t\" violates check constraint \"c\"".into()))), "23514");
+        assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("new row for relation \"t\" violates check constraint \"c\"".into(), "23514"))), "23514");
+        assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("invalid input value for enum mood: \"x\"".into(), "22P02"))), "22P02");
     }
 }

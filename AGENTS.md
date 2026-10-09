@@ -71,7 +71,7 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           (one registry of every kind of object: ADR-049, invariant 227), seq.rs (sequences and
           identity columns: invariant 234), index.rs (indexes kept as objects: invariant 235),
           constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236),
-          and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
+          types.rs (enum types: invariant 242), and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
           237–239)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
@@ -141,7 +141,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   and window emission), `v/` views, `w/` session views' bounds, `k/` tasks, `x/` Delta and `i/`
   Iceberg publish state, `a/` lakes attached, `f/` functions, `r/` macros and procedures, `e/`
   secrets (sealed), `o/` catalogs attached from outside and `fd/` feeds (round 23), `sq/` sequences
-  (round 34: only the sequencer writes them), `ix/` indexes (round 34), `sh/` shares and `sr/` recipients (ADR-046), `m` members
+  (round 34: only the sequencer writes them), `ix/` indexes (round 34), `ty/` types (round 34), `sh/` shares and `sr/` recipients (ADR-046), `m` members
   (replicated acks), `n` next segment, `c` commit number. One process (the leader) writes it;
   everyone reads it.
 - **Writes:** a client POSTs a batch to *any* node. That node encodes it (Arrow IPC + ZSTD), runs
@@ -1615,6 +1615,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 239. **Every request at the sharing door is a row of `pondra.audit`, refusals too** (`audit::shared`,
    door `sharing`, class `share`). An `ATTACH` naming a token or a profile is kept with them as
    `'***'`. `sharing_check.py`.
+242. **An enum column holds text, and every door checks its labels** (`types.rs`): a table keeps its
+   enum columns' labels (`TableMeta::enums`, by stored name), so `defaults::check` (every door,
+   invariant 130) refuses a value they don't list without reading anything else (22P02, a
+   `Violation`, so a group's appends are checked one by one). `ALTER TYPE … ADD VALUE` adds the label
+   to every table using the type in the type's own commit; a label is never renamed or taken away,
+   since files are never rewritten. Casts to a type and `enum_range` become text where SQL comes in
+   (`types::rewrite`, after the macros). (240–241 are the grant fix's.) `harness.py enums`.
 
 ## Tests: run these before and after any change
 
@@ -1641,6 +1648,7 @@ python3 tools/harness.py minmax         # a global min/max over 24 files skips n
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
 python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
 python3 tools/harness.py sequences      # nextval on three nodes (every value once), identity columns from every door, ALWAYS, owned sequences, a leader's kill
+python3 tools/harness.py enums          # CREATE TYPE … AS ENUM and ENUM('a', 'b') columns: labels from every door (22P02), casts, enum_range, ADD VALUE, RENAME, DROP while used
 python3 tools/harness.py constraints    # UNIQUE from every door and three nodes at once (23505), NOT ENFORCED facts, ADD/DROP CONSTRAINT, SHOW CREATE, the Postgres catalog
 python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
 python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)

@@ -32,6 +32,7 @@ Columns take these types. A list is written `type[]`, such as `FLOAT[]` for an e
 | `BYTEA` | `BINARY`, `VARBINARY`, `BLOB` | bytes |
 | `JSON` | `VARIANT` | JSON text, read with `json_get` and `->` (see [functions](/pondra/reference/functions/)) |
 | `type[]` | | a list of one type |
+| an enum type, or `ENUM('a', 'b')` | | text, one of its labels ([enum types](#enum-types)) |
 
 A `TIMESTAMPTZ` written with an offset (`'2026-09-29 10:00:00+05'`) is stored as the instant it names,
 so it reads back as `2026-09-29T05:00:00Z`. A time may leave out its seconds, as in Postgres and
@@ -42,6 +43,41 @@ DuckDB: `'2024-05-01 10:30'` is a timestamp in `INSERT`, `CAST`, `TIMESTAMP '…
 A value that doesn't cast to its column's type is refused, and the error names the value: `'abc'` into
 a `BIGINT` is an error, never a `NULL`. `substr`, `substring(b FROM 2 FOR 1)` and `byte_length` work
 on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
+
+### Enum types
+
+| Statement | Syntax |
+|---|---|
+| Make one | `CREATE TYPE [IF NOT EXISTS] name AS ENUM ('label', …)` |
+| Add a label | `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label' [BEFORE \| AFTER 'label']` |
+| Rename | `ALTER TYPE name RENAME TO new_name` |
+| Drop | `DROP TYPE [IF EXISTS] name [, …]` |
+
+A column of an enum type holds text: other engines and every client read it as a string. Every way
+of writing rows (`INSERT`, `UPDATE`, `MERGE`, `COPY`, appends, Kafka, Flight, `pondra sql`) refuses
+a value its labels don't list, with Postgres's code `22P02`; `NULL` is allowed. A column may also say
+its labels itself, as MySQL and DuckDB write it: `size ENUM('s', 'm', 'l')`. `'happy'::mood` is a
+label checked as it is read, and `enum_range(NULL::mood)`, `enum_first` and `enum_last` give the
+labels in their order. Values compare and sort as text; `array_position(enum_range(NULL::mood),
+feeling)` is their place. A label is never renamed or taken away (the rows keep the text they were
+written with), a type isn't dropped while a column uses it (`2BP01`), and a temporary table's
+columns take no enum. A type is listed in `pondra.objects`, shown by `SHOW CREATE TYPE` and
+described by `COMMENT ON TYPE`; over Postgres its columns are `text`.
+
+```sql
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TABLE moods (who VARCHAR, feeling mood);
+INSERT INTO moods VALUES ('ann', 'happy'), ('bo', 'sad');
+ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok';
+SELECT who, feeling, array_position(enum_range(NULL::mood), feeling) AS place FROM moods ORDER BY place;
+```
+
+```text
+ who | feeling | place
+-----+---------+-------
+ bo  | sad     |     1
+ ann | happy   |     4
+```
 
 ## Queries
 

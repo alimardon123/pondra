@@ -7228,6 +7228,136 @@ def constraints():
     return f"{sum(checks.values())} of {len(checks)} constraint checks"
 
 
+def enums():
+    """ENUM types, `CREATE TYPE … AS ENUM` and an inline `ENUM('a', 'b')` column: a column of one takes its
+    labels and NULL from every door (INSERT, INSERT … SELECT, UPDATE, POST /append, Postgres, `pondra sql`)
+    and reads them back as text; any other value is refused (22P02) and nothing is written. Casts and
+    enum_range / enum_first / enum_last; ADD VALUE BEFORE and AFTER; RENAME TO (columns follow it); DROP TYPE
+    refused while a column uses it; SHOW CREATE and COMMENT ON TYPE; a temporary table's enum column, and
+    CREATE OR REPLACE, refused; ADD COLUMN of an enum type."""
+    import psycopg
+    lake = new_lake()
+    ports = [A.port + 1]
+    pg = A.port + 10
+    nodes = [Node(lake, ports[0], pg=f"127.0.0.1:{pg}").start()]
+    q = lambda s, port=ports[0], hh=None: call(port, "POST", "/sql", s.encode(), timeout=120, headers=hh)
+    def err(s, port=ports[0], path="/sql", hh=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", path, s.encode(), hh or {})
+        r = c.getresponse()
+        data = r.read()
+        return (r.status, r.getheader("x-pondra-sqlstate"), data.decode()[:300]) if r.status != 200 else (200, None, "")
+    def pg_write(s):  # the Postgres door's SQLSTATE for a statement, None when it went in
+        with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+            try:
+                conn.cursor().execute(s)
+                return None
+            except psycopg.Error as e:
+                return e.sqlstate
+    cli = lambda s: subprocess.run([BIN, "sql", "--dir", lake, s], capture_output=True, text=True, timeout=120)
+    text_of = lambda rs: " ".join(str(v) for r in rs for v in r.values())  # (a SHOW CREATE's text, whatever its column is called)
+    checks, info = {}, {}
+    # Types and the tables that use them
+    q("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    same = err("CREATE TYPE IF NOT EXISTS mood AS ENUM ('sad', 'ok', 'happy')")
+    again = err("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+    bad_types = [err("CREATE TYPE bad AS ENUM ()"), err("CREATE TYPE dup AS ENUM ('a', 'a')"), err("CREATE OR REPLACE TYPE mood AS ENUM ('x')")]
+    temp_enum = err("CREATE TEMP TABLE tt (a mood)", hh={"x-pondra-session": "harness-enums"})
+    q("CREATE TABLE people (id INT, name TEXT, feeling mood)")
+    q("CREATE TABLE t2 (id INT, size ENUM('s', 'm', 'l'))")
+    info["types"] = [same, again, bad_types, temp_enum]
+    checks["CREATE TYPE … AS ENUM makes a type; IF NOT EXISTS again is fine; a repeat, an empty or duplicate label list, OR REPLACE and a temporary table's enum column are refused (500)"] = \
+        same[0] == 200 and again[0] == 500 and all(r[0] == 500 for r in bad_types) and temp_enum[0] == 500
+    # Labels and NULL go in from every door; SELECT reads them back as text
+    q("INSERT INTO people VALUES (1, 'Ann', 'happy'), (2, 'Bo', 'sad'), (3, 'Cy', NULL)")
+    q("INSERT INTO people SELECT id + 10, name, feeling FROM people WHERE id = 2")
+    q("UPDATE people SET feeling = 'ok' WHERE id = 2")
+    appended = err('{"id": 4, "name": "Di", "feeling": "ok"}\n', path="/append/people")
+    pg_ok = pg_write("INSERT INTO people VALUES (5, 'Ed', 'happy')")
+    cli_ok = cli("INSERT INTO people VALUES (6, 'Fa', 'sad')")
+    q("INSERT INTO t2 VALUES (1, 'm')")
+    people = [[r.get("id"), r.get("feeling")] for r in q("SELECT id, feeling FROM people ORDER BY id")]  # (the node's JSON leaves NULLs out)
+    info["valid"] = [appended, pg_ok, cli_ok.returncode, people]
+    checks["a column of an ENUM type takes its labels and NULL from every door (INSERT, INSERT … SELECT, UPDATE, POST /append, Postgres, pondra sql) and reads them back as text"] = \
+        appended[0] == 200 and pg_ok is None and cli_ok.returncode == 0 and \
+        people == [[1, "happy"], [2, "ok"], [3, None], [4, "ok"], [5, "happy"], [6, "sad"], [12, "sad"]]
+    # Anything else is refused with 22P02 from every door, and nothing is written
+    refused = [err("INSERT INTO people VALUES (9, 'Gi', 'angry')"), err("INSERT INTO people SELECT id + 20, name, 'angry' FROM people WHERE id = 1"),
+               err("UPDATE people SET feeling = 'angry' WHERE id = 1"), err('{"id": 9, "feeling": "angry"}\n', path="/append/people"),
+               err("INSERT INTO t2 VALUES (2, 'xl')")]
+    pg_bad = pg_write("INSERT INTO people VALUES (10, 'Hu', 'angry')")
+    cli_bad = cli("INSERT INTO people VALUES (11, 'Ju', 'angry')")
+    counts = [q("SELECT count(*) AS n FROM people")[0]["n"], q("SELECT count(*) AS n FROM t2")[0]["n"]]
+    info["refused"] = [refused, pg_bad, cli_bad.returncode, cli_bad.stderr[-200:], counts]
+    checks["a value that isn't a label is refused (22P02) from every door, the inline ENUM('s', 'm', 'l') too; nothing is written"] = \
+        all(r[1] == "22P02" for r in refused) and pg_bad == "22P02" and cli_bad.returncode != 0 and \
+        "invalid input value for enum" in cli_bad.stderr and counts == [7, 1]
+    # Casts, and the functions that read a type's labels
+    cast = q("SELECT 'happy'::mood AS m")[0]["m"]
+    cast_bad = err("SELECT 'angry'::mood AS m")
+    labels = q("SELECT enum_range(NULL::mood) AS r")[0]["r"]
+    edges = [q("SELECT enum_first(NULL::mood) AS f")[0]["f"], q("SELECT enum_last(NULL::mood) AS l")[0]["l"]]
+    info["casts"] = [cast, cast_bad, labels, edges]
+    checks["'happy'::mood reads back; 'angry'::mood is refused (22P02); enum_range, enum_first and enum_last read the labels in order"] = \
+        cast == "happy" and cast_bad[1] == "22P02" and labels == ["sad", "ok", "happy"] and edges == ["sad", "happy"]
+    # Before any ALTER: the definition, an inline ENUM's, and a comment that pondra.objects lists
+    shown_type = text_of(q("SHOW CREATE TYPE mood"))
+    shown_t2 = text_of(q("SHOW CREATE TABLE t2"))
+    q("COMMENT ON TYPE mood IS 'how one feels'")
+    listed = [(r.get("kind"), r.get("name"), r.get("comment")) for r in q("SELECT kind, name, comment FROM pondra.objects WHERE kind = 'type'")]
+    info["shown"] = [shown_type, shown_t2, listed]
+    checks["SHOW CREATE TYPE and an inline ENUM show their labels; COMMENT ON TYPE is listed by pondra.objects with its comment"] = \
+        "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')" in shown_type and "ENUM('s', 'm', 'l')" in shown_t2 and \
+        any(k == "type" and n in ("mood", "public.mood") and c == "how one feels" for k, n, c in listed)
+    # ALTER TYPE … ADD VALUE: where a label goes; a label not added yet is refused until it is
+    early = err("INSERT INTO people VALUES (30, 'Hi', 'meh')")
+    q("ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'")
+    labels2 = q("SELECT enum_range(NULL::mood) AS r")[0]["r"]
+    meh = err("INSERT INTO people VALUES (30, 'Hi', 'meh')")
+    ine = err("ALTER TYPE mood ADD VALUE IF NOT EXISTS 'meh'")
+    again_add = err("ALTER TYPE mood ADD VALUE 'meh'")
+    q("ALTER TYPE mood ADD VALUE 'great' AFTER 'happy'")
+    labels3 = q("SELECT enum_range(NULL::mood) AS r")[0]["r"]
+    info["added"] = [early, labels2, meh, ine, again_add, labels3]
+    checks["ALTER TYPE … ADD VALUE BEFORE or AFTER puts a label in its place (last after 'happy'); refused until added; IF NOT EXISTS is fine, a repeat refused"] = \
+        early[1] == "22P02" and labels2 == ["sad", "meh", "ok", "happy"] and meh[0] == 200 and ine[0] == 200 and again_add[0] == 500 and \
+        labels3 == ["sad", "meh", "ok", "happy", "great"]
+    # ALTER TABLE … ADD COLUMN of an enum type: its values are checked too (old rows read NULL)
+    q("ALTER TABLE t2 ADD COLUMN m2 mood")
+    m2_bad = err("INSERT INTO t2 VALUES (5, 's', 'angry')")
+    q("INSERT INTO t2 VALUES (5, 's', 'ok')")
+    t2_rows = [[r.get("id"), r.get("size"), r.get("m2")] for r in q("SELECT id, size, m2 FROM t2 ORDER BY id")]
+    # RENAME TO: the new name works, the old is refused, and the columns follow it
+    q("ALTER TYPE mood RENAME TO feeling_t")
+    renamed_labels = q("SELECT enum_range(NULL::feeling_t) AS r")[0]["r"]
+    old_name = err("SELECT enum_range(NULL::mood) AS r")
+    renamed_ok = err("INSERT INTO people VALUES (31, 'Jo', 'happy')")
+    renamed_bad = err("INSERT INTO people VALUES (32, 'Ka', 'angry')")
+    shown_people = text_of(q("SHOW CREATE TABLE people"))
+    info["renamed"] = [renamed_labels, old_name, renamed_ok, renamed_bad, shown_people]
+    checks["ALTER TYPE … RENAME TO: enum_range takes the new name and not the old (42704), a column still takes its labels and refuses others, SHOW CREATE shows the new name"] = \
+        renamed_labels == ["sad", "meh", "ok", "happy", "great"] and old_name[1] == "42704" and renamed_ok[0] == 200 and renamed_bad[1] == "22P02" and \
+        "feeling_t" in shown_people
+    # DROP TYPE: refused while a column uses it (t2's m2 too), and fine once none does
+    in_use = err("DROP TYPE feeling_t")
+    q("DROP TABLE people")
+    still = err("DROP TYPE feeling_t")  # (t2's m2 uses it too)
+    q("DROP TABLE t2")
+    dropped = err("DROP TYPE feeling_t")
+    gone = err("DROP TYPE IF EXISTS feeling_t")
+    info["columns"] = [m2_bad, t2_rows, in_use, still, dropped, gone]
+    checks["ADD COLUMN of an enum type checks its values; DROP TYPE is refused while a column uses it (2BP01), works once none does; IF EXISTS is fine"] = \
+        m2_bad[1] == "22P02" and t2_rows == [[1, "m", None], [5, "s", "ok"]] and in_use[1] == "2BP01" and "uses it" in in_use[2] and \
+        still[0] == 500 and dropped[0] == 200 and gone[0] == 200
+    for n in nodes:
+        n.kill()
+    ok = all(checks.values())
+    print(json.dumps({"enums": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} enum checks"
+
+
 def registry():
     """The statement registry (ADR-049): every kind of object in `pondra.objects` with its comment and
     definition; `SHOW CREATE` of each kind runs again to the same object; `COMMENT ON` every kind,
@@ -8287,7 +8417,7 @@ def friendly():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, sparksql, variables, scripts, hot, minmax, history, plans, friendly, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, scripts, hot, minmax, history, plans, friendly, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -8295,7 +8425,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "plans", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "plans", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -8307,7 +8437,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

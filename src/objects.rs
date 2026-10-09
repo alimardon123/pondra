@@ -35,6 +35,7 @@ pub static KINDS: &[Kind] = &[
     Kind { name: "external table", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON"] },
     Kind { name: "sequence", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"] },
     Kind { name: "index", family: "relation", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"] },
+    Kind { name: "type", family: "type", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"] },
     Kind { name: "function", family: "routine", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON", "SHOW CREATE"] },
     Kind { name: "macro", family: "routine", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON", "SHOW CREATE"] },
     Kind { name: "table function", family: "routine", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON", "SHOW CREATE"] },
@@ -61,7 +62,7 @@ pub struct Object {
 impl Object {
     fn new(kind: &'static str, lake: &str, name: &str, definition: Option<String>) -> Object {
         let (schema, name) = match self::kind(kind).map(|k| k.family) {
-            Some("relation" | "routine" | "task") => split(name),
+            Some("relation" | "routine" | "task" | "type") => split(name),
             _ => ("", name),
         };
         Object { kind, lake: lake.into(), schema: Some(schema.to_string()).filter(|s| !s.is_empty()), name: name.into(), comment: None, definition }
@@ -74,7 +75,7 @@ impl Object {
 type Lister = for<'a> fn(&'a Lake) -> BoxFuture<'a, Result<Vec<Object>>>;
 
 /// Each family's objects, read from the catalog alone (no query run).
-static FAMILIES: &[(&str, Lister)] = &[("schema", schemas), ("relation", relations), ("relation", sequences), ("relation", indexes), ("routine", routines), ("task", tasks), ("secret", secrets), ("user", users), ("database", databases)];
+static FAMILIES: &[(&str, Lister)] = &[("schema", schemas), ("relation", relations), ("relation", sequences), ("relation", indexes), ("type", types), ("routine", routines), ("task", tasks), ("secret", secrets), ("user", users), ("database", databases)];
 
 /// Every object of this lake and the lakes attached to it, with its comment, as the caller may see
 /// them (a user limited by grants: the tables it may read, and no secrets, users or roles).
@@ -173,6 +174,21 @@ fn indexes(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
     })
 }
 
+/// Types of this lake and those attached (`types.rs`: enums), each in its schema.
+fn types(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
+    Box::pin(async move {
+        let here = crate::ddl::lake_name(lake);
+        let mut all = vec![];
+        for (name, l) in lakes(lake) {
+            for (k, t) in l.cat.scan::<crate::types::Type>("ty/", "ty0").await? {
+                let named = if name == here { name_sql(&k[3..]) } else { format!("{}.{}", ident(&name), name_sql(&k[3..])) };
+                all.push(Object::new("type", &name, &k[3..], Some(crate::types::create_sql(&named, &t))));
+            }
+        }
+        Ok(all)
+    })
+}
+
 fn routines(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
     Box::pin(async move {
         use crate::routines::Kind as R;
@@ -240,7 +256,7 @@ fn databases(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
 // ---------------------------------------------------------------- definitions
 
 /// A name in SQL: each part bare if it can be, quoted if not.
-fn name_sql(local: &str) -> String { local.split('.').map(ident).collect::<Vec<_>>().join(".") }
+pub fn name_sql(local: &str) -> String { local.split('.').map(ident).collect::<Vec<_>>().join(".") }
 
 /// One part of a name as SQL reads it back: bare when lower case and not a word SQL reserves.
 pub fn ident(n: &str) -> String {
@@ -314,7 +330,8 @@ fn table_sql(name: &str, m: &TableMeta) -> String {
             Some(i) => format!(" {}", i.sql()), // (its sequence is the table's: made with it)
             None => m.defaults.get(c).map(|d| format!(" DEFAULT {d}")).unwrap_or_default(),
         };
-        format!("{} {}{merge}{null}{default}", ident(c), sql_type(t))
+        let ty = m.enums.get(c).map_or_else(|| sql_type(t), |e| e.sql()); // (an enum column: its type, not the text it holds)
+        format!("{} {ty}{merge}{null}{default}", ident(c))
     }).collect();
     if !m.key.is_empty() {
         parts.push(format!("PRIMARY KEY ({})", list_sql(&m.key)));
@@ -544,6 +561,7 @@ async fn there(lake: &Lake, key: &str) -> Result<bool> {
             None => false,
         },
         "routine" => has(crate::routines::key(name)).await?,
+        "type" => has(crate::types::key(name)).await?,
         "task" => has(crate::runs::task_key(name)).await?,
         "schema" => name == PUBLIC || has(crate::ddl::schema_key(name)).await?,
         "secret" => has(format!("e/{name}")).await?,
@@ -585,7 +603,7 @@ async fn comment(lake: &Lake, word: &str, name: &str, text: Option<String>, if_e
 
 /// Does carrying out `d` drop or rename something a comment may be on?
 pub fn moves(d: &Ddl) -> bool {
-    matches!(d, Ddl::Sequence(_) | Ddl::Index(_) | Ddl::DropTable { .. } | Ddl::DropView { .. } | Ddl::DropSchema { .. } | Ddl::DropRoutine { .. } | Ddl::DropTask { .. } | Ddl::DropSecret { .. }
+    matches!(d, Ddl::Sequence(_) | Ddl::Index(_) | Ddl::Type(_) | Ddl::DropTable { .. } | Ddl::DropView { .. } | Ddl::DropSchema { .. } | Ddl::DropRoutine { .. } | Ddl::DropTask { .. } | Ddl::DropSecret { .. }
         | Ddl::Detach { .. } | Ddl::DropDatabase { .. } | Ddl::RenameTable { .. } | Ddl::AlterColumn { .. } | Ddl::Users(_))
 }
 
@@ -598,17 +616,18 @@ pub async fn follow(lake: &Lake, out: &Value) -> Result<()> {
         return Ok(());
     }
     let (mut put, mut gone) = (vec![], vec![]);
-    let renamed = match (out["table"].as_str().or(out["view"].as_str()).or(out["sequence"].as_str()).or(out["index"].as_str()), out["renamed"].as_str()) {
-        (Some(from), Some(to)) => Some((from.to_string(), to.to_string())),
+    let relation = out["table"].as_str().or(out["view"].as_str()).or(out["sequence"].as_str()).or(out["index"].as_str()).map(|n| ("relation", n));
+    let renamed = match (relation.or(out["type"].as_str().map(|n| ("type", n))), out["renamed"].as_str()) {
+        (Some((family, from)), Some(to)) => Some((family, from.to_string(), to.to_string())),
         _ => None,
     };
     for (k, text) in notes {
-        let moved = renamed.as_ref().and_then(|(from, to)| {
+        let moved = renamed.as_ref().and_then(|(family, from, to)| {
             let rest = k.strip_prefix("cm/")?;
-            if rest == format!("relation/{from}") {
-                Some(format!("cm/relation/{to}"))
+            if rest == format!("{family}/{from}") {
+                Some(format!("cm/{family}/{to}"))
             } else {
-                rest.strip_prefix(&format!("column/{from}/")).map(|c| format!("cm/column/{to}/{c}"))
+                rest.strip_prefix(&format!("column/{from}/")).filter(|_| *family == "relation").map(|c| format!("cm/column/{to}/{c}"))
             }
         });
         match moved {
@@ -668,6 +687,10 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
     ensure!(checks == old.checks, "{table}'s CHECK constraints can't change yet");
     let constraints: Vec<crate::constraints::Constraint> = serde_json::from_value(s["constraints"].clone()).unwrap_or_default();
     ensure!(constraints == old.constraints, "{table}'s UNIQUE, PRIMARY KEY and FOREIGN KEY constraints change with ALTER TABLE {table} ADD | DROP CONSTRAINT");
+    let enums: BTreeMap<String, crate::types::Enum> = serde_json::from_value(s["enums"].clone()).unwrap_or_default();
+    if let Some((c, _)) = was.iter().find(|(c, _)| enums.get(c) != old.enums.get(c)) {
+        bail!("{table}.{c}: a column's enum can't change here (a type takes a new label with ALTER TYPE … ADD VALUE)");
+    }
     // Types widened, as ALTER COLUMN … TYPE does (and refuses, by name, one that would narrow).
     let mut changed = vec![];
     for ((c, t), (_, new)) in was.iter().zip(&columns) {

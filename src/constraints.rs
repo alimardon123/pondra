@@ -322,7 +322,7 @@ pub async fn apply(lake: &Lake, table: &str, change: Change) -> Result<serde_jso
             let found = crate::query::sql(&crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?, &sql).await?.collect().await?;
             let n = found.first().and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|a| a.value(0))).unwrap_or(0);
             if n > 0 {
-                return Err(anyhow::Error::new(crate::views::Violation(format!("check constraint \"{name}\" of relation \"{table}\" is violated by {n} row{}", if n == 1 { "" } else { "s" }))));
+                return Err(anyhow::Error::new(crate::views::Violation(format!("check constraint \"{name}\" of relation \"{table}\" is violated by {n} row{}", if n == 1 { "" } else { "s" }), "23514")));
             }
             m.checks.push((name.clone(), cond));
             serde_json::json!({"table": table, "constraint": name})

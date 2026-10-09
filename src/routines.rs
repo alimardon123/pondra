@@ -743,7 +743,7 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     let expands = all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) || views.keys().any(named) || FROM_FIRST.is_match(sql) || crate::ext::mentions(sql)
         || outside.iter().any(|(n, _)| named(n)) || sql.contains("pondra_at(");
     let as_written = || Ok(named_apart(sql).unwrap_or_else(|| sql.to_string()));
-    if !expands && !crate::friendly::wanted(sql) {
+    if !expands && !crate::friendly::wanted(sql) && !crate::types::wanted(sql) {
         return as_written();
     }
     // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
@@ -765,9 +765,10 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
             }
         }
     }
+    let typed = crate::types::rewrite(lake, &mut stmts).await?; // (`'sad'::mood`, `enum_range(NULL::mood)`: an enum's casts as text)
     // DuckDB's and Snowflake's forms (`friendly.rs`): a text sent on as it was when none is in it
     let friendly = crate::friendly::rewrite(lake, &mut stmts).await?;
-    if !expands && !friendly {
+    if !expands && !friendly && !typed {
         return as_written();
     }
     Ok(text(&stmts))

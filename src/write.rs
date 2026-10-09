@@ -59,6 +59,8 @@ enum TableSpec {
         identity: BTreeMap<String, crate::seq::Identity>, // identity columns: numbered by sequences made with the table (`seq.rs`)
         #[serde(default)]
         constraints: Vec<crate::constraints::Constraint>, // UNIQUE, and keys and references said NOT ENFORCED (`constraints.rs`)
+        #[serde(default)]
+        enums: BTreeMap<String, crate::types::Enum>, // enum columns: the labels each takes (`types.rs`)
     },
 }
 
@@ -67,9 +69,9 @@ enum TableSpec {
 pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> {
     let name = &crate::ddl::new_name(lake, name).await?; // (its schema exists; `public.t` is `t`)
     ensure!(lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(name)).await?.is_none(), "{name} is a view");
-    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, mut defaults, properties, checks, retention, identity, constraints) = match serde_json::from_str(spec)? {
-        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![]),
-        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints),
+    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, mut defaults, properties, checks, retention, identity, constraints, enums) = match serde_json::from_str(spec)? {
+        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![], BTreeMap::new()),
+        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums),
     };
     let retention = retention.as_deref().map(crate::ddl::retention).transpose()?;
     // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `query::dtype`).
@@ -101,6 +103,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     if let Some(c) = constraints.iter().flat_map(|k| &k.columns).find(|c| !columns.iter().any(|(n, _)| n == *c)) {
         bail!("column \"{c}\" named in a constraint does not exist");
     }
+    if let Some(c) = enums.keys().find(|c| !columns.iter().any(|(n, t)| n == *c && t == "Utf8")) {
+        bail!("{c}: an enum column holds text (a column of the table, of type VARCHAR)");
+    }
     for (c, expr) in &defaults {
         let t = &columns.iter().find(|(n, _)| n == c).expect("a column").1;
         ensure!(!identity.contains_key(c), "{c} is an identity column: its values come from its sequence, not a DEFAULT");
@@ -129,7 +134,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 i.sequence = crate::seq::owned(lake, name, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
                 defaults.insert(c.clone(), format!("nextval('{}')", i.sequence.replace('\'', "''")));
             }
-            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, folder, tiered: lake.visible(), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
+            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, folder, tiered: lake.visible(), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
         }
         Some(mut m) => {
             // (the spec names columns as SQL does; the table keeps its stored names: ADR-022)
@@ -159,6 +164,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                     let s = (1..).map(|i| if i == 1 { c.clone() } else { format!("{c}~{i}") }).find(|s| !taken(s)).expect("a free name");
                     if s != *c {
                         m.names.insert(s.clone(), c.clone());
+                    }
+                    if let Some(e) = enums.get(c) {
+                        m.enums.insert(s.clone(), e.clone()); // (ALTER TABLE … ADD COLUMN c mood)
                     }
                     m.columns.push((s, t.clone()));
                 }
@@ -408,6 +416,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     }
     if let Some(s) = crate::index::statement(sql) {
         return Some(s); // (CREATE, ALTER, DROP INDEX)
+    }
+    if let Some(s) = crate::types::statement(sql) {
+        return Some(s); // (CREATE TYPE … AS ENUM, ALTER and DROP TYPE)
     }
     if let Some(sql) = crate::seq::in_order(sql) {
         return parse(&sql); // (an identity's options as the parser takes them)
@@ -737,12 +748,14 @@ pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::Fi
 }
 
 pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Result<String> {
-    let declared = || declared_of(&c.columns);
+    let (as_text, mut enums) = crate::types::columns(from, &c.columns).await?; // (an enum column holds text: `types.rs`)
+    let declared = || declared_of(&as_text);
     let fields = match (&c.like, &c.query) {
         // `CREATE TABLE t LIKE s` takes s's columns and their types, as Postgres's does by default
         // (made with none, it was a table of no columns).
         (Some(ast::CreateTableLikeKind::Plain(l) | ast::CreateTableLikeKind::Parenthesized(l)), _) => {
             ensure!(c.columns.is_empty() && c.query.is_none(), "CREATE TABLE {} LIKE {}: columns or a query, or LIKE, not both", c.name, l.name);
+            enums = crate::types::of_table(from, &object(&l.name)).await; // (its enum columns are enums here too)
             let sql = format!("SELECT * FROM {} LIMIT 0", l.name);
             crate::query::sql(&session(from, &sql, "").await?, &sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>()
         }
@@ -817,7 +830,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
         columns.push(("_deleted".into(), "Boolean".into())); // (so DELETE works; writes leave it out)
     }
     let constraints = crate::constraints::declared(c, &table)?;
-    let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by"), "ttl": opts.get("ttl"), "partition_by": opts.get("partition_by"), "order_by": opts.get("order_by"), "not_null": not_null, "defaults": defaults, "checks": checks, "retention": opts.get("retention"), "identity": identity, "constraints": constraints});
+    let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by"), "ttl": opts.get("ttl"), "partition_by": opts.get("partition_by"), "order_by": opts.get("order_by"), "not_null": not_null, "defaults": defaults, "checks": checks, "retention": opts.get("retention"), "identity": identity, "constraints": constraints, "enums": enums});
     Ok(spec.to_string())
 }
 
@@ -843,6 +856,7 @@ pub fn stored(t: &DataType) -> DataType {
 /// `ALTER TABLE t ADD COLUMN c TYPE`: the table's definition with the new column at the end, sent
 /// like a CREATE TABLE (the leader adds it; old rows read it as null). None: IF NOT EXISTS, and it does.
 async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     let table = stmt.table();
     let m: TableMeta = lake.cat.get::<TableMeta>(&table_key(&table)).await?.ok_or_else(|| anyhow::anyhow!("no table {table}"))?.logical(); // (as SQL names it)
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
@@ -854,10 +868,19 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
                 return Ok(None);
             }
             let ctx = SessionContext::new_with_config(crate::optimize::config(datafusion::prelude::SessionConfig::new())); // (TIMESTAMPTZ in UTC)
+            let declared = Parser::new(&GenericDialect {}).try_with_sql(sql_type).and_then(|mut p| p.parse_data_type());
+            let enumerated = match &declared {
+                Ok(t) => crate::types::of(lake, t).await?,
+                Err(_) => None,
+            };
+            let sql_type = if enumerated.is_some() { "VARCHAR" } else { sql_type }; // (an enum column holds text)
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
             let mut columns = m.columns.clone();
             columns.push((column.to_string(), crate::query::type_name(ctx.table("t").await?.schema().field(0).data_type())));
             spec["columns"] = j!(columns);
+            if let Some(e) = enumerated {
+                spec["enums"] = j!({column: e});
+            }
         }
         // (files written from now on follow them; the ones before keep their order until merged)
         Stmt::SetOptions(_, options) => {

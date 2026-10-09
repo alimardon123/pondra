@@ -227,6 +227,7 @@ pub enum Ddl {
     Object(crate::objects::Op),                              // the registry's: COMMENT ON, CREATE OR ALTER TABLE (`objects.rs`)
     Sequence(crate::seq::Change),                            // CREATE, ALTER, DROP SEQUENCE (`seq.rs`)
     Index(crate::index::Change),                             // CREATE, ALTER, DROP INDEX (`index.rs`)
+    Type(crate::types::Change),                              // CREATE TYPE … AS ENUM, ALTER TYPE, DROP TYPE (`types.rs`)
     Constraint { table: String, change: crate::constraints::Change }, // ALTER TABLE … ADD | DROP CONSTRAINT (`constraints.rs`)
 }
 
@@ -298,6 +299,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Object(op) => crate::objects::apply(lake, op).await,
         Ddl::Sequence(c) => crate::seq::apply(lake, c).await,
         Ddl::Index(c) => crate::index::apply(lake, c).await,
+        Ddl::Type(c) => crate::types::apply(lake, c).await,
         Ddl::Constraint { table, change } => {
             let (other, table) = resolve(lake, &table).await?;
             ensure!(other.is_none(), "{table} is an attached lake's: change its constraints from a node of that lake");
