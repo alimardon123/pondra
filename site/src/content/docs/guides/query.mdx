@@ -257,7 +257,9 @@ curl -s -X POST "http://localhost:8080/sql?stale_ms=5000" -d "SELECT count(*) AS
 
 ## Explain a query
 
-`EXPLAIN` shows the plan, and `EXPLAIN ANALYZE` runs the query and adds what each step cost:
+`EXPLAIN` shows the plan as it will run, with the rows the planner expects from each step
+(`expected_rows`). `EXPLAIN ANALYZE` runs the query and adds the rows each step really gave
+(`output_rows`) and what it cost, so a step whose rows are far from what was expected stands out:
 
 ```python
 for row in db.sql("EXPLAIN SELECT item, sum(qty) FROM orders GROUP BY item").rows():
@@ -270,10 +272,20 @@ logical_plan
 Aggregate: groupBy=[[orders.item]], aggr=[[sum(CAST(orders.qty AS Int64))]]
   TableScan: orders projection=[item, qty]
 physical_plan
-AggregateExec: mode=FinalPartitioned, gby=[item@0 as item], aggr=[sum(orders.qty)]
-  RepartitionExec: partitioning=Hash([item@0], 2), input_partitions=1
-    AggregateExec: mode=Partial, gby=[item@0 as item], aggr=[sum(orders.qty)]
-      DataSourceExec: partitions=1, partition_sizes=[1]
+AggregateExec: mode=FinalPartitioned, gby=[item@0 as item], aggr=[sum(orders.qty)], expected_rows=4
+  RepartitionExec: partitioning=Hash([item@0], 4), input_partitions=1, expected_rows=4
+    AggregateExec: mode=Partial, gby=[item@0 as item], aggr=[sum(orders.qty)], expected_rows=4
+      DataSourceExec: partitions=1, partition_sizes=[1], expected_rows=4
+```
+
+Every statement is also a row of [`pondra.history`](/pondra/reference/sql/#users-and-grants), with a
+fingerprint that is the same for the same query with other values, the commit it read (`version`:
+`AT (VERSION => n)` reads the lake as it was then, so an answer can be had again without being
+kept), and how far a join's rows were from what was expected (`misestimate`):
+
+```sql
+SELECT fingerprint, count(*) AS runs, avg(ms) AS ms, max(misestimate) AS worst
+FROM pondra.history WHERE outcome = 'ok' GROUP BY fingerprint ORDER BY ms DESC LIMIT 5;
 ```
 
 ## Queries across several nodes

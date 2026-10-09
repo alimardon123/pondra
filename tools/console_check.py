@@ -830,10 +830,20 @@ def folders_checks(browser, port, show):
         p.fill("#askIn", name)
         p.press("#askIn", "Enter")
 
-    def more_of(row):
-        """Open a row's ⋯ menu (on hover), and what it lists."""
-        row.hover()
+    def open_more(row):
+        """Click a row's ⋯, shown on hover. The tree may draw the row again between the hover and
+        the click (a listing arriving), so the new row is hovered and clicked again."""
+        for _ in range(5):
+            row.hover()
+            try:
+                return row.locator("button.more").click(timeout=3000)
+            except Exception:  # noqa: BLE001 (drawn again under the pointer)
+                pass
         row.locator("button.more").click()
+
+    def more_of(row):
+        """Open a row's ⋯ menu, and what it lists."""
+        open_more(row)
         return items()
 
     make("projects", lambda: p.click("#newfile"))
@@ -956,9 +966,7 @@ def folders_checks(browser, port, show):
     csv, nb = os.path.join(tmp, "up.csv"), os.path.join(tmp, "up.ipynb")
     open(csv, "w").write("a,b\n1,2\n")
     nbformat.write(nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("%%sql\nSELECT 1 AS one")]), nb)
-    row = folder("projects")
-    row.hover()
-    row.locator("button.more").click()
+    open_more(folder("projects"))
     with p.expect_file_chooser() as chooser:
         p.locator("#menu button", has_text="Upload files here").click()
     chooser.value.set_files([csv, nb])
@@ -1317,6 +1325,7 @@ def work_checks(browser, port, show):
     c = pg.run(1, "SELECT region, sum(amount) AS total FROM wk GROUP BY region ORDER BY region")
     c.locator(".abar .ptab", has_text="Plan").click()
     plan = until(lambda: c.locator(".pgraph .pn").count() > 1, True, 10)
+    expected = until(lambda: "rows expected" in c.locator(".pgraph").inner_text() and "expected_rows" not in c.locator(".pgraph").inner_text(), True, 5)
     c.locator(".abar .ptab", has_text="Chart").click()
     chart = until(lambda: c.locator(".chart svg").count() > 0 and c.locator(".abar .ptab.on").all_inner_texts() == ["Chart"], True, 10)
     p.fill("#nbname", "wkbook")
@@ -1329,8 +1338,8 @@ def work_checks(browser, port, show):
     oc = other.cell(1)
     again = until(lambda: oc.locator(".chart svg").count() > 0 and oc.locator(".abar .ptab.on").all_inner_texts() == ["Chart"], True, 15)
     other.ctx.close()
-    checks["a SQL cell's answer has Chart and Plan (its graph), as a SQL file's pane; the chart open, and its settings, are kept with the notebook"] = \
-        plan is True and chart is True and meta.get("pondra", {}).get("view") == "chart" and meta["pondra"].get("chart", {}).get("x") == "region" and again is True
+    checks["a SQL cell's answer has Chart and Plan (its graph, each step's expected rows apart from its details), as a SQL file's pane; the chart open, and its settings, are kept with the notebook"] = \
+        plan is True and expected is True and chart is True and meta.get("pondra", {}).get("view") == "chart" and meta["pondra"].get("chart", {}).get("x") == "region" and again is True
 
     # The owner's third list: a cell's Data profile; SQL <-> Python; the editor's right-click; Create as; the tree's menus; rows a page
     c.locator(".abar .ptab", has_text="Data profile").click()
@@ -1572,7 +1581,8 @@ def layout_checks(browser, port, show):
     seen = lambda: p.locator("#data .row:visible .nm").all_inner_texts()
     only = until(lambda: "lx" in seen() and "ly" not in seen(), True)
     p.press("#filter", "Escape")
-    checks["the filter narrows the trees to the names that hold it (and what they are in); Esc clears it"] = only is True and "ly" in seen()
+    cleared = until(lambda: "ly" in seen(), True)
+    checks["the filter narrows the trees to the names that hold it (and what they are in); Esc clears it"] = only is True and cleared is True
     p.locator("#docs").click()
     p.keyboard.press("Control+b")
     hid = p.locator("#left").is_hidden()

@@ -299,6 +299,13 @@ def external():
     checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
         "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no files" in said["none"] \
         and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "program that started the node" in said["not owner"]
+    # A lake table's files are the lake's: LOCATION was dropped and the table made in the lake; and
+    # a DELETE of an attached Delta table read "no table" with its path.
+    placed = err(f"CREATE TABLE placed (id BIGINT) LOCATION '{here}/placed/'")
+    q(f"COPY (SELECT 1 AS id) TO '{here}/wh/s/t/' (FORMAT delta)"); q(f"ATTACH '{here}/wh' AS wh (TYPE delta)")
+    checks["CREATE TABLE … LOCATION refused by name, nothing made; DELETE of an attached Delta table refused by name"] = "LOCATION" in placed and "not found" in err("SELECT * FROM placed") \
+        and "another engine's table" in err("DELETE FROM wh.s.t WHERE id = 1") and q("SELECT count(*) AS n FROM wh.s.t") == [{"n": 1}]
+    q("DETACH wh")
     # The lake's own files (PUT /files/…) are the lake's: whoever reads the lake reads them as a
     # table too, and nothing else of its folder (ADR-032); /objects says what each object is.
     call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n1,x\n")
@@ -1872,6 +1879,7 @@ def schemas():
     joined = q("SELECT t.k, s.qty FROM warehouse.stock s JOIN t ON s.id = t.k ORDER BY 1", 2)
     before_insert = n("warehouse.stock", 0)
     q("INSERT INTO warehouse.stock VALUES (3, 300)", 2)
+    at_once = n("warehouse.stock", 2)  # (the node that wrote it, at its next statement: `write::seen_there`)
     fresh = until(lambda: n("warehouse.stock", 0), 3, 15)  # (an answer remembered from before is not)
     nodes[2].kill()
     nodes[2].start(tries=1)
@@ -1889,8 +1897,8 @@ def schemas():
     q("DROP VIEW from_first")
     q("DETACH warehouse")
     gone = [until(lambda i=i: reach(i), False, 15) for i in range(3)]
-    checks["ATTACH 'dir' AS name on one node: every node, after a restart, pondra sql; joins and writes across; DETACH everywhere; bad ones refused"] = \
-        all(refused) and all(everywhere) and joined == [{"k": 1, "qty": 100}, {"k": 2, "qty": 200}] and (before_insert, fresh) == (2, 3) and after_restart == 3 and "| 3 |" in cli \
+    checks["ATTACH 'dir' AS name on one node: every node, after a restart, pondra sql; joins and writes across, a write read at once where it was sent; DETACH everywhere; bad ones refused"] = \
+        all(refused) and all(everywhere) and joined == [{"k": 1, "qty": 100}, {"k": 2, "qty": 200}] and (before_insert, at_once, fresh) == (2, 3, 3) and after_restart == 3 and "| 3 |" in cli \
         and {me, "other", "warehouse"} <= listed and not any(gone)
     # a new lake: ATTACH of a place with no lake makes one there; CREATE DATABASE makes one beside this lake
     fresh, beside = third + "-new", f"made_{uuid.uuid4().hex[:6]}"
@@ -1898,13 +1906,14 @@ def schemas():
     made, db = q(f"ATTACH '{fresh}' AS fresh", 1), q(f"CREATE DATABASE {beside}", 2)
     q(f"CREATE TABLE {beside}.x (a BIGINT)")
     q(f"INSERT INTO {beside}.x VALUES (1), (2)", 1)
-    checks["ATTACH of a place with no lake makes one; CREATE DATABASE makes one beside this lake, attached; twice is refused"] = made.get("created") is True and db.get("created") is True \
-        and until(lambda: _try(lambda: n(f"{beside}.x", 2)), 2, 15) == 2 and err(f"CREATE DATABASE {beside}") is not None and "unchanged" in q(f"CREATE DATABASE IF NOT EXISTS {beside}")
+    written = n(f"{beside}.x", 1)  # (through that lake's inbox, by a `pondra sql` leading it: read at once all the same)
+    checks["ATTACH of a place with no lake makes one; CREATE DATABASE makes one beside this lake, attached, written and read at once; twice is refused"] = made.get("created") is True and db.get("created") is True \
+        and written == 2 and until(lambda: _try(lambda: n(f"{beside}.x", 2)), 2, 15) == 2 and err(f"CREATE DATABASE {beside}") is not None and "unchanged" in q(f"CREATE DATABASE IF NOT EXISTS {beside}")
     [x.kill() for x in nodes + [b, c]]
     ok = all(checks.values())
     print(json.dumps({"schemas": checks, "ok": ok}, indent=1))
     if not ok:
-        print(before, over_view, got, spaces, in_dbo, by_flight, rest, used, view_owned, full, shown, refused, everywhere, joined, before_insert, fresh, after_restart, cli, listed, gone, from_first, change)
+        print(before, over_view, got, spaces, in_dbo, by_flight, rest, used, view_owned, full, shown, refused, everywhere, joined, before_insert, at_once, fresh, after_restart, cli, listed, gone, from_first, change, written)
         sys.exit(1)
     return f"schemas: lake.schema.table, attached lakes as catalogs, CREATE/DROP SCHEMA, DROP TABLE, CTAS, stored and materialized views in SQL from any node, spread over views, clients list schemas: all {len(checks)} checks pass"
 
@@ -4972,6 +4981,89 @@ def history():
     return f"history: every statement a row, slow ones with plans and traces: all {len(checks)} checks pass"
 
 
+def plans():
+    """Every plan as estimated and as it ran (ADR-050, part 1): `EXPLAIN` gives each operator its
+    expected rows, `EXPLAIN ANALYZE` those beside the rows it got (its metrics still last, for the
+    console). Every row of `pondra.history` says what it ran: a fingerprint one query's runs share
+    whatever their literals, the plan's shape (`plan_id`), the commit it read at (its answer again with
+    `AT (VERSION => n)`), the tables it read and those it changed, and for a query with joins how many
+    times their rows were off what the planner expected (`misestimate`); ten times off, a query keeps
+    its plan though fast."""
+    lake = new_lake()
+    a = Node(lake, A.port, env={"PONDRA_LEARN_MS": "0"}).start()
+    q = lambda s: sql(A.port, s)
+    rows_of = lambda tag: [r for r in q(f"SELECT * FROM pondra.history WHERE statement LIKE '%{tag}%' AND statement NOT LIKE '%pondra.history%' ORDER BY at") if tag in r.get("statement")]
+    def until_rows(tag, want=1, secs=15):
+        deadline = time.time() + secs
+        while len(got := rows_of(tag)) < want and time.time() < deadline:
+            time.sleep(0.5)
+        return got
+    checks, seen = {}, {}
+    try:
+        # 20,000 customers, Paris only in France and only one in a hundred; 100,000 orders
+        q("CREATE TABLE customers (id BIGINT, country VARCHAR, city VARCHAR)")
+        q("INSERT INTO customers SELECT value, CASE WHEN value % 100 = 0 THEN 'FR' WHEN value % 2 = 0 THEN 'FR' ELSE 'DE' END, CASE WHEN value % 100 = 0 THEN 'Paris' ELSE 'Lyon' END FROM range(0, 20000)")
+        q("CREATE TABLE orders (id BIGINT, customer_id BIGINT, total BIGINT)")
+        q("INSERT INTO orders SELECT value, value % 20000, value % 97 FROM range(0, 100000)")
+        join = "SELECT count(*) AS n FROM orders o JOIN customers c ON c.id = o.customer_id WHERE c.country = 'FR' AND c.city = 'Paris'"
+        # EXPLAIN: each operator's expected rows, DataFusion's long statistics gone
+        plan = {r["plan_type"]: r["plan"] for r in q("EXPLAIN " + join)}
+        physical = plan.get("physical_plan", "")
+        seen["explain"] = physical
+        checks["EXPLAIN: each operator its expected rows"] = "expected_rows=" in physical and "statistics=[" not in physical \
+            and all("expected_rows=" in l for l in physical.splitlines() if "DataSourceExec" in l)
+        # EXPLAIN ANALYZE: the rows it got beside the rows it expected, metrics last
+        analyzed = "\n".join(r["plan"] for r in q("EXPLAIN ANALYZE " + join))
+        seen["analyze"] = analyzed
+        lines = [l for l in analyzed.splitlines() if "HashJoinExec" in l]
+        checks["EXPLAIN ANALYZE: expected and actual rows on each line, its metrics last"] = bool(lines) and all(
+            "expected_rows=" in l and "output_rows=" in l and l.index("expected_rows=") < l.index("metrics=[") and l.rstrip().endswith("]") for l in lines) \
+            and "statistics=[" not in analyzed
+        # The history: one query's runs share a fingerprint and a plan whatever their literals
+        q("SELECT count(*) AS n FROM orders WHERE total = 3 AND id IN (1, 2, 3) -- p-same-1")
+        q("SELECT count(*) AS n FROM orders WHERE total = 41 AND id IN (7, 8) -- p-same-2")
+        q("SELECT count(*) AS n FROM orders WHERE total > 3 -- p-other")
+        one, two, other = until_rows("p-same-1"), until_rows("p-same-2"), until_rows("p-other")
+        seen["fingerprints"] = [(r.get("fingerprint"), r.get("plan_id")) for r in one + two + other]
+        checks["one query asked with other values: the same fingerprint and plan"] = len(one) == len(two) == 1 and one[0].get("fingerprint") == two[0].get("fingerprint") is not None \
+            and one[0].get("plan_id") == two[0].get("plan_id") is not None
+        checks["another query: another fingerprint"] = len(other) == 1 and other[0].get("fingerprint") not in (None, one[0].get("fingerprint") if one else None)
+        # The tables it read, and how far its joins were from what was expected
+        q(join + " -- p-join")
+        joined = until_rows("p-join")
+        seen["join"] = [{k: r.get(k) for k in ("reads", "misestimate", "plan_id", "ms")} | {"plan": (r.get("plan") or "")[:2000]} for r in joined]
+        j = joined[0] if joined else {}
+        checks["the tables it read"] = sorted(j.get("reads") or []) == ["customers", "orders"] and (one[0].get("reads") if one else None) == ["orders"]
+        checks["a query with joins: how far they were from what was expected"] = isinstance(j.get("misestimate"), (int, float)) and j.get("misestimate") >= 1 \
+            and (one[0].get("misestimate") if one else 0) is None
+        checks["…ten times off: its plan kept, though fast"] = j.get("misestimate") is not None and (j.get("misestimate") < 10 or ("expected_rows=" in (j.get("plan") or "") and "output_rows=" in j.get("plan")))
+        checks["a join's plan is another plan"] = j.get("plan_id") not in (None, one[0].get("plan_id") if one else None)
+        # The commit it read at: its answer again, after more rows came
+        n = q("SELECT count(*) AS n FROM orders -- p-version")[0]["n"]
+        at = until_rows("p-version")
+        q("INSERT INTO orders SELECT value, value % 20000, 1 FROM range(100000, 100500)")
+        version = at[0].get("version") if at else None
+        again = q(f"SELECT count(*) AS n FROM orders AT (VERSION => {version})")[0]["n"] if version is not None else None
+        seen["version"] = {"version": version, "then": n, "again": again, "now": q("SELECT count(*) AS n FROM orders")[0]["n"]}
+        checks["the commit it read at gives its answer again (AT VERSION)"] = again == n == 100000 and seen["version"]["now"] == 100500
+        # A write: the table it changed, and what it read
+        q("INSERT INTO orders VALUES (-1, 0, 0) -- p-write")
+        q("INSERT INTO orders SELECT -id - 2, id, 0 FROM customers WHERE id < 3 -- p-copied")
+        q("UPDATE orders SET total = 1 WHERE id = -1 -- p-update")
+        w, copied, updated = until_rows("p-write"), until_rows("p-copied"), until_rows("p-update")
+        seen["writes"] = [(r.get("reads"), r.get("writes")) for r in w + copied + updated]
+        checks["a write: the table it changed, and what it read"] = [(r.get("reads") or [], r.get("writes")) for r in w + copied + updated] == [([], ["orders"]), (["customers"], ["orders"]), (["orders"], ["orders"])] \
+            and all(r.get("fingerprint") is not None for r in w + copied + updated)
+    finally:
+        a.kill()
+        clean_up()
+    ok = all(checks.values())
+    print(json.dumps({"plans": checks, "seen": seen, "ok": ok}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"plans: expected rows beside actual ones, and what each statement ran: all {len(checks)} checks pass"
+
+
 def found():
     """What writing the docs found (round 26), each fixed: a filtered materialized view follows
     UPDATE and DELETE; a producer's seq 0 refused (HTTP, Flight); a merge table that leaves a
@@ -7672,7 +7764,7 @@ def friendly():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, plans, friendly, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -7680,7 +7772,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "plans", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -7692,7 +7784,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

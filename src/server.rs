@@ -583,6 +583,8 @@ impl App {
     async fn query_listed(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
+        crate::history::read_at(self.lake.visible()); // (its answer again: `t AT (VERSION => n)`)
+        let explained = crate::write::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
         let run = async {
             let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::past::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await // (rows sent with a request are here only; so are the session's temporary tables, its transaction and settings, and a Python table function's call)
                 || crate::auth::limited().is_some(); // (and a user's granted some tables: its grants are checked where it is planned, here)
@@ -599,6 +601,9 @@ impl App {
             let run = |frugal: bool| async move {
                 let ctx = session(&self.lake, query, "").await?;
                 let ctx = if files { ctx.enable_url_table() } else { ctx };
+                if explained {
+                    ctx.state_ref().write().config_mut().options_mut().explain.show_statistics = true; // (each operator's expected rows: `history::expected`)
+                }
                 if frugal {
                     // Hash joins can't spill, sort-merge joins can; sorts keep less aside to merge.
                     let state = ctx.state_ref();
@@ -610,7 +615,8 @@ impl App {
                 let (schema, task) = (Arc::new(df.schema().as_arrow().clone()), Arc::new(df.task_ctx()));
                 let plan = df.create_physical_plan().await?;
                 let out = datafusion::physical_plan::collect(plan.clone(), task).await?;
-                crate::history::planned(&plan); // (a slow statement's plan, with what each operator did)
+                crate::history::planned(&plan); // (its shape; a slow statement's plan, with what each operator did)
+                let out = if explained { crate::history::explained(out)? } else { out };
                 anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(schema)] } else { out }) // (no rows: still its columns)
             };
             let here = std::time::Instant::now();

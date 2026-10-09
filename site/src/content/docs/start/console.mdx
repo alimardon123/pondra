@@ -191,10 +191,11 @@ click puts the name in the file, for `name.table`); both copy the name.
   columns (the chart picks lines over time, else bars, until you pick). **Save** keeps it as a PNG
   picture or an SVG drawing.
 - **Plan** draws the statement's plan as a graph: each step (a scan, a filter, a join, an
-  aggregate) above the steps it reads from, and a dashed box where rows move between cores, or
-  between nodes when a query is spread. **Text** shows `EXPLAIN` as it is: the logical plan and the
+  aggregate) above the steps it reads from, with the rows the planner expects from it, and a dashed
+  box where rows move between cores, or between nodes when a query is spread. **Text** shows `EXPLAIN` as it is: the logical plan and the
   physical one, as planned. **Query profile** runs
-  the statement with `EXPLAIN ANALYZE` (it does run it) and puts each step's rows and time on it,
+  the statement with `EXPLAIN ANALYZE` (it does run it) and puts each step's rows (beside those
+  expected) and time on it,
   the costliest marked in red, so you see where the time goes. Its download button copies the plan
   as text, or saves it as text or as a picture (SVG or PNG).
 - **Data profile** summarizes each column of the answer: its share of NULLs, its distinct values, its
