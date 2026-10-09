@@ -321,18 +321,31 @@ fn whole(arrays: Vec<ArrayRef>) -> Vec<ArrayRef> {
             });
         })
     });
-    let mut arena = MutableBuffer::with_capacity(total);
-    for b in &distinct {
-        arena.extend_from_slice(b.as_slice());
-        arena.resize(arena.len().next_multiple_of(ALIGN), 0);
-    }
-    let arena = Arc::new(Buffer::from(arena));
+    let fill = |base: *mut u8| {
+        let mut offset = 0;
+        for b in &distinct {
+            // SAFETY: `base` has `total` bytes, laid out above for these buffers in this order; nothing reads them yet.
+            unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), base.add(offset), b.len()) };
+            offset += b.len().next_multiple_of(ALIGN);
+        }
+    };
+    let (base, arena) = match mapped(total) {
+        Some((base, mapped)) => {
+            fill(base);
+            (base, mapped)
+        }
+        None => {
+            let mut heap = MutableBuffer::from_len_zeroed(total);
+            fill(heap.as_mut_ptr());
+            let heap = Arc::new(Buffer::from(heap));
+            (heap.as_ptr() as *mut u8, heap as Arc<dyn datafusion::arrow::alloc::Allocation>)
+        }
+    };
     let pieces: HashMap<(usize, usize), Buffer> = at
         .into_iter()
         .map(|((ptr, len), offset)| {
-            let owner: Arc<dyn datafusion::arrow::alloc::Allocation> = arena.clone();
-            // SAFETY: `offset..offset + len` is inside the arena (laid out above), which `owner` keeps alive.
-            let p = unsafe { Buffer::from_custom_allocation(std::ptr::NonNull::new_unchecked(arena.as_ptr().add(offset) as *mut u8), len, owner) };
+            // SAFETY: `offset..offset + len` is inside the arena (laid out above), which the owner keeps alive.
+            let p = unsafe { Buffer::from_custom_allocation(std::ptr::NonNull::new_unchecked(base.add(offset)), len, arena.clone()) };
             ((ptr, len), p)
         })
         .collect();
@@ -347,6 +360,50 @@ fn whole(arrays: Vec<ArrayRef>) -> Vec<ArrayRef> {
     }
     datas.iter().map(|d| make_array(rebuild(d, &piece))).collect()
 }
+
+/// A file column's arena in memory of its own from the OS, given back whole when the file leaves
+/// the hot columns. In the heap, files coming and going under steady writes left holes that the
+/// next, larger files couldn't use: a node held hundreds of MB more than it counted, and still grew
+/// after hours (`tools/soak.py`). Small arenas stay in the heap, which keeps them well, and so does
+/// everything past `MOST` mappings: the OS allows a process about 65,000, and the allocator and the
+/// threads need theirs. Elsewhere than Unix, or if the OS says no: the heap.
+#[cfg(unix)]
+fn mapped(len: usize) -> Option<(*mut u8, Arc<dyn datafusion::arrow::alloc::Allocation>)> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    const SMALL: usize = 64 << 10;
+    const MOST: usize = 16_384;
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    struct Mapped(std::ptr::NonNull<u8>, usize);
+    // SAFETY: plain memory, written once before it is shared and only read after.
+    unsafe impl Send for Mapped {}
+    unsafe impl Sync for Mapped {}
+    impl std::panic::RefUnwindSafe for Mapped {}
+    impl Drop for Mapped {
+        fn drop(&mut self) {
+            // SAFETY: the mapping made below; every buffer pointing into it is gone (each held this).
+            unsafe { libc::munmap(self.0.as_ptr() as *mut libc::c_void, self.1) };
+            LIVE.fetch_sub(1, Relaxed);
+        }
+    }
+    if len < SMALL || LIVE.fetch_add(1, Relaxed) >= MOST {
+        if len >= SMALL {
+            LIVE.fetch_sub(1, Relaxed);
+        }
+        return None;
+    }
+    // SAFETY: a fresh private anonymous mapping (zeroed), unmapped only by `Mapped`'s drop.
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+    match std::ptr::NonNull::new(p as *mut u8).filter(|_| p != libc::MAP_FAILED) {
+        Some(p) => Some((p.as_ptr(), Arc::new(Mapped(p, len)))),
+        None => {
+            LIVE.fetch_sub(1, Relaxed);
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn mapped(_: usize) -> Option<(*mut u8, Arc<dyn datafusion::arrow::alloc::Allocation>)> { None }
 
 /// Each batch's least and greatest value, for a column whose order can rule a batch out: not
 /// floats (a NaN sorts apart, invariant 65) or strings (rarely in order, and costly to keep).
