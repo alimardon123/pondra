@@ -2005,9 +2005,12 @@ def bykey():
     q("CREATE MATERIALIZED VIEW sizes AS SELECT customers > 10 AS big, count(*) AS regions, sum(customers) AS c FROM regulars GROUP BY 1")
     q("UPDATE orders SET customer = 'solo' WHERE region = 'west'")  # (west's distinct customers: 1)
     q("INSERT INTO orders VALUES ('east', 'new2', NULL, 1.0, TIMESTAMP '2026-10-07 00:00:00')")
-    flows = _bykey_same(q, "busy", "SELECT region, customers FROM regulars WHERE customers > 9", "region") and \
-        _bykey_same(q, "sizes", "SELECT customers > 10 AS big, count(*) AS regions, sum(customers) AS c FROM regulars GROUP BY 1", "big") and \
-        _bykey_same(q, "regulars", views["regulars"][0], "region")
+    follows = {"busy": _bykey_same(q, "busy", "SELECT region, customers FROM regulars WHERE customers > 9", "region"),
+               "sizes": _bykey_same(q, "sizes", "SELECT customers > 10 AS big, count(*) AS regions, sum(customers) AS c FROM regulars GROUP BY 1", "big"),
+               "regulars": _bykey_same(q, "regulars", views["regulars"][0], "region")}
+    if not all(follows.values()):
+        follows["rows"] = {v: q(f"SELECT * FROM {v}") for v in ("regulars", "busy", "sizes")}
+    flows = all(follows[k] for k in ("busy", "sizes", "regulars"))
     listed = {r["name"]: r for r in q("SELECT name, kind, refresh, reason FROM pondra.flows")}
     shown = q("SHOW CREATE MATERIALIZED VIEW totals")[0]["definition"]
     by_key = " WITH (refresh = 'by key') AS "
@@ -2055,7 +2058,7 @@ def bykey():
     ok = all(checks.values())
     print(json.dumps({"bykey": checks, "ok": ok}, indent=1))
     if not ok:
-        print(json.dumps({"made": made, "inserted": inserted, "changed": changed, "gone": gone, "before": before, "after": after, "listed": listed,
+        print(json.dumps({"made": made, "inserted": inserted, "changed": changed, "gone": gone, "before": before, "after": after, "follows": follows, "listed": listed,
                           "shown": shown, "refused": refused}, indent=1, default=str)[-12000:])
         sys.exit(1)
     return "views kept by key (median, count(DISTINCT), string_agg, array_agg, HAVING): == ad hoc through changes, a restart and three nodes; unchanged groups not rewritten"
