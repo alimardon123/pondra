@@ -155,6 +155,29 @@ def race():
     agree = len({s.get("leader") or f"127.0.0.1:{nd.port}" for nd, s in zip(nodes, stats)})
     print(f"race: {A.nodes} nodes started at once -> {len(leaders)} leader(s), all agree: {agree == 1}")
     [nd.kill() for nd in nodes]
+    # The same with the folder named as the guide's cluster names it (`pondra serve cluster/lake`,
+    # no --dir): a node that found the first one's term but no catalog yet took the folder for
+    # "other things than lakes" and exited.
+    named = True
+    if not A.s3:
+        folder = os.path.join(harness.new_lake(), "lake")
+        nodes = [Node(folder, A.port + A.nodes + 1 + i) for i in range(A.nodes)]
+        failed = []
+        for nd in nodes:
+            nd.args[2:4] = [folder]  # (`serve PATH`: what the path holds decides)
+
+        def start(nd):
+            try:
+                nd.start(tries=1)
+            except RuntimeError as e:
+                failed.append(str(e)[-160:])
+        threads = [threading.Thread(target=start, args=(nd,)) for nd in nodes]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        roles = sorted(call(nd.port, "GET", "/stats")["role"] for nd in nodes if nd.p.poll() is None) if not failed else []
+        named = not failed and roles == ["follower"] * (A.nodes - 1) + ["leader"]
+        print(f"race: {A.nodes} nodes started at once on a new folder by its name -> {roles or failed}: {named}")
+        [nd.kill() for nd in nodes]
     # A leader that claimed the lake and died before making its catalog (its mark is fresh).
     young = harness.new_lake()
     put = lambda key, body: harness.put_object(young, key, body)
@@ -170,7 +193,7 @@ def race():
         took_over = False
     print(f"race: a leader that never made the catalog -> the next node leads after {time.time() - t:.0f} s: {took_over}")
     late.kill()
-    return len(leaders) == 1 and agree == 1 and took_over
+    return len(leaders) == 1 and agree == 1 and took_over and named
 
 
 def failover():

@@ -574,10 +574,43 @@ impl Tail {
     }
 }
 
+/// How this process reaches a lake on another server (ADR-058): the settings of the bucket key it
+/// is read with (a secret's, `ext::build`; None: the environment's), whether nothing here may write
+/// it, and where its leader is asked (a URL, with a TYPE pondra secret's token).
+#[derive(Clone, Default, Debug)]
+pub struct Reach {
+    pub read_only: bool,
+    pub params: Option<BTreeMap<String, String>>,
+    pub endpoint: Option<String>,
+    pub token: Option<String>,
+    pub secret: Option<String>, // (the bucket secret's name: who may use it reads the lake here, `users::across`)
+}
+
+static REACH: std::sync::RwLock<BTreeMap<String, Reach>> = std::sync::RwLock::new(BTreeMap::new());
+
+/// Say how `url` (a lake) is reached. Asked again (an attachment and a branch of it in one
+/// process), what the new one leaves out is kept, and read-only stays read-only.
+pub fn reach_by(url: &str, r: Reach) {
+    let mut all = REACH.write().unwrap();
+    let old = all.remove(url.trim_end_matches('/')).unwrap_or_default();
+    let read_only = old.read_only || r.read_only;
+    all.insert(url.trim_end_matches('/').to_string(), Reach { read_only, params: r.params.or(old.params), endpoint: r.endpoint.or(old.endpoint), token: r.token.or(old.token), secret: r.secret.or(old.secret) });
+}
+
+/// How `url`, or a lake it is in, is reached (the longest registered prefix: `url` itself, or a
+/// path under it).
+pub fn reach_of(url: &str) -> Option<Reach> {
+    let url = url.trim_end_matches('/');
+    let all = REACH.read().unwrap();
+    all.iter().filter(|(k, _)| url.strip_prefix(k.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
+        .max_by_key(|(k, _)| k.len()).map(|(_, r)| r.clone())
+}
+
 /// Open a lake's object store. For a bucket (`s3://`, `gs://`, `az://`, `abfss://`), also returns
 /// the bucket-level client that query scans use (DataFusion addresses objects by their full path
 /// in the bucket). Credentials and endpoints come from the environment, as each cloud's own tools
-/// read them: `AWS_*` (`AWS_ENDPOINT` for R2 and MinIO), `GOOGLE_*`, `AZURE_*`.
+/// read them: `AWS_*` (`AWS_ENDPOINT` for R2 and MinIO), `GOOGLE_*`, `AZURE_*`. A lake on another
+/// server is read with the key its attachment names (`reach_of`), and a read-only one refuses writes.
 pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
     let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
         std::fs::create_dir_all(url)?;
@@ -586,16 +619,22 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     };
     let (bucket, prefix) = rest.trim_end_matches('/').split_once('/').unwrap_or((rest, ""));
     let root = format!("{scheme}://{bucket}");
+    let reach = reach_of(url);
+    let params = reach.as_ref().and_then(|r| r.params.as_ref());
     // Idle connections are dropped after 15 s rather than reused: through proxies and NATs that
     // silently forget idle connections, a reused one hung a PUT for the full 30 s timeout on R2.
     let (idle, after) = (ClientConfigKey::PoolIdleTimeout, "15s");
     // Every request to the bucket takes a turn of its budget, retries too (`budget.rs`, C5).
     let turns = || crate::budget::Budget::of(&root);
-    let whole: Store = match scheme {
-        "s3" => Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
-        "gs" => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).with_config(GoogleConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
-        _ => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&root).with_config(AzureConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
+    let mut whole: Store = match (params, scheme) {
+        (Some(_), _) => crate::ext::build(&url::Url::parse(&root)?, params, true)?,
+        (None, "s3") => Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
+        (None, "gs") => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).with_config(GoogleConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
+        (None, _) => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&root).with_config(AzureConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
     };
+    if reach.as_ref().is_some_and(|r| r.read_only) {
+        whole = Arc::new(ReadOnly(whole, url.trim_end_matches('/').to_string())); // (before the prefix: the lake's store and the bucket's refuse alike)
+    }
     let store: Store = if prefix.is_empty() { whole.clone() } else { Arc::new(PrefixStore::new(whole.clone(), prefix)) };
     Ok((url.trim_end_matches('/').to_string(), Arc::new(Counted(store)), Some((root, whole))))
 }
@@ -645,6 +684,39 @@ impl ObjectStore for Counted {
         crate::metrics::add(&crate::metrics::OBJECT_WRITES, 1);
         self.0.copy_opts(from, to, opts).await
     }
+}
+
+/// What a node still catching up with its leader answers (57P03: it ran nothing, ask again or
+/// another node; `Lake::caught_up`).
+pub const CATCHING_UP: &str = "this node just started and is still catching up with its leader: try again in a moment, or ask another node";
+
+/// A lake read with a read-only key (ADR-058): nothing in this process writes or deletes there,
+/// whatever the key allows (the bucket would refuse too; this says why first).
+#[derive(Debug)]
+struct ReadOnly(Store, String);
+
+/// What a write to a lake read with a read-only key gets back.
+fn refused(lake: &str, path: &str) -> object_store::Error {
+    object_store::Error::PermissionDenied { path: path.to_string(), source: format!("{lake} is read with a read-only key here: nothing on this server writes it (ADR-058)").into() }
+}
+
+impl std::fmt::Display for ReadOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{} (read only)", self.0) }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ReadOnly {
+    async fn put_opts(&self, at: &Path, _: object_store::PutPayload, _: PutOptions) -> object_store::Result<object_store::PutResult> { Err(refused(&self.1, &at.to_string())) }
+    async fn put_multipart_opts(&self, at: &Path, _: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> { Err(refused(&self.1, &at.to_string())) }
+    async fn get_opts(&self, at: &Path, opts: object_store::GetOptions) -> object_store::Result<object_store::GetResult> { self.0.get_opts(at, opts).await }
+    fn delete_stream(&self, at: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        use futures::StreamExt;
+        let lake = self.1.clone();
+        at.map(move |p| Err(refused(&lake, &p.map(|p| p.to_string()).unwrap_or_default()))).boxed()
+    }
+    fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> { self.0.list(prefix) }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> { self.0.list_with_delimiter(prefix).await }
+    async fn copy_opts(&self, _: &Path, to: &Path, _: object_store::CopyOptions) -> object_store::Result<()> { Err(refused(&self.1, &to.to_string())) }
 }
 
 impl Lake {
@@ -816,13 +888,16 @@ impl Lake {
     }
 
     /// Wait, 10 s at most, until this node holds what its leader had committed when it started
-    /// (`cluster::catch_up`). A node restarted after a failover would otherwise answer from an older
-    /// catalog than it did before: its view reads no WAL, and the new leader flushes what it took
-    /// over a moment after it leads (a table just made was "not found").
-    pub async fn caught_up(&self) {
+    /// (`cluster::catch_up`), and refuse (57P03) if it doesn't yet. A node restarted after a
+    /// failover would otherwise answer from an older catalog than it did before: its view reads no
+    /// WAL, and the new leader flushes what it took over a moment after it leads (a table just
+    /// made was "not found").
+    pub async fn caught_up(&self) -> Result<()> {
         if !*self.caught.borrow() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), self.caught.subscribe().wait_for(|c| *c)).await;
         }
+        anyhow::ensure!(*self.caught.borrow(), "{CATCHING_UP}");
+        Ok(())
     }
 
     /// Non-leaders: catch up with our own catalog view (and prune what it now holds).

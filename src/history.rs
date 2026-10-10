@@ -99,6 +99,7 @@ pub fn planned(logical: &datafusion::logical_expr::LogicalPlan, plan: &Arc<dyn E
             true => crate::learned::found(logical, plan),
             false => vec![],
         };
+        crate::learned::note(&note.learned); // (the planner knows them here at once)
         if took >= slow() || note.misestimate.is_some_and(|m| m >= 10.0) {
             let text = datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(plan.as_ref()).set_show_statistics(true).indent(true).to_string();
             note.plan = Some(cut(expected(&text), 64 << 10));

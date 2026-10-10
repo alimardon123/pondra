@@ -288,7 +288,8 @@ part is a small surface another part can plug into (principle 9):
    the `spmd.rs` part to the main thread as paste-ready text.
 2. **Facts** (`pondra.learned` the only new name): kept in the history and shown (`learned.rs`, this
    thread, built); used by the join order and the spread guard (`optimize.rs`, `guard.rs`: the main
-   thread, with the gates).
+   thread, with the gates). The join order's use built in round 34 (invariant 262, `harness.py learn`
+   in place of `learn_check.py`); the spread guard's next.
 3. **Adapting between steps** (`spmd.rs`: the main thread).
 4. **Maintenance where the reads are, advice, `CLUSTER BY AUTO`** (`tier.rs`; the names through
    the SQL review thread). An AI advisor, near 1.0, plugs in as another source of advice (§7).

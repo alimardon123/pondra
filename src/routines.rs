@@ -1754,6 +1754,9 @@ async fn run(app: &App, name: String, r: Routine, row: RecordBatch, who: Who, jo
 /// for in `pondra.runs`.
 fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a str, who: Who, job: Option<String>) -> futures::future::BoxFuture<'a, Result<Outcome>> {
     Box::pin(async move {
+        // (a deploy's statement can't start one: it would run after the deploy ended, with the deploy's
+        // admin rights and no record of it; `auth::carried` would keep both. `CALL` waits for it instead)
+        ensure!(!crate::protect::deploying(), "a deploy's statements don't start a procedure (pondra.start, START CALL): it would run after the deploy ends, outside its record. CALL it, which waits for it");
         let id = crate::runs::new_id();
         let (app2, id2) = (app.clone(), id.clone());
         if crate::workspace::is_run(name) {

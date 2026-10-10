@@ -380,7 +380,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let token = header.as_deref().and_then(|h| h.strip_prefix("Bearer "));
     let node = token.is_some_and(|t| t.starts_with("pn_") || app.auth.token_role(t) > crate::auth::Role::None); // (the cluster's own calls: never held)
     if starting && needed > crate::auth::Role::None && !node {
-        app.lake.caught_up().await; // (a node that just started signs users in from what its leader had: `open`)
+        let _ = app.lake.caught_up().await; // (a node that just started signs users in from what its leader had: `open`)
     }
     let signed = match &header {
         Some(h) => crate::users::who(&app.lake, &app.auth, Some(h)).await,
@@ -399,18 +399,33 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         None => crate::auth::Principal::of(crate::auth::Role::None),
     };
     let who = who.at("http", from);
-    if who.role < needed {
+    // (a branch's pin: a user granted CLONE may ask for it, and `ddl` lets nothing else of theirs through: ADR-058)
+    let pin = req.uri().path() == "/cluster/ddl";
+    let cloning = pin && who.access.as_ref().is_some_and(|a| a.clones().is_some());
+    if who.role < needed && !cloning {
         return match who.role {
             crate::auth::Role::None => (StatusCode::UNAUTHORIZED, "sign in: a token, or a user's name and password").into_response(),
             _ => {
-                crate::audit::refused(&app, &who.name, "http", from, &format!("{} {}", req.method(), req.uri().path()), "this needs more rights than this token's or user's");
-                (StatusCode::FORBIDDEN, "this needs more rights than this token's or user's").into_response()
+                let why = match pin {
+                    true => "a pin needs CLONE on this database or a schema of it (GRANT CLONE ON DATABASE … TO …)",
+                    false => "this needs more rights than this token's or user's",
+                };
+                crate::audit::refused(&app, &who.name, "http", from, &format!("{} {}", req.method(), req.uri().path()), why);
+                (StatusCode::FORBIDDEN, why).into_response()
             }
         };
     }
     req.extensions_mut().insert(who.role);
     let heavy = queries(req.uri().path());
+    // (a Python procedure of a deploy calls back with its lent token: those calls are the deploy's, as its statements are)
+    let deploying = crate::auth::lent_deploying(token);
     let run = crate::auth::WHO.scope(who, next.run(req));
+    let run = async move {
+        match deploying {
+            true => crate::protect::DEPLOYING.scope((), run).await,
+            false => run.await,
+        }
+    };
     match if heavy { crate::panics::work(run).await } else { crate::panics::door(run).await } {
         Ok(r) => r,
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(), // (and the node stays up)
@@ -466,7 +481,7 @@ impl App {
         if self.auth.on() {
             return false;
         }
-        self.lake.caught_up().await;
+        let _ = self.lake.caught_up().await; // (still catching up after 10 s: its own catalog decides)
         !crate::users::any(&self.lake).await
     }
 }
@@ -697,11 +712,12 @@ impl App {
             }
             Ok((out, false))
         };
-        let out = run.await;
+        let (out, planned) = crate::learned::planning(query, run).await; // (planned with what runs learned, as its runs so far say)
         add(&QUERIES, 1);
         add(&QUERY_US, start.elapsed().as_micros() as u64);
         match out {
             Ok((batches, spread)) => {
+                crate::learned::ran(query, planned, start.elapsed()); // (never worse: facts that made it slower twice are set aside)
                 add(&SPREAD, spread as u64);
                 crate::history::rows(batches.iter().map(|b| b.num_rows() as u64).sum());
                 Ok(batches.into_iter().map(crate::query::compact).collect()) // (an answer kept or sent holds only its own strings)
@@ -853,7 +869,10 @@ impl App {
 
 /// Body: a table's definition (see `write::TableSpec`): `[["user","Utf8"],…]`, or
 /// `{"columns": [...], "key": ["user"], "merge": {...}, "publish": [...], "cluster_by": [...]}`.
-async fn create_table(State(app): State<App>, Path(name): Path<String>, body: String) -> Result<Json<Value>, E> {
+async fn create_table(State(app): State<App>, Path(name): Path<String>, headers: HeaderMap, body: String) -> Result<Json<Value>, E> {
+    if !cluster_call(&app, &headers) {
+        crate::protect::check_table(&app.lake, &name).await?; // (it may add columns to a project's table)
+    }
     let _guard = app.lock.lock().await;
     Ok(Json(crate::write::create_table(&app.lake, &name, &body).await?))
 }
@@ -953,14 +972,33 @@ async fn change(State(app): State<App>, Json((sql, job, sent)): Json<(String, St
     Ok(Json(crate::query::SENT.scope(sent, crate::change::run(&app.lake, seq, &sql, &job)).await?))
 }
 
-/// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`).
-async fn ddl(State(app): State<App>, headers: HeaderMap, Json(d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
-    let key = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).filter(|k| k.starts_with("pb_"));
+/// Whether a request is the cluster's own (the nodes' key, an operator's token, or none on an open
+/// lake), which the door it first came in by checked. A user's sign-in, Basic included, is not, so
+/// the routes the cluster forwards to check a protected database's objects for it (`protect.rs`).
+fn cluster_call(app: &App, headers: &HeaderMap) -> bool {
+    match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        None => true,
+        Some(h) => h.strip_prefix("Bearer ").is_some_and(|b| b.starts_with("pn_") || app.auth.token_role(b) > crate::auth::Role::None),
+    }
+}
+
+/// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`), and a
+/// branch's pin (ADR-058). A follower sends it to the leader, asked with the caller's own token.
+async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Extension<crate::auth::Role>>, Json(mut d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
+    let bearer = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).map(String::from);
+    let key = bearer.as_deref().filter(|k| k.starts_with("pb_"));
     if let Some(key) = key {
         crate::branch::keyed(&app.lake, &d, key).await?; // (a branch's key: its own pin, nothing else)
+    } else if role.is_none_or(|r| r.0 < crate::auth::Role::Admin) {
+        crate::branch::cloning(&d)?; // (a user with CLONE: a pin, and nothing else)
     }
+    if !cluster_call(&app, &headers) && key.is_none() {
+        crate::protect::check_ddl(&app.lake, &d).await?;
+    }
+    crate::protect::stamp(&mut d); // (who lifts a protection, when the statement doesn't say)
     let out = match &app.seq {
         Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone()).await?,
+        None if !app.cluster.is_leader() => Box::pin(crate::write::send_as(&app.lake.url, crate::write::Request::Ddl(d.clone()), bearer.as_deref())).await?, // (the leader makes it)
         None => {
             let _guard = app.lock.lock().await;
             crate::ddl::apply(&app.lake, d.clone()).await?

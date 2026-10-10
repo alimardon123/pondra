@@ -5848,6 +5848,134 @@ def plans():
     return f"plans: expected rows beside actual ones, and what each statement ran: all {len(checks)} checks pass"
 
 
+def learn():
+    """What runs learned, used by the planner (ADR-050 §3): a filter on a table whose share a run measured
+    is planned with that share in place of the estimate. Customers whose city and country go together
+    (every Paris customer is in France) look many times more than they are; once a run has seen it, the
+    join order starts from them, with the same answer and no slower. Another node reads the fact from the
+    history; the run after a query's first with facts is planned without them, its bar. Three nodes plan
+    a spread query with the facts its coordinator sends (otherwise their plans differ and it falls back
+    to one node); the facts come back after a restart, from the history; PONDRA_LEARN=off plans as before."""
+    lake = new_lake()
+    env = {"PONDRA_LEARN_MS": "0"}  # (every query learns, however quick)
+    a = Node(lake, A.port, env=env).start()
+    # (b and c print each join order they weigh, and whether an input's rows were learned)
+    b = Node(lake, A.port + 1, env={**env, "PONDRA_DEBUG_JOIN_ORDER": "1"}).start()
+    c = Node(lake, A.port + 2, env={**env, "PONDRA_LEARN": "off", "PONDRA_DEBUG_JOIN_ORDER": "1"}).start()
+    nodes = [a, b, c]
+    runs = itertools.count()
+    # Every statement text unique (a comment with a number): the node's remembered answers would
+    # otherwise answer a repeated one without planning it.
+    def q(s, i=0, spread="0"):
+        return call(A.port + i, "POST", f"/sql?spread={spread}", f"{s} -- l-{next(runs)}".encode())
+    join = ("SELECT count(*) AS n FROM products p JOIN orders o ON o.product_id = p.id "
+            "JOIN customers c ON c.id = o.customer_id "
+            "WHERE p.price < 50 AND c.country = 'FR' AND c.city = 'Paris'")
+    def first_scan(i):
+        """The table the join order starts from: the first TableScan of the logical plan on node i.
+        Its name's last part, so a name qualified by its schema (public.products) reads as products."""
+        plan = {r["plan_type"]: r["plan"] for r in q("EXPLAIN " + join, i)}.get("logical_plan", "")
+        scans = [l.split("TableScan: ", 1)[1].split()[0].rsplit(".", 1)[-1] for l in plan.splitlines() if "TableScan: " in l]
+        return scans[0] if scans else None
+    def timed(i, spread="0"):
+        t = time.time()
+        n = q(join, i, spread)[0]["n"]
+        return n, time.time() - t
+    def learned_rows():
+        return [r for r in q("SELECT object, about, actual FROM pondra.learned") if r.get("object") == "customers"]
+    checks, seen = {}, {}
+    try:
+        # 200,000 customers, half in France; Paris is 1% of them, all in France. 50,000 products, a
+        # twentieth of them under 50 (a range the planner judges well). 4,000,000 orders.
+        q("CREATE TABLE customers (id BIGINT, country VARCHAR, city VARCHAR)")
+        q("INSERT INTO customers SELECT value, CASE WHEN value % 2 = 0 THEN 'FR' ELSE 'DE' END, "
+          "CASE WHEN value % 100 = 0 THEN 'Paris' WHEN value % 2 = 0 THEN 'Lyon' ELSE 'Berlin' END FROM range(0, 200000)")
+        q("CREATE TABLE products (id BIGINT, price BIGINT)")
+        q("INSERT INTO products SELECT value, value % 1000 FROM range(0, 50000)")
+        q("CREATE TABLE orders (id BIGINT, customer_id BIGINT, product_id BIGINT)")
+        q("INSERT INTO orders SELECT value, value % 200000, (value / 3) % 50000 FROM range(0, 4000000)")
+        # Before anything is learned: the order as written, from the products
+        before = first_scan(0)
+        seen["before"] = before
+        checks["before a run has measured the customers' filter, the join order starts from the products"] = before == "products"
+        # A run on one node measures it
+        first, _ = timed(0)
+        deadline = time.time() + 20
+        while not (facts := learned_rows()) and time.time() < deadline:
+            time.sleep(0.5)
+        seen["learned"] = facts
+        checks["the run learned the customers' filter: 1% of them kept"] = len(facts) == 1 and abs(facts[0]["actual"] - 0.01) < 1e-9
+        # Planned with it: the join order starts from the filtered customers; PONDRA_LEARN=off keeps the order as written
+        after, off = first_scan(0), first_scan(2)
+        seen["after"], seen["off"] = after, off
+        checks["once learned, the join order starts from the filtered customers"] = after == "customers"
+        checks["PONDRA_LEARN=off: the order as written"] = off == "products"
+        # Another node reads it from the history (at most 10 s old): b's join order starts from the customers too
+        deadline, there = time.time() + 30, None
+        while time.time() < deadline and (there := first_scan(1)) != "customers":
+            time.sleep(1)
+        seen["another node"] = there
+        checks["another node reads the fact from the history: its join order starts from the customers"] = there == "customers"
+        # Same answer, no slower: b (with facts) against c (without), two followers alike, alternating,
+        # the best of each
+        with_facts, without = [], []
+        for _ in range(5):
+            without.append(timed(2))
+            with_facts.append(timed(1))
+        seen["times"] = {"with": [round(t, 3) for _, t in with_facts], "without": [round(t, 3) for _, t in without]}
+        answers = {first} | {n for n, _ in with_facts + without}
+        seen["answers"] = sorted(answers)
+        checks["the same answer either way"] = len(answers) == 1
+        best_with, best_without = min(t for _, t in with_facts), min(t for _, t in without)
+        checks["no slower with what was learned"] = best_with <= best_without * 1.25 + 0.05
+        # The bar: b's second run of the query with facts was planned without them, so its runs show two plans
+        deadline, plans = time.time() + 20, set()
+        while len(plans) < 2 and time.time() < deadline:
+            time.sleep(0.5)
+            plans = {r["plan_id"] for r in q(f"SELECT plan_id FROM pondra.history WHERE node = '127.0.0.1:{A.port + 1}' "
+                                              "AND statement LIKE 'SELECT count(*) AS n FROM products%'") if r.get("plan_id")}
+        seen["b's plans"] = sorted(plans)
+        checks["the run after the first with facts is planned without them: the bar they are held to"] = len(plans) == 2
+        # Spread over three nodes: each plans with the facts the coordinator sent, so none falls back
+        deadline = time.time() + 30
+        while len(call(A.port, "GET", "/stats")["nodes"]) < 3 and time.time() < deadline:
+            time.sleep(0.2)
+        n, _ = timed(0, spread="1")
+        spread_row = []
+        deadline = time.time() + 20
+        while not spread_row and time.time() < deadline:
+            time.sleep(0.5)
+            spread_row = [r for r in q("SELECT statement, nodes FROM pondra.history ORDER BY at DESC LIMIT 200")
+                          if r.get("statement", "").startswith("SELECT count(*) AS n FROM products") and r.get("nodes")]
+        seen["spread"] = spread_row[:1]
+        # (c never plans with facts of its own: PONDRA_LEARN=off. Only those the coordinator sent.)
+        sent = {x: ", learned)" in open(node.log).read() for x, node in (("b", b), ("c", c))}
+        seen["planned with the coordinator's facts"] = sent
+        checks["spread over three nodes, planned alike with the coordinator's facts: the same answer, not fallen back to one node"] = \
+            n in answers and bool(spread_row) and spread_row[0]["nodes"] == 3 and all(sent.values())
+        # A restart: the facts are read back from the history
+        a.kill()
+        a = Node(lake, A.port, env=env).start()
+        nodes[0] = a
+        deadline, again = time.time() + 40, None
+        while time.time() < deadline:
+            again = first_scan(0)
+            if again == "customers":
+                break
+            time.sleep(1)
+        seen["after a restart"] = again
+        checks["after a restart, read back from the history: the join order starts from the customers"] = again == "customers"
+    finally:
+        for n in nodes:
+            n.kill()
+        clean_up()
+    ok = all(checks.values())
+    print(json.dumps({"learn": checks, "seen": seen, "ok": ok}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"learn: the planner uses what runs learned: all {len(checks)} checks pass"
+
+
 def found():
     """What writing the docs found (round 26), each fixed: a filtered materialized view follows
     UPDATE and DELETE; a producer's seq 0 refused (HTTP, Flight); a merge table that leaves a
@@ -9212,13 +9340,13 @@ def friendly():
 # suite in parts side by side that end together. A section not listed counts as 5 s.
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
-        "users": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
+        "users": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
         "upsert": 11, "sessions": 11, "objects": 11, "columns": 10}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, scripts, hot, minmax, history, plans, friendly, reader, crash, load)
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, scripts, hot, minmax, history, plans, learn, friendly, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -9246,7 +9374,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "plans", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -9259,7 +9387,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

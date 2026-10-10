@@ -10,9 +10,12 @@ GET/HEAD/LIST default to p50 100 ms, p90 170 ms (assumption). Request counts: GE
 
 The store's limits (C5), when asked for: more than N writes a second to a bucket are answered
 503 SlowDown, as S3 answers a hot prefix; a key written again within the second is answered 429,
-as R2 does. Refusals per second are in the stats (`second`: [writes, 503s, 429s]).
+as R2 does. A key is written by a PUT of an object or a multipart upload's completion: an upload's
+start and its parts, and a bulk delete (a POST to the bucket itself), write none (R2's documents say
+only "concurrent writes to the same key"; limits-r2.yml logs what R2 itself refuses). Refusals per
+second are in the stats (`second`: [writes, 503s, 429s]).
 """
-import argparse, json, math, random, threading, time
+import argparse, json, math, random, threading, time, urllib.parse
 from collections import Counter
 from moto.moto_server.werkzeug_app import DomainDispatcherApplication, create_backend_app
 from werkzeug.serving import run_simple
@@ -41,17 +44,18 @@ def app(environ, start_response):
             return [json.dumps({**counts, "second": {str(k): v for k, v in sorted(seconds.items())}}).encode()]
     kind = "PUT" if method in ("PUT", "POST", "DELETE") else ("LIST" if "list-type" in environ.get("QUERY_STRING", "") else "GET")
     t0 = time.time()
-    refuse = None
+    refuse, q = None, urllib.parse.parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+    keyed = (method == "PUT" and "partNumber" not in q) or (method == "POST" and "uploadId" in q)
     with lock:
         counts[kind] += 1
         if method in ("PUT", "POST"):
             sec = seconds.setdefault(int(t0), [0, 0, 0])
             sec[0] += 1
-            if a.key_writes_per_sec and t0 - last_write.get(path, 0) < 1 / a.key_writes_per_sec:
+            if a.key_writes_per_sec and keyed and t0 - last_write.get(path, 0) < 1 / a.key_writes_per_sec:
                 refuse, sec[2] = ("429 Too Many Requests", "TooManyRequests"), sec[2] + 1
             elif a.writes_per_sec and sec[0] - sec[1] - sec[2] > a.writes_per_sec:
                 refuse, sec[1] = ("503 Slow Down", "SlowDown"), sec[1] + 1
-            else:
+            elif keyed:
                 last_write[path] = t0
             if refuse:
                 counts[refuse[1]] += 1

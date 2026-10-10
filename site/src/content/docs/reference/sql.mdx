@@ -615,9 +615,10 @@ parts | rows
 | Make a new lake | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir']`: a lake beside this one, attached. On a [folder of lakes](/pondra/guides/server/) it makes a new served database, and `DROP DATABASE name` drops one, folder and all |
 | Branch a database | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir'] CLONE base [WITH (schemas = (s, …))] [WITH NO DATA]`: a whole database as `base` is now, no data file copied ([branches](/pondra/guides/environments/)) |
 | Bring a branch's tables up to date | `ALTER DATABASE name REFRESH [t, …]`: those tables (a materialized view: the tables it reads; none named: every table the branch took from its base), and the views that follow them, as the base has them now, in one commit |
+| Protect a database | `ALTER DATABASE name SET (protected = true \| false)`: while protected, a project's objects change only by a deploy; lifting it is an admin's and audited ([protected production](/pondra/guides/environments/#protected-production)) |
 | Drop a branch | `DROP DATABASE name`: what it wrote goes; refused while it has branches of its own |
 | Compare two tables | `SELECT * FROM pondra.diff('a', 'b')`: the rows of `b` that differ from `a`, with `_change_type` |
-| Attach a lake | `ATTACH 'dir' AS name`; `ATTACH 'url' AS name (TYPE delta \| iceberg \| kafka, …)` for other engines |
+| Attach a lake | `ATTACH 'dir' AS name`; `ATTACH 'url' AS name (READ_ONLY [, ENDPOINT 'https://…'])` for a lake on another server, read with the secret whose `SCOPE` covers it and written there only ([production apart](/pondra/guides/environments/#production-on-a-server-of-its-own)); `ATTACH 'url' AS name (TYPE delta \| iceberg \| kafka, …)` for other engines |
 | Detach | `DETACH [IF EXISTS] name` |
 
 A table is `t` (in schema `public`), `s.t`, or `lake.s.t`. Names are letters, digits, `_` and `-`.
@@ -753,7 +754,7 @@ brought from them runs as it is:
 |---|---|
 | Write files | `COPY (SELECT …) TO 'url' (FORMAT parquet \| csv \| json \| delta \| iceberg, PARTITION_BY (col, …), APPEND \| OVERWRITE, HEADER true, DELIMITER ';', COMPRESSION zstd, ROW_GROUP_SIZE n)` |
 | Write a topic | `COPY (SELECT …) TO 'kafka://brokers/topic' (FORMAT json, KEY col)` |
-| Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| generic, KEY value, …, SCOPE 'url')` |
+| Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| pondra \| generic, KEY value, …, SCOPE 'url')`; `TYPE pondra, TOKEN '…', SCOPE 'https://…'` is how a lake attached `READ_ONLY` asks its own server's leader to pin a branch |
 | A session's own | `CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…)`: in the node's memory for this session only, used before the lake's |
 | Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name` |
 
@@ -773,13 +774,15 @@ their values.
 | Drop one | `DROP USER [IF EXISTS] name`, `DROP ROLE [IF EXISTS] name` |
 | Grant | `GRANT SELECT [(col, …)] \| INSERT \| UPDATE \| DELETE \| ALL [PRIVILEGES] ON [TABLE] t \| SCHEMA s \| ALL TABLES [IN SCHEMA s] TO name, …` |
 | Grant a secret | `GRANT USAGE ON SECRET s TO name, …` |
+| Let another server branch this one | `GRANT CLONE ON DATABASE d \| SCHEMA s TO name, …`: its token pins a branch of those schemas and does nothing else |
+| Let a user deploy | `GRANT DEPLOY ON DATABASE d TO name, …`: deploys the database (`pondra deploy`, `CALL deploy`) without being an admin; on a protected database, only a holder or the node's operator may deploy ([protected production](/pondra/guides/environments/#protected-production)) |
 | Grant a role | `GRANT role, … TO user, …` |
 | Take back | `REVOKE … FROM …`, as GRANT names them (`REVOKE SELECT (col) ON t FROM r`: that column only) |
 | A token | `CREATE TOKEN name FOR [USER] u [EXPIRES IN '90 days']` (answers it, once), `DROP TOKEN name FOR [USER] u` |
 | List | `SELECT * FROM pondra.users`, `SELECT * FROM pondra.grants` |
 | What was done, and refused | `SELECT * FROM pondra.audit` (a superuser's): `at`, `user`, `door`, `from`, `class`, `statement`, `outcome`, `message`, `ms`, `node` |
 | Every statement | `SELECT * FROM pondra.history` (a superuser sees every row, anyone else their own): `at`, `id`, `user`, `door`, `from`, `node`, `session`, `class`, `statement`, `outcome`, `error`, `ms`, `rows`, `nodes`; `fingerprint` (the statement with its literals left out: one query's runs share it), `plan_id` (the shape of the plan it ran), `version` (the commit it read at: `t AT (VERSION => n)` reads what it read), `reads` and `writes` (the tables and views it read, the tables it changed), `misestimate` (for a query of `PONDRA_LEARN_MS` or more, a factor: how many times more or fewer rows its worst join gave than expected, so `40` is forty times off); `learned` (as JSON, each filter on a table that kept 2× or more of its rows more or fewer than expected: its table, conditions, and the shares expected and kept); and for a statement slower than `PONDRA_SLOW_MS`, or ten times off, its `plan` (each step's rows beside its expected rows, and its time) and `trace` (each node's share, as JSON) |
-| What the lake learned | `SELECT * FROM pondra.learned` (from the history you may read): `object`, `kind` (`filter`), `about` (its conditions), `expected` and `actual` (the shares of the rows read it was expected to keep and kept), `runs`, `updated_at`; each fact as last seen |
+| What the lake learned | `SELECT * FROM pondra.learned` (from the history you may read): `object`, `kind` (`filter`), `about` (its conditions), `expected` and `actual` (the shares of its table's rows it was expected to keep and kept: the planner counts the filter as `actual` from then on), `runs`, `updated_at`; each fact as last seen |
 
 `public` is every user: `GRANT SELECT ON t TO public`. A grant on a schema covers its tables made later
 too. Only a superuser (or the admin token) runs these. `MAX_QUERIES` and `STATEMENT_TIMEOUT` are a user's

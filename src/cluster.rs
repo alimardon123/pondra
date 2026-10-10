@@ -280,15 +280,18 @@ impl Cluster {
     }
 }
 
-/// A node that just started under a leader: what the leader has committed, then until this node
-/// holds it too (`Lake::caught_up` waits on it; 10 s at most each way). Restarted after a
-/// failover, its catalog view lacks what the new leader took over from the old one's WAL until the
-/// new leader flushes it, a moment after it leads.
-pub fn catch_up(lake: Arc<Lake>, leader: String) {
+/// A node that just started under a leader, reading the commit stream (its view reads no WAL):
+/// what the leader has committed, then until this node holds it too (`Lake::caught_up` waits on
+/// it, and refuses meanwhile). Restarted after a failover, its catalog view lacks what the new
+/// leader took over from the old one's WAL until the new leader flushes it, a moment after it
+/// leads. The leader is asked for 30 s: a new one answers only once it has recovered what its
+/// followers held (up to 20 s, `replica::recover`), and an answer from an older catalog given up
+/// waiting sooner is what made a table just made "not found".
+pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
     lake.caught.send_replace(false);
     crate::panics::spawn(async move {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let url = crate::tls::url(&format!("{leader}/cluster/visible"));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let url = crate::tls::url(&format!("{}/cluster/visible", leader.addr));
         let mut upto = None;
         while upto.is_none() && tokio::time::Instant::now() < deadline {
             upto = async { http().get(&url).timeout(Duration::from_secs(2)).send().await?.error_for_status()?.json::<u64>().await }.await.ok();
@@ -296,9 +299,24 @@ pub fn catch_up(lake: Arc<Lake>, leader: String) {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
-        if let Some(upto) = upto {
-            let mut hwm = lake.hwm.subscribe();
-            let _ = tokio::time::timeout(Duration::from_secs(10), async { while lake.visible() < upto { let _ = tokio::time::timeout(Duration::from_millis(50), hwm.changed()).await; } }).await;
+        match upto {
+            Some(upto) => {
+                let mut hwm = lake.hwm.subscribe();
+                if tokio::time::timeout(Duration::from_secs(30), async { while lake.visible() < upto { let _ = tokio::time::timeout(Duration::from_millis(50), hwm.changed()).await; } }).await.is_err() {
+                    eprintln!("this node's catalog hasn't reached its leader's commit {upto} in 30 s: answering from it anyway");
+                }
+            }
+            // A leader whose mark is old by now died before we started: this node takes over, or
+            // follows whoever does, in a moment, and starts again (`follow`). Answering from this
+            // catalog meanwhile would miss what it committed last (a lone node killed, then the shell).
+            None if !alive(&store, &leader).await => {
+                let gone = tokio::time::Instant::now() + Duration::from_secs(60);
+                while tokio::time::Instant::now() < gone && !alive(&store, &leader).await {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                eprintln!("the leader at {} is gone and nobody took over in 60 s: answering from this node's own catalog", leader.addr);
+            }
+            None => eprintln!("the leader at {} didn't answer in 30 s: answering from this node's own catalog", leader.addr),
         }
         lake.caught.send_replace(true);
     });

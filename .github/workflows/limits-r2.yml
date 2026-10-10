@@ -1,0 +1,81 @@
+name: limits-r2
+
+# The bucket's limits (principle 7; tools/limits_check.py --real) on real R2: three nodes, each
+# reaching the bucket through its own tools/faulty_s3.py (no faults set: it only logs every request),
+# 48 writers, 8 upserters, 4 readers and a `pondra sql` from outside once a minute, for 10 minutes.
+# Every acknowledged row must be there once, on every node, and the request log is checked against
+# the limits: fewer than 1% of requests refused, no key written twice within a second, nothing
+# listing the lake or the bucket whole after the first minute, and keys many nodes add starting
+# with a random part. The numbers are logged: the JSON goes to the job log and to the artifact.
+#
+# Nightly on main, and by hand. The bucket and its keys are the cluster bench's secrets (R2_*). The
+# lakes go under limits/ in the bucket and are deleted after every run, whatever happened (R2's free
+# tier is 10 GB).
+on:
+  schedule:
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: limits-r2 # (one at a time: they share the bucket's limits/ folder)
+  cancel-in-progress: false
+
+permissions:
+  actions: read # (the build run's packages)
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+  AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
+  AWS_REGION: auto
+  AWS_DEFAULT_REGION: auto
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required # (R2 and newer AWS CLIs and boto3)
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  PONDRA_BUCKET: ${{ secrets.R2_BUCKET }}
+  PONDRA_TEST_PREFIX: limits/
+
+jobs:
+  check:
+    name: the bucket's limits on R2
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: boto3 (to delete the lakes)
+        run: pip install boto3
+      - name: This commit's Linux binary (the build workflow's)
+        run: |
+          bash tools/ci_artifact.sh linux-x64 "$SHA"
+          mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
+      - name: The checks
+        env:
+          PONDRA_BIN: ${{ github.workspace }}/bin/pondra
+        run: python tools/limits_check.py --real --minutes 10 --out limits-r2.json
+      - name: The numbers, in the job log
+        if: always()
+        run: |
+          cat limits-r2.json || echo "(no limits-r2.json: the run didn't reach its end)"
+      - name: The numbers, as an artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: limits-r2
+          path: limits-r2.json
+          if-no-files-found: ignore
+      - name: The lakes deleted, whatever happened
+        if: always()
+        run: aws s3 rm "s3://$PONDRA_BUCKET/limits/" --recursive --only-show-errors
+      - name: The nodes' logs, when a check failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: limits-r2-logs
+          path: /tmp/pondra-*.stderr
+          if-no-files-found: ignore

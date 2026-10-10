@@ -41,11 +41,18 @@ pub(crate) fn start(dir: &str) -> Result<(Child, String, String, std::path::Path
 
 /// Only ever this machine's own node, over plain HTTP: never through a proxy the environment names
 /// (it couldn't reach the node), and no CA certificates needed (minimal images have none).
+/// Ready, not only listening (`/ready`): on a lake whose last node was killed, the node follows that
+/// one until its mark is old (invariant 17), then leads; a statement sent meanwhile would be
+/// refused (57P03: it doesn't yet hold what the lake's leader had, invariant 197).
 pub(crate) async fn up(base: &str, node: &mut Child, log: &Path) -> Result<reqwest::Client> {
-    let (http, started) = (reqwest::Client::builder().no_proxy().tls_certs_only([]).build()?, Instant::now());
-    while http.get(format!("{base}/stats")).send().await.is_err() {
+    let (http, started, mut said) = (reqwest::Client::builder().no_proxy().tls_certs_only([]).build()?, Instant::now(), false);
+    while !http.get(format!("{base}/ready")).send().await.is_ok_and(|r| r.status().is_success()) {
         if node.try_wait()?.is_some() || started.elapsed() > Duration::from_secs(120) {
             bail!("the node didn't start: {}", std::fs::read_to_string(log).unwrap_or_default());
+        }
+        if !said && started.elapsed() > Duration::from_secs(2) && std::io::stderr().is_terminal() {
+            eprintln!("Waiting for the lake: a node of it stopped without handing it on, and is waited for (30 s at most)…");
+            said = true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

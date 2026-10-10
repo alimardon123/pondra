@@ -228,6 +228,7 @@ struct Lent {
     secrets: Vec<String>,
     session: Option<String>, // (its caller's temporary tables are its own too: `temp.rs`)
     vars: crate::vars::Lent, // (its run's variables and given values: `db.vars` is `$name`)
+    deploying: bool,         // (called by a deploy's statement: `protect::deploying`)
 }
 
 /// A table as the catalog names it (`t` for `public.t`, `s.t`; another lake's `l.s.t` stays).
@@ -243,12 +244,16 @@ static LENT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Stri
 pub fn lend(role: Role, files: bool) -> Lease {
     let token = format!("lease-{}", uuid::Uuid::new_v4().simple());
     let who = current().filter(|p| p.role >= role).unwrap_or_else(|| Principal::of(role));
-    LENT.lock().unwrap().insert(token.clone(), Lent { role, who, files, secrets: vec![], session: crate::temp::current(), vars: crate::vars::lend() });
+    let deploying = crate::protect::deploying(); // (a deploy's migration calling it: its calls back may change a project's objects, until the call ends)
+    LENT.lock().unwrap().insert(token.clone(), Lent { role, who, files, secrets: vec![], session: crate::temp::current(), vars: crate::vars::lend(), deploying });
     Lease(token)
 }
 
 /// What a lent token allows, while its procedure runs.
 pub fn lent(token: Option<&str>) -> Option<(Role, bool)> { LENT.lock().unwrap().get(token?).map(|l| (l.role, l.files)) }
+
+/// Whether a lent token's procedure runs inside a deploy (`protect::deploying`): its requests are the deploy's.
+pub fn lent_deploying(token: Option<&str>) -> bool { token.is_some_and(|t| LENT.lock().unwrap().get(t).is_some_and(|l| l.deploying)) }
 
 /// The session of the caller a lent token's procedure runs for.
 pub fn lent_session(token: Option<&str>) -> Option<String> { LENT.lock().unwrap().get(token?).and_then(|l| l.session.clone()) }

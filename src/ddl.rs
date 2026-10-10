@@ -44,6 +44,10 @@ pub fn attachment_key(n: &str) -> String { format!("a/{n}") }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Attachment {
     pub dir: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool, // (a lake on another server, read with a read-only key: ADR-058)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>, // (its server's URL, where its leader is asked for a pin)
 }
 
 /// A table's schema, and its name within it.
@@ -201,13 +205,14 @@ pub enum Ddl {
     CreateExternal { name: String, sql: String, replace: bool, if_not_exists: bool }, // DataFusion's CREATE EXTERNAL TABLE: a view of files (`ext::external`)
     CreateMaterialized { name: String, sql: String, options: std::collections::BTreeMap<String, String> }, // (`views::options`)
     DropView { name: String, if_exists: bool },
-    Attach { name: String, dir: String },
+    Attach { name: String, dir: String, #[serde(default, skip_serializing_if = "std::ops::Not::not")] read_only: bool, #[serde(default, skip_serializing_if = "Option::is_none")] endpoint: Option<String> }, // (READ_ONLY and ENDPOINT: a lake on another server, ADR-058)
     Detach { name: String, if_exists: bool },
     CreateDatabase { name: String, if_not_exists: bool, dir: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] clone: Option<crate::branch::CloneOf> }, // a new lake (beside this one unless `dir`), attached; a branch of another (ADR-047)
     Branch(crate::branch::Make),            // the new lake's leader: make it its base as that is now (ADR-047)
     Pin { lake: String, ms: Option<u64> },  // a base's leader: keep the files a branch reads
     Unpin { lake: String },
     Refresh { database: Option<String>, tables: Vec<String> }, // ALTER DATABASE b REFRESH t, …: b's leader (ADR-047)
+    Protect { database: String, on: bool, #[serde(default)] by: String }, // ALTER DATABASE b SET (protected = …): b's leader (ADR-058, `protect.rs`)
     Deploy { claim: bool, after: u64, record: Vec<u8> }, // a deploy's entry: its claim, its record, a migration done (`deploy::keep`, ADR-047 §4)
     DropDatabase { name: String, if_exists: bool }, // a folder of databases' (`dbserver.rs`): its node stopped, its folder deleted (ADR-030)
     AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
@@ -375,22 +380,33 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             Ok(j!({"view": name, "materialized": true}))
         }
         Ddl::DropView { name, if_exists } => drop_view(lake, &name, if_exists).await,
-        Ddl::Attach { name, dir } => {
+        Ddl::Attach { name, dir, read_only, endpoint } => {
             check(&name)?;
             ensure!(name != lake_name(lake), "this lake is called {name}: attach the other under another name");
             ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach the other under another name");
             ensure!(!crate::ext::is_attached(lake, &name).await?, "{name} is attached already, as another engine's tables");
+            ensure!(endpoint.is_none() || read_only, "ENDPOINT goes with READ_ONLY: a database on another server is read with its bucket's read-only key and asked through its leader's URL");
+            ensure!(endpoint.as_deref().is_none_or(|e| e.starts_with("http://") || e.starts_with("https://")), "ENDPOINT is its server's URL: https://…");
             if let Some(a) = lake.cat.get::<Attachment>(&attachment_key(&name)).await? {
-                ensure!(a.dir == full(&dir)?, "{name} is attached already, to {}", a.dir);
+                ensure!(a.dir == full(&dir)? && a.read_only == read_only && a.endpoint == endpoint, "{name} is attached already, to {}{}", a.dir, if a.read_only { " (READ_ONLY)" } else { "" });
                 return Ok(j!({"attached": name, "dir": a.dir, "unchanged": true}));
             }
             ensure!(!lake.attached.read().unwrap().iter().any(|(n, _)| *n == name), "{name} is attached already (--attach, or found beside this lake by the shell)");
             ensure!(full(&dir)? != lake.url, "{dir} is this lake");
-            let (dir, created) = lake_dir(&dir).await?;
-            lake.cat.commit(vec![(attachment_key(&name), json(&Attachment { dir: dir.clone() }))], &[]).await?;
-            Ok(match created {
-                true => j!({"attached": name, "dir": dir, "created": true}),
-                false => j!({"attached": name, "dir": dir}),
+            let (dir, created) = match read_only {
+                true => {
+                    let dir = full(&dir)?;
+                    crate::ext::reach(lake, &dir, true, endpoint.as_deref()).await?; // (its key and its server, before it is opened)
+                    ensure!(has_catalog(&dir).await?, "{dir} holds no lake: a READ_ONLY attachment reads one that is there");
+                    (dir, false)
+                }
+                false => lake_dir(&dir).await?,
+            };
+            lake.cat.commit(vec![(attachment_key(&name), json(&Attachment { dir: dir.clone(), read_only, endpoint }))], &[]).await?;
+            Ok(match (created, read_only) {
+                (true, _) => j!({"attached": name, "dir": dir, "created": true}),
+                (false, true) => j!({"attached": name, "dir": dir, "read_only": true}),
+                (false, false) => j!({"attached": name, "dir": dir}),
             })
         }
         Ddl::CreateDatabase { name, if_not_exists, dir, clone: Some(of) } => crate::branch::create(lake, &name, if_not_exists, dir, of).await,
@@ -398,6 +414,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Pin { lake: branch, ms } => crate::branch::pin(lake, &branch, ms).await,
         Ddl::Unpin { lake: branch } => crate::branch::unpin(lake, &branch).await,
         Ddl::Refresh { .. } => bail!("ALTER DATABASE … REFRESH is done by its database's leader (write::handle)"),
+        Ddl::Protect { database, on, by } => crate::protect::set(lake, &database, on, &by).await,
         Ddl::Deploy { claim, after, record } => crate::deploy::keep(lake, claim, after, &record).await,
         Ddl::CreateDatabase { name, if_not_exists, dir, clone: None } => {
             check(&name)?;
@@ -405,7 +422,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             if has_catalog(&full(&dir)?).await? {
                 ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name})");
             }
-            Box::pin(apply(lake, Ddl::Attach { name, dir })).await
+            Box::pin(apply(lake, Ddl::Attach { name, dir, read_only: false, endpoint: None })).await
         }
         Ddl::DropDatabase { name, if_exists } => {
             ensure!(name != lake_name(lake), "this is database {name}: drop it from another one");
@@ -644,6 +661,12 @@ pub async fn sync(lake: &Lake, me: &str, follow: bool) -> Result<()> {
         let name = &key[2..];
         if lake.attached.read().unwrap().iter().any(|(n, _)| n == name) {
             continue;
+        }
+        if a.read_only {
+            if let Err(e) = crate::ext::reach(lake, &a.dir, true, a.endpoint.as_deref()).await {
+                eprintln!("attaching {name} ({}): {e:#}", a.dir);
+                continue;
+            }
         }
         match attach(lake, name, &a.dir, me, follow, false).await {
             Ok(()) => FROM_SQL.lock().unwrap().push((lake.url.clone(), name.to_string())),

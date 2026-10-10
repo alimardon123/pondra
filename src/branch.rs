@@ -42,6 +42,10 @@ pub struct Base {
     pub ms: u64, // its pin: every file live then is kept
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>, // its key there: its pin renewed and let go with it (`keyed`, ADR-058)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>, // (a base on another server: its URL, where its leader is asked for pins)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool, // (a base on another server, read with a read-only key: ADR-058)
 }
 
 /// A base's promise to a branch: every file live at `ms` stays until this goes.
@@ -71,6 +75,8 @@ pub struct Make {
     #[serde(default)]
     pub schemas: Vec<String>,
     pub data: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<(String, crate::ext::Secret)>, // (the bucket keys its bases on other servers are read with: kept in its own catalog)
 }
 
 fn yes() -> bool { true }
@@ -115,10 +121,18 @@ pub fn rebase_file(f: &mut crate::store::DataFile, id: &str) {
     }
 }
 
-/// Lake::open: the bases a branch reads, so its paths resolve (`Lake::full`, `Lake::object`).
+/// Lake::open: the bases a branch reads, so its paths resolve (`Lake::full`, `Lake::object`). A base
+/// on another server is read with the bucket key its branch keeps (ADR-058).
 pub async fn load(lake: &Lake) -> Result<()> {
     if let Some(b) = lake.cat.get::<Bases>(BASES).await? {
+        let secrets = match b.lakes.values().any(|b| b.read_only) {
+            true => crate::ext::list(lake).await?,
+            false => vec![],
+        };
         for (id, base) in b.lakes {
+            if base.read_only {
+                crate::ext::reach_with(&secrets, &base.url, true, base.endpoint.as_deref())?;
+            }
             lake.add_base(&id, &base.url)?;
         }
     }
@@ -129,11 +143,12 @@ pub async fn load(lake: &Lake) -> Result<()> {
 pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<String>, of: CloneOf) -> Result<Value> {
     crate::ddl::check(name)?;
     let (base, inherited) = base(lake, &of.from).await?;
+    let away = crate::store::reach_of(&base); // (a base on another server: its key and its leader's URL, ADR-058)
     let dir = crate::ddl::full(&dir.unwrap_or_else(|| crate::ddl::beside(&lake.url, name)))?;
     ensure!(dir.contains("://") == base.contains("://"), "a branch lives where its base does: {base} is {}", if base.contains("://") { "in a bucket" } else { "a folder on this machine" });
     if crate::ddl::has_catalog(&dir).await? {
         ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name} CLONE {})", of.from);
-        return Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir })).await;
+        return Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None })).await;
     }
     // Pins first, then the branch's first commit, which reads its base at a version that holds
     // its pin: every file it lists is then kept.
@@ -141,21 +156,29 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
     let mut pinned = vec![];
     let made = async {
         let pinning = pin_in(lake, &base, &dir, None, None).await;
-        let (ms, _, key) = match base == lake.url {
+        let p = match base == lake.url {
             true => pinning?,
-            false => pinning.with_context(|| format!("pinning it in {}: a database that signs in on its own is cloned on its own node (CREATE DATABASE … CLONE … there), or by nodes that share its admin token", of.from))?,
+            false => pinning.with_context(|| match &away {
+                Some(r) => format!("pinning it in {}: its leader{} is asked with the TYPE pondra secret's token, whose user needs GRANT CLONE there", of.from, r.endpoint.as_ref().map(|e| format!(" at {e}")).unwrap_or_default()),
+                None => format!("pinning it in {}: a database that signs in on its own is cloned on its own node (CREATE DATABASE … CLONE … there), or by nodes that share its admin token", of.from),
+            })?,
         };
-        pinned.push((base.clone(), key.clone()));
+        pinned.push((base.clone(), p.key.clone()));
+        let schemas = schemas_taken(&of, p.schemas)?; // (refused here, after the pin: the error path lets it go)
         for (id, b) in inherited.lakes.iter() {
             // (the key their pins give this branch, not the one its base gave it)
-            let (_, _, key) = pin_in(lake, &b.url, &dir, Some(b.ms), None).await?;
+            let key = pin_in(lake, &b.url, &dir, Some(b.ms), None).await?.key;
             if let Some(e) = lakes.get_mut(id) {
                 e.key = key.clone();
             }
             pinned.push((b.url.clone(), key));
         }
-        lakes.insert(id_of(&base), Base { url: base.clone(), ms, key });
-        let make = Make { base: base.clone(), me: dir.clone(), lakes, schemas: of.schemas.clone(), data: of.data };
+        let (endpoint, read_only) = (away.as_ref().and_then(|r| r.endpoint.clone()), away.as_ref().is_some_and(|r| r.read_only));
+        lakes.insert(id_of(&base), Base { url: base.clone(), ms: p.ms, key: p.key, endpoint, read_only });
+        // (the bucket keys of the bases on other servers, which the branch reads with)
+        let urls: Vec<String> = lakes.values().filter(|b| b.read_only).map(|b| b.url.clone()).collect();
+        let secrets = crate::ext::lent(lake, &urls).await?;
+        let make = Make { base: base.clone(), me: dir.clone(), lakes, schemas, data: of.data, secrets };
         Box::pin(crate::write::send(&dir, Request::Ddl(Ddl::Branch(make)))).await
     }.await;
     let made = match made {
@@ -169,8 +192,26 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
             return Err(e.context(format!("cloning {}", of.from)));
         }
     };
-    let attached = Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir })).await?;
+    let attached = Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None })).await?;
     Ok(j!({"database": name, "cloned": of.from, "tables": made["tables"], "dir": attached["dir"]}))
+}
+
+/// The schemas a clone takes: the ones it names, within what its base's pin lets this caller clone (a
+/// user granted CLONE on some schemas only; none: all of them, and none named: the ones allowed).
+fn schemas_taken(of: &CloneOf, allowed: Option<Vec<String>>) -> Result<Vec<String>> {
+    let Some(allowed) = allowed else { return Ok(of.schemas.clone()) };
+    ensure!(!allowed.is_empty(), "{} lets this server clone no schema (GRANT CLONE ON SCHEMA … there)", of.from);
+    if of.schemas.is_empty() {
+        return Ok(allowed);
+    }
+    ensure!(of.schemas.iter().all(|s| allowed.contains(s)), "{} lets this server clone {} only (GRANT CLONE ON SCHEMA … there)", of.from, allowed.join(", "));
+    Ok(of.schemas.clone())
+}
+
+/// What a user granted CLONE may ask over `/cluster/ddl`: a pin of a branch, and nothing else (ADR-058).
+pub fn cloning(d: &Ddl) -> Result<()> {
+    ensure!(matches!(d, Ddl::Pin { .. }), "permission denied: CLONE pins a branch, and does nothing else");
+    Ok(())
 }
 
 /// The lake a clone is of (this one, or one attached here), and its own bases.
@@ -185,15 +226,28 @@ async fn base(lake: &Lake, from: &str) -> Result<(String, Bases)> {
     Ok((other.url.clone(), bases))
 }
 
+/// What a pin answers: its time, and when it was written (by that leader's clock), the key its pin
+/// gives the branch, and the schemas its user may clone (None: all of them).
+struct Pinned {
+    ms: u64,
+    at_ms: u64,
+    key: Option<String>,
+    schemas: Option<Vec<String>>,
+}
+
 /// Pin `branch` in the lake at `at`: here, or through its own leader (invariant 20), with `key` when
-/// it has one (a branch's renewal, `keyed`). Its time, when it was written (by that leader's clock),
-/// and the key its pin gives the branch.
-async fn pin_in(lake: &Lake, at: &str, branch: &str, ms: Option<u64>, key: Option<&str>) -> Result<(u64, u64, Option<String>)> {
+/// it has one (a branch's renewal, `keyed`).
+async fn pin_in(lake: &Lake, at: &str, branch: &str, ms: Option<u64>, key: Option<&str>) -> Result<Pinned> {
     let v = match at == lake.url {
         true => pin(lake, branch, ms).await?,
         false => Box::pin(crate::write::send_as(at, Request::Ddl(Ddl::Pin { lake: branch.into(), ms }), key)).await?,
     };
-    Ok((v["ms"].as_u64().context("a pin's time")?, v["at_ms"].as_u64().unwrap_or(0), v["key"].as_str().map(String::from)))
+    Ok(Pinned {
+        ms: v["ms"].as_u64().context("a pin's time")?,
+        at_ms: v["at_ms"].as_u64().unwrap_or(0),
+        key: v["key"].as_str().map(String::from),
+        schemas: v["schemas"].as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect()),
+    })
 }
 
 async fn unpin_in(lake: &Lake, at: &str, branch: &str, key: Option<&str>) -> Result<()> {
@@ -213,7 +267,12 @@ pub async fn pin(lake: &Lake, branch: &str, ms: Option<u64>) -> Result<Value> {
         ms = ms.min(p.ms);
     }
     lake.cat.commit(vec![(key, json(&Pin { lake: branch.into(), ms, at_ms: now }))], &[]).await?;
-    Ok(j!({"pinned": branch, "ms": ms, "at_ms": now, "key": key_for(lake, branch).await?}))
+    let mut out = j!({"pinned": branch, "ms": ms, "at_ms": now, "key": key_for(lake, branch).await?});
+    // (a user granted CLONE on some schemas only: the branch takes only those, and says so here)
+    if let Some(s) = crate::auth::limited().and_then(|a| a.clones()).filter(|s| !s.is_empty()) {
+        out["schemas"] = j!(s);
+    }
+    Ok(out)
 }
 
 pub async fn unpin(lake: &Lake, branch: &str) -> Result<Value> {
@@ -286,6 +345,9 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
         return Ok(j!({"branch": lake.url, "of": m.base, "unchanged": true})); // (asked again: done)
     }
     ensure!(lake.cat.scan_raw("t/", "t0").await?.is_empty(), "{} holds tables: a branch is made into a new database", lake.url);
+    for b in m.lakes.values().filter(|b| b.read_only) {
+        crate::ext::reach_with(&m.secrets, &b.url, true, b.endpoint.as_deref())?; // (its key and its leader, before it is read)
+    }
     let base = Lake::open(&m.base, false, false).await.with_context(|| format!("opening {}", m.base))?;
     let id = id_of(&m.base);
     let pin = pin_key(&m.me);
@@ -297,12 +359,16 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     // (a share and its recipients, and what they're described as, are the base's: a branch hands
     // nothing to another company)
     let deny = ["e/", "z/", "x/", "i/", "dt/", "jt/", "pn/", "fd/", "s/", "d/", "sh/", "sr/", "cm/share/", "cm/recipient/"];
-    let mut puts = vec![];
+    let mut puts: Vec<(String, Vec<u8>)> = m.secrets.iter().map(|(name, secret)| (crate::ext::secret_key(name), json(secret))).collect(); // (the base's own `e/` stays denied)
+    // (a base on another server: its users and grants sign in there; the branch is this server's,
+    // signed in to as this server's databases are: ADR-058)
+    let away = m.lakes.get(&id).is_some_and(|b| b.read_only);
     let (mut tables, mut tiered) = (0, end);
     for (k, v) in &snap {
         let (prefix, name) = k.split_once('/').map_or((k.as_str(), ""), |(p, n)| (p, n));
         match prefix {
             _ if deny.iter().any(|d| k.starts_with(d)) => {}
+            "u" if away => {}
             "c" | "n" | "b" | "m" | BASES | "format" | crate::store::QUIET => {}
             "t" if name.starts_with("pondra$") || !wanted(name) => {} // (the run log, audit, history: the branch's own)
             "t" => {
@@ -413,16 +479,22 @@ pub async fn release(lake: &Lake, bases: &Bases) {
 
 /// `pondra.databases`: this database and the ones attached here, with what each was branched from.
 pub async fn databases(lake: &Lake) -> Result<datafusion::arrow::record_batch::RecordBatch> {
-    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
+    use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray};
     use std::sync::Arc;
     let mut all = vec![(crate::ddl::lake_name(lake), lake.arc())];
     all.extend(lake.attached.read().unwrap().iter().cloned());
     let named = |url: &str| all.iter().find(|(_, l)| l.url == url).map_or(url.to_string(), |(n, _)| n.clone());
     let mut rows = vec![];
+    let mut lifts = vec![]; // (protected, lifted_at in µs, lifted_by), per row: a lifted protection shows until it is set again
     for (name, l) in &all {
         let b = l.cat.get::<Bases>(BASES).await.ok().flatten();
         let branches = l.cat.scan::<Pin>("pn/", "pn0").await.map(|p| p.len()).unwrap_or(0);
         rows.push((name.clone(), l.url.clone(), b.as_ref().map(|b| named(&b.base)), b.map(|b| b.at_ms as i64 * 1000), branches as i64));
+        lifts.push(match crate::protect::of(l).await.ok().flatten() {
+            Some(p) if p.protected => (true, None, None),
+            Some(p) => (false, Some(p.at_ms as i64 * 1000), Some(p.by)),
+            None => (false, None, None),
+        });
     }
     let s = |f: &dyn Fn(&(String, String, Option<String>, Option<i64>, i64)) -> Option<String>| Arc::new(rows.iter().map(f).collect::<StringArray>()) as ArrayRef;
     Ok(datafusion::arrow::record_batch::RecordBatch::try_from_iter(vec![
@@ -431,6 +503,9 @@ pub async fn databases(lake: &Lake) -> Result<datafusion::arrow::record_batch::R
         ("base", s(&|r| r.2.clone())),
         ("branched_at", Arc::new(rows.iter().map(|r| r.3).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),
         ("branches", Arc::new(rows.iter().map(|r| Some(r.4)).collect::<Int64Array>()) as ArrayRef),
+        ("protected", Arc::new(lifts.iter().map(|l| Some(l.0)).collect::<BooleanArray>()) as ArrayRef),
+        ("lifted_at", Arc::new(lifts.iter().map(|l| l.1).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),
+        ("lifted_by", Arc::new(lifts.iter().map(|l| l.2.clone()).collect::<StringArray>()) as ArrayRef),
     ])?)
 }
 
@@ -452,7 +527,7 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
     // A version of the base from after this statement: the pin written again (its time kept: the
     // files it lists now are newer) shows in it.
     let key = me.lakes.get(&id_of(&me.base)).and_then(|b| b.key.clone());
-    let (_, at, _) = pin_in(lake, &me.base, &me.me, None, key.as_deref()).await?;
+    let at = pin_in(lake, &me.base, &me.me, None, key.as_deref()).await?.at_ms;
     let base = Lake::open(&me.base, false, false).await.with_context(|| format!("opening {}", me.base))?;
     let snap = snapshot(&base, &pin_key(&me.me), at).await?;
     let number = |k: &str| snap.get(k).and_then(|v| serde_json::from_slice::<u64>(v).ok()).unwrap_or(0);

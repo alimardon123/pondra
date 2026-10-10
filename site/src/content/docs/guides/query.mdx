@@ -296,6 +296,13 @@ France). `pondra.learned` lists what the lake has learned so, each as last seen:
 SELECT object, about, expected, actual, runs FROM pondra.learned;
 ```
 
+The planner uses what was learned: the next time a query filters that table the same way, it counts
+the share the run measured instead of its estimate, so a join starts from the customers that are
+really few. Every node of a query spread over several plans with the facts the first node planned
+with. Now and then a query that uses them is planned without them once more, and timed: if it runs
+slower with them twice in a row, they are set aside for it. A query asked again with another comment
+is the same query. `PONDRA_LEARN=off` turns this off.
+
 ## Queries across several nodes
 
 With several nodes on one lake, a query over a big table runs on all of them: each node reads its share

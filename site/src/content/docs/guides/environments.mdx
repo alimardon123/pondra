@@ -286,9 +286,94 @@ pondra branch --drop
 - run: pondra branch pr-${{ github.event.number }} --drop
 ```
 
+### Production on a server of its own
+
+A company that keeps production apart runs it as its own server, with its own bucket, and dev as
+another. Dev's nodes never hold a key that writes production's bucket, yet a branch of production on
+dev still copies no data. Dev reads production's files with a key that only reads them, and asks
+production's leader to pin the tables it branches, with a token that may do nothing else.
+
+On production, an admin makes a user for dev's server and lets it clone what dev may see:
+
+```sql norun
+CREATE USER dev_server;
+GRANT CLONE ON SCHEMA sales TO dev_server;   -- or ON DATABASE prod: every schema
+CREATE TOKEN clone FOR USER dev_server;      -- answers the token, once
+```
+
+On dev, an admin keeps production's read-only bucket key and that token as secrets, and attaches
+production:
+
+```sql norun
+CREATE SECRET prod_ro (TYPE s3, KEY_ID '…', SECRET '…', REGION 'eu-west-1', SCOPE 's3://acme-prod/prod');
+CREATE SECRET prod_clone (TYPE pondra, TOKEN '…', SCOPE 'https://prod.acme.com');
+ATTACH 's3://acme-prod/prod' AS prod (READ_ONLY, ENDPOINT 'https://prod.acme.com');
+CREATE DATABASE ali CLONE prod;              -- in dev's bucket: sales only, no file copied
+```
+
+Nothing on dev writes or deletes under production's prefix, whatever dev's own key allows: a write
+to `prod` is refused by name. The branch keeps the read-only key in its own catalog, so it reads
+production on its own, and `ALTER DATABASE ali REFRESH` asks production's leader again with the
+branch's own key. A branch can't be made while production's leader is down; one made earlier can
+still be read. A clone takes only the schemas `dev_server`'s CLONE grant covers (`WITH (schemas = (…))` picks among them).
+
+In pondra.toml, `base` says where an environment's branches come from, so `pondra branch` makes them
+on dev's server, of production attached there:
+
+```toml
+[env.prod]
+url = "https://prod.acme.com"
+
+[env.dev]
+url = "https://dev.acme.com"
+base = "prod"                        # branches are made here, of prod attached as `prod`
+```
+
 An environment with `clone = "prod"` (a test database, say) is made again as a branch of prod before
 each deploy, so it is always production plus the new code. Five developers never share a branch:
 each has a Git branch and a database of its name, and they merge in Git.
 
-Not here yet: protected databases (changed only by a deploy) and a `DEPLOY` privilege, a
-materialized view rebuilt beside the old one and swapped in, and Python files in `objects/`.
+### Protected production
+
+On a protected database, a project's objects change only by a deploy. Its objects are what its last
+finished deploy left: tables, views, roles and grants. A change to one is refused by name, an admin
+included, unless a deploy makes it. Rows still change, and people still make, change and drop their
+own objects, in the project's schema too:
+
+```text
+permission denied: table sales.orders is project shop's, and prod is protected: change it in the project and deploy it (or an admin lifts the protection: ALTER DATABASE prod SET (protected = false))
+```
+
+A user granted DEPLOY can deploy the database without being an admin, so a CI account needs no admin
+token. DEPLOY is granted on the database alone, not on a schema or a table:
+
+```sql norun
+GRANT DEPLOY ON DATABASE prod TO ci;
+```
+
+The project says which environment is protected, and the first deploy to it protects the database
+once it has applied:
+
+```toml
+[env.prod]
+protected = true                     # its objects change only by a deploy, once one has applied
+```
+
+On a protected database a deploy needs DEPLOY or the node's own operator (its tokens and key). A
+superuser without DEPLOY is refused. Lifting the protection is an admin's statement, and it is
+audited. It shows in `pondra.databases` until the database is protected again:
+
+```sql norun
+ALTER DATABASE prod SET (protected = false);  -- an admin's: written to pondra.audit
+ALTER DATABASE prod SET (protected = true);   -- when the fix is in
+```
+
+```sql
+SELECT name, protected, lifted_at, lifted_by FROM pondra.databases;
+```
+
+A branch of a protected database isn't protected: `CREATE DATABASE dev CLONE prod` gives dev a
+database whose objects change as dev's own, and prod keeps its protection.
+
+Not here yet: a materialized view rebuilt beside the old one and swapped in, and Python files in
+`objects/`.
