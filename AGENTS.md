@@ -1717,6 +1717,36 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    runs again itself. A row view that looks across its source's rows (`ORDER BY`, `LIMIT`,
    `DISTINCT`, a window, a subquery over it: `rerun::across`) is never kept from each write's rows.
    `harness.py bykey`, `refreshed`.
+254. **A branch's key renews and releases its own pin, and opens nothing else** (`branch::key_for`,
+   `keyed`; the guard in `server.rs`). A base answers every pin with `pb_` plus an HMAC of the
+   branch's place under its session key, so a retry gets the same key and nothing is stored. The key
+   reaches `/cluster/ddl` only, as a principal with no role, and there only a renewal of the pin it
+   was made for while that pin exists, or its unpin. Every other path is 401.
+   `environments_check.py`: "a branch's key renews and lets go of its own pin, and opens nothing
+   else" and "…its unpin lets go, and then the key makes no new pin".
+255. **REFRESH brings only the schemas the clone took** (`Bases.schemas`, `branch::took`). A table
+   named outside them is refused by name; with nothing named, the branch's tables of other schemas,
+   and the base's views there, are left alone. `environments_check.py`: "…only the schemas the clone
+   took: one named outside them refused; none named, the branch's own table of another schema stays
+   its own".
+256. **A clone of another database is checked against its sign-in where the statement comes in**
+   (`branch::may`, in `write::on_node_listed`): `CREATE DATABASE … CLONE` of a database attached
+   here and `ALTER DATABASE … REFRESH` of another database ask `users::across` (invariant 240)
+   before anything is made, since the leader the statement goes to runs it as the node.
+   `environments_check.py`: "CLONE of a database next door that signs in on its own: refused
+   without its own rights, and saying where it is cloned".
+257. **A table's rows are written as Parquet can hold them, and read back as the table's type**
+   (`tier::storable`, every data file and a Parquet download): Parquet has no type for Arrow's
+   intervals of months, days and nanoseconds, so such a column (in a list or a struct too) is written
+   as its text, which every read casts back exactly (`hot::decode` and the scans cast a file's
+   columns to the table's types). Written as it was, a table with an `INTERVAL` column never left
+   the log, and its `DROP TABLE` failed (the 0.33.0 gates). `harness.py tiering`: "INTERVAL columns
+   tiered, merged and changed, read back exactly".
+258. **One table's tiering round failing stops no other table's** (`server::each`, in `tier_all`):
+   each table's fold, purge and maintenance is its own, and the round names every table that failed
+   once the rest are done. With one round for all, a table with an `INTERVAL` column stopped every
+   table of the lake from leaving the log. (No test makes a table's round fail now that 257 holds;
+   `harness.py tiering` runs the per-table path, its `spans` table beside the others.)
 
 ## Tests: run these before and after any change
 

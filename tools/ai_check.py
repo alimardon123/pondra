@@ -163,8 +163,15 @@ def ai_check(bin, work, port, vectors):
     close = lambda u, v: abs(u - v) <= 1e-9 * max(1.0, abs(v))
     checks["every vector function == numpy, under every name"] = all(close(r[f], want[name][r["id"]]) for name, fs in names.items() for f in [name, *fs] for r in got)
     one = q("SELECT cosine_similarity([1.0, 0.0], [1.0, 0.0]) AS s, l2_distance([1, 2], [1, 2]) AS d, dot_product(CAST(NULL AS FLOAT[]), [1.0]) AS n, "
-            "cosine_similarity([1.0, 2.0], [1.0]) AS m, cosine_similarity([1.0, NULL], [1.0, 2.0]) AS h, cosine_distance([0.0, 0.0], [1.0, 0.0]) AS z")[0]
-    checks["literals, NULLs, a NULL inside, lengths that differ"] = {k: one.get(k) for k in "sdnmhz"} == {"s": 1.0, "d": 0.0, "n": None, "m": None, "h": None, "z": 1.0}
+            "dot_product(CAST([] AS FLOAT[]), CAST([] AS FLOAT[])) AS e, cosine_similarity([1.0, NULL], [1.0, 2.0]) AS h, cosine_distance([0.0, 0.0], [1.0, 0.0]) AS z")[0]
+    checks["literals, NULLs, a NULL inside, empty vectors, a vector with no direction (cosine NULL)"] = {k: one.get(k) for k in "sdnehz"} == {"s": 1.0, "d": 0.0, "n": None, "e": 0.0, "h": None, "z": None}
+    def refused(s):
+        try:
+            q(s)
+            return ""
+        except Exception as e:
+            return str(e)
+    checks["lengths that differ: an error, as in DuckDB and pgvector (a NULL hid the bug)"] = all("vectors of 2 and 1 numbers" in refused(f"SELECT {f}([1.0, 2.0], [1.0])") for f in ["cosine_similarity", "l2_distance", "inner_product"])
     checks["a query's vector against the column (sorted by distance)"] = [r["id"] for r in q(f"SELECT id FROM vv ORDER BY cosine_distance(a, {list(map(float, a[5]))}) LIMIT 1")] == [5]
 
     # A frame's + joins text, as Polars' does (and still adds numbers).

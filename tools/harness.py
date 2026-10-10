@@ -843,13 +843,21 @@ def tiering():
     call(A.port, "POST", "/tables/events", json.dumps([["user", "Utf8"], ["amount", "Int64"]]).encode())
     call(A.port, "POST", "/tables/kv", json.dumps({"columns": [["id", "Int64"], ["v", "Int64"]], "key": ["id"]}).encode())
     call(A.port, "POST", "/views/totals", b"SELECT user, sum(amount) AS amount FROM events GROUP BY user")
+    # An INTERVAL column, which Parquet can't hold as it is (written as its text): its table
+    # tiers, merges and changes like any other, and stops no other table's tiering.
+    sql(A.port, "CREATE TABLE spans (k BIGINT, i INTERVAL, l INTERVAL[])")
     for r in range(1, rounds + 1):
         call(A.port, "POST", f"/append/events?producer=p&seq={r}", "".join(
             json.dumps({"user": f"u{i % 50}", "amount": 1}) + "\n" for i in range(per)).encode(), timeout=600)
         call(A.port, "POST", f"/append/kv?producer=k&seq={r}", "".join(
             json.dumps({"id": i, "v": r}) + "\n" for i in range(200)).encode())
+        sql(A.port, f"INSERT INTO spans VALUES ({r}, INTERVAL '{r} months -{r} days {r}.000000001 seconds', [INTERVAL '{r} hours', NULL])")
+        if r == 3:
+            sql(A.port, "UPDATE spans SET i = i + INTERVAL '1 day' WHERE k = 2")
         call(A.port, "POST", "/tier", timeout=600)
     untiered = call(A.port, "GET", "/stats")["untiered_rows"]
+    want = [{"k": r, "i": f"{r} mons {-r + (r == 2)} days {r}.000000001 secs", "l": [f"{r} hours", None]} for r in range(1, rounds + 1)]
+    spans = sql(A.port, "SELECT k, CAST(i AS VARCHAR) AS i, l FROM spans ORDER BY k") == want
     out = subprocess.run([BIN, "catalog", "--dir", lake, "t/"], capture_output=True, text=True).stdout
     files = {l.split(" ", 1)[0][2:]: len(json.loads(l.split(" ", 1)[1])["files"]) for l in out.splitlines()}
     got = {"events": sql(A.port, "SELECT count(*) AS n FROM events")[0]["n"],
@@ -871,12 +879,13 @@ def tiering():
     node.kill()
     classes = len(first) == 1 and first[0] in wide and len(wide) == 2
     ok = (got["events"] == rounds * per and got["totals"] == rounds * per
-          and got["kv"] == {"n": 200, "v": 200 * rounds} and untiered == 0 and max(files.values()) <= 8 and classes)
+          and got["kv"] == {"n": 200, "v": 200 * rounds} and untiered == 0 and max(files.values()) <= 8 and classes and spans)
     print(f"tiering: {rounds} rounds -> files {files}, untiered rows {untiered}, rows {got}; "
-          f"a merged file kept while eight more merge: {classes} ({len(first)} then {len(wide)} files) -> {'OK' if ok else 'FAIL'}")
+          f"a merged file kept while eight more merge: {classes} ({len(first)} then {len(wide)} files); "
+          f"INTERVAL columns tiered, merged and changed, read back exactly: {spans} -> {'OK' if ok else 'FAIL'}")
     if not ok:
         sys.exit(1)
-    return f"{rounds} rounds of writes and tiering: log drained, files bounded ({files}), every row exact; merges by size class"
+    return f"{rounds} rounds of writes and tiering: log drained, files bounded ({files}), every row exact (INTERVAL columns too); merges by size class"
 
 
 def tails():

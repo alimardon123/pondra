@@ -300,8 +300,8 @@ impl ScalarUDFImpl for Distance {
         }).collect::<Result<Vec<_>>>()?;
         let rows = if both { 1 } else { args.number_rows };
         let out = match sides[0].0.data_type() {
-            DataType::List(f) if f.data_type() == &DataType::Float32 => over::<Float32Type>(&sides, rows, self.metric),
-            _ => over::<Float64Type>(&sides, rows, self.metric),
+            DataType::List(f) if f.data_type() == &DataType::Float32 => over::<Float32Type>(self.name, &sides, rows, self.metric)?,
+            _ => over::<Float64Type>(self.name, &sides, rows, self.metric)?,
         };
         Ok(match both {
             true => ColumnarValue::Scalar(ScalarValue::try_from_array(&out, 0)?),
@@ -311,8 +311,10 @@ impl ScalarUDFImpl for Distance {
 }
 
 /// The metric for each row, straight from the lists' values (no copy of a vector); a side that is
-/// one vector for every row (a literal, a parameter) has its length worked out once.
-fn over<T: ArrowPrimitiveType>(sides: &[(ArrayRef, bool)], rows: usize, metric: Metric) -> Float64Array
+/// one vector for every row (a literal, a parameter) has its length worked out once. Vectors of
+/// two lengths are an error, as in DuckDB, pgvector and DataFusion: a NULL would hide the bug. A
+/// cosine of a vector with no length is NULL (it has no direction).
+fn over<T: ArrowPrimitiveType>(name: &str, sides: &[(ArrayRef, bool)], rows: usize, metric: Metric) -> Result<Float64Array>
 where
     T::Native: Into<f64>,
 {
@@ -333,24 +335,23 @@ where
             out.append_null();
             continue;
         };
-        if x.len() != y.len() || x.is_empty() {
-            out.append_null();
-            continue;
+        if x.len() != y.len() {
+            return exec_err!("{name}: vectors of {} and {} numbers", x.len(), y.len());
         }
         let cosine = || {
             match once[0].unwrap_or_else(|| norm(x)) * once[1].unwrap_or_else(|| norm(y)) {
-                0.0 => 0.0,
-                n => sum(x, y, |a, b| a * b) / n,
+                0.0 => None,
+                n => Some(sum(x, y, |a, b| a * b) / n),
             }
         };
-        out.append_value(match metric {
-            Metric::Dot => sum(x, y, |a, b| a * b),
-            Metric::L2 => sum(x, y, |a, b| (a - b) * (a - b)).sqrt(),
+        out.append_option(match metric {
+            Metric::Dot => Some(sum(x, y, |a, b| a * b)),
+            Metric::L2 => Some(sum(x, y, |a, b| (a - b) * (a - b)).sqrt()),
             Metric::Cosine => cosine(),
-            Metric::CosineDistance => 1.0 - cosine(),
+            Metric::CosineDistance => cosine().map(|c| 1.0 - c),
         });
     }
-    out.finish()
+    Ok(out.finish())
 }
 
 /// Σ f(x[i], y[i]) in doubles, over eight running sums so the compiler can use the CPU's vector
