@@ -1567,22 +1567,26 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    before them rewrote a streamed table every minute or so, and every query read it cold from
    Parquet until the hot columns had it again. `harness.py tiering`: "a merged file kept while eight
    more merge".
-231. **A request's queries run on a runtime of their own once another is running** (`panics::work`,
+231. **A request's queries run on a runtime of their own once another has run a while** (`panics::work`,
    `server::queries`: `/sql`, `/mcp`, `/live`, pages, bulk inserts, a spread query's stages and
    shares, tiering jobs; every Postgres statement): appends, commits, heartbeats and the commit
    stream keep the node's runtime, and the OS shares the cores between the two. On one runtime a
    woken append ran after every query task ahead of it (beside 400 dashboard clients a writer landed
-   2,860 rows a second of 22,000; now 20,000, acks 5 ms). The first request runs where it came in:
-   on this VM the hop between runtimes cost 0.9 ms a statement (a parked thread woken each way),
-   which halved pgbench. Dropped, as when its client goes, the moved work stops. A new door or a
-   route whose work is a query's goes through `work` too. `harness.py pace`: a writer's acks beside
-   64 querying clients (449 ms on one runtime against 5 ms alone; 7 ms now).
+   2,860 rows a second of 22,000; now 20,000, acks 5 ms). A request runs where it came in while no
+   other running one is `panics::LONG` (10 ms) old: on this VM the hop between runtimes cost 0.9 ms
+   a statement (a parked thread woken each way), which halved pgbench's one client and, hopping
+   whenever another was running, took a sixth of its four clients' transactions (0.33.0's gates).
+   Dropped, as when its client goes, the moved work stops. A new door or a route whose work is a
+   query's goes through `work` too. `harness.py pace`: a writer's acks beside 64 querying clients
+   (449 ms on one runtime against 5 ms alone; 8 ms now).
 232. **A door boxes a statement's future before wrapping it** (`server::sql`: `sql_as`; `pg::told`
    and `caught`): a statement's future is hundreds of KB, and every layer around it (scopes,
    `door`, `work`) copied it whole on each statement. Boxed, a point lookup takes 0.16 ms over
    Postgres (0.35 before) and 0.19 ms over HTTP (0.31), and pgbench's one client 210 transactions a
-   second (150). No test fails without it: `tools/bench/pgbench.py` and single-client point lookups
-   show it.
+   second (150). A statement is read by `write::parse` several times on its way, so the registry's
+   readers there (shares, users, sequences, …) run only for a statement whose first word could
+   start their kinds: each tokenized the whole text again. No test fails without either:
+   `tools/bench/pgbench.py` and single-client point lookups show them.
 233. **A file a commit replaced leaves the hot columns when the node sees that commit**
    (`Lake::arrived` → `Hot::forget`, over the table's `garbage`, its path and its `path#…` keys):
    no query plans it again, and one that already has holds its own batches. Kept until the budget

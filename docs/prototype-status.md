@@ -26,7 +26,11 @@ killed): 43,138 batches each once, 0 torn reads of 423,085; a node's memory grew
 under steady writes, which round 35 takes. The gates found three bugs before the tag, all fixed: a
 `WITH RECURSIVE` whose friendly probe asked itself until the node died; a table with an `INTERVAL`
 column that never left the log and held every other table's tiering with it (invariants 257–258);
-and `EXPLAIN (ANALYZE, FORMAT PGJSON)` refused. Gates: `logs/gates/README.md`, 2026-10-10. What a user
+and `EXPLAIN (ANALYZE, FORMAT PGJSON)` refused. They also found pgbench a sixth slower at four clients
+than 0.32.0's, measured side by side: every statement was read again by each kind of the registry, and
+went to the queries' runtime whenever another was running. Both fixed (invariants 231, 232): 186–204
+and 160–167 transactions a second against 0.32.0's 187–210 and 165–175, and a writer's acks beside 64
+querying clients still 8 ms. Gates: `logs/gates/README.md`, 2026-10-10. What a user
 sees is in `.github/release.md`; each change's checks in its pull request.
 
 **Begun (2026-10-03, round 34): SQL as people write it.** DuckDB's spellings, rewritten where SQL
