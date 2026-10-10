@@ -1514,8 +1514,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    its own, as the caller, under the `WITH`s around it: one pass asks, the next takes the answers
    in the same order, so every node of a spread query gets the same text. A lambda stays `x -> …`
    in the text (the generic dialect reads it as JSON's arrow) and becomes one where a query is
-   planned (`query::sql`, at every planning site). `harness.py friendly`: 30 forms == DuckDB's
-   answers, spread == one node, over Postgres, in a view and a materialized view.
+   planned (`query::sql`, at every planning site). A probe made inside a CTE is planned over the
+   CTEs before it only, and a recursive one's first term as itself (`Friendly::over`): with its own
+   definition in it, the probe asked itself again until the stack overflowed and the node died (a
+   plain `WITH RECURSIVE`, found by the 0.33.0 gates); asks inside asks stop 8 deep (`ASKING`).
+   `harness.py friendly`: 34 forms == DuckDB's answers (`WITH RECURSIVE` and CTEs among them),
+   spread == one node, over Postgres, in a view and a materialized view.
 226. **What DataFusion answers wrong is mended where it goes wrong, and the query that showed it
    stays a check** (`tools/random_sql.py`, D2): an IN list that isn't all values (a column, a NULL,
    an expression) is ORs before DataFusion's simplifier sees it (`optimize::InListOfRows`, the

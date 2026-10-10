@@ -1,0 +1,1 @@
+{"scale": 1, "runs": [{"clients": 1, "tps": 181.772843, "latency_ms": 5.501, "transactions": 2727.0, "failed": 0.0, "retried": 0.0, "error": null}, {"clients": 4, "tps": 142.241933, "latency_ms": 28.121, "transactions": 2144.0, "failed": 0.0, "retried": 625.0, "error": null}], "balances": {"a": 139723, "t": 139723, "b": 139723, "h": 139723, "n": 4871}, "balances_right": true}
