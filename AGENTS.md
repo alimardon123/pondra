@@ -1784,13 +1784,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    measured counts as the share of the table's rows it kept (`optimize::size`; `learned::found` takes
    shares of the whole table as the planner counts it, never of a scan its files' ranges pruned), and
    a join order whose every input is so counted needs only 1.2× to be taken. Each node's copy is read
-   from the history's newer rows at most every 10 s, and only while queries are planned. A query whose
-   runs with facts were a quarter slower than without, twice in a row, has them set aside
-   (`learned::ran`). `PONDRA_LEARN=off`: a node plans with none of its own, but a slice's still. A
-   plan made anywhere else (a view, a write's query) uses none. `harness.py learn`: the order starts
-   from the filtered customers once learned, same answer, no slower; three nodes plan with the
-   coordinator's facts (a node with `PONDRA_LEARN=off` among them, fails without `Slice::learned`);
-   read back after a restart.
+   from the history's newer rows at most every 10 s, and only while queries are planned. Facts are held
+   to a bar measured on the same node, as warm (`learned::ran`): the run after a query's 1st, 2nd, 4th,
+   8th… with them is planned without them, and runs with them a tenth slower than the best of those,
+   twice in a row, have them set aside. A query is known by its words (`key`: comments and spacing
+   left out, so a benchmark's numbered comment doesn't make each run a stranger; `EXPLAIN` of it is
+   it and records nothing): a bar measured cold, or by text alone, never held a run to anything.
+   `PONDRA_LEARN=off`: a node plans with none of its own, but a slice's still. A plan made anywhere
+   else (a view, a write's query) uses none. `harness.py learn`: the order starts from the filtered
+   customers once learned, on another node too (read from the history); same answer, no slower than an
+   equal node without; the bar run's plan among its runs; three nodes plan with the coordinator's
+   facts (a node with `PONDRA_LEARN=off` among them, fails without `Slice::learned`); read back after a
+   restart.
 
 ## Tests: run these before and after any change
 
@@ -1818,6 +1823,7 @@ python3 tools/harness.py tails          # a table's log tail kept between querie
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
 python3 tools/harness.py plans          # EXPLAIN's expected rows, history's fingerprint, plan_id, version, reads, writes, misestimate; what a run learned and pondra.learned
+python3 tools/harness.py learn          # the planner uses what runs learned: the join order from a measured filter, on another node too; no slower; the bar; three nodes alike; a restart
 python3 tools/harness.py finishes       # GROUP BY views with avg, stddev, HAVING, ORDER BY/LIMIT == ad hoc: changes, EMIT FINAL, a restart, three nodes
 python3 tools/harness.py bykey          # views kept by key (median, count(DISTINCT), string_agg) == ad hoc: changes, flows, a restart, three nodes
 python3 tools/harness.py refreshed      # views run whole (ORDER BY … LIMIT, windows, joins, now() with a lag) == ad hoc: changes, flows, a restart, three nodes
