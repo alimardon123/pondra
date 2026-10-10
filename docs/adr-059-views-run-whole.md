@@ -1,4 +1,4 @@
-# ADR-057: Views run whole again
+# ADR-059: Views run whole again
 
 **Date:** 2026-10-04 · **Status:** proposed, built on the recommended answer to the open card
 "Keep every materialized view current: incremental, by key, or refreshed?" (All three ways) ·

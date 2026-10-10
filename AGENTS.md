@@ -87,7 +87,9 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           environments (ADR-047): branch.rs (`CREATE DATABASE dev CLONE prod`, REFRESH: invariant
           245), deploy.rs (plan, deploy, test and export: a project made true in a database;
           `pondra.deploys`: invariants 246–250), project.rs (the command line's project commands) and
-          sync.rs (`pondra workspace pull | push`)
+          sync.rs (`pondra workspace pull | push`); views kept current (ADR-055, ADR-056, ADR-059):
+          finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
+          view that runs its query again, by key or whole: invariant 253)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -1681,6 +1683,24 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`views::merges`: DataFusion groups a merge table read with partial rows by the columns its key
    determines too). `harness.py flows`: "a rollup by all of a GROUP BY view's keys, made while rows
    stream in".
+252. **A grouped view that needs a last step keeps partial rows and is finished as it is read**
+   (`finish.rs`, ADR-055): its table holds the partial query's rows (`__count`, `__sum_i`,
+   `__count_i`, `__min_i`, `__max_i`, `__moments_i`); `TableMeta::finish` is applied in
+   `query::table_view`'s merge branch only, so every reader (a session, a spread query's whole
+   tables, `EMIT FINAL`'s emission) sees finished answers. A variance's moments are a count and the
+   values' sum and sum of squares from a shift: parts add up in any order, a take-back negates the
+   count and both sums, and a part whose count is 0 (an `UPDATE`'s) still holds its change. Listings
+   describe it by `Finish::columns` (`TableMeta::described`). `harness.py finishes`.
+253. **A view that runs its query again commits its rows and its progress together, and only what
+   changed** (`rerun.rs`, ADR-056, ADR-059): the leader runs it after commits (`rerun::run_all`),
+   from `done` (the `rerun:{view}` producer's seq) to a commit number of its own (`now`); by key,
+   only the groups whose rows moved in (done, now], else the whole query; the rows that came out
+   different go in, the old ones to `{view}$deleted`, with `prev = done`, so a run that lost a race
+   writes nothing. Its log is held until every table it follows has been read past it
+   (`rerun::follows` in `tier::expire`). Nothing follows it inline: a view of it takes rows back or
+   runs again itself. A row view that looks across its source's rows (`ORDER BY`, `LIMIT`,
+   `DISTINCT`, a window, a subquery over it: `rerun::across`) is never kept from each write's rows.
+   `harness.py bykey`, `refreshed`.
 
 ## Tests: run these before and after any change
 
@@ -1708,6 +1728,9 @@ python3 tools/harness.py tails          # a table's log tail kept between querie
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
 python3 tools/harness.py plans          # EXPLAIN's expected rows, history's fingerprint, plan_id, version, reads, writes, misestimate; what a run learned and pondra.learned
+python3 tools/harness.py finishes       # GROUP BY views with avg, stddev, HAVING, ORDER BY/LIMIT == ad hoc: changes, EMIT FINAL, a restart, three nodes
+python3 tools/harness.py bykey          # views kept by key (median, count(DISTINCT), string_agg) == ad hoc: changes, flows, a restart, three nodes
+python3 tools/harness.py refreshed      # views run whole (ORDER BY … LIMIT, windows, joins, now() with a lag) == ad hoc: changes, flows, a restart, three nodes
 python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
 python3 tools/harness.py sequences      # nextval on three nodes (every value once), identity columns from every door, ALWAYS, owned sequences, a leader's kill
 python3 tools/harness.py enums          # CREATE TYPE … AS ENUM and ENUM('a', 'b') columns: labels from every door (22P02), casts, enum_range, ADD VALUE, RENAME, DROP while used

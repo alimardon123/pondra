@@ -1938,7 +1938,7 @@ def finishes():
                                                "GROUP BY 1 ORDER BY a LIMIT 2 EMIT FINAL")),
         "rename": _raises_text(lambda: q("ALTER TABLE stats RENAME COLUMN mean TO average")),
     }
-    # (a view of one runs its query whole again, ADR-057: what it reads is worked out as it is read)
+    # (a view of one runs its query whole again, ADR-059: what it reads is worked out as it is read)
     q("CREATE MATERIALIZED VIEW m3 AS SELECT region, count(*) AS n FROM stats GROUP BY region")
     of_it = q("SELECT region, n FROM m3 ORDER BY region NULLS FIRST") == q("SELECT region, count(*) AS n FROM stats GROUP BY region ORDER BY region NULLS FIRST") \
         and q("SELECT refresh FROM pondra.flows WHERE name = 'm3'") == [{"refresh": "full"}]
@@ -2083,7 +2083,7 @@ def full_on_three():
 
 
 def refreshed():
-    """Materialized views run whole again (ADR-057): ORDER BY … LIMIT, a window, DISTINCT, a
+    """Materialized views run whole again (ADR-059): ORDER BY … LIMIT, a window, DISTINCT, a
     subquery over its own table, a join with a median, a global aggregate and a keyed table's
     median, chosen because the rows can't keep them. Each == its query run ad hoc right after CREATE,
     after bulk and log INSERTs, UPDATEs and DELETEs (of the joined table too), a restart and on three
@@ -2489,7 +2489,7 @@ def schemas():
     got = until(lambda: q("SELECT k, n, s FROM dbo.per_k ORDER BY k"), want, 30)
     checks["CREATE MATERIALIZED VIEW: the rows already there and those written after; WITH (window …) emits to _final; bad options refused"] = got == want and len(want) == 3 \
         and n("per_min_final") == 0 and err("CREATE MATERIALIZED VIEW m2 WITH (windw = 'w') AS SELECT k FROM t") is not None
-    # a view of a view (a flow, ADR-036): of a GROUP BY view's partial rows a rollup, or run whole (ADR-057); of a _final, as of a table
+    # a view of a view (a flow, ADR-036): of a GROUP BY view's partial rows a rollup, or run whole (ADR-059); of a _final, as of a table
     over = [err("CREATE MATERIALIZED VIEW m3 AS SELECT k FROM dbo.per_k"), err("CREATE MATERIALIZED VIEW m4 AS SELECT w FROM per_min_final")]
     checks["a materialized view of a GROUP BY view that isn't a rollup runs whole; of a _final, made"] = over == [None, None] \
         and q("SELECT k FROM m3 ORDER BY k") == q("SELECT k FROM dbo.per_k ORDER BY k") and q("SELECT refresh FROM pondra.flows WHERE name = 'm3'") == [{"refresh": "full"}]
@@ -6983,7 +6983,7 @@ def flows():
     checks = {}
     refused = err("INSERT INTO orders VALUES (1, 'r0', 'u1', 500000, 'paid'), (2, 'r0', 'u1', 5, 'paid')", ports[1])
     checks["a row a FAIL expectation refuses fails its INSERT, naming it"] = bool(refused) and 'violates check constraint "small"' in refused
-    # (what a GROUP BY view's partial rows can't keep as they come runs its query again, ADR-057)
+    # (what a GROUP BY view's partial rows can't keep as they come runs its query again, ADR-059)
     whole = {
         "rich": ("SELECT * FROM gold WHERE total > 100", "region, buyer NULLS FIRST"),
         "buyers": ("SELECT region, count(*) AS n FROM gold GROUP BY region", "region"),

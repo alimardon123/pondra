@@ -228,7 +228,7 @@ pub struct Options {
     /// What `once::create` found: the view keeps its groups in `{v}$open` and each once in `v`.
     pub keep: Option<Once>,
     /// `refresh = 'incremental' | 'by key' | 'full'`: the way it is kept current, asked for
-    /// (ADR-056, ADR-057).
+    /// (ADR-056, ADR-059).
     pub refresh: Option<Refresh>,
     /// `lag = '1 minute'`: a view that runs its query again runs at most once a lag.
     pub lag_secs: Option<u64>,
@@ -465,7 +465,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     let typed = |p: &LogicalPlan| -> Vec<(String, String)> { p.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect() };
     let shown = typed(&plan); // (the view's columns, as it is read)
     let written = sql;
-    // Its query run again (ADR-056, ADR-057) when asked, or when the rows alone can't keep it: by
+    // Its query run again (ADR-056, ADR-059) when asked, or when the rows alone can't keep it: by
     // key when it can be (`median`, …), else whole (`ORDER BY … LIMIT`, a window, `now()`, …).
     let plain = emit.is_none() && keep.is_none() && history.is_none() && expect.is_empty();
     let rerun = |how: crate::rerun::How, why: Option<String>| crate::rerun::create(lake, name, written, &source, &src, upstream.as_ref(), &plan, how, why, lag_secs);

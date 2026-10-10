@@ -1,4 +1,4 @@
-//! Materialized views kept current by running their query again (ADR-056, ADR-057): what the
+//! Materialized views kept current by running their query again (ADR-056, ADR-059): what the
 //! rows alone can't keep.
 //!
 //! **By key**: a `GROUP BY` whose answers can't be added up as rows arrive (`median`, percentiles,
