@@ -18,6 +18,7 @@ mod guard;
 mod hilbert;
 mod history;
 mod ddl;
+mod deploy;
 mod defaults;
 mod delta;
 mod ext;
@@ -29,8 +30,12 @@ mod flight;
 mod fresh;
 mod fsum;
 mod hot;
+mod index;
+mod types;
+mod constraints;
 mod intervals;
 mod layout;
+mod learned;
 mod iceberg;
 mod inbox;
 mod kafka;
@@ -60,6 +65,7 @@ mod txn;
 mod mcp;
 mod pg;
 mod pg_catalog;
+mod project;
 mod query;
 mod read_delta;
 mod read_iceberg;
@@ -73,12 +79,14 @@ mod replica;
 mod routines;
 mod scan;
 mod script;
+mod seq;
 mod server;
 mod service;
 mod spill;
 mod sparksql;
 mod spmd;
 mod store;
+mod sync;
 mod sys;
 mod tasks;
 mod temp;
@@ -264,6 +272,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: service::Command,
     },
+    /// The lake's files kept in a folder of your own, for git and your editor: `pondra workspace
+    /// pull ./ws` writes them there, `pondra workspace push ./ws` sends back what changed. A file
+    /// changed on both sides is listed and left as it is.
+    Workspace {
+        #[command(subcommand)]
+        cmd: sync::Command,
+    },
+    #[command(flatten)]
+    Project(project::Command),
     /// Print catalog entries whose keys start with `prefix` (t/ tables, s/ segments, p/ producers…).
     Catalog {
         #[arg(long, visible_alias = "lake")]
@@ -281,6 +298,13 @@ enum Cmd {
         #[arg(long)]
         attach: Vec<String>,
         query: String,
+    },
+    /// Lead a lake for a moment: make it if nothing is there yet, answer what waits in its inbox,
+    /// let go. A node runs it for a lake nobody leads (`inbox::lead_once`, invariant 62).
+    #[command(hide = true)]
+    Lead {
+        #[arg(long)]
+        dir: String,
     },
     /// Run a SQL file — its statements in order, `$name` taking the value of `--name` — on a node
     /// of the lake started for it (`pondra run load.sql lake --day 2026-09-27`), or on a node
@@ -540,13 +564,12 @@ async fn run() -> anyhow::Result<()> {
             tr("followers' changes recovered");
             let max_backlog = (tier_secs > 0.0).then_some(backlog); // rows waiting to be tiered
             let seq = if leader { Some(log::Sequencer::start(lake.clone(), max_backlog).await?) } else { None };
-            let log = (!reader).then(|| {
-                let to = match &seq {
-                    Some(s) => log::To::Local(s.clone()),
-                    None => log::To::Leader(cluster.leader.addr.clone()),
-                };
-                Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to))
-            });
+            let to = match &seq {
+                Some(s) => log::To::Local(s.clone()),
+                None => log::To::Leader(cluster.leader.addr.clone()),
+            };
+            let _ = lake.to.set(to.clone()); // (a follower's sequences' values: the leader's sequencer)
+            let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to)));
             tr("the sequencer");
             python::init(python);
             let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
@@ -613,13 +636,14 @@ async fn run() -> anyhow::Result<()> {
                 inbox::serve(lake.clone(), seq.clone(), app.lock.clone()); // writers that can't reach us
             }
             if leader {
-                // The leader's SSD tier learns of objects other nodes wrote from its own commits.
+                // The leader's SSD tier learns of objects other nodes wrote from its own commits (and its hot
+                // columns of the files they replaced).
                 let l = lake.clone();
                 panics::spawn(async move {
                     let (_, mut commits) = l.cat.subscribe();
                     loop {
                         match commits.recv().await {
-                            Ok(store::Frame::Change(d)) => l.prefetch(&d),
+                            Ok(store::Frame::Change(d)) => l.arrived(&d),
                             Ok(_) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue, // (just fewer prefetches)
                             Err(_) => break,
@@ -720,6 +744,8 @@ async fn run() -> anyhow::Result<()> {
             print!("{}", shell::script(lake.as_deref().unwrap_or("lake"), url.as_deref(), token.as_deref(), body).await?);
         }
         Cmd::Service { cmd } => service::command(cmd).await?,
+        Cmd::Workspace { cmd } => sync::command(cmd).await?,
+        Cmd::Project(cmd) => project::command(cmd).await?,
         Cmd::Catalog { dir, prefix } => {
             let lake = store::Lake::open(&dir, false, false).await?;
             match prefix.starts_with("d/") {
@@ -731,6 +757,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Lead { dir } => write::lead_only(&dir).await?,
         Cmd::Sql { dir, query, attach: attached } if write::checkpoint(&query) => {
             // (the leader's work; with nobody leading, the next node to start tiers the log)
             let store = store::open_store(&dir)?.1;

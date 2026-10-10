@@ -22,9 +22,14 @@ lambdas, `({…}).a`, `max_by`/`arg_max`/`min_by`/`arg_min`, `list()`, `string_s
 `json_extract`, DuckDB's `ASOF [LEFT] JOIN … ON`, a select's alias in its `WHERE`, `SUMMARIZE`,
 `USING SAMPLE`, and a `TABLESAMPLE` that samples (DataFusion ignored it and returned every row).
 `harness.py friendly`: 30 forms answer as DuckDB 1.5.5 does over the same 2,000 rows, and the same
-spread over three nodes, over Postgres and in views. 69 of the 73 everyday features probed on
-2026-10-03 now work; the four left (`CREATE TYPE … AS ENUM`, `CREATE SEQUENCE`, `CREATE INDEX`,
-`COMMENT ON`) wait on the SQL registry's decision.
+spread over three nodes, over Postgres and in views. 70 of the 73 everyday features probed on
+2026-10-03 now work (`COMMENT ON` came with the statement registry, invariant 227). On the
+registry since: sequences and identity columns (`harness.py sequences`: three nodes taking values at
+once, a leader killed, every value once), `CREATE INDEX` kept as an object (nothing built), and
+`UNIQUE` checked by the leader for every SQL write (`harness.py constraints`: three nodes inserting
+the same 40 values at once, 40 go in, 80 refused with 23505), with `NOT ENFORCED` keys kept as
+facts; and enum types, `CREATE TYPE … AS ENUM` and `ENUM('a', 'b')` columns, held as text with their
+labels checked at every door (`harness.py enums`: 8 of 8).
 
 **100,000 random queries** (`tools/random_sql.py --seed 3434`, D2): each against DuckDB 1.5.5 on
 one node, every tenth spread over three, 42,826 split three ways by a condition. The first run
@@ -38,6 +43,43 @@ one node's; the 26 left are refusals DataFusion makes and DuckDB doesn't (`NULL 
 Postgres, and two decimal types too wide) (`logs/round34/random-100k.json`). **TPC-DS on three
 nodes**: 99 of 99 the same as one node, all spread (q66 and q75 had fallen back over an
 aggregate's `ordering_mode`: invariant 34).
+
+**Big writes on every node** (invariant 228): an `INSERT … SELECT` or `CREATE TABLE AS` whose rows
+split as they are is written by every node from its own share, recorded in one commit, row ids
+unique, a retried job writing nothing. Three nodes sharing one 4-core box: a copy of TPC-H SF1's
+lineitem (6,001,215 rows) 5.9 s on one node, 3.6 s on three; a filtered copy (3,426,687 rows) 2.8 s
+against 1.5 s (`logs/round34/insert-spread.json`). Building it found two read bugs on spread
+queries, both fixed: a query naming `_row_id` fell back to one node, and a history view (SCD type
+2) spread over the nodes counted its deleted versions (98,970 rows read as 100,000), since round
+33.
+
+**Dashboards while writes land** (`serve_bench.py --users`, invariants 229–230): five dashboard
+statements from Go clients against one node on 4 cores, while an append table takes 1,000 rows and a
+keyed one 100 upserts every 50 ms. Each query had conformed every log segment again and run a batch
+a segment, a streamed table's merges rewrote it every minute or so (sending reads back to cold
+Parquet), and each scan planned a small query of its own. Now a table's log tail is kept between
+queries and extended by new segments, small files merge with files of their size, and a table that
+never changed is planned straight from its tail and files. Queries a second: 760 → 870 at 50
+clients, 826 → 956 at 100, 749 → 934 at 200, 751 → 861 at 400; p99 at 200 clients 1.54 → 0.83 s
+(`logs/round34/users.json`). TPC-H and TPC-DS from files and from memory are no slower. What it also
+showed: the writer, a request at a time, landed 9,770 rows a second beside 50 readers and 2,860
+beside 400, its acks waiting behind the queries' tasks on the one runtime. Now a request's queries
+run on a runtime of their own once another is running (invariant 231), and a door boxes a
+statement's future before wrapping it (232): the writer lands 19,800–19,900 rows a second at every
+count of readers, acks 5–6 ms at p50 (80–240 ms before), and the readers keep 760–860 queries a
+second (`logs/round34/users-writes.json`). A point lookup takes 0.16 ms over Postgres (0.35) and
+0.19 ms over HTTP (0.31); pgbench's one client 210 transactions a second (150).
+
+**ClickHouse beside DuckDB** (`singlenode.py`, ClickHouse 26.9.9.28 as `clickhouse local`, 4 cores,
+best of three; `logs/round34/singlenode-*-clickhouse.json`). TPC-H SF1: DuckDB 1.5.5's tables
+0.97 s, Pondra from memory 1.20 s, DuckDB over Parquet 2.02 s, Pondra from files 2.17 s, ClickHouse's
+MergeTree tables 2.56 s, ClickHouse over Parquet 4.98 s. ClickBench's first 10 million rows:
+ClickHouse's MergeTree 4.63 s, DuckDB's tables 6.69 s, Pondra from memory 6.73 s, ClickHouse over
+Parquet 7.89 s, Pondra from files 9.86 s, DuckDB over Parquet 10.71 s. Where ClickHouse's tables are
+far ahead: q29's `REGEXP_REPLACE` (0.46 s against 1.29 s), q28 (0.04 s, its `length` counting bytes
+and its table sorted by the grouped key), q24's wide top-N (0.20 s against 0.50 s), q23, q19. Its
+answers that differ are its own: `0.06 - 0.01` a float (TPC-H q6), sums of doubles in any order
+(q15, now and then), `length` in bytes (q28, q29), `avg` of a BIGINT wrapping (q4).
 
 **Now (2026-10-03, round 33, toward 0.33.0): run it for years.**
 

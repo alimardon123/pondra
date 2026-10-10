@@ -184,8 +184,8 @@ impl TableProvider for Files {
         let mut list = self.lake.store.list(Some(&object_store::path::Path::from(self.prefix.as_str())));
         while let Some(o) = list.next().await {
             let o = o.map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
-            if o.location.as_ref().starts_with(VERSIONS) && !self.prefix.starts_with(VERSIONS) {
-                continue; // (files' versions: `?versions` lists them)
+            if [VERSIONS, DEPLOYS].iter().any(|d| o.location.as_ref().starts_with(d) && !self.prefix.starts_with(d)) {
+                continue; // (files' versions: `?versions` lists them; what each deploy ran: `deploy.rs`)
             }
             paths.push(o.location.to_string());
             sizes.push(o.size as i64);
@@ -249,6 +249,7 @@ impl AsyncScalarUDFImpl for FileRead {
 // ---------------------------------------------------------------- versions (ADR-035 §8)
 
 pub const VERSIONS: &str = "files/.versions/";
+pub const DEPLOYS: &str = "files/.deploys/"; // (each deploy's project as it ran: `deploy::keep_files`)
 const KEPT_MB: usize = 64; // (a bigger file isn't kept twice)
 
 /// Where `path`'s versions are kept.

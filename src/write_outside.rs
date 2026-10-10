@@ -25,7 +25,7 @@ pub async fn insert(lake: &Lake, table: &str, query: &str, job: &str) -> Result<
     let spec = crate::ext::spec(table).context("not another engine's table")?;
     crate::ext::check(lake, &spec).await?; // (written by whoever may read it: a secret covering it, or the node's owner)
     let query = crate::routines::expand(lake, query).await?;
-    let df = crate::query::session(lake, &query, "").await?.sql_with_options(&query, crate::query::read_only()).await?;
+    let df = crate::query::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
     match spec.format.as_str() {
         "delta" => delta(lake, spec.urls[0].trim_end_matches('/'), df, job, false).await,
         "iceberg" => iceberg(lake, &spec, df, job, false).await,

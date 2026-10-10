@@ -3,7 +3,8 @@
 # a simulated R2 bucket too, where its followers always have a flush in flight); a cluster
 # of the newest release is upgraded to this build a node at a time under load
 # (tools/upgrade_check.py all); a table's past: UNDROP and retention (tools/history_check.py, ADR-043);
-# branch databases on disk and in a bucket (tools/environments_check.py, ADR-047).
+# branch databases on disk and in a bucket (tools/environments_check.py, ADR-047); a project in Git
+# deployed to them (tools/project_check.py). In two halves side by side: the releases' checks, and the rest.
 # build.yml calls it once a pull request's build is done (the label `ci` or `full-ci`): it tries
 # the binary that run made, so nothing is compiled here. By hand too.
 name: upgrade
@@ -18,6 +19,12 @@ env:
 
 jobs:
   upgrade:
+    name: upgrade (${{ matrix.part }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # (two halves side by side, about six minutes each on a runner)
+        part: [releases, "past, branches, a bucket"]
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     permissions:
@@ -38,22 +45,32 @@ jobs:
         run: |
           [ -f dist/pondra-linux-x64.tar.gz ] || bash tools/ci_artifact.sh linux-x64 "$SHA"
           mkdir -p target/release && tar xzf dist/pondra-linux-x64.tar.gz -C target/release && ls -l target/release
+      - name: The checks' Python packages (tools/requirements.txt's versions)
+        run: pip install -q $(grep -E '^(pyarrow|deltalake|pyiceberg|pyiceberg-core|psycopg\[binary\]|boto3|moto\[server\])==|^boto3$' tools/requirements.txt | sed 's/ *#.*//')
       - name: Every release's lake, a newer format, drains, a rolling upgrade
+        if: matrix.part == 'releases'
         env:
           GITHUB_TOKEN: ${{ github.token }} # (the releases' list: a runner's shared address has a low limit)
         run: |
           set -o pipefail   # (the check's exit status, not tee's)
-          pip install -q $(grep -E '^(pyarrow|deltalake|pyiceberg|pyiceberg-core|psycopg\[binary\]|boto3|moto\[server\])==|^boto3$' tools/requirements.txt | sed 's/ *#.*//')
           python3 tools/upgrade_check.py all --new target/release/pondra --work "$RUNNER_TEMP/upgrade" | tee upgrade.json
       - name: A table's past (UNDROP, retention)
+        if: matrix.part != 'releases'
         run: |
           set -o pipefail
           python3 tools/history_check.py --new target/release/pondra --work "$RUNNER_TEMP/history" | tee history.json
       - name: Branch databases (CREATE DATABASE dev CLONE prod)
+        if: matrix.part != 'releases'
         run: |
           set -o pipefail
           python3 tools/environments_check.py --new target/release/pondra --work "$RUNNER_TEMP/environments" | tee environments.json
+      - name: A project in Git made true in a database (pondra plan, deploy, branch, diff)
+        if: matrix.part != 'releases'
+        run: |
+          set -o pipefail
+          python3 tools/project_check.py --new target/release/pondra --work "$RUNNER_TEMP/project" | tee project.json
       - name: A leader stopped on a bucket (simulated R2) hands over at once; branches in a bucket
+        if: matrix.part != 'releases'
         run: |
           set -o pipefail
           python3 tools/sim_r2.py --port 9000 > "$RUNNER_TEMP/sim_r2.log" 2>&1 &
@@ -64,13 +81,15 @@ jobs:
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: upgrade
+          name: upgrade-${{ strategy.job-index }}
           path: |
             upgrade.json
             upgrade-s3.json
             history.json
             environments.json
             environments-s3.json
+            project.json
+            ${{ runner.temp }}/project/**/*.log
             ${{ runner.temp }}/history/*.log
             ${{ runner.temp }}/environments*/**/*.log
             ${{ runner.temp }}/upgrade/**/*.log

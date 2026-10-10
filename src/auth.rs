@@ -178,7 +178,7 @@ impl Auth {
             "login" | "whoami" => Role::None, // (signing in; and who one is)
             "secrets" => Role::None, // (a procedure's lent token only: `server::secret`)
             "v1" if method == "POST" || method == "DELETE" => Role::Write, // (another engine's append: ADR-028; its tables made, dropped and renamed: ADR-029, as the SQL's rights say)
-            "sql" | "lookup" | "watch" | "live" | "sessions" | "mcp" | "v1" | "metrics" | "routines" | "objects" | "kinds" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog)
+            "sql" | "lookup" | "watch" | "live" | "sessions" | "mcp" | "v1" | "metrics" | "routines" | "objects" | "kinds" | "plan" | "deploy" | "test" | "export" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog; a deploy, not its plan, needs an admin: `deploy::ask`)
             "append" | "insert" => Role::Write,
             "cluster" if path.starts_with("/cluster/files") || path.starts_with("/cluster/commit") => Role::Write, // (writers on other machines)
             "cluster" if path.starts_with("/cluster/leader") => Role::None,
