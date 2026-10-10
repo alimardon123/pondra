@@ -3,7 +3,9 @@
 its writes are its own; prod keeps the files it reads while it lives, through merges, purges and
 retention; `pondra.diff` tells their rows apart; `ALTER DATABASE dev REFRESH [t]` brings a table
 (a view: the tables it reads; none named: all) and what follows it up to prod's present; a branch of
-a branch; `DROP DATABASE` lets go.
+a branch; `DROP DATABASE` lets go. A base that signs in on its own (a user, no token shared with the
+branch): its branch's REFRESH and unpin go by the branch's own key, and a clone's REFRESH stays within
+the schemas it took (`signed_in_check`).
 
   environments_check.py [--new target/release/pondra] [--work DIR] [--port 9780] [--s3]
 
@@ -15,7 +17,7 @@ purges changed rows every round (`PONDRA_PURGE_ROWS=1`), so what a branch reads 
 once if nothing kept it. Prints the checks as JSON and exits 1 if one fails (the lakes and the nodes'
 logs are then kept in --work).
 """
-import argparse, glob, json, os, shutil, sys, tempfile, time
+import argparse, base64, glob, json, os, shutil, sys, tempfile, time, urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -34,6 +36,18 @@ def keys(lake):
 
 def parquet(lake):
     return [k for k in keys(lake) if "/data/" in k and k.endswith(".parquet")]
+
+
+def raw(port, method, path, body, headers):
+    """A request to the node on `port` with exactly these headers (no token of the test's own): (status, text)."""
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=body.encode() if body else None, method=method, headers=headers)
+    try:
+        r = urllib.request.urlopen(req, timeout=30)
+        return r.status, r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")
+    except OSError as e:
+        return 0, str(e)
 
 
 def environments_check(bin, work, port, root):
@@ -216,6 +230,91 @@ def environments_check(bin, work, port, root):
     return checks
 
 
+def signed_in_check(bin, work, port, root):
+    """A branch of a database that signs in on its own (a user, and no admin token shared with the
+    branch): its REFRESH and unpin go by the branch's own key (`branch::keyed`), which opens nothing
+    else; a clone's REFRESH stays within the schemas it took; a database next door that signs in on
+    its own is cloned only by a caller who may read it (`branch::may`)."""
+    prod_dir, dev_dir = root + "/sprod", root + "/sdev"  # (the folder names are the databases' names: prod is `sprod`)
+    env = {"PONDRA_PURGE_ROWS": "1"}
+    prod = Node(bin, prod_dir, port + 10, work, "--retain-secs", "1", env=env, token=False).start()
+
+    def rows(n, sql):
+        return [tuple(r.values()) for r in n.q(sql)]
+
+    def refused(n, sql):
+        try:
+            n.q(sql)
+            return ""
+        except Failed as e:
+            return str(e)
+
+    basic = "Basic " + base64.b64encode(b"ann:ann-password-1").decode()
+
+    def as_ann(sql):
+        status, text = raw(port + 10, "POST", "/sql", sql, {"Authorization": basic})
+        if status != 200:
+            raise Failed(f"as ann, {sql}: {status} {text[:800]}")
+        return [tuple(r.values()) for r in json.loads(text)]
+
+    checks = {}
+    prod.q("CREATE SCHEMA sales")
+    prod.q("CREATE TABLE sales.orders (id BIGINT, amount DOUBLE)")
+    prod.q("INSERT INTO sales.orders VALUES (1, 1.5), (2, 3.0), (3, 4.5)")
+    prod.q("CREATE SCHEMA hr")
+    prod.q("CREATE TABLE hr.pay (id BIGINT, amount DOUBLE)")
+    prod.q("INSERT INTO hr.pay VALUES (1, 100.0)")
+    # (made before prod has a user, so sdev has none and is open; prod signs in on its own after)
+    prod.q("CREATE DATABASE sdev CLONE sprod WITH (schemas = (sales))")
+    prod.q("CREATE USER ann PASSWORD 'ann-password-1' SUPERUSER")
+    dev = Node(bin, dev_dir, port + 11, work, "--retain-secs", "1", env=env, token=False).start()
+    prod.q("INSERT INTO sales.orders VALUES (4, 6.0), (5, 7.5)")
+
+    dev.q("ALTER DATABASE sdev REFRESH sales.orders")  # (sdev's own node asks prod with its key)
+    checks["REFRESH of a base that signs in on its own, with no token shared: by the branch's key"] = rows(dev, "SELECT count(*) FROM sales.orders") == [(5,)]
+
+    took_hr = refused(dev, "ALTER DATABASE sdev REFRESH hr.pay")
+    dev.q("CREATE SCHEMA hr")
+    dev.q("CREATE TABLE hr.pay (id BIGINT, amount DOUBLE)")
+    dev.q("INSERT INTO hr.pay VALUES (7, 7.0)")
+    dev.q("ALTER DATABASE sdev REFRESH")
+    checks["…only the schemas the clone took: one named outside them refused; none named, the branch's own table of another schema stays its own"] = \
+        "took only" in took_hr and rows(dev, "SELECT id FROM hr.pay") == [(7,)]
+
+    loc = prod.q("SELECT location FROM pondra.databases WHERE name = 'sdev'")[0]["location"]
+    status, text = raw(port + 10, "POST", "/cluster/ddl", json.dumps({"op": "pin", "lake": loc, "ms": None}), {"Authorization": basic, "Content-Type": "application/json"})
+    if status != 200:
+        raise Failed(f"prod's pin of sdev, as ann: {status} {text[:800]}")
+    key = json.loads(text)["key"]
+    checks["prod's pin of sdev gives it a key of its own (pb_…)"] = key.startswith("pb_")
+    bearer = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+    def ddl(body, headers=bearer):
+        return raw(port + 10, "POST", "/cluster/ddl", json.dumps(body), headers)[0]
+
+    checks["a branch's key renews and lets go of its own pin, and opens nothing else"] = \
+        ddl({"op": "pin", "lake": loc, "ms": None}) == 200 \
+        and ddl({"op": "pin", "lake": loc, "ms": 0}) != 200 \
+        and ddl({"op": "pin", "lake": "/elsewhere", "ms": None}) != 200 \
+        and ddl({"op": "drop_table", "name": "sales.orders", "if_exists": True}) != 200 \
+        and as_ann("SELECT count(*) AS n FROM sales.orders") == [(5,)] \
+        and raw(port + 10, "POST", "/sql", "SELECT 1", {"Authorization": f"Bearer {key}"})[0] == 401 \
+        and ddl({"op": "pin", "lake": loc, "ms": None}, {"Authorization": "Bearer pb_nope", "Content-Type": "application/json"}) != 200
+
+    dev.q(f"ATTACH '{prod_dir}' AS prod2")  # (a database next door that signs in on its own)
+    status, _, text = dev.plain("POST", "/sql", "CREATE DATABASE x CLONE prod2")
+    cloning = refused(dev, "CREATE DATABASE x2 CLONE prod2")  # (the owner passes; prod refuses dev's own key)
+    checks["CLONE of a database next door that signs in on its own: refused without its own rights, and saying where it is cloned"] = \
+        status != 200 and "read and written through it" in text and "cloned on its own node" in cloning and "read and written through it" not in cloning and not keys(root + "/x") and not keys(root + "/x2")
+
+    checks["…its unpin lets go, and then the key makes no new pin"] = ddl({"op": "unpin", "lake": loc}) == 200 \
+        and as_ann("SELECT branches FROM pondra.databases WHERE name = 'sprod'") == [(0,)] \
+        and "never makes one" in refused(dev, "ALTER DATABASE sdev REFRESH sales.orders")
+    dev.stop()
+    prod.stop()
+    return checks
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--new", default=os.path.join(HERE, "..", "target", "release", "pondra"), help="this build's binary")
@@ -228,6 +327,7 @@ def main():
     root = f"s3://{os.environ['PONDRA_BUCKET']}/environments-{os.getpid()}-{int(time.time())}" if a.s3 else work
     try:
         checks = environments_check(os.path.abspath(a.new), work, a.port, root)
+        checks.update(signed_in_check(os.path.abspath(a.new), work, a.port, root))
     except Failed as e:
         checks = {"ran to the end": False, "error": str(e)}
     finally:
