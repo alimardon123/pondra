@@ -45,6 +45,7 @@ pub struct Cluster {
     heard: std::sync::atomic::AtomicBool,    // follower: the leader has answered us at least once
     pub shard_runs: std::sync::atomic::AtomicU64, // task shards this node has run (for /stats)
     cut_off: std::sync::atomic::AtomicBool,       // leader: it can't reach the bucket (`keep_alive`)
+    others: std::sync::atomic::AtomicBool,        // leader cut off: another node was there meanwhile
 }
 
 impl Cluster {
@@ -66,7 +67,7 @@ impl Cluster {
         let view = Mutex::new(vec![]); // a follower runs no shards until the leader lists it
         let last_ok = Mutex::new(Instant::now() + STARTUP); // until we first hear from the leader
         let (beats, shard_runs, heard) = (Default::default(), Default::default(), Default::default());
-        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default() }))
+        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default(), others: Default::default() }))
     }
 
     pub fn is_leader(&self) -> bool { self.leader.addr == self.addr }
@@ -114,9 +115,11 @@ impl Cluster {
     pub fn leader_status(&self) -> (u64, bool) { (self.leader.n, self.leader_ok() && !self.unreached()) }
 
     /// Leader: has it gone `CUT_OFF` without reaching the bucket, with another node there to take
-    /// over? It turns requests away then. A leader alone serves what it can, as it always did:
+    /// over, now or at any time since? It turns requests away then. (One that took over beats to
+    /// its own term, so after a lease this one would look alone, and held every write sent to it
+    /// until its client gave up.) A leader alone all along serves what it can, as it always did:
     /// nobody else can lead, and its writes wait for the bucket.
-    pub fn cut_off(&self) -> bool { self.unreached() && self.nodes().len() > 1 }
+    pub fn cut_off(&self) -> bool { self.unreached() && (self.others.load(std::sync::atomic::Ordering::Relaxed) || self.nodes().len() > 1) }
 
     fn unreached(&self) -> bool { self.cut_off.load(std::sync::atomic::Ordering::Relaxed) }
 
@@ -156,7 +159,11 @@ impl Cluster {
                 if cut != (crate::log::now_ms().saturating_sub(heard) > CUT_OFF.as_millis() as u64) {
                     cut = !cut;
                     self.cut_off.store(cut, std::sync::atomic::Ordering::Relaxed);
+                    self.others.store(false, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("{}", if cut { "this leader can't reach the bucket: it tells its followers, and one that reaches it takes over" } else { "this leader reaches the bucket again, and still leads" });
+                }
+                if cut && self.nodes().len() > 1 {
+                    self.others.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         });

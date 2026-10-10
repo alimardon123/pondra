@@ -3,12 +3,15 @@ name: build
 # Every push to main: Pondra built as it is released (the dist profile; Linux against glibc 2.17,
 # with zig, so it runs on any Linux from 2014 on) for all five platforms, tried there (smoke.py),
 # packaged for pip and npm and alone for the one-line installers (tools/package.py), and the
-# packages installed and tried as users get them (tools/try_packages.sh). The Linux job then runs
-# the suite on its binary, while the others finish (the slowest, macOS Intel, doesn't hold it up).
+# packages installed and tried as users get them (tools/try_packages.sh). linux-x64 is built
+# first, on its own, and the suite then runs on its binary in parts side by side, with the tests
+# that need only it (upgrade, resilience, sharing), while the other platforms finish (the slowest,
+# macOS Intel, holds up none of them).
 # A tag's release (release.yml) publishes this run's packages: nothing is built twice, and what
 # the suite tested is what ships. A pull request's push runs nothing (its thread builds and tests
 # where it works), unless the pull request asks: the label `ci` builds linux-x64 with the suite,
-# and `full-ci` all five, as main would, once before it merges. Decided from the labels alone, so a
+# and `full-ci` every platform but macOS Intel, once before it merges (macOS Intel's build is the
+# slowest by far, 31 to 50 minutes, and is main's alone). Decided from the labels alone, so a
 # push that asks for nothing never waits for a runner to say so; a newer push stops the older run.
 # Two pull requests' runs go at once: a third waits, holding no runner, until ci-slots.yml starts it.
 on:
@@ -30,8 +33,8 @@ jobs:
   # on every platform (the merge changed nothing in it: the branch was up to date with main)
   # builds nothing: release.yml and cluster-bench.yml take that run's packages (tools/ci_build.sh
   # finds them by the commit's tree). Otherwise main builds all five. A pull request labelled `ci`
-  # builds linux-x64; labelled `full-ci`, all five (and main reuses that run when the tree is the
-  # same); with neither, this job and the build are skipped.
+  # builds linux-x64; labelled `full-ci`, all but macOS Intel (so main builds a merge of it again);
+  # with neither, this job and the build are skipped.
   plan:
     if: >-
       github.event_name != 'pull_request' ||
@@ -43,7 +46,9 @@ jobs:
       contents: read
     outputs:
       run: ${{ steps.plan.outputs.run }}
-      matrix: ${{ steps.plan.outputs.matrix }}
+      linux: ${{ steps.plan.outputs.linux }}
+      others: ${{ steps.plan.outputs.others }}
+      full: ${{ steps.plan.outputs.full }}
       resilience: ${{ steps.plan.outputs.resilience }}
       upgrade: ${{ steps.plan.outputs.upgrade }}
       sharing: ${{ steps.plan.outputs.sharing }}
@@ -72,11 +77,16 @@ jobs:
             echo "run=$run" >> "$GITHUB_OUTPUT"
             if [ -n "$run" ]; then echo "Built and tested already: https://github.com/$GITHUB_REPOSITORY/actions/runs/$run" >> "$GITHUB_STEP_SUMMARY"; fi
           fi
-          if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`). Before merging, the label \`full-ci\` builds all five platforms." >> "$GITHUB_STEP_SUMMARY"; fi
-          echo "matrix=$(jq -c --argjson full "$FULL" '{include: [.[] | select($full or .platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
+          if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`). Before merging, the label \`full-ci\` builds the other platforms but macOS Intel (main's alone)." >> "$GITHUB_STEP_SUMMARY"; fi
+          # (linux-x64 apart: the suite and the tests after the build start once it is built, and
+          # never wait for the slowest platform)
+          echo "linux=$(jq -c '{include: [.[] | select(.platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
+          # (macOS Intel on main alone: a pull request's full-ci waited for it, the slowest by far)
+          echo "others=$(jq -c --arg event "$GITHUB_EVENT_NAME" '{include: [.[] | select(.platform != "linux-x64" and ($event != "pull_request" or .platform != "macos-x64"))]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
+          echo "full=$FULL" >> "$GITHUB_OUTPUT"
           # The tests of what a pull request's run builds, called below once it is built: upgrade
           # always, resilience when what it puts under failure changes, sharing when what it shares,
-          # deploy's (all five platforms: `full-ci`) when what it tries changes. (The files from git:
+          # deploy's (`full-ci`: the platforms it tries) when what it tries changes. (The files from git:
           # the API's hourly allowance for the repository runs out on a busy day.)
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             files=$(git diff --name-only HEAD^1 HEAD)
@@ -108,26 +118,29 @@ jobs:
           echo "::error title=Waiting for a CI slot::Two other pull requests' CI runs are going, and only two run at once. This run starts again by itself when one ends (ci-slots.yml): nothing to do."
           exit 1
 
-  build:
+  # linux-x64 first, on its own: the suite and the tests after the build need its packages alone,
+  # so they start once it is built, never waiting for the slowest platform.
+  linux:
     needs: plan
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' }}
-    name: ${{ matrix.platform == 'linux-x64' && 'linux-x64 (build and suite)' || matrix.platform }}
+    name: ${{ matrix.platform }}
     strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.linux) }}
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        shell: bash # (Git Bash on Windows)
+        shell: bash
     env:
       BIN: target/${{ matrix.target }}/dist/pondra${{ matrix.exe }}
-    steps:
+    steps: &build # (every platform's, `build` below too)
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
+          # (the key it had when every platform was the job `build`: main's caches stay theirs)
+          shared-key: build
           cache-on-failure: true # (a failed run keeps what it compiled: the dist profile's dependencies take most of a cold build)
           # (main's caches only: every branch reads them, and a branch's own would push them out of
           # the repository's 10 GB; the dependencies are what is cached, and they rarely change)
@@ -176,27 +189,76 @@ jobs:
           name: pondra-npm
           path: dist/pondra-[0-9]*.tgz
 
-      # The suite, on this very binary (Linux): the quick correctness suite (upserts, split brain,
-      # crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on GCS and Azure,
-      # scale, Flight…), frames against Polars, the console in Chromium, every example on the
-      # website, then a cluster losing its leader twice.
+  # The other platforms (main; `full-ci` all but macOS Intel), with the same steps.
+  build:
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' && needs.plan.outputs.full == 'true' }}
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.others) }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash # (Git Bash on Windows)
+    env:
+      BIN: target/${{ matrix.target }}/dist/pondra${{ matrix.exe }}
+    steps: *build
+
+  # The suite, on linux-x64's very binary, in three parts side by side: the quick correctness suite
+  # (upserts, split brain, crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on
+  # GCS and Azure, scale, Flight…) in two halves (`harness.py all --shard`), and frames against
+  # Polars, the console in Chromium, every example on the website, then a cluster losing its leader
+  # twice.
+  suite:
+    needs: [plan, linux]
+    if: ${{ !cancelled() && needs.linux.result == 'success' }}
+    name: suite (${{ matrix.part }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { part: "harness, first half", shard: "1/2" }
+          - { part: "harness, second half", shard: "2/2" }
+          - { part: "frames, console, docs, failover" }
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PONDRA_BIN: ${{ github.workspace }}/bin/pondra
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tools/requirements.txt
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v7 # (this run's own, with no API call)
+        with:
+          name: pondra-linux-x64
+          path: dist
+      - name: linux-x64's binary
+        run: mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
+      - run: pip install -r tools/requirements.txt
       - uses: actions/cache@v5 # (Apache Kafka for harness.py kafkas: archive.apache.org takes minutes)
-        if: matrix.platform == 'linux-x64'
+        if: matrix.shard
         id: kafka
         with:
           path: ~/kafka_2.13-4.3.1
           key: kafka_2.13-4.3.1
-      - name: The suite
-        if: matrix.platform == 'linux-x64'
-        env:
-          PONDRA_BIN: ${{ github.workspace }}/${{ env.BIN }}
+      - name: harness.py all, this half
+        if: matrix.shard
         run: |
-          pip install -r tools/requirements.txt
           npm install -g azurite   # (Azure's emulator: harness.py clouds)
           if [ "${{ steps.kafka.outputs.cache-hit }}" != "true" ]; then
             (curl -sSfL https://dlcdn.apache.org/kafka/4.3.1/kafka_2.13-4.3.1.tgz || curl -sSfL https://archive.apache.org/dist/kafka/4.3.1/kafka_2.13-4.3.1.tgz) | tar xz -C ~
           fi
-          python3 tools/harness.py all
+          python3 tools/harness.py all --shard ${{ matrix.shard }}
+      - name: Frames, the console, the website's examples, a failover
+        if: ${{ !matrix.shard }}
+        run: |
           python3 tools/frames_check.py
           python3 -m playwright install --with-deps chromium
           python3 tools/brand_check.py --node   # (the mark and colours from brand/ only: ADR-032)
@@ -204,29 +266,36 @@ jobs:
           python3 tools/console_check.py
           python3 tools/docs_check.py   # (every example on the website runs)
           python3 tools/cluster.py failover --secs 30
+      - name: The nodes' logs, when a check failed
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: suite-logs-${{ strategy.job-index }} # (not pondra-…: release.yml takes every pondra-* artifact)
+          path: /tmp/pondra-*.stderr
+          if-no-files-found: ignore
 
   # The tests of what the build made, each a workflow of its own (which also runs by hand), called
-  # once the build is done. A test that waited for the packages inside its own job held a runner
-  # all that time, and enough of them held every runner the builds they waited for needed
-  # (2026-10-03: 15 runs queued behind them).
+  # once linux-x64's build is done (deploy's once every platform's is). A test that waited for the
+  # packages inside its own job held a runner all that time, and enough of them held every runner
+  # the builds they waited for needed (2026-10-03: 15 runs queued behind them).
   resilience:
-    needs: [plan, build]
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.plan.outputs.resilience == 'true' }}
+    needs: [plan, linux]
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.plan.outputs.resilience == 'true' }}
     permissions: { actions: read, contents: read }
     uses: ./.github/workflows/resilience.yml
   upgrade:
-    needs: [plan, build]
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.plan.outputs.upgrade == 'true' }}
+    needs: [plan, linux]
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.plan.outputs.upgrade == 'true' }}
     permissions: { actions: read, contents: read }
     uses: ./.github/workflows/upgrade.yml
   sharing:
-    needs: [plan, build]
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.plan.outputs.sharing == 'true' }}
+    needs: [plan, linux]
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.plan.outputs.sharing == 'true' }}
     permissions: { actions: read, contents: read }
     uses: ./.github/workflows/sharing.yml
   deploy:
-    needs: [plan, build]
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.plan.outputs.deploy == 'true' }}
+    needs: [plan, linux, build]
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.build.result == 'success' && needs.plan.outputs.deploy == 'true' }}
     permissions: { actions: read, contents: read }
     uses: ./.github/workflows/deploy-check.yml
     with:
