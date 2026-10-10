@@ -28,6 +28,7 @@
   harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
   harness.py stopped             a run whose node was killed under it: stopped, not running for good
   harness.py variables           DECLARE $day / $day = … from every door, a file's parameters (DECLARE PARAMETER, a .py file's cell), runs and procedures of their own
+  harness.py use                 USE and SET search_path: schemas and databases, views and tasks, Postgres, Python, the shell, three nodes
   harness.py friendly            SQL as DuckDB's users write it (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, …) == DuckDB's answers, spread too
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
@@ -9098,11 +9099,202 @@ console.log(JSON.stringify([all, top, rows, await db.vars(), (await db.parameter
         sys.exit(1)
     return f"variables: DECLARE $day, $day = …, from HTTP, Postgres and Python; a file's parameters; runs and procedures of their own: all {len(checks)} checks pass"
 
+def use_path():
+    """USE and a session's search path (round 34, `path.rs`): `USE crm` makes crm the session's
+    schema, `USE dev` a database (an attached lake, its public), `USE dev.sales` both; `USE DATABASE`
+    and `USE SCHEMA` when a name is both; `SET search_path TO crm, public` and `SET SCHEMA 'crm'` are
+    the same setting. A one-part name is looked for there and a new object goes to its first schema;
+    the names are written in where SQL comes in, so views, tasks, the result cache and spread queries
+    see full names. Over HTTP, Postgres, the Python client and the shell (one session until it quits);
+    refused by name without a session; a spread query from a follower's session on three nodes."""
+    import psycopg
+    lake = new_lake()
+    other = f"{lake}-other"  # (a database made beside this lake: CREATE DATABASE, attached)
+    LAKES.append(other)
+    db_name = lake.rstrip("/").rsplit("/", 1)[-1].lower()  # (current_database(): the lake's name, its folder's)
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
+    q = lambda s, h=None: call(A.port, "POST", "/sql", s.encode(), headers=h or {})
+    def http(body, session=None):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", body.encode(), {"x-pondra-session": session} if session else {})
+        r = c.getresponse()
+        data = r.read()
+        return r.status, r.getheader("x-pondra-sqlstate"), (json.loads(data) if data[:1] in (b"{", b"[") else data.decode())
+    checks, info = {}, {}
+    # crm.t has two rows, public.t five; public's are none of them a = 1, so a lookup shows which one it read.
+    q("CREATE SCHEMA crm")
+    q("CREATE TABLE crm.t (a INT)")
+    q("INSERT INTO crm.t VALUES (1), (2)")
+    q("CREATE TABLE t (a INT)")
+    q("INSERT INTO t VALUES (11), (12), (13), (14), (15)")
+    # USE crm, the names it gives, SHOW, RESET.
+    h1 = {"x-pondra-session": "use-one"}
+    q("USE crm", h1)
+    info["crm"] = q("SELECT count(*) AS n FROM t", h1)
+    info["names"] = q("SELECT current_schema() AS s, current_database() AS d", h1)
+    info["shown"] = q("SHOW search_path", h1)
+    q("RESET search_path", h1)
+    info["reset"] = q("SELECT count(*) AS n FROM t", h1)
+    checks["USE crm: a one-part name is crm's (2 rows, not public's 5); current_schema() and current_database() say so; SHOW search_path shows it; RESET gives public back"] = \
+        info["crm"] == [{"n": 2}] and info["names"] == [{"s": "crm", "d": db_name}] and [r.get("value") for r in info["shown"]] == ["crm"] and info["reset"] == [{"n": 5}]
+    # The result cache is keyed by the text the engine runs: the same text, under USE crm and not, in turns and at once.
+    a, b = {"x-pondra-session": "use-cache-a"}, {"x-pondra-session": "use-cache-b"}
+    q("USE crm", a)
+    count = lambda h: q("SELECT count(*) AS n FROM t", h)[0]["n"]
+    info["turns"] = [count(h) for _ in range(3) for h in (a, b)]
+    at_once = {}
+    def many(key, h):
+        at_once[key] = [count(h) for _ in range(3)]
+    threads = [threading.Thread(target=many, args=(k, h)) for k, h in (("a", a), ("b", b))]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    info["at once"] = at_once
+    checks["the result cache isn't fooled: the same text under USE crm (2) and without (5), in turns and in two sessions at once"] = \
+        info["turns"] == [2, 5] * 3 and at_once == {"a": [2, 2, 2], "b": [5, 5, 5]}
+    # Writes and DDL go to the session's schema.
+    w = {"x-pondra-session": "use-write"}
+    q("USE crm", w)
+    q("INSERT INTO t VALUES (9)", w)
+    q("UPDATE t SET a = 10 WHERE a = 9", w)
+    q("CREATE TABLE u (b INT)", w)
+    q("CREATE VIEW v AS SELECT count(*) AS n FROM t", w)
+    q("CREATE SEQUENCE s", w)
+    info["nextval"] = q("SELECT nextval('s') AS v", w)
+    info["crm rows"] = q("SELECT a FROM crm.t ORDER BY a")
+    info["crm u"] = q("SELECT count(*) AS n FROM crm.u")
+    info["crm v"] = q("SELECT n FROM crm.v")
+    info["public rows"] = q("SELECT count(*) AS n FROM public.t")
+    info["next crm"] = q("SELECT nextval('crm.s') AS v")
+    checks["writes and DDL under USE crm land in crm: INSERT, UPDATE, CREATE TABLE, VIEW, SEQUENCE; public's five rows are untouched"] = \
+        info["nextval"] == [{"v": 1}] and info["crm rows"] == [{"a": 1}, {"a": 2}, {"a": 10}] and info["crm u"] == [{"n": 0}] \
+        and info["crm v"] == [{"n": 3}] and info["public rows"] == [{"n": 5}] and info["next crm"] == [{"v": 2}]
+    # A view keeps the names it was made with, whatever path reads it.
+    p = {"x-pondra-session": "use-path-read"}
+    q("SET search_path TO public", p)
+    q("CREATE VIEW pv AS SELECT count(*) AS n FROM t")  # (made in public, no session)
+    info["view crm, no path"] = q("SELECT n FROM crm.v")
+    info["view crm, public's path"] = q("SELECT n FROM crm.v", p)
+    info["view public, under USE crm"] = q("SELECT n FROM public.pv", w)
+    checks["a view keeps its names: crm's read with no path or public's path (3), public's read under USE crm (5)"] = \
+        info["view crm, no path"] == [{"n": 3}] and info["view crm, public's path"] == [{"n": 3}] and info["view public, under USE crm"] == [{"n": 5}]
+    # Names that are not a schema's: a CTE, a temporary table, the Postgres catalog.
+    s = {"x-pondra-session": "use-skip"}
+    q("USE crm", s)
+    q("CREATE TEMP TABLE tmp AS SELECT 7 AS a", s)
+    info["cte"] = q("WITH t AS (SELECT 42 AS a) SELECT a FROM t", s)
+    info["temp"] = q("SELECT a FROM tmp", s)
+    info["catalog"] = q("SELECT count(*) AS n FROM pg_class", s)
+    checks["under USE crm a CTE named t, a temporary table and pg_class are the query's own, not crm's"] = \
+        info["cte"] == [{"a": 42}] and info["temp"] == [{"a": 7}] and info["catalog"][0]["n"] > 0
+    # SET search_path: crm first, then public, new objects in crm.
+    q("CREATE TABLE only_pub (x INT)")
+    q("INSERT INTO only_pub VALUES (7)")
+    sp = {"x-pondra-session": "use-search-path"}
+    q("SET search_path TO crm, public", sp)
+    info["path count"] = q("SELECT count(*) AS n FROM t", sp)
+    info["path public"] = q("SELECT x FROM only_pub", sp)
+    q("CREATE TABLE made_here (x INT)", sp)
+    info["made here"] = q("SELECT count(*) AS n FROM crm.made_here")
+    info["not in public"] = _raises(lambda: q("SELECT count(*) AS n FROM public.made_here"))
+    checks["SET search_path TO crm, public: crm's table first (3 rows), a table only in public found, a new table made in crm"] = \
+        info["path count"] == [{"n": 3}] and info["path public"] == [{"x": 7}] and info["made here"] == [{"n": 0}] and info["not in public"]
+    # A task made under USE crm is crm's, and writes into crm.
+    k = {"x-pondra-session": "use-task"}
+    q("CREATE TABLE crm.log (x INT)")
+    q("USE crm", k)
+    q("CREATE TASK tk SCHEDULE '1 second' AS INSERT INTO log VALUES (1)", k)
+    info["task wrote"] = until(lambda: q("SELECT count(*) AS n FROM crm.log")[0]["n"] > 0, True, 20)
+    info["tasks"] = [r["name"] for r in q("SELECT name FROM pondra.tasks")]
+    checks["a task made under USE crm is crm.tk, and writes into crm.log within 20 s"] = info["task wrote"] is True and "crm.tk" in info["tasks"] and "tk" not in info["tasks"]
+    # Another database: USE other, USE other.public, USE DATABASE other.
+    q(f"CREATE DATABASE other LOCATION '{other}'")
+    q("CREATE TABLE other.public.ot (x INT)")
+    q("INSERT INTO other.public.ot VALUES (1), (2), (3)")
+    o1 = {"x-pondra-session": "use-db-one"}
+    q("USE other", o1)
+    info["other first"] = q("SELECT count(*) AS n FROM ot", o1)
+    q("INSERT INTO ot VALUES (4)", o1)
+    info["other after"] = q("SELECT count(*) AS n FROM other.public.ot")
+    info["not here"] = _raises(lambda: q("SELECT count(*) AS n FROM ot"))
+    o2 = {"x-pondra-session": "use-db-two"}
+    q("USE other.public", o2)
+    info["other.public"] = q("SELECT count(*) AS n FROM ot", o2)
+    q("INSERT INTO ot VALUES (5)", o2)
+    o3 = {"x-pondra-session": "use-db-three"}
+    q("USE DATABASE other", o3)
+    info["DATABASE other"] = q("SELECT count(*) AS n FROM ot", o3)
+    checks["USE other, USE other.public, USE DATABASE other: ot is other's (3, then 4 and 5 once written); this lake has no ot"] = \
+        info["other first"] == [{"n": 3}] and info["other after"] == [{"n": 4}] and info["not here"] and info["other.public"] == [{"n": 4}] \
+        and info["DATABASE other"] == [{"n": 5}] and q("SELECT count(*) AS n FROM other.public.ot") == [{"n": 5}]
+    # Refused by name: a name that is both, unknown ones, no session, pondra sql.
+    q("CREATE SCHEMA other")  # (now `other` is a database and a schema of this lake: USE other must say which)
+    info["both"] = http("USE other", "use-both")
+    info["nope"] = http("USE nope", "use-nope")
+    info["nope db"] = http("USE nope.public", "use-nope")
+    info["no session"] = http("USE crm")
+    cli = subprocess.run([BIN, "sql", "--dir", lake, "USE crm"], capture_output=True, text=True, timeout=120)
+    info["cli"] = [cli.returncode, (cli.stdout + cli.stderr)[-300:]]
+    checks["refused by name: an unknown schema (3F000) or database (3D000), a name that is both (USE DATABASE or USE SCHEMA), no session, pondra sql"] = \
+        info["nope"][1] == "3F000" and info["nope db"][1] == "3D000" and "USE DATABASE" in str(info["both"][2]) and "USE SCHEMA" in str(info["both"][2]) \
+        and info["no session"][0] != 200 and "session" in str(info["no session"][2]) and cli.returncode != 0 and "session" in cli.stdout + cli.stderr
+    # The Postgres port: one connection, its own session.
+    q("CREATE TABLE crm.kt (id BIGINT PRIMARY KEY, v VARCHAR)")
+    q("INSERT INTO crm.kt VALUES (1, 'crm')")
+    q("CREATE TABLE kt (id BIGINT PRIMARY KEY, v VARCHAR)")
+    q("INSERT INTO kt VALUES (2, 'public')")
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as c:
+        c.execute("USE crm")
+        info["pg crm"] = c.execute("SELECT count(*) FROM t").fetchall()
+        info["pg key"] = c.execute("SELECT v FROM kt WHERE id = 1").fetchall()  # (a key lookup: crm's row)
+        info["pg key public"] = c.execute("SELECT v FROM kt WHERE id = 2").fetchall()  # (public's row: not on the path)
+        c.execute("SET search_path TO public")
+        info["pg public"] = c.execute("SELECT count(*) FROM t").fetchall()
+        c.execute("SET search_path TO crm")
+        info["pg schema"] = c.execute("SELECT current_schema()").fetchall()
+        info["pg visible"] = c.execute("SELECT relname FROM pg_class c WHERE pg_table_is_visible(c.oid) AND relname IN ('t', 'only_pub')").fetchall()
+        info["pg lookup"] = c.execute("SELECT a FROM t WHERE a = 1").fetchall()
+    checks["over Postgres: USE crm (3), a key lookup from crm, SET search_path to public (5), current_schema(), only crm's t visible in pg_class"] = \
+        info["pg crm"] == [(3,)] and info["pg key"] == [("crm",)] and info["pg key public"] == [] and info["pg public"] == [(5,)] \
+        and info["pg schema"] == [("crm",)] and info["pg visible"] == [("t",)] and info["pg lookup"] == [(1,)]
+    # The Python client: USE is its connection's.
+    con, others = _client(A.port), _client(A.port)
+    con.sql("USE crm")
+    info["python crm"] = con.sql("SELECT count(*) AS n FROM t").rows()
+    info["python other"] = others.sql("SELECT count(*) AS n FROM t").rows()
+    con.close()
+    others.close()
+    checks["the Python client: USE is its connection's (3 rows); another connection still reads public (5)"] = \
+        info["python crm"] == [{"n": 3}] and info["python other"] == [{"n": 5}]
+    node.kill()
+    # The shell: one session until it quits.
+    shell = subprocess.run([BIN, lake], input="USE crm;\nSELECT count(*) AS n FROM t;\n", capture_output=True, text=True, timeout=180)
+    info["shell"] = shell.stdout[-400:]
+    checks["the shell keeps its session from line to line: USE crm on one line, crm's count (3, not 5) on the next"] = "| 3 " in shell.stdout and "| 5 " not in shell.stdout
+    # A spread query from a follower's session: the same answer as crm.t on one node.
+    lake3 = new_lake()
+    trio = [Node(lake3, A.port + i).start() for i in range(3)]
+    time.sleep(1)
+    sql(A.port, "CREATE SCHEMA crm")
+    sql(A.port, "CREATE TABLE crm.t AS SELECT value AS id FROM generate_series(1, 30000)")
+    f = {"x-pondra-session": "use-spread"}
+    until(lambda: _try(lambda: call(A.port + 1, "POST", "/sql", b"USE crm", headers=f)) is not None, True, 15)
+    spread = until(lambda: _try(lambda: call(A.port + 1, "POST", "/sql?spread=1", b"SELECT count(*) AS n FROM t", headers=f)), [{"n": 30000}], 15)
+    one = sql(A.port, "SELECT count(*) AS n FROM crm.t")
+    info["spread"], info["one node"] = spread, one
+    checks["under USE crm on a follower, a query spread over three nodes == crm.t on one node (30000 rows)"] = spread == one == [{"n": 30000}]
+    [n.kill() for n in trio]
+    ok = all(checks.values())
+    print(json.dumps({"use": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"use: USE and search_path over HTTP, Postgres, Python and the shell, refused by name, spread on three nodes: all {len(checks)} checks pass"
+
+
 def doors():
     """The doors matrix (ADR-036 §7): one list of features, each through every door — SQL over HTTP
     (a session), the Python client, the Postgres port (psycopg), Flight SQL (ADBC), the JavaScript
-    client and MCP. Each cell is right, or refused by name where the door can't (a transaction needs
-    a session: Flight SQL and MCP have none). The table is printed; every cell must be one of the two."""
+    client and MCP. Each cell is right, or refused by name where the door can't (a transaction and a
+    USE need a session: Flight SQL and MCP have none). The table is printed; every cell must be one of the two."""
     import re, psycopg, adbc_driver_flightsql.dbapi as adbc
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
     import pondra
@@ -9114,6 +9306,9 @@ def doors():
     q("CREATE TABLE d_log (door VARCHAR, n BIGINT)")
     q("INSERT INTO d_items SELECT value AS id, 100 AS qty FROM range(1, 101)")
     q("CREATE PROCEDURE d_bump(k BIGINT) LANGUAGE sql AS $$ UPDATE d_items SET qty = qty + 1000 WHERE id = $k $$")
+    q("CREATE SCHEMA d_crm")  # (USE a schema: its one-part names are d_crm's)
+    q("CREATE TABLE d_crm.d_only (x BIGINT)")
+    q("INSERT INTO d_crm.d_only VALUES (1), (2), (3)")
     DOORS = ["http", "python", "postgres", "flight", "javascript", "mcp"]
     def features(i):
         k = 10 * i + 1  # (each door its own keys)
@@ -9128,6 +9323,7 @@ def doors():
             "procedure": ([f"CALL d_bump({k + 4})"], lambda r: q(f"SELECT qty FROM d_items WHERE id = {k + 4}") == [{"qty": 1100}]),
             "transaction": (["BEGIN", f"UPDATE d_items SET qty = qty - 7 WHERE id = {k + 5}", f"UPDATE d_items SET qty = qty + 7 WHERE id = {k + 6}", f"SELECT qty FROM d_items WHERE id = {k + 5}", "COMMIT"],
                             lambda r: r[3] == [[93]] and q(f"SELECT count(DISTINCT _version) AS v, sum(qty) AS s FROM d_items WHERE id IN ({k + 5}, {k + 6})") == [{"v": 1, "s": 200}]),
+            "USE a schema": (["USE d_crm", "SELECT count(*) AS n FROM d_only"], lambda r: r[-1] == [[3]]),
         }
     def rows_of(x):
         return [list(r.values()) if isinstance(r, dict) else list(r) for r in x] if isinstance(x, list) else x
@@ -9204,7 +9400,7 @@ finally {{ await db.close?.(); }}"""
         return json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else "refused: " + r.stderr[-160:]
     via = {"http": via_http, "python": via_python, "postgres": via_postgres, "flight": via_flight, "javascript": via_javascript, "mcp": via_mcp}
     matrix, checks = {}, {}
-    no_session = {"flight", "mcp"}  # (no session to hold a transaction: refused by name)
+    no_session = {"flight", "mcp"}  # (no session to hold a transaction or a USE: refused by name)
     for i, door in enumerate(DOORS):
         for name, (stmts, right) in features(i + 1).items():
             try:
@@ -9217,7 +9413,7 @@ finally {{ await db.close?.(); }}"""
             except Exception:
                 pass
             refused = isinstance(got, str) and ("session" in got or got.startswith("refused") or got == "0A000")
-            cell = "ok" if ok else ("refused" if refused and name == "transaction" and door in no_session else "WRONG")
+            cell = "ok" if ok else ("refused" if refused and name in ("transaction", "USE a schema") and door in no_session else "WRONG")
             matrix.setdefault(name, {})[door] = cell if cell != "WRONG" else f"WRONG: {str(got)[:120]}"
     for name, row in matrix.items():
         checks[f"{name}: " + ", ".join(f"{d} {'ok' if v == 'ok' else v}" for d, v in row.items())] = all(v in ("ok", "refused") for v in row.values())
@@ -9423,12 +9619,12 @@ def attached():
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
-        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10}
+        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10, "use_path": 40}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, scripts, hot, minmax, history, plans, learn, friendly, reader, crash, load)
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -9456,7 +9652,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -9469,7 +9665,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

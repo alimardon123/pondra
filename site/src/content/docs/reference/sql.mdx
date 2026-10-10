@@ -432,14 +432,16 @@ with `40001`: run it again. See [Transactions](/pondra/guides/change-rows/#trans
 
 ## Settings and prepared statements
 
-A session's own, as in Postgres: a Postgres connection's, the Python or JavaScript client's, or
-one script's (statements sent together, over HTTP or in the shell).
+A session's own, as in Postgres: a Postgres connection's, the Python or JavaScript client's, the
+shell's (one session until it quits, so a `SET`, `USE` or `BEGIN` on one line holds on the next), or
+one script's (statements sent together over HTTP).
 
 | Statement | Syntax |
 |---|---|
 | Set | `SET name = value`, `SET name TO value`, `SET TIME ZONE '+08:00'` |
 | Show | `SHOW name`, `SHOW TIME ZONE`, `SHOW ALL` |
 | Set back | `RESET name`, `RESET ALL` |
+| Use a schema or database | `USE s`, `USE db`, `USE db.s`; `USE DATABASE db`, `USE SCHEMA s` when a name is both |
 | Prepare | `PREPARE p [(type, …)] AS statement`, with `$1`, `$2`, … where the values go |
 | Run | `EXECUTE p [(value, …)]` |
 | Forget | `DEALLOCATE [PREPARE] p`, `DEALLOCATE ALL` |
@@ -448,8 +450,8 @@ one script's (statements sent together, over HTTP or in the shell).
   (`datafusion.execution.time_zone`, `datafusion.execution.batch_size`,
   `datafusion.sql_parser.dialect`, …), checked as it is set. The session's queries are planned with
   it; they run on its node, and aren't answered from the results other queries left.
-- Any other name without a dot is Postgres's (`search_path`, `extra_float_digits`,
-  `application_name`, …): kept, and shown by `SHOW`, since clients set many as they connect.
+- Any other name without a dot is Postgres's (`extra_float_digits`, `application_name`, …): kept,
+  and shown by `SHOW`, since clients set many as they connect.
 - `datafusion.runtime.*` (memory, spill folder, caches) is the node's, set as it starts
   ([`PONDRA_MEMORY_MB`](/pondra/reference/environment/)), and refused here.
 - `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`) gives the session Spark's
@@ -457,6 +459,21 @@ one script's (statements sent together, over HTTP or in the shell).
   and `'duckdb'` takes DuckDB's `STRUCT(a INT)` in `CREATE TABLE`.
 - A prepared statement can be a query or a write. `EXECUTE` puts its values where `$1`, `$2`, …
   were, each cast to the type `PREPARE` gave, and runs it as if it were sent.
+- `USE crm` makes `crm`, a schema of this lake, the session's schema. `USE dev` makes an attached
+  lake `dev` the database (its `public` schema), and `USE dev.sales` names both. When a name is both
+  a database and a schema, say which: `USE DATABASE dev` or `USE SCHEMA dev`. Without a session,
+  `USE` is refused, as `SET` is.
+- `search_path` is the session's path, and `SET search_path TO crm, public` (or `SET SCHEMA 'crm'`)
+  is the same setting, with Postgres's meaning. A name with one part is looked for in `crm`, then in
+  `public`, and a new table, view or sequence goes to `crm`. `SHOW search_path` shows it, and
+  `RESET search_path` gives this lake's `public` back.
+- Names are filled in where SQL comes in, so `SELECT * FROM t` under `USE crm` reads `crm.t` wherever
+  it runs. A view or a task keeps the names it was made with: one made under `USE crm` still reads
+  `crm` when read from elsewhere, and one made in `public` still reads `public` under `USE crm`.
+- `current_database()` and `current_schema()` answer the session's values at every door: this lake's
+  name and `public` when there is no session.
+- A session lasts as long as its connection: a Postgres connection, an HTTP `x-pondra-session`, a
+  console tab, the Python or JavaScript client's connection, or one script's statements.
 
 ```sql
 SET TIME ZONE '+08:00';
@@ -473,6 +490,21 @@ CREATE TABLE people (id INT, name VARCHAR, age INT);
 INSERT INTO people VALUES (1, 'ann', 31), (2, 'bob', 25);
 PREPARE older (INT) AS SELECT name FROM people WHERE age > $1 ORDER BY name;
 EXECUTE older (30);
+```
+
+```text
+name
+ann
+```
+
+With `USE`, a name with one part is the session's schema's, so the last query reads `crm.leads`:
+
+```sql
+CREATE SCHEMA crm;
+CREATE TABLE crm.leads (name VARCHAR);
+INSERT INTO crm.leads VALUES ('ann');
+USE crm;
+SELECT name FROM leads;
 ```
 
 ```text
@@ -621,7 +653,9 @@ parts | rows
 | Attach a lake | `ATTACH 'dir' AS name`; `ATTACH 'url' AS name (READ_ONLY [, ENDPOINT 'https://…'])` for a lake on another server, read with the secret whose `SCOPE` covers it and written there only ([production apart](/pondra/guides/environments/#production-on-a-server-of-its-own)); `ATTACH 'url' AS name (TYPE delta \| iceberg \| kafka, …)` for other engines |
 | Detach | `DETACH [IF EXISTS] name` |
 
-A table is `t` (in schema `public`), `s.t`, or `lake.s.t`. Names are letters, digits, `_` and `-`.
+A table is `t` (in schema `public`), `s.t`, or `lake.s.t`. With `USE s`, a name with one part is
+the session's schema's ([settings](#settings-and-prepared-statements)). Names are letters, digits, `_`
+and `-`.
 
 ```sql
 CREATE SCHEMA sales;
