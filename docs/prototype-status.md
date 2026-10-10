@@ -99,6 +99,23 @@ and its table sorted by the grouped key), q24's wide top-N (0.20 s against 0.50 
 answers that differ are its own: `0.06 - 0.01` a float (TPC-H q6), sums of doubles in any order
 (q15, now and then), `length` in bytes (q28, q29), `avg` of a BIGINT wrapping (q4).
 
+**A small build looked up in an array** (`optimize::config`). A join on one integer key whose build
+side's keys span under 262,144 values now looks them up in an array of that span (at most 1 MB),
+however few they are: DataFusion's perfect hash join, which by default takes only a span under 1,024
+or keys at least 15% dense. TPC-H q17's 204 parts, spread over 200,000 part keys, had stayed in a hash
+table, and its 6 million probes took 2.4 times as long. Measured as `SET` in the same request,
+interleaved, best of 10–30 rounds (`logs/round34/perfect-hash-join-ab.json`): TPC-H SF1 from memory
+1.142 s → 1.038 s, from files 2.088 s → 1.962 s (q17 58 → 24 ms and 101 → 70 ms), TPC-DS SF1 11.06 s
+and 11.17 s (no query apart beyond this box's noise at 15 rounds). With it, the single-node bench
+(`logs/round34/singlenode-tpch-sf1-perfect-hash.json`): Pondra from memory 1.16 s against DuckDB's
+tables 0.97 s (the last gate's 1.26 s), from files 2.00 s against DuckDB over Parquet 2.04 s; 22 of 22
+answers equal. TPC-DS 99 of 99 equal to DuckDB's from files and from memory, `join_order.py`,
+`spread_tpch.py --expect 22`, `harness.py scale`, `hot` and `minmax` pass.
+
+**On GitHub's runners** (`.github/workflows/singlenode-bench.yml`): TPC-H SF10 and all 100 M rows
+of ClickBench, Pondra from memory and from files against DuckDB over Parquet and in its own tables,
+every answer checked; weekly on main, by hand, and on a pull request labelled `bench`.
+
 **Now (2026-10-03, round 33, toward 0.33.0): run it for years.**
 
 1. **Every statement remembered** (ADR-048, `history.rs`): `SELECT * FROM pondra.history` has a row

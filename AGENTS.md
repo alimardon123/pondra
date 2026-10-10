@@ -86,7 +86,8 @@ src/      55,200 lines of Rust in 101 files, one per concern (see the table in R
           237–239); learned.rs (what a run learned about its filters, ADR-050: invariant 244);
           environments (ADR-047): branch.rs (`CREATE DATABASE dev CLONE prod`, REFRESH: invariant
           245), deploy.rs (plan, deploy, test and export: a project made true in a database;
-          `pondra.deploys`: invariants 246–250), project.rs (the command line's project commands) and
+          `pondra.deploys`: invariants 246–250), project.rs (the command line's project commands,
+          `pondra ci init` and `pondra dev`), protect.rs (a protected database: invariant 266) and
           sync.rs (`pondra workspace pull | push`); views kept current (ADR-055, ADR-056, ADR-059):
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253)
@@ -1848,6 +1849,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    behind the entries an attached lake's changed row went missing (336 of 607 reads on main
    2801b4d); with an entry read before a table's first UPDATE and its log read past it, a leader too
    kept both versions. `harness.py attached` (55 wrong reads on 0.33.0).
+266. **In a protected database, a project's objects change only through a deploy by a holder of
+   DEPLOY, and lifting the protection is an admin's, audited** (`protect.rs`, `deploy::authorize`,
+   ADR-058). `protect::door`, where every statement comes in (`write::on_node_listed`,
+   `write::from_cli`, and for a user's direct call `server::ddl` and `create_table`), refuses a change
+   to anything a project's last finished deploy declared (`deploy::declared`), unless
+   `protect::DEPLOYING` is set. Only a deploy sets it, from its claim to its record (tests included),
+   and a procedure it calls back through gets it for that call alone. Its matches over `Stmt` and
+   `Ddl` have no `_` arm: a new kind says what it touches. The flag lives in `z/protect`, which a
+   branch never copies. `environments_check.py`: "an admin's DROP, CREATE OR REPLACE and ALTER of a
+   project's table or view, and of its role's grants, are refused by name", "the cluster's own door
+   refuses it too…", "a superuser without DEPLOY can't deploy a protected database; ci's deploy
+   changes it".
 
 ## Tests: run these before and after any change
 
