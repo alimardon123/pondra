@@ -45,6 +45,8 @@ pub static KINDS: &[Kind] = &[
     Kind { name: "user", family: "user", verbs: &["CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COMMENT ON"] },
     Kind { name: "role", family: "user", verbs: &["CREATE", "DROP", "GRANT", "REVOKE", "COMMENT ON", "SHOW CREATE"] },
     Kind { name: "database", family: "database", verbs: &["CREATE", "CLONE", "ATTACH", "DETACH", "DROP", "COMMENT ON", "SHOW CREATE"] },
+    Kind { name: "share", family: "share", verbs: &["CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COMMENT ON", "SHOW CREATE"] },
+    Kind { name: "recipient", family: "recipient", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON"] },
 ];
 
 fn kind(name: &str) -> Option<&'static Kind> { KINDS.iter().find(|k| k.name == name) }
@@ -75,7 +77,8 @@ impl Object {
 type Lister = for<'a> fn(&'a Lake) -> BoxFuture<'a, Result<Vec<Object>>>;
 
 /// Each family's objects, read from the catalog alone (no query run).
-static FAMILIES: &[(&str, Lister)] = &[("schema", schemas), ("relation", relations), ("relation", sequences), ("relation", indexes), ("type", types), ("routine", routines), ("task", tasks), ("secret", secrets), ("user", users), ("database", databases)];
+static FAMILIES: &[(&str, Lister)] = &[("schema", schemas), ("relation", relations), ("relation", sequences), ("relation", indexes), ("type", types), ("routine", routines), ("task", tasks), ("secret", secrets), ("user", users), ("database", databases),
+    ("share", shares), ("recipient", recipients)];
 
 /// Every object of this lake and the lakes attached to it, with its comment, as the caller may see
 /// them (a user limited by grants: the tables it may read, and no secrets, users or roles).
@@ -275,6 +278,30 @@ async fn branched(lake: &Lake, name: &str, dir: &str) -> Option<String> {
     Some(format!("CREATE DATABASE {}{location} CLONE {}{schemas}{data}", ident(name), ident(&base)))
 }
 
+fn shares(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
+    Box::pin(async move {
+        if crate::auth::limited().is_some() {
+            return Ok(vec![]); // (an admin's, as pondra.shares is)
+        }
+        let here = crate::ddl::lake_name(lake);
+        let mut all = vec![];
+        for (n, s) in crate::shares::shares(lake).await? {
+            all.push(Object::new("share", &here, &n, Some(share_sql(lake, &n, &s).await?)));
+        }
+        Ok(all)
+    })
+}
+
+fn recipients(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
+    Box::pin(async move {
+        if crate::auth::limited().is_some() {
+            return Ok(vec![]);
+        }
+        let here = crate::ddl::lake_name(lake);
+        Ok(crate::shares::recipients(lake).await?.into_iter().map(|(n, _)| Object::new("recipient", &here, &n, None)).collect()) // (its token was shown once)
+    })
+}
+
 // ---------------------------------------------------------------- definitions
 
 /// A name in SQL: each part bare if it can be, quoted if not.
@@ -470,6 +497,30 @@ pub(crate) fn routine_sql(name: &str, r: &crate::routines::Routine) -> String {
     }
 }
 
+/// `CREATE SHARE`, the tables it hands out (their partitions, the names they are shared as, their
+/// history) and the recipients it is granted to.
+async fn share_sql(lake: &Lake, name: &str, s: &crate::shares::Share) -> Result<String> {
+    let mut script = vec![format!("CREATE SHARE {}", ident(name))];
+    for t in &s.tables {
+        let mut add = format!("ALTER SHARE {} ADD TABLE {}", ident(name), name_sql(&t.table));
+        if !t.partitions.is_empty() {
+            let column = lake.cat.get::<TableMeta>(&table_key(&t.table)).await?.and_then(|m| m.logical().partition).unwrap_or_default();
+            add += &format!(" PARTITION {}", t.partitions.iter().map(|v| format!("({} = {})", ident(&column), literal(v))).collect::<Vec<_>>().join(", "));
+        }
+        if (t.schema.as_str(), t.name.as_str()) != split(&t.table) {
+            add += &format!(" AS {}.{}", ident(&t.schema), ident(&t.name));
+        }
+        if t.history {
+            add += " WITH HISTORY";
+        }
+        script.push(add);
+    }
+    if !s.recipients.is_empty() {
+        script.push(format!("GRANT SELECT ON SHARE {} TO RECIPIENT {}", ident(name), list_sql(&s.recipients)));
+    }
+    Ok(script.join(";\n"))
+}
+
 /// `CREATE TASK`: when, after what, on what condition and with what options it runs.
 pub(crate) fn task_sql(name: &str, t: &crate::runs::Task) -> String {
     let mut s = format!("CREATE TASK {name}");
@@ -594,6 +645,8 @@ async fn there(lake: &Lake, key: &str) -> Result<bool> {
         "secret" => has(format!("e/{name}")).await?,
         "user" => has(format!("u/{name}")).await?,
         "database" => has(crate::ddl::attachment_key(name)).await? || has(format!("o/{name}")).await?,
+        "share" => has(crate::shares::share_key(name)).await?,
+        "recipient" => has(crate::shares::recipient_key(name)).await?,
         _ => false,
     })
 }
@@ -631,7 +684,8 @@ async fn comment(lake: &Lake, word: &str, name: &str, text: Option<String>, if_e
 /// Does carrying out `d` drop or rename something a comment may be on?
 pub fn moves(d: &Ddl) -> bool {
     matches!(d, Ddl::Sequence(_) | Ddl::Index(_) | Ddl::Type(_) | Ddl::DropTable { .. } | Ddl::DropView { .. } | Ddl::DropSchema { .. } | Ddl::DropRoutine { .. } | Ddl::DropTask { .. } | Ddl::DropSecret { .. }
-        | Ddl::Detach { .. } | Ddl::DropDatabase { .. } | Ddl::RenameTable { .. } | Ddl::AlterColumn { .. } | Ddl::Users(_))
+        | Ddl::Detach { .. } | Ddl::DropDatabase { .. } | Ddl::RenameTable { .. } | Ddl::AlterColumn { .. } | Ddl::Users(_)
+        | Ddl::Shares(crate::shares::Change::DropShare { .. } | crate::shares::Change::DropRecipient { .. }))
 }
 
 /// After a drop or a rename (`out`: what it answered): comments follow a renamed table or view, and
@@ -777,7 +831,7 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
         ensure!(p.peek_token().token == Token::EOF, "SHOW CREATE {} name", word.to_uppercase());
         n
     };
-    let wanted = kind(&word).context("SHOW CREATE TABLE | VIEW | MATERIALIZED VIEW | FUNCTION | PROCEDURE | TASK | SCHEMA | ROLE | DATABASE name")?;
+    let wanted = kind(&word).context("SHOW CREATE TABLE | VIEW | MATERIALIZED VIEW | FUNCTION | PROCEDURE | TASK | SCHEMA | ROLE | DATABASE | SHARE name")?;
     let here = crate::ddl::lake_name(lake);
     let parts: Vec<&str> = name.split('.').collect();
     let all = list(lake).await?;
@@ -794,6 +848,7 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
     let def = o.definition.as_ref().with_context(|| format!("{} {name}: {}", o.kind, match o.kind {
         "secret" => "a secret's values are never shown",
         "user" => "a user's password and tokens are never shown (CREATE USER … PASSWORD '…')",
+        "recipient" => "a recipient's token is shown once, when it is made (ALTER RECIPIENT … ROTATE TOKEN gives it another)",
         "external table" => "its statement isn't kept as written yet (its query is in pondra.tables)",
         _ => "made with its materialized view",
     }))?;
@@ -864,6 +919,7 @@ mod tests {
         };
         assert_eq!(ddl("COMMENT ON TABLE sales.Orders IS 'one row per order'")["text"], "one row per order");
         assert_eq!(ddl("comment on materialized view v is null")["kind"], "materialized view");
+        assert_eq!((ddl("COMMENT ON SHARE acme IS 'for Acme'")["kind"].clone(), ddl("comment on recipient acme_corp is null")["kind"].clone()), (j!("share"), j!("recipient")));
         assert_eq!(ddl("COMMENT IF EXISTS ON COLUMN t.\"Amount\" IS $$in euros$$")["name"], "t.Amount");
         assert_eq!(ddl("COMMENT ON TASK nightly IS ''")["text"], j!(null));
         assert!(ddl("COMMENT ON TABLE t IS 42")["error"].is_string());

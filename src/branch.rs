@@ -294,8 +294,9 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     let (commit, next, block) = (number("c"), number("n").max(1), number("b"));
     let end = next - 1;
     let wanted = |name: &str| took(&m.schemas, name);
-    // (a share and its recipients are the base's: a branch hands nothing to another company)
-    let deny = ["e/", "z/", "x/", "i/", "dt/", "jt/", "pn/", "fd/", "s/", "d/", "sh/", "sr/"];
+    // (a share and its recipients, and what they're described as, are the base's: a branch hands
+    // nothing to another company)
+    let deny = ["e/", "z/", "x/", "i/", "dt/", "jt/", "pn/", "fd/", "s/", "d/", "sh/", "sr/", "cm/share/", "cm/recipient/"];
     let mut puts = vec![];
     let (mut tables, mut tiered) = (0, end);
     for (k, v) in &snap {
