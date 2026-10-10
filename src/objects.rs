@@ -84,7 +84,7 @@ const RELATION: &[&str] = &["CREATE", "CREATE OR ALTER", "CREATE OR REPLACE", "A
 const ROUTINE: &[&str] = &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON", "SHOW CREATE"];
 const READ: &[&str] = &["SELECT"];
 const ROWS: &[&str] = &["SELECT", "INSERT", "UPDATE", "DELETE"];
-/// A project's refusal for shares and recipients (deploy.rs says it): each environment's, so a
+/// A project's refusal for shares and recipients (apply.rs says it): each environment's, so a
 /// partner's token never reaches dev.
 const SHARES_PROJECT: &str = "shares and recipients are each environment's: prod's never reach its branches, so a partner's token never reaches dev; make and grant them in the database (CREATE SHARE …)";
 pub static KINDS: &[Kind] = &[

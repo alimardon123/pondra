@@ -1,4 +1,4 @@
-//! Plan and deploy (ADR-047 §4): a project, files that say what every object is, made true in a
+//! Plan and apply (ADR-047 §4): a project, files that say what every object is, made true in a
 //! database; and a database written out as such files (`export`).
 //!
 //! - **A project** is files: `pondra.toml` (its name, and each environment's values and attached
@@ -9,19 +9,21 @@
 //!   `CALL plan('files/sales')` reads one kept in the workspace.
 //! - **The plan** compares each object the project declares with the database: its fingerprint (its
 //!   statement's tokens, comments, spacing and case aside, with the values bound into it) against
-//!   what the last deploy recorded, and against the object as the database has it now (`export`'s
+//!   what the last apply recorded, and against the object as the database has it now (`export`'s
 //!   statement for it). A table is compared column by column: columns added at the end become
 //!   `ADD COLUMN`, widened ones `ALTER COLUMN … TYPE`, changed options `ALTER TABLE … SET`; a column
 //!   gone, renamed, moved or narrowed, or another key, is refused with the migration to write.
 //!   Anything else that changed is made again (`CREATE OR REPLACE`), a materialized view with what
-//!   follows it. An object no longer declared is kept, unless the deploy prunes.
-//! - **A deploy** applies the plan it was shown (refused if the database changed since), one at a
+//!   follows it. An object no longer declared is kept, unless the apply prunes.
+//! - **An apply** carries out the plan it was shown (refused if the database changed since), one at a
 //!   time per database (`dl`, kept fresh while it runs), each statement as the caller under its own
-//!   part of the deploy's job, then the tests. Each is an entry `dp/<n>` (`pondra.deploys`), each
+//!   part of the apply's job, then the tests. Each is an entry `dp/<n>` (`pondra.applies`), each
 //!   migration once `dm/<project>/<file>`, and its files are kept under `files/.deploys/<n>/`. Run
-//!   again, a deploy finds nothing to do: that is also how one that stopped half way is finished.
-//! - **One owner per object**: a deploy refuses to change an object another project's deploy made.
-//!   In a branch, the tasks a deploy makes start suspended, as the branch's own did (ADR-047 §3).
+//!   again, an apply finds nothing to do: that is also how one that stopped half way is finished.
+//!   The stored keys and folder keep the old word, deploy (`dl`, `dp/`, `dm/`, `files/.deploys/`, the
+//!   job ids): they are the lake's format, so a rename must not move them.
+//! - **One owner per object**: an apply refuses to change an object another project's apply made.
+//!   In a branch, the tasks an apply makes start suspended, as the branch's own did (ADR-047 §3).
 
 use crate::objects::{ident, materialized_sql, name_sql as quoted, routine_sql, sql_type, table_sql, task_sql}; // (`SHOW CREATE`'s statements: an export reads as it does)
 use crate::routines::{Outcome, Who};
@@ -33,20 +35,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::{BTreeMap, HashMap};
 
-const LOCK: &str = "dl"; // (the deploy under way: its number and when it last said it was alive)
+const LOCK: &str = "dl"; // (the apply under way: its number and when it last said it was alive. A stored key keeps the old word: the lake's format is its name)
 const STALE_MS: u64 = 120_000;
+// (stored keys keep the old word, deploy: "dp" and "dm" are the lake's format, and a rename must not move them)
 fn record_key(n: u64) -> String { format!("dp/{n:010}") }
 fn migration_key(project: &str, file: &str) -> String { format!("dm/{project}/{file}") }
 
-/// What is asked of a project: `POST /plan`, `/deploy` and `/test` (`CALL plan`, `CALL deploy`).
+/// What is asked of a project: `POST /plan`, `/apply` and `/test` (`CALL plan`, `CALL apply`).
 #[derive(Clone, Copy, PartialEq)]
 pub enum Verb {
     Plan,
-    Deploy,
+    Apply,
     Test,
 }
 
-/// A deploy, plan or test asked for: the project's files, as the command line sends them.
+/// An apply, plan or test asked for: the project's files, as the command line sends them.
 #[derive(Deserialize, Default)]
 pub struct Ask {
     pub files: BTreeMap<String, String>, // its path in the project → its text
@@ -55,13 +58,13 @@ pub struct Ask {
     #[serde(default)]
     pub commit: Option<String>, // git's, when the project is in git
     #[serde(default)]
-    pub secrets: BTreeMap<String, String>, // `$name` values from the deploying machine: bound, never kept
+    pub secrets: BTreeMap<String, String>, // `$name` values from the applying machine: bound, never kept
     #[serde(default)]
-    pub test: bool, // a deploy's: its tests after it
+    pub test: bool, // an apply's: its tests after it
     #[serde(default)]
     pub prune: bool, // drop what the project no longer declares
     #[serde(default)]
-    pub plan: Option<String>, // a deploy's: the plan it showed, refused if that is no longer the plan
+    pub plan: Option<String>, // an apply's: the plan it showed, refused if that is no longer the plan
 }
 
 #[derive(Deserialize, Default)]
@@ -85,7 +88,7 @@ struct Env {
     #[serde(default)]
     attach: BTreeMap<String, Attach>,
     #[serde(default)]
-    protected: bool, // (its database is protected once a deploy has applied: `protect.rs`)
+    protected: bool, // (its database is protected once an apply has made it true: `protect.rs`)
 }
 
 #[derive(Deserialize, Clone)]
@@ -181,7 +184,7 @@ struct Project {
     migrations: Vec<(String, String)>, // (file, text), in name order
     tests: Vec<(String, String)>,
     values: HashMap<String, Value>,
-    protect: bool, // (the chosen environment's `protected`: the deploy protects the database)
+    protect: bool, // (the chosen environment's `protected`: the apply protects the database)
 }
 
 fn project(ask: &Ask) -> Result<Project> {
@@ -426,7 +429,7 @@ async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
 }
 
 /// The grants each role has, as statements (never compared: a grant is the project's once a
-/// deploy made it, and making it again changes nothing).
+/// apply made it, and making it again changes nothing).
 async fn grants(lake: &Lake) -> Result<Vec<String>> {
     use crate::users::On;
     let mut out = vec![];
@@ -439,9 +442,10 @@ async fn grants(lake: &Lake) -> Result<Vec<String>> {
             let on = match &g.on {
                 On::Table(t) => format!("TABLE {}", quoted(t)),
                 On::Schema(s) => format!("ALL TABLES IN SCHEMA {}", ident(s)),
-                On::Lake if g.of_database() => format!("DATABASE {}", ident(&crate::ddl::lake_name(lake))), // (CLONE and DEPLOY: ADR-058)
+                On::Lake if g.of_database() => format!("DATABASE {}", ident(&crate::ddl::lake_name(lake))), // (CLONE and APPLY: ADR-058)
                 On::Lake => "ALL TABLES".into(),
                 On::Secret(s) => format!("SECRET {}", ident(s)),
+                On::Database(d) => format!("DATABASE {}", ident(d)), // (CLONE on a database attached here: the project's attachments are exported too)
             };
             out.push(format!("GRANT {}{columns} ON {on} TO {}", g.privilege.to_uppercase(), ident(&k[2..])));
         }
@@ -519,7 +523,7 @@ fn change_of(mark: &str, kind: Kind) -> &'static str {
 #[derive(Serialize)]
 pub struct Plan {
     pub id: String,
-    pub after: u64, // the deploy it follows (0: none)
+    pub after: u64, // the apply it follows (0: none)
     pub steps: Vec<Step>,
     pub refused: Vec<String>,
     pub tests: usize,
@@ -527,7 +531,7 @@ pub struct Plan {
     objects: BTreeMap<String, String>, // key → fingerprint, for the record
 }
 
-/// A deploy as it is kept (`dp/<n>`): who, which commit, the plan, each step, the tests.
+/// An apply as it is kept (`dp/<n>`): who, which commit, the plan, each step, the tests.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Record {
     pub n: u64,
@@ -552,10 +556,10 @@ pub struct Record {
     pub objects: BTreeMap<String, (String, String)>,
 }
 
-/// The deploy entries, newest last.
+/// The apply entries, newest last.
 async fn records(lake: &Lake) -> Result<Vec<Record>> { Ok(lake.cat.scan::<Record>("dp/", "dp0").await?.into_iter().map(|(_, r)| r).collect()) }
 
-/// Each project's last finished deploy (a record that ended `ok` or `tests_failed`): what it left declared.
+/// Each project's last finished apply (a record that ended `ok` or `tests_failed`): what it left declared.
 fn last_finished(all: &[Record]) -> BTreeMap<String, &Record> {
     let mut last = BTreeMap::new();
     for r in all.iter().filter(|r| r.status == "ok" || r.status == "tests_failed") {
@@ -564,8 +568,8 @@ fn last_finished(all: &[Record]) -> BTreeMap<String, &Record> {
     last
 }
 
-/// Every object a project's last finished deploy left declared, by its key (`table sales.orders`),
-/// with the project's name. A protected database changes these only by a deploy (`protect.rs`).
+/// Every object a project's last finished apply left declared, by its key (`table sales.orders`),
+/// with the project's name. A protected database changes these only by an apply (`protect.rs`).
 pub async fn declared(lake: &Lake) -> Result<BTreeMap<String, String>> {
     let all = records(lake).await?;
     Ok(last_finished(&all).into_iter().flat_map(|(project, r)| r.objects.keys().map(move |k| (k.clone(), project.clone()))).collect())
@@ -575,7 +579,7 @@ pub async fn declared(lake: &Lake) -> Result<BTreeMap<String, String>> {
 async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Plan> {
     let all = records(lake).await?;
     let after = all.last().map_or(0, |r| r.n);
-    // What each project's last finished deploy left declared, and who owns what.
+    // What each project's last finished apply left declared, and who owns what.
     let last = last_finished(&all);
     let mine: BTreeMap<String, (String, String)> = last.get(&p.name).map(|r| r.objects.clone()).unwrap_or_default();
     let owner: HashMap<&String, &String> = last.iter().filter(|(n, _)| **n != p.name).flat_map(|(n, r)| r.objects.keys().map(move |k| (k, n))).collect();
@@ -588,12 +592,12 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
     for d in &p.objects {
         let k = d.key();
         if let Some(o) = owner.get(&k) {
-            refused.push(format!("{k} is project {o}'s: a deploy changes only its own project's objects"));
+            refused.push(format!("{k} is project {o}'s: an apply changes only its own project's objects"));
             continue;
         }
         let step = |mark, what: &str, sql: Vec<String>| Step { mark, change: change_of(mark, d.kind), kind: d.kind.word().into(), name: d.name.clone(), what: what.into(), sql };
         let Some(cur) = now.get(&k) else {
-            // (grants, secrets and attachments aren't read back: compared with what the last deploy made)
+            // (grants, secrets and attachments aren't read back: compared with what the last apply made)
             match (d.kind, mine.get(&k)) {
                 (Kind::Grant, Some(_)) => continue,
                 (Kind::Attach | Kind::Secret, Some((was, _))) if *was == d.print => continue,
@@ -628,7 +632,7 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
             continue;
         }
         let drift = mine.contains_key(&k) && was == d.print;
-        let what = if drift { "changed outside a deploy: made as the project says" } else { "replaced" };
+        let what = if drift { "changed outside an apply: made as the project says" } else { "replaced" };
         match d.kind {
             Kind::Materialized => {
                 // Made again from the rows already there, with every view that follows it.
@@ -675,7 +679,7 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
     gone.reverse(); // (what was made last goes first)
     steps.extend(gone);
     // In the order they run: what is added (objects made, tables' columns), then the migrations
-    // (a backfill finds its column, a first deploy's rows their table), then what is replaced or
+    // (a backfill finds its column, a first apply's rows their table), then what is replaced or
     // dropped (planned again after them: a rename makes a table match its declaration).
     let (mut first, rest): (Vec<Step>, Vec<Step>) = steps.into_iter().partition(|s| s.mark == "+" || s.mark == "~" && s.kind == "table");
     first.extend(pending.iter().map(|(f, text)| Step { mark: "▶", change: "migrate", kind: "migration".into(), name: f.clone(), what: "runs once".into(), sql: vec![text.clone()] }));
@@ -742,9 +746,9 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
     let have: Vec<&(String, String)> = m.columns.iter().filter(|(c, _)| !crate::sys::NAMES.contains(&c.as_str()) && c != "_deleted").collect();
     let names = |v: &mut dyn Iterator<Item = &String>| v.cloned().collect::<Vec<_>>().join(", ");
     // (ALTER TABLE … RENAME, DROP and ALTER COLUMN are refused while views read the table: a
-    // migration drops them first, and the deploy makes them again after it)
+    // migration drops them first, and the apply makes them again after it)
     let readers = crate::ddl::readers(lake, &d.name).await?;
-    let first = if readers.is_empty() { String::new() } else { format!(", after dropping what reads it ({}): the deploy makes them again", readers.join(", ")) };
+    let first = if readers.is_empty() { String::new() } else { format!(", after dropping what reads it ({}): the apply makes them again", readers.join(", ")) };
     ensure!(declared.len() >= have.len() && have.iter().zip(&declared).all(|((a, _), (b, ..))| a == b),
         "its columns are ({}) here and ({}) in the project: a column renamed, dropped or moved is a migration's (ALTER TABLE {} RENAME COLUMN … TO …, DROP COLUMN …{first})",
         names(&mut have.iter().map(|(c, _)| c)), names(&mut declared.iter().map(|(c, ..)| c)), quoted(&d.name));
@@ -803,13 +807,13 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
     Ok(sql)
 }
 
-// ---------------------------------------------------------------- the deploy
+// ---------------------------------------------------------------- the apply
 
-/// `POST /deploy`: the plan (`apply` false), the deploy, or the tests alone, of the project sent.
+/// `POST /apply`: the plan, the apply, or the tests alone, of the project sent.
 pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
-    let deployer = crate::auth::limited().is_some_and(|a| a.deploys()); // (a user granted DEPLOY on this database)
-    if verb == Verb::Deploy {
-        authorize(app, who, deployer).await?;
+    let applier = crate::auth::limited().is_some_and(|a| a.applies()); // (a user granted APPLY on this database)
+    if verb == Verb::Apply {
+        authorize(app, who, applier).await?;
     }
     let p = project(&ask)?;
     if verb == Verb::Test {
@@ -823,80 +827,82 @@ pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
         return Ok(j!({"plan": plan, "project": p.name, "ok": plan.refused.is_empty()}));
     }
     if let Some(shown) = &ask.plan {
-        ensure!(*shown == plan.id, "the database changed since that plan (someone deployed, or changed what the project makes): plan again");
+        ensure!(*shown == plan.id, "the database changed since that plan (someone applied, or changed what the project makes): plan again");
     }
     ensure!(plan.refused.is_empty(), "the plan refuses: {}", plan.refused.join("; "));
-    deploy(app, &p, &plan, &ask, who, deployer).await
+    apply(app, &p, &plan, &ask, who, applier).await
 }
 
-/// Who may deploy. On a database that isn't protected: an admin, or a DEPLOY holder. On a protected one
-/// (`protect.rs`): a DEPLOY holder, whoever runs the nodes (their tokens, their key, the program that
-/// started them), or an open lake; a superuser without DEPLOY is refused.
-async fn authorize(app: &App, who: Who, deployer: bool) -> Result<()> {
+/// Who may apply. On a database that isn't protected: an admin, or an APPLY holder. On a protected one
+/// (`protect.rs`): an APPLY holder, whoever runs the nodes (their tokens, their key, the program that
+/// started them), or an open lake; a superuser without APPLY is refused.
+async fn authorize(app: &App, who: Who, applier: bool) -> Result<()> {
     let db = crate::ddl::lake_name(&app.lake);
     match crate::protect::protected(&app.lake).await? {
-        true => ensure!(deployer || crate::auth::operator() || app.open().await, "permission denied: {db} is protected: a deploy needs DEPLOY (GRANT DEPLOY ON DATABASE {db} TO …), or an admin lifts the protection first (ALTER DATABASE {db} SET (protected = false))"),
-        false => ensure!(who.role >= crate::auth::Role::Admin || deployer, "a deploy changes what the database is: it needs an admin token or DEPLOY (a plan or a test runs as you are)"),
+        true => ensure!(applier || crate::auth::operator() || app.open().await, "permission denied: {db} is protected: an apply needs APPLY (GRANT APPLY ON DATABASE {db} TO …), or an admin lifts the protection first (ALTER DATABASE {db} SET (protected = false))"),
+        false => ensure!(who.role >= crate::auth::Role::Admin || applier, "an apply changes what the database is: it needs an admin token or APPLY (a plan or a test runs as you are)"),
     }
     Ok(())
 }
 
-/// A deploy that applied: its statements (`making`), then the database protected when the project's
-/// environment says so and it isn't yet (`[env.prod] protected = true`). A deploy that failed protects nothing.
-async fn deploy(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, deployer: bool) -> Result<Value> {
-    let record = making(app, p, plan, ask, who, deployer).await?;
+/// An apply that succeeded: its statements (`making`), then the database protected when the project's
+/// environment says so and it isn't yet (`[env.prod] protected = true`). An apply that failed protects nothing.
+async fn apply(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applier: bool) -> Result<Value> {
+    let record = making(app, p, plan, ask, who, applier).await?;
     let protects = p.protect && !crate::protect::protected(&app.lake).await?;
     if protects {
         let protect = crate::ddl::Ddl::Protect { database: crate::ddl::lake_name(&app.lake), on: true, by: caller(who) };
         crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![protect]), None, false).await?;
     }
-    let mut out = j!({"deploy": record.n, "status": record.status, "steps": record.steps, "tests": record.tests, "ok": record.status == "ok"});
+    let mut out = j!({"apply": record.n, "status": record.status, "steps": record.steps, "tests": record.tests, "ok": record.status == "ok"});
     if protects {
         out["protected"] = j!(true);
     }
     Ok(out)
 }
 
-/// The deploy's statements from its claim to its final record, tests included, with `DEPLOYING` set so
-/// a project's objects may change (`protect.rs`). A DEPLOY holder below admin runs them as an admin under
+/// The apply's statements from its claim to its final record, tests included, with `APPLYING` set so
+/// a project's objects may change (`protect.rs`). An APPLY holder below admin runs them as an admin under
 /// its own name: making the project true takes an admin's statements, and the record keeps who asked.
 /// This span is also where that admin right ends: a procedure it starts would outlive it (`routines::start`).
-async fn making(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, deployer: bool) -> Result<Record> {
-    let admin = crate::auth::current().filter(|_| deployer && who.role < crate::auth::Role::Admin).map(|me| crate::auth::Principal { role: crate::auth::Role::Admin, access: None, operator: false, ..me });
+async fn making(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applier: bool) -> Result<Record> {
+    let admin = crate::auth::current().filter(|_| applier && who.role < crate::auth::Role::Admin).map(|me| crate::auth::Principal { role: crate::auth::Role::Admin, access: None, operator: false, ..me });
     let as_who = if admin.is_some() { Who { role: crate::auth::Role::Admin, ..who } } else { who };
-    let span = crate::protect::DEPLOYING.scope((), claim_to_record(app, p, plan, ask, as_who));
+    let span = crate::protect::APPLYING.scope((), claim_to_record(app, p, plan, ask, as_who));
     match admin {
         Some(me) => crate::auth::WHO.scope(me, span).await,
         None => span.await,
     }
 }
 
-/// The claim, the deploy's statements (`apply`), and its record's end (`making`'s span).
+/// The claim, the apply's statements (`statements`), and its record's end (`making`'s span).
 async fn claim_to_record(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who) -> Result<Record> {
     let mut record = Record { project: p.name.clone(), env: ask.env.clone(), commit: ask.commit.clone(), who: caller(who), started_ms: crate::log::now_ms(), status: "running".into(), ..Default::default() };
-    let claimed = crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Deploy { claim: true, after: plan.after, record: json(&record) }]), None, false).await?;
-    record.n = claimed["deploy"].as_u64().context("a deploy number")?;
+    let claimed = crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: true, after: plan.after, record: json(&record) }]), None, false).await?;
+    // (the leader's answer keeps `keep`'s old key, "deploy": see there)
+    record.n = claimed["deploy"].as_u64().context("an apply number")?;
     keep_files(&app.lake, record.n, &ask.files).await?;
     let alive = tokio::spawn(beat(app.clone(), record.n));
-    let out = apply(app, p, plan, &mut record, who, ask.test, &ask.secrets).await;
+    let out = statements(app, p, plan, &mut record, who, ask.test, &ask.secrets).await;
     alive.abort();
     if let Err(e) = &out {
         record.status = "failed".into();
         record.error = Some(crate::ext::said(e));
     }
     record.ended_ms = Some(crate::log::now_ms());
-    crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Deploy { claim: false, after: record.n, record: json(&record) }]), None, false).await?;
+    crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&record) }]), None, false).await?;
     out?;
     Ok(record)
 }
 
-/// Who a deploy is recorded as: the caller's name, else its role's.
+/// Who an apply is recorded as: the caller's name, else its role's.
 fn caller(who: Who) -> String { crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("{:?}", who.role).to_lowercase()) }
 
-/// The deploy's statements, then its record of what it left declared, then the tests.
-async fn apply(app: &App, p: &Project, plan: &Plan, record: &mut Record, who: Who, test: bool, secrets: &BTreeMap<String, String>) -> Result<()> {
+/// The apply's statements, then its record of what it left declared, then the tests.
+async fn statements(app: &App, p: &Project, plan: &Plan, record: &mut Record, who: Who, test: bool, secrets: &BTreeMap<String, String>) -> Result<()> {
     let mut values: HashMap<String, Value> = p.values.clone();
     values.extend(secrets.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))));
+    // (the job id keeps the old word: a retried apply's marks are stored under it, so it writes once)
     let job = format!("deploy:{}:{}", p.name, record.n);
     let none = HashMap::new();
     // What is added, then the migrations, then the rest: planned again against what they left.
@@ -912,7 +918,7 @@ async fn apply(app: &App, p: &Project, plan: &Plan, record: &mut Record, who: Wh
     let migrations: Vec<Step> = steps.iter().filter(|s| s.mark == "▶").cloned().collect();
     for m in &migrations {
         crate::routines::script(app, &m.sql[0], &values, &none, who, Some(format!("migration:{}:{}", p.name, m.name))).await.with_context(|| format!("migration {}", m.name))?;
-        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Deploy { claim: false, after: record.n, record: json(&j!({"migration": migration_key(&p.name, &m.name)})) }]), None, false).await?;
+        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&j!({"migration": migration_key(&p.name, &m.name)})) }]), None, false).await?;
         record.steps.push(j!({"mark": m.mark, "kind": m.kind, "name": m.name, "what": "ran"}));
     }
     if !migrations.is_empty() {
@@ -968,24 +974,24 @@ async fn tests(app: &App, p: &Project, who: Who) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-/// The project as deployed, under `files/.deploys/<n>/`, so the database says which code it runs.
+/// The project as applied, under `files/.deploys/<n>/`, so the database says which code it runs.
 async fn keep_files(lake: &Lake, n: u64, files: &BTreeMap<String, String>) -> Result<()> {
     for (p, t) in files {
-        match lake.put(&format!("{}{n}/{p}", crate::files::DEPLOYS), t.as_bytes().to_vec()).await {
-            Err(e) if format!("{e:#}").contains("already exists") => {} // (a retried deploy's)
+        match lake.put(&format!("{}{n}/{p}", crate::files::APPLIES), t.as_bytes().to_vec()).await {
+            Err(e) if format!("{e:#}").contains("already exists") => {} // (a retried apply's)
             done => done?,
         }
     }
     Ok(())
 }
 
-/// While a deploy runs, it says so every 30 s: a deploy whose word is older than two minutes
+/// While an apply runs, it says so every 30 s: an apply whose word is older than two minutes
 /// stopped (its node went), and the next may start.
 async fn beat(app: App, n: u64) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         let alive = Record { n, status: "alive".into(), started_ms: crate::log::now_ms(), ..Default::default() };
-        let _ = crate::write::on_node_as(&app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Deploy { claim: false, after: n, record: json(&alive) }]), None, false).await;
+        let _ = crate::write::on_node_as(&app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: n, record: json(&alive) }]), None, false).await;
     }
 }
 
@@ -995,9 +1001,10 @@ struct Held {
     alive_ms: u64,
 }
 
-/// Leader, under the lake's lock: a deploy's entry. A claim (`claim`) takes the next number when
-/// the newest deploy is still `after` and none is under way; else it writes the record, a
-/// migration done, or that the deploy under way is alive.
+/// Leader, under the lake's lock: an apply's entry. A claim (`claim`) takes the next number when
+/// the newest apply is still `after` and none is under way; else it writes the record, a
+/// migration done, or that the apply under way is alive. Its answer names the number `deploy`: nodes send
+/// it to one another, so the key keeps the old word.
 pub async fn keep(lake: &Lake, claim: bool, after: u64, record: &[u8]) -> Result<Value> {
     let now = crate::log::now_ms();
     let v: Value = serde_json::from_slice(record)?;
@@ -1021,9 +1028,9 @@ pub async fn keep(lake: &Lake, claim: bool, after: u64, record: &[u8]) -> Result
     let all = records(lake).await?;
     let newest = all.last().map_or(0, |r| r.n);
     if let Some(h) = lake.cat.get::<Held>(LOCK).await? {
-        ensure!(now.saturating_sub(h.alive_ms) > STALE_MS, "deploy {} is under way: wait for it to end", h.n);
+        ensure!(now.saturating_sub(h.alive_ms) > STALE_MS, "apply {} is under way: wait for it to end", h.n);
     }
-    ensure!(newest == after, "deploy {newest} ran since that plan: plan again");
+    ensure!(newest == after, "apply {newest} ran since that plan: plan again");
     let mut puts = vec![];
     for mut old in all.into_iter().filter(|r| r.status == "running") {
         old.status = "stopped".into(); // (its node went before it ended: what it did is done)
@@ -1036,7 +1043,7 @@ pub async fn keep(lake: &Lake, claim: bool, after: u64, record: &[u8]) -> Result
     Ok(j!({"deploy": r.n}))
 }
 
-/// `pondra.deploys`: every deploy, newest last.
+/// `pondra.applies`: every apply, newest last.
 pub async fn table(lake: &Lake) -> Result<datafusion::arrow::array::RecordBatch> {
     use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
     use std::sync::Arc;
@@ -1058,7 +1065,7 @@ pub async fn table(lake: &Lake) -> Result<datafusion::arrow::array::RecordBatch>
     ])?)
 }
 
-// ---------------------------------------------------------------- CALL plan(…), CALL deploy(…)
+// ---------------------------------------------------------------- CALL plan(…), CALL apply(…)
 
 /// The first `n` rows as JSON objects.
 fn rows_json(rows: &[datafusion::arrow::array::RecordBatch], n: usize) -> Result<Vec<Value>> {
@@ -1070,20 +1077,20 @@ fn rows_json(rows: &[datafusion::arrow::array::RecordBatch], n: usize) -> Result
 }
 
 /// Pondra's own procedures for a project kept in the workspace.
-pub fn is_own(name: &str) -> bool { matches!(name.to_ascii_lowercase().as_str(), "plan" | "deploy" | "pondra.plan" | "pondra.deploy") }
+pub fn is_own(name: &str) -> bool { matches!(name.to_ascii_lowercase().as_str(), "plan" | "apply" | "pondra.plan" | "pondra.apply") }
 
-/// `CALL plan('files/sales', env => 'prod')`, `CALL deploy('files/sales', env => 'prod', test => true,
-/// prune => false)`: the plan's lines, or the deploy's steps, as rows.
+/// `CALL plan('files/sales', env => 'prod')`, `CALL apply('files/sales', env => 'prod', test => true,
+/// prune => false)`: the plan's lines, or the apply's steps, as rows.
 pub async fn call(app: &App, name: &str, args: &[datafusion::sql::sqlparser::ast::FunctionArg], who: Who) -> Result<Outcome> {
     use datafusion::sql::sqlparser::ast::{FunctionArg, FunctionArgExpr};
-    let apply = name.to_ascii_lowercase().ends_with("deploy");
-    let verb = if apply { Verb::Deploy } else { Verb::Plan };
+    let applying = name.to_ascii_lowercase().ends_with("apply");
+    let verb = if applying { Verb::Apply } else { Verb::Plan };
     let mut select = vec![];
     for (i, a) in args.iter().enumerate() {
         select.push(match a {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) if i == 0 => format!("CAST(({e}) AS VARCHAR) AS folder"),
             FunctionArg::Named { name, arg: FunctionArgExpr::Expr(e), .. } if ["env", "test", "prune", "commit"].contains(&crate::write::ident(name).as_str()) => format!("({e}) AS {}", crate::write::ident(name)),
-            _ => bail!("{name}('files/sales', env => 'prod'{}): the project's folder in the workspace, then env (and test, prune) by name", if apply { ", test => true" } else { "" }),
+            _ => bail!("{name}('files/sales', env => 'prod'{}): the project's folder in the workspace, then env (and test, prune) by name", if applying { ", test => true" } else { "" }),
         });
     }
     ensure!(!select.is_empty(), "{name}: the project's folder in the workspace ('files/sales')");
@@ -1104,7 +1111,7 @@ pub async fn call(app: &App, name: &str, args: &[datafusion::sql::sqlparser::ast
     ensure!(files.contains_key("pondra.toml"), "{folder} holds no pondra.toml: a project's folder (pondra export, or pondra init)");
     let a = Ask { files, env: v["env"].as_str().map(String::from), commit: v["commit"].as_str().map(String::from), test: v["test"] == true, prune: v["prune"] == true, ..Default::default() };
     let out = ask(app, verb, a, who).await?;
-    let steps: Vec<Value> = match apply {
+    let steps: Vec<Value> = match applying {
         true => out["steps"].as_array().cloned().unwrap_or_default(),
         false => {
             let mut s = out["plan"]["steps"].as_array().cloned().unwrap_or_default();

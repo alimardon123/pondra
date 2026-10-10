@@ -35,6 +35,8 @@ pub struct Bases {
     pub schemas: Vec<String>,
     #[serde(default = "yes")]
     pub data: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>, // (who made it: it or an admin drops it, `door`)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -65,6 +67,8 @@ pub struct CloneOf {
     pub schemas: Vec<String>,
     #[serde(default = "yes")]
     pub data: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>, // (who makes it, stamped where the statement comes in: `door`)
 }
 
 /// What the new lake's leader is asked to make of itself.
@@ -78,6 +82,10 @@ pub struct Make {
     pub data: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<(String, crate::ext::Secret)>, // (the bucket keys its bases on other servers are read with: kept in its own catalog)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::users::User>, // (its maker, as the database making it has it: a superuser in the branch)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
 }
 
 fn yes() -> bool { true }
@@ -151,6 +159,13 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
         ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name} CLONE {})", of.from);
         return Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None })).await;
     }
+    // The maker's record, as this lake has it: the branch makes it a superuser (`make`). Only a
+    // user of this database has one; a token's name has none, and so no owner.
+    let owner = match &of.owner {
+        Some(n) => lake.cat.get::<crate::users::User>(&crate::users::user_key(n)).await?,
+        None => None,
+    };
+    let owner_name = owner.as_ref().and(of.owner.clone());
     // Pins first, then the branch's first commit, which reads its base at a version that holds
     // its pin: every file it lists is then kept.
     let mut lakes = inherited.lakes.clone();
@@ -179,7 +194,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
         // (the bucket keys of the bases on other servers, which the branch reads with)
         let urls: Vec<String> = lakes.values().filter(|b| b.read_only).map(|b| b.url.clone()).collect();
         let secrets = crate::ext::lent(lake, &urls).await?;
-        let make = Make { base: base.clone(), me: dir.clone(), lakes, schemas, data: of.data, secrets };
+        let make = Make { base: base.clone(), me: dir.clone(), lakes, schemas, data: of.data, secrets, owner, owner_name };
         Box::pin(crate::write::send(&dir, Request::Ddl(Ddl::Branch(make)))).await
     }.await;
     let made = match made {
@@ -317,6 +332,84 @@ pub async fn may(lake: &Lake, d: &Ddl) -> Result<()> {
     }
 }
 
+/// Where a statement comes in (`write::on_node_listed`, instead of `may`): what a user who isn't a
+/// superuser may branch or drop, and who makes a branch, its owner (ADR-058). CLONE is enough to make
+/// one; a branch is dropped by its owner and by nobody else. Admins and superusers are checked as
+/// before (`may`).
+pub async fn door(lake: &Lake, d: &mut Ddl) -> Result<()> {
+    match crate::auth::limited() {
+        Some(a) => user_door(lake, d, &a).await?,
+        None => may(lake, d).await?,
+    }
+    stamp(lake, d).await
+}
+
+/// A user who isn't a superuser: its grants decide a branch or a drop (`Auth::allows` lets nothing
+/// else of its through).
+async fn user_door(lake: &Lake, d: &mut Ddl, a: &crate::users::Access) -> Result<()> {
+    if let Ddl::CreateDatabase { clone: Some(of), .. } = d {
+        return clone_as(lake, of, a);
+    }
+    if let Ddl::DropDatabase { name, if_exists } = d {
+        return drop_as(lake, name.as_str(), *if_exists).await;
+    }
+    may(lake, d).await
+}
+
+/// A branch of a database, made by a user with CLONE: on this database, as its grants let it (every
+/// schema, or those granted, and only those it names); on a database attached here, by its own grant.
+/// Prod still decides what the attachment's token may pin (`pin`), so `may` isn't asked there.
+fn clone_as(lake: &Lake, of: &mut CloneOf, a: &crate::users::Access) -> Result<()> {
+    let from = of.from.trim_matches('"').to_lowercase();
+    let here = crate::ddl::lake_name(lake);
+    let me = crate::auth::current().map(|p| p.name).unwrap_or_default();
+    if from != here {
+        ensure!(a.clones_of(&from), "permission denied: a branch of {from} here needs CLONE on it (GRANT CLONE ON DATABASE {from} TO {me}, run on {here})");
+        return Ok(());
+    }
+    let Some(schemas) = a.clones() else { bail!("permission denied: a branch of {here} needs CLONE (GRANT CLONE ON DATABASE {here} TO {me})") };
+    if schemas.is_empty() {
+        return Ok(()); // (CLONE ON DATABASE: every schema)
+    }
+    if of.schemas.is_empty() {
+        of.schemas = schemas;
+    } else {
+        ensure!(of.schemas.iter().all(|s| schemas.contains(s)), "permission denied: {me} may clone {} of {here} only (GRANT CLONE ON SCHEMA … TO {me})", schemas.join(", "));
+    }
+    Ok(())
+}
+
+/// A branch dropped by a user who isn't a superuser: by its owner alone (an admin drops any). A
+/// shared one (test, a pull request's) is CI's, so a developer who may clone prod can't drop it. A
+/// database that isn't there is nothing to drop with IF EXISTS.
+async fn drop_as(lake: &Lake, name: &str, if_exists: bool) -> Result<()> {
+    let me = crate::auth::current().map(|p| p.name).unwrap_or_default();
+    // (attached here, or beside this lake on its server, not yet attached to this node)
+    let attached = lake.attached.read().unwrap().iter().find(|(n, _)| *n == name).map(|(_, l)| l.url.clone());
+    let url = attached.unwrap_or_else(|| crate::ddl::beside(&lake.url, name));
+    if !crate::ddl::has_catalog(&url).await? {
+        ensure!(if_exists, "no database {name}");
+        return Ok(());
+    }
+    let bases = Lake::open(&url, false, false).await?.cat.get::<Bases>(BASES).await?;
+    match bases.and_then(|b| b.owner) {
+        Some(owner) if owner == me => Ok(()),
+        Some(owner) => bail!("permission denied: {name} is {owner}'s branch: {owner} or an admin drops it"),
+        None => bail!("permission denied: DROP DATABASE {name} needs an admin (a user drops only the branches it made)"),
+    }
+}
+
+/// Who makes a branch: a user of this database (not a token's name) is stamped on the statement where
+/// it comes in. `create` reads that user's record, and `make` makes it the branch's superuser.
+async fn stamp(lake: &Lake, d: &mut Ddl) -> Result<()> {
+    let Ddl::CreateDatabase { clone: Some(of), .. } = d else { return Ok(()) };
+    let me = crate::auth::current().map(|p| p.name).unwrap_or_default();
+    if !me.is_empty() && lake.cat.get::<crate::users::User>(&crate::users::user_key(&me)).await?.is_some() {
+        of.owner = Some(me);
+    }
+    Ok(())
+}
+
 /// The pins clean-up keeps files for: the oldest and the newest (None: no branch reads this lake).
 pub async fn pins(lake: &Lake) -> Result<Option<(u64, u64)>> {
     let all = lake.cat.scan::<Pin>("pn/", "pn0").await?;
@@ -401,6 +494,13 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
             _ => puts.push((k.clone(), v.to_vec())),
         }
     }
+    // The maker owns what it made: a superuser there, whatever it may do in the database it was made
+    // from. (Whether the base's users were copied above or not, `"u" if away`, its record is this one.)
+    if let (Some(record), Some(name)) = (&m.owner, &m.owner_name) {
+        let key = crate::users::user_key(name);
+        puts.retain(|(k, _)| *k != key);
+        puts.push((key, json(&crate::users::User { superuser: true, ..record.clone() })));
+    }
     // The base's log after the oldest table's files, copied with its segment numbers: rows not
     // yet in any file (seconds of them), with their ids and versions.
     let mut objects = vec![];
@@ -428,7 +528,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     futures::stream::iter(objects).map(|p| copy(&base, lake, p)).buffer_unordered(16).try_collect::<Vec<_>>().await?;
     puts.push(("n".into(), json(&next.max(lake.cat.get::<u64>("n").await?.unwrap_or(0)))));
     puts.push(("b".into(), json(&block.max(lake.cat.get::<u64>("b").await?.unwrap_or(0)))));
-    let me = Bases { base: m.base.clone(), at_ms: crate::log::now_ms(), me: m.me.clone(), lakes: m.lakes.clone(), schemas: m.schemas.clone(), data: m.data };
+    let me = Bases { base: m.base.clone(), at_ms: crate::log::now_ms(), me: m.me.clone(), lakes: m.lakes.clone(), schemas: m.schemas.clone(), data: m.data, owner: m.owner_name.clone() };
     puts.push((BASES.into(), json(&me)));
     lake.cat.start_after(commit).await;
     lake.cat.commit(puts, &[]).await?;
@@ -495,18 +595,20 @@ pub async fn databases(lake: &Lake) -> Result<datafusion::arrow::record_batch::R
     for (name, l) in &all {
         let b = l.cat.get::<Bases>(BASES).await.ok().flatten();
         let branches = l.cat.scan::<Pin>("pn/", "pn0").await.map(|p| p.len()).unwrap_or(0);
-        rows.push((name.clone(), l.url.clone(), b.as_ref().map(|b| named(&b.base)), b.map(|b| b.at_ms as i64 * 1000), branches as i64));
+        let owner = b.as_ref().and_then(|b| b.owner.clone());
+        rows.push((name.clone(), l.url.clone(), b.as_ref().map(|b| named(&b.base)), b.map(|b| b.at_ms as i64 * 1000), branches as i64, owner));
         lifts.push(match crate::protect::of(l).await.ok().flatten() {
             Some(p) if p.protected => (true, None, None),
             Some(p) => (false, Some(p.at_ms as i64 * 1000), Some(p.by)),
             None => (false, None, None),
         });
     }
-    let s = |f: &dyn Fn(&(String, String, Option<String>, Option<i64>, i64)) -> Option<String>| Arc::new(rows.iter().map(f).collect::<StringArray>()) as ArrayRef;
+    let s = |f: &dyn Fn(&(String, String, Option<String>, Option<i64>, i64, Option<String>)) -> Option<String>| Arc::new(rows.iter().map(f).collect::<StringArray>()) as ArrayRef;
     Ok(datafusion::arrow::record_batch::RecordBatch::try_from_iter(vec![
         ("name", s(&|r| Some(r.0.clone()))),
         ("location", s(&|r| Some(r.1.clone()))),
         ("base", s(&|r| r.2.clone())),
+        ("owner", s(&|r| r.5.clone())), // (the user who made a branch; none for an admin's branch and for a database that isn't one)
         ("branched_at", Arc::new(rows.iter().map(|r| r.3).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),
         ("branches", Arc::new(rows.iter().map(|r| Some(r.4)).collect::<Int64Array>()) as ArrayRef),
         ("protected", Arc::new(lifts.iter().map(|l| Some(l.0)).collect::<BooleanArray>()) as ArrayRef),

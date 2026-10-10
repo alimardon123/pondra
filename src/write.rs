@@ -500,7 +500,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         static SCHEMAS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)schemas\s*=\s*\(([^)]*)\)").expect("a regex"));
         let tail = c.get(5).map_or("", |m| m.as_str());
         let schemas = SCHEMAS.captures(tail).map(|s| s[1].split(',').map(|n| name(n.trim())).filter(|n| !n.is_empty()).collect()).unwrap_or_default();
-        let clone = crate::branch::CloneOf { from: name(&c[4]), schemas, data: !regex::Regex::new(r"(?i)WITH\s+NO\s+DATA").expect("a regex").is_match(tail) };
+        let clone = crate::branch::CloneOf { from: name(&c[4]), schemas, data: !regex::Regex::new(r"(?i)WITH\s+NO\s+DATA").expect("a regex").is_match(tail), owner: None };
         return Some(Stmt::Ddl(vec![Ddl::CreateDatabase { name: name(&c[2]), if_not_exists: c.get(1).is_some(), dir: c.get(3).map(|d| d.as_str().replace("''", "'")), clone: Some(clone) }]));
     }
     // `ALTER DATABASE b REFRESH [t, …]`: a branch's tables (all it took from its base, or those
@@ -694,7 +694,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             _ => return None,
         },
         Statement::CreateDatabase { db_name, if_not_exists, location, clone, .. } => {
-            let clone = clone.map(|c| crate::branch::CloneOf { from: object(&c).to_lowercase(), schemas: vec![], data: true });
+            let clone = clone.map(|c| crate::branch::CloneOf { from: object(&c).to_lowercase(), schemas: vec![], data: true, owner: None });
             Stmt::Ddl(vec![Ddl::CreateDatabase { name: object(&db_name).to_lowercase(), if_not_exists, dir: location, clone }])
         }
         Statement::DetachDuckDBDatabase { if_exists, database_alias, .. } => Stmt::Ddl(vec![Ddl::Detach { name: ident(&database_alias), if_exists }]),
@@ -1296,7 +1296,7 @@ async fn seen_there(other: &Lake, mark: Option<String>) {
 }
 
 async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
-    let stmt = crate::protect::door(&app.lake, stmt).await?; // (a project's objects in a protected database: a deploy's only)
+    let stmt = crate::protect::door(&app.lake, stmt).await?; // (a project's objects in a protected database: an apply's only)
     if let Some(out) = crate::temp::statement(app, &stmt, files).await? {
         return Ok(out); // (the session's own tables and views: on this node, in memory)
     }
@@ -1326,8 +1326,8 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     let (lake, job) = (&app.lake, job.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
     if let Stmt::Ddl(ddls) = stmt {
         let mut out = j!({});
-        for d in ddls {
-            crate::branch::may(lake, &d).await?; // (another database's own sign-in: users::across)
+        for mut d in ddls {
+            crate::branch::door(lake, &mut d).await?; // (a branch: who may make or drop one, and its owner; another database's sign-in: users::across)
             out = match &app.seq {
                 Some(seq) => ddl_here(lake, seq, &app.lock, d.clone()).await?,
                 None => post(&app.cluster.leader.addr, &Request::Ddl(d.clone())).await?,

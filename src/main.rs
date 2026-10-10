@@ -19,7 +19,7 @@ mod guard;
 mod hilbert;
 mod history;
 mod ddl;
-mod deploy;
+mod apply;
 mod defaults;
 mod delta;
 mod ext;

@@ -178,7 +178,7 @@ impl Auth {
             "login" | "whoami" => Role::None, // (signing in; and who one is)
             "secrets" => Role::None, // (a procedure's lent token only: `server::secret`)
             "v1" if method == "POST" || method == "DELETE" => Role::Write, // (another engine's append: ADR-028; its tables made, dropped and renamed: ADR-029, as the SQL's rights say)
-            "sql" | "lookup" | "watch" | "live" | "sessions" | "mcp" | "v1" | "metrics" | "routines" | "objects" | "kinds" | "plan" | "deploy" | "test" | "export" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog; a deploy, not its plan, needs an admin: `deploy::ask`)
+            "sql" | "lookup" | "watch" | "live" | "sessions" | "mcp" | "v1" | "metrics" | "routines" | "objects" | "kinds" | "plan" | "apply" | "test" | "export" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog; an apply, not its plan, needs an admin: `apply::ask`)
             "append" | "insert" => Role::Write,
             "cluster" if path.starts_with("/cluster/files") || path.starts_with("/cluster/commit") => Role::Write, // (writers on other machines)
             "cluster" if path.starts_with("/cluster/leader") => Role::None,
@@ -190,6 +190,10 @@ impl Auth {
     pub fn allows(&self, role: Role, stmt: &Stmt) -> Result<()> {
         if crate::temp::own(stmt) {
             return Ok(()); // (the session's own tables and views: any role may keep them)
+        }
+        // (CLONE is enough to make a branch, and its owner drops it: `branch::door` checks)
+        if limited().is_some() && matches!(stmt, Stmt::Ddl(ds) if ds.len() == 1 && matches!(ds[0], crate::ddl::Ddl::CreateDatabase { clone: Some(_), .. } | crate::ddl::Ddl::DropDatabase { .. })) {
+            return Ok(());
         }
         let need = if matches!(stmt, Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::CopyTo(..)) { Role::Admin } else { Role::Write };
         if role < need && !(need == Role::Write && limited().is_some()) { // (a user's writes: its grants, below)
@@ -228,7 +232,7 @@ struct Lent {
     secrets: Vec<String>,
     session: Option<String>, // (its caller's temporary tables are its own too: `temp.rs`)
     vars: crate::vars::Lent, // (its run's variables and given values: `db.vars` is `$name`)
-    deploying: bool,         // (called by a deploy's statement: `protect::deploying`)
+    applying: bool,          // (called by an apply's statement: `protect::applying`)
 }
 
 /// A table as the catalog names it (`t` for `public.t`, `s.t`; another lake's `l.s.t` stays).
@@ -244,16 +248,16 @@ static LENT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Stri
 pub fn lend(role: Role, files: bool) -> Lease {
     let token = format!("lease-{}", uuid::Uuid::new_v4().simple());
     let who = current().filter(|p| p.role >= role).unwrap_or_else(|| Principal::of(role));
-    let deploying = crate::protect::deploying(); // (a deploy's migration calling it: its calls back may change a project's objects, until the call ends)
-    LENT.lock().unwrap().insert(token.clone(), Lent { role, who, files, secrets: vec![], session: crate::temp::current(), vars: crate::vars::lend(), deploying });
+    let applying = crate::protect::applying(); // (an apply's migration calling it: its calls back may change a project's objects, until the call ends)
+    LENT.lock().unwrap().insert(token.clone(), Lent { role, who, files, secrets: vec![], session: crate::temp::current(), vars: crate::vars::lend(), applying });
     Lease(token)
 }
 
 /// What a lent token allows, while its procedure runs.
 pub fn lent(token: Option<&str>) -> Option<(Role, bool)> { LENT.lock().unwrap().get(token?).map(|l| (l.role, l.files)) }
 
-/// Whether a lent token's procedure runs inside a deploy (`protect::deploying`): its requests are the deploy's.
-pub fn lent_deploying(token: Option<&str>) -> bool { token.is_some_and(|t| LENT.lock().unwrap().get(t).is_some_and(|l| l.deploying)) }
+/// Whether a lent token's procedure runs inside an apply (`protect::applying`): its requests are the apply's.
+pub fn lent_applying(token: Option<&str>) -> bool { token.is_some_and(|t| LENT.lock().unwrap().get(t).is_some_and(|l| l.applying)) }
 
 /// The session of the caller a lent token's procedure runs for.
 pub fn lent_session(token: Option<&str>) -> Option<String> { LENT.lock().unwrap().get(token?).and_then(|l| l.session.clone()) }

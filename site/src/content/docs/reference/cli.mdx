@@ -9,7 +9,7 @@ import { Aside } from '@astrojs/starlight/components';
 
 `pondra` is one binary. On its own it opens a SQL shell on a lake. `pondra serve` runs a node on a
 lake, or serves a folder of lakes as databases, `pondra sql` and `pondra run` run SQL, `pondra
-workspace` keeps the lake's files in a folder of yours, `pondra plan` and `pondra deploy` make a
+workspace` keeps the lake's files in a folder of yours, `pondra plan` and `pondra apply` make a
 database match a project of files, and `pondra catalog` prints what the lake's catalog holds.
 
 | Command | Does |
@@ -19,8 +19,8 @@ database match a project of files, and `pondra catalog` prints what the lake's c
 | `pondra sql --dir LAKE "SQL"` | run one statement against the lake, with no server |
 | `pondra run FILE LAKE` | run a SQL file, its `$name` parameters taking the values you pass |
 | `pondra workspace pull\|push DIR LAKE` | the lake's files in a folder of yours, for git and your editor |
-| `pondra init`, `plan`, `deploy`, `test`, `export` | a project of files, made true in a database ([environments](/pondra/guides/environments/#deploy-a-project)) |
-| `pondra login URL`, `branch`, `diff` | a server's token kept; a database branched from another; what a branch changes |
+| `pondra init`, `plan`, `apply`, `test`, `export` | a project of files, made true in a database ([environments](/pondra/guides/environments/#apply-a-project)) |
+| `pondra login`, `branch`, `switch`, `diff`, `ci init` | a server's token kept; a Git branch and its database; what a branch changes; CI set up |
 | `pondra catalog --dir LAKE PREFIX` | print catalog entries |
 | `pondra --version`, `pondra --help` | the version, and help for any command |
 
@@ -348,39 +348,45 @@ pushed 1, deleted 0 in the lake
 pulled 0, removed 0 here
 ```
 
-## pondra plan, deploy and the project's commands
+## pondra plan, apply and the project's commands
 
 A project is a folder with `pondra.toml`, `objects/`, `migrations/` and `tests/`
-([deploy a project](/pondra/guides/environments/#deploy-a-project)). Each command reads it from
+([apply a project](/pondra/guides/environments/#apply-a-project)). Each command reads it from
 `--project` (this folder by default) and talks to an environment's node.
 
 | Command | Does |
 |---|---|
-| `pondra init [DIR]` | start a project: pondra.toml, objects/, migrations/, tests/ (`--name`) |
-| `pondra plan` | what a deploy would change, and what it refuses (exit 1 if anything is refused) |
-| `pondra deploy [--test] [--prune]` | the plan, then each step; `--test` runs tests/ after it, `--prune` drops what the project no longer declares (exit 1 if it fails) |
-| `pondra test` | run tests/: any row a query returns is a failure (exit 1 if one fails) |
+| `pondra init [DIR]` | start a project: pondra.toml, objects/, migrations/, tests/, and a `.gitignore` that leaves out `lake/` (`--name`) |
+| `pondra plan [ENV]` | what an apply would change, and what it refuses (exit 1 if anything is refused) |
+| `pondra apply [ENV]` | the plan, then each step, then tests/ (exit 1 if it fails); the database is made first if it isn't there |
+| `pondra apply local` | this machine's own database: the lake in the project's `lake/` folder, which `pondra` there opens as its shell; no server (pondra.toml's `[env.local]` says otherwise) |
+| `pondra apply --watch` | apply again on every save of the project's files; Ctrl-C stops (refused on prod, `main` and protected databases); a lake's node stays up while it watches, its console at the address printed |
+| `pondra apply --fresh` | make a clone (a branch, or `[env.test]`) again from where it came from first |
+| `pondra apply --no-test`, `--prune` | skip tests/; drop the objects the project no longer declares |
+| `pondra test [ENV]` | run tests/: any row a query returns is a failure (exit 1 if one fails) |
 | `pondra export [DIR]` | the environment's objects as a project's files (pondra.toml kept if DIR has one) |
-| `pondra login URL [--token T \| --user U]` | keep a token for a server in `~/.pondra` (`PONDRA_HOME`); asked for when not given |
-| `pondra branch [NAME] [--from prod] [--replace \| --drop \| --if-missing]` | `CREATE DATABASE NAME CLONE prod` on prod's node (NAME: the git branch's); `--drop` lets it go; `--if-missing` leaves a database that is there |
-| `pondra branch --hook [--from prod]` | a git hook (`.git/hooks/post-checkout`) that makes the branch's database on each `git switch` to a branch |
-| `pondra dev [--from prod]` | make the git branch's database if it isn't there, then deploy and test the project on each save; Ctrl-C stops (refused on prod, main and protected databases) |
-| `pondra ci init [--force]` | write `.github/workflows/pondra.yml`: each pull request's branch of prod deployed, tested and diffed; test on merge; prod on approval |
-| `pondra diff [--against prod]` | the objects that differ and the rows of each table both have, as Markdown |
+| `pondra login [URL] [--token T \| --user U]` | keep a token for a server in `~/.pondra` (`PONDRA_HOME`); with no URL, for each server pondra.toml names; asked for when not given |
+| `pondra branch NAME [--from DB]` | start a branch: the Git branch NAME (switched to) and a database of its name, cloned from `[env.dev] clone`, else prod, with no file copied |
+| `pondra switch NAME` | `git switch NAME`, and its database made if it isn't there |
+| `pondra branch` | the branches' databases: where each came from, when, who made it; `*` marks yours |
+| `pondra branch -d NAME` | drop its database (its maker or an admin), and its Git branch when git lets it go |
+| `pondra diff [ENV] [--against DB]` | the objects that differ and the rows of each table both have, as Markdown (against its clone's source, else prod) |
+| `pondra ci init [--force]` | set CI up: `.github/workflows/pondra.yml`, prod protected, CI's users and tokens, GitHub's secrets and `prod` environment (through `gh`) |
 
 Where the environment is:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--env NAME`, `-e` | `PONDRA_ENV`, else the git branch's database, else pondra.toml's only environment | the environment: `[env.NAME]` in pondra.toml, or a database on the project's server |
-| `--url URL` | `[env.NAME] url`, else `[project] server` + `/db/NAME` | the node to talk to |
+| `ENV`, `--env NAME`, `-e` | `PONDRA_ENV`, else the git branch's database (on `main`, name one) | an environment in pondra.toml, or a branch's database |
+| `--url URL` | `[env.NAME] url`, else its server + `/db/NAME` | the node to talk to |
 | `--lake LAKE` | `[env.NAME] lake` | start a node for this lake instead |
-| `--token TOKEN` | `PONDRA_TOKEN`, else `pondra login`'s | a token for it: an admin's to deploy, a reader's to plan |
+| `--token TOKEN` | `PONDRA_TOKEN`, else `pondra login`'s | a token for it: one that may apply, or a reader's to plan |
 | `--project DIR` | `.` | the project's folder |
 
-A database name is letters, digits and `_`: `pr-123` and `feature/x` become `pr_123` and
-`feature_x`. A deploy sends `[env.NAME]`'s values (`[env.dev]`'s for a database pondra.toml doesn't
-name), the git commit, and `[secrets]`' values from this machine's environment.
+An environment's server is its own `server`, a branch's is `[env.dev]`'s, and otherwise the
+project's. A database name is letters, digits and `_`: `pr-123` and `feature/x` become `pr_123` and
+`feature_x`. An apply sends `[env.NAME]`'s values (`[env.dev]`'s for a branch), the git commit, and
+`[secrets]`' values from this machine's environment.
 
 ## pondra catalog
 

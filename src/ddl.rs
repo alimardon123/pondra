@@ -213,7 +213,9 @@ pub enum Ddl {
     Unpin { lake: String },
     Refresh { database: Option<String>, tables: Vec<String> }, // ALTER DATABASE b REFRESH t, …: b's leader (ADR-047)
     Protect { database: String, on: bool, #[serde(default)] by: String }, // ALTER DATABASE b SET (protected = …): b's leader (ADR-058, `protect.rs`)
-    Deploy { claim: bool, after: u64, record: Vec<u8> }, // a deploy's entry: its claim, its record, a migration done (`deploy::keep`, ADR-047 §4)
+    // (the wire op keeps the old word: a node of the last release sends it to the leader)
+    #[serde(rename = "deploy")]
+    Apply { claim: bool, after: u64, record: Vec<u8> }, // an apply's entry: its claim, its record, a migration done (`apply::keep`, ADR-047 §4)
     DropDatabase { name: String, if_exists: bool }, // a folder of databases' (`dbserver.rs`): its node stopped, its folder deleted (ADR-030)
     AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
     RenameTable { name: String, to: String }, // ALTER TABLE | VIEW … RENAME TO (ADR-030)
@@ -415,7 +417,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Unpin { lake: branch } => crate::branch::unpin(lake, &branch).await,
         Ddl::Refresh { .. } => bail!("ALTER DATABASE … REFRESH is done by its database's leader (write::handle)"),
         Ddl::Protect { database, on, by } => crate::protect::set(lake, &database, on, &by).await,
-        Ddl::Deploy { claim, after, record } => crate::deploy::keep(lake, claim, after, &record).await,
+        Ddl::Apply { claim, after, record } => crate::apply::keep(lake, claim, after, &record).await,
         Ddl::CreateDatabase { name, if_not_exists, dir, clone: None } => {
             check(&name)?;
             let dir = dir.unwrap_or_else(|| beside(&lake.url, &name));
@@ -436,6 +438,9 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                 branches = now.cat.scan::<crate::branch::Pin>("pn/", "pn0").await?.into_iter().map(|(_, p)| p.lake).collect();
             }
             ensure!(branches.is_empty(), "{name} has branches ({}): drop them first", branches.join(", "));
+            if target.is_none() && if_exists && std::env::var("PONDRA_SERVER_URL").is_err() {
+                return Ok(j!({"database": name, "dropped": false, "notice": format!("database \"{name}\" does not exist, skipping")}));
+            }
             let dropped = match (std::env::var("PONDRA_SERVER_URL"), &bases, &target) {
                 (Ok(server), ..) => {
                     let r = crate::cluster::http().delete(format!("{server}/databases/{name}?if_exists={if_exists}")).send().await?;

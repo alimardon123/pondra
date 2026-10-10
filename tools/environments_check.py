@@ -5,7 +5,8 @@ retention; `pondra.diff` tells their rows apart; `ALTER DATABASE dev REFRESH [t]
 (a view: the tables it reads; none named: all) and what follows it up to prod's present; a branch of
 a branch; `DROP DATABASE` lets go. A base that signs in on its own (a user, no token shared with the
 branch): its branch's REFRESH and unpin go by the branch's own key, and a clone's REFRESH stays within
-the schemas it took (`signed_in_check`).
+the schemas it took (`signed_in_check`). Who makes a branch and who may drop it: `owners_check` (a user
+with CLONE branches a database and owns the branch; only its owner, or an admin, drops it).
 
   environments_check.py [--new target/release/pondra] [--work DIR] [--port 9780] [--s3]
   environments_check.py --across [--new target/release/pondra] [--work DIR] [--port 9780]
@@ -244,6 +245,16 @@ def environments_check(bin, work, port, root):
         and rows(dev, "SELECT count(*) FROM secrets()") == [(0,)] and rows(prod, "SELECT count(*) FROM secrets()") == [(1,)] \
         and rows(dev, shared) == [(0, 0)] and rows(prod, shared) == [(1, 1)]
     checks["dev has prod's workspace files"] = dev.get("/files/etl/orders.sql") == b"SELECT count(*) FROM sales.orders"
+    # A task dev makes waits for RESUME too (an apply's, say); one it resumed stays started when made again.
+    dev.q("CREATE TASK hourly SCHEDULE '1 hour' AS INSERT INTO k VALUES (98, 'dev')")
+    made_suspended = rows(dev, "SELECT name, state FROM pondra.tasks ORDER BY name")
+    dev.q("ALTER TASK hourly RESUME")
+    dev.q("CREATE OR REPLACE TASK hourly SCHEDULE '2 hours' AS INSERT INTO k VALUES (98, 'dev')")
+    checks["a task dev makes starts suspended too, one it resumed stays started when made again, and prod's runs"] = \
+        made_suspended == [("hourly", "suspended"), ("nightly", "suspended")] \
+        and rows(dev, "SELECT state FROM pondra.tasks WHERE name = 'hourly'") == [("started",)] \
+        and rows(prod, "SELECT state FROM pondra.tasks WHERE name = 'nightly'") == [("started",)]
+    dev.q("DROP TASK hourly")
     dev.q("INSERT INTO sales.orders VALUES (5001, 1.0)")
     dev.q("UPDATE sales.orders SET amount = 0 WHERE id BETWEEN 21 AND 25")
     dev.q("DELETE FROM sales.orders WHERE id BETWEEN 26 AND 30")
@@ -505,6 +516,16 @@ def across_check(bin, work, port):
         writes = [refused(dev, "INSERT INTO prod.sales.orders VALUES (9, 9.0)"), refused(dev, "DELETE FROM prod.sales.orders WHERE id = 1")]
         checks["a write to the attachment is refused by name: a read-only key here"] = all("read-only key" in w for w in writes)
 
+        # A user of dev granted CLONE on prod (attached here) branches it on dev and owns it. dev has no
+        # token, but a user who signs in is limited by its own grants all the same: the grant alone lets dana.
+        dev.q("CREATE USER dana PASSWORD 'dana-password-1'")
+        dev.q("GRANT CLONE ON DATABASE prod TO dana")
+        dana = {"Authorization": "Basic " + base64.b64encode(b"dana:dana-password-1").decode()}
+        made_dana = raw(port + 1, "POST", "/sql", "CREATE DATABASE dana CLONE prod", dana)[0]
+        owner_dana = rows(dev, "SELECT owner FROM pondra.databases WHERE name = 'dana'")
+        dropped_dana = raw(port + 1, "POST", "/sql", "DROP DATABASE dana", dana)[0]
+        checks["a user of dev granted CLONE ON DATABASE prod (attached) branches it on dev, and owns it"] = \
+            made_dana == 200 and owner_dana == [("dana",)] and dropped_dana == 200
         dev.q("CREATE DATABASE ali CLONE prod")
         checks["CREATE DATABASE ali CLONE prod on dev keeps its folder in acme-dev and copies no file of prod's"] = \
             len(keys(ali_lake)) > 0 and not keys("s3://acme-prod/ali") and parquet(ali_lake) == []
@@ -525,6 +546,12 @@ def across_check(bin, work, port):
         ali = Anon(bin, ali_lake, port + 2, work, env=s3_env(env_url, key_dev), token=False).start()
         checks["a node on ali's folder that never saw the attachment answers as dev did: it reads prod with the key it kept"] = \
             rows(ali, "SELECT id, amount FROM sales.orders ORDER BY id") == ali_before
+        metrics = ali.get("/metrics").decode()
+        turns = {l.split(" ")[0]: float(l.split(" ")[1]) for l in metrics.splitlines() if l.startswith("pondra_bucket_turns") and 'lake="prod"' in l}
+        quarter = max(1, int(os.environ.get("PONDRA_BUCKET_REQUESTS", "256")) // 4)
+        checks["ali reads prod's files with a quarter of a node's turns at prod's bucket, and used them (/metrics)"] = \
+            turns.get('pondra_bucket_turns{bucket="s3://acme-prod",lake="prod"}') == quarter \
+            and 1 <= turns.get('pondra_bucket_turns_most{bucket="s3://acme-prod",lake="prod"}', 0) <= quarter
 
         prod.q("UPDATE sales.orders SET amount = amount + 100")  # (prod moves on: every row changed, one deleted)
         prod.q("DELETE FROM sales.orders WHERE id = 2")
@@ -565,9 +592,9 @@ def across_check(bin, work, port):
 
 
 def protect_check(bin, work, port, root):
-    """Protected databases (ADR-058 step 3): a project's deploy protects `pprod` ([env.prod] protected = true),
-    after which its objects change only by a deploy (a DEPLOY holder's, or an admin's); rows and a person's
-    own objects stay free; lifting is an admin's and audited; a branch isn't protected; DEPLOY is a database's."""
+    """Protected databases (ADR-058 step 3): a project's apply protects `pprod` ([env.prod] protected = true),
+    after which its objects change only by an apply (an APPLY holder's, or an admin's); rows and a person's
+    own objects stay free; lifting is an admin's and audited; a branch isn't protected; APPLY is a database's."""
     prod = Node(bin, root + "/pprod", port + 20, work, token=False).start()  # (the database is named by its folder)
     basic = {u: "Basic " + base64.b64encode(f"{u}:{u}-password-1".encode()).decode() for u in ["root", "ci"]}
 
@@ -605,7 +632,7 @@ def protect_check(bin, work, port, root):
         return [tuple(r.values()) for r in json.loads(text)]
 
     def post(user, path, body):
-        """A JSON request (a deploy, the cluster's own door) as a user signs in: (status, text)."""
+        """A JSON request (an apply, the cluster's own door) as a user signs in: (status, text)."""
         return raw(port + 20, "POST", path, json.dumps(body), {"Authorization": basic[user], "Content-Type": "application/json"})
 
     def state():
@@ -622,11 +649,11 @@ def protect_check(bin, work, port, root):
     try:
         prod.q("CREATE USER root PASSWORD 'root-password-1' SUPERUSER")
         prod.q("CREATE USER ci PASSWORD 'ci-password-1'")
-        prod.q("GRANT DEPLOY ON DATABASE pprod TO ci")
-        status, text = post("ci", "/deploy", {"files": project, "env": "prod"})
+        prod.q("GRANT APPLY ON DATABASE pprod TO ci")
+        status, text = post("ci", "/apply", {"files": project, "env": "prod"})
         if status != 200:
-            raise Failed(f"ci's deploy of the project: {status} {text[:800]}")
-        checks["a DEPLOY holder who isn't an admin deploys, and `[env.prod] protected = true` protects the database"] = state() == [(True, False, None)]
+            raise Failed(f"ci's apply of the project: {status} {text[:800]}")
+        checks["an APPLY holder who isn't an admin applies, and `[env.prod] protected = true` protects the database"] = state() == [(True, False, None)]
 
         frozen = ["DROP TABLE sales.orders", "CREATE OR REPLACE VIEW sales.big AS SELECT 1 AS x", "ALTER TABLE sales.orders ADD COLUMN x INT",
                   "ALTER TABLE sales.orders RENAME COLUMN amount TO a", "DROP ROLE analyst", "REVOKE SELECT ON sales.orders FROM analyst"]
@@ -642,10 +669,10 @@ def protect_check(bin, work, port, root):
         checks["the cluster's own door refuses it too: an admin's drop over /cluster/ddl is refused, and the table stays"] = \
             post("root", "/cluster/ddl", drop)[0] != 200 and refused(prod, "SELECT count(*) FROM sales.orders") == ""
 
-        root_deploy = post("root", "/deploy", {"files": with_note, "env": "prod"})
-        ci_deploy = post("ci", "/deploy", {"files": with_note, "env": "prod"})
-        checks["a superuser without DEPLOY can't deploy a protected database; ci's deploy changes it"] = \
-            root_deploy[0] != 200 and "DEPLOY" in root_deploy[1] and ci_deploy[0] == 200 and refused(prod, "SELECT note FROM sales.orders") == ""
+        root_apply = post("root", "/apply", {"files": with_note, "env": "prod"})
+        ci_apply = post("ci", "/apply", {"files": with_note, "env": "prod"})
+        checks["a superuser without APPLY can't apply a protected database; ci's apply changes it"] = \
+            root_apply[0] != 200 and "APPLY" in root_apply[1] and ci_apply[0] == 200 and refused(prod, "SELECT note FROM sales.orders") == ""
 
         ci_lift = denied("ci", "ALTER DATABASE pprod SET (protected = false)")
         root_lift = as_("root", "ALTER DATABASE pprod SET (protected = false)")[0] == 200
@@ -666,11 +693,93 @@ def protect_check(bin, work, port, root):
             pdev.stop()
         checks["a branch of a protected database isn't protected"] = branched == [(False,)] and dropped == "" and "project sales" in denied("root", "DROP VIEW sales.big")
 
-        grants = [refused(prod, s) for s in ["GRANT DEPLOY ON SCHEMA sales TO ci", "GRANT DEPLOY ON TABLE sales.orders TO ci", "GRANT DEPLOY ON DATABASE other TO ci"]]
-        checks["DEPLOY is a database's, and names the one it runs on"] = "DEPLOY is a database's" in grants[0] and "DEPLOY is a database's" in grants[1] and "pprod" in grants[2]
+        grants = [refused(prod, s) for s in ["GRANT APPLY ON SCHEMA sales TO ci", "GRANT APPLY ON TABLE sales.orders TO ci", "GRANT APPLY ON DATABASE other TO ci"]]
+        checks["APPLY is a database's, and names the one it runs on"] = "APPLY is a database's" in grants[0] and "APPLY is a database's" in grants[1] and "pprod" in grants[2]
         return checks
     finally:
         prod.stop()
+
+
+def owners_check(bin, work, port, root):
+    """Who makes a branch and who may drop it (ADR-058): CLONE is enough for a user to branch a database,
+    and the branch's owner is a superuser in it; CLONE ON SCHEMA takes those schemas only; a branch is
+    dropped by its owner (or an admin), by nobody else; and on a server with another
+    database attached, GRANT CLONE ON DATABASE names that one, and its grant lets a user branch it."""
+    oprod = Node(bin, root + "/oprod", port + 30, work).start()  # (an admin token: a node of its own, as a server's)
+    basic = {u: "Basic " + base64.b64encode(f"{u}:{u}-password-1".encode()).decode() for u in ["ali", "bob", "sam", "cleo"]}
+
+    def rows(n, sql):
+        return [tuple(r.values()) for r in n.q(sql)]
+
+    def refused(n, sql):
+        try:
+            n.q(sql)
+            return ""
+        except Failed as e:
+            return str(e)
+
+    def as_(n, user, sql):
+        """A statement as a user signs in to node `n` (Basic): (status, text)."""
+        return raw(n.port, "POST", "/sql", sql, {"Authorization": basic[user]})
+
+    def denied(n, user, sql):
+        """What a user's statement is refused with on `n` ('' when it runs)."""
+        status, text = as_(n, user, sql)
+        return "" if status == 200 else text
+
+    checks = {}
+    try:
+        oprod.q("CREATE SCHEMA sales")
+        oprod.q("CREATE SCHEMA hr")
+        oprod.q("CREATE TABLE sales.orders (id BIGINT, amount DOUBLE)")
+        oprod.q("INSERT INTO sales.orders VALUES (1, 1.5)")
+        oprod.q("CREATE TABLE hr.pay (id BIGINT, amount DOUBLE)")
+        oprod.q("INSERT INTO hr.pay VALUES (1, 100.0)")
+        for u in basic:
+            oprod.q(f"CREATE USER {u} PASSWORD '{u}-password-1'")
+        oprod.q("GRANT CLONE ON DATABASE oprod TO ali")
+        oprod.q("GRANT CLONE ON DATABASE oprod TO bob")
+        oprod.q("GRANT CLONE ON SCHEMA sales TO cleo")
+        oprod.q("GRANT SELECT ON ALL TABLES TO sam")
+
+        made = as_(oprod, "ali", "CREATE DATABASE ali_b CLONE oprod")[0]
+        checks["a user with only CLONE makes a branch of prod, and pondra.databases names it its owner"] = \
+            made == 200 and rows(oprod, "SELECT owner FROM pondra.databases WHERE name = 'ali_b'") == [("ali",)]
+
+        loc = rows(oprod, "SELECT location FROM pondra.databases WHERE name = 'ali_b'")[0][0]
+        branch = Node(bin, loc, port + 31, work).start()  # (the branch's own node, with the same admin token as oprod's)
+        try:
+            made_table = [as_(branch, "ali", s)[0] for s in ["CREATE TABLE mine (x INT)", "INSERT INTO mine VALUES (1)"]]
+            superuser = rows(branch, "SELECT superuser FROM pondra.users WHERE name = 'ali'")
+        finally:
+            branch.stop()
+        checks["the owner is a superuser in its branch: it makes a table there"] = made_table == [200, 200] and superuser == [(True,)]
+
+        checks["a user without CLONE is refused, naming CLONE"] = "CLONE" in denied(oprod, "sam", "CREATE DATABASE sam_b CLONE oprod")
+
+        cleo_b = as_(oprod, "cleo", "CREATE DATABASE cleo_b CLONE oprod")[0]
+        took_sales = cleo_b == 200 and rows(oprod, "SELECT id FROM cleo_b.sales.orders") == [(1,)] and refused(oprod, "SELECT * FROM cleo_b.hr.pay") != ""
+        checks["CLONE ON SCHEMA sales: the branch takes sales only, and naming hr is refused"] = \
+            took_sales and "sales" in denied(oprod, "cleo", "CREATE DATABASE cleo_c CLONE oprod WITH (schemas = (hr))")
+
+        by_sam, by_bob = denied(oprod, "sam", "DROP DATABASE ali_b"), denied(oprod, "bob", "DROP DATABASE ali_b")
+        checks["another user can't drop a branch, even one who may clone its base (bob) and one who may not (sam), and the refusal names its owner"] = \
+            "ali's branch" in by_sam and "ali's branch" in by_bob and "ali_b" in [r[0] for r in rows(oprod, "SELECT name FROM pondra.databases")]
+        checks["the owner drops its own branch"] = as_(oprod, "cleo", "DROP DATABASE cleo_b")[0] == 200 and as_(oprod, "ali", "DROP DATABASE ali_b")[0] == 200
+        checks["DROP DATABASE IF EXISTS of one that isn't there: nothing, for a user too; without IF EXISTS, refused"] = \
+            as_(oprod, "bob", "DROP DATABASE IF EXISTS never_made")[0] == 200 and "no database" in denied(oprod, "bob", "DROP DATABASE never_made")
+
+        other = Node(bin, root + "/other", port + 32, work).start()  # (another lake, made by a node, then attached here)
+        other.stop()
+        oprod.q(f"ATTACH '{root}/other' AS other")
+        granted = refused(oprod, "GRANT CLONE ON DATABASE other TO sam") == ""
+        shown = rows(oprod, "SELECT on_kind, on_name FROM pondra.grants WHERE grantee = 'sam' AND privilege = 'CLONE'")
+        checks["GRANT CLONE ON DATABASE names this database or one attached here, and pondra.grants shows it"] = \
+            granted and shown == [("database", "other")] and refused(oprod, "GRANT APPLY ON DATABASE other TO sam") != "" \
+            and refused(oprod, "GRANT CLONE ON DATABASE nowhere TO sam") != ""
+        return checks
+    finally:
+        oprod.stop()
 
 
 def main():
@@ -691,6 +800,7 @@ def main():
             checks = environments_check(os.path.abspath(a.new), work, a.port, root)
             checks.update(signed_in_check(os.path.abspath(a.new), work, a.port, root))
             checks.update(protect_check(os.path.abspath(a.new), work, a.port, root))
+            checks.update(owners_check(os.path.abspath(a.new), work, a.port, root))
     except Failed as e:
         checks = {"ran to the end": False, "error": str(e)}
     finally:

@@ -142,10 +142,10 @@ pub fn router(app: App) -> Router {
         .route("/ready", get(ready))
         .route("/login", post(login))
         .route("/whoami", get(whoami))
-        .route("/plan", post(deploy))
-        .route("/deploy", post(deploy))
-        .route("/test", post(deploy))
-        .route("/export", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::deploy::export(&app.lake).await?)) }))
+        .route("/plan", post(apply))
+        .route("/apply", post(apply))
+        .route("/test", post(apply))
+        .route("/export", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::apply::export(&app.lake).await?)) }))
         .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::console::objects(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
@@ -414,12 +414,12 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     }
     req.extensions_mut().insert(who.role);
     let heavy = queries(req.uri().path());
-    // (a Python procedure of a deploy calls back with its lent token: those calls are the deploy's, as its statements are)
-    let deploying = crate::auth::lent_deploying(token);
+    // (a Python procedure of an apply calls back with its lent token: those calls are the apply's, as its statements are)
+    let applying = crate::auth::lent_applying(token);
     let run = crate::auth::WHO.scope(who, next.run(req));
     let run = async move {
-        match deploying {
-            true => crate::protect::DEPLOYING.scope((), run).await,
+        match applying {
+            true => crate::protect::APPLYING.scope((), run).await,
             false => run.await,
         }
     };
@@ -1120,17 +1120,17 @@ async fn secret(State(app): State<App>, Path(name): Path<String>, headers: axum:
     Ok(Json(j!(values)))
 }
 
-/// `POST /plan`, `/deploy`, `/test`: a project's files planned here, deployed, or its tests run
+/// `POST /plan`, `/apply`, `/test`: a project's files planned here, applied, or its tests run
 /// (ADR-047 §4), each with the same body.
-async fn deploy(State(app): State<App>, uri: axum::http::Uri, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, Json(ask): Json<crate::deploy::Ask>) -> Result<Json<Value>, E> {
-    use crate::deploy::Verb;
+async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, Json(ask): Json<crate::apply::Ask>) -> Result<Json<Value>, E> {
+    use crate::apply::Verb;
     let verb = match uri.path().rsplit('/').next() {
         Some("plan") => Verb::Plan,
         Some("test") => Verb::Test,
-        _ => Verb::Deploy,
+        _ => Verb::Apply,
     };
     let who = crate::routines::Who { role: role.0, files: owner(&headers), depth: 0 };
-    Ok(Json(crate::deploy::ask(&app, verb, ask, who).await?))
+    Ok(Json(crate::apply::ask(&app, verb, ask, who).await?))
 }
 
 async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Result<Response, E> {

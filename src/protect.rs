@@ -1,6 +1,6 @@
 //! Protected databases (ADR-058, step 3). `ALTER DATABASE db SET (protected = true)` marks a database
-//! whose project objects change only through a deploy: what a project's last finished deploy declared
-//! (`deploy::declared`) is refused by name, unless a deploy is making it (`DEPLOYING`). Rows, people
+//! whose project objects change only through an apply: what a project's last finished apply declared
+//! (`apply::declared`) is refused by name, unless an apply is making it (`APPLYING`). Rows, people
 //! and objects no project declared stay as they were, in the project's schema too. A branch isn't
 //! protected: its `z/` keys are never copied (`branch::make`). Lifting it is an admin's statement,
 //! written to `pondra.audit` (class `role`) and shown in `pondra.databases` until it is set again.
@@ -25,14 +25,14 @@ pub struct Protection {
 }
 
 tokio::task_local! {
-    /// Set by a deploy around its statements: a project's objects may change while it runs.
-    pub static DEPLOYING: ();
+    /// Set by an apply around its statements: a project's objects may change while it runs.
+    pub static APPLYING: ();
 }
 
-/// Whether a deploy is making the project true in this task (its statements, and a Python procedure's
+/// Whether an apply is making the project true in this task (its statements, and a Python procedure's
 /// calls back while it runs: `auth::lend`). A procedure started with `pondra.start` is not: it would
-/// outlive the deploy, so it has no exemption (`routines::start` refuses to start one).
-pub fn deploying() -> bool { DEPLOYING.try_with(|_| ()).is_ok() }
+/// outlive the apply, so it has no exemption (`routines::start` refuses to start one).
+pub fn applying() -> bool { APPLYING.try_with(|_| ()).is_ok() }
 
 pub async fn of(lake: &Lake) -> Result<Option<Protection>> { lake.cat.get(KEY).await }
 
@@ -119,8 +119,8 @@ fn ddl_touches(d: &Ddl) -> Vec<Touch> {
         Ddl::Refresh { database, .. } => vec![Touch::Database(database.clone(), "refreshed")],
         Ddl::DropDatabase { name, .. } => vec![Touch::Database(Some(name.clone()), "dropped")],
         Ddl::Users(c) => users(c),
-        // (none of these is a project's: `deploy::head` refuses the kinds a project can't declare)
-        Ddl::CreateSchema { .. } | Ddl::CreateDatabase { .. } | Ddl::Branch(_) | Ddl::Pin { .. } | Ddl::Unpin { .. } | Ddl::Deploy { .. } | Ddl::ExecuteTask { .. }
+        // (none of these is a project's: `apply::head` refuses the kinds a project can't declare)
+        Ddl::CreateSchema { .. } | Ddl::CreateDatabase { .. } | Ddl::Branch(_) | Ddl::Pin { .. } | Ddl::Unpin { .. } | Ddl::Apply { .. } | Ddl::ExecuteTask { .. }
         | Ddl::RunLog | Ddl::AuditLog | Ddl::HistoryLog | Ddl::Shares(_) | Ddl::Sequence(_) | Ddl::Index(_) | Ddl::Type(_) | Ddl::Protect { .. } => vec![],
     }
 }
@@ -135,9 +135,9 @@ fn users(c: &crate::users::Change) -> Vec<Touch> {
     }
 }
 
-/// Refuses a change to what a project declares in a protected database (none while a deploy runs).
+/// Refuses a change to what a project declares in a protected database (none while an apply runs).
 async fn check(lake: &Lake, t: Touch) -> Result<()> {
-    if deploying() {
+    if applying() {
         return Ok(());
     }
     match t {
@@ -164,7 +164,7 @@ async fn check_object(lake: &Lake, name: &str) -> Result<()> {
     if !protected(target).await? {
         return Ok(());
     }
-    let owned = owner(&crate::deploy::declared(target).await?, |k, n| !matches!(k, "schema" | "role" | "grant") && n == local);
+    let owned = owner(&crate::apply::declared(target).await?, |k, n| !matches!(k, "schema" | "role" | "grant") && n == local);
     refuse(owned, &db)
 }
 
@@ -174,7 +174,7 @@ async fn check_schema(lake: &Lake, schema: &str) -> Result<()> {
         return Ok(());
     }
     let inside = format!("{schema}.");
-    let owned = owner(&crate::deploy::declared(lake).await?, |k, n| (k == "schema" && n == schema) || (!matches!(k, "role" | "grant") && n.starts_with(&inside)));
+    let owned = owner(&crate::apply::declared(lake).await?, |k, n| (k == "schema" && n == schema) || (!matches!(k, "role" | "grant") && n.starts_with(&inside)));
     refuse(owned, &ddl::lake_name(lake))
 }
 
@@ -182,7 +182,7 @@ async fn check_roles(lake: &Lake, roles: &[String]) -> Result<()> {
     if !protected(lake).await? {
         return Ok(());
     }
-    let declared = crate::deploy::declared(lake).await?;
+    let declared = crate::apply::declared(lake).await?;
     for role in roles {
         refuse(owner(&declared, |k, n| makes_role(k, n, role)), &ddl::lake_name(lake))?;
     }
@@ -212,7 +212,7 @@ fn attached_as(lake: &Lake, name: &str) -> Option<Arc<Lake>> {
 /// The first declared key that `mine` says is a project's own, with its project's name.
 fn owner(declared: &BTreeMap<String, String>, mine: impl Fn(&str, &str) -> bool) -> Option<(String, String)> {
     declared.iter().find(|(k, _)| {
-        let (kind, name) = crate::deploy::split_key(k.as_str());
+        let (kind, name) = crate::apply::split_key(k.as_str());
         mine(kind, name)
     }).map(|(k, p)| (k.clone(), p.clone()))
 }
@@ -234,7 +234,7 @@ fn grantees(grant: &str) -> Vec<String> {
 /// The refusal for a change to what `owned` names (its key and its project), in database `db`.
 fn refuse(owned: Option<(String, String)>, db: &str) -> Result<()> {
     match owned {
-        Some((key, project)) => bail!("permission denied: {key} is project {project}'s, and {db} is protected: change it in the project and deploy it (or an admin lifts the protection: ALTER DATABASE {db} SET (protected = false))"),
+        Some((key, project)) => bail!("permission denied: {key} is project {project}'s, and {db} is protected: change it in the project and apply it (or an admin lifts the protection: ALTER DATABASE {db} SET (protected = false))"),
         None => Ok(()),
     }
 }

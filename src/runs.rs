@@ -581,7 +581,14 @@ fn roots(all: &HashMap<String, Task>, name: &str, task: &Task, seen: &mut Vec<St
 /// Leader: keep a task (`ddl::apply`); its first tick is the first after now.
 pub async fn create_task(lake: &Lake, name: &str, mut task: Task, replace: bool) -> Result<serde_json::Value> {
     let name = crate::ddl::new_name(lake, name).await?;
-    ensure!(replace || lake.cat.get::<Task>(&task_key(&name)).await?.is_none(), "task {name} already exists (CREATE OR REPLACE TASK)");
+    let old = lake.cat.get::<Task>(&task_key(&name)).await?;
+    ensure!(replace || old.is_none(), "task {name} already exists (CREATE OR REPLACE TASK)");
+    // A branch's tasks wait for `ALTER TASK … RESUME`, as those it was cloned with do (`branch::make`):
+    // nothing in a branch reaches the outside on its own. One replaced keeps the state it had.
+    let branch = lake.cat.get::<crate::branch::Bases>(crate::branch::BASES).await?.is_some();
+    if branch {
+        task.suspended = old.map_or(true, |o| o.suspended);
+    }
     let mut all: HashMap<String, Task> = tasks(lake).await?.iter().cloned().collect();
     for a in task.after.iter_mut() {
         *a = crate::ddl::local(lake, a).with_context(|| format!("AFTER {a}: not this lake's"))?;
@@ -594,8 +601,12 @@ pub async fn create_task(lake: &Lake, name: &str, mut task: Task, replace: bool)
     }
     task.created_ms = now_ms();
     lake.cat.commit(vec![(task_key(&name), json(&task))], &[]).await?;
-    let next = every(&task.schedule).ok().filter(|_| task.after.is_empty()).map(|e| next_after(&e, task.created_ms));
-    Ok(serde_json::json!({"task": name, "next": next, "after": task.after}))
+    let next = every(&task.schedule).ok().filter(|_| task.after.is_empty() && !task.suspended).map(|e| next_after(&e, task.created_ms));
+    let mut out = serde_json::json!({"task": name, "next": next, "after": task.after});
+    if branch && task.suspended {
+        out["notice"] = format!("task {name} is suspended: a branch's tasks run after ALTER TASK {name} RESUME").into();
+    }
+    Ok(out)
 }
 
 pub async fn drop_task(lake: &Lake, name: &str, if_exists: bool) -> Result<serde_json::Value> {
@@ -958,7 +969,7 @@ fn latest(e: &Every, after: u64, now: u64) -> Option<u64> {
 /// Does `sql` read one of these tables?
 pub fn mentioned(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.shares", "pondra.recipients", "pondra.audit", "pondra.history", "pondra.learned", "pondra.flows", "pondra.expectations", "pondra.variables", "pondra.dropped", "pondra.objects", "pondra.kinds", "pondra.databases", "pondra.deploys"].iter().any(|t| s.contains(t))
+    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.shares", "pondra.recipients", "pondra.audit", "pondra.history", "pondra.learned", "pondra.flows", "pondra.expectations", "pondra.variables", "pondra.dropped", "pondra.objects", "pondra.kinds", "pondra.databases", "pondra.applies"].iter().any(|t| s.contains(t))
 }
 
 /// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now.
@@ -1040,7 +1051,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("rows_in_files", g(&|d| d.meta.files.iter().map(|f| f.rows).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.rows))),
         ("bytes_in_files", g(&|d| d.meta.files.iter().map(|f| f.bytes).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.bytes))),
     ])?;
-    Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?), ("tables", mem(listed)?), ("dropped", mem(dropped)?), ("databases", mem(crate::branch::databases(lake).await?)?), ("deploys", mem(crate::deploy::table(lake).await?)?)])
+    Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?), ("tables", mem(listed)?), ("dropped", mem(dropped)?), ("databases", mem(crate::branch::databases(lake).await?)?), ("applies", mem(crate::apply::table(lake).await?)?)])
 }
 
 /// `pondra.runs` before any run: no rows, its columns.

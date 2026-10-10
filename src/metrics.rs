@@ -50,6 +50,10 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("files_skipped_total", "counter", "Parquet files queries skipped by min/max, unopened", &one(get(&FILES_SKIPPED)));
     let requests = [("write", &OBJECT_WRITES), ("list", &OBJECT_LISTS), ("delete", &OBJECT_DELETES)].map(|(op, c)| (format!("{{op=\"{op}\"}}"), get(c)));
     metric("object_requests_total", "counter", "object-store writes, lists and deletes this process made (what a bucket bills and rate-limits most)", &requests);
+    let turns = crate::budget::turns();
+    let label = |b: &str, l: &str| format!("{{bucket=\"{b}\",lake=\"{l}\"}}");
+    metric("bucket_turns", "gauge", "requests this node may have at once at a bucket, or at another lake in it it reads (a branch's base: a quarter)", &turns.iter().map(|(b, l, n, _)| (label(b, l), *n as f64)).collect::<Vec<_>>());
+    metric("bucket_turns_most", "gauge", "the most requests it had at once there so far", &turns.iter().map(|(b, l, _, m)| (label(b, l), *m as f64)).collect::<Vec<_>>());
     let ai = [("answered", &crate::ai::CALLS), ("failed", &crate::ai::FAILED), ("retried", &crate::ai::RETRIED)].map(|(r, c)| (format!("{{result=\"{r}\"}}"), get(c)));
     metric("ai_requests_total", "counter", "requests ai_complete and ai_embed made to the model's endpoint: answered, failed for good (their rows NULL), tried again", &ai);
     metric("shuffle_spilled_bytes_total", "counter", "shuffle rows written to this node's disk", &one(get(&SPILLED)));
