@@ -396,12 +396,19 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         None => crate::auth::Principal::of(crate::auth::Role::None),
     };
     let who = who.at("http", from);
-    if who.role < needed {
+    // (a branch's pin: a user granted CLONE may ask for it, and `ddl` lets nothing else of theirs through: ADR-058)
+    let pin = req.uri().path() == "/cluster/ddl";
+    let cloning = pin && who.access.as_ref().is_some_and(|a| a.clones().is_some());
+    if who.role < needed && !cloning {
         return match who.role {
             crate::auth::Role::None => (StatusCode::UNAUTHORIZED, "sign in: a token, or a user's name and password").into_response(),
             _ => {
-                crate::audit::refused(&app, &who.name, "http", from, &format!("{} {}", req.method(), req.uri().path()), "this needs more rights than this token's or user's");
-                (StatusCode::FORBIDDEN, "this needs more rights than this token's or user's").into_response()
+                let why = match pin {
+                    true => "a pin needs CLONE on this database or a schema of it (GRANT CLONE ON DATABASE … TO …)",
+                    false => "this needs more rights than this token's or user's",
+                };
+                crate::audit::refused(&app, &who.name, "http", from, &format!("{} {}", req.method(), req.uri().path()), why);
+                (StatusCode::FORBIDDEN, why).into_response()
             }
         };
     }
@@ -950,14 +957,19 @@ async fn change(State(app): State<App>, Json((sql, job, sent)): Json<(String, St
     Ok(Json(crate::query::SENT.scope(sent, crate::change::run(&app.lake, seq, &sql, &job)).await?))
 }
 
-/// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`).
-async fn ddl(State(app): State<App>, headers: HeaderMap, Json(d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
-    let key = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).filter(|k| k.starts_with("pb_"));
+/// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`), and a
+/// branch's pin (ADR-058). A follower sends it to the leader, asked with the caller's own token.
+async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Extension<crate::auth::Role>>, Json(d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
+    let bearer = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).map(String::from);
+    let key = bearer.as_deref().filter(|k| k.starts_with("pb_"));
     if let Some(key) = key {
         crate::branch::keyed(&app.lake, &d, key).await?; // (a branch's key: its own pin, nothing else)
+    } else if role.is_none_or(|r| r.0 < crate::auth::Role::Admin) {
+        crate::branch::cloning(&d)?; // (a user with CLONE: a pin, and nothing else)
     }
     let out = match &app.seq {
         Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone()).await?,
+        None if !app.cluster.is_leader() => Box::pin(crate::write::send_as(&app.lake.url, crate::write::Request::Ddl(d.clone()), bearer.as_deref())).await?, // (the leader makes it)
         None => {
             let _guard = app.lock.lock().await;
             crate::ddl::apply(&app.lake, d.clone()).await?

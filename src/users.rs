@@ -76,7 +76,7 @@ pub struct Token {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Grant {
-    pub privilege: String, // select, insert, update, delete, usage
+    pub privilege: String, // select, insert, update, delete, usage, clone
     pub on: On,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>, // (SELECT on these only)
@@ -99,15 +99,15 @@ pub enum Change {
     Create { name: String, login: bool, if_not_exists: bool, verifier: Option<Verifier>, superuser: bool, #[serde(default)] limits: Limits },
     Alter { name: String, verifier: Option<Verifier>, superuser: Option<bool>, #[serde(default)] limits: Limits },
     Drop { name: String, if_exists: bool },
-    Grant { privileges: Vec<String>, on: On, columns: Vec<String>, to: Vec<String> },
-    Revoke { privileges: Vec<String>, on: On, columns: Vec<String>, from: Vec<String> },
+    Grant { privileges: Vec<String>, on: On, columns: Vec<String>, to: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String> },
+    Revoke { privileges: Vec<String>, on: On, columns: Vec<String>, from: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String> },
     GrantRole { roles: Vec<String>, to: Vec<String> },
     RevokeRole { roles: Vec<String>, from: Vec<String> },
     CreateToken { name: String, user: String, expires_secs: Option<u64> },
     DropToken { name: String, user: String },
 }
 
-const PRIVILEGES: [&str; 5] = ["select", "insert", "update", "delete", "usage"];
+const PRIVILEGES: [&str; 6] = ["select", "insert", "update", "delete", "usage", "clone"]; // (CLONE: a database's or a schema's, ADR-058)
 
 // ---------------------------------------------------------------- statements
 
@@ -329,6 +329,7 @@ fn token(w: &mut Words, create: bool) -> Result<Change> {
 fn grant(w: &mut Words, grant: bool) -> Result<Change> {
     let mut privileges = vec![];
     let mut columns = vec![];
+    let mut database = None; // (ON DATABASE: CLONE's alone, and the statement's own database)
     // (a list of privileges, or of roles: told apart by ON)
     let mut list = vec![];
     loop {
@@ -357,13 +358,16 @@ fn grant(w: &mut Words, grant: bool) -> Result<Change> {
         match p.as_str() {
             "all" => privileges.extend(["select", "insert", "update", "delete"].map(String::from)),
             p if PRIVILEGES.contains(&p) => privileges.push(p.to_string()),
-            p => bail!("{p}: the privileges are SELECT, INSERT, UPDATE, DELETE, ALL (on tables) and USAGE (on secrets)"),
+            p => bail!("{p}: the privileges are SELECT, INSERT, UPDATE, DELETE, ALL (on tables), USAGE (on secrets) and CLONE (on a database or a schema)"),
         }
     }
     let on = if w.is("schema") {
         On::Schema(w.name()?)
     } else if w.is("secret") {
         On::Secret(w.name()?)
+    } else if w.is("database") {
+        database = Some(w.name()?.trim_matches('"').to_lowercase()); // (checked to be this one where it runs: `apply`)
+        On::Lake
     } else if w.is("all") {
         w.expect("tables")?;
         if w.is("in") {
@@ -379,10 +383,21 @@ fn grant(w: &mut Words, grant: bool) -> Result<Change> {
     ensure!(columns.is_empty() || privileges == ["select"] && matches!(on, On::Table(_)), "columns are named for SELECT on a table: GRANT SELECT (a, b) ON t TO r");
     let usage = matches!(on, On::Secret(_));
     ensure!(privileges.iter().all(|p| (p == "usage") == usage), "{}", if usage { "a secret's privilege is USAGE" } else { "USAGE is a secret's" });
+    ensure!(!privileges.iter().any(|p| p == "clone") || database.is_some() || matches!(on, On::Schema(_)), "CLONE is a database's or a schema's: GRANT CLONE ON DATABASE prod | SCHEMA sales TO r");
+    ensure!(database.is_none() || privileges == ["clone"], "ON DATABASE is for CLONE alone: a database's tables are ON ALL TABLES");
     w.expect(to)?;
     let who = w.names()?.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
     w.done()?;
-    Ok(if grant { Change::Grant { privileges, on, columns, to: who } } else { Change::Revoke { privileges, on, columns, from: who } })
+    Ok(if grant { Change::Grant { privileges, on, columns, to: who, database } } else { Change::Revoke { privileges, on, columns, from: who, database } })
+}
+
+/// `ON DATABASE d` names the database the statement runs on: another's grants are made there.
+fn this_database(lake: &Lake, named: Option<&str>) -> Result<()> {
+    let here = crate::ddl::lake_name(lake);
+    match named {
+        Some(d) if d != here => bail!("this is the database {here}: GRANT CLONE ON DATABASE {d} is run on {d}"),
+        _ => Ok(()),
+    }
 }
 
 /// A user's or role's name: a plain one, not the tokens' (`admin`, `writer`, `reader`).
@@ -444,7 +459,8 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             lake.cat.commit(puts, &[user_key(&name)]).await?;
             j!({"user": name, "dropped": true})
         }
-        Change::Grant { privileges, on, columns, to } => {
+        Change::Grant { privileges, on, columns, to, database } => {
+            this_database(lake, database.as_deref())?;
             let on = resolved(lake, on).await?;
             let mut puts = vec![];
             for n in &to {
@@ -459,7 +475,8 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             lake.cat.commit(puts, &[]).await?;
             j!({"granted": privileges, "to": to})
         }
-        Change::Revoke { privileges, on, columns, from } => {
+        Change::Revoke { privileges, on, columns, from, database } => {
+            this_database(lake, database.as_deref())?;
             let on = resolved(lake, on).await?;
             let mut puts = vec![];
             for n in &from {
@@ -884,6 +901,19 @@ impl Access {
         some.map(Some)
     }
     pub fn secret(&self, name: &str) -> bool { self.grants.iter().any(|g| g.privilege == "usage" && g.on == On::Secret(name.to_string())) }
+    /// The schemas this user may clone a branch of, or pin one for (ADR-058): None, no CLONE grant;
+    /// Some(none), every schema (CLONE ON DATABASE); Some(these), CLONE ON SCHEMA.
+    pub fn clones(&self) -> Option<Vec<String>> {
+        let mut some: Option<Vec<String>> = None;
+        for g in self.grants.iter().filter(|g| g.privilege == "clone") {
+            match &g.on {
+                On::Lake => return Some(vec![]),
+                On::Schema(s) => some.get_or_insert_with(Vec::new).push(s.clone()),
+                _ => {}
+            }
+        }
+        some
+    }
     fn writes(&self) -> bool { self.grants.iter().any(|g| ["insert", "update", "delete"].contains(&g.privilege.as_str())) }
 }
 
@@ -990,10 +1020,25 @@ fn fresh(lake: &Lake, now: Option<u64>, then: Option<u64>, at: std::time::Instan
 /// databases attach each other). A user granted some tables needs a grant naming the other lake's
 /// table besides (`Access::named`).
 pub async fn across(other: &Lake, ns: &str) -> Result<()> {
+    if let Some(r) = crate::store::reach_of(&other.url).filter(|r| r.read_only) {
+        return read_only(&r, ns);
+    }
     if crate::auth::operator() || !(crate::auth::tokens_on() || any(other).await) {
         return Ok(());
     }
     bail!("permission denied: {ns} signs in on its own: its tables are read and written through it (the database {ns}), or with one of the nodes' tokens")
+}
+
+/// A lake on another server, attached READ_ONLY (ADR-058): its users sign in there, and its bucket
+/// key reads all of it whoever asks, so here it is read by whoever may use that key's secret (a
+/// user granted USAGE on it), and by tokens, as files under a secret's scope are.
+fn read_only(r: &crate::store::Reach, ns: &str) -> Result<()> {
+    let Some(a) = crate::auth::limited() else { return Ok(()) };
+    match &r.secret {
+        Some(s) if a.secret(s) => Ok(()),
+        Some(s) => bail!("permission denied: {ns} is read with the secret {s}: GRANT USAGE ON SECRET {s} TO …"),
+        None => bail!("permission denied: {ns} is read with this server's own key: a token's, or an admin's"),
+    }
 }
 
 /// The same for a write to `table` of that lake (its name there), and, for a user granted some
@@ -1083,12 +1128,13 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("created", Arc::new(all.iter().map(|(_, u)| (u.created_ms > 0).then_some(u.created_ms as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),
     ])?;
     let rows: Vec<(String, &Grant)> = all.iter().flat_map(|(k, u)| u.grants.iter().map(move |g| (k[2..].to_string(), g))).collect();
+    let here = crate::ddl::lake_name(lake); // (CLONE ON DATABASE is this database, not every table)
     let g = |f: &dyn Fn(&String, &Grant) -> Option<String>| Arc::new(rows.iter().map(|(n, g)| f(n, g)).collect::<StringArray>()) as ArrayRef;
     let grants = RecordBatch::try_from_iter(vec![
         ("grantee", g(&|n, _| Some(n.clone()))),
         ("privilege", g(&|_, g| Some(g.privilege.to_uppercase()))),
-        ("on_kind", g(&|_, g| Some(match &g.on { On::Table(_) => "table", On::Schema(_) => "schema", On::Lake => "lake", On::Secret(_) => "secret" }.into()))),
-        ("on_name", g(&|_, g| match &g.on { On::Table(n) | On::Schema(n) | On::Secret(n) => Some(n.clone()), On::Lake => None })),
+        ("on_kind", g(&|_, g| Some(match &g.on { On::Table(_) => "table", On::Schema(_) => "schema", On::Lake if g.privilege == "clone" => "database", On::Lake => "lake", On::Secret(_) => "secret" }.into()))),
+        ("on_name", g(&|_, g| match &g.on { On::Table(n) | On::Schema(n) | On::Secret(n) => Some(n.clone()), On::Lake if g.privilege == "clone" => Some(here.clone()), On::Lake => None })),
         ("columns", g(&|_, g| Some(g.columns.join(", ")).filter(|c| !c.is_empty()))),
     ])?;
     let mem = |b: RecordBatch| -> Result<Arc<dyn datafusion::catalog::TableProvider>> { Ok(Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };

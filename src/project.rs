@@ -133,6 +133,8 @@ struct Env {
     lake: Option<String>,
     #[serde(default)]
     clone: Option<String>, // made again as a branch of this database before each deploy
+    #[serde(default)]
+    base: Option<String>, // branches of this database are made on this environment's server (ADR-058)
 }
 
 fn read_toml(dir: &Path) -> Result<Toml> {
@@ -398,7 +400,7 @@ fn init(dir: &str, name: Option<String>) -> Result<String> {
     std::fs::create_dir_all(dir)?;
     let name = name.unwrap_or_else(|| std::fs::canonicalize(dir).ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_else(|| "project".into()));
     let toml = format!(
-        "[project]\nname = \"{}\"\n# server = \"https://pondra.example.com\"   # where its databases are (pondra serve --lakes)\n\n[env.prod]\n# url = \"https://prod.example.com\"     # a database served on its own\n# values = {{ min_order = 10 }}          # $name values its statements are given\n\n[env.dev]                             # what a developer's branch takes\n\n# [secrets]\n# crm_token = \"env:CRM_TOKEN\"          # a $name's value from the deploying machine's environment\n",
+        "[project]\nname = \"{}\"\n# server = \"https://pondra.example.com\"   # where its databases are (pondra serve --lakes)\n\n[env.prod]\n# url = \"https://prod.example.com\"     # a database served on its own\n# values = {{ min_order = 10 }}          # $name values its statements are given\n\n[env.dev]                             # what a developer's branch takes\n# base = \"prod\"                       # branches made on this server, of prod attached there (ADR-058)\n\n# [secrets]\n# crm_token = \"env:CRM_TOKEN\"          # a $name's value from the deploying machine's environment\n",
         database(&name)
     );
     std::fs::write(dir.join("pondra.toml"), toml)?;
@@ -420,7 +422,9 @@ async fn branch(name: Option<String>, from: &str, replace: bool, drop: bool, at:
         None => database(&git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD").context("a branch's name: pondra branch NAME (or run it in a git branch)")?),
     };
     ensure!(name != database(from), "{name} is the database it would start as");
-    let base = node(&Where { env: Some(from.to_string()), ..at.clone() }, &toml, from).await?;
+    // (a branch is made where its base's environment is: the server that has prod attached, ADR-058)
+    let maker = toml.env.iter().find(|(_, e)| e.base.as_deref() == Some(from)).map(|(n, _)| n.clone()).unwrap_or_else(|| from.to_string());
+    let base = node(&Where { env: Some(maker.clone()), ..at.clone() }, &toml, &maker).await?;
     if drop || replace {
         base.sql(&format!("DROP DATABASE IF EXISTS {name}")).await?;
         if drop {
