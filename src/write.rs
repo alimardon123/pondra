@@ -1314,6 +1314,7 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     if let Stmt::Ddl(ddls) = stmt {
         let mut out = j!({});
         for d in ddls {
+            crate::branch::may(lake, &d).await?; // (another database's own sign-in: users::across)
             out = match &app.seq {
                 Some(seq) => ddl_here(lake, seq, &app.lock, d.clone()).await?,
                 None => post(&app.cluster.leader.addr, &Request::Ddl(d.clone())).await?,

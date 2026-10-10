@@ -234,7 +234,7 @@ def signed_in_check(bin, work, port, root):
     """A branch of a database that signs in on its own (a user, and no admin token shared with the
     branch): its REFRESH and unpin go by the branch's own key (`branch::keyed`), which opens nothing
     else; a clone's REFRESH stays within the schemas it took; a database next door that signs in on
-    its own is cloned on its own node."""
+    its own is cloned only by a caller who may read it (`branch::may`)."""
     prod_dir, dev_dir = root + "/sprod", root + "/sdev"  # (the folder names are the databases' names: prod is `sprod`)
     env = {"PONDRA_PURGE_ROWS": "1"}
     prod = Node(bin, prod_dir, port + 10, work, "--retain-secs", "1", env=env, token=False).start()
@@ -302,9 +302,10 @@ def signed_in_check(bin, work, port, root):
         and ddl({"op": "pin", "lake": loc, "ms": None}, {"Authorization": "Bearer pb_nope", "Content-Type": "application/json"}) != 200
 
     dev.q(f"ATTACH '{prod_dir}' AS prod2")  # (a database next door that signs in on its own)
-    cloning = refused(dev, "CREATE DATABASE x2 CLONE prod2")  # (prod refuses dev's own key)
-    checks["CLONE of a database next door that signs in on its own: refused, saying where it is cloned, nothing left behind"] = \
-        "cloned on its own node" in cloning and not keys(root + "/x2")
+    status, _, text = dev.plain("POST", "/sql", "CREATE DATABASE x CLONE prod2")
+    cloning = refused(dev, "CREATE DATABASE x2 CLONE prod2")  # (the owner passes; prod refuses dev's own key)
+    checks["CLONE of a database next door that signs in on its own: refused without its own rights, and saying where it is cloned"] = \
+        status != 200 and "read and written through it" in text and "cloned on its own node" in cloning and "read and written through it" not in cloning and not keys(root + "/x") and not keys(root + "/x2")
 
     checks["…its unpin lets go, and then the key makes no new pin"] = ddl({"op": "unpin", "lake": loc}) == 200 \
         and as_ann("SELECT branches FROM pondra.databases WHERE name = 'sprod'") == [(0,)] \

@@ -240,6 +240,23 @@ pub async fn keyed(lake: &Lake, d: &Ddl, key: &str) -> Result<()> {
     Ok(())
 }
 
+/// May the request being served clone from, or refresh, another database attached here?
+/// (`users::across`: one that signs in on its own is cloned through its own sign-in, on its own
+/// node, or with the nodes' tokens.) Checked where the statement comes in: the leader it goes
+/// to runs it as the node. A branch's own REFRESH goes by its key (`keyed`).
+pub async fn may(lake: &Lake, d: &Ddl) -> Result<()> {
+    let name = match d {
+        Ddl::CreateDatabase { clone: Some(of), .. } => of.from.trim_matches('"').to_lowercase(),
+        Ddl::Refresh { database: Some(db), .. } => db.clone(),
+        _ => return Ok(()),
+    };
+    let other = lake.attached.read().unwrap().iter().find(|(n, _)| *n == name).map(|(_, l)| l.clone());
+    match other {
+        Some(o) if name != crate::ddl::lake_name(lake) => crate::users::across(&o, &name).await,
+        _ => Ok(()),
+    }
+}
+
 /// The pins clean-up keeps files for: the oldest and the newest (None: no branch reads this lake).
 pub async fn pins(lake: &Lake) -> Result<Option<(u64, u64)>> {
     let all = lake.cat.scan::<Pin>("pn/", "pn0").await?;
