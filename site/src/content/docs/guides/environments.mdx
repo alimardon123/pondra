@@ -286,6 +286,32 @@ pondra branch --drop
 - run: pondra branch pr-${{ github.event.number }} --drop
 ```
 
+`pondra ci init` writes that workflow to `.github/workflows/pondra.yml`, with a test job when pondra.toml
+has `[env.test]`. It then says what is left to set up: a user for CI that may deploy and nothing more, a
+token on dev's server, two secrets and a `prod` environment in GitHub, and `protected = true` under
+`[env.prod]`.
+
+```bash norun
+pondra ci init                           # .github/workflows/pondra.yml, pinned to this pondra
+```
+
+`pondra dev` works on the git branch's database: it makes the database if it isn't there, deploys the
+project and runs its tests, then does the same after every save. It never deploys to prod, to `main` or to
+a protected database. Ctrl-C stops it.
+
+```bash norun
+git switch -c orders-by-channel
+pondra dev                               # its database, deployed and tested on each save
+```
+
+`pondra branch --hook` installs a git hook that makes the branch's database when `git switch` lands on a
+branch, so there is no `pondra branch` to type:
+
+```bash norun
+pondra branch --hook                     # .git/hooks/post-checkout, branching from prod
+git switch -c orders-by-channel          # its database is made here, if it isn't there
+```
+
 ### Production on a server of its own
 
 A company that keeps production apart runs it as its own server, with its own bucket, and dev as

@@ -225,10 +225,11 @@ fn project(ask: &Ask) -> Result<Project> {
 
 fn first_line(sql: &str) -> String { sql.trim().lines().next().unwrap_or_default().chars().take(80).collect() }
 
+/// The kinds a project declares, as the registry lists them (those it doesn't refuse).
+fn declarable() -> String { crate::objects::KINDS.iter().filter(|k| k.project.is_none()).map(|k| k.name).collect::<Vec<_>>().join(", ") }
+
 /// What a statement in `objects/` makes, and its name inside the database. None: nothing (a
 /// comment alone).
-const SHARES: &str = "shares and recipients are each environment's: prod's never reach its branches, so a partner's token never reaches dev; make and grant them in the database (CREATE SHARE …)";
-
 fn head(sql: &str) -> Result<Option<(Kind, String)>> {
     let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else { bail!("not SQL the plan can read") };
     let solid: Vec<&Token> = tokens.iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
@@ -242,7 +243,7 @@ fn head(sql: &str) -> Result<Option<(Kind, String)>> {
     let mut i = 0;
     match word(0).as_str() {
         "grant" => {
-            ensure!(!(0..solid.len()).any(|i| matches!((word(i).as_str(), word(i + 1).as_str()), ("on", "share") | ("to", "recipient"))), "{SHARES}");
+            ensure!(!(0..solid.len()).any(|i| matches!((word(i).as_str(), word(i + 1).as_str()), ("on", "share") | ("to", "recipient"))), "{}", crate::objects::kind("share").and_then(|k| k.project).unwrap_or_default());
             return Ok(Some((Kind::Grant, sql.trim().trim_end_matches(';')[5..].split_whitespace().collect::<Vec<_>>().join(" ")))); // (named by what it grants: `SELECT ON TABLE t TO analyst`)
         }
         "create" => i += 1,
@@ -253,6 +254,11 @@ fn head(sql: &str) -> Result<Option<(Kind, String)>> {
         i += 2;
     }
     ensure!(!matches!(word(i).as_str(), "temp" | "temporary"), "a temporary object is a session's, not a project's");
+    // The registry says what a project can't declare, and why (`objects::Kind::project`). (By the
+    // statement's word: a kind of two words, `materialized view`, is one a project declares.)
+    if let Some(why) = crate::objects::kind(&word(i)).and_then(|k| k.project) {
+        bail!("{why}");
+    }
     let kind = match (word(i).as_str(), word(i + 1).as_str()) {
         ("materialized", "view") => {
             i += 1;
@@ -271,9 +277,7 @@ fn head(sql: &str) -> Result<Option<(Kind, String)>> {
         ("macro", _) => Kind::Macro,
         ("procedure", _) => Kind::Procedure,
         ("task", _) => Kind::Task,
-        ("share" | "recipient", _) => bail!("{SHARES}"),
-        ("user", _) => bail!("users are each environment's: a project makes roles (CREATE ROLE analyst), and an environment's admin grants them (GRANT analyst TO ann)"),
-        (w, _) => bail!("CREATE {}: a project declares schemas, tables, views, materialized views, functions, macros, procedures, tasks, secrets, roles and grants", w.to_uppercase()),
+        (w, _) => bail!("CREATE {}: a project declares {} and grants", w.to_uppercase(), declarable()),
     };
     i += 1;
     if word(i) == "if" && word(i + 1) == "not" && word(i + 2) == "exists" {
@@ -1133,6 +1137,8 @@ mod tests {
         assert!(head("CREATE RECIPIENT acme_corp").unwrap_err().to_string().contains("shares and recipients"));
         assert!(head("GRANT SELECT ON SHARE acme TO RECIPIENT acme_corp").unwrap_err().to_string().contains("shares and recipients"));
         assert!(head("CREATE TABLE prod.sales.orders (id INT)").unwrap_err().to_string().contains("without their database"));
+        assert!(head("CREATE SEQUENCE ids").unwrap_err().to_string().contains("sequences aren't declared"));
+        assert!(matches!(head("CREATE TABLE function (id INT)"), Ok(Some((Kind::Table, _)))));
         assert!(head("-- only a comment").unwrap().is_none());
     }
 

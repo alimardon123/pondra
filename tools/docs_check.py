@@ -4,6 +4,7 @@ against a fresh node, so the docs can't fall behind the code.
 
   python3 tools/docs_check.py                      # every page under site/src/content/docs
   python3 tools/docs_check.py site/src/content/docs/guides/streaming.mdx
+  python3 tools/docs_check.py --write-glossary     # docs/glossary.md and the site's glossary, written from GET /kinds
 
 A page gets its own lake and a node on the ports the docs use: HTTP 8080, Postgres 5432, Kafka
 9092, Flight 8815 (and Python functions on). Its frontmatter's `setup:` SQL runs first, unseen.
@@ -109,6 +110,25 @@ def shifted(code):
     return code
 
 
+def start_node(work):
+    """A node on this run's ports, its lake in `work` (a page's examples, and the glossary's kinds)."""
+    env = {**os.environ, "PATH": os.path.dirname(BIN) + os.pathsep + os.environ.get("PATH", ""), "PONDRA_URL": f"http://127.0.0.1:{PORTS['http']}",
+           "PYTHONPATH": os.path.join(ROOT, "python") + os.pathsep + os.environ.get("PYTHONPATH", ""), "PONDRA_BIN": BIN}
+    node = subprocess.Popen([BIN, "serve", "--dir", os.path.join(work, "lake"), "--addr", f"127.0.0.1:{PORTS['http']}", "--pg", f"127.0.0.1:{PORTS['pg']}",
+                             "--kafka", f"127.0.0.1:{PORTS['kafka']}", "--flight", f"127.0.0.1:{PORTS['flight']}", "--python", "auto", "--stop-with-stdin", "--tier-secs", "1"],
+                            cwd=work, env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=open(os.path.join(work, "node.log"), "w"))
+    return node, env
+
+
+def stop_node(node):
+    """Closing its standard input stops it (it gives its leader's term up); it is killed if that takes long."""
+    node.stdin.close()
+    try:
+        node.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        node.kill()
+
+
 def check_page(path, verbose):
     front, found = blocks(open(path, encoding="utf-8").read())
     found = [(lang, info, shifted(code), line) for lang, info, code, line in found]
@@ -119,11 +139,7 @@ def check_page(path, verbose):
     if busy:
         return {"page": path, "ok": False, "error": f"ports in use: {busy} (stop what holds them)"}
     work = tempfile.mkdtemp(prefix="pondra-docs-")
-    env = {**os.environ, "PATH": os.path.dirname(BIN) + os.pathsep + os.environ.get("PATH", ""), "PONDRA_URL": f"http://127.0.0.1:{PORTS['http']}",
-           "PYTHONPATH": os.path.join(ROOT, "python") + os.pathsep + os.environ.get("PYTHONPATH", ""), "PONDRA_BIN": BIN}
-    node = subprocess.Popen([BIN, "serve", "--dir", os.path.join(work, "lake"), "--addr", f"127.0.0.1:{PORTS['http']}", "--pg", f"127.0.0.1:{PORTS['pg']}",
-                             "--kafka", f"127.0.0.1:{PORTS['kafka']}", "--flight", f"127.0.0.1:{PORTS['flight']}", "--python", "auto", "--stop-with-stdin", "--tier-secs", "1"],
-                            cwd=work, env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=open(os.path.join(work, "node.log"), "w"))
+    node, env = start_node(work)
     py, report = None, {"page": path, "ran": 0, "ok": True}
     try:
         if not wait_http(f"http://127.0.0.1:{PORTS['http']}/stats"):
@@ -177,11 +193,7 @@ def check_page(path, verbose):
         if py:
             py.stdin.close()
             py.wait(timeout=30)
-        node.stdin.close()
-        try:
-            node.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            node.kill()
+        stop_node(node)
         shutil.rmtree(work, ignore_errors=True)
     return report
 
@@ -192,14 +204,76 @@ def logs(work):
     return "".join(f"\n--- {os.path.relpath(p, work)}:\n" + open(p, errors="replace").read()[-1200:] for p in found)[-6000:]
 
 
+GLOSSARY_MD = os.path.join(ROOT, "docs", "glossary.md")
+GLOSSARY_SITE = os.path.join(ROOT, "site", "src", "content", "docs", "reference", "glossary.mdx")
+GLOSSARY_FILES = (GLOSSARY_MD, GLOSSARY_SITE)
+GLOSSARY_NOTE = ("Generated from `pondra.kinds` (`src/objects.rs`): don't edit it here; "
+                 "`python3 tools/docs_check.py --write-glossary` writes it again.")
+GLOSSARY_DESCRIPTION = "Every kind of object, part and pattern Pondra has, what it is, and what other products call it."
+
+
+def glossary(rows):
+    """The glossary, from GET /kinds (`rows`): the markdown for docs/ and the site's MDX, which differ only
+    in the site's frontmatter. Each kind, part and pattern is one paragraph, sorted by name; nothing in it
+    is typed here, so a kind added to the registry is in it."""
+    def sentence(text):
+        return text if text.endswith(".") else text + "."
+    def others(row):
+        return f" Other products call it {', '.join(row['also'])}." if row.get("also") else ""
+    def paragraphs(is_, line):
+        return [line(r) for r in sorted((r for r in rows if r["is"] == is_), key=lambda r: r["kind"].lower())]
+    sections = [
+        ("## Objects", paragraphs("object", lambda r: f"**{r['kind']}**: {sentence(r['about'])}{others(r)}")),
+        ("## Parts", paragraphs("part", lambda r: f"**{r['kind']}**, inside a {', '.join(r['inside'])}: {sentence(r['about'])}{others(r)}")),
+        ("## Patterns", paragraphs("pattern", lambda r: f"**{r['kind']}**: {r['about'].rstrip('.')}; listed by `{r['lists']}`.{others(r)}")),
+    ]
+    body = "\n\n".join([GLOSSARY_NOTE] + [f"{head}\n\n" + "\n\n".join(paras) for head, paras in sections]) + "\n"
+    site = f"---\ntitle: Glossary\ndescription: {GLOSSARY_DESCRIPTION}\n---\n\n{body}"
+    return f"# Glossary\n\n{body}", site
+
+
+def kinds_rows():
+    """GET /kinds from a node of its own, on a lake made for the moment (the glossary is written from it)."""
+    busy = [n for n, p in PORTS.items() if not free(p)]
+    if busy:
+        raise RuntimeError(f"ports in use: {busy} (stop what holds them)")
+    work = tempfile.mkdtemp(prefix="pondra-glossary-")
+    node, _ = start_node(work)
+    try:
+        if not wait_http(f"http://127.0.0.1:{PORTS['http']}/stats"):
+            raise RuntimeError("the node didn't start: " + open(os.path.join(work, "node.log")).read()[-1000:])
+        return json.loads(urllib.request.urlopen(f"http://127.0.0.1:{PORTS['http']}/kinds", timeout=30).read())
+    finally:
+        stop_node(node)
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def glossary_checks():
+    """Each glossary file as a page's report: out of date (or missing) when it isn't what GET /kinds says now."""
+    reports = []
+    for path, text in zip(GLOSSARY_FILES, glossary(kinds_rows())):
+        ok = os.path.exists(path) and open(path, encoding="utf-8").read() == text
+        reports.append({"page": path, "ran": 0, "ok": ok, **({} if ok else {"error": "out of date: python3 tools/docs_check.py --write-glossary"})})
+    return reports
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("paths", nargs="*", default=[os.path.join(ROOT, "site", "src", "content", "docs")])
+    ap.add_argument("paths", nargs="*", help="pages or folders to check (default: every page of the site, and the glossary)")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--offset", type=int, default=0, help="move every port by this much (and the examples' too), to run beside another check")
+    ap.add_argument("--write-glossary", action="store_true", help="write docs/glossary.md and the site's glossary from GET /kinds, and stop")
     a = ap.parse_args()
     for name in PORTS:
         PORTS[name] = DOC_PORTS[name] + a.offset
+    if a.write_glossary:
+        for path, text in zip(GLOSSARY_FILES, glossary(kinds_rows())):
+            open(path, "w", encoding="utf-8").write(text)
+            print(f"wrote {os.path.relpath(path, ROOT)}", flush=True)
+        sys.exit(0)
+    everything = not a.paths
+    if everything:
+        a.paths = [os.path.join(ROOT, "site", "src", "content", "docs")]
     pages = []
     for p in a.paths:
         if os.path.isdir(p):
@@ -214,6 +288,12 @@ def main():
         print(f"{mark} {os.path.relpath(page, ROOT)} ({r.get('ran', 0)} examples)", flush=True)
         if not r["ok"]:
             print(f"     at {r.get('failed', '?')} ({r.get('lang', '')}):\n{r.get('error', '')}\n", flush=True)
+    if everything or any(os.path.abspath(p) in GLOSSARY_FILES for p in a.paths):
+        for r in glossary_checks():
+            results.append(r)
+            print(f"{'ok  ' if r['ok'] else 'FAIL'} {os.path.relpath(r['page'], ROOT)} (generated from GET /kinds)", flush=True)
+            if not r["ok"]:
+                print(f"     {r['error']}\n", flush=True)
     bad = [r for r in results if not r["ok"]]
     print(json.dumps({"pages": len(results), "examples": sum(r.get("ran", 0) for r in results), "failed": [os.path.relpath(r["page"], ROOT) for r in bad], "ok": not bad}))
     sys.exit(1 if bad else 0)

@@ -111,7 +111,13 @@ deploy are the same on either layout.
    outlive the deploy. Checked by `environments_check.py`.
 4. **The developer's day:** `pondra ci init` (the workflow: a branch, a deploy, tests and the diff
    on each pull request, test on merge, prod on approval), `pondra dev` (deploy and test on save),
-   and a Git hook that moves the branch's database with `git switch`.
+   and a Git hook that moves the branch's database with `git switch`. *Built in round 34:* `pondra ci
+   init` writes the workflow to `.github/workflows/pondra.yml` (pinned to this pondra, with a test job
+   when pondra.toml has `[env.test]`) and says the four things left to set up; `pondra dev` makes the git
+   branch's database, then deploys and tests on each save (never prod, `main` or a protected database;
+   a failed deploy is printed and the watch goes on); `pondra branch --if-missing` leaves a database that
+   is there, and `pondra branch --hook` installs the `post-checkout` hook that calls it on `git switch`.
+   Checked by `project_check.py`, which runs the hook, the watch and the workflow's jobs.
 5. **Later:** masked branches; a branch on the laptop over `vend` (round 35's in-process mode).
 
 **Names** (checked by the SQL review thread, 2026-10-09):

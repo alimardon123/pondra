@@ -1672,22 +1672,40 @@ impl Catalog {
         Ok(r.get("c").await?.map(|v| serde_json::from_slice(&v)).transpose()?.unwrap_or(0))
     }
 
-    /// Non-leader: how far our own catalog view is; drop the streamed changes it now has.
-    async fn refresh(&self) -> Result<()> {
-        let Db_::Reader(r) = &self.db else { return Ok(()) };
+    /// Non-leader: move our view's marks to where the reader is now. Returns its commit and the
+    /// oldest commit a scan still in progress (it started from an older view) holds.
+    async fn mark(&self) -> Result<(u64, u64)> {
+        let Db_::Reader(r) = &self.db else { return Ok((0, 0)) };
         let get = |k: &'static str| async move { Ok::<u64, anyhow::Error>(r.get(k).await?.map(|v| serde_json::from_slice(&v)).transpose()?.unwrap_or(0)) };
         // "n" BEFORE "c": our view only moves forward, so this `n` is one our view already had
         // at commit `c` (the other way round it could be from a newer view than `c`, and reads
         // held back to an older commit would miss segments this node thought it could read).
         let (n, c) = (get("n").await?.max(1), get("c").await?);
+        let pins = self.pins.lock().unwrap();
+        self.view.0.fetch_max(c, Relaxed); // (queries move them too, `settle`: an older read never wins)
+        self.view.1.fetch_max(n, Relaxed);
+        Ok((c, pins.keys().next().map_or(c, |&p| p.min(c))))
+    }
+
+    /// Right after a query read table entries, on a node with no in-memory catalog (an attached
+    /// lake, a follower between seeds): those entries are the reader as it is now, which moves on
+    /// between refreshes, so the log's end the query reads to (`visible`) is brought up to them.
+    /// Behind them, a change's old row was left out while its new one wasn't read yet (an attached
+    /// lake's changed row missing from half the reads: `harness.py attached`). Marks only: pruning
+    /// and seeding stay `refresh`'s, once a period (invariant 8).
+    pub async fn settle(&self) -> Result<()> {
+        match self.mirror.load(Relaxed) {
+            true => Ok(()),
+            false => self.mark().await.map(|_| ()),
+        }
+    }
+
+    /// Non-leader: how far our own catalog view is; drop the streamed changes it now has.
+    async fn refresh(&self) -> Result<()> {
+        let Db_::Reader(_) = &self.db else { return Ok(()) };
         // Drop the streamed copies our view now has, except those a scan still in progress
         // (it started from an older view) may lay over its data.
-        let upto = {
-            let pins = self.pins.lock().unwrap();
-            self.view.0.store(c, Relaxed);
-            self.view.1.store(n, Relaxed);
-            pins.keys().next().map_or(c, |&p| p.min(c))
-        };
+        let (c, upto) = self.mark().await?;
         {
             let mut o = self.overlay.lock().unwrap();
             if self.mirror.load(Relaxed) {

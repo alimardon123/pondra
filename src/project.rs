@@ -1,5 +1,5 @@
 //! A project on the command line (ADR-047 §4, §6): `pondra init`, `login`, `branch`, `plan`,
-//! `deploy`, `test`, `export` and `diff`. The folder is read here and sent to the environment's node
+//! `deploy`, `test`, `export`, `diff`, `dev` and `ci init`. The folder is read here and sent to the environment's node
 //! (`POST /deploy`), which plans and deploys it (`deploy.rs`). An environment is a database, found by
 //! `--url` or `--lake`, else by pondra.toml: `[env.prod] url = …` (or `lake = …`), or the project's
 //! `server` and the database's name (`/db/prod`, `pondra serve --lakes`). A token comes from
@@ -45,6 +45,12 @@ pub enum Command {
         /// Drop it instead.
         #[arg(long)]
         drop: bool,
+        /// Leave it as it is if it is there: for scripts and the git hook.
+        #[arg(long, conflicts_with_all = ["replace", "drop"])]
+        if_missing: bool,
+        /// Install a git hook that makes the branch's database after each `git switch`.
+        #[arg(long)]
+        hook: bool,
         #[command(flatten)]
         at: Where,
     },
@@ -86,6 +92,34 @@ pub enum Command {
         /// The database it is compared with.
         #[arg(long, default_value = "prod")]
         against: String,
+    },
+    /// Continuous integration: `pondra ci init` writes a GitHub Actions workflow for the project.
+    Ci {
+        #[command(subcommand)]
+        cmd: Ci,
+    },
+    /// Work on the git branch's database: make it if it isn't there (from --from), then deploy the
+    /// project and run its tests each time a file of it is saved. Ctrl-C stops.
+    Dev {
+        #[command(flatten)]
+        at: Where,
+        /// The database a new branch starts as.
+        #[arg(long, default_value = "prod")]
+        from: String,
+        /// Stop after this many deploys (the first included): for the tests.
+        #[arg(long, hide = true)]
+        deploys: Option<usize>,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub enum Ci {
+    /// Write .github/workflows/pondra.yml for the project (--force writes it again).
+    Init {
+        #[arg(long, default_value = ".")]
+        project: String,
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -135,6 +169,8 @@ struct Env {
     clone: Option<String>, // made again as a branch of this database before each deploy
     #[serde(default)]
     base: Option<String>, // branches of this database are made on this environment's server (ADR-058)
+    #[serde(default)]
+    protected: bool, // (its objects change only by a deploy: `pondra dev` never deploys here)
 }
 
 fn read_toml(dir: &Path) -> Result<Toml> {
@@ -385,12 +421,15 @@ async fn run(cmd: Command) -> Result<(String, bool)> {
     match cmd {
         Command::Init { dir, name } => init(dir.as_deref().unwrap_or("."), name).map(|s| (s, true)),
         Command::Login { url, token, user } => login(&url, token, user).await.map(|s| (s + "\n", true)),
-        Command::Branch { name, from, replace, drop, at } => branch(name, &from, replace, drop, &at).await.map(|s| (s, true)),
+        Command::Branch { hook: true, from, at, .. } => git_hook(&at, &from).map(|s| (s, true)),
+        Command::Branch { name, from, replace, drop, if_missing, at, .. } => branch(name, &from, replace, drop, if_missing, &at).await.map(|s| (s, true)),
         Command::Plan { at, prune } => deploy(&at, false, false, prune).await,
         Command::Deploy { at, test, prune } => deploy(&at, true, test, prune).await,
         Command::Test { at } => tests(&at).await,
         Command::Export { dir, at } => export(dir.as_deref().unwrap_or("."), &at).await.map(|s| (s, true)),
         Command::Diff { at, against } => diff(&at, &against).await,
+        Command::Ci { cmd: Ci::Init { project, force } } => ci_init(&project, force).map(|s| (s, true)),
+        Command::Dev { at, from, deploys } => dev(&at, &from, deploys).await.map(|()| (String::new(), true)),
     }
 }
 
@@ -414,7 +453,7 @@ fn init(dir: &str, name: Option<String>) -> Result<String> {
     Ok(format!("a project in {}: pondra.toml, objects/, migrations/, tests/\n", dir.display()))
 }
 
-async fn branch(name: Option<String>, from: &str, replace: bool, drop: bool, at: &Where) -> Result<String> {
+async fn branch(name: Option<String>, from: &str, replace: bool, drop: bool, if_missing: bool, at: &Where) -> Result<String> {
     let dir = Path::new(&at.project);
     let toml = read_toml(dir)?;
     let name = match name.or_else(|| at.env.clone()) {
@@ -431,8 +470,45 @@ async fn branch(name: Option<String>, from: &str, replace: bool, drop: bool, at:
             return Ok(format!("{name} dropped\n"));
         }
     }
-    base.sql(&format!("CREATE DATABASE {name} CLONE {}", database(from))).await?;
+    let ine = if if_missing { "IF NOT EXISTS " } else { "" };
+    let made = base.sql(&format!("CREATE DATABASE {ine}{name} CLONE {}", database(from))).await?;
+    // (an IF NOT EXISTS that found it answers the attachment it already had, not a new clone)
+    if if_missing && made.get("attached").is_some() {
+        return Ok(format!("{name}: there already\n"));
+    }
     Ok(format!("{name}: {from} as it is now, no file copied (pondra deploy --env {name})\n"))
+}
+
+/// `pondra branch --hook`: a git hook that makes the branch's database each time a `git switch` lands
+/// on a branch (`--if-missing`). A hook of pondra's own is rewritten; any other is refused by name.
+fn git_hook(at: &Where, from: &str) -> Result<String> {
+    const MARK: &str = "# pondra branch --hook";
+    let dir = Path::new(&at.project);
+    let hooks = git(dir, &["rev-parse", "--git-path", "hooks"]).context("a git repository: git init, then pondra branch --hook")?;
+    let path = dir.join(hooks).join("post-checkout");
+    if path.exists() {
+        let old = std::fs::read(&path)?;
+        ensure!(String::from_utf8_lossy(&old).contains(MARK), "{} is a post-checkout hook of its own: move it aside, then pondra branch --hook", path.display());
+    }
+    // (the words are quoted, so a path with a space or a `$` stays one word in the shell)
+    let project = sh_word(&std::path::absolute(dir)?.display().to_string());
+    let script = format!(
+        "#!/bin/sh\n{MARK}: a database for each git branch, made when you switch to it\n\
+         [ \"$3\" = 1 ] || exit 0\n\
+         b=$(git rev-parse --abbrev-ref HEAD)\n\
+         case \"$b\" in main|master|HEAD) exit 0 ;; esac\n\
+         pondra branch --if-missing --from {} --project {project} || echo \"pondra: no database for $b yet (pondra branch)\"\n",
+        sh_word(from)
+    );
+    std::fs::write(&path, script)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    Ok(format!("a git hook in {}: each git switch to a branch makes its database (from {from})\n", path.display()))
+}
+
+/// A word for a POSIX shell: in single quotes, with each quote inside it written `'\''`.
+fn sh_word(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 async fn deploy(at: &Where, apply: bool, test: bool, prune: bool) -> Result<(String, bool)> {
@@ -441,7 +517,7 @@ async fn deploy(at: &Where, apply: bool, test: bool, prune: bool) -> Result<(Str
     let env = env_of(at, &toml, dir)?;
     let files = files(dir)?;
     if let (true, Some(from)) = (apply, toml.env.get(&env).and_then(|e| e.clone.clone())) {
-        branch(Some(env.clone()), &from, true, false, at).await?; // (made again from its base before each deploy)
+        branch(Some(env.clone()), &from, true, false, false, at).await?; // (made again from its base before each deploy)
     }
     let node = node(at, &toml, &env).await?;
     let commit = commit(dir);
@@ -545,6 +621,205 @@ async fn diff(at: &Where, against: &str) -> Result<(String, bool)> {
         false => format!("Rows:\n\n| table | inserted | changed | deleted |\n|---|---:|---:|---:|\n{}", rows.concat()),
     });
     Ok((out, true))
+}
+
+// ---------------------------------------------------------------- the developer's day
+
+/// The workflow `pondra ci init` writes, in three parts: the pull requests and the merge's test job
+/// (in `workflow`), then prod, which waits for test when there is one. `@VERSION@` is this pondra.
+const WORKFLOW_TOP: &str = r##"# Pondra (pondra ci init): each pull request gets a branch of prod with its code deployed and
+# tested, and the diff on the pull request; a merge to main deploys to test; an approval in
+# GitHub's "prod" environment deploys the same commit to prod.
+name: pondra
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  push:
+    branches: [main]
+concurrency: pondra-${{ github.event.pull_request.number || github.ref }}
+jobs:
+  pull-request:
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    env:
+      PONDRA_TOKEN: ${{ secrets.PONDRA_DEV_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install pondra==@VERSION@
+      - run: pondra branch pr-${{ github.event.number }} --from prod --replace
+      - run: pondra deploy --env pr-${{ github.event.number }} --test
+      - run: pondra diff --env pr-${{ github.event.number }} >> "$GITHUB_STEP_SUMMARY"
+  closed:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    env:
+      PONDRA_TOKEN: ${{ secrets.PONDRA_DEV_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install pondra==@VERSION@
+      - run: pondra branch pr-${{ github.event.number }} --drop
+"##;
+
+const WORKFLOW_TEST: &str = r##"  test:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      PONDRA_TOKEN: ${{ secrets.PONDRA_DEV_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install pondra==@VERSION@
+      - run: pondra deploy --env test --test
+"##;
+
+const WORKFLOW_PROD: &str = r##"    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      PONDRA_TOKEN: ${{ secrets.PONDRA_PROD_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install pondra==@VERSION@
+      - run: pondra deploy --env prod --test
+"##;
+
+/// The whole workflow for this pondra; the test job and prod's `needs` only when pondra.toml has [env.test].
+fn workflow(version: &str, test: bool) -> String {
+    let mut y = String::from(WORKFLOW_TOP);
+    if test {
+        y.push_str(WORKFLOW_TEST);
+    }
+    y.push_str("  prod:\n    if: github.event_name == 'push'\n");
+    if test {
+        y.push_str("    needs: test\n");
+    }
+    y.push_str(WORKFLOW_PROD);
+    y.replace("@VERSION@", version)
+}
+
+/// `pondra ci init`: the project's GitHub Actions workflow, and what is left for a person to set up.
+fn ci_init(dir: &str, force: bool) -> Result<String> {
+    let project = Path::new(dir);
+    ensure!(project.join("pondra.toml").exists(), "no pondra.toml here: pondra init first");
+    let path = project.join(".github/workflows/pondra.yml");
+    ensure!(force || !path.exists(), "{} is there: --force writes it again", path.display());
+    let toml = read_toml(project)?;
+    std::fs::create_dir_all(path.parent().unwrap_or(project))?;
+    std::fs::write(&path, workflow(env!("CARGO_PKG_VERSION"), toml.env.contains_key("test")))?;
+    let mut out = String::from("wrote .github/workflows/pondra.yml. Then:\n");
+    out.push_str("  1. on prod, a user for CI that may deploy and nothing more:\n");
+    out.push_str("       CREATE USER ci; GRANT DEPLOY ON DATABASE prod TO ci; CREATE TOKEN github FOR USER ci;\n");
+    out.push_str("  2. on the server the branches are made on (dev), a token that may make databases\n");
+    out.push_str("  3. in GitHub: the secrets PONDRA_PROD_TOKEN and PONDRA_DEV_TOKEN (the same token if one server\n");
+    out.push_str("     holds everything), and an environment named prod with required reviewers\n");
+    out.push_str("     (Settings → Environments)\n");
+    if !toml.env.get("prod").is_some_and(|e| e.protected) {
+        out.push_str("  4. in pondra.toml: protected = true under [env.prod], so only CI's deploys change prod\n");
+    }
+    Ok(out)
+}
+
+fn dev_refused(env: &str) -> Result<()> {
+    bail!("pondra dev deploys on every save: not to {env}. git switch -c a-branch first")
+}
+
+/// `pondra dev`: the git branch's database (made from `from` when pondra.toml doesn't declare it), deployed
+/// and tested now, and again after each save of the project's files. A deploy that fails is printed and
+/// the watch goes on; Ctrl-C ends it.
+async fn dev(at: &Where, from: &str, deploys: Option<usize>) -> Result<()> {
+    let dir = Path::new(&at.project);
+    let toml = read_toml(dir)?;
+    // (on main, env_of would ask which environment: the refusal names main, and says what to do)
+    let env = match git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Some(b) if at.env.is_none() && (b == "main" || b == "master") => b,
+        _ => env_of(at, &toml, dir)?,
+    };
+    if matches!(env.as_str(), "prod" | "main" | "master") || toml.env.get(&env).is_some_and(|e| e.protected) {
+        return dev_refused(&env);
+    }
+    let lake = at.lake.is_some() || (at.url.is_none() && toml.env.get(&env).is_some_and(|e| e.lake.is_some()));
+    ensure!(!lake, "pondra dev works with a server (--url, or [project] server): a lake's node stops after each command");
+    if !toml.env.contains_key(&env) {
+        say(&branch(Some(env.clone()), from, false, false, true, at).await?);
+    }
+    let node = node(at, &toml, &env).await?;
+    let db = node.sql(&format!("SELECT protected FROM pondra.databases WHERE name = '{}'", database(&env))).await?;
+    if db[0]["protected"] == true {
+        return dev_refused(&env);
+    }
+    say(&format!("{env}: console at {}/\nwatching the project's files: each save is deployed and tested (Ctrl-C stops)\n", node.base));
+    let target = Where { env: Some(env.clone()), ..at.clone() };
+    let mut last = files(dir)?; // (what the last deploy was of)
+    let mut count = 0;
+    loop {
+        deploy_say(&target).await;
+        count += 1;
+        if deploys.is_some_and(|n| count >= n) || !settled(dir, &mut last).await {
+            return Ok(());
+        }
+    }
+}
+
+/// One deploy with its tests, printed. A failure is printed too, and the watch goes on.
+async fn deploy_say(at: &Where) {
+    match deploy(at, true, true, false).await {
+        Ok((text, _)) => say(&text),
+        Err(e) => say(&format!("{e:#}\n")),
+    }
+}
+
+/// Waits until the files differ from `last` and have stopped changing for 300 ms, then makes `last`
+/// what they are; false when Ctrl-C comes first. A save of several files is one change, one deploy.
+async fn settled(dir: &Path, last: &mut BTreeMap<String, String>) -> bool {
+    loop {
+        if !pause(500).await {
+            return false;
+        }
+        let Ok(mut now) = files(dir) else { continue };
+        if now == *last {
+            continue;
+        }
+        loop {
+            if !pause(300).await {
+                return false;
+            }
+            match files(dir) {
+                Ok(next) if next == now => break,
+                Ok(next) => now = next,
+                Err(_) => {}
+            }
+        }
+        say(&format!("{} changed: {}\n", clock(), changed(last, &now)));
+        *last = now;
+        return true;
+    }
+}
+
+/// Sleeps `ms`: false if Ctrl-C comes first.
+async fn pause(ms: u64) -> bool {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => false,
+        _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => true,
+    }
+}
+
+/// The names of the files that differ between two snapshots, sorted.
+fn changed(a: &BTreeMap<String, String>, b: &BTreeMap<String, String>) -> String {
+    let mut names: Vec<&String> = a.keys().chain(b.keys()).filter(|k| a.get(*k) != b.get(*k)).collect();
+    names.sort();
+    names.dedup();
+    names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ")
+}
+
+/// The time of day in UTC as HH:MM:SS (chrono is built without a clock, so it is worked out here).
+fn clock() -> String {
+    let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() % 86_400);
+    format!("{:02}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+}
+
+/// Prints now, not when the buffer fills: a watch's lines show as they happen.
+fn say(text: &str) {
+    use std::io::Write;
+    print!("{text}");
+    let _ = std::io::stdout().flush();
 }
 
 #[cfg(test)]
