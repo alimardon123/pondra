@@ -1012,7 +1012,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    is never made a lake, the current folder only when named; `--lake` on a folder of lakes and
    `--lakes` on a lake are refused with the command meant; one lake's options (`--flight`,
    `--kafka`, `--attach`, `--advertise`, `--attach-found`) are refused with `--lakes`, and every
-   other reaches each database's node (`Options.node`). `harness.py server`.
+   other reaches each database's node (`Options.node`). A folder whose first node has claimed a
+   term but not yet made the catalog is a lake being made (`dbserver::is_lake`): nodes started at
+   once on a new folder by its name all join it (two of three exited). `harness.py server`,
+   `cluster.py race`.
 143. **A database's node isn't stopped while in use** (`dbserver::Busy`): an open Postgres
    connection or an HTTP request (until its answer's last byte) holds it; idle time counts from
    when the last one ended; `reap` checks again under the lock before it stops one. `harness.py
@@ -1315,12 +1318,20 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    only by columns it kept. PySpark's `spark.sql` sends its queries this way, its writes as
    Pondra's SQL. `harness.py sparksql` (its "by a column it leaves out" fails without the first).
 197. **A node that just started answers only once it holds what its leader had** (`cluster::catch_up`,
-   `Lake::caught_up`, in `query::session_at` and `write::on_node_as`; 10 s at most): restarted after
-   a failover, its catalog view reads no WAL, and what the new leader took over from the old one's
-   is flushed a moment after it leads, so a table made just before the kill was "not found" there.
-   A Flight log stream that follows a table skips the commits to other tables instead of sending
-   them as empty chunks. The website's `guides/clusters.mdx` (a node killed and restarted, then
-   asked for that table) failed one run in three under load without it; `cluster.py failover`.
+   `Lake::caught_up`, in `query::session_at` and `write::on_node_as`): restarted after a failover,
+   its catalog view reads no WAL, and what the new leader took over from the old one's is flushed a
+   moment after it leads, so a table made just before the kill was "not found" there. Only a node
+   reading the commit stream catches up (a view that replays the WAL has it all). It asks its leader
+   for 30 s (a new one answers once it has recovered, up to 20 s), a request waits 10 s, and then it
+   is refused with 57P03 (`store::CATCHING_UP`: the clients ask again, or another node), never
+   answered from the older catalog. Nor may the two wait on each other: a new leader asks its
+   members with the nodes' key (`users::node_key_made`, before `replica::recover`), and a lake's keys
+   reach every node's view as soon as they are made (a checkpoint), or a follower restarted soon
+   after the lake was made held the new leader's call 10 s, gave up catching up, and answered from
+   its older catalog. A Flight log stream that follows a table skips the commits to other tables
+   instead of sending them as empty chunks. The website's `guides/clusters.mdx` (a leader killed
+   seconds after the lake was made, then a node asked to INSERT into its table) failed one run in
+   three without it (PR #50's CI); `cluster.py failover`.
 
 198. **A variable's value is bound, never pasted, and lives where its statements do** (`vars.rs`,
    ADR-037): `DECLARE $day DATE = …` and `$day = …` (DuckDB's `SET VARIABLE`, `RESET VARIABLE`,

@@ -93,13 +93,21 @@ pub async fn holds_lakes(path: &str) -> anyhow::Result<bool> {
     Ok(!is_lake(path).await? && !databases(path).await.is_empty())
 }
 
-/// Is there a lake at `dir` (a folder, or a bucket's prefix)?
+/// Is there a lake at `dir` (a folder, or a bucket's prefix)? One being made counts: its first
+/// node claims a term before it writes the catalog, and a node started at the same instant takes
+/// it for the lake it is becoming (it exited, "holds other things than lakes").
 pub async fn is_lake(dir: &str) -> Result<bool> {
     if !dir.contains("://") {
-        return Ok(std::path::Path::new(dir).join("catalog").is_dir());
+        let d = std::path::Path::new(dir);
+        return Ok(d.join("catalog").is_dir() || d.join("cluster").join("term").is_dir());
     }
     let store = crate::store::open_store(dir)?.1;
-    Ok(futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog")))).await.transpose()?.is_some())
+    for prefix in ["catalog", "cluster/term"] {
+        if futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from(prefix)))).await.transpose()?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Where database `name` is: a subfolder, or a prefix under the bucket's.

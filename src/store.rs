@@ -639,6 +639,10 @@ impl ObjectStore for Counted {
     }
 }
 
+/// What a node still catching up with its leader answers (57P03: it ran nothing, ask again or
+/// another node; `Lake::caught_up`).
+pub const CATCHING_UP: &str = "this node just started and is still catching up with its leader: try again in a moment, or ask another node";
+
 impl Lake {
     /// `writer`: the leader. `streamed`: a follower, which also gets every commit streamed from
     /// the leader, so its own catalog view only needs the leader's checkpoints (no log replay).
@@ -808,13 +812,16 @@ impl Lake {
     }
 
     /// Wait, 10 s at most, until this node holds what its leader had committed when it started
-    /// (`cluster::catch_up`). A node restarted after a failover would otherwise answer from an older
-    /// catalog than it did before: its view reads no WAL, and the new leader flushes what it took
-    /// over a moment after it leads (a table just made was "not found").
-    pub async fn caught_up(&self) {
+    /// (`cluster::catch_up`), and refuse (57P03) if it doesn't yet. A node restarted after a
+    /// failover would otherwise answer from an older catalog than it did before: its view reads no
+    /// WAL, and the new leader flushes what it took over a moment after it leads (a table just
+    /// made was "not found").
+    pub async fn caught_up(&self) -> Result<()> {
         if !*self.caught.borrow() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), self.caught.subscribe().wait_for(|c| *c)).await;
         }
+        anyhow::ensure!(*self.caught.borrow(), "{CATCHING_UP}");
+        Ok(())
     }
 
     /// Non-leaders: catch up with our own catalog view (and prune what it now holds).

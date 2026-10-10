@@ -54,7 +54,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("divide by zero") || has("division by zero") => "22012",                       // division_by_zero
         _ if has("overflow") || has("out of range") => "22003",                                 // numeric_value_out_of_range
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
-        _ if has("can't reach the bucket") => "57P03",                                         // cannot_connect_now (a leader cut off: ask another node)
+        _ if has("can't reach the bucket") || has("catching up with its leader") => "57P03",   // cannot_connect_now (a leader cut off, a node just started: ask another node)
         _ if has("error sending request") => "58030",                                           // io_error (the bucket or another node didn't answer: try again)
         _ if has("statement timeout") || has("canceling statement") || has("timed out") => "57014", // query_canceled
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
@@ -112,6 +112,7 @@ mod tests {
         assert_eq!(of("type \"mood\" does not exist"), "42704");
         assert_eq!(of("cannot drop type mood because column t.m uses it"), "2BP01");
         assert_eq!(of(crate::cluster::CUT_OFF_SAYS), "57P03");
+        assert_eq!(of(crate::store::CATCHING_UP), "57P03");
         assert_eq!(of("error sending request for url (http://10.0.0.2:8080/cluster/commit)"), "58030");
         assert_eq!(of("cannot insert a non-DEFAULT value into column \"id\" of t: it is an identity column defined as GENERATED ALWAYS"), "428C9");
         assert_eq!(of("nextval: reached maximum value of sequence \"s\" (3)"), "2200H");

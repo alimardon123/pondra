@@ -787,6 +787,15 @@ pub async fn kept(lake: &Lake) -> &'static str {
 /// The key nodes call each other with when no admin token is set (`cluster::http`).
 pub async fn node_key(lake: &Lake) -> Result<String> { Ok(keys(lake).await?.node) }
 
+/// The nodes' key if the lake's keys are made, never making them: a new leader asks its members
+/// what they hold before it writes anything (`replica::recover`).
+pub async fn node_key_made(lake: &Lake) -> Option<String> {
+    match kept(lake).await {
+        "none" => None,
+        _ => node_key(lake).await.ok(),
+    }
+}
+
 /// How long a signed-in session lasts: `PONDRA_SESSION_HOURS` (12).
 fn session_ms() -> u64 { std::env::var("PONDRA_SESSION_HOURS").ok().and_then(|h| h.parse::<f64>().ok()).map_or(12 * 3_600_000, |h| (h * 3_600_000.0) as u64) }
 
