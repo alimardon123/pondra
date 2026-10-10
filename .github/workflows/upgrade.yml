@@ -64,6 +64,11 @@ jobs:
         run: |
           set -o pipefail
           python3 tools/environments_check.py --new target/release/pondra --work "$RUNNER_TEMP/environments" | tee environments.json
+      - name: Branches across servers (ATTACH … READ_ONLY, GRANT CLONE; two buckets behind gates)
+        if: matrix.part != 'releases'
+        run: |
+          set -o pipefail
+          python3 tools/environments_check.py --across --new target/release/pondra --work "$RUNNER_TEMP/environments-across" | tee environments-across.json
       - name: A project in Git made true in a database (pondra plan, deploy, branch, diff)
         if: matrix.part != 'releases'
         run: |
@@ -88,6 +93,7 @@ jobs:
             history.json
             environments.json
             environments-s3.json
+            environments-across.json
             project.json
             ${{ runner.temp }}/project/**/*.log
             ${{ runner.temp }}/history/*.log

@@ -685,7 +685,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Statement::CreateView(v) if v.temporary => Stmt::TempView(object(&v.name), view_sql(&v), v.or_replace, v.if_not_exists), // (the session's: `temp.rs`)
         Statement::CreateView(v) => Stmt::Ddl(vec![unless(v.if_not_exists, &object(&v.name), "relation", Ddl::CreateView { name: object(&v.name), sql: view_sql(&v), replace: v.or_replace })]),
         Statement::AttachDatabase { schema_name, database_file_name: ast::Expr::Value(v), .. } => match &v.value {
-            ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir) => Stmt::Ddl(vec![Ddl::Attach { name: ident(&schema_name), dir: dir.clone() }]),
+            ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir) => Stmt::Ddl(vec![Ddl::Attach { name: ident(&schema_name), dir: dir.clone(), read_only: false, endpoint: None }]),
             _ => return None,
         },
         Statement::CreateDatabase { db_name, if_not_exists, location, clone, .. } => {
@@ -1285,6 +1285,9 @@ async fn seen_there(other: &Lake, mark: Option<String>) {
     while !matches!(other.cat.get::<Value>(&key).await, Ok(Some(_))) && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    // (and how far this node reads it, which its refresh moves every 250 ms: a read before then
+    // took an UPDATE's old row out, from the view, but not its new one, from the log up to there)
+    let _ = other.refresh().await;
 }
 
 async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
@@ -1690,6 +1693,9 @@ pub async fn send(dir: &str, req: Request) -> Result<Value> { deliver(dir, Some(
 /// can't be reached, or, when nobody leads, by leading for a moment: here (`one_off`: a `pondra
 /// sql` process, which ends right after), or, from a node, in a `pondra sql` of its own.
 async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: &str, one_off: bool) -> Result<Value> {
+    if let Some(r) = crate::store::reach_of(dir).filter(|r| r.read_only) {
+        return across(dir, &r, req).await; // (a lake on another server: ADR-058)
+    }
     let store = open_store(dir)?.1;
     loop {
         match latest(&store).await? {
@@ -1794,6 +1800,37 @@ pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>
             crate::ddl::apply(lake, d).await
         }
     }
+}
+
+/// A lake on another server, read here with a read-only key (ADR-058): nothing here writes its
+/// bucket (no inbox, no term claimed), and only a branch's pin goes to its leader, at its
+/// ENDPOINT, with the pondra secret's token or the branch's own key.
+async fn across(dir: &str, r: &crate::store::Reach, req: Option<Option<Request>>) -> Result<Value> {
+    let Some(Some(req @ Request::Ddl(crate::ddl::Ddl::Pin { .. } | crate::ddl::Ddl::Unpin { .. }))) = req else {
+        bail!("{dir} is read with a read-only key here: it is written on its own server (ADR-058)");
+    };
+    // (never sent without one: this server's own key, or its user's token, must not go to another
+    // server; only a branch's own `pb_` key is meant for its base's leader)
+    let Some(token) = BEARER.try_with(|k| k.clone()).ok().filter(|k| k.starts_with("pb_")).or_else(|| r.token.clone()) else {
+        bail!("{dir}'s leader is asked with a token: CREATE SECRET … (TYPE pondra, TOKEN '…', SCOPE '<its endpoint>')");
+    };
+    let at = match &r.endpoint {
+        Some(e) => e.trim_end_matches('/').to_string(),
+        None => {
+            let store = open_store(dir)?.1;
+            match latest(&store).await? {
+                Some(t) if !t.addr.is_empty() && alive(&store, &t).await => crate::tls::url(&t.addr),
+                _ => bail!("nobody leads {dir}"),
+            }
+        }
+    };
+    let (path, body) = req.http()?;
+    let res = http().post(format!("{at}{path}")).header("content-type", "application/json").bearer_auth(token).body(body).send().await
+        .with_context(|| format!("{dir}'s leader doesn't answer at {at}: a branch is pinned while its base's server is up"))?;
+    if !res.status().is_success() {
+        bail!("{dir}'s leader at {at}: {}", res.text().await?);
+    }
+    Ok(res.json().await?)
 }
 
 pub async fn post(addr: &str, r: &Request) -> Result<Value> {

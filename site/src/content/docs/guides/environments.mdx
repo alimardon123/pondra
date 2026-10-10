@@ -286,6 +286,49 @@ pondra branch --drop
 - run: pondra branch pr-${{ github.event.number }} --drop
 ```
 
+### Production on a server of its own
+
+A company that keeps production apart runs it as its own server, with its own bucket, and dev as
+another. Dev's nodes never hold a key that writes production's bucket, yet a branch of production on
+dev still copies no data. Dev reads production's files with a key that only reads them, and asks
+production's leader to pin the tables it branches, with a token that may do nothing else.
+
+On production, an admin makes a user for dev's server and lets it clone what dev may see:
+
+```sql norun
+CREATE USER dev_server;
+GRANT CLONE ON SCHEMA sales TO dev_server;   -- or ON DATABASE prod: every schema
+CREATE TOKEN clone FOR USER dev_server;      -- answers the token, once
+```
+
+On dev, an admin keeps production's read-only bucket key and that token as secrets, and attaches
+production:
+
+```sql norun
+CREATE SECRET prod_ro (TYPE s3, KEY_ID '…', SECRET '…', REGION 'eu-west-1', SCOPE 's3://acme-prod/prod');
+CREATE SECRET prod_clone (TYPE pondra, TOKEN '…', SCOPE 'https://prod.acme.com');
+ATTACH 's3://acme-prod/prod' AS prod (READ_ONLY, ENDPOINT 'https://prod.acme.com');
+CREATE DATABASE ali CLONE prod;              -- in dev's bucket: sales only, no file copied
+```
+
+Nothing on dev writes or deletes under production's prefix, whatever dev's own key allows: a write
+to `prod` is refused by name. The branch keeps the read-only key in its own catalog, so it reads
+production on its own, and `ALTER DATABASE ali REFRESH` asks production's leader again with the
+branch's own key. A branch can't be made while production's leader is down; one made earlier can
+still be read. A clone takes only the schemas `dev_server`'s CLONE grant covers (`WITH (schemas = (…))` picks among them).
+
+In pondra.toml, `base` says where an environment's branches come from, so `pondra branch` makes them
+on dev's server, of production attached there:
+
+```toml
+[env.prod]
+url = "https://prod.acme.com"
+
+[env.dev]
+url = "https://dev.acme.com"
+base = "prod"                        # branches are made here, of prod attached as `prod`
+```
+
 An environment with `clone = "prod"` (a test database, say) is made again as a branch of prod before
 each deploy, so it is always production plus the new code. Five developers never share a branch:
 each has a Git branch and a database of its name, and they merge in Git.

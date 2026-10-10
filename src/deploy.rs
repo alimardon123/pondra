@@ -431,6 +431,7 @@ async fn grants(lake: &Lake) -> Result<Vec<String>> {
             let on = match &g.on {
                 On::Table(t) => format!("TABLE {}", quoted(t)),
                 On::Schema(s) => format!("ALL TABLES IN SCHEMA {}", ident(s)),
+                On::Lake if g.privilege == "clone" => format!("DATABASE {}", ident(&crate::ddl::lake_name(lake))), // (CLONE: ADR-058)
                 On::Lake => "ALL TABLES".into(),
                 On::Secret(s) => format!("SECRET {}", ident(s)),
             };

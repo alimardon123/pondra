@@ -617,7 +617,7 @@ parts | rows
 | Bring a branch's tables up to date | `ALTER DATABASE name REFRESH [t, …]`: those tables (a materialized view: the tables it reads; none named: every table the branch took from its base), and the views that follow them, as the base has them now, in one commit |
 | Drop a branch | `DROP DATABASE name`: what it wrote goes; refused while it has branches of its own |
 | Compare two tables | `SELECT * FROM pondra.diff('a', 'b')`: the rows of `b` that differ from `a`, with `_change_type` |
-| Attach a lake | `ATTACH 'dir' AS name`; `ATTACH 'url' AS name (TYPE delta \| iceberg \| kafka, …)` for other engines |
+| Attach a lake | `ATTACH 'dir' AS name`; `ATTACH 'url' AS name (READ_ONLY [, ENDPOINT 'https://…'])` for a lake on another server, read with the secret whose `SCOPE` covers it and written there only ([production apart](/pondra/guides/environments/#production-on-a-server-of-its-own)); `ATTACH 'url' AS name (TYPE delta \| iceberg \| kafka, …)` for other engines |
 | Detach | `DETACH [IF EXISTS] name` |
 
 A table is `t` (in schema `public`), `s.t`, or `lake.s.t`. Names are letters, digits, `_` and `-`.
@@ -753,7 +753,7 @@ brought from them runs as it is:
 |---|---|
 | Write files | `COPY (SELECT …) TO 'url' (FORMAT parquet \| csv \| json \| delta \| iceberg, PARTITION_BY (col, …), APPEND \| OVERWRITE, HEADER true, DELIMITER ';', COMPRESSION zstd, ROW_GROUP_SIZE n)` |
 | Write a topic | `COPY (SELECT …) TO 'kafka://brokers/topic' (FORMAT json, KEY col)` |
-| Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| generic, KEY value, …, SCOPE 'url')` |
+| Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| pondra \| generic, KEY value, …, SCOPE 'url')`; `TYPE pondra, TOKEN '…', SCOPE 'https://…'` is how a lake attached `READ_ONLY` asks its own server's leader to pin a branch |
 | A session's own | `CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…)`: in the node's memory for this session only, used before the lake's |
 | Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name` |
 
@@ -773,6 +773,7 @@ their values.
 | Drop one | `DROP USER [IF EXISTS] name`, `DROP ROLE [IF EXISTS] name` |
 | Grant | `GRANT SELECT [(col, …)] \| INSERT \| UPDATE \| DELETE \| ALL [PRIVILEGES] ON [TABLE] t \| SCHEMA s \| ALL TABLES [IN SCHEMA s] TO name, …` |
 | Grant a secret | `GRANT USAGE ON SECRET s TO name, …` |
+| Let another server branch this one | `GRANT CLONE ON DATABASE d \| SCHEMA s TO name, …`: its token pins a branch of those schemas and does nothing else |
 | Grant a role | `GRANT role, … TO user, …` |
 | Take back | `REVOKE … FROM …`, as GRANT names them (`REVOKE SELECT (col) ON t FROM r`: that column only) |
 | A token | `CREATE TOKEN name FOR [USER] u [EXPIRES IN '90 days']` (answers it, once), `DROP TOKEN name FOR [USER] u` |
