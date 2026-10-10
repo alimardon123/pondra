@@ -1428,16 +1428,44 @@ impl VisitorMut for Expander<'_> {
     }
 }
 
+/// A call's arguments as written: those by position, then those by name (`day => …`, or `day := …`),
+/// each name once. Every procedure and table function of Pondra's own reads its arguments through
+/// this, so `=>` means one thing everywhere.
+pub struct Args<'a> {
+    pub given: Vec<&'a Expr>,
+    pub named: Vec<(String, &'a Expr)>,
+}
+
+/// `what` names the call in errors (`run`, `read_csv`, …).
+pub fn args<'a>(what: &str, args: &'a [FunctionArg]) -> Result<Args<'a>> {
+    let mut out = Args { given: vec![], named: vec![] };
+    for a in args {
+        match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                ensure!(out.named.is_empty(), "{what}: arguments by position come before those by name");
+                out.given.push(e);
+            }
+            FunctionArg::Named { name, arg: FunctionArgExpr::Expr(e), .. } | FunctionArg::ExprNamed { name: Expr::Identifier(name), arg: FunctionArgExpr::Expr(e), .. } => {
+                let n = ident(name);
+                ensure!(!out.named.iter().any(|(m, _)| *m == n), "{what}: {n} given twice");
+                out.named.push((n, e));
+            }
+            _ => bail!("{what}: an argument is an expression, or name => expression"),
+        }
+    }
+    Ok(out)
+}
+
 /// Each parameter's argument: by position, then by name (`rate := 0.3`, `rate => 0.3`), then its
 /// default.
-fn arguments(name: &str, r: &Routine, args: &[FunctionArg]) -> Result<HashMap<String, Expr>> {
+fn arguments(name: &str, r: &Routine, given: &[FunctionArg]) -> Result<HashMap<String, Expr>> {
+    let a = args(name, given)?;
     let mut out = HashMap::new();
-    for (i, a) in args.iter().enumerate() {
-        let (p, e) = match a {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => (r.params.get(i).map(|p| p.name.clone()).with_context(|| format!("{name} takes {} arguments", r.params.len()))?, e),
-            FunctionArg::Named { name: n, arg: FunctionArgExpr::Expr(e), .. } => (ident(n), e),
-            _ => bail!("{name}: an argument is an expression, or name := expression"),
-        };
+    for (i, e) in a.given.into_iter().enumerate() {
+        let p = r.params.get(i).map(|p| p.name.clone()).with_context(|| format!("{name} takes {} arguments", r.params.len()))?;
+        out.insert(p, e.clone());
+    }
+    for (p, e) in a.named {
         ensure!(r.params.iter().any(|q| q.name == p), "{name} has no parameter {p}");
         ensure!(out.insert(p.clone(), e.clone()).is_none(), "{name}: {p} given twice");
     }
@@ -1921,4 +1949,26 @@ pub async fn with_views(lake: &Lake, sql: &str) -> Result<String> {
         text.push_str(&v);
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(sql: &str) -> Vec<FunctionArg> {
+        let Expr::Function(f) = parse_expr(sql).unwrap() else { panic!("{sql}: not a call") };
+        let FunctionArguments::List(l) = f.args else { panic!("{sql}: no arguments") };
+        l.args
+    }
+
+    #[test]
+    fn arguments_by_position_then_by_name() {
+        let given = call("f(1, 'x', day => DATE '2026-09-29', \"Rate\" := 0.3)");
+        let a = args("f", &given).unwrap();
+        assert_eq!(a.given.iter().map(|e| e.to_string()).collect::<Vec<_>>(), ["1", "'x'"]);
+        assert_eq!(a.named.iter().map(|(n, e)| format!("{n}={e}")).collect::<Vec<_>>(), ["day=DATE '2026-09-29'", "Rate=0.3"]);
+        let refused = |sql: &str| args("f", &call(sql)).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(refused("f(day => 1, 2)").contains("by position come before those by name"));
+        assert!(refused("f(day => 1, DAY => 2)").contains("day given twice"));
+    }
 }

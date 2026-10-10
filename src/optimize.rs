@@ -483,7 +483,8 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let end = rules.iter().position(|r| r.name() == "SanityCheckPlan").unwrap_or(rules.len());
     rules.insert(end, Arc::new(crate::hot::TopFirst)); // (after DataFusion's own sort pushdown)
     rules.insert(end, Arc::new(MinMaxBounds)); // (after the filters are pushed down)
-    rules.insert(end, Arc::new(WideTopN)); // (likewise)
+    let filters = rules.iter().position(|r| r.name() == "FilterPushdown").unwrap_or(0);
+    rules.insert(filters, Arc::new(WideTopN)); // (before the filters are pushed down: then they go into the scan)
     rules
 }
 
@@ -554,7 +555,12 @@ impl PhysicalOptimizerRule for MinMaxBounds {
 /// for the rows they keep, as DuckDB fetches them (ClickBench q24 from files 2.34 → 0.57 s).
 /// Anywhere else decoding all of a scan's columns at once is faster (with it on for every scan,
 /// TPC-H from files took a third longer), so only under a top-N, through what keeps its rows as they
-/// are, and only for a scan of at least `WIDE` columns. The filters still run above it.
+/// are, and only for a scan of at least `WIDE` columns. It runs before the filters are pushed down,
+/// so the scan takes them whole and no filter is left above it: a filter holds its rows back until
+/// it has a batch's worth, and a rare match then reached the top-N only once every file was read,
+/// so its moving bound skipped nothing (ClickBench q24 over 100 files 1.28 s, DuckDB 0.50 s). With
+/// none, the bound skips files and rows as soon as the top-N has its first rows, and DataFusion
+/// reads first the files whose statistics hold the smallest keys.
 #[derive(Debug)]
 struct WideTopN;
 

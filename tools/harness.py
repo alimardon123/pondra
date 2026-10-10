@@ -5616,7 +5616,8 @@ def minmax():
     the scans skip row groups by it (round 32's fix of DataFusion's): a table of 24 files read from
     them, each file's `a` above the last's, `b` NULL in the first six and `c` in all but the last.
     Every answer the model's; without the fix `max(b + 1)` came back too low and `max(c)` NULL. And a
-    top-N of 20 columns through a filter, which decodes its files filtering as it goes."""
+    top-N of 20 columns through a filter, which decodes its files filtering as it goes, the filter
+    taken into the scan whole."""
     lake = new_lake()
     node = Node(lake, A.port, env={"PONDRA_HOT_GB": "0"}).start()
     q = lambda s: sql(A.port, s)
@@ -5644,6 +5645,11 @@ def minmax():
             got = [q(ask + f" -- {run}") for run in range(3)]
             seen[name] = "== model" if all(g == want for g in got) else got
             checks[f"{name}: the model's answer, three times"] = all(g == want for g in got)
+        # (a filter left above the scan held a rare match back until it had a batch's worth, so the
+        # top-N's moving bound skipped nothing until every file was read: ClickBench q24)
+        plan = "\n".join(r["plan"] for r in q("EXPLAIN SELECT * FROM w WHERE s LIKE '%77%' ORDER BY a DESC LIMIT 3") if r["plan_type"] == "physical_plan")
+        seen["a top-N of many columns' plan"] = plan
+        checks["a top-N of many columns: its filter goes into the scan whole, none left above it"] = "FilterExec" not in plan and "LIKE" in plan.split("DataSourceExec", 1)[-1]
     finally:
         node.kill()
         clean_up()
@@ -8309,6 +8315,7 @@ def registry():
     for k, n in comments.items():
         q(f"COMMENT ON {k.upper()} {n} IS 'about {n}'")
     q("COMMENT ON COLUMN sales.orders.amount IS $$in euros, it's net$$")
+    q("COMMENT ON COLUMN eu_orders.amount IS 'net, in euros'")
     q("COMMENT ON TABLE clicks IS 'gone soon'")
     q("COMMENT ON TABLE clicks IS NULL")
     listed = {(r["kind"], r.get("schema"), r["name"]): r for r in q("SELECT * FROM pondra.objects")}
@@ -8336,7 +8343,8 @@ def registry():
     again = {(k, n): show(k, n) for k, n, _ in made}
     info["differs"] = {f"{k} {n}": [before[(k, n)], again[(k, n)]] for k, n, _ in made if before[(k, n)] != again[(k, n)]}
     checks["SHOW CREATE of every kind, run again after a drop, makes the same object, comments and all; a drop takes its comments"] = \
-        not info["differs"] and after_drop == ["sales"] and "COMMENT ON COLUMN sales.orders.amount IS 'in euros, it''s net'" in again[("table", "sales.orders")]
+        not info["differs"] and after_drop == ["sales"] and "COMMENT ON COLUMN sales.orders.amount IS 'in euros, it''s net'" in again[("table", "sales.orders")] \
+        and "COMMENT ON COLUMN eu_orders.amount IS 'net, in euros'" in again[("view", "eu_orders")]
     q("ALTER TABLE sales.orders RENAME TO orders_2025")
     moved = q("SELECT name, comment FROM pondra.objects WHERE kind = 'table' AND schema = 'sales'")
     checks["a renamed table keeps its comments, its columns' too"] = moved == [{"name": "orders_2025", "comment": "about sales.orders"}] \
@@ -8456,9 +8464,9 @@ def registry():
         and all(k["inside"] and set(k["inside"]) <= object_names for k in kinds if k["is"] == "part") \
         and all(k["lists"] for k in kinds if k["is"] == "pattern") \
         and {k["kind"] for k in kinds if k["is"] == "object" and k["on_clone"] == "leave"} == {"secret", "share", "recipient"}
-    missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'")]
+    missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'", "COMMENT ON COLUMN eu_orders.region IS 'x'")]
     quiet = q("COMMENT IF EXISTS ON TABLE nothing_here IS 'x'")
-    checks["what isn't there: refused by name, or nothing with IF EXISTS"] = missing == [500, 500, 500] and quiet.get("exists") is False
+    checks["what isn't there: refused by name, or nothing with IF EXISTS"] = missing == [500, 500, 500, 500] and quiet.get("exists") is False
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"registry": checks, "ok": ok, "info": info}, indent=1, default=str))

@@ -15,7 +15,7 @@ use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use datafusion::datasource::file_format::{csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat, FileFormat};
 use datafusion::datasource::listing::ListingTableUrl;
-use datafusion::sql::sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, TableFactor, Value};
+use datafusion::sql::sqlparser::ast::{Expr, TableFactor, Value};
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -99,18 +99,16 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
         _ => return Ok(None),
     };
     let (mut urls, mut options) = (vec![], BTreeMap::new());
-    for a in &args.args {
-        match a {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => urls.extend(strings(e).with_context(|| format!("{f}: files are a string or a list of them"))?),
-            FunctionArg::Named { name, arg: FunctionArgExpr::Expr(e), .. } | FunctionArg::ExprNamed { name: Expr::Identifier(name), arg: FunctionArgExpr::Expr(e), .. } => {
-                let value = match (name.value.to_lowercase().as_str(), e) {
-                    ("columns" | "hive_types", Expr::Dictionary(d)) => d.iter().map(|c| Ok(format!("{} {}", quoted(&c.key.value), literal(&c.value)?))).collect::<Result<Vec<_>>>().map(|c| c.join(", ")),
-                    _ => literal(e),
-                };
-                options.insert(name.value.to_lowercase(), value.with_context(|| format!("{f}: {name} is a value"))?);
-            }
-            _ => bail!("{f}: files first, then options by name ({f}('s3://bucket/path/*.{format}', …))"),
-        }
+    let a = crate::routines::args(&f, &args.args)?;
+    for e in a.given {
+        urls.extend(strings(e).with_context(|| format!("{f}: files are a string or a list of them"))?);
+    }
+    for (name, e) in a.named {
+        let value = match (name.to_lowercase().as_str(), e) {
+            ("columns" | "hive_types", Expr::Dictionary(d)) => d.iter().map(|c| Ok(format!("{} {}", quoted(&c.key.value), literal(&c.value)?))).collect::<Result<Vec<_>>>().map(|c| c.join(", ")),
+            _ => literal(e),
+        };
+        options.insert(name.to_lowercase(), value.with_context(|| format!("{f}: {name} is a value"))?);
     }
     ensure!(!urls.is_empty(), "{f}: which files? {f}('s3://bucket/path/*.{format}')");
     let known: &[&str] = match format {
