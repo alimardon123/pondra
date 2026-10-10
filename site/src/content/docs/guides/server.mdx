@@ -138,6 +138,25 @@ GROUP BY c.name;
 The query runs on the node of the database you are connected to, and reads the other lake's files
 directly. No data moves between nodes first.
 
+## Who may use which database
+
+Each database has its own users and grants, made in it with `CREATE USER` and `GRANT`
+([users, roles and grants](/pondra/guides/security/#users-roles-and-grants)). The server's tokens
+are every database's. A user signs in to one database, and is nobody in the others:
+
+- Another database that signs in on its own (it has a user, or the server has tokens) is read and
+  written only through itself, or with one of the server's tokens. Its superuser can't read it from
+  the database next door either.
+- Another database with no sign-in is open to anyone, so it is open from the next one too. A user
+  granted some tables still needs a grant naming its table there:
+
+```sql norun
+GRANT SELECT ON crm.customers TO ann;   -- made in sales: ann reads crm.customers through sales
+```
+
+`ON ALL TABLES` and `ON SCHEMA` grants cover their own database's tables only. The same holds at
+every door: SQL over HTTP and Postgres, listings such as `pondra.tables`, and the Iceberg catalog.
+
 ## Clusters of one database
 
 A database's node can lead a cluster. It advertises itself as `host:8080/db/sales`, so a node on
@@ -179,6 +198,7 @@ The options of `pondra serve` that matter for a folder of lakes.
 | `--pg` | Speak the Postgres protocol here, such as `0.0.0.0:5432` |
 | `--default NAME` | The database a client that names none gets (default `lake`, else the only one) |
 | `--read-token`, `--write-token`, `--admin-token` | Tokens, as on a node of one lake. Every database's node gets them |
+| `--tls-cert`, `--tls-key`, `--tls-ca` | TLS on the HTTP and Postgres ports, as on a node of one lake ([TLS](/pondra/guides/security/#tls)) |
 | `--python` | Python for functions, procedures and the console's Python cells, as `pondra serve --python` |
 | Every other option | Applies to each database's node: `--reader` (every database read-only), `--tier-secs`, `--memory-gb`, `--cache-dir`, `--cache-gb`, `--ack`, `--replicas`, `--fsync`, `--publish`, `--flush-ms`, `--task-ms`, `--retain-secs`, `--changelog-secs` and `--backlog` |
 
@@ -193,8 +213,7 @@ node, not for all of them together.
   `--attach-found` too, each with a message that names the flag. Routing them to many databases
   (Kafka by topic, such as `sales.orders`, and Flight by the database the client names) is planned
   for the next round. Serve such a lake on its own: `pondra serve data/sales --flight 0.0.0.0:8815`.
-- **Per-database settings and access.** `ALTER DATABASE sales SET …` and grants per database are
-  planned with the security round. Today the tokens are the same for every database.
-- **TLS.** Neither port speaks TLS yet. Put the server behind a proxy that does, or keep it on a
-  private network.
+- **Per-database settings and users made once.** `ALTER DATABASE sales SET …` is planned, and so are
+  users made once for every database. Today each database has users of its own, and the tokens are
+  the same for every database.
 </Aside>

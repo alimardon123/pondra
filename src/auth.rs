@@ -22,10 +22,11 @@ pub struct Principal {
     pub access: Option<Arc<crate::users::Access>>,
     pub door: &'static str,                  // (which door it came in by, and from where: the audit log's)
     pub from: Option<std::net::SocketAddr>,
+    pub operator: bool, // (whoever runs the nodes: one of their tokens, their key, the program that started this one; `users::across`)
 }
 
 impl Principal {
-    /// A token's (or nobody's): its role over everything.
+    /// Its role over everything, as anyone on a node nothing locks (or nobody).
     pub fn of(role: Role) -> Principal {
         let name = match role {
             Role::Admin => "admin",
@@ -33,8 +34,12 @@ impl Principal {
             Role::Read => "reader",
             Role::None => "",
         };
-        Principal { name: name.into(), role, access: None, door: "node", from: None }
+        Principal { name: name.into(), role, access: None, door: "node", from: None, operator: false }
     }
+
+    /// A token's (one of the nodes', or their key), or the program's that started the node: its
+    /// role over everything, this lake's and the lakes attached to it.
+    pub fn token(role: Role) -> Principal { Principal { operator: true, ..Principal::of(role) } }
 
     /// The same, as come in by `door` from `from`.
     pub fn at(mut self, door: &'static str, from: Option<std::net::SocketAddr>) -> Principal {
@@ -82,6 +87,15 @@ pub fn check_all(table: &str) -> Result<()> {
 /// A user's grants, if the request being served is a user's who isn't a superuser.
 pub fn limited() -> Option<Arc<crate::users::Access>> { current().and_then(|p| p.access) }
 
+/// Is the request being served from whoever runs the nodes (`Principal::token`)? (None: work no
+/// door started, a task's included, is not: whoever made the task may be anyone.)
+pub fn operator() -> bool { current().is_some_and(|p| p.operator) }
+
+/// Does a node in this process take tokens? (Then nothing it serves is open, attached lakes included.)
+pub fn tokens_on() -> bool { TOKENS.load(std::sync::atomic::Ordering::Relaxed) }
+
+static TOKENS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// May the request being served use `privilege` on `table` (as the catalog names it)?
 pub fn check(privilege: &str, table: &str) -> Result<()> {
     match limited() {
@@ -106,7 +120,13 @@ pub struct Auth {
 }
 
 impl Auth {
-    pub fn new(read: Option<String>, write: Option<String>, admin: Option<String>) -> Auth { Auth { read, write, admin } }
+    pub fn new(read: Option<String>, write: Option<String>, admin: Option<String>) -> Auth {
+        let auth = Auth { read, write, admin };
+        if auth.on() {
+            TOKENS.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        auth
+    }
 
     pub fn on(&self) -> bool { self.read.is_some() || self.write.is_some() || self.admin.is_some() }
 
@@ -179,19 +199,20 @@ impl Auth {
                 _ => "write",
             });
         }
-        match stmt {
-            Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) => check("insert", &catalog_name(t)),
-            Stmt::Update(t, ..) => check("update", &catalog_name(t)),
-            Stmt::Delete(t, _) => check("delete", &catalog_name(t)),
-            Stmt::Merge(m) => {
-                let t = catalog_name(&m.target);
-                for p in m.privileges() {
-                    check(p, &t)?;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+        let (t, privileges) = needs(stmt);
+        privileges.iter().try_for_each(|p| check(p, &t))
+    }
+}
+
+/// The table a write changes (as the catalog names it) and the privileges it needs on it: none for
+/// anything else.
+pub fn needs(stmt: &Stmt) -> (String, Vec<&'static str>) {
+    match stmt {
+        Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) => (catalog_name(t), vec!["insert"]),
+        Stmt::Update(t, ..) => (catalog_name(t), vec!["update"]),
+        Stmt::Delete(t, _) => (catalog_name(t), vec!["delete"]),
+        Stmt::Merge(m) => (catalog_name(&m.target), m.privileges()),
+        _ => (String::new(), vec![]),
     }
 }
 

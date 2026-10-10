@@ -788,7 +788,7 @@ async fn run() -> anyhow::Result<()> {
                 None => {
                     let planned = asof::rewrite(&query)?; // (as every door: ASOF JOIN, and `*` without the system columns a query names)
                     let run = async { anyhow::Ok(query::session(&lake, &query, "").await?.enable_url_table().sql(&planned).await?.collect().await?) };
-                    let batches = ext::scope(true, run).await?;
+                    let batches = ext::scope(true, auth::WHO.scope(auth::Principal::token(auth::Role::Admin), run)).await?; // (and its storage: attached lakes too)
                     println!("{}", pretty_format_batches(&batches)?);
                 }
             }

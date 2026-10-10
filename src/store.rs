@@ -851,7 +851,7 @@ impl Lake {
             crate::query::stored_views(self, sql, false).await.ok()?.iter().for_each(|(_, v)| text.push_str(&format!(" {v}")));
         }
         for (name, other) in self.attached.read().unwrap().iter().filter(|(n, _)| crate::ddl::mentions(&text, n)) {
-            (name, other.cat.version()?).hash(&mut h);
+            (name, other.cat.version()?, crate::auth::operator()).hash(&mut h); // (whoever runs the nodes may read what a user may not: `users::across`)
         }
         Some(h.finish())
     }
