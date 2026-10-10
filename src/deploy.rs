@@ -84,6 +84,8 @@ struct Env {
     values: BTreeMap<String, toml::Value>,
     #[serde(default)]
     attach: BTreeMap<String, Attach>,
+    #[serde(default)]
+    protected: bool, // (its database is protected once a deploy has applied: `protect.rs`)
 }
 
 #[derive(Deserialize, Clone)]
@@ -179,6 +181,7 @@ struct Project {
     migrations: Vec<(String, String)>, // (file, text), in name order
     tests: Vec<(String, String)>,
     values: HashMap<String, Value>,
+    protect: bool, // (the chosen environment's `protected`: the deploy protects the database)
 }
 
 fn project(ask: &Ask) -> Result<Project> {
@@ -216,7 +219,8 @@ fn project(ask: &Ask) -> Result<Project> {
         }
     }
     let of = |dir: &str| ask.files.iter().filter(|(p, _)| p.starts_with(dir) && p.ends_with(".sql") && !p[dir.len()..].contains('/')).map(|(p, t)| (p[dir.len()..].to_string(), t.clone())).collect::<Vec<_>>();
-    Ok(Project { name: toml.project.name, objects: ordered(objects), migrations: of("migrations/"), tests: of("tests/"), values })
+    let protect = env.is_some_and(|e| e.protected);
+    Ok(Project { name: toml.project.name, objects: ordered(objects), migrations: of("migrations/"), tests: of("tests/"), values, protect })
 }
 
 fn first_line(sql: &str) -> String { sql.trim().lines().next().unwrap_or_default().chars().take(80).collect() }
@@ -431,7 +435,7 @@ async fn grants(lake: &Lake) -> Result<Vec<String>> {
             let on = match &g.on {
                 On::Table(t) => format!("TABLE {}", quoted(t)),
                 On::Schema(s) => format!("ALL TABLES IN SCHEMA {}", ident(s)),
-                On::Lake if g.privilege == "clone" => format!("DATABASE {}", ident(&crate::ddl::lake_name(lake))), // (CLONE: ADR-058)
+                On::Lake if g.of_database() => format!("DATABASE {}", ident(&crate::ddl::lake_name(lake))), // (CLONE and DEPLOY: ADR-058)
                 On::Lake => "ALL TABLES".into(),
                 On::Secret(s) => format!("SECRET {}", ident(s)),
             };
@@ -547,15 +551,28 @@ pub struct Record {
 /// The deploy entries, newest last.
 async fn records(lake: &Lake) -> Result<Vec<Record>> { Ok(lake.cat.scan::<Record>("dp/", "dp0").await?.into_iter().map(|(_, r)| r).collect()) }
 
+/// Each project's last finished deploy (a record that ended `ok` or `tests_failed`): what it left declared.
+fn last_finished(all: &[Record]) -> BTreeMap<String, &Record> {
+    let mut last = BTreeMap::new();
+    for r in all.iter().filter(|r| r.status == "ok" || r.status == "tests_failed") {
+        last.insert(r.project.clone(), r);
+    }
+    last
+}
+
+/// Every object a project's last finished deploy left declared, by its key (`table sales.orders`),
+/// with the project's name. A protected database changes these only by a deploy (`protect.rs`).
+pub async fn declared(lake: &Lake) -> Result<BTreeMap<String, String>> {
+    let all = records(lake).await?;
+    Ok(last_finished(&all).into_iter().flat_map(|(project, r)| r.objects.keys().map(move |k| (k.clone(), project.clone()))).collect())
+}
+
 /// The plan for `p` here, as the database is now.
 async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Plan> {
     let all = records(lake).await?;
     let after = all.last().map_or(0, |r| r.n);
     // What each project's last finished deploy left declared, and who owns what.
-    let mut last: BTreeMap<String, &Record> = BTreeMap::new();
-    for r in all.iter().filter(|r| r.status == "ok" || r.status == "tests_failed") { // (what a finished deploy left declared)
-        last.insert(r.project.clone(), r);
-    }
+    let last = last_finished(&all);
     let mine: BTreeMap<String, (String, String)> = last.get(&p.name).map(|r| r.objects.clone()).unwrap_or_default();
     let owner: HashMap<&String, &String> = last.iter().filter(|(n, _)| **n != p.name).flat_map(|(n, r)| r.objects.keys().map(move |k| (k, n))).collect();
     let now = current(lake).await?;
@@ -665,7 +682,7 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
     Ok(Plan { id: crate::users::sha256(&shown)[..16].to_string(), after, steps, refused, tests: p.tests.len(), objects })
 }
 
-fn split_key(k: &str) -> (&str, &str) {
+pub(crate) fn split_key(k: &str) -> (&str, &str) {
     match k.strip_prefix("materialized view ") {
         Some(n) => ("materialized view", n),
         None => k.split_once(' ').unwrap_or((k, "")),
@@ -786,7 +803,10 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
 
 /// `POST /deploy`: the plan (`apply` false), the deploy, or the tests alone, of the project sent.
 pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
-    ensure!(verb != Verb::Deploy || who.role >= crate::auth::Role::Admin, "a deploy changes what the database is: it needs an admin token (a plan or a test runs as you are)");
+    let deployer = crate::auth::limited().is_some_and(|a| a.deploys()); // (a user granted DEPLOY on this database)
+    if verb == Verb::Deploy {
+        authorize(app, who, deployer).await?;
+    }
     let p = project(&ask)?;
     if verb == Verb::Test {
         let tests = tests(app, &p, who).await?;
@@ -802,13 +822,59 @@ pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
         ensure!(*shown == plan.id, "the database changed since that plan (someone deployed, or changed what the project makes): plan again");
     }
     ensure!(plan.refused.is_empty(), "the plan refuses: {}", plan.refused.join("; "));
-    let who_name = crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("{:?}", who.role).to_lowercase());
-    let mut record = Record { project: p.name.clone(), env: ask.env.clone(), commit: ask.commit.clone(), who: who_name, started_ms: crate::log::now_ms(), status: "running".into(), ..Default::default() };
+    deploy(app, &p, &plan, &ask, who, deployer).await
+}
+
+/// Who may deploy. On a database that isn't protected: an admin, or a DEPLOY holder. On a protected one
+/// (`protect.rs`): a DEPLOY holder, whoever runs the nodes (their tokens, their key, the program that
+/// started them), or an open lake; a superuser without DEPLOY is refused.
+async fn authorize(app: &App, who: Who, deployer: bool) -> Result<()> {
+    let db = crate::ddl::lake_name(&app.lake);
+    match crate::protect::protected(&app.lake).await? {
+        true => ensure!(deployer || crate::auth::operator() || app.open().await, "permission denied: {db} is protected: a deploy needs DEPLOY (GRANT DEPLOY ON DATABASE {db} TO …), or an admin lifts the protection first (ALTER DATABASE {db} SET (protected = false))"),
+        false => ensure!(who.role >= crate::auth::Role::Admin || deployer, "a deploy changes what the database is: it needs an admin token or DEPLOY (a plan or a test runs as you are)"),
+    }
+    Ok(())
+}
+
+/// A deploy that applied: its statements (`making`), then the database protected when the project's
+/// environment says so and it isn't yet (`[env.prod] protected = true`). A deploy that failed protects nothing.
+async fn deploy(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, deployer: bool) -> Result<Value> {
+    let record = making(app, p, plan, ask, who, deployer).await?;
+    let protects = p.protect && !crate::protect::protected(&app.lake).await?;
+    if protects {
+        let protect = crate::ddl::Ddl::Protect { database: crate::ddl::lake_name(&app.lake), on: true, by: caller(who) };
+        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![protect]), None, false).await?;
+    }
+    let mut out = j!({"deploy": record.n, "status": record.status, "steps": record.steps, "tests": record.tests, "ok": record.status == "ok"});
+    if protects {
+        out["protected"] = j!(true);
+    }
+    Ok(out)
+}
+
+/// The deploy's statements from its claim to its final record, tests included, with `DEPLOYING` set so
+/// a project's objects may change (`protect.rs`). A DEPLOY holder below admin runs them as an admin under
+/// its own name: making the project true takes an admin's statements, and the record keeps who asked.
+/// This span is also where that admin right ends: a procedure it starts would outlive it (`routines::start`).
+async fn making(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, deployer: bool) -> Result<Record> {
+    let admin = crate::auth::current().filter(|_| deployer && who.role < crate::auth::Role::Admin).map(|me| crate::auth::Principal { role: crate::auth::Role::Admin, access: None, operator: false, ..me });
+    let as_who = if admin.is_some() { Who { role: crate::auth::Role::Admin, ..who } } else { who };
+    let span = crate::protect::DEPLOYING.scope((), claim_to_record(app, p, plan, ask, as_who));
+    match admin {
+        Some(me) => crate::auth::WHO.scope(me, span).await,
+        None => span.await,
+    }
+}
+
+/// The claim, the deploy's statements (`apply`), and its record's end (`making`'s span).
+async fn claim_to_record(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who) -> Result<Record> {
+    let mut record = Record { project: p.name.clone(), env: ask.env.clone(), commit: ask.commit.clone(), who: caller(who), started_ms: crate::log::now_ms(), status: "running".into(), ..Default::default() };
     let claimed = crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Deploy { claim: true, after: plan.after, record: json(&record) }]), None, false).await?;
     record.n = claimed["deploy"].as_u64().context("a deploy number")?;
     keep_files(&app.lake, record.n, &ask.files).await?;
     let alive = tokio::spawn(beat(app.clone(), record.n));
-    let out = apply(app, &p, &plan, &mut record, who, ask.test, &ask.secrets).await;
+    let out = apply(app, p, plan, &mut record, who, ask.test, &ask.secrets).await;
     alive.abort();
     if let Err(e) = &out {
         record.status = "failed".into();
@@ -817,8 +883,11 @@ pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
     record.ended_ms = Some(crate::log::now_ms());
     crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Deploy { claim: false, after: record.n, record: json(&record) }]), None, false).await?;
     out?;
-    Ok(j!({"deploy": record.n, "status": record.status, "steps": record.steps, "tests": record.tests, "ok": record.status == "ok"}))
+    Ok(record)
 }
+
+/// Who a deploy is recorded as: the caller's name, else its role's.
+fn caller(who: Who) -> String { crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("{:?}", who.role).to_lowercase()) }
 
 /// The deploy's statements, then its record of what it left declared, then the tests.
 async fn apply(app: &App, p: &Project, plan: &Plan, record: &mut Record, who: Who, test: bool, secrets: &BTreeMap<String, String>) -> Result<()> {

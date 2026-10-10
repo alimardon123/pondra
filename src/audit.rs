@@ -73,6 +73,7 @@ pub fn class(sql: &str) -> &'static str {
         "GRANT" | "REVOKE" => "role",
         "CREATE" | "ALTER" | "DROP" if about(&["USER", "ROLE", "TOKEN", "SECRET", "SHARE", "RECIPIENT"]) => "role",
         "ATTACH" if sql.to_uppercase().contains("TOKEN") => "role", // (a share's profile: its token is a secret)
+        "ALTER" if about(&["DATABASE"]) && sql.to_lowercase().contains("protected") => "role", // (who may change a protected database's projects: ADR-058)
         "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "ATTACH" | "DETACH" | "COMMENT" | "UNDROP" | "OPTIMIZE" | "VACUUM" | "CHECKPOINT" => "ddl",
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "COPY" | "UPSERT" => "write",
         "CALL" | "DO" => "function",
@@ -251,6 +252,8 @@ mod tests {
         assert_eq!(class("CREATE USER ana PASSWORD 'x'"), "role");
         assert_eq!(class("create or replace secret s (type s3, secret 'y')"), "role");
         assert_eq!(class("GRANT SELECT ON t TO ana"), "role");
+        assert_eq!(class("ALTER DATABASE prod SET (protected = false)"), "role");
+        assert_eq!(class("ALTER DATABASE dev REFRESH t"), "ddl");
         assert_eq!(class("CREATE TABLE t (a INT)"), "ddl");
         assert_eq!(class("insert into t values (1)"), "write");
         assert_eq!(class("CALL p(1)"), "function");

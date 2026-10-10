@@ -101,7 +101,14 @@ deploy are the same on either layout.
    reads `acme-prod`). Not yet: pins of a branch on another server are let go by `DROP DATABASE` or
    REFRESH only, never swept as idle (prod can't see dev's bucket).
 3. **Protected databases and `DEPLOY`,** with the break-glass and its audit. Checks: a protected
-   database's objects change only through a deploy; a person's own schema is still theirs.
+   database's objects change only through a deploy; a person's own schema is still theirs. *Built in
+   round 34:* `ALTER DATABASE d SET (protected = true | false)`, an admin's; a lift is written to
+   `pondra.audit` and shown in `pondra.databases` until the database is protected again. `GRANT
+   DEPLOY ON DATABASE d` deploys without an admin token, and on a protected database only a DEPLOY
+   holder or the node's operator may deploy. `[env.prod] protected = true` makes the first deploy
+   that applies protect the database. A deploy's statements, tests included, run as the deploy
+   (`protect::DEPLOYING`); a procedure it would start without waiting is refused, since it would
+   outlive the deploy. Checked by `environments_check.py`.
 4. **The developer's day:** `pondra ci init` (the workflow: a branch, a deploy, tests and the diff
    on each pull request, test on merge, prod on approval), `pondra dev` (deploy and test on save),
    and a Git hook that moves the branch's database with `git switch`.

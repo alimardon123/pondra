@@ -510,6 +510,11 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         let tables = c[2].split(',').map(|t| name(t.trim())).filter(|t| !t.is_empty()).collect();
         return Some(Stmt::Ddl(vec![Ddl::Refresh { database: Some(name(&c[1])), tables }]));
     }
+    // `ALTER DATABASE b SET (protected = true | false)`: a database's protection (ADR-058: `protect.rs`).
+    static DB_PROTECT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+SET\s*\(\s*protected\s*=\s*(true|false)\s*\)\s*;?\s*$"#).expect("a regex"));
+    if let Some(c) = DB_PROTECT.captures(first_word(sql)) {
+        return Some(Stmt::Ddl(vec![Ddl::Protect { database: name(&c[1]), on: c[2].eq_ignore_ascii_case("true"), by: String::new() }]));
+    }
     // `UNDROP TABLE t` (Snowflake's, Databricks'): the table dropped last under that name, back (ADR-043).
     static UNDROP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*UNDROP\s+TABLE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
     if let Some(c) = UNDROP.captures(first_word(sql)) {
@@ -1291,6 +1296,7 @@ async fn seen_there(other: &Lake, mark: Option<String>) {
 }
 
 async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
+    let stmt = crate::protect::door(&app.lake, stmt).await?; // (a project's objects in a protected database: a deploy's only)
     if let Some(out) = crate::temp::statement(app, &stmt, files).await? {
         return Ok(out); // (the session's own tables and views: on this node, in memory)
     }
@@ -1603,7 +1609,9 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
     if let Stmt::Invalid(why) = stmt {
         bail!(why); // (said as a node says it)
     }
+    let mut stmt = stmt;
     if let Ok(lake) = Lake::open(dir, false, false).await {
+        stmt = crate::protect::door(&lake, stmt).await?; // (a node's door too: this path never reaches `on_node_listed`)
         if let Some((query, to, options)) = crate::ext::view_write(&lake, &stmt).await? {
             let out = crate::copy::copy_to(&lake, &query, &to, &options, &[], "").await?; // (a view of a folder: a new file in it)
             return Ok(j!({"rows": out["copied"]}));

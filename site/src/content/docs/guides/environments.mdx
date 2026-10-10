@@ -333,5 +333,47 @@ An environment with `clone = "prod"` (a test database, say) is made again as a b
 each deploy, so it is always production plus the new code. Five developers never share a branch:
 each has a Git branch and a database of its name, and they merge in Git.
 
-Not here yet: protected databases (changed only by a deploy) and a `DEPLOY` privilege, a
-materialized view rebuilt beside the old one and swapped in, and Python files in `objects/`.
+### Protected production
+
+On a protected database, a project's objects change only by a deploy. Its objects are what its last
+finished deploy left: tables, views, roles and grants. A change to one is refused by name, an admin
+included, unless a deploy makes it. Rows still change, and people still make, change and drop their
+own objects, in the project's schema too:
+
+```text
+permission denied: table sales.orders is project shop's, and prod is protected: change it in the project and deploy it (or an admin lifts the protection: ALTER DATABASE prod SET (protected = false))
+```
+
+A user granted DEPLOY can deploy the database without being an admin, so a CI account needs no admin
+token. DEPLOY is granted on the database alone, not on a schema or a table:
+
+```sql norun
+GRANT DEPLOY ON DATABASE prod TO ci;
+```
+
+The project says which environment is protected, and the first deploy to it protects the database
+once it has applied:
+
+```toml
+[env.prod]
+protected = true                     # its objects change only by a deploy, once one has applied
+```
+
+On a protected database a deploy needs DEPLOY or the node's own operator (its tokens and key). A
+superuser without DEPLOY is refused. Lifting the protection is an admin's statement, and it is
+audited. It shows in `pondra.databases` until the database is protected again:
+
+```sql norun
+ALTER DATABASE prod SET (protected = false);  -- an admin's: written to pondra.audit
+ALTER DATABASE prod SET (protected = true);   -- when the fix is in
+```
+
+```sql
+SELECT name, protected, lifted_at, lifted_by FROM pondra.databases;
+```
+
+A branch of a protected database isn't protected: `CREATE DATABASE dev CLONE prod` gives dev a
+database whose objects change as dev's own, and prod keeps its protection.
+
+Not here yet: a materialized view rebuilt beside the old one and swapped in, and Python files in
+`objects/`.

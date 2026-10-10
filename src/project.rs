@@ -400,7 +400,7 @@ fn init(dir: &str, name: Option<String>) -> Result<String> {
     std::fs::create_dir_all(dir)?;
     let name = name.unwrap_or_else(|| std::fs::canonicalize(dir).ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_else(|| "project".into()));
     let toml = format!(
-        "[project]\nname = \"{}\"\n# server = \"https://pondra.example.com\"   # where its databases are (pondra serve --lakes)\n\n[env.prod]\n# url = \"https://prod.example.com\"     # a database served on its own\n# values = {{ min_order = 10 }}          # $name values its statements are given\n\n[env.dev]                             # what a developer's branch takes\n# base = \"prod\"                       # branches made on this server, of prod attached there (ADR-058)\n\n# [secrets]\n# crm_token = \"env:CRM_TOKEN\"          # a $name's value from the deploying machine's environment\n",
+        "[project]\nname = \"{}\"\n# server = \"https://pondra.example.com\"   # where its databases are (pondra serve --lakes)\n\n[env.prod]\n# url = \"https://prod.example.com\"     # a database served on its own\n# values = {{ min_order = 10 }}          # $name values its statements are given\n# protected = true                     # its objects change only by a deploy (GRANT DEPLOY ON DATABASE prod TO ci)\n\n[env.dev]                             # what a developer's branch takes\n# base = \"prod\"                       # branches made on this server, of prod attached there (ADR-058)\n\n# [secrets]\n# crm_token = \"env:CRM_TOKEN\"          # a $name's value from the deploying machine's environment\n",
         database(&name)
     );
     std::fs::write(dir.join("pondra.toml"), toml)?;

@@ -68,6 +68,7 @@ mod mcp;
 mod pg;
 mod pg_catalog;
 mod project;
+mod protect;
 mod query;
 mod read_delta;
 mod read_iceberg;

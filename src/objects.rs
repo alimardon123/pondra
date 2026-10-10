@@ -249,6 +249,10 @@ fn databases(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
         let mut all = vec![];
         for (k, a) in lake.cat.scan::<crate::ddl::Attachment>("a/", "a0").await? {
             let made = branched(lake, &k[2..], &a.dir).await.unwrap_or_else(|| format!("ATTACH {} AS {}", literal(&a.dir), ident(&k[2..])));
+            let made = match attached_protected(lake, &k[2..]).await {
+                true => format!("{made};\nALTER DATABASE {} SET (protected = true)", ident(&k[2..])), // (its protection is its own: `protect.rs`)
+                false => made,
+            };
             all.push(Object::new("database", &here, &k[2..], Some(made)));
         }
         for (n, a) in crate::ext::attached(lake).await? {
@@ -257,6 +261,15 @@ fn databases(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
         }
         Ok(all)
     })
+}
+
+/// Whether an attached database is protected, read from its own catalog (`protect.rs`).
+async fn attached_protected(lake: &Lake, name: &str) -> bool {
+    let db = lake.attached.read().unwrap().iter().find(|(n, _)| n == name).map(|(_, l)| l.clone());
+    match db {
+        Some(db) => crate::protect::protected(&db).await.unwrap_or(false),
+        None => false,
+    }
 }
 
 /// A branch is made by the clone that made it (ADR-047), never by its `ATTACH`: `DROP DATABASE`
