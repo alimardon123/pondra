@@ -6,6 +6,7 @@
 //! prod keeps every file that was live when the branch was made, for as long as its pin is there
 //! (`pn/`: `tier::expire`, the orphan sweep); a branch of a branch pins every lake it reads.
 use crate::ddl::Ddl;
+use crate::objects::{OnClone, KINDS};
 use crate::store::{json, table_key, Lake, TableMeta};
 use crate::views::View;
 use crate::write::Request;
@@ -356,9 +357,14 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     let (commit, next, block) = (number("c"), number("n").max(1), number("b"));
     let end = next - 1;
     let wanted = |name: &str| took(&m.schemas, name);
-    // (a share and its recipients, and what they're described as, are the base's: a branch hands
-    // nothing to another company)
-    let deny = ["e/", "z/", "x/", "i/", "dt/", "jt/", "pn/", "fd/", "s/", "d/", "sh/", "sr/", "cm/share/", "cm/recipient/"];
+    // (what a branch never takes: the kinds the registry marks `Leave` (a secret, a share and a
+    // recipient, with their comments: a branch hands nothing to another company), and the catalog's
+    // own keys, which no kind has)
+    let mut deny: Vec<String> = ["z/", "x/", "i/", "dt/", "jt/", "pn/", "fd/", "s/", "d/"].iter().map(|p| p.to_string()).collect();
+    for k in KINDS.iter().filter(|k| k.on_clone == OnClone::Leave) {
+        deny.push(k.prefix.to_string());
+        deny.push(format!("cm/{}/", k.family));
+    }
     let mut puts: Vec<(String, Vec<u8>)> = m.secrets.iter().map(|(name, secret)| (crate::ext::secret_key(name), json(secret))).collect(); // (the base's own `e/` stays denied)
     // (a base on another server: its users and grants sign in there; the branch is this server's,
     // signed in to as this server's databases are: ADR-058)
