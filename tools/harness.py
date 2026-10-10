@@ -6988,14 +6988,14 @@ def flows():
         "rich": ("SELECT * FROM gold WHERE total > 100", "region, buyer NULLS FIRST"),
         "buyers": ("SELECT region, count(*) AS n FROM gold GROUP BY region", "region"),
         "above5": ("SELECT region, sum(total) AS t FROM gold WHERE total > 5 GROUP BY region", "region"),
+        "by_total": ("SELECT region, buyer, total, sum(n) AS n FROM gold GROUP BY region, buyer, total", "region, buyer NULLS FIRST, total"),  # (a total as a key: no rollup)
     }
     made = {v: err(f"CREATE MATERIALIZED VIEW {v} AS {s}") for v, (s, _) in whole.items()}
-    checks["a view of a GROUP BY view's partial rows, count(*) of them or a WHERE on their totals: made, run whole"] = not any(made.values())
+    checks["a view of a GROUP BY view's partial rows, count(*) of them, a WHERE on their totals or a total as a key: made, run whole"] = not any(made.values())
     say = {
         "expectations on a GROUP BY view": err("CREATE MATERIALIZED VIEW bad4 (CONSTRAINT c CHECK (n > 0)) AS SELECT region, count(*) AS n FROM orders GROUP BY region"),
         "a FAIL expectation rows already break": err("CREATE MATERIALIZED VIEW bad5 (CONSTRAINT c CHECK (amount > 0)) AS SELECT id, amount FROM orders"),
         "dropping a view others follow": err("DROP MATERIALIZED VIEW silver"),
-        "a GROUP BY view's total as a rollup's key": err("CREATE MATERIALIZED VIEW bad6 AS SELECT region, buyer, total, sum(n) AS n FROM gold GROUP BY region, buyer, total"),
     }
     checks["a rollup by all of a GROUP BY view's keys, made while rows stream in"] = again is None
     for what, e in say.items():
