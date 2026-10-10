@@ -97,6 +97,9 @@ impl Results {
             c.1 -= old.body.len();
         }
     }
+
+    /// The bytes of answers remembered now.
+    pub fn held(&self) -> usize { self.0.lock().unwrap().1 }
 }
 
 pub fn router(app: App) -> Router {
@@ -889,8 +892,8 @@ async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
     if !p.producer.is_empty() && p.seq == 0 {
         return Err(E(anyhow::anyhow!(crate::log::SEQ_FROM_1))); // (0 is "nothing yet": its batch would be taken for a retry)
     }
-    let meta: TableMeta = app.lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
-    let schema = schema(&meta.logical().columns)?; // (rows come under SQL's names; the log keeps stored ones: ADR-022)
+    let meta = app.lake.cat.meta(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
+    let schema = schema(&meta.logical_columns())?; // (rows come under SQL's names; the log keeps stored ones: ADR-022)
     let arrow = headers.get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"application/vnd.apache.arrow"));
     let (batches, given) = if arrow {
         // Columns by name, cast to the table's types (pandas, Polars and Arrow differ in string

@@ -1331,7 +1331,7 @@ async fn offset_commit(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
                 (_, e) if e != 0 => e,
                 (Some(meta), _) if index == 0 && offset >= 0 => {
                     let src = Src { producer: offsets_key(&group, &name), seq: offset as u64 + 1, prev: None };
-                    match app.log()?.append(name.clone(), src, RecordBatch::new_empty(schema(&meta.logical().columns)?)).await {
+                    match app.log()?.append(name.clone(), src, RecordBatch::new_empty(schema(&meta.logical_columns())?)).await {
                         Ok(_) => 0,
                         Err(e) => {
                             eprintln!("kafka offset commit: {e:#}");

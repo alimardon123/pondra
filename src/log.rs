@@ -353,10 +353,10 @@ pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<Strin
         Ok(())
     };
     let mut by_table = followed;
-    let mut metas: BTreeMap<String, Option<TableMeta>> = BTreeMap::new(); // (the log keeps columns under their stored names: ADR-022)
+    let mut metas: BTreeMap<String, Option<Arc<TableMeta>>> = BTreeMap::new(); // (the log keeps columns under their stored names: ADR-022)
     for a in pending {
         if !metas.contains_key(&a.table) {
-            metas.insert(a.table.clone(), lake.cat.get::<TableMeta>(&table_key(&a.table)).await?);
+            metas.insert(a.table.clone(), lake.cat.meta(&table_key(&a.table)).await?);
         }
         let stored = match &metas[&a.table] {
             Some(m) => m.to_stored(&a.batch)?,

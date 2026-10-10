@@ -1005,6 +1005,81 @@ def pace():
     return f"writes keep their pace beside 64 querying clients: acks p50 {p50(alone):.1f} ms alone, {p50(beside):.1f} ms beside"
 
 
+def memory():
+    """A node keeps few threads, and its own memory doesn't run away, under a steady stream of small
+    commits (the soak's, ten times as often): four producers append 10-row batches, each a commit,
+    with no reader. On a local lake each file read and write is a blocking task, often enough that
+    tokio's pool kept every thread it had started (about 90 on 4 cores), each with its own heap: a
+    node grew 180 → 920 MB in ten minutes at this pace (the 24-hour soak's 2–5 MB a minute) while
+    what it held stayed at 80–90 MB. With four blocking threads a core, 16 at least
+    (`panics::runtime`), it peaks near 300–400 MB in the first minutes and then comes down;
+    `PONDRA_BLOCKING_THREADS=512` fails the threads' check. Its own memory is RssAnon less what its
+    bounded caches hold (`pondra_hot_bytes`, `pondra_cache_bytes`)."""
+    SECS_RUN = 240  # how long the producers run; the node's memory is sampled every 10 s meanwhile
+    lake = new_lake()
+    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "0"}).start()
+    call(A.port, "POST", "/tables/ev", json.dumps([["producer", "Utf8"], ["seq", "Int64"], ["i", "Int64"]]).encode())
+    stop, acked = threading.Event(), [0, 0, 0, 0]
+
+    def produce(k):
+        t0, seq = time.time(), 1
+        while not stop.is_set():
+            body = "".join(json.dumps({"producer": f"p{k}", "seq": seq, "i": i}) + "\n" for i in range(10)).encode()
+            try:
+                call(A.port, "POST", f"/append/ev?producer=p{k}&seq={seq}", body)
+            except Exception:
+                time.sleep(0.1)  # a node busy or restarting: the same batch again, unless stopped
+                continue
+            acked[k] += 1
+            time.sleep(max(0, t0 + seq / 60 - time.time()))  # 60 batches a second; a slow machine goes as fast as it can
+            seq += 1
+
+    def own():
+        """A node's own memory in MB and its threads, or None where there is no /proc (Linux only)."""
+        try:
+            with open(f"/proc/{node.p.pid}/status") as f:
+                status = {l.split(":")[0]: l.split()[1] for l in f if ":" in l and len(l.split()) > 1}
+            g = metrics_of(A.port)
+            caches = sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes"))
+            return (int(status["RssAnon"]) * 1024 - g.get("pondra_hot_bytes", 0) - caches) / 2**20, int(status["Threads"])
+        except Exception:
+            return None
+
+    threads = [threading.Thread(target=produce, args=(k,), daemon=True) for k in range(4)]
+    [t.start() for t in threads]
+    samples, t_start = [], time.time()
+    while time.time() - t_start < SECS_RUN:
+        time.sleep(10)
+        m = own()
+        if m is not None:
+            samples.append((time.time() - t_start, m))
+    stop.set()
+    [t.join(30) for t in threads]
+    node.kill()
+    if not samples:
+        print("memory: skipped (no /proc on this machine)")
+        return "skipped: no /proc"
+    median = lambda xs: sorted(xs)[len(xs) // 2]
+    early = median([m for t, (m, _) in samples if 60 <= t <= 120])  # the second minute, after the warm-up
+    late = median([m for t, (m, _) in samples if t >= SECS_RUN - 60])
+    most = max(n for _, (_, n) in samples)
+    cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    allowed = max(16, 4 * cores) + cores + 12  # the blocking threads, the workers, and the node's own few
+    commits = sum(acked)
+    rate = commits / SECS_RUN
+    checks = {
+        "the producers' commits went in (at least 100 a second)": rate >= 100,
+        f"a node under small commits keeps at most four blocking threads a core, 16 at least ({allowed} threads in all)": most <= allowed,
+        "its own memory doesn't run away: its last minute within 1.5x (+64 MB) of its second (the soak's rule)": late <= early * 1.5 + 64,
+    }
+    for name, good in checks.items():
+        print(f"memory: {name}: {'OK' if good else 'FAIL'}")
+    print(f"memory: {commits} commits ({rate:.0f} a second), {most} threads at most ({allowed} allowed), own memory {early:.0f} MB early, {late:.0f} MB in the last minute; samples {[round(m) for _, (m, _) in samples]}")
+    if not all(checks.values()):
+        sys.exit(1)
+    return f"own memory under {rate:.0f} small commits a second: {early:.0f} MB early, {late:.0f} MB at {SECS_RUN // 60} minutes"
+
+
 def fence():
     """A second node on the same lake joins as a follower. Then the leader is frozen (SIGSTOP, like
     a network partition), the follower takes over, and the old leader wakes up still believing it
@@ -9343,7 +9418,7 @@ def attached():
 # About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
 # prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
 # suite in parts side by side that end together. A section not listed counts as 5 s.
-SECS = {"stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
+SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
         "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10}
@@ -9351,7 +9426,7 @@ SECS = {"stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36,
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, scripts, hot, minmax, history, plans, learn, friendly, reader, crash, load)
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, scripts, hot, minmax, history, plans, learn, friendly, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -9379,7 +9454,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -9392,7 +9467,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

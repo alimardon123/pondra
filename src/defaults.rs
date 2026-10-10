@@ -28,7 +28,7 @@ fn check_named(meta: &TableMeta, table: &str, rows: &RecordBatch, sql_names: boo
                 RecordBatch::try_new(std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), rows.columns().to_vec())?
             }
         };
-        let all = crate::query::conform(&named, &crate::query::schema(&meta.logical().columns)?)?;
+        let all = crate::query::conform(&named, &crate::query::schema(&meta.logical_columns())?)?;
         for (name, c) in &meta.checks {
             let bad = breaking(&all, c)?;
             if (0..bad.len()).any(|i| bad.value(i) && !marker(i)) {

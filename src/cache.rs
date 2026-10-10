@@ -163,6 +163,9 @@ impl CachedStore {
         Self { inner, cache: Mutex::new((lru::LruCache::unbounded(), 0)), max_bytes: 0, disk: None, lakes: Default::default(), id: uuid::Uuid::new_v4().simple().to_string() }
     }
 
+    /// The bytes of objects' ranges held in memory now (at most `max_bytes`).
+    pub fn held(&self) -> usize { self.cache.lock().unwrap().1 }
+
     fn saw(&self, m: &ObjectMeta) { saw(&self.id, &self.lakes.read().unwrap(), m) }
 
     /// An object outside the lakes: a byte range of the version last listed, from memory or
