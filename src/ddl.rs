@@ -119,7 +119,7 @@ pub async fn schemas(lake: &Lake) -> Result<Vec<String>> {
     Ok(out)
 }
 
-async fn has_schema(lake: &Lake, s: &str) -> Result<bool> {
+pub async fn has_schema(lake: &Lake, s: &str) -> Result<bool> {
     Ok(s == PUBLIC || lake.cat.get::<Schema>(&schema_key(s)).await?.is_some())
 }
 
@@ -157,6 +157,16 @@ async fn attached(lake: &Lake, l: &str) -> Result<Option<Arc<Lake>>> {
         }
     }
     Ok(here())
+}
+
+/// The database called `name`: this lake (its own name) or an attached one; None when there is
+/// none. Attachments are read here, so a name the catalog lists but this node hasn't attached yet
+/// is waited for, as `attached` does.
+pub async fn database(lake: &Lake, name: &str) -> Result<Option<Arc<Lake>>> {
+    if name == lake_name(lake) {
+        return Ok(Some(lake.arc()));
+    }
+    attached(lake, name).await
 }
 
 /// A table of this lake by its name inside it, from a name as SQL wrote it (`write::object`):

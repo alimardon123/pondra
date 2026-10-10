@@ -211,7 +211,7 @@ pub async fn view_write(lake: &Lake, stmt: &crate::write::Stmt) -> Result<Option
         Stmt::InsertInto(_, n, q) => (q, n.clone()),
         _ => bail!("{name} is a view of files (CREATE EXTERNAL TABLE): UPDATE, DELETE and ALTER change a lake's tables; INSERT adds a file to a view of a folder"),
     };
-    let expanded = crate::routines::expand(lake, &view.sql).await?;
+    let expanded = crate::routines::expand_stored(lake, &view.sql).await?;
     let spec = match &self::names(&expanded)[..] {
         [one] => spec(one).context("its files")?,
         _ => bail!("{name}: a view of several reads"),

@@ -70,7 +70,7 @@ pub fn named(name: &str) -> Option<&'static str> {
     const NAMES: &[(&str, &str)] = &[
         ("serialization_failure", "40001"), ("check_violation", "23514"), ("not_null_violation", "23502"), ("unique_violation", "23505"),
         ("insufficient_privilege", "42501"), ("invalid_password", "28P01"), ("syntax_error", "42601"), ("undefined_column", "42703"),
-        ("undefined_function", "42883"), ("undefined_table", "42P01"), ("invalid_schema_name", "3F000"), ("duplicate_table", "42P07"),
+        ("undefined_function", "42883"), ("undefined_table", "42P01"), ("invalid_schema_name", "3F000"), ("invalid_catalog_name", "3D000"), ("duplicate_table", "42P07"),
         ("division_by_zero", "22012"), ("numeric_value_out_of_range", "22003"), ("invalid_text_representation", "22P02"),
         ("query_canceled", "57014"), ("out_of_memory", "53200"), ("too_many_connections", "53300"), ("feature_not_supported", "0A000"),
         ("read_only_sql_transaction", "25006"), ("raise_exception", "P0001"), ("assert_failure", "P0004"), ("internal_error", "XX000"),
@@ -120,6 +120,8 @@ mod tests {
         assert_eq!(of("relation \"s\" does not exist"), "42P01");
         assert_eq!(of("something else"), "XX000");
         assert_eq!(super::of(&super::coded("40001", "could not serialize access due to concurrent update")), "40001");
+        assert_eq!(super::of(&super::coded("3D000", "no database x (CREATE DATABASE x)")), "3D000"); // (USE of a database that isn't there)
+        assert_eq!(super::named("invalid_catalog_name"), Some("3D000"));
         assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("new row for relation \"t\" violates check constraint \"c\"".into(), "23514"))), "23514");
         assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("invalid input value for enum mood: \"x\"".into(), "22P02"))), "22P02");
     }

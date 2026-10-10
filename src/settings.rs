@@ -19,12 +19,12 @@ use datafusion::sql::sqlparser::ast::{self, Expr, Reset, Set, Statement, Value, 
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::ops::ControlFlow;
 
-const NO_SESSION: &str = "a setting or a prepared statement is a session's: a Postgres connection's, the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>), or a script's (send it with the statements that use it)";
+pub const NO_SESSION: &str = "a setting or a prepared statement is a session's: a Postgres connection's, the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>), or a script's (send it with the statements that use it)";
 
-/// Is this one of the statements kept here?
+/// Is this one of the statements kept here? (`USE`, too: the session's search path, `path.rs`.)
 pub fn is(sql: &str) -> bool {
     let word = crate::write::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_uppercase();
-    matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE" | "ANALYZE" | "ANALYSE" | "REFRESH")
+    matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE" | "ANALYZE" | "ANALYSE" | "REFRESH" | "USE")
         && crate::runs::execute_of(sql).is_none() // (EXECUTE TASK: the leader's)
 }
 
@@ -65,10 +65,21 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
     if let Some(done) = current(lake, sql).await? {
         return Ok(done);
     }
-    let mut parsed = Parser::parse_sql(&GenericDialect {}, sql)?;
-    ensure!(parsed.len() == 1, "one statement at a time");
     let session = crate::temp::current();
     let session = || session.clone().context(NO_SESSION);
+    // `USE` and `SET SCHEMA` set the session's search path (`path.rs`). sqlparser reads neither, so
+    // they are taken here. The session is looked for first: a USE with none says so, by name.
+    if crate::path::is_use(sql) {
+        let session = session()?;
+        set(&session, "search_path", crate::path::use_of(lake, sql).await?)?;
+        return Ok(Done::Said("USE"));
+    }
+    if let Some(schema) = crate::path::set_schema(sql) {
+        set(&session()?, "search_path", schema)?;
+        return Ok(Done::Said("SET"));
+    }
+    let mut parsed = Parser::parse_sql(&GenericDialect {}, sql)?;
+    ensure!(parsed.len() == 1, "one statement at a time");
     Ok(match parsed.remove(0) {
         Statement::Set(Set::SingleAssignment { variable, values, .. }) => {
             let value = values.iter().map(text).collect::<Result<Vec<_>>>()?.join(", ");
@@ -147,6 +158,7 @@ fn text(e: &Expr) -> Result<String> {
             v => bail!("SET takes a string, a number or a word, not {v}"),
         },
         Expr::Identifier(i) => i.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."), // (SET search_path TO dev.sales)
         Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } => format!("-{}", text(expr)?),
         Expr::UnaryOp { op: ast::UnaryOperator::Plus, expr } => format!("+{}", text(expr)?),
         e => bail!("SET takes a string, a number or a word, not {e}"),

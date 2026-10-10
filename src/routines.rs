@@ -562,6 +562,7 @@ pub async fn prepare(lake: &Lake, sql: &str, params: &HashMap<String, Value>, vi
             out => out?,
         },
     };
+    let sql = crate::path::door(lake, &sql, &views.keys().cloned().collect()).await?; // (the session's search path: `path.rs`; a client's frames are views, not tables)
     expand_with(lake, &sql, views).await
 }
 
@@ -720,7 +721,18 @@ pub fn sql(s: &Statement) -> String {
 /// procedure or stored view keeps its calls: they are read when used (`query::stored_views`), so
 /// a function changed later changes them too. A materialized view keeps the functions as they were
 /// when it was made: it has been adding up rows since.
-pub async fn expand(lake: &Lake, sql: &str) -> Result<String> { expand_with(lake, sql, &HashMap::new()).await }
+///
+/// The current session's search path is written in first (`path.rs`), so every door, a task's body
+/// and a spread query see full names. Stored SQL is read with `expand_stored` instead.
+pub async fn expand(lake: &Lake, sql: &str) -> Result<String> {
+    let sql = crate::path::door(lake, sql, &std::collections::HashSet::new()).await?;
+    expand_with(lake, &sql, &HashMap::new()).await
+}
+
+/// `expand` for SQL that is already stored (a view's, a file's query): read as it was made, without
+/// the session's path. A view made under `USE crm` kept `crm.t` when it was made; one made without a
+/// path reads `t` as public, whoever reads it.
+pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { expand_with(lake, sql, &HashMap::new()).await }
 
 async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) -> Result<String> {
     let sql = &crate::vars::parameters_in(lake, sql).await?; // (`pondra.parameters('etl/orders.sql')`: a file's parameters, as rows)
@@ -781,6 +793,9 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
 /// `information_schema.schemata`, `secrets()`, `pondra.users` and `pondra.grants`, as Snowflake has them. (`SHOW FUNCTIONS` is every function a query may call,
 /// as DataFusion lists them: its own, and the Python ones; `SHOW TABLES` is DataFusion's.)
 fn show(sql: &str) -> Option<String> {
+    if let Some(q) = crate::path::show(sql) {
+        return Some(q); // (`SHOW search_path`: the session's path)
+    }
     static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views|schemas|databases|secrets|users|roles|grants)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
     if let Some(q) = show_shares(sql) {
         return Some(q);

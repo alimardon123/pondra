@@ -142,6 +142,7 @@ struct Lakes {
     schemas: Vec<(u32, String)>,
     rels: Vec<Rel>,
     routines: Vec<(u32, String, String, crate::routines::Routine)>, // oid, schema, name
+    visible: Vec<String>, // (this lake's schemas on the session's search path: `path.rs`; public when none is set)
 }
 
 /// A stable oid for an object: a hash of its kind and name, above Postgres's own (16384).
@@ -251,7 +252,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
     let mut all_schemas: Vec<(u32, String)> = vec![(11, "pg_catalog".into()), (13_000, "information_schema".into())];
     all_schemas.extend(schemas.iter().map(|s| (schema_oid(s), s.clone())));
     all_schemas.push((schema_oid(TEMP), TEMP.into()));
-    Ok(Lakes { indexes, database, databases, user: user.into(), schemas: all_schemas, rels, routines })
+    Ok(Lakes { indexes, database, databases, user: user.into(), schemas: all_schemas, rels, routines, visible: crate::path::schemas_here(lake) })
 }
 
 // ---------------------------------------------------------------- tables
@@ -681,9 +682,10 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
         Ok(texts_out((0..n).map(|i| format_type(oids[i]? as u32, mods.as_ref().and_then(|m| m[i]).unwrap_or(-1) as i32))))
     }));
     ctx.register_udf(udf("pg_get_expr", to_text, |a, _| Ok(Arc::new(datafusion::arrow::compute::cast(&a[0], &DataType::Utf8)?))));
-    // Visible: on the search path, which is `public` (and a session's temporary schema, and the
-    // catalog's own), as in Postgres: `\dt` and SQLAlchemy's default schema list only those.
-    let off_path = |schema: &str| !matches!(schema, "public" | TEMP | "pg_catalog");
+    // Visible: on the search path, which is `public` unless the session set one (and a session's
+    // temporary schema, and the catalog's own), as in Postgres: `\dt` and SQLAlchemy's default
+    // schema list only those.
+    let off_path = |schema: &str| !l.visible.iter().any(|v| v == schema) && schema != TEMP && schema != "pg_catalog";
     let hidden: Arc<std::collections::HashSet<u32>> = Arc::new(l.rels.iter().filter(|r| off_path(&r.schema)).flat_map(|r| [r.oid, oid("i", &format!("{}.{}", r.schema, r.name))])
         .chain(l.routines.iter().filter(|(_, schema, ..)| off_path(schema)).map(|(o, ..)| *o)).collect());
     for name in ["pg_table_is_visible", "pg_function_is_visible"] {
@@ -711,8 +713,9 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
         let names = text_arg(&a[0])?;
         Ok(texts_out((0..n).map(|i| SETTINGS.iter().find(|(k, _)| names[i].as_deref().is_some_and(|x| x.eq_ignore_ascii_case(k))).map(|(_, v)| v.to_string()))))
     }));
-    ctx.register_udf(udf("current_schemas", |_| list(DataType::Utf8), |_, n| {
-        let one = ScalarValue::List(ScalarValue::new_list_nullable(&[s("pg_catalog"), s("public")], &DataType::Utf8));
+    let on_path: Vec<ScalarValue> = std::iter::once(s("pg_catalog")).chain(l.visible.iter().map(|v| s(v.as_str()))).collect();
+    ctx.register_udf(udf("current_schemas", |_| list(DataType::Utf8), move |_, n| {
+        let one = ScalarValue::List(ScalarValue::new_list_nullable(&on_path, &DataType::Utf8));
         Ok(ScalarValue::iter_to_array(std::iter::repeat_n(one, n.max(1)))?)
     }));
     ctx.register_udf(udf("quote_ident", to_text, |a, n| {
@@ -879,10 +882,10 @@ const INFO_TABLES: &[&str] = &["schemata", "tables", "columns", "views", "table_
 /// `sql` with what only Postgres says said so DataFusion takes it: catalog tables by their
 /// schema, `OPERATOR(pg_catalog.~)` as `~`, `::regclass` and its kin as functions, `COLLATE`
 /// dropped, `current_user` as the user. Unchanged if it doesn't parse as Postgres's.
-pub fn rewrite(sql: &str, user: &str) -> String {
+pub fn rewrite(sql: &str, user: &str, schema: &str) -> String {
     use datafusion::sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
     let Ok(mut stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else { return sql.to_string() };
-    let mut r = Rewriter { user: if user.is_empty() { "pondra" } else { user } };
+    let mut r = Rewriter { user: if user.is_empty() { "pondra" } else { user }, schema };
     for s in stmts.iter_mut() {
         let _ = s.visit(&mut r);
     }
@@ -891,6 +894,7 @@ pub fn rewrite(sql: &str, user: &str) -> String {
 
 struct Rewriter<'a> {
     user: &'a str,
+    schema: &'a str, // (the session's current schema: `current_schema()`)
 }
 
 fn is_pg_table(name: &str) -> bool { CATALOG.iter().any(|(n, _)| *n == name) }
@@ -909,7 +913,7 @@ fn regproc(e: &ast::Expr) -> bool {
 
 fn boolean(e: &ast::Expr) -> bool {
     static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> = std::sync::LazyLock::new(|| {
-        let empty = Lakes { database: String::new(), databases: vec![], user: String::new(), schemas: vec![], rels: vec![], routines: vec![], indexes: vec![] };
+        let empty = Lakes { database: String::new(), databases: vec![], user: String::new(), schemas: vec![], rels: vec![], routines: vec![], indexes: vec![], visible: vec![] };
         tables(&empty).unwrap_or_default().iter().flat_map(|(_, t)| datafusion::datasource::TableProvider::schema(t.as_ref()).fields().iter().filter(|f| *f.data_type() == DataType::Boolean).map(|f| f.name().clone()).collect::<Vec<_>>()).collect()
     });
     let name = match e {
@@ -1231,7 +1235,7 @@ impl VisitorMut for Rewriter<'_> {
                     Some("current_user" | "session_user" | "current_role") if bare => Some(ast::Expr::Value(ast::Value::SingleQuotedString(self.user.to_string()).into())),
                     // (beside `unnest(a)` in a select list, each element's place: zipped, as Postgres does)
                     Some("generate_subscripts") if !args.is_empty() => expr(&format!("unnest(generate_series(1, cardinality({})))", args[0])),
-                    Some("current_schema") => Some(ast::Expr::Value(ast::Value::SingleQuotedString("public".into()).into())),
+                    Some("current_schema") => Some(ast::Expr::Value(ast::Value::SingleQuotedString(self.schema.to_string()).into())),
                     Some("current_database" | "current_catalog") => None,
                     _ => None,
                 }
