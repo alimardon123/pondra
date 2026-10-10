@@ -38,7 +38,9 @@ The owner's design principles, which every change must respect:
 8. **Every round leaves it better on every angle** (the owner, 2026-09-30): faster, more
    performant, simpler, easier to use, more functional, versatile, scalable and powerful — while
    staying lightweight and efficient. The gates hold each round to it (`logs/gates/`: speed and
-   SQL never drop), and the console's budget keeps the page light.
+   SQL never drop), and the console's budget keeps the page light. The owner, 2026-10-10: whatever
+   we add must be really useful and pay its way, shown with numbers before it is called done;
+   what doesn't is off by default or taken out.
 9. **Easy to change, replace and extend** (the owner, 2026-10-01): the platform will grow tools of
    its own (ETL on a canvas, AI agents, reports, GPUs) and parts will be swapped. Every feature is
    a part with one job behind a small surface — a registry entry (`register.*` in the console, a
@@ -50,6 +52,8 @@ The owner's design principles, which every change must respect:
    applies everywhere, with no copies to chase. Users customize and extend the whole product
    (their own objects, functions, settings, extensions) as fully as the core does. Reliability,
    simplicity, performance and efficiency stay the bar, and every review holds a change to this.
+   The owner, 2026-10-10: code any developer can read, change, extend and maintain later; the
+   simple shape first, plain names, and no cleverness a newcomer would have to decode.
 10. **Every feature through every door** (the owner, 2026-10-09): what Pondra can do, it can do from
    SQL, Python, JavaScript, the command line, HTTP, Flight, the Postgres port, MCP and the console,
    as far as a door allows (Kafka's protocol carries rows, not statements). A door that can't take
@@ -1817,11 +1821,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    twice in a row, have them set aside. A query is known by its words (`key`: comments and spacing
    left out, so a benchmark's numbered comment doesn't make each run a stranger; `EXPLAIN` of it is
    it and records nothing): a bar measured cold, or by text alone, never held a run to anything.
-   `PONDRA_LEARN=off`: a node plans with none of its own, but a slice's still. A plan made anywhere
+   A node plans with its own facts only with `PONDRA_LEARN=on` (off by default since 0.34: on TPC-H and
+   TPC-DS they changed one plan and sped up none), and with a slice's always. A plan made anywhere
    else (a view, a write's query) uses none. `harness.py learn`: the order starts from the filtered
    customers once learned, on another node too (read from the history); same answer, no slower than an
    equal node without; the bar run's plan among its runs; three nodes plan with the coordinator's
-   facts (a node with `PONDRA_LEARN=off` among them, fails without `Slice::learned`); read back after a
+   facts (a node without `PONDRA_LEARN=on` among them, fails without `Slice::learned`); read back after a
    restart.
 263. **A lake attached READ_ONLY is read with its own key and written by nothing here** (`store::Reach`,
    `ReadOnly`, `write::across`; ADR-058). Its store is built from the secret whose scope covers its URL
@@ -1861,6 +1866,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    project's table or view, and of its role's grants, are refused by name", "the cluster's own door
    refuses it too…", "a superuser without DEPLOY can't deploy a protected database; ci's deploy
    changes it".
+267. **A node keeps few blocking threads** (`panics::runtime`, both runtimes): at most four a core (16
+   at least, `PONDRA_BLOCKING_THREADS`), each gone after a second idle. On a local lake every file
+   read and write is a blocking task. Under small steady commits they came often enough that no
+   thread ever sat idle a second, so the pool kept the most it had ever needed (about 90 on 4
+   cores), and each thread's heap kept what its work had used: a node grew 2–5 MB a minute while its
+   live heap stayed at 80–90 MB. Windows keeps tokio's 512, since a child's pipes hold blocking
+   threads there. `harness.py memory`: "keeps at most four blocking threads a core" fails with
+   `PONDRA_BLOCKING_THREADS=512`.
 
 ## Tests: run these before and after any change
 
@@ -1883,6 +1896,7 @@ python3 tools/harness.py stopped        # a run whose node was killed under it: 
 python3 tools/harness.py scripts        # IF, CASE, loops, handlers, RETURN, EXECUTE IMMEDIATE: errors at their line, scopes, a job run twice writing once, Postgres's protocols
 python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
 python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model; merged files leave memory
+python3 tools/harness.py memory         # 240 small commits a second, no reader: the node's threads stay few and its own memory doesn't run away
 python3 tools/harness.py pace           # a writer's acks beside 64 querying clients stay near its acks alone (queries on their own runtime)
 python3 tools/harness.py tails          # a table's log tail kept between queries: reads == a model while rows land, a transaction's snapshot, a column added, tiering
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer

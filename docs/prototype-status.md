@@ -112,9 +112,35 @@ tables 0.97 s (the last gate's 1.26 s), from files 2.00 s against DuckDB over Pa
 answers equal. TPC-DS 99 of 99 equal to DuckDB's from files and from memory, `join_order.py`,
 `spread_tpch.py --expect 22`, `harness.py scale`, `hot` and `minmax` pass.
 
+**Keys a query implies** (`optimize::implied`, `Equal`). The join order sees what a query's keys say
+together: two columns of one type that each equal a third are equal. TPC-H q5's customers and
+suppliers each name a nation, so customers may join the nation at once, and the order starts from the
+region (Asia) instead of a year of orders. A join takes only the keys those it already has don't
+say (`Equal::said`): given q17's implied key beside its own, its last join hashed two columns and lost
+the array lookup above, twice as slow (`join_order.py`: "TPC-H q17: no join takes a key the others
+say"). Two nodes on copies of one lake, interleaved, both ways round, best of 20
+(`logs/round34/implied-keys-ab.json`): TPC-H q5 0.74×, TPC-DS q64 0.76× and q72 0.82×, the rest
+within this box's noise. TPC-H SF1 from memory 1.07 s against DuckDB's tables 1.03 s, from files
+1.94 s against DuckDB over Parquet 2.04 s, 22 of 22 equal
+(`logs/round34/singlenode-tpch-sf1-implied-keys.json`); TPC-DS 99 of 99 equal to DuckDB's from
+files and from memory; `join_order.py`, `spread_tpch.py --expect 22`, `harness.py scale` and 10,000
+random queries (the same known differences, no new one) pass.
+
+**What runs learn, measured** (the owner asked, 2026-10-10, whether the planner's use of them pays).
+Planned with them, TPC-H SF1 changed one plan (q17's) and TPC-DS SF1 none, and no query ran faster.
+They cost nothing measurable either: a `SELECT 1` 1.43 ms against 1.42, a three-way join 11.6 ms
+against 11.7, and a refresh's read of the history 4 ms every 10 s while queries are planned
+(`logs/round34/learned-facts.json`). So, as the owner's rule says of what doesn't pay its way, the
+planner uses them only with `PONDRA_LEARN=on`; every run still learns them and `pondra.learned`
+lists them, for people to read and for the planner where a filter's columns go together (the case
+`harness.py learn` builds).
+
 **On GitHub's runners** (`.github/workflows/singlenode-bench.yml`): TPC-H SF10 and all 100 M rows
 of ClickBench, Pondra from memory and from files against DuckDB over Parquet and in its own tables,
-every answer checked; weekly on main, by hand, and on a pull request labelled `bench`.
+every answer checked; weekly on main, by hand, and on a pull request labelled `bench`. Its first
+run (before implied keys, `logs/round34/singlenode-tpch-sf10-github.json`): TPC-H SF10 from memory
+12.95 s against DuckDB's tables 15.28 s, from files 19.50 s against DuckDB over Parquet 23.70 s, 22
+of 22 equal; furthest behind DuckDB's tables, q18 (1.69 s against 1.16), q20 and q12.
 
 **Now (2026-10-03, round 33, toward 0.33.0): run it for years.**
 

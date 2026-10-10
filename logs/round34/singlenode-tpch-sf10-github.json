@@ -1,0 +1,485 @@
+{
+ "what": "TPC-H SF10 on a GitHub runner (singlenode-bench.yml, ubuntu-24.04, 4 vCPU, 16 GB): pondra from the hot columns and cold from the lake's Parquet, DuckDB 1.5.5 over the same Parquet and in its own tables; best of 3 per query (s)",
+ "commit": "aefcd95 (the perfect hash join's threshold; before implied keys)",
+ "totals_s": {
+  "pondra": 12.95,
+  "pondra-cold": 19.5,
+  "duckdb": 23.7,
+  "duckdb-native": 15.28
+ },
+ "suite": "tpch",
+ "data": "/mnt/bench/tpch-sf10-bench",
+ "sf": 10.0,
+ "cores": 4,
+ "runs": 3,
+ "info": {
+  "pondra_load_s": 58.7,
+  "pondra_warm_s": 33.9,
+  "pondra_wall_s": 39.8,
+  "pondra-cold_wall_s": 59.7,
+  "duckdb_load_s": 0.0,
+  "duckdb_version": "1.5.5",
+  "duckdb_wall_s": 73.6,
+  "duckdb-native_load_s": 27.8,
+  "duckdb-native_version": "1.5.5",
+  "duckdb-native_wall_s": 93.1
+ },
+ "results": {
+  "pondra": {
+   "1": {
+    "hot": 1.258,
+    "first": 1.293,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.064,
+    "first": 0.07,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.382,
+    "first": 0.388,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.45,
+    "first": 0.46,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.441,
+    "first": 0.451,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.294,
+    "first": 0.296,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.384,
+    "first": 0.403,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.406,
+    "first": 0.415,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 1.138,
+    "first": 1.186,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.582,
+    "first": 0.603,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.107,
+    "first": 0.112,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.724,
+    "first": 0.731,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 1.237,
+    "first": 1.237,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.094,
+    "first": 0.099,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.222,
+    "first": 0.222,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.26,
+    "first": 0.279,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.212,
+    "first": 0.217,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 1.693,
+    "first": 1.693,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.943,
+    "first": 0.961,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.554,
+    "first": 0.573,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 1.391,
+    "first": 1.391,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.118,
+    "first": 0.118,
+    "same_as_duckdb": true
+   },
+   "total_hot": 12.95,
+   "answers_match": 22
+  },
+  "pondra-cold": {
+   "1": {
+    "hot": 1.245,
+    "first": 1.279,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.15,
+    "first": 0.157,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.706,
+    "first": 0.735,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.511,
+    "first": 0.538,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 1.124,
+    "first": 1.131,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.557,
+    "first": 0.557,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.844,
+    "first": 0.851,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.996,
+    "first": 1.016,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 1.89,
+    "first": 1.89,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.961,
+    "first": 0.961,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.123,
+    "first": 0.128,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.79,
+    "first": 0.796,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 1.225,
+    "first": 1.291,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.416,
+    "first": 0.436,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.873,
+    "first": 0.873,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.286,
+    "first": 0.321,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.668,
+    "first": 0.691,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 2.057,
+    "first": 2.063,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.969,
+    "first": 0.969,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.85,
+    "first": 0.858,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 2.067,
+    "first": 2.067,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.193,
+    "first": 0.193,
+    "same_as_duckdb": true
+   },
+   "total_hot": 19.5,
+   "answers_match": 22
+  },
+  "duckdb": {
+   "1": {
+    "hot": 1.613,
+    "first": 2.165,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.243,
+    "first": 0.328,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.958,
+    "first": 1.435,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.684,
+    "first": 0.731,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 1.113,
+    "first": 1.232,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.674,
+    "first": 0.679,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 1.06,
+    "first": 1.084,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 1.283,
+    "first": 1.37,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 2.347,
+    "first": 2.366,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 1.13,
+    "first": 1.168,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.192,
+    "first": 0.2,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.888,
+    "first": 0.915,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 1.508,
+    "first": 1.599,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.755,
+    "first": 0.764,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.673,
+    "first": 0.678,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.313,
+    "first": 0.326,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 1.209,
+    "first": 1.215,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 1.512,
+    "first": 1.574,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 1.109,
+    "first": 1.126,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 1.121,
+    "first": 1.121,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 2.968,
+    "first": 2.981,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.348,
+    "first": 0.354,
+    "same_as_duckdb": true
+   },
+   "total_hot": 23.7,
+   "answers_match": 22
+  },
+  "duckdb-native": {
+   "1": {
+    "hot": 1.354,
+    "first": 5.821,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.072,
+    "first": 0.477,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.656,
+    "first": 1.722,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.554,
+    "first": 1.227,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.477,
+    "first": 0.989,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.335,
+    "first": 0.395,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.38,
+    "first": 0.555,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.526,
+    "first": 0.75,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 2.703,
+    "first": 6.293,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.745,
+    "first": 1.099,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.036,
+    "first": 0.057,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.59,
+    "first": 1.209,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 1.246,
+    "first": 1.97,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.337,
+    "first": 0.404,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.303,
+    "first": 0.36,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.257,
+    "first": 0.326,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.308,
+    "first": 0.385,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 1.16,
+    "first": 1.932,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.955,
+    "first": 2.025,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.405,
+    "first": 0.487,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 1.681,
+    "first": 1.965,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.195,
+    "first": 0.199,
+    "same_as_duckdb": true
+   },
+   "total_hot": 15.28,
+   "answers_match": 22
+  }
+ }
+}

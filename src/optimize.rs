@@ -797,7 +797,9 @@ fn lifted(plan: Arc<LogicalPlan>) -> Result<Arc<LogicalPlan>> {
 /// A join's rows are estimated the textbook way — `rows(a) × rows(b) / distinct(key)`, a side
 /// whose distinct count nothing knows counting as one row per value, which is what a key usually
 /// is. That is what catches the joins that *expand*: TPC-H q5 relates customers to suppliers by
-/// nation, 25 values, so every customer meets four hundred suppliers.
+/// nation, 25 values, so every customer meets four hundred suppliers. Keys the query's imply count
+/// too (`implied`): with `c_nationkey = s_nationkey` and `s_nationkey = n_nationkey`, customers can
+/// meet their nation first, and q5 starts from Asia's five nations instead of a year of orders.
 ///
 /// Two things keep it honest, and they matter more than the search. The order the query wrote is
 /// costed the same way, as the tree it is, and kept unless the new one is cheaper — a query that
@@ -833,6 +835,8 @@ impl OptimizerRule for JoinOrder {
         }
         let (mut leaves, mut keys, mut filters) = (vec![], vec![], vec![]);
         flatten(&plan, equality, &mut leaves, &mut keys, &mut filters);
+        let written = keys.len();
+        keys.extend(implied(&keys, plan.schema()));
         if leaves.len() < 3 {
             return Ok(Transformed::no(plan)); // (two inputs: the build side is chosen by size when it runs)
         }
@@ -873,24 +877,28 @@ impl OptimizerRule for JoinOrder {
         }
         // Rebuilt left-deep in that order: each join takes the keys that connect its input to what
         // is built, and every condition that can be evaluated by then.
-        let mut used = vec![false; keys.len()];
+        // A key the ones already taken say is left out: TPC-H q17's last join, given the key its
+        // part and its subquery imply as well, hashed two columns where one says it all (no array
+        // lookup, twice as slow).
+        let (mut used, mut equal) = (vec![false; keys.len()], Equal::default());
         let mut left = leaves[order[0]].clone();
         for &i in &order[1..] {
             let right = Arc::new(leaves[i].clone());
+            let schema = build_join_schema(left.schema(), right.schema(), &JoinType::Inner)?;
             let mut on = vec![];
             for (k, pair) in connect(&keys, left.schema(), right.schema())? {
-                if !std::mem::replace(&mut used[k], true) {
+                if !std::mem::replace(&mut used[k], true) && !equal.said(&pair.0, &pair.1, &schema) {
                     on.push(pair);
                 }
             }
-            let schema = build_join_schema(left.schema(), right.schema(), &JoinType::Inner)?;
             let (mine, rest) = std::mem::take(&mut filters).into_iter().partition::<Vec<Expr>, _>(|f| f.column_refs().iter().all(|c| schema.has_column(c)));
             filters = rest;
             left = LogicalPlan::Join(Join::try_new(Arc::new(left), right, on, conjunction(mine), JoinType::Inner, constraint, equality, false)?);
         }
         // A key no join could take (one side spanning two inputs joined apart) stays a condition,
-        // so nothing is ever dropped; the next pass pushes it back down.
-        filters.extend(keys.iter().zip(&used).filter(|(_, &u)| !u).map(|((l, r), _)| l.clone().eq(r.clone())));
+        // so nothing is ever dropped; the next pass pushes it back down. An implied one no join
+        // took is already said by the written ones.
+        filters.extend(keys.iter().zip(&used).take(written).filter(|(_, &u)| !u).map(|((l, r), _)| l.clone().eq(r.clone())));
         let schema = Arc::clone(plan.schema());
         if left.schema() != &schema {
             left = LogicalPlan::Projection(Projection::new_from_schema(Arc::new(left), schema)); // (the columns as the query had them)
@@ -939,6 +947,58 @@ fn equalities(j: &Join) -> (Vec<(Expr, Expr)>, Vec<Expr>) {
         }
     }
     (keys, rest)
+}
+
+/// The keys `keys` imply and don't say: two columns of one type that each equal a third are equal
+/// (with NULLs too: a NULL meets nothing, or, where NULLs meet, only NULLs). Only plain columns, a
+/// class of at most eight, each pair once, in the order the keys name them, so every node finds
+/// the same. A join may then take one of them; the rest are left out, as the written keys hold them.
+fn implied(keys: &[(Expr, Expr)], schema: &DFSchema) -> Vec<(Expr, Expr)> {
+    let mut equal = Equal::default();
+    for (l, r) in keys {
+        equal.said(l, r, schema);
+    }
+    let said = |a: &Column, b: &Column| keys.iter().any(|(l, r)| matches!((l, r), (Expr::Column(x), Expr::Column(y)) if (x == a && y == b) || (x == b && y == a)));
+    let mut out = vec![];
+    for class in equal.0.iter().filter(|k| k.len() <= 8) {
+        for (i, a) in class.iter().enumerate() {
+            for b in &class[i + 1..] {
+                if !said(a, b) {
+                    out.push((Expr::Column(a.clone()), Expr::Column(b.clone())));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Columns known equal, in classes: two plain columns of one type that a key pairs, and through
+/// them every column either is equal to.
+#[derive(Default)]
+struct Equal(Vec<Vec<Column>>);
+
+impl Equal {
+    /// Whether the key `l = r` is said by the ones before it; if not, it is now. A key of anything
+    /// but two plain columns of one type is never said.
+    fn said(&mut self, l: &Expr, r: &Expr, schema: &DFSchema) -> bool {
+        let (Expr::Column(a), Expr::Column(b)) = (l, r) else { return false };
+        let (Ok((_, ta)), Ok((_, tb))) = (schema.qualified_field_from_column(a), schema.qualified_field_from_column(b)) else { return false };
+        if ta.data_type() != tb.data_type() {
+            return false;
+        }
+        let at = |c: &Column| self.0.iter().position(|k| k.contains(c));
+        match (at(a), at(b)) {
+            (Some(i), Some(j)) if i == j => return true,
+            (Some(i), Some(j)) => {
+                let moved = self.0.remove(i.max(j));
+                self.0[i.min(j)].extend(moved);
+            }
+            (Some(i), None) => self.0[i].push(b.clone()),
+            (None, Some(j)) => self.0[j].push(a.clone()),
+            (None, None) => self.0.push(vec![a.clone(), b.clone()]),
+        }
+        false
+    }
 }
 
 /// How big a join input is: its rows, and an upper bound on each column's distinct values where
@@ -1282,5 +1342,27 @@ mod tests {
         let both = joined(&inventory, &dates, &[(&l, &r)], join_rows(&inventory, &dates, &[(&l, &r)]));
         assert_eq!(both.rows, 11_745_000);
         assert_eq!((both.distinct["d_week_seq"], both.distinct["d_date_sk"], both.distinct["inv_date_sk"]), (261, 261, 261));
+    }
+
+    /// Customers meet suppliers by nation and suppliers their nation, so customers meet their
+    /// nation too (TPC-H q5); a key of another type, or one already said, adds nothing.
+    #[test]
+    fn keys_imply_keys_through_a_third() {
+        use datafusion::arrow::datatypes::Field;
+        let field = |t: &str, c: &str, ty: DataType| (Some(datafusion::common::TableReference::bare(t)), Arc::new(Field::new(c, ty, true)));
+        let schema = DFSchema::new_with_metadata(
+            vec![field("c", "c_nationkey", DataType::Int32), field("s", "s_nationkey", DataType::Int32), field("n", "n_nationkey", DataType::Int32), field("x", "x_key", DataType::Int64)],
+            Default::default(),
+        )
+        .unwrap();
+        let c = |t: &str, n: &str| Expr::Column(Column::new(Some(t), n));
+        let keys = vec![(c("c", "c_nationkey"), c("s", "s_nationkey")), (c("s", "s_nationkey"), c("n", "n_nationkey")), (c("n", "n_nationkey"), c("x", "x_key"))];
+        assert_eq!(implied(&keys, &schema), vec![(c("c", "c_nationkey"), c("n", "n_nationkey"))]);
+        assert!(implied(&keys[..1], &schema).is_empty());
+        // Taken one at a time, a key the ones before it say is said; one of two types never is.
+        let mut equal = Equal::default();
+        assert!(!equal.said(&keys[0].0, &keys[0].1, &schema) && !equal.said(&keys[1].0, &keys[1].1, &schema));
+        assert!(equal.said(&c("n", "n_nationkey"), &c("c", "c_nationkey"), &schema));
+        assert!(!equal.said(&keys[2].0, &keys[2].1, &schema) && !equal.said(&keys[2].0, &keys[2].1, &schema));
     }
 }

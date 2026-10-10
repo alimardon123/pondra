@@ -178,7 +178,9 @@ table grows. Part 2 learns filters; joins' fan-outs and exchanges' bytes come wi
 - **Never worse**: the plan with the facts and the plan before them are both timed, and the faster
   wins, as the spread guard does today (invariant 72). A fact that made a query slower twice is set
   aside for that query. (SQL Server calls this automatic plan correction.)
-- `PONDRA_LEARN=off` turns it off; nothing else is to set.
+- `PONDRA_LEARN=off` turns it off; nothing else is to set. (Round 34, measured: on TPC-H and TPC-DS
+  the facts changed one plan and sped up none, so the planner uses them only with `PONDRA_LEARN=on`;
+  runs still learn them. `docs/prototype-status.md`, `logs/round34/learned-facts.json`.)
 
 ### 4. Adapting while it runs, where a run pauses
 
