@@ -8179,6 +8179,12 @@ def enums():
     return f"{sum(checks.values())} of {len(checks)} enum checks"
 
 
+# The object kinds `registry()` doesn't make itself, and where each is checked (grepped: each named
+# section or tool makes the kind and asserts on it). A kind added to KINDS without a check fails there.
+ELSEWHERE = {"external table": "harness.py external", "type": "harness.py enums", "secret": "harness.py secrets", "user": "harness.py users",
+             "database": "this section's branches, environments_check.py", "share": "sharing_check.py", "recipient": "sharing_check.py"}
+
+
 def registry():
     """The statement registry (ADR-049): every kind of object in `pondra.objects` with its comment and
     definition; `SHOW CREATE` of each kind runs again to the same object; `COMMENT ON` every kind,
@@ -8325,7 +8331,21 @@ def registry():
     here = q("SELECT name FROM pondra.databases")[0]["name"]
     dev_at, slim_at = f"{lake}-dev", f"{lake}-slim"
     LAKES.extend([dev_at, slim_at])
+    q("CREATE SECRET reg_secret (TYPE http, BEARER_TOKEN 'reg-token-1', SCOPE 'https://reg.example.com/')")  # (a secret the clone must leave)
     q(f"CREATE DATABASE dev LOCATION '{dev_at}' CLONE \"{here}\"")
+    # What the clone took, as the registry says (pondra.kinds' on_clone, read here, never written in), against what each lake lists
+    on_clone = {r["kind"]: r for r in q("SELECT * FROM pondra.kinds") if r["is"] == "object"}
+    cloned_families = ("schema", "relation", "routine", "task", "type", "secret")
+    lists = lambda rows: {(r["kind"], r.get("schema"), r["name"]) for r in rows if on_clone[r["kind"]]["family"] in cloned_families}
+    base = lists(q(f"SELECT kind, schema, name FROM pondra.objects WHERE lake = '{here}'"))
+    branch = lists(q("SELECT kind, schema, name FROM pondra.objects WHERE lake = 'dev'"))
+    how = lambda e: on_clone[e[0]]["on_clone"]
+    info["clone"] = {"base": sorted(map(str, base)), "branch": sorted(map(str, branch)),
+                     "missing_in_branch": sorted(str(e) for e in base if how(e) in ("copy", "pin") and e not in branch)}
+    checks["a clone takes what the registry says (copy, pin) and leaves what it says (leave): the secret stays the base's"] = \
+        not any(e in branch for e in base if how(e) == "leave") and all(e in branch for e in base if how(e) in ("copy", "pin")) \
+        and ("secret", None, "reg_secret") in base
+    q("DROP SECRET reg_secret")
     q(f"CREATE DATABASE slim LOCATION '{slim_at}' CLONE \"{here}\" WITH (schemas = (sales)) WITH NO DATA")
     q("COMMENT ON DATABASE dev IS 'a branch'")
     branches = {n: show("database", n) for n in ("dev", "slim")}
@@ -8344,6 +8364,20 @@ def registry():
     kinds = call(A.port, "GET", "/kinds")
     checks["GET /kinds and pondra.kinds list every kind and its statements"] = {k["kind"] for k in kinds} >= {"table", "view", "materialized view", "function", "procedure", "task", "schema"} \
         and q("SELECT statements FROM pondra.kinds WHERE kind = 'table'")[0]["statements"].startswith("CREATE, CREATE OR ALTER")
+    listed_kinds = q('SELECT kind, "is" FROM pondra.kinds')
+    object_kinds = {r["kind"] for r in listed_kinds if r["is"] == "object"}
+    made_kinds = {k for k, _, _ in made}
+    info["kinds"] = {"objects": sorted(object_kinds), "made": sorted(made_kinds), "elsewhere": sorted(ELSEWHERE),
+                     "unchecked": sorted(object_kinds - made_kinds - set(ELSEWHERE)), "unknown": sorted((made_kinds | set(ELSEWHERE)) - object_kinds)}
+    checks["every kind is checked: made here, or named in ELSEWHERE (a kind added without a check fails here)"] = object_kinds == made_kinds | set(ELSEWHERE)
+    names = [k["kind"] for k in kinds]
+    object_names = {k["kind"] for k in kinds if k["is"] == "object"}
+    checks["pondra.kinds and GET /kinds are one list: objects, parts and patterns, each answering its questions"] = \
+        sorted((r["kind"], r["is"]) for r in listed_kinds) == sorted((k["kind"], k["is"]) for k in kinds) and len(set(names)) == len(names) \
+        and all(k["statements"] and k["on_clone"] in ("copy", "pin", "leave") for k in kinds if k["is"] == "object") \
+        and all(k["inside"] and set(k["inside"]) <= object_names for k in kinds if k["is"] == "part") \
+        and all(k["lists"] for k in kinds if k["is"] == "pattern") \
+        and {k["kind"] for k in kinds if k["is"] == "object" and k["on_clone"] == "leave"} == {"secret", "share", "recipient"}
     missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'")]
     quiet = q("COMMENT IF EXISTS ON TABLE nothing_here IS 'x'")
     checks["what isn't there: refused by name, or nothing with IF EXISTS"] = missing == [500, 500, 500] and quiet.get("exists") is False

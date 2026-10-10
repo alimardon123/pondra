@@ -249,8 +249,14 @@ grants sees the tables and views they may read, and no secrets, users, roles, sh
 | `comment` | what [`COMMENT ON`](/pondra/reference/sql/#every-kind-of-object) said about it, or null |
 | `definition` | the statement that makes it again, as `SHOW CREATE` gives it without the comments (a branch's is the `CREATE DATABASE … CLONE` that made it); null for what is never shown (a secret's values, a user's password, a recipient's token) |
 
-`pondra.kinds` lists the kinds: `kind`, `family` (kinds of one family share their names: a table and
-a view can't both be `orders`) and `statements`, the statements the kind takes.
+`pondra.kinds` lists every kind of object, part and pattern, one row each. `is` says which one it is
+(`object`, `part` or `pattern`). `family` says which kinds share a name (a table and a view can't both
+be `orders`), and `statements` and `privileges` say what the kind takes and what `GRANT` gives on it.
+`on_clone` says what `CREATE DATABASE … CLONE` does with an object (`copy`, `pin` or `leave`), and
+`in_project`, `undrop` and `secret` say whether a project may declare it, whether `UNDROP` brings it
+back, and whether its values are never shown. A part's `inside` and a pattern's `lists` say where it
+sits. The [glossary](/pondra/reference/glossary/) has the same rows as text, with each one's `about`
+and `also`.
 
 ```sql
 CREATE TABLE shelf (sku VARCHAR, qty BIGINT);

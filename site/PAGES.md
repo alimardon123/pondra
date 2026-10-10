@@ -63,6 +63,7 @@ leave them out.
 | `cli.mdx` | `pondra`, `serve` (every flag), `sql`, `run`, `catalog`, `server` ★ (leave a placeholder line) | `src/main.rs` |
 | `environment.mdx` | every `PONDRA_*` environment variable, with its default | `grep -rn 'PONDRA_' src python js` |
 | `system-columns.mdx` | `_row_id`, `_version`, `_created_at`, `_updated_at`, `_deleted`, `_change_type`, `pondra.runs`, `pondra.routines`, `pondra.tasks` | ADR-020, ADR-027 |
+| `glossary.mdx` | every kind of object, part and pattern, what each is and what other products call it; written from `GET /kinds` by `tools/docs_check.py --write-glossary` (the same text as `docs/glossary.md`) | `src/objects.rs` (`KINDS`, `PARTS`, `PATTERNS`), ADR-049 |
 
 ## Concepts (`concepts/`)
 
