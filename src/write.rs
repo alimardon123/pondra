@@ -1357,6 +1357,9 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
             let _guard = app.lock.lock().await;
             return crate::change::FILES.scope(files, crate::change::run(lake, seq, &sql, &job)).await;
         }
+        if let Some(o) = &other {
+            crate::users::across_write(o, &attached_as(&stmt), &local, &stmt).await?; // (that lake's own sign-in)
+        }
         let target = other.clone().unwrap_or_else(|| lake.arc());
         let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files).await?;
         let Some(o) = other else { return post(&app.cluster.leader.addr, &Request::Change(sql, job, sent)).await };
@@ -1367,6 +1370,7 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     // A table of an attached lake: the work runs here, that lake's leader records it.
     let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
     if let Some(other) = other {
+        crate::users::across_write(&other, &attached_as(&stmt), &table, &stmt).await?; // (that lake's own sign-in)
         let req = prepare(lake, &other, &table, &stmt, &job, files).await?;
         let mark = match &req {
             Some(Request::Files(f)) => Some(producer_key(&format!("job:{}", f.job))),
@@ -1429,6 +1433,9 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
     Ok(if ack.duplicate { j!({"duplicate": true}) } else { j!({"rows": n}) })
 }
+
+/// The name a write's table is attached under (`crm` of `crm.customers`, `crm.s.t`).
+fn attached_as(stmt: &Stmt) -> String { stmt.table().split('.').next().unwrap_or_default().to_string() }
 
 /// An INSERT's files written by every node at once (`spmd::insert`), when its query's rows split
 /// over them as they are; None: from here (`here`: a query that reads this machine's files, or a

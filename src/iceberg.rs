@@ -586,10 +586,19 @@ async fn spaces(app: &crate::server::App) -> Vec<(Vec<String>, std::sync::Arc<La
     out
 }
 
-/// A namespace from the URL (its parts joined by 0x1F, as the REST spec has it).
+/// A namespace from the URL (its parts joined by 0x1F, as the REST spec has it). An attached lake's
+/// only under its own sign-in (`users::across`), and not for a user granted some tables: an engine
+/// reads whole files, and only grants naming another database's tables count.
 async fn space(app: &crate::server::App, ns: &str) -> Result<(Vec<String>, std::sync::Arc<Lake>, String), (axum::http::StatusCode, axum::Json<Value>)> {
     let parts: Vec<&str> = ns.split('\u{1f}').collect();
-    spaces(app).await.into_iter().find(|(p, _, _)| *p == parts).ok_or_else(|| missing(&format!("namespace {}", parts.join(".")), "NoSuchNamespaceException"))
+    let found = spaces(app).await.into_iter().find(|(p, _, _)| *p == parts).ok_or_else(|| missing(&format!("namespace {}", parts.join(".")), "NoSuchNamespaceException"))?;
+    if !std::sync::Arc::ptr_eq(&found.1, &app.lake) {
+        crate::users::across(&found.1, &found.0[0]).await.map_err(|e| refused(403, "ForbiddenException", e.to_string()))?;
+        if crate::auth::limited().is_some() {
+            return Err(refused(403, "ForbiddenException", format!("permission denied: {} is another database: its tables are read through it (the database {})", found.0[0], found.0[0])));
+        }
+    }
+    Ok(found)
 }
 
 async fn namespaces(axum::extract::State(app): axum::extract::State<crate::server::App>) -> axum::Json<Value> {
