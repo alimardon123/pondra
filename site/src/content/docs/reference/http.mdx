@@ -316,7 +316,7 @@ token is refused.
 | `POST /login` | none | `{"user", "password"}`: a session for the user, `{"token": "ps_…", "until": ms}`, to send as `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`) |
 | `GET /whoami` | none | who the request signs in as: `{"user", "role", "superuser", "open"}` |
 | `GET /objects` | read | each table and view of this lake and the lakes attached to it: `catalog`, `schema`, `name`, `kind` (`table`, `view`, `materialized view`, or `files` for [a view of files](/pondra/reference/sql/)), and for a table its `rows` and `bytes` in files, `files`, `key`, `partition`, `cluster`, `publish`, `not_null`, `defaults`; for a view its `sql`. Also `files`: where the lake's own files are, for `read_csv('…')`. What the console's catalog shows |
-| `GET /kinds` | read | every kind of object a lake holds, `[{"kind", "family", "statements"}]`, as [`pondra.kinds`](/pondra/reference/system-columns/#every-object) lists them |
+| `GET /kinds` | read | every kind of object, part and pattern, one row each, as [`pondra.kinds`](/pondra/reference/system-columns/#every-object) lists them: `[{"kind", "is", "family", "inside", "statements", "privileges", "on_clone", "in_project", "undrop", "secret", "lists", "about", "also"}]`; a column that doesn't apply is `null`. The [glossary](/pondra/reference/glossary/) says what each one is |
 | `GET /metrics` | read | Prometheus metrics, as text |
 | `POST /tier` | admin | write the log into Parquet now: `{"rows_tiered": N}` |
 | `DELETE /sessions/{id}` | read | end a session: its temporary tables and views go, and so does its Python: `{"ended": true}` |

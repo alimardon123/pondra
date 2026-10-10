@@ -303,7 +303,10 @@ pub async fn raw(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta
 /// changed since.
 async fn current(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>, at: Option<u64>) -> Result<DataFrame> {
     use crate::sys::{with_sys, ROW_ID, VERSION};
-    let (upto, at) = (upto.or(Some(lake.visible())), at.or(upto)); // (as of one commit: a change writes both)
+    let upto = upto.or(Some(lake.visible()));
+    let at = at.or(upto); // (as of one commit: a change writes both. `at.or` of the `upto` given, None,
+    // read every old row while the table's own were read to `visible`: a reader whose view is behind
+    // its catalog's entries lost a changed row, `harness.py attached`)
     let dead = dead(lake, ctx, name, meta, at).await?;
     if dead.is_empty() {
         return raw(lake, ctx, name, meta, upto).await;
@@ -658,17 +661,17 @@ impl Pruned {
     }
 
     /// Any other table's rows, planned as a query of their own.
-    async fn planned(&self, meta: &TableMeta, range: Option<Expr>, projection: &[usize]) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    async fn planned(&self, meta: &TableMeta, range: Option<Expr>, projection: &[usize], upto: Option<u64>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let e = |e: anyhow::Error| datafusion::error::DataFusionError::External(e.into());
         let ctx = self.lake.session();
-        if self.meta.changed {
+        if meta.changed {
             // (the query this scan is part of may still swap the anti-join's sides: DataFusion
             // refuses once a join has built its dynamic filter)
             ctx.state_ref().write().config_mut().options_mut().set("datafusion.optimizer.enable_dynamic_filter_pushdown", "false").map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
         }
-        let df = match self.meta.changed {
-            true => current(&self.lake, &ctx, &self.name, meta, self.upto, self.at).await.map_err(e)?,
-            false => raw(&self.lake, &ctx, &self.name, meta, self.upto).await.map_err(e)?,
+        let df = match meta.changed {
+            true => current(&self.lake, &ctx, &self.name, meta, upto, self.at).await.map_err(e)?,
+            false => raw(&self.lake, &ctx, &self.name, meta, upto).await.map_err(e)?,
         };
         let df = match range {
             Some(r) => df.filter(r)?, // (reaches the Parquet reader: row groups outside it are skipped)
@@ -705,12 +708,20 @@ impl TableProvider for Pruned {
         };
         let filters: Vec<Expr> = filters.iter().cloned().chain(range.clone()).collect();
         let files = crate::manifest::pruned(&self.lake, &self.meta, self.manifests.as_deref(), &filters, &self.schema).await.map_err(e)?;
-        let meta = TableMeta { files, sealed: None, ..self.meta.clone() };
+        let mut meta = TableMeta { files, sealed: None, ..self.meta.clone() };
+        // The log's end is fixed first, then the table asked whether it changed since its entry was
+        // read: a change makes `{t}$deleted` in or before its commit, so one not there now means no
+        // row up to `upto` is a change's. (An entry read before a table's first UPDATE, its log read
+        // past it, kept both versions of the row: `harness.py attached`.)
+        let upto = Some(self.upto.unwrap_or_else(|| self.lake.visible()));
+        if !meta.changed && meta.key.is_empty() && meta.ext.is_none() {
+            meta.changed = self.lake.cat.get_raw(&crate::store::table_key(&crate::sys::deleted(&self.name))).await.map_err(e)?.is_some();
+        }
         let all: Vec<usize> = (0..self.schema.fields().len()).collect();
         let plain = !meta.changed && range.is_none() && meta.key.is_empty() && meta.ext.is_none() && self.lake.hot.on();
         let plan = match plain {
-            true => plain_scan(&self.lake, state, &self.name, &meta, self.upto, projection).await.map_err(e)?,
-            false => self.planned(&meta, range, projection.unwrap_or(&all)).await?,
+            true => plain_scan(&self.lake, state, &self.name, &meta, upto, projection).await.map_err(e)?,
+            false => self.planned(&meta, range, projection.unwrap_or(&all), upto).await?,
         };
         let Some((rows, bytes)) = self.share else { return Ok(plan) };
         // (with each column's distinct values and range, from the catalog: an aggregate over a
@@ -887,7 +898,9 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != PUBLIC) {
         default.register_schema(&s, Arc::new(MemorySchemaProvider::new()))?;
     }
-    for (key, raw) in lake.cat.scan_raw("t/", "t0").await? {
+    let entries = lake.cat.scan_raw("t/", "t0").await?;
+    lake.cat.settle().await?; // (the log read as far as these entries: `Catalog::settle`)
+    for (key, raw) in entries {
         let name = &key[2..];
         if name != except && !crate::sys::hidden(name) && (listing || mentions(&text, name)) {
             let meta: TableMeta = serde_json::from_slice(&raw)?; // (only the tables it names: decoding every one was half of a small query's time)
@@ -936,7 +949,9 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         if old {
             default.register_schema(&ns, Arc::new(MemorySchemaProvider::new()))?;
         }
-        for (key, raw) in other.cat.scan_raw("t/", "t0").await? {
+        let entries = other.cat.scan_raw("t/", "t0").await?;
+        other.cat.settle().await?; // (as this lake's own, above)
+        for (key, raw) in entries {
             let name = &key[2..];
             if crate::sys::hidden(name) || !(listing || mentions(&text, name)) {
                 continue;

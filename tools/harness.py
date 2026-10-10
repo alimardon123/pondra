@@ -8179,6 +8179,12 @@ def enums():
     return f"{sum(checks.values())} of {len(checks)} enum checks"
 
 
+# The object kinds `registry()` doesn't make itself, and where each is checked (grepped: each named
+# section or tool makes the kind and asserts on it). A kind added to KINDS without a check fails there.
+ELSEWHERE = {"external table": "harness.py external", "type": "harness.py enums", "secret": "harness.py secrets", "user": "harness.py users",
+             "database": "this section's branches, environments_check.py", "share": "sharing_check.py", "recipient": "sharing_check.py"}
+
+
 def registry():
     """The statement registry (ADR-049): every kind of object in `pondra.objects` with its comment and
     definition; `SHOW CREATE` of each kind runs again to the same object; `COMMENT ON` every kind,
@@ -8325,7 +8331,21 @@ def registry():
     here = q("SELECT name FROM pondra.databases")[0]["name"]
     dev_at, slim_at = f"{lake}-dev", f"{lake}-slim"
     LAKES.extend([dev_at, slim_at])
+    q("CREATE SECRET reg_secret (TYPE http, BEARER_TOKEN 'reg-token-1', SCOPE 'https://reg.example.com/')")  # (a secret the clone must leave)
     q(f"CREATE DATABASE dev LOCATION '{dev_at}' CLONE \"{here}\"")
+    # What the clone took, as the registry says (pondra.kinds' on_clone, read here, never written in), against what each lake lists
+    on_clone = {r["kind"]: r for r in q("SELECT * FROM pondra.kinds") if r["is"] == "object"}
+    cloned_families = ("schema", "relation", "routine", "task", "type", "secret")
+    lists = lambda rows: {(r["kind"], r.get("schema"), r["name"]) for r in rows if on_clone[r["kind"]]["family"] in cloned_families}
+    base = lists(q(f"SELECT kind, schema, name FROM pondra.objects WHERE lake = '{here}'"))
+    branch = lists(q("SELECT kind, schema, name FROM pondra.objects WHERE lake = 'dev'"))
+    how = lambda e: on_clone[e[0]]["on_clone"]
+    info["clone"] = {"base": sorted(map(str, base)), "branch": sorted(map(str, branch)),
+                     "missing_in_branch": sorted(str(e) for e in base if how(e) in ("copy", "pin") and e not in branch)}
+    checks["a clone takes what the registry says (copy, pin) and leaves what it says (leave): the secret stays the base's"] = \
+        not any(e in branch for e in base if how(e) == "leave") and all(e in branch for e in base if how(e) in ("copy", "pin")) \
+        and ("secret", None, "reg_secret") in base
+    q("DROP SECRET reg_secret")
     q(f"CREATE DATABASE slim LOCATION '{slim_at}' CLONE \"{here}\" WITH (schemas = (sales)) WITH NO DATA")
     q("COMMENT ON DATABASE dev IS 'a branch'")
     branches = {n: show("database", n) for n in ("dev", "slim")}
@@ -8344,6 +8364,20 @@ def registry():
     kinds = call(A.port, "GET", "/kinds")
     checks["GET /kinds and pondra.kinds list every kind and its statements"] = {k["kind"] for k in kinds} >= {"table", "view", "materialized view", "function", "procedure", "task", "schema"} \
         and q("SELECT statements FROM pondra.kinds WHERE kind = 'table'")[0]["statements"].startswith("CREATE, CREATE OR ALTER")
+    listed_kinds = q('SELECT kind, "is" FROM pondra.kinds')
+    object_kinds = {r["kind"] for r in listed_kinds if r["is"] == "object"}
+    made_kinds = {k for k, _, _ in made}
+    info["kinds"] = {"objects": sorted(object_kinds), "made": sorted(made_kinds), "elsewhere": sorted(ELSEWHERE),
+                     "unchecked": sorted(object_kinds - made_kinds - set(ELSEWHERE)), "unknown": sorted((made_kinds | set(ELSEWHERE)) - object_kinds)}
+    checks["every kind is checked: made here, or named in ELSEWHERE (a kind added without a check fails here)"] = object_kinds == made_kinds | set(ELSEWHERE)
+    names = [k["kind"] for k in kinds]
+    object_names = {k["kind"] for k in kinds if k["is"] == "object"}
+    checks["pondra.kinds and GET /kinds are one list: objects, parts and patterns, each answering its questions"] = \
+        sorted((r["kind"], r["is"]) for r in listed_kinds) == sorted((k["kind"], k["is"]) for k in kinds) and len(set(names)) == len(names) \
+        and all(k["statements"] and k["on_clone"] in ("copy", "pin", "leave") for k in kinds if k["is"] == "object") \
+        and all(k["inside"] and set(k["inside"]) <= object_names for k in kinds if k["is"] == "part") \
+        and all(k["lists"] for k in kinds if k["is"] == "pattern") \
+        and {k["kind"] for k in kinds if k["is"] == "object" and k["on_clone"] == "leave"} == {"secret", "share", "recipient"}
     missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'")]
     quiet = q("COMMENT IF EXISTS ON TABLE nothing_here IS 'x'")
     checks["what isn't there: refused by name, or nothing with IF EXISTS"] = missing == [500, 500, 500] and quiet.get("exists") is False
@@ -9260,18 +9294,64 @@ def friendly():
     return f"SQL as DuckDB's users write it: {len(same) + 1} forms answer as DuckDB does, samples sample, refusals by name, spread == one node"
 
 
+def attached():
+    """An attached lake read while its own leader changes rows, tiers and purges them: every read is
+    its table as of one commit (`Catalog::settle`, `Pruned::scan`). A reader's catalog entries are
+    the newest state while its log's end moves every 250 ms; reads that mixed the two lost a changed
+    row (336 of 607 reads on main 2801b4d), or kept both versions of a table's first changed row."""
+    other, lake = new_lake(), new_lake()
+    a = Node(other, A.port, tier_secs=0.5, env={"PONDRA_PURGE_ROWS": "1"}).start()  # (tiering and purging all the while)
+    b = Node(lake, A.port + 1).start()
+    firsts = [f"f{i}" for i in range(6)]  # (each changed once, while it is read)
+    for t in ["t"] + firsts:
+        sql(a.port, f"CREATE TABLE {t} (id BIGINT, amount DOUBLE)")
+        sql(a.port, f"INSERT INTO {t} VALUES (1, 1.5), (2, 3.0), (3, 4.5)")
+    sql(b.port, f"ATTACH '{other}' AS other")
+    until(lambda: _try(lambda: sql(b.port, "SELECT count(*) AS n FROM other.t")), [{"n": 3}], 15)
+    reads, wrong, stop = {}, [], threading.Event()
+    def read(tables):
+        while not stop.is_set():
+            for t in tables:
+                r = _try(lambda: sql(b.port, f"SELECT id, _version AS v FROM other.{t} ORDER BY id"))
+                reads[t] = reads.get(t, 0) + 1
+                if not isinstance(r, list) or [x["id"] for x in r] != [1, 2, 3]:
+                    wrong.append((t, r))
+    readers = [threading.Thread(target=read, args=(ts,)) for ts in (["t"], firsts)]
+    [r.start() for r in readers]
+    try:
+        for i in range(80):
+            sql(a.port, "UPDATE t SET amount = amount + 1 WHERE id = 1")
+            if i % 12 == 6 and i // 12 < len(firsts):
+                sql(a.port, f"UPDATE {firsts[i // 12]} SET amount = amount + 1 WHERE id = 1")
+            time.sleep(0.05)
+    finally:
+        stop.set()
+        [r.join() for r in readers]
+    [n.kill() for n in (a, b)]
+    checks = {
+        f"every read of a table of an attached lake while its leader updates, tiers and purges it holds each row once ({reads.get('t', 0)} reads)": reads.get("t", 0) > 50 and not any(t == "t" for t, _ in wrong),
+        "…and of tables read while their first UPDATE lands": all(reads.get(t, 0) > 3 for t in firsts) and not any(t in firsts for t, _ in wrong),
+    }
+    for name, good in checks.items():
+        print(f"attached: {name}: {'OK' if good else 'FAIL'}")
+    if not all(checks.values()):
+        print(f"attached: {len(wrong)} wrong, {wrong[:5]}")
+        sys.exit(1)
+    return "an attached lake read while its leader changes, tiers and purges rows: every read as of one commit"
+
+
 # About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
 # prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
 # suite in parts side by side that end together. A section not listed counts as 5 s.
 SECS = {"stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
-        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10}
+        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, scripts, hot, minmax, history, plans, learn, friendly, reader, crash, load)
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, scripts, hot, minmax, history, plans, learn, friendly, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -9299,7 +9379,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -9312,7 +9392,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

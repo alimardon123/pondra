@@ -1552,7 +1552,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    registry. A comment is `cm/{family}/{name}` (a column's by its stored name), moved by a rename and
    removed by a drop in `objects::follow`, which `ddl::apply` calls. `SHOW CREATE` of every kind, run
    again after a drop, makes the same object; `CREATE OR ALTER TABLE` never loses or reinterprets a
-   row, and refuses by name what it can't do by adding at the end or widening. `harness.py registry`.
+   row, and refuses by name what it can't do by adding at the end or widening. A kind's entry says
+   what code used to keep in lists of its own: its catalog prefix, its privileges, what a clone does
+   with it (`OnClone`: copy, pin or leave; `branch::make` leaves what it says), why a project can't
+   declare it (`deploy::head` asks the entry), whether it holds a secret, a line about it and other
+   products' names; `PARTS` and `PATTERNS` beside it, and `pondra.kinds` and `GET /kinds` one list of
+   all three (`objects::rows`), from which the glossary is written (`docs_check.py --write-glossary`;
+   a stale one fails). `pondra.objects` lists the attached lakes' objects of every family a lake
+   holds (not its users, databases, shares or recipients) for whoever may use them
+   (`users::across`, invariant 240), with their statements shown by their own lake's nodes.
+   `harness.py registry`: every kind made there or named where it is checked (`ELSEWHERE`), a clone
+   against `on_clone` (its schemas, routines and tasks were left out of the base's listing of it).
 228. **An `INSERT … SELECT` or `CREATE TABLE AS` is written by every node only when its rows split as
    they are, under one reserved commit** (`spmd::insert`, `writers`, `/cluster/insert`): the query's
    biggest append table sliced, the rest read whole, no exchange and no sort on top (a `GROUP BY`, a
@@ -1828,6 +1838,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    CLONE ON DATABASE` names the database it runs on. `environments_check.py --across`: "a pin asked with
    the token of a user without CLONE is refused", "dev_server's token … can't drop prod's table", "a
    clone of a schema dev_server has no CLONE on is refused".
+265. **A query reads a table as of one commit, its entry and its log alike** (`Catalog::settle`,
+   `Pruned::scan`, `query::current`). A node with no in-memory catalog (an attached lake, a follower
+   between seeds) reads entries as its reader holds them now, while its log's end (`visible`) moves
+   at each refresh; so right after a query reads them, the end is brought up to them (marks only:
+   pruning and seeding stay `refresh`'s, invariant 8). A scan then fixes its log's end before asking
+   whether a table its entry says never changed has a `{t}$deleted` now (a change makes it in or
+   before its commit), and the old rows it leaves out are those up to that same end. With the end
+   behind the entries an attached lake's changed row went missing (336 of 607 reads on main
+   2801b4d); with an entry read before a table's first UPDATE and its log read past it, a leader too
+   kept both versions. `harness.py attached` (55 wrong reads on 0.33.0).
 
 ## Tests: run these before and after any change
 
@@ -2466,7 +2486,7 @@ Known limits, in the order they matter:
     order-independent (not `avg`, `stddev`, …).
 13. **Frames and procedures** (round 22): a Python procedure starts a process per call (a warm
     pool would take the 0.15 s away) and doesn't run on a schedule yet; the JavaScript client has
-    no frame builder; `pondra run models/` (a folder of `.sql` and `.py` models in order of what
+    no frame builder; `pondra run etl/` (a folder of `.sql` and `.py` files in order of what
     reads what) is next; a `MERGE` from rows sent with a request needs the leader to receive it.
     `con.sql(query)` is lazy since round 22: it runs when its rows are asked for, each time.
 14. **Outside the lake** (round 23): another engine's table takes `INSERT`, not `UPDATE`,
@@ -2499,3 +2519,26 @@ signed packages, the docs).
   a beautiful result, scalability, power, and versatility.
 - The logo and colours come from `brand/` only; the console is extended through its registry
   (`window.pondra`), never by editing a copy of it.
+- **Every new concept is an object, a part or a pattern, and passes the checks for it**
+  (`designs/rules-for-new-kinds.md`):
+  - An **object** has a life of its own (a table, a model). It is a `Kind` in `KINDS`.
+  - A **part** lives and dies with one object (a column, a measure, a key, a link, a model's
+    version). It is a `Part` in `PARTS`, and its owner's lister yields it into `pondra.parts`.
+  - A **pattern** stores nothing and is read from objects and parts (the ontology, a flow, a
+    feature). It is a `Pattern` in `PATTERNS`, naming its listing function.
+  - Each entry carries a one-line description and other products' names for it (`also`).
+    `pondra.kinds` lists all three and the website's glossary is generated from it. `pondra.search`
+    finds all of them, by their names, descriptions and `also`.
+  - An object passes ten checks: (1) SQL's word, naming nothing else; (2) one registry entry, a
+    catalog prefix of its own, `schema.name`; (3) the same verbs, `SHOW CREATE` running again after
+    a drop, any other verb refused by name with Postgres's code; (4) its privileges asked by the one
+    check, its secret parts never shown; (5) its life cycle declared in its entry (rename, drop,
+    `UNDROP`, clone and `REFRESH`, deploy); (6) SQL at every door, a client verb only where SQL
+    can't, `register.objectKind`, a row in the doors matrix; (7) written by the leader, free when
+    unused, no service, within the bucket's limits; (8) a catalog shape older releases would misread
+    waits for the format; (9) `harness.py registry` walks it; (10) a reference page.
+  - A part takes its owner's verbs (`ALTER … ADD | DROP`, `COMMENT ON`), rights and life cycle,
+    shows in its owner's `SHOW CREATE`, and passes checks 1, 2 and 6 to 10.
+  - A pattern passes 1, 2 and 10.
+  - A plugin's entries also name their origin, live under `pl/{plugin}/`, and may not take a word
+    already used.
