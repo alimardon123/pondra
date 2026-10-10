@@ -1012,7 +1012,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    is never made a lake, the current folder only when named; `--lake` on a folder of lakes and
    `--lakes` on a lake are refused with the command meant; one lake's options (`--flight`,
    `--kafka`, `--attach`, `--advertise`, `--attach-found`) are refused with `--lakes`, and every
-   other reaches each database's node (`Options.node`). `harness.py server`.
+   other reaches each database's node (`Options.node`). A folder whose first node has claimed a
+   term but not yet made the catalog is a lake being made (`dbserver::is_lake`): nodes started at
+   once on a new folder by its name all join it (two of three exited). `harness.py server`,
+   `cluster.py race`.
 143. **A database's node isn't stopped while in use** (`dbserver::Busy`): an open Postgres
    connection or an HTTP request (until its answer's last byte) holds it; idle time counts from
    when the last one ended; `reap` checks again under the lock before it stops one. `harness.py
@@ -1315,12 +1318,25 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    only by columns it kept. PySpark's `spark.sql` sends its queries this way, its writes as
    Pondra's SQL. `harness.py sparksql` (its "by a column it leaves out" fails without the first).
 197. **A node that just started answers only once it holds what its leader had** (`cluster::catch_up`,
-   `Lake::caught_up`, in `query::session_at` and `write::on_node_as`; 10 s at most): restarted after
-   a failover, its catalog view reads no WAL, and what the new leader took over from the old one's
-   is flushed a moment after it leads, so a table made just before the kill was "not found" there.
-   A Flight log stream that follows a table skips the commits to other tables instead of sending
-   them as empty chunks. The website's `guides/clusters.mdx` (a node killed and restarted, then
-   asked for that table) failed one run in three under load without it; `cluster.py failover`.
+   `Lake::caught_up`, in `query::session_at` and `write::on_node_as`): restarted after a failover,
+   its catalog view reads no WAL, and what the new leader took over from the old one's is flushed a
+   moment after it leads, so a table made just before the kill was "not found" there. Only a node
+   reading the commit stream catches up (a view that replays the WAL has it all). It asks its leader
+   for 30 s (a new one answers once it has recovered, up to 20 s), a request waits 10 s, and then it
+   is refused with 57P03 (`store::CATCHING_UP`: the clients ask again, or another node), never
+   answered from the older catalog. Nor may the two wait on each other: a new leader asks its
+   members with the nodes' key (`users::node_key_made`, before `replica::recover`), and a lake's keys
+   reach every node's view as soon as they are made (a checkpoint), or a follower restarted soon
+   after the lake was made held the new leader's call 10 s, gave up catching up, and answered from
+   its older catalog. A Flight log stream that follows a table skips the commits to other tables
+   instead of sending them as empty chunks. The website's `guides/clusters.mdx` (a leader killed
+   seconds after the lake was made, then a node asked to INSERT into its table) failed one run in
+   three without it (PR #50's CI); `cluster.py failover`. A leader whose mark is old by the time a
+   node gives up asking died before the node started: it waits on (60 s at most) for whoever takes
+   over, which starts it again. The shell, `pondra run` and the project commands send nothing until
+   their node is ready (`shell::up`: `/ready`), so a shell opened on a lake whose only node was killed
+   answers once the lake is led again (`harness.py functions`' shell check, after every node is
+   killed, failed on PR #50's CI without both).
 
 198. **A variable's value is bound, never pasted, and lives where its statements do** (`vars.rs`,
    ADR-037): `DECLARE $day DATE = …` and `$day = …` (DuckDB's `SET VARIABLE`, `RESET VARIABLE`,
@@ -1751,6 +1767,67 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    once the rest are done. With one round for all, a table with an `INTERVAL` column stopped every
    table of the lake from leaving the log. (No test makes a table's round fail now that 257 holds;
    `harness.py tiering` runs the per-table path, its `spans` table beside the others.)
+259. **A share hands out the table it names only while that table is there** (`shares::tables_moved`,
+   from `ddl::drop_table`, `rename` and `drop_view`): a rename moves the share's entry to the new
+   name, still shared under the old one; a drop takes the table out of every share in the drop's own
+   commit, so a new table under its name is shared only once it is added (Snowflake's rule). A
+   share's and a recipient's comments are `cm/share/` and `cm/recipient/` (invariant 227), which a
+   branch never takes (`branch::make`). `sharing_check.py`: "a shared table renamed: still shared
+   under its name…" and "shares and recipients in pondra.objects with their comments…".
+260. **A lake's own keys are sealed by its master key when every node shares one** (`users::Kept`,
+   `seal_keys`; ADR-058). `z/auth` (the sessions' signing key, the nodes' key) is sealed as a
+   secret's values are (`ext::seal`), at format 3: from the first write when this process made the
+   lake, otherwise by its leader once every node knows format 3 (tried each minute). A new master
+   key, with the previous one set, rewraps it. The machine's own key never seals it
+   (`ext::shared_master`): a node on another machine couldn't open it. A key that only reads the
+   bucket (a branch on another server) must sign no one in. A lake's format only moves forward
+   (`format::set`), so a made lake's mark (`raise`) never lowers what its keys moved it to.
+   `harness.py secrets`: "…sealed from its first write (format 3): nothing of them in the clear in
+   its files", "…rewraps them…" and "…sealed when its leader starts with one…".
+   `upgrade_check.py format`: the release before refuses it by name.
+261. **A node that just started signs users in from what its leader had** (`server::guard`,
+   `App::open`, `users::keys`). A follower's mirror seeded before the leader flushed its first user
+   and its keys knows neither; it waited for its commit stream, which needed those keys to open, and
+   meanwhile took the lake for open and answered anyone as an admin. It reads the lake's keys from
+   its own view when its mirror lacks them (`Catalog::from_view`; they never change once written),
+   and every door asks whether the lake is open only once the node has caught up
+   (`Lake::caught_up`, 10 s at most); the cluster's own calls and the paths that need no sign-in are
+   never held. `harness.py secrets`: "a follower that joins once users sign in … answering nothing
+   unsigned meanwhile".
+262. **The planner takes a measured share in place of its estimate only while a door's query is
+   planned, and a spread query's every node plans with its coordinator's facts alone** (`learned.rs`:
+   `planning`, `given`, `share`; `Slice::learned`; ADR-050 §3). A filter over a table that a run
+   measured counts as the share of the table's rows it kept (`optimize::size`; `learned::found` takes
+   shares of the whole table as the planner counts it, never of a scan its files' ranges pruned), and
+   a join order whose every input is so counted needs only 1.2× to be taken. Each node's copy is read
+   from the history's newer rows at most every 10 s, and only while queries are planned. Facts are held
+   to a bar measured on the same node, as warm (`learned::ran`): the run after a query's 1st, 2nd, 4th,
+   8th… with them is planned without them, and runs with them a tenth slower than the best of those,
+   twice in a row, have them set aside. A query is known by its words (`key`: comments and spacing
+   left out, so a benchmark's numbered comment doesn't make each run a stranger; `EXPLAIN` of it is
+   it and records nothing): a bar measured cold, or by text alone, never held a run to anything.
+   `PONDRA_LEARN=off`: a node plans with none of its own, but a slice's still. A plan made anywhere
+   else (a view, a write's query) uses none. `harness.py learn`: the order starts from the filtered
+   customers once learned, on another node too (read from the history); same answer, no slower than an
+   equal node without; the bar run's plan among its runs; three nodes plan with the coordinator's
+   facts (a node with `PONDRA_LEARN=off` among them, fails without `Slice::learned`); read back after a
+   restart.
+263. **A lake attached READ_ONLY is read with its own key and written by nothing here** (`store::Reach`,
+   `ReadOnly`, `write::across`; ADR-058). Its store is built from the secret whose scope covers its URL
+   (`ext::reach`) and wrapped so every put, copy and delete fails by name. `write::deliver` sends it only
+   a branch's pin or unpin, to its leader at ENDPOINT, with a TYPE pondra secret's token or the branch's
+   own `pb_` key, never this server's key or its user's token. Nothing here claims its term, writes its
+   inbox or leads it for a moment. A branch of it keeps that key in its own catalog (`Make.secrets`) and
+   none of its users. It is read here by whoever may use that secret (`users::across`).
+   `environments_check.py --across`: the gate in front of the base's bucket counts no write, and "a write
+   to the attachment is refused by name".
+264. **CLONE pins a branch and does nothing else, and a clone takes only the schemas it covers**
+   (`users::Access::clones`, `server::guard`, `branch::cloning`, `branch::pin`'s `schemas`). A principal
+   below admin that holds CLONE reaches `/cluster/ddl` for a Pin only. The pin's answer names the schemas
+   its grant covers, and the clone refuses others before anything is made, letting the pin go. `GRANT
+   CLONE ON DATABASE` names the database it runs on. `environments_check.py --across`: "a pin asked with
+   the token of a user without CLONE is refused", "dev_server's token … can't drop prod's table", "a
+   clone of a schema dev_server has no CLONE on is refused".
 
 ## Tests: run these before and after any change
 
@@ -1778,6 +1855,7 @@ python3 tools/harness.py tails          # a table's log tail kept between querie
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
 python3 tools/harness.py plans          # EXPLAIN's expected rows, history's fingerprint, plan_id, version, reads, writes, misestimate; what a run learned and pondra.learned
+python3 tools/harness.py learn          # the planner uses what runs learned: the join order from a measured filter, on another node too; no slower; the bar; three nodes alike; a restart
 python3 tools/harness.py finishes       # GROUP BY views with avg, stddev, HAVING, ORDER BY/LIMIT == ad hoc: changes, EMIT FINAL, a restart, three nodes
 python3 tools/harness.py bykey          # views kept by key (median, count(DISTINCT), string_agg) == ad hoc: changes, flows, a restart, three nodes
 python3 tools/harness.py refreshed      # views run whole (ORDER BY … LIMIT, windows, joins, now() with a lag) == ad hoc: changes, flows, a restart, three nodes

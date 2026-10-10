@@ -377,7 +377,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let token = header.as_deref().and_then(|h| h.strip_prefix("Bearer "));
     let node = token.is_some_and(|t| t.starts_with("pn_") || app.auth.token_role(t) > crate::auth::Role::None); // (the cluster's own calls: never held)
     if starting && needed > crate::auth::Role::None && !node {
-        app.lake.caught_up().await; // (a node that just started signs users in from what its leader had: `open`)
+        let _ = app.lake.caught_up().await; // (a node that just started signs users in from what its leader had: `open`)
     }
     let signed = match &header {
         Some(h) => crate::users::who(&app.lake, &app.auth, Some(h)).await,
@@ -470,7 +470,7 @@ impl App {
         if self.auth.on() {
             return false;
         }
-        self.lake.caught_up().await;
+        let _ = self.lake.caught_up().await; // (still catching up after 10 s: its own catalog decides)
         !crate::users::any(&self.lake).await
     }
 }
@@ -701,11 +701,12 @@ impl App {
             }
             Ok((out, false))
         };
-        let out = run.await;
+        let (out, planned) = crate::learned::planning(query, run).await; // (planned with what runs learned, as its runs so far say)
         add(&QUERIES, 1);
         add(&QUERY_US, start.elapsed().as_micros() as u64);
         match out {
             Ok((batches, spread)) => {
+                crate::learned::ran(query, planned, start.elapsed()); // (never worse: facts that made it slower twice are set aside)
                 add(&SPREAD, spread as u64);
                 crate::history::rows(batches.iter().map(|b| b.num_rows() as u64).sum());
                 Ok(batches.into_iter().map(crate::query::compact).collect()) // (an answer kept or sent holds only its own strings)

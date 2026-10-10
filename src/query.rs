@@ -869,7 +869,7 @@ pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionCont
 /// `session`, this lake's tables as of log segment `upto` (every query in it reads the same rows).
 pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>) -> Result<SessionContext> {
     use crate::ddl::{mentions, split, PUBLIC};
-    lake.caught_up().await; // (a node that just started: not from an older catalog than its leader's)
+    lake.caught_up().await?; // (a node that just started: not from an older catalog than its leader's)
     let upto = upto.or_else(crate::txn::snapshot); // (in a transaction: as of its snapshot, its writes over it)
     use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
     let ctx = crate::settings::apply(lake.session()).await?; // (the session's `SET datafusion.…`)

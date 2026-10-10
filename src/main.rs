@@ -425,7 +425,7 @@ async fn run() -> anyhow::Result<()> {
                     let many = dbserver::holds_lakes(&p).await?;
                     // (this folder is made a lake only when named: `pondra serve .`; and a folder with
                     // other things in it, never: a mistyped path doesn't become a lake)
-                    let lake = std::path::Path::new(&p).join("catalog").is_dir();
+                    let lake = dbserver::is_lake(&p).await?; // (one being made too: nodes started at once)
                     anyhow::ensure!(given || many || lake, "no lake in this folder, and no lakes in its folders: `pondra serve lake` makes one at ./lake (or name yours: pondra serve <folder>)");
                     let empty = std::fs::read_dir(&p).map_or(true, |mut d| d.next().is_none());
                     anyhow::ensure!(many || lake || empty || ext::scheme(&p).is_some_and(|s| s != "file"), "{p} holds other things than lakes: serve a lake in it (pondra serve {p}/lake), or make one there anyway with --lake {p}");
@@ -561,6 +561,13 @@ async fn run() -> anyhow::Result<()> {
             tr("warming");
             let replica = if reader { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr))?) };
             if let (true, Some(own)) = (leader, &replica) {
+                // (the members are asked with the nodes' key: one that just restarted holds an
+                // unsigned call until it has caught up, and it catches up from this leader)
+                if std::env::var_os("PONDRA_NODE_KEY").is_none() {
+                    if let Some(k) = users::node_key_made(&lake).await {
+                        std::env::set_var("PONDRA_NODE_KEY", k);
+                    }
+                }
                 replica::recover(&lake, &addr, cluster.leader.n, Some(own)).await?;
             }
             tr("followers' changes recovered");
@@ -575,11 +582,17 @@ async fn run() -> anyhow::Result<()> {
             tr("the sequencer");
             python::init(python);
             let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
+            learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
             if leader {
                 let (l, c) = (app.lake.clone(), app.cluster.clone()); // (beside serving, not before it: C5)
                 panics::spawn(async move {
-                    if let Err(e) = users::make_keys(&l).await {
-                        eprintln!("the lake's keys (sessions', the nodes'): {e:#}"); // (sessions' signing key, and the nodes' own: `users.rs`)
+                    let made = users::kept(&l).await == "none";
+                    match users::make_keys(&l).await {
+                        Err(e) => eprintln!("the lake's keys (sessions', the nodes'): {e:#}"), // (sessions' signing key, and the nodes' own: `users.rs`)
+                        // (into every node's view at once: a node restarted before the next checkpoint
+                        // couldn't check the nodes' key, and held its new leader's calls 10 s)
+                        Ok(()) if made => l.cat.checkpoint().await.unwrap_or_else(|e| eprintln!("checkpoint: {e:#}")),
+                        Ok(()) => {}
                     }
                     match ext::rewrap(&l).await {
                         Ok(0) => {}
@@ -705,7 +718,9 @@ async fn run() -> anyhow::Result<()> {
                 format::raise(lake.clone(), cluster.clone()); // (once every node knows this build's format: ADR-039)
             } else {
                 format::watch(lake.clone());
-                cluster::catch_up(lake.clone(), cluster.leader.addr.clone()); // (answers wait until this node holds what the leader had)
+                if streamed {
+                    cluster::catch_up(lake.clone(), store.clone(), cluster.leader.clone()); // (answers wait until this node holds what the leader had; a view that replays the WAL has it)
+                }
                 match reader {
                     false => cluster.clone().follow(store),
                     true => cluster.clone().watch_leader(store, streamed), // a reader never votes or leads

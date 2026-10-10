@@ -857,10 +857,13 @@ impl OptimizerRule for JoinOrder {
         // Both costed the same way.
         let (Some((_, was)), Some((now, order))) = (as_written(&plan, equality)?, best) else { return Ok(Transformed::no(plan)) };
         if std::env::var_os("PONDRA_DEBUG_JOIN_ORDER").is_some() {
-            let named: Vec<String> = leaves.iter().zip(&sizes).map(|(l, s)| format!("{} ({} rows)", l.display(), s.rows)).collect();
+            let named: Vec<String> = leaves.iter().zip(&sizes).map(|(l, s)| format!("{} ({} rows{})", l.display(), s.rows, if s.learned { ", learned" } else { "" })).collect();
             eprintln!("join order: as written {was} rows moved, {now} in the order {order:?} of {named:?}");
         }
-        if order == asked || now.saturating_mul(margin()) >= was {
+        // Counts are trusted more than bounds: where every input's rows are a share a run measured,
+        // 1.2 times cheaper is enough (ADR-050 §3).
+        let margin = if sizes.iter().all(|s| s.learned) { (margin() as f64).min(1.2) } else { margin() as f64 };
+        if order == asked || now as f64 * margin >= was as f64 {
             return Ok(Transformed::no(plan));
         }
         // Rebuilt left-deep in that order: each join takes the keys that connect its input to what
@@ -941,12 +944,13 @@ struct Size {
     rows: u64,
     distinct: std::collections::HashMap<String, u64>,
     spans: std::collections::HashMap<String, (f64, f64)>, // (a table's columns' least and greatest values, as numbers: for its filters)
+    learned: bool, // (its rows are a share of its table a run measured: learned.rs)
 }
 
 impl Size {
     /// The same input cut to `rows` (a filter, or a join that kept some of them).
     fn cut(&self, rows: u64) -> Size {
-        Size { rows, distinct: self.distinct.iter().map(|(c, &n)| (c.clone(), n.min(rows))).collect(), spans: self.spans.clone() }
+        Size { rows, distinct: self.distinct.iter().map(|(c, &n)| (c.clone(), n.min(rows))).collect(), spans: self.spans.clone(), learned: false }
     }
 
     fn of(&self, e: &Expr) -> Option<u64> {
@@ -976,7 +980,7 @@ fn joined(a: &Size, b: &Size, on: &[(&Expr, &Expr)], rows: u64) -> Size {
         let n = distinct.get(&c).map_or(n, |had| n.min(*had)); // (the same name twice: take the smaller — the join looks no cheaper than it is)
         distinct.insert(c, n);
     }
-    Size { rows, distinct, spans: Default::default() }
+    Size { rows, distinct, spans: Default::default(), learned: false }
 }
 
 /// How many rows a join of `a` and `b` on `on` leaves: every row of one side meets the rows of the
@@ -1207,11 +1211,16 @@ fn size(plan: &LogicalPlan) -> Option<Size> {
             let columns = || s.source.schema().fields().iter().zip(&stats.column_statistics).map(|(f, c)| (f.name().clone(), c)).collect::<Vec<_>>();
             let distinct = columns().into_iter().filter_map(|(f, c)| Some((f, *c.distinct_count.get_value()? as u64))).collect();
             let spans = columns().into_iter().filter_map(|(f, c)| Some((f, (number(c.min_value.get_value()?)?, number(c.max_value.get_value()?)?)))).collect();
-            let whole = Size { rows: *stats.num_rows.get_value()? as u64, distinct, spans };
+            let whole = Size { rows: *stats.num_rows.get_value()? as u64, distinct, spans, learned: false };
             whole.cut(whole.rows.min(s.fetch.unwrap_or(usize::MAX) as u64)) // (its filters are counted by the Filter above it: a lake's tables take them inexactly)
         }
         LogicalPlan::Filter(f) => {
             let input = size(&f.input)?;
+            if let LogicalPlan::TableScan(s) = f.input.as_ref() {
+                if let Some(share) = crate::learned::share(&s.table_name, &f.predicate) {
+                    return Some(Size { learned: true, ..input.cut((input.rows as f64 * share).ceil() as u64) }); // (a share a run measured: `learned.rs`)
+                }
+            }
             input.cut((input.rows as f64 * kept(&input, &split_conjunction(&f.predicate))).ceil() as u64)
         }
         LogicalPlan::Projection(p) => size(&p.input)?,
@@ -1244,7 +1253,7 @@ mod tests {
     /// A table's size: its rows, and each column's (name, distinct values, least, greatest).
     fn table(rows: u64, columns: &[(&str, u64, f64, f64)]) -> Size {
         let distinct = columns.iter().map(|c| (c.0.to_string(), c.1)).collect();
-        Size { rows, distinct, spans: columns.iter().map(|c| (c.0.to_string(), (c.2, c.3))).collect() }
+        Size { rows, distinct, spans: columns.iter().map(|c| (c.0.to_string(), (c.2, c.3))).collect(), learned: false }
     }
 
     /// A month of 200 years of dates is a month of them (both ends of the range together), a year

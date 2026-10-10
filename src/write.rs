@@ -1222,7 +1222,7 @@ pub async fn on_node(app: &crate::server::App, stmt: Stmt, job: Option<String>) 
 #[inline(never)] // (its work on the heap, made here: `App::query_as`)
 pub fn on_node_as(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> futures::future::BoxFuture<'_, Result<Value>> {
     Box::pin(async move {
-        app.lake.caught_up().await; // (a node that just started: not against an older catalog than its leader's)
+        app.lake.caught_up().await?; // (a node that just started: not against an older catalog than its leader's)
         let out = crate::ext::listing(on_node_listed(app, stmt, job, files)).await?; // (files outside the lake: listed once a statement)
         seen_here(app).await;
         Ok(out)

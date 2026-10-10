@@ -33,12 +33,13 @@ ERRORS = [("500 Internal Server Error", "InternalError", "We encountered an inte
 class Faulty:
     """A proxy on 127.0.0.1:`port` (0: any free one) to `upstream`, its faults changed by `set`."""
 
-    def __init__(self, upstream, port=0, sign=None):
+    def __init__(self, upstream, port=0, sign=None, record=False):
         u = urllib.parse.urlsplit(upstream)
         self.tls, self.sign = u.scheme == "https", sign
         self.up = (u.hostname, u.port or (443 if self.tls else 80))
         self.host = u.hostname if u.port in (None, 443, 80) else f"{u.hostname}:{u.port}"
         self.faults, self.counts, self.lock = dict(OFF), {}, threading.Lock()
+        self.record, self.log = record, []  # (record: every forwarded request is logged, see `note`)
         proxy = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -56,6 +57,13 @@ class Faulty:
             def any(self):
                 if self.path.startswith("/__faults"):
                     return proxy.control(self)
+                self.started, self.sent, self.answered = time.time(), 0, 0
+                try:
+                    return self.forward()
+                finally:
+                    proxy.note(self)
+
+            def forward(self):
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 fault = proxy.draw(self.command)
                 if fault == "down":
@@ -69,6 +77,7 @@ class Faulty:
                     status, code, message = random.choice(ERRORS)
                     return self.answer(int(status[:3]), status[4:], [("Content-Type", "application/xml")],
                                        f"<?xml version='1.0' encoding='UTF-8'?><Error><Code>{code}</Code><Message>{message}</Message></Error>".encode())
+                self.sent = len(body)  # (what reached the store)
                 path, headers = self.path, {k: v for k, v in self.headers.items() if k.lower() != "connection"}
                 if proxy.sign:
                     path, headers = signed(self.command, path, headers, body, proxy.host, *proxy.sign)
@@ -105,6 +114,7 @@ class Faulty:
                 super().finish()
 
             def answer(self, status, reason, headers, data, length=None):
+                self.answered = status
                 self.send_response_only(status, reason)
                 for k, v in headers:
                     self.send_header(k, v)
@@ -169,6 +179,15 @@ class Faulty:
         with self.lock:
             data = json.dumps({"faults": self.faults, "counts": self.counts}).encode()
         h.answer(200, "OK", [("Content-Type", "application/json")], data)
+
+    def note(self, h):
+        """Logs one request the proxy forwarded (`record`): when it started and ended, what it was,
+        and how it was answered (0 where the proxy dropped it: `down`, `hang`, `lost`)."""
+        if self.record:
+            u = urllib.parse.urlsplit(h.path)
+            with self.lock:
+                self.log.append({"t0": h.started, "t1": time.time(), "method": h.command, "path": u.path,
+                                 "query": u.query, "status": h.answered, "bytes": h.sent})
 
     def close(self):
         self.server.shutdown()
