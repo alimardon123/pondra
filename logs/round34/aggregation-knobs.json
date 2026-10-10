@@ -1,0 +1,253 @@
+{
+ "what": "Two DataFusion knobs tried for big GROUP BYs (the SF10 gap: q18), as SET in the same request, interleaved, best of N rounds, one node, this box (4 cores, 15 GB). Neither is taken: each makes a few queries reliably slower.",
+ "target_partitions_8_vs_4": {
+  "totals": {
+   "tpch_sf1_memory": [
+    0.943,
+    0.855
+   ],
+   "tpcds_sf1_memory": [
+    7.489,
+    6.876
+   ],
+   "tpch_sf1_files": [
+    2.022,
+    1.927
+   ],
+   "clickbench_10m_memory": [
+    6.996,
+    6.81
+   ]
+  },
+  "rechecked_20_rounds": {
+   "q1.sql": {
+    "base": 0.0596,
+    "tp6": 0.0768,
+    "tp8": 0.0617
+   },
+   "q13.sql": {
+    "base": 0.077,
+    "tp6": 0.0583,
+    "tp8": 0.0537
+   },
+   "q18.sql": {
+    "base": 0.0736,
+    "tp6": 0.077,
+    "tp8": 0.0665
+   },
+   "q20.sql": {
+    "base": 0.0371,
+    "tp6": 0.038,
+    "tp8": 0.0407
+   },
+   "q21.sql": {
+    "base": 0.0751,
+    "tp6": 0.0708,
+    "tp8": 0.0641
+   },
+   "q9.sql": {
+    "base": 0.0699,
+    "tp6": 0.0655,
+    "tp8": 0.0577
+   },
+   "tpcds_q14.sql": {
+    "base": 0.3943,
+    "tp6": 0.4035,
+    "tp8": 0.3847
+   },
+   "tpcds_q27.sql": {
+    "base": 0.0677,
+    "tp6": 0.0721,
+    "tp8": 0.0721
+   },
+   "tpcds_q36.sql": {
+    "base": 0.0654,
+    "tp6": 0.0722,
+    "tp8": 0.0688
+   },
+   "tpcds_q44.sql": {
+    "base": 0.0281,
+    "tp6": 0.0296,
+    "tp8": 0.032
+   },
+   "tpcds_q46.sql": {
+    "base": 0.051,
+    "tp6": 0.0514,
+    "tp8": 0.0498
+   },
+   "tpcds_q87.sql": {
+    "base": 0.0434,
+    "tp6": 0.04,
+    "tp8": 0.0393
+   },
+   "tpcds_q93.sql": {
+    "base": 0.0476,
+    "tp6": 0.0464,
+    "tp8": 0.0377
+   },
+   "clickbench_q28.sql": {
+    "base": 0.1591,
+    "tp6": 0.1672,
+    "tp8": 0.1684
+   },
+   "clickbench_q31.sql": {
+    "base": 0.0557,
+    "tp6": 0.0565,
+    "tp8": 0.0554
+   },
+   "clickbench_q32.sql": {
+    "base": 0.0594,
+    "tp6": 0.059,
+    "tp8": 0.0611
+   }
+  },
+  "verdict": "5-9% less in all, from big groups and joins (TPC-H q13 0.70x, q9 0.83x, TPC-DS q93 0.79x); TPC-H q20 1.10-1.21x in three runs and TPC-DS q44 1.14x; spread queries would move twice the buckets. Not taken."
+ },
+ "skip_partial_aggregation_probe_ratio_threshold_0_2_vs_0_8": {
+  "totals": {
+   "tpch_sf1_memory": [
+    0.967,
+    0.911
+   ],
+   "tpch_sf1_files": [
+    2.04,
+    2.032
+   ],
+   "tpcds_sf1_memory": [
+    7.214,
+    7.077
+   ],
+   "clickbench_10m_memory": [
+    6.25,
+    5.663
+   ]
+  },
+  "rechecked_15_21_rounds": {
+   "tpch_q1.sql": {
+    "base": 0.0604,
+    "sp2": 0.0611
+   },
+   "tpch_q10.sql": {
+    "base": 0.0636,
+    "sp2": 0.066
+   },
+   "tpch_q13.sql": {
+    "base": 0.0849,
+    "sp2": 0.0599
+   },
+   "tpch_q18.sql": {
+    "base": 0.0854,
+    "sp2": 0.0857
+   },
+   "tpch_q19.sql": {
+    "base": 0.0664,
+    "sp2": 0.0704
+   },
+   "tpch_q3.sql": {
+    "base": 0.0353,
+    "sp2": 0.0356
+   },
+   "tpcds_q02.sql": {
+    "base": 0.0507,
+    "sp2": 0.0516
+   },
+   "tpcds_q03.sql": {
+    "base": 0.012,
+    "sp2": 0.0107
+   },
+   "tpcds_q14.sql": {
+    "base": 0.4311,
+    "sp2": 0.401
+   },
+   "tpcds_q17.sql": {
+    "base": 0.0506,
+    "sp2": 0.0591
+   },
+   "tpcds_q29.sql": {
+    "base": 0.0491,
+    "sp2": 0.0492
+   },
+   "tpcds_q49.sql": {
+    "base": 0.0632,
+    "sp2": 0.0654
+   },
+   "tpcds_q67.sql": {
+    "base": 0.533,
+    "sp2": 0.5057
+   },
+   "tpcds_q70.sql": {
+    "base": 0.0444,
+    "sp2": 0.0463
+   },
+   "tpcds_q78.sql": {
+    "base": 0.2503,
+    "sp2": 0.33
+   },
+   "tpcds_q82.sql": {
+    "base": 0.0348,
+    "sp2": 0.0315
+   },
+   "tpcds_q95.sql": {
+    "base": 0.1015,
+    "sp2": 0.109
+   },
+   "tpcds_q97.sql": {
+    "base": 0.0553,
+    "sp2": 0.0573
+   },
+   "tpcds_q99.sql": {
+    "base": 0.0455,
+    "sp2": 0.0467
+   },
+   "clickbench_q06.sql": {
+    "base": 0.101,
+    "sp2": 0.0973
+   },
+   "clickbench_q10.sql": {
+    "base": 0.0898,
+    "sp2": 0.0885
+   },
+   "clickbench_q13.sql": {
+    "base": 0.1072,
+    "sp2": 0.0822
+   },
+   "clickbench_q15.sql": {
+    "base": 0.1277,
+    "sp2": 0.1148
+   },
+   "clickbench_q16.sql": {
+    "base": 0.0671,
+    "sp2": 0.0739
+   },
+   "clickbench_q18.sql": {
+    "base": 0.1886,
+    "sp2": 0.1707
+   },
+   "clickbench_q19.sql": {
+    "base": 0.4291,
+    "sp2": 0.2998
+   },
+   "clickbench_q21.sql": {
+    "base": 0.0618,
+    "sp2": 0.0617
+   },
+   "clickbench_q24.sql": {
+    "base": 0.2963,
+    "sp2": 0.4048
+   },
+   "clickbench_q34.sql": {
+    "base": 0.4632,
+    "sp2": 0.3686
+   },
+   "clickbench_q35.sql": {
+    "base": 0.4553,
+    "sp2": 0.3952
+   },
+   "clickbench_q36.sql": {
+    "base": 0.0602,
+    "sp2": 0.0715
+   }
+  },
+  "verdict": "ClickBench 0.91x (q19 0.70x, q13 0.77x, q34 0.80x), TPC-H q13 0.71x; but TPC-DS q78 1.26x and 1.32x in two runs and ClickBench q36 (GROUP BY ClientIP) 1.13x and 1.19x: the probe decides on a partition's first 100,000 rows, and groups that repeat later lose their partial step. Not taken."
+ }
+}

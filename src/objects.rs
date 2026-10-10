@@ -7,7 +7,7 @@
 //!
 //! A new kind is an entry in `KINDS`, and its family's lister in `FAMILIES`: nothing else needs
 //! editing for it to be listed, described and shown. Comments are kept apart (`cm/{family}/{name}`,
-//! `cm/column/{table}/{stored column}`), and follow a rename or go with a drop (`follow`, from
+//! `cm/column/{table}/{stored column}`, a view's column by its name), and follow a rename or go with a drop (`follow`, from
 //! `ddl::apply`).
 use crate::ddl::{join, split, Ddl, PUBLIC};
 use crate::store::{json, table_key, Lake, TableMeta};
@@ -753,7 +753,10 @@ async fn there(lake: &Lake, key: &str) -> Result<bool> {
     Ok(match family {
         "relation" => !crate::sys::hidden(name) && (has(table_key(name)).await? || has(crate::ddl::query_key(name)).await? || has(crate::seq::key(name)).await? || has(crate::index::key(name)).await?),
         "column" => match name.rsplit_once('/') {
-            Some((t, c)) => lake.cat.get::<TableMeta>(&table_key(t)).await?.is_some_and(|m| m.live().any(|(s, _, _)| s == c)),
+            Some((t, c)) => match lake.cat.get::<TableMeta>(&table_key(t)).await? {
+                Some(m) => m.live().any(|(s, _, _)| s == c),
+                None => has(crate::ddl::query_key(t)).await?, // (a view's: SHOW CREATE shows those of the columns it has)
+            },
             None => false,
         },
         "routine" => has(crate::routines::key(name)).await?,
@@ -775,7 +778,10 @@ async fn comment(lake: &Lake, word: &str, name: &str, text: Option<String>, if_e
             let (table, column) = name.rsplit_once('.').context("COMMENT ON COLUMN table.column")?;
             let table = local(lake, table, "relation").await?;
             let meta = lake.cat.get::<TableMeta>(&table_key(&table)).await?.filter(|_| !crate::sys::hidden(&table));
-            let stored = meta.as_ref().and_then(|m| m.stored(column).map(str::to_string));
+            let stored = match &meta {
+                Some(m) => m.stored(column).map(str::to_string),
+                None => view_columns(lake, &table).await?.and_then(|c| c.into_iter().find(|c| c == column)),
+            };
             match stored {
                 Some(s) => format!("column/{table}/{s}"),
                 None if if_exists => return Ok(j!({"column": name, "exists": false})),
@@ -797,6 +803,19 @@ async fn comment(lake: &Lake, word: &str, name: &str, text: Option<String>, if_e
         None => lake.cat.commit(vec![], &[format!("cm/{key}")]).await?,
     };
     Ok(j!({word: name, "comment": text}))
+}
+
+/// A (stored) view's columns as its query names them now, or None for no such view. (Boxed: planning
+/// it expands SQL, which may show a SHOW CREATE, which comes back here.)
+fn view_columns<'a>(lake: &'a Lake, view: &'a str) -> BoxFuture<'a, Result<Option<Vec<String>>>> {
+    Box::pin(async move {
+        if lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(view)).await?.is_none() {
+            return Ok(None);
+        }
+        let sql = format!("SELECT * FROM {} LIMIT 0", name_sql(view));
+        let df = crate::query::sql(&crate::query::session(lake, &sql, "").await?, &sql).await?;
+        Ok(Some(df.schema().fields().iter().map(|f| f.name().clone()).collect()))
+    })
 }
 
 /// Does carrying out `d` drop or rename something a comment may be on?
@@ -983,11 +1002,19 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
         script.push(format!("COMMENT ON {word} {named} IS {}", literal(c)));
     }
     if o.family() == "relation" && o.lake == here {
-        if let Some(m) = lake.cat.get::<TableMeta>(&table_key(&o.local())).await? {
-            for (k, text) in lake.cat.scan::<String>(&format!("cm/column/{}/", o.local()), &format!("cm/column/{}0", o.local())).await? {
-                let stored = k.rsplit('/').next().unwrap_or_default();
-                script.push(format!("COMMENT ON COLUMN {named}.{} IS {}", ident(m.name_of(stored)), literal(&text)));
-            }
+        let meta = lake.cat.get::<TableMeta>(&table_key(&o.local())).await?;
+        let view = match meta {
+            None => view_columns(lake, &o.local()).await?,
+            Some(_) => None,
+        };
+        for (k, text) in lake.cat.scan::<String>(&format!("cm/column/{}/", o.local()), &format!("cm/column/{}0", o.local())).await? {
+            let stored = k.rsplit('/').next().unwrap_or_default();
+            let column = match (&meta, &view) {
+                (Some(m), _) => m.name_of(stored),
+                (None, Some(columns)) if columns.iter().any(|c| c == stored) => stored, // (a view's columns go by their names)
+                _ => continue,
+            };
+            script.push(format!("COMMENT ON COLUMN {named}.{} IS {}", ident(column), literal(&text)));
         }
     }
     Ok(Some(format!("SELECT {} AS definition", literal(&format!("{};", script.join(";\n"))))))

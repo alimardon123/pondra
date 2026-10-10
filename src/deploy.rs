@@ -1075,18 +1075,15 @@ pub fn is_own(name: &str) -> bool { matches!(name.to_ascii_lowercase().as_str(),
 /// `CALL plan('files/sales', env => 'prod')`, `CALL deploy('files/sales', env => 'prod', test => true,
 /// prune => false)`: the plan's lines, or the deploy's steps, as rows.
 pub async fn call(app: &App, name: &str, args: &[datafusion::sql::sqlparser::ast::FunctionArg], who: Who) -> Result<Outcome> {
-    use datafusion::sql::sqlparser::ast::{FunctionArg, FunctionArgExpr};
     let apply = name.to_ascii_lowercase().ends_with("deploy");
     let verb = if apply { Verb::Deploy } else { Verb::Plan };
-    let mut select = vec![];
-    for (i, a) in args.iter().enumerate() {
-        select.push(match a {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) if i == 0 => format!("CAST(({e}) AS VARCHAR) AS folder"),
-            FunctionArg::Named { name, arg: FunctionArgExpr::Expr(e), .. } if ["env", "test", "prune", "commit"].contains(&crate::write::ident(name).as_str()) => format!("({e}) AS {}", crate::write::ident(name)),
-            _ => bail!("{name}('files/sales', env => 'prod'{}): the project's folder in the workspace, then env (and test, prune) by name", if apply { ", test => true" } else { "" }),
-        });
+    let a = crate::routines::args(name, args)?;
+    ensure!(!a.given.is_empty(), "{name}: the project's folder in the workspace ('files/sales')");
+    if a.given.len() > 1 || a.named.iter().any(|(n, _)| !["env", "test", "prune", "commit"].contains(&n.as_str())) {
+        bail!("{name}('files/sales', env => 'prod'{}): the project's folder in the workspace, then env (and test, prune) by name", if apply { ", test => true" } else { "" });
     }
-    ensure!(!select.is_empty(), "{name}: the project's folder in the workspace ('files/sales')");
+    let mut select = vec![format!("CAST(({}) AS VARCHAR) AS folder", a.given[0])];
+    select.extend(a.named.iter().map(|(n, e)| format!("({e}) AS {n}")));
     let rows = app.query(&format!("SELECT {}", select.join(", ")), None).await?;
     let v = rows_json(&rows, 1)?.into_iter().next().unwrap_or_default();
     let folder = crate::files::under_files(v["folder"].as_str().unwrap_or_default());

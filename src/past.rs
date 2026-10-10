@@ -169,17 +169,15 @@ pub fn table_factor(lake: &Lake, t: &mut ast::TableFactor) -> Result<bool> {
         return Ok(false);
     }
     let shape = "t AT (VERSION => n), AT (TIMESTAMP => t) or AT (OFFSET => -seconds)";
-    let table = match args.args.first() {
-        Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::Identifier(i)))) => crate::write::ident(i),
-        Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::CompoundIdentifier(parts)))) => parts.iter().map(crate::write::ident).collect::<Vec<_>>().join("."),
+    let a = crate::routines::args("AT", &args.args).map_err(|_| anyhow!("{shape}"))?;
+    let table = match a.given.first() {
+        Some(ast::Expr::Identifier(i)) => crate::write::ident(i),
+        Some(ast::Expr::CompoundIdentifier(parts)) => parts.iter().map(crate::write::ident).collect::<Vec<_>>().join("."),
         _ => bail!("{shape}: after a table's name"),
     };
     let table = crate::ddl::local(lake, &table).ok_or_else(|| anyhow!("{table} AT (…): only this lake's tables are read as they were (ask a node of that lake)"))?;
-    let (at, expr) = match args.args.get(1) {
-        Some(ast::FunctionArg::Named { name, arg: ast::FunctionArgExpr::Expr(e), .. }) => (name.value.to_lowercase(), e.to_string()),
-        _ => bail!("{shape}"),
-    };
-    ensure!(args.args.len() == 2 && ["version", "timestamp", "offset"].contains(&at.as_str()), "{shape}");
+    ensure!(a.given.len() == 1 && a.named.len() == 1 && ["version", "timestamp", "offset"].contains(&a.named[0].0.as_str()), "{shape}");
+    let (at, expr) = (a.named[0].0.clone(), a.named[0].1.to_string());
     let spec = B64.encode(serde_json::to_vec(&Spec { table, at, expr })?);
     let ast::TableFactor::Table { name, args, .. } = t else { unreachable!() };
     (*name, *args) = (ast::ObjectName::from(vec![ast::Ident::with_quote('"', format!("at:{spec}"))]), None);
