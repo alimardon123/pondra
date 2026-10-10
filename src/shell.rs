@@ -62,8 +62,9 @@ pub(crate) async fn up(base: &str, node: &mut Child, log: &Path) -> Result<reqwe
 /// `pondra run`: a script (`{"sql", "params"}`) on a node started for it, or on `url`; its answer
 /// (rows as a table).
 pub async fn script(dir: &str, url: Option<&str>, token: Option<&str>, body: serde_json::Value) -> Result<String> {
+    let session = format!("shell-{}", uuid::Uuid::new_v4().simple()); // (one session for the script: its statements share it)
     let send = |http: reqwest::Client, base: String, key: String| async move {
-        let mut r = http.post(format!("{base}/sql?format=table")).header("x-pondra-owner", key).json(&body);
+        let mut r = http.post(format!("{base}/sql?format=table")).header("x-pondra-owner", key).header("x-pondra-session", session).json(&body);
         if let Some(t) = token {
             r = r.bearer_auth(t);
         }
@@ -118,6 +119,9 @@ async fn databases(http: &reqwest::Client, base: &str) -> Result<Vec<String>> {
 /// terminal: there, an error is just the answer).
 async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path) -> Result<bool> {
     let http = up(base, node, log).await?;
+    // One session for the whole shell: SET, USE, DECLARE, temporary tables and BEGIN last from one
+    // line to the next (a session is the `x-pondra-session` header, `temp.rs`).
+    let session = format!("shell-{}", uuid::Uuid::new_v4().simple());
     let tty = std::io::stdin().is_terminal();
     if tty {
         let others = databases(&http, base).await.unwrap_or_default();
@@ -145,7 +149,7 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
         sql = rest;
         for statement in statements.iter().filter(|s| !s.trim().is_empty()) {
             let at = Instant::now();
-            let answer = match http.post(format!("{base}/sql?format=table")).header("x-pondra-owner", key).body(statement.trim().to_string()).send().await {
+            let answer = match http.post(format!("{base}/sql?format=table")).header("x-pondra-owner", key).header("x-pondra-session", &session).body(statement.trim().to_string()).send().await {
                 Ok(r) => Ok((r.status().is_success(), notices(r.headers()), r.text().await.unwrap_or_default())),
                 Err(_) if node.try_wait()?.is_some() => bail!("the node stopped: {}", std::fs::read_to_string(log).unwrap_or_default()),
                 Err(e) => Err(e),

@@ -1044,7 +1044,7 @@ pub async fn stored_views(lake: &Lake, sql: &str, listing: bool) -> Result<Vec<(
         }
         for (k, raw) in more {
             let v: crate::ddl::StoredView = serde_json::from_slice(raw)?;
-            let sql = crate::routines::expand(lake, &v.sql).await?; // (macros as they are now)
+            let sql = crate::routines::expand_stored(lake, &v.sql).await?; // (macros as they are now; the path it was made under is in its text)
             text.push_str(&format!(" {sql}"));
             views.push((k[2..].to_string(), sql));
         }

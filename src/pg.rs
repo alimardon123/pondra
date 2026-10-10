@@ -196,6 +196,7 @@ impl Backend {
             return Ok(Response::Execution(Tag::new(tag)));
         }
         let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: its value; `$1` is the protocol's)
+        let bound = self.placed(bound.into_owned()).await?; // (the session's search path: full names, ahead of the key lookup)
         let sql: &str = &bound;
         let reader = crate::auth::current().is_some_and(|p| p.role >= crate::auth::Role::Read);
         if reader && crate::txn::open() && crate::txn::refuse().is_ok() {
@@ -449,14 +450,15 @@ impl Backend {
 /// psql, JDBC and SQLAlchemy ask for a few Postgres-only things on connect.
 fn pg_dialect(lake: &crate::store::Lake, sql: &str, user: &str) -> String {
     let sql = sql.trim().trim_end_matches(';');
+    let schema = crate::path::current(lake).map_or_else(|| "public".to_string(), |p| p.schema().to_string()); // (the session's current schema)
     let sql = match crate::pg_catalog::wanted(sql) {
-        true => crate::pg_catalog::rewrite(sql, user),
+        true => crate::pg_catalog::rewrite(sql, user, &schema),
         false => sql.to_string(),
     };
     let sql = if sql.eq_ignore_ascii_case("select version()") { "SELECT version() AS version".into() } else { sql }; // (the column's name in Postgres)
     // (the ADBC driver's list of types: receive functions are names here, not function ids)
     let sql = sql.replace("(typreceive != 0 OR typsend != 0)", "true").replace("typreceive::TEXT", "typreceive");
-    sql.replace("current_schema()", "'public'").replace("CURRENT_SCHEMA()", "'public'").replace("current_database()", &format!("'{}'", crate::ddl::lake_name(lake))).replace("version()", "'PostgreSQL 16.0 (Pondra on Apache DataFusion)'")
+    sql.replace("current_schema()", &format!("'{schema}'")).replace("CURRENT_SCHEMA()", &format!("'{schema}'")).replace("current_database()", &format!("'{}'", crate::ddl::lake_name(lake))).replace("version()", "'PostgreSQL 16.0 (Pondra on Apache DataFusion)'")
 }
 
 /// The command tag Postgres answers a write with: `INSERT 0 3`, `UPDATE 2`, `SELECT 5` for a
@@ -509,6 +511,7 @@ fn session_command(sql: &str) -> Option<Response> {
         "SHOW" if !sql.to_lowercase().contains("tables") && !sql.to_lowercase().contains("datafusion.") && !sql.to_lowercase().trim_end_matches(';').trim().ends_with(" all") => {
             let name = sql.split_whitespace().skip(1).collect::<Vec<_>>().join(" ").trim_end_matches(';').to_lowercase();
             setting(&crate::settings::shown(&name).unwrap_or_else(|| match name.as_str() {
+                "search_path" => "public".into(), // (no session path: this lake's public, as Postgres's `"$user", public` in its usual setup)
                 s if s.contains("standard_conforming_strings") => "on".into(),
                 s if s.contains("transaction") => "read committed".into(),
                 s if s.contains("server_version") => "16.0".into(),
@@ -889,8 +892,18 @@ impl Backend {
         types
     }
 
+    /// `sql` with the session's search path written in (`path.rs`). Only a session that set one:
+    /// without, `pg_dialect` answers `current_schema()`, and drivers' catalog queries go on as sent.
+    async fn placed(&self, sql: String) -> PgWireResult<String> {
+        match crate::path::current(&self.app.lake) {
+            Some(_) => crate::path::door(&self.app.lake, &sql, &Default::default()).await.map_err(user_error),
+            None => Ok(sql),
+        }
+    }
+
     /// The columns a statement returns (none for writes and session commands).
     async fn describe(&self, sql: &str, format: &Format) -> PgWireResult<Vec<FieldInfo>> {
+        let sql = &self.placed(sql.to_string()).await?; // (the session's search path, as `run` has it)
         let point = match crate::auth::limited() {
             None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| p.schema().ok()), // (a key lookup's columns, unplanned, first)
             Some(_) => None,

@@ -66,6 +66,7 @@ mod tls;
 mod txn;
 mod mcp;
 mod pg;
+mod path;
 mod pg_catalog;
 mod project;
 mod protect;
@@ -804,6 +805,8 @@ async fn run() -> anyhow::Result<()> {
             let _ = attached;
         }
         Cmd::Sql { dir, query, attach: attached } => {
+            // `USE` sets a session's path, and this command has no session (`path.rs`).
+            anyhow::ensure!(!path::is_use(&query) && path::set_schema(&query).is_none(), "{}", settings::NO_SESSION);
             // As a node takes SQL: functions and files (`read_csv(…)`, `'x.parquet'`) expanded, then
             // a write or a query. A write to a folder with no lake yet makes one.
             let lake = match write::parse(&query) {
