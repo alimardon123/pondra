@@ -144,11 +144,11 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
             return;
         };
         // (a column the batch leaves out: its DEFAULT)
-        let (m, sch) = (&meta, &schema);
+        let (m, sch, lk) = (&meta, &schema, &lake);
         let conformed = |b: RecordBatch| async move {
             let given: Vec<String> = b.schema().fields().iter().map(|f| f.name().clone()).collect();
             let rows = crate::query::conform(&b, sch)?;
-            crate::defaults::fill(m, rows, |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(b.num_rows()))).await
+            crate::defaults::fill(lk, m, rows, |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(b.num_rows()))).await
         };
         let mut i = 0;
         while let Some(b) = batches.next().await {

@@ -151,6 +151,9 @@ pub async fn file(lake: &Lake, seq: &crate::log::Sequencer, commits: &[FileCommi
                 Some(m) => m,
                 None => c.new.clone().with_context(|| format!("no table {}", c.table))?,
             };
+            if !c.added.is_empty() {
+                crate::constraints::door(&meta, &c.table)?; // (an enforced UNIQUE's rows are checked on the leader: `constraints.rs`)
+            }
             let (removed, deleted) = carry(lake, &c.table, &meta, c).await?;
             let gone = take_out(lake, &c.table, &mut meta, &removed).await?;
             let hit = mark(lake, &c.table, &mut meta, &deleted).await?;
@@ -191,6 +194,7 @@ pub async fn file(lake: &Lake, seq: &crate::log::Sequencer, commits: &[FileCommi
             }
             Outcome::Retry(r) if r.is_empty() => tokio::time::sleep(std::time::Duration::from_millis(10)).await, // (views changed: derive again)
             Outcome::Retry(_) => return Ok(None),
+            Outcome::Refused(why) => anyhow::bail!(why),
         }
     }
 }
@@ -211,8 +215,10 @@ pub async fn upserts(lake: &Lake, seq: &crate::log::Sequencer, table: &str, rows
     loop {
         match seq.submit(crate::log::pack(lake, std::slice::from_ref(&append)).await?).await? {
             Outcome::Retry(r) if r.is_empty() => tokio::time::sleep(std::time::Duration::from_millis(10)).await, // (views changed: derive again)
+            Outcome::Acks(a) if a.iter().any(|a| a.refused) => anyhow::bail!("{table} has a UNIQUE constraint: another engine's change to it isn't checked"),
             Outcome::Acks(a) => return Ok(a.iter().all(|a| !a.duplicate)),
             Outcome::Retry(_) => return Ok(false),
+            Outcome::Refused(why) => anyhow::bail!(why),
         }
     }
 }

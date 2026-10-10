@@ -78,6 +78,7 @@ pub struct Session {
     pub settings: std::collections::BTreeMap<String, String>,       // SET name = value (`settings.rs`)
     pub prepared: HashMap<String, String>,                          // PREPARE name AS …: its text
     pub variables: std::collections::BTreeMap<String, crate::vars::Var>, // DECLARE $name …, $name = … (`vars.rs`)
+    pub currval: HashMap<String, i64>,                              // each sequence's last value its nextval gave (`seq.rs`)
     used: Option<Instant>,
     version: u64, // changes so far (`live.rs` watches them)
 }
@@ -281,6 +282,8 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
     let spec: Value = serde_json::from_str(&crate::write::create_spec(c, &app.lake, files).await?)?;
     let keyed = spec["key"].as_array().is_some_and(|k| !k.is_empty()) || spec["merge"].as_object().is_some_and(|m| !m.is_empty());
     ensure!(!keyed, "{name}: a temporary table keeps its rows as they come (PRIMARY KEY and merge are a lake table's)");
+    ensure!(spec["enums"].as_object().is_none_or(|e| e.is_empty()), "{name}: a temporary table's columns are plain types (an enum column is a lake table's)");
+    ensure!(!spec["constraints"].as_array().is_some_and(|k| k.iter().any(|k| k["enforced"] == true)), "{name}: a temporary table keeps its rows as they come (UNIQUE is a lake table's; NOT ENFORCED keeps none)");
     let columns: Vec<(String, String)> = serde_json::from_value(spec["columns"].clone())?;
     let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::write::stored(&crate::query::dtype(t)?))))).collect::<Result<Vec<_>>>()?;
     ensure!(columns.iter().all(|(c, _)| !crate::sys::NAMES.contains(&c.as_str())), "{}: system columns (every table has them)", crate::sys::NAMES.join(", "));

@@ -32,6 +32,7 @@ Columns take these types. A list is written `type[]`, such as `FLOAT[]` for an e
 | `BYTEA` | `BINARY`, `VARBINARY`, `BLOB` | bytes |
 | `JSON` | `VARIANT` | JSON text, read with `json_get` and `->` (see [functions](/pondra/reference/functions/)) |
 | `type[]` | | a list of one type |
+| an enum type, or `ENUM('a', 'b')` | | text, one of its labels ([enum types](#enum-types)) |
 
 A `TIMESTAMPTZ` written with an offset (`'2026-09-29 10:00:00+05'`) is stored as the instant it names,
 so it reads back as `2026-09-29T05:00:00Z`. A time may leave out its seconds, as in Postgres and
@@ -42,6 +43,41 @@ DuckDB: `'2024-05-01 10:30'` is a timestamp in `INSERT`, `CAST`, `TIMESTAMP '…
 A value that doesn't cast to its column's type is refused, and the error names the value: `'abc'` into
 a `BIGINT` is an error, never a `NULL`. `substr`, `substring(b FROM 2 FOR 1)` and `byte_length` work
 on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
+
+### Enum types
+
+| Statement | Syntax |
+|---|---|
+| Make one | `CREATE TYPE [IF NOT EXISTS] name AS ENUM ('label', …)` |
+| Add a label | `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label' [BEFORE \| AFTER 'label']` |
+| Rename | `ALTER TYPE name RENAME TO new_name` |
+| Drop | `DROP TYPE [IF EXISTS] name [, …]` |
+
+A column of an enum type holds text: other engines and every client read it as a string. Every way
+of writing rows (`INSERT`, `UPDATE`, `MERGE`, `COPY`, appends, Kafka, Flight, `pondra sql`) refuses
+a value its labels don't list, with Postgres's code `22P02`; `NULL` is allowed. A column may also say
+its labels itself, as MySQL and DuckDB write it: `size ENUM('s', 'm', 'l')`. `'happy'::mood` is a
+label checked as it is read, and `enum_range(NULL::mood)`, `enum_first` and `enum_last` give the
+labels in their order. Values compare and sort as text; `array_position(enum_range(NULL::mood),
+feeling)` is their place. A label is never renamed or taken away (the rows keep the text they were
+written with), a type isn't dropped while a column uses it (`2BP01`), and a temporary table's
+columns take no enum. A type is listed in `pondra.objects`, shown by `SHOW CREATE TYPE` and
+described by `COMMENT ON TYPE`; over Postgres its columns are `text`.
+
+```sql
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TABLE moods (who VARCHAR, feeling mood);
+INSERT INTO moods VALUES ('ann', 'happy'), ('bo', 'sad');
+ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok';
+SELECT who, feeling, array_position(enum_range(NULL::mood), feeling) AS place FROM moods ORDER BY place;
+```
+
+```text
+ who | feeling | place
+-----+---------+-------
+ bo  | sad     |     1
+ ann | happy   |     4
+```
 
 ## Queries
 
@@ -163,7 +199,7 @@ past starts when it was made.
 
 | Statement | Syntax |
 |---|---|
-| Create | `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY] [MERGE sum\|count\|min\|max], … [, PRIMARY KEY (column, …)] [, CONSTRAINT name CHECK (condition)]) [PARTITION BY expression] [CLUSTER BY (column, …)] [SEQUENCE BY column] [TTL column + INTERVAL '…'] [WITH (option = value, …)]`: the layout clauses in any order ([table options](/pondra/reference/table-options/)) |
+| Create | `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY] [UNIQUE] [REFERENCES u (column) NOT ENFORCED] [MERGE sum\|count\|min\|max], … [, PRIMARY KEY (column, …)] [, [CONSTRAINT name] CHECK (condition) \| UNIQUE (column, …) \| FOREIGN KEY (column, …) REFERENCES u (column, …) NOT ENFORCED]) [PARTITION BY expression] [CLUSTER BY (column, …)] [SEQUENCE BY column] [TTL column + INTERVAL '…'] [WITH (option = value, …)]`: the layout clauses in any order ([table options](/pondra/reference/table-options/)) |
 | Create like another | `CREATE TABLE t LIKE s`: an empty table with `s`'s columns and their types, as Postgres's does |
 | Create from a query | `CREATE TABLE t AS SELECT …`, `CREATE TABLE t (a INT, b VARCHAR) AS VALUES …`, or `SELECT … INTO t FROM …` |
 | Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type` |
@@ -171,6 +207,8 @@ past starts when it was made.
 | Rename a table | `ALTER TABLE t RENAME TO u` |
 | Drop a column | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` |
 | Widen a column | `ALTER TABLE t ALTER COLUMN c TYPE BIGINT` |
+| Add a constraint | `ALTER TABLE t ADD [CONSTRAINT name] UNIQUE (column, …) \| CHECK (condition) \| FOREIGN KEY (…) REFERENCES u (…) NOT ENFORCED` |
+| Drop a constraint | `ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name` |
 | Change the layout | `ALTER TABLE t CLUSTER BY (user)`, `ALTER TABLE t TTL ts + INTERVAL '2 hours'`, `ALTER TABLE t SEQUENCE BY ts` |
 | Change options | `ALTER TABLE t SET (publish = delta, retention = '7 days')` |
 | Empty | `TRUNCATE [TABLE] t` |
@@ -208,6 +246,29 @@ is false is refused with `23514` (`new row for relation "t" violates check const
 `NULL` passes, as in Postgres. One without a name is named as Postgres names it: `{table}_{column}_check`
 on a column, `{table}_check` on the table.
 
+A `UNIQUE` column, or columns, never holds a value twice: an `INSERT`, `INSERT … SELECT`,
+`UPDATE`, `MERGE` or transaction that would give one a second time is refused with `23505`
+(`duplicate key value violates unique constraint "users_email_key"`), from any node, over Postgres
+and from `pondra sql`. The leader checks every write to the table under the lake's lock, so two
+writers on two nodes can never both add one value. A statement is checked as a whole, as the SQL
+standard has it: an `UPDATE` that swaps two values holds. `NULL`s are distinct, as by default in
+Postgres. In a table with a key, a key's new version may keep its own value. A UNIQUE table takes its
+rows through SQL: `POST /append`, `COPY … FROM STDIN`, Kafka, Flight and other engines' commits skip
+the leader's check, so they are refused for it, by name. `ALTER TABLE … ADD CONSTRAINT … UNIQUE`
+checks the rows already there (`23505` if two share a value, and nothing is kept). One without a name
+is named as Postgres names it: `{table}_{columns}_key`.
+
+`NOT ENFORCED` keeps a constraint as a fact about the data, for the tools that read it
+(`information_schema`, `pg_constraint`, BI tools' joins, `SHOW CREATE`), and checks nothing: a
+`PRIMARY KEY … NOT ENFORCED` makes no key, so the table takes rows as they come. A `FOREIGN KEY`
+must say `NOT ENFORCED`, since nothing checks a reference yet. A renamed column keeps its
+constraints; a dropped one takes them with it.
+
+```sql
+CREATE TABLE members (id BIGINT, email VARCHAR UNIQUE, team BIGINT REFERENCES teams (id) NOT ENFORCED);
+ALTER TABLE members ADD CONSTRAINT one_handle UNIQUE (team, id);
+```
+
 `ALTER TABLE … ADD COLUMN … NOT NULL` and `… DEFAULT` are refused, because the rows already there
 would need a value and no file is rewritten. Add the column, then `UPDATE` it.
 
@@ -238,6 +299,83 @@ DROP TABLE large_orders;
 UNDROP TABLE large_orders;
 DROP TABLE large_orders PURGE;
 TRUNCATE accounts;
+```
+
+### Sequences and identity columns
+
+| Statement | Syntax |
+|---|---|
+| Make a sequence | `CREATE [OR REPLACE] SEQUENCE [IF NOT EXISTS] s [AS smallint\|integer\|bigint] [INCREMENT [BY] n] [MINVALUE n \| NO MINVALUE] [MAXVALUE n \| NO MAXVALUE] [START [WITH] n] [CACHE n] [[NO] CYCLE]`, the options in any order |
+| Its next value | `nextval('s')` |
+| The last value this session took | `currval('s')` |
+| Set it | `setval('s', n)`: the next value is the one after `n`; `setval('s', n, false)`: it is `n` |
+| Change it | `ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]`, `… INCREMENT BY n` (or any option above), `… RENAME TO t` |
+| Drop | `DROP SEQUENCE [IF EXISTS] s [, …]` |
+| A column numbered for you | `id BIGINT GENERATED ALWAYS AS IDENTITY`, `… GENERATED BY DEFAULT AS IDENTITY (START WITH 100)`, `SERIAL`, `BIGSERIAL`, `SMALLSERIAL`, `AUTO_INCREMENT`, `IDENTITY(1, 1)`, `AUTOINCREMENT` |
+
+A sequence hands out each value once, across the whole cluster and through a leader's failover.
+Each node takes a block of values at a time and gives them out in order, so values from one node
+count up and the nodes' values interleave. A node that stops, and any change to the sequence,
+leave a gap, as Postgres's `CACHE` does; `CACHE n` is the smallest block a node takes. Past its
+`MAXVALUE` (or `MINVALUE`, counting down) a sequence stops with `2200H`, unless it `CYCLE`s.
+
+An identity column is a sequence its column owns, named `{table}_{column}_seq`: a row that leaves
+the column out takes the next value. `ALWAYS` refuses a value given in an `INSERT` or set by an
+`UPDATE` (`428C9`); `BY DEFAULT`, `SERIAL` and the others take one. Loading rows (`POST /append`,
+`COPY`, Kafka, Flight) keeps a value given, as Postgres's `COPY` does. The sequence goes with
+`DROP TABLE … PURGE` and comes back with `UNDROP`.
+
+`currval` is a session's: a Postgres connection's, or a client's (`x-pondra-session`), and `55000`
+before that session's first `nextval`. A `DEFAULT nextval('s')` needs `s` to be there, and `s`
+can't be dropped or renamed while a default names it. A materialized view can't call `nextval`: its
+rows are worked out again as its tables change, and would be numbered again.
+
+```sql
+CREATE SEQUENCE invoice_no START 1000 INCREMENT 10;
+SELECT nextval('invoice_no') AS n;
+CREATE TABLE tickets (id BIGINT GENERATED ALWAYS AS IDENTITY, title VARCHAR);
+INSERT INTO tickets (title) VALUES ('printer jam'), ('no coffee');
+SELECT * FROM tickets ORDER BY id;
+CREATE TABLE invoices (no BIGINT DEFAULT nextval('invoice_no'), amount DECIMAL(10, 2));
+INSERT INTO invoices (amount) VALUES (12.50);
+```
+
+```text
+ id | title
+----+-------------
+  1 | printer jam
+  2 | no coffee
+```
+
+### Indexes
+
+| Statement | Syntax |
+|---|---|
+| Make one | `CREATE INDEX [IF NOT EXISTS] [name] ON t [USING method] (column \| (expression) [ASC \| DESC] [NULLS FIRST \| LAST], …) [INCLUDE (column, …)] [WHERE condition]` |
+| Rename | `ALTER INDEX [IF EXISTS] name RENAME TO new_name` |
+| Drop | `DROP INDEX [IF EXISTS] name [, …]` |
+
+An index is an object like a table's others: listed in `pondra.objects` and `pg_indexes`, shown by
+`SHOW CREATE INDEX`, described by `COMMENT ON INDEX`. Nothing is built for it, and a notice says so:
+every file keeps its columns' ranges, which a filter skips files and row groups by, and
+`CLUSTER BY` orders a table's rows to keep those ranges narrow. So a schema copied from Postgres,
+an ORM's migrations or dbt's indexes run as they are. An index is in its table's schema, shares
+names with tables, views and sequences, follows a renamed table or column, and goes with its table
+or a column it names. Left without a name it is called `{table}_{columns}_idx`. Vector and text
+indexes (`USING hnsw`, `ivfflat`, `bm25`) are refused by name. `CREATE UNIQUE INDEX [IF NOT EXISTS]
+[name] ON t (column, …)`, as ORMs write a unique column (Prisma's `@unique`, Rails' `unique: true`),
+is the table's `UNIQUE` constraint under that name, checked as one ([Tables](#tables)), and `DROP
+INDEX name` drops it; on an expression, with `WHERE` or `INCLUDE`, it is refused.
+
+```sql
+CREATE INDEX ON tickets (title);
+SELECT name, definition FROM pondra.objects WHERE kind = 'index';
+```
+
+```text
+       name       |                    definition
+------------------+---------------------------------------------------
+ tickets_title_idx | CREATE INDEX tickets_title_idx ON tickets (title)
 ```
 
 ## Rows
@@ -758,13 +896,13 @@ a query needs no table: see [names](/pondra/reference/names/).
 ## Every kind of object
 
 Every kind of object a lake holds (schemas, tables, views, materialized views, external tables,
-functions, macros, procedures, tasks, secrets, users, roles and the lakes attached) takes the same
+sequences, functions, macros, procedures, tasks, secrets, users, roles and the lakes attached) takes the same
 words for being listed, described and made again.
 
 | Statement | Meaning |
 |---|---|
 | `SELECT … FROM pondra.objects` | every object, of every kind: `kind`, `lake`, `schema`, `name`, `comment`, and `definition`, the statements that make it again ([system tables](/pondra/reference/system-columns/#every-object)) |
-| `SHOW CREATE TABLE t` (or `VIEW`, `MATERIALIZED VIEW`, `FUNCTION`, `PROCEDURE`, `TASK`, `SCHEMA`, `ROLE`, `DATABASE`) | the statements that make it again, its comments included, as one `definition` |
+| `SHOW CREATE TABLE t` (or `VIEW`, `MATERIALIZED VIEW`, `SEQUENCE`, `FUNCTION`, `PROCEDURE`, `TASK`, `SCHEMA`, `ROLE`, `DATABASE`) | the statements that make it again, its comments included, as one `definition` |
 | `COMMENT ON TABLE t IS 'text'` | describe it; any kind above, `COLUMN t.c` too, and `IS NULL` takes it away. A comment follows a rename and goes with a drop |
 | `COMMENT IF EXISTS ON TABLE t IS 'text'` | the same, and nothing if `t` isn't there |
 | `CREATE OR ALTER TABLE t (…) [layout clauses] [WITH (…)]` | make `t`, or bring the one there to this definition without losing a row: columns added at the end, types widened, the layout and options set as written (one left out goes back to its default). A column taken away, moved or narrowed, and a changed key, partition, `NOT NULL`, `DEFAULT` or `CHECK`, is refused, saying which |
@@ -842,7 +980,9 @@ Pondra refuses these by name, so a statement never runs and quietly does somethi
 | a column called `_row_id`, `_version`, `_created_at` or `_updated_at` | refused: every table has them already |
 | `DROP TABLE` while a view or task reads the table | refused; drop the view or task first |
 | a change to a table a window, session, join or min/max view follows | refused, with the view's name, because such a view cannot take a row back |
-| `CREATE INDEX` | not supported: files carry their columns' ranges, and `cluster_by` orders them |
+| a `FOREIGN KEY` or `REFERENCES` without `NOT ENFORCED`; `UNIQUE NULLS NOT DISTINCT`; `DEFERRABLE`; `ALTER TABLE … ADD PRIMARY KEY` | refused, saying why: a reference isn't checked yet; a table's key is made with it |
+| `POST /append`, `COPY … FROM STDIN`, Kafka, Flight or another engine's commit into a table with a `UNIQUE` | refused, by name: only SQL's writes are checked on the leader |
+| `CREATE UNIQUE INDEX` on an expression, or with `WHERE` or `INCLUDE`; `CREATE INDEX … USING hnsw \| ivfflat \| bm25` | refused by name ([Indexes](#indexes): a unique index on columns is a `UNIQUE` constraint; any other index is kept, nothing is built) |
 | `SAVEPOINT`, `ROLLBACK TO` | refused: a transaction commits or rolls back whole |
 | `CREATE`, `ALTER`, `DROP` inside `BEGIN` … `COMMIT` | refused (`0A000`): run them outside the transaction |
 | a materialized view of a `GROUP BY` view that isn't a rollup | refused, saying why ([Flows](/pondra/guides/flows/)) |
