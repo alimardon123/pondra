@@ -22,7 +22,8 @@ use std::time::Duration;
 
 /// The newest format this build reads and writes. 2: a materialized view that finishes its answers
 /// as it is read (`TableMeta::finish`, ADR-055) or runs its query again (`View::rerun`, ADR-056, 057).
-pub const FORMAT: u32 = 2;
+/// 3: the lake's own keys sealed by its master key (`users::Kept`, ADR-058).
+pub const FORMAT: u32 = 3;
 
 /// The format every lake gets without asking: the mark itself (`raise`).
 const BASE: u32 = 1;
@@ -68,6 +69,9 @@ impl std::error::Error for Newer {}
 /// Did this process make its lake (open it to write with nothing ever committed there)?
 static MADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Did this process make its lake? (No release older than this build has read it.)
+pub fn made() -> bool { MADE.load(std::sync::atomic::Ordering::Relaxed) }
+
 /// Refuse a lake newer than this build; its format otherwise.
 pub async fn check(cat: &Catalog, url: &str, writer: bool) -> Result<u32> {
     let s = of(cat).await?;
@@ -78,8 +82,14 @@ pub async fn check(cat: &Catalog, url: &str, writer: bool) -> Result<u32> {
     Ok(s.format)
 }
 
-/// Commit the lake's format.
+/// Commit the lake's format, one at a time and never back: a lake this process made gets the mark
+/// (`raise`) while its keys may already have moved it on (`require`).
 async fn set(lake: &Lake, to: u32) -> Result<()> {
+    static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one = ONE.lock().await;
+    if of(&lake.cat).await?.format >= to {
+        return Ok(());
+    }
     let stamp = Stamp { format: to, by: VERSION.into() };
     lake.cat.commit(vec![(KEY.into(), serde_json::to_vec(&stamp).expect("json"))], &[]).await?;
     eprintln!("the lake is format {to} now (Pondra {VERSION})");

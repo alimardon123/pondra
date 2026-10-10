@@ -1693,6 +1693,16 @@ impl Catalog {
         self.mirror.load(Relaxed).then(|| o.get(key).map(|(id, _)| *id)).flatten()
     }
 
+    /// `key` from this node's own view of the bucket, past the mirror: for what a follower needs
+    /// before its commit stream opens, which never changes once written (the lake's own keys, which
+    /// signing in to that stream takes: `users::keys`).
+    pub async fn from_view(&self, key: &str) -> Result<Option<Bytes>> {
+        match &self.db {
+            Db_::Reader(r) => Ok(r.get(key).await?),
+            Db_::Writer(_) => self.get_raw(key).await,
+        }
+    }
+
     pub async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
         Ok(match &self.db {
             // The leader answers from its in-memory catalog: committed writes only, never ones

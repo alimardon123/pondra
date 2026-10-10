@@ -1418,22 +1418,41 @@ fn kms_run(cmd: &str, what: &str, input: &str) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
+/// Is the master key one every node can have: `PONDRA_SECRET_KEY` or a key service, never only this
+/// machine's own (`~/.pondra/secret.key`), which a node on another machine couldn't open with?
+pub fn shared_master() -> bool { kms().is_some() || std::env::var("PONDRA_SECRET_KEY").is_ok_and(|k| !k.is_empty()) }
+
+/// `plain` sealed with a data key of its own, which the master key wraps: (the sealed bytes, the
+/// wrapped key). The lake's own keys are kept this way (`users::Kept`), as a secret's values are.
+pub fn seal(plain: &[u8]) -> Result<(String, String)> { seal_new(plain) }
+
+/// What `seal` made, opened: its data key unwrapped by the master key (or the previous one).
+pub fn unseal(sealed: &str, wrapped: &str) -> Result<Vec<u8>> { open_with(&unwrap_key(wrapped)?, sealed).context("sealed with another data key") }
+
+/// A data key wrapped again by the master key in use now, when another wrapped it (the previous
+/// master key, or the local key before a key service was set); `None` when it needs nothing.
+pub fn rewrapped(wrapped: &str) -> Result<Option<String>> {
+    if wrapped.starts_with("kms:") == kms().is_some() && (wrapped.starts_with("kms:") || open_with(&master()?, wrapped).is_some()) {
+        return Ok(None);
+    }
+    Ok(Some(wrap_key(&unwrap_key(wrapped)?)?))
+}
+
 /// Leader: every secret's data key wrapped by the master key in use now (after it changed: the
 /// previous one still set), its values untouched. How many were.
 pub async fn rewrap(lake: &Lake) -> Result<usize> {
     let mut puts = vec![];
     for (k, mut s) in lake.cat.scan::<Secret>("e/", "e0").await? {
-        let current = match &s.key {
-            Some(w) if w.starts_with("kms:") == kms().is_some() && (w.starts_with("kms:") || open_with(&master()?, w).is_some()) => continue,
-            Some(w) => unwrap_key(w)?,
-            None => master()?.to_vec(),
-        };
-        if s.key.is_none() {
-            // (sealed by the master key itself, before round 29: sealed again, with a key of its own)
-            let plain = open_with(&current, &s.sealed).with_context(|| format!("secret {}", &k[2..]))?;
-            (s.sealed, s.key) = { let (a, b) = seal_new(&plain)?; (a, Some(b)) };
-        } else {
-            s.key = Some(wrap_key(&current)?);
+        match s.key.clone() {
+            Some(w) => match rewrapped(&w)? {
+                Some(again) => s.key = Some(again),
+                None => continue,
+            },
+            None => {
+                // (sealed by the master key itself, before round 29: sealed again, with a key of its own)
+                let plain = open_with(&master()?, &s.sealed).with_context(|| format!("secret {}", &k[2..]))?;
+                (s.sealed, s.key) = { let (a, b) = seal_new(&plain)?; (a, Some(b)) };
+            }
         }
         puts.push((k, json(&s)));
     }

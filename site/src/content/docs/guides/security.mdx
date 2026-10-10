@@ -336,6 +336,14 @@ key on its input (a short script over `aws kms`, `gcloud kms`, `az keyvault key`
 start the nodes with the new one and the old as `PONDRA_SECRET_KEY_PREVIOUS`: the leader rewraps every
 secret's key when it starts (the values aren't touched), and the old key can then go.
 
+The master key seals the lake's own keys too: the one sessions are signed with, and the one nodes call
+each other with. A lake made with `PONDRA_SECRET_KEY` (or a key service) has them sealed from its first
+write. One made without has them sealed when its leader next starts with one, once every node runs a
+release that reads them sealed (the lake's format moves to 3). So a key that only reads the bucket, such
+as a backup's or another environment's, can't sign anyone in. `GET /stats` says which (`"keys":
+"sealed"`). The key made for one machine never seals them, since a node on another machine couldn't
+open them.
+
 ## Quotas
 
 A user may be held to a **quota** on each node: `MAX_QUERIES n`, how many of its statements run at

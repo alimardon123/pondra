@@ -6599,7 +6599,8 @@ def secrets():
     (the values never in the clear in the catalog); a user uses one only with USAGE on it; a
     session's CREATE TEMPORARY SECRET is its own, in memory, nowhere in the lake; a new master key
     (the previous one still set) rewraps every data key when the leader starts; a key service
-    (PONDRA_KMS_COMMAND) wraps them instead, and without it they don't open."""
+    (PONDRA_KMS_COMMAND) wraps them instead, and without it they don't open. The lake's own keys (z/auth)
+    are sealed by the master key too when every node shares one (ADR-058): see _lake_keys."""
     import base64, http.server, socketserver
     here = tempfile.mkdtemp(prefix="pondra-secrets-")
     open(os.path.join(here, "rates.csv"), "w").write("cur,rate\nEUR,1.1\nGBP,1.3\n")
@@ -6667,9 +6668,98 @@ def secrets():
     checks["PONDRA_KMS_COMMAND wraps a data key (kms:…); without it, it doesn't open"] = by_kms == [[{"cur": "EUR"}, {"cur": "GBP"}], True] and "PONDRA_KMS_COMMAND" in without
     web.shutdown()
     node.kill()
+    kept, keys_info = _lake_keys()
+    checks.update(kept)
     ok = all(checks.values())
-    print(json.dumps({"secrets": checks, "ok": ok, "info": {"used": used, "temp": temp, "refused": refused, "without": without}}, indent=1, default=str))
+    print(json.dumps({"secrets": checks, "ok": ok, "info": {"used": used, "temp": temp, "refused": refused, "without": without, "keys": keys_info}}, indent=1, default=str))
     return ok
+
+
+def _lake_keys():
+    """The lake's own keys (z/auth: the sessions' signing key and the nodes' key, ADR-058): sealed by
+    the master key from a lake's first write when every node shares one, in the clear otherwise (and
+    sealed when a leader starts with a shared key later); a new master key rewraps them; a follower
+    with the same key opens them, and a node with another key can't and says so; sign-in keeps working
+    through all of it."""
+    import base64
+    checks, info = {}, {}
+    basic = "Basic " + base64.b64encode(b"boss:boss-password-1").decode()
+    def as_(port, auth, q, path="/sql"):
+        try:
+            return call(port, "POST", path, q.encode(), headers={"Authorization": auth} if auth else {})
+        except Exception as e:
+            return f"ERROR {e}"
+    stats = lambda port: call(port, "GET", "/stats")
+    login = lambda port: as_(port, None, json.dumps({"user": "boss", "password": "boss-password-1"}), path="/login")
+    z_of = lambda lake, env: subprocess.run([BIN, "catalog", "--dir", lake, "z/"], capture_output=True, text=True, env={**os.environ, **env}).stdout
+    def in_files(lake, needle=b'"node":"pn_'):  # (the catalog's own files, as a reader of the bucket sees them)
+        for d, _, fs in os.walk(lake):
+            for f in fs:
+                try:
+                    with open(os.path.join(d, f), "rb") as fh:
+                        if needle in fh.read():
+                            return True
+                except OSError:
+                    pass
+        return False
+    # A lake made with a master key every node shares: its keys sealed from the first write (format 3)
+    k1 = {"PONDRA_SECRET_KEY": "keys-master-1"}
+    lake = new_lake()
+    a = Node(lake, A.port, env=k1).start()
+    as_(A.port, None, "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")
+    as_(A.port, basic, "CREATE TABLE t (x BIGINT)")
+    kept = until(lambda: stats(A.port).get("keys"), "sealed", 15)
+    z = z_of(lake, k1)
+    info["made sealed"] = {"keys": kept, "format": stats(A.port).get("format"), "z/": z[:300]}
+    checks["a lake made with a master key every node shares has its own keys sealed from its first write (format 3): nothing of them in the clear in its files"] = \
+        kept == "sealed" and stats(A.port).get("format") == 3 and '"sealed"' in z and "pn_" not in z and not in_files(lake)
+    # A follower with the same key opens them and writes through the leader; another key can't open them
+    b = Node(lake, A.port + 1, env=k1).start()
+    unsigned = as_(A.port + 1, None, "SELECT count(*) AS n FROM t")  # (its mirror may be seeded before the user was flushed: never open for that)
+    wrote = until(lambda: as_(A.port + 1, basic, "INSERT INTO t VALUES (1)"), {"rows": 1}, 20)
+    c = Node(lake, A.port + 2, env={"PONDRA_SECRET_KEY": "another-master-key"})
+    try:
+        c.start()
+    except Exception:
+        pass
+    said = until(lambda: "PONDRA_SECRET_KEY" in open(c.log).read(), True, 20)
+    info["follower"] = {"unsigned": unsigned, "wrote": wrote, "another key said": open(c.log).read()[-400:]}
+    checks["a follower that joins once users sign in opens them with the same master key and writes through the leader, answering nothing unsigned meanwhile; a node with another key can't, and says why"] = \
+        str(unsigned).startswith("ERROR 401") and wrote == {"rows": 1} and said is True
+    for n in (a, b, c):
+        n.kill()
+    # A new master key, the previous one set: the leader rewraps them; then the new key alone opens them
+    a = Node(lake, A.port, env={"PONDRA_SECRET_KEY": "keys-master-2", "PONDRA_SECRET_KEY_PREVIOUS": "keys-master-1"}).start()
+    rewrapped = until(lambda: "the lake's own keys rewrapped" in open(a.log).read(), True, 20)
+    a.kill()
+    a = Node(lake, A.port, env={"PONDRA_SECRET_KEY": "keys-master-2"}).start()
+    session = login(A.port)
+    read = as_(A.port, "Bearer " + session["token"], "SELECT count(*) AS n FROM t") if isinstance(session, dict) else session
+    a.kill()
+    info["rewrapped"] = {"rewrapped": rewrapped, "read": read}
+    checks["a new master key (the previous one set) rewraps them; then they open with the new key alone: a session signs in"] = \
+        rewrapped is True and isinstance(read, list) and read[0]["n"] >= 1
+    # A lake whose keys are in the clear (no shared master key), sealed when its leader starts with one
+    lake2 = new_lake()
+    none = {"PONDRA_SECRET_KEY": ""}  # (no master key every node shares: this machine's own at most)
+    n = Node(lake2, A.port, env=none).start()
+    as_(A.port, None, "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")
+    as_(A.port, basic, "CREATE TABLE t (x BIGINT)")
+    as_(A.port, basic, "INSERT INTO t VALUES (1)")
+    clear = until(lambda: stats(A.port).get("keys"), "clear", 15)
+    before = stats(A.port).get("format")
+    session = login(A.port)
+    seen = until(lambda: in_files(lake2), True, 15) if os.path.isdir(lake2) else True  # (the catalog's files show them: the look works; a local lake's only)
+    n.kill()
+    n = Node(lake2, A.port, env=k1).start()
+    kept = until(lambda: stats(A.port).get("keys"), "sealed", 20)
+    still = as_(A.port, "Bearer " + session["token"], "SELECT count(*) AS n FROM t") if isinstance(session, dict) else session
+    after = stats(A.port).get("format")
+    n.kill()
+    info["sealed later"] = {"clear": clear, "format before": before, "seen in files": seen, "kept": kept, "format after": after, "a session from before": still}
+    checks["a lake whose keys are in the clear (no shared master key: its files show them) has them sealed when its leader starts with one; the same keys: a session from before still signs in"] = \
+        clear == "clear" and seen is True and isinstance(before, int) and before < 3 and kept == "sealed" and after == 3 and still == [{"n": 1}] and '"sealed"' in z_of(lake2, k1)
+    return checks, info
 
 
 def safety():

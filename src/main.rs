@@ -576,8 +576,8 @@ async fn run() -> anyhow::Result<()> {
             python::init(python);
             let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
             if leader {
-                let l = app.lake.clone(); // (beside serving, not before it: C5)
-                tokio::spawn(async move {
+                let (l, c) = (app.lake.clone(), app.cluster.clone()); // (beside serving, not before it: C5)
+                panics::spawn(async move {
                     if let Err(e) = users::make_keys(&l).await {
                         eprintln!("the lake's keys (sessions', the nodes'): {e:#}"); // (sessions' signing key, and the nodes' own: `users.rs`)
                     }
@@ -586,16 +586,35 @@ async fn run() -> anyhow::Result<()> {
                         Ok(n) => eprintln!("rewrapped {n} secret{} with the master key in use now", if n == 1 { "" } else { "s" }),
                         Err(e) => eprintln!("secrets not rewrapped: {e:#}"),
                     }
+                    // (sealed once every node can read them sealed: tried each minute until then)
+                    let mut said = false;
+                    while let Err(e) = users::seal_keys(&l).await {
+                        if !c.is_leader() {
+                            break;
+                        }
+                        if !std::mem::replace(&mut said, true) {
+                            eprintln!("the lake's own keys stay as they are for now: {e:#}");
+                        }
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
                 });
             }
             tr("the app");
             let l = app.lake.clone();
             panics::spawn(async move {
                 // (a follower's catalog shows the leader's keys once the leader has flushed them)
+                let mut said = false;
                 for _ in 0..600 {
-                    if let Ok(k) = users::node_key(&l).await {
-                        std::env::set_var("PONDRA_NODE_KEY", k); // (nodes call each other with it when no admin token is set: cluster::http)
-                        return;
+                    match users::node_key(&l).await {
+                        Ok(k) => {
+                            std::env::set_var("PONDRA_NODE_KEY", k); // (nodes call each other with it when no admin token is set: cluster::http)
+                            return;
+                        }
+                        Err(e) if !said && format!("{e:#}").contains("master key") => {
+                            said = true; // (sealed by a master key this node doesn't have: said at once, since waiting won't help)
+                            eprintln!("{e:#}");
+                        }
+                        Err(_) => {}
                     }
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }

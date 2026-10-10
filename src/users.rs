@@ -676,12 +676,30 @@ impl Scram {
 }
 
 /// The lake's own keys, made the first time they're wanted: the one sessions are signed with, and
-/// the one nodes call each other with when no admin token is set. Kept in the catalog, which only
-/// trusted compute reads (ADR-035 §1).
+/// the one nodes call each other with when no admin token is set. Kept in the catalog, sealed by the
+/// master key when every node shares one (`Kept`): a key that only reads the bucket, as a branch on
+/// another server holds (ADR-058), must not sign anyone in.
 #[derive(Serialize, Deserialize, Clone)]
 struct Keys {
     session: String,
     node: String,
+}
+
+/// `z/auth` as kept: sealed (`ext::seal`, at format 3), or in the clear (a lake whose nodes share no
+/// master key, or one made before; its leader seals it once every node can read it sealed: `seal_keys`).
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Kept {
+    Sealed { sealed: String, key: String },
+    Clear(Keys),
+}
+
+/// The format the lake's keys are sealed at: a release before it would find none.
+const SEALED: u32 = 3;
+
+fn sealed(k: &Keys) -> Result<Kept> {
+    let (sealed, key) = crate::ext::seal(&serde_json::to_vec(k)?)?;
+    Ok(Kept::Sealed { sealed, key })
 }
 
 static KEYS_HERE: LazyLock<Mutex<HashMap<String, Keys>>> = LazyLock::new(Default::default);
@@ -695,8 +713,18 @@ async fn keys(lake: &Lake) -> Result<Keys> {
     if let Some(k) = KEYS_HERE.lock().unwrap().get(&lake.url) {
         return Ok(k.clone());
     }
-    let k = match lake.cat.get::<Keys>(KEYS).await? {
-        Some(k) => k,
+    let found = match lake.cat.get::<Kept>(KEYS).await? {
+        // (a follower whose mirror was seeded before the leader's keys were flushed: its commit
+        // stream won't open without them where users sign in, so they come from its own view)
+        None if !lake.cat.is_writer() => lake.cat.from_view(KEYS).await?.map(|v| serde_json::from_slice(&v)).transpose()?,
+        found => found,
+    };
+    let k = match found {
+        Some(Kept::Clear(k)) => k,
+        Some(Kept::Sealed { sealed, key }) => {
+            let plain = crate::ext::unseal(&sealed, &key).map_err(|e| anyhow!("the lake's own keys are sealed by a master key this node doesn't have ({e:#}): every node needs the same PONDRA_SECRET_KEY (or PONDRA_KMS_COMMAND)"))?;
+            serde_json::from_slice(&plain)?
+        }
         None => {
             let mut a = [0u8; 32];
             let mut b = [0u8; 32];
@@ -704,7 +732,17 @@ async fn keys(lake: &Lake) -> Result<Keys> {
             aws_lc_rs::rand::fill(&mut b).map_err(|_| anyhow!("no randomness"))?;
             let k = Keys { session: B64.encode(a), node: format!("pn_{}", B64U.encode(b)) };
             ensure!(lake.cat.is_writer(), "the lake's keys aren't made yet: its leader makes them when it starts");
-            lake.cat.commit(vec![(KEYS.to_string(), json(&k))], &[]).await?;
+            // (sealed from the first write when no release older than format 3 can read the lake; otherwise
+            // in the clear, and `seal_keys` seals them once every node can read them sealed)
+            let fresh = crate::format::made() || crate::format::of(&lake.cat).await?.format >= SEALED;
+            let kept = match crate::ext::shared_master() && fresh {
+                true => {
+                    crate::format::require(lake, SEALED, "the lake's own keys, sealed").await?;
+                    sealed(&k)?
+                }
+                false => Kept::Clear(k.clone()),
+            };
+            lake.cat.commit(vec![(KEYS.to_string(), json(&kept))], &[]).await?;
             k
         }
     };
@@ -714,6 +752,37 @@ async fn keys(lake: &Lake) -> Result<Keys> {
 
 /// Leader: make the lake's keys if there are none yet (when it starts).
 pub async fn make_keys(lake: &Lake) -> Result<()> { keys(lake).await.map(|_| ()) }
+
+/// Leader: the lake's own keys sealed by the master key once every node can read them sealed
+/// (format 3), when every node shares one (`ext::shared_master`); and wrapped again after the
+/// master key changed (`PONDRA_SECRET_KEY_PREVIOUS`), as `ext::rewrap` does secrets'.
+pub async fn seal_keys(lake: &Lake) -> Result<()> {
+    keys(lake).await?; // (made, if they aren't yet)
+    match lake.cat.get::<Kept>(KEYS).await? {
+        Some(Kept::Clear(k)) if crate::ext::shared_master() => {
+            crate::format::require(lake, SEALED, "the lake's own keys, sealed").await?;
+            lake.cat.commit(vec![(KEYS.to_string(), json(&sealed(&k)?))], &[]).await?;
+            eprintln!("the lake's own keys are sealed by its master key now");
+        }
+        Some(Kept::Sealed { sealed, key }) => {
+            if let Some(key) = crate::ext::rewrapped(&key)? {
+                lake.cat.commit(vec![(KEYS.to_string(), json(&Kept::Sealed { sealed, key }))], &[]).await?;
+                eprintln!("the lake's own keys rewrapped with the master key in use now");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// How the lake's own keys are kept: "sealed", "clear", or "none" yet (`/stats`).
+pub async fn kept(lake: &Lake) -> &'static str {
+    match lake.cat.get::<Kept>(KEYS).await {
+        Ok(Some(Kept::Sealed { .. })) => "sealed",
+        Ok(Some(Kept::Clear(_))) => "clear",
+        _ => "none",
+    }
+}
 
 /// The key nodes call each other with when no admin token is set (`cluster::http`).
 pub async fn node_key(lake: &Lake) -> Result<String> { Ok(keys(lake).await?.node) }
