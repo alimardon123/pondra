@@ -196,7 +196,7 @@ impl Backend {
             return Ok(Response::Execution(Tag::new(tag)));
         }
         let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: its value; `$1` is the protocol's)
-        let bound = self.placed(bound).await?; // (the session's search path: full names, ahead of the key lookup)
+        let bound = self.placed(bound.into_owned()).await?; // (the session's search path: full names, ahead of the key lookup)
         let sql: &str = &bound;
         let reader = crate::auth::current().is_some_and(|p| p.role >= crate::auth::Role::Read);
         if reader && crate::txn::open() && crate::txn::refuse().is_ok() {
