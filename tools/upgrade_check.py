@@ -109,8 +109,8 @@ def stop_all():
 class Node:
     """A node of `bin` serving `lake`, started and stopped as a scheduler would."""
 
-    def __init__(self, bin, lake, port, work, *flags, env=None, tier_secs=0):
-        self.bin, self.lake, self.port, self.flags, self.env, self.tier = bin, lake, port, list(flags), env or {}, tier_secs
+    def __init__(self, bin, lake, port, work, *flags, env=None, tier_secs=0, token=True):
+        self.bin, self.lake, self.port, self.flags, self.env, self.tier, self.token = bin, lake, port, list(flags), env or {}, tier_secs, token
         self.log = os.path.join(work, f"node-{port}-{os.path.basename(lake)}.log")
         self.p = None
 
@@ -119,11 +119,15 @@ class Node:
             if s.connect_ex(("127.0.0.1", self.port)) == 0:
                 raise Failed(f"port {self.port} is in use: stop what serves it")
         env = {**os.environ, "PONDRA_SECRET_KEY": SECRET_KEY, "PONDRA_OWNER_KEY": OWNER, "PONDRA_ADMIN_TOKEN": TOKEN, **self.env}
+        admin = ["--admin-token", TOKEN] if self.token else []
+        if not self.token:  # (no admin token of its own: the tokens the caller's shell has are not this node's)
+            for k in ("PONDRA_ADMIN_TOKEN", "PONDRA_TOKEN", "PONDRA_NODE_KEY"):
+                env.pop(k, None)
         with open(self.log, "a") as err:
             err.write(f"\n=== {self.bin} serve {self.lake} {' '.join(self.flags)}\n")
             err.flush()
             self.mark = err.tell()
-            self.p = subprocess.Popen([self.bin, "serve", "--dir", self.lake, "--addr", f"127.0.0.1:{self.port}", "--admin-token", TOKEN, "--tier-secs", str(self.tier), *self.flags],
+            self.p = subprocess.Popen([self.bin, "serve", "--dir", self.lake, "--addr", f"127.0.0.1:{self.port}", *admin, "--tier-secs", str(self.tier), *self.flags],
                                       env=env, stdout=subprocess.DEVNULL, stderr=err, stdin=subprocess.DEVNULL)
         NODES.append(self)
         deadline = time.time() + 120

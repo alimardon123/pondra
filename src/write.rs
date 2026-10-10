@@ -1657,6 +1657,20 @@ async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
     deliver(&to, req, &stmt, &job, true).await
 }
 
+tokio::task_local! {
+    /// A key a request to another lake's leader goes with instead of this process's token: a
+    /// branch's key in its base (`branch::keyed`).
+    static BEARER: String;
+}
+
+/// `send`, with `key` as its `Authorization` when given.
+pub async fn send_as(dir: &str, req: Request, key: Option<&str>) -> Result<Value> {
+    match key {
+        Some(k) => BEARER.scope(k.to_string(), send(dir, req)).await,
+        None => send(dir, req).await,
+    }
+}
+
 /// Have the leader of the lake at `dir` record `req` (made on this node), however it's reached.
 pub async fn send(dir: &str, req: Request) -> Result<Value> { deliver(dir, Some(Some(req)), &Stmt::Invalid(String::new()), "", false).await }
 
@@ -1772,7 +1786,12 @@ pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>
 
 pub async fn post(addr: &str, r: &Request) -> Result<Value> {
     let (path, body) = r.http()?;
-    let res = http().post(crate::tls::url(&format!("{addr}{path}"))).header("content-type", "application/json").body(body).send().await?;
+    let call = http().post(crate::tls::url(&format!("{addr}{path}"))).header("content-type", "application/json").body(body);
+    let call = match BEARER.try_with(|k| k.clone()) {
+        Ok(k) => call.bearer_auth(k), // (a branch's key, sent as this request's own Authorization)
+        Err(_) => call,
+    };
+    let res = call.send().await?;
     ensure!(res.status().is_success(), "the leader at {addr}: {}", res.text().await?);
     Ok(res.json().await?)
 }
