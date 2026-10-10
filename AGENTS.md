@@ -1632,13 +1632,25 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 239. **Every request at the sharing door is a row of `pondra.audit`, refusals too** (`audit::shared`,
    door `sharing`, class `share`). An `ATTACH` naming a token or a profile is kept with them as
    `'***'`. `sharing_check.py`.
+240. **Another database's tables are read and written under its own sign-in** (`users::across`,
+   `across_write`; `query::across`, `write::on_node_as`, `iceberg::space`, `ddl::listed`). A lake
+   attached here that has a user who signs in, or any lake when the node has tokens, is used through
+   it only by whoever runs the nodes (`Principal::operator`: their tokens, their key, the program
+   that started the node). A user signed in here, an open node's anyone and a task are not. A user
+   granted some tables needs a grant naming the other lake's table (`Access::named`), since `ON ALL
+   TABLES` and `ON SCHEMA` are this lake's. A remembered answer over attached lakes is keyed by
+   `operator` too (`Lake::version_for`). `harness.py server`: the four cross-database checks.
+241. **A procedure started without waiting runs as its caller** (`auth::carried`: `routines::start`
+   runs the spawned work in the caller's `auth::WHO` and session). A spawned task keeps no
+   task-local, so it ran with no grants at all. `harness.py users`: "a procedure started without
+   waiting (pondra.start) has its caller's grants…".
 242. **An enum column holds text, and every door checks its labels** (`types.rs`): a table keeps its
    enum columns' labels (`TableMeta::enums`, by stored name), so `defaults::check` (every door,
    invariant 130) refuses a value they don't list without reading anything else (22P02, a
    `Violation`, so a group's appends are checked one by one). `ALTER TYPE … ADD VALUE` adds the label
    to every table using the type in the type's own commit; a label is never renamed or taken away,
    since files are never rewritten. Casts to a type and `enum_range` become text where SQL comes in
-   (`types::rewrite`, after the macros). (240–241 are the grant fix's.) `harness.py enums`.
+   (`types::rewrite`, after the macros). `harness.py enums`.
 243. **A statement's history says what it ran, and its path pays nothing for it** (`history.rs`,
    ADR-050): its fingerprint and the tables it read and wrote are worked out by the node's writer
    from the statement as sent; its plan's shape and the commit it read at are noted as it runs; how
