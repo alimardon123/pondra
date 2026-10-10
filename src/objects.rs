@@ -805,14 +805,17 @@ async fn comment(lake: &Lake, word: &str, name: &str, text: Option<String>, if_e
     Ok(j!({word: name, "comment": text}))
 }
 
-/// A (stored) view's columns as its query names them now, or None for no such view.
-async fn view_columns(lake: &Lake, view: &str) -> Result<Option<Vec<String>>> {
-    if lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(view)).await?.is_none() {
-        return Ok(None);
-    }
-    let sql = format!("SELECT * FROM {} LIMIT 0", name_sql(view));
-    let df = crate::query::sql(&crate::query::session(lake, &sql, "").await?, &sql).await?;
-    Ok(Some(df.schema().fields().iter().map(|f| f.name().clone()).collect()))
+/// A (stored) view's columns as its query names them now, or None for no such view. (Boxed: planning
+/// it expands SQL, which may show a SHOW CREATE, which comes back here.)
+fn view_columns<'a>(lake: &'a Lake, view: &'a str) -> BoxFuture<'a, Result<Option<Vec<String>>>> {
+    Box::pin(async move {
+        if lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(view)).await?.is_none() {
+            return Ok(None);
+        }
+        let sql = format!("SELECT * FROM {} LIMIT 0", name_sql(view));
+        let df = crate::query::sql(&crate::query::session(lake, &sql, "").await?, &sql).await?;
+        Ok(Some(df.schema().fields().iter().map(|f| f.name().clone()).collect()))
+    })
 }
 
 /// Does carrying out `d` drop or rename something a comment may be on?
