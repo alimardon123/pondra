@@ -10,13 +10,15 @@
 - another project can't change this one's objects;
 - `pondra export` of prod, deployed into an empty database, exports the same;
 - `pondra branch` and `pondra diff`: a branch's new view and rows, its task suspended;
-- `CALL plan(…)` and `CALL deploy(…)` on a project kept in the workspace; `pondra.deploys`.
+- `CALL plan(…)` and `CALL deploy(…)` on a project kept in the workspace; `pondra.deploys`;
+- the developer's day: `pondra ci init`, `pondra branch --if-missing` and `--hook`, `pondra dev`.
 
   project_check.py [--new target/release/pondra] [--work DIR] [--port 9790]
 
 Prints the checks as JSON and exits 1 if one fails (the lakes and the project are then kept in --work).
 """
-import argparse, json, os, shutil, subprocess, sys, tempfile, time, urllib.request, urllib.error
+import argparse, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.request, urllib.error
+import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -230,6 +232,63 @@ def project_check(bin, work, port):
         and any(r["name"] == "sales.small" for r in deployed) and rows("prod", "SELECT count(*) FROM sales.small") == [(2,)]
     checks["each deploy's files are kept, out of files()"] = call("GET", "/db/prod/files/.deploys/1/pondra.toml") is not None \
         and not any(".deploys" in r["path"] for r in q("prod", "SELECT path FROM files()"))
+
+    # The developer's day: the CI workflow, branches made by hand and by the git hook, and pondra dev.
+    subprocess.run(["git", "switch", "-q", "main"], cwd=proj, env=env, check=True)
+    wf_path = os.path.join(proj, ".github", "workflows", "pondra.yml")
+    ci_toml = open(os.path.join(proj, "pondra.toml")).read()
+    said = pondra("ci", "init")
+    jobs = yaml.safe_load(open(wf_path).read())["jobs"]  # (PyYAML reads the key `on` as True: the jobs are read under `jobs`)
+    checks["pondra ci init: the pull-request, closed and prod jobs (no test: pondra.toml has no [env.test]); the four things to do"] = \
+        set(jobs) == {"pull-request", "closed", "prod"} and jobs["prod"]["environment"] == "prod" and "needs" not in jobs["prod"] \
+        and "GRANT DEPLOY ON DATABASE prod TO ci" in said and "protected = true" in said
+    again = pondra("ci", "init", ok=False)
+    checks["pondra ci init again: refused without --force, saying so"] = "--force" in again
+    write("pondra.toml", ci_toml + '\n[env.test]\nclone = "prod"\n')
+    pondra("ci", "init", "--force")
+    jobs = yaml.safe_load(open(wf_path).read())["jobs"]
+    checks["pondra ci init --force with [env.test]: a test job, and prod needs it"] = jobs.get("test", {}).get("if") == "github.event_name == 'push'" and jobs["prod"].get("needs") == "test"
+    write("pondra.toml", ci_toml)
+
+    subprocess.run(["git", "switch", "-q", "-c", "hooked-by-hand"], cwd=proj, env=env, check=True)
+    pondra("branch", "--if-missing")
+    second = pondra("branch", "--if-missing")
+    checks["pondra branch --if-missing twice on a new git branch: both exit 0, the database there once, the second saying so"] = \
+        [d["name"] for d in call("GET", "/databases")].count("hooked_by_hand") == 1 and "there already" in second
+
+    pondra("branch", "--hook")
+    hook_env = {**env, "PATH": os.path.dirname(bin) + os.pathsep + env["PATH"]}  # (the hook finds pondra on the PATH)
+    subprocess.run(["git", "switch", "-q", "-c", "via-hook"], cwd=proj, env=hook_env, check=True)
+    checks["pondra branch --hook: git switch -c via-hook made its database (the hook ran pondra)"] = "via_hook" in [d["name"] for d in call("GET", "/databases")]
+    os.remove(os.path.join(proj, ".git", "hooks", "post-checkout"))  # (the next switch is pondra dev's own: no hook makes its database first)
+
+    subprocess.run(["git", "switch", "-q", "main"], cwd=proj, env=env, check=True)
+    refused_main = pondra("dev", ok=False)
+    checks["pondra dev on main: refused, saying git switch"] = "git switch" in refused_main
+
+    subprocess.run(["git", "switch", "-q", "-c", "dev-loop"], cwd=proj, env=env, check=True)
+    dev_log = os.path.join(work, "dev.log")
+    with open(dev_log, "w") as log:
+        dev = subprocess.Popen([bin, "dev", "--deploys", "2"], cwd=proj, env=env, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        deadline = time.time() + 120
+        while time.time() < deadline and not ("dev_loop: deploy" in open(dev_log).read() and "dev_loop" in [d["name"] for d in call("GET", "/databases")]):
+            time.sleep(0.5)
+        write("objects/sales/dev_loop.sql", "CREATE VIEW sales.dev_loop AS SELECT count(*) AS n FROM sales.orders;\n")
+        code = dev.wait(timeout=120)
+    finally:
+        if dev.poll() is None:
+            dev.kill()
+    dev_out = open(dev_log).read()
+    checks["pondra dev --deploys 2 on git branch dev-loop: its database made and deployed, a save deployed again (timed), exit 0"] = \
+        code == 0 and dev_out.count("dev_loop: deploy") == 2 and re.search(r"\d\d:\d\d:\d\d changed: objects/sales/dev_loop.sql", dev_out) is not None
+    if not checks["pondra dev --deploys 2 on git branch dev-loop: its database made and deployed, a save deployed again (timed), exit 0"]:
+        checks["(dev)"] = [code, dev_out[-800:]]
+    checks["…the view saved is answered by the branch"] = rows("dev_loop", "SELECT n FROM sales.dev_loop") == [(20,)]
+    os.remove(os.path.join(proj, "objects", "sales", "dev_loop.sql"))
+    pondra("branch", "--drop")
+    subprocess.run(["git", "switch", "-q", "main"], cwd=proj, env=env, check=True)
+
     server.terminate()
     server.wait(10)
     return checks

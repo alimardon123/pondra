@@ -362,7 +362,10 @@ A project is a folder with `pondra.toml`, `objects/`, `migrations/` and `tests/`
 | `pondra test` | run tests/: any row a query returns is a failure (exit 1 if one fails) |
 | `pondra export [DIR]` | the environment's objects as a project's files (pondra.toml kept if DIR has one) |
 | `pondra login URL [--token T \| --user U]` | keep a token for a server in `~/.pondra` (`PONDRA_HOME`); asked for when not given |
-| `pondra branch [NAME] [--from prod] [--replace] [--drop]` | `CREATE DATABASE NAME CLONE prod` on prod's node (NAME: the git branch's); `--drop` lets it go |
+| `pondra branch [NAME] [--from prod] [--replace \| --drop \| --if-missing]` | `CREATE DATABASE NAME CLONE prod` on prod's node (NAME: the git branch's); `--drop` lets it go; `--if-missing` leaves a database that is there |
+| `pondra branch --hook [--from prod]` | a git hook (`.git/hooks/post-checkout`) that makes the branch's database on each `git switch` to a branch |
+| `pondra dev [--from prod]` | make the git branch's database if it isn't there, then deploy and test the project on each save; Ctrl-C stops (refused on prod, main and protected databases) |
+| `pondra ci init [--force]` | write `.github/workflows/pondra.yml`: each pull request's branch of prod deployed, tested and diffed; test on merge; prod on approval |
 | `pondra diff [--against prod]` | the objects that differ and the rows of each table both have, as Markdown |
 
 Where the environment is:
