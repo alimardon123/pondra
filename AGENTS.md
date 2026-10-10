@@ -2536,12 +2536,14 @@ signed packages, the docs).
   (`designs/rules-for-new-kinds.md`):
   - An **object** has a life of its own (a table, a model). It is a `Kind` in `KINDS`.
   - A **part** lives and dies with one object (a column, a measure, a key, a link, a model's
-    version). It is a `Part` in `PARTS`, and its owner's lister yields it into `pondra.parts`.
+    version or feature). It is a `Part` in `PARTS`, and its owner's lister yields it into
+    `pondra.parts`.
   - A **pattern** stores nothing and is read from objects and parts (the ontology, a flow, a
-    feature). It is a `Pattern` in `PATTERNS`, naming its listing function.
+    history view). It is a `Pattern` in `PATTERNS`, naming its listing function.
   - Each entry carries a one-line description and other products' names for it (`also`).
-    `pondra.kinds` lists all three and the website's glossary is generated from it. `pondra.search`
-    finds all of them, by their names, descriptions and `also`.
+    `pondra.kinds` lists all three and the website's glossary is generated from it. `pondra.find`
+    finds all of them, by their names, descriptions and `also` (`search` is ADR-051's search of a
+    table's rows).
   - An object passes ten checks: (1) SQL's word, naming nothing else; (2) one registry entry, a
     catalog prefix of its own, `schema.name`; (3) the same verbs, `SHOW CREATE` running again after
     a drop, any other verb refused by name with Postgres's code; (4) its privileges asked by the one
@@ -2550,6 +2552,9 @@ signed packages, the docs).
     can't, `register.objectKind`, a row in the doors matrix; (7) written by the leader, free when
     unused, no service, within the bucket's limits; (8) a catalog shape older releases would misread
     waits for the format; (9) `harness.py registry` walks it; (10) a reference page.
+  - Other products' words go only in `also`; Pondra's own table functions are `pondra.*`, scalar
+    functions and names other engines use unqualified are not (`predict`, `nextval`, `ai_*`); named
+    arguments are `=>`, rewritten by one helper.
   - A part takes its owner's verbs (`ALTER … ADD | DROP`, `COMMENT ON`), rights and life cycle,
     shows in its owner's `SHOW CREATE`, and passes checks 1, 2 and 6 to 10.
   - A pattern passes 1, 2 and 10.
