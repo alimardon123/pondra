@@ -218,7 +218,7 @@ mod tests {
         assert!(cap("/lakes/prod/data/t/a.parquet").is_some()); // (virtual-hosted)
         assert_eq!(cap("/shares-test/lakes/prod2/data/t/a.parquet"), None); // (another lake whose name starts alike)
         assert_eq!(cap("/shares-test/lakes/dev/data/lakes/prod/a.parquet"), None); // (the branch's own, whatever its tables are called)
-        assert_eq!(shared("s3://other", "/other/lakes/prod/a"), None); // (another bucket)
+        assert!(shared("s3://other", "/other/lakes/prod/a").is_none()); // (another bucket)
         share("s3://shares-test"); // (a bucket's root: nothing to tell it by)
         assert_eq!(SHARES.lock().unwrap()["s3://shares-test"].len(), 1);
     }

@@ -493,6 +493,18 @@ pub async fn export(lake: &Lake) -> Result<BTreeMap<String, String>> {
     Ok(files)
 }
 
+/// `GET /export?database=prod`: a database attached here, as a project's files. `pondra diff` compares a branch
+/// with its base this way when the base is on another server (ADR-058). Its objects are what a clone of it holds,
+/// so CLONE on it is enough.
+pub async fn export_attached(lake: &Lake, name: &str) -> Result<BTreeMap<String, String>> {
+    if let Some(a) = crate::auth::limited() {
+        ensure!(a.clones_of(name), "permission denied: {name}'s objects are read here with CLONE on it (GRANT CLONE ON DATABASE {name} TO …)");
+    }
+    let other = lake.attached.read().unwrap().iter().find(|(n, _)| n == name).map(|(_, l)| l.clone());
+    let other = other.with_context(|| format!("database \"{name}\" isn't attached here"))?;
+    export(&other).await
+}
+
 // ---------------------------------------------------------------- the plan
 
 /// One line of a plan: what happens to an object, and the statements that do it.

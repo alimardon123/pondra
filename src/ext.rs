@@ -1029,11 +1029,13 @@ pub async fn reach(lake: &Lake, dir: &str, read_only: bool, endpoint: Option<&st
     reach_with(&list(lake).await?, dir, read_only, endpoint)
 }
 
-/// The bucket secrets covering `urls` (no temporary ones), for a branch to keep (`branch::make`).
+/// The bucket secrets covering `urls` (no temporary ones), for a branch to keep (`branch::make`). Whoever
+/// may clone a database attached here lends its key without USAGE on it: the branch can't read its base
+/// without it, and CLONE is the grant that says who may (ADR-058).
 pub async fn lent(lake: &Lake, urls: &[String]) -> Result<Vec<(String, Secret)>> {
     let all: Vec<(String, Secret)> = list(lake).await?.into_iter().filter(|(_, s)| !s.temporary).collect();
     let mut found: Vec<(String, Secret)> = vec![];
-    for hit in urls.iter().filter_map(|u| covering(&all, u)) {
+    for hit in urls.iter().filter_map(|u| scoped(all.iter(), u)) {
         if !found.iter().any(|(n, _)| *n == hit.0) {
             found.push(hit);
         }
@@ -1378,8 +1380,13 @@ fn usable(name: &str, s: &Secret) -> bool { s.temporary || crate::auth::limited(
 /// The secret for a URL: the longest scope that is a prefix of it (no scope: every URL of its
 /// type's schemes).
 pub(crate) fn covering(secrets: &[(String, Secret)], url: &str) -> Option<(String, Secret)> {
+    scoped(secrets.iter().filter(|(n, x)| usable(n, x)), url)
+}
+
+/// The same among `secrets`, whoever asks.
+fn scoped<'a>(secrets: impl Iterator<Item = &'a (String, Secret)>, url: &str) -> Option<(String, Secret)> {
     let s = scheme(url)?;
-    secrets.iter().filter(|(n, x)| usable(n, x) && x.kind != "pondra" && kind(&x.kind).is_ok_and(|(_, schemes)| schemes.contains(&s)))
+    secrets.filter(|(_, x)| x.kind != "pondra" && kind(&x.kind).is_ok_and(|(_, schemes)| schemes.contains(&s)))
         .filter(|(_, x)| x.scope.as_deref().is_none_or(|p| url.starts_with(p)))
         .max_by_key(|(_, x)| x.scope.as_ref().map_or(0, |p| p.len() + 1)).cloned()
 }

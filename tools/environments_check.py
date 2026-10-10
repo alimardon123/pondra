@@ -25,11 +25,11 @@ key of prod's bucket and prod's URL, clones a schema of it into its own bucket a
 Two gates in front of moto (`Gate`) refuse what dev's own key may not reach and what the read-only key
 may not write, and count it: the check asserts the counts.
 """
-import argparse, base64, glob, http.client, http.server, json, os, shutil, subprocess, sys, tempfile, threading, time, urllib.error, urllib.parse, urllib.request
+import argparse, base64, glob, http.client, http.server, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, urllib.error, urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from upgrade_check import Node, Failed, NODES, stop_all, gone  # (a node started and stopped as a scheduler would)
+from upgrade_check import Node, Failed, NODES, OWNER, stop_all, gone  # (a node started and stopped as a scheduler would)
 
 
 def keys(lake):
@@ -155,13 +155,14 @@ class Gate:
 
 
 class Anon(Node):
-    """A node the test calls with no token of its own: it has none (token=False: open until a user signs
-    in), so the test's admin token never reaches it, and what it sends on to another server carries only
-    the TYPE pondra secret's token (`across_check`)."""
+    """A node the test calls with no token of its own: it has none (token=False), so the test's admin token
+    never reaches it, and what it sends on to another server carries only the TYPE pondra secret's token
+    (`across_check`). The test is the program that started it (`x-pondra-owner`), so it stays an admin here
+    once a user signs in, as the shell is."""
 
     def call(self, method, path, body=None, headers=None, timeout=120):
         data = body if isinstance(body, (bytes, type(None))) else (body if isinstance(body, str) else json.dumps(body)).encode()
-        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method, headers=headers or {})
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method, headers={"x-pondra-owner": OWNER, **(headers or {})})
         try:
             out = urllib.request.urlopen(req, timeout=timeout).read()
         except urllib.error.HTTPError as e:
@@ -700,6 +701,187 @@ def protect_check(bin, work, port, root):
         prod.stop()
 
 
+class Folder:
+    """A `pondra serve --lakes` server on `port`: a folder of lakes, each a database, answering to its own admin
+    token and reaching its bucket with its own settings (`env`). Stopped with the other nodes when the check ends."""
+
+    def __init__(self, bin, folder, port, work, token, env):
+        self.bin, self.folder, self.port, self.token, self.env = bin, folder, port, token, env
+        self.log = os.path.join(work, f"folder-{port}.log")
+        self.p = None
+
+    def start(self):
+        inherited = {k: v for k, v in os.environ.items() if k not in ("PONDRA_ADMIN_TOKEN", "PONDRA_TOKEN", "PONDRA_NODE_KEY")}
+        with open(self.log, "a") as err:
+            self.p = subprocess.Popen([self.bin, "serve", "--lakes", self.folder, "--addr", f"127.0.0.1:{self.port}", "--admin-token", self.token],
+                                      env={**inherited, **self.env}, stdout=subprocess.DEVNULL, stderr=err, stdin=subprocess.DEVNULL)
+        NODES.append(self)
+        deadline = time.time() + 120
+        while True:
+            try:
+                self.call("GET", "/databases", timeout=2)
+                return self
+            except Exception:  # (not up yet)
+                if self.p.poll() is not None or time.time() > deadline:
+                    raise Failed(f"serve --lakes {self.folder} didn't answer on {self.port}: {open(self.log).read()[-1500:]}")
+                time.sleep(0.2)
+
+    def call(self, method, path, body=None, timeout=120):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                     headers={"Authorization": f"Bearer {self.token}", "content-type": "application/json"})
+        try:
+            out = urllib.request.urlopen(req, timeout=timeout).read()
+        except urllib.error.HTTPError as e:
+            raise Failed(f"{method} {path}: {e.code} {e.read().decode(errors='replace')[:800]}") from None
+        return json.loads(out) if out[:1] in (b"{", b"[") else out
+
+    def q(self, sql, db=None):
+        """A statement at the server's root (its default database) or at database `db`."""
+        return self.call("POST", f"/db/{db}/sql" if db else "/sql", {"sql": sql})
+
+    def stop(self, how="term"):
+        if self.p and self.p.poll() is None:
+            self.p.send_signal(signal.SIGKILL if how == "kill" else signal.SIGTERM)
+            try:
+                self.p.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                self.p.kill()
+                self.p.wait()
+
+
+def gh_calls(log):
+    """Every call the fake gh logged (`project_check.FAKE_GH`): its arguments and its standard input."""
+    return [json.loads(line) for line in open(log)] if os.path.exists(log) else []
+
+
+def gh_given(log, *args):
+    """What gh was given on standard input for the last call with these arguments (None: no such call)."""
+    got = [c["stdin"] for c in gh_calls(log) if c["args"] == list(args)]
+    return got[-1] if got else None
+
+
+def layout_b_check(bin, work, port):
+    """Branches on another server (Layout B, ADR-058, what `pondra ci init` sets up): prod and dev are two servers,
+    folders of lakes with their own admin tokens and buckets. `pondra ci init` finds prod not attached on dev's
+    server and prints what to run there; run as printed (with a read-only key of prod's bucket), dev attaches prod
+    READ_ONLY, and the next `pondra ci init` makes dev's CI user. Then the branches are made on dev from prod with
+    that user's token. Proves: dev reads prod's bucket through the read-only key only (the gates count what reached
+    them); a branch made on dev is prod's rows and no file of prod's; ci_prod applies to prod; the dev token is
+    refused on prod."""
+    from project_check import FAKE_GH, put  # (the stand-in for gh that project_check uses, and its file writer)
+    prod_url, dev_url = f"http://127.0.0.1:{port + 40}", f"http://127.0.0.1:{port + 41}"
+    env_url, ro_url, moto_url = f"http://127.0.0.1:{port + 43}", f"http://127.0.0.1:{port + 44}", f"http://127.0.0.1:{port + 45}"
+    key_prod, key_dev = "layout-b-prod-master-key-0123456789abcdef", "layout-b-dev-master-key-0123456789abcdef"
+    counts = {"prod_by_env": 0, "prod_writes": 0, "prod_reads": 0}  # (what the gates refused or read of prod's bucket)
+    os.environ.update(AWS_ENDPOINT=moto_url, AWS_ENDPOINT_URL=moto_url, AWS_ACCESS_KEY_ID="test", AWS_SECRET_ACCESS_KEY="test", AWS_REGION="us-east-1")
+    proj, gh_log = os.path.join(work, "sales-b"), os.path.join(work, "gh-b.jsonl")
+    fake = os.path.join(work, "fake-gh-b")
+    put(fake, "gh", FAKE_GH.replace("@PYTHON@", sys.executable))
+    os.chmod(os.path.join(fake, "gh"), 0o755)
+    env = {**os.environ, "PONDRA_HOME": os.path.join(work, "home-b"), "GIT_CONFIG_GLOBAL": os.devnull,
+           "PATH": fake + os.pathsep + os.environ["PATH"], "FAKE_GH_LOG": gh_log}
+    for k in ("PONDRA_TOKEN", "PONDRA_ENV", "PONDRA_ADMIN_TOKEN"):
+        env.pop(k, None)
+    checks, gates, moto_proc, prod, dev = {}, [], None, None, None
+
+    def cli(*args, token=None, ok=True):
+        """`pondra` in the project folder, as a developer runs it: (exit code, what it printed). `ok` None: either."""
+        e = {**env, "PONDRA_TOKEN": token} if token else env
+        r = subprocess.run([bin, *args], cwd=proj, env=e, capture_output=True, text=True, timeout=900)
+        if ok is not None and (r.returncode == 0) != ok:
+            raise Failed(f"pondra {' '.join(args)}: exit {r.returncode}\n{r.stdout}{r.stderr}")
+        return r.returncode, r.stdout + r.stderr
+
+    def rows(n, sql, db=None):
+        """The rows, or what refused them: a check reads False then, and the next ones still run."""
+        try:
+            return [tuple(r.values()) for r in n.q(sql, db)]
+        except Failed as e:
+            return str(e)[:400]
+
+    try:
+        moto_proc = moto(port + 45, work)
+        gates.append(Gate(moto_url, port + 43, counts, env=True))  # (dev's own endpoint: its key reaches acme-dev only)
+        gates.append(Gate(moto_url, port + 44, counts, env=False))  # (prod's read-only key: reads acme-prod, writes nothing)
+        prod = Folder(bin, "s3://acme-prod", port + 40, work, "prod-admin", s3_env(moto_url, key_prod)).start()
+        dev = Folder(bin, "s3://acme-dev", port + 41, work, "dev-admin", s3_env(env_url, key_dev)).start()
+        put(proj, "pondra.toml", f'[project]\nname = "sales"\n\n[env.prod]\nserver = "{prod_url}"\n\n[env.dev]\nserver = "{dev_url}"\n')
+        put(proj, "objects/schemas.sql", "CREATE SCHEMA sales;\n")
+        put(proj, "objects/sales/orders.sql", "CREATE TABLE sales.orders (id BIGINT, amount DOUBLE);\n")
+        put(proj, "migrations/001-first-orders.sql", "INSERT INTO sales.orders VALUES (1, 10.0), (2, 20.0);\n")
+        cli("login", prod_url, "--token", "prod-admin")
+        cli("login", dev_url, "--token", "dev-admin")
+
+        _, out = cli("apply", "prod")
+        checks["pondra apply prod: a new database on prod's server, applied, two rows"] = \
+            "a new database" in out and rows(prod, "SELECT id, amount FROM sales.orders ORDER BY id", "prod") == [(1, 10.0), (2, 20.0)]
+
+        # The first ci init: dev's server doesn't attach prod, so ci init says what to run there and makes no ci user on it.
+        _, first = cli("ci", "init")
+        printed = [s.strip().rstrip(";") for s in first.splitlines() if s.strip().startswith(("CREATE SECRET prod_", "ATTACH "))]
+        attach = next((s for s in printed if s.startswith("ATTACH ")), "")
+        link = next((s for s in printed if s.startswith("CREATE SECRET prod_link")), "")
+        location = re.search(r"ATTACH '([^']+)'", attach)
+        checks["pondra ci init on a dev server that doesn't attach prod: the statements to run there are printed, and no ci user is made there"] = \
+            len(printed) == 3 and f"• {dev_url} doesn't attach prod yet" in first and "ci on " not in first
+
+        # Run as printed, with prod's read-only key and the read-only gate's endpoint in prod_read (across_check's prod_ro).
+        read = f"CREATE SECRET prod_read (TYPE s3, KEY_ID 'test', SECRET 'test', REGION 'us-east-1', ENDPOINT '{ro_url}', URL_STYLE 'path', SCOPE '{location.group(1)}')" if location else ""
+        ran = True
+        for stmt in [read, link, attach]:
+            try:
+                dev.q(stmt)
+            except Failed as e:
+                ran = False
+                checks[f"(the notice's statement) {stmt[:40]}"] = str(e)[:400]
+        checks["the statements printed for dev's server run there as printed (prod_read with the read-only key and endpoint filled in)"] = ran and bool(location)
+
+        _, again = cli("ci", "init")
+        dev_tok = gh_given(gh_log, "secret", "set", "PONDRA_DEV_TOKEN")
+        checks["pondra ci init again: dev's server attaches prod, so ci is made there, and its token is PONDRA_DEV_TOKEN in gh"] = \
+            f"ci on {dev_url}" in again and bool(dev_tok) and dev_tok.startswith("pt_")
+        granted = [(g, p.upper(), k, n) for g, p, k, n in rows(dev, "SELECT grantee, privilege, on_kind, on_name FROM pondra.grants")]
+        checks["ci holds CLONE on prod on dev's server, where prod is attached (pondra.grants)"] = ("ci", "CLONE", "database", "prod") in granted
+
+        # A pull request adds a view. Its branch is made on dev from prod with ci's token: prod's rows, and no file of
+        # prod's bucket copied. (prod's rows go into its files first: a branch takes the log rows not yet in a file
+        # and tiers them into its own.)
+        put(proj, "objects/sales/big.sql", "CREATE VIEW sales.big AS SELECT * FROM sales.orders WHERE amount >= 15;\n")
+        prod.q("CHECKPOINT", "prod")
+        made_code, made = cli("apply", "pr-1", "--fresh", token=dev_tok, ok=None)
+        branch = rows(dev, "SELECT id, amount FROM sales.orders ORDER BY id", "pr_1")
+        checks["pr-1 is made on dev's server from prod with ci's token: prod's rows, its folder in acme-dev with no data file, and nothing written to prod's bucket"] = \
+            branch == [(1, 10.0), (2, 20.0)] and parquet("s3://acme-dev/pr_1") == [] and counts["prod_writes"] == 0 \
+            or f"{branch}, files {parquet('s3://acme-dev/pr_1')}, writes {counts['prod_writes']}\n{made[-600:]}"
+        checks["pondra apply pr-1 --fresh with ci's token on dev: the view added (exit 0)"] = \
+            made_code == 0 and rows(dev, "SELECT id FROM sales.big ORDER BY id", "pr_1") == [(2,)] or made[-600:]
+        diff_code, diffed = cli("diff", "pr-1", token=dev_tok, ok=None)
+        checks["pondra diff pr-1 with ci's token on dev: the new view, against prod's objects read through its attachment there (exit 0)"] = \
+            diff_code == 0 and "- `+` objects/sales/big.sql" in diffed and "Objects: prod can't" not in diffed or diffed[-800:]
+
+        # prod: ci_prod applies the merged files; the dev token is refused there.
+        prod_tok = gh_given(gh_log, "secret", "set", "PONDRA_PROD_TOKEN", "--env", "prod")
+        applied, _ = cli("apply", "prod", token=prod_tok, ok=None)
+        big = rows(prod, "SELECT id FROM sales.big ORDER BY id", "prod")
+        checks["with PONDRA_PROD_TOKEN (ci_prod), pondra apply prod adds the view, which reads prod's rows"] = applied == 0 and big == [(2,)]
+        refused, _ = cli("apply", "prod", token=dev_tok, ok=None)
+        checks["with the dev token, pondra apply prod is refused"] = refused != 0
+
+        checks["the gates: dev's own key never reached prod's bucket, nothing wrote it, and the read-only key read it"] = \
+            counts["prod_by_env"] == 0 and counts["prod_writes"] == 0 and counts["prod_reads"] > 0
+        return checks
+    finally:
+        for n in (dev, prod):
+            if n:
+                n.stop()
+        for g in gates:
+            g.close()
+        if moto_proc:
+            moto_proc.terminate()
+            moto_proc.wait()
+
+
 def owners_check(bin, work, port, root):
     """Who makes a branch and who may drop it (ADR-058): CLONE is enough for a user to branch a database,
     and the branch's owner is a superuser in it; CLONE ON SCHEMA takes those schemas only; a branch is
@@ -793,21 +975,23 @@ def main():
     work = a.work or tempfile.mkdtemp(prefix="pondra-environments-")
     os.makedirs(work, exist_ok=True)
     root = f"s3://{os.environ['PONDRA_BUCKET']}/environments-{os.getpid()}-{int(time.time())}" if a.s3 else work
+    new = os.path.abspath(a.new)
+    parts = [lambda: across_check(new, work, a.port)] if a.across else [
+        lambda: environments_check(new, work, a.port, root), lambda: signed_in_check(new, work, a.port, root),
+        lambda: protect_check(new, work, a.port, root), lambda: layout_b_check(new, work, a.port), lambda: owners_check(new, work, a.port, root)]
+    checks = {}
     try:
-        if a.across:
-            checks = across_check(os.path.abspath(a.new), work, a.port)
-        else:
-            checks = environments_check(os.path.abspath(a.new), work, a.port, root)
-            checks.update(signed_in_check(os.path.abspath(a.new), work, a.port, root))
-            checks.update(protect_check(os.path.abspath(a.new), work, a.port, root))
-            checks.update(owners_check(os.path.abspath(a.new), work, a.port, root))
-    except Failed as e:
-        checks = {"ran to the end": False, "error": str(e)}
+        for i, part in enumerate(parts):
+            try:
+                checks.update(part())
+            except Failed as e:  # (one part stopped: the others still run, and say what they found)
+                checks[f"part {i + 1} ran to the end"] = str(e)[:1000]
+                stop_all()
     finally:
         stop_all()
         if a.s3:
             gone(root)
-    ok = all(v is True for k, v in checks.items() if k != "error")
+    ok = all(v is True for v in checks.values())
     print(json.dumps({**checks, "ok": ok}, indent=1))
     if ok and not a.work:
         shutil.rmtree(work, ignore_errors=True)

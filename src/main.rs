@@ -67,6 +67,7 @@ mod txn;
 mod mcp;
 mod pg;
 mod pg_catalog;
+mod ci;
 mod project;
 mod protect;
 mod query;

@@ -16,13 +16,15 @@
 - `pondra apply --watch --applies 2`: each save applied and tested; `--watch` on prod is refused;
 - `CALL plan(…)` and `CALL apply(…)` on a project kept in the workspace; `pondra.applies`;
 - `pondra switch NAME`: a branch that exists is checked out with its database made; one that doesn't is refused;
-- the developer's day: `pondra ci init`: the pull-request, closed and prod jobs.
+- the developer's day: `pondra ci init`: the workflow, prod protected, ci and ci_prod made with their grants and
+  fresh tokens, GitHub's secrets and prod environment set through gh (a stand-in that logs its calls), the tokens
+  rotated by a second run, and the same with no gh.
 
   project_check.py [--new target/release/pondra] [--work DIR] [--port 9790]
 
 Prints the checks as JSON and exits 1 if one fails (the lakes and the project are then kept in --work).
 """
-import argparse, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.request, urllib.error
+import argparse, json, os, re, shutil, subprocess, sys, tempfile, time, tomllib, urllib.request, urllib.error
 import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +43,20 @@ def put(root, rel, text):
         f.write(text)
 
 
+FAKE_GH = """#!@PYTHON@
+# A stand-in for the GitHub CLI: it logs its arguments and its standard input, and answers the two calls
+# `pondra ci init` reads from it (the repository's name and the user's id).
+import json, os, sys
+payload = sys.stdin.read()
+with open(os.environ["FAKE_GH_LOG"], "a") as log:
+    log.write(json.dumps({"args": sys.argv[1:], "stdin": payload}) + "\\n")
+if sys.argv[1:3] == ["repo", "view"]:
+    print("acme/sales")
+elif sys.argv[1:] == ["api", "user", "-q", ".id"]:
+    print(42)
+"""
+
+
 def project_check(bin, work, port):
     lakes, proj = os.path.join(work, "lakes"), os.path.join(work, "sales")
     os.makedirs(lakes, exist_ok=True)
@@ -52,9 +68,11 @@ def project_check(bin, work, port):
     env = {**os.environ, "PONDRA_HOME": os.path.join(work, "home"), "GIT_CONFIG_GLOBAL": os.devnull}
     env.pop("PONDRA_ENV", None)
 
+    signed = {}  # (the admin's Authorization, once the test signs in: a server with users answers nobody else)
+
     def call(method, path, body=None):
         data = None if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
-        req = urllib.request.Request(base + path, data=data, method=method, headers={"content-type": "application/json"})
+        req = urllib.request.Request(base + path, data=data, method=method, headers={"content-type": "application/json", **signed})
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
                 text = r.read()
@@ -369,14 +387,46 @@ def project_check(bin, work, port):
     pondra("branch", "-d", "dev-loop")  # (checked out: its git branch stays)
     subprocess.run(["git", "switch", "-q", "main"], cwd=proj, env=env, check=True)
 
-    # The developer's day: the CI workflow for a project with and without [env.test].
+    # The developer's day: `pondra ci init` sets CI up. It makes users and grants on the server, so an admin signs
+    # in first. Once a user has a token the server answers nobody anonymously, so every call from here carries the
+    # admin's token. gh is a stand-in that logs what it is asked, and what it is given on standard input.
+    q("prod", "CREATE USER root SUPERUSER")
+    root_token = q("prod", "CREATE TOKEN cli FOR USER root")["token"]
+    signed["Authorization"] = f"Bearer {root_token}"
+    pondra("login", "--token", root_token)
+    fake_gh = os.path.join(work, "fake-gh")
+    put(fake_gh, "gh", FAKE_GH.replace("@PYTHON@", sys.executable))
+    os.chmod(os.path.join(fake_gh, "gh"), 0o755)
+    env["PATH"] = fake_gh + os.pathsep + env["PATH"]
+    env["FAKE_GH_LOG"] = os.path.join(work, "gh.jsonl")
     wf_path = os.path.join(proj, ".github", "workflows", "pondra.yml")
+
+    def gh_calls():
+        path = env["FAKE_GH_LOG"]
+        return [json.loads(line) for line in open(path)] if os.path.exists(path) else []
+
+    def given(*args):
+        """What gh was given on standard input for the last call with these arguments (None: no such call)."""
+        got = [c["stdin"] for c in gh_calls() if c["args"] == list(args)]
+        return got[-1] if got else None
+
+    def whoami(tok):
+        """Whose token this is on prod: its user's name, or the HTTP status it is refused with."""
+        req = urllib.request.Request(f"{base}/db/prod/whoami", headers={"Authorization": f"Bearer {tok}"})
+        try:
+            return json.load(urllib.request.urlopen(req, timeout=60)).get("user")
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    # [env.test] on the branches' server: its CI user is dev's, so PONDRA_TEST_TOKEN is the same token.
     ci_toml = open(os.path.join(proj, "pondra.toml")).read()
-    said = pondra("ci", "init")
-    jobs = yaml.safe_load(open(wf_path).read())["jobs"]  # (PyYAML reads the key `on` as True: the jobs are read under `jobs`)
-    checks["pondra ci init: the pull-request, closed and prod jobs (no test: pondra.toml has no [env.test]); the four things to do"] = \
-        set(jobs) == {"pull-request", "closed", "prod"} and jobs["prod"]["environment"] == "prod" and "needs" not in jobs["prod"] \
-        and "CREATE USER ci_prod" in said and "GRANT APPLY ON DATABASE prod TO ci_prod" in said and "protected = true" in said
+    write("pondra.toml", ci_toml + '\n[env.test]\nclone = "prod"\n')
+    pondra("ci", "init")
+    ours = open(wf_path).read()
+    jobs = yaml.safe_load(ours)["jobs"]  # (PyYAML reads the key `on` as True: the jobs are read under `jobs`)
+    checks["pondra ci init: the workflow written, with a test job (pondra.toml has [env.test]) and prod after it"] = \
+        set(jobs) == {"pull-request", "closed", "test", "prod"} and jobs["test"]["env"]["PONDRA_TOKEN"] == "${{ secrets.PONDRA_TEST_TOKEN }}" \
+        and jobs["prod"].get("needs") == "test" and jobs["prod"]["environment"] == "prod"
     pr_runs, closed_runs = runs(jobs["pull-request"]), runs(jobs["closed"])
     checks["pondra ci init: a pull request applies pr-N --fresh and diffs it; closed drops only pr-N's database (no BRANCH env, no branch -d of the head ref)"] = \
         "pondra apply pr-${{ github.event.number }} --fresh" in pr_runs and "pondra diff pr-${{ github.event.number }} >> \"$GITHUB_STEP_SUMMARY\"" in pr_runs \
@@ -384,23 +434,62 @@ def project_check(bin, work, port):
     checks["pondra ci init: prod applies with PONDRA_PROD_TOKEN; the pull request with PONDRA_DEV_TOKEN"] = \
         jobs["prod"]["env"]["PONDRA_TOKEN"] == "${{ secrets.PONDRA_PROD_TOKEN }}" and jobs["pull-request"]["env"]["PONDRA_TOKEN"] == "${{ secrets.PONDRA_DEV_TOKEN }}" \
         and "pondra apply prod" in runs(jobs["prod"])
-    again = pondra("ci", "init", ok=False)
-    checks["pondra ci init again: refused without --force, saying so"] = "--force" in again
-    write("pondra.toml", ci_toml + '\n[env.test]\nclone = "prod"\n')
-    pondra("ci", "init", "--force")
-    jobs = yaml.safe_load(open(wf_path).read())["jobs"]
-    checks["pondra ci init --force with [env.test]: a test job with PONDRA_TEST_TOKEN, and prod needs it"] = \
-        jobs.get("test", {}).get("if") == "github.event_name == 'push'" and jobs["test"]["env"]["PONDRA_TOKEN"] == "${{ secrets.PONDRA_TEST_TOKEN }}" \
-        and jobs["prod"].get("needs") == "test"
-    write("pondra.toml", ci_toml)
+    checks["pondra ci init: prod is protected in pondra.toml, under [env.prod]"] = \
+        tomllib.loads(open(os.path.join(proj, "pondra.toml")).read()).get("env", {}).get("prod", {}).get("protected") is True
+    granted = [(g, p.upper(), k, n) for g, p, k, n in rows("prod", "SELECT grantee, privilege, on_kind, on_name FROM pondra.grants")]
+    checks["pondra ci init: ci and ci_prod made on prod, with CLONE and APPLY on prod (pondra.grants)"] = \
+        ("ci", "CLONE", "database", "prod") in granted and ("ci_prod", "APPLY", "database", "prod") in granted
+    dev_tok, test_tok = given("secret", "set", "PONDRA_DEV_TOKEN"), given("secret", "set", "PONDRA_TEST_TOKEN")
+    prod_tok = given("secret", "set", "PONDRA_PROD_TOKEN", "--env", "prod")
+    checks["pondra ci init: GitHub's secrets PONDRA_DEV_TOKEN, PONDRA_TEST_TOKEN (dev's token) and PONDRA_PROD_TOKEN (in prod) set through gh, each a pt_ token on standard input"] = \
+        all(t and t.startswith("pt_") for t in (dev_tok, prod_tok)) and test_tok == dev_tok
+    checks["pondra ci init: no token in gh's arguments (they go on standard input, where ps can't see them)"] = \
+        not any("pt_" in a for c in gh_calls() for a in c["args"])
+    env_put = [c for c in gh_calls() if c["args"][:3] == ["api", "-X", "PUT"]]
+    checks["pondra ci init: the prod environment set through gh, reviewed by gh's user (id 42), the body on standard input"] = \
+        len(env_put) == 1 and env_put[0]["args"][3] == "repos/acme/sales/environments/prod" \
+        and json.loads(env_put[0]["stdin"]) == {"reviewers": [{"type": "User", "id": 42}]}
+    checks["pondra ci init: the tokens work: PONDRA_DEV_TOKEN is ci on prod, PONDRA_PROD_TOKEN is ci_prod"] = \
+        whoami(dev_tok) == "ci" and whoami(prod_tok) == "ci_prod"
 
-    # Signed in with no URL: the project's server (the open server answers at its database prod).
-    login_out = pondra("login", "--token", "x")
+    # Again: the workflow is kept as it was, and the tokens are rotated, so the ones from before are refused.
+    again = pondra("ci", "init")
+    dev_again = given("secret", "set", "PONDRA_DEV_TOKEN")
+    checks["pondra ci init again: the workflow kept as it was, the tokens rotated (the old one refused)"] = \
+        "pondra.yml (as it was)" in again and dev_again != dev_tok and isinstance(whoami(dev_tok), int) and whoami(dev_again) == "ci"
+
+    # A workflow that differs is kept and said so; the steps after it still run (the tokens rotate); --force writes ours.
+    write(".github/workflows/pondra.yml", "# mine\n" + ours)
+    differs = pondra("ci", "init")
+    dev_differs = given("secret", "set", "PONDRA_DEV_TOKEN")
+    kept = "• kept .github/workflows/pondra.yml: yours differs (--force writes ours)" in differs and open(wf_path).read() == "# mine\n" + ours \
+        and dev_differs != dev_again
+    pondra("ci", "init", "--force")
+    checks["pondra ci init: a workflow that differs is kept and said so, the steps after it still run; --force writes ours"] = \
+        kept and open(wf_path).read() == ours
+
+    # Without gh (a PATH with git alone): the values are printed once, the environment step in words, and they work.
+    calls_before = len(gh_calls())
+    nogh = os.path.join(work, "no-gh")
+    os.makedirs(nogh, exist_ok=True)
+    os.symlink(shutil.which("git"), os.path.join(nogh, "git"))
+    with_gh, env["PATH"] = env["PATH"], nogh
+    try:
+        no_gh = pondra("ci", "init")
+    finally:
+        env["PATH"] = with_gh
+    printed = dict(re.findall(r"(PONDRA_\w+_TOKEN)=(pt_\S+)", no_gh))
+    checks["pondra ci init without gh: the secrets printed once, the environment step in words, and the printed tokens work"] = \
+        no_gh.count("PONDRA_DEV_TOKEN=") == 1 and "• add these to GitHub (shown once):" in no_gh and "Settings → Environments → prod" in no_gh \
+        and len(gh_calls()) == calls_before and whoami(printed.get("PONDRA_DEV_TOKEN", "")) == "ci" and whoami(printed.get("PONDRA_PROD_TOKEN", "")) == "ci_prod"
+
+    # Signed in with no URL: the project's server, which answers at its database prod (its root has two databases).
+    login_out = pondra("login", "--token", root_token)
     try:
         saved = json.load(open(os.path.join(work, "home", "login.json"))).get(base)
     except (OSError, ValueError):
         saved = None
-    checks["pondra login with no URL: signed in to the project's server"] = f"signed in to {base}" in login_out and saved == "x"
+    checks["pondra login with no URL: signed in to the project's server"] = f"signed in to {base}" in login_out and saved == root_token
 
     server.terminate()
     server.wait(10)

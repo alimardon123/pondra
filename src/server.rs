@@ -148,7 +148,12 @@ pub fn router(app: App) -> Router {
         .route("/plan", post(apply))
         .route("/apply", post(apply))
         .route("/test", post(apply))
-        .route("/export", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::apply::export(&app.lake).await?)) }))
+        .route("/export", get(|State(app): State<App>, Query(q): Query<HashMap<String, String>>| async move {
+            Ok::<_, E>(Json(match q.get("database") {
+                Some(name) => crate::apply::export_attached(&app.lake, name).await?,
+                None => crate::apply::export(&app.lake).await?,
+            }))
+        }))
         .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::console::objects(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))

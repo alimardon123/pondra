@@ -126,10 +126,12 @@ pub enum Command {
 
 #[derive(clap::Subcommand)]
 pub enum Ci {
-    /// Write .github/workflows/pondra.yml for the project (--force writes it again) (pondra ci init).
+    /// Set CI up for the project: the GitHub Actions workflow, prod protected in pondra.toml, the users CI
+    /// signs in as, and GitHub's secrets and prod environment (pondra ci init).
     Init {
         #[arg(long, default_value = ".")]
         project: String,
+        /// Write the workflow again when it differs from ours (yours is kept otherwise).
         #[arg(long)]
         force: bool,
     },
@@ -142,7 +144,7 @@ pub struct Where {
     env: Option<String>,
     /// The project's folder.
     #[arg(long, default_value = ".")]
-    project: String,
+    pub(crate) project: String,
     /// A node to use instead (http://host:8080).
     #[arg(long)]
     url: Option<String>,
@@ -165,11 +167,11 @@ impl Where {
 }
 
 #[derive(Deserialize, Default)]
-struct Toml {
+pub(crate) struct Toml {
     #[serde(default)]
     project: Section,
     #[serde(default)]
-    env: BTreeMap<String, Env>,
+    pub(crate) env: BTreeMap<String, Env>,
     #[serde(default)]
     secrets: BTreeMap<String, String>, // a `$name` → `env:VARIABLE`, read on the applying machine
 }
@@ -181,7 +183,7 @@ struct Section {
 }
 
 #[derive(Deserialize, Default, Clone)]
-struct Env {
+pub(crate) struct Env {
     #[serde(default)]
     url: Option<String>,
     #[serde(default)]
@@ -194,7 +196,7 @@ struct Env {
     protected: bool, // its objects change only by an apply: `pondra apply --watch` never applies here
 }
 
-fn read_toml(dir: &Path) -> Result<Toml> {
+pub(crate) fn read_toml(dir: &Path) -> Result<Toml> {
     match std::fs::read_to_string(dir.join("pondra.toml")) {
         Ok(t) => toml::from_str(&t).context("pondra.toml"),
         Err(_) => Ok(Toml::default()),
@@ -261,7 +263,7 @@ fn clone_of(toml: &Toml, env: &str) -> Option<String> {
 
 /// The server `env`'s database is on, without a trailing slash: its own `server` (a branch's is
 /// [env.dev]'s), else the project's.
-fn server_of(toml: &Toml, env: &str) -> Option<String> {
+pub(crate) fn server_of(toml: &Toml, env: &str) -> Option<String> {
     section_of(toml, env).and_then(|e| e.server.clone()).or_else(|| toml.project.server.clone()).map(|s| s.trim_end_matches('/').to_string())
 }
 
@@ -311,9 +313,9 @@ fn only_env(toml: &Toml) -> Result<String> {
 // ---------------------------------------------------------------- nodes
 
 /// A node to talk to, and the node this command started for a lake, if it did.
-struct Node {
+pub(crate) struct Node {
     http: reqwest::Client,
-    base: String,
+    pub(crate) base: String,
     token: Option<String>,
     owner: String,
     child: Option<std::process::Child>,
@@ -344,7 +346,7 @@ impl Node {
 
     async fn get(&self, rel: &str) -> Result<Value> { self.send(self.http.get(format!("{}{rel}", self.base))).await }
 
-    async fn sql(&self, sql: &str) -> Result<Value> { self.post("/sql", json!({"sql": sql})).await }
+    pub(crate) async fn sql(&self, sql: &str) -> Result<Value> { self.post("/sql", json!({"sql": sql})).await }
 }
 
 /// This machine's own database: the lake in the project's `lake/` folder, which `pondra` opens as its shell
@@ -394,7 +396,7 @@ fn node_at(at: &Where, base: String) -> Node {
 }
 
 /// The node an environment is served by. A lake's node is started for the command and stopped when it ends.
-async fn node(at: &Where, toml: &Toml, env: &str) -> Result<Node> {
+pub(crate) async fn node(at: &Where, toml: &Toml, env: &str) -> Result<Node> {
     if let Some(lake) = lake_of(at, toml, env) {
         let (mut child, base, owner, log) = crate::shell::start(&lake)?;
         let http = crate::shell::up(&base, &mut child, &log).await?;
@@ -411,12 +413,18 @@ async fn node(at: &Where, toml: &Toml, env: &str) -> Result<Node> {
 /// The node that makes `env`'s database as a clone of `src`. On src's own server it is src's node; when
 /// env is on another server, it is that server's root, where src is attached (ADR-058). An address the
 /// user gave is where they said.
-async fn maker(at: &Where, toml: &Toml, env: &str, src: &str) -> Result<Node> {
-    let typed = at.url.is_some() || at.lake.is_some();
-    match (server_of(toml, env), server_of(toml, src)) {
-        (Some(s), other) if !typed && other.as_deref() != Some(s.as_str()) => Ok(node_at(at, s)),
-        _ => node(at, toml, src).await,
+pub(crate) async fn maker(at: &Where, toml: &Toml, env: &str, src: &str) -> Result<Node> {
+    match across(at, toml, env, src) {
+        Some(server) => Ok(node_at(at, server)),
+        None => node(at, toml, src).await,
     }
+}
+
+/// env's server, when src is on another (where src is attached, ADR-058). None on one server, or at an
+/// address the user gave.
+fn across(at: &Where, toml: &Toml, env: &str, src: &str) -> Option<String> {
+    let typed = at.url.is_some() || at.lake.is_some();
+    server_of(toml, env).filter(|s| !typed && server_of(toml, src).as_deref() != Some(s.as_str()))
 }
 
 /// `CREATE DATABASE IF NOT EXISTS env CLONE src`, sent to the node that makes it (`fresh`: dropped first).
@@ -727,7 +735,10 @@ async fn run(cmd: Command) -> Result<(String, bool)> {
         Command::Test { target, at } => tests(&at.with(target)).await,
         Command::Export { dir, at } => export(dir.as_deref().unwrap_or("."), &at).await.map(|s| (s, true)),
         Command::Diff { target, at, against } => diff(&at.with(target), against).await,
-        Command::Ci { cmd: Ci::Init { project, force } } => ci_init(&project, force).map(|s| (s, true)),
+        Command::Ci { cmd: Ci::Init { project, force } } => {
+            let at = Where { env: None, project, url: None, lake: None, token: None };
+            crate::ci::init(&at, force).await.map(|()| (String::new(), true)) // (its lines are printed as each step is done)
+        }
     }
 }
 
@@ -873,99 +884,6 @@ async fn list_branches(at: &Where) -> Result<String> {
         let when: String = r["branched_at"].as_str().unwrap_or_default().replace('T', " ").chars().take(16).collect();
         let owner = r["owner"].as_str().map(|o| format!("  {o}")).unwrap_or_default();
         out.push_str(&format!("{mark} {name:<width$}  from {}  {when}{owner}\n", r["base"].as_str().unwrap_or_default()));
-    }
-    Ok(out)
-}
-
-// ---------------------------------------------------------------- continuous integration
-
-/// The workflow `pondra ci init` writes, in three parts: the pull requests and the merge's test job
-/// (in `workflow`), then prod, which waits for test when there is one. `@VERSION@` is this pondra.
-const WORKFLOW_TOP: &str = r##"# Pondra (pondra ci init): each pull request gets a branch of prod with its code applied and
-# tested, and the diff on the pull request; a merge to main applies to test; an approval in
-# GitHub's "prod" environment applies the same commit to prod.
-name: pondra
-on:
-  pull_request:
-    types: [opened, synchronize, reopened, closed]
-  push:
-    branches: [main]
-concurrency: pondra-${{ github.event.pull_request.number || github.ref }}
-jobs:
-  pull-request:
-    if: github.event_name == 'pull_request' && github.event.action != 'closed'
-    runs-on: ubuntu-latest
-    env:
-      PONDRA_TOKEN: ${{ secrets.PONDRA_DEV_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-      - run: pip install pondra==@VERSION@
-      - run: pondra apply pr-${{ github.event.number }} --fresh
-      - run: pondra diff pr-${{ github.event.number }} >> "$GITHUB_STEP_SUMMARY"
-  closed:
-    if: github.event_name == 'pull_request' && github.event.action == 'closed'
-    runs-on: ubuntu-latest
-    env:
-      PONDRA_TOKEN: ${{ secrets.PONDRA_DEV_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-      - run: pip install pondra==@VERSION@
-      - run: pondra branch -d pr-${{ github.event.number }}
-"##;
-
-const WORKFLOW_TEST: &str = r##"  test:
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    env:
-      PONDRA_TOKEN: ${{ secrets.PONDRA_TEST_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-      - run: pip install pondra==@VERSION@
-      - run: pondra apply test
-"##;
-
-const WORKFLOW_PROD: &str = r##"    runs-on: ubuntu-latest
-    environment: prod
-    env:
-      PONDRA_TOKEN: ${{ secrets.PONDRA_PROD_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-      - run: pip install pondra==@VERSION@
-      - run: pondra apply prod
-"##;
-
-/// The whole workflow for this pondra; the test job and prod's `needs` only when pondra.toml has [env.test].
-fn workflow(version: &str, test: bool) -> String {
-    let mut y = String::from(WORKFLOW_TOP);
-    if test {
-        y.push_str(WORKFLOW_TEST);
-    }
-    y.push_str("  prod:\n    if: github.event_name == 'push'\n");
-    if test {
-        y.push_str("    needs: test\n");
-    }
-    y.push_str(WORKFLOW_PROD);
-    y.replace("@VERSION@", version)
-}
-
-/// `pondra ci init`: the project's GitHub Actions workflow, and what is left for a person to set up.
-fn ci_init(dir: &str, force: bool) -> Result<String> {
-    let project = Path::new(dir);
-    ensure!(project.join("pondra.toml").exists(), "no pondra.toml here: pondra init first");
-    let path = project.join(".github/workflows/pondra.yml");
-    ensure!(force || !path.exists(), "{} is there: --force writes it again", path.display());
-    let toml = read_toml(project)?;
-    std::fs::create_dir_all(path.parent().unwrap_or(project))?;
-    std::fs::write(&path, workflow(env!("CARGO_PKG_VERSION"), toml.env.contains_key("test")))?;
-    let mut out = String::from("wrote .github/workflows/pondra.yml. Then:\n");
-    out.push_str("  1. on prod, a user for CI that may apply and nothing more:\n");
-    out.push_str("       CREATE USER ci_prod; GRANT APPLY ON DATABASE prod TO ci_prod; CREATE TOKEN github FOR USER ci_prod;\n");
-    out.push_str("  2. on the server the branches are made on (dev), a token that may make databases\n");
-    out.push_str("  3. in GitHub: the secrets PONDRA_DEV_TOKEN, PONDRA_PROD_TOKEN and, with [env.test], PONDRA_TEST_TOKEN\n");
-    out.push_str("     (the same token for each if one server holds everything), and an environment named prod with\n");
-    out.push_str("     required reviewers (Settings → Environments)\n");
-    if !toml.env.get("prod").is_some_and(|e| e.protected) {
-        out.push_str("  4. in pondra.toml: protected = true under [env.prod], so only CI's applies change prod\n");
     }
     Ok(out)
 }
@@ -1122,7 +1040,7 @@ fn clock() -> String {
 }
 
 /// Prints now, not when the buffer fills: a watch's lines show as they happen.
-fn say(text: &str) {
+pub(crate) fn say(text: &str) {
     use std::io::Write;
     print!("{text}");
     let _ = std::io::stdout().flush();
@@ -1178,21 +1096,19 @@ fn objects_diff(a: &BTreeMap<String, String>, b: &BTreeMap<String, String>) -> S
     if lines.is_empty() { "Objects: the same.\n\n".to_string() } else { format!("Objects:\n\n{}\n", lines.concat()) }
 }
 
-/// The rows each table has changed against `against`, as Markdown rows: inserted, changed, deleted (`pondra.diff`).
-async fn row_diffs(mine: &Node, against: &str, tables: &[String]) -> Vec<String> {
+/// The rows each table has changed against `against`, as Markdown rows: inserted, changed, deleted, asked of
+/// `node` as `pondra.diff('{against}.t', '{mine}t')`. The first table `against` can't be read from there stops it.
+async fn row_diffs(node: &Node, against: &str, mine: &str, tables: &[String]) -> Result<Vec<String>> {
     let mut rows = vec![];
     for t in tables {
-        let sql = format!("SELECT _change_type AS c, count(*) AS n FROM pondra.diff('{}.{t}', '{t}') GROUP BY 1", database(against));
-        match mine.sql(&sql).await {
-            Ok(Value::Array(found)) if !found.is_empty() => {
-                let n = |c: &str| found.iter().filter(|r| r["c"] == c).map(|r| r["n"].as_u64().unwrap_or(0)).sum::<u64>();
-                rows.push(format!("| {t} | {} | {} | {} |\n", n("insert"), n("update_postimage"), n("delete")));
-            }
-            Ok(_) => {}
-            Err(e) => rows.push(format!("| {t} | ({}) | | |\n", first_line(&e))),
+        let sql = format!("SELECT _change_type AS c, count(*) AS n FROM pondra.diff('{}.{t}', '{mine}{t}') GROUP BY 1", database(against));
+        let Value::Array(found) = node.sql(&sql).await? else { continue };
+        if !found.is_empty() {
+            let n = |c: &str| found.iter().filter(|r| r["c"] == c).map(|r| r["n"].as_u64().unwrap_or(0)).sum::<u64>();
+            rows.push(format!("| {t} | {} | {} | {} |\n", n("insert"), n("update_postimage"), n("delete")));
         }
     }
-    rows
+    Ok(rows)
 }
 
 /// `pondra diff`: what an environment changes against another. When the other can't be read from here, the
@@ -1204,9 +1120,13 @@ async fn diff(at: &Where, against: Option<String>) -> Result<(String, bool)> {
     let head = made(at, &toml, &env, false).await?.unwrap_or_default();
     let against = against.unwrap_or_else(|| clone_of(&toml, &env).unwrap_or_else(|| "prod".into()));
     let mine = node(at, &toml, &env).await?;
-    let base = node(&Where { env: Some(against.clone()), url: None, lake: None, ..at.clone() }, &toml, &against).await?;
     let b = exported(&mine).await?;
-    let theirs = exported(&base).await;
+    // (against on another server is read where it is attached: env's server's own database, ADR-058)
+    let there = across(at, &toml, &env, &against).map(|server| node_at(at, server));
+    let theirs = match &there {
+        Some(n) => n.get(&format!("/export?database={}", database(&against))).await.and_then(|v| Ok(serde_json::from_value(v)?)),
+        None => exported(&node(&Where { env: Some(against.clone()), url: None, lake: None, ..at.clone() }, &toml, &against).await?).await,
+    };
     let mut out = format!("{head}### {} against {}\n\n", database(&env), database(&against));
     match &theirs {
         Ok(a) => out.push_str(&objects_diff(a, &b)),
@@ -1214,10 +1134,14 @@ async fn diff(at: &Where, against: Option<String>) -> Result<(String, bool)> {
     }
     // (a table both sides define; when the other can't be read, every table here)
     let tables: Vec<String> = b.iter().filter(|(p, t)| is_table(t) && theirs.as_ref().ok().is_none_or(|a| a.get(*p).is_some_and(|x| is_table(x)))).filter_map(|(p, _)| table_of(p)).collect();
-    let rows = row_diffs(&mine, &against, &tables).await;
-    out.push_str(&match rows.is_empty() {
-        true => "Rows: the same in every table both have.\n".to_string(),
-        false => format!("Rows:\n\n| table | inserted | changed | deleted |\n|---|---:|---:|---:|\n{}", rows.concat()),
+    let rows = match &there {
+        Some(n) => row_diffs(n, &against, &format!("{}.", database(&env)), &tables).await,
+        None => row_diffs(&mine, &against, "", &tables).await,
+    };
+    out.push_str(&match rows {
+        Ok(rows) if rows.is_empty() => "Rows: the same in every table both have.\n".to_string(),
+        Ok(rows) => format!("Rows:\n\n| table | inserted | changed | deleted |\n|---|---:|---:|---:|\n{}", rows.concat()),
+        Err(e) => format!("Rows: not compared from here ({}).\n", first_line(&e)),
     });
     Ok((out, true))
 }
