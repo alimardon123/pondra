@@ -113,6 +113,8 @@ The IDs other documents cite. Done items are gone from this list (their ADRs and
 | E15 | Machine learning models trained in SQL (approved 2026-10-10; `designs/models-and-names.md`). ADR-051's `CREATE MODEL` gains `AS SELECT …` with a trainer (`USING 'sklearn/GradientBoostingClassifier'`, the library's own class, or `FUNCTION f`; `WITH (target = …)`; a registry of trainers), trained on a Python worker as a run. Each version keeps its object, the commit it read, its metrics and who made it. `predict('m', …)` and `predict_proba('m', …)` are vectorized functions spread with the query, alongside `pondra.evaluate('m' [, (query)])`, `pondra.model_versions('m')`, `ALTER MODEL m ADD VERSION` and `SET (default_version = n)`. Features are views kept current; `ASOF JOIN` builds training sets as of each label's time; keyed lookups serve features online. Proof: `harness.py models` | right after 1.0 (with ADR-051 phase 2) |
 | F | Depth by evidence (above) | after 1.0 |
 | G6, G7 | Databases attached with their changes streamed in; sinks | 36 |
+| G10 | XML files as tables: `read_xml('…')`, one more `read_*` format beside `read_json`, through every door that reads files | 36 |
+| G11 | Files loaded once each as they land (what Snowpipe and Auto Loader do): `COPY INTO t FROM 's3://landing/…'` remembers the files it loaded, so running it again (or as a task) loads only new ones, each once through a failover; its spelling goes past the SQL review first | 36 |
 | I1 | Extensions (ADR-031, proposed) | after 1.0 |
 | J1, J3–J7 | The platform on top (above) | after 1.0 |
 
