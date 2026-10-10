@@ -138,16 +138,6 @@ pub async fn use_of(lake: &Lake, sql: &str) -> Result<String> {
     Ok(text_of(&here, &[entry]))
 }
 
-/// `SHOW search_path` as a one-row answer: the session's path as it was set, `public` when none
-/// was. Every door reads it so (the Postgres port answers it the same way: `pg.rs`).
-pub fn show(sql: &str) -> Option<String> {
-    static SHOW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*show\s+search_path\s*;?\s*$").expect("a regex"));
-    SHOW.is_match(sql).then(|| {
-        let path = crate::settings::shown("search_path").unwrap_or_else(|| PUBLIC.to_string());
-        format!("SELECT '{}' AS search_path", path.replace('\'', "''"))
-    })
-}
-
 /// `SET SCHEMA 'x'` (Postgres's alias of `SET search_path TO x`, which sqlparser doesn't read): x.
 pub fn set_schema(sql: &str) -> Option<String> {
     static SET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*set\s+schema\s+(?:'((?:[^']|'')*)'|(\S+?))\s*;?\s*$").expect("a regex"));
@@ -824,8 +814,10 @@ mod tests {
 
     #[test]
     fn shows_the_path() {
-        assert_eq!(show("show search_path;").as_deref(), Some("SELECT 'public' AS search_path")); // (no session here: public)
-        assert_eq!(show("SHOW datafusion.execution.batch_size"), None);
+        assert_eq!(crate::settings::show("show search_path;").as_deref(), Some("SELECT 'public' AS search_path")); // (no session here: public)
+        assert_eq!(crate::settings::show("SHOW datafusion.execution.batch_size"), None);
+        assert_eq!(crate::settings::show("SHOW TIMEZONE"), None);
+        assert_eq!(crate::settings::show("SHOW TABLES"), None);
     }
 
     #[test]

@@ -221,6 +221,19 @@ pub fn dialect() -> Option<Box<dyn datafusion::sql::sqlparser::dialect::Dialect>
     datafusion::sql::sqlparser::dialect::dialect_from_str(session.or_else(node)?)
 }
 
+/// `SHOW name` of a Postgres setting the session keeps: one row, its column named as the setting,
+/// as Postgres answers it (`search_path` is `public` until set). DataFusion's own (`datafusion.*`,
+/// `TIME ZONE`) and a name never set are left to DataFusion's `SHOW`.
+pub fn show(sql: &str) -> Option<String> {
+    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^\s*show\s+([a-z_][a-z0-9_]*)\s*;?\s*$").expect("a regex"));
+    let n = SHOW.captures(sql)?[1].to_lowercase();
+    if name(&n).contains('.') {
+        return None;
+    }
+    let v = shown(&n).or_else(|| (n == "search_path").then(|| "public".to_string()))?;
+    Some(format!("SELECT '{}' AS {n}", v.replace('\'', "''")))
+}
+
 /// A Postgres setting the current session set (`SHOW name`).
 pub fn shown(n: &str) -> Option<String> {
     let s = crate::temp::current()?;

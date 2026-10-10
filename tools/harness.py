@@ -9128,7 +9128,7 @@ def use_path():
     q("CREATE TABLE t (a INT)")
     q("INSERT INTO t VALUES (11), (12), (13), (14), (15)")
     # USE crm, the names it gives, SHOW, RESET.
-    h1 = {"x-pondra-session": "use-one"}
+    h1 = {"x-pondra-session": "use-one-1"}
     q("USE crm", h1)
     info["crm"] = q("SELECT count(*) AS n FROM t", h1)
     info["names"] = q("SELECT current_schema() AS s, current_database() AS d", h1)
@@ -9136,7 +9136,7 @@ def use_path():
     q("RESET search_path", h1)
     info["reset"] = q("SELECT count(*) AS n FROM t", h1)
     checks["USE crm: a one-part name is crm's (2 rows, not public's 5); current_schema() and current_database() say so; SHOW search_path shows it; RESET gives public back"] = \
-        info["crm"] == [{"n": 2}] and info["names"] == [{"s": "crm", "d": db_name}] and [r.get("value") for r in info["shown"]] == ["crm"] and info["reset"] == [{"n": 5}]
+        info["crm"] == [{"n": 2}] and info["names"] == [{"s": "crm", "d": db_name}] and info["shown"] == [{"search_path": "crm"}] and info["reset"] == [{"n": 5}]
     # The result cache is keyed by the text the engine runs: the same text, under USE crm and not, in turns and at once.
     a, b = {"x-pondra-session": "use-cache-a"}, {"x-pondra-session": "use-cache-b"}
     q("USE crm", a)
@@ -9152,7 +9152,7 @@ def use_path():
     checks["the result cache isn't fooled: the same text under USE crm (2) and without (5), in turns and in two sessions at once"] = \
         info["turns"] == [2, 5] * 3 and at_once == {"a": [2, 2, 2], "b": [5, 5, 5]}
     # Writes and DDL go to the session's schema.
-    w = {"x-pondra-session": "use-write"}
+    w = {"x-pondra-session": "use-write-1"}
     q("USE crm", w)
     q("INSERT INTO t VALUES (9)", w)
     q("UPDATE t SET a = 10 WHERE a = 9", w)
@@ -9177,14 +9177,14 @@ def use_path():
     info["view public, under USE crm"] = q("SELECT n FROM public.pv", w)
     checks["a view keeps its names: crm's read with no path or public's path (3), public's read under USE crm (5)"] = \
         info["view crm, no path"] == [{"n": 3}] and info["view crm, public's path"] == [{"n": 3}] and info["view public, under USE crm"] == [{"n": 5}]
-    # Names that are not a schema's: a CTE, a temporary table, the Postgres catalog.
-    s = {"x-pondra-session": "use-skip"}
+    # Names that are not a schema's: a CTE, a temporary table, the information schema (pg_class: the Postgres check).
+    s = {"x-pondra-session": "use-skip-1"}
     q("USE crm", s)
     q("CREATE TEMP TABLE tmp AS SELECT 7 AS a", s)
     info["cte"] = q("WITH t AS (SELECT 42 AS a) SELECT a FROM t", s)
     info["temp"] = q("SELECT a FROM tmp", s)
-    info["catalog"] = q("SELECT count(*) AS n FROM pg_class", s)
-    checks["under USE crm a CTE named t, a temporary table and pg_class are the query's own, not crm's"] = \
+    info["catalog"] = q("SELECT count(*) AS n FROM information_schema.tables", s)
+    checks["under USE crm a CTE named t, a temporary table and information_schema.tables are the query's own, not crm's"] = \
         info["cte"] == [{"a": 42}] and info["temp"] == [{"a": 7}] and info["catalog"][0]["n"] > 0
     # SET search_path: crm first, then public, new objects in crm.
     q("CREATE TABLE only_pub (x INT)")
@@ -9199,7 +9199,7 @@ def use_path():
     checks["SET search_path TO crm, public: crm's table first (3 rows), a table only in public found, a new table made in crm"] = \
         info["path count"] == [{"n": 3}] and info["path public"] == [{"x": 7}] and info["made here"] == [{"n": 0}] and info["not in public"]
     # A task made under USE crm is crm's, and writes into crm.
-    k = {"x-pondra-session": "use-task"}
+    k = {"x-pondra-session": "use-task-1"}
     q("CREATE TABLE crm.log (x INT)")
     q("USE crm", k)
     q("CREATE TASK tk SCHEDULE '1 second' AS INSERT INTO log VALUES (1)", k)
@@ -9228,9 +9228,9 @@ def use_path():
         and info["DATABASE other"] == [{"n": 5}] and q("SELECT count(*) AS n FROM other.public.ot") == [{"n": 5}]
     # Refused by name: a name that is both, unknown ones, no session, pondra sql.
     q("CREATE SCHEMA other")  # (now `other` is a database and a schema of this lake: USE other must say which)
-    info["both"] = http("USE other", "use-both")
-    info["nope"] = http("USE nope", "use-nope")
-    info["nope db"] = http("USE nope.public", "use-nope")
+    info["both"] = http("USE other", "use-both-1")
+    info["nope"] = http("USE nope", "use-nope-1")
+    info["nope db"] = http("USE nope.public", "use-nope-1")
     info["no session"] = http("USE crm")
     cli = subprocess.run([BIN, "sql", "--dir", lake, "USE crm"], capture_output=True, text=True, timeout=120)
     info["cli"] = [cli.returncode, (cli.stdout + cli.stderr)[-300:]]

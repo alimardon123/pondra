@@ -793,8 +793,8 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
 /// `information_schema.schemata`, `secrets()`, `pondra.users` and `pondra.grants`, as Snowflake has them. (`SHOW FUNCTIONS` is every function a query may call,
 /// as DataFusion lists them: its own, and the Python ones; `SHOW TABLES` is DataFusion's.)
 fn show(sql: &str) -> Option<String> {
-    if let Some(q) = crate::path::show(sql) {
-        return Some(q); // (`SHOW search_path`: the session's path)
+    if let Some(q) = crate::settings::show(sql) {
+        return Some(q); // (`SHOW search_path`, `SHOW application_name`: the session's)
     }
     static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views|schemas|databases|secrets|users|roles|grants)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
     if let Some(q) = show_shares(sql) {
