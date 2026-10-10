@@ -7713,12 +7713,41 @@ def friendly():
     return f"SQL as DuckDB's users write it: {len(same) + 1} forms answer as DuckDB does, samples sample, refusals by name, spread == one node"
 
 
+# About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
+# prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
+# suite in parts side by side that end together. A section not listed counts as 5 s.
+SECS = {"stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
+        "found": 26, "alter": 24, "outside": 20, "load": 20, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
+        "users": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
+        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10}
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, plans, friendly, reader, crash)}
-    A.secs = min(A.secs, 20)
-    out["load"] = load()
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, plans, friendly, reader, crash, load)
+    k, n = (int(x) for x in A.shard.split("/"))
+    if not 1 <= k <= n:
+        sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
+    out = {}
+    for t in shard(sections, k, n):
+        if t is load:
+            A.secs = min(A.secs, 20)
+        t0 = time.time()
+        out[t.__name__] = t()
+        print(f"harness all: {t.__name__} took {time.time() - t0:.0f} s", file=sys.stderr, flush=True)
     print(json.dumps(out, indent=1))
+
+
+def shard(sections, k, n):
+    """The k-th of n shares of `sections`, in their own order: each section, longest first, goes to
+    the share with the least time so far (SECS), so the shares take about as long."""
+    sums, mine = [0] * n, set()
+    for t in sorted(sections, key=lambda t: -SECS.get(t.__name__, 5)):
+        i = sums.index(min(sums))
+        sums[i] += SECS.get(t.__name__, 5)
+        if i == k - 1:
+            mine.add(t)
+    return [t for t in sections if t in mine]
 
 
 if __name__ == "__main__":
@@ -7733,6 +7762,7 @@ if __name__ == "__main__":
     ap.add_argument("--rounds", type=int, default=12, help="tiering test: write + /tier rounds")
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
+    ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
         {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
