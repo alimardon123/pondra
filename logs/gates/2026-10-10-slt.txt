@@ -1,5 +1,5 @@
 [1/504] agg_func_substitute.slt: 2/5
-[2/504] aggregate.slt: 1359/1405
+[2/504] aggregate.slt: 1360/1405
 [3/504] aggregate_any_value.slt: 5/6
 [4/504] aggregate_memory_spill.slt: 13/21
 [5/504] aggregate_repartition.slt: 8/11
@@ -21,7 +21,7 @@
 [21/504] array/array_first.slt: 18/18
 [22/504] array/array_has.slt: 232/238
 [23/504] array/array_index.slt: 156/156
-[24/504] array/array_length.slt: 198/200
+[24/504] array/array_length.slt: 199/200
 [25/504] array/array_literal.slt: 141/141
 [26/504] array/array_min_max.slt: 173/173
 [27/504] array/array_operators.slt: 139/141
@@ -37,7 +37,7 @@
 [37/504] array/array_slice.slt: 200/200
 [38/504] array/array_sort.slt: 160/160
 [39/504] array/array_to_string.slt: 174/174
-[40/504] array/array_transform.slt: 40/49
+[40/504] array/array_transform.slt: 41/49
 [41/504] array/array_union.slt: 174/174
 [42/504] array/arrays_zip.slt: 203/203
 [43/504] array/cardinality.slt: 145/145
@@ -69,7 +69,7 @@
 [69/504] clickbench_extended.slt: 8/9
 [70/504] coalesce.slt: 63/63
 [71/504] copy.slt: 70/96
-[72/504] cosine_distance.slt: 21/23
+[72/504] cosine_distance.slt: 23/23
 [73/504] count_star_rule.slt: 7/11
 [74/504] create_external_table.slt: 45/56
 [75/504] create_function.slt: 6/8
@@ -91,12 +91,12 @@
 [91/504] datetime/arith_timestamp_timestamp.slt: 2/2
 [92/504] datetime/current_date_timezone.slt: 13/13
 [93/504] datetime/current_time_timezone.slt: 17/17
-[94/504] datetime/date_part.slt: 245/282
+[94/504] datetime/date_part.slt: 246/282
 [95/504] datetime/dates.slt: 64/68
-[96/504] datetime/interval.slt: 71/95
+[96/504] datetime/interval.slt: 95/95
 [97/504] datetime/interval_mysql.slt: 10/10
-[98/504] datetime/timestamps.slt: 800/831
-[99/504] ddl.slt: 169/206
+[98/504] datetime/timestamps.slt: 806/831
+[99/504] ddl.slt: 180/206
 [100/504] decimal.slt: 167/167
 [101/504] delete.slt: 5/13
 [102/504] describe.slt: 24/26
@@ -113,7 +113,7 @@
 [113/504] encrypted_parquet.slt: 6/10
 [114/504] errors.slt: 34/35
 [115/504] explain.slt: 62/80
-[116/504] explain_analyze.slt: 83/109
+[116/504] explain_analyze.slt: 85/109
 [117/504] explain_tree.slt: 57/92
 [118/504] expr.slt: 446/449
 [119/504] file_row_index.slt: 20/23
@@ -124,18 +124,18 @@
 [124/504] functional_dependencies.slt: 23/36
 [125/504] functions.slt: 252/269
 [126/504] group.slt: 37/37
-[127/504] group_by.slt: 563/638
+[127/504] group_by.slt: 564/638
 [128/504] grouping.slt: 34/34
 [129/504] grouping_set_repartition.slt: 11/12
 [130/504] ident_normalization.slt: 20/34
 [131/504] identifiers.slt: 19/19
 [132/504] imdb.slt: 176/176
-[133/504] in_list.slt: 29/38
+[133/504] in_list.slt: 34/38
 [134/504] information_schema.slt: 65/108
 [135/504] information_schema_columns.slt: 6/10
 [136/504] information_schema_multiple_catalogs.slt: 18/24
 [137/504] information_schema_table_types.slt: 6/7
-[138/504] inner_product.slt: 24/26
+[138/504] inner_product.slt: 26/26
 [139/504] input_file_name.slt: 11/14
 [140/504] insert.slt: 63/67
 [141/504] insert_to_external.slt: 72/98
@@ -235,7 +235,7 @@
 [235/504] spark/aggregate/collect_window.slt: 42/42
 [236/504] spark/aggregate/try_sum.slt: 20/20
 [237/504] spark/array/array.slt: 13/13
-[238/504] spark/array/array_contains.slt: 13/17
+[238/504] spark/array/array_contains.slt: 17/17
 [239/504] spark/array/array_repeat.slt: 17/17
 [240/504] spark/array/sequence.slt: 0/0
 [241/504] spark/array/shuffle.slt: 18/18
@@ -357,7 +357,7 @@
 [357/504] spark/math/log1p.slt: 0/0
 [358/504] spark/math/log2.slt: 0/0
 [359/504] spark/math/mod.slt: 49/49
-[360/504] spark/math/negative.slt: 57/60
+[360/504] spark/math/negative.slt: 58/60
 [361/504] spark/math/pi.slt: 0/0
 [362/504] spark/math/pmod.slt: 65/65
 [363/504] spark/math/positive.slt: 0/0
@@ -503,37 +503,38 @@
 [503/504] window_topk_pushdown.slt: 10/12
 [504/504] window_topn.slt: 76/100
 
-22669 of 23162 records pass (97.9%), 504 files, 1 node(s); 1621 more fail for a named reason (91.5% of all 24783)
-  1310  [plan text] EXPLAIN prints Pondra's plan, made with rules and scans of its own (optimize.rs, scan.rs): the text differs where the answers agree
+22731 of 23159 records pass (98.2%), 504 files, 1 node(s); 1624 more fail for a named reason (91.7% of all 24783)
+  1312  [plan text] EXPLAIN prints Pondra's plan, made with rules and scans of its own (optimize.rs, scan.rs): the text differs where the answers agree
     37  [a write explained] EXPLAIN of an INSERT, UPDATE, DELETE or COPY: Pondra's writes aren't DataFusion's plans
    196  [the runner's own] a table or function DataFusion's runner makes in Rust before the file runs (range_partitioned, table_with_metadata, union_table, async_abs, …): no SQL in the file makes it
     41  [the node's memory] datafusion.runtime.* (memory limit, spill folder, caches) is the node's, set as it starts (PONDRA_MEMORY_MB, PONDRA_SPILL_DIR), not a session's
     23  [microseconds] a table's TIMESTAMP keeps microseconds, as Postgres, Delta and Iceberg do; DataFusion's keeps nanoseconds, which the answer shows
      6  [an order not asked for] the same rows in another order, from a query with no ORDER BY: SQL leaves the order open, and Pondra's plans give another
      8  [interval arithmetic] `n * INTERVAL '1 hour'` and `INTERVAL … / n`, which DataFusion refuses and Pondra computes as Postgres does
+     1  [FETCH FIRST] `FETCH FIRST | NEXT n ROWS ONLY`, standard SQL that DataFusion refuses and Pondra takes, as Postgres and DuckDB do (friendly.rs)
 
-   174  answer differs
-    50  Error during planning: table … not found"
-    48  an error was expected
+   159  answer differs
+    48  Error during planning: table … not found"
+    44  an error was expected
     17  Error during planning: Column in SELECT must be in GROUP BY or an aggregate function: While expanding wildcard, column … must appear in the 
-    14  NYI: Attempting to write an Arrow interval type MonthDayNano to parquet that is not yet implemented'
     11  files stored as avro: Pondra reads Parquet, CSV, JSON (a value a line) and Arrow'
      8  COPY \xe2\x80\xa6 TO … (FORMAT parquet, \xe2\x80\xa6): OPTIONS (… …, \xe2\x80\xa6)"
      6  N
      6  This feature is not implemented: Unsupported SQL type UUID'
-     6  Schema error: No field named d.
-     6  Schema error: No field named ts.
      6  Invalid argument error: Arrow IPC field metadata cannot encode direct dictionary-of-dictionary values for field …'
      5  date value out of range
-     5  table t already exists (CREATE TABLE IF NOT EXISTS leaves it as it is; CREATE OR REPLACE TABLE makes it anew)'
-     5  Schema error: No field named time.
      5  CREATE EXTERNAL TABLE \xe2\x80\xa6 OPTIONS (… \xe2\x80\xa6): Pondra doesn't read files with it"
      4  [<class …>]
      3  gzip files aren't read yet: Parquet, CSV, JSON and Arrow as they are"
-     3  t already exists (CREATE OR REPLACE EXTERNAL TABLE, or IF NOT EXISTS)'
      3  …: names are letters, digits, _ and - (a dot separates schema and table)'
      3  NYI: Datatype Dictionary(Int32, Dictionary(UInt32, Utf8)) is not yet supported'
      3  Invalid argument error: Arrow IPC field metadata cannot encode direct dictionary-of-dictionary values for field …\xc3\xa9\\…Dictionary(UInt3
      3  Schema error: No field named year.
      3  Error during planning: Statement not supported: Prepare'
      2  Error during planning: Invalid function ….
+     2  COPY \xe2\x80\xa6 TO test_files/scratch/copy/table_with_metadata/: the folder holds files already: OVERWRITE replaces them, APPEND adds to t
+     2  Schema error: No field named id.
+     2  timestamp_strings is used by view timestamp_utc: drop them first'
+     2  table t already exists (CREATE TABLE IF NOT EXISTS leaves it as it is; CREATE OR REPLACE TABLE makes it anew)'
+     2  no schema foo (CREATE SCHEMA foo)'
+     2  NOT NULL, DEFAULT and identity: columns of the table'
