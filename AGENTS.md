@@ -1552,7 +1552,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    registry. A comment is `cm/{family}/{name}` (a column's by its stored name), moved by a rename and
    removed by a drop in `objects::follow`, which `ddl::apply` calls. `SHOW CREATE` of every kind, run
    again after a drop, makes the same object; `CREATE OR ALTER TABLE` never loses or reinterprets a
-   row, and refuses by name what it can't do by adding at the end or widening. `harness.py registry`.
+   row, and refuses by name what it can't do by adding at the end or widening. A kind's entry says
+   what code used to keep in lists of its own: its catalog prefix, its privileges, what a clone does
+   with it (`OnClone`: copy, pin or leave; `branch::make` leaves what it says), why a project can't
+   declare it (`deploy::head` asks the entry), whether it holds a secret, a line about it and other
+   products' names; `PARTS` and `PATTERNS` beside it, and `pondra.kinds` and `GET /kinds` one list of
+   all three (`objects::rows`), from which the glossary is written (`docs_check.py --write-glossary`;
+   a stale one fails). `pondra.objects` lists the attached lakes' objects of every family a lake
+   holds (not its users, databases, shares or recipients) for whoever may use them
+   (`users::across`, invariant 240), with their statements shown by their own lake's nodes.
+   `harness.py registry`: every kind made there or named where it is checked (`ELSEWHERE`), a clone
+   against `on_clone` (its schemas, routines and tasks were left out of the base's listing of it).
 228. **An `INSERT … SELECT` or `CREATE TABLE AS` is written by every node only when its rows split as
    they are, under one reserved commit** (`spmd::insert`, `writers`, `/cluster/insert`): the query's
    biggest append table sliced, the rest read whole, no exchange and no sort on top (a `GROUP BY`, a

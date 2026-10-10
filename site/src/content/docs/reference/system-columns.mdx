@@ -239,6 +239,8 @@ SHOW MATERIALIZED VIEWS LIKE 'sold%';
 schemas, tables, views, materialized views, external tables, functions, macros, table functions,
 procedures, tasks, secrets, users, roles, the lakes attached, shares and recipients. A user given
 grants sees the tables and views they may read, and no secrets, users, roles, shares or recipients.
+An attached lake's users, roles, lakes, shares and recipients are its own and aren't listed here,
+and an attached lake that signs in on its own is listed only for whoever runs the nodes.
 
 | Column | Meaning |
 |---|---|
@@ -247,7 +249,7 @@ grants sees the tables and views they may read, and no secrets, users, roles, sh
 | `schema` | its schema, or null for a kind that has none (a schema, a user, a role, a lake) |
 | `name` | its name |
 | `comment` | what [`COMMENT ON`](/pondra/reference/sql/#every-kind-of-object) said about it, or null |
-| `definition` | the statement that makes it again, as `SHOW CREATE` gives it without the comments (a branch's is the `CREATE DATABASE … CLONE` that made it); null for what is never shown (a secret's values, a user's password, a recipient's token) |
+| `definition` | the statement that makes it again, as `SHOW CREATE` gives it without the comments (a branch's is the `CREATE DATABASE … CLONE` that made it); null for what is never shown (a secret's values, a user's password, a recipient's token) and for an attached lake's schemas, routines and tasks, which its own nodes show |
 
 `pondra.kinds` lists every kind of object, part and pattern, one row each. `is` says which one it is
 (`object`, `part` or `pattern`). `family` says which kinds share a name (a table and a view can't both
