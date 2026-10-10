@@ -982,11 +982,15 @@ def main():
     checks = {}
     try:
         for i, part in enumerate(parts):
+            saved = dict(os.environ)  # (a part on moto of its own points S3 there: the next one starts from the run's own)
             try:
                 checks.update(part())
             except Failed as e:  # (one part stopped: the others still run, and say what they found)
                 checks[f"part {i + 1} ran to the end"] = str(e)[:1000]
                 stop_all()
+            finally:
+                os.environ.clear()
+                os.environ.update(saved)
     finally:
         stop_all()
         if a.s3:
