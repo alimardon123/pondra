@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Single-node TPC-H (and ClickBench): Pondra against DuckDB, Polars, Daft and Bodo, on one machine
-and one copy of the data.
+"""Single-node TPC-H (and ClickBench): Pondra against DuckDB, ClickHouse, Polars, Daft and Bodo, on
+one machine and one copy of the data.
 
   singlenode.py prepare --data ~/tpch/sf1                  # tpchgen output -> <data>-bench/ (below)
   singlenode.py run --data ~/tpch/sf1-bench --sf 1 [--engines pondra,duckdb,polars,daft,bodo]
@@ -18,10 +18,12 @@ the script with another Python for another DuckDB (`pip install --pre duckdb` fo
 The data: tpchgen-cli's Parquet with money columns as DOUBLE (not every engine computes on
 DECIMAL alike) and 122,880-row row groups. Two ways to run, compared like with like:
 
-- from files, every query: `duckdb`, `polars`, `polars-streaming`, `daft` and `bodo` read the
-  Parquet files; `pondra-cold` reads its lake's (loaded with one INSERT per table), with its
-  in-memory columns off (PONDRA_HOT_GB=0);
-- from memory: `duckdb-native` loads the tables into DuckDB first; `pondra` runs every query twice
+- from files, every query: `duckdb`, `clickhouse`, `polars`, `polars-streaming`, `daft` and `bodo`
+  read the Parquet files; `pondra-cold` reads its lake's (loaded with one INSERT per table), with
+  its in-memory columns off (PONDRA_HOT_GB=0);
+- from memory: `duckdb-native` loads the tables into DuckDB first, `clickhouse-native` into
+  MergeTree tables (merged; `hits` sorted by ClickBench's own key for ClickHouse, TPC-H's tables
+  by their first key column); `pondra` runs every query twice
   first, so the columns they read are in memory (hot.rs takes a file on its second read; they get
   `--hot-gb` GB: 3 by default, room for TPC-H SF1's; 6 for ClickBench, whose 10 million rows'
   columns take 5.4 GB decoded). Neither load is in the times.
@@ -29,12 +31,21 @@ DECIMAL alike) and 122,880-row row groups. Two ways to run, compared like with l
 Each query runs `--runs` times: the best time is "hot", the first "first". Answers are checked
 against DuckDB's (row count, and every value; numbers to a relative 1e-6).
 
-The queries are each project's own: SQL (DataFusion's q1-q22, the same text) for Pondra and
-DuckDB; pola-rs/tpch for Polars (its in-memory and streaming engines, whichever is faster); Daft's
+ClickHouse is `clickhouse local` (`--clickhouse`, the one binary), a process per query running
+it `--runs` times; its times are its own (`--time`), so starting the process isn't in them. It
+gets the same SQL text, the files' lower-case names given ClickBench's spellings (ClickHouse's
+names are case-sensitive), inferred columns not nullable (none holds a NULL) and, for TPC-H,
+`join_use_nulls` (SQL's outer joins). Its answers that differ are its own: `0.06 - 0.01` is a
+float, not a decimal (TPC-H q6), a sum of doubles depends on its order (q15's `= max(…)` finds
+no row now and then), `length` counts bytes (ClickBench q28, q29) and `avg` of a BIGINT wraps
+(q4); the rest are ties at a LIMIT, as DuckDB's tables' are (`clickbench_ties.py`).
+
+The queries are each project's own: SQL (DataFusion's q1-q22, the same text) for Pondra,
+DuckDB and ClickHouse (ClickBench's 43 are ClickHouse's own `clickhouse-parquet` text too); pola-rs/tpch for Polars (its in-memory and streaming engines, whichever is faster); Daft's
 benchmarking/tpch (SQL, q21 in DataFrames); Bodo's benchmarks/tpch (bodo.pandas DataFrames).
 `--repos` holds those three repositories (git clone; see ensure_repos).
 """
-import argparse, json, os, subprocess, sys, tempfile, threading, time
+import argparse, json, os, shutil, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TABLES = ["region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem"]
@@ -132,6 +143,40 @@ if engine.startswith("duckdb"):
     qs = json.load(open(os.path.join(repos, "sql.json")))
     for q in queries:
         report(q, lambda: con.execute(qs[str(q)]).fetch_arrow_table())
+
+elif engine.startswith("clickhouse"):
+    import re, shutil, subprocess, tempfile, pyarrow as pa, pyarrow.parquet as pq
+    qs = json.load(open(os.path.join(repos, "sql.json")))
+    db = tempfile.mkdtemp(prefix="pondra-ch-")
+    flags = ["--schema_inference_make_columns_nullable=0"] + (["--join_use_nulls=1"] if T != ["hits"] else [])  # (SQL's outer joins pad with NULLs)
+    def local(sql):  # -> (stdout, each statement's time as ClickHouse measured it)
+        r = subprocess.run([os.environ["CLICKHOUSE"], "local", "--path", db, "--time", "--multiquery", *flags, "--query", sql], capture_output=True)
+        err = r.stderr.decode(errors="replace")
+        if r.returncode:
+            raise RuntimeError(err.strip().splitlines()[-1] if err.strip() else f"exit {r.returncode}")
+        return r.stdout, [float(x) for x in err.split() if re.fullmatch(r"\d+\.\d+", x)]
+    # ClickHouse's names are case-sensitive and the queries' are ClickBench's (WatchID); the files' are lower case
+    said = {w.lower(): w for w in sorted(set(re.findall(r"[A-Za-z_]\w*", " ".join(qs.values()))), key=lambda w: w == w.lower())[::-1]}
+    try:
+        t0 = time.time()
+        for t in T:
+            names = pq.ParquetFile(path(t)).schema_arrow.names
+            src = "SELECT " + ", ".join(f"`{c}` AS `{said.get(c, c)}`" for c in names) + f" FROM file('{path(t)}', Parquet)"
+            if engine == "clickhouse-native":  # (ClickBench's own sort key for hits; TPC-H's tables by their first key)
+                key = "CounterID, EventDate, UserID, EventTime, WatchID" if t == "hits" else names[0]
+                local(f"CREATE TABLE {t} ENGINE = MergeTree ORDER BY ({key}) AS {src}; OPTIMIZE TABLE {t} FINAL")
+            else:
+                local(f"CREATE VIEW {t} AS {src}")
+        version = local("SELECT version()")[0].decode().strip()
+        print(json.dumps({"load": time.time() - t0, "version": version}), flush=True)
+        for q in queries:
+            try:  # every run in one process, the last one's rows kept
+                out, times = local(";\n".join([qs[str(q)] + "\nFORMAT Null"] * (runs - 1) + [qs[str(q)] + "\nFORMAT ArrowStream"]))
+                print(json.dumps({"q": q, "times": times[-runs:], "rows": rows_of(pa.ipc.open_stream(out).read_all())}, default=str), flush=True)
+            except Exception as e:
+                print(json.dumps({"q": q, "error": str(e)[:300]}), flush=True)
+    finally:
+        shutil.rmtree(db, ignore_errors=True)
 
 elif engine.startswith("pondra"):
     import http.client, pyarrow as pa
@@ -242,7 +287,7 @@ def run_engine(engine, python, qs_left, env):
                 r = json.loads(line)
                 out[r["q"]] = r
                 left.remove(r["q"])
-                print(f"  {engine:17} q{r['q']:<2} {min(r['times']):7.3f} s", flush=True)
+                print(f"  {engine:17} q{r['q']:<2} " + (f"{min(r['times']):7.3f} s" if "times" in r else f"FAILED: {r['error'][:120]}"), flush=True)
         stop.set()
         p.wait()
         if left:  # the next query failed or took too long
@@ -299,6 +344,7 @@ def run():
     for engine in engines:
         env = dict(os.environ)
         python = {"daft": A.daft_python, "bodo": A.bodo_python}.get(engine, sys.executable)
+        env["CLICKHOUSE"] = A.clickhouse
         if engine.startswith("pondra"):
             node, warm = pondra_up(lake, engine == "pondra", sql_queries(A.queries))
             if engine == "pondra":
@@ -350,13 +396,14 @@ if __name__ == "__main__":
     ap.add_argument("--suite", choices=["tpch", "clickbench"], default="tpch")
     ap.add_argument("--data", required=True)
     ap.add_argument("--sf", type=float, default=1)
-    ap.add_argument("--engines", default="duckdb,duckdb-native,pondra,pondra-cold,polars,polars-streaming,daft,bodo")
+    ap.add_argument("--engines", default="duckdb,duckdb-native,clickhouse,clickhouse-native,pondra,pondra-cold,polars,polars-streaming,daft,bodo")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--timeout", type=int, default=600, help="seconds per query at most")
     ap.add_argument("--queries", default=os.path.expanduser("~/tpch/queries"))
     ap.add_argument("--repos", default=os.path.expanduser("~/bench-repos"))
     ap.add_argument("--daft-python", default=os.path.expanduser("~/venv-daft/bin/python"))
     ap.add_argument("--bodo-python", default=os.path.expanduser("~/venv-bodo/bin/python"))
+    ap.add_argument("--clickhouse", default=shutil.which("clickhouse") or os.path.expanduser("~/engines/clickhouse"), help="the clickhouse binary (clickhouse.com/docs/install)")
     ap.add_argument("--port", type=int, default=8150)
     ap.add_argument("--flag", action="append", default=[], help="a pondra serve flag for the node, e.g. memory-gb=4")
     ap.add_argument("--hot-gb", type=float, help="memory for Pondra's hot columns (PONDRA_HOT_GB; 3, 6 for ClickBench)")

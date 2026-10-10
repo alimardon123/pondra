@@ -109,12 +109,16 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str, now_
         shadow(lake, table, &mut meta, &new, false).await?; // (its delete markers, kept to shadow what's older)
         true
     } else if meta.key.is_empty() && (small.len() >= 2 || meta.files.iter().any(mostly_deleted)) {
-        // Small files of one partition merge together (so each file keeps one): 8 at a time, and
-        // all of them before they're sealed (manifests never change, so they'd stay small).
+        // Small files of one partition merge together (so each file keeps one): 8 of about one
+        // size at a time (`class`), and all of them before they're sealed (manifests never change,
+        // so they'd stay small).
         let sealing: std::collections::HashSet<&str> = crate::manifest::to_seal(&meta).iter().map(|f| f.path.as_str()).collect();
-        let mut by_part: BTreeMap<(&str, bool), Vec<DataFile>> = BTreeMap::new();
-        small.iter().for_each(|f| by_part.entry((f.part.as_str(), sealing.contains(f.path.as_str()))).or_default().push(f.clone()));
-        let mut groups: Vec<Vec<DataFile>> = by_part.into_iter().flat_map(|((_, sealing), g)| {
+        let mut by_part: BTreeMap<(&str, bool, u32), Vec<DataFile>> = BTreeMap::new();
+        small.iter().for_each(|f| {
+            let sealing = sealing.contains(f.path.as_str());
+            by_part.entry((f.part.as_str(), sealing, if sealing { 0 } else { class(f.bytes) })).or_default().push(f.clone())
+        });
+        let mut groups: Vec<Vec<DataFile>> = by_part.into_iter().flat_map(|((_, sealing, _), g)| {
             let (least, most) = if sealing { (2, 32) } else { (8, 8) };
             if g.len() < least {
                 return vec![];
@@ -403,6 +407,12 @@ fn run(files: &[DataFile]) -> Vec<DataFile> {
     by_age.into_iter().filter(|f| f.ord >= from).collect()
 }
 
+/// A small file's size class, each 4× the last (under 4 MB, under 16, under 64). A merge's file
+/// moves up a class, so it waits for others of its size instead of being merged again with every
+/// new one: merging the newest files into everything before them rewrote a streamed table every
+/// minute or so, and every query read it cold from Parquet until the hot columns had it again.
+fn class(bytes: u64) -> u32 { (bytes >> 20).max(1).ilog2() / 2 }
+
 /// Swap `old` files for `new` ones; the old ones are deleted after the retention period.
 fn replace(meta: &mut TableMeta, old: &[DataFile], new: Vec<DataFile>) {
     meta.files.retain(|f| !old.iter().any(|o| o.path == f.path));
@@ -570,17 +580,34 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
             return Ok(merged);
         }
     };
+    write_parts(lake, &table, &meta, batches, &keys, ord, whole).await
+}
+
+/// A job's rows as files, one a partition.
+async fn write_parts(lake: &Lake, table: &str, meta: &TableMeta, batches: Vec<RecordBatch>, keys: &[String], ord: u64, whole: bool) -> Result<Vec<DataFile>> {
     let parts = match &meta.partition {
         Some(spec) => split(spec, batches).await?,
         None => vec![(String::new(), batches)],
     };
     let mut files = vec![];
     for (part, batches) in parts {
-        if let Some(f) = write_file(lake, &table, &batches, &keys, meta.key.is_empty()).await? {
+        if let Some(f) = write_file(lake, table, &batches, keys, meta.key.is_empty()).await? {
             files.push(DataFile { ord, whole, part, ..f });
         }
     }
     Ok(files)
+}
+
+/// What a fold job of `from`'s log segments (after, upto] writes, written as files of `to`: a
+/// branch's REFRESH takes its base's rows not yet in files so (`branch::refresh`), with their
+/// system columns; a keyed table's one row per key, delete markers kept.
+pub async fn fold_into(from: &Lake, to: &Lake, table: &str, meta: &TableMeta, after: u64, upto: u64) -> Result<Vec<DataFile>> {
+    let meta = crate::sys::with_sys(meta);
+    let (keys, batches) = match meta.key.is_empty() {
+        true => (meta.cluster.clone(), crate::query::tail_of(from, table, after, Some(upto), false, true, false).await?),
+        false => (meta.key.clone(), latest(from, table, &TableMeta { files: vec![], tiered: after, ..meta.clone() }, upto, true).await?),
+    };
+    write_parts(to, table, &meta, batches, &keys, upto, false).await
 }
 
 /// A partitioned table's rows, one group per partition value (`day(ts)`: the day, `col`: the value).

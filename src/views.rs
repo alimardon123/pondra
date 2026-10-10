@@ -430,6 +430,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         return Ok(()); // (asked again, the same: a notebook cell run twice)
     }
     ensure!(lake.cat.get::<TableMeta>(&table_key(name)).await?.is_none(), "table {name} already exists");
+    crate::ddl::unclaimed(lake, name).await?;
     let (other, source) = crate::ddl::resolve(lake, &first_table(sql)?).await?;
     ensure!(other.is_none(), "a view follows a table of this lake");
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?.logical(); // (SQL's names: ADR-022)
@@ -634,9 +635,10 @@ async fn expectations(lake: &Lake, name: &str, source: &str, planned: &str, meta
     Ok(())
 }
 
-/// A row an expectation or a table's CHECK refuses (Postgres's `check_violation`, 23514).
+/// A row an expectation or a table's CHECK refuses (Postgres's `check_violation`, 23514), or a value
+/// its column's enum doesn't list (22P02): its words, and its SQLSTATE.
 #[derive(Debug)]
-pub struct Violation(pub String);
+pub struct Violation(pub String, pub &'static str);
 
 impl std::fmt::Display for Violation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
@@ -677,7 +679,7 @@ fn expected(view: &str, v: &View, rows: RecordBatch, filling: bool) -> Result<(R
             continue;
         }
         if e.on == OnViolation::Fail && !filling {
-            return Err(anyhow::Error::new(Violation(format!("new row for relation \"{view}\" violates check constraint \"{}\": CHECK ({})", e.name, e.check))));
+            return Err(anyhow::Error::new(Violation(format!("new row for relation \"{view}\" violates check constraint \"{}\": CHECK ({})", e.name, e.check), "23514")));
         }
         if e.on != OnViolation::Keep {
             keep.iter_mut().zip(bad.values().iter()).for_each(|(k, b)| *k &= !b);
@@ -1268,9 +1270,15 @@ fn merges(plan: &LogicalPlan, up: Option<(&str, &TableMeta)>) -> Result<(Vec<Str
     if let Some((source, m)) = up {
         // (its keys only, no subquery; below its GROUP BY, filters, then the view's table — whose
         // reading, which combines its rows, the plan shows inlined under its name)
-        use datafusion::common::tree_node::TreeNode;
-        let keys = |e: &Expr| e.column_refs().iter().all(|c| m.key.contains(&c.name)) && !e.exists(|e| Ok(matches!(e, Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_)))).unwrap_or(true);
-        let mut ok = agg.group_expr.iter().all(keys);
+        let keys = |e: &Expr| of_keys(e, m);
+        // (DataFusion adds to a GROUP BY the columns its keys determine: read while it holds
+        // partial rows, the view's table is grouped by its key, which then determines its sums.
+        // Grouping by those too splits nothing; a rollup's own keys are checked below.)
+        let input = agg.input.schema();
+        let named: Vec<String> = agg.group_expr.iter().filter(|e| keys(e)).map(|e| e.schema_name().to_string()).collect();
+        let implied = datafusion::common::get_target_functional_dependencies(input, &named).unwrap_or_default();
+        let added = |e: &Expr| matches!(e, Expr::Column(c) if input.index_of_column(c).is_ok_and(|i| implied.contains(&i)));
+        let mut ok = agg.group_expr.iter().all(|e| keys(e) || added(e));
         let mut below = agg.input.as_ref();
         loop {
             match below {
@@ -1288,6 +1296,9 @@ fn merges(plan: &LogicalPlan, up: Option<(&str, &TableMeta)>) -> Result<(Vec<Str
         let Expr::Column(c) = e.clone().unalias_nested().data else { bail!("column {} must be a group key or one aggregate: {e}", f.name()) };
         let i = agg.schema.index_of_column(&c)?;
         if i < agg.group_expr.len() {
+            if let Some((source, m)) = up {
+                ensure!(of_keys(&agg.group_expr[i], m), rollup(source, m)); // (a rollup's keys are its source's)
+            }
             key.push(f.name().clone());
             continue;
         }
@@ -1318,6 +1329,12 @@ fn merges(plan: &LogicalPlan, up: Option<(&str, &TableMeta)>) -> Result<(Vec<Str
     }
     ensure!(!key.is_empty(), "an aggregating view needs GROUP BY columns in its SELECT");
     Ok((key, merge))
+}
+
+/// Whether `e` reads only `m`'s keys (and no subquery).
+fn of_keys(e: &Expr, m: &TableMeta) -> bool {
+    use datafusion::common::tree_node::TreeNode;
+    e.column_refs().iter().all(|c| m.key.contains(&c.name)) && !e.exists(|e| Ok(matches!(e, Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_)))).unwrap_or(true)
 }
 
 /// The query's own GROUP BY, if any: the first Aggregate below its top-level projection, sort,

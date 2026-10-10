@@ -129,11 +129,19 @@ pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: 
 /// `filed`: file commits' rows too (`Segment::files`), as the log's readers take them; queries
 /// and tiering don't (those files are the table's already).
 pub async fn tail_of(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool, sys: bool, filed: bool) -> Result<Vec<RecordBatch>> {
+    Ok(tail_segments(lake, table, after, upto, ord, sys, filed).await?.0.into_iter().flat_map(|(_, rows)| rows).collect())
+}
+
+/// `tail_of`'s rows a segment at a time, and the newest segment the scan saw, of any table: the
+/// view held every segment up to it (commits number them in order).
+async fn tail_segments(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool, sys: bool, filed: bool) -> Result<(Vec<(u64, Vec<RecordBatch>)>, u64)> {
     let end = upto.map_or("s0".to_string(), |u| seg_key(u + 1)); // "s0" sorts right after every "s/…"
-    let mut segs = vec![];
+    let (mut segs, mut seen) = (vec![], after);
     for (key, seg) in lake.cat.scan::<Segment>(&seg_key(after + 1), &end).await? {
+        let n = key[2..].parse::<u64>()?;
+        seen = seen.max(n);
         if seg.parts.contains_key(table) || (filed && seg.files.contains_key(table)) {
-            segs.push((key[2..].parse::<u64>()?, seg));
+            segs.push((n, seg));
         }
     }
     // Fetch many segments at once: on object storage each one may be a round trip. (A file
@@ -153,7 +161,7 @@ pub async fn tail_of(lake: &Lake, table: &str, after: u64, upto: Option<u64>, or
     };
     let mut out = vec![];
     for ((n, seg), rows) in segs.iter().zip(fetched) {
-        let (n, mut pos) = (*n, 0u64);
+        let (n, mut pos, mut mine) = (*n, 0u64, vec![]);
         for (b, logged) in rows.iter() {
             let b = &match &target {
                 Some(s) if sys && *logged => conform(&crate::sys::derive(b, n, pos, seg.ts_ms)?, s)?,
@@ -162,7 +170,7 @@ pub async fn tail_of(lake: &Lake, table: &str, after: u64, upto: Option<u64>, or
             };
             if !ord {
                 pos += b.num_rows() as u64;
-                out.push(b.clone());
+                mine.push(b.clone());
                 continue;
             }
             let ords: ArrayRef = Arc::new(UInt64Array::from_iter_values((pos..pos + b.num_rows() as u64).map(|p| crate::log::ord(n, p))));
@@ -171,10 +179,109 @@ pub async fn tail_of(lake: &Lake, table: &str, after: u64, upto: Option<u64>, or
             fields.push(Arc::new(Field::new("_ord", DataType::UInt64, false)));
             let mut cols = b.columns().to_vec();
             cols.push(ords);
-            out.push(RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?);
+            mine.push(RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?);
+        }
+        out.push((n, mine));
+    }
+    Ok((out, seen))
+}
+
+/// A table's log tail as its queries read it (`sources`): conformed to its read schema, in
+/// batches of up to 8,192 rows, kept from one query to the next and extended by the segments
+/// committed since. Each query had conformed every segment's rows again (its strings copied into
+/// views) and planned and run a batch a segment: hundreds of small ones while rows stream in,
+/// which made dashboards three times as costly while writes landed.
+#[derive(Clone)]
+pub struct Tail {
+    of: (u64, String),       // the table's `tiered` mark, and the schema and flags it was read with
+    through: u64,            // every segment up to here is in it
+    rows: Vec<RecordBatch>,
+    ends: Vec<(u64, usize)>, // each segment with rows of the table, and the rows up to its end
+    bytes: usize,
+}
+
+const TAILS: usize = 128 << 20; // tails kept, per node
+const TAIL_BATCH: usize = 8192;
+
+impl Tail {
+    /// Its rows up to segment `u`: a prefix (a slice of a query as of an older commit).
+    fn upto(&self, u: u64) -> Vec<RecordBatch> {
+        let mut left = self.ends.iter().take_while(|(n, _)| *n <= u).last().map_or(0, |e| e.1);
+        let mut out = vec![];
+        for b in &self.rows {
+            if left == 0 {
+                break;
+            }
+            let k = left.min(b.num_rows());
+            out.push(if k == b.num_rows() { b.clone() } else { b.slice(0, k) });
+            left -= k;
+        }
+        out
+    }
+
+    fn add(&mut self, segs: Vec<(u64, Vec<RecordBatch>)>, s: &SchemaRef) -> Result<()> {
+        let (mut new, mut total) = (vec![], self.ends.last().map_or(0, |e| e.1));
+        for (n, batches) in segs {
+            let before = total;
+            for b in batches.iter().filter(|b| b.num_rows() > 0) {
+                total += b.num_rows();
+                new.push(conform(b, s)?);
+            }
+            if total > before {
+                self.ends.push((n, total));
+            }
+        }
+        self.bytes += new.iter().map(|b| b.get_array_memory_size()).sum::<usize>();
+        self.rows.extend(new);
+        // The small batches at the end become one once they would fill it: a query a segment
+        // copies nothing, and the batches stay few.
+        let small = self.rows.iter().rev().take_while(|b| b.num_rows() < TAIL_BATCH).count();
+        let rows: usize = self.rows[self.rows.len() - small..].iter().map(|b| b.num_rows()).sum();
+        if small > 1 && rows >= TAIL_BATCH {
+            let tail = self.rows.split_off(self.rows.len() - small);
+            let all = datafusion::arrow::compute::concat_batches(s, &tail)?;
+            self.bytes += all.get_array_memory_size();
+            self.bytes = self.bytes.saturating_sub(tail.iter().map(|b| b.get_array_memory_size()).sum());
+            self.rows.extend((0..all.num_rows()).step_by(TAIL_BATCH).map(|at| all.slice(at, TAIL_BATCH.min(all.num_rows() - at))));
+        }
+        Ok(())
+    }
+}
+
+/// A table's log rows after `after` up to segment `upto` (None: as far as this node's view goes),
+/// as `sources` reads them, through the table's kept `Tail`.
+async fn tail_rows(lake: &Lake, table: &str, after: u64, upto: Option<u64>, keyed: bool, sys: bool, s: &SchemaRef) -> Result<Vec<RecordBatch>> {
+    if upto.is_some_and(|u| u <= after) {
+        return Ok(vec![]); // (a slice of a spread query that reads no log)
+    }
+    let of = (after, format!("{keyed} {sys} {:?}", s.fields()));
+    let kept = lake.tails.lock().unwrap().0.get(table).filter(|t| t.of == of).cloned();
+    if let (Some(t), Some(u)) = (&kept, upto) {
+        if u <= t.through {
+            return Ok(t.upto(u));
         }
     }
-    Ok(out)
+    let mut t = kept.as_deref().cloned().unwrap_or(Tail { of, through: after, rows: vec![], ends: vec![], bytes: 0 });
+    let (segs, seen) = tail_segments(lake, table, t.through, upto, keyed, sys, false).await?;
+    t.add(segs, s)?;
+    t.through = t.through.max(seen);
+    let rows = t.upto(upto.unwrap_or(u64::MAX));
+    if t.bytes <= TAILS {
+        let t = Arc::new(t);
+        let mut c = lake.tails.lock().unwrap();
+        // (a newer mark wins: a slice read at an older one, as its coordinator saw it, keeps none)
+        if c.0.peek(table).is_none_or(|o| t.of.0 > o.of.0 || (t.of.0 == o.of.0 && (t.of.1 != o.of.1 || t.through > o.through))) {
+            c.1 += t.bytes;
+            if let Some(old) = c.0.put(table.to_string(), t) {
+                c.1 -= old.bytes;
+            }
+            while c.1 > TAILS && c.0.len() > 1 {
+                let Some((_, old)) = c.0.pop_lru() else { break };
+                c.1 -= old.bytes;
+            }
+        }
+    }
+    Ok(rows)
 }
 
 /// All rows of a table (files ∪ tail up to `upto`); upsert tables carry `_ord` (0 for files).
@@ -255,16 +362,15 @@ pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
         files.push(if keyed { df.with_column("_ord", lit(0u64))? } else { df });
     }
     let sys = meta.columns.iter().any(|(c, _)| c == crate::sys::ROW_ID); // (`sys::with_sys`)
-    let hot = tail_of(lake, name, meta.tiered, upto, keyed, sys, false).await?;
-    if hot.is_empty() {
-        return Ok((None, files));
-    }
     let mut fields = schema.fields().to_vec(); // the table's own schema, so every batch agrees
     if keyed {
         fields.push(Arc::new(Field::new("_ord", DataType::UInt64, false)));
     }
-    let s = Arc::new(Schema::new(fields));
-    Ok((Some(ctx.read_batches(hot.iter().map(|b| conform(b, &s)).collect::<Result<Vec<_>>>()?)?), files))
+    let hot = tail_rows(lake, name, meta.tiered, upto, keyed, sys, &Arc::new(Schema::new(fields))).await?;
+    if hot.is_empty() {
+        return Ok((None, files));
+    }
+    Ok((Some(ctx.read_batches(hot)?), files))
 }
 
 /// Parquet files as one read: through the hot columns (`hot.rs`) when they're on, which read a
@@ -273,8 +379,34 @@ async fn read_files(lake: &Lake, ctx: &SessionContext, files: Vec<&DataFile>, me
     if !lake.hot.on() {
         return files_once(lake, ctx, &files, meta, schema).await;
     }
+    Ok(ctx.read_table(Arc::new(hot_files(lake, files, meta, schema)))?)
+}
+
+fn hot_files(lake: &Lake, files: Vec<&DataFile>, meta: &TableMeta, schema: &SchemaRef) -> crate::hot::HotFiles {
     let meta = TableMeta { columns: meta.columns.clone(), names: meta.names.clone(), key: meta.key.clone(), ..Default::default() }; // (what reading a file takes of its table)
-    Ok(ctx.read_table(Arc::new(crate::hot::HotFiles { lake: lake.arc(), files: files.into_iter().cloned().collect(), schema: schema.clone(), meta }))?)
+    crate::hot::HotFiles { lake: lake.arc(), files: files.into_iter().cloned().collect(), schema: schema.clone(), meta }
+}
+
+/// An append table that never changed, read through the hot columns, as a plan: its log tail and
+/// its files side by side, as `raw` reads them. Planned here, not as a query of its own: that
+/// query's optimizer passes are the ones the whole query runs over it again anyway, and they were
+/// a sixth of a dashboard query's time while rows streamed in.
+async fn plain_scan(lake: &Lake, state: &dyn datafusion::catalog::Session, name: &str, meta: &TableMeta, upto: Option<u64>, projection: Option<&Vec<usize>>) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    use datafusion::datasource::memory::MemorySourceConfig;
+    let schema = read_schema(&meta.columns)?;
+    let sys = meta.columns.iter().any(|(c, _)| c == crate::sys::ROW_ID);
+    let tail = tail_rows(lake, name, meta.tiered, upto, false, sys, &schema).await?;
+    let mut parts: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>> = vec![];
+    if !tail.is_empty() {
+        parts.push(MemorySourceConfig::try_new_exec(&[tail], schema.clone(), projection.cloned())?);
+    }
+    if !meta.files.is_empty() {
+        parts.push(hot_files(lake, meta.files.iter().collect(), meta, &schema).scan(state, projection, &[], None).await?);
+    }
+    if parts.is_empty() {
+        parts.push(MemorySourceConfig::try_new_exec(&[vec![]], schema, projection.cloned())?);
+    }
+    Ok(datafusion::physical_plan::union::UnionExec::try_new(parts)?)
 }
 
 /// Files of a table as one read, as `read_files` reads them but not through the hot columns (and
@@ -509,6 +641,27 @@ impl Pruned {
         }
         stats
     }
+
+    /// Any other table's rows, planned as a query of their own.
+    async fn planned(&self, meta: &TableMeta, range: Option<Expr>, projection: &[usize]) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        let e = |e: anyhow::Error| datafusion::error::DataFusionError::External(e.into());
+        let ctx = self.lake.session();
+        if self.meta.changed {
+            // (the query this scan is part of may still swap the anti-join's sides: DataFusion
+            // refuses once a join has built its dynamic filter)
+            ctx.state_ref().write().config_mut().options_mut().set("datafusion.optimizer.enable_dynamic_filter_pushdown", "false").map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
+        }
+        let df = match self.meta.changed {
+            true => current(&self.lake, &ctx, &self.name, meta, self.upto, self.at).await.map_err(e)?,
+            false => raw(&self.lake, &ctx, &self.name, meta, self.upto).await.map_err(e)?,
+        };
+        let df = match range {
+            Some(r) => df.filter(r)?, // (reaches the Parquet reader: row groups outside it are skipped)
+            None => df,
+        };
+        let df = df.select_columns(&projection.iter().map(|&i| self.schema.field(i).name().as_str()).collect::<Vec<_>>())?;
+        df.create_physical_plan().await
+    }
 }
 
 #[async_trait::async_trait]
@@ -529,7 +682,7 @@ impl TableProvider for Pruned {
         Some(self.stats.get_or_init(|| self.count()).clone())
     }
 
-    async fn scan(&self, _: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], _: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    async fn scan(&self, state: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], _: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let e = |e: anyhow::Error| datafusion::error::DataFusionError::External(e.into());
         let range = match &self.range {
             Some(r) => Some(r.expr(self.schema.field_with_name(&r.column)?.data_type()).map_err(e)?),
@@ -538,23 +691,12 @@ impl TableProvider for Pruned {
         let filters: Vec<Expr> = filters.iter().cloned().chain(range.clone()).collect();
         let files = crate::manifest::pruned(&self.lake, &self.meta, self.manifests.as_deref(), &filters, &self.schema).await.map_err(e)?;
         let meta = TableMeta { files, sealed: None, ..self.meta.clone() };
-        let ctx = self.lake.session();
-        if self.meta.changed {
-            // (the query this scan is part of may still swap the anti-join's sides: DataFusion
-            // refuses once a join has built its dynamic filter)
-            ctx.state_ref().write().config_mut().options_mut().set("datafusion.optimizer.enable_dynamic_filter_pushdown", "false").map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
-        }
-        let df = match self.meta.changed {
-            true => current(&self.lake, &ctx, &self.name, &meta, self.upto, self.at).await.map_err(e)?,
-            false => raw(&self.lake, &ctx, &self.name, &meta, self.upto).await.map_err(e)?,
-        };
-        let df = match range {
-            Some(r) => df.filter(r)?, // (reaches the Parquet reader: row groups outside it are skipped)
-            None => df,
-        };
         let all: Vec<usize> = (0..self.schema.fields().len()).collect();
-        let df = df.select_columns(&projection.unwrap_or(&all).iter().map(|&i| self.schema.field(i).name().as_str()).collect::<Vec<_>>())?;
-        let plan = df.create_physical_plan().await?;
+        let plain = !meta.changed && range.is_none() && meta.key.is_empty() && meta.ext.is_none() && self.lake.hot.on();
+        let plan = match plain {
+            true => plain_scan(&self.lake, state, &self.name, &meta, self.upto, projection).await.map_err(e)?,
+            false => self.planned(&meta, range, projection.unwrap_or(&all)).await?,
+        };
         let Some((rows, bytes)) = self.share else { return Ok(plan) };
         // (with each column's distinct values and range, from the catalog: an aggregate over a
         // slice then knows it puts out a few groups, not a row per row — `guard.rs` weighs that)

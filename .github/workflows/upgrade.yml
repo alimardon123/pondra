@@ -3,8 +3,8 @@
 # a simulated R2 bucket too, where its followers always have a flush in flight); a cluster
 # of the newest release is upgraded to this build a node at a time under load
 # (tools/upgrade_check.py all); a table's past: UNDROP and retention (tools/history_check.py, ADR-043);
-# branch databases on disk and in a bucket (tools/environments_check.py, ADR-047). In two halves
-# side by side: the releases' checks, and the rest.
+# branch databases on disk and in a bucket (tools/environments_check.py, ADR-047); a project in Git
+# deployed to them (tools/project_check.py). In two halves side by side: the releases' checks, and the rest.
 # build.yml calls it once a pull request's build is done (the label `ci` or `full-ci`): it tries
 # the binary that run made, so nothing is compiled here. By hand too.
 name: upgrade
@@ -64,6 +64,11 @@ jobs:
         run: |
           set -o pipefail
           python3 tools/environments_check.py --new target/release/pondra --work "$RUNNER_TEMP/environments" | tee environments.json
+      - name: A project in Git made true in a database (pondra plan, deploy, branch, diff)
+        if: matrix.part != 'releases'
+        run: |
+          set -o pipefail
+          python3 tools/project_check.py --new target/release/pondra --work "$RUNNER_TEMP/project" | tee project.json
       - name: A leader stopped on a bucket (simulated R2) hands over at once; branches in a bucket
         if: matrix.part != 'releases'
         run: |
@@ -83,6 +88,8 @@ jobs:
             history.json
             environments.json
             environments-s3.json
+            project.json
+            ${{ runner.temp }}/project/**/*.log
             ${{ runner.temp }}/history/*.log
             ${{ runner.temp }}/environments*/**/*.log
             ${{ runner.temp }}/upgrade/**/*.log

@@ -142,12 +142,17 @@ pub fn router(app: App) -> Router {
         .route("/ready", get(ready))
         .route("/login", post(login))
         .route("/whoami", get(whoami))
+        .route("/plan", post(deploy))
+        .route("/deploy", post(deploy))
+        .route("/test", post(deploy))
+        .route("/export", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::deploy::export(&app.lake).await?)) }))
         .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::console::objects(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))
         .route("/cluster/stage", post(stage))
         .route("/cluster/copy", post(copy))
+        .route("/cluster/insert", post(insert_share))
         .route("/cluster/shuffle", get(bucket))
         .route("/cluster/job", post(job))
         .route("/cluster/probe", get(|Query(p): Query<HashMap<String, usize>>| async move { crate::guard::probe(p.get("bytes").copied().unwrap_or(0)) }))
@@ -381,10 +386,18 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         };
     }
     req.extensions_mut().insert(who.role);
-    match crate::panics::door(crate::auth::WHO.scope(who, next.run(req))).await {
+    let heavy = queries(req.uri().path());
+    let run = crate::auth::WHO.scope(who, next.run(req));
+    match if heavy { crate::panics::work(run).await } else { crate::panics::door(run).await } {
         Ok(r) => r,
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(), // (and the node stays up)
     }
+}
+
+/// The routes whose work is queries' (`panics::work`): planned and run on a runtime of their own,
+/// so appends, commits, heartbeats and the commit stream keep theirs.
+fn queries(path: &str) -> bool {
+    matches!(path, "/sql" | "/mcp" | "/live" | "/tier" | "/cluster/stage" | "/cluster/copy" | "/cluster/insert" | "/cluster/job") || path.starts_with("/sql/pages/") || path.starts_with("/insert/")
 }
 
 /// The user name in a Basic header (for the audit log: who tried).
@@ -485,6 +498,12 @@ async fn stage(State(app): State<App>, Json(slice): Json<crate::spmd::Slice>) ->
     Ok(Body::from_stream(crate::spmd::reply(&shape, parts, done)).into_response())
 }
 
+/// This node's share of an `INSERT … SELECT`, written into the table's folder (see `spmd::insert`):
+/// its columns and files.
+async fn insert_share(State(app): State<App>, Json((slice, table, stamp)): Json<(crate::spmd::Slice, String, Option<crate::log::Reserved>)>) -> Result<Json<(crate::spmd::Columns, Vec<crate::store::DataFile>)>, E> {
+    Ok(Json(crate::spmd::insert_share(&app.lake, &slice, &table, stamp).await?))
+}
+
 /// This node's share of a `COPY … TO` a folder, written (see `spmd::copy`): how many rows.
 async fn copy(State(app): State<App>, Json((slice, target)): Json<(crate::spmd::Slice, crate::copy::Target)>) -> Result<Json<u64>, E> {
     Ok(Json(crate::spmd::copy_share(&app.lake, &slice, &target).await?))
@@ -576,15 +595,21 @@ impl App {
         Box::pin(crate::ext::listing(self.query_listed(query, spread, files))) // (every door: files listed once a statement)
     }
 
+    /// Whether `query` must run on this node alone: rows sent with the request are here only; so are
+    /// the session's temporary tables, its transaction, settings and variables, a past it reads, and
+    /// a Python table function's call; and a user granted some tables has its grants checked where
+    /// the query is planned, here.
+    pub async fn here_only(&self, query: &str) -> bool {
+        crate::query::sent() || crate::temp::mentioned(query) || crate::past::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
+    }
+
     async fn query_listed(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         crate::history::read_at(self.lake.visible()); // (its answer again: `t AT (VERSION => n)`)
         let explained = crate::write::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
         let run = async {
-            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::past::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await // (rows sent with a request are here only; so are the session's temporary tables, its transaction and settings, and a Python table function's call)
-                || crate::auth::limited().is_some(); // (and a user's granted some tables: its grants are checked where it is planned, here)
-            let nodes = if here_only { vec![] } else { self.cluster.nodes() };
+            let nodes = if spread == Some("0") || self.here_only(query).await { vec![] } else { self.cluster.nodes() };
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
                 Ok(Some(batches)) => {
                     crate::guard::ran_spread(query, start.elapsed());
@@ -816,10 +841,10 @@ async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
     let batch = concat_batches(&schema, &batches)?;
     let batch = match (crate::defaults::any(&meta), given) {
         (false, _) => batch,
-        (true, Some(given)) => crate::defaults::fill(&meta, batch.clone(), |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(batch.num_rows()))).await?,
+        (true, Some(given)) => crate::defaults::fill(&app.lake, &meta, batch.clone(), |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(batch.num_rows()))).await?,
         (true, None) => {
             let absent = crate::defaults::absent_keys(&meta, &body)?; // (a JSON row without the key)
-            crate::defaults::fill(&meta, batch, |c| absent.get(c).cloned()).await?
+            crate::defaults::fill(&app.lake, &meta, batch, |c| absent.get(c).cloned()).await?
         }
     };
     Ok(Json(log.append(name, Src { producer: p.producer, seq: p.seq, prev: p.prev }, batch).await?))
@@ -881,9 +906,12 @@ async fn change(State(app): State<App>, Json((sql, job, sent)): Json<(String, St
 
 /// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`).
 async fn ddl(State(app): State<App>, Json(d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
-    let out = {
-        let _guard = app.lock.lock().await;
-        crate::ddl::apply(&app.lake, d.clone()).await?
+    let out = match &app.seq {
+        Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone()).await?,
+        None => {
+            let _guard = app.lock.lock().await;
+            crate::ddl::apply(&app.lake, d.clone()).await?
+        }
     };
     crate::ddl::settle(&app.lake, &d, &app.cluster.addr).await?; // (ATTACH, CREATE DATABASE: the leader too at once, not in a second)
     Ok(Json(out))
@@ -961,7 +989,7 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
     let session = crate::temp::of(&headers); // (its temporary tables: `temp.rs`)
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let vars = crate::auth::lent_vars(token); // (Python code a run lent a connection to: the run's variables)
-    let go = crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, sql_as(app, p, role, headers, body))));
+    let go = crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, Box::pin(sql_as(app, p, role, headers, body))))); // (boxed: a statement's future is big, and every layer around it would copy it)
     let (out, heard) = crate::routines::with_notices(crate::python::holder(vars.is_some(), go)).await; // (a lent token's code holds a slot: what it calls takes none)
     let mut r = out.unwrap_or_else(IntoResponse::into_response);
     if session.as_deref().is_some_and(crate::temp::holds) {
@@ -1002,6 +1030,19 @@ async fn secret(State(app): State<App>, Path(name): Path<String>, headers: axum:
     let values = crate::ext::reveal(&app.lake, &name.to_lowercase()).await?;
     crate::auth::revealed(token, values.iter().filter(|(k, _)| *k != "type" && *k != "scope").map(|(_, v)| v.clone()));
     Ok(Json(j!(values)))
+}
+
+/// `POST /plan`, `/deploy`, `/test`: a project's files planned here, deployed, or its tests run
+/// (ADR-047 §4), each with the same body.
+async fn deploy(State(app): State<App>, uri: axum::http::Uri, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, Json(ask): Json<crate::deploy::Ask>) -> Result<Json<Value>, E> {
+    use crate::deploy::Verb;
+    let verb = match uri.path().rsplit('/').next() {
+        Some("plan") => Verb::Plan,
+        Some("test") => Verb::Test,
+        _ => Verb::Deploy,
+    };
+    let who = crate::routines::Who { role: role.0, files: owner(&headers), depth: 0 };
+    Ok(Json(crate::deploy::ask(&app, verb, ask, who).await?))
 }
 
 async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Result<Response, E> {
@@ -1066,7 +1107,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // or may read a file on this machine).
     let asks = |text: &str| {
         let q = text.to_lowercase();
-        !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.learned", "pondra.variables", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+        !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.learned", "pondra.variables", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
     };
     let volatile = files || limited || asks(query)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)

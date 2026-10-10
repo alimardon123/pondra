@@ -1,0 +1,711 @@
+{
+ "suite": "tpch",
+ "data": "/root/tpch/sf1-bench",
+ "sf": 1.0,
+ "cores": 4,
+ "runs": 3,
+ "info": {
+  "pondra_load_s": 11.1,
+  "duckdb_load_s": 0.0,
+  "duckdb_version": "1.5.5",
+  "duckdb_wall_s": 6.6,
+  "duckdb-native_load_s": 1.4,
+  "duckdb-native_version": "1.5.5",
+  "duckdb-native_wall_s": 4.7,
+  "clickhouse_load_s": 0.8,
+  "clickhouse_version": "26.9.9.28",
+  "clickhouse_wall_s": 19.8,
+  "clickhouse-native_load_s": 17.0,
+  "clickhouse-native_version": "26.9.9.28",
+  "clickhouse-native_wall_s": 28.4,
+  "pondra_warm_s": 6.2,
+  "pondra_wall_s": 4.3,
+  "pondra-cold_wall_s": 7.5
+ },
+ "results": {
+  "duckdb": {
+   "1": {
+    "hot": 0.141,
+    "first": 0.263,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.027,
+    "first": 0.032,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.082,
+    "first": 0.086,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.061,
+    "first": 0.064,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.089,
+    "first": 0.093,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.058,
+    "first": 0.06,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.089,
+    "first": 0.092,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.107,
+    "first": 0.107,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.172,
+    "first": 0.209,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.137,
+    "first": 0.139,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.018,
+    "first": 0.018,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.065,
+    "first": 0.066,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.128,
+    "first": 0.128,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.081,
+    "first": 0.084,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.05,
+    "first": 0.05,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.034,
+    "first": 0.037,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.088,
+    "first": 0.109,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.137,
+    "first": 0.147,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.104,
+    "first": 0.104,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.08,
+    "first": 0.084,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.223,
+    "first": 0.232,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.045,
+    "first": 0.048,
+    "same_as_duckdb": true
+   },
+   "total_hot": 2.02,
+   "answers_match": 22
+  },
+  "duckdb-native": {
+   "1": {
+    "hot": 0.083,
+    "first": 0.156,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.014,
+    "first": 0.016,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.029,
+    "first": 0.032,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.033,
+    "first": 0.036,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.031,
+    "first": 0.031,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.025,
+    "first": 0.025,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.031,
+    "first": 0.031,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.023,
+    "first": 0.025,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.092,
+    "first": 0.111,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.067,
+    "first": 0.075,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.006,
+    "first": 0.007,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.048,
+    "first": 0.049,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.08,
+    "first": 0.08,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.027,
+    "first": 0.03,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.021,
+    "first": 0.021,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.03,
+    "first": 0.032,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.017,
+    "first": 0.021,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.088,
+    "first": 0.088,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.07,
+    "first": 0.074,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.034,
+    "first": 0.037,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.095,
+    "first": 0.096,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.024,
+    "first": 0.026,
+    "same_as_duckdb": true
+   },
+   "total_hot": 0.97,
+   "answers_match": 22
+  },
+  "clickhouse": {
+   "1": {
+    "hot": 0.213,
+    "first": 0.249,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.07,
+    "first": 0.103,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.283,
+    "first": 0.355,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.107,
+    "first": 0.147,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.274,
+    "first": 0.353,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.106,
+    "first": 0.155,
+    "same_as_duckdb": false
+   },
+   "7": {
+    "hot": 0.237,
+    "first": 0.269,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.335,
+    "first": 0.399,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.416,
+    "first": 0.645,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.316,
+    "first": 0.362,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.051,
+    "first": 0.073,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.405,
+    "first": 0.442,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.151,
+    "first": 0.204,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.123,
+    "first": 0.161,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.19,
+    "first": 0.22,
+    "same_as_duckdb": false
+   },
+   "16": {
+    "hot": 0.054,
+    "first": 0.075,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.247,
+    "first": 0.275,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.172,
+    "first": 0.229,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.338,
+    "first": 0.37,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.205,
+    "first": 0.238,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.59,
+    "first": 0.639,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.097,
+    "first": 0.112,
+    "same_as_duckdb": true
+   },
+   "total_hot": 4.98,
+   "answers_match": 20
+  },
+  "clickhouse-native": {
+   "1": {
+    "hot": 0.167,
+    "first": 0.182,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.04,
+    "first": 0.056,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.107,
+    "first": 0.147,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.076,
+    "first": 0.094,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.113,
+    "first": 0.166,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.084,
+    "first": 0.1,
+    "same_as_duckdb": false
+   },
+   "7": {
+    "hot": 0.115,
+    "first": 0.155,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.159,
+    "first": 0.193,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.206,
+    "first": 0.242,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.13,
+    "first": 0.167,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.025,
+    "first": 0.032,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.126,
+    "first": 0.153,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.073,
+    "first": 0.096,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.091,
+    "first": 0.118,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.166,
+    "first": 0.197,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.03,
+    "first": 0.059,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.134,
+    "first": 0.146,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.114,
+    "first": 0.142,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.159,
+    "first": 0.174,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.116,
+    "first": 0.152,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.296,
+    "first": 0.35,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.031,
+    "first": 0.044,
+    "same_as_duckdb": true
+   },
+   "total_hot": 2.56,
+   "answers_match": 21
+  },
+  "pondra": {
+   "1": {
+    "hot": 0.105,
+    "first": 0.158,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.02,
+    "first": 0.021,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.053,
+    "first": 0.053,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.031,
+    "first": 0.031,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.058,
+    "first": 0.073,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.03,
+    "first": 0.03,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.05,
+    "first": 0.065,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.043,
+    "first": 0.044,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.092,
+    "first": 0.099,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.072,
+    "first": 0.082,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.014,
+    "first": 0.019,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.065,
+    "first": 0.108,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.085,
+    "first": 0.094,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.014,
+    "first": 0.015,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.023,
+    "first": 0.024,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.058,
+    "first": 0.107,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.06,
+    "first": 0.069,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.092,
+    "first": 0.192,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.09,
+    "first": 0.09,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.042,
+    "first": 0.065,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.091,
+    "first": 0.093,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.017,
+    "first": 0.017,
+    "same_as_duckdb": true
+   },
+   "total_hot": 1.2,
+   "answers_match": 22
+  },
+  "pondra-cold": {
+   "1": {
+    "hot": 0.127,
+    "first": 0.177,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.037,
+    "first": 0.042,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.089,
+    "first": 0.089,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.075,
+    "first": 0.087,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.105,
+    "first": 0.106,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.065,
+    "first": 0.071,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.118,
+    "first": 0.118,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.118,
+    "first": 0.122,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.203,
+    "first": 0.445,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.128,
+    "first": 0.144,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.03,
+    "first": 0.033,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.087,
+    "first": 0.108,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.093,
+    "first": 0.1,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.058,
+    "first": 0.06,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.085,
+    "first": 0.09,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.046,
+    "first": 0.047,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.111,
+    "first": 0.123,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.173,
+    "first": 0.306,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.113,
+    "first": 0.113,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.083,
+    "first": 0.087,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.187,
+    "first": 0.187,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.037,
+    "first": 0.037,
+    "same_as_duckdb": true
+   },
+   "total_hot": 2.17,
+   "answers_match": 22
+  }
+ }
+}
