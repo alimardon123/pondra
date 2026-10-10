@@ -777,7 +777,7 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
         return Ok(());
     }
     let params = secret.as_ref().map(|(n, s)| open(n, s)).transpose()?;
-    let store = build(&url::Url::parse(&root)?, params.as_ref())?;
+    let store = build(&url::Url::parse(&root)?, params.as_ref(), false)?;
     lake.rt.register_object_store(&url::Url::parse(&root)?, Arc::new(crate::cache::CachedStore::files(store))); // (a file's ranges kept by its version)
     MADE.lock().unwrap().get_or_insert_default().insert(root, made_with);
     Ok(())
@@ -796,15 +796,21 @@ pub async fn get(lake: &Lake, url: &str) -> Result<bytes::Bytes> {
     Ok(object_store_df::ObjectStoreExt::get(&store, &path).await.with_context(|| format!("reading {url}"))?.bytes().await?)
 }
 
-/// A store for a bucket, container or host, with a secret's settings or the environment's.
-fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>) -> Result<Arc<dyn object_store::ObjectStore>> {
-    use object_store::{aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder, http::HttpBuilder};
+/// A store for a bucket, container or host, with a secret's settings or the environment's. A
+/// lake's own bucket (`lake`) is read as `store::open_store` reads it: idle connections dropped,
+/// and every request a turn of the bucket's budget (invariant 182).
+pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, lake: bool) -> Result<Arc<dyn object_store::ObjectStore>> {
+    use object_store::{aws::{AmazonS3Builder, AmazonS3ConfigKey}, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder, http::HttpBuilder};
     let get = |k: &str| p.and_then(|p| p.get(k)).cloned();
     let chain = p.is_none() || get("provider").as_deref() == Some("credential_chain");
     let bucket = url.host_str().context("no bucket in the URL")?.to_string();
+    let home = format!("{}://{bucket}", url.scheme());
     let s3 = |endpoint: Option<String>| -> Result<Arc<dyn object_store::ObjectStore>> {
         let mut b = if chain { AmazonS3Builder::from_env() } else { AmazonS3Builder::new().with_region(get("region").unwrap_or_else(|| "us-east-1".into())) };
         b = b.with_bucket_name(&bucket);
+        if lake {
+            b = b.with_config(AmazonS3ConfigKey::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home));
+        }
         if let Some(e) = endpoint.or_else(|| get("endpoint")) {
             let e = if e.contains("://") { e } else if get("use_ssl").as_deref() == Some("false") { format!("http://{e}") } else { format!("https://{e}") };
             b = b.with_allow_http(e.starts_with("http://")).with_endpoint(e);
@@ -837,6 +843,9 @@ fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>) -> Result<Arc<dyn
             if let Some(e) = get("endpoint") {
                 b = b.with_config(K::Client(object_store::ClientConfigKey::AllowHttp), e.starts_with("http://").to_string()).with_base_url(&e);
             }
+            if lake {
+                b = b.with_config(K::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home));
+            }
             Arc::new(b.build()?)
         }
         "az" | "azure" | "abfs" | "abfss" => {
@@ -851,6 +860,9 @@ fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>) -> Result<Arc<dyn
                 if let Some(v) = found {
                     b = b.with_config(key, v);
                 }
+            }
+            if lake {
+                b = b.with_config(K::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home));
             }
             Arc::new(b.build()?)
         }
@@ -993,6 +1005,44 @@ pub async fn share_token(lake: &Lake, endpoint: &str) -> Result<Option<String>> 
     Ok(open(&name, &secret)?.get("token").cloned())
 }
 
+/// The token a Pondra server's leader is asked with (ADR-058), from the TYPE pondra secret covering it.
+fn pondra_token(secrets: &[(String, Secret)], endpoint: &str) -> Result<Option<String>> {
+    let found = secrets.iter().filter(|(n, x)| x.kind == "pondra" && usable(n, x))
+        .filter(|(_, x)| x.scope.as_deref().is_none_or(|p| endpoint.starts_with(p)))
+        .max_by_key(|(_, x)| x.scope.as_ref().map_or(0, |p| p.len() + 1));
+    let Some((name, secret)) = found else { return Ok(None) };
+    Ok(open(name, secret)?.get("token").cloned())
+}
+
+/// Say how this process reaches the lake at `dir` on another server (`store::Reach`): with the
+/// bucket secret among `secrets` covering it, and its leader at `endpoint` with the pondra secret
+/// covering that.
+pub fn reach_with(secrets: &[(String, Secret)], dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
+    let hit = covering(secrets, dir);
+    let params = hit.as_ref().map(|(n, s)| open(n, s)).transpose()?;
+    let token = endpoint.map(|e| pondra_token(secrets, e)).transpose()?.flatten();
+    let secret = hit.map(|(n, _)| n);
+    crate::store::reach_by(dir, crate::store::Reach { read_only, params, endpoint: endpoint.map(str::to_string), token, secret });
+    Ok(())
+}
+
+/// The same, with this lake's secrets.
+pub async fn reach(lake: &Lake, dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
+    reach_with(&list(lake).await?, dir, read_only, endpoint)
+}
+
+/// The bucket secrets covering `urls` (no temporary ones), for a branch to keep (`branch::make`).
+pub async fn lent(lake: &Lake, urls: &[String]) -> Result<Vec<(String, Secret)>> {
+    let all: Vec<(String, Secret)> = list(lake).await?.into_iter().filter(|(_, s)| !s.temporary).collect();
+    let mut found: Vec<(String, Secret)> = vec![];
+    for hit in urls.iter().filter_map(|u| covering(&all, u)) {
+        if !found.iter().any(|(n, _)| *n == hit.0) {
+            found.push(hit);
+        }
+    }
+    Ok(found)
+}
+
 /// The bearer token for a REST catalog, from the secret covering it: its TOKEN, or one its
 /// CLIENT_ID and CLIENT_SECRET get (OAuth's client credentials), kept until it expires.
 pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
@@ -1039,7 +1089,7 @@ pub struct Secret {
     pub temporary: bool, // (CREATE TEMPORARY SECRET: the session's, in memory: `temp.rs`)
 }
 
-fn secret_key(name: &str) -> String { format!("e/{name}") }
+pub(crate) fn secret_key(name: &str) -> String { format!("e/{name}") }
 
 /// Each type's settings (DuckDB's names), and the URL schemes it serves.
 fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
@@ -1050,9 +1100,10 @@ fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
         "http" => (&["bearer_token", "scope"], &["http", "https"]),
         "iceberg" => (&["token", "client_id", "client_secret", "oauth2_server_uri", "oauth2_scope", "scope"], &["http", "https"]), // (a REST catalog)
         "share" => (&["token", "scope"], &["http", "https"]), // (a Delta Sharing server: a recipient's token)
+        "pondra" => (&["token", "scope"], &["http", "https"]), // (a Pondra server's leader, asked with a user's token: ADR-058)
         "kafka" => (&["security_protocol", "sasl_mechanism", "username", "password", "scope"], &["kafka"]),
         "generic" => (&[], &[]), // (any settings: for procedures, `pondra.secret(name)`)
-        t => bail!("secrets of TYPE {t}: s3, r2, gcs, azure, http, iceberg, share, kafka or generic"),
+        t => bail!("secrets of TYPE {t}: s3, r2, gcs, azure, http, iceberg, share, kafka, pondra or generic"),
     })
 }
 
@@ -1122,7 +1173,8 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
 }
 
 /// `ATTACH [DATABASE] [IF NOT EXISTS] 'url' [AS] name (TYPE delta | iceberg, ENDPOINT '…', …)`:
-/// another engine's tables. None: another lake (no TYPE, or TYPE pondra), as before.
+/// another engine's tables. Another lake (no TYPE, or TYPE pondra) is `ddl::Attach`, with its
+/// READ_ONLY and ENDPOINT options (ADR-058). None: an ATTACH with no options, as before.
 fn attach_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<crate::write::Stmt> {
     use datafusion::sql::sqlparser::{keywords::Keyword, tokenizer::Token};
     let usage = "ATTACH 's3://bucket/tables' AS name (TYPE delta), or ATTACH 'https://catalog' AS name (TYPE iceberg)";
@@ -1155,7 +1207,12 @@ fn attach_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Optio
     }
     let kind = options.remove("type").unwrap_or_default().to_lowercase();
     if kind.is_empty() || kind == "pondra" {
-        return None; // (a lake: `ddl::Attach`)
+        let read_only = options.remove("read_only").is_some_and(|v| !v.eq_ignore_ascii_case("false"));
+        let endpoint = options.remove("endpoint");
+        if let Some(k) = options.keys().next() {
+            return Some(crate::write::Stmt::Invalid(format!("ATTACH 'lake' AS name (READ_ONLY, ENDPOINT 'https://…'): {k} isn't an option of a Pondra lake")));
+        }
+        return Some(crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Attach { name, dir: url, read_only, endpoint }]));
     }
     let mut url = url;
     if kind == "share" && url.trim_start().starts_with('{') {
@@ -1324,7 +1381,7 @@ fn usable(name: &str, s: &Secret) -> bool { s.temporary || crate::auth::limited(
 /// type's schemes).
 pub(crate) fn covering(secrets: &[(String, Secret)], url: &str) -> Option<(String, Secret)> {
     let s = scheme(url)?;
-    secrets.iter().filter(|(n, x)| usable(n, x) && kind(&x.kind).is_ok_and(|(_, schemes)| schemes.contains(&s)))
+    secrets.iter().filter(|(n, x)| usable(n, x) && x.kind != "pondra" && kind(&x.kind).is_ok_and(|(_, schemes)| schemes.contains(&s)))
         .filter(|(_, x)| x.scope.as_deref().is_none_or(|p| url.starts_with(p)))
         .max_by_key(|(_, x)| x.scope.as_ref().map_or(0, |p| p.len() + 1)).cloned()
 }
