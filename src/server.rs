@@ -372,6 +372,13 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
         };
     }
+    let needed = crate::auth::Auth::needed(req.uri().path(), req.method().as_str());
+    let starting = !*app.lake.caught.borrow();
+    let token = header.as_deref().and_then(|h| h.strip_prefix("Bearer "));
+    let node = token.is_some_and(|t| t.starts_with("pn_") || app.auth.token_role(t) > crate::auth::Role::None); // (the cluster's own calls: never held)
+    if starting && needed > crate::auth::Role::None && !node {
+        app.lake.caught_up().await; // (a node that just started signs users in from what its leader had: `open`)
+    }
     let signed = match &header {
         Some(h) => crate::users::who(&app.lake, &app.auth, Some(h)).await,
         None => None,
@@ -379,6 +386,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let who = match signed {
         Some(p) => p,
         None if owner(req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
+        None if starting && needed == crate::auth::Role::None => crate::auth::Principal::of(crate::auth::Role::None), // (a probe while it catches up: answered, never held)
         None if app.open().await => crate::auth::Principal::of(crate::auth::Role::Admin),
         None if header.is_some() => {
             crate::audit::refused(&app, &basic_user(header.as_deref()), "http", from, &format!("{} {}", req.method(), req.uri().path()), "wrong token, or user name and password");
@@ -388,7 +396,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         None => crate::auth::Principal::of(crate::auth::Role::None),
     };
     let who = who.at("http", from);
-    if who.role < crate::auth::Auth::needed(req.uri().path(), req.method().as_str()) {
+    if who.role < needed {
         return match who.role {
             crate::auth::Role::None => (StatusCode::UNAUTHORIZED, "sign in: a token, or a user's name and password").into_response(),
             _ => {
@@ -448,8 +456,16 @@ async fn whoami(State(app): State<App>) -> Json<Value> {
 }
 
 impl App {
-    /// Does nothing need a sign-in here? (No token set, and no user who signs in.)
-    pub async fn open(&self) -> bool { !self.auth.on() && !crate::users::any(&self.lake).await }
+    /// Does nothing need a sign-in here? (No token set, and no user who signs in. A node that just
+    /// started asks once it holds what its leader had: a mirror seeded before the first user was
+    /// flushed knows of none.)
+    pub async fn open(&self) -> bool {
+        if self.auth.on() {
+            return false;
+        }
+        self.lake.caught_up().await;
+        !crate::users::any(&self.lake).await
+    }
 }
 
 /// Followers forward metadata writes to the leader, unchanged.
@@ -1364,6 +1380,7 @@ async fn stats(State(app): State<App>) -> Json<Value> {
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     s["version"] = j!(crate::format::VERSION);
     s["format"] = j!(crate::format::of(&app.lake.cat).await.map(|f| f.format).unwrap_or_default()); // (the lake's: ADR-039)
+    s["keys"] = j!(crate::users::kept(&app.lake).await); // (the lake's own keys: sealed by its master key, or in the clear)
     if c.is_leader() {
         s["releases"] = j!(c.releases()); // (each live node's: a rolling upgrade's progress)
     }
