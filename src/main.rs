@@ -719,7 +719,7 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 format::watch(lake.clone());
                 if streamed {
-                    cluster::catch_up(lake.clone(), cluster.leader.addr.clone()); // (answers wait until this node holds what the leader had; a view that replays the WAL has it)
+                    cluster::catch_up(lake.clone(), store.clone(), cluster.leader.clone()); // (answers wait until this node holds what the leader had; a view that replays the WAL has it)
                 }
                 match reader {
                     false => cluster.clone().follow(store),

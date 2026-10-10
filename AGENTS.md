@@ -1331,7 +1331,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    its older catalog. A Flight log stream that follows a table skips the commits to other tables
    instead of sending them as empty chunks. The website's `guides/clusters.mdx` (a leader killed
    seconds after the lake was made, then a node asked to INSERT into its table) failed one run in
-   three without it (PR #50's CI); `cluster.py failover`.
+   three without it (PR #50's CI); `cluster.py failover`. A leader whose mark is old by the time a
+   node gives up asking died before the node started: it waits on (60 s at most) for whoever takes
+   over, which starts it again. The shell, `pondra run` and the project commands send nothing until
+   their node is ready (`shell::up`: `/ready`), so a shell opened on a lake whose only node was killed
+   answers once the lake is led again (`harness.py functions`' shell check, after every node is
+   killed, failed on PR #50's CI without both).
 
 198. **A variable's value is bound, never pasted, and lives where its statements do** (`vars.rs`,
    ADR-037): `DECLARE $day DATE = …` and `$day = …` (DuckDB's `SET VARIABLE`, `RESET VARIABLE`,
