@@ -8308,6 +8308,7 @@ def registry():
     for k, n in comments.items():
         q(f"COMMENT ON {k.upper()} {n} IS 'about {n}'")
     q("COMMENT ON COLUMN sales.orders.amount IS $$in euros, it's net$$")
+    q("COMMENT ON COLUMN eu_orders.amount IS 'net, in euros'")
     q("COMMENT ON TABLE clicks IS 'gone soon'")
     q("COMMENT ON TABLE clicks IS NULL")
     listed = {(r["kind"], r.get("schema"), r["name"]): r for r in q("SELECT * FROM pondra.objects")}
@@ -8335,7 +8336,8 @@ def registry():
     again = {(k, n): show(k, n) for k, n, _ in made}
     info["differs"] = {f"{k} {n}": [before[(k, n)], again[(k, n)]] for k, n, _ in made if before[(k, n)] != again[(k, n)]}
     checks["SHOW CREATE of every kind, run again after a drop, makes the same object, comments and all; a drop takes its comments"] = \
-        not info["differs"] and after_drop == ["sales"] and "COMMENT ON COLUMN sales.orders.amount IS 'in euros, it''s net'" in again[("table", "sales.orders")]
+        not info["differs"] and after_drop == ["sales"] and "COMMENT ON COLUMN sales.orders.amount IS 'in euros, it''s net'" in again[("table", "sales.orders")] \
+        and "COMMENT ON COLUMN eu_orders.amount IS 'net, in euros'" in again[("view", "eu_orders")]
     q("ALTER TABLE sales.orders RENAME TO orders_2025")
     moved = q("SELECT name, comment FROM pondra.objects WHERE kind = 'table' AND schema = 'sales'")
     checks["a renamed table keeps its comments, its columns' too"] = moved == [{"name": "orders_2025", "comment": "about sales.orders"}] \
@@ -8455,9 +8457,9 @@ def registry():
         and all(k["inside"] and set(k["inside"]) <= object_names for k in kinds if k["is"] == "part") \
         and all(k["lists"] for k in kinds if k["is"] == "pattern") \
         and {k["kind"] for k in kinds if k["is"] == "object" and k["on_clone"] == "leave"} == {"secret", "share", "recipient"}
-    missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'")]
+    missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'", "COMMENT ON COLUMN eu_orders.region IS 'x'")]
     quiet = q("COMMENT IF EXISTS ON TABLE nothing_here IS 'x'")
-    checks["what isn't there: refused by name, or nothing with IF EXISTS"] = missing == [500, 500, 500] and quiet.get("exists") is False
+    checks["what isn't there: refused by name, or nothing with IF EXISTS"] = missing == [500, 500, 500, 500] and quiet.get("exists") is False
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"registry": checks, "ok": ok, "info": info}, indent=1, default=str))
