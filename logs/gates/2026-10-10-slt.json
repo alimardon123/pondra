@@ -9,7 +9,7 @@
  "pass_rate": 0.9815,
  "raw_pass_rate": 0.9172,
  "error_text_differs": 730,
- "secs": 135,
+ "secs": 134,
  "exceptions": {
   "plan text": {
    "records": 1312,
@@ -2668,49 +2668,49 @@
    "file": "aggregate_memory_spill.slt",
    "line": 54,
    "sql": "EXPLAIN ANALYZE\nSELECT count(*), sum(total)\nFROM (\n  SELECT (v * 7) % 100000 AS k, sum(v) AS total\n  FROM generate_series(1, 100000) AS t(v)\n  GROUP BY (v * 7) % 100000\n)",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(total)@1 as sum(total)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=694ns, output_bytes=16.0 B, output_batches=1, expr_0_eval_time=106ns, expr_1_eval_time=84ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), sum(total)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=276.16\u00b5s, output_bytes=16.0 B, output_batches=1]'], want ['<slt:ignore>', '04)------A",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(total)@1 as sum(total)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=954ns, output_bytes=16.0 B, output_batches=1, expr_0_eval_time=216ns, expr_1_eval_time=113ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), sum(total)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=447.68\u00b5s, output_bytes=16.0 B, output_batches=1]'], want ['<slt:ignore>', '04)------",
    "exception": "plan text"
   },
   {
    "file": "aggregate_memory_spill.slt",
    "line": 80,
    "sql": "EXPLAIN ANALYZE\nSELECT count(*), sum(total)\nFROM (\n  SELECT (v * 7) % 100000 AS a, (v * 13) % 100000 AS b, sum(v) AS total\n  FROM generate_series(1, 100000) AS t(v)\n  GROUP BY (v * 7) % 100000, (v * 13) % 100000\n)",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(total)@1 as sum(total)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=672ns, output_bytes=16.0 B, output_batches=1, expr_0_eval_time=150ns, expr_1_eval_time=79ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), sum(total)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=313.72\u00b5s, output_bytes=16.0 B, output_batches=1]'], want ['<slt:ignore>', '04)------A",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(total)@1 as sum(total)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=629ns, output_bytes=16.0 B, output_batches=1, expr_0_eval_time=72ns, expr_1_eval_time=100ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), sum(total)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=291.75\u00b5s, output_bytes=16.0 B, output_batches=1]'], want ['<slt:ignore>', '04)------A",
    "exception": "plan text"
   },
   {
    "file": "aggregate_memory_spill.slt",
    "line": 106,
    "sql": "EXPLAIN ANALYZE\nSELECT count(*), sum(d)\nFROM (\n  SELECT (v * 7) % 100000 AS k, count(DISTINCT v) AS d\n  FROM generate_series(1, 100000) AS t(v)\n  GROUP BY (v * 7) % 100000\n)",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(d)@1 as sum(d)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=805ns, output_bytes=16.0 B, output_batches=1, expr_0_eval_time=97ns, expr_1_eval_time=77ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), sum(d)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=291.75\u00b5s, output_bytes=16.0 B, output_batches=1]'], want ['<slt:ignore>', '04)------AggregateExec:",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(d)@1 as sum(d)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=749ns, output_bytes=16.0 B, output_batches=1, expr_0_eval_time=105ns, expr_1_eval_time=75ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), sum(d)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=287.17\u00b5s, output_bytes=16.0 B, output_batches=1]'], want ['<slt:ignore>', '04)------AggregateExec",
    "exception": "plan text"
   },
   {
    "file": "aggregate_memory_spill.slt",
    "line": 132,
    "sql": "EXPLAIN ANALYZE\nSELECT count(*), sum(s), min(mn), max(mx)\nFROM (\n  SELECT (v * 7) % 100000 AS k, sum(v) AS s, min(v) AS mn, max(v) AS mx\n  FROM generate_series(1, 100000) AS t(v)\n  GROUP BY (v * 7) % 100000\n)",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(s)@1 as sum(s), min(mn)@2 as min(mn), max(mx)@3 as max(mx)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=1.11\u00b5s, output_bytes=32.0 B, output_batches=1, expr_0_eval_time=98ns, expr_1_eval_time=62ns, expr_2_eval_time=63ns, expr_3_eval_time=87ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), sum(s), min(mn), max(mx)], expected_rows=1, metrics=[output_rows=1, elaps",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(s)@1 as sum(s), min(mn)@2 as min(mn), max(mx)@3 as max(mx)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=1.18\u00b5s, output_bytes=32.0 B, output_batches=1, expr_0_eval_time=91ns, expr_1_eval_time=75ns, expr_2_eval_time=58ns, expr_3_eval_time=68ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), sum(s), min(mn), max(mx)], expected_rows=1, metrics=[output_rows=1, elaps",
    "exception": "plan text"
   },
   {
    "file": "aggregate_memory_spill.slt",
    "line": 158,
    "sql": "EXPLAIN ANALYZE\nSELECT count(*), min(a), max(a)\nFROM (\n  SELECT (v * 7) % 100000 AS k, avg(v) AS a\n  FROM generate_series(1, 100000) AS t(v)\n  GROUP BY (v * 7) % 100000\n)",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), min(a)@1 as min(a), max(a)@2 as max(a)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=922ns, output_bytes=24.0 B, output_batches=1, expr_0_eval_time=128ns, expr_1_eval_time=92ns, expr_2_eval_time=88ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), min(a), max(a)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=669.03\u00b5s, output_bytes=24.0 B, output_batches=",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), min(a)@1 as min(a), max(a)@2 as max(a)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=1.15\u00b5s, output_bytes=24.0 B, output_batches=1, expr_0_eval_time=207ns, expr_1_eval_time=146ns, expr_2_eval_time=153ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), min(a), max(a)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=572.77\u00b5s, output_bytes=24.0 B, output_batch",
    "exception": "plan text"
   },
   {
    "file": "aggregate_memory_spill.slt",
    "line": 184,
    "sql": "EXPLAIN ANALYZE\nSELECT count(*), sum(l)\nFROM (\n  SELECT (v * 7) % 100000 AS k, array_length(array_agg(v)) AS l\n  FROM generate_series(1, 100000) AS t(v)\n  GROUP BY (v * 7) % 100000\n)",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(l)@1 as sum(l)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=1.13\u00b5s, output_bytes=16.0 B, output_batches=1, expr_0_eval_time=152ns, expr_1_eval_time=199ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), sum(l)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=286.82\u00b5s, output_bytes=16.0 B, output_batches=1]'], want ['<slt:ignore>', '04)------AggregateEx",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(l)@1 as sum(l)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=581ns, output_bytes=16.0 B, output_batches=1, expr_0_eval_time=111ns, expr_1_eval_time=53ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1)), sum(l)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=273.86\u00b5s, output_bytes=16.0 B, output_batches=1]'], want ['<slt:ignore>', '04)------AggregateExec",
    "exception": "plan text"
   },
   {
    "file": "aggregate_memory_spill.slt",
    "line": 214,
    "sql": "EXPLAIN ANALYZE\nSELECT count(*), sum(total)\nFROM (\n  SELECT (v * 7) % 100000 AS k, sum(v) AS total\n  FROM generate_series(1, 100000) AS t(v)\n  GROUP BY (v * 7) % 100000\n)",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(total)@1 as sum(total)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=696ns, output_bytes=16.0 B, output_batches=1, expr_0_eval_time=136ns, expr_1_eval_time=66ns]', '02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), sum(total)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=7.23\u00b5s, output_bytes=16.0 B, output_batches=1]'], want ['<slt:ignore>', '06)----------",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*), sum(total)@1 as sum(total)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=678ns, output_bytes=16.0 B, output_batches=1, expr_0_eval_time=88ns, expr_1_eval_time=89ns]', '02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), sum(total)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=5.93\u00b5s, output_bytes=16.0 B, output_batches=1]'], want ['<slt:ignore>', '06)----------A",
    "exception": "plan text"
   },
   {
@@ -3102,7 +3102,7 @@
    "file": "array_transform.slt",
    "line": 54,
    "sql": "SELECT array_transform([1,2,3,4,5], v -> list_repeat(\"a\", v));",
-   "why": "500: b\"Error during planning: Invalid function 'list_repeat'.\\nDid you mean 'list_replace'?\""
+   "why": "500: b\"Error during planning: Invalid function 'list_repeat'.\\nDid you mean 'list_prepend'?\""
   },
   {
    "file": "array_transform.slt",
@@ -4784,7 +4784,7 @@
    "file": "timestamps.slt",
    "line": 679,
    "sql": "SELECT DISTINCT ts FROM ts_data_nanos;",
-   "why": "answer differs: got ['2020-09-08T12:42:29.190855', '2020-09-08T11:42:29.190855', '2020-09-08T13:42:29.190855'], want ['2020-09-08T11:42:29.190855123', '2020-09-08T12:42:29.190855123', '2020-09-08T13:42:29.190855123']",
+   "why": "answer differs: got ['2020-09-08T13:42:29.190855', '2020-09-08T12:42:29.190855', '2020-09-08T11:42:29.190855'], want ['2020-09-08T11:42:29.190855123', '2020-09-08T12:42:29.190855123', '2020-09-08T13:42:29.190855123']",
    "exception": "microseconds"
   },
   {
@@ -5369,7 +5369,7 @@
    "file": "dynamic_filter_pushdown_config.slt",
    "line": 98,
    "sql": "EXPLAIN ANALYZE SELECT id, value AS v, value + id as name FROM test_parquet where value > 3 ORDER BY v DESC LIMIT 3;",
-   "why": "answer differs: got ['Plan with Metrics', '01)SortPreservingMergeExec: [v@1 DESC], fetch=3, expected_rows=3, metrics=[output_rows=3, elapsed_compute=11.42\u00b5s, output_bytes=36.0 B]', '02)--SortExec: TopK(fetch=3), expr=[v@1 DESC], preserve_partitioning=[true], filter=[v@1 IS NULL OR v@1 > 800], expected_rows=3, metrics=[output_rows=3, elapsed_compute=61.52\u00b5s, output_bytes=36.0 B]'], want ['Plan with Metrics', '01)SortPreservingMergeExec: [v@1 DESC], fetch=3, metrics=[output_rows=3, <slt:ignore>]',",
+   "why": "answer differs: got ['Plan with Metrics', '01)SortPreservingMergeExec: [v@1 DESC], fetch=3, expected_rows=3, metrics=[output_rows=3, elapsed_compute=25.16\u00b5s, output_bytes=36.0 B]', '02)--SortExec: TopK(fetch=3), expr=[v@1 DESC], preserve_partitioning=[true], filter=[v@1 IS NULL OR v@1 > 800], expected_rows=3, metrics=[output_rows=3, elapsed_compute=74.05\u00b5s, output_bytes=36.0 B]'], want ['Plan with Metrics', '01)SortPreservingMergeExec: [v@1 DESC], fetch=3, metrics=[output_rows=3, <slt:ignore>]',",
    "exception": "plan text"
   },
   {
@@ -5542,7 +5542,7 @@
    "file": "dynamic_row_group_pruning.slt",
    "line": 96,
    "sql": "explain analyze select v from t order by v desc limit 3;",
-   "why": "answer differs: got ['Plan with Metrics', '01)SortExec: TopK(fetch=3), expr=[v@0 DESC], preserve_partitioning=[false], filter=[v@0 IS NULL OR v@0 > 12], expected_rows=3, metrics=[output_rows=3, elapsed_compute=32.00\u00b5s, output_bytes=24.0 B]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/dynamic_row_group_pruning/data.parquet]]}, projection=[v], file_type=parquet, predicate=DynamicFilter [ v@0 IS NULL OR v@0 > 12 ], sort_order_for_reorder",
+   "why": "answer differs: got ['Plan with Metrics', '01)SortExec: TopK(fetch=3), expr=[v@0 DESC], preserve_partitioning=[false], filter=[v@0 IS NULL OR v@0 > 12], expected_rows=3, metrics=[output_rows=3, elapsed_compute=31.44\u00b5s, output_bytes=24.0 B]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/dynamic_row_group_pruning/data.parquet]]}, projection=[v], file_type=parquet, predicate=DynamicFilter [ v@0 IS NULL OR v@0 > 12 ], sort_order_for_reorder",
    "exception": "plan text"
   },
   {
@@ -5990,14 +5990,14 @@
    "file": "explain_analyze.slt",
    "line": 156,
    "sql": "EXPLAIN ANALYZE\nSELECT a+1, pow(a,2)\nFROM generate_series(1, 100) as t1(a);",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[a@0 + 1 as t1.a + Int64(1), power(CAST(a@0 AS Float64), 2) as pow(t1.a,Int64(2))], metrics=[output_rows=100, elapsed_compute=50.80\u00b5s, output_bytes=1632.0 B, output_batches=1, expr_0_eval_time=13.96\u00b5s, expr_1_eval_time=34.70\u00b5s]', '02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true, metrics=[output_rows=100, elapsed_compute=4.60\u00b5s, output_bytes=64.0 KB, output_batches=1, spill_coun",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[a@0 + 1 as t1.a + Int64(1), power(CAST(a@0 AS Float64), 2) as pow(t1.a,Int64(2))], metrics=[output_rows=100, elapsed_compute=95.24\u00b5s, output_bytes=1632.0 B, output_batches=1, expr_0_eval_time=19.32\u00b5s, expr_1_eval_time=74.00\u00b5s]', '02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true, metrics=[output_rows=100, elapsed_compute=4.31\u00b5s, output_bytes=64.0 KB, output_batches=1, spill_coun",
    "exception": "plan text"
   },
   {
    "file": "explain_analyze.slt",
    "line": 167,
    "sql": "EXPLAIN ANALYZE\nSELECT a+1, a+1 as another_a_plus_one\nFROM generate_series(1, 100) as t1(a);",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[__common_expr_1@0 as t1.a + Int64(1), __common_expr_1@0 as another_a_plus_one], metrics=[output_rows=100, elapsed_compute=1.06\u00b5s, output_bytes=800.0 B, output_batches=1, expr_0_eval_time=172ns, expr_1_eval_time=148ns]', '02)--ProjectionExec: expr=[a@0 + 1 as __common_expr_1], metrics=[output_rows=100, elapsed_compute=10.85\u00b5s, output_bytes=800.0 B, output_batches=1, expr_0_eval_time=9.17\u00b5s]'], want ['Plan with Metrics', '01)Proje",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[__common_expr_1@0 as t1.a + Int64(1), __common_expr_1@0 as another_a_plus_one], metrics=[output_rows=100, elapsed_compute=1.09\u00b5s, output_bytes=800.0 B, output_batches=1, expr_0_eval_time=126ns, expr_1_eval_time=179ns]', '02)--ProjectionExec: expr=[a@0 + 1 as __common_expr_1], metrics=[output_rows=100, elapsed_compute=10.01\u00b5s, output_bytes=800.0 B, output_batches=1, expr_0_eval_time=8.30\u00b5s]'], want ['Plan with Metrics', '01)Proje",
    "exception": "plan text"
   },
   {
@@ -6032,7 +6032,7 @@
    "file": "explain_analyze.slt",
    "line": 290,
    "sql": "explain analyze select * from cat_tracking where species > 'M' AND s >= 50 order by species limit 3;",
-   "why": "answer differs: got ['Plan with Metrics', '01)SortExec: TopK(fetch=3), expr=[species@0 ASC NULLS LAST], preserve_partitioning=[false], filter=[species@0 < Nlpine Sheep], expected_rows=3, metrics=[elapsed_compute=25.25\u00b5s]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/explain_analyze/data.parquet]]}, projection=[species, s], file_type=parquet, predicate=s@1 >= 50 AND species@0 > M AND DynamicFilter [ species@0 < Nlpine Sheep ], sort_orde",
+   "why": "answer differs: got ['Plan with Metrics', '01)SortExec: TopK(fetch=3), expr=[species@0 ASC NULLS LAST], preserve_partitioning=[false], filter=[species@0 < Nlpine Sheep], expected_rows=3, metrics=[elapsed_compute=22.64\u00b5s]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/explain_analyze/data.parquet]]}, projection=[species, s], file_type=parquet, predicate=s@1 >= 50 AND species@0 > M AND DynamicFilter [ species@0 < Nlpine Sheep ], sort_orde",
    "exception": "plan text"
   },
   {
@@ -6116,7 +6116,7 @@
    "file": "explain_analyze.slt",
    "line": 575,
    "sql": "EXPLAIN (ANALYZE, METRICS 'timing', LEVEL summary) select * from cat_tracking where species > 'M' AND s >= 50 order by species limit 3;",
-   "why": "answer differs: got ['Plan with Metrics', '01)SortExec: TopK(fetch=3), expr=[species@0 ASC NULLS LAST], preserve_partitioning=[false], filter=[species@0 < Nlpine Sheep], expected_rows=3, metrics=[elapsed_compute=23.54\u00b5s]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/explain_analyze/data.parquet]]}, projection=[species, s], file_type=parquet, predicate=s@1 >= 50 AND species@0 > M AND DynamicFilter [ species@0 < Nlpine Sheep ], sort_orde",
+   "why": "answer differs: got ['Plan with Metrics', '01)SortExec: TopK(fetch=3), expr=[species@0 ASC NULLS LAST], preserve_partitioning=[false], filter=[species@0 < Nlpine Sheep], expected_rows=3, metrics=[elapsed_compute=23.37\u00b5s]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/explain_analyze/data.parquet]]}, projection=[species, s], file_type=parquet, predicate=s@1 >= 50 AND species@0 > M AND DynamicFilter [ species@0 < Nlpine Sheep ], sort_orde",
    "exception": "plan text"
   },
   {
@@ -6130,7 +6130,7 @@
    "file": "explain_analyze.slt",
    "line": 595,
    "sql": "EXPLAIN (ANALYZE, METRICS 'rows', TIMING on, LEVEL summary) select * from cat_tracking where species > 'M' AND s >= 50 order by species limit 3;",
-   "why": "answer differs: got ['Plan with Metrics', '01)SortExec: TopK(fetch=3), expr=[species@0 ASC NULLS LAST], preserve_partitioning=[false], filter=[species@0 < Nlpine Sheep], expected_rows=3, metrics=[output_rows=3, elapsed_compute=21.48\u00b5s]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/explain_analyze/data.parquet]]}, projection=[species, s], file_type=parquet, predicate=s@1 >= 50 AND species@0 > M AND DynamicFilter [ species@0 < Nlpine She",
+   "why": "answer differs: got ['Plan with Metrics', '01)SortExec: TopK(fetch=3), expr=[species@0 ASC NULLS LAST], preserve_partitioning=[false], filter=[species@0 < Nlpine Sheep], expected_rows=3, metrics=[output_rows=3, elapsed_compute=23.65\u00b5s]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/explain_analyze/data.parquet]]}, projection=[species, s], file_type=parquet, predicate=s@1 >= 50 AND species@0 > M AND DynamicFilter [ species@0 < Nlpine She",
    "exception": "plan text"
   },
   {
@@ -6774,7 +6774,7 @@
    "file": "functions.slt",
    "line": 979,
    "sql": "SELECT * REPLACE (price*2 AS price) FROM products",
-   "why": "answer differs (in another order): got ['2 OldBrand Product 2 59.98', '4 OldBrand Product 4 99.98', '1 OldBrand Product 1 39.98'], want ['1 OldBrand Product 1 39.98', '2 OldBrand Product 2 59.98', '3 OldBrand Product 3 79.98']",
+   "why": "answer differs (in another order): got ['1 OldBrand Product 1 39.98', '3 OldBrand Product 3 79.98', '2 OldBrand Product 2 59.98'], want ['1 OldBrand Product 1 39.98', '2 OldBrand Product 2 59.98', '3 OldBrand Product 3 79.98']",
    "exception": "an order not asked for"
   },
   {
@@ -7086,7 +7086,7 @@
    "file": "group_by.slt",
    "line": 3644,
    "sql": "SELECT *\n  FROM(SELECT *, SUM(l.amount) OVER(ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as sum_amount\n    FROM sales_global_with_pk AS l\n  ) as l\n  GROUP BY l.sn\n  ORDER BY l.sn",
-   "why": "answer differs: got ['0 GRC 0 2022-01-01T06:00:00 EUR 30 130', '1 FRA 1 2022-01-01T08:00:00 EUR 50 250', '1 TUR 2 2022-01-01T11:30:00 TRY 75 375'], want ['0 GRC 0 2022-01-01T06:00:00 EUR 30 80', '1 FRA 1 2022-01-01T08:00:00 EUR 50 155', '1 TUR 2 2022-01-01T11:30:00 TRY 75 325']"
+   "why": "answer differs: got ['0 GRC 0 2022-01-01T06:00:00 EUR 30 130', '1 FRA 1 2022-01-01T08:00:00 EUR 50 325', '1 TUR 2 2022-01-01T11:30:00 TRY 75 225'], want ['0 GRC 0 2022-01-01T06:00:00 EUR 30 80', '1 FRA 1 2022-01-01T08:00:00 EUR 50 155', '1 TUR 2 2022-01-01T11:30:00 TRY 75 325']"
   },
   {
    "file": "group_by.slt",
@@ -7654,7 +7654,7 @@
    "file": "information_schema.slt",
    "line": 843,
    "sql": "select * from information_schema.routines where routine_name = 'date_trunc' OR routine_name = 'string_agg' OR routine_name = 'rank' ORDER BY routine_name",
-   "why": "answer differs: got ['lake public date_trunc lake public date_trunc FUNCTION true Time(ns) SCALAR Truncates a timestamp or time value to a specified precision. date_trunc(precision, expression)', 'lake public date_trunc lake public date_trunc FUNCTION true Timestamp(ns) SCALAR Truncates a timestamp or time value to a specified precision. date_trunc(precision, expression)', 'lake public date_trunc lake public date_trunc FUNCTION true String SCALAR Truncates a timestamp or time value to a specifie"
+   "why": "answer differs: got ['lake public date_trunc lake public date_trunc FUNCTION true Timestamp(ns, \"+TZ\") SCALAR Truncates a timestamp or time value to a specified precision. date_trunc(precision, expression)', 'lake public date_trunc lake public date_trunc FUNCTION true Time(ns) SCALAR Truncates a timestamp or time value to a specified precision. date_trunc(precision, expression)', 'lake public date_trunc lake public date_trunc FUNCTION true Timestamp(ns) SCALAR Truncates a timestamp or time value"
   },
   {
    "file": "information_schema.slt",
@@ -7732,7 +7732,7 @@
    "file": "information_schema_table_types.slt",
    "line": 34,
    "sql": "SELECT * from information_schema.tables;",
-   "why": "answer differs: got ['lake public query VIEW', 'lake public physical BASE TABLE', 'lake information_schema tables VIEW'], want ['datafusion information_schema columns VIEW', 'datafusion information_schema df_settings VIEW', 'datafusion information_schema parameters VIEW']"
+   "why": "answer differs: got ['lake public physical BASE TABLE', 'lake public query VIEW', 'lake information_schema tables VIEW'], want ['datafusion information_schema columns VIEW', 'datafusion information_schema df_settings VIEW', 'datafusion information_schema parameters VIEW']"
   },
   {
    "file": "input_file_name.slt",
@@ -7911,7 +7911,7 @@
    "file": "insert_to_external.slt",
    "line": 619,
    "sql": "select * from table_without_values;",
-   "why": "answer differs: got ['3 300', 'NULL 400', '2 NULL'], want ['1 100', '2 NULL', '3 NULL']"
+   "why": "answer differs: got ['3 300', 'NULL 400', '3 NULL'], want ['1 100', '2 NULL', '3 NULL']"
   },
   {
    "file": "insert_to_external.slt",
@@ -7923,7 +7923,7 @@
    "file": "insert_to_external.slt",
    "line": 659,
    "sql": "select a,b,c,d from test_column_defaults",
-   "why": "answer differs: got ['1 10 100 ABC', 'NULL 20 NULL NULL', '2 NULL NULL NULL'], want ['1 10 100 ABC', 'NULL 20 500 default_text']"
+   "why": "answer differs: got ['2 NULL NULL NULL', 'NULL 20 NULL NULL', '1 10 100 ABC'], want ['1 10 100 ABC', 'NULL 20 500 default_text']"
   },
   {
    "file": "insert_to_external.slt",
@@ -8511,7 +8511,7 @@
    "file": "joins.slt",
    "line": 2592,
    "sql": "SELECT * FROM test_timestamps_table as t1 JOIN (SELECT * FROM test_timestamps_table ) as t2 ON t1.micros = t2.micros",
-   "why": "answer differs: got ['2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011 2018-11-13T17:11:10 Row 0 2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011 2018-11-13T17:11:10 Row 0', '2011-12-13T11:13:10.123450 2011-12-13T11:13:10.123450 2011-12-13T11:13:10.123 2011-12-13T11:13:10 Row 1 2011-12-13T11:13:10.123450 2011-12-13T11:13:10.123450 2011-12-13T11:13:10.123 2011-12-13T11:13:10 Row 1', '2021-01-01T05:11:10.432 2021-01-01T05:11:10.432 2021-01-",
+   "why": "answer differs: got ['2021-01-01T05:11:10.432 2021-01-01T05:11:10.432 2021-01-01T05:11:10.432 2021-01-01T05:11:10 Row 3 2021-01-01T05:11:10.432 2021-01-01T05:11:10.432 2021-01-01T05:11:10.432 2021-01-01T05:11:10 Row 3', '2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011 2018-11-13T17:11:10 Row 0 2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011 2018-11-13T17:11:10 Row 0', '2011-12-13T11:13:10.123450 2011-12-13T11:13:10.123450 2011-12-13T11:",
    "exception": "microseconds"
   },
   {
@@ -8524,7 +8524,7 @@
    "file": "joins.slt",
    "line": 2608,
    "sql": "SELECT * FROM test_timestamps_table as t1 JOIN (SELECT * FROM test_timestamps_table ) as t2 ON t1.millis = t2.millis",
-   "why": "answer differs: got ['2021-01-01T05:11:10.432 2021-01-01T05:11:10.432 2021-01-01T05:11:10.432 2021-01-01T05:11:10 Row 3 2021-01-01T05:11:10.432 2021-01-01T05:11:10.432 2021-01-01T05:11:10.432 2021-01-01T05:11:10 Row 3', '2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011 2018-11-13T17:11:10 Row 0 2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011 2018-11-13T17:11:10 Row 0', '2011-12-13T11:13:10.123450 2011-12-13T11:13:10.123450 2011-12-13T11:",
+   "why": "answer differs: got ['2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011 2018-11-13T17:11:10 Row 0 2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011375 2018-11-13T17:11:10.011 2018-11-13T17:11:10 Row 0', '2011-12-13T11:13:10.123450 2011-12-13T11:13:10.123450 2011-12-13T11:13:10.123 2011-12-13T11:13:10 Row 1 2011-12-13T11:13:10.123450 2011-12-13T11:13:10.123450 2011-12-13T11:13:10.123 2011-12-13T11:13:10 Row 1', '2021-01-01T05:11:10.432 2021-01-01T05:11:10.432 2021-01-",
    "exception": "microseconds"
   },
   {
@@ -9025,7 +9025,7 @@
    "file": "joins.slt",
    "line": 5172,
    "sql": "EXPLAIN ANALYZE\nWITH t1 (k) AS (\n    VALUES (1), (2)\n), t2 (k) AS (\n    VALUES (1)\n)\nSELECT *\nFROM t1\nLEFT ANTI JOIN (\n    SELECT *\n    FROM t2\n    WHERE k <> 1\n) t2 ON t1.k = t2.k;",
-   "why": "answer differs: got ['Plan with Metrics', '01)HashJoinExec: mode=CollectLeft, join_type=RightAnti, on=[(k@0, k@0)], expected_rows=2, metrics=[output_rows=2, elapsed_compute=27.97\u00b5s, output_bytes=32.0 B, output_batches=1, build_mem_used=73.0 B, array_map_created_count=0, build_input_batches=0, build_input_rows=0, input_batches=1, input_rows=2, build_time=27.35\u00b5s, join_time=619ns, avg_fanout=N/A (0/0), probe_hit_rate=0% (0/2)]', '02)--ProjectionExec: expr=[column1@0 as k], expected_rows=1, metrics",
+   "why": "answer differs: got ['Plan with Metrics', '01)HashJoinExec: mode=CollectLeft, join_type=RightAnti, on=[(k@0, k@0)], expected_rows=2, metrics=[output_rows=2, elapsed_compute=30.41\u00b5s, output_bytes=32.0 B, output_batches=1, build_mem_used=73.0 B, array_map_created_count=0, build_input_batches=0, build_input_rows=0, input_batches=1, input_rows=2, build_time=29.71\u00b5s, join_time=701ns, avg_fanout=N/A (0/0), probe_hit_rate=0% (0/2)]', '02)--ProjectionExec: expr=[column1@0 as k], expected_rows=1, metrics",
    "exception": "plan text"
   },
   {
@@ -9384,14 +9384,14 @@
    "file": "limit_pruning.slt",
    "line": 63,
    "sql": "explain analyze select * from tracking_data where species > 'M' AND s >= 50 limit 3;",
-   "why": "answer differs: got ['Plan with Metrics DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/limit_pruning/data.parquet]]}, projection=[species, s], limit=3, file_type=parquet, predicate=s@1 >= 50 AND species@0 > M, pruning_predicate=s_null_count@1 != row_count@2 AND s_max@0 >= 50 AND species_null_count@4 != row_count@2 AND species_max@3 > M, required_guarantees=[], expected_rows=12, metrics=[output_rows=3, elapsed_compute=3.25\u00b5s, output_bytes=334.0 ",
+   "why": "answer differs: got ['Plan with Metrics DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/limit_pruning/data.parquet]]}, projection=[species, s], limit=3, file_type=parquet, predicate=s@1 >= 50 AND species@0 > M, pruning_predicate=s_null_count@1 != row_count@2 AND s_max@0 >= 50 AND species_null_count@4 != row_count@2 AND species_max@3 > M, required_guarantees=[], expected_rows=12, metrics=[output_rows=3, elapsed_compute=3.64\u00b5s, output_bytes=334.0 ",
    "exception": "plan text"
   },
   {
    "file": "limit_pruning.slt",
    "line": 118,
    "sql": "explain analyze select * from tracking_data where species > 'M' AND s >= 50 order by species limit 3;",
-   "why": "answer differs: got ['Plan with Metrics', '01)SortExec: TopK(fetch=3), expr=[species@0 ASC NULLS LAST], preserve_partitioning=[false], filter=[species@0 < Nlpine Sheep], expected_rows=3, metrics=[output_rows=3, elapsed_compute=41.38\u00b5s, output_bytes=72.0 B]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/limit_pruning/data.parquet]]}, projection=[species, s], file_type=parquet, predicate=s@1 >= 50 AND species@0 > M AND DynamicFilter [ spe",
+   "why": "answer differs: got ['Plan with Metrics', '01)SortExec: TopK(fetch=3), expr=[species@0 ASC NULLS LAST], preserve_partitioning=[false], filter=[species@0 < Nlpine Sheep], expected_rows=3, metrics=[output_rows=3, elapsed_compute=63.33\u00b5s, output_bytes=72.0 B]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/limit_pruning/data.parquet]]}, projection=[species, s], file_type=parquet, predicate=s@1 >= 50 AND species@0 > M AND DynamicFilter [ spe",
    "exception": "plan text"
   },
   {
@@ -9968,14 +9968,14 @@
    "file": "nested_loop_join_spill.slt",
    "line": 45,
    "sql": "EXPLAIN ANALYZE SELECT count(*)\nFROM generate_series(1, 100000) AS t1(v1)\nINNER JOIN generate_series(1, 1) AS t2(v2)\n  ON (t1.v1 + t2.v2) > 0",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=621ns, output_bytes=8.0 B, output_batches=1, expr_0_eval_time=147ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1))], expected_rows=1, metrics=[output_rows=1, elapsed_compute=32.89\u00b5s, output_bytes=8.0 B, output_batches=1]'], want ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)], metrics=[<slt:",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=900ns, output_bytes=8.0 B, output_batches=1, expr_0_eval_time=249ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1))], expected_rows=1, metrics=[output_rows=1, elapsed_compute=27.91\u00b5s, output_bytes=8.0 B, output_batches=1]'], want ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)], metrics=[<slt:",
    "exception": "plan text"
   },
   {
    "file": "nested_loop_join_spill.slt",
    "line": 98,
    "sql": "EXPLAIN ANALYZE\nSELECT count(*)\nFROM generate_series(1, 100000) AS t1(v1)\nRIGHT JOIN generate_series(1, 200) AS t2(v2)\n  ON (t1.v1 + t2.v2) = 2 AND t2.v2 <= 100",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=807ns, output_bytes=8.0 B, output_batches=1, expr_0_eval_time=328ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1))], expected_rows=1, metrics=[output_rows=1, elapsed_compute=9.95\u00b5s, output_bytes=8.0 B, output_batches=1]'], want ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)], metrics=[<slt:i",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)], expected_rows=1, metrics=[output_rows=1, elapsed_compute=569ns, output_bytes=8.0 B, output_batches=1, expr_0_eval_time=186ns]', '02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1))], expected_rows=1, metrics=[output_rows=1, elapsed_compute=9.40\u00b5s, output_bytes=8.0 B, output_batches=1]'], want ['Plan with Metrics', '01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)], metrics=[<slt:i",
    "exception": "plan text"
   },
   {
@@ -10454,7 +10454,7 @@
    "file": "ordered_aggregate_spill.slt",
    "line": 46,
    "sql": "EXPLAIN ANALYZE\nSELECT v1, sum(v1 * 2)\nFROM generate_series(20000) AS t1(v1)\nGROUP BY v1",
-   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=FinalPartitioned, gby=[v1@0 as v1], aggr=[sum(t1.v1 * Int64(2))], ordering_mode=Sorted, metrics=[output_rows=20.00 K, elapsed_compute=794.29\u00b5s, output_bytes=468.0 KB, output_batches=160, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, aggregate_arguments_time=36.04\u00b5s, aggregation_time=39.29\u00b5s, emitting_time=230.69\u00b5s, time_calculating_group_ids=78.57\u00b5s]', '02)--RepartitionExec: partitioning=Hash([v1@0], 2), input_partitions=2, ",
+   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=FinalPartitioned, gby=[v1@0 as v1], aggr=[sum(t1.v1 * Int64(2))], ordering_mode=Sorted, metrics=[output_rows=20.00 K, elapsed_compute=785.57\u00b5s, output_bytes=468.0 KB, output_batches=160, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, aggregate_arguments_time=30.30\u00b5s, aggregation_time=33.29\u00b5s, emitting_time=248.88\u00b5s, time_calculating_group_ids=71.88\u00b5s]', '02)--RepartitionExec: partitioning=Hash([v1@0], 2), input_partitions=2, ",
    "exception": "plan text"
   },
   {
@@ -10481,7 +10481,7 @@
    "file": "ordered_aggregate_spill.slt",
    "line": 91,
    "sql": "EXPLAIN ANALYZE\nSELECT round(v1, -4), v1 % 5000, sum(v1 * 2)\nFROM generate_series(20000) AS t1(v1)\nGROUP BY round(v1, -4), v1 % 5000",
-   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=FinalPartitioned, gby=[round(t1.v1,Int64(-4))@0 as round(t1.v1,Int64(-4)), t1.v1 % Int64(5000)@1 as t1.v1 % Int64(5000)], aggr=[sum(t1.v1 * Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[output_rows=15.00 K, elapsed_compute=2.03ms, output_bytes=537.6 KB, output_batches=120, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, aggregate_arguments_time=29.09\u00b5s, aggregation_time=36.07\u00b5s, emitting_time=1.08ms, time_calculatin",
+   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=FinalPartitioned, gby=[round(t1.v1,Int64(-4))@0 as round(t1.v1,Int64(-4)), t1.v1 % Int64(5000)@1 as t1.v1 % Int64(5000)], aggr=[sum(t1.v1 * Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[output_rows=15.00 K, elapsed_compute=3.03ms, output_bytes=537.6 KB, output_batches=120, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, aggregate_arguments_time=48.78\u00b5s, aggregation_time=64.17\u00b5s, emitting_time=1.47ms, time_calculatin",
    "exception": "plan text"
   },
   {
@@ -10495,7 +10495,7 @@
    "file": "ordered_aggregate_spill.slt",
    "line": 115,
    "sql": "EXPLAIN ANALYZE\nSELECT round(v1, -4), v1 % 5000, sum(v1 * 2)\nFROM generate_series(20000) AS t1(v1)\nGROUP BY round(v1, -4), v1 % 5000",
-   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=FinalPartitioned, gby=[round(t1.v1,Int64(-4))@0 as round(t1.v1,Int64(-4)), t1.v1 % Int64(5000)@1 as t1.v1 % Int64(5000)], aggr=[sum(t1.v1 * Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[output_rows=15.00 K, elapsed_compute=2.36ms, output_bytes=537.6 KB, output_batches=120, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, aggregate_arguments_time=47.60\u00b5s, aggregation_time=46.24\u00b5s, emitting_time=997.10\u00b5s, time_calculat",
+   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=FinalPartitioned, gby=[round(t1.v1,Int64(-4))@0 as round(t1.v1,Int64(-4)), t1.v1 % Int64(5000)@1 as t1.v1 % Int64(5000)], aggr=[sum(t1.v1 * Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[output_rows=15.00 K, elapsed_compute=2.73ms, output_bytes=537.6 KB, output_batches=120, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, aggregate_arguments_time=46.56\u00b5s, aggregation_time=74.50\u00b5s, emitting_time=1.25ms, time_calculatin",
    "exception": "plan text"
   },
   {
@@ -10509,7 +10509,7 @@
    "file": "ordered_aggregate_spill.slt",
    "line": 139,
    "sql": "EXPLAIN ANALYZE\nSELECT round(v1, -4), v1 % 5000, sum(v1 * 2)\nFROM generate_series(20000) AS t1(v1)\nGROUP BY round(v1, -4), v1 % 5000",
-   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=FinalPartitioned, gby=[round(t1.v1,Int64(-4))@0 as round(t1.v1,Int64(-4)), t1.v1 % Int64(5000)@1 as t1.v1 % Int64(5000)], aggr=[sum(t1.v1 * Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[output_rows=15.00 K, elapsed_compute=2.79ms, output_bytes=537.6 KB, output_batches=120, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, aggregate_arguments_time=43.23\u00b5s, aggregation_time=64.41\u00b5s, emitting_time=1.18ms, time_calculatin",
+   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=FinalPartitioned, gby=[round(t1.v1,Int64(-4))@0 as round(t1.v1,Int64(-4)), t1.v1 % Int64(5000)@1 as t1.v1 % Int64(5000)], aggr=[sum(t1.v1 * Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[output_rows=15.00 K, elapsed_compute=2.82ms, output_bytes=537.6 KB, output_batches=120, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, aggregate_arguments_time=47.15\u00b5s, aggregation_time=63.15\u00b5s, emitting_time=1.28ms, time_calculatin",
    "exception": "plan text"
   },
   {
@@ -10523,7 +10523,7 @@
    "file": "ordered_aggregate_spill.slt",
    "line": 166,
    "sql": "EXPLAIN ANALYZE\nSELECT round(v1, -4), v1 % 5000,\n  sum(v1 * 2), min(CAST(v1 % 2 AS VARCHAR))\nFROM generate_series(20000) AS t1(v1)\nGROUP BY round(v1, -4), v1 % 5000",
-   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=FinalPartitioned, gby=[round(t1.v1,Int64(-4))@0 as round(t1.v1,Int64(-4)), t1.v1 % Int64(5000)@1 as t1.v1 % Int64(5000)], aggr=[sum(t1.v1 * Int64(2)), min(t1.v1 % Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[output_rows=15.00 K, elapsed_compute=5.89ms, output_bytes=771.9 KB, output_batches=120, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, aggregate_arguments_time=79.28\u00b5s, aggregation_time=2.02ms, emitting_time=2",
+   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=FinalPartitioned, gby=[round(t1.v1,Int64(-4))@0 as round(t1.v1,Int64(-4)), t1.v1 % Int64(5000)@1 as t1.v1 % Int64(5000)], aggr=[sum(t1.v1 * Int64(2)), min(t1.v1 % Int64(2))], ordering_mode=PartiallySorted([0]), metrics=[output_rows=15.00 K, elapsed_compute=5.94ms, output_bytes=771.9 KB, output_batches=120, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, aggregate_arguments_time=84.95\u00b5s, aggregation_time=1.81ms, emitting_time=2",
    "exception": "plan text"
   },
   {
@@ -10537,7 +10537,7 @@
    "file": "ordered_aggregate_spill.slt",
    "line": 192,
    "sql": "EXPLAIN ANALYZE\nSELECT round(v1, -4), v1 % 5000, min(v1 * 2), avg(v1)\nFROM generate_series(20000) AS t1(v1)\nGROUP BY round(v1, -4), v1 % 5000",
-   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=Single, gby=[round(v1@0, -4) as round(t1.v1,Int64(-4)), v1@0 % 5000 as t1.v1 % Int64(5000)], aggr=[min(t1.v1 * Int64(2)), avg(t1.v1)], ordering_mode=PartiallySorted([0]), metrics=[output_rows=15.00 K, elapsed_compute=1.98ms, output_bytes=28.1 MB, output_batches=120, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, peak_mem_used=866.9 KB, aggregate_arguments_time=130.92\u00b5s, aggregation_time=249.89\u00b5s, emitting_time=126.22\u00b5s, time_",
+   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=Single, gby=[round(v1@0, -4) as round(t1.v1,Int64(-4)), v1@0 % 5000 as t1.v1 % Int64(5000)], aggr=[min(t1.v1 * Int64(2)), avg(t1.v1)], ordering_mode=PartiallySorted([0]), metrics=[output_rows=15.00 K, elapsed_compute=2.46ms, output_bytes=28.1 MB, output_batches=120, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, peak_mem_used=866.9 KB, aggregate_arguments_time=183.28\u00b5s, aggregation_time=287.82\u00b5s, emitting_time=162.99\u00b5s, time_",
    "exception": "plan text"
   },
   {
@@ -10551,7 +10551,7 @@
    "file": "ordered_aggregate_spill.slt",
    "line": 213,
    "sql": "EXPLAIN ANALYZE\nSELECT round(v1, -4), v1 % 5000, min(v1 * 2), avg(v1)\nFROM generate_series(20000) AS t1(v1)\nGROUP BY round(v1, -4), v1 % 5000",
-   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=Single, gby=[round(v1@0, -4) as round(t1.v1,Int64(-4)), v1@0 % 5000 as t1.v1 % Int64(5000)], aggr=[min(t1.v1 * Int64(2)), avg(t1.v1)], ordering_mode=PartiallySorted([0]), metrics=[output_rows=15.00 K, elapsed_compute=1.98ms, output_bytes=28.1 MB, output_batches=120, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, peak_mem_used=866.9 KB, aggregate_arguments_time=143.76\u00b5s, aggregation_time=221.35\u00b5s, emitting_time=119.96\u00b5s, time_",
+   "why": "answer differs: got ['Plan with Metrics', '01)AggregateExec: mode=Single, gby=[round(v1@0, -4) as round(t1.v1,Int64(-4)), v1@0 % 5000 as t1.v1 % Int64(5000)], aggr=[min(t1.v1 * Int64(2)), avg(t1.v1)], ordering_mode=PartiallySorted([0]), metrics=[output_rows=15.00 K, elapsed_compute=2.03ms, output_bytes=28.1 MB, output_batches=120, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, peak_mem_used=866.9 KB, aggregate_arguments_time=173.02\u00b5s, aggregation_time=248.21\u00b5s, emitting_time=161.69\u00b5s, time_",
    "exception": "plan text"
   },
   {
@@ -10960,21 +10960,21 @@
    "file": "parquet_max_row_group_bytes.slt",
    "line": 148,
    "sql": "EXPLAIN ANALYZE SELECT * FROM rg_count_size_and_bytes WHERE id >= 0;",
-   "why": "answer differs: got ['Plan with Metrics', '01)FilterExec: id@0 >= 0, expected_rows=4096, metrics=[output_rows=4.10 K, elapsed_compute=23.12\u00b5s, output_bytes=40.0 KB, output_batches=5, selectivity=100% (4.10 K/4.10 K)]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_max_row_group_bytes/rg_count_size_and_bytes/DMHXe6THdP1nb4BA_0.parquet]]}, projection=[id], file_type=parquet, predicate=id@0 >= 0, pruning_predicate=id_null_count@1 !=",
+   "why": "answer differs: got ['Plan with Metrics', '01)FilterExec: id@0 >= 0, expected_rows=4096, metrics=[output_rows=4.10 K, elapsed_compute=42.97\u00b5s, output_bytes=40.0 KB, output_batches=5, selectivity=100% (4.10 K/4.10 K)]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_max_row_group_bytes/rg_count_size_and_bytes/MCkDD4MZFjSqhZGk_0.parquet]]}, projection=[id], file_type=parquet, predicate=id@0 >= 0, pruning_predicate=id_null_count@1 !=",
    "exception": "plan text"
   },
   {
    "file": "parquet_max_row_group_bytes.slt",
    "line": 169,
    "sql": "EXPLAIN ANALYZE SELECT * FROM rg_count_bytes_only WHERE id >= 0;",
-   "why": "answer differs: got ['Plan with Metrics', '01)FilterExec: id@0 >= 0, expected_rows=4096, metrics=[output_rows=4.10 K, elapsed_compute=19.71\u00b5s, output_bytes=32.0 KB, output_batches=4, selectivity=100% (4.10 K/4.10 K)]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_max_row_group_bytes/rg_count_bytes_only/UFyjH0efkAqRbva7_0.parquet]]}, projection=[id], file_type=parquet, predicate=id@0 >= 0, pruning_predicate=id_null_count@1 != row",
+   "why": "answer differs: got ['Plan with Metrics', '01)FilterExec: id@0 >= 0, expected_rows=4096, metrics=[output_rows=4.10 K, elapsed_compute=18.05\u00b5s, output_bytes=32.0 KB, output_batches=4, selectivity=100% (4.10 K/4.10 K)]', '02)--DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_max_row_group_bytes/rg_count_bytes_only/u61QgRvAmO12U0R3_0.parquet]]}, projection=[id], file_type=parquet, predicate=id@0 >= 0, pruning_predicate=id_null_count@1 != row",
    "exception": "plan text"
   },
   {
    "file": "parquet_metadata_functions.slt",
    "line": 35,
    "sql": "SELECT input_file_name(), file_row_index(), column1\nFROM test_table",
-   "why": "answer differs: got ['root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/first.parquet 0 10', 'root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/first.parquet 1 20', 'root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/first.parquet 2 30'], want ['WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/first.parquet 0 10', 'WORKSPACE_ROOT/datafusion/sqllogictest/t"
+   "why": "answer differs: got ['root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/second.parquet 0 40', 'root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/second.parquet 1 50', 'root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/second.parquet 2 60'], want ['WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/first.parquet 0 10', 'WORKSPACE_ROOT/datafusion/sqllogictes"
   },
   {
    "file": "parquet_metadata_functions.slt",
@@ -10987,7 +10987,7 @@
    "file": "parquet_metadata_functions.slt",
    "line": 61,
    "sql": "SELECT input_file_name(), file_row_index(), column1\nFROM test_table\nWHERE file_row_index() = 2 AND input_file_name() LIKE '%parquet';",
-   "why": "answer differs: got ['root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/second.parquet 2 60', 'root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/first.parquet 2 30'], want ['WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/first.parquet 2 30', 'WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/second.parquet 2 60']"
+   "why": "answer differs: got ['root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/first.parquet 2 30', 'root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/second.parquet 2 60'], want ['WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/first.parquet 2 30', 'WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_metadata_functions/second.parquet 2 60']"
   },
   {
    "file": "parquet_metadata_functions.slt",
@@ -10999,14 +10999,14 @@
    "file": "parquet_nested_schema_pruning.slt",
    "line": 457,
    "sql": "explain analyze select s from narrow where id >= 2;",
-   "why": "answer differs: got ['Plan with Metrics DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_nested_schema_pruning/wide.parquet]]}, projection=[s], file_type=parquet, predicate=id@0 >= 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 >= 2, required_guarantees=[], expected_rows=3, metrics=[output_rows=2, elapsed_compute=12.06\u00b5s, output_bytes=256.0 B, output_batches=1, files_ranges_pruned_statistics=1 total \u2192 1 matched, row_grou",
+   "why": "answer differs: got ['Plan with Metrics DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_nested_schema_pruning/wide.parquet]]}, projection=[s], file_type=parquet, predicate=id@0 >= 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 >= 2, required_guarantees=[], expected_rows=3, metrics=[output_rows=2, elapsed_compute=13.20\u00b5s, output_bytes=256.0 B, output_batches=1, files_ranges_pruned_statistics=1 total \u2192 1 matched, row_grou",
    "exception": "plan text"
   },
   {
    "file": "parquet_nested_schema_pruning.slt",
    "line": 462,
    "sql": "explain analyze select s from full_schema where id >= 2;",
-   "why": "answer differs: got ['Plan with Metrics DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_nested_schema_pruning/wide.parquet]]}, projection=[s], file_type=parquet, predicate=id@0 >= 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 >= 2, required_guarantees=[], expected_rows=3, metrics=[output_rows=2, elapsed_compute=9.95\u00b5s, output_bytes=400.0 B, output_batches=1, files_ranges_pruned_statistics=1 total \u2192 1 matched, row_group",
+   "why": "answer differs: got ['Plan with Metrics DataSourceExec: file_groups={1 group: [[root/datafusion/datafusion/sqllogictest/test_files/scratch/parquet_nested_schema_pruning/wide.parquet]]}, projection=[s], file_type=parquet, predicate=id@0 >= 2, pruning_predicate=id_null_count@1 != row_count@2 AND id_max@0 >= 2, required_guarantees=[], expected_rows=3, metrics=[output_rows=2, elapsed_compute=13.56\u00b5s, output_bytes=400.0 B, output_batches=1, files_ranges_pruned_statistics=1 total \u2192 1 matched, row_grou",
    "exception": "plan text"
   },
   {
@@ -14035,70 +14035,70 @@
    "file": "sort_merge_join_spill.slt",
    "line": 138,
    "sql": "EXPLAIN ANALYZE\nSELECT p.k, w.v, length(w.p) FROM probe p JOIN wide w ON p.k = w.k",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@2 as v, character_length(p@3) as length(w.p)], metrics=[output_rows=2.00 K, elapsed_compute=77.58\u00b5s, output_bytes=39.1 KB, output_batches=10, expr_0_eval_time=1.07\u00b5s, expr_1_eval_time=730ns, expr_2_eval_time=71.61\u00b5s]', '02)--SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)], metrics=[output_rows=2.00 K, elapsed_compute=2ns, output_bytes=1054.7 KB, output_batches=10, spill_count=0, spilled_bytes=0.0 B, spilled_rows=",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@2 as v, character_length(p@3) as length(w.p)], metrics=[output_rows=2.00 K, elapsed_compute=78.72\u00b5s, output_bytes=39.1 KB, output_batches=10, expr_0_eval_time=1.46\u00b5s, expr_1_eval_time=805ns, expr_2_eval_time=71.13\u00b5s]', '02)--SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)], metrics=[output_rows=2.00 K, elapsed_compute=2ns, output_bytes=1054.7 KB, output_batches=10, spill_count=0, spilled_bytes=0.0 B, spilled_rows=",
    "exception": "plan text"
   },
   {
    "file": "sort_merge_join_spill.slt",
    "line": 150,
    "sql": "EXPLAIN ANALYZE\nSELECT p.k, w.v, length(w.p) FROM probe p LEFT JOIN wide w ON p.k = w.k",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@2 as v, character_length(p@3) as length(w.p)], metrics=[output_rows=2.00 K, elapsed_compute=73.05\u00b5s, output_bytes=42.3 KB, output_batches=11, expr_0_eval_time=1.29\u00b5s, expr_1_eval_time=868ns, expr_2_eval_time=65.55\u00b5s]', '02)--SortMergeJoinExec: join_type=Left, on=[(k@0, k@0)], metrics=[output_rows=2.00 K, elapsed_compute=2ns, output_bytes=1059.6 KB, output_batches=11, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@2 as v, character_length(p@3) as length(w.p)], metrics=[output_rows=2.00 K, elapsed_compute=81.36\u00b5s, output_bytes=42.3 KB, output_batches=11, expr_0_eval_time=1.81\u00b5s, expr_1_eval_time=879ns, expr_2_eval_time=72.79\u00b5s]', '02)--SortMergeJoinExec: join_type=Left, on=[(k@0, k@0)], metrics=[output_rows=2.00 K, elapsed_compute=2ns, output_bytes=1059.6 KB, output_batches=11, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0",
    "exception": "plan text"
   },
   {
    "file": "sort_merge_join_spill.slt",
    "line": 162,
    "sql": "EXPLAIN ANALYZE\nSELECT p.k, w.v, length(w.p) FROM wide w RIGHT JOIN probe p ON p.k = w.k",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@3 as k, v@1 as v, character_length(p@2) as length(w.p)], metrics=[output_rows=2.00 K, elapsed_compute=84.60\u00b5s, output_bytes=42.3 KB, output_batches=11, expr_0_eval_time=1.52\u00b5s, expr_1_eval_time=889ns, expr_2_eval_time=75.83\u00b5s]', '02)--SortMergeJoinExec: join_type=Right, on=[(k@0, k@0)], metrics=[output_rows=2.00 K, elapsed_compute=2ns, output_bytes=1059.6 KB, output_batches=11, spill_count=0, spilled_bytes=0.0 B, spilled_rows=",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@3 as k, v@1 as v, character_length(p@2) as length(w.p)], metrics=[output_rows=2.00 K, elapsed_compute=76.81\u00b5s, output_bytes=42.3 KB, output_batches=11, expr_0_eval_time=1.31\u00b5s, expr_1_eval_time=821ns, expr_2_eval_time=69.56\u00b5s]', '02)--SortMergeJoinExec: join_type=Right, on=[(k@0, k@0)], metrics=[output_rows=2.00 K, elapsed_compute=2ns, output_bytes=1059.6 KB, output_batches=11, spill_count=0, spilled_bytes=0.0 B, spilled_rows=",
    "exception": "plan text"
   },
   {
    "file": "sort_merge_join_spill.slt",
    "line": 174,
    "sql": "EXPLAIN ANALYZE\nSELECT p.k, w.v, length(w.p) FROM probe p FULL JOIN wide w ON p.k = w.k",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@2 as v, character_length(p@3) as length(w.p)], metrics=[output_rows=2.00 K, elapsed_compute=83.30\u00b5s, output_bytes=42.3 KB, output_batches=11, expr_0_eval_time=1.71\u00b5s, expr_1_eval_time=929ns, expr_2_eval_time=74.50\u00b5s]', '02)--SortMergeJoinExec: join_type=Full, on=[(k@0, k@0)], metrics=[output_rows=2.00 K, elapsed_compute=2ns, output_bytes=1059.6 KB, output_batches=11, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@2 as v, character_length(p@3) as length(w.p)], metrics=[output_rows=2.00 K, elapsed_compute=80.50\u00b5s, output_bytes=42.3 KB, output_batches=11, expr_0_eval_time=1.46\u00b5s, expr_1_eval_time=837ns, expr_2_eval_time=72.49\u00b5s]', '02)--SortMergeJoinExec: join_type=Full, on=[(k@0, k@0)], metrics=[output_rows=2.00 K, elapsed_compute=2ns, output_bytes=1059.6 KB, output_batches=11, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0",
    "exception": "plan text"
   },
   {
    "file": "sort_merge_join_spill.slt",
    "line": 189,
    "sql": "EXPLAIN ANALYZE\nSELECT p.k, w.v, length(w.p) FROM probe p\nJOIN wide w ON p.k = w.k AND p.x < w.x",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@3 as v, character_length(p@5) as length(w.p)], metrics=[output_rows=900, elapsed_compute=19.35\u00b5s, output_bytes=18.8 KB, output_batches=5, expr_0_eval_time=676ns, expr_1_eval_time=335ns, expr_2_eval_time=15.50\u00b5s]', '02)--SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)], filter=x@0 < x@1, metrics=[output_rows=900, elapsed_compute=2ns, output_bytes=491.8 KB, output_batches=5, spill_count=0, spilled_bytes=0.0 B, spill",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@3 as v, character_length(p@5) as length(w.p)], metrics=[output_rows=900, elapsed_compute=39.81\u00b5s, output_bytes=18.8 KB, output_batches=5, expr_0_eval_time=1.22\u00b5s, expr_1_eval_time=512ns, expr_2_eval_time=32.21\u00b5s]', '02)--SortMergeJoinExec: join_type=Inner, on=[(k@0, k@0)], filter=x@0 < x@1, metrics=[output_rows=900, elapsed_compute=2ns, output_bytes=491.8 KB, output_batches=5, spill_count=0, spilled_bytes=0.0 B, spil",
    "exception": "plan text"
   },
   {
    "file": "sort_merge_join_spill.slt",
    "line": 203,
    "sql": "EXPLAIN ANALYZE\nSELECT p.k, w.v, length(w.p) FROM probe p\nLEFT JOIN wide w ON p.k = w.k AND p.x < w.x",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@3 as v, character_length(p@5) as length(w.p)], metrics=[output_rows=902, elapsed_compute=19.53\u00b5s, output_bytes=20.8 KB, output_batches=2, expr_0_eval_time=1.13\u00b5s, expr_1_eval_time=248ns, expr_2_eval_time=15.74\u00b5s]', '02)--SortMergeJoinExec: join_type=Left, on=[(k@0, k@0)], filter=x@0 < x@1, metrics=[output_rows=902, elapsed_compute=2ns, output_bytes=496.7 KB, output_batches=2, spill_count=0, spilled_bytes=0.0 B, spill",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@3 as v, character_length(p@5) as length(w.p)], metrics=[output_rows=902, elapsed_compute=31.49\u00b5s, output_bytes=20.8 KB, output_batches=2, expr_0_eval_time=1.14\u00b5s, expr_1_eval_time=149ns, expr_2_eval_time=26.77\u00b5s]', '02)--SortMergeJoinExec: join_type=Left, on=[(k@0, k@0)], filter=x@0 < x@1, metrics=[output_rows=902, elapsed_compute=2ns, output_bytes=496.7 KB, output_batches=2, spill_count=0, spilled_bytes=0.0 B, spill",
    "exception": "plan text"
   },
   {
    "file": "sort_merge_join_spill.slt",
    "line": 217,
    "sql": "EXPLAIN ANALYZE\nSELECT p.k, w.v, length(w.p) FROM wide w\nRIGHT JOIN probe p ON p.k = w.k AND p.x < w.x",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@4 as k, v@1 as v, character_length(p@3) as length(w.p)], metrics=[output_rows=902, elapsed_compute=24.00\u00b5s, output_bytes=20.8 KB, output_batches=2, expr_0_eval_time=1.36\u00b5s, expr_1_eval_time=221ns, expr_2_eval_time=18.96\u00b5s]', '02)--SortMergeJoinExec: join_type=Right, on=[(k@0, k@0)], filter=x@1 < x@0, metrics=[output_rows=902, elapsed_compute=2ns, output_bytes=496.7 KB, output_batches=2, spill_count=0, spilled_bytes=0.0 B, spil",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@4 as k, v@1 as v, character_length(p@3) as length(w.p)], metrics=[output_rows=902, elapsed_compute=18.35\u00b5s, output_bytes=20.8 KB, output_batches=2, expr_0_eval_time=416ns, expr_1_eval_time=226ns, expr_2_eval_time=15.89\u00b5s]', '02)--SortMergeJoinExec: join_type=Right, on=[(k@0, k@0)], filter=x@1 < x@0, metrics=[output_rows=902, elapsed_compute=2ns, output_bytes=496.7 KB, output_batches=2, spill_count=0, spilled_bytes=0.0 B, spill",
    "exception": "plan text"
   },
   {
    "file": "sort_merge_join_spill.slt",
    "line": 231,
    "sql": "EXPLAIN ANALYZE\nSELECT p.k, w.v, length(w.p) FROM probe p\nFULL JOIN wide w ON p.k = w.k AND p.x < w.x",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@3 as v, character_length(p@5) as length(w.p)], metrics=[output_rows=2.00 K, elapsed_compute=43.28\u00b5s, output_bytes=42.4 KB, output_batches=3, expr_0_eval_time=2.09\u00b5s, expr_1_eval_time=307ns, expr_2_eval_time=36.76\u00b5s]', '02)--SortMergeJoinExec: join_type=Full, on=[(k@0, k@0)], filter=x@0 < x@1, metrics=[output_rows=2.00 K, elapsed_compute=2ns, output_bytes=1094.5 KB, output_batches=3, spill_count=0, spilled_bytes=0.0 B",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@3 as v, character_length(p@5) as length(w.p)], metrics=[output_rows=2.00 K, elapsed_compute=33.32\u00b5s, output_bytes=42.4 KB, output_batches=3, expr_0_eval_time=1.33\u00b5s, expr_1_eval_time=268ns, expr_2_eval_time=28.29\u00b5s]', '02)--SortMergeJoinExec: join_type=Full, on=[(k@0, k@0)], filter=x@0 < x@1, metrics=[output_rows=2.00 K, elapsed_compute=2ns, output_bytes=1094.5 KB, output_batches=3, spill_count=0, spilled_bytes=0.0 B",
    "exception": "plan text"
   },
   {
    "file": "sort_merge_join_spill.slt",
    "line": 247,
    "sql": "EXPLAIN ANALYZE\nSELECT p.k, w.v, length(w.p) FROM probe_nomatch p FULL JOIN wide w ON p.k = w.k",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@2 as v, character_length(p@3) as length(w.p)], metrics=[output_rows=2.00 K, elapsed_compute=78.16\u00b5s, output_bytes=45.7 KB, output_batches=12, expr_0_eval_time=1.49\u00b5s, expr_1_eval_time=896ns, expr_2_eval_time=71.22\u00b5s]', '02)--SortMergeJoinExec: join_type=Full, on=[(k@0, k@0)], metrics=[output_rows=2.00 K, elapsed_compute=2ns, output_bytes=1064.6 KB, output_batches=12, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k, v@2 as v, character_length(p@3) as length(w.p)], metrics=[output_rows=2.00 K, elapsed_compute=74.53\u00b5s, output_bytes=45.7 KB, output_batches=12, expr_0_eval_time=1.89\u00b5s, expr_1_eval_time=977ns, expr_2_eval_time=65.79\u00b5s]', '02)--SortMergeJoinExec: join_type=Full, on=[(k@0, k@0)], metrics=[output_rows=2.00 K, elapsed_compute=2ns, output_bytes=1064.6 KB, output_batches=12, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0",
    "exception": "plan text"
   },
   {
    "file": "sort_merge_join_spill.slt",
    "line": 265,
    "sql": "EXPLAIN ANALYZE\nSELECT pr.k\nFROM probe pr\nWHERE EXISTS (\n  SELECT 1\n  FROM bitwise_wide wi\n  WHERE pr.k = wi.k\n    AND wi.v <= pr.x - 300\n)",
-   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k], metrics=[output_rows=1, elapsed_compute=1.39\u00b5s, output_bytes=1600.0 B, output_batches=1, expr_0_eval_time=340ns]', '02)--SortMergeJoinExec: join_type=LeftSemi, on=[(k@0, k@0)], filter=v@1 <= x@0 - 300, metrics=[output_rows=1, elapsed_compute=2ns, output_bytes=3.1 KB, output_batches=1, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, peak_mem_used=331.2 KB, input_batches=102, input_rows=20.00 K, join_time=216.06\u00b5s]'",
+   "why": "answer differs: got ['Plan with Metrics', '01)ProjectionExec: expr=[k@0 as k], metrics=[output_rows=1, elapsed_compute=1.23\u00b5s, output_bytes=1600.0 B, output_batches=1, expr_0_eval_time=253ns]', '02)--SortMergeJoinExec: join_type=LeftSemi, on=[(k@0, k@0)], filter=v@1 <= x@0 - 300, metrics=[output_rows=1, elapsed_compute=2ns, output_bytes=3.1 KB, output_batches=1, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, peak_mem_used=331.2 KB, input_batches=102, input_rows=20.00 K, join_time=200.27\u00b5s]'",
    "exception": "plan text"
   },
   {
