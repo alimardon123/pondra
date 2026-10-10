@@ -18,6 +18,7 @@ mod guard;
 mod hilbert;
 mod history;
 mod ddl;
+mod deploy;
 mod defaults;
 mod delta;
 mod ext;
@@ -64,6 +65,7 @@ mod txn;
 mod mcp;
 mod pg;
 mod pg_catalog;
+mod project;
 mod query;
 mod read_delta;
 mod read_iceberg;
@@ -84,6 +86,7 @@ mod spill;
 mod sparksql;
 mod spmd;
 mod store;
+mod sync;
 mod sys;
 mod tasks;
 mod temp;
@@ -269,6 +272,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: service::Command,
     },
+    /// The lake's files kept in a folder of your own, for git and your editor: `pondra workspace
+    /// pull ./ws` writes them there, `pondra workspace push ./ws` sends back what changed. A file
+    /// changed on both sides is listed and left as it is.
+    Workspace {
+        #[command(subcommand)]
+        cmd: sync::Command,
+    },
+    #[command(flatten)]
+    Project(project::Command),
     /// Print catalog entries whose keys start with `prefix` (t/ tables, s/ segments, p/ producers…).
     Catalog {
         #[arg(long, visible_alias = "lake")]
@@ -286,6 +298,13 @@ enum Cmd {
         #[arg(long)]
         attach: Vec<String>,
         query: String,
+    },
+    /// Lead a lake for a moment: make it if nothing is there yet, answer what waits in its inbox,
+    /// let go. A node runs it for a lake nobody leads (`inbox::lead_once`, invariant 62).
+    #[command(hide = true)]
+    Lead {
+        #[arg(long)]
+        dir: String,
     },
     /// Run a SQL file — its statements in order, `$name` taking the value of `--name` — on a node
     /// of the lake started for it (`pondra run load.sql lake --day 2026-09-27`), or on a node
@@ -725,6 +744,8 @@ async fn run() -> anyhow::Result<()> {
             print!("{}", shell::script(lake.as_deref().unwrap_or("lake"), url.as_deref(), token.as_deref(), body).await?);
         }
         Cmd::Service { cmd } => service::command(cmd).await?,
+        Cmd::Workspace { cmd } => sync::command(cmd).await?,
+        Cmd::Project(cmd) => project::command(cmd).await?,
         Cmd::Catalog { dir, prefix } => {
             let lake = store::Lake::open(&dir, false, false).await?;
             match prefix.starts_with("d/") {
@@ -736,6 +757,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Lead { dir } => write::lead_only(&dir).await?,
         Cmd::Sql { dir, query, attach: attached } if write::checkpoint(&query) => {
             // (the leader's work; with nobody leading, the next node to start tiers the log)
             let store = store::open_store(&dir)?.1;

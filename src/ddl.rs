@@ -204,6 +204,8 @@ pub enum Ddl {
     Branch(crate::branch::Make),            // the new lake's leader: make it its base as that is now (ADR-047)
     Pin { lake: String, ms: Option<u64> },  // a base's leader: keep the files a branch reads
     Unpin { lake: String },
+    Refresh { database: Option<String>, tables: Vec<String> }, // ALTER DATABASE b REFRESH t, …: b's leader (ADR-047)
+    Deploy { claim: bool, after: u64, record: Vec<u8> }, // a deploy's entry: its claim, its record, a migration done (`deploy::keep`, ADR-047 §4)
     DropDatabase { name: String, if_exists: bool }, // a folder of databases' (`dbserver.rs`): its node stopped, its folder deleted (ADR-030)
     AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
     RenameTable { name: String, to: String }, // ALTER TABLE | VIEW … RENAME TO (ADR-030)
@@ -392,6 +394,8 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Branch(m) => crate::branch::make(lake, m).await,
         Ddl::Pin { lake: branch, ms } => crate::branch::pin(lake, &branch, ms).await,
         Ddl::Unpin { lake: branch } => crate::branch::unpin(lake, &branch).await,
+        Ddl::Refresh { .. } => bail!("ALTER DATABASE … REFRESH is done by its database's leader (write::handle)"),
+        Ddl::Deploy { claim, after, record } => crate::deploy::keep(lake, claim, after, &record).await,
         Ddl::CreateDatabase { name, if_not_exists, dir, clone: None } => {
             check(&name)?;
             let dir = dir.unwrap_or_else(|| beside(&lake.url, &name));
@@ -966,7 +970,7 @@ pub async fn free_folder(lake: &Lake, name: &str) -> Result<Option<String>> {
 }
 
 /// What reads or writes table `name` by its columns: views, stored views, tasks.
-async fn readers(lake: &Lake, name: &str) -> Result<Vec<String>> {
+pub(crate) async fn readers(lake: &Lake, name: &str) -> Result<Vec<String>> {
     let mut out: Vec<String> = vec![];
     for (k, v) in lake.cat.scan::<crate::views::View>("v/", "v0").await? {
         if v.source == name || reads(lake, &v.sql, name) {
@@ -1065,7 +1069,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
 }
 
 /// Does every value of type `old` read as `new`, exactly? The widenings Iceberg and Delta allow.
-fn widens(old: &datafusion::arrow::datatypes::DataType, new: &datafusion::arrow::datatypes::DataType) -> bool {
+pub(crate) fn widens(old: &datafusion::arrow::datatypes::DataType, new: &datafusion::arrow::datatypes::DataType) -> bool {
     use datafusion::arrow::datatypes::DataType::*;
     let int = |t: &datafusion::arrow::datatypes::DataType| match t {
         Int8 => Some(8),

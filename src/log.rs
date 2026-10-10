@@ -63,6 +63,9 @@ pub struct Flush {
     pub reserve: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub block: bool,
+    /// Row ids' blocks nobody takes: a branch's counters moved past its base's (`branch::refresh`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub blocks: u64,
     /// A file commit (the leader's own, under the lake's lock: `adopt::file`): files into tables
     /// and out of them, in this commit, as its segment names them (`Segment::files`).
     #[serde(skip)]
@@ -490,11 +493,11 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
             *next += 1; // (a number of its own, as a reserve's: a node tells a block from before a change by it)
             continue;
         }
-        if f.reserve > 0 || f.block {
+        if f.reserve > 0 || f.block || f.blocks > 0 {
             // (numbers no segment will take: gaps in the log's sequence, which nothing minds)
             let ack = Ack { seg: *next, ms: now_ms(), block: *block, ..Default::default() };
             *next += f.reserve;
-            *block += f.block as u64;
+            *block += f.block as u64 + f.blocks;
             replies.push((reply, Outcome::Acks(vec![ack])));
             continue;
         }

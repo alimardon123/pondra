@@ -499,6 +499,13 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         let clone = crate::branch::CloneOf { from: name(&c[4]), schemas, data: !regex::Regex::new(r"(?i)WITH\s+NO\s+DATA").expect("a regex").is_match(tail) };
         return Some(Stmt::Ddl(vec![Ddl::CreateDatabase { name: name(&c[2]), if_not_exists: c.get(1).is_some(), dir: c.get(3).map(|d| d.as_str().replace("''", "'")), clone: Some(clone) }]));
     }
+    // `ALTER DATABASE b REFRESH [t, …]`: a branch's tables (all it took from its base, or those
+    // named: a view stands for the tables it reads), and what follows them, as its base has them now (ADR-047).
+    static DB_REFRESH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+REFRESH((?:\s+[\w".$-]+(?:\s*,\s*[\w".$-]+)*)?)\s*;?\s*$"#).expect("a regex"));
+    if let Some(c) = DB_REFRESH.captures(first_word(sql)) {
+        let tables = c[2].split(',').map(|t| name(t.trim())).filter(|t| !t.is_empty()).collect();
+        return Some(Stmt::Ddl(vec![Ddl::Refresh { database: Some(name(&c[1])), tables }]));
+    }
     // `UNDROP TABLE t` (Snowflake's, Databricks'): the table dropped last under that name, back (ADR-043).
     static UNDROP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*UNDROP\s+TABLE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
     if let Some(c) = UNDROP.captures(first_word(sql)) {
@@ -1307,11 +1314,9 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     if let Stmt::Ddl(ddls) = stmt {
         let mut out = j!({});
         for d in ddls {
-            out = if app.seq.is_some() {
-                let _guard = app.lock.lock().await;
-                crate::ddl::apply(lake, d.clone()).await?
-            } else {
-                post(&app.cluster.leader.addr, &Request::Ddl(d.clone())).await?
+            out = match &app.seq {
+                Some(seq) => ddl_here(lake, seq, &app.lock, d.clone()).await?,
+                None => post(&app.cluster.leader.addr, &Request::Ddl(d.clone())).await?,
             };
             crate::ddl::settle(lake, &d, &app.cluster.addr).await?; // (ATTACH, DETACH: here at once)
             if let Some(n) = out["notice"].as_str() {
@@ -1541,10 +1546,7 @@ pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request
             let _guard = lock.lock().await;
             create_table(lake, &name, &spec).await
         }
-        Request::Ddl(d) => {
-            let _guard = lock.lock().await;
-            crate::ddl::apply(lake, d).await
-        }
+        Request::Ddl(d) => ddl_here(lake, seq, lock, d).await,
         Request::Change(sql, job, sent) => {
             let _guard = lock.lock().await;
             crate::query::SENT.scope(Arc::new(crate::change::unpack(&sent)?), crate::change::run(lake, seq, &sql, &job)).await
@@ -1572,6 +1574,14 @@ pub async fn made(dir: &str) -> Result<Arc<Lake>> {
     }
     deliver(dir, Some(None), &Stmt::Invalid(String::new()), "", true).await?;
     Lake::open(dir, false, false).await
+}
+
+/// `pondra lead`: lead the lake at `dir` once, making it if it's new, for what waits in its inbox
+/// (or nothing, when someone leads it already: they answer the bell). No reader of the lake is
+/// opened and no statement run, so a node's CREATE DATABASE, a branch's first commit and a write
+/// to a lake nobody leads pay for one lead, not two and four catalogs opened.
+pub async fn lead_only(dir: &str) -> Result<()> {
+    deliver(dir, Some(None), &Stmt::Invalid(String::new()), "", true).await.map(drop)
 }
 
 pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
@@ -1748,6 +1758,18 @@ pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
 }
 
 /// Send a request to the leader over HTTP.
+/// A DDL statement on the leader, under the lake's lock; REFRESH takes it itself, once it has read
+/// its base (`branch::refresh`).
+pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>, d: crate::ddl::Ddl) -> Result<Value> {
+    match d {
+        crate::ddl::Ddl::Refresh { database, tables } => crate::branch::refresh(lake, seq, lock, database, tables).await,
+        d => {
+            let _guard = lock.lock().await;
+            crate::ddl::apply(lake, d).await
+        }
+    }
+}
+
 pub async fn post(addr: &str, r: &Request) -> Result<Value> {
     let (path, body) = r.http()?;
     let res = http().post(crate::tls::url(&format!("{addr}{path}"))).header("content-type", "application/json").body(body).send().await?;

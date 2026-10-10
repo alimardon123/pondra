@@ -1116,9 +1116,15 @@ fn merges(plan: &LogicalPlan, up: Option<(&str, &TableMeta)>) -> Result<(Vec<Str
     if let Some((source, m)) = up {
         // (its keys only, no subquery; below its GROUP BY, filters, then the view's table — whose
         // reading, which combines its rows, the plan shows inlined under its name)
-        use datafusion::common::tree_node::TreeNode;
-        let keys = |e: &Expr| e.column_refs().iter().all(|c| m.key.contains(&c.name)) && !e.exists(|e| Ok(matches!(e, Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_)))).unwrap_or(true);
-        let mut ok = agg.group_expr.iter().all(keys);
+        let keys = |e: &Expr| of_keys(e, m);
+        // (DataFusion adds to a GROUP BY the columns its keys determine: read while it holds
+        // partial rows, the view's table is grouped by its key, which then determines its sums.
+        // Grouping by those too splits nothing; a rollup's own keys are checked below.)
+        let input = agg.input.schema();
+        let named: Vec<String> = agg.group_expr.iter().filter(|e| keys(e)).map(|e| e.schema_name().to_string()).collect();
+        let implied = datafusion::common::get_target_functional_dependencies(input, &named).unwrap_or_default();
+        let added = |e: &Expr| matches!(e, Expr::Column(c) if input.index_of_column(c).is_ok_and(|i| implied.contains(&i)));
+        let mut ok = agg.group_expr.iter().all(|e| keys(e) || added(e));
         let mut below = agg.input.as_ref();
         loop {
             match below {
@@ -1136,6 +1142,9 @@ fn merges(plan: &LogicalPlan, up: Option<(&str, &TableMeta)>) -> Result<(Vec<Str
         let Expr::Column(c) = e.clone().unalias_nested().data else { bail!("column {} must be a group key or one aggregate: {e}", f.name()) };
         let i = agg.schema.index_of_column(&c)?;
         if i < agg.group_expr.len() {
+            if let Some((source, m)) = up {
+                ensure!(of_keys(&agg.group_expr[i], m), rollup(source, m)); // (a rollup's keys are its source's)
+            }
             key.push(f.name().clone());
             continue;
         }
@@ -1165,6 +1174,12 @@ fn merges(plan: &LogicalPlan, up: Option<(&str, &TableMeta)>) -> Result<(Vec<Str
     }
     ensure!(!key.is_empty(), "an aggregating view needs GROUP BY columns in its SELECT");
     Ok((key, merge))
+}
+
+/// Whether `e` reads only `m`'s keys (and no subquery).
+fn of_keys(e: &Expr, m: &TableMeta) -> bool {
+    use datafusion::common::tree_node::TreeNode;
+    e.column_refs().iter().all(|c| m.key.contains(&c.name)) && !e.exists(|e| Ok(matches!(e, Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_)))).unwrap_or(true)
 }
 
 /// The query's own GROUP BY, if any: the first Aggregate below its top-level projection, sort,
