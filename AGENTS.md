@@ -44,7 +44,18 @@ The owner's design principles, which every change must respect:
    a part with one job behind a small surface — a registry entry (`register.*` in the console, a
    kind of object, a door, a format), not a branch threaded through other code — and works the
    same from the UI, SQL, the clients and the HTTP API. Prefer a shape a new tool can plug into
-   over one that has to be edited to admit it.
+   over one that has to be edited to admit it. The owner, 2026-10-09: everything, in the code and in
+   the product, is flexible and easy to change and maintain. Each thing is defined once (one
+   registry, one table of names, one check at every door), so a change made in that one place
+   applies everywhere, with no copies to chase. Users customize and extend the whole product
+   (their own objects, functions, settings, extensions) as fully as the core does. Reliability,
+   simplicity, performance and efficiency stay the bar, and every review holds a change to this.
+10. **Every feature through every door** (the owner, 2026-10-09): what Pondra can do, it can do from
+   SQL, Python, JavaScript, the command line, HTTP, Flight, the Postgres port, MCP and the console,
+   as far as a door allows (Kafka's protocol carries rows, not statements). A door that can't take
+   something refuses it by name, never quietly. A new feature adds its row to the doors matrix
+   (`harness.py doors`), and the promises scorecard in `docs/roadmap.md` lists where the doors
+   still differ and the round that closes each gap.
 
 ## Layout
 
@@ -61,12 +72,18 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           file tabs; console.js the shell and `window.pondra`; loaded when first used: more.js
           (Runs, Variables, Settings, search, choosing Python), data.js (data files), chart.js,
           plan.js, details.js and more.css, sqlfile.js (a SQL file), rename.js (renaming a file),
-          tabs.js (the tabs' and the panes' menus), live.js (live queries)), xlsx.rs (a download as an Excel workbook); round 32 fresh.rs (a view's plan kept from one write to
+          tabs.js (the tabs' and the panes' menus), live.js (live queries), share.js (sharing a
+          table with another company)), xlsx.rs (a download as an Excel workbook); round 32 fresh.rs (a view's plan kept from one write to
           the next); round 33 format.rs (the lake's format, ADR-039), drain.rs (stopping without
           dropping work), service.rs (`pondra service`: systemd, launchd, a Windows service;
           ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043) and history.rs (every
           statement a row of `pondra.history`, slow ones with plans and traces, ADR-048); round 34
-          friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225)
+          friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225), objects.rs
+          (one registry of every kind of object: ADR-049, invariant 227), seq.rs (sequences and
+          identity columns: invariant 234), index.rs (indexes kept as objects: invariant 235),
+          constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236),
+          types.rs (enum types: invariant 242), and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
+          237–239)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -134,7 +151,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   `d/` inline segment data, `p/` producer progress (also Kafka producers, consumer-group offsets
   and window emission), `v/` views, `w/` session views' bounds, `k/` tasks, `x/` Delta and `i/`
   Iceberg publish state, `a/` lakes attached, `f/` functions, `r/` macros and procedures, `e/`
-  secrets (sealed), `o/` catalogs attached from outside and `fd/` feeds (round 23), `m` members
+  secrets (sealed), `o/` catalogs attached from outside and `fd/` feeds (round 23), `sq/` sequences
+  (round 34: only the sequencer writes them), `ix/` indexes (round 34), `ty/` types (round 34), `sh/` shares and `sr/` recipients (ADR-046), `m` members
   (replicated acks), `n` next segment, `c` commit number. One process (the leader) writes it;
   everyone reads it.
 - **Writes:** a client POSTs a batch to *any* node. That node encodes it (Arrow IPC + ZSTD), runs
@@ -1502,6 +1520,119 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `routines::sql` (sqlparser writes `- -3` as `--3`, a comment); DataFusion's aggregate schema
    check is off (its two analyses of a CASE's nullability disagree; the rows are the same).
    `harness.py friendly`'s last five checks fail without them.
+227. **Every kind of object is one registry entry, and its comments live apart from it** (`objects.rs`,
+   ADR-049): a new kind adds a `KINDS` entry (and a lister in `FAMILIES` for a new family), never a
+   listing of its own; `pondra.objects`, `SHOW CREATE`, `COMMENT ON` and `GET /kinds` read the
+   registry. A comment is `cm/{family}/{name}` (a column's by its stored name), moved by a rename and
+   removed by a drop in `objects::follow`, which `ddl::apply` calls. `SHOW CREATE` of every kind, run
+   again after a drop, makes the same object; `CREATE OR ALTER TABLE` never loses or reinterprets a
+   row, and refuses by name what it can't do by adding at the end or widening. `harness.py registry`.
+228. **An `INSERT … SELECT` or `CREATE TABLE AS` is written by every node only when its rows split as
+   they are, under one reserved commit** (`spmd::insert`, `writers`, `/cluster/insert`): the query's
+   biggest append table sliced, the rest read whole, no exchange and no sort on top (a `GROUP BY`, a
+   join that shuffles, an `ORDER BY` or a `LIMIT` is written from one node), and this node writes its
+   share and the log tail. Every share stamps its rows under the one `Reserved` version with a block
+   of row ids of its own (`To::block`), or not at all when something follows the table (invariant
+   159); the shares' columns must agree, and the leader records every file in one commit with the
+   job's mark, so a retried job writes nothing. A share that fails leaves its files to the orphan
+   sweep, and this node writes it all. A spread query that names a system column gets them in its
+   tables, as `session_at` gives them (`spmd::shared`: it fell back to one node). A history view
+   (invariant 183) is never sliced (`spmd::sliceable`: a version's `__end_at` is the next version's,
+   in whichever file) and every node reads it through `views::history_view`: a spread read counted
+   its deleted versions (since round 33). `harness.py insert`: "every node writes its share" (the
+   followers' object writes), the rows, ids and one version, "a GROUP BY is written by one node", "a
+   history view spread == one node…", "nothing fell back… (a spread query naming _row_id too)".
+229. **A table's kept log tail holds for one `tiered` mark and one read schema, and a query reads only
+   the part its snapshot covers** (`query::Tail`, `tail_rows`): it grows only by the segments after
+   `through`, in order; a query as of an older commit (a transaction's snapshot, a spread query's
+   slice) takes the rows up to its segment (`ends`), never a later one's; a slice read at an older
+   mark never replaces the node's own; a node keeps 128 MB of tails at most. An append table that
+   never changed is planned straight from its tail and its files when the hot columns are on
+   (`plain_scan`: the rows `raw` reads), any other table as before. Conforming every segment again
+   for each query, a batch a segment, made dashboards three times as costly while rows streamed in.
+   `harness.py tails`: every read == a model while rows land, a transaction's snapshot held while
+   other reads move past it, rows from before an added column, through tiering.
+230. **A merge's file waits for files of its size** (`tier::class`: under 4 MB, 16 MB, 64 MB, each
+   class merged on its own, eight files at a time): merging the newest small files into everything
+   before them rewrote a streamed table every minute or so, and every query read it cold from
+   Parquet until the hot columns had it again. `harness.py tiering`: "a merged file kept while eight
+   more merge".
+231. **A request's queries run on a runtime of their own once another is running** (`panics::work`,
+   `server::queries`: `/sql`, `/mcp`, `/live`, pages, bulk inserts, a spread query's stages and
+   shares, tiering jobs; every Postgres statement): appends, commits, heartbeats and the commit
+   stream keep the node's runtime, and the OS shares the cores between the two. On one runtime a
+   woken append ran after every query task ahead of it (beside 400 dashboard clients a writer landed
+   2,860 rows a second of 22,000; now 20,000, acks 5 ms). The first request runs where it came in:
+   on this VM the hop between runtimes cost 0.9 ms a statement (a parked thread woken each way),
+   which halved pgbench. Dropped, as when its client goes, the moved work stops. A new door or a
+   route whose work is a query's goes through `work` too. `harness.py pace`: a writer's acks beside
+   64 querying clients (449 ms on one runtime against 5 ms alone; 7 ms now).
+232. **A door boxes a statement's future before wrapping it** (`server::sql`: `sql_as`; `pg::told`
+   and `caught`): a statement's future is hundreds of KB, and every layer around it (scopes,
+   `door`, `work`) copied it whole on each statement. Boxed, a point lookup takes 0.16 ms over
+   Postgres (0.35 before) and 0.19 ms over HTTP (0.31), and pgbench's one client 210 transactions a
+   second (150). No test fails without it: `tools/bench/pgbench.py` and single-client point lookups
+   show it.
+233. **A file a commit replaced leaves the hot columns when the node sees that commit**
+   (`Lake::arrived` → `Hot::forget`, over the table's `garbage`, its path and its `path#…` keys):
+   no query plans it again, and one that already has holds its own batches. Kept until the budget
+   needed room, a busy table's merges filled it with files nobody could read (Durability's soak:
+   537 MB after 25 minutes, of a table of a few tens). `harness.py hot`: "a merge's replaced files
+   leave memory".
+234. **A sequence's values are durable before any is handed out, and only the sequencer moves it**
+   (`seq.rs`, `sq/{name}`): `nextval` takes a block in a commit of the sequencer's own (`Flush::sequence`,
+   `seq::Held`), answered once durable, so a value given out is never given again, through a
+   leader's kill too. Every sequence op takes a log number of its own (`*next += 1`), which is the
+   sequence's `version`: a node's block from before a change (`ALTER`, `setval`, a rename) is told
+   apart by it and dropped. A commit that only takes blocks is quiet (invariant 224). `VALUES`
+   rows take theirs in order (`write::whole_rows` → `seq::taken`: DataFusion plans a `VALUES` with a
+   call in it as one-row projections run at once). An identity column owns its sequence; `ALWAYS`
+   refuses a value given or set at every SQL door (428C9); loading doors (JSON, Arrow, Kafka,
+   Flight, `COPY`) keep a given value, as Postgres's `COPY` does. `harness.py sequences`: with the
+   numbers shared, "…RESTART…" hands out the old block; "after the leader is killed…" checks no
+   value comes twice.
+235. **An index is an object, never a promise of speed** (`index.rs`, `ix/{schema.name}`): `CREATE
+   INDEX` keeps its definition (keys over stored column names, so a rename is followed), says in a
+   notice that nothing is built (files' ranges and `CLUSTER BY` are what skip data), and shares the
+   relation names of tables, views and sequences (`ddl::unclaimed`, `seq::relation`). It goes with
+   its table, and with a column it names (`index::follow`, after `objects::follow`). What would be
+   a promise (`USING hnsw | ivfflat | bm25`) is refused by name until it is kept; `CREATE UNIQUE
+   INDEX` on columns is a UNIQUE constraint (invariant 236), on anything else refused.
+   `harness.py registry`: an index through a column's rename, a table's rename and drops; refusals.
+236. **A UNIQUE holds because only the leader's check writes its table** (`constraints.rs`, ADR-057):
+   every SQL write to a table with an enforced UNIQUE goes to the change path (`write::changes`),
+   whose `constraints::check` runs under the lake's lock against the table at `visible()`, and the
+   sequencer takes that table's rows only from a flush the change path made (`Flush::checked`,
+   never sent between nodes; `constraints::sequenced`). The other doors refuse the table by name. A
+   UNIQUE added to a table is committed before the rows there are checked (with one flush through
+   the sequencer between, so those sequenced before it are in), and put back if two share a value.
+   Without `checked`, an `ALTER TABLE … ADD CONSTRAINT` raced by a node that hadn't seen it would let
+   a duplicate in (no test reproduces that race yet). `harness.py constraints`: three nodes inserting
+   the same 40 values at once, 40 go in (more without the lock); every door; ADD over duplicates;
+   `CREATE UNIQUE INDEX`; the Postgres catalog.
+237. **A recipient reads only what is shared with it, at a published version, through links that end**
+   (`sharing.rs`, `vend.rs`, ADR-046). The sharing door serves a table's published Delta log
+   (`read_delta::replay`; so only durable state, invariant 16). Its files are filtered by the
+   share's partitions, and a file whose partition isn't known is left out. Each link reads one
+   object for `PONDRA_SHARE_URL_SECS`: the bucket's signed URL, or the node's, signed with the
+   lake's key over the object, its end and its recipient. The door takes recipients' tokens only,
+   and users' tokens mean nothing there. A client that can't read deletion vectors or column
+   mapping is refused, never given deleted rows. A branch holds none of its base's shares or
+   recipients (`branch::make`). `tools/sharing_check.py`, `tools/environments_check.py`.
+238. **A node's link carries its signature as a query parameter** (`vend::links`: `?sp=r&sig=…`).
+   Delta's kernel, which reads for the delta-sharing client, takes an http link as a link only when
+   it has one of the clouds' signature parameters. With the signature in the path, it looked for the
+   link's path on the client's own disk. `sharing_check.py`: "a shared table read with pandas…".
+239. **Every request at the sharing door is a row of `pondra.audit`, refusals too** (`audit::shared`,
+   door `sharing`, class `share`). An `ATTACH` naming a token or a profile is kept with them as
+   `'***'`. `sharing_check.py`.
+242. **An enum column holds text, and every door checks its labels** (`types.rs`): a table keeps its
+   enum columns' labels (`TableMeta::enums`, by stored name), so `defaults::check` (every door,
+   invariant 130) refuses a value they don't list without reading anything else (22P02, a
+   `Violation`, so a group's appends are checked one by one). `ALTER TYPE … ADD VALUE` adds the label
+   to every table using the type in the type's own commit; a label is never renamed or taken away,
+   since files are never rewritten. Casts to a type and `enum_range` become text where SQL comes in
+   (`types::rewrite`, after the macros). (240–241 are the grant fix's.) `harness.py enums`.
 
 ## Tests: run these before and after any change
 
@@ -1514,16 +1645,23 @@ python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres
 python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
 python3 tools/soak.py --minutes 10 [--hours 24] [--s3]                   # C4: steady ingest, nodes stopped and killed, memory, the log, commits on a timeline
+python3 tools/sharing_check.py [--s3]   # shares read by the delta-sharing client (its own venv: it pins pandas < 3) and another Pondra == the provider's rows; refusals; the audit log
 python3 tools/history_check.py   # DROP/UNDROP, retention, PURGE, Delta; AT (VERSION | TIMESTAMP | OFFSET) == a model of 13 states; RESTORE; CLONE (no copy, apart, merges and drops); refusals
 python3 tools/deploy_check.py                  # the image and compose; add python, chart, helm (kind), service: deploy.yml runs them all
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
 python3 tools/harness.py scripts        # IF, CASE, loops, handlers, RETURN, EXECUTE IMMEDIATE: errors at their line, scopes, a job run twice writing once, Postgres's protocols
 python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
-python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model
+python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model; merged files leave memory
+python3 tools/harness.py pace           # a writer's acks beside 64 querying clients stay near its acks alone (queries on their own runtime)
+python3 tools/harness.py tails          # a table's log tail kept between queries: reads == a model while rows land, a transaction's snapshot, a column added, tiering
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
 python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
+python3 tools/harness.py sequences      # nextval on three nodes (every value once), identity columns from every door, ALWAYS, owned sequences, a leader's kill
+python3 tools/harness.py enums          # CREATE TYPE … AS ENUM and ENUM('a', 'b') columns: labels from every door (22P02), casts, enum_range, ADD VALUE, RENAME, DROP while used
+python3 tools/harness.py constraints    # UNIQUE from every door and three nodes at once (23505), NOT ENFORCED facts, ADD/DROP CONSTRAINT, SHOW CREATE, the Postgres catalog
+python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
 python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
@@ -1644,6 +1782,13 @@ Iceberg snapshot cleanup). Any change to replication or recovery: `users` and `f
 
 Practical notes for an agent working here:
 
+- **How a thread works (the owner, 2026-10-09).** Its Opus designs, plans, orchestrates and reviews;
+  coding and small tasks go to Haiku workers with clear, specific instructions (the files, the
+  change, the check to run), and the thread reviews every result against its plan, and checks the
+  work itself, before it lands. A Fable worker only as an advisor, on a genuinely hard call. At most
+  two or three threads at once. Planned work, a robust core and the APIs come first and the UI at
+  the end, so build APIs flexible and reliable enough that a UI is easy to build and fix. Fast and
+  token-lean, still well tested, reviewed and bug free.
 - Never rebuild the binary while a test suite is running (tests exec `argv[0]` when a node restarts).
 - Test runs delete their lakes when they exit (`harness.new_lake`; `--keep` or `PONDRA_KEEP=1`
   keeps them). The owner's R2 free tier is 10 GB: after R2 runs, `tools/clean_bucket.py --bucket

@@ -123,6 +123,12 @@ rows, counts
  ['pondra_spread_queries_total 1'])
 ```
 
+Big writes use every node too. An `INSERT … SELECT` or a `CREATE TABLE … AS` over a big table is
+written by every node at once, each node writing its own share's files. The leader records them in
+one commit, so the rows, their row ids and a retried job's answer are what one node would give. A
+query whose rows have to be brought together first (a `GROUP BY`, an `ORDER BY`, a `LIMIT`, a join
+that shuffles) is written from one node.
+
 <Aside type="caution">
 A query that can't be split correctly runs on one node instead: `NOT IN` over a subquery on big
 data, a `LIMIT` inside such a subquery, and a window over all rows. A keyed table is read whole on

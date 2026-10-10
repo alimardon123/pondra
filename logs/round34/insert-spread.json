@@ -1,0 +1,13 @@
+{
+  "what": "CREATE TABLE AS over TPC-H SF1's lineitem (6 files, 6,001,215 rows) on one node and on three nodes sharing one 4-core box; each statement run twice, then DROP TABLE … PURGE. The first one-node run read the files cold.",
+  "tool": "a CTAS and a filtered CTAS through POST /sql; node 0 with PONDRA_SPREAD_MB=0",
+  "build": "claude/project-thread-ubu7b6 on main c02a001",
+  "secs": {
+    "ctas_1_node": [14.88, 5.9],
+    "ctas_3_nodes": [3.62, 3.55],
+    "filtered_1_node": [2.87, 2.71],
+    "filtered_3_nodes": [1.43, 1.61]
+  },
+  "rows": {"ctas": 6001215, "filtered": 3426687},
+  "checks": "count(*) == count(DISTINCT _row_id) after every run"
+}

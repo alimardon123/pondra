@@ -167,5 +167,5 @@ async fn over(lake: &Lake, feed: &Feed, batch: datafusion::arrow::record_batch::
     let sql = feed.sql.replace(&format!("\"{}\"", feed.topic), &format!("\"{HERE}\"")); // (the session never lists the topic)
     let ctx = crate::query::session(lake, &sql, "").await?;
     ctx.register_batch(HERE, batch)?;
-    Ok(ctx.sql_with_options(&sql, crate::query::read_only()).await?)
+    crate::query::sql(&ctx, &sql).await
 }
