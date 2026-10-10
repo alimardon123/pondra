@@ -609,9 +609,11 @@ impl App {
                 }
                 let df = crate::query::sql(&ctx, query).await?;
                 let (schema, task) = (Arc::new(df.schema().as_arrow().clone()), Arc::new(df.task_ctx()));
-                let plan = df.create_physical_plan().await?;
+                let (state, logical) = df.into_parts();
+                let logical = state.optimize(&logical)?; // (as `create_physical_plan`, the plan it optimized kept: what its filters were about, `learned.rs`)
+                let plan = state.query_planner().create_physical_plan(&logical, &state).await?;
                 let out = datafusion::physical_plan::collect(plan.clone(), task).await?;
-                crate::history::planned(&plan); // (its shape; a slow statement's plan, with what each operator did)
+                crate::history::planned(&logical, &plan); // (its shape; a slow statement's plan, with what each operator did; what it learned)
                 let out = if explained { crate::history::explained(out)? } else { out };
                 anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(schema)] } else { out }) // (no rows: still its columns)
             };
@@ -1064,7 +1066,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // or may read a file on this machine).
     let asks = |text: &str| {
         let q = text.to_lowercase();
-        !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.variables", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+        !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.learned", "pondra.variables", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
     };
     let volatile = files || limited || asks(query)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)

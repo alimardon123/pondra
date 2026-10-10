@@ -72,8 +72,11 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
     meta.files.extend(files);
     (meta.tiered, meta.rows_at) = (upto, upto);
     shadow(lake, table, &mut meta, &new, true).await?;
-    lake.cat.commit(vec![(table_key(table), json(&meta))], &[]).await?;
+    // (Counted off before the commit is awaited: a round that fails on another table drops this
+    // future while it waits, the commit lands all the same, and a count taken off after it was
+    // never taken off, so the log looked forever undrained. Fewer counted is only a gauge's lag.)
     lake.backlog.fetch_sub(n.min(lake.backlog.load(std::sync::atomic::Ordering::Relaxed)), std::sync::atomic::Ordering::Relaxed);
+    lake.cat.commit(vec![(table_key(table), json(&meta))], &[]).await?;
     Ok((rows, n < MAX_ROWS))
 }
 

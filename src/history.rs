@@ -12,7 +12,9 @@
 //! out, so one query's runs group together), its `plan_id` (the shape of the plan that ran), the
 //! `version` it read at (its answer again: `t AT (VERSION => n)`), the tables and views it `reads`
 //! and those it `writes`, and, for a query of `PONDRA_LEARN_MS` (100) or more, its `misestimate`: how
-//! many times its joins' rows were off what the planner expected, at the worst of them.
+//! many times its joins' rows were off what the planner expected, at the worst of them, and what it
+//! `learned`: each filter on a table that kept 2× or more of its rows more or fewer than expected
+//! (`learned.rs`, which adds them up as `pondra.learned`).
 //!
 //! Nothing waits for any of it. Rows go to a writer on each node, which appends what came in a
 //! second. At most `PONDRA_HISTORY_RATE` (500) rows a second are written a node: past that, the
@@ -39,6 +41,7 @@ pub struct Note {
     version: Option<u64>,
     plan_id: Option<String>,
     misestimate: Option<f64>,
+    learned: Vec<crate::learned::Fact>,
 }
 
 /// A part of a statement's work: what it was, on which node, from when and for how long (ms).
@@ -83,14 +86,19 @@ pub fn span(what: impl Into<String>, node: &str, began: Instant) {
 /// The commit its query read at (its statement's last query, as `rows`).
 pub fn read_at(version: u64) { with(|_, note| note.version = Some(version)); }
 
-/// A plan it ran: its shape always; how far its joins were from what was expected when it took
-/// `PONDRA_LEARN_MS` or more; the plan itself, each operator's rows beside the rows it expected, when
-/// it is slow by now or that was ten times off.
-pub fn planned(plan: &Arc<dyn ExecutionPlan>) {
+/// A plan it ran (and the plan the planner made, `logical`): its shape always; how far its joins and
+/// its tables' filters were from what was expected when it took `PONDRA_LEARN_MS` or more; the plan
+/// itself, each operator's rows beside the rows it expected, when it is slow by now or that was ten
+/// times off.
+pub fn planned(logical: &datafusion::logical_expr::LogicalPlan, plan: &Arc<dyn ExecutionPlan>) {
     with(|start, note| {
         note.plan_id = Some(plan_id(plan));
         let took = start.elapsed();
         note.misestimate = (took >= learn()).then(|| misestimate(plan)).flatten();
+        note.learned = match took >= learn() {
+            true => crate::learned::found(logical, plan),
+            false => vec![],
+        };
         if took >= slow() || note.misestimate.is_some_and(|m| m >= 10.0) {
             let text = datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(plan.as_ref()).set_show_statistics(true).indent(true).to_string();
             note.plan = Some(cut(expected(&text), 64 << 10));
@@ -281,7 +289,7 @@ pub fn ended(app: &App, class: &'static str, sql: &str, outcome: &'static str, e
         return; // (a read-only node writes nothing)
     }
     let slow = took >= slow();
-    if !slow && outcome == "ok" && skipped() {
+    if !slow && outcome == "ok" && note.learned.is_empty() && skipped() {
         return; // (counted: nothing else to do, on the path of every statement)
     }
     let who = crate::auth::current();
@@ -325,7 +333,7 @@ fn columns() -> Vec<(String, String)> {
     let int = |n: &str| (n.to_string(), "Int64".to_string());
     // (stored columns only grow, at the end: a lake's history made before keeps its rows, `create_log`)
     vec![("at".into(), ts), text("id"), text("user"), text("door"), text("from"), text("node"), text("session"), text("class"), text("statement"), text("outcome"), text("error"), int("ms"), int("rows"), int("nodes"), text("plan"), text("trace"),
-         text("fingerprint"), text("plan_id"), int("version"), ("reads".into(), "Utf8[]".into()), ("misestimate".into(), "Float64".into()), ("writes".into(), "Utf8[]".into())]
+         text("fingerprint"), text("plan_id"), int("version"), ("reads".into(), "Utf8[]".into()), ("misestimate".into(), "Float64".into()), ("writes".into(), "Utf8[]".into()), text("learned")]
 }
 
 /// Leader: the table, made the first time a node has a row for it (`Ddl::HistoryLog`), or given
@@ -372,7 +380,12 @@ fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
         int(&|l| l.note.version.map(|v| v as i64)),
     ];
     let [reads, writes] = touched(app, lines);
-    let arrays = [arrays, vec![reads, Arc::new(lines.iter().map(|l| l.note.misestimate).collect::<Float64Array>()) as ArrayRef, writes]].concat();
+    let local = |n: &String| crate::ddl::local(&app.lake, n).unwrap_or_else(|| n.clone());
+    let learned = text(&|l| (!l.note.learned.is_empty()).then(|| {
+        let facts: Vec<_> = l.note.learned.iter().map(|f| crate::learned::Fact { object: local(&f.object), ..f.clone() }).collect();
+        serde_json::to_string(&facts).unwrap_or_default()
+    }));
+    let arrays = [arrays, vec![reads, Arc::new(lines.iter().map(|l| l.note.misestimate).collect::<Float64Array>()) as ArrayRef, writes, learned]].concat();
     Ok(RecordBatch::try_new(crate::query::schema(&columns())?, arrays)?)
 }
 
