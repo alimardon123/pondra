@@ -99,7 +99,9 @@ pub async fn holds_lakes(path: &str) -> anyhow::Result<bool> {
 pub async fn is_lake(dir: &str) -> Result<bool> {
     if !dir.contains("://") {
         let d = std::path::Path::new(dir);
-        return Ok(d.join("catalog").is_dir() || d.join("cluster").join("term").is_dir());
+        // (`cluster/`, not `cluster/term/`: a node claiming the first term makes one folder, then the
+        // other, and a node started at the same moment looked in between)
+        return Ok(d.join("catalog").is_dir() || d.join("cluster").is_dir());
     }
     let store = crate::store::open_store(dir)?.1;
     for prefix in ["catalog", "cluster/term"] {
