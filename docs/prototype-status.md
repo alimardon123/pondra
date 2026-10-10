@@ -15,6 +15,17 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
 
+**Round 33 complete (2026-10-10): 0.33.0.** Each database read and written under its own sign-in;
+branches (`CREATE DATABASE dev CLONE prod`, zero copy, `REFRESH`) and projects planned, deployed and
+tested (`pondra plan`, `pondra deploy`); sharing with other companies over Delta Sharing; every
+materialized view kept current whatever its query (partial rows finished as read, by key, or run
+whole); windows as SQL with `EMIT FINAL`; `INSERT … SELECT` written by every node; plans that learn
+(`EXPLAIN`'s expected rows, `pondra.learned`); vector search as fast as DuckDB's; task graphs; every
+statement in `pondra.history`. The 24-hour soak's first leg on R2 (4.8 hours, eight nodes stopped or
+killed): 43,138 batches each once, 0 torn reads of 423,085; a node's memory grew 2–5 MB a minute
+under steady writes, which round 35 takes. Gates: `logs/gates/README.md`, 2026-10-10. What a user
+sees is in `.github/release.md`; each change's checks in its pull request.
+
 **Begun (2026-10-03, round 34): SQL as people write it.** DuckDB's spellings, rewritten where SQL
 comes in (`friendly.rs`, invariant 225): `PIVOT` and `UNPIVOT` (DuckDB's statements and the
 standard's), `COLUMNS(…)`, `* RENAME`, `ORDER BY ALL`, `FETCH FIRST`, list comprehensions and

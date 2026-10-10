@@ -19,7 +19,7 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~30,700 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650; Python functions, procedures on workers, the run log and tasks, round 24, 1,400; outside appends, live queries, temporary tables, answers kept and changes across lakes, round 25, 1,200; other engines' changes as written, round 28, 1,300).
+5. **Short, simple, readable code** — without losing functionality. ~55,200 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650; Python functions, procedures on workers, the run log and tasks, round 24, 1,400; outside appends, live queries, temporary tables, answers kept and changes across lakes, round 25, 1,200; other engines' changes as written, round 28, 1,300).
    If a change makes a file much longer, look for the simpler shape first.
 6. **Scale-out is the point** (the owner, 2026-09-27): running across machines is what sets
    Pondra apart from single-node engines (DuckDB, Polars, Daft, Bodo) and makes it leaner than
@@ -60,7 +60,7 @@ The owner's design principles, which every change must respect:
 ## Layout
 
 ```
-src/      28,600 lines of Rust, one file per concern (see the table in README.md); round 25 added
+src/      55,200 lines of Rust in 101 files, one per concern (see the table in README.md); round 25 added
           live.rs (live queries) and temp.rs (a session's temporary tables and views); round 31 vars.rs
           (SQL variables and a file's declared parameters, ADR-037, ADR-044) and script.rs (a script's
           blocks, branches, loops and handlers, ADR-045); round 26
@@ -1885,13 +1885,30 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-10-03, round 32 complete: 0.32.0)
+## State of the work (2026-10-10, round 33 complete: 0.33.0)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
-round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/`, round 26's in `logs/round26/`, round 27's in `logs/round27/`, round 28's in `logs/round28/`, round 29's in `logs/round29/`, round 30's in `logs/round30/`, round 31's in `logs/round31/` and round 32's in `logs/round32/`.
+round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/`, round 26's in `logs/round26/`, round 27's in `logs/round27/`, round 28's in `logs/round28/`, round 29's in `logs/round29/`, round 30's in `logs/round30/`, round 31's in `logs/round31/` and round 32's in `logs/round32/`; from round 33 on, each pull request's checks are in its body and its one-page review, and the gates' rows in `logs/gates/`.
+
+**Round 33 (0.33.0): sure, shared and kept current**, with much of round 34's SQL done beside it.
+Safety: the 24-hour soak's first leg on R2 (4.8 hours, eight nodes stopped or killed, 43,138
+batches each once, no torn read; memory grows 2–5 MB a minute under steady writes, which round 35
+takes), each database read and written under its own sign-in (240, 241), five wrong answers that
+100,000 random queries against DuckDB found (226). Teams: branches (`CREATE DATABASE dev CLONE
+prod`, zero copy, REFRESH: 245), projects planned, deployed and tested (`pondra plan`, `deploy`,
+migrations once: 246–250), sharing with other companies over Delta Sharing (ADR-046: 237–239).
+Engine: every materialized view kept current whatever its query (ADR-055, 056, 059: 252, 253),
+windows as SQL with `EMIT FINAL` (ADR-052), `INSERT … SELECT` written by every node (228), dashboards
+and writes fast together (229–233), plans that learn (ADR-050: 243, 244). SQL: DuckDB's spellings
+(225), one registry of objects (ADR-049: 227), sequences, indexes, UNIQUE and enum types (234–236,
+242), vector search and model calls (ADR-051 phase 0), task graphs and scripts that run things at
+once (219, 221, 222), every statement in `pondra.history` (223, 224). Each change's checks are in
+its pull request and its review; `.github/release.md` has the user's view. Left for later rounds:
+the soak's other legs and the memory growth (35), branches across servers and protected prod
+(ADR-058), the planner using what runs learned, and round 34's scale runs on machines.
 
 **Round 32 (after 0.30.0; 0.31.0, 0.31.1 untagged, 0.32.0): lean and fast.** The join order from
 every input (TPC-DS q72 81 s → 0.17 s; the 99 18.2 → 12.1 s), planning and small queries cheaper
@@ -2289,10 +2306,11 @@ Known limits, in the order they matter:
 1. **Multi-machine runs only over the internet so far** (GitHub's runners, where a shuffle costs
    more than it saves: the guard keeps such queries on one node). `.github/workflows/cluster-bench.yml`
    and `tools/cloud/` are the kits; the owner starts them.
-2. **What follows a table and can't take a row back** (windows emitted once, min/max views, views
-   over joins, streaming tasks) makes a change of it refused; Kafka consumers see an UPDATE's new
-   rows, not its deletes; a purge rewrites whole files (no deletion vectors yet); `ALTER TABLE`
-   renames a table only by copying it (`CREATE TABLE … AS`, `DROP TABLE`), and never narrows a type.
+2. **What follows a table and can't take a row back** (windows and sessions emitted once, stream
+   joins, views kept from each write's rows that keep a min or max or read other tables, streaming
+   tasks) makes a change of it refused; a view that runs its query again (ADR-056, ADR-059) follows
+   any change. Kafka consumers see an UPDATE's new rows, not its deletes; `ALTER TABLE` never
+   narrows a type.
 3. **Distributed edges:** a `LIMIT` inside a subquery over sliced data and order-preserving
    shuffles run on one node; a join with a hot key on both sides shares out only one side; key
    ranges are found from the files, not declared (a table written out of order isn't sliced by
@@ -2319,9 +2337,10 @@ Known limits, in the order they matter:
    leader (rows in memory); an as-of join in a view joins what the table has when the
    event arrives (Flink's temporal join waits for the table's watermark); keyed tables keep only
    their latest row, so as-of joins need a table's history kept as rows.
-10. **Security:** tokens per role only; no TLS (use a proxy) — the nodes' own calls to each other
-    are plain HTTP too, so run a cluster in a private network, a VPC or Tailscale — no per-table
-    grants or quotas.
+10. **Security:** users, roles and grants per table (invariant 176), TLS at every door and between
+    the nodes (179), an audit log and quotas (180), each database under its own sign-in (240); the
+    review of it all is round 37's, and an environment's node keys sealed before dev reads prod
+    across servers is ADR-058's.
 11. **`VARIANT` is JSON text**, not a shredded variant; `ai_*` and Flight functions call out of
     the process, so their latency is the endpoint's.
 12. **Packages:** 0.22.1 is on PyPI and npm (all five platforms). Outside CI, only the owner's

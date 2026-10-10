@@ -5,8 +5,8 @@ bucket. Each names the release's archives (`archive()` in tools/package.py) by U
 Nothing is published or built here: it writes files, and whoever releases puts them where they go.
 
   distribute.py --version 0.30.0 --release --out out/      # SHA-256s from the release's own archives (downloaded)
-  distribute.py --version 0.32.0 --dist dist --out out/    # from a folder holding the five archives (the build workflow's packages)
-  distribute.py --version 0.32.0 --dist dist --url-base file:///tmp/dist   # URLs (and --release's downloads) from there, to try the files before a release exists
+  distribute.py --version 0.33.0 --dist dist --out out/    # from a folder holding the five archives (the build workflow's packages)
+  distribute.py --version 0.33.0 --dist dist --url-base file:///tmp/dist   # URLs (and --release's downloads) from there, to try the files before a release exists
 
 Writes out/homebrew/pondra.rb (`brew install alimardon123/pondra/pondra`), out/winget/manifests/p/Pondra/
 Pondra/<version>/*.yaml (`winget install Pondra.Pondra`) and out/scoop/pondra.json. Exit 1, writing

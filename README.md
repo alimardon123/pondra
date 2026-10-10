@@ -4,7 +4,7 @@
 install it, load and query data, stream, run a cluster, and every statement, function, flag and
 endpoint, each example tested.
 
-One Rust binary (~28,000 lines) that ingests streams, stores them as a lakehouse (Parquet files
+One Rust binary (~55,000 lines) that ingests streams, stores them as a lakehouse (Parquet files
 plus a catalog, on object storage; Delta Lake and Iceberg metadata for other engines on request),
 keeps SQL views and streaming state up to date, answers SQL, and scales out by starting more
 copies of itself on the same bucket. It reads and writes what is outside it too: files on any
