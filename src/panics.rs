@@ -4,7 +4,7 @@
 //!
 //! - **Doors** run each request in [`door`]: HTTP (`server::guard`), each Postgres statement, and
 //!   each Kafka and Flight connection (its task: a panic ends that connection only); a query's
-//!   request in [`work`], on the queries' runtime when another is running.
+//!   request in [`work`], on the queries' runtime when another has run a while.
 //! - **The node's own loops** are started with [`spawn`]: a panic in one aborts the process.
 //! - DataFusion's own tasks (a query's partitions) hand a panic back to the request that ran them.
 use futures::FutureExt;
@@ -21,29 +21,42 @@ pub async fn door<T>(f: impl Future<Output = T>) -> Result<T, String> {
 /// (appends, commits, heartbeats, the commit stream) then never wait behind each other's tasks:
 /// the OS shares the cores between two runtimes, where one ran a woken append only after every
 /// query task ahead of it (a writer beside 400 dashboard clients landed 2,860 rows a second of
-/// 22,000). A request that comes alone runs where it came in: the runtime is its own then. Dropped,
-/// as when its client goes, it stops the work.
+/// 22,000). A request runs where it came in while no other has run for [`LONG`]: the hop wakes a
+/// parked thread each way, which cost pgbench's four clients, whose statements take a millisecond
+/// or two, a sixth of their transactions. Dropped, as when its client goes, it stops the work.
 pub async fn work<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    static RUNNING: AtomicUsize = AtomicUsize::new(0);
-    struct Stop(Option<tokio::task::AbortHandle>);
+    use std::{collections::BTreeMap, sync::Mutex, time::Instant};
+    // The requests running, by when each started: ids grow with time, so the first is the oldest.
+    static RUNNING: Mutex<BTreeMap<u64, Instant>> = Mutex::new(BTreeMap::new());
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    struct Stop(u64, Option<tokio::task::AbortHandle>);
     impl Drop for Stop {
         fn drop(&mut self) {
-            RUNNING.fetch_sub(1, SeqCst);
-            if let Some(t) = self.0.take() {
+            RUNNING.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+            if let Some(t) = self.1.take() {
                 t.abort();
             }
         }
     }
-    let others = RUNNING.fetch_add(1, SeqCst);
-    let mut stop = Stop(None);
-    if others == 0 {
-        return door(f).await; // (alone: the hop would cost more than it saves, a parked thread woken each way)
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let long = {
+        let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        let long = running.first_key_value().is_some_and(|(_, t)| t.elapsed() >= LONG);
+        running.insert(id, Instant::now());
+        long
+    };
+    let mut stop = Stop(id, None);
+    if !long {
+        return door(f).await;
     }
     let task = queries().spawn(door(f));
-    stop.0 = Some(task.abort_handle());
+    stop.1 = Some(task.abort_handle());
     task.await.unwrap_or_else(|e| Err(format!("internal error: {e}")))
 }
+
+/// How long a request runs before the ones after it go to the queries' runtime: under load a
+/// query's time grows as the cores are shared, so dashboards beside writers pass it at once.
+const LONG: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The queries' runtime: made when first asked for, with a thread a core and the node's stacks.
 fn queries() -> &'static tokio::runtime::Runtime {

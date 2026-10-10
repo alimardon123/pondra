@@ -100,8 +100,9 @@ document, and finish with `->>` or a typed getter.
 ## Vectors
 
 A vector is a `FLOAT[]` column. The distance functions take two vectors of the same length and
-give a `DOUBLE`. If the lengths differ, or either side is `NULL` or holds a `NULL`, the answer is
-`NULL`. Each also answers to DuckDB's names, so SQL written for DuckDB runs as it is.
+give a `DOUBLE`. Vectors of different lengths are an error. If either side is `NULL` or holds a
+`NULL`, the answer is `NULL`, and so is a cosine of a vector of zeros, which has no direction. Each
+also answers to DuckDB's names, so SQL written for DuckDB runs as it is.
 
 | Function | Meaning | Also called |
 |---|---|---|

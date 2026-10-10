@@ -292,6 +292,7 @@ EXCEPTIONS = {
     "microseconds": "a table's TIMESTAMP keeps microseconds, as Postgres, Delta and Iceberg do; DataFusion's keeps nanoseconds, which the answer shows",
     "an order not asked for": "the same rows in another order, from a query with no ORDER BY: SQL leaves the order open, and Pondra's plans give another",
     "interval arithmetic": "`n * INTERVAL '1 hour'` and `INTERVAL … / n`, which DataFusion refuses and Pondra computes as Postgres does",
+    "FETCH FIRST": "`FETCH FIRST | NEXT n ROWS ONLY`, standard SQL that DataFusion refuses and Pondra takes, as Postgres and DuckDB do (friendly.rs)",
 }
 RUNNER_FUNCTIONS = {"async_abs"}  # (async_udf.slt's: registered by the runner)
 MADE = re.compile(r"\s*(?:create\s+(?:or\s+replace\s+)?(?:(?:temp|temporary|external|unbounded|materialized)\s+)*(?:table|view)\s+(?:if\s+not\s+exists\s+)?|select\b.*?\binto\s+)(\"[^\"]+\"|[\w.]+)", re.I | re.S)
@@ -302,6 +303,8 @@ def exception(sql, why, made):
     explain = re.match(r"\s*explain\b", sql, re.I)
     if why == "an error was expected" and re.search(r"interval\s+'[^']*'\s*[*/]|[*]\s*interval\s+'", sql, re.I):
         return "interval arithmetic"
+    if why == "an error was expected" and re.search(r"\bfetch\s+(first|next)\b", sql, re.I):
+        return "FETCH FIRST"
     if explain and why.startswith("answer differs"):
         return "plan text"
     if explain and "DML not supported" in why:

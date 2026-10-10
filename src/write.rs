@@ -396,31 +396,35 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         };
         return Some(Stmt::Invalid(format!("CREATE OR REPLACE {kind}: replacing one would drop {lost}; CREATE {kind} IF NOT EXISTS leaves one that is there as it is")));
     }
-    if let Some(s) = crate::shares::statement(sql) {
+    // The kinds below each begin with one of these words, so a query or a row's change goes past
+    // them without being read again by each (every statement is read here more than once).
+    let head = first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_ascii_lowercase();
+    let kinds = matches!(head.as_str(), "create" | "alter" | "drop" | "grant" | "revoke" | "comment" | "copy" | "attach");
+    if let Some(s) = kinds.then(|| crate::shares::statement(sql)).flatten() {
         return Some(s); // (CREATE SHARE and RECIPIENT, GRANT SELECT ON SHARE: `shares.rs`, before users' GRANT)
     }
-    if let Some(s) = crate::users::statement(sql) {
+    if let Some(s) = kinds.then(|| crate::users::statement(sql)).flatten() {
         return Some(s); // (CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN: `users.rs`)
     }
-    if let Some(s) = crate::ext::statement(sql) {
+    if let Some(s) = kinds.then(|| crate::ext::statement(sql)).flatten() {
         return Some(s); // (CREATE SECRET: values of any kind; DROP SECRET)
     }
-    if let Some(s) = crate::routines::statement(sql) {
+    if let Some(s) = kinds.then(|| crate::routines::statement(sql)).flatten() {
         return Some(s); // (CREATE FUNCTION and PROCEDURE as Postgres writes them, CREATE TASK, DROP TASK, DROP MACRO)
     }
-    if let Some(s) = crate::objects::statement(sql) {
+    if let Some(s) = kinds.then(|| crate::objects::statement(sql)).flatten() {
         return Some(s); // (COMMENT ON, CREATE OR ALTER TABLE | VIEW: the registry's)
     }
-    if let Some(s) = crate::seq::statement(sql) {
+    if let Some(s) = kinds.then(|| crate::seq::statement(sql)).flatten() {
         return Some(s); // (CREATE, ALTER, DROP SEQUENCE)
     }
-    if let Some(s) = crate::index::statement(sql) {
+    if let Some(s) = kinds.then(|| crate::index::statement(sql)).flatten() {
         return Some(s); // (CREATE, ALTER, DROP INDEX)
     }
-    if let Some(s) = crate::types::statement(sql) {
+    if let Some(s) = kinds.then(|| crate::types::statement(sql)).flatten() {
         return Some(s); // (CREATE TYPE … AS ENUM, ALTER and DROP TYPE)
     }
-    if let Some(sql) = crate::seq::in_order(sql) {
+    if let Some(sql) = kinds.then(|| crate::seq::in_order(sql)).flatten() {
         return parse(&sql); // (an identity's options as the parser takes them)
     }
     // `ALTER VIEW v RENAME TO w` (dbt's): the parser takes only ALTER VIEW … AS.

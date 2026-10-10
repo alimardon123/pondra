@@ -15,7 +15,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::{compute::concat_batches, json as arrow_json, record_batch::RecordBatch, util::pretty::pretty_format_batches};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json as j, Value};
 use std::collections::HashMap;
@@ -585,6 +585,19 @@ async fn replica(State(app): State<App>, Query(p): Query<AckParams>) -> Result<V
     Ok(app.replica.as_ref().ok_or(StatusCode::NOT_FOUND)?.serve(p.term, p.after))
 }
 
+/// Each table's job, four at a time: the answers of those that worked, and a line for `failed`
+/// naming each that didn't.
+async fn each<'a, T>(jobs: Vec<impl std::future::Future<Output = (&'a String, anyhow::Result<T>)>>, failed: &mut Vec<String>) -> Vec<T> {
+    let mut done = vec![];
+    for (table, r) in futures::stream::iter(jobs).buffer_unordered(4).collect::<Vec<_>>().await {
+        match r {
+            Ok(v) => done.push(v),
+            Err(e) => failed.push(format!("{table}: {e:#}")),
+        }
+    }
+    done
+}
+
 impl App {
     pub fn log(&self) -> anyhow::Result<&Log> { self.log.as_deref().ok_or_else(|| anyhow::anyhow!("read-only node")) }
 
@@ -634,8 +647,9 @@ impl App {
             let run = |frugal: bool| async move {
                 let ctx = session(&self.lake, query, "").await?;
                 let ctx = if files { ctx.enable_url_table() } else { ctx };
-                if explained {
-                    ctx.state_ref().write().config_mut().options_mut().explain.show_statistics = true; // (each operator's expected rows: `history::expected`)
+                if explained && !query.to_lowercase().contains("pgjson") {
+                    // (each operator's expected rows: `history::expected`; Postgres's JSON has no place for them)
+                    ctx.state_ref().write().config_mut().options_mut().explain.show_statistics = true;
                 }
                 if frugal {
                     // Hash joins can't spill, sort-merge joins can; sorts keep less aside to merge.
@@ -728,17 +742,20 @@ impl App {
         if untidy.is_empty() && changed.is_empty() {
             return Ok(0); // (the pressure check, most of the time: don't hold the lock for nothing)
         }
-        let per_table: Vec<_> = busy.iter().map(|t| self.tier_one(t, hwm, &nodes)).collect();
-        let rows: u64 = futures::stream::iter(per_table).buffer_unordered(4).try_collect::<Vec<u64>>().await?.iter().sum();
+        // Each table's work is its own: one that fails (rows its files can't hold, say) is named
+        // once the round is done, and stops no other table's.
+        let (nodes, mut failed) = (&nodes, vec![]);
+        let per_table: Vec<_> = busy.iter().map(|t| async move { (t, self.tier_one(t, hwm, nodes).await) }).collect();
+        let rows: u64 = each(per_table, &mut failed).await.iter().sum();
         // Changed rows out of the files (published tables: before they are published).
-        let purge: Vec<_> = changed.iter().map(|t| crate::tier::purge(&self.lake, t, &nodes, &self.cluster.addr, self.retain_ms, false)).collect();
-        futures::stream::iter(purge).buffer_unordered(4).try_collect::<Vec<bool>>().await?;
+        let purge: Vec<_> = changed.iter().map(|t| async move { (t, crate::tier::purge(&self.lake, t, nodes, &self.cluster.addr, self.retain_ms, false).await) }).collect();
+        each(purge, &mut failed).await;
         let tiered = start.elapsed();
         crate::delta::publish_all(&self.lake).await?; // what other engines read, as soon as it's tiered
         let first_publish = start.elapsed();
         // Then merges and compactions (published too, once done).
-        let maintain: Vec<_> = untidy.iter().map(|t| crate::tier::maintain(&self.lake, t, &nodes, &self.cluster.addr, false)).collect();
-        if futures::stream::iter(maintain).buffer_unordered(4).try_collect::<Vec<bool>>().await?.contains(&true) {
+        let maintain: Vec<_> = untidy.iter().map(|t| async move { (t, crate::tier::maintain(&self.lake, t, nodes, &self.cluster.addr, false).await) }).collect();
+        if each(maintain, &mut failed).await.contains(&true) {
             crate::delta::publish_all(&self.lake).await?;
         }
         let published = start.elapsed();
@@ -754,6 +771,7 @@ impl App {
             let (publish, merges, expire) = (first_publish - tiered, published - first_publish, start.elapsed() - published);
             eprintln!("slow tiering: {rows} rows in {:?} (tables {tiered:?}, publish {publish:?}, merges {merges:?}, expire {expire:?})", start.elapsed());
         }
+        anyhow::ensure!(failed.is_empty(), "{}", failed.join("; "));
         Ok(rows)
     }
 
@@ -1194,9 +1212,10 @@ pub fn render(batches: &[RecordBatch], format: Option<&str>) -> anyhow::Result<b
             w.into_inner()
         }
         Some("parquet") => {
+            let batches = batches.iter().map(crate::tier::storable).collect::<anyhow::Result<Vec<_>>>()?; // (intervals as text)
             let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
             let mut w = datafusion::parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, None)?;
-            for b in batches {
+            for b in &batches {
                 w.write(b)?;
             }
             w.into_inner()?

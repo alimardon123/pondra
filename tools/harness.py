@@ -843,13 +843,21 @@ def tiering():
     call(A.port, "POST", "/tables/events", json.dumps([["user", "Utf8"], ["amount", "Int64"]]).encode())
     call(A.port, "POST", "/tables/kv", json.dumps({"columns": [["id", "Int64"], ["v", "Int64"]], "key": ["id"]}).encode())
     call(A.port, "POST", "/views/totals", b"SELECT user, sum(amount) AS amount FROM events GROUP BY user")
+    # An INTERVAL column, which Parquet can't hold as it is (written as its text): its table
+    # tiers, merges and changes like any other, and stops no other table's tiering.
+    sql(A.port, "CREATE TABLE spans (k BIGINT, i INTERVAL, l INTERVAL[])")
     for r in range(1, rounds + 1):
         call(A.port, "POST", f"/append/events?producer=p&seq={r}", "".join(
             json.dumps({"user": f"u{i % 50}", "amount": 1}) + "\n" for i in range(per)).encode(), timeout=600)
         call(A.port, "POST", f"/append/kv?producer=k&seq={r}", "".join(
             json.dumps({"id": i, "v": r}) + "\n" for i in range(200)).encode())
+        sql(A.port, f"INSERT INTO spans VALUES ({r}, INTERVAL '{r} months -{r} days {r}.000000001 seconds', [INTERVAL '{r} hours', NULL])")
+        if r == 3:
+            sql(A.port, "UPDATE spans SET i = i + INTERVAL '1 day' WHERE k = 2")
         call(A.port, "POST", "/tier", timeout=600)
     untiered = call(A.port, "GET", "/stats")["untiered_rows"]
+    want = [{"k": r, "i": f"{r} mons {-r + (r == 2)} days {r}.000000001 secs", "l": [f"{r} hours", None]} for r in range(1, rounds + 1)]
+    spans = sql(A.port, "SELECT k, CAST(i AS VARCHAR) AS i, l FROM spans ORDER BY k") == want
     out = subprocess.run([BIN, "catalog", "--dir", lake, "t/"], capture_output=True, text=True).stdout
     files = {l.split(" ", 1)[0][2:]: len(json.loads(l.split(" ", 1)[1])["files"]) for l in out.splitlines()}
     got = {"events": sql(A.port, "SELECT count(*) AS n FROM events")[0]["n"],
@@ -871,12 +879,13 @@ def tiering():
     node.kill()
     classes = len(first) == 1 and first[0] in wide and len(wide) == 2
     ok = (got["events"] == rounds * per and got["totals"] == rounds * per
-          and got["kv"] == {"n": 200, "v": 200 * rounds} and untiered == 0 and max(files.values()) <= 8 and classes)
+          and got["kv"] == {"n": 200, "v": 200 * rounds} and untiered == 0 and max(files.values()) <= 8 and classes and spans)
     print(f"tiering: {rounds} rounds -> files {files}, untiered rows {untiered}, rows {got}; "
-          f"a merged file kept while eight more merge: {classes} ({len(first)} then {len(wide)} files) -> {'OK' if ok else 'FAIL'}")
+          f"a merged file kept while eight more merge: {classes} ({len(first)} then {len(wide)} files); "
+          f"INTERVAL columns tiered, merged and changed, read back exactly: {spans} -> {'OK' if ok else 'FAIL'}")
     if not ok:
         sys.exit(1)
-    return f"{rounds} rounds of writes and tiering: log drained, files bounded ({files}), every row exact; merges by size class"
+    return f"{rounds} rounds of writes and tiering: log drained, files bounded ({files}), every row exact (INTERVAL columns too); merges by size class"
 
 
 def tails():
@@ -1938,7 +1947,7 @@ def finishes():
                                                "GROUP BY 1 ORDER BY a LIMIT 2 EMIT FINAL")),
         "rename": _raises_text(lambda: q("ALTER TABLE stats RENAME COLUMN mean TO average")),
     }
-    # (a view of one runs its query whole again, ADR-057: what it reads is worked out as it is read)
+    # (a view of one runs its query whole again, ADR-059: what it reads is worked out as it is read)
     q("CREATE MATERIALIZED VIEW m3 AS SELECT region, count(*) AS n FROM stats GROUP BY region")
     of_it = q("SELECT region, n FROM m3 ORDER BY region NULLS FIRST") == q("SELECT region, count(*) AS n FROM stats GROUP BY region ORDER BY region NULLS FIRST") \
         and q("SELECT refresh FROM pondra.flows WHERE name = 'm3'") == [{"refresh": "full"}]
@@ -2083,7 +2092,7 @@ def full_on_three():
 
 
 def refreshed():
-    """Materialized views run whole again (ADR-057): ORDER BY … LIMIT, a window, DISTINCT, a
+    """Materialized views run whole again (ADR-059): ORDER BY … LIMIT, a window, DISTINCT, a
     subquery over its own table, a join with a median, a global aggregate and a keyed table's
     median, chosen because the rows can't keep them. Each == its query run ad hoc right after CREATE,
     after bulk and log INSERTs, UPDATEs and DELETEs (of the joined table too), a restart and on three
@@ -2489,7 +2498,7 @@ def schemas():
     got = until(lambda: q("SELECT k, n, s FROM dbo.per_k ORDER BY k"), want, 30)
     checks["CREATE MATERIALIZED VIEW: the rows already there and those written after; WITH (window …) emits to _final; bad options refused"] = got == want and len(want) == 3 \
         and n("per_min_final") == 0 and err("CREATE MATERIALIZED VIEW m2 WITH (windw = 'w') AS SELECT k FROM t") is not None
-    # a view of a view (a flow, ADR-036): of a GROUP BY view's partial rows a rollup, or run whole (ADR-057); of a _final, as of a table
+    # a view of a view (a flow, ADR-036): of a GROUP BY view's partial rows a rollup, or run whole (ADR-059); of a _final, as of a table
     over = [err("CREATE MATERIALIZED VIEW m3 AS SELECT k FROM dbo.per_k"), err("CREATE MATERIALIZED VIEW m4 AS SELECT w FROM per_min_final")]
     checks["a materialized view of a GROUP BY view that isn't a rollup runs whole; of a _final, made"] = over == [None, None] \
         and q("SELECT k FROM m3 ORDER BY k") == q("SELECT k FROM dbo.per_k ORDER BY k") and q("SELECT refresh FROM pondra.flows WHERE name = 'm3'") == [{"refresh": "full"}]
@@ -7033,7 +7042,7 @@ def flows():
     checks = {}
     refused = err("INSERT INTO orders VALUES (1, 'r0', 'u1', 500000, 'paid'), (2, 'r0', 'u1', 5, 'paid')", ports[1])
     checks["a row a FAIL expectation refuses fails its INSERT, naming it"] = bool(refused) and 'violates check constraint "small"' in refused
-    # (what a GROUP BY view's partial rows can't keep as they come runs its query again, ADR-057)
+    # (what a GROUP BY view's partial rows can't keep as they come runs its query again, ADR-059)
     whole = {
         "rich": ("SELECT * FROM gold WHERE total > 100", "region, buyer NULLS FIRST"),
         "buyers": ("SELECT region, count(*) AS n FROM gold GROUP BY region", "region"),
@@ -8972,6 +8981,10 @@ def friendly():
         "ASOF LEFT JOIN … ON": ("SELECT t.id, q.p FROM t ASOF LEFT JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
         "a select's alias in its WHERE": ("SELECT x * 2 AS dbl FROM t WHERE dbl > 4000", True, False),
         "… but a column of that name wins": ("SELECT id + 100 AS x FROM t WHERE x > 20", True, False),
+        "WITH RECURSIVE, its step naming a column it gives again (its probe asked itself, and the node died)": ("WITH RECURSIVE nodes AS (SELECT 1 AS id UNION ALL SELECT id + 1 AS id FROM nodes WHERE id < 10) SELECT * FROM nodes", True, False),
+        "WITH RECURSIVE, an alias in its step's WHERE": ("WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 AS m FROM r WHERE m < 6) SELECT * FROM r", True, False),
+        "a select's alias in its WHERE, inside a CTE": ("WITH d AS (SELECT x * 2 AS dbl FROM t WHERE dbl > 4000), e AS (SELECT dbl + 1 AS u FROM d WHERE u > 4500) SELECT * FROM e", True, False),
+        "ORDER BY ALL inside a CTE": ("WITH a AS (SELECT g, k, id FROM t ORDER BY ALL LIMIT 5) SELECT * FROM a", True, False),
         "a minus before a minus, in a text written again (it read back as a comment)": ("SELECT id, - -k AS m, - - -x AS b FROM t WHERE m > 3 AND g IS DISTINCT FROM 'b'", True, False),
         "DISTINCT over a CASE whose WHEN shows its THEN isn't NULL (random_sql.py)": ("SELECT DISTINCT CASE WHEN k < 3 AND n = 2.5 THEN n ELSE 0 END AS c FROM t", True, False),
         "x IN (a column, …) AND x IN (…): not the lists' intersection (random_sql.py)": ("SELECT id FROM t WHERE g IN (g, 'z') AND g IN ('a', 'b')", True, False),

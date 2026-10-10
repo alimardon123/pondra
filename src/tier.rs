@@ -934,7 +934,33 @@ fn codec() -> Compression {
     }
 }
 
-/// Write batches as one Parquet file (none if there are no rows).
+/// `batch` as Parquet can hold it. Parquet has no type for Arrow's intervals of months, days and
+/// nanoseconds (its own `INTERVAL` keeps milliseconds), so such a column is written as its text
+/// (`1 mons -2 days 3.000000004 secs`), which reads cast back to the table's type exactly. Written
+/// as it was, a table with an `INTERVAL` column never left the log, and its failing round stopped
+/// every other table's too.
+pub fn storable(batch: &RecordBatch) -> Result<RecordBatch> {
+    use datafusion::arrow::datatypes::{DataType, Field, IntervalUnit, Schema};
+    fn stored(t: &DataType) -> DataType {
+        let item = |f: &std::sync::Arc<Field>| std::sync::Arc::new(f.as_ref().clone().with_data_type(stored(f.data_type())));
+        match t {
+            DataType::Interval(IntervalUnit::MonthDayNano) => DataType::Utf8,
+            DataType::List(f) => DataType::List(item(f)),
+            DataType::LargeList(f) => DataType::LargeList(item(f)),
+            DataType::FixedSizeList(f, n) => DataType::FixedSizeList(item(f), *n),
+            DataType::Struct(fs) => DataType::Struct(fs.iter().map(item).collect()),
+            t => t.clone(),
+        }
+    }
+    let schema = batch.schema();
+    if schema.fields().iter().all(|f| stored(f.data_type()) == *f.data_type()) {
+        return Ok(batch.clone());
+    }
+    let fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone().with_data_type(stored(f.data_type()))).collect();
+    let columns = batch.columns().iter().zip(&fields).map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type())).collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new(std::sync::Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())), columns)?)
+}
+
 /// One Parquet file of these rows; with `stats`, it carries its columns' min/max (append tables).
 pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys: &[String], stats: bool) -> Result<Option<DataFile>> {
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -942,11 +968,12 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
         return Ok(None);
     }
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
-    let ids = field_ids(meta.as_ref(), &batches[0].schema());
+    let stored: Vec<RecordBatch> = batches.iter().map(storable).collect::<Result<_>>()?;
+    let ids = field_ids(meta.as_ref(), &stored[0].schema());
     let folder = meta.as_ref().map_or(table, |m| m.folder(table));
     let mut buf = vec![];
-    let mut w = writer(&mut buf, &batches[0].clone().with_schema(ids.clone())?, keys)?;
-    for b in batches {
+    let mut w = writer(&mut buf, &stored[0].clone().with_schema(ids.clone())?, keys)?;
+    for b in &stored {
         w.write(&b.clone().with_schema(ids.clone())?)?;
     }
     let footer = w.close()?; // (its statistics: the file's min and max, without a second pass)

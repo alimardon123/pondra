@@ -340,10 +340,18 @@ enum Asks {
 
 struct Friendly {
     asks: Asks,
-    with: Vec<Option<With>>,
+    with: Vec<Level>,
     orders: Vec<Option<usize>>,
     selects: Vec<Option<Vec<Column>>>,
     names: Vec<Vec<Option<String>>>,
+}
+
+/// A query being visited: its WITH, which of its parent's CTEs it defines (if it is one), and how
+/// many of its own CTEs have been entered (they are visited first, in order).
+struct Level {
+    with: Option<With>,
+    defines: Option<usize>,
+    entered: usize,
 }
 
 /// `stmts` with every friendly form in them rewritten, asking the lake what they need to know;
@@ -372,9 +380,21 @@ pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
     Ok(before != stmts)
 }
 
+tokio::task_local! {
+    /// How many asks this one is inside (an ask's query is expanded, and may ask in turn).
+    static ASKING: usize;
+}
+
 /// The answer to an ask, from a query run as the caller (itself expanded: it may hold friendly
-/// SQL too).
+/// SQL too). Asks inside asks stop 8 deep: a probe that asked itself again overflowed the stack
+/// and took the node down.
 async fn answer(lake: &Lake, ask: Ask) -> Result<Vec<Column>> {
+    let depth = ASKING.try_with(|d| *d).unwrap_or(0);
+    ensure!(depth < 8, "a query that needs its own columns to know its own columns (asked 8 deep)");
+    ASKING.scope(depth + 1, answered(lake, ask)).await
+}
+
+async fn answered(lake: &Lake, ask: Ask) -> Result<Vec<Column>> {
     let (sql, values) = match ask {
         Ask::Values(q) => (q, true),
         Ask::Columns(q) => (q, false),
@@ -434,10 +454,28 @@ impl Friendly {
             Asks::Apply(q) => q.pop_front(),
         }
     }
-    /// A query over `from`, under every WITH it is inside.
+    /// A query over `from`, under every WITH it is inside: inside a CTE, only the CTEs before it,
+    /// and itself as its first term when the WITH is recursive (its columns are that term's). Its
+    /// own definition in a probe would ask the same probe again, without end.
     fn over(&self, sql: String) -> String {
-        let ctes: Vec<String> = self.with.iter().flatten().flat_map(|w| w.cte_tables.iter().map(|c| c.to_string())).collect();
-        let recursive = self.with.iter().flatten().any(|w| w.recursive);
+        let mut ctes = vec![];
+        for (k, level) in self.with.iter().enumerate() {
+            let Some(w) = &level.with else { continue };
+            match self.with.get(k + 1).and_then(|l| l.defines) {
+                None => ctes.extend(w.cte_tables.iter().map(|c| c.to_string())),
+                Some(i) => {
+                    ctes.extend(w.cte_tables[..i].iter().map(|c| c.to_string()));
+                    if w.recursive {
+                        let mut first = &*w.cte_tables[i].query.body;
+                        while let SetExpr::SetOperation { left, .. } = first {
+                            first = left;
+                        }
+                        ctes.push(format!("{} AS ({first})", w.cte_tables[i].alias));
+                    }
+                }
+            }
+        }
+        let recursive = self.with.iter().filter_map(|l| l.with.as_ref()).any(|w| w.recursive);
         match ctes.is_empty() {
             true => sql,
             false => format!("WITH {}{} {sql}", if recursive { "RECURSIVE " } else { "" }, ctes.join(", ")),
@@ -449,7 +487,15 @@ impl VisitorMut for Friendly {
     type Break = anyhow::Error;
 
     fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<anyhow::Error> {
-        self.with.push(q.with.clone());
+        let defines = self.with.last_mut().and_then(|l| {
+            let w = l.with.as_ref()?;
+            let i = l.entered;
+            (i < w.cte_tables.len() && *w.cte_tables[i].query == *q).then(|| {
+                l.entered += 1;
+                i
+            })
+        });
+        self.with.push(Level { with: q.with.clone(), defines, entered: 0 });
         // ORDER BY ALL over `*`: how many columns the answer has
         let n = match all_of(q) == Some(true) {
             true => {

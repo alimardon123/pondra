@@ -1,6 +1,6 @@
 [project]
 name = "pondra"
-version = "0.32.0"
+version = "0.33.0"
 description = "Pondra, a streamhouse in one binary: the binary, and a Python client (SQL into pandas/Polars/Arrow, exactly-once appends, change feeds)"
 readme = "README.md"
 requires-python = ">=3.9"
