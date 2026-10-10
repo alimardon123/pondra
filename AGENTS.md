@@ -2476,7 +2476,7 @@ Known limits, in the order they matter:
     order-independent (not `avg`, `stddev`, …).
 13. **Frames and procedures** (round 22): a Python procedure starts a process per call (a warm
     pool would take the 0.15 s away) and doesn't run on a schedule yet; the JavaScript client has
-    no frame builder; `pondra run models/` (a folder of `.sql` and `.py` models in order of what
+    no frame builder; `pondra run etl/` (a folder of `.sql` and `.py` files in order of what
     reads what) is next; a `MERGE` from rows sent with a request needs the leader to receive it.
     `con.sql(query)` is lazy since round 22: it runs when its rows are asked for, each time.
 14. **Outside the lake** (round 23): another engine's table takes `INSERT`, not `UPDATE`,
@@ -2509,3 +2509,26 @@ signed packages, the docs).
   a beautiful result, scalability, power, and versatility.
 - The logo and colours come from `brand/` only; the console is extended through its registry
   (`window.pondra`), never by editing a copy of it.
+- **Every new concept is an object, a part or a pattern, and passes the checks for it**
+  (`designs/rules-for-new-kinds.md`):
+  - An **object** has a life of its own (a table, a model). It is a `Kind` in `KINDS`.
+  - A **part** lives and dies with one object (a column, a measure, a key, a link, a model's
+    version). It is a `Part` in `PARTS`, and its owner's lister yields it into `pondra.parts`.
+  - A **pattern** stores nothing and is read from objects and parts (the ontology, a flow, a
+    feature). It is a `Pattern` in `PATTERNS`, naming its listing function.
+  - Each entry carries a one-line description and other products' names for it (`also`).
+    `pondra.kinds` lists all three and the website's glossary is generated from it. `pondra.search`
+    finds all of them, by their names, descriptions and `also`.
+  - An object passes ten checks: (1) SQL's word, naming nothing else; (2) one registry entry, a
+    catalog prefix of its own, `schema.name`; (3) the same verbs, `SHOW CREATE` running again after
+    a drop, any other verb refused by name with Postgres's code; (4) its privileges asked by the one
+    check, its secret parts never shown; (5) its life cycle declared in its entry (rename, drop,
+    `UNDROP`, clone and `REFRESH`, deploy); (6) SQL at every door, a client verb only where SQL
+    can't, `register.objectKind`, a row in the doors matrix; (7) written by the leader, free when
+    unused, no service, within the bucket's limits; (8) a catalog shape older releases would misread
+    waits for the format; (9) `harness.py registry` walks it; (10) a reference page.
+  - A part takes its owner's verbs (`ALTER … ADD | DROP`, `COMMENT ON`), rights and life cycle,
+    shows in its owner's `SHOW CREATE`, and passes checks 1, 2 and 6 to 10.
+  - A pattern passes 1, 2 and 10.
+  - A plugin's entries also name their origin, live under `pl/{plugin}/`, and may not take a word
+    already used.
