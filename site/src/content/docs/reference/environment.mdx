@@ -75,6 +75,8 @@ PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 | `PONDRA_TXN_IDLE_SECS` | `600` | a transaction idle this long ends, rolled back ([Transactions](/pondra/guides/change-rows/#transactions)) |
 | `PONDRA_TRACE_PG` | unset | `1`: where each Postgres statement's time goes, on the node's stderr |
 | `PONDRA_DATABASE_IDLE_SECS` | `600` | serving a [folder of lakes](/pondra/guides/server/): a database's node with no connection open and no request on its way, that nothing has used for this long, and that has nothing left to tier, stops. The next query starts it again |
+| `PONDRA_PIN_LEASE_SECS` | `1209600` (14 days) | on a base: a branch on another server's pin that isn't renewed for this long goes, and with it what the base kept for that branch ([branches across servers](/pondra/guides/environments/#production-on-a-server-of-its-own)) |
+| `PONDRA_PIN_RENEW_SECS` | `3600` | on a branch: how often its node renews its pins in bases on other servers |
 | `PONDRA_CODEC` | `lz4` | how data files are compressed: `lz4` (fastest to read), `zstd` (smaller files), `snappy` or `none` |
 
 ## Queries across nodes

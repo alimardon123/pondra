@@ -724,8 +724,9 @@ enum Kept {
     Clear(Keys),
 }
 
-/// The format the lake's keys are sealed at: a release before it would find none.
-const SEALED: u32 = 3;
+/// The format the lake's keys are sealed at, and a branch's keys in its bases (`branch::Base`): a
+/// release before it would find none.
+pub const SEALED: u32 = 3;
 
 fn sealed(k: &Keys) -> Result<Kept> {
     let (sealed, key) = crate::ext::seal(&serde_json::to_vec(k)?)?;

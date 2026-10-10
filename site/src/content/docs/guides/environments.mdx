@@ -373,6 +373,12 @@ branch's own key. A branch can't be made while production's leader is down; one 
 still be read. A clone takes only the schemas the link's CLONE grant covers
 (`WITH (schemas = (…))` picks among them).
 
+While dev uses a branch (its own node, or a node it is attached to), it renews its pin in production
+every hour with its own key, which dev keeps sealed by its master key. Production lets go of a pin
+nobody renewed for 14 days (`PONDRA_PIN_LEASE_SECS`), so a branch whose server is gone stops holding
+production's files. Such a branch can then no longer read what production has deleted since: drop it
+and clone again.
+
 ### Protected production
 
 On a protected database, a project's objects change only by an apply. Its objects are what its last
