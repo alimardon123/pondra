@@ -575,6 +575,7 @@ async fn run() -> anyhow::Result<()> {
             tr("the sequencer");
             python::init(python);
             let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
+            learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
             if leader {
                 let (l, c) = (app.lake.clone(), app.cluster.clone()); // (beside serving, not before it: C5)
                 panics::spawn(async move {

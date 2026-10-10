@@ -1751,6 +1751,46 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    once the rest are done. With one round for all, a table with an `INTERVAL` column stopped every
    table of the lake from leaving the log. (No test makes a table's round fail now that 257 holds;
    `harness.py tiering` runs the per-table path, its `spans` table beside the others.)
+259. **A share hands out the table it names only while that table is there** (`shares::tables_moved`,
+   from `ddl::drop_table`, `rename` and `drop_view`): a rename moves the share's entry to the new
+   name, still shared under the old one; a drop takes the table out of every share in the drop's own
+   commit, so a new table under its name is shared only once it is added (Snowflake's rule). A
+   share's and a recipient's comments are `cm/share/` and `cm/recipient/` (invariant 227), which a
+   branch never takes (`branch::make`). `sharing_check.py`: "a shared table renamed: still shared
+   under its name…" and "shares and recipients in pondra.objects with their comments…".
+260. **A lake's own keys are sealed by its master key when every node shares one** (`users::Kept`,
+   `seal_keys`; ADR-058). `z/auth` (the sessions' signing key, the nodes' key) is sealed as a
+   secret's values are (`ext::seal`), at format 3: from the first write when this process made the
+   lake, otherwise by its leader once every node knows format 3 (tried each minute). A new master
+   key, with the previous one set, rewraps it. The machine's own key never seals it
+   (`ext::shared_master`): a node on another machine couldn't open it. A key that only reads the
+   bucket (a branch on another server) must sign no one in. A lake's format only moves forward
+   (`format::set`), so a made lake's mark (`raise`) never lowers what its keys moved it to.
+   `harness.py secrets`: "…sealed from its first write (format 3): nothing of them in the clear in
+   its files", "…rewraps them…" and "…sealed when its leader starts with one…".
+   `upgrade_check.py format`: the release before refuses it by name.
+261. **A node that just started signs users in from what its leader had** (`server::guard`,
+   `App::open`, `users::keys`). A follower's mirror seeded before the leader flushed its first user
+   and its keys knows neither; it waited for its commit stream, which needed those keys to open, and
+   meanwhile took the lake for open and answered anyone as an admin. It reads the lake's keys from
+   its own view when its mirror lacks them (`Catalog::from_view`; they never change once written),
+   and every door asks whether the lake is open only once the node has caught up
+   (`Lake::caught_up`, 10 s at most); the cluster's own calls and the paths that need no sign-in are
+   never held. `harness.py secrets`: "a follower that joins once users sign in … answering nothing
+   unsigned meanwhile".
+262. **The planner takes a measured share in place of its estimate only while a door's query is
+   planned, and a spread query's every node plans with its coordinator's facts alone** (`learned.rs`:
+   `planning`, `given`, `share`; `Slice::learned`; ADR-050 §3). A filter over a table that a run
+   measured counts as the share of the table's rows it kept (`optimize::size`; `learned::found` takes
+   shares of the whole table as the planner counts it, never of a scan its files' ranges pruned), and
+   a join order whose every input is so counted needs only 1.2× to be taken. Each node's copy is read
+   from the history's newer rows at most every 10 s, and only while queries are planned. A query whose
+   runs with facts were a quarter slower than without, twice in a row, has them set aside
+   (`learned::ran`). `PONDRA_LEARN=off`: a node plans with none of its own, but a slice's still. A
+   plan made anywhere else (a view, a write's query) uses none. `harness.py learn`: the order starts
+   from the filtered customers once learned, same answer, no slower; three nodes plan with the
+   coordinator's facts (a node with `PONDRA_LEARN=off` among them, fails without `Slice::learned`);
+   read back after a restart.
 
 ## Tests: run these before and after any change
 

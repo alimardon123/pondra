@@ -694,11 +694,12 @@ impl App {
             }
             Ok((out, false))
         };
-        let out = run.await;
+        let (out, used) = crate::learned::planning(query, run).await; // (planned with what runs learned, unless set aside for it)
         add(&QUERIES, 1);
         add(&QUERY_US, start.elapsed().as_micros() as u64);
         match out {
             Ok((batches, spread)) => {
+                crate::learned::ran(query, used, start.elapsed()); // (never worse: facts that made it slower twice are set aside)
                 add(&SPREAD, spread as u64);
                 crate::history::rows(batches.iter().map(|b| b.num_rows() as u64).sum());
                 Ok(batches.into_iter().map(crate::query::compact).collect()) // (an answer kept or sent holds only its own strings)

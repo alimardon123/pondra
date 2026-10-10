@@ -83,6 +83,9 @@ pub struct Slice {
     /// The tables of files outside the lake it reads (`ext.rs`), as the coordinator listed them.
     #[serde(default)]
     pub ext: Vec<(String, TableMeta)>,
+    /// The facts its coordinator planned with (`learned.rs`): every node plans with these alone.
+    #[serde(default)]
+    pub learned: crate::learned::Given,
 }
 
 impl Slice {
@@ -130,8 +133,9 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
     let mine = nodes.iter().position(|n| n == me).context("not a member")?;
     let parts = deal(lake, &meta, &main, nodes.len()).await?;
     let id = uuid::Uuid::new_v4().to_string(); // (the folder every node spills this query's results into)
+    let learned = crate::learned::of(&tables); // (the facts this plan uses, sent to every node: `learned.rs`)
     let (whole, upto) = (whole(lake, &tables, &[&main]).await?, lake.visible());
-    let slice = |parts| Slice { sql: sql.into(), parts, shuffle: None, id: id.clone(), whole: whole.clone(), upto, partitions: partitions(), ext: ext.clone() };
+    let slice = |parts| Slice { sql: sql.into(), parts, shuffle: None, id: id.clone(), whole: whole.clone(), upto, partitions: partitions(), ext: ext.clone(), learned: learned.clone() };
     let slices: Vec<Slice> = parts.into_iter().map(|p| slice(vec![p])).collect();
     let (ctx, plan) = plan(lake, &slices[mine]).await?;
     // Gather when everything below the plan's first gather splits over the nodes as it is (each
@@ -225,8 +229,9 @@ async fn writers<'a>(lake: &Lake, nodes: &'a [String], me: &str, sql: &str) -> R
     let Some(Main { tables, ext, main, meta }) = sliced(lake, nodes.len(), sql, false).await? else { return Ok(None) };
     let mine = nodes.iter().position(|n| n == me).context("not a member")?;
     let id = uuid::Uuid::new_v4().to_string();
+    let learned = crate::learned::of(&tables); // (the facts this plan uses, sent to every node: `learned.rs`)
     let (whole, upto) = (whole(lake, &tables, &[&main]).await?, lake.visible());
-    let slice = |parts| Slice { sql: sql.into(), parts, shuffle: None, id: id.clone(), whole: whole.clone(), upto, partitions: partitions(), ext: ext.clone() };
+    let slice = |parts| Slice { sql: sql.into(), parts, shuffle: None, id: id.clone(), whole: whole.clone(), upto, partitions: partitions(), ext: ext.clone(), learned: learned.clone() };
     let mut shares: Vec<(&str, Slice)> = nodes.iter().map(String::as_str).zip(deal(lake, &meta, &main, nodes.len()).await?.into_iter().map(|p| slice(vec![p]))).collect();
     let (_, plan) = plan(lake, &shares[mine].1).await?;
     let mut exchanges = vec![];
@@ -263,10 +268,10 @@ pub async fn copy(lake: &Lake, nodes: &[String], me: &str, sql: &str, target: &c
 /// This node's share of a `COPY … TO`, written: how many rows.
 pub async fn copy_share(lake: &Lake, s: &Slice, target: &crate::copy::Target) -> Result<u64> {
     crate::ext::register(lake, &target.to).await?;
-    crate::ext::scope(true, async {
+    crate::learned::given(&s.learned, crate::ext::scope(true, async {
         crate::ext::prime(lake, &s.ext).await?;
         crate::copy::write(shared(lake, s).await?.1, target).await
-    })
+    }))
     .await
 }
 
@@ -300,13 +305,13 @@ pub type Columns = Vec<(String, String)>;
 
 /// This node's share of an `INSERT`, written into the table's folder: its files.
 pub async fn insert_share(lake: &Lake, s: &Slice, table: &str, stamp: Option<crate::log::Reserved>) -> Result<(Columns, Vec<DataFile>)> {
-    crate::ext::scope(true, async {
+    crate::learned::given(&s.learned, crate::ext::scope(true, async {
         crate::ext::prime(lake, &s.ext).await?;
         let (ctx, _) = shared(lake, s).await?;
         crate::write::in_order(&ctx); // (planned again, its partitions writing in the order rows come)
         let df = crate::query::sql(&ctx, &s.sql).await?;
         crate::write::write_rows(lake, &ctx, table, df, stamp).await
-    })
+    }))
     .await
 }
 
@@ -467,7 +472,7 @@ pub fn reply(shape: &str, parts: Vec<Spill>, done: Option<crate::spill::Gone>) -
 /// The physical plan of the slice's query, its tables standing for just their parts.
 async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn ExecutionPlan>)> {
     // Files outside the lake as the coordinator listed them; it checked who may read them.
-    crate::ext::scope(true, async { crate::ext::prime(lake, &s.ext).await.and(Ok(planned(lake, s).await?)) }).await
+    crate::learned::given(&s.learned, crate::ext::scope(true, async { crate::ext::prime(lake, &s.ext).await.and(Ok(planned(lake, s).await?)) })).await
 }
 
 async fn planned(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn ExecutionPlan>)> {
@@ -595,6 +600,7 @@ static LAST: LazyLock<Mutex<Option<String>>> = LazyLock::new(Default::default);
 /// the ways after it move more). Keyed tables, and tables of attached lakes, are always read whole.
 async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tables: &[String], main: &str, guard: Option<(crate::guard::Link, u64)>) -> Result<Option<Vec<RecordBatch>>> {
     let ext = crate::ext::of(lake, tables).await?;
+    let learned = crate::learned::of(tables);
     for how in [How::Ranged, How::Broadcast, How::Partitioned, How::Sliced] {
         let upto = lake.visible();
         // Its append tables (the biggest first), as of now.
@@ -621,7 +627,7 @@ async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tabl
         let id = uuid::Uuid::new_v4().to_string();
         *LAST.lock().unwrap() = Some(id.clone());
         let shuffle = |me| Some(Shuffle { id: id.clone(), nodes: nodes.to_vec(), me, step: 0, how, splits: vec![] });
-        let mut slices: Vec<Slice> = (0..nodes.len()).map(|me| Slice { sql: sql.into(), parts: vec![], shuffle: shuffle(me), id: id.clone(), whole: vec![], upto, partitions: partitions(), ext: ext.clone() }).collect();
+        let mut slices: Vec<Slice> = (0..nodes.len()).map(|me| Slice { sql: sql.into(), parts: vec![], shuffle: shuffle(me), id: id.clone(), whole: vec![], upto, partitions: partitions(), ext: ext.clone(), learned: learned.clone() }).collect();
         for (t, meta) in &big {
             let parts = match scheme.as_ref().filter(|s| s.columns.contains_key(t)) {
                 Some(s) => crate::ranges::parts(lake, meta, t, s, nodes.len(), (meta.tiered, upto)).await?, // (every node reads the log tail through its range)
