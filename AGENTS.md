@@ -1828,6 +1828,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    CLONE ON DATABASE` names the database it runs on. `environments_check.py --across`: "a pin asked with
    the token of a user without CLONE is refused", "dev_server's token … can't drop prod's table", "a
    clone of a schema dev_server has no CLONE on is refused".
+265. **A query reads a table as of one commit, its entry and its log alike** (`Catalog::settle`,
+   `Pruned::scan`, `query::current`). A node with no in-memory catalog (an attached lake, a follower
+   between seeds) reads entries as its reader holds them now, while its log's end (`visible`) moves
+   at each refresh; so right after a query reads them, the end is brought up to them (marks only:
+   pruning and seeding stay `refresh`'s, invariant 8). A scan then fixes its log's end before asking
+   whether a table its entry says never changed has a `{t}$deleted` now (a change makes it in or
+   before its commit), and the old rows it leaves out are those up to that same end. With the end
+   behind the entries an attached lake's changed row went missing (336 of 607 reads on main
+   2801b4d); with an entry read before a table's first UPDATE and its log read past it, a leader too
+   kept both versions. `harness.py attached` (55 wrong reads on 0.33.0).
 
 ## Tests: run these before and after any change
 
