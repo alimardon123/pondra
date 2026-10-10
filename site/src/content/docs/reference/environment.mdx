@@ -35,7 +35,7 @@ A number that is left unset, or set to something that is not a number, takes its
 | `PONDRA_HISTORY_RATE` | `500` | at most this many rows a second a node in `pondra.history`; past it, fast statements that went well are counted in one row (`class = 'skipped'`). Slow and failed ones are always written |
 | `PONDRA_HISTORY_DAYS` | `7` | how many days `pondra.history` keeps. Read when it is first made |
 | `PONDRA_SLOW_MS` | `1000` | a statement this slow keeps its plan and trace in `pondra.history` and writes a line to the node's log |
-| `PONDRA_LEARN_MS` | `100` | a query this slow notes in `pondra.history` how far its joins' rows were from what was expected (`misestimate`); ten times off, it keeps its plan too |
+| `PONDRA_LEARN_MS` | `100` | a query this slow notes in `pondra.history` how far its joins' rows were from what was expected (`misestimate`), ten times off keeping its plan too, and the filters it found 2× or more off (`learned`, `pondra.learned`) |
 | `PONDRA_USER_QUERIES` | none | how many statements a user without its own `MAX_QUERIES` runs at once on a node ([quotas](/pondra/guides/security/#quotas)) |
 | `PONDRA_USER_TIMEOUT` | none | how many seconds a statement of a user without its own `STATEMENT_TIMEOUT` may run |
 

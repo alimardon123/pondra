@@ -288,6 +288,14 @@ SELECT fingerprint, count(*) AS runs, avg(ms) AS ms, max(misestimate) AS worst
 FROM pondra.history WHERE outcome = 'ok' GROUP BY fingerprint ORDER BY ms DESC LIMIT 5;
 ```
 
+A query of 100 ms or more also notes each filter on a table that kept far more or far fewer of its
+rows than the planner expected, such as two conditions that go together (every Paris customer is in
+France). `pondra.learned` lists what the lake has learned so, each as last seen:
+
+```sql
+SELECT object, about, expected, actual, runs FROM pondra.learned;
+```
+
 ## Queries across several nodes
 
 With several nodes on one lake, a query over a big table runs on all of them: each node reads its share
