@@ -1807,6 +1807,22 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    equal node without; the bar run's plan among its runs; three nodes plan with the coordinator's
    facts (a node with `PONDRA_LEARN=off` among them, fails without `Slice::learned`); read back after a
    restart.
+263. **A lake attached READ_ONLY is read with its own key and written by nothing here** (`store::Reach`,
+   `ReadOnly`, `write::across`; ADR-058). Its store is built from the secret whose scope covers its URL
+   (`ext::reach`) and wrapped so every put, copy and delete fails by name. `write::deliver` sends it only
+   a branch's pin or unpin, to its leader at ENDPOINT, with a TYPE pondra secret's token or the branch's
+   own `pb_` key, never this server's key or its user's token. Nothing here claims its term, writes its
+   inbox or leads it for a moment. A branch of it keeps that key in its own catalog (`Make.secrets`) and
+   none of its users. It is read here by whoever may use that secret (`users::across`).
+   `environments_check.py --across`: the gate in front of the base's bucket counts no write, and "a write
+   to the attachment is refused by name".
+264. **CLONE pins a branch and does nothing else, and a clone takes only the schemas it covers**
+   (`users::Access::clones`, `server::guard`, `branch::cloning`, `branch::pin`'s `schemas`). A principal
+   below admin that holds CLONE reaches `/cluster/ddl` for a Pin only. The pin's answer names the schemas
+   its grant covers, and the clone refuses others before anything is made, letting the pin go. `GRANT
+   CLONE ON DATABASE` names the database it runs on. `environments_check.py --across`: "a pin asked with
+   the token of a user without CLONE is refused", "dev_server's token … can't drop prod's table", "a
+   clone of a schema dev_server has no CLONE on is refused".
 
 ## Tests: run these before and after any change
 
