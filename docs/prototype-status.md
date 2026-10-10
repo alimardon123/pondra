@@ -23,7 +23,10 @@ whole); windows as SQL with `EMIT FINAL`; `INSERT … SELECT` written by every n
 (`EXPLAIN`'s expected rows, `pondra.learned`); vector search as fast as DuckDB's; task graphs; every
 statement in `pondra.history`. The 24-hour soak's first leg on R2 (4.8 hours, eight nodes stopped or
 killed): 43,138 batches each once, 0 torn reads of 423,085; a node's memory grew 2–5 MB a minute
-under steady writes, which round 35 takes. Gates: `logs/gates/README.md`, 2026-10-10. What a user
+under steady writes, which round 35 takes. The gates found three bugs before the tag, all fixed: a
+`WITH RECURSIVE` whose friendly probe asked itself until the node died; a table with an `INTERVAL`
+column that never left the log and held every other table's tiering with it (invariants 257–258);
+and `EXPLAIN (ANALYZE, FORMAT PGJSON)` refused. Gates: `logs/gates/README.md`, 2026-10-10. What a user
 sees is in `.github/release.md`; each change's checks in its pull request.
 
 **Begun (2026-10-03, round 34): SQL as people write it.** DuckDB's spellings, rewritten where SQL
