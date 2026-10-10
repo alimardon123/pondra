@@ -28,6 +28,11 @@ pub struct Bases {
     pub at_ms: u64,    // when
     pub me: String,    // its own place, as its bases' pins name it
     pub lakes: BTreeMap<String, Base>,
+    // (what it was made with, for `SHOW CREATE DATABASE`: the registry's)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schemas: Vec<String>,
+    #[serde(default = "yes")]
+    pub data: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -297,7 +302,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     futures::stream::iter(objects).map(|p| copy(&base, lake, p)).buffer_unordered(16).try_collect::<Vec<_>>().await?;
     puts.push(("n".into(), json(&next.max(lake.cat.get::<u64>("n").await?.unwrap_or(0)))));
     puts.push(("b".into(), json(&block.max(lake.cat.get::<u64>("b").await?.unwrap_or(0)))));
-    let me = Bases { base: m.base.clone(), at_ms: crate::log::now_ms(), me: m.me.clone(), lakes: m.lakes.clone() };
+    let me = Bases { base: m.base.clone(), at_ms: crate::log::now_ms(), me: m.me.clone(), lakes: m.lakes.clone(), schemas: m.schemas.clone(), data: m.data };
     puts.push((BASES.into(), json(&me)));
     lake.cat.start_after(commit).await;
     lake.cat.commit(puts, &[]).await?;

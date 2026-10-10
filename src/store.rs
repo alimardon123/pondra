@@ -147,6 +147,10 @@ pub struct TableMeta {
     /// reads give each its `__start_at` and `__end_at` (`views::history_view`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<crate::views::History>,
+    /// A GROUP BY view's table whose answers need a last step (avg, stddev, HAVING, …: ADR-055):
+    /// its columns are what adds up, and reads give the view's columns from them (`finish.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<crate::finish::Finish>,
     /// `retention = '7 days'` (ADR-043): how long the table's past is kept (`ddl::KEEP_MS` when not
     /// set): read `AT (…)` (`past.rs`), and undropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -215,6 +219,15 @@ impl TableMeta {
             names: BTreeMap::new(),
             dropped: vec![],
             ..self.clone()
+        }
+    }
+
+    /// The table as its readers see it, to describe it (listings, `pg_catalog`, MCP): `logical`, but
+    /// a view that finishes its answers (`finish.rs`) shows the columns it answers, not its partial ones.
+    pub fn described(&self) -> TableMeta {
+        match &self.finish {
+            Some(f) => TableMeta { columns: f.columns.clone(), merge: BTreeMap::new(), ..self.logical() },
+            None => self.logical(),
         }
     }
 
@@ -901,6 +914,7 @@ impl Lake {
         crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
         crate::asof::register(&ctx); // (ASOF JOIN's marker)
         crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
+        crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
         crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
         crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
         ctx
