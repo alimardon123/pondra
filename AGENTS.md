@@ -83,7 +83,11 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           identity columns: invariant 234), index.rs (indexes kept as objects: invariant 235),
           constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236),
           types.rs (enum types: invariant 242), and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
-          237–239)
+          237–239); learned.rs (what a run learned about its filters, ADR-050: invariant 244);
+          environments (ADR-047): branch.rs (`CREATE DATABASE dev CLONE prod`, REFRESH: invariant
+          245), deploy.rs (plan, deploy, test and export: a project made true in a database;
+          `pondra.deploys`: invariants 246–250), project.rs (the command line's project commands) and
+          sync.rs (`pondra workspace pull | push`)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -643,7 +647,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    this machine's files for whoever asks".
 62. **A node never leads another lake in its own process** (`inbox::lead_once`): a write to an
    attached lake nobody leads, `CREATE DATABASE` and `ATTACH` of a new folder go through a `pondra
-   sql` of their own, which leads for a moment and ends. That lake's catalog writer would
+   lead` of their own (hidden), which leads for a moment, once, and ends. That lake's catalog writer would
    otherwise stay open in the node, and its next leader would fence it. (No test catches the
    stray writer yet; `smoke.py`'s `CREATE DATABASE` and `harness.py changes` run the path.)
 63. **DataFusion settings that have their own switches are changed through `set`**
@@ -1633,6 +1637,50 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    to every table using the type in the type's own commit; a label is never renamed or taken away,
    since files are never rewritten. Casts to a type and `enum_range` become text where SQL comes in
    (`types::rewrite`, after the macros). (240–241 are the grant fix's.) `harness.py enums`.
+243. **A statement's history says what it ran, and its path pays nothing for it** (`history.rs`,
+   ADR-050): its fingerprint and the tables it read and wrote are worked out by the node's writer
+   from the statement as sent; its plan's shape and the commit it read at are noted as it runs; how
+   far its joins were from what was expected only for queries of `PONDRA_LEARN_MS` or more. A plan
+   shown or kept carries each operator's `expected_rows` before its metrics, which stay last (the
+   console reads them there). The history table grows columns only at its end, and a lake's history
+   made before gets them (`create_log`). `harness.py plans`.
+244. **What a run learned is a part of its history row, and only what it can vouch for**
+   (`learned.rs`, ADR-050): a query of `PONDRA_LEARN_MS` or more keeps each filter on a table 2× or
+   more off over 1,000 rows or more, named by its table and `learned::about` (the same text from the
+   logical plan and the running one). A filter that a join's dynamic filter, a top-N, a min/max or a
+   limit may have cut as it ran teaches nothing. `pondra.learned` reads the history the caller may
+   read and is never a remembered answer. `harness.py plans`.
+245. **A refresh brings a branch's tables to one snapshot of its base, with everything that follows
+   them, in one commit, and numbers what comes after past the base** (`branch::refresh`: the pin, the
+   closure of following views, `tier::fold_into` for the base's log tail, `Flush.blocks`).
+   `environments_check.py`: "ALTER DATABASE dev REFRESH t: t and its view as prod has them now",
+   "…what dev writes after it is newer: an upsert wins through tiering, row ids stay unique, prod
+   unchanged".
+246. **A deploy applies the plan it showed, one at a time per database** (`deploy::ask`: the plan's id
+   is a hash of its steps; `dl` held and kept fresh while it runs, stale after 120 s; each statement
+   under the job part `deploy:{project}:{n}:…`). `project_check.py`: "a plan shown before someone
+   else deployed: refused, plan again", "deployed again: nothing to change".
+247. **An object has one owner, and a table changes in place only in ways that keep its rows**
+   (`deploy::plan`: owners from deploys that succeeded; `table_change`: columns added at the end,
+   widened types, options; a rename, drop, move, key or partition change is refused with the
+   migration to write and the views that read it, `ddl::readers`). `project_check.py`: "another
+   project declaring this one's view: refused, naming its owner", "a renamed column: refused, saying
+   the migration and what reads it".
+248. **A migration runs once in each database, after what a deploy adds and before what it replaces**
+   (`dm/{project}/{file}`, committed after it runs; the rest of the plan is made again after the
+   migrations, `plan_again`). `project_check.py`: "a renamed column: … with it, deployed, the views
+   made again".
+249. **A fingerprint never holds a secret** (`deploy::fingerprint`: a secret's value as
+   `secret:<sha256>`); secrets are never exported.
+250. **Shares and recipients are each database's own** (`branch::make` leaves `sh/` and `sr/` out;
+   REFRESH copies only tables and what follows them; plan and export never list them;
+   `deploy::head` refuses `CREATE SHARE`, `CREATE RECIPIENT` and `GRANT … ON SHARE` in `objects/`).
+   `environments_check.py`: "…and no REFRESH brings prod's shares or recipients…";
+   `project_check.py`: "prod's shares and recipients: never in a plan, even pruning…".
+251. **A rollup's keys are its GROUP BY view's keys, and the columns they determine**
+   (`views::merges`: DataFusion groups a merge table read with partial rows by the columns its key
+   determines too). `harness.py flows`: "a rollup by all of a GROUP BY view's keys, made while rows
+   stream in".
 
 ## Tests: run these before and after any change
 
@@ -1646,6 +1694,8 @@ python3 tools/resilience_check.py [storage cutoff clients doors disk cache serve
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
 python3 tools/soak.py --minutes 10 [--hours 24] [--s3]                   # C4: steady ingest, nodes stopped and killed, memory, the log, commits on a timeline
 python3 tools/sharing_check.py [--s3]   # shares read by the delta-sharing client (its own venv: it pins pandas < 3) and another Pondra == the provider's rows; refusals; the audit log
+python3 tools/environments_check.py [--s3]   # CREATE DATABASE dev CLONE prod: no file copied, ids kept, writes apart, prod's merges and purges under it, REFRESH, DROP lets go
+python3 tools/project_check.py          # pondra init, plan, deploy, test, export, branch, diff against a lakes server: migrations once, drift, renames refused, a failed test, a stale plan, one owner per object
 python3 tools/history_check.py   # DROP/UNDROP, retention, PURGE, Delta; AT (VERSION | TIMESTAMP | OFFSET) == a model of 13 states; RESTORE; CLONE (no copy, apart, merges and drops); refusals
 python3 tools/deploy_check.py                  # the image and compose; add python, chart, helm (kind), service: deploy.yml runs them all
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
@@ -1657,6 +1707,7 @@ python3 tools/harness.py pace           # a writer's acks beside 64 querying cli
 python3 tools/harness.py tails          # a table's log tail kept between queries: reads == a model while rows land, a transaction's snapshot, a column added, tiering
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
+python3 tools/harness.py plans          # EXPLAIN's expected rows, history's fingerprint, plan_id, version, reads, writes, misestimate; what a run learned and pondra.learned
 python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
 python3 tools/harness.py sequences      # nextval on three nodes (every value once), identity columns from every door, ALWAYS, owned sequences, a leader's kill
 python3 tools/harness.py enums          # CREATE TYPE … AS ENUM and ENUM('a', 'b') columns: labels from every door (22P02), casts, enum_range, ADD VALUE, RENAME, DROP while used
