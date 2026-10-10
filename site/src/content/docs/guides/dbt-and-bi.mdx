@@ -19,9 +19,9 @@ pondra serve lake --pg 0.0.0.0:5432 --admin-token "$TOKEN"
 |---|---|
 | Host, port | the node's `--pg` address, such as `host:5432` |
 | Database | the lake's name (the folder's, such as `lake`), or a database of a [folder of lakes](/pondra/guides/server/) |
-| User | `admin`, `writer` or `reader`: which token the password is |
-| Password | that token (a node with no tokens takes any password) |
-| SSL | off: the port doesn't speak TLS yet |
+| User | `admin`, `writer` or `reader`: which token the password is; or a user made with `CREATE USER` |
+| Password | that token, or the user's password (a node with no tokens or users takes any password) |
+| SSL | `require` when the node has a certificate ([TLS](/pondra/guides/security/#tls)); otherwise off |
 
 ## What is tested
 
@@ -85,8 +85,8 @@ Iceberg](/pondra/guides/other-engines/), queried over HTTP, or kept current with
 1. **Start the node** with `--pg`, as above. For a tool on another machine, give the node a token
    (`--read-token` is enough for dashboards) and listen on an address the tool can reach.
 
-2. **Add a PostgreSQL connection** in the tool, with the settings in the table at the top. Turn SSL
-   off, or set it to *prefer* or *allow*.
+2. **Add a PostgreSQL connection** in the tool, with the settings in the table at the top. Set SSL
+   to *require* when the node has a certificate, and off, *prefer* or *allow* when it hasn't.
 
 3. **Browse and query.** The tool lists the lake's schemas, tables, views and columns, with
    Postgres's type names (`bigint`, `character varying`, `timestamp with time zone`, arrays as
@@ -114,7 +114,6 @@ Objects get stable ids (`oid`s), so a tool that caches them finds the same table
 restart.
 
 <Aside type="caution" title="Limits">
-- **No TLS on the Postgres port yet** (planned). Keep it on a private network, or behind a tunnel.
 - **Power BI Desktop itself** runs only on Windows, so it isn't run here. Its PostgreSQL connector
   talks through Npgsql 4.0, and its ODBC connector through psqlODBC: both are tested.
 - **Indexes:** a keyed table's primary key shows as an index. Pondra has no other indexes: it finds

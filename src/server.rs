@@ -378,7 +378,8 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     };
     let who = match signed {
         Some(p) => p,
-        None if owner(req.headers()) || app.open().await => crate::auth::Principal::of(crate::auth::Role::Admin),
+        None if owner(req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
+        None if app.open().await => crate::auth::Principal::of(crate::auth::Role::Admin),
         None if header.is_some() => {
             crate::audit::refused(&app, &basic_user(header.as_deref()), "http", from, &format!("{} {}", req.method(), req.uri().path()), "wrong token, or user name and password");
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
@@ -803,7 +804,8 @@ impl App {
         match &self.seq {
             Some(seq) => {
                 crate::views::fill_all(&self.lake, seq, self.log()?, &self.lock).await?; // (the leader: views filled from the rows already there)
-                crate::views::join_all(&self.lake, self.log()?).await // (and stream joins)
+                crate::views::join_all(&self.lake, self.log()?).await?; // (and stream joins)
+                crate::rerun::run_all(&self.lake, seq, &self.lock).await // (and views kept by key: each in a task of its own)
             }
             None => Ok(()),
         }

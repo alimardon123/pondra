@@ -558,6 +558,11 @@ async fn member(lake: &Lake, who: &str, role: &str, depth: usize) -> Result<bool
     Ok(false)
 }
 
+/// Is there a table or view `n` in `lake`?
+async fn there(lake: &Lake, n: &str) -> Result<bool> {
+    Ok(lake.cat.get::<Value>(&crate::store::table_key(n)).await?.is_some() || lake.cat.get::<Value>(&crate::ddl::query_key(n)).await?.is_some())
+}
+
 /// What a grant is on, named as the catalog names it, and there.
 async fn resolved(lake: &Lake, on: On) -> Result<On> {
     let here = crate::ddl::lake_name(lake);
@@ -572,8 +577,12 @@ async fn resolved(lake: &Lake, on: On) -> Result<On> {
     Ok(match on {
         On::Table(n) => {
             let n = strip(&n);
-            let exists = lake.cat.get::<Value>(&crate::store::table_key(&n)).await?.is_some() || lake.cat.get::<Value>(&crate::ddl::query_key(&n)).await?.is_some();
-            ensure!(exists, "no table or view {n}");
+            if let Ok((Some(other), local)) = crate::ddl::resolve(lake, &n).await {
+                // (another database's table, `l.t`: what its own sign-in lets through, this grant narrows: `across`)
+                ensure!(there(&other, &local).await?, "no table or view {n}");
+                return Ok(On::Table(format!("{}.{local}", n.split('.').next().unwrap_or_default())));
+            }
+            ensure!(there(lake, &n).await?, "no table or view {n}");
             On::Table(n)
         }
         On::Schema(s) => {
@@ -793,6 +802,18 @@ impl Access {
         some.map(Some)
     }
     pub fn may(&self, privilege: &str, table: &str) -> bool { self.columns(privilege, table).is_some() }
+    /// The same, for a table of another lake attached here (`l.t`, `l.s.t`): only grants naming
+    /// it count; ON ALL TABLES and ON SCHEMA are this lake's.
+    pub fn named(&self, privilege: &str, table: &str) -> Option<Option<HashSet<String>>> {
+        let mut some: Option<HashSet<String>> = None;
+        for g in self.grants.iter().filter(|g| g.privilege == privilege && g.on == On::Table(table.to_string())) {
+            if g.columns.is_empty() {
+                return Some(None);
+            }
+            some.get_or_insert_with(HashSet::new).extend(g.columns.iter().cloned());
+        }
+        some.map(Some)
+    }
     pub fn secret(&self, name: &str) -> bool { self.grants.iter().any(|g| g.privilege == "usage" && g.on == On::Secret(name.to_string())) }
     fn writes(&self) -> bool { self.grants.iter().any(|g| ["insert", "update", "delete"].contains(&g.privilege.as_str())) }
 }
@@ -836,7 +857,7 @@ pub async fn principal(lake: &Lake, user: &str) -> Result<Principal> {
         }
     };
     let role = if superuser { Role::Admin } else if access.writes() { Role::Write } else { Role::Read };
-    Ok(Principal { name: user.to_string(), role, access: (!superuser).then_some(access), door: "node", from: None })
+    Ok(Principal { name: user.to_string(), role, access: (!superuser).then_some(access), door: "node", from: None, operator: false })
 }
 
 /// Seconds as said: `90 seconds`, `5 minutes`, `1 hour`.
@@ -893,6 +914,31 @@ fn fresh(lake: &Lake, now: Option<u64>, then: Option<u64>, at: std::time::Instan
     (lake.cat.is_writer() && now.is_some() && now == then) || at.elapsed() < std::time::Duration::from_secs(1)
 }
 
+/// May the request being served read or write the tables of `other`, a lake attached here as `ns`?
+/// Refused, saying why, when that lake has a sign-in of its own (a user who signs in, or the node's
+/// tokens) and the request isn't from whoever runs the nodes (`auth::operator`): a user signed in
+/// here is nobody there, and a database nothing locks opens nothing of another (the lake server's
+/// databases attach each other). A user granted some tables needs a grant naming the other lake's
+/// table besides (`Access::named`).
+pub async fn across(other: &Lake, ns: &str) -> Result<()> {
+    if crate::auth::operator() || !(crate::auth::tokens_on() || any(other).await) {
+        return Ok(());
+    }
+    bail!("permission denied: {ns} signs in on its own: its tables are read and written through it (the database {ns}), or with one of the nodes' tokens")
+}
+
+/// The same for a write to `table` of that lake (its name there), and, for a user granted some
+/// tables, a grant naming it for each privilege the write needs.
+pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::write::Stmt) -> Result<()> {
+    across(other, ns).await?;
+    let Some(a) = crate::auth::limited() else { return Ok(()) };
+    let (table, privileges) = (format!("{ns}.{table}"), crate::auth::needs(stmt).1);
+    match privileges.iter().find(|p| a.named(p, &table).is_none()) {
+        Some(p) => bail!("permission denied: {} on {table}, another database's table: GRANT {} ON {table} TO … (ON ALL TABLES and ON SCHEMA are this database's)", p.to_uppercase(), p.to_uppercase()),
+        None => Ok(()),
+    }
+}
+
 static ANY: LazyLock<Mutex<HashMap<String, (Option<u64>, std::time::Instant, bool)>>> = LazyLock::new(Default::default);
 
 /// Does the lake have a user who signs in (a password or a token)? Then a request with nothing
@@ -917,10 +963,10 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) ->
         }
         let role = auth.token_role(token);
         if role > Role::None {
-            return Some(Principal::of(role));
+            return Some(Principal::token(role));
         }
         if token.starts_with("pn_") && keys(lake).await.is_ok_and(|k| k.node == token) {
-            return Some(Principal::of(Role::Admin));
+            return Some(Principal::token(Role::Admin));
         }
         let user = if token.starts_with("ps_") { session_user(lake, token).await? } else { token_user(lake, token).await? };
         return principal(lake, &user).await.ok();
@@ -935,7 +981,7 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) ->
 pub async fn sign_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Option<Principal> {
     if BUILT_IN.contains(&user) {
         let role = auth.token_role(password);
-        return (role > Role::None && auth.token_for(user).as_deref() == Some(password)).then(|| Principal::of(role));
+        return (role > Role::None && auth.token_for(user).as_deref() == Some(password)).then(|| Principal::token(role));
     }
     let ok = match password.starts_with("pt_") {
         true => token_user(lake, password).await.as_deref() == Some(user),

@@ -66,11 +66,78 @@ A view of a filter or a projection also follows an `UPDATE` or `DELETE` of its t
 changes is changed in the view, and a row that no longer matches leaves it (see
 [Change rows](/pondra/guides/change-rows/#views-follow)).
 
+A grouped view takes the aggregates you would write by hand: `count`, `sum`, `avg`, `min`, `max`,
+`stddev` and `variance` (and their `_samp` and `_pop` forms), `bool_and` and `bool_or`, any
+expression over them, `HAVING`, and `ORDER BY … LIMIT`. Its table keeps running totals as rows
+arrive (sums, counts, and a variance's moments), and each read works the answers out from them, so
+they are as current as the rows:
+
+```sql
+CREATE MATERIALIZED VIEW IF NOT EXISTS habits AS
+  SELECT user, count(*) AS n, avg(amount) AS mean, stddev_pop(amount) AS spread
+  FROM clicks GROUP BY user HAVING count(*) > 1;
+SELECT * FROM habits;
+```
+
+```text
+user  n  mean  spread
+ann   3  3.0   1.632993161855452
+```
+
+### Medians and distinct counts: kept by key
+
+`count(DISTINCT …)`, `median`, percentiles, `string_agg` and `array_agg` need every row of a group,
+not running totals. A view of them is **kept by key**: after each commit, the groups its rows
+touched are worked out again from the table, and only those. Nothing is held in memory, and a
+write costs a read of its own groups' rows, not of the table.
+
+```sql
+CREATE MATERIALIZED VIEW IF NOT EXISTS reach AS
+  SELECT page, count(DISTINCT user) AS users, median(amount) AS typical
+  FROM clicks GROUP BY page;
+SELECT * FROM reach ORDER BY page;
+```
+
+```text
+page      users  typical
+cart      1      3.0
+checkout  1      5.0
+home      2      1.5
+```
+
+Such a view is current a moment after the commit, not in it: read the table when you need the
+answer as of your own write. `WITH (lag = '1 minute')` works it out at most once a minute, and
+`WITH (refresh = 'by key')` keeps any grouped view this way. It reads one table, with no join or
+subquery, and groups by columns it selects.
+
+### Anything else: run whole
+
+Every other query is a materialized view too: a top N (`ORDER BY … LIMIT`), a window function,
+`DISTINCT`, a subquery over its own table, a median across a join, or a filter on `now()`. Its query
+runs whole again after a commit changes a table it reads, at most so often that its runs take a
+tenth of the time (a query of 50 ms is current within half a second; one of 10 s, within 100 s).
+A view that calls `now()`, or reads another lake or files, also runs every minute, or every `lag`.
+
+```sql
+CREATE MATERIALIZED VIEW IF NOT EXISTS biggest AS
+  SELECT user, page, amount FROM clicks ORDER BY amount DESC LIMIT 2;
+SELECT * FROM biggest ORDER BY amount DESC;
+```
+
+```text
+user  page      amount
+ann   checkout  5
+ann   cart      3
+```
+
+A row that comes out the same stays as it is, so the view's [change feed](/pondra/guides/change-rows/)
+shows only what moved. `pondra.flows` says how each view is kept (`refresh`: `incremental`,
+`by key` or `full`), why (`reason`), and which tables it follows. `WITH (refresh = 'full')` runs any
+view this way; `WITH (refresh = 'incremental')` refuses a view the rows alone can't keep.
+
 <Aside type="caution">
-A grouped view keeps `sum`, `count`, `min` and `max`. `avg` and `count(DISTINCT …)` are refused,
-because they can't be combined from partial results: keep `sum` and `count` and divide when you
-read. A view that keeps a `min` or `max`, joins another table, or is a window, session or stream
-join can't take a row back, so an `UPDATE` or `DELETE` on its source is refused while it exists.
+A view that keeps a `min` or `max`, joins another table, or is a window, session or stream join
+can't take a row back, so an `UPDATE` or `DELETE` on its source is refused while it exists.
 `DROP MATERIALIZED VIEW name` first, or change a copy of the table. To change a view's query,
 `CREATE OR REPLACE MATERIALIZED VIEW` makes it again from the rows already there. A materialized
 view may follow another, in the same commit: see [Flows](/pondra/guides/flows/).

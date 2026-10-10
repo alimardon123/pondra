@@ -29,7 +29,7 @@ pub struct Kind {
 const RELATION: &[&str] = &["CREATE", "CREATE OR ALTER", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"];
 pub static KINDS: &[Kind] = &[
     Kind { name: "schema", family: "schema", verbs: &["CREATE", "DROP", "COMMENT ON", "SHOW CREATE"] },
-    Kind { name: "table", family: "relation", verbs: &["CREATE", "CREATE OR ALTER", "CREATE OR REPLACE", "ALTER", "DROP", "UNDROP", "COMMENT ON", "SHOW CREATE"] },
+    Kind { name: "table", family: "relation", verbs: &["CREATE", "CREATE OR ALTER", "CREATE OR REPLACE", "ALTER", "DROP", "UNDROP", "CLONE", "COMMENT ON", "SHOW CREATE"] },
     Kind { name: "view", family: "relation", verbs: RELATION },
     Kind { name: "materialized view", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"] },
     Kind { name: "external table", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON"] },
@@ -44,7 +44,7 @@ pub static KINDS: &[Kind] = &[
     Kind { name: "secret", family: "secret", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON"] },
     Kind { name: "user", family: "user", verbs: &["CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COMMENT ON"] },
     Kind { name: "role", family: "user", verbs: &["CREATE", "DROP", "GRANT", "REVOKE", "COMMENT ON", "SHOW CREATE"] },
-    Kind { name: "database", family: "database", verbs: &["CREATE", "ATTACH", "DETACH", "DROP", "COMMENT ON", "SHOW CREATE"] },
+    Kind { name: "database", family: "database", verbs: &["CREATE", "CLONE", "ATTACH", "DETACH", "DROP", "COMMENT ON", "SHOW CREATE"] },
 ];
 
 fn kind(name: &str) -> Option<&'static Kind> { KINDS.iter().find(|k| k.name == name) }
@@ -243,14 +243,36 @@ fn users(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
 fn databases(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
     Box::pin(async move {
         let here = crate::ddl::lake_name(lake);
-        let mut all: Vec<Object> = lake.cat.scan::<crate::ddl::Attachment>("a/", "a0").await?.into_iter()
-            .map(|(k, a)| Object::new("database", &here, &k[2..], Some(format!("ATTACH {} AS {}", literal(&a.dir), ident(&k[2..]))))).collect();
+        let mut all = vec![];
+        for (k, a) in lake.cat.scan::<crate::ddl::Attachment>("a/", "a0").await? {
+            let made = branched(lake, &k[2..], &a.dir).await.unwrap_or_else(|| format!("ATTACH {} AS {}", literal(&a.dir), ident(&k[2..])));
+            all.push(Object::new("database", &here, &k[2..], Some(made)));
+        }
         for (n, a) in crate::ext::attached(lake).await? {
             let options: String = a.options.iter().map(|(k, v)| format!(", {} {}", k.to_uppercase(), literal(v))).collect();
             all.push(Object::new("database", &here, &n, Some(format!("ATTACH {} AS {} (TYPE {}{options})", literal(&a.url), ident(&n), a.kind))));
         }
         Ok(all)
     })
+}
+
+/// A branch is made by the clone that made it (ADR-047), never by its `ATTACH`: `DROP DATABASE`
+/// deletes a branch, so there would be nothing left to attach.
+async fn branched(lake: &Lake, name: &str, dir: &str) -> Option<String> {
+    let lakes = lake.attached.read().unwrap().clone();
+    let branch = lakes.iter().find(|(n, _)| n == name)?.1.cat.get::<crate::branch::Bases>(crate::branch::BASES).await.ok()??;
+    let base = match branch.base == lake.url {
+        true => crate::ddl::lake_name(lake),
+        false => lakes.iter().find(|(_, l)| l.url == branch.base)?.0.clone(), // (a base not attached here can't be named)
+    };
+    let beside = crate::ddl::full(&crate::ddl::beside(&lake.url, name)).ok();
+    let location = if beside.as_deref() == Some(dir) { String::new() } else { format!(" LOCATION {}", literal(dir)) };
+    let schemas = match branch.schemas.is_empty() {
+        true => String::new(),
+        false => format!(" WITH (schemas = ({}))", branch.schemas.iter().map(|s| ident(s)).collect::<Vec<_>>().join(", ")),
+    };
+    let data = if branch.data { "" } else { " WITH NO DATA" };
+    Some(format!("CREATE DATABASE {}{location} CLONE {}{schemas}{data}", ident(name), ident(&base)))
 }
 
 // ---------------------------------------------------------------- definitions
@@ -391,9 +413,14 @@ pub(crate) fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<
     if let Some(h) = meta.and_then(|m| m.history.as_ref()) {
         with.push(format!("history = {}, sequence_by = {}", literal(&h.key.join(", ")), literal(&h.sequence_by)));
     }
+    if let Some(b) = v.rerun.as_ref().filter(|b| b.asked) {
+        // (chosen, it is chosen again from the query; asked for, it is asked for again)
+        with.push(format!("refresh = '{}'", if b.full.is_some() { "full" } else { "by key" }));
+        with.extend(b.lag_secs.map(|s| format!("lag = '{s} seconds'")));
+    }
     let expect = if expect.is_empty() { String::new() } else { format!(" (\n  {}\n)", expect.join(",\n  ")) };
     let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
-    format!("CREATE MATERIALIZED VIEW {name}{expect}{with} AS\n{}", v.sql)
+    format!("CREATE MATERIALIZED VIEW {name}{expect}{with} AS\n{}", v.query())
 }
 
 /// `CREATE FUNCTION`, `CREATE MACRO` or `CREATE PROCEDURE`, in the form it was made in.

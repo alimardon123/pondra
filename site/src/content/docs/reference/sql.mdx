@@ -906,7 +906,7 @@ words for being listed, described and made again.
 | Statement | Meaning |
 |---|---|
 | `SELECT … FROM pondra.objects` | every object, of every kind: `kind`, `lake`, `schema`, `name`, `comment`, and `definition`, the statements that make it again ([system tables](/pondra/reference/system-columns/#every-object)) |
-| `SHOW CREATE TABLE t` (or `VIEW`, `MATERIALIZED VIEW`, `SEQUENCE`, `FUNCTION`, `PROCEDURE`, `TASK`, `SCHEMA`, `ROLE`, `DATABASE`) | the statements that make it again, its comments included, as one `definition` |
+| `SHOW CREATE TABLE t` (or `VIEW`, `MATERIALIZED VIEW`, `SEQUENCE`, `FUNCTION`, `PROCEDURE`, `TASK`, `SCHEMA`, `ROLE`, `DATABASE`) | the statements that make it again, its comments included, as one `definition`; a branch's is the `CREATE DATABASE … CLONE` that made it, of its base as the base is then |
 | `COMMENT ON TABLE t IS 'text'` | describe it; any kind above, `COLUMN t.c` too, and `IS NULL` takes it away. A comment follows a rename and goes with a drop |
 | `COMMENT IF EXISTS ON TABLE t IS 'text'` | the same, and nothing if `t` isn't there |
 | `CREATE OR ALTER TABLE t (…) [layout clauses] [WITH (…)]` | make `t`, or bring the one there to this definition without losing a row: columns added at the end, types widened, the layout and options set as written (one left out goes back to its default). A column taken away, moved or narrowed, and a changed key, partition, `NOT NULL`, `DEFAULT` or `CHECK`, is refused, saying which |
@@ -989,7 +989,6 @@ Pondra refuses these by name, so a statement never runs and quietly does somethi
 | `CREATE UNIQUE INDEX` on an expression, or with `WHERE` or `INCLUDE`; `CREATE INDEX … USING hnsw \| ivfflat \| bm25` | refused by name ([Indexes](#indexes): a unique index on columns is a `UNIQUE` constraint; any other index is kept, nothing is built) |
 | `SAVEPOINT`, `ROLLBACK TO` | refused: a transaction commits or rolls back whole |
 | `CREATE`, `ALTER`, `DROP` inside `BEGIN` … `COMMIT` | refused (`0A000`): run them outside the transaction |
-| a materialized view of a `GROUP BY` view that isn't a rollup | refused, saying why ([Flows](/pondra/guides/flows/)) |
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |
 | Python functions and procedures on a node started without `--python` | refused, with the flag to use |
