@@ -564,6 +564,115 @@ def across_check(bin, work, port):
             moto_proc.wait()
 
 
+def protect_check(bin, work, port, root):
+    """Protected databases (ADR-058 step 3): a project's deploy protects `pprod` ([env.prod] protected = true),
+    after which its objects change only by a deploy (a DEPLOY holder's, or an admin's); rows and a person's
+    own objects stay free; lifting is an admin's and audited; a branch isn't protected; DEPLOY is a database's."""
+    prod = Node(bin, root + "/pprod", port + 20, work, token=False).start()  # (the database is named by its folder)
+    basic = {u: "Basic " + base64.b64encode(f"{u}:{u}-password-1".encode()).decode() for u in ["root", "ci"]}
+
+    def rows(n, sql):
+        return [tuple(r.values()) for r in n.q(sql)]
+
+    def refused(n, sql):
+        try:
+            n.q(sql)
+            return ""
+        except Failed as e:
+            return str(e)
+
+    def until(f, secs=30):
+        deadline = time.time() + secs
+        while True:
+            v = f()
+            if v or time.time() > deadline:
+                return v
+            time.sleep(0.5)
+
+    def as_(user, sql):
+        """A statement as a user signs in (Basic): (status, text)."""
+        return raw(port + 20, "POST", "/sql", sql, {"Authorization": basic[user]})
+
+    def denied(user, sql):
+        """What a user's statement is refused with ('' when it runs)."""
+        status, text = as_(user, sql)
+        return "" if status == 200 else text
+
+    def rows_as(user, sql):
+        status, text = as_(user, sql)
+        if status != 200:
+            raise Failed(f"as {user}, {sql}: {status} {text[:800]}")
+        return [tuple(r.values()) for r in json.loads(text)]
+
+    def post(user, path, body):
+        """A JSON request (a deploy, the cluster's own door) as a user signs in: (status, text)."""
+        return raw(port + 20, "POST", path, json.dumps(body), {"Authorization": basic[user], "Content-Type": "application/json"})
+
+    def state():
+        """pprod's protection as pondra.databases shows it: (protected, lifted?, lifted_by)."""
+        return [(r.get("protected"), r.get("lifted_at") is not None, r.get("lifted_by")) for r in prod.q("SELECT protected, lifted_at, lifted_by FROM pondra.databases WHERE name = 'pprod'")]  # (a row's JSON leaves NULLs out)
+
+    project = {"pondra.toml": '[project]\nname = "sales"\n\n[env.prod]\nprotected = true\n',
+               "objects/schemas.sql": "CREATE SCHEMA sales;\n",
+               "objects/sales/orders.sql": "CREATE TABLE sales.orders (id BIGINT, amount DOUBLE);\n",
+               "objects/sales/big.sql": "CREATE VIEW sales.big AS SELECT id, amount FROM sales.orders WHERE amount >= 0;\n",
+               "objects/access.sql": "CREATE ROLE analyst;\nGRANT SELECT ON TABLE sales.orders TO analyst;\n"}
+    with_note = {**project, "objects/sales/orders.sql": "CREATE TABLE sales.orders (id BIGINT, amount DOUBLE, note VARCHAR);\n"}
+    checks = {}
+    try:
+        prod.q("CREATE USER root PASSWORD 'root-password-1' SUPERUSER")
+        prod.q("CREATE USER ci PASSWORD 'ci-password-1'")
+        prod.q("GRANT DEPLOY ON DATABASE pprod TO ci")
+        status, text = post("ci", "/deploy", {"files": project, "env": "prod"})
+        if status != 200:
+            raise Failed(f"ci's deploy of the project: {status} {text[:800]}")
+        checks["a DEPLOY holder who isn't an admin deploys, and `[env.prod] protected = true` protects the database"] = state() == [(True, False, None)]
+
+        frozen = ["DROP TABLE sales.orders", "CREATE OR REPLACE VIEW sales.big AS SELECT 1 AS x", "ALTER TABLE sales.orders ADD COLUMN x INT",
+                  "ALTER TABLE sales.orders RENAME COLUMN amount TO a", "DROP ROLE analyst", "REVOKE SELECT ON sales.orders FROM analyst"]
+        checks["an admin's DROP, CREATE OR REPLACE and ALTER of a project's table or view, and of its role's grants, are refused by name"] = \
+            all("protected" in t and "project sales" in t for t in (denied("root", s) for s in frozen))
+
+        writes = [as_("root", s)[0] for s in ["INSERT INTO sales.orders VALUES (1, 10.0), (2, 20.0)", "UPDATE sales.orders SET amount = 11.0 WHERE id = 1", "DELETE FROM sales.orders WHERE id = 2"]]
+        own = ["CREATE TABLE sales.scratch (a INT)", "DROP TABLE sales.scratch", "CREATE USER ann PASSWORD 'ann-password-2'", "GRANT analyst TO ann", "GRANT SELECT ON sales.orders TO ann"]
+        checks["rows still change, and a person's own objects are theirs, in the project's schema too"] = \
+            writes == [200, 200, 200] and rows(prod, "SELECT id, amount FROM sales.orders ORDER BY id") == [(1, 11.0)] and all(as_("root", s)[0] == 200 for s in own)
+
+        drop = {"op": "drop_table", "name": "sales.orders", "if_exists": False}  # (Ddl::DropTable's JSON: `op` names the variant)
+        checks["the cluster's own door refuses it too: an admin's drop over /cluster/ddl is refused, and the table stays"] = \
+            post("root", "/cluster/ddl", drop)[0] != 200 and refused(prod, "SELECT count(*) FROM sales.orders") == ""
+
+        root_deploy = post("root", "/deploy", {"files": with_note, "env": "prod"})
+        ci_deploy = post("ci", "/deploy", {"files": with_note, "env": "prod"})
+        checks["a superuser without DEPLOY can't deploy a protected database; ci's deploy changes it"] = \
+            root_deploy[0] != 200 and "DEPLOY" in root_deploy[1] and ci_deploy[0] == 200 and refused(prod, "SELECT note FROM sales.orders") == ""
+
+        ci_lift = denied("ci", "ALTER DATABASE pprod SET (protected = false)")
+        root_lift = as_("root", "ALTER DATABASE pprod SET (protected = false)")[0] == 200
+        lifted = state()
+        audit_sql = 'SELECT "user", class FROM pondra.audit WHERE statement LIKE \'%protected = false%\''  # (audit.rs writes it a moment later)
+        logged = until(lambda: ("root", "role") in rows_as("root", audit_sql))
+        view = as_("root", "CREATE OR REPLACE VIEW sales.big AS SELECT * FROM sales.orders")[0] == 200
+        again = as_("root", "ALTER DATABASE pprod SET (protected = true)")[0] == 200
+        checks["lifting is an admin's, written in pondra.audit, and shown in pondra.databases until protected again"] = \
+            ci_lift != "" and root_lift and lifted == [(False, True, "root")] and logged and view and again and state() == [(True, False, None)]
+
+        prod.q("CREATE DATABASE pdev CLONE pprod")
+        branched = rows(prod, "SELECT protected FROM pondra.databases WHERE name = 'pdev'")
+        pdev = Node(bin, root + "/pdev", port + 21, work, token=False).start()  # (the branch's own node: a view's DROP is its own lake's)
+        try:
+            dropped = refused(pdev, "DROP VIEW sales.big")
+        finally:
+            pdev.stop()
+        checks["a branch of a protected database isn't protected"] = branched == [(False,)] and dropped == "" and "project sales" in denied("root", "DROP VIEW sales.big")
+
+        grants = [refused(prod, s) for s in ["GRANT DEPLOY ON SCHEMA sales TO ci", "GRANT DEPLOY ON TABLE sales.orders TO ci", "GRANT DEPLOY ON DATABASE other TO ci"]]
+        checks["DEPLOY is a database's, and names the one it runs on"] = "DEPLOY is a database's" in grants[0] and "DEPLOY is a database's" in grants[1] and "pprod" in grants[2]
+        return checks
+    finally:
+        prod.stop()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--new", default=os.path.join(HERE, "..", "target", "release", "pondra"), help="this build's binary")
@@ -581,6 +690,7 @@ def main():
         else:
             checks = environments_check(os.path.abspath(a.new), work, a.port, root)
             checks.update(signed_in_check(os.path.abspath(a.new), work, a.port, root))
+            checks.update(protect_check(os.path.abspath(a.new), work, a.port, root))
     except Failed as e:
         checks = {"ran to the end": False, "error": str(e)}
     finally:

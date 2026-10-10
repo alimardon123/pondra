@@ -212,6 +212,7 @@ pub enum Ddl {
     Pin { lake: String, ms: Option<u64> },  // a base's leader: keep the files a branch reads
     Unpin { lake: String },
     Refresh { database: Option<String>, tables: Vec<String> }, // ALTER DATABASE b REFRESH t, …: b's leader (ADR-047)
+    Protect { database: String, on: bool, #[serde(default)] by: String }, // ALTER DATABASE b SET (protected = …): b's leader (ADR-058, `protect.rs`)
     Deploy { claim: bool, after: u64, record: Vec<u8> }, // a deploy's entry: its claim, its record, a migration done (`deploy::keep`, ADR-047 §4)
     DropDatabase { name: String, if_exists: bool }, // a folder of databases' (`dbserver.rs`): its node stopped, its folder deleted (ADR-030)
     AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
@@ -413,6 +414,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Pin { lake: branch, ms } => crate::branch::pin(lake, &branch, ms).await,
         Ddl::Unpin { lake: branch } => crate::branch::unpin(lake, &branch).await,
         Ddl::Refresh { .. } => bail!("ALTER DATABASE … REFRESH is done by its database's leader (write::handle)"),
+        Ddl::Protect { database, on, by } => crate::protect::set(lake, &database, on, &by).await,
         Ddl::Deploy { claim, after, record } => crate::deploy::keep(lake, claim, after, &record).await,
         Ddl::CreateDatabase { name, if_not_exists, dir, clone: None } => {
             check(&name)?;
