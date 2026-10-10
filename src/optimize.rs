@@ -34,7 +34,12 @@ pub fn config(mut config: SessionConfig) -> SessionConfig {
         datafusion.execution.time_zone=+00:00,\
         datafusion.optimizer.hash_join_single_partition_threshold=33554432,\
         datafusion.optimizer.hash_join_single_partition_threshold_rows=1048576,\
+        datafusion.execution.perfect_hash_join_small_build_threshold=262144,\
         datafusion.execution.skip_physical_aggregate_schema_check=true";
+    // (the perfect hash join's: a join on one integer key whose build side's keys span under 262,144
+    // values looks them up in an array of that span, at most 1 MB, however few they are; DataFusion's
+    // 1,024 kept TPC-H q17's 204 parts, spread over 200,000 keys, in a hash table, and its 6 M probes
+    // took 2.4 times as long)
     // (the last: DataFusion 55 works out a CASE's nullability two ways, and the planner's one is
     // the more careful, so `SELECT DISTINCT CASE WHEN a < 1 AND b = 5 THEN b ELSE 5 END` failed its
     // check that they agree; the rows are the same either way)
