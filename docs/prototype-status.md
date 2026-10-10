@@ -99,6 +99,49 @@ and its table sorted by the grouped key), q24's wide top-N (0.20 s against 0.50 
 answers that differ are its own: `0.06 - 0.01` a float (TPC-H q6), sums of doubles in any order
 (q15, now and then), `length` in bytes (q28, q29), `avg` of a BIGINT wrapping (q4).
 
+**A small build looked up in an array** (`optimize::config`). A join on one integer key whose build
+side's keys span under 262,144 values now looks them up in an array of that span (at most 1 MB),
+however few they are: DataFusion's perfect hash join, which by default takes only a span under 1,024
+or keys at least 15% dense. TPC-H q17's 204 parts, spread over 200,000 part keys, had stayed in a hash
+table, and its 6 million probes took 2.4 times as long. Measured as `SET` in the same request,
+interleaved, best of 10–30 rounds (`logs/round34/perfect-hash-join-ab.json`): TPC-H SF1 from memory
+1.142 s → 1.038 s, from files 2.088 s → 1.962 s (q17 58 → 24 ms and 101 → 70 ms), TPC-DS SF1 11.06 s
+and 11.17 s (no query apart beyond this box's noise at 15 rounds). With it, the single-node bench
+(`logs/round34/singlenode-tpch-sf1-perfect-hash.json`): Pondra from memory 1.16 s against DuckDB's
+tables 0.97 s (the last gate's 1.26 s), from files 2.00 s against DuckDB over Parquet 2.04 s; 22 of 22
+answers equal. TPC-DS 99 of 99 equal to DuckDB's from files and from memory, `join_order.py`,
+`spread_tpch.py --expect 22`, `harness.py scale`, `hot` and `minmax` pass.
+
+**Keys a query implies** (`optimize::implied`, `Equal`). The join order sees what a query's keys say
+together: two columns of one type that each equal a third are equal. TPC-H q5's customers and
+suppliers each name a nation, so customers may join the nation at once, and the order starts from the
+region (Asia) instead of a year of orders. A join takes only the keys those it already has don't
+say (`Equal::said`): given q17's implied key beside its own, its last join hashed two columns and lost
+the array lookup above, twice as slow (`join_order.py`: "TPC-H q17: no join takes a key the others
+say"). Two nodes on copies of one lake, interleaved, both ways round, best of 20
+(`logs/round34/implied-keys-ab.json`): TPC-H q5 0.74×, TPC-DS q64 0.76× and q72 0.82×, the rest
+within this box's noise. TPC-H SF1 from memory 1.07 s against DuckDB's tables 1.03 s, from files
+1.94 s against DuckDB over Parquet 2.04 s, 22 of 22 equal
+(`logs/round34/singlenode-tpch-sf1-implied-keys.json`); TPC-DS 99 of 99 equal to DuckDB's from
+files and from memory; `join_order.py`, `spread_tpch.py --expect 22`, `harness.py scale` and 10,000
+random queries (the same known differences, no new one) pass.
+
+**What runs learn, measured** (the owner asked, 2026-10-10, whether the planner's use of them pays).
+Planned with them, TPC-H SF1 changed one plan (q17's) and TPC-DS SF1 none, and no query ran faster.
+They cost nothing measurable either: a `SELECT 1` 1.43 ms against 1.42, a three-way join 11.6 ms
+against 11.7, and a refresh's read of the history 4 ms every 10 s while queries are planned
+(`logs/round34/learned-facts.json`). So, as the owner's rule says of what doesn't pay its way, the
+planner uses them only with `PONDRA_LEARN=on`; every run still learns them and `pondra.learned`
+lists them, for people to read and for the planner where a filter's columns go together (the case
+`harness.py learn` builds).
+
+**On GitHub's runners** (`.github/workflows/singlenode-bench.yml`): TPC-H SF10 and all 100 M rows
+of ClickBench, Pondra from memory and from files against DuckDB over Parquet and in its own tables,
+every answer checked; weekly on main, by hand, and on a pull request labelled `bench`. Its first
+run (before implied keys, `logs/round34/singlenode-tpch-sf10-github.json`): TPC-H SF10 from memory
+12.95 s against DuckDB's tables 15.28 s, from files 19.50 s against DuckDB over Parquet 23.70 s, 22
+of 22 equal; furthest behind DuckDB's tables, q18 (1.69 s against 1.16), q20 and q12.
+
 **Now (2026-10-03, round 33, toward 0.33.0): run it for years.**
 
 1. **Every statement remembered** (ADR-048, `history.rs`): `SELECT * FROM pondra.history` has a row

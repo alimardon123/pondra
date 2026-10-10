@@ -1,0 +1,131 @@
+{
+ "what": "Does the planner's use of what runs learned (ADR-050, invariant 262) pay? Two nodes on one lake, both learning from every query (PONDRA_LEARN_MS=0), one planning with the facts (PONDRA_LEARN=on), one without; each suite run twice on both before comparing; the logical plans compared, every TPC-H query timed (best of 5, interleaved, from the hot columns)",
+ "box": "4 vCPU, 15 GB",
+ "tpch_sf1": {
+  "plans_differ": [],
+  "best_s": {
+   "q1.sql": {
+    "learned": 0.069,
+    "off": 0.073
+   },
+   "q10.sql": {
+    "learned": 0.076,
+    "off": 0.082
+   },
+   "q11.sql": {
+    "learned": 0.014,
+    "off": 0.012
+   },
+   "q12.sql": {
+    "learned": 0.053,
+    "off": 0.052
+   },
+   "q13.sql": {
+    "learned": 0.088,
+    "off": 0.089
+   },
+   "q14.sql": {
+    "learned": 0.017,
+    "off": 0.016
+   },
+   "q15.sql": {
+    "learned": 0.031,
+    "off": 0.032
+   },
+   "q16.sql": {
+    "learned": 0.047,
+    "off": 0.05
+   },
+   "q17.sql": {
+    "learned": 0.022,
+    "off": 0.025
+   },
+   "q18.sql": {
+    "learned": 0.087,
+    "off": 0.102
+   },
+   "q19.sql": {
+    "learned": 0.096,
+    "off": 0.069
+   },
+   "q2.sql": {
+    "learned": 0.018,
+    "off": 0.018
+   },
+   "q20.sql": {
+    "learned": 0.052,
+    "off": 0.055
+   },
+   "q21.sql": {
+    "learned": 0.085,
+    "off": 0.084
+   },
+   "q22.sql": {
+    "learned": 0.014,
+    "off": 0.014
+   },
+   "q3.sql": {
+    "learned": 0.041,
+    "off": 0.041
+   },
+   "q4.sql": {
+    "learned": 0.033,
+    "off": 0.032
+   },
+   "q5.sql": {
+    "learned": 0.039,
+    "off": 0.042
+   },
+   "q6.sql": {
+    "learned": 0.032,
+    "off": 0.038
+   },
+   "q7.sql": {
+    "learned": 0.057,
+    "off": 0.049
+   },
+   "q8.sql": {
+    "learned": 0.046,
+    "off": 0.052
+   },
+   "q9.sql": {
+    "learned": 0.086,
+    "off": 0.085
+   }
+  },
+  "total_s": {
+   "with_facts": 1.103,
+   "without": 1.112
+  }
+ },
+ "tpcds_sf1": {
+  "plans_differ": []
+ },
+ "before_implied_keys": "TPC-H: only q17's plan differed, 0.066 s with facts against 0.056 s without; TPC-DS: none",
+ "overhead_tpcds_sf1_after_three_runs": {
+  "refresh_read_ms": 4.07,
+  "select 1": {
+   "facts_p50_ms": 1.429,
+   "off_p50_ms": 1.419,
+   "facts_p90_ms": 1.693,
+   "off_p90_ms": 1.677
+  },
+  "a filtered count": {
+   "facts_p50_ms": 3.488,
+   "off_p50_ms": 3.454,
+   "facts_p90_ms": 4.303,
+   "off_p90_ms": 4.25
+  },
+  "a three-way join": {
+   "facts_p50_ms": 11.586,
+   "off_p50_ms": 11.749,
+   "facts_p90_ms": 14.157,
+   "off_p90_ms": 14.287
+  },
+  "facts": 12,
+  "history_rows": 595,
+  "rss_mb_facts": 2441,
+  "rss_mb_off": 2598
+ },
+ "decision": "the planner uses facts only with PONDRA_LEARN=on; runs still learn them and pondra.learned lists them"
+}

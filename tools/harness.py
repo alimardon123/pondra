@@ -5855,13 +5855,15 @@ def learn():
     join order starts from them, with the same answer and no slower. Another node reads the fact from the
     history; the run after a query's first with facts is planned without them, its bar. Three nodes plan
     a spread query with the facts its coordinator sends (otherwise their plans differ and it falls back
-    to one node); the facts come back after a restart, from the history; PONDRA_LEARN=off plans as before."""
+    to one node); the facts come back after a restart, from the history. Only nodes with PONDRA_LEARN=on
+    plan with their own facts: by default a node plans as before (it still learns)."""
     lake = new_lake()
-    env = {"PONDRA_LEARN_MS": "0"}  # (every query learns, however quick)
+    plain = {"PONDRA_LEARN_MS": "0"}  # (every query learns, however quick)
+    env = {**plain, "PONDRA_LEARN": "on"}
     a = Node(lake, A.port, env=env).start()
     # (b and c print each join order they weigh, and whether an input's rows were learned)
     b = Node(lake, A.port + 1, env={**env, "PONDRA_DEBUG_JOIN_ORDER": "1"}).start()
-    c = Node(lake, A.port + 2, env={**env, "PONDRA_LEARN": "off", "PONDRA_DEBUG_JOIN_ORDER": "1"}).start()
+    c = Node(lake, A.port + 2, env={**plain, "PONDRA_DEBUG_JOIN_ORDER": "1"}).start()
     nodes = [a, b, c]
     runs = itertools.count()
     # Every statement text unique (a comment with a number): the node's remembered answers would
@@ -5905,11 +5907,11 @@ def learn():
             time.sleep(0.5)
         seen["learned"] = facts
         checks["the run learned the customers' filter: 1% of them kept"] = len(facts) == 1 and abs(facts[0]["actual"] - 0.01) < 1e-9
-        # Planned with it: the join order starts from the filtered customers; PONDRA_LEARN=off keeps the order as written
+        # Planned with it: the join order starts from the filtered customers; a node by default keeps the order as written
         after, off = first_scan(0), first_scan(2)
         seen["after"], seen["off"] = after, off
         checks["once learned, the join order starts from the filtered customers"] = after == "customers"
-        checks["PONDRA_LEARN=off: the order as written"] = off == "products"
+        checks["by default (PONDRA_LEARN not on): the order as written"] = off == "products"
         # Another node reads it from the history (at most 10 s old): b's join order starts from the customers too
         deadline, there = time.time() + 30, None
         while time.time() < deadline and (there := first_scan(1)) != "customers":
@@ -5948,7 +5950,7 @@ def learn():
             spread_row = [r for r in q("SELECT statement, nodes FROM pondra.history ORDER BY at DESC LIMIT 200")
                           if r.get("statement", "").startswith("SELECT count(*) AS n FROM products") and r.get("nodes")]
         seen["spread"] = spread_row[:1]
-        # (c never plans with facts of its own: PONDRA_LEARN=off. Only those the coordinator sent.)
+        # (c never plans with facts of its own: PONDRA_LEARN isn't on. Only those the coordinator sent.)
         sent = {x: ", learned)" in open(node.log).read() for x, node in (("b", b), ("c", c))}
         seen["planned with the coordinator's facts"] = sent
         checks["spread over three nodes, planned alike with the coordinator's facts: the same answer, not fallen back to one node"] = \
