@@ -430,7 +430,7 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta
             false => Ok(Some(concat_batches(&s, &b.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?)),
         }
     };
-    let ids = with_ids(&crate::query::schema(&meta.logical().columns)?);
+    let ids = with_ids(&crate::query::schema(&meta.logical_columns())?);
     let old = match old.first().map(|f| f.schema()) {
         Some(s) => one(old, s)?,
         None => None,

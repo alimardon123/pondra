@@ -952,7 +952,7 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
 pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str) -> Result<String> {
     let (other, name) = crate::ddl::resolve(lake, table).await?;
     let meta: TableMeta = other.as_deref().unwrap_or(lake).cat.get(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?;
-    let columns: Vec<String> = meta.logical().columns.into_iter().map(|(c, _)| c).filter(|c| c != "_deleted" || names.contains(c)).collect();
+    let columns: Vec<String> = meta.logical_columns().into_iter().map(|(c, _)| c).filter(|c| c != "_deleted" || names.contains(c)).collect();
     let names = if names.is_empty() { &columns[..] } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: every column)
     let given: Vec<String> = names.iter().enumerate().filter(|(i, _)| !defaulted(query, *i)).map(|(_, n)| n.clone()).collect();
     crate::seq::check_given(&meta.logical(), table, &given)?;

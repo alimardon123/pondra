@@ -175,7 +175,7 @@ pub async fn file(lake: &Lake, seq: &crate::log::Sequencer, commits: &[FileCommi
                 }
             }
             let src = Src { producer: format!("job:{}", c.job), seq: 1, prev: None }; // (the job, once)
-            let none = RecordBatch::new_empty(crate::query::schema(&meta.logical().columns)?);
+            let none = RecordBatch::new_empty(crate::query::schema(&meta.logical_columns())?);
             marks.push(Append { table: c.table.clone(), src, batch: none, ack: tokio::sync::oneshot::channel().0 });
             filings.push(Filing { table: c.table.clone(), meta, added: files, removed: gone, deleted: hit });
         }

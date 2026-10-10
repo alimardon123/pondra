@@ -222,6 +222,14 @@ impl TableMeta {
         }
     }
 
+    /// SQL's columns, as `logical()` has them, without copying the rest of the entry (its files).
+    pub fn logical_columns(&self) -> Vec<(String, String)> {
+        if !self.mapped() {
+            return self.columns.clone();
+        }
+        self.live().map(|(_, n, t)| (n.to_string(), t.to_string())).collect()
+    }
+
     /// The table as its readers see it, to describe it (listings, `pg_catalog`, MCP): `logical`, but
     /// a view that finishes its answers (`finish.rs`) shows the columns it answers, not its partial ones.
     pub fn described(&self) -> TableMeta {
@@ -923,6 +931,17 @@ impl Lake {
     /// Query memory in use, and the limit.
     pub fn memory(&self) -> (usize, usize) { (self.rt.memory_pool.reserved(), memory_limit()) }
 
+    /// What each of the node's bounded caches holds now, in bytes (`/metrics`' `cache_bytes`): what
+    /// fills up to its limit is not memory the node is losing (`tools/soak.py`).
+    pub fn cached_bytes(&self) -> [(&'static str, usize); 4] {
+        [
+            ("ranges", self.cached.as_ref().map_or(0, |c| c.held())),
+            ("log", self.tail.lock().unwrap().bytes),
+            ("tails", self.tails.lock().unwrap().1),
+            ("lookups", self.groups.held()),
+        ]
+    }
+
     /// This lake as an `Arc` (for query plans that outlive the call that made them).
     pub fn arc(&self) -> Arc<Lake> { self.me.upgrade().expect("a lake outlives its queries") }
 
@@ -1196,6 +1215,7 @@ pub struct Catalog {
     follows: bool,                // follower / read-only node that gets the commit stream
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
+    metas: Mutex<lru::LruCache<String, (u64, Arc<TableMeta>)>>, // tables' entries as parsed, by the commit that wrote them (`meta`)
 }
 
 /// A scan in progress: the streamed changes it may still lay over its (older) view stay.
@@ -1487,7 +1507,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud }
+        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))) }
     }
 
     /// Leader: the recent frames plus a receiver for every frame from now on.
@@ -1685,6 +1705,26 @@ impl Catalog {
 
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         self.get_raw(key).await?.map(|v| serde_json::from_slice(&v).context(key.to_string())).transpose()
+    }
+
+    /// A table's entry (`t/…`), parsed once for each write of it where the catalog is in memory
+    /// (the leader's always is): every append and every flush reads its table's, and parsing an
+    /// entry of 128 files' statistics each time was most of a small commit's allocations. Elsewhere,
+    /// read and parsed as `get` does.
+    pub async fn meta(&self, key: &str) -> Result<Option<Arc<TableMeta>>> {
+        let held = if self.mirror.load(Relaxed) { self.overlay.lock().unwrap().get(key).cloned() } else { None };
+        let Some((at, raw)) = held else {
+            return Ok(self.get::<TableMeta>(key).await?.map(Arc::new));
+        };
+        let Some(raw) = raw else { return Ok(None) };
+        if let Some((seen, m)) = self.metas.lock().unwrap().get(key) {
+            if *seen == at {
+                return Ok(Some(m.clone()));
+            }
+        }
+        let m = Arc::new(serde_json::from_slice::<TableMeta>(&raw).context(key.to_string())?);
+        self.metas.lock().unwrap().put(key.to_string(), (at, m.clone()));
+        Ok(Some(m))
     }
 
     /// The commit that last wrote `key`, where the catalog is in memory (the leader's always is).
