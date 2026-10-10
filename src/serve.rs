@@ -30,6 +30,9 @@ pub struct Groups {
 
 impl Groups {
     pub fn new(max: usize) -> Self { Groups { rows: Mutex::new((lru::LruCache::unbounded(), 0)), footers: Default::default(), max } }
+
+    /// The bytes of row groups held for lookups now (at most `max`).
+    pub fn held(&self) -> usize { self.rows.lock().unwrap().1 }
 }
 
 /// The newest row of `key` (comma-separated values, in key order) in upsert table `meta`, if it

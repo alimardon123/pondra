@@ -380,12 +380,9 @@ fn main() {
     // get 2 MB, which procedures calling procedures 16 deep overflowed in the release build (only
     // the pages a thread touches are memory).
     let work = std::thread::Builder::new().name("pondra".into()).stack_size(8 << 20).spawn(|| {
-        // Blocking threads (file reads and writes, the SSD tier) go after a second idle, not tokio's
-        // ten: tiering every 10 s kept ~70 of them alive on 4 cores, and each kept the memory its
-        // biggest piece of work had used. A node under steady writes held 1 GB of its own after ten
-        // minutes, growing 60 MB a minute; with this, 250 MB, growing 7 (soak.py).
-        let keep = std::time::Duration::from_secs(1);
-        tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(8 << 20).thread_keep_alive(keep).build().expect("a runtime").block_on(async {
+        // Few blocking threads, gone after a second idle (`panics::runtime`): kept alive, each held
+        // the memory its work had used, and a node under steady writes grew for as long as it ran.
+        panics::runtime().build().expect("a runtime").block_on(async {
             // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
             if let Err(e) = run().await {
                 eprintln!("Error: {}", ext::said(&e));

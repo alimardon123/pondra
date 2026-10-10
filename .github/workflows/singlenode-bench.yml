@@ -1,0 +1,198 @@
+name: singlenode-bench
+
+# Pondra on one machine against DuckDB, on GitHub's runners, where there is disk for the data this
+# sandbox can't hold: TPC-H at scale factor 10 (60 M lineitem rows) and ClickBench on all 100 M rows
+# (its 100 hits_N.parquet files, 1 M rows each). tools/bench/singlenode.py runs each suite in its own
+# job: every engine in its own process on the same Parquet files, the warm time (the best of three
+# runs) of every query, and every answer checked against DuckDB's. `pondra` runs with its columns in
+# memory (--hot-gb 6, the runner's 16 GB); `pondra-cold` reads its lake's files alone.
+#
+# The data goes to /mnt/bench, the runner's big temporary disk (about 70 GB), and the lakes and
+# temporary files there too (TMPDIR). The runner takes it all away when the job ends: what is kept is
+# the numbers, in the job's summary (a table per suite), in the log and as the artifact
+# singlenode-<suite>. The data is public (ClickBench) or generated (TPC-H): no secrets.
+#
+# Weekly on main (Sundays); by hand (Actions → singlenode-bench → Run workflow: suite, sf,
+# partitions); and on a pull request labelled `bench`, which benchmarks that pull request's commit
+# with its build run's binary (or one built here, when that run isn't there).
+
+on:
+  schedule:
+    - cron: "13 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Which suite: both, tpch or clickbench"
+        type: choice
+        options: [both, tpch, clickbench]
+        default: both
+      sf:
+        description: "TPC-H scale factor (SF10 fits the runner's disk and memory; SF100 doesn't)"
+        default: "10"
+      partitions:
+        description: "ClickBench: how many of its hits_N.parquet files, 1 M rows each (100: all of it)"
+        default: "100"
+  pull_request:
+    types: [labeled] # (the label `bench`)
+
+concurrency: # (a pull request's other labels skip every job: they get a group of their own, so they never cancel a waiting bench run)
+  group: singlenode-bench-${{ github.ref }}-${{ github.event_name != 'pull_request' || github.event.label.name == 'bench' }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read # (the build run's packages, tools/ci_build.sh)
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  binary:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'bench'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SHA }}
+      - name: The build workflow's package for this commit (nothing, if no build run passed)
+        id: ci
+        run: echo "run=$(bash tools/ci_build.sh "$SHA")" >> "$GITHUB_OUTPUT"
+      - name: Its linux-x64 binary
+        if: steps.ci.outputs.run != ''
+        run: gh run download "${{ steps.ci.outputs.run }}" --name pondra-linux-x64 --dir dl && tar -xzf dl/pondra-linux-x64.tar.gz pondra
+      - name: Rust, when no build run passed
+        if: steps.ci.outputs.run == ''
+        uses: dtolnay/rust-toolchain@stable
+      - if: steps.ci.outputs.run == ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build # (main's build cache: the dependencies)
+          save-if: false
+      - name: The build from this commit, when no build run passed
+        if: steps.ci.outputs.run == ''
+        run: cargo build --profile dist && cp target/dist/pondra pondra
+      - uses: actions/upload-artifact@v6
+        with: { name: pondra, path: pondra, retention-days: 1 }
+
+  bench:
+    needs: binary
+    if: github.event_name != 'pull_request' || github.event.label.name == 'bench'
+    name: ${{ matrix.suite }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ inputs.suite == 'tpch' && fromJSON('["tpch"]') || inputs.suite == 'clickbench' && fromJSON('["clickbench"]') || fromJSON('["tpch","clickbench"]') }}
+    env:
+      SF: ${{ inputs.sf || '10' }}
+      PARTITIONS: ${{ inputs.partitions || '100' }}
+      RESULTS: /mnt/bench/results-${{ matrix.suite }}.json
+      REPO: ${{ github.workspace }}
+      PONDRA_BIN: ${{ github.workspace }}/bin/pondra # (where tools/harness.py finds the binary)
+      TMPDIR: /mnt/bench/tmp # (the lakes and the nodes' logs: on the big disk too)
+      SUITE: ${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SHA }}
+      - name: The data's disk
+        run: |
+          sudo mkdir -p /mnt/bench && sudo chown "$(id -un)" /mnt/bench && mkdir -p /mnt/bench/tmp
+          df -h /mnt /
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tools/requirements.txt
+      - name: The packages (tpchgen-cli pinned to the version these steps were checked with)
+        run: pip install -r tools/requirements.txt tpchgen-cli==3.0.0
+      - uses: actions/download-artifact@v7
+        with: { name: pondra, path: bin }
+      - name: The binary, executable
+        run: chmod +x bin/pondra && bin/pondra --version
+
+      - name: TPC-H, generated and prepared
+        if: matrix.suite == 'tpch'
+        run: |
+          cd /mnt/bench
+          tpchgen-cli parquet -s "$SF" --output-dir "/mnt/bench/tpch-sf$SF"
+          python3 "$REPO/tools/bench/singlenode.py" prepare --data "/mnt/bench/tpch-sf$SF"
+      - name: TPC-H, run
+        if: matrix.suite == 'tpch'
+        run: |
+          cd /mnt/bench # (DuckDB's spill folder is the working folder's)
+          python3 "$REPO/tools/bench/singlenode.py" run --suite tpch --data "/mnt/bench/tpch-sf$SF-bench" --sf "$SF" \
+            --engines pondra,pondra-cold,duckdb,duckdb-native --hot-gb 6 --timeout 1200 \
+            --queries "$REPO/tools/bench/tpch-queries" --repos /mnt/bench/repos --out "$RESULTS"
+
+      - name: ClickBench, its partitioned files (8 at a time)
+        if: matrix.suite == 'clickbench'
+        run: |
+          mkdir -p /mnt/bench/clickbench
+          seq 0 $((PARTITIONS - 1)) | xargs -P 8 -I{} curl -fsSL --retry 5 \
+            -o "/mnt/bench/clickbench/hits_{}.parquet" "https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_{}.parquet"
+      - name: ClickBench, prepared, then its raw files deleted (the lake needs their disk)
+        if: matrix.suite == 'clickbench'
+        run: |
+          cd /mnt/bench
+          python3 "$REPO/tools/bench/singlenode.py" prepare --suite clickbench --data /mnt/bench/clickbench
+          rm -f /mnt/bench/clickbench/hits_*.parquet
+      - name: ClickBench, run
+        if: matrix.suite == 'clickbench'
+        run: |
+          cd /mnt/bench
+          python3 "$REPO/tools/bench/singlenode.py" run --suite clickbench --data /mnt/bench/clickbench-bench \
+            --engines pondra,pondra-cold,duckdb,duckdb-native --hot-gb 6 --timeout 1200 \
+            --repos /mnt/bench/repos --out "$RESULTS"
+
+      - name: The results, in the log
+        if: always()
+        run: cat "$RESULTS" || echo "(no results; the run didn't reach its end)"
+      - name: The results, in the job's summary
+        if: always()
+        run: |
+          [ -f "$RESULTS" ] || { echo "No results: the run didn't reach its end." >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          if [ "$SUITE" = tpch ]; then
+            title="TPC-H, SF$SF"; note=""
+          else
+            title="ClickBench, $PARTITIONS files of 1 M rows"
+            note="An answer that differs on a query with a LIMIT is usually a tie at the cut: DuckDB's own table (duckdb-native) differs from its views on many of the same queries. tools/bench/clickbench_ties.py checks the ones it covers."
+          fi
+          python3 - "$RESULTS" "$title" "$note" <<'PY'
+          import json, os, sys
+          d = json.load(open(sys.argv[1]))
+          res, engines = d["results"], list(d["results"])
+          qs = sorted({q for e in engines for q in res[e] if q.isdigit()}, key=int)
+          def cell(v):
+              if "hot" not in v:
+                  return "failed: " + " ".join(v.get("error", "not run").split())[:60].replace("|", "/")
+              return f"{v['hot']:.3f} s" + ("" if v["same_as_duckdb"] else " (differs)")
+          lines = [f"### {sys.argv[2]}", "", f"Warm time per query (best of {d['runs']} runs), and whether its answer equals DuckDB's:", "",
+                   "| query | " + " | ".join(engines) + " |", "|---|" + "---:|" * len(engines)]
+          lines += [f"| {q} | " + " | ".join(cell(res[e].get(q, {"error": "not run"})) for e in engines) + " |" for q in qs]
+          lines.append("| **total** | " + " | ".join(f"**{res[e]['total_hot']} s**" if res[e]["total_hot"] is not None else "not all ran" for e in engines) + " |")
+          lines.append("| answers equal to DuckDB's | " + " | ".join(f"{res[e]['answers_match']} of {len(qs)}" for e in engines) + " |")
+          if sys.argv[3]:
+              lines += ["", sys.argv[3]]
+          lines += ["", f"Loads and warm-ups (s): `{json.dumps(d['info'])}`"]
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write("\n".join(lines) + "\n")
+          PY
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: singlenode-${{ matrix.suite }}
+          path: ${{ env.RESULTS }}
+          if-no-files-found: ignore
+      - name: The nodes' logs, when it failed
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: singlenode-${{ matrix.suite }}-logs
+          path: /mnt/bench/tmp/pondra-*.stderr
+          if-no-files-found: ignore
+      - name: The disk, after
+        if: always()
+        run: df -h /mnt /

@@ -38,7 +38,9 @@ The owner's design principles, which every change must respect:
 8. **Every round leaves it better on every angle** (the owner, 2026-09-30): faster, more
    performant, simpler, easier to use, more functional, versatile, scalable and powerful — while
    staying lightweight and efficient. The gates hold each round to it (`logs/gates/`: speed and
-   SQL never drop), and the console's budget keeps the page light.
+   SQL never drop), and the console's budget keeps the page light. The owner, 2026-10-10: whatever
+   we add must be really useful and pay its way, shown with numbers before it is called done;
+   what doesn't is off by default or taken out.
 9. **Easy to change, replace and extend** (the owner, 2026-10-01): the platform will grow tools of
    its own (ETL on a canvas, AI agents, reports, GPUs) and parts will be swapped. Every feature is
    a part with one job behind a small surface — a registry entry (`register.*` in the console, a
@@ -50,6 +52,8 @@ The owner's design principles, which every change must respect:
    applies everywhere, with no copies to chase. Users customize and extend the whole product
    (their own objects, functions, settings, extensions) as fully as the core does. Reliability,
    simplicity, performance and efficiency stay the bar, and every review holds a change to this.
+   The owner, 2026-10-10: code any developer can read, change, extend and maintain later; the
+   simple shape first, plain names, and no cleverness a newcomer would have to decode.
 10. **Every feature through every door** (the owner, 2026-10-09): what Pondra can do, it can do from
    SQL, Python, JavaScript, the command line, HTTP, Flight, the Postgres port, MCP and the console,
    as far as a door allows (Kafka's protocol carries rows, not statements). A door that can't take
@@ -86,7 +90,8 @@ src/      55,200 lines of Rust in 101 files, one per concern (see the table in R
           237–239); learned.rs (what a run learned about its filters, ADR-050: invariant 244);
           environments (ADR-047): branch.rs (`CREATE DATABASE dev CLONE prod`, REFRESH: invariant
           245), deploy.rs (plan, deploy, test and export: a project made true in a database;
-          `pondra.deploys`: invariants 246–250), project.rs (the command line's project commands) and
+          `pondra.deploys`: invariants 246–250), project.rs (the command line's project commands,
+          `pondra ci init` and `pondra dev`), protect.rs (a protected database: invariant 266) and
           sync.rs (`pondra workspace pull | push`); views kept current (ADR-055, ADR-056, ADR-059):
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253)
@@ -1816,11 +1821,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    twice in a row, have them set aside. A query is known by its words (`key`: comments and spacing
    left out, so a benchmark's numbered comment doesn't make each run a stranger; `EXPLAIN` of it is
    it and records nothing): a bar measured cold, or by text alone, never held a run to anything.
-   `PONDRA_LEARN=off`: a node plans with none of its own, but a slice's still. A plan made anywhere
+   A node plans with its own facts only with `PONDRA_LEARN=on` (off by default since 0.34: on TPC-H and
+   TPC-DS they changed one plan and sped up none), and with a slice's always. A plan made anywhere
    else (a view, a write's query) uses none. `harness.py learn`: the order starts from the filtered
    customers once learned, on another node too (read from the history); same answer, no slower than an
    equal node without; the bar run's plan among its runs; three nodes plan with the coordinator's
-   facts (a node with `PONDRA_LEARN=off` among them, fails without `Slice::learned`); read back after a
+   facts (a node without `PONDRA_LEARN=on` among them, fails without `Slice::learned`); read back after a
    restart.
 263. **A lake attached READ_ONLY is read with its own key and written by nothing here** (`store::Reach`,
    `ReadOnly`, `write::across`; ADR-058). Its store is built from the secret whose scope covers its URL
@@ -1848,6 +1854,26 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    behind the entries an attached lake's changed row went missing (336 of 607 reads on main
    2801b4d); with an entry read before a table's first UPDATE and its log read past it, a leader too
    kept both versions. `harness.py attached` (55 wrong reads on 0.33.0).
+266. **In a protected database, a project's objects change only through a deploy by a holder of
+   DEPLOY, and lifting the protection is an admin's, audited** (`protect.rs`, `deploy::authorize`,
+   ADR-058). `protect::door`, where every statement comes in (`write::on_node_listed`,
+   `write::from_cli`, and for a user's direct call `server::ddl` and `create_table`), refuses a change
+   to anything a project's last finished deploy declared (`deploy::declared`), unless
+   `protect::DEPLOYING` is set. Only a deploy sets it, from its claim to its record (tests included),
+   and a procedure it calls back through gets it for that call alone. Its matches over `Stmt` and
+   `Ddl` have no `_` arm: a new kind says what it touches. The flag lives in `z/protect`, which a
+   branch never copies. `environments_check.py`: "an admin's DROP, CREATE OR REPLACE and ALTER of a
+   project's table or view, and of its role's grants, are refused by name", "the cluster's own door
+   refuses it too…", "a superuser without DEPLOY can't deploy a protected database; ci's deploy
+   changes it".
+267. **A node keeps few blocking threads** (`panics::runtime`, both runtimes): at most four a core (16
+   at least, `PONDRA_BLOCKING_THREADS`), each gone after a second idle. On a local lake every file
+   read and write is a blocking task. Under small steady commits they came often enough that no
+   thread ever sat idle a second, so the pool kept the most it had ever needed (about 90 on 4
+   cores), and each thread's heap kept what its work had used: a node grew 2–5 MB a minute while its
+   live heap stayed at 80–90 MB. Windows keeps tokio's 512, since a child's pipes hold blocking
+   threads there. `harness.py memory`: "keeps at most four blocking threads a core" fails with
+   `PONDRA_BLOCKING_THREADS=512`.
 
 ## Tests: run these before and after any change
 
@@ -1870,6 +1896,7 @@ python3 tools/harness.py stopped        # a run whose node was killed under it: 
 python3 tools/harness.py scripts        # IF, CASE, loops, handlers, RETURN, EXECUTE IMMEDIATE: errors at their line, scopes, a job run twice writing once, Postgres's protocols
 python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
 python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model; merged files leave memory
+python3 tools/harness.py memory         # 240 small commits a second, no reader: the node's threads stay few and its own memory doesn't run away
 python3 tools/harness.py pace           # a writer's acks beside 64 querying clients stay near its acks alone (queries on their own runtime)
 python3 tools/harness.py tails          # a table's log tail kept between queries: reads == a model while rows land, a transaction's snapshot, a column added, tiering
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
@@ -2523,12 +2550,14 @@ signed packages, the docs).
   (`designs/rules-for-new-kinds.md`):
   - An **object** has a life of its own (a table, a model). It is a `Kind` in `KINDS`.
   - A **part** lives and dies with one object (a column, a measure, a key, a link, a model's
-    version). It is a `Part` in `PARTS`, and its owner's lister yields it into `pondra.parts`.
+    version or feature). It is a `Part` in `PARTS`, and its owner's lister yields it into
+    `pondra.parts`.
   - A **pattern** stores nothing and is read from objects and parts (the ontology, a flow, a
-    feature). It is a `Pattern` in `PATTERNS`, naming its listing function.
+    history view). It is a `Pattern` in `PATTERNS`, naming its listing function.
   - Each entry carries a one-line description and other products' names for it (`also`).
-    `pondra.kinds` lists all three and the website's glossary is generated from it. `pondra.search`
-    finds all of them, by their names, descriptions and `also`.
+    `pondra.kinds` lists all three and the website's glossary is generated from it. `pondra.find`
+    finds all of them, by their names, descriptions and `also` (`search` is ADR-051's search of a
+    table's rows).
   - An object passes ten checks: (1) SQL's word, naming nothing else; (2) one registry entry, a
     catalog prefix of its own, `schema.name`; (3) the same verbs, `SHOW CREATE` running again after
     a drop, any other verb refused by name with Postgres's code; (4) its privileges asked by the one
@@ -2537,6 +2566,9 @@ signed packages, the docs).
     can't, `register.objectKind`, a row in the doors matrix; (7) written by the leader, free when
     unused, no service, within the bucket's limits; (8) a catalog shape older releases would misread
     waits for the format; (9) `harness.py registry` walks it; (10) a reference page.
+  - Other products' words go only in `also`; Pondra's own table functions are `pondra.*`, scalar
+    functions and names other engines use unqualified are not (`predict`, `nextval`, `ai_*`); named
+    arguments are `=>`, rewritten by one helper.
   - A part takes its owner's verbs (`ALTER … ADD | DROP`, `COMMENT ON`), rights and life cycle,
     shows in its owner's `SHOW CREATE`, and passes checks 1, 2 and 6 to 10.
   - A pattern passes 1, 2 and 10.

@@ -9,7 +9,7 @@ use crate::routines::{Outcome, Who};
 use crate::server::App;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, RecordBatch, StringArray};
-use datafusion::sql::sqlparser::ast::{FunctionArg, FunctionArgExpr};
+use datafusion::sql::sqlparser::ast::FunctionArg;
 use serde_json::{json as j, Value};
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -21,19 +21,10 @@ const USAGE: &str = "run('etl/orders.sql', day => DATE '2026-09-29'): the file, 
 
 /// The file's path and its parameters' values (one row), worked out once, as the caller.
 pub async fn arguments(app: &App, args: &[FunctionArg]) -> Result<(String, RecordBatch)> {
-    let (mut select, mut names) = (vec![], std::collections::HashSet::new());
-    for (i, a) in args.iter().enumerate() {
-        select.push(match a {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) if i == 0 => format!("CAST(({e}) AS VARCHAR) AS \"file to run\""),
-            FunctionArg::Named { name, arg: FunctionArgExpr::Expr(e), .. } if i > 0 => {
-                let n = crate::write::ident(name);
-                ensure!(names.insert(n.clone()), "run: {n} given twice");
-                format!("({e}) AS \"{}\"", n.replace('"', "\"\""))
-            }
-            _ => bail!(USAGE),
-        });
-    }
-    ensure!(!select.is_empty(), USAGE);
+    let a = crate::routines::args("run", args)?;
+    let [file] = &a.given[..] else { bail!(USAGE) };
+    let mut select = vec![format!("CAST(({file}) AS VARCHAR) AS \"file to run\"")];
+    select.extend(a.named.iter().map(|(n, e)| format!("({e}) AS \"{}\"", n.replace('"', "\"\""))));
     let rows = app.query(&format!("SELECT {}", select.join(", ")), Some("0")).await.context("run's arguments")?;
     let row = datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
     let path = datafusion::arrow::compute::cast(row.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?; // (VARCHAR is Utf8View)

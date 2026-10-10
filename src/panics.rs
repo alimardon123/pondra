@@ -58,12 +58,29 @@ pub async fn work<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static
 /// query's time grows as the cores are shared, so dashboards beside writers pass it at once.
 const LONG: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// The queries' runtime: made when first asked for, with a thread a core and the node's stacks.
+/// The queries' runtime: made when first asked for, with a thread a core, as [`runtime`] makes them.
 fn queries() -> &'static tokio::runtime::Runtime {
     static R: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     R.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread().thread_name("pondra-query").thread_stack_size(8 << 20).enable_all().build().expect("a runtime")
+        runtime().thread_name("pondra-query").build().expect("a runtime")
     })
+}
+
+/// A runtime as the node's are made (`main.rs`'s and the queries'): Linux's main stack on every
+/// thread, 8 MB (invariant 195), and few blocking threads, each gone after a second idle. On a
+/// local lake every file read and write is a blocking task; under small steady commits they come
+/// often enough that no thread of the pool ever sat idle a second, so it stayed at the most it had
+/// ever needed at once (about 90 on 4 cores), and each thread's heap kept what its work had used: a
+/// node grew 2–5 MB a minute (the 24-hour soak) while what it held stayed at 80–90 MB. With four a
+/// core, 16 at least, it levels off, and TPC-H reads files as fast (`harness.py memory`). Windows
+/// keeps tokio's 512: there a child's pipes are read on blocking threads (each Python worker
+/// holds one), and a cap could leave none for files.
+pub fn runtime() -> tokio::runtime::Builder {
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let most = std::env::var("PONDRA_BLOCKING_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(if cfg!(windows) { 512 } else { 16.max(4 * cores) });
+    let mut b = tokio::runtime::Builder::new_multi_thread();
+    b.enable_all().thread_stack_size(8 << 20).thread_keep_alive(std::time::Duration::from_secs(1)).max_blocking_threads(most);
+    b
 }
 
 /// Start a loop the node can't do without: if it panics, the node stops.

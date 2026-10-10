@@ -63,10 +63,20 @@ SHAPES = {
     "past an outer join": ("""select count(*) as n, count(l_orderkey) as returned from {}
                               where o_custkey = c_custkey and c_nationkey = n_nationkey and n_name = 'KENYA'""",
                            "nation, customer, orders left join lineitem on l_orderkey = o_orderkey and l_returnflag = 'R'"),
+    # TPC-H q5, as it is written: customers meet suppliers by nation (`c_nationkey = s_nationkey`)
+    # and suppliers their nation, so no key joins customers to their nation. The order took
+    # customers and a year of orders to all of lineitem (910 K rows) before Asia cut them; with the
+    # key the two imply (`optimize::implied`), it starts from Asia's five nations.
+    "implied through a third": ("""select count(*) as n from {}
+                                   where c_custkey = o_custkey and l_orderkey = o_orderkey and l_suppkey = s_suppkey
+                                     and c_nationkey = s_nationkey and s_nationkey = n_nationkey and n_regionkey = r_regionkey
+                                     and r_name = 'ASIA' and o_orderdate >= date '1994-01-01' and o_orderdate < date '1995-01-01'""",
+                                "region, nation, customer, orders, lineitem, supplier", "customer, orders, lineitem, supplier, nation, region"),
 }
 
 # The shapes whose plans are checked, written badly, with the rule on: the tables each is joined from.
-FIRST = {"far from the filters": ("orders", "part"), "under an exists": ("nation",), "past an outer join": ("orders", "customer", "nation")}
+FIRST = {"far from the filters": ("orders", "part"), "under an exists": ("nation",), "past an outer join": ("orders", "customer", "nation"),
+         "implied through a third": ("region", "nation")}
 
 
 def shapes():
@@ -150,11 +160,17 @@ def measure(lake, queries, on):
             plan = call(A.port, "POST", "/sql", ("EXPLAIN " + queries[shape][1]).encode())
             logical = next(r["plan"] for r in plan if r["plan_type"] == "logical_plan")
             JOINED[shape] = re.findall(r"TableScan: (\w+)", logical)
+        # (its part and its subquery imply a key to lineitem beside the one written; a join that
+        # took both hashed two columns, twice as slow)
+        plan = call(A.port, "POST", "/sql", ("EXPLAIN " + KEYS["sql"]).encode())
+        logical = next(r["plan"] for r in plan if r["plan_type"] == "logical_plan")
+        KEYS["tpch-q17"] = [l.split("Inner Join:")[1].split(" Filter:")[0].strip() for l in logical.splitlines() if "Inner Join:" in l]
     node.kill()
     return out
 
 
 JOINED = {}  # (each FIRST shape written badly: its tables in the order its plan joins them)
+KEYS = {}  # (TPC-H q17 as written, and each of its inner joins' keys)
 
 
 def main():
@@ -162,6 +178,7 @@ def main():
     from tpch import queries as tpch_queries
     lake = lake_of(A.data)
     queries = shapes()
+    KEYS["sql"] = tpch_queries(A.queries)[17]
     for i, sql in tpch_queries(A.queries).items():
         bad = reversed_from(sql)
         if bad:
@@ -181,11 +198,14 @@ def main():
         "far from the filters, written badly, starts from a filtered table": JOINED["far from the filters"][0] in FIRST["far from the filters"],
         "under an exists, written badly, starts from the nation": JOINED["under an exists"][0] in FIRST["under an exists"],
         "past an outer join, written badly, joins the returns last": JOINED["past an outer join"][-1] == "lineitem",
+        "implied through a third (TPC-H q5 as written): starts from Asia, customers before lineitem": JOINED["implied through a third"][0] in FIRST["implied through a third"]
+            and JOINED["implied through a third"].index("customer") < JOINED["implied through a third"].index("lineitem"),
+        "TPC-H q17: no join takes a key the others say (one key each)": bool(KEYS["tpch-q17"]) and all("," not in k for k in KEYS["tpch-q17"]),
     }
     out = {"queries": len(queries), "rule_on": {"well_s": total(on, "well"), "badly_s": total(on, "badly"), "worst_ratio": round(worst(on), 2)},
            "rule_off": {"well_s": total(off, "well"), "badly_s": total(off, "badly"), "worst_ratio": round(worst(off), 2)},
            "slower_with_the_rule": {k: slower(k) for k in ("well", "badly")},
-           "per_query": {q: {"on": on[q], "off": off[q]} for q in queries}, "joined_from": JOINED, "checks": checks, "ok": all(checks.values())}
+           "per_query": {q: {"on": on[q], "off": off[q]} for q in queries}, "joined_from": JOINED, "q17_keys": KEYS.get("tpch-q17"), "checks": checks, "ok": all(checks.values())}
     print(json.dumps(out, indent=1))
     sys.exit(0 if out["ok"] else 1)
 

@@ -511,7 +511,7 @@ async fn changed(lake: &Lake, source: &str, after: u64, upto: u64) -> Result<Dat
     let ctx = session_at(lake, &format!("SELECT {VERSION} FROM {}", crate::write::sql_name(source)), "", Some(upto)).await?;
     let within = |df: DataFrame| df.filter(ident(VERSION).gt(lit(after as i64)).and(ident(VERSION).lt_eq(lit(upto as i64))));
     let new = within(ctx.table(table_ref(source)).await?)?;
-    let columns: Vec<(String, DataType)> = meta.logical().columns.iter().map(|(c, _)| Ok((c.clone(), new.schema().field_with_unqualified_name(c)?.data_type().clone()))).collect::<Result<_>>()?;
+    let columns: Vec<(String, DataType)> = meta.logical_columns().iter().map(|(c, _)| Ok((c.clone(), new.schema().field_with_unqualified_name(c)?.data_type().clone()))).collect::<Result<_>>()?;
     let pick = |df: DataFrame| -> Result<DataFrame> {
         let exprs = columns.iter().map(|(c, t)| match df.schema().has_column_with_unqualified_name(c) {
             true => Ok(cast(ident(c), t.clone()).alias(c)),

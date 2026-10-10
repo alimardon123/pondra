@@ -20,7 +20,9 @@
 //! bar, as the spread guard lets the faster way win (`ran`): the run after a query's 1st, 2nd, 4th,
 //! 8th… with facts is planned without them, as warm, and a query whose runs with them are slower than
 //! the best of those by a tenth (and 2 ms), twice in a row, has them set aside. A query is known by its words, without
-//! its comments and spacing (`key`). `PONDRA_LEARN=off`: the planner uses none.
+//! its comments and spacing (`key`). The planner uses them only with `PONDRA_LEARN=on`: measured on
+//! TPC-H and TPC-DS they changed one plan (q17's) and made nothing faster, so by default they are
+//! learned and kept (`pondra.learned`), and a node plans with none of its own (a slice's still).
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{ScalarValue, TableReference};
 use datafusion::logical_expr::{utils::split_conjunction, Expr, LogicalPlan};
@@ -249,9 +251,10 @@ const KEPT: usize = 20_000; // (facts at most: a few MB)
 fn known() -> std::sync::RwLockReadGuard<'static, Known> { KNOWN.read().unwrap_or_else(|e| e.into_inner()) }
 fn known_mut() -> std::sync::RwLockWriteGuard<'static, Known> { KNOWN.write().unwrap_or_else(|e| e.into_inner()) }
 
-/// Whether the planner uses facts (`PONDRA_LEARN=off`: never; they are still learned and kept).
+/// Whether the planner uses this node's facts (`PONDRA_LEARN=on`; by default they are learned and
+/// kept, not used).
 fn on() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| !matches!(std::env::var("PONDRA_LEARN").as_deref(), Ok("off" | "0" | "false")));
+    static ON: LazyLock<bool> = LazyLock::new(|| matches!(std::env::var("PONDRA_LEARN").as_deref(), Ok("on" | "1" | "true")));
     *ON
 }
 
@@ -342,7 +345,7 @@ enum Verdict {
 /// How a query a door asked for was planned.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Planned {
-    /// no fact applied (or `PONDRA_LEARN=off`, or set aside for it)
+    /// no fact applied (`PONDRA_LEARN` not on, or set aside for it)
     Plain,
     Used,
     /// facts applied and were held back: its bar
@@ -627,7 +630,8 @@ mod tests {
         assert_eq!(share(&t, &paris), None, "no query being planned");
         let sent: Given = vec![("customers".into(), about(&paris).unwrap(), 0.01)];
         let (got, planned) = rt.block_on(planning("SELECT 'a slice of this test'", given(&sent, async { share(&t, &paris) })));
-        assert_eq!((got, planned), (Some(0.01), Planned::Used));
+        // (a slice uses the facts sent whatever this node's switch; its query hears of it only when on)
+        assert_eq!((got, planned), (Some(0.01), if on() { Planned::Used } else { Planned::Plain }));
         assert_eq!(rt.block_on(given(&vec![], async { share(&t, &paris) })), None, "none sent: none used");
     }
 }

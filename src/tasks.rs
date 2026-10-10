@@ -82,7 +82,7 @@ async fn run(lake: &Lake, task: &Task, shard: u32, mut rows: Vec<RecordBatch>) -
 }
 
 async fn target_schema(lake: &Lake, task: &Task) -> Result<datafusion::arrow::datatypes::SchemaRef> {
-    schema(&lake.cat.get::<TableMeta>(&table_key(&task.target)).await?.context("no target table")?.logical().columns)
+    schema(&lake.cat.get::<TableMeta>(&table_key(&task.target)).await?.context("no target table")?.logical_columns())
 }
 
 /// Register a task (leader only): its SQL must plan, and the target table is created from the
