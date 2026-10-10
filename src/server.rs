@@ -354,6 +354,17 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             return (StatusCode::UNAUTHORIZED, "the nodes' key is taken only with a certificate the nodes' authority signed (PONDRA_TLS_CA)").into_response();
         }
     }
+    if header.as_deref().is_some_and(|h| h.starts_with("Bearer pb_")) {
+        // (a branch's key: it renews or lets go of its own pin, which `ddl` checks, and opens nothing else: ADR-058)
+        if req.uri().path() != "/cluster/ddl" {
+            return (StatusCode::UNAUTHORIZED, "a branch's key renews its pin, and opens nothing else").into_response();
+        }
+        let who = crate::auth::Principal::of(crate::auth::Role::None).at("http", from);
+        return match crate::panics::door(crate::auth::WHO.scope(who, next.run(req))).await {
+            Ok(r) => r,
+            Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+        };
+    }
     if req.uri().path().starts_with("/delta-sharing/") {
         // (a recipient's token or a file's signed link, which the door checks: never a user's sign-in)
         return match crate::panics::door(next.run(req)).await {
@@ -906,7 +917,11 @@ async fn change(State(app): State<App>, Json((sql, job, sent)): Json<(String, St
 }
 
 /// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`).
-async fn ddl(State(app): State<App>, Json(d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
+async fn ddl(State(app): State<App>, headers: HeaderMap, Json(d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
+    let key = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).filter(|k| k.starts_with("pb_"));
+    if let Some(key) = key {
+        crate::branch::keyed(&app.lake, &d, key).await?; // (a branch's key: its own pin, nothing else)
+    }
     let out = match &app.seq {
         Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone()).await?,
         None => {
