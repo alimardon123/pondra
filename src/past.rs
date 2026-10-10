@@ -264,7 +264,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
 /// The version (and time, in ms) before which `meta`'s past is no longer whole: a purge has let
 /// old versions go (`TableMeta::past_from`). A table changed before this was kept (legacy) is whole
 /// from its oldest purge kept on.
-fn kept_since(meta: &TableMeta) -> Option<(u64, u64)> {
+pub(crate) fn kept_since(meta: &TableMeta) -> Option<(u64, u64)> {
     match meta.past_from {
         Some(b) => Some(b).filter(|b| *b != (0, 0)),
         None => meta.purges.first().copied().filter(|_| meta.changed),

@@ -463,7 +463,7 @@ def differences(old, new, columns_of_old=True):
     out = {}
     for k, rows in old.items():
         got = new.get(k)
-        if got is not None and columns_of_old and k.startswith("rows of ") and rows:
+        if got is not None and columns_of_old and rows and all(r.startswith("{") for r in rows):  # (a system table gains columns between releases; text answers are not rows)
             keep = set().union(*(json.loads(r) for r in rows))  # (a row leaves out its nulls)
             got = sorted(json.dumps({c: x for c, x in json.loads(r).items() if c in keep}, sort_keys=True) for r in got)
         if got != rows:
@@ -598,35 +598,37 @@ def until(what, secs, step=0.5):
 
 # ---------------------------------------------------------------- the lake's format
 
-def format_check(new_bin, work, port):
-    """The lake's format (ADR-039), this build posing as a later one for a node (PONDRA_TEST_FORMAT=2)."""
+def format_check(new_bin, work, port, old=None):
+    """The lake's format (ADR-039), this build posing as a later one for a node (PONDRA_TEST_FORMAT=3:
+    this build's format, 2, plus one); and a write that needs format 2 (ADR-055) against `old`, the
+    release before (version, binary)."""
     checks, info = {}, {}
-    lake, later = os.path.join(work, "format-lake"), {"PONDRA_TEST_FORMAT": "2"}
+    lake, later = os.path.join(work, "format-lake"), {"PONDRA_TEST_FORMAT": "3"}
     fmt = lambda n: n.get("/stats", timeout=5)["format"]
     first = Node(new_bin, lake, port, work).start()  # makes the lake
     checks["a lake this build makes has the mark (format 1) from the start, and moves past it only for what needs it"] = until(lambda: fmt(first) == 1, 3, step=0.1)
     first.q("CREATE TABLE t (x INT)")
     first.q("INSERT INTO t VALUES (1), (2)")
     first.stop()
-    a = Node(new_bin, lake, port, work, env=later).start()  # leads, and knows format 2
-    b = Node(new_bin, lake, port + 1, work).start()  # follows, and knows format 1
+    a = Node(new_bin, lake, port, work, env=later).start()  # leads, and knows format 3
+    b = Node(new_bin, lake, port + 1, work).start()  # follows, and knows format 2
     time.sleep(22)  # (the leader's first two looks: it must not go past what the follower knows)
     info["with a node of each"] = {"leader's": fmt(a), "follower's": fmt(b), "releases": a.get("/stats")["releases"]}
     checks["a lake moves on only to the newest format every node knows"] = fmt(a) == 1 and fmt(b) == 1
     b.stop()
-    checks["…and on again once the node that didn't know the next one has gone"] = until(lambda: fmt(a) == 2, 40)
-    refused = lambda x: x.p.poll() not in (None, 0) and "format 2" in x.said() and "run Pondra" in x.said()
+    checks["…and on again once the node that didn't know the next one has gone"] = until(lambda: fmt(a) == 3, 40)
+    refused = lambda x, n=3: x.p.poll() not in (None, 0) and f"format {n}" in x.said() and "run Pondra" in x.said()
     b = Node(new_bin, lake, port + 1, work)
     try:  # a node that doesn't know the lake's format: at once, or as soon as its view holds the format
         b.start()
         b.p.wait(20)
     except (Failed, subprocess.TimeoutExpired):
         pass
-    info["a follower that knows format 1 said"] = b.said()[-300:]
+    info["a follower that knows format 2 said"] = b.said()[-300:]
     checks["a node that doesn't know the lake's format refuses it, saying which release it needs"] = refused(b)
     b.stop("kill")
     code, said = cli(new_bin, lake, "SELECT count(*) AS n FROM t", ok=False)
-    checks["…and so does pondra sql"] = code != 0 and "format 2" in said
+    checks["…and so does pondra sql"] = code != 0 and "format 3" in said
     a.stop()
     t0 = time.time()
     b = Node(new_bin, lake, port + 1, work)
@@ -637,10 +639,30 @@ def format_check(new_bin, work, port):
     b.stop("kill")
     t1 = time.time()
     a = Node(new_bin, lake, port, work, env=later).start()
-    info["seconds"] = {"a node of format 1 refused to lead it": round(t1 - t0, 1), "then one of format 2 led it": round(time.time() - t1, 1)}
+    info["seconds"] = {"a node of format 2 refused to lead it": round(t1 - t0, 1), "then one of format 3 led it": round(time.time() - t1, 1)}
     checks["…without holding on to the leader's term: the next node leads at once"] = refused(b) and time.time() - t1 < 10
     checks["the lake reads as it did"] = a.q("SELECT count(*) AS n FROM t") == [{"n": 2}]
     a.stop()
+    if old:  # format 2's first need: a view that works its answers out as it is read (ADR-055)
+        v, old_bin = old
+        lake = os.path.join(work, "format-views-lake")
+        n = Node(new_bin, lake, port, work).start()
+        n.q("CREATE TABLE s (k VARCHAR, x DOUBLE)")
+        n.q("CREATE MATERIALIZED VIEW totals AS SELECT k, sum(x) AS t FROM s GROUP BY k")
+        plain = fmt(n)
+        n.q("CREATE MATERIALIZED VIEW means AS SELECT k, avg(x) AS m FROM s GROUP BY k")
+        info["formats"] = {"a view of sums": plain, "a view of averages": fmt(n)}
+        n.stop()
+        o = Node(old_bin, lake, port, work)
+        try:
+            o.start()
+            o.p.wait(20)
+        except (Failed, subprocess.TimeoutExpired):
+            pass
+        info[f"Pondra {v} said"] = o.said()[-300:]
+        checks[f"a view that works its answers out as it is read moves the lake to format 2 (one of sums doesn't), and Pondra {v} then refuses it by name"] = (
+            plain == 1 and info["formats"]["a view of averages"] == 2 and refused(o, 2))
+        o.stop("kill")
     return checks, info
 
 
@@ -920,7 +942,7 @@ def main():
     work = A.work or tempfile.mkdtemp(prefix="pondra-upgrade-")
     os.makedirs(work, exist_ok=True)
     wanted = [v for v in A.only.split(",") if v]
-    found = [(v, url) for v, url in releases(A.first) if not wanted or v in wanted] if A.what in ("lakes", "rolling", "all") else []
+    found = [(v, url) for v, url in releases(A.first) if not wanted or v in wanted] if A.what in ("lakes", "format", "rolling", "all") else []
     out, ok = {}, True
     if A.what in ("lakes", "all"):
         out["lakes"] = {}
@@ -928,7 +950,7 @@ def main():
             ok &= run(v, out["lakes"], lake_check, v, binary(v, url, A.cache), new_bin, work, A.port)
         ok &= bool(found)
     if A.what in ("format", "all"):
-        ok &= run("format", out, format_check, new_bin, work, A.port)
+        ok &= run("format", out, format_check, new_bin, work, A.port, (found[-1][0], binary(*found[-1], A.cache)) if found else None)
     if A.what in ("drain", "all"):
         ok &= run("drain", out, drain_check, new_bin, work, A.port)
     if A.what in ("rolling", "all"):
