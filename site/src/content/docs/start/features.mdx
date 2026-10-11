@@ -1,0 +1,1895 @@
+---
+title: Everything Pondra does
+description: Every feature of Pondra in one line, with a short example that runs, grouped by what you want to do.
+tableOfContents:
+  maxHeadingLevel: 2
+---
+
+import FeatureIndex from '../../../components/FeatureIndex.astro';
+
+This page lists every feature of Pondra. Each one gets a sentence, a short example and a link to the
+page that explains it in full. Every example on this page runs as written, top to bottom, on one node
+(`pondra serve lake`). They run on every change to Pondra, so what you read here is what the code does.
+
+The Python examples use a connection to that node:
+
+```python
+import pondra
+db = pondra.connect("http://localhost:8080")
+```
+
+<FeatureIndex />
+
+## Run it: one machine to many
+
+The same binary runs on a laptop, on a server, and as a cluster on a bucket, with the same commands at each step.
+
+### Install
+Install with one line, pip or npm, then check that the program runs with `pondra --version`. [Install](/pondra/start/install/)
+
+```bash
+pondra --version
+```
+
+### The shell
+`pondra` on a folder opens a SQL shell on that lake, and piped input runs as a script, so the same commands work in a CI job. [The SQL shell](/pondra/start/shell/)
+
+```bash
+pondra shop <<'SQL'
+CREATE TABLE products (id BIGINT, name VARCHAR, price DOUBLE);
+INSERT INTO products VALUES (1, 'tea', 3.5), (2, 'cake', 4.5);
+SELECT name, price FROM products ORDER BY id
+SQL
+```
+
+### Scripts and files with parameters
+`pondra run` runs a `.sql` file and binds each `$name` to the `--name` you pass, so a value is never pasted into the text. [Command line](/pondra/reference/cli/#pondra-run)
+
+```bash
+cat > report.sql <<'SQL'
+CREATE TABLE products AS SELECT 'tea' AS name, 3.5 AS price UNION ALL SELECT 'cake', 4.5;
+SELECT name, price FROM products WHERE price >= $min;
+SQL
+pondra run report.sql daily --min 4
+```
+
+### Python: pondra.local()
+`pondra.local()` starts a node on a lake from inside your program and connects to it; the node stops when you call `close()` or the program ends. [Python client](/pondra/reference/python/)
+
+```python
+local = pondra.local("local-py")
+print(local.sql("SELECT 1 AS one").rows())
+local.close()
+```
+
+### JavaScript: local()
+`local()` does the same from Node: it starts a node, connects to it, and `close()` stops the node and keeps the lake. [JavaScript client](/pondra/reference/javascript/)
+
+```js
+import { local } from "pondra";
+const db = await local("local-js");
+console.log(await db.sql("SELECT 1 AS one"));
+await db.close();
+```
+
+### A server
+`pondra serve` runs a node on a lake, with HTTP, the console and clients on `--addr`, and it stays up until you stop it. [Command line](/pondra/reference/cli/#pondra-serve)
+
+```bash norun
+pondra serve lake --addr 127.0.0.1:8080
+```
+
+### Many databases on one server
+`pondra serve` on a folder serves each lake in it as a database, behind one HTTP port (and one Postgres port with `--pg`), and starts each database the first time it is used. [Many databases](/pondra/guides/server/)
+
+```bash norun
+pondra serve data --addr 0.0.0.0:8080 --pg 0.0.0.0:5432
+```
+
+### A cluster
+Nodes started on the same lake form a cluster: one leads the commits, the others take reads and writes, and any of them takes over if the leader stops. [Clusters](/pondra/guides/clusters/)
+
+```bash norun
+pondra serve s3://my-bucket/lake --addr 10.0.0.2:8080
+```
+
+### Any bucket
+A lake can live in S3, R2, MinIO, Google Cloud Storage or Azure: give its `s3://`, `gs://` or `az://` URL and read the credentials from the environment. [Object storage](/pondra/guides/object-storage/)
+
+```bash norun
+export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1
+pondra serve s3://my-bucket/lake --addr 10.0.0.1:8080
+```
+
+### Replicated acknowledgements
+`--ack replicated` acknowledges a write once two nodes hold it, in about 4 ms on any storage, and the bucket gets the write a moment later. [Clusters](/pondra/guides/clusters/#failover)
+
+```bash norun
+pondra serve s3://my-bucket/lake --addr 10.0.0.1:8080 --ack replicated
+```
+
+### Read-only nodes for dashboards
+`--reader` makes a node that answers SQL and never leads, so it needs only read access to the bucket and can sit beside the writers. [Clusters](/pondra/guides/clusters/)
+
+```bash norun
+pondra serve s3://my-bucket/lake --addr 10.0.0.3:8080 --reader
+```
+
+### Containers, Helm and system services
+`pondra service install` keeps a node running on a machine: systemd, launchd or the Windows service manager starts it at boot and stops it cleanly. The same guide covers the container image and the Helm chart. [Deploy](/pondra/guides/deploy/)
+
+```bash norun
+sudo pondra service install --addr 0.0.0.0:8080 --pg 0.0.0.0:5432
+```
+
+### Stopping and upgrading without losing work
+A node told to stop drains: it refuses new requests, finishes the running ones and hands leadership over, so you can replace the nodes one at a time while the cluster serves. [Upgrades and stopping nodes](/pondra/guides/upgrades/)
+
+```bash norun
+sudo systemctl stop pondra          # drains, then stops
+sudo systemctl start pondra
+until curl -sf localhost:8080/ready; do sleep 1; done
+```
+
+### Health and metrics
+`/healthz` answers while the process runs, `/ready` while the node serves, `/metrics` in Prometheus format, and `/stats` in JSON says the node's role, term and leader. [HTTP API](/pondra/reference/http/#the-server)
+
+```bash
+curl -s localhost:8080/healthz; echo
+curl -s localhost:8080/ready; echo
+curl -s localhost:8080/metrics | head -3
+```
+
+## Tables and the lake
+
+A table is Parquet files plus a log of the newest rows, and its options decide what kind of table it is, how its files are laid out, and what other engines see.
+
+### Append table
+Without a key, every row you write is kept, and a query sees all of them. [Tables](/pondra/guides/tables/)
+
+```sql
+CREATE TABLE events (user VARCHAR, amount BIGINT, ts TIMESTAMP);
+INSERT INTO events VALUES ('ann', 5, TIMESTAMP '2026-09-29 10:00:00'),
+  ('bob', 7, TIMESTAMP '2026-09-29 10:01:00');
+```
+
+### Keyed table
+With `PRIMARY KEY`, an `INSERT` replaces the row with the same key, and `UPDATE` and `DELETE` find rows by key. `db.lookup` reads one key without planning a query. [Keyed tables](/pondra/concepts/keyed-tables/)
+
+```sql
+CREATE TABLE customers (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
+INSERT INTO customers VALUES (1, 'ann', 'free'), (2, 'bob', 'free');
+INSERT INTO customers VALUES (2, 'bob', 'pro');
+```
+
+### Latest row by event time
+`SEQUENCE BY` makes the row with the latest event time current, so a late row never replaces a newer one. [Table options](/pondra/sql/table-options/#keyed-table)
+
+```sql
+CREATE TABLE readings (sensor VARCHAR PRIMARY KEY, ts TIMESTAMP, value DOUBLE) SEQUENCE BY ts;
+INSERT INTO readings VALUES ('s1', TIMESTAMP '2026-09-27 10:05:00', 41.3);
+INSERT INTO readings VALUES ('s1', TIMESTAMP '2026-09-27 10:01:00', 41.2);
+SELECT * FROM readings;
+```
+
+### Merge table
+A merge table combines the rows that share a key, with `MERGE sum`, `count`, `min` or `max` on each column that isn't the key. [Table options](/pondra/sql/table-options/#merge-table)
+
+```sql
+CREATE TABLE inventory (sku VARCHAR PRIMARY KEY, qty BIGINT MERGE sum);
+INSERT INTO inventory VALUES ('tea', 5), ('cake', 2);
+INSERT INTO inventory VALUES ('tea', 7);
+SELECT * FROM inventory ORDER BY sku;
+```
+
+### Rows that expire
+On a keyed table, `TTL` hides a row once its timestamp is older than the interval, and a full compaction deletes it for good. [Table options](/pondra/sql/table-options/#keyed-table)
+
+```sql
+CREATE TABLE signups (email VARCHAR PRIMARY KEY, seen TIMESTAMP) TTL seen + INTERVAL '1 day';
+INSERT INTO signups VALUES ('ann@example.com', now());
+```
+
+### Partitions and clustering
+`PARTITION BY` keeps one partition in each file, and `CLUSTER BY` sorts each file, so a filter on those columns skips most of the files or rows. [Tables](/pondra/guides/tables/#lay-out-the-files)
+
+```sql
+CREATE TABLE prices (product VARCHAR, ts TIMESTAMP, price DOUBLE) PARTITION BY day(ts) CLUSTER BY (product);
+```
+
+### Schemas and three-part names
+A table belongs to a schema, `public` unless you name one, and its full name is `lake.schema.table`. [Tables](/pondra/guides/tables/#group-tables-in-schemas)
+
+```sql
+CREATE SCHEMA crm;
+CREATE TABLE crm.customers (id BIGINT, name VARCHAR);
+INSERT INTO crm.customers VALUES (1, 'ann');
+SELECT * FROM lake.crm.customers;
+```
+
+### Changing columns
+`ALTER TABLE` adds, renames, drops and widens columns while rows keep arriving. No file is rewritten: old rows read a new column as null. [Tables](/pondra/guides/tables/#change-a-tables-columns)
+
+```sql
+CREATE TABLE staging (sensor VARCHAR, value INT, note VARCHAR);
+ALTER TABLE staging ADD COLUMN unit VARCHAR;
+ALTER TABLE staging RENAME COLUMN value TO celsius;
+ALTER TABLE staging ALTER COLUMN celsius TYPE BIGINT;
+ALTER TABLE staging DROP COLUMN note;
+```
+
+### CREATE OR ALTER TABLE
+`CREATE OR ALTER TABLE` makes a table, or brings the one already there to this definition without losing a row, so a project's files can run again and again. [SQL statements](/pondra/sql/statements/#every-kind-of-object)
+
+```sql
+CREATE OR ALTER TABLE products (sku VARCHAR PRIMARY KEY, name VARCHAR, price DOUBLE);
+CREATE OR ALTER TABLE products (sku VARCHAR PRIMARY KEY, name VARCHAR, price DOUBLE, shelf VARCHAR);
+```
+
+### NOT NULL, DEFAULT and CHECK
+`NOT NULL` refuses a row that gives no value, `DEFAULT` fills in a missing one, and `CHECK` refuses a row whose condition is false, on every door. [Tables](/pondra/guides/tables/#require-a-value-not-null-and-default)
+
+```sql
+CREATE TABLE crm.products (sku VARCHAR NOT NULL, price DOUBLE DEFAULT 0 CHECK (price >= 0), note VARCHAR DEFAULT 'new');
+INSERT INTO crm.products (sku) VALUES ('tea');
+SELECT * FROM crm.products;
+```
+
+### UNIQUE
+`UNIQUE` refuses a second row with the same value, from any node and any door, with Postgres's code `23505`. [SQL statements](/pondra/sql/statements/#tables)
+
+```sql
+CREATE TABLE crm.signups (id BIGINT, email VARCHAR UNIQUE);
+INSERT INTO crm.signups VALUES (1, 'ann@example.com');
+```
+
+### Sequences and identity columns
+`CREATE SEQUENCE` hands out each number once across the cluster, and an identity column takes the next number for every row that leaves it out. [SQL statements](/pondra/sql/statements/#sequences-and-identity-columns)
+
+```sql
+CREATE SEQUENCE signup_no START 1000 INCREMENT 10;
+CREATE TABLE crm.inventory (id BIGINT GENERATED ALWAYS AS IDENTITY, sku VARCHAR);
+INSERT INTO crm.inventory (sku) VALUES ('tea'), ('cake');
+SELECT nextval('signup_no') AS n;
+```
+
+### Enum types
+`CREATE TYPE … AS ENUM` makes a type whose column holds only its labels, and every way of writing rows refuses any other value. [SQL statements](/pondra/sql/statements/#enum-types)
+
+```sql
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TABLE crm.readings (who VARCHAR, feeling mood);
+INSERT INTO crm.readings VALUES ('ann', 'happy'), ('bo', 'sad');
+```
+
+### Indexes
+`CREATE INDEX` keeps an index as an object you can list and describe. Nothing is built for it: the files already keep each column's range, and `CLUSTER BY` keeps those ranges narrow. [SQL statements](/pondra/sql/statements/#indexes)
+
+```sql
+CREATE INDEX ON customers (name);
+SELECT name, definition FROM pondra.objects WHERE kind = 'index';
+```
+
+### Comments
+`COMMENT ON` describes a table, a column or any other object, and the comment follows a rename and goes with a drop. [SQL statements](/pondra/sql/statements/#every-kind-of-object)
+
+```sql
+COMMENT ON TABLE prices IS 'what each product cost, by day';
+COMMENT ON COLUMN prices.price IS 'in euros';
+```
+
+### SHOW CREATE
+`SHOW CREATE TABLE` gives the statements that make a table again, its comments included, so a copy can be made from it. [SQL statements](/pondra/sql/statements/#every-kind-of-object)
+
+```sql
+SHOW CREATE TABLE prices;
+```
+
+### Views
+`CREATE VIEW` stores a query that runs over the tables as they are when the view is read, and a view can read other views. [Tables](/pondra/guides/tables/#views)
+
+```sql
+CREATE VIEW big_events AS SELECT * FROM events WHERE amount > 5;
+SELECT * FROM big_events;
+```
+
+### Temporary tables
+`CREATE TEMP TABLE` makes a table that only your session sees, held in the node's memory, and it goes when the session ends. [SQL statements](/pondra/sql/statements/#views)
+
+```python
+db.sql("CREATE TEMP TABLE picked AS SELECT user FROM events WHERE amount > 5")
+print(db.sql("SELECT * FROM picked").rows())
+```
+
+### Rename a table
+`ALTER TABLE … RENAME TO` changes a table's name in place: no file is rewritten, and a published table stays readable by other engines under its new name. [Tables](/pondra/guides/tables/#rename-a-table)
+
+```sql
+ALTER TABLE crm.signups RENAME TO staging;
+SELECT count(*) AS n FROM crm.staging;
+```
+
+### Swap two tables
+`ALTER TABLE … SWAP WITH` exchanges two tables in one commit, so a rebuilt table can be written beside the live one, checked, and then swapped in. [Tables](/pondra/guides/tables/#write-audit-publish)
+
+```sql
+CREATE TABLE crm.prices CLONE prices;
+INSERT INTO crm.prices VALUES ('tea', TIMESTAMP '2026-09-27 12:00:00', 3.5);
+ALTER TABLE prices SWAP WITH crm.prices;
+SELECT count(*) AS n FROM prices;
+```
+
+### System columns
+Every row has `_row_id`, `_version`, `_created_at` and `_updated_at`. An `UPDATE` keeps the row's id and takes a new version, and a query names a system column to see it. [System columns](/pondra/sql/system-tables/#columns)
+
+```sql
+UPDATE events SET amount = 6 WHERE user = 'ann';
+SELECT _row_id, _version, user, amount FROM events ORDER BY _row_id;
+```
+
+### Published as Delta and Iceberg
+`publish` keeps a table as an Iceberg table, a Delta Lake table, or both, beside its Parquet files, so Spark, DuckDB and Polars read it without Pondra. [Other engines](/pondra/guides/other-engines/)
+
+```sql
+ALTER TABLE events SET (publish = iceberg);
+CHECKPOINT;
+```
+
+### Finding tables and objects
+`pondra.tables` lists every table and view with its kind, `pondra.objects` lists every object of every kind with its comment and definition, and `pondra.kinds` lists the kinds there are. [System columns and tables](/pondra/sql/system-tables/#tables-and-views)
+
+```sql
+SELECT schema, name, kind FROM pondra.tables WHERE lake = 'lake' ORDER BY 1, 2;
+```
+
+### Search everything by meaning
+`pondra.find('revenue')` searches every object, column, key, link and routine by name, comment and definition, and Pondra's concepts by other products' words; `pondra.parts` lists what is inside each object. `db.find` and MCP's `find` tool ask the same. [System columns and tables](/pondra/sql/system-tables/#parts-and-finding-things)
+
+```sql
+SELECT is, kind, object, name, matched FROM pondra.find('foreign key');
+```
+
+### Databases and attached lakes
+`CREATE DATABASE` makes a lake beside this one and attaches it, `ATTACH` attaches a lake that already exists, and `DETACH` lets go of it again. [Tables](/pondra/guides/tables/#use-other-lakes-as-databases)
+
+```sql
+CREATE DATABASE archive;
+CREATE TABLE archive.public.events AS SELECT * FROM events;
+DETACH archive;
+ATTACH 'archive' AS old;
+SELECT count(*) AS n FROM old.events;
+```
+
+## Load data
+
+Put rows into a table with SQL, an append from code, a file, a DataFrame, Postgres's `COPY`, Kafka, Arrow Flight or another engine, and load each batch exactly once when a retry must not count twice.
+
+### Insert rows with SQL
+`INSERT … VALUES` writes a few rows, and `INSERT … SELECT` writes a bulk load straight into Parquet files, written by the node that gets the statement. [Load data](/pondra/guides/load-data/#insert-rows-with-sql)
+
+```sql
+INSERT INTO events VALUES ('dee', 4, TIMESTAMP '2026-09-29 12:00:00');
+INSERT INTO events SELECT 'u' || (i % 3), i, TIMESTAMP '2026-09-29 12:30:00'
+  FROM generate_series(1, 1000) t(i);
+SELECT count(*) AS n FROM events;
+```
+
+### A table from a file
+`CREATE TABLE … AS SELECT * FROM 'file.csv'` makes a table from a file on your machine. Parquet and JSON lines work the same way, and `read_csv` takes options such as `header => true`. [Load data](/pondra/guides/load-data/#load-files)
+
+```bash
+printf 'user,amount,ts\nfay,8,2026-09-29 12:10:00\n' > more.csv
+pondra shop <<'SQL'
+CREATE TABLE events AS SELECT * FROM 'more.csv';
+SELECT user, amount FROM events;
+SQL
+```
+
+### Exactly-once appends
+`db.append` sends rows in batches that the client numbers, so a batch resent after a lost answer is applied once. Each connection has its own producer name, and the batches are retried until they are acknowledged. [Python client](/pondra/reference/python/#writing-rows)
+
+```python
+print(db.append("events", [{"user": "eve", "amount": 1}, {"user": "fay", "amount": 2}]))
+```
+
+### Rows from pandas, Polars or Arrow
+`db.write_table` takes a pandas, Polars or Arrow table, or a query, and creates, appends to or overwrites a table with it (`mode="create"`, `"append"` or `"overwrite"`). [Python client](/pondra/reference/python/#writing-rows)
+
+```python
+import pandas as pd
+db.write_table("events", pd.DataFrame({"user": ["gus"], "amount": [9]}), mode="append")
+```
+
+### A bulk INSERT with a job
+Give a write a job id, and a retry of it changes nothing: this is how a nightly load is made safe to run twice. Over HTTP the same is `POST /insert/{table}?job=ID`. [Load data](/pondra/guides/load-data/#load-a-batch-once-with-a-job)
+
+```python
+load = "INSERT INTO events SELECT 'nightly', i, TIMESTAMP '2026-09-29 23:00:00' FROM generate_series(1, 50) t(i)"
+print(db.sql(load, job="load-2026-09-29"))
+print(db.sql(load, job="load-2026-09-29"))    # a retry: nothing is written
+```
+
+### COPY FROM STDIN
+With the Postgres port on, `COPY … FROM STDIN` loads text or CSV rows from psql, from psycopg and from any client that speaks the protocol. [Postgres port](/pondra/reference/postgres/)
+
+```bash
+printf 'cy,4,2026-09-29 12:20:00\n' | psql -h localhost -p 5432 -c "COPY events FROM STDIN (FORMAT csv)"
+```
+
+### Kafka producers
+A Kafka topic is a table: an existing Kafka producer writes JSON rows to it, and a table's `_key` and `_timestamp` columns take each record's key and time. [Kafka](/pondra/guides/kafka/)
+
+```sql
+CREATE TABLE crm.events (user VARCHAR, amount BIGINT, _key VARCHAR, _timestamp TIMESTAMP);
+```
+
+```python
+import json
+from confluent_kafka import Producer
+
+producer = Producer({"bootstrap.servers": "localhost:9092", "enable.idempotence": True})
+producer.produce("crm.events", key="u1", value=json.dumps({"user": "u1", "amount": 3}))
+producer.flush(10)
+```
+
+### Arrow Flight DoPut
+`DoPut` appends a stream of Arrow batches to a table through the log. With a producer name and a first sequence number, each batch is applied exactly once, and a repeated one is answered with `duplicate: true`. [Arrow Flight](/pondra/reference/flight/#write-with-doput)
+
+```python
+import json
+import pyarrow as pa
+import pyarrow.flight as flight
+
+client = flight.FlightClient("grpc://localhost:8815")
+batch = pa.table({"user": ["hal", "ivy"], "amount": [4, 6]})
+writer, reader = client.do_put(flight.FlightDescriptor.for_path("events", "flight-1", "1"), batch.schema)
+writer.write_table(batch)
+writer.done_writing()
+print(json.loads(reader.read().to_pybytes()))
+writer.close()
+```
+
+### Debezium change events
+Debezium change events become upserts and deletes on a table with a primary key: `after` is the new row, and a record with no value (a tombstone) deletes its key. This example reuses the `producer` from the Kafka example above. [Kafka](/pondra/guides/kafka/#debezium-and-change-events)
+
+```python
+change = {"op": "c", "before": None, "after": {"id": 3, "name": "cy", "plan": "free"}, "source": {"db": "shop"}}
+producer.produce("customers", key=json.dumps({"id": 3}), value=json.dumps(change))
+producer.produce("customers", key=json.dumps({"id": 1}), value=None)    # a tombstone: key 1 is deleted
+producer.flush(10)
+```
+
+### Other engines appending through the Iceberg REST catalog
+Another engine, such as PyIceberg or Spark, attaches the node's Iceberg REST catalog by URL and appends to a published table with its own compute. The node records each file after checking it, and never copies the rows. [Other engines](/pondra/guides/other-engines/#append-from-another-engine)
+
+```python
+import datetime as dt
+import pyarrow as pa
+from pyiceberg.catalog import load_catalog
+
+catalog = load_catalog("pondra", type="rest", uri="http://localhost:8080")
+rows = pa.table({
+    "user": ["cy"],
+    "amount": pa.array([9], pa.int64()),
+    "ts": pa.array([dt.datetime(2026, 9, 29, 11, 0)], pa.timestamp("us")),
+})
+catalog.load_table("default.events").append(rows)
+```
+
+## Query
+
+SQL with Postgres's forms and DuckDB's spellings, parameters and variables, transactions, key lookups, and the tools to see what a query did.
+
+### SQL
+
+Postgres's forms on Apache DataFusion: joins, CTEs and window functions over the lake's tables, written as you would in Postgres. [Query](/pondra/guides/query/)
+
+```sql
+CREATE TABLE sales (id BIGINT, day DATE, item VARCHAR, qty INT, amount DOUBLE);
+INSERT INTO sales VALUES (1, DATE '2026-09-28', 'tea', 2, 7.0),
+  (2, DATE '2026-09-28', 'cake', 1, 4.5), (3, DATE '2026-09-29', 'tea', 1, 3.5),
+  (4, DATE '2026-09-29', 'pie', 2, 9.0);
+WITH totals AS (SELECT item, sum(amount) AS total FROM sales GROUP BY item)
+SELECT item, total, rank() OVER (ORDER BY total DESC) AS place FROM totals
+  ORDER BY place;
+```
+
+### FROM-first queries
+
+`FROM t` alone is `SELECT * FROM t`, and `FROM t SELECT …` names the columns first, as DuckDB writes it. [SQL statements](/pondra/sql/statements/#queries)
+
+```sql
+FROM sales SELECT item, sum(amount) AS total GROUP BY item ORDER BY total DESC;
+```
+
+### PIVOT
+
+`PIVOT t ON col USING agg(x)` makes a column per value of `col`; without `IN (…)`, the values are found when the query runs. [Query](/pondra/guides/query/#write-it-as-duckdb-does)
+
+```sql
+PIVOT sales ON item USING sum(amount) GROUP BY day;
+```
+
+### COLUMNS(…)
+
+`COLUMNS('regex')` or `COLUMNS(*)` picks columns by name, and the function around it runs once per column, so you get one maximum per column. [Query](/pondra/guides/query/#write-it-as-duckdb-does)
+
+```sql
+SELECT max(COLUMNS('qty|amount')), max_by(item, amount) AS biggest FROM sales;
+```
+
+### SUMMARIZE
+
+`SUMMARIZE t` gives a row per column: its type, min, max, distinct values, mean, quartiles, count and NULLs. [Query](/pondra/guides/query/#write-it-as-duckdb-does)
+
+```sql
+SUMMARIZE sales;
+```
+
+### Lambdas
+
+`x -> x + 1` and list comprehensions (`[q * 2 FOR q IN … IF …]`) work on lists in any query; `LAMBDA x: x + 1` is the same. [Query](/pondra/guides/query/#write-it-as-duckdb-does)
+
+```sql
+SELECT id, list_transform([qty], x -> x + 1) AS plus, [q * 2 FOR q IN [qty, qty + 1] IF q > 1] AS doubled
+  FROM sales;
+```
+
+### USING SAMPLE
+
+`FROM t USING SAMPLE 50%` keeps each row with that chance, and `n ROWS` keeps a fixed count. [Query](/pondra/guides/query/#write-it-as-duckdb-does)
+
+```sql
+SELECT count(*) AS about_100 FROM range(1000) USING SAMPLE 10%;
+SELECT item FROM sales USING SAMPLE 2 ROWS;
+```
+
+### GROUP BY ALL
+
+`GROUP BY ALL` groups by every column the query doesn't aggregate, so you don't list them twice. [SQL statements](/pondra/sql/statements/#queries)
+
+```sql
+SELECT item, day, sum(amount) AS total FROM sales GROUP BY ALL;
+```
+
+### Spark SQL in a query
+
+`spark_sql('…')` in a `FROM` takes a query in Spark SQL's grammar, with Spark's functions, and returns its rows to the query around it. [SQL functions](/pondra/sql/functions/#sparks-functions)
+
+```sql
+SELECT * FROM spark_sql('SELECT floor(-2.5) AS f, substring("Spark SQL", -3) AS s') s;
+```
+
+### ASOF JOIN
+
+Each row gets the other table's row as it was at that moment: here the latest quote at or before each trade. [SQL statements](/pondra/sql/statements/#queries)
+
+```sql
+CREATE TABLE quotes (sym VARCHAR, ts TIMESTAMP, price DOUBLE);
+CREATE TABLE trades (id BIGINT, sym VARCHAR, ts TIMESTAMP, qty BIGINT);
+INSERT INTO quotes VALUES ('ABC', '2026-09-29 09:30:00', 10.0),
+  ('ABC', '2026-09-29 09:31:00', 11.0);
+INSERT INTO trades VALUES (1, 'ABC', '2026-09-29 09:30:30', 5),
+  (2, 'ABC', '2026-09-29 09:31:45', 2);
+SELECT t.id, t.qty, q.price
+  FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym
+  ORDER BY t.id;
+```
+
+### Parameters
+
+Write `$name` in the SQL and pass its value with the call: the node binds the value and never pastes it into the text. [Query](/pondra/guides/query/#parameters)
+
+```python
+print(db.sql("SELECT item, sum(qty) AS n FROM sales WHERE amount >= $min GROUP BY item ORDER BY item", min=4).rows())
+```
+
+### Variables
+
+`DECLARE $day DATE = …` holds one value for the statements after it, in a session or a script, and `$day` is bound wherever it is used. [SQL statements](/pondra/sql/statements/#variables)
+
+```sql
+DECLARE $day DATE = DATE '2026-09-29';
+$day = $day - 1;
+SELECT $day, sum(amount) AS total FROM sales WHERE day = $day;
+```
+
+### USE and the search path
+
+`USE desk` makes a schema the session's, so a name with one part is looked up there first; `SET search_path` is the same setting in Postgres's words. [SQL statements](/pondra/sql/statements/#settings-and-prepared-statements)
+
+```sql
+CREATE SCHEMA desk; CREATE TABLE desk.bids (id BIGINT, amount DOUBLE);
+INSERT INTO desk.bids VALUES (1, 9.5); USE desk;
+SELECT count(*) AS n FROM bids;
+```
+
+### Transactions
+
+`BEGIN` … `COMMIT` makes several statements one commit, all or nothing; each reads the lake as it was at `BEGIN`, and a conflicting commit is refused with `40001`. [Change rows](/pondra/guides/change-rows/#transactions)
+
+```sql
+CREATE TABLE accounts (id BIGINT PRIMARY KEY, owner VARCHAR, balance BIGINT);
+INSERT INTO accounts VALUES (1, 'ann', 100), (2, 'bo', 50);
+BEGIN;
+UPDATE accounts SET balance = balance - 30 WHERE id = 1;
+UPDATE accounts SET balance = balance + 30 WHERE id = 2;
+COMMIT;
+```
+
+### Point lookups
+
+`GET /lookup/{table}/{key}` answers one key's current row of a keyed table, without SQL planning. [HTTP API](/pondra/reference/http/#read-and-follow)
+
+```bash
+curl -s http://localhost:8080/lookup/accounts/1
+```
+
+### Queries across nodes
+
+A query over a big table runs across the nodes when that pays, without asking; `?spread=1` spreads it anyway and `?spread=0` keeps it on one node. [Query](/pondra/guides/query/#queries-across-several-nodes)
+
+```bash
+curl -s -X POST "http://localhost:8080/sql?spread=1" -d "SELECT count(*) AS n FROM sales"
+```
+
+### Remembered answers
+
+A node remembers an answer until the next commit to the tables it reads, and `stale_ms` accepts one up to that many milliseconds old. [Query](/pondra/guides/query/#repeated-queries)
+
+```bash
+curl -s -X POST "http://localhost:8080/sql?stale_ms=5000" -d "SELECT count(*) AS n FROM sales"
+```
+
+### EXPLAIN and EXPLAIN ANALYZE
+
+`EXPLAIN` shows the plan with the rows each step expects; `EXPLAIN ANALYZE` runs the query and adds the rows each step really gave. [Query](/pondra/guides/query/#explain-a-query)
+
+```sql
+EXPLAIN SELECT item, sum(amount) FROM sales GROUP BY item;
+EXPLAIN ANALYZE SELECT item, sum(amount) FROM sales GROUP BY item;
+```
+
+### Downloads
+
+`POST /sql?format=csv` (also `tsv`, `ndjson`, `parquet` and `xlsx`) runs the query again and downloads every row as a file. [HTTP API](/pondra/reference/http/#run-sql)
+
+```bash
+curl -s -X POST "http://localhost:8080/sql?format=csv" -d "SELECT id, item, amount FROM sales ORDER BY id"
+```
+
+### Statement history
+
+Every statement is a row of `pondra.history`, with its fingerprint, duration, rows and the commit it read, so you can find the slow queries. [System tables](/pondra/sql/system-tables/)
+
+```sql
+SELECT fingerprint, count(*) AS runs, avg(ms) AS ms FROM pondra.history
+  WHERE outcome = 'ok' GROUP BY fingerprint ORDER BY ms DESC LIMIT 5;
+```
+
+### Session settings
+
+`SET datafusion.…` changes one of DataFusion's options for the session's queries, and each name and value is checked as it is set; here, Spark's dialect. [SQL statements](/pondra/sql/statements/#settings-and-prepared-statements)
+
+```sql
+SET datafusion.sql_parser.dialect = 'spark';
+SELECT floor(2.5) AS f, substring("Spark SQL", -3) AS s;
+```
+
+## Change rows and time travel
+
+Change rows in place, follow every change, and read, restore, clone, drop and bring back a table as it was.
+
+### Update and delete rows
+
+`UPDATE` and `DELETE` change the rows that match; nothing is rewritten, and the old version is hidden from every read. [Change rows](/pondra/guides/change-rows/#update-and-delete-rows)
+
+```sql
+CREATE TABLE stock (sku VARCHAR, qty INT, note VARCHAR);
+INSERT INTO stock VALUES ('tea', 10, ''), ('cake', 5, ''), ('pie', 2, ''),
+  ('jam', 8, '');
+UPDATE stock SET qty = qty + 1, note = 'counted' WHERE sku = 'tea';
+DELETE FROM stock WHERE sku = 'jam';
+```
+
+### Merge rows
+
+`MERGE` lines a source up against a table and decides each row: `WHEN MATCHED` updates or deletes, `WHEN NOT MATCHED` inserts, and `WHEN NOT MATCHED BY SOURCE` changes the table's rows the source lacks. [Change rows](/pondra/guides/change-rows/#merge-rows-from-another-table)
+
+```sql
+MERGE INTO stock t USING (VALUES ('tea', 1), ('fig', 4)) AS s(sku, qty) ON t.sku = s.sku
+WHEN MATCHED THEN UPDATE SET qty = t.qty + s.qty
+WHEN NOT MATCHED THEN INSERT VALUES (s.sku, s.qty, 'from a list');
+```
+
+### Update or delete with a join
+
+`UPDATE … FROM` and `DELETE … USING` join the table to another one, as in Postgres, and a row that matches twice is changed once. [Change rows](/pondra/guides/change-rows/#update-or-delete-with-another-table)
+
+```sql
+UPDATE accounts SET balance = balance + d.delta
+  FROM (VALUES (1, 10), (2, -5)) AS d(id, delta) WHERE accounts.id = d.id;
+DELETE FROM accounts USING (VALUES (2)) AS gone(id) WHERE accounts.id = gone.id;
+```
+
+### Insert or update on a key
+
+`INSERT … ON CONFLICT (key)` decides what a row does when its key is already there: `DO UPDATE SET` changes the row that is there, and `DO NOTHING` skips the new one. [Change rows](/pondra/guides/change-rows/#insert-or-update-on-a-key)
+
+```sql
+INSERT INTO accounts VALUES (3, 'cy', 20) ON CONFLICT (id) DO UPDATE
+  SET balance = accounts.balance + excluded.balance;
+INSERT INTO accounts VALUES (3, 'cy', 99) ON CONFLICT (id) DO NOTHING;
+SELECT * FROM accounts ORDER BY id;
+```
+
+### Empty a table
+
+`TRUNCATE` deletes every row and keeps the table, its columns and its options. [Change rows](/pondra/guides/change-rows/#empty-a-table)
+
+```sql
+TRUNCATE trades;
+SELECT count(*) AS n FROM trades;
+```
+
+### Change rows once
+
+A job id makes a change safe to retry: a second statement with the same id changes nothing and answers `duplicate`. [Change rows](/pondra/guides/change-rows/#change-rows-exactly-once)
+
+```python
+bump = "UPDATE stock SET qty = qty + 100 WHERE sku = 'pie'"
+print(db.sql(bump, job="restock-2026-10-11"))
+print(db.sql(bump, job="restock-2026-10-11"))  # a retry: nothing changes
+```
+
+### Follow changes
+
+The change feed streams every change to a table as it commits, each row with `_change_type` (`insert`, `update_preimage`, `update_postimage`, `delete`); `changes=True` adds the updates and deletes. [Change rows](/pondra/guides/change-rows/#follow-the-changes)
+
+```python
+import itertools
+for row in itertools.islice(db.watch("stock", after=0, changes=True), 3):
+    print(row["_change_type"], row["sku"], row["qty"])
+```
+
+### A table as it was
+
+`t AT (VERSION => n)`, `AT (TIMESTAMP => '…')` or `AT (OFFSET => -3600)` reads an append table as it was then, anywhere a table is read, joins included. [SQL statements](/pondra/sql/statements/#a-tables-past)
+
+```sql
+DECLARE $before BIGINT = (SELECT max(_version) FROM stock);
+UPDATE stock SET qty = 0 WHERE sku = 'tea';
+SELECT n.sku, w.qty AS was, n.qty AS now FROM stock n
+  JOIN stock AT (VERSION => $before) w ON n.sku = w.sku WHERE n.sku = 'tea';
+```
+
+### Restore a table
+
+`RESTORE TABLE t TO VERSION AS OF n` (or `TIMESTAMP AS OF '…'`) puts an append table back as it was then, in one change that can itself be undone. [SQL statements](/pondra/sql/statements/#tables)
+
+```python
+v = db.sql("SELECT max(_version) AS v FROM stock").rows()[0]["v"]
+db.sql("UPDATE stock SET qty = 0 WHERE sku = 'pie'")
+db.sql(f"RESTORE TABLE stock TO VERSION AS OF {v}")
+print(db.sql("SELECT qty FROM stock WHERE sku = 'pie'").rows())
+```
+
+### Clone a table
+
+`CREATE TABLE c CLONE t` makes `c` with `t`'s rows as they are, copying no file, and the two change apart from then on. [SQL statements](/pondra/sql/statements/#a-tables-past)
+
+```sql
+CREATE TABLE ledger CLONE stock;
+SELECT count(*) AS n FROM ledger;
+```
+
+### Drop and undrop a table
+
+`DROP TABLE` keeps the table for a day, or for its `retention`, so `UNDROP TABLE` brings it back with every row and version. [SQL statements](/pondra/sql/statements/#tables)
+
+```sql
+ALTER TABLE ledger SET (retention = '2 hours');
+DROP TABLE ledger;
+UNDROP TABLE ledger;
+```
+
+## Streams and live views
+
+Views that stay current as rows arrive: any query, windows and sessions by event time, stream joins, flows, feeds from Kafka and live answers.
+
+### Views kept current
+
+A materialized view is any query the node keeps current in the same commit as the rows, so a read never lags the table: here the two biggest clicks. [Streaming](/pondra/guides/streaming/#keep-a-query-up-to-date)
+
+```sql
+CREATE TABLE clicks (user VARCHAR, page VARCHAR, ts TIMESTAMP, amount BIGINT);
+INSERT INTO clicks VALUES ('ann', 'home', '2026-09-29 10:00:05', 1),
+  ('bob', 'home', '2026-09-29 10:00:40', 2), ('ann', 'cart', '2026-09-29 10:01:10', 3);
+CREATE MATERIALIZED VIEW biggest AS SELECT user, page, amount FROM clicks
+  ORDER BY amount DESC LIMIT 2;
+```
+
+### GROUP BY views
+
+A grouped view keeps one running row per group, updated by every commit, and any number of nodes add to it at once. [Streaming](/pondra/guides/streaming/#keep-a-query-up-to-date)
+
+```sql
+CREATE MATERIALIZED VIEW spend AS SELECT user, count(*) AS n, sum(amount) AS total
+  FROM clicks GROUP BY user;
+INSERT INTO clicks VALUES ('ann', 'checkout', '2026-09-29 10:02:00', 5);
+SELECT * FROM spend ORDER BY user;
+```
+
+### Tumbling windows
+
+`EMIT FINAL` keeps each group of event-time buckets once the watermark (the newest event time less `lateness`) has passed its end, instead of keeping running totals. [Streaming](/pondra/guides/streaming/#windows-each-group-once-its-over)
+
+```sql
+CREATE MATERIALIZED VIEW per_minute WITH (lateness = '10 seconds') AS
+  SELECT date_bin(INTERVAL '1 minute', ts) AS minute, user, count(*) AS n FROM clicks
+  GROUP BY 1, 2 EMIT FINAL;
+```
+
+### Sliding windows
+
+A window frame over the minutes a view keeps adds up the last five minutes at every minute, and each row is counted once, in its own minute. [Streaming](/pondra/guides/streaming/#sliding-windows)
+
+```sql
+CREATE MATERIALIZED VIEW minutes AS
+  SELECT date_bin(INTERVAL '1 minute', ts) AS minute, user, count(*) AS n FROM clicks
+  GROUP BY 1, 2;
+SELECT minute, user, sum(n) OVER (PARTITION BY user ORDER BY minute
+  RANGE BETWEEN INTERVAL '4 minutes' PRECEDING AND CURRENT ROW) AS last_five
+  FROM minutes ORDER BY minute, user;
+```
+
+### Session windows
+
+`GROUP BY … SESSION(ts, INTERVAL …)` keeps each key's rows with no gap longer than the interval as one session, and `EMIT FINAL` keeps each session once it is over, with `session_start` and `session_end`. [Streaming](/pondra/guides/streaming/#session-windows)
+
+```sql
+CREATE MATERIALIZED VIEW sessions WITH (lateness = '5 seconds') AS
+  SELECT user, count(*) AS n, sum(amount) AS spent FROM clicks
+  GROUP BY user, SESSION(ts, INTERVAL '30 seconds') EMIT FINAL;
+```
+
+### Join two streams
+
+`join = 'streams'` pairs each row with the other table's rows as they arrive, in whichever order they come, each pair once; `within_secs` bounds how far apart they may be. [Streaming](/pondra/guides/streaming/#join-two-streams)
+
+```sql
+CREATE TABLE bids (user VARCHAR, amount DOUBLE, ts TIMESTAMP);
+CREATE MATERIALIZED VIEW bid_clicks
+  WITH (join = 'streams', time = 'ts', within_secs = 600) AS
+  SELECT c.user, c.page, b.amount FROM clicks c JOIN bids b ON c.user = b.user
+  AND b.ts BETWEEN c.ts AND c.ts + INTERVAL '10 minutes';
+```
+
+### Flows
+
+Materialized views that follow each other move in the same commit as the rows that started them: a silver view over a bronze table, and a gold view over silver. [Flows](/pondra/guides/flows/#bronze-silver-gold)
+
+```sql
+CREATE TABLE raw_orders (id BIGINT, region VARCHAR, buyer VARCHAR, amount BIGINT, status VARCHAR, at BIGINT);
+CREATE MATERIALIZED VIEW clean_orders AS SELECT id, region, buyer, amount
+  FROM raw_orders WHERE status <> 'test';
+CREATE MATERIALIZED VIEW buyer_totals AS
+  SELECT region, buyer, count(*) AS orders, sum(amount) AS total FROM clean_orders
+  GROUP BY region, buyer;
+INSERT INTO raw_orders VALUES (1, 'eu', 'ann', 30, 'paid', 1),
+  (2, 'us', 'bob', 12, 'paid', 2), (3, 'us', 'cat', 50, 'test', 3);
+```
+
+### Rollups
+
+A view of a `GROUP BY` view sees its partial rows, so it combines them: group by some of its keys and `sum()` its sums and counts. [Flows](/pondra/guides/flows/#what-a-view-of-a-view-may-be)
+
+```sql
+CREATE MATERIALIZED VIEW region_totals AS
+  SELECT region, sum(orders) AS orders, sum(total) AS total FROM buyer_totals
+  GROUP BY region;
+```
+
+### Expectations
+
+`CHECK … ON VIOLATION DROP ROW` leaves out rows that break it, `EXPECT` keeps them and counts them, and a plain `CHECK` refuses the write that brings one. [Flows](/pondra/guides/flows/#expectations)
+
+```sql
+CREATE MATERIALIZED VIEW checked_orders (CONSTRAINT positive CHECK (amount > 0)
+  ON VIOLATION DROP ROW, CONSTRAINT has_buyer EXPECT (buyer IS NOT NULL)) AS
+  SELECT id, buyer, amount FROM raw_orders;
+CREATE MATERIALIZED VIEW strict_orders (CONSTRAINT small CHECK (amount < 1000)) AS
+  SELECT id, amount FROM raw_orders;
+SELECT view, expectation, on_violation, failed_rows FROM pondra.expectations
+  ORDER BY expectation;
+```
+
+### History per key
+
+A history view keeps every version of each key, with `__start_at` and `__end_at` when you read it, put in order by `sequence_by` (Databricks' SCD type 2). [Flows](/pondra/guides/flows/#history-per-key-scd-type-2)
+
+```sql
+CREATE MATERIALIZED VIEW order_history WITH (history = 'id', sequence_by = 'at') AS
+  SELECT id, region, amount, status, at FROM raw_orders;
+SELECT id, amount, __start_at, __end_at FROM order_history ORDER BY id, __start_at;
+```
+
+### Detach a view
+
+`ALTER MATERIALIZED VIEW v DETACH` stops the view following its tables and keeps what it holds as a table of the same name, which then takes inserts like any other. [Flows](/pondra/guides/flows/#stop-a-stage-keep-its-rows)
+
+```sql
+CREATE MATERIALIZED VIEW eu_orders AS SELECT id, buyer, amount FROM raw_orders
+  WHERE region = 'eu';
+ALTER MATERIALIZED VIEW eu_orders DETACH;
+```
+
+### Kafka topic feeds
+
+A materialized view over a Kafka topic is a feed: each record lands once, through restarts and leader changes, because its offset commits with its rows. [Kafka](/pondra/guides/kafka/#keep-a-table-fed-from-a-topic)
+
+```sql
+CREATE SECRET feed_kafka (TYPE kafka, SECURITY_PROTOCOL 'PLAINTEXT', SCOPE 'kafka://127.0.0.1:9092');
+ATTACH 'kafka://127.0.0.1:9092' AS brokers (TYPE kafka);
+CREATE MATERIALIZED VIEW ledger_feed WITH (start = 'earliest') AS
+  SELECT json_get_str(value, 'sku') AS sku FROM brokers.ledger;
+```
+
+### Live queries
+
+`db.live(query)` answers now, and again each time a commit changes what the query reads; it stops when you close it, and nothing runs on the node after that. [Streaming](/pondra/guides/streaming/#live-queries)
+
+```python
+live = db.live("SELECT count(*) AS n FROM clicks")
+print(next(live))
+db.append("clicks", [{"user": "eve", "page": "cart", "ts": "2026-09-29T10:05:00", "amount": 2}])
+print(next(live)); live.close()
+```
+
+### Streaming tasks
+
+A task runs any SQL over each commit's new rows and appends its result to a target table, exactly once; here it keeps each user's running total in `daily`. [Streaming](/pondra/guides/streaming/#tasks-any-streaming-sql)
+
+```bash
+curl -s -X POST localhost:8080/sql -d "CREATE TABLE daily (user VARCHAR PRIMARY KEY, total BIGINT, n BIGINT)"
+curl -s -X POST localhost:8080/tasks/running_totals -d '{"source": "clicks", "target": "daily", "key": ["user"], "sql": "SELECT c.user, coalesce(max(t.total), 0) + sum(c.amount) AS total, coalesce(max(t.n), 0) + count(*) AS n FROM clicks c LEFT JOIN daily t ON c.user = t.user GROUP BY c.user"}'
+```
+
+## Python and code
+
+Python and SQL work on the same tables: query from Python in Polars' or PySpark's names, write functions and procedures in either language, and run scripts, notebooks and files as jobs, now or on a schedule.
+
+### SQL from Python
+
+Run SQL from Python with `db.sql`, which answers a frame you read with `rows()` or `to_pandas()`, and nothing runs until you ask. [Python client](/pondra/reference/python/)
+
+```python
+db.sql("CREATE TABLE measurements (id BIGINT, sensor VARCHAR, celsius DOUBLE)")
+db.sql("INSERT INTO measurements VALUES (1, 'north', 18.5), (2, 'north', 22.0), (3, 'south', 26.5), (4, 'south', 30.0), (5, 'east', 12.0)")
+print(db.sql("SELECT sensor, avg(celsius) AS avg_c FROM measurements GROUP BY sensor ORDER BY sensor").rows())
+```
+
+### Frames with Polars names
+
+Build a query step by step with Polars' method names; it runs as one SQL statement when you ask for its rows. [DataFrames](/pondra/guides/dataframes/)
+
+```python
+from pondra import col
+
+print(db.table("measurements").filter(col("celsius") > 20).group_by("sensor").agg(col("celsius").sum().alias("total"), pondra.len().alias("n")).sort("sensor").rows())
+```
+
+### Change rows from a frame
+
+`update` and `delete` on a table's frame take a `where` and run as SQL on the node. [Frames](/pondra/reference/frames/)
+
+```python
+db.table("measurements").update({"celsius": col("celsius") + 1}, where=col("id") == 5)
+db.table("measurements").delete(where=col("id") == 1)
+```
+
+### PySpark names
+
+Write PySpark's names over the same frames with `pondra.spark`, so a PySpark job moves here by changing its imports. [PySpark](/pondra/guides/pyspark/)
+
+```python
+from pondra.spark import SparkSession, functions as F
+
+spark = SparkSession.builder.remote("pondra://localhost:8080").getOrCreate()
+print(spark.table("measurements").where(F.col("celsius") > 20).groupBy("sensor").agg(F.count("*").alias("n")).orderBy("sensor").toPandas())
+```
+
+### SQL naming your Python data
+
+A name in a query that isn't a table is read from your Python variables, and a pandas table travels with that one query. [Notebooks](/pondra/guides/notebooks/#your-variables-are-tables)
+
+```python
+import pandas as pd
+
+alarms = pd.DataFrame({"sensor": ["north", "south"], "alarm_at": [20.0, 28.0]})
+print(db.sql("SELECT m.sensor, max(m.celsius) AS peak, a.alarm_at FROM measurements m JOIN alarms a USING (sensor) GROUP BY m.sensor, a.alarm_at ORDER BY m.sensor").rows())
+```
+
+### SQL functions
+
+A SQL function is an expression or a query whose body goes into the query where it is called, so it spreads over the nodes like any query. [Functions and procedures](/pondra/guides/functions-and-procedures/#sql-functions)
+
+```sql
+CREATE FUNCTION is_hot(c DOUBLE, threshold DOUBLE = 25) RETURNS BOOLEAN RETURN c >= threshold;
+SELECT id, sensor FROM measurements WHERE is_hot(celsius) ORDER BY id;
+```
+
+### Macros
+
+A macro is DuckDB's name for a SQL function, and DuckDB's `CREATE MACRO` runs as it is. [SQL statements](/pondra/sql/statements/#functions-procedures-and-tasks)
+
+```sql
+CREATE MACRO pct_of(part, whole) AS part * 100.0 / whole;
+SELECT sensor, round(pct_of(celsius, 40.0), 1) AS pct FROM measurements ORDER BY id;
+```
+
+### Python functions
+
+A function written in Python runs on each node's own rows, called once per row by default. [Functions and procedures](/pondra/guides/functions-and-procedures/#python-functions)
+
+```sql
+CREATE FUNCTION fahrenheit(c DOUBLE) RETURNS DOUBLE LANGUAGE python AS $$
+    return c * 9 / 5 + 32
+$$;
+SELECT sensor, fahrenheit(celsius) AS f FROM measurements ORDER BY id;
+```
+
+### Vectorized Python functions
+
+`WITH (vectorized = true)` calls the function once per batch with pyarrow arrays, the fast shape for arithmetic. [Functions and procedures](/pondra/guides/functions-and-procedures/#python-functions)
+
+```sql
+CREATE FUNCTION fahrenheit_batch(c DOUBLE) RETURNS DOUBLE LANGUAGE python WITH (vectorized = true) AS $$
+    import pyarrow.compute as pc
+    return pc.add(pc.multiply(c, 1.8), 32.0)
+$$;
+SELECT sensor, round(fahrenheit_batch(celsius), 1) AS f FROM measurements ORDER BY id;
+```
+
+### Python table functions
+
+A Python function that returns rows (a list of tuples, a DataFrame or an Arrow table) is read in `FROM`. [Functions and procedures](/pondra/guides/functions-and-procedures/#python-functions)
+
+```sql
+CREATE FUNCTION countdown(n BIGINT) RETURNS TABLE (i BIGINT, label VARCHAR) LANGUAGE python AS $$
+    return [(k, f"step {k}") for k in range(n, 0, -1)]
+$$;
+SELECT * FROM countdown(3);
+```
+
+### Functions from a file
+
+`@db.function` turns a Python function in a `.py` file or a notebook into a lake function, with its imports and helpers. [Functions and procedures](/pondra/guides/functions-and-procedures/#functions-from-a-notebook-or-a-file)
+
+```bash
+cat > feat_fns.py <<'EOF'
+import re
+import pondra
+
+db = pondra.connect("http://localhost:8080")
+
+@db.function
+def slugify(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+
+print(db.sql("SELECT slugify('Hello, World!') AS s").rows())
+EOF
+python3 feat_fns.py
+```
+
+### SQL procedures
+
+A procedure is a script you `CALL`, and it runs with its caller's rights. [Functions and procedures](/pondra/guides/functions-and-procedures/#procedures)
+
+```sql
+CREATE TABLE jobs_log (job VARCHAR, day DATE, n BIGINT);
+INSERT INTO jobs_log VALUES ('old', DATE '2026-01-01', 1),
+  ('new', DATE '2026-09-01', 2);
+CREATE PROCEDURE cleanup($keep DATE) AS BEGIN
+    DELETE FROM jobs_log WHERE day < $keep;
+END;
+CALL cleanup(DATE '2026-06-01');
+SELECT job FROM jobs_log;
+```
+
+### Python procedures
+
+A procedure written in Python runs on the node's workers, and what it prints comes back as notices; `db.call` runs it from Python. [Functions and procedures](/pondra/guides/functions-and-procedures/#python-procedures)
+
+```sql
+CREATE PROCEDURE hottest(k BIGINT DEFAULT 1) LANGUAGE python AS $$
+    rows = pondra.sql("SELECT sensor, max(celsius) AS peak FROM measurements GROUP BY sensor ORDER BY peak DESC LIMIT $k", k=k).rows()
+    print(f"best: {rows[0]['sensor']}")
+    return rows
+$$;
+CALL hottest(1);
+```
+
+### Secrets in procedures
+
+A procedure reads a secret with `pondra.secret`; SQL shows the secret's name and type, and its values come back as `***`. [Functions and procedures](/pondra/guides/functions-and-procedures/#secrets)
+
+```sql
+CREATE SECRET reports_mail (TYPE generic, HOST 'smtp.example.com', USER 'reports@example.com', PASSWORD 'not-a-real-password');
+CREATE PROCEDURE mail_host() LANGUAGE python AS $$
+    s = pondra.secret("reports_mail")
+    print("host", s["host"], "user", s["user"])
+$$;
+CALL mail_host();
+```
+
+### DO blocks
+
+`DO` runs a block of code once, with no name to call later, and its last line comes back as the answer. [Functions and procedures](/pondra/guides/functions-and-procedures/#run-code-once-do)
+
+```sql
+DO LANGUAGE python $$
+rows = db.sql("SELECT sensor, count(*) AS n FROM measurements GROUP BY sensor ORDER BY sensor").rows()
+print(len(rows), "sensors")
+rows
+$$;
+```
+
+### Python cells on the node
+
+In the console a Python cell runs on the node as a `DO` block, and the cells of one page share their variables. [The console](/pondra/start/console/)
+
+```python cell
+by_sensor = db.sql("SELECT sensor, max(celsius) AS peak FROM measurements GROUP BY sensor").rows()
+```
+```python cell
+print("sensors:", len(by_sensor))
+```
+
+### Scripts: branch and loop
+
+A script branches with `IF` and loops with `FOR` over a query's rows, and it runs the same from every door. [SQL statements](/pondra/sql/statements/#scripts)
+
+```sql
+DECLARE $total = 0;
+FOR r IN (SELECT celsius FROM measurements ORDER BY id) DO
+  $total = $total + $r.celsius;
+END FOR;
+IF $total > 100 THEN
+  PRINT 'warm: ' || $total;
+END IF;
+SELECT $total AS total;
+```
+
+### Scripts: error handlers
+
+`BEGIN … EXCEPTION WHEN … THEN` catches an error by its name, and `$error` holds its message. [SQL statements](/pondra/sql/statements/#scripts)
+
+```sql
+DECLARE $n = (SELECT count(*) FROM measurements);
+BEGIN
+  ASSERT $n > 100, 'only ' || $n || ' rows';
+EXCEPTION WHEN assert_failure THEN
+  PRINT 'checked: ' || $error;
+END;
+```
+
+### Scripts: parallel and async
+
+`FOR … PARALLEL n` runs up to `n` passes at once, and `ASYNC` starts a statement that `AWAIT` waits for. [SQL statements](/pondra/sql/statements/#scripts)
+
+```sql
+FOR p IN (SELECT value AS n FROM generate_series(1, 6)) PARALLEL 3 DO
+  INSERT INTO jobs_log VALUES ('part', current_date, $p.n);
+END FOR;
+ASYNC INSERT INTO jobs_log VALUES ('async', current_date, 0);
+AWAIT ALL;
+SELECT count(*) AS n FROM jobs_log;
+```
+
+### Notebooks: SQL cells
+
+After `%load_ext pondra`, a `%%sql` cell runs its SQL on your connection and shows the answer as a frame. [Notebooks](/pondra/guides/notebooks/#sql-cells)
+
+```python norun
+%%sql
+SELECT sensor, max(celsius) AS peak FROM measurements GROUP BY sensor ORDER BY peak DESC
+```
+
+### Run a file as a job
+
+`CALL run` runs a `.sql` file of the lake with its `$name`s bound to the values you name, and each run is logged. [Run files as jobs](/pondra/guides/workspace/)
+
+```bash
+curl -s -X PUT http://localhost:8080/files/etl/measure.sql --data-binary @- <<'EOF'
+INSERT INTO measurements VALUES ($id, $sensor, $celsius);
+SELECT sensor, celsius FROM measurements WHERE id = $id;
+EOF
+```
+```sql
+CALL run('etl/measure.sql', id => 7, sensor => 'east', celsius => 9.5);
+```
+
+### File parameters
+
+`DECLARE PARAMETER` gives a file's parameter a type and a default, and `pondra.parameters` lists them. [Run files as jobs](/pondra/guides/workspace/#parameters-declared)
+
+```bash
+curl -s -X PUT http://localhost:8080/files/etl/hot_days.sql --data-binary @- <<'EOF'
+-- The sensor to count
+DECLARE PARAMETER $sensor VARCHAR = 'north';
+SELECT count(*) AS n FROM measurements WHERE sensor = $sensor;
+EOF
+```
+```sql
+SELECT name, type, "default", required FROM pondra.parameters('etl/hot_days.sql');
+CALL run('etl/hot_days.sql', sensor => 'south');
+```
+
+### Run a file from Python
+
+`db.run` runs a lake file from Python, with its values as keyword arguments. [Run files as jobs](/pondra/guides/workspace/#from-every-client)
+
+```python
+db.run("etl/measure.sql", id=8, sensor="east", celsius=8.0)
+```
+
+### Tasks on a schedule
+
+A task runs a statement on a schedule, and each tick runs once, even when the leader changes. [Functions and procedures](/pondra/guides/functions-and-procedures/#run-on-a-schedule)
+
+```sql
+CREATE TASK nightly SCHEDULE 'cron 0 2 * * * UTC' AS CALL cleanup(current_date - 30);
+SELECT name, schedule, statement FROM pondra.tasks;
+DROP TASK nightly;
+```
+
+### Task graphs
+
+A task can run `AFTER` other tasks, and `WHEN` with `pondra.result` decides whether it runs. [Functions and procedures](/pondra/guides/functions-and-procedures/#run-tasks-in-order)
+
+```sql
+CREATE TASK tally SCHEDULE 'cron 0 3 * * * UTC' AS SELECT count(*) FROM measurements;
+CREATE TASK tally_log AFTER tally WHEN pondra.result('tally') > 0 AS BEGIN
+  INSERT INTO jobs_log VALUES ('tally', current_date, pondra.result('tally'));
+END;
+EXECUTE TASK tally;
+DROP TASK tally_log;
+DROP TASK tally;
+```
+
+### The run log
+
+Every procedure call and file run is a row of `pondra.runs`, with its caller, status and notices, written a moment after the call so the call never waits for it. [Functions and procedures](/pondra/guides/functions-and-procedures/#see-what-ran)
+
+```sql
+SELECT routine, caller, status, notices FROM pondra.runs ORDER BY started DESC LIMIT 3;
+```
+
+### Start a call without waiting
+
+`pondra.start` starts a procedure on the node and answers its run id at once. [Functions and procedures](/pondra/guides/functions-and-procedures/#start-a-call-without-waiting)
+
+```sql
+SELECT pondra.start('cleanup', DATE '2026-06-01') AS run;
+```
+
+## Files and other engines
+
+Files, folders, buckets and other engines' tables read as tables, and results go back out as Parquet, CSV, JSON, Delta, Iceberg or Kafka records. A node reads files on its own machine only for the program that started it, so the examples on local files run in the shell (`pondra files`), which writes under `out/`.
+
+### Read files in place
+
+`read_csv`, `read_json` and `read_parquet` name a file or a folder where SQL takes a table, and read it as it is now. [Files and other lakes](/pondra/guides/files-and-other-lakes/#read-files)
+
+```bash
+pondra files <<'SQL'
+CREATE TABLE exports (id BIGINT, region VARCHAR, amount DOUBLE);
+INSERT INTO exports VALUES (1, 'eu', 7.0), (2, 'us', 4.5), (3, 'eu', 9.0);
+COPY exports TO 'out/exports.csv' (FORMAT csv, HEADER true);
+COPY exports TO 'out/exports.json' (FORMAT json);
+SELECT region, sum(amount) AS total FROM read_csv('out/exports.csv') GROUP BY region ORDER BY region;
+SELECT count(*) AS n FROM read_json('out/exports.json');
+SQL
+```
+
+### Hive-style folders
+
+A folder written with `PARTITION_BY` reads back as one table, and its partition column comes from the `region=…` folder names. [Files and other lakes](/pondra/guides/files-and-other-lakes/#read-files)
+
+```bash
+pondra files <<'SQL'
+COPY (SELECT * FROM exports) TO 'out/exports_by_region/' (FORMAT parquet, PARTITION_BY (region));
+SELECT region, sum(amount) AS total FROM read_parquet('out/exports_by_region/', hive_partitioning => true) GROUP BY region ORDER BY region;
+SQL
+```
+
+### External tables
+
+`CREATE EXTERNAL TABLE` gives files a table's name without copying them, and an `INSERT` into a folder writes a new file there. [SQL statements](/pondra/sql/statements/#external-tables)
+
+```bash
+pondra files <<'SQL'
+CREATE EXTERNAL TABLE exports_files (id BIGINT, region VARCHAR, amount DOUBLE)
+  STORED AS PARQUET PARTITIONED BY (region) LOCATION 'out/exports_by_region/';
+SELECT region, count(*) AS n FROM exports_files GROUP BY region ORDER BY region;
+SQL
+```
+
+### Write files
+
+`COPY (query) TO 'path' (FORMAT …)` writes rows out as Parquet, CSV, JSON, Arrow, Delta or Iceberg, and a path ending in `/` is a folder. [Files and other lakes](/pondra/guides/files-and-other-lakes/#write-files)
+
+```bash
+pondra files <<'SQL'
+COPY (SELECT * FROM exports WHERE amount > 4) TO 'out/big.parquet' (FORMAT parquet, COMPRESSION zstd);
+SQL
+```
+
+### Secrets for buckets
+
+`CREATE SECRET` with a `SCOPE` lets nodes read the URLs under it, and SQL shows its name, type and scope but never its values. [Files and other lakes](/pondra/guides/files-and-other-lakes/#files-in-buckets-and-over-https)
+
+```sql
+CREATE SECRET exports_s3 (TYPE s3, KEY_ID 'my-key-id', SECRET 'my-secret', REGION 'eu-west-1', SCOPE 's3://my-bucket');
+SELECT name, type, scope FROM secrets();
+DROP SECRET exports_s3;
+```
+
+### Read from a bucket
+
+With a secret in place, a bucket's or a web address's files read the same way as local ones, in SQL and in every client. [Files and other lakes](/pondra/guides/files-and-other-lakes/#files-in-buckets-and-over-https)
+
+```sql norun
+SELECT region, sum(amount) FROM 's3://my-bucket/2026/*.parquet' GROUP BY region;
+```
+
+### Delta tables: write and read
+
+`COPY … (FORMAT delta)` writes a Delta table, `APPEND` adds a commit to it, and `read_delta` reads it back. [Files and other lakes](/pondra/guides/files-and-other-lakes/#other-engines-tables)
+
+```bash
+pondra files <<'SQL'
+COPY (SELECT id, region, amount FROM exports) TO 'out/exports_delta/' (FORMAT delta);
+COPY (SELECT id + 100 AS id, region, amount FROM exports) TO 'out/exports_delta/' (FORMAT delta, APPEND);
+SELECT count(*) AS rows_now FROM read_delta('out/exports_delta/');
+SQL
+```
+
+### Iceberg tables: write and read
+
+`COPY … (FORMAT iceberg)` writes an Iceberg table into a folder, and `read_iceberg` reads it back. [Files and other lakes](/pondra/guides/files-and-other-lakes/#other-engines-tables)
+
+```bash
+pondra files <<'SQL'
+COPY (SELECT id, region, amount FROM exports) TO 'out/exports_iceberg/' (FORMAT iceberg);
+SELECT count(*) AS n FROM read_iceberg('out/exports_iceberg/');
+SQL
+```
+
+### DuckDB's names for files
+
+`delta_scan` and `parquet_scan` are DuckDB's names for the same readers, and they read the same files. [Names](/pondra/reference/names/)
+
+```bash
+pondra files <<'SQL'
+SELECT count(*) AS n FROM delta_scan('out/exports_delta/');
+SELECT count(*) AS n FROM parquet_scan('out/big.parquet');
+SQL
+```
+
+### Iceberg REST catalog from Python
+
+An engine attaches the node's Iceberg REST catalog by its URL, and PyIceberg lists its namespaces and loads a table. [Iceberg REST catalog](/pondra/reference/iceberg-rest/#read-with-pyiceberg)
+
+```python
+from pyiceberg.catalog import load_catalog
+
+catalog = load_catalog("pondra", uri="http://localhost:8080", type="rest")
+print(catalog.list_namespaces())
+print(catalog.load_table("default.events").scan().to_pandas())
+```
+
+### Attach a warehouse
+
+`ATTACH` a folder of Delta tables laid out as `schema/table`, and its tables join with yours; an `INSERT` commits to the table in its own format. [Files and other lakes](/pondra/guides/files-and-other-lakes/#other-engines-tables)
+
+```bash
+pondra files <<'SQL'
+COPY (SELECT id, region, amount FROM exports) TO 'out/warehouse/sales/exports/' (FORMAT delta);
+ATTACH 'out/warehouse' AS wh (TYPE delta);
+SELECT count(*) AS n FROM wh.sales.exports;
+INSERT INTO wh.sales.exports SELECT 10 AS id, 'eu' AS region, 2.5 AS amount;
+DETACH wh;
+SQL
+```
+
+### Attach an Iceberg REST catalog
+
+`ATTACH` a REST catalog by its URL and a secret, and join its tables with yours. [Files and other lakes](/pondra/guides/files-and-other-lakes/#other-engines-tables)
+
+```sql norun
+ATTACH 'https://catalog.example.com/api/catalog' AS pol (TYPE iceberg, SECRET polaris);
+SELECT * FROM pol.sales.pages;
+```
+
+### Kafka topics: write records
+
+`COPY … TO 'kafka://…'` writes rows as records to a topic, and a topic is a table, so each record also reads back as a row. [Kafka](/pondra/guides/kafka/#write-to-a-topic)
+
+```sql
+CREATE TABLE exports (id BIGINT, msg VARCHAR, level VARCHAR);
+COPY (SELECT 1 AS id, 'disk full' AS msg, 'high' AS level
+  UNION ALL SELECT 2, 'slow query', 'low')
+  TO 'kafka://127.0.0.1:9092/exports' (FORMAT json, KEY id);
+SELECT id, msg FROM exports ORDER BY id;
+```
+
+## Every door
+
+The same lake answers through every door the node opens: HTTP, the Python and JavaScript clients, the command line, the Postgres port, Arrow Flight, the Kafka protocol, the Iceberg REST catalog, MCP and the console. Each door takes what it can carry (Kafka's carries rows, not statements) and refuses the rest by name.
+
+### HTTP: run SQL
+
+`POST /sql` takes SQL text and answers the last statement's rows, or a write's outcome. [HTTP API](/pondra/reference/http/#run-sql)
+
+```bash
+curl -s -X POST http://localhost:8080/sql -d "CREATE TABLE notes (id BIGINT PRIMARY KEY, body VARCHAR NOT NULL)"
+curl -s -X POST http://localhost:8080/sql -d "INSERT INTO notes VALUES (1, 'hello')"
+curl -s -X POST http://localhost:8080/sql -d "SELECT count(*) AS n FROM notes"
+```
+
+### HTTP: append rows once
+
+`POST /append/{table}` adds rows, and a retry with the same `producer` and `seq` is recognised and not applied twice. [HTTP API](/pondra/reference/http/#write-rows)
+
+```bash
+curl -s -X POST 'http://localhost:8080/append/notes?producer=feat&seq=1' -H 'content-type: application/x-ndjson' --data-binary $'{"id":2,"body":"second"}\n'
+```
+
+### Python client
+
+`db.sql` in Python answers the same rows as `POST /sql`, as a frame you can keep working on. [Python client](/pondra/reference/python/)
+
+```python
+print(db.sql("SELECT count(*) AS n FROM notes").item())
+```
+
+### JavaScript client
+
+The JavaScript client does the same with `await`: `connect`, then `db.sql`. [JavaScript client](/pondra/reference/javascript/)
+
+```js
+import { connect } from "pondra";
+
+const db = connect("http://localhost:8080");
+console.log(await db.sql("SELECT count(*) AS n FROM notes"));
+```
+
+### Command line: pondra sql
+
+`pondra sql --dir` runs one statement against a lake folder with no server, and a write prints its outcome as JSON. [Command line](/pondra/reference/cli/#pondra-sql)
+
+```bash
+pondra sql --dir shop "SELECT name, price FROM products ORDER BY name"
+```
+
+### Postgres port: psql
+
+Any Postgres client connects to the node's Postgres port, and `psql` runs SQL on the lake named in its URL. [Postgres port](/pondra/reference/postgres/)
+
+```bash
+psql "postgresql://admin@localhost:5432/lake" <<'EOF'
+SELECT id, body FROM notes ORDER BY id;
+EOF
+```
+
+### Postgres drivers: psycopg
+
+Any Postgres driver works as it does with a Postgres server; here psycopg counts the `notes` table. [Postgres port](/pondra/reference/postgres/)
+
+```python
+import psycopg
+
+with psycopg.connect("host=localhost port=5432 user=admin dbname=lake", autocommit=True) as conn:
+    print(conn.execute("SELECT count(*) FROM notes").fetchall())
+```
+
+### Arrow Flight SQL
+
+An ADBC Flight SQL driver runs SQL and reads the answer back as Arrow, from the node's Flight port. [Arrow Flight](/pondra/reference/flight/)
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+conn = flightsql.connect("grpc://localhost:8815", autocommit=True)
+with conn.cursor() as cur:
+    cur.execute("SELECT count(*) AS n FROM notes")
+    print(cur.fetch_arrow_table().to_pydict())
+```
+
+### Kafka protocol
+
+A Kafka producer writes to a topic that is a table: each JSON record becomes a row, and on a keyed table it upserts that key. [Kafka protocol](/pondra/reference/kafka-protocol/)
+
+```python
+import json
+from kafka import KafkaProducer
+
+producer = KafkaProducer(bootstrap_servers="localhost:9092")
+producer.send("notes", json.dumps({"id": 3, "body": "from kafka"}).encode())
+producer.flush()
+```
+
+### Iceberg REST catalog
+
+An Iceberg engine reaches the node's tables through `/v1/…`, and a table that publishes Iceberg is listed there. [Iceberg REST catalog](/pondra/reference/iceberg-rest/)
+
+```bash
+curl -s -X POST http://localhost:8080/sql -d "CREATE TABLE metrics (name VARCHAR, value DOUBLE) WITH (publish = 'iceberg')"
+curl -s http://localhost:8080/v1/namespaces/default/tables
+```
+
+### MCP for agents
+
+`POST /mcp` takes a JSON-RPC call; this one runs the `query` tool with a SQL text. [MCP](/pondra/reference/mcp/)
+
+```bash
+curl -s -X POST http://localhost:8080/mcp -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT count(*) AS n FROM notes"}}}'
+```
+
+### The console
+
+The node serves its console at its own address, with SQL and Python cells, tables, and notebooks saved in the lake. [The console](/pondra/start/console/)
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/
+```
+
+### One error code everywhere
+
+An error carries Postgres's SQLSTATE code on every door; over HTTP it comes in the `x-pondra-sqlstate` header. [Postgres port](/pondra/reference/postgres/#error-codes)
+
+```bash
+curl -s -D - -o /dev/null -X POST http://localhost:8080/sql -d "SELECT * FROM nope" | grep -i x-pondra-sqlstate
+```
+
+### Notices from procedures
+
+What a procedure or a `DO` block prints comes back as notices on every door; over HTTP it is the `x-pondra-notices` header. [Functions and procedures](/pondra/guides/functions-and-procedures/#python-procedures)
+
+```bash
+curl -s -D - -o /dev/null -X POST http://localhost:8080/sql -d 'DO LANGUAGE python $$ print("hello from DO") $$' | grep -i x-pondra-notices
+```
+
+---
+
+## Teams and environments
+
+Branches, projects and the files that keep them: a database can be a zero-copy branch of another, and a project's files say what its objects are.
+
+### Branches
+
+A branch is a whole database that starts as another one is now, with no data copied. [Branches and environments](/pondra/guides/environments/)
+
+```sql
+CREATE TABLE docs (id BIGINT, title VARCHAR, words INT);
+INSERT INTO docs VALUES (1, 'refunds', 120), (2, 'shipping', 80), (3, 'returns', 60);
+CREATE DATABASE dev CLONE lake;
+```
+
+### Branch writes stay apart
+
+Writes to a branch stay in it, and its base carries on without them. [Branches and environments](/pondra/guides/environments/#change-it-apart)
+
+```sql
+INSERT INTO dev.docs VALUES (4, 'warranty', 90);
+UPDATE dev.docs SET words = 100 WHERE id = 2;
+SELECT (SELECT count(*) FROM dev.docs) AS in_dev, (SELECT count(*) FROM docs) AS here;
+```
+
+### Comparing branches
+
+`pondra.diff` gives the rows that differ between two tables, in the change feed's words; the command line's `pondra diff` adds the objects that differ. [Branches and environments](/pondra/guides/environments/#compare-two-databases)
+
+```sql
+SELECT _change_type, id, words FROM pondra.diff('docs', 'dev.docs')
+  ORDER BY id, _change_type;
+```
+
+### Refreshing a branch
+
+`ALTER DATABASE … REFRESH` brings tables up to their base's present, and the branch's own changes to them go. [Branches and environments](/pondra/guides/environments/#bring-tables-up-to-date)
+
+```sql
+INSERT INTO docs VALUES (5, 'gifts', 40);
+ALTER DATABASE dev REFRESH docs;
+SELECT id, title FROM dev.docs ORDER BY id;
+```
+
+### Dropping a branch
+
+`DROP DATABASE` removes a branch: only what the branch wrote goes, and its base lets go of the files it kept for it. [Branches and environments](/pondra/guides/environments/#drop-a-branch)
+
+```sql
+DROP DATABASE dev;
+```
+
+### Projects: plan, apply, test
+
+A project is a folder of files that says what every object is: `pondra plan` shows what an apply would change, `pondra apply` makes the database match it, and `pondra test` runs the queries in `tests/`. [Branches and environments](/pondra/guides/environments/#apply-a-project)
+
+```bash
+pondra init reviews && cd reviews
+echo "CREATE TABLE reviews (id BIGINT, stars INT, body VARCHAR);" > objects/reviews.sql
+echo "SELECT * FROM reviews WHERE stars NOT BETWEEN 1 AND 5;" > tests/stars.sql
+pondra plan --url http://127.0.0.1:8080 && pondra apply --url http://127.0.0.1:8080 && pondra test --url http://127.0.0.1:8080
+```
+
+### Migrations
+
+A migration is a one-off step, such as a backfill, that runs once in each database after the objects an apply adds. [Branches and environments](/pondra/guides/environments/#apply-a-project)
+
+```bash
+cd reviews
+echo "CREATE TABLE reviews (id BIGINT, stars INT, body VARCHAR);" > objects/reviews.sql
+echo "UPDATE reviews SET body = 'no text' WHERE body IS NULL;" > migrations/001-backfill.sql
+pondra apply --url http://127.0.0.1:8080
+```
+
+### Changes made by hand
+
+`pondra status` lists what differs from the files, and `pondra capture` writes the chosen changes into them. [Branches and environments](/pondra/guides/environments/#changes-made-in-the-database)
+
+```bash
+cd reviews
+curl -s -X POST localhost:8080/sql -d "ALTER TABLE reviews ADD COLUMN channel VARCHAR"
+pondra status --url http://127.0.0.1:8080 && pondra capture reviews --url http://127.0.0.1:8080
+```
+
+### Files kept in versions
+
+Every save of a lake file is kept as a version, which you can list, read and restore. [HTTP API](/pondra/reference/http/#files)
+
+```bash
+curl -s -X PUT localhost:8080/files/policy/terms.txt --data-binary 'refunds in 14 days'
+v=$(curl -sI localhost:8080/files/policy/terms.txt | tr -d '\r' | sed -n 's/^etag: //ip')
+curl -s -X PUT localhost:8080/files/policy/terms.txt -H "If-Match: $v" --data-binary 'refunds in 30 days'
+curl -s "localhost:8080/files/policy/terms.txt?versions"
+```
+
+### Workspace sync
+
+`pondra workspace pull` and `push` keep a folder in step with the lake's files, so you can edit them in your editor and commit them with git. [Run files as jobs](/pondra/guides/workspace/#in-git)
+
+```bash
+pondra workspace pull ws --url http://localhost:8080
+printf 'SELECT count(*) AS n FROM reviews;\n' > ws/reviews_count.sql
+pondra workspace push ws --url http://localhost:8080
+```
+
+### Protected databases
+
+On a protected database, a project's objects change only by an apply, and lifting the protection is an admin's audited statement. [Branches and environments](/pondra/guides/environments/#protected-production)
+
+```sql norun
+ALTER DATABASE qa SET (protected = true);
+SELECT name, protected, lifted_at, lifted_by FROM pondra.databases;
+```
+
+### Git folders
+
+A project folder paired with a GitHub branch: the node commits, pulls and opens pull requests itself, with no `git` installed. [Branches and environments](/pondra/guides/environments/#git-folders)
+
+```sql norun
+CALL git_checkout('sales', repository => 'https://github.com/acme/sales', branch => 'main');
+CALL git_commit('sales', 'Discounts by channel');
+CALL git_pull_request('sales', title => 'Discounts by channel');
+```
+
+### CI in one command
+
+`pondra ci init` sets up CI for the project: a workflow that tests each pull request's database, protects prod and makes the users CI signs in as. [Branches and environments](/pondra/guides/environments/#branches-and-environments-on-a-team)
+
+```bash norun
+pondra ci init
+```
+
+## Security and sharing
+
+Tokens, users and grants, quotas, the audit log, sealed secrets and sharing a table with another company.
+
+### Tokens on every door
+
+Once a token is set, a node refuses a request without one with 401, on every door; `GET /stats` stays open. [Security](/pondra/guides/security/#turn-tokens-on)
+
+```bash
+PONDRA_ADMIN_TOKEN=admin-demo pondra serve tokens --addr 127.0.0.1:8086 > tokens.log 2>&1 &
+until curl -sf localhost:8086/stats > /dev/null; do sleep 0.3; done
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8086/sql -d 'SELECT 1 AS one'
+curl -s -H 'Authorization: Bearer admin-demo' -X POST localhost:8086/sql -d 'SELECT 1 AS one'; kill $!
+```
+
+### Users, roles and grants
+
+A role is a set of grants, and a user who signs in gets the roles it is given, down to a table's columns. [Security](/pondra/guides/security/#users-roles-and-grants)
+
+```sql
+CREATE TABLE payroll (id BIGINT, name VARCHAR, pay DOUBLE);
+CREATE ROLE analysts;
+GRANT SELECT (id, name) ON payroll TO analysts;
+```
+
+### Audit log
+
+`pondra.audit` says who did what, through which door, and what came of it, refusals included. [Security](/pondra/guides/security/#the-audit-log)
+
+```sql
+SELECT at, "user", door, class, statement, outcome FROM pondra.audit ORDER BY at DESC
+  LIMIT 3;
+```
+
+### Sealed secrets
+
+A password or key for something else goes in a secret: kept encrypted, with its name and type listed but never its value. [Security](/pondra/guides/security/#secrets)
+
+```sql
+CREATE SECRET partner_mail (TYPE generic, HOST 'smtp.example.com', PASSWORD 'not-a-real-password');
+SELECT name, type FROM secrets();
+```
+
+### Python only for admins
+
+A node without an admin token refuses `--python` unless it listens on 127.0.0.1, because a Python function or procedure runs code on the machine. [Security](/pondra/guides/security/#code-runs-as-its-caller)
+
+```bash
+timeout 20 pondra serve open-lake --addr 0.0.0.0:8087 --python auto 2>&1 | head -1
+```
+
+### Sharing a table
+
+A share hands a table to another company through Delta Sharing, so they read it with their own tools. [Share a table](/pondra/guides/sharing/)
+
+```sql
+CREATE SHARE partners COMMENT 'Docs for partners';
+ALTER SHARE partners ADD TABLE docs;
+CHECKPOINT;
+```
+
+### Making a recipient
+
+A recipient is a company's profile: its token is answered once and kept only as a hash, and it reads what a share grants. [Share a table](/pondra/guides/sharing/#make-a-recipient-and-send-the-profile)
+
+```python
+import json
+profile = db.sql("CREATE RECIPIENT acme COMMENT 'Acme Corp' EXPIRES IN '90 days'")["profile"]
+db.sql("GRANT SELECT ON SHARE partners TO RECIPIENT acme")
+with open("acme.share", "w") as f:
+    json.dump(profile, f)
+```
+
+### Reading a share
+
+`ATTACH` a profile to read a share in another lake, and query it like your own tables. [Share a table](/pondra/guides/sharing/#another-pondra)
+
+```python
+db.sql(f"ATTACH '{json.dumps(profile)}' AS acme (TYPE share)")
+print(db.sql("SELECT id, title FROM acme.docs ORDER BY id").rows())
+```
+
+### Taking access back
+
+`REVOKE` ends a recipient's access to one share at once; `ALTER SHARE … REMOVE TABLE` takes one table out for everyone. [Share a table](/pondra/guides/sharing/#see-and-take-back)
+
+```sql
+REVOKE SELECT ON SHARE partners FROM RECIPIENT acme;
+```
+
+### Sharing audit
+
+Every request at the sharing door is a row of `pondra.audit`, refusals too, written a moment after the request so the door never waits for it. [Share a table](/pondra/guides/sharing/#see-and-take-back)
+
+```sql
+SELECT at, "user", statement, outcome FROM pondra.audit WHERE door = 'sharing'
+  ORDER BY at DESC LIMIT 10;
+```
+
+### Signing in as a user
+
+A user with a password signs in as itself, and once one exists a node refuses every request that doesn't sign in. [Security](/pondra/guides/security/#users-roles-and-grants)
+
+```sql norun
+CREATE USER ann PASSWORD 'correct-horse-battery';
+GRANT analysts TO ann;
+```
+
+### Quotas
+
+A user is held to a number of statements at once, and to a time each may run, on each node. [Security](/pondra/guides/security/#quotas)
+
+```sql norun
+ALTER USER ann MAX_QUERIES 2 STATEMENT_TIMEOUT '1 second';
+```
+
+### TLS on every door
+
+With a certificate, every door takes TLS on its own port, and a plain connection is taken only from the node's own machine. [Security](/pondra/guides/security/#tls)
+
+```bash norun
+pondra serve tls-lake --addr 127.0.0.1:8096 --tls-cert node.pem --tls-key node.key
+```
+
+### Reading with Delta Sharing
+
+Any Delta Sharing client reads a share with its own compute, pandas and Spark among them. [Share a table](/pondra/guides/sharing/#what-they-run)
+
+```python norun
+import delta_sharing
+delta_sharing.load_as_pandas("acme.share#partners.public.docs")
+```
+
+## AI and unstructured data
+
+Vectors you sort by distance, files kept beside the tables, your own functions over Arrow Flight, JSON columns and model calls from SQL.
+
+### Vector columns and search
+
+A vector is a `FLOAT[]` column, and `cosine_similarity` says how close each one points to the one you have. There is no vector index yet, so a search reads every row. [Vectors, files and models](/pondra/guides/ai-and-files/#search-by-meaning)
+
+```sql
+CREATE TABLE chunks (id BIGINT, title VARCHAR, v FLOAT[]);
+INSERT INTO chunks VALUES (1, 'tea', [1.0, 0.0, 0.0]), (2, 'cake', [0.0, 1.0, 0.0]),
+  (3, 'coffee', [0.9, 0.1, 0.0]);
+SELECT title, cosine_similarity(v, [1.0, 0.0, 0.0]) AS score FROM chunks
+  ORDER BY score DESC LIMIT 2;
+```
+
+### Files kept in the lake
+
+`PUT` a file into the lake beside the tables, and list the files in SQL with `files()`. [Vectors, files and models](/pondra/guides/ai-and-files/#files-next-to-your-tables)
+
+```bash
+curl -s -X PUT localhost:8080/files/policy/guide.txt --data-binary 'refunds within 14 days'
+curl -s -X POST localhost:8080/sql -d "SELECT path, size FROM files('policy/') ORDER BY path"
+```
+
+### Functions over Arrow Flight
+
+A function of your own runs in a process of your own: the node sends it a batch of rows over Arrow Flight and reads back one column. [Vectors, files and models](/pondra/guides/ai-and-files/#your-own-model-behind-arrow-flight)
+
+```python
+import threading
+import pyarrow as pa
+import pyarrow.flight as flight
+import requests
+
+class Caption(flight.FlightServerBase):
+    def do_exchange(self, context, descriptor, reader, writer):
+        args = reader.read_all().column("arg0").to_pylist()
+        out = pa.table({"out": [None if b is None else f"a file of {len(b)} bytes" for b in args]})
+        writer.begin(out.schema)
+        writer.write_table(out)
+        writer.close()
+
+server = Caption("grpc://127.0.0.1:0")
+threading.Thread(target=server.serve, daemon=True).start()
+requests.post("http://localhost:8080/functions/caption_file", json={"flight": f"http://127.0.0.1:{server.port}", "args": ["Binary"], "returns": "Utf8"}).json()
+print(db.sql("SELECT caption_file(file_read('policy/guide.txt')) AS caption").rows())
+```
+
+### JSON functions
+
+A `JSON` column holds JSON text, and typed getters such as `json_get_str` read a value at a path in place. [SQL functions](/pondra/sql/functions/#json)
+
+```sql
+SELECT json_get_str('{"user": {"name": "ann"}}', 'user', 'name') AS name, json_get_float('{"amount": 4.5}', 'amount') AS amount;
+```
+
+### Model calls in SQL
+
+`ai_complete` and `ai_embed` call an OpenAI-compatible endpoint from SQL, and `ai_embed` fills a vector column. [Vectors, files and models](/pondra/guides/ai-and-files/#models-in-sql)
+
+```sql norun
+UPDATE chunks SET v = ai_embed(title) WHERE v IS NULL;
+SELECT id, ai_complete('Summarize in five words: ' || title) AS summary FROM chunks;
+```

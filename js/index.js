@@ -272,6 +272,14 @@ export class Pondra {
    * of the lake's: `await db.parameters("etl/orders.sql")`. */
   async parameters(file) { return this.sql(`SELECT * FROM pondra.parameters('${String(file).replace(/'/g, "''")}')`); }
 
+  /** Every object, part and concept whose name, comment or definition has each of the words, best
+   * first (rank, is, kind, lake, schema, object, name, about, matched): `await db.find("revenue",
+   * { kind: "column" })`. */
+  async find(text, { kind } = {}) {
+    const quote = (s) => `'${String(s).replace(/'/g, "''")}'`;
+    return this.sql(`SELECT * FROM pondra.find(${quote(text)}${kind ? `, kind => ${quote(kind)}` : ""})`);
+  }
+
   /** A stored procedure (`CREATE PROCEDURE`), called, as Python's `con.call`: `await db.call("load_day", "2026-09-27")`. */
   async call(name, ...args) {
     return this.sql(`CALL ${name}(${args.map((_, i) => `$p${i}`).join(", ")})`, Object.fromEntries(args.map((a, i) => [`p${i}`, a])));

@@ -350,6 +350,13 @@ class Pondra:
         description; a `.py` file's `# %% tags=["parameters"]` cell's names; a notebook's."""
         return self._run(f"SELECT * FROM pondra.parameters({_literal(str(file))})").rows()
 
+    def find(self, text, kind=None):
+        """Every table, view, column, key, link, routine and other object or part whose name, comment
+        or definition has each of the words, best first, and the concepts Pondra has under other
+        products' names (`db.find("foreign key")` finds `link`): `db.find("revenue", kind="column")`."""
+        only = f", kind => {_literal(kind)}" if kind else ""
+        return self._run(f"SELECT * FROM pondra.find({_literal(str(text))}{only})").rows()
+
     def _frame_rows(self, frame, format=None):
         """A frame's rows: a pyarrow Table, or (no pyarrow here) a list of dicts, or the text table
         `format="table"` asks for. A name the lake doesn't have is looked for among this

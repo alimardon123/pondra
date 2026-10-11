@@ -1,8 +1,6 @@
 ---
 title: dbt and BI tools
 description: Point dbt, DBeaver, Tableau, Metabase, Excel or any Postgres tool at Pondra's Postgres port. They find a Postgres database, with Postgres's catalog.
-sidebar:
-  order: 16
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
@@ -116,8 +114,11 @@ restart.
 <Aside type="caution" title="Limits">
 - **Power BI Desktop itself** runs only on Windows, so it isn't run here. Its PostgreSQL connector
   talks through Npgsql 4.0, and its ODBC connector through psqlODBC: both are tested.
-- **Indexes:** a keyed table's primary key shows as an index. Pondra has no other indexes: it finds
-  rows by the files' column ranges instead.
-- **Transactions:** `BEGIN` and `COMMIT` are accepted, and each statement commits on its own, so a
-  failed statement doesn't undo the ones before it.
+- **Indexes:** a keyed table's primary key shows as an index. `CREATE INDEX` is accepted and kept as
+  an object (it shows in `pg_indexes`), but nothing is built for it: the files' column ranges do the
+  finding. See [Indexes](/pondra/sql/statements/#indexes).
+- **Transactions:** the statements between `BEGIN` and `COMMIT` are one commit, with snapshot
+  isolation. `COMMIT` fails with `40001` if another commit changed a row they changed, and a failed
+  statement fails the whole transaction: `COMMIT` then rolls it back. See
+  [Transactions](/pondra/guides/change-rows/#transactions).
 </Aside>

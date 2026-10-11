@@ -1,8 +1,6 @@
 ---
 title: The console
 description: A web page for SQL, Python, notebooks and data files that every Pondra node serves at /. The lake's tables and files on the left, files in tabs in the middle, details, profiles and variables on the right, answers in a spreadsheet-like grid, and room for extensions.
-sidebar:
-  order: 5
 setup: |
   CREATE TABLE sales (day DATE, item VARCHAR, region VARCHAR, amount DOUBLE);
   INSERT INTO sales VALUES (DATE '2026-09-27', 'tea', 'eu', 7.0), (DATE '2026-09-27', 'cake', 'us', 4.5), (DATE '2026-09-28', 'tea', 'us', 3.5);
@@ -85,8 +83,7 @@ are at the left, grouped, and **Search settings** at the top finds a setting in 
 - **This node:** **Python** (the one in use, and **Choose…**) and **About** (the version, the lake,
   the cluster, and where the settings are kept).
 
-Sections an extension (or an enterprise build: users, tokens, audit) adds show here too, under their
-own heading: `register.setting` below.
+Sections an extension adds show here too, under their own heading: `register.setting` below.
 
 The node keeps them on its machine, so every lake and every session you open on that machine has
 them: in `PONDRA_CONFIG_DIR` if it is set, else `%APPDATA%\pondra` on Windows,
@@ -229,7 +226,8 @@ message says where it went wrong.
 
 ### Jobs and schedules
 
-A file's **Run ▾** (and a notebook's, in `notebooks`) runs it on the node, where it goes on without the page:
+A job runs on the node, where it goes on without the page. A SQL or Python file's **Run ▾**, and a
+notebook's **Run all ▾**, have these:
 
 - **Run as a job** saves the file and starts it, with the parameters' values as they are now.
   **History** opens with the job at its top, and a note says when it is done or why it failed.
@@ -240,7 +238,7 @@ A file's **Run ▾** (and a notebook's, in `notebooks`) runs it on the node, whe
 card: its name and whether its last run worked, how often it runs and when next, a bar for each of its
 last runs (its height the time it took, red if it failed), and the statement it runs. Click the card
 for its last runs; **Run now** starts it at once (a `CALL` as a job), and its **⋯** opens its file,
-copies the statement, or drops it. Flows will be a section here too.
+copies the statement, or drops it.
 
 **Edit** (and **New schedule**) opens a schedule's editor. Pick how often: **Every** so many minutes,
 hours or days, **Daily**, **Weekly** (on the days picked) or **Monthly** (on a day) at a time in a
@@ -253,7 +251,7 @@ you pick. Below them is the statement it runs, in an editor of its own. A schedu
 whose:
 
 - **This tab**, **This page** or **All:** statements as the node remembers them
-  ([`pondra.history`](/pondra/reference/sql/#users-and-grants)). Each shows its SQL (or a Python
+  ([`pondra.history`](/pondra/sql/statements/#users-and-grants)). Each shows its SQL (or a Python
   cell's first line), how long it took or how it ended, when, its rows, and how many nodes it ran on.
   **All** is every statement you may see, from every door (an admin sees everyone's, with who ran it),
   but not the console's own queries. A statement shows up a second or so after it ends.

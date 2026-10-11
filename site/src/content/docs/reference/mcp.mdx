@@ -1,8 +1,6 @@
 ---
 title: MCP
 description: Let AI agents list tables, query, write and follow changes on a node over the Model Context Protocol, with the same tokens as everyone else.
-sidebar:
-  order: 13
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -15,7 +13,8 @@ answer is plain JSON: each tool answers at once, so there is no event stream.
 ## Connect
 
 Give the client the node's URL, `http://HOST:8080/mcp`. With tokens set, also give it a header,
-`Authorization: Bearer TOKEN`: see [tokens](#tokens).
+`Authorization: Bearer TOKEN`: see [tokens](#tokens). With a certificate on the node, use `https://`
+from another machine: a plain request from one is refused with `403` ([TLS](/pondra/guides/security/#tls)).
 
 <Aside type="caution">
 Use a `read` token for an agent that should only look. An agent with a `write` token can insert,
@@ -63,7 +62,7 @@ above are as those clients document them, and are not run here.
 
 ## Tools
 
-`tools/list` gives four tools, and then one for each stored procedure.
+`tools/list` gives five tools, and then one for each stored procedure.
 
 | Tool | Arguments | Does |
 |---|---|---|
@@ -71,6 +70,7 @@ above are as those clients document them, and are not run here.
 | `query` | `sql` | runs one query and answers `{"rows": […], "total_rows": N}`: the first 1000 rows, and the count of all. A statement that writes is refused: `this is a write: use the write tool` |
 | `write` | `sql`, `job` (optional) | runs `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP` or `CALL`. It is committed and durable when it answers. `job` is an id for the write: sent again with the same id, it is applied once |
 | `changes` | `table`, `after` (optional) | what was committed to a table after a position: every insert, update and delete, about 1000 rows at a time, and the `position` to ask from next |
+| `find` | `text`, `kind` (optional) | finds tables, views, columns, keys, links, routines and every other object or part by its name, comment or definition, and Pondra's concepts by other products' names: the rows `pondra.find(text)` gives in SQL |
 
 `list_tables` names column types as Arrow does (`Int64`, `Utf8`). `write` answers what the same
 statement answers over [HTTP](/pondra/reference/http/#run-sql): `{"rows": 1}` for an `INSERT`, or
@@ -78,7 +78,7 @@ the table for a `CREATE`.
 
 `changes` takes `after` as a position from an earlier call: `0` for as far back as the log is
 kept, and left out for from now. Each row carries `_change_type`, `_row_id` and `_version`: see
-[system columns](/pondra/reference/system-columns/). On a keyed table the change type is `upsert`.
+[system columns](/pondra/sql/system-tables/). On a keyed table the change type is `upsert`.
 
 ### Procedures as tools
 
@@ -88,8 +88,9 @@ something an agent can do, with the rights of the agent's token.
 | Part | Comes from |
 |---|---|
 | name | the procedure's name. A `.` becomes `__`, and a name that is one of the four tools above gets `call_` in front |
-| arguments | the procedure's parameters. `BIGINT`, `INT` and the other whole numbers are `integer`, `DOUBLE`, `REAL` and `DECIMAL` are `number`, `BOOLEAN` is `boolean`, anything else is `string`. A parameter with a default is optional |
+| arguments | the procedure's parameters. `BIGINT`, `INT`, `INTEGER`, `SMALLINT` and `TINYINT` are `integer`; `DOUBLE`, `REAL`, `FLOAT`, `DECIMAL` and `NUMERIC` are `number`; `BOOLEAN` and `BOOL` are `boolean`; anything else is `string`. A parameter with a default is optional |
 | description | the first line of the body, if it is a comment (`--` or `#`) |
+| annotations | `readOnlyHint` is `false`: a procedure may write |
 
 The tool runs `CALL name(k => v, …)`. Its answer is the procedure's rows, or its outcome, and
 `notices`, what it printed.
@@ -111,7 +112,7 @@ Every request is a JSON-RPC message in a `POST`. A `GET` answers `405`.
 |---|---|
 | `initialize` | the protocol version the client asked for, `capabilities` of `{"tools": {}}`, `serverInfo` (`pondra` and its version), and `instructions` that tell the agent to start with `list_tables` |
 | `ping` | `{}` |
-| `tools/list` | the tools, each with its `inputSchema`, a description, and `annotations`: `query`, `list_tables` and `changes` are read-only, and `write` is not |
+| `tools/list` | the tools, each with its `inputSchema`, a description, and `annotations`: `query`, `list_tables` and `changes` are `readOnlyHint`, and `write` is not (it is marked `destructiveHint` and `idempotentHint`) |
 | `tools/call` | `{"content": [{"type": "text", "text": …}], "isError": false}`. The text is JSON |
 | a message with no `id` (a notification) | `202`, with no body |
 | any other method | the error `-32601`, `no method NAME` |
@@ -121,7 +122,8 @@ A tool that fails is not a protocol error: it answers with `"isError": true` and
 text, which the agent can read and act on (`no tool nosuch`, `this token may not write`, or the
 SQL error), after Postgres's code for it: `SQLSTATE 23514: new row for relation "t" violates check
 constraint …` ([error codes](/pondra/reference/postgres/#error-codes)). MCP has no session, so a
-transaction is refused by name: send a procedure that does the work as one statement instead.
+transaction is refused by name, with `SQLSTATE 0A000`: `query` and `write` answer `BEGIN` with
+`Unsupported SQL statement: BEGIN`. Send a procedure that does the work as one statement instead.
 
 ```bash
 mcp() {
@@ -138,11 +140,11 @@ mcp '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"query","arg
 
 ```text
 2025-06-18 pondra ['capabilities', 'instructions', 'protocolVersion', 'serverInfo']
-['list_tables', 'query', 'write', 'changes', 'add_note']
+['list_tables', 'query', 'write', 'changes', 'find', 'add_note']
 {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"rows\":1}"}],"isError":false}}
 {"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"rows\":1}"}],"isError":false}}
 {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"{\"rows\":[{\"id\":1,\"body\":\"hello agent\"},{\"id\":2,\"body\":\"none\"}],\"total_rows\":2}"}],"isError":false}}
-{"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"this is a write: use the write tool"}],"isError":true}}
+{"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"SQLSTATE XX000: this is a write: use the write tool"}],"isError":true}}
 ```
 
 ## With the Python SDK
@@ -171,7 +173,7 @@ asyncio.run(main())
 ```
 
 ```text
-['list_tables', 'query', 'write', 'changes', 'add_note']
+['list_tables', 'query', 'write', 'changes', 'find', 'add_note']
 {'rows': [{'n': 2}], 'total_rows': 1}
 [(1, 'upsert'), (2, 'upsert')]
 ```

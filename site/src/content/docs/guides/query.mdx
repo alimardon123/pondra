@@ -1,8 +1,6 @@
 ---
 title: Query
 description: Run SQL against a lake from SQL, Python, JavaScript or psql, with parameters, scripts, formats, EXPLAIN and queries spread over nodes.
-sidebar:
-  order: 3
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -87,9 +85,10 @@ A `PIVOT` without `IN (…)` finds its values with a query of its own when it ru
 ## What a query sees
 
 A query reads the lake's Parquet files and the newest rows, which have not become Parquet yet, as one
-snapshot: everything committed up to one moment, never half of a commit. A write is in the answer as
-soon as it is acknowledged, on any node. So there is nothing to refresh, and no difference between "old"
-and "new" rows.
+snapshot: everything committed up to one moment, never half of a commit. A SQL write is in the answer
+as soon as its statement returns, on the node that took it, and other nodes see it a few
+milliseconds later ([freshness and guarantees](/pondra/concepts/freshness-and-guarantees/)). So
+there is nothing to refresh, and no difference between "old" and "new" rows.
 
 Tables join across schemas and attached lakes as one query, keyed tables included:
 
@@ -112,7 +111,12 @@ ORDER BY u.name, rank;
 ```
 
 `FROM orders` alone means `SELECT * FROM orders`, and `FROM orders SELECT item, qty` picks columns.
-`FROM orders WHERE …` is not accepted: write the `SELECT *`.
+A clause after the `FROM` works the same way, so `FROM orders WHERE qty > 1 ORDER BY id` is
+`SELECT * FROM orders WHERE qty > 1 ORDER BY id`:
+
+```sql
+FROM orders WHERE qty > 1 ORDER BY id;
+```
 
 ## Parameters
 
@@ -278,7 +282,7 @@ AggregateExec: mode=FinalPartitioned, gby=[item@0 as item], aggr=[sum(orders.qty
       DataSourceExec: partitions=1, partition_sizes=[1], expected_rows=4
 ```
 
-Every statement is also a row of [`pondra.history`](/pondra/reference/sql/#users-and-grants), with a
+Every statement is also a row of [`pondra.history`](/pondra/sql/statements/#users-and-grants), with a
 fingerprint that is the same for the same query with other values, the commit it read (`version`:
 `AT (VERSION => n)` reads the lake as it was then, so an answer can be had again without being
 kept), and how far a join's rows were from what was expected (`misestimate`):
@@ -320,8 +324,9 @@ curl -s -X POST "http://localhost:8080/sql?spread=0" -d "SELECT count(*) AS n FR
 [{"n":4}]
 ```
 
-Answers are the same on one node and on many, including sums over `DOUBLE`, which add up exactly. Queries
-that need more memory than `--memory-gb` allows (a third of the machine's by default) spill to disk.
+Answers are the same on one node and on many, and a sum over `DOUBLE` comes out the same whatever
+order its rows arrive in. Queries that need more memory than `--memory-gb` allows (a third of the
+machine's by default) spill to disk.
 [Clusters](/pondra/guides/clusters/) covers running several nodes.
 
 <Aside type="caution">

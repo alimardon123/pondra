@@ -747,10 +747,19 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     deletes.extend(segs.iter().filter(|(_, s)| s.path.is_empty()).map(|(k, _)| data_key(k[2..].parse().unwrap_or(0))));
     // Dropped tables kept past their time (ADR-043) go: their files are then orphans, swept a day on.
     #[derive(serde::Deserialize)]
-    struct Kept { at_ms: u64, keep_ms: u64 }
+    struct Kept { at_ms: u64, keep_ms: u64, meta: TableMeta }
     let now = crate::log::now_ms();
     // (one dropped since a branch was made stays: the branch may read its files)
-    deletes.extend(lake.cat.scan::<Kept>("dt/", "dt0").await?.into_iter().filter(|(_, d)| now >= d.at_ms + d.keep_ms && pins.is_none_or(|p| d.at_ms < p.0)).map(|(k, _)| k));
+    let dropped = lake.cat.scan::<Kept>("dt/", "dt0").await?;
+    let expired = |d: &Kept| now >= d.at_ms + d.keep_ms && pins.is_none_or(|p| d.at_ms < p.0);
+    deletes.extend(dropped.iter().filter(|(_, d)| expired(d)).map(|(k, _)| k.clone()));
+    // The loads of a folder let go (copy.rs) with its last table: one no live table or kept drop uses.
+    let folder = |k: &str, m: &TableMeta| m.folder.clone().unwrap_or_else(|| k[3..].rsplit_once('/').map_or(k[3..].to_string(), |(n, _)| n.to_string()));
+    let used: std::collections::HashSet<String> = tables.iter().map(|(k, m)| m.folder(&k[2..]).to_string()).chain(dropped.iter().filter(|(_, d)| !expired(d)).map(|(k, d)| folder(k, &d.meta))).collect();
+    let mut let_go: Vec<String> = dropped.iter().filter(|(_, d)| expired(d)).map(|(k, d)| folder(k, &d.meta)).filter(|f| !used.contains(f)).collect();
+    let_go.sort();
+    let_go.dedup();
+    deletes.extend(crate::copy::gone(lake, &let_go).await?);
     // A folder a clone shares (ADR-043): files there go only by the orphan sweep, which counts
     // every table listing them, never as one table's garbage.
     let mut shared: std::collections::HashSet<String> = tables.iter().flat_map(|(_, m)| m.shares.iter().map(|f| format!("data/{f}/"))).collect();

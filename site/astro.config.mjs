@@ -30,13 +30,45 @@ export default defineConfig({
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/alimardon123/pondra' }],
       editLink: { baseUrl: 'https://github.com/alimardon123/pondra/edit/main/site/' },
       customCss: ['../brand/colors.css', './src/styles/pondra.css'],
+      expressiveCode: { themes: ['github-dark-default', 'github-light-default'], defaultProps: { wrap: true, hangingIndent: 2, overridesByLang: { 'text,txt,plaintext,ansi': { wrap: false } } }, styleOverrides: { borderRadius: '0.6rem', codeFontSize: '0.85rem', frames: { shadowColor: 'transparent' } } },
+      components: { Header: './src/components/Header.astro', Sidebar: './src/components/Sidebar.astro' },
+      routeMiddleware: './src/tabs.ts',
+      // The three tabs (src/tabs.ts): each top-level group is one, with its own sidebar. site/PAGES.md
+      // says what each page covers; a new page goes in the group of its kind (site/STYLE.md).
       sidebar: [
-        { label: 'Start here', items: [{ autogenerate: { directory: 'start' } }] },
-        { label: 'Guides', items: [{ autogenerate: { directory: 'guides' } }] },
-        { label: 'Reference', items: [{ autogenerate: { directory: 'reference' } }] },
-        { label: 'Concepts', items: [{ autogenerate: { directory: 'concepts' } }] },
+        { label: 'Docs', items: [
+          { label: 'Get started', items: ['start/install', 'start/first-lake', 'start/features', 'start/tour', 'start/shell', 'start/console'] },
+          { label: 'Data', collapsed: true, items: ['guides/tables', 'guides/load-data', 'guides/query', 'guides/change-rows', 'guides/files-and-other-lakes'] },
+          { label: 'Streams', collapsed: true, items: ['guides/streaming', 'guides/flows', 'guides/kafka'] },
+          { label: 'Python and code', collapsed: true, items: ['guides/dataframes', 'guides/pyspark', 'guides/functions-and-procedures', 'guides/workspace', 'guides/notebooks'] },
+          { label: 'Teams', collapsed: true, items: ['guides/environments', 'guides/sharing', 'guides/security'] },
+          { label: 'Connect', collapsed: true, items: ['guides/dbt-and-bi', 'guides/other-engines', 'guides/ai-and-files'] },
+          { label: 'Operate', collapsed: true, items: ['guides/clusters', 'guides/object-storage', 'guides/server', 'guides/deploy', 'guides/upgrades'] },
+          { label: 'How it works', collapsed: true, items: ['concepts/how-it-works', 'concepts/lake-format', 'concepts/keyed-tables', 'concepts/freshness-and-guarantees', 'concepts/failures', 'concepts/performance', 'concepts/compared', 'concepts/design-notes'] },
+        ] },
+        { label: 'SQL', items: [
+          'sql',
+          { label: 'Language', items: ['sql/statements', 'sql/functions', 'sql/table-options'] },
+          { label: 'Catalog', items: ['sql/system-tables', 'sql/glossary'] },
+        ] },
+        { label: 'APIs', items: [
+          'reference',
+          { label: 'Clients', items: ['reference/python', 'reference/frames', 'reference/pyspark', 'reference/javascript', 'reference/names'] },
+          { label: 'Command line', items: ['reference/cli'] },
+          { label: 'Protocols', items: ['reference/http', 'reference/postgres', 'reference/flight', 'reference/kafka-protocol', 'reference/iceberg-rest', 'reference/mcp'] },
+          { label: 'Configuration', items: ['reference/environment'] },
+        ] },
       ],
     }),
   ],
+  // Pages that moved when the site took its three tabs (2026-10): old links still land.
+  redirects: {
+    '/reference/sql': '/pondra/sql/statements/',
+    '/reference/functions': '/pondra/sql/functions/',
+    '/reference/table-options': '/pondra/sql/table-options/',
+    '/reference/system-columns': '/pondra/sql/system-tables/',
+    '/reference/glossary': '/pondra/sql/glossary/',
+    '/guides': '/pondra/start/features/',
+  },
   vite: { server: { fs: { allow: ['..'] } } }, // (brand/, beside site/)
 });
