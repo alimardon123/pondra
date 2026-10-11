@@ -11,7 +11,13 @@ batch = spec["check"]
 env = TableEnvironment.create(EnvironmentSettings.in_batch_mode() if batch else EnvironmentSettings.in_streaming_mode())
 conf = env.get_config()
 conf.set("parallelism.default", "2")
-conf.set("taskmanager.memory.process.size", "3g")
+# (Memory: in a local MiniCluster Flink runs inside PyFlink's gateway JVM and ignores taskmanager.memory.process.size;
+# its heap is JVM_ARGS's -Xmx, which nexmark.py sets. At the JVM's default, a quarter of RAM, q9's state on the heap
+# stalled garbage collection until the job's heartbeat timed out at 10M events, and with 10 GB all twenty queries
+# at once did. `state` rocksdb keeps state in RocksDB, off the heap, as Flink's own Nexmark setup does.)
+if spec.get("state") == "rocksdb":
+    conf.set("state.backend.type", "rocksdb")
+    conf.set("taskmanager.memory.managed.size", spec["managed"])  # (RocksDB's memory: local execution keeps a size it is given)
 conf.set("table.local-time-zone", "UTC")
 conf.set("table.exec.mini-batch.enabled", "true")  # (Flink's advice for aggregations)
 conf.set("table.exec.mini-batch.allow-latency", "200 ms")
@@ -54,7 +60,8 @@ def why(e):
 
 
 queries = spec["queries"]
-out = {"engine": "flink", "events": sum(spec["counts"].values()), "startup_s": round(time.time() - t0, 2), "alone_s": {}, "failed": {}}
+out = {"engine": "flink", "events": sum(spec["counts"].values()), "state": spec.get("state", "heap"), "jvm_args": os.environ.get("JVM_ARGS", ""),
+       "startup_s": round(time.time() - t0, 2), "alone_s": {}, "failed": {}}
 for k, sql in queries.items():
     try:
         sink(k, sql)
@@ -63,13 +70,15 @@ for k, sql in queries.items():
         out["alone_s"][k] = round(time.time() - t, 2)
     except Exception as e:
         out["failed"][k] = why(e)
-t = time.time()
-ss = env.create_statement_set()
-for k, sql in queries.items():
-    if k in out["alone_s"]:
-        ss.add_insert_sql(f"INSERT INTO {k}_sink {sql}")
-if out["alone_s"]:
-    ss.execute().wait()
-out["secs"] = round(time.time() - t, 2)
-out["events_per_s"] = round(out["events"] / out["secs"]) if out["secs"] else None
+if spec.get("together", True) and out["alone_s"]:
+    t = time.time()
+    ss = env.create_statement_set()
+    for k in out["alone_s"]:
+        ss.add_insert_sql(f"INSERT INTO {k}_sink {queries[k]}")
+    try:
+        ss.execute().wait()
+        out["secs"] = round(time.time() - t, 2)
+        out["events_per_s"] = round(out["events"] / out["secs"])
+    except Exception as e:
+        out["together_failed"] = f"after {time.time() - t:.0f} s: {why(e)}"
 print(json.dumps(out), flush=True)

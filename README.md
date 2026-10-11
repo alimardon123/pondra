@@ -406,7 +406,7 @@ python3 tools/harness.py clients                # SQL writes, Python client, Pos
 python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP SDK against a node (pip install mcp)
 python3 tools/harness.py kafka | alter           # Kafka clients, ALTER TABLE under load
 python3 tools/harness.py columns | fills | dedup # RENAME/DROP/widen under streaming; views filled from existing rows; dedup by event time
-python3 tools/bench/nexmark.py                  # Nexmark q1, q2, q5, q7, q11: Pondra and Flink, the answers checked against DuckDB
+python3 tools/bench/nexmark.py                  # Nexmark's 20 queries: Pondra and Flink, the answers checked against DuckDB
 python3 tools/harness.py procedures             # macros, procedures (SQL and Python), scripts, parameters: rights, depth, three nodes, MCP tools
 python3 tools/harness.py functions              # functions (SQL, Python), workers, notices at every door, mail, secrets, run log, tasks, speed
 python3 tools/harness.py names | answers         # read_*/write_* == the tools' names, the docs' table run; function answers kept for a while

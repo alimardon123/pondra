@@ -133,7 +133,7 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           written, spread), sim_gcs.py and sim_iceberg_rest.py (a local GCS and an Iceberg REST catalog),
           bench/files_tpch.py (TPC-H from files outside the lake against the lake's tables),
           files_s3_check.py (files in a real bucket), slt_check.py (DataFusion's sqllogictest files: D1),
-          bench/nexmark.py (five Nexmark queries, Pondra and Flink), frames_check.py (frames == Polars; SQL and
+          bench/nexmark.py (Nexmark's 20 queries, Pondra and Flink), frames_check.py (frames == Polars; SQL and
           Python mixed every way), spark_check.py (pondra.spark == PySpark), bench/tpch_frames.py (TPC-H as
           SQL, frames and PySpark code), asof_check.py (ASOF JOIN == DuckDB's, one node and three), stream_check.py (windows,
           sessions and an as-of view over one stream: every click once; rates and delays),
@@ -2076,7 +2076,7 @@ python3 tools/harness.py begin          # BEGIN … COMMIT from every door, read
 python3 tools/bench/pgbench.py          # pgbench's own TPC-B script, 1 and 4 clients: the balances agree (--postgres: Postgres too)
 python3 tools/bench/flow.py             # what a flow of 0 to 3 views costs ingest; every stage right when acknowledged
 python3 tools/bench/footprint.py        # install size, start to first answer, idle memory: Pondra, DuckDB, Polars, Spark, Flink (a venv with pyspark, apache-flink)
-FLINK_PYTHON=/tmp/engines/bin/python python3 tools/bench/nexmark.py --bids 10000000   # Nexmark q1 q2 q5 q7 q11 against Flink 2.3
+FLINK_PYTHON=/tmp/engines/bin/python python3 tools/bench/nexmark.py --events 10000000   # Nexmark's 20 queries against Flink 2.3 (RocksDB state; --flink-state heap)
 python3 tools/bench/tpch.py --data ~/tpch/sf1 --queries tools/bench/tpch-queries --engines pondra,duckdb,spark --spark-python /tmp/engines/bin/python   # Spark alone if memory is short
 bash tools/cold_trace.sh                # a cold start's requests on the simulator at R2's latency, and the node's own steps
 python3 tools/c5_check.py               # the bucket's limits: a 10 writes/s bucket, 240 INSERTs at once, the inbox's bell
@@ -2124,7 +2124,7 @@ python3 tools/slt_check.py --slt <datafusion>/datafusion/sqllogictest/test_files
 python3 tools/frames_check.py                  # pondra.frame == Polars (26 pipelines); one question asked 10 ways; a sort kept through steps
 ~/venv-spark/bin/python tools/spark_check.py   # pondra.spark == PySpark 4.0.1 (55 pipelines, files and UDFs among them: values and column names)
 python3 tools/bench/tpch_frames.py --data ~/tpch/sf1-bench   # TPC-H: SQL == frames == PySpark code, 22 of 22
-python3 tools/bench/nexmark.py [--bids 4000000] # Nexmark q1, q2, q5, q7, q11: Pondra (== DuckDB) and Flink 2.3 (venv-flink)
+python3 tools/bench/nexmark.py [--events 4000000] [--alone] # Nexmark's 20 queries: Pondra (== DuckDB) and Flink 2.3 (venv-flink)
 python3 tools/smoke.py target/release/pondra   # what CI runs on Windows, macOS and Linux (stdlib only)
 python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # shell, local(), kill -9, wheel, npm, notebook; glibc 2.17 + Ubuntu 22.04
 python3 tools/bench/repeat.py --data ~/tpch/sf1-bench --query 15 --runs 20 [--hot]   # one query many times vs DuckDB
