@@ -102,11 +102,19 @@ def max(c):  # noqa: A001
 
 
 def first(c, ignorenulls=False):
-    return _f("first", c, sql="first_value")
+    return _first_last("first", "first_value", c, ignorenulls)
 
 
 def last(c, ignorenulls=False):
-    return _f("last", c, sql="last_value")
+    return _first_last("last", "last_value", c, ignorenulls)
+
+
+def _first_last(name, sql, c, ignorenulls):
+    """PySpark's first and last: `ignorenulls` skips NULLs (`IGNORE NULLS`). Its name has no flag,
+    as PySpark's has none either."""
+    x = c if isinstance(c, Column) else _col(c)
+    skip = " IGNORE NULLS" if ignorenulls else ""
+    return Column(f"{sql}({x.sql}){skip}", f"{name}({x._name})")
 
 
 def stddev(c):

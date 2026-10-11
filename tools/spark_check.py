@@ -566,6 +566,14 @@ def p_sample_int_argument_raises(spark, F, Window):  # PySpark takes a float fra
     return spark.table("orders").sample(1).collect()
 
 
+def p_first_last_ignorenulls(spark, F, Window):  # first and last skip NULLs with ignorenulls=True, and keep them without it
+    rows = [(1, 1, None), (1, 2, "b"), (1, 3, None), (1, 4, "d"), (1, 5, None), (2, 1, None), (2, 2, None)]
+    df = spark.createDataFrame(rows, "k int, i int, s string")
+    w = Window.partitionBy("k").orderBy("i").rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)
+    return df.select("k", "i", F.first("s", ignorenulls=True).over(w).alias("first_kept"), F.first("s").over(w).alias("first_any"),
+                     F.last("s", ignorenulls=True).over(w).alias("last_kept"), F.last("s").over(w).alias("last_any"))
+
+
 def _row_class(spark):
     """PySpark's Row, or Pondra's, by the session that is asked."""
     if type(spark).__module__.startswith("pondra"):
@@ -670,6 +678,7 @@ PIPELINES = [
     ("sample_fraction_one_count", None, "value", p_sample_fraction_one),
     ("sample_with_replacement_refused", None, "refused", p_sample_with_replacement_refused),
     ("sample_int_argument_raises", None, "raises", p_sample_int_argument_raises),
+    ("first_last_ignorenulls", False, "frame", p_first_last_ignorenulls),
 ]
 
 
