@@ -262,7 +262,7 @@ def main():
         if local:
             for t in tables:  # (the first node isn't up yet: this process leads the lake for a moment)
                 src = f"{data}/{t}/*.parquet" if os.path.isdir(f"{data}/{t}") else f"{data}/{t}.parquet"
-                pondra(cluster.lake, f"INSERT INTO {t} SELECT * FROM read_parquet('{src}')")
+                pondra(cluster.lake, f"CREATE TABLE {t} AS SELECT * FROM read_parquet('{src}')")
         for k in ks:
             print(f"== Pondra, {k} node{'s' * (k > 1)}", flush=True)
             out["pondra"][str(k)] = pondra_at(cluster, k, qs, base)

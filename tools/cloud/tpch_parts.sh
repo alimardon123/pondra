@@ -9,7 +9,8 @@
 #       Spark reads. nation and region can't be split: machine 1 makes them whole, so they are
 #       loaded once and not N times.
 # load: starts the nodes (so each INSERT reaches the leader over HTTP, as in the cluster-bench
-#       workflow), then every machine loads its own files, one INSERT a table:
+#       workflow), makes the tables empty from machine 1's files (an INSERT needs its table),
+#       then every machine loads its own files, one INSERT a table:
 #         pondra sql --lake $LAKE "INSERT INTO t SELECT * FROM read_parquet('/mnt/ssd/tpch/t/*.parquet')"
 #       Machines inserting into one table at once is supported: each writes its own files and the
 #       leader records them. At the end the row counts are checked against TPC-H's.
@@ -58,6 +59,15 @@ set -euo pipefail
 for t in region nation supplier customer part partsupp orders lineitem; do
   [ -d /mnt/ssd/tpch/\$t ] || continue
   /tmp/pondra sql --lake '$LAKE' "INSERT INTO \$t SELECT * FROM read_parquet('/mnt/ssd/tpch/\$t/*.parquet')"
+done
+EOF
+}
+
+create_script() {  # on machine 1, which has a part of every table: the tables, empty
+  cat <<EOF
+set -euo pipefail
+for t in region nation supplier customer part partsupp orders lineitem; do
+  /tmp/pondra sql --lake '$LAKE' "CREATE TABLE IF NOT EXISTS \$t AS SELECT * FROM read_parquet('/mnt/ssd/tpch/\$t/*.parquet') LIMIT 0"
 done
 EOF
 }
@@ -118,6 +128,7 @@ if [ "$phase" != gen ]; then
   # shellcheck disable=SC2086  # (flags are several words)
   bash "$here/cluster.sh" start "$hosts" "$env" $flags
   ssh -n "$first" "$(wait_script)"
+  ssh -n "$first" "$(create_script)"
   each load_script
   echo "rows in the lake:"
   ssh -n "$first" "$(count_script)" | check
