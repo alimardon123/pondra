@@ -11,6 +11,8 @@
 //                                                  <dir> has ca.pem (that node's certificate, self-signed) and cases.json
 //                                                  ({ key }: the lookup's key, which Python wrote). JSON on stdout
 //   node js_frames_pipelines.mjs starting <dir>    local()'s own refusals and its node's log, in <dir>; JSON on stdout
+//   node js_frames_pipelines.mjs another <dir> <port>  local() on a port another node holds: refused, or not; JSON on stdout
+//   node js_frames_pipelines.mjs start <url> <name> <n>  db.start(name, n) on a node: the run's id; JSON on stdout
 //
 // The pipelines are built in the order of frames_check.py's pipelines(), with the same base frames, so
 // the CTE names (`_1`, `_2`, … from one counter per process) come out as Python's do.
@@ -295,12 +297,35 @@ async function starting(dir) {
   console.log(JSON.stringify(out));
 }
 
+// db.start(name, n): a procedure started without waiting; its run's id comes back.
+async function start(url, name, n) {
+  const db = connect(url, { onNotice: null });
+  const id = await db.start(name, Number(n));
+  console.log(JSON.stringify({ id: id ?? null }));
+  await db.close();
+}
+
+// local() on a port another node already holds: it refuses, and gives no connection to that node.
+async function another(dir, port) {
+  const out = {};
+  try {
+    const db = await local(dir, { port: Number(port), python: false });
+    out.connected = true; // (not expected: the connection would be the other node's)
+    await db.close();
+  } catch (e) {
+    out.error = e.message;
+  }
+  console.log(JSON.stringify(out));
+}
+
 const [mode, ...args] = process.argv.slice(2);
 if (mode === "pipelines") await pipelines(args[0]);
 else if (mode === "misc") await misc(args[0]);
 else if (mode === "client") await client(...args);
 else if (mode === "starting") await starting(args[0]);
+else if (mode === "another") await another(...args);
+else if (mode === "start") await start(...args);
 else {
-  console.error("usage: js_frames_pipelines.mjs pipelines <url> | misc <dir> | client <url> <tls-url> <dir> | starting <dir>");
+  console.error("usage: js_frames_pipelines.mjs pipelines <url> | misc <dir> | client <url> <tls-url> <dir> | starting <dir> | another <dir> <port> | start <url> <name> <n>");
   process.exit(2);
 }

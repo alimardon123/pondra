@@ -846,7 +846,7 @@ def local(dir="lake", port=None, token=None, flags=(), timeout=120, python=True)
     db.process, db.owner, deadline = proc, owner, time.time() + timeout
     while True:
         try:
-            db._call("GET", "/stats")
+            stats = db._call("GET", "/stats")
             db.retry_secs = 60
             break
         except (OSError, RuntimeError):
@@ -854,6 +854,21 @@ def local(dir="lake", port=None, token=None, flags=(), timeout=120, python=True)
                 db.close()
                 raise RuntimeError(f"the node didn't start; its log: {log}") from None
             time.sleep(0.05)
+    try:
+        seen = json.loads(stats).get("pid")  # (a node from before this check says no pid: accepted)
+    except (ValueError, AttributeError):
+        seen = None
+    if seen is not None and seen != proc.pid:
+        # Another node answers on this port: ours failed to bind it. Stop ours (it may still be starting) and
+        # don't use the other one, whose lake isn't the one asked for. (Not db.close(): that would reach it.)
+        if proc.poll() is None:
+            proc.stdin.close()  # (closing its input stops it, as close() does)
+            try:
+                proc.wait(15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        raise RuntimeError(f"127.0.0.1:{port} is another node's (pid {seen}), not the one this started; its log: {log}")
     atexit.register(db.close)
     return db
 

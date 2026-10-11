@@ -280,9 +280,10 @@ export class Pondra {
   /** A stored procedure started on the node, not waited for (SQL's `pondra.start`): its run's id,
    * whose row of `pondra.runs` says how it went. */
   async start(name, ...args) {
-    const given = args.map((_, i) => `, $p${i}`).join("");
-    const params = { name, ...Object.fromEntries(args.map((a, i) => [`p${i}`, a])) };
-    const [row] = await this.sql(`SELECT pondra.start($name${given})`, params);
+    // Written as Python's call(wait=False) writes it: the name and the arguments as literals, and the
+    // column named (`AS run`), so the node reads the call as a start and answers its run's id.
+    const given = args.map((a) => `, ${literal(a)}`).join("");
+    const [row] = await this.sql(`SELECT pondra.start(${literal(name)}${given}) AS run`);
     return row.run;
   }
 
@@ -489,16 +490,24 @@ export async function local(dir = "lake", { port, token, flags = [], timeout = 1
   db.owner = owner;
   process.on("exit", () => node.stdin.end());
   for (const until = Date.now() + timeout * 1000; ; await sleep(50)) {
+    let seen;
     try {
-      await db.request("GET", "/stats");
-      db.retrySecs = 60;
-      return db;
+      seen = await (await db.request("GET", "/stats")).json().then((s) => s?.pid, () => undefined); // (a node from before this check says no pid)
     } catch {
       if (failed || node.exitCode !== null || Date.now() > until) {
         if (node.pid && node.exitCode === null) node.stdin.end(); // (still running: closing its input stops it, as close() does)
         throw new Error(`the node didn't start; its log: ${log}`, failed ? { cause: failed } : undefined); // (a failed spawn, say; else the log says why)
       }
+      continue;
     }
+    if (seen !== undefined && seen !== node.pid) {
+      // Another node answers on this port: ours failed to bind it. Stop ours (it may still be starting) and
+      // don't use the other one, whose lake isn't the one asked for. (Not close(): that would reach it.)
+      if (node.pid && node.exitCode === null) node.stdin.end(); // (closing its input stops it, as close() does)
+      throw new Error(`127.0.0.1:${port} is another node's (pid ${seen}), not the one this started; its log: ${log}`);
+    }
+    db.retrySecs = 60;
+    return db;
   }
 }
 

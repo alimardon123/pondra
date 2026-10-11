@@ -18,6 +18,9 @@
    with it; a valid PEM on a plain node); the fetch option; the SQL text of createFunction, createProcedure and
    view as Python's is. Then local()'s refusals (timeoutMs; a bad flag names its log, which says why), no static
    node: import in js/index.js or js/frame.js, and `from pondra import *` leaves Python's builtins alone.
+   Also: local() on a port another node holds is refused by name from Python and JavaScript, naming that node's pid,
+   and the node on the port still answers; db.start (JavaScript) and call(wait=False) (Python) each give a run id
+   that is a row of pondra.runs for the procedure, ok.
 
   python3 tools/js_frames_check.py [--port 8831] [--bin target/release/pondra]
 
@@ -439,6 +442,68 @@ def starting_check(report, tmp):
                  else f"local(flags): {bad!r}; its log says {text[:200]!r}")
 
 
+def another_check(port, report, tmp):
+    """local() on a port another node already holds (one from an earlier run, say) refuses it by name, naming that
+    node's pid, from Python and from JavaScript; the node that holds the port still answers."""
+    first = pondra.local(os.path.join(tmp, "another", "first"), port=port, python=False)
+    py_error = None
+    try:
+        try:
+            pondra.local(os.path.join(tmp, "another", "second-python"), port=port, python=False)
+        except RuntimeError as e:
+            py_error = str(e)
+        js = run_node(["another", os.path.join(tmp, "another", "second-js"), str(port)], timeout=300)
+        answers = first.sql("SELECT 1 AS x").rows()
+    finally:
+        first.close()
+    pid = f"(pid {first.process.pid})"
+    py_ok = py_error is not None and "another node's" in py_error and pid in py_error
+    report.check(py_ok, f"local() on a port another node holds: Python refuses it by name, naming that node {pid}" if py_ok
+                 else f"Python's local() on that port: {'no error (a connection to the other node)' if py_error is None else py_error!r}")
+    js_error = js.get("error") or ""
+    js_ok = "another node's" in js_error and pid in js_error and not js.get("connected")
+    report.check(js_ok, f"local() on a port another node holds: JavaScript refuses it by name, naming that node {pid}" if js_ok
+                 else f"JavaScript's local() on that port: {js!r}")
+    alive = answers == [{"x": 1}]
+    report.check(alive, "the node that holds the port still answers: neither refused call's connection is used" if alive
+                 else f"the node on the port: {answers!r}")
+
+
+def run_row(con, rid, timeout=10):
+    """The row of pondra.runs for a run id, once it has ended (none by the time out)."""
+    until = time.time() + timeout
+    while True:
+        rows = con.sql("SELECT id, routine, status FROM pondra.runs WHERE id = $id", id=rid).rows() if rid else []
+        if rows and rows[0]["status"] != "running":
+            return rows[0]
+        if time.time() > until:
+            return rows[0] if rows else None
+        time.sleep(0.1)
+
+
+def start_check(port, report, tmp):
+    """db.start (JavaScript) and call(wait=False) (Python) start a procedure: each gives its run's id, and each id
+    is a row of pondra.runs for that procedure, ok, which wrote its row."""
+    con = pondra.local(os.path.join(tmp, "start", "lake"), port=port, python=False)
+    try:
+        con.sql("CREATE TABLE started (n INT)")
+        con.create_procedure("add_started", params={"n": "INT"}, language="sql", body="INSERT INTO started VALUES ($n)")
+        js = run_node(["start", f"http://127.0.0.1:{port}", "add_started", "1"], timeout=300)
+        py_run = con.call("add_started", 2, wait=False)
+        js_row = run_row(con, js.get("id"))
+        py_row = run_row(con, py_run.id)
+        values = con.sql("SELECT n FROM started ORDER BY n").rows()
+    finally:
+        con.close()
+    for who, got_id, row in (("JavaScript", js.get("id"), js_row), ("Python", py_run.id, py_row)):
+        ok = isinstance(got_id, str) and row is not None and row.get("routine") == "add_started" and row.get("status") == "ok"
+        text = (f"db.start from JavaScript: its run's id is a row of pondra.runs for add_started, ok" if who == "JavaScript"
+                else f"call(wait=False) from Python: its run's id is a row of pondra.runs for add_started, ok")
+        report.check(ok, text if ok else f"{who}: run id {got_id!r} -> {row!r}")
+    report.check(values == [{"n": 1}, {"n": 2}], "both started runs wrote their rows (1 and 2)" if values == [{"n": 1}, {"n": 2}]
+                 else f"started: {values!r}")
+
+
 def static_check(report):
     """No static import of a Node module in the client's files: a browser, Deno and Bun load them too."""
     for name in ("index.js", "frame.js"):
@@ -481,6 +546,8 @@ def main():
         lambda: misc_check(report, tmp),
         lambda: client_check(A.port, report, tmp),
         lambda: starting_check(report, tmp),
+        lambda: another_check(A.port + 2, report, tmp),
+        lambda: start_check(A.port + 4, report, tmp),
         lambda: static_check(report),
         lambda: builtins_check(report, tmp),
     ]
