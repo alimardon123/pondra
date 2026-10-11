@@ -26,7 +26,7 @@ pub(crate) struct Options {
     pub auth: Arc<auth::Auth>,
 }
 
-/// What a node holds as it starts (its term when it leads, then its lake), so a stop at any point gives back what was taken (invariant 46).
+/// What a node holds as it starts (its term when it leads, then its lake), so a stop at any point gives back what was taken (ADR-061, invariant 300).
 #[derive(Default)]
 pub(crate) struct Held {
     term: OnceLock<(store::Store, u64)>,
