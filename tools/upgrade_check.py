@@ -432,7 +432,11 @@ def ask(n, v, ids=None):
             refused = req("SELECT * FROM kv").status
         except urllib.error.HTTPError as e:
             refused = e.code
-        out["a user signs in"] = [json.dumps(json.loads(req("SELECT count(*) AS n FROM ev").read())), f"kv: {refused}"]
+        # ann lacks SELECT on kv: the refusal is the point, not its exact HTTP status, which 0.34
+        # corrected from a blanket 500 to the one its SQLSTATE asks for (42501 -> 403). Any 4xx/5xx
+        # is "refused"; a 200 (ann could suddenly read kv) still differs from it and fails, as it must.
+        kv = "refused" if refused >= 400 else str(refused)
+        out["a user signs in"] = [json.dumps(json.loads(req("SELECT count(*) AS n FROM ev").read())), f"kv: {kv}"]
     return out, ids
 
 
