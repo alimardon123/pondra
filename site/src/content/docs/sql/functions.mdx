@@ -1,8 +1,6 @@
 ---
 title: SQL functions
-description: The functions Pondra adds to DataFusion's standard ones, for Spark's vocabulary, JSON, vectors, files, binary data, models and routines.
-sidebar:
-  order: 2
+description: The functions Pondra adds to DataFusion's standard ones, for Spark's vocabulary, sequences, JSON, vectors, files, binary data, models and routines.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -10,17 +8,13 @@ import { Aside } from '@astrojs/starlight/components';
 Pondra's SQL is [Apache DataFusion's](https://datafusion.apache.org/user-guide/sql/scalar_functions.html),
 so every function in DataFusion's lists works here: strings, math, dates, arrays, `regexp_*`,
 `window` functions and aggregates. This page lists what Pondra adds. For the functions you make
-yourself, see [`CREATE FUNCTION`](/pondra/reference/sql/#functions-procedures-and-tasks).
+yourself, see [`CREATE FUNCTION`](/pondra/sql/statements/#functions-procedures-and-tasks).
 
 ## Spark's functions
 
 Spark SQL's functions whose names DataFusion doesn't have work as Spark computes them (from Apache
 DataFusion's [`datafusion-spark`](https://crates.io/crates/datafusion-spark)), so a PySpark job's
-SQL keeps its words: `format_string`, `pmod`, `parse_url`, `try_parse_url`, `sha1`, `sha2`, `crc32`,
-`xxhash64`, `bin`, `bit_count`, `bit_get`, `shiftleft`, `shiftright`, `luhn_check`, `soundex`,
-`elt`, `str_to_map`, `json_tuple`, `make_dt_interval`, `date_add`, `date_sub`, `last_day`,
-`next_day`, `from_utc_timestamp`, `to_utc_timestamp`, `collect_list`, `collect_set`, `try_sum` and
-more (`SHOW FUNCTIONS` lists them all).
+SQL keeps its words:
 
 ```sql
 SELECT format_string('%s x %d', 'tea', 3) AS said, pmod(-7, 3) AS m, parse_url('https://example.com/a?q=1', 'HOST') AS host;
@@ -31,12 +25,26 @@ said     m  host
 tea x 3  2  example.com
 ```
 
-Where both have a name and differ (Spark's `floor` of a `DOUBLE` is a `BIGINT`; its `substring`
-from a negative start counts from the end), DataFusion's is the one you get, unless the session
-speaks Spark: after `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`), Spark's are,
-and so are its `EXTRACT` and `SUBSTRING`. Spark's are also there under names of their own
-(`spark_floor`, `spark_substring`, …), which a query in Spark's grammar, `spark_sql('…')`, calls
-where it says `floor`:
+Spark's names, by kind. Each one works under its own name:
+
+| Kind | Names |
+|---|---|
+| Strings and text | `char`, `format_string`, `ilike`, `like`, `is_valid_utf8`, `luhn_check`, `make_valid_utf8`, `parse_url`, `try_parse_url`, `quote`, `soundex`, `space`, `str_to_map`, `try_url_decode`, `url_decode`, `url_encode` |
+| Encodings and hashes | `base64`, `unbase64`, `bin`, `hex`, `unhex`, `crc32`, `sha1`, `sha2`, `xxhash64` |
+| Numbers and bits | `bit_count`, `bit_get`, `bitwise_not`, `shiftleft`, `shiftright`, `shiftrightunsigned`, `expm1`, `hypot`, `mod`, `negative`, `pmod`, `rint`, `width_bucket` |
+| Dates and times | `add_months`, `date_add`, `date_diff`, `date_sub`, `from_utc_timestamp`, `to_utc_timestamp`, `hour`, `minute`, `second`, `last_day`, `make_dt_interval`, `make_interval`, `monthname`, `next_day`, `time_trunc`, `unix_date`, `unix_micros`, `unix_millis`, `unix_seconds`, `weekday` |
+| Casts | `spark_cast(n, 'timestamp')`: a number of seconds since 1970, as a timestamp |
+| Arrays and maps | `array`, `elt`, `if`, `map_from_arrays`, `map_from_entries`, `shuffle`, `size`, `slice` |
+| JSON | `json_tuple` |
+| Bitmaps | `bitmap_bit_position`, `bitmap_bucket_number`, `bitmap_count` |
+| Aggregates | `collect_list`, `collect_set`, `try_sum` |
+
+Where DataFusion and Spark both have a name and answer differently, the plain name is DataFusion's,
+and Spark's is the name with `spark_` in front: `spark_abs`, `spark_array_contains`,
+`spark_array_repeat`, `spark_ascii`, `spark_atan2`, `spark_ceil`, `spark_concat`, `spark_concat_ws`,
+`spark_date_part`, `spark_date_trunc`, `spark_factorial`, `spark_floor`, `spark_length`, `spark_pow`,
+`spark_round`, `spark_substring` and `spark_trunc`. A query in Spark's grammar, `spark_sql('…')`,
+calls Spark's where it says the plain name:
 
 ```sql
 SELECT floor(2.5) AS pondra, spark_floor(2.5) AS spark, s.* FROM spark_sql('SELECT floor(-2.5) AS f, substring("Spark SQL", -3) AS s') s;
@@ -46,6 +54,23 @@ SELECT floor(2.5) AS pondra, spark_floor(2.5) AS spark, s.* FROM spark_sql('SELE
 pondra  spark  f   s
 2.0     2      -3  SQL
 ```
+
+To make the plain names Spark's for a whole session, set the dialect. `SET datafusion.sql_parser.dialect = 'spark'`
+(or `'databricks'`) changes `floor`, `substring` and `EXTRACT` in that session. Here the day of the
+week counts Sunday as 1, not 0:
+
+```sql
+SET datafusion.sql_parser.dialect = 'spark';
+SELECT floor(2.5) AS f, substring('Spark SQL', -3) AS tail, extract(dow FROM DATE '2020-01-05') AS sunday;
+```
+
+```text
+f  tail  sunday
+2  SQL   1
+```
+
+`SELECT routine_name FROM information_schema.routines` lists every function name a node has, the
+aliases and Spark's names too.
 
 ## JSON
 
@@ -61,11 +86,13 @@ objects and positions for arrays. A path that isn't there gives `NULL`.
 | `json_get_bool(doc, path…)` | the boolean |
 | `json_get_array(doc, path…)` | the array |
 | `json_get_json(doc, path…)` | the value as JSON text |
-| `json_get(doc, path…)` | the value, in whatever type it has |
+| `json_get(doc, path…)` | the value as a JSON value (see the caution below) |
 | `json_as_text(doc, path…)` | the value as text, whatever its type |
 | `json_contains(doc, path…)` | true if the path exists |
 | `json_length(doc, path…)` | the length of the array or object |
 | `json_object_keys(doc, path…)` | the keys of the object |
+| `json_from_scalar(x)` | a JSON value made from a number, text or boolean (cast a decimal to `DOUBLE` first) |
+| `json_union_to_text(v)` | the JSON text of a JSON value, from `json_get`, `->` or `json_from_scalar`: a text keeps its quotes |
 | `doc -> path` | the same as `json_get`; chain it: `doc -> 'a' -> 'b'` |
 | `doc ->> path` | the same as `json_as_text` |
 
@@ -93,9 +120,30 @@ id  name  amount  tags
 <Aside type="caution">
 The typed getters don't convert: `json_get_str` on a number is `NULL`, and `json_get_int` on
 `4.5` is `NULL`. Use `json_get_float` for any number, or `->>` to read anything as text and
-`CAST` it. `->` and `json_get` give a value that shows as `{int=7}`; use it to go deeper into a
-document, and finish with `->>` or a typed getter.
+`CAST` it.
+
+`->` and `json_get` give a JSON value, not text, so they can be chained to go deeper. Finish with
+`->>`, a typed getter or `json_union_to_text`. Over HTTP, a JSON value selected as it is fails with
+`Json error: Unsupported data type`.
 </Aside>
+
+`json_union_to_text` turns a JSON value into its text, and `json_from_scalar` makes one from a
+number, text or boolean:
+
+```sql
+SELECT id,
+       json_union_to_text(json_get(payload, 'user')) AS user_json,
+       json_union_to_text(json_from_scalar(CAST(4.5 AS DOUBLE))) AS amount_json,
+       json_union_to_text(json_from_scalar('tea')) AS name_json
+FROM events
+ORDER BY id;
+```
+
+```text
+id  user_json         amount_json  name_json
+1   {"name": "ann"}   4.5          "tea"
+2   {"name": "bo"}    4.5          "tea"
+```
 
 ## Vectors
 
@@ -109,7 +157,7 @@ also answers to DuckDB's names, so SQL written for DuckDB runs as it is.
 | `cosine_similarity(a, b)` | 1 for the same direction, 0 for unrelated, -1 for opposite | `array_cosine_similarity`, `list_cosine_similarity` |
 | `cosine_distance(a, b)` | `1 - cosine_similarity(a, b)`: 0 for the same direction | `array_cosine_distance`, `list_cosine_distance` |
 | `l2_distance(a, b)` | Euclidean distance: 0 for the same vector | `array_distance`, `list_distance` |
-| `dot_product(a, b)` | the sum of the products of each pair of numbers | `inner_product`, `array_inner_product`, `list_inner_product` |
+| `dot_product(a, b)` | the sum of the products of each pair of numbers | `inner_product`, `array_inner_product`, `list_inner_product`, `array_dot_product`, `list_dot_product` |
 
 An array literal, `[1.0, 0.0, 0.0]`, is a vector, so "most like this" is an `ORDER BY`:
 
@@ -130,7 +178,79 @@ tea     1.0
 coffee  0.9938837341719244
 ```
 
+`array_dot_product` and `list_dot_product` are the same function as `dot_product`:
+
+```sql
+SELECT array_dot_product([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]) AS dot;
+```
+
+```text
+dot
+32.0
+```
+
 There is no vector index yet, so a search reads every row.
+
+## Sequences
+
+A sequence hands out numbers, once each, across the cluster. You make one with
+[`CREATE SEQUENCE`](/pondra/sql/statements/#sequences-and-identity-columns). These three functions
+read it and move it.
+
+| Function | Returns |
+|---|---|
+| `nextval('s')` | the next value of sequence `s`, and moves the sequence on |
+| `currval('s')` | the value this session's last `nextval('s')` gave. It is an error (`55000`) before that session's first `nextval`, and outside a session |
+| `setval('s', n)` | `n`, and the next value becomes the one after `n`. `setval('s', n, false)` returns `n` too, and the next value is `n` |
+
+A session is a Postgres connection, or a client that sends an `x-pondra-session` header (of 8 to
+128 letters, digits, `-` or `_`). A Python connection is one session, so `currval` works on the
+connection that called `nextval`:
+
+```sql
+CREATE SEQUENCE ticket_no START 100 INCREMENT 10;
+SELECT nextval('ticket_no') AS n;
+```
+
+```text
+n
+100
+```
+
+```python
+import pondra
+db = pondra.connect("http://localhost:8080")
+print(db.sql("SELECT nextval('ticket_no') AS n").rows())
+print(db.sql("SELECT currval('ticket_no') AS c").rows())
+```
+
+```text
+[{'n': 110}]
+[{'c': 110}]
+```
+
+`setval` moves the sequence. The next `nextval` after this one is 510, because the increment is 10:
+
+```sql
+SELECT setval('ticket_no', 500) AS value;
+```
+
+```text
+value
+500
+```
+
+```sql
+SELECT nextval('ticket_no') AS n;
+```
+
+```text
+n
+510
+```
+
+A column can take its numbers from a sequence by itself, with `DEFAULT nextval('s')` or an identity
+column. See [sequences and identity columns](/pondra/sql/statements/#sequences-and-identity-columns).
 
 ## Models
 
@@ -165,7 +285,9 @@ answers `NULL` for every row, check `PONDRA_AI_URL` first.
 
 A file is an object in the lake, next to the tables: an image, a PDF, a model. Upload it with
 `PUT /files/<path>` (see [HTTP](/pondra/reference/http/)), then list and read it in SQL. Files are
-stored under `files/`, and a path that exists can't be written again.
+stored under `files/`. Writing a path that already holds a file needs an `If-Match` header with the
+version a `GET` of that file gave: without it the write is refused with `409`, and if the file has
+changed since, with `412`.
 
 | Function | Returns |
 |---|---|
@@ -296,7 +418,7 @@ An option Pondra doesn't know is an error that lists the ones it does. A bare qu
 `FROM` (`FROM 'sales.csv'`) picks the reader from the file's extension.
 
 To keep a name for files instead of spelling the reader out each time, see
-[`CREATE EXTERNAL TABLE`](/pondra/reference/sql/#external-tables).
+[`CREATE EXTERNAL TABLE`](/pondra/sql/statements/#external-tables).
 
 A path on the node's machine is read only by the program that started the node: the shell,
 `pondra.local()` or `pondra sql`. A query over HTTP is refused.
@@ -348,9 +470,10 @@ SELECT * FROM secrets();
 |---|---|
 | `pondra.start('name', arg…)` | run a procedure without waiting, and answer with its run's id |
 
-`CALL p(args)` waits for the procedure to finish. `pondra.start` returns at once with an id you
-can find in `pondra.runs` (see [system columns](/pondra/reference/system-columns/)). Add `AS name`
-to name the column. As a statement, `START CALL p(args)` does the same.
+`CALL p(args)` waits for the procedure to finish. `pondra.start` returns at once with the run's id,
+which you can find in `pondra.runs` (see [system columns](/pondra/sql/system-tables/)). Its column is
+`run`, or the name you give with `AS name`. Write it as a SELECT of its own, with nothing else in the
+list. As a statement, `START CALL p(args)` does the same.
 
 ```sql
 CREATE TABLE stamps (n BIGINT);
@@ -370,12 +493,23 @@ digits from one run to the next. Sums of integers and decimals, and `sum(DISTINC
 DataFusion's own.
 
 ```sql
-SELECT sum(x) AS total FROM (VALUES (0.1), (0.2), (0.3)) AS t(x);
+SELECT sum(CAST(x AS DOUBLE)) AS total FROM (VALUES (0.1), (0.2), (0.3)) AS t(x);
 ```
 
 ```text
 total
 0.6
+```
+
+Added up one pair at a time, the same three numbers give a different last digit:
+
+```sql
+SELECT CAST(0.1 AS DOUBLE) + CAST(0.2 AS DOUBLE) + CAST(0.3 AS DOUBLE) AS added_up;
+```
+
+```text
+added_up
+0.6000000000000001
 ```
 
 ## Functions you bring
@@ -390,6 +524,7 @@ the function as soon as your `POST` is answered, and loses it as soon as you `DE
 import json, threading, urllib.request
 import pyarrow as pa
 import pyarrow.flight as fl
+import pondra
 
 class Shout(fl.FlightServerBase):
     def do_exchange(self, context, descriptor, reader, writer):

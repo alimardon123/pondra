@@ -1,8 +1,6 @@
 ---
 title: Iceberg REST catalog
 description: Let PyIceberg, DuckDB, Spark and other engines find a node's tables by URL, read them and append to them.
-sidebar:
-  order: 12
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -28,7 +26,7 @@ CREATE TABLE sales.orders (id BIGINT, item VARCHAR) WITH (publish = 'iceberg');
 
 Its first, empty version is published when the table is made, so an engine that appends to a new
 table finds it. Views are not in the catalog. Set `publish` on a table that exists with
-`ALTER TABLE … SET (publish = 'iceberg')`: see [table options](/pondra/reference/table-options/).
+`ALTER TABLE … SET (publish = 'iceberg')`: see [table options](/pondra/sql/table-options/).
 
 Namespaces are schemas:
 
@@ -36,7 +34,7 @@ Namespaces are schemas:
 |---|---|
 | `default` | the lake's `public` schema |
 | `sales` | the lake's other schema `sales` |
-| `other` | the `public` schema of an [attached lake](/pondra/reference/sql/#schemas-and-other-lakes) `other` |
+| `other` | the `public` schema of an [attached lake](/pondra/sql/statements/#schemas-and-other-lakes) `other` |
 | `other.sales` | that lake's schema `sales`. On the wire the parts are joined with the character `0x1F`, as the REST specification says |
 
 Other engines read a table's files, so they see the rows the node has written to files. New rows
@@ -63,16 +61,20 @@ version for up to `--tier-secs`. `POST /tier` (with the admin token) writes the 
 | `DELETE /v1/namespaces/{ns}/tables/{table}` | `DROP TABLE`, its files with it. `204` |
 | `POST /v1/tables/rename` | `ALTER TABLE … RENAME TO`, within the table's namespace. `204` |
 
-There is no `{prefix}` in the path. These are refused, each with a `400 BadRequestException` whose
-message names the SQL that does it:
+The paths have no prefix: `/v1/namespaces`, not `/v1/{prefix}/namespaces`. `GET /v1/config` names
+the endpoints as the REST specification writes them, with `{prefix}`, and sets no prefix, so an engine
+calls the paths above. These are refused, each with a `400 BadRequestException` whose message names
+the SQL that does it:
 
 | Request | Do this in Pondra's SQL |
 |---|---|
 | `POST /v1/namespaces` | `CREATE SCHEMA` |
 | `DELETE /v1/namespaces/{ns}` | `DROP SCHEMA` |
 
-Errors come in the REST API's shape, `{"error": {"message": …, "type": …, "code": …}}`. A client
-that reads `/v1/config` knows which of these the catalog serves, and does not send the others.
+Errors come in the REST API's shape, `{"error": {"message": …, "type": …, "code": …}}`, with the
+status the table gives. The sign-in and route checks answer first, as plain text: no token or a wrong
+one is `401`, and a token with too few rights for the route is `403`. A client that reads
+`/v1/config` knows which of these the catalog serves, and does not send the others.
 
 ```bash
 # write the new rows to files now, so other engines see them
@@ -253,6 +255,7 @@ A lake on object storage needs the engine to reach the bucket too: for PyIceberg
 With tokens set, the catalog uses the same ones as [HTTP](/pondra/reference/http/#roles), sent as
 `Authorization: Bearer`. Reading needs the `read` token, and a commit needs the `write` token. A
 token with too few rights gets `403` with the text `this needs more rights than this token's or user's`; no token, or a wrong one, `401`.
+A write token that makes, renames or drops a table gets a `403` in the REST shape, with the reason.
 
 ```python norun
 import os
