@@ -1210,8 +1210,10 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
     let asks = |text: &str| {
+        // (AT (OFFSET => -n) is n seconds before now: a moment that moves)
+        static OFFSET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*OFFSET\s*=>").expect("a regex"));
         let q = text.to_lowercase();
-        !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.learned", "pondra.variables", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+        OFFSET.is_match(text) || !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.learned", "pondra.variables", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
     };
     let volatile = files || limited || asks(query)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)

@@ -219,6 +219,15 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
         let since = chrono::DateTime::from_timestamp_millis(ms as i64).map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default();
         ensure!(!refused, "{t} AT (…): its past is kept from version {v} ({since}) on (its retention: ALTER TABLE {t} SET (retention = '7 days') keeps more from now on)");
     }
+    if let Some((v, ms)) = meta.made {
+        // (strictly before `v`: at `v` itself the table may already be there, as after CREATE TABLE)
+        let before = match at {
+            At::Version(n) => n < v as i64,
+            At::Time(us) => us < ms as i64 * 1000,
+        };
+        let made = chrono::DateTime::from_timestamp_millis(ms as i64).map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default();
+        ensure!(!before, "{t} AT (…): {t} was made at version {v} ({made}); it has no past before that");
+    }
     let ts = |us: i64| lit(ScalarValue::TimestampMicrosecond(Some(us), Some("UTC".into())));
     let user: Vec<Expr> = meta.columns.iter().map(|(c, _)| ident(c)).collect();
     let shown = |more: Vec<Expr>| user.iter().cloned().chain(more).collect::<Vec<_>>();

@@ -135,7 +135,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 i.sequence = crate::seq::owned(lake, name, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
                 defaults.insert(c.clone(), format!("nextval('{}')", i.sequence.replace('\'', "''")));
             }
-            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, folder, tiered: lake.visible(), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
+            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, folder, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
         }
         Some(mut m) => {
             defaulted = false;
@@ -1204,7 +1204,7 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     if lake.cat.get::<u64>(&producer_key(&format!("job:{}", f.job))).await?.is_some() {
         return Ok(j!({"duplicate": true})); // the same job finished concurrently
     }
-    let new = TableMeta { columns: f.columns.clone(), publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() }; // (a table `POST /insert/{t}` makes starts at the log's end, as CREATE TABLE's does; SQL's INSERT needs one already: `is_there`)
+    let new = TableMeta { columns: f.columns.clone(), publish: default_publish(), ids: true, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), ..Default::default() }; // (a table `POST /insert/{t}` makes starts at the log's end, as CREATE TABLE's does; SQL's INSERT needs one already: `is_there`)
     let meta = lake.cat.get::<TableMeta>(&table_key(&f.table)).await?.unwrap_or_else(|| new.clone());
     // Types as the lake stores them, so a writer may name them its own way (`Utf8View`, `VARIANT`).
     let types = |c: &[(String, String)]| c.iter().map(|(_, t)| crate::query::dtype(t).map(|t| crate::query::type_name(&t)).unwrap_or_else(|_| t.clone())).collect::<Vec<_>>();

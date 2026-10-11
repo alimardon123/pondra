@@ -562,7 +562,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         // (0.32 would read its partial rows as the view's: ADR-055)
         crate::format::require(lake, 2, "a materialized view that works its answers out as it is read (avg, stddev, HAVING, …)").await?;
     }
-    let mut meta = TableMeta { columns, key, merge, publish: default_publish(), ids: true, tiered: lake.visible(), history, finish: finish.clone(), ..Default::default() };
+    let mut meta = TableMeta { columns, key, merge, publish: default_publish(), ids: true, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), history, finish: finish.clone(), ..Default::default() };
     meta.publish = meta.publish.iter().filter(|f| crate::delta::refused(&meta, f).is_none()).cloned().collect(); // (said by `ddl`: `delta::left_out`)
     if !expect.is_empty() {
         expectations(lake, name, &source, &planned, &meta, &expect).await?;

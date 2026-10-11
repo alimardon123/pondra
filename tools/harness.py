@@ -7043,7 +7043,8 @@ def safety():
     Postgres's sslmode, Kafka's SSL, Flight's grpc+tls), plain connections only from this machine,
     nodes calling each other over HTTPS, the nodes' key only with the authority's certificate
     (mutual TLS); the audit log (what's written by default, values hidden, refusals at every door,
-    a superuser's only); a user's quota (statements at once, and how long each may run)."""
+    a superuser's only); a user's quota (statements at once, and how long each may run) and a
+    session's statement_timeout."""
     import base64, re, socket, ssl, struct, psycopg, pyarrow.flight as fl
     here = tempfile.mkdtemp(prefix="pondra-tls-")
     ca_key, ca, key, csr, crt, ext = [os.path.join(here, n) for n in ("ca.key", "ca.pem", "node.key", "node.csr", "node.pem", "ext.cnf")]
@@ -7203,6 +7204,21 @@ def safety():
     q(boss, "ALTER USER ana MAX_QUERIES 0 STATEMENT_TIMEOUT 0")
     after = q(boss, "SELECT max_queries, statement_timeout FROM pondra.users WHERE name = 'ana'")
     info["quota"] = {"listed": listed, "took": took, "after": after}
+    # A session's SET statement_timeout (Postgres, as the superuser boss) stops its statements at that limit, with
+    # Postgres's own code and words; 0 lifts it on the same connection.
+    with psycopg.connect(f"host=127.0.0.1 port={P + 15} user=boss password=boss-password-1 dbname=lake", autocommit=True) as pg:
+        pg.execute("SET statement_timeout = '1s'")
+        t0 = time.time()
+        try:
+            pg.execute("SELECT sum(v) AS s FROM generate_series(1, 4000000000) g(v)").fetchall()
+            stopped = None
+        except psycopg.Error as e:
+            stopped = (e.sqlstate, str(e).strip(), round(time.time() - t0, 2))
+        pg.execute("SET statement_timeout = 0")
+        lifted = pg.execute("SELECT 1 AS x").fetchall()
+    info["statement_timeout"] = stopped
+    checks["SET statement_timeout stops a statement at the session's limit (57014, Postgres's words), over Postgres; 0 lifts it"] = \
+        stopped is not None and stopped[0] == "57014" and "canceling statement due to statement timeout" in stopped[1] and stopped[2] <= 4 and lifted == [(1,)]
     checks["a user's quota: one statement at a time (the next waits its turn), each stopped after its STATEMENT_TIMEOUT; pondra.users says so; 0 lifts it"] = \
         listed == [{"max_queries": 1, "statement_timeout": "2 seconds"}] and all("STATEMENT_TIMEOUT" in r for r, _ in took.values()) \
         and 1.5 <= ends[0] <= 3.5 and ends[1] >= ends[0] + 1.5 and after == [{}]  # (nulls: no keys)

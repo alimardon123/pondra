@@ -160,6 +160,10 @@ pub struct TableMeta {
     /// this was kept, and whole only from its oldest purge kept (`past::kept_since`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub past_from: Option<(u64, u64)>,
+    /// When the table was made: the log's end then and the time (ms). `t AT (…)` before it is
+    /// refused (`past::table`); None for a table made before this was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub made: Option<(u64, u64)>,
     /// A clone's (`CREATE TABLE c CLONE t`, ADR-043): the folders of other tables whose files it
     /// lists too. Files there go only by the orphan sweep, which counts every table listing them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
