@@ -419,7 +419,7 @@ pub fn columns_of(returns: &str) -> Result<Vec<(String, String)>> {
 pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Result<Value> {
     let name = crate::ddl::new_name(lake, name).await?;
     ensure!(r.kind != Kind::Procedure || !crate::workspace::is_run(crate::ddl::split(&name).1), "{name}: run is Pondra's own procedure (CALL run('etl/orders.sql') runs a file of the lake's)");
-    ensure!(r.kind != Kind::Procedure || !crate::apply::is_own(crate::ddl::split(&name).1), "{name}: plan and apply are Pondra's own procedures (CALL apply('files/sales', env => 'prod'))");
+    ensure!(r.kind != Kind::Procedure || !crate::apply::is_own(crate::ddl::split(&name).1), "{name}: plan, apply, status and capture are Pondra's own procedures (CALL apply('files/sales', env => 'prod'))");
     if let Some(old) = lake.cat.get::<Routine>(&key(&name)).await? {
         ensure!(replace, "{} {name} already exists (CREATE OR REPLACE {})", old.what(), r.what().to_uppercase());
         ensure!((old.kind == Kind::Procedure) == (r.kind == Kind::Procedure), "{name} is a {}", old.what());

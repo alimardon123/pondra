@@ -721,6 +721,7 @@ DROP MATERIALIZED VIEW spend_by_item;
 | Python procedure | `CREATE PROCEDURE p($x type, …) LANGUAGE python AS $$ … $$` |
 | Call | `CALL p(args)` or `CALL p(name => value)` |
 | Run a file | `CALL run('etl/orders.sql', day => DATE '2026-09-29')`: a `.sql`, `.py` or notebook file of the lake's, its parameters by name ([Run files as jobs](/pondra/guides/workspace/)) |
+| Project status | `CALL status('shop', env => 'prod')`: what differs between a project kept in the workspace and that database, as rows (`state`, `mark`, `kind`, `name`, `what`, `who`, `at`). `CALL capture` is refused, since it writes the project's files: `pondra capture` does that ([Changes made in the database](/pondra/guides/environments/#changes-made-in-the-database)) |
 | Run code once | `DO LANGUAGE python \| sql $$ … $$` (the language may come after the code, as in Postgres) |
 | Start | `START CALL p(args)`: runs it without waiting, and answers with the run's id (`AWAIT` it, or find it in `pondra.runs`) |
 | Task | `CREATE [OR REPLACE] TASK [IF NOT EXISTS] t SCHEDULE '5 minutes' \| 'cron 0 2 * * * UTC' AS CALL p(…)` |

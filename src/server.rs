@@ -148,6 +148,8 @@ pub fn router(app: App) -> Router {
         .route("/plan", post(apply))
         .route("/apply", post(apply))
         .route("/test", post(apply))
+        .route("/status", post(apply))
+        .route("/capture", post(apply))
         .route("/export", get(|State(app): State<App>, Query(q): Query<HashMap<String, String>>| async move {
             Ok::<_, E>(Json(match q.get("database") {
                 Some(name) => crate::apply::export_attached(&app.lake, name).await?,
@@ -1128,13 +1130,16 @@ async fn secret(State(app): State<App>, Path(name): Path<String>, headers: axum:
     Ok(Json(j!(values)))
 }
 
-/// `POST /plan`, `/apply`, `/test`: a project's files planned here, applied, or its tests run
-/// (ADR-047 §4), each with the same body.
+/// `POST /plan`, `/apply`, `/test`, `/status`, `/capture`: a project's files planned here, applied, its tests run,
+/// what differs from the database, or what writing it into the files takes (ADR-047 §4, ADR-060 §7), each with the
+/// same body.
 async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, Json(ask): Json<crate::apply::Ask>) -> Result<Json<Value>, E> {
     use crate::apply::Verb;
     let verb = match uri.path().rsplit('/').next() {
         Some("plan") => Verb::Plan,
         Some("test") => Verb::Test,
+        Some("status") => Verb::Status,
+        Some("capture") => Verb::Capture,
         _ => Verb::Apply,
     };
     let who = crate::routines::Who { role: role.0, files: owner(&headers), depth: 0 };

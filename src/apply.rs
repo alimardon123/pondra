@@ -39,14 +39,17 @@ const LOCK: &str = "dl"; // (the apply under way: its number and when it last sa
 const STALE_MS: u64 = 120_000;
 // (stored keys keep the old word, deploy: "dp" and "dm" are the lake's format, and a rename must not move them)
 fn record_key(n: u64) -> String { format!("dp/{n:010}") }
-fn migration_key(project: &str, file: &str) -> String { format!("dm/{project}/{file}") }
+pub(crate) fn migration_key(project: &str, file: &str) -> String { format!("dm/{project}/{file}") }
 
-/// What is asked of a project: `POST /plan`, `/apply` and `/test` (`CALL plan`, `CALL apply`).
+/// What is asked of a project: `POST /plan`, `/apply`, `/test`, `/status` and `/capture` (`CALL plan`, `CALL
+/// apply`, `CALL status`; capture writes files, so only the command line and `POST /capture` ask it).
 #[derive(Clone, Copy, PartialEq)]
 pub enum Verb {
     Plan,
     Apply,
     Test,
+    Status,
+    Capture,
 }
 
 /// An apply, plan or test asked for: the project's files, as the command line sends them.
@@ -65,6 +68,8 @@ pub struct Ask {
     pub prune: bool, // drop what the project no longer declares
     #[serde(default)]
     pub plan: Option<String>, // an apply's: the plan it showed, refused if that is no longer the plan
+    #[serde(default)]
+    pub names: Vec<String>, // a capture's: the objects it writes (none: all of them)
 }
 
 #[derive(Deserialize, Default)]
@@ -101,7 +106,7 @@ struct Attach {
 /// What an apply makes: an object of the registry's (`objects::KINDS`: its word and its order), or what
 /// pondra.toml and GRANTs say, which aren't objects.
 #[derive(Clone, Copy, Debug)]
-enum Kind {
+pub(crate) enum Kind {
     Object(&'static crate::objects::Kind),
     Attach,
     Grant,
@@ -114,7 +119,7 @@ impl PartialEq for Kind {
 impl Eq for Kind {}
 
 impl Kind {
-    fn word(self) -> &'static str {
+    pub(crate) fn word(self) -> &'static str {
         match self {
             Kind::Object(k) => k.name,
             Kind::Attach => "attach",
@@ -123,7 +128,7 @@ impl Kind {
     }
 
     /// The kind a word names, if a project may declare it.
-    fn of(word: &str) -> Option<Kind> {
+    pub(crate) fn of(word: &str) -> Option<Kind> {
         match word {
             "attach" => Some(Kind::Attach),
             "grant" => Some(Kind::Grant),
@@ -134,7 +139,7 @@ impl Kind {
     /// A kind by a word this file uses (the registry has it, and a project declares it).
     fn named(word: &str) -> Kind { Kind::of(word).expect("a kind a project declares") }
 
-    fn is(self, word: &str) -> bool { self.word() == word }
+    pub(crate) fn is(self, word: &str) -> bool { self.word() == word }
 
     /// The order things are made in: what others name first.
     fn rank(self) -> u8 {
@@ -157,35 +162,35 @@ impl Kind {
 
 /// An object a project declares: its statement as written, and its fingerprint.
 #[derive(Clone)]
-struct Declared {
-    kind: Kind,
-    name: String,
-    sql: String,
-    file: String,
-    print: String,
+pub(crate) struct Declared {
+    pub(crate) kind: Kind,
+    pub(crate) name: String,
+    pub(crate) sql: String,
+    pub(crate) file: String,
+    pub(crate) print: String,
 }
 
 impl Declared {
-    fn key(&self) -> String { key(self.kind, &self.name) }
+    pub(crate) fn key(&self) -> String { key(self.kind, &self.name) }
 }
 
-fn key(kind: Kind, name: &str) -> String { format!("{} {name}", kind.word()) }
+pub(crate) fn key(kind: Kind, name: &str) -> String { format!("{} {name}", kind.word()) }
 
 /// What a project's files say, for one environment.
-struct Project {
-    name: String,
-    objects: Vec<Declared>,
-    migrations: Vec<(String, String)>, // (file, text), in name order
+pub(crate) struct Project {
+    pub(crate) name: String,
+    pub(crate) objects: Vec<Declared>,
+    pub(crate) migrations: Vec<(String, String)>, // (file, text), in name order
     seeds: Vec<(String, String)>, // (file, text): rows a new database starts with, in name order
     tests: Vec<(String, String)>,
-    values: HashMap<String, Value>,
+    pub(crate) values: HashMap<String, Value>,
     protect: bool, // (the chosen environment's `protected`: the apply protects the database)
 }
 
 impl Project {
     /// Whether `k`, an object of the database, is in a schema the project's objects are in: what its
     /// migrations could have changed. Another schema's objects, an empty schema and roles aren't.
-    fn holds(&self, k: &str) -> bool {
+    pub(crate) fn holds(&self, k: &str) -> bool {
         let (word, name) = split_key(k);
         let schema = |kind: Kind, name: &str| match kind {
             Kind::Object(k) if matches!(k.family, "relation" | "routine" | "task" | "type") => Some(name.split_once('.').map_or(crate::ddl::PUBLIC, |(s, _)| s).to_string()),
@@ -196,7 +201,7 @@ impl Project {
     }
 }
 
-fn project(ask: &Ask) -> Result<Project> {
+pub(crate) fn project(ask: &Ask) -> Result<Project> {
     let toml: Toml = match ask.files.get("pondra.toml") {
         Some(t) => toml::from_str(t).context("pondra.toml")?,
         None => Toml::default(),
@@ -242,7 +247,7 @@ fn declarable() -> String { crate::objects::KINDS.iter().filter(|k| k.project.is
 
 /// What a statement in `objects/` makes, and its name inside the database. None: nothing (a
 /// comment alone).
-fn head(sql: &str) -> Result<Option<(Kind, String)>> {
+pub(crate) fn head(sql: &str) -> Result<Option<(Kind, String)>> {
     let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else { bail!("not SQL the plan can read") };
     let solid: Vec<&Token> = tokens.iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
     if solid.is_empty() {
@@ -326,7 +331,7 @@ fn dotted(solid: &[&Token], at: usize) -> Result<(Vec<String>, usize)> {
 /// A statement's fingerprint: its tokens, comments, spacing, case, `OR REPLACE`, `IF NOT EXISTS` and
 /// a last `;` aside, with each `$name` the value it will be given (a secret's as its hash, so the
 /// fingerprint never holds it).
-fn fingerprint(sql: &str, values: &HashMap<String, Value>, secrets: &BTreeMap<String, String>) -> String {
+pub(crate) fn fingerprint(sql: &str, values: &HashMap<String, Value>, secrets: &BTreeMap<String, String>) -> String {
     let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else {
         return crate::users::sha256(&sql.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase());
     };
@@ -373,7 +378,7 @@ fn ordered(mut all: Vec<Declared>) -> Vec<Declared> {
 }
 
 /// Does `sql` name `name` (as a whole word, its schema too)?
-fn mentions(sql: &str, name: &str) -> bool {
+pub(crate) fn mentions(sql: &str, name: &str) -> bool {
     let (s, t) = crate::ddl::split(name);
     let lower = sql.to_lowercase();
     let whole = |n: &str| lower.match_indices(n).any(|(i, _)| {
@@ -382,6 +387,28 @@ fn mentions(sql: &str, name: &str) -> bool {
         !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
     });
     if s == crate::ddl::PUBLIC { whole(t) } else { whole(&format!("{s}.{t}")) }
+}
+
+/// The tables and views a migration renames, as (from, to): `to` in `from`'s schema when written without
+/// one, as `ALTER TABLE … RENAME TO` does (`ddl::rename`).
+fn renames(sql: &str) -> Vec<(String, String)> {
+    let mut out = vec![];
+    for stmt in crate::routines::split(sql) {
+        let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse(&stmt) else { continue };
+        for d in ds {
+            let crate::ddl::Ddl::RenameTable { name, to } = d else { continue };
+            let (schema, table) = crate::ddl::split(&name);
+            let to = match to.contains('.') {
+                true => {
+                    let (ts, tt) = crate::ddl::split(&to);
+                    crate::ddl::join(ts, tt)
+                }
+                false => crate::ddl::join(schema, &to),
+            };
+            out.push((crate::ddl::join(schema, table), to));
+        }
+    }
+    out
 }
 
 /// `GRANT … TO r` → `REVOKE … FROM r`.
@@ -393,20 +420,30 @@ fn revoke(sql: &str) -> String {
 
 // ---------------------------------------------------------------- the database as files
 
+/// A table as an apply left it: its folder, which a rename keeps, and each live column's stored name
+/// with the name SQL gives it (a rename changes only the second). `status.rs` tells renames from
+/// drops by them.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Shape {
+    pub folder: String,
+    pub columns: Vec<(String, String)>, // (stored, SQL's)
+}
+
 /// An object as the database has it: its statement as `export` writes it.
-struct Current {
-    sql: String,
-    meta: Option<TableMeta>,
+pub(crate) struct Current {
+    pub(crate) sql: String,
+    pub(crate) meta: Option<TableMeta>,
+    pub(crate) shape: Option<Shape>, // (a table's only)
 }
 
 /// Every object of the lake a project could declare, by its key, as the statement that makes it.
-async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
+pub(crate) async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
     let mut out = BTreeMap::new();
-    let mut put = |kind: Kind, name: &str, sql: String, meta: Option<TableMeta>| {
-        out.insert(key(kind, name), Current { sql, meta });
+    let mut put = |kind: Kind, name: &str, sql: String, meta: Option<TableMeta>, shape: Option<Shape>| {
+        out.insert(key(kind, name), Current { sql, meta, shape });
     };
     for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != crate::ddl::PUBLIC) {
-        put(Kind::named("schema"), &s, format!("CREATE SCHEMA {}", ident(&s)), None);
+        put(Kind::named("schema"), &s, format!("CREATE SCHEMA {}", ident(&s)), None, None);
     }
     let materialized: BTreeMap<String, crate::views::View> = lake.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().map(|(k, v)| (k[2..].to_string(), v)).collect();
     for (k, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
@@ -416,29 +453,30 @@ async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
             continue;
         }
         let m = meta.logical();
-        put(Kind::named("table"), name, table_sql(&quoted(name), &m), Some(m));
+        let shape = Shape { folder: meta.folder(name).to_string(), columns: meta.live().map(|(s, n, _)| (s.to_string(), n.to_string())).collect() };
+        put(Kind::named("table"), name, table_sql(&quoted(name), &m), Some(m), Some(shape));
     }
     for (k, s) in lake.cat.scan::<crate::seq::Sequence>("sq/", "sq0").await? {
         if s.owned.is_none() {
             // (an identity column's goes with its table, as its statement says)
-            put(Kind::named("sequence"), &k[3..], crate::seq::create_sql(&quoted(&k[3..]), &s), None);
+            put(Kind::named("sequence"), &k[3..], crate::seq::create_sql(&quoted(&k[3..]), &s), None, None);
         }
     }
     for (k, i) in lake.cat.scan::<crate::index::Index>("ix/", "ix0").await? {
         let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(&i.table)).await?;
         let sql = crate::index::create_sql(&ident(crate::ddl::split(&k[3..]).1), &quoted(&i.table), &i, meta.as_ref());
-        put(Kind::named("index"), &k[3..], sql, None);
+        put(Kind::named("index"), &k[3..], sql, None, None);
     }
     for (k, t) in lake.cat.scan::<crate::types::Type>("ty/", "ty0").await? {
-        put(Kind::named("type"), &k[3..], crate::types::create_sql(&quoted(&k[3..]), &t), None);
+        put(Kind::named("type"), &k[3..], crate::types::create_sql(&quoted(&k[3..]), &t), None, None);
     }
     for (name, v) in &materialized {
         let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(name)).await?;
-        put(Kind::named("materialized view"), name, materialized_sql(&quoted(name), v, meta.as_ref()), None);
+        put(Kind::named("materialized view"), name, materialized_sql(&quoted(name), v, meta.as_ref()), None, None);
     }
     for (k, v) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
         let name = &k[2..];
-        put(Kind::named("view"), name, format!("CREATE VIEW {} AS\n{}", quoted(name), v.sql.trim()), None);
+        put(Kind::named("view"), name, format!("CREATE VIEW {} AS\n{}", quoted(name), v.sql.trim()), None, None);
     }
     for (name, r) in crate::routines::listed(lake).await?.iter() {
         let kind = match r.what() {
@@ -446,17 +484,17 @@ async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
             "macro" => Kind::named("macro"),
             _ => Kind::named("function"),
         };
-        put(kind, name, routine_sql(&quoted(name), r), None);
+        put(kind, name, routine_sql(&quoted(name), r), None, None);
     }
     for (name, t) in crate::runs::tasks(lake).await?.iter() {
-        put(Kind::named("task"), name, task_sql(&quoted(name), t), None);
+        put(Kind::named("task"), name, task_sql(&quoted(name), t), None, None);
     }
     for (k, u) in lake.cat.scan::<crate::users::User>("u/", "u0").await? {
         let name = &k[2..];
         if u.login {
             continue; // (a user is the environment's, not the project's)
         }
-        put(Kind::named("role"), name, format!("CREATE ROLE {}", ident(name)), None);
+        put(Kind::named("role"), name, format!("CREATE ROLE {}", ident(name)), None, None);
     }
     Ok(out)
 }
@@ -488,6 +526,19 @@ async fn grants(lake: &Lake) -> Result<Vec<String>> {
 
 fn text(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 
+/// The file under `objects/` an object's statement goes in: schemas and roles have one file each, every
+/// other object its table name's file, in its schema's folder (`objects/sales/orders.sql`).
+pub(crate) fn path_of(word: &str, name: &str) -> String {
+    match word {
+        "schema" => "objects/schemas.sql".to_string(),
+        "role" => "objects/access.sql".to_string(),
+        _ => {
+            let (s, t) = crate::ddl::split(name);
+            if s == crate::ddl::PUBLIC { format!("objects/{t}.sql") } else { format!("objects/{s}/{t}.sql") }
+        }
+    }
+}
+
 /// The lake's objects as a project's files (`pondra export`): `pondra.toml`, a file per schema's
 /// object under `objects/`, roles and their grants in `objects/access.sql`. Secrets stay out (their
 /// values are the environment's), and so do users.
@@ -503,16 +554,8 @@ pub async fn export(lake: &Lake) -> Result<BTreeMap<String, String>> {
         f.push_str(";\n");
     };
     for (k, c) in &now {
-        let (word, name) = k.split_once(' ').map(|(w, n)| if w == "materialized" { ("materialized view", &n[5..]) } else { (w, n) }).unwrap_or(("", k));
-        let path = match word {
-            "schema" => "objects/schemas.sql".to_string(),
-            "role" => "objects/access.sql".to_string(),
-            _ => {
-                let (s, t) = crate::ddl::split(name);
-                if s == crate::ddl::PUBLIC { format!("objects/{t}.sql") } else { format!("objects/{s}/{t}.sql") }
-            }
-        };
-        add(path, &c.sql);
+        let (word, name) = split_key(k);
+        add(path_of(word, name), &c.sql);
     }
     for g in grants(lake).await? {
         add("objects/access.sql".into(), &g);
@@ -548,6 +591,8 @@ pub struct Step {
     pub kind: String,
     pub name: String,
     pub what: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub drift: bool, // (the database changed outside an apply: `pondra status` lists it as drifted)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sql: Vec<String>,
 }
@@ -601,15 +646,18 @@ pub struct Record {
     /// Each object it left declared: its fingerprint as written, and as the database has it after.
     #[serde(default)]
     pub objects: BTreeMap<String, (String, String)>,
+    /// Each declared table's shape after it (`Shape`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shapes: BTreeMap<String, Shape>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub new: bool, // (it made a brand-new database: `new_database`)
 }
 
 /// The apply entries, newest last.
-async fn records(lake: &Lake) -> Result<Vec<Record>> { Ok(lake.cat.scan::<Record>("dp/", "dp0").await?.into_iter().map(|(_, r)| r).collect()) }
+pub(crate) async fn records(lake: &Lake) -> Result<Vec<Record>> { Ok(lake.cat.scan::<Record>("dp/", "dp0").await?.into_iter().map(|(_, r)| r).collect()) }
 
 /// Each project's last finished apply (a record that ended `ok` or `tests_failed`): what it left declared.
-fn last_finished(all: &[Record]) -> BTreeMap<String, &Record> {
+pub(crate) fn last_finished(all: &[Record]) -> BTreeMap<String, &Record> {
     let mut last = BTreeMap::new();
     for r in all.iter().filter(|r| r.status == "ok" || r.status == "tests_failed") {
         last.insert(r.project.clone(), r);
@@ -625,7 +673,7 @@ pub async fn declared(lake: &Lake) -> Result<BTreeMap<String, String>> {
 }
 
 /// The plan for `p` here, as the database is now.
-async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Plan> {
+pub(crate) async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Plan> {
     let all = records(lake).await?;
     let after = all.last().map_or(0, |r| r.n);
     // What each project's last finished apply left declared, and who owns what.
@@ -645,7 +693,7 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
             refused.push(format!("{k} is project {o}'s: an apply changes only its own project's objects"));
             continue;
         }
-        let step = |mark, what: &str, sql: Vec<String>| Step { mark, change: change_of(mark, d.kind), kind: d.kind.word().into(), name: d.name.clone(), what: what.into(), sql };
+        let step = |mark, what: &str, sql: Vec<String>| Step { mark, change: change_of(mark, d.kind), kind: d.kind.word().into(), name: d.name.clone(), what: what.into(), drift: false, sql };
         let Some(cur) = now.get(&k) else {
             // (grants, secrets and attachments aren't read back: compared with what the last apply made)
             match (d.kind.word(), mine.get(&k)) {
@@ -661,7 +709,14 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
             if d.kind.is("task") && branch {
                 sql.push(format!("ALTER TASK {} SUSPEND", quoted(&d.name))); // (a branch's tasks start suspended)
             }
-            steps.push(step("+", "made", sql));
+            // (a kind the database reads back, in what the last apply made, is gone: dropped outside an apply)
+            if mine.contains_key(&k) && !matches!(d.kind.word(), "grant" | "attach" | "secret") {
+                let mut s = step("+", "dropped outside an apply: made again as the project says", sql);
+                s.drift = true;
+                steps.push(s);
+            } else {
+                steps.push(step("+", "made", sql));
+            }
             continue;
         };
         if d.kind.is("table") {
@@ -674,16 +729,15 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
             continue;
         }
         let (was, then) = mine.get(&k).cloned().unwrap_or_default();
-        let same = match mine.contains_key(&k) {
-            true => was == d.print && then == print(&cur.sql),
-            false => print(&cur.sql) == d.print,
-        };
+        // (as the files say now, or as the last apply left it and the files haven't changed)
+        let same = print(&cur.sql) == d.print || mine.contains_key(&k) && was == d.print && then == print(&cur.sql);
         if same || matches!(d.kind.word(), "schema" | "role") {
             continue;
         }
         let drift = mine.contains_key(&k) && was == d.print;
         let what = if drift { "changed outside an apply: made as the project says" } else { "replaced" };
         let action = |a: &str| if drift { format!("changed outside an apply: {a}") } else { a.to_string() };
+        let at = steps.len();
         match d.kind.word() {
             "materialized view" => {
                 // Made again from the rows already there, with every view that follows it.
@@ -700,7 +754,7 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
                 for f in &fresh {
                     sql.push(f.sql.clone());
                     rebuilt.push(f.name.clone());
-                    steps.push(Step { mark: "↻", change: "rebuild", kind: f.kind.word().into(), name: f.name.clone(), what: format!("made again with {}", d.name), sql: vec![] });
+                    steps.push(Step { mark: "↻", change: "rebuild", kind: f.kind.word().into(), name: f.name.clone(), what: format!("made again with {}", d.name), drift: false, sql: vec![] });
                 }
                 rebuilt.push(d.name.clone());
                 let at = steps.len() - fresh.len() - 1;
@@ -739,29 +793,42 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
                 steps.push(step("~", what, sql));
             }
         }
+        if drift {
+            // (its own steps: what follows a materialized view is made again, not changed)
+            for s in steps[at..].iter_mut().filter(|s| s.name == d.name) {
+                s.drift = true;
+            }
+        }
     }
     let declared: Vec<String> = p.objects.iter().map(Declared::key).collect();
     let mut gone: Vec<Step> = vec![];
     for k in mine.keys().filter(|k| !declared.contains(k)) {
         let (word, name) = split_key(k);
         let Some(kind) = Kind::of(word) else { continue };
+        if !matches!(word, "grant" | "attach" | "secret") && !now.contains_key(k) {
+            continue; // (dropped outside an apply already: a DROP of it would fail)
+        }
         gone.push(match prune {
-            true => Step { mark: "-", change: "drop", kind: word.into(), name: name.into(), what: "dropped: no longer in the project".into(), sql: vec![kind.drop(name)] },
-            false => Step { mark: "!", change: "keep", kind: word.into(), name: name.into(), what: "no longer in the project: kept (prune drops it)".into(), sql: vec![] },
+            true => Step { mark: "-", change: "drop", kind: word.into(), name: name.into(), what: "dropped: no longer in the project".into(), drift: false, sql: vec![kind.drop(name)] },
+            false => Step { mark: "!", change: "keep", kind: word.into(), name: name.into(), what: "no longer in the project: kept (prune drops it)".into(), drift: false, sql: vec![] },
         });
     }
     gone.reverse(); // (what was made last goes first)
     steps.extend(gone);
     // In the order they run: what is added (objects made, tables' columns, enum labels), then the migrations
     // (a backfill finds its column, a first apply's rows their table), then what is replaced or
-    // dropped (planned again after them: a rename makes a table match its declaration).
-    let (mut first, rest): (Vec<Step>, Vec<Step>) = steps.into_iter().partition(|s| s.mark == "+" || s.mark == "~" && (s.kind == "table" || s.kind == "type"));
+    // dropped (planned again after them: a rename makes a table match its declaration). A table a migration
+    // renames to waits for the migrations too: made first, the rename would find it there already.
+    // (and a view that reads a renamed table waits too: made first, it would name a table the rename has yet to make)
+    let renamed: Vec<String> = pending.iter().flat_map(|(_, text)| renames(text)).map(|(_, to)| to).collect();
+    let waits = |s: &Step| renamed.contains(&s.name) || renamed.iter().any(|to| s.sql.iter().any(|sql| mentions(sql, to)));
+    let (mut first, rest): (Vec<Step>, Vec<Step>) = steps.into_iter().partition(|s| (s.mark == "+" && !waits(s)) || s.mark == "~" && (s.kind == "table" || s.kind == "type"));
     first.extend(pending.iter().map(|(f, text)| match new {
-        true => Step { mark: "▶", change: "record", kind: "migration".into(), name: f.clone(), what: "recorded, not run: a new database is made as the files are now".into(), sql: vec![] },
-        false => Step { mark: "▶", change: "migrate", kind: "migration".into(), name: f.clone(), what: "runs once".into(), sql: vec![text.clone()] },
+        true => Step { mark: "▶", change: "record", kind: "migration".into(), name: f.clone(), what: "recorded, not run: a new database is made as the files are now".into(), drift: false, sql: vec![] },
+        false => Step { mark: "▶", change: "migrate", kind: "migration".into(), name: f.clone(), what: "runs once".into(), drift: false, sql: vec![text.clone()] },
     }));
     if new {
-        first.extend(p.seeds.iter().map(|(f, text)| Step { mark: "▶", change: "seed", kind: "seed".into(), name: f.clone(), what: "loads once: a new database".into(), sql: vec![text.clone()] }));
+        first.extend(p.seeds.iter().map(|(f, text)| Step { mark: "▶", change: "seed", kind: "seed".into(), name: f.clone(), what: "loads once: a new database".into(), drift: false, sql: vec![text.clone()] }));
     }
     first.extend(rest);
     let steps = first;
@@ -922,9 +989,15 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
 
 /// `POST /apply`: the plan, the apply, or the tests alone, of the project sent.
 pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
-    let applier = crate::auth::limited().is_some_and(|a| a.applies()); // (a user granted APPLY on this database)
+    let applier = applier();
     if verb == Verb::Apply {
         authorize(app, who, applier).await?;
+    }
+    if verb == Verb::Status {
+        return crate::status::status(app, &ask, who).await;
+    }
+    if verb == Verb::Capture {
+        return crate::status::capture(app, &ask, who).await; // (it asks for its own authorization, as an apply does)
     }
     let p = project(&ask)?;
     if verb == Verb::Test {
@@ -944,10 +1017,13 @@ pub async fn ask(app: &App, verb: Verb, ask: Ask, who: Who) -> Result<Value> {
     apply(app, &p, &plan, &ask, who, applier).await
 }
 
+/// Whether the caller holds APPLY on this database (a user granted it: `users::Access`).
+pub(crate) fn applier() -> bool { crate::auth::limited().is_some_and(|a| a.applies()) }
+
 /// Who may apply. On a database that isn't protected: an admin, or an APPLY holder. On a protected one
 /// (`protect.rs`): an APPLY holder, whoever runs the nodes (their tokens, their key, the program that
 /// started them), or an open lake; a superuser without APPLY is refused.
-async fn authorize(app: &App, who: Who, applier: bool) -> Result<()> {
+pub(crate) async fn authorize(app: &App, who: Who, applier: bool) -> Result<()> {
     let db = crate::ddl::lake_name(&app.lake);
     match crate::protect::protected(&app.lake).await? {
         true => ensure!(applier || crate::auth::operator() || app.open().await, "permission denied: {db} is protected: an apply needs APPLY (GRANT APPLY ON DATABASE {db} TO …), or an admin lifts the protection first (ALTER DATABASE {db} SET (protected = false))"),
@@ -977,13 +1053,19 @@ async fn apply(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applier
 /// its own name: making the project true takes an admin's statements, and the record keeps who asked.
 /// This span is also where that admin right ends: a procedure it starts would outlive it (`routines::start`).
 async fn making(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applier: bool) -> Result<Record> {
-    let admin = crate::auth::current().filter(|_| applier && who.role < crate::auth::Role::Admin).map(|me| crate::auth::Principal { role: crate::auth::Role::Admin, access: None, operator: false, ..me });
+    let admin = admin_for(who, applier);
     let as_who = if admin.is_some() { Who { role: crate::auth::Role::Admin, ..who } } else { who };
     let span = crate::protect::APPLYING.scope((), claim_to_record(app, p, plan, ask, as_who));
     match admin {
         Some(me) => crate::auth::WHO.scope(me, span).await,
         None => span.await,
     }
+}
+
+/// The admin an APPLY holder below admin acts as for an apply's statements, and for the migrations `capture`
+/// records as run: making the project true takes an admin's statements, and the record keeps who asked.
+pub(crate) fn admin_for(who: Who, applier: bool) -> Option<crate::auth::Principal> {
+    crate::auth::current().filter(|_| applier && who.role < crate::auth::Role::Admin).map(|me| crate::auth::Principal { role: crate::auth::Role::Admin, access: None, operator: false, ..me })
 }
 
 /// The claim, the apply's statements (`statements`), and its record's end (`making`'s span).
@@ -1058,6 +1140,7 @@ async fn statements(app: &App, p: &Project, plan: &Plan, record: &mut Record, wh
     let now = current(&app.lake).await?;
     let print = |sql: &str| fingerprint(sql, &HashMap::new(), &BTreeMap::new());
     record.objects = plan.objects.iter().map(|(k, f)| (k.clone(), (f.clone(), now.get(k).map(|c| print(&c.sql)).unwrap_or_default()))).collect();
+    record.shapes = plan.objects.keys().filter_map(|k| now.get(k)?.shape.clone().map(|s| (k.clone(), s))).collect();
     record.status = "ok".into();
     if test {
         record.tests = tests(app, p, who).await?;
@@ -1190,7 +1273,7 @@ pub async fn table(lake: &Lake) -> Result<datafusion::arrow::array::RecordBatch>
 // ---------------------------------------------------------------- CALL plan(…), CALL apply(…)
 
 /// The first `n` rows as JSON objects.
-fn rows_json(rows: &[datafusion::arrow::array::RecordBatch], n: usize) -> Result<Vec<Value>> {
+pub(crate) fn rows_json(rows: &[datafusion::arrow::array::RecordBatch], n: usize) -> Result<Vec<Value>> {
     let mut w = datafusion::arrow::json::ArrayWriter::new(Vec::new());
     w.write_batches(&rows.iter().collect::<Vec<_>>())?;
     w.finish()?;
@@ -1198,14 +1281,19 @@ fn rows_json(rows: &[datafusion::arrow::array::RecordBatch], n: usize) -> Result
     Ok(all.into_iter().take(n).collect())
 }
 
-/// Pondra's own procedures for a project kept in the workspace.
-pub fn is_own(name: &str) -> bool { matches!(name.to_ascii_lowercase().as_str(), "plan" | "apply" | "pondra.plan" | "pondra.apply") }
+/// Pondra's own procedures for a project kept in the workspace (`capture` is one only to refuse it by name).
+pub fn is_own(name: &str) -> bool { matches!(name.to_ascii_lowercase().as_str(), "plan" | "apply" | "status" | "capture" | "pondra.plan" | "pondra.apply" | "pondra.status" | "pondra.capture") }
 
 /// `CALL plan('files/sales', env => 'prod')`, `CALL apply('files/sales', env => 'prod', test => true,
 /// prune => false)`: the plan's lines, or the apply's steps, as rows.
 pub async fn call(app: &App, name: &str, args: &[datafusion::sql::sqlparser::ast::FunctionArg], who: Who) -> Result<Outcome> {
-    let applying = name.to_ascii_lowercase().ends_with("apply");
-    let verb = if applying { Verb::Apply } else { Verb::Plan };
+    let verb = match name.to_ascii_lowercase().rsplit('.').next().unwrap_or_default() {
+        "apply" => Verb::Apply,
+        "status" => Verb::Status,
+        "capture" => bail!("capture writes the project's files: run pondra capture where they are (or POST /capture)"),
+        _ => Verb::Plan,
+    };
+    let applying = verb == Verb::Apply;
     let a = crate::routines::args(name, args)?;
     ensure!(!a.given.is_empty(), "{name}: the project's folder in the workspace ('files/sales')");
     if a.given.len() > 1 || a.named.iter().any(|(n, _)| !["env", "test", "prune", "commit"].contains(&n.as_str())) {
@@ -1230,18 +1318,21 @@ pub async fn call(app: &App, name: &str, args: &[datafusion::sql::sqlparser::ast
     ensure!(files.contains_key("pondra.toml"), "{folder} holds no pondra.toml: a project's folder (pondra export, or pondra init)");
     let a = Ask { files, env: v["env"].as_str().map(String::from), commit: v["commit"].as_str().map(String::from), test: v["test"] == true, prune: v["prune"] == true, ..Default::default() };
     let out = ask(app, verb, a, who).await?;
-    let steps: Vec<Value> = match applying {
-        true => out["steps"].as_array().cloned().unwrap_or_default(),
-        false => {
-            let mut s = out["plan"]["steps"].as_array().cloned().unwrap_or_default();
-            s.extend(out["plan"]["refused"].as_array().into_iter().flatten().map(|r| j!({"mark": "!", "change": "refuse", "kind": "refused", "name": "", "what": r})));
-            s
-        }
+    // (what a refusal is, as a row: the refused lines of a plan or a status)
+    let refusals = |k: &str| out[k]["refused"].as_array().into_iter().flatten().map(|r| j!({"mark": "!", "change": "refuse", "state": "refused", "kind": "refused", "name": "", "what": r})).collect::<Vec<Value>>();
+    let steps: Vec<Value> = match verb {
+        Verb::Apply => out["steps"].as_array().cloned().unwrap_or_default(),
+        Verb::Status => out["status"]["lines"].as_array().into_iter().flatten().cloned().chain(refusals("status")).collect(),
+        _ => out["plan"]["steps"].as_array().into_iter().flatten().cloned().chain(refusals("plan")).collect(),
     };
     use datafusion::arrow::array::{ArrayRef, StringArray};
     use std::sync::Arc;
     let col = |k: &str| Arc::new(steps.iter().map(|s| s[k].as_str().map(String::from)).collect::<StringArray>()) as ArrayRef;
-    let batch = datafusion::arrow::array::RecordBatch::try_from_iter(vec![("mark", col("mark")), ("change", col("change")), ("kind", col("kind")), ("name", col("name")), ("what", col("what"))])?;
+    let cols: &[&str] = match verb {
+        Verb::Status => &["state", "mark", "kind", "name", "what", "who", "at"],
+        _ => &["mark", "change", "kind", "name", "what"],
+    };
+    let batch = datafusion::arrow::array::RecordBatch::try_from_iter(cols.iter().map(|c| (*c, col(c))))?;
     Ok(Outcome::Rows(vec![batch]))
 }
 
@@ -1320,5 +1411,14 @@ mod tests {
         assert_eq!(labels("CREATE TYPE mood AS ENUM ('sad', 'it''s', 'ok')"), ["sad", "it's", "ok"]);
         assert_eq!(labels("-- an enum (not a label)\nCREATE TYPE enum AS ENUM ()"), Vec::<String>::new());
         assert_eq!(text("it's"), "'it''s'");
+    }
+
+    #[test]
+    fn renames_are_read() {
+        let r = |from: &str, to: &str| (from.to_string(), to.to_string());
+        assert_eq!(renames("ALTER TABLE sales.orders RENAME TO orders2;\nSELECT 1;"), [r("sales.orders", "sales.orders2")]);
+        assert_eq!(renames("alter table public.t rename to u"), [r("t", "u")]);
+        assert_eq!(renames("ALTER TABLE a.t RENAME TO b.u"), [r("a.t", "b.u")]);
+        assert_eq!(renames("ALTER TABLE t ADD COLUMN c INT"), Vec::<(String, String)>::new());
     }
 }

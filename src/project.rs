@@ -68,6 +68,23 @@ pub enum Command {
         #[arg(long)]
         prune: bool,
     },
+    /// What differs between the project's files and an environment, as `git status` does: what an apply would
+    /// change, what was changed in the database outside an apply, and what no project declares (pondra status).
+    Status {
+        /// The environment or branch (default: the git branch's).
+        #[arg(value_name = "ENV", conflicts_with = "env")]
+        target: Option<String>,
+        #[command(flatten)]
+        at: Where,
+    },
+    /// Write what was changed in the database outside an apply into the project's files: each object's statement,
+    /// a migration for a renamed table or column (pondra capture sales.memos).
+    Capture {
+        /// The objects to write, by name (default: all of them).
+        names: Vec<String>,
+        #[command(flatten)]
+        at: Where,
+    },
     /// Make the project true in an environment: its plan, each step, then its tests (pondra apply test).
     Apply {
         /// The environment or branch (default: the git branch's).
@@ -724,6 +741,8 @@ async fn run(cmd: Command) -> Result<(String, bool)> {
         Command::Login { url, project, token, user } => login(url, &project, token, user).await.map(|s| (s + "\n", true)),
         Command::Branch { name, from, delete, at } => branch_cmd(&at, name, from, delete).await,
         Command::Plan { target, at, prune } => apply_env(&at.with(target), Run { apply: false, test: false, prune, fresh: false }).await,
+        Command::Status { target, at } => status_env(&at.with(target)).await,
+        Command::Capture { names, at } => capture_env(&at, &names).await,
         Command::Switch { name, at } => switch_cmd(&at, &name).await,
         Command::Apply { target, at, watch, fresh, no_test, prune, applies } => {
             let at = at.with(target);
@@ -940,6 +959,108 @@ async fn apply_env(at: &Where, run: Run) -> Result<(String, bool)> {
         out.push_str(&format!("  console: {}/\n", node.base));
     }
     Ok((out, ok))
+}
+
+/// Asks an environment's node `rel` with the project's files, as `pondra plan` does (a database that is a clone is
+/// made first). Returns the environment, what was said when it was made, and the answer.
+async fn ask_files(at: &Where, rel: &str, names: &[String]) -> Result<(String, String, Value)> {
+    let dir = Path::new(&at.project);
+    let toml = read_toml(dir)?;
+    let env = env_of(at, &toml, dir)?;
+    let head = made(at, &toml, &env, false).await?.unwrap_or_default();
+    let node = node(at, &toml, &env).await?;
+    let body = json!({"files": files(dir)?, "env": section(&toml, &env), "commit": commit(dir), "secrets": secrets(&toml)?, "names": names});
+    let (answer, line) = ask_node(at, &toml, &env, &node, rel, body).await?;
+    Ok((env, head + &line, answer))
+}
+
+/// `pondra status`: what an apply would change, what changed outside one, and what no project declares, as lines
+/// (`status.rs`). Exit 0 unless something is refused.
+async fn status_env(at: &Where) -> Result<(String, bool)> {
+    let (env, head, answer) = ask_files(at, "/status", &[]).await?;
+    let st = &answer["status"];
+    let lines: Vec<Value> = st["lines"].as_array().cloned().unwrap_or_default();
+    let refused: Vec<String> = serde_json::from_value(st["refused"].clone()).unwrap_or_default();
+    let after = st["after"].as_u64().unwrap_or(0);
+    let git = commit(Path::new(&at.project)).map(|c| format!(" · git {c}")).unwrap_or_default();
+    let mut out = format!("{head}{env}: {}{git}\n", if after == 0 { "first apply".to_string() } else { format!("after apply {after}") });
+    out.push_str(&if lines.is_empty() { "  nothing differs: the database is the files\n".to_string() } else { status_text(&lines) });
+    for r in &refused {
+        out.push_str(&format!("  ✗ refused    {r}\n"));
+    }
+    Ok((out, refused.is_empty()))
+}
+
+/// The lines of `pondra status`, in the groups an apply, a change outside one, and an untracked object make.
+fn status_text(lines: &[Value]) -> String {
+    let wide = lines.iter().map(|l| l["name"].as_str().unwrap_or_default().chars().count()).max().unwrap_or(0).clamp(8, 40);
+    let groups = [
+        ("apply", "To apply (pondra apply):"),
+        ("changed", "Changed outside an apply (pondra capture NAME writes it into the files, pondra apply puts it back):"),
+        ("untracked", "Untracked (pondra capture NAME):"),
+    ];
+    let mut out = String::new();
+    for (state, title) in groups {
+        let mine: Vec<&Value> = lines.iter().filter(|l| l["state"] == state).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("{title}\n"));
+        for l in mine {
+            // (an apply's line says where it is declared; a change says what and who, and when)
+            let tail = match (state, l["who"].as_str(), l["at"].as_str()) {
+                ("apply", _, _) => l["file"].as_str().or(l["what"].as_str()).unwrap_or_default().to_string(),
+                (_, who, Some(at)) => format!("{} · {}{at}", l["what"].as_str().unwrap_or_default(), who.map(|w| format!("{w}, ")).unwrap_or_default()),
+                _ => l["what"].as_str().unwrap_or_default().to_string(),
+            };
+            out.push_str(&format!("  {} {:<10} {:<wide$}  {tail}\n", l["mark"].as_str().unwrap_or(" "), l["kind"].as_str().unwrap_or_default(), l["name"].as_str().unwrap_or_default()));
+        }
+    }
+    out
+}
+
+/// `pondra capture [NAME…]`: writes what was changed in the database outside an apply into the project's files,
+/// and the migrations a rename needs (recorded as run in the database, which has the change). Exit 1 if anything
+/// was refused.
+async fn capture_env(at: &Where, names: &[String]) -> Result<(String, bool)> {
+    let dir = Path::new(&at.project);
+    let (env, head, answer) = ask_files(at, "/capture", names).await?;
+    let db = database(&env);
+    let migrations: Vec<String> = serde_json::from_value(answer["migrations"].clone()).unwrap_or_default();
+    let wrote = answer["files"].as_object().is_some_and(|f| !f.is_empty());
+    let refused = answer["refused"].as_array().is_some_and(|r| !r.is_empty());
+    let mut out = head + &match (wrote, refused) {
+        (true, _) => format!("{env}: captured into the files\n"),
+        (false, true) => format!("{env}: nothing captured\n"),
+        (false, false) => format!("{env}: nothing to capture: the database is the files\n"),
+    };
+    for (path, text) in answer["files"].as_object().into_iter().flatten() {
+        // (only a path inside the project: the answer comes from a server)
+        ensure!(Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_))), "{path}: not a path in the project");
+        let target = dir.join(path);
+        match text.as_str() {
+            Some(t) => {
+                std::fs::create_dir_all(target.parent().unwrap_or(dir))?;
+                std::fs::write(&target, t)?;
+                let recorded = path.strip_prefix("migrations/").is_some_and(|f| migrations.iter().any(|m| m == f));
+                out.push_str(&match recorded {
+                    true => format!("  wrote {path} (recorded as run in {db})\n"),
+                    false => format!("  wrote {path}\n"),
+                });
+            }
+            None => {
+                let _ = std::fs::remove_file(&target);
+                out.push_str(&format!("  removed {path}\n"));
+            }
+        }
+    }
+    for r in answer["refused"].as_array().into_iter().flatten() {
+        out.push_str(&format!("  ✗ refused    {}\n", r.as_str().unwrap_or_default()));
+    }
+    if wrote {
+        out.push_str("  git diff shows the change; commit it, and pondra apply makes it everywhere else\n");
+    }
+    Ok((out, answer["ok"] == true))
 }
 
 /// `pondra test`: the project's tests in an environment.

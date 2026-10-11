@@ -258,6 +258,70 @@ run), `seed`, `drop`, `keep` or `refuse`), and
 `pondra export DIR` writes a database's objects as a project's files, so a lake built by hand in the
 console becomes a project in one command.
 
+## Changes made in the database
+
+A change made straight in a database (a `CREATE` in a SQL cell, psql, a BI tool) is not written into
+the files on its own: the files say what every database should be, and only you know which change
+made by hand should stay. `pondra status` lists what differs, as `git status` does, and
+`pondra capture` writes the chosen objects into the files.
+
+Here a view is made by hand, and a column is added to a table:
+
+```bash
+cd shop
+pondra apply --url http://127.0.0.1:8080
+curl -s -o /dev/null -X POST http://localhost:8080/sql -d "CREATE VIEW sales.scratch AS SELECT count(*) AS n FROM sales.orders"
+curl -s -o /dev/null -X POST http://localhost:8080/sql -d "ALTER TABLE sales.orders ADD COLUMN note VARCHAR"
+pondra status --url http://127.0.0.1:8080
+```
+
+```text
+dev: apply 2
+  ~ table      sales.orders  ADD COLUMN channel VARCHAR
+  ~ view       sales.big     replaced
+  ✓ tests      1 passed
+  console: http://127.0.0.1:8080/
+dev: after apply 2
+Changed outside an apply (pondra capture NAME writes it into the files, pondra apply puts it back):
+  ~ table      sales.orders   columns changed outside an apply: added note
+Untracked (pondra capture NAME):
+  ? view       sales.scratch  made outside an apply: in no project's files
+```
+
+Each line changed outside an apply also says who changed it and when, from `pondra.history`, once
+the node has written the statement there (a second or so after it ran).
+
+`pondra capture` writes what is listed into the files: each object's statement as the database has it
+(the author's own text, when one statement made it), a new file for an untracked object, and the
+declaration taken out of the files for a dropped one. Name the objects to write them alone, as
+`pondra capture sales.scratch`.
+
+```bash
+cd shop
+pondra capture --url http://127.0.0.1:8080
+pondra status --url http://127.0.0.1:8080
+```
+
+```text
+dev: captured into the files
+  wrote objects/sales.sql
+  wrote objects/sales/scratch.sql
+  git diff shows the change; commit it, and pondra apply makes it everywhere else
+dev: after apply 2
+  nothing differs: the database is the files
+```
+
+A table renamed in the database, or a column renamed or dropped in it, is not a change to write as
+it is: the files would then say the old name while the database has the new one. `pondra status`
+lists it as renamed (`↷`), and `pondra capture` writes a migration for it, `migrations/NNN-rename-….sql`,
+which renames the table or column in the databases that still have the old names. The migration is
+recorded as run where it was made, since it already is there; the other databases run it on their next
+apply, before what follows the rename. Views that read the table are dropped by the migration and made
+again by the apply after it.
+
+Git shows what `pondra capture` wrote, and a commit makes it the project's: `pondra apply` then makes
+the other databases match it.
+
 ## Branches and environments on a team
 
 On a team, the databases are served by `pondra serve --lakes` (production can run a cluster of its

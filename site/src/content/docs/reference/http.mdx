@@ -306,6 +306,20 @@ and `{"dropped": name}` for `DELETE`.
 `GET /secrets/{name}` is what `pondra.secret(name)` calls inside a Python procedure. Any other
 token is refused.
 
+## Projects
+
+A project's files go to the node that holds the database, with the environment's values and the
+git commit: the command line sends them, and [apply a project](/pondra/guides/environments/#apply-a-project)
+says what each request does.
+
+| Method and path | Role | Meaning |
+|---|---|---|
+| `POST /plan` | read | what an apply would change, and what it refuses |
+| `POST /apply` | admin, or APPLY on the database | the plan's steps, each applied, then the tests |
+| `POST /test` | read | the project's tests alone |
+| `POST /status` | read | what differs from the database: to apply, changed outside an apply, untracked (`pondra status`) |
+| `POST /capture` | admin, or APPLY on the database | the files that write the chosen changed and untracked objects into the project, with a migration for a rename; the answer holds each file's new text (`null`: removed), and the command line writes them (`pondra capture`) |
+
 ## The server
 
 | Method and path | Role | Meaning |
