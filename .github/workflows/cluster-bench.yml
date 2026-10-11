@@ -64,19 +64,26 @@ jobs:
       nodes: ${{ steps.n.outputs.nodes }}
       count: ${{ steps.n.outputs.count }}
       sf: ${{ steps.n.outputs.sf }}
+      token: ${{ steps.n.outputs.token }}
     steps:
       - id: n
         # (a scheduled run has no inputs: 3 nodes, or 6 on Sunday's cron; SF10)
+        # (the nodes listen on the network, so they answer only this run's admin token: masked in the logs)
         run: |
           n=${{ inputs.nodes || (github.event.schedule == '23 5 * * 0' && '6') || '3' }}
+          token=$(openssl rand -hex 24)
+          echo "::add-mask::$token"
           echo "count=$n" >> "$GITHUB_OUTPUT"
           echo "sf=${{ inputs.sf || '10' }}" >> "$GITHUB_OUTPUT"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
           echo "nodes=$(python3 -c "import json; print(json.dumps(list(range($n))))")" >> "$GITHUB_OUTPUT"
 
   node:
     needs: [binary, plan]
     runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 300
+    env:
+      PONDRA_ADMIN_TOKEN: ${{ needs.plan.outputs.token }} # (the node takes it from here, off the command line)
     strategy:
       fail-fast: false
       matrix:
@@ -113,6 +120,8 @@ jobs:
     needs: [binary, plan]
     runs-on: ubuntu-24.04
     timeout-minutes: 300
+    env:
+      PONDRA_ADMIN_TOKEN: ${{ needs.plan.outputs.token }} # (the nodes' token: the driver's calls and its `pondra sql` loads)
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Pondra deployed the ways ADR-041 gives, each tried as a user would run it:
 
-- **image**: the container image serves, as a user that isn't root, from a volume it owns; its
+- **image**: the container image serves, as a user that isn't root, from a volume it owns, on the network with no
+  token: its leader makes the first user and prints its token (`pondra token` makes another); its
   queries are sized by the container's memory, not the host's; `docker stop` hands the lake on
   cleanly (exit 0); a new container on the same volume has the rows and the key that seals secrets.
 - **compose**: `deploy/compose/compose.yaml`'s three nodes are one cluster: one leader, a write on
@@ -92,6 +93,21 @@ def postgres_answers(port):
         return s.recv(1) == b"R"
 
 
+def status(port, q, token=None):
+    """The HTTP status of a SQL request: a refusal is an answer (401 with no token)."""
+    try:
+        http(port, "/sql", q, 30, token)
+        return 200
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def printed(log):
+    """The token a node prints once, when it makes the lake's first user (`pt_…`), if the log has it."""
+    m = re.search(r"pt_[A-Za-z0-9_-]+", log)
+    return m.group(0) if m else None
+
+
 def metric(port, name):
     for line in http(port, "/metrics").splitlines():
         if line.startswith(name + " ") or line.startswith(name + "{"):
@@ -117,10 +133,19 @@ def image(a):
             return
         user = run("docker", "inspect", "-f", "{{.Config.User}}", tag)
         check("it runs as a user that isn't root", user not in ("", "0", "root", "0:0"), user)
-        sql(port, "CREATE TABLE t (id BIGINT, name TEXT)")
-        sql(port, "INSERT INTO t SELECT x, 'n' || x FROM generate_series(1, 1000) AS g(x)")
-        check("SQL writes and reads in it", count(port) == 1000, count(port))
-        sql(port, "CREATE SECRET kept (TYPE s3, KEY_ID 'id', SECRET 'shh', SCOPE 's3://pondra-check-bucket')")
+        # (on 0.0.0.0 with no token, the leader makes the lake's first user and prints its token once:
+        # `pondra token` in the container makes another, through the bucket, while the node runs)
+        token = until(lambda: printed(run("docker", "logs", name, check=False, both=True)), 60, every=1)
+        refused, allowed = status(port, "SELECT 1 AS one") == 401, bool(token) and status(port, "SELECT 1 AS one", token) == 200
+        other = run("docker", "exec", name, "pondra", "token", "--dir", "/data/lake", check=False)
+        answers = other.startswith("pt_") and status(port, "SELECT 1 AS one", other) == 200
+        if not check("the image on 0.0.0.0 with no token makes user pondra and prints its token once: without it 401, with it 200, and `pondra token` gives another that works",
+                     bool(token) and refused and allowed and answers, {"printed": bool(token), "refused": refused, "allowed": allowed, "pondra token": answers}):
+            return
+        sql(port, "CREATE TABLE t (id BIGINT, name TEXT)", token=token)
+        sql(port, "INSERT INTO t SELECT x, 'n' || x FROM generate_series(1, 1000) AS g(x)", token=token)
+        check("SQL writes and reads in it", count(port, token=token) == 1000, count(port, token=token))
+        sql(port, "CREATE SECRET kept (TYPE s3, KEY_ID 'id', SECRET 'shh', SCOPE 's3://pondra-check-bucket')", token=token)
         owners = look("stat -c '%u %a %n' /data /data/lake /data/.pondra /data/.pondra/secret.key /data/cache")
         info["owners"] = owners
         check("everything it keeps is under /data, the image user's own; the key readable by it alone",
@@ -136,8 +161,8 @@ def image(a):
         check("docker stop ends it cleanly, at once (SIGTERM: exit 0)", code == "0" and took < 15, f"exit {code} after {took:.1f} s")
         run("docker", "rm", name)
         port = start()
-        check("a new container on the same volume has the rows", port and count(port) == 1000, port and count(port))
-        secrets = port and sql(port, "SELECT name FROM secrets()")
+        check("a new container on the same volume has the rows", port and count(port, token=token) == 1000, port and count(port, token=token))
+        secrets = port and sql(port, "SELECT name FROM secrets()", token=token)
         check("…and the key that seals its secrets", key == look("sha256sum /data/.pondra/secret.key") and secrets and {"name": "kept"} in secrets, secrets)
     finally:
         run("docker", "rm", "-f", name, check=False)
@@ -151,21 +176,25 @@ def compose(a):
     http_port = {"node1": 8080, "node2": 8081, "node3": 8082}
     try:
         dc("up", "-d", "--quiet-pull")
-        up = until(lambda: all(stats(p) for p in http_port.values()) and [stats(p) for p in http_port.values()], 90)
+        # (no token is set: whichever node leads first makes the lake's first user and prints its token)
+        token = until(lambda: printed(dc("logs", "--no-color", check=False, both=True)), 90, every=1)
+        if not check("the leader makes the lake's first user and prints its token (the nodes are on the network with no token)", token, dc("logs", "--tail", "40", check=False, both=True)[-1500:]):
+            return
+        up = until(lambda: all(stats(p, token) for p in http_port.values()) and [stats(p, token) for p in http_port.values()], 90)
         if not check("three nodes start", up, dc("logs", "--tail", "20", check=False)):
             return
-        settled = until(lambda: (s := [stats(p) for p in http_port.values()]) and len({(x["leader"], x["term"]) for x in s}) == 1
+        settled = until(lambda: (s := [stats(p, token) for p in http_port.values()]) and len({(x["leader"], x["term"]) for x in s}) == 1
                         and sorted(x["role"] for x in s) == ["follower", "follower", "leader"] and len(s[0]["nodes"]) == 3 and s, 60)
         info["at start"] = [(x["role"], x["leader"], x["term"]) for x in settled or up]
         check("they are one cluster: one leader, the others following it", settled, info["at start"])
-        sql(8081, "CREATE TABLE t (id BIGINT, at TIMESTAMP)")
-        sql(8081, "INSERT INTO t SELECT x, now() FROM generate_series(1, 30000) AS g(x)")
-        check("a write on one node is read on another", until(lambda: count(8082) == 30000, 30), count(8082))
+        sql(8081, "CREATE TABLE t (id BIGINT, at TIMESTAMP)", token=token)
+        sql(8081, "INSERT INTO t SELECT x, now() FROM generate_series(1, 30000) AS g(x)", token=token)
+        check("a write on one node is read on another", until(lambda: count(8082, token=token) == 30000, 30), count(8082, token=token))
         check("Postgres answers on each node's port", all(postgres_answers(p) for p in (5432, 5433, 5434)))
         check("Kafka listens on each node's port", all(socket.create_connection(("127.0.0.1", p), timeout=5).close() is None for p in (9092, 9093, 9094)))
 
         def leader(among):
-            s = {n: stats(http_port[n]) for n in among}
+            s = {n: stats(http_port[n], token) for n in among}
             leads = [n for n, x in s.items() if x and x["role"] == "leader"]
             return leads[0] if len(leads) == 1 and all(x and x["leader"] == f"{leads[0]}:8080" for x in s.values()) else None
 
@@ -175,13 +204,13 @@ def compose(a):
         rest = [n for n in http_port if n != first]
         second = until(lambda: leader(rest), 60)
         info["killed leader -> a new one (s)"] = round(time.time() - t0, 1)
-        check("the leader killed, another leads", second, {n: stats(http_port[n]) for n in rest})
+        check("the leader killed, another leads", second, {n: stats(http_port[n], token) for n in rest})
         other = next(n for n in rest if n != second)
-        wrote = until(lambda: sql(http_port[other], "INSERT INTO t VALUES (30001, now())"), 60, every=1)
-        check("…and takes writes, from any node", wrote, count(http_port[other]))
+        wrote = until(lambda: sql(http_port[other], "INSERT INTO t VALUES (30001, now())", token=token), 60, every=1)
+        check("…and takes writes, from any node", wrote, count(http_port[other], token=token))
         dc("start", first)
-        back = until(lambda: (s := stats(http_port[first])) and s["role"] == "follower" and s["leader"] == f"{second}:8080", 60)
-        check("the killed node comes back as a follower", back, stats(http_port[first]))
+        back = until(lambda: (s := stats(http_port[first], token)) and s["role"] == "follower" and s["leader"] == f"{second}:8080", 60)
+        check("the killed node comes back as a follower", back, stats(http_port[first], token))
         t0 = time.time()
         dc("stop", second)
         took = time.time() - t0
@@ -189,8 +218,8 @@ def compose(a):
         info["leader stopped -> a new one (s)"] = round(time.time() - t0, 1)
         check("a leader stopped (SIGTERM) hands on, at once", third and took < 15, f"{took:.1f} s to stop, then {info['leader stopped -> a new one (s)']} s")
         dc("start", second)
-        same = until(lambda: all(count(p) == 30001 for p in http_port.values()), 60)
-        check("every node has every row", same, {n: count(p) for n, p in http_port.items()})
+        same = until(lambda: all(count(p, token=token) == 30001 for p in http_port.values()), 60)
+        check("every node has every row", same, {n: count(p, token=token) for n, p in http_port.items()})
     finally:
         if not all(checks.values()):
             info["logs"] = dc("logs", "--tail", "40", check=False)[-6000:]

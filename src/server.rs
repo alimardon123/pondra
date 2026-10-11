@@ -492,11 +492,13 @@ async fn whoami(State(app): State<App>) -> Json<Value> {
 }
 
 impl App {
-    /// Does nothing need a sign-in here? (No token set, and no user who signs in. A node that just
-    /// started asks once it holds what its leader had: a mirror seeded before the first user was
-    /// flushed knows of none.)
+    /// Does nothing need a sign-in here? (No token set, no user who signs in, and the node listens on
+    /// this machine only. A node on the network is never open: its leader made the lake's first user
+    /// before it served (`users::first_user`), and a follower of a lake with none yet refuses everyone
+    /// until one has a token (`pondra token`). A node that just started asks once it holds what its
+    /// leader had: a mirror seeded before the first user was flushed knows of none.)
     pub async fn open(&self) -> bool {
-        if self.auth.on() {
+        if self.auth.on() || self.auth.network() {
             return false;
         }
         let _ = self.lake.caught_up().await; // (still catching up after 10 s: its own catalog decides)

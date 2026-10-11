@@ -225,11 +225,14 @@ pub struct Auth {
     read: Option<String>,
     write: Option<String>,
     admin: Option<String>,
+    /// Does the node listen beyond this machine (`--addr`, `--pg`, `--kafka` or `--flight`)? Then it is
+    /// never open, tokens or not (`App::open`).
+    network: bool,
 }
 
 impl Auth {
     pub fn new(read: Option<String>, write: Option<String>, admin: Option<String>) -> Auth {
-        let auth = Auth { read, write, admin };
+        let auth = Auth { read, write, admin, network: false };
         if auth.on() {
             TOKENS.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -237,6 +240,11 @@ impl Auth {
     }
 
     pub fn on(&self) -> bool { self.read.is_some() || self.write.is_some() || self.admin.is_some() }
+
+    /// This node listens beyond this machine (`network`).
+    pub fn on_network(self, network: bool) -> Auth { Auth { network, ..self } }
+
+    pub fn network(&self) -> bool { self.network }
 
     /// Is an admin token set? Then the nodes call each other with it, and the nodes' key counts for nothing.
     pub fn admin_set(&self) -> bool { self.admin.is_some() }

@@ -24,6 +24,7 @@
   harness.py upserts             keyed tables published every round; other engines' upserts, deletes, equality deletes
   harness.py external            CREATE EXTERNAL TABLE: a named view of files, INSERT into a folder's, what it refuses
   harness.py server              pondra serve <folder of lakes>: each a database (Postgres, HTTP, joins, idle, restart)
+  harness.py first               a node on the network with no token makes the lake's first user and prints its token once; pondra token
   harness.py sealed              the lake's keys and secrets sealed by an admin token alone: nodes, rotation, short tokens
   harness.py safety              panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
   harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
@@ -105,8 +106,8 @@ def clean_up():
 
 
 class Node:
-    def __init__(self, lake, port, reader=False, env=None, cwd=None, **flags):
-        self.args = [BIN, "serve", "--dir", lake, "--addr", f"127.0.0.1:{port}"] + (["--reader"] if reader else [])
+    def __init__(self, lake, port, reader=False, env=None, cwd=None, host="127.0.0.1", **flags):
+        self.args = [BIN, "serve", "--dir", lake, "--addr", f"{host}:{port}"] + (["--reader"] if reader else [])
         self.args += [f"--{k.replace('_', '-')}" + ("" if v is True or v == "true" else f"={v}") for k, v in flags.items()]  # (a bare flag for true)
         self.port, self.env, self.cwd, self.p = port, {**os.environ, **(env or {})}, cwd, None
         self.log = os.path.join(tempfile.gettempdir(), f"pondra-{port}-{uuid.uuid4().hex[:6]}.stderr")
@@ -6763,6 +6764,111 @@ def server():
     return f"server: a folder of lakes as databases over Postgres and HTTP, created, dropped, idle-stopped, joined, restarted: all {len(checks)} checks pass"
 
 
+def first():
+    """A node on the network (its --addr, --pg, --flight or --kafka not on 127.0.0.1) with no token
+    makes the lake's first user, pondra, a superuser, and prints its token once, before it serves
+    anyone: otherwise every request would be an admin's. A restart makes no other user. `pondra token`
+    makes another through the bucket, with the node up or with none; the lake keeps only its hash. A
+    node on 127.0.0.1 stays open; `serve --lakes` on the network with no token refuses to start; a
+    node with an admin token makes no user at all. A node on the network is never open: a follower of
+    a lake with no user yet answers no one until `pondra token` makes one."""
+    import re
+    import psycopg
+    checks = {}
+    port, pg = A.port, A.port + 10
+    lake = new_lake()
+
+    def answer(p, path, body=b"", token=None):  # (status and body: a refusal is an answer too)
+        c = http.client.HTTPConnection("127.0.0.1", p, timeout=30)
+        c.request("POST" if body else "GET", path, body, {"Authorization": f"Bearer {token}"} if token else {})
+        r = c.getresponse()
+        return r.status, r.read()
+
+    def token_in(log):  # (the token a node's log shows, if any)
+        m = re.search(r"pt_[A-Za-z0-9_-]+", open(log).read())
+        return m.group(0) if m else None
+
+    def in_lake(needle):  # (the lake's own files, as a reader of the bucket sees them)
+        for d, _, fs in os.walk(lake):
+            for f in fs:
+                try:
+                    with open(os.path.join(d, f), "rb") as fh:
+                        if needle in fh.read():
+                            return True
+                except OSError:
+                    pass
+        return False
+
+    def stop(node):  # (SIGTERM, as a scheduler stops it: a leader hands its term on at once)
+        node.p.send_signal(signal.SIGTERM)
+        node.p.wait(timeout=120)
+
+    n1 = Node(lake, port, host="0.0.0.0", pg=f"0.0.0.0:{pg}").start()
+    token = token_in(n1.log)
+    checks["a node on the network with no token makes user pondra and prints its token once: without it 401, with it 200 (HTTP and Postgres as pondra)"] = bool(token) \
+        and "Its first user is pondra, a superuser" in open(n1.log).read() and answer(port, "/sql", b"SELECT 1 AS x")[0] == 401 \
+        and json.loads(answer(port, "/sql", b"SELECT 1 AS x", token)[1]) == [{"x": 1}]
+    pg_ok = False
+    if token:
+        with psycopg.connect(f"host=127.0.0.1 port={pg} user=pondra password={token} dbname=lake", autocommit=True) as c:
+            pg_ok = c.execute("SELECT 1 AS x").fetchall() == [(1,)]
+    checks["...and as pondra over Postgres, with the token as its password (a wrong one refused)"] = pg_ok and _raises(
+        lambda: psycopg.connect(f"host=127.0.0.1 port={pg} user=pondra password=pt_nope dbname=lake", autocommit=True))
+
+    stop(n1)
+    n2 = Node(lake, port, host="0.0.0.0", pg=f"0.0.0.0:{pg}").start()
+    names = json.loads(answer(port, "/sql", b"SELECT name FROM pondra.users ORDER BY name", token)[1])
+    checks["started again, it makes no other user and prints no token"] = token_in(n2.log) is None and names == [{"name": "pondra"}]
+
+    made = subprocess.run([BIN, "token", "--dir", lake], capture_output=True, text=True, timeout=120)
+    t2 = made.stdout.strip()
+    checks["pondra token --dir gives another token that works, with the node up (through the inbox); its stdout is the token alone"] = made.returncode == 0 \
+        and t2.startswith("pt_") and "shown once" in made.stderr and answer(port, "/sql", b"SELECT 1 AS x", t2)[0] == 200 and made.stdout.count("\n") == 1
+    stop(n2)
+    made = subprocess.run([BIN, "token", "--dir", lake, "--name", "offline"], capture_output=True, text=True, timeout=120)
+    t3 = made.stdout.strip()
+    n3 = Node(lake, port, host="0.0.0.0", pg=f"0.0.0.0:{pg}").start()
+    checks["...and with no node (it leads for a moment): that token works too; nothing of any token is in the lake's files"] = made.returncode == 0 \
+        and t3.startswith("pt_") and answer(port, "/sql", b"SELECT 1 AS x", t3)[0] == 200 and not any(in_lake(t.encode()) for t in (token, t2, t3) if t)
+
+    open_node = Node(new_lake(), port + 1).start()  # (127.0.0.1 only: open, as it always was)
+    made_open = answer(port + 1, "/sql", b"CREATE TABLE t AS SELECT 1 AS x")[0] == 200 and json.loads(answer(port + 1, "/sql", b"SELECT x FROM t")[1]) == [{"x": 1}]
+    checks["a node on 127.0.0.1 stays open: /sql with no token answers, and no token is made"] = made_open and token_in(open_node.log) is None
+    open_node.kill()
+
+    folder = tempfile.mkdtemp(prefix="pondra-first-")
+    subprocess.run([BIN, "sql", "--dir", os.path.join(folder, "sales"), "CREATE TABLE t AS SELECT 1 AS x"], check=True, capture_output=True)
+    refused = subprocess.run([BIN, "serve", "--lakes", folder, "--addr", f"0.0.0.0:{port + 2}"], capture_output=True, text=True, timeout=60)
+    shutil.rmtree(folder, ignore_errors=True)
+    checks["serve --lakes on 0.0.0.0 with no token refuses to start, naming --admin-token"] = refused.returncode != 0 and "--admin-token" in refused.stderr
+
+    admin = Node(new_lake(), port + 3, host="0.0.0.0", admin_token="adm-first-1").start()
+    names = json.loads(answer(port + 3, "/sql", b"SELECT name FROM pondra.users", "adm-first-1")[1])
+    checks["a node with --admin-token on 0.0.0.0 makes no user: its token answers, and no other does"] = names == [] and token_in(admin.log) is None \
+        and answer(port + 3, "/sql", b"SELECT 1 AS x")[0] == 401
+    admin.kill()
+    n3.kill()
+
+    # (a follower on the network beside a leader on 127.0.0.1, of a lake with no user yet: never open)
+    lone = new_lake()
+    ld = Node(lone, port + 4).start()
+    fl = Node(lone, port + 5, host="0.0.0.0").start()
+    before = answer(port + 5, "/sql", b"SELECT 1 AS x")[0], answer(port + 4, "/sql", b"SELECT 1 AS x")[0]
+    made = subprocess.run([BIN, "token", "--dir", lone], capture_output=True, text=True, timeout=120)
+    t4 = made.stdout.strip()
+    took = lambda p: answer(p, "/sql", b"SELECT 1 AS x", t4)[0]
+    checks["a follower on the network, of a lake with no user yet (its leader on 127.0.0.1), answers no one; pondra token makes user pondra and a token both nodes take"] = \
+        before == (401, 200) and made.returncode == 0 and t4.startswith("pt_") and until(lambda: took(port + 5), 200) == 200 and took(port + 4) == 200
+    fl.kill()
+    ld.kill()
+
+    ok = all(checks.values())
+    print(json.dumps({"first": checks, "ok": ok}, indent=1))
+    if not ok:
+        return False
+    return f"a node on the network makes the lake's first user and prints its token once, with pondra token beside it: all {len(checks)} checks pass"
+
+
 # ---------------------------------------------------------------- round 29, part 2 (ADR-035)
 
 def users():
@@ -10158,12 +10264,12 @@ def backpressure():
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
-        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10, "use_path": 40}
+        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10, "use_path": 40, "first": 30}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, sealed, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, reader, crash, load)
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -10195,7 +10301,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "sealed", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -10208,7 +10314,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "all": all_tests}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "all": all_tests}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

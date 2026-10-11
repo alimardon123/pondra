@@ -1735,6 +1735,8 @@ tokio::task_local! {
     /// A key a request to another lake's leader goes with instead of this process's token: a
     /// branch's key in its base (`branch::keyed`).
     static BEARER: String;
+    /// Set while a request goes through the bucket alone (`through_bucket`): it is not sent over HTTP.
+    static BUCKET: ();
 }
 
 /// `send`, with `key` as its `Authorization` when given.
@@ -1747,6 +1749,13 @@ pub async fn send_as(dir: &str, req: Request, key: Option<&str>) -> Result<Value
 
 /// Have the leader of the lake at `dir` record `req` (made on this node), however it's reached.
 pub async fn send(dir: &str, req: Request) -> Result<Value> { deliver(dir, Some(Some(req)), &Stmt::Invalid(String::new()), "", false).await }
+
+/// Have the leader of the lake at `dir` record `req`, through the bucket alone: its inbox, or this
+/// process leading for a moment when nobody does. For a caller with no token (`pondra token`, which
+/// the leader would refuse over HTTP): whoever can write the bucket owns the lake (invariant 18).
+pub async fn through_bucket(dir: &str, req: Request) -> Result<Value> {
+    BUCKET.scope((), deliver(dir, Some(Some(req)), &Stmt::Invalid(String::new()), "", true)).await
+}
 
 /// Have the leader of the lake at `dir` record a write: over HTTP, through the bucket inbox if it
 /// can't be reached, or, when nobody leads, by leading for a moment: here (`one_off`: a `pondra
@@ -1768,7 +1777,8 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
                     req = Some(prepare(&lake, &lake, &stmt.table(), stmt, job, true).await?);
                 }
                 let Some(Some(r)) = &req else { return Ok(j!({"duplicate": true})) };
-                let direct = std::env::var("PONDRA_NO_DIRECT").is_err(); // (test hook: act as if the leader were out of reach)
+                // (test hook PONDRA_NO_DIRECT: act as if the leader were out of reach; `through_bucket` never goes over HTTP)
+                let direct = std::env::var("PONDRA_NO_DIRECT").is_err() && BUCKET.try_with(|_| ()).is_err();
                 match if direct { Some(post(&t.addr, r).await) } else { None } {
                     Some(Ok(v)) => return summary(matches!(r, Request::Flush(_)), v),
                     Some(Err(e)) if !unreachable(&e) => return Err(e),
