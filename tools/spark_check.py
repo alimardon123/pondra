@@ -596,6 +596,15 @@ def p_split_regex_and_limit(spark, F, Window):  # split takes a regular expressi
                      F.split("s", "[0-9]+", 3).alias("three"), F.split("s", "[,;]+", 2).alias("sep2"))
 
 
+def p_drop_every_column(spark, F, Window):  # dropping every column leaves no columns, and the rows are still there
+    empty = spark.table("orders").where(F.col("id") <= 30).select("id", "item").drop("id", "item")
+    return {"columns": list(empty.columns), "count": empty.count(), "rows": len(empty.collect())}
+
+
+def p_show_vertical_no_columns_raises(spark, F, Window):  # PySpark can't show a record of no columns: both refuse
+    spark.table("orders").where(F.col("id") <= 3).select("id").drop("id").show(vertical=True)
+
+
 def _row_class(spark):
     """PySpark's Row, or Pondra's, by the session that is asked."""
     if type(spark).__module__.startswith("pondra"):
@@ -705,6 +714,7 @@ PIPELINES = [
     ("log_int_base_raises", None, "raises", p_log_int_base_raises),
     ("regexp_extract_groups", False, "frame", p_regexp_extract_groups),
     ("split_regex_and_limit", False, "frame", p_split_regex_and_limit),
+    ("drop_every_column", None, "value", p_drop_every_column),
 ]
 
 

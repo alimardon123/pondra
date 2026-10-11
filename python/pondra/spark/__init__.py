@@ -701,7 +701,11 @@ class DataFrame:
     def drop(self, *cols):
         have = {c.lower(): c for c in self.columns}
         gone = [have[c.lower()] for c in (x._name if isinstance(x, Column) else x for x in cols) if c.lower() in have]  # (PySpark: unknown names are no error)
-        return self._new(self._f.drop(*gone)) if gone else self
+        if not gone:
+            return self
+        if len(set(gone)) == len(self.columns):  # every column: no columns left, and the rows stay (PySpark's count)
+            return self._new(self._f._step(lambda r: f"SELECT FROM {r}"))
+        return self._new(self._f.drop(*gone))
 
     # rows
     def filter(self, condition):
