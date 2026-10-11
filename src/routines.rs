@@ -754,7 +754,8 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     let sql = &crate::branch::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
     let sql = &crate::past::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
     let sql = &crate::friendly::text(sql)?.into_owned(); // (`PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON: as SQL that parses)
-    let sql = &crate::measures::text(sql).into_owned(); // (`sum(x) AS MEASURE revenue`: an alias that parses, ADR-065 §3)
+    let marked = crate::measures::text(sql); // (`sum(x) AS MEASURE revenue`: an alias that parses, ADR-065 §3)
+    let sql: &str = &marked;
     let all = listed(lake).await?;
     let outside = crate::ext::attached(lake).await?;
     let named = |n: &String| crate::ddl::mentions(sql, n);

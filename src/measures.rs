@@ -49,7 +49,8 @@ static CALL_TEXT: LazyLock<regex::Regex> =
 
 /// Turns `expr AS MEASURE name` into the stored form; only tokens are looked at, so strings and comments are left alone.
 pub fn text(sql: &str) -> Cow<'_, str> {
-    if !sql.to_lowercase().contains("measure") {
+    // (every statement passes here: looked for without copying the text)
+    if !sql.as_bytes().windows(7).any(|w| w.eq_ignore_ascii_case(b"measure")) {
         return Cow::Borrowed(sql);
     }
     let dialect = GenericDialect {};
@@ -1023,12 +1024,22 @@ async fn views(lake: &Lake, sql: &str) -> Result<HashMap<String, Arc<Definition>
     Ok(out)
 }
 
-/// Whether a statement may need the rewrite: it names a measure, or may read a view with measures. The words come first.
+/// Whether a statement may need the rewrite: it names a measure, or may read a view with measures. The words come first,
+/// then this lake's views as kept, then an attached lake's only when the statement names it (every statement asks: no copy).
 pub async fn wanted(lake: &Lake, sql: &str) -> Result<bool> {
     if sql.contains(MARK) || CALL_TEXT.is_match(sql) {
         return Ok(true);
     }
-    Ok(views(lake, sql).await?.keys().any(|name| ddl::mentions(sql, name)))
+    if own_views(lake).await?.keys().any(|name| ddl::mentions(sql, name)) {
+        return Ok(true);
+    }
+    let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().iter().filter(|(name, _)| ddl::mentions(sql, name)).cloned().collect();
+    for (name, other) in attached {
+        if own_views(&other).await?.keys().any(|local| ddl::mentions(sql, &format!("{name}.{local}")) || ddl::mentions(sql, &format!("{name}.public.{local}"))) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Rewrites statements against the views with measures of `lake`, and the functions it has (see `rewrite_with`).
