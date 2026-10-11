@@ -4,9 +4,10 @@ description: The pondra Python package, with every method of a connection, its s
 ---
 
 The `pondra` package talks to a node over HTTP. `pondra.connect` reaches a node that is running,
-and `pondra.local` starts one on a folder and connects to it. A connection, called `db` on this
-page, runs SQL, writes rows, makes views, and calls functions and procedures. A query comes back as
-a **frame**, which the [frames reference](/pondra/reference/frames/) covers.
+and `pondra.local` starts one on a folder and connects to it. Both return a connection, a
+`pondra.Pondra`, called `db` on this page. It runs SQL, writes rows, makes views, and calls
+functions and procedures. A query comes back as a **frame**, which the
+[frames reference](/pondra/reference/frames/) covers.
 
 ```python
 import pondra
@@ -67,6 +68,24 @@ local.close()
 [{'one': 1}]
 ```
 
+## Attributes
+
+| Attribute | Meaning |
+|---|---|
+| `db.url`, `db.urls` | the node in use, and the list of every node the connection was given |
+| `db.session` | the connection's session id: its temporary tables and views, and its variables, live under it |
+| `db.producer`, `db.seq` | the name `append` writes under, and the sequence number of its last append |
+| `db.notices` | what the last statement's procedures printed, as a list of strings |
+| `db.position` | the commit a `watch` or `live` answer is as of: where to resume |
+
+```python
+print(db.urls == [db.url], db.producer.startswith("py-"), db.session != "", db.notices)
+```
+
+```text
+True True True []
+```
+
 ## Queries
 
 | Method | Meaning |
@@ -75,7 +94,7 @@ local.close()
 | `db.table(name)` | a table or view as a frame |
 | `db.run(file, job=None, wait=True, **params)` | a `.sql` file on this machine, or else a `.sql`, `.py` or notebook file of the lake's, run on the node (`CALL run`, [Run files as jobs](/pondra/guides/workspace/)); or SQL text itself. The last statement's rows or outcome. `wait=False` starts a lake file's run and gives its `Run` |
 | `db.from_arrow(data, name=None)` | rows of this machine as a frame: a pyarrow, pandas or Polars table, or a list of dicts. Also `from_pandas`, `from_polars`, `from_rows` |
-| `db.vars` | SQL's [variables](/pondra/sql/statements/#variables): `db.vars.day` (or `db.vars["day"]`) is `$day`, `db.vars.day = date(2026, 9, 30)` sets it, `del db.vars.day` forgets it, `dict(db.vars)` has them all. In a procedure or a file run, the run's |
+| `db.vars` | SQL's [variables](/pondra/sql/statements/#variables): `db.vars.day` (or `db.vars["day"]`) is `$day`, `db.vars.day = date(2026, 9, 30)` sets it, `del db.vars.day` forgets it, `dict(db.vars)` has them all. `db.vars.keys()`, `db.vars.items()`, a `for` loop, `len` and `in` work too. In a procedure or a file run, they are the run's own |
 | `db.parameters(file)` | a file's parameters (a SQL file's `DECLARE PARAMETER`s and the `$name`s it uses unset; a `.py` file's `# %% tags=["parameters"]` cell): name, type, default, required, description |
 
 In `sql` and `run`, a keyword argument is a `$name` parameter in the query. A keyword whose value
@@ -110,10 +129,12 @@ A variable is the connection's, from SQL or from Python:
 db.sql("DECLARE $since DATE = DATE '2026-09-01'")
 db.vars.top = 5
 print(db.vars.since, db.sql("SELECT item FROM orders WHERE amount > $top ORDER BY id").rows())
+print(list(db.vars.keys()), list(db.vars.items()))
 ```
 
 ```text
 2026-09-01 [{'item': 'tea'}]
+['since', 'top'] [('since', datetime.date(2026, 9, 1)), ('top', 5)]
 ```
 
 A statement that writes or changes the lake returns a dict, such as `{'rows': 1}`. A query returns
@@ -155,31 +176,75 @@ db_files.close()
 [{'id': 1, 'name': 'tea'}, {'id': 2, 'name': 'cake'}]
 ```
 
+The readers take the sources SQL's `read_*` functions take. `scan_*` and `read_ndjson` are the same
+methods under Polars' names, and `pondra.read_*` reads through the current connection:
+
+```python
+here = pondra.local("py-files")
+here.sql("COPY (SELECT 1 AS id, 'tea' AS item) TO 'menu.parquet' (FORMAT parquet)")
+here.sql("COPY (SELECT 2 AS id, 'cake' AS item) TO 'menu.json' (FORMAT json)")
+here.sql("SELECT 3 AS id, 'milk' AS item").write_delta("menu_delta")
+here.sql("SELECT 4 AS id, 'juice' AS item").write_iceberg("menu_iceberg")
+print(here.read_parquet("menu.parquet").rows(), here.scan_parquet("menu.parquet").rows())
+print(here.read_json("menu.json").rows(), here.read_ndjson("menu.json").rows(), here.scan_ndjson("menu.json").rows())
+print(here.read_delta("menu_delta").rows(), here.read_iceberg("menu_iceberg").rows())
+print(pondra.read_parquet("menu.parquet").rows(), pondra.current().url == here.url)
+here.close()
+```
+
+```text
+[{'id': 1, 'item': 'tea'}] [{'id': 1, 'item': 'tea'}]
+[{'id': 2, 'item': 'cake'}] [{'id': 2, 'item': 'cake'}] [{'id': 2, 'item': 'cake'}]
+[{'id': 3, 'item': 'milk'}] [{'id': 4, 'item': 'juice'}]
+[{'id': 1, 'item': 'tea'}] True
+```
+
 ## Writing rows
 
 | Method | Meaning |
 |---|---|
-| `db.append(table, data, retries=10)` | append rows exactly once: a list of dicts, or a pandas, Polars or Arrow table. A retry after a lost answer is recognised and not applied twice |
+| `db.append(table, data)` | append rows exactly once: a list of dicts, or a pandas, Polars or Arrow table. A retry after a lost answer is recognised and not applied twice. Each connection numbers its appends (`db.seq`) |
 | `db.write_table(name, data, mode="create")` | rows into a table: `data` is a frame, SQL text, or pandas, Polars or Arrow data (or a list of dicts). `mode` is `"create"`, `"append"` or `"overwrite"` |
-| `db.lookup(table, key)` | the current row of one key of a keyed table, or `None` |
+| `db.lookup(table, key)` | the current row of one key of a keyed table, or `None`. A composite key is its values, comma-separated, in the key's column order |
 
-`append` answers with a dict: `seg` (the log segment), `duplicate` (true if this was a retry that
-was already applied), `conflict`, `row` and `ms`. Each connection numbers its appends. A composite
-key is written as comma-separated values in the key's column order.
+`append` answers with a dict. `seg` and `row` say where in the log the rows went, and `block` is the
+block of row ids they were given. `duplicate` is true for a retry that was already applied, and
+`conflict` is true when the write's `prev` didn't match. `ms` is the commit's time in milliseconds.
 
 ```python
 print(db.write_table("orders_copy", db.table("orders")))
 print(db.write_table("orders_copy", [{"id": 9, "item": "juice", "qty": 1, "amount": 2.0}], mode="append"))
 
 db.sql("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR)")
-db.append("users", [{"id": 7, "name": "ann"}])
+print(db.append("users", [{"id": 7, "name": "ann"}]))
 print(db.lookup("users", 7), db.lookup("users", 8))
+
+db.sql("CREATE TABLE seats (row_no BIGINT, seat VARCHAR, who VARCHAR, PRIMARY KEY (row_no, seat))")
+db.append("seats", [{"row_no": 3, "seat": "B", "who": "ann"}])
+print(db.lookup("seats", "3,B"))
 ```
 
 ```text
 {'rows': 3}
 {'rows': 1}
+{'seg': 10, 'duplicate': False, 'conflict': False, 'row': 0, 'ms': 0, 'block': 0}
 {'id': 7, 'name': 'ann'} None
+{'row_no': 3, 'seat': 'B', 'who': 'ann'}
+```
+
+`from_arrow` makes a frame of rows this machine holds, and `seq` is the sequence number of the connection's
+last append:
+
+```python
+import pyarrow as pa
+
+print(db.from_arrow(pa.table({"id": [1, 2], "item": ["tea", "cake"]})).rows())
+print(db.seq)
+```
+
+```text
+[{'id': 1, 'item': 'tea'}, {'id': 2, 'item': 'cake'}]
+3
 ```
 
 ## Views
@@ -204,6 +269,19 @@ print(spend.sort("item").rows())
 [{'item': 'cake', 'qty': 1}, {'item': 'tea', 'qty': 3}]
 ```
 
+A view made with `temporary=True` is this connection's only, until `close()`. `replace=True` makes it
+again under the same name:
+
+```python
+db.view("big_temp", "SELECT * FROM orders WHERE amount > 4", temporary=True)
+db.view("big_temp", "SELECT * FROM orders WHERE amount > 9", temporary=True, replace=True)
+print(db.sql("SELECT count(*) AS n FROM big_temp").rows())
+```
+
+```text
+[{'n': 0}]
+```
+
 ## Functions and procedures
 
 | Method | Meaning |
@@ -213,7 +291,7 @@ print(spend.sort("item").rows())
 | `db.create_procedure(name, body=None, file=None, params=None, language="python", entry=None, packages=None, timeout=None, replace=True)` | a stored procedure from code (or a file of it) |
 | `@db.function` | a decorator: this Python function becomes one of the lake's functions, for SQL and frames, on every node |
 | `@db.procedure` | a decorator: this Python function becomes a stored procedure |
-| `db.task(name, sql, schedule=None, after=None, when=None, retries=None, retry_delay=None, timeout=None, on_failure=None, replace=True)` | [`CREATE TASK`](/pondra/sql/statements/#functions-procedures-and-tasks): `sql` run on a `schedule`, or `after` other tasks |
+| `db.task(name, sql, *, schedule=None, after=None, when=None, retries=None, retry_delay=None, timeout=None, on_failure=None, replace=True)` | [`CREATE TASK`](/pondra/sql/statements/#functions-procedures-and-tasks): `sql` run on a `schedule`, or `after` other tasks |
 | `@db.task(schedule=…)` or `@db.task(after=…)` | a decorator: this Python function becomes a procedure, and a task calls it |
 | `db.execute_task(name, **values)` | `EXECUTE TASK`: its graph runs now, with these values for its tasks' `$name`s; a `Run` (`.wait()`) |
 | `db.secret(name)` | a secret's values as a dict; only a procedure's code may read them |
@@ -311,6 +389,72 @@ print(run.wait()["status"])
 ok
 ```
 
+### Names in a Python procedure
+
+A procedure's code also has `plpy`, PL/Python's names, so a PL/Python routine runs as it is. The
+procedure's `plpy.execute` runs SQL as its caller, with the caller's rights.
+
+| Name | Meaning |
+|---|---|
+| `plpy.execute(query, args=None, limit=None)` | runs SQL and gives its rows as a list of dicts, with `nrows()`, `status()` and `colnames()` |
+| `plpy.prepare(query, types=None)` | a prepared statement (a `Plan`); its `execute(args, limit)` runs it with the arguments |
+| `plpy.cursor(query, args=None)` | an iterator over the rows of a query |
+| `plpy.notice(*msg)`, `plpy.info(*msg)`, `plpy.warning(*msg)` | a notice to the caller, as `db.notices` gets it |
+| `plpy.debug(*msg)`, `plpy.log(*msg)` | to the node's standard error (its log) |
+| `plpy.error(*msg)`, `plpy.fatal(*msg)` | raise `plpy.Error` or `plpy.Fatal`, failing the call |
+| `plpy.Error`, `plpy.Fatal` | the exceptions `plpy.error` and `plpy.fatal` raise. `Fatal` is an `Error`, so `except plpy.Error` catches both. `plpy.SPIError` is there for code that names it; nothing here raises it |
+| `plpy.quote_literal(s)`, `plpy.quote_nullable(s)`, `plpy.quote_ident(s)` | a SQL literal, a literal or `NULL`, and a SQL identifier |
+| `plpy.GD` | a dict shared by every routine one worker runs |
+
+`plpy.subtransaction()` raises `NotImplementedError`: a procedure's statements aren't nested.
+
+```python
+db.create_procedure("archive", """
+rows = plpy.execute("SELECT count(*) AS n FROM orders")
+plan = plpy.prepare("SELECT $1 AS doubled", ["bigint"])
+doubled = plan.execute([rows[0]["n"] * 2])[0]["doubled"]
+plpy.notice(f"{rows[0]['n']} orders, {rows.nrows()} row, columns {rows.colnames()}")
+return [{"n": rows[0]["n"], "doubled": doubled}]
+""")
+print(db.call("archive").rows())
+```
+
+```text
+3 orders, 1 row, columns ['n']
+[{'n': 3, 'doubled': 6}]
+```
+
+`plpy.GD` is a dict that every routine one worker runs shares. `plpy.cursor` iterates over a query's rows,
+`plpy.info` and `plpy.warning` send notices, `plpy.debug` writes to the node's log, `plpy.quote_*` quote text
+for SQL, and `plpy.error` raises `plpy.Error`:
+
+```python
+db.create_procedure("names_demo", """
+plpy.GD["seen"] = True
+plpy.info("info line")
+plpy.warning("warning line")
+plpy.debug("debug line goes to the node's log")
+first = [r["item"] for r in plpy.cursor("SELECT item FROM orders ORDER BY id")][0]
+quoted = plpy.quote_literal("O'Brien") + " " + plpy.quote_ident("order items") + " " + plpy.quote_nullable(None)
+try:
+    plpy.error("stopped here")
+except plpy.Error as e:
+    caught = str(e)
+return [{"first": first, "quoted": quoted, "caught": caught, "seen": plpy.GD["seen"]}]
+""")
+print(db.call("names_demo").rows())
+print(db.notices)
+print("archive" in db.routines(), "names_demo" in db.routines())
+```
+
+```text
+info line
+warning line
+[{'first': 'tea', 'quoted': '\'O\'\'Brien\' "order items" NULL', 'caught': 'stopped here', 'seen': True}]
+['info line', 'warning line']
+True True
+```
+
 ## Following changes
 
 | Method | Meaning |
@@ -347,8 +491,9 @@ for rows in db.live("SELECT count(*) AS n FROM orders"):
 | `result.to_arrow()`, `result.collect()` | a pyarrow Table |
 | `result.to_pandas()`, `result.to_polars()` | a pandas or Polars DataFrame |
 
-Without pyarrow installed, rows come as the node's JSON, dates and times as text, and `rows()`,
-`item()` and `show()` still work. Tables (`collect()`, `to_pandas()`) need `pip install pyarrow`.
+Without pyarrow installed, rows come as the node's JSON, with dates and times as text. A `Result`
+has `rows()`, and so does a frame, which also has `item()` and `show()`. Tables (`collect()`,
+`to_arrow()`, `to_pandas()`, `to_polars()`) need `pip install pyarrow`.
 
 ## Transactions and errors
 
@@ -382,23 +527,105 @@ with pondra.connect("http://localhost:8080") as session:
     print(session.sql("SELECT 1 AS one").rows())
 ```
 
+```text
+[{'one': 1}]
+```
+
 `db.read_csv` takes its options by Polars' names (`separator=`, `has_header=`) or by SQL's
 (`delim=`, `header=`): `db.read_csv("a.csv", delim=";", header=True)`. If you give both, Polars' win.
 
 ## Module functions
 
-`pondra.sql`, `pondra.table`, `pondra.read_parquet`, `pondra.read_csv`, `pondra.read_json`,
-`pondra.read_delta`, `pondra.read_iceberg`, `pondra.call`, `pondra.run`, `pondra.parameters`, `pondra.secret`
-and `pondra.vars` do what the
-connection's methods do, on the current connection: the newest one made, or inside a procedure the
-one its caller lent. Code moves between a notebook and a procedure as it is, as `duckdb.sql` runs
-on DuckDB's default connection.
+`import pondra` gives these names. The functions use the current connection: the newest one made,
+or inside a procedure the one its caller lent it. Code moves between a notebook and a procedure as
+it is, as `duckdb.sql` runs on DuckDB's default connection.
+
+| Name | Meaning |
+|---|---|
+| `pondra.sql`, `pondra.table`, `pondra.call`, `pondra.run`, `pondra.parameters`, `pondra.secret` | the connection's methods of the same names |
+| `pondra.vars` | the current connection's SQL variables: `pondra.vars.day` is `$day` |
+| `pondra.read_parquet`, `pondra.read_csv`, `pondra.read_json`, `pondra.read_delta`, `pondra.read_iceberg` | the connection's readers |
+| `pondra.scan_parquet`, `pondra.scan_csv`, `pondra.scan_delta`, `pondra.scan_iceberg`, `pondra.scan_ndjson`, `pondra.read_ndjson` | the same readers under Polars' names |
+| `pondra.connect`, `pondra.local`, `pondra.current`, `pondra.binary` | see [Connect](#connect) |
+| `pondra.col`, `pondra.lit`, `pondra.when`, `pondra.coalesce`, `pondra.concat`, `pondra.concat_str`, `pondra.sql_expr`, `pondra.all`, `pondra.len`, `pondra.sum`, `pondra.mean`, `pondra.min`, `pondra.max`, `pondra.count`, `pondra.n_unique`, `pondra.median`, `pondra.first`, `pondra.last`, `pondra.fn` | the frame functions: see [frames](/pondra/reference/frames/#expressions) |
+| `pondra.Pondra`, `pondra.Frame`, `pondra.Expr`, `pondra.GroupBy`, `pondra.Result`, `pondra.Run`, `pondra.PondraError` | the classes: a connection, a frame, an expression, what `group_by` returns, a statement's rows, a started procedure, and an error from a node |
+| `pondra.__version__` | the package's version |
 
 ```python
-db = pondra.connect("http://localhost:8080")
 print(pondra.sql("SELECT count(*) AS n FROM orders").rows())
+print("pondra", pondra.__version__)
 ```
 
 ```text
 [{'n': 3}]
+pondra 0.33.0
+```
+
+The module's functions work on the current connection. Aggregates and expressions are the same as a frame's:
+
+```python
+orders = db.table("orders")
+orders.select(pondra.mean("amount").alias("avg"), pondra.median("amount").alias("mid"),
+              pondra.max("qty").alias("most")).show()
+orders.select(pondra.n_unique("item").alias("items"), pondra.first("item").alias("first_item"),
+              pondra.last("item").alias("last_item")).show()
+orders.select(pondra.col("id"), pondra.sql_expr("qty * 2").alias("twice"),
+              pondra.coalesce(pondra.col("item"), pondra.lit("none")).alias("kind"),
+              pondra.fn.upper(pondra.col("item")).alias("up")).sort("id").limit(2).show()
+orders.select(pondra.col("id"),
+              pondra.concat_str([pondra.col("item"), pondra.lit("!")]).alias("loud"),
+              pondra.when(pondra.col("qty") > 1).then(pondra.lit("many"))
+              .otherwise(pondra.lit("one")).alias("size")).sort("id").limit(2).show()
+print(isinstance(pondra.col("qty"), pondra.Expr),
+      isinstance(orders.group_by("item"), pondra.GroupBy))
+print(pondra.current() is not None)
+```
+
+```text
++-----+-----+------+
+| avg | mid | most |
++-----+-----+------+
+| 5.0 | 4.5 | 2    |
++-----+-----+------+
++-------+------------+-----------+
+| items | first_item | last_item |
++-------+------------+-----------+
+| 2     | tea        | tea       |
++-------+------------+-----------+
++----+-------+------+------+
+| id | twice | kind | up   |
++----+-------+------+------+
+| 1  | 4     | tea  | TEA  |
+| 2  | 2     | cake | CAKE |
++----+-------+------+------+
++----+-------+------+
+| id | loud  | size |
++----+-------+------+
+| 1  | tea!  | many |
+| 2  | cake! | one  |
++----+-------+------+
+True True
+True
+```
+
+### The `pondra` command
+
+`python -m pondra` runs the `pondra` binary that pip installed, with the arguments you give it, from
+wherever pip put it. So it works when that folder isn't on your `PATH`. See
+[install](/pondra/start/install/) for the first run.
+
+```bash
+python3 -m pondra --version
+```
+
+```text
+pondra 0.33.0
+```
+
+`python -m pondra --add-to-path` puts the binary's folder on your `PATH`: in the registry on
+Windows, and in your shell's startup file elsewhere (`~/.bashrc`, `~/.zshrc`, `~/.profile`). It
+changes that file, so run it yourself, once. Then open a new terminal and run `pondra`.
+
+```bash norun
+python3 -m pondra --add-to-path
 ```

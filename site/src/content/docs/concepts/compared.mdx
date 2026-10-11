@@ -19,19 +19,20 @@ Per machine, in the main areas, Pondra measured ahead of Spark and Flink:
 - **Streaming:** Nexmark's q1, q2, q5, q7 and q11 over 10 million bids in 7.1 s against Flink 2.3's
   16.2 s on 4 cores (14.3 s against 30.4 s on 2), ingest over HTTP included; about 3 times Flink's
   throughput on a keyed aggregation.
-- **Into the lake:** a row is in the Delta and Iceberg tables other engines read about 0.4 s after its
+- **Into the lake:** a row is in the Delta and Iceberg tables other engines read about a second after its
   acknowledgement on local disk (3 to 10 s on R2), where Fluss's lake tables trail by 3 minutes by
   default.
-- **Light:** one 118 MB binary that answers about 0.1 s after it starts and idles at about 105 MB, half
-  of it its own code; Spark and Flink take 6 to 7 s and over 530 MB.
-- **Latency:** a change shows up on another node in about 5 ms. Writes are acknowledged in 2 to 4 ms on
+- **Light:** one 118 MB binary that answers its first query 0.12 to 0.14 s after it starts and idles at
+  105 to 109 MB. Spark and Flink take 6.4 to 6.9 s and idle at 549 to 585 MB (`tools/bench/footprint.py`,
+  2026-10-02).
+- **Latency:** a change shows up on another node 10 to 15 ms after it is acknowledged. Writes are acknowledged in 2 to 4 ms on
   R2 with `--ack replicated`.
 - **Flows:** materialized views that follow each other (bronze, silver, gold) move in the commit
   that wrote the rows, with expectations that keep, drop or refuse rows: no stage lags another, where
   Databricks' pipelines, Snowflake's dynamic tables and chained Flink jobs each lag the stage before
   ([Flows](/pondra/guides/flows/)).
 - **A database's behaviour:** `BEGIN` … `COMMIT` as one commit with snapshot isolation, Postgres's
-  error codes on every door, and key lookups through the Postgres port in about 0.4 ms. pgbench's own
+  error codes on every door, and key lookups through the Postgres port in about 0.2 ms. pgbench's own
   TPC-B script runs with its balances right.
 
 At cluster scale, and in breadth, it is not there yet:
@@ -78,8 +79,8 @@ and R.
 
 - On the same machine, TPC-H SF1 took 4.5 s against Spark 4.2's 56.1 s (2026-10-01), and a 20-million-row batch
   ran 2 to 14 times faster, with 293 MB of peak memory against 1.5 GB.
-- One binary of about 100 MB, against 485 MB of PySpark and a JVM. It starts a first query in 0.02 to
-  0.07 s, where Spark takes 4.1 s.
+- One binary of 118 MB, against 464 MB of PySpark and a JVM. It answers its first query 0.12 to 0.14 s
+  after it starts, where Spark takes 6.8 to 6.9 s.
 - `pondra.spark` takes a PySpark job by changing its imports. 55 of 55 test pipelines give PySpark 4's
   own answers and column names. [PySpark](/pondra/guides/pyspark/) says what differs.
 - Views and tasks are declared in SQL and run incrementally, as Spark's declarative pipelines do.
@@ -110,7 +111,7 @@ Flink is a stateful stream processor.
   durable, over HTTP, against 13.3 s), and on the Nexmark queries q1, q2, q5, q7 and q11, 10 million
   bids in 7.1 s against Flink 2.3's 16.2 s on 4 cores (14.3 s against 30.4 s on 2). Flink generated its input in process,
   and Pondra took its over HTTP.
-- A change is visible on another node in 5 ms. Flink's exactly-once results become visible at a
+- A change is visible on another node 10 to 15 ms after it is acknowledged. Flink's exactly-once results become visible at a
   checkpoint.
 - A flow of views (a filter, then an aggregate of it, then a rollup) is one commit: each stage's
   rows are written with the rows that caused them, exactly once, with no state to checkpoint between
@@ -140,7 +141,7 @@ top-level project in August 2026 and released 1.0 on 2026-09-21. You pair it wit
 - **Like for like, the fast paths match.** Pondra's nodes see a write 10 to 15 ms after the
   acknowledgement, as Fluss's TabletServers serve theirs in milliseconds.
 - **The lake tables don't.** Pondra's Delta and Iceberg versions trail the acknowledgement by about
-  0.4 seconds on local disk and 3 to 10 seconds on R2. Fluss's lake tables trail by 3 minutes by
+  a second on local disk and 3 to 10 seconds on R2. Fluss's lake tables trail by 3 minutes by
   default. Fluss can be set lower, and so can Pondra.
 - Pondra already has the Postgres protocol and MCP, which are on Fluss's roadmap.
 
@@ -155,7 +156,7 @@ as a service.
 **Where DuckDB is stronger:**
 
 - It is the reference for single-machine SQL, with a mature ecosystem and extensions.
-- With the data in memory, on 4 cores (round 32), DuckDB 1.5's own format was about 15% ahead on
+- With the data in memory, on 4 cores (Pondra 0.32), DuckDB 1.5's own format was about 15% ahead on
   TPC-H SF1 (1.05 s against Pondra's 1.24 s), and its 2.0 preview more (0.92 s). On ClickBench 2.0's
   preview was ahead (6.22 s against 6.58 s) and 1.5 behind (7.18 s).
 - It is small, about 20 MB for its command line, against 118 MB for Pondra's one binary (its
@@ -163,7 +164,7 @@ as a service.
 
 **Where Pondra fits:**
 
-- Reading Parquet on 4 cores (round 32), Pondra was level with DuckDB 1.5 on TPC-H SF1 (2.16 s against
+- Reading Parquet on 4 cores (Pondra 0.32), Pondra was level with DuckDB 1.5 on TPC-H SF1 (2.16 s against
   2.05 to 2.19 s) and ahead of DuckDB 1.5 and 2.0's preview on ClickBench (10.47 s against 11.10 and
   10.89 s).
 - Reading Parquet files on 2 vCPUs, Pondra was the fastest of five at SF10 (38.0 s, against DuckDB's 39.8 s), and
@@ -189,7 +190,6 @@ AI tools.
   claims sub-100 ms at 12,000 queries a second on a cluster. Pondra runs a new TPC-H query in 60 to 600
   ms on two cores.
 - Lakebase gives it a serverless Postgres next to the lakehouse. It has Zerobus for direct ingestion.
-  Its newest items are collected partly from third-party summit recaps, so check them.
 
 **Where Pondra fits:**
 
@@ -200,11 +200,11 @@ AI tools.
 - It runs anywhere you can run a binary, with no cloud account: on your disk or in any bucket.
 - Spark 4 reads the Delta and Iceberg tables Pondra publishes, and gets Pondra's answers. Databricks'
   own runtime hasn't been tried.
-- Its flows are Databricks' declarative pipelines in SQL — views following views, expectations
-  (`CONSTRAINT … EXPECT (…) ON VIOLATION DROP ROW | FAIL`), counted in `pondra.expectations` — but
+- Its flows are Databricks' declarative pipelines in SQL: views following views, with expectations
+  (`CONSTRAINT … EXPECT (…) ON VIOLATION DROP ROW | FAIL`) counted in `pondra.expectations`. But
   every stage commits with its source's rows, where a Databricks pipeline updates its tables on
   compute of its own, every 10 seconds to a few minutes in continuous mode. History per key (SCD
-  type 2) isn't built yet.
+  type 2) is a history view in Pondra ([Flows](/pondra/guides/flows/)).
 
 ## Snowflake
 
@@ -241,8 +241,9 @@ Pondra hasn't been measured against Snowflake.
 ## What Pondra doesn't have yet
 
 <Aside type="caution">
-- **Evidence at scale.** The multi-machine runs so far were on one machine and on three machines over
-  the internet, where a cluster was no faster than one node.
+- **Evidence at scale.** The multi-machine runs so far are GitHub's runners over the internet, on TPC-H
+  SF10. With 3 or 6 nodes the cluster was 6 to 8% faster than one node, with the same answers. Spreading
+  every query over the nodes was slower (33 to 35 s). Runs on machines in one data centre are still to come.
 - **Governance.** Users, roles and grants down to a column, TLS on every door and between nodes, an
   audit log and quotas are built ([Security](/pondra/guides/security/)). Single sign-on, row filters
   and masking policies aren't, and Unity Catalog's and Snowflake's governance go further.
@@ -253,12 +254,12 @@ Pondra hasn't been measured against Snowflake.
   Kafka sinks are not covered.
 - **Other databases.** Reading and writing Postgres or MySQL as attached databases, and streaming their
   changes in natively, are on the roadmap and not built. Debezium events through the Kafka port work.
-- **BI tools and JDBC.** dbt, psql, SQLAlchemy, pgjdbc and psqlODBC are tested against the Postgres
+- **BI tools and JDBC.** dbt, psql, SQLAlchemy, pgjdbc, psqlODBC and ADBC are tested against the Postgres
   port, and so is Npgsql, the driver in Power BI Desktop's PostgreSQL connector
   ([dbt and BI tools](/pondra/guides/dbt-and-bi/)).
 - **Streaming.** No timers, CEP, or Top-N by event time, and one watermark per source.
-- **Maturity.** Pondra is new and hasn't run in production for years. Chaos tests across several
-  machines, fuzzing and long soak runs are still on the plan.
+- **Maturity.** Pondra is new and hasn't run in production for years. Its fuzzing at every door and its
+  soak runs on a real bucket are a start; chaos tests across several machines and a 24-hour soak are still to run.
 </Aside>
 
 ## Where to read more

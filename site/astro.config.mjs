@@ -53,7 +53,7 @@ export default defineConfig({
         ] },
         { label: 'APIs', items: [
           'reference',
-          { label: 'Clients', items: ['reference/python', 'reference/frames', 'reference/javascript', 'reference/names'] },
+          { label: 'Clients', items: ['reference/python', 'reference/frames', 'reference/pyspark', 'reference/javascript', 'reference/names'] },
           { label: 'Command line', items: ['reference/cli'] },
           { label: 'Protocols', items: ['reference/http', 'reference/postgres', 'reference/flight', 'reference/kafka-protocol', 'reference/iceberg-rest', 'reference/mcp'] },
           { label: 'Configuration', items: ['reference/environment'] },

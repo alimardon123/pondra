@@ -149,8 +149,11 @@ pondra sql --dir s3://my-bucket/lake "INSERT INTO events VALUES (10001, 'u1', 1.
 {"committed":true}
 ```
 
-Opening a lake's catalog is about twenty sequential requests, so a serverless query has a floor: 30
-ms on local disk and a few seconds on R2 from far away. A running node keeps the catalog in memory.
+Opening a lake's catalog is about twenty sequential requests, so a serverless query has a floor. As
+measured, a new `pondra sql` process sees a write about 34 ms after its acknowledgement on local
+disk, about 3 s on a near R2 bucket, and about 6 s on a far one. The
+[freshness page](/pondra/concepts/freshness-and-guarantees/) has the table. A running node keeps the
+catalog in memory.
 
 ## The SSD cache
 
@@ -219,7 +222,7 @@ same catalog commit, so it costs latency, not requests. See [clusters](/pondra/g
 |---|---|---|
 | A node (`pondra serve`, `--reader`) | milliseconds after the ack | its catalog follows the leader's commit stream |
 | `pondra sql`, no node | once it is in the bucket | every acknowledged write with `--ack durable` |
-| Delta and Iceberg readers | after the next tiering round | about 30 ms on local disk, 3 to 4 s on a nearby R2 bucket, 7 to 10 s on a far one |
+| Delta and Iceberg readers | after the next tiering round | about a second on local disk, 3 to 4 s on a nearby R2 bucket, 7 to 10 s on a far one |
 
 An acknowledged write is durable in the default mode: it is in the bucket when the ack returns. The
 numbers for R2 are the project's own measurements from a machine in North America (one writer:

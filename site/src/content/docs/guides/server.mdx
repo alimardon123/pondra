@@ -59,9 +59,9 @@ or a request names it. The process passes that database's traffic through to its
 A database stops once no connection to it is open, no request is on its way, nothing has come for
 `PONDRA_DATABASE_IDLE_SECS` (600 seconds), and it has nothing left to tier. A statement that runs
 longer than that, or a connection a BI tool keeps open, keeps it running. The next query starts it
-again: on a local disk here the first answer took about 70 ms, and the ones after it about 1 ms. So a database nobody uses costs nothing, and each one
-keeps everything a node does: leading its cluster, tiering, views, tasks and recovery after a
-crash.
+again, and the database answers as a node does once it is up. So a database nobody uses costs
+nothing, and each one keeps everything a node does: leading its cluster, tiering, views, tasks and
+recovery after a crash.
 
 ## Connect
 
@@ -116,7 +116,8 @@ DROP DATABASE hr;
   needs an admin token, and you run it from another database, as in Postgres. `DROP DATABASE IF
   EXISTS` is quiet about one that isn't there. On a node that serves one lake, there is no folder
   of lakes to drop it from, so it says to use `DETACH` instead.
-- `GET /databases` lists them, with whether each is running and which is the default:
+- `GET /databases` lists them, with whether each is running and which is the default. Here `sales` is
+  the default, as `pondra serve data --default sales` makes it:
 
 ```json
 [{"name": "crm", "running": false, "default": false}, {"name": "sales", "running": true, "default": true}]
@@ -157,15 +158,15 @@ every door: SQL over HTTP and Postgres, listings such as `pondra.tables`, and th
 
 ## Clusters of one database
 
-A database's node can lead a cluster. It advertises itself as `host:8080/db/sales`, so a node on
-another machine joins that database's cluster through the process that serves the folder:
+A database's node can lead a cluster, as any node can. The server advertises it as
+`host:8080/db/sales`, which is the server's address for that database, so nodes on other machines
+reach the leader through the server. A lake in a bucket is the way to share one: run `pondra serve`
+on the database's lake on as many machines as you like, and [Clusters](/pondra/guides/clusters/)
+explains how the nodes share the work.
 
 ```bash norun
-pondra serve /shared/data/sales --addr 10.0.0.6:8080
+pondra serve s3://bucket/data/sales --addr 10.0.0.6:8080
 ```
-
-For a lake in a bucket, run `pondra serve s3://bucket/sales` on as many machines as you like;
-[Clusters](/pondra/guides/clusters/) explains how the nodes share the work.
 
 ## A folder in a bucket
 
@@ -207,10 +208,10 @@ node, not for all of them together.
 
 <Aside type="caution" title="What a folder of lakes doesn't do yet">
 - **Flight and Kafka ports.** A Flight or Kafka port speaks for one lake today, so a folder of
-  lakes refuses `--flight`, `--kafka` (and `--kafka-advertise`), and `--attach`, `--advertise` and
-  `--attach-found` too, each with a message that names the flag. Routing them to many databases
-  (Kafka by topic, such as `sales.orders`, and Flight by the database the client names) is planned
-  for the next round. Serve such a lake on its own: `pondra serve data/sales --flight 0.0.0.0:8815`.
+  lakes refuses `--flight`, `--kafka`, `--attach`, `--advertise` and `--attach-found`, each with a
+  message that names the flag. Routing them to many databases (Kafka by topic, such as
+  `sales.orders`, and Flight by the database the client names) is not built yet. Serve such a lake
+  on its own: `pondra serve data/sales --flight 0.0.0.0:8815`.
 - **Per-database settings and users made once.** `ALTER DATABASE sales SET …` is planned, and so are
   users made once for every database. Today each database has users of its own, and the tokens are
   the same for every database.

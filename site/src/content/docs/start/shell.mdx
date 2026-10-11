@@ -23,7 +23,7 @@ This is a session on a terminal. Type a statement, end it with `;`, and read the
 
 ```text
 $ pondra shop
-Pondra 0.29.0 on shop, also at http://127.0.0.1:37957. Databases: crm, shop. End each statement with ;  .tables and .databases list them, .quit leaves.
+Pondra 0.33.0 on shop, also at http://127.0.0.1:37957. Databases: crm, shop. End each statement with ;  .tables and .databases list them, .quit leaves.
 The console, as this shell: http://127.0.0.1:37957/#key=6f0c…
 pondra> SELECT item, sum(qty) AS items FROM orders GROUP BY item ORDER BY item;
 +------+-------+
@@ -101,8 +101,8 @@ exit status: 1
 
 ## Use the lakes beside yours as databases
 
-Every folder next to your lake that holds a lake is a database in the shell, under its folder's
-name. Tables are `database.table`, or `database.schema.table`, and you can join across them:
+Every lake in the folder you start the shell from is a database in the shell, under the lake's
+folder name. Tables are `database.table`, or `database.schema.table`, and you can join across them:
 
 ```bash
 mkdir -p databases && cd databases
@@ -204,8 +204,8 @@ pondra run report.sql daily --day 2026-09-27 --min 5
 - The last statement's answer is printed. A failing statement stops the run with its error, and the
   command exits with an error status.
 
-To run the file on a node that is already running, give `--url` instead of the lake. It and the
-parameters may come in any order:
+To run the file on a node that is already running, give `--url` instead of the lake. `--url` and
+`--token` may come anywhere after the file, mixed with the parameters:
 
 ```bash
 cat > today.sql <<'SQL'

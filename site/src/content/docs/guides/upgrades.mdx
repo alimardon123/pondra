@@ -37,7 +37,7 @@ def stats(port):
 ```
 
 ```text
-[('leader', '0.30.0', 1), ('follower', '0.30.0', 1)]
+[('leader', '0.33.0', 1), ('follower', '0.33.0', 1)]
 ```
 
 ```python
@@ -45,7 +45,7 @@ stats(8091)["releases"]
 ```
 
 ```text
-{'127.0.0.1:8091': '0.30.0', '127.0.0.1:8092': '0.30.0'}
+{'127.0.0.1:8091': '0.33.0', '127.0.0.1:8092': '0.33.0'}
 ```
 
 ## Stop a node without dropping work
@@ -127,7 +127,7 @@ On machines of their own that looks like this, however you run the binary:
 
 ```bash norun
 sudo systemctl stop pondra          # drains, then stops
-sudo install pondra-0.31.0 /usr/local/bin/pondra
+sudo install pondra-new /usr/local/bin/pondra   # the new release's binary
 sudo systemctl start pondra
 until curl -sf localhost:8080/ready; do sleep 1; done
 ```
@@ -154,6 +154,37 @@ stats(8091)["role"], sorted(stats(8092)["releases"])
 
 The leader can go first too; it only costs the older followers a few seconds more to take over.
 
+## Upgrade each install
+
+A new release replaces the binary. The lake stays where it is, and the node opens it when it starts.
+
+| Installed with | Upgrade | Stay on one release |
+|---|---|---|
+| pip | `pip install -U pondra` | `pip install 'pondra==0.33.*'` |
+| npm | `npm install pondra@latest` | `npm install pondra@0.33` |
+| the one-line installer | run it again | set `PONDRA_VERSION=0.33.0` before it (PowerShell: `$env:PONDRA_VERSION = "0.33.0"`) |
+| a container | run the new release's tag, `ghcr.io/alimardon123/pondra:0.33.0` | name a tag, never `latest`, for a server |
+| Helm | `helm upgrade pondra oci://ghcr.io/alimardon123/charts/pondra --reuse-values --set image.tag=0.33.0` | `image.tag` |
+| `pondra service` | upgrade the binary with pip or the installer, then restart the service (below) | keep that binary as it is |
+
+The images and the chart are not in GitHub's registry yet: build the image as the
+[deploy guide](/pondra/guides/deploy/) says, and use your own tag.
+
+- **Helm** replaces one pod at a time, and each node drains before it stops: the rolling upgrade
+  above, with nothing more to do.
+- **Compose:** restart one node at a time, such as `docker compose up -d --no-deps node2`, so the
+  cluster always has a leader. A plain `docker compose up -d` restarts every node at once.
+- **`pondra service`** runs the binary at the path it was installed from, so the upgraded binary is
+  what starts. A restart drains the node first, as any stop does:
+
+  | System | Restart |
+  |---|---|
+  | Linux | `sudo systemctl restart pondra` (`systemctl --user restart pondra` for your own) |
+  | macOS | `sudo launchctl kickstart -k system/pondra` (`launchctl kickstart -k gui/$(id -u)/pondra` for your own) |
+  | Windows | `Stop-Service pondra` before the upgrade, since Windows can't replace a running program, and `Start-Service pondra` after it |
+
+  A service installed with `--name` goes by that name instead of `pondra`.
+
 ## Which releases can open a lake
 
 A lake has a format, a number in its catalog. A release opens every lake of its format or older:
@@ -166,11 +197,13 @@ can't read. Until something moves it, the release before still opens it.
 |---|---|---|
 | 1 | 0.32 | every lake, as soon as a release that knows formats opens it |
 | 2 | 0.33 | a materialized view that works its answers out as it is read (`avg`, `stddev`, `HAVING`, …) |
+| 3 | 0.34 | a lake's own keys sealed by a master key every node shares (`PONDRA_SECRET_KEY` or `PONDRA_KMS_COMMAND`): from the first write in a lake the release makes, otherwise by its leader once every node knows format 3 |
 
-An older release refuses a newer lake by name, before it reads anything:
+An older release refuses a newer lake by name, before it reads anything. The message has this shape,
+with the lake, its format and the release that wrote it filled in:
 
 ```text
-s3://my-bucket/lake is a lake of format 2, written by Pondra 1.2.0; this is Pondra 1.1.0, which knows formats up to 1: run Pondra 1.2.0 or newer here
+<lake> is a lake of format <n>, written by Pondra <release>; this is Pondra <this release>, which knows formats up to <m>: run Pondra <release> or newer here
 ```
 
 So you can go back to the older release during an upgrade, but not once the lake has moved on.

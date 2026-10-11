@@ -6,8 +6,9 @@ description: Publish tables as Delta Lake and Iceberg so DuckDB, Polars, Spark a
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 
 A Pondra table can also be a **Delta Lake** table and an **Iceberg** table, in the same folder as
-its Parquet files. Spark, Databricks, DuckDB, Polars, delta-rs, PyIceberg, Trino and Athena read
-them without knowing Pondra. Engines can also attach the node's **Iceberg REST catalog** by URL,
+its Parquet files. They are open formats, so engines that read Delta Lake or Iceberg read them without
+knowing Pondra. The readers this project tests against are Spark 4, DuckDB, Polars, delta-rs and
+PyIceberg. Engines can also attach the node's **Iceberg REST catalog** by URL,
 make tables there and append to them with their own compute. Use this page to hand a table to a
 team that uses other tools.
 
@@ -39,7 +40,7 @@ lake/data/events/
   metadata/v1.metadata.json …                the Iceberg table
 ```
 
-Other engines see a table **as of the last tiering round**: about 30 ms after a write on local
+Other engines see a table **as of the last tiering round**: about a second after a write on local
 disk, and a few seconds on object storage. `--tier-secs` (default 10) is how often a busy table is
 tiered at most; Pondra's own queries always see every commit at once. `CHECKPOINT` tiers every table
 now, so an engine sees the rows without waiting for the next round:
@@ -324,10 +325,11 @@ A Delta writer commits by writing the log itself, and Pondra offers no Delta cat
   view.
 - **Keyed tables** publish every tier round, like append tables: the older versions a round replaces
   and its delete markers become position deletes (Delta deletion vectors), so readers see one row per
-  key. A keyed table with `order_by` or merge functions still publishes after each full compaction
-  (`CHECKPOINT` brings it up to date).
+  key. A keyed table with `order_by`, or with `MERGE` columns (`MERGE sum`, and a `GROUP BY` view's
+  table), publishes only when it holds one generation, which a full compaction makes. `CHECKPOINT`
+  compacts such a table and publishes it up to date.
 - **Deleted rows** are Iceberg position-delete files and Delta deletion vectors. PyIceberg, DuckDB,
-  Polars, Spark and Trino read them, and so does delta-rs's `QueryBuilder`; its `to_pyarrow_table`
+  Polars and Spark read them, and so does delta-rs's `QueryBuilder`; its `to_pyarrow_table`
   doesn't read deletion vectors yet, and refuses the table.
 - **Schema changes follow.** `ADD COLUMN`, renames and drops reach Delta (column mapping) and
   Iceberg (field ids) without rewriting files.

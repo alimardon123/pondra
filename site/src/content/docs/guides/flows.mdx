@@ -92,8 +92,9 @@ INSERT INTO orders VALUES (6, 'eu', 'ann', 5000, 'paid');
 -- ERROR 23514: new row for relation "strict" violates check constraint "small": CHECK (amount < 1000)
 ```
 
-Expectations go on row-by-row views (no `GROUP BY`): a grouped view's table keeps partial sums, so
-its totals aren't there to check. Put them on the view before it.
+Expectations go on row-by-row views, not on a view with `GROUP BY`: a grouped view's table keeps
+partial sums, not totals, so its totals can't be checked there. Put the expectation on a view of the
+same source without `GROUP BY`, and let the grouped view follow that one.
 
 ## What a view of a view may be
 
@@ -195,11 +196,9 @@ strict     orders            rows       1
 ```
 
 <Aside>
-**Compared with Databricks and Snowflake.** A Databricks pipeline updates its tables on compute of
-its own, every 10 seconds to a few minutes in continuous mode; a Snowflake dynamic table refreshes
-within its target lag, 60 seconds at least. Here every stage is computed by the node that took the
-rows in, as part of packing them, so the whole flow commits at once: no lag between stages and
-no checkpoints to keep. The cost is that each stage's SQL runs as rows arrive (three stages took
-29% off ingest on two vCPUs); a stage that must see everything at once (a top-N over all time, a
-totals filter) is a stored view, read when asked.
+A flow commits all its stages in one commit. The node that took the rows in computes each stage as
+it packs them, so no stage lags behind the one before it, and there are no checkpoints to keep. The
+cost is that every stage's SQL runs as the rows arrive. A view that must see everything at once, such
+as a top N over all time or a filter on a total, runs its query whole again after a change instead
+([Streaming](/pondra/guides/streaming/#anything-else-run-whole)).
 </Aside>

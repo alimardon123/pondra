@@ -54,7 +54,7 @@ Options come by name. The same option has each tool's spelling:
 | CSV delimiter | `delim => ';'` (or `sep`, `delimiter`) | `separator=';'` | `.option("sep", ";")` |
 | CSV header row (default true) | `header => false` | `has_header=False` | `.option("header", True)` |
 | Folders named `k=v` are columns | `hive_partitioning => true` | `hive_partitioning=True` | on by default |
-| Combine files with different columns | `union_by_name => true` | `union_by_name=True` | |
+| Combine files with different columns | `union_by_name => true` | `union_by_name=True` | `.option("mergeSchema", True)` (Parquet) |
 | Delta version | `version => 3` | `version=3` | |
 | Iceberg snapshot | `snapshot_from_id => 123` | `snapshot_id=123` | |
 | Column names and types | `columns => {'id': 'BIGINT', 'name': 'VARCHAR'}` | | |

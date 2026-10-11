@@ -99,6 +99,7 @@ What these checks don't cover yet, or where Pondra waits instead of failing:
 - **A request the bucket holds holds the commits behind it,** until it is answered or times out:
   with 2% of requests held for 20 s, writes went on at a few a second.
 - Every run on a pull request is on one machine with a simulated bucket. The bucket's failures run
-  against a real R2 bucket every night (`resilience_check.py --real`); several machines and a
-  24-hour soak are next.
+  against a real R2 bucket every night (`resilience_check.py --real`). A 4.8-hour soak on R2 stopped
+  and killed eight nodes, and every batch landed once. A full 24-hour soak and runs on several
+  machines are next.
 </Aside>

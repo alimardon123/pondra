@@ -295,9 +295,9 @@ Mail, HTTP calls, files and cloud SDKs are all fair game, which is why only an a
 a procedure, and a node runs Python only when started with `--python`. A node with no tokens takes
 `--python` only on 127.0.0.1.
 
-```sql norun
-CREATE SECRET smtp (TYPE generic, HOST 'smtp.example.com', USER 'reports@example.com', PASSWORD '…');
+This procedure reads the `smtp` secret that [Secrets](#secrets) makes below:
 
+```sql norun
 CREATE PROCEDURE send_report(day DATE, to_addr VARCHAR) LANGUAGE python AS $$
     import smtplib
     from email.message import EmailMessage
@@ -517,7 +517,8 @@ EXECUTE TASK count_orders (day => DATE '2026-09-29');
 
 `pondra.tasks` shows each task's schedule or what it follows, its state, and its last run's status
 and result. Each run is a row of `pondra.runs` whose id is `task-<name>-<tick>`, the same for every
-task in one run of a graph. A task others follow is dropped after them.
+task in one run of a graph. `DROP TASK` refuses a task that another task runs after: drop the later
+tasks first, as the example below does.
 
 ```sql
 SELECT name, after, state, last_status, last_result FROM pondra.tasks;
@@ -528,8 +529,10 @@ DROP TASK count_orders;
 
 ## See what ran
 
-Every procedure call is a row of `pondra.runs`: routine, caller, node, arguments, start, end, status
-(`running`, `ok`, `failed`, or `stopped` when its node stopped while it ran), notices and error. A file's run is named `files/<path>@<version>`. Rows go after 30 days (`PONDRA_RUNS_DAYS`).
+Every procedure call is a row of `pondra.runs`: its `routine`, `caller`, `node`, `job`, `args` (the
+arguments as JSON), `started` and `ended` times, `status` (`running`, `ok`, `failed`, or `stopped` when
+its node stopped while it ran), `notices` and `error`. [System tables](/pondra/sql/system-tables/#the-run-log)
+lists the columns. A file's run is named `files/<path>@<version>`. Rows go after 30 days (`PONDRA_RUNS_DAYS`).
 
 ```sql
 SELECT routine, caller, status, notices FROM pondra.runs ORDER BY started DESC LIMIT 3;

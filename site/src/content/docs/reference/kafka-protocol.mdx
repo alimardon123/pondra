@@ -300,6 +300,9 @@ logs in with SASL/PLAIN: a [user](/pondra/guides/security/#users-roles-and-grant
 [Postgres](/pondra/reference/postgres/#connect). A `reader` may consume and not produce; a user
 produces to a table it has INSERT on, and consumes one it may read every column of. A client that does not log in, or logs in with a wrong password, cannot connect: its
 first request is refused and the connection closes. Use `SASL_PLAINTEXT`, or `SASL_SSL` when the node has a certificate ([TLS](/pondra/guides/security/#tls)).
+With a certificate, a client on another machine must use TLS (`SASL_SSL`, or `SSL` on a node nobody signs
+in to): a plain connection from another machine is closed, and plain is taken from this machine only
+(`PONDRA_TLS=optional` takes it from anywhere).
 
 ```python norun
 import os

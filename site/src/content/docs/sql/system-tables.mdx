@@ -12,7 +12,7 @@ what procedures did and what is on a schedule. You read both with ordinary SQL.
 
 | Column | Type | Meaning |
 |---|---|---|
-| `_row_id` | `BIGINT` | which row this is, from its `INSERT` on. An `UPDATE` or `MERGE` keeps it. A new row gets a new one: an `INSERT`, and an upsert that replaces a keyed table's row |
+| `_row_id` | `BIGINT` | which row this is. It is given when the row is first written, and an `UPDATE`, a `MERGE` or a keyed table's upsert keeps it |
 | `_version` | `BIGINT` | the commit that wrote this version of the row: a sequence number for the whole lake |
 | `_created_at` | `TIMESTAMP` (UTC) | when the row's first version was committed |
 | `_updated_at` | `TIMESTAMP` (UTC) | when this version was committed |
@@ -26,7 +26,7 @@ v3's row lineage and Delta's row tracking number rows). A merge writes them into
 
 `SELECT *` leaves the system columns out, and so does `DESCRIBE`. A query that names one gets it:
 `SELECT _row_id, * FROM t`. `SELECT *, _row_id FROM t` shows the table's columns and `_row_id`
-once. Over a join, `*` shows each table's system columns as well.
+once. Over a join, `*` gives the columns of each table and no system columns: name them to get them.
 
 An `UPDATE` writes a new version of the row: it keeps `_row_id` and `_created_at`, and takes a new
 `_version` and `_updated_at`. Nothing is rewritten in place. The old version stays in its file
@@ -50,19 +50,22 @@ ORDER BY t.id;
 [{"id":1,"status":"closed","same_row":true,"newer":true,"same_created":true},{"id":2,"status":"open","same_row":true,"newer":false,"same_created":true}]
 ```
 
-Ticket 1 is the same row with a newer version, and ticket 2 did not change. In a merge table, or a
-view that groups, a row combines many: its `_row_id` and `_created_at` are the first row's, and its
-`_version` and `_updated_at` the last commit's.
+Ticket 1 is the same row with a newer version, and ticket 2 did not change.
+
+A merge table (a keyed table with `MERGE` columns, which adds up the values of a key) and a view
+that groups combine many rows into one. A merge table's row keeps the `_row_id` and `_created_at`
+of its first row, and takes the `_version` and `_updated_at` of the last commit. A grouping view
+gives each group its own `_row_id`; the group's `_created_at` is when the group first appeared, and
+its `_version` and `_updated_at` are the group's last change.
 
 ## Keyed tables
 
 A keyed table (`PRIMARY KEY`) has a `_deleted` column as well. A `DELETE` does not remove the row:
-it adds a row for the key with `_deleted` true, and reads leave out keys whose newest row is a
-delete. `_deleted` is null for a row that was only inserted, and false for an `UPDATE`'s new row.
-Reads leave the column out unless a query names it (`SELECT *, _deleted FROM t`), and you never see
-a deleted key there, so its value is null in what you read. It shows up when you follow the table:
-in the stream from `/watch`, in a [Flight log stream](/pondra/reference/flight/#the-log-as-a-stream),
-and in the rows [Kafka](/pondra/reference/kafka-protocol/#consume) consumers get as tombstones.
+it adds a row for the key with `_deleted` true. Reads leave out a key whose newest row is a delete,
+with or without naming `_deleted`, so a query never shows a deleted key. A live row's `_deleted` is
+`false` or null. The delete marker shows when you follow the table: in the stream from `/watch`, in
+a [Flight log stream](/pondra/reference/flight/#the-log-as-a-stream), and in the rows
+[Kafka](/pondra/reference/kafka-protocol/#consume) consumers get as tombstones.
 
 ```sql
 CREATE TABLE accounts (id BIGINT PRIMARY KEY, name VARCHAR);
@@ -70,14 +73,22 @@ INSERT INTO accounts VALUES (1, 'ann'), (2, 'bo');
 DELETE FROM accounts WHERE id = 2;
 ```
 
-```bash
-curl -s --max-time 2 'http://localhost:8080/watch/accounts?after=0' || true
+The `/watch` stream sends every change to a table, from its start with `after=0`. This reads it
+until the delete marker arrives, and fails after 30 seconds if the marker never comes:
+
+```python
+import json, urllib.request
+rows = []
+with urllib.request.urlopen("http://localhost:8080/watch/accounts?after=0", timeout=30) as stream:
+    for line in stream:
+        rows.append(json.loads(line))
+        if rows[-1].get("_deleted"):
+            break
+print(rows)
 ```
 
 ```text
-{"id":1,"name":"ann"}
-{"id":2,"name":"bo"}
-{"id":2,"name":"bo","_deleted":true}
+[{'id': 1, 'name': 'ann'}, {'id': 2, 'name': 'bo'}, {'id': 2, 'name': 'bo', '_deleted': True}]
 ```
 
 ## The change feed
@@ -114,7 +125,8 @@ print(seen)
 
 `pondra.runs` has a row for each call of a stored procedure, from any node, and it outlives the
 nodes. It is written as the call starts (`running`) and again as it ends, in batches, so a call
-never waits for its log, and it shows in the table within about a second. A row stays for 30
+never waits for its log. The row is written a moment after the call, within about a second, so a
+query right after the call may not see it yet: wait for it, as the example does. A row stays for 30
 days (`PONDRA_RUNS_DAYS`, see [environment](/pondra/reference/environment/)). A procedure that
 does not exist is refused before it starts, and has no row.
 
@@ -140,16 +152,23 @@ $$;
 CALL report('2026-09-27');
 ```
 
-```bash
-sleep 2
-```
+This waits until the call's row has ended, for up to 30 seconds, and fails if it never does:
 
-```sql
-SELECT routine, caller, status, args FROM pondra.runs WHERE routine = 'report' AND caller = 'admin';
+```python
+import time
+import pondra
+
+db = pondra.connect("http://localhost:8080")
+rows, deadline = [], time.time() + 30
+while not rows and time.time() < deadline:
+    rows = db.sql("SELECT routine, caller, status, args FROM pondra.runs WHERE routine = 'report' AND caller = 'admin' AND status <> 'running'").rows()
+    time.sleep(0.2)
+assert rows, "the run did not end within 30 seconds"
+print(rows)
 ```
 
 ```text
-[{"routine":"report","caller":"admin","status":"ok","args":"{\"day\":\"2026-09-27\"}"}]
+[{'routine': 'report', 'caller': 'admin', 'status': 'ok', 'args': '{"day":"2026-09-27"}'}]
 ```
 
 ## Routines and tasks
@@ -224,7 +243,7 @@ SELECT name, kind, key FROM pondra.tables WHERE name IN ('sold', 'sold_by_item',
 ```
 
 ```text
-[{"name":"big_sales","kind":"view","key":null},{"name":"sold","kind":"table","key":null},{"name":"sold_by_item","kind":"materialized view","key":"item"}]
+[{"name":"big_sales","kind":"view"},{"name":"sold","kind":"table"},{"name":"sold_by_item","kind":"materialized view","key":"item"}]
 ```
 
 ```sql
@@ -314,6 +333,9 @@ SELECT name, follows, kind FROM pondra.flows WHERE name = 'sold_by_item';
 ```
 
 <Aside type="caution">
-A schema of your own that is called `pondra` takes the name: `pondra.runs` then means its `runs`
-table. The three system tables are read-only: a write to one fails with `no schema pondra`.
+The tables in `pondra` are read-only: a write to one, such as `INSERT INTO pondra.runs`, fails with
+`no schema pondra (CREATE SCHEMA pondra)`. A schema of your own called `pondra` takes the name, and
+until you drop it the system tables are not there: `pondra.runs` then means your own table, or is
+`table 'pondra.runs' not found`. The other tables in `pondra`, such as `pondra.history`,
+`pondra.audit`, `pondra.users` and `pondra.grants`, are on the [statements page](/pondra/sql/statements/#users-and-grants).
 </Aside>

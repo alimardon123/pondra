@@ -281,8 +281,16 @@ cluster in one data centre yet.
   | Round 21's run | 21.7 s | 21.5 s (3 queries spread, 9 MB moved) | 38.9 s |
   | 0.24.0, 3 nodes | 23.8 s | 24.1 s (7 queries spread) | 49.5 s |
   | 0.24.0, 6 nodes | 24.9 s | 22.4 s (6 queries spread) | 29.0 s |
+  | 0.27.0, 3 nodes | 25.1 s | 23.9 s (4 queries spread) | 40.0 s |
+  | 0.27.0, 6 nodes | 22.7 s | 21.1 s (2 queries spread) | 33.0 s |
+  | 0.30, 3 nodes | 23.8 s | 22.4 s | 34.5 s |
+  | 0.30, 6 nodes | 26.2 s | 24.2 s | 33.3 s |
 
-- **Six nodes** (GitHub runners with 4 vCPUs each, links of 32 to 54 ms and 52 to 89 MB/s): the
+  The 0.30 runs (the owner's runs #15 and #16, TPC-H SF10 on GitHub's runners over Tailscale) gave
+  the same answers as one node. The cluster was 6% faster with three nodes and 8% faster with six.
+  Spreading every query was slower. Their numbers are in [the status notes](https://github.com/alimardon123/pondra/blob/main/docs/prototype-status.md).
+
+- **Six nodes, on 0.24.0** (GitHub runners with 4 vCPUs each, links of 32 to 54 ms and 52 to 89 MB/s): the
   cluster ran TPC-H 10% faster than one node, with every answer the same. The queries it spread got
   faster: q21 took 1.30 s instead of 2.95 s, q19 0.65 s instead of 1.00 s, and q6 0.26 s instead of
   0.57 s. Spreading every query was slower overall (29.0 s), because the slow links make the small

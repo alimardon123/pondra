@@ -18,11 +18,12 @@ where you run it:
 | A laptop with a package manager | [Homebrew, winget and Scoop](#homebrew-winget-and-scoop) (not published yet) |
 
 <Aside type="caution">
-The image and the chart are published to GitHub's registry by a release once the project turns that
-on, and the first release that carries them will say so. Until then, build the image from a checkout
-of the repository: `python3 tools/image.py --release 0.30.0 --out ctx`, then
-`docker build -f deploy/docker/Dockerfile -t pondra ctx`, and install the chart from its folder,
-`deploy/helm/pondra`, with `--set image.repository=pondra` and your registry.
+A release publishes the image and the chart to GitHub's registry only once the project turns that on.
+The first release that does will say so. Until then, build the image from a checkout of the
+repository and a release's Linux binary: `python3 tools/image.py --release 0.33.0 --out ctx` (or
+`--bin target/release/pondra` for one you built), then `docker build -f deploy/docker/Dockerfile -t
+pondra ctx`. Install the chart from its folder,
+`deploy/helm/pondra`, with `--set image.repository=pondra` and your own registry.
 </Aside>
 
 Whichever you pick, the node is the same `pondra serve`. [Clusters](/pondra/guides/clusters/) says what
@@ -31,7 +32,8 @@ lake, and [security](/pondra/guides/security/) how to put tokens and TLS on ever
 
 ## A container image
 
-`ghcr.io/alimardon123/pondra` has an image for `linux/amd64` and `linux/arm64`. Each release is tagged
+Once a release publishes them (see the note above), `ghcr.io/alimardon123/pondra` has an image for
+`linux/amd64` and `linux/arm64`. Each release is tagged
 with its version and as `latest`, and each tag has a `-python` twin:
 
 | Image | What it holds |
@@ -197,6 +199,8 @@ deploy/compose/compose.yaml down`; add `-v` to delete the lake and the volumes t
 The chart runs the nodes as a StatefulSet. Each keeps its name, so a restarted node is the same member
 of the cluster: a leader whose pod comes back quickly leads again, and if it stays down another node
 takes over within seconds. It needs Kubernetes 1.25 or newer.
+
+Once the chart is published (see the note at the top), install it from the registry:
 
 ```bash norun
 helm install pondra oci://ghcr.io/alimardon123/charts/pondra \

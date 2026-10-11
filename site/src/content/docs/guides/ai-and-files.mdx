@@ -159,11 +159,11 @@ says where the lake's files are). Whoever may read the lake may read its files t
 as a table you can edit (CSV and JSON) and save back in place.
 
 <Aside type="caution">
-A path that exists isn't written again blind: a `PUT` without `If-Match` returns `409`. To replace
-it, send the version a `GET` gave (its `etag`) as `If-Match`; if the file changed since, the `PUT`
-returns `412` (see [Files](/pondra/reference/http/#files)). `file_read` of a path that isn't there is `NULL`. `file_read` returns files up
-to 256 MB, eight at a time. String functions other than `substr` and `byte_length` need a
-`CAST(… AS VARCHAR)` first.
+- A path that exists isn't written again blind: a `PUT` without `If-Match` returns `409`. To replace
+  it, send the version a `GET` gave (its `etag`) as `If-Match`. If the file changed since, the `PUT`
+  returns `412` (see [Files](/pondra/reference/http/#files)).
+- `file_read` of a path that isn't there is `NULL`. It returns files up to 256 MB, eight at a time.
+- String functions other than `substr` and `byte_length` need a `CAST(… AS VARCHAR)` first.
 </Aside>
 
 ## Models in SQL

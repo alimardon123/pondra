@@ -152,9 +152,11 @@ branches it made.
 
 - **Tasks start suspended**, so a branch never runs production's schedules. Resume one with
   `ALTER TASK … RESUME`.
-- **Secrets stay with the base**, and a view fed by a Kafka topic arrives as a plain table: nothing
-  in a branch reaches outside on its own.
-- **A branch lives where its base does**: both in the same bucket, or both on the same machine.
+- **Secrets stay with the base.** The one exception is the read-only key that a branch on another
+  server keeps to read its base ([below](#production-on-a-server-of-its-own)). A view fed by a Kafka
+  topic arrives as a plain table: nothing in a branch reaches outside on its own.
+- **A branch is in its base's bucket, or on another server.** In the same bucket it reads the base's
+  files and copies none of them. On another server it reads them with that read-only key.
 
 ## Apply a project
 
@@ -345,7 +347,10 @@ values = { min_order = 0 }
 crm_token = "env:CRM_TOKEN"          # $crm_token, from the applying machine's environment
 ```
 
-A branch is a Git branch and a database of the same name, made from prod with no file copied. A
+A branch is a Git branch and a database, made from prod with no file copied. The database's name is
+the branch's name as SQL takes it: lower case, with every character that isn't a letter, a digit or
+`_` made `_`, and a `_` before a name that starts with a digit. So `orders-by-channel` is
+`orders_by_channel`, and `2026-q4` is `_2026_q4`. A
 developer's day:
 
 ```bash norun

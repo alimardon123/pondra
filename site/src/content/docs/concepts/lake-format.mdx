@@ -159,12 +159,11 @@ is recorded by the sales lake's leader.
    `add`. Iceberg writes a snapshot without the old files. The old files are deleted after
    `--retain-secs`.
 
-Other engines see a row from step 2. Measured with `--tier-secs 2`, the default when this was
-measured:
+Other engines see a row from step 2. Measured with `--tier-secs 2` (the default is now 10):
 
-- about 30 ms after the acknowledgement on local disk;
+- about a second after the acknowledgement on local disk (Delta and Iceberg readers at `--tier-secs 2`, 2026-10-11);
 - 3 to 4 seconds on a nearby R2 bucket, and 7 to 10 seconds on a far one, which is a few sequential
-  round trips to the bucket.
+  round trips to the bucket (measured earlier, in round 8).
 
 <Aside type="caution">
 The default is now `--tier-secs 10`, to write fewer objects. Other engines can be up to that much
@@ -179,8 +178,10 @@ Small writes don't make small objects, on disk or in a bucket.
 - **Batches.** A node puts everything it received into one flush per round. Flushes up to 64 KB (1 MB
   with replicated acks) ride inside the catalog commit and make no object at all.
 - **Tiering** writes one Parquet file per busy table per round.
-- **Append tables.** Once 8 files are small, they are merged 8 into 1, up to 4 million rows or 64 MB.
-  A table has at most about 8 small files, plus big ones.
+- **Append tables.** A small file is under 64 MB and under 4 million rows. Small files merge eight at a
+  time, and only with files of about their own size: under 4 MB, 4 to 16 MB, or 16 to 64 MB. A merged
+  file waits for others of its size, so a streaming table is not rewritten every minute. A table has
+  at most about eight small files of each size, plus big ones.
 - **Keyed tables** merge differently. [Keyed tables](/pondra/concepts/keyed-tables/) explains.
 - **Table metadata stays small.** A table's catalog entry lists at most 128 files. Past that, all but
   the newest 64 are sealed into manifests of up to 4,096 files each, behind one list object. A table
@@ -263,10 +264,17 @@ Rules for outside readers:
 - **Types.** Numbers, strings, booleans, dates, timestamps, binary, decimals and vector columns
   publish. `INT8` and `INT16` publish to Delta only. A table with a column type a format can't hold
   isn't published in that format.
-- **Keyed tables** are published when one file holds one row per key, which is after a full
-  compaction. `CHECKPOINT` compacts a published keyed table so other engines see it as it is now.
-- **Iceberg REST appends** go to append tables. Deletes, schema changes and writes to keyed tables
-  are refused by name.
+- **Keyed tables** publish in two ways. A plain upsert table (no `order_by`, no merge columns) publishes
+  every tiering round: its older versions and deletes become positions, so other engines see its rows as
+  they are now. A keyed table with `order_by` or merge columns (`MERGE sum`, and a GROUP BY view's table) publishes
+  only once it is one generation, which a full compaction makes, so other engines see it as of its last
+  compaction. `CHECKPOINT`
+  compacts a published keyed table so other engines see it as it is now.
+- **Writes through the Iceberg REST catalog** are recorded as the engine wrote them: appends, deletes,
+  overwrites and schema changes on append tables, and upserts and deletes on a plain keyed table. Equality
+  deletes and a snapshot that replaces files are refused by name, and so is any write to a keyed table
+  with `order_by` or merge columns. See
+  [Other engines](/pondra/guides/other-engines/).
 
 ## Design notes
 

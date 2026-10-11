@@ -14,7 +14,7 @@ Arrow, with nothing parsed or converted on the way. Two kinds of client use it:
 pondra serve lake --flight 0.0.0.0:8815
 ```
 
-Connect with `grpc://host:8815`, or `grpc+tls://host:8815` when the node has a certificate ([TLS](/pondra/guides/security/#tls)). A request can be as large as 1 GiB.
+With a certificate (`--tls-cert` and `--tls-key`), connect from other machines with `grpc+tls://host:8815`. A plain `grpc://` connection from another machine is closed, and plain is taken from this machine only (`PONDRA_TLS=optional` takes it from anywhere). See [TLS](/pondra/guides/security/#tls). A request can be as large as 1 GiB.
 
 ## Flight SQL
 
@@ -36,9 +36,10 @@ An error is a gRPC status near its meaning (`NOT_FOUND` for no such table, `FAIL
 for a `CHECK`, `ABORTED` for a conflict…), with Postgres's code in its metadata as
 `x-pondra-sqlstate`. ADBC shows it in the error's `details`.
 
-Anything else answers `Unimplemented`: prepared statements (so bound parameters too), keys and
-transactions. Put values in the SQL text instead. A statement's writes
-and queries follow the same [roles](/pondra/reference/http/#roles) as HTTP.
+Flight SQL's other commands are not implemented: prepared statements (so bound parameters too), keys,
+transactions and savepoints, and cancelling a query. Each answers `Unimplemented`. Put values in the
+SQL text instead, and use [HTTP](/pondra/reference/http/#run-sql) or the Postgres port for `BEGIN` … `COMMIT`.
+A statement's writes and queries follow the same [roles](/pondra/reference/http/#roles) as HTTP.
 
 ```python
 import adbc_driver_flightsql.dbapi as flightsql
@@ -246,7 +247,7 @@ for chunk in stream:
 {'user_id': [3, 4], 'amount': [4.0, 0.0]}
 {'user_id': [3, 4], 'amount': [4.0, 0.0]}
 {'user_id': [3, 4], 'amount': [4.0, 0.0]}
-{'after': 6}
+{'after': 7}
 ```
 
 With `follow` on, the stream stays open, so read it in a loop and stop when you have enough.
@@ -268,7 +269,7 @@ stream.cancel()
 
 ```text
 {'user_id': [9], 'amount': [1.0]}
-{'after': 7}
+{'after': 8}
 ```
 
 ## Describe and list
@@ -292,6 +293,12 @@ print(info.schema.names, info.endpoints[0].ticket.ticket)
 [b'users'] ['id', 'name']
 ['n'] b'{"sql": "SELECT count(*) AS n FROM events"}'
 ```
+
+## Calls it doesn't take
+
+`GetSchema`, `PollFlightInfo` and `DoExchange` answer `Unimplemented`, and `DoAction` refuses every
+action with `INVALID_ARGUMENT`. For a schema, call `GetFlightInfo` with a `{"sql": …}` or
+`{"table": …}` command, as above.
 
 ## Tokens
 

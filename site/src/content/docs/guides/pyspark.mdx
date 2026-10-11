@@ -114,21 +114,6 @@ w = Window.partitionBy("user").orderBy("id")
 3   4   cy  coffee    3    3.0    1       NaN
 ```
 
-## What's covered
-
-- **Session:** `sql`, `table`, `range`, `createDataFrame`, `read`, `catalog.listTables`, `udf.register`.
-- **DataFrame:** `select`, `selectExpr`, `filter`/`where`, `withColumn(s)`, `withColumnRenamed`, `drop`,
-  `groupBy` with `agg`/`count`/`sum`/`avg`/`min`/`max`, `orderBy`/`sort`, `limit`, `join`,
-  `crossJoin`, `union`, `unionByName`, `distinct`, `dropDuplicates`, `na.fill`/`na.drop`, `alias`,
-  `show`, `count`, `first`, `head`, `take`, `printSchema`, `explain`, `createOrReplaceTempView`.
-  `cache()` and `repartition()` do nothing: the lake is the cache.
-- **`functions`:** `col`, `lit`, `expr`, `when`/`otherwise`, `coalesce`, aggregates (`sum`, `avg`,
-  `count`, `countDistinct`, `min`, `max`, `first`, `last`, `stddev`, `collect_list`), string, math and
-  date functions (`date_trunc`, `to_date`, `datediff`, `concat`, `regexp_replace`, `substring`…),
-  and the ranking and offset functions (`row_number`, `rank`, `dense_rank`, `lag`, `lead`).
-- **Writers:** `mode`, `format`, `partitionBy`, `saveAsTable`, `insertInto`, `parquet`, `csv`,
-  `json`, `save`, and `delta`.
-
 ## Read and write files
 
 `spark.read` and `df.write` are Pondra's [files and other lakes](/pondra/guides/files-and-other-lakes/)
@@ -228,20 +213,6 @@ spark.sql("SELECT * FROM items_by_user ORDER BY user").toPandas()
 
 See [streaming](/pondra/guides/streaming/) for windows, sessions and stream joins.
 
-## Where it differs from PySpark
+## Every name
 
-Where PySpark's meaning differs from SQL's, the SQL says PySpark's: ascending sorts put nulls first,
-`/` divides as doubles, columns are named as PySpark names them (`sum(amount)`, `(price / 2)`),
-column names match whatever their case, and `concat` with a null is null.
-
-<Aside type="caution">
-
-- What isn't covered raises `NotImplementedError` naming the way round: RDDs (use DataFrame methods
-  or `spark.sql`), `pivot` (write a `CASE WHEN`), `readStream` (a materialized view),
-  `DeltaTable.forPath` (a Pondra table goes by name).
-- There is no Scala or Java client, no `SparkContext`, and no Spark Connect server.
-- `printSchema()` and `dtypes` show Arrow's type names (`int64`, `string_view`), not Spark's.
-- A UDF runs in Python on the nodes with the imports, helpers and constants it uses. Anything
-  else from your notebook (a DataFrame, a connection) is refused with the fix in the message.
-
-</Aside>
+[PySpark names](/pondra/reference/pyspark/) lists every name `pondra.spark` has, grouped by what it is for, each with an example, and [where Pondra differs from PySpark](/pondra/reference/pyspark/#where-it-differs-from-pyspark).

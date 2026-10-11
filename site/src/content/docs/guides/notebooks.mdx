@@ -27,8 +27,12 @@ db = pondra.local("notebook-lake")
 
 `pondra.local()` on its own uses `./lake`. To use a node that is already running, on a server or in a
 cluster, connect to it instead: `pondra.connect("http://host:8080", token=…)`. Either way the rest of the
-notebook is the same. Python [functions and procedures](/pondra/guides/functions-and-procedures/) run
-with the notebook's own Python.
+notebook is the same.
+
+[Python functions and procedures](/pondra/guides/functions-and-procedures/) written in a notebook run
+with the notebook's own Python only through `pondra.local()`, which starts the node with that Python.
+A node you `connect()` to runs them with the Python it was started with (`--python`). Without one, it
+refuses them.
 
 Make some data. Put a frame in the last line of a cell and the notebook shows its first rows as a
 table. Nothing runs until then, so a frame is cheap to build up:
