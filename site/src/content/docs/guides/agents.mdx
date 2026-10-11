@@ -1,0 +1,169 @@
+---
+title: AI agents (MCP)
+description: Connect Claude, Cursor or any MCP client to a node so it can list tables, query them, write through procedures you wrote and follow changes, with only the rights of its token.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+An AI agent reaches a node over the Model Context Protocol (MCP) at `POST /mcp`, on the node's HTTP port.
+This guide connects one and decides what it may do. The tools, their arguments and the wire format are in
+the [MCP reference](/pondra/reference/mcp/).
+
+## Connect a client
+
+Give the client the node's URL, `http://HOST:8080/mcp`. No flag is needed. With
+[tokens](/pondra/guides/security/#a-token-at-every-door) on, also send `Authorization: Bearer TOKEN`. From
+another machine, use `https://` when the node has a certificate; a plain request from another machine is
+refused.
+
+```bash norun
+# Claude Code
+claude mcp add --transport http pondra http://127.0.0.1:8080/mcp
+
+# with tokens on
+claude mcp add --transport http pondra https://node.example.com/mcp --header "Authorization: Bearer $PONDRA_READ_TOKEN"
+```
+
+Clients that read a settings file take the same two things, a URL and a header. For Cursor, in `mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "pondra": {
+      "url": "https://node.example.com/mcp",
+      "headers": { "Authorization": "Bearer <read token>" }
+    }
+  }
+}
+```
+
+Claude Desktop's settings file starts local programs, so it reaches a remote server through a bridge such
+as `mcp-remote`:
+
+```json
+{
+  "mcpServers": {
+    "pondra": {
+      "command": "npx",
+      "args": ["mcp-remote", "https://node.example.com/mcp", "--header", "Authorization: Bearer <read token>"]
+    }
+  }
+}
+```
+
+These are the settings the clients document; they aren't run here. The [Python check](#check-the-connection-from-python)
+below runs the same protocol with the official SDK.
+
+## Choose its token
+
+An agent has the rights of its token, and no more:
+
+- a **read** token: the agent lists the tables, queries them and follows changes;
+- a **write** token: also inserts, updates and deletes rows, and calls procedures;
+- an **admin** token: also creates, alters and drops tables, views and schemas.
+
+Start an agent with a read token. Give it a write token only for an agent that should change rows, and
+prefer a procedure to raw writes: a procedure does one job, with the rights you choose, as shown below.
+
+<Aside type="caution">
+An agent with a write token can insert, update and delete any row it can reach, and one with an admin token
+can drop tables. Both can do it in a loop, so give them only what their job needs.
+</Aside>
+
+## Start with the tables
+
+The node tells the agent to start with `list_tables`. It answers every table and view with its columns and
+its kind: `append`, `upsert` (a primary key: the newest row per key wins), `merge` (rows per key combine, as
+a sum does) or `view`. A view also gives its SQL, so the agent can see how it is built.
+
+## Find what the data means
+
+`find` searches tables, views, columns, keys, links and routines by their names, comments and definitions,
+best match first, so an agent asked about "revenue" finds the column whose comment says so. It takes
+other products' words too: "foreign key" finds Pondra's `link`. `kind` narrows it to one kind, such as
+`column`. It answers the rows of [`pondra.find`](/pondra/sql/system-tables/#parts-and-finding-things),
+and only what the agent's token may see. Comments on tables and columns (`COMMENT ON`) are what make it
+useful.
+
+## Query
+
+`query` runs one SQL query and answers the first 1000 rows and the total. A statement that writes is refused
+with `this is a write: use the write tool`. On an upsert table, `WHERE key = …` is a point lookup. For vector
+search, `ORDER BY cosine_distance(embedding, [0.1, …]) LIMIT k` (see [AI and files](/pondra/guides/ai-and-files/)).
+
+## Write
+
+`write` runs `INSERT`, `UPDATE`, `DELETE` and `CALL`, and, for an admin token, `CREATE`, `ALTER` and `DROP` of
+tables, views, materialized views and schemas. It is committed and durable when it answers. Give the write a
+`job` id: sent again with the same id, it is applied once, so an agent that loses an answer can ask again safely.
+
+## Give it a job: procedures
+
+A stored procedure is a tool of its own. Its name is the tool's name, its parameters are the tool's arguments,
+and its first comment line is the tool's description. Write the job as a procedure, and the agent calls it
+with its arguments instead of composing SQL:
+
+```sql
+CREATE TABLE tickets (id BIGINT PRIMARY KEY, status VARCHAR, note VARCHAR);
+INSERT INTO tickets VALUES (1, 'open', '');
+
+CREATE PROCEDURE close_ticket(id BIGINT, note VARCHAR DEFAULT 'closed by an agent') LANGUAGE sql AS $$
+-- Close a support ticket
+UPDATE tickets SET status = 'closed', note = $note WHERE id = $id;
+$$;
+```
+
+The agent sees `close_ticket` with `id` required and `note` optional. The procedure runs with the rights of
+the agent's token: a read token that calls it is refused by the `UPDATE`, as it would be anywhere else. The
+parameter types and the other parts of a tool are in the [reference](/pondra/reference/mcp/#procedures-as-tools).
+
+## Follow changes
+
+`changes` answers what was committed to a table after a position: every insert, update and delete, each row
+with its `_change_type`, `_row_id` and `_version`, and the `position` to ask from next. `after: 0` starts from
+the oldest change the node still keeps; leave `after` out to start from now. An agent that watches a table
+keeps the last `position` and asks from there. On a keyed table the change type is `upsert`.
+
+## When a tool fails
+
+A tool that fails doesn't stop the agent: it answers with `isError: true` and the reason, with Postgres's
+code in front (`SQLSTATE 23514: …` for a row that breaks a check). The agent can read it and act on it.
+
+- A transaction isn't kept across calls. `query` refuses `BEGIN` with `SQLSTATE 0A000`. Put the steps that
+  must succeed together in one procedure, and call it once.
+- What a procedure prints comes back as `notices` in its answer. If it fails after printing, the error says
+  what it printed (`it printed:`), so the agent sees how far it got.
+
+## Check the connection from Python
+
+The official MCP SDK does the handshake and the framing. It is a good way to test a node before you connect a
+client. This runs the procedure above and reads the table back:
+
+```python
+import asyncio
+import json
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+async def main():
+    async with streamablehttp_client("http://localhost:8080/mcp") as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            print([tool.name for tool in tools.tools])
+            closed = await session.call_tool("close_ticket", {"id": 1})
+            print(json.loads(closed.content[0].text))
+            ticket = await session.call_tool("query", {"sql": "SELECT id, status, note FROM tickets"})
+            print(json.loads(ticket.content[0].text)["rows"])
+            feed = await session.call_tool("changes", {"table": "tickets", "after": 0})
+            print([(row["status"], row["_change_type"]) for row in json.loads(feed.content[0].text)["rows"]])
+
+asyncio.run(main())
+```
+
+```text
+['list_tables', 'query', 'write', 'changes', 'find', 'close_ticket']
+{'rows': 1}
+[{'id': 1, 'status': 'closed', 'note': 'closed by an agent'}]
+[('open', 'upsert'), ('closed', 'upsert')]
+```
