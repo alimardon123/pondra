@@ -514,6 +514,36 @@ def p_column_name_call(spark, F, Window):  # Column.name("x") is alias("x") (PyS
     return spark.table("orders").where(F.col("id") <= 20).select(F.col("id").name("order_id"), F.col("qty").alias("q"))
 
 
+def p_sort_kept_through_steps(spark, F, Window):  # a sort survives withColumn and select that keep its columns
+    return (spark.table("orders").orderBy(F.desc("price"), F.asc("id"))
+            .withColumn("total", F.col("qty") * F.col("price"))
+            .select("id", "price", "total").limit(40))
+
+
+def p_sort_kept_through_rename(spark, F, Window):  # …and a rename: the sort follows the column's new name
+    return (spark.table("orders").orderBy("id").withColumnRenamed("id", "order_id")
+            .select("order_id", "user", "item").limit(25))
+
+
+def p_orderBy_after_select_dropped(spark, F, Window):  # PySpark sorts by a column a select dropped; Pondra refuses by name
+    return spark.table("orders").select("user", "item").orderBy("id").collect()
+
+
+def p_sort_replaced_refused(spark, F, Window):  # PySpark sorts by a column's old values after replacing it; Pondra refuses
+    return spark.table("orders").orderBy("id").withColumn("id", -F.col("id")).collect()
+
+
+def p_alias_qualified_columns(spark, F, Window):  # df.alias("o"): F.col("o.id") and df["x"] resolve in select and where
+    o = spark.table("orders").alias("o")
+    return (o.where(F.col("o.qty") > 15)
+            .select(F.col("o.id"), o["user"], o.item, F.col("o.price").alias("p")))
+
+
+def p_column_by_attribute(spark, F, Window):  # df.x and df["x"] in select, next to a plain name
+    orders = spark.table("orders")
+    return orders.where(F.col("id") <= 40).select(orders.id, orders["item"], orders.qty.alias("q"))
+
+
 def _row_class(spark):
     """PySpark's Row, or Pondra's, by the session that is asked."""
     if type(spark).__module__.startswith("pondra"):
@@ -608,6 +638,12 @@ PIPELINES = [
     ("column_name_call", False, "frame", p_column_name_call),
     ("row_repr_positional_and_named", None, "value", p_row_repr),
     ("stop_keeps_the_active_session", None, "self", self_stop_keeps_active),
+    ("sort_kept_through_steps", True, "frame", p_sort_kept_through_steps),
+    ("sort_kept_through_rename", True, "frame", p_sort_kept_through_rename),
+    ("orderBy_after_select_dropped_refused", None, "refused", p_orderBy_after_select_dropped),
+    ("sort_replaced_refused", None, "refused", p_sort_replaced_refused),
+    ("alias_qualified_columns", False, "frame", p_alias_qualified_columns),
+    ("column_by_attribute", False, "frame", p_column_by_attribute),
 ]
 
 

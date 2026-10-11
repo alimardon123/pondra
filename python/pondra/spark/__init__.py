@@ -40,6 +40,20 @@ def _name_sql(name):
     return _quote(name)
 
 
+def _is_column(sql, name):
+    """Is `sql` the column `name` itself (`id`, `"id"`), and not something made from it?"""
+    return sql.lower() in (_name_sql(name).lower(), _quote(name).lower())
+
+
+def _rekey(sql, name, new):
+    """A sort's text with its column renamed (`id DESC NULLS LAST` becomes `k DESC NULLS LAST`);
+    None when the text doesn't start with that column."""
+    for ref in (_name_sql(name), _quote(name)):
+        if sql.lower().startswith(ref.lower()):
+            return _name_sql(new) + sql[len(ref):]
+    return None
+
+
 # ---------------------------------------------------------------- columns
 
 class Column:
@@ -577,6 +591,7 @@ class DataFrame:
 
     def __init__(self, spark, frame, alias=None, join=None, lineage=()):
         self.spark, self._f, self._alias = spark, frame, alias or f"_d{next(_ids)}"
+        self._named = alias is not None  # (a name `alias()` gave: the steps after it keep the name)
         self._join = join  # (just joined: FROM clause, WHERE, SELECT — the aliases still in scope)
         self._lineage = {self._alias, *lineage}  # (the DataFrames joined into this one: `orders.o_orderkey` still means its column)
 
@@ -594,16 +609,48 @@ class DataFrame:
         return self[name]
 
     def _new(self, frame):
-        return DataFrame(self.spark, frame)
+        """The next DataFrame over `frame`; a name `alias()` gave it goes on with it."""
+        return DataFrame(self.spark, frame, alias=self._alias if self._named else None)
 
     def _step(self, select, where="", tail="", order=None):
-        """The next step: over the join's FROM if one was just made (its aliases in scope)."""
+        """The next step: over the join's FROM if one was just made (its aliases in scope). Otherwise
+        the columns are this frame's own, so the alias in their names goes (`_strip`)."""
         if self._join and not select.startswith(("*", "DISTINCT")):
             src, conds, _ = self._join
             w = " AND ".join([*conds, *([where] if where else [])])
             by = f" ORDER BY {', '.join(o for o, _ in order)}" if order else ""
             return self._new(self._f._with(f"SELECT {select} FROM {src}" + (f" WHERE {w}" if w else "") + by + tail, self._f._ctes, order=order))
+        select, where = _strip(select, self._alias), _strip(where, self._alias)
         return self._new(self._f._step(lambda r: f"SELECT {select} FROM {r}" + (f" WHERE {where}" if where else ""), order, tail))
+
+    def _sort_after(self, outs):
+        """The sort a step keeps. `outs` are the step's columns (`*`: every column as it is). A sorted
+        column the step keeps, or renames, keeps the sort (under its new name). One it drops ends the
+        sort: SQL drops a CTE's ORDER BY, so the steps after it don't sort. One it replaces is refused,
+        since PySpark sorts by the old values and the step no longer has them."""
+        order = self._f._order
+        if not order:
+            return None
+        explicit = [c for c in outs if c.sql != "*"]
+        kept = []
+        for sql, name in order:
+            own = [c for c in explicit if c._name.lower() == name.lower()]
+            if own and _is_column(own[0].sql, name):
+                kept.append((sql, name))
+            elif own:
+                raise NotImplementedError(f"orderBy({name}), then a step that replaces {name}: sort after the replacement. "
+                                          "PySpark sorts by the old values, which this step no longer has")
+            elif any(c.sql == "*" for c in outs):
+                kept.append((sql, name))
+            else:
+                moved = [c for c in explicit if _is_column(c.sql, name)]
+                if not moved:
+                    return None
+                new_sql = _rekey(sql, name, moved[0]._name)
+                if new_sql is None:
+                    return None
+                kept.append((new_sql, moved[0]._name))
+        return kept
 
     # what it is
     @property
@@ -623,7 +670,8 @@ class DataFrame:
 
     # columns
     def select(self, *cols):
-        return self._step(", ".join(_named(c) for c in _cols(cols)))
+        cs = _cols(cols)
+        return self._step(", ".join(_named(c) for c in cs), order=self._sort_after(cs))
 
     def selectExpr(self, *exprs):
         from .functions import expr
@@ -634,9 +682,11 @@ class DataFrame:
 
     def withColumns(self, cols):
         have = {c.lower(): c for c in self.columns}
-        replace = [f"{_as_val(c).sql} AS {_quote(have[n.lower()])}" for n, c in cols.items() if n.lower() in have]
-        new = [f"{_as_val(c).sql} AS {_quote(n)}" for n, c in cols.items() if n.lower() not in have]
-        return self._step(", ".join([f"* REPLACE ({', '.join(replace)})" if replace else "*", *new]))
+        made = [(have.get(n.lower(), n), _as_val(c)) for n, c in cols.items()]  # (the column's name, its value)
+        replace = [f"{v.sql} AS {_quote(n)}" for n, v in made if n.lower() in have]
+        new = [f"{v.sql} AS {_quote(n)}" for n, v in made if n.lower() not in have]
+        outs = [Column("*", "*"), *(Column(v.sql, n) for n, v in made)]
+        return self._step(", ".join([f"* REPLACE ({', '.join(replace)})" if replace else "*", *new]), order=self._sort_after(outs))
 
     def withColumnRenamed(self, old, new):
         return self.select(*[Column(_quote(c), new) if c.lower() == old.lower() else Column(_quote(c), c) for c in self.columns])
@@ -660,7 +710,7 @@ class DataFrame:
             src, conds, sel = self._join
             conds = [*conds, c.sql]
             return DataFrame(self.spark, self._f._with(f"SELECT {sel} FROM {src} WHERE {' AND '.join(conds)}", self._f._ctes), join=(src, conds, sel))
-        return self._new(self._f.filter(_strip(c.sql)))
+        return self._new(self._f.filter(_strip(c.sql, self._alias)))
 
     where = filter
 
@@ -668,7 +718,12 @@ class DataFrame:
         cs = _cols(cols)
         asc = ascending if isinstance(ascending, (list, tuple)) else [ascending] * len(cs)
         order = [(c._sort or (c.asc() if a else c.desc())._sort, c._name) for c, a in zip(cs, asc)]
-        return self._step("*", order=[(_strip(o), n) for o, n in order])
+        have = {c.lower() for c in self.columns}
+        for _, name in order:  # (a column a select before this dropped: PySpark still sorts by it; Pondra can't)
+            if _SIMPLE.match(name) and name.lower() not in have:
+                raise NotImplementedError(f"orderBy({name}): no column {name} here, a select before this dropped it. "
+                                          "Sort before the select, or keep the column in it")
+        return self._step("*", order=[(_strip(o, self._alias), n) for o, n in order])
 
     sort = orderBy
 
@@ -831,9 +886,11 @@ class DataFrame:
         return self._f.to_view(name, **kw)
 
 
-def _strip(sql):
-    """A column made from `df["x"]` names its DataFrame's alias; outside a join there is none."""
-    return re.sub(r"\b_d\d+\.", "", sql)
+def _strip(sql, alias=None):
+    """A column made from `df["x"]`, or from `F.col("o.x")` on `df.alias("o")`, names its DataFrame's
+    alias. Outside a join a step's columns are the frame's own, so the alias goes."""
+    names = [r"_d\d+", *([re.escape(alias)] if alias else [])]
+    return re.sub(rf"\b(?:{'|'.join(names)})\.", "", sql)
 
 
 class _Na:
@@ -872,8 +929,8 @@ class GroupedData:
             from . import functions as F
             exprs = [getattr(F, {"mean": "avg"}.get(fn, fn))(c) for c, fn in exprs[0].items()]
         cols = [*self.keys, *_cols(exprs)]
-        group = f" GROUP BY {', '.join(_strip(k.sql) if not self.df._join else k.sql for k in self.keys)}" if self.keys else ""
-        sel = ", ".join((_named(c) if self.df._join else _strip(_named(c))) for c in cols)
+        group = f" GROUP BY {', '.join(_strip(k.sql, self.df._alias) if not self.df._join else k.sql for k in self.keys)}" if self.keys else ""
+        sel = ", ".join((_named(c) if self.df._join else _strip(_named(c), self.df._alias)) for c in cols)
         return self.df._step(sel, tail=group)
 
     def count(self):
