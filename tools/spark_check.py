@@ -514,6 +514,40 @@ def p_column_name_call(spark, F, Window):  # Column.name("x") is alias("x") (PyS
     return spark.table("orders").where(F.col("id") <= 20).select(F.col("id").name("order_id"), F.col("qty").alias("q"))
 
 
+def _row_class(spark):
+    """PySpark's Row, or Pondra's, by the session that is asked."""
+    if type(spark).__module__.startswith("pondra"):
+        from pondra.spark import Row
+    else:
+        from pyspark.sql import Row
+    return Row
+
+
+def p_row_repr(spark, F, Window):  # positional rows print as <Row(…)>, named ones as Row(k=v)
+    R = _row_class(spark)
+    return [repr(R(1, "x")), repr(R(id=1, name="x")), repr(R())]
+
+
+def self_stop_keeps_active(_spark, F, Window):
+    """stop() of a session that isn't the active one leaves the active one be, and stop() of the
+    active one clears it. Pondra's contract alone: PySpark has one default session, nothing to compare."""
+    from pondra.spark import SparkSession as Session
+
+    class _Con:
+        def close(self):
+            pass
+
+    active, other = Session(_Con()), Session(_Con())
+    Session._active = active
+    try:
+        other.stop()
+        kept = Session.getActiveSession() is active
+        active.stop()
+        return kept and Session.getActiveSession() is None
+    finally:
+        Session._active = None
+
+
 PIPELINES = [
     ("select", False, "frame", p_select),
     ("selectExpr", False, "frame", p_select_expr),
@@ -572,6 +606,8 @@ PIPELINES = [
     ("udf_in_groupBy", False, "frame", p_udf_group_by),
     ("sha2_number_literal", False, "frame", p_sha2_number_literal),
     ("column_name_call", False, "frame", p_column_name_call),
+    ("row_repr_positional_and_named", None, "value", p_row_repr),
+    ("stop_keeps_the_active_session", None, "self", self_stop_keeps_active),
 ]
 
 
@@ -584,8 +620,50 @@ def _run_side(fn, spark, F, Window, kind):
     return None, val
 
 
+def _force(val):
+    """A DataFrame runs (both engines answer lazily); anything else is already a value."""
+    if hasattr(val, "collect"):
+        val.collect()
+
+
+def _raised(fn, spark, F, Window):
+    """How `fn` failed on one side (`Type: message`), or None if it didn't."""
+    try:
+        _force(fn(spark, F, Window))
+    except Exception as e:  # noqa: BLE001 (what it raised is the answer)
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
 def run_pipeline(name, ordered, kind, fn, real_spark, pon_spark):
+    """Kinds: `frame` and `value` (the same answer from both engines), `refused` (PySpark answers,
+    Pondra refuses by name with NotImplementedError), `raises` (both refuse the same call), `self`
+    (Pondra's own contract, no PySpark side: its answer is True)."""
     out = {"name": name}
+    if kind == "self":
+        try:
+            out["equal"] = bool(fn(None, PF, PWindow))
+        except Exception as e:  # noqa: BLE001
+            out["equal"], out["detail"] = False, f"pondra error: {type(e).__name__}: {e}"
+        out["names_equal"] = True
+        return out
+    if kind == "refused":
+        real = _raised(fn, real_spark, RF, RWindow)
+        if real is not None:
+            out["equal"], out["names_equal"], out["detail"] = False, False, f"pyspark error: {real}"
+            return out
+        pon = _raised(fn, pon_spark, PF, PWindow)
+        ok = pon is not None and pon.startswith("NotImplementedError:")
+        out["equal"], out["names_equal"] = ok, ok
+        out["refused"] = ok
+        out["detail"] = pon if ok else f"pondra did not refuse by name: {pon or 'it answered'}"
+        return out
+    if kind == "raises":
+        real, pon = _raised(fn, real_spark, RF, RWindow), _raised(fn, pon_spark, PF, PWindow)
+        out["equal"], out["names_equal"] = real is not None and pon is not None, True
+        if not out["equal"]:
+            out["detail"] = f"pyspark: {real or 'no error'}; pondra: {pon or 'no error'}"
+        return out
     try:
         real_names, real_data = _run_side(fn, real_spark, RF, RWindow, kind)
     except Exception as e:  # noqa: BLE001 (the failure itself is the report)
@@ -643,7 +721,8 @@ def main():
         results = [run_pipeline(name, ordered, kind, fn, real_spark, pon_spark) for name, ordered, kind, fn in pipelines]
         for r in results:
             print(json.dumps(r), flush=True)
-        summary = {"equal": sum(r["equal"] for r in results), "names_equal": sum(r["names_equal"] for r in results), "total": len(results)}
+        summary = {"equal": sum(r["equal"] for r in results), "names_equal": sum(r["names_equal"] for r in results),
+                   "refused": sum(bool(r.get("refused")) for r in results), "total": len(results)}
         print(json.dumps(summary), flush=True)
     finally:
         if real_spark is not None:

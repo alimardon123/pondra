@@ -268,7 +268,9 @@ class Row(tuple):
         return dict(zip(self.__fields__, self))
 
     def __repr__(self):
-        return "Row(" + ", ".join(f"{k}={v!r}" for k, v in zip(self.__fields__, self)) + ")"
+        if self.__fields__:
+            return "Row(" + ", ".join(f"{k}={v!r}" for k, v in zip(self.__fields__, self)) + ")"
+        return "<Row(" + ", ".join(repr(v) for v in self) + ")>"  # (PySpark's form for positional rows)
 
 
 # ---------------------------------------------------------------- the session
@@ -364,7 +366,8 @@ class SparkSession:
         return df
 
     def stop(self):
-        SparkSession._active = None
+        if SparkSession._active is self:  # (stopping another session leaves the active one be)
+            SparkSession._active = None
         self.con.close()
 
     @property
