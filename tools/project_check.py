@@ -61,7 +61,7 @@ elif sys.argv[1:] == ["api", "user", "-q", ".id"]:
 """
 
 
-def project_check(bin, work, port):
+def project_check(bin, work, port, checks):
     lakes, proj = os.path.join(work, "lakes"), os.path.join(work, "sales")
     os.makedirs(lakes, exist_ok=True)
     for name in ["prod", "empty"]:
@@ -125,7 +125,6 @@ def project_check(bin, work, port):
                 raise
             time.sleep(0.3)
 
-    checks = {}
     os.makedirs(proj)
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=proj, env=env, check=True)
     pondra("init")
@@ -401,8 +400,8 @@ def project_check(bin, work, port):
     if not checks["pondra status: a table renamed outside an apply with a column renamed (who and when), a view made, a view changed, none of them in what an apply does"]:
         checks["(status)"] = status
     cap = pondra("capture", "sales.memos", "sales.scratch", "sales.by_channel")
-    notes = open(os.path.join(proj, "objects/sales/notes.sql")).read()
-    channels = open(os.path.join(proj, "objects/sales/channels.sql")).read()
+    text = lambda rel: open(os.path.join(proj, rel)).read() if os.path.exists(os.path.join(proj, rel)) else ""
+    notes, channels = text("objects/sales/notes.sql"), text("objects/sales/channels.sql")
     migrations = glob.glob(os.path.join(proj, "migrations", "*-rename-memos.sql"))
     migration = open(migrations[0]).read() if len(migrations) == 1 else ""
     checks["pondra capture sales.memos sales.scratch sales.by_channel: each written into its file, the rename a migration recorded as run here"] = \
@@ -418,9 +417,9 @@ def project_check(bin, work, port):
         not any(w in plan for w in ["sales.notes", "sales.memos", "sales.scratch", "sales.by_channel", "rename-memos"]) and "sales.big" in plan and "changed outside an apply" in plan
     if not checks["pondra plan after the capture: nothing about notes, memos, scratch, by_channel or their migration; sales.big still changed outside an apply"]:
         checks["(plan)"] = plan
-    pondra("apply", "prod")
-    checks["pondra apply prod: the migration runs there, the rows renamed, the view made on the new name"] = \
-        rows("prod", "SELECT count(*), min(text) FROM sales.memos") == [(3, "a")] and rows("prod", "SELECT n FROM sales.scratch") == [(3,)]
+    applied = pondra("apply", "prod", ok=None)
+    checks["pondra apply prod: the migration runs there, the rows renamed, the view made on the new name"] = "Error:" not in applied \
+        and rows("prod", "SELECT count(*), min(text) FROM sales.memos") == [(3, "a")] and rows("prod", "SELECT n FROM sales.scratch") == [(3,)]
     # A view made here and captured, then a view dropped here: `pondra status` says it was dropped outside an apply.
     # The view must be in an apply first (what an apply made is what status compares with), which also puts
     # sales.big's drift back.
@@ -445,7 +444,7 @@ def project_check(bin, work, port):
     clean = pondra("status")
     checks["pondra status: a column added outside an apply listed, not refused; captured, nothing about the table"] = \
         any("~ table" in l and "sales.memos" in l and "added tag" in l for l in added.splitlines()) and "refused" not in added \
-        and "sales.memos" not in clean and "tag" in open(os.path.join(proj, "objects/sales/notes.sql")).read()
+        and "sales.memos" not in clean and "tag" in text("objects/sales/notes.sql")
     if not checks["pondra status: a column added outside an apply listed, not refused; captured, nothing about the table"]:
         checks["(added)"] = [added, clean]
     os.remove(os.path.join(proj, "objects/sales/channels.sql"))
@@ -630,10 +629,11 @@ def main():
     a = ap.parse_args()
     work = a.work or tempfile.mkdtemp(prefix="pondra-project-")
     os.makedirs(work, exist_ok=True)
+    checks = {}  # (filled as it goes: a step that raises keeps the checks before it)
     try:
-        checks = project_check(os.path.abspath(a.new), work, a.port)
+        project_check(os.path.abspath(a.new), work, a.port, checks)
     except Exception as e:
-        checks = {"ran to the end": False, "error": str(e)}
+        checks.update({"ran to the end": False, "error": str(e)})
     finally:
         # (by the binary's own name: a copy under another name escapes `pgrep -x pondra`)
         for p in subprocess.run(["pgrep", "-x", os.path.basename(a.new)[:15]], capture_output=True, text=True).stdout.split():
