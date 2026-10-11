@@ -29,6 +29,9 @@ pub fn open(name: &str) -> String { format!("{name}$open") }
 
 /// `CREATE MATERIALIZED VIEW … EMIT FINAL`: the statement without its last two words.
 pub fn emit_final(sql: &str) -> Option<String> {
+    if crate::write::head(sql) != "create" {
+        return None;
+    }
     static END: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+(?:OR\s+REPLACE\s+)?MATERIALIZED\s+VIEW\b.*?)\s+EMIT\s+FINAL\s*;?\s*$").expect("a regex"));
     END.captures(sql).map(|c| c[1].to_string())
 }

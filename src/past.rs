@@ -293,6 +293,9 @@ async fn when(lake: &Lake, spec: &Spec) -> Result<At> {
 /// `_row_id` kept), a row made since goes, a row deleted since comes back as a new row. It is a
 /// change like any, so it can be undone the same way. None: not a RESTORE.
 pub async fn restore(lake: &Lake, sql: &str) -> Result<Option<String>> {
+    if crate::write::head(sql) != "restore" {
+        return Ok(None);
+    }
     static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"(?is)^\s*RESTORE\s+(?:TABLE\s+)?([\w."-]+)\s+(?:TO\s+)?(VERSION|TIMESTAMP)\s+AS\s+OF\s+(.+?)\s*;?\s*$"#).expect("a regex")
     });
