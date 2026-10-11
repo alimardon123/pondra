@@ -697,19 +697,23 @@ async fn run() -> anyhow::Result<()> {
                 });
                 // Tier as soon as new rows commit — other engines see them in the Delta log a moment
                 // later — but at most once every `tier_secs`, and at least every 5 × that (bulk
-                // inserts, compaction, retention).
+                // inserts, compaction, retention). A quiet commit (the statements' history, every
+                // second while anyone queries: `store::quiet`) waits for that: woken by it, the
+                // round's pace held a lake's next write back up to `tier_secs` (freshness.py: Delta
+                // and Iceberg 1 s after the ack instead of 30 ms).
                 if tier_secs > 0.0 {
                     let (a, mut hwm, period) = (app.clone(), lake.hwm.subscribe(), Duration::from_secs_f64(tier_secs));
                     panics::spawn(async move {
                         loop {
-                            let start = tokio::time::Instant::now();
+                            let (start, seen) = (tokio::time::Instant::now(), a.lake.cat.version());
                             hwm.borrow_and_update();
                             let failed = a.tier_all(0).await.inspect_err(|e| eprintln!("background job failed: {e:#}")).is_err();
                             tokio::time::sleep_until(start + period).await;
                             // (right away if rows came meanwhile; a round that failed, say on a full
                             // disk, is tried again then too, not only once more rows come)
                             if !failed {
-                                let _ = tokio::time::timeout(period * 4, hwm.changed()).await;
+                                let loud = async { while hwm.changed().await.is_ok() && a.lake.cat.version() == seen {} };
+                                let _ = tokio::time::timeout(period * 4, loud).await;
                             }
                         }
                     });

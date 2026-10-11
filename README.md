@@ -190,10 +190,13 @@ SELECT user, sum(amount) FROM delta_scan('s3://my-bucket/lake/data/events') GROU
 SELECT count(*) FROM iceberg_scan('s3://my-bucket/lake/data/events/metadata/v42.metadata.json');
 ```
 
-Other engines read the table as of the last tiering round:
+Other engines read the table as of the last tiering round, which runs as soon as rows commit,
+at most once every `--tier-secs` (10 by default). A write after a quiet spell is there:
 
 - ~30 ms after the ack on local disk;
-- 3–10 s on R2 at the default `--tier-secs 2`, depending on how far away the bucket is.
+- 3–10 s after it on R2, depending on how far away the bucket is.
+
+Under a steady stream of writes, add up to `--tier-secs`.
 
 **And they append to it** through the node's Iceberg REST catalog, as they would through Polaris
 or Unity Catalog (Pondra's own catalog stays the one that counts):
