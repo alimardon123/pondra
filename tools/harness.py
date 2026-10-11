@@ -6645,7 +6645,8 @@ def server():
     port, pg = A.port, A.port + 10
     env = {**os.environ, "PONDRA_DATABASE_IDLE_SECS": "3"}
     def start(how=()):
-        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log = open(f"/tmp/pondra-{port}-server-{uuid.uuid4().hex[:6]}.stderr", "w")  # (its databases' nodes write here too: CI keeps it when a check fails)
+        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5"], env=env, stdout=subprocess.DEVNULL, stderr=log)
         until(lambda: _try(lambda: call(port, "GET", "/databases") is not None), True, 30)
         return p
     srv = start()
@@ -6756,6 +6757,7 @@ def server():
     print(json.dumps({"server": checks, "ok": ok, "first_write_s": first_write}, indent=1))
     if not ok:
         print(missing[:300], idle, joined)
+        print(json.dumps({"seen": seen}, default=str)[:4000])  # (what each database answered whom)
         sys.exit(1)
     return f"server: a folder of lakes as databases over Postgres and HTTP, created, dropped, idle-stopped, joined, restarted: all {len(checks)} checks pass"
 
