@@ -98,56 +98,50 @@ struct Attach {
     kind: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+/// What an apply makes: an object of the registry's (`objects::KINDS`: its word and its order), or what
+/// pondra.toml and GRANTs say, which aren't objects.
+#[derive(Clone, Copy, Debug)]
 enum Kind {
-    Schema,
-    Role,
-    Secret,
+    Object(&'static crate::objects::Kind),
     Attach,
-    Table,
-    Function,
-    Macro,
-    View,
-    Materialized,
-    Procedure,
-    Task,
     Grant,
 }
+
+impl PartialEq for Kind {
+    fn eq(&self, other: &Kind) -> bool { self.word() == other.word() }
+}
+
+impl Eq for Kind {}
 
 impl Kind {
     fn word(self) -> &'static str {
         match self {
-            Kind::Schema => "schema",
-            Kind::Role => "role",
-            Kind::Secret => "secret",
+            Kind::Object(k) => k.name,
             Kind::Attach => "attach",
-            Kind::Table => "table",
-            Kind::Function => "function",
-            Kind::Macro => "macro",
-            Kind::View => "view",
-            Kind::Materialized => "materialized view",
-            Kind::Procedure => "procedure",
-            Kind::Task => "task",
             Kind::Grant => "grant",
         }
     }
 
+    /// The kind a word names, if a project may declare it.
     fn of(word: &str) -> Option<Kind> {
-        [Kind::Schema, Kind::Role, Kind::Secret, Kind::Attach, Kind::Table, Kind::Function, Kind::Macro, Kind::View, Kind::Materialized, Kind::Procedure, Kind::Task, Kind::Grant].into_iter().find(|k| k.word() == word)
+        match word {
+            "attach" => Some(Kind::Attach),
+            "grant" => Some(Kind::Grant),
+            _ => crate::objects::kind(word).filter(|k| k.project.is_none()).map(Kind::Object),
+        }
     }
+
+    /// A kind by a word this file uses (the registry has it, and a project declares it).
+    fn named(word: &str) -> Kind { Kind::of(word).expect("a kind a project declares") }
+
+    fn is(self, word: &str) -> bool { self.word() == word }
 
     /// The order things are made in: what others name first.
     fn rank(self) -> u8 {
         match self {
-            Kind::Schema => 0,
-            Kind::Role => 1,
-            Kind::Secret | Kind::Attach => 2,
-            Kind::Table => 3,
-            Kind::Function | Kind::Macro => 4,
-            Kind::View | Kind::Materialized => 5,
-            Kind::Procedure => 6,
-            Kind::Task => 7,
-            Kind::Grant => 8,
+            Kind::Object(k) => k.order,
+            Kind::Attach => 3, // (with secrets: before the tables that may read a database)
+            Kind::Grant => 10, // (last: a grant names what the others made)
         }
     }
 
@@ -156,7 +150,7 @@ impl Kind {
         match self {
             Kind::Grant => revoke(&format!("GRANT {name}")),
             Kind::Attach => format!("DETACH {}", quoted(name)),
-            k => format!("DROP {} {}", k.word().to_uppercase(), quoted(name)),
+            Kind::Object(_) => format!("DROP {} {}", self.word().to_uppercase(), quoted(name)),
         }
     }
 }
@@ -194,11 +188,11 @@ impl Project {
     fn holds(&self, k: &str) -> bool {
         let (word, name) = split_key(k);
         let schema = |kind: Kind, name: &str| match kind {
-            Kind::Schema | Kind::Role | Kind::Secret | Kind::Attach | Kind::Grant => None,
-            _ => Some(name.split_once('.').map_or(crate::ddl::PUBLIC, |(s, _)| s).to_string()),
+            Kind::Object(k) if matches!(k.family, "relation" | "routine" | "task" | "type") => Some(name.split_once('.').map_or(crate::ddl::PUBLIC, |(s, _)| s).to_string()),
+            _ => None,
         };
         let Some(theirs) = Kind::of(word).and_then(|kind| schema(kind, name)) else { return false };
-        self.objects.iter().any(|d| schema(d.kind, &d.name).as_ref() == Some(&theirs) || (d.kind == Kind::Schema && d.name == theirs))
+        self.objects.iter().any(|d| schema(d.kind, &d.name).as_ref() == Some(&theirs) || (d.kind.is("schema") && d.name == theirs))
     }
 }
 
@@ -280,28 +274,43 @@ fn head(sql: &str) -> Result<Option<(Kind, String)>> {
     let kind = match (word(i).as_str(), word(i + 1).as_str()) {
         ("materialized", "view") => {
             i += 1;
-            Kind::Materialized
+            Kind::named("materialized view")
         }
         ("external", "table") => {
             i += 1;
-            Kind::View // (a view of files: `CREATE EXTERNAL TABLE`)
+            Kind::named("view") // (a view of files: `CREATE EXTERNAL TABLE`)
         }
-        ("schema", _) => Kind::Schema,
-        ("role", _) => Kind::Role,
-        ("secret", _) => Kind::Secret,
-        ("table", _) => Kind::Table,
-        ("view", _) => Kind::View,
-        ("function", _) => Kind::Function,
-        ("macro", _) => Kind::Macro,
-        ("procedure", _) => Kind::Procedure,
-        ("task", _) => Kind::Task,
-        (w, _) => bail!("CREATE {}: a project declares {} and grants", w.to_uppercase(), declarable()),
+        ("unique", "index") => bail!("a UNIQUE goes in its table's statement (UNIQUE (a, b)), so a project keeps it with the table"),
+        (w, _) => match Kind::of(w).filter(|k| matches!(k, Kind::Object(_))) {
+            Some(kind) => kind,
+            None => bail!("CREATE {}: a project declares {} and grants", w.to_uppercase(), declarable()),
+        },
     };
     i += 1;
     if word(i) == "if" && word(i + 1) == "not" && word(i + 2) == "exists" {
         i += 3;
     }
-    let mut parts = vec![];
+    let (parts, last) = dotted(&solid, i)?;
+    let name = if kind.is("index") {
+        // (an index is in its table's schema: its name is the table's, and the table comes after ON)
+        ensure!(parts.len() == 1, "an index is named without a schema: it is in its table's");
+        ensure!(word(last + 1) == "on", "a project names an index as CREATE INDEX name ON table (column)");
+        let table = dotted(&solid, last + 2)?.0;
+        ensure!(table.len() <= 2, "{}: a project names objects without their database (sales.orders), as each environment is one", table.join("."));
+        crate::ddl::join(if table.len() == 2 { table[0].as_str() } else { crate::ddl::PUBLIC }, &parts[0])
+    } else {
+        match &parts[..] {
+            [t] => t.clone(),
+            [s, t] if !kind.is("schema") => crate::ddl::join(s, t),
+            _ => bail!("{}: a project names objects without their database (sales.orders), as each environment is one", parts.join(".")),
+        }
+    };
+    Ok(Some((kind, name)))
+}
+
+/// A name's parts from token `at` (`sales.orders` is two), and the token its last part is at.
+fn dotted(solid: &[&Token], at: usize) -> Result<(Vec<String>, usize)> {
+    let (mut parts, mut i) = (vec![], at);
     loop {
         match solid.get(i) {
             Some(Token::Word(w)) => parts.push(if w.quote_style.is_some() { w.value.clone() } else { w.value.to_lowercase() }),
@@ -309,15 +318,9 @@ fn head(sql: &str) -> Result<Option<(Kind, String)>> {
         }
         match solid.get(i + 1) {
             Some(Token::Period) => i += 2,
-            _ => break,
+            _ => return Ok((parts, i)),
         }
     }
-    let name = match &parts[..] {
-        [t] => t.clone(),
-        [s, t] if kind != Kind::Schema => crate::ddl::join(s, t),
-        _ => bail!("{}: a project names objects without their database (sales.orders), as each environment is one", parts.join(".")),
-    };
-    Ok(Some((kind, name)))
 }
 
 /// A statement's fingerprint: its tokens, comments, spacing, case, `OR REPLACE`, `IF NOT EXISTS` and
@@ -356,8 +359,9 @@ fn fingerprint(sql: &str, values: &HashMap<String, Value>, secrets: &BTreeMap<St
 /// they don't name each other).
 fn ordered(mut all: Vec<Declared>) -> Vec<Declared> {
     all.sort_by_key(|d| d.kind.rank()); // (stable: as written within a kind)
-    let (mut out, mut views): (Vec<Declared>, Vec<Declared>) = all.into_iter().partition(|d| d.kind.rank() != Kind::View.rank());
-    let at = out.iter().position(|d| d.kind.rank() > Kind::View.rank()).unwrap_or(out.len());
+    let view = Kind::named("view").rank();
+    let (mut out, mut views): (Vec<Declared>, Vec<Declared>) = all.into_iter().partition(|d| d.kind.rank() != view);
+    let at = out.iter().position(|d| d.kind.rank() > view).unwrap_or(out.len());
     let mut done: Vec<Declared> = vec![];
     while !views.is_empty() {
         let names: Vec<String> = views.iter().map(|v| v.name.clone()).collect();
@@ -402,7 +406,7 @@ async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
         out.insert(key(kind, name), Current { sql, meta });
     };
     for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != crate::ddl::PUBLIC) {
-        put(Kind::Schema, &s, format!("CREATE SCHEMA {}", ident(&s)), None);
+        put(Kind::named("schema"), &s, format!("CREATE SCHEMA {}", ident(&s)), None);
     }
     let materialized: BTreeMap<String, crate::views::View> = lake.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().map(|(k, v)| (k[2..].to_string(), v)).collect();
     for (k, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
@@ -412,33 +416,47 @@ async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
             continue;
         }
         let m = meta.logical();
-        put(Kind::Table, name, table_sql(&quoted(name), &m), Some(m));
+        put(Kind::named("table"), name, table_sql(&quoted(name), &m), Some(m));
+    }
+    for (k, s) in lake.cat.scan::<crate::seq::Sequence>("sq/", "sq0").await? {
+        if s.owned.is_none() {
+            // (an identity column's goes with its table, as its statement says)
+            put(Kind::named("sequence"), &k[3..], crate::seq::create_sql(&quoted(&k[3..]), &s), None);
+        }
+    }
+    for (k, i) in lake.cat.scan::<crate::index::Index>("ix/", "ix0").await? {
+        let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(&i.table)).await?;
+        let sql = crate::index::create_sql(&ident(crate::ddl::split(&k[3..]).1), &quoted(&i.table), &i, meta.as_ref());
+        put(Kind::named("index"), &k[3..], sql, None);
+    }
+    for (k, t) in lake.cat.scan::<crate::types::Type>("ty/", "ty0").await? {
+        put(Kind::named("type"), &k[3..], crate::types::create_sql(&quoted(&k[3..]), &t), None);
     }
     for (name, v) in &materialized {
         let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(name)).await?;
-        put(Kind::Materialized, name, materialized_sql(&quoted(name), v, meta.as_ref()), None);
+        put(Kind::named("materialized view"), name, materialized_sql(&quoted(name), v, meta.as_ref()), None);
     }
     for (k, v) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
         let name = &k[2..];
-        put(Kind::View, name, format!("CREATE VIEW {} AS\n{}", quoted(name), v.sql.trim()), None);
+        put(Kind::named("view"), name, format!("CREATE VIEW {} AS\n{}", quoted(name), v.sql.trim()), None);
     }
     for (name, r) in crate::routines::listed(lake).await?.iter() {
         let kind = match r.what() {
-            "procedure" => Kind::Procedure,
-            "macro" => Kind::Macro,
-            _ => Kind::Function,
+            "procedure" => Kind::named("procedure"),
+            "macro" => Kind::named("macro"),
+            _ => Kind::named("function"),
         };
         put(kind, name, routine_sql(&quoted(name), r), None);
     }
     for (name, t) in crate::runs::tasks(lake).await?.iter() {
-        put(Kind::Task, name, task_sql(&quoted(name), t), None);
+        put(Kind::named("task"), name, task_sql(&quoted(name), t), None);
     }
     for (k, u) in lake.cat.scan::<crate::users::User>("u/", "u0").await? {
         let name = &k[2..];
         if u.login {
             continue; // (a user is the environment's, not the project's)
         }
-        put(Kind::Role, name, format!("CREATE ROLE {}", ident(name)), None);
+        put(Kind::named("role"), name, format!("CREATE ROLE {}", ident(name)), None);
     }
     Ok(out)
 }
@@ -486,9 +504,9 @@ pub async fn export(lake: &Lake) -> Result<BTreeMap<String, String>> {
     };
     for (k, c) in &now {
         let (word, name) = k.split_once(' ').map(|(w, n)| if w == "materialized" { ("materialized view", &n[5..]) } else { (w, n) }).unwrap_or(("", k));
-        let path = match Kind::of(word) {
-            Some(Kind::Schema) => "objects/schemas.sql".to_string(),
-            Some(Kind::Role) => "objects/access.sql".to_string(),
+        let path = match word {
+            "schema" => "objects/schemas.sql".to_string(),
+            "role" => "objects/access.sql".to_string(),
             _ => {
                 let (s, t) = crate::ddl::split(name);
                 if s == crate::ddl::PUBLIC { format!("objects/{t}.sql") } else { format!("objects/{s}/{t}.sql") }
@@ -538,7 +556,7 @@ pub struct Step {
 fn change_of(mark: &str, kind: Kind) -> &'static str {
     match mark {
         "+" => "create",
-        "~" if kind == Kind::Table => "alter",
+        "~" if kind.is("table") => "alter",
         "~" => "replace",
         "↻" => "rebuild",
         "▶" => "migrate",
@@ -630,23 +648,23 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
         let step = |mark, what: &str, sql: Vec<String>| Step { mark, change: change_of(mark, d.kind), kind: d.kind.word().into(), name: d.name.clone(), what: what.into(), sql };
         let Some(cur) = now.get(&k) else {
             // (grants, secrets and attachments aren't read back: compared with what the last apply made)
-            match (d.kind, mine.get(&k)) {
-                (Kind::Grant, Some(_)) => continue,
-                (Kind::Attach | Kind::Secret, Some((was, _))) if *was == d.print => continue,
-                (Kind::Attach, Some(_)) => {
+            match (d.kind.word(), mine.get(&k)) {
+                ("grant", Some(_)) => continue,
+                ("attach" | "secret", Some((was, _))) if *was == d.print => continue,
+                ("attach", Some(_)) => {
                     steps.push(step("~", "replaced", vec![d.kind.drop(&d.name), d.sql.clone()]));
                     continue;
                 }
                 _ => {}
             }
-            let mut sql = vec![if d.kind == Kind::Secret { or_replace(&d.sql) } else { d.sql.clone() }];
-            if d.kind == Kind::Task && branch {
+            let mut sql = vec![if d.kind.is("secret") { or_replace(&d.sql) } else { d.sql.clone() }];
+            if d.kind.is("task") && branch {
                 sql.push(format!("ALTER TASK {} SUSPEND", quoted(&d.name))); // (a branch's tasks start suspended)
             }
             steps.push(step("+", "made", sql));
             continue;
         };
-        if d.kind == Kind::Table {
+        if d.kind.is("table") {
             match table_change(lake, d, cur.meta.as_ref().expect("a table's meta")).await {
                 Ok(sql) if sql.is_empty() => {}
                 Ok(sql) => steps.push(step("~", &sql.iter().map(|s| s.splitn(4, ' ').nth(3).unwrap_or_default()).collect::<Vec<_>>().join("; "), sql)), // (ALTER TABLE t ADD COLUMN c: ADD COLUMN c)
@@ -660,16 +678,16 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
             true => was == d.print && then == print(&cur.sql),
             false => print(&cur.sql) == d.print,
         };
-        if same || matches!(d.kind, Kind::Schema | Kind::Role) {
+        if same || matches!(d.kind.word(), "schema" | "role") {
             continue;
         }
         let drift = mine.contains_key(&k) && was == d.print;
         let what = if drift { "changed outside an apply: made as the project says" } else { "replaced" };
-        match d.kind {
-            Kind::Materialized => {
+        match d.kind.word() {
+            "materialized view" => {
                 // Made again from the rows already there, with every view that follows it.
                 let follow: Vec<&Declared> = followers(lake, &p.objects, &d.name).await?;
-                if let Some(missing) = follow.iter().find(|f| f.kind != Kind::Materialized) {
+                if let Some(missing) = follow.iter().find(|f| !f.kind.is("materialized view")) {
                     refused.push(format!("{} follows {} and isn't in the project as a materialized view", missing.name, d.name));
                     continue;
                 }
@@ -688,10 +706,21 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
                 steps[at].sql = sql; // (the view's step runs them all, in order)
             }
             _ if rebuilt.contains(&d.name) => {}
-            Kind::Attach => steps.push(step("~", what, vec![d.kind.drop(&d.name), d.sql.clone()])),
+            "attach" => steps.push(step("~", what, vec![d.kind.drop(&d.name), d.sql.clone()])),
+            "sequence" => steps.push(step("~", what, vec![alter_sequence(&d.sql)])), // (keeps its next value)
+            "index" => steps.push(step("~", what, vec![d.kind.drop(&d.name), d.sql.clone()])), // (nothing is built: made again)
+            "type" => {
+                // A label can only be added at the end: a file keeps the labels it was written with.
+                let (had, want) = (labels(&cur.sql), labels(&d.sql));
+                if !want.starts_with(&had) {
+                    refused.push(format!("type {}: a type's labels only grow at the end (ALTER TYPE … ADD VALUE): files are never rewritten", d.name));
+                } else if want.len() > had.len() {
+                    steps.push(step("~", what, want[had.len()..].iter().map(|l| format!("ALTER TYPE {} ADD VALUE {}", quoted(&d.name), text(l))).collect()));
+                }
+            }
             _ => {
                 let mut sql = vec![or_replace(&d.sql)];
-                if d.kind == Kind::Task && branch {
+                if d.kind.is("task") && branch {
                     sql.push(format!("ALTER TASK {} SUSPEND", quoted(&d.name)));
                 }
                 steps.push(step("~", what, sql));
@@ -710,10 +739,10 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
     }
     gone.reverse(); // (what was made last goes first)
     steps.extend(gone);
-    // In the order they run: what is added (objects made, tables' columns), then the migrations
+    // In the order they run: what is added (objects made, tables' columns, enum labels), then the migrations
     // (a backfill finds its column, a first apply's rows their table), then what is replaced or
     // dropped (planned again after them: a rename makes a table match its declaration).
-    let (mut first, rest): (Vec<Step>, Vec<Step>) = steps.into_iter().partition(|s| s.mark == "+" || s.mark == "~" && s.kind == "table");
+    let (mut first, rest): (Vec<Step>, Vec<Step>) = steps.into_iter().partition(|s| s.mark == "+" || s.mark == "~" && (s.kind == "table" || s.kind == "type"));
     first.extend(pending.iter().map(|(f, text)| match new {
         true => Step { mark: "▶", change: "record", kind: "migration".into(), name: f.clone(), what: "recorded, not run: a new database is made as the files are now".into(), sql: vec![] },
         false => Step { mark: "▶", change: "migrate", kind: "migration".into(), name: f.clone(), what: "runs once".into(), sql: vec![text.clone()] },
@@ -757,6 +786,25 @@ fn or_replace(sql: &str) -> String {
     }
 }
 
+/// A sequence's statement with its head (`CREATE [OR REPLACE] SEQUENCE [IF NOT EXISTS]`) made `ALTER
+/// SEQUENCE`: its options change, and its next value stays. Comments before the head stay.
+fn alter_sequence(sql: &str) -> String {
+    static HEAD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^((?:\s|--[^\n]*|/\*.*?\*/)*)CREATE\s+(?:OR\s+REPLACE\s+)?SEQUENCE\s+(?:IF\s+NOT\s+EXISTS\s+)?").expect("a regex"));
+    HEAD.replace(sql, "${1}ALTER SEQUENCE ").into_owned()
+}
+
+/// The labels of an enum type's statement, in order: `CREATE TYPE t AS ENUM ('a', 'it''s')` gives
+/// `a` and `it's` (the tokenizer reads the doubled quote).
+fn labels(sql: &str) -> Vec<String> {
+    let tokens = Tokenizer::new(&GenericDialect {}, sql).tokenize().unwrap_or_default();
+    let solid: Vec<Token> = tokens.into_iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
+    let at = solid.iter().position(|t| matches!(t, Token::Word(w) if w.value.eq_ignore_ascii_case("enum"))).map_or(solid.len(), |i| i + 1);
+    solid[at..].iter().take_while(|t| !matches!(t, Token::RParen)).filter_map(|t| match t {
+        Token::SingleQuotedString(s) => Some(s.clone()),
+        _ => None,
+    }).collect()
+}
+
 /// The project's materialized views that follow `name` here, in the order they're made.
 async fn followers<'a>(lake: &Lake, objects: &'a [Declared], name: &str) -> Result<Vec<&'a Declared>> {
     let views: BTreeMap<String, crate::views::View> = lake.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().map(|(k, v)| (k[2..].to_string(), v)).collect();
@@ -770,7 +818,7 @@ async fn followers<'a>(lake: &Lake, objects: &'a [Declared], name: &str) -> Resu
     }
     let mut out = vec![];
     for n in &set[1..] {
-        match objects.iter().find(|d| d.name == *n && matches!(d.kind, Kind::Materialized | Kind::View)) {
+        match objects.iter().find(|d| d.name == *n && matches!(d.kind.word(), "materialized view" | "view")) {
             Some(d) => out.push(d),
             None => bail!("{n} follows {name} and isn't in the project: declare it, or drop it first"),
         }
@@ -1202,19 +1250,24 @@ mod tests {
     #[test]
     fn heads() {
         let h = |s: &str| head(s).unwrap().unwrap();
-        assert_eq!(h("CREATE TABLE Sales.Orders (id BIGINT)"), (Kind::Table, "sales.orders".into()));
-        assert_eq!(h("create or replace materialized view public.big as select 1"), (Kind::Materialized, "big".into()));
-        assert_eq!(h("-- the rate\nCREATE MACRO IF NOT EXISTS \"Rate\"(x) AS x * 2"), (Kind::Macro, "Rate".into()));
-        assert_eq!(h("CREATE EXTERNAL TABLE logs STORED AS PARQUET LOCATION 'x/'"), (Kind::View, "logs".into()));
+        assert_eq!(h("CREATE TABLE Sales.Orders (id BIGINT)"), (Kind::named("table"), "sales.orders".into()));
+        assert_eq!(h("create or replace materialized view public.big as select 1"), (Kind::named("materialized view"), "big".into()));
+        assert_eq!(h("-- the rate\nCREATE MACRO IF NOT EXISTS \"Rate\"(x) AS x * 2"), (Kind::named("macro"), "Rate".into()));
+        assert_eq!(h("CREATE EXTERNAL TABLE logs STORED AS PARQUET LOCATION 'x/'"), (Kind::named("view"), "logs".into()));
+        assert_eq!(h("CREATE INDEX by_day ON sales.orders (day)"), (Kind::named("index"), "sales.by_day".into()));
+        assert_eq!(h("CREATE INDEX IF NOT EXISTS by_id ON orders (id)"), (Kind::named("index"), "by_id".into()));
+        assert_eq!(h("CREATE SEQUENCE sales.n"), (Kind::named("sequence"), "sales.n".into()));
+        assert_eq!(h("CREATE TYPE mood AS ENUM ('a')"), (Kind::named("type"), "mood".into()));
         assert_eq!(h("GRANT SELECT ON TABLE t TO analyst").0, Kind::Grant);
+        assert!(head("CREATE UNIQUE INDEX u ON t (a)").unwrap_err().to_string().contains("UNIQUE (a, b)"));
+        assert!(head("CREATE INDEX sales.idx ON sales.orders (day)").unwrap_err().to_string().contains("without a schema"));
         assert!(head("INSERT INTO t VALUES (1)").unwrap_err().to_string().contains("migrations/"));
         assert!(head("CREATE USER ann").unwrap_err().to_string().contains("environment's"));
         assert!(head("CREATE SHARE acme").unwrap_err().to_string().contains("shares and recipients"));
         assert!(head("CREATE RECIPIENT acme_corp").unwrap_err().to_string().contains("shares and recipients"));
         assert!(head("GRANT SELECT ON SHARE acme TO RECIPIENT acme_corp").unwrap_err().to_string().contains("shares and recipients"));
         assert!(head("CREATE TABLE prod.sales.orders (id INT)").unwrap_err().to_string().contains("without their database"));
-        assert!(head("CREATE SEQUENCE ids").unwrap_err().to_string().contains("sequences aren't declared"));
-        assert!(matches!(head("CREATE TABLE function (id INT)"), Ok(Some((Kind::Table, _)))));
+        assert!(matches!(head("CREATE TABLE function (id INT)"), Ok(Some((k, _))) if k.is("table")));
         assert!(head("-- only a comment").unwrap().is_none());
     }
 
@@ -1232,11 +1285,27 @@ mod tests {
 
     #[test]
     fn order() {
-        let d = |kind, name: &str, sql: &str| Declared { kind, name: name.into(), sql: sql.into(), file: String::new(), print: String::new() };
-        let all = ordered(vec![d(Kind::Task, "t", ""), d(Kind::Materialized, "b", "SELECT * FROM a"), d(Kind::Materialized, "a", "SELECT * FROM orders"), d(Kind::Table, "orders", ""), d(Kind::Schema, "s", "")]);
+        let d = |word: &str, name: &str, sql: &str| Declared { kind: Kind::named(word), name: name.into(), sql: sql.into(), file: String::new(), print: String::new() };
+        let all = ordered(vec![d("task", "t", ""), d("materialized view", "b", "SELECT * FROM a"), d("materialized view", "a", "SELECT * FROM orders"), d("table", "orders", ""), d("schema", "s", "")]);
         assert_eq!(all.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["s", "orders", "a", "b", "t"]);
+        let all = ordered(vec![d("index", "by_day", ""), d("sequence", "n", ""), d("table", "orders", ""), d("type", "mood", "")]);
+        assert_eq!(all.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["n", "mood", "orders", "by_day"]); // (a sequence or type before the tables that use it; an index after its table)
         assert_eq!(revoke("GRANT SELECT ON TABLE t TO analyst"), "REVOKE SELECT ON TABLE t FROM analyst");
         assert_eq!(or_replace("CREATE VIEW v AS SELECT 1"), "CREATE OR REPLACE VIEW v AS SELECT 1");
         assert_eq!(quoted("sales.order"), "sales.\"order\"");
+    }
+
+    #[test]
+    fn a_sequence_is_altered_and_keeps_its_next_value() {
+        assert_eq!(alter_sequence("CREATE SEQUENCE n"), "ALTER SEQUENCE n");
+        assert_eq!(alter_sequence("create or replace sequence if not exists sales.n increment by 2"), "ALTER SEQUENCE sales.n increment by 2");
+        assert_eq!(alter_sequence("-- the ids: one per order\nCREATE SEQUENCE sales.n START WITH 5"), "-- the ids: one per order\nALTER SEQUENCE sales.n START WITH 5");
+    }
+
+    #[test]
+    fn enum_labels_are_read_as_written() {
+        assert_eq!(labels("CREATE TYPE mood AS ENUM ('sad', 'it''s', 'ok')"), ["sad", "it's", "ok"]);
+        assert_eq!(labels("-- an enum (not a label)\nCREATE TYPE enum AS ENUM ()"), Vec::<String>::new());
+        assert_eq!(text("it's"), "'it''s'");
     }
 }

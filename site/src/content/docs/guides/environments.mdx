@@ -165,7 +165,7 @@ database match it, and `pondra plan` shows what that would change first:
 
 - `pondra.toml`: the project's name and its environments;
 - `objects/`: `CREATE` statements (tables, views, materialized views, functions, macros, procedures,
-  tasks, secrets, roles) and `GRANT`s, in any layout, several to a file;
+  tasks, secrets, roles, sequences, indexes and enum types) and `GRANT`s, in any layout, several to a file;
 - `migrations/`: one-off steps, such as a rename or a backfill, each run once in each database, in
   name order, after the objects and columns an apply adds and before what it replaces. A new database
   is made as `objects/` says now, so there they are recorded as run, not run;
