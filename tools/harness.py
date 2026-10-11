@@ -528,6 +528,8 @@ def loads():
         first8["rows"] == 2 and [l["file"].rsplit("/", 1)[1] for l in second8["loaded"]] == ["b.csv"] and second8["rows"] == 1
         and [r["file"].rsplit("/", 1)[1] for r in left8] == ["b.csv"] and r8("SELECT count(*) AS n, sum(amount) AS s FROM t8") == [{"n": 3, "s": 60}])
     n8.kill()
+    for n in nodes:  # (the next section starts its own on these ports)
+        n.kill()
     print(json.dumps(checks, indent=1, ensure_ascii=False))
     if not all(checks.values()):
         sys.exit(1)
