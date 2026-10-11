@@ -88,7 +88,9 @@ src/      62,500 lines of Rust in 108 files, one per concern (see the table in R
           ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043) and history.rs (every
           statement a row of `pondra.history`, slow ones with plans and traces, ADR-048); round 34
           friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225), objects.rs
-          (one registry of every kind of object: ADR-049, invariant 227), seq.rs (sequences and
+          (one registry of every kind of object: ADR-049, invariant 227), find.rs (`pondra.parts` and
+          `pondra.find`: every part of every object, and one search of objects, parts and concepts;
+          ADR-065, invariant 345), seq.rs (sequences and
           identity columns: invariant 234), index.rs (indexes kept as objects: invariant 235),
           constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236),
           types.rs (enum types: invariant 242), and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
@@ -2060,6 +2062,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and a name this lake can't resolve go on to their own paths. `harness.py objects`: "an INSERT into a
    name no table has is refused…"; `doors`: "an INSERT into no table, 42P01" at every door;
    `history_check.py`: "an INSERT under a renamed table's old name is refused…".
+345. **`pondra.parts` and `pondra.find` show only what the caller may see** (`find::parts`, `find::found`):
+   parts come only from the objects `objects::list` gave the caller; a user granted some columns of a table
+   sees those columns and no other part of it, and that table's definition is not shown. Neither is a
+   remembered answer. `harness.py find`: "a user granted one table…", "a user granted some columns…",
+   "never a remembered answer…".
 370. **A term's lock file says at once, on its machine only, that its claimer's process ended**
    (`cluster::new_lock`, `gone_here`, `relock`). A claim takes an OS lock (`File::try_lock`) on
    `{id}.lock` in the user's own folder of the temporary folder (`pondra-terms-{uid}`, 0700, used
@@ -2144,6 +2151,7 @@ python3 tools/harness.py sequences      # nextval on three nodes (every value on
 python3 tools/harness.py enums          # CREATE TYPE … AS ENUM and ENUM('a', 'b') columns: labels from every door (22P02), casts, enum_range, ADD VALUE, RENAME, DROP while used
 python3 tools/harness.py constraints    # UNIQUE from every door and three nodes at once (23505), NOT ENFORCED facts, ADD/DROP CONSTRAINT, SHOW CREATE, the Postgres catalog
 python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
+python3 tools/harness.py find           # pondra.parts and pondra.find at every door (HTTP, Postgres, MCP, Python, JavaScript), as each user may see them; 1,000 tables and 200 views
 python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals

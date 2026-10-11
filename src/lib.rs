@@ -40,6 +40,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod friendly;
 #[cfg(feature = "server")] mod flight;
 #[cfg(feature = "server")] mod fresh;
+#[cfg(feature = "server")] mod find;
 #[cfg(feature = "server")] mod git;
 #[cfg(feature = "server")] mod hot;
 #[cfg(feature = "server")] mod index;

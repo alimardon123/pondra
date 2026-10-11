@@ -69,7 +69,7 @@ is `designs/one-month-to-1-0.md` in the project's files). Rounds 17 to 33 are re
 | L2 | In-process and in the browser | `pondra.open(…)` in Python and Node (B1, B2); the browser build against DuckDB-WASM (B4); JavaScript frames, `write_table` and `read_*`; idle memory and a cold first answer; then B5 |
 | L3 | The Postgres port and the tools on it | pgbench scaling with clients and a one-row INSERT nearer Postgres; the BI tools checked, a SQLAlchemy dialect and a dbt adapter; the doors' gaps |
 | L4 | Sources and outside catalogs | Postgres's changes streamed in (G6); `COPY INTO` (G11); `read_xml` (G10); Glue, S3 Tables and vended credentials; Kafka partitions; then sinks (G7) and MySQL |
-| L5 | Semantic layer and AI | `pondra.parts` and `pondra.find`; measures in views (E13); the ontology's core (E14); `CREATE MODEL` and the six `ai_*` functions (ADR-051 phase 1); then volumes, the `FILE` column, pictures and PDFs |
+| L5 | Semantic layer and AI | `pondra.parts` and `pondra.find` (done: #76); measures in views (E13); the ontology's core (E14); `CREATE MODEL` and the six `ai_*` functions (ADR-051 phase 1); then volumes, the `FILE` column, pictures and PDFs |
 | L6 | SQL language | every new spelling reviewed; sqllogictest and the random queries held; refusals that say what to write; then the SQL 1.0 keeps stable |
 | L7 | Durability, safety and shipping | CI's capacity; the soak's other legs; a lake whose only node died writable at once; the security review; signing, Homebrew and winget; an upgrade guide; what 1.0 keeps stable |
 | L8 | Console and shell (from 10-18) | the console's backlog; the shell as a new user meets it; then views over what L3 to L5 landed, and the Ontology view |
