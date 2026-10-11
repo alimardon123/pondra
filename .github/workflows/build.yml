@@ -13,7 +13,7 @@ name: build
 # and `full-ci` every platform but macOS Intel, once before it merges (macOS Intel's build is the
 # slowest by far, 31 to 50 minutes, and is main's alone). Decided from the labels alone, so a
 # push that asks for nothing never waits for a runner to say so; a newer push stops the older run.
-# Two pull requests' runs go at once: a third waits, holding no runner, until ci-slots.yml starts it.
+# Four pull requests' runs go at once: a fifth waits, holding no runner, until ci-slots.yml starts it.
 on:
   push:
     branches: [main]
@@ -95,19 +95,20 @@ jobs:
             if [ "$FULL" = true ] && grep -qE '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)' <<< "$files"; then deploy=true; else deploy=false; fi
             printf 'upgrade=true\nresilience=%s\nsharing=%s\ndeploy=%s\n' "$resilience" "$sharing" "$deploy" >> "$GITHUB_OUTPUT"
             echo "After the build: upgrade$([ "$resilience" = false ] || echo ', resilience')$([ "$sharing" = false ] || echo ', sharing')$([ "$deploy" = false ] || echo ', deploy')." >> "$GITHUB_STEP_SUMMARY"
-            # At most two pull requests' CI at once (Alimardon, 2026-10-03): with two older runs of
-            # other pull requests going, this one waits. It builds nothing, its check `waiting for a
+            # At most four pull requests' CI at once (two from 2026-10-03; four from 2026-10-11, for the
+            # month's eight lanes; ci-slots.yml's SLOTS says the same): with four older runs of other
+            # pull requests going, this one waits. It builds nothing, its check `waiting for a
             # CI slot` fails, it holds no runner, and ci-slots.yml starts it again when a run ends.
             # (If the API can't be asked, it runs: a slot is never worth a stuck pull request.)
             going=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?event=pull_request&per_page=100" \
               --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and .status != \"completed\" and (.pull_requests[0].number // 0) != $PR)] | length") || going=0
-            if [ "$going" -ge 2 ]; then
+            if [ "$going" -ge 4 ]; then
               echo wait=true >> "$GITHUB_OUTPUT"
-              echo "Waiting for a CI slot: $going other pull requests' runs are going (two at a time). ci-slots.yml starts this run again when one ends." >> "$GITHUB_STEP_SUMMARY"
+              echo "Waiting for a CI slot: $going other pull requests' runs are going (four at a time). ci-slots.yml starts this run again when one ends." >> "$GITHUB_STEP_SUMMARY"
             fi
           fi
 
-  # A pull request over the two at a time: red until it runs, so nobody takes it for passed.
+  # A pull request over the four at a time: red until it runs, so nobody takes it for passed.
   slot:
     name: waiting for a CI slot
     needs: plan
@@ -115,7 +116,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - run: |
-          echo "::error title=Waiting for a CI slot::Two other pull requests' CI runs are going, and only two run at once. This run starts again by itself when one ends (ci-slots.yml): nothing to do."
+          echo "::error title=Waiting for a CI slot::Four other pull requests' CI runs are going, and only four run at once. This run starts again by itself when one ends (ci-slots.yml): nothing to do."
           exit 1
 
   # linux-x64 first, on its own: the suite and the tests after the build need its packages alone,
