@@ -9,8 +9,8 @@ same way every round, so a drop is seen before a release rather than after.
   and DuckDB on the files; every answer checked against DuckDB's (`bench/singlenode.py`).
 - **postgres**: key lookups, single-row inserts and TPC-H Q1 and Q6 against Postgres
   (`bench/vs_postgres.py`), on a Postgres this starts for the run.
-- **nexmark**: five Nexmark queries over 2M bids, answers checked against DuckDB's
-  (`bench/nexmark.py`).
+- **nexmark**: Nexmark's 20 queries as views over 2M events, all at once, answers checked against
+  DuckDB's (`bench/nexmark.py`; five queries over 2M bids before round 34, so `all_s` is new).
 - **pgbench**: pgbench's own TPC-B script through the Postgres port, 1 and 4 clients, retried on
   40001; the balances must agree (`bench/pgbench.py`).
 
@@ -105,11 +105,11 @@ def postgres(a, day):
 
 
 def nexmark(a, day):
-    r = subprocess.run([sys.executable, os.path.join(HERE, "bench", "nexmark.py"), "--engines", "pondra"], capture_output=True, text=True, timeout=3600,
+    r = subprocess.run([sys.executable, os.path.join(HERE, "bench", "nexmark.py"), "--events", "2000000", "--engines", "pondra"], capture_output=True, text=True, timeout=3600,
                        env={**os.environ, "PONDRA_BIN": a.bin})
     open(os.path.join(LOGS, f"{day}-nexmark.txt"), "w").write(r.stdout + r.stderr)
     got = json.loads(r.stdout.strip().splitlines()[-1])
-    return {"secs": got["secs"], "bids_per_s": got["bids_per_s"], "answers": got["same_as_duckdb"]}
+    return {"all_s": got["secs"], "events_per_s": got["events_per_s"], "answers": not got["wrong"] and not got["refused"]}
 
 
 def pgbench(a, day):
@@ -142,7 +142,7 @@ def drops(now, before):
         out.append("pgbench: balances wrong")
     if g(now, "nexmark", "answers") is False:
         out.append("Nexmark: answers differ from DuckDB's")
-    n, b = g(now, "nexmark", "secs"), g(before, "nexmark", "secs")
+    n, b = g(now, "nexmark", "all_s"), g(before, "nexmark", "all_s")
     if n and b and n > b * 1.15:
         out.append(f"Nexmark: {n} s, {b} s before")
     return out
@@ -156,7 +156,7 @@ def row(day, binary, r, note):
     mem = cell(t, f"{t.get('memory_s')} s")
     files = cell(t, f"{t.get('files_s')} s")
     duck = cell(t, f"{t.get('duckdb_own_s')} s / {t.get('duckdb_files_s')} s")
-    extra = [f"Nexmark 2M bids {n['secs']} s, answers {'right' if n['answers'] else 'WRONG'}"] if n.get("secs") else []
+    extra = [f"Nexmark's 20 queries over 2M events {n['all_s']} s, answers {'right' if n['answers'] else 'WRONG'}"] if n.get("all_s") else []
     pb = r.get("pgbench", {})
     if pb.get("runs"):
         extra.append("pgbench " + ", ".join(f"{x['clients']}c {x['tps']:.0f} tps" for x in pb["runs"]) + f", balances {'right' if pb['balances_right'] else 'WRONG'}")

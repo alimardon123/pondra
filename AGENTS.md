@@ -89,10 +89,15 @@ src/      55,200 lines of Rust in 101 files, one per concern (see the table in R
           types.rs (enum types: invariant 242), and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
           237–239); learned.rs (what a run learned about its filters, ADR-050: invariant 244);
           environments (ADR-047): branch.rs (`CREATE DATABASE dev CLONE prod`, REFRESH: invariant
-          245), deploy.rs (plan, deploy, test and export: a project made true in a database;
-          `pondra.deploys`: invariants 246–250), project.rs (the command line's project commands,
-          `pondra ci init` and `pondra dev`), protect.rs (a protected database: invariant 266) and
-          sync.rs (`pondra workspace pull | push`); views kept current (ADR-055, ADR-056, ADR-059):
+          245), apply.rs (plan, apply, test and export: a project made true in a database;
+          `pondra.applies`: invariants 246–250, 279), project.rs (the command line's project commands:
+          branch, switch, apply; a project's `objects/` (sequences, indexes and enum types too), `migrations/`,
+          `seeds/` and `tests/`), ci.rs
+          (`pondra ci init`), path.rs (`USE` and a session's search path: invariant 275), protect.rs
+          (a protected database: invariant 266), sync.rs (`pondra workspace pull | push`), git.rs (Git
+          folders: a workspace folder paired with a GitHub branch, ADR-060 §8: invariant 282) and status.rs
+          (`pondra status` and `pondra capture`: ADR-060 §7, invariant 280); views kept current (ADR-055,
+          ADR-056, ADR-059):
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
@@ -150,7 +155,8 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           a release), sign.py (macOS and Windows signing once the certificates are set),
           upgrade_check.py (every release's lake opens, formats, the drain, rolling upgrades),
           soak.py (C4's soak), faulty_s3.py (an S3 proxy that errs, loses replies, slows, holds and
-          goes down), resilience_check.py (every mode under failure)
+          goes down), resilience_check.py (every mode under failure), git_check.py (Git folders against
+          fake_github.py, a stand-in for GitHub's REST API)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
 ```
 
@@ -599,7 +605,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 50. **A new table starts at the log's end** (`create_table`: `tiered = lake.visible()`). A table's
    log rows are those after `tiered`; starting at 0, a table re-created after `DROP TABLE` read
    the dropped one's rows still in the log (`harness.py schemas`: "a new table of its name is
-   empty" fails without it).
+   empty" fails without it). A table an INSERT makes starts there too (`write::record`):
+   `history_check.py`'s "an INSERT under a renamed table's old name makes a table of its own rows only".
 51. **A node plans stored views after its shares are in place** (`spmd::plan`:
    `query::register_views` again). A `ViewTable` keeps the table it was planned over; planned
    over whole tables, a spread query over a view counted every row once per node
@@ -1560,7 +1567,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    row, and refuses by name what it can't do by adding at the end or widening. A kind's entry says
    what code used to keep in lists of its own: its catalog prefix, its privileges, what a clone does
    with it (`OnClone`: copy, pin or leave; `branch::make` leaves what it says), why a project can't
-   declare it (`deploy::head` asks the entry), whether it holds a secret, a line about it and other
+   declare it (`apply::head` asks the entry), whether it holds a secret, a line about it and other
    products' names; `PARTS` and `PATTERNS` beside it, and `pondra.kinds` and `GET /kinds` one list of
    all three (`objects::rows`), from which the glossary is written (`docs_check.py --write-glossary`;
    a stale one fails). `pondra.objects` lists the attached lakes' objects of every family a lake
@@ -1648,7 +1655,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    every SQL write to a table with an enforced UNIQUE goes to the change path (`write::changes`),
    whose `constraints::check` runs under the lake's lock against the table at `visible()`, and the
    sequencer takes that table's rows only from a flush the change path made (`Flush::checked`,
-   never sent between nodes; `constraints::sequenced`). The other doors refuse the table by name. A
+   never sent between nodes; the sequencer's check, `log::commit`). The other doors refuse the table by name. A
    UNIQUE added to a table is committed before the rows there are checked (with one flush through
    the sequencer between, so those sequenced before it are in), and put back if two share a value.
    Without `checked`, an `ALTER TABLE … ADD CONSTRAINT` raced by a node that hadn't seen it would let
@@ -1709,25 +1716,25 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `environments_check.py`: "ALTER DATABASE dev REFRESH t: t and its view as prod has them now",
    "…what dev writes after it is newer: an upsert wins through tiering, row ids stay unique, prod
    unchanged".
-246. **A deploy applies the plan it showed, one at a time per database** (`deploy::ask`: the plan's id
+246. **An apply applies the plan it showed, one at a time per database** (`apply::ask`: the plan's id
    is a hash of its steps; `dl` held and kept fresh while it runs, stale after 120 s; each statement
    under the job part `deploy:{project}:{n}:…`). `project_check.py`: "a plan shown before someone
-   else deployed: refused, plan again", "deployed again: nothing to change".
+   else applied: refused, plan again", "applied again: nothing to change…".
 247. **An object has one owner, and a table changes in place only in ways that keep its rows**
-   (`deploy::plan`: owners from deploys that succeeded; `table_change`: columns added at the end,
+   (`apply::plan`: owners from applies that succeeded; `table_change`: columns added at the end,
    widened types, options; a rename, drop, move, key or partition change is refused with the
    migration to write and the views that read it, `ddl::readers`). `project_check.py`: "another
    project declaring this one's view: refused, naming its owner", "a renamed column: refused, saying
    the migration and what reads it".
-248. **A migration runs once in each database, after what a deploy adds and before what it replaces**
+248. **A migration runs once in each database, after what an apply adds and before what it replaces**
    (`dm/{project}/{file}`, committed after it runs; the rest of the plan is made again after the
-   migrations, `plan_again`). `project_check.py`: "a renamed column: … with it, deployed, the views
+   migrations, `plan_again`). `project_check.py`: "a renamed column: … with it, applied, the views
    made again".
-249. **A fingerprint never holds a secret** (`deploy::fingerprint`: a secret's value as
+249. **A fingerprint never holds a secret** (`apply::fingerprint`: a secret's value as
    `secret:<sha256>`); secrets are never exported.
 250. **Shares and recipients are each database's own** (`branch::make` leaves `sh/` and `sr/` out;
    REFRESH copies only tables and what follows them; plan and export never list them;
-   `deploy::head` refuses `CREATE SHARE`, `CREATE RECIPIENT` and `GRANT … ON SHARE` in `objects/`).
+   `apply::head` refuses `CREATE SHARE`, `CREATE RECIPIENT` and `GRANT … ON SHARE` in `objects/`).
    `environments_check.py`: "…and no REFRESH brings prod's shares or recipients…";
    `project_check.py`: "prod's shares and recipients: never in a plan, even pruning…".
 251. **A rollup's keys are its GROUP BY view's keys, and the columns they determine**
@@ -1854,17 +1861,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    behind the entries an attached lake's changed row went missing (336 of 607 reads on main
    2801b4d); with an entry read before a table's first UPDATE and its log read past it, a leader too
    kept both versions. `harness.py attached` (55 wrong reads on 0.33.0).
-266. **In a protected database, a project's objects change only through a deploy by a holder of
-   DEPLOY, and lifting the protection is an admin's, audited** (`protect.rs`, `deploy::authorize`,
+266. **In a protected database, a project's objects change only through an apply by a holder of
+   APPLY, and lifting the protection is an admin's, audited** (`protect.rs`, `apply::authorize`,
    ADR-058). `protect::door`, where every statement comes in (`write::on_node_listed`,
    `write::from_cli`, and for a user's direct call `server::ddl` and `create_table`), refuses a change
-   to anything a project's last finished deploy declared (`deploy::declared`), unless
-   `protect::DEPLOYING` is set. Only a deploy sets it, from its claim to its record (tests included),
+   to anything a project's last finished apply declared (`apply::declared`), unless
+   `protect::APPLYING` is set. Only an apply sets it, from its claim to its record (tests included),
    and a procedure it calls back through gets it for that call alone. Its matches over `Stmt` and
    `Ddl` have no `_` arm: a new kind says what it touches. The flag lives in `z/protect`, which a
    branch never copies. `environments_check.py`: "an admin's DROP, CREATE OR REPLACE and ALTER of a
    project's table or view, and of its role's grants, are refused by name", "the cluster's own door
-   refuses it too…", "a superuser without DEPLOY can't deploy a protected database; ci's deploy
+   refuses it too…", "a superuser without APPLY can't apply a protected database; ci's apply
    changes it".
 267. **A node keeps few blocking threads** (`panics::runtime`, both runtimes): at most four a core (16
    at least, `PONDRA_BLOCKING_THREADS`), each gone after a second idle. On a local lake every file
@@ -1874,6 +1881,153 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    live heap stayed at 80–90 MB. Windows keeps tokio's 512, since a child's pipes hold blocking
    threads there. `harness.py memory`: "keeps at most four blocking threads a core" fails with
    `PONDRA_BLOCKING_THREADS=512`.
+268. **A branch is its maker's, and the shared ones are CI's** (`branch::door`, ADR-060 §5): CLONE is
+   enough to make one; its maker is stamped where the statement comes in and is a superuser in it;
+   only its owner or an admin drops it, and test's and `pr-N`'s are dropped by CI alone.
+   `environments_check.py` (`owners_check`).
+269. **A database is made when a command needs it, and a kept one is kept** (`project::made`,
+   `ask_node`): a branch and test are cloned with `CREATE DATABASE IF NOT EXISTS … CLONE`, so a second
+   apply finds test as QA left it; only `--fresh` drops it first; prod is made empty on its first
+   apply. `project_check.py`: "apply test: kept…", "--fresh…", "prod: a new database…".
+270. **A branch's tasks wait to be resumed** (`runs::create_task`): in a lake with a base, a task made
+   is suspended unless the one it replaces was resumed. `environments_check.py`: "a task dev makes
+   starts suspended too…".
+271. **Another database's files are read with a quarter of the node's turns at that bucket**
+   (`budget::share`, from `store::add_base`), so a branch's reads never take more than that from its
+   base's bucket. `environments_check.py --across`: "ali reads prod's files with a quarter of a node's
+   turns…".
+272. **A token is never on a command line** (`ci::gh`): `pondra ci init` gives `gh` each token on its
+   standard input, where `ps` can't see it. `project_check.py`: "no token in gh's arguments".
+273. **Whoever may clone an attached database lends its key** (`ext::lent`, ADR-058): the branch keeps
+   the attachment's read-only key though its maker has no USAGE on it, since CLONE is the grant and
+   the branch can't read its base without it. `environments_check.py --across`: "a user of dev granted
+   CLONE ON DATABASE prod (attached) branches it on dev…"; `layout_b_check`: "pr-1 is made on dev's
+   server from prod with ci's token…".
+274. **A base on another server is compared where it is attached** (`project::across`,
+   `apply::export_attached`): `pondra diff` reads its objects through `GET /export?database=` on the
+   branch's server, which CLONE on it allows, and its rows there. `environments_check.py`
+   (`layout_b_check`): "pondra diff pr-1 with ci's token on dev: the new view…".
+275. **A session's search path is written into its statements where SQL comes in, and nowhere else**
+   (`path.rs`: `path::door`, from `routines::expand` and `prepare` and the Postgres port's `run` and
+   `describe`): `USE s | db | db.s`, `SET search_path` and `SET SCHEMA` set it, a session's alone
+   (Flight SQL, MCP and `pondra sql` refuse it by name). A one-part name becomes the full name of
+   the first place on the path that has it (the first place for a new one), and `current_database()`
+   and `current_schema()` their values, so the result cache, a spread query, the leader's writes, a
+   task's body, a view's stored SQL and history see full names and need no session. Stored SQL is
+   read with `routines::expand_stored`, without the reader's path: a view made under `USE crm`
+   reads crm whoever reads it, one made in public reads public under `USE crm`. CTEs, temporary
+   tables, tables sent along, files (`'x.csv'`), Postgres's catalog, and routines and types nothing
+   on the path has stay as written; with no path the text is untouched. `harness.py use`: "the
+   result cache isn't fooled…", "a view keeps its names…".
+276. **A branch's key is sealed, and its pin in another server is a lease** (`branch::seal_keys`,
+   `Base::seal`, `branch::renew`, `branch::lapse` in `tier::expire`): a `pb_` key is kept sealed by the
+   master key wherever one is shared; a branch made without one keeps it in the clear until its leader
+   starts with one, then seals it. The branch's leader renews each pin in another server every
+   `PONDRA_PIN_RENEW_SECS` (3600), and the base lets go of a pin not renewed for
+   `PONDRA_PIN_LEASE_SECS` (14 days): prod can't look at dev's bucket, so a branch whose server is gone
+   stops holding prod's files. `environments_check.py`: "ali's key to its pin in prod is kept sealed…",
+   "…ali's pin is a lease that dev renews…", "a branch on another server nobody renews (dev stopped)
+   has its pin let go after its lease…", "a branch whose key was kept in the clear… has it sealed when
+   its own leader starts with one…".
+277. **The key a branch was lent reads its base and nothing else** (`ext::Secret.lent`, `ext::usable`,
+   `ext::reach_base`): only a branch opening or being made reaches its base's folder with it; no
+   statement can use it, even with USAGE granted, so a clone of one schema can't read another's files
+   by URL. `environments_check.py`: "the key ali was lent reads its base for ali's tables alone…".
+278. **A brand-new database is made as the files are now** (`apply::new_database`, `Project::holds`):
+   nothing in the project's schemas and nothing applied (or only first applies that failed), never a
+   clone. Its migrations are recorded as run, never run, and `seeds/` load once, each under the job
+   `seed:{project}:{file}`. `project_check.py`: "a new database made after the rename (apply local,
+   its lake gone): the migration recorded, not run, and the seed's rows loaded"; prod (which holds
+   another schema first) gets its seed on its first apply.
+279. **An apply's kinds are the registry's, and each changes only as its data allows** (`apply::Kind` over
+   `objects::KINDS`: `project`, `order`): every kind `GET /kinds` says a project may declare goes through
+   export and apply, so a new kind fails `project_check.py` until a project declares it. A sequence changes
+   by `ALTER SEQUENCE` (its next value kept; an option taken away refused), an enum type gains labels only
+   at the end, an index is made again, and an index is named in its table's schema.
+   `project_check.py`: "every kind a project may declare was exported and applied…", "a sequence, a type
+   and an index changed…", "…a sequence's option taken away: refused by name", "…a type's label taken
+   away: refused by name".
+280. **`pondra status` is the plan an apply would make, and a rename is told from a drop by what a rename keeps**
+   (`status.rs`, `apply::Shape`, `Record.shapes`): every apply records each declared table's folder and its
+   columns' stored names. A table gone from its name with an untracked table in its folder was renamed; a column
+   with its stored name under another name was renamed, one gone was dropped. `pondra capture` writes the
+   database's statement (its author's when the fingerprints match) and a rename as a migration recorded as run
+   where it was made. Elsewhere a table a pending migration renames to, and what reads it, waits for the
+   migrations (`apply::renames`). An object as the files say needs no step, and one dropped outside an apply
+   isn't dropped again. `project_check.py`: "pondra status: a table renamed outside an apply…", "pondra capture
+   sales.memos…", "pondra plan after the capture…", "pondra apply prod: the migration runs there…", "…a column
+   added outside an apply…".
+281. **A swap exchanges two tables alike but for their rows, in one commit, and leaves no row of
+   either under the other's name** (`ddl::swap`, `exchange`): both tables' log rows go to files
+   first; every moved entry, its `$deleted` too, takes the largest of the four `tiered` marks (the
+   log between two marks holds the other's rows, already in its files); and the four tables' appends are held
+   while the entries move (invariant 283). Each entry keeps its folder; comments, indexes, grants and stored views
+   stay with the names. Alike is the same `objects::table_sql` and stored columns. Refused by name:
+   a view, a materialized view or a part of one, a hidden table, one a materialized view or a task
+   follows, a shared or published table, an attached lake's. A clone's shared identity sequence goes
+   only when no table, live or kept dropped, names it (`seq::drop_owned`). `history_check.py`:
+   "ALTER TABLE … SWAP WITH…", "…one with every row in files and one with rows in the log…" (fails
+   with the marks left as they were), "…a follower reads…", "…a writer inserting into one of them
+   while they swap again and again…" (a row lost in 3 of 4 runs with neither the hold nor a second look at the log), "SWAP
+   refused by name…", "a clone's identity sequence outlives…".
+
+282. **A Git folder only moves its branch forward and loses no one's work, and a git token goes only where its
+   secret's SCOPE says** (`git.rs`): a commit goes on top of the folder's commit only while the branch's head is
+   that commit, and moves the branch with `force: false`; a pull refuses a file changed both here and on the branch
+   to different things, and changes nothing; the record (`.pondra-git.json`: repository, branch, commit, each file's
+   blob id) is written last, over the version it was read at. A token, named or picked, is sent only to a
+   repository its SCOPE covers, as written (no `..`, no user part), over https or to this machine's own address,
+   for a caller with USAGE; git secrets never read files (`ext::scoped`). `git_check.py`: "a commit after someone
+   else's push is refused: moved on" (their file lost with the check off and the push forced), "a path changed here
+   and on main: git_pull refused…", "a file deleted here and on main…", "refused by name: … a secret named that
+   doesn't cover the repository, a token over plain http to another machine…" and "…none of them asked the
+   repository anything".
+283. **A table's entry moves only with its appends held, and rows go only into a table that is there** (`ddl::still`,
+   `Sequencer::hold`, `log::commit`): a rename, a swap, a kept drop and a clone send the tables' rows to files, hold their
+   appends (a flush with rows for one goes back to its node, which sends it again, later each time), wait until every
+   flush sequenced before is committed, send what came meanwhile to files, and only then commit. The sequencer refuses
+   rows for a name with no table (`Ack::gone`: "no table t"), since a node may not have seen it renamed or dropped yet.
+   Backpressure pauses commits only while tiering can run, the lake's lock free or held by tiering (`log::Pace`,
+   `Sequencer::tiering`): anyone else holding it may be waiting for that round. `history_check.py`: "a table renamed
+   back and forth 200 times while two nodes append to it…", "…dropped and undropped 20 times…", "…while they swap again
+   and again: every swap goes through at once…", "while writes wait for tiering (backpressure), an UPDATE and a rename
+   answer at once…"; `harness.py backpressure`: "150 writes, each in time" (twenty views running their queries again)
+   times out at the 11th write with every commit paused, and "never half of 8,000 rows in the log" fails if none is.
+284. **A view of windows is kept by key only when each key's rows come from that key's rows alone**
+   (`rerun::window_keys`, `partitioned`, `within`): one table read alone under its windows, or
+   tables inner-joined on them (`joined`: each table has a column of the key's type equal to each
+   key, through the joins' conditions and the filters over them), columns every window partitions by
+   (a stack's shared ones), each selected as it is (`traced`). A run then reads only the touched
+   keys' rows under the windows (a semi join below the lowest one, or below each joined table:
+   `cut`), so every partition it works out holds all its rows; a key column is first kept to the
+   touched keys' least and greatest (a GROUP BY's too), only where none of them is NULL and its type
+   isn't a float (`Touched::ranges`), so the scans below skip files and batches outside it and the
+   join loses nothing. A join's keys come from every joined table's changes, found over the tables
+   as they are (a table replaced by its changes is a query of its own, which `joined` doesn't take),
+   and the view follows each of them (`Rerun::joins`, the source among them; `View::follows`: a bulk
+   INSERT into one takes the version of the commit that records it). The touched keys are the side a
+   semi join holds, as written (`kept_as_written`): swapped by the planner's estimates, the whole
+   table was held and a window's sort above it failed. A window over every row, a key not selected,
+   an outer join, a keyed table or a table not joined on the key is run whole. Kept whole, Nexmark's
+   q18 and q19 at 2M events answered 35 s after the last bid. `harness.py bykey`: `latest`, `top3`
+   (two windows sharing `region`), `led` (a join on the key, its other table changed too) == ad hoc
+   through changes, three nodes and a restart; "a key not selected (a window's too)", "a join not on
+   the windows' key", "a keyed table joined".
+285. **A view's run does its work before the lake's lock and away from the writes, and goes early only once its
+   tables are still** (`rerun::run`, `turn`, `panics::aside`): a run works out its rows, reads the view's rows as
+   they are and compares them before it takes the lock; under it they stand when the view's table has the same
+   columns and no commit has changed it since (only its own runs write it), else they are read and compared again
+   there. So the lock is held for the commit: at 2M Nexmark events q18's run held it 1.9 s, every other view's
+   waiting, and 0.4 s now. Runs start on the queries' runtime (`panics::aside`, as invariant 231's requests): on
+   the node's, a writer's acks beside eight busy views were 19–22 ms against 5–6 ms alone. A view runs again after
+   twice its work (ten times for a run of its whole query); once what it reads has been still a second since a
+   change its last run didn't see, it runs then, if its runs still take at most half the time, once a wait, and
+   again only when a change overtook that run while it ran. With no early run a burst's last row waited out the
+   pace; with one at every stillness a stream sent in batches (still between them) was sent slower; with one alone,
+   q5 ran while the stream's last windows were being emitted and answered four seconds after that run
+   (`logs/round34/nexmark-windows-by-key.json`). `harness.py refreshed`: "a burst's last row is answered within a
+   few seconds…" (9.1 s without the early run); `harness.py pace`: "…beside eight views running their queries
+   again…" fails with runs on the node's runtime.
 
 ## Tests: run these before and after any change
 
@@ -1887,15 +2041,18 @@ python3 tools/resilience_check.py [storage cutoff clients doors disk cache serve
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
 python3 tools/soak.py --minutes 10 [--hours 24] [--s3]                   # C4: steady ingest, nodes stopped and killed, memory, the log, commits on a timeline
 python3 tools/sharing_check.py [--s3]   # shares read by the delta-sharing client (its own venv: it pins pandas < 3) and another Pondra == the provider's rows; refusals; the audit log
-python3 tools/environments_check.py [--s3]   # CREATE DATABASE dev CLONE prod: no file copied, ids kept, writes apart, prod's merges and purges under it, REFRESH, DROP lets go
-python3 tools/project_check.py          # pondra init, plan, deploy, test, export, branch, diff against a lakes server: migrations once, drift, renames refused, a failed test, a stale plan, one owner per object
+python3 tools/environments_check.py [--s3]   # CREATE DATABASE dev CLONE prod: no file copied, ids kept, writes apart, prod's merges and purges under it, REFRESH, DROP lets go; Layout B: two servers, ci init, a pull request's branch on dev from prod (--across: sealed keys, leases, the lent key)
+python3 tools/git_check.py              # Git folders against a stand-in GitHub: checkout, status, commit (some paths, all), pull, a conflict refused, a new branch, a pull request; refusals
+python3 tools/project_check.py          # pondra init, plan, apply, test, export, branch, switch, diff against a lakes server: migrations once (recorded in a new database, seeds loaded), drift, renames refused, a failed test, a stale plan, one owner per object, apply to test, prod and local, --watch, ci init with a stand-in gh
 python3 tools/history_check.py   # DROP/UNDROP, retention, PURGE, Delta; AT (VERSION | TIMESTAMP | OFFSET) == a model of 13 states; RESTORE; CLONE (no copy, apart, merges and drops); refusals
 python3 tools/deploy_check.py                  # the image and compose; add python, chart, helm (kind), service: deploy.yml runs them all
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
 python3 tools/harness.py scripts        # IF, CASE, loops, handlers, RETURN, EXECUTE IMMEDIATE: errors at their line, scopes, a job run twice writing once, Postgres's protocols
+python3 tools/harness.py use            # USE and SET search_path: every door with a session, the cache, writes and DDL, views, tasks, another database, refusals, three nodes
 python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
 python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model; merged files leave memory
+python3 tools/harness.py backpressure   # writes wait for tiering past --backlog, and never while a view's run holds the lock tiering needs
 python3 tools/harness.py memory         # 240 small commits a second, no reader: the node's threads stay few and its own memory doesn't run away
 python3 tools/harness.py pace           # a writer's acks beside 64 querying clients stay near its acks alone (queries on their own runtime)
 python3 tools/harness.py tails          # a table's log tail kept between queries: reads == a model while rows land, a transaction's snapshot, a column added, tiering
@@ -1904,7 +2061,7 @@ python3 tools/harness.py history        # pondra.history: every door's statement
 python3 tools/harness.py plans          # EXPLAIN's expected rows, history's fingerprint, plan_id, version, reads, writes, misestimate; what a run learned and pondra.learned
 python3 tools/harness.py learn          # the planner uses what runs learned: the join order from a measured filter, on another node too; no slower; the bar; three nodes alike; a restart
 python3 tools/harness.py finishes       # GROUP BY views with avg, stddev, HAVING, ORDER BY/LIMIT == ad hoc: changes, EMIT FINAL, a restart, three nodes
-python3 tools/harness.py bykey          # views kept by key (median, count(DISTINCT), string_agg) == ad hoc: changes, flows, a restart, three nodes
+python3 tools/harness.py bykey          # views kept by key (median, count(DISTINCT), string_agg, windows within keys) == ad hoc: changes, flows, a restart, three nodes
 python3 tools/harness.py refreshed      # views run whole (ORDER BY … LIMIT, windows, joins, now() with a lag) == ad hoc: changes, flows, a restart, three nodes
 python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
 python3 tools/harness.py sequences      # nextval on three nodes (every value once), identity columns from every door, ALWAYS, owned sequences, a leader's kill

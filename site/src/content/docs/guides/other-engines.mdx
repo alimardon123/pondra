@@ -29,6 +29,8 @@ INSERT INTO events VALUES
 `publish` is `'delta'`, `'iceberg'` or both. Change it later with
 `ALTER TABLE events SET (publish = 'delta')`; turning a format off deletes its metadata, so nobody
 reads a stale copy. `pondra serve --publish delta,iceberg` publishes every new table by default.
+Adding a table to a share turns its Delta publishing on, since the sharing door hands out versions
+of its Delta log ([Sharing](/pondra/guides/sharing/)).
 
 The table is a folder at `<lake>/data/<table>`, on disk or in a bucket:
 
@@ -306,8 +308,8 @@ order, and a keyed table's key as its identifier fields.
 <Aside type="caution">
 Write through Pondra or through the REST catalog, never into the `_delta_log` or `metadata` folders
 yourself: Pondra's catalog is the truth, and a version it didn't write is overwritten by its next.
-Delta writers need Delta's catalog-managed commits, which Delta doesn't have yet, so engines write
-Iceberg to Pondra, not Delta.
+A Delta writer commits by writing the log itself, and Pondra offers no Delta catalog for writers
+(none it can test here), so engines write Iceberg to Pondra, not Delta.
 </Aside>
 
 ## What other engines see
@@ -316,8 +318,12 @@ Iceberg to Pondra, not Delta.
   Files replaced by compaction are deleted after `--retain-secs` (60 by default), so time travel
   further back than that fails.
 - **Column types:** integers, floats, strings, booleans, dates, timestamps, binary, decimals and
-  float arrays (vector columns) publish. A table with a column of another type isn't published in
-  that format.
+  float arrays (vector columns) publish. A format a table can't be published in is refused by name
+  where you ask for it (`WITH (publish = …)`, `ALTER TABLE … SET`, adding it to a share), and a
+  table that `--publish` would publish is left out of that format with a notice. That goes for a
+  column of another type, and for two kinds of materialized view whose files don't hold the rows
+  they answer with: one finished as it is read (an average, a variance, a `HAVING`) and a history
+  view.
 - **Keyed tables** publish every tier round, like append tables: the older versions a round replaces
   and its delete markers become position deletes (Delta deletion vectors), so readers see one row per
   key. A keyed table with `order_by` or merge functions still publishes after each full compaction

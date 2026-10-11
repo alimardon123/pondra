@@ -112,6 +112,7 @@ What Pondra refuses:
 | a merge table with a non-key column that has no `MERGE` | `a merge table combines every column but its key: s needs a merge function too` |
 | `b DOUBLE MERGE avg` | `MERGE: sum, count, min or max` |
 | `publish = parquet` | `publish formats: delta, iceberg` |
+| `publish = delta` on a table with an `INTERVAL` column | `spans can't be published as delta: delta has no type for d (Interval(MonthDayNano))` (under `--publish` it is made, left out of that format, with a notice) |
 | `CLUSTER BY` a column the table lacks | `CLUSTER BY: columns of the table` |
 | `PARTITION BY week(ts)` | `PARTITION BY: a column, or year/month/day/hour(a timestamp column)` |
 | `TTL` on a table with no key, or a column that isn't a timestamp or date | `TTL: a timestamp or date column of a keyed table` |

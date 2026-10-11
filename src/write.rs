@@ -121,7 +121,8 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     }
     // (a key's columns are NOT NULL too: a row with no key has nothing to be found by)
     let not_null: Vec<String> = columns.iter().map(|(c, _)| c).filter(|c| not_null.contains(c) || key.contains(c) || identity.contains_key(*c)).cloned().collect();
-    let meta = match lake.cat.get::<TableMeta>(&table_key(name)).await? {
+    let mut defaulted = publish.is_none(); // (a new table published as the node's --publish says)
+    let mut meta = match lake.cat.get::<TableMeta>(&table_key(name)).await? {
         // (A new table reads the log from now on: a table of this name dropped earlier left rows
         // in segments that aren't expired yet.)
         None => {
@@ -137,6 +138,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, folder, tiered: lake.visible(), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
         }
         Some(mut m) => {
+            defaulted = false;
             // (the spec names columns as SQL does; the table keeps its stored names: ADR-022)
             let l = m.logical();
             ensure!(partition.is_none() || partition == l.partition, "{name}'s partition_by can't change");
@@ -199,11 +201,22 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             m
         }
     };
+    // (a format the table can't be published in: refused when asked for, or when a column added
+    // to a published table has no type there; left out of the node's --publish with a notice)
+    let notice = if defaulted { crate::delta::left_out(name, &meta) } else { None };
+    if let Some((f, why)) = meta.publish.iter().find_map(|f| crate::delta::refused(&meta, f).map(|why| (f, why))) {
+        ensure!(defaulted, "{name} can't be published as {f}: {why}");
+    }
+    meta.publish = meta.publish.iter().filter(|f| crate::delta::refused(&meta, f).is_none()).cloned().collect();
     lake.cat.commit(vec![(table_key(name), json(&meta))], &[]).await?;
     if !meta.publish.is_empty() {
         crate::delta::publish_all(lake).await?; // (an empty table is there for other engines at once: they may append to it, ADR-028)
     }
-    Ok(j!({"table": name, "publish": meta.publish}))
+    let mut out = j!({"table": name, "publish": meta.publish});
+    if let Some(n) = notice {
+        out["notice"] = n.into();
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- statements
@@ -853,11 +866,17 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
 
 /// Create a table (or change it: a spec sent again) from any node: the leader does it.
 pub async fn define(app: &crate::server::App, name: &str, spec: &str) -> Result<Value> {
-    if app.seq.is_none() {
-        return Ok(http().post(crate::tls::url(&format!("{}/tables/{name}", app.cluster.leader.addr))).body(spec.to_string()).send().await?.error_for_status()?.json().await?);
+    let out: Value = match app.seq {
+        None => post(&app.cluster.leader.addr, &Request::Table(name.into(), spec.into())).await?, // (the leader's refusal, by name)
+        Some(_) => {
+            let _guard = app.lock.lock().await;
+            create_table(&app.lake, name, spec).await?
+        }
+    };
+    if let Some(n) = out["notice"].as_str() {
+        crate::routines::heard(n); // (told through the door the statement came in by)
     }
-    let _guard = app.lock.lock().await;
-    create_table(&app.lake, name, spec).await
+    Ok(out)
 }
 
 /// How a SQL type is kept: strings as Utf8; timestamps in microseconds, as Iceberg, Delta, Spark

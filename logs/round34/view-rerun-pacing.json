@@ -1,0 +1,16 @@
+{
+ "what": "Nexmark's 20 queries as Pondra views over 1M events on one node (tools/bench/nexmark.py --events 1000000 --engines pondra), all at once: secs is when the last view has its answer, sent_s when the last event was acknowledged. Runs of a view that runs its query again (q4, q5, q8, q9, q18, q19) are paced by what they took; before, that counted their waits for the lake's lock (held by tiering for seconds) and for their commit, so a run behind a tiering round waited ten times that again.",
+ "machine": "4 vCPU, 15 GB",
+ "before": [
+  {"secs": 28.55, "sent_s": 4.91, "last": ["q18 28.35", "q19 24.16", "q9 10.3"]},
+  {"secs": 14.87, "sent_s": 3.92, "last": ["q5 14.67", "q18 8.35", "q15 8.13"]},
+  {"secs": 9.1, "sent_s": 3.8, "last": ["q19 8.9", "q15 8.77", "q5 8.76"]}
+ ],
+ "after": [
+  {"secs": 7.27, "sent_s": 3.59, "last": ["q5 7.07", "q18 6.87", "q9 6.51"]},
+  {"secs": 9.78, "sent_s": 2.42, "last": ["q5 9.58", "q18 7.36", "q19 6.35"]},
+  {"secs": 10.5, "sent_s": 2.47, "last": ["q5 10.3", "q18 7.27", "q16 6.3"]},
+  {"secs": 8.68, "sent_s": 2.5, "last": ["q5 8.48", "q18 7.47", "q19 6.69"]}
+ ],
+ "summary": "every answer in 7.3–10.5 s (mean 9.1) instead of 9.1–28.6 s (mean 17.5); ingest no slower (sent 2.4–3.6 s against 3.8–4.9 s); every view == DuckDB's answer in every run"
+}

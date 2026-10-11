@@ -110,13 +110,33 @@ answer as of your own write. `WITH (lag = '1 minute')` works it out at most once
 `WITH (refresh = 'by key')` keeps any grouped view this way. It reads one table, with no join or
 subquery, and groups by columns it selects.
 
+Windows split by a column the view selects are kept by key too, a key at a time: the latest row of
+each user, the top three of each page. So are windows over tables joined on that column, such as
+each auction's winning bid from `auctions JOIN bids ON auctions.id = bids.auction`.
+
+```sql
+CREATE MATERIALIZED VIEW IF NOT EXISTS last_click AS
+  SELECT user, page, amount FROM (
+    SELECT *, row_number() OVER (PARTITION BY user ORDER BY ts DESC) AS n FROM clicks
+  ) WHERE n = 1;
+SELECT * FROM last_click ORDER BY user;
+```
+
+```text
+user  page      amount
+ann   checkout  5
+bob   home      2
+```
+
 ### Anything else: run whole
 
-Every other query is a materialized view too: a top N (`ORDER BY … LIMIT`), a window function,
+Every other query is a materialized view too: a top N (`ORDER BY … LIMIT`), a window over every row,
 `DISTINCT`, a subquery over its own table, a median across a join, or a filter on `now()`. Its query
 runs whole again after a commit changes a table it reads, at most so often that its runs take a
-tenth of the time (a query of 50 ms is current within half a second; one of 10 s, within 100 s).
-A view that calls `now()`, or reads another lake or files, also runs every minute, or every `lag`.
+tenth of the time (a query of 50 ms is current within half a second; one of 10 s, within 100 s),
+and once those tables have been still for a second it runs then, as long as its runs take at most
+half the time, so the last rows of a burst don't wait out that tenth. A view that calls `now()`, or reads another lake or files, also runs every
+minute, or every `lag`.
 
 ```sql
 CREATE MATERIALIZED VIEW IF NOT EXISTS biggest AS

@@ -401,6 +401,11 @@ pub fn empty(location: &str, columns: &[(String, String)], now: u64) -> Option<V
     }))
 }
 
+/// Does Iceberg have a type for a column of type `t`?
+pub fn carries(t: &str) -> bool {
+    fields(&TableMeta { columns: vec![("x".into(), t.into())], ..Default::default() }).is_some()
+}
+
 /// The table's columns as Iceberg fields, if every type has an equivalent: optional but a key's, each
 /// with its place among the stored columns as its id and the name SQL knows it by (a renamed
 /// column keeps its id; a dropped one leaves the schema, its id unused again: ADR-022).

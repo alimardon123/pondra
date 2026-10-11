@@ -391,7 +391,11 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             ensure!(outside.is_empty(), "a materialized view follows the rows its tables take in, and files outside the lake take none: read them into a table (CREATE TABLE … AS, INSERT … SELECT) and follow that, or make a stored view (CREATE VIEW)");
             crate::views::create(lake, &name, &sql, crate::views::options(&options)?).await?;
             crate::views::forget(lake); // (the sequencer holds flushes to it from its next commit)
-            Ok(j!({"view": name, "materialized": true}))
+            let mut out = j!({"view": name, "materialized": true});
+            if let Some(n) = lake.cat.get::<TableMeta>(&table_key(&name)).await?.and_then(|m| crate::delta::left_out(&name, &m)) {
+                out["notice"] = n.into();
+            }
+            Ok(out)
         }
         Ddl::DropView { name, if_exists } => drop_view(lake, &name, if_exists).await,
         Ddl::Attach { name, dir, read_only, endpoint } => {

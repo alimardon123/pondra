@@ -406,6 +406,9 @@ async fn shareable(lake: &Lake, table: &str) -> Result<(String, TableMeta)> {
         bail!("no table {table} (a share hands out files: a view is shared as a materialized view of it, CREATE MATERIALIZED VIEW … AS …)");
     };
     ensure!(meta.ext.is_none() && meta.shares.is_empty(), "{table} is a clone, whose files are partly another table's: share the table it was cloned from, or a copy (CREATE TABLE … AS SELECT * FROM {table})");
+    if let Some(why) = crate::delta::refused(&meta, "delta") {
+        bail!("{table} can't be shared: a share hands out its Delta log, and {why}"); // (one check: `delta::refused`)
+    }
     ensure!(meta.merge.is_empty() && meta.order.is_none(), "{table}'s rows combine as they are read (merge, order_by), which files can't carry: share a materialized view of it");
     Ok((t, meta))
 }
