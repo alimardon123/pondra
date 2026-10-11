@@ -16,13 +16,17 @@ spec:
     - name: test
       image: busybox:1.37
       securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      env:
+        # (a node names the cluster's members to a token only, `/stats`; optional: a chart with auth off has none)
+        - name: PONDRA_ADMIN_TOKEN
+          valueFrom: {secretKeyRef: {name: {{ include "pondra.tokensSecret" . }}, key: PONDRA_ADMIN_TOKEN, optional: true}}
       command: [sh, -c]
       args:
         - |
           set -e
           leaders=""
           for i in $(seq 0 {{ sub (int (include "pondra.replicas" .)) 1 }}); do
-            s=$(wget -qO- {{ if .Values.tls.existingSecret }}--no-check-certificate https{{ else }}http{{ end }}://{{ $full }}-$i.{{ $full }}-nodes:8080/stats)
+            s=$(wget -qO- --header "Authorization: Bearer $PONDRA_ADMIN_TOKEN" {{ if .Values.tls.existingSecret }}--no-check-certificate https{{ else }}http{{ end }}://{{ $full }}-$i.{{ $full }}-nodes:8080/stats)
             echo "{{ $full }}-$i: $s"
             leaders="$leaders $(echo "$s" | sed 's/.*"leader":"\([^"]*\)".*/\1/')"
           done

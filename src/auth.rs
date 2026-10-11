@@ -62,6 +62,10 @@ tokio::task_local! {
 /// The principal of the request being served (None: no door set one: this process's own work).
 pub fn current() -> Option<Principal> { WHO.try_with(|p| p.clone()).ok() }
 
+/// Who the request being served is, as one string: an answer kept for it is read back only by the
+/// same (`pages.rs`). No principal is this process's own work, which keeps and reads its own.
+pub fn holder() -> String { current().map_or_else(|| "node".to_string(), |p| format!("{}|{:?}|{}", p.name, p.role, p.operator)) }
+
 /// `f` as the request that makes it, for work it starts and doesn't wait for (`pondra.start`): the
 /// same user (its grants) and session. A spawned task keeps no task-local, and with no principal a
 /// started procedure ran with its role's every right, past the user's grants.

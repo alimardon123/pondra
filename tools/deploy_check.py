@@ -56,9 +56,9 @@ def sql(port, q, timeout=60, token=None):
     return json.loads(http(port, "/sql", q, timeout, token))
 
 
-def stats(port):
+def stats(port, token=os.environ.get("PONDRA_ADMIN_TOKEN")):  # (compose.yaml passes this token to the nodes; with it, the cluster's names are answered)
     try:
-        return json.loads(http(port, "/stats", timeout=3))
+        return json.loads(http(port, "/stats", timeout=3, token=token))
     except Exception:
         return None
 
@@ -240,8 +240,11 @@ def helm(a):
     kept = lambda: k("get", "secret", "p-pondra-key", "p-pondra-tokens", "-o", "jsonpath={.items[*].data}")
 
     def stats(pod):
+        # (the chart's nodes take tokens, and the names of the cluster need one: kubectl's proxy can't send
+        # it, so each pod is asked through a port-forward)
         try:
-            return json.loads(k("get", "--raw", f"/api/v1/namespaces/{ns}/pods/{pod}:8080/proxy/stats"))
+            with Forward(ns, f"pod/{pod}", 8080) as port:
+                return json.loads(http(port, "/stats", timeout=3, token=token))
         except Exception:
             return None
 
@@ -264,11 +267,11 @@ def helm(a):
         r = subprocess.run(["helm", "-n", ns, "install", "p", chart, *values, "--wait", "--timeout", "6m"], capture_output=True, text=True)
         if not check("the chart installs: three nodes and a reader, ready", r.returncode == 0, (r.stdout + r.stderr)[-1500:] + k("get", "pods", "-o", "wide", check=False)):
             return
+        token = base64.b64decode(k("get", "secret", "p-pondra-tokens", "-o", "jsonpath={.data.PONDRA_ADMIN_TOKEN}")).decode()
         first = until(leader, 60)
         check("the nodes are one cluster: one leader, the others following it", first)
         r = subprocess.run(["helm", "-n", ns, "test", "p", "--logs"], capture_output=True, text=True)
         check("helm test: every node answers, one leader", r.returncode == 0, (r.stdout + r.stderr)[-1500:])
-        token = base64.b64decode(k("get", "secret", "p-pondra-tokens", "-o", "jsonpath={.data.PONDRA_ADMIN_TOKEN}")).decode()
         with Forward(ns, "svc/p-pondra", 8080) as port:
             try:
                 sql(port, "SELECT 1")

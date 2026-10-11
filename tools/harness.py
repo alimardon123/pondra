@@ -7261,11 +7261,13 @@ def guarded():
     row doors (/append, /insert) only as its grants say, never through the nodes' own routes; a
     write token's flushes and files only into tables that are there, in the log and their folders;
     nobody but the nodes adds to the lake's own records; a change a follower forwards runs as its
-    user, reads included; a .py file is an admin's."""
+    user, reads included; a .py file is an admin's; a page of an answer is its asker's; /stats names
+    the cluster's nodes only to a signed-in caller; rows through /append and /insert are in the audit log."""
     import base64
     P = A.port
     lake = new_lake()
-    a = Node(lake, P).start()
+    audit = {"PONDRA_AUDIT": "role,ddl,function,write"}  # (the writes too: rows through /append and /insert are in the log)
+    a = Node(lake, P, env=audit).start()
     checks, info = {}, {}
 
     def ask(port, body, path="/sql", method="POST", auth=None, headers=None):
@@ -7294,8 +7296,11 @@ def guarded():
     checks["…a page from another site, or a name rebound to this machine, gets 403 saying why"] = \
         all(refused(said[k]) for k in ("another site's page", "another site, by fetch metadata", "a form posted from elsewhere", "a name rebound here", "…same origin as itself")) \
         and "another site" in said["another site's page"] and "DNS rebinding" in said["a name rebound here"]
+    open_stats = ask(P, b"", path="/stats", method="GET")  # (no users yet: an open node)
+    checks["/stats on an open node: every field, the cluster's names too"] = \
+        isinstance(open_stats, dict) and {"lake", "leader", "nodes", "releases", "role", "version", "term", "format", "keys"} <= set(open_stats)
     # Users: the row doors and the nodes' own routes
-    b = Node(lake, P + 1).start()  # (a follower)
+    b = Node(lake, P + 1, env=audit).start()  # (a follower)
     basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
     for q in ["CREATE TABLE orders (id BIGINT, amount DOUBLE)", "CREATE TABLE hr (id BIGINT, salary DOUBLE)", "INSERT INTO hr VALUES (1, 100.0)",
               "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
@@ -7335,6 +7340,31 @@ def guarded():
     checks["a change a follower forwards runs as its user: a read it may not make refused, its own change made"] = \
         "permission denied: SELECT on hr" in str(forwarded["reads what it may not"]) and isinstance(forwarded["its own"], dict) and forwarded["its own"].get("updated") == 1 \
         and until(lambda: ask(P, "SELECT amount FROM orders WHERE id = 7", auth=boss), [{"amount": 5.0}], 10) == [{"amount": 5.0}]
+    # A page of an answer is its asker's: another user's request for its id is as if it were gone (pages.rs)
+    typed = ask(P, "SELECT id FROM orders ORDER BY id", path="/sql?format=typed", auth=bob)
+    pages = typed.get("pages") if isinstance(typed, dict) else None
+    mine = ask(P, b"", path=f"/sql/pages/{pages}", method="GET", auth=bob)
+    theirs = ask(P, b"", path=f"/sql/pages/{pages}", method="GET", auth=boss)
+    info["pages"] = {"bob's": mine, "boss's": theirs}
+    checks["a page of an answer is read only by whoever asked for it: another user gets 410"] = \
+        isinstance(mine, dict) and mine.get("rows") == [[7], [8]] and str(theirs).startswith("ERROR 410")
+    # /stats: an unsigned caller gets every field but the cluster's names and addresses (lake, leader, nodes,
+    # releases), which a signed-in caller gets (here a user; the admin token is checked on node c below)
+    names = {"lake", "leader", "nodes", "releases"}
+    anon, signed = ask(P, b"", path="/stats", method="GET"), ask(P, b"", path="/stats", method="GET", auth=boss)
+    info["stats"] = {"anyone": sorted(anon) if isinstance(anon, dict) else anon, "boss": sorted(signed) if isinstance(signed, dict) else signed}
+    checks["/stats: unsigned on a lake with users, no node names (lake, leader, nodes, releases); signed in, all of them"] = \
+        isinstance(anon, dict) and not (names & set(anon)) and {"role", "version", "term", "keys"} <= set(anon) \
+        and isinstance(signed, dict) and names <= set(signed)
+    # Rows through /append and /insert are in the audit log while writes are audited (PONDRA_AUDIT, above), and
+    # refused ones always. The log's lines reach it a moment later, in batches.
+    expect = {("INSERT INTO orders (rows through /append)", "ok"), ("INSERT INTO hr (rows through /append)", "refused"),
+              ("INSERT INTO orders (rows through /insert)", "ok"), ("INSERT INTO hr (rows through /insert)", "refused")}
+    def audited():
+        got = ask(P, "SELECT statement, outcome FROM pondra.audit WHERE statement LIKE '%rows through%' ORDER BY at", auth=boss)
+        return {(r["statement"], r["outcome"]) for r in got} if isinstance(got, list) else set()
+    checks["rows through /append and /insert are in the audit log when writes are audited, and refused ones always"] = until(lambda: expect <= audited(), True, 15)
+    info["audit"] = sorted(audited())
     a.kill(), b.kill()
     # A write token: rows into tables that are there, in the log and their folders; never the lake's records
     lake2 = new_lake()
@@ -7358,6 +7388,12 @@ def guarded():
         and "needs an admin" in said["a branch's row ids"] and "written by Pondra alone" in said["rows for the audit log"] and "making a table needs an admin" in said["files into no table"]
     checks["a .py file is an admin's to save (code a node runs); a .sql file a writer's"] = refused(said["a python file"]) and not str(said["a sql file"]).startswith("ERROR") \
         and not str(said["a python file, by an admin"]).startswith("ERROR")
+    # /stats on a node with a token and no users: unsigned, no node names; the admin token, all of them
+    c_anon, c_admin = ask(P + 2, b"", path="/stats", method="GET"), ask(P + 2, b"", path="/stats", method="GET", auth="Bearer adm")
+    info["stats on c"] = {"anyone": sorted(c_anon) if isinstance(c_anon, dict) else c_anon, "admin": sorted(c_admin) if isinstance(c_admin, dict) else c_admin}
+    checks["/stats with the admin token: the node names too; unsigned on a tokened node, none"] = \
+        isinstance(c_anon, dict) and not (names & set(c_anon)) and "role" in c_anon \
+        and isinstance(c_admin, dict) and {"lake", "leader", "nodes"} <= set(c_admin)
     c.kill()
     ok = all(checks.values())
     print(json.dumps({"guarded": checks, "ok": ok, "info": info}, indent=1, default=str))

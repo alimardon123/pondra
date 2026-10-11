@@ -105,7 +105,13 @@ async fn status(name: &str) -> Result<()> {
     // (the node itself: from this machine its HTTP port answers plainly, TLS or not)
     let addr = config.args.iter().position(|a| a == "--addr").and_then(|i| config.args.get(i + 1)).map_or("127.0.0.1:8080", |a| a.as_str());
     let port = addr.rsplit(':').next().unwrap_or("8080");
-    let asked = reqwest::Client::new().get(format!("http://127.0.0.1:{port}/stats")).timeout(std::time::Duration::from_secs(3)).send().await;
+    // (a node with tokens names the cluster's members to a token only: this shell's, if it has one)
+    let token = std::env::var("PONDRA_TOKEN").or_else(|_| std::env::var("PONDRA_ADMIN_TOKEN")).ok();
+    let mut asking = reqwest::Client::new().get(format!("http://127.0.0.1:{port}/stats")).timeout(std::time::Duration::from_secs(3));
+    if let Some(t) = token {
+        asking = asking.bearer_auth(t);
+    }
+    let asked = asking.send().await;
     match asked {
         Ok(r) => match r.json::<serde_json::Value>().await {
             Ok(s) => println!("  node: {} of term {} (leader {}), {} node(s) in the cluster", s["role"].as_str().unwrap_or("?"), s["term"], s["leader"].as_str().unwrap_or("?"), s["nodes"].as_array().map_or(0, |n| n.len())),
