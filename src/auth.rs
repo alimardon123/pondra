@@ -238,6 +238,9 @@ impl Auth {
 
     pub fn on(&self) -> bool { self.read.is_some() || self.write.is_some() || self.admin.is_some() }
 
+    /// Is an admin token set? Then the nodes call each other with it, and the nodes' key counts for nothing.
+    pub fn admin_set(&self) -> bool { self.admin.is_some() }
+
     /// The role a bearer token grants.
     pub fn role(&self, token: Option<&str>) -> Role {
         if let Some((role, _)) = lent(token) {

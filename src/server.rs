@@ -1022,7 +1022,8 @@ async fn change(State(app): State<App>, Json((sql, job, sent)): Json<(String, St
 fn cluster_call(app: &App, headers: &HeaderMap) -> bool {
     match headers.get("authorization").and_then(|v| v.to_str().ok()) {
         None => true,
-        Some(h) => h.strip_prefix("Bearer ").is_some_and(|b| b.starts_with("pn_") || app.auth.token_role(b) > crate::auth::Role::None),
+        // (a `pn_` key counts only without an admin token, as in `users::who`)
+        Some(h) => h.strip_prefix("Bearer ").is_some_and(|b| (b.starts_with("pn_") && !app.auth.admin_set()) || app.auth.token_role(b) > crate::auth::Role::None),
     }
 }
 

@@ -610,20 +610,20 @@ def format_check(new_bin, work, port, old=None):
     unsealed = {"PONDRA_SECRET_KEY": ""}  # (no shared master key: the lake's keys stay in the clear, so the format moves only for what this check asks)
     lake, later = os.path.join(work, "format-lake"), {"PONDRA_TEST_FORMAT": "4", **unsealed}
     fmt = lambda n: n.get("/stats", timeout=5)["format"]
-    first = Node(new_bin, lake, port, work, env=unsealed).start()  # makes the lake
+    first = Node(new_bin, lake, port, work, env=unsealed, token=False).start()  # makes the lake
     checks["a lake this build makes has the mark (format 1) from the start, and moves past it only for what needs it"] = until(lambda: fmt(first) == 1, 3, step=0.1)
     first.q("CREATE TABLE t (x INT)")
     first.q("INSERT INTO t VALUES (1), (2)")
     first.stop()
-    a = Node(new_bin, lake, port, work, env=later).start()  # leads, and knows format 4
-    b = Node(new_bin, lake, port + 1, work, env=unsealed).start()  # follows, and knows format 3
+    a = Node(new_bin, lake, port, work, env=later, token=False).start()  # leads, and knows format 4
+    b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False).start()  # follows, and knows format 3
     time.sleep(22)  # (the leader's first two looks: it must not go past what the follower knows)
     info["with a node of each"] = {"leader's": fmt(a), "follower's": fmt(b), "releases": a.get("/stats")["releases"]}
     checks["a lake moves on only to the newest format every node knows"] = fmt(a) == 1 and fmt(b) == 1
     b.stop()
     checks["…and on again once the node that didn't know the next one has gone"] = until(lambda: fmt(a) == 4, 40)
     refused = lambda x, n=4: x.p.poll() not in (None, 0) and f"format {n}" in x.said() and "run Pondra" in x.said()
-    b = Node(new_bin, lake, port + 1, work, env=unsealed)
+    b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False)
     try:  # a node that doesn't know the lake's format: at once, or as soon as its view holds the format
         b.start()
         b.p.wait(20)
@@ -636,14 +636,14 @@ def format_check(new_bin, work, port, old=None):
     checks["…and so does pondra sql"] = code != 0 and "format 4" in said
     a.stop()
     t0 = time.time()
-    b = Node(new_bin, lake, port + 1, work, env=unsealed)
+    b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False)
     try:  # (nobody leads: it would, and must give the term back)
         b.start()
     except Failed:
         pass
     b.stop("kill")
     t1 = time.time()
-    a = Node(new_bin, lake, port, work, env=later).start()
+    a = Node(new_bin, lake, port, work, env=later, token=False).start()
     info["seconds"] = {"a node of format 3 refused to lead it": round(t1 - t0, 1), "then one of format 4 led it": round(time.time() - t1, 1)}
     checks["…without holding on to the leader's term: the next node leads at once"] = refused(b) and time.time() - t1 < 10
     checks["the lake reads as it did"] = a.q("SELECT count(*) AS n FROM t") == [{"n": 2}]
@@ -651,7 +651,7 @@ def format_check(new_bin, work, port, old=None):
     if old:  # format 2's first need, a view that works its answers out as it is read (ADR-055); format 3's, the lake's own keys sealed (ADR-058)
         v, old_bin = old
         lake = os.path.join(work, "format-views-lake")
-        n = Node(new_bin, lake, port, work, env=unsealed).start()
+        n = Node(new_bin, lake, port, work, env=unsealed, token=False).start()
         n.q("CREATE TABLE s (k VARCHAR, x DOUBLE)")
         n.q("CREATE MATERIALIZED VIEW totals AS SELECT k, sum(x) AS t FROM s GROUP BY k")
         plain = fmt(n)
@@ -662,7 +662,7 @@ def format_check(new_bin, work, port, old=None):
         sealed = until(lambda: fmt(n) == 3 and n.get("/stats", timeout=5)["keys"] == "sealed", 40)
         info["formats"] = {"a view of sums": plain, "a view of averages": means, "the lake's own keys sealed": fmt(n)}
         n.stop()
-        o = Node(old_bin, lake, port, work, env=unsealed)
+        o = Node(old_bin, lake, port, work, env=unsealed, token=False)
         try:
             o.start()
             o.p.wait(20)

@@ -424,10 +424,17 @@ fn plain(name: &str) -> Result<String> {
 
 /// Leader: carry out a change (under the lake's lock).
 pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
+    // (a password or a token made now opens the lake to whoever can read its keys in the clear)
+    let gives_access = match &c {
+        Change::Create { login, verifier, .. } => *login && verifier.is_some(),
+        Change::Alter { verifier, .. } => verifier.is_some(),
+        Change::CreateToken { .. } => true,
+        _ => false,
+    };
     let get = |n: &str| { let k = user_key(n); async move { lake.cat.get::<User>(&k).await } };
     let put = |n: &str, u: &User| (user_key(n), json(u));
     let must = |n: &str, u: Option<User>| u.ok_or_else(|| anyhow!("no user or role {n} (CREATE USER {n}, CREATE ROLE {n})"));
-    let out = match c {
+    let mut out = match c {
         Change::Create { name, login, if_not_exists, verifier, superuser, limits } => {
             if get(&name).await?.is_some() {
                 ensure!(if_not_exists, "{} {name} already exists", if login { "user" } else { "role" });
@@ -561,8 +568,19 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
         }
     };
     forget();
+    if gives_access && exposed(lake).await {
+        out["notice"] = EXPOSED.into(); // (told through the door: `write.rs` passes a DDL answer's notice on)
+        eprintln!("{EXPOSED}");
+    }
     Ok(out)
 }
+
+/// The sentence said where the lake's keys are in the clear and users sign in (`exposed`).
+const EXPOSED: &str = "the lake's own keys are in the clear in its bucket: whoever can read the bucket can sign in as anyone. Set --admin-token (or PONDRA_SECRET_KEY) on every node to seal them";
+
+/// Are the lake's own keys in the clear where users sign in? Then whoever can read the bucket can
+/// sign in as anyone (`EXPOSED`).
+async fn exposed(lake: &Lake) -> bool { any(lake).await && kept(lake).await == "clear" && !crate::ext::shared_master() }
 
 /// Whom a grant goes to: a user, a role, or `public` (every user: made when first granted to).
 async fn grantee(lake: &Lake, name: &str) -> Result<User> {
@@ -753,7 +771,7 @@ async fn keys(lake: &Lake) -> Result<Keys> {
     let k = match found {
         Some(Kept::Clear(k)) => k,
         Some(Kept::Sealed { sealed, key }) => {
-            let plain = crate::ext::unseal(&sealed, &key).map_err(|e| anyhow!("the lake's own keys are sealed by a master key this node doesn't have ({e:#}): every node needs the same PONDRA_SECRET_KEY (or PONDRA_KMS_COMMAND)"))?;
+            let plain = crate::ext::unseal(&sealed, &key).map_err(|e| anyhow!("the lake's own keys are sealed by a master key this node doesn't have ({e:#}): every node needs the same PONDRA_SECRET_KEY or PONDRA_ADMIN_TOKEN (or PONDRA_KMS_COMMAND; the one before a change as PONDRA_SECRET_KEY_PREVIOUS or PONDRA_ADMIN_TOKEN_PREVIOUS)"))?;
             serde_json::from_slice(&plain)?
         }
         None => {
@@ -801,7 +819,11 @@ pub async fn seal_keys(lake: &Lake) -> Result<()> {
                 eprintln!("the lake's own keys rewrapped with the master key in use now");
             }
         }
-        _ => {}
+        _ => {
+            if exposed(lake).await {
+                eprintln!("{EXPOSED}"); // (once, as a leader starts: a user made later is said by its CREATE)
+            }
+        }
     }
     Ok(())
 }
@@ -1110,7 +1132,8 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) ->
         if role > Role::None {
             return Some(Principal::token(role));
         }
-        if token.starts_with("pn_") && keys(lake).await.is_ok_and(|k| aws_lc_rs::constant_time::verify_slices_are_equal(k.node.as_bytes(), token.as_bytes()).is_ok()) {
+        // (where an admin token is set the nodes call each other with it, so a `pn_` key read from the bucket opens nothing)
+        if token.starts_with("pn_") && !auth.admin_set() && keys(lake).await.is_ok_and(|k| aws_lc_rs::constant_time::verify_slices_are_equal(k.node.as_bytes(), token.as_bytes()).is_ok()) {
             return Some(Principal::token(Role::Admin));
         }
         let user = if token.starts_with("ps_") { session_user(lake, token).await? } else { token_user(lake, token).await? };
