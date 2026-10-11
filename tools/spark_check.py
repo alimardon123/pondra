@@ -633,6 +633,15 @@ def p_union_by_name_differing_raises(spark, F, Window):  # without allowMissingC
     return left.unionByName(right).collect()
 
 
+def p_alias_quotes_and_literals(spark, F, Window):  # "a." in a string or a quoted name is data; only the alias's qualifier goes
+    df = spark.createDataFrame([(1, "x@a.com", "o.k"), (2, "y@b.com", "q"), (3, "z@a.com", None)], "id int, email string, note string")
+    by_alias = df.alias("a").where(F.col("a.email").like("%a.com")).select(F.col("a.email"), F.lit("a.b").alias("lit"))
+    # a column named a.b (PySpark's `a.b` in backticks), read through the alias
+    dotted = (df.alias("a").toDF("id", "a.b", "note").where(F.col("`a.b`").like("%a.com"))
+              .select(F.col("`a.b`").alias("email"), F.lit("a.b").alias("lit")))
+    return by_alias.union(dotted)
+
+
 def _row_class(spark):
     """PySpark's Row, or Pondra's, by the session that is asked."""
     if type(spark).__module__.startswith("pondra"):
@@ -747,6 +756,7 @@ PIPELINES = [
     ("union_by_name_differing_raises", None, "raises", p_union_by_name_differing_raises),
     ("show_vertical_records", None, "value", p_show_vertical),
     ("show_vertical_no_columns_raises", None, "raises", p_show_vertical_no_columns_raises),
+    ("alias_quotes_and_literals", False, "frame", p_alias_quotes_and_literals),
 ]
 
 

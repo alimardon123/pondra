@@ -31,9 +31,16 @@ def _type(t):
     return TYPES.get(t.lower(), t.upper())
 
 
+def _ticked(name):
+    """A name in backticks, as PySpark writes a column whose name has dots: `a.b` is one column."""
+    return len(name) > 2 and name[0] == name[-1] == "`"
+
+
 def _name_sql(name):
     """A column name as SQL: plain names unquoted (so they match any case, as PySpark does),
     `t.c` qualified, others quoted whole."""
+    if _ticked(name):
+        return _quote(name[1:-1])
     parts = name.split(".")
     if all(_SIMPLE.match(p) for p in parts):
         return name
@@ -190,7 +197,12 @@ def _col(name):
         return _lit(name)
     if name == "*":
         return Column("*", "*")
-    return Column(_name_sql(name), name.split(".")[-1])
+    return Column(_name_sql(name), _label(name))
+
+
+def _label(name):
+    """The name a column made from `name` has: `a.b` in backticks, else the part after the last dot."""
+    return name[1:-1] if _ticked(name) else name.split(".")[-1]
 
 
 def _lit(v):
@@ -632,7 +644,7 @@ class DataFrame:
     def __getitem__(self, name):
         if isinstance(name, Column):
             return self.filter(name)
-        return Column(f"{self._alias}.{_name_sql(name)}", name)
+        return Column(f"{self._alias}.{_name_sql(name)}", name[1:-1] if _ticked(name) else name)
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -946,9 +958,18 @@ class DataFrame:
 
 def _strip(sql, alias=None):
     """A column made from `df["x"]`, or from `F.col("o.x")` on `df.alias("o")`, names its DataFrame's
-    alias. Outside a join a step's columns are the frame's own, so the alias goes."""
-    names = [r"_d\d+", *([re.escape(alias)] if alias else [])]
-    return re.sub(rf"\b(?:{'|'.join(names)})\.", "", sql)
+    alias. Outside a join a step's columns are the frame's own, so the alias goes. Only outside
+    quotes: text in quotes is data, so 'o.k' and "a.b" keep their dots."""
+    names = "|".join([r"_d\d+", *([re.escape(alias)] if alias else [])])
+
+    def cut(m):
+        if m.group(1) is not None:  # a string literal
+            return m.group(0)
+        if m.group(2) is not None:  # a quoted name: a qualifier only when a dot follows it
+            return "" if m.group(3) and re.fullmatch(names, m.group(2)) else m.group(0)
+        return ""  # a bare qualifier (the alias or _d<n>) and its dot
+
+    return re.sub(rf"""('(?:[^']|'')*')|"((?:[^"]|"")*)"(\.)?|\b(?:{names})\.""", cut, sql)
 
 
 class _Na:
