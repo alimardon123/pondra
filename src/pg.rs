@@ -12,7 +12,7 @@ use crate::server::App;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Schema, TimeUnit, TimestampMicrosecondType};
+use datafusion::arrow::datatypes::{DataType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, IntervalMonthDayNanoType, IntervalUnit, Schema, Time64MicrosecondType, TimeUnit, TimestampMicrosecondType};
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::{stream, Sink, SinkExt};
 use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
@@ -568,9 +568,12 @@ fn pg_type(t: &DataType, format: FieldFormat) -> (Type, DataType) {
         DataType::Decimal256(..) if format == FieldFormat::Text => (Type::NUMERIC, DataType::Utf8),
         DataType::Decimal256(..) => (Type::FLOAT8, DataType::Float64),
         DataType::Date32 | DataType::Date64 => (Type::DATE, DataType::Date32),
+        DataType::Time32(_) | DataType::Time64(_) => (Type::TIME, DataType::Time64(TimeUnit::Microsecond)), // (`time`, as `micros_time` gives it)
+        DataType::Interval(_) => (Type::INTERVAL, DataType::Interval(IntervalUnit::MonthDayNano)), // (`PgInterval`: Postgres's text and binary)
         DataType::Timestamp(_, Some(_)) => (Type::TIMESTAMPTZ, DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))), // (an instant: sent in UTC)
         DataType::Timestamp(..) => (Type::TIMESTAMP, DataType::Timestamp(TimeUnit::Microsecond, None)),
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => (Type::BYTEA, DataType::Binary),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => (Type::TEXT, DataType::Utf8), // (text, as Postgres names a string expression's type)
         // Lists as Postgres's arrays (drivers give them as lists); of other things, as text.
         DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
             let of = |t: DataType| DataType::List(Arc::new(datafusion::arrow::datatypes::Field::new("item", t, true)));
@@ -610,6 +613,8 @@ macro_rules! encode {
             DataType::Float32 => row.encode_field(&c.as_primitive::<Float32Type>().value(i)),
             DataType::Float64 => row.encode_field(&c.as_primitive::<Float64Type>().value(i)),
             DataType::Date32 => row.encode_field(&c.as_primitive::<Date32Type>().value_as_date(i)),
+            DataType::Time64(_) => row.encode_field(&PgTime(c.as_primitive::<Time64MicrosecondType>().value(i))),
+            DataType::Interval(_) => row.encode_field(&PgInterval::of(c.as_primitive::<IntervalMonthDayNanoType>().value(i))),
             DataType::Timestamp(_, Some(_)) => row.encode_field(&c.as_primitive::<TimestampMicrosecondType>().value_as_datetime(i).map(|t| t.and_utc())),
             DataType::Timestamp(..) => row.encode_field(&c.as_primitive::<TimestampMicrosecondType>().value_as_datetime(i)),
             DataType::Binary => row.encode_field(&c.as_binary::<i32>().value(i)),
@@ -671,6 +676,62 @@ impl postgres_types::ToSql for Numeric {
 impl pgwire::types::ToSqlText for Numeric {
     fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
         out.extend_from_slice(self.0.as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+}
+
+/// An INTERVAL as Postgres sends it: its text (`interval_text`) or its binary (microseconds, days,
+/// months, in that order).
+#[derive(Debug)]
+struct PgInterval {
+    months: i64,
+    days: i64,
+    micros: i64,
+}
+
+impl PgInterval {
+    fn of(v: datafusion::arrow::datatypes::IntervalMonthDayNano) -> Self {
+        Self { months: v.months.into(), days: v.days.into(), micros: v.nanoseconds / 1000 }
+    }
+}
+
+impl postgres_types::ToSql for PgInterval {
+    fn to_sql(&self, _: &Type, out: &mut bytes::BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        use bytes::BufMut;
+        out.put_i64(self.micros);
+        out.put_i32(self.days as i32);
+        out.put_i32(self.months as i32);
+        Ok(postgres_types::IsNull::No)
+    }
+    fn accepts(ty: &Type) -> bool { *ty == Type::INTERVAL }
+    postgres_types::to_sql_checked!();
+}
+
+impl pgwire::types::ToSqlText for PgInterval {
+    fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(crate::pg_values::interval_text(self.months, self.days, self.micros).as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+}
+
+/// A TIME as Postgres sends it: its text (`time_text`, as few fraction digits as the value needs)
+/// or its binary (microseconds since midnight, which is what `NaiveTime` sends too).
+#[derive(Debug)]
+struct PgTime(i64);
+
+impl postgres_types::ToSql for PgTime {
+    fn to_sql(&self, _: &Type, out: &mut bytes::BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        use bytes::BufMut;
+        out.put_i64(self.0);
+        Ok(postgres_types::IsNull::No)
+    }
+    fn accepts(ty: &Type) -> bool { *ty == Type::TIME }
+    postgres_types::to_sql_checked!();
+}
+
+impl pgwire::types::ToSqlText for PgTime {
+    fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(crate::pg_values::time_text(self.0).as_bytes());
         Ok(postgres_types::IsNull::No)
     }
 }
@@ -776,11 +837,11 @@ impl CopyHandler for Backend {
     }
 }
 
-/// `$1`, `$2`… replaced by the portal's values: numbers as they are, anything else quoted. A
+/// `$1`, `$2`… replaced by the portal's values, each as a SQL literal of its type (`value`). A
 /// parameter's type is the client's, or else the one the query implies (`inferred`).
 fn bind(portal: &Portal<String>, inferred: &[Type]) -> PgWireResult<String> {
-    let mut sql = portal.statement.statement.clone();
-    for i in (0..portal.parameter_len()).rev() {
+    let mut values = Vec::with_capacity(portal.parameter_len());
+    for i in 0..portal.parameter_len() {
         let t = portal.statement.parameter_types.get(i).cloned().flatten().filter(|t| *t != Type::UNKNOWN);
         let t = t.or_else(|| inferred.get(i).cloned()).unwrap_or(Type::UNKNOWN);
         let v = match t {
@@ -788,21 +849,16 @@ fn bind(portal: &Portal<String>, inferred: &[Type]) -> PgWireResult<String> {
             Type::INT2 => portal.parameter::<i16>(i, &t)?.map(|v| v.to_string()),
             Type::INT4 => portal.parameter::<i32>(i, &t)?.map(|v| v.to_string()),
             Type::INT8 => portal.parameter::<i64>(i, &t)?.map(|v| v.to_string()),
-            Type::FLOAT4 => portal.parameter::<f32>(i, &t)?.map(|v| v.to_string()),
-            Type::FLOAT8 => portal.parameter::<f64>(i, &t)?.map(|v| v.to_string()),
             // arrays (embeddings for vector search): DataFusion's `[a, b, …]`
             Type::FLOAT4_ARRAY => list(portal.parameter::<Vec<Option<f32>>>(i, &t)?),
             Type::FLOAT8_ARRAY => list(portal.parameter::<Vec<Option<f64>>>(i, &t)?),
             Type::INT4_ARRAY => list(portal.parameter::<Vec<Option<i32>>>(i, &t)?),
             Type::INT8_ARRAY => list(portal.parameter::<Vec<Option<i64>>>(i, &t)?),
-            _ => portal.parameter::<String>(i, &Type::VARCHAR)?.map(|s| match s.parse::<f64>() {
-                Ok(_) if t == Type::UNKNOWN => s,
-                _ => format!("'{}'", s.replace('\'', "''")),
-            }),
+            _ => crate::pg_values::value(&t, portal.parameters[i].as_deref(), portal.parameter_format.is_binary(i)).map_err(user_error)?,
         };
-        sql = sql.replace(&format!("${}", i + 1), &v.unwrap_or_else(|| "NULL".into()));
+        values.push(v.unwrap_or_else(|| "NULL".into()));
     }
-    Ok(sql)
+    Ok(crate::pg_values::substitute(&portal.statement.statement, &values))
 }
 
 fn list<T: ToString>(v: Option<Vec<Option<T>>>) -> Option<String> {
@@ -875,7 +931,7 @@ impl Backend {
             return p.parameters(sql).iter().map(|t| pg_type(t, FieldFormat::Text).0).collect(); // (a key lookup's: its key's types, unplanned)
         }
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
-        let mut types = vec![Type::VARCHAR; n];
+        let mut types = vec![Type::TEXT; n]; // (text when the query doesn't say, as the doc above has it)
         if n > 0 && session_command(sql).is_none() && !crate::settings::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() && !crate::script::is(sql) {
             let plan = async {
                 let sql = crate::routines::expand(&self.app.lake, sql).await.ok()?;
@@ -931,4 +987,3 @@ fn trace() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("PONDRA_TRACE_PG").is_some());
     *ON
 }
-

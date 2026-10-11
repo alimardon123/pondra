@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Pondra as dbt and BI tools use it (ADR-030): its Postgres port, with Postgres's catalog.
 
-  clients_check.py [dbt,psql,sqlalchemy,jdbc,odbc,adbc,npgsql] [--port 8870]
+  clients_check.py [dbt,psql,sqlalchemy,jdbc,odbc,adbc,npgsql,params] [--port 8870] [--pg16 PORT]
+
+  (params takes a Postgres 16 running on PORT with --pg16, else starts one under the work folder.)
 
 - dbt: a project with seeds, a view, a table, incremental models (delete+insert, merge,
   append), a snapshot and data tests, run twice — the second time with changed seeds, so views
@@ -22,12 +24,21 @@
 - npgsql: Npgsql 4.0 (what Power BI Desktop's PostgreSQL connector carries) and 8: it loads the
   server's types on open (pg_type joined to pg_proc), then GetSchema's databases, tables, views
   and columns, and queries with a parameter.
+- params: psycopg 3 sends typed parameters (numeric, bytea, dates, times, timestamps with and
+  without a zone, uuid, json, jsonb, interval, text, boolean, float8), as text (`%t`) and binary
+  (`%b`): `SELECT %s` and an INSERT of each into a column of its type, read back, give Postgres
+  16's values and type codes, and `SELECT 70 + %s` with a Decimal gives the same. What Pondra
+  can't match is checked by name, as what it does: its results have no text, uuid, json or jsonb
+  type of their own (a text of the text sent), a uuid column is refused. A float8, infinities and
+  NaN included, is a float8 again, and `5 - $1` subtracts a negative one. A TIME and an INTERVAL print
+  as Postgres prints them.
 
 Needs: dbt-postgres (`PONDRA_DBT`, else `dbt` on PATH), Postgres 16's binaries
 (`PONDRA_PG_BIN`, else /usr/lib/postgresql/16/bin), java and javac with pgjdbc's jar
-(`PGJDBC_JAR`, else fetched once), psqlODBC with pyodbc, the .NET SDK (`dotnet`, with NuGet).
+(`PGJDBC_JAR`, else fetched once), psqlODBC with pyodbc, the .NET SDK (`dotnet`, with NuGet),
+psycopg 3 (`params` is skipped by name without it).
 """
-import argparse, json, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, contextlib, datetime as dt, decimal, json, math, os, re, shutil, subprocess, sys, tempfile, time, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -103,18 +114,28 @@ def rows_of(port, table, order, user):
     return [tuple(norm(v) for v in line.split("|")) for line in out.stdout.strip().splitlines()] if out.returncode == 0 else out.stderr.strip()
 
 
-def dbt_check(node_pg, work):
-    """The project against Pondra and against Postgres 16, run twice: the same rows."""
-    pg_dir = os.path.join(work, "pg16")
+@contextlib.contextmanager
+def postgres16(work, port):
+    """Postgres 16 on `port` for the length of the block, its data under `work` (run as `claude`
+    when this is root: initdb refuses root)."""
+    pg_dir = os.path.join(work, f"pg16-{port}")
     os.makedirs(pg_dir)
-    owner = "claude" if os.geteuid() == 0 else None  # (initdb refuses root)
+    owner = "claude" if os.geteuid() == 0 else None
     run_as = ["runuser", "-u", owner, "--"] if owner else []
     if owner:
         shutil.chown(pg_dir, owner)
     subprocess.run([*run_as, f"{PG_BIN}/initdb", "-D", f"{pg_dir}/data", "-A", "trust", "-U", "postgres"], check=True, capture_output=True)
-    pg_port = node_pg + 1
-    subprocess.run([*run_as, f"{PG_BIN}/pg_ctl", "-D", f"{pg_dir}/data", "-o", f"-p {pg_port} -k {pg_dir} -c listen_addresses=127.0.0.1", "-l", f"{pg_dir}/log", "-w", "start"], check=True, capture_output=True)
+    subprocess.run([*run_as, f"{PG_BIN}/pg_ctl", "-D", f"{pg_dir}/data", "-o", f"-p {port} -k {pg_dir} -c listen_addresses=127.0.0.1", "-l", f"{pg_dir}/log", "-w", "start"], check=True, capture_output=True)
     try:
+        yield
+    finally:
+        subprocess.run([*run_as, f"{PG_BIN}/pg_ctl", "-D", f"{pg_dir}/data", "-m", "immediate", "stop"], capture_output=True)
+
+
+def dbt_check(node_pg, work):
+    """The project against Pondra and against Postgres 16, run twice: the same rows."""
+    pg_port = node_pg + 1
+    with postgres16(work, pg_port):
         roots = {"pondra": (os.path.join(work, "dbt-pondra"), node_pg, "u"), "postgres": (os.path.join(work, "dbt-pg"), pg_port, "postgres")}
         steps, got = {}, {}
         for who, (root, port, user) in roots.items():
@@ -144,8 +165,6 @@ def dbt_check(node_pg, work):
         failed = {k: v[1] for k, v in steps.items() if not v[0]}
         diffs = {t: {"pondra": got["pondra"][t], "postgres": got["postgres"][t]} for t in got["pondra"] if got["pondra"][t] != got["postgres"].get(t)}
         return checks, {"failed steps": failed, "differences": diffs}
-    finally:
-        subprocess.run([*run_as, f"{PG_BIN}/pg_ctl", "-D", f"{pg_dir}/data", "-m", "immediate", "stop"], capture_output=True)
 
 
 # ---------------------------------------------------------------- psql, SQLAlchemy, JDBC, ODBC
@@ -355,10 +374,170 @@ def npgsql_check(pg, work):
     return checks, said
 
 
+# ---------------------------------------------------------------- params (psycopg 3)
+
+def param_cases():
+    """(name, the value psycopg 3 sends, the column it is written to, what Pondra answers to a SELECT,
+    what it answers for a value stored and read back). Where those are None, Pondra answers as
+    Postgres 16 does. Where not, it is a named difference, held to exactly: Pondra has no text, uuid,
+    json or jsonb type of its own, so a value of one comes back as a text (25) of the text it was
+    sent."""
+    from psycopg.types.json import Json, Jsonb
+    utc = dt.timezone.utc
+    as_text = lambda s: ("value", s, 25)
+    js = '{"a": [1, 2]}'
+    return [
+        ("numeric", decimal.Decimal("15.7563"), "NUMERIC", None, None),
+        ("numeric, negative", decimal.Decimal("-4.24"), "NUMERIC", None, None),
+        ("bytea", b"\xff\x00\x01", "BYTEA", None, None),
+        ("date", dt.date(2020, 1, 1), "DATE", None, None),
+        ("time", dt.time(12, 34, 56, 789000), "TIME", None, None),
+        ("timestamp", dt.datetime(2020, 1, 1, 12, 0), "TIMESTAMP", None, None),
+        ("timestamptz", dt.datetime(2020, 1, 1, 12, 0, tzinfo=utc), "TIMESTAMPTZ", None, None),
+        ("interval", dt.timedelta(days=1, seconds=3, microseconds=4), "INTERVAL", None, None),
+        ("uuid", uuid.UUID("12345678-1234-5678-1234-567812345678"), "UUID", as_text("12345678-1234-5678-1234-567812345678"), None),
+        ("json", Json({"a": [1, 2]}), "JSON", as_text(js), as_text(js)),
+        ("jsonb", Jsonb({"a": [1, 2]}), "JSONB", as_text(js), as_text(js)),
+        ("text", "it's", "TEXT", None, None),
+        ("boolean", True, "BOOLEAN", None, None),
+        ("double precision", 2.5, "DOUBLE PRECISION", None, None),
+        ("double precision, negative", -2.5, "DOUBLE PRECISION", None, None),
+        ("double precision, infinity", float("inf"), "DOUBLE PRECISION", None, None),
+        ("double precision, -infinity", float("-inf"), "DOUBLE PRECISION", None, None),
+        ("double precision, NaN", float("nan"), "DOUBLE PRECISION", None, None),
+    ]
+
+
+def _psycopg(port, db, user):
+    """A psycopg 3 connection that reads text as text: Pondra speaks UTF-8 only, and a Postgres made
+    without an encoding (SQL_ASCII) would otherwise hand psycopg bytes for every text value."""
+    import psycopg
+    return psycopg.connect(f"host=127.0.0.1 port={port} dbname={db} user={user} password={PASSWORD} client_encoding=UTF8",
+                           autocommit=True, prepare_threshold=None)
+
+
+def _pg_answer(conn, sql, args=None):
+    """What the server answers one statement: ("value", its first value, that column's type code), or
+    ("error", SQLSTATE, the message's first line)."""
+    try:
+        cur = conn.execute(sql, args)
+        return ("value", cur.fetchone()[0], cur.description[0].type_code)
+    except Exception as e:  # noqa: BLE001 (a refusal is an answer too)
+        return ("error", getattr(e, "sqlstate", None) or type(e).__name__, str(e).splitlines()[0][:200])
+
+
+def _stored(conn, table, coltype, ph, value):
+    """INSERT the value into a column of its type, then SELECT it back. A column the server refuses
+    is an answer too: ("refused", SQLSTATE, the message's first line)."""
+    try:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute(f"CREATE TABLE {table} (v {coltype})")
+    except Exception as e:  # noqa: BLE001
+        return ("refused", getattr(e, "sqlstate", None) or type(e).__name__, str(e).splitlines()[0][:200])
+    try:
+        conn.execute(f"INSERT INTO {table} (v) VALUES ({ph})", [value])
+    except Exception as e:  # noqa: BLE001
+        return ("error", getattr(e, "sqlstate", None) or type(e).__name__, str(e).splitlines()[0][:200])
+    return _pg_answer(conn, f"SELECT v FROM {table}")
+
+
+def _key(answer):
+    """An answer as it is compared: a value with its Python type and its type code (NaN is equal to
+    NaN here, which Python's own == is not); an error or a refusal by its SQLSTATE alone (the messages
+    differ by server)."""
+    if answer[0] != "value":
+        return answer[:2]
+    value = "NaN" if isinstance(answer[1], float) and math.isnan(answer[1]) else answer[1]
+    return (answer[0], type(answer[1]), value, *answer[2:])
+
+
+def _note(differences, label, got, want):
+    if _key(got) != _key(want):
+        differences.append(f"{label}: Pondra's answer {got!r} / Postgres's answer {want!r}")
+
+
+def _psql_value(port, user, db, sql):
+    r = subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(port), "-U", user, "-d", db, "-X", "-A", "-t", "-c", sql],
+                       capture_output=True, text=True, env={**os.environ, "PGPASSWORD": PASSWORD}, timeout=60)
+    return r.stdout.strip() if r.returncode == 0 else "ERROR " + r.stderr.strip()
+
+
+def params_check(pg, pg16):
+    """psycopg 3 against Pondra and against Postgres 16: each type as a parameter of SELECT and of an
+    INSERT, text (%t) and binary (%b), with Postgres 16's values and type codes. Pondra's own answers
+    where it has no type of Postgres's are held to by name; every other difference is listed."""
+    try:
+        import psycopg  # noqa: F401 (the part is skipped by name without it)
+    except ImportError:
+        return {}, {"skipped": "psycopg 3 isn't installed (pip install 'psycopg[binary]'): params wasn't run"}
+    pondra, postgres = _psycopg(pg, "lake", "u"), _psycopg(pg16, "postgres", "postgres")
+    checks, differences = {}, []
+    cases = param_cases()
+    how = lambda named: "as Pondra answers it (a named difference)" if named else "as Postgres 16 has it"
+    for i, (name, value, coltype, select_as, stored_as) in enumerate(cases):
+        for ph in ("%t", "%b"):
+            want = _pg_answer(postgres, f"SELECT {ph}", [value])
+            got = _pg_answer(pondra, f"SELECT {ph}", [value])
+            checks[f"{name} {ph}: SELECT {ph}, {how(select_as)}"] = _key(got) == _key(select_as or want)
+            _note(differences, f"SELECT {ph} of {name}", got, want)
+            table = f"pm_{i:02d}_{ph[1]}"
+            want = _stored(postgres, table, coltype, ph, value)
+            got = _stored(pondra, table, coltype, ph, value)
+            if got[0] == "refused":  # (a column Pondra has no type for: named, and never written)
+                checks[f"{name} {ph}: a {coltype} column is refused by name (Pondra)"] = coltype in got[2]
+                if ph == "%t":
+                    differences.append(f"CREATE TABLE … (v {coltype}): Pondra's answer {got[2]!r} / Postgres's answer created the column")
+                continue
+            checks[f"{name} {ph}: INSERT {ph}, then SELECT, {how(stored_as)}"] = _key(got) == _key(stored_as or want)
+            _note(differences, f"INSERT {ph} of {name}, then SELECT", got, want)
+    for ph in ("%t", "%b"):  # a numeric parameter's arithmetic: the same result on both
+        got = _pg_answer(pondra, f"SELECT 70 + {ph}", [decimal.Decimal("4.24")])
+        want = _pg_answer(postgres, f"SELECT 70 + {ph}", [decimal.Decimal("4.24")])
+        checks[f"SELECT 70 + {ph} with Decimal('4.24') is Decimal('74.24') with type 1700, as Postgres 16 has it"] = \
+            _key(got) == _key(want) == _key(("value", decimal.Decimal("74.24"), 1700))
+        _note(differences, f"SELECT 70 + {ph} with Decimal('4.24')", got, want)
+    for ph in ("%t", "%b"):  # a float parameter after a minus still subtracts, as it does on Postgres 16
+        got = _pg_answer(pondra, f"SELECT 5 - {ph}", [-2.5])
+        want = _pg_answer(postgres, f"SELECT 5 - {ph}", [-2.5])
+        checks[f"SELECT 5 - {ph} with -2.5 is 7.5 with type 701, as Postgres 16 has it"] = _key(got) == _key(want) == _key(("value", 7.5, 701))
+        _note(differences, f"SELECT 5 - {ph} with -2.5", got, want)
+    for conn in (postgres, pondra):  # a numeric parameter that isn't a number: refused, and nothing it says runs
+        conn.execute("DROP TABLE IF EXISTS pm_inj")
+        conn.execute("CREATE TABLE pm_inj (v TEXT)")
+        conn.execute("INSERT INTO pm_inj VALUES ('kept')")
+    injection = "1; DROP TABLE pm_inj"
+    got = _pg_answer(pondra, "SELECT %s::numeric", [injection])
+    want = _pg_answer(postgres, "SELECT %s::numeric", [injection])
+    kept = _pg_answer(pondra, "SELECT v FROM pm_inj")
+    checks["a numeric parameter that isn't a number is refused (22P02), and the table it names stays"] = \
+        got[:2] == ("error", "22P02") and kept[0] == "value" and kept[1] == "kept"
+    _note(differences, "SELECT %s::numeric with '1; DROP TABLE pm_inj'", got, want)
+    names = {name: i for i, (name, *_rest) in enumerate(cases)}  # (a TIME and an INTERVAL as psql prints them)
+    for name in ("time", "interval"):
+        table = f"pm_{names[name]:02d}_b"
+        got = _psql_value(pg, "u", "lake", f"SELECT v FROM {table}")
+        want = _psql_value(pg16, "postgres", "postgres", f"SELECT v FROM {table}")
+        checks[f"psql prints a {name} as Postgres 16 does"] = got == want
+        if got != want:
+            differences.append(f"psql, SELECT v FROM a {name}: Pondra's answer {got!r} / Postgres's answer {want!r}")
+    pondra.close()
+    postgres.close()
+    return checks, {"differences": differences}
+
+
+def params_part(pg, work, pg16):
+    """params against the Postgres 16 given by --pg16, else one started for it here."""
+    if pg16:
+        return params_check(pg, pg16)
+    with postgres16(work, pg + 1):
+        return params_check(pg, pg + 1)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("parts", nargs="?", default="dbt,psql,sqlalchemy,jdbc,odbc,adbc,npgsql")
+    ap.add_argument("parts", nargs="?", default="dbt,psql,sqlalchemy,jdbc,odbc,adbc,npgsql,params")
     ap.add_argument("--port", type=int, default=8870)
+    ap.add_argument("--pg16", type=int, default=None, help="a Postgres 16 already running on this port, for params (else one is started)")
     A = harness.A = ap.parse_args()
     A.s3, A.keep = False, False
     work = tempfile.mkdtemp(prefix="pondra-clients-")
@@ -373,7 +552,8 @@ def main():
         for part in A.parts.split(","):
             try:
                 checks, info = {"dbt": lambda: dbt_check(pg, work), "psql": lambda: psql_check(pg), "sqlalchemy": lambda: sqlalchemy_check(pg),
-                                "jdbc": lambda: jdbc_check(pg, work), "odbc": lambda: odbc_check(pg), "adbc": lambda: adbc_check(pg), "npgsql": lambda: npgsql_check(pg, work)}[part]()
+                                "jdbc": lambda: jdbc_check(pg, work), "odbc": lambda: odbc_check(pg), "adbc": lambda: adbc_check(pg), "npgsql": lambda: npgsql_check(pg, work),
+                                "params": lambda: params_part(pg, work, A.pg16)}[part]()
             except Exception as e:  # noqa: BLE001 (a part that couldn't run fails)
                 checks, info = {f"{part}: ran": False}, {"error": f"{type(e).__name__}: {str(e)[:1500]}"}
             results.update(checks)
@@ -384,8 +564,7 @@ def main():
         node.kill()
         shutil.rmtree(work, ignore_errors=True)
     ok = all(results.values())
-    if not ok:
-        print(json.dumps(said, indent=1, default=str)[:12000])
+    print(json.dumps(said, indent=1, default=str))  # (what each part said: its differences from the reference, its failures)
     print(json.dumps({"checks": len(results), "passed": sum(results.values()), "ok": ok}))
     sys.exit(0 if ok else 1)
 
