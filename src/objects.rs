@@ -154,7 +154,7 @@ impl Object {
         Object { kind, lake: lake.into(), schema: Some(schema.to_string()).filter(|s| !s.is_empty()), name: name.into(), comment: None, definition }
     }
     /// Its name in its lake's catalog: `schema.name`, or `name` in public.
-    fn local(&self) -> String { self.schema.as_deref().map_or_else(|| self.name.clone(), |s| join(s, &self.name)) }
+    pub(crate) fn local(&self) -> String { self.schema.as_deref().map_or_else(|| self.name.clone(), |s| join(s, &self.name)) }
     fn family(&self) -> &'static str { kind(self.kind).map_or("", |k| k.family) }
 }
 
@@ -184,7 +184,7 @@ pub async fn list(lake: &Lake) -> Result<Vec<Object>> {
 
 /// This lake and the lakes attached to it that the caller may use, by name: one that signs in on
 /// its own is listed only for whoever runs the nodes (invariant 240), as its tables are read.
-async fn lakes(lake: &Lake) -> Vec<(String, Arc<Lake>)> {
+pub(crate) async fn lakes(lake: &Lake) -> Vec<(String, Arc<Lake>)> {
     let mut all = vec![(crate::ddl::lake_name(lake), lake.arc())];
     let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().clone();
     for (name, l) in attached {
@@ -221,18 +221,24 @@ fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
         }
         let here = crate::ddl::lake_name(lake);
         let mut all = crate::ddl::listed(lake).await?;
-        if let Some(a) = crate::auth::limited() {
+        let limit = crate::auth::limited();
+        if let Some(a) = &limit {
             all.retain(|o| a.may("select", &if o.lake == here { join(&o.schema, &o.name) } else { format!("{}.{}", o.lake, join(&o.schema, &o.name)) }));
         }
         Ok(all.into_iter().map(|o| {
             let local = join(&o.schema, &o.name);
             let named = if o.lake == here { name_sql(&local) } else { format!("{}.{}.{}", ident(&o.lake), ident(&o.schema), ident(&o.name)) };
+            // (a column a user may not read is not shown by name either: a definition names every column, so a
+            // user granted only some of them gets none)
+            let catalog = if o.lake == here { local.clone() } else { format!("{}.{local}", o.lake) };
+            let partial = limit.as_ref().is_some_and(|a| a.columns("select", &catalog) != Some(None));
             let def = match o.kind {
                 "table" => o.meta.as_ref().map(|m| table_sql(&named, m)),
                 "view" => o.sql.as_ref().map(|s| format!("CREATE VIEW {named} AS\n{s}")),
                 "materialized view" => views.get(&(o.lake.clone(), local.clone())).or_else(|| views.get(&(o.lake.clone(), crate::once::open(&local)))).map(|v| materialized_sql(&named, v, o.meta.as_ref())),
                 _ => None, // (an external table's statement isn't kept as written; a window view's `_final` table is made with it)
             };
+            let def = def.filter(|_| !partial);
             let kind = KINDS.iter().find(|k| k.name == o.kind).map_or("table", |k| k.name);
             Object::new(kind, &o.lake, &local, def)
         }).collect())
@@ -443,7 +449,7 @@ pub fn ident(n: &str) -> String {
     if bare { n.to_string() } else { format!("\"{}\"", n.replace('"', "\"\"")) }
 }
 
-fn list_sql(names: &[String]) -> String { names.iter().map(|n| ident(n)).collect::<Vec<_>>().join(", ") }
+pub(crate) fn list_sql(names: &[String]) -> String { names.iter().map(|n| ident(n)).collect::<Vec<_>>().join(", ") }
 
 /// A string literal.
 fn literal(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
@@ -536,14 +542,20 @@ pub(crate) fn table_sql(name: &str, m: &TableMeta) -> String {
     s
 }
 
+/// An expectation as a view's `CREATE` writes it, after its name: a check that fails the flush, or
+/// an expectation that keeps or drops the rows that break it.
+pub(crate) fn expect_sql(e: &crate::views::Expect) -> String {
+    use crate::views::OnViolation;
+    match e.on {
+        OnViolation::Fail => format!("CHECK ({})", e.check),
+        OnViolation::Keep => format!("EXPECT ({})", e.check),
+        OnViolation::Drop => format!("EXPECT ({}) ON VIOLATION DROP ROW", e.check),
+    }
+}
+
 /// `CREATE MATERIALIZED VIEW`: its expectations, its options and its query.
 pub(crate) fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<&TableMeta>) -> String {
-    use crate::views::OnViolation;
-    let expect: Vec<String> = v.expect.iter().map(|e| match e.on {
-        OnViolation::Fail => format!("CONSTRAINT {} CHECK ({})", ident(&e.name), e.check),
-        OnViolation::Keep => format!("CONSTRAINT {} EXPECT ({})", ident(&e.name), e.check),
-        OnViolation::Drop => format!("CONSTRAINT {} EXPECT ({}) ON VIOLATION DROP ROW", ident(&e.name), e.check),
-    }).collect();
+    let expect: Vec<String> = v.expect.iter().map(|e| format!("CONSTRAINT {} {}", ident(&e.name), expect_sql(e))).collect();
     if let Some((sql, with)) = crate::once::written(v) {
         // (EMIT FINAL's, a session view's too: the window in the GROUP BY)
         let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
@@ -993,6 +1005,7 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
         "user" => "a user's password and tokens are never shown (CREATE USER … PASSWORD '…')",
         "recipient" => "a recipient's token is shown once, when it is made (ALTER RECIPIENT … ROTATE TOKEN gives it another)",
         "external table" => "its statement isn't kept as written yet (its query is in pondra.tables)",
+        _ if crate::auth::limited().is_some() => "its statement names every column, and you may read only some of them",
         _ => "made with its materialized view",
     }))?;
     let mut script = vec![def.clone()];
@@ -1025,13 +1038,14 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
     Ok(Some(format!("SELECT {} AS definition", literal(&format!("{};", script.join(";\n"))))))
 }
 
-/// Does `sql` read `pondra.objects` or `pondra.kinds`?
+/// Does `sql` read `pondra.objects`, `pondra.kinds` or `pondra.parts`?
 pub fn mentioned(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    s.contains("pondra.objects") || s.contains("pondra.kinds")
+    s.contains("pondra.objects") || s.contains("pondra.kinds") || s.contains("pondra.parts")
 }
 
-/// `pondra.objects` and `pondra.kinds`, as they are now (when `text` reads them).
+/// `pondra.objects` and `pondra.kinds`, as they are now (when `text` reads them). `pondra.parts` is
+/// listed only when a query names it: its views are planned to find their columns.
 pub async fn tables(lake: &Lake, text: &str) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
     use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray};
     use datafusion::datasource::MemTable;
@@ -1057,7 +1071,11 @@ pub async fn tables(lake: &Lake, text: &str) -> Result<Vec<(&'static str, Arc<dy
         ("privileges", cell("privileges")), ("on_clone", cell("on_clone")), ("in_project", flag("in_project")), ("undrop", flag("undrop")), ("secret", flag("secret")),
         ("lists", cell("lists")), ("about", cell("about")), ("also", cell("also")),
     ])?;
-    Ok(vec![("objects", mem(objects)?), ("kinds", mem(kinds)?)])
+    let mut out = vec![("objects", mem(objects)?), ("kinds", mem(kinds)?)];
+    if text.to_lowercase().contains("pondra.parts") {
+        out.push(("parts", mem(crate::find::parts_batch(&crate::find::parts(lake, &all).await?)?)?));
+    }
+    Ok(out)
 }
 
 /// One row per kind, then per part, then per pattern: what `pondra.kinds` and `GET /kinds` list. A
