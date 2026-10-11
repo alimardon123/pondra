@@ -591,6 +591,28 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     Ok(TableMeta { columns, files, ext: Some(spec.clone()), ..Default::default() })
 }
 
+/// The files a spec's path names, as `resolve` lists them (a glob, or a folder's files of the
+/// format): each one's full URL and its listing (its e-tag, size and time), sorted by name. Checked
+/// as a table's files are: a path of this machine only for the program that started the node.
+pub(crate) async fn objects(lake: &Lake, spec: &Spec) -> Result<Vec<(String, object_store_df::ObjectMeta)>> {
+    check(lake, spec).await?;
+    let u = &spec.urls[0];
+    let url = listing_url(u)?;
+    register(lake, u).await?;
+    let store = lake.rt.object_store(&url)?;
+    let ctx = lake.session();
+    let deep = u.contains("**") || glob_at(u).is_some_and(|i| u[i..].contains('/'));
+    ctx.state_ref().write().config_mut().options_mut().execution.listing_table_ignore_subdirectory = !deep;
+    let state = ctx.state();
+    let wanted = if u.ends_with('/') { format!(".{}", spec.format) } else { String::new() };
+    let found: Vec<_> = url.list_all_files(&state, store.as_ref(), &wanted).await?.try_collect().await?;
+    let root = url.object_store();
+    let root = root.as_str().strip_suffix('/').unwrap_or(root.as_str()).to_string();
+    let mut out: Vec<_> = found.into_iter().map(|o| (format!("{root}{}", url_path(&o)), o)).collect();
+    out.sort_by(|a, b| a.1.location.cmp(&b.1.location));
+    Ok(out)
+}
+
 /// A NULL's folder, as Hive, Spark, pyarrow and Polars name it.
 pub const NULL_FOLDER: &str = "__HIVE_DEFAULT_PARTITION__";
 
@@ -1134,6 +1156,9 @@ fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
 pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     use crate::ddl::Ddl;
     use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
+    if let Some(load) = copy_into_statement(&mut Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?) {
+        return Some(load);
+    }
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
     if let Some(copy) = copy_statement(&mut p) {
         return Some(copy);
@@ -1331,6 +1356,89 @@ fn copy_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<
         }
     }
     Some(crate::write::Stmt::CopyTo(query, to, options))
+}
+
+/// Clauses other engines spell for a load, refused by name with Pondra's own spelling (Databricks'
+/// FILEFORMAT, FORMAT_OPTIONS and COPY_OPTIONS, Snowflake's FILE_FORMAT and PATTERN).
+const LOAD_REFUSED: [(&str, &str); 5] = [
+    ("FILEFORMAT", "(FORMAT csv)"),
+    ("FORMAT_OPTIONS", "the reader's options by their names: (HEADER true, DELIM ';')"),
+    ("COPY_OPTIONS", "(FORCE true), to load every file again"),
+    ("FILE_FORMAT", "(FORMAT csv)"),
+    ("PATTERN", "a glob in the path: 's3://b/x/*.csv'"),
+];
+
+/// `COPY INTO t FROM 's3://b/x/*.csv' (FORMAT csv, HEADER true)` or `COPY INTO t FROM (SELECT … FROM
+/// 's3://b/x/*.csv')`: each file loaded once a version (`copy.rs`). None: not a COPY INTO.
+fn copy_into_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<crate::write::Stmt> {
+    use crate::copy::Source;
+    use datafusion::sql::sqlparser::{keywords::Keyword, tokenizer::Token};
+    if !p.parse_keywords(&[Keyword::COPY, Keyword::INTO]) {
+        return None;
+    }
+    let usage = "COPY INTO t FROM 's3://b/x/*.csv' (FORMAT csv, HEADER true), or FROM (SELECT … FROM 's3://b/x/*.csv')";
+    let invalid = |e: String| Some(crate::write::Stmt::Invalid(format!("{usage}: {e}")));
+    let table = match p.parse_object_name(false) {
+        Ok(t) => crate::write::object(&t),
+        Err(e) => return invalid(e.to_string()),
+    };
+    if !p.parse_keyword(Keyword::FROM) {
+        return invalid("FROM is missing".into());
+    }
+    let from = if p.consume_token(&Token::LParen) {
+        match p.parse_query().and_then(|q| p.expect_token(&Token::RParen).map(|_| q)) {
+            Ok(q) => Source::Query(q.to_string()),
+            Err(e) => return invalid(e.to_string()),
+        }
+    } else {
+        match p.parse_literal_string() {
+            Ok(path) => Source::Path(path),
+            Err(_) => return invalid("the path is a string".into()),
+        }
+    };
+    let mut options = BTreeMap::new();
+    if let Token::Word(w) = p.peek_token().token {
+        // (a clause outside the parentheses: another engine's spelling, or Pondra's options left out)
+        let name = w.value.to_uppercase();
+        return invalid(match LOAD_REFUSED.iter().find(|(n, _)| *n == name) {
+            _ if name == "FORCE" => "FORCE: Pondra writes (FORCE true)".into(),
+            Some((n, hint)) => format!("{n}: Pondra writes {hint}"),
+            None => format!("{}: the options go in parentheses after the path: (FORMAT csv, HEADER true)", w.value),
+        });
+    }
+    if p.consume_token(&Token::LParen) && !p.consume_token(&Token::RParen) {
+        loop {
+            let Ok(k) = p.parse_identifier() else { return invalid("an option's name".into()) };
+            let name = k.value.to_uppercase();
+            if let Some((_, hint)) = LOAD_REFUSED.iter().find(|(n, _)| *n == name) {
+                return invalid(format!("{name}: Pondra writes {hint}"));
+            }
+            let eq = p.consume_token(&Token::Eq); // (Snowflake's FORCE = TRUE: Pondra's is (FORCE true))
+            if eq && name == "FORCE" {
+                return invalid("FORCE: Pondra writes (FORCE true)".into());
+            }
+            let v = match p.peek_token().token {
+                Token::Comma | Token::RParen => "true".to_string(),
+                _ => match p.next_token().token {
+                    Token::SingleQuotedString(s) | Token::DoubleQuotedString(s) | Token::Number(s, _) => s,
+                    Token::Word(w) => w.value,
+                    t => return invalid(format!("{}: a value, not {t}", k.value)),
+                },
+            };
+            options.insert(k.value.to_lowercase(), v);
+            if p.consume_token(&Token::RParen) {
+                break;
+            }
+            if !p.consume_token(&Token::Comma) {
+                return invalid("options are separated by commas".into());
+            }
+        }
+    }
+    match p.peek_token().token {
+        Token::EOF | Token::SemiColon => {}
+        t => return invalid(format!("{t} after the options")),
+    }
+    Some(crate::write::Stmt::CopyInto(table, from, options))
 }
 
 /// Leader: keep a secret, sealed. Its scope's bucket may have no other secret's scope in it:

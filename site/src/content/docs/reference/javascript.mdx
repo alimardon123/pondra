@@ -1,15 +1,14 @@
 ---
 title: JavaScript client
 description: The pondra npm package, with every method of a connection, its arguments, what it returns and an example.
-sidebar:
-  order: 7
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
 The `pondra` package is a small client for a node's HTTP API. It has no dependencies and runs on
 Node 18 or later, or on any runtime with `fetch`. It is an ES module. `connect` reaches a node that
-is running, and `local` starts one on a folder and connects to it. JavaScript has no frames: SQL is
+is running and returns its connection, a `Pondra` (`new Pondra(url, options)` does the same), and
+`local` starts one on a folder and connects to it. JavaScript has no frames: SQL is
 its API, so files and other engines' tables are SQL's `read_*` functions and `COPY … TO`. See
 [names](/pondra/reference/names/).
 
@@ -72,15 +71,16 @@ await db.close();
 |---|---|
 | `await db.sql(query, params)` | a query's rows, as an array of objects. For other statements (`CREATE`, `INSERT`, `UPDATE`, `DELETE`, `CALL`, several at once), the last one's outcome. `params` gives values for `$name` in the query |
 | `await db.run(file, params = {})` | a `.sql` file on this machine, or else a `.sql`, `.py` or notebook file of the lake's, run on the node ([Run files as jobs](/pondra/guides/workspace/)); or SQL text. `$name` takes `params.name` |
+| `await db.find(text, { kind })` | every object, part and concept whose name, comment or definition has each word of `text`, best first: the rows of [`pondra.find`](/pondra/sql/system-tables/#parts-and-finding-things). `kind: "column"` searches one kind |
 
 A parameter is a JSON value: a number, string, boolean, `null` or an array.
 
 | Method | Returns |
 |---|---|
-| `await db.vars()` | this connection's SQL variables (`DECLARE $day …`, `$day = …`: [Variables](/pondra/reference/sql/#variables)) as an object of their values |
+| `await db.vars()` | this connection's SQL variables (`DECLARE $day …`, `$day = …`: [Variables](/pondra/sql/statements/#variables)) as an object of their values |
 | `await db.getVariable(name)` | one variable's value, `null` if it has none |
 | `await db.setVariable(name, value)` | sets it, as `$name = …` in SQL (the value bound, never pasted in) |
-| `await db.resetVariable(name)` | forgets it (`RESET $name`) |
+| `await db.resetVariable(name)` | forgets it (`RESET VARIABLE name`) |
 | `await db.parameters(file)` | a file of the lake's parameters: each `DECLARE PARAMETER`'s name, type, default and comment, and each `$name` it needs |
 
 ```js
@@ -109,16 +109,34 @@ console.log(await db.run("SELECT $x + 1 AS y", { x: 41 }));
 ```
 
 ```text
-{ seg: 2, duplicate: false, conflict: false, row: 0, ms: 0 }
+{ seg: 1, duplicate: false, conflict: false, row: 0, ms: 0, block: 0 }
 [ { item: 'cake', total: 4.5 }, { item: 'tea', total: 7 } ]
 [ { y: 42 } ]
 ```
+
+A null is left out of its row. `SELECT NULL AS x, 1 AS y` gives an object with no `x` key.
+
+```js
+import { connect } from "pondra";
+
+const db = connect("http://localhost:8080");
+console.log(await db.sql("SELECT NULL AS x, 1 AS y"));
+```
+
+```text
+[ { y: 1 } ]
+```
+
+<Aside type="caution">
+Read a missing key as `null`: `row.x ?? null`. This client doesn't put the nulls back, as the
+[Python client](/pondra/reference/python/#writing-rows) does.
+</Aside>
 
 ## Writing rows
 
 | Method | Returns |
 |---|---|
-| `await db.append(table, rows, retries = 10)` | appends an array of objects exactly once: a retry after a lost answer is recognised and not applied twice. Answers with `{ seg, duplicate, conflict, row, ms }`. An error the node refuses with (an HTTP status) is not retried |
+| `await db.append(table, rows)` | appends an array of objects exactly once: a retry after a lost answer is recognised and not applied twice. Answers with `{ seg, duplicate, conflict, row, ms, block }`, as the [Python client](/pondra/reference/python/#writing-rows) explains them. A node that is down, or turns the request away before running it, hands the append to the next node, for up to `retrySecs`. Any other refusal, such as `23514` for a CHECK, is thrown at once |
 | `await db.lookup(table, key)` | the current row of one key of a keyed table, or `null` |
 
 Other writes are SQL: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY`.
@@ -141,9 +159,9 @@ console.log(await db.lookup("users", 7), await db.lookup("users", 8));
 | Method | Returns |
 |---|---|
 | `await db.call(name, ...args)` | `CALL name(…)`: its rows or outcome. What the procedure printed is in `db.notices`, and goes to `onNotice` |
-| `await db.start(name, ...args)` | starts the procedure on the node without waiting, and answers with the run's id. The run's row in `pondra.runs` says how it went |
-| `await db.callProcedure(name, ...args)` | the same as `call`, from 0.22 |
-| `await db.task(name, sql, { schedule, after, when, retries, retryDelay, timeout, onFailure })` | [`CREATE TASK`](/pondra/reference/sql/#functions-procedures-and-tasks): `sql` run on a `schedule`, or `after` other tasks |
+| `await db.start(name, ...args)` | starts the procedure on the node without waiting. The run's row in `pondra.runs` says how it went. For the run's id, select `pondra.start(…) AS run` in SQL, as the example below does |
+| `await db.callProcedure(name, ...args)` | the name `call` had up to 0.22: the same method |
+| `await db.task(name, sql, { schedule, after, when, retries, retryDelay, timeout, onFailure })` | [`CREATE TASK`](/pondra/sql/statements/#functions-procedures-and-tasks): `sql` run on a `schedule`, or `after` other tasks |
 | `await db.executeTask(name, values)` | `EXECUTE TASK`: its graph runs now, with these values for its tasks' `$name`s; answers with the run's id |
 | `await db.wait(id)` | waits for a run (`start`'s or `executeTask`'s) to end, as SQL's `AWAIT 'id'`; throws its error if it failed |
 
@@ -155,13 +173,14 @@ import { connect } from "pondra";
 const db = connect("http://localhost:8080");
 await db.sql("CREATE PROCEDURE report(day VARCHAR) LANGUAGE sql AS $$ SELECT count(*) AS n, $day AS day FROM orders; $$");
 console.log(await db.call("report", "2026-09-27"));
-const run = await db.start("report", "2026-09-28");
-console.log(typeof run);
+const [{ run }] = await db.sql("SELECT pondra.start('report', '2026-09-28') AS run");
+await db.wait(run);
+console.log(await db.sql(`SELECT routine, status FROM pondra.runs WHERE id = '${run}'`));
 ```
 
 ```text
 [ { n: 2, day: '2026-09-27' } ]
-string
+[ { routine: 'report', status: 'ok' } ]
 ```
 
 ## Views
@@ -173,7 +192,7 @@ by name.
 |---|---|
 | `materialized: true` | keep it up to date with each new row (`CREATE MATERIALIZED VIEW`) instead of running the query when it is read |
 | `replace` | for a stored view, `false` refuses to replace one that exists |
-| other options | the options of a materialized view: `window`, `size_secs`, `slide_secs`, `lateness_secs`, `session`, `gap_secs`, `join`, `time`, `within_secs`. They need `materialized: true`. See [table options](/pondra/reference/table-options/#materialized-views) |
+| other options | the options of a materialized view: `window`, `size_secs`, `slide_secs`, `lateness_secs`, `session`, `gap_secs`, `join`, `time`, `within_secs`. They need `materialized: true`. See [table options](/pondra/sql/table-options/#materialized-views) |
 
 ```js
 import { connect } from "pondra";
@@ -221,13 +240,40 @@ for await (const rows of db.live("SELECT count(*) AS n FROM orders")) {
 
 | Member | Meaning |
 |---|---|
-| `db.url`, `db.token` | where the node is, and the token in use |
+| `db.url`, `db.urls` | the node in use (the first, to begin with), and every node the connection was given |
+| `db.token` | the token in use |
+| `db.held` | the node holding this connection's session, while one does (a transaction, temporary tables, settings, variables); `null` otherwise |
 | `db.notices` | what the last statement's procedures printed, as an array of strings |
 | `db.onNotice` | the function each notice goes to |
 | `db.producer`, `db.seq` | the name `append` writes under, and its last sequence number |
 | `db.session` | this connection's session id: its temporary tables and views, and the variables of its `DO LANGUAGE python` blocks, live under it |
 | `db.position` | the commit the last `live` answer is as of |
 | `await db.request(method, path, body, type)` | one HTTP request to the node, as the methods above make them. Answers the `fetch` response, and throws on an error status with the text `status: message`; the error's `sqlstate` is Postgres's code for it (`23514`, `40001`…) |
+
+The members are read from the connection. `request` is for a path the methods don't cover:
+
+```js
+import { connect } from "pondra";
+
+const db = connect("http://localhost:8080");
+console.log(db.urls.length, db.producer.startsWith("js-"));
+console.log(db.session !== "", db.notices, db.seq, db.held);
+await db.setVariable("top", 2);
+console.log(await db.getVariable("top"), await db.getVariable("nope"));
+await db.resetVariable("top");
+console.log(await db.getVariable("top"));
+const stats = await db.request("GET", "/stats");
+console.log(stats.status);
+await db.close();
+```
+
+```text
+1 true
+true [] 0 null
+2 null
+null
+200
+```
 
 ## Close
 

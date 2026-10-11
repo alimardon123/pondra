@@ -14,11 +14,33 @@ not why it was designed so. Link to a design note only when a reader would want 
   measured them (`docs/prototype-status.md`), with what was measured.
 - Admit limits where a user would hit them, in an `<Aside type="caution">`.
 
+## Where a page goes
+
+The site has three tabs, each a top-level group of the sidebar in `astro.config.mjs` (`src/tabs.ts`
+shows a page its own tab's sidebar):
+
+- **Docs** teaches and does. *Get started* is tutorials, read in order. The groups after it (Data,
+  Streams, Python and code, Teams, Connect, Operate) are guides: one task or area each, shown by
+  example. *How it works* explains (`concepts/`).
+- **SQL** is the language looked up: every statement, function, option and system table (`sql/`).
+- **APIs** is every other door looked up: the clients, the command line, the protocols and the
+  environment variables (`reference/`).
+
+A page is one of these kinds, never two: a guide links to the reference for every option instead of
+listing them, and a reference never teaches. `PAGES.md` says what each page covers, so each thing is
+said once: on its owning page. Elsewhere, one line and a link.
+
+**A new feature lands with its docs:** a line and an example on *Everything Pondra does*
+(`start/features.mdx`, in its group), a section on the guide that owns its area, and its rows in the
+reference (a statement, a function, a method, a route, a flag, a variable). A new page goes into the
+sidebar group of its kind, in `astro.config.mjs`, and into `PAGES.md`.
+
 ## Pages
 
-- Frontmatter: `title` (short), `description` (one sentence, for search results), and optionally
-  `sidebar: { order: N }`. `setup:` is SQL that `tools/docs_check.py` runs before the page's
-  examples (hidden from readers). Use it only for data a page needs and doesn't show making.
+- Frontmatter: `title` (short), `description` (one sentence, for search results). `setup:` is SQL
+  that `tools/docs_check.py` runs before the page's examples (hidden from readers). Use it only for
+  data a page needs and doesn't show making. The sidebar's order is `astro.config.mjs`'s, not the
+  page's.
 - Use `.mdx` when you need components:
   `import { Tabs, TabItem, Aside, Card, CardGrid, Steps, LinkCard } from '@astrojs/starlight/components';`
 - Headings start at `##`. Keep sections short, and make every heading a task or a noun a reader

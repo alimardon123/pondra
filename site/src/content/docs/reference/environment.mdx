@@ -1,8 +1,6 @@
 ---
 title: Environment variables
 description: Every environment variable Pondra reads, with what it does and its default.
-sidebar:
-  order: 15
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -22,9 +20,10 @@ A number that is left unset, or set to something that is not a number, takes its
 | `PONDRA_WRITE_TOKEN` | none | the write token, when `--write-token` is not given |
 | `PONDRA_ADMIN_TOKEN` | none | the admin token, when `--admin-token` is not given. A node also sends it when it calls other nodes |
 | `PONDRA_TOKEN` | none | the token a program presents: `pondra run` (`--token`), a write made with `pondra sql`, and a node's calls to other nodes, which use it before the admin token |
-| `PONDRA_SECRET_KEY` | one made for the machine | the master key that wraps each [secret's](/pondra/reference/sql/#files-and-secrets) own key, and seals the lake's own keys (sessions', the nodes'). Every node of a cluster needs the same one. Without it, a key is made in `~/.pondra/secret.key` (from `HOME` or `USERPROFILE`), which is enough for nodes that share that machine's home |
+| `PONDRA_SECRET_KEY` | one made for the machine | the master key that wraps each [secret's](/pondra/sql/statements/#files-and-secrets) own key, and seals the lake's own keys (sessions', the nodes'). Every node of a cluster needs the same one. Without it, a key is made in `~/.pondra/secret.key` (from `HOME` or `USERPROFILE`), which is enough for nodes that share that machine's home |
 | `PONDRA_SECRET_KEY_PREVIOUS` | none | the master key before it changed: secrets' keys and the lake's own keys it wrapped still open, and the leader rewraps them with the new one when it starts |
 | `PONDRA_KMS_COMMAND` | none | a key service in place of the master key: a command run with `wrap` or `unwrap` and a data key on its input, answering on its output (a script over `aws kms`, `gcloud kms`, `az keyvault key` or Vault's transit) |
+| `PONDRA_PASSWORD` | none | a user's password for `pondra login --user` and the project commands' user sign-in, used instead of asking for it. Set it for one command, so it doesn't stay in your shell |
 | `PONDRA_SESSION_HOURS` | 12 | how long a user's session lasts (`POST /login`, a Flight handshake) |
 | `PONDRA_TLS_CERT`, `PONDRA_TLS_KEY` | none | a PEM certificate and its key, when `--tls-cert` and `--tls-key` are not given: every door takes [TLS](/pondra/guides/security/#tls), and nodes call each other over HTTPS |
 | `PONDRA_TLS_CA` | none | the authority that signed the nodes' certificates, when `--tls-ca` is not given: nodes show theirs to each other (mutual TLS), and the nodes' own key is taken only with one it signed |
@@ -46,6 +45,18 @@ An empty value counts as not set. See [HTTP](/pondra/reference/http/#roles) for 
 PONDRA_ADMIN_TOKEN="$ADMIN" PONDRA_WRITE_TOKEN="$WRITE" PONDRA_READ_TOKEN="$READ" \
 PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 ```
+
+## Projects and logins
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PONDRA_ENV` | the git branch's database | the environment the project commands use when none is named: `pondra apply`, `pondra plan`, `pondra status` and the rest. `--env` or the name after the command wins |
+| `PONDRA_HOME` | `~/.pondra` (from `HOME`, or `USERPROFILE` on Windows) | the folder where `pondra login` keeps the tokens it saved, in `login.json` |
+
+[`pondra ci init`](/pondra/guides/environments/#branches-and-environments-on-a-team) also makes three
+GitHub secrets: `PONDRA_DEV_TOKEN` (for the server branches are made on), `PONDRA_TEST_TOKEN` (test's
+server) and `PONDRA_PROD_TOKEN` (in the `prod` environment, which a reviewer approves). The workflow it
+writes hands each job the one it needs as `PONDRA_TOKEN`; Pondra itself never reads them.
 
 ## Finding things
 
@@ -71,12 +82,13 @@ PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 | `PONDRA_PAGES_MB` | `256` | the memory for answers of more than 10,000 rows that a node keeps, so the console turns their pages (`GET /sql/pages/{id}`) without running them again. Each is kept 20 minutes after it was last read; past this size, the least lately read go first |
 | `PONDRA_CONFIG_DIR` | `%APPDATA%\pondra` on Windows, `~/Library/Application Support/pondra` on a Mac, `~/.config/pondra` elsewhere | where a node keeps what it keeps for its machine: the console's [settings](/pondra/start/console/#settings) (`console.json`) and the Python chosen in it (`python.txt`) |
 | `PONDRA_CONSOLE_EXTENSIONS` | none | scripts the console loads after its own, separated as `PATH` is: an [extension](/pondra/start/console/#extend-it) adds sections, tabs, views of answers and actions. Served at `/console/ext/{n}.js` |
+| `PONDRA_CONSOLE_DIR` | none | a folder the console's own files are read from on every request, instead of the built-in ones. For working on the console itself |
 | `PONDRA_SESSION_IDLE_SECS` | `3600` | a session idle this long ends. Its temporary tables go, and so does its [Python](/pondra/guides/functions-and-procedures/#cells-that-share-variables), with the variables its `DO LANGUAGE python` blocks made |
 | `PONDRA_TXN_IDLE_SECS` | `600` | a transaction idle this long ends, rolled back ([Transactions](/pondra/guides/change-rows/#transactions)) |
-| `PONDRA_TRACE_PG` | unset | `1`: where each Postgres statement's time goes, on the node's stderr |
 | `PONDRA_DATABASE_IDLE_SECS` | `600` | serving a [folder of lakes](/pondra/guides/server/): a database's node with no connection open and no request on its way, that nothing has used for this long, and that has nothing left to tier, stops. The next query starts it again |
 | `PONDRA_PIN_LEASE_SECS` | `1209600` (14 days) | on a base: a branch on another server's pin that isn't renewed for this long goes, and with it what the base kept for that branch ([branches across servers](/pondra/guides/environments/#production-on-a-server-of-its-own)) |
 | `PONDRA_PIN_RENEW_SECS` | `3600` | on a branch: how often its node renews its pins in bases on other servers |
+| `PONDRA_BLOCKING_THREADS` | four a core, at least 16 (512 on Windows) | the most blocking threads a node keeps for file reads and writes. Each one goes after a second idle |
 | `PONDRA_CODEC` | `lz4` | how data files are compressed: `lz4` (fastest to read), `zstd` (smaller files), `snappy` or `none` |
 
 ## Queries across nodes
@@ -105,7 +117,7 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PONDRA_GC_SECS` | `60` | how often the catalog's write-ahead-log objects and old manifests are cleared, and how old they must be |
+| `PONDRA_GC_SECS` | `5` for the write-ahead log and `60` for manifests on a local disk; `60` for both on a bucket | how often the catalog's write-ahead-log objects and old manifests are cleared, and how old they must be. Set it to use one value for both |
 | `PONDRA_RUNS_DAYS` | `30` | how many days the run log, `pondra.runs`, keeps. Read when the log is first made |
 | `PONDRA_BUCKET_REQUESTS` | `256` | how many requests a node sends a bucket at once to start with. It halves when the bucket answers 503 or 429, and grows back, up to four times this |
 | `PONDRA_FILE_VERSIONS` | `50` | how many versions of each of the lake's files are kept ([versions](/pondra/reference/http/#files)) |
@@ -125,12 +137,20 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PONDRA_AI_URL` | `http://127.0.0.1:11434/v1` | the OpenAI-compatible endpoint that [`ai_complete` and `ai_embed`](/pondra/reference/functions/#models) call |
+| `PONDRA_AI_URL` | `http://127.0.0.1:11434/v1` | the OpenAI-compatible endpoint that [`ai_complete` and `ai_embed`](/pondra/sql/functions/#models) call |
 | `PONDRA_AI_KEY` | none | sent as a bearer token to that endpoint, if it wants one |
 | `PONDRA_AI_MODEL` | `llama3.2` | the model `ai_complete` uses when the call names none |
 | `PONDRA_EMBED_MODEL` | `nomic-embed-text` | the model `ai_embed` uses when the call names none |
 | `PONDRA_AI_CALLS` | `16` | requests a node has in flight to that endpoint at most, from all its queries together |
 | `PONDRA_AI_TIMEOUT_SECS` | `300` | how long one request may take before its rows are `NULL` |
+
+## Sharing
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PONDRA_SHARING_URL` | this node's `/delta-sharing` address | the address recipients reach the sharing door at, written into a profile. Set it to an address that outlives the nodes, such as a load balancer's |
+| `PONDRA_SHARE_URL_SECS` | `900` | how long a link to a shared file lasts, at most 7 days |
+| `PONDRA_SHARE_FILES_PER_MINUTE` | `10000` | the most file links a recipient may be given in a minute, from each node. More is `429` |
 
 ## Writes with `pondra sql`
 
@@ -171,12 +191,22 @@ Do not set these. Pondra sets them for its own processes, and some are copies of
 | `PONDRA_PUBLISH`, `PONDRA_CHANGELOG_SECS`, `PONDRA_FSYNC`, `PONDRA_REPLICAS` | `pondra serve`, from `--publish`, `--changelog-secs`, `--fsync`, `--ack` and `--replicas` | the flags' values, for the rest of the node. Setting them in the environment has no effect: `serve` overwrites them. Use the flags |
 | `PONDRA_TRIES` | `pondra sql` | how many times a write has started over after another node took the lake |
 | `PONDRA_SERVER_URL` | `pondra serve` on a folder of lakes, for each database's node | where the process that serves the folder is, for `DROP DATABASE` |
+| `PONDRA_NODE_KEY` | `pondra serve`, from the lake's own key, when this isn't set | the key nodes call each other with when no admin or other token is set. Every node of a lake has the same one |
+| `PONDRA_SUPERVISED` | `pondra service`, for the node it starts | `1`: a service manager runs the node. A node that must restart to rejoin exits with status 75, and the manager starts it again |
+
+## Debugging
+
+These print what a node does, on its standard error. Leave them off except when you are finding a problem.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PONDRA_DEBUG_SPREAD` | unset | `1`: why each query ran on one node, or across them, with the estimate that decided |
+| `PONDRA_DEBUG_JOIN_ORDER` | unset | `1`: each join order the planner weighs, with the rows the order written moves and the rows the order chosen moves |
+| `PONDRA_DEBUG_PG` | unset | `1`: each statement the Postgres port gets, as it arrives and as it runs |
+| `PONDRA_TRACE_PG` | unset | `1`: where each Postgres statement's time goes |
+| `PONDRA_TRACE_START` | unset | `1`: a cold start's steps and their times (`tools/cold_trace.sh`) |
 
 <Aside type="caution">
-`PONDRA_CRASH`, `PONDRA_DROP_BEATS`, `PONDRA_NO_DIRECT`, `PONDRA_DEBUG_SPREAD` (why each query ran on
-one node or across them, with the estimate that decided), `PONDRA_DEBUG_JOIN_ORDER` (each join order
-considered: the rows the order written moves, the rows the order chosen moves, and each input's size)
-and `PONDRA_DEBUG_PG` (which prints each statement the Postgres port gets, as it arrives and as it
-runs) are for tests and debugging. `PONDRA_CRASH` aborts the process at chosen points, at random, to test recovery. Never
-set it on a node that matters.
+The variables the test suite sets to break things on purpose are not listed here. Don't set any
+variable you find in the source that this page doesn't list.
 </Aside>

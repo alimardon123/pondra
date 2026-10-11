@@ -1,8 +1,6 @@
 ---
 title: Tables
 description: Create tables with CREATE TABLE and its options, group them in schemas and databases, change their columns, and drop them.
-sidebar:
-  order: 1
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -60,7 +58,7 @@ CREATE TABLE tea_orders AS SELECT * FROM orders WHERE item = 'tea';
 ```
 
 A value that doesn't fit its column is refused, and the error names the value: `'abc'` into a
-`BIGINT` is an error, never a `NULL`. Types are in [SQL statements](/pondra/reference/sql/#types).
+`BIGINT` is an error, never a `NULL`. Types are in [SQL statements](/pondra/sql/statements/#types).
 
 ### Require a value: `NOT NULL` and `DEFAULT`
 
