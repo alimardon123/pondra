@@ -10890,6 +10890,40 @@ def cursors():
             c.rollback()
         checks["inside a transaction, DECLARE reads its own writes (3 rows); another connection sees the committed 1"] = own_writes == 3 and others == 1
 
+        # The cursor memory budget (PONDRA_CURSORS_MB, 1 MB here, on a second node of the same lake): a DECLARE whose
+        # answer would pass it is refused by name (53200), a small one works, a cursor already held is never evicted,
+        # and CLOSE gives its memory back.
+        node2 = Node(lake, A.port + 1, pg=f"127.0.0.1:{pg + 1}", env={"PONDRA_CURSORS_MB": "1"}).start()
+        try:
+            until(lambda: sql(A.port + 1, "SELECT count(*) AS n FROM big"), [{"n": 25000}], 20)
+            url2 = f"host=127.0.0.1 port={pg + 1} user=u dbname=lake"
+
+            def refusal(c, stmt):
+                """The SQLSTATE and message of a statement that is refused, or (None, None) when it runs."""
+                try:
+                    c.execute(stmt)
+                    return None, None
+                except psycopg.Error as e:
+                    return e.sqlstate, str(e)
+
+            with psycopg.connect(url2, autocommit=True) as a, psycopg.connect(url2, autocommit=True) as b:
+                big_code, big_msg = refusal(b, "DECLARE bigc CURSOR WITH HOLD FOR SELECT value AS id, CAST(value AS VARCHAR) AS s FROM range(1, 300001)")
+                b.execute("DECLARE sm CURSOR WITH HOLD FOR SELECT 1 AS one")
+                small = b.execute("FETCH 1 FROM sm").fetchone()
+                b.execute("CLOSE sm")
+                a.execute("DECLARE m1 CURSOR WITH HOLD FOR SELECT value FROM range(1, 80001)")
+                second_code, second_msg = refusal(b, "DECLARE m2 CURSOR WITH HOLD FOR SELECT value FROM range(1, 80001)")
+                kept = a.execute("FETCH 1 FROM m1").fetchone()  # (the cursor held is still there: nothing evicted)
+                a.execute("CLOSE m1")
+                after_close = refusal(b, "DECLARE m2 CURSOR WITH HOLD FOR SELECT value FROM range(1, 80001)")
+            info["budget"] = {"big": big_msg, "second": second_msg, "after_close": after_close}
+            checks["the cursor budget (PONDRA_CURSORS_MB): a DECLARE whose answer would pass it is refused by name, saying what is held and needed (53200); a small one works"] = \
+                big_code == "53200" and all(x in (big_msg or "") for x in ("PONDRA_CURSORS_MB", "hold", "needs", "CLOSE", "WHERE")) and small == (1,)
+            checks["…a cursor already held is never evicted (the next FETCH is its row), and CLOSE gives its memory back (the next DECLARE runs)"] = \
+                second_code == "53200" and kept == (1,) and after_close == (None, None)
+        finally:
+            node2.kill()
+
         # DECLARE is one row of pondra.history, as every statement a door runs is.
         with psycopg.connect(url, autocommit=True) as a:
             a.execute("DECLARE hist_probe CURSOR WITH HOLD FOR SELECT 1 AS hist_probe_col")

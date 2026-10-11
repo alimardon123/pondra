@@ -11,11 +11,14 @@
 //! are refused by name. A cursor without HOLD lives as long as the transaction it was declared in,
 //! as in Postgres: it keeps that transaction's id, and `sweep` drops it once the session's open
 //! transaction is no longer that one. A WITH HOLD cursor lives until CLOSE or the session's end.
+//!
+//! The answers the node's cursors hold are kept within `PONDRA_CURSORS_MB` together. A DECLARE that
+//! would pass it is refused (53200), never answered by dropping a cursor someone is still reading.
 use crate::auth::Role;
 use crate::codes::coded;
 use crate::server::App;
 use crate::txn;
-use anyhow::{ensure, Result};
+use anyhow::Result;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use std::collections::hash_map::Entry;
@@ -43,6 +46,7 @@ struct Cursor {
     batch: usize,        // the batch the next row is in
     row: usize,          // and its row in that batch
     txn: Option<String>, // the transaction it was declared in (None: WITH HOLD)
+    bytes: usize,        // what its answer holds in memory, counted as pages.rs counts an answer
 }
 
 /// Each session's cursors, by name. A session with none has no entry.
@@ -141,7 +145,9 @@ fn session() -> String { crate::temp::current().unwrap_or_default() }
 
 /// Runs a cursor statement in the current session, as `role` (signed in, as a query is).
 pub async fn run(app: &App, cmd: Cmd, role: Role) -> Result<Answer> {
-    ensure!(role >= Role::Read, "sign in first");
+    if role < Role::Read {
+        return Err(coded("28000", "sign in first"));
+    }
     sweep();
     match cmd {
         Cmd::Declare { name, hold, query } => declare_as(app, &name, hold, &query).await,
@@ -164,13 +170,37 @@ async fn declare_as(app: &App, name: &str, hold: bool, query: &str) -> Result<An
         Some(b) => b.schema(),
         None => planned(app, query).await?,
     };
-    match CURSORS.lock().unwrap().entry(session).or_default().entry(name.to_string()) {
+    let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+    let mut all = CURSORS.lock().unwrap(); // (the budget is checked under the lock the insert takes: two DECLAREs can't both pass it)
+    let held: usize = all.values().flat_map(|cs| cs.values()).map(|c| c.bytes).sum();
+    if held + bytes > budget() {
+        return Err(refused(held, bytes));
+    }
+    match all.entry(session).or_default().entry(name.to_string()) {
         Entry::Occupied(_) => Err(taken(name)),
         Entry::Vacant(v) => {
-            v.insert(Cursor { schema, batches, batch: 0, row: 0, txn: in_txn });
+            v.insert(Cursor { schema, batches, batch: 0, row: 0, txn: in_txn, bytes });
             Ok(Answer::Tag("DECLARE CURSOR".into()))
         }
     }
+}
+
+/// The most the node's cursors may hold together, in bytes: `PONDRA_CURSORS_MB` (1024 MB), as pages.rs
+/// reads its own. Nothing held is dropped to make room; a client is still reading each cursor.
+fn budget() -> usize { std::env::var("PONDRA_CURSORS_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024) << 20 }
+
+/// The refusal: what the node's cursors hold and what this answer needs, in MB, and the ways out.
+fn refused(held: usize, needs: usize) -> anyhow::Error {
+    let mb = |bytes: usize| format!("{:.1}", bytes as f64 / (1 << 20) as f64);
+    coded(
+        "53200",
+        format!(
+            "the cursors on this node hold {} MB and this answer needs {} MB, past PONDRA_CURSORS_MB ({} MB): CLOSE some cursors, or read the answer in parts with a WHERE",
+            mb(held),
+            mb(needs),
+            budget() >> 20
+        ),
+    )
 }
 
 /// The columns of a query that returned no rows, from its plan.

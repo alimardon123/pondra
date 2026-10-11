@@ -283,7 +283,7 @@ impl Backend {
         }
         let role = crate::auth::current().map_or(crate::auth::Role::None, |p| p.role);
         if role < crate::auth::Role::Read {
-            return Err(user_error(anyhow::anyhow!("sign in first")));
+            return Err(user_error(crate::codes::coded("28000", "sign in first")));
         }
         if crate::routines::runs_procedure(&sql) {
             let who = crate::routines::Who { role, files: false, depth: 0 };
