@@ -1,6 +1,6 @@
 ---
 title: System columns and tables
-description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.objects, pondra.kinds, pondra.dropped, pondra.flows and pondra.expectations tables.
+description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.objects, pondra.kinds, pondra.parts, pondra.find, pondra.dropped, pondra.flows and pondra.expectations tables.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -283,6 +283,87 @@ COMMENT ON TABLE shelf IS 'one row a shelf';
 SELECT kind, name, comment, definition FROM pondra.objects WHERE name = 'shelf';
 SELECT kind, statements FROM pondra.kinds WHERE kind IN ('table', 'task');
 ```
+
+## Parts and finding things
+
+`pondra.parts` lists what is inside every object you may see: a table's or view's columns (with their
+comments), a table's key, links and checks, a materialized view's expectations, a routine's parameters
+and an enum type's labels. A user granted some columns of a table sees only those columns, no other
+part of that table, and not its definition.
+
+| Column | Meaning |
+|---|---|
+| `kind` | `column`, `key`, `link`, `check`, `parameter`, `label` or `expectation` |
+| `lake`, `schema`, `object` | where the object it is inside is |
+| `object_kind` | that object's kind, as `pondra.objects` names it |
+| `name` | the part's name: a column's SQL name, a constraint's name, a parameter's, a label |
+| `type` | a column's or parameter's type, or null |
+| `comment` | a column's comment, or null |
+| `definition` | a key's, link's, check's or expectation's SQL, or a parameter's `DEFAULT`; else null |
+
+`pondra.find('words')` searches objects, parts and Pondra's own concepts at once. A row matches when
+every word is in one of its fields: its name, its comment, its definition, or for a concept the names
+other products use for it, so `pondra.find('foreign key')` finds the `link` part and
+`pondra.find('pipeline')` the `flow` pattern. `kind => 'column'` searches one kind only, and then no
+concepts.
+
+| Column | Meaning |
+|---|---|
+| `rank` | its place in the answer: a name that is the whole text first, then by the field that matched (name before comment before definition), then shorter names first |
+| `is` | `object`, `part` or `pattern` (a concept is listed under what it is) |
+| `kind` | its kind |
+| `lake`, `schema`, `object` | where it is (the object itself, or the one a part is inside); null for a concept |
+| `name` | its name |
+| `about` | its comment, or a concept's line from [`pondra.kinds`](#every-object) |
+| `matched` | the field that held the words: `name`, `comment`, `definition`, `also` or `about` |
+
+```sql
+CREATE TABLE sales (id BIGINT, net DOUBLE, region VARCHAR);
+COMMENT ON COLUMN sales.net IS 'revenue after refunds';
+SELECT kind, object, name, type, comment FROM pondra.parts WHERE object = 'sales' ORDER BY name;
+```
+
+```text
++--------+--------+--------+---------+-----------------------+
+| kind   | object | name   | type    | comment               |
++--------+--------+--------+---------+-----------------------+
+| column | sales  | id     | BIGINT  |                       |
+| column | sales  | net    | DOUBLE  | revenue after refunds |
+| column | sales  | region | VARCHAR |                       |
++--------+--------+--------+---------+-----------------------+
+```
+
+The word is in the column's comment, not its name:
+
+```sql
+SELECT rank, is, kind, object, name, matched FROM pondra.find('revenue');
+```
+
+```text
++------+------+--------+--------+------+---------+
+| rank | is   | kind   | object | name | matched |
++------+------+--------+--------+------+---------+
+| 1    | part | column | sales  | net  | comment |
++------+------+--------+--------+------+---------+
+```
+
+Other products' words find Pondra's concepts:
+
+```sql
+SELECT is, kind, name, matched FROM pondra.find('foreign key');
+```
+
+```text
++------+------+------+---------+
+| is   | kind | name | matched |
++------+------+------+---------+
+| part | link | link | also    |
++------+------+------+---------+
+```
+
+Both are worked out for each statement, so they are never a remembered answer. The clients have
+`db.find(text, kind=…)` ([Python](/pondra/reference/python/), [JavaScript](/pondra/reference/javascript/)),
+and agents the [MCP](/pondra/reference/mcp/) tool `find`.
 
 ## Dropped tables
 

@@ -96,6 +96,7 @@ True True True []
 | `db.from_arrow(data, name=None)` | rows of this machine as a frame: a pyarrow, pandas or Polars table, or a list of dicts. Also `from_pandas`, `from_polars`, `from_rows` |
 | `db.vars` | SQL's [variables](/pondra/sql/statements/#variables): `db.vars.day` (or `db.vars["day"]`) is `$day`, `db.vars.day = date(2026, 9, 30)` sets it, `del db.vars.day` forgets it, `dict(db.vars)` has them all. `db.vars.keys()`, `db.vars.items()`, a `for` loop, `len` and `in` work too. In a procedure or a file run, they are the run's own |
 | `db.parameters(file)` | a file's parameters (a SQL file's `DECLARE PARAMETER`s and the `$name`s it uses unset; a `.py` file's `# %% tags=["parameters"]` cell): name, type, default, required, description |
+| `db.find(text, kind=None)` | every object, part and concept whose name, comment or definition has each word of `text`, best first, as a list of dicts: the rows of [`pondra.find`](/pondra/sql/system-tables/#parts-and-finding-things). `kind="column"` searches one kind |
 
 In `sql` and `run`, a keyword argument is a `$name` parameter in the query. A keyword whose value
 is a frame, or pandas, Polars or Arrow data, is a table by that name, written `{name}` or plain.

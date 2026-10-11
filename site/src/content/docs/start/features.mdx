@@ -342,6 +342,13 @@ CHECKPOINT;
 SELECT schema, name, kind FROM pondra.tables WHERE lake = 'lake' ORDER BY 1, 2;
 ```
 
+### Search everything by meaning
+`pondra.find('revenue')` searches every object, column, key, link and routine by name, comment and definition, and Pondra's concepts by other products' words; `pondra.parts` lists what is inside each object. `db.find` and MCP's `find` tool ask the same. [System columns and tables](/pondra/sql/system-tables/#parts-and-finding-things)
+
+```sql
+SELECT is, kind, object, name, matched FROM pondra.find('foreign key');
+```
+
 ### Databases and attached lakes
 `CREATE DATABASE` makes a lake beside this one and attaches it, `ATTACH` attaches a lake that already exists, and `DETACH` lets go of it again. [Tables](/pondra/guides/tables/#use-other-lakes-as-databases)
 
