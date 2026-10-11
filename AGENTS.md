@@ -2068,6 +2068,35 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and a name this lake can't resolve go on to their own paths. `harness.py objects`: "an INSERT into a
    name no table has is refused…"; `doors`: "an INSERT into no table, 42P01" at every door;
    `history_check.py`: "an INSERT under a renamed table's old name is refused…".
+288. **An answer is counted until it is sent, and a big one goes in pieces** (`query::collect`,
+   `server::answer`, `stream`). A query's answer counts in the node's memory for queries as its
+   batches come, each buffer once (`RecordBatchMemoryCounter`: a page's batches share their
+   strings' buffers), and one that would pass it is refused (53200) instead of growing the node
+   past it. Over HTTP the count is held (`query::HELD`) until the body's last byte is sent. An
+   answer of `PONDRA_STREAM_MB` (8) or more as Arrow goes as JSON, CSV, TSV, NDJSON or Arrow in
+   pieces of about 1 MB, written on the queries' runtime a piece or two ahead of the client, never
+   rendered whole. Only a whole body is remembered (`Results`) or handed to the requests that
+   waited for the same query; those a streamed run covered run on their own. The Postgres port,
+   Flight and MCP let the count go when the answer is made. `harness.py answers_big`: every
+   format's pieces == the whole answer; an answer bigger than a 0.25 GB node's memory refused
+   (53200), the node answering after; 3M rows' peak at least half their JSON under rendering them
+   whole (442 MB against 715 when written).
+289. **A node runs at most `PONDRA_QUERIES` queries at once** (`server::TURNS`: four a core, 16 at
+   least), the rest in the order they asked, and one that waits `PONDRA_QUEUE_SECS` (60) is
+   refused (53300: a client asks again, or another node). A query run inside one this task runs (a
+   procedure's, a script's, a probe of DuckDB's spellings) uses its caller's turn (`TURN`), never
+   waiting for one its caller holds; the cluster's own calls (a spread query's shares and stages)
+   take none, or a coordinator holding every turn would wait for shares waiting for one.
+   `pondra_queries_running` and `pondra_queries_waiting` count them. `harness.py answers_big`:
+   two turns and four slow queries, two at once and the rest refused (53300) or answered after;
+   one turn does for a PIVOT, which asks the data first.
+337. **A file is loaded into a table once a version, and its record lands with its rows** (`copy.rs`,
+   `adopt::file`, `log::Filing::also`): `COPY INTO t FROM '…'` loads each file under the job
+   `load:{table, file, version}` (an e-tag, else size and time), so the bulk path's job mark keeps a
+   retry, a second statement and a failover to one load; the record `ld/{folder}/{sha256(file)}` is
+   written in the commit that records the file's rows, and the old version's job mark deleted there.
+   Records follow the table's folder through renames, drops and clones, and go 64 days after their load
+   (`PONDRA_LOAD_RETENTION_SECS`). `harness.py loads`.
 345. **`pondra.parts` and `pondra.find` show only what the caller may see** (`find::parts`, `find::found`):
    parts come only from the objects `objects::list` gave the caller; a user granted some columns of a table
    sees those columns and no other part of it, and that table's definition is not shown. Neither is a
@@ -2145,6 +2174,8 @@ python3 tools/harness.py backpressure   # writes wait for tiering past --backlog
 python3 tools/harness.py memory         # 240 small commits a second, no reader: the node's threads stay few and its own memory doesn't run away
 python3 tools/harness.py pace           # a writer's acks beside 64 querying clients stay near its acks alone (queries on their own runtime)
 python3 tools/harness.py tails          # a table's log tail kept between queries: reads == a model while rows land, a transaction's snapshot, a column added, tiering
+python3 tools/harness.py answers_big    # big answers in pieces in every format == whole, an answer past the node's memory refused (53200), query turns (53300)
+python3 tools/harness.py loads          # COPY INTO: each file once a version, through retries, two nodes, a kill; pondra.loads; renames, clones
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
 python3 tools/harness.py plans          # EXPLAIN's expected rows, history's fingerprint, plan_id, version, reads, writes, misestimate; what a run learned and pondra.learned
