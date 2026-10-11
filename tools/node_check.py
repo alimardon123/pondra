@@ -12,6 +12,10 @@ b. "a node stopped while it starts gives its term back too": a node is stopped a
    printing `serving`, and the next node on the folder must be ready in under 5 s. A try that serves
    before the stop lands is made again on a new folder, up to five times.
 
+Each node has a temporary folder of its own (TMPDIR), as on a machine of its own. Sharing one, a
+term's lock file shows the next node that the stopped one is gone, and neither check could tell a
+term given back from one kept.
+
 Only the standard library. Every node is this script's child: it is stopped by its standard input,
 and killed by its own pid if that doesn't end it. No other process is touched.
 """
@@ -35,6 +39,12 @@ def launch(bin_, lake, port, trace=False):
     its standard error (read by the caller); otherwise its log goes to a file beside the lake."""
     env = dict(os.environ)
     env.pop("PONDRA_TRACE_START", None)
+    # A temporary folder of its own, as if each node ran on a machine of its own: a term's lock file
+    # there would tell the next node at once that a stopped node is gone, whether or not it gave its
+    # term back. Each node then sees only the bucket, as on separate machines (invariant 17).
+    own = os.path.join(os.path.dirname(lake), f"tmp-{port}-{len(children)}")
+    os.makedirs(own, exist_ok=True)
+    env.update(TMPDIR=own, TMP=own, TEMP=own)
     err = subprocess.PIPE
     if trace:
         env["PONDRA_TRACE_START"] = "1"  # (a line per start step: `start: the lease 0.01 s`)
