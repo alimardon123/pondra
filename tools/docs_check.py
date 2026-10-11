@@ -19,7 +19,7 @@ A block whose info string says `norun` is shown but not run: things that can't r
 cluster, Windows, credentials, a command that serves until stopped). Other languages (text,
 json, toml, yaml, …) are never run.
 """
-import argparse, json, os, re, shutil, socket, subprocess, sys, tempfile, time, urllib.request
+import argparse, json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -27,6 +27,8 @@ BIN = os.environ.get("PONDRA_BIN") or os.path.join(ROOT, "target", "release", "p
 DOC_PORTS = {"http": 8080, "pg": 5432, "kafka": 9092, "flight": 8815}  # (what the docs say)
 PORTS = dict(DOC_PORTS)  # (where this run's node listens: --offset moves them, for runs side by side)
 RUN = {"sql", "python", "py", "js", "javascript", "bash", "sh", "shell"}
+BLOCK_SECS = 300  # (the longest a Python block may run)
+FETCH_REFUSES = {1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080}  # (ports Node's fetch won't call)
 FENCE = re.compile(r"^(\s*)(`{3,}|~{3,})\s*([\w+-]*)\s*(.*)$")
 
 # One Python per page: blocks come in on stdin as JSON lines, answers go out the same way.
@@ -159,13 +161,16 @@ def check_page(path, verbose):
                     py.stdin.write(json.dumps(code) + "\n")
                     py.stdin.flush()
                     answer = None
+                    stuck = threading.Timer(BLOCK_SECS, py.kill)  # (a wait that never ends fails the page, not the build)
+                    stuck.start()
                     while answer is None:  # (a library writing to the real stdout, as DuckDB's progress bar does, isn't the answer)
                         line = py.stdout.readline()
                         try:
-                            got = json.loads(line or '{"ok": false, "error": "python exited"}')
+                            got = json.loads(line or json.dumps({"ok": False, "error": f"python exited (or ran past {BLOCK_SECS} s)"}))
                         except json.JSONDecodeError:
                             continue
                         answer = got if isinstance(got, dict) and "ok" in got else None
+                    stuck.cancel()
                     if not answer["ok"]:
                         raise RuntimeError(answer.get("error", ""))
                     out = answer["out"]
@@ -205,7 +210,7 @@ def logs(work):
 
 
 GLOSSARY_MD = os.path.join(ROOT, "docs", "glossary.md")
-GLOSSARY_SITE = os.path.join(ROOT, "site", "src", "content", "docs", "reference", "glossary.mdx")
+GLOSSARY_SITE = os.path.join(ROOT, "site", "src", "content", "docs", "sql", "glossary.mdx")
 GLOSSARY_FILES = (GLOSSARY_MD, GLOSSARY_SITE)
 GLOSSARY_NOTE = ("Generated from `pondra.kinds` (`src/objects.rs`): don't edit it here; "
                  "`python3 tools/docs_check.py --write-glossary` writes it again.")
@@ -257,21 +262,115 @@ def glossary_checks():
     return reports
 
 
+# What the references must name (`--coverage`, and with every page): everything a user can call,
+# run or set, read from the code and the binary's own --help, so a new route, flag, method or
+# variable fails the check until its reference page names it. A name left out on purpose is in
+# UNLISTED with its reason, one by one, never a pattern.
+DOCS = os.path.join(ROOT, "site", "src", "content", "docs")
+UNLISTED = {
+    "PONDRA_TEST_FORMAT": "a build posing as a later lake format, for upgrade_check.py",
+    "PONDRA_TEST_PANICS": "turns on pondra_panic(), for harness.py safety",
+    "PONDRA_CRASH": "injects crashes at named points, for harness.py crash",
+    "PONDRA_DROP_BEATS": "drops heartbeats from the nodes a file names, for cluster.py isolate",
+    "PONDRA_NO_DIRECT": "acts as if the leader were out of reach, for harness.py serverless",
+    "load_ipython_extension": "IPython calls it for `%load_ext pondra`, which the Python reference shows",
+    "expr": "frame.py's own helper (an Expr from a value or SQL), not one of Polars' names",
+    "sql_type": "frame.py's own helper (a SQL type from a dtype), which client.py uses",
+    "trailing_order": "frame.py's own helper (a query's last ORDER BY), which client.py uses",
+}
+
+
+def _text(*pages):
+    return "\n".join(open(os.path.join(DOCS, p), encoding="utf-8").read() for p in pages)
+
+
+def _shape(path):
+    """A route with its parameters made alike: `/files/{*path}` and `/files/{path}` are one."""
+    return re.sub(r"\{[^}]*\}", "{}", path.rstrip("/") or "/")
+
+
+def _routes():
+    """Every route a node or a folder of lakes answers, but the nodes' own (`/cluster/…`)."""
+    out = set()
+    for f in ["server.rs", "dbserver.rs", "iceberg.rs", "sharing.rs"]:
+        for m in re.finditer(r'\.route\(\s*"([^"]+)"', open(os.path.join(ROOT, "src", f), encoding="utf-8").read()):
+            if not m.group(1).startswith("/cluster/"):
+                out.add(m.group(1))
+    return out
+
+
+def _commands(args=()):
+    """`pondra`'s commands and their flags, from --help, every level down: {"pondra service install": {"--lake", …}}."""
+    text = subprocess.run([BIN, *args, "--help"], capture_output=True, text=True, timeout=30).stdout
+    name = " ".join(["pondra", *args])
+    out = {name: {f for f in re.findall(r"(?<![\w-])(--[a-z][a-z0-9-]*)", text.split("Options:")[-1]) if f not in ("--help", "--version")}}
+    if "Commands:" in text:
+        for c in re.findall(r"^\s{2}([a-z][a-z-]*)\s", text.split("Commands:")[1].split("\n\n")[0], re.M):
+            if c != "help":
+                out.update(_commands((*args, c)))
+    return out
+
+
+def _public(path, classes):
+    """A Python file's public functions, and the public methods of the classes named."""
+    import ast
+    tree = ast.parse(open(os.path.join(ROOT, path), encoding="utf-8").read())
+    out = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and not n.name.startswith("_")}
+    for n in tree.body:
+        if isinstance(n, ast.ClassDef) and n.name in classes:
+            out |= {m.name for m in n.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and not m.name.startswith("_")}
+    return out
+
+
+def _variables():
+    """Every PONDRA_* variable the node or a client reads: the name as a string of its own."""
+    out = set()
+    for d in ["src", "python/pondra", "js"]:
+        for base, _, files in os.walk(os.path.join(ROOT, d)):
+            for f in files:
+                if f.endswith((".rs", ".py", ".js")) and "node_modules" not in base:
+                    text = open(os.path.join(base, f), encoding="utf-8", errors="replace").read()
+                    out |= set(re.findall(r"""["'](PONDRA_[A-Z0-9_]+)["']""", text)) | set(re.findall(r"process\.env\.(PONDRA_[A-Z0-9_]+)", text))
+    return out
+
+
+def coverage():
+    """Each reference as a page's report: ok when it names everything its door has."""
+    word = lambda name, text: re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", text)
+    http = _text("reference/http.mdx", "reference/iceberg-rest.mdx")
+    named = {_shape(m.group(0)) for m in re.finditer(r"/[A-Za-z0-9_{}*.\-/]*", http)}
+    cli = _text("reference/cli.mdx")
+    commands = _commands() if os.path.exists(BIN) else {}
+    checks = {
+        "reference/http.mdx": sorted(r for r in _routes() if _shape(r) not in named),
+        "reference/cli.mdx": sorted(c for c in commands if c not in cli) + sorted({f for fs in commands.values() for f in fs if not word(f, cli)}),
+        "reference/python.mdx": sorted(n for n in _public("python/pondra/client.py", {"Pondra", "Result", "Run", "Vars"}) | _public("python/pondra/__init__.py", ()) if not word(n, _text("reference/python.mdx"))),
+        "reference/frames.mdx": sorted(n for n in _public("python/pondra/frame.py", {"Frame", "Expr", "_Str", "_Dt", "GroupBy", "Merge"}) if not word(n, _text("reference/frames.mdx"))),
+        "reference/javascript.mdx": sorted(n for n in set(re.findall(r"^\s{2}(?:async\s+)?\*?([a-zA-Z]\w*)\s*\(", open(os.path.join(ROOT, "js", "index.js"), encoding="utf-8").read(), re.M)) - {"constructor", "if", "for", "while", "switch", "catch"} if not word(n, _text("reference/javascript.mdx"))),
+        "reference/environment.mdx": sorted(v for v in _variables() if v not in _text("reference/environment.mdx")),
+    }
+    checks = {p: [n for n in missing if n not in UNLISTED] for p, missing in checks.items()}
+    return [{"page": os.path.join(DOCS, p), "ran": 0, "ok": not missing, **({} if not missing else {"error": "doesn't name: " + ", ".join(missing)})} for p, missing in checks.items()]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="*", help="pages or folders to check (default: every page of the site, and the glossary)")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--offset", type=int, default=0, help="move every port by this much (and the examples' too), to run beside another check")
     ap.add_argument("--write-glossary", action="store_true", help="write docs/glossary.md and the site's glossary from GET /kinds, and stop")
+    ap.add_argument("--coverage", action="store_true", help="only check that the references name everything (also run with every page)")
     a = ap.parse_args()
     for name in PORTS:
         PORTS[name] = DOC_PORTS[name] + a.offset
+    if PORTS["http"] in FETCH_REFUSES:
+        sys.exit(f"--offset {a.offset} puts HTTP on {PORTS['http']}, a port Node's fetch refuses: pick another offset")
     if a.write_glossary:
         for path, text in zip(GLOSSARY_FILES, glossary(kinds_rows())):
             open(path, "w", encoding="utf-8").write(text)
             print(f"wrote {os.path.relpath(path, ROOT)}", flush=True)
         sys.exit(0)
-    everything = not a.paths
+    everything = not a.paths and not a.coverage
     if everything:
         a.paths = [os.path.join(ROOT, "site", "src", "content", "docs")]
     pages = []
@@ -292,6 +391,12 @@ def main():
         for r in glossary_checks():
             results.append(r)
             print(f"{'ok  ' if r['ok'] else 'FAIL'} {os.path.relpath(r['page'], ROOT)} (generated from GET /kinds)", flush=True)
+            if not r["ok"]:
+                print(f"     {r['error']}\n", flush=True)
+    if everything or a.coverage:
+        for r in coverage():
+            results.append(r)
+            print(f"{'ok  ' if r['ok'] else 'FAIL'} {os.path.relpath(r['page'], ROOT)} (names everything its door has)", flush=True)
             if not r["ok"]:
                 print(f"     {r['error']}\n", flush=True)
     bad = [r for r in results if not r["ok"]]

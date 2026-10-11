@@ -1,8 +1,6 @@
 ---
 title: How Pondra works
 description: One binary, a lake in a folder or a bucket, nodes that all take writes, and a leader that only puts commits in order.
-sidebar:
-  order: 1
 ---
 
 import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components';
@@ -160,7 +158,7 @@ Parquet. The leader only records the files. If nobody leads, `pondra sql` leads 
 record them. [Clusters](/pondra/guides/clusters/) has the details.
 
 <Aside type="caution">
-Opening the catalog costs about 20 sequential requests to the bucket: 30 ms on local disk, and 3 to
+Opening the catalog costs about 20 sequential requests to the bucket: about 0.2 s on local disk, and 3 to
 6 seconds on Cloudflare R2 from the 2-vCPU test sandbox. For fast reads on a bucket, start a node
 (`pondra serve --reader`) instead: it keeps the catalog in memory.
 </Aside>
@@ -202,8 +200,10 @@ All 22 TPC-H queries give the same answers spread over three nodes as on one.
 
 <Aside type="caution">
 Scale-out is the least tested part. Pondra has run on several processes on one machine, and on three
-GitHub-hosted machines joined over the public internet. There, spreading every query took 46.6 s where
-one node took 23.1 s, which is why the guard above exists. [Performance](/pondra/concepts/performance/) has the numbers.
+and six GitHub-hosted machines joined over the public internet. There, the cluster was 6 to 8% faster
+than one node on TPC-H SF10 (0.30), because it spreads a query only when that pays. Spreading every query was
+slower (33 to 35 s, against 24 to 26 s for one node), which is why the guard above exists.
+[Performance](/pondra/concepts/performance/) has the numbers.
 </Aside>
 
 ## Where next

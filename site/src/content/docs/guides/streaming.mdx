@@ -1,8 +1,6 @@
 ---
 title: Streaming
 description: Views that stay current, event-time windows, sessions, stream joins, as-of joins, tasks, and live queries.
-sidebar:
-  order: 6
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -349,7 +347,7 @@ it.
 Before `EMIT FINAL`, windows and sessions were options: `WITH (window = 'w', size_secs = 60,
 lateness_secs = 10)` kept every window, open or not, in the view and each one once in
 `<view>_final`; `WITH (session = 'ts', gap_secs = 30)` is the `SESSION(…)` above. Both still work
-([table options](/pondra/reference/table-options/#materialized-views)).
+([table options](/pondra/sql/table-options/#materialized-views)).
 </Aside>
 
 ## Join two streams

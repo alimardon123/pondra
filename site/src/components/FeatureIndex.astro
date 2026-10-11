@@ -1,0 +1,21 @@
+---
+// The feature map's index: each group (a page's h2) with its features (its h3s), read from the
+// page's own headings, so it can't fall behind the page.
+type Group = { text: string; slug: string; items: { text: string; slug: string }[] };
+const groups: Group[] = [];
+for (const h of Astro.locals.starlightRoute.headings) {
+  if (h.depth === 2) groups.push({ text: h.text, slug: h.slug, items: [] });
+  else if (h.depth === 3 && groups.length) groups[groups.length - 1].items.push({ text: h.text, slug: h.slug });
+}
+---
+
+<nav class="feature-index not-content" aria-label="Every feature">
+  {groups.filter((g) => g.items.length).map((g) => (
+    <section>
+      <a class="group" href={`#${g.slug}`}>{g.text}</a>
+      <ul>
+        {g.items.map((i) => <li><a href={`#${i.slug}`}>{i.text}</a></li>)}
+      </ul>
+    </section>
+  ))}
+</nav>
