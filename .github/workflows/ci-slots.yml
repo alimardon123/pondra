@@ -1,10 +1,11 @@
 name: ci slots
 
-# At most two pull requests' CI at once (Alimardon, 2026-10-03). build.yml's plan makes a pull
-# request's run wait while two others are going: it builds nothing and fails its `waiting for a CI
-# slot` check, holding no runner. Whenever a pull request's build run ends, this starts the oldest
-# waiting ones again, as many as there are free slots. A run is started again only while it is its
-# pull request's newest and its head is still the pull request's, so a newer push is never undone.
+# At most four pull requests' CI at once (two from 2026-10-03, four from 2026-10-11). build.yml's
+# plan makes a pull request's run wait while four others are going (its `-ge 4` says the same): it
+# builds nothing and fails its `waiting for a CI slot` check, holding no runner. Whenever a pull
+# request's build run ends, this starts the oldest waiting ones again, as many as there are free
+# slots. A run is started again only while it is its pull request's newest and its head is still
+# the pull request's, so a newer push is never undone.
 #
 # It is main's copy that runs (workflow_run), whatever a pull request changes, and it checks out
 # nothing: it reads runs and re-runs them. Main's runs, the soak's and the nightly ones aren't
@@ -32,7 +33,7 @@ jobs:
     timeout-minutes: 5
     env:
       GH_TOKEN: ${{ github.token }}
-      SLOTS: 2
+      SLOTS: 4
     steps:
       - run: |
           r=$GITHUB_REPOSITORY
