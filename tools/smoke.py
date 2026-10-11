@@ -56,6 +56,15 @@ def main():
         resident, limit = float(metrics["pondra_resident_bytes"]), float(metrics["pondra_memory_limit_bytes"])
         checks["the node knows its resident memory"] = resident > 10 << 20
         checks["and the machine's (a third of it for queries, not the 4 GiB guess)"] = limit != 4 << 30 and limit > 256 << 20
+        # kill -9 lets go of the node's term lock: the next writer on this machine finds it free and
+        # writes at once, instead of waiting out the leader's 30 s mark.
+        node.kill()
+        node.wait(timeout=30)
+        started = time.time()
+        r = subprocess.run([BIN, "sql", "--dir", os.path.join(work, "lake"), "INSERT INTO sales.orders VALUES (3, 1.0)"], capture_output=True, text=True, timeout=120)
+        seconds = round(time.time() - started, 2)
+        print(f"the next writer after a killed node took {seconds}s", file=sys.stderr)
+        checks["a node killed, the next writer on this machine writes at once (the OS let go of its term)"] = r.returncode == 0 and seconds < 15
     finally:
         node.terminate()
         node.wait(timeout=30)
