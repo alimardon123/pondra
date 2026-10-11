@@ -1,0 +1,88 @@
+---
+title: Joins over streams
+description: Pair the rows of two streams as they arrive, and join a stream to a table as of each row's own event time with ASOF JOIN.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Use a stream join when two tables fill up at different times and each row should meet the other
+table's rows, whichever arrives first. Use an as-of join to give each row the other table's row as it
+was at the row's own event time.
+
+## Join two streams
+
+`join = 'streams'` pairs a row of either table with the other table's rows when it arrives and
+with those that arrive after it, each pair once, in whichever order they come. `within_secs`
+bounds how far apart in time a pair may be, so only that much of the other table is read.
+
+```sql
+CREATE TABLE orders (id BIGINT, amount DOUBLE, ts TIMESTAMP);
+CREATE TABLE payments (order_id BIGINT, paid DOUBLE, ts TIMESTAMP);
+CREATE MATERIALIZED VIEW paid WITH (join = 'streams', time = 'ts', within_secs = 600) AS
+  SELECT o.id, o.amount, p.paid
+  FROM orders o JOIN payments p
+    ON o.id = p.order_id AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '10 minutes';
+INSERT INTO payments VALUES (1, 9.5, '2026-09-29 10:00:30');
+INSERT INTO orders VALUES (1, 9.5, '2026-09-29 10:00:00'), (2, 4.0, '2026-09-29 10:00:10');
+INSERT INTO payments VALUES (2, 4.0, '2026-09-29 10:03:00'), (3, 1.0, '2026-09-29 10:30:00');
+```
+
+```bash
+sleep 2
+```
+
+```sql
+SELECT * FROM paid ORDER BY id;
+```
+
+```text
+id  amount  paid
+1   9.5     9.5
+2   4.0     4.0
+```
+
+Payment 1 arrived before its order and still paired with it. Payment 3 has no order.
+
+<Aside type="caution">
+Stream joins run on the leader alone, and start from the moment the view is made.
+</Aside>
+
+## As-of joins
+
+`ASOF JOIN` gives each row the other table's row as it was at that moment: the latest quote at
+or before each trade. `MATCH_CONDITION` takes `>=`, `>`, `<=` or `<`; a row with no match gets
+NULLs.
+
+```sql
+CREATE TABLE quotes (sym VARCHAR, ts TIMESTAMP, price DOUBLE);
+CREATE TABLE trades (id BIGINT, sym VARCHAR, ts TIMESTAMP, qty BIGINT);
+INSERT INTO quotes VALUES
+  ('ABC', '2026-09-29 09:30:00', 10.0), ('ABC', '2026-09-29 09:31:00', 11.0), ('ABC', '2026-09-29 09:32:00', 12.0);
+INSERT INTO trades VALUES
+  (1, 'ABC', '2026-09-29 09:30:30', 5), (2, 'ABC', '2026-09-29 09:31:45', 2), (3, 'XYZ', '2026-09-29 09:31:45', 2);
+SELECT t.id, t.qty, q.price, t.qty * q.price AS value
+FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym
+ORDER BY t.id;
+```
+
+```text
+id  qty  price  value
+1   5    10.0   50.0
+2   2    11.0   22.0
+3   2    NULL   NULL
+```
+
+Put the same query in a materialized view and each new trade is priced as of its own event time,
+even when it arrives after a newer quote:
+
+```sql
+CREATE MATERIALIZED VIEW priced AS
+  SELECT t.id, t.qty, q.price, t.qty * q.price AS value
+  FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym;
+```
+
+<Aside type="caution">
+A quote that arrives after a trade of its time doesn't reach that trade. A keyed table keeps only
+its latest row per key, so an as-of join against one gives the latest, not the row of that
+moment: keep a table's history as rows for that.
+</Aside>
