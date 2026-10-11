@@ -6,6 +6,7 @@ setup: |
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 The lake's own files are a workspace. A `.sql` file, a `.py` file or a notebook kept there (the
 console's Workspace, or `PUT /files/…`) runs as a job: with parameters, from any client, on a
@@ -24,9 +25,7 @@ EOF
 
 Run it with `CALL run`, naming each value:
 
-```sql
-CALL run('etl/orders.sql', day => DATE '2026-09-29', region => 'west', amount => 10.5);
-```
+<Ways sql={`CALL run('etl/orders.sql', day => DATE '2026-09-29', region => 'west', amount => 10.5)`} />
 
 ```text
  region | n | total
@@ -59,9 +58,7 @@ SELECT count(*) AS n FROM orders WHERE day BETWEEN $since AND $day AND region = 
 EOF
 ```
 
-```sql
-SELECT name, type, "default", required, description FROM pondra.parameters('etl/by_region.sql');
-```
+<Ways sql={`SELECT name, type, "default", required, description FROM pondra.parameters('etl/by_region.sql')`} />
 
 ```text
  name   | type    | default          | required | description
@@ -77,7 +74,7 @@ CALL run('etl/by_region.sql', region => 'west', day => '2026-09-29');
 
 - **A `$name` used and never set** is a parameter too, required, with no type.
 - **The run's variables are its own:** a `DECLARE` in a file doesn't change the caller's `$day`,
-  and `$day = $day + 1` in it changes only the run's ([variables](/pondra/sql/statements/#variables)).
+  and `$day = $day + 1` in it changes only the run's ([variables](/pondra/guides/scripts/#variables)).
 - **In Python** (a `.py` file, a notebook's cells), `pondra.vars.day` is the same value.
 
 ## Python files and notebooks
@@ -160,9 +157,7 @@ CALL run('etl/orders.sql', day => $day, region => 'north', amount => 2.0);
 EOF
 ```
 
-```sql
-CALL run('etl/daily.sql', day => DATE '2026-09-30');
-```
+<Ways sql={`CALL run('etl/daily.sql', day => DATE '2026-09-30')`} />
 
 ```python norun
 pondra.run("etl/orders.sql", day=datetime.date(2026, 9, 29), region="chain", amount=3.0)  # in a .py file
@@ -173,7 +168,7 @@ Runs inside runs stop 16 deep, so a file that runs itself ends with an error, no
 ## Jobs, schedules and the run log
 
 `pondra.start('run', …)` starts a file on the node and answers at once with its run's id. A task
-runs it on a schedule:
+runs it on a schedule ([Tasks](/pondra/guides/tasks/)):
 
 ```sql
 SELECT pondra.start('run', 'etl/orders.sql', day => DATE '2026-09-28', region => 'later', amount => 8.0) AS run;
@@ -184,9 +179,7 @@ Every run is a row of `pondra.runs`, named `files/<path>@<version>`: the file, a
 that ran. Its arguments, who ran it (a task's runs say `task:nightly`), when, and how it went are
 there too:
 
-```sql
-SELECT routine, args, caller, status, error FROM pondra.runs WHERE routine LIKE 'files/%' ORDER BY started DESC LIMIT 5;
-```
+<Ways sql={`SELECT routine, args, caller, status, error FROM pondra.runs WHERE routine LIKE 'files/%' ORDER BY started DESC LIMIT 5`} />
 
 - **Retried with a job, a run writes once.** Over HTTP, `POST /sql?job=…`; a task's tick has its
   own. Each statement of the file (and of the files it runs) gets its part of the job.

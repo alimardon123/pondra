@@ -4,6 +4,7 @@ description: Produce to and consume from tables with Kafka clients, ingest Debez
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 Every node can speak the Kafka protocol. **A topic is a table**: producers write rows, consumers
 read the table's log. Use it to point existing Kafka producers, Debezium and consumers at Pondra
@@ -38,9 +39,7 @@ for i in range(5):
 producer.flush(10)
 ```
 
-```sql
-SELECT user, amount, _key FROM events ORDER BY amount;
-```
+<Ways sql={`SELECT user, amount, _key FROM events ORDER BY amount`} />
 
 ```text
 user  amount  _key
@@ -89,9 +88,7 @@ producer.produce("users", key=json.dumps({"id": 2}), value=None)     # Debezium'
 producer.flush(10)
 ```
 
-```sql
-SELECT * FROM users ORDER BY id;
-```
+<Ways sql={`SELECT * FROM users ORDER BY id`} />
 
 ```text
 id  name  score
@@ -113,9 +110,7 @@ producer.produce("lines", key=b"k2", value=b'{"event": "click", "n": 3}')
 producer.flush(10)
 ```
 
-```sql
-SELECT _key, _value->>'event' AS event, json_get_int(_value, 'n') AS n FROM lines ORDER BY _key;
-```
+<Ways sql={`SELECT _key, _value->>'event' AS event, json_get_int(_value, 'n') AS n FROM lines ORDER BY _key`} />
 
 ```text
 _key  event  n
@@ -221,9 +216,9 @@ You can try all of this without another cluster: Pondra's own Kafka port is a Ka
 ```sql
 CREATE SECRET this_node (TYPE kafka, SECURITY_PROTOCOL 'PLAINTEXT', SCOPE 'kafka://localhost:9092');
 ATTACH 'kafka://localhost:9092' AS k (TYPE kafka);
-SELECT _partition, json_get_str(value, 'user') AS user, json_get_int(value, 'amount') AS amount
-FROM k.events ORDER BY amount LIMIT 3;
 ```
+
+<Ways sql={`SELECT _partition, json_get_str(value, 'user') AS user, json_get_int(value, 'amount') AS amount FROM k.events ORDER BY amount LIMIT 3`} />
 
 ```text
 _partition  user  amount
@@ -240,7 +235,14 @@ _partition  user  amount
 CREATE TABLE alerts (id BIGINT, msg VARCHAR, level VARCHAR);
 COPY (SELECT 1 AS id, 'disk full' AS msg, 'high' AS level UNION ALL SELECT 2, 'slow query', 'low')
   TO 'kafka://localhost:9092/alerts' (FORMAT json, KEY id);
-SELECT id, msg FROM alerts ORDER BY id;
+```
+
+<Ways sql={`SELECT id, msg FROM alerts ORDER BY id`} />
+
+```text
+id  msg
+1   disk full
+2   slow query
 ```
 
 ### Keep a table fed from a topic
@@ -267,9 +269,7 @@ while db.sql("SELECT count(*) AS n FROM orders_in").rows()[0]["n"] < 5:
     time.sleep(0.2)
 ```
 
-```sql
-SELECT user, amount FROM orders_in ORDER BY amount;
-```
+<Ways sql={`SELECT user, amount FROM orders_in ORDER BY amount`} />
 
 ```text
 user  amount

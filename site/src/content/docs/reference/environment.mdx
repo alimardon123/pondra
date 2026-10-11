@@ -53,7 +53,7 @@ PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 | `PONDRA_ENV` | the git branch's database | the environment the project commands use when none is named: `pondra apply`, `pondra plan`, `pondra status` and the rest. `--env` or the name after the command wins |
 | `PONDRA_HOME` | `~/.pondra` (from `HOME`, or `USERPROFILE` on Windows) | the folder where `pondra login` keeps the tokens it saved, in `login.json` |
 
-[`pondra ci init`](/pondra/guides/environments/#branches-and-environments-on-a-team) also makes three
+[`pondra ci init`](/pondra/guides/projects/#continuous-integration) also makes three
 GitHub secrets: `PONDRA_DEV_TOKEN` (for the server branches are made on), `PONDRA_TEST_TOKEN` (test's
 server) and `PONDRA_PROD_TOKEN` (in the `prod` environment, which a reviewer approves). The workflow it
 writes hands each job the one it needs as `PONDRA_TOKEN`; Pondra itself never reads them.

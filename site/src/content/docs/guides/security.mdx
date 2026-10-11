@@ -4,6 +4,7 @@ description: Turn on read, write and admin tokens for every door, make users and
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 A node with no tokens lets everyone do everything, which is right for a lake on your laptop or on a
 private network. To share it, start the node with **tokens**. There are three, one for each role, and
@@ -139,7 +140,7 @@ produce("writer", tokens["write"]), produce("reader", tokens["read"])
 (None, KafkaError{code=TOPIC_AUTHORIZATION_FAILED,val=29,str="Broker: Topic authorization failed"})
 ```
 
-The writer's `None` is success. MCP takes the same `Authorization: Bearer` header, so an AI agent has the rights of its token: give it a
+The writer's `None` is success. MCP takes the same `Authorization: Bearer` header, so an AI agent has the rights of its token ([AI agents](/pondra/guides/agents/)): give it a
 read token and it can look but not write. The Iceberg REST catalog takes the token as its `token`
 (PyIceberg) or an `iceberg` secret (DuckDB): see [other engines](/pondra/guides/other-engines/).
 `pondra run --url …` and a `pondra sql` write, which the leader records, send `PONDRA_TOKEN`.
@@ -316,6 +317,10 @@ connect("read").sql("SELECT * FROM secrets()").rows()
 ```text
 [{'name': 'mail', 'type': 'generic', 'scope': None}]
 ```
+
+The same list is one statement through any door, and it never shows a value:
+
+<Ways sql={`SELECT * FROM secrets();`} />
 
 Only the code of a procedure reads the values, with `pondra.secret("mail")`, and any of them the
 procedure prints or fails with is blanked out (`***`) in its notices, errors and run log. A URL a query
