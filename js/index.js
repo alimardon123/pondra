@@ -1,5 +1,6 @@
 // Pondra from JavaScript: SQL, exactly-once appends, key lookups and change feeds, over a node's
-// HTTP API. No dependencies (Node 18+, or any runtime with fetch).
+// HTTP API. No dependencies (Node 18+, or any runtime with fetch: the client runs in browsers, Deno
+// and Bun too; `local` and `binary` need Node, and load its modules when they are called).
 //
 //   import { local, connect } from "pondra";
 //   const db = await local("lake");                 // a node on ./lake, here; or
@@ -11,14 +12,13 @@
 //   for await (const row of db.watch("events")) { … }   // new rows as they commit
 //   const top = db.table("events").filter(col("amount").gt(100)).groupBy("user").agg(col("amount").sum());
 //   for (const row of await top) …                       // a frame: a query, run when awaited (frame.js)
-import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import { createServer } from "node:net";
-import { Frame, quote, scan } from "./frame.js";
+import { Frame, literal, quote, scan } from "./frame.js";
 
 export { Expr, Frame, Merge, all, coalesce, col, concat, concatStr, count, first, fn, last, len, lit, max, mean, median, min, nUnique, sqlExpr, sum, when } from "./frame.js";
+
+// A random id: Web Crypto's where it exists (browsers, Deno, Bun, Node 19 and later). Node 18 has it only
+// behind a flag, so there it is node:crypto's, loaded once.
+const randomUUID = globalThis.crypto?.randomUUID ? () => globalThis.crypto.randomUUID() : (await import("node:crypto")).randomUUID;
 
 // A node answered that it ran nothing, or that it couldn't reach the bucket or another node: a
 // request that may be sent again goes to the next node. (57P01 admin_shutdown, 57P03
@@ -29,9 +29,59 @@ const code = (sql) => sql.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"|\$(\w*)\$[\s\S]
 const isQuery = (sql) => { const c = code(sql); return !c.includes(";") && /^\(*\s*(select|with|values|from|table|show|describe|desc|explain)\b/i.test(c) && !/\bstart\s*\(/i.test(c); };
 const isChange = (sql) => { const c = code(sql); return !c.includes(";") && /^\s*(insert|update|delete|merge)\b/i.test(c); };
 
-const quoted = (v) => (typeof v === "number" ? String(v) : `'${String(v).replace(/'/g, "''")}'`); // (a SQL literal: a task's schedule and options)
 const varName = (n) => { if (!/^[A-Za-z_]\w*$/.test(n)) throw new Error(`${n}: not a variable's name (letters, digits and _, not first a digit)`); return n; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Basic auth's base64 of a text's UTF-8 bytes: btoa reads one byte a character, and Buffer is Node's.
+const base64 = (text) => btoa(String.fromCharCode(...new TextEncoder().encode(text)));
+
+// The PEM texts this process already trusts: a CA file several connections read is added once.
+const trusted = new Set();
+
+/** The authority in `file` joins this process's trusted ones, as NODE_EXTRA_CA_CERTS adds it, so the
+ * global fetch trusts a node whose certificate it signed. Node 22.19 and 24.5 (and later) have the calls
+ * for it; older Nodes are told the two ways round it. */
+async function trustCa(file) {
+  const { readFileSync } = await import("node:fs");
+  const pem = readFileSync(file, "utf8");
+  const tls = await import("node:tls");
+  if (!tls.setDefaultCACertificates || !tls.getCACertificates) throw new Error("{ ca } needs Node 22.19 or later; or start Node with NODE_EXTRA_CA_CERTS=<file>, or pass { fetch } with your own agent");
+  if (trusted.has(pem)) return;
+  tls.setDefaultCACertificates([...tls.getCACertificates("default"), pem]);
+  trusted.add(pem);
+}
+
+/** A file on this machine as text, or null when there's none (or no file system, as in a browser). */
+async function localFile(file) {
+  const fs = await import("node:fs").catch(() => null);
+  return fs?.existsSync(file) ? fs.readFileSync(file, "utf8") : null;
+}
+
+/** A routine's code: its text, or the text of its `file`, read here (Node only). */
+async function bodyOf(body, file) {
+  if (file !== undefined) return (await import("node:fs/promises")).readFile(file, "utf8");
+  if (typeof body !== "string") throw new Error("a function or procedure takes body (its code as text) or file (a path to it)");
+  return body;
+}
+
+// `name TYPE [DEFAULT value], …` from { name: "TYPE" } or { name: ["TYPE", default] } (Python's `_params`).
+const paramsSql = (params = {}) => Object.entries(params).map(([name, spec]) => {
+  const [type, ...rest] = Array.isArray(spec) ? spec : [spec];
+  return `${name} ${type}${rest.length ? ` DEFAULT ${literal(rest[0])}` : ""}`;
+}).join(", ");
+
+// `WITH (k = v, …)` for the options that are set (Python's `_with`): not undefined, null, false or "".
+// A list is its items, comma-separated.
+const withOptions = (options) => {
+  const given = Object.entries(options).filter(([, v]) => v !== undefined && v !== null && v !== false && v !== "");
+  return given.length ? ` WITH (${given.map(([k, v]) => `${k} = ${literal(Array.isArray(v) ? v.join(", ") : v)}`).join(", ")})` : "";
+};
+
+// The body between dollar quotes it doesn't contain (Python's `_dollar`).
+const dollar = (body) => {
+  const tag = body.includes("$pondra$") ? `$p${randomUUID().slice(0, 8)}$` : "$pondra$";
+  return `${tag}${body}${tag}`;
+};
 
 // Rows as NDJSON. A Date goes as its UTC time without a zone, the text a TIMESTAMP reads (JSON's own
 // form would end in Z, which a TIMESTAMP has no place for).
@@ -63,16 +113,22 @@ export class Pondra {
    * bucket) hands the work to the next, for up to `retrySecs` (a request it may have run goes again
    * only if that can't apply it twice: a query, an `append`, a single INSERT, UPDATE, DELETE or
    * MERGE, sent with a job). While a node holds this connection's session — a transaction,
-   * temporary tables, settings, variables — every request goes to it alone. */
-  constructor(url = "http://127.0.0.1:8080", { token, user, password, onNotice = (n) => console.log(n), retrySecs = 60 } = {}) {
+   * temporary tables, settings, variables — every request goes to it alone.
+   * `ca`: a PEM file of the authority that signs an https node's certificate, trusted by this process
+   * from the first request (see `trustCa`). `fetch`: a function used in place of the global fetch
+   * (Bun's TLS, undici's Agent, Deno's client); it brings its own TLS, so `ca` doesn't apply to it. */
+  constructor(url = "http://127.0.0.1:8080", { token, user, password, onNotice = (n) => console.log(n), retrySecs = 60, ca, fetch: fetcher } = {}) {
     this.urls = (Array.isArray(url) ? url : url.split(",")).map((u) => u.trim().replace(/\/$/, "")).filter(Boolean);
     this.url = this.urls[0];
     this.retrySecs = retrySecs;
+    this.ca = ca;
+    this.trusting = null; // (the CA file read and trusted, once: the first request does it)
+    this.fetch = fetcher ?? null; // (a fetch of the caller's; null: the global one)
     this.held = null; // the node holding this connection's session, while one does (`x-pondra-session: held`)
     this.reached = false;
     this.jobs = 0;
     this.token = token;
-    this.basic = user ? `Basic ${Buffer.from(`${user}:${password}`).toString("base64")}` : null; // (a user: its name and password, or its token as the password)
+    this.basic = user ? `Basic ${base64(`${user}:${password}`)}` : null; // (a user: its name and password, or its token as the password)
     this.notices = []; // what the last statement's procedures printed
     this.onNotice = onNotice; // (each one, as it comes back; null: keep them quiet)
     this.producer = `js-${randomUUID().slice(0, 12)}`; // exactly-once: one name, increasing seq
@@ -84,13 +140,15 @@ export class Pondra {
    * unrun, hands it to the next of `urls`; one that may have run it does so only if `again` (it
    * can't be applied twice: GETs unless said otherwise), until `retrySecs` have passed. */
   async request(method, path, body, type, again = method === "GET") {
+    if (this.ca) await (this.trusting ??= trustCa(this.ca)); // (the CA file, read and trusted once for this connection)
     const headers = { "x-pondra-session": this.session, ...(this.token ? { authorization: `Bearer ${this.token}` } : this.basic && { authorization: this.basic }), ...(type && { "content-type": type }), ...(this.owner && { "x-pondra-owner": this.owner }) };
     const deadline = Date.now() + this.retrySecs * 1000;
+    const send = this.fetch ?? globalThis.fetch; // (called on its own: a browser's fetch refuses another object as `this`)
     for (let tried = 1, wait = 100; ; tried++) {
       const url = this.held ?? this.url;
       let error;
       try {
-        const r = await fetch(url + path, { method, body, headers });
+        const r = await send(url + path, { method, body, headers });
         this.reached = true; // (a node has answered: one that is gone now is waited for, not before)
         if (path.startsWith("/sql")) this.held = r.headers.get("x-pondra-session") === "held" ? url : null; // (keep to it while it holds the session)
         const said = r.headers.get("x-pondra-notices");
@@ -184,7 +242,8 @@ export class Pondra {
    * runs from here; otherwise a file of the lake's (`etl/orders.sql`, `.py`, `.ipynb`: ADR-033) runs
    * on the node, as `CALL run(…)`, logged in `pondra.runs`. */
   async run(file, params = {}) {
-    if (file.endsWith(".sql") && existsSync(file)) return this.sql(readFileSync(file, "utf8"), params);
+    const here = file.endsWith(".sql") ? await localFile(file) : null;
+    if (here !== null) return this.sql(here, params); // (a file on this machine: it runs from here)
     if (!/\.(sql|py|ipynb)$|^(files\/)?notebooks\/[\w.-]+$/.test(file)) return this.sql(file, params); // (else a file of the lake's, or a saved notebook by name)
     const names = Object.keys(params);
     const given = names.map((n, i) => `, "${n.replace(/"/g, '""')}" => $p${i}`).join("");
@@ -233,9 +292,9 @@ export class Pondra {
    * `onFailure` (a procedure called with the task's name and its error) are its options. */
   async task(name, sql, { schedule, after, when, retries, retryDelay, timeout, onFailure, replace = true } = {}) {
     if ((schedule === undefined) === (after === undefined)) throw new Error("a task takes schedule or after, one of them");
-    const how = schedule !== undefined ? `SCHEDULE ${quoted(schedule)}` : `AFTER ${[after].flat().join(", ")}`;
+    const how = schedule !== undefined ? `SCHEDULE ${literal(schedule)}` : `AFTER ${[after].flat().join(", ")}`;
     const opts = Object.entries({ retries, retry_delay: retryDelay, timeout, on_failure: onFailure }).filter(([, v]) => v !== undefined && v !== null);
-    const options = opts.length ? ` WITH (${opts.map(([k, v]) => `${k} = ${quoted(v)}`).join(", ")})` : "";
+    const options = opts.length ? ` WITH (${opts.map(([k, v]) => `${k} = ${literal(v)}`).join(", ")})` : "";
     return this.sql(`CREATE ${replace ? "OR REPLACE " : ""}TASK ${name} ${how}${when ? ` WHEN ${when}` : ""}${options} AS ${sql}`);
   }
 
@@ -248,11 +307,36 @@ export class Pondra {
   }
 
   /** Wait for a run (`start`'s or `executeTask`'s id) to end, as SQL's `AWAIT 'id'`: its error if it failed. */
-  async wait(id) { await this.sql(`AWAIT ${quoted(id)}`); }
+  async wait(id) { await this.sql(`AWAIT ${literal(id)}`); }
 
   /** `call`'s name up to 0.22. */
   async callProcedure(name, ...args) {
     return this.call(name, ...args);
+  }
+
+  /** A stored function from code (or a file of it), as Python's `create_function` writes it. `language`
+   * "python" (the default) runs `body` on a node's Python, with `entry` naming the module's function to
+   * run; "sql" takes SQL that names its parameters as they are. `params` maps each parameter to its SQL
+   * type, or to `[type, default]`; `returns` is a SQL type, or an object of columns and their types (a
+   * table). `cache: "10 minutes"`: an answer is reused that long for the same arguments. */
+  async createFunction(name, { body, file, params, returns, language = "python", entry, vectorized, strict, volatility, packages, timeout, cache, replace = true } = {}) {
+    if (returns === undefined) throw new Error(`${name}: returns is a SQL type ("INT"), or an object of columns and their types (a table)`);
+    const code = await bodyOf(body, file);
+    const type = typeof returns === "string" ? returns : `TABLE (${Object.entries(returns).map(([c, t]) => `${quote(c)} ${t}`).join(", ")})`;
+    const words = [strict ? "STRICT" : "", (volatility ?? "").toUpperCase()].filter(Boolean).join(" ");
+    return this.sql(`CREATE ${replace ? "OR REPLACE " : ""}FUNCTION ${name}(${paramsSql(params)}) RETURNS ${type} LANGUAGE ${language} ${words}${withOptions({ entry, vectorized, packages, timeout, cache })} AS ${dollar(code)}`);
+  }
+
+  /** A stored procedure from code (or a file of it), as Python's `create_procedure` writes it: `params` as
+   * `createFunction`'s. A SQL procedure's body names its parameters with `$` (`$n`), as a `CALL` binds them. */
+  async createProcedure(name, { body, file, params, language = "python", entry, packages, timeout, replace = true } = {}) {
+    const code = await bodyOf(body, file);
+    return this.sql(`CREATE ${replace ? "OR REPLACE " : ""}PROCEDURE ${name}(${paramsSql(params)}) LANGUAGE ${language}${withOptions({ entry, packages, timeout })} AS ${dollar(code)}`);
+  }
+
+  /** This lake's functions and procedures (SQL's `pondra.routines`): each one's kind, parameters, language and body. */
+  async routines() {
+    return (await this.request("GET", "/routines")).json();
   }
 
   /** Append rows exactly once: sent again after a lost answer, on any node, it is recognised and
@@ -262,22 +346,23 @@ export class Pondra {
     return (await this.request("POST", `/append/${table}?producer=${this.producer}&seq=${seq}`, ndjson(rows), "application/x-ndjson", true)).json();
   }
 
-  /** A view others read by name, as SQL's `CREATE VIEW` and Python's `db.view` make one: `sql`
-   * runs over the tables as they are when the view is read. `{ materialized: true }`: kept up to
-   * date instead (`CREATE MATERIALIZED VIEW`), filled from the rows already there, then with each
-   * batch of new rows (with GROUP BY, kept per key); its other options make it emit what is
-   * final: `{ window: "w", size_secs: 60, lateness_secs: 10 }` (and `slide_secs`: sliding),
-   * `{ session: "ts", gap_secs: 1800 }`, or `{ join: "streams", time: "ts", within_secs: 600 }`. */
-  async view(name, sql, { materialized, replace = true, ...options } = {}) {
+  /** A view others read by name, as SQL's `CREATE VIEW` and Python's `db.view` make one: `query` (SQL, or a
+   * frame) runs over the tables as they are when the view is read. `{ materialized: true }`: kept up to
+   * date instead (`CREATE MATERIALIZED VIEW`), filled from the rows already there, then with each batch of
+   * new rows (with GROUP BY, kept per key); its other options make it emit what is final: `{ window: "w",
+   * size_secs: 60, lateness_secs: 10 }` (and `slide_secs`: sliding), `{ session: "ts", gap_secs: 1800 }`, or
+   * `{ join: "streams", time: "ts", within_secs: 600 }`. `{ temporary: true }`: this connection's only.
+   * Answers the view as a frame: awaiting it is its rows. */
+  view(name, query, { materialized, temporary = false, replace, ...options } = {}) {
     const opts = Object.entries(options);
     if (materialized === undefined && opts.length) { // (up to 0.22, view() made every view a materialized one)
       console.warn("view(…) with window/session/join options: pass { materialized: true } (a view is a stored query unless asked)");
       materialized = true;
     }
     if (!materialized && opts.length) throw new Error(`${opts.map(([k]) => k).join(", ")}: options of a materialized view ({ materialized: true })`);
-    const literal = (v) => (typeof v === "number" ? String(v) : `'${String(v).replaceAll("'", "''")}'`);
-    const withs = opts.length ? ` WITH (${opts.map(([k, v]) => `${k} = ${literal(v)}`).join(", ")})` : "";
-    return this.sql(materialized ? `CREATE MATERIALIZED VIEW ${name}${withs} AS ${sql}` : `CREATE ${replace ? "OR REPLACE " : ""}VIEW ${name} AS ${sql}`);
+    if (typeof query === "string" && !isQuery(query)) throw new Error("view(name, query): the query is a SELECT (or WITH, VALUES…), not a statement");
+    const frame = typeof query === "string" ? this.sql(query) : query;
+    return frame.toView(name, { temporary, materialized, replace, ...options });
   }
 
   /** The current row of one key of a keyed table, or null. */
@@ -286,17 +371,44 @@ export class Pondra {
     return rows[0] ?? null;
   }
 
-  /** New rows of a table as they commit; with `after`, a replay from there first. With
-   * `changes`, every change: UPDATE's and DELETE's too, each row with its `_change_type`. */
+  /** `await db.transaction(async (tx) => { … })`: the block's statements as one commit (`BEGIN` … `COMMIT`),
+   * reading their own writes. If the block throws, it is rolled back and its error goes on to the caller.
+   * Another commit that changed one of its rows first refuses it: an error with `sqlstate` "40001"; run the
+   * block again. Answers what the block returns. (Python's `with con.transaction():` is the same.) */
+  async transaction(fn) {
+    await this.sql("BEGIN");
+    let answer;
+    try {
+      answer = await fn(this);
+    } catch (e) {
+      // (a node that went took the transaction with it, so there is nothing to roll back; and a ROLLBACK
+      // that fails doesn't hide the error the block threw)
+      if (e?.sqlstate !== GONE) await this.sql("ROLLBACK").catch(() => {});
+      throw e;
+    }
+    await this.sql("COMMIT");
+    return answer;
+  }
+
+  /** New rows of a table as they commit (a keyed table: every upsert and delete); with `after`, a replay
+   * from there first, as far back as the node keeps its change feed. With `changes`, every change:
+   * UPDATE's and DELETE's too, each row with `_change_type`, `_row_id` and `_version`. After each batch the
+   * node sends where it has got to (a line of its own, not yielded): `this.position` is that commit, the
+   * place to resume from. `watch(table, { after: db.position })` then yields what came after it. */
   async *watch(table, { after, changes } = {}) {
-    const q = [after === undefined ? "" : `after=${after}`, changes ? "changes=true" : ""].filter(Boolean).join("&");
-    const r = await this.request("GET", `/watch/${table}` + (q ? `?${q}` : ""));
+    const q = ["marks=true", after === undefined ? "" : `after=${after}`, changes ? "changes=true" : ""].filter(Boolean).join("&");
+    const r = await this.request("GET", `/watch/${table}?${q}`);
     const decoder = new TextDecoder();
     let rest = "";
     for await (const chunk of r.body) {
       const lines = (rest + decoder.decode(chunk, { stream: true })).split("\n");
       rest = lines.pop();
-      for (const line of lines) if (line) yield JSON.parse(line);
+      for (const line of lines) {
+        if (!line) continue;
+        const row = JSON.parse(line);
+        if ("_after" in row && Object.keys(row).length === 1) this.position = row._after; // (a mark: where to resume)
+        else yield row;
+      }
     }
   }
 
@@ -325,10 +437,12 @@ export class Pondra {
     }
   }
 
-  /** End this connection's session (its temporary tables and views), and stop the node `local()`
-   * started: closing its input stops it (it hands the lake on at once), on every OS; it would stop
-   * the same way if this process were killed. */
-  async close(timeoutMs = 15_000) {
+  /** End this connection's session (its temporary tables and views), and stop the node `local()` started:
+   * closing its input stops it (it hands the lake on at once), on every OS; it would stop the same way if
+   * this process were killed. It waits up to 15 seconds for the node to stop, then kills it. Takes no
+   * argument. */
+  async close(...more) {
+    if (more.length) throw new Error("close() takes no argument");
     const retrySecs = this.retrySecs;
     this.retrySecs = 0; // (a node that's gone isn't waited for here)
     await this.request("DELETE", `/sessions/${this.session}`).catch(() => {});
@@ -337,7 +451,7 @@ export class Pondra {
     if (!node || node.exitCode !== null || node.signalCode !== null) return;
     const exited = new Promise((resolve) => node.once("exit", resolve));
     node.stdin.end();
-    const late = setTimeout(() => node.kill(), timeoutMs); // (it didn't stop in time)
+    const late = setTimeout(() => node.kill(), 15_000); // (it didn't stop in time)
     await exited;
     clearTimeout(late);
   }
@@ -348,42 +462,61 @@ export const connect = (url, options) => new Pondra(url, options);
 /** Start a node on a lake here — a folder, or s3://bucket/prefix — and connect to it. It stops
  * when this process exits, or with `close()`; the lake stays. Its SQL may read files on this
  * machine (`SELECT * FROM 'jan.csv'`), as DuckDB's may; its Python functions and procedures run
- * with a Python here that has the `pondra` package, if there is one (`python: false`: none). */
-export async function local(dir = "lake", { port, token, flags = [], timeoutMs = 120_000, python = true, onNotice } = {}) {
+ * with a Python here that has the `pondra` package, if there is one (`python: false`: none).
+ * `timeout`: seconds to wait for the node to start (120), as Python's `local(timeout=120)`. Its
+ * standard error goes to `pondra-<port>.log` in the temp folder: a node that doesn't start says where. */
+export async function local(dir = "lake", { port, token, flags = [], timeout = 120, python = true, onNotice, timeoutMs } = {}) {
+  if (timeoutMs !== undefined) throw new Error("local({ timeoutMs }): it is { timeout } now, in seconds, as Python's");
+  const { spawn } = await import("node:child_process");
+  const { closeSync, mkdirSync, openSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const exe = await binary();
   port ??= await freePort();
   if (!dir.includes("://")) mkdirSync(dir, { recursive: true });
+  const log = join(tmpdir(), `pondra-${port}.log`);
+  const errors = openSync(log, "a");
   const args = ["serve", "--dir", dir, "--addr", `127.0.0.1:${port}`, "--stop-with-stdin", ...(python ? ["--python", "auto"] : []), ...flags];
   const owner = randomUUID().replaceAll("-", ""); // (with it, the node lets this process's SQL read files here)
-  const node = spawn(binary(), args, { stdio: ["pipe", "ignore", "ignore"], env: { ...process.env, PONDRA_OWNER_KEY: owner } });
+  const node = spawn(exe, args, { stdio: ["pipe", "ignore", errors], env: { ...process.env, PONDRA_OWNER_KEY: owner } });
+  closeSync(errors); // (the node has its own copy of the log's file)
   let failed = null;
   node.on("error", (e) => (failed = e)); // (no binary, say)
   const db = new Pondra(`http://127.0.0.1:${port}`, { token, retrySecs: 0, ...(onNotice !== undefined && { onNotice }) });
   db.process = node;
   db.owner = owner;
   process.on("exit", () => node.stdin.end());
-  for (const until = Date.now() + timeoutMs; ; await sleep(50)) {
+  for (const until = Date.now() + timeout * 1000; ; await sleep(50)) {
     try {
       await db.request("GET", "/stats");
       db.retrySecs = 60;
       return db;
-    } catch (e) {
-      if (failed || node.exitCode !== null || Date.now() > until) throw new Error(`the node didn't start: ${(failed ?? e).message}`);
+    } catch {
+      if (failed || node.exitCode !== null || Date.now() > until) {
+        if (node.pid && node.exitCode === null) node.stdin.end(); // (still running: closing its input stops it, as close() does)
+        throw new Error(`the node didn't start; its log: ${log}`, failed ? { cause: failed } : undefined); // (a failed spawn, say; else the log says why)
+      }
     }
   }
 }
 
-/** The `pondra` executable: $PONDRA_BIN, or the one npm installed for this platform. */
-export function binary() {
+/** The `pondra` executable: $PONDRA_BIN, or the one npm installed for this platform. Async, as it loads
+ * Node's module resolver only when it is asked. */
+export async function binary() {
   if (process.env.PONDRA_BIN) return process.env.PONDRA_BIN;
+  const { createRequire } = await import("node:module");
   const os = { linux: "linux", darwin: "macos", win32: "windows" }[process.platform];
   const exe = process.platform === "win32" ? "pondra.exe" : "pondra";
   return createRequire(import.meta.url).resolve(`pondra-${os}-${process.arch}/${exe}`);
 }
 
-const freePort = () =>
-  new Promise((resolve, reject) => {
+/** A port nothing listens on here, for `local`'s node. */
+async function freePort() {
+  const { createServer } = await import("node:net");
+  return new Promise((resolve, reject) => {
     const s = createServer().once("error", reject).listen(0, "127.0.0.1", () => {
       const { port } = s.address();
       s.close(() => resolve(port));
     });
   });
+}

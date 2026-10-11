@@ -822,14 +822,15 @@ export class Frame {
   // back to SQL, and writes
 
   /** A view others read by name, made now (`CREATE VIEW`; `materialized`: kept up to date; `temporary`:
-   * this connection's only). The frame returned is the view's table. */
+   * this connection's only, and never materialized). `replace: false` refuses to replace one that exists.
+   * The frame returned is the view's table. */
   toView(name, { temporary = false, materialized = false, replace = null, ...options } = {}) {
+    if (temporary && materialized) throw new Error("temporary and materialized: a temporary view is this connection's alone, and the lake keeps a materialized one");
     const opts = Object.entries(options);
     if (opts.length && !materialized) throw new Error(`${opts.map(([k]) => k).join(", ")}: options of a materialized view ({ materialized: true })`);
     const withs = opts.length ? ` WITH (${opts.map(([k, v]) => `${k} = ${literal(v)}`).join(", ")})` : "";
     const head = materialized ? `CREATE MATERIALIZED VIEW ${name}${withs} AS`
-      : temporary ? `CREATE TEMP VIEW ${name} AS`
-        : `CREATE ${replace === false ? "" : "OR REPLACE "}VIEW ${name} AS`;
+      : `CREATE ${replace === false ? "" : "OR REPLACE "}${temporary ? "TEMP " : ""}VIEW ${name} AS`;
     const made = this.sql().then((text) => this._con.sql(`${head} ${text}`, this._params));
     return new Frame(this._con, `SELECT * FROM ${name}`, { rel: name, table: name, waits: [handled(made)] });
   }

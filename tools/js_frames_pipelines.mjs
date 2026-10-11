@@ -5,10 +5,17 @@
 //                                                  its SQL, its rows and its columns, as JSON on stdout
 //   node js_frames_pipelines.mjs misc <dir>        the checks that read files and write tables, on a node this
 //                                                  process starts in <dir> (its local files need that node: invariant 61)
+//   node js_frames_pipelines.mjs client <url> <tls-url> <dir>
+//                                                  the client's calls (transactions, routines, views, watch, lookup, fetch,
+//                                                  ca) on the node Python started at <url>, and on a TLS node at <tls-url>;
+//                                                  <dir> has ca.pem (that node's certificate, self-signed) and cases.json
+//                                                  ({ key }: the lookup's key, which Python wrote). JSON on stdout
+//   node js_frames_pipelines.mjs starting <dir>    local()'s own refusals and its node's log, in <dir>; JSON on stdout
 //
 // The pipelines are built in the order of frames_check.py's pipelines(), with the same base frames, so
 // the CTE names (`_1`, `_2`, … from one counter per process) come out as Python's do.
-import { col, concat, connect, len, lit, local, when } from "../js/index.js";
+import { readFileSync } from "node:fs";
+import { binary, col, concat, connect, len, lit, local, Pondra, when } from "../js/index.js";
 
 // [name, build(orders, users, quotes), ordered]: frames_check.py's pipelines, in its order.
 const PIPELINES = [
@@ -146,10 +153,132 @@ async function misc(dir) {
   await db.close();
 }
 
-const [mode, arg] = process.argv.slice(2);
-if (mode === "pipelines") await pipelines(arg);
-else if (mode === "misc") await misc(arg);
+/** The client's own calls, on the node Python started at `url` and on a TLS node at `tlsUrl` whose
+ * certificate is dir/ca.pem. Each result is its value, or { error, code, cause, sqlstate } for the call that
+ * threw. The order matters: a CA is trusted by this whole process from the call that first uses it on, so
+ * the call that must fail without it comes before any that adds it. */
+async function client(url, tlsUrl, dir) {
+  const { key } = JSON.parse(readFileSync(`${dir}/cases.json`, "utf8"));
+  const out = {};
+  const check = async (name, fn) => {
+    try {
+      out[name] = await fn();
+    } catch (e) {
+      out[name] = { error: e?.message ?? String(e), code: e?.code ?? null, cause: e?.cause?.code ?? null, sqlstate: e?.sqlstate ?? null };
+    }
+  };
+  const db = connect(url, { onNotice: null });
+  const count = async (table) => Number((await db.sql(`SELECT count(*) AS n FROM ${table}`))[0].n);
+
+  await check("lookup", () => db.lookup("kt", key));
+
+  await check("transactionCommit", async () => {
+    await db.sql("CREATE TABLE js_tx (a INT)");
+    const inside = await db.transaction(async (tx) => {
+      await tx.sql("INSERT INTO js_tx VALUES (1), (2)");
+      return Number((await tx.sql("SELECT count(*) AS n FROM js_tx"))[0].n); // (its own writes, read back)
+    });
+    return { inside, after: await count("js_tx") };
+  });
+
+  await check("transactionRollback", async () => {
+    let thrown = null;
+    try {
+      await db.transaction(async (tx) => {
+        await tx.sql("INSERT INTO js_tx VALUES (3)");
+        throw new Error("stop here");
+      });
+    } catch (e) {
+      thrown = e.message; // (the block's own error, as it was thrown)
+    }
+    return { thrown, count: await count("js_tx") };
+  });
+
+  await check("routines", async () => {
+    await db.createFunction("twice", { params: { x: "INT" }, returns: "INT", language: "sql", body: "SELECT x * 2" });
+    const value = Number((await db.sql("SELECT twice(21) AS v"))[0].v);
+    return { value, listed: Object.keys(await db.routines()).includes("twice") };
+  });
+
+  await check("procedure", async () => {
+    await db.sql("CREATE TABLE js_procs (a INT)");
+    await db.createProcedure("add_row", { params: { n: "INT" }, language: "sql", body: "INSERT INTO js_procs VALUES ($n)" });
+    await db.call("add_row", 5);
+    return (await db.sql("SELECT a FROM js_procs")).map((r) => Number(r.a));
+  });
+
+  await check("viewTemporary", async () => {
+    const mine = await db.view("js_tv", "SELECT 7 AS x", { temporary: true }); // (awaited: its rows)
+    const otherError = await connect(url, { onNotice: null }).sql("SELECT x FROM js_tv").then(() => null, (e) => e.message);
+    return { mine, otherError };
+  });
+
+  await check("watchMarks", async () => {
+    await db.sql("CREATE TABLE js_wt (a INT)");
+    await db.sql("INSERT INTO js_wt VALUES (1), (2)");
+    const it = db.watch("js_wt", { after: 0 });
+    const got = [(await it.next()).value, (await it.next()).value];
+    await db.sql("INSERT INTO js_wt VALUES (3)");
+    got.push((await it.next()).value); // (the mark after 1 and 2 is read on the way, so position is set now)
+    const position = db.position ?? null;
+    await it.return();
+    const later = db.watch("js_wt", { after: position });
+    const first = (await later.next()).value;
+    await later.return();
+    return { rows: got.map((r) => r.a), markYielded: got.some((r) => "_after" in r), position, laterFirst: first.a };
+  });
+
+  await check("closeArgument", () => db.close(1).then(() => "closed", (e) => e.message));
+
+  await check("caMissingFile", () => new Pondra(url, { ca: `${dir}/absent.pem`, onNotice: null }).sql("SELECT 1 AS x"));
+  await check("tlsWithoutCa", () => new Pondra(tlsUrl, { onNotice: null }).sql("SELECT 1 AS x"));
+  await check("tlsWithCa", () => new Pondra(tlsUrl, { ca: `${dir}/ca.pem`, onNotice: null }).sql("SELECT 1 AS x"));
+  await check("caOnPlainNode", () => new Pondra(url, { ca: `${dir}/ca.pem`, onNotice: null }).sql("SELECT 1 AS x"));
+
+  await check("fetchOption", async () => {
+    const asked = [];
+    const rows = await new Pondra(url, { onNotice: null, fetch: (u, o) => (asked.push(u), fetch(u, o)) }).sql("SELECT 1 AS x");
+    return { rows, asked: asked.length };
+  });
+
+  // The SQL text of the CREATEs, as they are sent: Python's must be the same for the same arguments.
+  const sent = [];
+  const recorder = connect(url, { onNotice: null });
+  const sendSql = recorder.sql.bind(recorder);
+  recorder.sql = (query, params) => (sent.push(query), sendSql(query, params));
+  await check("sqlText", async () => {
+    await recorder.createFunction("text_twice", { params: { x: ["INT", 1] }, returns: "INT", language: "sql", body: "SELECT x * 2", strict: true, volatility: "immutable" });
+    await recorder.createProcedure("text_proc", { params: { n: "INT" }, language: "sql", body: "SELECT $n" });
+    await recorder.view("text_view", "SELECT 1 AS x");
+    return sent.filter((t) => t.startsWith("CREATE"));
+  });
+
+  console.log(JSON.stringify(out));
+}
+
+/** local()'s own refusals, and a node that doesn't start: its error names its log (the file is in the temp
+ * folder; Python reads it). */
+async function starting(dir) {
+  const out = {};
+  const check = async (name, fn) => {
+    try {
+      await fn();
+      out[name] = "no error";
+    } catch (e) {
+      out[name] = e.message;
+    }
+  };
+  await check("timeoutMs", () => local(`${dir}/timeout-ms`, { timeoutMs: 1 }));
+  await check("badFlag", () => local(`${dir}/bad-flag`, { python: false, flags: ["--no-such-flag"] }));
+  console.log(JSON.stringify(out));
+}
+
+const [mode, ...args] = process.argv.slice(2);
+if (mode === "pipelines") await pipelines(args[0]);
+else if (mode === "misc") await misc(args[0]);
+else if (mode === "client") await client(...args);
+else if (mode === "starting") await starting(args[0]);
 else {
-  console.error("usage: js_frames_pipelines.mjs pipelines <url> | misc <dir>");
+  console.error("usage: js_frames_pipelines.mjs pipelines <url> | misc <dir> | client <url> <tls-url> <dir> | starting <dir>");
   process.exit(2);
 }

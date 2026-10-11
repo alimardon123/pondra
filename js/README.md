@@ -11,7 +11,9 @@ the bucket is the only state.
 [Releases](https://github.com/alimardon123/pondra/releases) · MIT OR Apache-2.0
 
 This package installs the `pondra` binary for your platform and a small JavaScript client (no
-dependencies; Node 18+).
+dependencies; Node 18+). The client also runs in browsers, Deno and Bun, wherever `fetch` does; `local`
+and `binary` need Node, and `ca` (the authority that signs an `https` node's certificate) needs Node 22.19
+or later.
 
 ```bash
 npm install pondra        # in a project; or npm install -g pondra, or npx pondra with no install
@@ -45,6 +47,12 @@ const big = db.table("events").filter(col("amount").gt(3)).groupBy("user").agg(c
 await big.writeTable("big_spenders");                     // a table made from the frame
 console.log(await db.readParquet("sales/*.parquet").limit(5)); // files as a frame: awaiting runs it
 ```
+
+Functions and procedures take their code as text or a file: `db.createFunction(…)` and `db.createProcedure(…)`
+send it to the node, as SQL or as Python. Python's `@db.function` and `@db.procedure` decorators take a Python
+function from Python's own source, so they can't ship code from JavaScript. Python's `secret()` answers only a
+running procedure's own lent connection, which JavaScript code never runs as, so JavaScript has no way to read
+a secret.
 
 `npx pondra` opens a SQL shell on `./lake`, and `npx pondra serve lake` runs a node with its
 console at `http://localhost:8080`.

@@ -525,8 +525,9 @@ class Pondra:
         return frame.write_table(name, mode)
 
     def lookup(self, table, key):
-        """The current row of one key of a keyed table (None if absent)."""
-        rows = json.loads(self._call("GET", f"/lookup/{table}/{key}"))
+        """The current row of one key of a keyed table (None if absent). The key is one URL segment,
+        escaped as JavaScript's `encodeURIComponent` escapes it: a space, `/`, `#` or `?` in it is fine."""
+        rows = json.loads(self._call("GET", f"/lookup/{table}/{urllib.parse.quote(str(key), safe='')}"))
         return rows[0] if rows else None
 
     def watch(self, table, after=None, changes=False):

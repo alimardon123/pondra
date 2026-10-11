@@ -10,13 +10,23 @@
    started it: invariant 61), after the first node is closed: one node at a time.
 3. `unique`'s keep and maintainOrder are taken on a sorted frame (pipelines above) and refused by name, with
    the message, on one that isn't; `groupBy`'s maintainOrder is refused by name.
+4. The client's own calls (`client`): transactions commit, and roll back with the block's error rethrown;
+   createFunction's SQL function is called and routines() lists it; createProcedure's CALL writes its row; a
+   temporary view is this connection's alone; watch's marks (position is set, and watch after it yields only
+   later rows); lookup of a key with a space, a slash, ? and # (JavaScript and Python read the same row);
+   close() takes no argument; `ca` (a file that isn't there; a self-signed node refused without it and answered
+   with it; a valid PEM on a plain node); the fetch option; the SQL text of createFunction, createProcedure and
+   view as Python's is. Then local()'s refusals (timeoutMs; a bad flag names its log, which says why), no static
+   node: import in js/index.js or js/frame.js, and `from pondra import *` leaves Python's builtins alone.
 
   python3 tools/js_frames_check.py [--port 8831] [--bin target/release/pondra]
 
-Needs node (18+) and pyarrow; the binary is `--bin`, else `PONDRA_BIN`, else the release build.
-Prints "ok …" or "FAIL …" for each check, and exits 1 on any failure.
+Needs node (18+; the `ca` checks need 22.19+) and pyarrow, and openssl for item 4's certificate. The binary is
+`--bin`, else `PONDRA_BIN`, else the release build. Prints "ok …" or "FAIL …" for each check, and exits 1 on
+any failure.
 """
-import argparse, datetime as dt, decimal, json, math, os, random, shutil, subprocess, sys, tempfile
+import argparse, contextlib, datetime as dt, decimal, json, math, os, random, re, shutil, socket, ssl, subprocess, sys, tempfile, time
+import urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 JS = os.path.join(HERE, "js_frames_pipelines.mjs")
@@ -262,6 +272,177 @@ def misc_check(report, tmp):
                      else f"{key}: {refused.get(key)!r}, not {text!r}")
 
 
+# ---------------------------------------------------------------- the client's calls (item 4)
+
+KEY = "a b/c?#"  # a key with a space, a slash, a question mark and a hash: one URL segment, escaped by each client
+TIMEOUT_MS_MESSAGE = "local({ timeoutMs }): it is { timeout } now, in seconds, as Python's"
+
+
+def make_cert(d):
+    """A self-signed certificate for 127.0.0.1, as ca.pem: the authority that signs the TLS node's."""
+    cert, key = os.path.join(d, "ca.pem"), os.path.join(d, "key.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                    "-keyout", key, "-out", cert, "-days", "2", "-subj", "/CN=127.0.0.1",
+                    "-addext", "subjectAltName=IP:127.0.0.1"], check=True, capture_output=True)
+    return cert, key
+
+
+def tls_ready(port, cert):
+    """Whether the node answers over TLS, checked with Python's own verification of `cert`."""
+    try:
+        with urllib.request.urlopen(f"https://127.0.0.1:{port}/stats", context=ssl.create_default_context(cafile=cert), timeout=2):
+            return True
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def start_tls(d, port, cert, key):
+    """A node over TLS on `port`, with a lake of its own in `d`; it stops when its input closes (as local()'s do)."""
+    lake = os.path.join(d, "tls-lake")
+    os.makedirs(lake, exist_ok=True)
+    log = os.path.join(d, "tls.log")
+    with open(log, "wb") as err:
+        proc = subprocess.Popen([os.environ["PONDRA_BIN"], "serve", "--dir", lake, "--addr", f"127.0.0.1:{port}", "--stop-with-stdin",
+                                 "--tls-cert", cert, "--tls-key", key], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err)
+    for _ in range(600):
+        if proc.poll() is not None:
+            break
+        if tls_ready(port, cert):
+            return proc
+        time.sleep(0.1)
+    proc.kill()
+    raise RuntimeError(f"the TLS node didn't start on port {port}; its log: {log}")
+
+
+@contextlib.contextmanager
+def recording(con):
+    """The SQL text Python's calls send to the node, in order (a list, filled while the block runs)."""
+    sent, run = [], con._run
+
+    def keep(sql, *args, **kwargs):
+        sent.append(sql)
+        return run(sql, *args, **kwargs)
+
+    con._run = keep
+    try:
+        yield sent
+    finally:
+        con._run = run
+
+
+def client_check(port, report, tmp):
+    """The JavaScript client's calls against a node Python started, and against a TLS node whose certificate is
+    the `ca` file. The JavaScript side reports each result; the SQL text of the CREATEs is Python's to compare."""
+    d = os.path.join(tmp, "client")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "cases.json"), "w", encoding="utf-8") as f:
+        json.dump({"key": KEY}, f)
+    cert, key = make_cert(d)
+    con = pondra.local(os.path.join(d, "lake"), port=port)
+    tls = None
+    try:
+        con.sql("CREATE TABLE kt (name VARCHAR, v BIGINT, PRIMARY KEY (name))")
+        con.append("kt", [{"name": KEY, "v": 1}])
+        try:
+            py_row = con.lookup("kt", KEY)
+        except Exception as e:  # noqa: BLE001 (a FAIL line below; the client's other checks still run)
+            py_row = f"Python's lookup: {e}"
+        with recording(con) as py_sql:
+            con.create_function("text_twice", params={"x": ("INT", 1)}, returns="INT", language="sql", body="SELECT x * 2", strict=True, volatility="immutable")
+            con.create_procedure("text_proc", params={"n": "INT"}, language="sql", body="SELECT $n")
+            con.view("text_view", "SELECT 1 AS x")
+        tls = start_tls(d, port + 1, cert, key)
+        got = run_node(["client", f"http://127.0.0.1:{port}", f"https://127.0.0.1:{port + 1}", d], timeout=600)
+    finally:
+        if tls is not None:
+            tls.stdin.close()
+            tls.wait(timeout=60)
+        con.close()
+    check_client(report, got, py_row, [s for s in py_sql if s.startswith("CREATE")])
+
+
+def check_client(report, got, py_row, py_sql):
+    """Each of the JavaScript client's calls, as it reports, against what it should be."""
+    def same(name, value, want, good):
+        report.check(value == want, good if value == want else f"{name}: {value!r}, not {want!r}")
+
+    def obj(name):
+        value = got.get(name)
+        return value if isinstance(value, dict) else {}
+
+    same("lookup", got.get("lookup"), py_row, "lookup of a key with a space, a slash, ? and #: JavaScript reads Python's row")
+    same("transactionCommit", got.get("transactionCommit"), {"inside": 2, "after": 2},
+         "transaction commit: its two rows read back inside the block and kept after COMMIT")
+    same("transactionRollback", got.get("transactionRollback"), {"thrown": "stop here", "count": 2},
+         "transaction rollback: the block's error comes back as it was thrown, and its insert is undone")
+    same("routines", got.get("routines"), {"value": 42, "listed": True},
+         "createFunction (SQL): twice(21) is 42, and routines() lists it")
+    same("procedure", got.get("procedure"), [5], "createProcedure (SQL): CALL add_row(5) wrote its row")
+    vt = obj("viewTemporary")
+    report.check(vt.get("mine") == [{"x": 7}] and bool(vt.get("otherError")),
+                 "temporary view: this connection reads it, a second connection doesn't" if vt.get("mine") == [{"x": 7}] and vt.get("otherError")
+                 else f"temporary view: {got.get('viewTemporary')!r}")
+    wm = obj("watchMarks")
+    report.check(wm.get("rows") == [1, 2, 3] and wm.get("markYielded") is False and isinstance(wm.get("position"), (int, float)) and wm.get("laterFirst") == 3,
+                 "watch with marks: rows 1, 2, 3 in order and no mark yielded; position is set; watch after it yields only row 3"
+                 if wm.get("rows") == [1, 2, 3] and wm.get("markYielded") is False and isinstance(wm.get("position"), (int, float)) and wm.get("laterFirst") == 3
+                 else f"watch with marks: {got.get('watchMarks')!r}")
+    same("closeArgument", got.get("closeArgument"), "close() takes no argument", "close(…) with an argument throws, saying it takes none")
+    cm = obj("caMissingFile")
+    report.check(cm.get("code") == "ENOENT", "ca: a file that isn't there throws ENOENT, before any request" if cm.get("code") == "ENOENT" else f"ca missing file: {got.get('caMissingFile')!r}")
+    tw = obj("tlsWithoutCa")
+    report.check("error" in tw, f"https without ca: the node's self-signed certificate is refused (cause {tw.get('cause')})" if "error" in tw
+                 else f"https without ca answered: {got.get('tlsWithoutCa')!r}")
+    same("tlsWithCa", got.get("tlsWithCa"), [{"x": 1}], "https with ca: the same node's certificate is trusted, and the query answered")
+    same("caOnPlainNode", got.get("caOnPlainNode"), [{"x": 1}], "ca on a plain http node: a valid PEM is read and the query answered")
+    fo = obj("fetchOption")
+    report.check(fo.get("rows") == [{"x": 1}] and fo.get("asked", 0) >= 1, "fetch option: the node is reached through the function given" if fo.get("asked", 0) >= 1
+                 else f"fetch option: {got.get('fetchOption')!r}")
+    sql_ok = got.get("sqlText") == py_sql
+    report.check(sql_ok, f"SQL text: createFunction, createProcedure and view send Python's text, character for character ({len(py_sql)} statements)" if sql_ok
+                 else f"SQL text differs: JavaScript {got.get('sqlText')!r} vs Python {py_sql!r}")
+
+
+def starting_check(report, tmp):
+    """local()'s refusals in JavaScript, and what a node that doesn't start says: its log, in the temp folder."""
+    got = run_node(["starting", os.path.join(tmp, "starting")], timeout=300)
+    report.check(got.get("timeoutMs") == TIMEOUT_MS_MESSAGE, "local({ timeoutMs }) is refused by name: it is { timeout } now, in seconds" if got.get("timeoutMs") == TIMEOUT_MS_MESSAGE
+                 else f"local({{ timeoutMs }}): {got.get('timeoutMs')!r}")
+    bad = got.get("badFlag") or ""
+    prefix = "the node didn't start; its log: "
+    path = bad[len(prefix):] if bad.startswith(prefix) else ""
+    text = ""
+    if path and os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        os.remove(path)
+    good = os.path.dirname(path) == tempfile.gettempdir() and "--no-such-flag" in text
+    report.check(good, "local({ flags: ['--no-such-flag'] }) throws naming its log, in the temp folder, which says why" if good
+                 else f"local(flags): {bad!r}; its log says {text[:200]!r}")
+
+
+def static_check(report):
+    """No static import of a Node module in the client's files: a browser, Deno and Bun load them too."""
+    for name in ("index.js", "frame.js"):
+        with open(os.path.join(HERE, "..", "js", name), encoding="utf-8") as f:
+            bad = re.findall(r'^(?:import|export)\b[^\n]*\bfrom\s+["\']node:[^\n]*$', f.read(), re.M)
+        report.check(not bad, f"js/{name}: no static node: import (its Node modules load when a call needs them)" if not bad
+                     else f"js/{name}: static node: import {bad[0]!r}")
+
+
+def builtins_check(report, tmp):
+    """`from pondra import *` leaves Python's sum, len, max, min and all alone; pondra.sum is still the frame's."""
+    snippet = (
+        "import pondra, pondra.frame\n"
+        'exec("from pondra import *\\nassert sum([1, 2]) == 3 and len([1]) == 1 and max(1, 2) == 2 and min(1, 2) == 1 and all([True])")\n'
+        "assert pondra.sum is pondra.frame.sum\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.path.abspath(os.path.join(HERE, "..", "python"))}
+    done = subprocess.run([sys.executable, "-c", snippet], capture_output=True, text=True, env=env, cwd=tmp, timeout=120)
+    report.check(done.returncode == 0, "from pondra import *: Python's sum, len, max, min and all are still Python's; pondra.sum is the frame's" if done.returncode == 0
+                 else f"from pondra import *: {done.stderr.strip()[-300:]}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8831)
@@ -277,11 +458,20 @@ def main():
     os.environ["PONDRA_BIN"] = A.bin  # (for pondra.local() here, and for the JavaScript side's local())
     tmp = tempfile.mkdtemp(prefix="pondra-js-frames-")
     report = Report()
+    steps = [
+        lambda: pipelines_check(A.port, report, tmp),
+        lambda: misc_check(report, tmp),
+        lambda: client_check(A.port, report, tmp),
+        lambda: starting_check(report, tmp),
+        lambda: static_check(report),
+        lambda: builtins_check(report, tmp),
+    ]
     try:
-        pipelines_check(A.port, report, tmp)
-        misc_check(report, tmp)
-    except Exception as e:  # noqa: BLE001 (reported, not a traceback)
-        report.check(False, f"the check stopped: {type(e).__name__}: {str(e)[:600]}")
+        for step in steps:
+            try:
+                step()
+            except Exception as e:  # noqa: BLE001 (reported, not a traceback: the next section still runs)
+                report.check(False, f"the check stopped: {type(e).__name__}: {str(e)[:600]}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"{report.total - report.failed} of {report.total} checks ok", flush=True)

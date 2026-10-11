@@ -28,9 +28,9 @@ console.log(await db.sql("SELECT 1 AS one"));
 
 | Call | Meaning |
 |---|---|
-| `connect(url = "http://127.0.0.1:8080", { token, onNotice, retrySecs })` | a connection to a node, or to any of several (an array of URLs) |
-| `await local(dir = "lake", { port, token, flags, timeoutMs, python, onNotice })` | start a node on a lake here (a folder or `s3://bucket/prefix`) and connect to it |
-| `binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, or the one npm installed for this platform |
+| `connect(url = "http://127.0.0.1:8080", { token, user, password, onNotice, retrySecs, ca, fetch })` | a connection to a node, or to any of several (an array of URLs) |
+| `await local(dir = "lake", { port, token, flags, timeout, python, onNotice })` | start a node on a lake here (a folder or `s3://bucket/prefix`) and connect to it |
+| `await binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, or the one npm installed for this platform |
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -39,9 +39,11 @@ console.log(await db.sql("SELECT 1 AS one"));
 | `onNotice` | `console.log` | called with each line a procedure printed. `null` keeps them quiet |
 | `port` | a free port | the port `local`'s node listens on (`127.0.0.1`) |
 | `flags` | `[]` | more `pondra serve` options, such as `["--memory-gb", "2"]` |
-| `timeoutMs` | 120000 | how long `local` waits for the node to start |
+| `timeout` | 120 | seconds `local` waits for the node to start. (`timeoutMs` throws, naming `timeout`) |
 | `python` | `true` | give the node a Python, for Python functions and procedures, if this machine has one with the `pondra` package (`--python auto`); `false` for none |
 | `retrySecs` | 60 | how long a call keeps trying while no node answers it (0: once) |
+| `ca` | none | a PEM file of the authority that signs an `https` node's certificate. This process trusts it from the first request, as `NODE_EXTRA_CA_CERTS` would. Node 22.19 or later has the call for it; older Nodes throw, naming the two ways round it |
+| `fetch` | the global `fetch` | a function used in place of it, for TLS of your own (Bun's, an undici `Agent`, Deno's client). It brings its own certificates, so `ca` doesn't apply to it |
 
 Given a cluster's nodes, a connection rides out one going away, as the
 [Python client](/pondra/reference/python/#connect) does: a call no node ran goes to the next node,
@@ -56,7 +58,8 @@ const db = connect(["http://10.0.0.1:8080", "http://10.0.0.2:8080", "http://10.0
 
 `local` stops its node on `db.close()` or when the process exits, and the lake stays. Because this
 program started the node, its SQL may read and write files on this machine
-(`SELECT * FROM read_csv('jan.csv')`).
+(`SELECT * FROM read_csv('jan.csv')`). Its standard error goes to `pondra-<port>.log` in the temp
+folder: a node that doesn't start throws `the node didn't start; its log: <path>`, and the log says why.
 
 ```js
 import { local } from "pondra";
@@ -136,6 +139,40 @@ console.log(await db.lookup("users", 7), await db.lookup("users", 8));
 { id: 7, name: 'ann' } null
 ```
 
+## Transactions
+
+`await db.transaction(async (tx) => { … })` runs the block's statements as one commit (`BEGIN`, the block,
+`COMMIT`). The block reads its own writes. If it throws, the transaction is rolled back and the error goes on
+to the caller. Another commit that changed one of its rows first refuses it, with `sqlstate` `40001`: run the
+block again. It answers what the block returns.
+
+```js
+import { connect } from "pondra";
+
+const db = connect("http://localhost:8080");
+await db.sql("CREATE TABLE ledger (id BIGINT, amount DOUBLE)");
+const total = await db.transaction(async (tx) => {
+  await tx.sql("INSERT INTO ledger VALUES (1, 5.0), (2, 2.5)");
+  return (await tx.sql("SELECT sum(amount) AS total FROM ledger"))[0].total; // its own writes
+});
+console.log(total);
+try {
+  await db.transaction(async (tx) => {
+    await tx.sql("INSERT INTO ledger VALUES (3, 9.0)");
+    throw new Error("the check failed");
+  });
+} catch (e) {
+  console.log(e.message); // rolled back: id 3 isn't there
+}
+console.log(await db.sql("SELECT count(*) AS n FROM ledger"));
+```
+
+```text
+7.5
+the check failed
+[ { n: 2 } ]
+```
+
 ## Procedures
 
 | Method | Returns |
@@ -164,14 +201,42 @@ console.log(typeof run);
 string
 ```
 
+## Functions and procedures
+
+| Method | Returns |
+|---|---|
+| `await db.createFunction(name, { params, returns, language, body, file, entry, vectorized, strict, volatility, packages, timeout, cache, replace })` | `CREATE FUNCTION`: a function called from SQL and from frames. `language: "sql"` takes a SQL body, which names its parameters as they are; `"python"` (the default) runs Python code on the node, as `body` text or a `file` of it, with `entry` naming the function to run. `params` maps each parameter to its SQL type, or to `[type, default]`; `returns` is a SQL type, or an object of columns and their types (a table). `cache: "10 minutes"` reuses an answer that long for the same arguments |
+| `await db.createProcedure(name, { params, language, body, file, entry, packages, timeout, replace })` | `CREATE PROCEDURE`, with the options of `createFunction`. A SQL body names its parameters with `$` (`$n`), as a `CALL` binds them |
+| `await db.routines()` | this lake's functions and procedures (SQL's `pondra.routines`), as an object keyed by name: each one's kind, parameters, language and body |
+
+Python's `@db.function` and `@db.procedure` decorators take a Python function from Python's own source, so they can't ship code from JavaScript: JavaScript sends its code as text or as a file, through `createFunction` and `createProcedure`. Python's `secret()` answers only a running procedure's own lent connection, which JavaScript code never runs as, so JavaScript has no way to read a secret; a Python procedure on the node can.
+
+```js
+import { connect } from "pondra";
+
+const db = connect("http://localhost:8080");
+await db.createFunction("twice", { params: { x: "INT" }, returns: "INT", language: "sql", body: "SELECT x * 2" });
+await db.sql("CREATE TABLE doubled (a INT)");
+await db.createProcedure("add_row", { params: { n: "INT" }, language: "sql", body: "INSERT INTO doubled VALUES ($n)" });
+await db.call("add_row", 21);
+console.log(await db.sql("SELECT twice(a) AS v FROM doubled"));
+console.log(Object.keys(await db.routines()).includes("twice"));
+```
+
+```text
+[ { v: 42 } ]
+true
+```
+
 ## Views
 
-`await db.view(name, sql, { materialized, replace = true, ...options })` makes a view others read
-by name.
+`db.view(name, query, { materialized, temporary, replace = true, ...options })` makes a view others read
+by name. It answers the view as a frame: awaiting it gives the view's rows.
 
 | Option | Meaning |
 |---|---|
 | `materialized: true` | keep it up to date with each new row (`CREATE MATERIALIZED VIEW`) instead of running the query when it is read |
+| `temporary: true` | a temporary view (`CREATE OR REPLACE TEMP VIEW`): this connection's alone, gone when it closes. A materialized view can't be one |
 | `replace` | for a stored view, `false` refuses to replace one that exists |
 | other options | the options of a materialized view: `window`, `size_secs`, `slide_secs`, `lateness_secs`, `session`, `gap_secs`, `join`, `time`, `within_secs`. They need `materialized: true`. See [table options](/pondra/reference/table-options/#materialized-views) |
 
@@ -181,11 +246,14 @@ import { connect } from "pondra";
 const db = connect("http://localhost:8080");
 console.log(await db.view("big_orders", "SELECT * FROM orders WHERE amount > 5"));
 console.log(await db.view("spend", "SELECT item, sum(amount) AS total FROM orders GROUP BY item", { materialized: true }));
+await db.view("mine", "SELECT item FROM orders", { temporary: true }); // (awaited: it exists before the next query)
+console.log(await db.sql("SELECT count(*) AS n FROM mine"));
 ```
 
 ```text
-{ view: 'big_orders' }
-{ view: 'spend', materialized: true }
+[ { id: 1, item: 'tea', amount: 7 } ]
+[ { item: 'cake', total: 4.5 }, { item: 'tea', total: 7 } ]
+[ { n: 2 } ]
 ```
 
 ## Following changes
@@ -195,7 +263,9 @@ console.log(await db.view("spend", "SELECT item, sum(amount) AS total FROM order
 | `db.watch(table, { after, changes })` | an async generator of a table's new rows as they commit, one object each. For a keyed table, every upsert and delete. `after` replays from that position first. `changes: true` also yields UPDATE's and DELETE's rows, each with `_change_type`, `_row_id` and `_version` |
 | `db.live(sql, { params, everyMs })` | an async generator of a query's answer now, and again each time a commit changes it: an array of rows each time. An answer that comes out the same isn't sent again. A busy table is queried at most every `everyMs` (default 100) |
 
-After an answer, `db.position` is the commit it is as of. Both run until you leave the loop: a
+`db.position` is where the stream has got to: a `live` answer sets it, and so does each batch of `watch`, which the
+node marks. A `watch` sets it when its next row is asked for, so read one row past a batch before reading it:
+`db.watch(table, { after: db.position })` then yields what came after. Both run until you leave the loop: a
 `break` ends the stream on the node.
 
 ```js
@@ -226,14 +296,14 @@ for await (const rows of db.live("SELECT count(*) AS n FROM orders")) {
 | `db.onNotice` | the function each notice goes to |
 | `db.producer`, `db.seq` | the name `append` writes under, and its last sequence number |
 | `db.session` | this connection's session id: its temporary tables and views, and the variables of its `DO LANGUAGE python` blocks, live under it |
-| `db.position` | the commit the last `live` answer is as of |
+| `db.position` | where the last `live` answer or `watch` batch is as of: a commit, the place to resume from |
 | `await db.request(method, path, body, type)` | one HTTP request to the node, as the methods above make them. Answers the `fetch` response, and throws on an error status with the text `status: message`; the error's `sqlstate` is Postgres's code for it (`23514`, `40001`…) |
 
 ## Close
 
-`await db.close(timeoutMs = 15000)` ends the connection's session, so its temporary tables and
+`await db.close()` takes no argument. It ends the connection's session, so its temporary tables and
 views go, and so do the variables of its `DO LANGUAGE python` blocks. It also stops the node `local`
-started: it waits for the node to stop, and kills it after `timeoutMs`.
+started: it waits up to 15 seconds for the node to stop, then kills it.
 
 ```js
 import { connect } from "pondra";
