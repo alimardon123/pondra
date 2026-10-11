@@ -350,11 +350,17 @@ def environments_check(bin, work, port, root):
     for name in ["dev2", "dev", "sales_only", "fixtures"]:
         q(f"DROP DATABASE {name}")
     held = len(parquet(prod_dir))
-    for _ in range(3):
+
+    def let_go():
+        return not keys(dev_dir) and rows(prod, "SELECT name, branches FROM pondra.databases") == [("prod", 0)] and len(parquet(prod_dir)) < held
+    # (a tiering round after each retention period, until they go: three were too few on a busy
+    # runner now and then, PR #77's CI)
+    for _ in range(8):
         time.sleep(11)
         prod.post("/tier")
-    checks["DROP DATABASE: the branches' folders go, prod's pins with them, and prod lets the files they held go"] = \
-        not keys(dev_dir) and rows(prod, "SELECT name, branches FROM pondra.databases") == [("prod", 0)] and len(parquet(prod_dir)) < held
+        if let_go():
+            break
+    checks["DROP DATABASE: the branches' folders go, prod's pins with them, and prod lets the files they held go"] = let_go()
     checks["prod answers as it should after it all"] = rows(prod, "SELECT count(*) FROM sales.orders") == [(len([r for r in before if r[2] <= 900]) + 1,)]
     checks["(cloned in {:.1f} s)".format(took)] = True
     return checks
