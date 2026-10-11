@@ -90,11 +90,13 @@ src/      55,200 lines of Rust in 101 files, one per concern (see the table in R
           237–239); learned.rs (what a run learned about its filters, ADR-050: invariant 244);
           environments (ADR-047): branch.rs (`CREATE DATABASE dev CLONE prod`, REFRESH: invariant
           245), apply.rs (plan, apply, test and export: a project made true in a database;
-          `pondra.applies`: invariants 246–250), project.rs (the command line's project commands:
-          branch, switch, apply; a project's `objects/`, `migrations/`, `seeds/` and `tests/`), ci.rs
+          `pondra.applies`: invariants 246–250, 279), project.rs (the command line's project commands:
+          branch, switch, apply; a project's `objects/` (sequences, indexes and enum types too), `migrations/`,
+          `seeds/` and `tests/`), ci.rs
           (`pondra ci init`), path.rs (`USE` and a session's search path: invariant 275), protect.rs
-          (a protected database: invariant 266) and
-          sync.rs (`pondra workspace pull | push`); views kept current (ADR-055, ADR-056, ADR-059):
+          (a protected database: invariant 266), sync.rs (`pondra workspace pull | push`) and status.rs
+          (`pondra status` and `pondra capture`: ADR-060 §7, invariant 280); views kept current (ADR-055,
+          ADR-056, ADR-059):
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
@@ -1934,7 +1936,25 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `seed:{project}:{file}`. `project_check.py`: "a new database made after the rename (apply local,
    its lake gone): the migration recorded, not run, and the seed's rows loaded"; prod (which holds
    another schema first) gets its seed on its first apply.
-279. **Commits wait for tiering only while tiering can run** (`log::Backpressure`, `Lake::tiering`):
+279. **An apply's kinds are the registry's, and each changes only as its data allows** (`apply::Kind` over
+   `objects::KINDS`: `project`, `order`): every kind `GET /kinds` says a project may declare goes through
+   export and apply, so a new kind fails `project_check.py` until a project declares it. A sequence changes
+   by `ALTER SEQUENCE` (its next value kept; an option taken away refused), an enum type gains labels only
+   at the end, an index is made again, and an index is named in its table's schema.
+   `project_check.py`: "every kind a project may declare was exported and applied…", "a sequence, a type
+   and an index changed…", "…a sequence's option taken away: refused by name", "…a type's label taken
+   away: refused by name".
+280. **`pondra status` is the plan an apply would make, and a rename is told from a drop by what a rename keeps**
+   (`status.rs`, `apply::Shape`, `Record.shapes`): every apply records each declared table's folder and its
+   columns' stored names. A table gone from its name with an untracked table in its folder was renamed; a column
+   with its stored name under another name was renamed, one gone was dropped. `pondra capture` writes the
+   database's statement (its author's when the fingerprints match) and a rename as a migration recorded as run
+   where it was made. Elsewhere a table a pending migration renames to, and what reads it, waits for the
+   migrations (`apply::renames`). An object as the files say needs no step, and one dropped outside an apply
+   isn't dropped again. `project_check.py`: "pondra status: a table renamed outside an apply…", "pondra capture
+   sales.memos…", "pondra plan after the capture…", "pondra apply prod: the migration runs there…", "…a column
+   added outside an apply…".
+281. **Commits wait for tiering only while tiering can run** (`log::Backpressure`, `Lake::tiering`):
    while more than `--backlog` rows wait in the log, the sequencer holds commits back, but only while
    the lake's lock is free or a tiering round holds it (`server::Tiering`: on once the round has the
    lock, off once it has let it go). Tiering needs that lock, and whoever else holds it (a view running
@@ -1942,6 +1962,23 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    held, Nexmark's twenty views stopped every write, one run in four. `harness.py backpressure`: "150
    writes, each in time" times out at the 11th write without it; "never half of 8,000 rows in the
    log" fails if commits never wait.
+282. **A view of windows is kept by key only when each key's rows come from that key's rows alone**
+   (`rerun::window_keys`, `partitioned`, `within`): one table read alone under its windows, or tables
+   inner-joined on them (`joined`: each table has a column of the key's type equal to each key,
+   through the joins' conditions and the filters over them), columns every window partitions by (a
+   stack's shared ones), each selected as it is (`traced`). A run then reads only the touched keys'
+   rows under the windows (a semi join below the lowest one, or below each joined table: `cut`), so
+   every partition it works out holds all its rows. A join's keys come from every joined table's
+   changes, found over the tables as they are (a table replaced by its changes is a query of its own,
+   which `joined` doesn't take), and the view follows each of them (`Rerun::joins`, the source among
+   them; `View::follows`: a bulk INSERT into one takes the version of the commit that records it).
+   The touched keys are the side a semi join holds, as written (`kept_as_written`): swapped by the
+   planner's estimates, the whole table was held and a window's sort above it failed. A window over
+   every row, a key not selected, an outer join, a keyed table or a table not joined on the key is run
+   whole. Kept whole, Nexmark's q18 and q19 at 2M events answered 35 s after the last bid.
+   `harness.py bykey`: `latest`, `top3` (two windows sharing `region`), `led` (a join on the key, its
+   other table changed too) == ad hoc through changes, three nodes and a restart; "a key not selected
+   (a window's too)", "a join not on the windows' key", "a keyed table joined".
 
 ## Tests: run these before and after any change
 
@@ -1974,7 +2011,7 @@ python3 tools/harness.py history        # pondra.history: every door's statement
 python3 tools/harness.py plans          # EXPLAIN's expected rows, history's fingerprint, plan_id, version, reads, writes, misestimate; what a run learned and pondra.learned
 python3 tools/harness.py learn          # the planner uses what runs learned: the join order from a measured filter, on another node too; no slower; the bar; three nodes alike; a restart
 python3 tools/harness.py finishes       # GROUP BY views with avg, stddev, HAVING, ORDER BY/LIMIT == ad hoc: changes, EMIT FINAL, a restart, three nodes
-python3 tools/harness.py bykey          # views kept by key (median, count(DISTINCT), string_agg) == ad hoc: changes, flows, a restart, three nodes
+python3 tools/harness.py bykey          # views kept by key (median, count(DISTINCT), string_agg, windows within keys) == ad hoc: changes, flows, a restart, three nodes
 python3 tools/harness.py refreshed      # views run whole (ORDER BY … LIMIT, windows, joins, now() with a lag) == ad hoc: changes, flows, a restart, three nodes
 python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
 python3 tools/harness.py sequences      # nextval on three nodes (every value once), identity columns from every door, ALWAYS, owned sequences, a leader's kill

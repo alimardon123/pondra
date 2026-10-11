@@ -380,6 +380,16 @@ def fingerprint(row, q):
     return [None if v is None else round(float(v), 3) for v in vals]
 
 
+def same(got, want):
+    """Two fingerprints agree: equal, but for a sum of doubles' last digits. DuckDB adds doubles in
+    whatever order its threads finish, and Pondra's sums are exact (`fsum.rs`). (q17's sum of
+    120,000 averages is about 2e12: a run once waited its whole deadline on q17 alone, though the
+    view equalled a fresh DuckDB answer when checked by hand.)"""
+    if not isinstance(got, list) or len(got) != len(want):
+        return False
+    return all(g == w or (g is not None and w is not None and abs(g - w) <= 1e-11 * max(1.0, abs(w))) for g, w in zip(got, want))
+
+
 def pondra(n, names, port=8290):
     import pyarrow as pa, harness
     harness.A = argparse.Namespace(s3=False, port=port)
@@ -419,7 +429,7 @@ def pondra(n, names, port=8290):
                 w.write_table(t)
             harness.call(port, "POST", f"/append/{s}?producer=nexmark-{s}&seq={seqs[s] + 1}", buf.getvalue(), headers=arrow)
         done, got = {}, {}
-        deadline = time.time() + 1800
+        deadline = time.time() + max(600, 5 * sent)  # (an answer still wrong by then is reported with what it was)
         while len(done) < len(names) and time.time() < deadline:
             for name in names:
                 if name in done:
@@ -428,7 +438,7 @@ def pondra(n, names, port=8290):
                     got[name] = fingerprint(q(f"SELECT {QUERIES[name]['fp']} FROM {QUERIES[name]['read']}")[0], QUERIES[name])
                 except Exception as e:
                     got[name] = str(e)[:200]
-                if got[name] == want[name]:
+                if same(got[name], want[name]):
                     done[name] = round(time.time() - t0, 2)
             time.sleep(0.2)
         secs = time.time() - t0

@@ -195,8 +195,11 @@ impl View {
     pub fn shown<'a>(&'a self, name: &'a str) -> &'a str { self.once.as_ref().map_or(name, |o| o.into.as_str()) }
     /// Its query as it was written (`SHOW CREATE`, the listings).
     pub fn query(&self) -> &str { self.written.as_deref().unwrap_or(&self.sql) }
-    /// Does this view follow `table`'s rows (its source, or either side of a stream join)?
-    pub fn follows(&self, table: &str) -> bool { self.source == table || self.join.as_ref().is_some_and(|j| j.tables.iter().any(|t| t == table)) }
+    /// Does this view follow `table`'s rows (its source, either side of a stream join, or a table
+    /// its windows join when kept by key)?
+    pub fn follows(&self, table: &str) -> bool {
+        self.source == table || self.join.as_ref().is_some_and(|j| j.tables.iter().any(|t| t == table)) || self.rerun.as_ref().is_some_and(|r| r.joins.iter().any(|t| t == table))
+    }
     /// Are its rows derived as flushes are packed (`derive`)? Sessions are cut as they close,
     /// stream joins and views kept by key run once rows commit.
     pub fn inline(&self) -> bool { self.sessions.is_none() && self.join.is_none() && self.rerun.is_none() }
@@ -493,7 +496,9 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         let (key, merge) = merges(&plan, partial.then_some((source.as_str(), &src)))?;
         Ok::<_, anyhow::Error>((sql, planned, plan, finish, key, merge))
     };
-    let fits = crate::rerun::keys(&plan).is_ok() && src.key.is_empty() && src.merge.is_empty() && upstream.as_ref().is_none_or(|u| u.sessions.is_none() || u.rerun.is_some());
+    // (what `rerun::create` takes by key: else the query runs whole)
+    let fits = crate::rerun::keys(&plan).is_ok() && src.key.is_empty() && src.merge.is_empty() && src.finish.is_none() && src.history.is_none() && upstream.as_ref().is_none_or(|u| u.sessions.is_none() || u.rerun.is_some())
+        && crate::rerun::joins(lake, &plan, written, &source).await.is_ok();
     let (sql, planned, plan, finish, key, merge) = match kept.await {
         Ok(k) => k,
         // (what the rows alone can't keep: by key, if it can be; else run whole)
@@ -503,7 +508,8 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
                 (Some(need), true) => rerun(crate::rerun::How::ByKey, Some(format!("{need}: the groups a change touches are worked out again"))).await,
                 (Some(need), false) => whole(format!("{need}, and {}", match crate::rerun::keys(&plan) {
                     _ if !src.key.is_empty() => format!("{source} is keyed (a new row says nothing of the group its key's old row was in)"),
-                    _ if !src.merge.is_empty() => format!("{source} keeps partial rows"),
+                    _ if !src.merge.is_empty() || src.finish.is_some() => format!("{source} keeps partial rows"),
+                    _ if src.history.is_some() => format!("{source} is a history view (its versions are worked out as it is read)"),
                     Err(e) => format!("{e:#}"),
                     Ok(_) => format!("{source} cuts sessions as they close"),
                 })).await,
@@ -515,7 +521,11 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     // (a query that looks across its source's rows, which each write's rows alone can't answer)
     if let Some(what) = crate::rerun::across(&plan, &source) {
         ensure!(plain && refresh.is_none(), "{what}: a view kept from each write's rows can't answer it, and one that runs its query again (refresh = 'full') can't have windows, EMIT FINAL, history or expectations");
-        return whole(what).await;
+        // (windows within keys it selects: only the keys a change touches; `fits` holds only for them here)
+        return match crate::rerun::keys(&plan) {
+            Ok(keys) if fits => rerun(crate::rerun::How::ByKey, Some(format!("{what}, each {}'s apart: the ones a change touches are worked out again", keys.join(", ")))).await,
+            _ => whole(what).await,
+        };
     }
     ensure!(lag_secs.is_none(), "lag spaces out the runs of a view that runs its query again: {name} is kept from each write's rows, in its commit (refresh = 'full' runs it again instead)");
     let sql = sql.as_str();

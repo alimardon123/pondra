@@ -84,7 +84,7 @@ pub fn stats(batches: &[RecordBatch], written: Option<&ParquetMetaData>) -> Stat
 }
 
 /// The least and greatest value in `cols` (None if they can't be ordered).
-fn min_max(cols: &[ArrayRef]) -> Option<(ScalarValue, ScalarValue)> {
+pub fn min_max(cols: &[ArrayRef]) -> Option<(ScalarValue, ScalarValue)> {
     use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
     let (mut lo, mut hi) = (MinAccumulator::try_new(cols.first()?.data_type()).ok()?, MaxAccumulator::try_new(cols[0].data_type()).ok()?);
     cols.iter().try_for_each(|c| lo.update_batch(&[c.clone()]).and_then(|_| hi.update_batch(&[c.clone()]))).ok()?;
@@ -123,7 +123,8 @@ pub fn text(v: &ScalarValue) -> Option<String> {
     Some(s.as_string::<i32>().value(0).to_string()).filter(|s| s.len() <= 64)
 }
 
-fn orderable(t: &DataType) -> bool {
+/// A type whose files keep a range (floats too, from their rows: Parquet leaves NaN out of its own).
+pub fn orderable(t: &DataType) -> bool {
     t.is_integer() || t.is_floating() || matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 | DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) | DataType::Decimal128(..) | DataType::Boolean)
 }
 

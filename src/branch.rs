@@ -798,7 +798,7 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
             }
         }
     }
-    let follows = |v: &View, set: &[String]| set.contains(&v.source) || v.join.as_ref().is_some_and(|j| j.tables.iter().any(|t| set.contains(t)));
+    let follows = |v: &View, set: &[String]| set.iter().any(|t| v.follows(t));
     loop {
         let more: std::collections::BTreeSet<String> = theirs.iter().chain(&ours).filter(|(n, v)| !set.contains(n) && follows(v, &set)).map(|(n, _)| n.clone()).collect();
         if more.is_empty() {

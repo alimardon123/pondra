@@ -2083,7 +2083,17 @@ BYKEY_VIEWS = {
     "who": ("SELECT region, string_agg(customer, ',' ORDER BY customer) AS who FROM orders WHERE amount > 10 GROUP BY region HAVING count(DISTINCT customer) > 3", "region"),
     "coupons": ("SELECT coupon, count(DISTINCT customer) AS customers, max(amount) - min(amount) AS spread FROM orders GROUP BY coupon", "coupon"),
     "daily": ("SELECT date_trunc('day', ts) AS day, region, count(DISTINCT customer) AS customers, array_agg(DISTINCT coupon ORDER BY coupon) AS kinds FROM orders GROUP BY 1, 2", "day, region"),
+    # windows within keys the view selects: each key's rows worked out from its own source rows
+    "latest": ("SELECT region, customer, amount, ts FROM (SELECT *, row_number() OVER (PARTITION BY region, customer ORDER BY ts DESC, amount DESC) AS rn FROM orders) WHERE rn <= 1", "region, customer"),
+    "top3": ("SELECT region, customer, amount, place, by_coupon FROM (SELECT region, customer, amount, row_number() OVER (PARTITION BY region ORDER BY amount DESC, ts) AS place, "
+             "sum(amount) OVER (PARTITION BY region, coupon) AS by_coupon FROM orders WHERE coupon IS NOT NULL) WHERE place <= 3", "region, place"),
+    # windows over a join on their key: each key's rows come from its rows of both tables
+    "led": ("SELECT region, customer, amount, manager FROM (SELECT o.region, o.customer, o.amount, m.manager, "
+            "row_number() OVER (PARTITION BY o.region ORDER BY o.amount DESC, o.ts, m.manager) AS place FROM orders o JOIN managers m ON o.region = m.region) WHERE place <= 2",
+            "region, amount, customer, manager"),
 }
+
+MANAGERS = ("CREATE TABLE managers (region VARCHAR, manager VARCHAR)", "INSERT INTO managers VALUES ('east', 'ann'), ('west', 'bo'), ('north', 'cy')")
 
 
 def _bykey_same(q, name, query, by, secs=30):
@@ -2107,6 +2117,8 @@ def bykey_on_three():
     q = lambda s, port=A.port: sql(port, s)
     q("CREATE TABLE orders (region VARCHAR, customer VARCHAR, coupon VARCHAR, amount DOUBLE, ts TIMESTAMP)")
     q("INSERT INTO orders " + ORDER_ROWS.format(1, 300))
+    for s in MANAGERS:
+        q(s)
     for name, (query, _) in BYKEY_VIEWS.items():
         q(f"CREATE MATERIALIZED VIEW {name} AS {query}", A.port + 1)
     def retry(s, port):
@@ -2122,6 +2134,8 @@ def bykey_on_three():
         port = A.port + 1 + k % 2
         retry("INSERT INTO orders " + ORDER_ROWS.format(1000 + k * 50, 1049 + k * 50), port)
         retry(f"UPDATE orders SET amount = amount + 1 WHERE customer = 'c{k % 11}' AND region = 'east'", port)
+        if k in (3, 8):
+            retry(f"UPDATE managers SET manager = 'm{k}' WHERE region = 'north'" if k == 3 else "INSERT INTO managers VALUES ('east', 'ed')", port)
         if k == 5:
             nodes[0].kill(); nodes[0].start()  # (the leader, between runs)
     retry("DELETE FROM orders WHERE region = 'north' AND customer = 'c2'", A.port + 2)
@@ -2133,7 +2147,7 @@ def bykey_on_three():
 
 FULL_VIEWS = {
     "top": ("SELECT customer, amount FROM orders ORDER BY amount DESC, customer LIMIT 5", "amount, customer"),
-    "ranks": ("SELECT region, customer, amount, rank() OVER (PARTITION BY region ORDER BY amount DESC) AS r FROM orders WHERE amount > 90", "region, customer, amount, r"),
+    "ranks": ("SELECT customer, amount, rank() OVER (PARTITION BY region ORDER BY amount DESC) AS r FROM orders WHERE amount > 90", "customer, amount, r"),  # (its key not selected)
     "kinds": ("SELECT DISTINCT region, coupon FROM orders", "region, coupon"),
     "above": ("SELECT customer, amount FROM orders WHERE amount > (SELECT avg(amount) * 1.9 FROM orders)", "customer, amount"),
     "by_tier": ("SELECT c.tier, median(o.amount) AS med, count(DISTINCT o.customer) AS customers FROM orders o JOIN tiers c ON o.customer = c.customer GROUP BY c.tier", "tier"),
@@ -2283,12 +2297,16 @@ def bykey():
     DELETEs emptying one, a restart and on three nodes through a leader kill. A group that came out
     the same isn't written again; one that changed keeps its row's id; views of it follow; listed in
     `pondra.flows` with why; SHOW CREATE gives back what makes it; what can't be kept by key refused
-    by name."""
+    by name. Windows partitioned by columns the view selects (the latest row of each key, a top three
+    of each, two windows sharing a key, a top two over a join on the key) are kept by key too."""
     lake = new_lake()
     node = Node(lake, A.port, tier_secs=1).start()
     q = lambda s: sql(A.port, s)
     q("CREATE TABLE orders (region VARCHAR, customer VARCHAR, coupon VARCHAR, amount DOUBLE, ts TIMESTAMP)")
     q("CREATE TABLE prices (id BIGINT PRIMARY KEY, amount DOUBLE)")
+    q("CREATE TABLE heads (region VARCHAR PRIMARY KEY, head VARCHAR)")
+    for s in MANAGERS:
+        q(s)
     q("INSERT INTO orders " + ORDER_ROWS.format(1, 500))  # (there before the views: their first run works every group out)
     views = dict(BYKEY_VIEWS)
     views["totals"] = ("SELECT region, sum(amount) AS total, count(*) AS n FROM orders GROUP BY region", "region")
@@ -2306,6 +2324,8 @@ def bykey():
     q("UPDATE orders SET region = 'east' WHERE region = 'south'")  # (a group emptied, another worked out again)
     q("UPDATE orders SET amount = amount * 2 WHERE customer = 'c3'")
     q("DELETE FROM orders WHERE customer = 'c5' OR region IS NULL")
+    q("UPDATE managers SET manager = 'dee' WHERE region = 'west'")  # (the joined table's changes: its keys worked out again)
+    q("INSERT INTO managers VALUES ('north', 'eve')")
     changed = same()
     gone = q("SELECT count(*) AS n FROM medians WHERE region = 'south' OR region IS NULL")[0]["n"]
     # A group that came out the same stays as it was; one that changed keeps its row's id.
@@ -2329,7 +2349,7 @@ def bykey():
     if not all(follows.values()):
         follows["rows"] = {v: q(f"SELECT * FROM {v}") for v in ("regulars", "busy", "sizes")}
     flows = all(follows[k] for k in ("busy", "sizes", "regulars"))
-    listed = {r["name"]: r for r in q("SELECT name, kind, refresh, reason FROM pondra.flows")}
+    listed = {r["name"]: r for r in q("SELECT name, kind, follows, refresh, reason FROM pondra.flows")}
     shown = q("SHOW CREATE MATERIALIZED VIEW totals")[0]["definition"]
     by_key = " WITH (refresh = 'by key') AS "
     refused = {
@@ -2338,6 +2358,12 @@ def bykey():
         "now": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r3" + by_key + "SELECT region, median(amount) AS m FROM orders WHERE ts < now() GROUP BY region")),
         "keyed": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r4" + by_key + "SELECT amount, count(DISTINCT id) AS n FROM prices GROUP BY amount")),
         "unselected": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r5" + by_key + "SELECT median(amount) AS m FROM orders GROUP BY region")),
+        "window": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r9" + by_key + "SELECT customer, rank() OVER (PARTITION BY region ORDER BY amount) AS r FROM orders")),
+        "every row": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r10" + by_key + "SELECT region, rank() OVER (ORDER BY amount) AS r FROM orders")),
+        "unjoined": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r11" + by_key + "SELECT customer, r FROM (SELECT o.customer, rank() OVER (PARTITION BY o.customer ORDER BY o.amount) AS r "
+                                           "FROM orders o JOIN managers m ON o.region = m.region)")),
+        "keyed join": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r12" + by_key + "SELECT region, r FROM (SELECT o.region, rank() OVER (PARTITION BY o.region ORDER BY o.amount) AS r "
+                                             "FROM orders o JOIN heads h ON o.region = h.region)")),
         "incremental": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r6 WITH (refresh = 'incremental') AS SELECT region, median(amount) AS m FROM orders GROUP BY region")),
         "final": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r8 WITH (refresh = 'by key') AS SELECT date_bin(INTERVAL '1 day', ts) AS d, count(*) AS n FROM orders GROUP BY 1 EMIT FINAL")),
     }
@@ -2358,18 +2384,20 @@ def bykey():
     node.kill()
     checks = {
         "right after CREATE: each view == its query (its first run works every group out)": all(made.values()),
-        "median, count(DISTINCT), string_agg, array_agg, HAVING, a NULL key, an expression key, a sum asked by key == ad hoc after bulk and log INSERTs": all(inserted.values()),
+        "median, count(DISTINCT), string_agg, array_agg, HAVING, a NULL key, an expression key, a sum asked by key, windows within keys == ad hoc after bulk and log INSERTs": all(inserted.values()),
         "UPDATEs moving rows between groups and DELETEs: groups worked out again, an emptied one gone": all(changed.values()) and gone == 0,
         "a group that came out the same isn't written again; one that changed keeps its row's id": kept_as_is and kept_id,
         "what follows it takes its rows back (row by row; sums and counts)": flows,
         "pondra.flows: refresh 'by key' and why": listed["medians"]["refresh"] == "by key" and "median()" in listed["medians"]["reason"]
             and listed["regulars"]["refresh"] == "by key" and "DISTINCT" in listed["regulars"]["reason"] and "asked" in listed["totals"]["reason"]
-            and listed["busy"]["refresh"] == "incremental",
+            and listed["busy"]["refresh"] == "incremental"
+            and all(listed[n]["refresh"] == "by key" and "window" in listed[n]["reason"] for n in ("latest", "top3", "led")) and listed["led"]["follows"] == "orders, managers",
         "SHOW CREATE gives back what makes it (refresh = 'by key' when asked)": "refresh = 'by key'" in shown and again,
         "a restart: the same rows, and it goes on": restarted and all(after_restart.values()),
-        "by key asked, refused by name: ORDER BY across groups, a join, now(), a keyed source, a key not selected, incremental asked, EMIT FINAL; a max over one is kept by key":
+        "by key asked, refused by name: ORDER BY across groups, a join, now(), a keyed source, a key not selected (a window's too), a window over every row, a join not on the windows' key, a keyed table joined, incremental asked, EMIT FINAL; a max over one is kept by key":
             "ORDER BY" in refused["order"] and "one table" in refused["join"] and "now()" in refused["now"] and "keyed" in refused["keyed"]
             and "isn't selected" in refused["unselected"] and "needs every row" in refused["incremental"] and "EMIT FINAL" in refused["final"]
+            and "isn't selected" in refused["window"] and "all its rows" in refused["every row"] and "joined on" in refused["unjoined"] and "keyed table" in refused["keyed join"]
             and all("refresh = 'full'" in refused[k] for k in ("order", "join", "now", "keyed", "unselected")) and most,
         "three nodes, rows written on followers through a leader kill: == ad hoc on every node": bykey_on_three(),
     }
@@ -2379,7 +2407,7 @@ def bykey():
         print(json.dumps({"made": made, "inserted": inserted, "changed": changed, "gone": gone, "before": before, "after": after, "follows": follows, "listed": listed,
                           "shown": shown, "refused": refused}, indent=1, default=str)[-12000:])
         sys.exit(1)
-    return "views kept by key (median, count(DISTINCT), string_agg, array_agg, HAVING): == ad hoc through changes, a restart and three nodes; unchanged groups not rewritten"
+    return "views kept by key (median, count(DISTINCT), string_agg, array_agg, HAVING, windows within keys): == ad hoc through changes, a restart and three nodes; unchanged groups not rewritten"
 
 
 def asof():
@@ -9682,7 +9710,7 @@ def publishing():
 
 def backpressure():
     """Writes wait while more than `--backlog` rows wait in the log to be tiered, and only while
-    tiering can run (invariant 279): its round takes the lake's lock, and a view that runs its query
+    tiering can run (invariant 281): its round takes the lake's lock, and a view that runs its query
     again holds that lock while its rows commit, so a commit held back behind tiering stopped every
     write for good (Nexmark's twenty views, now and then). 8,000 rows written fast, 500 a write,
     wait for tiering (never half of them in the log at once; all of them without the wait); then
