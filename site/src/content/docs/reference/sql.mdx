@@ -647,7 +647,7 @@ parts | rows
 | Make a new lake | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir']`: a lake beside this one, attached. On a [folder of lakes](/pondra/guides/server/) it makes a new served database, and `DROP DATABASE name` drops one, folder and all |
 | Branch a database | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir'] CLONE base [WITH (schemas = (s, …))] [WITH NO DATA]`: a whole database as `base` is now, no data file copied ([branches](/pondra/guides/environments/)) |
 | Bring a branch's tables up to date | `ALTER DATABASE name REFRESH [t, …]`: those tables (a materialized view: the tables it reads; none named: every table the branch took from its base), and the views that follow them, as the base has them now, in one commit |
-| Protect a database | `ALTER DATABASE name SET (protected = true \| false)`: while protected, a project's objects change only by a deploy; lifting it is an admin's and audited ([protected production](/pondra/guides/environments/#protected-production)) |
+| Protect a database | `ALTER DATABASE name SET (protected = true \| false)`: while protected, a project's objects change only by an apply; lifting it is an admin's and audited ([protected production](/pondra/guides/environments/#protected-production)) |
 | Drop a branch | `DROP DATABASE name`: what it wrote goes; refused while it has branches of its own |
 | Compare two tables | `SELECT * FROM pondra.diff('a', 'b')`: the rows of `b` that differ from `a`, with `_change_type` |
 | Attach a lake | `ATTACH 'dir' AS name`; `ATTACH 'url' AS name (READ_ONLY [, ENDPOINT 'https://…'])` for a lake on another server, read with the secret whose `SCOPE` covers it and written there only ([production apart](/pondra/guides/environments/#production-on-a-server-of-its-own)); `ATTACH 'url' AS name (TYPE delta \| iceberg \| kafka, …)` for other engines |
@@ -808,8 +808,8 @@ their values.
 | Drop one | `DROP USER [IF EXISTS] name`, `DROP ROLE [IF EXISTS] name` |
 | Grant | `GRANT SELECT [(col, …)] \| INSERT \| UPDATE \| DELETE \| ALL [PRIVILEGES] ON [TABLE] t \| SCHEMA s \| ALL TABLES [IN SCHEMA s] TO name, …` |
 | Grant a secret | `GRANT USAGE ON SECRET s TO name, …` |
-| Let another server branch this one | `GRANT CLONE ON DATABASE d \| SCHEMA s TO name, …`: its token pins a branch of those schemas and does nothing else |
-| Let a user deploy | `GRANT DEPLOY ON DATABASE d TO name, …`: deploys the database (`pondra deploy`, `CALL deploy`) without being an admin; on a protected database, only a holder or the node's operator may deploy ([protected production](/pondra/guides/environments/#protected-production)) |
+| Let someone branch a database | `GRANT CLONE ON DATABASE d \| SCHEMA s TO name, …`: a user makes branches of it, and owns each (it or an admin drops it); another server's token pins a branch of those schemas and does nothing else |
+| Let a user apply a project | `GRANT APPLY ON DATABASE d TO name, …`: applies to the database (`pondra apply`, `CALL apply`) without being an admin; on a protected database, only a holder or the node's operator may apply ([protected production](/pondra/guides/environments/#protected-production)) |
 | Grant a role | `GRANT role, … TO user, …` |
 | Take back | `REVOKE … FROM …`, as GRANT names them (`REVOKE SELECT (col) ON t FROM r`: that column only) |
 | A token | `CREATE TOKEN name FOR [USER] u [EXPIRES IN '90 days']` (answers it, once), `DROP TOKEN name FOR [USER] u` |

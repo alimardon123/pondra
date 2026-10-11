@@ -419,7 +419,7 @@ pub fn columns_of(returns: &str) -> Result<Vec<(String, String)>> {
 pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Result<Value> {
     let name = crate::ddl::new_name(lake, name).await?;
     ensure!(r.kind != Kind::Procedure || !crate::workspace::is_run(crate::ddl::split(&name).1), "{name}: run is Pondra's own procedure (CALL run('etl/orders.sql') runs a file of the lake's)");
-    ensure!(r.kind != Kind::Procedure || !crate::deploy::is_own(crate::ddl::split(&name).1), "{name}: plan and deploy are Pondra's own procedures (CALL deploy('files/sales', env => 'prod'))");
+    ensure!(r.kind != Kind::Procedure || !crate::apply::is_own(crate::ddl::split(&name).1), "{name}: plan and apply are Pondra's own procedures (CALL apply('files/sales', env => 'prod'))");
     if let Some(old) = lake.cat.get::<Routine>(&key(&name)).await? {
         ensure!(replace, "{} {name} already exists (CREATE OR REPLACE {})", old.what(), r.what().to_uppercase());
         ensure!((old.kind == Kind::Procedure) == (r.kind == Kind::Procedure), "{name} is a {}", old.what());
@@ -1628,8 +1628,8 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
         if crate::workspace::is_run(&name) {
             return Box::pin(crate::workspace::run(app, &args, who, job, None)).await; // (a file of the lake's: ADR-033)
         }
-        if crate::deploy::is_own(&name) {
-            return Box::pin(crate::deploy::call(app, &name, &args, who)).await; // (a project in the workspace, planned or deployed: ADR-047 §4)
+        if crate::apply::is_own(&name) {
+            return Box::pin(crate::apply::call(app, &name, &args, who)).await; // (a project in the workspace, planned or applied: ADR-047 §4)
         }
         let (local, r, row) = Box::pin(prepared(app, &name, &args, who)).await?;
         return Box::pin(run(app, local, r, row, who, job, None)).await;
@@ -1797,9 +1797,9 @@ async fn run(app: &App, name: String, r: Routine, row: RecordBatch, who: Who, jo
 /// for in `pondra.runs`.
 fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a str, who: Who, job: Option<String>) -> futures::future::BoxFuture<'a, Result<Outcome>> {
     Box::pin(async move {
-        // (a deploy's statement can't start one: it would run after the deploy ended, with the deploy's
+        // (an apply's statement can't start one: it would run after the apply ended, with the apply's
         // admin rights and no record of it; `auth::carried` would keep both. `CALL` waits for it instead)
-        ensure!(!crate::protect::deploying(), "a deploy's statements don't start a procedure (pondra.start, START CALL): it would run after the deploy ends, outside its record. CALL it, which waits for it");
+        ensure!(!crate::protect::applying(), "an apply's statements don't start a procedure (pondra.start, START CALL): it would run after the apply ends, outside its record. CALL it, which waits for it");
         let id = crate::runs::new_id();
         let (app2, id2) = (app.clone(), id.clone());
         if crate::workspace::is_run(name) {

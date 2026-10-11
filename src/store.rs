@@ -1039,6 +1039,7 @@ impl Lake {
         if self.bases.read().unwrap().contains_key(id) {
             return Ok(());
         }
+        crate::budget::share(url); // (its objects read with a share of the bucket's turns: prod's own nodes come first)
         match (bucket_url(url), &self.cached) {
             (Some(bucket), Some(ours)) if bucket_url(&self.url).as_ref() == Some(&bucket) => ours.add_lake(url[bucket.len()..].trim_start_matches('/')),
             (Some(bucket), _) => {
