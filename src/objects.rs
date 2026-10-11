@@ -116,8 +116,8 @@ pub static KINDS: &[Kind] = &[
 /// The parts: stored inside one object, and listed beside the kinds.
 pub static PARTS: &[Part] = &[
     Part { name: "column", inside: &["table", "view", "materialized view", "external table"], about: "a named, typed field of every row", also: &["field", "attribute"] },
-    Part { name: "key", inside: &["table"], about: "PRIMARY KEY or UNIQUE: the columns that name a row", also: &["primary key", "identifier"] },
-    Part { name: "link", inside: &["table"], about: "FOREIGN KEY … NOT ENFORCED: a fact that one table's rows name another's", also: &["foreign key", "relationship", "reference"] },
+    Part { name: "key", inside: &["table", "view", "materialized view"], about: "PRIMARY KEY or UNIQUE: the columns that name a row", also: &["primary key", "identifier"] },
+    Part { name: "link", inside: &["table", "view", "materialized view"], about: "FOREIGN KEY … NOT ENFORCED: a fact that one table's rows name another's", also: &["foreign key", "relationship", "reference"] },
     Part { name: "check", inside: &["table"], about: "CHECK: a condition every row written must meet", also: &["constraint"] },
     Part { name: "parameter", inside: &["function", "macro", "table function", "procedure"], about: "an argument a routine takes, with its type and default", also: &["argument"] },
     Part { name: "label", inside: &["type"], about: "one value an enum type allows", also: &["enum value"] },
@@ -214,9 +214,13 @@ fn schemas(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
 fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
     Box::pin(async move {
         let mut views = HashMap::new();
+        let mut facts = HashMap::new(); // (a stored view's key facts, shown in its definition: ADR-065 §2)
         for (name, l) in lakes(lake).await {
             for (k, v) in l.cat.scan::<crate::views::View>("v/", "v0").await? {
                 views.insert((name.clone(), k[2..].to_string()), v);
+            }
+            for (k, v) in l.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
+                facts.insert((name.clone(), k[2..].to_string()), v.facts);
             }
         }
         let here = crate::ddl::lake_name(lake);
@@ -234,7 +238,10 @@ fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
             let partial = limit.as_ref().is_some_and(|a| a.columns("select", &catalog) != Some(None));
             let def = match o.kind {
                 "table" => o.meta.as_ref().map(|m| table_sql(&named, m)),
-                "view" => o.sql.as_ref().map(|s| format!("CREATE VIEW {named} AS\n{s}")),
+                "view" => o.sql.as_ref().map(|s| {
+                    let kept = facts.get(&(o.lake.clone(), local.clone())).map_or(&[][..], |f: &Vec<crate::constraints::Constraint>| f.as_slice());
+                    format!("CREATE VIEW {named}{} AS\n{s}", crate::facts::in_list(kept))
+                }),
                 "materialized view" => views.get(&(o.lake.clone(), local.clone())).or_else(|| views.get(&(o.lake.clone(), crate::once::open(&local)))).map(|v| materialized_sql(&named, v, o.meta.as_ref())),
                 _ => None, // (an external table's statement isn't kept as written; a window view's `_final` table is made with it)
             };
@@ -555,11 +562,14 @@ pub(crate) fn expect_sql(e: &crate::views::Expect) -> String {
 
 /// `CREATE MATERIALIZED VIEW`: its expectations, its options and its query.
 pub(crate) fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<&TableMeta>) -> String {
-    let expect: Vec<String> = v.expect.iter().map(|e| format!("CONSTRAINT {} {}", ident(&e.name), expect_sql(e))).collect();
+    // (its expectations, then its key facts (ADR-065 §2): one list, which `facts::parse` reads back)
+    let mut expect: Vec<String> = v.expect.iter().map(|e| format!("CONSTRAINT {} {}", ident(&e.name), expect_sql(e))).collect();
+    expect.extend(meta.map(|m| m.described().constraints).unwrap_or_default().iter().filter(|c| !c.enforced).map(|c| c.sql(&ident)));
+    let list = if expect.is_empty() { String::new() } else { format!(" (\n  {}\n)", expect.join(",\n  ")) };
     if let Some((sql, with)) = crate::once::written(v) {
         // (EMIT FINAL's, a session view's too: the window in the GROUP BY)
         let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
-        return format!("CREATE MATERIALIZED VIEW {name}{with} AS\n{sql}");
+        return format!("CREATE MATERIALIZED VIEW {name}{list}{with} AS\n{sql}");
     }
     let mut with: Vec<String> = vec![];
     if let Some(e) = &v.emit {
@@ -580,9 +590,8 @@ pub(crate) fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<
         with.push(format!("refresh = '{}'", if b.full.is_some() { "full" } else { "by key" }));
         with.extend(b.lag_secs.map(|s| format!("lag = '{s} seconds'")));
     }
-    let expect = if expect.is_empty() { String::new() } else { format!(" (\n  {}\n)", expect.join(",\n  ")) };
     let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
-    format!("CREATE MATERIALIZED VIEW {name}{expect}{with} AS\n{}", v.query())
+    format!("CREATE MATERIALIZED VIEW {name}{list}{with} AS\n{}", v.query())
 }
 
 /// `CREATE FUNCTION`, `CREATE MACRO` or `CREATE PROCEDURE`, in the form it was made in.

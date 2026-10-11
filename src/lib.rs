@@ -34,6 +34,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod defaults;
 #[cfg(feature = "server")] mod delta;
 #[cfg(feature = "server")] mod ext;
+#[cfg(feature = "server")] mod facts;
 #[cfg(feature = "server")] mod feeds;
 #[cfg(feature = "server")] mod files;
 #[cfg(feature = "server")] mod format;

@@ -36,6 +36,9 @@ pub struct StoredView {
     /// Made by CREATE EXTERNAL TABLE (a view of files): DROP TABLE drops it too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub external: bool,
+    /// A view's key facts, NOT ENFORCED (ADR-065 §2): its own, so a rename, a drop and a clone take them along.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<crate::constraints::Constraint>,
 }
 
 /// Another lake, attached in SQL (`ATTACH 'dir' AS name`): every node attaches it.
@@ -211,7 +214,7 @@ pub enum Ddl {
     DropTable { name: String, if_exists: bool, #[serde(default)] purge: bool }, // (PURGE: not kept to be undropped)
     Undrop { name: String },                                                   // UNDROP TABLE (ADR-043)
     Clone { name: String, from: String },                                      // CREATE TABLE c CLONE t: t's files, none copied (ADR-043)
-    CreateView { name: String, sql: String, replace: bool },
+    CreateView { name: String, sql: String, replace: bool, #[serde(default)] facts: Option<Vec<crate::constraints::Constraint>> }, // (None: as before, or kept through OR REPLACE: `facts.rs`)
     CreateExternal { name: String, sql: String, replace: bool, if_not_exists: bool }, // DataFusion's CREATE EXTERNAL TABLE: a view of files (`ext::external`)
     CreateMaterialized { name: String, sql: String, options: std::collections::BTreeMap<String, String> }, // (`views::options`)
     DropView { name: String, if_exists: bool },
@@ -247,6 +250,7 @@ pub enum Ddl {
     Unless { name: String, kind: String, then: Box<Ddl> }, // CREATE … IF NOT EXISTS: nothing if a `kind` ("relation", "routine", "task") of that name is there
     Replacing { name: String, then: Box<Ddl> },              // CREATE OR REPLACE MATERIALIZED VIEW: the old one dropped first (refused while another follows it)
     DetachView { name: String },                             // ALTER MATERIALIZED VIEW v DETACH: its rows stop following, and stay a table
+    ViewFacts { view: String, #[serde(default)] if_exists: bool, change: crate::constraints::Change }, // ALTER [MATERIALIZED] VIEW [IF EXISTS] v ADD | DROP CONSTRAINT: a view's key facts (ADR-065 §2, `facts.rs`)
     Object(crate::objects::Op),                              // the registry's: COMMENT ON, CREATE OR ALTER TABLE (`objects.rs`)
     Sequence(crate::seq::Change),                            // CREATE, ALTER, DROP SEQUENCE (`seq.rs`)
     Index(crate::index::Change),                             // CREATE, ALTER, DROP INDEX (`index.rs`)
@@ -285,7 +289,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DropTable { name, if_exists, purge } => Ddl::DropTable { name: here(name), if_exists, purge },
         Ddl::Undrop { name } => Ddl::Undrop { name: here(name) },
         Ddl::Clone { name, from } => Ddl::Clone { name: here(name), from: here(from) },
-        Ddl::CreateView { name, sql, replace } => Ddl::CreateView { name: here(name), sql, replace },
+        Ddl::CreateView { name, sql, replace, facts } => Ddl::CreateView { name: here(name), sql, replace, facts },
         Ddl::CreateExternal { name, sql, replace, if_not_exists } => Ddl::CreateExternal { name: here(name), sql, replace, if_not_exists },
         Ddl::CreateMaterialized { name, sql, options } => Ddl::CreateMaterialized { name: here(name), sql, options },
         Ddl::DropView { name, if_exists } => Ddl::DropView { name: here(name), if_exists },
@@ -296,6 +300,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Unless { name, kind, then } => Ddl::Unless { name: here(name), kind, then },
         Ddl::Replacing { name, then } => Ddl::Replacing { name: here(name), then },
         Ddl::DetachView { name } => Ddl::DetachView { name: here(name) },
+        Ddl::ViewFacts { view, if_exists, change } => Ddl::ViewFacts { view: here(view), if_exists, change },
         d => d,
     };
     match d {
@@ -327,7 +332,13 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Constraint { table, change } => {
             let (other, table) = resolve(lake, &table).await?;
             ensure!(other.is_none(), "{table} is an attached lake's: change its constraints from a node of that lake");
+            crate::facts::not_a_view(lake, &table).await?; // (a view's name here: ALTER VIEW says how, 42809)
             crate::constraints::apply(lake, &table, change).await
+        }
+        Ddl::ViewFacts { view, if_exists, change } => {
+            let (other, view) = resolve(lake, &view).await?;
+            ensure!(other.is_none(), "{view} is an attached lake's: change its facts from a node of that lake");
+            crate::facts::apply(lake, &view, if_exists, change).await
         }
         Ddl::CreateSchema { name, if_not_exists } => {
             check(&name)?;
@@ -365,7 +376,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DropTable { name, if_exists, purge } => drop_table(lake, &name, if_exists, purge).await,
         Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?).await,
         Ddl::Clone { name, from } => clone(lake, &new_name(lake, &name).await?, &from).await,
-        Ddl::CreateView { name, sql, replace } => create_view(lake, &name, sql, replace, false).await,
+        Ddl::CreateView { name, sql, replace, facts } => create_view(lake, &name, sql, replace, false, facts).await,
         Ddl::CreateExternal { name, sql, replace, if_not_exists } => {
             let name = new_name(lake, &name).await?;
             let taken = lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_some()
@@ -374,16 +385,21 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                 return Ok(j!({"table": name, "unchanged": true}));
             }
             ensure!(replace || !taken, "{name} already exists (CREATE OR REPLACE EXTERNAL TABLE, or IF NOT EXISTS)");
-            create_view(lake, &name, sql, replace, true).await
+            create_view(lake, &name, sql, replace, true, None).await
         }
-        Ddl::CreateMaterialized { name, sql, options } => {
+        Ddl::CreateMaterialized { name, sql, mut options } => {
             let name = new_name(lake, &name).await?;
+            let facts = crate::facts::taken(&mut options)?; // (ALTER VIEW's facts in its list: `facts.rs`)
             ensure!(lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "{name} is a (stored) view");
             let outside = crate::ext::names(&sql);
             if let [topic] = &outside[..] {
                 if crate::ext::spec(topic).is_some_and(|s| s.format == "kafka") {
                     crate::feeds::create(lake, &name, &sql, topic, &options).await?; // (a topic's records, as they arrive)
                     crate::views::forget(lake);
+                    if let Err(e) = crate::facts::materialized(lake, &name, facts).await {
+                        drop_view(lake, &name, true).await?; // (refused: nothing made)
+                        return Err(e);
+                    }
                     return Ok(j!({"view": name, "feed": true}));
                 }
             }
@@ -391,6 +407,10 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             ensure!(outside.is_empty(), "a materialized view follows the rows its tables take in, and files outside the lake take none: read them into a table (CREATE TABLE … AS, INSERT … SELECT) and follow that, or make a stored view (CREATE VIEW)");
             crate::views::create(lake, &name, &sql, crate::views::options(&options)?).await?;
             crate::views::forget(lake); // (the sequencer holds flushes to it from its next commit)
+            if let Err(e) = crate::facts::materialized(lake, &name, facts).await {
+                drop_view(lake, &name, true).await?; // (refused: nothing made)
+                return Err(e);
+            }
             let mut out = j!({"view": name, "materialized": true});
             if let Some(n) = lake.cat.get::<TableMeta>(&table_key(&name)).await?.and_then(|m| crate::delta::left_out(&name, &m)) {
                 out["notice"] = n.into();
@@ -773,7 +793,7 @@ pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
 
 /// `CREATE VIEW` (and CREATE EXTERNAL TABLE's view of files): a query by name, planned once here
 /// to be sure it can be, and kept as written.
-async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, external: bool) -> Result<Value> {
+async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, external: bool, facts: Option<Vec<crate::constraints::Constraint>>) -> Result<Value> {
     let name = new_name(lake, name).await?;
     unclaimed(lake, &name).await?;
     ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_none(), "{name} is a table");
@@ -782,8 +802,9 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
     crate::measures::check(lake, &sql).await?; // (a view with measures: its shape, and each join onto a key: ADR-065 §3)
     let expanded = crate::routines::expand(lake, &sql).await?; // (kept as written: macros are read when it is used)
     let planned = crate::asof::rewrite(&expanded)?;
-    crate::query::sql(&crate::query::session(lake, &planned, "").await?, &planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
-    lake.cat.commit(vec![(query_key(&name), json(&StoredView { sql, external }))], &[]).await?;
+    let df = crate::query::sql(&crate::query::session(lake, &planned, "").await?, &planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
+    let facts = crate::facts::settled(lake, &name, &sql, df.schema(), facts, replace).await?; // (its key facts: `facts.rs`)
+    lake.cat.commit(vec![(query_key(&name), json(&StoredView { sql, external, facts }))], &[]).await?;
     Ok(match external {
         true => j!({"table": name, "files": true}),
         false => j!({"view": name}),

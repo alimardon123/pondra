@@ -50,11 +50,11 @@ Generated from `pondra.kinds` (`src/objects.rs`): don't edit it here; `python3 t
 
 **expectation**, inside a materialized view: a condition a view's new rows are counted against, and kept, dropped or failed by. Other products call it data quality check, assertion.
 
-**key**, inside a table: PRIMARY KEY or UNIQUE: the columns that name a row. Other products call it primary key, identifier.
+**key**, inside a table, view, materialized view: PRIMARY KEY or UNIQUE: the columns that name a row. Other products call it primary key, identifier.
 
 **label**, inside a type: one value an enum type allows. Other products call it enum value.
 
-**link**, inside a table: FOREIGN KEY … NOT ENFORCED: a fact that one table's rows name another's. Other products call it foreign key, relationship, reference.
+**link**, inside a table, view, materialized view: FOREIGN KEY … NOT ENFORCED: a fact that one table's rows name another's. Other products call it foreign key, relationship, reference.
 
 **measure**, inside a view: an aggregate a view keeps, worked out at each query's own grain: MEASURE(m). Other products call it metric, KPI, semantic model, calculated measure.
 

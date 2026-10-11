@@ -1081,6 +1081,9 @@ async fn join_keys(lake: &Lake, query: &ast::Query) -> Result<HashMap<String, Ve
             }
             found.extend(meta.constraints.iter().filter(|c| matches!(c.kind, Kind::PrimaryKey | Kind::Unique)).map(|c| c.columns.clone()));
         }
+        if let Some(view) = owner.cat.get::<ddl::StoredView>(&ddl::query_key(&local)).await? {
+            found.extend(view.facts.iter().filter(|c| matches!(c.kind, Kind::PrimaryKey | Kind::Unique)).map(|c| c.columns.clone())); // (a view's key facts: ADR-065 §2)
+        }
         keys.insert(full, found);
     }
     Ok(keys)

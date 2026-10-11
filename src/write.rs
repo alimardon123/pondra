@@ -283,6 +283,20 @@ impl Stmt {
     }
 }
 
+/// Puts a materialized view's expectations (JSON) in its options, through OR REPLACE's and IF NOT
+/// EXISTS's wrappers; false for a statement that isn't a materialized view's.
+fn expect_in(d: &mut crate::ddl::Ddl, expect: &str) -> bool {
+    use crate::ddl::Ddl;
+    match d {
+        Ddl::CreateMaterialized { options, .. } => {
+            options.insert("expect".into(), expect.into());
+            true
+        }
+        Ddl::Unless { then, .. } | Ddl::Replacing { then, .. } => expect_in(then, expect),
+        _ => false,
+    }
+}
+
 /// A view's query with its column list (`CREATE VIEW v (a, b) AS …`, TPC-H q15's form) given to
 /// its outputs: the select list's items renamed, so a materialized view keeps the shape `views.rs`
 /// reads; a query whose outputs can't be renamed one by one (`*`, `VALUES`) is put in a subquery
@@ -474,17 +488,20 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             _ => wrong(),
         });
     }
+    // A view's key facts in its list, and ALTER VIEW … ADD | DROP CONSTRAINT (ADR-065 §2), which the parser doesn't take.
+    if let Some(s) = crate::facts::parse(sql) {
+        return Some(s);
+    }
     // CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…) ON VIOLATION DROP ROW, …): its
     // expectations (ADR-036 §2), which the parser doesn't take.
     match crate::views::constraints(sql) {
         Ok(Some((rest, expect))) => {
+            let expect = serde_json::to_string(&expect).unwrap_or_default();
             return Some(match parse(&rest) {
-                Some(Stmt::Ddl(mut d)) if matches!(d[..], [Ddl::CreateMaterialized { .. }]) => {
-                    if let Some(Ddl::CreateMaterialized { options, .. }) = d.first_mut() {
-                        options.insert("expect".into(), serde_json::to_string(&expect).unwrap_or_default());
-                    }
-                    Stmt::Ddl(d)
-                }
+                Some(Stmt::Ddl(mut d)) if d.len() == 1 => match expect_in(&mut d[0], &expect) {
+                    true => Stmt::Ddl(d),
+                    false => Stmt::Invalid("CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…)) AS SELECT …".into()),
+                },
                 other => other.unwrap_or_else(|| Stmt::Invalid("CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…)) AS SELECT …".into())),
             });
         }
@@ -702,7 +719,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         }
         Statement::CreateView(v) if v.or_replace && v.if_not_exists => Stmt::Invalid("CREATE OR REPLACE VIEW … IF NOT EXISTS: one or the other".into()),
         Statement::CreateView(v) if v.temporary => Stmt::TempView(object(&v.name), view_sql(&v), v.or_replace, v.if_not_exists), // (the session's: `temp.rs`)
-        Statement::CreateView(v) => Stmt::Ddl(vec![unless(v.if_not_exists, &object(&v.name), "relation", Ddl::CreateView { name: object(&v.name), sql: view_sql(&v), replace: v.or_replace })]),
+        Statement::CreateView(v) => Stmt::Ddl(vec![unless(v.if_not_exists, &object(&v.name), "relation", Ddl::CreateView { name: object(&v.name), sql: view_sql(&v), replace: v.or_replace, facts: None })]),
         Statement::AttachDatabase { schema_name, database_file_name: ast::Expr::Value(v), .. } => match &v.value {
             ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir) => Stmt::Ddl(vec![Ddl::Attach { name: ident(&schema_name), dir: dir.clone(), read_only: false, endpoint: None }]),
             _ => return None,

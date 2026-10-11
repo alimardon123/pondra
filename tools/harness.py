@@ -7559,6 +7559,18 @@ def flows():
     checks = {}
     refused = err("INSERT INTO orders VALUES (1, 'r0', 'u1', 500000, 'paid'), (2, 'r0', 'u1', 5, 'paid')", ports[1])
     checks["a row a FAIL expectation refuses fails its INSERT, naming it"] = bool(refused) and 'violates check constraint "small"' in refused
+    # OR REPLACE and IF NOT EXISTS keep a materialized view's CHECK expectations as a plain CREATE does (they were dropped)
+    # (the views are made before the rows: a row written after them goes through each view's CHECK)
+    q("CREATE TABLE tallies (id BIGINT, amount BIGINT)")
+    expect_check = "(CONSTRAINT pos CHECK (amount > 0) ON VIOLATION DROP ROW)"
+    rows_of = lambda v: [(r["id"], r["amount"]) for r in q(f"SELECT id, amount FROM {v} ORDER BY id")]
+    q(f"CREATE MATERIALIZED VIEW tallies_plain {expect_check} AS SELECT id, amount FROM tallies")
+    q("CREATE MATERIALIZED VIEW tallies_replaced AS SELECT id, amount FROM tallies")
+    q(f"CREATE OR REPLACE MATERIALIZED VIEW tallies_replaced {expect_check} AS SELECT id, amount FROM tallies")
+    q(f"CREATE MATERIALIZED VIEW IF NOT EXISTS tallies_unless {expect_check} AS SELECT id, amount FROM tallies")
+    q("INSERT INTO tallies VALUES (1, 5), (2, -3), (3, 0), (4, 7)")
+    checks["CREATE OR REPLACE MATERIALIZED VIEW and IF NOT EXISTS keep a CHECK ... ON VIOLATION DROP ROW: the rows a plain CREATE keeps"] = \
+        rows_of("tallies_plain") == [(1, 5), (4, 7)] and rows_of("tallies_replaced") == [(1, 5), (4, 7)] and rows_of("tallies_unless") == [(1, 5), (4, 7)]
     # (what a GROUP BY view's partial rows can't keep as they come runs its query again, ADR-059)
     whole = {
         "rich": ("SELECT * FROM gold WHERE total > 100", "region, buyer NULLS FIRST"),
@@ -9158,6 +9170,204 @@ def measures():
     return f"{sum(bool(v) for v in checks.values())} of {len(checks)} measures checks"
 
 
+def facts():
+    """Key facts on views (ADR-065 §2, L5-2): PRIMARY KEY, UNIQUE and FOREIGN KEY said NOT ENFORCED, kept with the view: listed, shown, moved and dropped with it, seen by Postgres and by a measure's join, refused by name where they can't hold, exported, and never checked."""
+    import psycopg
+    lake = new_lake()
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
+    dsn = f"host=127.0.0.1 port={A.port + 10} user=pondra dbname=pondra"
+    q = lambda s: call(A.port, "POST", "/sql", s.encode(), timeout=120)
+    def run(s):
+        """(status, text) of a statement sent to /sql: a refusal is a status of 400 or more, its words in the text."""
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", s.encode())
+        r = c.getresponse()
+        return r.status, r.read().decode()
+    def over_pg(s):
+        """The rows (dicts) of a statement over the Postgres port."""
+        with psycopg.connect(dsn, autocommit=True) as c:
+            cur = c.execute(s)
+            names = [d.name for d in cur.description]
+            return [dict(zip(names, r)) for r in cur.fetchall()]
+    def parts(obj):
+        """The key and link parts of an object (pondra.parts), as sorted (kind, name, definition)."""
+        rows = q(f"SELECT kind, name, definition FROM pondra.parts WHERE object = '{obj}'")
+        return sorted((r["kind"], r["name"], r.get("definition") or "") for r in rows if r["kind"] in ("key", "link"))
+    def shown(kind, name):
+        """SHOW CREATE of an object, as its statement."""
+        return q(f"SHOW CREATE {kind} {name}")[0]["definition"]
+    def made_now(names):
+        """The names, of these, that the lake holds (as pondra.objects lists them)."""
+        listed = q("SELECT name FROM pondra.objects WHERE name IN (" + ", ".join(f"'{n}'" for n in names) + ")")
+        return sorted(r["name"] for r in listed)
+
+    PK = "PRIMARY KEY (id) NOT ENFORCED"
+    FK = "FOREIGN KEY (region) REFERENCES regions(code) NOT ENFORCED"
+    for s in [
+        "CREATE TABLE regions (code VARCHAR PRIMARY KEY NOT ENFORCED, name VARCHAR)",
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY NOT ENFORCED, name VARCHAR, region VARCHAR)",
+        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, amount DOUBLE)",
+        "INSERT INTO regions VALUES ('north', 'North'), ('south', 'South'), ('east', 'East')",
+        "INSERT INTO customers VALUES (1, 'ann', 'north'), (2, 'bob', 'south'), (3, 'cy', 'north'), (4, 'dee', 'east')",
+        "INSERT INTO orders VALUES (1, 1, 10.0), (2, 2, 20.5), (3, 3, 5.0), (4, 1, 7.0), (5, 4, 3.0)",
+    ]:
+        q(s)
+    checks, info = {}, {}
+
+    # 1. a view's key and link made with it, listed as parts; find() finds the key
+    q("CREATE VIEW customers_v (PRIMARY KEY (id) NOT ENFORCED, CONSTRAINT customers_v_region_fkey FOREIGN KEY (region) REFERENCES regions (code) NOT ENFORCED) AS SELECT id, name, region FROM customers")
+    key_parts = sorted([("key", "customers_v_pkey", PK), ("link", "customers_v_region_fkey", FK)])
+    found = q("SELECT * FROM pondra.find('customers_v_pkey')")
+    info["parts"] = parts("customers_v")
+    checks["a view's key and link made with it are listed as parts with their definitions, and find() finds the key"] = \
+        parts("customers_v") == key_parts and any(r.get("name") == "customers_v_pkey" for r in found)
+
+    # 8. Postgres sees them: pg_constraint's p and f rows, and information_schema lists them for the view
+    pg_rows = over_pg("SELECT c.conname, c.contype FROM pg_constraint c JOIN pg_class r ON c.conrelid = r.oid WHERE r.relname = 'customers_v'")
+    info_rows = over_pg("SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'customers_v'")
+    info["pg"] = [pg_rows, info_rows]
+    checks["Postgres sees them: pg_constraint's p and f rows for the view, and information_schema.table_constraints lists them"] = \
+        sorted((r["conname"], r["contype"]) for r in pg_rows) == [("customers_v_pkey", "p"), ("customers_v_region_fkey", "f")] \
+        and sorted((r["constraint_name"], r["constraint_type"]) for r in info_rows) == [("customers_v_pkey", "PRIMARY KEY"), ("customers_v_region_fkey", "FOREIGN KEY")]
+
+    # 9a. a measure view joins a view whose PRIMARY KEY is a fact (its key is the join's)
+    joined = run("CREATE VIEW sales_v AS SELECT c.region, sum(o.amount) AS MEASURE revenue FROM orders o LEFT JOIN customers_v c ON o.customer_id = c.id")
+    run("DROP VIEW sales_v")
+    info["measure_join"] = joined
+    checks["a measure view joins onto a view whose PRIMARY KEY is a fact"] = joined[0] < 400
+
+    # 2. ALTER VIEW adds and drops one fact; IF NOT EXISTS and IF EXISTS say nothing twice; a bare DROP names what's missing
+    U = "customers_v_name_key"
+    ADD = f"ALTER VIEW customers_v ADD CONSTRAINT {U} UNIQUE (name) NOT ENFORCED"
+    added = run(ADD)[0]
+    added_again = run(ADD.replace("ADD CONSTRAINT", "ADD CONSTRAINT IF NOT EXISTS"))[0]
+    listed_once = [p for p in parts("customers_v") if p[1] == U]
+    dropped = run(f"ALTER VIEW customers_v DROP CONSTRAINT {U}")[0]
+    gone = not [p for p in parts("customers_v") if p[1] == U]
+    dropped_again = run(f"ALTER VIEW customers_v DROP CONSTRAINT IF EXISTS {U}")[0]
+    bare_status, bare_text = run(f"ALTER VIEW customers_v DROP CONSTRAINT {U}")
+    info["alter"] = [added, added_again, listed_once, dropped, dropped_again, bare_status, bare_text[:300]]
+    checks["ALTER VIEW adds and drops one fact: listed, IF NOT EXISTS and IF EXISTS say nothing twice, a bare DROP of a missing one is refused by name"] = \
+        added < 400 and added_again < 400 and listed_once == [("key", U, "UNIQUE (name) NOT ENFORCED")] and dropped < 400 and gone \
+        and dropped_again < 400 and bare_status >= 400 and U in bare_text
+
+    # 10. refused by name, and nothing made: each refusal's words, the catalog as it was
+    before_def, before_parts = shown("VIEW", "customers_v"), parts("customers_v")
+    q("CREATE MATERIALIZED VIEW mv_big (CONSTRAINT big CHECK (amount > 0) ON VIOLATION DROP ROW) AS SELECT id, amount FROM orders")
+    refusals = [
+        ("CREATE VIEW r1 (UNIQUE (name)) AS SELECT name FROM customers", ["write UNIQUE (name) NOT ENFORCED"]),
+        ("CREATE VIEW r2 (PRIMARY KEY (id)) AS SELECT id FROM customers", ["write PRIMARY KEY (id) NOT ENFORCED"]),
+        ("CREATE VIEW r3 (CONSTRAINT r3_c CHECK (id > 0)) AS SELECT id FROM customers", ["a view's CHECK"]),
+        ("CREATE VIEW r4 (PRIMARY KEY (nothing) NOT ENFORCED) AS SELECT id FROM customers", ["nothing", "does not exist"]),
+        ("CREATE VIEW r5 (PRIMARY KEY (id) NOT ENFORCED, CONSTRAINT r5_b PRIMARY KEY (name) NOT ENFORCED) AS SELECT id, name FROM customers", ["multiple primary keys", "r5"]),
+        ("ALTER VIEW customers_v ADD CONSTRAINT customers_v_pkey UNIQUE (name) NOT ENFORCED", ["already exists", "customers_v_pkey"]),
+        ("ALTER MATERIALIZED VIEW mv_big ADD CONSTRAINT big UNIQUE (amount) NOT ENFORCED", ["already exists", "big"]),
+        ("ALTER VIEW customers ADD CONSTRAINT customers_u UNIQUE (name) NOT ENFORCED", ["is a table", "ALTER TABLE"]),
+        ("ALTER TABLE customers_v ADD CONSTRAINT customers_v_u UNIQUE (name) NOT ENFORCED", ["ALTER VIEW customers_v"]),
+        ("ALTER VIEW nope ADD CONSTRAINT nope_u UNIQUE (id) NOT ENFORCED", ["nope", "does not exist"]),
+        ("ALTER VIEW customers_v ADD CONSTRAINT customers_v_c CHECK (id > 0)", ["a view's CHECK"]),
+        ("CREATE VIEW m_v (PRIMARY KEY (total) NOT ENFORCED) AS SELECT customer_id, sum(amount) AS MEASURE total FROM orders", ["total", "does not exist"]),
+        ("CREATE TEMP VIEW t_v (PRIMARY KEY (id) NOT ENFORCED) AS SELECT id FROM customers", ["temporary view"]),
+    ]
+    got = [(s, *run(s)) for s, _ in refusals]
+    info["refusals"] = [[status, text[:300]] for _, status, text in got]
+    refused_by_name = all(status >= 400 and all(w in text for w in words) for (_, status, text), (_, words) in zip(got, refusals))
+    missing_ok = run("ALTER VIEW IF EXISTS nope DROP CONSTRAINT nope_u")[0] < 400
+    pg_code, pg_msg = "", ""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        try:
+            c.execute("ALTER TABLE customers_v ADD CONSTRAINT customers_v_u UNIQUE (name) NOT ENFORCED")
+        except psycopg.Error as e:
+            pg_code, pg_msg = e.sqlstate or "", str(e)
+    info["pg_refused"] = [pg_code, pg_msg[:300]]
+    q("DROP MATERIALIZED VIEW mv_big")
+    unchanged = shown("VIEW", "customers_v") == before_def and parts("customers_v") == before_parts
+    checks["refused by name, its words naming it, and nothing made: the view's facts as they were (42809 over Postgres, pointing at ALTER VIEW)"] = \
+        refused_by_name and missing_ok and pg_code == "42809" and "ALTER VIEW customers_v" in pg_msg \
+        and made_now(["r1", "r2", "r3", "r4", "r5", "m_v", "t_v", "nope"]) == [] and unchanged
+
+    # 3. SHOW CREATE VIEW run again after a drop makes the same view, with the same parts
+    shown_1, parts_1 = shown("VIEW", "customers_v"), parts("customers_v")
+    q("DROP VIEW customers_v")
+    q(shown_1)
+    shown_2 = shown("VIEW", "customers_v")
+    info["show_create"] = [shown_1, shown_2]
+    checks["SHOW CREATE VIEW holds the list, and run again after a drop makes the same view with the same parts"] = \
+        PK in shown_1 and "customers_v_region_fkey" in shown_1 and shown_2 == shown_1 and parts("customers_v") == parts_1
+
+    # 4. kept through CREATE OR REPLACE while their columns are there; a column gone is refused by name
+    q("CREATE OR REPLACE VIEW customers_v (id, name, region) AS SELECT id, name, region FROM customers")
+    kept_by_list = parts("customers_v") == key_parts  # (a column list of the same names keeps them)
+    st_list, text_list = run("CREATE OR REPLACE VIEW customers_v (cid, name, region) AS SELECT id, name, region FROM customers")
+    info["list_refused"] = [st_list, text_list[:300]]
+    refused_list = st_list >= 400 and all(w in text_list for w in ["customers_v_pkey", "id", "DROP CONSTRAINT"]) and parts("customers_v") == key_parts
+    q("CREATE OR REPLACE VIEW customers_v AS SELECT id, name, region, 1 AS extra FROM customers")
+    kept_both = parts("customers_v") == key_parts
+    kept_def = shown("VIEW", "customers_v")
+    st, text = run("CREATE OR REPLACE VIEW customers_v AS SELECT id, name FROM customers")
+    info["replace_refused"] = [st, text[:300]]
+    refused_replace = st >= 400 and all(w in text for w in ["customers_v_region_fkey", "region", "DROP CONSTRAINT"]) and shown("VIEW", "customers_v") == kept_def
+    q("ALTER VIEW customers_v DROP CONSTRAINT customers_v_region_fkey")
+    q("CREATE OR REPLACE VIEW customers_v AS SELECT id, name FROM customers")
+    pk_stays = parts("customers_v") == [("key", "customers_v_pkey", PK)]
+    q("CREATE OR REPLACE VIEW customers_v (UNIQUE (name) NOT ENFORCED) AS SELECT id, name FROM customers")
+    only_listed = parts("customers_v") == [("key", U, "UNIQUE (name) NOT ENFORCED")]
+    checks["kept through CREATE OR REPLACE while their columns are there (a column list of the same names too; one renaming a fact's column is refused by name); one whose column is gone is refused; a list replaces them"] = \
+        kept_by_list and refused_list and kept_both and refused_replace and pk_stays and only_listed
+
+    # 5. moved by a rename, gone with a drop, and a view made without a list has none
+    before_rename = parts("customers_v")
+    q("ALTER VIEW customers_v RENAME TO clients_v")
+    moved = parts("clients_v") == before_rename and parts("customers_v") == []
+    q("DROP VIEW clients_v")
+    dropped_both = parts("clients_v") == [] and parts("customers_v") == []
+    q("CREATE VIEW customers_v AS SELECT id, name, region FROM customers")
+    no_list = parts("customers_v") == []
+    checks["moved by a rename, gone with a drop, and a view made without a list has no key"] = moved and dropped_both and no_list
+
+    # 9b. the same measure join onto a view with no key fact is refused: "has no key"
+    no_key = run("CREATE VIEW sales_bad AS SELECT c.region, sum(o.amount) AS MEASURE revenue FROM orders o LEFT JOIN customers_v c ON o.customer_id = c.id")
+    info["measure_no_key"] = no_key
+    checks["a measure view joining a view with no key fact is refused: has no key"] = no_key[0] >= 400 and "has no key" in no_key[1]
+
+    # 6. never checked: a PRIMARY KEY column with duplicates reads every row
+    q("CREATE VIEW dup_v (PRIMARY KEY (region) NOT ENFORCED) AS SELECT region FROM customers")
+    dup_rows = q("SELECT region FROM dup_v")
+    checks["never checked: a view whose PRIMARY KEY column has duplicate values reads all its rows"] = \
+        len(dup_rows) == 4 and sorted(r["region"] for r in dup_rows) == sorted(r["region"] for r in q("SELECT region FROM customers"))
+
+    # 7. a materialized view's facts: the GROUP BY key listed, ALTER adds one, SHOW CREATE runs again, rows keep flowing
+    q("CREATE MATERIALIZED VIEW region_totals (PRIMARY KEY (region) NOT ENFORCED) AS SELECT c.region, sum(o.amount) AS total FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region")
+    q("ALTER MATERIALIZED VIEW region_totals ADD UNIQUE (total) NOT ENFORCED")
+    mv_parts = parts("region_totals")
+    info["mv_parts"] = mv_parts
+    mv_listed = ("key", "region_totals_pkey", "PRIMARY KEY (region)") in mv_parts and ("key", "region_totals_total_key", "UNIQUE (total) NOT ENFORCED") in mv_parts
+    mv_shown = shown("MATERIALIZED VIEW", "region_totals")
+    q("DROP MATERIALIZED VIEW region_totals")
+    q(mv_shown)
+    mv_same = shown("MATERIALIZED VIEW", "region_totals") == mv_shown and parts("region_totals") == mv_parts
+    q("INSERT INTO orders VALUES (6, 2, 1.5)")
+    got_rows = sorted((r["region"], round(r["total"], 6)) for r in q("SELECT region, total FROM region_totals"))
+    want_rows = sorted((r["region"], round(r["total"], 6)) for r in q("SELECT c.region, sum(o.amount) AS total FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region"))
+    checks["a materialized view's facts: the GROUP BY key and ALTER's UNIQUE listed, SHOW CREATE runs again to the same view, rows keep flowing"] = \
+        mv_listed and mv_same and got_rows == want_rows and len(want_rows) == 3
+
+    # 11. export writes the list: the view made again with its key and link, then GET /export holds them
+    q("CREATE OR REPLACE VIEW customers_v (PRIMARY KEY (id) NOT ENFORCED, CONSTRAINT customers_v_region_fkey FOREIGN KEY (region) REFERENCES regions (code) NOT ENFORCED) AS SELECT id, name, region FROM customers")
+    exported = call(A.port, "GET", "/export")
+    text = next((t for t in exported.values() if "CREATE VIEW customers_v" in t), "")
+    info["export"] = text[:400]
+    checks["export writes them: the view's file holds its key and link"] = \
+        "CONSTRAINT customers_v_pkey PRIMARY KEY (id) NOT ENFORCED" in text and "CONSTRAINT customers_v_region_fkey FOREIGN KEY (region) REFERENCES regions(code) NOT ENFORCED" in text
+
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"facts": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(bool(v) for v in checks.values())} of {len(checks)} facts checks"
+
+
 def sparksql():
     """Spark SQL where PySpark code sends it (H8): `spark.sql(…)` read with Spark's grammar and
     turned into Pondra's SQL (`spark_sql('…')`): `"text"`, backticks, `LATERAL VIEW [OUTER]
@@ -10438,13 +10648,13 @@ def backpressure():
 # suite in parts side by side that end together. A section not listed counts as 5 s.
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
-        "users": 15, "find": 15, "measures": 120, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
+        "users": 15, "find": 15, "measures": 120, "facts": 90, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
         "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10, "use_path": 40}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, measures, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, reader, crash, load)
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, measures, facts, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -10472,7 +10682,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "measures", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -10485,7 +10695,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "measures": measures, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):
