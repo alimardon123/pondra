@@ -3,7 +3,8 @@ name: build
 # Every push to main: Pondra built as it is released (the dist profile; Linux against glibc 2.17,
 # with zig, so it runs on any Linux from 2014 on) for all five platforms, tried there (smoke.py),
 # packaged for pip and npm and alone for the one-line installers (tools/package.py), and the
-# packages installed and tried as users get them (tools/try_packages.sh). linux-x64 is built
+# packages installed and tried as users get them (tools/try_packages.sh). The website is built as
+# `pages.yml` publishes it (a pull request's when it changes `site/` or `brand/`). linux-x64 is built
 # first, on its own, and the suite then runs on its binary in parts side by side, with the tests
 # that need only it (upgrade, resilience, sharing), while the other platforms finish (the slowest,
 # macOS Intel, holds up none of them).
@@ -13,7 +14,7 @@ name: build
 # and `full-ci` every platform but macOS Intel, once before it merges (macOS Intel's build is the
 # slowest by far, 31 to 50 minutes, and is main's alone). Decided from the labels alone, so a
 # push that asks for nothing never waits for a runner to say so; a newer push stops the older run.
-# Two pull requests' runs go at once: a third waits, holding no runner, until ci-slots.yml starts it.
+# Four pull requests' runs go at once: a fifth waits, holding no runner, until ci-slots.yml starts it.
 on:
   push:
     branches: [main]
@@ -54,6 +55,7 @@ jobs:
       sharing: ${{ steps.plan.outputs.sharing }}
       deploy: ${{ steps.plan.outputs.deploy }}
       wait: ${{ steps.plan.outputs.wait }}
+      site: ${{ steps.plan.outputs.site }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -93,21 +95,25 @@ jobs:
             if grep -qE '^(src/|Cargo\.(toml|lock)$|python/pondra/client\.py$|js/index\.js$|tools/(resilience_check|faulty_s3|sim_r2|harness)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(resilience|build)\.yml$)' <<< "$files"; then resilience=true; else resilience=false; fi
             if grep -qE '^(src/(shares|sharing|vend|read_delta|delta|ext|scan|audit|server)\.rs$|tools/(sharing_check|sim_r2)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sharing|build)\.yml$)' <<< "$files"; then sharing=true; else sharing=false; fi
             if [ "$FULL" = true ] && grep -qE '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)' <<< "$files"; then deploy=true; else deploy=false; fi
+            if grep -qE '^(site/|brand/|\.github/workflows/(build|pages)\.yml$)' <<< "$files"; then site=true; else site=false; fi
+            echo "site=$site" >> "$GITHUB_OUTPUT"
             printf 'upgrade=true\nresilience=%s\nsharing=%s\ndeploy=%s\n' "$resilience" "$sharing" "$deploy" >> "$GITHUB_OUTPUT"
             echo "After the build: upgrade$([ "$resilience" = false ] || echo ', resilience')$([ "$sharing" = false ] || echo ', sharing')$([ "$deploy" = false ] || echo ', deploy')." >> "$GITHUB_STEP_SUMMARY"
-            # At most two pull requests' CI at once (Alimardon, 2026-10-03): with two older runs of
-            # other pull requests going, this one waits. It builds nothing, its check `waiting for a
+            # At most four pull requests' CI at once (two from 2026-10-03; four from 2026-10-11, for the
+            # month's eight lanes; ci-slots.yml's SLOTS says the same): with four older runs of other
+            # pull requests going, this one waits. It builds nothing, its check `waiting for a
             # CI slot` fails, it holds no runner, and ci-slots.yml starts it again when a run ends.
             # (If the API can't be asked, it runs: a slot is never worth a stuck pull request.)
             going=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?event=pull_request&per_page=100" \
               --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and .status != \"completed\" and (.pull_requests[0].number // 0) != $PR)] | length") || going=0
-            if [ "$going" -ge 2 ]; then
+            if [ "$going" -ge 4 ]; then
               echo wait=true >> "$GITHUB_OUTPUT"
-              echo "Waiting for a CI slot: $going other pull requests' runs are going (two at a time). ci-slots.yml starts this run again when one ends." >> "$GITHUB_STEP_SUMMARY"
+              echo "Waiting for a CI slot: $going other pull requests' runs are going (four at a time). ci-slots.yml starts this run again when one ends." >> "$GITHUB_STEP_SUMMARY"
             fi
           fi
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then echo site=true >> "$GITHUB_OUTPUT"; fi
 
-  # A pull request over the two at a time: red until it runs, so nobody takes it for passed.
+  # A pull request over the four at a time: red until it runs, so nobody takes it for passed.
   slot:
     name: waiting for a CI slot
     needs: plan
@@ -115,8 +121,29 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - run: |
-          echo "::error title=Waiting for a CI slot::Two other pull requests' CI runs are going, and only two run at once. This run starts again by itself when one ends (ci-slots.yml): nothing to do."
+          echo "::error title=Waiting for a CI slot::Four other pull requests' CI runs are going, and only four run at once. This run starts again by itself when one ends (ci-slots.yml): nothing to do."
           exit 1
+
+  # The documentation website, built as pages.yml publishes it with each release, so a page that
+  # breaks the build is found on its pull request, not at the release. (Its examples run in the
+  # suite: tools/docs_check.py.)
+  site:
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.wait != 'true' && needs.plan.outputs.site == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - run: npm ci
+        working-directory: site
+      - run: npm run build
+        working-directory: site
+      - run: python3 ../tools/brand_check.py --site dist   # (its mark and favicon: brand/'s, ADR-032)
+        working-directory: site
 
   # linux-x64 first, on its own: the suite and the tests after the build need its packages alone,
   # so they start once it is built, never waiting for the slowest platform.
@@ -256,6 +283,11 @@ jobs:
             (curl -sSfL https://dlcdn.apache.org/kafka/4.3.1/kafka_2.13-4.3.1.tgz || curl -sSfL https://archive.apache.org/dist/kafka/4.3.1/kafka_2.13-4.3.1.tgz) | tar xz -C ~
           fi
           python3 tools/harness.py all --shard ${{ matrix.shard }}
+      - name: What 1.0 keeps (ADR-068), against main's list
+        if: ${{ !matrix.shard }}
+        run: |
+          git fetch --depth 1 origin main && git show FETCH_HEAD:docs/surface.json > "$RUNNER_TEMP/main-surface.json" || true
+          python3 tools/surface.py --bin "$PONDRA_BIN" --check docs/surface.json --base "$RUNNER_TEMP/main-surface.json"
       - name: Frames, the console, the website's examples, a failover
         if: ${{ !matrix.shard }}
         run: |
