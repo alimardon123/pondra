@@ -236,9 +236,27 @@ def regexp_extract(c, pattern, idx):
     return Column(f"CASE WHEN {x.sql} IS NULL THEN NULL ELSE {got} END", f"regexp_extract({x._name}, {pattern}, {idx})")
 
 
-def split(c, pattern):
+def split(c, pattern, limit=-1):
+    """PySpark's split: `pattern` is a regular expression, and a `limit` above 0 keeps that many parts,
+    the last one holding the rest of the text. DataFusion has no regex split, so each match is marked
+    with U+0001 and the text cut there. A text that already holds U+0001 is an error (the CAST below
+    fails with its message), never a cut in the wrong place."""
     x = _col(c)
-    return Column(f"string_to_array({x.sql}, {_lit(pattern).sql})", f"split({x._name}, {pattern}, -1)")
+    pat = _lit(pattern).sql
+    checked = (f"CASE WHEN CAST(CASE WHEN strpos({x.sql}, chr(1)) > 0 THEN 'split: text holds U+0001' ELSE '0' END AS INT) = 0 "
+               f"THEN {x.sql} END")
+    cut = f"string_to_array(regexp_replace({checked}, {pat}, chr(1), 'g'), chr(1))"
+    n = int(limit)
+    if n <= 0:
+        sql = f"CASE WHEN {x.sql} = '' THEN make_array('') ELSE {cut} END"
+    else:
+        # (each match marked on both sides, so the parts after the (n-1)th match, joined back with
+        # their marks gone, are the rest of the text, separators and all)
+        marked = f"string_to_array(regexp_replace({checked}, {_lit('(' + pattern + ')').sql}, chr(1) || '$1' || chr(1), 'g'), chr(1))"
+        rest = f"array_to_string(array_slice({marked}, {2 * n - 1}, CAST(array_length({marked}) AS BIGINT)), '')"
+        sql = (f"CASE WHEN {x.sql} = '' THEN make_array('') WHEN array_length({cut}) > {n} "
+               f"THEN array_append(array_slice({cut}, 1, {n - 1}), {rest}) ELSE {cut} END")
+    return Column(sql, f"split({x._name}, {pattern}, {n})")
 
 
 def date_trunc(fmt, c):

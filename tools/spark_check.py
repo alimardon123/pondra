@@ -589,6 +589,13 @@ def p_regexp_extract_groups(spark, F, Window):  # group 0 is the whole match; an
     return df.select(F.regexp_extract("s", pat, 0), F.regexp_extract("s", pat, 1).alias("g1"), F.regexp_extract("s", pat, 2).alias("g2"))
 
 
+def p_split_regex_and_limit(spark, F, Window):  # split takes a regular expression; a limit keeps that many parts, the last the rest
+    rows = [("a1b22c",), ("xyz",), ("",), (None,), ("1a",), ("a1",), ("a,;b1c;d",), ("a1b22c333",), ("q1q",)]
+    df = spark.createDataFrame(rows, "s string")
+    return df.select(F.split("s", "[0-9]+"), F.split("s", "[0-9]+", 1).alias("one"), F.split("s", "[0-9]+", 2).alias("two"),
+                     F.split("s", "[0-9]+", 3).alias("three"), F.split("s", "[,;]+", 2).alias("sep2"))
+
+
 def _row_class(spark):
     """PySpark's Row, or Pondra's, by the session that is asked."""
     if type(spark).__module__.startswith("pondra"):
@@ -697,6 +704,7 @@ PIPELINES = [
     ("log_base_and_nonpositive_null", False, "frame", p_log_base_and_nonpositive),
     ("log_int_base_raises", None, "raises", p_log_int_base_raises),
     ("regexp_extract_groups", False, "frame", p_regexp_extract_groups),
+    ("split_regex_and_limit", False, "frame", p_split_regex_and_limit),
 ]
 
 
