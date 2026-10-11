@@ -877,16 +877,26 @@ def tiering():
         if r == 8:
             first = listed()
     wide = listed()
+    # A wide table's row groups hold at most 64 MB as Parquet's writer counts them (`tier::writer`):
+    # a scan holds a row group's columns while it decodes them, and a million rows of 105 columns
+    # held a node's memory 1.9 GB deep for a top-10 of them.
+    import pyarrow.parquet as pq
+    sql(A.port, "CREATE TABLE broad AS SELECT value AS i, " + ", ".join(f"md5(CAST(value * {c} AS VARCHAR)) AS c{c}" for c in range(1, 49)) + " FROM generate_series(1, 60000)")
+    broad = [pq.ParquetFile(os.path.join(lake, f["path"])).metadata for f in json.loads(subprocess.run(
+        [BIN, "catalog", "--dir", lake, "t/broad"], capture_output=True, text=True).stdout.split(" ", 1)[1])["files"]]
+    sizes = [sum(m.row_group(g).column(c).total_compressed_size for c in range(m.num_columns)) for m in broad for g in range(m.num_row_groups)]
+    groups = sum(m.num_rows for m in broad) == 60000 and len(sizes) > len(broad) and max(sizes) <= 64 << 20
     node.kill()
     classes = len(first) == 1 and first[0] in wide and len(wide) == 2
     ok = (got["events"] == rounds * per and got["totals"] == rounds * per
-          and got["kv"] == {"n": 200, "v": 200 * rounds} and untiered == 0 and max(files.values()) <= 8 and classes and spans)
+          and got["kv"] == {"n": 200, "v": 200 * rounds} and untiered == 0 and max(files.values()) <= 8 and classes and spans and groups)
     print(f"tiering: {rounds} rounds -> files {files}, untiered rows {untiered}, rows {got}; "
           f"a merged file kept while eight more merge: {classes} ({len(first)} then {len(wide)} files); "
-          f"INTERVAL columns tiered, merged and changed, read back exactly: {spans} -> {'OK' if ok else 'FAIL'}")
+          f"INTERVAL columns tiered, merged and changed, read back exactly: {spans}; "
+          f"a wide table's row groups at most 64 MB: {groups} ({len(sizes)} in {len(broad)} files, the largest {max(sizes) >> 20} MB) -> {'OK' if ok else 'FAIL'}")
     if not ok:
         sys.exit(1)
-    return f"{rounds} rounds of writes and tiering: log drained, files bounded ({files}), every row exact (INTERVAL columns too); merges by size class"
+    return f"{rounds} rounds of writes and tiering: log drained, files bounded ({files}), every row exact (INTERVAL columns too); merges by size class; wide row groups at most 64 MB"
 
 
 def tails():

@@ -1,0 +1,160 @@
+{
+ "what": "ClickBench's 10 M rows (the lake's 11 files, 1.4 GB) on this 4-core sandbox, scaled down from the 100 M rows on GitHub's 16 GB runner: a 1.6 GB memory cgroup (v1, page cache charged, as 14 GB of files on 16 GB) and a 2.4 GB one. Best of 3 per query, q24 left out (it is killed for memory in the 1.6 GB box). main = 317f6eb (#58).",
+ "found": [
+  "q33's four final aggregations share the query memory with 8 other operators that may spill (4 partial aggregations, 4 exchanges): DataFusion's fair pool gives each a twelfth, so they spill 20 times at 38 MB while 153 MB of the box's 533 MB is held.",
+  "With all the memory (no box) q33 takes 0.48 s against DuckDB's 0.39 s: the GROUP BY itself is 1.2x DuckDB; the box's 3x is spilling and the files' pages pushed out of memory.",
+  "A pool shared among the operators holding memory (DataFusion's divides among every one that may spill) is 2% faster at the default memory and 9% from memory in the 2.4 GB box, but with the query memory raised to 1.0 or 1.2 GB the node is killed for memory at q32, where DataFusion's pool at 1.2 GB is not: the operators' real memory is up to twice what they count (a hash table that doubles is counted after it has), and the fair pool's twelfths hid that margin. Not taken.",
+  "In-memory columns at full memory: all in memory 1.8x faster than files (5.10 s against 9.33 s), a tenth in memory as fast as files (9.10 s). Slower than files only when they are made to compete with queries for memory (the 100 M bench sets 6 GB of them on a 16 GB runner whose files are 14 GB).",
+  "In-memory columns that give memory back as queries grow (trimmed when query memory and theirs pass the limit): 10% slower in the 2.4 GB box (12.83 s against 11.71 s), since what they give back is loaded again. Not taken."
+ ],
+ "runs": {
+  "box 1.6 GB, files, main (two runs)": [
+   {
+    "queries": 42,
+    "total_s": 11.739,
+    "q19": 0.888,
+    "q33": 1.227,
+    "q34": 1.144,
+    "q35": 1.332
+   },
+   {
+    "queries": 42,
+    "total_s": 12.016,
+    "q19": 0.951,
+    "q33": 1.286,
+    "q34": 1.194,
+    "q35": 1.558
+   }
+  ],
+  "box 1.6 GB, files, pool among holders (two runs)": [
+   {
+    "queries": 42,
+    "total_s": 11.641,
+    "q19": 0.961,
+    "q33": 1.307,
+    "q34": 1.34,
+    "q35": 1.309
+   },
+   {
+    "queries": 42,
+    "total_s": 11.666,
+    "q19": 0.899,
+    "q33": 1.324,
+    "q34": 1.35,
+    "q35": 1.338
+   }
+  ],
+  "box 2.4 GB, 0.9 GB in memory, main": {
+   "queries": 42,
+   "total_s": 11.712,
+   "q19": 0.94,
+   "q33": 1.081,
+   "q34": 1.72,
+   "q35": 1.326
+  },
+  "box 2.4 GB, 0.9 GB in memory, pool among holders": {
+   "queries": 42,
+   "total_s": 12.136,
+   "q19": 0.86,
+   "q33": 1.447,
+   "q34": 1.395,
+   "q35": 1.168
+  },
+  "box 1.6 GB, query memory 0.8 GB, main": {
+   "queries": 42,
+   "total_s": 11.922,
+   "q19": 1.002,
+   "q33": 1.344,
+   "q34": 1.341,
+   "q35": 1.24
+  },
+  "box 1.6 GB, query memory 0.8 GB, holders": {
+   "queries": 42,
+   "total_s": 12.088,
+   "q19": 1.073,
+   "q33": 1.496,
+   "q34": 1.346,
+   "q35": 1.345
+  },
+  "box 1.6 GB, query memory 1.0 GB, main": {
+   "queries": 42,
+   "total_s": 11.973,
+   "q19": 0.944,
+   "q33": 1.409,
+   "q34": 1.289,
+   "q35": 1.366
+  },
+  "box 1.6 GB, query memory 1.0 GB, holders (killed for memory at q32)": {
+   "queries": 31,
+   "total_s": 6.862,
+   "q19": 0.581,
+   "q33": null,
+   "q34": null,
+   "q35": null
+  },
+  "box 1.6 GB, query memory 1.2 GB, main": {
+   "queries": 42,
+   "total_s": 10.935,
+   "q19": 0.803,
+   "q33": 1.544,
+   "q34": 0.84,
+   "q35": 0.74
+  },
+  "box 1.6 GB, query memory 1.2 GB, holders (killed for memory at q32)": {
+   "queries": 31,
+   "total_s": 6.908,
+   "q19": 0.647,
+   "q33": null,
+   "q34": null,
+   "q35": null
+  },
+  "box 2.4 GB, files, main": {
+   "queries": 42,
+   "total_s": 10.906,
+   "q19": 0.912,
+   "q33": 1.134,
+   "q34": 1.135,
+   "q35": 1.214
+  },
+  "box 2.4 GB, 0.9 GB in memory, columns giving room back": {
+   "queries": 42,
+   "total_s": 12.831,
+   "q19": 0.852,
+   "q33": 1.022,
+   "q34": 1.604,
+   "q35": 1.615
+  },
+  "full memory, files": {
+   "queries": 42,
+   "total_s": 9.326,
+   "q19": 0.493,
+   "q33": 0.476,
+   "q34": 0.612,
+   "q35": 0.684
+  },
+  "full memory, 0.5 GB in memory (0.34 held)": {
+   "queries": 42,
+   "total_s": 9.1,
+   "q19": 0.5,
+   "q33": 0.442,
+   "q34": 0.64,
+   "q35": 0.691
+  },
+  "full memory, 6 GB in memory (3.56 held: all of it)": {
+   "queries": 42,
+   "total_s": 5.097,
+   "q19": 0.349,
+   "q33": 0.334,
+   "q34": 0.428,
+   "q35": 0.419
+  },
+  "DuckDB 1.5 in the 1.6 GB box": {
+   "queries": 43,
+   "total_s": 10.257,
+   "q19": 0.479,
+   "q33": 0.393,
+   "q34": 0.584,
+   "q35": 0.599
+  }
+ }
+}

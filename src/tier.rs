@@ -87,6 +87,7 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
 /// similar size (`run`); only when that run reaches the oldest file is the whole table rewritten.
 /// Returns whether anything changed.
 const MERGE_BYTES: u64 = 256 << 20; // input a merge job takes at most
+const ROW_GROUP_BYTES: usize = 64 << 20; // a row group at most, as the Parquet writer counts it (`writer`)
 
 /// `now_anyway` (`CHECKPOINT`): a keyed table that publishes is compacted whatever it holds, so
 /// other engines see its rows as they are now.
@@ -896,8 +897,14 @@ impl Seen {
 /// Parquet writer. Keyed tables are written for lookups as well as scans — sorted by key (see
 /// `latest_sql`), with a bloom filter per key column, and in small row groups and pages, so reading
 /// one key touches one page instead of a million rows.
+///
+/// Every table's row groups hold at most `ROW_GROUP_BYTES` as the writer counts them (about 40 MB
+/// written): a scan holds a row group's columns while it decodes it, so a million rows of a wide
+/// table held hundreds of MB a partition (ClickBench's 105 columns on four cores: a top-10 of every
+/// column peaked at 1.9 GB, and a node in a 1.6 GB container was killed; 1.0 GB in groups of this
+/// size, and faster). A narrower table's million rows stay one group (TPC-H's lineitem: 34 MB).
 fn writer<'a>(buf: &'a mut Vec<u8>, batch: &RecordBatch, keys: &[String]) -> Result<ArrowWriter<&'a mut Vec<u8>>> {
-    let mut props = WriterProperties::builder().set_compression(codec());
+    let mut props = WriterProperties::builder().set_compression(codec()).set_max_row_group_bytes(Some(ROW_GROUP_BYTES));
     if !keys.is_empty() {
         props = props.set_max_row_group_row_count(Some(256 << 10));
     }
