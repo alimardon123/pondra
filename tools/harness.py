@@ -7737,7 +7737,7 @@ def objects():
     again = http("CREATE TABLE t (a BIGINT)")
     as_again = http("CREATE TABLE t AS SELECT 9 AS a")
     quiet = q("CREATE TABLE IF NOT EXISTS t AS SELECT 9 AS a")
-    checks["CREATE TABLE of one there: refused (42P07), AS SELECT adds nothing, IF NOT EXISTS leaves it"] = again[:2] == (500, "42P07") and as_again[1] == "42P07" \
+    checks["CREATE TABLE of one there: refused (409, 42P07), AS SELECT adds nothing, IF NOT EXISTS leaves it"] = again[:2] == (409, "42P07") and as_again[1] == "42P07" \
         and quiet.get("exists") is True and q("SELECT count(*) AS n FROM t") == [{"n": 2}]
     q("CREATE OR REPLACE TABLE t AS SELECT 7 AS a")
     checks["CREATE OR REPLACE TABLE makes it anew"] = q("SELECT a FROM t") == [{"a": 7}]
@@ -7750,7 +7750,7 @@ def objects():
     call(A.port, "POST", "/insert/bulk_made?job=bm", b"SELECT 1 AS a")
     info["nope"] = [nope[:2], nope_select[:2], nope_read[:2], cli_nope.returncode, (cli_nope.stdout + cli_nope.stderr)[-200:]]
     checks["an INSERT into a name no table has is refused (42P01, naming it) over HTTP and pondra sql, nothing made; POST /insert/{t} still makes one"] = \
-        nope[:2] == (500, "42P01") and "no table nope" in str(nope[2]) and nope_select[1] == "42P01" and nope_read[1] == "42P01" \
+        nope[:2] == (404, "42P01") and "no table nope" in str(nope[2]) and nope_select[1] == "42P01" and nope_read[1] == "42P01" \
         and cli_nope.returncode != 0 and "no table nope" in cli_nope.stdout + cli_nope.stderr and q("SELECT count(*) AS n FROM bulk_made") == [{"n": 1}]
     q("CREATE VIEW v AS SELECT a FROM t")
     q("CREATE VIEW IF NOT EXISTS v AS SELECT a + 1 AS a FROM t")
@@ -7772,7 +7772,7 @@ def objects():
     q("CREATE FUNCTION IF NOT EXISTS twice(x BIGINT) RETURNS BIGINT RETURN x * 3")
     q("CREATE TASK tick SCHEDULE '1 hour' AS SELECT 1")
     q("CREATE TASK IF NOT EXISTS tick SCHEDULE '1 hour' AS SELECT 2")
-    checks["functions and tasks: IF NOT EXISTS leaves them"] = q("SELECT twice(5) AS x") == [{"x": 10}] and http("CREATE TASK tick SCHEDULE '1 hour' AS SELECT 3")[0] == 500
+    checks["functions and tasks: IF NOT EXISTS leaves them"] = q("SELECT twice(5) AS x") == [{"x": 10}] and http("CREATE TASK tick SCHEDULE '1 hour' AS SELECT 3")[0] == 409
     # Every other kind alike (IF NOT EXISTS leaves one, OR REPLACE replaces it, both at once
     # refused), and OR REPLACE refused where it would drop what's inside
     q("CREATE MACRO plus1(x) AS x + 1")
@@ -7803,8 +7803,8 @@ def objects():
     kept = [http(f"CREATE OR REPLACE {k}") for k in ("SCHEMA s1", "DATABASE d1", "USER u1 PASSWORD 'pw-0123456789'", "ROLE r1")]
     info.update({"macros": macros, "secrets": secrets, "externals": externals, "temps": temps, "kept": [str(k[2])[:160] for k in kept]})
     checks["macros, secrets, external tables, a session's temporary tables, views and secrets: IF NOT EXISTS, OR REPLACE, both refused"] = \
-        macros == [[{"x": 2}], [{"x": 4}], 500] and secrets == [True, 500, [{"scope": "http://127.0.0.1:9/c/"}], 500] \
-        and externals == [True, 500, [{"a": 1}], [{"a": "1"}], 500] and temps == [200, 200, {"secret": "ts", "temporary": True, "exists": True}, [{"a": 1}], [{"a": 3}], 500, 500, 500, 500]
+        macros == [[{"x": 2}], [{"x": 4}], 500] and secrets == [True, 409, [{"scope": "http://127.0.0.1:9/c/"}], 500] \
+        and externals == [True, 409, [{"a": 1}], [{"a": "1"}], 400] and temps == [200, 200, {"secret": "ts", "temporary": True, "exists": True}, [{"a": 1}], [{"a": 3}], 500, 500, 500, 500]
     checks["OR REPLACE of a schema, a database, a user or a role: refused, saying what it would drop"] = all(k[0] == 500 for k in kept) \
         and all("everything in it" in str(k[2]) for k in kept[:2]) and all("rights given to it" in str(k[2]) for k in kept[2:])
     # DETACH: rows stay, the flow stops, what follows keeps following the table
@@ -8065,7 +8065,7 @@ def sequences():
     fresh = q("SELECT a FROM ser")
     listed = sorted(r["name"] for r in q("SELECT name FROM pondra.objects WHERE kind = 'sequence'"))
     info["owned"] = [no, undropped, gone, fresh, listed]
-    checks["DROP SEQUENCE refused while a DEFAULT or a table uses it; a missing one, a materialized view's nextval, TEMP and an added identity refused"] = all(r[0] == 500 for r in no)
+    checks["DROP SEQUENCE refused while a DEFAULT or a table uses it; a missing one, a materialized view's nextval, TEMP and an added identity refused"] = all(r[0] >= 400 for r in no)
     checks["an owned sequence: kept with a dropped table and its UNDROP, gone with PURGE, made again with the table; not listed apart"] = \
         undropped == [1, 2, 3] and gone[1] == "42P01" and fresh == [{"a": 1}] and listed == ["c", "e", "o2", "s"]
     # past a leader's kill, no value is handed out again
@@ -8211,7 +8211,7 @@ def constraints():
     missing = err("ALTER TABLE tags DROP CONSTRAINT one_tag")
     info["alter"] = [dup, now, again, long, missing]
     checks["ADD CONSTRAINT UNIQUE over a value twice refused (23505) and not kept; added over clean rows, every node refuses a duplicate; DROP CONSTRAINT lets it in; ADD CHECK; a name taken, one missing refused"] = \
-        dup[1] == "23505" and after_dup and all(r[1] == "23505" for r in now) and again[0] == 500 and long[1] == "23514" and missing[0] == 500 and \
+        dup[1] == "23505" and after_dup and all(r[1] == "23505" for r in now) and again[0] == 409 and long[1] == "23514" and missing[0] == 404 and \
         [r[1] for r in rows("tags")] == ["a", "b", "a"]
     # CREATE UNIQUE INDEX, as ORMs write a UNIQUE (Prisma's @unique)
     q('CREATE TABLE "User" (id INT, "email" TEXT)')
@@ -8303,8 +8303,8 @@ def enums():
     q("CREATE TABLE people (id INT, name TEXT, feeling mood)")
     q("CREATE TABLE t2 (id INT, size ENUM('s', 'm', 'l'))")
     info["types"] = [same, again, bad_types, temp_enum]
-    checks["CREATE TYPE … AS ENUM makes a type; IF NOT EXISTS again is fine; a repeat, an empty or duplicate label list, OR REPLACE and a temporary table's enum column are refused (500)"] = \
-        same[0] == 200 and again[0] == 500 and all(r[0] == 500 for r in bad_types) and temp_enum[0] == 500
+    checks["CREATE TYPE … AS ENUM makes a type; IF NOT EXISTS again is fine; a repeat, an empty or duplicate label list, OR REPLACE and a temporary table's enum column are refused (a repeat 409, the rest 500)"] = \
+        same[0] == 200 and again[0] == 409 and all(r[0] == 500 for r in bad_types) and temp_enum[0] == 500
     # Labels and NULL go in from every door; SELECT reads them back as text
     q("INSERT INTO people VALUES (1, 'Ann', 'happy'), (2, 'Bo', 'sad'), (3, 'Cy', NULL)")
     q("INSERT INTO people SELECT id + 10, name, feeling FROM people WHERE id = 2")
@@ -8357,7 +8357,7 @@ def enums():
     labels3 = q("SELECT enum_range(NULL::mood) AS r")[0]["r"]
     info["added"] = [early, labels2, meh, ine, again_add, labels3]
     checks["ALTER TYPE … ADD VALUE BEFORE or AFTER puts a label in its place (last after 'happy'); refused until added; IF NOT EXISTS is fine, a repeat refused"] = \
-        early[1] == "22P02" and labels2 == ["sad", "meh", "ok", "happy"] and meh[0] == 200 and ine[0] == 200 and again_add[0] == 500 and \
+        early[1] == "22P02" and labels2 == ["sad", "meh", "ok", "happy"] and meh[0] == 200 and ine[0] == 200 and again_add[0] == 409 and \
         labels3 == ["sad", "meh", "ok", "happy", "great"]
     # ALTER TABLE … ADD COLUMN of an enum type: its values are checked too (old rows read NULL)
     q("ALTER TABLE t2 ADD COLUMN m2 mood")
@@ -8385,7 +8385,7 @@ def enums():
     info["columns"] = [m2_bad, t2_rows, in_use, still, dropped, gone]
     checks["ADD COLUMN of an enum type checks its values; DROP TYPE is refused while a column uses it (2BP01), works once none does; IF EXISTS is fine"] = \
         m2_bad[1] == "22P02" and t2_rows == [[1, "m", None], [5, "s", "ok"]] and in_use[1] == "2BP01" and "uses it" in in_use[2] and \
-        still[0] == 500 and dropped[0] == 200 and gone[0] == 200
+        still[0] == 409 and dropped[0] == 200 and gone[0] == 200
     for n in nodes:
         n.kill()
     ok = all(checks.values())
@@ -8511,7 +8511,7 @@ def registry():
         notice[0] == 200 and "nothing is built" in notice[1] and again == (200, 'relation "visits_page_idx" already exists, skipping') \
         and pg == [{"indexname": "visits_lower", "indexdef": "CREATE INDEX visits_lower ON public.visits USING brin (lower(path)) WHERE (path IS NOT NULL)"},
                    {"indexname": "visits_page_idx", "indexdef": "CREATE INDEX visits_page_idx ON public.visits (path)"}] \
-        and renamed == ["clicks_lower_page", "orders_region_at_idx", "visits_lower", "visits_path"] and [r[0] for r in refused_ix] == [500] * 6 \
+        and renamed == ["clicks_lower_page", "orders_region_at_idx", "visits_lower", "visits_path"] and [r[0] for r in refused_ix] == [500, 500, 500, 500, 409, 409] \
         and "hnsw" in refused_ix[2][1] and "a view" in refused_ix[0][1] and "an index has the name" in refused_ix[4][1] \
         and after_column == ["clicks_lower_page", "orders_region_at_idx"] and after_table == after_column \
         and show("index", "sales.orders_region_at_idx") == "CREATE INDEX orders_region_at_idx ON sales.orders_2025 (region, at DESC);"
@@ -8598,7 +8598,7 @@ def registry():
         and {k["kind"] for k in kinds if k["is"] == "object" and k["on_clone"] == "leave"} == {"secret", "share", "recipient"}
     missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'", "COMMENT ON COLUMN eu_orders.region IS 'x'")]
     quiet = q("COMMENT IF EXISTS ON TABLE nothing_here IS 'x'")
-    checks["what isn't there: refused by name, or nothing with IF EXISTS"] = missing == [500, 500, 500, 500] and quiet.get("exists") is False
+    checks["what isn't there: refused by name (4xx), or nothing with IF EXISTS"] = all(400 <= s < 500 for s in missing) and quiet.get("exists") is False
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"registry": checks, "ok": ok, "info": info}, indent=1, default=str))

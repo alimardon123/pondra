@@ -294,7 +294,7 @@ async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result
 async fn session_python(method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>) -> Result<Json<Value>, E> {
     let id = crate::temp::id(&id); // (as the client's requests name it: its user's)
     if *role < crate::auth::Role::Admin {
-        return Err(E(anyhow::anyhow!("a session's Python is an admin's, as DO is")));
+        return Err(E(crate::codes::coded("42501", "a session's Python is an admin's, as DO is")));
     }
     Ok(Json(match method {
         axum::http::Method::DELETE => j!({"restarted": crate::python::end_session(&id)}),
@@ -320,7 +320,7 @@ async fn list_pythons(Query(q): Query<HashMap<String, String>>, role: axum::Exte
 /// this machine). From a page on this machine only, an admin's.
 async fn choose_python(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, .. }): axum::extract::ConnectInfo<crate::tls::Peer>, role: axum::Extension<crate::auth::Role>, Json(b): Json<Value>) -> Result<Json<Value>, E> {
     if *role < crate::auth::Role::Admin || !from.ip().is_loopback() {
-        return Err(E(anyhow::anyhow!("which Python runs is chosen by an admin, on this machine")));
+        return Err(E(crate::codes::coded("42501", "which Python runs is chosen by an admin, on this machine")));
     }
     Ok(Json(crate::python::choose(b["path"].as_str().unwrap_or_default()).await?))
 }
@@ -1172,7 +1172,9 @@ fn notices(heard: &[String]) -> Option<axum::http::HeaderValue> {
 /// The values are kept out of what that procedure says (its notices, its error, the run log).
 async fn secret(State(app): State<App>, Path(name): Path<String>, headers: axum::http::HeaderMap) -> Result<Json<Value>, E> {
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    ensure!(crate::auth::lent(token).is_some(), "only a procedure's code reads a secret: pondra.secret(name), in a Python procedure");
+    if crate::auth::lent(token).is_none() {
+        return Err(E(crate::codes::coded("42501", "only a procedure's code reads a secret: pondra.secret(name), in a Python procedure")));
+    }
     let values = crate::ext::reveal(&app.lake, &name.to_lowercase()).await?;
     crate::auth::revealed(token, values.iter().filter(|(k, _)| *k != "type" && *k != "scope").map(|(_, v)| v.clone()));
     Ok(Json(j!(values)))
@@ -1509,7 +1511,9 @@ macro_rules! ensure {
 }
 use ensure;
 
-/// Any error becomes a 500 with its message.
+/// Any error becomes a response whose HTTP status follows its SQLSTATE: a client's bad request is a
+/// 4xx, a transient condition 503, a real fault 500 (`codes::http`). The message is the body and
+/// `x-pondra-sqlstate` the exact code (ADR-036 §4).
 pub struct E(anyhow::Error);
 impl<T: Into<anyhow::Error>> From<T> for E {
     fn from(e: T) -> Self { E(e.into()) }
@@ -1517,6 +1521,7 @@ impl<T: Into<anyhow::Error>> From<T> for E {
 impl IntoResponse for E {
     fn into_response(self) -> Response {
         let code = crate::codes::of(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4)
-        (StatusCode::INTERNAL_SERVER_ERROR, [("x-pondra-sqlstate", code)], crate::ext::said(&self.0)).into_response()
+        let status = StatusCode::from_u16(crate::codes::http(code)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, [("x-pondra-sqlstate", code)], crate::ext::said(&self.0)).into_response()
     }
 }

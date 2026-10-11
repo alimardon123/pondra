@@ -26,7 +26,7 @@ read.
 | admin | also create tables, views, tasks and functions, run DDL (`CREATE`, `ALTER`, `DROP`, `COPY … TO`) and `DO` blocks in `POST /sql`, and tier |
 
 A request with no token is answered `401` (`sign in: a token, or a user's name and password`), with a wrong one `401` too, and with a token or user without enough rights `403` (`this needs more rights than this token's or user's`). Any
-other error is `500` with its message as plain text.
+other error's status follows its SQLSTATE: a request that is the client's own mistake is a `4xx` (a bad statement or value `400`, a name that isn't there `404`, a conflict such as a duplicate key or a serialization failure `409`, a quota `429`), a transient condition that is worth retrying is `503` (the node is catching up, a timeout, the bucket didn't answer), a feature not yet supported is `501`, and only a real fault is `500`. The message is the body (plain text), and `x-pondra-sqlstate` carries the exact code ([error codes](/pondra/reference/postgres/#error-codes)).
 
 ```bash norun
 curl -s -H "Authorization: Bearer $PONDRA_TOKEN" -X POST http://localhost:8080/sql -d "SELECT 1"
@@ -88,8 +88,9 @@ The header `x-pondra-notices` on an answer carries what procedures and `DO` bloc
 JSON list of lines. Send `x-pondra-session: <id>` (8 to 128 letters, digits, `-` or `_`) to use temporary tables that only that id sees,
 `DO LANGUAGE python` blocks that share their variables ([Functions and procedures](/pondra/guides/functions-and-procedures/#cells-that-share-variables)),
 and a transaction: `BEGIN`, then statements, then `COMMIT`, each request with the same id
-([Transactions](/pondra/guides/change-rows/#transactions)). An error is status 500 with its message
-as the body, and `x-pondra-sqlstate`, Postgres's code for it ([error codes](/pondra/reference/postgres/#error-codes)).
+([Transactions](/pondra/guides/change-rows/#transactions)). An error's status follows its SQLSTATE
+(the client's mistake a `4xx`, a transient condition `503`, a real fault `500`), its message is the
+body, and `x-pondra-sqlstate` carries Postgres's code for it ([error codes](/pondra/reference/postgres/#error-codes)).
 
 ```bash
 curl -s -X POST http://localhost:8080/sql -d "CREATE TABLE events (user VARCHAR, amount BIGINT)"
