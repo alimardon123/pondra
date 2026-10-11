@@ -7139,6 +7139,21 @@ def safety():
     checks["PONDRA_ALLOWED_ORIGINS lets a listed origin through, and no other"] = \
         allowed_said["listed origin"] == (200, '[{"x":1}]') and allowed_said["other origin"][0] == 401
     allow.kill()
+    # PUT /console/settings is an admin's, from this machine (like choosing the Python): a web page
+    # the user visits can't overwrite them, and behind a reverse proxy a loopback address no longer
+    # stands in for a token. Its own PONDRA_CONFIG_DIR keeps the test off this machine's real settings.
+    cfg = tempfile.mkdtemp(prefix="pondra-settings-")
+    setn = Node(new_lake(), P + 50, env={"PONDRA_CONFIG_DIR": cfg}).start()
+    settings_said = {
+        "local admin (no origin)": web(P + 50, "/console/settings", body=b'{"theme":"dark"}', method="PUT"),
+        "cross-site": web(P + 50, "/console/settings", origin="https://evil.example", body=b'{"theme":"light"}', method="PUT"),
+        "read-back": web(P + 50, "/console/settings", body=b"", method="GET"),
+    }
+    info["settings"] = settings_said
+    checks["the console's settings are saved by a local admin only: a web page the user visits can't write them"] = \
+        settings_said["local admin (no origin)"][0] == 204 and settings_said["cross-site"][0] == 403 \
+        and '"theme":"dark"' in settings_said["read-back"][1] and "light" not in settings_said["read-back"][1]
+    setn.kill()
 
     def raw(port, chunks, source=None, wrap=False, first=None):
         s = socket.create_connection(("127.0.0.1", port), timeout=10, source_address=(source, 0) if source else None)
