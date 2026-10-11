@@ -377,7 +377,7 @@ fn options(p: &mut Parser, o: &mut Options) -> Result<()> {
             true => match p.next_token().token {
                 Token::SingleQuotedString(s) | Token::Number(s, _) => s,
                 Token::Word(w) => w.value.to_lowercase(),
-                t => bail!("{k}: a value, not {t}"),
+                t => bail!("{k}: a value, not {t} (a number, a word or 'text' in quotes, such as 3, immutable or '10 minutes')"),
             },
             false => "true".into(),
         };

@@ -472,7 +472,7 @@ fn task_options(p: &mut Parser) -> Result<TaskOptions> {
         let v = match p.next_token().token {
             Token::SingleQuotedString(s) | Token::Number(s, _) => s,
             Token::Word(w) => w.value,
-            t => bail!("{k}: a value, not {t}"),
+            t => bail!("{k}: a value, not {t} (a number, a word or 'text' in quotes, such as 3, immutable or '10 minutes')"),
         };
         let secs = |v: &str| -> Result<u64> {
             match v.parse::<u64>() {
@@ -831,7 +831,7 @@ pub fn every(text: &str) -> Result<Every> {
     if t.starts_with("cron ") || (fields.len() >= 5 && fields[0].chars().all(|c| c.is_ascii_digit() || "*/,-".contains(c))) {
         ensure!((5..=6).contains(&fields.len()), "cron: five fields (minute hour day month weekday) and a time zone");
         let tz = match fields.get(5) {
-            Some(z) => text.split_whitespace().last().unwrap_or(z).parse::<chrono_tz::Tz>().map_err(|e| anyhow::anyhow!("cron: time zone {z}: {e}"))?,
+            Some(z) => text.split_whitespace().last().unwrap_or(z).parse::<chrono_tz::Tz>().map_err(|e| anyhow::anyhow!("cron: time zone {z}: {e} (a time zone such as 'UTC' or 'Europe/Berlin')"))?,
             None => chrono_tz::UTC,
         };
         return Ok(Every::Cron(Box::new(Cron::parse(&fields[..5])?), tz));

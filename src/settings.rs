@@ -118,7 +118,7 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
             let name = name.to_string().to_lowercase();
             let kept = crate::temp::with(&session()?, false, |s| Ok(s.prepared.get(&name).cloned()))?;
             let kept = kept.with_context(|| format!("Prepared statement '{name}' does not exist"))?;
-            let Some(Statement::Prepare { data_types, statement, .. }) = Parser::parse_sql(&GenericDialect {}, &kept)?.pop() else { bail!("{name}: not a prepared statement") };
+            let Some(Statement::Prepare { data_types, statement, .. }) = Parser::parse_sql(&GenericDialect {}, &kept)?.pop() else { bail!("{name}: not a prepared statement (PREPARE {name} AS … makes one)") };
             let mut statement = *statement;
             let mut args = Arguments { values: parameters, types: data_types, wrong: None };
             let _ = VisitMut::visit(&mut statement, &mut args);
@@ -127,7 +127,7 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
             }
             Done::Run(statement.to_string())
         }
-        Statement::Execute { .. } => bail!("EXECUTE statement requires a name"),
+        Statement::Execute { .. } => bail!("EXECUTE statement requires a name (EXECUTE name, or EXECUTE name(1, 'a') with its values)"),
         Statement::Deallocate { name, .. } => {
             let name = name.value.to_lowercase();
             crate::temp::with(&session()?, false, |s| match name.as_str() {
@@ -136,7 +136,7 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
             })?;
             Done::Said("DEALLOCATE")
         }
-        _ => bail!("not a setting or a prepared statement"),
+        _ => bail!("not a setting or a prepared statement (SET name = value or SHOW name for a setting, PREPARE name AS … for a statement)"),
     })
 }
 
@@ -253,11 +253,11 @@ impl VisitorMut for Arguments {
         let Expr::Value(v) = e else { return ControlFlow::Continue(()) };
         let Value::Placeholder(p) = &v.value else { return ControlFlow::Continue(()) };
         let Some(i) = p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()).filter(|i| *i >= 1) else {
-            self.wrong = Some(format!("Unknown placeholder: {p}"));
+            self.wrong = Some(format!("Unknown placeholder: {p} (the placeholders are $1, $2, … in order)"));
             return ControlFlow::Break(());
         };
         let Some(value) = self.values.get(i - 1).cloned() else {
-            self.wrong = Some(format!("No value found for placeholder with name {p}"));
+            self.wrong = Some(format!("No value found for placeholder with name {p} (EXECUTE name(1, 'a') gives one value per placeholder, in order)"));
             return ControlFlow::Break(());
         };
         *e = match self.types.get(i - 1) {
