@@ -36,7 +36,11 @@ jobs:
       AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
       PONDRA_BUCKET: ${{ secrets.R2_BUCKET }}
     steps:
+      # (the commit the plan names, not a pull request's merge ref: that ref is gone once the pull
+      # request merges, and a day's later legs start hours after)
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ fromJSON(inputs.plan).sha }}
       - name: The build workflow's binary, for this commit
         if: fromJSON(inputs.plan).binary == 'ci'
         env:
