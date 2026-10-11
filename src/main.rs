@@ -435,7 +435,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             };
             if many {
-                let one = [(flight.is_some(), "--flight"), (kafka.is_some(), "--kafka"), (!attached.is_empty(), "--attach"), (advertise.is_some(), "--advertise"), (attach_found.is_some(), "--attach-found")];
+                let one = [(flight.is_some(), "--flight"), (kafka.is_some(), "--kafka"), (kafka_advertise.is_some(), "--kafka-advertise"), (!attached.is_empty(), "--attach"), (advertise.is_some(), "--advertise"), (attach_found.is_some(), "--attach-found")];
                 if let Some((_, flag)) = one.iter().find(|(given, _)| *given) {
                     anyhow::bail!("{dir} holds several lakes, served as databases; {flag} is one lake's (serve that lake: pondra serve {dir}/<name> {flag} …)");
                 }
@@ -796,7 +796,10 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Catalog { dir, prefix } => {
             let lake = store::Lake::open(&dir, false, false).await?;
             match prefix.starts_with("d/") {
-                true => println!("{prefix}: {:?} bytes", lake.cat.get_raw(&prefix).await?.map(|b| b.len())), // inline data: binary
+                true => match lake.cat.get_raw(&prefix).await? {
+                    Some(b) => println!("{prefix}: {} bytes", b.len()), // inline data: binary
+                    None => println!("{prefix}: not in the catalog"),
+                },
                 false => {
                     for (k, v) in lake.cat.scan::<serde_json::Value>(&prefix, &format!("{prefix}\u{10ffff}")).await? {
                         println!("{k} {v}");
