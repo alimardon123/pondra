@@ -856,10 +856,13 @@ static VERIFIED: LazyLock<Mutex<HashMap<String, std::time::Instant>>> = LazyLock
 /// Is this `user`'s password? (Its verifier checked, or remembered as checked.)
 pub async fn password_ok(lake: &Lake, user: &str, password: &str) -> bool {
     let key = sha256(&format!("{user}\0{password}"));
-    if VERIFIED.lock().unwrap().get(&key).is_some_and(|t| t.elapsed().as_secs() < 60) {
+    let Ok(Some(u)) = lake.cat.get::<User>(&user_key(user)).await else { return false };
+    // (remembered for a minute only as the verifier it was checked against: a user who may no longer
+    // sign in, or whose password changed, is refused at once)
+    let key = sha256(&format!("{key}\0{}", u.verifier.as_ref().map(|v| v.stored_key.as_str()).unwrap_or_default()));
+    if u.login && VERIFIED.lock().unwrap().get(&key).is_some_and(|t| t.elapsed().as_secs() < 60) {
         return true;
     }
-    let Ok(Some(u)) = lake.cat.get::<User>(&user_key(user)).await else { return false };
     let ok = u.login && u.verifier.as_ref().is_some_and(|v| v.matches(password));
     if ok {
         let mut all = VERIFIED.lock().unwrap();
@@ -1139,7 +1142,7 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) ->
         if role > Role::None {
             return Some(Principal::token(role));
         }
-        if token.starts_with("pn_") && keys(lake).await.is_ok_and(|k| k.node == token) {
+        if token.starts_with("pn_") && keys(lake).await.is_ok_and(|k| aws_lc_rs::constant_time::verify_slices_are_equal(k.node.as_bytes(), token.as_bytes()).is_ok()) {
             return Some(Principal::token(Role::Admin));
         }
         let user = if token.starts_with("ps_") { session_user(lake, token).await? } else { token_user(lake, token).await? };
@@ -1155,7 +1158,7 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) ->
 pub async fn sign_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Option<Principal> {
     if BUILT_IN.contains(&user) {
         let role = auth.token_role(password);
-        return (role > Role::None && auth.token_for(user).as_deref() == Some(password)).then(|| Principal::token(role));
+        return (role > Role::None && auth.token_for(user).is_some_and(|t| aws_lc_rs::constant_time::verify_slices_are_equal(t.as_bytes(), password.as_bytes()).is_ok())).then(|| Principal::token(role));
     }
     let ok = match password.starts_with("pt_") {
         true => token_user(lake, password).await.as_deref() == Some(user),

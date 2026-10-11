@@ -10,7 +10,7 @@
 //! Every door (HTTP, Postgres, Kafka, Flight) works out a `Principal` and runs the request inside
 //! `WHO.scope(…)`, so one check (`check`, `allows`, the query's tables in `query.rs`) sees it.
 use crate::write::Stmt;
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use std::sync::Arc;
 
 /// Who a request is: a name, the most it may do (`role`), and, for a user who isn't a superuser,
@@ -96,6 +96,110 @@ pub fn tokens_on() -> bool { TOKENS.load(std::sync::atomic::Ordering::Relaxed) }
 
 static TOKENS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The header that carries, with a change a node sends its leader, the user it is for: the leader
+/// runs it as that user, so its subqueries read with the user's grants, as where it came in. Only the
+/// cluster's own calls may say it (`Principal::operator`), and it only narrows what they may do.
+pub const AS_USER: &str = "x-pondra-as";
+
+/// The user the request being served is for, when its work goes on elsewhere (None: not a user's).
+pub fn as_user() -> Option<String> { current().filter(|p| p.access.is_some()).map(|p| p.name) }
+
+/// Whether a request a node with no sign-in would answer as anyone may be answered. Programs send no
+/// `Origin` or `Sec-Fetch-Site`, and the node's own console sends its own origin; a browser sends
+/// what the page it runs is. So a page from anywhere else can't use a node on the user's machine
+/// through the user's browser (CSRF), nor can a page that pointed its own name at this machine (DNS
+/// rebinding: asked from this machine by a name that isn't this machine's). A link followed from
+/// elsewhere still opens the console: a page is shown in the user's tab, never to the page that
+/// linked it, and no GET changes anything. `own` is the node's address (`--advertise`). Some(why):
+/// refuse.
+pub fn cross_site(h: &axum::http::HeaderMap, method: &axum::http::Method, from: Option<std::net::SocketAddr>, own: &str) -> Option<String> {
+    let header = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(str::to_ascii_lowercase);
+    let host = header("host").unwrap_or_default();
+    let away = "a page from another site may not use this node through your browser: open the node's own console, or give the node a token (--admin-token)";
+    let navigated = (method == axum::http::Method::GET || method == axum::http::Method::HEAD) && header("sec-fetch-mode").is_some_and(|m| m == "navigate");
+    if !navigated && header("sec-fetch-site").is_some_and(|s| s != "same-origin" && s != "none") {
+        return Some(away.into());
+    }
+    // (an origin's default port is left out, a Host's may not be)
+    let bare = |a: &str| a.trim_end_matches(":80").trim_end_matches(":443").to_string();
+    if let Some(origin) = header("origin").filter(|_| !navigated) {
+        if origin.split_once("://").is_none_or(|(_, o)| bare(o) != bare(&host)) {
+            return Some(away.into());
+        }
+    }
+    let name = host.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(host.as_str(), |(n, _)| n);
+    let name = name.trim_start_matches('[').trim_end_matches(']');
+    let ours = name.is_empty()
+        || name.parse::<std::net::IpAddr>().is_ok()
+        || name == "localhost"
+        || name.ends_with(".localhost")
+        || own.rsplit_once(':').is_some_and(|(o, _)| o.eq_ignore_ascii_case(name))
+        || MACHINE.iter().any(|m| m.eq_ignore_ascii_case(name) || m.split('.').next().is_some_and(|short| short.eq_ignore_ascii_case(name)));
+    if from.is_some_and(|f| f.ip().is_loopback()) && !ours {
+        return Some(format!("asked from this machine as {name}, which isn't this machine's name: a page may have pointed its name here (DNS rebinding). Use http://127.0.0.1 or http://localhost, or give the node a token (--admin-token)"));
+    }
+    None
+}
+
+/// This machine's name, as the OS says it.
+static MACHINE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(sysinfo::System::host_name);
+
+/// May the request being served add rows to `table` (as the catalog names it) through a door that
+/// takes rows, not SQL (`/append`, `/insert`)? Its INSERT grant, as SQL's `INSERT` asks; and never a
+/// system table (`$` in its name: `pondra$audit`, `t$deleted`), which only Pondra writes.
+pub fn check_rows(table: &str) -> Result<()> {
+    ensure!(!table.contains('$'), "{table} is written by Pondra alone");
+    check("insert", table)
+}
+
+/// Is the request being served at least `role`'s? (Making a table through `/insert`: an admin's, as
+/// `CREATE TABLE` is.)
+pub fn at_least(role: Role, what: &str) -> Result<()> {
+    ensure!(current().is_none_or(|p| p.role >= role), "{what} needs an admin");
+    Ok(())
+}
+
+/// The lake's own records: what was done and by whom, which no writer but the nodes may add to.
+const RECORDS: [&str; 3] = ["pondra$audit", "pondra$history", "pondra$runs"];
+
+/// What the nodes' own write routes (`/cluster/commit`, `/cluster/files`) take from a caller that
+/// isn't an admin (a `pondra sql` writer on another machine, with a write token): rows into tables
+/// that are there, and no more. A user writes with SQL, where its grants are checked. A write token
+/// never moves a sequence or a branch's row ids, and never names an object the lake would one day
+/// delete as its own: a segment outside `log/`, a file outside its table's folder; nor adds to the
+/// lake's own records.
+pub fn flush_from_writer(f: &crate::log::Flush) -> Result<()> {
+    if !writer()? {
+        return Ok(());
+    }
+    ensure!(f.sequence.is_none() && f.blocks == 0, "moving a sequence or a branch's row ids needs an admin");
+    if let Some(p) = f.parts.iter().find(|p| RECORDS.contains(&p.table.as_str())) {
+        bail!("{} is written by Pondra alone", p.table);
+    }
+    let seg = f.path.strip_prefix("log/").and_then(|n| n.strip_suffix(".seg"));
+    ensure!(f.path.is_empty() || seg.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')), "a flush's rows are in a segment of the log (log/<id>.seg), not {}", f.path);
+    Ok(())
+}
+
+/// The same for a bulk INSERT's files: into a table that is there (`folder`: its folder under
+/// `data/`), each in that folder.
+pub fn files_from_writer(folder: Option<&str>, files: &[String]) -> Result<()> {
+    if !writer()? {
+        return Ok(());
+    }
+    let Some(folder) = folder else { bail!("making a table needs an admin") };
+    let home = format!("data/{folder}/");
+    ensure!(files.iter().all(|f| f.starts_with(&home) && !f.split('/').any(|part| part == ".." || part == ".")), "a table's files are in its folder ({home})");
+    Ok(())
+}
+
+/// Is the request being served a writer's that isn't an admin (refused if it is a user's)?
+fn writer() -> Result<bool> {
+    let Some(p) = current().filter(|p| p.role < Role::Admin) else { return Ok(false) };
+    ensure!(p.access.is_none(), "a user's rows go in through SQL (POST /sql, the Postgres port), where its grants are checked: this route is the nodes' own");
+    Ok(true)
+}
+
 /// May the request being served use `privilege` on `table` (as the catalog names it)?
 pub fn check(privilege: &str, table: &str) -> Result<()> {
     match limited() {
@@ -172,6 +276,7 @@ impl Auth {
         let first = path.trim_start_matches('/').split('/').next().unwrap_or_default();
         match first {
             "files" if method == "GET" => Role::Read, // (objects next to the tables: files.rs)
+            "files" if path.to_ascii_lowercase().ends_with(".py") => Role::Admin, // (code a node runs: an admin stores it, invariant 85)
             "files" => Role::Write,
             "" | "console" => Role::None, // (the console's page and files: they hold no data, and ask for a token)
             "stats" | "healthz" | "ready" => Role::None, // (health checks: load balancers and the tests poll them)

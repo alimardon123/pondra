@@ -62,7 +62,7 @@ fn install(name: &str, mut args: Vec<String>) -> Result<()> {
     ensure!(!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'), "a service's name is letters, digits, - and _");
     if args.iter().any(|a| a == "--help" || a == "-h") {
         use clap::CommandFactory;
-        let mut cli = crate::Cli::command();
+        let mut cli = crate::cli::Cli::command();
         cli.build(); // (each command's usage named in full: `pondra service install`)
         let service = cli.find_subcommand_mut("service").expect("service");
         service.find_subcommand_mut("install").expect("install").print_help()?;
@@ -70,8 +70,8 @@ fn install(name: &str, mut args: Vec<String>) -> Result<()> {
         return Ok(cli.find_subcommand_mut("serve").expect("serve").print_help()?);
     }
     // (the options as `serve` takes them: a mistake is said now, not in a log at boot)
-    let cli = crate::Cli::try_parse_from(["pondra", "serve"].into_iter().map(String::from).chain(args.iter().cloned())).map_err(|e| anyhow::anyhow!("{}", e.render()))?;
-    let Some(crate::Cmd::Serve { path, dir, databases, stop_with_stdin, .. }) = cli.cmd else { unreachable!("parsed as serve") };
+    let cli = crate::cli::Cli::try_parse_from(["pondra", "serve"].into_iter().map(String::from).chain(args.iter().cloned())).map_err(|e| anyhow::anyhow!("{}", e.render()))?;
+    let Some(crate::cli::Cmd::Serve { path, dir, databases, stop_with_stdin, .. }) = cli.cmd else { unreachable!("parsed as serve") };
     ensure!(!stop_with_stdin, "leave out --stop-with-stdin: the service manager stops the node");
     let cwd = std::env::current_dir()?;
     if path.is_none() && dir.is_none() && databases.is_none() {

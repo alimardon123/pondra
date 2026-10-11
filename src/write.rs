@@ -1130,6 +1130,9 @@ pub struct Files {
 }
 
 impl Files {
+    /// The table they go into.
+    pub fn table(&self) -> &str { &self.table }
+
     /// Where its files are.
     pub fn paths(&self) -> Vec<String> { self.files.iter().map(|f| f.path.clone()).collect() }
 }
@@ -1420,7 +1423,7 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
         }
         let target = other.clone().unwrap_or_else(|| lake.arc());
         let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files).await?;
-        let Some(o) = other else { return post(&app.cluster.leader.addr, &Request::Change(sql, job, sent)).await };
+        let Some(o) = other else { return post_as(&app.cluster.leader.addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await };
         let out = deliver(&o.url, Some(Some(Request::Change(sql, job.clone(), sent))), &stmt, &job, false).await?;
         seen_there(&o, Some(producer_key(&format!("sql:{job}")))).await;
         return Ok(out);
@@ -1889,12 +1892,20 @@ async fn across(dir: &str, r: &crate::store::Reach, req: Option<Option<Request>>
     Ok(res.json().await?)
 }
 
-pub async fn post(addr: &str, r: &Request) -> Result<Value> {
+pub async fn post(addr: &str, r: &Request) -> Result<Value> { post_as(addr, r, None).await }
+
+/// `post`, naming the user a change is for to this lake's own leader, which runs it as them
+/// (`auth::AS_USER`). Never to another lake's: it has users of its own.
+async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value> {
     let (path, body) = r.http()?;
     let call = http().post(crate::tls::url(&format!("{addr}{path}"))).header("content-type", "application/json").body(body);
     let call = match BEARER.try_with(|k| k.clone()) {
         Ok(k) => call.bearer_auth(k), // (a branch's key, sent as this request's own Authorization)
         Err(_) => call,
+    };
+    let call = match user {
+        Some(user) => call.header(crate::auth::AS_USER, user),
+        None => call,
     };
     let res = call.send().await?;
     ensure!(res.status().is_success(), "the leader at {addr}: {}", res.text().await?);
