@@ -225,8 +225,15 @@ def regexp_replace(c, pattern, replacement):
 
 
 def regexp_extract(c, pattern, idx):
+    """PySpark's regexp_extract: group `idx` of the first match, '' when there is no match or the
+    group took no part, and NULL for a NULL. Group 0 is the whole match: the pattern goes in one more
+    group, which regexp_match then gives first."""
     x = _col(c)
-    return Column(f"coalesce((regexp_match({x.sql}, {_lit(pattern).sql}))[{int(idx)}], '')", f"regexp_extract({x._name}, {pattern}, {idx})")
+    group, pat = int(idx), pattern
+    if group == 0:
+        group, pat = 1, f"({pattern})"
+    got = f"coalesce((regexp_match({x.sql}, {_lit(pat).sql}))[{group}], '')"
+    return Column(f"CASE WHEN {x.sql} IS NULL THEN NULL ELSE {got} END", f"regexp_extract({x._name}, {pattern}, {idx})")
 
 
 def split(c, pattern):

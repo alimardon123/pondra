@@ -583,6 +583,12 @@ def p_log_int_base_raises(spark, F, Window):  # PySpark takes the base as a floa
     return spark.createDataFrame([(8.0,)], "x double").select(F.log(2, F.col("x"))).collect()
 
 
+def p_regexp_extract_groups(spark, F, Window):  # group 0 is the whole match; an unmatched group is ''; NULL stays NULL
+    df = spark.createDataFrame([("a-1",), ("xyz",), ("",), (None,), ("#",)], "s string")
+    pat = "([a-z])(-[0-9]+)?"
+    return df.select(F.regexp_extract("s", pat, 0), F.regexp_extract("s", pat, 1).alias("g1"), F.regexp_extract("s", pat, 2).alias("g2"))
+
+
 def _row_class(spark):
     """PySpark's Row, or Pondra's, by the session that is asked."""
     if type(spark).__module__.startswith("pondra"):
@@ -690,6 +696,7 @@ PIPELINES = [
     ("first_last_ignorenulls", False, "frame", p_first_last_ignorenulls),
     ("log_base_and_nonpositive_null", False, "frame", p_log_base_and_nonpositive),
     ("log_int_base_raises", None, "raises", p_log_int_base_raises),
+    ("regexp_extract_groups", False, "frame", p_regexp_extract_groups),
 ]
 
 
