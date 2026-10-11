@@ -93,12 +93,16 @@ async fn query(app: &App, sql: &str) -> anyhow::Result<(SchemaRef, Vec<RecordBat
     let batches = crate::audit::statement(app, sql, app.query(sql, None)).await?;
     let schema = match batches.first() {
         Some(b) => b.schema(),
-        None => Arc::new(plan_schema(app, sql).await?),
+        None => Arc::new(planned(app, sql).await?),
     };
     Ok((schema, batches))
 }
 
-async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> {
+/// The columns a query will answer with, for its flight's info: expanded as every door expands SQL
+/// (macros, `FROM t`, `pondra.git_status`), then planned, not run.
+async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> { planned(app, &crate::routines::expand(&app.lake, sql).await?).await }
+
+async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> {
     let ctx = crate::query::session(&app.lake, sql, "").await?;
     Ok(crate::query::sql(&ctx, &crate::asof::rewrite(sql)?).await?.schema().as_arrow().clone())
 }

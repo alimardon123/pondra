@@ -177,6 +177,12 @@ CALL git_pull('/Shared/sales');                                   -- a file chan
 CALL git_pull_request('/Shared/sales', title => 'Discounts by channel');
 ```
 
+**Built** (round 34: `src/git.rs`, `tools/git_check.py`) for GitHub, with the procedures above; a folder
+is named as the workspace names it (`'sales'` is `files/sales`). The build added two rules: a git secret
+names its `SCOPE`, and its token goes only to repositories that scope covers (over https, or to this
+machine), for those with `USAGE` on it; and git secrets are never used to read files. GitLab is one more
+arm of `git::host`, refused by name until then.
+
 **How the console uses them** (in the console round):
 - **The branch picker** lists the databases that have a base.
 - **New branch** clones a database and checks out the Git branch of the same name.

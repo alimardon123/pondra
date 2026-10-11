@@ -1114,9 +1114,10 @@ fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
         "iceberg" => (&["token", "client_id", "client_secret", "oauth2_server_uri", "oauth2_scope", "scope"], &["http", "https"]), // (a REST catalog)
         "share" => (&["token", "scope"], &["http", "https"]), // (a Delta Sharing server: a recipient's token)
         "pondra" => (&["token", "scope"], &["http", "https"]), // (a Pondra server's leader, asked with a user's token: ADR-058)
+        "git" => (&["token", "provider", "scope"], &["http", "https"]), // (a person's git host token: `git.rs`; never read as a file's secret)
         "kafka" => (&["security_protocol", "sasl_mechanism", "username", "password", "scope"], &["kafka"]),
         "generic" => (&[], &[]), // (any settings: for procedures, `pondra.secret(name)`)
-        t => bail!("secrets of TYPE {t}: s3, r2, gcs, azure, http, iceberg, share, kafka, pondra or generic"),
+        t => bail!("secrets of TYPE {t}: s3, r2, gcs, azure, http, iceberg, share, kafka, pondra, git or generic"),
     })
 }
 
@@ -1335,6 +1336,7 @@ fn made(name: &str, mut params: BTreeMap<String, String>) -> Result<Secret> {
         bail!("a {t} secret has no {k}: {}", known.join(", "));
     }
     let scope = params.remove("scope");
+    ensure!(t != "git" || scope.is_some(), "a git secret says where its token may go: SCOPE 'https://github.com/acme'");
     if let Some(s) = &scope {
         ensure!(scheme(s).is_some_and(|x| schemes.contains(&x)), "a {t} secret's SCOPE is a URL of {}", schemes.iter().map(|s| format!("{s}://")).collect::<Vec<_>>().join(" or "));
     }
@@ -1356,9 +1358,9 @@ pub async fn create(lake: &Lake, name: &str, params: BTreeMap<String, String>, r
         }
     }
     let bucket = |s: &str| root(s);
-    if let Some(b) = scope.as_deref().and_then(bucket) {
+    if let Some(b) = scope.as_deref().and_then(bucket).filter(|_| secret.kind != "git") { // (git tokens: each person has their own for the same host)
         for (other, s) in list(lake).await? {
-            let same = s.scope.as_deref().is_some_and(|o| bucket(o).as_deref() == Some(b.as_str()));
+            let same = s.kind != "git" && s.scope.as_deref().is_some_and(|o| bucket(o).as_deref() == Some(b.as_str()));
             ensure!(other == name || !same, "{b} already has secret {other} for {}: a bucket is read with one secret (one SCOPE in it)", s.scope.unwrap_or_default());
         }
     }
@@ -1388,7 +1390,7 @@ pub async fn list(lake: &Lake) -> Result<Vec<(String, Secret)>> {
 
 /// May the request being served use this secret? Its own temporary one, or one a user is granted
 /// USAGE on (`GRANT USAGE ON SECRET`); a token's or a superuser's, any but a key lent to read a base.
-fn usable(name: &str, s: &Secret) -> bool { !s.lent && (s.temporary || crate::auth::limited().is_none_or(|a| a.secret(name))) }
+pub(crate) fn usable(name: &str, s: &Secret) -> bool { !s.lent && (s.temporary || crate::auth::limited().is_none_or(|a| a.secret(name))) }
 
 /// The secret for a URL: the longest scope that is a prefix of it (no scope: every URL of its
 /// type's schemes).
@@ -1399,7 +1401,7 @@ pub(crate) fn covering(secrets: &[(String, Secret)], url: &str) -> Option<(Strin
 /// The same among `secrets`, whoever asks.
 fn scoped<'a>(secrets: impl Iterator<Item = &'a (String, Secret)>, url: &str) -> Option<(String, Secret)> {
     let s = scheme(url)?;
-    secrets.filter(|(_, x)| x.kind != "pondra" && kind(&x.kind).is_ok_and(|(_, schemes)| schemes.contains(&s)))
+    secrets.filter(|(_, x)| !matches!(x.kind.as_str(), "pondra" | "git") && kind(&x.kind).is_ok_and(|(_, schemes)| schemes.contains(&s)))
         .filter(|(_, x)| x.scope.as_deref().is_none_or(|p| url.starts_with(p)))
         .max_by_key(|(_, x)| x.scope.as_ref().map_or(0, |p| p.len() + 1)).cloned()
 }

@@ -723,6 +723,7 @@ DROP MATERIALIZED VIEW spend_by_item;
 | Call | `CALL p(args)` or `CALL p(name => value)` |
 | Run a file | `CALL run('etl/orders.sql', day => DATE '2026-09-29')`: a `.sql`, `.py` or notebook file of the lake's, its parameters by name ([Run files as jobs](/pondra/guides/workspace/)) |
 | Project status | `CALL status('shop', env => 'prod')`: what differs between a project kept in the workspace and that database, as rows (`state`, `mark`, `kind`, `name`, `what`, `who`, `at`). `CALL capture` is refused, since it writes the project's files: `pondra capture` does that ([Changes made in the database](/pondra/guides/environments/#changes-made-in-the-database)) |
+| Git folder | `CALL git_checkout('sales', repository => 'https://github.com/acme/sales', branch => 'main')`, `CALL git_commit('sales', 'message' [, paths => ['a.sql', …]])`, `CALL git_pull('sales')`, `CALL git_pull_request('sales', title => '…' [, base => 'main', body => '…'])`; `pondra.git_status('sales')` (or `CALL git_status`) lists what changed as rows (`path`, `change`, `branch`, `commit`). Each takes `secret => 'name'` ([Git folders](/pondra/guides/environments/#git-folders)) |
 | Run code once | `DO LANGUAGE python \| sql $$ … $$` (the language may come after the code, as in Postgres) |
 | Start | `START CALL p(args)`: runs it without waiting, and answers with the run's id (`AWAIT` it, or find it in `pondra.runs`) |
 | Task | `CREATE [OR REPLACE] TASK [IF NOT EXISTS] t SCHEDULE '5 minutes' \| 'cron 0 2 * * * UTC' AS CALL p(…)` |
@@ -790,7 +791,7 @@ brought from them runs as it is:
 |---|---|
 | Write files | `COPY (SELECT …) TO 'url' (FORMAT parquet \| csv \| json \| delta \| iceberg, PARTITION_BY (col, …), APPEND \| OVERWRITE, HEADER true, DELIMITER ';', COMPRESSION zstd, ROW_GROUP_SIZE n)` |
 | Write a topic | `COPY (SELECT …) TO 'kafka://brokers/topic' (FORMAT json, KEY col)` |
-| Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| pondra \| generic, KEY value, …, SCOPE 'url')`; `TYPE pondra, TOKEN '…', SCOPE 'https://…'` is how a lake attached `READ_ONLY` asks its own server's leader to pin a branch |
+| Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| pondra \| git \| generic, KEY value, …, SCOPE 'url')`; `TYPE pondra, TOKEN '…', SCOPE 'https://…'` is how a lake attached `READ_ONLY` asks its own server's leader to pin a branch; `TYPE git, TOKEN '…', SCOPE 'https://github.com/acme'` is a person's token for [Git folders](/pondra/guides/environments/#git-folders), sent only to the repositories its `SCOPE` covers and never used to read files |
 | A session's own | `CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…)`: in the node's memory for this session only, used before the lake's |
 | Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name` |
 

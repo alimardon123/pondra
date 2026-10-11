@@ -420,6 +420,7 @@ pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Resul
     let name = crate::ddl::new_name(lake, name).await?;
     ensure!(r.kind != Kind::Procedure || !crate::workspace::is_run(crate::ddl::split(&name).1), "{name}: run is Pondra's own procedure (CALL run('etl/orders.sql') runs a file of the lake's)");
     ensure!(r.kind != Kind::Procedure || !crate::apply::is_own(crate::ddl::split(&name).1), "{name}: plan, apply, status and capture are Pondra's own procedures (CALL apply('files/sales', env => 'prod'))");
+    ensure!(r.kind != Kind::Procedure || !crate::git::is_own(crate::ddl::split(&name).1), "{name}: git_checkout, git_status, git_commit, git_pull and git_pull_request are Pondra's own procedures (CALL git_commit('sales', 'message'))");
     if let Some(old) = lake.cat.get::<Routine>(&key(&name)).await? {
         ensure!(replace, "{} {name} already exists (CREATE OR REPLACE {})", old.what(), r.what().to_uppercase());
         ensure!((old.kind == Kind::Procedure) == (r.kind == Kind::Procedure), "{name} is a {}", old.what());
@@ -736,6 +737,7 @@ pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { expand_wi
 
 async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) -> Result<String> {
     let sql = &crate::vars::parameters_in(lake, sql).await?; // (`pondra.parameters('etl/orders.sql')`: a file's parameters, as rows)
+    let sql = &crate::git::status_in(lake, sql).await?; // (`pondra.git_status('sales')`: a Git folder's local changes, as rows)
     if let Some(q) = show(sql) {
         return Ok(q);
     }
@@ -1630,6 +1632,9 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
         }
         if crate::apply::is_own(&name) {
             return Box::pin(crate::apply::call(app, &name, &args, who)).await; // (a project in the workspace, planned or applied: ADR-047 §4)
+        }
+        if crate::git::is_own(&name) {
+            return Box::pin(crate::git::call(app, &name, &args, who)).await; // (a Git folder of the workspace: ADR-060 §8)
         }
         let (local, r, row) = Box::pin(prepared(app, &name, &args, who)).await?;
         return Box::pin(run(app, local, r, row, who, job, None)).await;
