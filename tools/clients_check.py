@@ -121,8 +121,9 @@ def rows_of(port, table, order, user):
 def postgres16(work, port):
     """Postgres 16 on `port` for the length of the block, its data under `work` (run as `claude`
     when this is root: initdb refuses root)."""
-    pg_dir = os.path.join(work, f"pg16-{port}")
-    os.makedirs(pg_dir)
+    # A folder of its own each time: dbt and params both start one on the same port in one run, and the
+    # first one's data folder stayed behind (FileExistsError, so params never ran in the default run).
+    pg_dir = tempfile.mkdtemp(dir=work, prefix=f"pg16-{port}-")
     owner = "claude" if os.geteuid() == 0 else None
     run_as = ["runuser", "-u", owner, "--"] if owner else []
     if owner:
