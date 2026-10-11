@@ -812,15 +812,11 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Re
     let deleted = crate::sys::deleted(name);
     let mut puts = vec![];
     let kept = keep_ms > 0 && !purge && !crate::sys::hidden(name);
+    let _held = match kept {
+        true => Some(still(lake, &[name.to_string(), deleted.clone()]).await?), // (until it's gone: rows sent since are refused)
+        false => None,
+    };
     if kept {
-        let mut sent = false;
-        for _ in 0..10 {
-            if to_files(lake, &[name.to_string(), deleted.clone()]).await? {
-                sent = true;
-                break;
-            }
-        }
-        ensure!(sent, "{name} kept taking rows while it was dropped: try again when its writers pause (or DROP TABLE {name} PURGE)");
         let at_ms = crate::log::now_ms();
         let meta = lake.cat.get::<TableMeta>(&table_key(name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
         let deleted = lake.cat.get::<TableMeta>(&table_key(&deleted)).await?;
@@ -911,50 +907,50 @@ async fn clone(lake: &Lake, name: &str, from: &str) -> Result<Value> {
     ensure!(lake.cat.get::<TableMeta>(&table_key(&from)).await?.is_some(), "no table {from}");
     ensure!(!crate::sys::hidden(&from), "{from} is a hidden table");
     let deleted = crate::sys::deleted(&from);
-    for _ in 0..10 {
-        if !to_files(lake, &[from.clone(), deleted.clone()]).await? {
-            continue;
+    let _held = still(lake, &[from.clone(), deleted.clone()]).await?; // (every row before the clone is in it)
+    let (at, now) = (lake.visible(), crate::log::now_ms());
+    let mut puts = vec![];
+    for (source, target) in [(from.clone(), name.to_string()), (deleted.clone(), crate::sys::deleted(name))] {
+        let Some(mut m) = lake.cat.get::<TableMeta>(&table_key(&source)).await? else { continue };
+        let folder = m.folder(&source).to_string();
+        m.shares.push(folder);
+        m.shares.sort();
+        m.shares.dedup();
+        m.folder = free_folder(lake, &target).await?;
+        m.tiered = at;
+        m.publish.clear();
+        m.garbage.clear(); // (the source's to delete, not ours)
+        m.garbage_deletes.clear();
+        m.replaced.clear();
+        if source == from {
+            m.past_from = Some((at, now));
         }
-        let (at, now) = (lake.visible(), crate::log::now_ms());
-        let mut puts = vec![];
-        for (source, target) in [(from.clone(), name.to_string()), (deleted.clone(), crate::sys::deleted(name))] {
-            let Some(mut m) = lake.cat.get::<TableMeta>(&table_key(&source)).await? else { continue };
-            let folder = m.folder(&source).to_string();
-            m.shares.push(folder);
-            m.shares.sort();
-            m.shares.dedup();
-            m.folder = free_folder(lake, &target).await?;
-            m.tiered = at;
-            m.publish.clear();
-            m.garbage.clear(); // (the source's to delete, not ours)
-            m.garbage_deletes.clear();
-            m.replaced.clear();
-            if source == from {
-                m.past_from = Some((at, now));
-            }
-            puts.push((table_key(&target), json(&m)));
-        }
-        lake.cat.commit(puts, &[]).await?;
-        return Ok(j!({"table": name, "cloned": from}));
+        puts.push((table_key(&target), json(&m)));
     }
-    bail!("{from} kept taking rows while it was cloned: try again when its writers pause")
+    lake.cat.commit(puts, &[]).await?;
+    Ok(j!({"table": name, "cloned": from}))
 }
 
-/// Send `tables`' rows in the log to files, up to its end. False if more came meanwhile.
-async fn to_files(lake: &Lake, tables: &[String]) -> Result<bool> {
-    let mut late = false;
+/// `tables`' rows all in files, and no more coming until the hold is dropped, for a statement that
+/// moves their entries (rename, swap, drop, clone). Their rows go to files while appends still go
+/// in; then their appends are held (`Sequencer::hold`: a node sends them again, to whichever table
+/// has the name then) and the rows that came meanwhile go to files too. Looking at the log again
+/// instead left a row sequenced between the last look and the statement's commit under a name no
+/// table read, and refused the statement while writers kept up.
+async fn still(lake: &Lake, tables: &[String]) -> Result<crate::log::Hold> {
+    to_files(lake, tables).await?;
+    let Some(crate::log::To::Local(seq)) = lake.to.get() else { bail!("a table's entry is moved by the leader") };
+    let hold = seq.hold(tables).await?;
+    to_files(lake, tables).await?;
+    Ok(hold)
+}
+
+/// Send `tables`' rows in the log to files, up to its end now.
+async fn to_files(lake: &Lake, tables: &[String]) -> Result<()> {
     for t in tables {
-        loop {
-            let (_, done) = crate::tier::tier_table(lake, t, lake.visible(), &["here".to_string()], "here").await?;
-            if done {
-                break;
-            }
-        }
-        let Some(meta) = lake.cat.get::<TableMeta>(&table_key(t)).await? else { continue }; // (no rows ever changed: no `$deleted`)
-        let upto = lake.visible();
-        late |= lake.cat.scan::<crate::store::Segment>(&crate::store::seg_key(meta.tiered + 1), &crate::store::seg_key(upto + 1)).await?.iter().any(|(_, s)| s.parts.contains_key(t));
+        while !crate::tier::tier_table(lake, t, lake.visible(), &["here".to_string()], "here").await?.1 {}
     }
-    Ok(!late)
+    Ok(())
 }
 
 /// `ALTER TABLE | VIEW name RENAME TO to` (ADR-030). A stored view's entry moves. A table's
@@ -986,36 +982,32 @@ async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
     ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_some(), "no table or view {name}");
     let followers: Vec<String> = readers(lake, &name).await?.into_iter().filter(|r| !r.starts_with("view ")).collect();
     ensure!(followers.is_empty(), "{name} is followed by {}: they follow it by name, so drop them first", followers.join(", "));
-    // Its rows in the log go to files, so none is left under the old name (new ones may come:
-    // then again); its changed rows' old versions (`{name}$deleted`) too, or they would show again.
+    // Its rows in the log go to files, so none is left under the old name; its changed rows' old
+    // versions (`{name}$deleted`) too, or they would show again. Appends wait meanwhile, then go to
+    // whatever has the name, or are refused if nothing does.
     let (old_deleted, new_deleted) = (crate::sys::deleted(&name), crate::sys::deleted(&to));
-    for _ in 0..10 {
-        if !to_files(lake, &[name.clone(), old_deleted.clone()]).await? {
-            continue;
-        }
-        let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
-        let mut puts = vec![];
-        let mut gone = vec![table_key(&name)];
-        let moved = |mut m: TableMeta, n: &str| {
-            m.folder = Some(m.folder(n).to_string());
-            m
-        };
-        puts.push((table_key(&to), json(&moved(meta, &name))));
-        if let Some(d) = lake.cat.get::<TableMeta>(&table_key(&old_deleted)).await? {
-            puts.push((table_key(&new_deleted), json(&moved(d, &old_deleted))));
-            gone.push(table_key(&old_deleted));
-        }
-        for state in ["x", "i"] {
-            if let Some(v) = lake.cat.get::<Value>(&format!("{state}/{name}")).await? {
-                puts.push((format!("{state}/{to}"), json(&v)));
-                gone.push(format!("{state}/{name}"));
-            }
-        }
-        puts.extend(crate::shares::tables_moved(lake, &[(name.as_str(), Some(to.as_str()))]).await?.0); // (shared under the name it had)
-        lake.cat.commit(puts, &gone).await?;
-        return Ok(j!({"table": name, "renamed": to}));
+    let _held = still(lake, &[name.clone(), old_deleted.clone()]).await?;
+    let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
+    let mut puts = vec![];
+    let mut gone = vec![table_key(&name)];
+    let moved = |mut m: TableMeta, n: &str| {
+        m.folder = Some(m.folder(n).to_string());
+        m
+    };
+    puts.push((table_key(&to), json(&moved(meta, &name))));
+    if let Some(d) = lake.cat.get::<TableMeta>(&table_key(&old_deleted)).await? {
+        puts.push((table_key(&new_deleted), json(&moved(d, &old_deleted))));
+        gone.push(table_key(&old_deleted));
     }
-    bail!("{name} kept taking rows while it was renamed: try again when its writers pause")
+    for state in ["x", "i"] {
+        if let Some(v) = lake.cat.get::<Value>(&format!("{state}/{name}")).await? {
+            puts.push((format!("{state}/{to}"), json(&v)));
+            gone.push(format!("{state}/{name}"));
+        }
+    }
+    puts.extend(crate::shares::tables_moved(lake, &[(name.as_str(), Some(to.as_str()))]).await?.0); // (shared under the name it had)
+    lake.cat.commit(puts, &gone).await?;
+    Ok(j!({"table": name, "renamed": to}))
 }
 
 /// `ALTER TABLE a SWAP WITH b` (write-audit-publish): two tables alike but for their rows exchange
@@ -1034,12 +1026,9 @@ async fn swap(lake: &Lake, name: &str, with: &str) -> Result<Value> {
     // Their rows in the log go to files first, as rename does: a row left there would show under the
     // other table's name after the swap.
     let (da, db) = (crate::sys::deleted(&a), crate::sys::deleted(&b));
-    for _ in 0..10 {
-        if to_files(lake, &[a.clone(), da.clone(), b.clone(), db.clone()]).await? && exchange(lake, &a, &b).await? {
-            return Ok(j!({"table": a, "swapped": b}));
-        }
-    }
-    bail!("{a} and {b} kept taking rows while they were swapped: try again when their writers pause")
+    let _held = still(lake, &[a.clone(), da, b.clone(), db]).await?;
+    exchange(lake, &a, &b).await?;
+    Ok(j!({"table": a, "swapped": b}))
 }
 
 /// What a swap needs of one of its tables: a table, not a view or part of a materialized view,
@@ -1072,28 +1061,16 @@ async fn alike(lake: &Lake, a: &str, b: &str) -> Result<()> {
     Ok(())
 }
 
-/// The swap itself, in one commit (leader). Each name takes the other's entry, and its `$deleted`
-/// entry (or none, when the other had none), keeping the folder it had. Every moved entry takes the
-/// largest of the four `tiered` marks: a table reads its log rows after its mark, by name, and the
-/// log between the two marks holds rows the other table wrote under this name, already in its files.
-/// Moving a mark up must skip nothing of a table's own, and writes into the log don't wait for the
-/// lake's lock: a row that landed after `to_files` looked at its table may sit under the new mark. So
-/// the log is read again up to now, for all four, and the swap waits for another round (false) if
-/// one has a row past its own mark. A row landing after that is numbered past `mark`, so it shows
-/// under the name it was written to.
-async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<bool> {
+/// The swap itself, in one commit (leader), the four tables' rows all in files and their appends held
+/// (`still`). Each name takes the other's entry, and its `$deleted` entry (or none, when the other had
+/// none), keeping the folder it had. Every moved entry takes the largest of the four `tiered` marks: a
+/// table reads its log rows after its mark, by name, and the log between the two marks holds rows the
+/// other table wrote under this name, already in its files.
+async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<()> {
     let (da, db) = (crate::sys::deleted(a), crate::sys::deleted(b));
     let (ea, eb) = (lake.cat.get::<TableMeta>(&table_key(a)).await?, lake.cat.get::<TableMeta>(&table_key(b)).await?);
     let (eda, edb) = (lake.cat.get::<TableMeta>(&table_key(&da)).await?, lake.cat.get::<TableMeta>(&table_key(&db)).await?);
     let mark = [&ea, &eb, &eda, &edb].into_iter().flatten().map(|m| m.tiered).max().unwrap_or(0);
-    let marks: Vec<(&str, u64)> = [(a, &ea), (b, &eb), (&da[..], &eda), (&db[..], &edb)].into_iter().filter_map(|(t, m)| m.as_ref().map(|m| (t, m.tiered))).collect();
-    let (from, upto) = (marks.iter().map(|(_, t)| *t).min().unwrap_or(mark), lake.visible());
-    for (k, s) in lake.cat.scan::<crate::store::Segment>(&crate::store::seg_key(from + 1), &crate::store::seg_key(upto + 1)).await? {
-        let n: u64 = k[2..].parse()?;
-        if marks.iter().any(|(t, tiered)| n > *tiered && s.parts.contains_key(*t)) {
-            return Ok(false);
-        }
-    }
     let (mut puts, mut gone) = (vec![], vec![]);
     for (to, from, from_name) in [(a, eb, b), (b, ea, a), (&da[..], edb, &db[..]), (&db[..], eda, &da[..])] {
         match from {
@@ -1105,8 +1082,7 @@ async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<bool> {
             None => gone.push(table_key(to)), // (the other had no changed rows: none is left under this name)
         }
     }
-    lake.cat.commit(puts, &gone).await?;
-    Ok(true)
+    lake.cat.commit(puts, &gone).await
 }
 
 /// A folder under `data/` for a new table: its name's, unless another table has that one (a

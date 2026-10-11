@@ -31,6 +31,7 @@ mod flight;
 mod fresh;
 mod finish;
 mod fsum;
+mod git;
 mod hot;
 mod index;
 mod types;
@@ -572,9 +573,9 @@ async fn run() -> anyhow::Result<()> {
                 replica::recover(&lake, &addr, cluster.leader.n, Some(own)).await?;
             }
             tr("followers' changes recovered");
-            let lock: Arc<tokio::sync::Mutex<()>> = Default::default(); // (the lake's: `App::lock`)
-            let held = (tier_secs > 0.0).then(|| log::Backpressure { max: backlog, lock: lock.clone() }); // rows waiting to be tiered
-            let seq = if leader { Some(log::Sequencer::start(lake.clone(), held).await?) } else { None };
+            let lock: Arc<tokio::sync::Mutex<()>> = Default::default(); // (the lake's: everything that rewrites table metadata)
+            let pace = (tier_secs > 0.0).then(|| log::Pace { rows: backlog, lock: lock.clone() }); // rows waiting to be tiered
+            let seq = if leader { Some(log::Sequencer::start(lake.clone(), pace).await?) } else { None };
             let to = match &seq {
                 Some(s) => log::To::Local(s.clone()),
                 None => log::To::Leader(cluster.leader.addr.clone()),

@@ -605,7 +605,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 50. **A new table starts at the log's end** (`create_table`: `tiered = lake.visible()`). A table's
    log rows are those after `tiered`; starting at 0, a table re-created after `DROP TABLE` read
    the dropped one's rows still in the log (`harness.py schemas`: "a new table of its name is
-   empty" fails without it).
+   empty" fails without it). A table an INSERT makes starts there too (`write::record`):
+   `history_check.py`'s "an INSERT under a renamed table's old name makes a table of its own rows only".
 51. **A node plans stored views after its shares are in place** (`spmd::plan`:
    `query::register_views` again). A `ViewTable` keeps the table it was planned over; planned
    over whole tables, a spread query over a view counted every row once per node
@@ -1654,7 +1655,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    every SQL write to a table with an enforced UNIQUE goes to the change path (`write::changes`),
    whose `constraints::check` runs under the lake's lock against the table at `visible()`, and the
    sequencer takes that table's rows only from a flush the change path made (`Flush::checked`,
-   never sent between nodes; `constraints::sequenced`). The other doors refuse the table by name. A
+   never sent between nodes; the sequencer's check, `log::commit`). The other doors refuse the table by name. A
    UNIQUE added to a table is committed before the rows there are checked (with one flush through
    the sequencer between, so those sequenced before it are in), and put back if two share a value.
    Without `checked`, an `ALTER TABLE … ADD CONSTRAINT` raced by a node that hadn't seen it would let
@@ -1959,17 +1960,15 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 281. **A swap exchanges two tables alike but for their rows, in one commit, and leaves no row of
    either under the other's name** (`ddl::swap`, `exchange`): both tables' log rows go to files
    first; every moved entry, its `$deleted` too, takes the largest of the four `tiered` marks (the
-   log between two marks holds the other's rows, already in its files); and since appends don't take
-   the lake's lock, the log is read again just before the commit, and a row past its table's own
-   mark makes the swap take another round. A row after that is past the mark and shows under the
-   name it was written to. Each entry keeps its folder; comments, indexes, grants and stored views
+   log between two marks holds the other's rows, already in its files); and the four tables' appends are held
+   while the entries move (invariant 283). Each entry keeps its folder; comments, indexes, grants and stored views
    stay with the names. Alike is the same `objects::table_sql` and stored columns. Refused by name:
    a view, a materialized view or a part of one, a hidden table, one a materialized view or a task
    follows, a shared or published table, an attached lake's. A clone's shared identity sequence goes
    only when no table, live or kept dropped, names it (`seq::drop_owned`). `history_check.py`:
    "ALTER TABLE … SWAP WITH…", "…one with every row in files and one with rows in the log…" (fails
    with the marks left as they were), "…a follower reads…", "…a writer inserting into one of them
-   while they swap again and again…" (a row lost in 3 of 4 runs without the second look), "SWAP
+   while they swap again and again…" (a row lost in 3 of 4 runs with neither the hold nor a second look at the log), "SWAP
    refused by name…", "a clone's identity sequence outlives…".
 
 282. **A Git folder only moves its branch forward and loses no one's work, and a git token goes only where its
@@ -1983,14 +1982,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and on main: git_pull refused…", "a file deleted here and on main…", "refused by name: … a secret named that
    doesn't cover the repository, a token over plain http to another machine…" and "…none of them asked the
    repository anything".
-283. **Commits wait for tiering only while tiering can run** (`log::Backpressure`, `Lake::tiering`):
-   while more than `--backlog` rows wait in the log, the sequencer holds commits back, but only while
-   the lake's lock is free or a tiering round holds it (`server::Tiering`: on once the round has the
-   lock, off once it has let it go). Tiering needs that lock, and whoever else holds it (a view running
-   its query again, a change, a fill) may be waiting for the very commit held back: with every commit
-   held, Nexmark's twenty views stopped every write, one run in four. `harness.py backpressure`: "150
-   writes, each in time" times out at the 11th write without it; "never half of 8,000 rows in the
-   log" fails if commits never wait.
+283. **A table's entry moves only with its appends held, and rows go only into a table that is there** (`ddl::still`,
+   `Sequencer::hold`, `log::commit`): a rename, a swap, a kept drop and a clone send the tables' rows to files, hold their
+   appends (a flush with rows for one goes back to its node, which sends it again, later each time), wait until every
+   flush sequenced before is committed, send what came meanwhile to files, and only then commit. The sequencer refuses
+   rows for a name with no table (`Ack::gone`: "no table t"), since a node may not have seen it renamed or dropped yet.
+   Backpressure pauses commits only while tiering can run, the lake's lock free or held by tiering (`log::Pace`,
+   `Sequencer::tiering`): anyone else holding it may be waiting for that round. `history_check.py`: "a table renamed
+   back and forth 200 times while two nodes append to it…", "…dropped and undropped 20 times…", "…while they swap again
+   and again: every swap goes through at once…", "while writes wait for tiering (backpressure), an UPDATE and a rename
+   answer at once…"; `harness.py backpressure`: "150 writes, each in time" (twenty views running their queries again)
+   times out at the 11th write with every commit paused, and "never half of 8,000 rows in the log" fails if none is.
 284. **A view of windows is kept by key only when each key's rows come from that key's rows alone**
    (`rerun::window_keys`, `partitioned`, `within`): one table read alone under its windows, or
    tables inner-joined on them (`joined`: each table has a column of the key's type equal to each
@@ -2011,6 +2013,21 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (two windows sharing `region`), `led` (a join on the key, its other table changed too) == ad hoc
    through changes, three nodes and a restart; "a key not selected (a window's too)", "a join not on
    the windows' key", "a keyed table joined".
+285. **A view's run does its work before the lake's lock and away from the writes, and goes early only once its
+   tables are still** (`rerun::run`, `turn`, `panics::aside`): a run works out its rows, reads the view's rows as
+   they are and compares them before it takes the lock; under it they stand when the view's table has the same
+   columns and no commit has changed it since (only its own runs write it), else they are read and compared again
+   there. So the lock is held for the commit: at 2M Nexmark events q18's run held it 1.9 s, every other view's
+   waiting, and 0.4 s now. Runs start on the queries' runtime (`panics::aside`, as invariant 231's requests): on
+   the node's, a writer's acks beside eight busy views were 19–22 ms against 5–6 ms alone. A view runs again after
+   twice its work (ten times for a run of its whole query); once what it reads has been still a second since a
+   change its last run didn't see, it runs then, if its runs still take at most half the time, once a wait, and
+   again only when a change overtook that run while it ran. With no early run a burst's last row waited out the
+   pace; with one at every stillness a stream sent in batches (still between them) was sent slower; with one alone,
+   q5 ran while the stream's last windows were being emitted and answered four seconds after that run
+   (`logs/round34/nexmark-windows-by-key.json`). `harness.py refreshed`: "a burst's last row is answered within a
+   few seconds…" (9.1 s without the early run); `harness.py pace`: "…beside eight views running their queries
+   again…" fails with runs on the node's runtime.
 
 ## Tests: run these before and after any change
 
