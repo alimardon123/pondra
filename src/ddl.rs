@@ -1031,8 +1031,7 @@ async fn swap(lake: &Lake, name: &str, with: &str) -> Result<Value> {
     // other table's name after the swap.
     let (da, db) = (crate::sys::deleted(&a), crate::sys::deleted(&b));
     for _ in 0..10 {
-        if to_files(lake, &[a.clone(), da.clone(), b.clone(), db.clone()]).await? {
-            exchange(lake, &a, &b).await?;
+        if to_files(lake, &[a.clone(), da.clone(), b.clone(), db.clone()]).await? && exchange(lake, &a, &b).await? {
             return Ok(j!({"table": a, "swapped": b}));
         }
     }
@@ -1073,13 +1072,24 @@ async fn alike(lake: &Lake, a: &str, b: &str) -> Result<()> {
 /// entry (or none, when the other had none), keeping the folder it had. Every moved entry takes the
 /// largest of the four `tiered` marks: a table reads its log rows after its mark, by name, and the
 /// log between the two marks holds rows the other table wrote under this name, already in its files.
-/// Nothing of either table is in the log past its own mark (`to_files`), so moving a mark up skips
-/// nothing of its own.
-async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<()> {
+/// Moving a mark up must skip nothing of a table's own, and writes into the log don't wait for the
+/// lake's lock: a row that landed after `to_files` looked at its table may sit under the new mark. So
+/// the log is read again up to now, for all four, and the swap waits for another round (false) if
+/// one has a row past its own mark. A row landing after that is numbered past `mark`, so it shows
+/// under the name it was written to.
+async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<bool> {
     let (da, db) = (crate::sys::deleted(a), crate::sys::deleted(b));
     let (ea, eb) = (lake.cat.get::<TableMeta>(&table_key(a)).await?, lake.cat.get::<TableMeta>(&table_key(b)).await?);
     let (eda, edb) = (lake.cat.get::<TableMeta>(&table_key(&da)).await?, lake.cat.get::<TableMeta>(&table_key(&db)).await?);
     let mark = [&ea, &eb, &eda, &edb].into_iter().flatten().map(|m| m.tiered).max().unwrap_or(0);
+    let marks: Vec<(&str, u64)> = [(a, &ea), (b, &eb), (&da[..], &eda), (&db[..], &edb)].into_iter().filter_map(|(t, m)| m.as_ref().map(|m| (t, m.tiered))).collect();
+    let (from, upto) = (marks.iter().map(|(_, t)| *t).min().unwrap_or(mark), lake.visible());
+    for (k, s) in lake.cat.scan::<crate::store::Segment>(&crate::store::seg_key(from + 1), &crate::store::seg_key(upto + 1)).await? {
+        let n: u64 = k[2..].parse()?;
+        if marks.iter().any(|(t, tiered)| n > *tiered && s.parts.contains_key(*t)) {
+            return Ok(false);
+        }
+    }
     let (mut puts, mut gone) = (vec![], vec![]);
     for (to, from, from_name) in [(a, eb, b), (b, ea, a), (&da[..], edb, &db[..]), (&db[..], eda, &da[..])] {
         match from {
@@ -1091,7 +1101,8 @@ async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<()> {
             None => gone.push(table_key(to)), // (the other had no changed rows: none is left under this name)
         }
     }
-    lake.cat.commit(puts, &gone).await
+    lake.cat.commit(puts, &gone).await?;
+    Ok(true)
 }
 
 /// A folder under `data/` for a new table: its name's, unless another table has that one (a

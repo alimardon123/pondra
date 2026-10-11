@@ -11,7 +11,7 @@ is dropped; `--retain-secs 1`, so the log's segments go soon after; `PONDRA_PURG
 changed rows leave the table's files every round and only `t$deleted` has their old versions. Prints the checks as JSON and
 exits 1 if one fails (the lake and the node's log are then kept in --work).
 """
-import argparse, datetime, json, os, shutil, sys, tempfile, time
+import argparse, datetime, json, os, random, shutil, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -238,12 +238,26 @@ def history_check(bin, work, port):
     q("UPDATE ow_wap SET v = 'B' WHERE id = 2")
     wap_ids = rows("SELECT id, _row_id FROM ow_wap ORDER BY id")
     q("INSERT INTO ow VALUES (5, 'e')")  # (still in the log when they swap)
+    f = Node(bin, lake, port + 1, work, "--retain-secs", "1", env={"PONDRA_PURGE_ROWS": "1"}).start()  # (a follower)
+
+    def on_follower(sql, want):  # (what the follower reads once it has the leader's commits, or after 15 s)
+        deadline = time.time() + 15
+        while True:
+            got = [tuple(r.values()) for r in f.q(sql)]
+            if got == want or time.time() > deadline:
+                return got
+            time.sleep(0.2)
+
+    both = "SELECT 'ow' AS t, id, v, _row_id FROM ow UNION ALL SELECT 'ow_wap', id, v, _row_id FROM ow_wap ORDER BY 1, 2"
+    warm = on_follower(both, rows(both)) == rows(both)  # (the follower's log tails kept from before the swap)
     q("ALTER TABLE ow SWAP WITH ow_wap")
+    followed_swap = warm and on_follower(both, rows(both)) == rows(both)
     checks["ALTER TABLE … SWAP WITH: each table's rows (ids, changes, those in the log) under the other's name; the view and the comment stay with the name"] = \
         rows("SELECT id, v FROM ow ORDER BY id") == [(1, "a"), (2, "B"), (3, "c"), (4, "d")] \
         and rows("SELECT id FROM ow_wap ORDER BY id") == [(1,), (2,), (3,), (5,)] \
         and rows("SELECT id, _row_id FROM ow ORDER BY id") == wap_ids and rows("SELECT n FROM ow_count") == [(4,)] \
         and "COMMENT ON TABLE ow IS 'the orders'" in q("SHOW CREATE TABLE ow")[0]["definition"]
+    checks["…a follower reads each table's rows under its new name, its log tails kept from before"] = followed_swap
     before = (rows("SELECT id, v FROM ow ORDER BY id"), rows("SELECT id, v FROM ow_wap ORDER BY id"))
     q("CHECKPOINT")
     tiered = (rows("SELECT id, v FROM ow ORDER BY id"), rows("SELECT id, v FROM ow_wap ORDER BY id"))
@@ -253,6 +267,14 @@ def history_check(bin, work, port):
     checks["…the same after tiering, and both take writes and changes"] = \
         tiered == before and rows("SELECT id, v FROM ow ORDER BY id") == [(1, "x"), (2, "B"), (3, "c"), (4, "d"), (6, "f")] \
         and rows("SELECT id, v FROM ow_wap ORDER BY id") == [(1, "a"), (2, "b"), (3, "c")]
+    q("CREATE TABLE mk (id BIGINT)")
+    q("INSERT INTO mk VALUES (1)")
+    q("CHECKPOINT")  # (mk's rows in files, its mark there)
+    q("CREATE TABLE mk2 CLONE mk")
+    q("INSERT INTO mk2 VALUES (2)")  # (in the log, past mk's mark)
+    q("ALTER TABLE mk SWAP WITH mk2")
+    checks["…one with every row in files and one with rows in the log: neither reads the other's log rows"] = \
+        rows("SELECT id FROM mk ORDER BY id") == [(1,), (2,)] and rows("SELECT id FROM mk2 ORDER BY id") == [(1,)]
     ow_rows, wap_rows = rows("SELECT id, v FROM ow ORDER BY id"), rows("SELECT id, v FROM ow_wap ORDER BY id")
     q("DROP TABLE ow_wap")
     q("UNDROP TABLE ow_wap")
@@ -278,19 +300,58 @@ def history_check(bin, work, port):
     checks["SWAP refused by name: itself, a view, tables not alike, one a materialized view follows, a published one (either side), a shared one"] = \
         "itself" in itself and "is a view" in as_view and "differ in more than their rows" in unlike and "followed by" in followed \
         and "published" in published and "published" in published_b and "is in share ow_share" in shared
+    # A writer inserting into one of two tables while they swap again and again. A row that lands while a
+    # swap puts the other table's rows in files sits under the mark the swap gives both, unless it looks again.
+    q("CREATE TABLE wr (id BIGINT, v VARCHAR)")
+    q("INSERT INTO wr VALUES (0, 'first')")
+    q("CREATE TABLE wr2 CLONE wr")
+    acked, stop = [], threading.Event()
+
+    def writer():
+        i = 0
+        while not stop.is_set():
+            i += 1
+            q(f"INSERT INTO wr VALUES ({i}, 'written')")
+            acked.append(i)
+            time.sleep(random.random() * 0.005)
+
+    w = threading.Thread(target=writer)
+    w.start()
+    swapped, tries, deadline = 0, 0, time.time() + 60
+    try:
+        while swapped < 300 and time.time() < deadline:  # (the unchecked swap lost a row in 3 of 4 runs)
+            tries += 1
+            q(f"INSERT INTO wr2 VALUES ({100000 + tries}, 'staged')")  # (rows of the other table's to put in files too)
+            try:
+                q("ALTER TABLE wr SWAP WITH wr2")
+                swapped += 1
+            except Failed as e:
+                if "kept taking rows" not in str(e):
+                    raise
+    finally:
+        stop.set()
+        w.join()
+    written = [i for (i,) in rows("SELECT id FROM wr UNION ALL SELECT id FROM wr2") if 0 < i < 100000]
+    checks["…a writer inserting into one of them while they swap again and again: every row in one of them, once"] = \
+        swapped >= 100 and sorted(written) == sorted(set(written)) and set(written) == set(acked)
+    print(f"(swapped {swapped} times in {tries} tries, beside {len(acked)} inserts)", file=sys.stderr)
     q("CREATE TABLE sq (id BIGINT GENERATED ALWAYS AS IDENTITY, v VARCHAR)")
     q("INSERT INTO sq (v) VALUES ('a')")
     q("CREATE TABLE sq2 CLONE sq")
     q("DROP TABLE sq2 PURGE")
-    q("INSERT INTO sq (v) VALUES ('b')")  # (the source's sequence outlived its clone)
-    q("CREATE TABLE sq3 CLONE sq")
-    q("DROP TABLE sq PURGE")
-    q("INSERT INTO sq3 (v) VALUES ('c')")  # (and the clone's, its source)
-    distinct = rows("SELECT count(DISTINCT id), count(*) FROM sq3")
+    try:
+        q("INSERT INTO sq (v) VALUES ('b')")  # (the source's sequence outlived its clone)
+        q("CREATE TABLE sq3 CLONE sq")
+        q("DROP TABLE sq PURGE")
+        q("INSERT INTO sq3 (v) VALUES ('c')")  # (and the clone's, its source)
+        distinct = rows("SELECT count(DISTINCT id), count(*) FROM sq3")
+    except Failed as e:
+        distinct = [(str(e), None)]
     checks["a clone's identity sequence outlives the clone, and its source: DROP … PURGE of either leaves the other numbering rows"] = \
         distinct[0][0] == distinct[0][1] == 3
 
     # From `pondra sql`, with no node running.
+    f.stop()
     n.stop()
     cli(bin, lake, "DROP TABLE t_second")
     cli(bin, lake, "UNDROP TABLE t_second")
