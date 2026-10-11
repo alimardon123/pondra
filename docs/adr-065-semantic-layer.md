@@ -30,7 +30,7 @@ connector. Snowflake's semantic views are a new kind of object with its own DDL.
   one field. Exact names first, then by the first field that holds the words (name, comment,
   definition; a concept's name, also, about), then shorter names. Columns `rank, is, kind, lake,
   schema, object, name, about, matched`.
-- Both are text where SQL comes in (`objects::functions_in`, as `pondra.parameters` is), so they work
+- Both are text where SQL comes in (`find::functions_in`, as `pondra.parameters` is), so they work
   at every door: HTTP, Postgres, Flight, the shell, frames. MCP's `find` tool is the same query, and
   `db.find(text, kind=…)` in Python and JavaScript. Neither is ever a remembered answer.
 - A kind added to the registry is found as soon as its lister yields it. E13's `list_metrics` and
@@ -106,7 +106,7 @@ proposed from `pondra.history`) follow E13 after 1.0's freeze unless asked soone
 
 ## Invariants
 
-345. **`pondra.parts` and `pondra.find` show only what the caller may see** (`objects::parts`, `found`):
+345. **`pondra.parts` and `pondra.find` show only what the caller may see** (`find::parts`, `find::found`):
    parts come only from the objects `objects::list` gave the caller; a user granted some columns of a
    table sees those columns and no other part of it, and that table's definition is not shown. Neither
    is a remembered answer. `harness.py find`: "a user granted one table…", "a user granted some
