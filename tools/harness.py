@@ -6959,7 +6959,8 @@ def first():
     makes another through the bucket, with the node up or with none; the lake keeps only its hash. A
     node on 127.0.0.1 stays open; `serve --lakes` on the network with no token refuses to start; a
     node with an admin token makes no user at all. A node on the network is never open: a follower of
-    a lake with no user yet answers no one until `pondra token` makes one."""
+    a lake with no user yet answers no one until `pondra token` makes one. `pondra sql` with no token
+    writes there with the lake's own key for its nodes."""
     import re
     import psycopg
     checks = {}
@@ -7018,6 +7019,14 @@ def first():
     n3 = Node(lake, port, host="0.0.0.0", pg=f"0.0.0.0:{pg}").start()
     checks["...and with no node (it leads for a moment): that token works too; nothing of any token is in the lake's files"] = made.returncode == 0 \
         and t3.startswith("pt_") and answer(port, "/sql", b"SELECT 1 AS x", t3)[0] == 200 and not any(in_lake(t.encode()) for t in (token, t2, t3) if t)
+
+    # (pondra sql with no token, while that leader serves: it sends the lake's own key for its nodes)
+    answer(port, "/sql", b"CREATE TABLE w (x BIGINT)", t3)
+    bare = {k: v for k, v in os.environ.items() if k not in ("PONDRA_TOKEN", "PONDRA_ADMIN_TOKEN", "PONDRA_NODE_KEY", "PONDRA_OWNER_KEY")}
+    wrote = [subprocess.run([BIN, "sql", "--dir", lake, q], capture_output=True, text=True, timeout=120, env=bare) for q in ("INSERT INTO w VALUES (1)", "INSERT INTO w SELECT x + 1 FROM w")]
+    rows = lambda: json.loads(answer(port, "/sql", b"SELECT count(*) AS n FROM w", t3)[1])[0]["n"]
+    checks["pondra sql writes to a lake its leader on the network serves, with no token (the lake's own key for its nodes): a row through the log, then a bulk INSERT"] = \
+        all(w.returncode == 0 for w in wrote) and until(rows, 2) == 2
 
     open_node = Node(new_lake(), port + 1).start()  # (127.0.0.1 only: open, as it always was)
     made_open = answer(port + 1, "/sql", b"CREATE TABLE t AS SELECT 1 AS x")[0] == 200 and json.loads(answer(port + 1, "/sql", b"SELECT x FROM t")[1]) == [{"x": 1}]

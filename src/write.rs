@@ -1728,6 +1728,13 @@ async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
             crate::ddl::sync(&lake, "", false).await?; // (lakes attached by ATTACH: read here too)
             let (other, table) = crate::ddl::resolve(&lake, &stmt.table()).await?;
             let (stmt, target) = (stmt.on(table.clone()), other.unwrap_or_else(|| lake.clone())); // (a write to an attached lake goes to its leader)
+            if ["PONDRA_TOKEN", "PONDRA_ADMIN_TOKEN", "PONDRA_NODE_KEY"].iter().all(|v| std::env::var(v).map_or(true, |t| t.is_empty())) {
+                // (no token: the lake's own key for its nodes, which whoever holds the lake can read; a
+                // leader on the network answers nothing unsigned. `cluster::http` sends it.)
+                if let Ok(k) = crate::users::node_key(&target).await {
+                    std::env::set_var("PONDRA_NODE_KEY", k);
+                }
+            }
             (Some(prepare(&lake, &target, &table, &stmt, &job, true).await?), stmt, target.url.clone())
         }
         Err(_) => (None, stmt, dir.to_string()),
@@ -1922,6 +1929,9 @@ async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value>
         None => call,
     };
     let res = call.send().await?;
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        bail!("the leader at {addr} asks for a sign-in: set PONDRA_TOKEN to one of the lake's tokens ({})", res.text().await?);
+    }
     ensure!(res.status().is_success(), "the leader at {addr}: {}", res.text().await?);
     Ok(res.json().await?)
 }
