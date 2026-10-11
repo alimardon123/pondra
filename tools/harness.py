@@ -9742,8 +9742,8 @@ def dialects():
     FROM, DELETE, INSERT … ON CONFLICT and MERGE, its own columns kept apart from the system ones
     (`change::select_as` named both `__o_created_at`, and every change of such a table failed)."""
     import dialects_check
-    FLOOR = {"postgres": 36, "duckdb": 31, "snowflake": 13, "spark": 10, "mysql": 17, "bigquery": 12, "sqlserver": 6}
-    XX000 = 999  # (refusals that are internal errors: lower it as they get codes, never raise it)
+    FLOOR = {"postgres": 41, "duckdb": 31, "snowflake": 13, "spark": 10, "mysql": 19, "bigquery": 12, "sqlserver": 6}
+    XX000 = 26  # (refusals that are internal errors: lower it as they get codes, never raise it)
     lake = new_lake()
     node = Node(lake, A.port).start()
     q = lambda s: sql(A.port, s)

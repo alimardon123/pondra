@@ -124,8 +124,10 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
             Done::Said("SET")
         }
         Statement::Set(Set::SetNamesDefault {}) => Done::Said("SET"),
-        Statement::Set(Set::ParenthesizedAssignments { .. }) => {
-            return Err(crate::codes::coded("0A000", "SET (a, b) = (…) is Snowflake's for variables: here a variable is $a = 1, or DECLARE $a INT = 1, and $a reads it"))
+        Statement::Set(Set::ParenthesizedAssignments { variables, values }) => {
+            let each = variables.iter().zip(values).map(|(n, v)| format!("${n} = {v}")).collect::<Vec<_>>().join("; ");
+            let first = variables.first().map(|n| format!("${n}")).unwrap_or_default();
+            return Err(crate::codes::coded("0A000", format!("SET (…) = (…) is Snowflake's for variables: here each is set on its own, {each} (or DECLARE {first} INT = …), and {first} reads it")));
         }
         Statement::Set(other) => return Err(crate::codes::coded("0A000", format!("{other}: not a setting here (SET name = value, or SHOW name)"))),
         Statement::Reset(r) => {
@@ -181,6 +183,7 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
 fn name(n: &str) -> String {
     match n.to_lowercase().as_str() {
         "timezone" | "time.zone" | "time zone" => "datafusion.execution.time_zone".into(),
+        "threads" | "worker_threads" => "datafusion.execution.target_partitions".into(), // (DuckDB's: how many parts a query runs in at once)
         n => n.into(),
     }
 }
@@ -218,13 +221,11 @@ const ONE_WAY: &[(&str, &[&str], &str, &str)] = &[
 const THE_NODES: &[(&str, &str)] = &[
     ("memory_limit", "start the node with --memory-gb (PONDRA_MEMORY_GB)"),
     ("max_memory", "start the node with --memory-gb (PONDRA_MEMORY_GB)"),
-    ("threads", "SET datafusion.execution.target_partitions = 4 runs this session's queries in that many parts"),
-    ("worker_threads", "SET datafusion.execution.target_partitions = 4 runs this session's queries in that many parts"),
     ("temp_directory", "spill files go to the system's temporary folder (TMPDIR)"),
 ];
 
-const SERIALIZABLE: &str = "SERIALIZABLE isn't kept here: a transaction is one snapshot, and a row another commit changed meanwhile refuses its COMMIT (40001), as Postgres's REPEATABLE READ does: SET TRANSACTION ISOLATION LEVEL REPEATABLE READ";
-const READ_ONLY: &str = "a read-only transaction isn't kept here: a session writes as far as its sign-in may, so sign in as a user granted SELECT only for reads that can't write";
+pub const SERIALIZABLE: &str = "SERIALIZABLE isn't kept here: a transaction is one snapshot, and a row another commit changed meanwhile refuses its COMMIT (40001), as Postgres's REPEATABLE READ does: SET TRANSACTION ISOLATION LEVEL REPEATABLE READ";
+pub const READ_ONLY: &str = "a read-only transaction isn't kept here: a session writes as far as its sign-in may, so sign in as a user granted SELECT only for reads that can't write";
 
 /// Is this value of a setting one `ONE_WAY` refuses? (Its SQLSTATE and why.) `DateStyle` takes any
 /// order of days and months, but only ISO's output.
