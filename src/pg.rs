@@ -458,7 +458,7 @@ fn pg_dialect(lake: &crate::store::Lake, sql: &str, user: &str) -> String {
     let sql = if sql.eq_ignore_ascii_case("select version()") { "SELECT version() AS version".into() } else { sql }; // (the column's name in Postgres)
     // (the ADBC driver's list of types: receive functions are names here, not function ids)
     let sql = sql.replace("(typreceive != 0 OR typsend != 0)", "true").replace("typreceive::TEXT", "typreceive");
-    sql.replace("current_schema()", &format!("'{schema}'")).replace("CURRENT_SCHEMA()", &format!("'{schema}'")).replace("current_database()", &format!("'{}'", crate::ddl::lake_name(lake))).replace("version()", "'PostgreSQL 16.0 (Pondra on Apache DataFusion)'")
+    sql.replace("version()", "'PostgreSQL 16.0 (Pondra on Apache DataFusion)'") // (current_schema() and current_database() are `path::door`'s, at every door)
 }
 
 /// The command tag Postgres answers a write with: `INSERT 0 3`, `UPDATE 2`, `SELECT 5` for a
@@ -893,7 +893,8 @@ impl Backend {
     }
 
     /// `sql` with the session's search path written in (`path.rs`). Only a session that set one:
-    /// without, `pg_dialect` answers `current_schema()`, and drivers' catalog queries go on as sent.
+    /// without, `routines::expand` still answers `current_schema()` (as `door` does for every door),
+    /// and drivers' catalog queries go on as sent.
     async fn placed(&self, sql: String) -> PgWireResult<String> {
         match crate::path::current(&self.app.lake) {
             Some(_) => crate::path::door(&self.app.lake, &sql, &Default::default()).await.map_err(user_error),

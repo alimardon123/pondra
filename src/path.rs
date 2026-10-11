@@ -161,6 +161,8 @@ pub async fn door(lake: &Lake, sql: &str, skip: &HashSet<String>) -> Result<Stri
         None if !mentions_current(sql) => return Ok(sql.to_string()),
         None => Path::plain(&lake_name(lake)),
     };
+    let inlined = crate::sparksql::inline(sql)?; // (`spark_sql('…')` first: its text is placed like any SQL's)
+    let sql = inlined.as_str();
     if let Some(out) = head(lake, &path, sql, &HEADS).await? {
         return Ok(out);
     }
@@ -176,6 +178,82 @@ pub async fn door(lake: &Lake, sql: &str, skip: &HashSet<String>) -> Result<Stri
         return Ok(sql.to_string());
     }
     Ok(stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n"))
+}
+
+/// Stored SQL (a view's query) with its `current_*` as the reader's session has them: its path, else
+/// this lake's public. Its names stay as they were made, so a view made under `USE crm` reads `crm.t`
+/// whoever reads it. Text with no `current_*` is returned at once, unparsed.
+pub fn currents(lake: &Lake, sql: &str) -> String {
+    if !mentions_current(sql) {
+        return sql.to_string();
+    }
+    let path = current(lake).unwrap_or_else(|| Path::plain(&lake_name(lake)));
+    currents_of(&path, sql)
+}
+
+/// `currents` for a path given: `current_*` written as `path`'s names. Text that doesn't parse, or
+/// has none, comes back as it came.
+fn currents_of(path: &Path, sql: &str) -> String {
+    let Some(mut stmts) = parse_text(sql) else { return sql.to_string() };
+    let mut walk = Currents { path, changed: false };
+    for s in stmts.iter_mut() {
+        let _ = s.visit(&mut walk);
+    }
+    match walk.changed {
+        true => stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n"),
+        false => sql.to_string(),
+    }
+}
+
+/// Writes a reader's `current_*` into a stored view's text (`currents_of`); nothing else changes.
+struct Currents<'a> {
+    path: &'a Path,
+    changed: bool,
+}
+
+impl VisitorMut for Currents<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        if let Some(w) = current_word(e) {
+            *e = current_value(self.path, &w);
+            self.changed = true;
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Does `sql` read a stored view whose text names `current_*`, or a view that does (read by one that
+/// reads it)? Such a query answers each session its own way, so it runs where its session is and is
+/// never kept. Any error says yes: the caller then neither spreads the query nor keeps its answer.
+pub async fn reads_current(lake: &Lake, sql: &str) -> bool {
+    stored_current(lake, sql).await.unwrap_or(true)
+}
+
+/// `reads_current`, with its errors: the stored views `sql` names, and the views those name, read as
+/// they were made (not expanded). Each view is looked at once.
+async fn stored_current(lake: &Lake, sql: &str) -> Result<bool> {
+    let stored = lake.cat.scan_raw("q/", "q0").await?; // (as `query::stored_views` reads them)
+    let (mut text, mut seen) = (sql.to_string(), HashSet::<String>::new());
+    loop {
+        let mut found = false;
+        for (k, raw) in &stored {
+            let name = &k[2..];
+            if seen.contains(name) || !ddl::mentions(&text, name) {
+                continue;
+            }
+            let v: ddl::StoredView = serde_json::from_slice(raw)?;
+            if mentions_current(&v.sql) {
+                return Ok(true);
+            }
+            text.push_str(&format!(" {}", v.sql));
+            seen.insert(name.to_string());
+            found = true;
+        }
+        if !found {
+            return Ok(false);
+        }
+    }
 }
 
 /// A name's parts as SQL means them: a quoted part as it is written, an unquoted one in lower case
@@ -443,6 +521,7 @@ struct Walk<'a> {
     temp: Vec<String>,        // the session's temporary tables and views, and the tables sent with the request
     wanted: Vec<(Fam, String)>,
     changed: bool,
+    view: bool,               // inside a stored view's query: its current_* stay, worked out as each reader reads it (`currents`)
 }
 
 impl<'a> Walk<'a> {
@@ -450,7 +529,7 @@ impl<'a> Walk<'a> {
         let (tables, views) = crate::temp::listed();
         let sent = crate::query::SENT.try_with(|t| t.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()).unwrap_or_default();
         let temp = tables.into_iter().map(|(n, _)| n).chain(views.into_iter().map(|(n, _)| n)).chain(sent).collect();
-        Walk { path, skip, world, ctes: vec![], temp, wanted: vec![], changed: false }
+        Walk { path, skip, world, ctes: vec![], temp, wanted: vec![], changed: false, view: false }
     }
 
     /// Names a name the path never changes: a CTE, a temporary table, a table sent with the request
@@ -524,13 +603,12 @@ impl<'a> Walk<'a> {
     }
 
     /// `current_database()`, `current_catalog()` and `current_schema()` (or the bare words): the
-    /// session's names, as text.
+    /// session's names, as text. A stored view's stay (a reader's session has its own).
     fn current(&mut self, e: &mut Expr, word: &str) {
-        if self.world.is_none() {
+        if self.world.is_none() || self.view {
             return;
         }
-        let value = if word == "current_schema" { self.path.schema() } else { self.path.database() };
-        *e = Expr::Value(Value::SingleQuotedString(value.to_string()).into());
+        *e = current_value(self.path, word);
         self.changed = true;
     }
 
@@ -585,18 +663,16 @@ impl VisitorMut for Walk<'_> {
     }
 
     fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
-        let word = match e {
-            Expr::Function(f) => one_part(&f.name),
-            Expr::Identifier(i) if i.quote_style.is_none() => Some(i.value.to_lowercase()),
-            _ => None,
-        };
-        match (word.as_deref(), e) {
-            (Some(w @ ("current_database" | "current_catalog" | "current_schema")), e) => self.current(e, w),
-            (Some("nextval" | "currval" | "setval"), Expr::Function(f)) => self.sequence_arg(f),
-            (_, Expr::Function(f)) => {
+        if let Some(w) = current_word(e) {
+            self.current(e, &w);
+            return ControlFlow::Continue(());
+        }
+        match e {
+            Expr::Function(f) if matches!(one_part(&f.name).as_deref(), Some("nextval" | "currval" | "setval")) => self.sequence_arg(f),
+            Expr::Function(f) => {
                 self.name(&mut f.name, Fam::Routine, false);
             }
-            (_, Expr::Cast { data_type, .. }) => self.ty(data_type),
+            Expr::Cast { data_type, .. } => self.ty(data_type),
             _ => {}
         }
         ControlFlow::Continue(())
@@ -626,6 +702,9 @@ impl VisitorMut for Walk<'_> {
             Statement::CreateView(v) => {
                 if !v.temporary {
                     self.name(&mut v.name, Fam::Relation, true);
+                }
+                if !v.materialized && !v.temporary {
+                    self.view = true; // (a materialized view computes its rows now; a temporary one is the session's)
                 }
             }
             Statement::CreateIndex(i) => {
@@ -657,8 +736,17 @@ impl VisitorMut for Walk<'_> {
             Statement::AlterTable(a) => {
                 self.name(&mut a.name, Fam::Relation, false);
             }
-            Statement::AlterView { name, .. } | Statement::AlterIndex { name, .. } => {
+            Statement::AlterView { name, .. } => {
                 self.name(name, Fam::Relation, false);
+                self.view = true; // (ALTER VIEW v AS query: a stored view's query, as CREATE VIEW's is)
+            }
+            Statement::AlterIndex { name, .. } => {
+                self.name(name, Fam::Relation, false);
+            }
+            Statement::ShowColumns { show_options, .. } => {
+                if let Some(ast::ShowStatementIn { parent_name: Some(n), .. }) = &mut show_options.show_in {
+                    self.name(n, Fam::Relation, false); // (SHOW COLUMNS FROM t: the table is placed)
+                }
             }
             Statement::AlterType(a) => {
                 self.name(&mut a.name, Fam::Type, false);
@@ -711,6 +799,14 @@ impl VisitorMut for Walk<'_> {
         }
         ControlFlow::Continue(())
     }
+
+    /// A stored view's statement ends here: what follows is the session's again.
+    fn post_visit_statement(&mut self, s: &mut Statement) -> ControlFlow<()> {
+        if matches!(s, Statement::CreateView(_) | Statement::AlterView { .. }) {
+            self.view = false;
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// A function's name, when it has one part (the lower-case word).
@@ -719,6 +815,23 @@ fn one_part(name: &ObjectName) -> Option<String> {
         [p] => p.as_ident().map(crate::write::ident),
         _ => None,
     }
+}
+
+/// The `current_*` word an expression is: `current_database`, `current_catalog` or `current_schema`,
+/// called with no arguments or written bare (unquoted). None for anything else.
+fn current_word(e: &Expr) -> Option<String> {
+    let word = match e {
+        Expr::Function(f) => one_part(&f.name),
+        Expr::Identifier(i) if i.quote_style.is_none() => Some(i.value.to_lowercase()),
+        _ => None,
+    }?;
+    matches!(word.as_str(), "current_database" | "current_catalog" | "current_schema").then_some(word)
+}
+
+/// What a `current_*` word is in `path`: the schema for `current_schema`, else the database, as text.
+fn current_value(path: &Path, word: &str) -> Expr {
+    let value = if word == "current_schema" { path.schema() } else { path.database() };
+    Expr::Value(Value::SingleQuotedString(value.to_string()).into())
 }
 
 #[cfg(test)]
@@ -810,6 +923,28 @@ mod tests {
         assert!(rewrite(&crm, &none, "DROP TABLE t").contains("DROP TABLE crm.t"));
         assert!(rewrite(&crm, &none, "COMMENT ON COLUMN t.a IS 'x'").contains("crm.t.a"));
         assert!(rewrite(&crm, &none, "TRUNCATE TABLE t").contains("TRUNCATE TABLE crm.t"));
+        assert!(rewrite(&crm, &none, "SHOW COLUMNS FROM t").contains("crm.t"), "SHOW COLUMNS names its table");
+    }
+
+    #[test]
+    fn keeps_a_views_current_names_for_its_readers() {
+        let crm = parse("lake", "crm");
+        let none = world(&[], &[]);
+        let v = rewrite(&crm, &none, "CREATE VIEW v AS SELECT current_schema() AS s FROM t");
+        assert!(v.contains("CREATE VIEW crm.v") && v.contains("FROM crm.t") && v.contains("current_schema()"), "{v}");
+        let m = rewrite(&crm, &none, "CREATE MATERIALIZED VIEW m AS SELECT current_schema() AS s");
+        assert!(m.contains("'crm'") && !m.contains("current_schema"), "a materialized view computes its rows now: {m}");
+        assert!(rewrite(&crm, &none, "SELECT current_schema() AS s").contains("'crm'"));
+        let two = rewrite(&crm, &none, "CREATE VIEW v AS SELECT current_schema() AS s; SELECT current_schema() AS s");
+        assert!(two.contains("SELECT 'crm' AS s"), "the view's flag ends with its statement: {two}");
+    }
+
+    #[test]
+    fn reads_a_stored_views_current_names_as_its_reader() {
+        let crm = parse("lake", "crm");
+        let s = currents_of(&crm, "SELECT current_schema() AS s, current_database() AS d FROM crm.t");
+        assert!(s.contains("'crm'") && s.contains("'lake'") && s.contains("crm.t"), "{s}");
+        assert_eq!(currents_of(&crm, "SELECT 1 AS one"), "SELECT 1 AS one");
     }
 
     #[test]

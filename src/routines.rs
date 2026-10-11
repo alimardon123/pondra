@@ -732,8 +732,9 @@ pub async fn expand(lake: &Lake, sql: &str) -> Result<String> {
 
 /// `expand` for SQL that is already stored (a view's, a file's query): read as it was made, without
 /// the session's path. A view made under `USE crm` kept `crm.t` when it was made; one made without a
-/// path reads `t` as public, whoever reads it.
-pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { expand_with(lake, sql, &HashMap::new()).await }
+/// path reads `t` as public, whoever reads it. Its `current_schema()` and the like are its reader's
+/// (`path::currents`), as Postgres reads a view's.
+pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { expand_with(lake, &crate::path::currents(lake, sql), &HashMap::new()).await }
 
 async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) -> Result<String> {
     let sql = &crate::vars::parameters_in(lake, sql).await?; // (`pondra.parameters('etl/orders.sql')`: a file's parameters, as rows)

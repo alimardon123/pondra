@@ -1204,7 +1204,7 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     if lake.cat.get::<u64>(&producer_key(&format!("job:{}", f.job))).await?.is_some() {
         return Ok(j!({"duplicate": true})); // the same job finished concurrently
     }
-    let new = TableMeta { columns: f.columns.clone(), publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() }; // (a table the INSERT makes starts at the log's end, as CREATE TABLE's does)
+    let new = TableMeta { columns: f.columns.clone(), publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() }; // (a table `POST /insert/{t}` makes starts at the log's end, as CREATE TABLE's does; SQL's INSERT needs one already: `is_there`)
     let meta = lake.cat.get::<TableMeta>(&table_key(&f.table)).await?.unwrap_or_else(|| new.clone());
     // Types as the lake stores them, so a writer may name them its own way (`Utf8View`, `VARIANT`).
     let types = |c: &[(String, String)]| c.iter().map(|(_, t)| crate::query::dtype(t).map(|t| crate::query::type_name(&t)).unwrap_or_else(|_| t.clone())).collect::<Vec<_>>();
@@ -1299,6 +1299,24 @@ pub async fn seen_here(app: &crate::server::App) {
     }
 }
 
+/// Is there a table for SQL's INSERT into `table` to write? A file, another engine's table
+/// attached, and a name this lake can't resolve answer yes: their own paths take them (or refuse
+/// them by name).
+async fn is_there(lake: &Lake, table: &str) -> Result<bool> {
+    if crate::ext::spec(table).is_some() || crate::ext::outside_target(lake, table).await?.is_some() {
+        return Ok(true);
+    }
+    let Ok((other, name)) = crate::ddl::resolve(lake, table).await else { return Ok(true) };
+    Ok(other.as_deref().unwrap_or(lake).cat.get::<TableMeta>(&table_key(&name)).await?.is_some())
+}
+
+/// SQL's INSERT into a name no table has: refused, as Postgres and DuckDB refuse it (42P01).
+/// `CREATE TABLE … AS SELECT` makes a table of a query (`POST /insert/{t}`, the bulk door, still
+/// makes one).
+fn no_table(table: &str) -> anyhow::Error {
+    crate::codes::coded("42P01", format!("no table {table} (CREATE TABLE {table} AS SELECT … makes one from a query)"))
+}
+
 /// A write to an attached lake is in this node's reads of it before it answers, as one here is
 /// (`seen_here`): our view of that lake follows its catalog every 250 ms, so the next statement
 /// could read it from before the write (`smoke.py`'s CREATE TABLE … AS SELECT into another
@@ -1335,6 +1353,12 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
             crate::seq::check_every(&app.lake, &t).await?; // (every column given, an ALWAYS identity's too)
+            if !is_there(&app.lake, &t).await? {
+                seen_here(app).await; // (a table just made through another node: this one holds it once it holds what its leader had)
+                if !is_there(&app.lake, &t).await? {
+                    return Err(no_table(&t));
+                }
+            }
             Stmt::Insert(t, query)
         }
         s => s,
@@ -1640,7 +1664,11 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
     let stmt = match stmt {
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&*Lake::open(dir, false, false).await?, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
-            crate::seq::check_every(&*Lake::open(dir, false, false).await?, &t).await?;
+            let lake = Lake::open(dir, false, false).await?;
+            crate::seq::check_every(&lake, &t).await?;
+            if !is_there(&lake, &t).await? {
+                return Err(no_table(&t));
+            }
             Stmt::Insert(t, query)
         }
         s => s,
