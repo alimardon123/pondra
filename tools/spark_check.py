@@ -29,6 +29,8 @@ import time
 os.environ["TZ"] = "UTC"
 if hasattr(time, "tzset"):
     time.tzset()
+# PySpark's Python workers (pandas UDFs) need pyarrow: use this interpreter, which has it.
+os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "python"))  # the pondra client
@@ -504,6 +506,14 @@ def p_udf_group_by(spark, F, Window):
     return spark.table("orders").groupBy(size("item").alias("size")).agg(F.count("*").alias("n"))
 
 
+def p_sha2_number_literal(spark, F, Window):  # a number where PySpark takes a literal (F.sha2(c, 256))
+    return spark.table("orders").where(F.col("id") <= 20).select("id", F.sha2(F.col("item"), 256).alias("h"))
+
+
+def p_column_name_call(spark, F, Window):  # Column.name("x") is alias("x") (PySpark's name)
+    return spark.table("orders").where(F.col("id") <= 20).select(F.col("id").name("order_id"), F.col("qty").alias("q"))
+
+
 PIPELINES = [
     ("select", False, "frame", p_select),
     ("selectExpr", False, "frame", p_select_expr),
@@ -560,6 +570,8 @@ PIPELINES = [
     ("udf_register_then_sql", False, "frame", p_udf_register_sql),
     ("pandas_udf", False, "frame", p_pandas_udf),
     ("udf_in_groupBy", False, "frame", p_udf_group_by),
+    ("sha2_number_literal", False, "frame", p_sha2_number_literal),
+    ("column_name_call", False, "frame", p_column_name_call),
 ]
 
 

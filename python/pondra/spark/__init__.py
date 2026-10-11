@@ -48,10 +48,10 @@ class Column:
     __hash__ = None
 
     def __init__(self, sql, name, sort=None):
-        self.sql, self.name, self._sort = sql, name, sort
+        self.sql, self._name, self._sort = sql, name, sort
 
     def __repr__(self):
-        return f"Column<'{self.name}'>"
+        return f"Column<'{self._name}'>"
 
     def __bool__(self):
         raise ValueError("Cannot convert column into bool: please use '&' for 'and', '|' for 'or', '~' for 'not'")
@@ -59,7 +59,7 @@ class Column:
     def _op(self, op, other, right=False, label=None):
         o = other if isinstance(other, Column) else _lit(other)
         a, b = (o, self) if right else (self, o)
-        return Column(f"({a.sql} {op} {b.sql})", f"({a.name} {label or op} {b.name})")
+        return Column(f"({a.sql} {op} {b.sql})", f"({a._name} {label or op} {b._name})")
 
     __add__ = lambda s, o: s._op("+", o)
     __radd__ = lambda s, o: s._op("+", o, True)
@@ -76,83 +76,86 @@ class Column:
     __ge__ = lambda s, o: s._op(">=", o)
     __and__ = lambda s, o: s._op("AND", o)
     __or__ = lambda s, o: s._op("OR", o)
-    __invert__ = lambda s: Column(f"(NOT {s.sql})", f"(NOT {s.name})")
-    __neg__ = lambda s: Column(f"(- {s.sql})", f"(- {s.name})")
+    __invert__ = lambda s: Column(f"(NOT {s.sql})", f"(NOT {s._name})")
+    __neg__ = lambda s: Column(f"(- {s.sql})", f"(- {s._name})")
 
     def __truediv__(self, o):  # (PySpark: a double, whatever the operands)
         o = o if isinstance(o, Column) else _lit(o)
-        return Column(f"(CAST({self.sql} AS DOUBLE) / {o.sql})", f"({self.name} / {o.name})")
+        return Column(f"(CAST({self.sql} AS DOUBLE) / {o.sql})", f"({self._name} / {o._name})")
 
     def __rtruediv__(self, o):
         o = o if isinstance(o, Column) else _lit(o)
-        return Column(f"(CAST({o.sql} AS DOUBLE) / {self.sql})", f"({o.name} / {self.name})")
+        return Column(f"(CAST({o.sql} AS DOUBLE) / {self.sql})", f"({o._name} / {self._name})")
 
     def alias(self, name):
         return Column(self.sql, name)
 
+    def name(self, alias):  # (PySpark: `col.name("x")` is `col.alias("x")`)
+        return self.alias(alias)
+
     name_ = alias
 
     def cast(self, t):
-        return Column(f"CAST({self.sql} AS {_type(t)})", self.name)
+        return Column(f"CAST({self.sql} AS {_type(t)})", self._name)
 
     astype = cast
 
     def isNull(self):
-        return Column(f"({self.sql} IS NULL)", f"({self.name} IS NULL)")
+        return Column(f"({self.sql} IS NULL)", f"({self._name} IS NULL)")
 
     def isNotNull(self):
-        return Column(f"({self.sql} IS NOT NULL)", f"({self.name} IS NOT NULL)")
+        return Column(f"({self.sql} IS NOT NULL)", f"({self._name} IS NOT NULL)")
 
     def isin(self, *values):
         vs = values[0] if len(values) == 1 and isinstance(values[0], (list, tuple, set)) else values
-        return Column(f"({self.sql} IN ({', '.join(_literal(v) for v in vs)}))", f"({self.name} IN ({', '.join(map(str, vs))}))")
+        return Column(f"({self.sql} IN ({', '.join(_literal(v) for v in vs)}))", f"({self._name} IN ({', '.join(map(str, vs))}))")
 
     def between(self, lo, hi):
-        return Column(f"({self.sql} BETWEEN {_lit(lo).sql} AND {_lit(hi).sql})", f"(({self.name} >= {lo}) AND ({self.name} <= {hi}))")
+        return Column(f"({self.sql} BETWEEN {_lit(lo).sql} AND {_lit(hi).sql})", f"(({self._name} >= {lo}) AND ({self._name} <= {hi}))")
 
     def like(self, pattern):
-        return Column(f"({self.sql} LIKE {_literal(pattern)})", f"{self.name} LIKE {pattern}")
+        return Column(f"({self.sql} LIKE {_literal(pattern)})", f"{self._name} LIKE {pattern}")
 
     def rlike(self, pattern):
-        return Column(f"regexp_like({self.sql}, {_literal(pattern)})", f"RLIKE({self.name}, {pattern})")
+        return Column(f"regexp_like({self.sql}, {_literal(pattern)})", f"RLIKE({self._name}, {pattern})")
 
     def contains(self, s):
-        return Column(f"(strpos({self.sql}, {_literal(s)}) > 0)", f"contains({self.name}, {s})")
+        return Column(f"(strpos({self.sql}, {_literal(s)}) > 0)", f"contains({self._name}, {s})")
 
     def startswith(self, s):
-        return Column(f"starts_with({self.sql}, {_literal(s)})", f"startswith({self.name}, {s})")
+        return Column(f"starts_with({self.sql}, {_literal(s)})", f"startswith({self._name}, {s})")
 
     def endswith(self, s):
-        return Column(f"ends_with({self.sql}, {_literal(s)})", f"endswith({self.name}, {s})")
+        return Column(f"ends_with({self.sql}, {_literal(s)})", f"endswith({self._name}, {s})")
 
     def substr(self, pos, length):
-        return Column(f"substr({self.sql}, {int(pos)}, {int(length)})", f"substring({self.name}, {pos}, {length})")
+        return Column(f"substr({self.sql}, {int(pos)}, {int(length)})", f"substring({self._name}, {pos}, {length})")
 
     # sorts: PySpark's nulls (first ascending, last descending) unless asked
     def asc(self):
-        return Column(self.sql, self.name, f"{self.sql} ASC NULLS FIRST")
+        return Column(self.sql, self._name, f"{self.sql} ASC NULLS FIRST")
 
     def desc(self):
-        return Column(self.sql, self.name, f"{self.sql} DESC NULLS LAST")
+        return Column(self.sql, self._name, f"{self.sql} DESC NULLS LAST")
 
     def asc_nulls_last(self):
-        return Column(self.sql, self.name, f"{self.sql} ASC NULLS LAST")
+        return Column(self.sql, self._name, f"{self.sql} ASC NULLS LAST")
 
     def desc_nulls_first(self):
-        return Column(self.sql, self.name, f"{self.sql} DESC NULLS FIRST")
+        return Column(self.sql, self._name, f"{self.sql} DESC NULLS FIRST")
 
     asc_nulls_first, desc_nulls_last = asc, desc
 
     def over(self, window):
-        return Column(f"{self.sql} OVER ({window._clause()})", f"{self.name} OVER ({window._clause()})")
+        return Column(f"{self.sql} OVER ({window._clause()})", f"{self._name} OVER ({window._clause()})")
 
     # CASE WHEN, built as F.when(…).when(…).otherwise(…)
     @staticmethod
     def _case(cases, otherwise=None):
         body = " ".join(f"WHEN {_as_col(c).sql} THEN {_as_val(v).sql}" for c, v in cases)
-        names = " ".join(f"WHEN {_as_col(c).name} THEN {_as_val(v).name}" for c, v in cases)
+        names = " ".join(f"WHEN {_as_col(c)._name} THEN {_as_val(v)._name}" for c, v in cases)
         e = "" if otherwise is None else f" ELSE {_as_val(otherwise).sql}"
-        col = Column(f"CASE {body}{e} END", f"CASE {names}{'' if otherwise is None else ' ELSE ' + _as_val(otherwise).name} END")
+        col = Column(f"CASE {body}{e} END", f"CASE {names}{'' if otherwise is None else ' ELSE ' + _as_val(otherwise)._name} END")
         col._cases = cases
         return col
 
@@ -163,12 +166,14 @@ class Column:
         return Column._case(self._cases, value)
 
     def getItem(self, key):
-        return Column(f"{self.sql}[{_literal(key if not isinstance(key, int) else key + 1)}]", f"{self.name}[{key}]")
+        return Column(f"{self.sql}[{_literal(key if not isinstance(key, int) else key + 1)}]", f"{self._name}[{key}]")
 
 
 def _col(name):
     if isinstance(name, Column):
         return name
+    if not isinstance(name, str):  # (a number where PySpark takes a literal: F.sha2(c, 256))
+        return _lit(name)
     if name == "*":
         return Column("*", "*")
     return Column(_name_sql(name), name.split(".")[-1])
@@ -190,7 +195,7 @@ def _named(c):
     """A column in a SELECT, named as PySpark names it."""
     if c.sql == "*" or c.sql.endswith(".*"):
         return c.sql
-    return c.sql if c.sql == _name_sql(c.name) else f"{c.sql} AS {_quote(c.name)}"
+    return c.sql if c.sql == _name_sql(c._name) else f"{c.sql} AS {_quote(c._name)}"
 
 
 def _cols(xs):
@@ -419,7 +424,7 @@ class UserDefinedFunction:
     def __call__(self, *cols):
         self._make(SparkSession._active.con if SparkSession._active else _client.current())
         cs = [c if isinstance(c, Column) else _col(c) for c in cols]
-        return Column(f"{self.__name__}({', '.join(c.sql for c in cs)})", f"{self.__name__}({', '.join(c.name for c in cs)})")
+        return Column(f"{self.__name__}({', '.join(c.sql for c in cs)})", f"{self.__name__}({', '.join(c._name for c in cs)})")
 
 
 def _sql_from(con, query, caller, names, params):
@@ -642,7 +647,7 @@ class DataFrame:
 
     def drop(self, *cols):
         have = {c.lower(): c for c in self.columns}
-        gone = [have[c.lower()] for c in (x.name if isinstance(x, Column) else x for x in cols) if c.lower() in have]  # (PySpark: unknown names are no error)
+        gone = [have[c.lower()] for c in (x._name if isinstance(x, Column) else x for x in cols) if c.lower() in have]  # (PySpark: unknown names are no error)
         return self._new(self._f.drop(*gone)) if gone else self
 
     # rows
@@ -659,7 +664,7 @@ class DataFrame:
     def orderBy(self, *cols, ascending=True):
         cs = _cols(cols)
         asc = ascending if isinstance(ascending, (list, tuple)) else [ascending] * len(cs)
-        order = [(c._sort or (c.asc() if a else c.desc())._sort, c.name) for c, a in zip(cs, asc)]
+        order = [(c._sort or (c.asc() if a else c.desc())._sort, c._name) for c, a in zip(cs, asc)]
         return self._step("*", order=[(_strip(o), n) for o, n in order])
 
     sort = orderBy
