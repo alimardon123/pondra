@@ -635,11 +635,33 @@ export class Frame {
 
   head(n = 5) { return this.limit(n); }
 
-  /** The distinct rows, or, with `subset`, one row per distinct value of those columns. */
-  unique(subset = null) {
-    if (subset === null || subset === undefined) return this._step((r) => `SELECT DISTINCT * FROM ${r}`);
-    const keys = exprs(subset).map((e) => e.sql).join(", ");
-    return this._step((r) => `SELECT DISTINCT ON (${keys}) * FROM ${r}`);
+  /** The distinct rows, or, with `subset`, one row per distinct value of those columns. `keep`: "any" (the
+   * engine's pick), "first" or "last" (the row of each value first or last in the sort), or "none" (only the
+   * values that occur once). `first`, `last` and `maintainOrder` need a sorted frame: a frame has no first or
+   * last row until it is sorted. */
+  unique(subset = null, { keep = "any", maintainOrder = false } = {}) {
+    if (!["any", "first", "last", "none"].includes(keep)) throw new Error(`unique({ keep: '${keep}' }): any, first, last or none`);
+    if (keep === "any" && !maintainOrder) { // (the engine's pick, as it always was)
+      if (subset === null || subset === undefined) return this._step((r) => `SELECT DISTINCT * FROM ${r}`);
+      const keys = exprs(subset).map((e) => e.sql).join(", ");
+      return this._step((r) => `SELECT DISTINCT ON (${keys}) * FROM ${r}`);
+    }
+    // (after a rename the sort is a promise: the check waits for it, and a frame that isn't sorted refuses then)
+    const order = later([this._order], ([o]) => {
+      if (!o && (keep === "first" || keep === "last")) throw new Error(`unique({ keep: '${keep}' }): a frame has no row order until it is sorted (sort it first, or keep: 'any')`);
+      if (!o && maintainOrder) throw new Error("unique({ maintainOrder: true }): a frame has no row order until it is sorted (sort it first)");
+      return o;
+    });
+    const keys = subset === null || subset === undefined
+      ? then(this._names(), (names) => names.map((c) => quote(c)).join(", "))
+      : exprs(subset).map((e) => e.sql).join(", ");
+    // (a window keeps one row of each value: DISTINCT ON wants its ORDER BY to begin with its keys,
+    // which a sort by other columns doesn't, so a sorted frame takes each value's row in its sort)
+    return this._step((r) => later([keys, order], ([ks, o]) => {
+      if (keep === "none") return `SELECT * EXCLUDE (__pondra_n) FROM (SELECT *, count(*) OVER (PARTITION BY ${ks}) AS __pondra_n FROM ${r}) WHERE __pondra_n = 1`;
+      const by = keep === "last" ? reversedOrder(o) : o;
+      return `SELECT * EXCLUDE (__pondra_n) FROM (SELECT *, row_number() OVER (PARTITION BY ${ks} ORDER BY ${by.map(([s]) => s).join(", ")}) AS __pondra_n FROM ${r}) WHERE __pondra_n = 1`;
+    }), this._kept());
   }
 
   /** `{ n }` rows, or about `fraction` of them, at random; with a `seed`, the same ones every time
@@ -670,7 +692,12 @@ export class Frame {
     return this._step((r) => later([cols], ([cs]) => `SELECT * FROM ${r} WHERE ${cs.map((c) => `${quote(c)} IS NOT NULL`).join(" AND ")}`), this._kept());
   }
 
-  groupBy(...keys) { return new GroupBy(this, exprs(flat(keys))); }
+  /** The groups by these keys. `{ maintainOrder: true }` as the last argument is refused: a GROUP BY promises no order. */
+  groupBy(...args) {
+    const { maintainOrder = false } = isPlain(args[args.length - 1]) ? args.pop() : {};
+    if (maintainOrder) throw new Error("groupBy({ maintainOrder: true }): groups come in no particular order here; sort the result by its keys (.sort(...))");
+    return new GroupBy(this, exprs(flat(args)));
+  }
 
   /** Polars' join: the key once (inner, left, right), both kept (full), the right side's other columns
    * with `suffix` where names clash. `how`: inner, left, right, full, cross, semi, anti. */
@@ -897,6 +924,11 @@ export function trailingOrder(sql) {
     out.push([`${quote(name)} ${way} ${nulls}`, name]);
   }
   return out;
+}
+
+/** A sort turned around, for `unique`'s `keep: "last"`: each key's direction and nulls side flipped. */
+function reversedOrder(order) {
+  return order.map(([sql, name]) => [sql.replace(/(ASC|DESC) NULLS (FIRST|LAST)$/, (_, way, nulls) => `${way === "ASC" ? "DESC" : "ASC"} NULLS ${nulls === "FIRST" ? "LAST" : "FIRST"}`), name]);
 }
 
 /** `groupBy(...)`: its `agg(...)` steps, and `len()`. */

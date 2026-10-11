@@ -28,6 +28,12 @@ const PIPELINES = [
   ["join cross (small)", (o, u) => u.filter(col("tier").eq("gold")).select("user").join(u.filter(col("tier").eq("new")).select("user"), { how: "cross" })],
   ["join_asof backward by", (o, u, q) => o.filter(col("item").isIn(["tea", "cake"])).sort("ts").joinAsof(q.sort("at"), { leftOn: "ts", rightOn: "at", by: "item" }).select("id", "px")],
   ["unique", (o) => o.select("user", "item").unique()],
+  ["unique(keep='none') on a subset: the values that occur once", (o) => o.filter(col("id").lt(300)).select("id", "user", "item").unique(["user", "item"], { keep: "none" })],
+  ["unique(keep='none') of every column", (o) => o.filter(col("id").lt(300)).select("user", "item", "qty").unique(null, { keep: "none" })],
+  ["sort, then unique(keep='first') on a subset, the sort kept", (o) => o.sort(["user", "id"]).select("id", "user", "item").unique("user", { keep: "first", maintainOrder: true }), true],
+  ["sort, then unique(keep='last'), descending with nulls last", (o) => o.sort(["user", "qty", "id"], { descending: [false, true, false], nullsLast: [false, true, false] })
+    .select("id", "user", "qty").unique("user", { keep: "last", maintainOrder: true }), true],
+  ["sort, then unique(keep='last') of every column", (o) => o.sort(["user", "item"]).select("user", "item").unique(null, { keep: "last", maintainOrder: true }), true],
   ["drop, rename, cast", (o) => o.drop("ts", "region").rename({ qty: "n" }).cast({ n: "Float64" })],
   ["when / then / otherwise", (o) => o.select("id", when(col("qty").gt(6)).then(lit("big")).when(col("qty").gt(2)).then(lit("mid")).otherwise(lit("small")).alias("size"))],
   ["is_in, is_between, is_null, fill_null", (o) => o.select("id", col("item").isIn(["tea", "bun"]).alias("a"), col("price").isBetween(5, 10).alias("b"),
@@ -119,6 +125,23 @@ async function misc(dir) {
     await db.readParquet(`${dir}/readable.parquet`).filter(col("v").gt(2)).writeTable("wframe");
     return db.table("wframe").rows();
   });
+  // Polars' keep and maintain_order, and groupBy's maintainOrder: refused by name where a frame has no
+  // row order, before anything runs (each refusal's message, or null if it was taken)
+  const refusal = (fn) => {
+    try {
+      fn();
+      return null;
+    } catch (e) {
+      return oneLine(e);
+    }
+  };
+  out.refusals = {
+    keepFirst: refusal(() => db.table("orders").unique("user", { keep: "first" })),
+    keepLast: refusal(() => db.table("orders").unique("user", { keep: "last" })),
+    keepUnknown: refusal(() => db.table("orders").unique("user", { keep: "x" })),
+    maintainOrder: refusal(() => db.table("orders").unique("user", { maintainOrder: true })),
+    groupMaintainOrder: refusal(() => db.table("orders").groupBy("user", { maintainOrder: true })),
+  };
   console.log(JSON.stringify(out));
   await db.close();
 }

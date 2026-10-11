@@ -495,7 +495,7 @@ class Pondra:
 
     # ------------------------------------------------------------ rows in, rows out
 
-    def append(self, table, data, retries=None):
+    def append(self, table, data):
         """Append rows — a list of dicts, or a pandas / Polars / Arrow table — exactly once: sent
         again after a lost answer, on any node, it is recognised and not applied twice (for up to
         the connection's `retry_secs`)."""

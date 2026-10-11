@@ -8,6 +8,8 @@
    file this check writes; `writeTable` with rows (create, overwrite, append) and with a frame, each
    read back. JavaScript starts this node itself (a node's reads of local files need the program that
    started it: invariant 61), after the first node is closed: one node at a time.
+3. `unique`'s keep and maintainOrder are taken on a sorted frame (pipelines above) and refused by name, with
+   the message, on one that isn't; `groupBy`'s maintainOrder is refused by name.
 
   python3 tools/js_frames_check.py [--port 8831] [--bin target/release/pondra]
 
@@ -83,6 +85,12 @@ PIPELINES = [
     ("join cross (small)", lambda c, o, u, q: u.filter(col("tier") == "gold").select("user").join(u.filter(col("tier") == "new").select("user"), how="cross"), False),
     ("join_asof backward by", lambda c, o, u, q: o.filter(col("item").is_in(["tea", "cake"])).sort("ts").join_asof(q.sort("at"), left_on="ts", right_on="at", by="item").select("id", "px"), False),
     ("unique", lambda c, o, u, q: o.select("user", "item").unique(), False),
+    ("unique(keep='none') on a subset: the values that occur once", lambda c, o, u, q: o.filter(col("id") < 300).select("id", "user", "item").unique(["user", "item"], keep="none"), False),
+    ("unique(keep='none') of every column", lambda c, o, u, q: o.filter(col("id") < 300).select("user", "item", "qty").unique(keep="none"), False),
+    ("sort, then unique(keep='first') on a subset, the sort kept", lambda c, o, u, q: o.sort(["user", "id"]).select("id", "user", "item").unique("user", keep="first", maintain_order=True), True),
+    ("sort, then unique(keep='last'), descending with nulls last", lambda c, o, u, q: o.sort(["user", "qty", "id"], descending=[False, True, False], nulls_last=[False, True, False])
+        .select("id", "user", "qty").unique("user", keep="last", maintain_order=True), True),
+    ("sort, then unique(keep='last') of every column", lambda c, o, u, q: o.sort(["user", "item"]).select("user", "item").unique(keep="last", maintain_order=True), True),
     ("drop, rename, cast", lambda c, o, u, q: o.drop("ts", "region").rename({"qty": "n"}).cast({"n": "Float64"}), False),
     ("when / then / otherwise", lambda c, o, u, q: o.select("id", when(col("qty") > 6).then(lit("big")).when(col("qty") > 2).then(lit("mid")).otherwise(lit("small")).alias("size")), False),
     ("is_in, is_between, is_null, fill_null", lambda c, o, u, q: o.select("id", col("item").is_in(["tea", "bun"]).alias("a"), col("price").is_between(5, 10).alias("b"),
@@ -240,6 +248,18 @@ def misc_check(report, tmp):
             continue
         why = compare_rows(want, got_rows, ordered=False)
         report.check(why is None, f"{text}" if why is None else f"{text}: {why}")
+    # (the JavaScript spelling of each refusal: a JavaScript caller's own option names)
+    unsorted = "a frame has no row order until it is sorted"
+    refused = got.get("refusals") or {}
+    for key, text in [
+        ("keepFirst", f"Error: unique({{ keep: 'first' }}): {unsorted} (sort it first, or keep: 'any')"),
+        ("keepLast", f"Error: unique({{ keep: 'last' }}): {unsorted} (sort it first, or keep: 'any')"),
+        ("keepUnknown", "Error: unique({ keep: 'x' }): any, first, last or none"),
+        ("maintainOrder", f"Error: unique({{ maintainOrder: true }}): {unsorted} (sort it first)"),
+        ("groupMaintainOrder", "Error: groupBy({ maintainOrder: true }): groups come in no particular order here; sort the result by its keys (.sort(...))"),
+    ]:
+        report.check(refused.get(key) == text, f"refused by name, saying why: {text[len('Error: '):]}" if refused.get(key) == text
+                     else f"{key}: {refused.get(key)!r}, not {text!r}")
 
 
 def main():
