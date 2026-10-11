@@ -23,6 +23,25 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// The lake's lock, taken for a tiering round, with `Lake::tiering` on while it is held
+/// (`log::Backpressure`): set once the round has the lock, cleared once it has let it go.
+struct Tiering<'a>(&'a Lake, Option<tokio::sync::MutexGuard<'a, ()>>);
+
+impl<'a> Tiering<'a> {
+    async fn lock(app: &'a App) -> Tiering<'a> {
+        let guard = app.lock.lock().await;
+        app.lake.tiering.store(true, std::sync::atomic::Ordering::Relaxed);
+        Tiering(&app.lake, Some(guard))
+    }
+}
+
+impl Drop for Tiering<'_> {
+    fn drop(&mut self) {
+        self.1.take(); // (the lock first: free, with the flag still on, commits wait as they should)
+        self.0.tiering.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 pub struct App {
     pub lake: Arc<Lake>,
@@ -766,7 +785,7 @@ impl App {
     /// Tier the tables with at least `min_rows` rows in the log (0: all of them), publish them
     /// for other engines, then expire what everything has consumed (leader).
     pub async fn tier_all(&self, min_rows: u64) -> anyhow::Result<u64> {
-        let _guard = self.lock.lock().await;
+        let _guard = Tiering::lock(self).await; // (commits wait for it while too much waits in the log)
         let start = std::time::Instant::now();
         let hwm = *self.lake.hwm.borrow();
         let tables = self.lake.cat.scan::<TableMeta>("t/", "t0").await?;

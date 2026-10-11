@@ -9631,6 +9631,97 @@ def attached():
     return "an attached lake read while its leader changes, tiers and purges rows: every read as of one commit"
 
 
+def publishing():
+    """What can't be published as Delta or Iceberg is refused by name, never written wrong or
+    skipped quietly: asked for, a column the format has no type for, a materialized view finished
+    as it is read (its files hold partial rows) and a history view are refused, and so is sharing
+    one, or adding such a column to a published table; under the node's --publish they are made,
+    left out of that format, and the statement says so; and nothing of theirs is written as Delta or
+    Iceberg (a finished view's partial rows were, before)."""
+    import urllib.request
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=0.5, env={"PONDRA_PUBLISH": "delta,iceberg"}).start()
+    q = lambda s: sql(A.port, s)
+    err = lambda s: _raises_text(lambda: q(s))
+    said = lambda s: json.loads(urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", s.encode()), timeout=60).headers.get("x-pondra-notices") or "[]")
+    iceberg = lambda t: _try(lambda: call(A.port, "GET", f"/v1/namespaces/default/tables/{t}")) is not None
+    checks = {}
+    try:
+        q("CREATE TABLE ev (id BIGINT, g VARCHAR, amount DOUBLE, ts TIMESTAMP)")
+        e = err("CREATE TABLE spans (id BIGINT, d INTERVAL) WITH (publish = 'delta')")
+        checks["a column Delta has no type for, asked for: refused by name"] = "can't be published as delta" in e and "no type for d" in e
+        heard = said("CREATE TABLE spans (id BIGINT, d INTERVAL)")
+        checks["…under --publish: made, left out of both formats, and said"] = len(heard) == 1 and "spans isn't published as" in heard[0] and "no type for d" in heard[0]
+        e = err("ALTER TABLE ev ADD COLUMN d INTERVAL")
+        checks["a column added to a published table that the format can't carry: refused"] = "ev can't be published as delta" in e
+        heard = said("CREATE MATERIALIZED VIEW avgs AS SELECT g, avg(amount) AS a FROM ev GROUP BY g")
+        checks["a view finished as it is read, under --publish: left out, and said"] = len(heard) == 1 and "partial rows" in heard[0]
+        e = err("ALTER TABLE avgs SET (publish = 'iceberg')")
+        checks["…and refused when asked for"] = "can't be published as iceberg" in e and "partial rows" in e
+        heard = said("CREATE MATERIALIZED VIEW hist WITH (history = 'id', sequence_by = 'ts') AS SELECT id, amount, ts FROM ev")
+        checks["a history view, under --publish: left out, and said"] = len(heard) == 1 and "__start_at" in heard[0]
+        q("CREATE SHARE out_s")
+        e = err("ALTER SHARE out_s ADD TABLE avgs")
+        checks["sharing one (a share hands out a Delta log): refused by name"] = "avgs can't be shared" in e and "partial rows" in e
+        q("INSERT INTO ev VALUES (1, 'a', 2.0, '2026-01-01 00:00:00'), (2, 'a', 4.0, '2026-01-01 00:00:01'), (3, 'b', 6.0, '2026-01-01 00:00:02')")
+        q("INSERT INTO spans VALUES (1, INTERVAL '2 days')")
+        q("CHECKPOINT")
+        until(lambda: iceberg("ev"), True, 30)
+        checks["a plain table: published as --publish says"] = iceberg("ev")
+        checks["…the others never: no Iceberg or Delta of them"] = not any(iceberg(t) for t in ("spans", "avgs", "hist")) and (A.s3 or not any(
+            os.path.exists(os.path.join(lake, "data", t, d)) for t in ("spans", "avgs", "hist") for d in ("_delta_log", "metadata")))
+        checks["…and read as before"] = q("SELECT g, a FROM avgs ORDER BY g") == [{"g": "a", "a": 3.0}, {"g": "b", "a": 6.0}] and q("SELECT count(*) AS n FROM spans") == [{"n": 1}]
+    finally:
+        node.kill()
+    for name, good in checks.items():
+        print(f"publishing: {name}: {'OK' if good else 'FAIL'}")
+    if not all(checks.values()):
+        sys.exit(1)
+    return "what can't be published is refused by name, left out of --publish with a notice, and never written"
+
+
+def backpressure():
+    """Writes wait while more than `--backlog` rows wait in the log to be tiered, and only while
+    tiering can run (invariant 279): its round takes the lake's lock, and a view that runs its query
+    again holds that lock while its rows commit, so a commit held back behind tiering stopped every
+    write for good (Nexmark's twenty views, now and then). 8,000 rows written fast, 500 a write,
+    wait for tiering (never half of them in the log at once; all of them without the wait); then
+    150 writes under two such views each answer in time, and the views == their queries."""
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=2, backlog=1000).start()
+    q = lambda s: sql(A.port, s)
+    rows = lambda i, n: "".join(json.dumps({"k": i * n + j, "v": (i * 7919 + j * 31) % 10007}) + "\n" for j in range(n)).encode()
+    checks = {}
+    try:
+        q("CREATE TABLE ev (k BIGINT, v BIGINT)")
+        most = 0
+        for i in range(16):
+            call(A.port, "POST", f"/append/ev?producer=bp&seq={i + 1}", rows(i, 500), timeout=60)
+            most = max(most, call(A.port, "GET", "/stats")["untiered_rows"])
+        checks[f"writes wait for tiering: never half of 8,000 rows in the log at once (at most {most})"] = most < 4000
+        views = {"top": ("SELECT k, v FROM ev ORDER BY v DESC, k LIMIT 5", "v DESC, k"), "mid": ("SELECT k % 7 AS g, median(v) AS m FROM ev GROUP BY k % 7", "g")}
+        for name, (query, _) in views.items():
+            q(f"CREATE MATERIALIZED VIEW {name} AS {query}")
+        slowest, stuck = 0.0, None
+        for i in range(150):
+            t = time.time()
+            try:
+                call(A.port, "POST", f"/append/ev?producer=bp2&seq={i + 1}", rows(100 + i, 100), timeout=30)
+            except Exception as e:
+                stuck = f"write {i + 1}: {e!r}"[:200]
+                break
+            slowest = max(slowest, time.time() - t)
+        checks[f"…while views run their queries again: 150 writes, each in time (slowest {slowest:.1f} s{'; ' + stuck if stuck else ''})"] = stuck is None
+        checks["…and the views == their queries"] = stuck is None and all(_bykey_same(q, name, query, by) for name, (query, by) in views.items())
+    finally:
+        node.kill()
+    for name, good in checks.items():
+        print(f"backpressure: {name}: {'OK' if good else 'FAIL'}")
+    if not all(checks.values()):
+        sys.exit(1)
+    return "writes wait for tiering only while it can run"
+
+
 # About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
 # prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
 # suite in parts side by side that end together. A section not listed counts as 5 s.
@@ -9642,7 +9733,7 @@ SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 4
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, reader, crash, load)
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -9670,7 +9761,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -9683,7 +9774,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

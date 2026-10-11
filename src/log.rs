@@ -395,15 +395,31 @@ pub fn decode_flush(body: Bytes) -> Result<Flush> {
 
 // ---------------------------------------------------------------- the sequencer (leader)
 
+/// Commits wait while more than `max` rows wait in the log to be tiered, and tiering can run.
+pub struct Backpressure {
+    pub max: u64,
+    pub lock: Arc<tokio::sync::Mutex<()>>, // the lake's (`App::lock`), which tiering takes
+}
+
+impl Backpressure {
+    /// Tiering needs the lake's lock, and whoever else holds it (a view running its query again,
+    /// a change, a fill) may be waiting for this very commit: held back, it never lets go, tiering
+    /// never starts, and every write stops (Nexmark's twenty views, now and then). So commits wait
+    /// only while the lock is free or tiering holds it (invariant 279).
+    fn holds(&self, lake: &Lake) -> bool {
+        lake.backlog.load(Ordering::Relaxed) > self.max && (lake.tiering.load(Ordering::Relaxed) || self.lock.try_lock().is_ok())
+    }
+}
+
 pub struct Sequencer {
     tx: mpsc::Sender<(Flush, oneshot::Sender<Outcome>)>,
     pub commit_ms: Arc<Mutex<Vec<f64>>>, // catalog commit latencies, for /stats
 }
 
 impl Sequencer {
-    /// `max_backlog`: while more rows than this wait in the log to be tiered, commits pause
-    /// (so producers slow down to what the cluster sustains, instead of memory growing).
-    pub async fn start(lake: Arc<Lake>, max_backlog: Option<u64>) -> Result<Arc<Sequencer>> {
+    /// `held`: while too many rows wait in the log to be tiered, commits pause (so producers slow
+    /// down to what the cluster sustains, instead of memory growing).
+    pub async fn start(lake: Arc<Lake>, held: Option<Backpressure>) -> Result<Arc<Sequencer>> {
         let mut next: u64 = lake.cat.get("n").await?.unwrap_or(1);
         // Row ids' blocks (ADR-029 §11): a counter of their own, which starts above every commit
         // number (the blocks before it had), and moves only as blocks are taken.
@@ -424,7 +440,7 @@ impl Sequencer {
             let disk = (!lake.url.contains("://")).then(|| std::path::PathBuf::from(&lake.url)); // (a lake on local disk)
             while let Some(first) = rx.recv().await {
                 let slot = in_flight.clone().acquire_owned().await.expect("never closed");
-                while max_backlog.is_some_and(|m| lake.backlog.load(Ordering::Relaxed) > m) {
+                while held.as_ref().is_some_and(|b| b.holds(&lake)) {
                     tokio::time::sleep(Duration::from_millis(20)).await; // backpressure: let tiering catch up
                 }
                 // …and the room the lake's upkeep needs on its disk (`store::short_of_room`).

@@ -89,9 +89,11 @@ src/      55,200 lines of Rust in 101 files, one per concern (see the table in R
           types.rs (enum types: invariant 242), and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
           237–239); learned.rs (what a run learned about its filters, ADR-050: invariant 244);
           environments (ADR-047): branch.rs (`CREATE DATABASE dev CLONE prod`, REFRESH: invariant
-          245), deploy.rs (plan, deploy, test and export: a project made true in a database;
-          `pondra.deploys`: invariants 246–250), project.rs (the command line's project commands,
-          `pondra ci init` and `pondra dev`), protect.rs (a protected database: invariant 266) and
+          245), apply.rs (plan, apply, test and export: a project made true in a database;
+          `pondra.applies`: invariants 246–250), project.rs (the command line's project commands:
+          branch, switch, apply; a project's `objects/`, `migrations/`, `seeds/` and `tests/`), ci.rs
+          (`pondra ci init`), path.rs (`USE` and a session's search path: invariant 275), protect.rs
+          (a protected database: invariant 266) and
           sync.rs (`pondra workspace pull | push`); views kept current (ADR-055, ADR-056, ADR-059):
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253)
@@ -1560,7 +1562,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    row, and refuses by name what it can't do by adding at the end or widening. A kind's entry says
    what code used to keep in lists of its own: its catalog prefix, its privileges, what a clone does
    with it (`OnClone`: copy, pin or leave; `branch::make` leaves what it says), why a project can't
-   declare it (`deploy::head` asks the entry), whether it holds a secret, a line about it and other
+   declare it (`apply::head` asks the entry), whether it holds a secret, a line about it and other
    products' names; `PARTS` and `PATTERNS` beside it, and `pondra.kinds` and `GET /kinds` one list of
    all three (`objects::rows`), from which the glossary is written (`docs_check.py --write-glossary`;
    a stale one fails). `pondra.objects` lists the attached lakes' objects of every family a lake
@@ -1709,25 +1711,25 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `environments_check.py`: "ALTER DATABASE dev REFRESH t: t and its view as prod has them now",
    "…what dev writes after it is newer: an upsert wins through tiering, row ids stay unique, prod
    unchanged".
-246. **A deploy applies the plan it showed, one at a time per database** (`deploy::ask`: the plan's id
+246. **An apply applies the plan it showed, one at a time per database** (`apply::ask`: the plan's id
    is a hash of its steps; `dl` held and kept fresh while it runs, stale after 120 s; each statement
    under the job part `deploy:{project}:{n}:…`). `project_check.py`: "a plan shown before someone
-   else deployed: refused, plan again", "deployed again: nothing to change".
+   else applied: refused, plan again", "applied again: nothing to change…".
 247. **An object has one owner, and a table changes in place only in ways that keep its rows**
-   (`deploy::plan`: owners from deploys that succeeded; `table_change`: columns added at the end,
+   (`apply::plan`: owners from applies that succeeded; `table_change`: columns added at the end,
    widened types, options; a rename, drop, move, key or partition change is refused with the
    migration to write and the views that read it, `ddl::readers`). `project_check.py`: "another
    project declaring this one's view: refused, naming its owner", "a renamed column: refused, saying
    the migration and what reads it".
-248. **A migration runs once in each database, after what a deploy adds and before what it replaces**
+248. **A migration runs once in each database, after what an apply adds and before what it replaces**
    (`dm/{project}/{file}`, committed after it runs; the rest of the plan is made again after the
-   migrations, `plan_again`). `project_check.py`: "a renamed column: … with it, deployed, the views
+   migrations, `plan_again`). `project_check.py`: "a renamed column: … with it, applied, the views
    made again".
-249. **A fingerprint never holds a secret** (`deploy::fingerprint`: a secret's value as
+249. **A fingerprint never holds a secret** (`apply::fingerprint`: a secret's value as
    `secret:<sha256>`); secrets are never exported.
 250. **Shares and recipients are each database's own** (`branch::make` leaves `sh/` and `sr/` out;
    REFRESH copies only tables and what follows them; plan and export never list them;
-   `deploy::head` refuses `CREATE SHARE`, `CREATE RECIPIENT` and `GRANT … ON SHARE` in `objects/`).
+   `apply::head` refuses `CREATE SHARE`, `CREATE RECIPIENT` and `GRANT … ON SHARE` in `objects/`).
    `environments_check.py`: "…and no REFRESH brings prod's shares or recipients…";
    `project_check.py`: "prod's shares and recipients: never in a plan, even pruning…".
 251. **A rollup's keys are its GROUP BY view's keys, and the columns they determine**
@@ -1854,17 +1856,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    behind the entries an attached lake's changed row went missing (336 of 607 reads on main
    2801b4d); with an entry read before a table's first UPDATE and its log read past it, a leader too
    kept both versions. `harness.py attached` (55 wrong reads on 0.33.0).
-266. **In a protected database, a project's objects change only through a deploy by a holder of
-   DEPLOY, and lifting the protection is an admin's, audited** (`protect.rs`, `deploy::authorize`,
+266. **In a protected database, a project's objects change only through an apply by a holder of
+   APPLY, and lifting the protection is an admin's, audited** (`protect.rs`, `apply::authorize`,
    ADR-058). `protect::door`, where every statement comes in (`write::on_node_listed`,
    `write::from_cli`, and for a user's direct call `server::ddl` and `create_table`), refuses a change
-   to anything a project's last finished deploy declared (`deploy::declared`), unless
-   `protect::DEPLOYING` is set. Only a deploy sets it, from its claim to its record (tests included),
+   to anything a project's last finished apply declared (`apply::declared`), unless
+   `protect::APPLYING` is set. Only an apply sets it, from its claim to its record (tests included),
    and a procedure it calls back through gets it for that call alone. Its matches over `Stmt` and
    `Ddl` have no `_` arm: a new kind says what it touches. The flag lives in `z/protect`, which a
    branch never copies. `environments_check.py`: "an admin's DROP, CREATE OR REPLACE and ALTER of a
    project's table or view, and of its role's grants, are refused by name", "the cluster's own door
-   refuses it too…", "a superuser without DEPLOY can't deploy a protected database; ci's deploy
+   refuses it too…", "a superuser without APPLY can't apply a protected database; ci's apply
    changes it".
 267. **A node keeps few blocking threads** (`panics::runtime`, both runtimes): at most four a core (16
    at least, `PONDRA_BLOCKING_THREADS`), each gone after a second idle. On a local lake every file

@@ -66,7 +66,7 @@ pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> 
     let print = |meta: &TableMeta| std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), json(meta));
     let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
     let changed: Vec<_> = tables.iter().filter(|(key, meta)| named.iter().any(|n| key[2..] == *n.table) || SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();
-    let jobs = changed.iter().flat_map(|(key, meta)| meta.publish.iter().map(move |f| (&key[2..], meta, f.as_str())));
+    let jobs = changed.iter().flat_map(|(key, meta)| meta.publish.iter().filter(|f| refused(meta, f).is_none()).map(move |f| (&key[2..], meta, f.as_str())));
     let states = futures::future::try_join_all(jobs.map(|(table, meta, format)| async move {
         match format {
             "delta" => publish(lake, table, meta).await,
@@ -105,6 +105,34 @@ pub async fn publishable(lake: &Lake, meta: &TableMeta) -> Result<Option<Parts>>
         false if meta.files.windows(2).all(|w| w[0].ord == w[1].ord) && !meta.files.is_empty() && meta.files.iter().all(|f| f.whole || !deletes) => Some(Parts { manifests: vec![], inline: meta.files.clone() }),
         false => None,
     })
+}
+
+/// Why `meta` can't be published as `format`, if it can't. Asked wherever publishing is asked for
+/// (`write::create_table`, `ALTER SHARE … ADD TABLE`) and refused there by name; the node's own
+/// `--publish` leaves such a table out with a notice. A table refused is never published
+/// (`publish_named`): another engine would read rows that aren't the table's.
+pub fn refused(meta: &TableMeta, format: &str) -> Option<String> {
+    if meta.finish.is_some() {
+        return Some("its files hold partial rows, finished as they are read (an average, a variance, a HAVING)".into());
+    }
+    if meta.history.is_some() {
+        return Some("a history view's __start_at and __end_at are worked out as it is read".into());
+    }
+    let carried = |t: &str| match format {
+        "delta" => schema_string(&[(String::new(), t.to_string())]).is_some(),
+        _ => crate::iceberg::carries(t),
+    };
+    let (_, name, t) = meta.live().filter(|(s, _, _)| !meta.marker(s)).find(|(_, _, t)| !carried(t))?;
+    Some(format!("{format} has no type for {name} ({t})"))
+}
+
+/// What a new table's maker is told when the node's `--publish` asks for a format `refused` says it
+/// can't be published in (it is left out of that format).
+pub fn left_out(name: &str, meta: &TableMeta) -> Option<String> {
+    let no: Vec<(String, String)> = crate::store::default_publish().into_iter().filter_map(|f| refused(meta, &f).map(|why| (f, why))).collect();
+    let (formats, mut whys): (Vec<String>, Vec<String>) = no.into_iter().unzip();
+    whys.dedup(); // (a view's reason is the same for both)
+    (!formats.is_empty()).then(|| format!("{name} isn't published as {}, though --publish asks for it: {}", formats.join(" or "), whys.join("; ")))
 }
 
 /// Stop publishing a table in `format`: its metadata goes, so no engine reads a stale copy.
