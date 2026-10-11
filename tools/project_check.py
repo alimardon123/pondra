@@ -141,13 +141,17 @@ def project_check(bin, work, port):
           "CREATE PROCEDURE sales.add(n BIGINT) LANGUAGE sql AS $$ INSERT INTO sales.orders VALUES (n, n * 10.0) $$;\n"
           "CREATE TASK sales.nightly SCHEDULE '1 hour' AS CALL sales.add(999);\n")
     write("objects/access.sql", "CREATE ROLE analyst;\nGRANT SELECT ON TABLE sales.orders TO analyst;\n")
+    kinds = "CREATE SEQUENCE sales.order_ids START WITH 100;\nCREATE TYPE sales.status AS ENUM ('new', 'paid');\nCREATE INDEX by_id ON sales.orders (id);\n" \
+        "CREATE FUNCTION sales.add_one(x BIGINT) RETURNS BIGINT LANGUAGE sql AS 'SELECT x + 1';\n" \
+        "CREATE FUNCTION sales.recent(n BIGINT) RETURNS TABLE (id BIGINT) LANGUAGE sql AS $$ SELECT id FROM sales.orders LIMIT n $$;\n"
+    write("objects/sales/kinds.sql", kinds)
     write("seeds/001-first-orders.sql", "INSERT INTO sales.orders SELECT x, x * 10.0 FROM generate_series(1, 20) AS s(x);\n")
     write("tests/no_negative.sql", "SELECT * FROM sales.orders WHERE amount < 0\n")
     subprocess.run(["git", "add", "-A"], cwd=proj, env=env, check=True)
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "first"], cwd=proj, env=env, check=True)
 
     plan = pondra("plan", "prod")
-    checks["pondra plan: each object made, the seed loaded once (a new database), nothing done"] = all(f"+ {k}" in plan for k in ["table", "view", "materialized view", "macro", "procedure", "task", "role", "grant"]) \
+    checks["pondra plan: each object made, the seed loaded once (a new database), nothing done"] = all(f"+ {k}" in plan for k in ["table", "view", "materialized view", "macro", "procedure", "task", "role", "grant", "sequence", "type", "index", "function"]) \
         and "▶ seed" in plan and "first apply" in plan and refused("prod", "SELECT * FROM sales.orders") != ""
     out = pondra("apply", "prod")
     checks["pondra apply prod: every object made, the seed's rows, the view's value, the tests passed"] = \
@@ -175,6 +179,31 @@ def project_check(bin, work, port):
     plan = pondra("plan", "prod")
     pondra("apply", "prod")
     checks["a view changed outside an apply: shown as drift, put back"] = "changed outside an apply" in plan and rows("prod", "SELECT count(*) FROM sales.big") == [(10,)]
+
+    # A sequence, a type and an index changed: ALTER SEQUENCE keeps its next value, a type's labels grow at
+    # the end, an index is made again; a sequence's option taken away, or a label, is refused by name.
+    first = rows("prod", "SELECT nextval('sales.order_ids') AS n")
+    changed = kinds.replace("START WITH 100", "START WITH 100 INCREMENT BY 5").replace("'paid')", "'paid', 'shipped')").replace("(id);", "(id, channel);")
+    write("objects/sales/kinds.sql", changed)
+    plan = pondra("plan", "prod")
+    pondra("apply", "prod")
+    status = str(rows("prod", "SHOW CREATE TYPE sales.status"))
+    name = "a sequence, a type and an index changed: ALTER SEQUENCE keeping its next value, a label added at the end, the index made again"
+    # The values a node took in its block stay used (as a cache does in Postgres): what follows is past them,
+    # never 100 again, and five apart.
+    after, index, again = rows("prod", "SELECT nextval('sales.order_ids') AS n"), str(rows("prod", "SHOW CREATE INDEX sales.by_id")), pondra("plan", "prod")
+    after += rows("prod", "SELECT nextval('sales.order_ids') AS n")
+    checks[name] = "ALTER SEQUENCE" in plan and "ADD VALUE" in plan and first == [(100,)] and after[0][0] > 100 and after[1][0] == after[0][0] + 5 \
+        and "'shipped'" in status and "channel" in index and "nothing to change" in again
+    if not checks[name]:
+        checks["(kinds changed)"] = [plan, first, after, status, index, again]
+    write("objects/sales/kinds.sql", changed.replace(" START WITH 100", ""))
+    no_start = pondra("plan", "prod", ok=False)
+    write("objects/sales/kinds.sql", changed.replace("'new', ", ""))
+    no_label = pondra("plan", "prod", ok=False)
+    write("objects/sales/kinds.sql", changed)
+    checks["…a sequence's option taken away: refused by name"] = "can't take one away" in no_start
+    checks["…a type's label taken away: refused by name"] = "labels only grow at the end" in no_label
 
     # pondra apply local: this machine's own database, the lake in the project's lake/ (where pondra opens its
     # shell), with no server; --watch keeps its node up, and git leaves it out.
@@ -285,6 +314,14 @@ def project_check(bin, work, port):
         and not any("acme" in v for v in exported.values())
     if not same:
         checks["(export differs)"] = sorted(set(exported.items()) ^ set(again.items()))[:6]
+    # Every kind a project may declare (GET /kinds) went through that export and apply: a new one fails here
+    # until the project above declares it. A secret's values are the environment's, never exported; an
+    # external table is exported as the view of files it is.
+    declarable = {k["kind"] for k in call("GET", "/db/empty/kinds") if k.get("in_project")} - {"secret", "external table"}
+    shown = {o["kind"] for o in q("empty", "SELECT kind FROM pondra.objects WHERE lake = 'empty'")}
+    checks["every kind a project may declare was exported and applied (GET /kinds' in_project)"] = declarable <= shown
+    if not declarable <= shown:
+        checks["(kinds not exported)"] = sorted(declarable - shown)
 
     # On main nothing is named: refused, and the message says what to do. prod is not a branch, and
     # --watch never applies to it.

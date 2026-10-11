@@ -556,7 +556,7 @@ pub struct Step {
 fn change_of(mark: &str, kind: Kind) -> &'static str {
     match mark {
         "+" => "create",
-        "~" if kind.is("table") => "alter",
+        "~" if matches!(kind.word(), "table" | "sequence" | "type") => "alter",
         "~" => "replace",
         "↻" => "rebuild",
         "▶" => "migrate",
@@ -683,6 +683,7 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
         }
         let drift = mine.contains_key(&k) && was == d.print;
         let what = if drift { "changed outside an apply: made as the project says" } else { "replaced" };
+        let action = |a: &str| if drift { format!("changed outside an apply: {a}") } else { a.to_string() };
         match d.kind.word() {
             "materialized view" => {
                 // Made again from the rows already there, with every view that follows it.
@@ -707,15 +708,27 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
             }
             _ if rebuilt.contains(&d.name) => {}
             "attach" => steps.push(step("~", what, vec![d.kind.drop(&d.name), d.sql.clone()])),
-            "sequence" => steps.push(step("~", what, vec![alter_sequence(&d.sql)])), // (keeps its next value)
-            "index" => steps.push(step("~", what, vec![d.kind.drop(&d.name), d.sql.clone()])), // (nothing is built: made again)
+            "sequence" => {
+                // ALTER SEQUENCE keeps its next value, and changes or adds options: one taken away would stay.
+                let (had, want) = (crate::seq::declared(&cur.sql).unwrap_or_default(), crate::seq::declared(&d.sql).unwrap_or_default());
+                if crate::seq::options_sql(&had) == crate::seq::options_sql(&want) {
+                    continue; // (the same options, written in another order)
+                }
+                match had.iter().all(|o| want.iter().any(|w| w.rank() == o.rank())) {
+                    true => steps.push(step("~", &action("ALTER SEQUENCE: its options, its next value kept"), vec![alter_sequence(&d.sql)])),
+                    false => refused.push(format!("sequence {}: an apply changes a sequence's options or adds some, keeping its next value, but can't take one away: keep it, or make the sequence again in a migration", d.name)),
+                }
+            }
+            "index" => steps.push(step("~", &action("made again (nothing is built for an index)"), vec![d.kind.drop(&d.name), d.sql.clone()])),
             "type" => {
                 // A label can only be added at the end: a file keeps the labels it was written with.
                 let (had, want) = (labels(&cur.sql), labels(&d.sql));
                 if !want.starts_with(&had) {
                     refused.push(format!("type {}: a type's labels only grow at the end (ALTER TYPE … ADD VALUE): files are never rewritten", d.name));
                 } else if want.len() > had.len() {
-                    steps.push(step("~", what, want[had.len()..].iter().map(|l| format!("ALTER TYPE {} ADD VALUE {}", quoted(&d.name), text(l))).collect()));
+                    let added: Vec<String> = want[had.len()..].iter().map(|l| text(l)).collect();
+                    let sql = added.iter().map(|l| format!("ALTER TYPE {} ADD VALUE {l}", quoted(&d.name))).collect();
+                    steps.push(step("~", &action(&format!("ADD VALUE {}", added.join(", "))), sql));
                 }
             }
             _ => {

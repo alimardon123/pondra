@@ -46,7 +46,7 @@ pub enum Opt {
 }
 
 impl Opt {
-    fn rank(&self) -> usize { [matches!(self, Opt::As(_)), matches!(self, Opt::Increment(_)), matches!(self, Opt::Min(_)), matches!(self, Opt::Max(_)), matches!(self, Opt::Start(_)), matches!(self, Opt::Cache(_)), matches!(self, Opt::Cycle(_))].iter().position(|m| *m).unwrap_or(0) }
+    pub fn rank(&self) -> usize { [matches!(self, Opt::As(_)), matches!(self, Opt::Increment(_)), matches!(self, Opt::Min(_)), matches!(self, Opt::Max(_)), matches!(self, Opt::Start(_)), matches!(self, Opt::Cache(_)), matches!(self, Opt::Cycle(_))].iter().position(|m| *m).unwrap_or(0) }
     fn sql(&self) -> String {
         match self {
             Opt::As(t) => format!("AS {t}"),
@@ -64,6 +64,17 @@ impl Opt {
 }
 
 /// The options as SQL, each kind once (the last written), in Postgres's order.
+/// The options a `CREATE SEQUENCE` statement declares, or None when it isn't one (an apply compares them).
+pub fn declared(sql: &str) -> Option<Vec<Opt>> {
+    match statement(sql) {
+        Some(Stmt::Ddl(mut d)) => match d.pop() {
+            Some(crate::ddl::Ddl::Sequence(Change::Create { declared, .. })) => Some(declared),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub fn options_sql(declared: &[Opt]) -> String {
     let last: Vec<&Opt> = (0..7).filter_map(|r| declared.iter().rev().find(|o| o.rank() == r)).collect();
     last.iter().map(|o| o.sql()).collect::<Vec<_>>().join(" ")
