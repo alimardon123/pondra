@@ -11,8 +11,8 @@
    "after_last_event_s": 27.5,
    "events_sent_s": 52.71,
    "wrong": 0,
-   "peak_rss_mb": 7155,
-   "note": "from the first event sent until every view's answer equals DuckDB's; q18 (each bidder's latest bid on an auction) is last. Peak memory includes the in-memory columns, which take up to a quarter of RAM"
+   "peak_rss_mb": 8021,
+   "note": "from the first event sent until every view's answer equals DuckDB's; q18 (each bidder's latest bid on an auction) is last. Peak memory (the most of the three runs, sampled every 2 s) includes the in-memory columns, which take up to a quarter of RAM"
   },
   "flink_rocksdb_s": 685.17,
   "flink_rocksdb_peak_rss_mb": 8957,
