@@ -399,3 +399,41 @@ for the tools that read it (to it, a materialized view is a `BASE TABLE`).
 SELECT schema, name, kind FROM pondra.tables WHERE lake = 'lake' ORDER BY 1, 2;
 SELECT table_name FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = 'public' ORDER BY 1;
 ```
+
+## Write, audit, publish
+
+Write a rebuilt table's new rows somewhere readers don't look, check them, then make them the table
+in one step. Write them to a clone: `CREATE TABLE … CLONE` copies no file. Then
+`ALTER TABLE orders SWAP WITH orders_wap` exchanges the two tables in one commit. Readers of `orders`
+see the new rows at once, and the old rows are under `orders_wap`, so putting them back is one more
+swap.
+
+A swap moves each table's rows, files, row ids and past. Comments, indexes, grants and views stay with
+the names, so a view of `orders` reads the new rows. The two tables must differ in nothing but their
+rows, which a clone always does. A swap is refused for a published or shared table, for a table that a
+materialized view or a task follows, and for tables that differ in more than their rows.
+
+```sql
+CREATE TABLE orders_wap CLONE orders;
+INSERT INTO orders_wap VALUES (3, 'tea', 1, 3.5, TIMESTAMP '2026-09-27 12:00:00');
+ALTER TABLE orders SWAP WITH orders_wap;
+SELECT count(*) FROM orders;
+ALTER TABLE orders SWAP WITH orders_wap;
+SELECT count(*) FROM orders;
+```
+
+```text
++----------+
+| count(*) |
++----------+
+| 3        |
++----------+
++----------+
+| count(*) |
++----------+
+| 2        |
++----------+
+```
+
+After a publish you are happy with, `DROP TABLE orders_wap` removes the old rows. Like any dropped
+table, they are kept for a day, and `UNDROP TABLE` brings them back.

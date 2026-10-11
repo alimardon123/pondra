@@ -633,6 +633,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
                 let to = to.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
                 Stmt::Ddl(vec![Ddl::RenameTable { name: object(&a.name), to }])
             }
+            [ast::AlterTableOperation::SwapWith { table_name }] => Stmt::Ddl(vec![Ddl::Swap { name: object(&a.name), with: object(table_name) }]),
             // Snowflake's and Databricks' `ALTER TABLE t CLUSTER BY (a, b)`: `SET (cluster_by = 'a, b')`.
             [ast::AlterTableOperation::ClusterBy { exprs }] => Stmt::SetOptions(object(&a.name), vec![("cluster_by".into(), exprs.iter().flat_map(cluster_names).collect::<Vec<_>>().join(", "))]),
             [op @ (ast::AlterTableOperation::AddConstraint { .. } | ast::AlterTableOperation::DropConstraint { .. })] => match crate::constraints::change(op, &object(&a.name)) {

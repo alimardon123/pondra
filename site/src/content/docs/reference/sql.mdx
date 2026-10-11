@@ -215,6 +215,7 @@ past starts when it was made.
 | Drop | `DROP TABLE [IF EXISTS] t [, t2 …] [PURGE]` |
 | Bring back a dropped table | `UNDROP TABLE t` |
 | Copy a table without copying files | `CREATE TABLE [IF NOT EXISTS] c [SHALLOW] CLONE t` |
+| Publish a table written beside another | `ALTER TABLE t SWAP WITH u`: the two exchange names in one commit, alike but for their rows (files, row ids and past go with them; comments, indexes, grants and views stay with the names). Refused for a published or shared table, one a materialized view or a task follows, or tables that differ in more than their rows ([write, audit, publish](/pondra/guides/tables/#write-audit-publish)) |
 | Put a table back as it was | `RESTORE TABLE t TO VERSION AS OF n`, or `TO TIMESTAMP AS OF '…'` |
 
 A table of that name already there refuses `CREATE TABLE` (`42P07`, as in Postgres), whether it
