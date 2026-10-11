@@ -990,7 +990,7 @@ async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Result<Vec<Str
             _ if meta.merge.is_empty() => None,
             _ if !alone(&plan(lake, &v).await?, true) => Some("reads other tables too"),
             _ if meta.merge.values().any(|f| !["sum", "count", crate::finish::MOMENTS].contains(&f.as_str())) => Some("keeps a min or max"),
-            _ if !meta.merge.values().any(|f| f == "count") => Some("has no count(*) to drop the groups a change empties"),
+            _ if !meta.merge.values().any(|f| f == "count") => Some("has no count(*) to drop the groups a change empties: make it again with count(*) among its columns, or WITH (refresh = 'by key')"),
             _ if meta.columns.iter().any(|(c, t)| meta.merge.contains_key(c) && t.starts_with("UInt")) => Some("adds up an unsigned column (it can't subtract)"),
             _ => None,
         };

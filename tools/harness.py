@@ -3300,7 +3300,7 @@ def guard():
     small = {"PONDRA_SPREAD_MB": "1"}  # (tables this small are left on one node by size alone)
     slow = Node(lake, A.port, env={"PONDRA_LINK": "40,60", **small}).start()
     fast = Node(lake, A.port + 1, env={"PONDRA_LINK": "0.2,5000", "PONDRA_DEBUG_SPREAD": "1", **small}).start()
-    third = Node(lake, A.port + 2, env=small).start()
+    third = Node(lake, A.port + 2, env={"PONDRA_DEBUG_SPREAD": "1", **small}).start()  # (its log says what the guard knew)
     n = itertools.count()  # (a comment makes each ask new to the result cache; the guard knows it as the same query)
     q = lambda s, port, spread=None: call(port, "POST", "/sql" + ("" if spread is None else f"?spread={spread}"), f"{s} -- {next(n)}".encode(), timeout=300)
     q("CREATE TABLE f (id BIGINT, k BIGINT, v DOUBLE, p BIGINT) WITH (partition_by = 'p')", A.port)  # (a file per partition, merged or not)
@@ -3354,6 +3354,9 @@ def guard():
         went = spreads(third.port) > before
         if max(here, spread) > 1.5 * min(here, spread):  # (clearly apart: else either is right)
             learned.append(went == (spread < here))
+            if learned[-1] is False:
+                print(f"guard: {s[:40]!r} took {here:.3f}s here, {spread:.3f}s spread, and went {'spread' if went else 'here'}; its node said:",
+                      *[l.rstrip() for l in open(third.log) if l.startswith("spread: ")][-4:], sep="\n  ")
     [n.kill() for n in (slow, fast, third)]
     checks = {"the same answers every way": all(r["slow"][0] and r["fast"][0] and r["forced"][0] for r in out.values()),
               "a query nothing is known about stays on one node": all(r["slow"][2] and r["fast"][2] for r in out.values()),
@@ -6399,6 +6402,71 @@ def found():
     flown = client.do_get(fl.Ticket(json.dumps({"sql": few}))).read_all()
     seen["few"] = (len(sent), flown.nbytes, flown.num_rows)
     checks["a few rows of a table's, sent as Arrow (HTTP, Flight), carry only their own strings"] = len(sent) < 16 << 10 and flown.nbytes < 16 << 10 and flown.num_rows == 5
+    # A request's status, SQLSTATE header and body, whatever it answers (a refusal is a check's, not a crash).
+    def answer(path, s):
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", path, s.encode())
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode()
+    # json_get answers a union (a number, a string, a list, nothing): over HTTP, as its text (JSON, typed, CSV).
+    import csv, io
+    jg = """SELECT json_get('{"a": 1}', 'a') AS i, json_get('{"a": "x"}', 'a') AS s, json_get('{"a": [1,2]}', 'a') AS l, json_get('{}', 'a') AS n"""
+    jrow = q(jg)
+    typed_status, _, typed_text = answer("/sql?format=typed", jg)
+    csv_status, _, csv_text = answer("/sql?format=csv", jg)
+    typed_rows = json.loads(typed_text).get("rows", []) if typed_status == 200 else None
+    crows = list(csv.reader(io.StringIO(csv_text))) if csv_status == 200 else []
+    seen["json_get"] = (jrow, typed_status, typed_text[:300], csv_status, csv_text[:300])
+    checks["a JSON value json_get returns (a union) is answered as its text over HTTP: JSON, typed and CSV"] = \
+        len(jrow) == 1 and jrow[0].get("i") == "1" and jrow[0].get("s") == "x" and jrow[0].get("l", "").replace(" ", "") == "[1,2]" and jrow[0].get("n") is None \
+        and bool(typed_rows) and len(typed_rows) == 1 and crows[:1] == [["i", "s", "l", "n"]] and len(crows) == 2 and crows[1][:2] == ["1", "x"] \
+        and crows[1][2].replace(" ", "") == "[1,2]" and crows[1][3] == ""
+    # The same answer over Flight (a string column, the same values) and in a table made of it (CREATE TABLE … AS).
+    try:
+        fj = client.do_get(fl.Ticket(json.dumps({"sql": jg}))).read_all()
+        flown_jg = {"type": str(fj.schema.field("i").type), "rows": [{**r, "l": (r["l"] or "").replace(" ", "")} for r in fj.to_pylist()]}
+    except Exception as e:
+        flown_jg = {"error": str(e)[:300]}
+    jt_err = _raises_text(lambda: q("CREATE TABLE jt AS " + jg))
+    jt_rows = q("SELECT * FROM jt") if not jt_err else None
+    seen["json_get_flight"] = (flown_jg, jt_err[:300], jt_rows)
+    checks["a JSON value json_get returns is a string over Flight (1, x, [1,2], NULL), and a table made of it keeps the text"] = \
+        flown_jg.get("type") == "string" and flown_jg.get("rows") == [{"i": "1", "s": "x", "l": "[1,2]", "n": None}] and not jt_err and jt_rows == jrow
+    # A merge table takes INSERTs only: UPDATE and DELETE are refused as the merge table's own, not a view's. (4 + 2 is 6,
+    # so an UPDATE to 5 that went through would show.)
+    q("CREATE TABLE totals (k BIGINT PRIMARY KEY, n BIGINT MERGE sum)")
+    q("INSERT INTO totals VALUES (1, 2)")
+    q("INSERT INTO totals VALUES (1, 4)")
+    seen["merge_upd"] = answer("/sql", "UPDATE totals SET n = 5 WHERE k = 1")
+    seen["merge_del"] = answer("/sql", "DELETE FROM totals WHERE k = 1")
+    total = q("SELECT k, n FROM totals")
+    # (A keyed merge table's UPDATE and DELETE are refused in write.rs, a keyless one's in change.rs: both 0A000.)
+    checks["UPDATE and DELETE on a merge table made by CREATE TABLE refused by name (not called a view's), 0A000"] = \
+        all(a[0] != 200 and a[1] == "0A000" and ("merge tables combine rows per key" in a[2] or "is a merge table" in a[2]) and "is a view's" not in a[2]
+            for a in (seen["merge_upd"], seen["merge_del"])) and total == [{"k": 1, "n": 6}]
+    # dbt's snapshots: a DELETE or UPDATE that matches no row changes nothing, so a view that can't take rows back (a sum
+    # with no count) doesn't refuse it; a MERGE that only inserts is followed; a column named *_deleted isn't _deleted.
+    q("CREATE TABLE snap (k BIGINT, v BIGINT)")
+    q("INSERT INTO snap VALUES (1, 10), (2, 20)")
+    q("CREATE MATERIALIZED VIEW snap_sum AS SELECT k, sum(v) AS v FROM snap GROUP BY k")
+    seen["noop"] = (answer("/sql", "DELETE FROM snap WHERE k = 3"), answer("/sql", "UPDATE snap SET v = 0 WHERE k = 3"))
+    seen["merge_in"] = answer("/sql", "MERGE INTO snap USING (SELECT 3 AS k, 30 AS v) s ON snap.k = s.k WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.v)")
+    seen["taken_back"] = answer("/sql", "DELETE FROM snap WHERE k = 1")
+    seen["snap_sum"] = q("SELECT k, v FROM snap_sum ORDER BY k")
+    seen["dbt_deleted"] = answer("/sql", "SELECT *, 'False' AS dbt_is_deleted FROM snap ORDER BY k")
+    checks["dbt's snapshots: a DELETE and an UPDATE matching no row change nothing (rows 0) under a view that can't take rows back; a MERGE that only inserts is followed; a real take-back still refused"] = \
+        all(a[0] == 200 and '"rows":0' in a[2].replace(" ", "") for a in seen["noop"]) and seen["merge_in"][0] == 200 \
+        and seen["taken_back"][0] != 200 and "count(*)" in seen["taken_back"][2] \
+        and seen["snap_sum"] == [{"k": 1, "v": 10}, {"k": 2, "v": 20}, {"k": 3, "v": 30}]
+    checks["a column named dbt_is_deleted isn't a keyed table's _deleted: SELECT *, 'False' AS dbt_is_deleted answers"] = \
+        seen["dbt_deleted"][0] == 200 and len(json.loads(seen["dbt_deleted"][2])) == 3
+    # An UPDATE of a keyed table keeps the row's own _deleted: an updated row isn't deleted, so it stays NULL, not false.
+    q("CREATE TABLE kv (k BIGINT PRIMARY KEY, v VARCHAR)")
+    q("INSERT INTO kv VALUES (1, 'a')")
+    q("UPDATE kv SET v = 'b' WHERE k = 1")
+    seen["kv"] = q("SELECT k, v, _deleted FROM kv")
+    checks["a keyed table's UPDATE keeps _deleted as it was (NULL), not false"] = \
+        [{"k": r.get("k"), "v": r.get("v"), "_deleted": r.get("_deleted")} for r in seen["kv"]] == [{"k": 1, "v": "b", "_deleted": None}]
     node.kill(); locked.kill()
     ok = all(checks.values())
     print(json.dumps({"found": checks, "ok": ok}, indent=1))

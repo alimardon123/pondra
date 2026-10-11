@@ -998,6 +998,7 @@ impl Lake {
         let mut ctx = SessionContext::new_with_state(state.build());
         spark(&ctx); // format_string, pmod, parse_url, …
         datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
+        crate::query::register_json_text(&ctx); // pondra_json_text(x): a union (json_get's answer) as its text
         crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
         crate::asof::register(&ctx); // (ASOF JOIN's marker)
         crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order

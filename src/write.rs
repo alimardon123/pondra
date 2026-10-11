@@ -953,18 +953,18 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
     match stmt {
         Stmt::Insert(_, query) => Ok(query.clone()),
         Stmt::Update(t, set, cond) => {
-            ensure!(meta.merge.is_empty(), "merge tables combine rows per key: INSERT into them instead");
+            if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", "merge tables combine rows per key: INSERT into them instead of UPDATE")); }
             ensure!(set.iter().all(|(c, _)| !meta.key.contains(c) && meta.columns.iter().any(|(n, _)| n == c)), "UPDATE sets existing non-key columns");
             crate::seq::check_set(meta, &set.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
             let pick = |c: &str| match set.iter().find(|(s, _)| s == c) {
                 Some((_, e)) => format!("({e})"),
-                None if c == "_deleted" => "false".into(),
-                None => q(c),
+                None => q(c), // (`_deleted` too: an updated row keeps its own, as `change::select_as` does)
             };
             Ok(select(&pick, t, cond))
         }
         Stmt::Delete(t, cond) => {
-            ensure!(meta.merge.is_empty() && deletes, "DELETE needs an upsert table with a Boolean _deleted column");
+            if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", "merge tables combine rows per key: INSERT into them instead of DELETE")); }
+            ensure!(deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
         Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) => unreachable!("not a row write here"),
