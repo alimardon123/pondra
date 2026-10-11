@@ -204,6 +204,7 @@ impl Client {
             for b in &self.s.brokers {
                 match self.metadata(b, topic, create).await {
                     Ok(p) => return Ok(p),
+                    Err(e) if e.is::<NoTopic>() => return Err(e),
                     Err(e) => {
                         self.drop_conn(b).await;
                         last = Some(e);
@@ -230,12 +231,15 @@ impl Client {
             r.nstr()?; // rack
             brokers.insert(id, format!("{host}:{port}"));
         }
-        r.nstr()?; // cluster id
+        let cluster = r.nstr()?;
         r.i32()?; // controller
         let mut out = vec![];
         for _ in 0..r.len()? {
             let (err, name) = (r.i16()?, r.str()?);
             r.i8()?; // internal
+            if err == 3 && cluster.as_deref() == Some("pondra") {
+                return Err(NoTopic(name).into());
+            }
             ensure!(err != 3, "no topic {name} in the cluster");
             ensure!(err == 0, "the cluster's metadata for {name}: error {err}");
             for _ in 0..r.len()? {
@@ -536,6 +540,20 @@ pub async fn read(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionC
     let table = datafusion::catalog::streaming::StreamingTable::try_new(schema.clone(), parts)?;
     Ok(ctx.read_table(Arc::new(table))?)
 }
+
+/// A Pondra node has no such topic, and won't make one: its topics are its tables. Kafka answers a
+/// topic it is still making as unknown too, so only a Pondra node's answer stops the asking at once
+/// (asking ten times took a COPY to a missing topic 3 s).
+#[derive(Debug)]
+struct NoTopic(String);
+
+impl std::fmt::Display for NoTopic {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "no topic {} on this Pondra node: a topic is a table (CREATE TABLE {} …)", self.0, self.0)
+    }
+}
+
+impl std::error::Error for NoTopic {}
 
 #[derive(Debug)]
 struct Range {

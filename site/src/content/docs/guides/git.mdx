@@ -1,0 +1,125 @@
+---
+title: Git folders
+description: Pair a project folder in the workspace with a branch of a GitHub repository, then check out, commit, pull and open pull requests from SQL with no git program; a person's token is a secret whose SCOPE says where it may go.
+---
+
+A Git folder is a folder of the workspace paired with a branch of a GitHub repository. The node talks
+to GitHub itself, so the console, or any SQL that calls a procedure, commits the project's files and
+opens pull requests, with no `git` installed. The folder holds a [project](/pondra/guides/projects/),
+and `pondra` applies it the same way.
+
+## Give a person a token
+
+Each person keeps their own token as a secret, so commits and pull requests are theirs. Its `SCOPE`
+says which repositories it may go to:
+
+```sql
+CREATE SECRET ann_git (TYPE git, TOKEN 'ghp_…', SCOPE 'https://github.com/acme');
+```
+
+Grant it to the people who may use it: `GRANT USAGE ON SECRET ann_git TO ann;`. Secrets and their
+`SCOPE` are covered in [security](/pondra/guides/security/#secrets).
+
+## Refused outside the scope
+
+A token goes only to a repository its `SCOPE` covers. A repository outside it is refused before the
+node asks GitHub anything, and so is a folder that isn't a Git folder yet:
+
+```python
+import pondra
+db = pondra.connect("http://localhost:8080")
+
+def refused(sql):
+    try:
+        db.sql(sql)
+    except RuntimeError as error:
+        return str(error).split(": ", 1)[1]
+    return "ran"
+
+print(refused("CALL git_checkout('sales', repository => 'https://github.com/other/sales', branch => 'main')"))
+print(refused("SELECT * FROM pondra.git_status('sales')"))
+```
+
+```text
+no git secret covers https://github.com/other/sales: an admin makes one (CREATE SECRET name (TYPE git, TOKEN '…', SCOPE 'https://github.com/other/sales')) and grants USAGE on it
+files/sales is not a Git folder: CALL git_checkout('sales', repository => …, branch => …) first
+```
+
+## Check out a repository
+
+`git_checkout` copies a branch's files into the folder and writes the folder's record, which says which
+repository, branch and commit the folder matches. The first checkout names the repository; later ones
+name only the branch.
+
+```sql norun
+CALL git_checkout('sales', repository => 'https://github.com/acme/sales', branch => 'main');
+CALL plan('files/sales');                                -- the project checked out, as any other
+```
+
+## See what changed
+
+`pondra.git_status` lists the folder's changes since its commit as rows: `path`, `change` (`added`,
+`modified` or `deleted`), `branch` and `commit`. It reads the folder's record and its files, so it needs
+no network. `CALL git_status('sales')` gives the same rows.
+
+```sql norun
+SELECT * FROM pondra.git_status('sales');
+```
+
+## Commit
+
+`git_commit` writes every changed file on top of the folder's commit and moves the branch onto it. Name
+`paths` to commit only some.
+
+```sql norun
+CALL git_commit('sales', 'Discounts by channel');
+CALL git_commit('sales', 'Discounts', paths => ['objects/sales/discounts.sql']);
+```
+
+- **A commit only moves the branch forward.** If someone pushed since the folder's commit, the commit is
+  refused: `main moved on since 1a2b3c4 (the folder's commit): git_pull('sales') first`. Nothing is lost.
+- **Of two commits of one folder at once**, the second is told to try again.
+
+## Pull
+
+`git_pull` writes the branch's new commits into the folder, so you have what others pushed.
+
+```sql norun
+CALL git_pull('sales');
+```
+
+A file changed both here and on the branch, to different things, is refused by name, and nothing changes:
+commit or undo one side, then pull.
+
+## Branches
+
+`git_checkout` with a `branch` moves the folder to another branch of the same repository. A branch the
+repository lacks is made at the folder's commit, and the local changes carry over, as `git switch -c`
+does.
+
+```sql norun
+CALL git_checkout('sales', branch => 'discounts');
+```
+
+A switch to a branch that exists is refused while the folder has changes not committed, and names the
+files.
+
+## Pull requests
+
+`git_pull_request` opens a pull request from the folder's branch into the repository's default branch. Name
+`base` to aim it at another.
+
+```sql norun
+CALL git_pull_request('sales', title => 'Discounts by channel');
+```
+
+## Who may do what
+
+- `git_status` reads a folder, so any reader may call it.
+- `git_checkout`, `git_commit`, `git_pull` and `git_pull_request` write the workspace's files, so they need
+  a write token (or a user with the right to write).
+- A token goes only to a repository its `SCOPE` covers, over https (or to this machine), and only for those
+  with `USAGE` on the secret. It is never used to read files. Any of these procedures takes
+  `secret => 'name'` when more than one secret covers a repository.
+- **GitLab** is next. `PROVIDER 'gitlab'` is refused by name for now.
+

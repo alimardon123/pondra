@@ -1,0 +1,215 @@
+---
+title: Windows and sessions
+description: Keep each time window or session once it is over, with lateness, idle time, sliding windows, and the rows that arrive too late.
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A window keeps each time bucket of rows, such as each minute, once event time has moved past its end.
+A session keeps one key's run of rows once the gap after them has passed. Both come from `EMIT FINAL`
+on a materialized view, and each is written once, so a total for a closed minute doesn't change.
+
+## Windows: each group once it's over
+
+A grouped view keeps running totals: a group changes with every row that arrives. Add `EMIT FINAL`
+and the view keeps each group only once it is over, when event time has moved past it. Group by a
+time bucket of an event-time column: `date_bin`, `date_trunc`, a date, or any expression that only
+grows as time does.
+
+```sql
+CREATE TABLE taps (user VARCHAR, ts TIMESTAMP);
+```
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    CREATE MATERIALIZED VIEW per_minute WITH (lateness = '10 seconds') AS
+      SELECT date_bin(INTERVAL '1 minute', ts) AS minute, user, count(*) AS n
+      FROM taps GROUP BY 1, 2
+      EMIT FINAL;
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.connect("http://localhost:8080")
+    db.view("per_minute",
+            "SELECT date_bin(INTERVAL '1 minute', ts) AS minute, user, count(*) AS n FROM taps GROUP BY 1, 2",
+            materialized=True, lateness="10 seconds", emit="final")
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    await db.view("per_minute",
+      "SELECT date_bin(INTERVAL '1 minute', ts) AS minute, user, count(*) AS n FROM taps GROUP BY 1, 2",
+      { materialized: true, lateness: "10 seconds", emit: "final" });
+    ```
+  </TabItem>
+</Tabs>
+
+`lateness` is how far out of order rows may arrive. The **watermark** is the newest event time in
+the stream less that lateness, and a minute is over when the watermark passes its end. A row that
+is out of order by less than `lateness` always counts.
+
+```sql
+INSERT INTO taps VALUES
+  ('ann', '2026-09-29 10:00:05'), ('ann', '2026-09-29 10:00:35'), ('bob', '2026-09-29 10:00:50'),
+  ('ann', '2026-09-29 10:01:20'), ('bob', '2026-09-29 10:01:40'),
+  ('bob', '2026-09-29 10:02:30');
+```
+
+The leader looks for groups that are over twice a second, so give it a moment:
+
+```bash
+sleep 2
+```
+
+```sql
+SELECT minute, user, n FROM per_minute ORDER BY minute, user;
+```
+
+```text
+minute               user  n
+2026-09-29T10:00:00  ann   2
+2026-09-29T10:00:00  bob   1
+2026-09-29T10:01:00  ann   1
+2026-09-29T10:01:00  bob   1
+```
+
+The 10:02 minute isn't there yet. The newest row is 10:02:30, so the watermark is 10:02:20, before
+the minute's end. The view's query run on its own answers it as it is now, open minute and all:
+
+```sql
+SELECT date_bin(INTERVAL '1 minute', ts) AS minute, user, count(*) AS n
+FROM taps GROUP BY 1, 2 ORDER BY 1, 2;
+```
+
+```text
+minute               user  n
+2026-09-29T10:00:00  ann   2
+2026-09-29T10:00:00  bob   1
+2026-09-29T10:01:00  ann   1
+2026-09-29T10:01:00  bob   1
+2026-09-29T10:02:00  bob   1
+```
+
+A view made over rows already in the table starts from them, and keeps each group of them that is
+over at once.
+
+### Late rows
+
+A row that arrives after its group was kept is late. It is in the table, and the view keeps what
+it had. `pondra.flows` counts each view's late rows:
+
+```sql
+INSERT INTO taps VALUES ('ann', '2026-09-29 10:00:59');
+```
+
+```bash
+sleep 1
+```
+
+```sql
+SELECT name, late_rows FROM pondra.flows WHERE name = 'per_minute';
+```
+
+```text
+name        late_rows
+per_minute  1
+```
+
+If the count keeps growing, raise `lateness`: each group is then kept that much later.
+
+### When the stream goes quiet
+
+The watermark moves with the rows, so the last group of a stream that stops waits for the next
+row. `idle` moves it on with the clock once no newer row has come for that long:
+
+```sql
+CREATE MATERIALIZED VIEW per_minute_now WITH (idle = '30 seconds') AS
+  SELECT date_trunc('minute', ts) AS minute, count(*) AS n FROM taps GROUP BY 1
+  EMIT FINAL;
+```
+
+A row that comes for a group kept that way is late.
+
+### Sliding windows
+
+A total over the last five minutes, every minute, is a window frame over the minutes kept. Each row
+is counted once, in its minute, and the frame adds five of them up when it is read:
+
+```sql
+SELECT minute, user,
+  sum(n) OVER (PARTITION BY user ORDER BY minute
+               RANGE BETWEEN INTERVAL '4 minutes' PRECEDING AND CURRENT ROW) AS last_five
+FROM per_minute ORDER BY minute, user;
+```
+
+```text
+minute               user  last_five
+2026-09-29T10:00:00  ann   2
+2026-09-29T10:00:00  bob   1
+2026-09-29T10:01:00  ann   3
+2026-09-29T10:01:00  bob   2
+```
+
+## Session windows
+
+A session is one key's rows with no gap longer than an interval between them. Group by the key and
+`SESSION(ts, INTERVAL …)`, then add `EMIT FINAL`. Pondra adds `session_start` and `session_end` (the
+last row plus the gap) and keeps each session once, whole, when the watermark passes its end.
+
+```sql
+CREATE TABLE visits (user VARCHAR, ts TIMESTAMP, amount BIGINT);
+CREATE MATERIALIZED VIEW sessions WITH (lateness = '5 seconds') AS
+  SELECT user, count(*) AS n, sum(amount) AS spent FROM visits
+  GROUP BY user, SESSION(ts, INTERVAL '30 seconds')
+  EMIT FINAL;
+INSERT INTO visits VALUES
+  ('ann', '2026-09-29 10:00:00', 2), ('ann', '2026-09-29 10:00:10', 2), ('ann', '2026-09-29 10:00:20', 2),
+  ('bob', '2026-09-29 10:00:00', 2), ('bob', '2026-09-29 10:00:25', 2),
+  ('bob', '2026-09-29 10:02:00', 2),
+  ('cy',  '2026-09-29 10:05:00', 2);
+```
+
+```bash
+sleep 2
+```
+
+```sql
+SELECT user, n, spent, session_start, session_end FROM sessions ORDER BY user, session_start;
+```
+
+```text
+user  n  spent  session_start        session_end
+ann   3  6      2026-09-29T10:00:00  2026-09-29T10:00:50
+bob   2  4      2026-09-29T10:00:00  2026-09-29T10:00:55
+bob   1  2      2026-09-29T10:02:00  2026-09-29T10:02:30
+```
+
+Bob's rows at 10:00:25 and 10:02:00 are more than 30 seconds apart, so they are two sessions. Cy's
+row moved the watermark to 10:04:55, which closed everything before it. A row that falls inside a
+session already kept is late, and is left out. A row behind the watermark whose session isn't over
+yet still counts.
+
+<Aside type="caution">
+A session view starts from the moment it is created; rows already in the table are not part of
+it.
+</Aside>
+
+<Aside type="note">
+Before `EMIT FINAL`, windows and sessions were options: `WITH (window = 'w', size_secs = 60,
+lateness_secs = 10)` kept every window, open or not, in the view and each one once in
+`<view>_final`; `WITH (session = 'ts', gap_secs = 30)` is the `SESSION(…)` above. Both still work
+([table options](/pondra/sql/table-options/#materialized-views)).
+</Aside>
+
+## What windows and sessions don't do yet
+
+- There is one watermark per source table, not per partition or node. A source that goes quiet
+  holds it: its last sessions wait for more rows (a window view's `idle` moves it on).
+- Top-N by event time, timers and `MATCH_RECOGNIZE` don't exist.
+- A window view's late rows are counted (`pondra.flows`' `late_rows`), not kept apart; there's no
+  side output for them. A session view leaves its late rows out without counting them yet.

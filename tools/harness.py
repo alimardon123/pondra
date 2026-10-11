@@ -351,6 +351,191 @@ def external():
     return ok
 
 
+def loads():
+    """COPY INTO t FROM 'path' (invariant 337): each file of a folder, glob or query loaded once a
+    version, whether a retry, a second statement at once, two nodes at once or a node killed mid-way
+    loads it; a changed file loads again, FORCE loads all; records follow the table's folder through
+    renames and drops; columns by name or by position; refusals by name; S3 with a secret only."""
+    import base64, boto3, threading, socket
+    owner_key, s3p = uuid.uuid4().hex, A.port + 60
+    for port in (s3p,):  # (a server left from a run that died would answer with that run's files)
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                raise RuntimeError(f"port {port} is already in use")
+    d = tempfile.mkdtemp(prefix="pondra-loads-")
+    write = lambda rel, text: (os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True), open(os.path.join(d, rel), "w").write(text))
+    write("in/a.csv", "id,amount\n1,10\n2,20\n")
+    write("in/b.csv", "id,amount\n3,30\n")
+    write("in/c.csv", "id,amount\n4,40\n5,50\n")
+    lake = new_lake()
+    nodes = [Node(lake, A.port + i, env={"PONDRA_OWNER_KEY": owner_key}).start() for i in range(3)]
+
+    def run(s, i=0):
+        return call(A.port + i, "POST", "/sql", s.encode(), headers={"x-pondra-owner": owner_key})
+
+    def refused(s, i=0):
+        try:
+            run(s, i)
+            return ""
+        except RuntimeError as e:
+            return str(e)
+
+    def count(t, i=0):
+        return run(f"SELECT count(*) AS n, coalesce(sum(amount), 0) AS s FROM {t}", i)[0]
+
+    run("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+    checks = {}
+    first = run(f"COPY INTO orders FROM '{d}/in/' (FORMAT csv, HEADER true)")
+    checks["1. COPY INTO a folder: the rows its files hold, and the answer lists the three files with their rows"] = (
+        count("orders") == {"n": 5, "s": 150} and sorted((l["file"].rsplit("/", 1)[1], l["rows"]) for l in first["loaded"]) == [("a.csv", 2), ("b.csv", 1), ("c.csv", 2)] and first["rows"] == 5)
+    second = run(f"COPY INTO orders FROM '{d}/in/' (FORMAT csv, HEADER true)")
+    checks["2. the same statement again: zero rows, and the notice"] = second["rows"] == 0 and second["loaded"] == [] and "was loaded before" in second.get("notice", "")
+    write("in/d.csv", "id,amount\n6,60\n")
+    write("in/b.csv", "id,amount\n9,90\n")  # (rewritten under its name, other rows)
+    third = run(f"COPY INTO orders FROM '{d}/in/' (FORMAT csv, HEADER true)")
+    checks["3. a fourth file and a rewritten one load; nothing else does"] = sorted(l["file"].rsplit("/", 1)[1] for l in third["loaded"]) == ["b.csv", "d.csv"] and count("orders") == {"n": 7, "s": 300}
+    forced = run(f"COPY INTO orders FROM '{d}/in/' (FORMAT csv, HEADER true, FORCE true)")
+    checks["4. FORCE true loads every file again"] = forced["rows"] == 6 and len(forced["loaded"]) == 4 and count("orders") == {"n": 13, "s": 570}
+
+    listed = run("SELECT name, file, version, rows FROM pondra.loads WHERE name = 'orders' ORDER BY file")
+    checks["7. pondra.loads lists each file of the table, its version and rows (a system table)"] = (
+        sorted((r["file"].rsplit("/", 1)[1], r["rows"]) for r in listed) == [("a.csv", 2), ("b.csv", 1), ("c.csv", 2), ("d.csv", 1)] and all(r["version"] for r in listed))
+
+    run("CREATE TABLE events (id BIGINT, amount BIGINT)")
+    for i in range(6):
+        write(f"many/f{i}.csv", "id,amount\n" + "".join(f"{i * 100 + j},{j}\n" for j in range(50)))
+    got = {}
+    threads = [threading.Thread(target=lambda i=i: got.__setitem__(i, run(f"COPY INTO events FROM '{d}/many/' (FORMAT csv, HEADER true)", i))) for i in (0, 1)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    files = sorted(l["file"] for r in got.values() for l in r["loaded"])
+    checks["5. two COPY INTO of one folder at once, from two nodes: every file once"] = (len(files) == len(set(files)) == 6 and count("events") == {"n": 300, "s": 6 * sum(range(50))})
+
+    run("CREATE TABLE big (id BIGINT, amount BIGINT)")
+    for i in range(20):
+        write(f"killed/k{i:02d}.csv", "id,amount\n" + "".join(f"{i * 10000 + j},{j}\n" for j in range(20000)))
+    def victim_statement():
+        try:
+            run(f"COPY INTO big FROM '{d}/killed/' (FORMAT csv, HEADER true)", 2)
+        except (RuntimeError, http.client.HTTPException, OSError):
+            pass  # (its node was killed under it: the answer is lost, the files it committed stay)
+    victim = threading.Thread(target=victim_statement)
+    victim.start()
+    deadline = time.time() + 60
+    while count("big", 0)["n"] == 0 and victim.is_alive() and time.time() < deadline:
+        time.sleep(0.05)  # (the kill lands once the first file has committed)
+    nodes[2].kill()
+    victim.join()
+    again = run(f"COPY INTO big FROM '{d}/killed/' (FORMAT csv, HEADER true)", 0)
+    checks["6. a node killed in a COPY INTO of 20 files, the statement run again elsewhere: every file once"] = count("big") == {"n": 400000, "s": sum(range(20000)) * 20} and again["rows"] < 400000
+
+    write("pos/x.csv", "7,70\n8,80\n")
+    write("sub/h1.csv", "id,amount\n10,1\n")
+    write("sub/h2.csv", "id,amount\n11,2\n")
+    headerless = run(f"COPY INTO events FROM '{d}/pos/' (FORMAT csv, HEADER false)")
+    subquery = run(f"COPY INTO orders FROM (SELECT id, CAST(amount AS BIGINT) AS amount FROM '{d}/sub/*.csv')")
+    checks["9. a headerless CSV loads by position; FROM (SELECT … FROM '…') with a cast"] = headerless["rows"] == 2 and subquery["rows"] == 2 and count("orders")["n"] == 15
+
+    write("bad/x.csv", "id,note\n1,hi\n")
+    checks["10a. a file column the table lacks is refused by name, with both ways out"] = (
+        "orders has no column note (in " in refused(f"COPY INTO orders FROM '{d}/bad/' (FORMAT csv, HEADER true)") and "ALTER TABLE orders ADD COLUMN note" in refused(f"COPY INTO orders FROM '{d}/bad/' (FORMAT csv, HEADER true)"))
+    checks["10b. FILEFORMAT = CSV is refused, saying (FORMAT csv)"] = "(FORMAT csv)" in refused(f"COPY INTO orders FROM '{d}/in/' FILEFORMAT = CSV")
+    checks["10c. PATTERN = '…' is refused, saying a glob in the path"] = "a glob in the path" in refused(f"COPY INTO orders FROM '{d}/in/' PATTERN = '*.csv'")
+    run("CREATE VIEW vw AS SELECT * FROM orders")
+    checks["10d. a view as the target is refused"] = "a view" in refused(f"COPY INTO vw FROM '{d}/in/' (FORMAT csv, HEADER true)")
+    run("CREATE TABLE kt (id BIGINT PRIMARY KEY, amount BIGINT)")
+    checks["10e. a keyed table is refused: INSERT INTO … SELECT … upserts each run"] = "upserts each run" in refused(f"COPY INTO kt FROM '{d}/in/' (FORMAT csv, HEADER true)")
+
+    run("ALTER TABLE orders RENAME TO orders2")
+    renamed = run(f"COPY INTO orders2 FROM '{d}/in/' (FORMAT csv, HEADER true)")
+    checks["12a. after a RENAME, the same folder loads nothing again"] = renamed["rows"] == 0 and count("orders2") == {"n": 15, "s": 573}
+    run("DROP TABLE orders2")
+    run("UNDROP TABLE orders2")
+    undropped = run(f"COPY INTO orders2 FROM '{d}/in/' (FORMAT csv, HEADER true)")
+    checks["12b. after a DROP and UNDROP, the same"] = undropped["rows"] == 0
+    run("CREATE TABLE orders (id BIGINT, amount BIGINT)")
+    fresh = run(f"COPY INTO orders FROM '{d}/in/' (FORMAT csv, HEADER true)")
+    checks["12c. a new table under the old name starts with no loads"] = fresh["rows"] == 6 and count("orders") == {"n": 6, "s": 270}
+
+    # A clone of the database (ADR-047) keeps the loads of the rows it takes: a node on its own folder
+    # loads nothing again from the same folder, and lists the files
+    here = run("SELECT name FROM pondra.databases")[0]["name"]
+    dev_at = f"{lake}-dev"
+    LAKES.append(dev_at)
+    run(f"CREATE DATABASE dev LOCATION '{dev_at}' CLONE \"{here}\"")
+    dev = Node(dev_at, A.port + 30, env={"PONDRA_OWNER_KEY": owner_key}).start()
+    dev_run = lambda s: call(A.port + 30, "POST", "/sql", s.encode(), headers={"x-pondra-owner": owner_key})
+    cloned = dev_run(f"COPY INTO orders FROM '{d}/in/' (FORMAT csv, HEADER true)")
+    checks["13. a clone of the database loads nothing again from the same folder; its pondra.loads lists the files"] = (
+        cloned["rows"] == 0 and cloned["loaded"] == [] and dev_run("SELECT count(*) AS n FROM pondra.loads WHERE name = 'orders'") == [{"n": 4}])
+    dev.kill()
+
+    # (S3 through a local bucket, with a secret that covers it: the same statement loads; without one, refused)
+    sim = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim_r2.py"), "--port", str(s3p), "--zero"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    atexit.register(sim.kill)
+    s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{s3p}", region_name="us-east-1", aws_access_key_id="k", aws_secret_access_key="s")
+    for _ in range(600):
+        try:
+            s3.create_bucket(Bucket="loads")
+            break
+        except Exception:
+            time.sleep(0.1)
+    s3.put_object(Bucket="loads", Key="in/x.csv", Body=b"id,amount\n70,7\n71,8\n")
+    s3lake = new_lake()
+    s3env = {"PONDRA_SECRET_KEY": "one key for the cluster", "PONDRA_OWNER_KEY": owner_key, "AWS_ENDPOINT": f"http://127.0.0.1:{s3p}", "AWS_ACCESS_KEY_ID": "k", "AWS_SECRET_ACCESS_KEY": "s", "AWS_REGION": "us-east-1", "AWS_ALLOW_HTTP": "true"}
+    sn = Node(s3lake, A.port + 10, env=s3env).start()
+    sq = lambda s: call(A.port + 10, "POST", "/sql", s.encode(), headers={"x-pondra-owner": owner_key})
+    sq("CREATE TABLE s3orders (id BIGINT, amount BIGINT)")
+    no_secret = ""
+    try:
+        call(A.port + 10, "POST", "/sql", f"COPY INTO s3orders FROM 's3://loads/in/' (FORMAT csv, HEADER true)".encode())
+    except RuntimeError as e:
+        no_secret = str(e)
+    checks["11a. files on S3 with no covering secret: refused (ext::check's text)"] = "no secret covers s3://loads" in no_secret
+    sq("CREATE SECRET loads_s3 (TYPE s3, KEY_ID 'k', SECRET 's', ENDPOINT 'http://127.0.0.1:%d', SCOPE 's3://loads')" % s3p)
+    loaded = sq("COPY INTO s3orders FROM 's3://loads/in/' (FORMAT csv, HEADER true)")
+    checks["11b. with the secret: the files load, once"] = loaded["rows"] == 2 and sq("SELECT count(*) AS n FROM s3orders") == [{"n": 2}] and sq("COPY INTO s3orders FROM 's3://loads/in/' (FORMAT csv, HEADER true)")["rows"] == 0
+    sn.kill()
+    # Check 7's second half: a user without SELECT on orders gets none of its loads (or a refusal by
+    # name); granted SELECT, it lists them
+    basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    boss_auth, ann_auth = basic("boss", "boss-password-1"), basic("ann", "ann-password-1")
+    def as_user(auth, q):
+        try:
+            return call(A.port, "POST", "/sql", q.encode(), headers={"Authorization": auth})
+        except RuntimeError as e:
+            return str(e)
+    run("CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")
+    as_user(boss_auth, "CREATE USER ann PASSWORD 'ann-password-1'")
+    unseen = as_user(ann_auth, "SELECT name, file FROM pondra.loads WHERE name = 'orders'")
+    as_user(boss_auth, "GRANT SELECT ON orders TO ann")
+    seen = as_user(ann_auth, "SELECT name, file FROM pondra.loads WHERE name = 'orders'")
+    checks["7b. a user without SELECT on orders gets none of its loads (or a refusal by name); granted SELECT, it lists them"] = (
+        (unseen == [] or "permission denied" in unseen) and isinstance(seen, list) and len(seen) == 4)
+    # Check 8: a node that keeps records for two seconds (PONDRA_LOAD_RETENTION_SECS, read once): past
+    # it, a load's record goes, and its old file (last changed before the window) isn't loaded again
+    lake8 = new_lake()
+    n8 = Node(lake8, A.port + 20, env={"PONDRA_OWNER_KEY": owner_key, "PONDRA_LOAD_RETENTION_SECS": "2"}).start()
+    r8 = lambda s: call(A.port + 20, "POST", "/sql", s.encode(), headers={"x-pondra-owner": owner_key})
+    r8("CREATE TABLE t8 (id BIGINT, amount BIGINT)")
+    write("in8/a.csv", "id,amount\n1,10\n2,20\n")
+    first8 = r8(f"COPY INTO t8 FROM '{d}/in8/' (FORMAT csv, HEADER true)")
+    time.sleep(3)  # (past the two seconds: a.csv's record is due to go, and a.csv is older than the window)
+    write("in8/b.csv", "id,amount\n3,30\n")
+    second8 = r8(f"COPY INTO t8 FROM '{d}/in8/' (FORMAT csv, HEADER true)")
+    left8 = r8("SELECT file FROM pondra.loads WHERE name = 't8'")
+    checks["8. past the retention a load's record goes and its old file isn't loaded again; a new file loads"] = (
+        first8["rows"] == 2 and [l["file"].rsplit("/", 1)[1] for l in second8["loaded"]] == ["b.csv"] and second8["rows"] == 1
+        and [r["file"].rsplit("/", 1)[1] for r in left8] == ["b.csv"] and r8("SELECT count(*) AS n, sum(amount) AS s FROM t8") == [{"n": 3, "s": 60}])
+    n8.kill()
+    for n in nodes:  # (the next section starts its own on these ports)
+        n.kill()
+    print(json.dumps(checks, indent=1, ensure_ascii=False))
+    if not all(checks.values()):
+        sys.exit(1)
+    return f"COPY INTO: all {len(checks)} checks pass"
+
+
 def outside():
     """Files outside the lake (ADR-026) on a local S3 (moto) and a web server, against pyarrow:
     Parquet globs, folders and lists, CSV and TSV with options, JSON lines, Hive-style folders,
@@ -705,6 +890,9 @@ def kafkas():
     q(f"ATTACH 'kafka://127.0.0.1:{pk}' AS pondra_k (TYPE kafka)")
     got = q("SELECT count(*) AS n, sum(CAST(value->>'v' AS BIGINT)) AS s FROM pondra_k.ticks")
     checks["a Pondra node's Kafka port, SASL PLAIN from a secret: its table as a topic"] = got == [{"n": 500, "s": 249500}]
+    began = time.time()
+    said = refused(f"COPY (SELECT 1 AS id) TO 'kafka://127.0.0.1:{pk}/nothere' (FORMAT json)")
+    checks["…a COPY to a topic it doesn't have: refused at once, by name (not asked for ten times)"] = "no topic nothere on this Pondra node" in said and time.time() - began < 1
     q(f"CREATE OR REPLACE SECRET theirs (TYPE kafka, SECURITY_PROTOCOL 'SASL_PLAINTEXT', SASL_MECHANISM 'PLAIN', USERNAME 'reader', PASSWORD 'wrong', SCOPE 'kafka://127.0.0.1:{pk}')")
     checks["…a wrong password: refused"] = "refused" in refused("SELECT count(*) AS n FROM pondra_k.ticks")
     them.kill()
@@ -10279,14 +10467,14 @@ def backpressure():
 # prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
 # suite in parts side by side that end together. A section not listed counts as 5 s.
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
-        "found": 26, "alter": 24, "outside": 20, "load": 20, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
+        "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
         "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10, "use_path": 40}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, reader, crash, load)
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, loads, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -10314,7 +10502,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "loads", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -10327,7 +10515,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "loads": loads, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

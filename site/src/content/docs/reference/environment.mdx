@@ -31,6 +31,7 @@ A number that is left unset, or set to something that is not a number, takes its
 | `PONDRA_AUDIT` | `role,ddl,function` | what the [audit log](/pondra/guides/security/#the-audit-log) keeps, by class: `role`, `ddl`, `function`, `write`, `read`, `misc`, `all`, or `off`. Refusals are always kept |
 | `PONDRA_AUDIT_DAYS` | `90` | how many days `pondra.audit` keeps. Read when the log is first made |
 | `PONDRA_HISTORY` | on | `off`: this node writes nothing to `pondra.history`, the row every statement leaves |
+| `PONDRA_LOAD_RETENTION_SECS` | 64 days | how long `COPY INTO t FROM …` keeps each file's load record. A file last changed before then is skipped without `FORCE`, as Snowflake does |
 | `PONDRA_HISTORY_RATE` | `500` | at most this many rows a second a node in `pondra.history`; past it, fast statements that went well are counted in one row (`class = 'skipped'`). Slow and failed ones are always written |
 | `PONDRA_HISTORY_DAYS` | `7` | how many days `pondra.history` keeps. Read when it is first made |
 | `PONDRA_SLOW_MS` | `1000` | a statement this slow keeps its plan and trace in `pondra.history` and writes a line to the node's log |
@@ -54,7 +55,7 @@ PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 | `PONDRA_ENV` | the git branch's database | the environment the project commands use when none is named: `pondra apply`, `pondra plan`, `pondra status` and the rest. `--env` or the name after the command wins |
 | `PONDRA_HOME` | `~/.pondra` (from `HOME`, or `USERPROFILE` on Windows) | the folder where `pondra login` keeps the tokens it saved, in `login.json` |
 
-[`pondra ci init`](/pondra/guides/environments/#branches-and-environments-on-a-team) also makes three
+[`pondra ci init`](/pondra/guides/projects/#continuous-integration) also makes three
 GitHub secrets: `PONDRA_DEV_TOKEN` (for the server branches are made on), `PONDRA_TEST_TOKEN` (test's
 server) and `PONDRA_PROD_TOKEN` (in the `prod` environment, which a reviewer approves). The workflow it
 writes hands each job the one it needs as `PONDRA_TOKEN`; Pondra itself never reads them.

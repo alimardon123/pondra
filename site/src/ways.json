@@ -1,0 +1,10 @@
+{
+  "query_words": ["select", "from", "with", "values", "table", "show", "describe", "summarize", "explain", "pivot"],
+  "ways": [
+    {"label": "SQL", "lang": "sql", "query": "{sql};", "statement": "{sql};"},
+    {"label": "Python", "lang": "python", "query": "db.sql(\"\"\"\n{sql}\n\"\"\").show()", "statement": "db.sql(\"\"\"\n{sql}\n\"\"\")"},
+    {"label": "JavaScript", "lang": "js", "query": "console.log(await db.sql(`\n{sql}\n`));", "statement": "await db.sql(`\n{sql}\n`);"},
+    {"label": "Shell", "lang": "bash", "query": "pondra lake <<'SQL'\n{sql};\nSQL", "statement": "pondra lake <<'SQL'\n{sql};\nSQL"},
+    {"label": "HTTP", "lang": "bash", "query": "curl -s localhost:8080/sql --data-binary @- <<'SQL'\n{sql}\nSQL", "statement": "curl -s localhost:8080/sql --data-binary @- <<'SQL'\n{sql}\nSQL"}
+  ]
+}

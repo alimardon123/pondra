@@ -45,7 +45,7 @@ sidebar group of its kind, in `astro.config.mjs`, and into `PAGES.md`.
   `import { Tabs, TabItem, Aside, Card, CardGrid, Steps, LinkCard } from '@astrojs/starlight/components';`
 - Headings start at `##`. Keep sections short, and make every heading a task or a noun a reader
   would search for.
-- Link to other pages with site-relative paths: `/pondra/guides/streaming/`.
+- Link to other pages with site-relative paths: `/pondra/guides/views/`.
 
 ## Examples: every one runs
 
@@ -97,7 +97,13 @@ Where a feature exists in SQL and in the clients, show it with synced tabs:
 </Tabs>
 ```
 
-Labels are always exactly `SQL`, `Python`, `Frames`, `PySpark`, `JavaScript`, `Shell`, `psql`, in
+A statement that runs the same on every door is written once, as `<Ways sql={`…`} />` (import it with
+`import Ways from '../../../components/Ways.astro';`, the path relative to the page). It shows the SQL,
+Python, JavaScript, Shell and HTTP tabs from `site/src/ways.json`, and `docs_check.py` runs all five.
+Write tabs by hand only where a door has its own call (frames, `append`, `write_table`, PySpark). Output
+still goes in a `text` block after it.
+
+Labels are always exactly `SQL`, `Python`, `Frames`, `PySpark`, `JavaScript`, `Shell`, `HTTP`, `psql`, in
 that order, and only the ones that apply. The reader's choice is remembered across the site.
 
 ## Facts
