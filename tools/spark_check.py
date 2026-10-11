@@ -605,6 +605,18 @@ def p_show_vertical_no_columns_raises(spark, F, Window):  # PySpark can't show a
     spark.table("orders").where(F.col("id") <= 3).select("id").drop("id").show(vertical=True)
 
 
+def p_union_by_name_missing(spark, F, Window):  # allowMissingColumns: a column one side lacks is NULL there; the left's come first
+    left = spark.table("orders").where(F.col("id") <= 5).select("id", "item")
+    right = spark.table("orders").where(F.col("id") <= 3).select("id", "qty", F.col("price").alias("p"))
+    return left.unionByName(right, allowMissingColumns=True)
+
+
+def p_union_by_name_differing_raises(spark, F, Window):  # without allowMissingColumns, PySpark refuses differing columns; so does Pondra
+    left = spark.table("orders").select("id", "item")
+    right = spark.table("orders").select("id", "qty")
+    return left.unionByName(right).collect()
+
+
 def _row_class(spark):
     """PySpark's Row, or Pondra's, by the session that is asked."""
     if type(spark).__module__.startswith("pondra"):
@@ -715,6 +727,8 @@ PIPELINES = [
     ("regexp_extract_groups", False, "frame", p_regexp_extract_groups),
     ("split_regex_and_limit", False, "frame", p_split_regex_and_limit),
     ("drop_every_column", None, "value", p_drop_every_column),
+    ("union_by_name_allow_missing", False, "frame", p_union_by_name_missing),
+    ("union_by_name_differing_raises", None, "raises", p_union_by_name_differing_raises),
 ]
 
 

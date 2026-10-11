@@ -752,6 +752,12 @@ class DataFrame:
 
     def unionByName(self, other, allowMissingColumns=False):
         from ..frame import concat
+        if not allowMissingColumns:  # (PySpark refuses a column one side lacks; the NULL fill is for allowMissingColumns only)
+            here, there = {c.lower() for c in self.columns}, {c.lower() for c in other.columns}
+            if here != there:
+                one_side = [c for c in self.columns if c.lower() not in there] + [c for c in other.columns if c.lower() not in here]
+                raise ValueError(f"unionByName: {', '.join(one_side)} on one side only; "
+                                 "allowMissingColumns=True fills the missing ones with NULLs")
         return self._new(concat([self._f, other._f], how="diagonal"))
 
     def sample(self, withReplacement=None, fraction=None, seed=None):
