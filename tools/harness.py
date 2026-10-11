@@ -8724,7 +8724,10 @@ await db.close?.();"""
     find_ms, find_n = timed("SELECT count(*) AS n FROM pondra.find('amount')")
     parts_ms, parts_n = timed("SELECT count(*) AS n FROM pondra.parts")
     info.update(find_ms_1000_tables=round(find_ms, 1), find_rows=find_n, parts_ms_1000_tables=round(parts_ms, 1), parts_rows=parts_n)
-    checks["a find over 1,000 tables answers in under 2 s"] = find_ms < 2000 and find_n >= 1000
+    call(A.port, "POST", "/sql", ";\n".join(f"CREATE VIEW v_{i} AS SELECT id, amount FROM t_{i}" for i in range(200)).encode(), timeout=600)
+    views_ms, views_n = timed("SELECT count(*) AS n FROM pondra.find('amount')")
+    info.update(find_ms_1000_tables_200_views=round(views_ms, 1), find_rows_with_views=views_n)
+    checks["a find over 1,000 tables and 200 views answers in under 2 s"] = find_ms < 2000 and find_n >= 1000 and views_ms < 2000 and views_n >= find_n + 200
 
     # last: signing in closes the node to anyone unsigned
     basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()

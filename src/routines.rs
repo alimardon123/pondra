@@ -738,6 +738,7 @@ pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { expand_wi
 
 async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) -> Result<String> {
     let sql = &crate::vars::parameters_in(lake, sql).await?; // (`pondra.parameters('etl/orders.sql')`: a file's parameters, as rows)
+    let sql = &crate::find::functions_in(lake, sql).await?; // (`pondra.find('revenue')`: the catalog searched, as rows)
     let sql = &crate::git::status_in(lake, sql).await?; // (`pondra.git_status('sales')`: a Git folder's local changes, as rows)
     if let Some(q) = show(sql) {
         return Ok(q);

@@ -29,6 +29,7 @@ mod format;
 mod friendly;
 mod flight;
 mod fresh;
+mod find;
 mod finish;
 mod fsum;
 mod git;
