@@ -643,7 +643,8 @@ fn pg_type(t: &DataType, format: FieldFormat) -> (Type, DataType) {
         DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
             let of = |t: DataType| DataType::List(Arc::new(datafusion::arrow::datatypes::Field::new("item", t, true)));
             match f.data_type() {
-                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => (Type::VARCHAR_ARRAY, of(DataType::Utf8)),
+                // (text[], as the catalog's pg_attribute and pg_type give a list of strings: pg_catalog.rs)
+                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => (Type::TEXT_ARRAY, of(DataType::Utf8)),
                 DataType::Int8 | DataType::Int16 | DataType::UInt8 => (Type::INT2_ARRAY, of(DataType::Int16)),
                 DataType::Int32 | DataType::UInt16 => (Type::INT4_ARRAY, of(DataType::Int32)),
                 DataType::Int64 | DataType::UInt64 => (Type::INT8_ARRAY, of(DataType::Int64)),

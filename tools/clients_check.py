@@ -246,6 +246,12 @@ def psycopg_check(pg):
     url = f"host=127.0.0.1 port={pg} user=u dbname=lake password={PASSWORD}"
     checks = {}
     with psycopg.connect(url, autocommit=True) as c:
+        # A list of strings is text[] (1009) both in the result's description and in the catalog's
+        # pg_attribute, so a client that checks one against the other sees the same type.
+        result_type = c.execute("SELECT tags FROM events").description[0].type_code
+        catalog_type = c.execute("SELECT a.atttypid FROM pg_attribute a JOIN pg_class k ON k.oid = a.attrelid "
+                                 "WHERE k.relname = 'events' AND a.attname = 'tags'").fetchone()[0]
+        checks["psycopg: a list of strings is text[] (1009) in the result and in pg_attribute"] = result_type == 1009 and catalog_type == 1009
         c.execute("CREATE TABLE ten_k (id BIGINT)")
         c.execute("INSERT INTO ten_k SELECT value FROM range(1, 10001)")
     with psycopg.connect(url) as c:
