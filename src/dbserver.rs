@@ -282,7 +282,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     eprintln!("pondra serve: the lakes in {folder} as databases, on {addr}");
     let listener = crate::tls::Doors::bind(&addr, crate::tls::Door::Http).await?; // (TLS too: `tls.rs`)
     let stop = async {
-        crate::stopped(false).await;
+        crate::cli::stopped(false).await;
     };
     axum::serve(listener, app.into_make_service_with_connect_info::<crate::tls::Peer>()).with_graceful_shutdown(stop).await?;
     let nodes: Vec<Node> = server.nodes.lock().await.drain().map(|(_, n)| n).collect();
