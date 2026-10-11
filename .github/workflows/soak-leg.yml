@@ -46,10 +46,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ fromJSON(inputs.plan).sha }}
-        run: |
-          run=$(bash tools/ci_build.sh "$SHA")
-          [ -n "$run" ] || { echo "::error::no passing build run for $SHA: wait for it (a pull request's needs full-ci), or use binary: build"; exit 1; }
-          gh run download "$run" --name pondra-linux-x64 --dir dl && tar -xzf dl/pondra-linux-x64.tar.gz pondra
+        # (waited for while that run builds: a soak labelled with the pull request's `ci` starts at once)
+        run: bash tools/ci_artifact.sh linux-x64 "$SHA" && tar -xzf dist/pondra-linux-x64.tar.gz pondra
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         if: fromJSON(inputs.plan).binary == 'build'
         with:

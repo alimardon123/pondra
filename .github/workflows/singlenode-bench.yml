@@ -58,7 +58,7 @@ jobs:
           ref: ${{ env.SHA }}
       - name: The build workflow's package for this commit (nothing, if no build run passed)
         id: ci
-        run: echo "run=$(bash tools/ci_build.sh "$SHA")" >> "$GITHUB_OUTPUT"
+        run: echo "run=$(bash tools/ci_build.sh "$SHA" pondra-linux-x64)" >> "$GITHUB_OUTPUT"
       - name: Its linux-x64 binary
         if: steps.ci.outputs.run != ''
         run: gh run download "${{ steps.ci.outputs.run }}" --name pondra-linux-x64 --dir dl && tar -xzf dl/pondra-linux-x64.tar.gz pondra
