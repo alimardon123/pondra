@@ -171,7 +171,7 @@ def image(a):
 
 def compose(a):
     """deploy/compose/compose.yaml as it is: three nodes on one lake."""
-    project, env = f"pondra-check-{os.getpid()}", {"PONDRA_IMAGE": a.image}
+    project, env = f"pondra-check-{os.getpid()}", {"PONDRA_IMAGE": a.image, "PONDRA_ADMIN_TOKEN": ""}  # (no token: the leader makes the first user)
     dc = lambda *a, **k: run("docker", "compose", "-f", COMPOSE, "-p", project, *a, env=env, **k)
     http_port = {"node1": 8080, "node2": 8081, "node3": 8082}
     try:
