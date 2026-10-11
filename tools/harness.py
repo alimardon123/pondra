@@ -8739,11 +8739,11 @@ await db.close?.();"""
               "CREATE USER cal PASSWORD 'cal-password-1'", "GRANT SELECT (id, amount) ON sales.orders TO cal"]:
         as_(boss, s)
     ann, cal_user = basic("ann", "ann-password-1"), basic("cal", "cal-password-1")
-    ann_parts = as_(ann, "SELECT DISTINCT object FROM pondra.parts")
+    ann_parts = as_(ann, "SELECT DISTINCT object FROM pondra.parts WHERE object_kind NOT IN ('function', 'type')")  # (functions and types are everyone's, as on Postgres)
     ann_revenue = as_(ann, "SELECT * FROM pondra.find('revenue')")
     ann_customers = as_(ann, "SELECT * FROM pondra.find('customers')")
     info["ann"] = [ann_parts, ann_revenue, ann_customers]
-    checks["a user granted one table sees its parts only, and finds only what it may read"] = \
+    checks["a user granted one table sees its parts only (and the functions and types everyone may use), and finds only what it may read"] = \
         sorted(r["object"] for r in ann_parts) == ["orders"] \
         and any(r.get("object") == "orders" and r["name"] == "amount" for r in ann_revenue) \
         and not any(r["name"] in ("revenue", "revenue_daily", "total") for r in ann_revenue) \

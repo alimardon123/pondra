@@ -828,19 +828,9 @@ fn view_columns<'a>(lake: &'a Lake, view: &'a str) -> BoxFuture<'a, Result<Optio
         if lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(view)).await?.is_none() {
             return Ok(None);
         }
-        let columns = columns_of(lake, &name_sql(view)).await?;
-        Ok(Some(columns.into_iter().map(|(name, _)| name).collect()))
-    })
-}
-
-/// The columns of a stored view or an external table, as its query names and types them now: each
-/// one's name and SQL type. Planned, not run (`LIMIT 0`). (Boxed: planning expands SQL, which may
-/// show a SHOW CREATE, which comes back here.)
-pub(crate) fn columns_of<'a>(lake: &'a Lake, named: &'a str) -> BoxFuture<'a, Result<Vec<(String, String)>>> {
-    Box::pin(async move {
-        let sql = format!("SELECT * FROM {named} LIMIT 0");
+        let sql = format!("SELECT * FROM {} LIMIT 0", name_sql(view));
         let df = crate::query::sql(&crate::query::session(lake, &sql, "").await?, &sql).await?;
-        Ok(df.schema().fields().iter().map(|f| (f.name().clone(), sql_type(&f.data_type().to_string()))).collect())
+        Ok(Some(df.schema().fields().iter().map(|f| f.name().clone()).collect()))
     })
 }
 
