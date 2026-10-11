@@ -1447,14 +1447,14 @@ async fn ready(State(app): State<App>) -> Response {
     }
 }
 
-async fn stats(State(app): State<App>) -> Json<Value> {
+async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<Value> {
     let c = &app.cluster;
     let role = if c.reader { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     let mut s = j!({"lake": crate::ddl::lake_name(&app.lake), "role": role, "leader": c.leader.addr, "term": c.leader.n, "nodes": c.nodes(),
                     "hwm": *app.lake.hwm.borrow(), "shard_runs": c.shard_runs.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     s["version"] = j!(crate::format::VERSION);
-    s["pid"] = j!(std::process::id()); // (so a program that started a node can tell it from another on the same port: local())
+    s["owner"] = j!(owner(&headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)
     s["format"] = j!(crate::format::of(&app.lake.cat).await.map(|f| f.format).unwrap_or_default()); // (the lake's: ADR-039)
     s["keys"] = j!(crate::users::kept(&app.lake).await); // (the lake's own keys: sealed by its master key, or in the clear)
     if c.is_leader() {

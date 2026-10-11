@@ -18,7 +18,7 @@
    with it; a valid PEM on a plain node); the fetch option; the SQL text of createFunction, createProcedure and
    view as Python's is. Then local()'s refusals (timeoutMs; a bad flag names its log, which says why), no static
    node: import in js/index.js or js/frame.js, and `from pondra import *` leaves Python's builtins alone.
-   Also: local() on a port another node holds is refused by name from Python and JavaScript, naming that node's pid,
+   Also: local() on a port another node holds is refused by name from Python and JavaScript, saying why,
    and the node on the port still answers; db.start (JavaScript) and call(wait=False) (Python) each give a run id
    that is a row of pondra.runs for the procedure, ok.
 
@@ -444,7 +444,7 @@ def starting_check(report, tmp):
 
 def another_check(port, report, tmp):
     """local() on a port another node already holds (one from an earlier run, say) refuses it by name, naming that
-    node's pid, from Python and from JavaScript; the node that holds the port still answers."""
+    port and why, from Python and from JavaScript; the node that holds the port still answers."""
     first = pondra.local(os.path.join(tmp, "another", "first"), port=port, python=False)
     py_error = None
     try:
@@ -456,13 +456,13 @@ def another_check(port, report, tmp):
         answers = first.sql("SELECT 1 AS x").rows()
     finally:
         first.close()
-    pid = f"(pid {first.process.pid})"
-    py_ok = py_error is not None and "another node's" in py_error and pid in py_error
-    report.check(py_ok, f"local() on a port another node holds: Python refuses it by name, naming that node {pid}" if py_ok
+    said = f"127.0.0.1:{port} is another node's"
+    py_ok = py_error is not None and said in py_error
+    report.check(py_ok, "local() on a port another node holds: Python refuses it by name" if py_ok
                  else f"Python's local() on that port: {'no error (a connection to the other node)' if py_error is None else py_error!r}")
     js_error = js.get("error") or ""
-    js_ok = "another node's" in js_error and pid in js_error and not js.get("connected")
-    report.check(js_ok, f"local() on a port another node holds: JavaScript refuses it by name, naming that node {pid}" if js_ok
+    js_ok = said in js_error and not js.get("connected")
+    report.check(js_ok, "local() on a port another node holds: JavaScript refuses it by name" if js_ok
                  else f"JavaScript's local() on that port: {js!r}")
     alive = answers == [{"x": 1}]
     report.check(alive, "the node that holds the port still answers: neither refused call's connection is used" if alive

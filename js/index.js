@@ -490,9 +490,9 @@ export async function local(dir = "lake", { port, token, flags = [], timeout = 1
   db.owner = owner;
   process.on("exit", () => node.stdin.end());
   for (const until = Date.now() + timeout * 1000; ; await sleep(50)) {
-    let seen;
+    let ours;
     try {
-      seen = await (await db.request("GET", "/stats")).json().then((s) => s?.pid, () => undefined); // (a node from before this check says no pid)
+      ours = await (await db.request("GET", "/stats")).json().then((s) => s?.owner, () => undefined); // (asked with our key; a node from before this check doesn't say)
     } catch {
       if (failed || node.exitCode !== null || Date.now() > until) {
         if (node.pid && node.exitCode === null) node.stdin.end(); // (still running: closing its input stops it, as close() does)
@@ -500,11 +500,11 @@ export async function local(dir = "lake", { port, token, flags = [], timeout = 1
       }
       continue;
     }
-    if (seen !== undefined && seen !== node.pid) {
+    if (ours === false) {
       // Another node answers on this port: ours failed to bind it. Stop ours (it may still be starting) and
       // don't use the other one, whose lake isn't the one asked for. (Not close(): that would reach it.)
       if (node.pid && node.exitCode === null) node.stdin.end(); // (closing its input stops it, as close() does)
-      throw new Error(`127.0.0.1:${port} is another node's (pid ${seen}), not the one this started; its log: ${log}`);
+      throw new Error(`127.0.0.1:${port} is another node's, not the one this started (it failed to listen there); its log: ${log}`);
     }
     db.retrySecs = 60;
     return db;
