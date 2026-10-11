@@ -529,6 +529,9 @@ impl Drop for Turn {
         if let Some(p) = PACE.lock().unwrap().get_mut(&self.key) {
             let waited = Duration::from_micros(self.waited.load(std::sync::atomic::Ordering::Relaxed));
             (p.running, p.took) = (false, p.started.map_or(Duration::ZERO, |s| s.elapsed().saturating_sub(waited)));
+            if std::env::var("PONDRA_DEBUG_RERUN").is_ok() { // TEMPORARY
+                eprintln!("RERUN {} {} x took_ms={} waited_ms={} ok=true", crate::log::now_ms(), self.key.1, p.started.map_or(0, |s| s.elapsed().as_millis()), waited.as_millis());
+            }
         }
     }
 }
@@ -718,6 +721,14 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
             true => vec![],
             false => worked_out(lake, v, now, scanned.as_ref()).await?,
         };
+        // The view's rows as they are, read before the lake's lock: a by-key run's can take a second
+        // to read, and every other view's run waited for it. Under the lock they are taken as read
+        // when no commit has changed the view's table since, else read again there.
+        let seen = lake.visible();
+        let read = match none {
+            true => vec![],
+            false => old_rows(lake, view, &r.keys, scanned.as_ref(), seen).await?,
+        };
         // Under the lake's lock, as a change is (invariant 56): the view's rows as they are, and
         // this view still the one this run is for (dropped and made again meanwhile, it's another).
         let guard = waiting(waited, lock.lock()).await;
@@ -727,9 +738,10 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
         let meta: TableMeta = lake.cat.get(&table_key(view)).await?.context("view without table")?;
         crate::change::companion(lake, view, &meta).await?; // (its `$deleted`, which every run names)
         let meta: TableMeta = lake.cat.get(&table_key(view)).await?.context("view without table")?;
-        let old = match none {
-            true => vec![],
-            false => old_rows(lake, view, &r.keys, scanned.as_ref()).await?,
+        let at = lake.visible();
+        let old = match none || !moved_since(lake, seen, at, &[view.to_string()]).await? {
+            true => read,
+            false => old_rows(lake, view, &r.keys, scanned.as_ref(), at).await?,
         };
         let keys = match r.keys.is_empty() {
             true => meta.columns.iter().map(|(c, _)| c.clone()).collect(), // (rows matched whole)
@@ -925,11 +937,11 @@ fn kept_as_written(ctx: &SessionContext) {
     ctx.state_ref().write().config_mut().options_mut().optimizer.join_reordering = false;
 }
 
-/// The view's rows of the touched groups (or all of them), with their `_row_id`, `_created_at`
-/// and `_version`.
-async fn old_rows(lake: &Lake, view: &str, keys: &[String], touched: Option<&Touched>) -> Result<Vec<RecordBatch>> {
+/// The view's rows of the touched groups (or all of them) as of commit `at`, with their `_row_id`,
+/// `_created_at` and `_version`.
+async fn old_rows(lake: &Lake, view: &str, keys: &[String], touched: Option<&Touched>, at: u64) -> Result<Vec<RecordBatch>> {
     let sql = format!("SELECT *, {ROW_ID}, {CREATED}, {VERSION} FROM {}", crate::write::sql_name(view));
-    let ctx = session_at(lake, &sql, "", Some(lake.visible())).await?;
+    let ctx = session_at(lake, &sql, "", Some(at)).await?;
     let mut plan = ctx.sql(&crate::sys::hide(&sql)).await?.into_unoptimized_plan(); // (`*` without the system columns)
     if let Some(t) = touched {
         kept_as_written(&ctx);
