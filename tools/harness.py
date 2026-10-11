@@ -29,12 +29,13 @@
   harness.py stopped             a run whose node was killed under it: stopped, not running for good
   harness.py variables           DECLARE $day / $day = … from every door, a file's parameters (DECLARE PARAMETER, a .py file's cell), runs and procedures of their own
   harness.py use                 USE and SET search_path: schemas and databases, views and tasks, Postgres, Python, the shell, three nodes
+  harness.py answers_big         answers in pieces: the same bytes as whole; 3M rows over 0.25 GB (53200 past it); turns (53300)
   harness.py friendly            SQL as DuckDB's users write it (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, …) == DuckDB's answers, spread too
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
 import http.client as http_client
-import argparse, atexit, glob as glob_, http.client, itertools, json, math, os, random, shutil, signal, subprocess, sys, tempfile, threading, time, traceback, urllib.request, uuid
+import argparse, atexit, glob as glob_, http.client, io, itertools, json, math, os, random, re, shutil, signal, subprocess, sys, tempfile, threading, time, traceback, urllib.request, uuid
 
 BIN = os.environ.get("PONDRA_BIN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "../target/release/pondra"))
 A = None  # parsed args
@@ -8130,9 +8131,14 @@ def objects():
     q("CREATE MATERIALIZED VIEW IF NOT EXISTS eu AS SELECT id FROM orders")
     same = q("SELECT count(*) AS n, sum(amount) AS s FROM eu")
     q("CREATE OR REPLACE MATERIALIZED VIEW eu AS SELECT id, amount * 2 AS amount FROM orders WHERE region = 'eu'")
+    replaced = q("SELECT sum(amount) AS s FROM eu") # (at once: OR REPLACE answers once its view is filled, as CREATE does)
+    q("CREATE OR REPLACE MATERIALIZED VIEW by_region AS SELECT region, count(*) AS n FROM orders GROUP BY region")
+    new_one = q("SELECT region, n FROM by_region ORDER BY region")
     q("CREATE MATERIALIZED VIEW eu_big AS SELECT id FROM eu WHERE amount > 30")
     followed = http("CREATE OR REPLACE MATERIALIZED VIEW eu AS SELECT id, amount FROM orders")
-    checks["materialized views: IF NOT EXISTS, OR REPLACE, refused while another follows"] = same == [{"n": 2, "s": 40}] \
+    info["replaced"] = [replaced, new_one]
+    checks["materialized views: IF NOT EXISTS, OR REPLACE (its rows there when it answers, a new one's too), refused while another follows"] = same == [{"n": 2, "s": 40}] \
+        and replaced == [{"s": 80}] and new_one == [{"region": "eu", "n": 2}, {"region": "us", "n": 1}] \
         and q("SELECT sum(amount) AS s FROM eu") == [{"s": 80}] and followed[0] == 500 and "follow" in str(followed[2])
     q("CREATE FUNCTION twice(x BIGINT) RETURNS BIGINT RETURN x * 2")
     q("CREATE FUNCTION IF NOT EXISTS twice(x BIGINT) RETURNS BIGINT RETURN x * 3")
@@ -10463,18 +10469,168 @@ def backpressure():
     return "writes wait for tiering only while it can run"
 
 
+def raw_sql(port, q, fmt=None, timeout=900):
+    """POST /sql as the wire has it: (status, content type, SQLSTATE header, body bytes)."""
+    c = http_client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    c.request("POST", "/sql" + (f"?format={fmt}" if fmt else ""), q.encode())
+    r = c.getresponse()
+    body = r.read()
+    c.close()
+    return r.status, r.getheader("content-type"), r.getheader("x-pondra-sqlstate"), body
+
+
+def vm_hwm(pid):
+    """The node's peak resident memory, in bytes (/proc/<pid>/status VmHWM)."""
+    for line in open(f"/proc/{pid}/status"):
+        if line.startswith("VmHWM:"):
+            return int(line.split()[1]) << 10
+    return 0
+
+
+def answers_big():
+    """An answer too big to hold as one body is sent in pieces (`server::stream`), and its bytes are
+    the whole answer's: a node with PONDRA_STREAM_MB=0 (every answer in pieces) answers what the
+    default node does, in JSON, CSV, TSV, NDJSON and Arrow (Arrow as tables). An answer counts in
+    the node's query memory (`query::collect`): 3M rows of json over a 0.25 GB node come back whole,
+    at a peak at least half their JSON under the same answer's rendered whole (442 MB against 715
+    when written); an answer bigger than that memory is refused
+    with 53200 and the node answers after. Queries take one of PONDRA_QUERIES' turns: with two turns
+    and a second's queue, four slow queries at once answer two at once and refuse the rest with
+    53300 (or answer after), and a query run inside a query (PIVOT asks the data) takes no turn of its
+    own, so one turn does for it."""
+    import pyarrow.compute as pc, pyarrow.csv as pacsv, pyarrow.ipc as paipc
+    checks = {}
+    # 1. The bytes of a streamed answer are the whole answer's.
+    lake = new_lake()
+    default = Node(lake, A.port).start()
+    streamed = Node(lake, A.port + 1, env={"PONDRA_STREAM_MB": "0"}).start()
+    try:
+        q = lambda s: sql(A.port, s)
+        q("CREATE TABLE t (id BIGINT, s VARCHAR, d DECIMAL(12,2), dt DATE, ts TIMESTAMP, l BIGINT[], f DOUBLE, b BOOLEAN)")
+        q("INSERT INTO t SELECT value, CASE WHEN value % 7 = 0 THEN NULL WHEN value % 3 = 0 THEN 'say \"hi\", ' || chr(10) || 'ok' ELSE 'plain ' || value END, "
+          "CASE WHEN value % 11 = 0 THEN NULL ELSE CAST(value AS DECIMAL(12,2)) / 7 END, DATE '2020-01-01' + CAST(value % 500 AS INTEGER), "
+          "TIMESTAMP '2020-01-01 00:00:00' + value * INTERVAL '1 second', CASE WHEN value % 13 = 0 THEN NULL ELSE make_array(value, value + 1) END, "
+          "value / 3.0, value % 2 = 0 FROM generate_series(1, 60000) AS g(value)")
+        until(lambda: sql(A.port + 1, "SELECT count(*) AS n FROM t")[0]["n"], 60000)  # (the second node sees every row)
+        # (CSV and TSV have no writer for a list column: only the query that reads `l` is refused there)
+        queries = {
+            "every column but the list": "SELECT id, s, d, dt, ts, f, b FROM t ORDER BY id",
+            "nulls and quotes": "SELECT id, s, d, dt FROM t WHERE s IS NULL OR s LIKE '%\"%' OR d IS NULL ORDER BY id",
+            "a join's repeated names": "SELECT t.id, t.s, t.d, u.id, u.s, u.ts FROM t JOIN t AS u ON t.id = u.id + 1 WHERE t.id < 20000 ORDER BY t.id",
+            "lists, times and bools": "SELECT id, l, f, b, ts FROM t ORDER BY id LIMIT 30000",
+            "no rows": "SELECT id, s, d, dt, ts, f, b FROM t WHERE id < 0",
+            "one value": "SELECT 1 AS one",
+        }
+        same, differ, arrow_same, answered = [], [], [], []
+        for name, query in queries.items():
+            for fmt in (None, "csv", "tsv", "ndjson", "arrow"):
+                a, b = raw_sql(A.port, query, fmt), raw_sql(A.port + 1, query, fmt)
+                tag = f"{name} as {fmt or 'json'}"
+                answered.append((tag, a[0]))
+                if fmt == "arrow" and a[0] == 200 and b[0] == 200:
+                    ta, tb = paipc.open_stream(a[3]).read_all(), paipc.open_stream(b[3]).read_all()
+                    (arrow_same if ta.equals(tb) else differ).append(tag)
+                    continue
+                (same if (a[0], a[1], a[2], a[3]) == (b[0], b[1], b[2], b[3]) else differ).append(tag)
+        checks[f"streamed answers are the whole answers' bytes: {len(same)} of {len(same) + len(differ)} (Arrow as tables: {len(arrow_same)} equal)"] = not differ
+        checks[f"…and the answers are there: {sum(1 for _, s in answered if s == 200)} of {len(answered)} with 200"] = all(s == 200 for t, s in answered if not ("lists" in t and ("csv" in t or "tsv" in t)))
+        checks["…a streamed answer carries the content type its format has"] = raw_sql(A.port + 1, queries["every column but the list"], "csv")[1].startswith("text/csv") and raw_sql(A.port + 1, queries["every column but the list"], "arrow")[1] == "application/vnd.apache.arrow.stream"
+    finally:
+        streamed.kill()
+        default.kill()
+
+    # 2. A big answer counts in the query memory, and is sent in pieces at a bounded peak.
+    lake = new_lake()
+    node = Node(lake, A.port + 2).start()
+    rows = 3_000_000
+    try:
+        sql(A.port + 2, "CREATE TABLE big (a BIGINT, b BIGINT, c DOUBLE, s VARCHAR)")
+        sql(A.port + 2, f"INSERT INTO big SELECT value, value * 2, value / 4.0, 'row ' || value FROM generate_series(1, {rows}) AS g(value)")
+    finally:
+        node.kill()
+    node = Node(lake, A.port + 2, memory_gb=0.25).start()
+    try:
+        status, ctype, _, body = raw_sql(A.port + 2, "SELECT * FROM big")
+        peak_json, json_size = vm_hwm(node.p.pid), len(body)
+        sums = [int(m.group(1)) for m in re.finditer(rb'"a":(\d+)', body)]
+        checks[f"a {rows:,}-row answer in json over 0.25 GB: 200, every row ({len(sums):,}, sum of a right: {sum(sums) == rows * (rows + 1) // 2})"] = status == 200 and len(sums) == rows and sum(sums) == rows * (rows + 1) // 2
+        arrow_status, _, _, arrow = raw_sql(A.port + 2, "SELECT * FROM big", "arrow")
+        del body, sums
+        csv_status, _, _, csv_body = raw_sql(A.port + 2, "SELECT * FROM big", "csv")
+        read = csv_status == 200 and arrow_status == 200
+        t = pacsv.read_csv(io.BytesIO(csv_body)) if read else None
+        back = paipc.open_stream(arrow).read_all() if read else None  # (no ORDER BY: rows come in any order, so sums)
+        checks[f"…?format=csv ({csv_status}) and arrow ({arrow_status}) read back equal (rows and sums)"] = read and (
+            t.num_rows == rows and pc.sum(t.column("a")).as_py() == rows * (rows + 1) // 2 and pc.sum(t.column("b")).as_py() == rows * (rows + 1)
+            and back.num_rows == rows and pc.sum(back.column("a")).as_py() == rows * (rows + 1) // 2 and pc.sum(back.column("b")).as_py() == rows * (rows + 1))
+        del csv_body, t, arrow
+        status, _, code, text = raw_sql(A.port + 2, "SELECT b1.a, b2.a FROM big b1 CROSS JOIN (SELECT a FROM big LIMIT 20) b2")
+        checks[f"a 60M-row answer over 0.25 GB: refused with 53200 ({code}) by name: {'the answer is bigger than this node' in text.decode(errors='replace')}"] = status != 200 and code == "53200"
+        checks["…and the node answers after: SELECT 1 is 1"] = json.loads(raw_sql(A.port + 2, "SELECT 1 AS one")[3]) == [{"one": 1}]
+    finally:
+        node.kill()
+    # (the same answer rendered whole, as before pieces: its JSON held in memory at once)
+    node = Node(lake, A.port + 2, memory_gb=0.25, env={"PONDRA_STREAM_MB": "100000"}).start()
+    try:
+        status, _, _, body = raw_sql(A.port + 2, "SELECT * FROM big")
+        peak_whole = vm_hwm(node.p.pid)
+        del body
+        checks[f"…in pieces its peak ({peak_json >> 20} MB) is at least half its JSON ({json_size >> 20} MB) under the same answer's rendered whole ({peak_whole >> 20} MB)"] = status == 200 and peak_json + json_size // 2 < peak_whole
+    finally:
+        node.kill()
+
+    # 3. Turns: PONDRA_QUERIES at once, the rest wait PONDRA_QUEUE_SECS and are refused (53300).
+    lake = new_lake()
+    node = Node(lake, A.port + 3, env={"PONDRA_QUERIES": "2", "PONDRA_QUEUE_SECS": "0.5"}).start()
+    # (seconds each, far past the half second the others wait; each its own text: identical queries
+    # share one computation, so one turn)
+    slow = "SELECT count(*) AS n FROM generate_series(1, 1000000000) AS g(v) WHERE v % 7 = {}"
+    try:
+        out, seen = [], []
+        def ask(k):
+            out.append(raw_sql(A.port + 3, slow.format(k))[::2])  # (status, SQLSTATE)
+        threads = [threading.Thread(target=ask, args=(k,)) for k in range(4)]
+        [t.start() for t in threads]
+        for _ in range(40):
+            m = call(A.port + 3, "GET", "/metrics").decode()
+            seen.append((int(re.search(r"\npondra_queries_running (\d+)", m).group(1)), int(re.search(r"\npondra_queries_waiting (\d+)", m).group(1))))
+            time.sleep(0.025)
+        [t.join(300) for t in threads]
+        refused = [s for s, c in out if c == "53300"]
+        answered = [s for s, c in out if s == 200]
+        checks[f"four slow queries at once on two turns: {len(answered)} answered, {len(refused)} refused with 53300 after waiting half a second"] = len(answered) == 2 and len(refused) == 2
+        checks["…the running and waiting gauges show two running and some waiting"] = max(r for r, _ in seen) == 2 and max(w for _, w in seen) >= 1
+        checks["…and a fifth, simple query after they end answers"] = json.loads(raw_sql(A.port + 3, "SELECT 1 AS one")[3]) == [{"one": 1}]
+    finally:
+        node.kill()
+    lake = new_lake()
+    node = Node(lake, A.port + 4, env={"PONDRA_QUERIES": "1", "PONDRA_QUEUE_SECS": "5"}).start()
+    try:
+        sql(A.port + 4, "CREATE TABLE ev (g VARCHAR, v BIGINT)")
+        sql(A.port + 4, "INSERT INTO ev VALUES ('a', 1), ('b', 2), ('a', 3)")
+        pivoted = raw_sql(A.port + 4, "PIVOT ev ON g USING sum(v)")
+        checks["with one turn, a PIVOT (which asks the data before it runs) answers"] = pivoted[0] == 200 and json.loads(pivoted[3]) == [{"a": 4, "b": 2}]
+    finally:
+        node.kill()
+    for name, good in checks.items():
+        print(f"answers_big: {name}: {'OK' if good else 'FAIL'}")
+    if not all(checks.values()):
+        sys.exit(1)
+    return "big answers go in pieces that are the whole's bytes, count in the query memory, and take turns"
+
+
 # About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
 # prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
 # suite in parts side by side that end together. A section not listed counts as 5 s.
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
-        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10, "use_path": 40}
+        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10, "use_path": 40, "answers_big": 15}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, loads, reader, crash, load)
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, loads, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -10502,7 +10658,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "loads", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "answers_big", "load", "loads", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -10515,7 +10671,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "loads": loads, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

@@ -337,10 +337,15 @@ def environments_check(bin, work, port, root):
     q("CREATE DATABASE dev2 CLONE dev")
     checks["a branch of a branch answers as its base"] = until(lambda: rows(prod, every.replace("sales.orders", "dev2.sales.orders")) == dev_rows) is True
     checks["a database with branches can't be dropped first"] = "branches" in refused(prod, "DROP DATABASE dev")
+    for s in ("CREATE INDEX kv_v ON kv (v)", "CREATE INDEX orders_amount ON sales.orders (amount)", "CREATE TYPE mood AS ENUM ('ok', 'not')", "CREATE TYPE sales.stage AS ENUM ('new', 'won')"):
+        q(s)
     q("CREATE DATABASE sales_only CLONE prod WITH (schemas = (sales))")
     q("CREATE DATABASE fixtures CLONE prod WITH NO DATA")
-    checks["WITH (schemas = (sales)) takes that schema alone"] = rows(prod, "SELECT count(*) FROM sales_only.sales.orders") == rows(prod, "SELECT count(*) FROM sales.orders") \
-        and "not found" in refused(prod, "SELECT * FROM sales_only.k").lower() + refused(prod, "SELECT * FROM sales_only.public.k").lower()
+    taken = sorted(rows(prod, "SELECT kind, coalesce(schema, 'public') AS s, name FROM pondra.objects WHERE lake = 'sales_only' AND kind IN ('index', 'type')"))
+    print(f"  (sales_only's indexes and types: {taken})", flush=True)
+    checks["WITH (schemas = (sales)) takes that schema alone, its indexes and enum types too"] = rows(prod, "SELECT count(*) FROM sales_only.sales.orders") == rows(prod, "SELECT count(*) FROM sales.orders") \
+        and "not found" in refused(prod, "SELECT * FROM sales_only.k").lower() + refused(prod, "SELECT * FROM sales_only.public.k").lower() \
+        and taken == [("index", "sales", "orders_amount"), ("type", "sales", "stage")]
     checks["WITH NO DATA: the tables, empty"] = rows(prod, "SELECT count(*) FROM fixtures.sales.orders") == [(0,)]
     elsewhere = os.path.join(work, "y") if root.startswith("s3://") else "s3://b/y"
     checks["refused by name: a clone of a database not here, a branch where its base isn't (a bucket, a disk)"] = \

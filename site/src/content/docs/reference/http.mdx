@@ -104,7 +104,11 @@ query) and `tables` are for clients that send frames and data along; the clients
 
 A query answers a JSON array of rows, one object each. A column that is null in a row is left out
 of its object. A statement that isn't a query answers a JSON object, such as `{"rows": 2}` or
-`{"table": "t", "publish": []}`. Several statements in one request run in order.
+`{"table": "t", "publish": []}`. Several statements in one request run in order. An answer of 8 MB
+or more (`PONDRA_STREAM_MB`) comes in pieces as it is written (`Transfer-Encoding: chunked`), as
+JSON, CSV, TSV, NDJSON or Arrow; one bigger than the node's memory for queries is refused with
+SQLSTATE `53200` (`x-pondra-sqlstate`), and a query that waited too long for its turn with `53300`
+([Environment](/pondra/reference/environment/#memory-and-disk)).
 
 `format=typed` is what [the console](/pondra/start/console/) uses: `{"columns": [{"name", "type"}],
 "rows": [[…], …], "total": N, "pages": "…"}`. Each row is a list in the columns' order, so two

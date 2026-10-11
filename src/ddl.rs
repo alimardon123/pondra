@@ -706,6 +706,14 @@ pub async fn sync(lake: &Lake, me: &str, follow: bool) -> Result<()> {
 /// After this node sent an `ATTACH` or `DETACH`: once its catalog shows it, as it does here. After
 /// `CREATE MATERIALIZED VIEW`: once it is filled from the rows already there (`views::fill_all`).
 pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
+    match d {
+        // (CREATE OR REPLACE makes what it says, so it is waited for as when made plainly; IF NOT
+        // EXISTS a materialized view only: one there already was filled when it was made, and a
+        // routine there already may differ from the one asked for)
+        Ddl::Replacing { then, .. } => return Box::pin(settle(lake, then, me)).await,
+        Ddl::Unless { then, .. } if matches!(**then, Ddl::CreateMaterialized { .. }) => return Box::pin(settle(lake, then, me)).await,
+        _ => {}
+    }
     if let Ddl::CreateMaterialized { name, .. } = d {
         let name = local(lake, name).unwrap_or_default();
         let open = crate::once::open(&name);

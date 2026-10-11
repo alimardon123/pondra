@@ -316,7 +316,7 @@ Python and `err.sqlstate` in JavaScript.
 | `42501` | a user's grants don't allow it |
 | `42P07` | a table or view of that name exists |
 | `22012`, `22003`, `22P02` | division by zero, a number out of range, a value that doesn't cast |
-| `57014`, `53200` | a statement timeout; out of memory |
+| `57014`, `53200`, `53300` | a statement timeout; out of memory (an answer bigger than the node's memory for queries too); too many queries waiting at once |
 | `0A000` | not supported |
 | `XX000` | anything else |
 

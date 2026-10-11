@@ -12,6 +12,10 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::prelude::*;
+use datafusion::common::utils::memory::RecordBatchMemoryCounter;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 
@@ -803,6 +807,41 @@ tokio::task_local! {
 
 /// Does this request carry tables of its own?
 pub fn sent() -> bool { SENT.try_with(|t| !t.is_empty()).unwrap_or(false) }
+
+tokio::task_local! {
+    /// The memory of the last answer a request collected (`collect`), counted until the request's body
+    /// is sent: an answer sent in pieces (`server::Rendered`) takes it over. Only the last one is kept:
+    /// an earlier statement's batches were dropped when that statement ended.
+    pub static HELD: std::cell::RefCell<Option<MemoryReservation>>;
+}
+
+/// An answer's batches, collected from a plan's partitions. They are counted in the query memory
+/// (DataFusion counts the operators', not what they hand back), so an answer bigger than the memory
+/// stops with 53200 instead of taking the node down.
+pub async fn collect(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>) -> Result<Vec<RecordBatch>> {
+    let held = MemoryConsumer::new("an answer").register(task.memory_pool());
+    let mut counted = RecordBatchMemoryCounter::new(); // (each buffer once: batches cut from one batch or page share theirs)
+    let mut stream = datafusion::physical_plan::execute_stream(plan, task)?;
+    let mut out = vec![];
+    while let Some(batch) = stream.try_next().await? {
+        if held.try_grow(counted.count_batch(&batch)).is_err() {
+            return Err(crate::codes::coded("53200", format!("the answer is bigger than this node's memory for queries ({} MB): ask for fewer rows (a LIMIT or a filter), or write them out with COPY (…) TO a file or folder", memory_limit() >> 20)));
+        }
+        out.push(batch);
+    }
+    keep_held(held);
+    Ok(out)
+}
+
+/// Keeps an answer's memory counted in the request's scope (`HELD`); a door with no scope of its own
+/// (Postgres, Flight, MCP) releases it when the answer is returned.
+fn keep_held(held: MemoryReservation) {
+    let mut held = Some(held);
+    let _ = HELD.try_with(|h| *h.borrow_mut() = held.take());
+}
+
+/// The memory of the answer a request kept, for the body that sends it (`server::answer`).
+pub fn take_held() -> Option<MemoryReservation> { HELD.try_with(|h| h.borrow_mut().take()).ok().flatten() }
 
 /// Batches as an Arrow IPC stream.
 pub fn ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
