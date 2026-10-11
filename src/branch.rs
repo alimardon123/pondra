@@ -578,12 +578,22 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     // (a base on another server: its users and grants sign in there; the branch is this server's,
     // signed in to as this server's databases are: ADR-058)
     let away = m.lakes.get(&id).is_some_and(|b| b.read_only);
+    // (a clone with rows keeps the loads of the folders it takes: `copy.rs`, a file loaded once a version)
+    let loads: Vec<String> = snap.iter().filter_map(|(k, v)| {
+        let name = k.strip_prefix("t/")?;
+        if !wanted(name) || name.starts_with("pondra$") {
+            return None;
+        }
+        let meta: TableMeta = serde_json::from_slice(v).ok()?;
+        Some(format!("ld/{}/", meta.folder(name)))
+    }).collect();
     let (mut tables, mut tiered) = (0, end);
     for (k, v) in &snap {
         let (prefix, name) = k.split_once('/').map_or((k.as_str(), ""), |(p, n)| (p, n));
         match prefix {
             _ if deny.iter().any(|d| k.starts_with(d)) => {}
             "u" if away => {}
+            "ld" if !m.data || !loads.iter().any(|p| k.starts_with(p.as_str())) => {}
             "c" | "n" | "b" | "m" | BASES | "format" | crate::store::QUIET => {}
             "t" if name.starts_with("pondra$") || !wanted(name) => {} // (the run log, audit, history: the branch's own)
             "t" => {
@@ -835,6 +845,9 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
         seq.submit(skip).await?;
     }
     let mark = seq.number().await?.version;
+    // The loads of these tables' folders as the base has them (`copy.rs`): a file it loaded since the
+    // clone is among the rows this brings, so it isn't loaded here again.
+    let loads: Vec<String> = metas.iter().map(|(t, m)| format!("ld/{}/", m.folder(t))).collect();
     let (mut puts, now_ms) = (vec![], crate::log::now_ms());
     for (t, mut meta) in metas {
         meta.tiered = mark;
@@ -846,6 +859,7 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
         }
         puts.push((table_key(&t), json(&meta)));
     }
+    puts.extend(snap.iter().filter(|(k, _)| loads.iter().any(|p| k.starts_with(p.as_str()))).map(|(k, v)| (k.clone(), v.to_vec())));
     let mut fills = vec![];
     for v in views {
         puts.push((crate::views::view_key(v), snap[&crate::views::view_key(v)].to_vec()));

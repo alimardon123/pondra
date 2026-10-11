@@ -1,25 +1,25 @@
 ---
 title: Command line
-description: The pondra command, its SQL shell, and every serve, sql, run and catalog option with its default.
-sidebar:
-  order: 14
+description: Every pondra command and option, with its default. Covers the shell, serve, sql, run, catalog, the project commands and the system service.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
 `pondra` is one binary. On its own it opens a SQL shell on a lake. `pondra serve` runs a node on a
-lake, or serves a folder of lakes as databases, `pondra sql` and `pondra run` run SQL, `pondra
-workspace` keeps the lake's files in a folder of yours, `pondra plan` and `pondra apply` make a
-database match a project of files, and `pondra catalog` prints what the lake's catalog holds.
+lake, or serves a folder of lakes as databases, `pondra service` keeps a node running on the machine
+at boot, `pondra sql` and `pondra run` run SQL, `pondra workspace` keeps the lake's files in a folder
+of yours, `pondra plan` and `pondra apply` make a database match a project of files, and `pondra
+catalog` prints what the lake's catalog holds.
 
 | Command | Does |
 |---|---|
 | `pondra [LAKE]` | a SQL shell on a lake (`./lake` if you name none) |
 | `pondra serve [PATH]` | run a node on a lake, or serve every lake in a folder as a database |
+| `pondra service install\|status\|uninstall` | keep a node running on this machine, at boot and after a stop ([deploy](/pondra/guides/deploy/#as-a-service-on-one-machine)) |
 | `pondra sql --dir LAKE "SQL"` | run one statement against the lake, with no server |
 | `pondra run FILE LAKE` | run a SQL file, its `$name` parameters taking the values you pass |
 | `pondra workspace pull\|push DIR LAKE` | the lake's files in a folder of yours, for git and your editor |
-| `pondra init`, `plan`, `apply`, `test`, `export` | a project of files, made true in a database ([environments](/pondra/guides/environments/#apply-a-project)) |
+| `pondra init`, `plan`, `status`, `capture`, `apply`, `test`, `export` | a project of files, made true in a database ([environments](/pondra/guides/projects/#apply-it)) |
 | `pondra login`, `branch`, `switch`, `diff`, `ci init` | a server's token kept; a Git branch and its database; what a branch changes; CI set up |
 | `pondra catalog --dir LAKE PREFIX` | print catalog entries |
 | `pondra --version`, `pondra --help` | the version, and help for any command |
@@ -104,8 +104,9 @@ pondra serve --lake /srv/lake
 pondra serve --lakes /srv/data
 ```
 
-`--lake` serves exactly this lake, and makes it if it is missing (`--dir` is the same, for older scripts). `--lakes` serves exactly this
-folder of lakes. Use these two in anything that starts a node unattended.
+`--lake` serves exactly this lake, and makes it if it is missing (`--dir` is the same, for older
+scripts). `--lakes` serves exactly this folder of lakes (`--databases` is the same). Use these two in
+anything that starts a node unattended.
 
 ### Where and how
 
@@ -113,7 +114,7 @@ folder of lakes. Use these two in anything that starts a node unattended.
 |---|---|---|
 | `PATH` | the current folder | the lake (a folder, or `s3://bucket/prefix`, its credentials and endpoint from the `AWS_*` variables), or a folder of lakes |
 | `--lake LAKE` | none | exactly this lake, made if it is missing, and nothing guessed. For scripts and services (`--dir` is the same) |
-| `--lakes FOLDER` | none | exactly this folder of lakes, each a database. For scripts and services. `--lake` on a folder of lakes, or `--lakes` on a lake, is refused and says which you meant |
+| `--lakes FOLDER` | none | exactly this folder of lakes, each a database. For scripts and services (`--databases` is the same). `--lake` on a folder of lakes, or `--lakes` on a lake, is refused and says which you meant |
 | `--default NAME` | `lake`, else the only one | serving a folder of lakes: the database a client that names none gets (HTTP without `/db/`, Postgres without a database) |
 | `--addr ADDR` | `127.0.0.1:8080` | the address the HTTP API and [the console](/pondra/start/console/) listen on, and other nodes reach this one at |
 | `--advertise ADDR` | `--addr` | the address other nodes reach this one at, when it isn't `--addr`. A database's node, behind the process that serves its folder, is `host:port/db/name` |
@@ -153,7 +154,7 @@ environment: a flag shows in the process list.
 
 | Flag | Environment | Meaning |
 |---|---|---|
-| `--tls-cert FILE` | `PONDRA_TLS_CERT` | a PEM certificate: HTTP, Postgres, Kafka and Flight take TLS on their own ports, and plain connections only from this machine |
+| `--tls-cert FILE` | `PONDRA_TLS_CERT` | a PEM certificate: HTTP, Postgres, Kafka and Flight take TLS on their own ports, and plain connections only from this machine (`PONDRA_TLS=optional`: from anywhere) |
 | `--tls-key FILE` | `PONDRA_TLS_KEY` | its key |
 | `--tls-ca FILE` | `PONDRA_TLS_CA` | the authority that signs the nodes' certificates: mutual TLS between nodes |
 
@@ -213,18 +214,17 @@ used and stopped when idle (`PONDRA_DATABASE_IDLE_SECS`, 600). See
 pondra serve data --addr 0.0.0.0:8080 --pg 0.0.0.0:5432
 ```
 
-Every other option of `pondra serve` applies to each database's node: `--pg`, the tokens
-(`--read-token`, `--write-token`, `--admin-token`), the TLS files (to the server's own doors),
-`--python`, `--reader` (every database
+These options apply to each database's node: `--pg`, the tokens (`--read-token`, `--write-token`,
+`--admin-token`), the TLS files (to the server's own doors), `--python`, `--reader` (every database
 read-only), `--tier-secs`, `--memory-gb`, `--cache-dir`, `--cache-gb`, `--ack`, `--replicas`,
 `--fsync`, `--publish`, `--flush-ms`, `--task-ms`, `--retain-secs`, `--changelog-secs` and
 `--backlog`. Each database is a process of its own, so a value such as `--memory-gb` is for each
 database's node, not for all of them together.
 
-`--flight`, `--kafka` (and `--kafka-advertise`), `--attach`, `--advertise` and `--attach-found` are
-refused, and the message names the flag. A Flight or Kafka port speaks for one lake today. Routing
-them to many databases (Kafka by topic, such as `sales.orders`, and Flight by the database the client
-names) is planned for the next round. Serve such a lake on its own:
+`--flight`, `--kafka`, `--attach`, `--advertise` and `--attach-found` are refused, and the message
+names the flag. A Flight or Kafka port speaks for one lake today. Routing them to many databases
+(Kafka by topic, such as `sales.orders`, and Flight by the database the client names) is not built
+yet. Serve such a lake on its own:
 
 ```bash norun
 pondra serve data/sales --flight 0.0.0.0:8815
@@ -264,6 +264,25 @@ latest transactional object (e.g. manifest) version`. Make the lake first with t
 any statement that creates a table.
 </Aside>
 
+### CHECKPOINT
+
+`pondra sql --dir LAKE CHECKPOINT` runs [`CHECKPOINT`](/pondra/sql/statements/) on the lake: it
+tiers the log into Parquet and writes the catalog down, so other engines read what is current. If
+a node runs the lake, the command sends the statement to it and prints the node's answer. If none
+runs, it prints this, and the next node to start tiers the log:
+
+```bash
+pondra sql --dir shell-lake CHECKPOINT
+```
+
+```text
+{"checkpoint":false,"why":"no node runs this lake: the next one to start tiers its log"}
+```
+
+With a node running, the answer is the node's, such as `{"checkpoint":true,"rows_tiered":0,"rewritten":[]}`.
+When the lake's node has tokens, set `PONDRA_ADMIN_TOKEN` first: the command sends `PONDRA_TOKEN` or
+`PONDRA_ADMIN_TOKEN` to the node.
+
 ## pondra run
 
 `pondra run FILE LAKE` runs a SQL file: its statements in order, and `$name` in them takes the
@@ -275,11 +294,11 @@ rows print as a table.
 | Option | Default | Meaning |
 |---|---|---|
 | `FILE` | required | the SQL file |
-| `LAKE` | `lake` | the lake, unless `--url` |
-| `--url URL` | none | run on the node at this URL |
+| `LAKE` | `lake` | the lake, unless `--url`. Name it before the parameters |
+| `--url URL` | none | run on the node at this URL. Not together with a lake |
 | `--token TOKEN` | `PONDRA_TOKEN` | a token for that node |
-| `--NAME VALUE` | none | the file's parameters, after `LAKE` |
-| `--help` | | this, and with `FILE` the file's parameters: each `DECLARE PARAMETER`'s type, default and comment |
+| `--NAME VALUE` | none | a parameter of the file, such as `--day 2026-09-27`. Give them after `FILE` and `LAKE` |
+| `-h`, `--help` | | `pondra run -h` lists these options. `pondra run FILE --help` also lists the file's parameters: each `DECLARE PARAMETER`'s type, default and comment |
 
 ```bash
 printf 'SELECT count(*) AS orders, $day AS day FROM orders;\n' > report.sql
@@ -295,7 +314,7 @@ pondra run report.sql shell-lake --day 2026-09-27
 ```
 
 A file that declares its parameters (`DECLARE PARAMETER $day DATE = current_date - 1;`, with what each
-means in the comment above it: see [Variables](/pondra/reference/sql/#variables)) says so with
+means in the comment above it: see [Variables](/pondra/sql/statements/#variables)) says so with
 `--help`, and a value given replaces the default, cast to its type:
 
 ```bash
@@ -319,9 +338,11 @@ Options: --url URL (a node already running), --token TOKEN (also PONDRA_TOKEN)
 ```
 
 <Aside type="caution">
-Parameters are read only after `LAKE`, so with `--url` you still give a lake first, as in
-`pondra run report.sql lake --url http://localhost:8080 --day 2026-09-27`. Without it,
-`--day` fails with `unexpected argument '--day' found`.
+`--url` and `--token` may come anywhere after `FILE`, so `pondra run report.sql --url
+http://localhost:8080 --day 2026-09-27` works. A lake word must come before the first parameter:
+`pondra run report.sql lake --day 2026-09-27`. A lake word after a parameter is taken as a
+parameter and refused. Naming both a lake and `--url` fails with `run a script on a lake folder or
+on a node (--url), not both`.
 </Aside>
 
 ## pondra workspace
@@ -351,13 +372,13 @@ pulled 0, removed 0 here
 ## pondra plan, apply and the project's commands
 
 A project is a folder with `pondra.toml`, `objects/`, `migrations/`, `seeds/` and `tests/`
-([apply a project](/pondra/guides/environments/#apply-a-project)). Each command reads it from
+([apply a project](/pondra/guides/projects/#apply-it)). Each command reads it from
 `--project` (this folder by default) and talks to an environment's node.
 
 | Command | Does |
 |---|---|
 | `pondra init [DIR]` | start a project: pondra.toml, objects/, migrations/, seeds/, tests/, and a `.gitignore` that leaves out `lake/` (`--name`) |
-| `pondra plan [ENV]` | what an apply would change, and what it refuses (exit 1 if anything is refused) |
+| `pondra plan [ENV]` | what an apply would change, and what it refuses (exit 1 if anything is refused). `--prune` also plans the drops of objects the project no longer declares |
 | `pondra status [ENV]` | what differs, as `git status` does: to apply, changed outside an apply (renamed, dropped, or columns changed), and untracked; who changed each and when (exit 1 if anything is refused) |
 | `pondra capture [NAME…]` | write the chosen changed and untracked objects into the files (all when no name is given): the database's statement, a new file, or the declaration taken out for a dropped one; a renamed table or column gets a migration, recorded as run where it was made (exit 1 if anything is refused) |
 | `pondra apply [ENV]` | the plan, then each step, then tests/ (exit 1 if it fails); the database is made first if it isn't there |
@@ -367,13 +388,13 @@ A project is a folder with `pondra.toml`, `objects/`, `migrations/`, `seeds/` an
 | `pondra apply --no-test`, `--prune` | skip tests/; drop the objects the project no longer declares |
 | `pondra test [ENV]` | run tests/: any row a query returns is a failure (exit 1 if one fails) |
 | `pondra export [DIR]` | the environment's objects as a project's files (pondra.toml kept if DIR has one) |
-| `pondra login [URL] [--token T \| --user U]` | keep a token for a server in `~/.pondra` (`PONDRA_HOME`); with no URL, for each server pondra.toml names; asked for when not given |
+| `pondra login [URL] [--token T \| --user U] [--project DIR]` | keep a token for a server in `~/.pondra` (`PONDRA_HOME`). `--user U` signs in as a user instead: its password is asked for, or read from `PONDRA_PASSWORD`. With no URL, for each server pondra.toml names (in `--project`, this folder by default). Asked for when neither is given |
 | `pondra branch NAME [--from DB]` | start a branch: the Git branch NAME (switched to) and a database of its name, cloned from `[env.dev] clone`, else prod, with no file copied |
 | `pondra switch NAME` | `git switch NAME`, and its database made if it isn't there |
 | `pondra branch` | the branches' databases: where each came from, when, who made it; `*` marks yours |
-| `pondra branch -d NAME` | drop its database (its maker or an admin), and its Git branch when git lets it go |
+| `pondra branch -d NAME` | drop its database (its maker or an admin), and its Git branch when git lets it go. `--delete NAME` is the same |
 | `pondra diff [ENV] [--against DB]` | the objects that differ and the rows of each table both have, as Markdown (against its clone's source, else prod) |
-| `pondra ci init [--force]` | set CI up: `.github/workflows/pondra.yml`, prod protected, CI's users and tokens, GitHub's secrets and `prod` environment (through `gh`) |
+| `pondra ci init [--project DIR] [--force]` | set CI up: `.github/workflows/pondra.yml`, prod protected, CI's users and tokens, GitHub's secrets and `prod` environment (through `gh`). `--force` writes the workflow again when it differs from ours; yours is kept otherwise |
 
 Where the environment is:
 
@@ -386,20 +407,65 @@ Where the environment is:
 | `--project DIR` | `.` | the project's folder |
 
 An environment's server is its own `server`, a branch's is `[env.dev]`'s, and otherwise the
-project's. A database name is letters, digits and `_`: `pr-123` and `feature/x` become `pr_123` and
-`feature_x`. An apply sends `[env.NAME]`'s values (`[env.dev]`'s for a branch), the git commit, and
-`[secrets]`' values from this machine's environment.
+project's. A database name is the environment's or branch's name as SQL takes it: lower-cased,
+every character that is not an ASCII letter or digit, or `_`, becomes `_`, and a leading digit gets
+a `_` in front. So `PR-123` is `pr_123`, `feature/x` is `feature_x` and `2026-plan` is `_2026_plan`.
+An apply sends `[env.NAME]`'s values (`[env.dev]`'s for a branch), the git commit, and `[secrets]`'
+values from this machine's environment.
+
+## pondra service
+
+`pondra service` keeps a node running on this machine: it starts at boot, starts again when it
+stops, and stops cleanly. The system's own manager runs it: systemd on Linux, launchd on macOS, and
+Windows's service manager on Windows. The [deploy guide](/pondra/guides/deploy/#as-a-service-on-one-machine)
+shows the steps.
+
+| Command | Does |
+|---|---|
+| `pondra service install [--name NAME] [serve options]` | install the node and start it. The options are `pondra serve`'s, and the lake is `./lake` in the folder you run it from unless you name one. `--name` (default `pondra`) goes before the serve options. Installing again with the same name changes them |
+| `pondra service status [--name NAME]` | whether it runs, the `pondra serve` command it runs, the node's role, and where its logs are |
+| `pondra service uninstall [--name NAME]` | stop it and remove it. The lake and its logs stay |
+
+`install` saves the options, and the variables that start with `PONDRA_`, `AWS_`, `AZURE_` or
+`GOOGLE_` (except `PONDRA_OWNER_KEY` and `PONDRA_SUPERVISED`), in the service's settings file. That
+file is `/etc/pondra/services/NAME.json` after `sudo`, `~/.config/pondra/services/NAME.json`
+otherwise, and `%ProgramData%\pondra\services\NAME.json` on Windows. On Linux and macOS only the
+service's user can read it. So set tokens and keys in your terminal before `install`.
+
+```bash norun
+sudo pondra service install --lake /srv/lake --addr 0.0.0.0:8080 --pg 0.0.0.0:5432
+pondra service status
+sudo pondra service uninstall
+```
+
+On a machine with no service of that name, `status` says so:
+
+```text
+Error: no service named pondra here (`pondra service install --name pondra …` makes it)
+```
+
+## python -m pondra
+
+`python -m pondra ARGS` runs the `pondra` binary that pip installed, with `ARGS`, so it works when
+that folder isn't on your `PATH`. `python -m pondra --add-to-path` puts that folder on your `PATH`:
+in the registry on Windows, and in your shell's startup file elsewhere. The
+[Python reference](/pondra/reference/python/#the-pondra-command) has the details.
+
+```bash norun
+python3 -m pondra --version
+python3 -m pondra --add-to-path
+```
 
 ## pondra catalog
 
-`pondra catalog --dir LAKE PREFIX` prints the catalog's entries whose keys start with `PREFIX`: `t/`
-for tables, `s/` for log segments, `p/` for producers. It is for looking inside a lake, and what
-it prints is the lake's own format: see [the lake format](/pondra/concepts/lake-format/).
+`pondra catalog --dir LAKE PREFIX` (or `--lake`) prints the catalog's entries whose keys start with
+`PREFIX`: `t/` for tables, `s/` for log segments, `p/` for producers. It is for looking inside a
+lake, and what it prints is the lake's own format: see [the lake format](/pondra/concepts/lake-format/).
 
 ```bash
 pondra catalog --dir shell-lake t/ | cut -c1-40
 ```
 
 ```text
-t/orders {"columns":[["id","Int64"],["am
+t/orders {"columns":[["am
 ```

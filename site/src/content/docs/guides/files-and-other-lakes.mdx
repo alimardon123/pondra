@@ -1,11 +1,10 @@
 ---
 title: Files and other lakes
 description: Read and write Parquet, CSV, JSON, Delta and Iceberg on disk, in buckets or over HTTPS, and attach other engines' tables.
-sidebar:
-  order: 4
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 Files, other engines' tables and Kafka topics are tables wherever SQL takes one. You can query them,
 join them with your own tables, copy them into the lake, and write query results back out to them, in
@@ -151,7 +150,7 @@ SQL
   refused.
 - **`DROP TABLE`** drops the name. The files stay.
 
-[SQL statements](/pondra/reference/sql/#external-tables) has the options and what is refused.
+[SQL statements](/pondra/sql/statements/#external-tables) has the options and what is refused.
 
 ## Copy files into the lake
 
@@ -184,8 +183,9 @@ The same names work on `s3://` (AWS, R2, MinIO and anything S3-compatible), `gs:
 cluster as a table's are. A node reads a URL with the **secret** that covers it. An admin makes one, and
 the credentials never appear in SQL that queries run:
 
+<Ways sql={`CREATE SECRET sales_s3 (TYPE s3, KEY_ID 'my-key-id', SECRET 'my-secret', REGION 'eu-west-1', SCOPE 's3://my-bucket');`} />
+
 ```sql
-CREATE SECRET sales_s3 (TYPE s3, KEY_ID 'my-key-id', SECRET 'my-secret', REGION 'eu-west-1', SCOPE 's3://my-bucket');
 SELECT * FROM secrets();
 ```
 
@@ -325,7 +325,7 @@ SQL
 
 - `PARTITION_BY` writes Hive-style folders (`day=2026-09-27/`).
 - `COPY` takes DataFusion's words too, `STORED AS CSV PARTITIONED BY (day) OPTIONS ('format.has_header' 'false')`
-  in place of the brackets: see [SQL statements](/pondra/reference/sql/#files-and-secrets). Its
+  in place of the brackets: see [SQL statements](/pondra/sql/statements/#files-and-secrets). Its
   writers' own options pass through as DataFusion names them (`'format.compression' 'zstd(10)'`,
   `'format.data_page_row_count_limit' '1000'`, `'format.quote_style' 'Always'`, …); one that isn't
   the format's is refused.

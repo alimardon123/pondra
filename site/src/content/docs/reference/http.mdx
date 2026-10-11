@@ -1,8 +1,6 @@
 ---
 title: HTTP API
-description: Every HTTP endpoint of a Pondra node, with its method, path, role, parameters, body and answer.
-sidebar:
-  order: 8
+description: Every HTTP endpoint of a Pondra node, with its method, path, role, parameters, body, answer and status codes.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -12,25 +10,76 @@ clients, the shell and the console all use these endpoints, and so can `curl`. A
 request. A request that changes a table, view, task or function goes to the leader, and a
 follower forwards it there.
 
+With a certificate (`--tls-cert` and `--tls-key`), the node takes `https://` on the same port. A
+plain `http://` request from another machine is refused with `403` and the reason. Plain requests
+are taken from this machine only, unless `PONDRA_TLS=optional`. See [TLS](/pondra/guides/security/#tls).
+
 ## Roles
 
 A node started without tokens is open. With `--read-token`, `--write-token` and `--admin-token`
 (or the `PONDRA_*_TOKEN` variables), a request carries `Authorization: Bearer <token>`, and the
 token's role decides what it may do. A role covers the ones before it: admin, then write, then
-read.
+read. A user who signs in with `POST /login` gets a token of their own, sent the same way. The
+[security guide](/pondra/guides/security/) has the users and their grants.
 
 | Role | May |
 |---|---|
-| read | run queries, look up keys, watch, live queries, read files, the Iceberg catalog |
-| write | also append rows, insert, put files, and write with `POST /sql` |
-| admin | also create tables, views, tasks and functions, run DDL (`CREATE`, `ALTER`, `DROP`, `COPY … TO`) and `DO` blocks in `POST /sql`, and tier |
+| none | the console's page and files, `GET /stats`, `GET /healthz`, `GET /ready`, `POST /login`, `GET /whoami`, `/console/settings`, and a procedure's `GET /secrets/{name}` (its lent token only) |
+| read | run queries (`POST /sql`, `GET /sql/pages/{id}`), look up keys, watch, live queries, read files, end a session, `GET /objects`, `GET /kinds`, `GET /routines`, `GET /metrics`, the projects' `plan`, `test`, `status` and `export`, the Iceberg catalog's reads, MCP's reads, the Delta Sharing door |
+| write | also append rows, insert, put, restore and delete files, write with `POST /sql`, and commit to the Iceberg catalog |
+| admin | also create tables, views, tasks and functions, `POST /tier`, Python (`/python`, `/sessions/{id}/python`), `GET /functions`, making and dropping databases in a folder of lakes, DDL in `POST /sql` (`CREATE`, `ALTER`, `DROP`, `COPY … TO`), `DO` blocks, and `apply` |
 
-A request with no token is answered `401` (`sign in: a token, or a user's name and password`), with a wrong one `401` too, and with a token or user without enough rights `403` (`this needs more rights than this token's or user's`). Any
-other error is `500` with its message as plain text.
+`apply` needs an admin token, or the `APPLY` privilege on the database. Other rights a route checks
+inside its handler, such as a write statement's, are listed where the route is.
 
 ```bash norun
 curl -s -H "Authorization: Bearer $PONDRA_TOKEN" -X POST http://localhost:8080/sql -d "SELECT 1"
 ```
+
+## Status codes
+
+Every answer has one of these codes. Errors that a route doesn't name below are `500`, with the
+message as the body.
+
+| Status | When | Body |
+|---|---|---|
+| `200` | the answer | the JSON or text the route describes |
+| `204` | a change with no answer: `PUT /console/settings`, an Iceberg table's commit or drop, a rename | empty |
+| `304` | a console file that hasn't changed, when `If-None-Match` names its `ETag` | empty |
+| `400` | a request the route can't use: a folder of lakes' bad name, an Iceberg `POST /v1/namespaces` (use `CREATE SCHEMA`), a Delta Sharing feature not yet offered | text, or an Iceberg or Delta Sharing error object |
+| `401` | no token, a wrong token, or a wrong user name or password. A `POST /login` with a wrong password is `401` too | `sign in: a token, or a user's name and password`, `wrong token, or user name and password`, `wrong user name or password` |
+| `403` | the token or user has too few rights for the route. Also a plain request from another machine when the node takes TLS | `this needs more rights than this token's or user's`, or the TLS message |
+| `404` | no such file, version, namespace or table; an unknown path; a folder's database that can't be started | the name, and the reason |
+| `409` | `PUT /files/{path}` with no `If-Match` to a path that exists; an Iceberg commit against a table that changed meanwhile (`CommitFailedException`) | the reason |
+| `410` | `GET /sql/pages/{id}` for an answer no longer kept | `this answer's rows are no longer kept here: run it again` |
+| `412` | `PUT /files/{path}` with an `If-Match` the file has moved past | the path and the change |
+| `422` | a JSON body that lacks a field the route needs, such as `POST /plan` without `files` | the field, as the JSON reader names it |
+| `500` | any other error, such as a bad statement or a refused statement | the message as text, and the `x-pondra-sqlstate` header |
+| `502` | a folder of lakes can't reach a running database's node | the reason |
+| `503` | the node is stopping, or it leads but can't reach its bucket; `/ready` while it catches up | the reason; `Retry-After: 1` when the node is stopping or cut off |
+
+A `500` carries a header with Postgres's code for the error, `x-pondra-sqlstate`, so a client can
+tell a syntax error from a conflict without reading the words. Only the `500` answers have it. The
+codes are listed in [error codes](/pondra/reference/postgres/#error-codes).
+
+```bash
+curl -s -i -X POST http://localhost:8080/sql -d "SELEC 1" | grep -i "^HTTP\|x-pondra-sqlstate"
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/files/no/such.txt
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/sql/pages/none
+```
+
+```text
+HTTP/1.1 500 Internal Server Error
+x-pondra-sqlstate: 42601
+404
+410
+```
+
+A node that is stopping answers every other path with `503` and `Retry-After: 1`: send the request
+to another node. A node that leads but can't reach its bucket answers `503` the same way, while
+another node takes over. A node that has just started answers queries `500` with
+`x-pondra-sqlstate: 57P03` until it has what its leader had. `GET /ready` says which of these holds
+(below).
 
 ## Run SQL
 
@@ -48,9 +97,10 @@ query) and `tables` are for clients that send frames and data along; the clients
 |---|---|
 | `format` | `json` (the default), `table` (a text table), `arrow` (an Arrow IPC stream, for pandas, Polars and DuckDB) or `typed` (below); or a file of every row to download: `csv`, `tsv`, `ndjson` (JSON lines), `parquet` or `xlsx` (an Excel workbook: one sheet, the names in bold, at most 1,048,575 rows) |
 | `after` | wait until this node has seen this log segment (from an append's `seg`), for reading your own writes |
-| `spread` | `1` runs the query across the cluster even for small tables, `0` only here |
+| `spread` | `1` runs the query across the cluster even for small tables, `0` only here. Left out, the cluster decides ([clusters](/pondra/guides/clusters/)) |
 | `stale_ms` | accept a remembered answer up to this many milliseconds old |
 | `job` | for a write: a retry with the same job id is applied once |
+| `rows` | `typed` only: how many rows the first page holds (1 to 100,000; 10,000 if left out) |
 
 A query answers a JSON array of rows, one object each. A column that is null in a row is left out
 of its object. A statement that isn't a query answers a JSON object, such as `{"rows": 2}` or
@@ -59,8 +109,8 @@ of its object. A statement that isn't a query answers a JSON object, such as `{"
 `format=typed` is what [the console](/pondra/start/console/) uses: `{"columns": [{"name", "type"}],
 "rows": [[…], …], "total": N, "pages": "…"}`. Each row is a list in the columns' order, so two
 columns may share a name (a join's). It holds the first 10,000 rows (`&rows=N` for another number,
-1 to 100,000: the console's rows a page), and `total` says how many there were. Decimals come as text with all their digits (`"1.50"`), and so do integers past 2^53, which
-JavaScript can't hold exactly.
+1 to 100,000: the console's rows a page), and `total` says how many there were. Decimals come as text
+with all their digits (`"1.50"`), and so do integers past 2^53, which JavaScript can't hold exactly.
 
 An answer of more rows than that is kept on the node a while, and `pages` is its id (else `null`).
 `GET /sql/pages/{id}?from=10000&rows=10000` answers more of its rows, in the same form: the same rows
@@ -85,11 +135,12 @@ print(first["total"], len(first["rows"]), len(more["rows"]), more["rows"][0])
 ```
 
 The header `x-pondra-notices` on an answer carries what procedures and `DO` blocks printed, as a
-JSON list of lines. Send `x-pondra-session: <id>` (8 to 128 letters, digits, `-` or `_`) to use temporary tables that only that id sees,
-`DO LANGUAGE python` blocks that share their variables ([Functions and procedures](/pondra/guides/functions-and-procedures/#cells-that-share-variables)),
+JSON list of lines. Send `x-pondra-session: <id>` (8 to 128 letters, digits, `-` or `_`) to use
+temporary tables that only that id sees, `DO LANGUAGE python` blocks that share their variables
+([Functions and procedures](/pondra/guides/functions-and-procedures/#cells-that-share-variables)),
 and a transaction: `BEGIN`, then statements, then `COMMIT`, each request with the same id
-([Transactions](/pondra/guides/change-rows/#transactions)). An error is status 500 with its message
-as the body, and `x-pondra-sqlstate`, Postgres's code for it ([error codes](/pondra/reference/postgres/#error-codes)).
+([Transactions](/pondra/guides/change-rows/#transactions)). A node answers `x-pondra-session: held`
+while it keeps that session's state, and a client keeps to that node meanwhile.
 
 ```bash
 curl -s -X POST http://localhost:8080/sql -d "CREATE TABLE events (user VARCHAR, amount BIGINT)"
@@ -122,18 +173,21 @@ curl -s -X POST 'http://localhost:8080/sql?format=table' -d "SELECT * FROM event
 `POST /append/{table}?producer=NAME&seq=N[&prev=M]`: the body is newline-delimited JSON, one row
 per line, or an Arrow IPC stream with `Content-Type: application/vnd.apache.arrow.stream`. A
 column left out takes its `DEFAULT`, or null. `producer` names the writer and `seq` counts its
-appends, from 1, so a retry with the same `producer` and `seq` is recognised and not applied twice.
-`prev` is a compare-and-swap: the append applies only if the producer's last `seq` is `prev`.
-Without `producer`, an append is applied each time it is sent (at least once), as a Kafka
-producer that isn't idempotent. The answer is:
+appends, from 1 (`seq=0` is refused), so a retry with the same `producer` and `seq` is recognised
+and not applied twice. `prev` is a compare-and-swap: the append applies only if the producer's last
+`seq` is `prev`. Without `producer`, an append is applied each time it is sent (at least once), as a
+Kafka producer that isn't idempotent. The answer is:
 
 | Field | Meaning |
 |---|---|
 | `seg` | the log segment that holds the rows |
 | `duplicate` | true if this `seq` was already applied, so nothing was written |
 | `conflict` | true if `prev` didn't match: read again and retry |
+| `refused` | true if a table with a `UNIQUE` constraint refused the rows: a duplicate value |
+| `gone` | true if the table was renamed or dropped as the rows came: nothing was written |
 | `row` | where the rows start among the table's rows in `seg` |
 | `ms` | the commit time, for a reservation |
+| `block` | the block of row ids a reservation took, `0` for an append that took none |
 
 `POST /insert/{table}?job=ID`: the body is a query, such as `SELECT * FROM events`. The node runs
 it and writes the rows as Parquet, and the table is made if it doesn't exist. The answer is
@@ -147,8 +201,8 @@ curl -s -X POST 'http://localhost:8080/insert/events_copy?job=copy-1' -d "SELECT
 ```
 
 ```text
-{"seg":3,"duplicate":false,"conflict":false,"row":0,"ms":0}
-{"seg":0,"duplicate":true,"conflict":false,"row":0,"ms":0}
+{"seg":3,"duplicate":false,"conflict":false,"row":0,"ms":0,"block":0}
+{"seg":0,"duplicate":true,"conflict":false,"row":0,"ms":0,"block":0}
 {"rows":4}
 {"duplicate":true}
 ```
@@ -165,11 +219,11 @@ The body of `POST /tables/{name}` is either a list of `[name, type]` pairs, with
 (`Utf8`, `Int64`, `Float64`, `Boolean`, `Timestamp(Microsecond, None)`), or an object with
 `columns` and the options: `key` (a list), `merge` (an object of column to function), `publish`
 and `cluster_by` (lists), `partition_by`, `ttl` and `order_by` (strings). See
-[table options](/pondra/reference/table-options/#the-same-options-over-http). The answer is
+[table options](/pondra/sql/table-options/#the-same-options-over-http). The answer is
 `{"table": name, "publish": […]}`.
 
 `POST /views/{name}?window=w&size_secs=60&lateness_secs=10` takes any of the options of
-[`CREATE MATERIALIZED VIEW`](/pondra/reference/table-options/#materialized-views) as query
+[`CREATE MATERIALIZED VIEW`](/pondra/sql/table-options/#materialized-views) as query
 parameters. The answer is `{"view": name, "materialized": true}`.
 
 `POST /tasks/{name}` takes JSON: `source` and `target` (table names), `sql` (the query over the
@@ -205,7 +259,8 @@ values, comma-separated, in the key's column order. It is an error for a table w
 connection open. Its parameters: `after=N` (replay from this position; the default is from now on,
 and a replay goes as far back as the log is kept), `marks=true` (after each batch of rows, a line
 `{"_after": N}`: resume with `?after=N`) and `changes=true` (the change feed: UPDATE's and DELETE's
-rows too, each with `_change_type`, `_row_id`, `_version`, `_created_at` and `_updated_at`).
+rows too, each with `_change_type`, `_row_id`, `_version`, `_created_at` and `_updated_at`). A user
+whose grants don't cover the whole table's rows gets `403`.
 
 `/live` answers a query now, and again each time a commit changes a table it reads, as lines of
 `{"at": COMMIT, "rows": […]}`. `GET /live?sql=…` takes the query in the URL, and `POST /live`
@@ -234,9 +289,14 @@ curl -s --max-time 2 http://localhost:8080/live -H 'content-type: application/js
 {"user":"bo","amount":7}
 {"user":"cy","amount":3}
 {"user":"di","amount":4}
-{"_after":6}
-{"at":7,"rows":[{"n":4}]}
+{"_after":7}
+{"at":8,"rows":[{"n":4}]}
+{"id":"one","at":8,"rows":[{"one":1}]}
+{"id":"n","at":8,"rows":[{"n":4}]}
 ```
+
+On a shared connection, each line names its query by `id`, and lines of different queries can come
+in any order.
 
 ## Files
 
@@ -258,6 +318,8 @@ console's Workspace shows them and edits them in place.
   the `PUT` is refused with `412`, and theirs is kept: read it again, or save under another name.
 - **The answer to `PUT`** is `{"path": "files/{path}", "bytes": N, "version": "…"}`, the version
   the next `If-Match` needs. A `GET` of a path with no file is `404`.
+- **The answer to `DELETE`** is `{"removed": "files/{path}"}`. `POST ?restore=` answers
+  `{"path", "version", "restored"}`, with the version it made the file again.
 - **Every node reads a replaced file's new bytes** at its next statement: nothing caches `files/`
   (not the SSD tier either). The rest of the lake is never overwritten, so it is cached.
 - **Every save is kept as a version**, with who made it and when, in `files/.versions/` (which
@@ -265,7 +327,7 @@ console's Workspace shows them and edits them in place.
   `PONDRA_FILE_VERSIONS_DAYS`), files up to 64 MB. A deleted file keeps its versions, so it can be
   restored. The console's **Versions…** shows what changed and restores one.
 
-Read them from SQL with `files()` and `file_read()`, see [functions](/pondra/reference/functions/#files).
+Read them from SQL with `files()` and `file_read()`, see [functions](/pondra/sql/functions/#files).
 
 ```bash
 curl -s -X PUT http://localhost:8080/files/notes/a.txt --data-binary 'hello'
@@ -288,6 +350,10 @@ files/notes/a.txt: the file changed since it was opened: open it again, or save 
 hello
 ```
 
+A `PUT` with no `If-Match` to a path that exists answers `409`, and a `GET` of its `?version=`
+that isn't one of the file's answers `404`. Both are plain text. A `304` isn't sent for files: a
+`GET` always answers the bytes.
+
 ## Functions, routines and secrets
 
 | Method and path | Role | Meaning |
@@ -299,26 +365,49 @@ hello
 | `GET /secrets/{name}` | none | a secret's values: only for the token a running Python procedure is lent |
 
 The body of `POST /functions/{name}` is `{"flight": "http://host:port", "args": ["Utf8"], "returns":
-"Utf8", "rows": N}`, where `rows` is optional. See
-[functions](/pondra/reference/functions/#functions-you-bring). The answer is `{"function": name}`,
+"Utf8", "rows": N}`, where `rows` is optional. A body that doesn't read answers `500` with the shape it
+expects. See [functions](/pondra/sql/functions/#functions-you-bring). The answer is `{"function": name}`,
 and `{"dropped": name}` for `DELETE`.
 
 `GET /secrets/{name}` is what `pondra.secret(name)` calls inside a Python procedure. Any other
-token is refused.
+token is refused, and so is a request with no token.
 
 ## Projects
 
 A project's files go to the node that holds the database, with the environment's values and the
-git commit: the command line sends them, and [apply a project](/pondra/guides/environments/#apply-a-project)
-says what each request does.
+git commit: the command line sends them, and [apply a project](/pondra/guides/projects/#apply-it)
+says what each request does. Every project route takes the same body:
+
+| Field | Meaning |
+|---|---|
+| `files` (required) | the project's files: a map of path to text, `pondra.toml` and `objects/`, `migrations/`, `seeds/`, `tests/` |
+| `env` | the environment whose `[env.…]` values and attached catalogs apply |
+| `commit` | the git commit, when the project is in git |
+| `secrets` | `$name` values from the applying machine: bound for the run, never kept |
+| `test` | `apply` only: run the tests after it |
+| `prune` | drop what the project no longer declares |
+| `plan` | `apply` only: the plan's `id` it showed; refused if the plan has changed since |
+| `names` | `capture` only: the objects to write (none: all of them) |
 
 | Method and path | Role | Meaning |
 |---|---|---|
-| `POST /plan` | read | what an apply would change, and what it refuses |
-| `POST /apply` | admin, or APPLY on the database | the plan's steps, each applied, then the tests |
-| `POST /test` | read | the project's tests alone |
-| `POST /status` | read | what differs from the database: to apply, changed outside an apply, untracked (`pondra status`) |
-| `POST /capture` | admin, or APPLY on the database | the files that write the chosen changed and untracked objects into the project, with a migration for a rename; the answer holds each file's new text (`null`: removed), and the command line writes them (`pondra capture`) |
+| `POST /plan` | read | what an apply would change, and what it refuses: `{"plan": {"id", "after", "steps", "refused", "tests"}, "project", "ok"}` |
+| `POST /apply` | admin, or APPLY on the database | apply the plan, then the tests: `{"apply", "status", "steps", "tests", "ok"}` |
+| `POST /test` | read | the project's tests alone: `{"tests": [...], "ok"}` |
+| `POST /status` | read | what differs from the database: to apply, changed outside an apply, untracked (`pondra status`): `{"status": {"after", "lines", "refused"}, "project", "ok"}` |
+| `POST /capture` | admin, or APPLY on the database | the files that write the chosen changed and untracked objects into the project, with a migration for a rename: `{"files", "captured", "migrations", "refused", "ok"}`, where each file's value is its new text (`null`: removed). The command line writes them (`pondra capture`) |
+
+```bash
+curl -s -X POST http://localhost:8080/plan -H 'content-type: application/json' \
+  -d '{"files": {"pondra.toml": "[project]\nname = \"demo\"\n"}}'
+```
+
+```text
+{"plan":{"id":"d20f079062a3c20e","after":0,"steps":[],"refused":[],"tests":0,"new":true},"project":"demo","ok":true}
+```
+
+A project route with no `files` answers `422`. A project whose `pondra.toml` is missing or names no
+project answers `500`, with the reason.
 
 ## The server
 
@@ -326,34 +415,33 @@ says what each request does.
 |---|---|---|
 | `GET /stats` | none | health and position, as JSON |
 | `GET /healthz` | none | `ok` (200) while the process runs: a liveness check |
-| `GET /ready` | none | `ready` (200) when the node serves; 503 while it [stops](/pondra/guides/upgrades/#stop-a-node-without-dropping-work), or just after it started and is still catching up with its leader: a readiness check |
-| `POST /login` | none | `{"user", "password"}`: a session for the user, `{"token": "ps_…", "until": ms}`, to send as `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`) |
-| `GET /whoami` | none | who the request signs in as: `{"user", "role", "superuser", "open"}` |
-| `GET /objects` | read | each table and view of this lake and the lakes attached to it: `catalog`, `schema`, `name`, `kind` (`table`, `view`, `materialized view`, or `files` for [a view of files](/pondra/reference/sql/)), and for a table its `rows` and `bytes` in files, `files`, `key`, `partition`, `cluster`, `publish`, `not_null`, `defaults`; for a view its `sql`. Also `files`: where the lake's own files are, for `read_csv('…')`. What the console's catalog shows |
-| `GET /kinds` | read | every kind of object, part and pattern, one row each, as [`pondra.kinds`](/pondra/reference/system-columns/#every-object) lists them: `[{"kind", "is", "family", "inside", "statements", "privileges", "on_clone", "in_project", "undrop", "secret", "lists", "about", "also"}]`; a column that doesn't apply is `null`. The [glossary](/pondra/reference/glossary/) says what each one is |
+| `GET /ready` | none | `ready` (200) when the node serves; `503` with the reason while it stops (`stopping`), while it catches up with its leader after a start (`catching up with the leader`), or when it can't reach its bucket (`can't reach the bucket: another node leads`): a readiness check |
+| `POST /login` | none | `{"user", "password"}`: a session for the user, answered `{"token": "ps_…", "until": ms, "user": name}`, to send as `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`); `401` for a wrong password |
+| `GET /whoami` | none | who the request signs in as: `{"user", "role", "superuser", "open"}`; `role` is `admin`, `write`, `read` or `none` |
+| `GET /objects` | read | the lake's objects, and the lakes attached to it, as `{"objects": [...], "files": ...}`. Each object has `catalog`, `schema`, `name` and `kind` (`table`, `view`, `materialized view`, or `files` for [a view of files](/pondra/sql/statements/)); a table adds its `rows`, `bytes`, `files`, `key`, `partition`, `cluster`, `publish`, `not_null` and `defaults`, a view its `sql`. `files` says where the lake's own files are, for `read_csv('…')`. What the console's catalog shows |
+| `GET /kinds` | read | every kind of object, part and pattern, one row each, as [`pondra.kinds`](/pondra/sql/system-tables/#every-object) lists them: `[{"kind", "is", "family", "inside", "statements", "privileges", "on_clone", "in_project", "undrop", "secret", "lists", "about", "also"}]`; a column that doesn't apply is `null`. The [glossary](/pondra/sql/glossary/) says what each one is |
+| `GET /export` | read | the project files that describe this database: a map of path to text, `pondra.toml` and an `objects/` file for each object. `?database=NAME` exports an attached database as this node sees it (`pondra diff` reads it that way) |
 | `GET /metrics` | read | Prometheus metrics, as text |
 | `POST /tier` | admin | write the log into Parquet now: `{"rows_tiered": N}` |
-| `DELETE /sessions/{id}` | read | end a session: its temporary tables and views go, and so does its Python: `{"ended": true}` |
+| `DELETE /sessions/{id}` | read | end a session: its temporary tables and views go, and so does its Python: `{"ended": true}` (`false` if it had none) |
 | `GET /sessions/{id}/python` | admin | the session's Python (a console page's cells): `{"running", "busy", "variables": [{"name", "type", "size", "look"}], "python": {"python", "version"}}` |
 | `POST /sessions/{id}/python` | admin | interrupt its running cell: it ends with `KeyboardInterrupt` and the variables stay (`{"done": "interrupted"}`); on Windows Python restarts instead (`"restarted"`) |
-| `DELETE /sessions/{id}/python` | admin | restart it: its variables go, its temporary tables stay |
+| `DELETE /sessions/{id}/python` | admin | restart it: its variables go, its temporary tables stay (`{"restarted": true}`) |
 | `GET /python` | admin | the Python workers run with: `{"python", "version"}`; with `?all=1`, also `pythons`: each Python this machine has, tried (`path`, `version`, `pondra`, `pyarrow`, `ok`, `error`) |
-| `PUT /python` | admin, from this machine | `{"path": "…"}`: run workers with that Python from now on (it must have `pondra` and `pyarrow`), and next time too. Workers running now finish with the Python they have |
+| `PUT /python` | admin, from this machine | `{"path": "…"}`: run workers with that Python from now on (it must have `pondra` and `pyarrow`), and next time too. Workers running now finish with the Python they have. Refused from another machine |
 | `POST /python/format` | admin | `{"code": "…"}`: Python code formatted by the node's Python, as ruff (or black, if it has no ruff) formats it: `{"code": "…"}`. The code is only read, never run |
 | `GET /` | none | [the console](/pondra/start/console/): a web page, with no data in it until you use it |
-| `GET /console/console.js`, `/console/console.css`, `/console/ext/{n}.js` | none | the console's scripts and style (the modules it loads, some the first time they are needed), and the extensions the node was given (`PONDRA_CONSOLE_EXTENSIONS`); each with an `ETag`, `304` when unchanged |
+| `GET /console/{file}` | none | the console's scripts, style sheet and modules by name (`console.js`, `console.css`, and the modules it loads, some the first time they are needed), and the extensions the node was given (`ext/{n}.js`, from `PONDRA_CONSOLE_EXTENSIONS`). Each has an `ETag`, and `304` when `If-None-Match` names it. `404` for a name it doesn't have |
 | `GET /console/settings` | none | the console's settings kept on this machine (theme, colours, layout), as JSON: `{}` if none |
-| `PUT /console/settings` | none, from this machine | keep them: a JSON object, at most 64 KB. From a page on another machine it is refused, and that page keeps its own |
+| `PUT /console/settings` | none, from this machine | keep them: a JSON object, at most 64 KB; `204`. From another machine `403`, and that page keeps its own. A body that isn't one JSON object is `400` |
 
 `GET /stats` needs no token, so a load balancer can poll it. It answers `lake` (its name), `role` (`leader`,
 `follower` or `reader`), `leader` (its address), `term`, `nodes`, `hwm` (the newest commit),
-`shard_runs`, `python_workers`, `live_queries`, `version` (the node's release) and `format` (the
-lake's, see [upgrades](/pondra/guides/upgrades/#which-releases-can-open-a-lake)). On the leader it
-also has `untiered_rows`, `commits`, `commit_ms_p50`, `commit_ms_p95` and `releases` (each live
-node's release, by address).
-
-A node that is stopping answers every other path with 503 and `Retry-After: 1`: send the request to
-another node.
+`shard_runs`, `python_workers`, `live_queries`, `version` (the node's release), `format` (the
+lake's, see [upgrades](/pondra/guides/upgrades/#which-releases-can-open-a-lake)) and `keys` (how the
+lake's own keys are kept: `sealed` by the master key, `clear`, or `none` until the lake makes them). On the leader it also has
+`untiered_rows`, `commits`, `commit_ms_p50`, `commit_ms_p95` and `releases` (each live node's
+release, by address).
 
 ```bash
 curl -s http://localhost:8080/stats
@@ -362,7 +450,7 @@ curl -s -X POST http://localhost:8080/tier
 ```
 
 ```text
-{"lake":"lake","role":"leader","leader":"127.0.0.1:8080","term":1,"nodes":["127.0.0.1:8080"],"hwm":7,"shard_runs":1,"python_workers":0,"live_queries":0,"version":"0.30.0","format":1,"untiered_rows":0,"commits":9,"commit_ms_p50":1.69,"commit_ms_p95":2.98,"releases":{"127.0.0.1:8080":"0.30.0"}}
+{"lake":"lake","role":"leader","leader":"127.0.0.1:8080","term":1,"nodes":["127.0.0.1:8080"],"hwm":8,"shard_runs":1,"python_workers":0,"live_queries":0,"version":"0.33.0","format":1,"keys":"clear","releases":{"127.0.0.1:8080":"0.33.0"},"untiered_rows":0,"commits":11,"commit_ms_p50":1.28899,"commit_ms_p95":2.365491}
 # HELP pondra_role 1 for this node's role
 # TYPE pondra_role gauge
 pondra_role{role="leader"} 1
@@ -375,39 +463,62 @@ pondra_role{role="leader"} 1
 
 | Method and path | Role | Meaning |
 |---|---|---|
-| `/db/{name}/…` | as on a node | database `name`'s whole API: `POST /db/sales/sql`, `GET /db/sales/stats`, … |
+| `/db/{name}`, `/db/{name}/{*rest}` | as on a node | database `name`'s whole API, the node's path after its name: `POST /db/sales/sql`, `GET /db/sales/stats`, … |
 | any other path | as on a node | the default database's (`--default`) |
 | `GET /databases` | read | the databases: `[{"name", "running", "default"}]` |
-| `POST /databases` | admin | make one: `{"name": "hr"}`, as `CREATE DATABASE hr` |
-| `DELETE /databases/{name}` | admin | drop one, folder and all, as `DROP DATABASE`; `?if_exists=true` is quiet about one that isn't there |
-| `GET /` | none | the console, listing every database |
+| `POST /databases` | admin | make one: `{"name": "hr"}`, as `CREATE DATABASE hr`; `400` with the reason if it can't |
+| `DELETE /databases/{name}` | admin | drop one, folder and all, as `DROP DATABASE`; `?if_exists=true` is quiet about one that isn't there. `400` with the reason if it can't |
+| `GET /console/…` | none | the console's files and settings, as on a node. `GET /` lists every database |
+
+A database's node starts when its first request comes. If it can't start, the request answers `404`
+with the reason, and if a running node stops answering, `502`.
+
+```bash norun
+curl -s http://localhost:8080/db/sales/stats
+curl -s -X POST http://localhost:8080/db/sales/sql -d "SELECT count(*) FROM orders"
+```
+
+## Delta Sharing
+
+A node shares tables with other companies over the Delta Sharing protocol, at `/delta-sharing/…`.
+A recipient signs in with the token its profile gives it, as `Authorization: Bearer`, and reads only
+what the share names. [Sharing](/pondra/guides/sharing/) has the whole of it: making shares and
+recipients, the profile and the client.
+
+| Method and path | Meaning |
+|---|---|
+| `GET /delta-sharing/shares` | the shares this recipient may read |
+| `GET /delta-sharing/shares/{share}` | one share |
+| `GET /delta-sharing/shares/{share}/schemas` | its schemas |
+| `GET /delta-sharing/shares/{share}/schemas/{schema}/tables` | the tables of a schema in the share |
+| `GET /delta-sharing/shares/{share}/all-tables` | every table of the share |
+| `GET`, `HEAD …/tables/{table}/version` | the table's current version; `?startingTimestamp=` for the version at that time |
+| `GET …/tables/{table}/metadata` | the table's protocol and metadata |
+| `POST …/tables/{table}/query` | the table's files for a query: a body with `version` or `timestamp` reads that version |
+| `GET …/tables/{table}/changes` | refused for now: `400 FEATURE_NOT_SUPPORTED` |
+| `GET`, `HEAD /delta-sharing/files/{link}` | one file, through a link that ends. A `Range` request answers `206` |
+
+A missing or unknown token is `401` with `errorCode` `UNAUTHENTICATED`. A link that isn't valid, or
+has ended, is `403` with `PERMISSION_DENIED`. More files a minute than `PONDRA_SHARE_FILES_PER_MINUTE`
+(10000) is `429`. Every request at this door is a row of `pondra.audit`, refusals too.
 
 ## Other doors on the same port
 
 | Path | Role | What it is |
 |---|---|---|
 | `POST /mcp` | read (writes need more) | the MCP server: see [MCP](/pondra/reference/mcp/) |
-| `/v1/...` | read; write for `POST` | the Iceberg REST catalog: see [Iceberg REST](/pondra/reference/iceberg-rest/) |
+| `/v1/…` | read; write for `POST` and `DELETE` | the Iceberg REST catalog: see [Iceberg REST](/pondra/reference/iceberg-rest/) |
+| `/delta-sharing/…` | a recipient's token | Delta Sharing: see the table above |
+
+The Postgres port, Arrow Flight and Kafka listen on their own ports: [Postgres](/pondra/reference/postgres/),
+[Flight](/pondra/reference/flight/) and [Kafka](/pondra/reference/kafka-protocol/).
 
 ## Between nodes
 
-Nodes in a cluster call each other on these paths. You don't call them, but they are why a
-firewall between nodes must let HTTP through. Each call carries the caller's release and the newest lake format it
-knows (`x-pondra-version`, `x-pondra-format`), so the leader knows when every node can read a newer
-format. They need an admin token, except `commit` and
-`files`, which need a write token, and `leader`, which needs none.
-
-| Path | Meaning |
-|---|---|
-| `POST /cluster/commit` | a follower's flush, to be sequenced by the leader |
-| `POST /cluster/files` | record the files an `INSERT` wrote, on the leader |
-| `POST /cluster/ddl`, `/cluster/change`, `/cluster/iceberg` | forward a schema change, an `UPDATE`, `DELETE` or `MERGE`, or another engine's Iceberg append to the leader |
-| `POST /cluster/stage`, `/cluster/copy`, `/cluster/job` | this node's share of a spread query, `COPY … TO`, or the leader's data work |
-| `GET /cluster/shuffle` | a shuffle bucket this node keeps for another node |
-| `GET /cluster/log`, `/cluster/replica`, `POST /cluster/ack` | the commit stream, and replicated commits |
-| `POST /cluster/beat` | a heartbeat |
-| `GET /cluster/leader`, `/cluster/kafka` | who leads, and where the Kafka port is |
-| `GET /cluster/probe` | measure the link between two nodes |
+Nodes in a cluster call each other on `/cluster/…` paths, over HTTPS when the node has a certificate.
+You don't call them, and a firewall between nodes must let HTTP through. Each call carries the
+caller's release and lake format (`x-pondra-version` and `x-pondra-format`), so the leader knows when
+every node can read a newer format.
 
 <Aside type="caution">
 A request body is limited to 1 GiB. The body of an append or an insert must fit in memory on

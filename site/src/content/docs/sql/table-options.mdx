@@ -1,8 +1,6 @@
 ---
 title: Table options
 description: Every option of CREATE TABLE, CREATE MATERIALIZED VIEW and CREATE FUNCTION, with its values, its default and an example.
-sidebar:
-  order: 3
 ---
 
 A table's layout is written as clauses after its columns. Everything else goes in a
@@ -107,7 +105,7 @@ What Pondra refuses:
 
 | You write | Error |
 |---|---|
-| an option name the table doesn't take, such as `cluser_by` | `CREATE TABLE … WITH (cluser_by = …): tables take publish, cluster_by, partition_by, ttl, order_by, merge` |
+| an option name the table doesn't take, such as `cluser_by` | `CREATE TABLE … WITH (cluser_by = …): tables take publish, cluster_by, partition_by, ttl, order_by, merge, retention` |
 | `MERGE` without a key | `MERGE needs a key: a merge table combines the rows of each key` |
 | a merge table with a non-key column that has no `MERGE` | `a merge table combines every column but its key: s needs a merge function too` |
 | `b DOUBLE MERGE avg` | `MERGE: sum, count, min or max` |
@@ -116,11 +114,11 @@ What Pondra refuses:
 | `CLUSTER BY` a column the table lacks | `CLUSTER BY: columns of the table` |
 | `PARTITION BY week(ts)` | `PARTITION BY: a column, or year/month/day/hour(a timestamp column)` |
 | `TTL` on a table with no key, or a column that isn't a timestamp or date | `TTL: a timestamp or date column of a keyed table` |
-| `TTL ts + INTERVAL '1 month'` | `an interval in seconds, minutes, hours, days or weeks` |
+| `TTL ts + INTERVAL '1 month'` | `an interval in seconds, minutes, hours, days or weeks, not "month" ("1 month")` |
 | `SEQUENCE BY` a key column | `SEQUENCE BY: a column of the table, not its key` |
-| `PARTITION BY` and `partition_by` both | `partition_by is given twice, as a clause and in WITH (…)` |
-| `ALTER TABLE t SET (partition_by = …)` | `PARTITION BY can't change` |
-| `retention = 'soon'` | `retention: a time such as '7 days', '12 hours' or '0 seconds'` |
+| `PARTITION BY` and `partition_by` both | `CREATE TABLE: partition_by is given twice, as a clause and in WITH (…)` |
+| `ALTER TABLE t SET (partition_by = …)` | `PARTITION BY can't change: each of t's files holds one partition` |
+| `retention = 'soon'` | `retention: a time such as '7 days', '12 hours' or '0 seconds', not "soon"` |
 
 ## Materialized views
 
@@ -134,7 +132,7 @@ two streams the older way. An option the view doesn't know is an error that list
 | `lateness` | a time, such as `'10 seconds'` | `'0 seconds'` | `EMIT FINAL`: how far out of order a row may arrive and still count |
 | `idle` | a time | none | `EMIT FINAL`: once no newer row has come for this long, the watermark moves on with the clock |
 | `emit` | `'final'` | | the same as `EMIT FINAL` at the statement's end, for clients that build the statement |
-| `refresh` | `'incremental'`, `'by key'` or `'full'` | chosen | how the view is kept current: from each write's rows, in its commit; by working out again the groups a commit touched, right after it ([kept by key](/pondra/guides/streaming/#medians-and-distinct-counts-kept-by-key)); or by running its query whole again ([run whole](/pondra/guides/streaming/#anything-else-run-whole)). Unset, the first of these that can keep it |
+| `refresh` | `'incremental'`, `'by key'` or `'full'` | chosen | how the view is kept current: from each write's rows, in its commit; by working out again the groups a commit touched, right after it ([kept by key](/pondra/guides/views/#medians-and-distinct-counts-kept-by-key)); or by running its query whole again ([run whole](/pondra/guides/views/#anything-else-run-whole)). Unset, the first of these that can keep it |
 | `lag` | a time, such as `'1 minute'` | none | a view kept by key or run whole runs at most once this long; one that calls `now()` runs this often (a minute unless given). Refused on an incremental view |
 | `window` | column name | | the view's window-start column, made by `date_bin(…)` in `GROUP BY`; each window goes to `{view}_final` once, when it is final |
 | `size_secs` | seconds | 60 | how long a window is |
@@ -145,6 +143,7 @@ two streams the older way. An option the view doesn't know is an error that list
 | `join` | `'streams'` | | pair rows of two tables as they arrive on either side |
 | `time` | `'col'` or `'col1, col2'` | | the event-time column both tables have, or one for each table |
 | `within_secs` | seconds | none | pair a row only with rows this close to it in time; needs `time` |
+| `expect` | a JSON list of `{"name", "check", "on"}` | none | a condition each of the view's rows should meet; `on` is `"keep"`, `"drop"` or `"fail"` ([expectations](/pondra/guides/flows/#expectations)) |
 | `start` | `'earliest'` or `'latest'` | `'earliest'` | for a view over a Kafka topic: where to start reading |
 | `history` | `'col'` or `'col1, col2'` | | keep every version of each key, with `__start_at` and `__end_at` when read ([history per key](/pondra/guides/flows/#history-per-key-scd-type-2)) |
 | `sequence_by` | column name | | a history view's order of versions: a time, or a number that grows |
@@ -171,8 +170,24 @@ INSERT INTO readings VALUES
   (TIMESTAMP '2026-01-01 10:01:30', 'a', 30.0), (TIMESTAMP '2026-01-01 10:03:00', 'a', 25.0);
 ```
 
-```bash
-sleep 2   # the leader looks for groups that are over twice a second
+A group comes out a moment after the watermark passes it. `wait_for` waits for a query's rows, which
+the examples below use too:
+
+```python
+import time
+import pondra
+
+db = pondra.connect("http://localhost:8080")
+
+def wait_for(sql, n):
+    """Wait up to 30 s for a query to return n rows."""
+    for _ in range(150):
+        if len(db.sql(sql).rows()) >= n:
+            return
+        time.sleep(0.2)
+    raise TimeoutError(f"{sql}: fewer than {n} rows after 30 s")
+
+wait_for("SELECT minute FROM per_minute", 2)
 ```
 
 ```sql
@@ -212,8 +227,8 @@ The view has a row for every window, still open or not. `per_minute_open_final` 
 final, a moment after the watermark passes them: here the first two, because the 10:03 row moved
 the watermark past them.
 
-```bash
-sleep 5   # windows close a moment after the watermark passes them
+```python
+wait_for("SELECT w FROM per_minute_open_final", 2)
 ```
 
 ```sql
@@ -228,7 +243,7 @@ w                    sensor  total  n
 
 A window made with these options keeps `sum`, `count`, `min` and `max`. For `avg`, `stddev` or
 `HAVING`, write it as `GROUP BY` a time bucket `… EMIT FINAL` (see
-[Streaming](/pondra/guides/streaming/#windows-each-group-once-its-over)).
+[Windows](/pondra/guides/windows/#windows-each-group-once-its-over)).
 
 For sliding windows, add `slide_secs`, and make the view's `date_bin` that long. This makes a
 five-minute window every minute, and each row is added once, not once per window:
@@ -255,8 +270,10 @@ INSERT INTO pageviews VALUES
   ('a', TIMESTAMP '2026-01-01 10:05:00', 1), ('b', TIMESTAMP '2026-01-01 10:10:00', 1);
 ```
 
-```bash
-sleep 5   # sessions close a moment after the watermark passes them
+Sessions close a moment after the watermark passes them:
+
+```python
+wait_for("SELECT visitor FROM visitor_sessions", 2)
 ```
 
 ```sql
@@ -288,8 +305,10 @@ INSERT INTO orders VALUES (1, 9.5, TIMESTAMP '2026-01-01 10:00:00');
 INSERT INTO payments VALUES (1, 9.5, TIMESTAMP '2026-01-01 10:02:00');
 ```
 
-```bash
-sleep 5   # the leader pairs rows just after each commit
+The pair appears a moment after the second row commits:
+
+```python
+wait_for("SELECT id FROM paid", 1)
 ```
 
 ```sql
@@ -317,8 +336,10 @@ CREATE MATERIALIZED VIEW menu_in WITH (start = 'earliest') AS
   SELECT json_get_int(value, 'id') AS id, json_get_str(value, 'name') AS name FROM k.menu;
 ```
 
-```bash
-sleep 10   # the feed reads the topic in the background
+The feed reads the topic in the background:
+
+```python
+wait_for("SELECT id FROM menu_in", 2)
 ```
 
 ```sql
@@ -335,7 +356,7 @@ id  name
 
 `CREATE FUNCTION f(…) RETURNS type LANGUAGE python WITH (…) AS $$ … $$`. Procedures take
 `packages`, `entry` and `timeout`. The Postgres words `STRICT`, `IMMUTABLE`, `STABLE` and
-`VOLATILE` work too, in place of `strict` and `volatility`. A SQL function takes no options.
+`VOLATILE` work too, in place of `strict` and `volatility`.
 
 | Option | Value | Default | Meaning |
 |---|---|---|---|
@@ -347,8 +368,9 @@ id  name
 | `timeout` | seconds, at most a week | 60 for a function; none for a procedure | how long one call (a function: one batch) may take before its worker is stopped |
 | `cache` | `'10 minutes'`, `'30 seconds'` | none | reuse an answer for the same arguments this long, so an API or a model isn't called again |
 
-`vectorized`, `cache` and `strict` are for functions only. A Python function says what it returns,
-in `RETURNS type` or `RETURNS TABLE (…)`.
+`vectorized` and `cache` are for Python functions only: a SQL function is part of its query, and a
+procedure is called for what it does. `packages` and `entry` are for Python routines. A Python
+function says what it returns, in `RETURNS type` or `RETURNS TABLE (…)`.
 
 ```sql
 CREATE FUNCTION double_all(x BIGINT) RETURNS BIGINT LANGUAGE python WITH (vectorized = true) AS $$
@@ -376,9 +398,12 @@ SELECT double_all(21) AS v, shout('tea') AS s, shout(NULL) AS n, quick(0) AS q, 
 ```
 
 ```text
-v   s     n     q  same
-42  TEA!  NULL  0  true
+v   s     q  same
+42  TEA!  0  true
 ```
+
+`shout(NULL)` is `NULL` without calling the function, because `shout` is `strict`. An answer
+leaves out a `NULL`, so the `n` column is not in the answer.
 
 `quick(3)` would stop at one second with `it took longer than 1 s, its limit (the worker was
 stopped)`.

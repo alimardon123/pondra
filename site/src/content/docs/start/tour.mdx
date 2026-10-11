@@ -1,8 +1,6 @@
 ---
 title: A ten-minute tour
 description: A table, a keyed table, a view that stays current, a frame, a Python function, a live query, a Parquet file in and an export out.
-sidebar:
-  order: 4
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -43,7 +41,8 @@ print(db.sql("SELECT item, sum(qty) AS items FROM orders GROUP BY item ORDER BY 
 [{'item': 'cake', 'items': 1}, {'item': 'coffee', 'items': 1}, {'item': 'tea', 'items': 3}]
 ```
 
-A write is visible to every query as soon as it is acknowledged.
+A SQL write is in the answer as soon as its statement returns, on the node that took it, and other
+nodes see it a few milliseconds later ([freshness and guarantees](/pondra/concepts/freshness-and-guarantees/)).
 
 ## 2. A keyed table
 
@@ -237,4 +236,4 @@ and reads them all back. See [Files and other lakes](/pondra/guides/files-and-ot
 - [Tables](/pondra/guides/tables/): every option of `CREATE TABLE`, schemas and databases, `ALTER TABLE`.
 - [Load data](/pondra/guides/load-data/) and [Query](/pondra/guides/query/).
 - [Change rows](/pondra/guides/change-rows/): `UPDATE`, `DELETE` and `MERGE`.
-- [Streaming](/pondra/guides/streaming/): windows, sessions and stream joins over views like step 3.
+- [Streaming](/pondra/guides/views/): windows, sessions and stream joins over views like step 3.

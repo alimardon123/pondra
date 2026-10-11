@@ -1,11 +1,10 @@
 ---
 title: Kafka
 description: Produce to and consume from tables with Kafka clients, ingest Debezium change events, and read or write other Kafka clusters from SQL.
-sidebar:
-  order: 11
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 Every node can speak the Kafka protocol. **A topic is a table**: producers write rows, consumers
 read the table's log. Use it to point existing Kafka producers, Debezium and consumers at Pondra
@@ -40,9 +39,7 @@ for i in range(5):
 producer.flush(10)
 ```
 
-```sql
-SELECT user, amount, _key FROM events ORDER BY amount;
-```
+<Ways sql={`SELECT user, amount, _key FROM events ORDER BY amount`} />
 
 ```text
 user  amount  _key
@@ -53,8 +50,9 @@ u1    3       u1
 u0    4       u0
 ```
 
-The rows are in the table when the producer's acknowledgement comes back, and every other client
-sees them: SQL, views, Delta and Iceberg readers.
+The rows are in the table when the producer's acknowledgement comes back. SQL and views see them
+there, and on the other nodes a few milliseconds later. A table that publishes Delta or Iceberg has
+them there after the next tiering round.
 
 An **idempotent producer** (`enable.idempotence`) is exactly-once: a batch that is retried is
 recognised and applied once. Other producers are at-least-once, as in Kafka. Records may be
@@ -90,9 +88,7 @@ producer.produce("users", key=json.dumps({"id": 2}), value=None)     # Debezium'
 producer.flush(10)
 ```
 
-```sql
-SELECT * FROM users ORDER BY id;
-```
+<Ways sql={`SELECT * FROM users ORDER BY id`} />
 
 ```text
 id  name  score
@@ -114,9 +110,7 @@ producer.produce("lines", key=b"k2", value=b'{"event": "click", "n": 3}')
 producer.flush(10)
 ```
 
-```sql
-SELECT _key, _value->>'event' AS event, json_get_int(_value, 'n') AS n FROM lines ORDER BY _key;
-```
+<Ways sql={`SELECT _key, _value->>'event' AS event, json_get_int(_value, 'n') AS n FROM lines ORDER BY _key`} />
 
 ```text
 _key  event  n
@@ -195,7 +189,9 @@ Producer({"bootstrap.servers": "node:9092", "security.protocol": "SASL_PLAINTEXT
           "sasl.mechanisms": "PLAIN", "sasl.username": "writer", "sasl.password": "<write token>"})
 ```
 
-The Kafka port speaks plain text, so keep it on a private network or behind a TLS proxy.
+With a certificate (`--tls-cert` and `--tls-key`), the Kafka port takes TLS too: clients use
+`security.protocol` `SSL` or `SASL_SSL` ([TLS](/pondra/guides/security/#tls)). Without one, the port
+speaks plain text, so keep it on a private network.
 
 ## Other Kafka clusters
 
@@ -220,9 +216,9 @@ You can try all of this without another cluster: Pondra's own Kafka port is a Ka
 ```sql
 CREATE SECRET this_node (TYPE kafka, SECURITY_PROTOCOL 'PLAINTEXT', SCOPE 'kafka://localhost:9092');
 ATTACH 'kafka://localhost:9092' AS k (TYPE kafka);
-SELECT _partition, json_get_str(value, 'user') AS user, json_get_int(value, 'amount') AS amount
-FROM k.events ORDER BY amount LIMIT 3;
 ```
+
+<Ways sql={`SELECT _partition, json_get_str(value, 'user') AS user, json_get_int(value, 'amount') AS amount FROM k.events ORDER BY amount LIMIT 3`} />
 
 ```text
 _partition  user  amount
@@ -239,7 +235,14 @@ _partition  user  amount
 CREATE TABLE alerts (id BIGINT, msg VARCHAR, level VARCHAR);
 COPY (SELECT 1 AS id, 'disk full' AS msg, 'high' AS level UNION ALL SELECT 2, 'slow query', 'low')
   TO 'kafka://localhost:9092/alerts' (FORMAT json, KEY id);
-SELECT id, msg FROM alerts ORDER BY id;
+```
+
+<Ways sql={`SELECT id, msg FROM alerts ORDER BY id`} />
+
+```text
+id  msg
+1   disk full
+2   slow query
 ```
 
 ### Keep a table fed from a topic
@@ -254,16 +257,19 @@ CREATE MATERIALIZED VIEW orders_in AS
   FROM k.events;
 ```
 
-A feed reads the topic from its first record and then follows it. The first records take a few
-seconds to arrive after the view is made, and each new one about a second.
+A feed reads the topic from its first record and then follows it. Its first rows arrive a moment
+after the view is made. This waits until the five rows are there, then reads them:
 
-```bash
-sleep 10  # the feed's first round
+```python
+import time
+import pondra
+
+db = pondra.connect("http://localhost:8080")
+while db.sql("SELECT count(*) AS n FROM orders_in").rows()[0]["n"] < 5:
+    time.sleep(0.2)
 ```
 
-```sql
-SELECT user, amount FROM orders_in ORDER BY amount;
-```
+<Ways sql={`SELECT user, amount FROM orders_in ORDER BY amount`} />
 
 ```text
 user  amount

@@ -1,0 +1,8 @@
+---
+// The site's tabs, as tabs.ts found them: in the header on wide screens, atop the menu on narrow ones.
+const tabs: { label: string; href?: string; current: boolean }[] = (Astro.locals as any).tabs ?? [];
+---
+
+<nav class="site-tabs" aria-label="Sections">
+  {tabs.map((t) => <a href={t.href} aria-current={t.current ? 'page' : undefined}>{t.label}</a>)}
+</nav>

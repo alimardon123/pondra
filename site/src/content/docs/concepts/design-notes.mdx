@@ -1,8 +1,6 @@
 ---
 title: Design notes
 description: The architecture decision records behind Pondra, one line each, with links to the full text on GitHub.
-sidebar:
-  order: 7
 ---
 
 Each design note records one decision and the reasons for it. You don't need them to use Pondra: the
@@ -81,19 +79,51 @@ One vocabulary, and reading and writing everything else.
 | [ADR-026](https://github.com/alimardon123/pondra/blob/main/docs/adr-026-read-and-write-anything.md) | Read and write anything: files, Delta and Iceberg tables and Kafka clusters anywhere, and `CREATE SECRET` | Accepted, built (round 23) |
 | [ADR-027](https://github.com/alimardon123/pondra/blob/main/docs/adr-027-sql-and-python-as-one.md) | `CREATE FUNCTION` in Postgres's forms, procedures that do anything Python can, warm workers, schedules and a run log | Accepted, built (round 24) |
 | [ADR-028](https://github.com/alimardon123/pondra/blob/main/docs/adr-028-one-vocabulary-and-open-writes.md) | `read_*` and `write_*` everywhere, other engines appending through the Iceberg REST catalog, live queries, temporary tables | Accepted, built (round 25) |
-| [ADR-033](https://github.com/alimardon123/pondra/blob/main/docs/adr-033-a-workspace-files-runs-and-parameters.md) | A workspace: SQL, Python and notebook files in the lake, run with parameters from every client, recorded and scheduled | Accepted, built (after round 26) |
-| [ADR-034](https://github.com/alimardon123/pondra/blob/main/docs/adr-034-a-console-of-tabs.md) | A console of tabs: notebooks, SQL, Python and data files edited in place, one grid, a performance budget | Accepted, built (round 26) |
 
-## Next
+## The console, the server and the workspace
 
-Decisions made and not yet built.
+Pondra's web console, serving lakes as databases, and files that run as jobs.
 
 | Note | What it decides | Status |
 |---|---|---|
-| [ADR-029](https://github.com/alimardon123/pondra/blob/main/docs/adr-029-anyones-compute-one-catalog.md) | Anyone's compute, one catalog: other engines write with their own compute and Pondra only commits their files | Accepted; phase 1 built (round 27), phase 2 next |
-| [ADR-030](https://github.com/alimardon123/pondra/blob/main/docs/adr-030-the-console-the-server-and-the-docs.md) | The web console, serving a folder of lakes as databases, Postgres as dbt and BI tools use it, and this documentation site | Accepted (round 26) |
+| [ADR-030](https://github.com/alimardon123/pondra/blob/main/docs/adr-030-the-console-the-server-and-the-docs.md) | The web console, serving a folder of lakes as databases, Postgres for dbt and BI tools, and this documentation site | Accepted, built (round 26) |
+| [ADR-032](https://github.com/alimardon123/pondra/blob/main/docs/adr-032-files-by-name-one-serve-a-console-to-build-on.md) | Files by name (`CREATE EXTERNAL TABLE`), one `serve` command for a lake or a folder of lakes, a page's Python cells sharing variables, and the console as a core to build on; compatibility from 1.0 | Built (round 26), except §9, a server's own catalog, which is proposed |
+| [ADR-033](https://github.com/alimardon123/pondra/blob/main/docs/adr-033-a-workspace-files-runs-and-parameters.md) | A workspace: SQL, Python and notebook files in the lake, run with parameters from every client, recorded and scheduled | Accepted, built (after round 26) |
+| [ADR-034](https://github.com/alimardon123/pondra/blob/main/docs/adr-034-a-console-of-tabs.md) | A console of tabs: notebooks, SQL, Python and data files edited in place, one grid, a performance budget | Accepted, built (round 26) |
+
+## Rounds 27 to 34
+
+Other engines' writes, the team's workflow, history, and the SQL people write.
+
+| Note | What it decides | Status |
+|---|---|---|
+| [ADR-029](https://github.com/alimardon123/pondra/blob/main/docs/adr-029-anyones-compute-one-catalog.md) | Anyone's compute, one catalog: other engines write their files with their own compute, and Pondra commits them | Accepted; phases 1 and 2 built (rounds 27 and 28); phase 3 when each part can be tested |
+| [ADR-035](https://github.com/alimardon123/pondra/blob/main/docs/adr-035-trust-anywhere-plugins-and-the-platform.md) | Users, keys and secrets in every form, plugins, file versions, and the platform around the lake | Partly built (round 29); the rest proposed |
+| [ADR-036](https://github.com/alimardon123/pondra/blob/main/docs/adr-036-pipelines-and-a-databases-behaviour.md) | Pipelines of views that follow each other in one commit, expectations, and a database's transactions and key lookups from every door | Built (round 30); identity columns and `UNIQUE` followed in round 33 |
+| [ADR-037](https://github.com/alimardon123/pondra/blob/main/docs/adr-037-variables-and-declared-parameters.md) | SQL variables, `DECLARE $day DATE = …`, bound as values and never pasted into the text | Accepted, built (round 31) |
+| [ADR-039](https://github.com/alimardon123/pondra/blob/main/docs/adr-039-run-it-for-years.md) | Run it for years: a lake's format version, every release's lake opening in the newest build, rolling upgrades, and drains | Accepted; its data half built (round 33) |
+| [ADR-041](https://github.com/alimardon123/pondra/blob/main/docs/adr-041-deployed-and-distributed.md) | Deployment: a container image, a Helm chart, a service for systemd, launchd and Windows, and the package managers | Accepted, built (round 33) |
+| [ADR-043](https://github.com/alimardon123/pondra/blob/main/docs/adr-043-a-tables-past.md) | A table's past: `UNDROP`, retention per table, `AT (…)` time travel, `RESTORE` and zero-copy `CLONE` | Accepted, built (round 33) |
+| [ADR-044](https://github.com/alimardon123/pondra/blob/main/docs/adr-044-parameters-declared-variables-own.md) | A file's parameters declared with `DECLARE PARAMETER`; its other variables stay its own | Accepted, built (round 31) |
+| [ADR-045](https://github.com/alimardon123/pondra/blob/main/docs/adr-045-scripts-that-decide-and-tasks-that-follow.md) | Scripts that decide (`IF`, `CASE`, loops, handlers) and tasks that follow each other | Proposed; its scripts and task graphs are built (round 33) |
+| [ADR-046](https://github.com/alimardon123/pondra/blob/main/docs/adr-046-sharing.md) | Sharing: a door that gives recipients the files a grant covers, over Delta Sharing | Accepted; phase 1 built (round 33) |
+| [ADR-047](https://github.com/alimardon123/pondra/blob/main/docs/adr-047-one-lake-holds-the-data.md) | Environments: one lake holds the data, and each environment is a branch of it (`CREATE DATABASE dev CLONE prod`) | Accepted; branches built (round 33) |
+| [ADR-048](https://github.com/alimardon123/pondra/blob/main/docs/adr-048-every-statement-remembered.md) | Every statement remembered in `pondra.history`, the slow ones with their plans | Accepted, built (round 33) |
+| [ADR-049](https://github.com/alimardon123/pondra/blob/main/docs/adr-049-one-registry-of-objects.md) | One registry of objects, with the same words and checks for every kind | Accepted, built (round 33) |
+| [ADR-050](https://github.com/alimardon123/pondra/blob/main/docs/adr-050-plans-that-learn.md) | Every plan shown with its estimates and its actual run, and a lake that learns from its runs | Proposed; part 1 built; the planner uses what runs learned only when switched on (off by default) |
+| [ADR-052](https://github.com/alimardon123/pondra/blob/main/docs/adr-052-windows-as-sql.md) | Windows written as SQL, with `EMIT FINAL` | Accepted, built (round 33) |
+| [ADR-055](https://github.com/alimardon123/pondra/blob/main/docs/adr-055-views-that-finish-their-answers.md) | Views that finish their answers as they are read: averages, deviations and `HAVING` on grouped views | Accepted, built (round 33) |
+| [ADR-056](https://github.com/alimardon123/pondra/blob/main/docs/adr-056-views-kept-by-key.md) | Views kept current by key: only the groups whose rows changed are recomputed | Proposed; built on its recommended answer (round 33) |
+| [ADR-057](https://github.com/alimardon123/pondra/blob/main/docs/adr-057-constraints.md) | `UNIQUE` kept on the leader, and other keys kept as facts | Accepted, built (round 33) |
+| [ADR-058](https://github.com/alimardon123/pondra/blob/main/docs/adr-058-an-environment-is-a-server.md) | An environment as its own server, with its own bucket and keys: sealed keys, read-only attachments, protected databases | Accepted, built (round 34) |
+| [ADR-059](https://github.com/alimardon123/pondra/blob/main/docs/adr-059-views-run-whole.md) | Views that run their whole query again, for the views that can't be kept by key | Proposed; built on its recommended answer (round 33) |
+| [ADR-060](https://github.com/alimardon123/pondra/blob/main/docs/adr-060-branch-apply-merge.md) | The team's workflow: branch, apply and merge, in a terminal and in the console | Accepted, built |
+
+## Proposed
+
+| Note | What it decides | Status |
+|---|---|---|
 | [ADR-031](https://github.com/alimardon123/pondra/blob/main/docs/adr-031-extensions.md) | Extensions: DuckDB-style `INSTALL` and `LOAD`, as WebAssembly components | Proposed |
-| [ADR-032](https://github.com/alimardon123/pondra/blob/main/docs/adr-032-files-by-name-one-serve-a-console-to-build-on.md) | Files by name (`CREATE EXTERNAL TABLE`), one serve command (`--lake`, `--lakes`, local or in a bucket), a page's Python cells sharing variables, the brand in one place, and the console as a core to build on; backward compatibility from 1.0; a server's catalog (proposed) | Accepted (round 26), §9 proposed |
 
 ## Other documents
 

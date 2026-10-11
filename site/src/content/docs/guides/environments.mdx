@@ -1,15 +1,14 @@
 ---
 title: Branches and environments
-description: Make a whole database a zero-copy branch of another, change it apart, compare it and bring tables up to date; apply a project of files to each environment.
-sidebar:
-  order: 9.7
+description: Make a whole database a zero-copy branch of another, change it apart, compare it and bring tables up to date; run branches on a team and on servers of their own.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 A branch is a whole database that starts as another one is right now, with every table, view,
 function and file, without copying any data. Make one per developer, per pull request or for a test
-run, change it as you like, compare it with where it came from, and drop it when you're done.
+run, change it as you like, compare it with where it came from, and drop it when you're done. What
+each database should hold, as files, is in [Projects](/pondra/guides/projects/).
 
 ## Make a branch
 
@@ -38,14 +37,12 @@ id | amount
 
 `dev` lists its base's files where they are, so making it takes about the same time for a table of a
 thousand rows or a billion. Only the rows the base hasn't written to files yet, and the workspace's
-files, are copied. Rows keep their `_row_id` and `_version`. The database you clone can be this
-node's own lake or any database attached to it.
+files, are copied. Rows keep their `_row_id` and `_version`. The database you clone can be this node's
+own lake or any database attached to it.
 
 `pondra.databases` shows which database is a branch of which:
 
-```sql
-SELECT name, base, branches FROM pondra.databases ORDER BY name;
-```
+<Ways sql={`SELECT name, base, branches FROM pondra.databases ORDER BY name;`} />
 
 ```text
 name | base | branches
@@ -76,8 +73,9 @@ Writes to a branch stay in the branch. Its materialized views follow its own row
 ```sql
 INSERT INTO dev.orders VALUES (4, 40.0);
 UPDATE dev.orders SET amount = 25.0 WHERE id = 2;
-SELECT (SELECT count(*) FROM dev.big) AS in_dev, (SELECT count(*) FROM big) AS here;
 ```
+
+<Ways sql={`SELECT (SELECT count(*) FROM dev.big) AS in_dev, (SELECT count(*) FROM big) AS here;`} />
 
 ```text
 in_dev | here
@@ -85,17 +83,15 @@ in_dev | here
      3 |    2
 ```
 
-The base carries on too: its merges, compactions and retention never take away a file `dev`
-reads. It keeps them for as long as `dev` exists.
+The base carries on too: its merges, compactions and retention never take away a file `dev` reads. It
+keeps them for as long as `dev` exists.
 
 ## Compare two databases
 
 `pondra.diff('a', 'b')` gives the rows of table `b` that differ from table `a`, in the
 [change feed](/pondra/guides/change-rows/)'s words:
 
-```sql
-SELECT _change_type, id, amount FROM pondra.diff('orders', 'dev.orders') ORDER BY id, _change_type;
-```
+<Ways sql={`SELECT _change_type, id, amount FROM pondra.diff('orders', 'dev.orders') ORDER BY id, _change_type;`} />
 
 ```text
 _change_type     | id | amount
@@ -105,8 +101,9 @@ update_preimage  |  2 |   20.0
 insert           |  4 |   40.0
 ```
 
-Rows both hold alike are matched by their `_row_id` and `_version`, so comparing a big table reads
-only its rows, never a join on every column.
+Rows both hold alike are matched by their `_row_id` and `_version`, so comparing a big table reads only
+its rows, never a join on every column. The command line's
+[`pondra diff`](/pondra/guides/projects/#compare-with-another-database) adds the objects that differ.
 
 ## Bring tables up to date
 
@@ -116,8 +113,9 @@ base's present, with the materialized views that follow them:
 ```sql
 INSERT INTO orders VALUES (5, 50.0);
 ALTER DATABASE dev REFRESH orders;
-SELECT id, amount FROM dev.orders ORDER BY id;
 ```
+
+<Ways sql={`SELECT id, amount FROM dev.orders ORDER BY id;`} />
 
 ```text
 id | amount
@@ -128,16 +126,16 @@ id | amount
  5 |   50.0
 ```
 
-The branch's own changes to those tables go (here row 4 and the update); every other table stays as
-the branch has it.
+The branch's own changes to those tables go (here row 4 and the update); every other table stays as the
+branch has it.
 
 - `ALTER DATABASE dev REFRESH` with no names brings every table the branch took from its base.
 - `ALTER DATABASE dev REFRESH orders, customers` brings those, in one commit.
 - Naming a materialized view brings the tables it reads, and the view comes with them.
 
-REFRESH says what to do instead of guessing when the branch has a view of those tables that its
-base doesn't have, defines one otherwise, or keeps state of its own (a window emitted once,
-sessions, a stream join): drop it, refresh, then make it again.
+REFRESH says what to do instead of guessing when the branch has a view of those tables that its base
+doesn't have, defines one otherwise, or keeps state of its own (a window emitted once, sessions, a
+stream join): drop it, refresh, then make it again.
 
 ## Drop a branch
 
@@ -146,263 +144,57 @@ DROP DATABASE fixtures;
 DROP DATABASE dev;
 ```
 
-Only what the branch wrote goes. Its base lets go of the files it kept for it. A database that still
-has branches can't be dropped; drop the branches first. A user who isn't an admin drops only the
-branches it made.
+Only what the branch wrote goes. Its base lets go of the files it kept for it. A database that still has
+branches can't be dropped; drop the branches first. A user who isn't an admin drops only the branches it
+made.
 
 ## What a branch leaves behind
 
 - **Tasks start suspended**, so a branch never runs production's schedules. Resume one with
   `ALTER TASK … RESUME`.
-- **Secrets stay with the base**, and a view fed by a Kafka topic arrives as a plain table: nothing
-  in a branch reaches outside on its own.
-- **A branch lives where its base does**: both in the same bucket, or both on the same machine.
-
-## Apply a project
-
-A project is a folder, usually in Git, that says what every object is. `pondra apply` makes a
-database match it, and `pondra plan` shows what that would change first:
-
-- `pondra.toml`: the project's name and its environments;
-- `objects/`: `CREATE` statements (tables, views, materialized views, functions, macros, procedures,
-  tasks, secrets, roles, sequences, indexes and enum types) and `GRANT`s, in any layout, several to a file;
-- `migrations/`: one-off steps, such as a rename or a backfill, each run once in each database, in
-  name order, after the objects and columns an apply adds and before what it replaces. A new database
-  is made as `objects/` says now, so there they are recorded as run, not run;
-- `seeds/`: the rows a new database starts with (`INSERT …`), loaded once when an apply makes it,
-  in name order. A branch has its base's rows instead;
-- `tests/`: queries; any row one returns is a failure. They run after every apply (`--no-test` skips
-  them).
-
-```bash
-pondra init shop
-cd shop
-cat > objects/sales.sql <<'SQL'
-CREATE SCHEMA sales;
-CREATE TABLE sales.orders (id BIGINT, amount DOUBLE);
-CREATE VIEW sales.big AS SELECT * FROM sales.orders WHERE amount >= 20;
-SQL
-echo "INSERT INTO sales.orders VALUES (1, 10.0), (2, 20.0), (3, 30.0);" > seeds/001-first-orders.sql
-echo "SELECT * FROM sales.orders WHERE amount < 0" > tests/no_negative.sql
-pondra apply --url http://127.0.0.1:8080
-```
-
-```text
-a project in shop: pondra.toml, objects/, migrations/, seeds/, tests/
-dev: apply 1
-  + schema     sales                 made
-  + table      sales.orders          made
-  + view       sales.big             made
-  ▶ seed       001-first-orders.sql  loaded
-  ✓ tests      1 passed
-  console: http://127.0.0.1:8080/
-```
-
-Apply again and nothing changes. Change a file and the plan says how the database will follow it:
-
-```bash
-cd shop
-cat > objects/sales.sql <<'SQL'
-CREATE SCHEMA sales;
-CREATE TABLE sales.orders (id BIGINT, amount DOUBLE, channel VARCHAR);
-CREATE VIEW sales.big AS SELECT * FROM sales.orders WHERE amount > 20;
-SQL
-pondra plan --url http://127.0.0.1:8080
-```
-
-```text
-dev: after apply 1
-  ~ table      sales.orders  ADD COLUMN channel VARCHAR
-  ~ view       sales.big     replaced
-```
-
-- **A table changes in place** only by columns added at the end, types widened and its options. A
-  column renamed, dropped or moved is refused with the migration to write
-  (`ALTER TABLE … RENAME COLUMN …`): a declaration can't tell a rename from a drop and an add, and an
-  apply never loses data unasked. The plan names the views that read the table: the migration drops
-  them first, and the apply makes them again after it.
-- **A sequence, an enum type and an index change in place too.** A sequence's options change with
-  `ALTER SEQUENCE`, and its next value stays; one taken away is refused. A type's labels are only
-  added at the end (`ALTER TYPE … ADD VALUE`), since files keep the labels they were written with. An
-  index is made again: nothing is built for it.
-- **Anything else that changed is replaced.** A materialized view is made again from the rows
-  already there, with the materialized views that follow it.
-- **Drift shows.** An object an apply made and someone changed by hand is listed, and the apply puts
-  it back.
-- **One apply at a time**, from the plan it showed: if someone applied in between, it is refused, and
-  you plan again. Each statement runs under its own part of the apply's job, so running an apply that
-  stopped half way again finishes it.
-- **Each object has one owner.** An apply changes only what its own project made; another project's
-  objects, and objects people made by hand, are left alone. An object the project no longer declares
-  is kept unless you apply with `--prune`.
-
-Every apply is a row of `pondra.applies`, with the commit it was of, and its files are kept under
-`files/.deploys/`:
-
-```sql
-SELECT id, project, status FROM pondra.applies ORDER BY id;
-```
-
-```text
-id | project | status
----+---------+-------
- 1 | shop    | ok
-```
-
-A project kept in the workspace applies from SQL too: `CALL plan('shop', env => 'prod')` lists its
-plan as rows (`mark`, `change`, `kind`, `name`, `what`; `change` is a word to filter by: `create`,
-`alter`, `replace`, `rebuild`, `migrate`, `record` (a migration a new database is marked as having
-run), `seed`, `drop`, `keep` or `refuse`), and
-`CALL apply('shop', env => 'prod', test => true)` does it.
-
-`pondra export DIR` writes a database's objects as a project's files, so a lake built by hand in the
-console becomes a project in one command.
-
-## Changes made in the database
-
-A change made straight in a database (a `CREATE` in a SQL cell, psql, a BI tool) is not written into
-the files on its own: the files say what every database should be, and only you know which change
-made by hand should stay. `pondra status` lists what differs, as `git status` does, and
-`pondra capture` writes the chosen objects into the files.
-
-Here a view is made by hand, and a column is added to a table:
-
-```bash
-cd shop
-pondra apply --url http://127.0.0.1:8080
-curl -s -o /dev/null -X POST http://localhost:8080/sql -d "CREATE VIEW sales.scratch AS SELECT count(*) AS n FROM sales.orders"
-curl -s -o /dev/null -X POST http://localhost:8080/sql -d "ALTER TABLE sales.orders ADD COLUMN note VARCHAR"
-pondra status --url http://127.0.0.1:8080
-```
-
-```text
-dev: apply 2
-  ~ table      sales.orders  ADD COLUMN channel VARCHAR
-  ~ view       sales.big     replaced
-  ✓ tests      1 passed
-  console: http://127.0.0.1:8080/
-dev: after apply 2
-Changed outside an apply (pondra capture NAME writes it into the files, pondra apply puts it back):
-  ~ table      sales.orders   columns changed outside an apply: added note
-Untracked (pondra capture NAME):
-  ? view       sales.scratch  made outside an apply: in no project's files
-```
-
-Each line changed outside an apply also says who changed it and when, from `pondra.history`, once
-the node has written the statement there (a second or so after it ran).
-
-`pondra capture` writes what is listed into the files: each object's statement as the database has it
-(the author's own text, when one statement made it), a new file for an untracked object, and the
-declaration taken out of the files for a dropped one. Name the objects to write them alone, as
-`pondra capture sales.scratch`.
-
-```bash
-cd shop
-pondra capture --url http://127.0.0.1:8080
-pondra status --url http://127.0.0.1:8080
-```
-
-```text
-dev: captured into the files
-  wrote objects/sales.sql
-  wrote objects/sales/scratch.sql
-  git diff shows the change; commit it, and pondra apply makes it everywhere else
-dev: after apply 2
-  nothing differs: the database is the files
-```
-
-A table renamed in the database, or a column renamed or dropped in it, is not a change to write as
-it is: the files would then say the old name while the database has the new one. `pondra status`
-lists it as renamed (`↷`), and `pondra capture` writes a migration for it, `migrations/NNN-rename-….sql`,
-which renames the table or column in the databases that still have the old names. The migration is
-recorded as run where it was made, since it already is there; the other databases run it on their next
-apply, before what follows the rename. Views that read the table are dropped by the migration and made
-again by the apply after it.
-
-Git shows what `pondra capture` wrote, and a commit makes it the project's: `pondra apply` then makes
-the other databases match it.
+- **Secrets stay with the base.** The one exception is the read-only key that a branch on another server
+  keeps to read its base ([below](#production-on-a-server-of-its-own)). A view fed by a Kafka topic
+  arrives as a plain table: nothing in a branch reaches outside on its own.
+- **A branch is in its base's bucket, or on another server.** In the same bucket it reads the base's
+  files and copies none of them. On another server it reads them with that read-only key.
 
 ## Branches and environments on a team
 
-On a team, the databases are served by `pondra serve --lakes` (production can run a cluster of its
-own), and pondra.toml says where:
-
-```toml
-[project]
-name = "shop"
-server = "https://pondra.acme.com"   # every database here is /db/<name>
-
-[env.prod]
-protected = true                     # its objects change only by an apply
-values = { min_order = 10 }          # what $min_order is in prod's statements
-attach.events = { type = "kafka", url = "kafka://kafka.acme.internal:9092" }
-
-[env.test]
-clone = "prod"                       # made from prod once, then applied on each merge
-
-[env.dev]                            # what every branch takes
-values = { min_order = 0 }
-
-[secrets]
-crm_token = "env:CRM_TOKEN"          # $crm_token, from the applying machine's environment
-```
-
-A branch is a Git branch and a database of the same name, made from prod with no file copied. A
-developer's day:
+On a team, a branch is a Git branch and a database of the same name. The checked-out Git branch picks
+the database, and these commands start, switch to and remove them:
 
 ```bash norun
-pondra login                             # once: a token for each server pondra.toml names, kept in ~/.pondra
 pondra branch orders-by-channel          # the Git branch, and its database: prod as it is now
-pondra apply                             # the branch's database matches the files, with [env.dev]'s values; tests run
-pondra apply --watch                     # or: again on every save
-pondra apply local --watch               # or: this laptop's own lake, no server (lake/ in the project)
-pondra diff                              # its objects and rows against prod's, as Markdown
 pondra switch fix-vat                    # another branch: git switch, and its database made if it's missing
 pondra branch                            # the branches, who made each and when
 pondra branch -d orders-by-channel       # its database, and its Git branch once merged
 ```
 
-- **The checked-out Git branch picks the database.** On `orders-by-channel`, `pondra apply` goes to
-  the database `orders_by_channel`. Pondra keeps no state of its own about which branch you are on.
-  On `main` there is no branch, so name the environment: `pondra apply test`, `pondra apply prod`.
+- **The database's name** is the branch's name as SQL takes it: lower case, with every character that
+  isn't a letter, a digit or `_` made `_`, and a `_` before a name that starts with a digit. So
+  `orders-by-channel` is `orders_by_channel`, and `2026-q4` is `_2026_q4`.
+- **The checked-out Git branch picks the database.** On `orders-by-channel`, `pondra apply` goes to the
+  database `orders_by_channel`. Pondra keeps no state of its own about which branch you are on. On `main`
+  there is no branch, so name the environment: `pondra apply test`, `pondra apply prod`. Applying a
+  project to a branch is in [Projects](/pondra/guides/projects/#apply-it).
 - **A database is made when a command first needs it.** A branch, and test, start as a clone of prod
-  (`[env.dev] clone` or `[env.test] clone` names another); prod starts empty on its server. Test is
-  then kept, with whatever QA adds to it; `--fresh` makes a clone again from where it came from.
-- **A branch is its maker's.** `GRANT CLONE ON DATABASE prod TO developers` is all a developer needs
-  to make one, and only its maker or an admin drops it. Test and the pull requests' databases are
-  CI's.
-- **`--watch` never applies to prod**, to `main` or to a protected database.
-- **`pondra apply local` needs no server.** It applies to the lake in the project's `lake/` folder,
-  which `pondra` opens as its shell there and `pondra init`'s `.gitignore` leaves out of Git. With
-  `--watch` its node stays up, and the console it prints shows each save as it lands.
-- **A branch's tasks wait to be resumed.** A task made in a branch or in test starts suspended, as
-  the tasks it was cloned with do, so nothing in a branch reaches the outside on a schedule. `ALTER TASK name RESUME` starts it, and `EXECUTE TASK name` runs it once.
-- **A branch reads prod's files gently.** Its reads of prod's objects get a quarter of a node's
-  requests at prod's bucket, and halve when the bucket asks to slow down
-  (`pondra_bucket_turns` in `/metrics`), so prod's own nodes keep most of it.
-
-`pondra ci init` sets up CI for the project in one command. It writes `.github/workflows/pondra.yml`,
-in which each pull request's database is made fresh from prod, applied, tested and compared; a merge
-applies `main` to test; and prod is applied once someone approves the `prod` environment:
-
-```yaml
-- run: pondra apply pr-${{ github.event.number }} --fresh
-- run: pondra diff pr-${{ github.event.number }} >> "$GITHUB_STEP_SUMMARY"
-```
-
-It also protects prod in pondra.toml, makes the users CI signs in as (`ci`, which may clone prod,
-and `ci_prod`, which may only apply to prod) with fresh tokens, and stores them in GitHub through
-`gh`, with the `prod` environment reviewed by you. Without `gh` it prints them once. Running it
-again rotates the tokens.
-
-```bash norun
-pondra ci init
-```
+  (`[env.dev] clone` or `[env.test] clone` in [pondra.toml](/pondra/guides/projects/#pondratoml) names
+  another); prod starts empty on its server. Test is then kept, with whatever QA adds to it; `--fresh`
+  makes a clone again from where it came from.
+- **A branch is its maker's.** `GRANT CLONE ON DATABASE prod TO developers` is all a developer needs to
+  make one, and only its maker or an admin drops it. Test and the pull requests' databases are CI's.
+  Each project's CI is in [Continuous integration](/pondra/guides/projects/#continuous-integration).
+- **A branch's tasks wait to be resumed.** A task made in a branch or in test starts suspended, as the
+  tasks it was cloned with do, so nothing in a branch reaches the outside on a schedule. `ALTER TASK name
+  RESUME` starts it, and `EXECUTE TASK name` runs it once.
+- **A branch reads prod's files gently.** Its reads of prod's objects get a quarter of a node's requests
+  at prod's bucket, and halve when the bucket asks to slow down (`pondra_bucket_turns` in `/metrics`), so
+  prod's own nodes keep most of it.
 
 ### Production on a server of its own
 
-A company that keeps production apart runs it as its own server, with its own bucket, and dev as
-another. The commands are the same as on one server; pondra.toml gives each environment its server:
+A company that keeps production apart runs it as its own server, with its own bucket, and dev as another.
+The commands are the same as on one server; pondra.toml gives each environment its server:
 
 ```toml
 [env.prod]
@@ -417,11 +209,10 @@ clone = "prod"
 server = "https://dev.acme.com"      # every branch's database is made here, of prod attached as `prod`
 ```
 
-Dev's nodes never hold a key that writes production's bucket, yet a branch of production on dev
-still copies no data. Dev reads production's files with a key that only reads them, and asks
-production's leader to pin the tables it branches, with a token that may do nothing else.
-`pondra ci init` makes that token's user on production and prints what to run on each other server,
-which by hand is:
+Dev's nodes never hold a key that writes production's bucket, yet a branch of production on dev still
+copies no data. Dev reads production's files with a key that only reads them, and asks production's
+leader to pin the tables it branches, with a token that may do nothing else. [`pondra ci init`](/pondra/guides/projects/#continuous-integration)
+makes that token's user on production and prints what to run on each other server, which by hand is:
 
 ```sql norun
 -- on production
@@ -438,104 +229,21 @@ ATTACH 's3://acme-prod/prod' AS prod (READ_ONLY, ENDPOINT 'https://prod.acme.com
 CREATE DATABASE ali CLONE prod;              -- in dev's bucket, no file copied
 ```
 
-Nothing on dev writes or deletes under production's prefix, whatever dev's own key allows: a write
-to `prod` is refused by name. The branch keeps the read-only key in its own catalog, so it reads
-production on its own, and `ALTER DATABASE ali REFRESH` asks production's leader again with the
-branch's own key. That key reads the branch's own tables and nothing else: no statement in the
-branch can use it, whoever owns the branch, so a clone of the `sales` schema can't read `hr`'s files
-by their URL. A branch can't be made while production's leader is down; one made earlier can
-still be read. A clone takes only the schemas the link's CLONE grant covers
-(`WITH (schemas = (…))` picks among them).
+Nothing on dev writes or deletes under production's prefix, whatever dev's own key allows: a write to
+`prod` is refused by name. The branch keeps the read-only key in its own catalog, so it reads production
+on its own, and `ALTER DATABASE ali REFRESH` asks production's leader again with the branch's own key.
+That key reads the branch's own tables and nothing else: no statement in the branch can use it, whoever
+owns the branch, so a clone of the `sales` schema can't read `hr`'s files by their URL. A branch can't be
+made while production's leader is down; one made earlier can still be read. A clone takes only the
+schemas the link's CLONE grant covers (`WITH (schemas = (…))` picks among them).
 
-While dev uses a branch (its own node, or a node it is attached to), it renews its pin in production
-every hour with its own key, which dev keeps sealed by its master key. Production lets go of a pin
-nobody renewed for 14 days (`PONDRA_PIN_LEASE_SECS`), so a branch whose server is gone stops holding
-production's files. Such a branch can then no longer read what production has deleted since: drop it
-and clone again.
+While dev uses a branch (its own node, or a node it is attached to), it renews its pin in production every
+hour with its own key, which dev keeps sealed by its master key. Production lets go of a pin nobody renewed
+for 14 days (`PONDRA_PIN_LEASE_SECS`), so a branch whose server is gone stops holding production's files.
+Such a branch can then no longer read what production has deleted since: drop it and clone again.
 
-### Protected production
+## Projects and Git
 
-On a protected database, a project's objects change only by an apply. Its objects are what its last
-finished apply left: tables, views, roles and grants. A change to one is refused by name, an admin
-included, unless an apply makes it. Rows still change, and people still make, change and drop their
-own objects, in the project's schema too:
-
-```text
-permission denied: table sales.orders is project shop's, and prod is protected: change it in the project and apply it (or an admin lifts the protection: ALTER DATABASE prod SET (protected = false))
-```
-
-A user granted APPLY can apply to the database without being an admin, so a CI account needs no
-admin token. APPLY is granted on the database alone, not on a schema or a table:
-
-```sql norun
-GRANT APPLY ON DATABASE prod TO ci_prod;
-```
-
-The project says which environment is protected, and the first apply to it protects the database
-once it has finished:
-
-```toml
-[env.prod]
-protected = true                     # its objects change only by an apply, once one has finished
-```
-
-On a protected database an apply needs APPLY or the node's own operator (its tokens and key). A
-superuser without APPLY is refused. Lifting the protection is an admin's statement, and it is
-audited. It shows in `pondra.databases` until the database is protected again:
-
-```sql norun
-ALTER DATABASE prod SET (protected = false);  -- an admin's: written to pondra.audit
-ALTER DATABASE prod SET (protected = true);   -- when the fix is in
-```
-
-```sql
-SELECT name, protected, lifted_at, lifted_by FROM pondra.databases;
-```
-
-A branch of a protected database isn't protected: `CREATE DATABASE dev CLONE prod` gives dev a
-database whose objects change as dev's own, and prod keeps its protection.
-
-## Git folders
-
-A project kept in the workspace can be a Git folder: a folder paired with a branch of a GitHub
-repository. The node speaks to GitHub itself, so the console, or anything that runs SQL, commits the
-project's files and opens pull requests with no `git` installed.
-
-Each person keeps their own token as a secret, so commits and pull requests are theirs. Its `SCOPE`
-says which repositories it may go to:
-
-```sql norun
-CREATE SECRET ann_git (TYPE git, TOKEN 'ghp_…', SCOPE 'https://github.com/acme');
-GRANT USAGE ON SECRET ann_git TO ann;
-```
-
-Then, in SQL from any door:
-
-```sql norun
-CALL git_checkout('sales', repository => 'https://github.com/acme/sales', branch => 'main');
-CALL plan('files/sales');                                -- the project checked out, as any other
-SELECT * FROM pondra.git_status('sales');               -- what changed here: added, modified, deleted
-CALL git_commit('sales', 'Discounts by channel');        -- every changed file, on top of main
-CALL git_commit('sales', 'Discounts', paths => ['objects/sales/discounts.sql']);   -- just this one
-CALL git_pull('sales');                                  -- what others pushed
-CALL git_checkout('sales', branch => 'discounts');       -- a branch the repository lacks: made here
-CALL git_pull_request('sales', title => 'Discounts by channel');
-```
-
-- **A commit only moves the branch forward.** If someone pushed since the folder's commit,
-  `git_commit` is refused ("main moved on since 1a2b3c4 (the folder's commit): git_pull('sales') first"). `git_pull` brings their
-  files. A file changed both here and there is refused by name, and nothing changes: commit or undo
-  one side, then pull.
-- **The folder's record** is `.pondra-git.json`: the repository, the branch, the commit and each
-  file's git blob id, so `git_status` needs no network. Of two commits of one folder at once, the
-  second is told to try again.
-- **Another branch** is written over the folder, which is refused while it has changes not committed.
-  A branch the repository lacks is made at the folder's commit, and the changes carry over, as
-  `git switch -c` does.
-- **Rights.** `git_status` reads. The others write the workspace's files, so they need a write token.
-  A token goes only to a repository its `SCOPE` covers, over https (or to this machine), for those
-  with `USAGE` on it, and it is never used to read files.
-- **GitLab** is next: `PROVIDER 'gitlab'` is refused by name for now.
-
-Not here yet: a materialized view rebuilt beside the old one and swapped in, and Python files in
-`objects/`.
+A project's files say what each database holds, and `pondra apply` makes them true there: see
+[Projects](/pondra/guides/projects/), including protected production. A project kept in the workspace can
+be paired with a GitHub branch: see [Git folders](/pondra/guides/git/).

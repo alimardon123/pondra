@@ -1,11 +1,10 @@
 ---
 title: Query
 description: Run SQL against a lake from SQL, Python, JavaScript or psql, with parameters, scripts, formats, EXPLAIN and queries spread over nodes.
-sidebar:
-  order: 3
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 Pondra's SQL is [Apache DataFusion's](https://datafusion.apache.org/user-guide/sql/index.html): the
 Postgres-style SQL you know, with joins, subqueries, CTEs, window functions and the usual functions,
@@ -65,12 +64,26 @@ view, over Postgres and on a query spread over several nodes:
 ```sql
 PIVOT orders ON item USING sum(amount) GROUP BY user_id;
 UNPIVOT (SELECT id, qty, amount FROM orders) ON qty, amount INTO NAME field VALUE value;
-SELECT * EXCLUDE (ts) RENAME (amount AS total) FROM orders ORDER BY ALL;
 SELECT min(COLUMNS('qty|amount')), max_by(item, amount) AS biggest FROM orders;
 SELECT id, [q * 2 FOR q IN [qty, qty + 1] IF q > 2] AS doubled, list_transform([qty], x -> x + 1) AS plus FROM orders;
 SELECT amount * 2 AS twice FROM orders WHERE twice > 10;
 SUMMARIZE orders;
 SELECT count(*) FROM orders USING SAMPLE 50%;
+```
+
+`SELECT *` can leave columns out and rename others in one go, and `ORDER BY ALL` sorts by every column:
+
+<Ways sql={`SELECT * EXCLUDE (ts) RENAME (amount AS total) FROM orders ORDER BY ALL;`} />
+
+```text
++----+---------+------+-----+-------+
+| id | user_id | item | qty | total |
++----+---------+------+-----+-------+
+| 1  | 1       | tea  | 2   | 7.0   |
+| 2  | 2       | cake | 1   | 4.5   |
+| 3  | 1       | tea  | 1   | 3.5   |
+| 4  | 3       | pie  | 2   | 9.0   |
++----+---------+------+-----+-------+
 ```
 
 The standard's `PIVOT (… FOR … IN (…))` and `UNPIVOT (… FOR … IN (…))` work too, and so do
@@ -87,18 +100,17 @@ A `PIVOT` without `IN (…)` finds its values with a query of its own when it ru
 ## What a query sees
 
 A query reads the lake's Parquet files and the newest rows, which have not become Parquet yet, as one
-snapshot: everything committed up to one moment, never half of a commit. A write is in the answer as
-soon as it is acknowledged, on any node. So there is nothing to refresh, and no difference between "old"
-and "new" rows.
+snapshot: everything committed up to one moment, never half of a commit. A SQL write is in the answer
+as soon as its statement returns, on the node that took it, and other nodes see it a few
+milliseconds later ([freshness and guarantees](/pondra/concepts/freshness-and-guarantees/)). So
+there is nothing to refresh, and no difference between "old" and "new" rows.
 
 Tables join across schemas and attached lakes as one query, keyed tables included:
 
-```sql
-SELECT u.name, o.item, o.amount,
+<Ways sql={`SELECT u.name, o.item, o.amount,
        rank() OVER (PARTITION BY u.name ORDER BY o.amount DESC) AS rank
 FROM orders o JOIN users u ON u.id = o.user_id
-ORDER BY u.name, rank;
-```
+ORDER BY u.name, rank;`} />
 
 ```text
 +------+------+--------+------+
@@ -112,7 +124,10 @@ ORDER BY u.name, rank;
 ```
 
 `FROM orders` alone means `SELECT * FROM orders`, and `FROM orders SELECT item, qty` picks columns.
-`FROM orders WHERE …` is not accepted: write the `SELECT *`.
+A clause after the `FROM` works the same way, so `FROM orders WHERE qty > 1 ORDER BY id` is
+`SELECT * FROM orders WHERE qty > 1 ORDER BY id`:
+
+<Ways sql={`FROM orders WHERE qty > 1 ORDER BY id;`} />
 
 ## Parameters
 
@@ -278,17 +293,9 @@ AggregateExec: mode=FinalPartitioned, gby=[item@0 as item], aggr=[sum(orders.qty
       DataSourceExec: partitions=1, partition_sizes=[1], expected_rows=4
 ```
 
-Every statement is also a row of [`pondra.history`](/pondra/reference/sql/#users-and-grants), with a
-fingerprint that is the same for the same query with other values, the commit it read (`version`:
-`AT (VERSION => n)` reads the lake as it was then, so an answer can be had again without being
-kept), and how far a join's rows were from what was expected (`misestimate`):
+Every statement is kept in `pondra.history`, with its plan when it was slow: see [Observability](/pondra/guides/observability/).
 
-```sql
-SELECT fingerprint, count(*) AS runs, avg(ms) AS ms, max(misestimate) AS worst
-FROM pondra.history WHERE outcome = 'ok' GROUP BY fingerprint ORDER BY ms DESC LIMIT 5;
-```
-
-A query of 100 ms or more also notes each filter on a table that kept far more or far fewer of its
+Queries also teach the planner. A query of 100 ms or more notes each filter on a table that kept far more or far fewer of its
 rows than the planner expected, such as two conditions that go together (every Paris customer is in
 France). `pondra.learned` lists what the lake has learned so, each as last seen:
 
@@ -320,8 +327,9 @@ curl -s -X POST "http://localhost:8080/sql?spread=0" -d "SELECT count(*) AS n FR
 [{"n":4}]
 ```
 
-Answers are the same on one node and on many, including sums over `DOUBLE`, which add up exactly. Queries
-that need more memory than `--memory-gb` allows (a third of the machine's by default) spill to disk.
+Answers are the same on one node and on many, and a sum over `DOUBLE` comes out the same whatever
+order its rows arrive in. Queries that need more memory than `--memory-gb` allows (a third of the
+machine's by default) spill to disk.
 [Clusters](/pondra/guides/clusters/) covers running several nodes.
 
 <Aside type="caution">

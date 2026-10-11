@@ -1,11 +1,10 @@
 ---
 title: Share a table
 description: Share a table, some of its partitions or a materialized view with another company through the Delta Sharing protocol; they read it with pandas, Spark, Power BI or another Pondra, with their own compute, and no key to your bucket leaves.
-sidebar:
-  order: 16.2
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 To give another company one table, make a **share**, put the table in it, make a **recipient** for
 the company and grant it the share. The recipient gets a small profile file. With it, their pandas,
@@ -94,16 +93,15 @@ db.sql("SELECT region, sum(total) AS total FROM acme.orders GROUP BY region ORDE
 The token is kept as a sealed secret of the attachment (`share_acme`) and never shown; `DETACH acme`
 drops it. A share with more than one name is picked with `SHARE 'name'`; a server's address with
 its token works too: `ATTACH 'https://…/delta-sharing' AS acme (TYPE share, SHARE 'acme', TOKEN
-'…')`. Any Delta Sharing server can be attached this way, Databricks' included.
+'…')`. A server of another product that speaks the Delta Sharing protocol attaches the same way. The
+tests run against Pondra's own server, read by Pondra and by the delta-sharing client.
 
 ## Share less than a table
 
 A share hands out whole files, so it can hold a table's partitions by its `partition_by` column, under
 a name of their own:
 
-```sql
-ALTER SHARE acme ADD TABLE orders PARTITION (region = 'EU'), (region = 'UK') AS public.orders_europe;
-```
+<Ways sql={`ALTER SHARE acme ADD TABLE orders PARTITION (region = 'EU'), (region = 'UK') AS public.orders_europe;`} />
 
 Some columns, or rows picked any other way, are a materialized view: it is kept fresh as rows land,
 and the recipient reads its files.
@@ -120,9 +118,7 @@ Snowflake's way of saying it works too: `GRANT SELECT ON TABLE orders TO SHARE a
 `WITH HISTORY` lets the recipient read the table as it was at a version or a time
 (`load_as_pandas(…, version=3)`, `timestamp='…'`). Without it, only the current version is served.
 
-```sql
-ALTER SHARE acme ADD TABLE orders AS public.orders_history WITH HISTORY;
-```
+<Ways sql={`ALTER SHARE acme ADD TABLE orders AS public.orders_history WITH HISTORY;`} />
 
 Rows you update or delete reach the recipient as Delta's deletion vectors, which pandas (from
 delta-sharing 1.1), Spark and Pondra read. A client that can't read them is refused that table by
@@ -160,9 +156,7 @@ minutes (`PONDRA_SHARE_URL_SECS`).
 Every request at the sharing door is a row of `pondra.audit`, refusals too, with the recipient, the
 table and how it ended:
 
-```sql
-SELECT at, "user", statement, outcome FROM pondra.audit WHERE door = 'sharing' ORDER BY at DESC LIMIT 10;
-```
+<Ways sql={`SELECT at, "user", statement, outcome FROM pondra.audit WHERE door = 'sharing' ORDER BY at DESC LIMIT 10;`} />
 
 ## Where the bytes go
 

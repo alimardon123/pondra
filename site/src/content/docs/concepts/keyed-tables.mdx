@@ -1,8 +1,6 @@
 ---
 title: Keyed tables
 description: Tables with a PRIMARY KEY that keep one current row per key, and the merge, TTL and event-time options that go with them.
-sidebar:
-  order: 3
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -166,7 +164,7 @@ SELECT * FROM per_user ORDER BY user;
 +------+-------+---+
 ```
 
-[Streaming](/pondra/guides/streaming/) has the views that group by time windows.
+[Streaming](/pondra/guides/windows/) has the views that group by time windows.
 
 ## Expire rows with a TTL
 
@@ -297,9 +295,11 @@ Row 1 moved from the 28th to the 29th and is still one row.
 
 ## Other engines and keyed tables
 
-A keyed table publishes to Delta and Iceberg when one file holds one row per key, which is after a
-full compaction. Other engines see the table as of its last full compaction, which comes when 8
-tiering rounds pile up. `CHECKPOINT` compacts a published keyed table so they see it as it is now.
+A plain keyed table (no `order_by`, no merge columns) publishes to Delta and Iceberg every tiering
+round. Its older versions and deletes are written as positions, so other engines see its rows as they
+are now. A keyed table with `order_by` or merge columns (`MERGE sum`, and a GROUP BY view's table) publishes
+only as one generation, which a full compaction makes. Other engines see it as of its last full compaction, which comes when 8 tiering rounds
+pile up. `CHECKPOINT` compacts a published keyed table so they see it as it is now.
 
 <Aside type="caution">
 - A change (`UPDATE`, `DELETE`, `MERGE`) to a table is refused while a view follows it that can't take
@@ -307,7 +307,9 @@ tiering rounds pile up. `CHECKPOINT` compacts a published keyed table so they se
   a streaming task. Views that add up (`sum`, `count`) do take rows back.
 - An `ASOF JOIN` looks up a table's rows. A keyed table keeps only its latest row per key, so the
   join gives the latest row, not the one from that moment. Keep a table's history as an append table.
-- Other engines can't append to a keyed table through the Iceberg REST catalog. It is refused by name.
+- A plain keyed table takes other engines' writes through the Iceberg REST catalog as upserts and deletes
+  (see [Other engines](/pondra/guides/other-engines/)). A keyed table with `order_by` or merge columns
+  refuses them by name.
 - Pondra's own reads of a keyed table don't prune by partition yet: a newer row in another partition
   may hide an older one. Outside engines reading the compacted table do prune.
 </Aside>

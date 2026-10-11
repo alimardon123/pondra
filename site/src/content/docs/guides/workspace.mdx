@@ -1,13 +1,12 @@
 ---
 title: Run files as jobs
 description: Run the lake's SQL, Python and notebook files with parameters, from every client, on a schedule, each run logged.
-sidebar:
-  order: 9.5
 setup: |
   CREATE TABLE orders (day DATE, region VARCHAR, amount DOUBLE);
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 The lake's own files are a workspace. A `.sql` file, a `.py` file or a notebook kept there (the
 console's Workspace, or `PUT /files/…`) runs as a job: with parameters, from any client, on a
@@ -26,9 +25,7 @@ EOF
 
 Run it with `CALL run`, naming each value:
 
-```sql
-CALL run('etl/orders.sql', day => DATE '2026-09-29', region => 'west', amount => 10.5);
-```
+<Ways sql={`CALL run('etl/orders.sql', day => DATE '2026-09-29', region => 'west', amount => 10.5)`} />
 
 ```text
  region | n | total
@@ -61,9 +58,7 @@ SELECT count(*) AS n FROM orders WHERE day BETWEEN $since AND $day AND region = 
 EOF
 ```
 
-```sql
-SELECT name, type, "default", required, description FROM pondra.parameters('etl/by_region.sql');
-```
+<Ways sql={`SELECT name, type, "default", required, description FROM pondra.parameters('etl/by_region.sql')`} />
 
 ```text
  name   | type    | default          | required | description
@@ -79,7 +74,7 @@ CALL run('etl/by_region.sql', region => 'west', day => '2026-09-29');
 
 - **A `$name` used and never set** is a parameter too, required, with no type.
 - **The run's variables are its own:** a `DECLARE` in a file doesn't change the caller's `$day`,
-  and `$day = $day + 1` in it changes only the run's ([variables](/pondra/reference/sql/#variables)).
+  and `$day = $day + 1` in it changes only the run's ([variables](/pondra/guides/scripts/#variables)).
 - **In Python** (a `.py` file, a notebook's cells), `pondra.vars.day` is the same value.
 
 ## Python files and notebooks
@@ -162,9 +157,7 @@ CALL run('etl/orders.sql', day => $day, region => 'north', amount => 2.0);
 EOF
 ```
 
-```sql
-CALL run('etl/daily.sql', day => DATE '2026-09-30');
-```
+<Ways sql={`CALL run('etl/daily.sql', day => DATE '2026-09-30')`} />
 
 ```python norun
 pondra.run("etl/orders.sql", day=datetime.date(2026, 9, 29), region="chain", amount=3.0)  # in a .py file
@@ -175,7 +168,7 @@ Runs inside runs stop 16 deep, so a file that runs itself ends with an error, no
 ## Jobs, schedules and the run log
 
 `pondra.start('run', …)` starts a file on the node and answers at once with its run's id. A task
-runs it on a schedule:
+runs it on a schedule ([Tasks](/pondra/guides/tasks/)):
 
 ```sql
 SELECT pondra.start('run', 'etl/orders.sql', day => DATE '2026-09-28', region => 'later', amount => 8.0) AS run;
@@ -186,9 +179,7 @@ Every run is a row of `pondra.runs`, named `files/<path>@<version>`: the file, a
 that ran. Its arguments, who ran it (a task's runs say `task:nightly`), when, and how it went are
 there too:
 
-```sql
-SELECT routine, args, caller, status, error FROM pondra.runs WHERE routine LIKE 'files/%' ORDER BY started DESC LIMIT 5;
-```
+<Ways sql={`SELECT routine, args, caller, status, error FROM pondra.runs WHERE routine LIKE 'files/%' ORDER BY started DESC LIMIT 5`} />
 
 - **Retried with a job, a run writes once.** Over HTTP, `POST /sql?job=…`; a task's tick has its
   own. Each statement of the file (and of the files it runs) gets its part of the job.
@@ -237,5 +228,6 @@ pushed 1, deleted 0 in the lake
   the statements, bound on the node.
 - **The file's ⋯** (and a notebook's) has **Run as a job**, which saves the file and starts it on the
   node, and **Schedule…**, which makes a task that runs it (`15 minutes`, `1 day`, or a cron line).
-- **History** (the right pane), at **Runs**, lists the node's runs, newest first, and the schedules, each with a
-  button to drop it. A running job's row updates until it ends. Click a file's run to open the file.
+- **History** (in the right pane) lists what ran, newest first, the node's runs among it. A running
+  job's row updates until it ends. Click a file's run to open the file.
+- **Jobs** (in the right pane, too) lists the schedules. Each one's ⋯ menu drops it.

@@ -1,11 +1,10 @@
 ---
 title: Functions and procedures
-description: Write your own SQL and Python functions, procedures that do anything, and tasks that run them on a schedule or in order.
-sidebar:
-  order: 9
+description: Write your own SQL and Python functions and procedures that do anything, and call them from queries, clients and the command line.
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 A **function** goes inside a query: `SELECT slug(title) FROM posts`. A **procedure** is a job you
 `CALL`, and it may change tables, call an API or send mail. Both are written in SQL or Python and
@@ -33,10 +32,10 @@ CREATE FUNCTION twice(x) AS x * 2;
 
 CREATE FUNCTION on_day($d DATE) RETURNS TABLE (id BIGINT, item VARCHAR)
   AS $$ SELECT id, item FROM sales WHERE ts::DATE = $d $$;
-
-SELECT item, net(price) AS net, net(price, rate => 0.5) AS half, twice(price) AS two FROM sales ORDER BY id;
 SELECT * FROM on_day(DATE '2026-09-29');
 ```
+
+<Ways sql={`SELECT item, net(price) AS net, net(price, rate => 0.5) AS half, twice(price) AS two FROM sales ORDER BY id`} />
 
 - **Parameters.** Write a parameter `x` or `$x`, with its type or without one, and its default
   after `=` (or `DEFAULT`). In the body, `x` and `$x` both mean it. A parameter with no type takes
@@ -297,9 +296,9 @@ Mail, HTTP calls, files and cloud SDKs are all fair game, which is why only an a
 a procedure, and a node runs Python only when started with `--python`. A node with no tokens takes
 `--python` only on 127.0.0.1.
 
-```sql norun
-CREATE SECRET smtp (TYPE generic, HOST 'smtp.example.com', USER 'reports@example.com', PASSWORD '…');
+This procedure reads the `smtp` secret that [Secrets](#secrets) makes below:
 
+```sql norun
 CREATE PROCEDURE send_report(day DATE, to_addr VARCHAR) LANGUAGE python AS $$
     import smtplib
     from email.message import EmailMessage
@@ -458,84 +457,21 @@ as it is with `CALL run('etl/orders.sql', day => …)`: see [Run files as jobs](
 `db.call(…, wait=False)` gives a `Run` whose `wait()` returns its row of `pondra.runs`, or raises
 its error; JavaScript's `db.start(name, …args)` gives the id.
 
-```sql
-SELECT pondra.start('top_items', 1) AS run;
-```
+<Ways sql={`SELECT pondra.start('top_items', 1) AS run`} />
 
-## Run on a schedule
+## Tasks
 
-A **task** is a statement on a timer. The leader runs each tick once, and a failover neither skips
-nor repeats one.
-
-```sql
-CREATE TASK refresh SCHEDULE '5 minutes' AS CALL load_day(current_date - 1);
-CREATE TASK nightly SCHEDULE 'cron 0 2 * * * UTC' AS CALL load_day(current_date - 1);
-SHOW TASKS;
-```
-
-A schedule is `'5 minutes'`, `'every 30 seconds'`, or cron with an optional time zone
-(`'cron 0 2 * * * Europe/Berlin'`). Ticks missed while no node led run once, as the latest of them.
-`SHOW TASKS` (or the table `pondra.tasks`) gives each task's last and next tick, and
-`DROP TASK name` stops one. A task's statement runs as an admin.
-
-```sql
-DROP TASK refresh;
-DROP TASK nightly;
-```
-
-## Run tasks in order
-
-A task can run **after** other tasks instead of on a schedule of its own. A scheduled task and the
-tasks that follow it form a graph, and each of its ticks is one run of the graph. A task runs once
-everything it follows has ended well in that run, so a failure stops what comes after it.
-
-```sql
-CREATE TABLE order_counts (day DATE, orders BIGINT);
-CREATE TASK count_orders SCHEDULE 'cron 0 2 * * * UTC' AS SELECT count(*) FROM orders;
-CREATE TASK load_counts AFTER count_orders
-  WHEN pondra.result('count_orders') > 0
-  WITH (retries = 2, retry_delay = '1 minute', timeout = '1 hour')
-AS BEGIN
-  DECLARE PARAMETER $day DATE = current_date - 1;
-  INSERT INTO order_counts VALUES ($day, pondra.result('count_orders'));
-  RETURN (SELECT count(*) FROM order_counts);
-END;
-CREATE TASK report AFTER load_counts AS PRINT 'days loaded: ' || pondra.result('load_counts');
-EXECUTE TASK count_orders (day => DATE '2026-09-29');
-```
-
-- `WHEN` is checked first. When it's false the task is `skipped`, and what follows it still runs.
-- `pondra.result('t')` is what task `t` answered in this run of the graph: its `RETURN`, or the
-  first value of its last query. It is NULL if `t` gave nothing.
-- `EXECUTE TASK` runs a graph now, from its first task, with values for its tasks' `$name`s. A
-  scheduled run gives none, so a task gives its own default with `DECLARE PARAMETER`. It is
-  refused while that task's last run is still going.
-- `retries` runs a failed task again with the same job, so what a try wrote lands once, and
-  `retry_delay` waits between tries (10 seconds by default). `timeout` fails a try that runs longer.
-  `on_failure` names a procedure that is called with the task's name and its error once it has
-  failed for good.
-- `ALTER TASK t SUSPEND` stops a task until `ALTER TASK t RESUME`: it has no ticks of its own, and
-  in a graph neither it nor what follows it runs. `EXECUTE TASK` still runs it.
-
-`pondra.tasks` shows each task's schedule or what it follows, its state, and its last run's status
-and result. Each run is a row of `pondra.runs` whose id is `task-<name>-<tick>`, the same for every
-task in one run of a graph. A task others follow is dropped after them.
-
-```sql
-SELECT name, after, state, last_status, last_result FROM pondra.tasks;
-DROP TASK report;
-DROP TASK load_counts;
-DROP TASK count_orders;
-```
+A task runs a procedure, or any statement, on a schedule or after other tasks. Tasks have their own
+page: [Tasks](/pondra/guides/tasks/).
 
 ## See what ran
 
-Every procedure call is a row of `pondra.runs`: routine, caller, node, arguments, start, end, status
-(`running`, `ok`, `failed`, or `stopped` when its node stopped while it ran), notices and error. A file's run is named `files/<path>@<version>`. Rows go after 30 days (`PONDRA_RUNS_DAYS`).
+Every procedure call is a row of `pondra.runs`: its `routine`, `caller`, `node`, `job`, `args` (the
+arguments as JSON), `started` and `ended` times, `status` (`running`, `ok`, `failed`, or `stopped` when
+its node stopped while it ran), `notices` and `error`. [System tables](/pondra/sql/system-tables/#the-run-log)
+lists the columns. A file's run is named `files/<path>@<version>`. Rows go after 30 days (`PONDRA_RUNS_DAYS`).
 
-```sql
-SELECT routine, caller, status, notices FROM pondra.runs ORDER BY started DESC LIMIT 3;
-```
+<Ways sql={`SELECT routine, caller, status, notices FROM pondra.runs ORDER BY started DESC LIMIT 3`} />
 
 `SHOW USER FUNCTIONS`, `SHOW PROCEDURES` and the table `pondra.routines` list the lake's own routines
 with their code.
@@ -551,6 +487,5 @@ with their code.
   rights, and returns a table instead.
 - Mail and HTTP calls are outside the lake. A retried call sends again unless the procedure checks
   `pondra.runs`.
-- A task's ticks missed while no node led run once.
 
 </Aside>
