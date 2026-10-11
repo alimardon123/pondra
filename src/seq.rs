@@ -377,10 +377,21 @@ pub async fn owned(lake: &Lake, table: &str, column: &str, declared: Vec<Opt>) -
     unreachable!("a free name")
 }
 
-/// The sequences a table's identity columns own, dropped with it (leader).
+/// The sequences a table's identity columns own, dropped with it (leader). A clone shares its
+/// source's sequence, so one a table still numbers by (live, or kept to be undropped) stays.
 pub async fn drop_owned(lake: &Lake, meta: &TableMeta) -> Result<()> {
+    if meta.identity.is_empty() {
+        return Ok(());
+    }
+    let mut used: std::collections::HashSet<String> = Default::default();
+    for (_, t) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
+        used.extend(t.identity.into_values().map(|i| i.sequence));
+    }
+    for (_, d) in crate::ddl::dropped(lake).await? {
+        used.extend(d.meta.identity.into_values().map(|i| i.sequence));
+    }
     for i in meta.identity.values() {
-        if lake.cat.get::<Sequence>(&key(&i.sequence)).await?.is_some_and(|s| s.owned.is_some()) {
+        if !used.contains(&i.sequence) && lake.cat.get::<Sequence>(&key(&i.sequence)).await?.is_some_and(|s| s.owned.is_some()) {
             submit(lake, Op::Drop { name: i.sequence.clone() }).await?;
         }
     }

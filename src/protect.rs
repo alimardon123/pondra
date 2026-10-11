@@ -123,6 +123,7 @@ fn ddl_touches(d: &Ddl) -> Vec<Touch> {
         | Ddl::DropTask { name, .. } | Ddl::AlterTask { name, .. } | Ddl::DetachView { name } => object(name),
         Ddl::AlterColumn { table, .. } | Ddl::Constraint { table, .. } => object(table),
         Ddl::RenameTable { name, to } => vec![Touch::Object(name.clone()), Touch::Object(to.clone())],
+        Ddl::Swap { .. } => vec![], // (a swap changes what two tables hold, as writes do: a protected database allows it, and no definition changes)
         Ddl::Replacing { name, then } => std::iter::once(Touch::Object(name.clone())).chain(ddl_touches(then)).collect(),
         Ddl::Unless { then, .. } => ddl_touches(then),
         Ddl::Object(crate::objects::Op::OrAlterTable { name, .. }) => object(name),

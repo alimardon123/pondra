@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """A table's past (ADR-043): UNDROP TABLE, each table's `retention`, `t AT (VERSION => n |
 TIMESTAMP => t | OFFSET => -seconds)` against a model of every state the table went through,
-RESTORE TABLE and zero-copy CLONE.
+RESTORE TABLE and zero-copy CLONE; ALTER TABLE … SWAP WITH (write-audit-publish: two tables alike but
+for their rows exchange names in one commit) and the identity sequence a clone shares with its source.
 
   history_check.py [--new target/release/pondra] [--work DIR] [--port 9760]
 
@@ -226,6 +227,68 @@ def history_check(bin, work, port):
     checks["a clone and its source change apart; their merges and expiry, and the source dropped, take none of the other's files; refused: publishing a clone, its past before the clone"] = \
         apart == [(900, 902, "f0", "clone changed")] and "is a clone" in published and "its past is kept from version" in past \
         and still and merged and after == [(902, 902, sum(r[1] for r in source) + 7001)]
+
+    # ALTER TABLE … SWAP WITH (write-audit-publish): two tables alike but for their rows exchange names.
+    q("CREATE TABLE ow (id BIGINT, v VARCHAR)")
+    q("INSERT INTO ow VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+    q("CREATE VIEW ow_count AS SELECT count(*) AS n FROM ow")
+    q("COMMENT ON TABLE ow IS 'the orders'")
+    q("CREATE TABLE ow_wap CLONE ow")
+    q("INSERT INTO ow_wap VALUES (4, 'd')")
+    q("UPDATE ow_wap SET v = 'B' WHERE id = 2")
+    wap_ids = rows("SELECT id, _row_id FROM ow_wap ORDER BY id")
+    q("INSERT INTO ow VALUES (5, 'e')")  # (still in the log when they swap)
+    q("ALTER TABLE ow SWAP WITH ow_wap")
+    checks["ALTER TABLE … SWAP WITH: each table's rows (ids, changes, those in the log) under the other's name; the view and the comment stay with the name"] = \
+        rows("SELECT id, v FROM ow ORDER BY id") == [(1, "a"), (2, "B"), (3, "c"), (4, "d")] \
+        and rows("SELECT id FROM ow_wap ORDER BY id") == [(1,), (2,), (3,), (5,)] \
+        and rows("SELECT id, _row_id FROM ow ORDER BY id") == wap_ids and rows("SELECT n FROM ow_count") == [(4,)] \
+        and "COMMENT ON TABLE ow IS 'the orders'" in q("SHOW CREATE TABLE ow")[0]["definition"]
+    before = (rows("SELECT id, v FROM ow ORDER BY id"), rows("SELECT id, v FROM ow_wap ORDER BY id"))
+    q("CHECKPOINT")
+    tiered = (rows("SELECT id, v FROM ow ORDER BY id"), rows("SELECT id, v FROM ow_wap ORDER BY id"))
+    q("INSERT INTO ow VALUES (6, 'f')")
+    q("UPDATE ow SET v = 'x' WHERE id = 1")
+    q("DELETE FROM ow_wap WHERE id = 5")
+    checks["…the same after tiering, and both take writes and changes"] = \
+        tiered == before and rows("SELECT id, v FROM ow ORDER BY id") == [(1, "x"), (2, "B"), (3, "c"), (4, "d"), (6, "f")] \
+        and rows("SELECT id, v FROM ow_wap ORDER BY id") == [(1, "a"), (2, "b"), (3, "c")]
+    ow_rows, wap_rows = rows("SELECT id, v FROM ow ORDER BY id"), rows("SELECT id, v FROM ow_wap ORDER BY id")
+    q("DROP TABLE ow_wap")
+    q("UNDROP TABLE ow_wap")
+    q("ALTER TABLE ow SWAP WITH ow_wap")
+    checks["a swap undone: DROP, UNDROP and SWAP again give each its rows back"] = \
+        rows("SELECT id, v FROM ow ORDER BY id") == wap_rows == [(1, "a"), (2, "b"), (3, "c")] and rows("SELECT id, v FROM ow_wap ORDER BY id") == ow_rows
+    itself = refused("ALTER TABLE ow SWAP WITH ow")
+    as_view = refused("ALTER TABLE ow SWAP WITH ow_count")
+    q("CREATE TABLE ow_other (id BIGINT, v VARCHAR, w INT)")
+    unlike = refused("ALTER TABLE ow SWAP WITH ow_other")
+    q("CREATE MATERIALIZED VIEW ow_mv AS SELECT count(*) AS n FROM ow_other")
+    q("CREATE TABLE ow_other2 CLONE ow_other")
+    followed = refused("ALTER TABLE ow_other SWAP WITH ow_other2")
+    q("CREATE TABLE ow_pub (id BIGINT, v VARCHAR, w INT) WITH (publish = 'delta')")  # (a clone can't be published: its own table is)
+    q("CREATE TABLE ow_pub2 CLONE ow_pub")
+    published = refused("ALTER TABLE ow_pub SWAP WITH ow_pub2")
+    published_b = refused("ALTER TABLE ow_pub2 SWAP WITH ow_pub")
+    q("CREATE TABLE ow_sh (id BIGINT, v VARCHAR, w INT)")
+    q("CREATE TABLE ow_sh2 CLONE ow_sh")
+    q("CREATE SHARE ow_share")
+    q("ALTER SHARE ow_share ADD TABLE ow_sh")
+    shared = refused("ALTER TABLE ow_sh2 SWAP WITH ow_sh")
+    checks["SWAP refused by name: itself, a view, tables not alike, one a materialized view follows, a published one (either side), a shared one"] = \
+        "itself" in itself and "is a view" in as_view and "differ in more than their rows" in unlike and "followed by" in followed \
+        and "published" in published and "published" in published_b and "is in share ow_share" in shared
+    q("CREATE TABLE sq (id BIGINT GENERATED ALWAYS AS IDENTITY, v VARCHAR)")
+    q("INSERT INTO sq (v) VALUES ('a')")
+    q("CREATE TABLE sq2 CLONE sq")
+    q("DROP TABLE sq2 PURGE")
+    q("INSERT INTO sq (v) VALUES ('b')")  # (the source's sequence outlived its clone)
+    q("CREATE TABLE sq3 CLONE sq")
+    q("DROP TABLE sq PURGE")
+    q("INSERT INTO sq3 (v) VALUES ('c')")  # (and the clone's, its source)
+    distinct = rows("SELECT count(DISTINCT id), count(*) FROM sq3")
+    checks["a clone's identity sequence outlives the clone, and its source: DROP … PURGE of either leaves the other numbering rows"] = \
+        distinct[0][0] == distinct[0][1] == 3
 
     # From `pondra sql`, with no node running.
     n.stop()

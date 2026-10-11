@@ -229,6 +229,7 @@ pub enum Ddl {
     DropDatabase { name: String, if_exists: bool }, // a folder of databases' (`dbserver.rs`): its node stopped, its folder deleted (ADR-030)
     AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
     RenameTable { name: String, to: String }, // ALTER TABLE | VIEW … RENAME TO (ADR-030)
+    Swap { name: String, with: String }, // ALTER TABLE … SWAP WITH … (write-audit-publish)
     CreateRoutine { name: String, routine: crate::routines::Routine, replace: bool }, // CREATE MACRO, CREATE PROCEDURE (ADR-023)
     DropRoutine { name: String, if_exists: bool },
     CreateSecret { name: String, params: std::collections::BTreeMap<String, String>, replace: bool, if_not_exists: bool }, // (ADR-026: `ext.rs`)
@@ -289,6 +290,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::CreateMaterialized { name, sql, options } => Ddl::CreateMaterialized { name: here(name), sql, options },
         Ddl::DropView { name, if_exists } => Ddl::DropView { name: here(name), if_exists },
         Ddl::RenameTable { name, to } => Ddl::RenameTable { name: here(name), to },
+        Ddl::Swap { name, with } => Ddl::Swap { name: here(name), with: here(with) },
         Ddl::CreateRoutine { name, routine, replace } => Ddl::CreateRoutine { name: here(name), routine, replace },
         Ddl::DropRoutine { name, if_exists } => Ddl::DropRoutine { name: here(name), if_exists },
         Ddl::Unless { name, kind, then } => Ddl::Unless { name: here(name), kind, then },
@@ -476,6 +478,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         }
         Ddl::AlterColumn { table, column, change } => alter_column(lake, &table, &column, change).await,
         Ddl::RenameTable { name, to } => rename(lake, &name, &to).await,
+        Ddl::Swap { name, with } => swap(lake, &name, &with).await,
         Ddl::CreateRoutine { name, routine, replace } => crate::routines::create(lake, &name, routine, replace).await,
         Ddl::DropRoutine { name, if_exists } => crate::routines::drop(lake, &name, if_exists).await,
         Ddl::CreateSecret { name, params, replace, if_not_exists } => crate::ext::create(lake, &name, params, replace, if_not_exists).await,
@@ -1009,6 +1012,86 @@ async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
         return Ok(j!({"table": name, "renamed": to}));
     }
     bail!("{name} kept taking rows while it was renamed: try again when its writers pause")
+}
+
+/// `ALTER TABLE a SWAP WITH b` (write-audit-publish): two tables alike but for their rows exchange
+/// names in one commit. Each keeps its files, row ids, past, changed rows and folder, under the
+/// other's name, so a table written beside the one readers use is published by one step. Comments,
+/// indexes and grants stay with the names, and a stored view reads whichever table has its name now.
+/// Refused for what would change a table's definition or leave its readers reading the wrong rows
+/// (`swappable`, `alike`).
+async fn swap(lake: &Lake, name: &str, with: &str) -> Result<Value> {
+    let a = local(lake, name).ok_or_else(|| anyhow::anyhow!("{name} is an attached lake's: swap it from a node of that lake"))?;
+    let b = local(lake, with).ok_or_else(|| anyhow::anyhow!("{with} is an attached lake's: swap it from a node of that lake"))?;
+    ensure!(a != b, "{a} is swapped with itself: name two tables");
+    swappable(lake, &a).await?;
+    swappable(lake, &b).await?;
+    alike(lake, &a, &b).await?;
+    // Their rows in the log go to files first, as rename does: a row left there would show under the
+    // other table's name after the swap.
+    let (da, db) = (crate::sys::deleted(&a), crate::sys::deleted(&b));
+    for _ in 0..10 {
+        if to_files(lake, &[a.clone(), da.clone(), b.clone(), db.clone()]).await? {
+            exchange(lake, &a, &b).await?;
+            return Ok(j!({"table": a, "swapped": b}));
+        }
+    }
+    bail!("{a} and {b} kept taking rows while they were swapped: try again when their writers pause")
+}
+
+/// What a swap needs of one of its tables: a table, not a view or part of a materialized view,
+/// that nothing keeps rows derived from, and that no other engine reads or a share hands out.
+async fn swappable(lake: &Lake, n: &str) -> Result<()> {
+    ensure!(lake.cat.get::<StoredView>(&query_key(n)).await?.is_none(), "{n} is a view: a swap exchanges two tables (CREATE OR REPLACE VIEW changes a view)");
+    let owner = n.strip_suffix("_final").unwrap_or(n);
+    ensure!(lake.cat.get::<Value>(&crate::views::view_key(n)).await?.is_none(), "{n} is a materialized view: they aren't swapped");
+    ensure!(!crate::sys::hidden(n) && lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{n} is part of materialized view {owner}");
+    ensure!(lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(n))).await?.is_none(), "{n} is a materialized view: they aren't swapped");
+    let meta = lake.cat.get::<TableMeta>(&table_key(n)).await?.ok_or_else(|| anyhow::anyhow!("no table {n}"))?;
+    // (a stored view reads by name, so it keeps working after a swap; what keeps rows derived from the table does not)
+    let followers: Vec<String> = readers(lake, n).await?.into_iter().filter(|r| !r.starts_with("view ")).collect();
+    ensure!(followers.is_empty(), "{n} is followed by {}: they keep rows derived from what it holds, so drop them first", followers.join(", "));
+    // (a share publishes its table as Delta, so its share is named before its publishing)
+    if let Some((s, _)) = crate::shares::shares(lake).await?.into_iter().find(|(_, s)| s.tables.iter().any(|x| x.table == n)) {
+        bail!("{n} is in share {s}: its recipients read its files by name");
+    }
+    ensure!(meta.publish.is_empty(), "{n} is published ({}): other engines read its folder, which a swap doesn't move", meta.publish.join(", "));
+    Ok(())
+}
+
+/// Two tables swap only when they differ in nothing but their rows: the same definition (what a
+/// deploy and a protected database see) and the same stored columns, which the files are read by.
+async fn alike(lake: &Lake, a: &str, b: &str) -> Result<()> {
+    let ma = lake.cat.get::<TableMeta>(&table_key(a)).await?.ok_or_else(|| anyhow::anyhow!("no table {a}"))?;
+    let mb = lake.cat.get::<TableMeta>(&table_key(b)).await?.ok_or_else(|| anyhow::anyhow!("no table {b}"))?;
+    let same = crate::objects::table_sql("t", &ma) == crate::objects::table_sql("t", &mb) && ma.columns == mb.columns && ma.names == mb.names && ma.dropped == mb.dropped;
+    ensure!(same, "{a} and {b} differ in more than their rows: a swap exchanges two tables alike (CREATE TABLE {b} CLONE {a} makes one)");
+    Ok(())
+}
+
+/// The swap itself, in one commit (leader). Each name takes the other's entry, and its `$deleted`
+/// entry (or none, when the other had none), keeping the folder it had. Every moved entry takes the
+/// largest of the four `tiered` marks: a table reads its log rows after its mark, by name, and the
+/// log between the two marks holds rows the other table wrote under this name, already in its files.
+/// Nothing of either table is in the log past its own mark (`to_files`), so moving a mark up skips
+/// nothing of its own.
+async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<()> {
+    let (da, db) = (crate::sys::deleted(a), crate::sys::deleted(b));
+    let (ea, eb) = (lake.cat.get::<TableMeta>(&table_key(a)).await?, lake.cat.get::<TableMeta>(&table_key(b)).await?);
+    let (eda, edb) = (lake.cat.get::<TableMeta>(&table_key(&da)).await?, lake.cat.get::<TableMeta>(&table_key(&db)).await?);
+    let mark = [&ea, &eb, &eda, &edb].into_iter().flatten().map(|m| m.tiered).max().unwrap_or(0);
+    let (mut puts, mut gone) = (vec![], vec![]);
+    for (to, from, from_name) in [(a, eb, b), (b, ea, a), (&da[..], edb, &db[..]), (&db[..], eda, &da[..])] {
+        match from {
+            Some(mut m) => {
+                m.folder = Some(m.folder(from_name).to_string());
+                m.tiered = mark;
+                puts.push((table_key(to), json(&m)));
+            }
+            None => gone.push(table_key(to)), // (the other had no changed rows: none is left under this name)
+        }
+    }
+    lake.cat.commit(puts, &gone).await
 }
 
 /// A folder under `data/` for a new table: its name's, unless another table has that one (a
