@@ -122,6 +122,7 @@ pub static PARTS: &[Part] = &[
     Part { name: "parameter", inside: &["function", "macro", "table function", "procedure"], about: "an argument a routine takes, with its type and default", also: &["argument"] },
     Part { name: "label", inside: &["type"], about: "one value an enum type allows", also: &["enum value"] },
     Part { name: "expectation", inside: &["materialized view"], about: "a condition a view's new rows are counted against, and kept, dropped or failed by", also: &["data quality check", "assertion"] },
+    Part { name: "load", inside: &["table"], about: "a file COPY INTO loaded into it, once a version: its path, version and rows (pondra.loads)", also: &["file load", "ingest record"] },
 ];
 
 /// The patterns: ways of using objects and parts together, nothing stored, listed beside the kinds.

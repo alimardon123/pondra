@@ -317,7 +317,7 @@ impl Auth {
 /// anything else.
 pub fn needs(stmt: &Stmt) -> (String, Vec<&'static str>) {
     match stmt {
-        Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) => (catalog_name(t), vec!["insert"]),
+        Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::CopyInto(t, ..) => (catalog_name(t), vec!["insert"]), // (COPY INTO's rows are an INSERT's)
         Stmt::Update(t, ..) => (catalog_name(t), vec!["update"]),
         Stmt::Delete(t, _) => (catalog_name(t), vec!["delete"]),
         Stmt::Merge(m) => (catalog_name(&m.target), m.privileges()),
