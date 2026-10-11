@@ -107,8 +107,8 @@ async function misc(dir) {
     await db.writeTable("wrows", ROWS);
     return db.table("wrows").rows();
   });
-  await check("write_replace", async () => {
-    await db.writeTable("wrows", ROWS_AGAIN, { mode: "replace" });
+  await check("write_overwrite", async () => {
+    await db.writeTable("wrows", ROWS_AGAIN, { mode: "overwrite" });
     return db.table("wrows").rows();
   });
   await check("write_append", async () => {

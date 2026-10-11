@@ -161,10 +161,11 @@ export class Pondra {
   readIceberg(source, options = {}) { return scan(this, "read_iceberg", source, options); }
 
   /** Rows into a table: a frame, a query's SQL text, or an array of row objects. `mode`: "create" (a
-   * new table: an error if it's there), "append", or "replace" (dropped, then made). Rows make the
-   * table's columns from their values (see `typeOfColumn`), then are appended exactly once. */
+   * new table: an error if it's there), "append", or "overwrite" (dropped, then made), as Python's
+   * `write_table`. Rows make the table's columns from their values (see `typeOfColumn`), then are
+   * appended exactly once. */
   async writeTable(name, data, { mode = "create" } = {}) {
-    if (!["create", "append", "replace"].includes(mode)) throw new Error(`mode ${mode}: create, append or replace`);
+    if (!["create", "append", "overwrite"].includes(mode)) throw new Error(`mode ${mode}: create, append or overwrite`);
     if (data instanceof Frame) return data.writeTable(name, { mode });
     if (typeof data === "string") {
       if (!isQuery(data)) throw new Error("writeTable(name, text): the text is a query (SELECT …)");
@@ -174,7 +175,7 @@ export class Pondra {
     if (mode === "append") return data.length ? this.append(name, data) : null;
     if (!data.length) throw new Error("writeTable: no rows, so no columns to make the table with (write a frame, or some rows)");
     const columns = columnsOf(data);
-    if (mode === "replace") await this.sql(`DROP TABLE IF EXISTS ${name}`);
+    if (mode === "overwrite") await this.sql(`DROP TABLE IF EXISTS ${name}`);
     await this.sql(`CREATE TABLE ${name} (${columns.map(([c, t]) => `${quote(c)} ${t}`).join(", ")})`);
     return this.append(name, data);
   }

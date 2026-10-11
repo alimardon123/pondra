@@ -5,16 +5,16 @@
    the same SQL text, the same column names, and equal rows (sorted unless the pipeline sorts; floats
    to a relative 1e-9). Python starts the node (pondra.local()); the JavaScript side connects to it.
 2. `await db.sql("SELECT 1 AS x")` is [{x: 1}]; `CREATE TABLE t2 (a INT)`; `readParquet` of a Parquet
-   file this check writes; `writeTable` with rows (create, replace, append) and with a frame, each
+   file this check writes; `writeTable` with rows (create, overwrite, append) and with a frame, each
    read back. JavaScript starts this node itself (a node's reads of local files need the program that
    started it: invariant 61), after the first node is closed: one node at a time.
 
-  python3 tools/js_frames_check.py [--port 8831] [--bin /home/user/pondra/target/release/pondra]
+  python3 tools/js_frames_check.py [--port 8831] [--bin target/release/pondra]
 
-The binary is waited for: the check looks every 30 seconds until it exists. Needs node (18+), pyarrow.
+Needs node (18+) and pyarrow; the binary is `--bin`, else `PONDRA_BIN`, else the release build.
 Prints "ok …" or "FAIL …" for each check, and exits 1 on any failure.
 """
-import argparse, datetime as dt, decimal, json, math, os, random, shutil, subprocess, sys, tempfile, time
+import argparse, datetime as dt, decimal, json, math, os, random, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 JS = os.path.join(HERE, "js_frames_pipelines.mjs")
@@ -26,7 +26,7 @@ import pyarrow.parquet as pq
 import pondra
 from pondra import col, lit, when
 
-DEFAULT_BIN = "/home/user/pondra/target/release/pondra"
+DEFAULT_BIN = os.environ.get("PONDRA_BIN", os.path.join(HERE, "..", "target", "release", "pondra"))
 
 
 # ---------------------------------------------------------------- the tables (frames_check.py's data())
@@ -149,16 +149,6 @@ def compare_rows(ours, theirs, ordered):
 
 # ---------------------------------------------------------------- running
 
-def wait_for_binary(path, every=30):
-    """The node's binary, once the other build has made it: checked every `every` seconds."""
-    announced = False
-    while not os.path.isfile(path):
-        if not announced:
-            print(f"waiting for {path} (checked every {every} s)", flush=True)
-            announced = True
-        time.sleep(every)
-
-
 def run_node(args, timeout):
     """tools/js_frames_pipelines.mjs's answer (its JSON on stdout)."""
     done = subprocess.run(["node", JS, *args], capture_output=True, text=True, timeout=timeout)
@@ -238,7 +228,7 @@ def misc_check(report, tmp):
         ("read_parquet", everything, "readParquet of the Parquet file: all 5 rows"),
         ("write_rows", [{"id": 1, "name": "ann", "score": 2.5, "ok": True, "at": "2026-09-01T12:00:00"}, {"id": 2, "score": 3.0, "ok": False}],
          "writeTable with rows (a fraction, text, a boolean, a date, a null)"),
-        ("write_replace", [{"id": 7, "name": "bo", "score": 0.25, "ok": False, "at": "2026-09-02T00:00:00"}], "writeTable replace: the old rows gone"),
+        ("write_overwrite", [{"id": 7, "name": "bo", "score": 0.25, "ok": False, "at": "2026-09-02T00:00:00"}], "writeTable overwrite: the old rows gone"),
         ("write_append", [{"id": 7, "name": "bo", "score": 0.25, "ok": False, "at": "2026-09-02T00:00:00"}, {"id": 9, "name": "cy", "score": 1.0, "ok": True}],
          "writeTable append: one more row"),
         ("write_frame", [r for r in everything if r["v"] > 2], "writeTable of a frame (readParquet, filtered): its rows"),
@@ -260,7 +250,10 @@ def main():
     if not shutil.which("node"):
         print("FAIL node: not on PATH (node 18 or later runs js/frame.js)", flush=True)
         sys.exit(1)
-    wait_for_binary(A.bin)
+    if not os.path.isfile(A.bin):
+        print(f"FAIL the binary: {A.bin} isn't there (cargo build --release, or --bin)", flush=True)
+        sys.exit(1)
+    A.bin = os.path.abspath(A.bin)
     os.environ["PONDRA_BIN"] = A.bin  # (for pondra.local() here, and for the JavaScript side's local())
     tmp = tempfile.mkdtemp(prefix="pondra-js-frames-")
     report = Report()

@@ -807,17 +807,16 @@ export class Frame {
     return new Frame(this._con, `SELECT * FROM ${name}`, { rel: name, table: name, waits: [handled(made)] });
   }
 
-  /** Its rows into a table: `create` (CREATE TABLE … AS), `append` (INSERT), `replace` (a new table in
-   * its place; frame.py's `overwrite`). */
+  /** Its rows into a table: `create` (CREATE TABLE … AS), `append` (INSERT) or `overwrite` (a new
+   * table in its place), as Python's `write_table`. */
   async writeTable(name, { mode = "create" } = {}) {
     const text = await this.sql();
     const bodies = new Map([
       ["create", `CREATE TABLE ${name} AS ${text}`],
       ["append", `INSERT INTO ${name} ${text}`],
-      ["replace", `DROP TABLE IF EXISTS ${name}; CREATE TABLE ${name} AS ${text}`],
       ["overwrite", `DROP TABLE IF EXISTS ${name}; CREATE TABLE ${name} AS ${text}`],
     ]);
-    if (!bodies.has(mode)) throw new Error(`mode ${mode}: create, append or replace`);
+    if (!bodies.has(mode)) throw new Error(`mode ${mode}: create, append or overwrite`);
     return this._con.sql(bodies.get(mode), this._params);
   }
 
