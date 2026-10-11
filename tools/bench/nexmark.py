@@ -17,8 +17,9 @@ same events, and Flink's streams against DuckDB's rows (`--check`).
 Three of Flink's queries are left out, each for a reason other than SQL: q6 (Flink doesn't run
 it), q10 (it writes files), q12 (processing-time windows: answers depend on the machine's clock).
 
-  nexmark.py [--events 10000000] [--engines pondra,flink] [--only q3,q9] [--alone] [--check]
-  (Flink: PyFlink 2.3 in $FLINK_PYTHON, or /home/claude/venv-flink)
+  nexmark.py [--events 10000000] [--engines pondra,flink] [--only q3,q9] [--alone] [--check] [--flink-state rocksdb|heap]
+  (Flink: PyFlink 2.3 in $FLINK_PYTHON, or /home/claude/venv-flink; its state in RocksDB as Flink's own Nexmark
+  setup keeps it, or on the heap, faster alone, which at 10M events on 15 GB failed with all twenty at once)
 """
 import argparse, io, json, os, shutil, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -449,18 +450,26 @@ def pondra(n, names, port=8290):
         shutil.rmtree(lake, ignore_errors=True)
 
 
-def flink(n, names, venv=os.environ.get("FLINK_PYTHON", "/home/claude/venv-flink/bin/python"), check=False):
+def flink(n, names, venv=os.environ.get("FLINK_PYTHON", "/home/claude/venv-flink/bin/python"), check=False, state="rocksdb"):
     """Each query alone, then all of them over one source (`flink_nexmark.py`)."""
     here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flink_nexmark.py")
     d = Dialect(True)
     spec = {"counts": counts(n), "streams": {s: [(c, t, sql) for c, t, sql in columns(s, d)] for s in STREAMS},
-            "queries": {k: QUERIES[k]["flink"] for k in names}, "side_input": [[i, f"label-{i % 97}"] for i in range(10000)], "check": check}
+            "queries": {k: QUERIES[k]["flink"] for k in names}, "side_input": [[i, f"label-{i % 97}"] for i in range(10000)], "check": check,
+            "state": state, "managed": f"{max(ram_gb() // 3, 1)}g"}
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(spec, f)
-    r = subprocess.run([venv, here, f.name], capture_output=True, text=True, timeout=7200)
+    # Flink's heap, unless JVM_ARGS says otherwise (flink_nexmark.py says why): two thirds of the machine's memory with
+    # state on the heap, a third with RocksDB, which has another third as managed memory.
+    jvm = os.environ.get("JVM_ARGS") or f"-Xmx{max(ram_gb() * (2 if state == 'heap' else 1) // 3, 1)}g"
+    r = subprocess.run([venv, here, f.name], capture_output=True, text=True, timeout=7200, env={**os.environ, "JVM_ARGS": jvm})
     os.unlink(f.name)
     lines = [l for l in r.stdout.splitlines() if l.startswith("{")]
     return json.loads(lines[-1]) if lines else {"engine": "flink", "error": r.stderr[-2000:]}
+
+
+def ram_gb():
+    return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") >> 30
 
 
 def check_streams(n):
@@ -486,13 +495,14 @@ if __name__ == "__main__":
     ap.add_argument("--only", default=",".join(QUERIES))
     ap.add_argument("--alone", action="store_true", help="Pondra: each query by itself too, after all of them at once")
     ap.add_argument("--check", action="store_true", help="Flink's streams against DuckDB's rows, then stop")
+    ap.add_argument("--flink-state", default="rocksdb", choices=["rocksdb", "heap"], help="where Flink keeps state (rocksdb: as Flink's own Nexmark setup)")
     a = ap.parse_args()
     names = a.only.split(",")
     if a.check:
         print(json.dumps(check_streams(a.events)), flush=True)
         sys.exit(0)
     for e in a.engines.split(","):
-        out = {"pondra": pondra, "flink": flink}[e](a.events, names)
+        out = pondra(a.events, names) if e == "pondra" else flink(a.events, names, state=a.flink_state)
         if e == "pondra" and a.alone:
             each = {k: pondra(a.events, [k]) for k in names if k not in out["refused"]}
             out["alone_s"] = {k: r["done_s"][k] for k, r in each.items() if k in r["done_s"]}

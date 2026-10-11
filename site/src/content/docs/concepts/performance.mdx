@@ -175,11 +175,14 @@ More streaming numbers:
   Fluss and checkpoints to do this, so they weren't run on it.
 - **A 3-node cluster,** producers writing to the followers: 4.3 to 4.6 million events a second, durable
   and exactly-once. The leader used 26 to 28% of the CPU.
-- **Nexmark** (queries q1, q2, q5, q7, q11, over 10 million bids, measured again on 2026-10-02 on
-  the 4-core machine): Pondra took 7.1 s for all five over one stream and Flink 2.3 16.2 s (Flink's
-  6.6 s to start not counted). Pondra took the bids over HTTP (5.5 s of the 7.1) and wrote every
-  view to the lake, and its answers equal DuckDB's; Flink generated the bids in its own process,
-  into blackhole sinks. On 2 vCPUs, the day before, it was 14.3 s against 30.4 s.
+- **Nexmark** (20 of the 23 queries in Flink's suite, over 10 million events, measured on 2026-10-11
+  on the 4-core machine; `nexmark.py` says why three are left out): with every query a view at
+  once, Pondra's last answer came 80 s after the first event (the median of three runs), every
+  answer equal to DuckDB's. It took the events over HTTP and committed them to the lake as they
+  came (53 s of the 80). Flink 2.3, generating the events in its own process into blackhole sinks,
+  took 685 s for the 20 at once with RocksDB state, and failed after 18 minutes with its state on a
+  10 GB heap. Each query alone, Pondra was faster than Flink's better run on 10 of the 20; the
+  slowest of Pondra's is q18 (each bidder's latest bid on an auction), 42.6 s against Flink's 31.7.
 - **A flow** (views following views, [Flows](/pondra/guides/flows/)): 4 producers, 1,000-row
   batches over HTTP: no view 183,000 rows a second; a filter with two expectations 156,000; then an
   aggregate of it 135,000; then a rollup of that 131,000. At every acknowledgement each stage already
@@ -383,7 +386,7 @@ The repository has the benchmarks behind this page. Each prints its own numbers:
 python3 tools/bench/tpch.py --data sf1        # TPC-H on Pondra, DuckDB and Spark
 python3 tools/bench/singlenode.py             # TPC-H against DuckDB, Polars, Daft and Bodo
 ENGINES=pondra,spark,flink python3 tools/bench/run.py batch 20000000   # batch, streaming and ETL
-python3 tools/bench/nexmark.py                # Nexmark q1, q2, q5, q7, q11, Pondra and Flink
+python3 tools/bench/nexmark.py                # Nexmark's 20 queries, Pondra and Flink
 python3 tools/serve_bench.py --keys 2000000   # point lookups and dashboards: p50, p99, QPS
 python3 tools/freshness.py                    # who sees a write when
 python3 tools/kafka_bench.py                  # Kafka ingest throughput and latency
