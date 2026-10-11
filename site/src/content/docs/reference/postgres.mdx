@@ -37,7 +37,7 @@ The roles are the same as for [HTTP](/pondra/reference/http/#roles): `reader` ma
 also insert, update, delete and copy in, and `admin` may also create tables and other objects.
 
 ```bash norun
-psql "postgresql://reader:$READ_TOKEN@db.example.com:5432/lake"
+psql "postgresql://reader:$READ_TOKEN@db.example.com:5432/lake?sslmode=require"
 ```
 
 <Tabs syncKey="lang">

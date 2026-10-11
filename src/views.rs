@@ -1379,7 +1379,8 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
             tables.push(t);
         }
     }
-    ensure!(tables.len() == 2 && tables[0] == source, "join = 'streams': the query joins two append tables of this lake (it names {tables:?})");
+    let named = if tables.is_empty() { "none".to_string() } else { tables.join(", ") };
+    ensure!(tables.len() == 2 && tables[0] == source, "join = 'streams': the query joins {source} with one other append table of this lake (the append tables it reads: {named})");
     for t in &tables {
         let kept = lake.cat.get::<View>(&view_key(t)).await?.is_some_and(|v| v.rerun.is_some());
         ensure!(!kept, "{t} is kept by key: its rows are replaced as their groups are worked out again, and a stream join pairs each row once. Join its own source");

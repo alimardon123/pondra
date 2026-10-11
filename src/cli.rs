@@ -289,9 +289,54 @@ pub fn main() {
     }
 }
 
+/// The shell's lake, guessed as `serve PATH` guesses one (invariant 142): a word that isn't a folder
+/// and is a command with a letter left out or two swapped is that command mistyped, and a folder
+/// holding other things is never made a lake. (A word longer than a command is a name: `test2`.)
+async fn opened(lake: &str, given: bool) -> anyhow::Result<()> {
+    let path = std::path::Path::new(lake);
+    if lake.contains("://") || (!given && !path.exists()) {
+        return Ok(());
+    }
+    anyhow::ensure!(!path.is_file(), "{lake} is a file, and pondra opens a lake (a folder): run pondra, then read it with FROM '{lake}'");
+    if !path.exists() {
+        let commands = <Cli as clap::CommandFactory>::command();
+        if let Some(c) = commands.get_subcommands().filter(|c| !c.is_hide_set()).map(|c| c.get_name()).find(|c| mistyped(lake, c)) {
+            anyhow::bail!("no command {lake}: did you mean `pondra {c}`? (a new lake named {lake}: pondra ./{lake})");
+        }
+        return Ok(());
+    }
+    if dbserver::holds_lakes(lake).await? {
+        anyhow::bail!("{lake} holds lakes, each a database: open one (pondra {lake}/<name>), or serve them all (pondra serve --lakes {lake})");
+    }
+    let empty = std::fs::read_dir(lake).map_or(true, |mut d| d.next().is_none());
+    anyhow::ensure!(empty || dbserver::is_lake(lake).await?, "{lake} holds other things than a lake: open a lake in it (pondra {lake}/lake)");
+    Ok(())
+}
+
+/// Is `word` the command `c` with one letter left out, changed, or swapped with the next?
+fn mistyped(word: &str, c: &str) -> bool {
+    let (w, c): (Vec<char>, Vec<char>) = (word.chars().collect(), c.chars().collect());
+    if c.len() < 4 {
+        return false; // (`sq`, `fun`: a short name is as likely a lake's)
+    }
+    match c.len().checked_sub(w.len()) {
+        Some(0) => {
+            let off: Vec<usize> = (0..w.len()).filter(|&i| w[i] != c[i]).collect();
+            off.len() == 1 || (off.len() == 2 && off[1] == off[0] + 1 && w[off[0]] == c[off[1]] && w[off[1]] == c[off[0]])
+        }
+        Some(1) => (0..c.len()).any(|i| c[..i] == w[..i] && c[i + 1..] == w[i..]),
+        _ => false,
+    }
+}
+
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let Some(cmd) = cli.cmd else { return shell::run(&cli.lake.unwrap_or_else(|| "lake".into())).await };
+    let Some(cmd) = cli.cmd else {
+        let given = cli.lake.is_some();
+        let lake = cli.lake.unwrap_or_else(|| "lake".into());
+        opened(&lake, given).await?;
+        return shell::run(&lake).await;
+    };
     match cmd {
         Cmd::Serve { path, dir, databases, default, addr, advertise, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, tls_cert, tls_key, tls_ca, attach: attached, attach_found, stop_with_stdin, python } => {
             for (flag, var) in [(tls_cert, "PONDRA_TLS_CERT"), (tls_key, "PONDRA_TLS_KEY"), (tls_ca, "PONDRA_TLS_CA")] {
@@ -771,4 +816,17 @@ where
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_command_mistyped() {
+        for (word, c) in [("serv", "serve"), ("sevre", "serve"), ("sorve", "serve"), ("aply", "apply"), ("stauts", "status")] {
+            assert!(super::mistyped(word, c), "{word} for {c}");
+        }
+        for (word, c) in [("serve", "serve"), ("test2", "test"), ("tests", "test"), ("sales", "apply"), ("sq", "sql"), ("lake", "plan")] {
+            assert!(!super::mistyped(word, c), "{word} isn't {c}");
+        }
+    }
 }

@@ -46,7 +46,7 @@ message as the body.
 | `200` | the answer | the JSON or text the route describes |
 | `204` | a change with no answer: `PUT /console/settings`, an Iceberg table's commit or drop, a rename | empty |
 | `304` | a console file that hasn't changed, when `If-None-Match` names its `ETag` | empty |
-| `400` | a request the route can't use: a folder of lakes' bad name, an Iceberg `POST /v1/namespaces` (use `CREATE SCHEMA`), a Delta Sharing feature not yet offered | text, or an Iceberg or Delta Sharing error object |
+| `400` | a request the route can't use: a folder of lakes' bad name, a Delta Sharing feature not yet offered | text, or an Iceberg or Delta Sharing error object |
 | `401` | no token, a wrong token, or a wrong user name or password. A `POST /login` with a wrong password is `401` too | `sign in: a token, or a user's name and password`, `wrong token, or user name and password`, `wrong user name or password` |
 | `403` | the token or user has too few rights for the route. Also a plain request from another machine when the node takes TLS | `this needs more rights than this token's or user's`, or the TLS message |
 | `404` | no such file, version, namespace or table; an unknown path; a folder's database that can't be started | the name, and the reason |

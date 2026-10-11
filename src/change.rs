@@ -239,7 +239,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
     ensure!(view.is_none(), "{table} is a view's: change the table it follows");
     if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", format!("{table} is a merge table: its rows add up as they're read, so UPDATE and DELETE aren't taken; insert rows that add up to the change"))); }
     let append = meta.key.is_empty();
-    ensure!(meta.ids || !append, "{table} holds rows from before row ids (made before Pondra 0.19): copy it once (CREATE TABLE t2 AS SELECT * FROM {table}) and change the copy");
+    ensure!(meta.ids || !append, "{table} was made before Pondra 0.19, and its rows have no row ids, which UPDATE, DELETE and MERGE need: copy it once (CREATE TABLE t2 AS SELECT * FROM {table}) and change the copy");
     let upto = lake.visible(); // (one snapshot for every query below: the lock keeps its files)
     let point = match &stmt {
         crate::write::Stmt::Update(_, set, Some(cond)) if !append => crate::txn::point_change(lake, &table, &stored, None, set, cond).await?, // (one key: no planning, ADR-036 §6)

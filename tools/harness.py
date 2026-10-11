@@ -300,7 +300,7 @@ def external():
             "not owner": _raises_text(lambda: call(A.port, "POST", "/sql", b"CREATE EXTERNAL TABLE z STORED AS PARQUET LOCATION 'dir/'"))}
     checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
         "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no files" in said["none"] \
-        and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "program that started the node" in said["not owner"]
+        and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "through a node it started itself" in said["not owner"]
     # A lake table's files are the lake's: LOCATION was dropped and the table made in the lake; and
     # a DELETE of an attached Delta table read "no table" with its path.
     placed = err(f"CREATE TABLE placed (id BIGINT) LOCATION '{here}/placed/'")
@@ -321,7 +321,7 @@ def external():
     shown = [r["name"] for r in call(A.port, "POST", "/sql", b"SHOW MATERIALIZED VIEWS")]
     q("DROP MATERIALIZED VIEW mv_kinds"); q("DROP TABLE kinds_t")
     checks["the lake's own files read as a table by any reader, and nothing else of its folder; /objects and pondra.tables say each object's kind (a materialized view's too)"] = mine == [{"a": 1, "b": "x"}] \
-        and all(("program that started the node" if not A.s3 else "no secret covers") in e for e in outside) and kinds.get("ev") == "files" and kinds.get("v") == "view" \
+        and all(("through a node it started itself" if not A.s3 else "no secret covers") in e for e in outside) and kinds.get("ev") == "files" and kinds.get("v") == "view" \
         and listed.get("ev") == "external table" and listed.get("v") == "view" and listed.get("mv_kinds") == "materialized view" and shown == ["mv_kinds"]
     reader = Node(lake, A.port + 1, reader=True, cwd=here, **({"cache_dir": tier + "2"} if A.s3 else {})).start()
     count = lambda port: call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_csv('{area}reports/q1.csv')".encode())[0]["n"]
@@ -625,7 +625,7 @@ def outside():
     by_region = f"SELECT region, count(*) AS n, sum(amount) AS s FROM {glob} GROUP BY region ORDER BY region"
     checks = {"without a secret, a URL is refused": "no secret covers" in refused(by_region),
               "…but the program that started the node reads it, with its own credentials": q(by_region, owner=True) == want,
-              "…and a path on the node's machine only for that program": "only the program that started the node" in refused("SELECT * FROM read_csv('/etc/hostname')")
+              "…and a path on the node's machine only for that program": "through a node it started itself" in refused("SELECT * FROM read_csv('/etc/hostname')")
                   and q("SELECT count(*) AS n FROM read_csv('/etc/hostname', header => false)", owner=True) == [{"n": 1}]}
     q("CREATE SECRET ext_s3 (TYPE s3, KEY_ID 'k', SECRET 'pondra-sealed-7f3a', ENDPOINT 'http://127.0.0.1:%d', SCOPE 's3://ext')" % s3p)
     q("CREATE SECRET web (TYPE http, SCOPE 'http://127.0.0.1:%d')" % webp)
@@ -710,7 +710,7 @@ def outside():
     checks["…from the Postgres port too"] = pq.read_table(io.BytesIO(got("out/pg.parquet"))).to_pylist() == [{"b": 2}]
     mine = tempfile.mkdtemp(prefix="pondra-copy-")
     checks["…to a bucket no secret covers: refused, but the node's owner may"] = ("no secret covers" in refused("COPY eu TO 's3://elsewhere/eu.parquet'")
-        and "only the program that started the node" in refused(f"COPY eu TO '{mine}/eu.parquet'")
+        and "through a node it started itself" in refused(f"COPY eu TO '{mine}/eu.parquet'")
         and q(f"COPY eu TO '{mine}/eu.parquet'", owner=True) and pq.read_table(f"{mine}/eu.parquet").num_rows == len(lines) - 1
         and q(f"SELECT count(*) AS n FROM '{mine}/*.parquet'", owner=True) == [{"n": len(lines) - 1}])
     checks["…and never into a lake, not even by the node's owner"] = "inside the lake" in refused(f"COPY eu TO '{lake}/data/eu/x.parquet'", owner=True)
@@ -5204,6 +5204,16 @@ def adopted():
     cat.drop_table("default.smaller")
     checks["renamed and dropped through the catalog"] = renamed == [{"n": 80}] and bool(_raises_text(lambda: q("SELECT * FROM smaller"))) \
         and "default.smaller" not in [".".join(t) for t in cat.list_tables("default")]
+    cat.create_namespace("crm", {"owner": "spark"})  # (Spark's CREATE NAMESPACE names its owner)
+    cat.create_table("crm.leads", schema=three)
+    listed, leads = ("crm",) in cat.list_namespaces(), q("SELECT count(*) AS n FROM crm.leads")
+    spaces = {"not empty": _raises_text(lambda: cat.drop_namespace("crm")), "there": _raises_text(lambda: cat.create_namespace("crm")),
+              "property": _raises_text(lambda: cat.create_namespace("crm2", {"location": "s3://elsewhere/"}))}
+    cat.drop_table("crm.leads")
+    cat.drop_namespace("crm")
+    checks["namespaces made and dropped through the catalog, as CREATE and DROP SCHEMA (not empty, there already, a property: refused by name)"] = \
+        listed and leads == [{"n": 0}] and ("crm",) not in cat.list_namespaces() and ("crm2",) not in cat.list_namespaces() \
+        and "isn't empty" in spaces["not empty"] and "already exists" in spaces["there"] and "location" in spaces["property"] or (listed, leads, spaces)
     [x.kill() for x in (a, b, c)]
     ok = all(checks.values())
     print(json.dumps({"adopted": checks, "ok": ok, "cpu_s": {"adopted": adopt_cpu, "copied": copy_cpu, "rows": n}}, indent=1))

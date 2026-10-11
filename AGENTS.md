@@ -1041,8 +1041,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `--kafka`, `--attach`, `--advertise`, `--attach-found`) are refused with `--lakes`, and every
    other reaches each database's node (`Options.node`). A folder whose first node has claimed a
    term but not yet made the catalog is a lake being made (`dbserver::is_lake`): nodes started at
-   once on a new folder by its name all join it (two of three exited). `harness.py server`,
-   `cluster.py race`.
+   once on a new folder by its name all join it (two of three exited). The shell's lake is guessed
+   the same way (`cli::opened`): a word that isn't a folder and is a command with a letter left out
+   or two swapped is refused with the command meant, and a folder holding other things, or lakes, is
+   never made one. `harness.py server`, `cluster.py race`, `smoke.py` ("a mistyped command isn't
+   made a lake…").
 143. **A database's node isn't stopped while in use** (`dbserver::Busy`): an open Postgres
    connection or an HTTP request (until its answer's last byte) holds it; idle time counts from
    when the last one ended; `reap` checks again under the lock before it stops one. `harness.py
@@ -1114,8 +1117,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `reserve`), never from commit numbers; a log row's place is `log::ord` (segment << 24, then its
    row), and a segment with more of a table's rows than that takes the numbers after it
    (`log::span`), which a Kafka fetch looks back over. `harness.py ids`.
-156. **The REST catalog makes, renames and drops tables as the SQL does** (`iceberg::create`,
-   `drop_table`, `rename`): each is the statement, run as the caller (DDL: an admin's); what
+156. **The REST catalog makes, renames and drops tables and namespaces as the SQL does**
+   (`iceberg::create`, `drop_table`, `rename`, `create_namespace`, `drop_namespace`): each is the
+   statement, run as the caller (DDL: an admin's); a namespace's properties but `owner`, and a
+   namespace not empty (409), are refused by name; what
    Pondra's tables can't be (a type, a spec of two fields or by bucket, a descending order, a
    staged create) is refused by name, and a table made answers its first published version.
    `harness.py adopted`.

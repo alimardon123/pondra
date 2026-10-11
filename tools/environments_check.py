@@ -530,7 +530,7 @@ def across_check(bin, work, port):
         dev.q(f"ATTACH 's3://acme-prod/prod' AS prod (READ_ONLY, ENDPOINT '{prod_url}')")
         checks["dev reads prod's tables through the attachment: prod's rows, as prod has them"] = rows(dev, "SELECT id, amount FROM prod.sales.orders ORDER BY id") == before
         writes = [refused(dev, "INSERT INTO prod.sales.orders VALUES (9, 9.0)"), refused(dev, "DELETE FROM prod.sales.orders WHERE id = 1")]
-        checks["a write to the attachment is refused by name: a read-only key here"] = all("read-only key" in w for w in writes)
+        checks["a write to the attachment is refused by name: attached here read-only"] = all("attached here read-only" in w for w in writes)
 
         # A user of dev granted CLONE on prod (attached here) branches it on dev and owns it. dev has no
         # token, but a user who signs in is limited by its own grants all the same: the grant alone lets dana.

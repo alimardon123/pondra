@@ -62,7 +62,7 @@ pub fn join(schema: &str, table: &str) -> String {
 /// parts of a name; quotes, slashes and spaces would get in the way of paths and SQL.
 pub fn check(part: &str) -> Result<()> {
     ensure!(!part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
-            "{part:?}: names are letters, digits, _ and - (a dot separates schema and table)");
+            "'{part}': names are letters, digits, _ and - (a dot separates schema and table)");
     Ok(())
 }
 

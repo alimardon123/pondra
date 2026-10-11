@@ -171,7 +171,7 @@ pub async fn statement(app: &crate::server::App, stmt: &Stmt, files: bool) -> Re
     let stored: TableMeta = lake.cat.get(&table_key(&name)).await?.with_context(|| format!("no table {name}"))?;
     let meta = stored.logical();
     ensure!(lake.cat.get::<crate::views::View>(&crate::views::view_key(&name)).await?.is_none() && meta.merge.is_empty(), "{name} is a view's: change the table it follows");
-    ensure!(meta.ids, "{name} holds rows from before row ids (made before Pondra 0.19): copy it once and change the copy");
+    ensure!(meta.ids, "{name} was made before Pondra 0.19, and its rows have no row ids, which a transaction's changes need: copy it once (CREATE TABLE t2 AS SELECT * FROM {name}) and change the copy");
     if let (Stmt::Update(_, set, Some(cond)), None) = (stmt, &insert) {
         if let Some((old, new)) = point_change(lake, &name, &stored, Some(snapshot), set, cond).await? {
             let n = new.iter().map(|b| b.num_rows()).sum::<usize>();
