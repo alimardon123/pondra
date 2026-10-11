@@ -3,7 +3,7 @@
 //! Databricks, DuckDB, Polars, Trino, Athena, Snowflake. Iceberg is in `iceberg.rs`; Delta here.
 //! A table's Parquet files already live in `data/{table}/`; this keeps that folder's
 //! `_delta_log/` in step with the catalog: one JSON commit per change to the table's file list,
-//! plus a Parquet checkpoint every 10 commits so readers never replay a long log; the last 1,000
+//! plus a Parquet checkpoint every 10 commits so readers never replay a long log; the last 100
 //! versions are kept.
 //!
 //! The catalog stays the source of truth: a commit is derived only from what the catalog has
