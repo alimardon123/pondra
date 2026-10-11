@@ -38,6 +38,7 @@ A number that is left unset, or set to something that is not a number, takes its
 | `PONDRA_LEARN` | off | `on`: the planner uses what runs learned (`pondra.learned`); by default they are learned and listed, not used |
 | `PONDRA_USER_QUERIES` | none | how many statements a user without its own `MAX_QUERIES` runs at once on a node ([quotas](/pondra/guides/security/#quotas)) |
 | `PONDRA_USER_TIMEOUT` | none | how many seconds a statement of a user without its own `STATEMENT_TIMEOUT` may run |
+| `PONDRA_STATEMENT_TIMEOUT` | none | how long a statement may run when its session set no `statement_timeout`, as Postgres writes it (`30s`, `5min`; a bare number is milliseconds), for everyone: tokens, users and an open node's callers. A user's own limit, if shorter, wins |
 
 An empty value counts as not set. See [HTTP](/pondra/reference/http/#roles) for what each token may do.
 
