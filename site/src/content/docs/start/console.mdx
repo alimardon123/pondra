@@ -1,8 +1,6 @@
 ---
 title: The console
 description: A web page for SQL, Python, notebooks and data files that every Pondra node serves at /. The lake's tables and files on the left, files in tabs in the middle, details, profiles and variables on the right, answers in a spreadsheet-like grid, and room for extensions.
-sidebar:
-  order: 5
 setup: |
   CREATE TABLE sales (day DATE, item VARCHAR, region VARCHAR, amount DOUBLE);
   INSERT INTO sales VALUES (DATE '2026-09-27', 'tea', 'eu', 7.0), (DATE '2026-09-27', 'cake', 'us', 4.5), (DATE '2026-09-28', 'tea', 'us', 3.5);
@@ -253,7 +251,7 @@ you pick. Below them is the statement it runs, in an editor of its own. A schedu
 whose:
 
 - **This tab**, **This page** or **All:** statements as the node remembers them
-  ([`pondra.history`](/pondra/reference/sql/#users-and-grants)). Each shows its SQL (or a Python
+  ([`pondra.history`](/pondra/sql/statements/#users-and-grants)). Each shows its SQL (or a Python
   cell's first line), how long it took or how it ended, when, its rows, and how many nodes it ran on.
   **All** is every statement you may see, from every door (an admin sees everyone's, with who ran it),
   but not the console's own queries. A statement shows up a second or so after it ends.

@@ -1,8 +1,6 @@
 ---
 title: HTTP API
 description: Every HTTP endpoint of a Pondra node, with its method, path, role, parameters, body and answer.
-sidebar:
-  order: 8
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -165,11 +163,11 @@ The body of `POST /tables/{name}` is either a list of `[name, type]` pairs, with
 (`Utf8`, `Int64`, `Float64`, `Boolean`, `Timestamp(Microsecond, None)`), or an object with
 `columns` and the options: `key` (a list), `merge` (an object of column to function), `publish`
 and `cluster_by` (lists), `partition_by`, `ttl` and `order_by` (strings). See
-[table options](/pondra/reference/table-options/#the-same-options-over-http). The answer is
+[table options](/pondra/sql/table-options/#the-same-options-over-http). The answer is
 `{"table": name, "publish": […]}`.
 
 `POST /views/{name}?window=w&size_secs=60&lateness_secs=10` takes any of the options of
-[`CREATE MATERIALIZED VIEW`](/pondra/reference/table-options/#materialized-views) as query
+[`CREATE MATERIALIZED VIEW`](/pondra/sql/table-options/#materialized-views) as query
 parameters. The answer is `{"view": name, "materialized": true}`.
 
 `POST /tasks/{name}` takes JSON: `source` and `target` (table names), `sql` (the query over the
@@ -265,7 +263,7 @@ console's Workspace shows them and edits them in place.
   `PONDRA_FILE_VERSIONS_DAYS`), files up to 64 MB. A deleted file keeps its versions, so it can be
   restored. The console's **Versions…** shows what changed and restores one.
 
-Read them from SQL with `files()` and `file_read()`, see [functions](/pondra/reference/functions/#files).
+Read them from SQL with `files()` and `file_read()`, see [functions](/pondra/sql/functions/#files).
 
 ```bash
 curl -s -X PUT http://localhost:8080/files/notes/a.txt --data-binary 'hello'
@@ -300,7 +298,7 @@ hello
 
 The body of `POST /functions/{name}` is `{"flight": "http://host:port", "args": ["Utf8"], "returns":
 "Utf8", "rows": N}`, where `rows` is optional. See
-[functions](/pondra/reference/functions/#functions-you-bring). The answer is `{"function": name}`,
+[functions](/pondra/sql/functions/#functions-you-bring). The answer is `{"function": name}`,
 and `{"dropped": name}` for `DELETE`.
 
 `GET /secrets/{name}` is what `pondra.secret(name)` calls inside a Python procedure. Any other
@@ -329,8 +327,8 @@ says what each request does.
 | `GET /ready` | none | `ready` (200) when the node serves; 503 while it [stops](/pondra/guides/upgrades/#stop-a-node-without-dropping-work), or just after it started and is still catching up with its leader: a readiness check |
 | `POST /login` | none | `{"user", "password"}`: a session for the user, `{"token": "ps_…", "until": ms}`, to send as `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`) |
 | `GET /whoami` | none | who the request signs in as: `{"user", "role", "superuser", "open"}` |
-| `GET /objects` | read | each table and view of this lake and the lakes attached to it: `catalog`, `schema`, `name`, `kind` (`table`, `view`, `materialized view`, or `files` for [a view of files](/pondra/reference/sql/)), and for a table its `rows` and `bytes` in files, `files`, `key`, `partition`, `cluster`, `publish`, `not_null`, `defaults`; for a view its `sql`. Also `files`: where the lake's own files are, for `read_csv('…')`. What the console's catalog shows |
-| `GET /kinds` | read | every kind of object, part and pattern, one row each, as [`pondra.kinds`](/pondra/reference/system-columns/#every-object) lists them: `[{"kind", "is", "family", "inside", "statements", "privileges", "on_clone", "in_project", "undrop", "secret", "lists", "about", "also"}]`; a column that doesn't apply is `null`. The [glossary](/pondra/reference/glossary/) says what each one is |
+| `GET /objects` | read | each table and view of this lake and the lakes attached to it: `catalog`, `schema`, `name`, `kind` (`table`, `view`, `materialized view`, or `files` for [a view of files](/pondra/sql/statements/)), and for a table its `rows` and `bytes` in files, `files`, `key`, `partition`, `cluster`, `publish`, `not_null`, `defaults`; for a view its `sql`. Also `files`: where the lake's own files are, for `read_csv('…')`. What the console's catalog shows |
+| `GET /kinds` | read | every kind of object, part and pattern, one row each, as [`pondra.kinds`](/pondra/sql/system-tables/#every-object) lists them: `[{"kind", "is", "family", "inside", "statements", "privileges", "on_clone", "in_project", "undrop", "secret", "lists", "about", "also"}]`; a column that doesn't apply is `null`. The [glossary](/pondra/sql/glossary/) says what each one is |
 | `GET /metrics` | read | Prometheus metrics, as text |
 | `POST /tier` | admin | write the log into Parquet now: `{"rows_tiered": N}` |
 | `DELETE /sessions/{id}` | read | end a session: its temporary tables and views go, and so does its Python: `{"ended": true}` |

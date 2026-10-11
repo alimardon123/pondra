@@ -1,8 +1,6 @@
 ---
 title: Vectors, files and models
 description: Search by meaning with vector columns, keep files next to your tables, call models from SQL, read JSON, and run your own model behind Arrow Flight.
-sidebar:
-  order: 12
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -193,7 +191,7 @@ DESC` puts them first, as `DESC` puts every `NULL` first. Each distinct text in 
 and embeddings go many to a request; a node keeps at most `PONDRA_AI_CALLS` requests in flight and
 tries one again after a `429`, a `5xx` or a lost connection. A row whose call still fails is
 `NULL`, so one bad row doesn't lose the query. The
-[reference](/pondra/reference/functions/#models) lists the settings (`PONDRA_AI_KEY` and the default
+[reference](/pondra/sql/functions/#models) lists the settings (`PONDRA_AI_KEY` and the default
 models).
 
 <Aside type="caution">
@@ -289,7 +287,7 @@ id  name  first_tag  amount  tags
 `payload ->> 'amount'` reads any value as text, and `->` steps into a nested one. A path that isn't
 there is `NULL`. The typed getters (`json_get_str`, `json_get_int`, `json_get_float`,
 `json_get_bool`) don't convert, so a number read with `json_get_str` is `NULL`: use `->>` and `CAST`
-when you don't know the type. The [functions reference](/pondra/reference/functions/#json) has the
+when you don't know the type. The [functions reference](/pondra/sql/functions/#json) has the
 full list. A [Kafka](/pondra/guides/kafka/) topic's values, and a Debezium feed, are read the same way.
 
 <Aside type="caution">

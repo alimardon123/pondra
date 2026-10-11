@@ -1,8 +1,6 @@
 ---
 title: Kafka protocol
 description: Write to tables with Kafka producers and read their log with Kafka consumers, over the Kafka protocol on any node.
-sidebar:
-  order: 11
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -74,7 +72,7 @@ How a record becomes a row:
 | headers | not kept |
 
 `_key` and `_timestamp` can sit beside ordinary columns. A `_value` table keeps text, Avro or
-Protobuf bytes untouched, and the [JSON functions](/pondra/reference/functions/#json) read them:
+Protobuf bytes untouched, and the [JSON functions](/pondra/sql/functions/#json) read them:
 
 ```sql
 CREATE TABLE notes (_key VARCHAR, _timestamp TIMESTAMP, _value VARCHAR);
@@ -301,7 +299,7 @@ logs in with SASL/PLAIN: a [user](/pondra/guides/security/#users-roles-and-grant
 (or one of its tokens), or `reader`, `writer` or `admin` with that role's token, as for
 [Postgres](/pondra/reference/postgres/#connect). A `reader` may consume and not produce; a user
 produces to a table it has INSERT on, and consumes one it may read every column of. A client that does not log in, or logs in with a wrong password, cannot connect: its
-first request is refused and the connection closes. There is no TLS, so use `SASL_PLAINTEXT`.
+first request is refused and the connection closes. Use `SASL_PLAINTEXT`, or `SASL_SSL` when the node has a certificate ([TLS](/pondra/guides/security/#tls)).
 
 ```python norun
 import os
@@ -327,5 +325,5 @@ sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule require
 ## Other clusters
 
 To read another Kafka cluster's topics as tables, or write a query's rows to one, Pondra is the
-client, not the broker. See [a topic as a table](/pondra/reference/table-options/#a-topic-as-a-table)
-and the `kafka` secret in [SQL](/pondra/reference/sql/#files-and-secrets).
+client, not the broker. See [a topic as a table](/pondra/sql/table-options/#a-topic-as-a-table)
+and the `kafka` secret in [SQL](/pondra/sql/statements/#files-and-secrets).

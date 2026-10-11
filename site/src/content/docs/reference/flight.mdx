@@ -1,8 +1,6 @@
 ---
 title: Arrow Flight
 description: Query, write and stream tables over Arrow Flight and Flight SQL, with ADBC, pyarrow and any Flight client.
-sidebar:
-  order: 10
 ---
 
 A node speaks Arrow Flight on the address you give `--flight`. Arrow goes in and comes out as
@@ -16,7 +14,7 @@ Arrow, with nothing parsed or converted on the way. Two kinds of client use it:
 pondra serve lake --flight 0.0.0.0:8815
 ```
 
-The port has no TLS: connect with `grpc://host:8815`. A request can be as large as 1 GiB.
+Connect with `grpc://host:8815`, or `grpc+tls://host:8815` when the node has a certificate ([TLS](/pondra/guides/security/#tls)). A request can be as large as 1 GiB.
 
 ## Flight SQL
 

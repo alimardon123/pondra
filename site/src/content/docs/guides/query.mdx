@@ -1,8 +1,6 @@
 ---
 title: Query
 description: Run SQL against a lake from SQL, Python, JavaScript or psql, with parameters, scripts, formats, EXPLAIN and queries spread over nodes.
-sidebar:
-  order: 3
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -278,7 +276,7 @@ AggregateExec: mode=FinalPartitioned, gby=[item@0 as item], aggr=[sum(orders.qty
       DataSourceExec: partitions=1, partition_sizes=[1], expected_rows=4
 ```
 
-Every statement is also a row of [`pondra.history`](/pondra/reference/sql/#users-and-grants), with a
+Every statement is also a row of [`pondra.history`](/pondra/sql/statements/#users-and-grants), with a
 fingerprint that is the same for the same query with other values, the commit it read (`version`:
 `AT (VERSION => n)` reads the lake as it was then, so an answer can be had again without being
 kept), and how far a join's rows were from what was expected (`misestimate`):

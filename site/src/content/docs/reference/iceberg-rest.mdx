@@ -1,8 +1,6 @@
 ---
 title: Iceberg REST catalog
 description: Let PyIceberg, DuckDB, Spark and other engines find a node's tables by URL, read them and append to them.
-sidebar:
-  order: 12
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -28,7 +26,7 @@ CREATE TABLE sales.orders (id BIGINT, item VARCHAR) WITH (publish = 'iceberg');
 
 Its first, empty version is published when the table is made, so an engine that appends to a new
 table finds it. Views are not in the catalog. Set `publish` on a table that exists with
-`ALTER TABLE … SET (publish = 'iceberg')`: see [table options](/pondra/reference/table-options/).
+`ALTER TABLE … SET (publish = 'iceberg')`: see [table options](/pondra/sql/table-options/).
 
 Namespaces are schemas:
 
@@ -36,7 +34,7 @@ Namespaces are schemas:
 |---|---|
 | `default` | the lake's `public` schema |
 | `sales` | the lake's other schema `sales` |
-| `other` | the `public` schema of an [attached lake](/pondra/reference/sql/#schemas-and-other-lakes) `other` |
+| `other` | the `public` schema of an [attached lake](/pondra/sql/statements/#schemas-and-other-lakes) `other` |
 | `other.sales` | that lake's schema `sales`. On the wire the parts are joined with the character `0x1F`, as the REST specification says |
 
 Other engines read a table's files, so they see the rows the node has written to files. New rows

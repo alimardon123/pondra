@@ -1,8 +1,6 @@
 ---
 title: SQL functions
 description: The functions Pondra adds to DataFusion's standard ones, for Spark's vocabulary, JSON, vectors, files, binary data, models and routines.
-sidebar:
-  order: 2
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -10,7 +8,7 @@ import { Aside } from '@astrojs/starlight/components';
 Pondra's SQL is [Apache DataFusion's](https://datafusion.apache.org/user-guide/sql/scalar_functions.html),
 so every function in DataFusion's lists works here: strings, math, dates, arrays, `regexp_*`,
 `window` functions and aggregates. This page lists what Pondra adds. For the functions you make
-yourself, see [`CREATE FUNCTION`](/pondra/reference/sql/#functions-procedures-and-tasks).
+yourself, see [`CREATE FUNCTION`](/pondra/sql/statements/#functions-procedures-and-tasks).
 
 ## Spark's functions
 
@@ -296,7 +294,7 @@ An option Pondra doesn't know is an error that lists the ones it does. A bare qu
 `FROM` (`FROM 'sales.csv'`) picks the reader from the file's extension.
 
 To keep a name for files instead of spelling the reader out each time, see
-[`CREATE EXTERNAL TABLE`](/pondra/reference/sql/#external-tables).
+[`CREATE EXTERNAL TABLE`](/pondra/sql/statements/#external-tables).
 
 A path on the node's machine is read only by the program that started the node: the shell,
 `pondra.local()` or `pondra sql`. A query over HTTP is refused.
@@ -349,7 +347,7 @@ SELECT * FROM secrets();
 | `pondra.start('name', arg…)` | run a procedure without waiting, and answer with its run's id |
 
 `CALL p(args)` waits for the procedure to finish. `pondra.start` returns at once with an id you
-can find in `pondra.runs` (see [system columns](/pondra/reference/system-columns/)). Add `AS name`
+can find in `pondra.runs` (see [system columns](/pondra/sql/system-tables/)). Add `AS name`
 to name the column. As a statement, `START CALL p(args)` does the same.
 
 ```sql

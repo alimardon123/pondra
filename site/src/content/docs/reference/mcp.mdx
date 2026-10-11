@@ -1,8 +1,6 @@
 ---
 title: MCP
 description: Let AI agents list tables, query, write and follow changes on a node over the Model Context Protocol, with the same tokens as everyone else.
-sidebar:
-  order: 13
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -78,7 +76,7 @@ the table for a `CREATE`.
 
 `changes` takes `after` as a position from an earlier call: `0` for as far back as the log is
 kept, and left out for from now. Each row carries `_change_type`, `_row_id` and `_version`: see
-[system columns](/pondra/reference/system-columns/). On a keyed table the change type is `upsert`.
+[system columns](/pondra/sql/system-tables/). On a keyed table the change type is `upsert`.
 
 ### Procedures as tools
 

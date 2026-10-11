@@ -1,8 +1,6 @@
 ---
 title: Command line
 description: The pondra command, its SQL shell, and every serve, sql, run and catalog option with its default.
-sidebar:
-  order: 14
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -295,7 +293,7 @@ pondra run report.sql shell-lake --day 2026-09-27
 ```
 
 A file that declares its parameters (`DECLARE PARAMETER $day DATE = current_date - 1;`, with what each
-means in the comment above it: see [Variables](/pondra/reference/sql/#variables)) says so with
+means in the comment above it: see [Variables](/pondra/sql/statements/#variables)) says so with
 `--help`, and a value given replaces the default, cast to its type:
 
 ```bash

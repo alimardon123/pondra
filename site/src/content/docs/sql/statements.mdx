@@ -1,8 +1,6 @@
 ---
 title: SQL statements
 description: Every SQL statement Pondra takes, with its syntax and an example, and the ones it refuses.
-sidebar:
-  order: 1
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -30,7 +28,7 @@ Columns take these types. A list is written `type[]`, such as `FLOAT[]` for an e
 | `DATE`, `TIME`, `TIMESTAMP` | | `TIMESTAMP` is a wall-clock time with no zone, kept in microseconds |
 | `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | an instant, kept and shown in UTC with its zone: `2026-09-29T05:00:00Z` |
 | `BYTEA` | `BINARY`, `VARBINARY`, `BLOB` | bytes |
-| `JSON` | `VARIANT` | JSON text, read with `json_get` and `->` (see [functions](/pondra/reference/functions/)) |
+| `JSON` | `VARIANT` | JSON text, read with `json_get` and `->` (see [functions](/pondra/sql/functions/)) |
 | `type[]` | | a list of one type |
 | an enum type, or `ENUM('a', 'b')` | | text, one of its labels ([enum types](#enum-types)) |
 
@@ -38,7 +36,7 @@ A `TIMESTAMPTZ` written with an offset (`'2026-09-29 10:00:00+05'`) is stored as
 so it reads back as `2026-09-29T05:00:00Z`. A time may leave out its seconds, as in Postgres and
 DuckDB: `'2024-05-01 10:30'` is a timestamp in `INSERT`, `CAST`, `TIMESTAMP '…'` and comparisons.
 `to_timestamp(…)` answers a `TIMESTAMP`, not a `TIMESTAMPTZ`: see
-[dates and times](/pondra/reference/functions/#dates-and-times).
+[dates and times](/pondra/sql/functions/#dates-and-times).
 
 A value that doesn't cast to its column's type is refused, and the error names the value: `'abc'` into
 a `BIGINT` is an error, never a `NULL`. `substr`, `substring(b FROM 2 FOR 1)` and `byte_length` work
@@ -104,7 +102,7 @@ SELECT who, feeling, array_position(enum_range(NULL::mood), feeling) AS place FR
 | `FROM t USING SAMPLE 10%` (or `n ROWS`), `FROM t TABLESAMPLE (10)` (or `(n ROWS)`) | a sample: each row kept on its own, or `n` of them |
 | `EXPLAIN SELECT …`, `EXPLAIN ANALYZE SELECT …` | the estimated plan, each step with the rows it expects (`expected_rows`), and whether it would spread over the nodes; run, the actual plan: each step's rows (`output_rows`) and time beside what it expected |
 | `DESCRIBE t`, `SHOW TABLES`, `SHOW COLUMNS FROM t` | what the lake holds |
-| `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS [LIKE 'p%']`, `SELECT … FROM pondra.tables` | each table and view with its kind (see [system tables](/pondra/reference/system-columns/#tables-and-views)) |
+| `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS [LIKE 'p%']`, `SELECT … FROM pondra.tables` | each table and view with its kind (see [system tables](/pondra/sql/system-tables/#tables-and-views)) |
 | `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS` (each `[LIKE 'p%']`) | the schemas, the lakes a query can name, the secrets (never their values), users, roles and grants |
 | `SELECT … FROM 'file.parquet'` | a file or URL as a table (see [names](/pondra/reference/names/)) |
 | `SELECT … FROM spark_sql('SELECT …')` | a query in Spark SQL's grammar, with Spark's functions (PySpark's `spark.sql` sends this) |
@@ -199,7 +197,7 @@ past starts when it was made.
 
 | Statement | Syntax |
 |---|---|
-| Create | `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY] [UNIQUE] [REFERENCES u (column) NOT ENFORCED] [MERGE sum\|count\|min\|max], … [, PRIMARY KEY (column, …)] [, [CONSTRAINT name] CHECK (condition) \| UNIQUE (column, …) \| FOREIGN KEY (column, …) REFERENCES u (column, …) NOT ENFORCED]) [PARTITION BY expression] [CLUSTER BY (column, …)] [SEQUENCE BY column] [TTL column + INTERVAL '…'] [WITH (option = value, …)]`: the layout clauses in any order ([table options](/pondra/reference/table-options/)) |
+| Create | `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY] [UNIQUE] [REFERENCES u (column) NOT ENFORCED] [MERGE sum\|count\|min\|max], … [, PRIMARY KEY (column, …)] [, [CONSTRAINT name] CHECK (condition) \| UNIQUE (column, …) \| FOREIGN KEY (column, …) REFERENCES u (column, …) NOT ENFORCED]) [PARTITION BY expression] [CLUSTER BY (column, …)] [SEQUENCE BY column] [TTL column + INTERVAL '…'] [WITH (option = value, …)]`: the layout clauses in any order ([table options](/pondra/sql/table-options/)) |
 | Create like another | `CREATE TABLE t LIKE s`: an empty table with `s`'s columns and their types, as Postgres's does |
 | Create from a query | `CREATE TABLE t AS SELECT …`, `CREATE TABLE t (a INT, b VARCHAR) AS VALUES …`, or `SELECT … INTO t FROM …` |
 | Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type` |
@@ -232,7 +230,7 @@ BigQuery's, Snowflake's and Databricks' words. `PARTITIONED BY (c)` (Spark's), `
 partitions. A clause and the option it stands for, both given, are refused.
 
 A table without a primary key is an append table. With a key, a new row replaces the old one with the
-same key. The options are on [table options](/pondra/reference/table-options/). An `ALTER TABLE`
+same key. The options are on [table options](/pondra/sql/table-options/). An `ALTER TABLE`
 rewrites no file: old rows read a new column as null.
 
 `NOT NULL` and `DEFAULT` are enforced on every door: `INSERT`, `POST /append`, `COPY`, Flight,
@@ -282,7 +280,7 @@ sent to the old name afterwards (over HTTP, Kafka or Flight) are refused with `n
 
 A dropped table is kept for a day, or for its `retention`, and `UNDROP TABLE t` brings it back as it
 was: every row, with its ids and versions. `pondra.dropped` lists the tables that can still come back
-(see [system tables](/pondra/reference/system-columns/#dropped-tables)). `UNDROP` takes the table
+(see [system tables](/pondra/sql/system-tables/#dropped-tables)). `UNDROP` takes the table
 dropped last under that name, and is refused while another table has the name: rename that one first.
 `DROP TABLE … PURGE`, or `retention = '0 seconds'`, keeps nothing.
 
@@ -458,7 +456,7 @@ one script's (statements sent together over HTTP).
 - `datafusion.runtime.*` (memory, spill folder, caches) is the node's, set as it starts
   ([`PONDRA_MEMORY_MB`](/pondra/reference/environment/)), and refused here.
 - `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`) gives the session Spark's
-  functions where Spark and DataFusion share a name ([Spark's functions](/pondra/reference/functions/#sparks-functions)),
+  functions where Spark and DataFusion share a name ([Spark's functions](/pondra/sql/functions/#sparks-functions)),
   and `'duckdb'` takes DuckDB's `STRUCT(a INT)` in `CREATE TABLE`.
 - A prepared statement can be a query or a write. `EXECUTE` puts its values where `$1`, `$2`, …
   were, each cast to the type `PREPARE` gave, and runs it as if it were sent.
@@ -691,7 +689,7 @@ DROP SCHEMA sales CASCADE;
 
 A materialized view is filled from the rows already in its table, then follows every new row.
 `EMIT FINAL` and its options make windows and sessions, and other options stream joins: see
-[table options](/pondra/reference/table-options/#materialized-views).
+[table options](/pondra/sql/table-options/#materialized-views).
 `WITH (history = 'id', sequence_by = 'at' [, delete_when = '…'])` keeps every version of each key
 with its `__start_at` and `__end_at` ([history per key](/pondra/guides/flows/#history-per-key-scd-type-2)).
 A temporary table lives in the memory of the node a session talks to, and ends with the session (a
@@ -745,7 +743,7 @@ comes back as notices, and its last expression, if it is a frame, table, list of
 back as rows (see [Functions and procedures](/pondra/guides/functions-and-procedures/#run-code-once-do)).
 Python functions and procedures need a node started with `--python`. Functions, procedures and tasks are kept in the lake, so every node and client has
 them. Every call of a procedure, and every file run, is a row of `pondra.runs`
-(see [system columns](/pondra/reference/system-columns/)).
+(see [system columns](/pondra/sql/system-tables/)).
 
 ```sql
 CREATE FUNCTION net(x DOUBLE, rate DOUBLE = 0.2) RETURNS DOUBLE RETURN x * (1 - rate);
@@ -950,7 +948,7 @@ words for being listed, described and made again.
 
 | Statement | Meaning |
 |---|---|
-| `SELECT … FROM pondra.objects` | every object, of every kind: `kind`, `lake`, `schema`, `name`, `comment`, and `definition`, the statements that make it again ([system tables](/pondra/reference/system-columns/#every-object)) |
+| `SELECT … FROM pondra.objects` | every object, of every kind: `kind`, `lake`, `schema`, `name`, `comment`, and `definition`, the statements that make it again ([system tables](/pondra/sql/system-tables/#every-object)) |
 | `SHOW CREATE TABLE t` (or `VIEW`, `MATERIALIZED VIEW`, `SEQUENCE`, `FUNCTION`, `PROCEDURE`, `TASK`, `SCHEMA`, `ROLE`, `DATABASE`, `SHARE`) | the statements that make it again, its comments included, as one `definition`; a branch's is the `CREATE DATABASE … CLONE` that made it, of its base as the base is then |
 | `COMMENT ON TABLE t IS 'text'` | describe it; any kind above, `COLUMN t.c` too (a table's, a view's or a materialized view's column), and `IS NULL` takes it away. A comment follows a rename and goes with a drop |
 | `COMMENT IF EXISTS ON TABLE t IS 'text'` | the same, and nothing if `t` isn't there |
@@ -1012,7 +1010,7 @@ Pondra refuses these by name, so a statement never runs and quietly does somethi
 | `INSERT OVERWRITE` | refused; write `BEGIN; DELETE FROM t; INSERT INTO t …; COMMIT`, one commit |
 | `INSERT`, `UPDATE` or `DELETE` with `RETURNING` | refused, not taken yet; read the rows with a `SELECT` after it |
 | `CREATE TABLE … ENGINE = …`, `… TBLPROPERTIES (…)` | refused; a table's options go in `WITH (…)` |
-| `CREATE TABLE … WITH (…)` with an option name Pondra doesn't know | refused, with the name; see [table options](/pondra/reference/table-options/) |
+| `CREATE TABLE … WITH (…)` with an option name Pondra doesn't know | refused, with the name; see [table options](/pondra/sql/table-options/) |
 | `CREATE TEMPORARY EXTERNAL TABLE` | refused; use `CREATE TEMP VIEW v AS SELECT * FROM read_parquet('…')` |
 | `CREATE EXTERNAL TABLE … STORED AS AVRO` | refused; Pondra reads Parquet, CSV, JSON (one value a line) and Arrow |
 | `CREATE TABLE t` when `t` is there | refused (`42P07`); say `IF NOT EXISTS` or `OR REPLACE` |

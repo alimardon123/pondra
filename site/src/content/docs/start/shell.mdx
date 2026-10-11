@@ -1,8 +1,6 @@
 ---
 title: The SQL shell
 description: Open a SQL shell on a lake with pondra, pipe a script into it, and run a .sql file with parameters.
-sidebar:
-  order: 3
 setup: |
   CREATE TABLE sales (day DATE, item VARCHAR, amount DOUBLE);
   INSERT INTO sales VALUES (DATE '2026-09-27', 'tea', 7.0), (DATE '2026-09-28', 'cake', 4.5);
@@ -50,7 +48,7 @@ pondra> .quit
   several lines.
 - An error is printed and the session goes on.
 - `.tables` lists the tables and views of every database with each one's kind (`table`, `view`,
-  `materialized view`, `external table`: [`pondra.tables`](/pondra/reference/system-columns/#tables-and-views)),
+  `materialized view`, `external table`: [`pondra.tables`](/pondra/sql/system-tables/#tables-and-views)),
   `.databases` lists the databases, and
   `.quit` leaves (so do `.exit`, `\q` and Ctrl+D).
 

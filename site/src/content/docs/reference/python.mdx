@@ -1,8 +1,6 @@
 ---
 title: Python client
 description: The pondra Python package, with every method of a connection, its signature, what it returns and an example.
-sidebar:
-  order: 5
 ---
 
 The `pondra` package talks to a node over HTTP. `pondra.connect` reaches a node that is running,
@@ -77,7 +75,7 @@ local.close()
 | `db.table(name)` | a table or view as a frame |
 | `db.run(file, job=None, wait=True, **params)` | a `.sql` file on this machine, or else a `.sql`, `.py` or notebook file of the lake's, run on the node (`CALL run`, [Run files as jobs](/pondra/guides/workspace/)); or SQL text itself. The last statement's rows or outcome. `wait=False` starts a lake file's run and gives its `Run` |
 | `db.from_arrow(data, name=None)` | rows of this machine as a frame: a pyarrow, pandas or Polars table, or a list of dicts. Also `from_pandas`, `from_polars`, `from_rows` |
-| `db.vars` | SQL's [variables](/pondra/reference/sql/#variables): `db.vars.day` (or `db.vars["day"]`) is `$day`, `db.vars.day = date(2026, 9, 30)` sets it, `del db.vars.day` forgets it, `dict(db.vars)` has them all. In a procedure or a file run, the run's |
+| `db.vars` | SQL's [variables](/pondra/sql/statements/#variables): `db.vars.day` (or `db.vars["day"]`) is `$day`, `db.vars.day = date(2026, 9, 30)` sets it, `del db.vars.day` forgets it, `dict(db.vars)` has them all. In a procedure or a file run, the run's |
 | `db.parameters(file)` | a file's parameters (a SQL file's `DECLARE PARAMETER`s and the `$name`s it uses unset; a `.py` file's `# %% tags=["parameters"]` cell): name, type, default, required, description |
 
 In `sql` and `run`, a keyword argument is a `$name` parameter in the query. A keyword whose value
@@ -126,7 +124,7 @@ a frame, and nothing runs until you call `rows()`, `collect()`, `to_pandas()`, `
 
 These make a frame over files, a folder, a glob (or a list of them), or another engine's table.
 They are SQL's `read_*` functions: see [names](/pondra/reference/names/) for the fallbacks and
-[functions](/pondra/reference/functions/#files-outside-the-lake) for the options.
+[functions](/pondra/sql/functions/#files-outside-the-lake) for the options.
 
 | Method | Meaning |
 |---|---|
@@ -140,7 +138,7 @@ They are SQL's `read_*` functions: see [names](/pondra/reference/names/) for the
 same methods under Polars' names.
 
 A path on this machine is read only by a node that `pondra.local` started. A URL (`s3://`, `gs://`,
-`az://`, `https://`) needs a [secret](/pondra/reference/sql/#files-and-secrets) whose scope covers
+`az://`, `https://`) needs a [secret](/pondra/sql/statements/#files-and-secrets) whose scope covers
 it.
 
 ```bash
@@ -194,7 +192,7 @@ others read by name, and returns it as a frame. `query` is SQL or a frame.
 | `materialized=True` | keep it up to date with each new row (`CREATE MATERIALIZED VIEW`) instead of running the query when it is read |
 | `temporary=True` | the view is this connection's only, until `close()` |
 | `replace` | for a stored view, `False` refuses to replace one that exists |
-| `**options` | the options of a materialized view: `window`, `size_secs`, `slide_secs`, `lateness_secs`, `session`, `gap_secs`, `join`, `time`, `within_secs`. See [table options](/pondra/reference/table-options/#materialized-views) |
+| `**options` | the options of a materialized view: `window`, `size_secs`, `slide_secs`, `lateness_secs`, `session`, `gap_secs`, `join`, `time`, `within_secs`. See [table options](/pondra/sql/table-options/#materialized-views) |
 
 ```python
 db.view("big_orders", "SELECT * FROM orders WHERE amount > 5")
@@ -215,7 +213,7 @@ print(spend.sort("item").rows())
 | `db.create_procedure(name, body=None, file=None, params=None, language="python", entry=None, packages=None, timeout=None, replace=True)` | a stored procedure from code (or a file of it) |
 | `@db.function` | a decorator: this Python function becomes one of the lake's functions, for SQL and frames, on every node |
 | `@db.procedure` | a decorator: this Python function becomes a stored procedure |
-| `db.task(name, sql, schedule=None, after=None, when=None, retries=None, retry_delay=None, timeout=None, on_failure=None, replace=True)` | [`CREATE TASK`](/pondra/reference/sql/#functions-procedures-and-tasks): `sql` run on a `schedule`, or `after` other tasks |
+| `db.task(name, sql, schedule=None, after=None, when=None, retries=None, retry_delay=None, timeout=None, on_failure=None, replace=True)` | [`CREATE TASK`](/pondra/sql/statements/#functions-procedures-and-tasks): `sql` run on a `schedule`, or `after` other tasks |
 | `@db.task(schedule=…)` or `@db.task(after=…)` | a decorator: this Python function becomes a procedure, and a task calls it |
 | `db.execute_task(name, **values)` | `EXECUTE TASK`: its graph runs now, with these values for its tasks' `$name`s; a `Run` (`.wait()`) |
 | `db.secret(name)` | a secret's values as a dict; only a procedure's code may read them |
@@ -223,7 +221,7 @@ print(spend.sort("item").rows())
 
 `params` maps each parameter to its SQL type, or to a pair of a type and a default. `returns` is a
 SQL type, `TABLE (…)`, or a dict of column names and Python types for a table function. The
-options are those of [`CREATE FUNCTION`](/pondra/reference/table-options/#functions-and-procedures).
+options are those of [`CREATE FUNCTION`](/pondra/sql/table-options/#functions-and-procedures).
 A body is a function body, as in PL/Python; with `entry`, it is a module and the function of that
 name runs.
 

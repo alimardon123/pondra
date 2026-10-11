@@ -1,8 +1,6 @@
 ---
 title: System columns and tables
 description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.objects, pondra.kinds, pondra.dropped, pondra.flows and pondra.expectations tables.
-sidebar:
-  order: 16
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -169,7 +167,7 @@ SELECT routine, caller, status, args FROM pondra.runs WHERE routine = 'report' A
 | `arguments` | its parameters, `day VARCHAR` |
 | `returns` | its return type, or null |
 | `volatility` | `immutable`, `stable` or `volatile` |
-| `options` | its options as JSON, or null: see [table options](/pondra/reference/table-options/#functions-and-procedures) |
+| `options` | its options as JSON, or null: see [table options](/pondra/sql/table-options/#functions-and-procedures) |
 | `body` | its code |
 
 `pondra.tasks`:
@@ -248,7 +246,7 @@ and an attached lake that signs in on its own is listed only for whoever runs th
 | `lake` | the lake it is in |
 | `schema` | its schema, or null for a kind that has none (a schema, a user, a role, a lake) |
 | `name` | its name |
-| `comment` | what [`COMMENT ON`](/pondra/reference/sql/#every-kind-of-object) said about it, or null |
+| `comment` | what [`COMMENT ON`](/pondra/sql/statements/#every-kind-of-object) said about it, or null |
 | `definition` | the statement that makes it again, as `SHOW CREATE` gives it without the comments (a branch's is the `CREATE DATABASE … CLONE` that made it); null for what is never shown (a secret's values, a user's password, a recipient's token) and for an attached lake's schemas, routines and tasks, which its own nodes show |
 
 `pondra.kinds` lists every kind of object, part and pattern, one row each. `is` says which one it is
@@ -257,7 +255,7 @@ be `orders`), and `statements` and `privileges` say what the kind takes and what
 `on_clone` says what `CREATE DATABASE … CLONE` does with an object (`copy`, `pin` or `leave`), and
 `in_project`, `undrop` and `secret` say whether a project may declare it, whether `UNDROP` brings it
 back, and whether its values are never shown. A part's `inside` and a pattern's `lists` say where it
-sits. The [glossary](/pondra/reference/glossary/) has the same rows as text, with each one's `about`
+sits. The [glossary](/pondra/sql/glossary/) has the same rows as text, with each one's `about`
 and `also`.
 
 ```sql
@@ -270,7 +268,7 @@ SELECT kind, statements FROM pondra.kinds WHERE kind IN ('table', 'task');
 ## Dropped tables
 
 `pondra.dropped` lists the dropped tables that `UNDROP TABLE` can still bring back. A table is kept
-for a day after it is dropped, or for its [`retention`](/pondra/reference/table-options/).
+for a day after it is dropped, or for its [`retention`](/pondra/sql/table-options/).
 
 | Column | Meaning |
 |---|---|

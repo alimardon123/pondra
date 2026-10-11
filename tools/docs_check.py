@@ -205,7 +205,7 @@ def logs(work):
 
 
 GLOSSARY_MD = os.path.join(ROOT, "docs", "glossary.md")
-GLOSSARY_SITE = os.path.join(ROOT, "site", "src", "content", "docs", "reference", "glossary.mdx")
+GLOSSARY_SITE = os.path.join(ROOT, "site", "src", "content", "docs", "sql", "glossary.mdx")
 GLOSSARY_FILES = (GLOSSARY_MD, GLOSSARY_SITE)
 GLOSSARY_NOTE = ("Generated from `pondra.kinds` (`src/objects.rs`): don't edit it here; "
                  "`python3 tools/docs_check.py --write-glossary` writes it again.")

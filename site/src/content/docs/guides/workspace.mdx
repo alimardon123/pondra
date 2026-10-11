@@ -1,8 +1,6 @@
 ---
 title: Run files as jobs
 description: Run the lake's SQL, Python and notebook files with parameters, from every client, on a schedule, each run logged.
-sidebar:
-  order: 9.5
 setup: |
   CREATE TABLE orders (day DATE, region VARCHAR, amount DOUBLE);
 ---
@@ -79,7 +77,7 @@ CALL run('etl/by_region.sql', region => 'west', day => '2026-09-29');
 
 - **A `$name` used and never set** is a parameter too, required, with no type.
 - **The run's variables are its own:** a `DECLARE` in a file doesn't change the caller's `$day`,
-  and `$day = $day + 1` in it changes only the run's ([variables](/pondra/reference/sql/#variables)).
+  and `$day = $day + 1` in it changes only the run's ([variables](/pondra/sql/statements/#variables)).
 - **In Python** (a `.py` file, a notebook's cells), `pondra.vars.day` is the same value.
 
 ## Python files and notebooks

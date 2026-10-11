@@ -1,8 +1,6 @@
 ---
 title: Names for reading and writing
 description: The one vocabulary for reading and writing files and tables in SQL, Python, PySpark and JavaScript, with the fallbacks from other tools.
-sidebar:
-  order: 4
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -44,10 +42,10 @@ and `db.read_*` return. See the [Python](/pondra/reference/python/) and
 ## What a name takes
 
 A source is a path, a glob (`sales/*.parquet`), a folder, a list of them, or a URL (`s3://`,
-`gs://`, `az://`, `https://`). A URL needs a [secret](/pondra/reference/sql/#files-and-secrets)
+`gs://`, `az://`, `https://`). A URL needs a [secret](/pondra/sql/statements/#files-and-secrets)
 whose scope covers it, unless the node is yours. A path on the node's machine is read and written
 only by the program that started the node: the shell, `pondra.local()` or `pondra sql`. To give a
-source a table's name, see [`CREATE EXTERNAL TABLE`](/pondra/reference/sql/#external-tables).
+source a table's name, see [`CREATE EXTERNAL TABLE`](/pondra/sql/statements/#external-tables).
 
 Options come by name. The same option has each tool's spelling:
 
@@ -69,7 +67,7 @@ Options come by name. The same option has each tool's spelling:
 
 Writing takes `PARTITION_BY (col, …)`, `APPEND` or `OVERWRITE`, `HEADER`, `DELIMITER`,
 `COMPRESSION` and `ROW_GROUP_SIZE` in SQL, or DataFusion's `STORED AS`, `PARTITIONED BY` and `OPTIONS`
-(see [`COPY`](/pondra/reference/sql/#files-and-secrets)). Spark's modes are `df.write.mode("overwrite")` and
+(see [`COPY`](/pondra/sql/statements/#files-and-secrets)). Spark's modes are `df.write.mode("overwrite")` and
 `"append"`, and `partitionBy(…)` picks the partition columns. A folder that already holds a Delta
 or Iceberg table takes `mode="append"` or `"overwrite"`; the default, `"error"`, refuses.
 

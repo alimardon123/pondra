@@ -1,8 +1,6 @@
 ---
 title: PySpark
 description: Run PySpark code on Pondra by changing its imports to pondra.spark, and see what differs.
-sidebar:
-  order: 8
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -96,7 +94,7 @@ spark.sql("""
 
 It takes a query (`SELECT`, `WITH`, `VALUES`); writes and other statements are Pondra's SQL, as
 `spark.sql` sends them. In SQL from anywhere else, `spark_sql('…')` is a table of a query in Spark's
-grammar ([SQL](/pondra/reference/sql/#queries)).
+grammar ([SQL](/pondra/sql/statements/#queries)).
 
 Windows and column functions are PySpark's:
 

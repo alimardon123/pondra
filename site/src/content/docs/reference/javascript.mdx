@@ -1,8 +1,6 @@
 ---
 title: JavaScript client
 description: The pondra npm package, with every method of a connection, its arguments, what it returns and an example.
-sidebar:
-  order: 7
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -77,7 +75,7 @@ A parameter is a JSON value: a number, string, boolean, `null` or an array.
 
 | Method | Returns |
 |---|---|
-| `await db.vars()` | this connection's SQL variables (`DECLARE $day …`, `$day = …`: [Variables](/pondra/reference/sql/#variables)) as an object of their values |
+| `await db.vars()` | this connection's SQL variables (`DECLARE $day …`, `$day = …`: [Variables](/pondra/sql/statements/#variables)) as an object of their values |
 | `await db.getVariable(name)` | one variable's value, `null` if it has none |
 | `await db.setVariable(name, value)` | sets it, as `$name = …` in SQL (the value bound, never pasted in) |
 | `await db.resetVariable(name)` | forgets it (`RESET $name`) |
@@ -143,7 +141,7 @@ console.log(await db.lookup("users", 7), await db.lookup("users", 8));
 | `await db.call(name, ...args)` | `CALL name(…)`: its rows or outcome. What the procedure printed is in `db.notices`, and goes to `onNotice` |
 | `await db.start(name, ...args)` | starts the procedure on the node without waiting, and answers with the run's id. The run's row in `pondra.runs` says how it went |
 | `await db.callProcedure(name, ...args)` | the same as `call`, from 0.22 |
-| `await db.task(name, sql, { schedule, after, when, retries, retryDelay, timeout, onFailure })` | [`CREATE TASK`](/pondra/reference/sql/#functions-procedures-and-tasks): `sql` run on a `schedule`, or `after` other tasks |
+| `await db.task(name, sql, { schedule, after, when, retries, retryDelay, timeout, onFailure })` | [`CREATE TASK`](/pondra/sql/statements/#functions-procedures-and-tasks): `sql` run on a `schedule`, or `after` other tasks |
 | `await db.executeTask(name, values)` | `EXECUTE TASK`: its graph runs now, with these values for its tasks' `$name`s; answers with the run's id |
 | `await db.wait(id)` | waits for a run (`start`'s or `executeTask`'s) to end, as SQL's `AWAIT 'id'`; throws its error if it failed |
 
@@ -173,7 +171,7 @@ by name.
 |---|---|
 | `materialized: true` | keep it up to date with each new row (`CREATE MATERIALIZED VIEW`) instead of running the query when it is read |
 | `replace` | for a stored view, `false` refuses to replace one that exists |
-| other options | the options of a materialized view: `window`, `size_secs`, `slide_secs`, `lateness_secs`, `session`, `gap_secs`, `join`, `time`, `within_secs`. They need `materialized: true`. See [table options](/pondra/reference/table-options/#materialized-views) |
+| other options | the options of a materialized view: `window`, `size_secs`, `slide_secs`, `lateness_secs`, `session`, `gap_secs`, `join`, `time`, `within_secs`. They need `materialized: true`. See [table options](/pondra/sql/table-options/#materialized-views) |
 
 ```js
 import { connect } from "pondra";

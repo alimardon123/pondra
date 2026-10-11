@@ -1,15 +1,124 @@
-/* Pondra's colours: the accent, from brand/colors.css (ADR-032), in dark (Starlight's first) and light. */
+/* The site's look: Starlight's, in the brand's fonts and colours (brand/: ADR-032), with calmer
+   headings, the three tabs in the header (components/Tabs.astro) and the home page's parts. */
+
+@font-face {
+  font-family: 'Geist';
+  src: url('../../../brand/fonts/Geist.woff2') format('woff2');
+  font-weight: 400 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('../../../brand/fonts/GeistMono.woff2') format('woff2');
+  font-weight: 400 700;
+  font-display: swap;
+}
+
+/* The accent, from brand/colors.css, in dark (Starlight's first) and light. */
 :root {
   --sl-color-accent-low: var(--pondra-accent-soft-dark);
   --sl-color-accent: var(--pondra-accent-dark);
   --sl-color-accent-high: var(--pondra-accent-strong-dark);
-  --sl-content-width: 50rem;
+  --sl-font: 'Geist', var(--sl-font-system);
+  --sl-font-mono: 'Geist Mono', var(--sl-font-system-mono);
+  --sl-content-width: 48rem;
+  --sl-line-height: 1.7;
+  --sl-text-h1: 2.25rem;
+  --sl-text-h2: 1.6rem;
+  --sl-text-h3: 1.25rem;
+  --sl-text-h4: 1.075rem;
+}
+@media (min-width: 72rem) {
+  :root { --sl-text-h1: 2.6rem; --sl-text-h2: 1.75rem; --sl-text-h3: 1.3rem; }
 }
 :root[data-theme='light'] {
   --sl-color-accent-low: var(--pondra-accent-soft);
   --sl-color-accent: var(--pondra-accent);
   --sl-color-accent-high: var(--pondra-accent-strong);
 }
+
+/* Headings: tighter, so a page reads as one column of text rather than a stack of banners. */
+.sl-markdown-content :is(h1, h2, h3, h4) { letter-spacing: -0.015em; font-weight: 650; }
+.sl-markdown-content h2 { margin-top: 2.5rem; padding-top: 0.25rem; }
+.sl-markdown-content h3 { margin-top: 1.75rem; }
+h1#_top { letter-spacing: -0.025em; font-weight: 700; }
+
 /* The mark beside the title: a little closer than Starlight's gap. */
 .site-title { gap: 0.55rem; }
 .site-title img { height: 1.75rem; width: auto; }
+
+/* The three tabs. */
+.site-tabs { display: flex; gap: 0.25rem; align-items: center; }
+.site-tabs a {
+  color: var(--sl-color-gray-2);
+  text-decoration: none;
+  font-size: var(--sl-text-sm);
+  font-weight: 550;
+  padding: 0.4rem 0.75rem;
+  border-radius: 999px;
+}
+.site-tabs a:hover { color: var(--sl-color-white); background: var(--sl-color-gray-6); }
+.site-tabs a[aria-current='page'] { color: var(--sl-color-accent-high); background: var(--sl-color-accent-low); }
+.sidebar-tabs .site-tabs { padding-bottom: 0.75rem; margin-bottom: 0.5rem; border-bottom: 1px solid var(--sl-color-hairline); }
+
+/* The sidebar: groups named in small capitals, links a touch quieter until chosen. */
+.sidebar-content .group-label .large {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-weight: 650;
+  color: var(--sl-color-gray-3);
+}
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:is(:hover, :focus) {
+  background: var(--sl-color-accent-low);
+  color: var(--sl-color-accent-high);
+  font-weight: 600;
+}
+
+/* Cards and link cards: rounder, lifted on hover. */
+.card, .sl-link-card { border-radius: 0.75rem; }
+.sl-link-card:hover { box-shadow: 0 2px 10px rgb(0 0 0 / 0.06); }
+
+/* Tables: quiet header, numbers lined up. */
+.sl-markdown-content table { font-variant-numeric: tabular-nums; }
+.sl-markdown-content th { font-weight: 600; }
+
+/* The home page. */
+.hero { padding-block: 3rem 2rem; }
+.hero .tagline { color: var(--sl-color-gray-2); max-width: 36rem; }
+.hero-html { justify-content: center; }
+.terminal {
+  width: 100%;
+  max-width: 36rem;
+  margin: 0;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.75rem;
+  background: var(--sl-color-gray-7, var(--sl-color-black));
+  box-shadow: 0 18px 48px rgb(0 0 0 / 0.12);
+  font: 0.8rem/1.6 var(--sl-font-mono);
+  text-align: start;
+  overflow: hidden;
+}
+.terminal .bar { display: flex; gap: 0.4rem; padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--sl-color-gray-5); }
+.terminal .bar i { width: 0.65rem; height: 0.65rem; border-radius: 50%; background: var(--sl-color-gray-5); }
+.terminal pre { margin: 0; padding: 0.9rem 1.1rem 1.1rem; background: none; border: 0; white-space: pre; overflow-x: auto; color: var(--sl-color-gray-1); }
+.terminal .p { color: var(--sl-color-accent-high); }
+.terminal .c { color: var(--sl-color-gray-3); }
+.terminal .k { color: var(--sl-color-accent-high); font-weight: 600; }
+.areas { display: grid; gap: 0.75rem; grid-template-columns: 1fr; margin-top: 1rem; }
+@media (min-width: 40rem) { .areas { grid-template-columns: repeat(2, 1fr); } }
+@media (min-width: 64rem) { .areas { grid-template-columns: repeat(3, 1fr); } }
+.areas a {
+  display: block;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.75rem;
+  text-decoration: none;
+  color: var(--sl-color-gray-2);
+  font-size: var(--sl-text-sm);
+  line-height: 1.5;
+  transition: border-color 0.15s, transform 0.15s;
+}
+.areas a:hover { border-color: var(--sl-color-accent); transform: translateY(-1px); }
+.areas a strong { display: block; color: var(--sl-color-white); font-size: var(--sl-text-base); margin-bottom: 0.25rem; }

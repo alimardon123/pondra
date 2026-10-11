@@ -1,8 +1,6 @@
 ---
 title: Frames
 description: Every method of a frame and every expression function, grouped, with Polars' names and an example for each group.
-sidebar:
-  order: 6
 ---
 
 A **frame** is a query that hasn't run yet, in Polars' style. You make one with `db.table`,
@@ -138,7 +136,7 @@ per_day.sort("day").show()
 +---------------------+-------+---+
 ```
 
-`sum` over `DOUBLE` gives the same answer in any order, as in [SQL](/pondra/reference/functions/#exact-sums).
+`sum` over `DOUBLE` gives the same answer in any order, as in [SQL](/pondra/sql/functions/#exact-sums).
 
 ## Joins
 
@@ -213,7 +211,7 @@ TableScan: orders projection=[id, user_id, item, qty, amount, ts]
 
 | Method | Meaning |
 |---|---|
-| `to_view(name, temporary=False, materialized=False, replace=None, **options)` | save the frame as a view others read by name. `materialized=True` keeps it up to date, and `options` are a materialized view's: `window`, `size_secs`, and the rest of [table options](/pondra/reference/table-options/#materialized-views). `temporary=True` keeps it to this connection |
+| `to_view(name, temporary=False, materialized=False, replace=None, **options)` | save the frame as a view others read by name. `materialized=True` keeps it up to date, and `options` are a materialized view's: `window`, `size_secs`, and the rest of [table options](/pondra/sql/table-options/#materialized-views). `temporary=True` keeps it to this connection |
 | `write_table(name, mode="create")` | rows into a table: `create` (`CREATE TABLE … AS`), `append` (`INSERT … SELECT`), `overwrite` (a new table in its place) |
 | `write_parquet(path, partition_by=None, mode=None)` | Parquet files: a file, or a folder if `path` ends in `/` or `partition_by` names columns |
 | `write_csv(path, separator=None, include_header=True, partition_by=None, mode=None)` | CSV files |
