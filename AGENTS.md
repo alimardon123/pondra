@@ -2144,6 +2144,7 @@ python3 tools/frames_check.py                  # pondra.frame == Polars (26 pipe
 ~/venv-spark/bin/python tools/spark_check.py   # pondra.spark == PySpark 4.0.1 (55 pipelines, files and UDFs among them: values and column names)
 python3 tools/bench/tpch_frames.py --data ~/tpch/sf1-bench   # TPC-H: SQL == frames == PySpark code, 22 of 22
 python3 tools/bench/nexmark.py [--events 4000000] [--alone] # Nexmark's 20 queries: Pondra (== DuckDB) and Flink 2.3 (venv-flink)
+python3 tools/bench/fluss_bench.py --fluss ~/fluss-1.0.0  # Fluss 1.0 side by side: start, memory, appends, acks, freshness, scans, upserts, lookups (pip install pyfluss==1.0.0)
 python3 tools/smoke.py target/release/pondra   # what CI runs on Windows, macOS and Linux (stdlib only)
 python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # shell, local(), kill -9, wheel, npm, notebook; glibc 2.17 + Ubuntu 22.04
 python3 tools/bench/repeat.py --data ~/tpch/sf1-bench --query 15 --runs 20 [--hot]   # one query many times vs DuckDB
