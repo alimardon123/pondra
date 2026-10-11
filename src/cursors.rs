@@ -12,8 +12,9 @@
 //! as in Postgres: it keeps that transaction's id, and `sweep` drops it once the session's open
 //! transaction is no longer that one. A WITH HOLD cursor lives until CLOSE or the session's end.
 //!
-//! The answers the node's cursors hold are kept within `PONDRA_CURSORS_MB` together. A DECLARE that
-//! would pass it is refused (53200), never answered by dropping a cursor someone is still reading.
+//! The answers the node's cursors hold are kept within a budget together: `PONDRA_CURSORS_MB`, or by
+//! default a quarter of the node's memory up to 1024 MB (`budget`). A DECLARE that would pass it is
+//! refused (53200), never answered by dropping a cursor someone is still reading.
 use crate::auth::Role;
 use crate::codes::coded;
 use crate::server::App;
@@ -185,17 +186,23 @@ async fn declare_as(app: &App, name: &str, hold: bool, query: &str) -> Result<An
     }
 }
 
-/// The most the node's cursors may hold together, in bytes: `PONDRA_CURSORS_MB` (1024 MB), as pages.rs
-/// reads its own. Nothing held is dropped to make room; a client is still reading each cursor.
-fn budget() -> usize { std::env::var("PONDRA_CURSORS_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024) << 20 }
+/// The most the node's cursors may hold together, in bytes. `PONDRA_CURSORS_MB` sets it. Unset, it is a
+/// quarter of the node's memory (`store::ram`, which knows a container's limit) or 1024 MB, whichever is
+/// less, and 1024 MB when the memory is unknown: a node in a 1 GB container mustn't hold 1 GB of cursors.
+/// Nothing held is dropped to make room; a client is still reading each cursor.
+fn budget() -> usize {
+    let default = crate::store::ram().map_or(1 << 30, |ram| (ram / 4).min(1 << 30));
+    std::env::var("PONDRA_CURSORS_MB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(default, |mb| mb << 20)
+}
 
-/// The refusal: what the node's cursors hold and what this answer needs, in MB, and the ways out.
+/// The refusal: what the node's cursors hold and what this answer needs, in MB, and the ways out. The
+/// budget's default is said too, so a refusal in a small container explains where the limit comes from.
 fn refused(held: usize, needs: usize) -> anyhow::Error {
     let mb = |bytes: usize| format!("{:.1}", bytes as f64 / (1 << 20) as f64);
     coded(
         "53200",
         format!(
-            "the cursors on this node hold {} MB and this answer needs {} MB, past PONDRA_CURSORS_MB ({} MB): CLOSE some cursors, or read the answer in parts with a WHERE",
+            "the cursors on this node hold {} MB and this answer needs {} MB, past the budget of {} MB (PONDRA_CURSORS_MB; unset, a quarter of the node's memory, at most 1024 MB): CLOSE some cursors, or read the answer in parts with a WHERE",
             mb(held),
             mb(needs),
             budget() >> 20
