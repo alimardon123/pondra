@@ -236,6 +236,7 @@ pub enum Stmt {
     Merge(Box<crate::change::Merge>),                     // MERGE INTO … (`change.rs`)
     Invalid(String),                                      // CREATE PROCEDURE or DROP MACRO, written wrong: why
     CopyTo(String, String, std::collections::BTreeMap<String, String>), // COPY (query) TO 'url' (options): files outside the lake (`ext.rs`)
+    CopyInto(String, crate::copy::Source, std::collections::BTreeMap<String, String>), // COPY INTO t FROM 'path' (options): each file loaded once a version (`copy.rs`)
     TempView(String, String, bool, bool),                  // CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] name AS query: the session's (`temp.rs`)
     TempSecret(String, std::collections::BTreeMap<String, String>, bool, bool), // CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…): the session's, in memory (`temp.rs`)
 }
@@ -245,7 +246,7 @@ impl Stmt {
     pub fn table(&self) -> String {
         match self {
             Stmt::Create(c) => object(&c.name),
-            Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => t.clone(),
+            Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) | Stmt::CopyInto(t, ..) => t.clone(),
             Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) => String::new(),
             Stmt::TempView(v, ..) | Stmt::TempSecret(v, ..) => v.clone(),
             Stmt::Merge(m) => m.target.clone(),
@@ -967,7 +968,7 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(meta.merge.is_empty() && deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) => unreachable!("not a row write here"),
+        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) => unreachable!("not a row write here"),
     }
 }
 
@@ -1368,6 +1369,9 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     };
     if let Stmt::CopyTo(query, to, options) = &stmt {
         return crate::copy::copy_to(&app.lake, query, to, options, &app.cluster.nodes(), &app.cluster.addr).await; // (files outside the lake: from here, or every node its share)
+    }
+    if let Stmt::CopyInto(table, from, options) = &stmt {
+        return crate::copy::copy_into(app, table, from, options).await; // (files into a table, each once a version)
     }
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
     let (lake, job) = (&app.lake, job.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));

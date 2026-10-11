@@ -1,0 +1,30 @@
+---
+title: SQL in Pondra
+description: The SQL Pondra speaks, where it runs, and where each part of the language is described.
+---
+
+Pondra's SQL is [Apache DataFusion](https://datafusion.apache.org/user-guide/sql/index.html)'s,
+which reads much like Postgres's, with Postgres's own forms for what changes data (`UPDATE … FROM`,
+`INSERT … ON CONFLICT`, `COPY`, `CREATE FUNCTION`, `BEGIN … COMMIT`). DuckDB's spellings work too
+(`FROM t` on its own, `PIVOT`, `COLUMNS(…)`, `SUMMARIZE`, lambdas), and Spark's inside
+`spark_sql('…')`. A statement means the same through every door: the shell, the console, a notebook's
+`%%sql` cell, Python's and JavaScript's `db.sql`, psql, HTTP and MCP.
+
+```sql
+CREATE TABLE langs (name VARCHAR, year INT);
+INSERT INTO langs VALUES ('SQL', 1974), ('Python', 1991), ('Rust', 2010);
+FROM langs WHERE year > 1980 ORDER BY year;
+```
+
+## The reference
+
+| Page | What it covers |
+|---|---|
+| [Statements](/pondra/sql/statements/) | Every statement Pondra takes, with its syntax and an example, and what is refused by name |
+| [Functions](/pondra/sql/functions/) | The functions Pondra adds to DataFusion's: JSON, vectors, files, AI, `pondra.*` |
+| [Table options](/pondra/sql/table-options/) | Every `WITH (…)` option of tables, materialized views and functions |
+| [System tables](/pondra/sql/system-tables/) | System columns (`_row_id`, `_version`, …) and the `pondra.*` tables: runs, history, objects |
+| [Glossary](/pondra/sql/glossary/) | Every kind of object, part and pattern, and what other products call it |
+
+DataFusion's own functions (strings, dates, math, aggregates, windows) are in its
+[function reference](https://datafusion.apache.org/user-guide/sql/scalar_functions.html).

@@ -1,0 +1,702 @@
+---
+title: PySpark names
+description: Every name pondra.spark has, grouped by what it is for, with an example of each, and where it differs from PySpark.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+`pondra.spark` has PySpark's names, and each one runs on a Pondra node. The [PySpark guide](/pondra/guides/pyspark/)
+shows how to move a job. This page lists every name, grouped by what it is for, with an example that runs.
+
+The setup block below starts the session and makes the `orders` table that most examples read. The
+file examples start a node of their own on this machine.
+
+## Setup
+
+```python
+from pondra.spark import SparkSession, functions as F, Window
+
+spark = SparkSession.builder.remote("pondra://localhost:8080").getOrCreate()
+orders = spark.createDataFrame(
+    [(1, "ann", "tea", 2, 3.5), (2, "bob", "cake", 1, 4.5), (3, "ann", "tea", 1, 3.5), (4, "cy", "coffee", 3, 3.0)],
+    ["id", "user", "item", "qty", "price"])
+orders.write.mode("overwrite").saveAsTable("orders")
+```
+
+## Session and catalog
+
+| Name | Does |
+|---|---|
+| `SparkSession.builder` | `.remote(url)` for a node, `.master("local[*]")` for a lake here (`.config("spark.pondra.lake", folder)`), `.config(key, value)`, `.appName(name)` (accepted, not used), `.getOrCreate()` |
+| `SparkSession.getActiveSession()` | the session in use, or `None` |
+| `spark.sql(query, args=…)` | a DataFrame of a query. `args` fills the `:name` markers |
+| `spark.table(name)` | a table or view as a DataFrame |
+| `spark.range(n)`, `spark.range(start, end)` | a column `id` from `start` up to `end` minus 1 |
+| `spark.createDataFrame(rows, schema)` | a DataFrame of rows. The schema is column names, a string such as `"id int, item string"`, or a `StructType` |
+| `spark.catalog.listTables()` | the tables and views, as rows with `name`, `database`, `tableType` and `isTemporary` |
+| `spark.catalog.tableExists(name)` | `True` or `False` |
+| `spark.catalog.dropTempView(name)` | forgets a temporary view. `True` if there was one |
+| `spark.read`, `spark.udf` | the readers of files and the Python functions: see [Readers](#readers) and [Python functions](/pondra/guides/pyspark/#python-functions) |
+| `spark.stop()` | ends the session. A session from `local()` also stops the node it started; a remote one leaves its node running. It is the last example on this page |
+
+```python
+print(spark.catalog.tableExists("orders"), spark.catalog.tableExists("nope"))
+print(spark.sql("SELECT id FROM orders WHERE qty > :q ORDER BY id", args={"q": 1}).collect())
+print(spark.range(2, 5).collect())
+spark.range(2).createOrReplaceTempView("two")
+print(spark.catalog.dropTempView("two"), spark.catalog.dropTempView("two"))
+print([t.name for t in spark.catalog.listTables() if t.name == "orders"])
+print(SparkSession.getActiveSession() is spark)
+```
+
+```text
+True False
+[Row(id=1), Row(id=4)]
+[Row(id=2), Row(id=3), Row(id=4)]
+True False
+['orders']
+True
+```
+
+## Columns and sorts
+
+| Name | Does |
+|---|---|
+| `F.col(name)`, `F.column(name)` | a column. `"t.x"` names column `x` of table `t` in a join |
+| `F.lit(value)`, `F.expr(sql)` | a constant, and a SQL expression |
+| `column.alias(name)`, `column.name_(name)` | the column under a new name. `name_` is the same: the name `name` is the column's own |
+| `column.cast(type)`, `column.astype(type)` | the type, as a name (`"double"`) or a type (`types.DoubleType()`) |
+| `isNull()`, `isNotNull()` | a test for null |
+| `isin(*values)` | `True` when the value is one of them |
+| `between(low, high)` | from `low` to `high`, both included |
+| `like(pattern)`, `rlike(regex)` | SQL's `LIKE` (`%` is any text, `_` one character), or a regular expression |
+| `contains(text)`, `startswith(text)`, `endswith(text)` | the text is inside, at the start, or at the end |
+| `substr(pos, length)` | `length` characters from `pos`, counted from 1 |
+| `getItem(key)` | an item of a list, counted from 0 |
+| `asc()`, `desc()` | a sort key: nulls first when ascending, last when descending |
+| `asc_nulls_first()`, `asc_nulls_last()`, `desc_nulls_first()`, `desc_nulls_last()` | a sort key with the nulls where the name says |
+
+```python
+spark.table("orders").select(
+    "id",
+    F.col("item").like("t%").alias("like_t"),
+    F.col("item").rlike("^c").alias("rlike_c"),
+    F.col("item").contains("ea").alias("has_ea"),
+    F.col("item").startswith("c").alias("starts_c"),
+    F.col("item").endswith("ea").alias("ends_ea"),
+    F.col("item").substr(1, 2).alias("start"),
+    F.col("qty").between(1, 2).alias("one_or_two"),
+    F.col("id").isin(1, 3).alias("picked"),
+    F.col("user").isNull().alias("no_user"),
+    F.col("user").isNotNull().alias("has_user"),
+    F.col("qty").cast("double").alias("qty_double"),
+    F.col("qty").name_("units"),
+).orderBy("id").show()
+
+gaps = spark.createDataFrame([(None,), (2,), (1,)], ["v"])
+for key in [F.col("v").asc(), F.col("v").desc(), F.col("v").asc_nulls_last(), F.col("v").desc_nulls_first(),
+            F.col("v").asc_nulls_first(), F.col("v").desc_nulls_last()]:
+    print([r.v for r in gaps.orderBy(key).collect()])
+print(spark.createDataFrame([(["tea", "cake"],)], ["xs"]).select(F.col("xs").getItem(0).alias("first")).collect())
+print(spark.table("orders").select(F.expr("qty * 2").alias("doubled"), F.col("qty").astype("string").alias("qty_text")).orderBy("doubled").limit(1).collect())
+```
+
+```text
+id  like_t  rlike_c  has_ea  starts_c  ends_ea start  one_or_two  picked  no_user  has_user  qty_double  units
+  1    True    False    True     False     True    te        True    True    False      True         2.0      2
+  2   False     True   False      True    False    ca        True   False    False      True         1.0      1
+  3    True    False    True     False     True    te        True    True    False      True         1.0      1
+  4   False     True   False      True    False    co       False   False    False      True         3.0      3
+[None, 1, 2]
+[2, 1, None]
+[1, 2, None]
+[None, 2, 1]
+[None, 1, 2]
+[2, 1, None]
+[Row(first='tea')]
+[Row(doubled=2, qty_text='1')]
+```
+
+## Windows and rows
+
+| Name | Does |
+|---|---|
+| `Window.partitionBy(*cols)`, `Window.orderBy(*cols)` | a window spec to start from |
+| `WindowSpec.partitionBy(*cols)`, `WindowSpec.orderBy(*cols)` | the same, added to a spec |
+| `rowsBetween(start, end)`, `rangeBetween(start, end)` | the rows, or the rows whose order value is in range, from `start` to `end`. Use `Window.unboundedPreceding`, `Window.unboundedFollowing`, `Window.currentRow` (0), or a number of rows (negative before, positive after) |
+| `column.over(window)` | the column, computed over the window |
+| `Row` | a row of an answer: `row.user`, `row["user"]`, `row.asDict()`. `Row(user="ann")` makes one |
+
+```python
+from pondra.spark import Row
+
+o = spark.table("orders")
+running = Window.orderBy("id").partitionBy("user").rowsBetween(Window.unboundedPreceding, Window.currentRow)
+rows = o.withColumn("running", F.sum("qty").over(running)).orderBy("id").collect()
+print([(r.user, r["qty"], r.running) for r in rows])
+print(rows[0].asDict())
+print(o.withColumn("upto", F.sum("qty").over(Window.orderBy("id").rangeBetween(Window.unboundedPreceding, 0)))
+      .select("id", "upto").orderBy("id").collect())
+print(Row(user="ann", qty=2).user)
+```
+
+```text
+[('ann', 2, 2), ('bob', 1, 1), ('ann', 1, 3), ('cy', 3, 3)]
+{'id': 1, 'user': 'ann', 'item': 'tea', 'qty': 2, 'price': 3.5, 'running': 2}
+[Row(id=1, upto=2), Row(id=2, upto=3), Row(id=3, upto=4), Row(id=4, upto=7)]
+ann
+```
+
+## DataFrame columns
+
+| Name | Does |
+|---|---|
+| `select(*cols)`, `selectExpr(*sql)` | the columns, as names, columns or SQL: `selectExpr("qty * price AS total")` |
+| `withColumn(name, col)`, `withColumns({name: col})` | adds a column, or several |
+| `withColumnRenamed(old, new)`, `withColumnsRenamed({old: new})` | renames a column, or several |
+| `toDF(*names)` | every column's new name, in order |
+| `drop(*cols)` | removes columns |
+| `columns`, `dtypes`, `schema` | the names; (name, type) pairs; the Arrow schema, whose `names` are the names |
+| `printSchema()` | the schema as a tree |
+
+```python
+o = spark.table("orders")
+print(o.columns, o.schema.names == o.columns)
+o.printSchema()
+print(o.selectExpr("id", "upper(item) AS loud").orderBy("id").collect()[:2])
+cols = (o.withColumn("cost", F.col("qty") * F.col("price"))
+        .withColumns({"half": F.col("cost") / 2, "tag": F.lit("x")})
+        .withColumnRenamed("cost", "total")
+        .withColumnsRenamed({"qty": "units"})
+        .drop("tag"))
+cols.toDF("id", "user", "item", "units", "price", "total", "half").orderBy("id").show(2)
+```
+
+```text
+['id', 'user', 'item', 'qty', 'price'] True
+root
+ |-- id: int64 (nullable = true)
+ |-- user: string_view (nullable = true)
+ |-- item: string_view (nullable = true)
+ |-- qty: int64 (nullable = true)
+ |-- price: double (nullable = true)
+[Row(id=1, loud='TEA'), Row(id=2, loud='CAKE')]
+ id user item  units  price  total  half
+  1  ann  tea      2    3.5    7.0  3.50
+  2  bob cake      1    4.5    4.5  2.25
+```
+
+## Filtering, ordering and distinct rows
+
+| Name | Does |
+|---|---|
+| `filter(cond)`, `where(cond)` | keeps the rows where the condition holds. A condition is a column, or SQL text such as `"qty > 1"` |
+| `orderBy(*cols, ascending=True)`, `sort(...)` | sorts. `ascending=False` reverses it. Columns or sort keys |
+| `limit(n)` | the first `n` rows, in the order they have |
+| `distinct()`, `dropDuplicates(subset)`, `drop_duplicates(subset)` | one row of each: of all the columns, or of the `subset` columns |
+| `sample(fraction)` | about `fraction` of the rows |
+
+```python
+o = spark.table("orders")
+print(o.where(o.qty > 1).count(), o.filter(F.col("item") == "tea").count())
+print(o.select("user").distinct().orderBy("user").collect())
+print(o.dropDuplicates(["user"]).count(), o.drop_duplicates(["item"]).count())
+print(o.orderBy(F.desc("qty"), "id").limit(2).collect())
+print(o.sort("qty", ascending=False).limit(1).collect())
+print(o.sample(fraction=1.0).count())
+```
+
+```text
+2 2
+[Row(user='ann'), Row(user='bob'), Row(user='cy')]
+3 3
+[Row(id=4, user='cy', item='coffee', qty=3, price=3.0), Row(id=1, user='ann', item='tea', qty=2, price=3.5)]
+[Row(id=4, user='cy', item='coffee', qty=3, price=3.0)]
+4
+```
+
+## Joins and set operations
+
+| Name | Does |
+|---|---|
+| `join(other, on, how)` | joins on a column name, a list of them, or a condition. `how` is `inner` (the default), `left`, `right`, `outer` or `full`, `left_semi` or `left_anti` |
+| `alias(name)` | names a DataFrame, for a join's condition: `F.col("o.user")` |
+| `crossJoin(other)` | every row with every row |
+| `union(other)`, `unionAll(other)` | the rows of both, repeats kept, as PySpark does |
+| `unionByName(other)` | the rows of both, matched by column name instead of position |
+| `F.broadcast(df)` | returns the DataFrame as it is: the node plans the join |
+
+```python
+owners = spark.createDataFrame([("ann", "Oslo"), ("bob", "Lima")], ["user", "city"])
+o = spark.table("orders")
+print(o.join(owners, "user", "left").select("id", "city").orderBy("id").collect())
+print(o.alias("o").join(owners.alias("c"), F.col("o.user") == F.col("c.user")).count())
+print(o.join(owners, "user", "left_anti").count())
+print(owners.crossJoin(spark.range(2)).count())
+print(owners.union(owners).count(), owners.unionAll(owners).count())
+print(owners.unionByName(spark.createDataFrame([("Bonn", "zed")], ["city", "user"])).orderBy("user").collect())
+print(o.join(F.broadcast(owners), "user").count())
+```
+
+```text
+[Row(id=1, city='Oslo'), Row(id=2, city='Lima'), Row(id=3, city='Oslo'), Row(id=4, city=None)]
+3
+1
+4
+4 4
+[Row(user='ann', city='Oslo'), Row(user='bob', city='Lima'), Row(user='zed', city='Bonn')]
+3
+```
+
+## Results and display
+
+| Name | Does |
+|---|---|
+| `show(n)` | prints the first `n` rows as a table |
+| `count()`, `first()` | the number of rows; the first row |
+| `head(n)`, `take(n)` | the first `n` rows, as a list |
+| `collect()` | every row, as a list of `Row` |
+| `toLocalIterator()` | the rows one at a time |
+| `toPandas()`, `toArrow()` | a pandas DataFrame; a pyarrow table |
+| `explain()` | prints the plan |
+| `rdd` | raises `NotImplementedError`: RDDs aren't here |
+| `createOrReplaceTempView(name)`, `createTempView(name)`, `registerTempTable(name)` | a name that `spark.sql` reads in this session |
+| `cache()`, `persist()`, `unpersist()`, `repartition(n)`, `coalesce(n)` | return the DataFrame as it is: the lake is the cache |
+
+```python
+o = spark.table("orders").orderBy("id")
+o.show(2)
+print(o.count(), o.first().user, o.head(1)[0].item, o.take(2)[1].id)
+print([r.id for r in o.toLocalIterator()])
+print(o.toPandas().shape, type(o.toArrow()).__name__)
+o.createOrReplaceTempView("ordered")
+o.createTempView("ordered_too")
+o.registerTempTable("ordered_three")
+print(spark.sql("SELECT count(*) AS n FROM ordered_three").collect())
+print(o.cache().count(), o.persist().count(), o.unpersist().count(), o.repartition(4).count(), o.coalesce(1).count())
+o.explain()
+try:
+    o.rdd
+except NotImplementedError as e:
+    print(e)
+```
+
+```text
+id user item  qty  price
+  1  ann  tea    2    3.5
+  2  bob cake    1    4.5
+4 ann tea 2
+[1, 2, 3, 4]
+(4, 5) Table
+[Row(n=4)]
+4 4 4 4 4
+Sort: orders.id ASC NULLS FIRST
+  TableScan: orders projection=[id, user, item, qty, price]
+SortExec: expr=[id@0 ASC], preserve_partitioning=[false], expected_rows=4
+  DataSourceExec: partitions=1, partition_sizes=[1], expected_rows=4
+
+RDDs: use DataFrame methods, or spark.sql
+```
+
+## Nulls and conditionals
+
+| Name | Does |
+|---|---|
+| `F.when(cond, value)`, `.when(cond, value)`, `.otherwise(value)` | a `CASE WHEN`: the first condition that holds gives its value |
+| `F.coalesce(*cols)` | the first column that isn't null |
+| `F.isnull(col)`, `F.isnan(col)` | a test for null, and for NaN |
+| `na.fill(value, subset)`, `fillna(value, subset)` | fills nulls: of the kind of `value` (text, a number, or true or false), in `subset` or every column |
+| `na.drop(how, subset)`, `dropna(how, subset)` | drops the rows with a null (`how="any"`, the default), or only where `subset` has one |
+
+```python
+gaps = spark.createDataFrame([(None, 1), ("x", None), ("y", 3)], ["s", "n"])
+print(gaps.na.fill("z").orderBy("n").collect())
+print(gaps.na.drop(subset=["n"]).count(), gaps.dropna().count())
+print(gaps.fillna(0, subset=["n"]).orderBy("s").collect())
+nums = spark.createDataFrame([(float("nan"), 1.5)], ["a", "b"])
+print(nums.select(F.isnan("a").alias("nan_a"), F.isnull("b").alias("null_b")).collect())
+print(spark.table("orders").select("id", F.when(F.col("qty") > 1, "many").when(F.col("qty") == 1, "one")
+      .otherwise("none").alias("size")).orderBy("id").collect())
+print(spark.createDataFrame([(None, "b")], ["a", "b"]).select(F.coalesce("a", "b").alias("c")).collect())
+```
+
+```text
+[Row(s='x', n=None), Row(s='z', n=1), Row(s='y', n=3)]
+2 1
+[Row(s=None, n=1), Row(s='x', n=0), Row(s='y', n=3)]
+[Row(nan_a=True, null_b=False)]
+[Row(id=1, size='many'), Row(id=2, size='one'), Row(id=3, size='one'), Row(id=4, size='many')]
+[Row(c='b')]
+```
+
+## Grouping and aggregates
+
+| Name | Does |
+|---|---|
+| `groupBy(*cols)`, `groupby(*cols)` | the groups, for `agg` and the methods below |
+| `agg(*exprs)` on a DataFrame | the aggregates of the whole DataFrame, in one row |
+| `GroupedData.agg(*exprs)` | one row per group, with the aggregates |
+| `GroupedData.count()` | the rows in each group, in a column `count` |
+| `GroupedData.sum(col)`, `avg(col)`, `mean(col)`, `min(col)`, `max(col)` | the aggregate of a column, named `sum(qty)` and so on |
+| `GroupedData.pivot(col)` | raises `NotImplementedError`: write a `CASE WHEN` |
+| `F.sum`, `F.avg`, `F.mean`, `F.min`, `F.max` | the aggregate of a column |
+| `F.count(col)`, `F.countDistinct(col)`, `F.count_distinct(col)` | the rows, or the distinct values |
+| `F.approx_count_distinct(col)` | the distinct values, estimated |
+| `F.first(col)`, `F.last(col)` | the first and last value, in the order of the rows. Nulls count (see the caution) |
+| `F.stddev(col)`, `F.variance(col)` | the sample standard deviation and variance |
+| `F.collect_list(col)` | the values of the group, as a list |
+
+```python
+o = spark.table("orders")
+print(o.groupBy("user").agg(F.sum("qty").alias("units"), F.avg("price").alias("avg_price"),
+      F.countDistinct("item").alias("kinds")).orderBy("user").collect())
+print(o.groupby("user").count().orderBy("user").collect())
+print(o.groupBy("user").sum("qty").orderBy("user").collect())
+print(o.groupBy("user").mean("price").orderBy("user").collect())
+print(o.groupBy("user").min("qty").orderBy("user").collect())
+print(o.groupBy("user").max("qty").orderBy("user").collect())
+print(o.agg(F.count("*").alias("n"), F.count_distinct("item").alias("items"),
+      F.approx_count_distinct("user").alias("users"), F.min("qty").alias("least"), F.max("qty").alias("most")).collect())
+print(o.agg(F.round(F.stddev("qty"), 3).alias("sd"), F.round(F.variance("qty"), 3).alias("var"),
+      F.round(F.mean("price"), 3).alias("mean_price")).collect())
+print(o.orderBy("id").agg(F.first("item").alias("first_item"), F.last("item").alias("last_item"),
+      F.collect_list("user").alias("users")).collect())
+try:
+    o.groupBy("user").pivot("item").sum("qty")
+except NotImplementedError as e:
+    print(e)
+```
+
+```text
+[Row(user='ann', units=3, avg_price=3.5, kinds=1), Row(user='bob', units=1, avg_price=4.5, kinds=1), Row(user='cy', units=3, avg_price=3.0, kinds=1)]
+[Row(user='ann', count=2), Row(user='bob', count=1), Row(user='cy', count=1)]
+[Row(user='ann', sum(qty)=3), Row(user='bob', sum(qty)=1), Row(user='cy', sum(qty)=3)]
+[Row(user='ann', avg(price)=3.5), Row(user='bob', avg(price)=4.5), Row(user='cy', avg(price)=3.0)]
+[Row(user='ann', min(qty)=1), Row(user='bob', min(qty)=1), Row(user='cy', min(qty)=3)]
+[Row(user='ann', max(qty)=2), Row(user='bob', max(qty)=1), Row(user='cy', max(qty)=3)]
+[Row(n=4, items=3, users=3, least=1, most=3)]
+[Row(sd=0.957, var=0.917, mean_price=3.625)]
+[Row(first_item='tea', last_item='coffee', users=['ann', 'bob', 'ann', 'cy'])]
+pivot: write it in SQL with CASE WHEN (spark.sql)
+```
+
+## Math and text functions
+
+| Name | Does |
+|---|---|
+| `F.abs`, `F.sqrt`, `F.exp`, `F.floor`, `F.ceil` | the absolute value, square root, e to the power, and the whole number below or above |
+| `F.round(col, scale)` | rounds half up to `scale` decimals |
+| `F.pow(a, b)` | `a` to the power `b` |
+| `F.log(col)` | the natural logarithm of one column |
+| `F.greatest(*cols)`, `F.least(*cols)` | the largest and smallest of the columns in each row |
+| `F.upper`, `F.lower`, `F.length` | the text in capitals, in small letters, and its length |
+| `F.trim`, `F.ltrim`, `F.rtrim` | removes spaces from both ends, the start, or the end |
+| `F.substring(col, pos, len)` | `len` characters from `pos`, counted from 1 |
+| `F.concat(*cols)`, `F.concat_ws(sep, *cols)` | joins text; the second puts `sep` between the parts |
+| `F.regexp_replace(col, pattern, repl)` | replaces every match of a regular expression |
+| `F.regexp_extract(col, pattern, group)` | the text of a group of the first match. Group 1 and up (see the caution) |
+| `F.split(col, sep)` | the text cut at each `sep`, as a list (see the caution) |
+
+```python
+o = spark.table("orders")
+print(o.select("id", F.round("price", 0).alias("rounded"), F.abs(F.col("price") - 4).alias("gap"),
+      F.pow("qty", 2).alias("squared"), F.sqrt("qty").alias("root"), F.floor("price").alias("down"),
+      F.ceil("price").alias("up"), F.greatest("qty", F.lit(2)).alias("big"), F.least("qty", F.lit(2)).alias("small"),
+      F.exp(F.lit(0)).alias("e"), F.log(F.lit(1.0)).alias("ln")).orderBy("id").limit(2).collect())
+print(o.select("id", F.upper("item").alias("up"), F.lower(F.lit("AB")).alias("lo"), F.length("item").alias("len"),
+      F.substring("item", 2, 3).alias("sub"), F.concat(F.col("user"), F.lit("-"), F.col("item")).alias("pair"),
+      F.concat_ws("/", "user", "item").alias("who"), F.regexp_replace("item", "[aeiou]", "*").alias("starred"),
+      F.regexp_extract("user", "(a)n", 1).alias("letter")).orderBy("id").limit(2).collect())
+print(spark.createDataFrame([("  x ", "a,b.c")], ["s", "t"]).select(F.trim("s").alias("trimmed"),
+      F.ltrim("s").alias("left_trim"), F.rtrim("s").alias("right_trim"), F.split("t", ",").alias("parts")).collect())
+```
+
+```text
+[Row(id=1, rounded=4.0, gap=0.5, squared=4.0, root=1.4142135623730951, down=3.0, up=4.0, big=2, small=2, e=1.0, ln=0.0), Row(id=2, rounded=5.0, gap=0.5, squared=1.0, root=1.0, down=4.0, up=5.0, big=2, small=1, e=1.0, ln=0.0)]
+[Row(id=1, up='TEA', lo='ab', len=3, sub='ea', pair='ann-tea', who='ann/tea', starred='t**', letter='a'), Row(id=2, up='CAKE', lo='ab', len=4, sub='ake', pair='bob-cake', who='bob/cake', starred='c*k*', letter='')]
+[Row(trimmed='x', left_trim='x ', right_trim='  x', parts=['a', 'b.c'])]
+```
+
+Any other of PySpark's functions is the SQL function of the same name, with its arguments in order.
+Give a number as `F.lit(…)`, as the examples below do:
+
+```python
+print(spark.range(1).select(
+    F.sha2(F.lit("s"), F.lit(256)).alias("h"),
+    F.pmod(F.lit(-7), F.lit(3)).alias("pm"),
+    F.format_string(F.lit("%s-%d"), F.lit("tea"), F.lit(3)).alias("fs"),
+    F.parse_url(F.lit("https://a.b/c?x=1"), F.lit("HOST")).alias("host"),
+).collect())
+```
+
+```text
+[Row(h='043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89', pm=2, fs='tea-3', host='a.b')]
+```
+
+## Date functions
+
+| Name | Does |
+|---|---|
+| `F.to_date(col)`, `F.to_timestamp(col)` | text as a date, and as a timestamp |
+| `F.year`, `F.month`, `F.dayofmonth` | the part of a date |
+| `F.hour`, `F.minute`, `F.second` | the part of a timestamp |
+| `F.dayofweek(col)` | the day of the week, Sunday is 1 |
+| `F.date_trunc(unit, col)` | the start of the `unit` (`"month"`, `"day"`, and so on) |
+| `F.datediff(end, start)` | the days from `start` to `end` |
+| `F.date_add(col, days)`, `F.date_sub(col, days)` | a date `days` later, or earlier |
+| `F.current_date()`, `F.current_timestamp()` | the date and the time now |
+
+```python
+d = spark.createDataFrame([("2026-09-27 10:20:30",)], ["ts"]).select(
+    F.to_date("ts").alias("day"), F.to_timestamp("ts").alias("at"))
+print(d.select(F.year("day").alias("y"), F.month("day").alias("m"), F.dayofmonth("day").alias("dom"),
+      F.dayofweek("day").alias("dow"), F.hour("at").alias("h"), F.minute("at").alias("mi"), F.second("at").alias("s"),
+      F.date_trunc("month", "at").cast("date").alias("month_start")).collect())
+print(d.select(F.date_add("day", 3).alias("plus_3"), F.date_sub("day", 3).alias("minus_3"),
+      F.datediff(F.lit("2026-10-01"), "day").alias("days_to_oct")).collect())
+print(spark.range(1).select(F.current_date().alias("today"), F.current_timestamp().alias("now")).count())
+```
+
+```text
+[Row(y=2026, m=9, dom=27, dow=1, h=10, mi=20, s=30, month_start=datetime.date(2026, 9, 1))]
+[Row(plus_3=datetime.date(2026, 9, 30), minus_3=datetime.date(2026, 9, 24), days_to_oct=4)]
+1
+```
+
+## Ranking and sorting functions
+
+| Name | Does |
+|---|---|
+| `F.row_number()`, `F.rank()`, `F.dense_rank()` | the position in the window; the rank with gaps after ties; the rank without gaps. Each takes `.over(window)` |
+| `F.lag(col, n)`, `F.lead(col, n)` | the value `n` rows before, or after. Each takes `.over(window)` |
+| `F.asc(col)`, `F.desc(col)` | a sort key for `orderBy`: nulls first ascending, last descending |
+
+```python
+o = spark.table("orders")
+w = Window.orderBy("id")
+print(o.select("id", F.row_number().over(w).alias("nth"), F.rank().over(Window.orderBy("qty")).alias("rank"),
+      F.dense_rank().over(Window.orderBy("qty")).alias("dense"), F.lag("qty", 1).over(w).alias("prev_qty"),
+      F.lead("qty", 1).over(w).alias("next_qty")).orderBy("id").collect())
+print(o.select("id", "qty").orderBy(F.asc("qty"), F.desc("id")).collect())
+```
+
+```text
+[Row(id=1, nth=1, rank=3, dense=2, prev_qty=None, next_qty=1), Row(id=2, nth=2, rank=1, dense=1, prev_qty=2, next_qty=1), Row(id=3, nth=3, rank=1, dense=1, prev_qty=1, next_qty=3), Row(id=4, nth=4, rank=4, dense=3, prev_qty=1, next_qty=None)]
+[Row(id=3, qty=1), Row(id=2, qty=1), Row(id=1, qty=2), Row(id=4, qty=3)]
+```
+
+## Writers
+
+| Name | Does |
+|---|---|
+| `df.write` | a writer for the DataFrame |
+| `mode(name)` | `error` (the default: refuses a folder that holds files), `overwrite`, `append`, or `ignore` (writes nothing where a folder or table is there) |
+| `format(name)` | the format `save` writes: `parquet`, `csv`, `json`, `delta` or `iceberg` |
+| `option(key, value)`, `options(**kw)` | a writer option: CSV's `header` and `sep`, Parquet's `compression`. JSON takes none |
+| `partitionBy(*cols)` | one folder per value of the columns, as `k=v` folders |
+| `saveAsTable(name)` | a lake table: made, replaced (`overwrite`), or added to (`append`) |
+| `insertInto(name, overwrite=False)` | adds the rows to a lake table. `overwrite=True` replaces them |
+| `save(path)` | the files, or a Delta table, in a folder, in the format set |
+| `parquet(path)`, `csv(path)`, `json(path)`, `delta(path)` | the same, by format |
+
+```python
+import pondra
+here = SparkSession(pondra.local("pyspark-files"))   # files are written on this machine, so this session is started here
+menu = here.createDataFrame([(1, "tea", 3.5), (2, "cake", 4.5)], ["id", "item", "price"])
+menu.write.mode("overwrite").option("header", True).csv("menu_csv")
+menu.write.mode("overwrite").option("compression", "snappy").parquet("menu_parquet")
+menu.write.mode("overwrite").format("json").save("menu_json")
+menu.write.mode("overwrite").partitionBy("item").parquet("menu_by_item")
+menu.write.mode("overwrite").format("delta").save("menu_delta")
+print(menu.write.mode("ignore").parquet("menu_parquet"))
+menu.write.mode("overwrite").options(compression="snappy").parquet("menu_opts")
+menu.write.mode("overwrite").saveAsTable("menu_table")
+menu.write.insertInto("menu_table")
+print(here.table("menu_table").count())
+```
+
+```text
+None
+4
+```
+
+## Readers
+
+| Name | Does |
+|---|---|
+| `spark.read` | a reader. Each call makes a new one, so options don't carry over |
+| `format(name)` | the format `load` reads: `parquet`, `csv`, `json`, `delta` or `iceberg` |
+| `option(key, value)`, `options(**kw)` | a reader option, by Spark's name: CSV's `header`, `sep` and `inferSchema`, Parquet's `mergeSchema`. An option Pondra doesn't take is refused by name |
+| `schema(schema)` | the columns and their types, as in `createDataFrame`. CSV columns are text unless `inferSchema` is set or a schema is given |
+| `load(path)` | the files at `path`, in the format set |
+| `parquet(*paths)`, `csv(path)`, `json(path)` | files by format |
+| `table(name)` | a lake table, as `spark.table` |
+
+```python
+print(here.read.option("header", True).csv("menu_csv").collect())
+print(here.read.option("header", True).option("inferSchema", True).csv("menu_csv").dtypes)
+print(here.read.schema("id int, item string, price double").option("header", True).csv("menu_csv").dtypes)
+print(here.read.options(header=True).format("csv").load("menu_csv").count())
+print(here.read.parquet("menu_parquet").count(), here.read.json("menu_json").orderBy("id").collect())
+print(here.read.format("parquet").load("menu_by_item").count())
+print(here.read.format("delta").load("menu_delta").count())
+print(here.read.table("menu_table").count())
+```
+
+```text
+[Row(id='1', item='tea', price='3.5'), Row(id='2', item='cake', price='4.5')]
+[('id', 'int64'), ('item', 'string_view'), ('price', 'double')]
+[('id', 'int32'), ('item', 'string_view'), ('price', 'double')]
+2
+2 [Row(id=1, item='tea', price=3.5), Row(id=2, item='cake', price=4.5)]
+2
+2
+4
+```
+
+## DeltaTable
+
+| Name | Does |
+|---|---|
+| `DeltaTable.forName(spark, name)` | a table by its name |
+| `DeltaTable.forPath(spark, path)` | raises `NotImplementedError`: a Pondra table goes by its name |
+| `alias(name)`, `toDF()` | the same table under a name for a merge; the table as a DataFrame |
+| `update(condition, set)` | `UPDATE`. `set` maps each column to SQL text (`"qty + 5"`) |
+| `delete(condition)` | `DELETE`, where the condition holds. SQL text, or a column |
+| `merge(source, condition)` | starts a `MERGE`, with the steps below and then `execute()` |
+| `whenMatchedUpdate(condition, set)`, `whenMatchedUpdateAll(condition)` | updates the matched rows: the columns in `set`, or every column the two share |
+| `whenMatchedDelete(condition)` | deletes the matched rows |
+| `whenNotMatchedInsert(condition, values)`, `whenNotMatchedInsertAll(condition)` | inserts the source rows with no match: the `values`, or every column the two share |
+| `whenNotMatchedBySourceDelete(condition)` | deletes the target rows the source doesn't have |
+| `execute()` | runs the merge |
+
+The [Update and merge](/pondra/guides/pyspark/#update-and-merge) section of the guide shows a whole job. Here is each step on a
+table of its own:
+
+```python
+from pondra.spark import DeltaTable
+
+spark.createDataFrame([("tea", 2), ("cake", 1), ("juice", 0)], ["item", "qty"]).write.mode("overwrite").saveAsTable("stock")
+stock = DeltaTable.forName(spark, "stock")
+print(stock.toDF().count())
+stock.update("item = 'cake'", {"qty": "qty + 5"})
+sales = spark.createDataFrame([("tea", 4), ("milk", 9)], ["item", "qty"])
+(stock.alias("t").merge(sales.alias("s"), "t.item = s.item")
+    .whenMatchedUpdateAll()
+    .whenNotMatchedInsert(values={"item": "s.item", "qty": "s.qty"})
+    .execute())
+returns = spark.createDataFrame([("juice", 0)], ["item", "qty"])
+(stock.alias("t").merge(returns.alias("s"), "t.item = s.item")
+    .whenMatchedDelete("s.qty = 0")
+    .whenNotMatchedBySourceDelete("t.item = 'cake'")
+    .execute())
+print(stock.toDF().orderBy("item").collect())
+try:
+    DeltaTable.forPath(spark, "stock")
+except NotImplementedError as e:
+    print(e)
+```
+
+```text
+3
+[Row(item='milk', qty=9), Row(item='tea', qty=4)]
+DeltaTable.forPath: a Pondra table goes by its name (DeltaTable.forName)
+```
+
+## Python function names
+
+| Name | Does |
+|---|---|
+| `F.udf(f, returnType)` | a Python function of one value at a time, for columns. It gives a `UserDefinedFunction`, which is called on columns |
+| `F.pandas_udf(f, returnType)` | the same, called once a batch with a pandas Series |
+| `spark.udf.register(name, f, returnType)` | a function for SQL and frames, under `name` |
+| `UserDefinedFunction` | the class `F.udf` gives |
+
+Python reads a function's source from its file or notebook, so write the function there, as in
+[Python functions](/pondra/guides/pyspark/#python-functions). A lambda works the same way:
+
+```bash
+cat > names_udf.py <<'EOF'
+from pondra.spark import SparkSession, UserDefinedFunction, functions as F
+
+spark = SparkSession.builder.remote("pondra://localhost:8080").getOrCreate()
+shout = F.udf(lambda s: s.upper() + "!", "string")
+print(isinstance(shout, UserDefinedFunction))
+print(spark.table("orders").select("id", shout("item").alias("loud")).orderBy("id").collect()[:2])
+EOF
+python3 names_udf.py
+```
+
+```text
+True
+[Row(id=1, loud='TEA!'), Row(id=2, loud='CAKE!')]
+```
+
+## Types
+
+| Name | Does |
+|---|---|
+| `types.StructType()`, `.add(name, type, nullable)` | a schema, built one column at a time |
+| `types.StructField(name, type, nullable)` | one column of a schema |
+| `types.StringType()`, `IntegerType()`, `LongType()`, `ShortType()`, `ByteType()`, `FloatType()`, `DoubleType()`, `BooleanType()`, `DateType()`, `TimestampType()`, `BinaryType()` | the types, for a schema or a cast |
+| `types.DecimalType(precision, scale)` | a decimal number |
+| `TYPES` | the SQL type of each PySpark type name, such as `TYPES["bigint"]` |
+
+```python
+from pondra.spark import TYPES, types
+
+schema = (types.StructType().add("id", types.LongType()).add("item", types.StringType())
+          .add("price", types.DecimalType(10, 2)).add("ok", types.BooleanType()).add("day", types.DateType()))
+goods = spark.createDataFrame([(1, "tea", 3.5, True, "2026-09-27")], schema)
+print(goods.dtypes)
+print(goods.collect())
+print(spark.range(1).select(F.lit(1).cast(types.ShortType()).alias("a"), F.lit(1).cast(types.ByteType()).alias("b"),
+      F.lit(1.5).cast(types.FloatType()).alias("c"), F.lit("2026-09-27 10:00:00").cast(types.TimestampType()).alias("d"),
+      F.lit("ab").cast(types.BinaryType()).alias("e"), F.lit("7").cast(types.IntegerType()).alias("f"),
+      F.lit(2).cast(types.DoubleType()).alias("g")).dtypes)
+print(types.StructField("qty", types.IntegerType(), False).nullable, TYPES["bigint"], TYPES["string"])
+```
+
+```text
+[('id', 'int64'), ('item', 'string_view'), ('price', 'decimal128(10, 2)'), ('ok', 'bool'), ('day', 'date32[day]')]
+[Row(id=1, item='tea', price=Decimal('3.50'), ok=True, day=datetime.date(2026, 9, 27))]
+[('a', 'int16'), ('b', 'int8'), ('c', 'float'), ('d', 'timestamp[ns]'), ('e', 'binary'), ('f', 'int32'), ('g', 'double')]
+False BIGINT VARCHAR
+```
+
+## Ending the session
+
+`spark.stop()` ends the session. This page's session is a remote one, so its node keeps running; a session from `local()` stops its node too. Nothing after it on this page uses a session.
+
+```python
+spark.stop()
+print(SparkSession.getActiveSession())
+```
+
+```text
+None
+```
+
+## Where it differs from PySpark
+
+What Pondra doesn't do, or does differently. Each is a limit you can plan around:
+
+<Aside type="caution">
+
+- What isn't covered raises `NotImplementedError` naming the way round: RDDs (use DataFrame methods
+  or `spark.sql`), `pivot` (write a `CASE WHEN`), `readStream` (a materialized view),
+  `DeltaTable.forPath` (a Pondra table goes by name).
+- There is no Scala or Java client, no `SparkContext`, and no Spark Connect server.
+- `printSchema()` and `dtypes` show Arrow's type names (`int64`, `string_view`), not Spark's.
+- A UDF runs in Python on the nodes with the imports, helpers and constants it uses. Anything
+  else from your notebook (a DataFrame, a connection) is refused with the fix in the message.
+- Put `orderBy` last. A `select`, `withColumn` or `withColumns` after it drops the sort.
+- Some names don't do all that PySpark's do yet. `sample` ignores its `seed`, so each run picks
+  other rows. `unionByName` takes `allowMissingColumns` but doesn't check it. `first` and `last` keep
+  nulls: `ignorenulls` is ignored. `regexp_extract` takes group 1 and up: group 0 gives an empty text.
+  `split` cuts at a plain text separator, not a regular expression. `F.log` takes one column (the
+  natural log), not a base. `show(vertical=True)` prints the usual table. A function takes a number only as `F.lit(…)`: `F.sha2(col, 256)` raises an error, where PySpark takes the plain 256.
+- `alias` names a DataFrame in a join only. Outside one, `F.col("o.id")` and `df["id"]` in a
+  `select` are errors. In a `where` or a join, `df["id"]` and `df.id` work.
+
+</Aside>

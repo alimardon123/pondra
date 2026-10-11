@@ -1,8 +1,6 @@
 ---
 title: Postgres port
 description: Connect psql, drivers and BI tools to a Pondra node over the Postgres wire protocol, with the types, COPY and the users.
-sidebar:
-  order: 9
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -27,9 +25,13 @@ pondra serve lake --pg 127.0.0.1:5432
 | host, port | the address of `--pg` |
 | database | any name on a node that serves one lake. `SELECT current_database()` gives the lake's name. On a [folder of lakes](/pondra/guides/server/), the database in the connection picks the lake |
 | user, password | with no tokens set and no user who signs in, anything. Otherwise a [user](/pondra/guides/security/#users-roles-and-grants) and its password, signed in with SCRAM-SHA-256 as Postgres does it (a user with only tokens gives one as its password); or `reader`, `writer` or `admin` and that role's token |
-| SSL | not offered yet: use `sslmode=disable`, or `prefer` |
+| SSL | with a certificate (`--tls-cert`, `--tls-key`), `sslmode=require` from other machines (`prefer` works too: it takes TLS when the node offers it). `sslmode=disable` works from this machine only: a plain connection from another machine gets `FATAL 28000` and the reason. Without a certificate, `sslmode=require` is refused. See [TLS](/pondra/guides/security/#tls) |
 
 `SELECT version()` answers `PostgreSQL 16.0 (Pondra on Apache DataFusion)`, and `SHOW server_version` answers `16.0`.
+
+Two things a driver may ask for are not offered. GSSAPI encryption (`gssencmode=require`) fails on
+the client, since the node doesn't offer it. A cancel request (psql's Ctrl-C, a driver's cancel) is
+accepted and does nothing, so it doesn't stop a statement: close the connection to stop one.
 
 The roles are the same as for [HTTP](/pondra/reference/http/#roles): `reader` may query, `writer` may
 also insert, update, delete and copy in, and `admin` may also create tables and other objects.
@@ -83,7 +85,7 @@ its own commit.
 | `DO LANGUAGE python \| sql $$ … $$` | the block's rows, or the tag `DO`. What Python prints comes as `NOTICE` messages. It needs an admin, and Python needs a node started with `--python` |
 | `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT` | a transaction: its statements one commit |
 | `SAVEPOINT`, `RELEASE`, `ROLLBACK TO` | refused (`0A000`): a transaction commits or rolls back whole |
-| `SET`, `RESET`, `SHOW` | the connection's [settings](/pondra/reference/sql/#settings-and-prepared-statements): DataFusion's `datafusion.*` options checked and used by its queries, Postgres's names kept and shown |
+| `SET`, `RESET`, `SHOW` | the connection's [settings](/pondra/sql/statements/#settings-and-prepared-statements): DataFusion's `datafusion.*` options checked and used by its queries, Postgres's names kept and shown |
 | `PREPARE`, `EXECUTE`, `DEALLOCATE` | the connection's prepared statements (a `DEALLOCATE` of a name the protocol prepared: accepted) |
 | `DISCARD`, `CLOSE` | accepted, and ignored |
 | `SHOW server_version`, `standard_conforming_strings`, `transaction_isolation`, `client_encoding` | a fixed answer, unless the connection set it |
@@ -197,7 +199,7 @@ text or CSV into a table, one batch at a time, through the log. `psql`'s `\copy`
 
 The default `NULL` is `\N` in text and empty in CSV. `COPY` into a lake you attached is refused:
 `INSERT INTO` it instead. A column you leave out is null. `COPY … TO 'url'` (with a quoted URL, not
-`STDOUT`) is not this: it is the [files statement](/pondra/reference/sql/#files-and-secrets).
+`STDOUT`) is not this: it is the [files statement](/pondra/sql/statements/#files-and-secrets).
 
 ```bash
 printf 'id,item,amount\n3,juice,2.5\n4,scone,3\n' > more.csv

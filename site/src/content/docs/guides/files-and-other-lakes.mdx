@@ -1,8 +1,6 @@
 ---
 title: Files and other lakes
 description: Read and write Parquet, CSV, JSON, Delta and Iceberg on disk, in buckets or over HTTPS, and attach other engines' tables.
-sidebar:
-  order: 4
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -151,7 +149,7 @@ SQL
   refused.
 - **`DROP TABLE`** drops the name. The files stay.
 
-[SQL statements](/pondra/reference/sql/#external-tables) has the options and what is refused.
+[SQL statements](/pondra/sql/statements/#external-tables) has the options and what is refused.
 
 ## Copy files into the lake
 
@@ -325,7 +323,7 @@ SQL
 
 - `PARTITION_BY` writes Hive-style folders (`day=2026-09-27/`).
 - `COPY` takes DataFusion's words too, `STORED AS CSV PARTITIONED BY (day) OPTIONS ('format.has_header' 'false')`
-  in place of the brackets: see [SQL statements](/pondra/reference/sql/#files-and-secrets). Its
+  in place of the brackets: see [SQL statements](/pondra/sql/statements/#files-and-secrets). Its
   writers' own options pass through as DataFusion names them (`'format.compression' 'zstd(10)'`,
   `'format.data_page_row_count_limit' '1000'`, `'format.quote_style' 'Always'`, …); one that isn't
   the format's is refused.

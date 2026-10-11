@@ -1,8 +1,6 @@
 ---
 title: Run files as jobs
 description: Run the lake's SQL, Python and notebook files with parameters, from every client, on a schedule, each run logged.
-sidebar:
-  order: 9.5
 setup: |
   CREATE TABLE orders (day DATE, region VARCHAR, amount DOUBLE);
 ---
@@ -79,7 +77,7 @@ CALL run('etl/by_region.sql', region => 'west', day => '2026-09-29');
 
 - **A `$name` used and never set** is a parameter too, required, with no type.
 - **The run's variables are its own:** a `DECLARE` in a file doesn't change the caller's `$day`,
-  and `$day = $day + 1` in it changes only the run's ([variables](/pondra/reference/sql/#variables)).
+  and `$day = $day + 1` in it changes only the run's ([variables](/pondra/sql/statements/#variables)).
 - **In Python** (a `.py` file, a notebook's cells), `pondra.vars.day` is the same value.
 
 ## Python files and notebooks
@@ -237,5 +235,6 @@ pushed 1, deleted 0 in the lake
   the statements, bound on the node.
 - **The file's ⋯** (and a notebook's) has **Run as a job**, which saves the file and starts it on the
   node, and **Schedule…**, which makes a task that runs it (`15 minutes`, `1 day`, or a cron line).
-- **History** (the right pane), at **Runs**, lists the node's runs, newest first, and the schedules, each with a
-  button to drop it. A running job's row updates until it ends. Click a file's run to open the file.
+- **History** (in the right pane) lists what ran, newest first, the node's runs among it. A running
+  job's row updates until it ends. Click a file's run to open the file.
+- **Jobs** (in the right pane, too) lists the schedules. Each one's ⋯ menu drops it.

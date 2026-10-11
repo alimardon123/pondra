@@ -1,8 +1,6 @@
 ---
 title: Your first lake
 description: Make a lake, write rows, query them, and keep a view up to date, from SQL, Python or JavaScript.
-sidebar:
-  order: 2
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -87,6 +85,7 @@ you get [the console](/pondra/start/console/): the lake's tables, and cells for 
 </Tabs>
 
 <Aside>
-A write is visible to every query as soon as it is acknowledged, on every node. There's nothing
-to refresh.
+A SQL write is in the answer as soon as its statement returns, on the node that took it, and other
+nodes see it a few milliseconds later. There's nothing to refresh.
+[Freshness and guarantees](/pondra/concepts/freshness-and-guarantees/) has the numbers.
 </Aside>

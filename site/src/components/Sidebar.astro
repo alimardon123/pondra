@@ -1,0 +1,8 @@
+---
+// Starlight's sidebar, with the site's tabs above it in the menu of a narrow screen.
+import Default from '@astrojs/starlight/components/Sidebar.astro';
+import Tabs from './Tabs.astro';
+---
+
+<div class="md:sl-hidden sidebar-tabs"><Tabs /></div>
+<Default><slot /></Default>
