@@ -586,6 +586,37 @@ class _Reader:
 
 # ---------------------------------------------------------------- data frames
 
+def _show_cell(v, truncate):
+    """One value as PySpark's show writes it: NULL, true or false, or its text, cut as `truncate`
+    says (True: 20 characters, a number: that many, the last three as "..."; False or 0: whole)."""
+    s = "NULL" if v is None else "true" if v is True else "false" if v is False else str(v)
+    width = 20 if truncate is True else int(truncate or 0)
+    if width <= 0 or len(s) <= width:
+        return s
+    return s[:width] if width < 4 else s[:width - 3] + "..."
+
+
+def _vertical(t, n, truncate):
+    """PySpark's `show(vertical=True)`: a `-RECORD i` block for each row, a line for each column, and
+    a footer when rows were left out. `t` holds one row more than `n`, which says whether any were."""
+    if not t.column_names:  # (PySpark fails here too: its widths are the maximum over no columns)
+        raise ValueError("show(vertical=True): the frame has no columns, so there is no record to show")
+    if t.num_rows == 0:
+        return "(0 rows)"
+    names = t.column_names
+    rows = list(zip(*[[_show_cell(v, truncate) for v in c.to_pylist()[:n]] for c in t.columns]))
+    name_w = max(3, *map(len, names))  # (PySpark's minimum width is 3)
+    value_w = max(3, *(len(v) for r in rows for v in r))
+    lines = []
+    for i, r in enumerate(rows):
+        lines.append(f"-RECORD {i}".ljust(name_w + value_w + 5, "-"))  # (the header fills the width of a field line)
+        lines += [f" {name.ljust(name_w)} | {v.ljust(value_w)} " for name, v in zip(names, r)]
+    text = "".join(line + "\n" for line in lines)
+    if t.num_rows > n:
+        text += f"only showing top {n} row{'s' if n != 1 else ''}"
+    return text
+
+
 class DataFrame:
     """A PySpark DataFrame: a `pondra.Frame` underneath (`df._f`), run when asked."""
 
@@ -862,6 +893,9 @@ class DataFrame:
         return self.limit(n).collect()
 
     def show(self, n=20, truncate=True, vertical=False):
+        if vertical:
+            print(_vertical(self.limit(n + 1).toArrow(), n, truncate))  # (one row more: it tells whether a footer is due)
+            return
         t = self.limit(n).toPandas()
         if truncate:
             t = t.map(lambda v: (str(v)[:17] + "...") if isinstance(v, str) and len(v) > 20 else v)

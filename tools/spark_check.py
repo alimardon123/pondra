@@ -13,7 +13,9 @@ session and node.
 PySpark lives only in /home/claude/venv-spark; run this with its Python. Java 21 is required.
 """
 import argparse
+import contextlib
 import datetime
+import io
 import json
 import math
 import os
@@ -605,6 +607,19 @@ def p_show_vertical_no_columns_raises(spark, F, Window):  # PySpark can't show a
     spark.table("orders").where(F.col("id") <= 3).select("id").drop("id").show(vertical=True)
 
 
+def p_show_vertical(spark, F, Window):  # show(vertical=True): -RECORD blocks, PySpark's widths, cuts, NULLs and the footer
+    rows = [(1, "tea", None, 2.5, True), (22, "a much longer string value here", "x", 3.0, False), (333, "", "yz", None, None)]
+    df = spark.createDataFrame(rows, "id int, item string, z string, f double, b boolean")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        df.show(vertical=True)
+        df.show(truncate=5, vertical=True)
+        df.show(n=1, vertical=True)
+        df.show(truncate=False, vertical=True)
+        df.where(F.col("id") < 0).show(vertical=True)
+    return buf.getvalue()
+
+
 def p_union_by_name_missing(spark, F, Window):  # allowMissingColumns: a column one side lacks is NULL there; the left's come first
     left = spark.table("orders").where(F.col("id") <= 5).select("id", "item")
     right = spark.table("orders").where(F.col("id") <= 3).select("id", "qty", F.col("price").alias("p"))
@@ -729,6 +744,8 @@ PIPELINES = [
     ("drop_every_column", None, "value", p_drop_every_column),
     ("union_by_name_allow_missing", False, "frame", p_union_by_name_missing),
     ("union_by_name_differing_raises", None, "raises", p_union_by_name_differing_raises),
+    ("show_vertical_records", None, "value", p_show_vertical),
+    ("show_vertical_no_columns_raises", None, "raises", p_show_vertical_no_columns_raises),
 ]
 
 
