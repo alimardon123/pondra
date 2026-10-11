@@ -19,6 +19,10 @@ server = ["dep:slatedb", "dep:reqwest", "dep:tokio", "dep:axum", "dep:toml", "de
 [lib]
 doctest = false # (the modules' docs are prose and SQL, not Rust examples)
 
+[[bin]]
+name = "pondra"
+required-features = ["server"] # (the program is a node's command line)
+
 [dependencies]
 parquet = { version = "59", default-features = false, features = ["snap", "zstd", "lz4"] }
 datafusion = { version = "55", default-features = false, features = ["parquet", "sql", "nested_expressions", "datetime_expressions", "string_expressions", "unicode_expressions", "regex_expressions", "crypto_expressions", "encoding_expressions"] }

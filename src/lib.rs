@@ -113,7 +113,3 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod write;
 #[cfg(feature = "server")] mod write_outside;
 #[cfg(feature = "server")] mod workspace;
-
-#[cfg(feature = "server")]
-#[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc; // returns freed memory to the OS promptly (glibc malloc holds on to it)
