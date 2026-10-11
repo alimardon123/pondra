@@ -277,13 +277,12 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
             let db = s.default_db().await;
             route(&s, &db, &path, req).await
         })
-        .layer(axum::middleware::from_fn_with_state(server.clone(), web_guard))
-        .layer(axum::middleware::from_fn(plain))
+        .layer(axum::middleware::from_fn_with_state(server.clone(), plain))
         .with_state(server.clone());
     eprintln!("pondra serve: the lakes in {folder} as databases, on {addr}");
     let listener = crate::tls::Doors::bind(&addr, crate::tls::Door::Http).await?; // (TLS too: `tls.rs`)
     let stop = async {
-        crate::stopped(false).await;
+        crate::cli::stopped(false).await;
     };
     axum::serve(listener, app.into_make_service_with_connect_info::<crate::tls::Peer>()).with_graceful_shutdown(stop).await?;
     let nodes: Vec<Node> = server.nodes.lock().await.drain().map(|(_, n)| n).collect();
@@ -350,11 +349,6 @@ async fn route(s: &Server, name: &str, path: &str, req: Request) -> Response {
     for (k, v) in parts.headers.iter().filter(|(k, _)| !matches!(k.as_str(), "host" | "content-length" | "transfer-encoding" | "connection")) {
         out = out.header(k, v);
     }
-    // (the browser's own host, so the child decides same-origin against it, not the loopback host
-    // this proxy rewrites to: `server::same_site`. A browser can't set this header itself.)
-    if let Some(host) = parts.headers.get("host") {
-        out = out.header("x-forwarded-host", host);
-    }
     match out.send().await {
         Ok(res) => {
             let mut resp = Response::builder().status(res.status().as_u16());
@@ -375,22 +369,20 @@ async fn route(s: &Server, name: &str, path: &str, req: Request) -> Response {
 
 /// A Postgres connection: its startup message says the database; from then on, the bytes go to
 /// and from that database's node as they are.
-/// A plain connection from another machine, when this server takes TLS: refused, saying why.
-async fn plain(axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, req: Request, next: axum::middleware::Next) -> Response {
-    match peer.allowed() {
-        true => next.run(req).await,
-        false => (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response(),
+/// A plain connection from another machine, when this server takes TLS: refused, saying why. With
+/// no tokens, a browser's page from elsewhere is refused here too (`auth::cross_site`), and what the
+/// browser said of its page goes no further: the databases' nodes are asked from this machine.
+async fn plain(State(s): State<Shared>, axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, mut req: Request, next: axum::middleware::Next) -> Response {
+    if !peer.allowed() {
+        return (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response();
     }
-}
-
-/// On a front with no tokens, every request is an administrator (as a single node's is), so keep a
-/// web page the user is visiting off it: a browser's cross-site request, or one whose host could
-/// have been rebound to this front, is refused (`server::same_site`). Non-browser clients and the
-/// front's own same-origin console pass. With tokens on, a browser can't carry one cross-site
-/// anyway, so the handlers' token checks do the work and this steps aside.
-async fn web_guard(State(s): State<Shared>, req: Request, next: axum::middleware::Next) -> Response {
-    if !s.auth.on() && !crate::server::same_site(req.headers()) {
-        return (StatusCode::FORBIDDEN, "this node has no tokens, so it answers only this machine's own tools; a request from a web page is refused (set a token, or list its origin in PONDRA_ALLOWED_ORIGINS)").into_response();
+    if !s.auth.on() && !req.headers().contains_key("authorization") {
+        if let Some(why) = crate::auth::cross_site(req.headers(), req.method(), Some(peer.addr), &s.addr) {
+            return (StatusCode::FORBIDDEN, why).into_response();
+        }
+    }
+    for k in ["origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "sec-fetch-user"] {
+        req.headers_mut().remove(k);
     }
     next.run(req).await
 }

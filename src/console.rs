@@ -216,7 +216,7 @@ pub async fn settings() -> Response {
 /// machine's (one file, shared by every lake and session opened here), so an admin writes them,
 /// and from this machine only — like choosing the Python (`choose_python`). On an open node the
 /// local console page is an admin and saves them; a web page the user visits is not (`guard`'s
-/// `same_site`), and a reverse proxy's loopback address no longer stands in for an admin token.
+/// `auth::cross_site`), and a reverse proxy's loopback address no longer stands in for an admin token.
 /// At most 64 KB of JSON.
 pub async fn save_settings(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, .. }): axum::extract::ConnectInfo<crate::tls::Peer>, role: axum::Extension<crate::auth::Role>, body: bytes::Bytes) -> Response {
     if *role < crate::auth::Role::Admin || !from.ip().is_loopback() {

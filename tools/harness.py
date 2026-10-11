@@ -1320,19 +1320,59 @@ def serverless():
     node = Node(lake, A.port).start()  # a node starting on the idle lake leads at once
     node_start_s, node_leads = round(time.time() - t, 2), leads(node)
     via_node, via_node_s = timed(insert)  # the files go to the running leader
-    node.kill()  # kill -9: its mark in the bucket goes stale within 30 s
-    after_kill, after_kill_s = timed(insert)  # (no followers to take over: it waits for the stale mark)
-    node2 = Node(lake, A.port + 1).start()
+    # kill -9 lets go of the leader's lock file, so a writer on this machine finds it free and writes
+    # at once (it doesn't wait for the leader's mark to go stale, which takes 30 s).
+    node.kill()
+    after_kill, after_kill_s = timed(insert)
+
+    def withdraw_requests():
+        # A killed writer can't withdraw the request it left in the inbox (`inbox::send` does when it
+        # gives up), so take it back here: else the next leader would record it.
+        if not lake.startswith("s3://"):
+            folder = os.path.join(lake, "inbox")
+            for f in (os.listdir(folder) if os.path.isdir(folder) else []):
+                if f != "bell" and not f.endswith(".out"):
+                    os.remove(os.path.join(folder, f))
+            return
+        bucket, prefix = lake[5:].split("/", 1)
+        for pg in S3[0].get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix + "/inbox/"):
+            keys = [{"Key": o["Key"]} for o in pg.get("Contents", []) if not o["Key"].endswith((".out", "/bell"))]
+            if keys:
+                S3[0].delete_objects(Bucket=bucket, Delete={"Objects": keys, "Quiet": True})
+
+    # Another machine: a writer with a temp folder of its own finds no lock file for the leader, so
+    # it waits for the leader's mark, as it always did. A leader here is killed, and that writer
+    # waits 5 s: it adds no term (the mark is still fresh), and it is stopped.
+    node3 = Node(lake, A.port + 2).start()
+    timed(insert)  # a leader started here takes the rows like any other
+    node3.kill()
+    terms, local = os.path.join(lake, "cluster", "term"), not lake.startswith("s3://")  # (a bucket's terms aren't files here)
+    before = os.listdir(terms) if local else []
+    other = tempfile.mkdtemp(prefix="pondra-other-")
+    waiting = subprocess.Popen([BIN, "sql", "--dir", lake, insert], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               env={**os.environ, "TMPDIR": other, "TEMP": other, "TMP": other})
+    time.sleep(5)
+    other_machine_waits = waiting.poll() is None and (not local or os.listdir(terms) == before)
+    waiting.kill()
+    waiting.wait()
+    withdraw_requests()
+    shutil.rmtree(other, ignore_errors=True)
+    node2 = Node(lake, A.port + 1).start()  # the other machine's writer is gone: this node leads at once
     n = sql(node2.port, "SELECT count(*) AS n, count(DISTINCT id) AS ids FROM sales")[0]
     node2_leads = leads(node2)
     node2.kill()
-    ok = n == {"n": 8000, "ids": 1000} and '"duplicate":true' in once[1] and node_leads and node2_leads and node_start_s < 10
+    # 8000 rows, and the leader started here adds 1000 more: 9000.
+    ok = (n == {"n": 9000, "ids": 1000} and '"duplicate":true' in once[1] and node_leads and node2_leads and node_start_s < 10
+          and after_kill_s < 10 and other_machine_waits)
     print(json.dumps({"serverless": {"alone_s": alone_s, "retry": once, "four_at_once": together, "node_start_s": node_start_s, "node_leads": node_leads,
-                                     "via_node_s": via_node_s, "after_leader_killed_s": after_kill_s, "rows": n, "ok": ok}}))
+                                     "via_node_s": via_node_s, "after_leader_killed_s": after_kill_s, "other_machine_waits": other_machine_waits,
+                                     "rows": n, "ok": ok}}))
     if not ok:
         sys.exit(1)
     return (f"INSERT from a process with no server: {alone_s}s alone, 4 at once, retries once; a node on the idle lake leads "
-            f"in {node_start_s}s; via a running leader {via_node_s}s; after the leader is killed {after_kill_s}s; {n['n']} rows, no duplicates")
+            f"in {node_start_s}s; via a running leader {via_node_s}s; after the leader is killed {after_kill_s}s (this machine's writer "
+            f"finds its lock free); another machine's writer waits for the mark (no new term in 5 s: {other_machine_waits}); "
+            f"{n['n']} rows, no duplicates")
 
 
 def clients():
@@ -6605,7 +6645,8 @@ def server():
     port, pg = A.port, A.port + 10
     env = {**os.environ, "PONDRA_DATABASE_IDLE_SECS": "3"}
     def start(how=()):
-        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log = open(f"/tmp/pondra-{port}-server-{uuid.uuid4().hex[:6]}.stderr", "w")  # (its databases' nodes write here too: CI keeps it when a check fails)
+        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5"], env=env, stdout=subprocess.DEVNULL, stderr=log)
         until(lambda: _try(lambda: call(port, "GET", "/databases") is not None), True, 30)
         return p
     srv = start()
@@ -6716,6 +6757,7 @@ def server():
     print(json.dumps({"server": checks, "ok": ok, "first_write_s": first_write}, indent=1))
     if not ok:
         print(missing[:300], idle, joined)
+        print(json.dumps({"seen": seen}, default=str)[:4000])  # (what each database answered whom)
         sys.exit(1)
     return f"server: a folder of lakes as databases over Postgres and HTTP, created, dropped, idle-stopped, joined, restarted: all {len(checks)} checks pass"
 
@@ -7097,12 +7139,11 @@ def safety():
     checks["HTTPS answers; plain HTTP only from this machine, refused from another saying why"] = said["https"] == (200, '[{"x":1}]') and said["plain here"] == (200, '[{"x":1}]') \
         and (not away or (said["https away"] == (200, '[{"x":1}]') and said["plain away"][0] == 403 and "takes TLS" in said["plain away"][1]))
 
-    # A web page is kept off an open node (no tokens): a browser's cross-site Origin, or a host it
-    # could have rebound to this node, is not auto-admitted; non-browser clients and the node's own
-    # page pass. (Invariant 288. The node `a` has no tokens, so every request is an admin otherwise.)
+    # A browser page the user visits is kept off an open node by `auth::cross_site` at the guard
+    # (its own test block is below, in `users`). Here we only check the settings endpoint's own
+    # belt: `web()` reaches it over plain HTTP from this machine, with or without a browser Origin.
     def web(port, path, origin=None, host=None, body=b"SELECT 1 AS x", method="POST", secure=False):
-        # (plain HTTP from this machine, which an open node answers: same_site is transport-independent,
-        # and this keeps the check off the TLS path the HTTPS checks above already cover.)
+        # (plain HTTP from this machine, which an open node answers; the HTTPS checks above cover TLS.)
         ctx = ssl.create_default_context(cafile=ca)
         c = http.client.HTTPSConnection("127.0.0.1", port, context=ctx, timeout=60) if secure else http.client.HTTPConnection("127.0.0.1", port, timeout=60)
         h = {}
@@ -7116,29 +7157,6 @@ def safety():
             return r.status, r.read().decode(errors="replace")
         except Exception as e:
             return 0, f"{type(e).__name__}: {e}"
-    web_said = {
-        "no origin (a client)": web(P, "/sql"),
-        "same origin (the console)": web(P, "/sql", origin=f"https://127.0.0.1:{P}", host=f"127.0.0.1:{P}"),
-        "cross-site write": web(P, "/sql", origin="https://evil.example"),
-        "cross-site read": web(P, "/sql", origin="https://evil.example", body=b"SELECT 1 AS x", method="POST"),
-        "rebound host": web(P, "/sql", origin="https://evil.example:4000", host="evil.example:4000"),
-        "page still loads cross-site": web(P, "/", origin="https://evil.example", body=b"", method="GET"),
-    }
-    info["web"] = {k: (s, b[:60]) for k, (s, b) in web_said.items()}
-    checks["a web page is kept off an open node: cross-site and rebinding refused, the client and the console page unaffected"] = \
-        web_said["no origin (a client)"] == (200, '[{"x":1}]') and web_said["same origin (the console)"] == (200, '[{"x":1}]') \
-        and web_said["cross-site write"][0] == 401 and web_said["cross-site read"][0] == 401 and web_said["rebound host"][0] == 401 \
-        and web_said["page still loads cross-site"][0] == 200
-    # PONDRA_ALLOWED_ORIGINS lets a named browser tool through (its origin, over a loopback host).
-    allow = Node(new_lake(), P + 40, env={"PONDRA_ALLOWED_ORIGINS": "https://studio.example"}).start()
-    allowed_said = {
-        "listed origin": web(P + 40, "/sql", origin="https://studio.example", host=f"127.0.0.1:{P + 40}", secure=False),
-        "other origin": web(P + 40, "/sql", origin="https://other.example", host=f"127.0.0.1:{P + 40}", secure=False),
-    }
-    info["allowed_origins"] = allowed_said
-    checks["PONDRA_ALLOWED_ORIGINS lets a listed origin through, and no other"] = \
-        allowed_said["listed origin"] == (200, '[{"x":1}]') and allowed_said["other origin"][0] == 401
-    allow.kill()
     # PUT /console/settings is an admin's, from this machine (like choosing the Python): a web page
     # the user visits can't overwrite them, and behind a reverse proxy a loopback address no longer
     # stands in for a token. Its own PONDRA_CONFIG_DIR keeps the test off this machine's real settings.
@@ -7267,6 +7285,116 @@ def safety():
     n.kill()
     ok = all(checks.values())
     print(json.dumps({"safety": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+def guarded():
+    """What each door takes, and from whom (the security review before 1.0): an open node answers
+    this machine and its own page, never a page from another site nor a name rebound to this
+    machine, though a link from elsewhere still opens the console; a user's rows go in through the
+    row doors (/append, /insert) only as its grants say, never through the nodes' own routes; a
+    write token's flushes and files only into tables that are there, in the log and their folders;
+    nobody but the nodes adds to the lake's own records; a change a follower forwards runs as its
+    user, reads included; a .py file is an admin's."""
+    import base64
+    P = A.port
+    lake = new_lake()
+    a = Node(lake, P).start()
+    checks, info = {}, {}
+
+    def ask(port, body, path="/sql", method="POST", auth=None, headers=None):
+        h = {**(headers or {}), **({"Authorization": auth} if auth else {})}
+        try:
+            return call(port, method, path, body.encode() if isinstance(body, str) else body, headers=h)
+        except Exception as e:
+            return f"ERROR {e}"
+    refused = lambda r: isinstance(r, str) and r.startswith("ERROR 403")
+    # An open node: no token, no user
+    me = f"127.0.0.1:{P}"
+    said = {
+        "a program": ask(P, "SELECT 1 AS x"),
+        "its own page": ask(P, "SELECT 1 AS x", headers={"Origin": f"http://{me}", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"}),
+        "localhost": ask(P, "SELECT 1 AS x", headers={"Host": f"localhost:{P}", "Origin": f"http://localhost:{P}"}),
+        "a link from elsewhere": ask(P, b"", path="/", method="GET", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}),
+        "another site's page": ask(P, "SELECT 1 AS x", headers={"Origin": "http://evil.example"}),
+        "another site, by fetch metadata": ask(P, "SELECT 1 AS x", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors"}),
+        "a form posted from elsewhere": ask(P, "SELECT 1 AS x", headers={"Origin": "null", "Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}),
+        "a name rebound here": ask(P, "SELECT 1 AS x", headers={"Host": f"evil.example:{P}"}),
+        "…same origin as itself": ask(P, "SELECT 1 AS x", headers={"Host": f"evil.example:{P}", "Origin": f"http://evil.example:{P}", "Sec-Fetch-Site": "same-origin"}),
+    }
+    info["open"] = said
+    checks["an open node answers programs on this machine and its own page; a link from elsewhere opens the console"] = \
+        said["a program"] == [{"x": 1}] and said["its own page"] == [{"x": 1}] and said["localhost"] == [{"x": 1}] and isinstance(said["a link from elsewhere"], bytes)
+    checks["…a page from another site, or a name rebound to this machine, gets 403 saying why"] = \
+        all(refused(said[k]) for k in ("another site's page", "another site, by fetch metadata", "a form posted from elsewhere", "a name rebound here", "…same origin as itself")) \
+        and "another site" in said["another site's page"] and "DNS rebinding" in said["a name rebound here"]
+    # Users: the row doors and the nodes' own routes
+    b = Node(lake, P + 1).start()  # (a follower)
+    basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    for q in ["CREATE TABLE orders (id BIGINT, amount DOUBLE)", "CREATE TABLE hr (id BIGINT, salary DOUBLE)", "INSERT INTO hr VALUES (1, 100.0)",
+              "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
+        ask(P, q)
+    boss = basic("boss", "boss-password-1")
+    for q in ["CREATE USER bob PASSWORD 'bob-password-1'", "GRANT SELECT, INSERT, UPDATE ON orders TO bob"]:
+        ask(P, q, auth=boss)
+    bob = basic("bob", "bob-password-1")
+    rows = json.dumps({"id": 7, "amount": 1.0})
+    flush = lambda head: (lambda h: len(h).to_bytes(4, "little") + h)(json.dumps(head).encode())
+    said = {
+        "append, granted": ask(P, rows, path="/append/orders", auth=bob),
+        "append, not granted": ask(P, json.dumps({"id": 2, "salary": 1e6}), path="/append/hr", auth=bob),
+        "append to the audit log": ask(P, "{}", path="/append/pondra$audit", auth=boss),
+        "insert, granted": ask(P, "SELECT 8 AS id, 2.0 AS amount", path="/insert/orders?job=g1", auth=bob),
+        "insert, reading what it may not": ask(P, "SELECT id, salary AS amount FROM hr", path="/insert/orders?job=g2", auth=bob),
+        "insert, not granted": ask(P, "SELECT 3 AS id, 1.0 AS salary", path="/insert/hr?job=g3", auth=bob),
+        "insert making a table": ask(P, "SELECT 1 AS id", path="/insert/made?job=g4", auth=bob),
+        "a user's flush": ask(P, flush({"path": "", "parts": []}), path="/cluster/commit", auth=bob),
+        "a user's files": ask(P, json.dumps({"table": "orders", "job": "g5", "columns": [], "files": []}), path="/cluster/files", auth=bob, headers={"Content-Type": "application/json"}),
+    }
+    info["users"] = said
+    checks["a user's rows through /append and /insert as its grants say (reads too); another table, a new table, the audit log: refused"] = \
+        isinstance(said["append, granted"], dict) and "permission denied: INSERT on hr" in said["append, not granted"] and "written by Pondra alone" in said["append to the audit log"] \
+        and isinstance(said["insert, granted"], dict) and "permission denied: SELECT" in said["insert, reading what it may not"] \
+        and "permission denied: INSERT on hr" in said["insert, not granted"] and "making a table needs an admin" in said["insert making a table"] \
+        and until(lambda: ask(P, "SELECT id FROM orders ORDER BY id", auth=boss), [{"id": 7}, {"id": 8}], 10) == [{"id": 7}, {"id": 8}] \
+        and ask(P, "SELECT count(*) AS n FROM hr", auth=boss) == [{"n": 1}]
+    checks["…and never through the nodes' own routes (/cluster/commit, /cluster/files)"] = \
+        "this route is the nodes' own" in said["a user's flush"] and "this route is the nodes' own" in said["a user's files"]
+    # A change a follower forwards runs as its user: what it reads too
+    forwarded = {
+        "reads what it may not": ask(P + 1, "UPDATE orders SET amount = (SELECT max(salary) FROM hr) WHERE id = 7", auth=bob),
+        "its own": ask(P + 1, "UPDATE orders SET amount = 5.0 WHERE id = 7", auth=bob),
+    }
+    info["forwarded"] = forwarded
+    checks["a change a follower forwards runs as its user: a read it may not make refused, its own change made"] = \
+        "permission denied: SELECT on hr" in str(forwarded["reads what it may not"]) and isinstance(forwarded["its own"], dict) and forwarded["its own"].get("updated") == 1 \
+        and until(lambda: ask(P, "SELECT amount FROM orders WHERE id = 7", auth=boss), [{"amount": 5.0}], 10) == [{"amount": 5.0}]
+    a.kill(), b.kill()
+    # A write token: rows into tables that are there, in the log and their folders; never the lake's records
+    lake2 = new_lake()
+    c = Node(lake2, P + 2, write_token="w", admin_token="adm").start()
+    ask(P + 2, "CREATE TABLE t (id BIGINT)", auth="Bearer adm")
+    w = "Bearer w"
+    said = {
+        "append": ask(P + 2, json.dumps({"id": 1}), path="/append/t", auth=w),
+        "a segment outside the log": ask(P + 2, flush({"path": "data/t/x.seg", "parts": []}), path="/cluster/commit", auth=w),
+        "a path climbing out": ask(P + 2, flush({"path": "log/../catalog/x.seg", "parts": []}), path="/cluster/commit", auth=w),
+        "a branch's row ids": ask(P + 2, flush({"path": "", "parts": [], "blocks": 9}), path="/cluster/commit", auth=w),
+        "rows for the audit log": ask(P + 2, flush({"path": "", "parts": [{"table": "pondra$audit", "off": 0, "len": 0, "rows": 0, "src": None}]}), path="/cluster/commit", auth=w),
+        "files into no table": ask(P + 2, json.dumps({"table": "made", "job": "w1", "columns": [], "files": []}), path="/cluster/files", auth=w, headers={"Content-Type": "application/json"}),
+        "a python file": ask(P + 2, "print('hi')", path="/files/etl/job.py", method="PUT", auth=w),
+        "a sql file": ask(P + 2, "SELECT 1", path="/files/etl/job.sql", method="PUT", auth=w),
+        "a python file, by an admin": ask(P + 2, "print('hi')", path="/files/etl/job.py", method="PUT", auth="Bearer adm"),
+    }
+    info["write token"] = said
+    checks["a write token's flushes: a segment of the log only, no row ids or sequences, never the lake's records; files only into a table there"] = \
+        isinstance(said["append"], dict) and "a segment of the log" in said["a segment outside the log"] and "a segment of the log" in said["a path climbing out"] \
+        and "needs an admin" in said["a branch's row ids"] and "written by Pondra alone" in said["rows for the audit log"] and "making a table needs an admin" in said["files into no table"]
+    checks["a .py file is an admin's to save (code a node runs); a .sql file a writer's"] = refused(said["a python file"]) and not str(said["a sql file"]).startswith("ERROR") \
+        and not str(said["a python file, by an admin"]).startswith("ERROR")
+    c.kill()
+    ok = all(checks.values())
+    print(json.dumps({"guarded": checks, "ok": ok, "info": info}, indent=1, default=str))
     return ok
 
 
@@ -9892,7 +10020,7 @@ SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 4
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, reader, crash, load)
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -9920,7 +10048,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -9933,7 +10061,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):
