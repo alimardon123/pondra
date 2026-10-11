@@ -66,19 +66,38 @@ pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> 
     let print = |meta: &TableMeta| std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), json(meta));
     let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
     let changed: Vec<_> = tables.iter().filter(|(key, meta)| named.iter().any(|n| key[2..] == *n.table) || SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();
-    let jobs = changed.iter().flat_map(|(key, meta)| meta.publish.iter().filter(|f| refused(meta, f).is_none()).map(move |f| (&key[2..], meta, f.as_str())));
-    let states = futures::future::try_join_all(jobs.map(|(table, meta, format)| async move {
-        match format {
-            "delta" => publish(lake, table, meta).await,
-            _ => crate::iceberg::publish(lake, table, meta, named.iter().find(|n| n.table == table)).await,
+    // Each table's formats are published together; one table that fails (a bucket error, a schema
+    // it can't yet publish) is named and left to the next round, and does not stop the other tables
+    // from publishing or being marked seen. The good tables are committed, and the failures are
+    // returned, so a caller that must publish (a DDL or a writer's commit) still sees them.
+    let done = futures::future::join_all(changed.iter().map(|(key, meta)| async move {
+        let table = &key[2..];
+        let mut puts = vec![];
+        for format in meta.publish.iter().filter(|f| refused(meta, f).is_none()) {
+            let r = match format.as_str() {
+                "delta" => publish(lake, table, meta).await,
+                _ => crate::iceberg::publish(lake, table, meta, named.iter().find(|n| n.table == table)).await,
+            };
+            match r {
+                Ok(state) => puts.extend(state),
+                Err(e) => return ((*key).clone(), meta, Err(format!("{table}: {e:#}"))),
+            }
         }
+        ((*key).clone(), meta, Ok(puts))
     }))
-    .await?;
-    let puts: Vec<(String, Vec<u8>)> = states.into_iter().flatten().collect();
+    .await;
+    let (mut puts, mut failed, mut seen): (Vec<(String, Vec<u8>)>, Vec<String>, Vec<(String, u64)>) = (vec![], vec![], vec![]);
+    for (key, meta, r) in done {
+        match r {
+            Ok(p) => { puts.extend(p); seen.push((key, print(meta))); }
+            Err(e) => failed.push(e),
+        }
+    }
     if !puts.is_empty() {
         lake.cat.commit(puts, &[]).await?; // (committed before the next round reads it)
     }
-    SEEN.lock().unwrap().extend(changed.iter().map(|(key, meta)| (key.clone(), print(meta))));
+    SEEN.lock().unwrap().extend(seen); // (only the tables that published: a failed one retries next round)
+    anyhow::ensure!(failed.is_empty(), "{}", failed.join("; "));
     Ok(())
 }
 

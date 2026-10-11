@@ -568,7 +568,7 @@ async fn run() -> anyhow::Result<()> {
             let (l, me) = (lake.clone(), addr.clone());
             ddl::sync(&l, &me, true).await?;
             tr("attachments synced");
-            every(Duration::from_secs(1), move || { let (l, me) = (l.clone(), me.clone()); async move { ddl::sync(&l, &me, true).await } });
+            every("sync", Duration::from_secs(1), move || { let (l, me) = (l.clone(), me.clone()); async move { ddl::sync(&l, &me, true).await } });
             let l = lake.clone();
             tokio::spawn(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
             // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
@@ -607,7 +607,7 @@ async fn run() -> anyhow::Result<()> {
                         Err(e) => eprintln!("the lake's keys (sessions', the nodes'): {e:#}"), // (sessions' signing key, and the nodes' own: `users.rs`)
                         // (into every node's view at once: a node restarted before the next checkpoint
                         // couldn't check the nodes' key, and held its new leader's calls 10 s)
-                        Ok(()) if made => l.cat.checkpoint().await.unwrap_or_else(|e| eprintln!("checkpoint: {e:#}")),
+                        Ok(()) if made => l.cat.checkpoint().await.unwrap_or_else(|e| { eprintln!("checkpoint: {e:#}"); crate::metrics::job_failed("checkpoint"); }),
                         Ok(()) => {}
                     }
                     match ext::rewrap(&l).await {
@@ -684,12 +684,13 @@ async fn run() -> anyhow::Result<()> {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         if let Err(e) = views::emit_all(&lake, &log).await {
                             eprintln!("emission: {e:#}");
+                            crate::metrics::job_failed("emission");
                         }
                     }
                 });
             }
             // Finished shuffles are forgotten here, and what they spilled deleted.
-            every(Duration::from_secs(30), || async { spmd::gc(); Ok(()) });
+            every("gc", Duration::from_secs(30), || async { spmd::gc(); Ok(()) });
             if let Some(seq) = &app.seq {
                 inbox::serve(lake.clone(), seq.clone(), app.lock.clone()); // writers that can't reach us
             }
@@ -717,7 +718,7 @@ async fn run() -> anyhow::Result<()> {
                         loop {
                             let start = tokio::time::Instant::now();
                             hwm.borrow_and_update();
-                            let failed = a.tier_all(0).await.inspect_err(|e| eprintln!("background job failed: {e:#}")).is_err();
+                            let failed = a.tier_all(0).await.inspect_err(|e| { eprintln!("background job failed: {e:#}"); crate::metrics::job_failed("tiering"); }).is_err();
                             tokio::time::sleep_until(start + period).await;
                             // (right away if rows came meanwhile; a round that failed, say on a full
                             // disk, is tried again then too, not only once more rows come)
@@ -729,13 +730,13 @@ async fn run() -> anyhow::Result<()> {
                 }
                 // …and any table as soon as a million rows wait in the log (bounds memory and read cost).
                 let a = app.clone();
-                every(if tier_secs == 0.0 { Duration::ZERO } else { Duration::from_secs(1) }, move || { let a = a.clone(); async move { a.tier_all(1_000_000).await.map(|_| ()) } });
+                every("tiering", if tier_secs == 0.0 { Duration::ZERO } else { Duration::from_secs(1) }, move || { let a = a.clone(); async move { a.tier_all(1_000_000).await.map(|_| ()) } });
                 // Persist the catalog's memtable every few seconds when something changed, so a
                 // restart (or a new leader, reader or `pondra sql`) replays only a few seconds of
                 // catalog WAL. Not more often: each is a level-0 file that SlateDB's compactor
                 // has to keep up with, and writes stall when too many pile up.
                 let l = lake.clone();
-                every(Duration::from_secs(5), move || { let l = l.clone(); async move { l.cat.checkpoint().await } });
+                every("checkpoint", Duration::from_secs(5), move || { let l = l.clone(); async move { l.cat.checkpoint().await } });
                 if lake.cat.replicas > 1 {
                     replica::members(lake.clone(), cluster.clone());
                 }
@@ -753,7 +754,7 @@ async fn run() -> anyhow::Result<()> {
                     cluster::mirror(lake.clone(), cluster.leader.addr.clone(), addr.clone(), replica);
                 }
                 // How far our own catalog view is: all a reader has, and a follower's fallback.
-                every(Duration::from_millis(250), move || { let l = lake.clone(); async move { l.refresh().await } });
+                every("refresh", Duration::from_millis(250), move || { let l = lake.clone(); async move { l.refresh().await } });
             }
             if !reader {
                 let (a, max_wait) = (app.clone(), Duration::from_millis(task_ms));
@@ -763,6 +764,7 @@ async fn run() -> anyhow::Result<()> {
                         let _ = tokio::time::timeout(max_wait, commits.changed()).await; // new rows, or time's up
                         if let Err(e) = a.run_tasks().await {
                             eprintln!("streaming tasks failed: {e:#}");
+                            crate::metrics::job_failed("tasks");
                             tokio::time::sleep(Duration::from_millis(200)).await;
                         }
                     }
@@ -778,7 +780,7 @@ async fn run() -> anyhow::Result<()> {
             runs::mark_stopped(app.clone()); // (runs whose node stopped under them: `stopped`)
             if leader {
                 let l = app.lake.clone(); // (what it inherited, replayed from the WAL, into every node's view)
-                tokio::spawn(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
+                tokio::spawn(async move { l.cat.checkpoint().await.map_err(|e| { eprintln!("checkpoint: {e:#}"); crate::metrics::job_failed("checkpoint"); }) });
             }
             axum::serve(listener, server::router(app).into_make_service_with_connect_info::<tls::Peer>()).await?; // (who asks: `console::save_settings`)
         }
@@ -865,8 +867,8 @@ async fn attach(home: &store::Lake, spec: &str, me: &str, follow: bool) -> anyho
 }
 
 /// Run `job` forever, starting every `period` (right away if a run took longer; a zero period
-/// disables it).
-fn every<F, Fut>(period: Duration, job: F)
+/// disables it). `name` names it in the stderr line and the `background_failures_total` metric.
+fn every<F, Fut>(name: &'static str, period: Duration, job: F)
 where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>> + Send,
@@ -880,7 +882,8 @@ where
         loop {
             ticks.tick().await;
             if let Err(e) = job().await {
-                eprintln!("background job failed: {e:#}");
+                eprintln!("{name} failed: {e:#}");
+                crate::metrics::job_failed(name);
             }
         }
     });

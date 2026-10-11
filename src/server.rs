@@ -832,12 +832,21 @@ impl App {
         let purge: Vec<_> = changed.iter().map(|t| async move { (t, crate::tier::purge(&self.lake, t, nodes, &self.cluster.addr, self.retain_ms, false).await) }).collect();
         each(purge, &mut failed).await;
         let tiered = start.elapsed();
-        crate::delta::publish_all(&self.lake).await?; // what other engines read, as soon as it's tiered
+        // A table whose publish fails is named by `publish_all`; it mustn't stop the merges and the
+        // retention below (storage would grow with no way out), so its error joins `failed` and the
+        // round carries on.
+        if let Err(e) = crate::delta::publish_all(&self.lake).await { // what other engines read, as soon as it's tiered
+            failed.push(format!("publish: {e:#}"));
+            crate::metrics::job_failed("publish");
+        }
         let first_publish = start.elapsed();
         // Then merges and compactions (published too, once done).
         let maintain: Vec<_> = untidy.iter().map(|t| async move { (t, crate::tier::maintain(&self.lake, t, nodes, &self.cluster.addr, false).await) }).collect();
         if each(maintain, &mut failed).await.contains(&true) {
-            crate::delta::publish_all(&self.lake).await?;
+            if let Err(e) = crate::delta::publish_all(&self.lake).await {
+                failed.push(format!("publish: {e:#}"));
+                crate::metrics::job_failed("publish");
+            }
         }
         let published = start.elapsed();
         // Retention every 10 s is plenty, and keeps its deletes off the path to fresh Delta versions.
@@ -1472,6 +1481,9 @@ async fn stats(State(app): State<App>) -> Json<Value> {
     s["version"] = j!(crate::format::VERSION);
     s["format"] = j!(crate::format::of(&app.lake.cat).await.map(|f| f.format).unwrap_or_default()); // (the lake's: ADR-039)
     s["keys"] = j!(crate::users::kept(&app.lake).await); // (the lake's own keys: sealed by its master key, or in the clear)
+    // Background jobs that failed, by kind: a rising count is a stall (tiering, publishing, …) that
+    // otherwise shows only on this node's stderr.
+    s["background_failures"] = j!(crate::metrics::failures().into_iter().filter(|(_, n)| *n > 0).collect::<std::collections::BTreeMap<_, _>>());
     if c.is_leader() {
         s["releases"] = j!(c.releases()); // (each live node's: a rolling upgrade's progress)
     }
