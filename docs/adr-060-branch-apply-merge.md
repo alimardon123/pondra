@@ -203,11 +203,15 @@ shapes (the rules for new kinds, ADR-049):
 - **A pattern** (an ontology, a flow, a task graph): it stores nothing of its own, so it travels with
   the objects it is read from.
 
-Two gaps today:
-1. Apply keeps its own list of how each kind is made, ordered, dropped and changed (`apply::Kind`).
-   That list moves into the registry with status and capture, which need it too. A test checks that
-   every kind a project may declare goes export → apply → export unchanged.
-2. A tool's files aren't applied yet. They are built with the first tool that keeps files.
+Apply's kinds are the registry's (round 34, after #62): `apply::Kind` is an entry of `objects::KINDS`
+(its word, `project`, and `order`: what others name comes first), or what `pondra.toml` and GRANTs
+say. Sequences, indexes and enum types are declared in `objects/` too. How a change is made stays in
+apply, by the kind's word: a table is altered in place, a sequence by `ALTER SEQUENCE` (its next value
+kept; an option taken away is refused), a type's labels only added at the end, an index made again,
+the rest replaced. `project_check.py` checks that every kind `GET /kinds` says a project may declare
+goes export → apply → export unchanged, so a new kind fails there until the project declares it.
+
+One gap today: a tool's files aren't applied yet. They are built with the first tool that keeps files.
 
 ## Rejected
 

@@ -165,7 +165,7 @@ database match it, and `pondra plan` shows what that would change first:
 
 - `pondra.toml`: the project's name and its environments;
 - `objects/`: `CREATE` statements (tables, views, materialized views, functions, macros, procedures,
-  tasks, secrets, roles) and `GRANT`s, in any layout, several to a file;
+  tasks, secrets, roles, sequences, indexes and enum types) and `GRANT`s, in any layout, several to a file;
 - `migrations/`: one-off steps, such as a rename or a backfill, each run once in each database, in
   name order, after the objects and columns an apply adds and before what it replaces. A new database
   is made as `objects/` says now, so there they are recorded as run, not run;
@@ -221,6 +221,10 @@ dev: after apply 1
   (`ALTER TABLE … RENAME COLUMN …`): a declaration can't tell a rename from a drop and an add, and an
   apply never loses data unasked. The plan names the views that read the table: the migration drops
   them first, and the apply makes them again after it.
+- **A sequence, an enum type and an index change in place too.** A sequence's options change with
+  `ALTER SEQUENCE`, and its next value stays; one taken away is refused. A type's labels are only
+  added at the end (`ALTER TYPE … ADD VALUE`), since files keep the labels they were written with. An
+  index is made again: nothing is built for it.
 - **Anything else that changed is replaced.** A materialized view is made again from the rows
   already there, with the materialized views that follow it.
 - **Drift shows.** An object an apply made and someone changed by hand is listed, and the apply puts
