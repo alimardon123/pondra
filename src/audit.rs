@@ -64,8 +64,22 @@ fn on() -> bool { !classes().iter().any(|c| c == "off") }
 
 fn written(class: &str) -> bool { on() && classes().iter().any(|c| c == class || c == "all") }
 
+/// A statement without the comments and spaces before its first word (a comment first must not
+/// make a `GRANT` a read).
+fn lead(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        sql = match () {
+            _ if sql.starts_with("--") => sql.find('\n').map_or("", |i| &sql[i..]),
+            _ if sql.starts_with("/*") => sql.find("*/").map_or("", |i| &sql[i + 2..]),
+            _ => return sql,
+        };
+    }
+}
+
 /// A statement's class, by its first words.
 pub fn class(sql: &str) -> &'static str {
+    let sql = lead(sql);
     let words: Vec<String> = sql.split(|c: char| c.is_whitespace() || c == '(' || c == ';').filter(|w| !w.is_empty()).take(6).map(|w| w.to_uppercase()).collect();
     let first = words.first().map_or("", |w| w.as_str());
     let about = |o: &[&str]| words.iter().skip(1).take(4).any(|w| o.contains(&w.as_str()));
@@ -87,9 +101,23 @@ pub fn class(sql: &str) -> &'static str {
 /// secret's; at most 4 KB.
 pub fn redacted(sql: &str, class: &str) -> String {
     let mut out = String::with_capacity(sql.len().min(4096));
-    match class == "role" {
-        false => out.push_str(sql),
-        true => {
+    let words: Vec<String> = lead(sql).split(|c: char| c.is_whitespace() || c == '(').filter(|w| !w.is_empty()).take(5).map(|w| w.to_uppercase()).collect();
+    let secret = matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER")) && words.iter().any(|w| w == "SECRET");
+    match (class == "role", sql.find('(')) {
+        // (a secret's options may be quoted either way, or not at all: every value but its TYPE is
+        // kept as '***')
+        (true, Some(open)) if secret => {
+            let close = sql.rfind(')').filter(|&c| c > open).unwrap_or(sql.len());
+            let options: Vec<String> = items(&sql[open + 1..close]).into_iter().map(|o| match o.split_once(char::is_whitespace) {
+                Some((name, _)) if !name.eq_ignore_ascii_case("type") => format!("{name} '***'"),
+                _ => o.to_string(),
+            }).collect();
+            out.push_str(&sql[..=open]);
+            out.push_str(&options.join(", "));
+            out.push_str(&sql[close..]);
+        }
+        (false, _) => out.push_str(sql),
+        (true, _) => {
             let (mut quoted, mut chars) = (false, sql.chars().peekable());
             while let Some(c) = chars.next() {
                 match (c, quoted) {
@@ -109,6 +137,24 @@ pub fn redacted(sql: &str, class: &str) -> String {
         }
     }
     crate::history::cut(out, 4096)
+}
+
+/// A list's items, split at the commas outside quotes, trimmed.
+fn items(list: &str) -> Vec<&str> {
+    let (mut items, mut start, mut quote) = (vec![], 0, None);
+    for (i, c) in list.char_indices() {
+        match (c, quote) {
+            ('\'' | '"', None) => quote = Some(c),
+            (c, Some(q)) if c == q => quote = None,
+            (',', None) => {
+                items.push(list[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(list[start..].trim());
+    items.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
 tokio::task_local! {
@@ -260,5 +306,10 @@ mod tests {
         assert_eq!(class("SELECT 1"), "read");
         assert_eq!(redacted("CREATE USER ana PASSWORD 'it''s' SUPERUSER", "role"), "CREATE USER ana PASSWORD '***' SUPERUSER");
         assert_eq!(redacted("INSERT INTO t VALUES ('a')", "write"), "INSERT INTO t VALUES ('a')");
+        // (a comment first is still the statement it comments; a secret's values hidden however written)
+        assert_eq!(class("/* x */ GRANT ALL ON t TO ana"), "role");
+        assert_eq!(class("-- note\nCREATE USER ana PASSWORD 'x'"), "role");
+        assert_eq!(redacted("CREATE SECRET s (TYPE s3, KEY_ID \"k\", SECRET xyz)", "role"), "CREATE SECRET s (TYPE s3, KEY_ID '***', SECRET '***')");
+        assert_eq!(redacted("/* a */ create temporary secret t (type http, bearer_token 'a,b''c')", "role"), "/* a */ create temporary secret t (type http, bearer_token '***')");
     }
 }

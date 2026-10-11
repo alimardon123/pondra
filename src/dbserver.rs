@@ -277,7 +277,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
             let db = s.default_db().await;
             route(&s, &db, &path, req).await
         })
-        .layer(axum::middleware::from_fn(plain))
+        .layer(axum::middleware::from_fn_with_state(server.clone(), plain))
         .with_state(server.clone());
     eprintln!("pondra serve: the lakes in {folder} as databases, on {addr}");
     let listener = crate::tls::Doors::bind(&addr, crate::tls::Door::Http).await?; // (TLS too: `tls.rs`)
@@ -369,12 +369,22 @@ async fn route(s: &Server, name: &str, path: &str, req: Request) -> Response {
 
 /// A Postgres connection: its startup message says the database; from then on, the bytes go to
 /// and from that database's node as they are.
-/// A plain connection from another machine, when this server takes TLS: refused, saying why.
-async fn plain(axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, req: Request, next: axum::middleware::Next) -> Response {
-    match peer.allowed() {
-        true => next.run(req).await,
-        false => (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response(),
+/// A plain connection from another machine, when this server takes TLS: refused, saying why. With
+/// no tokens, a browser's page from elsewhere is refused here too (`auth::cross_site`), and what the
+/// browser said of its page goes no further: the databases' nodes are asked from this machine.
+async fn plain(State(s): State<Shared>, axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, mut req: Request, next: axum::middleware::Next) -> Response {
+    if !peer.allowed() {
+        return (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response();
     }
+    if !s.auth.on() && !req.headers().contains_key("authorization") {
+        if let Some(why) = crate::auth::cross_site(req.headers(), req.method(), Some(peer.addr), &s.addr) {
+            return (StatusCode::FORBIDDEN, why).into_response();
+        }
+    }
+    for k in ["origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "sec-fetch-user"] {
+        req.headers_mut().remove(k);
+    }
+    next.run(req).await
 }
 
 async fn postgres(s: &Server, tcp: tokio::net::TcpStream) -> Result<()> {
