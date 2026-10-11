@@ -1,0 +1,349 @@
+---
+title: Projects
+description: Keep what every object in a database is in a folder of files, then plan, apply, test, capture and export it; protect production, and set up CI with pondra ci init.
+---
+
+import Ways from '../../../components/Ways.astro';
+
+A project is a folder, usually in Git, that says what every object in a database is: its tables,
+views, functions, roles and grants. `pondra plan` shows what an apply would change, `pondra apply`
+makes the database match the folder, and `pondra test` runs the queries in `tests/`. The same folder
+then makes the same database again on a branch, a test server or production.
+
+## Start a project
+
+`pondra init` makes the folder:
+
+- `pondra.toml`: the project's name and its environments ([below](#pondratoml));
+- `objects/`: `CREATE` statements and `GRANT`s, in any layout, several to a file: tables, views,
+  materialized views, functions, macros, procedures, tasks, secrets, roles, sequences, indexes and enum
+  types;
+- `migrations/`: one-off steps, such as a rename or a backfill, each run once in each database, in
+  name order, after the objects and columns an apply adds and before what it replaces. A new database
+  is made as `objects/` says now, so there they are recorded as run, not run;
+- `seeds/`: the rows a new database starts with (`INSERT …`), loaded once when an apply makes it, in
+  name order. A branch has its base's rows instead;
+- `tests/`: queries; any row one returns is a failure. They run after every apply (`--no-test` skips
+  them).
+
+`pondra init` also writes a `.gitignore` that leaves out `lake/`, the folder that
+[`pondra apply local`](#pondratoml) uses for this machine's own database.
+
+```bash
+pondra init shop
+cd shop
+cat > objects/sales.sql <<'SQL'
+CREATE SCHEMA sales;
+CREATE TABLE sales.orders (id BIGINT, amount DOUBLE);
+CREATE VIEW sales.big AS SELECT * FROM sales.orders WHERE amount >= 20;
+SQL
+echo "INSERT INTO sales.orders VALUES (1, 10.0), (2, 20.0), (3, 30.0);" > seeds/001-first-orders.sql
+echo "SELECT * FROM sales.orders WHERE amount < 0" > tests/no_negative.sql
+pondra apply --url http://127.0.0.1:8080
+```
+
+```text
+a project in shop: pondra.toml, objects/, migrations/, seeds/, tests/, .gitignore
+dev: apply 1
+  + schema     sales                 made
+  + table      sales.orders          made
+  + view       sales.big             made
+  ▶ seed       001-first-orders.sql  loaded
+  ✓ tests      1 passed
+  console: http://127.0.0.1:8080/
+```
+
+Every apply is recorded in `pondra.applies`, with the commit it was of:
+
+<Ways sql={`SELECT id, project, status FROM pondra.applies ORDER BY id;`} />
+
+```text
+id | project | status
+---+---------+-------
+ 1 | shop    | ok
+```
+
+## Sign in to a server
+
+`pondra login` keeps a token for each server that `pondra.toml` names, for every command after it.
+With no URL it signs in to each of them and asks for a token. `--user` signs in as a user with its
+password instead (`PONDRA_PASSWORD`, or asked for).
+
+```bash norun
+pondra login https://pondra.acme.com                 # asks for a token; kept in ~/.pondra
+pondra login https://pondra.acme.com --user ali      # or a user's password
+```
+
+Any command also takes `--url` and `--token`, or `PONDRA_TOKEN`, in place of a saved login.
+
+## pondra.toml
+
+`pondra.toml` names the project and where its databases are. Each `[env.NAME]` is a database a command
+can name, as in `pondra apply prod`. A name the file doesn't declare is a branch, and a branch's
+database takes the values of `[env.dev]`.
+
+```toml
+[project]
+name = "shop"
+server = "https://pondra.acme.com"   # every database here is /db/<name>
+
+[env.prod]
+protected = true                     # its objects change only by an apply
+values = { min_order = 10 }          # what $min_order is in prod's statements
+attach.events = { type = "kafka", url = "kafka://kafka.acme.internal:9092" }
+
+[env.test]
+clone = "prod"                       # made from prod once, then applied on each merge
+
+[env.dev]                            # what every branch takes
+values = { min_order = 0 }
+
+[secrets]
+crm_token = "env:CRM_TOKEN"          # $crm_token, from the applying machine's environment
+```
+
+- `server` (or an environment's own `server`, or `url`) says where a database is. A `lake` in place of
+  a `url` is a folder or bucket the command starts a node for. `[env.local]` (or no entry at all) with
+  `pondra apply local` is this machine's own lake in `lake/`, with no server.
+- `clone` names the database a branch or `[env.test]` is made from. It is made the first time a command
+  needs it, with no data copied.
+- `values` are what `$name` stands for in the statements of that environment.
+- `protected` is covered under [Protected production](#protected-production).
+- `[secrets]` takes a value from the applying machine's environment. It is never written to a database
+  or a file.
+
+## Plan a change
+
+`pondra plan` shows what `pondra apply` would do, and changes nothing. Change a file, then plan:
+
+```bash
+cd shop
+cat > objects/sales.sql <<'SQL'
+CREATE SCHEMA sales;
+CREATE TABLE sales.orders (id BIGINT, amount DOUBLE, channel VARCHAR);
+CREATE VIEW sales.big AS SELECT * FROM sales.orders WHERE amount > 20;
+SQL
+pondra plan --url http://127.0.0.1:8080
+```
+
+```text
+dev: after apply 1
+  ~ table      sales.orders  ADD COLUMN channel VARCHAR
+  ~ view       sales.big     replaced
+```
+
+Apply again and nothing changes. A plan that is refused (below) says why, and `pondra apply` doesn't run
+it.
+
+## Apply it
+
+`pondra apply` plans, applies each step, then runs `tests/`. It exits with 1 when a step or a test
+fails. The steps are the ones the plan showed: if someone applied in between, the apply is refused, and
+you plan again.
+
+```bash
+cd shop
+pondra apply --url http://127.0.0.1:8080
+```
+
+```text
+dev: apply 2
+  ~ table      sales.orders  ADD COLUMN channel VARCHAR
+  ~ view       sales.big     replaced
+  ✓ tests      1 passed
+  console: http://127.0.0.1:8080/
+```
+
+The apply's options:
+
+- `--watch` applies again on every save of the project's files until Ctrl-C. It never applies to
+  production, to `main` or to a protected database.
+- `--fresh` makes a clone (a branch, or `[env.test]`) again from the database it is cloned from.
+- `--no-test` skips `tests/`; `--prune` drops the objects the project no longer declares.
+
+Every command and flag is in the [command line reference](/pondra/reference/cli/).
+
+A project kept in the workspace applies from SQL too. `CALL plan('shop', env => 'prod')` lists the plan
+as rows (`mark`, `change`, `kind`, `name`, `what`), where `change` is one of `create`, `alter`,
+`replace`, `rebuild`, `migrate`, `record` (a migration a new database is marked as having run), `seed`,
+`drop`, `keep` or `refuse`. `CALL apply('shop', env => 'prod', test => true)` applies it.
+
+## What an apply changes
+
+- **A table changes in place** only by columns added at the end, types widened and its options. A
+  column renamed, dropped or moved is refused with the migration to write
+  (`ALTER TABLE … RENAME COLUMN …`): a declaration can't tell a rename from a drop and an add, and an
+  apply never loses data unasked. The plan names the views that read the table: the migration drops
+  them first, and the apply makes them again after it.
+- **A sequence, an enum type and an index change in place too.** A sequence's options change with
+  `ALTER SEQUENCE`, and its next value stays; one taken away is refused. A type's labels are only added
+  at the end (`ALTER TYPE … ADD VALUE`), since files keep the labels they were written with. An index is
+  made again: nothing is built for it.
+- **Anything else that changed is replaced.** A materialized view is made again from the rows already
+  there, with the materialized views that follow it.
+- **Drift shows.** An object an apply made and someone changed by hand is listed, and the apply puts it
+  back.
+- **One apply at a time**, from the plan it showed. Each statement runs under its own part of the
+  apply's job, so an apply that stopped half way finishes when it runs again.
+- **Each object has one owner.** An apply changes only what its own project made; another project's
+  objects, and objects people made by hand, are left alone. An object the project no longer declares is
+  kept unless you apply with `--prune`.
+- **Not yet:** a materialized view rebuilt beside the old one and swapped in, and Python files in
+  `objects/`.
+
+## Changes made in the database
+
+A change made straight in a database (a `CREATE` in a SQL cell, psql, a BI tool) is not written into
+the files on its own: the files say what every database should be, and only you know which change made
+by hand should stay. `pondra status` lists what differs, as `git status` does, and `pondra capture`
+writes the chosen objects into the files.
+
+Here a view is made by hand, and a column is added to a table, after the apply above:
+
+```bash
+cd shop
+curl -s -o /dev/null -X POST http://localhost:8080/sql -d "CREATE VIEW sales.scratch AS SELECT count(*) AS n FROM sales.orders"
+curl -s -o /dev/null -X POST http://localhost:8080/sql -d "ALTER TABLE sales.orders ADD COLUMN note VARCHAR"
+pondra status --url http://127.0.0.1:8080
+```
+
+```text
+dev: after apply 2
+Changed outside an apply (pondra capture NAME writes it into the files, pondra apply puts it back):
+  ~ table      sales.orders   columns changed outside an apply: added note
+Untracked (pondra capture NAME):
+  ? view       sales.scratch  made outside an apply: in no project's files
+```
+
+Each line changed outside an apply also says who changed it and when, from `pondra.history`, once the
+node has written the statement there (a second or so after it ran).
+
+`pondra capture` writes what is listed into the files: each object's statement as the database has it
+(the author's own text, when one statement made it), a new file for an untracked object, and the
+declaration taken out of the files for a dropped one. Name the objects to write them alone, as
+`pondra capture sales.scratch`.
+
+```bash
+cd shop
+pondra capture --url http://127.0.0.1:8080
+pondra status --url http://127.0.0.1:8080
+```
+
+```text
+dev: captured into the files
+  wrote objects/sales.sql
+  wrote objects/sales/scratch.sql
+  git diff shows the change; commit it, and pondra apply makes it everywhere else
+dev: after apply 2
+  nothing differs: the database is the files
+```
+
+A table renamed in the database, or a column renamed or dropped in it, is not a change to write as it
+is: the files would then say the old name while the database has the new one. `pondra status` lists it
+as renamed (`↷`), and `pondra capture` writes a migration for it, `migrations/NNN-rename-….sql`, which
+renames the table or column in the databases that still have the old names. The migration is recorded
+as run where it was made, since it already is there; the other databases run it on their next apply,
+before what follows the rename. Views that read the table are dropped by the migration and made again
+by the apply after it.
+
+Git shows what `pondra capture` wrote, and a commit makes it the project's: `pondra apply` then makes
+the other databases match it.
+
+## Export a database
+
+`pondra export DIR` writes a database's objects as a project's files, so a database built by hand in
+the console becomes a project in one command:
+
+```bash
+pondra export exported --url http://127.0.0.1:8080
+find exported -type f | sort
+```
+
+```text
+dev: 5 files in exported
+exported/objects/sales/big.sql
+exported/objects/sales/orders.sql
+exported/objects/sales/scratch.sql
+exported/objects/schemas.sql
+exported/pondra.toml
+```
+
+## Compare with another database
+
+`pondra diff` compares an environment with the database it was made from (its clone, else prod): what
+differs in the objects, and in the rows of each table both have, written as Markdown. It is the
+summary a pull request shows. `pondra.diff` in SQL compares two tables; see
+[Branches and environments](/pondra/guides/environments/#compare-two-databases).
+
+```bash norun
+pondra diff pr-12 > diff.md          # a branch against prod: what this pull request changes
+pondra diff pr-12 --against test     # or against another database
+```
+
+## Protected production
+
+On a protected database, a project's objects change only by an apply. Its objects are what its last
+finished apply left: tables, views, roles and grants. A change to one is refused by name, an admin
+included, unless an apply makes it. Rows still change, and people still make, change and drop their own
+objects, in the project's schema too:
+
+```text
+permission denied: table sales.orders is project shop's, and prod is protected: change it in the project and apply it (or an admin lifts the protection: ALTER DATABASE prod SET (protected = false))
+```
+
+A user granted APPLY can apply to the database without being an admin, so a CI account needs no admin
+token. APPLY is granted on the database alone, not on a schema or a table:
+
+```sql norun
+GRANT APPLY ON DATABASE prod TO ci_prod;
+```
+
+The project says which environment is protected, and the first apply to it protects the database once
+it has finished:
+
+```toml
+[env.prod]
+protected = true                     # its objects change only by an apply, once one has finished
+```
+
+On a protected database an apply needs APPLY or the node's own operator (its tokens and key). A
+superuser without APPLY is refused. Lifting the protection is an admin's statement, and it is audited.
+It shows in `pondra.databases` until the database is protected again:
+
+```sql norun
+ALTER DATABASE prod SET (protected = false);  -- an admin's: written to pondra.audit
+ALTER DATABASE prod SET (protected = true);   -- when the fix is in
+```
+
+<Ways sql={`SELECT name, protected, lifted_at, lifted_by FROM pondra.databases;`} />
+
+```text
+name | protected | lifted_at | lifted_by
+-----+-----------+-----------+----------
+lake |     false |           |
+```
+
+A branch of a protected database isn't protected: `CREATE DATABASE dev CLONE prod` gives dev a database
+whose objects change as dev's own, and prod keeps its protection.
+
+## Continuous integration
+
+`pondra ci init` sets up CI for the project in one command. It writes `.github/workflows/pondra.yml`,
+in which each pull request's database is made fresh from prod, applied, tested and compared; a merge
+applies `main` to test; and prod is applied once someone approves the `prod` environment:
+
+```yaml
+- run: pondra apply pr-${{ github.event.number }} --fresh
+- run: pondra diff pr-${{ github.event.number }} >> "$GITHUB_STEP_SUMMARY"
+```
+
+It also protects prod in pondra.toml, makes the users CI signs in as (`ci`, which may clone prod, and
+`ci_prod`, which may only apply to prod) with fresh tokens, and stores them in GitHub through `gh`, with
+the `prod` environment reviewed by you. Without `gh` it prints them once. Running it again rotates the
+tokens.
+
+```bash norun
+pondra ci init
+```
+
+Branches on a team are in [Branches and environments](/pondra/guides/environments/#branches-and-environments-on-a-team).

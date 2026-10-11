@@ -211,7 +211,7 @@ spark.table("orders").groupBy("user").agg(F.sum("qty").alias("items")).to_view("
 spark.sql("SELECT * FROM items_by_user ORDER BY user").toPandas()
 ```
 
-See [streaming](/pondra/guides/streaming/) for windows, sessions and stream joins.
+See [Windows and sessions](/pondra/guides/windows/) and [Joins over streams](/pondra/guides/stream-joins/).
 
 ## Every name
 

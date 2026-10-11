@@ -1,64 +1,12 @@
 ---
 title: MCP
-description: Let AI agents list tables, query, write and follow changes on a node over the Model Context Protocol, with the same tokens as everyone else.
+description: The Model Context Protocol endpoint at POST /mcp, with its four tools and their arguments, the stored procedures that become tools, the wire format, the errors and the token each tool needs.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
-Every node answers the Model Context Protocol (MCP) at `POST /mcp`, on the same port as HTTP. An AI
-agent (Claude, Cursor, or any MCP client) lists the tables, queries them, writes, and follows what
-changed. It needs no flag. It is JSON-RPC 2.0 over MCP's streamable HTTP transport, and every
-answer is plain JSON: each tool answers at once, so there is no event stream.
-
-## Connect
-
-Give the client the node's URL, `http://HOST:8080/mcp`. With tokens set, also give it a header,
-`Authorization: Bearer TOKEN`: see [tokens](#tokens). With a certificate on the node, use `https://`
-from another machine: a plain request from one is refused with `403` ([TLS](/pondra/guides/security/#tls)).
-
-<Aside type="caution">
-Use a `read` token for an agent that should only look. An agent with a `write` token can insert,
-update and delete, and one with an `admin` token can create and drop tables.
-</Aside>
-
-```bash norun
-# Claude Code
-claude mcp add --transport http pondra http://127.0.0.1:8080/mcp
-
-# with tokens on
-claude mcp add --transport http pondra https://node.example.com/mcp --header "Authorization: Bearer $PONDRA_READ_TOKEN"
-```
-
-Clients that read a settings file take the same two things, a URL and a header. For Cursor, in
-`mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "pondra": {
-      "url": "https://node.example.com/mcp",
-      "headers": { "Authorization": "Bearer <read token>" }
-    }
-  }
-}
-```
-
-Claude Desktop's settings file starts local programs, so it reaches a remote server through a
-bridge such as `mcp-remote`:
-
-```json
-{
-  "mcpServers": {
-    "pondra": {
-      "command": "npx",
-      "args": ["mcp-remote", "https://node.example.com/mcp", "--header", "Authorization: Bearer <read token>"]
-    }
-  }
-}
-```
-
-This repository tests the node with the official MCP SDK for Python. The commands and settings
-above are as those clients document them, and are not run here.
+Every node answers the Model Context Protocol (MCP) at `POST /mcp`, on its HTTP port. It is JSON-RPC 2.0
+over MCP's streamable HTTP transport, and every answer is plain JSON: each tool answers at once, so there is
+no event stream. This page is the look-up. To connect a client, and to see how an agent uses these tools,
+read [AI agents (MCP)](/pondra/guides/agents/).
 
 ## Tools
 
@@ -68,7 +16,7 @@ above are as those clients document them, and are not run here.
 |---|---|---|
 | `list_tables` | none | every table and view: its name (`schema.table` outside `public`, `lake.table` for an attached lake), its columns and their types, its kind, and a view's SQL. The kind is `append`, `upsert` (a primary key: the newest row per key wins), `merge` (rows per key combine, as `sum`) or `view` |
 | `query` | `sql` | runs one query and answers `{"rows": […], "total_rows": N}`: the first 1000 rows, and the count of all. A statement that writes is refused: `this is a write: use the write tool` |
-| `write` | `sql`, `job` (optional) | runs `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP` or `CALL`. It is committed and durable when it answers. `job` is an id for the write: sent again with the same id, it is applied once |
+| `write` | `sql`, `job` (optional) | runs `INSERT`, `UPDATE`, `DELETE` (on any table) and `CALL`, and `CREATE`, `ALTER` or `DROP` of tables, views, materialized views and schemas. It is committed and durable when it answers. `job` is an id for the write: sent again with the same id, it is applied once |
 | `changes` | `table`, `after` (optional) | what was committed to a table after a position: every insert, update and delete, about 1000 rows at a time, and the `position` to ask from next |
 | `find` | `text`, `kind` (optional) | finds tables, views, columns, keys, links, routines and every other object or part by its name, comment or definition, and Pondra's concepts by other products' names: the rows `pondra.find(text)` gives in SQL |
 
@@ -82,8 +30,7 @@ kept, and left out for from now. Each row carries `_change_type`, `_row_id` and 
 
 ### Procedures as tools
 
-A stored procedure is a tool of its own. What the owner of a lake wrote for a job becomes
-something an agent can do, with the rights of the agent's token.
+A stored procedure is a tool of its own, with the rights of the agent's token.
 
 | Part | Comes from |
 |---|---|
@@ -118,12 +65,16 @@ Every request is a JSON-RPC message in a `POST`. A `GET` answers `405`.
 | any other method | the error `-32601`, `no method NAME` |
 | a body that is not JSON | the error `-32700`, `not JSON` |
 
+## Errors
+
 A tool that fails is not a protocol error: it answers with `"isError": true` and the reason as the
 text, which the agent can read and act on (`no tool nosuch`, `this token may not write`, or the
 SQL error), after Postgres's code for it: `SQLSTATE 23514: new row for relation "t" violates check
-constraint …` ([error codes](/pondra/reference/postgres/#error-codes)). MCP has no session, so a
-transaction is refused by name, with `SQLSTATE 0A000`: `query` and `write` answer `BEGIN` with
-`Unsupported SQL statement: BEGIN`. Send a procedure that does the work as one statement instead.
+constraint …` ([error codes](/pondra/reference/postgres/#error-codes)).
+
+MCP has no session, so a transaction is refused by name. `query` answers `BEGIN` with `SQLSTATE 0A000`
+and `Unsupported SQL statement: BEGIN`. `write` refuses it as a statement that isn't a write, with
+`SQLSTATE XX000`. A procedure that does the work as one call takes its place.
 
 ```bash
 mcp() {
@@ -147,37 +98,6 @@ mcp '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"query","arg
 {"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"SQLSTATE XX000: this is a write: use the write tool"}],"isError":true}}
 ```
 
-## With the Python SDK
-
-The official SDK does the handshake and the framing. `call_tool` answers the tool's text in
-`content[0].text`.
-
-```python
-import asyncio
-import json
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
-
-async def main():
-    async with streamablehttp_client("http://localhost:8080/mcp") as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            tools = await session.list_tools()
-            print([tool.name for tool in tools.tools])
-            count = await session.call_tool("query", {"sql": "SELECT count(*) AS n FROM notes"})
-            print(json.loads(count.content[0].text))
-            feed = await session.call_tool("changes", {"table": "notes", "after": 0})
-            print([(row["id"], row["_change_type"]) for row in json.loads(feed.content[0].text)["rows"]])
-
-asyncio.run(main())
-```
-
-```text
-['list_tables', 'query', 'write', 'changes', 'find', 'add_note']
-{'rows': [{'n': 2}], 'total_rows': 1}
-[(1, 'upsert'), (2, 'upsert')]
-```
-
 ## Tokens
 
 The endpoint needs at least the `read` token (or a user). A request without one gets `401` (`sign in:
@@ -190,4 +110,6 @@ The endpoint needs at least the `read` token (or a user). A request without one 
 | `admin` | also `write` with `CREATE`, `ALTER` and `DROP`, and the other statements that change the lake's tables, views, schemas or routines. A `write` token is refused with `this token may not change the lake's tables, views, schemas, routines or users (an admin token, or a superuser, does)` |
 
 A procedure runs with the rights of the agent's token: a `read` token that calls one which writes
-is refused by the procedure's own statements.
+is refused by the procedure's own statements. Which token to give an agent is in
+[AI agents](/pondra/guides/agents/#choose-its-token); the tokens themselves are in
+[security](/pondra/guides/security/#a-token-at-every-door).

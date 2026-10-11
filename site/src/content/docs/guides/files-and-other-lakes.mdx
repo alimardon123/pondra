@@ -4,6 +4,7 @@ description: Read and write Parquet, CSV, JSON, Delta and Iceberg on disk, in bu
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 Files, other engines' tables and Kafka topics are tables wherever SQL takes one. You can query them,
 join them with your own tables, copy them into the lake, and write query results back out to them, in
@@ -182,8 +183,9 @@ The same names work on `s3://` (AWS, R2, MinIO and anything S3-compatible), `gs:
 cluster as a table's are. A node reads a URL with the **secret** that covers it. An admin makes one, and
 the credentials never appear in SQL that queries run:
 
+<Ways sql={`CREATE SECRET sales_s3 (TYPE s3, KEY_ID 'my-key-id', SECRET 'my-secret', REGION 'eu-west-1', SCOPE 's3://my-bucket');`} />
+
 ```sql
-CREATE SECRET sales_s3 (TYPE s3, KEY_ID 'my-key-id', SECRET 'my-secret', REGION 'eu-west-1', SCOPE 's3://my-bucket');
 SELECT * FROM secrets();
 ```
 

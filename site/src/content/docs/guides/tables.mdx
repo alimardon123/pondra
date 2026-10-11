@@ -3,7 +3,8 @@ title: Tables
 description: Create tables with CREATE TABLE and its options, group them in schemas and databases, change their columns, and drop them.
 ---
 
-import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 A table is Parquet files plus a log of the newest rows, in your lake. You make one with `CREATE
 TABLE`, and its options decide what kind of table it is: rows that pile up, rows that replace each
@@ -11,27 +12,7 @@ other by key, or rows that add up per key.
 
 ## Create a table
 
-<Tabs syncKey="lang">
-  <TabItem label="SQL">
-    ```sql
-    CREATE TABLE orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE, ts TIMESTAMP);
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    import pondra
-    db = pondra.connect("http://localhost:8080")
-    db.sql("CREATE TABLE IF NOT EXISTS orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE, ts TIMESTAMP)")
-    ```
-  </TabItem>
-  <TabItem label="JavaScript">
-    ```js
-    import { connect } from "pondra";
-    const db = connect("http://localhost:8080");
-    await db.sql("CREATE TABLE IF NOT EXISTS orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE, ts TIMESTAMP)");
-    ```
-  </TabItem>
-</Tabs>
+<Ways sql={`CREATE TABLE orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE, ts TIMESTAMP);`} />
 
 Every statement on this page runs the same way from SQL, Python (`db.sql(...)`), JavaScript
 (`await db.sql(...)`), the [shell](/pondra/start/shell/) and Postgres clients.
@@ -88,6 +69,8 @@ SELECT id, email, plan FROM accounts ORDER BY id;
 A row that breaks a rule is refused, and the error names the column:
 
 ```python
+import pondra
+db = pondra.connect("http://localhost:8080")
 try:
     db.sql("INSERT INTO accounts (id) VALUES (3)")
 except RuntimeError as e:
@@ -195,10 +178,8 @@ Two clauses decide how a table's files are written, and they combine with a key.
   With two or more columns the rows follow a Hilbert curve, so a filter on any one of them still skips
   most of a file.
 
-```sql
-CREATE TABLE events (id BIGINT, user VARCHAR, amount DOUBLE, ts TIMESTAMP)
-  PARTITION BY day(ts) CLUSTER BY (user);
-```
+<Ways sql={`CREATE TABLE events (id BIGINT, user VARCHAR, amount DOUBLE, ts TIMESTAMP)
+  PARTITION BY day(ts) CLUSTER BY (user);`} />
 
 `PARTITION BY` is fixed once the table is made. `CLUSTER BY` can change later (see `ALTER TABLE` below).
 
@@ -357,7 +338,7 @@ SELECT * FROM big_orders;
 ```
 
 `CREATE OR REPLACE VIEW` changes a view, and `ALTER VIEW … RENAME TO` renames it. A materialized view,
-which is kept up to date as rows arrive, is in [Streaming](/pondra/guides/streaming/).
+which is kept up to date as rows arrive, is in [Views kept current](/pondra/guides/views/).
 
 ## Drop things
 
@@ -374,20 +355,8 @@ DROP SCHEMA sales CASCADE;
 - `DROP TABLE` is refused while a view or task reads the table: drop those first.
 - `DROP SCHEMA` is refused for a schema that holds anything, unless you add `CASCADE`, which drops its
   views and then its tables. `public` can't be dropped.
-- A dropped table is kept for a day, or for its `retention` (`WITH (retention = '7 days')`), and
-  `UNDROP TABLE` brings it back as it was. `pondra.dropped` lists the ones that can still come back.
-  After that, its files are deleted. `DROP TABLE … PURGE` keeps nothing.
-- A new table with the same name starts empty. `UNDROP` brings back the table dropped last under a
-  name, once nothing else has it: rename the new one first.
-
-```sql
-CREATE TABLE notes (id BIGINT, body VARCHAR);
-INSERT INTO notes VALUES (1, 'keep me');
-DROP TABLE notes;
-SELECT name FROM pondra.dropped WHERE name = 'notes';
-UNDROP TABLE notes;
-SELECT body FROM notes;
-```
+- A dropped table can come back with `UNDROP TABLE` until its past runs out. How long that is, and how to
+  bring it back, is in [A table's past](/pondra/guides/past/#bring-back-a-dropped-table).
 
 List what you have with the shell's `.tables`, or with SQL: `pondra.tables` gives each one's kind
 (`table`, `view`, `materialized view` or `external table`), and `information_schema.tables` is there
@@ -401,7 +370,7 @@ SELECT table_name FROM information_schema.tables WHERE table_catalog = 'lake' AN
 ## Write, audit, publish
 
 Write a rebuilt table's new rows somewhere readers don't look, check them, then make them the table
-in one step. Write them to a clone: `CREATE TABLE … CLONE` copies no file. Then
+in one step. Write them to a clone, which copies no file (see [A table's past](/pondra/guides/past/#copy-a-table-without-copying-its-files)). Then
 `ALTER TABLE orders SWAP WITH orders_wap` exchanges the two tables in one commit. Readers of `orders`
 see the new rows at once, and the old rows are under `orders_wap`, so putting them back is one more
 swap.
@@ -434,4 +403,4 @@ SELECT count(*) FROM orders;
 ```
 
 After a publish you are happy with, `DROP TABLE orders_wap` removes the old rows. Like any dropped
-table, they are kept for a day, and `UNDROP TABLE` brings them back.
+table, they can come back with `UNDROP TABLE` until their past runs out.

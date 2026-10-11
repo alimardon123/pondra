@@ -124,7 +124,7 @@ db.table("orders").with_columns(
 ```
 
 Joins take `on=` (or `left_on` and `right_on`) and `how` (`inner`, `left`, `right`, `full`, `semi`,
-`anti`, `cross`). `join_asof` is an [as-of join](/pondra/guides/streaming/#as-of-joins).
+`anti`, `cross`). `join_asof` is an [as-of join](/pondra/guides/stream-joins/#as-of-joins).
 `pondra.concat([a, b])` stacks frames; `union`, `intersect` and `except_` are SQL's set operations;
 `unique`, `limit`, `drop_nulls`, `fill_null`, `rename`, `cast` and `drop` are there too.
 
@@ -162,43 +162,15 @@ rewritten as calls:
 
 ## Use SQL and frames together
 
-You don't decide up front which to use. Both give the same kind of result, and either can start
-from the other.
-
-**`db.sql(query)` is a frame.** It runs when you ask for rows, so you can keep going in Python:
-
-```python
-big = db.sql("SELECT * FROM orders WHERE qty > 1")
-big.group_by("user").agg(col("qty").sum().alias("items")).sort("user").rows()
-```
-
-**SQL reads Python by name.** A name in your SQL that isn't a table is looked up in your Python
-variables. A frame becomes part of the same statement, so it still runs on the node's data. A
-pandas, Polars or Arrow table is sent along with the query for that query only.
-
-```python
-import pandas as pd
-
-recent = db.table("orders").filter(col("qty") > 1)
-targets = pd.DataFrame({"user": ["ann", "bob", "cy"], "target": [10, 20, 30]})
-db.sql("""SELECT r.user, sum(r.qty * r.price) AS spent, t.target
-          FROM recent r JOIN targets t USING (user)
-          GROUP BY r.user, t.target ORDER BY r.user""").rows()
-```
-
-A table in the lake wins over a Python variable of the same name. To name things yourself, pass
-frames by keyword and use `{name}` in the SQL; other keywords are `$name` parameters, bound by
-the node and never pasted into the text:
-
-```python
-db.sql("SELECT id, user, qty FROM {r} WHERE qty > $min ORDER BY id", r=recent, min=2).rows()
-```
+A frame and a SQL query are interchangeable: `db.sql` gives a frame, and SQL reads your frames by their
+Python names. The rules and examples are on [SQL and Python together](/pondra/guides/sql-and-python/).
 
 ## Save a frame
 
 <Tabs syncKey="lang">
   <TabItem label="Frames">
     ```python
+    recent = db.table("orders").filter(col("qty") > 1)
     recent.to_view("recent_orders")                                   # CREATE OR REPLACE VIEW
     recent.write_table("big_orders")                                  # CREATE TABLE … AS SELECT
     db.table("orders").filter(col("qty") == 1).write_table("big_orders", mode="append")
@@ -214,7 +186,7 @@ db.sql("SELECT id, user, qty FROM {r} WHERE qty > $min ORDER BY id", r=recent, m
 
 A view made from a frame is a view like any other: SQL files, psql and BI tools read it by name.
 `to_view(name, temporary=True)` keeps it to your connection, `materialized=True` keeps it up to
-date as rows arrive (see [streaming](/pondra/guides/streaming/)), and `write_table` takes
+date as rows arrive (see [views](/pondra/guides/views/)), and `write_table` takes
 `mode="create"`, `"append"` or `"overwrite"`. A frame of data that lives only in Python
 (`db.from_arrow(...)`) can't become a view; write it to a table first.
 

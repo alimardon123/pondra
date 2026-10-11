@@ -1,0 +1,14 @@
+---
+// One statement, every way: SQL, Python, JavaScript, the shell and HTTP, from site/src/ways.json
+// (which tools/docs_check.py reads too, so the tabs and the checks can't disagree).
+import { Tabs, TabItem, Code } from '@astrojs/starlight/components';
+import spec from '../ways.json';
+const { sql } = Astro.props as { sql: string };
+const text = sql.trim().replace(/;\s*$/, '');
+const first = (text.split(/\s+/)[0] ?? '').toLowerCase();
+const query = !/;\s*\S/.test(text) && spec.query_words.includes(first);
+const fill = (t: string) => t.replaceAll('{sql}', text);
+---
+<Tabs syncKey="lang">
+  {spec.ways.map((w) => <TabItem label={w.label}><Code code={fill(query ? w.query : w.statement)} lang={w.lang} /></TabItem>)}
+</Tabs>
