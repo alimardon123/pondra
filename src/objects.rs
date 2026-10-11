@@ -121,6 +121,7 @@ pub static PARTS: &[Part] = &[
     Part { name: "check", inside: &["table"], about: "CHECK: a condition every row written must meet", also: &["constraint"] },
     Part { name: "parameter", inside: &["function", "macro", "table function", "procedure"], about: "an argument a routine takes, with its type and default", also: &["argument"] },
     Part { name: "label", inside: &["type"], about: "one value an enum type allows", also: &["enum value"] },
+    Part { name: "measure", inside: &["view"], about: "an aggregate a view keeps, worked out at each query's own grain: MEASURE(m)", also: &["metric", "KPI", "semantic model", "calculated measure"] },
     Part { name: "expectation", inside: &["materialized view"], about: "a condition a view's new rows are counted against, and kept, dropped or failed by", also: &["data quality check", "assertion"] },
 ];
 

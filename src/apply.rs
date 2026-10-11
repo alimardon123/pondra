@@ -476,7 +476,7 @@ pub(crate) async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
     }
     for (k, v) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
         let name = &k[2..];
-        put(Kind::named("view"), name, format!("CREATE VIEW {} AS\n{}", quoted(name), v.sql.trim()), None, None);
+        put(Kind::named("view"), name, format!("CREATE VIEW {} AS\n{}", quoted(name), crate::measures::written(v.sql.trim())), None, None);
     }
     for (name, r) in crate::routines::listed(lake).await?.iter() {
         let kind = match r.what() {

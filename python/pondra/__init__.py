@@ -26,11 +26,11 @@ a node's HTTP API; pyarrow for results. `pip install pondra` also installs the `
 Also over the Postgres protocol (`pondra serve --pg 0.0.0.0:5432`) with psycopg, SQLAlchemy, etc.
 """
 from .client import Pondra, PondraError, Result, Run, binary, connect, current, local
-from .frame import Expr, Frame, GroupBy, coalesce, col, concat, concat_str, fn, lit, sql_expr, when
+from .frame import Expr, Frame, GroupBy, coalesce, col, concat, concat_str, fn, lit, measure, sql_expr, when
 from .frame import all, count, first, last, len, max, mean, median, min, n_unique, sum  # noqa: A004 (Polars' names)
 
 __version__ = "0.33.0"
-__all__ = ["connect", "local", "current", "sql", "table", "read_parquet", "read_csv", "read_json", "read_delta", "read_iceberg", "call", "run", "secret", "parameters", "fn", "Pondra", "PondraError", "Result", "Run", "Frame", "Expr", "GroupBy", "col", "lit", "when",
+__all__ = ["connect", "local", "current", "sql", "table", "read_parquet", "read_csv", "read_json", "read_delta", "read_iceberg", "call", "run", "secret", "parameters", "fn", "Pondra", "PondraError", "Result", "Run", "Frame", "Expr", "GroupBy", "col", "lit", "measure", "when",
            "sql_expr", "coalesce", "concat", "concat_str",
            "all", "count", "first", "last", "len", "max", "mean", "median", "min", "n_unique", "sum"]
 

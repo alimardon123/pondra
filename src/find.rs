@@ -161,10 +161,17 @@ async fn view_parts(session: Option<&SessionContext>, l: &Lake, o: &Object, here
         None => vec![],
     };
     let comments = column_comments(l, &local).await?;
+    let measures: HashMap<String, String> = match l.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(&local)).await? {
+        Some(v) => crate::measures::listed(&v.sql).into_iter().collect(), // (a view's measures are parts of their own, with their expressions)
+        None => HashMap::new(),
+    };
     let columns = columns.into_iter().filter(|(name, _)| partial.is_none_or(|cols| cols.contains(name)));
     Ok(columns.map(|(name, ty)| {
         let comment = comments.get(&name).cloned();
-        part(o, "column", name, Some(ty), comment, None)
+        match measures.get(&name) {
+            Some(e) => part(o, "measure", name, Some(ty), comment, Some(e.clone())),
+            None => part(o, "column", name, Some(ty), comment, None),
+        }
     }).collect())
 }
 

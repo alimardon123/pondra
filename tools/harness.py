@@ -8916,6 +8916,248 @@ await db.close?.();"""
     return f"{sum(bool(v) for v in checks.values())} of {len(checks)} find checks"
 
 
+def measures():
+    """Measures in views (ADR-065 §3, L5-3): `AS MEASURE` in a view's SELECT, `MEASURE(m)` at each query's own grain, against the GROUP BY written by hand, at every door; the refusals; what it costs."""
+    import datetime, psycopg
+    lake = new_lake()
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
+    q = lambda s, path="/sql": call(A.port, "POST", path, s.encode(), timeout=120)
+    def http(body):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", body.encode())
+        r = c.getresponse()
+        data = r.read()
+        return r.status, data.decode()[:400]
+    dsn = f"host=127.0.0.1 port={A.port + 10} user=pondra dbname=pondra"
+    def over_pg(s):
+        """The column names and the rows (dicts, NULLs kept) of a statement over the Postgres port."""
+        with psycopg.connect(dsn, autocommit=True) as c:
+            cur = c.execute(s)
+            names = [d.name for d in cur.description]
+            return names, [dict(zip(names, r)) for r in cur.fetchall()]
+    def tuples(rows, keys=None):
+        """Rows as tuples of their values: under `keys` (JSON leaves out NULLs, so a key a row lacks is None), else in each row's own key order; floats rounded to 6 places."""
+        pick = (lambda r: [r.get(k) for k in keys]) if keys else (lambda r: list(r.values()))
+        return [tuple(round(v, 6) if isinstance(v, float) else v for v in pick(r)) for r in rows]
+    same = lambda a, b, keys=None: sorted(tuples(a, keys), key=repr) == sorted(tuples(b, keys), key=repr)
+    ordered = lambda a, b: tuples(a) == tuples(b)
+    median = lambda xs: sorted(xs)[len(xs) // 2]
+    fresh = itertools.count(1)  # (the result cache answers a text it has seen at this catalog version: each timed run gets a comment of its own)
+    def ms(s):
+        """One run of `s`, in milliseconds."""
+        t0 = time.perf_counter()
+        q(f"{s} /* run {next(fresh)} */")
+        return (time.perf_counter() - t0) * 1000
+    def insert(table, rows):
+        for lo in range(0, len(rows), 500):
+            q(f"INSERT INTO {table} VALUES " + ", ".join(rows[lo:lo + 500]))
+    def customer(i):
+        region = None if i % 37 == 0 else ["north", "south", "east", "west"][i % 4]
+        return f"({i}, {'NULL' if region is None else repr(region)})"
+    def order(i):
+        when = datetime.datetime(2026, 1, 1) + datetime.timedelta(days=i % 40, hours=i % 24)
+        status = "void" if i % 17 == 0 else "paid" if i % 3 else "open"
+        return f"({i}, {(i * 7) % 230 + 1}, TIMESTAMP '{when:%Y-%m-%d %H:%M:%S}', {((i * 13) % 500) + 0.25 * (i % 4)!r}, '{status}')"
+    B = "FROM orders o LEFT JOIN customers c ON o.customer_id = c.id WHERE o.status <> 'void'"
+    SALES = ("CREATE VIEW sales AS SELECT o.ordered_at::date AS day, c.region, o.status, sum(o.amount) AS MEASURE revenue, "
+             "count(DISTINCT o.customer_id) AS MEASURE customers, revenue / customers AS MEASURE per_customer, count(*) AS MEASURE orders_n, "
+             "sum(net(o.amount)) AS MEASURE net_revenue FROM orders o LEFT JOIN customers c ON o.customer_id = c.id WHERE o.status <> 'void'")
+    MQ2 = "SELECT region, MEASURE(per_customer) AS pc FROM sales GROUP BY region"
+    H2 = f"SELECT c.region, sum(o.amount) / count(DISTINCT o.customer_id) AS pc {B} GROUP BY 1"
+    MQ3 = "SELECT region, MEASURE(revenue) AS r FROM sales GROUP BY region"
+    H3 = f"SELECT c.region, sum(o.amount) AS r {B} GROUP BY 1"
+    checks, info = {}, {}
+    for s in [
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY NOT ENFORCED, region VARCHAR)",
+        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, ordered_at TIMESTAMP, amount DOUBLE, status VARCHAR)",
+        "CREATE FUNCTION net(x DOUBLE) RETURNS DOUBLE IMMUTABLE RETURN x * 0.8",
+        "CREATE VIEW plain_view AS SELECT status, sum(amount) AS total FROM orders GROUP BY status",
+        SALES,
+    ]:
+        q(s)
+    insert("customers", [customer(i) for i in range(1, 201)])
+    insert("orders", [order(i) for i in range(1, 3001)])
+    followers = [Node(lake, A.port + i).start() for i in (1, 2)]  # two more nodes on the lake: check 11 spreads over all three
+    time.sleep(1)  # (the followers hear of each other: spread queries need them)
+
+    # 1. a read of the view as stored: its dimensions and each measure, grouped by every dimension
+    plain = q("SELECT * FROM sales")
+    plain_h = q(f"SELECT o.ordered_at::date AS day, c.region, o.status, sum(o.amount) AS revenue, count(DISTINCT o.customer_id) AS customers, sum(o.amount) / count(DISTINCT o.customer_id) AS per_customer, count(*) AS orders_n, sum(o.amount * 0.8) AS net_revenue {B} GROUP BY 1, 2, 3")
+    names, _ = over_pg("SELECT * FROM sales LIMIT 1")  # (the cursor's column names: a row with a NULL leaves its key out of JSON)
+    info["plain"] = [plain, plain_h, names]
+    checks["a plain read is the view at its own grain: its dimensions and measures, grouped by every dimension"] = same(plain, plain_h) \
+        and names == ["day", "region", "status", "revenue", "customers", "per_customer", "orders_n", "net_revenue"]
+
+    # 2. per customer by region is the region's revenue over its distinct customers, not an average of the view's ratios
+    m2, h2 = q(MQ2), q(H2)
+    avg2 = q("SELECT region, avg(per_customer) AS pc FROM (SELECT * FROM sales) s GROUP BY region")
+    info["per_customer"] = [m2, h2, avg2]
+    checks["MEASURE() at the query's own grain: per customer by region is the region's revenue over its distinct customers, never an average of the view's rows"] = \
+        same(m2, h2) and not same(m2, avg2)
+
+    # 3. every way of naming a measure is one answer
+    hand3 = q(H3)
+    forms = ["MEASURE(revenue)", "AGG(revenue)", "AGGREGATE(revenue)", "measure(revenue)", "sum(revenue)", "max(revenue)", "revenue", "sales.revenue"]
+    got3 = {x: q(f"SELECT region, {x} AS r FROM sales GROUP BY region") for x in forms}
+    info["forms"] = [got3, hand3]
+    checks["every way of naming a measure gives one answer: MEASURE, AGG, AGGREGATE, sum() as BI tools send it, the bare name, qualified"] = \
+        all(same(v, hand3) for v in got3.values())
+
+    # 4. the columns that read no measure group; with none, one row
+    st, st_h = q("SELECT status, MEASURE(orders_n) AS n FROM sales"), q(f"SELECT o.status, count(*) AS n {B} GROUP BY 1")
+    one, one_h = q("SELECT MEASURE(revenue) AS r, MEASURE(customers) AS c FROM sales"), q(f"SELECT sum(o.amount) AS r, count(DISTINCT o.customer_id) AS c {B}")
+    info["no_group"] = [st, st_h, one, one_h]
+    checks["with no GROUP BY, the columns that read no measure group; with none, one row"] = same(st, st_h) and same(one, one_h) and len(one) == 1
+
+    # 5. WHERE on a dimension, HAVING, ORDER BY and LIMIT on measures
+    top = q("SELECT region, MEASURE(revenue) AS r FROM sales WHERE day >= DATE '2026-01-20' GROUP BY region HAVING MEASURE(orders_n) > 10 ORDER BY MEASURE(revenue) DESC LIMIT 3")
+    top_h = q(f"SELECT c.region, sum(o.amount) AS r {B} AND o.ordered_at::date >= DATE '2026-01-20' GROUP BY 1 HAVING count(*) > 10 ORDER BY sum(o.amount) DESC LIMIT 3")
+    info["top"] = [top, top_h]
+    checks["WHERE on a dimension, HAVING, ORDER BY and LIMIT on measures"] = ordered(top, top_h)
+
+    # 6. grouped by an expression of a dimension
+    mo = q("SELECT date_trunc('month', day) AS m, MEASURE(customers) AS n FROM sales GROUP BY 1")
+    mo_h = q(f"SELECT date_trunc('month', o.ordered_at::date) AS m, count(DISTINCT o.customer_id) AS n {B} GROUP BY 1")
+    info["by_month"] = [mo, mo_h]
+    checks["grouped by an expression of a dimension"] = same(mo, mo_h)
+
+    # 7. a measure through the lake's own function
+    nr = q("SELECT status, MEASURE(net_revenue) AS n FROM sales GROUP BY status")
+    nr_h = q(f"SELECT o.status, sum(o.amount * 0.8) AS n {B} GROUP BY 1")
+    info["net"] = [nr, nr_h]
+    checks["a measure through the lake's own function"] = same(nr, nr_h)
+
+    # 8. a join no used column reads is left out of the query
+    plan_day = json.dumps(q("EXPLAIN SELECT day, MEASURE(revenue) AS r FROM sales GROUP BY day"))
+    plan_region = json.dumps(q("EXPLAIN SELECT region, MEASURE(revenue) AS r FROM sales GROUP BY region"))
+    info["explain"] = [plan_day, plan_region]
+    checks["a join nothing reads is left out"] = "customers" not in plan_day and "customers" in plan_region
+
+    # 9. a view and a CTE over the view with measures
+    q("CREATE VIEW by_region AS SELECT region, MEASURE(revenue) AS revenue FROM sales GROUP BY region")
+    by_region = q("SELECT * FROM by_region")
+    m9 = q("WITH t AS (SELECT region, MEASURE(revenue) AS r FROM sales GROUP BY region) SELECT max(r) AS m FROM t")
+    h9 = q(f"SELECT max(r) AS m FROM (SELECT c.region, sum(o.amount) AS r {B} GROUP BY 1) t")
+    info["views"] = [by_region, m9, h9]
+    checks["views and CTEs over a view with measures"] = same(by_region, hand3) and same(m9, h9)
+
+    # 10. rows written after are counted
+    before10 = q(MQ3)
+    insert("orders", [order(i) for i in range(3001, 3301)])
+    after10, h10 = q(MQ3), q(H3)
+    info["after_writes"] = [before10, after10, h10]
+    checks["rows written after are counted"] = same(after10, h10) and not same(after10, before10)
+
+    # 11. spread over three nodes == one node
+    def spreads():
+        m = metrics_of(A.port)
+        return m.get("pondra_spread_queries_total", 0) + m.get("pondra_shuffled_queries_total", 0)
+    until(lambda: _try(lambda: call(A.port + 1, "POST", "/sql", b"SELECT count(*) AS n FROM orders")), [{"n": 3300}], 30)
+    spread_queries = [MQ2, "SELECT status, MEASURE(orders_n) AS n FROM sales", "WITH t AS (SELECT region, MEASURE(revenue) AS r FROM sales GROUP BY region) SELECT max(r) AS m FROM t"]
+    before_spread = spreads()
+    spread = [(q(s, "/sql?spread=1"), q(s, "/sql?spread=0")) for s in spread_queries]
+    info["spread"] = [spread, [before_spread, spreads()]]  # (the spread counters: whether the queries spread)
+    checks["spread over three nodes == one node"] = all(same(a, b) for a, b in spread)
+
+    # 12. over Postgres: the same answers, and the catalog lists the view's columns and its definition
+    http_rows = q(MQ3)
+    _, pg_rows = over_pg(MQ3)
+    _, cat = over_pg("SELECT column_name FROM information_schema.columns WHERE table_name = 'sales' ORDER BY ordinal_position")
+    _, defs = over_pg("SELECT definition FROM pg_views WHERE viewname = 'sales'")
+    cols = [r["column_name"] for r in cat]
+    info["postgres"] = [http_rows, pg_rows, cols, defs]
+    checks["over Postgres: MEASURE answers as over HTTP, and the catalog lists the view's dimensions and measures"] = \
+        same(http_rows, pg_rows, ["region", "r"]) and cols == ["day", "region", "status", "revenue", "customers", "per_customer", "orders_n", "net_revenue"] \
+        and any("AS MEASURE revenue" in (r["definition"] or "") for r in defs)
+
+    # 18. frames: pondra.measure through a frame's steps (a filter is a CTE the measure is read through)
+    db = _client(A.port)
+    import pondra as pondra_client
+    frame = db.table("sales").filter(pondra_client.col("day") >= pondra_client.sql_expr("DATE '2026-01-20'")).group_by("region").agg(pondra_client.measure("revenue"))
+    try:
+        framed = [{k: v for k, v in r.items() if v is not None} for r in frame.rows()]  # (the client puts nulls back; the node's JSON leaves them out)
+    except Exception as e:  # (kept in info: the frame's SQL and why it failed)
+        framed = [{"error": str(e)[:300]}]
+    framed_h = q(f"SELECT c.region, sum(o.amount) AS revenue {B} AND o.ordered_at::date >= DATE '2026-01-20' GROUP BY 1")
+    info["frames"] = [frame.sql, framed, framed_h]
+    checks["frames: pondra.measure through a frame's steps answers as the SQL does"] = bool(framed) and same(framed, framed_h)
+
+    # 13. SHOW CREATE and pondra.objects show AS MEASURE; the statement makes the view again (after its drops)
+    shown = q("SHOW CREATE VIEW sales")[0]["definition"] or ""
+    listed_def = [r.get("definition") or "" for r in q("SELECT definition FROM pondra.objects WHERE name = 'sales'")]
+    q("DROP VIEW by_region")
+    q("DROP VIEW sales")
+    made = _raises_text(lambda: q(shown))  # ("" when it made the view)
+    again = _try(lambda: q(MQ2)) or []
+    info["show_create"] = [shown, listed_def, made, again]
+    checks["SHOW CREATE VIEW and pondra.objects show AS MEASURE, and the statement makes the view again"] = \
+        "AS MEASURE revenue" in shown and "pondra_measure" not in shown and any("AS MEASURE" in d for d in listed_def) \
+        and made == "" and same(again, q(H2))  # (the hand query again: check 10 wrote rows since h2)
+
+    # 14. pondra.parts lists each measure with its expression; find() finds them
+    parts = q("SELECT kind, name, definition FROM pondra.parts WHERE object = 'sales'")
+    measure_names = {r["name"] for r in parts if r["kind"] == "measure"}
+    column_names = {r["name"] for r in parts if r["kind"] == "column"}
+    rev_def = next((r.get("definition") or "" for r in parts if r["kind"] == "measure" and r["name"] == "revenue"), "")
+    found = q("SELECT * FROM pondra.find('revenue', kind => 'measure')")
+    metric = q("SELECT * FROM pondra.find('metric')")
+    info["parts"] = [parts, found, metric]
+    checks["pondra.parts lists each measure with its expression, and find(kind => 'measure') finds them"] = \
+        measure_names == {"revenue", "customers", "per_customer", "orders_n", "net_revenue"} and column_names == {"day", "region", "status"} \
+        and "sum(o.amount)" in rev_def and bool(found) and found[0]["name"] == "revenue" \
+        and any(r["kind"] == "measure" and r["is"] == "part" for r in metric)
+
+    # 15. refused by name, and nothing made
+    refusals = [
+        ("SELECT region FROM sales WHERE revenue > 5", "HAVING"),
+        ("SELECT sum(revenue * 2) AS x FROM sales", "inside sum"),
+        ("SELECT MEASURE(revenue) FROM sales s JOIN customers c ON s.region = c.region", "inside the view"),
+        ("SELECT MEASURE(nothing) FROM sales", "no measure nothing"),
+        ("SELECT MEASURE(total) FROM plain_view", "reads none"),
+        ("CREATE VIEW bad1 AS SELECT status, sum(amount) AS MEASURE m FROM orders GROUP BY status", "GROUP BY"),
+        ("CREATE VIEW bad2 AS SELECT o.status, sum(o.amount) AS MEASURE m FROM orders o RIGHT JOIN customers c ON o.customer_id = c.id", "LEFT JOIN"),
+        ("CREATE VIEW bad3 AS SELECT o.status, sum(o.amount) AS MEASURE m FROM orders o LEFT JOIN customers c ON o.status = c.region", "not on a key"),
+        ("CREATE VIEW bad4 AS SELECT o.status, sum(o.amount) AS MEASURE m FROM orders o LEFT JOIN orders o2 ON o.id = o2.id", "has no key"),
+        ("CREATE VIEW bad5 AS SELECT a + 1 AS MEASURE b, b + 1 AS MEASURE a FROM orders", "refer to each other"),
+        ("CREATE MATERIALIZED VIEW bad6 AS SELECT sum(amount) AS MEASURE m FROM orders", "materialized view"),
+        ("CREATE VIEW bad7 (s, m) AS SELECT status, sum(amount) AS MEASURE m FROM orders", "not in a list"),
+    ]
+    refused = [http(s) for s, _ in refusals]
+    info["refused"] = [[st_code, text[:200]] for st_code, text in refused]
+    no_bad = q("SELECT name FROM pondra.objects WHERE name LIKE 'bad%'")
+    checks["refused by name, and nothing made"] = all(st_code >= 400 and phrase in text for (st_code, text), (_, phrase) in zip(refused, refusals)) and no_bad == []
+
+    # 16. a query with measures costs what its GROUP BY written by hand costs (each run its own text: none from the result cache,
+    # which keys on the text as expanded; a measure's query is written anew there, without its comment, so each run names its column apart)
+    named = lambda s: s.replace(" AS pc ", f" AS pc_{next(fresh)} ")
+    for _ in range(3):
+        ms(named(MQ2)), ms(named(H2))
+    m_ms, h_ms = [], []
+    for _ in range(15):
+        m_ms.append(ms(named(MQ2)))
+        h_ms.append(ms(named(H2)))
+    measure_ms, hand_ms = median(m_ms), median(h_ms)
+    info["timing_ms"] = {"measure": round(measure_ms, 2), "hand": round(hand_ms, 2)}
+    checks["a query with measures costs what its GROUP BY written by hand costs"] = measure_ms <= hand_ms * 1.25 + 3
+
+    # 17. a query naming no measure pays nothing for 100 views with measures
+    CNT = "SELECT count(*) AS n FROM orders WHERE amount > 100"
+    before_ms = [ms(CNT) for _ in range(15)]
+    call(A.port, "POST", "/sql", ";\n".join(f"CREATE VIEW mv_{i} AS SELECT status, sum(amount) AS MEASURE m FROM orders" for i in range(100)).encode(), timeout=600)
+    after_ms = [ms(CNT) for _ in range(15)]
+    before_med, after_med = median(before_ms), median(after_ms)
+    info["no_measure_ms"] = {"before": round(before_med, 2), "after": round(after_med, 2)}
+    checks["a query naming no measure pays nothing for 100 views with measures"] = after_med <= before_med * 1.25 + 2
+
+    for n in followers + [node]:
+        n.kill()
+    ok = all(checks.values())
+    print(json.dumps({"measures": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(bool(v) for v in checks.values())} of {len(checks)} measures checks"
+
+
 def sparksql():
     """Spark SQL where PySpark code sends it (H8): `spark.sql(…)` read with Spark's grammar and
     turned into Pondra's SQL (`spark_sql('…')`): `"text"`, backticks, `LATERAL VIEW [OUTER]
@@ -10196,13 +10438,13 @@ def backpressure():
 # suite in parts side by side that end together. A section not listed counts as 5 s.
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
-        "users": 15, "find": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
+        "users": 15, "find": 15, "measures": 120, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
         "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10, "use_path": 40}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, reader, crash, load)
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, measures, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -10230,7 +10472,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "measures", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -10243,7 +10485,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "measures": measures, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

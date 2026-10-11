@@ -107,7 +107,7 @@ pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> {
         }
         for (k, v) in l.cat.scan::<StoredView>("q/", "q0").await? {
             let (schema, view) = split(&k[2..]);
-            all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: Some(v.sql) });
+            all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: Some(crate::measures::written(&v.sql).into_owned()) });
         }
     }
     Ok(all)
@@ -779,6 +779,7 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
     ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_none(), "{name} is a table");
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_none(), "{name} is a materialized view");
     ensure!(replace || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "view {name} already exists (CREATE OR REPLACE VIEW)");
+    crate::measures::check(lake, &sql).await?; // (a view with measures: its shape, and each join onto a key: ADR-065 §3)
     let expanded = crate::routines::expand(lake, &sql).await?; // (kept as written: macros are read when it is used)
     let planned = crate::asof::rewrite(&expanded)?;
     crate::query::sql(&crate::query::session(lake, &planned, "").await?, &planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
