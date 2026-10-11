@@ -54,6 +54,13 @@ pub async fn work<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static
     task.await.unwrap_or_else(|e| Err(format!("internal error: {e}")))
 }
 
+/// Start work of the leader's own that reads and writes as queries do (a view running its query
+/// again) on the queries' runtime: appends and commits never wait behind it (invariant 231). A panic
+/// in it is that work's alone, as a request's is.
+pub fn aside<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
+    queries().spawn(f)
+}
+
 /// How long a request runs before the ones after it go to the queries' runtime: under load a
 /// query's time grows as the cores are shared, so dashboards beside writers pass it at once.
 const LONG: std::time::Duration = std::time::Duration::from_millis(10);

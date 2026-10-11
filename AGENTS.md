@@ -94,7 +94,8 @@ src/      55,200 lines of Rust in 101 files, one per concern (see the table in R
           branch, switch, apply; a project's `objects/` (sequences, indexes and enum types too), `migrations/`,
           `seeds/` and `tests/`), ci.rs
           (`pondra ci init`), path.rs (`USE` and a session's search path: invariant 275), protect.rs
-          (a protected database: invariant 266), sync.rs (`pondra workspace pull | push`) and status.rs
+          (a protected database: invariant 266), sync.rs (`pondra workspace pull | push`), git.rs (Git
+          folders: a workspace folder paired with a GitHub branch, ADR-060 §8: invariant 282) and status.rs
           (`pondra status` and `pondra capture`: ADR-060 §7, invariant 280); views kept current (ADR-055,
           ADR-056, ADR-059):
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
@@ -154,7 +155,8 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           a release), sign.py (macOS and Windows signing once the certificates are set),
           upgrade_check.py (every release's lake opens, formats, the drain, rolling upgrades),
           soak.py (C4's soak), faulty_s3.py (an S3 proxy that errs, loses replies, slows, holds and
-          goes down), resilience_check.py (every mode under failure)
+          goes down), resilience_check.py (every mode under failure), git_check.py (Git folders against
+          fake_github.py, a stand-in for GitHub's REST API)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
 ```
 
@@ -1970,7 +1972,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    while they swap again and again…" (a row lost in 3 of 4 runs without the second look), "SWAP
    refused by name…", "a clone's identity sequence outlives…".
 
-282. **Commits wait for tiering only while tiering can run** (`log::Backpressure`, `Lake::tiering`):
+282. **A Git folder only moves its branch forward and loses no one's work, and a git token goes only where its
+   secret's SCOPE says** (`git.rs`): a commit goes on top of the folder's commit only while the branch's head is
+   that commit, and moves the branch with `force: false`; a pull refuses a file changed both here and on the branch
+   to different things, and changes nothing; the record (`.pondra-git.json`: repository, branch, commit, each file's
+   blob id) is written last, over the version it was read at. A token, named or picked, is sent only to a
+   repository its SCOPE covers, as written (no `..`, no user part), over https or to this machine's own address,
+   for a caller with USAGE; git secrets never read files (`ext::scoped`). `git_check.py`: "a commit after someone
+   else's push is refused: moved on" (their file lost with the check off and the push forced), "a path changed here
+   and on main: git_pull refused…", "a file deleted here and on main…", "refused by name: … a secret named that
+   doesn't cover the repository, a token over plain http to another machine…" and "…none of them asked the
+   repository anything".
+283. **Commits wait for tiering only while tiering can run** (`log::Backpressure`, `Lake::tiering`):
    while more than `--backlog` rows wait in the log, the sequencer holds commits back, but only while
    the lake's lock is free or a tiering round holds it (`server::Tiering`: on once the round has the
    lock, off once it has let it go). Tiering needs that lock, and whoever else holds it (a view running
@@ -1978,7 +1991,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    held, Nexmark's twenty views stopped every write, one run in four. `harness.py backpressure`: "150
    writes, each in time" times out at the 11th write without it; "never half of 8,000 rows in the
    log" fails if commits never wait.
-283. **A view of windows is kept by key only when each key's rows come from that key's rows alone**
+284. **A view of windows is kept by key only when each key's rows come from that key's rows alone**
    (`rerun::window_keys`, `partitioned`, `within`): one table read alone under its windows, or
    tables inner-joined on them (`joined`: each table has a column of the key's type equal to each
    key, through the joins' conditions and the filters over them), columns every window partitions by
@@ -2012,6 +2025,7 @@ python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every
 python3 tools/soak.py --minutes 10 [--hours 24] [--s3]                   # C4: steady ingest, nodes stopped and killed, memory, the log, commits on a timeline
 python3 tools/sharing_check.py [--s3]   # shares read by the delta-sharing client (its own venv: it pins pandas < 3) and another Pondra == the provider's rows; refusals; the audit log
 python3 tools/environments_check.py [--s3]   # CREATE DATABASE dev CLONE prod: no file copied, ids kept, writes apart, prod's merges and purges under it, REFRESH, DROP lets go; Layout B: two servers, ci init, a pull request's branch on dev from prod (--across: sealed keys, leases, the lent key)
+python3 tools/git_check.py              # Git folders against a stand-in GitHub: checkout, status, commit (some paths, all), pull, a conflict refused, a new branch, a pull request; refusals
 python3 tools/project_check.py          # pondra init, plan, apply, test, export, branch, switch, diff against a lakes server: migrations once (recorded in a new database, seeds loaded), drift, renames refused, a failed test, a stale plan, one owner per object, apply to test, prod and local, --watch, ci init with a stand-in gh
 python3 tools/history_check.py   # DROP/UNDROP, retention, PURGE, Delta; AT (VERSION | TIMESTAMP | OFFSET) == a model of 13 states; RESTORE; CLONE (no copy, apart, merges and drops); refusals
 python3 tools/deploy_check.py                  # the image and compose; add python, chart, helm (kind), service: deploy.yml runs them all

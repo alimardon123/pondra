@@ -492,10 +492,13 @@ async fn reads(lake: &Lake, sql: &str, source: &str) -> Result<(Vec<String>, boo
 /// counted, a run behind a tiering round waited ten times that again.
 ///
 /// A run slowed by the node's other work still counts as long, and its view then waited ten times
-/// that after the other work was done: Nexmark's q5, under 50 ms alone, took half a second as the
-/// stream ended and ran again five seconds later. So once what a view reads has been still for
-/// `STILL`, its next run comes then, once (the one after waits again): a burst's last rows are
-/// answered a moment after it, and a view still runs at most twice in its wait.
+/// that after the other work was done: Nexmark's q5, 40 ms of work once the stream had ended, took
+/// 0.3 s while it ran, and so waited three seconds more. So once what a view reads has been still for
+/// `STILL` since a change its last run didn't see, it runs then, if that keeps its runs to half the
+/// time (as a by-key view's): a burst's last rows are answered a moment after it. Such a run comes
+/// once a wait (a stream sent in batches is still between them, and running at each slowed its
+/// writes), and again only if a change overtook it while it ran: q5's came as the stream's last
+/// windows were still being emitted, and its answer then came four seconds after it.
 #[derive(Default)]
 struct Pace {
     running: bool,
@@ -505,10 +508,11 @@ struct Pace {
     error: Option<String>,
     /// When a timed view last ran whatever changed.
     timed: Option<Instant>,
-    /// The commit its last run that worked was as of, and whether that run came early (its tables
-    /// still before its wait was over).
+    /// The commit its last run that worked was as of, whether that run came early (its tables still
+    /// before its wait was over), and when it ended (ms).
     upto: u64,
     early: bool,
+    ended: u64,
 }
 
 const STILL: Duration = Duration::from_secs(1);
@@ -529,9 +533,7 @@ impl Drop for Turn {
         if let Some(p) = PACE.lock().unwrap().get_mut(&self.key) {
             let waited = Duration::from_micros(self.waited.load(std::sync::atomic::Ordering::Relaxed));
             (p.running, p.took) = (false, p.started.map_or(Duration::ZERO, |s| s.elapsed().saturating_sub(waited)));
-            if std::env::var("PONDRA_DEBUG_RERUN").is_ok() { // TEMPORARY
-                eprintln!("RERUN {} {} x took_ms={} waited_ms={} ok=true", crate::log::now_ms(), self.key.1, p.started.map_or(0, |s| s.elapsed().as_millis()), waited.as_millis());
-            }
+            p.ended = crate::log::now_ms();
         }
     }
 }
@@ -572,8 +574,9 @@ fn turn(lake: &Lake, view: &str, r: &Rerun, changed: Option<(u64, u64)>) -> Opti
     let spaced = if r.full.is_some() { p.took * 10 } else { p.took * 2 }; // (from its start; a full run reads everything)
     let since = p.started.map(|s| s.elapsed());
     let paced = since.is_none_or(|s| s >= spaced.max(least));
-    let still = changed.is_some_and(|(n, ms)| n > p.upto && crate::log::now_ms().saturating_sub(ms) >= STILL.as_millis() as u64);
-    if p.running || !(paced || still && !p.early && since.is_none_or(|s| s >= least)) {
+    let overtaken = |ms: u64| !p.early || ms <= p.ended; // (after an early run, a change made while it ran)
+    let still = changed.is_some_and(|(n, ms)| n > p.upto && crate::log::now_ms().saturating_sub(ms) >= STILL.as_millis() as u64 && overtaken(ms));
+    if p.running || !(paced || still && since.is_none_or(|s| s >= (p.took * 2).max(least))) {
         return None;
     }
     p.early = !paced;
@@ -594,8 +597,9 @@ pub fn failing(lake: &Lake, view: &str) -> Option<String> {
 }
 
 /// Leader: start a run of every view that runs its query again whose turn it is, each in a task of
-/// its own (a run that reads many rows never holds up the others, or the leader's other work). A
-/// run is no loop: one that fails or panics is tried again at a later turn.
+/// its own on the queries' runtime (a run that reads many rows never holds up the others, the
+/// leader's other work, or appends and commits). A run is no loop: one that fails or panics is tried
+/// again at a later turn.
 pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>) -> Result<()> {
     let views: Vec<(String, View)> = lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.rerun.is_some()).map(|(k, v)| (k[2..].to_string(), v)).collect();
     if views.is_empty() {
@@ -606,7 +610,7 @@ pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &
     for (name, v) in views {
         let Some(turn) = turn(lake, &name, v.rerun.as_ref().expect("filtered"), last_change(lake, &follows(&v))) else { continue };
         let (lake, seq, lock) = (lake.clone(), seq.clone(), lock.clone());
-        tokio::spawn(async move {
+        crate::panics::aside(async move {
             let r = run(&lake, &seq, &lock, &name, &v, &turn).await;
             turn.ended(&r);
         });
@@ -721,16 +725,19 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
             true => vec![],
             false => worked_out(lake, v, now, scanned.as_ref()).await?,
         };
-        // The view's rows as they are, read before the lake's lock: a by-key run's can take a second
-        // to read, and every other view's run waited for it. Under the lock they are taken as read
-        // when no commit has changed the view's table since, else read again there.
+        // The view's rows as they are, and what came out different, worked out before the lake's
+        // lock: a by-key run's take a second or two, and every other view's run waited for them.
+        // Under the lock they stand when no commit has changed the view's table since (only its own
+        // runs write it), else they are worked out again there.
         let seen = lake.visible();
+        let before: TableMeta = lake.cat.get(&table_key(view)).await?.context("view without table")?;
         let read = match none {
             true => vec![],
             false => old_rows(lake, view, &r.keys, scanned.as_ref(), seen).await?,
         };
-        // Under the lake's lock, as a change is (invariant 56): the view's rows as they are, and
-        // this view still the one this run is for (dropped and made again meanwhile, it's another).
+        let changed = diff(&before, &r.keys, &read, &new)?;
+        // Under the lake's lock, as a change is (invariant 56): this view still the one this run is
+        // for (dropped and made again meanwhile, it's another), and its rows as they are.
         let guard = waiting(waited, lock.lock()).await;
         if lake.cat.get::<View>(&crate::views::view_key(view)).await?.and_then(|v| v.rerun).is_none_or(|x| x.id != r.id) {
             return Ok(());
@@ -739,15 +746,11 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
         crate::change::companion(lake, view, &meta).await?; // (its `$deleted`, which every run names)
         let meta: TableMeta = lake.cat.get(&table_key(view)).await?.context("view without table")?;
         let at = lake.visible();
-        let old = match none || !moved_since(lake, seen, at, &[view.to_string()]).await? {
-            true => read,
-            false => old_rows(lake, view, &r.keys, scanned.as_ref(), at).await?,
+        let stands = none || meta.columns == before.columns && !moved_since(lake, seen, at, &[view.to_string()]).await?;
+        let (old, new) = match stands {
+            true => changed,
+            false => diff(&meta, &r.keys, &old_rows(lake, view, &r.keys, scanned.as_ref(), at).await?, &new)?,
         };
-        let keys = match r.keys.is_empty() {
-            true => meta.columns.iter().map(|(c, _)| c.clone()).collect(), // (rows matched whole)
-            false => r.keys.clone(),
-        };
-        let (old, new) = diff(&meta, &keys, &old, &new)?;
         if fresh {
             if old.num_rows() == 0 && new.num_rows() == 0 {
                 return Ok(()); // (a timed run, nothing new here, and the same answer: nothing to say)
@@ -953,7 +956,7 @@ async fn old_rows(lake: &Lake, view: &str, keys: &[String], touched: Option<&Tou
 /// What a run changes: the old rows (with their system columns) that aren't among the new ones,
 /// and the new rows that aren't among the old, each with the id and time of the old row of its
 /// key it replaces (an update in the change feed), or none (a new group). Rows compared whole, by
-/// Arrow's row format: NULLs equal, as a key's are.
+/// Arrow's row format: NULLs equal, as a key's are. No `keys`: a row's key is all of it.
 fn diff(meta: &TableMeta, keys: &[String], old: &[RecordBatch], new: &[RecordBatch]) -> Result<(RecordBatch, RecordBatch)> {
     use datafusion::arrow::compute::{concat_batches, filter_record_batch, take};
     use datafusion::arrow::row::{RowConverter, SortField};
@@ -964,8 +967,11 @@ fn diff(meta: &TableMeta, keys: &[String], old: &[RecordBatch], new: &[RecordBat
     let olds = Arc::new(Schema::new(fields));
     let old = concat_batches(&olds, &old.iter().map(|b| crate::query::conform(b, &olds)).collect::<Result<Vec<_>>>()?)?;
     let new = concat_batches(&s, &new.iter().map(|b| crate::query::cast_as(b, &s)).collect::<Result<Vec<_>>>()?)?;
-    let at: Vec<usize> = keys.iter().map(|k| s.index_of(k)).collect::<Result<_, _>>()?;
     let all: Vec<usize> = (0..s.fields().len()).collect();
+    let at: Vec<usize> = match keys.is_empty() {
+        true => all.clone(), // (no keys: rows matched whole)
+        false => keys.iter().map(|k| s.index_of(k)).collect::<Result<_, _>>()?,
+    };
     // (one converter per pair, so the rows of old and new compare)
     let pair = |cols: &[usize]| -> Result<(datafusion::arrow::row::Rows, datafusion::arrow::row::Rows)> {
         let c = RowConverter::new(cols.iter().map(|&i| SortField::new(s.field(i).data_type().clone())).collect())?;

@@ -966,7 +966,8 @@ def tails():
 def pace():
     """Writes keep their pace while many clients query (`panics::work`): a writer's appends, a
     request at a time, alone and then beside 64 clients each asking an aggregate over 2 million
-    rows. On one runtime its acks waited behind the queries' tasks (20-50 times as long)."""
+    rows. On one runtime its acks waited behind the queries' tasks (20-50 times as long). Then
+    beside eight views running their queries again over what it writes (`panics::aside`)."""
     lake = new_lake()
     node = Node(lake, A.port).start()
     q = lambda s: sql(A.port, s)
@@ -1002,18 +1003,27 @@ def pace():
     beside = sorted(acks(8, 100000))
     stop.set()
     [r.join(60) for r in readers]
+    # Views that run their queries again over what the writer writes, each as often as its pace lets
+    # it (kept by key, every group touched by every write: each run reads every row): the leader's
+    # own work, on the queries' runtime too (`panics::aside`).
+    for i in range(8):
+        q(f"CREATE MATERIALIZED VIEW busy{i} AS SELECT id % 50 + {i} AS k, median(id) AS m, count(DISTINCT s) AS d FROM w GROUP BY 1")
+    time.sleep(2)
+    viewed = sorted(acks(8, 200000))
     node.kill()
     p50 = lambda xs: xs[len(xs) // 2]
     checks = {
         "64 clients' answers are right": not wrong and asked[0] > 64,
         "a writer's acks beside 64 querying clients stay within 5x of its acks alone (or 25 ms)": p50(beside) <= max(5 * p50(alone), 25),
+        "a writer's acks beside eight views running their queries again stay within 2.5x of its acks alone (or 15 ms)": p50(viewed) <= max(2.5 * p50(alone), 15),
     }
     for name, good in checks.items():
         print(f"pace: {name}: {'OK' if good else 'FAIL'}")
-    print(f"pace: acks alone p50 {p50(alone):.1f} ms, beside the readers p50 {p50(beside):.1f} ms ({len(beside)} appends), {asked[0]} queries answered, wrong {wrong[:2]}")
+    print(f"pace: acks alone p50 {p50(alone):.1f} ms, beside the readers p50 {p50(beside):.1f} ms ({len(beside)} appends), beside the views p50 {p50(viewed):.1f} ms "
+          f"({len(viewed)} appends), {asked[0]} queries answered, wrong {wrong[:2]}")
     if not all(checks.values()):
         sys.exit(1)
-    return f"writes keep their pace beside 64 querying clients: acks p50 {p50(alone):.1f} ms alone, {p50(beside):.1f} ms beside"
+    return f"writes keep their pace beside 64 querying clients and eight busy views: acks p50 {p50(alone):.1f} ms alone, {p50(beside):.1f} and {p50(viewed):.1f} ms beside"
 
 
 def memory():
@@ -9725,7 +9735,7 @@ def publishing():
 
 def backpressure():
     """Writes wait while more than `--backlog` rows wait in the log to be tiered, and only while
-    tiering can run (invariant 282): its round takes the lake's lock, and a view that runs its query
+    tiering can run (invariant 283): its round takes the lake's lock, and a view that runs its query
     again holds that lock while its rows commit, so a commit held back behind tiering stopped every
     write for good (Nexmark's twenty views, now and then). 8,000 rows written fast, 500 a write,
     wait for tiering (never half of them in the log at once; all of them without the wait); then
