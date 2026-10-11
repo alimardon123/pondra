@@ -12,6 +12,16 @@ private network. To share it, start the node with **tokens**. There are three, o
 every door checks them: HTTP, the Python and JavaScript clients, Postgres, Kafka, Arrow Flight, MCP
 and the Iceberg REST catalog.
 
+<Aside type="caution" title="A node with no tokens is for this machine">
+An open node (no tokens) is an administrator to anyone who reaches it. On a non-loopback address it
+prints a warning at start, because it is then open to that whole network — set a token. A node you
+start with the shell or `pondra.local()` is open on a loopback port; a web page you visit **cannot**
+drive it or read its answers, because a browser's cross-site request, and a request whose host could
+have been rebound to the node, are refused. A browser tool you trust is allowed by listing its
+origin in `PONDRA_ALLOWED_ORIGINS` (comma-separated `https://host[:port]`). This holds only for an
+open node; with tokens on, a browser can't carry one cross-site, so the token check does the work.
+</Aside>
+
 | Role | May |
 |---|---|
 | **read** | query: `SELECT`, key lookups, `watch` and `live`, MCP reads, the Iceberg catalog's reads, metrics, and `GET /files` |

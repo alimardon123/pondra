@@ -7097,6 +7097,49 @@ def safety():
     checks["HTTPS answers; plain HTTP only from this machine, refused from another saying why"] = said["https"] == (200, '[{"x":1}]') and said["plain here"] == (200, '[{"x":1}]') \
         and (not away or (said["https away"] == (200, '[{"x":1}]') and said["plain away"][0] == 403 and "takes TLS" in said["plain away"][1]))
 
+    # A web page is kept off an open node (no tokens): a browser's cross-site Origin, or a host it
+    # could have rebound to this node, is not auto-admitted; non-browser clients and the node's own
+    # page pass. (Invariant 288. The node `a` has no tokens, so every request is an admin otherwise.)
+    def web(port, path, origin=None, host=None, body=b"SELECT 1 AS x", method="POST", secure=False):
+        # (plain HTTP from this machine, which an open node answers: same_site is transport-independent,
+        # and this keeps the check off the TLS path the HTTPS checks above already cover.)
+        ctx = ssl.create_default_context(cafile=ca)
+        c = http.client.HTTPSConnection("127.0.0.1", port, context=ctx, timeout=60) if secure else http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        h = {}
+        if origin is not None:
+            h["Origin"] = origin
+        if host is not None:
+            h["Host"] = host  # (http.client keeps our Host when we set it: a rebind, as a browser sees it)
+        try:
+            c.request(method, path, body, h)
+            r = c.getresponse()
+            return r.status, r.read().decode(errors="replace")
+        except Exception as e:
+            return 0, f"{type(e).__name__}: {e}"
+    web_said = {
+        "no origin (a client)": web(P, "/sql"),
+        "same origin (the console)": web(P, "/sql", origin=f"https://127.0.0.1:{P}", host=f"127.0.0.1:{P}"),
+        "cross-site write": web(P, "/sql", origin="https://evil.example"),
+        "cross-site read": web(P, "/sql", origin="https://evil.example", body=b"SELECT 1 AS x", method="POST"),
+        "rebound host": web(P, "/sql", origin="https://evil.example:4000", host="evil.example:4000"),
+        "page still loads cross-site": web(P, "/", origin="https://evil.example", body=b"", method="GET"),
+    }
+    info["web"] = {k: (s, b[:60]) for k, (s, b) in web_said.items()}
+    checks["a web page is kept off an open node: cross-site and rebinding refused, the client and the console page unaffected"] = \
+        web_said["no origin (a client)"] == (200, '[{"x":1}]') and web_said["same origin (the console)"] == (200, '[{"x":1}]') \
+        and web_said["cross-site write"][0] == 401 and web_said["cross-site read"][0] == 401 and web_said["rebound host"][0] == 401 \
+        and web_said["page still loads cross-site"][0] == 200
+    # PONDRA_ALLOWED_ORIGINS lets a named browser tool through (its origin, over a loopback host).
+    allow = Node(new_lake(), P + 40, env={"PONDRA_ALLOWED_ORIGINS": "https://studio.example"}).start()
+    allowed_said = {
+        "listed origin": web(P + 40, "/sql", origin="https://studio.example", host=f"127.0.0.1:{P + 40}", secure=False),
+        "other origin": web(P + 40, "/sql", origin="https://other.example", host=f"127.0.0.1:{P + 40}", secure=False),
+    }
+    info["allowed_origins"] = allowed_said
+    checks["PONDRA_ALLOWED_ORIGINS lets a listed origin through, and no other"] = \
+        allowed_said["listed origin"] == (200, '[{"x":1}]') and allowed_said["other origin"][0] == 401
+    allow.kill()
+
     def raw(port, chunks, source=None, wrap=False, first=None):
         s = socket.create_connection(("127.0.0.1", port), timeout=10, source_address=(source, 0) if source else None)
         try:

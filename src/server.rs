@@ -397,7 +397,11 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         Some(p) => p,
         None if owner(req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
         None if starting && needed == crate::auth::Role::None => crate::auth::Principal::of(crate::auth::Role::None), // (a probe while it catches up: answered, never held)
-        None if app.open().await => crate::auth::Principal::of(crate::auth::Role::Admin),
+        // (nothing needs a sign-in here, so anyone is an admin — but never a web page the user is
+        // visiting: a browser's cross-site request, or one whose Host could have been rebound to
+        // this node, is not auto-admitted. It falls through to Role::None below, so the console,
+        // the health checks and sign-in still answer, while /sql and the writes ask for a token.)
+        None if app.open().await && same_site(req.headers()) => crate::auth::Principal::of(crate::auth::Role::Admin),
         None if header.is_some() => {
             crate::audit::refused(&app, &basic_user(header.as_deref()), "http", from, &format!("{} {}", req.method(), req.uri().path()), "wrong token, or user name and password");
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
@@ -443,6 +447,38 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
 /// so appends, commits, heartbeats and the commit stream keep theirs.
 fn queries(path: &str) -> bool {
     matches!(path, "/sql" | "/mcp" | "/live" | "/tier" | "/cluster/stage" | "/cluster/copy" | "/cluster/insert" | "/cluster/job") || path.starts_with("/sql/pages/") || path.starts_with("/insert/")
+}
+
+/// The host of an authority or an origin, without the scheme or the port: `https://h:443` → `h`,
+/// `h:8080` → `h`, `[::1]:8080` → `::1`.
+fn bare_host(s: &str) -> &str {
+    let s = s.rsplit_once("://").map(|(_, a)| a).unwrap_or(s);
+    match s.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest), // (an IPv6 literal, [::1] or [::1]:port)
+        None => s.rsplit_once(':').map(|(h, _)| h).unwrap_or(s),
+    }
+}
+
+/// May a request with no sign-in be auto-admitted on an open node (no tokens)? Non-browser clients
+/// (the Pondra clients, psql, curl, another node, the tests) send no `Origin`, so they pass. A
+/// browser sends `Origin` on every write and on a read it can read back; such a request is admitted
+/// only when it is this node's own page (`Origin` matches the request's host) *and* that host is a
+/// loopback or IP literal (so a name rebound to this node by DNS, where `Origin` and `Host` are
+/// both the attacker's name, is kept off). `PONDRA_ALLOWED_ORIGINS` (comma-separated
+/// `scheme://host[:port]` or bare hosts) widens both, for a browser tool the user trusts. A proxy
+/// (the `--lakes` front) passes the browser's host as `x-forwarded-host`; browsers can't set it.
+pub(crate) fn same_site(headers: &axum::http::HeaderMap) -> bool {
+    let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
+        return true; // (no Origin: not a browser, or a navigation that can't carry a write)
+    };
+    let host = headers.get("x-forwarded-host").or_else(|| headers.get("host")).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let allowed = std::env::var("PONDRA_ALLOWED_ORIGINS").unwrap_or_default();
+    let allowed: Vec<&str> = allowed.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let origin_ok = origin.rsplit_once("://").map(|(_, auth)| auth == host).unwrap_or(false)
+        || allowed.iter().any(|a| *a == origin || bare_host(a) == bare_host(origin));
+    let h = bare_host(host);
+    let host_ok = h == "localhost" || h.parse::<std::net::IpAddr>().is_ok() || allowed.iter().any(|a| bare_host(a) == h);
+    origin_ok && host_ok
 }
 
 /// The user name in a Basic header (for the audit log: who tried).

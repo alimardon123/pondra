@@ -277,6 +277,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
             let db = s.default_db().await;
             route(&s, &db, &path, req).await
         })
+        .layer(axum::middleware::from_fn_with_state(server.clone(), web_guard))
         .layer(axum::middleware::from_fn(plain))
         .with_state(server.clone());
     eprintln!("pondra serve: the lakes in {folder} as databases, on {addr}");
@@ -349,6 +350,11 @@ async fn route(s: &Server, name: &str, path: &str, req: Request) -> Response {
     for (k, v) in parts.headers.iter().filter(|(k, _)| !matches!(k.as_str(), "host" | "content-length" | "transfer-encoding" | "connection")) {
         out = out.header(k, v);
     }
+    // (the browser's own host, so the child decides same-origin against it, not the loopback host
+    // this proxy rewrites to: `server::same_site`. A browser can't set this header itself.)
+    if let Some(host) = parts.headers.get("host") {
+        out = out.header("x-forwarded-host", host);
+    }
     match out.send().await {
         Ok(res) => {
             let mut resp = Response::builder().status(res.status().as_u16());
@@ -375,6 +381,18 @@ async fn plain(axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crat
         true => next.run(req).await,
         false => (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response(),
     }
+}
+
+/// On a front with no tokens, every request is an administrator (as a single node's is), so keep a
+/// web page the user is visiting off it: a browser's cross-site request, or one whose host could
+/// have been rebound to this front, is refused (`server::same_site`). Non-browser clients and the
+/// front's own same-origin console pass. With tokens on, a browser can't carry one cross-site
+/// anyway, so the handlers' token checks do the work and this steps aside.
+async fn web_guard(State(s): State<Shared>, req: Request, next: axum::middleware::Next) -> Response {
+    if !s.auth.on() && !crate::server::same_site(req.headers()) {
+        return (StatusCode::FORBIDDEN, "this node has no tokens, so it answers only this machine's own tools; a request from a web page is refused (set a token, or list its origin in PONDRA_ALLOWED_ORIGINS)").into_response();
+    }
+    next.run(req).await
 }
 
 async fn postgres(s: &Server, tcp: tokio::net::TcpStream) -> Result<()> {
