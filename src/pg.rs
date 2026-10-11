@@ -738,7 +738,7 @@ struct Pending {
     job: String,
 }
 
-static COPIES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, Pending>>> = std::sync::LazyLock::new(Default::default);
+crate::per_node!(static COPIES: std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, Pending>> = Default::default());
 
 #[async_trait]
 impl CopyHandler for Backend {

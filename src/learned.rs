@@ -245,7 +245,7 @@ struct Known {
     reading: bool,
 }
 
-static KNOWN: LazyLock<RwLock<Known>> = LazyLock::new(Default::default);
+crate::per_node!(static KNOWN: RwLock<Known> = Default::default());
 const KEPT: usize = 20_000; // (facts at most: a few MB)
 
 fn known() -> std::sync::RwLockReadGuard<'static, Known> { KNOWN.read().unwrap_or_else(|e| e.into_inner()) }
@@ -494,7 +494,7 @@ struct Runs {
     aside: bool,
 }
 
-static RUNS: LazyLock<Mutex<lru::LruCache<u64, Runs>>> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())));
+crate::per_node!(static RUNS: Mutex<lru::LruCache<u64, Runs>> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
 
 /// A query by its words, without its comments and spacing: asked again with a note in a comment (as
 /// tools and dashboards do), it is the same query. Its literals stay: other values filter otherwise.

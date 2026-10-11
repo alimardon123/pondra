@@ -12,7 +12,7 @@
 use object_store::client::{ClientOptions, HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService, ReqwestConnector};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
 /// A bucket's turns.
@@ -94,9 +94,9 @@ pub struct Budget {
     inner: ReqwestConnector,
 }
 
-static GATES: LazyLock<Mutex<HashMap<String, Arc<Gate>>>> = LazyLock::new(Default::default);
-/// Each bucket's shares: the path of another lake in it (`a/b`), and its turns.
-static SHARES: LazyLock<Mutex<HashMap<String, Vec<(String, Arc<Gate>)>>>> = LazyLock::new(Default::default);
+crate::per_node!(static GATES: Mutex<HashMap<String, Arc<Gate>>> = Default::default());
+// Each bucket's shares: the path of another lake in it (`a/b`), and its turns.
+crate::per_node!(static SHARES: Mutex<HashMap<String, Vec<(String, Arc<Gate>)>>> = Default::default());
 
 /// Where a node's turns of a bucket start (`PONDRA_BUCKET_REQUESTS`).
 fn start() -> usize { std::env::var("PONDRA_BUCKET_REQUESTS").ok().and_then(|n| n.parse().ok()).unwrap_or(256usize).max(4) }

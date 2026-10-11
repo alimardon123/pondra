@@ -24,7 +24,7 @@ use datafusion::arrow::datatypes::{DataType, Int64Type};
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A table's changes in a transaction: rows it adds (new rows, whose `_row_id` is negative until
@@ -45,7 +45,7 @@ struct Txn {
     next: i64, // the next new row's temporary id (-1, -2, …)
 }
 
-static TXNS: LazyLock<Mutex<HashMap<String, Txn>>> = LazyLock::new(Default::default);
+crate::per_node!(static TXNS: Mutex<HashMap<String, Txn>> = Default::default());
 
 const NO_SESSION: &str = "a transaction is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>)";
 

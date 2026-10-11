@@ -334,12 +334,12 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
     });
 }
 
-/// Follower or read-only node: follow the leader's commit stream (see `store.rs`). If it breaks,
-/// reconnect; meanwhile our own catalog view keeps us correct, just a little behind. A follower
-/// (`replica`) of a leader that replicates commits also keeps every change on local disk and
-/// says so: that is what lets the leader acknowledge a write before the bucket has it.
-/// Is the leader's commit stream down (`mirror`)? A read-only node then looks for a new leader.
-static STREAM_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Follower or read-only node: follow the leader's commit stream (see `store.rs`). If it breaks,
+// reconnect; meanwhile our own catalog view keeps us correct, just a little behind. A follower
+// (`replica`) of a leader that replicates commits also keeps every change on local disk and
+// says so: that is what lets the leader acknowledge a write before the bucket has it.
+// Is the leader's commit stream down (`mirror`)? A read-only node then looks for a new leader.
+crate::per_node!(static STREAM_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
 
 pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<ReplicaLog>>) {
     // Acks, coalesced: however many changes arrive meanwhile, one request says "up to here".
@@ -480,10 +480,10 @@ pub async fn release(store: &Store, n: u64) {
     discard(held);
 }
 
-/// The lock files of the terms this process claimed (or took back after a restart), each locked until
-/// the term is let go (`release`) or the process ends, however it ends: the OS lets go then. Keyed by
-/// term number. (A process holds one claim per term number: one lake at a time.)
-static HELD: Mutex<BTreeMap<u64, (PathBuf, std::fs::File)>> = Mutex::new(BTreeMap::new());
+// The lock files of the terms this process claimed (or took back after a restart), each locked until
+// the term is let go (`release`) or the process ends, however it ends: the OS lets go then. Keyed by
+// term number. (A process holds one claim per term number: one lake at a time.)
+crate::per_node!(static HELD: Mutex<BTreeMap<u64, (PathBuf, std::fs::File)>> = Mutex::new(BTreeMap::new()));
 
 /// This user's folder of claim lock files, in the temp folder: per user on macOS and Windows, and
 /// named by the user's id on Linux, where `/tmp` is shared. Made 0700, and used only while it is

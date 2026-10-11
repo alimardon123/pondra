@@ -671,8 +671,8 @@ pub async fn attach_found(home: &Lake, folder: &str, me: &str) -> Vec<String> {
     found
 }
 
-/// The lakes this process attached because the catalog said so, per home lake.
-static FROM_SQL: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+// The lakes this process attached because the catalog said so, per home lake.
+crate::per_node!(static FROM_SQL: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new()));
 
 /// Attach here the lakes the catalog lists (`ATTACH`), and let go of those it no longer does
 /// (`DETACH`). Lakes attached with `--attach` stay. One that can't be opened is skipped (and

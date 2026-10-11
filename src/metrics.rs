@@ -4,24 +4,24 @@ use crate::store::{table_key, TableMeta};
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-pub static ROWS_IN: AtomicU64 = AtomicU64::new(0); // rows this node took into the log, by any door
-pub static QUERIES: AtomicU64 = AtomicU64::new(0); // SQL queries run here (HTTP, Postgres, MCP, Flight)
-pub static QUERY_ERRORS: AtomicU64 = AtomicU64::new(0);
-pub static QUERY_US: AtomicU64 = AtomicU64::new(0); // their total time
-pub static SPREAD: AtomicU64 = AtomicU64::new(0); // queries run across the cluster from here
-pub static SHUFFLED: AtomicU64 = AtomicU64::new(0); // …of them with a shuffle
-pub static RANGED: AtomicU64 = AtomicU64::new(0); // …of them with their tables sliced by a key's ranges
-pub static FILES_SCANNED: AtomicU64 = AtomicU64::new(0); // append-table files queries opened…
-pub static FILES_SKIPPED: AtomicU64 = AtomicU64::new(0); // …and skipped by their min/max
-pub static OBJECT_WRITES: AtomicU64 = AtomicU64::new(0); // object-store requests this process made (`store::Counted`): writes…
-pub static OBJECT_LISTS: AtomicU64 = AtomicU64::new(0); // …lists…
-pub static OBJECT_DELETES: AtomicU64 = AtomicU64::new(0); // …and deletes
-pub static SPILLED: AtomicU64 = AtomicU64::new(0); // shuffle bytes written to this node's disk
-pub static SKEW: AtomicU64 = AtomicU64::new(0); // the worst bucket/average seen in a shuffle, x100
-pub static SKEW_SPLITS: AtomicU64 = AtomicU64::new(0); // hot partitions of shuffled joins shared out
-pub static RECEIVED: AtomicU64 = AtomicU64::new(0); // shuffle bytes this node's steps read (its share of the work)
-pub static WIRE: AtomicU64 = AtomicU64::new(0); // bytes other nodes sent this node, compressed as sent (shuffles, gathered results)
-pub static WAIT_US: AtomicU64 = AtomicU64::new(0); // time this node's steps waited for other nodes' buckets
+crate::per_node!(pub static ROWS_IN: AtomicU64 = AtomicU64::new(0)); // rows this node took into the log, by any door
+crate::per_node!(pub static QUERIES: AtomicU64 = AtomicU64::new(0)); // SQL queries run here (HTTP, Postgres, MCP, Flight)
+crate::per_node!(pub static QUERY_ERRORS: AtomicU64 = AtomicU64::new(0));
+crate::per_node!(pub static QUERY_US: AtomicU64 = AtomicU64::new(0)); // their total time
+crate::per_node!(pub static SPREAD: AtomicU64 = AtomicU64::new(0)); // queries run across the cluster from here
+crate::per_node!(pub static SHUFFLED: AtomicU64 = AtomicU64::new(0)); // …of them with a shuffle
+crate::per_node!(pub static RANGED: AtomicU64 = AtomicU64::new(0)); // …of them with their tables sliced by a key's ranges
+crate::per_node!(pub static FILES_SCANNED: AtomicU64 = AtomicU64::new(0)); // append-table files queries opened…
+crate::per_node!(pub static FILES_SKIPPED: AtomicU64 = AtomicU64::new(0)); // …and skipped by their min/max
+crate::per_node!(pub static OBJECT_WRITES: AtomicU64 = AtomicU64::new(0)); // object-store requests this process made (`store::Counted`): writes…
+crate::per_node!(pub static OBJECT_LISTS: AtomicU64 = AtomicU64::new(0)); // …lists…
+crate::per_node!(pub static OBJECT_DELETES: AtomicU64 = AtomicU64::new(0)); // …and deletes
+crate::per_node!(pub static SPILLED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes written to this node's disk
+crate::per_node!(pub static SKEW: AtomicU64 = AtomicU64::new(0)); // the worst bucket/average seen in a shuffle, x100
+crate::per_node!(pub static SKEW_SPLITS: AtomicU64 = AtomicU64::new(0)); // hot partitions of shuffled joins shared out
+crate::per_node!(pub static RECEIVED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes this node's steps read (its share of the work)
+crate::per_node!(pub static WIRE: AtomicU64 = AtomicU64::new(0)); // bytes other nodes sent this node, compressed as sent (shuffles, gathered results)
+crate::per_node!(pub static WAIT_US: AtomicU64 = AtomicU64::new(0)); // time this node's steps waited for other nodes' buckets
 
 pub fn add(c: &AtomicU64, n: u64) { c.fetch_add(n, Relaxed); }
 

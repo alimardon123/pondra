@@ -27,7 +27,7 @@ use datafusion::logical_expr::{Accumulator, Expr};
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 pub const INLINE: usize = 128; // at most this many files in the catalog entry…
 pub const SEAL: usize = 64; // …then all but the newest this many are sealed
@@ -133,7 +133,7 @@ pub fn orderable(t: &DataType) -> bool {
 /// per version of the table — every query would otherwise re-parse every file's min and max.
 pub fn ranges(table: &str, manifests: &[Manifest], files: &[DataFile], schema: &SchemaRef) -> Arc<Stats> {
     use std::hash::{Hash, Hasher};
-    static SEEN: LazyLock<Mutex<lru::LruCache<String, (u64, Arc<Stats>)>>> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap())));
+    crate::per_node!(static SEEN: Mutex<lru::LruCache<String, (u64, Arc<Stats>)>> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
     let mut h = std::collections::hash_map::DefaultHasher::new();
     files.iter().for_each(|f| f.path.hash(&mut h));
     manifests.iter().for_each(|m| m.path.hash(&mut h));
@@ -223,8 +223,8 @@ impl PruningStatistics for View<'_> {
 
 // ---------------------------------------------------------------- reading
 
-/// Decompressed metadata objects, newest used kept, up to 256 MB (they never change).
-static CACHE: LazyLock<Mutex<(lru::LruCache<String, Arc<Vec<u8>>>, usize)>> = LazyLock::new(|| Mutex::new((lru::LruCache::unbounded(), 0)));
+// Decompressed metadata objects, newest used kept, up to 256 MB (they never change).
+crate::per_node!(static CACHE: Mutex<(lru::LruCache<String, Arc<Vec<u8>>>, usize)> = Mutex::new((lru::LruCache::unbounded(), 0)); clear = |m| { let mut c = m.lock().unwrap_or_else(|e| e.into_inner()); c.0.clear(); c.1 = 0; });
 const CACHE_BYTES: usize = 256 << 20;
 
 async fn object(lake: &Lake, path: &str) -> Result<Arc<Vec<u8>>> {

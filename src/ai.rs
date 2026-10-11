@@ -26,9 +26,9 @@ use std::time::Duration;
 const EMBEDS: usize = 64; // texts in one embeddings request
 const TRIES: u32 = 5; // a call, and four more after a 429, a 5xx or a lost connection
 
-pub static CALLS: AtomicU64 = AtomicU64::new(0); // requests to the endpoint that were answered…
-pub static FAILED: AtomicU64 = AtomicU64::new(0); // …that failed for good (their rows are null)…
-pub static RETRIED: AtomicU64 = AtomicU64::new(0); // …and that were tried again
+crate::per_node!(pub static CALLS: AtomicU64 = AtomicU64::new(0)); // requests to the endpoint that were answered…
+crate::per_node!(pub static FAILED: AtomicU64 = AtomicU64::new(0)); // …that failed for good (their rows are null)…
+crate::per_node!(pub static RETRIED: AtomicU64 = AtomicU64::new(0)); // …and that were tried again
 
 pub fn register(ctx: &SessionContext) {
     for embed in [false, true] {
@@ -161,7 +161,7 @@ fn refused(e: &anyhow::Error) -> bool {
 /// A call that failed for good: counted, and said on the node's standard error once every ten
 /// seconds at most (an endpoint that is down fails every row of every batch).
 fn failed(embed: bool, e: &anyhow::Error) {
-    static SAID: AtomicU64 = AtomicU64::new(0);
+    crate::per_node!(static SAID: AtomicU64 = AtomicU64::new(0));
     FAILED.fetch_add(1, Relaxed);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let last = SAID.load(Relaxed);

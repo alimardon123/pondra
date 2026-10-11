@@ -94,7 +94,7 @@ pub fn operator() -> bool { current().is_some_and(|p| p.operator) }
 /// Does a node in this process take tokens? (Then nothing it serves is open, attached lakes included.)
 pub fn tokens_on() -> bool { TOKENS.load(std::sync::atomic::Ordering::Relaxed) }
 
-static TOKENS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+crate::per_node!(static TOKENS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
 
 /// The header that carries, with a change a node sends its leader, the user it is for: the leader
 /// runs it as that user, so its subqueries read with the user's grants, as where it came in. Only the
@@ -348,7 +348,7 @@ pub fn catalog_name(t: &str) -> String {
     }
 }
 
-static LENT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Lent>>> = std::sync::LazyLock::new(Default::default);
+crate::per_node!(static LENT: std::sync::Mutex<std::collections::HashMap<String, Lent>> = Default::default());
 
 pub fn lend(role: Role, files: bool) -> Lease {
     let token = format!("lease-{}", uuid::Uuid::new_v4().simple());

@@ -7,6 +7,7 @@
 //! the wire (length-prefixed, `Frames`); a partition of the next step reads a `chain` of them, in
 //! node order, so the same query adds up the same rows the same way every time. Everything a job
 //! wrote goes when the job does.
+use crate::reset::Once;
 use anyhow::{Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -26,8 +27,8 @@ fn piece() -> usize {
 /// node. The node's own id is in the path because two nodes on one machine share a cache dir, and
 /// they name their buckets the same way — without it they would write over each other's rows.
 pub fn dir(job: &str) -> PathBuf {
-    static ME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let me = ME.get_or_init(|| uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string());
+    crate::per_node!(static ME: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
+    let me = ME.get_or(|| uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string());
     let base = std::env::var("PONDRA_CACHE_DIR").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("pondra-cache"));
     base.join("shuffle").join(match job.is_empty() {
         true => String::new(), // (the folder itself: sweeping and measuring)

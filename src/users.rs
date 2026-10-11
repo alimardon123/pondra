@@ -17,7 +17,7 @@ use base64::{engine::general_purpose::STANDARD as B64, engine::general_purpose::
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 pub fn user_key(name: &str) -> String { format!("u/{name}") }
 const KEYS: &str = "z/auth"; // (the lake's own keys: sessions' signing key, and the nodes' key; `k/` is streaming tasks')
@@ -733,7 +733,7 @@ fn sealed(k: &Keys) -> Result<Kept> {
     Ok(Kept::Sealed { sealed, key })
 }
 
-static KEYS_HERE: LazyLock<Mutex<HashMap<String, Keys>>> = LazyLock::new(Default::default);
+crate::per_node!(static KEYS_HERE: Mutex<HashMap<String, Keys>> = Default::default());
 
 async fn keys(lake: &Lake) -> Result<Keys> {
     if let Some(k) = KEYS_HERE.lock().unwrap().get(&lake.url) {
@@ -849,9 +849,9 @@ async fn session_user(lake: &Lake, token: &str) -> Option<String> {
     (v["x"].as_u64()? > crate::log::now_ms()).then(|| v["u"].as_str().map(String::from))?
 }
 
-/// Passwords checked lately (by their hash with the user's name): a minute, so a client that sends
-/// its password with every request (HTTP Basic) pays for SCRAM's hashing once.
-static VERIFIED: LazyLock<Mutex<HashMap<String, std::time::Instant>>> = LazyLock::new(Default::default);
+// Passwords checked lately (by their hash with the user's name): a minute, so a client that sends
+// its password with every request (HTTP Basic) pays for SCRAM's hashing once.
+crate::per_node!(static VERIFIED: Mutex<HashMap<String, std::time::Instant>> = Default::default());
 
 /// Is this `user`'s password? (Its verifier checked, or remembered as checked.)
 pub async fn password_ok(lake: &Lake, user: &str, password: &str) -> bool {
@@ -948,8 +948,8 @@ impl Access {
     fn writes(&self) -> bool { self.grants.iter().any(|g| ["insert", "update", "delete"].contains(&g.privilege.as_str())) }
 }
 
-/// Users' access, by name, as of a catalog version (grants change seldom: a check is a lookup).
-static ACCESS: LazyLock<Mutex<HashMap<String, (Option<u64>, std::time::Instant, Arc<Access>, bool)>>> = LazyLock::new(Default::default);
+// Users' access, by name, as of a catalog version (grants change seldom: a check is a lookup).
+crate::per_node!(static ACCESS: Mutex<HashMap<String, (Option<u64>, std::time::Instant, Arc<Access>, bool)>> = Default::default());
 
 fn forget() {
     ACCESS.lock().unwrap().clear();
@@ -1014,7 +1014,7 @@ pub fn quota() -> Quota {
     let env = |v: &str| std::env::var(v).ok().and_then(|n| n.parse::<u64>().ok());
     let most = a.limits.max_queries.map(u64::from).or_else(|| env("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
     let timeout = a.limits.timeout_secs.or_else(|| env("PONDRA_USER_TIMEOUT")).filter(|s| *s > 0).map(std::time::Duration::from_secs);
-    static TURNS: LazyLock<Mutex<HashMap<String, (u32, Arc<tokio::sync::Semaphore>)>>> = LazyLock::new(Default::default);
+    crate::per_node!(static TURNS: Mutex<HashMap<String, (u32, Arc<tokio::sync::Semaphore>)>> = Default::default());
     let turns = most.map(|n| {
         let mut all = TURNS.lock().unwrap();
         let e = all.entry(user.clone()).or_insert_with(|| (n, Arc::new(tokio::sync::Semaphore::new(n as usize))));
@@ -1084,7 +1084,7 @@ pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::wri
     }
 }
 
-static ANY: LazyLock<Mutex<HashMap<String, (Option<u64>, std::time::Instant, bool)>>> = LazyLock::new(Default::default);
+crate::per_node!(static ANY: Mutex<HashMap<String, (Option<u64>, std::time::Instant, bool)>> = Default::default());
 
 /// Does the lake have a user who signs in (a password or a token)? Then a request with nothing
 /// signed is refused, as with a token set.

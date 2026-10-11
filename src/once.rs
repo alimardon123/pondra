@@ -254,7 +254,7 @@ fn window(s: &ast::Select, src: &TableMeta) -> Result<(String, String, String)> 
 type Planned = (Arc<dyn PhysicalExpr>, SchemaRef);
 
 async fn planned(lake: &Lake, source: &str, o: &Once) -> Result<Planned> {
-    static PLANNED: LazyLock<Mutex<HashMap<(String, String, String), Planned>>> = LazyLock::new(Default::default);
+    crate::per_node!(static PLANNED: Mutex<HashMap<(String, String, String), Planned>> = Default::default());
     let key = (lake.url.clone(), o.time.clone(), o.bucket.clone());
     if let Some(p) = PLANNED.lock().unwrap().get(&key) {
         return Ok(p.clone());

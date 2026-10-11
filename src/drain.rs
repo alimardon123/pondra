@@ -18,7 +18,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::time::Duration;
 
-static DRAINING: AtomicBool = AtomicBool::new(false);
+crate::per_node!(static DRAINING: AtomicBool = AtomicBool::new(false));
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// Is this node stopping?

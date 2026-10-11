@@ -213,7 +213,7 @@ struct Pool {
     reaping: AtomicBool,
 }
 
-static POOLS: LazyLock<Mutex<HashMap<String, Arc<Pool>>>> = LazyLock::new(Default::default);
+crate::per_node!(static POOLS: Mutex<HashMap<String, Arc<Pool>>> = Default::default());
 
 fn cores() -> usize { std::thread::available_parallelism().map_or(2, |n| n.get()) }
 
@@ -505,8 +505,8 @@ impl Drop for Kernel {
     }
 }
 
-/// Each session's worker's process id: an interrupt reaches it while a cell holds its slot.
-static PIDS: LazyLock<Mutex<HashMap<String, u32>>> = LazyLock::new(Default::default);
+// Each session's worker's process id: an interrupt reaches it while a cell holds its slot.
+crate::per_node!(static PIDS: Mutex<HashMap<String, u32>> = Default::default());
 
 /// Interrupt `session`'s running cell: its worker gets SIGINT, and the cell ends with
 /// `KeyboardInterrupt`, its variables kept, as a notebook's kernel does. Windows has no such
@@ -527,7 +527,7 @@ pub fn interrupt(session: &str) -> &'static str {
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Kernel>>>;
-static KERNELS: LazyLock<Mutex<HashMap<String, (Slot, Instant)>>> = LazyLock::new(Default::default);
+crate::per_node!(static KERNELS: Mutex<HashMap<String, (Slot, Instant)>> = Default::default());
 
 /// Has the session a Python of its own here (its `DO` blocks' variables)?
 pub fn held(session: &str) -> bool { KERNELS.lock().unwrap().contains_key(session) }

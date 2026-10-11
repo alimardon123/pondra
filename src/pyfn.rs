@@ -321,7 +321,7 @@ impl Kept {
     }
 }
 
-static ANSWERS: LazyLock<Mutex<Answers>> = LazyLock::new(|| Mutex::new(Answers { kept: lru::LruCache::unbounded(), bytes: 0 }));
+crate::per_node!(static ANSWERS: Mutex<Answers> = Mutex::new(Answers { kept: lru::LruCache::unbounded(), bytes: 0 }); clear = |m| { let mut a = m.lock().unwrap_or_else(|e| e.into_inner()); a.kept.clear(); a.bytes = 0; });
 
 impl Answers {
     fn get(&mut self, key: &[u8]) -> Option<&Kept> {

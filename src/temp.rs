@@ -83,7 +83,7 @@ pub struct Session {
     version: u64, // changes so far (`live.rs` watches them)
 }
 
-static SESSIONS: LazyLock<Mutex<HashMap<String, Session>>> = LazyLock::new(Default::default);
+crate::per_node!(static SESSIONS: Mutex<HashMap<String, Session>> = Default::default());
 static CHANGES: LazyLock<tokio::sync::watch::Sender<u64>> = LazyLock::new(|| tokio::sync::watch::channel(0).0);
 
 /// Any session's temporary tables or views changed (`live.rs` waits on it).

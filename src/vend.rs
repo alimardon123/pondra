@@ -9,7 +9,7 @@ use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine};
 use object_store::signer::Signer;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// How long a link lasts: `PONDRA_SHARE_URL_SECS` (900, at most a week: S3's limit).
@@ -38,7 +38,7 @@ pub async fn links(lake: &Lake, base: &str, keys: &[String], who: &str) -> Resul
 
 /// The bucket's signer, made once from the environment's credentials (as the lake's store is).
 fn signer(scheme: &str, bucket: &str) -> Result<Arc<dyn Signer>> {
-    static MADE: LazyLock<Mutex<HashMap<String, Arc<dyn Signer>>>> = LazyLock::new(Default::default);
+    crate::per_node!(static MADE: Mutex<HashMap<String, Arc<dyn Signer>>> = Default::default());
     let at = format!("{scheme}://{bucket}");
     if let Some(s) = MADE.lock().unwrap().get(&at) {
         return Ok(s.clone());

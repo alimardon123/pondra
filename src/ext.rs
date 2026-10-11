@@ -792,7 +792,7 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
     let secrets = list(lake).await?;
     let secret = covering(&secrets, url);
     let made_with = secret.as_ref().map_or("the node's own".to_string(), |(n, s)| format!("{n}:{}", s.sealed));
-    static MADE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+    crate::per_node!(static MADE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None));
     if MADE.lock().unwrap().get_or_insert_default().get(&root) == Some(&made_with) {
         return Ok(());
     }
@@ -1079,7 +1079,7 @@ pub async fn lent(lake: &Lake, urls: &[String]) -> Result<Vec<(String, Secret)>>
 /// The bearer token for a REST catalog, from the secret covering it: its TOKEN, or one its
 /// CLIENT_ID and CLIENT_SECRET get (OAuth's client credentials), kept until it expires.
 pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
-    static TOKENS: Mutex<Option<HashMap<String, (String, std::time::Instant)>>> = Mutex::new(None);
+    crate::per_node!(static TOKENS: Mutex<Option<HashMap<String, (String, std::time::Instant)>>> = Mutex::new(None));
     let Some((name, secret)) = covering(&list(lake).await?, url).filter(|(_, s)| s.kind == "iceberg") else { return Ok(None) };
     let p = open(&name, &secret)?;
     if let Some(t) = p.get("token") {
@@ -1559,9 +1559,9 @@ fn open_with(key: &[u8], sealed: &str) -> Option<Vec<u8>> {
     key.open_in_place(Nonce::try_assume_unique_for_key(nonce).ok()?, Aad::empty(), &mut data).ok().map(|p| p.to_vec())
 }
 
-/// Data keys unwrapped so far (by their wrapped form): a query using a secret again doesn't ask the
-/// key service again.
-static UNWRAPPED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<u8>>>> = std::sync::LazyLock::new(Default::default);
+// Data keys unwrapped so far (by their wrapped form): a query using a secret again doesn't ask the
+// key service again.
+crate::per_node!(static UNWRAPPED: std::sync::Mutex<HashMap<String, Vec<u8>>> = Default::default());
 
 /// A data key wrapped by the master key: by `PONDRA_KMS_COMMAND wrap` (a key service: its key never
 /// leaves it), or sealed with the local master key (`PONDRA_SECRET_KEY`, else this machine's).

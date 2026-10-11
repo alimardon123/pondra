@@ -21,7 +21,7 @@ use slatedb::config::{CompactorOptions, DbReaderOptions, GarbageCollectorDirecto
 use slatedb::{Db, DbReader, DbReaderMode, ErrorKind, WriteBatch, WriteHandle};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -586,7 +586,7 @@ pub struct Reach {
     pub secret: Option<String>, // (the bucket secret's name: who may use it reads the lake here, `users::across`)
 }
 
-static REACH: std::sync::RwLock<BTreeMap<String, Reach>> = std::sync::RwLock::new(BTreeMap::new());
+crate::per_node!(static REACH: std::sync::RwLock<BTreeMap<String, Reach>> = std::sync::RwLock::new(BTreeMap::new()));
 
 /// Say how `url` (a lake) is reached. Asked again (an attachment and a branch of it in one
 /// process), what the new one leaves out is kept, and read-only stays read-only.
@@ -1163,7 +1163,7 @@ impl Lake {
             whole: u64, // …to here is in `segs`
             segs: BTreeMap<u64, Arc<Segment>>,
         }
-        static KNOWN: LazyLock<Mutex<std::collections::HashMap<String, Known>>> = LazyLock::new(Default::default);
+        crate::per_node!(static KNOWN: Mutex<std::collections::HashMap<String, Known>> = Default::default());
         let now = self.visible();
         let from = match KNOWN.lock().unwrap().get(&self.url) {
             Some(k) if k.start <= after + 1 && k.whole >= after => k.whole + 1, // (only what is new)
@@ -1447,8 +1447,8 @@ pub fn trace(what: &str, since: std::time::Instant) {
     }
 }
 
-/// Has the node begun to serve? (Then the catalog's upkeep starts: `upkeep`.)
-static SERVING: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::Sender::new(false));
+// Has the node begun to serve? (Then the catalog's upkeep starts: `upkeep`.)
+crate::per_node!(static SERVING: watch::Sender<bool> = watch::Sender::new(false));
 
 /// The node serves now (`main.rs`).
 pub fn serving() { SERVING.send_replace(true); }

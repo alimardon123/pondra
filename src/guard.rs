@@ -31,8 +31,8 @@ const WIRE: f64 = 3.0; // Arrow as a shuffle sends it (ZSTD) is about a third of
 /// at 17–54 ms apart, some 20 round trips; in one data centre that is a few milliseconds.
 const ROUND_TRIPS: f64 = 20.0;
 
-static LINKS: LazyLock<Mutex<HashMap<String, (Link, Instant)>>> = LazyLock::new(Default::default);
-static HERE: Mutex<Option<f64>> = Mutex::new(None); // bytes of tables read per second, one node
+crate::per_node!(static LINKS: Mutex<HashMap<String, (Link, Instant)>> = Default::default());
+crate::per_node!(static HERE: Mutex<Option<f64>> = Mutex::new(None)); // bytes of tables read per second, one node
 
 /// The body of `GET /cluster/probe?bytes=n`: bytes that don't compress (a link's measure).
 pub fn probe(bytes: usize) -> Vec<u8> {
@@ -94,8 +94,8 @@ pub fn ran_spread(sql: &str, took: Duration) { note(&SPREAD_TOOK, sql, took) }
 /// A query's last three times, one way. A busy machine makes a run slower, never faster, so the
 /// best of them is what that way costs: one slow run doesn't turn the choice.
 type Times = Mutex<lru::LruCache<u64, Vec<f64>>>;
-static TOOK: LazyLock<Times> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())));
-static SPREAD_TOOK: LazyLock<Times> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())));
+crate::per_node!(static TOOK: Times = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+crate::per_node!(static SPREAD_TOOK: Times = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
 
 fn note(times: &Times, sql: &str, took: Duration) {
     let mut all = times.lock().unwrap();

@@ -33,7 +33,7 @@ use datafusion::physical_plan::{displayable, ExecutionPlan, ExecutionPlanPropert
 use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Tables smaller than this aren't worth spreading (`PONDRA_SPREAD_MB`, 256).
@@ -593,8 +593,8 @@ async fn abandon(nodes: &[String], me: &str) {
     futures::future::join_all(asks).await;
 }
 
-/// The id of the shuffle this node started last (for `abandon`).
-static LAST: LazyLock<Mutex<Option<String>>> = LazyLock::new(Default::default);
+// The id of the shuffle this node started last (for `abandon`).
+crate::per_node!(static LAST: Mutex<Option<String>> = Default::default());
 
 /// One attempt, planned each way in turn (`How`) until one splits correctly — and pays (`guard`:
 /// the ways after it move more). Keyed tables, and tables of attached lakes, are always read whole.
@@ -747,7 +747,7 @@ struct Subquery {
     from: usize,
 }
 
-static JOBS: LazyLock<Mutex<HashMap<String, Arc<Job>>>> = LazyLock::new(Default::default);
+crate::per_node!(static JOBS: Mutex<HashMap<String, Arc<Job>>> = Default::default());
 
 impl Drop for Job {
     /// What the job spilled goes with it (the coordinator clears its own as soon as the last step
@@ -768,7 +768,7 @@ pub fn forget(id: &str) {
     crate::spill::clear(id);
 }
 
-static DROPPED: LazyLock<Mutex<HashMap<String, std::time::Instant>>> = LazyLock::new(Default::default);
+crate::per_node!(static DROPPED: Mutex<HashMap<String, std::time::Instant>> = Default::default());
 
 /// Forget finished shuffles (and delete what they spilled). Runs every half minute on every node,
 /// so a node that took part in a shuffle frees its scratch without being asked.

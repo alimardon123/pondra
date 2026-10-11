@@ -27,7 +27,7 @@ pub async fn door<T>(f: impl Future<Output = T>) -> Result<T, String> {
 pub async fn work<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
     use std::{collections::BTreeMap, sync::Mutex, time::Instant};
     // The requests running, by when each started: ids grow with time, so the first is the oldest.
-    static RUNNING: Mutex<BTreeMap<u64, Instant>> = Mutex::new(BTreeMap::new());
+    crate::per_node!(static RUNNING: Mutex<BTreeMap<u64, Instant>> = Mutex::new(BTreeMap::new()));
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     struct Stop(u64, Option<tokio::task::AbortHandle>);
     impl Drop for Stop {

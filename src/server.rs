@@ -818,7 +818,7 @@ impl App {
         }
         let published = start.elapsed();
         // Retention every 10 s is plenty, and keeps its deletes off the path to fresh Delta versions.
-        static EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        crate::per_node!(static EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
         let now = crate::log::now_ms();
         if now - EXPIRED.load(std::sync::atomic::Ordering::Relaxed) >= 10_000 {
             EXPIRED.store(now, std::sync::atomic::Ordering::Relaxed);

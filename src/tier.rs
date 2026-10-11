@@ -449,7 +449,7 @@ enum Kind {
 /// commits nothing, so what its other jobs wrote goes at once: left to the orphan sweep (a day
 /// on), a disk the lake had filled filled again with the files of the rounds that failed on it.
 async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result<Vec<DataFile>> {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    crate::per_node!(static NEXT: AtomicUsize = AtomicUsize::new(0));
     let paths = |f: &DataFile| std::iter::once(f.path.clone()).chain(f.delete_files().cloned()).collect::<Vec<_>>();
     // (a `Positions` job hands its files back with a delete file more: never theirs to delete)
     let given: std::collections::HashSet<String> = jobs.iter().flat_map(|j| match &j.kind {
@@ -718,7 +718,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     }
     // Only segments that were ALREADY below the floor `grace_ms` ago: a query that read a table's
     // metadata just before it was tiered may still be reading them.
-    static FLOORS: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+    crate::per_node!(static FLOORS: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> = std::sync::Mutex::new(std::collections::VecDeque::new()));
     let floor = {
         let mut floors = FLOORS.lock().unwrap();
         floors.push_back((crate::log::now_ms(), floor));
@@ -810,7 +810,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     use futures::TryStreamExt;
     const HOUR: u64 = 3_600_000;
     const DAY: u64 = 24 * HOUR;
-    static SWEPT: std::sync::LazyLock<std::sync::Mutex<(u64, std::collections::HashMap<String, u64>)>> = std::sync::LazyLock::new(Default::default);
+    crate::per_node!(static SWEPT: std::sync::Mutex<(u64, std::collections::HashMap<String, u64>)> = Default::default());
     let now = crate::log::now_ms();
     if now - SWEPT.lock().unwrap().0 < HOUR {
         return Ok(());

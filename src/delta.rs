@@ -62,7 +62,7 @@ pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> 
     let _one = ONE.lock().await;
     lake.cat.wait_durable(lake.cat.committed()).await; // (replicated acks: publish only what's in the bucket)
     // A table whose metadata is as last published is skipped without loading its manifests.
-    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> = std::sync::LazyLock::new(Default::default);
+    crate::per_node!(static SEEN: std::sync::Mutex<std::collections::HashMap<String, u64>> = Default::default());
     let print = |meta: &TableMeta| std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), json(meta));
     let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
     let changed: Vec<_> = tables.iter().filter(|(key, meta)| named.iter().any(|n| key[2..] == *n.table) || SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();

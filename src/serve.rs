@@ -101,7 +101,7 @@ impl Point {
 /// prepared statement's lookups are parsed and described once, not three times each).
 pub async fn point(lake: &Lake, sql: &str) -> Result<Option<Arc<Point>>> {
     type Seen = lru::LruCache<(String, String), (u64, Option<Arc<Point>>)>;
-    static SEEN: std::sync::LazyLock<Mutex<Seen>> = std::sync::LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).expect("non-zero"))));
+    crate::per_node!(static SEEN: Mutex<Seen> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).expect("non-zero"))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
     let head = sql.trim_start();
     if !head.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("select")) {
         return Ok(None); // (most statements: no parse)
@@ -218,7 +218,7 @@ fn hashes(batch: &RecordBatch, keys: &[(&str, ScalarValue)]) -> Result<Vec<u64>>
 
 /// The log tail's newest row of the key, with the commit that wrote it and when (`Tail`).
 async fn newest_in_log(lake: &Lake, table: &str, meta: &TableMeta, keys: &[(&str, ScalarValue)]) -> Result<Option<(RecordBatch, u64, u64)>> {
-    static TAILS: std::sync::LazyLock<Mutex<lru::LruCache<(String, String), Arc<Mutex<Tail>>>>> = std::sync::LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(16).expect("non-zero"))));
+    crate::per_node!(static TAILS: Mutex<lru::LruCache<(String, String), Arc<Mutex<Tail>>>> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(16).expect("non-zero"))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
     let types: Vec<_> = keys.iter().map(|(_, v)| v.data_type()).collect();
     let tail = {
         let mut all = TAILS.lock().unwrap();
