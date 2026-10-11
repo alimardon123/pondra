@@ -2,45 +2,119 @@
 //! speaks MCP — list the tables, query them, write, and follow what changed, with the same tokens
 //! as everyone else (`Authorization: Bearer …`). JSON-RPC 2.0 over MCP's "streamable HTTP"
 //! transport, each answer plain JSON (no event stream: every tool answers at once).
+//!
+//! A session: `initialize` gives the client an `Mcp-Session-Id`, and the tool calls that send it
+//! back share one session, so a `write` of `BEGIN` is a transaction the next calls are in, until
+//! `COMMIT`, `ROLLBACK`, or `DELETE /mcp` with the id (`txn.rs`, `temp.rs`).
 use crate::auth::Role;
 use crate::server::App;
 use crate::store::{Lake, TableMeta};
 use crate::views::View;
-use anyhow::{anyhow, ensure, Result};
+use anyhow::Result;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use datafusion::arrow::{json::ArrayWriter, record_batch::RecordBatch};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const ROWS: usize = 1000; // at most this many rows per answer: an agent reads them all
 
-pub async fn handle(State(app): State<App>, Extension(role): Extension<Role>, body: Bytes) -> Response {
+pub async fn handle(State(app): State<App>, Extension(role): Extension<Role>, headers: HeaderMap, body: Bytes) -> Response {
     let Ok(req) = serde_json::from_slice::<Value>(&body) else {
         return Json(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "not JSON"}})).into_response();
     };
     let Some(id) = req.get("id").cloned() else { return StatusCode::ACCEPTED.into_response() }; // a notification
+    let session = match named(&headers) {
+        Ok(session) => session,
+        Err(refused) => return refused,
+    };
     let (method, params) = (req["method"].as_str().unwrap_or_default(), &req["params"]);
+    // A request that names a session must name one this node holds (made by initialize, used within
+    // the idle time, not ended): otherwise 404, and the client initializes again (the Streamable HTTP
+    // spec). A request with no session header is stateless, as before.
+    if let (Some(s), false) = (&session, method == "initialize") {
+        if !crate::temp::live(s) {
+            return gone(&id);
+        }
+        crate::temp::touch(s);
+    }
+    let mut minted = None; // (`initialize` gives the client its session)
     let result = match method {
-        "initialize" => json!({
-            "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "pondra", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Pondra is a streaming lakehouse: tables that take appends, upserts and deletes and \
-                are queryable within milliseconds, in SQL (Apache DataFusion's dialect, close to PostgreSQL). \
-                Start with list_tables."}),
+        "initialize" => {
+            let raw = format!("mcp-{}", uuid::Uuid::new_v4().simple());
+            let _ = crate::temp::with(&crate::temp::id(&raw), false, |_| Ok(())); // (held from now: idle ends it, `reap`)
+            minted = Some(raw);
+            json!({
+                "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "pondra", "version": env!("CARGO_PKG_VERSION")},
+                "instructions": "Pondra is a streaming lakehouse: tables that take appends, upserts and deletes and \
+                    are queryable within milliseconds, in SQL (Apache DataFusion's dialect, close to PostgreSQL). \
+                    Start with list_tables."})
+        }
         "ping" => json!({}),
         "tools/list" => {
             let all = [tools().as_array().cloned().unwrap_or_default(), crate::find::mcp_tools(), procedures(&app).await].concat();
             json!({"tools": all})
         }
-        "tools/call" => call(&app, role, params).await,
+        "tools/call" => match crate::temp::SESSION.scope(session, call(&app, role, params)).await {
+            Ok(result) => result,
+            Err(error) => return Json(json!({"jsonrpc": "2.0", "id": id, "error": error})).into_response(), // (no such tool: a protocol error)
+        },
         _ => return Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("no method {method}")}})).into_response(),
     };
-    Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
+    let mut out = Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response();
+    if let Some(v) = minted.and_then(|s| HeaderValue::from_str(&s).ok()) {
+        out.headers_mut().insert("mcp-session-id", v);
+    }
+    out
+}
+
+/// The session an `Mcp-Session-Id` names: a well-formed one (`mcp-` and letters and digits, at most
+/// 64 characters) that `initialize` gave. Any other value is a 400. Whether this node still holds
+/// it is `handle`'s check (404). Keyed by the user, as `/sessions/{id}` is, so another user's id is
+/// another session.
+fn named(headers: &HeaderMap) -> Result<Option<String>, Response> {
+    let Some(h) = headers.get("mcp-session-id") else { return Ok(None) };
+    match h.to_str().ok().filter(|id| valid(id)) {
+        Some(id) => Ok(Some(crate::temp::id(id))),
+        None => Err(refused("Mcp-Session-Id: the id initialize gave (mcp- and letters and digits)")),
+    }
+}
+
+/// A request MCP refuses before any tool runs: HTTP 400 with JSON-RPC's Invalid Request (-32600),
+/// the protocol's own code, as the other protocol errors have.
+fn refused(message: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": message}}))).into_response()
+}
+
+fn valid(id: &str) -> bool {
+    id.len() <= 64 && id.strip_prefix("mcp-").is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// `DELETE /mcp` with its `Mcp-Session-Id`: the session ends, its transaction rolled back and its
+/// temporary tables gone, as an MCP client does when it closes. One this node doesn't hold is 404.
+pub async fn end(headers: HeaderMap) -> Response {
+    match named(&headers) {
+        Ok(Some(session)) if crate::temp::live(&session) => {
+            crate::temp::end(&session);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Some(_)) => gone(&Value::Null),
+        Ok(None) => refused("DELETE /mcp: send the Mcp-Session-Id that initialize gave"),
+        Err(refused) => refused,
+    }
+}
+
+/// A session this node doesn't hold (never made here, ended, or idle too long): HTTP 404, and the
+/// JSON-RPC error that the MCP SDKs send for it (-32001), so the client initializes again.
+fn gone(id: &Value) -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32001,
+        "message": "Mcp-Session-Id: no such session (it ended, went idle, or was never made here): send initialize again"}}))).into_response()
 }
 
 fn tools() -> Value {
@@ -53,11 +127,16 @@ fn tools() -> Value {
              or view (a stored query); and for views, their SQL."},
         {"name": "query", "annotations": {"readOnlyHint": true}, "inputSchema": args(sql.clone(), &["sql"]),
          "description": format!("Run one SQL query and get its rows as JSON (the first {ROWS}, and the total). \
-             `WHERE key = …` on an upsert table is a fast point lookup. Vector search: ORDER BY cosine_distance(embedding, [0.1, …]) LIMIT k.")},
+             `WHERE key = …` on an upsert table is a fast point lookup. Vector search: ORDER BY cosine_distance(embedding, [0.1, …]) LIMIT k. \
+             In a session (see write) it reads the transaction's snapshot and its own writes, and the session's variables.")},
         {"name": "write", "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": true},
          "inputSchema": args(json!({"sql": {"type": "string"}, "job": {"type": "string", "description": "an id for this write: retried with the same id, it is applied once"}}), &["sql"]),
-         "description": "INSERT, UPDATE or DELETE (UPDATE and DELETE on tables with a primary key); CREATE/DROP of a TABLE, VIEW, \
-             MATERIALIZED VIEW or SCHEMA. Committed and durable when this returns. Needs a write token; CREATE and DROP an admin token."},
+         "description": "Runs any script: one statement or several, a SELECT or a CALL among them, and BEGIN … COMMIT or ROLLBACK (see below). \
+             INSERT, UPDATE or DELETE; CREATE/DROP of a TABLE, VIEW, \
+             MATERIALIZED VIEW or SCHEMA. Committed and durable when this returns. Needs a write token; CREATE and DROP an admin token. \
+             In a session (the client keeps the Mcp-Session-Id that initialize gave, as MCP's SDKs do), BEGIN … COMMIT and ROLLBACK \
+             make a transaction, committed as one; without a session each call is on its own. A session idle for PONDRA_SESSION_IDLE_SECS \
+             (3600) ends, its transaction rolled back, and its next call is HTTP 404: send initialize again."},
         {"name": "changes", "annotations": {"readOnlyHint": true},
          "inputSchema": args(json!({"table": {"type": "string"}, "after": {"type": "integer", "description": "a position from an earlier call; 0 for as far back as kept; none for from now"}}), &["table"]),
          "description": format!("What was committed to a table after a position — every insert, update and delete, each row with its \
@@ -66,33 +145,36 @@ fn tools() -> Value {
     ])
 }
 
-async fn call(app: &App, role: Role, params: &Value) -> Value {
+/// A tool's answer as its result, or the JSON-RPC error for a tool the server doesn't have
+/// (-32602, Invalid params, with its SQLSTATE 42883 in `data`). A tool that fails is a result with
+/// `isError`, its message carrying the SQLSTATE: the agent sees it and can act on it.
+async fn call(app: &App, role: Role, params: &Value) -> Result<Value, Value> {
     let arg = |k: &str| params["arguments"][k].as_str().unwrap_or_default();
     let out = match params["name"].as_str().unwrap_or_default() {
         "list_tables" => list(app).await,
-        "query" => query(app, arg("sql")).await,
+        "query" => query(app, role, arg("sql")).await,
         "write" => write(app, role, arg("sql"), params["arguments"]["job"].as_str()).await,
         "changes" => changes(app, arg("table"), params["arguments"]["after"].as_u64()).await,
         name if crate::find::is_tool(name) => match crate::find::mcp_sql(name, &params["arguments"]) {
-            Ok(sql) => query(app, &sql).await,
+            Ok(sql) => query(app, role, &sql).await,
             Err(e) => Err(e),
         },
-        other => match procedure(app, other).await {
-            Some(name) => {
-                let given = params["arguments"].as_object().into_iter().flatten().map(|(k, v)| Ok(format!("{k} => {}", crate::routines::literal(v)?))).collect::<Result<Vec<_>>>();
-                match given {
-                    Ok(given) => called(app, role, &format!("CALL {name}({})", given.join(", ")), None).await,
-                    Err(e) => Err(e),
-                }
+        other => {
+            let Some(name) = procedure(app, other).await else {
+                return Err(json!({"code": -32602, "message": format!("no tool {other}"), "data": {"sqlstate": "42883"}}));
+            };
+            let given = params["arguments"].as_object().into_iter().flatten().map(|(k, v)| Ok(format!("{k} => {}", crate::routines::literal(v)?))).collect::<Result<Vec<_>>>();
+            match given {
+                Ok(given) => called(app, role, &format!("CALL {name}({})", given.join(", ")), None).await,
+                Err(e) => Err(e),
             }
-            None => Err(anyhow!("no tool {other}")),
-        },
+        }
     };
     let (text, error) = match out {
         Ok(v) => (v.to_string(), false),
         Err(e) => (format!("SQLSTATE {}: {e:#}", crate::codes::of(&e)), true), // (a tool error, which the agent sees and can act on: with Postgres's code)
     };
-    json!({"content": [{"type": "text", "text": text}], "isError": error})
+    Ok(json!({"content": [{"type": "text", "text": text}], "isError": error}))
 }
 
 /// Each stored procedure is a tool too, its parameters the tool's (ADR-023): what a lake's owner
@@ -134,12 +216,24 @@ fn lakes(app: &App) -> Vec<(String, Arc<Lake>)> {
     [(String::new(), app.lake.clone())].into_iter().chain(attached).collect()
 }
 
+/// May the request being served read `name`, a table or view of the lake `prefix` names? A user
+/// with grants sees only what it may SELECT, as `pondra.tables` lists it.
+fn may_see(prefix: &str, name: &str) -> bool {
+    crate::auth::limited().is_none_or(|a| a.may("select", &format!("{prefix}{name}")))
+}
+
 async fn list(app: &App) -> Result<Value> {
     let mut tables = vec![];
     for (prefix, lake) in lakes(app) {
+        if !prefix.is_empty() && crate::users::across(&lake, prefix.trim_end_matches('.')).await.is_err() {
+            continue; // (another database that signs in on its own: not even its names, as `pondra.tables`)
+        }
         let views = lake.cat.scan::<View>("v/", "v0").await?;
         for (key, m) in lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
             let name = &key[2..];
+            if !may_see(&prefix, name) {
+                continue;
+            }
             let kind = if !m.merge.is_empty() { "merge" } else if !m.key.is_empty() { "upsert" } else { "append" };
             let m = m.described(); // (SQL's names: ADR-022; a finished view's answers)
             let columns: Vec<Value> = m.columns.iter().filter(|(c, _)| c != "_deleted").map(|(c, t)| json!({"name": c, "type": t})).collect();
@@ -147,37 +241,72 @@ async fn list(app: &App) -> Result<Value> {
             tables.push(json!({"table": format!("{prefix}{name}"), "kind": kind, "key": m.key, "merge": m.merge, "columns": columns, "view": view}));
         }
         for (key, v) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
+            if !may_see(&prefix, &key[2..]) {
+                continue;
+            }
             tables.push(json!({"table": format!("{prefix}{}", &key[2..]), "kind": "view", "view": v.sql})); // (CREATE VIEW: run when read)
         }
     }
     Ok(json!({"tables": tables}))
 }
 
-async fn query(app: &App, sql: &str) -> Result<Value> {
+/// A query's rows as JSON. Never a write (the write tool's, and BEGIN, COMMIT and ROLLBACK too).
+/// In a session it runs as POST /sql runs a statement sent with its session: in a transaction it
+/// reads the transaction's snapshot and its own writes, and `$name`s are the session's variables.
+async fn query(app: &App, role: Role, sql: &str) -> Result<Value> {
+    if is_write(sql) {
+        return Err(crate::codes::coded("25006", "this changes data or a transaction: use the write tool")); // (a read-only tool: Postgres's read_only_sql_transaction)
+    }
+    if crate::temp::current().is_some() {
+        return Ok(match run(app, role, sql, None).await? {
+            crate::routines::Outcome::Rows(batches) => json!({"rows": rows(&batches)?, "total_rows": total(&batches)}),
+            crate::routines::Outcome::Done(v) => v,
+        });
+    }
     let sql = &crate::routines::expand(&app.lake, sql).await?; // (macros: ADR-023)
-    ensure!(crate::write::parse(sql).is_none() && !crate::routines::runs_procedure(sql), "this is a write: use the write tool");
     let batches = crate::audit::statement(app, sql, app.query(sql, None)).await?;
-    let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    Ok(json!({"rows": rows(&batches)?, "total_rows": total}))
+    Ok(json!({"rows": rows(&batches)?, "total_rows": total(&batches)}))
 }
 
+/// The write tool's SQL, run as POST /sql runs it (`run`): one statement or several, a
+/// transaction's BEGIN … COMMIT in its session, and `job`, so a retry is applied once.
 async fn write(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<Value> {
-    let sql = &crate::routines::expand(&app.lake, sql).await?;
-    if crate::routines::runs_procedure(sql) {
-        return called(app, role, sql, job).await; // (CALL: a procedure may write)
+    let (out, heard) = crate::routines::with_notices(run(app, role, sql, job.map(String::from))).await;
+    answer(out, heard)
+}
+
+/// `sql` as POST /sql runs it (`routines::script`), as `role`: each statement audited once, by the
+/// runner. Sent with no session, a script of several statements is one of its own, which ends
+/// with it (a transaction left open too), as POST /sql makes it.
+async fn run(app: &App, role: Role, sql: &str, job: Option<String>) -> Result<crate::routines::Outcome> {
+    // A transaction word alone, with no session, has nothing to hold it: refused by name. Several statements in one call
+    // (BEGIN; …; COMMIT) run as one script, in a session of their own, so they are a transaction.
+    let parts = crate::routines::split(sql).len();
+    if crate::temp::current().is_none() && parts == 1 && crate::txn::control(sql).is_some() {
+        return Err(crate::codes::coded("0A000", "a transaction needs a session: send initialize and keep the Mcp-Session-Id it gives"));
     }
-    let stmt = crate::write::parse(sql).ok_or_else(|| anyhow!("not a write (INSERT, UPDATE, DELETE, CREATE, DROP or CALL): use the query tool"))?;
-    crate::audit::statement(app, sql, async {
-        app.auth.allows(role, &stmt)?;
-        crate::write::on_node(app, stmt, job.map(String::from)).await
-    })
-    .await
+    let who = crate::routines::Who { role, files: false, depth: 0 };
+    let own = (crate::temp::current().is_none() && parts > 1).then(crate::temp::of_script);
+    // (named, so the future borrows values that live as long as it does)
+    let (params, views) = (HashMap::new(), HashMap::new());
+    let go = crate::routines::script(app, sql, &params, &views, who, job);
+    let out = match &own {
+        Some(s) => crate::temp::SESSION.scope(Some(s.clone()), go).await,
+        None => go.await,
+    };
+    own.inspect(|s| _ = crate::temp::end(s));
+    out
 }
 
 /// A procedure's answer, as a tool's: its rows or outcome, and what it printed (`notices`).
 async fn called(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<Value> {
     let who = crate::routines::Who { role, files: false, depth: 0 };
     let (out, heard) = crate::routines::with_notices(crate::routines::one(app, sql, who, job.map(String::from))).await;
+    answer(out, heard)
+}
+
+/// A statement's answer as a tool's: its rows or outcome, and what it printed (`notices`).
+fn answer(out: Result<crate::routines::Outcome>, heard: Vec<String>) -> Result<Value> {
     let mut v = match out {
         Ok(crate::routines::Outcome::Rows(batches)) => json!({"rows": rows(&batches)?}),
         Ok(crate::routines::Outcome::Done(v)) => v,
@@ -190,11 +319,24 @@ async fn called(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<V
     Ok(v)
 }
 
+/// Changes data or a transaction (INSERT, CALL, BEGIN…): not for the query tool.
+fn is_write(sql: &str) -> bool {
+    crate::write::parse(sql).is_some() || crate::routines::runs_procedure(sql) || crate::txn::control(sql).is_some()
+}
+
+fn total(batches: &[RecordBatch]) -> usize { batches.iter().map(RecordBatch::num_rows).sum() }
+
 /// Rows committed after `after`, in steps of doubling size until about `ROWS` are in hand.
 async fn changes(app: &App, table: &str, after: Option<u64>) -> Result<Value> {
-    let found = lakes(app).into_iter().rev().find_map(|(p, l)| Some((table.strip_prefix(p.as_str())?.to_string(), l)));
-    let (name, lake) = found.ok_or_else(|| anyhow!("no table {table}"))?;
-    ensure!(lake.cat.get::<TableMeta>(&crate::store::table_key(&name)).await?.is_some(), "no table {table}");
+    let found = lakes(app).into_iter().rev().find_map(|(p, l)| Some((table.strip_prefix(p.as_str())?.to_string(), p, l)));
+    let (name, prefix, lake) = found.ok_or_else(|| crate::codes::coded("42P01", format!("no table {table}")))?;
+    crate::auth::check_all(table)?; // (a user's: every column of the rows, as `/watch` and Kafka need, before anything is read)
+    if !prefix.is_empty() {
+        crate::users::across(&lake, prefix.trim_end_matches('.')).await?; // (an attached lake that signs in on its own: its own sign-in, as queries use)
+    }
+    if lake.cat.get::<TableMeta>(&crate::store::table_key(&name)).await?.is_none() {
+        return Err(crate::codes::coded("42P01", format!("no table {table}")));
+    }
     let now = lake.visible();
     let (mut at, mut step, mut got) = (after.unwrap_or(now).min(now), 16, vec![]);
     while at < now && got.iter().map(RecordBatch::num_rows).sum::<usize>() < ROWS {

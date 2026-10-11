@@ -113,7 +113,7 @@ pub fn grpc(code: &str) -> tonic::Code {
         "57014" => tonic::Code::DeadlineExceeded,
         "53200" | "53300" => tonic::Code::ResourceExhausted,
         "0A000" => tonic::Code::Unimplemented,
-        "23514" | "23502" | "25006" => tonic::Code::FailedPrecondition,
+        "23514" | "23502" | "25006" | "25P01" | "25P02" => tonic::Code::FailedPrecondition, // (a transaction that isn't open, or failed)
         c if c.starts_with("42") || c.starts_with("22") => tonic::Code::InvalidArgument,
         _ => tonic::Code::Internal,
     }

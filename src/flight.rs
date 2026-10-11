@@ -14,6 +14,9 @@
 //!     `follow` every new commit as it lands. After each commit's rows comes a message with only
 //!     `app_metadata` `{"after": N}`: where to resume.
 //!   - `GetFlightInfo` for the same JSON, and `ListFlights` (the tables).
+//! - **Transactions** (Flight SQL's own): `BeginTransaction` gives a `transaction_id`; statements
+//!   that carry it (queries, updates) run in that transaction's session, and `EndTransaction` commits
+//!   or rolls it back. Bulk ingest inside one is refused by name for now.
 //! - **Tokens:** `authorization: Bearer <token>`, or a handshake with basic auth whose password is
 //!   the token (what ADBC and pyarrow's `authenticate_basic_token` send).
 use crate::auth::Role;
@@ -23,7 +26,7 @@ use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
-use arrow_flight::sql::{Any, CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables, CommandStatementIngest, CommandStatementQuery, CommandStatementUpdate, ProstMessageExt, SqlInfo, TicketStatementQuery};
+use arrow_flight::sql::{Any, ActionBeginTransactionRequest, ActionBeginTransactionResult, ActionEndTransactionRequest, CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables, CommandStatementIngest, CommandStatementQuery, CommandStatementUpdate, EndTransaction, ProstMessageExt, SqlInfo, SqlSupportedTransaction, TicketStatementQuery};
 use arrow_flight::{Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -107,14 +110,27 @@ async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> {
     Ok(crate::query::sql(&ctx, &crate::asof::rewrite(sql)?).await?.schema().as_arrow().clone())
 }
 
+/// A statement's answer, as its ticket names it: a CALL's kept answer, a write's row count, or a
+/// query run now.
+async fn answer(app: &App, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
+    if let Some(id) = sql.strip_prefix("kept:") {
+        let Some((batches, _)) = KEPT.lock().unwrap().remove(id) else { return Err(Status::not_found("that answer was read already, or is gone")) };
+        let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
+        return Ok((schema, batches));
+    }
+    if let Some(n) = sql.strip_prefix("rows:").and_then(|n| n.parse::<i64>().ok()) {
+        let batch = RecordBatch::try_from_iter([("rows", Arc::new(datafusion::arrow::array::Int64Array::from(vec![n])) as _)]).map_err(status)?;
+        return Ok((batch.schema(), vec![batch]));
+    }
+    query(app, sql).await.map_err(status)
+}
+
 /// A CALL's answer, run when its flight was asked for, until its ticket reads it (10 minutes).
 static KEPT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, (Vec<RecordBatch>, std::time::Instant)>>> = std::sync::LazyLock::new(Default::default);
 
 /// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER (or a CALL). Returns the rows written.
 async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
-    if crate::txn::control(sql).is_some() {
-        return Err(status(crate::codes::coded("0A000", "Flight SQL's transactions aren't taken yet: BEGIN … COMMIT through the Postgres port or HTTP (a session)")));
-    }
+    no_sql_transaction(sql)?;
     if crate::routines::runs_procedure(sql) {
         let who = crate::routines::Who { role, files: false, depth: 0 };
         crate::routines::one(app, sql, who, None).await.map_err(status)?;
@@ -127,6 +143,57 @@ async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
         crate::write::on_node(app, stmt, None).await.map_err(status)
     });
     Ok(done.await?["rows"].as_i64().unwrap_or(0))
+}
+
+/// BEGIN, COMMIT, ROLLBACK and SAVEPOINT in SQL are refused, with or without a transaction id: a
+/// Flight SQL transaction is begun and ended by its own actions, as the protocol has it.
+fn no_sql_transaction(sql: &str) -> Result<(), Status> {
+    match crate::txn::control(sql) {
+        Some(_) => Err(status(crate::codes::coded("0A000", "Flight SQL's transactions are the protocol's own: BeginTransaction (ADBC: autocommit off), then EndTransaction (commit or rollback); BEGIN, COMMIT and ROLLBACK aren't run as SQL"))),
+        None => Ok(()),
+    }
+}
+
+/// The session of a transaction a Flight SQL call names (`transaction_id`, from BeginTransaction).
+/// One with no transaction open (ended, timed out, or never begun) is refused by name, never run
+/// outside a transaction.
+fn in_txn(id: &[u8]) -> Result<String, Status> {
+    let session = crate::temp::id(&String::from_utf8_lossy(id));
+    match crate::txn::held(&session) {
+        true => Ok(session),
+        false => Err(status(crate::codes::coded("25P01", "no transaction is open under that transaction_id: it was ended, or never begun"))),
+    }
+}
+
+/// `f`, in the session of the transaction the call names, if it names one: its reads see the
+/// transaction's snapshot and its own writes, as a POST /sql statement sent with its session does.
+/// Without a transaction id, `f` runs as it always has.
+async fn within<T>(txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>>) -> Result<T, Status> {
+    match txn {
+        Some(id) => {
+            let session = in_txn(id)?;
+            crate::temp::SESSION.scope(Some(session), f).await
+        }
+        None => f.await,
+    }
+}
+
+/// A statement's ticket: its SQL, and the transaction it runs in first (`txn:<id>:`), if it has
+/// one. A transaction id never has a colon (`fl-` and hex), so the first colon ends it.
+fn handle(sql: &str, txn: Option<&[u8]>) -> Vec<u8> {
+    match txn {
+        Some(id) => format!("txn:{}:{sql}", String::from_utf8_lossy(id)).into_bytes(),
+        None => sql.as_bytes().to_vec(),
+    }
+}
+
+/// A ticket's transaction and SQL (`handle`'s form; the rest is as it was).
+fn unhandle(handle: &[u8]) -> (Option<&[u8]>, &[u8]) {
+    let split = handle.strip_prefix(b"txn:").and_then(|rest| rest.iter().position(|b| *b == b':').map(|i| (&rest[..i], &rest[i + 1..])));
+    match split {
+        Some((id, sql)) => (Some(id), sql),
+        None => (None, handle),
+    }
 }
 
 /// Appends batches to `table` through the log, pipelined: each is queued as it arrives and
@@ -275,7 +342,7 @@ static INFO: LazyLock<SqlInfoData> = LazyLock::new(|| {
     b.append(SqlInfo::FlightSqlServerArrowVersion, "1.3");
     b.append(SqlInfo::FlightSqlServerReadOnly, false);
     b.append(SqlInfo::FlightSqlServerSql, true);
-    b.append(SqlInfo::FlightSqlServerTransaction, 0i32); // (none)
+    b.append(SqlInfo::FlightSqlServerTransaction, SqlSupportedTransaction::Transaction as i32); // (transactions: BeginTransaction, EndTransaction; ADBC's autocommit off)
     b.build().expect("static SQL info")
 });
 
@@ -327,13 +394,13 @@ impl FlightSqlService for Sql {
 
     async fn get_flight_info_statement(&self, q: CommandStatementQuery, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
         let role = allowed(&self.0, &req, Role::Read)?;
-        if crate::txn::control(&q.query).is_some() {
-            return Err(status(crate::codes::coded("0A000", "Flight SQL's transactions aren't taken yet: BEGIN … COMMIT through the Postgres port or HTTP (a session)")));
-        }
+        no_sql_transaction(&q.query)?;
+        let txn = q.transaction_id.as_deref(); // (the transaction the statement runs in, if it names one)
         if crate::routines::runs_procedure(&q.query) {
             // A CALL (or DO): run now, as every door runs one; the ticket reads back what it answered.
             let who = crate::routines::Who { role, files: false, depth: 0 };
-            let batches = match crate::routines::one(&self.0, &q.query, who, None).await.map_err(status)? {
+            let out = within(txn, async { crate::routines::one(&self.0, &q.query, who, None).await.map_err(status) }).await?;
+            let batches = match out {
                 crate::routines::Outcome::Rows(b) => b,
                 crate::routines::Outcome::Done(_) => vec![RecordBatch::try_from_iter([("rows", Arc::new(datafusion::arrow::array::Int64Array::from(vec![0])) as _)]).map_err(status)?],
             };
@@ -347,39 +414,61 @@ impl FlightSqlService for Sql {
         }
         if crate::write::parse(&q.query).is_some() {
             // A write sent as a query (DB-API's `execute`): done now; the ticket reads back the count.
-            let rows = write(&self.0, role, &q.query).await?;
+            let rows = within(txn, write(&self.0, role, &q.query)).await?;
             let schema = Schema::new(vec![datafusion::arrow::datatypes::Field::new("rows", datafusion::arrow::datatypes::DataType::Int64, false)]);
             let ticket = TicketStatementQuery { statement_handle: format!("rows:{rows}").into_bytes().into() };
             return info(&schema, ticket.as_any().encode_to_vec(), req.into_inner());
         }
-        let schema = plan_schema(&self.0, &q.query).await.map_err(status)?;
-        let ticket = TicketStatementQuery { statement_handle: q.query.into_bytes().into() };
+        let schema = within(txn, async { plan_schema(&self.0, &q.query).await.map_err(status) }).await?;
+        let ticket = TicketStatementQuery { statement_handle: handle(&q.query, txn).into() };
         info(&schema, ticket.as_any().encode_to_vec(), req.into_inner())
     }
 
     async fn do_get_statement(&self, t: TicketStatementQuery, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
         allowed(&self.0, &req, Role::Read)?;
-        let sql = String::from_utf8(t.statement_handle.to_vec()).map_err(status)?;
-        if let Some(id) = sql.strip_prefix("kept:") {
-            let Some((batches, _)) = KEPT.lock().unwrap().remove(id) else { return Err(Status::not_found("that answer was read already, or is gone")) };
-            let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
-            return Ok(Response::new(send(schema, batches)));
-        }
-        if let Some(n) = sql.strip_prefix("rows:").and_then(|n| n.parse::<i64>().ok()) {
-            let batch = RecordBatch::try_from_iter([("rows", Arc::new(datafusion::arrow::array::Int64Array::from(vec![n])) as _)]).map_err(status)?;
-            return Ok(Response::new(send(batch.schema(), vec![batch])));
-        }
-        let (schema, batches) = query(&self.0, &sql).await.map_err(status)?;
+        let (txn, sql) = unhandle(&t.statement_handle);
+        let sql = String::from_utf8(sql.to_vec()).map_err(status)?;
+        let (schema, batches) = within(txn, answer(&self.0, &sql)).await?;
         Ok(Response::new(send(schema, batches)))
+    }
+
+    async fn do_action_begin_transaction(&self, _: ActionBeginTransactionRequest, req: Request<Action>) -> Result<ActionBeginTransactionResult, Status> {
+        allowed(&self.0, &req, Role::Read)?;
+        let id = format!("fl-{}", uuid::Uuid::new_v4().simple()); // (the client's handle; its session is the caller's own, named by it)
+        crate::temp::with(&crate::temp::id(&id), false, |_| Ok(())).map_err(status)?; // (held as a session: an idle one ends, its transaction rolled back, as `temp::reap` does)
+        crate::temp::SESSION.scope(Some(crate::temp::id(&id)), crate::txn::command(&self.0, "BEGIN")).await.map_err(status)?;
+        Ok(ActionBeginTransactionResult { transaction_id: id.into_bytes().into() })
+    }
+
+    async fn do_action_end_transaction(&self, q: ActionEndTransactionRequest, req: Request<Action>) -> Result<(), Status> {
+        allowed(&self.0, &req, Role::Read)?;
+        let word = match EndTransaction::try_from(q.action) {
+            Ok(EndTransaction::Commit) => "COMMIT",
+            Ok(EndTransaction::Rollback) => "ROLLBACK",
+            _ => return Err(Status::invalid_argument("EndTransaction: commit or rollback")),
+        };
+        let session = in_txn(&q.transaction_id)?;
+        let out = crate::temp::SESSION.scope(Some(session.clone()), crate::txn::command(&self.0, word)).await;
+        crate::temp::end(&session); // (the session ends with its transaction, committed or not)
+        let (tag, _) = out.map_err(status)?;
+        if word == "COMMIT" && tag == "ROLLBACK" {
+            // (a failed transaction's COMMIT rolls back, as in Postgres: a client must learn it did not commit)
+            return Err(status(crate::codes::coded("25P02", "the transaction had failed, so it was rolled back, not committed")));
+        }
+        Ok(())
     }
 
     async fn do_put_statement_update(&self, cmd: CommandStatementUpdate, req: Request<PeekableFlightDataStream>) -> Result<i64, Status> {
         let role = allowed(&self.0, &req, Role::Write)?;
-        write(&self.0, role, &cmd.query).await
+        within(cmd.transaction_id.as_deref(), write(&self.0, role, &cmd.query)).await
     }
 
     async fn do_put_statement_ingest(&self, cmd: CommandStatementIngest, req: Request<PeekableFlightDataStream>) -> Result<i64, Status> {
         let role = allowed(&self.0, &req, Role::Write)?;
+        if cmd.transaction_id.is_some() {
+            // (an ingest appends through the log: its rows would commit at once, not with the transaction)
+            return Err(status(crate::codes::coded("0A000", "an ingest inside a transaction isn't taken yet: ingest outside it, or INSERT the rows in it")));
+        }
         let table = match cmd.schema.as_deref() {
             Some(schema) if !schema.is_empty() => crate::ddl::join(schema, &cmd.table), // (ADBC's db_schema_name)
             _ => cmd.table.clone(),
@@ -507,6 +596,12 @@ impl FlightSqlService for Sql {
     async fn register_sql_info(&self, _: i32, _: &SqlInfo) {}
 }
 
+/// The actions Pondra takes (`ListActions` lists exactly these). Any other is refused by name.
+const ACTIONS: [(&str, &str); 2] = [
+    ("BeginTransaction", "Begins a transaction: Request Message: ActionBeginTransactionRequest; Response Message: ActionBeginTransactionResult"),
+    ("EndTransaction", "Commits or rolls back a transaction: Request Message: ActionEndTransactionRequest; Response Message: N/A"),
+];
+
 /// Plain Flight in front of Flight SQL: JSON tickets and commands are ours, the rest is Flight
 /// SQL's (its messages are protobuf, never `{`).
 struct Door(Sql);
@@ -548,6 +643,8 @@ impl FlightService for Door {
             let schema = match (&json.sql, &json.table) {
                 (Some(sql), _) => plan_schema(app, sql).await.map_err(status)?,
                 (None, Some(table)) => {
+                    // Its schema names every column: a user needs SELECT on all of them, as its log stream does (checked before the table is looked up, so an unreadable one isn't told apart).
+                    crate::auth::check_all(&crate::auth::catalog_name(table)).map_err(|e| Status::permission_denied(e.to_string()))?;
                     let meta: TableMeta = app.lake.cat.get(&table_key(table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
                     let full = crate::query::schema(&meta.logical_columns()).map_err(status)?;
                     let pick = json.columns.iter().flatten().filter_map(|c| full.index_of(c).ok()).collect::<Vec<_>>();
@@ -560,14 +657,13 @@ impl FlightService for Door {
         }).await
     }
 
-    async fn poll_flight_info(&self, req: Request<FlightDescriptor>) -> Result<Response<PollInfo>, Status> {
-        let who = caller(&self.0 .0, &req).await;
-        crate::auth::WHO.scope(who, async move { self.0.poll_flight_info(req).await }).await
+    // (Not taken, refused by name: the protocol's default says only "Not yet implemented")
+    async fn poll_flight_info(&self, _req: Request<FlightDescriptor>) -> Result<Response<PollInfo>, Status> {
+        Err(Status::unimplemented("PollFlightInfo: Pondra doesn't take it; GetFlightInfo answers at once"))
     }
 
-    async fn get_schema(&self, req: Request<FlightDescriptor>) -> Result<Response<SchemaResult>, Status> {
-        let who = caller(&self.0 .0, &req).await;
-        crate::auth::WHO.scope(who, async move { self.0.get_schema(req).await }).await
+    async fn get_schema(&self, _req: Request<FlightDescriptor>) -> Result<Response<SchemaResult>, Status> {
+        Err(Status::unimplemented("GetSchema: Pondra doesn't take it; GetFlightInfo gives a statement's or a table's schema"))
     }
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
@@ -582,7 +678,7 @@ impl FlightService for Door {
                     Ok(Response::new(send(schema, batches)))
                 }
                 (None, Some(table)) => {
-                    crate::auth::check("select", &crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(e.to_string()))?;
+                    crate::auth::check_all(&crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(e.to_string()))?; // (a stream of rows: every column, as `/watch` needs)
                     Ok(Response::new(log_stream(app.clone(), table, json.after, json.columns, json.follow).await?))
                 }
                 _ => Err(Status::invalid_argument("{\"sql\": …} or {\"table\": …}")),
@@ -596,17 +692,21 @@ impl FlightService for Door {
     }
 
     async fn do_action(&self, req: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
+        // (refused here, before the protocol decodes the body: its own decoding answers a body it can't unpack INVALID_ARGUMENT)
+        let action = req.get_ref().r#type.clone();
+        if !ACTIONS.iter().any(|(name, _)| *name == action) {
+            return Err(Status::unimplemented(format!("DoAction {action}: Pondra doesn't take it (its actions: BeginTransaction, EndTransaction)")));
+        }
         let who = caller(&self.0 .0, &req).await;
         crate::auth::WHO.scope(who, async move { self.0.do_action(req).await }).await
     }
 
-    async fn list_actions(&self, req: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
-        let who = caller(&self.0 .0, &req).await;
-        crate::auth::WHO.scope(who, async move { self.0.list_actions(req).await }).await
+    async fn list_actions(&self, _req: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
+        let actions = ACTIONS.map(|(name, about)| Ok::<_, Status>(ActionType { r#type: name.into(), description: about.into() }));
+        Ok(Response::new(Box::pin(futures::stream::iter(actions)) as Self::ListActionsStream))
     }
 
-    async fn do_exchange(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoExchangeStream>, Status> {
-        let who = caller(&self.0 .0, &req).await;
-        crate::auth::WHO.scope(who, async move { self.0.do_exchange(req).await }).await
+    async fn do_exchange(&self, _req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoExchangeStream>, Status> {
+        Err(Status::unimplemented("DoExchange: Pondra doesn't take it; DoGet and DoPut are its streams"))
     }
 }

@@ -47,7 +47,7 @@ struct Txn {
 
 static TXNS: LazyLock<Mutex<HashMap<String, Txn>>> = LazyLock::new(Default::default);
 
-const NO_SESSION: &str = "a transaction is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>)";
+const NO_SESSION: &str = "a transaction is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>; over MCP, the Mcp-Session-Id that initialize gave; over Flight SQL, BeginTransaction)";
 
 /// The current session's open transaction's snapshot, if it has one: every read in it is as of then.
 pub fn snapshot() -> Option<u64> {

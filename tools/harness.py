@@ -1882,6 +1882,73 @@ def clients():
         and tool("r-tok", "query", sql="SELECT count(*) AS n FROM docs")["rows"] == [{"n": 3}] and tool("r-tok", "write", sql="DELETE FROM docs") is None \
         and wrote == {"rows": 1} and tool("w-tok", "write", sql="INSERT INTO docs VALUES (4, 'trucks', [0.0, 0.1, 0.9])", job="mcp-1") == {"duplicate": True} \
         and len(feed["rows"]) == 5 and any(r.get("_deleted") for r in feed["rows"]) and feed["position"] > 0
+    # Raw MCP calls, with the status and headers: (status, headers, the JSON answer or its text)
+    def mcp_raw(token, method, params=None, sid=None, verb="POST", port=None):
+        headers = {"content-type": "application/json", "authorization": f"Bearer {token}"}
+        if sid is not None:
+            headers["mcp-session-id"] = sid
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}).encode() if verb == "POST" else None
+        req = urllib.request.Request(f"http://127.0.0.1:{port or A.port}/mcp", data=body, headers=headers, method=verb)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, r.headers, (json.loads(r.read()) if verb == "POST" else None)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            return e.code, e.headers, (json.loads(raw) if raw[:1] == b"{" else raw.decode(errors="replace"))
+    # MCP's refusals: a tool that fails is its result, with its SQLSTATE (a write through the read-only query tool: 25006; no such
+    # table: 42P01); a tool the server doesn't have is JSON-RPC's Invalid params (-32602), SQLSTATE 42883 in data; a malformed
+    # Mcp-Session-Id is 400 (-32600)
+    said = [mcp("r-tok", "tools/call", {"name": n, "arguments": a})["content"][0]["text"] for n, a in
+            (("query", {"sql": "DELETE FROM docs"}), ("changes", {"table": "nope"}))]
+    no_tool = mcp_raw("r-tok", "tools/call", {"name": "nope", "arguments": {}})
+    bad_session = mcp_raw("r-tok", "ping", sid="not-a-session")
+    checks["MCP's refusals carry SQLSTATEs (a write through query 25006, an unknown table 42P01); an unknown tool is -32602 with 42883 in data; a malformed Mcp-Session-Id is 400, -32600"] = \
+        [s.split(":")[0] for s in said] == ["SQLSTATE 25006", "SQLSTATE 42P01"] and no_tool[0] == 200 and no_tool[2]["error"]["code"] == -32602 \
+        and no_tool[2]["error"]["data"]["sqlstate"] == "42883" and bad_session[0] == 400 and bad_session[2]["error"]["code"] == -32600
+    # A transaction word alone, with no session: write refuses it by name (0A000: its session is what holds a transaction); query refuses BEGIN (25006)
+    lone_write = mcp_raw("w-tok", "tools/call", {"name": "write", "arguments": {"sql": "BEGIN"}})
+    lone_query = mcp_raw("w-tok", "tools/call", {"name": "query", "arguments": {"sql": "BEGIN"}})
+    checks["a lone BEGIN through write with no session: 0A000, named (send initialize and keep the Mcp-Session-Id); through query: 25006"] = \
+        lone_write[0] == 200 and lone_write[2]["result"]["isError"] and "SQLSTATE 0A000: a transaction needs a session: send initialize and keep the Mcp-Session-Id it gives" in lone_write[2]["result"]["content"][0]["text"] \
+        and lone_query[2]["result"]["isError"] and "SQLSTATE 25006" in lone_query[2]["result"]["content"][0]["text"] and "use the write tool" in lone_query[2]["result"]["content"][0]["text"]
+    # Sessions: initialize gives an Mcp-Session-Id that holds until DELETE; after DELETE, or for an id this node never made, a call is
+    # 404 (-32001) so the client initializes again, and DELETE of such an id is 404; a call with no session header is stateless
+    sid = mcp_raw("r-tok", "initialize", {"protocolVersion": "2025-06-18"})[1]["mcp-session-id"]
+    live_call = mcp_raw("r-tok", "tools/list", sid=sid)[0]
+    ended = mcp_raw("r-tok", "tools/list", sid=sid, verb="DELETE")[0]
+    after = mcp_raw("r-tok", "tools/call", {"name": "list_tables", "arguments": {}}, sid=sid)
+    never = mcp_raw("r-tok", "tools/call", {"name": "list_tables", "arguments": {}}, sid="mcp-" + uuid.uuid4().hex)
+    gone_delete = mcp_raw("r-tok", "tools/list", sid="mcp-" + uuid.uuid4().hex, verb="DELETE")[0]
+    checks["MCP sessions: live until DELETE; after it, or an id never made here, 404 (-32001); a call with no session header still works"] = \
+        live_call == 200 and ended == 204 and after[0] == 404 and after[2]["error"]["code"] == -32001 and never[0] == 404 and gone_delete == 404 \
+        and "tools" in mcp("r-tok", "tools/list")
+    # An MCP session nobody ends goes idle (PONDRA_SESSION_IDLE_SECS, 2 here): its transaction is rolled back, and its next call is 404
+    idle_node = Node(new_lake(), A.port + 6, env={"PONDRA_SESSION_IDLE_SECS": "2"}, **tokens).start()
+    try:
+        p6 = A.port + 6
+        ok_tool = lambda r: r[0] == 200 and not r[2]["result"]["isError"]
+        put = lambda sql, sid=None, token="w-tok": mcp_raw(token, "tools/call", {"name": "write", "arguments": {"sql": sql}}, sid=sid, port=p6)
+        made = [ok_tool(put(s, token="a-tok")) for s in ("CREATE TABLE idle_t (id BIGINT PRIMARY KEY, qty BIGINT)", "INSERT INTO idle_t VALUES (1, 100)")]
+        idle_sid = mcp_raw("w-tok", "initialize", {"protocolVersion": "2025-06-18"}, port=p6)[1]["mcp-session-id"]
+        begun, changed = put("BEGIN", idle_sid), put("UPDATE idle_t SET qty = 50 WHERE id = 1", idle_sid)
+        time.sleep(6)  # (idle for 2 s: the reaper, every 2 s, ends it)
+        idle_call = mcp_raw("w-tok", "tools/call", {"name": "query", "arguments": {"sql": "SELECT 1 AS one"}}, sid=idle_sid, port=p6)
+        read = mcp_raw("w-tok", "tools/call", {"name": "query", "arguments": {"sql": "SELECT qty FROM idle_t WHERE id = 1"}}, port=p6)
+        checks["an MCP session nobody ends goes idle: its transaction rolled back (the row still 100), its next call 404"] = \
+            made == [True, True] and ok_tool(begun) and ok_tool(changed) and idle_call[0] == 404 and idle_call[2]["error"]["code"] == -32001 \
+            and json.loads(read[2]["result"]["content"][0]["text"])["rows"] == [{"qty": 100}]
+        # Several statements in one call, with no session, are a transaction of their own: BEGIN; …; COMMIT keeps its change and
+        # BEGIN; …; ROLLBACK drops it
+        def row_qty():
+            r = mcp_raw("w-tok", "tools/call", {"name": "query", "arguments": {"sql": "SELECT qty FROM idle_t WHERE id = 1"}}, port=p6)
+            return json.loads(r[2]["result"]["content"][0]["text"])["rows"]
+        whole = mcp_raw("w-tok", "tools/call", {"name": "write", "arguments": {"sql": "BEGIN; UPDATE idle_t SET qty = 70 WHERE id = 1; COMMIT"}}, port=p6)
+        kept = row_qty()
+        undone = mcp_raw("w-tok", "tools/call", {"name": "write", "arguments": {"sql": "BEGIN; UPDATE idle_t SET qty = 5 WHERE id = 1; ROLLBACK"}}, port=p6)
+        checks["BEGIN; UPDATE; COMMIT in one call with no session is one transaction (70 kept); BEGIN; UPDATE; ROLLBACK drops its change"] = \
+            ok_tool(whole) and kept == [{"qty": 70}] and ok_tool(undone) and row_qty() == [{"qty": 70}]
+    finally:
+        idle_node.kill()
     # Downloads (the console's, round 29): every row, not the 10,000 the console shows, in each form.
     import io, openpyxl, pyarrow.parquet as pq
     many = "SELECT value AS n, 'r' || value AS s, value % 2 = 0 AS even, value * 0.5 AS half FROM generate_series(1, 12345) ORDER BY n"
@@ -3111,7 +3178,7 @@ def schemas():
         spaces = {r[0] for r in c.execute("SELECT nspname FROM pg_catalog.pg_namespace").fetchall()}
         in_dbo = {r[0] for r in c.execute("SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'dbo'").fetchall()}
         by_pg = c.execute("SELECT count(*) FROM dbo.t").fetchone()[0]
-    conn = adbc.connect(f"grpc://127.0.0.1:{A.port + 30}")
+    conn = adbc.connect(f"grpc://127.0.0.1:{A.port + 30}", autocommit=True)
     cur = conn.cursor()
     cur.adbc_ingest("landed", pa.table({"a": pa.array([1, 2, 3], pa.int64())}), mode="create", db_schema_name="dbo")
     cur.close()
@@ -3313,6 +3380,80 @@ def scale():
     return f"scale: {n_rows:,} rows over {len(days)} daily partitions, {int(inline + sealed)} files ({int(sealed)} sealed), every file one day, a day's query reads {int(scanned)} files, 3 nodes, {sum(sp for _, _, sp, _ in shuffles.values())} of {len(shuffles)} queries spread, {sum(sh for _, sh, *_ in shuffles.values())} shuffled, {sum(r for *_, r in shuffles.values())} by key ranges (all equal to one node), 6 outside readers, a 50 MB memory limit: all {len(checks)} checks pass"
 
 
+def flight_protocol(fport):
+    """Flight SQL's protocol as Pondra takes it, over gRPC's own calls: ListActions lists the actions
+    Pondra takes and no others; any other action, with any body, is refused UNIMPLEMENTED naming it
+    (never INVALID_ARGUMENT); GetSchema, PollFlightInfo and DoExchange are UNIMPLEMENTED, naming them;
+    BeginTransaction gives an id that EndTransaction ends, and a body an action can't read is its own
+    INVALID_ARGUMENT. Returns the checks."""
+    import grpc
+    ident, svc, auth = (lambda b: b), "/arrow.flight.protocol.FlightService/", (("authorization", "Bearer r"),)  # (flight()'s read token)
+    def varint(n):
+        out = bytearray()
+        while n > 0x7F:
+            out.append((n & 0x7F) | 0x80)
+            n >>= 7
+        return bytes(out + bytes([n]))
+    def unvarint(buf, i):
+        n = shift = 0
+        while True:
+            b = buf[i]
+            i += 1
+            n |= (b & 0x7F) << shift
+            shift += 7
+            if b < 0x80:
+                return n, i
+    def ld(num, data):  # a length-delimited protobuf field
+        return varint(num << 3 | 2) + varint(len(data)) + data
+    def get(buf, num):  # that field of a message, if it is there
+        i = 0
+        while i < len(buf):
+            key, i = unvarint(buf, i)
+            if key & 7 == 0:
+                _, i = unvarint(buf, i)
+            elif key & 7 == 2:
+                n, i = unvarint(buf, i)
+                if key >> 3 == num:
+                    return buf[i:i + n]
+                i += n
+            else:
+                return None
+        return None
+    def outcome(fn):  # ("ok", the answer) or (the gRPC status, its message)
+        try:
+            return "ok", fn()
+        except grpc.RpcError as e:
+            return e.code().name, e.details()
+    ch = grpc.insecure_channel(f"127.0.0.1:{fport}")
+    def do_action(name, body):
+        call = ch.unary_stream(svc + "DoAction", request_serializer=ident, response_deserializer=ident)
+        return list(call(ld(1, name.encode()) + ld(2, body), metadata=auth))  # (an Action: its type and body)
+    def any_of(message, value):  # the Any a body of an action is
+        return ld(1, b"type.googleapis.com/arrow.flight.protocol.sql." + message) + ld(2, value)
+    listed = outcome(lambda: list(ch.unary_stream(svc + "ListActions", request_serializer=ident, response_deserializer=ident)(b"", metadata=auth)))
+    names = sorted(get(t, 1).decode() for t in listed[1]) if listed[0] == "ok" else listed
+    refused = []
+    for name in ["CreatePreparedStatement", "ClosePreparedStatement", "CreatePreparedSubstraitPlan", "BeginSavepoint", "EndSavepoint", "CancelQuery", "NoSuchAction"]:
+        for body in (b"", b"not protobuf"):
+            got = outcome(lambda: do_action(name, body))
+            refused.append(got[0] == "UNIMPLEMENTED" and name in got[1])
+    desc = varint(1 << 3) + varint(2) + ld(2, b"q")  # a FlightDescriptor of a command
+    unary = lambda method: outcome(lambda: ch.unary_unary(svc + method, request_serializer=ident, response_deserializer=ident)(desc, metadata=auth))
+    schema, poll = unary("GetSchema"), unary("PollFlightInfo")
+    exchange = outcome(lambda: list(ch.stream_stream(svc + "DoExchange", request_serializer=ident, response_deserializer=ident)(iter([]), metadata=auth)))
+    begun = outcome(lambda: do_action("BeginTransaction", any_of(b"ActionBeginTransactionRequest", b"")))
+    tid = get(get(get(begun[1][0], 1), 2), 1) if begun[0] == "ok" and begun[1] else b""  # (Result → Any → ActionBeginTransactionResult)
+    ended = outcome(lambda: do_action("EndTransaction", any_of(b"ActionEndTransactionRequest", ld(1, tid) + varint(2 << 3) + varint(2))))  # ROLLBACK
+    unread = outcome(lambda: do_action("EndTransaction", b"not protobuf"))
+    ch.close()
+    return {
+        "ListActions lists the actions Pondra takes, and no others": names == ["BeginTransaction", "EndTransaction"],
+        "an action Pondra doesn't take is UNIMPLEMENTED, naming it, whatever its body (never INVALID_ARGUMENT)": all(refused) and len(refused) == 14,
+        "GetSchema, PollFlightInfo and DoExchange are UNIMPLEMENTED, naming them": all(s[0] == "UNIMPLEMENTED" and m in s[1] for s, m in ((schema, "GetSchema"), (poll, "PollFlightInfo"), (exchange, "DoExchange"))),
+        "BeginTransaction gives an id that EndTransaction ends; a body it can't read is INVALID_ARGUMENT": begun[0] == "ok" and tid.startswith(b"fl-") and ended[0] == "ok" and unread[0] == "INVALID_ARGUMENT",
+    }
+
+
 def flight():
     """Arrow Flight and Flight SQL. pyarrow: DoPut exactly-once (a retried stream is applied
     once), DoGet SQL, GetFlightInfo, ListFlights, a table's log as a columnar stream (chosen
@@ -3379,7 +3520,8 @@ def flight():
     header = client.authenticate_basic_token("reader", "r")
     shaken = client.do_get(fl.Ticket(json.dumps({"sql": "SELECT 1 AS one FROM ev LIMIT 1"})), options=fl.FlightCallOptions(headers=[header])).read_all().num_rows
     # ADBC over Flight SQL.
-    conn = adbc.connect(f"grpc://127.0.0.1:{fport}", db_kwargs={"adbc.flight.sql.authorization_header": "Bearer a"})
+    # (autocommit on: DB-API's default is off, and the server now runs a transaction for it that this check never commits)
+    conn = adbc.connect(f"grpc://127.0.0.1:{fport}", db_kwargs={"adbc.flight.sql.authorization_header": "Bearer a"}, autocommit=True)
     cur = conn.cursor()
     cur.execute("SELECT count(*) AS n FROM ev")
     adbc_count = cur.fetchone()[0]
@@ -3408,6 +3550,7 @@ def flight():
         "ADBC write as a query, ingest, objects": ingest_back == (5000, sum(range(5000))) and ingested == 5000 and {"ev", "ingested"} <= set(names),
         "every row once": total == {"n": 14001, "s": 1000 * (sum(range(13)) + 100) + 5},
     }
+    checks.update(flight_protocol(fport))  # (the protocol's own actions and RPCs, over gRPC)
     node.kill(); follower.kill()
     ok = all(checks.values())
     follow_ms = round((lag[-1] - sent_at) * 1000) if lag else None
@@ -6684,7 +6827,7 @@ def found():
     # ADBC: a handshake without base64 padding ("reader:r" is 8 bytes), ingest modes, table types.
     shaken = adbc.connect(f"grpc://127.0.0.1:{fport + 1}", db_kwargs={"username": "reader", "password": "r"})
     cur = shaken.cursor(); cur.execute("SELECT count(*) AS n FROM kept"); seen["handshake"] = cur.fetchone(); cur.close(); shaken.close()
-    conn = adbc.connect(f"grpc://127.0.0.1:{fport}")
+    conn = adbc.connect(f"grpc://127.0.0.1:{fport}", autocommit=True)
     table = lambda lo, hi: pa.table({"k": pa.array(range(lo, hi), pa.int64())})
     def ingest(mode, lo, hi, name="ing"):
         c = conn.cursor()
@@ -7394,6 +7537,34 @@ def users():
             return f"ERROR {e}"
     flight_said = [bearer[1].decode().startswith("Bearer ps_"), fsql("SELECT item FROM sales.orders ORDER BY id"), fsql("SELECT card FROM sales.orders")]
     checks["Flight: a handshake with a user's name and password gives a session; held to the grants"] = flight_said[0] and flight_said[1] == [{"item": "tea"}, {"item": "cake"}] and "permission denied" in flight_said[2]
+    # MCP: a listing shows what a user may read; changes (a stream of rows, every column, as /watch's) is refused without them
+    def tool_result(name, args):
+        out = as_(A.port, ann, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}), path="/mcp")
+        return out["result"] if isinstance(out, dict) and "result" in out else out
+    denied = lambda r: isinstance(r, dict) and r.get("isError") is True and "permission denied" in json.dumps(r)
+    listed = tool_result("list_tables", {})
+    listed_names = sorted(t["table"] for t in json.loads(listed["content"][0]["text"])["tables"]) if isinstance(listed, dict) and "content" in listed else listed
+    checks["MCP list_tables shows a user only the tables it may read, as pondra.tables does"] = listed_names == ["notes", "sales.orders"]
+    changes = {t: tool_result("changes", {"table": t, "after": 0}) for t in ("hr", "sales.orders", "notes")}
+    checks["MCP changes refuses a table the user may not read (every column)"] = denied(changes["hr"]) and denied(changes["sales.orders"]) \
+        and isinstance(changes["notes"], dict) and changes["notes"].get("isError") is False and "hello" in json.dumps(changes["notes"])
+    # Flight's log stream needs every column too: a user granted some of a table's is refused, a user granted all of notes is served
+    def log_stream(table):
+        try:
+            return client.do_get(fl.Ticket(json.dumps({"table": table, "after": 0, "follow": False})), opts).read_all().to_pylist()
+        except Exception as e:
+            return f"ERROR {e}"
+    streams = [log_stream("sales.orders"), log_stream("notes")]
+    checks["Flight's log stream refuses a user granted only some columns"] = "permission denied" in str(streams[0]) and "hello" in json.dumps(streams[1])
+    # GetFlightInfo of a table names its columns: a user granted only some of them learns none of them
+    def table_info(table):
+        try:
+            return client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"table": table})), opts).schema.names
+        except Exception as e:
+            return f"ERROR {e}"
+    infos = [table_info("sales.orders"), table_info("notes")]
+    checks["Flight's GetFlightInfo of a table refuses a user granted only some columns (no column names), and serves one it may read"] = \
+        "permission denied" in str(infos[0]) and "text" in infos[1]
     # Revoked and dropped: at once, on the leader and a follower
     as_(A.port, boss, "REVOKE SELECT (item) ON sales.orders FROM analyst")
     revoked = [until(lambda: "permission denied" in str(as_(port, ann, "SELECT item FROM sales.orders")), True, 10) for port in (A.port, A.port + 1)]
@@ -7410,7 +7581,9 @@ def users():
     a.kill(), b.kill()  # (the ports free for the next test of `all`)
     ok = all(checks.values())
     print(json.dumps({"users": checks, "ok": ok, "info": info}, indent=1, default=str))
-    return ok
+    if not ok:
+        sys.exit(1)  # (as the other sections: a false check ends the run with a failing status, and `all` with it)
+    return f"users: sign-ins, grants and the doors that check them, all {len(checks)} checks pass"
 
 
 def secrets():
@@ -10337,8 +10510,9 @@ def use_path():
 def doors():
     """The doors matrix (ADR-036 §7): one list of features, each through every door — SQL over HTTP
     (a session), the Python client, the Postgres port (psycopg), Flight SQL (ADBC), the JavaScript
-    client and MCP. Each cell is right, or refused by name where the door can't (a transaction and a
-    USE need a session: Flight SQL and MCP have none). The table is printed; every cell must be one of the two."""
+    client and MCP. Each cell is right, or refused by name where the door can't (a USE needs a session,
+    which Flight SQL has none of; a transaction is a session's on Postgres, HTTP, MCP, and a transaction
+    id's on Flight SQL). The table is printed; every cell must be one of the two."""
     import re, psycopg, adbc_driver_flightsql.dbapi as adbc
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
     import pondra
@@ -10414,10 +10588,16 @@ def doors():
         return out
     def via_flight(stmts):
         out = []
+        txn = stmts[0].strip().upper() == "BEGIN"  # (a transaction is Flight SQL's own: ADBC's autocommit off, then commit)
         try:
-            with adbc.connect(f"grpc://127.0.0.1:{fp}", autocommit=True) as c:
+            with adbc.connect(f"grpc://127.0.0.1:{fp}", autocommit=not txn) as c:
                 cur = c.cursor()
                 for st in stmts:
+                    if txn and st.strip().upper() in ("BEGIN", "COMMIT"):
+                        if st.strip().upper() == "COMMIT":
+                            c.commit()
+                        out.append(None)
+                        continue
                     cur.execute(st)
                     try:
                         out.append([list(r) for r in cur.fetchall()])
@@ -10428,17 +10608,23 @@ def doors():
             return meta.get("x-pondra-sqlstate") or "refused: " + str(e).splitlines()[0][:160]
         return out
     def via_mcp(stmts):
-        out = []
-        for st in stmts:
-            tool = "query" if st.split()[0].upper() in ("SELECT",) else "write"
-            body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {"sql": st}}}).encode()
-            r = json.loads(urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/mcp", data=body, headers={"content-type": "application/json"}), timeout=60).read())["result"]
-            text = r["content"][0]["text"]
-            if r["isError"]:
-                m = re.search(r"\b(\d{2}[0-9A-Z]\d{2})\b", text)
-                return m.group(1) if m and m.group(1) in ("23514", "42P01", "40001", "25P02") else "refused: " + text[:160]
-            got = json.loads(text)
-            out.append(rows_of(got["rows"]) if isinstance(got, dict) and "rows" in got else None)
+        out, mcp = [], f"http://127.0.0.1:{A.port}/mcp"
+        # One session, as an MCP client keeps one (Mcp-Session-Id from initialize): BEGIN … COMMIT is its transaction.
+        init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}).encode()
+        sid = urllib.request.urlopen(urllib.request.Request(mcp, data=init, headers={"content-type": "application/json"}), timeout=60).headers["mcp-session-id"]
+        try:
+            for st in stmts:
+                tool = "query" if st.split()[0].upper() in ("SELECT",) else "write"
+                body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {"sql": st}}}).encode()
+                r = json.loads(urllib.request.urlopen(urllib.request.Request(mcp, data=body, headers={"content-type": "application/json", "mcp-session-id": sid}), timeout=60).read())["result"]
+                text = r["content"][0]["text"]
+                if r["isError"]:
+                    m = re.search(r"\b(\d{2}[0-9A-Z]\d{2})\b", text)
+                    return m.group(1) if m and m.group(1) in ("23514", "42P01", "40001", "25P02") else "refused: " + text[:160]
+                got = json.loads(text)
+                out.append(rows_of(got["rows"]) if isinstance(got, dict) and "rows" in got else None)
+        finally:
+            urllib.request.urlopen(urllib.request.Request(mcp, method="DELETE", headers={"mcp-session-id": sid}), timeout=60).read()  # (the session ends, its transaction with it)
         return out
     js_lib = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "js", "index.js")
     def via_javascript(stmts):
@@ -10453,7 +10639,7 @@ finally {{ await db.close?.(); }}"""
         return json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else "refused: " + r.stderr[-160:]
     via = {"http": via_http, "python": via_python, "postgres": via_postgres, "flight": via_flight, "javascript": via_javascript, "mcp": via_mcp}
     matrix, checks = {}, {}
-    no_session = {"flight", "mcp"}  # (no session to hold a transaction or a USE: refused by name)
+    no_session = {"USE a schema": {"flight"}}  # (USE needs a session: Flight SQL has none, so it's refused by name there)
     for i, door in enumerate(DOORS):
         for name, (stmts, right) in features(i + 1).items():
             try:
@@ -10466,7 +10652,7 @@ finally {{ await db.close?.(); }}"""
             except Exception:
                 pass
             refused = isinstance(got, str) and ("session" in got or got.startswith("refused") or got == "0A000")
-            cell = "ok" if ok else ("refused" if refused and name in ("transaction", "USE a schema") and door in no_session else "WRONG")
+            cell = "ok" if ok else ("refused" if refused and door in no_session.get(name, ()) else "WRONG")
             matrix.setdefault(name, {})[door] = cell if cell != "WRONG" else f"WRONG: {str(got)[:120]}"
     for name, row in matrix.items():
         checks[f"{name}: " + ", ".join(f"{d} {'ok' if v == 'ok' else v}" for d, v in row.items())] = all(v in ("ok", "refused") for v in row.values())
