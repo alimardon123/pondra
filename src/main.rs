@@ -601,14 +601,22 @@ async fn run() -> anyhow::Result<()> {
                     }
                     // (sealed once every node can read them sealed: tried each minute until then)
                     let mut said = false;
-                    while let Err(e) = users::seal_keys(&l).await {
+                    while let Err(e) = async { users::seal_keys(&l).await?; branch::seal_keys(&l).await }.await {
                         if !c.is_leader() {
                             break;
                         }
                         if !std::mem::replace(&mut said, true) {
-                            eprintln!("the lake's own keys stay as they are for now: {e:#}");
+                            eprintln!("the lake's keys stay as they are for now: {e:#}");
                         }
                         tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                });
+                let (l, c) = (app.lake.clone(), app.cluster.clone());
+                panics::spawn(async move {
+                    // (a branch's pins in bases on other servers, renewed while it is used here: `branch::lapse`)
+                    while c.is_leader() {
+                        branch::renew(&l).await;
+                        tokio::time::sleep(branch::renew_every()).await;
                     }
                 });
             }

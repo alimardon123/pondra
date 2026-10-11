@@ -739,6 +739,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
         None => lake.cat.scan::<Segment>(&seg_key(floor + 1), &seg_key(floor + 1001)).await?.first().map(|(_, s)| s.ts_ms),
     };
     // Files live when a branch was made stay while its pin does (ADR-047).
+    crate::branch::lapse(lake).await?; // (pins on lease not renewed: before the files they kept are counted)
     let pins = crate::branch::pins(lake).await?;
     let files_cutoff = next.map_or(cutoff, |ts| cutoff.min(ts)).min(pins.map_or(u64::MAX, |p| p.0));
     let mut dead: Vec<String> = segs.iter().filter(|(_, s)| !s.path.is_empty()).map(|(_, s)| s.path.clone()).collect();

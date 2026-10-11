@@ -182,9 +182,24 @@ struct Project {
     name: String,
     objects: Vec<Declared>,
     migrations: Vec<(String, String)>, // (file, text), in name order
+    seeds: Vec<(String, String)>, // (file, text): rows a new database starts with, in name order
     tests: Vec<(String, String)>,
     values: HashMap<String, Value>,
     protect: bool, // (the chosen environment's `protected`: the apply protects the database)
+}
+
+impl Project {
+    /// Whether `k`, an object of the database, is in a schema the project's objects are in: what its
+    /// migrations could have changed. Another schema's objects, an empty schema and roles aren't.
+    fn holds(&self, k: &str) -> bool {
+        let (word, name) = split_key(k);
+        let schema = |kind: Kind, name: &str| match kind {
+            Kind::Schema | Kind::Role | Kind::Secret | Kind::Attach | Kind::Grant => None,
+            _ => Some(name.split_once('.').map_or(crate::ddl::PUBLIC, |(s, _)| s).to_string()),
+        };
+        let Some(theirs) = Kind::of(word).and_then(|kind| schema(kind, name)) else { return false };
+        self.objects.iter().any(|d| schema(d.kind, &d.name).as_ref() == Some(&theirs) || (d.kind == Kind::Schema && d.name == theirs))
+    }
 }
 
 fn project(ask: &Ask) -> Result<Project> {
@@ -223,7 +238,7 @@ fn project(ask: &Ask) -> Result<Project> {
     }
     let of = |dir: &str| ask.files.iter().filter(|(p, _)| p.starts_with(dir) && p.ends_with(".sql") && !p[dir.len()..].contains('/')).map(|(p, t)| (p[dir.len()..].to_string(), t.clone())).collect::<Vec<_>>();
     let protect = env.is_some_and(|e| e.protected);
-    Ok(Project { name: toml.project.name, objects: ordered(objects), migrations: of("migrations/"), tests: of("tests/"), values, protect })
+    Ok(Project { name: toml.project.name, objects: ordered(objects), migrations: of("migrations/"), seeds: of("seeds/"), tests: of("tests/"), values, protect })
 }
 
 fn first_line(sql: &str) -> String { sql.trim().lines().next().unwrap_or_default().chars().take(80).collect() }
@@ -251,7 +266,7 @@ fn head(sql: &str) -> Result<Option<(Kind, String)>> {
         }
         "create" => i += 1,
         "attach" => bail!("an attached lake or catalog is each environment's: [env.prod] attach.events = {{ type = \"kafka\", url = \"…\" }} in pondra.toml"),
-        _ => bail!("objects/ holds what objects are (CREATE …, GRANT …); rows and one-off changes go in migrations/"),
+        _ => bail!("objects/ holds what objects are (CREATE …, GRANT …); the rows a new database starts with go in seeds/, one-off changes in migrations/"),
     }
     if word(i) == "or" && word(i + 1) == "replace" {
         i += 2;
@@ -511,7 +526,7 @@ pub async fn export_attached(lake: &Lake, name: &str) -> Result<BTreeMap<String,
 #[derive(Serialize, Clone, Debug)]
 pub struct Step {
     pub mark: &'static str, // + made, ~ changed, ↻ made again, ▶ a migration, - dropped, ! kept or refused
-    pub change: &'static str, // the same as a word to filter by: create, alter, replace, rebuild, migrate, drop, keep, refuse
+    pub change: &'static str, // the same as a word to filter by: create, alter, replace, rebuild, migrate, record, seed, drop, keep, refuse
     pub kind: String,
     pub name: String,
     pub what: String,
@@ -541,6 +556,8 @@ pub struct Plan {
     pub tests: usize,
     #[serde(skip)]
     objects: BTreeMap<String, String>, // key → fingerprint, for the record
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub new: bool, // (a brand-new database: `new_database`)
 }
 
 /// An apply as it is kept (`dp/<n>`): who, which commit, the plan, each step, the tests.
@@ -566,6 +583,8 @@ pub struct Record {
     /// Each object it left declared: its fingerprint as written, and as the database has it after.
     #[serde(default)]
     pub objects: BTreeMap<String, (String, String)>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new: bool, // (it made a brand-new database: `new_database`)
 }
 
 /// The apply entries, newest last.
@@ -599,6 +618,7 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
     let done: Vec<String> = lake.cat.scan::<u64>(&format!("dm/{}/", p.name), &format!("dm/{}0", p.name)).await?.into_iter().map(|(k, _)| k[4 + p.name.len()..].to_string()).collect();
     let (mut steps, mut refused) = (vec![], vec![]);
     let pending: Vec<&(String, String)> = p.migrations.iter().filter(|(f, _)| !done.contains(f)).collect();
+    let new = new_database(&all, !now.keys().any(|k| p.holds(k)));
     let print = |sql: &str| fingerprint(sql, &HashMap::new(), &BTreeMap::new());
     let mut rebuilt: Vec<String> = vec![];
     for d in &p.objects {
@@ -694,12 +714,30 @@ async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) -> Result<Pla
     // (a backfill finds its column, a first apply's rows their table), then what is replaced or
     // dropped (planned again after them: a rename makes a table match its declaration).
     let (mut first, rest): (Vec<Step>, Vec<Step>) = steps.into_iter().partition(|s| s.mark == "+" || s.mark == "~" && s.kind == "table");
-    first.extend(pending.iter().map(|(f, text)| Step { mark: "▶", change: "migrate", kind: "migration".into(), name: f.clone(), what: "runs once".into(), sql: vec![text.clone()] }));
+    first.extend(pending.iter().map(|(f, text)| match new {
+        true => Step { mark: "▶", change: "record", kind: "migration".into(), name: f.clone(), what: "recorded, not run: a new database is made as the files are now".into(), sql: vec![] },
+        false => Step { mark: "▶", change: "migrate", kind: "migration".into(), name: f.clone(), what: "runs once".into(), sql: vec![text.clone()] },
+    }));
+    if new {
+        first.extend(p.seeds.iter().map(|(f, text)| Step { mark: "▶", change: "seed", kind: "seed".into(), name: f.clone(), what: "loads once: a new database".into(), sql: vec![text.clone()] }));
+    }
     first.extend(rest);
     let steps = first;
     let objects: BTreeMap<String, String> = p.objects.iter().map(|d| (d.key(), d.print.clone())).collect();
     let shown = serde_json::to_string(&(&steps, &refused, after))?;
-    Ok(Plan { id: crate::users::sha256(&shown)[..16].to_string(), after, steps, refused, tests: p.tests.len(), objects })
+    Ok(Plan { id: crate::users::sha256(&shown)[..16].to_string(), after, steps, refused, tests: p.tests.len(), objects, new })
+}
+
+/// Whether an apply makes a brand-new database: nothing in the project's schemas (`Project::holds`)
+/// and nothing applied, or only its first applies, which failed (run again, it finishes them). Such a
+/// database is made as the files are now: its migrations changed what older files made, so they are
+/// recorded as run, never run, and the project's seeds/ load into it once. A clone carries its base's
+/// rows and migrations: never new.
+fn new_database(all: &[Record], empty: bool) -> bool {
+    match all.is_empty() {
+        true => empty,
+        false => all.iter().all(|r| r.new && r.status != "ok" && r.status != "tests_failed"),
+    }
 }
 
 pub(crate) fn split_key(k: &str) -> (&str, &str) {
@@ -889,7 +927,7 @@ async fn making(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who, applie
 
 /// The claim, the apply's statements (`statements`), and its record's end (`making`'s span).
 async fn claim_to_record(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Who) -> Result<Record> {
-    let mut record = Record { project: p.name.clone(), env: ask.env.clone(), commit: ask.commit.clone(), who: caller(who), started_ms: crate::log::now_ms(), status: "running".into(), ..Default::default() };
+    let mut record = Record { project: p.name.clone(), env: ask.env.clone(), commit: ask.commit.clone(), who: caller(who), started_ms: crate::log::now_ms(), status: "running".into(), new: plan.new, ..Default::default() };
     let claimed = crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: true, after: plan.after, record: json(&record) }]), None, false).await?;
     // (the leader's answer keeps `keep`'s old key, "deploy": see there)
     record.n = claimed["deploy"].as_u64().context("an apply number")?;
@@ -917,7 +955,8 @@ async fn statements(app: &App, p: &Project, plan: &Plan, record: &mut Record, wh
     // (the job id keeps the old word: a retried apply's marks are stored under it, so it writes once)
     let job = format!("deploy:{}:{}", p.name, record.n);
     let none = HashMap::new();
-    // What is added, then the migrations, then the rest: planned again against what they left.
+    // What is added, then the migrations (and a new database's seeds), then the rest: planned again
+    // against what they left.
     let ran = plan.steps.iter().position(|s| s.mark == "▶");
     let added: Vec<&Step> = plan.steps.iter().take(ran.unwrap_or(0)).collect();
     for (i, s) in added.iter().enumerate() {
@@ -927,13 +966,23 @@ async fn statements(app: &App, p: &Project, plan: &Plan, record: &mut Record, wh
         record.steps.push(j!({"mark": s.mark, "kind": s.kind, "name": s.name, "what": s.what}));
     }
     let mut steps = plan.steps.clone();
-    let migrations: Vec<Step> = steps.iter().filter(|s| s.mark == "▶").cloned().collect();
-    for m in &migrations {
-        crate::routines::script(app, &m.sql[0], &values, &none, who, Some(format!("migration:{}:{}", p.name, m.name))).await.with_context(|| format!("migration {}", m.name))?;
-        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&j!({"migration": migration_key(&p.name, &m.name)})) }]), None, false).await?;
-        record.steps.push(j!({"mark": m.mark, "kind": m.kind, "name": m.name, "what": "ran"}));
+    let once: Vec<Step> = steps.iter().filter(|s| s.mark == "▶").cloned().collect();
+    for m in &once {
+        // (each under a job of its own, so one run again writes once)
+        if let Some(sql) = m.sql.first() {
+            crate::routines::script(app, sql, &values, &none, who, Some(format!("{}:{}:{}", m.kind, p.name, m.name))).await.with_context(|| format!("{} {}", m.kind, m.name))?;
+        }
+        let what = match (m.kind.as_str(), m.sql.is_empty()) {
+            ("seed", _) => "loaded",
+            (_, true) => "recorded",
+            _ => "ran",
+        };
+        if m.kind == "migration" {
+            crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::Apply { claim: false, after: record.n, record: json(&j!({"migration": migration_key(&p.name, &m.name)})) }]), None, false).await?;
+        }
+        record.steps.push(j!({"mark": m.mark, "kind": m.kind, "name": m.name, "what": what}));
     }
-    if !migrations.is_empty() {
+    if !once.is_empty() {
         let branch = app.lake.cat.get_raw(crate::branch::BASES).await?.is_some();
         let again = plan_again(&app.lake, p, plan, branch).await?;
         ensure!(again.refused.is_empty(), "after the migrations, the plan refuses: {}", again.refused.join("; "));
@@ -1138,6 +1187,17 @@ pub async fn call(app: &App, name: &str, args: &[datafusion::sql::sqlparser::ast
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_database_is_one_nothing_made() {
+        let r = |status: &str, new: bool| Record { status: status.into(), new, ..Default::default() };
+        assert!(new_database(&[], true));
+        assert!(!new_database(&[], false)); // (objects made by hand: its migrations run)
+        assert!(new_database(&[r("failed", true)], false)); // (a first apply that failed, run again)
+        assert!(!new_database(&[r("failed", true), r("ok", true)], false));
+        assert!(!new_database(&[r("tests_failed", true)], false)); // (applied: only its tests failed)
+        assert!(!new_database(&[r("failed", false)], false));
+    }
 
     #[test]
     fn heads() {

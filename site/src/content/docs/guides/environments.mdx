@@ -167,7 +167,10 @@ database match it, and `pondra plan` shows what that would change first:
 - `objects/`: `CREATE` statements (tables, views, materialized views, functions, macros, procedures,
   tasks, secrets, roles) and `GRANT`s, in any layout, several to a file;
 - `migrations/`: one-off steps, such as a rename or a backfill, each run once in each database, in
-  name order, after the objects and columns an apply adds and before what it replaces;
+  name order, after the objects and columns an apply adds and before what it replaces. A new database
+  is made as `objects/` says now, so there they are recorded as run, not run;
+- `seeds/`: the rows a new database starts with (`INSERT …`), loaded once when an apply makes it,
+  in name order. A branch has its base's rows instead;
 - `tests/`: queries; any row one returns is a failure. They run after every apply (`--no-test` skips
   them).
 
@@ -179,18 +182,18 @@ CREATE SCHEMA sales;
 CREATE TABLE sales.orders (id BIGINT, amount DOUBLE);
 CREATE VIEW sales.big AS SELECT * FROM sales.orders WHERE amount >= 20;
 SQL
-echo "INSERT INTO sales.orders VALUES (1, 10.0), (2, 20.0), (3, 30.0);" > migrations/001-first-orders.sql
+echo "INSERT INTO sales.orders VALUES (1, 10.0), (2, 20.0), (3, 30.0);" > seeds/001-first-orders.sql
 echo "SELECT * FROM sales.orders WHERE amount < 0" > tests/no_negative.sql
 pondra apply --url http://127.0.0.1:8080
 ```
 
 ```text
-a project in shop: pondra.toml, objects/, migrations/, tests/
+a project in shop: pondra.toml, objects/, migrations/, seeds/, tests/
 dev: apply 1
   + schema     sales                 made
   + table      sales.orders          made
   + view       sales.big             made
-  ▶ migration  001-first-orders.sql  ran
+  ▶ seed       001-first-orders.sql  loaded
   ✓ tests      1 passed
   console: http://127.0.0.1:8080/
 ```
@@ -244,7 +247,8 @@ id | project | status
 
 A project kept in the workspace applies from SQL too: `CALL plan('shop', env => 'prod')` lists its
 plan as rows (`mark`, `change`, `kind`, `name`, `what`; `change` is a word to filter by: `create`,
-`alter`, `replace`, `rebuild`, `migrate`, `drop`, `keep` or `refuse`), and
+`alter`, `replace`, `rebuild`, `migrate`, `record` (a migration a new database is marked as having
+run), `seed`, `drop`, `keep` or `refuse`), and
 `CALL apply('shop', env => 'prod', test => true)` does it.
 
 `pondra export DIR` writes a database's objects as a project's files, so a lake built by hand in the
@@ -369,9 +373,17 @@ CREATE DATABASE ali CLONE prod;              -- in dev's bucket, no file copied
 Nothing on dev writes or deletes under production's prefix, whatever dev's own key allows: a write
 to `prod` is refused by name. The branch keeps the read-only key in its own catalog, so it reads
 production on its own, and `ALTER DATABASE ali REFRESH` asks production's leader again with the
-branch's own key. A branch can't be made while production's leader is down; one made earlier can
+branch's own key. That key reads the branch's own tables and nothing else: no statement in the
+branch can use it, whoever owns the branch, so a clone of the `sales` schema can't read `hr`'s files
+by their URL. A branch can't be made while production's leader is down; one made earlier can
 still be read. A clone takes only the schemas the link's CLONE grant covers
 (`WITH (schemas = (…))` picks among them).
+
+While dev uses a branch (its own node, or a node it is attached to), it renews its pin in production
+every hour with its own key, which dev keeps sealed by its master key. Production lets go of a pin
+nobody renewed for 14 days (`PONDRA_PIN_LEASE_SECS`), so a branch whose server is gone stops holding
+production's files. Such a branch can then no longer read what production has deleted since: drop it
+and clone again.
 
 ### Protected production
 

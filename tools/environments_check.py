@@ -478,11 +478,21 @@ def across_check(bin, work, port):
                 return v
             time.sleep(0.5)
 
+    def objects(lake):
+        """Every object of a lake's bucket, read as it is stored."""
+        import boto3
+        s3 = boto3.client("s3", endpoint_url=moto_url, region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test")
+        return [s3.get_object(Bucket=lake[len("s3://"):].split("/", 1)[0], Key=k)["Body"].read() for k in keys(lake)]
+
+    def bases(lake):
+        """A lake's bases (`bs`) as `pondra catalog` prints them, read with dev's master key."""
+        return subprocess.run([bin, "catalog", "--dir", lake, "bs"], capture_output=True, text=True, env={**os.environ, **s3_env(moto_url, key_dev)}).stdout
+
     try:
         moto_proc = moto(port + 5, work)
         gates.append(Gate(moto_url, port + 3, counts, env=True))  # (dev's environment's endpoint)
         gates.append(Gate(moto_url, port + 4, counts, env=False))  # (prod_ro's endpoint)
-        prod = Node(bin, prod_lake, port, work, "--retain-secs", "1", env=s3_env(moto_url, key_prod)).start()
+        prod = Node(bin, prod_lake, port, work, "--retain-secs", "1", env={**s3_env(moto_url, key_prod), "PONDRA_PIN_LEASE_SECS": "20"}).start()  # (a branch's pin not renewed for 20 s goes)
         prod.q("CREATE SCHEMA sales")
         prod.q("CREATE SCHEMA hr")
         prod.q("CREATE TABLE sales.orders (id BIGINT, amount DOUBLE)")
@@ -509,7 +519,7 @@ def across_check(bin, work, port):
         files_before = parquet(prod_lake)
 
         # dev has no token of its own (Anon): nothing of the test's admin token can reach prod through it.
-        dev = Anon(bin, dev_lake, port + 1, work, env=s3_env(env_url, key_dev), token=False).start()
+        dev = Anon(bin, dev_lake, port + 1, work, env={**s3_env(env_url, key_dev), "PONDRA_PIN_RENEW_SECS": "3"}, token=False).start()  # (renews its pins in prod every 3 s)
         dev.q(f"CREATE SECRET prod_ro (TYPE s3, KEY_ID 'test', SECRET 'test', REGION 'us-east-1', ENDPOINT '{ro_url}', URL_STYLE 'path', SCOPE 's3://acme-prod/prod')")
         dev.q(f"CREATE SECRET prod_clone (TYPE pondra, TOKEN '{dev_token}', SCOPE '{prod_url}')")
         dev.q(f"ATTACH 's3://acme-prod/prod' AS prod (READ_ONLY, ENDPOINT '{prod_url}')")
@@ -528,8 +538,12 @@ def across_check(bin, work, port):
         checks["a user of dev granted CLONE ON DATABASE prod (attached) branches it on dev, and owns it"] = \
             made_dana == 200 and owner_dana == [("dana",)] and dropped_dana == 200
         dev.q("CREATE DATABASE ali CLONE prod")
+        cloned_at = time.time()
         checks["CREATE DATABASE ali CLONE prod on dev keeps its folder in acme-dev and copies no file of prod's"] = \
             len(keys(ali_lake)) > 0 and not keys("s3://acme-prod/ali") and parquet(ali_lake) == []
+        ali_bases = bases(ali_lake)
+        checks["ali's key to its pin in prod is kept sealed by dev's master key: no pb_ in its objects, and its catalog shows it sealed"] = \
+            not any(b"pb_" in o for o in objects(ali_lake)) and '"sealed"' in ali_bases and "pb_" not in ali_bases
         checks["ali reads sales as prod has it (tables, keyed table and view), and has no hr schema (CLONE ON SCHEMA sales only)"] = \
             rows(dev, "SELECT id, amount FROM ali.sales.orders ORDER BY id") == before \
             and rows(dev, "SELECT id, v FROM ali.sales.k ORDER BY id") == rows(prod, "SELECT id, v FROM sales.k ORDER BY id") \
@@ -544,7 +558,7 @@ def across_check(bin, work, port):
         checks["ali's writes are its own: dev has them, prod's rows and files don't change"] = \
             (9, 9.0) in ali_before and (1, 0.0) in ali_before and rows(prod, "SELECT id, amount FROM sales.orders ORDER BY id") == before and parquet(prod_lake) == files_before
 
-        ali = Anon(bin, ali_lake, port + 2, work, env=s3_env(env_url, key_dev), token=False).start()
+        ali = Anon(bin, ali_lake, port + 2, work, env={**s3_env(env_url, key_dev), "PONDRA_PIN_RENEW_SECS": "3"}, token=False).start()
         checks["a node on ali's folder that never saw the attachment answers as dev did: it reads prod with the key it kept"] = \
             rows(ali, "SELECT id, amount FROM sales.orders ORDER BY id") == ali_before
         metrics = ali.get("/metrics").decode()
@@ -563,6 +577,19 @@ def across_check(bin, work, port):
         prod.post("/tier")
         checks["prod moves on (rows changed, merged, purged, its past let go): ali still answers as before, from what prod pinned"] = \
             rows(ali, "SELECT id, amount FROM sales.orders ORDER BY id") == ali_before and rows(prod, "SELECT count(*) FROM sales.orders WHERE amount > 100") == [(4,)]
+        # The key ali keeps reads its base and nothing else: a statement on ali's own node (open: whoever asks
+        # is a superuser there, but not the program that started it) naming one of prod's files by URL, hr's,
+        # which ali never took, finds no secret to read it with.
+        hr = next((k for k in parquet(prod_lake) if "hr.pay" in k), "")
+        status, text = raw(port + 2, "POST", "/sql", f"SELECT count(*) AS n FROM 's3://acme-prod/{hr}'", {})
+        checks["the key ali was lent reads its base for ali's tables alone: a statement on ali's node naming prod's hr file by URL is refused"] = \
+            hr != "" and status != 200 and "secret" in text.lower()
+        if not checks["the key ali was lent reads its base for ali's tables alone: a statement on ali's node naming prod's hr file by URL is refused"]:
+            checks["(lent key)"] = [hr, status, text[:300]]
+        time.sleep(max(0.0, 25 - (time.time() - cloned_at)))  # (past prod's 20 s lease since the clone)
+        prod.post("/tier")  # (a retention round: where a lease not renewed goes)
+        checks["…and ali's pin is a lease that dev renews: prod still holds it after more than its lease"] = \
+            rows(prod, "SELECT branches FROM pondra.databases WHERE name = 'prod'") == [(1,)]
 
         ali.q("ALTER DATABASE ali REFRESH sales.orders")  # (from ali's own node)
         checks["ALTER DATABASE ali REFRESH sales.orders, from ali's own node, brings prod's rows now"] = \
@@ -579,6 +606,12 @@ def across_check(bin, work, port):
         dev.q("DROP DATABASE ali")
         checks["DROP DATABASE ali on dev: its folder goes from acme-dev, and prod shows no branch left"] = \
             not keys(ali_lake) and until(lambda: rows(prod, "SELECT branches FROM pondra.databases WHERE name = 'prod'") == [(0,)]) is True
+        dev.q("CREATE DATABASE bob CLONE prod")
+        held = rows(prod, "SELECT branches FROM pondra.databases WHERE name = 'prod'") == [(1,)]
+        dev.stop()  # (nothing renews bob's pin now)
+        released = until(lambda: (prod.post("/tier"), rows(prod, "SELECT branches FROM pondra.databases WHERE name = 'prod'"))[1] == [(0,)], 90)
+        checks["a branch on another server nobody renews (dev stopped) has its pin let go after its lease, its folder still in acme-dev"] = \
+            held and released is True and len(keys("s3://acme-dev/bob")) > 0
         checks["the gates: nothing reached prod's bucket with a write, nothing through dev's own key, and prod_ro read it"] = \
             counts["prod_writes"] == 0 and counts["prod_by_env"] == 0 and counts["prod_reads"] > 0
         return checks
@@ -809,7 +842,7 @@ def layout_b_check(bin, work, port):
         put(proj, "pondra.toml", f'[project]\nname = "sales"\n\n[env.prod]\nserver = "{prod_url}"\n\n[env.dev]\nserver = "{dev_url}"\n')
         put(proj, "objects/schemas.sql", "CREATE SCHEMA sales;\n")
         put(proj, "objects/sales/orders.sql", "CREATE TABLE sales.orders (id BIGINT, amount DOUBLE);\n")
-        put(proj, "migrations/001-first-orders.sql", "INSERT INTO sales.orders VALUES (1, 10.0), (2, 20.0);\n")
+        put(proj, "seeds/001-first-orders.sql", "INSERT INTO sales.orders VALUES (1, 10.0), (2, 20.0);\n")
         cli("login", prod_url, "--token", "prod-admin")
         cli("login", dev_url, "--token", "dev-admin")
 
@@ -964,6 +997,47 @@ def owners_check(bin, work, port, root):
         oprod.stop()
 
 
+def sealed_later_check(bin, work, port, root):
+    """A branch made where no master key is shared keeps its key in the clear; when its own leader starts
+    with one, the key is sealed (`branch::seal_keys`), and REFRESH and DROP still go by it (ADR-058)."""
+    prod = Node(bin, root + "/kprod", port + 33, work, env={"PONDRA_SECRET_KEY": ""}, token=False)  # (no master key every node shares)
+    dev = Node(bin, root + "/kdev", port + 34, work, token=False)  # (the default env: a master key every node shares)
+
+    def rows(n, sql):
+        return [tuple(r.values()) for r in n.q(sql)]
+
+    def until(f, secs=30):
+        deadline = time.time() + secs
+        while True:
+            v = f()
+            if v or time.time() > deadline:
+                return v
+            time.sleep(0.5)
+
+    checks = {}
+    try:
+        prod.start()
+        prod.q("CREATE TABLE t (x BIGINT)")
+        prod.q("INSERT INTO t VALUES (1)")
+        prod.q("CREATE DATABASE kdev CLONE kprod")
+        cat = lambda: subprocess.run([bin, "catalog", "--dir", root + "/kdev", "bs"], capture_output=True, text=True).stdout
+        clear = '"pb_' in cat()
+        prod.q("INSERT INTO t VALUES (2)")
+        dev.start()
+        sealed = until(lambda: '"sealed"' in cat() and "pb_" not in cat(), 30)
+        dev.q("ALTER DATABASE kdev REFRESH t")
+        refreshed = rows(dev, "SELECT x FROM t ORDER BY x") == [(1,), (2,)]
+        dev.stop()
+        prod.q("DROP DATABASE kdev")
+        released = until(lambda: rows(prod, "SELECT branches FROM pondra.databases WHERE name = 'kprod'") == [(0,)], 30)
+        checks["a branch whose key was kept in the clear (no shared master key) has it sealed when its own leader starts with one, and REFRESH and DROP still go by it"] = \
+            clear and sealed is True and refreshed and released is True
+        return checks
+    finally:
+        dev.stop()
+        prod.stop()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--new", default=os.path.join(HERE, "..", "target", "release", "pondra"), help="this build's binary")
@@ -978,7 +1052,8 @@ def main():
     new = os.path.abspath(a.new)
     parts = [lambda: across_check(new, work, a.port)] if a.across else [
         lambda: environments_check(new, work, a.port, root), lambda: signed_in_check(new, work, a.port, root),
-        lambda: protect_check(new, work, a.port, root), lambda: layout_b_check(new, work, a.port), lambda: owners_check(new, work, a.port, root)]
+        lambda: protect_check(new, work, a.port, root), lambda: layout_b_check(new, work, a.port), lambda: owners_check(new, work, a.port, root),
+        lambda: sealed_later_check(new, work, a.port, root)]
     checks = {}
     try:
         for i, part in enumerate(parts):

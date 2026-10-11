@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(clap::Subcommand)]
 pub enum Command {
-    /// Start a project in DIR (default: this folder): pondra.toml, objects/, migrations/ and tests/.
+    /// Start a project in DIR (default: this folder): pondra.toml, objects/, migrations/, seeds/ and tests/.
     /// `pondra export` writes one from a database instead (pondra init shop).
     Init {
         dir: Option<String>,
@@ -640,7 +640,7 @@ fn keep_login(base: &str, token: String) -> Result<()> {
 
 // ---------------------------------------------------------------- the project's files
 
-/// The files an apply reads: pondra.toml, objects/**/*.sql, migrations/*.sql, tests/*.sql.
+/// The files an apply reads: pondra.toml, objects/**/*.sql, migrations/*.sql, seeds/*.sql, tests/*.sql.
 fn files(dir: &Path) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     let toml = dir.join("pondra.toml");
@@ -667,6 +667,7 @@ fn files(dir: &Path) -> Result<BTreeMap<String, String>> {
     }
     walk(dir, &dir.join("objects"), true, &mut out)?;
     walk(dir, &dir.join("migrations"), false, &mut out)?;
+    walk(dir, &dir.join("seeds"), false, &mut out)?;
     walk(dir, &dir.join("tests"), false, &mut out)?;
     Ok(out)
 }
@@ -752,7 +753,7 @@ fn init(dir: &str, name: Option<String>) -> Result<String> {
         database(&name)
     );
     std::fs::write(dir.join("pondra.toml"), toml)?;
-    for (d, keep) in [("objects", "CREATE TABLE, VIEW, MATERIALIZED VIEW, FUNCTION, PROCEDURE, TASK, ROLE, GRANT: what every object is, in any layout.\n"), ("migrations", "One-off steps (a rename, a backfill), each run once in each database, in name order.\n"), ("tests", "Queries: any row back is a failure.\n")] {
+    for (d, keep) in [("objects", "CREATE TABLE, VIEW, MATERIALIZED VIEW, FUNCTION, PROCEDURE, TASK, ROLE, GRANT: what every object is, in any layout.\n"), ("migrations", "One-off steps (a rename, a backfill), each run once in each database, in name order. A new database is made as objects/ says now: there they are recorded as run, not run.\n"), ("seeds", "Rows a new database starts with (INSERT …), loaded once when an apply makes it, in name order. A clone has its base's rows instead.\n"), ("tests", "Queries: any row back is a failure.\n")] {
         std::fs::create_dir_all(dir.join(d))?;
         let readme = dir.join(d).join("README.md");
         if !readme.exists() {
@@ -766,7 +767,7 @@ fn init(dir: &str, name: Option<String>) -> Result<String> {
         let gap = if had.is_empty() || had.ends_with('\n') { "" } else { "\n" };
         std::fs::write(&ignore, format!("{had}{gap}/lake/\n"))?;
     }
-    Ok(format!("a project in {}: pondra.toml, objects/, migrations/, tests/, .gitignore\n", dir.display()))
+    Ok(format!("a project in {}: pondra.toml, objects/, migrations/, seeds/, tests/, .gitignore\n", dir.display()))
 }
 
 // ---------------------------------------------------------------- branches

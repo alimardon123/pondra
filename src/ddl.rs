@@ -219,7 +219,7 @@ pub enum Ddl {
     Detach { name: String, if_exists: bool },
     CreateDatabase { name: String, if_not_exists: bool, dir: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] clone: Option<crate::branch::CloneOf> }, // a new lake (beside this one unless `dir`), attached; a branch of another (ADR-047)
     Branch(crate::branch::Make),            // the new lake's leader: make it its base as that is now (ADR-047)
-    Pin { lake: String, ms: Option<u64> },  // a base's leader: keep the files a branch reads
+    Pin { lake: String, ms: Option<u64>, #[serde(default, skip_serializing_if = "std::ops::Not::not")] lease: bool }, // a base's leader: keep the files a branch reads (lease: renewed by a branch on another server, let go when it isn't: `branch::lapse`)
     Unpin { lake: String },
     Refresh { database: Option<String>, tables: Vec<String> }, // ALTER DATABASE b REFRESH t, …: b's leader (ADR-047)
     Protect { database: String, on: bool, #[serde(default)] by: String }, // ALTER DATABASE b SET (protected = …): b's leader (ADR-058, `protect.rs`)
@@ -423,7 +423,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         }
         Ddl::CreateDatabase { name, if_not_exists, dir, clone: Some(of) } => crate::branch::create(lake, &name, if_not_exists, dir, of).await,
         Ddl::Branch(m) => crate::branch::make(lake, m).await,
-        Ddl::Pin { lake: branch, ms } => crate::branch::pin(lake, &branch, ms).await,
+        Ddl::Pin { lake: branch, ms, lease } => crate::branch::pin(lake, &branch, ms, lease).await,
         Ddl::Unpin { lake: branch } => crate::branch::unpin(lake, &branch).await,
         Ddl::Refresh { .. } => bail!("ALTER DATABASE … REFRESH is done by its database's leader (write::handle)"),
         Ddl::Protect { database, on, by } => crate::protect::set(lake, &database, on, &by).await,

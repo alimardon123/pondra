@@ -98,8 +98,10 @@ deploy are the same on either layout.
    schemas takes only those. The branch keeps the read-only key in its own catalog. `[env.dev] base
    = "prod"` makes `pondra branch` branch on dev's server. Checked by `environments_check.py
    --across` (two buckets behind gates: dev's key writes only `acme-dev`, prod's read-only key only
-   reads `acme-prod`). Not yet: pins of a branch on another server are let go by `DROP DATABASE` or
-   REFRESH only, never swept as idle (prod can't see dev's bucket).
+   reads `acme-prod`). *Since:* a branch keeps its key sealed by its server's master key
+   (`branch::Base::key`), and its pin in a base on another server is a lease: the branch's node, or a
+   node it is attached to, renews it every hour with that key, and the base lets go of one not renewed
+   for 14 days (`PONDRA_PIN_LEASE_SECS`).
 3. **Protected databases and `DEPLOY`,** with the break-glass and its audit. Checks: a protected
    database's objects change only through a deploy; a person's own schema is still theirs. *Built in
    round 34:* `ALTER DATABASE d SET (protected = true | false)`, an admin's; a lift is written to

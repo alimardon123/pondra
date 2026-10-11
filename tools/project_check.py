@@ -2,9 +2,10 @@
 """A project made true in its databases (ADR-047 §4): `pondra init`, `plan`, `apply`, `test`,
 `export`, `branch` and `diff` against a folder of lakes (`pondra serve --lakes`), as a team would.
 
-- the first apply makes every object, runs the migration once and the tests; a second finds nothing;
+- the first apply makes every object, loads the seed once and runs the tests; a second finds nothing;
 - a column added and a view changed are ALTER TABLE and a replacement; drift is put back;
-- a renamed column is refused with the migration to write, and passes with it;
+- a renamed column is refused with the migration to write, and passes with it; a new database made after it
+  records the migration instead of running it, and loads the seed;
 - a materialized view changed is made again with what follows it;
 - a failed test fails the apply; a plan shown before someone else applied is refused;
 - another project can't change this one's objects;
@@ -127,8 +128,8 @@ def project_check(bin, work, port):
     pondra("init")
     with open(os.path.join(proj, "pondra.toml")) as f:
         toml = f.read()
-    checks["pondra init: pondra.toml (named after the folder), objects/, migrations/, tests/, a .gitignore leaving out /lake/"] = 'name = "sales"' in toml \
-        and all(os.path.isdir(os.path.join(proj, d)) for d in ["objects", "migrations", "tests"]) and "/lake/" in open(os.path.join(proj, ".gitignore")).read().split()
+    checks["pondra init: pondra.toml (named after the folder), objects/, migrations/, seeds/, tests/, a .gitignore leaving out /lake/"] = 'name = "sales"' in toml \
+        and all(os.path.isdir(os.path.join(proj, d)) for d in ["objects", "migrations", "seeds", "tests"]) and "/lake/" in open(os.path.join(proj, ".gitignore")).read().split()
     base_toml = f'[project]\nname = "sales"\nserver = "{base}"\n\n[env.prod]\nvalues = {{ big = 100 }}\n\n[env.dev]\nvalues = {{ big = 50 }}\n'
     write("pondra.toml", base_toml)
     write("objects/schemas.sql", "CREATE SCHEMA sales;\n")
@@ -140,16 +141,16 @@ def project_check(bin, work, port):
           "CREATE PROCEDURE sales.add(n BIGINT) LANGUAGE sql AS $$ INSERT INTO sales.orders VALUES (n, n * 10.0) $$;\n"
           "CREATE TASK sales.nightly SCHEDULE '1 hour' AS CALL sales.add(999);\n")
     write("objects/access.sql", "CREATE ROLE analyst;\nGRANT SELECT ON TABLE sales.orders TO analyst;\n")
-    write("migrations/001-first-orders.sql", "INSERT INTO sales.orders SELECT x, x * 10.0 FROM generate_series(1, 20) AS s(x);\n")
+    write("seeds/001-first-orders.sql", "INSERT INTO sales.orders SELECT x, x * 10.0 FROM generate_series(1, 20) AS s(x);\n")
     write("tests/no_negative.sql", "SELECT * FROM sales.orders WHERE amount < 0\n")
     subprocess.run(["git", "add", "-A"], cwd=proj, env=env, check=True)
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "first"], cwd=proj, env=env, check=True)
 
     plan = pondra("plan", "prod")
-    checks["pondra plan: each object made, the migration once, nothing done"] = all(f"+ {k}" in plan for k in ["table", "view", "materialized view", "macro", "procedure", "task", "role", "grant"]) \
-        and "▶ migration" in plan and "first apply" in plan and refused("prod", "SELECT * FROM sales.orders") != ""
+    checks["pondra plan: each object made, the seed loaded once (a new database), nothing done"] = all(f"+ {k}" in plan for k in ["table", "view", "materialized view", "macro", "procedure", "task", "role", "grant"]) \
+        and "▶ seed" in plan and "first apply" in plan and refused("prod", "SELECT * FROM sales.orders") != ""
     out = pondra("apply", "prod")
-    checks["pondra apply prod: every object made, the migration's rows, the view's value, the tests passed"] = \
+    checks["pondra apply prod: every object made, the seed's rows, the view's value, the tests passed"] = \
         rows("prod", "SELECT count(*) FROM sales.orders") == [(20,)] and rows("prod", "SELECT count(*) FROM sales.big") == [(11,)] \
         and rows("prod", "SELECT sum(n) FROM sales.rollup") == [(20,)] and rows("prod", "SELECT sales.double(21) AS d") == [(42,)] \
         and "✓ tests      1 passed" in out and "apply 1" in out
@@ -157,7 +158,7 @@ def project_check(bin, work, port):
     head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=proj, env=env, capture_output=True, text=True).stdout.strip()
     checks["pondra.applies: the apply, its project, environment, commit and status"] = [tuple(r.values()) for r in d] == [(1, "sales", "prod", head, "ok")]
     again = pondra("apply", "prod")
-    checks["applied again: nothing to change, the migration not run again"] = "nothing to change" in again and rows("prod", "SELECT count(*) FROM sales.orders") == [(20,)]
+    checks["applied again: nothing to change, the seed not loaded again"] = "nothing to change" in again and rows("prod", "SELECT count(*) FROM sales.orders") == [(20,)]
     plans = [pondra("plan", "prod") for _ in range(2)]
     checks["a plan made twice is the same plan (nothing to change)"] = plans[0] == plans[1] and "nothing to change" in plans[0]
 
@@ -199,9 +200,9 @@ def project_check(bin, work, port):
     os.remove(os.path.join(proj, "objects", "sales", "local_loop.sql"))
     shell = subprocess.run([bin], cwd=proj, env=env, input="SELECT n AS local_rows FROM sales.local_loop;\n", capture_output=True, text=True, timeout=120)
     ignored = subprocess.run(["git", "status", "--porcelain"], cwd=proj, env=env, capture_output=True, text=True).stdout
-    checks["…pondra in the project's folder opens that lake (the view saved: the migration's 20 rows), and git leaves lake/ out"] = \
+    checks["…pondra in the project's folder opens that lake (the view saved: the seed's 20 rows), and git leaves lake/ out"] = \
         "local_rows" in shell.stdout and re.search(r"\b20\b", shell.stdout) is not None and "lake" not in ignored
-    if not checks["…pondra in the project's folder opens that lake (the view saved: the migration's 20 rows), and git leaves lake/ out"]:
+    if not checks["…pondra in the project's folder opens that lake (the view saved: the seed's 20 rows), and git leaves lake/ out"]:
         checks["(shell)"] = [shell.stdout[-400:], shell.stderr[-400:], ignored]
 
     # A rename is a migration's.
@@ -215,6 +216,16 @@ def project_check(bin, work, port):
     checks["a renamed column: refused, saying the migration and what reads it; with it, applied, the views made again"] = "refused" in no and "RENAME COLUMN" in no \
         and "materialized view sales.totals" in no and rows("prod", "SELECT sum(total) FROM sales.orders") == [(2100.0,)] \
         and rows("prod", "SELECT s FROM sales.totals ORDER BY odd") == [(1100.0,), (1000.0,)] and rows("prod", "SELECT sum(n) FROM sales.rollup") == [(20,)]
+    # A new database made after the rename: made as the files are now, so the rename migration is recorded,
+    # not run (the column is total already), and the seed's rows go in.
+    shutil.rmtree(os.path.join(proj, "lake"))
+    rebuilt = subprocess.run([bin, "apply", "local"], cwd=proj, env=env, capture_output=True, text=True, timeout=300)
+    summed = subprocess.run([bin], cwd=proj, env=env, input="SELECT sum(total) AS rebuilt_total FROM sales.orders;\n", capture_output=True, text=True, timeout=120)
+    name = "a new database made after the rename (apply local, its lake gone): the migration recorded, not run, and the seed's rows loaded"
+    checks[name] = rebuilt.returncode == 0 and re.search(r"002-rename\.sql +recorded", rebuilt.stdout) is not None \
+        and re.search(r"001-first-orders\.sql +loaded", rebuilt.stdout) is not None and "2100" in summed.stdout
+    if not checks[name]:
+        checks["(rebuilt)"] = [rebuilt.returncode, rebuilt.stdout[-800:], rebuilt.stderr[-800:], summed.stdout[-300:]]
     write("objects/sales/views.sql", open(os.path.join(proj, "objects/sales/views.sql")).read().replace("sum(total) AS s", "sum(total) AS s, sum(total * 2) AS twice"))
     plan = pondra("plan", "prod")
     pondra("apply", "prod")

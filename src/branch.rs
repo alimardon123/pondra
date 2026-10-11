@@ -44,11 +44,54 @@ pub struct Base {
     pub url: String,
     pub ms: u64, // its pin: every file live then is kept
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>, // its key there: its pin renewed and let go with it (`keyed`, ADR-058)
+    pub key: Option<String>, // its key there, in the clear (no master key every node shares, or kept before): its pin renewed and let go with it (`keyed`, ADR-058)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<Sealed>, // (its key there, sealed by the master key: `Base::key`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>, // (a base on another server: its URL, where its leader is asked for pins)
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub read_only: bool, // (a base on another server, read with a read-only key: ADR-058)
+}
+
+/// A branch's key sealed as the lake's own keys are (`users::Kept`): a data key of its own, wrapped.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Sealed {
+    sealed: String,
+    key: String,
+}
+
+impl Base {
+    /// Its key there, opened when it is kept sealed.
+    pub fn key(&self) -> Result<Option<String>> {
+        let Some(s) = &self.sealed else { return Ok(self.key.clone()) };
+        let plain = crate::ext::unseal(&s.sealed, &s.key).map_err(|e| anyhow::anyhow!("this branch's key in {} is sealed by a master key this node doesn't have ({e:#}): every node needs the same PONDRA_SECRET_KEY (or PONDRA_KMS_COMMAND)", self.url))?;
+        Ok(Some(String::from_utf8(plain)?))
+    }
+
+    /// Its key sealed by the master key when every node shares one (`ext::shared_master`; never this
+    /// machine's own, which another node couldn't open), or wrapped again after the master key
+    /// changed. Whether it changed.
+    fn seal(&mut self) -> Result<bool> {
+        if let Some(s) = &mut self.sealed {
+            let Some(key) = crate::ext::rewrapped(&s.key)? else { return Ok(false) };
+            s.key = key;
+            return Ok(true);
+        }
+        match self.key.take() {
+            Some(k) if crate::ext::shared_master() => {
+                let (sealed, key) = crate::ext::seal(k.as_bytes())?;
+                self.sealed = Some(Sealed { sealed, key });
+                Ok(true)
+            }
+            k => {
+                self.key = k;
+                Ok(false)
+            }
+        }
+    }
+
+    /// On another server (ADR-058): read with a read-only key, its leader at an endpoint.
+    pub fn away(&self) -> bool { self.read_only || self.endpoint.is_some() }
 }
 
 /// A base's promise to a branch: every file live at `ms` stays until this goes.
@@ -57,6 +100,8 @@ pub struct Pin {
     pub lake: String,
     pub ms: u64,
     pub at_ms: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lease: bool, // (a branch on another server's: it renews it, and it goes when it isn't renewed: `lapse`)
 }
 
 /// `CLONE a [WITH (schemas = (x, y))] [WITH NO DATA]`.
@@ -140,7 +185,7 @@ pub async fn load(lake: &Lake) -> Result<()> {
         };
         for (id, base) in b.lakes {
             if base.read_only {
-                crate::ext::reach_with(&secrets, &base.url, true, base.endpoint.as_deref())?;
+                crate::ext::reach_base(&secrets, &base.url, base.endpoint.as_deref())?;
             }
             lake.add_base(&id, &base.url)?;
         }
@@ -171,7 +216,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
     let mut lakes = inherited.lakes.clone();
     let mut pinned = vec![];
     let made = async {
-        let pinning = pin_in(lake, &base, &dir, None, None).await;
+        let pinning = pin_in(lake, &base, &dir, None, None, away.is_some()).await;
         let p = match base == lake.url {
             true => pinning?,
             false => pinning.with_context(|| match &away {
@@ -183,14 +228,18 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
         let schemas = schemas_taken(&of, p.schemas)?; // (refused here, after the pin: the error path lets it go)
         for (id, b) in inherited.lakes.iter() {
             // (the key their pins give this branch, not the one its base gave it)
-            let key = pin_in(lake, &b.url, &dir, Some(b.ms), None).await?.key;
+            let key = pin_in(lake, &b.url, &dir, Some(b.ms), None, b.away()).await?.key;
             if let Some(e) = lakes.get_mut(id) {
                 e.key = key.clone();
+                e.sealed = None; // (the inherited sealed key is the base branch's, never ours)
             }
             pinned.push((b.url.clone(), key));
         }
         let (endpoint, read_only) = (away.as_ref().and_then(|r| r.endpoint.clone()), away.as_ref().is_some_and(|r| r.read_only));
-        lakes.insert(id_of(&base), Base { url: base.clone(), ms: p.ms, key: p.key, endpoint, read_only });
+        lakes.insert(id_of(&base), Base { url: base.clone(), ms: p.ms, key: p.key, sealed: None, endpoint, read_only });
+        for b in lakes.values_mut() {
+            b.seal()?; // (sealed before they leave this node: the request to the branch's leader carries them so)
+        }
         // (the bucket keys of the bases on other servers, which the branch reads with)
         let urls: Vec<String> = lakes.values().filter(|b| b.read_only).map(|b| b.url.clone()).collect();
         let secrets = crate::ext::lent(lake, &urls).await?;
@@ -252,11 +301,11 @@ struct Pinned {
 }
 
 /// Pin `branch` in the lake at `at`: here, or through its own leader (invariant 20), with `key` when
-/// it has one (a branch's renewal, `keyed`).
-async fn pin_in(lake: &Lake, at: &str, branch: &str, ms: Option<u64>, key: Option<&str>) -> Result<Pinned> {
+/// it has one (a branch's renewal, `keyed`). `lease`: the branch is on another server (`pin`).
+async fn pin_in(lake: &Lake, at: &str, branch: &str, ms: Option<u64>, key: Option<&str>, lease: bool) -> Result<Pinned> {
     let v = match at == lake.url {
-        true => pin(lake, branch, ms).await?,
-        false => Box::pin(crate::write::send_as(at, Request::Ddl(Ddl::Pin { lake: branch.into(), ms }), key)).await?,
+        true => pin(lake, branch, ms, lease).await?,
+        false => Box::pin(crate::write::send_as(at, Request::Ddl(Ddl::Pin { lake: branch.into(), ms, lease }), key)).await?,
     };
     Ok(Pinned {
         ms: v["ms"].as_u64().context("a pin's time")?,
@@ -275,14 +324,18 @@ async fn unpin_in(lake: &Lake, at: &str, branch: &str, key: Option<&str>) -> Res
 }
 
 /// A base's leader: keep every file live at `ms` (now, less a margin, unless a branch of a branch
-/// carries its own base's on) while `branch` is there.
-pub async fn pin(lake: &Lake, branch: &str, ms: Option<u64>) -> Result<Value> {
+/// carries its own base's on) while `branch` is there. A lease (a branch on another server) goes when
+/// it isn't renewed (`lapse`).
+pub async fn pin(lake: &Lake, branch: &str, ms: Option<u64>, lease: bool) -> Result<Value> {
     let (key, now) = (pin_key(branch), crate::log::now_ms());
     let mut ms = ms.unwrap_or(now.saturating_sub(MARGIN_MS));
+    // (a user who may only clone is a server elsewhere's: its pin is a lease, and once one, always)
+    let mut lease = lease || crate::auth::limited().and_then(|a| a.clones()).is_some();
     if let Some(p) = lake.cat.get::<Pin>(&key).await? {
         ms = ms.min(p.ms);
+        lease |= p.lease;
     }
-    lake.cat.commit(vec![(key, json(&Pin { lake: branch.into(), ms, at_ms: now }))], &[]).await?;
+    lake.cat.commit(vec![(key, json(&Pin { lake: branch.into(), ms, at_ms: now, lease }))], &[]).await?;
     let mut out = j!({"pinned": branch, "ms": ms, "at_ms": now, "key": key_for(lake, branch).await?});
     // (a user granted CLONE on some schemas only: the branch takes only those, and says so here)
     if let Some(s) = crate::auth::limited().and_then(|a| a.clones()).filter(|s| !s.is_empty()) {
@@ -306,7 +359,7 @@ pub async fn key_for(lake: &Lake, branch: &str) -> Result<String> {
 /// one (a key makes no pin, nor an older one: a branch keeps no more of its base than it was given).
 pub async fn keyed(lake: &Lake, d: &Ddl, key: &str) -> Result<()> {
     let branch = match d {
-        Ddl::Pin { lake: b, ms: None } | Ddl::Unpin { lake: b } => b,
+        Ddl::Pin { lake: b, ms: None, .. } | Ddl::Unpin { lake: b } => b,
         _ => bail!("permission denied: a branch's key renews or lets go of its own pin, and does nothing else"),
     };
     let want = key_for(lake, branch).await?;
@@ -417,13 +470,76 @@ pub async fn pins(lake: &Lake) -> Result<Option<(u64, u64)>> {
 }
 
 /// Hourly, on a base's leader: a pin whose branch is gone (its lake deleted without a DROP
-/// DATABASE here) goes too. An hour's grace: a pin is taken just before its branch is made.
+/// DATABASE here) goes too. An hour's grace: a pin is taken just before its branch is made. These are
+/// the pins of branches on this lake's own storage, the only ones it can look at; a pin on lease (a
+/// branch on another server) goes by `lapse`.
 pub async fn sweep(lake: &Lake) -> Result<()> {
     let now = crate::log::now_ms();
     for (key, p) in lake.cat.scan::<Pin>("pn/", "pn0").await? {
         if p.at_ms + 3_600_000 < now && !crate::ddl::has_catalog(&p.lake).await.unwrap_or(true) {
             lake.cat.commit(vec![], &[key]).await?;
         }
+    }
+    Ok(())
+}
+
+/// How long a base keeps a pin on lease that isn't renewed (`PONDRA_PIN_LEASE_SECS`, 14 days).
+fn lease_ms() -> u64 { secs("PONDRA_PIN_LEASE_SECS", 14 * 86_400) * 1000 }
+
+/// How often a branch renews its pins on lease (`PONDRA_PIN_RENEW_SECS`, an hour).
+pub fn renew_every() -> std::time::Duration { std::time::Duration::from_secs(secs("PONDRA_PIN_RENEW_SECS", 3600)) }
+
+fn secs(name: &str, default: u64) -> u64 { std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default) }
+
+/// A base's leader, each retention round: a pin on lease that wasn't renewed within
+/// `PONDRA_PIN_LEASE_SECS` goes. Its branch is on another server, which this lake can't look at
+/// (`sweep`), so a branch nobody uses there any more stops holding this lake's files.
+pub async fn lapse(lake: &Lake) -> Result<()> {
+    let now = crate::log::now_ms();
+    let lapsed: Vec<(String, Pin)> = lake.cat.scan::<Pin>("pn/", "pn0").await?.into_iter().filter(|(_, p)| p.lease && p.at_ms + lease_ms() < now).collect();
+    if lapsed.is_empty() {
+        return Ok(());
+    }
+    for (_, p) in &lapsed {
+        eprintln!("{}'s pin let go: not renewed for {} s (PONDRA_PIN_LEASE_SECS)", p.lake, lease_ms() / 1000);
+    }
+    lake.cat.commit(vec![], &lapsed.into_iter().map(|(k, _)| k).collect::<Vec<_>>()).await?;
+    Ok(())
+}
+
+/// Leader, every `renew_every()`: the pins on lease this lake holds as a branch, and those of the
+/// branches attached here (a branch nobody leads is renewed by whoever uses it), renewed with each
+/// branch's own key, so their bases keep their files (`lapse`). Only bases on other servers, and
+/// only with the key: a renewal never makes a pin that was let go.
+pub async fn renew(lake: &Lake) {
+    let mut lakes = vec![lake.arc()];
+    lakes.extend(lake.attached.read().unwrap().iter().map(|(_, l)| l.clone()));
+    for l in lakes {
+        let Ok(Some(b)) = l.cat.get::<Bases>(BASES).await else { continue };
+        for base in b.lakes.values().filter(|b| b.away()) {
+            let renewed = async {
+                let Some(key) = base.key()? else { return Ok(()) };
+                pin_in(&l, &base.url, &b.me, None, Some(&key), true).await.map(|_| ())
+            };
+            if let Err(e) = renewed.await {
+                eprintln!("renewing {}'s pin in {}: {e:#} (a pin let go isn't made again: what the branch reads of it may be gone; DROP DATABASE it and CLONE again)", b.me, base.url);
+            }
+        }
+    }
+}
+
+/// Leader: this branch's keys in its bases sealed by the master key once every node shares one, and
+/// wrapped again after it changed, as the lake's own keys are (`users::seal_keys`).
+pub async fn seal_keys(lake: &Lake) -> Result<()> {
+    let Some(mut b) = lake.cat.get::<Bases>(BASES).await? else { return Ok(()) };
+    let mut changed = false;
+    for base in b.lakes.values_mut() {
+        changed |= base.seal()?;
+    }
+    if changed {
+        crate::format::require(lake, crate::users::SEALED, "a branch's keys, sealed").await?;
+        lake.cat.commit(vec![(BASES.into(), json(&b))], &[]).await?;
+        eprintln!("this branch's keys in its bases are sealed by its master key now");
     }
     Ok(())
 }
@@ -440,7 +556,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     }
     ensure!(lake.cat.scan_raw("t/", "t0").await?.is_empty(), "{} holds tables: a branch is made into a new database", lake.url);
     for b in m.lakes.values().filter(|b| b.read_only) {
-        crate::ext::reach_with(&m.secrets, &b.url, true, b.endpoint.as_deref())?; // (its key and its leader, before it is read)
+        crate::ext::reach_base(&m.secrets, &b.url, b.endpoint.as_deref())?; // (its key and its leader, before it is read)
     }
     let base = Lake::open(&m.base, false, false).await.with_context(|| format!("opening {}", m.base))?;
     let id = id_of(&m.base);
@@ -530,6 +646,10 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     puts.push(("b".into(), json(&block.max(lake.cat.get::<u64>("b").await?.unwrap_or(0)))));
     let me = Bases { base: m.base.clone(), at_ms: crate::log::now_ms(), me: m.me.clone(), lakes: m.lakes.clone(), schemas: m.schemas.clone(), data: m.data, owner: m.owner_name.clone() };
     puts.push((BASES.into(), json(&me)));
+    if m.lakes.values().any(|b| b.sealed.is_some()) || m.secrets.iter().any(|(_, s)| s.lent) {
+        // (a release before it finds no key in a base, and can't renew its pin; and would let a statement use a lent key)
+        crate::format::require(lake, crate::users::SEALED, "a branch's keys, sealed and lent").await?;
+    }
     lake.cat.start_after(commit).await;
     lake.cat.commit(puts, &[]).await?;
     load(lake).await?;
@@ -577,8 +697,15 @@ async fn copy(from: &Lake, to: &Lake, path: String) -> Result<()> {
 /// `DROP DATABASE` of a branch: its pins in its bases go once its lake has.
 pub async fn release(lake: &Lake, bases: &Bases) {
     for b in bases.lakes.values() {
-        if let Err(e) = unpin_in(lake, &b.url, &bases.me, b.key.as_deref()).await {
-            eprintln!("releasing {}'s pin in {}: {e:#} (the base's hourly sweep lets it go)", bases.me, b.url);
+        let key = match b.url == lake.url {
+            true => None, // (a base on this node lets go without a key)
+            false => b.key().unwrap_or_else(|e| {
+                eprintln!("{e:#}");
+                None
+            }),
+        };
+        if let Err(e) = unpin_in(lake, &b.url, &bases.me, key.as_deref()).await {
+            eprintln!("releasing {}'s pin in {}: {e:#} (the base lets it go by itself: its hourly sweep, or the lease running out)", bases.me, b.url);
         }
     }
 }
@@ -634,8 +761,9 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
     let me: Bases = lake.cat.get(BASES).await?.with_context(|| format!("{} isn't a branch: REFRESH brings a branch's tables up to its base's", crate::ddl::lake_name(lake)))?;
     // A version of the base from after this statement: the pin written again (its time kept: the
     // files it lists now are newer) shows in it.
-    let key = me.lakes.get(&id_of(&me.base)).and_then(|b| b.key.clone());
-    let at = pin_in(lake, &me.base, &me.me, None, key.as_deref()).await?.at_ms;
+    let key = me.lakes.get(&id_of(&me.base)).map(Base::key).transpose()?.flatten();
+    let away = me.lakes.get(&id_of(&me.base)).is_some_and(Base::away);
+    let at = pin_in(lake, &me.base, &me.me, None, key.as_deref(), away).await?.at_ms;
     let base = Lake::open(&me.base, false, false).await.with_context(|| format!("opening {}", me.base))?;
     let snap = snapshot(&base, &pin_key(&me.me), at).await?;
     let number = |k: &str| snap.get(k).and_then(|v| serde_json::from_slice::<u64>(v).ok()).unwrap_or(0);

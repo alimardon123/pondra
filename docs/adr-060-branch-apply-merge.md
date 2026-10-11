@@ -67,6 +67,13 @@ change.
   once the database has views of its own following the refreshed tables, and it can't keep
   migrations' records.
 - **A database of its own** (prod) is made empty on its first apply.
+- **A brand-new database is made as the files are now** (Alimardon chose "Record, don't run",
+  2026-10-11): its objects come from `objects/` as they are, so its migrations, which changed what older
+  files made, are recorded as run and never run (a rename has nothing to rename there). The rows it
+  starts with are in `seeds/`, loaded once into a new database, as dbt, Rails and Prisma do. New means
+  nothing in the schemas the project's objects are in (another schema's tables don't count) and nothing
+  applied, or only its first applies, which failed. A clone is never new: it carries its base's rows and
+  its record of migrations done.
 - **On `main`**, `pondra apply` names the environments to choose from, instead of guessing.
 
 ### 4. One server or one per environment, the same commands
