@@ -90,6 +90,7 @@ mod service;
 mod spill;
 mod sparksql;
 mod spmd;
+mod status;
 mod store;
 mod sync;
 mod sys;

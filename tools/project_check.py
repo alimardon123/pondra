@@ -14,6 +14,9 @@
 - `pondra apply test`: a clone made once and kept; `--fresh` makes it again; a name nobody declared is a branch of prod;
 - `pondra apply fresh_prod`: a database nobody made is made on its server, and applied;
 - `pondra branch NAME`, `pondra branch` (the list), `pondra branch -d NAME`, `pondra diff`: a branch's view and rows;
+- `pondra status` and `pondra capture`: a table renamed outside an apply (a column too), a view made and one changed
+  there are listed with who and when; capture writes them into the files, and the rename is a migration recorded as
+  run where it was made, which the other database then runs (ADR-060 §7);
 - `pondra apply --watch --applies 2`: each save applied and tested; `--watch` on prod is refused;
 - `CALL plan(…)` and `CALL apply(…)` on a project kept in the workspace; `pondra.applies`;
 - `pondra switch NAME`: a branch that exists is checked out with its database made; one that doesn't is refused;
@@ -25,7 +28,7 @@
 
 Prints the checks as JSON and exits 1 if one fails (the lakes and the project are then kept in --work).
 """
-import argparse, json, os, re, shutil, subprocess, sys, tempfile, time, tomllib, urllib.request, urllib.error
+import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile, time, tomllib, urllib.request, urllib.error
 import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -356,6 +359,11 @@ def project_check(bin, work, port):
     checks["pondra apply fresh_prod (no clone, not there yet): a new database on the server, applied, its table there"] = \
         "a new database on" in made_out and "fresh_prod: apply" in made_out and rows("fresh_prod", "SELECT count(*) FROM sales.orders") == [(0,)]
 
+    # A table with rows in prod, for the changes made outside an apply in the branch below.
+    write("objects/sales/notes.sql", "CREATE TABLE sales.notes (\n  id BIGINT,\n  body VARCHAR\n);\n")
+    pondra("apply", "prod")
+    q("prod", "INSERT INTO sales.notes VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+
     # A branch: a Git branch and a database of its name, prod as it is; its own view and rows.
     made = pondra("branch", "orders-by-channel")
     checks["pondra branch: a git branch and a database named after it, prod as it is"] = "a branch with prod's data" in made \
@@ -370,6 +378,76 @@ def project_check(bin, work, port):
     checks["pondra diff: the branch's new object and its rows apart from prod's"] = "`+` objects/sales/by_channel.sql" in diff and "| sales.orders | 1 | 0 | 1 |" in diff
     if not checks["pondra diff: the branch's new object and its rows apart from prod's"]:
         checks["(diff)"] = diff
+    # Changes made in the database outside an apply (ADR-060 §7): a table renamed, a column renamed in it, a view made,
+    # a view changed, and a view with a value (`$big`) changed. `pondra status` lists them with who and when,
+    # `pondra capture` writes them into the files (the rename as a migration, recorded as run in this database),
+    # and an apply in prod runs that migration.
+    q("orders_by_channel", "ALTER TABLE sales.notes RENAME TO memos")
+    q("orders_by_channel", "ALTER TABLE sales.memos RENAME COLUMN body TO text")
+    q("orders_by_channel", "CREATE VIEW sales.scratch AS SELECT count(*) AS n FROM sales.memos")
+    q("orders_by_channel", "CREATE OR REPLACE VIEW sales.by_channel AS SELECT channel, count(*) AS n, sum(total) AS total FROM sales.orders GROUP BY channel")
+    q("orders_by_channel", "CREATE OR REPLACE VIEW sales.big AS SELECT * FROM sales.orders WHERE total > 60")
+    deadline = time.time() + 20
+    while q("orders_by_channel", "SELECT count(*) AS n FROM pondra.history WHERE statement LIKE '%sales.scratch%'")[0]["n"] == 0 and time.time() < deadline:
+        time.sleep(0.5)
+    status = pondra("status")
+    lines = status.splitlines()
+    to_apply = status.split("Changed outside")[0]
+    scratch = next((l for l in lines if "? view" in l and "sales.scratch" in l), "")
+    checks["pondra status: a table renamed outside an apply with a column renamed (who and when), a view made, a view changed, none of them in what an apply does"] = \
+        "memos" not in to_apply and any("↷ table" in l and "sales.notes" in l and "renamed to sales.memos" in l and "body → text" in l for l in lines) \
+        and bool(scratch) and re.search(r"· .+, \d{4}-\d\d-\d\d \d\d:\d\d:\d\d", scratch) is not None \
+        and any("~ view" in l and "sales.by_channel" in l for l in lines)
+    if not checks["pondra status: a table renamed outside an apply with a column renamed (who and when), a view made, a view changed, none of them in what an apply does"]:
+        checks["(status)"] = status
+    cap = pondra("capture", "sales.memos", "sales.scratch", "sales.by_channel")
+    notes = open(os.path.join(proj, "objects/sales/notes.sql")).read()
+    channels = open(os.path.join(proj, "objects/sales/channels.sql")).read()
+    migrations = glob.glob(os.path.join(proj, "migrations", "*-rename-memos.sql"))
+    migration = open(migrations[0]).read() if len(migrations) == 1 else ""
+    checks["pondra capture sales.memos sales.scratch sales.by_channel: each written into its file, the rename a migration recorded as run here"] = \
+        os.path.exists(os.path.join(proj, "objects/sales/scratch.sql")) and "sales.memos" in notes and "text" in notes and "body" not in notes \
+        and "sum(total)" in channels and "RENAME TO memos" in migration and "RENAME COLUMN body TO text" in migration \
+        and "recorded as run" in cap and "003-rename-memos.sql" in cap
+    if not checks["pondra capture sales.memos sales.scratch sales.by_channel: each written into its file, the rename a migration recorded as run here"]:
+        checks["(capture)"] = [cap, notes, channels, migrations]
+    big = pondra("capture", "sales.big", ok=False)
+    checks["pondra capture sales.big: refused, saying its statement uses $big and to change it by hand"] = "$big" in big and "by hand" in big
+    plan = pondra("plan")
+    checks["pondra plan after the capture: nothing about notes, memos, scratch, by_channel or their migration; sales.big still changed outside an apply"] = \
+        not any(w in plan for w in ["sales.notes", "sales.memos", "sales.scratch", "sales.by_channel", "rename-memos"]) and "sales.big" in plan and "changed outside an apply" in plan
+    if not checks["pondra plan after the capture: nothing about notes, memos, scratch, by_channel or their migration; sales.big still changed outside an apply"]:
+        checks["(plan)"] = plan
+    pondra("apply", "prod")
+    checks["pondra apply prod: the migration runs there, the rows renamed, the view made on the new name"] = \
+        rows("prod", "SELECT count(*), min(text) FROM sales.memos") == [(3, "a")] and rows("prod", "SELECT n FROM sales.scratch") == [(3,)]
+    # A view made here and captured, then a view dropped here: `pondra status` says it was dropped outside an apply.
+    # The view must be in an apply first (what an apply made is what status compares with), which also puts
+    # sales.big's drift back.
+    q("orders_by_channel", "CREATE VIEW sales.gone_soon AS SELECT 1 AS x")
+    every = pondra("capture", ok=False)
+    checks["pondra capture (no name): the view made here written into its file; sales.big refused by name"] = \
+        os.path.exists(os.path.join(proj, "objects/sales/gone_soon.sql")) and "sales.big" in every and "$big" in every
+    pondra("apply")
+    q("orders_by_channel", "DROP VIEW sales.gone_soon")
+    gone = pondra("status")
+    checks["pondra status: a view dropped outside an apply shown as dropped, and pondra capture sales.gone_soon removes its file"] = \
+        any("+ view" in l and "sales.gone_soon" in l and "dropped outside an apply" in l for l in gone.splitlines())
+    pondra("capture", "sales.gone_soon")
+    checks["…its file is gone: nothing else in it"] = not os.path.exists(os.path.join(proj, "objects/sales/gone_soon.sql"))
+    if not checks["pondra status: a view dropped outside an apply shown as dropped, and pondra capture sales.gone_soon removes its file"]:
+        checks["(dropped)"] = gone
+    # A column added to a table under its own name: listed (the plan's refusal said instead), and once captured, gone
+    # from the status.
+    q("orders_by_channel", "ALTER TABLE sales.memos ADD COLUMN tag VARCHAR")
+    added = pondra("status")
+    pondra("capture", "sales.memos")
+    clean = pondra("status")
+    checks["pondra status: a column added outside an apply listed, not refused; captured, nothing about the table"] = \
+        any("~ table" in l and "sales.memos" in l and "added tag" in l for l in added.splitlines()) and "refused" not in added \
+        and "sales.memos" not in clean and "tag" in open(os.path.join(proj, "objects/sales/notes.sql")).read()
+    if not checks["pondra status: a column added outside an apply listed, not refused; captured, nothing about the table"]:
+        checks["(added)"] = [added, clean]
     os.remove(os.path.join(proj, "objects/sales/channels.sql"))
 
     # A second branch, then the list: * on the current git branch's database.

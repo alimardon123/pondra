@@ -90,6 +90,18 @@ enum Touch {
     Database(Option<String>, &'static str), // a database refreshed or dropped (None: this one)
 }
 
+/// The objects a statement changes, by the names `apply` keys them by (`status.rs` reads who changed what).
+pub(crate) fn named(sql: &str) -> Vec<String> {
+    let Some(stmt) = crate::write::parse(sql) else { return vec![] };
+    touched(&stmt).into_iter().filter_map(|t| match t {
+        Touch::Object(n) => {
+            let (s, t) = ddl::split(&n);
+            Some(ddl::join(s, t))
+        }
+        _ => None,
+    }).collect()
+}
+
 /// What a statement changes. Rows, and what a session keeps, change no object.
 fn touched(stmt: &Stmt) -> Vec<Touch> {
     match stmt {

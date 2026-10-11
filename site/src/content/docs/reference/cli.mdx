@@ -358,6 +358,8 @@ A project is a folder with `pondra.toml`, `objects/`, `migrations/`, `seeds/` an
 |---|---|
 | `pondra init [DIR]` | start a project: pondra.toml, objects/, migrations/, seeds/, tests/, and a `.gitignore` that leaves out `lake/` (`--name`) |
 | `pondra plan [ENV]` | what an apply would change, and what it refuses (exit 1 if anything is refused) |
+| `pondra status [ENV]` | what differs, as `git status` does: to apply, changed outside an apply (renamed, dropped, or columns changed), and untracked; who changed each and when (exit 1 if anything is refused) |
+| `pondra capture [NAME…]` | write the chosen changed and untracked objects into the files (all when no name is given): the database's statement, a new file, or the declaration taken out for a dropped one; a renamed table or column gets a migration, recorded as run where it was made (exit 1 if anything is refused) |
 | `pondra apply [ENV]` | the plan, then each step, then tests/ (exit 1 if it fails); the database is made first if it isn't there |
 | `pondra apply local` | this machine's own database: the lake in the project's `lake/` folder, which `pondra` there opens as its shell; no server (pondra.toml's `[env.local]` says otherwise) |
 | `pondra apply --watch` | apply again on every save of the project's files; Ctrl-C stops (refused on prod, `main` and protected databases); a lake's node stays up while it watches, its console at the address printed |

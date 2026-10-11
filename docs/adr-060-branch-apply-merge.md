@@ -137,7 +137,10 @@ the other servers, since only the person setting it up holds a read-only key of 
 
   `pondra capture [NAME…]` writes chosen objects into `objects/`, one object to a file, in the
   author's own text when one statement made it. In the console, an **Add to project** button sits by
-  a CREATE. On prod, protection refuses such changes anyway.
+  a CREATE. On prod, protection refuses such changes anyway. Both are built (`src/status.rs`): a
+  rename is found by the table's folder and its columns' stored names, which every apply records
+  (`Record.shapes`), so no ids are needed, and a rename or a dropped column becomes a migration
+  recorded as run where it was made.
 - **Plans look only at the schemas the project's files use**, so two projects on one prod never see
   each other's objects as drift.
 
