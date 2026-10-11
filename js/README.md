@@ -33,6 +33,19 @@ await db.call("send_report", "2026-09-27");              // a stored procedure (
 await db.close();
 ```
 
+A frame is a query written in JavaScript: each step is a CTE of the SQL the node runs, so the plan
+and the answer are the SQL's. Names are Polars' (`withColumns`, `groupBy`, `isNull`); nothing runs
+until it is awaited, or written with `writeTable`.
+
+```js
+import { col, local } from "pondra";
+
+const db = await local("lake");
+const big = db.table("events").filter(col("amount").gt(3)).groupBy("user").agg(col("amount").sum().alias("total"));
+await big.writeTable("big_spenders");                     // a table made from the frame
+console.log(await db.readParquet("sales/*.parquet").limit(5)); // files as a frame: awaiting runs it
+```
+
 `npx pondra` opens a SQL shell on `./lake`, and `npx pondra serve lake` runs a node with its
 console at `http://localhost:8080`.
 

@@ -9,11 +9,16 @@
 //   console.log(await db.sql("SELECT user, sum(amount) AS total FROM events WHERE amount > $min GROUP BY user", { min: 1 }));
 //   await db.call("load_day", "2026-09-27");             // a stored procedure (what it prints: db.notices)
 //   for await (const row of db.watch("events")) { … }   // new rows as they commit
+//   const top = db.table("events").filter(col("amount").gt(100)).groupBy("user").agg(col("amount").sum());
+//   for (const row of await top) …                       // a frame: a query, run when awaited (frame.js)
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
+import { Frame, quote, scan } from "./frame.js";
+
+export { Expr, Frame, Merge, all, coalesce, col, concat, concatStr, count, first, fn, last, len, lit, max, mean, median, min, nUnique, sqlExpr, sum, when } from "./frame.js";
 
 // A node answered that it ran nothing, or that it couldn't reach the bucket or another node: a
 // request that may be sent again goes to the next node. (57P01 admin_shutdown, 57P03
@@ -27,6 +32,30 @@ const isChange = (sql) => { const c = code(sql); return !c.includes(";") && /^\s
 const quoted = (v) => (typeof v === "number" ? String(v) : `'${String(v).replace(/'/g, "''")}'`); // (a SQL literal: a task's schedule and options)
 const varName = (n) => { if (!/^[A-Za-z_]\w*$/.test(n)) throw new Error(`${n}: not a variable's name (letters, digits and _, not first a digit)`); return n; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Rows as NDJSON. A Date goes as its UTC time without a zone, the text a TIMESTAMP reads (JSON's own
+// form would end in Z, which a TIMESTAMP has no place for).
+const ndjson = (rows) => rows.map((r) => JSON.stringify(r, function (k, v) { return this[k] instanceof Date ? this[k].toISOString().replace("T", " ").replace("Z", "") : v; })).join("\n") + "\n";
+
+/** The SQL type of a column from its values: whole numbers BIGINT, fractions and mixed numbers DOUBLE,
+ * text VARCHAR, true and false BOOLEAN, dates TIMESTAMP. Nulls say nothing; a column of nothing is text. */
+function typeOfColumn(name, values) {
+  const types = new Set();
+  for (const v of values) {
+    if (v === null || v === undefined) continue;
+    if (typeof v === "number" && !Number.isFinite(v)) throw new Error(`${name}: ${v} has no JSON form (NaN and the infinities are not sent)`);
+    const t = typeof v === "boolean" ? "BOOLEAN" : typeof v === "string" ? "VARCHAR" : v instanceof Date ? "TIMESTAMP"
+      : typeof v === "number" ? (Number.isSafeInteger(v) ? "BIGINT" : "DOUBLE") : null;
+    if (!t) throw new Error(`${name}: ${typeof v} values have no column type here (write text, numbers, booleans or dates)`);
+    types.add(t);
+  }
+  if (types.size === 2 && types.has("BIGINT") && types.has("DOUBLE")) return "DOUBLE";
+  if (types.size > 1) throw new Error(`${name}: ${[...types].join(" and ")} values in one column`);
+  return types.size ? [...types][0] : "VARCHAR";
+}
+
+/** The columns of some rows: each name any row has, in the order they first come, with its type. */
+const columnsOf = (rows) => [...new Set(rows.flatMap((r) => Object.keys(r)))].map((name) => [name, typeOfColumn(name, rows.map((r) => r[name]))]);
 
 export class Pondra {
   /** `url`: a node, or several (an array, or separated by commas): any of a cluster's nodes
@@ -91,14 +120,63 @@ export class Pondra {
     }
   }
 
-  /** A query's rows, as objects; for other statements (CREATE, INSERT, UPDATE, DELETE, CALL,
-   * several at once), the last one's outcome. `params`: values for `$name` in it. */
-  async sql(query, params) {
+  /** A query, as a frame: nothing runs until it is awaited (its rows), or asked for (`item()`,
+   * `writeTable()`, `toView()`…). Any other statement (CREATE, INSERT, UPDATE, DELETE, CALL, several at
+   * once) runs now, and awaiting it gives the last one's outcome. `params`: values for `$name` in it. */
+  sql(query, params) {
+    return isQuery(query) ? Frame.fromSql(this, query, params) : this._statement(query, params);
+  }
+
+  async _statement(query, params) {
     const changes = isChange(query);
     const path = changes ? `/sql?job=${this.producer}-${++this.jobs}` : "/sql"; // (sent again after a node went, a change is applied once)
-    const again = changes || isQuery(query);
-    if (!params) return (await this.request("POST", path, query, undefined, again)).json();
-    return (await this.request("POST", path, JSON.stringify({ sql: query, params }), "application/json", again)).json();
+    return (await this._post(path, query, params, changes)).json();
+  }
+
+  /** A query's answer as the node sends it: JSON rows, or `format` "typed", "arrow" or "table". */
+  _send(query, params, format = null) {
+    return this._post(format ? `/sql?format=${format}` : "/sql", query, params, isQuery(query));
+  }
+
+  /** The text of a statement, or with `params` its JSON `{ sql, params }` (`$name`s bound). */
+  _post(path, query, params, again) {
+    if (params === undefined || params === null) return this.request("POST", path, query, undefined, again);
+    return this.request("POST", path, JSON.stringify({ sql: query, params }), "application/json", again);
+  }
+
+  /** A table (or a view) as a frame: `db.table("orders").filter(col("qty").gt(2))`. */
+  table(name) {
+    return new Frame(this, `SELECT * FROM ${name}`, { rel: name, table: name });
+  }
+
+  // Files as frames, read where the node runs each time the frame runs (ADR-026). `source`: a path, a
+  // URL (s3://, gs://, az://, https://), a folder, a glob or a list of them. Options are named as
+  // Polars' readers name them (`hivePartitioning`, `separator`, `hasHeader`, `snapshotId`) or as SQL's
+  // read_* do (`delim`, `header`…).
+  readParquet(source, options = {}) { return scan(this, "read_parquet", source, options); }
+  readCsv(source, options = {}) { return scan(this, "read_csv", source, options); }
+  readJson(source, options = {}) { return scan(this, "read_json", source, options); }
+  readNdjson(source, options = {}) { return this.readJson(source, options); }
+  readDelta(source, options = {}) { return scan(this, "read_delta", source, options); }
+  readIceberg(source, options = {}) { return scan(this, "read_iceberg", source, options); }
+
+  /** Rows into a table: a frame, a query's SQL text, or an array of row objects. `mode`: "create" (a
+   * new table: an error if it's there), "append", or "replace" (dropped, then made). Rows make the
+   * table's columns from their values (see `typeOfColumn`), then are appended exactly once. */
+  async writeTable(name, data, { mode = "create" } = {}) {
+    if (!["create", "append", "replace"].includes(mode)) throw new Error(`mode ${mode}: create, append or replace`);
+    if (data instanceof Frame) return data.writeTable(name, { mode });
+    if (typeof data === "string") {
+      if (!isQuery(data)) throw new Error("writeTable(name, text): the text is a query (SELECT …)");
+      return this.sql(data).writeTable(name, { mode });
+    }
+    if (!Array.isArray(data)) throw new Error("writeTable(name, data): data is a frame, a query's text, or an array of row objects");
+    if (mode === "append") return data.length ? this.append(name, data) : null;
+    if (!data.length) throw new Error("writeTable: no rows, so no columns to make the table with (write a frame, or some rows)");
+    const columns = columnsOf(data);
+    if (mode === "replace") await this.sql(`DROP TABLE IF EXISTS ${name}`);
+    await this.sql(`CREATE TABLE ${name} (${columns.map(([c, t]) => `${quote(c)} ${t}`).join(", ")})`);
+    return this.append(name, data);
   }
 
   /** A file's statements in order, `$name` taking `params.name`: a `.sql` file here (or SQL itself)
@@ -180,8 +258,7 @@ export class Pondra {
    * not applied twice (for up to the connection's `retrySecs`). */
   async append(table, rows) {
     const seq = ++this.seq;
-    const body = rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
-    return (await this.request("POST", `/append/${table}?producer=${this.producer}&seq=${seq}`, body, "application/x-ndjson", true)).json();
+    return (await this.request("POST", `/append/${table}?producer=${this.producer}&seq=${seq}`, ndjson(rows), "application/x-ndjson", true)).json();
   }
 
   /** A view others read by name, as SQL's `CREATE VIEW` and Python's `db.view` make one: `sql`
