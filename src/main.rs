@@ -31,6 +31,7 @@ mod flight;
 mod fresh;
 mod finish;
 mod fsum;
+mod git;
 mod hot;
 mod index;
 mod types;

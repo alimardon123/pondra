@@ -495,5 +495,47 @@ SELECT name, protected, lifted_at, lifted_by FROM pondra.databases;
 A branch of a protected database isn't protected: `CREATE DATABASE dev CLONE prod` gives dev a
 database whose objects change as dev's own, and prod keeps its protection.
 
+## Git folders
+
+A project kept in the workspace can be a Git folder: a folder paired with a branch of a GitHub
+repository. The node speaks to GitHub itself, so the console, or anything that runs SQL, commits the
+project's files and opens pull requests with no `git` installed.
+
+Each person keeps their own token as a secret, so commits and pull requests are theirs. Its `SCOPE`
+says which repositories it may go to:
+
+```sql norun
+CREATE SECRET ann_git (TYPE git, TOKEN 'ghp_…', SCOPE 'https://github.com/acme');
+GRANT USAGE ON SECRET ann_git TO ann;
+```
+
+Then, in SQL from any door:
+
+```sql norun
+CALL git_checkout('sales', repository => 'https://github.com/acme/sales', branch => 'main');
+CALL plan('files/sales');                                -- the project checked out, as any other
+SELECT * FROM pondra.git_status('sales');               -- what changed here: added, modified, deleted
+CALL git_commit('sales', 'Discounts by channel');        -- every changed file, on top of main
+CALL git_commit('sales', 'Discounts', paths => ['objects/sales/discounts.sql']);   -- just this one
+CALL git_pull('sales');                                  -- what others pushed
+CALL git_checkout('sales', branch => 'discounts');       -- a branch the repository lacks: made here
+CALL git_pull_request('sales', title => 'Discounts by channel');
+```
+
+- **A commit only moves the branch forward.** If someone pushed since the folder's commit,
+  `git_commit` is refused ("main moved on since 1a2b3c4 (the folder's commit): git_pull('sales') first"). `git_pull` brings their
+  files. A file changed both here and there is refused by name, and nothing changes: commit or undo
+  one side, then pull.
+- **The folder's record** is `.pondra-git.json`: the repository, the branch, the commit and each
+  file's git blob id, so `git_status` needs no network. Of two commits of one folder at once, the
+  second is told to try again.
+- **Another branch** is written over the folder, which is refused while it has changes not committed.
+  A branch the repository lacks is made at the folder's commit, and the changes carry over, as
+  `git switch -c` does.
+- **Rights.** `git_status` reads. The others write the workspace's files, so they need a write token.
+  A token goes only to a repository its `SCOPE` covers, over https (or to this machine), for those
+  with `USAGE` on it, and it is never used to read files.
+- **GitLab** is next: `PROVIDER 'gitlab'` is refused by name for now.
+
 Not here yet: a materialized view rebuilt beside the old one and swapped in, and Python files in
 `objects/`.

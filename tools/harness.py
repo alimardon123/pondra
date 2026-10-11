@@ -9327,6 +9327,12 @@ def doors():
     q("CREATE SCHEMA d_crm")  # (USE a schema: its one-part names are d_crm's)
     q("CREATE TABLE d_crm.d_only (x BIGINT)")
     q("INSERT INTO d_crm.d_only VALUES (1), (2), (3)")
+    q("CREATE MACRO d_twice(x) AS x * 2")
+    record = {"repository": "https://github.com/acme/sales", "branch": "main", "commit": "0" * 40, "files": {}}  # (a Git folder: its record, and a file not committed)
+    for path, body in (("d_git/.pondra-git.json", json.dumps(record)), ("d_git/a.sql", "SELECT 1;\n")):
+        c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("PUT", f"/files/{path}", body.encode())
+        assert c.getresponse().status == 200, path
     DOORS = ["http", "python", "postgres", "flight", "javascript", "mcp"]
     def features(i):
         k = 10 * i + 1  # (each door its own keys)
@@ -9342,6 +9348,8 @@ def doors():
             "transaction": (["BEGIN", f"UPDATE d_items SET qty = qty - 7 WHERE id = {k + 5}", f"UPDATE d_items SET qty = qty + 7 WHERE id = {k + 6}", f"SELECT qty FROM d_items WHERE id = {k + 5}", "COMMIT"],
                             lambda r: r[3] == [[93]] and q(f"SELECT count(DISTINCT _version) AS v, sum(qty) AS s FROM d_items WHERE id IN ({k + 5}, {k + 6})") == [{"v": 1, "s": 200}]),
             "USE a schema": (["USE d_crm", "SELECT count(*) AS n FROM d_only"], lambda r: r[-1] == [[3]]),
+            "a macro": (["SELECT d_twice(21) AS n"], lambda r: r[-1] == [[42]]),
+            "a Git folder's status": (["SELECT path, change FROM pondra.git_status('d_git')"], lambda r: r[-1] == [["a.sql", "added"]]),
         }
     def rows_of(x):
         return [list(r.values()) if isinstance(r, dict) else list(r) for r in x] if isinstance(x, list) else x
