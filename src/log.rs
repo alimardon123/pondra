@@ -11,6 +11,7 @@ use crate::cluster::http;
 use crate::store::*;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
+use futures::future::Either;
 use datafusion::arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use datafusion::arrow::ipc::{reader::StreamReader, CompressionType};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -248,13 +249,15 @@ impl Log {
     /// order, so a client can have several batches in flight (the Kafka protocol does).
     pub async fn queue(&self, table: String, src: Src, batch: RecordBatch) -> Result<impl std::future::Future<Output = Result<Ack>> + use<>> {
         if let Some(m) = self.lake.cat.get::<TableMeta>(&table_key(&table)).await? {
-            crate::constraints::door(&m, &table)?; // (an enforced UNIQUE's rows are checked on the leader)
+            if crate::constraints::checked(&m) {
+                return Ok(Either::Right(crate::constraints::queue(self.lake.clone(), &m, table, src, batch)?)); // (an enforced UNIQUE: checked on the leader, `constraints.rs`)
+            }
             crate::defaults::check(&m, &table, &batch)?; // (NOT NULL, whichever door the rows came in by)
         }
         let (ack, rx) = oneshot::channel();
         crate::metrics::add(&crate::metrics::ROWS_IN, batch.num_rows() as u64);
         self.tx.send(Append { table, src, batch, ack }).await.map_err(|_| anyhow!("log closed"))?;
-        Ok(async move { rx.await?.map_err(|e| anyhow!(e)) })
+        Ok(Either::Left(async move { rx.await?.map_err(|e| anyhow!(e)) }))
     }
 }
 
