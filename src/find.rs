@@ -7,6 +7,8 @@ use crate::ddl::{join, PUBLIC};
 use crate::objects::{expect_sql, ident, kind, lakes, list, list_sql, name_sql, sql_type, Object, KINDS, PARTS, PATTERNS};
 use crate::store::{table_key, Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
+use datafusion::prelude::SessionContext;
+use futures::future::BoxFuture;
 use serde_json::{json as j, Value};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -38,9 +40,7 @@ tokio::task_local! {
 pub async fn parts(lake: &Lake, objects: &[Object]) -> Result<Vec<PartRow>> {
     let depth = LISTING.try_with(|d| *d).unwrap_or(0);
     ensure!(depth < 4, "pondra.parts: views that search the catalog they are in (asked {depth} deep)");
-    // (Boxed: planning the views expands SQL, which may search the catalog, which comes back here.)
-    let listing: futures::future::BoxFuture<'_, Result<Vec<PartRow>>> = Box::pin(parts_of(lake, objects));
-    LISTING.scope(depth + 1, listing).await
+    LISTING.scope(depth + 1, parts_of(lake, objects)).await
 }
 
 /// Each object's parts, read from its own lake (`lakes`: this one and those attached that the
@@ -55,7 +55,7 @@ async fn parts_of(lake: &Lake, objects: &[Object]) -> Result<Vec<PartRow>> {
     let views: Vec<String> = objects.iter().filter(|o| matches!(o.kind, "view" | "external table")).map(|o| reached_as(o, &here)).collect();
     let session = match views.is_empty() {
         true => None,
-        false => crate::query::session(lake, &format!("SELECT * FROM {}", views.join(", ")), "").await.ok(),
+        false => session_for(lake, &views).await,
     };
     for o in objects {
         let Some(l) = lakes.get(&o.lake) else { continue };
@@ -154,7 +154,7 @@ async fn column_comments(l: &Lake, local: &str) -> Result<HashMap<String, String
 
 /// A stored view's or external table's columns, as its query names and types them now, with their
 /// comments, planned in `session` (every view's, made once) under the name it is reached by there.
-async fn view_parts(session: Option<&datafusion::prelude::SessionContext>, l: &Lake, o: &Object, here: &str, partial: Option<&HashSet<String>>) -> Result<Vec<PartRow>> {
+async fn view_parts(session: Option<&SessionContext>, l: &Lake, o: &Object, here: &str, partial: Option<&HashSet<String>>) -> Result<Vec<PartRow>> {
     let local = o.local();
     let columns = match session {
         Some(ctx) => columns_in(ctx, &reached_as(o, here)).await.unwrap_or_default(), // (a view that won't plan has no columns to list)
@@ -176,10 +176,18 @@ fn reached_as(o: &Object, here: &str) -> String {
     }
 }
 
-/// A relation's columns, as a query in `ctx` names and types them.
-async fn columns_in(ctx: &datafusion::prelude::SessionContext, named: &str) -> Result<Vec<(String, String)>> {
-    let df = crate::query::sql(ctx, &format!("SELECT * FROM {named} LIMIT 0")).await?;
-    Ok(df.schema().fields().iter().map(|f| (f.name().clone(), sql_type(&f.data_type().to_string()))).collect())
+/// One session with every view of `views` in it (None if it can't be made). (Boxed, as `columns_in`
+/// is: making it expands the views' SQL, which may search the catalog, which comes back here.)
+fn session_for<'a>(lake: &'a Lake, views: &'a [String]) -> BoxFuture<'a, Option<SessionContext>> {
+    Box::pin(async move { crate::query::session(lake, &format!("SELECT * FROM {}", views.join(", ")), "").await.ok() })
+}
+
+/// A relation's columns, as a query in `ctx` names and types them. Planned, not run (`LIMIT 0`).
+fn columns_in<'a>(ctx: &'a SessionContext, named: &'a str) -> BoxFuture<'a, Result<Vec<(String, String)>>> {
+    Box::pin(async move {
+        let df = crate::query::sql(ctx, &format!("SELECT * FROM {named} LIMIT 0")).await?;
+        Ok(df.schema().fields().iter().map(|f| (f.name().clone(), sql_type(&f.data_type().to_string()))).collect())
+    })
 }
 
 /// A routine's parameters, each with its type and its default.
