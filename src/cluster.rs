@@ -61,11 +61,13 @@ impl Cluster {
     pub async fn join(store: &Store, addr: &str, reader: bool) -> Result<Arc<Cluster>> {
         let leader = loop {
             match latest(store).await? {
-                Some(t) if t.addr == addr && !reader => {
-                    relock(&t); // ours, after a restart: the exec let go of its lock
+                Some(t) if reader => break t, // (we only read anyway)
+                // (ours, after a restart: the exec let go of its lock. A term that stepped down is over,
+                // and taken again it would look dead to everyone (`alive`): a new one, below)
+                Some(t) if t.addr == addr && !stepped_down(store, t.n).await => {
+                    relock(&t);
                     break t;
                 }
-                Some(t) if t.addr == addr || reader => break t, // ours, or we only read anyway
                 None if reader => break Term { n: 0, addr: String::new(), lock: String::new() },
                 Some(t) if alive(store, &t).await && !t.addr.is_empty() => break t,
                 Some(t) if alive(store, &t).await => tokio::time::sleep(Duration::from_secs(1)).await, // a `pondra sql` INSERT is recording: wait
