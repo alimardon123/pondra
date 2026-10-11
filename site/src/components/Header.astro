@@ -1,0 +1,35 @@
+---
+// Starlight's header with the site's tabs (tabs.ts) between the title and the search.
+import Search from 'virtual:starlight/components/Search';
+import SiteTitle from 'virtual:starlight/components/SiteTitle';
+import SocialIcons from 'virtual:starlight/components/SocialIcons';
+import ThemeSelect from 'virtual:starlight/components/ThemeSelect';
+import Tabs from './Tabs.astro';
+---
+
+<div class="header">
+  <div class="title-wrapper sl-flex"><SiteTitle /></div>
+  <div class="sl-hidden md:sl-flex tabs-wrapper"><Tabs /></div>
+  <div class="sl-flex print:hidden search"><Search /></div>
+  <div class="sl-hidden md:sl-flex print:hidden right-group">
+    <div class="sl-flex social-icons"><SocialIcons /></div>
+    <ThemeSelect />
+  </div>
+</div>
+
+<style>
+  .header {
+    display: flex;
+    gap: var(--sl-nav-gap);
+    justify-content: space-between;
+    align-items: center;
+    height: 100%;
+  }
+  .title-wrapper { overflow: clip; padding: 0.25rem; margin: -0.25rem; min-width: 0; }
+  .right-group, .social-icons { gap: 1rem; align-items: center; }
+  .social-icons::after { content: ''; height: 2rem; border-inline-end: 1px solid var(--sl-color-gray-5); }
+  @media (min-width: 50rem) {
+    .header { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; }
+    .search { justify-content: flex-end; }
+  }
+</style>

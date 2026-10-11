@@ -1,8 +1,6 @@
 ---
 title: Frames
 description: Every method of a frame and every expression function, grouped, with Polars' names and an example for each group.
-sidebar:
-  order: 6
 ---
 
 A **frame** is a query that hasn't run yet, in Polars' style. You make one with `db.table`,
@@ -65,7 +63,7 @@ item LIKE 't%'")`, `with_columns("qty * amount AS total")`, `agg("sum(amount) AS
 | Call | Meaning |
 |---|---|
 | `db.table(name)` | a table or view |
-| `db.sql(query, **names)` | a query. Names in it can be frames or pandas, Polars and Arrow data |
+| `db.sql(query, job=None, **names)` | a query, as a frame. Names in it can be frames or pandas, Polars and Arrow data. `job` is for a write: a retry with the same job is applied once |
 | `db.read_parquet`, `db.read_csv`, `db.read_json`, `db.read_delta`, `db.read_iceberg` | files and other engines' tables, see [names](/pondra/reference/names/) |
 | `db.from_arrow(data)` | rows of this machine (also `from_pandas`, `from_polars`, `from_rows`) |
 | `pondra.concat(frames, how="vertical")` | frames one after another: by position (`"vertical"`), or by name with missing columns null (`"diagonal"`) |
@@ -77,6 +75,26 @@ item LIKE 't%'")`, `with_columns("qty * amount AS total")`, `agg("sum(amount) AS
 | `frame.sql` | the one SQL statement the frame is: each step is a CTE |
 | `frame.columns` | the column names |
 | `frame.schema` | a pyarrow schema. The statement is planned, not run |
+
+## Classes
+
+| Class | Made by | Meaning |
+|---|---|---|
+| `pondra.Frame` | `db.table`, `db.sql`, the readers, and every method of a frame | a query that hasn't run |
+| `pondra.Expr` | `col`, `lit`, `when` and the functions, and every method of an expression | a column or a computation on columns |
+| `pondra.GroupBy` | `frame.group_by(…)` | the groups, waiting for `agg` or `len` |
+| `pondra.frame.Merge` | `db.table(name).merge(source, on)` | a `MERGE` being built. It is in `pondra.frame`, not in `pondra` |
+
+```python
+from pondra.frame import Merge
+print(isinstance(orders, pondra.Frame), isinstance(col("amount"), pondra.Expr), isinstance(orders.group_by("item"), pondra.GroupBy))
+print(isinstance(db.table("orders").merge(orders, on="id"), Merge))
+```
+
+```text
+True True True
+True
+```
 
 ## Rows and columns
 
@@ -90,7 +108,7 @@ item LIKE 't%'")`, `with_columns("qty * amount AS total")`, `agg("sum(amount) AS
 | `cast(dtypes)` | change types: `{"qty": "BIGINT"}`. A type is SQL's name, a Python type (`int`, `float`, `str`) or a Polars-style name (`int64`, `float64`, `utf8`) |
 | `sort(by, *more, descending=False, nulls_last=False)` | order the rows; `descending` and `nulls_last` take a list for one flag per key |
 | `limit(n=5)` | the first `n` rows. Also `head` |
-| `unique(subset=None, keep="any")` | distinct rows, or one row per value of the `subset` columns |
+| `unique(subset=None)` | distinct rows, or one row per value of the `subset` columns. Which row of each value is kept is not set |
 | `sample(n=None, fraction=None, seed=None)` | `n` random rows, or about `fraction` of them. With a `seed` you get the same rows every time (they are picked by a hash of the seed and each row's values, so rows with identical values are picked together) |
 | `fill_null(value)` | replace nulls in every column of the value's kind: numbers, text, booleans, dates |
 | `drop_nulls(subset=None)` | drop rows with a null in the `subset` columns, or in any column |
@@ -110,9 +128,25 @@ print(orders.unique(["item"]).sort("item").select("item").rows())
 A sort is kept through the steps after it that keep the order, so `sort(...).select(...)` stays
 sorted.
 
+Nulls: `fill_null` replaces them, and `drop_nulls` removes the rows that have one.
+
+```python
+people = db.sql("""SELECT * FROM (VALUES (1, 'ann', CAST(NULL AS DOUBLE)),
+                                  (2, NULL, CAST(3.5 AS DOUBLE))) AS t(id, name, score)""")
+print(people.fill_null("?").rows())
+print(people.fill_null(0).rows())
+print(people.drop_nulls().rows(), people.drop_nulls(subset=["name"]).rows())
+```
+
+```text
+[{'id': 1, 'name': 'ann', 'score': None}, {'id': 2, 'name': '?', 'score': 3.5}]
+[{'id': 1, 'name': 'ann', 'score': 0.0}, {'id': 2, 'name': None, 'score': 3.5}]
+[] [{'id': 1, 'name': 'ann', 'score': None}]
+```
+
 ## Aggregation
 
-`group_by(*keys, maintain_order=False)` gives a `GroupBy`.
+`group_by(*keys)` gives a `GroupBy`. Its groups come in no set order, so `sort` the result to order them.
 
 | Method | Meaning |
 |---|---|
@@ -138,7 +172,7 @@ per_day.sort("day").show()
 +---------------------+-------+---+
 ```
 
-`sum` over `DOUBLE` gives the same answer in any order, as in [SQL](/pondra/reference/functions/#exact-sums).
+`sum` over `DOUBLE` gives the same answer in any order, as in [SQL](/pondra/sql/functions/#exact-sums).
 
 ## Joins
 
@@ -156,6 +190,18 @@ print(orders.join(users, left_on="user_id", right_on="id", how="anti").select("i
 ```text
 [{'id': 1, 'name': 'ann'}, {'id': 2, 'name': 'ann'}, {'id': 3, 'name': 'bo'}, {'id': 4, 'name': None}, {'id': 5, 'name': 'bo'}]
 [{'id': 4}]
+```
+
+`join_asof` joins each row to the latest row of the other frame at or before its `on` value:
+
+```python
+quotes = db.sql("SELECT * FROM (VALUES (1, 10.0), (5, 11.0)) AS t(ts, bid)")
+trades = db.sql("SELECT * FROM (VALUES (2, 'buy'), (6, 'sell')) AS t(ts, side)")
+print(trades.join_asof(quotes, on="ts").rows())
+```
+
+```text
+[{'ts': 2, 'side': 'buy', 'bid': Decimal('10.0')}, {'ts': 6, 'side': 'sell', 'bid': Decimal('11.0')}]
 ```
 
 ## Set operations
@@ -199,6 +245,9 @@ Nothing runs until you ask for rows.
 | `explain()` | Pondra's plan, and whether it would spread over the nodes. It works on a frame of any number of steps |
 | `watch()` | for a table or materialized view: its new rows as they commit |
 
+`rows()`, `item()` and `show()` work without pyarrow. `collect()`, `to_pandas()` and `to_polars()`
+need `pip install pyarrow`.
+
 ```python
 print(orders.select(pondra.len().alias("n")).item())
 print(orders.explain().splitlines()[0])
@@ -209,11 +258,24 @@ print(orders.explain().splitlines()[0])
 TableScan: orders projection=[id, user_id, item, qty, amount, ts]
 ```
 
+`collect()` (also `to_arrow()`), `to_pandas()` and `to_polars()` give the answer as that library's table:
+
+```python
+top_rows = orders.sort("id").limit(2)
+print(top_rows.collect().num_rows, top_rows.to_arrow().column_names)
+print(top_rows.to_pandas().shape, top_rows.to_polars().height)
+```
+
+```text
+2 ['id', 'user_id', 'item', 'qty', 'amount', 'ts']
+(2, 6) 2
+```
+
 ## Back to SQL, and writes
 
 | Method | Meaning |
 |---|---|
-| `to_view(name, temporary=False, materialized=False, replace=None, **options)` | save the frame as a view others read by name. `materialized=True` keeps it up to date, and `options` are a materialized view's: `window`, `size_secs`, and the rest of [table options](/pondra/reference/table-options/#materialized-views). `temporary=True` keeps it to this connection |
+| `to_view(name, temporary=False, materialized=False, replace=None, **options)` | save the frame as a view others read by name. `materialized=True` keeps it up to date, and `options` are a materialized view's: `window`, `size_secs`, and the rest of [table options](/pondra/sql/table-options/#materialized-views). `temporary=True` keeps it to this connection |
 | `write_table(name, mode="create")` | rows into a table: `create` (`CREATE TABLE … AS`), `append` (`INSERT … SELECT`), `overwrite` (a new table in its place) |
 | `write_parquet(path, partition_by=None, mode=None)` | Parquet files: a file, or a folder if `path` ends in `/` or `partition_by` names columns |
 | `write_csv(path, separator=None, include_header=True, partition_by=None, mode=None)` | CSV files |
@@ -265,6 +327,47 @@ print(copy.sort("id").select("id", "qty", "amount").rows())
 {'rows': 1, 'updated': 0, 'deleted': 1, 'inserted': 0}
 {'rows': 2, 'updated': 1, 'deleted': 0, 'inserted': 1}
 [{'id': 1, 'qty': 3, 'amount': 100.0}, {'id': 2, 'qty': 1, 'amount': 4.5}, {'id': 3, 'qty': 1, 'amount': 3.5}, {'id': 4, 'qty': 3, 'amount': 9.0}, {'id': 9, 'qty': None, 'amount': 1.0}]
+```
+
+A write takes a path, a folder or a name. Files are written on this machine, so this example uses a
+connection that `pondra.local` started here, which the node's own program owns:
+
+```python
+here = pondra.local("frame-files")
+menu = here.sql("SELECT * FROM (VALUES (1, 'tea'), (2, 'cake')) AS t(id, item)")
+menu.write_parquet("menu.parquet")
+menu.write_csv("menu.csv")
+menu.write_json("menu.json")
+menu.write_delta("menu_delta")
+menu.write_iceberg("menu_iceberg")
+print(here.read_parquet("menu.parquet").rows(), here.read_csv("menu.csv").rows())
+print(here.read_json("menu.json").rows(), len(here.read_delta("menu_delta").rows()), len(here.read_iceberg("menu_iceberg").rows()))
+here.close()
+```
+
+```text
+[{'id': 1, 'item': 'tea'}, {'id': 2, 'item': 'cake'}] [{'id': 1, 'item': 'tea'}, {'id': 2, 'item': 'cake'}]
+[{'id': 1, 'item': 'tea'}, {'id': 2, 'item': 'cake'}] 2 2
+```
+
+The merge's rules each take an optional `predicate`. `when_matched_update_all` updates every column the source shares,
+and `when_not_matched_by_source_delete` removes target rows the source doesn't have:
+
+```python
+orders.write_table("mirror_orders")
+mirror = db.table("mirror_orders")
+news = db.from_arrow([{"id": 1, "amount": 50.0}, {"id": 2, "amount": 0.0}, {"id": 7, "amount": 3.0}])
+print(mirror.merge(news, on="id")
+          .when_matched_update_all(predicate=col("s.amount") > 0)
+          .when_matched_delete(predicate=col("s.amount") == 0)
+          .when_not_matched_by_source_delete(predicate=col("t.id") > 4)
+          .run())
+print(mirror.sort("id").select("id", "amount").rows())
+```
+
+```text
+{'rows': 3, 'updated': 1, 'deleted': 2, 'inserted': 0}
+[{'id': 1, 'amount': 50.0}, {'id': 3, 'amount': 3.5}, {'id': 4, 'amount': 9.0}]
 ```
 
 ## Expressions
@@ -327,6 +430,101 @@ print(orders.select(pondra.sum("amount").alias("total"), pondra.mean("amount").a
 [{'total': 33.0, 'mean': 6.6, 'items': 3}]
 ```
 
+Math and null tests are methods of an expression. Aggregates such as `median`, `std` and `quantile` are
+for `agg` and `group_by`:
+
+```python
+nums = db.sql("""SELECT * FROM (VALUES (1, CAST(-2.5 AS DOUBLE), CAST(NULL AS DOUBLE)),
+                  (2, CAST(4.0 AS DOUBLE), CAST(3.0 AS DOUBLE)),
+                  (3, CAST(0.0 AS DOUBLE), CAST(9.0 AS DOUBLE))) AS t(id, x, y)""")
+```
+
+First, `abs`, `sqrt`, `floor` and `ceil`:
+
+```python
+nums.select("id", "x", "y",
+            col("x").abs().alias("abs_x"), col("y").sqrt().alias("sqrt_y"),
+            col("x").floor().alias("floor_x"), col("x").ceil().alias("ceil_x")).sort("id").show()
+```
+
+```text
++----+------+-----+-------+--------------------+---------+--------+
+| id | x    | y   | abs_x | sqrt_y             | floor_x | ceil_x |
++----+------+-----+-------+--------------------+---------+--------+
+| 1  | -2.5 |     | 2.5   |                    | -3.0    | -2.0   |
+| 2  | 4.0  | 3.0 | 4.0   | 1.7320508075688772 | 4.0     | 4.0    |
+| 3  | 0.0  | 9.0 | 0.0   | 3.0                | 0.0     | 0.0    |
++----+------+-----+-------+--------------------+---------+--------+
+```
+
+Then `round`, `clip` and the null tests:
+
+```python
+nums.select("id", "x", "y",
+            col("x").round(0).alias("round_x"), col("x").clip(-1.0, 3.0).alias("clip_x"),
+            col("y").is_null().alias("y_null"),
+            col("y").is_not_null().alias("y_set")).sort("id").show()
+```
+
+```text
++----+------+-----+---------+--------+--------+-------+
+| id | x    | y   | round_x | clip_x | y_null | y_set |
++----+------+-----+---------+--------+--------+-------+
+| 1  | -2.5 |     | -2.0    | -1.0   | true   | false |
+| 2  | 4.0  | 3.0 | 4.0     | 3.0    | false  | true  |
+| 3  | 0.0  | 9.0 | 0.0     | 0.0    | false  | true  |
++----+------+-----+---------+--------+--------+-------+
+```
+
+Then `log`, `fill_nan`, `is_nan` and `coalesce`:
+
+```python
+nums.select("id", "x", "y",
+            col("y").log().alias("ln_y"), col("y").fill_nan(0.0).alias("y_filled"),
+            col("x").is_nan().alias("x_nan"),
+            pondra.coalesce(col("y"), lit(0.0)).alias("y_or_0")).sort("id").show()
+```
+
+```text
++----+------+-----+--------------------+----------+-------+--------+
+| id | x    | y   | ln_y               | y_filled | x_nan | y_or_0 |
++----+------+-----+--------------------+----------+-------+--------+
+| 1  | -2.5 |     |                    |          | false | 0.0    |
+| 2  | 4.0  | 3.0 | 1.0986122886681098 | 3.0      | false | 3.0    |
+| 3  | 0.0  | 9.0 | 2.1972245773362196 | 9.0      | false | 9.0    |
++----+------+-----+--------------------+----------+-------+--------+
+```
+
+The aggregates `min`, `max`, `median` and `std` take the whole column:
+
+```python
+nums.select(col("x").min().alias("lo"), col("x").max().alias("hi"),
+            col("x").median().alias("mid"), col("x").std().alias("sd")).show()
+```
+
+```text
++------+-----+-----+----------------+
+| lo   | hi  | mid | sd             |
++------+-----+-----+----------------+
+| -2.5 | 4.0 | 0.0 | 3.278719262151 |
++------+-----+-----+----------------+
+```
+
+Last, `quantile`, `first` and `last`:
+
+```python
+nums.select(col("x").quantile(0.5).alias("q50"), col("y").first().alias("first_y"),
+            col("y").last().alias("last_y")).show()
+```
+
+```text
++-----+---------+--------+
+| q50 | first_y | last_y |
++-----+---------+--------+
+| 0.0 |         | 9.0    |
++-----+---------+--------+
+```
+
 ### Windows
 
 `over(partition_by=None, order_by=None, descending=False)` computes an expression per group of
@@ -373,6 +571,36 @@ window.sort("id").select("id", "prev", "running", "rank").show()
 | `split(by)` | split into a list |
 | `to_date(format=None)`, `to_datetime(format=None)` | parse text as a date or timestamp |
 
+Text has its own methods under `.str`:
+
+```python
+words = db.sql("SELECT * FROM (VALUES (1, '  Tea Time  '), (2, 'cake-x')) AS t(id, w)")
+words.select("id",
+    col("w").str.strip_chars().str.to_lowercase().alias("clean"),
+    col("w").str.len_chars().alias("n_chars"), col("w").str.len_bytes().alias("n_bytes"),
+    col("w").str.contains("Tea").alias("has_tea"),
+    col("w").str.starts_with("  T").alias("starts")).show()
+words.select("id",
+    col("w").str.ends_with("x").alias("ends_x"), col("w").str.replace("-", "_").alias("one_dash"),
+    col("w").str.replace_all("e", "E").alias("all_e"),
+    col("w").str.slice(2, 3).alias("part")).show()
+```
+
+```text
++----+----------+---------+---------+---------+--------+
+| id | clean    | n_chars | n_bytes | has_tea | starts |
++----+----------+---------+---------+---------+--------+
+| 1  | tea time | 12      | 12      | true    | true   |
+| 2  | cake-x   | 6       | 6       | false   | false  |
++----+----------+---------+---------+---------+--------+
++----+--------+--------------+--------------+------+
+| id | ends_x | one_dash     | all_e        | part |
++----+--------+--------------+--------------+------+
+| 1  | false  |   Tea Time   |   TEa TimE   | Tea  |
+| 2  | true   | cake_x       | cakE-x       | ke-  |
++----+--------+--------------+--------------+------+
+```
+
 ### Dates and times: `.dt`
 
 | Method | Meaning |
@@ -384,6 +612,7 @@ window.sort("id").select("id", "prev", "running", "rank").show()
 | `strftime(format)` | format as text |
 | `epoch(time_unit="us")` | since 1970: `"s"`, `"ms"`, `"us"` or `"ns"` |
 
+Dates and times have theirs under `.dt`:
 ```python
 parts = orders.select(
     col("item").str.to_uppercase().alias("upper"),
@@ -401,4 +630,41 @@ parts.limit(3).show()
 | CAKE  | 2026-09-01 | 11   |
 | TEA   | 2026-09-02 | 9    |
 +-------+------------+------+
+```
+
+```python
+events = db.sql("SELECT * FROM (VALUES (1, '2026-09-27 10:20:30')) AS t(id, ts_text)").with_columns(
+    col("ts_text").str.to_datetime().alias("ts"), col("ts_text").str.to_date().alias("day"))
+events.select(
+    col("ts").dt.quarter().alias("q"), col("ts").dt.ordinal_day().alias("doy"),
+    col("ts").dt.weekday().alias("wd"), col("ts").dt.minute().alias("mi"),
+    col("ts").dt.second().alias("s"), col("ts").dt.epoch("s").alias("secs")).show()
+```
+
+```text
++---+-----+----+----+----+------------+
+| q | doy | wd | mi | s  | secs       |
++---+-----+----+----+----+------------+
+| 3 | 270 | 7  | 20 | 30 | 1790504430 |
++---+-----+----+----+----+------------+
+```
+
+Dates have `year()` and `month()`, a frame has its `schema` (planned, not run), and `var` is the variance of a
+column. `concat` stacks frames, and `sql_expr` and `concat_str` take SQL text and join text:
+
+```python
+print(orders.select(col("ts").dt.year().alias("y"), col("ts").dt.month().alias("m")).limit(1).rows())
+print(orders.select(col("amount").var().alias("v")).rows())
+print(orders.schema.names)
+print(len(pondra.concat([orders.limit(1), orders.limit(2)]).rows()))
+print(orders.select(pondra.sql_expr("qty * 2").alias("twice"), pondra.concat_str([col("item"), lit("!")]).alias("loud"))
+      .sort("twice").limit(1).rows())
+```
+
+```text
+[{'y': 2026, 'm': 9}]
+[{'v': 6.425000000000001}]
+['id', 'user_id', 'item', 'qty', 'amount', 'ts']
+3
+[{'twice': 2, 'loud': 'cake!'}]
 ```
