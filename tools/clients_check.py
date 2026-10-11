@@ -3,7 +3,7 @@
 
   clients_check.py [dbt,psql,sqlalchemy,psycopg,jdbc,odbc,adbc,npgsql,params] [--port 8870] [--pg16 PORT]
 
-  (params takes a Postgres 16 running on PORT with --pg16, else starts one under the work folder.)
+  (params and sqlalchemy compare with a Postgres 16 running on PORT with --pg16, else start one under the work folder.)
 
 - dbt: a project with seeds, a view, a table, incremental models (delete+insert, merge,
   append), a snapshot and data tests, run twice — the second time with changed seeds, so views
@@ -14,7 +14,9 @@
   with its labels in order, and `\\d` shows a column of it by the type's name; a cursor in a
   transaction; Ctrl-C (SIGINT) on a running statement cancels it.
 - sqlalchemy: the inspector (schemas, tables, views, columns, primary keys, a view's definition,
-  an enum type's labels), with psycopg 2 and 3; pandas' `to_sql` and `read_sql`.
+  an enum type's labels), with psycopg 2 and 3; pandas' `to_sql` and `read_sql`; and the inspector's
+  reading of one table (named UNIQUE and CHECK constraints, defaults, identity, a sequence, indexes,
+  a view) against the same DDL on Postgres 16, which --pg16 names or the check starts.
 - psycopg: psycopg 3's named cursor (a server-side cursor, read a part at a time), its cursor
   statements by hand (tags, MOVE, FETCH, CLOSE), and `conn.cancel()` on a running statement.
 - jdbc: pgjdbc's DatabaseMetaData (what DBeaver, Metabase and Tableau's JDBC connector call):
@@ -41,7 +43,7 @@ Needs: dbt-postgres (`PONDRA_DBT`, else `dbt` on PATH), Postgres 16's binaries
 (`PGJDBC_JAR`, else fetched once), psqlODBC with pyodbc, the .NET SDK (`dotnet`, with NuGet),
 psycopg 3 (`params` is skipped by name without it).
 """
-import argparse, contextlib, datetime as dt, decimal, json, math, os, re, shutil, subprocess, sys, tempfile, time, uuid
+import argparse, contextlib, datetime as dt, decimal, json, math, os, pwd, re, shutil, subprocess, sys, tempfile, time, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -119,21 +121,19 @@ def rows_of(port, table, order, user):
 
 @contextlib.contextmanager
 def postgres16(work, port):
-    """Postgres 16 on `port` for the length of the block, its data under `work` (run as `claude`
-    when this is root: initdb refuses root)."""
+    """Postgres 16 on `port` for the length of the block, its data under `work` (UTF8, like the lake's
+    text; run as `claude` when this is root: initdb refuses root)."""
     # A folder of its own each time: dbt and params both start one on the same port in one run, and the
     # first one's data folder stayed behind (FileExistsError, so params never ran in the default run).
     pg_dir = tempfile.mkdtemp(dir=work, prefix=f"pg16-{port}-")
-    owner = "claude" if os.geteuid() == 0 else None
-    run_as = ["runuser", "-u", owner, "--"] if owner else []
-    if owner:
-        shutil.chown(pg_dir, owner)
-    subprocess.run([*run_as, f"{PG_BIN}/initdb", "-D", f"{pg_dir}/data", "-A", "trust", "-U", "postgres"], check=True, capture_output=True)
-    subprocess.run([*run_as, f"{PG_BIN}/pg_ctl", "-D", f"{pg_dir}/data", "-o", f"-p {port} -k {pg_dir} -c listen_addresses=127.0.0.1", "-l", f"{pg_dir}/log", "-w", "start"], check=True, capture_output=True)
+    if os.geteuid() == 0:
+        shutil.chown(pg_dir, "claude")
+    subprocess.run(as_owner([f"{PG_BIN}/initdb", "-D", f"{pg_dir}/data", "-E", "UTF8", "-A", "trust", "-U", "postgres"]), check=True, capture_output=True)
+    subprocess.run(as_owner([f"{PG_BIN}/pg_ctl", "-D", f"{pg_dir}/data", "-o", f"-p {port} -k {pg_dir} -c listen_addresses=127.0.0.1", "-l", f"{pg_dir}/log", "-w", "start"]), check=True, capture_output=True)
     try:
         yield
     finally:
-        subprocess.run([*run_as, f"{PG_BIN}/pg_ctl", "-D", f"{pg_dir}/data", "-m", "immediate", "stop"], capture_output=True)
+        subprocess.run(as_owner([f"{PG_BIN}/pg_ctl", "-D", f"{pg_dir}/data", "-m", "immediate", "stop"]), capture_output=True)
 
 
 def dbt_check(node_pg, work):
@@ -209,7 +209,7 @@ def psql_check(pg):
     return checks, {k: v[:600] for k, v in out.items() if "ERROR" in v}
 
 
-def sqlalchemy_check(pg):
+def sqlalchemy_check(pg, port, work, pg16=None):
     import pandas as pd, sqlalchemy as sa
     checks, said = {}, {}
     for drv in ("psycopg2", "psycopg"):
@@ -230,12 +230,20 @@ def sqlalchemy_check(pg):
             enums = [(e["name"], e["schema"], e["labels"]) for e in insp.get_enums()]
             checks[f"{drv}: get_enums() lists mood with its labels; a column of it is an ENUM of them"] = enums == [("mood", "public", ["sad", "ok", "happy"])] \
                 and isinstance(feeling, postgresql.ENUM) and feeling.enums == ["sad", "ok", "happy"]
+        except Exception as e:  # noqa: BLE001 (reported)
+            checks[f"{drv}: the inspector"] = False
+            said[drv] = str(e)[:800]
+        # (pandas creates its table inside a transaction, which Pondra refuses DDL in: it is checked apart from the inspector)
+        try:
             pd.DataFrame({"a": [1, 2], "b": ["x", "y"]}).to_sql(f"from_{drv}", eng, index=False, if_exists="replace")
             pd.DataFrame({"a": [3], "b": ["z"]}).to_sql(f"from_{drv}", eng, index=False, if_exists="append")
             checks[f"{drv}: pandas to_sql (replace, append) and read_sql"] = pd.read_sql(f"SELECT * FROM from_{drv} ORDER BY a", eng).to_dict("records") == [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}, {"a": 3, "b": "z"}]
         except Exception as e:  # noqa: BLE001 (reported)
-            checks[f"{drv}: the inspector"] = False
-            said[drv] = str(e)[:800]
+            checks[f"{drv}: pandas to_sql (replace, append) and read_sql"] = False
+            said[f"{drv} to_sql"] = str(e)[:800]
+    reflected, reflected_said = reflection_check(pg, port, work, pg16)
+    checks.update(reflected)
+    said.update(reflected_said)
     return checks, said
 
 
@@ -332,6 +340,82 @@ public class Cursors {
   }
 }
 """
+# One table, made by the same DDL on Pondra and on Postgres 16: what SQLAlchemy's inspector reads back must agree.
+REFLECT = ["CREATE SCHEMA refl",
+           "CREATE TABLE refl.items (id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, code TEXT NOT NULL, qty INTEGER NOT NULL DEFAULT 0, "
+           "price DOUBLE PRECISION DEFAULT 1.5, note TEXT DEFAULT 'none', made TIMESTAMP DEFAULT now(), "
+           "CONSTRAINT items_code_key UNIQUE (code), CONSTRAINT items_qty_check CHECK (qty >= 0))",
+           "CREATE INDEX items_qty_idx ON refl.items (qty)",
+           "CREATE SEQUENCE refl.steps START 10 INCREMENT 2",
+           "CREATE VIEW refl.items_v AS SELECT id, code FROM refl.items"]
+
+
+def as_owner(args):
+    """Postgres refuses to run as root, so when we are root its tools run as the 'claude' user (setpriv:
+    runuser is not allowed everywhere)."""
+    if os.geteuid() != 0:
+        return args
+    user = pwd.getpwnam("claude")
+    return ["setpriv", f"--reuid={user.pw_uid}", f"--regid={user.pw_gid}", "--clear-groups", *args]
+
+
+def words(text):
+    """SQL's words, lower-cased and without its layout or ';': Postgres lays a view out its own way."""
+    return " ".join(text.lower().replace(";", " ").split())
+
+
+def inspector_answers(url):
+    """What SQLAlchemy's inspector says of refl.items, its view and its sequences, each cut to what both must agree on."""
+    import sqlalchemy as sa
+    eng = sa.create_engine(url)
+    try:
+        insp = sa.inspect(eng)
+        return {
+            "tables": insp.get_table_names(schema="refl"),
+            "views": insp.get_view_names(schema="refl"),
+            "sequences": sorted(insp.get_sequence_names(schema="refl")),
+            "view definition": words(insp.get_view_definition("items_v", schema="refl")),
+            # (Pondra's port has no json type, so it sends an identity's options as JSON text: read as the dict Postgres sends)
+            "columns": [(c["name"], str(c["type"]), c["nullable"], c["default"], json.loads(c["identity"]) if isinstance(c.get("identity"), str) else c.get("identity"))
+                        for c in insp.get_columns("items", schema="refl")],
+            "primary key": insp.get_pk_constraint("items", schema="refl")["constrained_columns"],
+            "unique constraints": [(u["name"], u["column_names"]) for u in insp.get_unique_constraints("items", schema="refl")],
+            "check constraints": [(c["name"], c["sqltext"]) for c in insp.get_check_constraints("items", schema="refl")],
+            # (Postgres also lists the index a UNIQUE makes, marked as that constraint's; Pondra has the constraint alone)
+            "indexes": sorted((i["name"], i["column_names"], i["unique"]) for i in insp.get_indexes("items", schema="refl") if not i.get("duplicates_constraint")),
+            "enums": insp.get_enums(schema="refl"),
+        }
+    finally:
+        eng.dispose()
+
+
+def reflection_check(pg, port, work, pg16=None):
+    """The inspector reads the same table on Pondra (its DDL over HTTP on `port`) as on Postgres 16 (the reference:
+    the one --pg16 names, else one started here)."""
+    name = "sqlalchemy: the inspector reads a table as Postgres 16 does (named UNIQUE and CHECK, defaults, identity, a sequence, indexes, a view)"
+    ref_port = pg16 or pg + 1
+    try:
+        with contextlib.nullcontext() if pg16 else postgres16(work, ref_port):
+            ours, theirs = reflected(pg, port, ref_port)
+    except Exception as e:  # noqa: BLE001 (reported)
+        return {name: False}, {"reflection": str(e)[:800]}
+    differ = {k: {"pondra": ours.get(k), "postgres 16": theirs[k]} for k in theirs if ours.get(k) != theirs[k]}
+    return {name: not differ}, ({"reflection differs": differ} if differ else {})
+
+
+def reflected(pg, port, ref_port):
+    """REFLECT run on both, then what the inspector says of each."""
+    import sqlalchemy as sa
+    for s in REFLECT:
+        sql(port, s)
+    ref = sa.create_engine(f"postgresql+psycopg2://postgres@127.0.0.1:{ref_port}/postgres")
+    with ref.begin() as c:
+        c.exec_driver_sql("DROP SCHEMA IF EXISTS refl CASCADE")  # (a Postgres given by --pg16 may hold an earlier run's)
+        for s in REFLECT:
+            c.exec_driver_sql(s)
+    ref.dispose()
+    return (inspector_answers(f"postgresql+psycopg2://u:{PASSWORD}@127.0.0.1:{pg}/lake"),
+            inspector_answers(f"postgresql+psycopg2://postgres@127.0.0.1:{ref_port}/postgres"))
 
 
 JAVA = r"""
@@ -389,7 +473,8 @@ def jdbc_check(pg, work):
     print(json.dumps({"pgjdbc_portal_suspended": parts, "fetch": got2.get("fetch")}), flush=True)
     checks = {
         "pgjdbc: catalogs, schemas, tables and views": "lake|" in got.get("catalogs", "") and "sales|" in got.get("schemas", "") and "users|TABLE|" in got.get("tables", "") and "big|VIEW|" in got.get("tables", ""),
-        "pgjdbc: columns (types, nullable, defaults), primary keys, functions": "id|int8|0|null|" in got.get("columns", "") and "name|varchar|0|" in got.get("columns", "")
+        # (a VARCHAR is `text` here, every string being text in the catalog: psql's \d says so too)
+        "pgjdbc: columns (types, nullable, defaults), primary keys, functions": "id|int8|0|null|" in got.get("columns", "") and "name|text|0|null|" in got.get("columns", "")
             and "score|float8|1|0|" in got.get("columns", "") and got.get("keys") == "id|1|;" and "twice|" in got.get("functions", ""),
         "pgjdbc: a prepared query": got.get("query") == "bob|2.5|float8",
         "pgjdbc: Statement.cancel() stops a running statement (57014), extended and simple protocol; the connection carries on":
@@ -678,7 +763,7 @@ def main():
             sql(A.port, s)
         for part in A.parts.split(","):
             try:
-                checks, info = {"dbt": lambda: dbt_check(pg, work), "psql": lambda: psql_check(pg), "sqlalchemy": lambda: sqlalchemy_check(pg), "psycopg": lambda: psycopg_check(pg),
+                checks, info = {"dbt": lambda: dbt_check(pg, work), "psql": lambda: psql_check(pg), "sqlalchemy": lambda: sqlalchemy_check(pg, A.port, work, A.pg16), "psycopg": lambda: psycopg_check(pg),
                                 "jdbc": lambda: jdbc_check(pg, work), "odbc": lambda: odbc_check(pg), "adbc": lambda: adbc_check(pg), "npgsql": lambda: npgsql_check(pg, work),
                                 "params": lambda: params_part(pg, work, A.pg16)}[part]()
             except Exception as e:  # noqa: BLE001 (a part that couldn't run fails)

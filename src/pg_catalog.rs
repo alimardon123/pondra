@@ -121,6 +121,7 @@ struct Rel {
     sql: Option<String>, // a view's definition
     identity: BTreeMap<String, crate::seq::Identity>, // identity columns, by name (`attidentity`)
     constraints: Vec<crate::constraints::Constraint>, // UNIQUE, and keys said NOT ENFORCED (SQL's names)
+    checks: Vec<(String, String)>, // CHECK constraints: (name, condition)
     enums: BTreeMap<String, u32>, // enum columns (SQL's names): their type's oid (an inline ENUM('a') is text)
     comment: Option<String>, // COMMENT ON the relation (`cm/relation/…`, `objects.rs`)
     comments: BTreeMap<String, String>, // COMMENT ON its columns, by SQL name (`cm/column/…` by the stored name)
@@ -154,6 +155,16 @@ struct PgIndex {
     unique: bool, // an enforced UNIQUE constraint's
 }
 
+/// A sequence of the lake (`sq/`): its oid, its lake name (what an identity column names), its
+/// schema and name, and its options as Postgres counts them.
+struct SeqRel {
+    oid: u32,
+    lake_name: String,
+    schema: String,
+    name: String,
+    shape: crate::seq::Shape,
+}
+
 struct Lakes {
     indexes: Vec<PgIndex>,
     database: String,
@@ -161,6 +172,7 @@ struct Lakes {
     user: String,
     schemas: Vec<(u32, String)>,
     rels: Vec<Rel>,
+    sequences: Vec<SeqRel>,
     types: Vec<EnumType>,
     routines: Vec<(u32, String, String, crate::routines::Routine)>, // oid, schema, name
     visible: Vec<String>, // (this lake's schemas on the session's search path: `path.rs`; public when none is set)
@@ -249,7 +261,9 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
         let shown = |c: &String| c != "_deleted" || l.key.is_empty(); // (as `SELECT *` shows it)
         let cols = l.columns.iter().filter(|(c, _)| shown(c)).map(|(c, t)| {
             let t = crate::query::dtype(t).unwrap_or(DataType::Utf8);
-            (c.clone(), t, l.not_null.contains(c), l.defaults.get(c).cloned())
+            // (an identity column's default is its sequence: Postgres keeps no default for it in its catalog)
+            let default = l.defaults.get(c).filter(|_| !l.identity.contains_key(c)).map(|d| shown_default(d, &t));
+            (c.clone(), t, l.not_null.contains(c), default)
         }).collect();
         let (rows, bytes) = m.files.iter().fold((0, 0), |(r, b), f| (r + f.rows, b + f.bytes));
         let sealed = m.sealed.clone().unwrap_or_default();
@@ -261,7 +275,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
         }).collect();
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = l.columns.iter().filter_map(|(c, _)| Some((c.clone(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: None, identity: l.identity.clone(), constraints: l.constraints.clone(), enums, comment, comments, rows: rows + sealed.rows, bytes: bytes + sealed.bytes });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: None, identity: l.identity.clone(), constraints: l.constraints.clone(), checks: l.checks.clone(), enums, comment, comments, rows: rows + sealed.rows, bytes: bytes + sealed.bytes });
     }
     let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
     // (a view's columns are its query's: planned only when a client asks for columns, in a
@@ -282,16 +296,25 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
         };
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = cols.iter().filter_map(|(c, ..)| Some((c.clone(), notes.get(&format!("column/{name}/{c}"))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(v.sql), identity: Default::default(), constraints: vec![], enums: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(v.sql), identity: Default::default(), constraints: vec![], checks: vec![], enums: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
     }
     // The session's own temporary tables and views, in its temporary schema (as Postgres has them).
     let (temp_tables, temp_views) = crate::temp::listed();
     for (name, cols) in temp_tables {
         let cols = cols.iter().map(|(c, t)| (c.clone(), crate::query::dtype(t).unwrap_or(DataType::Utf8), false, None)).collect();
-        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'r', columns: cols, key: vec![], sql: None, identity: Default::default(), constraints: vec![], enums: BTreeMap::new(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'r', columns: cols, key: vec![], sql: None, identity: Default::default(), constraints: vec![], checks: vec![], enums: BTreeMap::new(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });
     }
     for (name, sql) in temp_views {
-        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'v', columns: vec![], key: vec![], sql: Some(sql), identity: Default::default(), constraints: vec![], enums: BTreeMap::new(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'v', columns: vec![], key: vec![], sql: Some(sql), identity: Default::default(), constraints: vec![], checks: vec![], enums: BTreeMap::new(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });
+    }
+    // Sequences (`sq/`): relations of their own, which an identity column counts by. One whose options
+    // don't make sense (none can be made) is left out.
+    let mut sequences = vec![];
+    for (k, seq) in lake.cat.scan::<crate::seq::Sequence>("sq/", "sq0").await? {
+        let Ok(shape) = crate::seq::shape(&seq.declared) else { continue };
+        let name = &k[3..];
+        let (schema, short) = crate::ddl::split(name);
+        sequences.push(SeqRel { oid: oid("sq", name), lake_name: name.into(), schema: schema.into(), name: short.into(), shape });
     }
     let routines = lake.cat.scan::<crate::routines::Routine>("r/", "r0").await?.into_iter().map(|(k, r)| {
         let (s, n) = crate::ddl::split(&k[2..]);
@@ -326,8 +349,22 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
     let mut all_schemas: Vec<(u32, String)> = vec![(11, "pg_catalog".into()), (13_000, "information_schema".into())];
     all_schemas.extend(schemas.iter().map(|s| (schema_oid(s), s.clone())));
     all_schemas.push((schema_oid(TEMP), TEMP.into()));
-    Ok(Lakes { indexes, database, databases, user: user.into(), schemas: all_schemas, rels, types, routines, visible: crate::path::schemas_here(lake) })
+    Ok(Lakes { indexes, database, databases, user: user.into(), schemas: all_schemas, rels, sequences, types, routines, visible: crate::path::schemas_here(lake) })
 }
+
+/// A column's default as Postgres shows it: a text column's string literal gets the `::text` that
+/// Postgres adds (`'a'` is `'a'::text`). Anything else, a concatenation among them, is shown as written.
+fn shown_default(d: &str, t: &DataType) -> String {
+    let inside = d.strip_prefix('\'').and_then(|x| x.strip_suffix('\''));
+    let one_literal = inside.is_some_and(|x| !x.replace("''", "").contains('\''));
+    match (t, one_literal) {
+        (DataType::Utf8, true) => format!("{d}::text"),
+        _ => d.to_string(),
+    }
+}
+
+/// A CHECK constraint's oid: its table's, then its name (`ck` apart from the other constraints).
+fn check_oid(r: &Rel, name: &str) -> u32 { oid("ck", &format!("{}.{}.{name}", r.schema, r.name)) }
 
 /// The lake's enum types (`types.rs`), read with the rest of the catalog: only for SQL that names it.
 async fn enum_types(lake: &Lake) -> Result<Vec<EnumType>> {
@@ -394,7 +431,7 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
     let mut classes = vec![];
     for r in &l.rels {
         classes.push(vec![o(r.oid), s(r.name.clone()), o(ns(&r.schema)), o(0), o(0), o(owner), o(if r.kind == 'v' { 0 } else { 2 }), o(r.oid), o(0), i4((r.bytes / 8192) as i32),
-            f4(if r.kind == 'v' { -1.0 } else { r.rows as f32 }), i4(0), o(0), b(!r.key.is_empty() || l.indexes.iter().any(|i| i.table == r.oid)), b(false), s(if r.schema == TEMP { "t" } else { "p" }), s(r.kind.to_string()), i2(r.columns.len() as i16), i2(0),
+            f4(if r.kind == 'v' { -1.0 } else { r.rows as f32 }), i4(0), o(0), b(!r.key.is_empty() || l.indexes.iter().any(|i| i.table == r.oid)), b(false), s(if r.schema == TEMP { "t" } else { "p" }), s(r.kind.to_string()), i2(r.columns.len() as i16), i2(r.checks.len() as i16),
             b(r.kind == 'v'), b(false), b(false), b(false), b(false), b(true), s("d"), b(false), o(0), n(), n(), n()]);
         if !r.key.is_empty() {
             classes.push(vec![o(oid("i", &format!("{}.{}", r.schema, r.name))), s(format!("{}_pkey", r.name)), o(ns(&r.schema)), o(0), o(0), o(owner), o(403), o(0), o(0), i4(1), f4(r.rows as f32),
@@ -404,6 +441,11 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
     for i in &l.indexes {
         classes.push(vec![o(i.oid), s(i.name.clone()), o(ns(&i.schema)), o(0), o(0), o(owner), o(403), o(0), o(0), i4(1), f4(0.0),
             i4(0), o(0), b(false), b(false), s("p"), s("i"), i2(i.at.len() as i16), i2(0), b(false), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), n(), n(), n()]);
+    }
+    // A sequence is a relation of kind 'S', with its three columns (last_value, log_cnt, is_called).
+    for q in &l.sequences {
+        classes.push(vec![o(q.oid), s(q.name.clone()), o(ns(&q.schema)), o(0), o(0), o(owner), o(0), o(q.oid), o(0), i4(0), f4(-1.0), i4(0), o(0), b(false), b(false), s("p"), s("S"), i2(3), i2(0),
+            b(false), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), n(), n(), n()]);
     }
     for (name, oid) in CATALOG {
         classes.push(vec![o(*oid), s(*name), o(11), o(0), o(0), o(owner), o(0), o(*oid), o(0), i4(0), f4(-1.0), i4(0), o(0), b(false), b(false), s("p"), s("v"), i2(0), i2(0),
@@ -489,6 +531,14 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
             each(o(3124)), i2s(&i.at.iter().map(|_| 0).collect::<Vec<_>>()), n(), n()]);
     }
     for r in &l.rels {
+        for (name, cond) in &r.checks {
+            // (the columns its condition names, by their words: Postgres keeps them as `conkey`)
+            let reads: Vec<String> = r.columns.iter().map(|(c, ..)| c.clone()).filter(|c| cond.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).any(|w| w == c)).collect();
+            constraints.push(vec![o(check_oid(r, name)), s(name.clone()), o(ns(&r.schema)), s("c"), b(false), b(false), b(true), o(r.oid), o(0), o(0), o(0), o(0), s(" "), s(" "), s(" "),
+                b(true), i4(0), b(true), i2s(&at_of(r, &reads)), n(), s(cond.clone()), b(true)]);
+        }
+    }
+    for r in &l.rels {
         for c in &r.constraints {
             let (kind, index) = match c.kind {
                 crate::constraints::Kind::Unique => ("u", if c.enforced { oid("uq", &format!("{}.{}.{}", r.schema, r.name, c.name)) } else { 0 }),
@@ -512,6 +562,13 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
     out.push(("pg_constraint", table(&[("oid", OID), ("conname", TEXT), ("connamespace", OID), ("contype", TEXT), ("condeferrable", BOOL), ("condeferred", BOOL), ("convalidated", BOOL),
         ("conrelid", OID), ("contypid", OID), ("conindid", OID), ("conparentid", OID), ("confrelid", OID), ("confupdtype", TEXT), ("confdeltype", TEXT), ("confmatchtype", TEXT),
         ("conislocal", BOOL), ("coninhcount", INT4), ("connoinherit", BOOL), ("conkey", list(INT2)), ("confkey", list(INT2)), ("conbin", TEXT), ("conenforced", BOOL)], constraints)?));
+    // Sequences: their type and options, as `seq::shape` works them out (Postgres's oids for the types).
+    let sequence_rows = l.sequences.iter().map(|q| {
+        let typ = match q.shape.as_type { "SMALLINT" => 21, "INTEGER" => 23, _ => 20 };
+        vec![o(q.oid), o(typ), ScalarValue::Int64(Some(q.shape.start)), ScalarValue::Int64(Some(q.shape.increment)), ScalarValue::Int64(Some(q.shape.max)),
+            ScalarValue::Int64(Some(q.shape.min)), ScalarValue::Int64(Some(q.shape.cache)), b(q.shape.cycle)]
+    }).collect();
+    out.push(("pg_sequence", table(&[("seqrelid", OID), ("seqtypid", OID), ("seqstart", INT8), ("seqincrement", INT8), ("seqmax", INT8), ("seqmin", INT8), ("seqcache", INT8), ("seqcycle", BOOL)], sequence_rows)?));
     // The views Postgres builds over those.
     let rel_rows = |kind: char| l.rels.iter().filter(move |r| r.kind == kind);
     out.push(("pg_tables", table(&[("schemaname", TEXT), ("tablename", TEXT), ("tableowner", TEXT), ("tablespace", TEXT), ("hasindexes", BOOL), ("hasrules", BOOL), ("hastriggers", BOOL), ("rowsecurity", BOOL)],
@@ -569,7 +626,6 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
         ("pg_extension", vec![("oid", OID), ("extname", TEXT), ("extowner", OID), ("extnamespace", OID), ("extrelocatable", BOOL), ("extversion", TEXT), ("extconfig", list(OID)), ("extcondition", list(TEXT))]),
         ("pg_range", vec![("rngtypid", OID), ("rngsubtype", OID), ("rngmultitypid", OID), ("rngcollation", OID), ("rngsubopc", OID), ("rngcanonical", TEXT), ("rngsubdiff", TEXT)]),
         ("pg_trigger", vec![("oid", OID), ("tgrelid", OID), ("tgparentid", OID), ("tgname", TEXT), ("tgfoid", OID), ("tgtype", INT2), ("tgenabled", TEXT), ("tgisinternal", BOOL), ("tgconstraint", OID)]),
-        ("pg_sequence", vec![("seqrelid", OID), ("seqtypid", OID), ("seqstart", INT8), ("seqincrement", INT8), ("seqmax", INT8), ("seqmin", INT8), ("seqcache", INT8), ("seqcycle", BOOL)]),
         ("pg_foreign_table", vec![("ftrelid", OID), ("ftserver", OID), ("ftoptions", list(TEXT))]),
         ("pg_partitioned_table", vec![("partrelid", OID), ("partstrat", TEXT), ("partnatts", INT2), ("partdefid", OID), ("partattrs", list(INT2))]),
         ("pg_policy", vec![("oid", OID), ("polname", TEXT), ("polrelid", OID), ("polcmd", TEXT), ("polpermissive", BOOL), ("polroles", list(OID)), ("polqual", TEXT), ("polwithcheck", TEXT)]),
@@ -626,9 +682,16 @@ fn information_schema(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
                 Some(e) => (e.schema.clone(), e.name.clone()),
                 None => ("pg_catalog".to_string(), type_name(typ).unwrap_or_else(|| "text".into())),
             };
+            // An identity column's options, from its sequence (the standard's identity_* columns).
+            let identity = r.identity.get(name);
+            let shape = identity.and_then(|id| l.sequences.iter().find(|q| q.lake_name == id.sequence)).map(|q| &q.shape);
+            let (generation, start, increment, maximum, minimum, cycle) = match (identity, shape) {
+                (Some(id), Some(sh)) => (s(if id.always { "ALWAYS" } else { "BY DEFAULT" }), s(sh.start.to_string()), s(sh.increment.to_string()), s(sh.max.to_string()), s(sh.min.to_string()), yes(sh.cycle)),
+                _ => (n(), n(), n(), n(), n(), n()),
+            };
             cols.push(vec![db(), s(r.schema.clone()), s(r.name.clone()), s(name.clone()), i4(i as i32 + 1), default.clone().map_or(n(), s), yes(!(*not_null || r.key.contains(name))), s(data_type),
                 n(), if matches!(typ, 25 | 1043) { i4(1_073_741_824) } else { n() }, precision, radix, scale, datetime, n(), n(), n(), n(), n(), n(), n(), n(), n(), n(), n(), db(), s(udt_schema), s(udt),
-                n(), n(), n(), n(), s((i + 1).to_string()), s("NO"), s("NO"), n(), n(), n(), n(), n(), s("NO"), s("NEVER"), n(), yes(r.kind == 'r')]);
+                n(), n(), n(), n(), s((i + 1).to_string()), s("NO"), yes(identity.is_some()), generation, start, increment, maximum, minimum, cycle, s("NEVER"), n(), yes(r.kind == 'r')]);
         }
     }
     out.push(("columns", table(&[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("column_name", TEXT), ("ordinal_position", INT4), ("column_default", TEXT),
@@ -684,6 +747,11 @@ fn information_schema(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
             }
         }
     }
+    for r in &l.rels {
+        for (name, _) in &r.checks {
+            table_constraints.push(vec![db(), s(r.schema.clone()), s(name.clone()), db(), s(r.schema.clone()), s(r.name.clone()), s("CHECK"), s("NO"), s("NO"), s("YES"), n()]);
+        }
+    }
     out.push(("table_constraints", table(&[("constraint_catalog", TEXT), ("constraint_schema", TEXT), ("constraint_name", TEXT), ("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT),
         ("constraint_type", TEXT), ("is_deferrable", TEXT), ("initially_deferred", TEXT), ("enforced", TEXT), ("nulls_distinct", TEXT)], table_constraints)?));
     out.push(("key_column_usage", table(&[("constraint_catalog", TEXT), ("constraint_schema", TEXT), ("constraint_name", TEXT), ("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT),
@@ -694,6 +762,13 @@ fn information_schema(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
             let procedure = r.kind == crate::routines::Kind::Procedure;
             vec![db(), s(schema.clone()), s(format!("{name}_{oid}")), db(), s(schema.clone()), s(name.clone()), s(if procedure { "PROCEDURE" } else { "FUNCTION" }), r.returns.clone().map_or(n(), s),
                 s(if r.language == "python" { "EXTERNAL" } else { "SQL" }), s(r.body.clone()), s(if r.language.is_empty() { "SQL".to_string() } else { r.language.to_uppercase() }), s("NO")]
+        }).collect())?));
+    out.push(("sequences", table(&[("sequence_catalog", TEXT), ("sequence_schema", TEXT), ("sequence_name", TEXT), ("data_type", TEXT), ("numeric_precision", INT4),
+        ("numeric_precision_radix", INT4), ("numeric_scale", INT4), ("start_value", TEXT), ("minimum_value", TEXT), ("maximum_value", TEXT), ("increment", TEXT), ("cycle_option", TEXT)],
+        l.sequences.iter().map(|q| {
+            let (data_type, bits) = match q.shape.as_type { "SMALLINT" => ("smallint", 16), "INTEGER" => ("integer", 32), _ => ("bigint", 64) };
+            vec![db(), s(q.schema.clone()), s(q.name.clone()), s(data_type), i4(bits), i4(2), i4(0), s(q.shape.start.to_string()), s(q.shape.min.to_string()),
+                s(q.shape.max.to_string()), s(q.shape.increment.to_string()), yes(q.shape.cycle)]
         }).collect())?));
     out.push(("referential_constraints", table(&[("constraint_catalog", TEXT), ("constraint_schema", TEXT), ("constraint_name", TEXT), ("unique_constraint_catalog", TEXT),
         ("unique_constraint_schema", TEXT), ("unique_constraint_name", TEXT), ("match_option", TEXT), ("update_rule", TEXT), ("delete_rule", TEXT)], referential)?));
@@ -775,6 +850,54 @@ fn int_arg(a: &ArrayRef) -> datafusion::error::Result<Vec<Option<i64>>> {
 }
 
 fn texts_out(v: impl IntoIterator<Item = Option<String>>) -> ArrayRef { Arc::new(StringArray::from_iter(v)) }
+
+/// One argument's value of a row as JSON text: numbers and booleans bare, text quoted, NULL as `null`.
+fn json_of(a: &ArrayRef, i: usize) -> datafusion::error::Result<String> {
+    if a.is_null(i) {
+        return Ok("null".into());
+    }
+    let text = datafusion::arrow::compute::cast(a, &DataType::Utf8)?;
+    let v = text.as_string::<i32>().value(i);
+    let bare = matches!(a.data_type(), DataType::Boolean) || a.data_type().is_numeric();
+    Ok(if bare { v.to_string() } else { serde_json::to_string(v).unwrap_or_default() })
+}
+
+/// `json_build_object(key, value, …)` for one row, as Postgres prints it: `{"key" : value, …}`.
+fn json_build(a: &[ArrayRef], i: usize) -> datafusion::error::Result<String> {
+    let mut pairs = vec![];
+    for kv in a.chunks(2) {
+        let value = match kv.get(1) {
+            Some(v) => json_of(v, i)?,
+            None => "null".into(),
+        };
+        pairs.push(format!("{} : {value}", json_of(&kv[0], i)?));
+    }
+    Ok(format!("{{{}}}", pairs.join(", ")))
+}
+
+/// The sequence a table's identity column counts by, named as Postgres names it (`schema.name`);
+/// None for a column that has none, or a name that isn't a table.
+fn serial_sequence(l: &Lakes, table: &str, column: &str) -> Option<String> {
+    let table = table.trim_matches('"');
+    let (schema, name) = table.rsplit_once('.').map_or((None, table), |(s, t)| (Some(s.trim_matches('"')), t.trim_matches('"')));
+    let rel = l.rels.iter().find(|r| r.kind != 'v' && r.name == name && schema.is_none_or(|s| s == r.schema))?;
+    let id = rel.identity.get(column)?;
+    let seq = l.sequences.iter().find(|q| q.lake_name == id.sequence)?;
+    Some(format!("{}.{}", seq.schema, seq.name))
+}
+
+/// A column's identity options as the JSON Postgres's query gives (`identity_of`): its sequence's
+/// options, or None for a column that isn't an identity column (`attidentity` blank).
+fn identity_options(l: &Lakes, relid: u32, column: &str, kind: &str) -> Option<String> {
+    if kind.is_empty() {
+        return None;
+    }
+    let rel = l.rels.iter().find(|r| r.oid == relid && r.kind != 'v')?;
+    let id = rel.identity.get(column)?;
+    let shape = &l.sequences.iter().find(|q| q.lake_name == id.sequence)?.shape;
+    Some(serde_json::json!({"always": id.always, "start": shape.start, "increment": shape.increment, "minvalue": shape.min,
+        "maxvalue": shape.max, "cache": shape.cache, "cycle": shape.cycle}).to_string())
+}
 
 fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
     let to_text = |_: &[DataType]| DataType::Utf8;
@@ -870,7 +993,9 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
         }))))
     }));
     // Objects by name and by oid.
-    let rels: Arc<Vec<(u32, String, String)>> = Arc::new(l.rels.iter().map(|r| (r.oid, r.schema.clone(), r.name.clone())).chain(CATALOG.iter().map(|(n, o)| (*o, "pg_catalog".to_string(), n.to_string()))).collect());
+    let rels: Arc<Vec<(u32, String, String)>> = Arc::new(l.rels.iter().map(|r| (r.oid, r.schema.clone(), r.name.clone()))
+        .chain(l.sequences.iter().map(|q| (q.oid, q.schema.clone(), q.name.clone())))
+        .chain(CATALOG.iter().map(|(n, o)| (*o, "pg_catalog".to_string(), n.to_string()))).collect());
     let sizes: Arc<BTreeMap<u32, u64>> = Arc::new(l.rels.iter().map(|r| (r.oid, r.bytes)).collect());
     let by_name = move |rels: &[(u32, String, String)], name: &str| -> Option<u32> {
         let name = name.trim_matches('"');
@@ -954,7 +1079,11 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
         [(oid("c", &full), (r.name.clone(), r.key.clone())), (oid("i", &full), (r.name.clone(), r.key.clone()))]
     }).collect());
     let k2 = keys.clone();
-    let declared: BTreeMap<u32, String> = l.rels.iter().flat_map(|r| r.constraints.iter().map(move |c| (constraint_oid(r, c), c.def(&|n| crate::objects::ident(n))))).collect();
+    let declared: BTreeMap<u32, String> = l.rels.iter().flat_map(|r| {
+        let constraints = r.constraints.iter().map(move |c| (constraint_oid(r, c), c.def(&|n| crate::objects::ident(n))));
+        let checks = r.checks.iter().map(move |(name, cond)| (check_oid(r, name), format!("CHECK (({cond}))")));
+        constraints.chain(checks)
+    }).collect();
     ctx.register_udf(udf("pg_get_constraintdef", to_text, move |a, n| {
         let v = int_arg(&a[0])?;
         Ok(texts_out((0..n).map(|i| v[i].and_then(|o| declared.get(&(o as u32)).cloned().or_else(|| k2.get(&(o as u32)).map(|(_, k)| format!("PRIMARY KEY ({})", k.join(", "))))))))
@@ -992,12 +1121,28 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
     }
     ctx.register_udf(udf("pg_indexes_size", |_| DataType::Int64, |_, n| Ok(Arc::new(datafusion::arrow::array::Int64Array::from(vec![0; n])))));
     ctx.register_udf(udf("txid_current", |_| DataType::Int64, |_, n| Ok(Arc::new(datafusion::arrow::array::Int64Array::from(vec![1; n.max(1)])))));
+    // SQLAlchemy's identity query: its options as JSON, and the sequence a column counts by.
+    ctx.register_udf(udf("json_build_object", to_text, |a, n| {
+        let rows = (0..n).map(|i| json_build(a, i)).collect::<datafusion::error::Result<Vec<_>>>()?;
+        Ok(texts_out(rows.into_iter().map(Some)))
+    }));
+    let lk = l.clone();
+    ctx.register_udf(udf("pg_get_serial_sequence", to_text, move |a, n| {
+        let (tables, columns) = (text_arg(&a[0])?, text_arg(&a[1])?);
+        Ok(texts_out((0..n).map(|i| serial_sequence(&lk, tables[i].as_deref()?, columns[i].as_deref()?))))
+    }));
+    // The identity options `identity_of` puts in place of SQLAlchemy's subquery: (attrelid, attname, attidentity).
+    ctx.register_udf(udf("identity_options", to_text, move |a, n| {
+        let (relids, columns, kinds) = (int_arg(&a[0])?, text_arg(&a[1])?, text_arg(&a[2])?);
+        Ok(texts_out((0..n).map(|i| identity_options(&l, relids[i]? as u32, columns[i].as_deref()?, kinds[i].as_deref()?))))
+    }));
 }
 
 /// Postgres's catalog, its functions and its `information_schema` in `ctx`, for a client logged in as `user`.
 pub async fn register(ctx: &SessionContext, lake: &Lake, user: &str, sql: &str) -> Result<()> {
     let lower = sql.to_lowercase();
-    let columns = ["pg_attribute", "information_schema", "columns"].iter().any(|w| lower.contains(w));
+    // (a view's columns: its `attnum`s and a key's `conkey`, which name them, need them too)
+    let columns = ["pg_attribute", "pg_constraint", "information_schema", "columns"].iter().any(|w| lower.contains(w));
     let l = Arc::new(lakes(lake, user, columns).await?);
     let catalog = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog");
     let pg = Arc::new(MemorySchemaProvider::new());
@@ -1015,7 +1160,7 @@ pub async fn register(ctx: &SessionContext, lake: &Lake, user: &str, sql: &str) 
 }
 
 const PG_INFO: &str = "pg_information_schema"; // (DataFusion keeps `information_schema` to itself)
-const INFO_TABLES: &[&str] = &["schemata", "tables", "columns", "views", "table_constraints", "key_column_usage", "routines", "referential_constraints", "constraint_column_usage"];
+const INFO_TABLES: &[&str] = &["schemata", "tables", "columns", "views", "table_constraints", "key_column_usage", "routines", "referential_constraints", "constraint_column_usage", "sequences"];
 
 // ---------------------------------------------------------------- Postgres's SQL, said DataFusion's way
 
@@ -1025,7 +1170,7 @@ const INFO_TABLES: &[&str] = &["schemata", "tables", "columns", "views", "table_
 pub fn rewrite(sql: &str, user: &str, schema: &str) -> String {
     use datafusion::sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
     let Ok(mut stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else { return sql.to_string() };
-    let mut r = Rewriter { user: if user.is_empty() { "pondra" } else { user }, schema };
+    let mut r = Rewriter { user: if user.is_empty() { "pondra" } else { user }, schema, expanded: vec![] };
     for s in stmts.iter_mut() {
         let _ = s.visit(&mut r);
     }
@@ -1035,6 +1180,7 @@ pub fn rewrite(sql: &str, user: &str, schema: &str) -> String {
 struct Rewriter<'a> {
     user: &'a str,
     schema: &'a str, // (the session's current schema: `current_schema()`)
+    expanded: Vec<String>, // the names of columns that are `_pg_expandarray` elements (pgjdbc's `(keys).x`)
 }
 
 fn is_pg_table(name: &str) -> bool { CATALOG.iter().any(|(n, _)| *n == name) }
@@ -1053,7 +1199,7 @@ fn regproc(e: &ast::Expr) -> bool {
 
 fn boolean(e: &ast::Expr) -> bool {
     static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> = std::sync::LazyLock::new(|| {
-        let empty = Lakes { database: String::new(), databases: vec![], user: String::new(), schemas: vec![], rels: vec![], types: vec![], routines: vec![], indexes: vec![], visible: vec![] };
+        let empty = Lakes { database: String::new(), databases: vec![], user: String::new(), schemas: vec![], rels: vec![], sequences: vec![], types: vec![], routines: vec![], indexes: vec![], visible: vec![] };
         tables(&empty).unwrap_or_default().iter().flat_map(|(_, t)| datafusion::datasource::TableProvider::schema(t.as_ref()).fields().iter().filter(|f| *f.data_type() == DataType::Boolean).map(|f| f.name().clone()).collect::<Vec<_>>()).collect()
     });
     let name = match e {
@@ -1074,9 +1220,37 @@ fn vector(e: &ast::Expr) -> bool {
     ["indkey", "indclass", "indcollation", "indoption", "proargtypes", "stxkeys"].contains(&name.as_str())
 }
 
+/// A column's name, lower-cased: the last part of `t.col`, or `col`.
+fn column_name(e: &ast::Expr) -> Option<String> {
+    match e {
+        ast::Expr::Identifier(i) => Some(i.value.to_lowercase()),
+        ast::Expr::CompoundIdentifier(p) => p.last().map(|i| i.value.to_lowercase()),
+        _ => None,
+    }
+}
+
+/// A projected int2vector or oidvector column as Postgres prints it: its elements, space-separated
+/// (`1 2`). SQLAlchemy splits that text to read an index's keys, which a list can't give it. Only a
+/// column projected alone changes; inside an expression it stays a list.
+fn vector_as_text(item: &mut ast::SelectItem) {
+    let text = |e: &ast::Expr| expr(&format!("array_to_string({e}, ' ')"));
+    let new = match item {
+        ast::SelectItem::UnnamedExpr(e) if vector(e) => match (text(e), column_name(e)) {
+            (Some(t), Some(n)) => ast::SelectItem::ExprWithAlias { expr: t, alias: ast::Ident::new(n) },
+            _ => return,
+        },
+        ast::SelectItem::ExprWithAlias { expr: e, alias } if vector(e) => match text(e) {
+            Some(t) => ast::SelectItem::ExprWithAlias { expr: t, alias: alias.clone() },
+            None => return,
+        },
+        _ => return,
+    };
+    *item = new;
+}
+
 /// Catalog tables that are always empty here: a subquery that joins one gives no row.
 const EMPTY: &[&str] = &["pg_publication_namespace", "pg_publication_rel", "pg_shdescription", "pg_depend", "pg_rewrite", "pg_inherits", "pg_collation", "pg_extension", "pg_range", "pg_trigger",
-    "pg_sequence", "pg_foreign_table", "pg_partitioned_table", "pg_policy", "pg_statistic_ext", "pg_publication", "pg_event_trigger", "pg_cast", "pg_opclass"];
+    "pg_foreign_table", "pg_partitioned_table", "pg_policy", "pg_statistic_ext", "pg_publication", "pg_event_trigger", "pg_cast", "pg_opclass"];
 
 /// A scalar subquery DataFusion can't decorrelate as Postgres writes it, said another way: NULL if
 /// it joins an always-empty catalog table; its conditions on the outer row alone taken out of it
@@ -1130,6 +1304,35 @@ fn settle(q: &mut ast::Query) -> Option<ast::Expr> {
         }
     }
     expr(&format!("CASE WHEN {when} THEN ({q}) END"))
+}
+
+/// SQLAlchemy's identity query for a column: a scalar subquery of `pg_sequence` correlated through
+/// `pg_get_serial_sequence`, which DataFusion can't decorrelate. It becomes `identity_options` over the
+/// same outer row (the same JSON, or NULL), so no subquery is left to plan.
+fn identity_of(q: &ast::Query) -> Option<ast::Expr> {
+    let ast::SetExpr::Select(sel) = q.body.as_ref() else { return None };
+    let [t] = &sel.from[..] else { return None };
+    let ast::TableFactor::Table { name, .. } = &t.relation else { return None };
+    if !name.0.last().and_then(|p| p.as_ident()).is_some_and(|i| i.value.eq_ignore_ascii_case("pg_sequence")) {
+        return None;
+    }
+    let mut serial = false;
+    let mut outer = None; // the table the column is read from: `pg_catalog.pg_attribute` for `…pg_attribute.attidentity`
+    let _ = ast::visit_expressions(sel.selection.as_ref()?, |x| {
+        match x {
+            ast::Expr::Function(f) if f.name.to_string().eq_ignore_ascii_case("pg_get_serial_sequence") => serial = true,
+            ast::Expr::CompoundIdentifier(p) if p.len() > 1 && p.last().is_some_and(|i| i.value.eq_ignore_ascii_case("attidentity")) => {
+                outer = Some(p[..p.len() - 1].iter().map(|i| i.value.clone()).collect::<Vec<_>>().join("."));
+            }
+            _ => {}
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    if !serial {
+        return None;
+    }
+    let from = outer?;
+    expr(&format!("identity_options({from}.attrelid, {from}.attname, {from}.attidentity)"))
 }
 
 fn split_and(e: ast::Expr, out: &mut Vec<ast::Expr>) {
@@ -1191,8 +1394,8 @@ fn expr(sql: &str) -> Option<ast::Expr> {
 /// `ARRAY(SELECT x FROM … WHERE … ORDER BY k)` as `(SELECT array_agg(x ORDER BY k) FROM … WHERE …)`.
 /// DataFusion can't plan a derived table of such a query when its filter uses the outer row (psql's
 /// `\dT+` filters `pg_enum` on the outer `t.oid`: "No field named __a.enumtypid"), and it plans the
-/// aggregate as it does `string_agg`. Only a plain query of one column is changed. An empty ARRAY is
-/// NULL here, where Postgres has `{}`.
+/// aggregate as it does `string_agg`. Only a plain query of one column is changed. The aggregate of no
+/// rows is NULL, so it is coalesced to an empty list: Postgres's `{}`.
 fn array_of_rows(q: &ast::Query) -> Option<ast::Expr> {
     let ast::SetExpr::Select(select) = q.body.as_ref() else { return None };
     let item = match select.projection.as_slice() {
@@ -1211,7 +1414,7 @@ fn array_of_rows(q: &ast::Query) -> Option<ast::Expr> {
     if let ast::SetExpr::Select(s) = out.body.as_mut() {
         s.projection = vec![ast::SelectItem::UnnamedExpr(agg)];
     }
-    Some(ast::Expr::Subquery(Box::new(out)))
+    expr(&format!("COALESCE(({out}), make_array())"))
 }
 
 impl VisitorMut for Rewriter<'_> {
@@ -1231,6 +1434,18 @@ impl VisitorMut for Rewriter<'_> {
         ControlFlow::Continue(())
     }
 
+    fn pre_visit_select(&mut self, select: &mut ast::Select) -> ControlFlow<()> {
+        for item in select.projection.iter_mut() {
+            if let ast::SelectItem::ExprWithAlias { expr: ast::Expr::Function(f), alias } = item {
+                if f.name.to_string().to_lowercase().ends_with("_pg_expandarray") {
+                    self.expanded.push(alias.value.to_lowercase());
+                }
+            }
+            vector_as_text(item);
+        }
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_expr(&mut self, e: &mut ast::Expr) -> ControlFlow<()> {
         let ast::Expr::CompoundFieldAccess { root, access_chain } = e else { return ControlFlow::Continue(()) };
         // pgjdbc's primary keys: `(information_schema._pg_expandarray(i.indkey)).n` and `.x` — each
@@ -1246,8 +1461,13 @@ impl VisitorMut for Rewriter<'_> {
                 return ControlFlow::Continue(());
             }
         }
+        // `.f` as written, or the quoted name `friendly.rs` made of it where SQL runs (a subscript).
         let field = match access_chain.as_slice() {
             [ast::AccessExpr::Dot(ast::Expr::Identifier(f))] => f.value.to_lowercase(),
+            [ast::AccessExpr::Subscript(ast::Subscript::Index { index: ast::Expr::Value(v) })] => match &v.value {
+                ast::Value::SingleQuotedString(f) => f.to_lowercase(),
+                _ => return ControlFlow::Continue(()),
+            },
             _ => return ControlFlow::Continue(()),
         };
         let inner = match root.as_ref() {
@@ -1266,7 +1486,9 @@ impl VisitorMut for Rewriter<'_> {
                     _ => None,
                 }
             }
-            x @ (ast::Expr::CompoundIdentifier(_) | ast::Expr::Identifier(_)) if field == "x" => Some(x.clone()),
+            // (pgjdbc's `(result.keys).x`: the element itself, for a column `_pg_expandarray` made; any
+            // other `(x).f` is a struct's field, as friendly.rs has it)
+            x @ (ast::Expr::CompoundIdentifier(_) | ast::Expr::Identifier(_)) if field == "x" && column_name(x).is_some_and(|n| self.expanded.contains(&n)) => Some(x.clone()),
             _ => None,
         };
         if let Some(r) = replaced {
@@ -1401,7 +1623,7 @@ impl VisitorMut for Rewriter<'_> {
             // A scalar subquery Postgres takes as one row (psql's, over the catalog): DataFusion takes
             // it once it's aggregated, and here it holds one row or none.
             ast::Expr::Subquery(q) => {
-                if let Some(replacement) = settle(q) {
+                if let Some(replacement) = identity_of(&**q).or_else(|| settle(q)) {
                     *e = replacement;
                     return ControlFlow::Continue(());
                 }
