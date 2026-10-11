@@ -276,7 +276,9 @@ would need a value and no file is rewritten. Add the column, then `UPDATE` it.
 `RENAME TO` changes the name in place: no file is rewritten, rows still in the log stay the table's,
 and its Delta and Iceberg copies stay readable. A stored view reads a table by name, so after a rename
 it reads whatever takes the old name next. It is refused when the new name is taken, when a
-materialized view or a task follows the table, and for a materialized view.
+materialized view or a task follows the table, and for a materialized view. Writers needn't pause: their
+appends wait a moment while the name moves (for `SWAP WITH`, a kept `DROP` and `CLONE` too), and rows
+sent to the old name afterwards (over HTTP, Kafka or Flight) are refused with `no table t`.
 
 A dropped table is kept for a day, or for its `retention`, and `UNDROP TABLE t` brings it back as it
 was: every row, with its ids and versions. `pondra.dropped` lists the tables that can still come back

@@ -1185,7 +1185,7 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     if lake.cat.get::<u64>(&producer_key(&format!("job:{}", f.job))).await?.is_some() {
         return Ok(j!({"duplicate": true})); // the same job finished concurrently
     }
-    let new = TableMeta { columns: f.columns.clone(), publish: default_publish(), ids: true, ..Default::default() };
+    let new = TableMeta { columns: f.columns.clone(), publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() }; // (a table the INSERT makes starts at the log's end, as CREATE TABLE's does)
     let meta = lake.cat.get::<TableMeta>(&table_key(&f.table)).await?.unwrap_or_else(|| new.clone());
     // Types as the lake stores them, so a writer may name them its own way (`Utf8View`, `VARIANT`).
     let types = |c: &[(String, String)]| c.iter().map(|(_, t)| crate::query::dtype(t).map(|t| crate::query::type_name(&t)).unwrap_or_else(|_| t.clone())).collect::<Vec<_>>();
@@ -1866,11 +1866,12 @@ fn summary(flush: bool, v: Value) -> Result<Value> {
     }
     let acks = match serde_json::from_value::<Outcome>(v)? {
         Outcome::Acks(a) => a,
-        Outcome::Retry(r) if r.is_empty() => bail!("a materialized view of the table was made or dropped as this was sent: run it again (it goes in once)"),
+        Outcome::Retry(r) if r.is_empty() => bail!("the table changed as this was sent (a materialized view of it made or dropped, or the table renamed, swapped or dropped): run it again (it goes in once)"),
         Outcome::Retry(r) => r.into_iter().map(|(_, a)| a).collect(),
         Outcome::Refused(why) => bail!(why),
     };
     ensure!(!acks.iter().any(|a| a.refused), "the table has a UNIQUE constraint: it takes rows through SQL's INSERT, UPDATE and MERGE, which check them on the leader");
+    ensure!(!acks.iter().any(|a| a.gone), "the table isn't there any more (renamed or dropped as this was sent)");
     Ok(if acks.iter().all(|a| a.duplicate) { j!({"duplicate": true}) } else { j!({"committed": true}) })
 }
 

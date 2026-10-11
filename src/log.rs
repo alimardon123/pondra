@@ -108,6 +108,8 @@ pub struct Ack {
     pub conflict: bool,  // `prev` didn't match: someone else committed first; re-read and retry
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refused: bool, // rows for a table with a UNIQUE constraint that the leader's check didn't make
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gone: bool, // rows for a table that isn't there (renamed or dropped as they came)
     #[serde(default)]
     pub row: u64, // where the rows start among the table's rows in `seg` (their `_ord`: `ord(seg, row)`)
     #[serde(default)]
@@ -260,7 +262,7 @@ impl Log {
 /// sequencer in the order they were cut (`turn`: the previous one is there; `done`: this one
 /// is), so a producer's pipelined batches commit in order.
 async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<oneshot::Receiver<()>>, done: oneshot::Sender<()>) {
-    let mut done = Some(done);
+    let (mut done, mut waits) = (Some(done), 0);
     while !pending.is_empty() {
         let outcome = async {
             stamp(lake, to, &mut pending).await?;
@@ -295,7 +297,10 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
             }
             Ok(Outcome::Retry(retried)) => {
                 if retried.is_empty() {
-                    tokio::time::sleep(Duration::from_millis(10)).await; // (packed with views this node didn't know of yet: again)
+                    // (packed with views this node didn't know of yet, or for a table held while its entry
+                    // moves: again, later each time, as a big flush is written to the bucket each time)
+                    tokio::time::sleep(Duration::from_millis(10 << waits.min(6))).await;
+                    waits += 1;
                 }
                 for (i, ack) in retried.into_iter().rev() {
                     let a = pending.remove(i);
@@ -331,9 +336,10 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
 
 /// An append's answer: its ack, or why the sequencer refused it.
 fn answer(a: &Append, ack: Ack) -> Result<Ack, String> {
-    match ack.refused {
-        true => Err(format!("{} has a UNIQUE constraint: it takes rows through SQL's INSERT, UPDATE and MERGE, which check them on the leader", a.table)),
-        false => Ok(ack),
+    match (ack.refused, ack.gone) {
+        (true, _) => Err(format!("{} has a UNIQUE constraint: it takes rows through SQL's INSERT, UPDATE and MERGE, which check them on the leader", a.table)),
+        (_, true) => Err(format!("no table {}", a.table)),
+        _ => Ok(ack),
     }
 }
 
@@ -398,12 +404,51 @@ pub fn decode_flush(body: Bytes) -> Result<Flush> {
 pub struct Sequencer {
     tx: mpsc::Sender<(Flush, oneshot::Sender<Outcome>)>,
     pub commit_ms: Arc<Mutex<Vec<f64>>>, // catalog commit latencies, for /stats
+    held: Held,
+    tiering: Arc<std::sync::atomic::AtomicUsize>, // (tiering rounds holding the lake's lock: `Pace`)
+}
+
+/// Backpressure (`serve --backlog`): while more than `rows` rows wait in the log to be tiered,
+/// commits pause, so writers slow to what tiering sustains instead of memory growing.
+pub struct Pace {
+    pub rows: u64,
+    pub lock: Arc<tokio::sync::Mutex<()>>, // the lake's, which tiering takes (`App::tier_all`)
+}
+
+/// While kept, a tiering round holds the lake's lock (`Sequencer::tiering`).
+pub struct Tiering(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Tiering {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::Relaxed); }
+}
+
+/// The tables whose appends wait while their entries move (`Sequencer::hold`), each with how many
+/// holds name it.
+type Held = Arc<Mutex<HashMap<String, usize>>>;
+
+/// While kept, a flush with rows for these tables goes back to its node, which sends it again.
+pub struct Hold {
+    held: Held,
+    tables: Vec<String>,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut held = self.held.lock().unwrap();
+        for t in &self.tables {
+            if let Some(n) = held.get_mut(t) {
+                *n -= 1;
+                if *n == 0 {
+                    held.remove(t);
+                }
+            }
+        }
+    }
 }
 
 impl Sequencer {
-    /// `max_backlog`: while more rows than this wait in the log to be tiered, commits pause
-    /// (so producers slow down to what the cluster sustains, instead of memory growing).
-    pub async fn start(lake: Arc<Lake>, max_backlog: Option<u64>) -> Result<Arc<Sequencer>> {
+    /// `pace`: backpressure, if any.
+    pub async fn start(lake: Arc<Lake>, pace: Option<Pace>) -> Result<Arc<Sequencer>> {
         let mut next: u64 = lake.cat.get("n").await?.unwrap_or(1);
         // Row ids' blocks (ADR-029 §11): a counter of their own, which starts above every commit
         // number (the blocks before it had), and moves only as blocks are taken.
@@ -416,7 +461,8 @@ impl Sequencer {
         let (tx, mut rx) = mpsc::channel::<(Flush, oneshot::Sender<Outcome>)>(10_000);
         let commit_ms = Arc::new(Mutex::new(vec![]));
         let ms = commit_ms.clone();
-        let me = lake.clone();
+        let (me, held, tiering) = (lake.clone(), Held::default(), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let (holds, tiers) = (held.clone(), tiering.clone());
         crate::panics::spawn(async move {
             let mut last_seq = HashMap::new(); // producer -> last committed seq (cache of p/ keys)
             let mut sequences = crate::seq::Held::default(); // (the counters it moved: it alone writes them)
@@ -424,8 +470,12 @@ impl Sequencer {
             let disk = (!lake.url.contains("://")).then(|| std::path::PathBuf::from(&lake.url)); // (a lake on local disk)
             while let Some(first) = rx.recv().await {
                 let slot = in_flight.clone().acquire_owned().await.expect("never closed");
-                while max_backlog.is_some_and(|m| lake.backlog.load(Ordering::Relaxed) > m) {
-                    tokio::time::sleep(Duration::from_millis(20)).await; // backpressure: let tiering catch up
+                // Backpressure: wait while tiering can catch up, the lake's lock free (tiering takes it)
+                // or held by tiering. Whoever else holds it (a change, a file commit, a view's fill, a
+                // rename's hold) may be waiting for this very round, and tiering for them.
+                let tiering_can = |p: &Pace| tiers.load(Ordering::Relaxed) > 0 || p.lock.try_lock().is_ok();
+                while pace.as_ref().is_some_and(|p| lake.backlog.load(Ordering::Relaxed) > p.rows && tiering_can(p)) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 // …and the room the lake's upkeep needs on its disk (`store::short_of_room`).
                 if let Some((free, keep)) = disk.as_deref().and_then(crate::store::short_of_room) {
@@ -440,14 +490,14 @@ impl Sequencer {
                 while let Ok(f) = rx.try_recv() {
                     batch.push(f);
                 }
-                if let Err(e) = commit(&lake, &mut next, &mut block, &mut last_seq, &mut sequences, batch, &ms, slot).await {
+                if let Err(e) = commit(&lake, &mut next, &mut block, &mut last_seq, &mut sequences, &holds, batch, &ms, slot).await {
                     // Committed or not, we can't tell: restart and reload the state from the catalog.
                     eprintln!("sequencer failed: {e:#}");
                     crate::cluster::restart("the sequencer failed");
                 }
             }
         });
-        let seq = Arc::new(Sequencer { tx, commit_ms });
+        let seq = Arc::new(Sequencer { tx, commit_ms, held, tiering });
         let _ = me.to.set(To::Local(seq.clone())); // (where this process's own sequence values come from)
         Ok(seq)
     }
@@ -459,6 +509,26 @@ impl Sequencer {
 
     /// `To::block`, here.
     pub async fn block(&self) -> Result<u64> { Ok(reserved(self.submit(Flush { block: true, ..Default::default() }).await?)?.block) }
+
+    /// Hold `tables`' appends while a DDL moves their entries (`ddl::still`): from now on a flush with
+    /// rows for one goes back to its node, which sends it again, until the hold is dropped. Answered
+    /// once every flush sequenced before it is committed, so nothing more for them is on its way.
+    pub async fn hold(&self, tables: &[String]) -> Result<Hold> {
+        let hold = Hold { held: self.held.clone(), tables: tables.to_vec() };
+        {
+            let mut held = self.held.lock().unwrap();
+            tables.iter().for_each(|t| *held.entry(t.clone()).or_default() += 1);
+        }
+        self.number().await?; // (a flush of its own: those before it are in)
+        Ok(hold)
+    }
+
+    /// Kept by a tiering round while it holds the lake's lock: commits paused by backpressure stay
+    /// paused, as it is what lets them go.
+    pub fn tiering(&self) -> Tiering {
+        self.tiering.fetch_add(1, Ordering::Relaxed);
+        Tiering(self.tiering.clone())
+    }
 
     /// Queue a flush; its outcome comes once it's committed.
     pub async fn enqueue(&self, f: Flush) -> Result<oneshot::Receiver<Outcome>> {
@@ -477,7 +547,7 @@ pub fn forget_producers(names: impl IntoIterator<Item = String>) { FORGOTTEN.loc
 /// Sequence a batch of flushes and write them as one catalog commit. Without waiting for it to
 /// be committed, the next batch can follow; acks go out once this one is.
 #[allow(clippy::too_many_arguments)]
-async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mut HashMap<String, u64>, sequences: &mut crate::seq::Held, batch: Vec<(Flush, oneshot::Sender<Outcome>)>, ms: &Arc<Mutex<Vec<f64>>>, slot: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
+async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mut HashMap<String, u64>, sequences: &mut crate::seq::Held, held: &Held, batch: Vec<(Flush, oneshot::Sender<Outcome>)>, ms: &Arc<Mutex<Vec<f64>>>, slot: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
     let (mut puts, mut seqs, mut replies) = (vec![], HashMap::<String, u64>::new(), vec![]);
     let (mut inline, mut inline_parts) = (vec![], BTreeMap::<String, Vec<(u64, u64, u64)>>::new()); // all inline flushes: one segment
     for p in std::mem::take(&mut *FORGOTTEN.lock().unwrap()) {
@@ -511,18 +581,26 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
             replies.push((reply, Outcome::Retry(vec![])));
             continue;
         }
-        let (mut acks, mut bad, mut mine) = (vec![Ack::default(); f.parts.len()], vec![], HashMap::new());
-        // 1. A table with a UNIQUE constraint takes rows only from the leader's check: a node that
-        // didn't know of the constraint yet (an ALTER TABLE … ADD a moment ago) is refused here.
-        if !f.checked {
-            for (i, p) in f.parts.iter().enumerate().filter(|(_, p)| p.src.is_some() && p.rows > 0) {
-                if crate::constraints::sequenced(lake, &p.table).await? {
-                    acks[i].refused = true;
-                    bad.push(i);
-                }
-            }
+        // 1. Rows for a table whose entry is moving (a rename, a swap, a drop: `Sequencer::hold`)
+        // go back to be sent again once it has moved, to whichever table has the name then.
+        let written = |p: &&Part| p.src.is_some() && p.rows > 0;
+        if f.parts.iter().filter(written).any(|p| held.lock().unwrap().contains_key(&p.table)) {
+            replies.push((reply, Outcome::Retry(vec![])));
+            continue;
         }
-        // 2. Skip retries of committed batches, and batches whose `prev` no longer holds.
+        // 2. Rows go only into a table that is there (a node may not have seen it renamed or
+        // dropped yet), and into one with a UNIQUE constraint only from the leader's check (a node
+        // may not know of an ALTER TABLE … ADD CONSTRAINT a moment ago).
+        let (mut acks, mut bad, mut mine) = (vec![Ack::default(); f.parts.len()], vec![], HashMap::new());
+        for (i, p) in f.parts.iter().enumerate().filter(|(_, p)| written(p)) {
+            match lake.cat.meta(&table_key(&p.table)).await? {
+                None => acks[i].gone = true,
+                Some(m) if !f.checked && crate::constraints::checked(&m) => acks[i].refused = true,
+                Some(_) => continue,
+            }
+            bad.push(i);
+        }
+        // 3. Skip retries of committed batches, and batches whose `prev` no longer holds.
         // (A part without a producer name is at-least-once: nothing to check.)
         let refused = bad.clone();
         for (i, src) in f.parts.iter().enumerate().filter(|(i, _)| !refused.contains(i)).filter_map(|(i, p)| Some((i, p.src.as_ref().filter(|s| !s.producer.is_empty())?))) {
@@ -550,7 +628,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
             continue;
         }
         seqs.extend(mine);
-        // 3. An object flush becomes the next segment, and so does a file commit; inline flushes
+        // 4. An object flush becomes the next segment, and so does a file commit; inline flushes
         // all go into one (below).
         let filings = std::mem::take(&mut f.filed);
         let inlined = f.path.is_empty() && filings.is_empty();
@@ -602,7 +680,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
             }
         }
     }
-    // 3. One catalog write for everything; acks once it's committed (see `Lake::commits`).
+    // 5. One catalog write for everything; acks once it's committed (see `Lake::commits`).
     puts.extend(seqs.iter().map(|(p, s)| (producer_key(p), json(s))));
     puts.push(("n".into(), json(next)));
     if *block != blocks {
