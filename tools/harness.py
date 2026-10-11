@@ -6680,7 +6680,8 @@ def found():
     without the node's paths; files() and file_read() with or without `files/`; a Flight function
     callable as soon as it is made, and gone as soon as it is dropped; ADBC's handshake without
     padding, its ingest modes and table types; `pondra run`'s flags anywhere. And what the console
-    found: a time without seconds, BASE TABLE, exact numbers, files() after PUT."""
+    found: a time without seconds, BASE TABLE, exact numbers, files() after PUT. And the Postgres catalog's
+    text columns (`text`, varchar kept in pg_type) and COMMENT ON (obj_description, col_description, pg_description)."""
     import datetime as dt, psycopg, pyarrow as pa, pyarrow.flight as fl
     import adbc_driver_flightsql.dbapi as adbc
     lake, guarded = new_lake(), new_lake()
@@ -6946,6 +6947,32 @@ def found():
     q("CREATE VIEW meets_v AS SELECT id FROM meets")
     kinds = {r["table_name"]: r["table_type"] for r in q("SELECT table_name, table_type FROM information_schema.tables WHERE table_name LIKE 'meets%'")}
     checks["information_schema: a table is a BASE TABLE, a view a VIEW"] = kinds == {"meets": "BASE TABLE", "meets_v": "VIEW"}
+    # The Postgres catalog, as psql and BI tools read it: a string column is `text` (oid 25) to
+    # information_schema and pg_attribute, while pg_type keeps varchar (1043); COMMENT ON is what
+    # obj_description, col_description and pg_description (\d+) give, and COMMENT ON … IS NULL removes it.
+    q("CREATE TABLE notes (id BIGINT PRIMARY KEY, body VARCHAR, tag TEXT)")
+    q("COMMENT ON TABLE notes IS 'a note'")
+    q("COMMENT ON COLUMN notes.body IS 'the words'")
+    with psycopg.connect(f"host=127.0.0.1 port={pgport} dbname=pondra user=u", autocommit=True) as conn:
+        column_types = dict(conn.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'notes'").fetchall())
+        att = conn.execute("SELECT a.attname, a.atttypid, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+                           "WHERE a.attrelid = 'notes'::regclass AND a.attnum > 0 ORDER BY a.attnum").fetchall()
+        pg_types = conn.execute("SELECT oid, typname FROM pg_type WHERE typname IN ('text', 'varchar') ORDER BY typname").fetchall()
+        described = conn.execute("SELECT obj_description('notes'::regclass, 'pg_class'), col_description('notes'::regclass, 2), "
+                                 "col_description('notes'::regclass, 3)").fetchall()
+        rows_before = conn.execute("SELECT objsubid, classoid, description FROM pg_description WHERE objoid = 'notes'::regclass ORDER BY objsubid").fetchall()
+    q("COMMENT ON COLUMN notes.body IS NULL")
+    with psycopg.connect(f"host=127.0.0.1 port={pgport} dbname=pondra user=u", autocommit=True) as conn:
+        removed = conn.execute("SELECT col_description('notes'::regclass, 2), obj_description('notes'::regclass, 'pg_class')").fetchall()
+        rows_after = conn.execute("SELECT objsubid, description FROM pg_description WHERE objoid = 'notes'::regclass ORDER BY objsubid").fetchall()
+    seen["text_comments"] = [column_types, att, pg_types, described, rows_before, removed, rows_after]
+    checks["Postgres's catalog: a string column is text (information_schema, pg_attribute, format_type), varchar stays in pg_type; COMMENT ON shows in obj_description, col_description and pg_description, and goes with IS NULL"] = \
+        column_types["body"] == "text" and column_types["tag"] == "text" \
+        and att[1] == ("body", 25, "text") and att[2] == ("tag", 25, "text") \
+        and pg_types == [(25, "text"), (1043, "varchar")] \
+        and described == [("a note", "the words", None)] \
+        and rows_before == [(0, 1259, "a note"), (2, 1259, "the words")] \
+        and removed == [(None, "a note")] and rows_after == [(0, "a note")]
     typed = call(port, "POST", "/sql?format=typed", b"SELECT CAST(1.5 AS DECIMAL(10,2)) AS d, 9007199254740993 AS big, 7 AS small")
     checks["format=typed: decimals and integers past 2^53 exact (as text), others as numbers"] = typed["rows"] == [["1.50", "9007199254740993", 7]] \
         and [c["type"] for c in typed["columns"]] == ["Decimal128(10, 2)", "Int64", "Int64"] and typed["total"] == 1
@@ -9103,7 +9130,7 @@ def enums():
     labels and NULL from every door (INSERT, INSERT … SELECT, UPDATE, POST /append, Postgres, `pondra sql`)
     and reads them back as text; any other value is refused (22P02) and nothing is written. Casts and
     enum_range / enum_first / enum_last; ADD VALUE BEFORE and AFTER; RENAME TO (columns follow it); DROP TYPE
-    refused while a column uses it; SHOW CREATE and COMMENT ON TYPE; a temporary table's enum column, and
+    refused while a column uses it (CASCADE and RESTRICT alike, 2BP01, the column named); SHOW CREATE and COMMENT ON TYPE; a temporary table's enum column, and
     CREATE OR REPLACE, refused; ADD COLUMN of an enum type."""
     import psycopg
     lake = new_lake()
@@ -9217,8 +9244,39 @@ def enums():
     gone = err("DROP TYPE IF EXISTS feeling_t")
     info["columns"] = [m2_bad, t2_rows, in_use, still, dropped, gone]
     checks["ADD COLUMN of an enum type checks its values; DROP TYPE is refused while a column uses it (2BP01), works once none does; IF EXISTS is fine"] = \
-        m2_bad[1] == "22P02" and t2_rows == [[1, "m", None], [5, "s", "ok"]] and in_use[1] == "2BP01" and "uses it" in in_use[2] and \
+        m2_bad[1] == "22P02" and t2_rows == [[1, "m", None], [5, "s", "ok"]] and in_use[1] == "2BP01" and "people.feeling, t2.m2" in in_use[2] and \
         still[0] == 409 and dropped[0] == 200 and gone[0] == 200
+    # Postgres's catalog shows the type as Postgres does: pg_type, pg_enum (a row per label, in order), the
+    # column's type (format_type, information_schema's USER-DEFINED with the type's name)
+    q("CREATE TYPE shade AS ENUM ('light', 'dark')")
+    q("CREATE TABLE paint (id INT, c shade)")
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+        ty = conn.execute("SELECT typtype, typcategory, typlen, typbyval, typinput, typreceive, typarray <> 0 FROM pg_type WHERE typname = 'shade'").fetchall()
+        lab = conn.execute("SELECT e.enumsortorder, e.enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'shade' ORDER BY e.enumsortorder").fetchall()
+        col = conn.execute("SELECT format_type(a.atttypid, a.atttypmod), a.atttypid = (SELECT oid FROM pg_type WHERE typname = 'shade') FROM pg_attribute a WHERE a.attrelid = 'paint'::regclass AND a.attname = 'c'").fetchall()
+        ic = conn.execute("SELECT data_type, udt_schema, udt_name FROM information_schema.columns WHERE table_name = 'paint' AND column_name = 'c'").fetchall()
+    info["catalog"] = [ty, lab, col, ic]
+    checks["Postgres's catalog shows the enum type: pg_type, pg_enum, the column's type"] = \
+        ty == [("e", "E", 4, True, "enum_in", "enum_recv", True)] and lab == [(1.0, "light"), (2.0, "dark")] and col == [("shade", True)] and ic == [("USER-DEFINED", "public", "shade")]
+    # DROP TYPE … CASCADE is the plain drop: with no column using the type it is dropped; with one, CASCADE,
+    # RESTRICT and a plain DROP are all refused (2BP01) naming the column, and the type stays as it was
+    q("CREATE TYPE rank AS ENUM ('low', 'high')")
+    cascade_free = err("DROP TYPE rank CASCADE")
+    rank_gone = err("DROP TYPE rank")
+    info["cascade_free"] = [cascade_free, rank_gone]
+    checks["DROP TYPE … CASCADE drops a type no column uses (a plain DROP after finds none, 500)"] = cascade_free[0] == 200 and rank_gone[0] == 500
+    q("CREATE TYPE tint AS ENUM ('x', 'y')")
+    q("CREATE TABLE tint_t (id INT, c tint)")
+    casc = err("DROP TYPE tint CASCADE")
+    restr = err("DROP TYPE tint RESTRICT")
+    plain = err("DROP TYPE tint")
+    still_tint = q("SELECT enum_range(NULL::tint) AS r")[0]["r"]
+    info["in_use"] = [casc, restr, plain, still_tint]
+    checks["DROP TYPE … CASCADE and RESTRICT with a column using the type: 2BP01 naming tint_t.c, drop or change them first; a plain DROP the same; the type keeps its labels"] = \
+        casc[1] == "2BP01" and restr[1] == "2BP01" and plain[1] == "2BP01" and all("tint_t.c" in r[2] and "drop or change them first" in r[2] for r in (casc, restr, plain)) \
+        and still_tint == ["x", "y"]
+    q("DROP TABLE tint_t")
+    checks["…and CASCADE drops it once no column uses it"] = err("DROP TYPE tint CASCADE")[0] == 200
     for n in nodes:
         n.kill()
     ok = all(checks.values())

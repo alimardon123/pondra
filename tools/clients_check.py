@@ -8,9 +8,10 @@
   and tables are replaced by renames and the incremental models take their incremental path —
   then `dbt docs generate`; the same project against Postgres 16, and every model's rows alike.
 - psql: `\\dt`, `\\d`, `\\dv`, `\\dn`, `\\df`, `\\l`, `\\du` show the lake's tables, columns (types,
-  NOT NULL, defaults, keys), views, schemas, functions and databases.
-- sqlalchemy: the inspector (schemas, tables, views, columns, primary keys, a view's definition),
-  with psycopg 2 and 3; pandas' `to_sql` and `read_sql`.
+  NOT NULL, defaults, keys), views, schemas, functions and databases; `\\dT+` lists an enum type
+  with its labels in order, and `\\d` shows a column of it by the type's name.
+- sqlalchemy: the inspector (schemas, tables, views, columns, primary keys, a view's definition,
+  an enum type's labels), with psycopg 2 and 3; pandas' `to_sql` and `read_sql`.
 - jdbc: pgjdbc's DatabaseMetaData (what DBeaver, Metabase and Tableau's JDBC connector call):
   catalogs, schemas, tables, columns, primary keys, then a query.
 - odbc: psqlODBC's catalog functions through pyodbc (what Tableau and Excel call): tables,
@@ -155,19 +156,24 @@ SETUP = ["CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR NOT NULL, scor
          "CREATE SCHEMA sales", "CREATE TABLE sales.orders (id BIGINT, total DOUBLE)",
          "CREATE FUNCTION twice(x BIGINT) RETURNS BIGINT AS 'x * 2'",
          "INSERT INTO users VALUES (1, 'ann', 1.5, TIMESTAMPTZ '2026-09-01 10:00:00+00'), (2, 'bob', 2.5, NULL)",
-         "INSERT INTO events VALUES (1, 12.5, TIMESTAMP '2026-09-01 10:00:00', ['a', 'b'])"]
+         "INSERT INTO events VALUES (1, 12.5, TIMESTAMP '2026-09-01 10:00:00', ['a', 'b'])",
+         "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')", "CREATE TABLE moods (id BIGINT PRIMARY KEY, feeling mood)", "INSERT INTO moods VALUES (1, 'ok')"]
 
 
 def psql_check(pg):
-    out = {c: psql(pg, c) for c in ("\\dt", "\\dt sales.*", "\\d users", "\\dv", "\\dn", "\\df", "\\l", "\\du", "\\d sales.orders", "\\d+ big")}
+    out = {c: psql(pg, c) for c in ("\\dt", "\\dt sales.*", "\\d users", "\\dv", "\\dn", "\\df", "\\l", "\\du", "\\d sales.orders", "\\d+ big", "\\dT+", "\\d moods")}
     checks = {
         "\\dt lists the tables on the search path (public), \\dt sales.* another schema's": all(x in out["\\dt"] for x in ("public|events|table", "public|users|table"))
             and "sales|" not in out["\\dt"] and "sales|orders|table" in out["\\dt sales.*"],
+        # (a string column is `text` here, as the catalog reports every string: Postgres 16 says `character varying`
+        # for a VARCHAR, and this is the one place the answers differ on purpose)
         "\\d shows columns, Postgres's types, NOT NULL, defaults and the key": all(x in out["\\d users"] for x in
-            ("id|bigint||not null|", "name|character varying||not null|", "score|double precision|||0", "joined|timestamp with time zone|||", '"users_pkey" PRIMARY KEY, btree (id)')),
+            ("id|bigint||not null|", "name|text||not null|", "score|double precision|||0", "joined|timestamp with time zone|||", '"users_pkey" PRIMARY KEY, btree (id)')),
         "\\dv, \\dn, \\df, \\l, \\du": "public|big|view" in out["\\dv"] and "sales|" in out["\\dn"] and "twice|" in out["\\df"] and "lake|" in out["\\l"] and "u|" in out["\\du"],
-        "\\d of a table in a schema, and \\d+ of a view with its definition": "tags|character varying[]" in psql(pg, "\\d events") and "total|double precision" in out["\\d sales.orders"]
+        "\\d of a table in a schema, and \\d+ of a view with its definition": "tags|text[]" in psql(pg, "\\d events") and "total|double precision" in out["\\d sales.orders"]
             and "SELECT * FROM events WHERE amount > 10" in out["\\d+ big"],
+        "\\dT+ lists the enum type mood with its labels in order; \\d shows a column's type as mood": re.search(r"public\s*\|\s*mood\s*\|\s*mood\s*\|\s*4\s*\|\s*sad\s*\n\s*ok\s*\n\s*happy\s*\|", out["\\dT+"]) is not None
+            and out["\\dT+"].index("sad") < out["\\dT+"].index("ok") < out["\\dT+"].index("happy") and re.search(r"feeling\s*\|\s*mood\s*\|", out["\\d moods"]) is not None,
     }
     return checks, {k: v[:600] for k, v in out.items() if "ERROR" in v}
 
@@ -185,9 +191,14 @@ def sqlalchemy_check(pg):
                 and listed["sales"] == ["orders"] and listed["views"] == ["big"]
             if not checks[f"{drv}: schemas, tables, views"]:
                 said[f"{drv} listed"] = listed
-            checks[f"{drv}: columns (types, nullable, defaults), the primary key, has_table"] = cols == {"id": ("BIGINT", False, None), "name": ("VARCHAR", False, None),
+            checks[f"{drv}: columns (types, nullable, defaults), the primary key, has_table"] = cols == {"id": ("BIGINT", False, None), "name": ("TEXT", False, None),  # (a string is TEXT here: see psql's \d)
                 "score": ("DOUBLE PRECISION", True, "0"), "joined": ("TIMESTAMP", True, None)} and insp.get_pk_constraint("users")["constrained_columns"] == ["id"] \
                 and insp.has_table("users") and not insp.has_table("nope") and insp.get_view_definition("big").startswith("SELECT")
+            from sqlalchemy.dialects import postgresql
+            feeling = {c["name"]: c["type"] for c in insp.get_columns("moods")}["feeling"]
+            enums = [(e["name"], e["schema"], e["labels"]) for e in insp.get_enums()]
+            checks[f"{drv}: get_enums() lists mood with its labels; a column of it is an ENUM of them"] = enums == [("mood", "public", ["sad", "ok", "happy"])] \
+                and isinstance(feeling, postgresql.ENUM) and feeling.enums == ["sad", "ok", "happy"]
             pd.DataFrame({"a": [1, 2], "b": ["x", "y"]}).to_sql(f"from_{drv}", eng, index=False, if_exists="replace")
             pd.DataFrame({"a": [3], "b": ["z"]}).to_sql(f"from_{drv}", eng, index=False, if_exists="append")
             checks[f"{drv}: pandas to_sql (replace, append) and read_sql"] = pd.read_sql(f"SELECT * FROM from_{drv} ORDER BY a", eng).to_dict("records") == [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}, {"a": 3, "b": "z"}]
