@@ -27,8 +27,9 @@ INSERT INTO orders SELECT 10000 + value, 'bulk', 1, 1.5 FROM generate_series(1, 
   `NOT NULL` column that gets no value refuses the row (see [Tables](/pondra/guides/tables/#require-a-value-not-null-and-default)).
 - A value that doesn't fit its column, such as `'abc'` for a `BIGINT`, is refused with an error that
   names the value. It is never stored as `NULL`.
-- The `SELECT` can read any table, view, or file (see below). `INSERT INTO new_table SELECT …` makes the
-  table when it isn't there yet; `CREATE TABLE … AS SELECT` does the same with the name first.
+- The `SELECT` can read any table, view, or file (see below). An `INSERT` into a name no table has is
+  refused (42P01), as in Postgres and DuckDB; `CREATE TABLE new_table AS SELECT …` makes a table from a
+  query.
 - Many small `INSERT … VALUES` statements don't make many small files: the rows are gathered into one
   file per table each time the lake tiers its newest rows to Parquet.
 - Into a keyed table, `INSERT` is an upsert (see [Tables](/pondra/guides/tables/)).

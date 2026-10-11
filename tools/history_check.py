@@ -393,14 +393,17 @@ def history_check(bin, work, port):
     checks["a table dropped and undropped 20 times while two nodes append to it: every acked row in it once, and an append while it is dropped refused by name"] = \
         not other and sorted(found) == sorted(set(found)) and set(found) == set(acked)
     print(f"(dropped 20 times beside {len(acked)} appends; other errors: {other[:3]})", file=sys.stderr)
-    # An INSERT into a name no table has makes one, which starts at the log's end like any new table:
-    # the renamed table's rows still in the log under that name aren't its.
+    # An INSERT into a name no table has is refused (42P01, as Postgres and DuckDB refuse it). Once
+    # a table is made under that name again, it starts at the log's end like any new table: the
+    # renamed table's rows still in the log under the name aren't its.
     q("CREATE TABLE nn (id BIGINT, v VARCHAR)")
     q("INSERT INTO nn VALUES (1, 'old')")
     q("ALTER TABLE nn RENAME TO nn2")
+    gone = refused("INSERT INTO nn VALUES (2, 'new')")
+    q("CREATE TABLE nn (id BIGINT, v VARCHAR)")
     q("INSERT INTO nn VALUES (2, 'new')")
-    checks["an INSERT under a renamed table's old name makes a table of its own rows only"] = \
-        rows("SELECT count(*) FROM nn") == [(1,)] and rows("SELECT id FROM nn2") == [(1,)]
+    checks["an INSERT under a renamed table's old name is refused (no table); one made again under it holds its own rows only, not the renamed table's still in the log"] = \
+        "no table nn" in gone and rows("SELECT count(*) FROM nn") == [(1,)] and rows("SELECT id FROM nn2") == [(1,)]
     q("CREATE TABLE sq (id BIGINT GENERATED ALWAYS AS IDENTITY, v VARCHAR)")
     q("INSERT INTO sq (v) VALUES ('a')")
     q("CREATE TABLE sq2 CLONE sq")

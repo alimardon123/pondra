@@ -471,10 +471,12 @@ one script's (statements sent together over HTTP).
   `public`, and a new table, view or sequence goes to `crm`. `SHOW search_path` shows it, and
   `RESET search_path` gives this lake's `public` back.
 - Names are filled in where SQL comes in, so `SELECT * FROM t` under `USE crm` reads `crm.t` wherever
-  it runs. A view or a task keeps the names it was made with: one made under `USE crm` still reads
+  it runs (in `spark_sql('…')`'s text and `SHOW COLUMNS FROM t` too). A view or a task keeps the names it was made with: one made under `USE crm` still reads
   `crm` when read from elsewhere, and one made in `public` still reads `public` under `USE crm`.
 - `current_database()` and `current_schema()` answer the session's values at every door: this lake's
-  name and `public` when there is no session.
+  name and `public` when there is no session. In a view they are worked out as it is read, as Postgres
+  does: a view saying `current_schema()` answers each reader's schema. A materialized view's are those
+  of the session that made it, since its rows are made then.
 - A session lasts as long as its connection: a Postgres connection, an HTTP `x-pondra-session`, a
   console tab, the Python or JavaScript client's connection, or one script's statements.
 

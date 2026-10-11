@@ -664,9 +664,11 @@ impl App {
     /// Whether `query` must run on this node alone: rows sent with the request are here only; so are
     /// the session's temporary tables, its transaction, settings and variables, a past it reads, and
     /// a Python table function's call; and a user granted some tables has its grants checked where
-    /// the query is planned, here.
+    /// the query is planned, here. So does a view that says `current_schema()` read under a path of
+    /// the session's own: the other nodes read it with no session, as its reader's path says.
     pub async fn here_only(&self, query: &str) -> bool {
         crate::query::sent() || crate::temp::mentioned(query) || crate::past::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
+            || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)
     }
 
     async fn query_listed(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
@@ -1215,7 +1217,8 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
         || crate::settings::any() // (and its settings may change the answer)
         || crate::routines::with_views(&app.lake, query).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)
-        || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)
+        || crate::routines::volatile(&app.lake, query).await // (a Python function may answer differently each time)
+        || (crate::path::current(&app.lake).is_some() && crate::path::reads_current(&app.lake, query).await); // (a view's current_schema() is its reader's: not one answer for every session)
     let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
     let key = format!("{format}{}|{}|{query}", p.rows.map(|n| format!(":{n}")).unwrap_or_default(), p.spread.as_deref().unwrap_or(""));
     let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)

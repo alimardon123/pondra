@@ -1303,7 +1303,7 @@ def serverless():
     def leads(node):
         return "pondra leader" in open(node.log).read()
 
-    first, alone_s = timed(insert)  # nobody running: this process records its own files
+    first, alone_s = timed(f"CREATE TABLE sales AS SELECT * FROM '{src}'")  # nobody running: this process makes the table and records its own files
     once = [timed(insert, job="jan-1")[0], timed(insert, job="jan-1")[0]]  # a retried job counts once
     together = [done(p) for p in [cli(insert) for _ in range(4)]]  # four machines at once, nobody running
     t = time.time()
@@ -7630,6 +7630,17 @@ def objects():
         and quiet.get("exists") is True and q("SELECT count(*) AS n FROM t") == [{"n": 2}]
     q("CREATE OR REPLACE TABLE t AS SELECT 7 AS a")
     checks["CREATE OR REPLACE TABLE makes it anew"] = q("SELECT a FROM t") == [{"a": 7}]
+    # An INSERT into a name no table has is refused (42P01, as Postgres and DuckDB refuse it), over
+    # HTTP and pondra sql, and nothing is made; the bulk door (POST /insert/{t}) still makes one.
+    nope = http("INSERT INTO nope VALUES (1, 'a')")
+    nope_select = http("INSERT INTO nope SELECT 1 AS a")
+    nope_read = http("SELECT * FROM nope")
+    cli_nope = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO nope VALUES (1)"], capture_output=True, text=True, timeout=120, env=node.env)
+    call(A.port, "POST", "/insert/bulk_made?job=bm", b"SELECT 1 AS a")
+    info["nope"] = [nope[:2], nope_select[:2], nope_read[:2], cli_nope.returncode, (cli_nope.stdout + cli_nope.stderr)[-200:]]
+    checks["an INSERT into a name no table has is refused (42P01, naming it) over HTTP and pondra sql, nothing made; POST /insert/{t} still makes one"] = \
+        nope[:2] == (500, "42P01") and "no table nope" in str(nope[2]) and nope_select[1] == "42P01" and nope_read[1] == "42P01" \
+        and cli_nope.returncode != 0 and "no table nope" in cli_nope.stdout + cli_nope.stderr and q("SELECT count(*) AS n FROM bulk_made") == [{"n": 1}]
     q("CREATE VIEW v AS SELECT a FROM t")
     q("CREATE VIEW IF NOT EXISTS v AS SELECT a + 1 AS a FROM t")
     kept = q("SELECT a FROM v")
@@ -9186,6 +9197,24 @@ def use_path():
     checks["writes and DDL under USE crm land in crm: INSERT, UPDATE, CREATE TABLE, VIEW, SEQUENCE; public's five rows are untouched"] = \
         info["nextval"] == [{"v": 1}] and info["crm rows"] == [{"a": 1}, {"a": 2}, {"a": 10}] and info["crm u"] == [{"n": 0}] \
         and info["crm v"] == [{"n": 3}] and info["public rows"] == [{"n": 5}] and info["next crm"] == [{"v": 2}]
+    # Spark SQL's text and SHOW COLUMNS are placed as any statement is.
+    info["spark_sql under USE crm"] = q("SELECT * FROM spark_sql('SELECT count(*) AS n FROM t')", w)
+    info["columns under USE crm"] = [r.get("column_name") for r in q("SHOW COLUMNS FROM u", w)]
+    checks["under USE crm, spark_sql('…')'s text reads crm.t (3, not 5) and SHOW COLUMNS FROM u shows crm.u's"] = \
+        info["spark_sql under USE crm"] == [{"n": 3}] and info["columns under USE crm"] == ["b"]
+    # A view's current_schema() is its reader's, as Postgres works it out when the view is read; a
+    # materialized view's is the one it was made under (its rows are made then). The result cache
+    # keeps the readers apart.
+    q("CREATE VIEW cs AS SELECT current_schema() AS s, current_database() AS d")  # (made in public, no session)
+    q("CREATE MATERIALIZED VIEW csm AS SELECT a, current_schema() AS s FROM t", w)
+    info["cs, no path"] = q("SELECT s, d FROM cs")
+    info["cs, USE crm"] = q("SELECT s, d FROM public.cs", w)
+    info["cs, in turns"] = [q("SELECT s FROM public.cs", h)[0]["s"] for _ in range(2) for h in (None, w)]
+    info["csm"] = q("SELECT DISTINCT s FROM crm.csm")
+    info["cs kept"] = "current_schema()" in json.dumps(q("SHOW CREATE VIEW cs"))
+    checks["a view's current_schema() and current_database() are its reader's (public, then crm), in turns too; a materialized view's are as it was made (crm); SHOW CREATE VIEW keeps current_schema()"] = \
+        info["cs, no path"] == [{"s": "public", "d": db_name}] and info["cs, USE crm"] == [{"s": "crm", "d": db_name}] \
+        and info["cs, in turns"] == ["public", "crm"] * 2 and info["csm"] == [{"s": "crm"}] and info["cs kept"]
     # A view keeps the names it was made with, whatever path reads it.
     p = {"x-pondra-session": "use-path-read"}
     q("SET search_path TO public", p)
@@ -9271,6 +9300,11 @@ def use_path():
         info["pg schema"] = c.execute("SELECT current_schema()").fetchall()
         info["pg visible"] = c.execute("SELECT relname FROM pg_class c WHERE pg_table_is_visible(c.oid) AND relname IN ('t', 'only_pub')").fetchall()
         info["pg lookup"] = c.execute("SELECT a FROM t WHERE a = 1").fetchall()
+        c.execute("CREATE VIEW cs_pg AS SELECT current_schema() AS s")  # (crm.cs_pg, its current_schema() kept)
+        info["pg view"] = c.execute("SELECT s FROM cs_pg").fetchall()
+    info["pg view, no path"] = q("SELECT s FROM crm.cs_pg")
+    checks["a view made over Postgres keeps its current_schema(): crm for its connection, public for a reader with no path"] = \
+        info["pg view"] == [("crm",)] and info["pg view, no path"] == [{"s": "public"}]
     checks["over Postgres: USE crm (3), a key lookup from crm, SET search_path to public (5), current_schema(), only crm's t visible in pg_class"] = \
         info["pg crm"] == [(3,)] and info["pg key"] == [("crm",)] and info["pg key public"] == [] and info["pg public"] == [(5,)] \
         and info["pg schema"] == [("crm",)] and info["pg visible"] == [("t",)] and info["pg lookup"] == [(1,)]
@@ -9300,6 +9334,11 @@ def use_path():
     one = sql(A.port, "SELECT count(*) AS n FROM crm.t")
     info["spread"], info["one node"] = spread, one
     checks["under USE crm on a follower, a query spread over three nodes == crm.t on one node (30000 rows)"] = spread == one == [{"n": 30000}]
+    # A view saying current_schema(), read under the session's path: the other nodes would read it with
+    # none, so it runs on the follower alone (every row crm's, not some public's).
+    sql(A.port, "CREATE VIEW crm.cs3 AS SELECT id, current_schema() AS s FROM crm.t")
+    info["spread view"] = until(lambda: _try(lambda: call(A.port + 1, "POST", "/sql?spread=1", b"SELECT s, count(*) AS n FROM crm.cs3 GROUP BY s", headers=f)), [{"s": "crm", "n": 30000}], 15)
+    checks["under USE crm on a follower, a view's current_schema() asked to spread is crm's on every row (30000)"] = info["spread view"] == [{"s": "crm", "n": 30000}]
     [n.kill() for n in trio]
     ok = all(checks.values())
     print(json.dumps({"use": checks, "ok": ok, "info": info}, indent=1, default=str))
@@ -9344,6 +9383,7 @@ def doors():
             "update by a filter": ([f"UPDATE d_items SET qty = qty + 1 WHERE id BETWEEN {k + 2} AND {k + 3}"], lambda r: q(f"SELECT sum(qty) AS s FROM d_items WHERE id BETWEEN {k + 2} AND {k + 3}") == [{"s": 202}]),
             "a CHECK refused, 23514": (["INSERT INTO d_items VALUES (999, -1)"], lambda r: r == "23514"),
             "no table, 42P01": (["SELECT * FROM d_nope"], lambda r: r == "42P01"),
+            "an INSERT into no table, 42P01": (["INSERT INTO d_nope VALUES (1)"], lambda r: r == "42P01"),
             "procedure": ([f"CALL d_bump({k + 4})"], lambda r: q(f"SELECT qty FROM d_items WHERE id = {k + 4}") == [{"qty": 1100}]),
             "transaction": (["BEGIN", f"UPDATE d_items SET qty = qty - 7 WHERE id = {k + 5}", f"UPDATE d_items SET qty = qty + 7 WHERE id = {k + 6}", f"SELECT qty FROM d_items WHERE id = {k + 5}", "COMMIT"],
                             lambda r: r[3] == [[93]] and q(f"SELECT count(DISTINCT _version) AS v, sum(qty) AS s FROM d_items WHERE id IN ({k + 5}, {k + 6})") == [{"v": 1, "s": 200}]),
