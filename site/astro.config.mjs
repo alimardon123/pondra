@@ -30,7 +30,7 @@ export default defineConfig({
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/alimardon123/pondra' }],
       editLink: { baseUrl: 'https://github.com/alimardon123/pondra/edit/main/site/' },
       customCss: ['../brand/colors.css', './src/styles/pondra.css'],
-      expressiveCode: { themes: ['github-dark-default', 'github-light-default'], styleOverrides: { borderRadius: '0.6rem', codeFontSize: '0.85rem', frames: { shadowColor: 'transparent' } } },
+      expressiveCode: { themes: ['github-dark-default', 'github-light-default'], defaultProps: { wrap: true, hangingIndent: 2, overridesByLang: { 'text,txt,plaintext,ansi': { wrap: false } } }, styleOverrides: { borderRadius: '0.6rem', codeFontSize: '0.85rem', frames: { shadowColor: 'transparent' } } },
       components: { Header: './src/components/Header.astro', Sidebar: './src/components/Sidebar.astro' },
       routeMiddleware: './src/tabs.ts',
       // The three tabs (src/tabs.ts): each top-level group is one, with its own sidebar. site/PAGES.md
