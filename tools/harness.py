@@ -705,6 +705,9 @@ def kafkas():
     q(f"ATTACH 'kafka://127.0.0.1:{pk}' AS pondra_k (TYPE kafka)")
     got = q("SELECT count(*) AS n, sum(CAST(value->>'v' AS BIGINT)) AS s FROM pondra_k.ticks")
     checks["a Pondra node's Kafka port, SASL PLAIN from a secret: its table as a topic"] = got == [{"n": 500, "s": 249500}]
+    began = time.time()
+    said = refused(f"COPY (SELECT 1 AS id) TO 'kafka://127.0.0.1:{pk}/nothere' (FORMAT json)")
+    checks["…a COPY to a topic it doesn't have: refused at once, by name (not asked for ten times)"] = "no topic nothere on this Pondra node" in said and time.time() - began < 1
     q(f"CREATE OR REPLACE SECRET theirs (TYPE kafka, SECURITY_PROTOCOL 'SASL_PLAINTEXT', SASL_MECHANISM 'PLAIN', USERNAME 'reader', PASSWORD 'wrong', SCOPE 'kafka://127.0.0.1:{pk}')")
     checks["…a wrong password: refused"] = "refused" in refused("SELECT count(*) AS n FROM pondra_k.ticks")
     them.kill()
