@@ -9640,7 +9640,7 @@ def publishing():
     Iceberg (a finished view's partial rows were, before)."""
     import urllib.request
     lake = new_lake()
-    node = Node(lake, A.port, tier_secs=0.5, env={"PONDRA_PUBLISH": "delta,iceberg"}).start()
+    node = Node(lake, A.port, tier_secs=0.5, publish="delta,iceberg").start()
     q = lambda s: sql(A.port, s)
     err = lambda s: _raises_text(lambda: q(s))
     said = lambda s: json.loads(urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", s.encode()), timeout=60).headers.get("x-pondra-notices") or "[]")

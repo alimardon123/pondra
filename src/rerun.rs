@@ -281,10 +281,11 @@ async fn reads(lake: &Lake, sql: &str, source: &str) -> Result<(Vec<String>, boo
 
 // ---------------------------------------------------------------- the runs (the leader's)
 
-/// When each view last ran, how long it took, and how many runs in a row failed: a view runs again
+/// When each view last ran, how long it worked, and how many runs in a row failed: a view runs again
 /// only once at least that long (ten times that for a full run, and its lag) has passed, so a slow
 /// one never takes the leader over, and one that keeps failing waits longer each time (up to a
-/// minute).
+/// minute). Its waits for the lake's lock and for its commit aren't work: counted, a run behind a
+/// tiering round waited ten times that again.
 #[derive(Default)]
 struct Pace {
     running: bool,
@@ -303,14 +304,24 @@ static PACE: Mutex<BTreeMap<(String, String), Pace>> = Mutex::new(BTreeMap::new(
 struct Turn {
     key: (String, String),
     due: bool,
+    waited: std::sync::atomic::AtomicU64, // µs: the run's waits (`waiting`), left out of what it took
 }
 
 impl Drop for Turn {
     fn drop(&mut self) {
         if let Some(p) = PACE.lock().unwrap().get_mut(&self.key) {
-            (p.running, p.took) = (false, p.started.map_or(Duration::ZERO, |s| s.elapsed()));
+            let waited = Duration::from_micros(self.waited.load(std::sync::atomic::Ordering::Relaxed));
+            (p.running, p.took) = (false, p.started.map_or(Duration::ZERO, |s| s.elapsed().saturating_sub(waited)));
         }
     }
+}
+
+/// `f`, its time added to what a run waited.
+async fn waiting<T>(waited: &std::sync::atomic::AtomicU64, f: impl std::future::Future<Output = T>) -> T {
+    let start = Instant::now();
+    let out = f.await;
+    waited.fetch_add(start.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    out
 }
 
 impl Turn {
@@ -347,7 +358,7 @@ fn turn(lake: &Lake, view: &str, r: &Rerun) -> Option<Turn> {
     if due {
         p.timed = p.started;
     }
-    Some(Turn { key, due })
+    Some(Turn { key, due, waited: Default::default() })
 }
 
 /// Why a view's runs keep failing on this node (two in a row), if they do: making it says so
@@ -367,7 +378,7 @@ pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &
         let Some(turn) = turn(lake, &name, r) else { continue };
         let (lake, seq, lock) = (lake.clone(), seq.clone(), lock.clone());
         tokio::spawn(async move {
-            let r = run(&lake, &seq, &lock, &name, &v, turn.due).await;
+            let r = run(&lake, &seq, &lock, &name, &v, turn.due, &turn.waited).await;
             turn.ended(&r);
         });
     }
@@ -398,7 +409,7 @@ async fn moved_since(lake: &Lake, after: u64, upto: u64, tables: &[String]) -> R
 /// of `now`, in place of theirs. The first run works every group out, and so does one whose
 /// changes its source no longer holds whole (`past::kept_since`). `due`: a timed view runs though
 /// nothing changed here, and commits only if its answer did.
-async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex<()>, view: &str, v: &View, due: bool) -> Result<()> {
+async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex<()>, view: &str, v: &View, due: bool, waited: &std::sync::atomic::AtomicU64) -> Result<()> {
     let r = v.rerun.as_ref().context("not run again")?;
     let producer = producer(view);
     let done: Option<u64> = lake.cat.get(&producer_key(&producer)).await?;
@@ -441,7 +452,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
         };
         // Under the lake's lock, as a change is (invariant 56): the view's rows as they are, and
         // this view still the one this run is for (dropped and made again meanwhile, it's another).
-        let guard = lock.lock().await;
+        let guard = waiting(waited, lock.lock()).await;
         if lake.cat.get::<View>(&crate::views::view_key(view)).await?.and_then(|v| v.rerun).is_none_or(|x| x.id != r.id) {
             return Ok(());
         }
@@ -463,7 +474,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
             }
             // (its answer moved with time alone: a commit of its own to be as of, and again)
             drop(guard);
-            (now, fresh) = (seq.number().await?.version, false);
+            (now, fresh) = (waiting(waited, seq.number()).await?.version, false);
             continue;
         }
         let (mut pending, _) = crate::change::appends(lake, seq, view, &meta, vec![old], vec![new], &producer).await?;
@@ -479,7 +490,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
             let name = if a.table == view { producer.clone() } else { format!("{producer}:deleted") };
             a.src = crate::log::Src { producer: name, seq: now, prev: Some(done.unwrap_or(0)) };
         }
-        if let crate::log::Outcome::Acks(acks) = crate::change::submit(lake, seq, &pending).await? {
+        if let crate::log::Outcome::Acks(acks) = waiting(waited, crate::change::submit(lake, seq, &pending)).await? {
             if acks.iter().any(|a| a.conflict) {
                 eprintln!("materialized view {view}: another run committed first; the next one reads on from it");
             }
