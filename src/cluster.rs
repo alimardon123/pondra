@@ -467,7 +467,9 @@ pub async fn alive(store: &Store, t: &Term) -> bool {
         return false; // a claimer on this machine that ended can't be alive, whatever its mark says
     }
     match store.head(&Path::from(format!("cluster/alive/{:020}", t.n))).await {
-        Ok(m) => (crate::log::now_ms() as i64 - m.last_modified.timestamp_millis()) < 30_000,
+        // (a leader that stepped down isn't alive, whatever its mark says: its last mark, in flight
+        // as it stepped down, can land after `release` took it away)
+        Ok(m) => (crate::log::now_ms() as i64 - m.last_modified.timestamp_millis()) < 30_000 && !stepped_down(store, t.n).await,
         Err(_) => false,
     }
 }
