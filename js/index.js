@@ -179,7 +179,7 @@ export class Pondra {
   }
 
   /** A query, as a frame: nothing runs until it is awaited (its rows), or asked for (`item()`,
-   * `writeTable()`, `toView()`…). Any other statement (CREATE, INSERT, UPDATE, DELETE, CALL, several at
+   * `writeTable()`…). Any other statement (CREATE, INSERT, UPDATE, DELETE, CALL, several at
    * once) runs now, and awaiting it gives the last one's outcome. `params`: values for `$name` in it. */
   sql(query, params) {
     return isQuery(query) ? Frame.fromSql(this, query, params) : this._statement(query, params);
@@ -352,8 +352,9 @@ export class Pondra {
    * new rows (with GROUP BY, kept per key); its other options make it emit what is final: `{ window: "w",
    * size_secs: 60, lateness_secs: 10 }` (and `slide_secs`: sliding), `{ session: "ts", gap_secs: 1800 }`, or
    * `{ join: "streams", time: "ts", within_secs: 600 }`. `{ temporary: true }`: this connection's only.
-   * Answers the view as a frame: awaiting it is its rows. */
-  view(name, query, { materialized, temporary = false, replace, ...options } = {}) {
+   * Resolves to the node's answer for the CREATE (`{ view: name }`), and a refusal rejects here, naming what
+   * the node refused (a table the query names that isn't there, say). Read the view with `db.table(name)`. */
+  async view(name, query, { materialized, temporary = false, replace, ...options } = {}) {
     const opts = Object.entries(options);
     if (materialized === undefined && opts.length) { // (up to 0.22, view() made every view a materialized one)
       console.warn("view(…) with window/session/join options: pass { materialized: true } (a view is a stored query unless asked)");
@@ -391,12 +392,13 @@ export class Pondra {
   }
 
   /** New rows of a table as they commit (a keyed table: every upsert and delete); with `after`, a replay
-   * from there first, as far back as the node keeps its change feed. With `changes`, every change:
+   * from there first, as far back as the node keeps its change feed. Without `after` (or with null), only
+   * the rows committed from now on. With `changes`, every change:
    * UPDATE's and DELETE's too, each row with `_change_type`, `_row_id` and `_version`. After each batch the
    * node sends where it has got to (a line of its own, not yielded): `this.position` is that commit, the
    * place to resume from. `watch(table, { after: db.position })` then yields what came after it. */
   async *watch(table, { after, changes } = {}) {
-    const q = ["marks=true", after === undefined ? "" : `after=${after}`, changes ? "changes=true" : ""].filter(Boolean).join("&");
+    const q = ["marks=true", after == null ? "" : `after=${after}`, changes ? "changes=true" : ""].filter(Boolean).join("&");
     const r = await this.request("GET", `/watch/${table}?${q}`);
     const decoder = new TextDecoder();
     let rest = "";

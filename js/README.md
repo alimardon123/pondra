@@ -37,7 +37,9 @@ await db.close();
 
 A frame is a query written in JavaScript: each step is a CTE of the SQL the node runs, so the plan
 and the answer are the SQL's. Names are Polars' (`withColumns`, `groupBy`, `isNull`); nothing runs
-until it is awaited, or written with `writeTable`.
+until it is awaited, or written with `writeTable`. `await db.view(name, query)` makes a view and resolves
+to the node's answer for it (a refusal rejects there, naming what it refused); read the view with
+`db.table(name)`.
 
 ```js
 import { col, local } from "pondra";

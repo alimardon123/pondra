@@ -347,10 +347,18 @@ def client_check(port, report, tmp):
             py_row = con.lookup("kt", KEY)
         except Exception as e:  # noqa: BLE001 (a FAIL line below; the client's other checks still run)
             py_row = f"Python's lookup: {e}"
-        with recording(con) as py_sql:
-            con.create_function("text_twice", params={"x": ("INT", 1)}, returns="INT", language="sql", body="SELECT x * 2", strict=True, volatility="immutable")
-            con.create_procedure("text_proc", params={"n": "INT"}, language="sql", body="SELECT $n")
-            con.view("text_view", "SELECT 1 AS x")
+        refused = []
+        with recording(con) as py_sql:  # (timeout=0 is sent, and the node refuses it: each side's refusal is compared below)
+            for make in (
+                lambda: con.create_function("text_twice", params={"x": ("INT", 1)}, returns="INT", language="sql", body="SELECT x * 2",
+                                            strict=True, volatility="immutable", timeout=0),
+                lambda: con.create_procedure("text_proc", params={"n": "INT"}, language="sql", body="SELECT $n", timeout=0),
+                lambda: con.view("text_view", "SELECT 1 AS x"),
+            ):
+                try:
+                    make()
+                except Exception as e:  # noqa: BLE001 (a refusal is compared with JavaScript's, below)
+                    refused.append(str(e))
         tls = start_tls(d, port + 1, cert, key)
         got = run_node(["client", f"http://127.0.0.1:{port}", f"https://127.0.0.1:{port + 1}", d], timeout=600)
     finally:
@@ -358,7 +366,7 @@ def client_check(port, report, tmp):
             tls.stdin.close()
             tls.wait(timeout=60)
         con.close()
-    check_client(report, got, py_row, [s for s in py_sql if s.startswith("CREATE")])
+    check_client(report, got, py_row, {"texts": [s for s in py_sql if s.startswith("CREATE")], "refused": refused})
 
 
 def check_client(report, got, py_row, py_sql):
@@ -379,14 +387,19 @@ def check_client(report, got, py_row, py_sql):
          "createFunction (SQL): twice(21) is 42, and routines() lists it")
     same("procedure", got.get("procedure"), [5], "createProcedure (SQL): CALL add_row(5) wrote its row")
     vt = obj("viewTemporary")
-    report.check(vt.get("mine") == [{"x": 7}] and bool(vt.get("otherError")),
-                 "temporary view: this connection reads it, a second connection doesn't" if vt.get("mine") == [{"x": 7}] and vt.get("otherError")
+    temp_ok = vt.get("answer") == {"view": "js_tv", "temporary": True} and vt.get("mine") == [{"x": 7}] and bool(vt.get("otherError"))
+    report.check(temp_ok, "temporary view: the node answers the CREATE; this connection reads it as a table, a second connection doesn't" if temp_ok
                  else f"temporary view: {got.get('viewTemporary')!r}")
+    vr = got.get("viewRefused")
+    refused_ok = isinstance(vr, dict) and "no_such_table" in str(vr.get("error")) and vr.get("sqlstate") == "42P01"
+    report.check(refused_ok, "view over a table that isn't there: refused where it is made, naming the table (42P01)" if refused_ok
+                 else f"view over a missing table: {vr!r}")
     wm = obj("watchMarks")
-    report.check(wm.get("rows") == [1, 2, 3] and wm.get("markYielded") is False and isinstance(wm.get("position"), (int, float)) and wm.get("laterFirst") == 3,
-                 "watch with marks: rows 1, 2, 3 in order and no mark yielded; position is set; watch after it yields only row 3"
-                 if wm.get("rows") == [1, 2, 3] and wm.get("markYielded") is False and isinstance(wm.get("position"), (int, float)) and wm.get("laterFirst") == 3
+    marks_ok = wm.get("rows") == [1, 2, 3] and wm.get("markYielded") is False and isinstance(wm.get("position"), (int, float)) and wm.get("laterFirst") == 3
+    report.check(marks_ok, "watch with marks: rows 1, 2, 3 in order and no mark yielded; position is set; watch after it yields only row 3" if marks_ok
                  else f"watch with marks: {got.get('watchMarks')!r}")
+    report.check(wm.get("nullFirst") == 4, "watch with after: null is no after: only the row committed from now on (4)" if wm.get("nullFirst") == 4
+                 else f"watch with after: null: {got.get('watchMarks')!r}")
     same("closeArgument", got.get("closeArgument"), "close() takes no argument", "close(…) with an argument throws, saying it takes none")
     cm = obj("caMissingFile")
     report.check(cm.get("code") == "ENOENT", "ca: a file that isn't there throws ENOENT, before any request" if cm.get("code") == "ENOENT" else f"ca missing file: {got.get('caMissingFile')!r}")
@@ -398,9 +411,14 @@ def check_client(report, got, py_row, py_sql):
     fo = obj("fetchOption")
     report.check(fo.get("rows") == [{"x": 1}] and fo.get("asked", 0) >= 1, "fetch option: the node is reached through the function given" if fo.get("asked", 0) >= 1
                  else f"fetch option: {got.get('fetchOption')!r}")
-    sql_ok = got.get("sqlText") == py_sql
-    report.check(sql_ok, f"SQL text: createFunction, createProcedure and view send Python's text, character for character ({len(py_sql)} statements)" if sql_ok
-                 else f"SQL text differs: JavaScript {got.get('sqlText')!r} vs Python {py_sql!r}")
+    st = got.get("sqlText") if isinstance(got.get("sqlText"), dict) else {}
+    sql_ok = st.get("texts") == py_sql["texts"]
+    report.check(sql_ok, f"SQL text: createFunction, createProcedure and view send Python's text, character for character ({len(py_sql['texts'])} statements, timeout = 0 among them)"
+                 if sql_ok else f"SQL text differs: JavaScript {st.get('texts')!r} vs Python {py_sql['texts']!r}")
+    refusals = [*(st.get("refused") or []), *py_sql["refused"]]
+    refusal_ok = len(st.get("refused") or []) == 2 and len(py_sql["refused"]) == 2 and all("timeout: seconds" in r for r in refusals)
+    report.check(refusal_ok, "timeout = 0: the node refuses it by name, in both clients (\"timeout: seconds, more than 0\")" if refusal_ok
+                 else f"timeout = 0: JavaScript {st.get('refused')!r}, Python {py_sql['refused']!r}")
 
 
 def starting_check(report, tmp):

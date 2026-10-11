@@ -208,10 +208,14 @@ async function client(url, tlsUrl, dir) {
   });
 
   await check("viewTemporary", async () => {
-    const mine = await db.view("js_tv", "SELECT 7 AS x", { temporary: true }); // (awaited: its rows)
+    const answer = await db.view("js_tv", "SELECT 7 AS x", { temporary: true }); // (the node's answer for the CREATE)
+    const mine = await db.table("js_tv").rows(); // (the view, read as a table)
     const otherError = await connect(url, { onNotice: null }).sql("SELECT x FROM js_tv").then(() => null, (e) => e.message);
-    return { mine, otherError };
+    return { answer, mine, otherError };
   });
+
+  // A refusal rejects where the view is made: this names the table the query reads, which isn't there.
+  await check("viewRefused", () => db.view("bad", "SELECT * FROM no_such_table"));
 
   await check("watchMarks", async () => {
     await db.sql("CREATE TABLE js_wt (a INT)");
@@ -225,7 +229,16 @@ async function client(url, tlsUrl, dir) {
     const later = db.watch("js_wt", { after: position });
     const first = (await later.next()).value;
     await later.return();
-    return { rows: got.map((r) => r.a), markYielded: got.some((r) => "_after" in r), position, laterFirst: first.a };
+    // after: null is no `after` at all: only the rows committed from now on (the watch is on the node before row 4 comes)
+    const fresh = db.watch("js_wt", { after: null });
+    // (a refusal is this check's result, not an unhandled rejection that would end the run)
+    const pending = fresh.next().then((r) => r.value, (e) => ({ error: e.message }));
+    await new Promise((r) => setTimeout(r, 500));
+    await db.sql("INSERT INTO js_wt VALUES (4)");
+    const first4 = await pending;
+    await fresh.return();
+    return { rows: got.map((r) => r.a), markYielded: got.some((r) => "_after" in r), position, laterFirst: first.a,
+      nullFirst: first4?.a ?? null, nullError: first4?.error ?? null };
   });
 
   await check("closeArgument", () => db.close(1).then(() => "closed", (e) => e.message));
@@ -246,11 +259,20 @@ async function client(url, tlsUrl, dir) {
   const recorder = connect(url, { onNotice: null });
   const sendSql = recorder.sql.bind(recorder);
   recorder.sql = (query, params) => (sent.push(query), sendSql(query, params));
+  // timeout: 0 is sent (the text keeps it); the node refuses it, by name, and each side reports that refusal.
   await check("sqlText", async () => {
-    await recorder.createFunction("text_twice", { params: { x: ["INT", 1] }, returns: "INT", language: "sql", body: "SELECT x * 2", strict: true, volatility: "immutable" });
-    await recorder.createProcedure("text_proc", { params: { n: "INT" }, language: "sql", body: "SELECT $n" });
-    await recorder.view("text_view", "SELECT 1 AS x");
-    return sent.filter((t) => t.startsWith("CREATE"));
+    const refused = [];
+    const attempt = async (make) => {
+      try {
+        await make();
+      } catch (e) {
+        refused.push(e.message);
+      }
+    };
+    await attempt(() => recorder.createFunction("text_twice", { params: { x: ["INT", 1] }, returns: "INT", language: "sql", body: "SELECT x * 2", strict: true, volatility: "immutable", timeout: 0 }));
+    await attempt(() => recorder.createProcedure("text_proc", { params: { n: "INT" }, language: "sql", body: "SELECT $n", timeout: 0 }));
+    await attempt(() => recorder.view("text_view", "SELECT 1 AS x"));
+    return { texts: sent.filter((t) => t.startsWith("CREATE")), refused };
   });
 
   console.log(JSON.stringify(out));

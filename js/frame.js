@@ -460,10 +460,9 @@ export class Frame {
   /**
    * `query`: the SQL, or a promise of it. `ctes`: name → SQL (text or a promise), in order. `rel`: the
    * name this frame is, if it is one (a table, or a step that keeps its input). `order`: the sort in
-   * effect, `[SQL, column name]` pairs (or a promise of them). `waits`: promises a run waits for (a view
-   * `toView` is making). `table`: the table a write changes.
+   * effect, `[SQL, column name]` pairs (or a promise of them). `table`: the table a write changes.
    */
-  constructor(con, query, { ctes = new Map(), rel = null, params = {}, order = null, table = null, waits = [] } = {}) {
+  constructor(con, query, { ctes = new Map(), rel = null, params = {}, order = null, table = null } = {}) {
     this._con = con;
     this._query = query;
     this._ctes = new Map(ctes);
@@ -471,7 +470,6 @@ export class Frame {
     this._params = { ...params };
     this._order = order;
     this._table = table;
-    this._waits = waits;
     this._types = null; // (the columns: asked of the node once, as frame.py's `schema`)
     for (const p of [query, order, ...ctes.values()]) if (isPromise(p)) handled(p);
   }
@@ -484,7 +482,6 @@ export class Frame {
 
   /** The one SQL statement this frame is: each step a CTE. */
   async sql() {
-    await Promise.all(this._waits);
     const query = await this._query;
     if (!this._ctes.size) return query;
     const steps = await Promise.all([...this._ctes].map(async ([name, q]) => `${name} AS (${await q})`));
@@ -524,8 +521,8 @@ export class Frame {
 
   // building (frame.py's `_with`, `_as_rel`, `_step`, `_kept`, `_joined`)
 
-  _with(query, ctes = this._ctes, { order = null, rel = null, params = this._params, waits = this._waits } = {}) {
-    return new Frame(this._con, query, { ctes, rel, params, order, waits });
+  _with(query, ctes = this._ctes, { order = null, rel = null, params = this._params } = {}) {
+    return new Frame(this._con, query, { ctes, rel, params, order });
   }
 
   /** A name for this frame in the next step (a new CTE, unless it is one already). */
@@ -558,7 +555,7 @@ export class Frame {
     for (const [k, v] of Object.entries(other._params)) {
       if (k in this._params && this._params[k] !== v) throw new Error(`$${k} has two values`);
     }
-    return { ctes: new Map([...this._ctes, ...other._ctes]), params: { ...this._params, ...other._params }, waits: [...this._waits, ...other._waits] };
+    return { ctes: new Map([...this._ctes, ...other._ctes]), params: { ...this._params, ...other._params } };
   }
 
   // rows and columns
@@ -702,7 +699,7 @@ export class Frame {
   /** Polars' join: the key once (inner, left, right), both kept (full), the right side's other columns
    * with `suffix` where names clash. `how`: inner, left, right, full, cross, semi, anti. */
   join(other, { on = null, how = "inner", leftOn = null, rightOn = null, suffix = "_right" } = {}) {
-    const { ctes, params, waits } = this._joined(other);
+    const { ctes, params } = this._joined(other);
     const lr = this._asRel(ctes);
     const rr = other._asRel(ctes);
     const lk = flat([leftOn || on || []]);
@@ -713,7 +710,7 @@ export class Frame {
     const pairs = lk.slice(0, rk.length).map((a, i) => `${l}.${quote(a)} = ${r}.${quote(rk[i])}`);
     const cond = pairs.join(" AND ") || "TRUE";
     if (how === "semi" || how === "anti") {
-      return this._with(`SELECT ${l}.* FROM ${lr} AS ${l} LEFT ${how.toUpperCase()} JOIN ${rr} AS ${r} ON ${cond}`, ctes, { params, waits });
+      return this._with(`SELECT ${l}.* FROM ${lr} AS ${l} LEFT ${how.toUpperCase()} JOIN ${rr} AS ${r} ON ${cond}`, ctes, { params });
     }
     const kinds = new Map(Object.entries({ inner: "JOIN", left: "LEFT JOIN", right: "RIGHT JOIN", full: "FULL JOIN", outer: "FULL JOIN", cross: "CROSS JOIN" }));
     if (!kinds.has(how)) throw new Error(`how: ${how}: inner, left, right, full, cross, semi or anti`);
@@ -733,7 +730,7 @@ export class Frame {
       }
       return `SELECT ${[...left, ...right].join(", ")} FROM ${lr} AS ${l} ${kinds.get(how)} ${rr} AS ${r}${onText}`;
     });
-    return this._with(text, ctes, { params, waits });
+    return this._with(text, ctes, { params });
   }
 
   /** The rows of both, each once (SQL's UNION); `{ distinct: false }` keeps repeats (UNION ALL). */
@@ -742,16 +739,16 @@ export class Frame {
   except(other) { return this._set(other, "EXCEPT"); }
 
   _set(other, op) {
-    const { ctes, params, waits } = this._joined(other);
+    const { ctes, params } = this._joined(other);
     const lr = this._asRel(ctes);
     const rr = other._asRel(ctes);
-    return this._with(`SELECT * FROM ${lr} ${op} SELECT * FROM ${rr}`, ctes, { params, waits });
+    return this._with(`SELECT * FROM ${lr} ${op} SELECT * FROM ${rr}`, ctes, { params });
   }
 
   /** Each row with the right side's nearest earlier (backward) or later (forward) row by `on`, within
    * `by` (SQL's ASOF JOIN). */
   joinAsof(other, { on = null, leftOn = null, rightOn = null, by = null, byLeft = null, byRight = null, strategy = "backward", suffix = "_right" } = {}) {
-    const { ctes, params, waits } = this._joined(other);
+    const { ctes, params } = this._joined(other);
     const lr = this._asRel(ctes);
     const rr = other._asRel(ctes);
     const lo = leftOn || on;
@@ -770,7 +767,7 @@ export class Frame {
       const onText = bl.length ? ` ON ${bl.slice(0, br.length).map((a, i) => `${l}.${quote(a)} = ${r}.${quote(br[i])}`).join(" AND ")}` : "";
       return `SELECT ${[`${l}.*`, ...right].join(", ")} FROM ${lr} AS ${l} ASOF JOIN ${rr} AS ${r} MATCH_CONDITION (${l}.${quote(lo)} ${ops.get(strategy)} ${r}.${quote(ro)})${onText}`;
     });
-    return this._with(text, ctes, { params, waits });
+    return this._with(text, ctes, { params });
   }
 
   // results
@@ -823,16 +820,17 @@ export class Frame {
 
   /** A view others read by name, made now (`CREATE VIEW`; `materialized`: kept up to date; `temporary`:
    * this connection's only, and never materialized). `replace: false` refuses to replace one that exists.
-   * The frame returned is the view's table. */
-  toView(name, { temporary = false, materialized = false, replace = null, ...options } = {}) {
+   * Resolves to the node's answer for the CREATE; a refusal rejects here, naming what the node refused.
+   * Read the view with `db.table(name)`: a frame is a query, and awaiting one reads its rows. */
+  async toView(name, { temporary = false, materialized = false, replace = null, ...options } = {}) {
     if (temporary && materialized) throw new Error("temporary and materialized: a temporary view is this connection's alone, and the lake keeps a materialized one");
     const opts = Object.entries(options);
     if (opts.length && !materialized) throw new Error(`${opts.map(([k]) => k).join(", ")}: options of a materialized view ({ materialized: true })`);
     const withs = opts.length ? ` WITH (${opts.map(([k, v]) => `${k} = ${literal(v)}`).join(", ")})` : "";
     const head = materialized ? `CREATE MATERIALIZED VIEW ${name}${withs} AS`
       : `CREATE ${replace === false ? "" : "OR REPLACE "}${temporary ? "TEMP " : ""}VIEW ${name} AS`;
-    const made = this.sql().then((text) => this._con.sql(`${head} ${text}`, this._params));
-    return new Frame(this._con, `SELECT * FROM ${name}`, { rel: name, table: name, waits: [handled(made)] });
+    const text = await this.sql();
+    return this._con.sql(`${head} ${text}`, this._params);
   }
 
   /** Its rows into a table: `create` (CREATE TABLE … AS), `append` (INSERT) or `overwrite` (a new
@@ -1027,7 +1025,7 @@ export function concat(frames, { how = "vertical" } = {}) {
     const more = out._joined(f);
     for (const [k, v] of more.ctes) ctes.set(k, v);
     rels.push(f._asRel(ctes));
-    out = out._with(out._query, ctes, { params: more.params, waits: more.waits });
+    out = out._with(out._query, ctes, { params: more.params });
   }
   const glue = how === "diagonal" ? " UNION ALL BY NAME " : " UNION ALL ";
   return out._with(rels.map((r) => `SELECT * FROM ${r}`).join(glue), ctes);

@@ -711,7 +711,8 @@ def _params(params):
 
 
 def _with(options):
-    given = {k: v for k, v in options.items() if v not in (None, False, "")}
+    # (0 is a value: `0 in (None, False, "")` is true, since 0 == False, so it is tested one way at a time)
+    given = {k: v for k, v in options.items() if not (v is None or v is False or v == "")}
     return (" WITH (" + ", ".join(f"{k} = {_literal(v if not isinstance(v, (list, tuple)) else ', '.join(v))}" for k, v in given.items()) + ")") if given else ""
 
 
