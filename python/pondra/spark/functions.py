@@ -146,8 +146,16 @@ def exp(c):
     return _f("EXP", c, sql="exp")
 
 
-def log(c):
-    return _f("ln", c)
+def log(arg1, arg2=None):
+    """PySpark's log: `log(c)` is the natural log, `log(base, c)` the log in `base`, a float (`2.0`,
+    as PySpark takes it). A value of 0 or less is NULL, as Spark answers it, not -inf or NaN."""
+    if arg2 is None:
+        x = _col(arg1)
+        return Column(f"CASE WHEN {x.sql} > 0 THEN ln({x.sql}) END", f"ln({x._name})")
+    if not isinstance(arg1, float):
+        raise TypeError("log(base, c): the base is a float, as PySpark takes it (2.0, not 2)")
+    x = _col(arg2)
+    return Column(f"CASE WHEN {x.sql} > 0 THEN log({_lit(arg1).sql}, {x.sql}) END", f"LOG({arg1}, {x._name})")
 
 
 def pow(c, p):  # noqa: A001

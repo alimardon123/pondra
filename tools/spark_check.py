@@ -574,6 +574,15 @@ def p_first_last_ignorenulls(spark, F, Window):  # first and last skip NULLs wit
                      F.last("s", ignorenulls=True).over(w).alias("last_kept"), F.last("s").over(w).alias("last_any"))
 
 
+def p_log_base_and_nonpositive(spark, F, Window):  # log(c) is ln, log(2.0, c) is base 2; 0, below 0 and NULL give NULL
+    df = spark.createDataFrame([(8.0,), (0.0,), (-1.0,), (None,), (2.5,)], "x double")
+    return df.select(F.log(F.col("x")), F.log(2.0, F.col("x")))
+
+
+def p_log_int_base_raises(spark, F, Window):  # PySpark takes the base as a float: log(2, c) is a TypeError
+    return spark.createDataFrame([(8.0,)], "x double").select(F.log(2, F.col("x"))).collect()
+
+
 def _row_class(spark):
     """PySpark's Row, or Pondra's, by the session that is asked."""
     if type(spark).__module__.startswith("pondra"):
@@ -679,6 +688,8 @@ PIPELINES = [
     ("sample_with_replacement_refused", None, "refused", p_sample_with_replacement_refused),
     ("sample_int_argument_raises", None, "raises", p_sample_int_argument_raises),
     ("first_last_ignorenulls", False, "frame", p_first_last_ignorenulls),
+    ("log_base_and_nonpositive_null", False, "frame", p_log_base_and_nonpositive),
+    ("log_int_base_raises", None, "raises", p_log_int_base_raises),
 ]
 
 
