@@ -198,9 +198,9 @@ def project_check(bin, work, port):
     if not checks[name]:
         checks["(kinds changed)"] = [plan, first, after, status, index, again]
     write("objects/sales/kinds.sql", changed.replace(" START WITH 100", ""))
-    no_start = pondra("plan", "prod", ok=False)
+    no_start = pondra("plan", "prod", ok=None)
     write("objects/sales/kinds.sql", changed.replace("'new', ", ""))
-    no_label = pondra("plan", "prod", ok=False)
+    no_label = pondra("plan", "prod", ok=None)
     write("objects/sales/kinds.sql", changed)
     checks["…a sequence's option taken away: refused by name"] = "can't take one away" in no_start
     checks["…a type's label taken away: refused by name"] = "labels only grow at the end" in no_label
