@@ -1,7 +1,7 @@
 //! A node: one lake served, from its start to its stop (ADR-061). The program (`cli.rs`) starts one
 //! with its signals and standard input around it; a library will start and stop one in its own process.
 use crate::*;
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, sync::{Arc, OnceLock}, time::Duration};
 
 /// What a node is started with: `pondra serve`'s options for one lake, worked out (cli.rs).
 pub(crate) struct Options {
@@ -26,19 +26,43 @@ pub(crate) struct Options {
     pub auth: Arc<auth::Auth>,
 }
 
+/// What a node holds as it starts (its term when it leads, then its lake), so a stop at any point gives back what was taken (invariant 46).
+#[derive(Default)]
+pub(crate) struct Held {
+    term: OnceLock<(store::Store, u64)>,
+    lake: OnceLock<Arc<store::Lake>>,
+}
+
+impl Held {
+    /// What a node does once drained (`drain.rs`, which the program runs first, with a second signal
+    /// racing it): what it committed is made durable, the catalog is checkpointed, and a leader gives up
+    /// its term, so the next node leads at once instead of waiting out the lease (invariant 210). A node
+    /// stopped before its lake is open gives up its term without the durable wait and the checkpoint.
+    pub(crate) async fn stop(&self) {
+        if let Some((store, n)) = self.term.get() {
+            if let Some(l) = self.lake.get() {
+                // (what it committed in the bucket, with replicated acks too; the catalog's
+                // memtable written out: the next leader replays no WAL, C5)
+                let _ = tokio::time::timeout(Duration::from_secs(10), l.cat.wait_durable(l.cat.committed())).await;
+                let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.checkpoint()).await;
+            }
+            cluster::step_down(store, *n).await;
+        }
+    }
+}
+
 /// A node serving one lake: started, serving, then stopped.
 pub(crate) struct Node {
-    lake: Arc<store::Lake>,
-    store: store::Store,
-    /// The term this node leads, when it leads (`None` for a follower or a reader).
-    term: Option<u64>,
+    /// What this node holds, given back by `stop`.
+    held: Arc<Held>,
     /// The HTTP door, served on a task of its own: `serving` waits on it.
     served: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
 impl Node {
     /// Everything `pondra serve` did before it served, then the HTTP door served on a task of its own.
-    pub(crate) async fn start(o: Options) -> anyhow::Result<Node> {
+    /// `held` takes what this start takes (the term, then the lake), so a stop during the start gives it back.
+    pub(crate) async fn start(o: Options, held: Arc<Held>) -> anyhow::Result<Node> {
         let Options { dir, listen, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth } = o;
         let (_, store, _) = store::open_store(&dir)?;
         let t_start = std::time::Instant::now();
@@ -46,14 +70,16 @@ impl Node {
         let addr = advertise.unwrap_or_else(|| listen.clone()); // (how others reach it: its cluster name)
         sharing::set_endpoint(&addr); // (where a recipient's profile points: `sharing.rs`)
         let cluster = cluster::Cluster::join(&store, &addr, reader).await?;
-        tr("the lease");
         let leader = cluster.is_leader();
+        if leader {
+            // (taken before the trace below, so a stop that follows the trace line finds it)
+            let _ = held.term.set((store.clone(), cluster.leader.n)); // (given back by a stop from here on: `Held::stop`)
+        }
+        tr("the lease");
         if leader {
             // "Still here", in the bucket, from the start: for machines outside the cluster.
             cluster.clone().keep_alive(store.clone(), &dir); // (beside the catalog's opening, not before it: C5)
         }
-        // (what `stop` needs once the node is up: the store, and the term when it leads)
-        let (s, n) = (store.clone(), leader.then_some(cluster.leader.n));
         // Read-only nodes follow the leader's commit stream too (when a live one is there to ask),
         // so their reads are as fresh as a follower's instead of waiting for catalog polls.
         let streamed = !leader && !cluster.leader.addr.is_empty() && (!reader || cluster.leader_alive().await);
@@ -79,6 +105,7 @@ impl Node {
             }
             lake => lake?,
         };
+        let _ = held.lake.set(lake.clone()); // (a stop from here on makes the lake durable first: `Held::stop`)
         tr("the lake open");
         for spec in &attached {
             attach(&lake, spec, &addr, true).await?;
@@ -307,9 +334,9 @@ impl Node {
             let l = app.lake.clone(); // (what it inherited, replayed from the WAL, into every node's view)
             tokio::spawn(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
         }
-        // (the HTTP door on a task of its own: `serving` waits on it, and the program stops the node by its signals)
-        let served = tokio::spawn(async move { axum::serve(listener, server::router(app).into_make_service_with_connect_info::<tls::Peer>()).await.map_err(anyhow::Error::from) }); // (who asks: `console::save_settings`)
-        Ok(Node { lake, store: s, term: n, served })
+        // (the HTTP door, a loop the node can't do without: a panic in it aborts, as invariant 178 says; `serving` waits on it)
+        let served = panics::spawn(async move { axum::serve(listener, server::router(app).into_make_service_with_connect_info::<tls::Peer>()).await.map_err(anyhow::Error::from) }); // (who asks: `console::save_settings`)
+        Ok(Node { held, served })
     }
 
     /// Until the HTTP door stops. An error ends the program, as it did when `serve` ran the door inline.
@@ -317,18 +344,9 @@ impl Node {
         (&mut self.served).await?
     }
 
-    /// What a node does once drained (`drain.rs`, which the program runs first, with a second signal
-    /// racing it): what it committed is made durable, the catalog is checkpointed, and a leader gives up
-    /// its term, so the next node leads at once instead of waiting out the lease (invariant 210).
+    /// Once drained (`drain.rs`, run by the program first): gives back what the node holds (`Held::stop`).
     pub(crate) async fn stop(&self) {
-        if let Some(n) = self.term {
-            let l = &self.lake;
-            // (what it committed in the bucket, with replicated acks too; the catalog's
-            // memtable written out: the next leader replays no WAL, C5)
-            let _ = tokio::time::timeout(Duration::from_secs(10), l.cat.wait_durable(l.cat.committed())).await;
-            let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.checkpoint()).await;
-            cluster::step_down(&self.store, n).await;
-        }
+        self.held.stop().await
     }
 }
 

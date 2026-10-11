@@ -375,11 +375,15 @@ async fn run() -> anyhow::Result<()> {
             // next node leads at once instead of waiting out the lease. Watched from before the node
             // starts, so a stop while it starts is seen too (invariant 46).
             let mut stop = panics::spawn(stopped(stop_with_stdin));
+            let held = Arc::new(node::Held::default()); // (what the start takes, given back by a stop: `node.rs`)
             let mut node = tokio::select! {
-                // (a node stopped while it starts ends there: nothing serves yet to drain, and a
-                // leader's term runs out with its lease rather than being given up)
-                started = node::Node::start(node::Options { dir, listen: addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth }) => started?,
-                _ = &mut stop => std::process::exit(0),
+                started = node::Node::start(node::Options { dir, listen: addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth }, held.clone()) => started?,
+                // (a node stopped while it starts gives back what it took so far, a leader its term, so
+                // the next node leads at once; there is no drain here, since nothing serves yet)
+                _ = &mut stop => {
+                    held.stop().await;
+                    std::process::exit(0);
+                }
             };
             tokio::select! {
                 served = node.serving() => served?,
