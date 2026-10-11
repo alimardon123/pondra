@@ -133,7 +133,7 @@ fn tools() -> Value {
          "inputSchema": args(json!({"sql": {"type": "string"}, "job": {"type": "string", "description": "an id for this write: retried with the same id, it is applied once"}}), &["sql"]),
          "description": "Runs any script: one statement or several, a SELECT or a CALL among them, and BEGIN … COMMIT or ROLLBACK (see below). \
              INSERT, UPDATE or DELETE; CREATE/DROP of a TABLE, VIEW, \
-             MATERIALIZED VIEW or SCHEMA. Committed and durable when this returns. Needs a write token; CREATE and DROP an admin token. \
+             MATERIALIZED VIEW or SCHEMA. Outside a transaction, committed and durable when this returns. Needs a write token; CREATE and DROP an admin token. \
              In a session (the client keeps the Mcp-Session-Id that initialize gave, as MCP's SDKs do), BEGIN … COMMIT and ROLLBACK \
              make a transaction, committed as one; without a session each call is on its own. A session idle for PONDRA_SESSION_IDLE_SECS \
              (3600) ends, its transaction rolled back, and its next call is HTTP 404: send initialize again."},
