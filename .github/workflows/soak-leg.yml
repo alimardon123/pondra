@@ -46,8 +46,10 @@ jobs:
           run=$(bash tools/ci_build.sh "$SHA")
           [ -n "$run" ] || { echo "::error::no passing build run for $SHA: wait for it (a pull request's needs full-ci), or use binary: build"; exit 1; }
           gh run download "$run" --name pondra-linux-x64 --dir dl && tar -xzf dl/pondra-linux-x64.tar.gz pondra
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         if: fromJSON(inputs.plan).binary == 'build'
+        with:
+          toolchain: stable
       - name: Or build from source
         if: fromJSON(inputs.plan).binary == 'build'
         run: cargo build --profile dist && cp target/dist/pondra pondra

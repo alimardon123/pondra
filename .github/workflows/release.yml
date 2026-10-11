@@ -3,7 +3,7 @@ name: release
 # A tag vX.Y.Z (or a run started by hand): publishes what the build workflow made and tested for
 # that very commit (build.yml: the five platforms' wheels, npm packages and installer archives,
 # each tried on its platform, and the suite run on the Linux binary) to a GitHub release with
-# install.sh and install.ps1, to PyPI and to npm. Nothing is built here, so a release takes a
+# install.sh, install.ps1 and SHA256SUMS, to PyPI and to npm. Nothing is built here, so a release takes a
 # minute or two: tag a commit once its build is green. A merge to main that changed nothing in a
 # pull request's code isn't built again: its packages are the pull request's (tools/ci_build.sh). A build still running is waited for; one
 # that failed stops the release (re-run its failed jobs, then this).
@@ -61,6 +61,8 @@ jobs:
             ls dist/pondra-$v-*.whl dist/pondra-$p-$v.tgz "$a" > /dev/null || exit 1
           done
           [ "$(ls dist/pondra-$v-*.whl | wc -l)" = 5 ] && ls dist/pondra-$v.tgz
+      - name: Every file's SHA-256 (install.sh and install.ps1 check the archive they download against it)
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -72,7 +74,7 @@ jobs:
           subject-path: dist/*
       - name: GitHub release (with the installers, and how to install at the top)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           body_path: .github/release.md
           generate_release_notes: true
@@ -83,7 +85,7 @@ jobs:
       - run: mkdir pypi && mv dist/*.whl pypi/
       - name: PyPI
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: pypi
           skip-existing: true # (a run started again publishes only what's missing)
