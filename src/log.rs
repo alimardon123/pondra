@@ -89,6 +89,8 @@ pub struct Filing {
     pub added: Vec<DataFile>,
     pub removed: Vec<DataFile>,
     pub deleted: Vec<(DataFile, Vec<crate::scan::Delete>)>,
+    pub also: Vec<(String, Vec<u8>)>, // catalog writes of the same commit beside the table's entry (a COPY INTO file's record)
+    pub gone: Vec<String>,            // keys the same commit deletes (the job mark of a version the record replaces)
 }
 
 fn is_zero(n: &u64) -> bool { *n == 0 }
@@ -549,6 +551,7 @@ pub fn forget_producers(names: impl IntoIterator<Item = String>) { FORGOTTEN.loc
 #[allow(clippy::too_many_arguments)]
 async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mut HashMap<String, u64>, sequences: &mut crate::seq::Held, held: &Held, batch: Vec<(Flush, oneshot::Sender<Outcome>)>, ms: &Arc<Mutex<Vec<f64>>>, slot: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
     let (mut puts, mut seqs, mut replies) = (vec![], HashMap::<String, u64>::new(), vec![]);
+    let mut lost: Vec<String> = vec![]; // (keys the filings of this commit delete: `Filing::gone`)
     let (mut inline, mut inline_parts) = (vec![], BTreeMap::<String, Vec<(u64, u64, u64)>>::new()); // all inline flushes: one segment
     for p in std::mem::take(&mut *FORGOTTEN.lock().unwrap()) {
         last_seq.remove(&p);
@@ -651,11 +654,13 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
             (false, false) => {
                 let (seg, ts) = (*next, now_ms());
                 let mut files = BTreeMap::new();
-                for Filing { table, mut meta, mut added, removed, deleted } in filings {
+                for Filing { table, mut meta, mut added, removed, deleted, also, gone } in filings {
                     added.iter_mut().for_each(|d| stamp_file(d, seg, ts));
                     meta.files.extend(added.iter().cloned());
                     meta.rows_at = seg;
                     puts.push((table_key(&table), json(&meta))); // (the leader's, under the lake's lock)
+                    puts.extend(also); // (a COPY INTO file's record: in the commit that records its rows)
+                    lost.extend(gone);
                     files.insert(table, Filed { added, removed, deleted });
                 }
                 *next += span(&parts, &files);
@@ -686,12 +691,16 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
     if *block != blocks {
         puts.push(("b".into(), json(block)));
     }
-    let (counters, dropped) = sequences.writes();
+    let (counters, mut dropped) = sequences.writes();
+    dropped.extend(lost);
     puts.extend(counters);
     if takes == Some(true) {
         puts.push((crate::store::QUIET.into(), json(&true))); // (remembered answers stay, unless something else here is loud)
     }
     let (t0, durable) = (Instant::now(), lake.cat.write(puts, &dropped).await?);
+    // (the job marks this commit deleted: forgotten once the delete is written, so the cache holds
+    // them until then; `copy::entries`)
+    forget_producers(dropped.iter().filter_map(|k| k.strip_prefix("p/job:").map(|j| format!("job:{j}"))));
     last_seq.extend(seqs);
     let (lake, ms, hwm) = (lake.clone(), ms.clone(), *next - 1);
     crate::panics::spawn(async move {
