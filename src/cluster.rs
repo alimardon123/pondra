@@ -13,6 +13,9 @@
 //! * The leader also marks itself alive in the bucket every 10 s (`cluster/alive/{n}`), for
 //!   machines outside the cluster: a node starting on an idle lake leads at once instead of
 //!   waiting out a lease, and a `pondra sql` INSERT never deposes a leader it merely can't reach.
+//!   A claimer also holds a lock file in this machine's temp folder (named in its term record), so
+//!   a process on the same machine knows at once that a killed claimer is gone; another machine
+//!   has no file to look at and waits for the mark.
 use crate::replica::ReplicaLog;
 use crate::store::{Frame, Lake, Store};
 use anyhow::Result;
@@ -20,6 +23,7 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::{path::Path, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +37,10 @@ pub const CUT_OFF_SAYS: &str = "this node leads but can't reach the bucket: anot
 pub struct Term {
     pub n: u64,
     pub addr: String, // the leader of this term
+    /// The claim's lock file on the machine that claimed it (`HELD`), or empty (older releases, or a
+    /// temp folder that couldn't take one): 32 hex characters, never a path.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lock: String,
 }
 
 pub struct Cluster {
@@ -53,8 +61,12 @@ impl Cluster {
     pub async fn join(store: &Store, addr: &str, reader: bool) -> Result<Arc<Cluster>> {
         let leader = loop {
             match latest(store).await? {
+                Some(t) if t.addr == addr && !reader => {
+                    relock(&t); // ours, after a restart: the exec let go of its lock
+                    break t;
+                }
                 Some(t) if t.addr == addr || reader => break t, // ours, or we only read anyway
-                None if reader => break Term { n: 0, addr: String::new() },
+                None if reader => break Term { n: 0, addr: String::new(), lock: String::new() },
                 Some(t) if alive(store, &t).await && !t.addr.is_empty() => break t,
                 Some(t) if alive(store, &t).await => tokio::time::sleep(Duration::from_secs(1)).await, // a `pondra sql` INSERT is recording: wait
                 t => {
@@ -214,8 +226,8 @@ impl Cluster {
                     }
                     // A member that lost the leader takes over after the lease (if no peer still
                     // hears it). One that never reached it — say, outside the cluster's network —
-                    // only once the leader's mark in the bucket is stale: it never deposes a live one.
-                    Err(_) if (!self.leader_ok() && self.heard.load(std::sync::atomic::Ordering::Relaxed)) || !alive(&store, &self.leader).await => match latest(&store).await {
+                    // only once the leader is gone (`alive`): it never deposes a live one.
+                    Err(_) if if self.heard.load(std::sync::atomic::Ordering::Relaxed) { !self.leader_ok() } else { !alive(&store, &self.leader).await } => match latest(&store).await {
                         Ok(Some(t)) if t.n > self.leader.n => restart(&format!("term {} has a newer leader", t.n)), // follow it
                         Ok(_) if self.peer_sees_leader().await => {}     // only our link to the leader is down
                         Ok(_) => {
@@ -420,12 +432,25 @@ pub async fn latest(store: &Store) -> Result<Option<Term>> {
 /// Try to become leader of term `n`: put-if-absent, so at most one node succeeds. (`addr` is
 /// empty for a `pondra sql` INSERT recording its files: nothing to follow, just wait for it.)
 pub async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
-    let term = Term { n, addr: addr.into() };
+    let lock = new_lock(); // (its id goes into the record: a process here can tell when we're gone)
+    let term = Term { n, addr: addr.into(), lock: lock.as_ref().map(|(id, ..)| id.clone()).unwrap_or_default() };
+    let lock = lock.map(|(_, path, f)| (path, f));
     let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
     match store.put_opts(&Path::from(format!("cluster/term/{n:020}")), serde_json::to_vec(&term)?.into(), opts).await {
-        Ok(_) => mark_alive(store, n).await.map(|_| Some(term)),
-        Err(object_store::Error::AlreadyExists { .. }) => Ok(None),
-        Err(e) => Err(e.into()),
+        Ok(_) => {
+            if let Some(held) = lock {
+                HELD.lock().unwrap().insert(n, held);
+            }
+            mark_alive(store, n).await.map(|_| Some(term))
+        }
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            discard(lock); // someone else won the term
+            Ok(None)
+        }
+        Err(e) => {
+            discard(lock);
+            Err(e.into())
+        }
     }
 }
 
@@ -435,17 +460,153 @@ pub async fn mark_alive(store: &Store, n: u64) -> Result<()> {
     Ok(())
 }
 
-/// Has the holder of term `t` marked itself alive in the last 30 s?
+/// Is the holder of term `t` alive? A claim made on this machine is alive while its process holds
+/// its lock file; anywhere else, it is alive if it marked itself alive in the last 30 s.
 pub async fn alive(store: &Store, t: &Term) -> bool {
+    if gone_here(t) {
+        return false; // a claimer on this machine that ended can't be alive, whatever its mark says
+    }
     match store.head(&Path::from(format!("cluster/alive/{:020}", t.n))).await {
         Ok(m) => (crate::log::now_ms() as i64 - m.last_modified.timestamp_millis()) < 30_000,
         Err(_) => false,
     }
 }
 
-/// A one-off writer is done: whoever comes next doesn't wait for its mark to go stale.
+/// A one-off writer is done: whoever comes next doesn't wait for its mark to go stale, nor for its
+/// lock file to be let go.
 pub async fn release(store: &Store, n: u64) {
     let _ = store.delete(&Path::from(format!("cluster/alive/{n:020}"))).await;
+    let held = HELD.lock().unwrap().remove(&n);
+    discard(held);
+}
+
+/// The lock files of the terms this process claimed (or took back after a restart), each locked until
+/// the term is let go (`release`) or the process ends, however it ends: the OS lets go then. Keyed by
+/// term number. (A process holds one claim per term number: one lake at a time.)
+static HELD: Mutex<BTreeMap<u64, (PathBuf, std::fs::File)>> = Mutex::new(BTreeMap::new());
+
+/// This user's folder of claim lock files, in the temp folder: per user on macOS and Windows, and
+/// named by the user's id on Linux, where `/tmp` is shared. Made 0700, and used only while it is
+/// ours alone, so no other user can take a lock away (and make a live leader look gone). None: the
+/// claims go on without locks, and the mark decides.
+fn lock_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let uid = unsafe { libc::getuid() };
+        let dir = std::env::temp_dir().join(format!("pondra-terms-{uid}"));
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+        let m = std::fs::symlink_metadata(&dir).ok()?;
+        (m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0).then_some(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let dir = std::env::temp_dir().join("pondra-terms");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }
+}
+
+/// Where term `t`'s lock file would be here: its id is trusted only as 32 hex characters (it comes
+/// from the bucket, so it must never become a path).
+fn lock_path(t: &Term) -> Option<PathBuf> {
+    let ok = t.lock.len() == 32 && t.lock.bytes().all(|b| b.is_ascii_hexdigit());
+    ok.then(|| lock_dir().map(|d| d.join(format!("{}.lock", t.lock)))).flatten()
+}
+
+fn open_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> { std::fs::OpenOptions::new().read(true).write(true).open(path) }
+
+/// A new claim's lock file: a random id (written into the term record) and the file, locked by this
+/// process. None when the folder can't take one: the claim goes on without it, and the next writer
+/// waits for the mark, as before.
+fn new_lock() -> Option<(String, PathBuf, std::fs::File)> {
+    let dir = lock_dir()?;
+    sweep_locks(&dir);
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let path = dir.join(format!("{id}.lock"));
+    let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).ok()?;
+    if f.try_lock().is_ok() {
+        return Some((id, path, f));
+    }
+    discard(Some((path, f)));
+    None
+}
+
+/// Removes the lock files of claims whose process has ended: files a day old that nobody holds. Best
+/// effort. (The age keeps the sweep off any claim made just now.)
+fn sweep_locks(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let path = e.path();
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(24 * 3600));
+        if !old || !path.extension().is_some_and(|x| x == "lock") {
+            continue;
+        }
+        let Ok(f) = open_lock(&path) else { continue };
+        if f.try_lock().is_ok() {
+            drop(f); // (Windows can't delete a file that's open)
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Lets go of a claim's lock file and removes it (best effort).
+fn discard(held: Option<(PathBuf, std::fs::File)>) {
+    if let Some((path, f)) = held {
+        drop(f); // (Windows can't delete a file that's open)
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// What a claim's lock file says: nothing while its process runs, `restarting <ms>` from when it
+/// restarts itself (`restart`) until it takes the lock back (`relock`).
+fn say(f: &std::fs::File, what: &str) {
+    use std::io::{Seek, Write};
+    let mut f = f;
+    let _ = f.set_len(0).and_then(|_| f.seek(std::io::SeekFrom::Start(0))).and_then(|_| f.write_all(what.as_bytes()));
+}
+
+/// Has the process that claimed term `t` on this machine ended? Its lock file is here, nobody holds
+/// it, and it didn't say it was restarting in the last 30 s (an exec lets go of the lock, and so does
+/// a restart on Windows: the claimer is coming back, so it isn't gone). A claim made on another
+/// machine, or by another user, has no file here: its mark decides, as invariant 17 asks.
+fn gone_here(t: &Term) -> bool {
+    let Some(path) = lock_path(t) else { return false };
+    if HELD.lock().unwrap().contains_key(&t.n) {
+        return false; // this very process holds it
+    }
+    let Ok(mut f) = open_lock(&path) else { return false };
+    if f.try_lock().is_err() {
+        return false; // its claimer holds it (a lock taken here ends with `f`)
+    }
+    let mut said = String::new();
+    let _ = std::io::Read::read_to_string(&mut f, &mut said);
+    let restarting = said.strip_prefix("restarting ").and_then(|ms| ms.parse::<u64>().ok());
+    !restarting.is_some_and(|ms| crate::log::now_ms().saturating_sub(ms) < 30_000)
+}
+
+/// Back after a restart, as the leader of term `t`: take its lock again (the exec, or the old
+/// process's end, let go of it) and clear what it said. Windows may not have let the old process go
+/// yet: then wait for its lock in the background.
+fn relock(t: &Term) {
+    let Some(path) = lock_path(t) else { return };
+    let Ok(f) = open_lock(&path) else { return };
+    let n = t.n;
+    match f.try_lock() {
+        Ok(()) => {
+            say(&f, "");
+            HELD.lock().unwrap().insert(n, (path, f));
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            std::thread::spawn(move || {
+                if f.lock().is_ok() {
+                    say(&f, "");
+                    HELD.lock().unwrap().insert(n, (path, f));
+                }
+            });
+        }
+        Err(_) => {} // the mark still covers it
+    }
 }
 
 /// The leader of term `n` stops, drained (`drain.rs`): it says so (`cluster/left/{n}`), so its
@@ -462,6 +623,11 @@ async fn stepped_down(store: &Store, n: u64) -> bool { store.head(&Path::from(fo
 /// (By the path it was started with: if the binary was upgraded in place, the new one starts.)
 pub fn restart(why: &str) -> ! {
     eprintln!("restarting to rejoin the cluster: {why}");
+    // (our claims' lock files say we're coming back: an exec, or a new process on Windows, lets go of
+    // them for a moment, and nobody here may take that for our end: `gone_here`)
+    if let Ok(held) = HELD.lock() {
+        held.values().for_each(|(_, f)| say(f, &format!("restarting {}", crate::log::now_ms())));
+    }
     let mut args = std::env::args_os();
     let mut cmd = std::process::Command::new(args.next().expect("argv[0]"));
     cmd.args(args);

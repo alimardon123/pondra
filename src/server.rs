@@ -143,7 +143,7 @@ pub fn router(app: App) -> Router {
         .route("/stats", get(stats))
         .route("/healthz", get(|| async { "ok" })) // (the process answers: a liveness probe)
         .route("/ready", get(ready))
-        .route("/login", post(login))
+        .route("/login", post(login).layer(axum::extract::DefaultBodyLimit::max(64 << 10))) // (asked before any sign-in: a small body)
         .route("/whoami", get(whoami))
         .route("/plan", post(apply))
         .route("/apply", post(apply))
@@ -397,7 +397,10 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         Some(p) => p,
         None if owner(req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
         None if starting && needed == crate::auth::Role::None => crate::auth::Principal::of(crate::auth::Role::None), // (a probe while it catches up: answered, never held)
-        None if app.open().await => crate::auth::Principal::of(crate::auth::Role::Admin),
+        None if app.open().await => match crate::auth::cross_site(req.headers(), req.method(), from, &app.cluster.addr) {
+            Some(why) => return (StatusCode::FORBIDDEN, why).into_response(), // (a browser's page from elsewhere: `auth::cross_site`)
+            None => crate::auth::Principal::of(crate::auth::Role::Admin),
+        },
         None if header.is_some() => {
             crate::audit::refused(&app, &basic_user(header.as_deref()), "http", from, &format!("{} {}", req.method(), req.uri().path()), "wrong token, or user name and password");
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
@@ -422,6 +425,14 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             }
         };
     }
+    // (a change a node sends its leader for a user runs as that user: `auth::AS_USER`)
+    let who = match req.headers().get(crate::auth::AS_USER).and_then(|v| v.to_str().ok()) {
+        Some(user) if who.operator => match crate::users::principal(&app.lake, user).await {
+            Ok(p) => p.at("http", from),
+            Err(e) => return (StatusCode::FORBIDDEN, format!("{e:#}")).into_response(),
+        },
+        _ => who,
+    };
     req.extensions_mut().insert(who.role);
     let heavy = queries(req.uri().path());
     // (a Python procedure of an apply calls back with its lent token: those calls are the apply's, as its statements are)
@@ -541,7 +552,9 @@ async fn beat(State(app): State<App>, Query(p): Query<BeatParams>, headers: axum
 /// A follower's flush, to be sequenced (leader only).
 async fn commit(State(app): State<App>, body: Bytes) -> Result<Json<crate::log::Outcome>, E> {
     let seq = app.seq.as_ref().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
-    Ok(Json(seq.submit(decode_flush(body)?).await?))
+    let flush = decode_flush(body)?;
+    crate::auth::flush_from_writer(&flush)?; // (a write token's: rows, and no more)
+    Ok(Json(seq.submit(flush).await?))
 }
 
 /// This node's share of a distributed query, sent a piece at a time (a big share is on disk).
@@ -902,6 +915,7 @@ async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
     if !p.producer.is_empty() && p.seq == 0 {
         return Err(E(anyhow::anyhow!(crate::log::SEQ_FROM_1))); // (0 is "nothing yet": its batch would be taken for a retry)
     }
+    crate::auth::check_rows(&name)?; // (its INSERT grant, as SQL's)
     let meta = app.lake.cat.meta(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
     let schema = schema(&meta.logical_columns())?; // (rows come under SQL's names; the log keeps stored ones: ADR-022)
     let arrow = headers.get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"application/vnd.apache.arrow"));
@@ -938,6 +952,10 @@ struct InsertParams {
 /// the table if missing.
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.cluster.reader, "read-only node");
+    if app.lake.cat.meta(&table_key(&name)).await?.is_none() {
+        crate::auth::at_least(crate::auth::Role::Admin, "making a table")?; // (as CREATE TABLE is)
+    }
+    crate::auth::check_rows(&name)?; // (its INSERT grant, as SQL's)
     let query = crate::routines::expand(&app.lake, &query).await?;
     let ctx = session(&app.lake, &query, "").await?;
     match crate::write::write_files(&app.lake, &ctx, &name, &query, &p.job, crate::write::stamp(&app.lake, &name, Some(&app.to())).await?).await? {
@@ -948,6 +966,8 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
 
 /// Record an INSERT's files (from another node, or a `pondra sql` somewhere else).
 async fn files(State(app): State<App>, Json(f): Json<crate::write::Files>) -> Result<Json<Value>, E> {
+    let meta = app.lake.cat.meta(&table_key(f.table())).await?;
+    crate::auth::files_from_writer(meta.as_ref().map(|m| m.folder(f.table())), &f.paths())?; // (a write token's: into its table's folder)
     Ok(Json(app.record_files(f).await?))
 }
 
@@ -1079,7 +1099,7 @@ fn owner(headers: &axum::http::HeaderMap) -> bool {
     static KEY: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("PONDRA_OWNER_KEY").ok().filter(|k| k.len() >= 16));
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     crate::auth::lent(token).is_some_and(|l| l.1) // (a Python procedure the owner called)
-        || KEY.as_deref().is_some_and(|k| headers.get("x-pondra-owner").is_some_and(|h| h.as_bytes() == k.as_bytes()))
+        || KEY.as_deref().is_some_and(|k| headers.get("x-pondra-owner").is_some_and(|h| aws_lc_rs::constant_time::verify_slices_are_equal(h.as_bytes(), k.as_bytes()).is_ok()))
 }
 
 /// `POST /sql`: statements (SQL, or JSON with `$name` parameters, or that and tables of the
@@ -1211,7 +1231,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // or may read a file on this machine).
     let asks = |text: &str| {
         let q = text.to_lowercase();
-        !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.learned", "pondra.variables", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+        !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
     };
     let volatile = files || limited || asks(query)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)

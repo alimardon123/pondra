@@ -62,7 +62,7 @@ above are as those clients document them, and are not run here.
 
 ## Tools
 
-`tools/list` gives four tools, and then one for each stored procedure.
+`tools/list` gives five tools, and then one for each stored procedure.
 
 | Tool | Arguments | Does |
 |---|---|---|
@@ -70,6 +70,7 @@ above are as those clients document them, and are not run here.
 | `query` | `sql` | runs one query and answers `{"rows": […], "total_rows": N}`: the first 1000 rows, and the count of all. A statement that writes is refused: `this is a write: use the write tool` |
 | `write` | `sql`, `job` (optional) | runs `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP` or `CALL`. It is committed and durable when it answers. `job` is an id for the write: sent again with the same id, it is applied once |
 | `changes` | `table`, `after` (optional) | what was committed to a table after a position: every insert, update and delete, about 1000 rows at a time, and the `position` to ask from next |
+| `find` | `text`, `kind` (optional) | finds tables, views, columns, keys, links, routines and every other object or part by its name, comment or definition, and Pondra's concepts by other products' names: the rows `pondra.find(text)` gives in SQL |
 
 `list_tables` names column types as Arrow does (`Int64`, `Utf8`). `write` answers what the same
 statement answers over [HTTP](/pondra/reference/http/#run-sql): `{"rows": 1}` for an `INSERT`, or
@@ -139,7 +140,7 @@ mcp '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"query","arg
 
 ```text
 2025-06-18 pondra ['capabilities', 'instructions', 'protocolVersion', 'serverInfo']
-['list_tables', 'query', 'write', 'changes', 'add_note']
+['list_tables', 'query', 'write', 'changes', 'find', 'add_note']
 {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"rows\":1}"}],"isError":false}}
 {"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"rows\":1}"}],"isError":false}}
 {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"{\"rows\":[{\"id\":1,\"body\":\"hello agent\"},{\"id\":2,\"body\":\"none\"}],\"total_rows\":2}"}],"isError":false}}
@@ -172,7 +173,7 @@ asyncio.run(main())
 ```
 
 ```text
-['list_tables', 'query', 'write', 'changes', 'add_note']
+['list_tables', 'query', 'write', 'changes', 'find', 'add_note']
 {'rows': [{'n': 2}], 'total_rows': 1}
 [(1, 'upsert'), (2, 'upsert')]
 ```

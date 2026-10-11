@@ -34,7 +34,7 @@ pub async fn handle(State(app): State<App>, Extension(role): Extension<Role>, bo
                 Start with list_tables."}),
         "ping" => json!({}),
         "tools/list" => {
-            let all = [tools().as_array().cloned().unwrap_or_default(), procedures(&app).await].concat();
+            let all = [tools().as_array().cloned().unwrap_or_default(), crate::find::mcp_tools(), procedures(&app).await].concat();
             json!({"tools": all})
         }
         "tools/call" => call(&app, role, params).await,
@@ -73,6 +73,10 @@ async fn call(app: &App, role: Role, params: &Value) -> Value {
         "query" => query(app, arg("sql")).await,
         "write" => write(app, role, arg("sql"), params["arguments"]["job"].as_str()).await,
         "changes" => changes(app, arg("table"), params["arguments"]["after"].as_u64()).await,
+        name if crate::find::is_tool(name) => match crate::find::mcp_sql(name, &params["arguments"]) {
+            Ok(sql) => query(app, &sql).await,
+            Err(e) => Err(e),
+        },
         other => match procedure(app, other).await {
             Some(name) => {
                 let given = params["arguments"].as_object().into_iter().flatten().map(|(k, v)| Ok(format!("{k} => {}", crate::routines::literal(v)?))).collect::<Result<Vec<_>>>();
@@ -115,7 +119,7 @@ async fn procedures(app: &App) -> Vec<Value> {
 /// A procedure's name as a tool's (letters, digits, `_`, `-`; not one of the four).
 fn tool(name: &str) -> String {
     let t = name.replace('.', "__");
-    if ["list_tables", "query", "write", "changes"].contains(&t.as_str()) { format!("call_{t}") } else { t }
+    if ["list_tables", "query", "write", "changes"].contains(&t.as_str()) || crate::find::is_tool(&t) { format!("call_{t}") } else { t }
 }
 
 /// The procedure a tool stands for.

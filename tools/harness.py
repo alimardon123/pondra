@@ -1320,19 +1320,59 @@ def serverless():
     node = Node(lake, A.port).start()  # a node starting on the idle lake leads at once
     node_start_s, node_leads = round(time.time() - t, 2), leads(node)
     via_node, via_node_s = timed(insert)  # the files go to the running leader
-    node.kill()  # kill -9: its mark in the bucket goes stale within 30 s
-    after_kill, after_kill_s = timed(insert)  # (no followers to take over: it waits for the stale mark)
-    node2 = Node(lake, A.port + 1).start()
+    # kill -9 lets go of the leader's lock file, so a writer on this machine finds it free and writes
+    # at once (it doesn't wait for the leader's mark to go stale, which takes 30 s).
+    node.kill()
+    after_kill, after_kill_s = timed(insert)
+
+    def withdraw_requests():
+        # A killed writer can't withdraw the request it left in the inbox (`inbox::send` does when it
+        # gives up), so take it back here: else the next leader would record it.
+        if not lake.startswith("s3://"):
+            folder = os.path.join(lake, "inbox")
+            for f in (os.listdir(folder) if os.path.isdir(folder) else []):
+                if f != "bell" and not f.endswith(".out"):
+                    os.remove(os.path.join(folder, f))
+            return
+        bucket, prefix = lake[5:].split("/", 1)
+        for pg in S3[0].get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix + "/inbox/"):
+            keys = [{"Key": o["Key"]} for o in pg.get("Contents", []) if not o["Key"].endswith((".out", "/bell"))]
+            if keys:
+                S3[0].delete_objects(Bucket=bucket, Delete={"Objects": keys, "Quiet": True})
+
+    # Another machine: a writer with a temp folder of its own finds no lock file for the leader, so
+    # it waits for the leader's mark, as it always did. A leader here is killed, and that writer
+    # waits 5 s: it adds no term (the mark is still fresh), and it is stopped.
+    node3 = Node(lake, A.port + 2).start()
+    timed(insert)  # a leader started here takes the rows like any other
+    node3.kill()
+    terms, local = os.path.join(lake, "cluster", "term"), not lake.startswith("s3://")  # (a bucket's terms aren't files here)
+    before = os.listdir(terms) if local else []
+    other = tempfile.mkdtemp(prefix="pondra-other-")
+    waiting = subprocess.Popen([BIN, "sql", "--dir", lake, insert], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               env={**os.environ, "TMPDIR": other, "TEMP": other, "TMP": other})
+    time.sleep(5)
+    other_machine_waits = waiting.poll() is None and (not local or os.listdir(terms) == before)
+    waiting.kill()
+    waiting.wait()
+    withdraw_requests()
+    shutil.rmtree(other, ignore_errors=True)
+    node2 = Node(lake, A.port + 1).start()  # the other machine's writer is gone: this node leads at once
     n = sql(node2.port, "SELECT count(*) AS n, count(DISTINCT id) AS ids FROM sales")[0]
     node2_leads = leads(node2)
     node2.kill()
-    ok = n == {"n": 8000, "ids": 1000} and '"duplicate":true' in once[1] and node_leads and node2_leads and node_start_s < 10
+    # 8000 rows, and the leader started here adds 1000 more: 9000.
+    ok = (n == {"n": 9000, "ids": 1000} and '"duplicate":true' in once[1] and node_leads and node2_leads and node_start_s < 10
+          and after_kill_s < 10 and other_machine_waits)
     print(json.dumps({"serverless": {"alone_s": alone_s, "retry": once, "four_at_once": together, "node_start_s": node_start_s, "node_leads": node_leads,
-                                     "via_node_s": via_node_s, "after_leader_killed_s": after_kill_s, "rows": n, "ok": ok}}))
+                                     "via_node_s": via_node_s, "after_leader_killed_s": after_kill_s, "other_machine_waits": other_machine_waits,
+                                     "rows": n, "ok": ok}}))
     if not ok:
         sys.exit(1)
     return (f"INSERT from a process with no server: {alone_s}s alone, 4 at once, retries once; a node on the idle lake leads "
-            f"in {node_start_s}s; via a running leader {via_node_s}s; after the leader is killed {after_kill_s}s; {n['n']} rows, no duplicates")
+            f"in {node_start_s}s; via a running leader {via_node_s}s; after the leader is killed {after_kill_s}s (this machine's writer "
+            f"finds its lock free); another machine's writer waits for the mark (no new term in 5 s: {other_machine_waits}); "
+            f"{n['n']} rows, no duplicates")
 
 
 def clients():
@@ -1414,7 +1454,7 @@ def clients():
     tables = {t["table"] for t in tool("r-tok", "list_tables")["tables"]}
     wrote = tool("w-tok", "write", sql="INSERT INTO docs VALUES (4, 'trucks', [0.0, 0.1, 0.9])", job="mcp-1")
     feed = tool("r-tok", "changes", table="docs", after=0)
-    checks["MCP"] = init["serverInfo"]["name"] == "pondra" and names == ["list_tables", "query", "write", "changes"] and {"users", "docs", "sales.orders"} <= tables \
+    checks["MCP"] = init["serverInfo"]["name"] == "pondra" and names == ["list_tables", "query", "write", "changes", "find"] and {"users", "docs", "sales.orders"} <= tables \
         and tool("r-tok", "query", sql="SELECT count(*) AS n FROM docs")["rows"] == [{"n": 3}] and tool("r-tok", "write", sql="DELETE FROM docs") is None \
         and wrote == {"rows": 1} and tool("w-tok", "write", sql="INSERT INTO docs VALUES (4, 'trucks', [0.0, 0.1, 0.9])", job="mcp-1") == {"duplicate": True} \
         and len(feed["rows"]) == 5 and any(r.get("_deleted") for r in feed["rows"]) and feed["position"] > 0
@@ -6605,7 +6645,8 @@ def server():
     port, pg = A.port, A.port + 10
     env = {**os.environ, "PONDRA_DATABASE_IDLE_SECS": "3"}
     def start(how=()):
-        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log = open(f"/tmp/pondra-{port}-server-{uuid.uuid4().hex[:6]}.stderr", "w")  # (its databases' nodes write here too: CI keeps it when a check fails)
+        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5"], env=env, stdout=subprocess.DEVNULL, stderr=log)
         until(lambda: _try(lambda: call(port, "GET", "/databases") is not None), True, 30)
         return p
     srv = start()
@@ -6716,6 +6757,7 @@ def server():
     print(json.dumps({"server": checks, "ok": ok, "first_write_s": first_write}, indent=1))
     if not ok:
         print(missing[:300], idle, joined)
+        print(json.dumps({"seen": seen}, default=str)[:4000])  # (what each database answered whom)
         sys.exit(1)
     return f"server: a folder of lakes as databases over Postgres and HTTP, created, dropped, idle-stopped, joined, restarted: all {len(checks)} checks pass"
 
@@ -7209,6 +7251,116 @@ def safety():
     n.kill()
     ok = all(checks.values())
     print(json.dumps({"safety": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+def guarded():
+    """What each door takes, and from whom (the security review before 1.0): an open node answers
+    this machine and its own page, never a page from another site nor a name rebound to this
+    machine, though a link from elsewhere still opens the console; a user's rows go in through the
+    row doors (/append, /insert) only as its grants say, never through the nodes' own routes; a
+    write token's flushes and files only into tables that are there, in the log and their folders;
+    nobody but the nodes adds to the lake's own records; a change a follower forwards runs as its
+    user, reads included; a .py file is an admin's."""
+    import base64
+    P = A.port
+    lake = new_lake()
+    a = Node(lake, P).start()
+    checks, info = {}, {}
+
+    def ask(port, body, path="/sql", method="POST", auth=None, headers=None):
+        h = {**(headers or {}), **({"Authorization": auth} if auth else {})}
+        try:
+            return call(port, method, path, body.encode() if isinstance(body, str) else body, headers=h)
+        except Exception as e:
+            return f"ERROR {e}"
+    refused = lambda r: isinstance(r, str) and r.startswith("ERROR 403")
+    # An open node: no token, no user
+    me = f"127.0.0.1:{P}"
+    said = {
+        "a program": ask(P, "SELECT 1 AS x"),
+        "its own page": ask(P, "SELECT 1 AS x", headers={"Origin": f"http://{me}", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"}),
+        "localhost": ask(P, "SELECT 1 AS x", headers={"Host": f"localhost:{P}", "Origin": f"http://localhost:{P}"}),
+        "a link from elsewhere": ask(P, b"", path="/", method="GET", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}),
+        "another site's page": ask(P, "SELECT 1 AS x", headers={"Origin": "http://evil.example"}),
+        "another site, by fetch metadata": ask(P, "SELECT 1 AS x", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors"}),
+        "a form posted from elsewhere": ask(P, "SELECT 1 AS x", headers={"Origin": "null", "Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}),
+        "a name rebound here": ask(P, "SELECT 1 AS x", headers={"Host": f"evil.example:{P}"}),
+        "…same origin as itself": ask(P, "SELECT 1 AS x", headers={"Host": f"evil.example:{P}", "Origin": f"http://evil.example:{P}", "Sec-Fetch-Site": "same-origin"}),
+    }
+    info["open"] = said
+    checks["an open node answers programs on this machine and its own page; a link from elsewhere opens the console"] = \
+        said["a program"] == [{"x": 1}] and said["its own page"] == [{"x": 1}] and said["localhost"] == [{"x": 1}] and isinstance(said["a link from elsewhere"], bytes)
+    checks["…a page from another site, or a name rebound to this machine, gets 403 saying why"] = \
+        all(refused(said[k]) for k in ("another site's page", "another site, by fetch metadata", "a form posted from elsewhere", "a name rebound here", "…same origin as itself")) \
+        and "another site" in said["another site's page"] and "DNS rebinding" in said["a name rebound here"]
+    # Users: the row doors and the nodes' own routes
+    b = Node(lake, P + 1).start()  # (a follower)
+    basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    for q in ["CREATE TABLE orders (id BIGINT, amount DOUBLE)", "CREATE TABLE hr (id BIGINT, salary DOUBLE)", "INSERT INTO hr VALUES (1, 100.0)",
+              "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
+        ask(P, q)
+    boss = basic("boss", "boss-password-1")
+    for q in ["CREATE USER bob PASSWORD 'bob-password-1'", "GRANT SELECT, INSERT, UPDATE ON orders TO bob"]:
+        ask(P, q, auth=boss)
+    bob = basic("bob", "bob-password-1")
+    rows = json.dumps({"id": 7, "amount": 1.0})
+    flush = lambda head: (lambda h: len(h).to_bytes(4, "little") + h)(json.dumps(head).encode())
+    said = {
+        "append, granted": ask(P, rows, path="/append/orders", auth=bob),
+        "append, not granted": ask(P, json.dumps({"id": 2, "salary": 1e6}), path="/append/hr", auth=bob),
+        "append to the audit log": ask(P, "{}", path="/append/pondra$audit", auth=boss),
+        "insert, granted": ask(P, "SELECT 8 AS id, 2.0 AS amount", path="/insert/orders?job=g1", auth=bob),
+        "insert, reading what it may not": ask(P, "SELECT id, salary AS amount FROM hr", path="/insert/orders?job=g2", auth=bob),
+        "insert, not granted": ask(P, "SELECT 3 AS id, 1.0 AS salary", path="/insert/hr?job=g3", auth=bob),
+        "insert making a table": ask(P, "SELECT 1 AS id", path="/insert/made?job=g4", auth=bob),
+        "a user's flush": ask(P, flush({"path": "", "parts": []}), path="/cluster/commit", auth=bob),
+        "a user's files": ask(P, json.dumps({"table": "orders", "job": "g5", "columns": [], "files": []}), path="/cluster/files", auth=bob, headers={"Content-Type": "application/json"}),
+    }
+    info["users"] = said
+    checks["a user's rows through /append and /insert as its grants say (reads too); another table, a new table, the audit log: refused"] = \
+        isinstance(said["append, granted"], dict) and "permission denied: INSERT on hr" in said["append, not granted"] and "written by Pondra alone" in said["append to the audit log"] \
+        and isinstance(said["insert, granted"], dict) and "permission denied: SELECT" in said["insert, reading what it may not"] \
+        and "permission denied: INSERT on hr" in said["insert, not granted"] and "making a table needs an admin" in said["insert making a table"] \
+        and until(lambda: ask(P, "SELECT id FROM orders ORDER BY id", auth=boss), [{"id": 7}, {"id": 8}], 10) == [{"id": 7}, {"id": 8}] \
+        and ask(P, "SELECT count(*) AS n FROM hr", auth=boss) == [{"n": 1}]
+    checks["…and never through the nodes' own routes (/cluster/commit, /cluster/files)"] = \
+        "this route is the nodes' own" in said["a user's flush"] and "this route is the nodes' own" in said["a user's files"]
+    # A change a follower forwards runs as its user: what it reads too
+    forwarded = {
+        "reads what it may not": ask(P + 1, "UPDATE orders SET amount = (SELECT max(salary) FROM hr) WHERE id = 7", auth=bob),
+        "its own": ask(P + 1, "UPDATE orders SET amount = 5.0 WHERE id = 7", auth=bob),
+    }
+    info["forwarded"] = forwarded
+    checks["a change a follower forwards runs as its user: a read it may not make refused, its own change made"] = \
+        "permission denied: SELECT on hr" in str(forwarded["reads what it may not"]) and isinstance(forwarded["its own"], dict) and forwarded["its own"].get("updated") == 1 \
+        and until(lambda: ask(P, "SELECT amount FROM orders WHERE id = 7", auth=boss), [{"amount": 5.0}], 10) == [{"amount": 5.0}]
+    a.kill(), b.kill()
+    # A write token: rows into tables that are there, in the log and their folders; never the lake's records
+    lake2 = new_lake()
+    c = Node(lake2, P + 2, write_token="w", admin_token="adm").start()
+    ask(P + 2, "CREATE TABLE t (id BIGINT)", auth="Bearer adm")
+    w = "Bearer w"
+    said = {
+        "append": ask(P + 2, json.dumps({"id": 1}), path="/append/t", auth=w),
+        "a segment outside the log": ask(P + 2, flush({"path": "data/t/x.seg", "parts": []}), path="/cluster/commit", auth=w),
+        "a path climbing out": ask(P + 2, flush({"path": "log/../catalog/x.seg", "parts": []}), path="/cluster/commit", auth=w),
+        "a branch's row ids": ask(P + 2, flush({"path": "", "parts": [], "blocks": 9}), path="/cluster/commit", auth=w),
+        "rows for the audit log": ask(P + 2, flush({"path": "", "parts": [{"table": "pondra$audit", "off": 0, "len": 0, "rows": 0, "src": None}]}), path="/cluster/commit", auth=w),
+        "files into no table": ask(P + 2, json.dumps({"table": "made", "job": "w1", "columns": [], "files": []}), path="/cluster/files", auth=w, headers={"Content-Type": "application/json"}),
+        "a python file": ask(P + 2, "print('hi')", path="/files/etl/job.py", method="PUT", auth=w),
+        "a sql file": ask(P + 2, "SELECT 1", path="/files/etl/job.sql", method="PUT", auth=w),
+        "a python file, by an admin": ask(P + 2, "print('hi')", path="/files/etl/job.py", method="PUT", auth="Bearer adm"),
+    }
+    info["write token"] = said
+    checks["a write token's flushes: a segment of the log only, no row ids or sequences, never the lake's records; files only into a table there"] = \
+        isinstance(said["append"], dict) and "a segment of the log" in said["a segment outside the log"] and "a segment of the log" in said["a path climbing out"] \
+        and "needs an admin" in said["a branch's row ids"] and "written by Pondra alone" in said["rows for the audit log"] and "making a table needs an admin" in said["files into no table"]
+    checks["a .py file is an admin's to save (code a node runs); a .sql file a writer's"] = refused(said["a python file"]) and not str(said["a sql file"]).startswith("ERROR") \
+        and not str(said["a python file, by an admin"]).startswith("ERROR")
+    c.kill()
+    ok = all(checks.values())
+    print(json.dumps({"guarded": checks, "ok": ok, "info": info}, indent=1, default=str))
     return ok
 
 
@@ -8548,6 +8700,222 @@ def registry():
         sys.exit(1)
 
 
+def find():
+    """`pondra.parts` and `pondra.find` (L5-1): every part of every object, and a search of objects, parts and concepts by name, comment and definition, at every door, as the caller may see them."""
+    import base64, psycopg
+    lake = new_lake()
+    shop_at = f"{lake}-shop"
+    LAKES.append(shop_at)
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
+    q = lambda s: sql(A.port, s)
+    def http(body):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", body.encode())
+        r = c.getresponse()
+        data = r.read()
+        return r.status, data.decode()[:400]
+    checks, info = {}, {}
+    for s in [
+        "CREATE SCHEMA sales",
+        "CREATE TYPE status AS ENUM ('open', 'paid', 'void')",
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY NOT ENFORCED, name VARCHAR, segment VARCHAR)",
+        "CREATE TABLE sales.orders (id BIGINT, customer_id BIGINT REFERENCES customers (id) NOT ENFORCED, amount DECIMAL(12, 2), state status, card VARCHAR, at TIMESTAMP, CONSTRAINT positive CHECK (amount >= 0))",
+        "CREATE TABLE totals (region VARCHAR PRIMARY KEY, amount DOUBLE)",
+        "COMMENT ON TABLE sales.orders IS 'every order, one row each'",
+        "COMMENT ON COLUMN sales.orders.amount IS 'the revenue of the order, in euros'",
+        "CREATE VIEW revenue AS SELECT customer_id, sum(amount) AS total FROM sales.orders GROUP BY customer_id",
+        "CREATE VIEW revenue_daily AS SELECT date_trunc('day', at) AS day, sum(amount) AS total FROM sales.orders GROUP BY 1",
+        "COMMENT ON COLUMN revenue.total IS 'net revenue'",
+        "CREATE MATERIALIZED VIEW big_orders (CONSTRAINT has_amount EXPECT (amount IS NOT NULL) ON VIOLATION DROP ROW) AS SELECT id, amount FROM sales.orders",
+        "CREATE FUNCTION net(x DOUBLE, rate DOUBLE DEFAULT 0.2) RETURNS DOUBLE IMMUTABLE RETURN x * (1 - rate)",
+    ]:
+        q(s)
+    q(f"CREATE DATABASE shop LOCATION '{shop_at}'")
+    q("CREATE TABLE shop.products (sku VARCHAR, price DOUBLE)")
+    # (the JSON leaves out NULLs: a concept's object or a column's comment is missing from its row, so read them with .get)
+
+    # pondra.parts: every part, with its type, comment and definition
+    parts = q("SELECT * FROM pondra.parts")
+    info["parts"] = parts
+    def part(obj, kind, name=None):
+        return next((r for r in parts if r.get("object") == obj and r["kind"] == kind and (name is None or r["name"] == name)), None) or {}
+    amount = part("orders", "column", "amount")
+    labels = {r["name"] for r in parts if r.get("object") == "status" and r["kind"] == "label"}
+    link_defs = [r.get("definition") or "" for r in parts if r.get("object") == "orders" and r["kind"] == "link"]
+    checks["pondra.parts: columns with their types and comments, keys, links, checks, expectations, parameters and labels, a view's columns too"] = bool(
+        amount.get("schema") == "sales" and amount.get("object_kind") == "table" and (amount.get("type") or "").startswith("DECIMAL")
+        and amount.get("comment") == "the revenue of the order, in euros"
+        and bool(part("orders", "column", "state"))
+        and any("REFERENCES" in d and "customers" in d for d in link_defs)
+        and part("orders", "check", "positive").get("definition") == "CHECK (amount >= 0)"
+        and any(r.get("object") == "customers" and r["kind"] == "key" for r in parts)
+        and part("totals", "key", "totals_pkey").get("definition") == "PRIMARY KEY (region)"
+        and bool(part("revenue", "column", "customer_id"))
+        and part("revenue", "column", "total").get("object_kind") == "view"
+        and part("revenue", "column", "total").get("comment") == "net revenue"
+        and (part("big_orders", "expectation", "has_amount").get("definition") or "").startswith("EXPECT (amount IS NOT NULL)")
+        and bool(part("net", "parameter", "x")) and part("net", "parameter", "rate").get("definition") == "DEFAULT 0.2"
+        and labels == {"open", "paid", "void"}
+        and part("products", "column", "sku").get("lake") == "shop"
+        and not any(r["kind"] == "column" and r["name"].startswith("_") for r in parts))
+    info["checked"] = {"amount": amount, "labels": sorted(labels), "link_defs": link_defs}
+
+    # pondra.find: a name first, then longer names, then comments; each row says which field matched
+    f = q("SELECT * FROM pondra.find('revenue')")
+    info["find_revenue"] = f
+    row = lambda rows, pred: next((r for r in rows if pred(r)), {})
+    first = (f or [{}])[0]
+    day = row(f, lambda r: r["name"] == "revenue_daily")
+    amt = row(f, lambda r: r.get("object") == "orders" and r["name"] == "amount")
+    total = row(f, lambda r: r["is"] == "part" and r.get("object") == "revenue" and r["name"] == "total")
+    checks["pondra.find: a name first, then longer names, then comments, each saying what matched"] = bool(
+        first.get("name") == "revenue" and first.get("kind") == "view" and first.get("is") == "object" and first.get("matched") == "name" and first.get("rank") == 1
+        and [r["rank"] for r in f] == list(range(1, len(f) + 1))
+        and day.get("rank", 99) < amt.get("rank", 0) and amt.get("matched") == "comment" and bool(total))
+
+    # kind => 'column': columns only, no concepts
+    cols = q("SELECT * FROM pondra.find('revenue', kind => 'column')")
+    info["find_column"] = cols
+    checks["kind => 'column' keeps columns only, and concepts out"] = bool(cols) and all(r["kind"] == "column" and r["is"] == "part" for r in cols) \
+        and any(r.get("object") == "orders" and r["name"] == "amount" for r in cols) and any(r.get("object") == "revenue" and r["name"] == "total" for r in cols)
+
+    # every word in one field: 'revenue' and 'euros' are both in orders.amount's comment, and in no one name
+    both = q("SELECT * FROM pondra.find('revenue euros')")
+    info["find_two_words"] = both
+    checks["every word in one field"] = any(r.get("object") == "orders" and r["name"] == "amount" for r in both) \
+        and not any(r["is"] == "object" and r["name"] == "revenue" for r in both)
+
+    # concepts, under other products' names; a kind leaves them out
+    fk = q("SELECT * FROM pondra.find('foreign key')")
+    pipe = q("SELECT * FROM pondra.find('pipeline')")
+    fk_link = q("SELECT * FROM pondra.find('foreign key', kind => 'link')")
+    info["concepts"] = [fk, pipe, fk_link]
+    checks["concepts by other products' names: 'foreign key' is the link part, 'pipeline' the flow pattern; a kind leaves them out"] = \
+        any(r["is"] == "part" and r["kind"] == "link" and r.get("matched") == "also" and r.get("object") is None for r in fk) \
+        and any(r["is"] == "pattern" and r["kind"] == "flow" for r in pipe) and not any(r.get("object") is None for r in fk_link)
+
+    # an attached lake's objects
+    prod = q("SELECT * FROM pondra.find('products')")
+    info["find_products"] = prod
+    checks["an attached lake's objects are found"] = any(r.get("lake") == "shop" and r["name"] == "products" and r["is"] == "object" for r in prod)
+
+    # refused by name, with the words that say why
+    refused = [http(s) for s in ("SELECT * FROM pondra.find('')", "SELECT * FROM pondra.find('x', kind => 'nothing')", "SELECT * FROM pondra.find(42)")]
+    info["refused"] = refused
+    checks["refused by name: no words, a kind there isn't, a call that isn't pondra.find('words')"] = \
+        [r[0] for r in refused] == [500, 500, 500] and "give the words" in refused[0][1] and "no kind nothing" in refused[1][1] and "pondra.find('words'" in refused[2][1]
+
+    # never a remembered answer: a table made and a comment set are found at once
+    before = [r for r in q("SELECT * FROM pondra.find('newthing')") if r["is"] == "object" and r["name"] == "newthing"]
+    q("CREATE TABLE newthing (x INT)")
+    at_once = [r for r in q("SELECT * FROM pondra.find('newthing')") if r["is"] == "object" and r["name"] == "newthing"]
+    q("COMMENT ON TABLE newthing IS 'hello there'")
+    by_comment = [r for r in q("SELECT * FROM pondra.find('hello there')") if r["name"] == "newthing" and r.get("matched") == "comment"]
+    count = q("SELECT count(*) AS n FROM pondra.parts WHERE object = 'newthing'")
+    info["fresh"] = [before, at_once, by_comment, count]
+    checks["never a remembered answer: a table made, and a comment set on it, are found at once"] = before == [] and len(at_once) == 1 \
+        and len(by_comment) == 1 and count == [{"n": 1}]
+
+    # in a query like any table
+    per = q("SELECT object, count(*) AS n FROM pondra.parts WHERE kind = 'column' AND object IN ('orders', 'revenue') GROUP BY object ORDER BY object")
+    top2 = q("SELECT name FROM pondra.find('revenue') WHERE \"is\" = 'object' ORDER BY rank LIMIT 2")
+    info["sql"] = [per, top2]
+    checks["in a query like any table: parts grouped by object, find filtered and ordered"] = \
+        per == [{"object": "orders", "n": 6}, {"object": "revenue", "n": 2}] and [r["name"] for r in top2] == ["revenue", "revenue_daily"]
+
+    # over Postgres
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=pondra dbname=pondra", autocommit=True) as c:
+        over_pg = c.execute("SELECT name FROM pondra.find('revenue') ORDER BY rank LIMIT 1").fetchall()
+        pg_count = c.execute("SELECT count(*) FROM pondra.parts").fetchone()[0]
+    http_count = q("SELECT count(*) AS n FROM pondra.parts")[0]["n"]
+    info["postgres"] = [over_pg, pg_count, http_count]
+    checks["over Postgres: find and parts answer as they do over HTTP"] = over_pg == [("revenue",)] and pg_count == http_count
+
+    # MCP: a tool named find, answering as the SQL does
+    rpc = lambda method, params: call(A.port, "POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
+                                      headers={"content-type": "application/json"})["result"]
+    tool = next((t for t in rpc("tools/list", {})["tools"] if t["name"] == "find"), {})
+    reply = rpc("tools/call", {"name": "find", "arguments": {"text": "revenue", "kind": "column"}})
+    body = json.loads(reply["content"][0]["text"]) if not reply["isError"] else {}
+    mcp_names = [r["name"] for r in body.get("rows", [])]
+    info["mcp"] = [tool.get("inputSchema", {}).get("required"), reply["isError"], mcp_names]
+    checks["MCP: find is a tool, answering as the SQL does"] = "text" in tool.get("inputSchema", {}).get("required", []) and not reply["isError"] \
+        and bool(mcp_names) and mcp_names == [r["name"] for r in cols]
+
+    # the Python client
+    db = _client(A.port)
+    py_first, py_cols = db.find("revenue"), db.find("revenue", kind="column")
+    info["python"] = [py_first[0]["name"], sorted({r["kind"] for r in py_cols})]
+    checks["the Python client's db.find: the best match first, and kind= keeps columns"] = py_first[0]["name"] == "revenue" and bool(py_cols) \
+        and all(r["kind"] == "column" for r in py_cols)
+
+    # the JavaScript client, as the other clients' checks run it
+    js = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "js", "index.js")
+    script = f"""import {{ connect }} from {json.dumps(js)};
+const db = connect("http://127.0.0.1:{A.port}");
+const first = await db.find("revenue"), cols = await db.find("revenue", {{ kind: "column" }});
+console.log(JSON.stringify([first[0].name, [...new Set(cols.map(r => r.kind))], cols.every(r => r.is === "part")]));
+await db.close?.();"""
+    path = os.path.join(tempfile.mkdtemp(prefix="pondra-find-"), "find.mjs")
+    open(path, "w").write(script)
+    js_out = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
+    info["javascript"] = js_out.stdout.strip() or js_out.stderr[-1500:]
+    checks["JavaScript: db.find(text, { kind }) gives the best match first, and kind keeps columns"] = \
+        info["javascript"] == json.dumps(["revenue", ["column"], True], separators=(",", ":"))
+
+    # timing: 1,000 tables; the median of five runs of each
+    for start in range(0, 1000, 100):
+        call(A.port, "POST", "/sql", ";\n".join(f"CREATE TABLE t_{i} (id BIGINT, name VARCHAR, amount DOUBLE)" for i in range(start, start + 100)).encode(), timeout=600)
+    def timed(s):
+        ms, got = [], None
+        for _ in range(5):
+            t0 = time.perf_counter()
+            got = q(s)
+            ms.append((time.perf_counter() - t0) * 1000)
+        return sorted(ms)[2], got[0]["n"]
+    find_ms, find_n = timed("SELECT count(*) AS n FROM pondra.find('amount')")
+    parts_ms, parts_n = timed("SELECT count(*) AS n FROM pondra.parts")
+    info.update(find_ms_1000_tables=round(find_ms, 1), find_rows=find_n, parts_ms_1000_tables=round(parts_ms, 1), parts_rows=parts_n)
+    call(A.port, "POST", "/sql", ";\n".join(f"CREATE VIEW v_{i} AS SELECT id, amount FROM t_{i}" for i in range(200)).encode(), timeout=600)
+    views_ms, views_n = timed("SELECT count(*) AS n FROM pondra.find('amount')")
+    info.update(find_ms_1000_tables_200_views=round(views_ms, 1), find_rows_with_views=views_n)
+    checks["a find over 1,000 tables and 200 views answers in under 2 s"] = find_ms < 2000 and find_n >= 1000 and views_ms < 2000 and views_n >= find_n + 200
+
+    # last: signing in closes the node to anyone unsigned
+    basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    as_ = lambda auth, s: call(A.port, "POST", "/sql", s.encode(), headers={"Authorization": auth})
+    boss = basic("boss", "boss-password-1")
+    q("CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")
+    info["closed"] = until(lambda: http("SELECT 1 AS x")[0], 401, 30)
+    for s in ["CREATE USER ann PASSWORD 'ann-password-1'", "GRANT SELECT ON sales.orders TO ann",
+              "CREATE USER cal PASSWORD 'cal-password-1'", "GRANT SELECT (id, amount) ON sales.orders TO cal"]:
+        as_(boss, s)
+    ann, cal_user = basic("ann", "ann-password-1"), basic("cal", "cal-password-1")
+    ann_parts = as_(ann, "SELECT DISTINCT object FROM pondra.parts WHERE object_kind NOT IN ('function', 'type')")  # (functions and types are everyone's, as on Postgres)
+    ann_revenue = as_(ann, "SELECT * FROM pondra.find('revenue')")
+    ann_customers = as_(ann, "SELECT * FROM pondra.find('customers')")
+    info["ann"] = [ann_parts, ann_revenue, ann_customers]
+    checks["a user granted one table sees its parts only (and the functions and types everyone may use), and finds only what it may read"] = \
+        sorted(r["object"] for r in ann_parts) == ["orders"] \
+        and any(r.get("object") == "orders" and r["name"] == "amount" for r in ann_revenue) \
+        and not any(r["name"] in ("revenue", "revenue_daily", "total") for r in ann_revenue) \
+        and not any(r["is"] == "object" and "customers" in (r.get("object"), r["name"]) for r in ann_customers)
+    cal_parts = as_(cal_user, "SELECT kind, name FROM pondra.parts WHERE object = 'orders' ORDER BY name")
+    cal_def = as_(cal_user, "SELECT definition FROM pondra.objects WHERE name = 'orders'")
+    cal_card = as_(cal_user, "SELECT * FROM pondra.find('card')")
+    info["cal"] = [cal_parts, cal_def, cal_card]
+    checks["a user granted some columns sees those columns only, and no definition naming the others"] = \
+        cal_parts == [{"kind": "column", "name": "amount"}, {"kind": "column", "name": "id"}] \
+        and cal_def in ([{}], [{"definition": None}]) and not any(r["name"] == "card" for r in cal_card)
+
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"find": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(bool(v) for v in checks.values())} of {len(checks)} find checks"
+
+
 def sparksql():
     """Spark SQL where PySpark code sends it (H8): `spark.sql(…)` read with Spark's grammar and
     turned into Pondra's SQL (`spark_sql('…')`): `"text"`, backticks, `LATERAL VIEW [OUTER]
@@ -9828,13 +10196,13 @@ def backpressure():
 # suite in parts side by side that end together. A section not listed counts as 5 s.
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
-        "users": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
+        "users": 15, "find": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
         "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10, "use_path": 40}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, reader, crash, load)
+    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -9862,7 +10230,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -9875,7 +10243,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):
