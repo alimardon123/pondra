@@ -19,7 +19,7 @@ use datafusion::sql::sqlparser::ast::{self, Expr, Reset, Set, Statement, Value, 
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::ops::ControlFlow;
 
-pub const NO_SESSION: &str = "a setting or a prepared statement is a session's: a Postgres connection's, the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>), or a script's (send it with the statements that use it)";
+pub const NO_SESSION: &str = "a setting or a prepared statement is a session's: a Postgres connection's, the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>, 8 to 128 letters, digits, - or _), or a script's (send it with the statements that use it)";
 
 /// Is this one of the statements kept here? (`USE`, too: the session's search path, `path.rs`.)
 pub fn is(sql: &str) -> bool {
@@ -90,7 +90,44 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
             set(&session()?, "timezone", text(&value)?)?;
             Done::Said("SET")
         }
-        Statement::Set(_) => Done::Said("SET"), // (SET TRANSACTION, SET ROLE, SET NAMES: Postgres's, kept by no one; transactions are snapshots)
+        Statement::Set(Set::MultipleAssignments { assignments }) => {
+            let session = session()?;
+            for a in assignments {
+                set(&session, &a.name.to_string(), text(&a.value)?)?;
+            }
+            Done::Said("SET")
+        }
+        // What other statements called SET ask for is done as asked, or refused by name: a SET
+        // answered and not done would be a quiet lie (principle 10).
+        Statement::Set(Set::SetTransaction { modes, snapshot, .. }) => {
+            if snapshot.is_some() {
+                return Err(crate::codes::coded("0A000", "SET TRANSACTION SNAPSHOT: a transaction reads the commit its BEGIN saw, never another's"));
+            }
+            for m in &modes {
+                match m {
+                    ast::TransactionMode::IsolationLevel(ast::TransactionIsolationLevel::Serializable) => return Err(crate::codes::coded("0A000", SERIALIZABLE)),
+                    ast::TransactionMode::AccessMode(ast::TransactionAccessMode::ReadOnly) => return Err(crate::codes::coded("0A000", READ_ONLY)),
+                    _ => {} // (READ COMMITTED, READ UNCOMMITTED, REPEATABLE READ, SNAPSHOT, READ WRITE: a snapshot is each of them or stronger, as the standard allows)
+                }
+            }
+            Done::Said("SET")
+        }
+        Statement::Set(Set::SetRole { role_name: None, .. }) => Done::Said("SET"), // (SET ROLE NONE: the sign-in's own rights, which a session always has)
+        Statement::Set(Set::SetRole { role_name: Some(role), .. }) => {
+            return Err(crate::codes::coded("0A000", format!("SET ROLE {role}: a session has its sign-in's rights, and no other: sign in as a user who has them, or GRANT {role} TO the user you sign in as")))
+        }
+        Statement::Set(Set::SetSessionAuthorization(_)) => {
+            return Err(crate::codes::coded("0A000", "SET SESSION AUTHORIZATION: a session is its sign-in's: sign in as that user (with its token or password)"))
+        }
+        Statement::Set(Set::SetNames { charset_name, .. }) => {
+            set(&session()?, "client_encoding", charset_name.value)?; // (Postgres's SET NAMES is client_encoding)
+            Done::Said("SET")
+        }
+        Statement::Set(Set::SetNamesDefault {}) => Done::Said("SET"),
+        Statement::Set(Set::ParenthesizedAssignments { .. }) => {
+            return Err(crate::codes::coded("0A000", "SET (a, b) = (…) is Snowflake's for variables: here a variable is $a = 1, or DECLARE $a INT = 1, and $a reads it"))
+        }
+        Statement::Set(other) => return Err(crate::codes::coded("0A000", format!("{other}: not a setting here (SET name = value, or SHOW name)"))),
         Statement::Reset(r) => {
             let name = match r.reset {
                 Reset::ALL => None,
@@ -165,9 +202,59 @@ fn text(e: &Expr) -> Result<String> {
     })
 }
 
+/// Postgres's settings that ask for something done one way here: the values that say what is done
+/// are kept (and `DEFAULT`), any other refused by name, with its SQLSTATE.
+const ONE_WAY: &[(&str, &[&str], &str, &str)] = &[
+    ("client_encoding", &["utf8", "utf-8", "unicode", "utf8mb4", "utf8mb3"], "22023", "text is UTF-8 here: SET client_encoding = 'UTF8'"),
+    ("standard_conforming_strings", &["on", "true", "1"], "22023", "a backslash in '…' is itself here, as Postgres has it by default; E'a\\nb' writes an escape"),
+    ("autocommit", &["on", "true", "1"], "22023", "each statement commits on its own here: BEGIN … COMMIT makes several one"),
+    ("transaction_read_only", &["off", "false", "0"], "0A000", READ_ONLY),
+    ("default_transaction_read_only", &["off", "false", "0"], "0A000", READ_ONLY),
+    ("transaction_isolation", &["read committed", "read uncommitted", "repeatable read"], "0A000", SERIALIZABLE),
+    ("default_transaction_isolation", &["read committed", "read uncommitted", "repeatable read"], "0A000", SERIALIZABLE),
+];
+
+/// Other engines' settings for what is the node's here, with the way to set it.
+const THE_NODES: &[(&str, &str)] = &[
+    ("memory_limit", "start the node with --memory-gb (PONDRA_MEMORY_GB)"),
+    ("max_memory", "start the node with --memory-gb (PONDRA_MEMORY_GB)"),
+    ("threads", "SET datafusion.execution.target_partitions = 4 runs this session's queries in that many parts"),
+    ("worker_threads", "SET datafusion.execution.target_partitions = 4 runs this session's queries in that many parts"),
+    ("temp_directory", "spill files go to the system's temporary folder (TMPDIR)"),
+];
+
+const SERIALIZABLE: &str = "SERIALIZABLE isn't kept here: a transaction is one snapshot, and a row another commit changed meanwhile refuses its COMMIT (40001), as Postgres's REPEATABLE READ does: SET TRANSACTION ISOLATION LEVEL REPEATABLE READ";
+const READ_ONLY: &str = "a read-only transaction isn't kept here: a session writes as far as its sign-in may, so sign in as a user granted SELECT only for reads that can't write";
+
+/// Is this value of a setting one `ONE_WAY` refuses? (Its SQLSTATE and why.) `DateStyle` takes any
+/// order of days and months, but only ISO's output.
+fn one_way(n: &str, value: &str) -> Option<(&'static str, String)> {
+    let v = value.trim().to_lowercase();
+    if v == "default" {
+        return None;
+    }
+    if n == "datestyle" {
+        let other = v.split(|c: char| c == ',' || c.is_whitespace()).find(|w| matches!(*w, "postgres" | "sql" | "german"))?;
+        return Some(("22023", format!("DateStyle {other}: dates are shown as ISO 8601 here (2026-10-11): SET DateStyle = 'ISO'")));
+    }
+    let (_, kept, code, why) = ONE_WAY.iter().find(|(name, ..)| *name == n)?;
+    (!kept.contains(&v.as_str())).then(|| (*code, format!("{n} = '{value}': {why}")))
+}
+
 fn set(session: &str, variable: &str, value: String) -> Result<()> {
     let n = name(variable);
-    ensure!(!n.starts_with("datafusion.runtime."), "{n} is the node's (its memory and spill files), not a session's: PONDRA_MEMORY_MB and PONDRA_SPILL_DIR set it");
+    if let Some(v) = n.strip_prefix('@') {
+        return Err(crate::codes::coded("0A000", format!("SET @{v} is MySQL's for a variable: here a variable is ${v} = …, and ${v} reads it")));
+    }
+    if let Some((code, why)) = one_way(&n, &value) {
+        return Err(crate::codes::coded(code, why));
+    }
+    if let Some((_, how)) = THE_NODES.iter().find(|(name, _)| *name == n) {
+        return Err(crate::codes::coded("55P02", format!("{n} is the node's, not a session's: {how}"))); // (cant_change_runtime_param)
+    }
+    if n.starts_with("datafusion.runtime.") {
+        return Err(crate::codes::coded("55P02", format!("{n} is the node's, not a session's: start the node with --memory-gb (PONDRA_MEMORY_GB) for its queries' memory; spill files go to the system's temporary folder (TMPDIR)")));
+    }
     if n.contains('.') {
         datafusion::config::ConfigOptions::new().set(&n, &value)?; // (a name DataFusion has, a value it takes)
     }

@@ -9743,6 +9743,7 @@ def dialects():
     (`change::select_as` named both `__o_created_at`, and every change of such a table failed)."""
     import dialects_check
     FLOOR = {"postgres": 36, "duckdb": 31, "snowflake": 13, "spark": 10, "mysql": 17, "bigquery": 12, "sqlserver": 6}
+    XX000 = 999  # (refusals that are internal errors: lower it as they get codes, never raise it)
     lake = new_lake()
     node = Node(lake, A.port).start()
     q = lambda s: sql(A.port, s)
@@ -9791,6 +9792,12 @@ def dialects():
     checks["no newcomer's statement takes the node down"] = downs == 0
     checks["each refusal carries a SQLSTATE"] = not uncoded
     checks["each dialect runs at least its floor of the newcomers' statements"] = all(ran[d] >= FLOOR[d] for d in FLOOR)
+    missed = [f"{r['sql'][:70]}: {r['sqlstate']} {r['message'][:120]}" for r in rows if r["expect"] and not dialects_check.met(r)]
+    info["missed their refusal"] = missed
+    checks["what a SET asks for is done, or refused by name with its SQLSTATE and the way out (SET ROLE, TRANSACTION, NAMES, DateStyle, @x, …)"] = not missed
+    internal = [r["sql"][:80] for r in rows if not r["ok"] and r["sqlstate"] == "XX000"]
+    info["refused as XX000 (internal)"] = len(internal)
+    checks[f"at most {XX000} refusals are XX000 (an internal error) rather than a code that names what went wrong"] = len(internal) <= XX000
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"dialects": checks, "ok": ok, "info": info}, indent=1, default=str))

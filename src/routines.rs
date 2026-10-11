@@ -631,7 +631,12 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
         }
         ControlFlow::<()>::Continue(())
     });
-    ensure!(missing.is_empty(), "no value for {} (give it one, or declare it: DECLARE {} = …)", missing.join(", "), missing[0]);
+    if let Some(first) = missing.first() {
+        let n = first.trim_start_matches('$');
+        let literal = |v: String| if v.parse::<f64>().is_ok() { v } else { format!("'{}'", v.replace('\'', "''")) };
+        let setting = crate::settings::shown(n).map(|v| format!("; SET {n} = … made a setting, not a variable: ${n} = {} makes one", literal(v))).unwrap_or_default();
+        return Err(crate::codes::coded("42P02", format!("no value for {} (give it one, or declare it: DECLARE {first} = …{setting})", missing.join(", ")))); // (undefined_parameter)
+    }
     Ok(text(&stmts))
 }
 

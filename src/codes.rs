@@ -38,6 +38,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("cannot insert a non-default value") || has("can only be updated to default") => "428C9", // generated_always
         _ if has("nextval: reached") => "2200H",                                                // sequence_generator_limit_exceeded
         _ if has("is not yet defined in this session") => "55000",                              // object_not_in_prerequisite_state
+        _ if has("is not a variable which can be viewed with 'show'") => "42704",                // undefined_object (Postgres: unrecognized configuration parameter)
         _ if has("is a session's:") => "55000",                                                 // (a SET, BEGIN or TEMP table sent with no session: send x-pondra-session)
         _ if has("violates check constraint") => "23514",                                       // check_violation
         _ if has("is not null, and a row gives it no value") || has("violates not-null") => "23502", // not_null_violation
@@ -109,6 +110,7 @@ mod tests {
         assert_eq!(of("permission denied: INSERT on t (GRANT INSERT ON t TO ann)"), "42501");
         assert_eq!(of("Invalid function 'nope'.\nDid you mean 'now'?"), "42883");
         assert_eq!(of("table t already exists"), "42P07");
+        assert_eq!(of("Error during planning: 'nope' is not a variable which can be viewed with 'SHOW'"), "42704");
         assert_eq!(of("a transaction is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>)"), "55000");
         assert_eq!(of("External error: invalid input value for enum mood: \"angry\" (its labels: 'sad', 'ok')"), "22P02"); // (a bulk INSERT's stream)
         assert_eq!(of("type \"mood\" does not exist"), "42704");

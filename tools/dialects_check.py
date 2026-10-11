@@ -326,6 +326,31 @@ CASES = [
     ("sqlserver", "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'"),
     ("sqlserver", "CREATE OR ALTER PROCEDURE dbo.mark_paid @oid INT AS UPDATE orders SET status = 'paid' WHERE id = @oid"),
     ("sqlserver", "EXEC dbo.mark_paid @oid = 2"),
+    # What a SET asks for is done as asked, or refused by name with the way out (a SET answered and not done
+    # would be a quiet lie): each of these says which, its SQLSTATE and words.
+    ("postgres", "SET ROLE analyst", ("0A000", "GRANT analyst TO")),
+    ("postgres", "SET ROLE NONE"),
+    ("postgres", "SET SESSION AUTHORIZATION 'ann'", ("0A000", "sign in as that user")),
+    ("postgres", "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"),
+    ("postgres", "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+    ("postgres", "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", ("0A000", "ISOLATION LEVEL REPEATABLE READ")),
+    ("postgres", "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY", ("0A000", "granted SELECT only")),
+    ("postgres", "SET default_transaction_isolation = 'serializable'", ("0A000", "ISOLATION LEVEL REPEATABLE READ")),
+    ("postgres", "SET client_encoding = 'LATIN1'", ("22023", "client_encoding = 'UTF8'")),
+    ("postgres", "SET client_encoding = 'UTF8'"),
+    ("postgres", "SET DateStyle = 'SQL, DMY'", ("22023", "DateStyle = 'ISO'")),
+    ("postgres", "SET DateStyle = 'ISO, MDY'"),
+    ("postgres", "SET standard_conforming_strings = off", ("22023", "backslash")),
+    ("postgres", "SHOW no_such_setting", ("42704", "no_such_setting")),
+    ("postgres", "SET datafusion.runtime.memory_limit = '1G'", ("55P02", "--memory-gb")),
+    ("duckdb", "SET memory_limit = '1GB'", ("55P02", "--memory-gb")),
+    ("mysql", "SET NAMES utf8mb4"),
+    ("mysql", "SET NAMES latin1", ("22023", "UTF-8")),
+    ("mysql", "SET autocommit = 0", ("22023", "BEGIN")),
+    ("mysql", "SET sql_safe_updates = 1, autocommit = 1"),
+    ("mysql", "SET @region = 'eu'", ("0A000", "$region = …")),
+    ("snowflake", "SET (lo, hi) = (1, 10)", ("0A000", "$lo = 1")),
+    ("snowflake", "SELECT count(*) FROM orders WHERE amount > $min_amount", ("42P02", "$min_amount = 20 makes one")),
 ]
 
 
