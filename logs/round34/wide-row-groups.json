@@ -1,0 +1,32 @@
+{
+  "what": "Row groups of at most 64 MB as Parquet's writer counts them (tier::writer), for every table. ClickBench's 10 M rows (11 files of up to 1 M rows, 105 columns) on this 4-core, 15 GB sandbox, loaded by CREATE TABLE AS from hits.parquet; main = 317f6eb (#58), one row group a file. 'box' = a 1.6 GB memory cgroup (v1, page cache charged), as 14 GB of files on GitHub's 16 GB runner at 100 M rows. Peaks are a fresh node's VmHWM over its first query. Times are best of 3 per query, two runs each way, interleaved.",
+  "found": [
+    "A scan holds a row group's columns while it decodes it: a million rows of 105 columns are 107 MB compressed, so four partitions reading every column held about 1 GB before a row reached the top-N. In row groups of 64 MB (about 40 MB written, 2 or 3 a file) a SELECT * top-10 peaks at 1.04 GB instead of 1.93, and answers in the 1.6 GB box (0.54 s), where main's node is killed.",
+    "Row groups of 32 MB (about 18 MB written) halve memory too, but in the box the other 42 queries took 4.6% longer (q17 1.44x, q34 and q35 1.1x), both runs; 64 MB is even there. Not taken.",
+    "TPC-H and TPC-DS at SF1: no row group is over 64 MB (lineitem's million rows are 34 MB written), so their files are what they were. At 32 MB, 23 groups became 27: files 2.228 against 2.209 s, from memory 1.122 against 1.123 s, TPC-DS 12.75 against 12.60 s, the same answers.",
+    "From memory (6 GB of columns, 4.7 GB held) the totals are the same; single queries move with which columns stay held, and run alone with their columns held (q17, q23, q28) they take the same time.",
+    "The page index read with each footer, so a wide scan filtering as it decodes fetches only the pages of the rows it keeps: q24's peak 1.94 to 1.79 GB. Not taken: the rows a top-N keeps are spread over most pages.",
+    "Left: the top-N keeps whole batches whose string views point into decoded pages (q24 1.04 GB against 0.71 GB for the same scan with a LIMIT and no ORDER BY). DataFusion's TopK compacts by rows, not bytes."
+  ],
+  "peaks_mb_and_first_run_s": {
+    "query": {
+      "q24: SELECT * WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10": {"main": [1929, 2.159], "32 MB": [1073, 0.9], "64 MB": [1042, 0.423]},
+      "SELECT * WHERE URL LIKE '%google%' LIMIT 10": {"main": [1098, 0.663], "32 MB": [521, 0.054], "64 MB": [711, 0.11]},
+      "SELECT * ORDER BY EventTime LIMIT 10": {"main": [1216, 1.052], "32 MB": [614, 0.197]},
+      "six columns, WHERE URL LIKE … ORDER BY EventTime LIMIT 10": {"main": [501, 0.384], "32 MB": [457, 0.376]},
+      "count(*) WHERE URL LIKE …": {"main": [376, 0.325], "32 MB": [287, 0.303]}
+    },
+    "DuckDB 1.5 on main's files, q24": "333 MB"
+  },
+  "row_groups": {"main": 11, "32 MB": 50, "64 MB": 26},
+  "clickbench_43_s": {
+    "files, full memory": {"main": 8.96, "64 MB": 8.66, "q24": [0.562, 0.395], "32 MB pair": [8.95, 8.82]},
+    "6 GB in memory": {"main": 6.2, "64 MB": 6.13},
+    "box 1.6 GB, files, 42 queries (q24 left out: main's node is killed)": {
+      "32 MB, interleaved": {"main": [13.763, 13.74], "32 MB": [14.368, 14.401]},
+      "64 MB, interleaved": {"main": [11.438, 11.588], "64 MB": [11.923, 11.408]},
+      "q24 in the box at 64 MB": 0.535
+    },
+    "q17 from memory alone, best of 10, three pairs": {"main": [0.175, 0.185, 0.178], "64 MB": [0.163, 0.175, 0.182]}
+  }
+}

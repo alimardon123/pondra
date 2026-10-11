@@ -184,7 +184,9 @@ The same on local disk and on object storage:
     manifest: a query skips whole manifests, then files, before opening any Parquet footer;
   - `partition_by` (a column, or year/month/day/hour of a timestamp): every file holds one
     value, so a filter on it skips all other partitions' files;
-  - Parquet min/max statistics per row group and page;
+  - Parquet min/max statistics per row group and page (a row group holds at most a million rows
+    and 64 MB as the writer counts them, about 40 MB written: a scan holds a row group's columns
+    while it decodes it);
   - keyed tables sorted by key, with bloom filters and small row groups;
   - `"cluster_by": ["col"]` on append tables: every file sorted by those columns. Measured with
     8 M rows: one-user queries 6.4x faster, ranges 11x; full scans 0.6x
