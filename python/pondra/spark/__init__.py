@@ -751,7 +751,21 @@ class DataFrame:
         return self._new(concat([self._f, other._f], how="diagonal"))
 
     def sample(self, withReplacement=None, fraction=None, seed=None):
-        return self._new(self._f.sample(fraction=fraction if fraction is not None else withReplacement))
+        """PySpark's forms: `sample(fraction, seed)`, `sample(withReplacement, fraction, seed)` and the
+        keywords; a fraction is a float, as PySpark reads it. Without replacement only."""
+        is_set = type(withReplacement) == bool and isinstance(fraction, float)
+        is_omitted_kw = withReplacement is None and isinstance(fraction, float)
+        is_omitted_args = isinstance(withReplacement, float)
+        if not (is_set or is_omitted_kw or is_omitted_args):
+            raise TypeError("sample: withReplacement (optional), fraction (a float, required) and seed (optional)")
+        if is_omitted_args:  # (sample(0.5, seed): the first argument is the fraction)
+            if fraction is not None:
+                seed = fraction
+            fraction, withReplacement = withReplacement, None
+        if withReplacement:
+            raise NotImplementedError("sample(withReplacement=True): Pondra samples without replacement; "
+                                      "use sample(fraction, seed) or sample(False, fraction, seed)")
+        return self._new(self._f.sample(fraction=fraction, seed=int(seed) if seed is not None else None))
 
     @property
     def na(self):

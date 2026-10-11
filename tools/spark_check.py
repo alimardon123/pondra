@@ -544,6 +544,28 @@ def p_column_by_attribute(spark, F, Window):  # df.x and df["x"] in select, next
     return orders.where(F.col("id") <= 40).select(orders.id, orders["item"], orders.qty.alias("q"))
 
 
+def p_sample_seed(spark, F, Window):  # the same seed, in each of PySpark's forms, gives the same rows; another seed others.
+    # Each engine draws its own rows, so only these shapes are compared, not the rows themselves.
+    orders = spark.table("orders")
+    a = [r["id"] for r in orders.sample(fraction=0.3, seed=7).collect()]
+    b = [r["id"] for r in orders.sample(0.3, 7).collect()]
+    c = [r["id"] for r in orders.sample(False, 0.3, 7).collect()]
+    d = [r["id"] for r in orders.sample(fraction=0.3, seed=8).collect()]
+    return {"same_seed_same_rows": a == b == c, "other_seed_other_rows": a != d, "about_a_third": 0.2 < len(a) / 2000 < 0.4}
+
+
+def p_sample_fraction_one(spark, F, Window):
+    return spark.table("orders").sample(fraction=1.0, seed=5).count()
+
+
+def p_sample_with_replacement_refused(spark, F, Window):  # PySpark draws with replacement; Pondra refuses by name
+    return spark.table("orders").sample(True, 0.5, 3).collect()
+
+
+def p_sample_int_argument_raises(spark, F, Window):  # PySpark takes a float fraction: sample(1) is a TypeError
+    return spark.table("orders").sample(1).collect()
+
+
 def _row_class(spark):
     """PySpark's Row, or Pondra's, by the session that is asked."""
     if type(spark).__module__.startswith("pondra"):
@@ -644,6 +666,10 @@ PIPELINES = [
     ("sort_replaced_refused", None, "refused", p_sort_replaced_refused),
     ("alias_qualified_columns", False, "frame", p_alias_qualified_columns),
     ("column_by_attribute", False, "frame", p_column_by_attribute),
+    ("sample_seed_forms", None, "value", p_sample_seed),
+    ("sample_fraction_one_count", None, "value", p_sample_fraction_one),
+    ("sample_with_replacement_refused", None, "refused", p_sample_with_replacement_refused),
+    ("sample_int_argument_raises", None, "raises", p_sample_int_argument_raises),
 ]
 
 
