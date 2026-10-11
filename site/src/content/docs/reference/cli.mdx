@@ -350,13 +350,13 @@ pulled 0, removed 0 here
 
 ## pondra plan, apply and the project's commands
 
-A project is a folder with `pondra.toml`, `objects/`, `migrations/` and `tests/`
+A project is a folder with `pondra.toml`, `objects/`, `migrations/`, `seeds/` and `tests/`
 ([apply a project](/pondra/guides/environments/#apply-a-project)). Each command reads it from
 `--project` (this folder by default) and talks to an environment's node.
 
 | Command | Does |
 |---|---|
-| `pondra init [DIR]` | start a project: pondra.toml, objects/, migrations/, tests/, and a `.gitignore` that leaves out `lake/` (`--name`) |
+| `pondra init [DIR]` | start a project: pondra.toml, objects/, migrations/, seeds/, tests/, and a `.gitignore` that leaves out `lake/` (`--name`) |
 | `pondra plan [ENV]` | what an apply would change, and what it refuses (exit 1 if anything is refused) |
 | `pondra apply [ENV]` | the plan, then each step, then tests/ (exit 1 if it fails); the database is made first if it isn't there |
 | `pondra apply local` | this machine's own database: the lake in the project's `lake/` folder, which `pondra` there opens as its shell; no server (pondra.toml's `[env.local]` says otherwise) |

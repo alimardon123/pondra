@@ -577,6 +577,15 @@ def across_check(bin, work, port):
         prod.post("/tier")
         checks["prod moves on (rows changed, merged, purged, its past let go): ali still answers as before, from what prod pinned"] = \
             rows(ali, "SELECT id, amount FROM sales.orders ORDER BY id") == ali_before and rows(prod, "SELECT count(*) FROM sales.orders WHERE amount > 100") == [(4,)]
+        # The key ali keeps reads its base and nothing else: a statement on ali's own node (open: whoever asks
+        # is a superuser there, but not the program that started it) naming one of prod's files by URL, hr's,
+        # which ali never took, finds no secret to read it with.
+        hr = next((k for k in parquet(prod_lake) if "hr.pay" in k), "")
+        status, text = raw(port + 2, "POST", "/sql", f"SELECT count(*) AS n FROM 's3://acme-prod/{hr}'", {})
+        checks["the key ali was lent reads its base for ali's tables alone: a statement on ali's node naming prod's hr file by URL is refused"] = \
+            hr != "" and status != 200 and "secret" in text.lower()
+        if not checks["the key ali was lent reads its base for ali's tables alone: a statement on ali's node naming prod's hr file by URL is refused"]:
+            checks["(lent key)"] = [hr, status, text[:300]]
         time.sleep(max(0.0, 25 - (time.time() - cloned_at)))  # (past prod's 20 s lease since the clone)
         prod.post("/tier")  # (a retention round: where a lease not renewed goes)
         checks["…and ali's pin is a lease that dev renews: prod still holds it after more than its lease"] = \
@@ -833,7 +842,7 @@ def layout_b_check(bin, work, port):
         put(proj, "pondra.toml", f'[project]\nname = "sales"\n\n[env.prod]\nserver = "{prod_url}"\n\n[env.dev]\nserver = "{dev_url}"\n')
         put(proj, "objects/schemas.sql", "CREATE SCHEMA sales;\n")
         put(proj, "objects/sales/orders.sql", "CREATE TABLE sales.orders (id BIGINT, amount DOUBLE);\n")
-        put(proj, "migrations/001-first-orders.sql", "INSERT INTO sales.orders VALUES (1, 10.0), (2, 20.0);\n")
+        put(proj, "seeds/001-first-orders.sql", "INSERT INTO sales.orders VALUES (1, 10.0), (2, 20.0);\n")
         cli("login", prod_url, "--token", "prod-admin")
         cli("login", dev_url, "--token", "dev-admin")
 

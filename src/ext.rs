@@ -1016,7 +1016,16 @@ fn pondra_token(secrets: &[(String, Secret)], endpoint: &str) -> Result<Option<S
 /// bucket secret among `secrets` covering it, and its leader at `endpoint` with the pondra secret
 /// covering that.
 pub fn reach_with(secrets: &[(String, Secret)], dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
-    let hit = covering(secrets, dir);
+    reach_by(covering(secrets, dir), secrets, dir, read_only, endpoint)
+}
+
+/// A branch's base on another server (`branch::load`, `make`), read with the key lent to the branch
+/// for it (`lent`): the one use of a lent key, and only for the base's own folder.
+pub fn reach_base(secrets: &[(String, Secret)], dir: &str, endpoint: Option<&str>) -> Result<()> {
+    reach_by(scoped(secrets.iter().filter(|(_, s)| s.lent), dir), secrets, dir, true, endpoint)
+}
+
+fn reach_by(hit: Option<(String, Secret)>, secrets: &[(String, Secret)], dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
     let params = hit.as_ref().map(|(n, s)| open(n, s)).transpose()?;
     let token = endpoint.map(|e| pondra_token(secrets, e)).transpose()?.flatten();
     let secret = hit.map(|(n, _)| n);
@@ -1031,13 +1040,15 @@ pub async fn reach(lake: &Lake, dir: &str, read_only: bool, endpoint: Option<&st
 
 /// The bucket secrets covering `urls` (no temporary ones), for a branch to keep (`branch::make`). Whoever
 /// may clone a database attached here lends its key without USAGE on it: the branch can't read its base
-/// without it, and CLONE is the grant that says who may (ADR-058).
+/// without it, and CLONE is the grant that says who may (ADR-058). Lent, it reads the base and nothing
+/// else (`reach_base`): no statement in the branch uses it, whoever its owner grants it to (`usable`).
 pub async fn lent(lake: &Lake, urls: &[String]) -> Result<Vec<(String, Secret)>> {
     let all: Vec<(String, Secret)> = list(lake).await?.into_iter().filter(|(_, s)| !s.temporary).collect();
     let mut found: Vec<(String, Secret)> = vec![];
-    for hit in urls.iter().filter_map(|u| scoped(all.iter(), u)) {
-        if !found.iter().any(|(n, _)| *n == hit.0) {
-            found.push(hit);
+    for (name, mut secret) in urls.iter().filter_map(|u| scoped(all.iter(), u)) {
+        if !found.iter().any(|(n, _)| *n == name) {
+            secret.lent = true;
+            found.push((name, secret));
         }
     }
     Ok(found)
@@ -1087,6 +1098,8 @@ pub struct Secret {
     pub key: Option<String>, // its data key, wrapped by the master key (`wrap`)
     #[serde(skip)]
     pub temporary: bool, // (CREATE TEMPORARY SECRET: the session's, in memory: `temp.rs`)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lent: bool, // (a key a branch was lent to read its base with: `reach_base` alone, never a statement: ADR-058)
 }
 
 pub(crate) fn secret_key(name: &str) -> String { format!("e/{name}") }
@@ -1326,7 +1339,7 @@ fn made(name: &str, mut params: BTreeMap<String, String>) -> Result<Secret> {
         ensure!(scheme(s).is_some_and(|x| schemes.contains(&x)), "a {t} secret's SCOPE is a URL of {}", schemes.iter().map(|s| format!("{s}://")).collect::<Vec<_>>().join(" or "));
     }
     let (sealed, key) = seal_new(&serde_json::to_vec(&params)?)?;
-    Ok(Secret { kind: t, scope, sealed, key: Some(key), temporary: false })
+    Ok(Secret { kind: t, scope, sealed, key: Some(key), temporary: false, lent: false })
 }
 
 /// `CREATE TEMPORARY SECRET`: a session's own, in this node's memory only (`temp.rs`), used by its
@@ -1374,8 +1387,8 @@ pub async fn list(lake: &Lake) -> Result<Vec<(String, Secret)>> {
 }
 
 /// May the request being served use this secret? Its own temporary one, or one a user is granted
-/// USAGE on (`GRANT USAGE ON SECRET`); a token's or a superuser's, any.
-fn usable(name: &str, s: &Secret) -> bool { s.temporary || crate::auth::limited().is_none_or(|a| a.secret(name)) }
+/// USAGE on (`GRANT USAGE ON SECRET`); a token's or a superuser's, any but a key lent to read a base.
+fn usable(name: &str, s: &Secret) -> bool { !s.lent && (s.temporary || crate::auth::limited().is_none_or(|a| a.secret(name))) }
 
 /// The secret for a URL: the longest scope that is a prefix of it (no scope: every URL of its
 /// type's schemes).
