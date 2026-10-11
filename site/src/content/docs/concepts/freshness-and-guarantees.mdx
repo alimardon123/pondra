@@ -1,8 +1,6 @@
 ---
 title: Freshness and guarantees
 description: When a write is safe, what exactly-once covers, and how soon each kind of reader sees a write.
-sidebar:
-  order: 4
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -101,7 +99,7 @@ The same idea covers the rest:
 | | `--ack durable` (default) | `--ack replicated` |
 |---|---|---|
 | Acknowledged when | The commit is in the bucket: one object-store write | `--replicas` nodes hold it (default 2: the leader in memory, a follower on its local disk). The bucket gets it a moment later |
-| Local disk | 4 ms | Not measured separately |
+| Local disk | 5 ms | Not measured separately |
 | Cloudflare R2, near bucket | 300 ms median (458 ms worst of 8 to 10) | 2 ms median (5 ms worst) |
 | Cloudflare R2, far bucket | 723 ms median (1,000 ms worst) | 2 ms median (4 ms worst) |
 | It survives | Anything: it is in the bucket | Any one node dying, the leader included |
@@ -146,39 +144,39 @@ leader dies.
 <line x1="250" y1="292" x2="730" y2="292" stroke="currentColor" stroke-opacity="0.5"/>
 <text x="240" y="76" text-anchor="end">Write acknowledged</text>
 <line x1="250" y1="72" x2="730" y2="72" stroke="currentColor" stroke-opacity="0.08"/>
-<circle cx="322.2" cy="72" r="5"/>
-<text x="322.2" y="94" text-anchor="middle" font-size="11">4 ms</text>
+<circle cx="333.9" cy="72" r="5"/>
+<text x="333.9" y="94" text-anchor="middle" font-size="11">5 ms</text>
 <rect x="542.3" y="67" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"/>
 <text x="547.3" y="61" text-anchor="middle" font-size="11">300 ms</text>
 <path d="M280.1,77 L286.1,66 L292.1,77 z"/>
 <text x="286.1" y="61" text-anchor="middle" font-size="11">2 ms</text>
 <text x="240" y="124" text-anchor="end">Another node can read it</text>
 <line x1="250" y1="120" x2="730" y2="120" stroke="currentColor" stroke-opacity="0.08"/>
-<circle cx="391.1" cy="120" r="5"/>
-<text x="391.1" y="142" text-anchor="middle" font-size="11">15 ms</text>
+<circle cx="364.5" cy="120" r="5"/>
+<text x="364.5" y="142" text-anchor="middle" font-size="11">9 ms</text>
 <rect x="365.0" y="115" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"/>
 <text x="370.0" y="109" text-anchor="middle" font-size="11">10 ms</text>
 <text x="240" y="172" text-anchor="end">A new pondra sql process</text>
 <line x1="250" y1="168" x2="730" y2="168" stroke="currentColor" stroke-opacity="0.08"/>
-<circle cx="433.8" cy="168" r="5"/>
-<text x="433.8" y="190" text-anchor="middle" font-size="11">34 ms</text>
+<circle cx="533.0" cy="168" r="5"/>
+<text x="533.0" y="190" text-anchor="middle" font-size="11">228 ms</text>
 <rect x="664.0" y="163" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"/>
 <text x="669.0" y="157" text-anchor="middle" font-size="11">3.1 s</text>
 <text x="240" y="220" text-anchor="end">A Delta reader (delta-rs)</text>
 <line x1="250" y1="216" x2="730" y2="216" stroke="currentColor" stroke-opacity="0.08"/>
-<circle cx="436.8" cy="216" r="5"/>
-<text x="436.8" y="238" text-anchor="middle" font-size="11">36 ms</text>
+<circle cx="609.3" cy="216" r="5"/>
+<text x="609.3" y="238" text-anchor="middle" font-size="11">987 ms</text>
 <rect x="667.2" y="211" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"/>
 <text x="672.2" y="205" text-anchor="middle" font-size="11">3.3 s</text>
 <text x="240" y="268" text-anchor="end">An Iceberg reader (PyIceberg)</text>
 <line x1="250" y1="264" x2="730" y2="264" stroke="currentColor" stroke-opacity="0.08"/>
-<circle cx="429.0" cy="264" r="5"/>
-<text x="429.0" y="286" text-anchor="middle" font-size="11">31 ms</text>
+<circle cx="609.8" cy="264" r="5"/>
+<text x="609.8" y="286" text-anchor="middle" font-size="11">997 ms</text>
 <rect x="675.9" y="259" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"/>
 <text x="680.9" y="253" text-anchor="middle" font-size="11">3.9 s</text>
 </svg>
 </div>
-<figcaption>Median time from the acknowledgement to the first read that sees the row, on a log scale. Delta and Iceberg readers were measured at <code>--tier-secs 2</code>.</figcaption>
+<figcaption>Median time from the acknowledgement to the first read that sees the row, on a log scale. Local disk was measured on 2026-10-11, with Delta and Iceberg published at <code>--tier-secs 2</code>. The R2 values are from earlier runs.</figcaption>
 </figure>
 
 Pondra's own readers see a write quickly. Other engines see it after the next tiering round.
@@ -188,26 +186,26 @@ once, each in its own process. The time is from the acknowledgement to the first
 row. The setup is 3 processes on one 2-vCPU machine, with two real R2 buckets: a near one (Eastern
 North America, about 290 ms per write from there) and a far one (about 670 ms). Each cell is the
 median, with the worst of 8 to 10 probes in brackets. Where a cell has two numbers, they are `durable`
-and `--ack replicated`.
+and `--ack replicated`. The local disk column was measured on 2026-10-11 on a 4-core machine, with ten probes.
 
 | Reader | Local disk | Real R2, near | Real R2, far |
 |---|---|---|---|
-| **Write acknowledged** | 4 ms | 300 ms (458) / **2 ms** (5) | 723 ms (1,000) / **2 ms** (4) |
-| **Another node** | 15 ms | 10 ms (56) / 13 ms (16) | 17 ms (28) / 9 ms (27) |
-| **A read-only node** | 15 ms | 11 ms (56) / 13 ms (16) | 13 ms (32) / 14 ms (29) |
-| **A new `pondra sql` process** | 34 ms | 3.1 s / 2.9 s | 5.8 s / 5.5 s |
-| **Delta** (delta-rs) | 36 ms | 3.3 s (4.3) / 3.6 s (5.1) | 7.1 s (9.4) / 7.2 s (9.1) |
-| **Iceberg** (PyIceberg) | 31 ms | 3.9 s (5.8) / 4.0 s (7.7) | 10.0 s (11.3) / 9.7 s (12.2) |
+| **Write acknowledged** | 5 ms (9) | 300 ms (458) / **2 ms** (5) | 723 ms (1,000) / **2 ms** (4) |
+| **Another node** | 9 ms (194) | 10 ms (56) / 13 ms (16) | 17 ms (28) / 9 ms (27) |
+| **A read-only node** | 15 ms (157) | 11 ms (56) / 13 ms (16) | 13 ms (32) / 14 ms (29) |
+| **A new `pondra sql` process** | 228 ms (262) | 3.1 s / 2.9 s | 5.8 s / 5.5 s |
+| **Delta** (delta-rs) | 987 ms (999) | 3.3 s (4.3) / 3.6 s (5.1) | 7.1 s (9.4) / 7.2 s (9.1) |
+| **Iceberg** (PyIceberg) | 997 ms (1,005) | 3.9 s (5.8) / 4.0 s (7.7) | 10.0 s (11.3) / 9.7 s (12.2) |
 
-- **Nodes** get every commit streamed from the leader, so they see a write about 10 to 15 ms after
-  the acknowledgement. The pollers were competing for two cores: a node alone sees it in about 5 ms.
+- **Nodes** get every commit streamed from the leader, so they see a write 10 to 15 ms after
+  the acknowledgement (9 ms at the median on local disk).
 - **`pondra sql`** sees every write already in the bucket, so it is fresh, but it is not fast on
   far-away storage: it spends about 20 sequential requests opening the catalog. For reads that are
   fast and fresh, join with `pondra serve --reader`. With `--ack replicated`, `pondra sql` can be up
   to one bucket write behind the acknowledgements.
 - **Delta and Iceberg readers** see the table as of the last tiering round: a few sequential round
-  trips to the bucket, and Iceberg needs two more than Delta. A published keyed table shows as of its
-  last full compaction. The default `--tier-secs` is now 10, so these can be up to 10 seconds
+  trips to the bucket, and Iceberg needs two more than Delta. A plain keyed table shows as of its last
+  tiering round. A keyed table with `order_by` or merge columns shows as of its last full compaction. The default `--tier-secs` is now 10, so these can be up to 10 seconds
   further behind than measured here. `--tier-secs 0.5` brings them closer, for more object-store
   writes.
 
@@ -219,7 +217,7 @@ Other ways to see a change as it happens:
 | `db.live(sql)`, `GET /live`: the answer now, and again after each commit that changes it | 9 to 19 ms after the statement on local disk. 0.4 to 0.5 s on R2, which includes the commit's own round trip | Nothing runs once the client goes |
 | A Kafka consumer on another node | 1 ms median, 2 ms at p99, after the producer sent, with replicated acks | 3 nodes, 4 librdkafka producers, one 2-vCPU machine |
 | A table's log as an Arrow Flight stream | Each new commit in 2.6 ms | |
-| A materialized view's row on another node | About 5 ms after the event | A view's row commits with the rows it comes from |
+| A materialized view's row on another node | When that node sees the row it comes from (another node, above) | A view's row commits with the rows it comes from |
 | A stream-join pair | 14 ms median after the second row's acknowledgement (24 ms at worst) | |
 
 A window view's `_final` table gets each window once, when the watermark passes its end. The
@@ -265,13 +263,11 @@ What Pondra does not promise yet:
   bits from run to run.
 - Kafka topics have one partition, and there are no Kafka transactions. Consumer groups live in the
   leader's memory, and members rejoin after a failover.
-- Row ids and Kafka offsets are built from commit numbers shifted by 32 bits. With a steady 500
-  commits a second on local disk, Kafka offsets turn negative after about 50 days and row ids repeat
-  after about 100. On R2 that is years away. ADR-029 (proposed) plans the fix in its first phase.
+- Kafka offsets are sparse, so a consumer can't count on them being consecutive. Row ids don't repeat.
 - Pondra is new: its first release was in 2026. It has a large test suite (crash, failover and chaos
   tests on one machine and on object storage) and benchmarks, but it hasn't yet run for years in
-  production as Spark, Flink or Postgres have. Chaos tests across several machines, fuzzing and long
-  soak runs are still on the plan.
+  production as Spark, Flink or Postgres have. Fuzzing at every door (`tools/fuzz_doors.py`) and a soak
+  on a real bucket have run. The full 24-hour soak and chaos tests across several machines are still to come.
 </Aside>
 
 ## Design notes

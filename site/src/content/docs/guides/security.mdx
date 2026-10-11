@@ -1,8 +1,6 @@
 ---
 title: Security
 description: Turn on read, write and admin tokens for every door, make users and roles with grants down to columns, hold them to quotas, keep an audit log, take TLS at every door, and keep secrets, code and the network in their place.
-sidebar:
-  order: 16
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -53,7 +51,9 @@ import pondra
 tokens = {role.lower(): token for role, token in
           re.findall(r"export PONDRA_(READ|WRITE|ADMIN)_TOKEN=(\S+)", open("tokens.env").read())}
 
-def connect(role):
+def connect(role=None, user=None, password=None):
+    if user:  # a user signs in with its name and password
+        return pondra.connect("http://localhost:8086", user=user, password=password)
     return pondra.connect("http://localhost:8086", token=tokens[role])
 
 connect("admin").sql("CREATE TABLE notes (id BIGINT, body VARCHAR)")
@@ -236,7 +236,7 @@ admin.sql("CREATE ROLE staff")
 admin.sql("GRANT SELECT (id, name) ON salaries TO staff")
 admin.sql("GRANT SELECT ON notes TO staff")
 admin.sql("GRANT staff TO ann")
-ann = pondra.connect("http://localhost:8086", user="ann", password="correct-horse-battery")
+ann = connect(user="ann", password="correct-horse-battery")
 ann.sql("SELECT id, name FROM salaries ORDER BY id").rows()
 ```
 
@@ -340,9 +340,9 @@ The master key seals the lake's own keys too: the one sessions are signed with, 
 each other with. A lake made with `PONDRA_SECRET_KEY` (or a key service) has them sealed from its first
 write. One made without has them sealed when its leader next starts with one, once every node runs a
 release that reads them sealed (the lake's format moves to 3). So a key that only reads the bucket, such
-as a backup's or another environment's, can't sign anyone in. `GET /stats` says which (`"keys":
-"sealed"`). The key made for one machine never seals them, since a node on another machine couldn't
-open them.
+as a backup's or another environment's, can't sign anyone in. `GET /stats` says which in its `keys`
+field: `"sealed"`, `"clear"` (kept in the clear), or `"none"` until the lake makes them. The key made
+for one machine never seals them, since a node on another machine couldn't open them.
 
 ## Quotas
 

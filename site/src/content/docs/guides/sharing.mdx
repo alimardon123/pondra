@@ -1,8 +1,6 @@
 ---
 title: Share a table
 description: Share a table, some of its partitions or a materialized view with another company through the Delta Sharing protocol; they read it with pandas, Spark, Power BI or another Pondra, with their own compute, and no key to your bucket leaves.
-sidebar:
-  order: 16.2
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
@@ -94,7 +92,8 @@ db.sql("SELECT region, sum(total) AS total FROM acme.orders GROUP BY region ORDE
 The token is kept as a sealed secret of the attachment (`share_acme`) and never shown; `DETACH acme`
 drops it. A share with more than one name is picked with `SHARE 'name'`; a server's address with
 its token works too: `ATTACH 'https://…/delta-sharing' AS acme (TYPE share, SHARE 'acme', TOKEN
-'…')`. Any Delta Sharing server can be attached this way, Databricks' included.
+'…')`. A server of another product that speaks the Delta Sharing protocol attaches the same way. The
+tests run against Pondra's own server, read by Pondra and by the delta-sharing client.
 
 ## Share less than a table
 

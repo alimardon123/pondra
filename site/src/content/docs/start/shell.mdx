@@ -1,8 +1,6 @@
 ---
 title: The SQL shell
 description: Open a SQL shell on a lake with pondra, pipe a script into it, and run a .sql file with parameters.
-sidebar:
-  order: 3
 setup: |
   CREATE TABLE sales (day DATE, item VARCHAR, amount DOUBLE);
   INSERT INTO sales VALUES (DATE '2026-09-27', 'tea', 7.0), (DATE '2026-09-28', 'cake', 4.5);
@@ -25,7 +23,7 @@ This is a session on a terminal. Type a statement, end it with `;`, and read the
 
 ```text
 $ pondra shop
-Pondra 0.29.0 on shop, also at http://127.0.0.1:37957. Databases: crm, shop. End each statement with ;  .tables and .databases list them, .quit leaves.
+Pondra 0.33.0 on shop, also at http://127.0.0.1:37957. Databases: crm, shop. End each statement with ;  .tables and .databases list them, .quit leaves.
 The console, as this shell: http://127.0.0.1:37957/#key=6f0c…
 pondra> SELECT item, sum(qty) AS items FROM orders GROUP BY item ORDER BY item;
 +------+-------+
@@ -50,7 +48,7 @@ pondra> .quit
   several lines.
 - An error is printed and the session goes on.
 - `.tables` lists the tables and views of every database with each one's kind (`table`, `view`,
-  `materialized view`, `external table`: [`pondra.tables`](/pondra/reference/system-columns/#tables-and-views)),
+  `materialized view`, `external table`: [`pondra.tables`](/pondra/sql/system-tables/#tables-and-views)),
   `.databases` lists the databases, and
   `.quit` leaves (so do `.exit`, `\q` and Ctrl+D).
 
@@ -103,8 +101,8 @@ exit status: 1
 
 ## Use the lakes beside yours as databases
 
-Every folder next to your lake that holds a lake is a database in the shell, under its folder's
-name. Tables are `database.table`, or `database.schema.table`, and you can join across them:
+Every lake in the folder you start the shell from is a database in the shell, under the lake's
+folder name. Tables are `database.table`, or `database.schema.table`, and you can join across them:
 
 ```bash
 mkdir -p databases && cd databases
@@ -206,8 +204,8 @@ pondra run report.sql daily --day 2026-09-27 --min 5
 - The last statement's answer is printed. A failing statement stops the run with its error, and the
   command exits with an error status.
 
-To run the file on a node that is already running, give `--url` instead of the lake. It and the
-parameters may come in any order:
+To run the file on a node that is already running, give `--url` instead of the lake. `--url` and
+`--token` may come anywhere after the file, mixed with the parameters:
 
 ```bash
 cat > today.sql <<'SQL'
