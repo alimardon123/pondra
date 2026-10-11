@@ -523,7 +523,8 @@ def p_sort_kept_through_steps(spark, F, Window):  # a sort survives withColumn a
 
 
 def p_sort_kept_through_rename(spark, F, Window):  # …and a rename: the sort follows the column's new name
-    return (spark.table("orders").orderBy("id").withColumnRenamed("id", "order_id")
+    # (descending: the rows come in ascending id order, so a sort that was lost would show)
+    return (spark.table("orders").orderBy(F.desc("id")).withColumnRenamed("id", "order_id")
             .select("order_id", "user", "item").limit(25))
 
 
