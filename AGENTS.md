@@ -1498,8 +1498,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `UNDROP` reads the log from its end (invariant 50). `tools/history_check.py`.
 217. **`t AT (…)` reads only a past the table still holds, or says so** (`past.rs`, `tier::settle`).
    A purge drops `{t}$deleted` files only past the table's retention, and moves
-   `TableMeta::past_from` to the newest it dropped. A moment before that, and any keyed table, is
-   refused by name, never answered with fewer rows. `tools/history_check.py`: "AT refused by name…".
+   `TableMeta::past_from` to the newest it dropped. A moment before that, or before the table was
+   made (`TableMeta::made`), and any keyed table, is refused by name, never answered with fewer rows.
+   `tools/history_check.py`: "AT refused by name…", "AT before the table was made…".
 218. **A file in a folder a clone shares is deleted only by the orphan sweep, once no table lists it**
    (`TableMeta::shares`, `tier::expire`, `collect_orphans`): never as one table's garbage, since the
    source's merges, the clone's merges and a `DROP` of either would take files the other reads. The

@@ -297,14 +297,22 @@ async fn when(lake: &Lake, spec: &Spec) -> Result<At> {
     })
 }
 
+static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)^\s*RESTORE\s+(?:TABLE\s+)?([\w."-]+)\s+(?:TO\s+)?(VERSION|TIMESTAMP)\s+AS\s+OF\s+(.+?)\s*;?\s*$"#).expect("a regex")
+});
+
+/// A RESTORE's text before its moment, and the moment (`$day` in it is bound by `routines::bind`:
+/// the parser doesn't read a RESTORE). None: not a RESTORE.
+pub fn restore_moment(sql: &str) -> Option<(&str, &str)> {
+    let moment = RESTORE.captures(sql)?.get(3)?;
+    Some((&sql[..moment.start()], moment.as_str()))
+}
+
 /// `RESTORE TABLE t TO VERSION AS OF n` (or `TIMESTAMP AS OF …`, Delta's words): t's rows as they
 /// were then, by one MERGE from `t AT (…)`. A row changed since gets its old values back (its
 /// `_row_id` kept), a row made since goes, a row deleted since comes back as a new row. It is a
 /// change like any, so it can be undone the same way. None: not a RESTORE.
 pub async fn restore(lake: &Lake, sql: &str) -> Result<Option<String>> {
-    static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?is)^\s*RESTORE\s+(?:TABLE\s+)?([\w."-]+)\s+(?:TO\s+)?(VERSION|TIMESTAMP)\s+AS\s+OF\s+(.+?)\s*;?\s*$"#).expect("a regex")
-    });
     let Some(c) = RESTORE.captures(sql) else { return Ok(None) };
     let name = c[1].split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
     let t = crate::ddl::local(lake, &name).ok_or_else(|| anyhow!("RESTORE {name}: a table of this lake (run it on a node of {name}'s)"))?;
