@@ -162,13 +162,14 @@ proposed from `pondra.history`) follow E13 after 1.0's freeze unless asked soone
 346. **A measure is worked out at the query's own grain, from the view's base rows, never from its
    default form's** (`measures::rewrite`, first in `routines::expand_with`'s tree stage): a query naming
    a measure reads the view's FROM and WHERE with the dimensions it uses and each column its measures
-   read, and each measure is its expression over those, grouped by the query's GROUP BY. Everything
+   read, and each measure is its expression over those, grouped by the query's GROUP BY; the base is
+   then written in place (`measures::flattened`) unless that could change a name's meaning. Everything
    after it sees a plain `GROUP BY` (spread, the result cache, the join order). `harness.py measures`:
    "MEASURE() at the query's own grain…", "every way of naming a measure…", "spread over three nodes
    == one node".
 347. **A view with measures joins only onto keys, so no row is counted twice** (`measures::check`, in
    `ddl::create_view`): each JOIN or LEFT JOIN's equalities cover a PRIMARY KEY or UNIQUE of the table
-   it joins (NOT ENFORCED is enough); a query that joins the view to anything else is refused.
+   or view it joins (NOT ENFORCED is enough); a query that joins the view to anything else is refused.
    `harness.py measures`: "refused by name, and nothing made" ('not on a key', 'has no key', 'inside
    the view').
 
