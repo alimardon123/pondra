@@ -10510,10 +10510,13 @@ def use_path():
 def doors():
     """The doors matrix (ADR-036 §7): one list of features, each through every door — SQL over HTTP
     (a session), the Python client, the Postgres port (psycopg), Flight SQL (ADBC), the JavaScript
-    client and MCP. Each cell is right, or refused by name where the door can't (a USE needs a session,
-    which Flight SQL has none of; a transaction is a session's on Postgres, HTTP, MCP, and a transaction
-    id's on Flight SQL). The table is printed; every cell must be one of the two."""
+    client, MCP, the command line (the shell, `pondra <lake>`, one process per feature) and the console
+    (its run in headless Chromium, one tab per feature). Each cell is right, or refused by name where the
+    door can't (a USE needs a session, which Flight SQL has none of; a transaction is a session's on
+    Postgres, HTTP, MCP, and a transaction id's on Flight SQL). The table is printed; every cell must be
+    one of the two. Needs playwright (Chromium at PLAYWRIGHT_BROWSERS_PATH)."""
     import re, psycopg, adbc_driver_flightsql.dbapi as adbc
+    from playwright.sync_api import sync_playwright
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
     import pondra
     lake = new_lake()
@@ -10533,7 +10536,8 @@ def doors():
         c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
         c.request("PUT", f"/files/{path}", body.encode())
         assert c.getresponse().status == 200, path
-    DOORS = ["http", "python", "postgres", "flight", "javascript", "mcp"]
+    DOORS = ["http", "python", "postgres", "flight", "javascript", "mcp", "cli", "console"]
+    shell_dir = tempfile.mkdtemp(prefix="pondra-doors-cwd-")  # (the shell attaches the lakes beside its folder: an empty one)
     def features(i):
         k = 10 * i + 1  # (each door its own keys)
         return {
@@ -10637,7 +10641,65 @@ finally {{ await db.close?.(); }}"""
         open(path, "w").write(script)
         r = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
         return json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else "refused: " + r.stderr[-160:]
-    via = {"http": via_http, "python": via_python, "postgres": via_postgres, "flight": via_flight, "javascript": via_javascript, "mcp": via_mcp}
+    def answers_of(text):
+        """The shell's standard output as one answer per statement: None for a JSON line (what it did), a
+        table's rows as lists. A table is three borders around its header and rows: the third ends it
+        (an empty one too)."""
+        out, table = [], None
+        for line in text.splitlines():
+            if line.startswith("+"):
+                if table is None:
+                    table = {"borders": 0, "rows": []}
+                table["borders"] += 1
+                if table["borders"] == 3:
+                    out.append(table["rows"])
+                    table = None
+            elif table is not None and table["borders"] == 2 and line.startswith("|"):
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                table["rows"].append([int(c) if re.fullmatch(r"-?\d+", c) else c for c in cells])
+            elif line.strip() and table is None:
+                out.append(None)
+        return out
+    # The shell prints its errors without a SQLSTATE (the header `x-pondra-sqlstate` carries it), so the
+    # codes this matrix checks are named by the words of their messages.
+    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01")]
+    def via_cli(stmts):
+        # The shell on the lake, one process for the feature's statements: one session (`shell.rs`). It has no
+        # `--url`, so it starts a node on the lake, which joins this one as a follower; its own address is an
+        # ephemeral port it picks. Its answers are on standard output, its errors on standard error.
+        p = subprocess.run([BIN, lake], input="".join(s.strip().rstrip(";") + ";\n" for s in stmts), capture_output=True, text=True, timeout=240, cwd=shell_dir)
+        errors = [e[len("Error: "):] for e in p.stderr.splitlines() if e.startswith("Error: ")]
+        if errors:
+            return next((code for word, code in shell_words if word in errors[0]), None) or "refused: " + errors[0][:160]
+        return answers_of(p.stdout) if p.returncode == 0 else "refused: " + p.stderr[-160:]
+    # The console's own run (`pondra.api.run`: core.js's `run`, as its Run button calls it), in the session a
+    # SQL file's first tab has. The page keeps only an error's text, so the page's fetch is wrapped (through
+    # the console's public `pondra.configure`) to read the SQLSTATE the node sends in its header.
+    console_run = """async stmts => {
+        const sid = pondra.session + '-1', out = [];
+        for (const s of stmts) {
+            window.__sqlstate = null;
+            try { const r = await pondra.api.run(s, undefined, undefined, undefined, sid); out.push(r.kind === 'rows' ? r.rows : null); }
+            catch (e) { return { sqlstate: window.__sqlstate, message: e.message }; }
+        }
+        return { answers: out };
+    }"""
+    console_wrap = """() => pondra.configure({ fetch: async (url, init) => { const r = await fetch(url, init); window.__sqlstate = r.headers.get('x-pondra-sqlstate'); return r; } })"""
+    def via_console(stmts):
+        page = browser.new_page()  # (a tab of its own per feature; one browser for all of them)
+        try:
+            page.goto(f"http://127.0.0.1:{A.port}/")
+            page.wait_for_function("() => window.pondra && window.pondra.api")
+            page.evaluate(console_wrap)
+            got = page.evaluate(console_run, stmts)
+        finally:
+            page.close()
+        if "answers" in got:
+            return got["answers"]
+        return got["sqlstate"] or "refused: " + got["message"][:160]
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch()
+    via = {"http": via_http, "python": via_python, "postgres": via_postgres, "flight": via_flight, "javascript": via_javascript, "mcp": via_mcp, "cli": via_cli, "console": via_console}
     matrix, checks = {}, {}
     no_session = {"USE a schema": {"flight"}}  # (USE needs a session: Flight SQL has none, so it's refused by name there)
     for i, door in enumerate(DOORS):
@@ -10654,6 +10716,9 @@ finally {{ await db.close?.(); }}"""
             refused = isinstance(got, str) and ("session" in got or got.startswith("refused") or got == "0A000")
             cell = "ok" if ok else ("refused" if refused and door in no_session.get(name, ()) else "WRONG")
             matrix.setdefault(name, {})[door] = cell if cell != "WRONG" else f"WRONG: {str(got)[:120]}"
+    browser.close()
+    pw.stop()
+    shutil.rmtree(shell_dir, ignore_errors=True)
     for name, row in matrix.items():
         checks[f"{name}: " + ", ".join(f"{d} {'ok' if v == 'ok' else v}" for d, v in row.items())] = all(v in ("ok", "refused") for v in row.values())
     node.kill()
