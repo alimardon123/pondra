@@ -54,30 +54,6 @@ impl Constraint {
 /// Does a write to this table have to be checked on the leader (an enforced UNIQUE)?
 pub fn checked(meta: &TableMeta) -> bool { meta.constraints.iter().any(|c| c.enforced) }
 
-/// Sequencer: does `table` take rows only from the leader's check? Its entry is read again only
-/// when a commit has written it since (`Catalog::written_at`), so a flush costs a lookup a table.
-pub async fn sequenced(lake: &Lake, table: &str) -> Result<bool> {
-    type Seen = std::collections::HashMap<(String, String), (u64, bool)>;
-    static SEEN: std::sync::LazyLock<std::sync::Mutex<Seen>> = std::sync::LazyLock::new(Default::default);
-    let key = crate::store::table_key(table);
-    let at = lake.cat.written_at(&key);
-    let id = (lake.url.clone(), table.to_string());
-    if let (Some(at), Some(&(seen, checks))) = (at, SEEN.lock().unwrap().get(&id)) {
-        if seen == at {
-            return Ok(checks);
-        }
-    }
-    let checks = lake.cat.get::<TableMeta>(&key).await?.is_some_and(|m| checked(&m));
-    if let Some(at) = at {
-        let mut seen = SEEN.lock().unwrap();
-        if seen.len() > 100_000 {
-            seen.clear(); // (tables dropped long ago)
-        }
-        seen.insert(id, (at, checks));
-    }
-    Ok(checks)
-}
-
 /// Refused at a door that writes rows without the leader's check (an append, Kafka, Flight,
 /// `COPY`, another engine's commit): a table with an enforced UNIQUE takes rows through SQL.
 pub fn door(meta: &TableMeta, table: &str) -> Result<()> {
@@ -292,7 +268,7 @@ pub async fn apply(lake: &Lake, table: &str, change: Change) -> Result<serde_jso
             m.constraints.push(Constraint { columns: stored, ..c.clone() });
             if c.enforced {
                 // Kept first, so every write from here on is checked (or refused, from a node
-                // that doesn't know of it yet: `sequenced`); then, once the flushes sequenced
+                // that doesn't know of it yet: `log::commit`); then, once the flushes sequenced
                 // before it are in, the rows already there are checked, and it goes if two share a value.
                 lake.cat.commit(vec![(key.clone(), crate::store::json(&m))], &[]).await?;
                 if let Some(to) = lake.to.get() {

@@ -3,6 +3,7 @@
 TIMESTAMP => t | OFFSET => -seconds)` against a model of every state the table went through,
 RESTORE TABLE and zero-copy CLONE; ALTER TABLE … SWAP WITH (write-audit-publish: two tables alike but
 for their rows exchange names in one commit) and the identity sequence a clone shares with its source.
+Tables renamed, swapped, dropped and undropped while two nodes append to them: every acked row once.
 
   history_check.py [--new target/release/pondra] [--work DIR] [--port 9760]
 
@@ -300,8 +301,8 @@ def history_check(bin, work, port):
     checks["SWAP refused by name: itself, a view, tables not alike, one a materialized view follows, a published one (either side), a shared one"] = \
         "itself" in itself and "is a view" in as_view and "differ in more than their rows" in unlike and "followed by" in followed \
         and "published" in published and "published" in published_b and "is in share ow_share" in shared
-    # A writer inserting into one of two tables while they swap again and again. A row that lands while a
-    # swap puts the other table's rows in files sits under the mark the swap gives both, unless it looks again.
+    # A writer inserting into one of two tables while they swap again and again. A swap holds both tables'
+    # appends while it moves them, so a row never lands between its last look at the log and its commit.
     q("CREATE TABLE wr (id BIGINT, v VARCHAR)")
     q("INSERT INTO wr VALUES (0, 'first')")
     q("CREATE TABLE wr2 CLONE wr")
@@ -322,19 +323,84 @@ def history_check(bin, work, port):
         while swapped < 300 and time.time() < deadline:  # (the unchecked swap lost a row in 3 of 4 runs)
             tries += 1
             q(f"INSERT INTO wr2 VALUES ({100000 + tries}, 'staged')")  # (rows of the other table's to put in files too)
-            try:
-                q("ALTER TABLE wr SWAP WITH wr2")
-                swapped += 1
-            except Failed as e:
-                if "kept taking rows" not in str(e):
-                    raise
+            q("ALTER TABLE wr SWAP WITH wr2")
+            swapped += 1
     finally:
         stop.set()
         w.join()
     written = [i for (i,) in rows("SELECT id FROM wr UNION ALL SELECT id FROM wr2") if 0 < i < 100000]
-    checks["…a writer inserting into one of them while they swap again and again: every row in one of them, once"] = \
-        swapped >= 100 and sorted(written) == sorted(set(written)) and set(written) == set(acked)
+    checks["…a writer inserting into one of them while they swap again and again: every swap goes through at once, every row in one of them, once"] = \
+        swapped == 300 and tries == 300 and sorted(written) == sorted(set(written)) and set(written) == set(acked)
     print(f"(swapped {swapped} times in {tries} tries, beside {len(acked)} inserts)", file=sys.stderr)
+
+    def appenders(table, run):
+        """Two writers, one on the leader and one on the follower, appending to `table` while `run()`
+        works; what each acked, and every error that wasn't "no table {table}"."""
+        acked, other, stop = [], [], threading.Event()
+
+        def writer(node, base):
+            i = base
+            while not stop.is_set():
+                i += 1
+                try:
+                    node.append(table, "", 0, [{"id": i, "v": "w"}])
+                    acked.append(i)
+                except Failed as e:
+                    if f"no table {table}" not in str(e):
+                        other.append(str(e)[:300])
+                time.sleep(random.random() * 0.002)
+
+        ws = [threading.Thread(target=writer, args=(node, base)) for node, base in ((n, 0), (f, 10_000_000))]
+        for w in ws:
+            w.start()
+        try:
+            run()
+        finally:
+            stop.set()
+            for w in ws:
+                w.join()
+        return acked, other
+
+    # A table renamed back and forth while two nodes append to it: every acked row is in it once.
+    q("CREATE TABLE rr (id BIGINT, v VARCHAR)")
+    names = ["rr"]
+
+    def renames():
+        for _ in range(200):
+            to = "rr2" if names[-1] == "rr" else "rr"
+            q(f"ALTER TABLE {names[-1]} RENAME TO {to}")
+            names.append(to)
+            time.sleep(0.01)
+
+    acked, other = appenders("rr", renames)
+    found = [i for (i,) in rows(f"SELECT id FROM {names[-1]}")]
+    checks["a table renamed back and forth 200 times while two nodes append to it: every rename goes through at once, every acked row in it once, and an append to the name it doesn't have refused by name"] = \
+        len(names) == 201 and not other and sorted(found) == sorted(set(found)) and set(found) == set(acked)
+    print(f"(renamed {len(names) - 1} times beside {len(acked)} appends; other errors: {other[:3]})", file=sys.stderr)
+
+    # A table dropped and undropped while two nodes append to it: every acked row is in it once.
+    q("CREATE TABLE dd (id BIGINT, v VARCHAR)")
+
+    def drops():
+        for _ in range(20):
+            time.sleep(0.1)
+            q("DROP TABLE dd")
+            time.sleep(0.05)
+            q("UNDROP TABLE dd")
+
+    acked, other = appenders("dd", drops)
+    found = [i for (i,) in rows("SELECT id FROM dd")]
+    checks["a table dropped and undropped 20 times while two nodes append to it: every acked row in it once, and an append while it is dropped refused by name"] = \
+        not other and sorted(found) == sorted(set(found)) and set(found) == set(acked)
+    print(f"(dropped 20 times beside {len(acked)} appends; other errors: {other[:3]})", file=sys.stderr)
+    # An INSERT into a name no table has makes one, which starts at the log's end like any new table:
+    # the renamed table's rows still in the log under that name aren't its.
+    q("CREATE TABLE nn (id BIGINT, v VARCHAR)")
+    q("INSERT INTO nn VALUES (1, 'old')")
+    q("ALTER TABLE nn RENAME TO nn2")
+    q("INSERT INTO nn VALUES (2, 'new')")
+    checks["an INSERT under a renamed table's old name makes a table of its own rows only"] = \
+        rows("SELECT count(*) FROM nn") == [(1,)] and rows("SELECT id FROM nn2") == [(1,)]
     q("CREATE TABLE sq (id BIGINT GENERATED ALWAYS AS IDENTITY, v VARCHAR)")
     q("INSERT INTO sq (v) VALUES ('a')")
     q("CREATE TABLE sq2 CLONE sq")
@@ -349,6 +415,39 @@ def history_check(bin, work, port):
         distinct = [(str(e), None)]
     checks["a clone's identity sequence outlives the clone, and its source: DROP … PURGE of either leaves the other numbering rows"] = \
         distinct[0][0] == distinct[0][1] == 3
+
+    # Writes paused by backpressure (`--backlog`) wait for tiering, which takes the lake's lock. A
+    # statement holding that lock while it goes through the sequencer (an UPDATE, a rename's hold)
+    # must not wait for them: tiering would wait for it, and neither would ever go.
+    p = Node(bin, os.path.join(work, "paced"), port + 2, work, "--backlog", "200", tier_secs=30).start()
+    p.q("CREATE TABLE pa (id BIGINT, v VARCHAR)")
+    p.q("INSERT INTO pa VALUES (0, 'a')")
+    p.q("CREATE TABLE flood (id BIGINT)")
+    p.append("flood", "", 0, [{"id": i} for i in range(1000)])  # (past --backlog: writes wait for the next round, 30 s on)
+    waited = {}
+
+    def paused():
+        t0 = time.time()
+        p.append("flood", "", 0, [{"id": -1}])
+        waited["append"] = time.time() - t0
+
+    w = threading.Thread(target=paused)
+    w.start()
+    time.sleep(1)
+    answered = {}
+    for sql in ["UPDATE pa SET v = 'b'", "ALTER TABLE pa RENAME TO pa2"]:
+        t0 = time.time()
+        try:
+            p.call("POST", "/sql", sql, timeout=15)
+            answered[sql] = round(time.time() - t0, 1)
+        except Exception as e:  # (a timeout too)
+            answered[sql] = str(e)[:120]
+    w.join(90)
+    still_paused = w.is_alive()
+    p.stop()
+    checks["while writes wait for tiering (backpressure), an UPDATE and a rename answer at once, and the writes go in"] = \
+        all(isinstance(v, float) and v < 5 for v in answered.values()) and not still_paused and waited.get("append", 99) < 60
+    print(f"(under backpressure: {answered}; the paused append waited {waited.get('append')} s)", file=sys.stderr)
 
     # From `pondra sql`, with no node running.
     f.stop()

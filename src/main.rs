@@ -573,8 +573,9 @@ async fn run() -> anyhow::Result<()> {
                 replica::recover(&lake, &addr, cluster.leader.n, Some(own)).await?;
             }
             tr("followers' changes recovered");
-            let max_backlog = (tier_secs > 0.0).then_some(backlog); // rows waiting to be tiered
-            let seq = if leader { Some(log::Sequencer::start(lake.clone(), max_backlog).await?) } else { None };
+            let lock: Arc<tokio::sync::Mutex<()>> = Default::default(); // (the lake's: everything that rewrites table metadata)
+            let pace = (tier_secs > 0.0).then(|| log::Pace { rows: backlog, lock: lock.clone() }); // rows waiting to be tiered
+            let seq = if leader { Some(log::Sequencer::start(lake.clone(), pace).await?) } else { None };
             let to = match &seq {
                 Some(s) => log::To::Local(s.clone()),
                 None => log::To::Leader(cluster.leader.addr.clone()),
@@ -583,7 +584,7 @@ async fn run() -> anyhow::Result<()> {
             let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to)));
             tr("the sequencer");
             python::init(python);
-            let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
+            let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock, retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
             learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
             if leader {
                 let (l, c) = (app.lake.clone(), app.cluster.clone()); // (beside serving, not before it: C5)

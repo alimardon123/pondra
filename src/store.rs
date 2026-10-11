@@ -1821,12 +1821,6 @@ impl Catalog {
         Ok(Some(m))
     }
 
-    /// The commit that last wrote `key`, where the catalog is in memory (the leader's always is).
-    pub fn written_at(&self, key: &str) -> Option<u64> {
-        let o = self.overlay.lock().unwrap();
-        self.mirror.load(Relaxed).then(|| o.get(key).map(|(id, _)| *id)).flatten()
-    }
-
     /// `key` from this node's own view of the bucket, past the mirror: for what a follower needs
     /// before its commit stream opens, which never changes once written (the lake's own keys, which
     /// signing in to that stream takes: `users::keys`).

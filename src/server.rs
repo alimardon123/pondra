@@ -767,6 +767,7 @@ impl App {
     /// for other engines, then expire what everything has consumed (leader).
     pub async fn tier_all(&self, min_rows: u64) -> anyhow::Result<u64> {
         let _guard = self.lock.lock().await;
+        let _tiering = self.seq.as_ref().map(|s| s.tiering()); // (writers paused by backpressure stay paused: `log::Pace`)
         let start = std::time::Instant::now();
         let hwm = *self.lake.hwm.borrow();
         let tables = self.lake.cat.scan::<TableMeta>("t/", "t0").await?;

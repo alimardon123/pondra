@@ -429,12 +429,17 @@ async fn queue(app: &App, table: &str, meta: &TableMeta, records: &[u8]) -> BoxF
 }
 
 /// A write's failure, as Kafka says it: a row refused (a CHECK, NOT NULL, a view's expectation) is
-/// a bad record, which a producer doesn't send again; anything else — the leader moving, the
-/// bucket out of reach — passes, so it's a timeout, which a producer retries (an idempotent one's
-/// retry is applied once). Said as a policy violation, a failover failed the producer's records.
+/// a bad record, which a producer doesn't send again; a topic renamed or dropped as it was sent is
+/// unknown; anything else — the leader moving, the bucket out of reach — passes, so it's a timeout,
+/// which a producer retries (an idempotent one's retry is applied once). Said as a policy
+/// violation, a failover failed the producer's records.
 fn failed(e: &anyhow::Error) -> Outcome {
-    let refused = crate::codes::of(e).starts_with("23");
-    (if refused { INVALID_RECORD } else { REQUEST_TIMED_OUT }, -1, Some(format!("{e:#}")))
+    let error = match crate::codes::of(e) {
+        c if c.starts_with("23") => INVALID_RECORD,
+        "42P01" => UNKNOWN_TOPIC,
+        _ => REQUEST_TIMED_OUT,
+    };
+    (error, -1, Some(format!("{e:#}")))
 }
 
 struct Rec {
