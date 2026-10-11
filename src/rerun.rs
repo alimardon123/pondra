@@ -486,10 +486,16 @@ async fn reads(lake: &Lake, sql: &str, source: &str) -> Result<(Vec<String>, boo
 // ---------------------------------------------------------------- the runs (the leader's)
 
 /// When each view last ran, how long it worked, and how many runs in a row failed: a view runs again
-/// only once at least that long (ten times that for a full run, and its lag) has passed, so a slow
-/// one never takes the leader over, and one that keeps failing waits longer each time (up to a
-/// minute). Its waits for the lake's lock and for its commit aren't work: counted, a run behind a
-/// tiering round waited ten times that again.
+/// only once that long has passed since its run ended (nine times that for a full run, and its lag),
+/// so its runs take at most half the time (a tenth for a full run), and one that keeps failing waits
+/// longer each time (up to a minute). Its waits for the lake's lock and for its commit aren't work:
+/// counted, a run behind a tiering round waited ten times that again.
+///
+/// A run slowed by the node's other work still counts as long, and its view then waited ten times
+/// that after the other work was done: Nexmark's q5, under 50 ms alone, took half a second as the
+/// stream ended and ran again five seconds later. So once what a view reads has been still for
+/// `STILL`, its next run comes then, once (the one after waits again): a burst's last rows are
+/// answered a moment after it, and a view still runs at most twice in its wait.
 #[derive(Default)]
 struct Pace {
     running: bool,
@@ -499,7 +505,13 @@ struct Pace {
     error: Option<String>,
     /// When a timed view last ran whatever changed.
     timed: Option<Instant>,
+    /// The commit its last run that worked was as of, and whether that run came early (its tables
+    /// still before its wait was over).
+    upto: u64,
+    early: bool,
 }
+
+const STILL: Duration = Duration::from_secs(1);
 
 static PACE: Mutex<BTreeMap<(String, String), Pace>> = Mutex::new(BTreeMap::new());
 
@@ -509,6 +521,7 @@ struct Turn {
     key: (String, String),
     due: bool,
     waited: std::sync::atomic::AtomicU64, // µs: the run's waits (`waiting`), left out of what it took
+    upto: std::sync::atomic::AtomicU64, // the commit the run is as of
 }
 
 impl Drop for Turn {
@@ -534,7 +547,7 @@ impl Turn {
         let mut pace = PACE.lock().unwrap();
         let Some(p) = pace.get_mut(&self.key) else { return };
         match r {
-            Ok(()) => (p.failures, p.error) = (0, None),
+            Ok(()) => (p.failures, p.error, p.upto) = (0, None, p.upto.max(self.upto.load(std::sync::atomic::Ordering::Relaxed))),
             Err(e) => {
                 let e = format!("{e:#}");
                 if p.error.as_ref() != Some(&e) {
@@ -546,23 +559,28 @@ impl Turn {
     }
 }
 
-fn turn(lake: &Lake, view: &str, r: &Rerun) -> Option<Turn> {
+/// `changed`: the newest commit that changed a table the view follows, and when it was made.
+fn turn(lake: &Lake, view: &str, r: &Rerun, changed: Option<(u64, u64)>) -> Option<Turn> {
     let mut pace = PACE.lock().unwrap();
     let key = (lake.url.clone(), view.to_string());
     let p = pace.entry(key.clone()).or_default();
     let backoff = Duration::from_secs(if p.failures == 0 { 0 } else { (1u64 << p.failures.min(6)).min(60) / 2 });
-    let spaced = if r.full.is_some() { p.took * 10 } else { p.took }; // (a full run reads everything)
-    let wait = spaced.max(Duration::from_secs(r.lag_secs.unwrap_or(0))).max(backoff);
-    if p.running || p.started.is_some_and(|s| s.elapsed() < wait) {
+    let least = Duration::from_secs(r.lag_secs.unwrap_or(0)).max(backoff);
+    let spaced = if r.full.is_some() { p.took * 10 } else { p.took * 2 }; // (from its start; a full run reads everything)
+    let since = p.started.map(|s| s.elapsed());
+    let paced = since.is_none_or(|s| s >= spaced.max(least));
+    let still = changed.is_some_and(|(n, ms)| n > p.upto && crate::log::now_ms().saturating_sub(ms) >= STILL.as_millis() as u64);
+    if p.running || !(paced || still && !p.early && since.is_none_or(|s| s >= least)) {
         return None;
     }
+    p.early = !paced;
     let every = r.lag_secs.map_or(TIMED, Duration::from_secs);
     let due = r.full.as_ref().is_some_and(|f| f.timed) && p.timed.is_none_or(|t| t.elapsed() >= every);
     (p.running, p.started) = (true, Some(Instant::now()));
     if due {
         p.timed = p.started;
     }
-    Some(Turn { key, due, waited: Default::default() })
+    Some(Turn { key, due, waited: Default::default(), upto: Default::default() })
 }
 
 /// Why a view's runs keep failing on this node (two in a row), if they do: making it says so
@@ -576,17 +594,52 @@ pub fn failing(lake: &Lake, view: &str) -> Option<String> {
 /// its own (a run that reads many rows never holds up the others, or the leader's other work). A
 /// run is no loop: one that fails or panics is tried again at a later turn.
 pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>) -> Result<()> {
-    for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
-        let Some(r) = &v.rerun else { continue };
-        let name = key[2..].to_string();
-        let Some(turn) = turn(lake, &name, r) else { continue };
+    let views: Vec<(String, View)> = lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.rerun.is_some()).map(|(k, v)| (k[2..].to_string(), v)).collect();
+    if views.is_empty() {
+        CHANGED.lock().unwrap().remove(&lake.url);
+        return Ok(());
+    }
+    look(lake).await?;
+    for (name, v) in views {
+        let Some(turn) = turn(lake, &name, v.rerun.as_ref().expect("filtered"), last_change(lake, &follows(&v))) else { continue };
         let (lake, seq, lock) = (lake.clone(), seq.clone(), lock.clone());
         tokio::spawn(async move {
-            let r = run(&lake, &seq, &lock, &name, &v, turn.due, &turn.waited).await;
+            let r = run(&lake, &seq, &lock, &name, &v, &turn).await;
             turn.ended(&r);
         });
     }
     Ok(())
+}
+
+/// Each lake's tables, with the newest commit that changed each and when it was made, as far as the
+/// log has been looked at: brought up to date from the commits since the last look (the first look
+/// starts at the log's end, and a lake no view runs again for is let go).
+static CHANGED: Mutex<BTreeMap<String, (u64, HashMap<String, (u64, u64)>)>> = Mutex::new(BTreeMap::new());
+
+async fn look(lake: &Lake) -> Result<()> {
+    let now = lake.visible();
+    let from = CHANGED.lock().unwrap().entry(lake.url.clone()).or_insert_with(|| (now, HashMap::new())).0;
+    if now <= from {
+        return Ok(());
+    }
+    let segments = lake.cat.scan::<Segment>(&seg_key(from + 1), &seg_key(now + 1)).await?;
+    let mut seen = CHANGED.lock().unwrap();
+    let (upto, at) = seen.get_mut(&lake.url).context("let go meanwhile")?;
+    for (key, s) in segments {
+        let n: u64 = key[2..].parse()?;
+        for t in s.parts.keys().chain(s.files.keys()).filter(|t| moved(&s, t)) {
+            at.insert(t.clone(), (n, s.ts_ms));
+        }
+    }
+    *upto = (*upto).max(now);
+    Ok(())
+}
+
+/// The newest commit that changed any of `tables` (`moved`), and when it was made.
+fn last_change(lake: &Lake, tables: &[String]) -> Option<(u64, u64)> {
+    let seen = CHANGED.lock().unwrap();
+    let at = &seen.get(&lake.url)?.1;
+    tables.iter().flat_map(|t| [at.get(t), at.get(&crate::sys::deleted(t))]).flatten().max().copied()
 }
 
 /// Has a log segment changed `source`'s rows: rows in (the log's, or a file commit's), old versions
@@ -617,7 +670,8 @@ async fn moved_since(lake: &Lake, after: u64, upto: u64, tables: &[String]) -> R
 /// of `now`, in place of theirs. The first run works every group out, and so does one whose
 /// changes its source no longer holds whole (`past::kept_since`). `due`: a timed view runs though
 /// nothing changed here, and commits only if its answer did.
-async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex<()>, view: &str, v: &View, due: bool, waited: &std::sync::atomic::AtomicU64) -> Result<()> {
+async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex<()>, view: &str, v: &View, turn: &Turn) -> Result<()> {
+    let (due, waited) = (turn.due, &turn.waited);
     let r = v.rerun.as_ref().context("not run again")?;
     let producer = producer(view);
     let done: Option<u64> = lake.cat.get(&producer_key(&producer)).await?;
@@ -626,6 +680,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
         seq.number().await?; // (a lake with no commit yet: its first, so the run has one to be as of)
         return Ok(());
     }
+    turn.upto.store(now, std::sync::atomic::Ordering::Relaxed);
     let mut fresh = done.is_some_and(|d| d >= now); // (nothing committed since its last run)
     if fresh && !due {
         return Ok(());
@@ -688,6 +743,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
             // (its answer moved with time alone: a commit of its own to be as of, and again)
             drop(guard);
             (now, fresh) = (waiting(waited, seq.number()).await?.version, false);
+            turn.upto.store(now, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
         let (mut pending, _) = crate::change::appends(lake, seq, view, &meta, vec![old], vec![new], &producer).await?;
@@ -863,8 +919,8 @@ fn semi(input: &LogicalPlan, by: &[Expr], touched: &Touched) -> Result<LogicalPl
 /// A run by key's session joins as `semi` says. DataFusion would swap the sides by its estimates,
 /// which count a table by its files' compressed bytes, and so held the whole table instead: every
 /// batch out of the join then pointed into all of it, and a window's sort above it counted
-/// gigabytes and failed (Nexmark's q18 at 2M events). A view kept by key reads one table, so `semi`
-/// is its only join.
+/// gigabytes and failed (Nexmark's q18 at 2M events). The view's own joins (windows over tables
+/// joined on their key) are then run as written too.
 fn kept_as_written(ctx: &SessionContext) {
     ctx.state_ref().write().config_mut().options_mut().optimizer.join_reordering = false;
 }

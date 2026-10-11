@@ -405,7 +405,7 @@ impl Backpressure {
     /// Tiering needs the lake's lock, and whoever else holds it (a view running its query again,
     /// a change, a fill) may be waiting for this very commit: held back, it never lets go, tiering
     /// never starts, and every write stops (Nexmark's twenty views, now and then). So commits wait
-    /// only while the lock is free or tiering holds it (invariant 281).
+    /// only while the lock is free or tiering holds it (invariant 282).
     fn holds(&self, lake: &Lake) -> bool {
         lake.backlog.load(Ordering::Relaxed) > self.max && (lake.tiering.load(Ordering::Relaxed) || self.lock.try_lock().is_ok())
     }

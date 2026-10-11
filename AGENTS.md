@@ -1954,7 +1954,23 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    isn't dropped again. `project_check.py`: "pondra status: a table renamed outside an apply…", "pondra capture
    sales.memos…", "pondra plan after the capture…", "pondra apply prod: the migration runs there…", "…a column
    added outside an apply…".
-281. **Commits wait for tiering only while tiering can run** (`log::Backpressure`, `Lake::tiering`):
+281. **A swap exchanges two tables alike but for their rows, in one commit, and leaves no row of
+   either under the other's name** (`ddl::swap`, `exchange`): both tables' log rows go to files
+   first; every moved entry, its `$deleted` too, takes the largest of the four `tiered` marks (the
+   log between two marks holds the other's rows, already in its files); and since appends don't take
+   the lake's lock, the log is read again just before the commit, and a row past its table's own
+   mark makes the swap take another round. A row after that is past the mark and shows under the
+   name it was written to. Each entry keeps its folder; comments, indexes, grants and stored views
+   stay with the names. Alike is the same `objects::table_sql` and stored columns. Refused by name:
+   a view, a materialized view or a part of one, a hidden table, one a materialized view or a task
+   follows, a shared or published table, an attached lake's. A clone's shared identity sequence goes
+   only when no table, live or kept dropped, names it (`seq::drop_owned`). `history_check.py`:
+   "ALTER TABLE … SWAP WITH…", "…one with every row in files and one with rows in the log…" (fails
+   with the marks left as they were), "…a follower reads…", "…a writer inserting into one of them
+   while they swap again and again…" (a row lost in 3 of 4 runs without the second look), "SWAP
+   refused by name…", "a clone's identity sequence outlives…".
+
+282. **Commits wait for tiering only while tiering can run** (`log::Backpressure`, `Lake::tiering`):
    while more than `--backlog` rows wait in the log, the sequencer holds commits back, but only while
    the lake's lock is free or a tiering round holds it (`server::Tiering`: on once the round has the
    lock, off once it has let it go). Tiering needs that lock, and whoever else holds it (a view running
@@ -1962,23 +1978,26 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    held, Nexmark's twenty views stopped every write, one run in four. `harness.py backpressure`: "150
    writes, each in time" times out at the 11th write without it; "never half of 8,000 rows in the
    log" fails if commits never wait.
-282. **A view of windows is kept by key only when each key's rows come from that key's rows alone**
-   (`rerun::window_keys`, `partitioned`, `within`): one table read alone under its windows, or tables
-   inner-joined on them (`joined`: each table has a column of the key's type equal to each key,
-   through the joins' conditions and the filters over them), columns every window partitions by (a
-   stack's shared ones), each selected as it is (`traced`). A run then reads only the touched keys'
-   rows under the windows (a semi join below the lowest one, or below each joined table: `cut`), so
-   every partition it works out holds all its rows. A join's keys come from every joined table's
-   changes, found over the tables as they are (a table replaced by its changes is a query of its own,
-   which `joined` doesn't take), and the view follows each of them (`Rerun::joins`, the source among
-   them; `View::follows`: a bulk INSERT into one takes the version of the commit that records it).
-   The touched keys are the side a semi join holds, as written (`kept_as_written`): swapped by the
-   planner's estimates, the whole table was held and a window's sort above it failed. A window over
-   every row, a key not selected, an outer join, a keyed table or a table not joined on the key is run
-   whole. Kept whole, Nexmark's q18 and q19 at 2M events answered 35 s after the last bid.
-   `harness.py bykey`: `latest`, `top3` (two windows sharing `region`), `led` (a join on the key, its
-   other table changed too) == ad hoc through changes, three nodes and a restart; "a key not selected
-   (a window's too)", "a join not on the windows' key", "a keyed table joined".
+283. **A view of windows is kept by key only when each key's rows come from that key's rows alone**
+   (`rerun::window_keys`, `partitioned`, `within`): one table read alone under its windows, or
+   tables inner-joined on them (`joined`: each table has a column of the key's type equal to each
+   key, through the joins' conditions and the filters over them), columns every window partitions by
+   (a stack's shared ones), each selected as it is (`traced`). A run then reads only the touched
+   keys' rows under the windows (a semi join below the lowest one, or below each joined table:
+   `cut`), so every partition it works out holds all its rows; a key column is first kept to the
+   touched keys' least and greatest (a GROUP BY's too), only where none of them is NULL and its type
+   isn't a float (`Touched::ranges`), so the scans below skip files and batches outside it and the
+   join loses nothing. A join's keys come from every joined table's changes, found over the tables
+   as they are (a table replaced by its changes is a query of its own, which `joined` doesn't take),
+   and the view follows each of them (`Rerun::joins`, the source among them; `View::follows`: a bulk
+   INSERT into one takes the version of the commit that records it). The touched keys are the side a
+   semi join holds, as written (`kept_as_written`): swapped by the planner's estimates, the whole
+   table was held and a window's sort above it failed. A window over every row, a key not selected,
+   an outer join, a keyed table or a table not joined on the key is run whole. Kept whole, Nexmark's
+   q18 and q19 at 2M events answered 35 s after the last bid. `harness.py bykey`: `latest`, `top3`
+   (two windows sharing `region`), `led` (a join on the key, its other table changed too) == ad hoc
+   through changes, three nodes and a restart; "a key not selected (a window's too)", "a join not on
+   the windows' key", "a keyed table joined".
 
 ## Tests: run these before and after any change
 

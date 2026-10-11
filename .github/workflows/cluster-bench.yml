@@ -46,10 +46,9 @@ jobs:
         if: (inputs.binary || 'ci') == 'ci'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          run=$(bash tools/ci_build.sh "$GITHUB_SHA")
-          [ -n "$run" ] || { echo "::error::no passing build run for $GITHUB_SHA: wait for it, or use binary: build"; exit 1; }
-          gh run download "$run" --name pondra-linux-x64 --dir dl && tar -xzf dl/pondra-linux-x64.tar.gz pondra
+        # (waited for while main's build runs: a night's run that started minutes after a merge found
+        # no build yet and benchmarked nothing, 2026-10-10)
+        run: bash tools/ci_artifact.sh linux-x64 "$GITHUB_SHA" && tar -xzf dist/pondra-linux-x64.tar.gz pondra
       - name: Or build from source
         if: inputs.binary == 'build'
         run: cargo build --profile dist && cp target/dist/pondra pondra

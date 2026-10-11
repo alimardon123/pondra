@@ -133,8 +133,10 @@ bob   home      2
 Every other query is a materialized view too: a top N (`ORDER BY … LIMIT`), a window over every row,
 `DISTINCT`, a subquery over its own table, a median across a join, or a filter on `now()`. Its query
 runs whole again after a commit changes a table it reads, at most so often that its runs take a
-tenth of the time (a query of 50 ms is current within half a second; one of 10 s, within 100 s).
-A view that calls `now()`, or reads another lake or files, also runs every minute, or every `lag`.
+tenth of the time (a query of 50 ms is current within half a second; one of 10 s, within 100 s),
+and once those tables have been still for a second it runs then, so the last rows of a burst never
+wait out that tenth. A view that calls `now()`, or reads another lake or files, also runs every
+minute, or every `lag`.
 
 ```sql
 CREATE MATERIALIZED VIEW IF NOT EXISTS biggest AS

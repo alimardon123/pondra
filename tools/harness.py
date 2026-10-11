@@ -2199,7 +2199,8 @@ def refreshed():
     nodes through a leader kill. A row that came out the same isn't written again; a view calling
     now() follows the clock with no write; what follows one takes its rows back; listed in
     `pondra.flows` with why and what it follows; SHOW CREATE gives back `refresh = 'full'` when asked;
-    `lag` on an incremental view, and what each way can't do, refused by name."""
+    `lag` on an incremental view, and what each way can't do, refused by name. A view whose runs take
+    a second answers a burst's last row within a few seconds of it (its tables gone still)."""
     lake = new_lake()
     node = Node(lake, A.port, tier_secs=1).start()
     q = lambda s: sql(A.port, s)
@@ -2263,6 +2264,19 @@ def refreshed():
     q("DROP MATERIALIZED VIEW top_names"); q("DROP MATERIALIZED VIEW asked")
     q(shown)
     again = _bykey_same(q, "asked", views["asked"][0], "region")
+    # A burst's last rows aren't held back by the wait between runs: this view's runs take about a
+    # second here (so ten seconds apart while rows come in), and it answers within a few seconds of
+    # the burst's last row (eight or more without it).
+    t = time.time()
+    q("SELECT sum(value % 7) AS s FROM generate_series(1, 100000000)")
+    rows = int(1e8 / max(time.time() - t, 0.05))
+    q("CREATE TABLE bursts (k VARCHAR, v BIGINT)")
+    q(f"CREATE MATERIALIZED VIEW last_burst AS SELECT k FROM bursts WHERE (SELECT sum(value % 7) FROM generate_series(1, {rows})) >= 0 ORDER BY v DESC LIMIT 1")
+    for i in range(4):
+        q(f"INSERT INTO bursts VALUES ('b{i}', {i})")
+        time.sleep(0.3)
+    t = time.time()
+    burst = until(lambda: [r["k"] for r in q("SELECT k FROM last_burst")], ["b3"], secs=30) == ["b3"] and round(time.time() - t, 2)
     node.kill()
     checks = {
         "right after CREATE: each view == its query (its first run works it out)": all(made.values()),
@@ -2281,12 +2295,13 @@ def refreshed():
         "refused by name: a lag on an incremental view, ORDER BY … LIMIT asked incremental, EMIT FINAL run whole, an unknown way":
             "lag" in refused["lag"] and "ORDER BY" in refused["incremental"] and "EMIT FINAL" in refused["final"] and "'full'" in refused["nonsense"],
         "three nodes, rows written on followers through a leader kill: == ad hoc on every node": full_on_three(),
+        "a burst's last row is answered within a few seconds by a view whose runs take a second (ten apart while rows come in)": bool(burst) and burst < 5,
     }
     ok = all(checks.values())
     print(json.dumps({"refreshed": checks, "ok": ok}, indent=1))
     if not ok:
         print(json.dumps({"made": made, "inserted": inserted, "changed": changed, "before": before, "after": after, "first": first, "listed": listed,
-                          "shown": shown, "refused": refused}, indent=1, default=str)[-12000:])
+                          "shown": shown, "refused": refused, "burst_s": burst}, indent=1, default=str)[-12000:])
     return "views run whole again: ORDER BY/LIMIT, windows, DISTINCT, subqueries, joins, now(): == ad hoc, changes, restart, three nodes"
 
 
@@ -9710,7 +9725,7 @@ def publishing():
 
 def backpressure():
     """Writes wait while more than `--backlog` rows wait in the log to be tiered, and only while
-    tiering can run (invariant 281): its round takes the lake's lock, and a view that runs its query
+    tiering can run (invariant 282): its round takes the lake's lock, and a view that runs its query
     again holds that lock while its rows commit, so a commit held back behind tiering stopped every
     write for good (Nexmark's twenty views, now and then). 8,000 rows written fast, 500 a write,
     wait for tiering (never half of them in the log at once; all of them without the wait); then
