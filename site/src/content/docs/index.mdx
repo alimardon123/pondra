@@ -14,7 +14,8 @@ hero:
       <span class="p">pondra&gt;</span> <span class="k">CREATE MATERIALIZED VIEW</span> totals <span class="k">AS</span>
          <span class="c">...&gt;</span> <span class="k">SELECT</span> user, sum(n) <span class="k">AS</span> total
          <span class="c">...&gt;</span> <span class="k">FROM</span> events <span class="k">GROUP BY</span> user;
-      <span class="p">pondra&gt;</span> <span class="k">INSERT INTO</span> events <span class="k">VALUES</span> ('ann', 5), ('ann', 7);
+      <span class="p">pondra&gt;</span> <span class="k">INSERT INTO</span> events
+         <span class="c">...&gt;</span> <span class="k">VALUES</span> ('ann', 5), ('ann', 7);
       <span class="p">pondra&gt;</span> <span class="k">SELECT</span> * <span class="k">FROM</span> totals;
       +------+-------+
       | user | total |

@@ -1,6 +1,49 @@
 ---
 title: Every door
-description: Every way to reach Pondra.
+description: Every way to reach a Pondra node, what each is for, and where its full reference is.
 ---
 
-Stub.
+A node answers on several doors at once. SQL means the same through every one of them, and the same
+tokens, users and grants guard them all. A door that can't do something refuses it by name.
+
+| Door | Where | For | Reference |
+|---|---|---|---|
+| **HTTP** | `--addr` (`127.0.0.1:8080`) | Any program: `POST /sql`, appends, live answers, files, the console | [HTTP API](/pondra/reference/http/) |
+| **Python** | `pip install pondra` | Scripts and notebooks: SQL, frames, PySpark's names, functions | [Python client](/pondra/reference/python/), [Frames](/pondra/reference/frames/) |
+| **JavaScript** | `npm install pondra` | Node programs and services | [JavaScript client](/pondra/reference/javascript/) |
+| **Command line** | `pondra` | A shell on a folder, scripts, `serve`, projects and branches | [Command line](/pondra/reference/cli/) |
+| **Postgres** | `--pg` (`:5432`) | psql, every Postgres driver, dbt, BI tools | [Postgres port](/pondra/reference/postgres/) |
+| **Arrow Flight** | `--flight` (`:8815`) | Columnar reads and writes: pyarrow, ADBC | [Arrow Flight](/pondra/reference/flight/) |
+| **Kafka** | `--kafka` (`:9092`) | Kafka producers and consumers, Debezium | [Kafka protocol](/pondra/reference/kafka-protocol/) |
+| **Iceberg REST** | `/v1/` on `--addr` | Spark, PyIceberg and DuckDB finding the lake's tables by URL, reading them and appending to them | [Iceberg REST catalog](/pondra/reference/iceberg-rest/) |
+| **Delta Sharing** | `/delta-sharing/` on `--addr` | Another company reading the tables you share with it | [Share a table](/pondra/guides/sharing/) |
+| **MCP** | `/mcp` on `--addr` | AI agents: Claude, Cursor and any MCP client | [MCP](/pondra/reference/mcp/) |
+| **The console** | `/` on `--addr` | Notebooks, SQL files and the lake's tables in a browser | [The console](/pondra/start/console/) |
+
+HTTP, the Iceberg REST catalog, Delta Sharing, MCP and the console share the node's one address. The
+Postgres, Flight and Kafka ports are off until a flag turns them on:
+
+```bash norun
+pondra serve lake --addr 0.0.0.0:8080 --pg 0.0.0.0:5432 --flight 0.0.0.0:8815 --kafka 0.0.0.0:9092
+```
+
+## The same statement, any door
+
+```bash
+curl -s localhost:8080/sql -d "SELECT 1 + 1 AS two"
+```
+
+```python
+import pondra
+db = pondra.connect("http://localhost:8080")
+print(db.sql("SELECT 1 + 1 AS two").rows())
+```
+
+```js
+import { connect } from "pondra";
+const db = connect("http://localhost:8080");
+console.log(await db.sql("SELECT 1 + 1 AS two"));
+```
+
+An error carries Postgres's code (its SQLSTATE) through every door: in HTTP's `x-pondra-sqlstate`
+header, Flight's metadata, a Postgres error, and the clients' `sqlstate`.
