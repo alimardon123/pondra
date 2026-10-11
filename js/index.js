@@ -479,18 +479,18 @@ export const connect = (url, options) => new Pondra(url, options);
 export async function local(dir = "lake", { port, token, flags = [], timeout = 120, python = true, onNotice, timeoutMs } = {}) {
   if (timeoutMs !== undefined) throw new Error("local({ timeoutMs }): it is { timeout } now, in seconds, as Python's");
   const { spawn } = await import("node:child_process");
-  const { closeSync, mkdirSync, openSync } = await import("node:fs");
+  const fs = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
   const exe = await binary();
   port ??= await freePort();
-  if (!dir.includes("://")) mkdirSync(dir, { recursive: true });
+  if (!dir.includes("://")) fs.mkdirSync(dir, { recursive: true });
   const log = join(tmpdir(), `pondra-${port}.log`);
-  const errors = openSync(log, "a");
+  const errors = fs.openSync(log, "a");
   const args = ["serve", "--dir", dir, "--addr", `127.0.0.1:${port}`, "--stop-with-stdin", ...(python ? ["--python", "auto"] : []), ...flags];
   const owner = randomUUID().replaceAll("-", ""); // (with it, the node lets this process's SQL read files here)
   const node = spawn(exe, args, { stdio: ["pipe", "ignore", errors], env: { ...process.env, PONDRA_OWNER_KEY: owner } });
-  closeSync(errors); // (the node has its own copy of the log's file)
+  fs.closeSync(errors); // (the node has its own copy of the log's file)
   let failed = null;
   node.on("error", (e) => (failed = e)); // (no binary, say)
   const db = new Pondra(`http://127.0.0.1:${port}`, { token, retrySecs: 0, ...(onNotice !== undefined && { onNotice }) });
