@@ -489,3 +489,8 @@ pub async fn point_read(lake: &Lake, sql: &str) -> Result<Option<Vec<RecordBatch
     })
 }
 
+/// The current session's open transaction's id, if it has one (a cursor without HOLD lives as long as it).
+pub fn id() -> Option<String> {
+    let s = crate::temp::current()?;
+    TXNS.lock().unwrap().get(&s).map(|t| t.id.clone())
+}

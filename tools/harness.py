@@ -33,6 +33,7 @@
   harness.py friendly            SQL as DuckDB's users write it (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, …) == DuckDB's answers, spread too
   harness.py unique_doors        UNIQUE through every loading door (appends, Flight, COPY): 23505 whole, retries duplicates, order, three nodes
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
+  harness.py cursors             DECLARE, FETCH, MOVE, CLOSE on the Postgres port; cancelling a running statement (psycopg, psql)
   harness.py all                 quick run of everything
 """
 import http.client as http_client
@@ -10565,6 +10566,358 @@ def use_path():
     return f"use: USE and search_path over HTTP, Postgres, Python and the shell, refused by name, spread on three nodes: all {len(checks)} checks pass"
 
 
+def cursors():
+    """Cursors on the Postgres port (cursors.rs) and cancelling a running statement (pg.rs), as Postgres
+    has them: psycopg's named cursor and SQLAlchemy's stream_results read 25,000 rows a part, in order;
+    DECLARE, MOVE, FETCH and CLOSE from psycopg with their tags, and Describe answers a FETCH with its
+    cursor's columns; WITH HOLD outlives its transaction, a cursor without it ends with it; SCROLL,
+    BINARY and backward moves are refused by name; psycopg's cancel() and psql's Ctrl-C answer 57014 at
+    once and stop the work (the node's CPU goes quiet, not only the error comes back); a cancel with a
+    key no connection holds does nothing; a cancelled statement fails its transaction."""
+    import psycopg, socket, struct, threading
+    import sqlalchemy as sa
+    lake = new_lake()
+    pg = A.port + 50  # (this section's Postgres port: inside the range its node port is in)
+    node = Node(lake, A.port, pg=f"127.0.0.1:{pg}", env={"PONDRA_HISTORY_RATE": "1000"}).start()  # (every statement a row of pondra.history)
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    checks, info = {}, {}
+
+    def portal_parts(query, max_rows):
+        """The extended protocol by hand: a portal executed with max_rows answers that many rows and
+        PortalSuspended, and the rest on the next Execute. Returns the messages' types and the rows' values."""
+        s = socket.create_connection(("127.0.0.1", pg))
+        def recv(n):
+            buf = b""
+            while len(buf) < n:
+                chunk = s.recv(n - len(buf))
+                if not chunk:
+                    raise ConnectionError("the node closed the connection")
+                buf += chunk
+            return buf
+        def read_one():
+            head = recv(5)
+            return head[:1].decode(), recv(struct.unpack("!I", head[1:])[0] - 4)
+        def send(kind, body):
+            s.sendall(kind + struct.pack("!I", len(body) + 4) + body)
+        def until(stops):
+            got = []
+            while True:
+                t, b = read_one()
+                got.append((t, b))
+                if t in stops:
+                    return got
+        body = struct.pack("!I", 196608) + b"user\0u\0database\0lake\0\0"  # (startup: protocol 3.0)
+        s.sendall(struct.pack("!I", len(body) + 4) + body)
+        until("Z")
+        send(b"P", b"\0" + query.encode() + b"\0" + struct.pack("!H", 0))
+        send(b"B", b"\0\0" + struct.pack("!HHH", 0, 0, 0))
+        got = []
+        for _ in range(3):  # (each Execute answers a part; Flush (H) keeps the portal between them)
+            send(b"E", b"\0" + struct.pack("!I", max_rows))
+            send(b"H", b"")
+            got += until("sCE")
+        send(b"S", b"")
+        got += until("Z")
+        s.close()
+        values = []
+        for t, b in got:
+            if t == "D":
+                n, pos, row = struct.unpack("!H", b[:2])[0], 2, []
+                for _ in range(n):
+                    size = struct.unpack("!i", b[pos:pos + 4])[0]
+                    pos += 4
+                    row.append(b[pos:pos + size].decode())
+                    pos += max(size, 0)
+                values.append(row[0])
+        return [t for t, _ in got], values
+
+    try:
+        sql(A.port, "CREATE TABLE big (id BIGINT, v DOUBLE)")
+        sql(A.port, "INSERT INTO big SELECT value, CAST(value AS DOUBLE) / 2 FROM range(1, 25001)")
+        # 1.6 billion rows, filtered: it runs until cancelled. (Without the filter DataFusion answers count(*) from the
+        # ranges' statistics at once, and nothing is left to cancel.)
+        LONG = "SELECT count(*) AS n FROM range(1, 40000) a CROSS JOIN range(1, 40000) b WHERE a.value * b.value % 1000003 = 7"
+
+        def cpu():
+            """The node's CPU seconds so far, all its threads (/proc/<pid>/stat: utime and stime)."""
+            fields = open(f"/proc/{node.p.pid}/stat").read().rsplit(")", 1)[1].split()
+            return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+        def first_error(c, *stmts):
+            """Runs `stmts` in one transaction, rolled back at the end: the SQLSTATE of the first that fails,
+            or None. Each check starts from nothing, so a cursor one check declares is gone for the next."""
+            try:
+                for s in stmts:
+                    c.execute(s)
+            except psycopg.Error as e:
+                return e.sqlstate
+            finally:
+                c.rollback()
+            return None
+
+        def timed(c, stmt, out):
+            """Runs `stmt` on `c` (a thread's job) and says how it ended in `out`."""
+            try:
+                out["rows"] = c.execute(stmt).fetchone()[0]
+            except psycopg.Error as e:
+                out["sqlstate"], out["message"] = e.sqlstate, str(e)
+
+        # A named cursor (psycopg's server-side cursor) and SQLAlchemy's stream_results read the answer a part at a time.
+        with psycopg.connect(url) as c:
+            with c.cursor(name="big_read") as cur:
+                cur.itersize = 1000
+                cur.execute("SELECT id FROM big ORDER BY id")
+                ids = [row[0] for row in cur]
+        checks["a named cursor (psycopg's) reads 25,000 rows, 1,000 a part, in order"] = ids == list(range(1, 25001))
+        eng = sa.create_engine(f"postgresql+psycopg2://u@127.0.0.1:{pg}/lake")  # (psycopg2: SQLAlchemy 2.0.54's psycopg 3 dialect fails to connect with psycopg 3.3 on main too)
+        with eng.connect() as conn:
+            res = conn.execution_options(stream_results=True).execute(sa.text("SELECT id FROM big ORDER BY id"))
+            parts = [len(p) for p in res.partitions(1000)]
+        eng.dispose()
+        checks["SQLAlchemy's stream_results reads it in 25 parts of 1,000"] = parts == [1000] * 25
+
+        # By hand: the statements, their tags, and what Describe says a FETCH returns.
+        with psycopg.connect(url) as c:
+            cur = c.cursor()
+            cur.execute("DECLARE m CURSOR FOR SELECT id FROM big ORDER BY id")
+            declared = (cur.statusmessage, cur.description)
+            cur.execute("MOVE 5 FROM m")
+            moved = cur.statusmessage
+            cur.execute("FETCH FORWARD 10 FROM m")
+            ten, ten_tag = [r[0] for r in cur.fetchall()], cur.statusmessage
+            cur.execute("FETCH NEXT FROM m")
+            nxt = cur.fetchone()[0]
+            cur.execute("FETCH 2 IN m")
+            two = [r[0] for r in cur.fetchall()]
+            cur.execute("FETCH ALL FROM m")
+            rest = (len(cur.fetchall()), cur.statusmessage)
+            cur.execute("FETCH NEXT FROM m")
+            last = (cur.statusmessage, cur.fetchall())
+            cur.execute("CLOSE m")
+            closed = cur.statusmessage
+            checks["DECLARE, MOVE, FETCH and CLOSE: their tags (DECLARE CURSOR, MOVE 5, FETCH 10, CLOSE CURSOR)"] = declared == ("DECLARE CURSOR", None) and moved == "MOVE 5" and ten_tag == "FETCH 10" and closed == "CLOSE CURSOR"
+            checks["FORWARD n, NEXT, IN and ALL go on where the last left off, and FETCH 0 at the end"] = ten == list(range(6, 16)) and nxt == 16 and two == [17, 18] \
+                and rest == (24982, "FETCH 24982") and last == ("FETCH 0", [])
+            cur.execute("DECLARE d CURSOR FOR SELECT id, v FROM big ORDER BY id")
+            cur.execute("MOVE 1 FROM d")
+            no_columns = cur.description is None
+            cur.execute("FETCH 1 FROM d")
+            columns, first = [(x.name, x.type_code) for x in cur.description], cur.fetchall()
+            checks["Describe: a FETCH gives its cursor's columns (int8, float8); DECLARE and MOVE give none"] = no_columns and columns == [("id", 20), ("v", 701)] and first == [(2, 1.0)]
+            c.rollback()
+
+        # SHOW under the extended protocol: Describe names its one column, as Postgres does (pgjdbc and
+        # prepared psycopg statements fail on a row whose column has no description).
+        with psycopg.connect(url, autocommit=True) as c:
+            shown = c.execute("SHOW TRANSACTION ISOLATION LEVEL", prepare=True)
+            named = (shown.description[0].name, len(shown.fetchall()))
+            search = c.execute("SHOW search_path", prepare=True)
+            search_named = search.description[0].name
+        checks["SHOW under the extended protocol (prepared): its column is named as Postgres names it (transaction_isolation, search_path)"] = named == ("transaction_isolation", 1) and search_named == "search_path"
+
+        # Errors, each as Postgres words them.
+        with psycopg.connect(url) as c:
+            errors = {
+                "SCROLL": first_error(c, "DECLARE s SCROLL CURSOR FOR SELECT 1"),
+                "BINARY": first_error(c, "DECLARE b BINARY CURSOR FOR SELECT 1"),
+                "PRIOR": first_error(c, "DECLARE m CURSOR FOR SELECT 1", "FETCH PRIOR FROM m"),
+                "BACKWARD ALL": first_error(c, "DECLARE m CURSOR FOR SELECT 1", "FETCH BACKWARD ALL FROM m"),
+                "MOVE -1": first_error(c, "DECLARE m CURSOR FOR SELECT 1", "MOVE -1 FROM m"),
+                "taken": first_error(c, "DECLARE m CURSOR FOR SELECT 1", "DECLARE m CURSOR FOR SELECT 2"),
+                "unknown": first_error(c, "FETCH 1 FROM nope"),
+                "after CLOSE": first_error(c, "DECLARE m CURSOR FOR SELECT 1", "CLOSE m", "FETCH 1 FROM m"),
+                "CLOSE unknown": first_error(c, "CLOSE nope"),
+                "not a query": first_error(c, "DECLARE m CURSOR FOR INSERT INTO big VALUES (0, 0)"),
+                "the query's own": first_error(c, "DECLARE m CURSOR FOR SELECT nope FROM big"),
+            }
+        info["errors"] = errors
+        want = {"SCROLL": "0A000", "BINARY": "0A000", "PRIOR": "55000", "BACKWARD ALL": "55000", "MOVE -1": "55000", "taken": "42P03", "unknown": "34000",
+                "after CLOSE": "34000", "CLOSE unknown": "34000", "not a query": "42601", "the query's own": "42703"}
+        checks["refused by name or by Postgres's code: SCROLL and BINARY 0A000, backward moves 55000, a taken name 42P03, an unknown one 34000, a query that isn't one 42601"] = errors == want
+
+        # Outside a transaction a cursor without HOLD is 25P01; WITH HOLD lives on until CLOSE.
+        with psycopg.connect(url, autocommit=True) as a:
+            outside = first_error(a, "DECLARE m CURSOR FOR SELECT 1")
+            a.execute("DECLARE hh CURSOR WITH HOLD FOR SELECT id FROM big ORDER BY id")
+            alone = a.execute("FETCH 2 FROM hh").fetchall()
+            a.execute("CLOSE hh")
+        checks["DECLARE outside a transaction: 25P01, except WITH HOLD, which lives until CLOSE"] = outside == "25P01" and alone == [(1,), (2,)]
+
+        # WITH HOLD outlives its COMMIT, a cursor without HOLD doesn't, and a cursor belongs to its connection.
+        with psycopg.connect(url) as c:
+            cur = c.cursor()
+            cur.execute("DECLARE h CURSOR WITH HOLD FOR SELECT id FROM big ORDER BY id")
+            cur.execute("DECLARE n CURSOR FOR SELECT id FROM big ORDER BY id")
+            c.commit()
+            ended = first_error(c, "FETCH 1 FROM n")
+            cur.execute("FETCH 3 FROM h")
+            three = [r[0] for r in cur.fetchall()]
+            c.commit()
+            cur.execute("FETCH 1 FROM h")
+            fourth = cur.fetchone()[0]
+            c.commit()
+            with psycopg.connect(url, autocommit=True) as other:
+                elsewhere = first_error(other, "FETCH 1 FROM h")
+            checks["WITH HOLD: the cursor goes on after COMMIT; one without HOLD ended with its transaction (34000)"] = ended == "34000" and three == [1, 2, 3] and fourth == 4
+            checks["a cursor belongs to its connection: another connection's FETCH is 34000"] = elsewhere == "34000"
+            cur.execute("CLOSE h")
+            c.commit()
+            checks["CLOSE ends a WITH HOLD cursor"] = first_error(c, "FETCH 1 FROM h") == "34000"
+            cur.execute("DECLARE r CURSOR FOR SELECT 1")
+            c.rollback()
+            checks["ROLLBACK ends a cursor without HOLD"] = first_error(c, "FETCH 1 FROM r") == "34000"
+
+        # Cancelling: psycopg's cancel() (the extended protocol) and psql's Ctrl-C (the simple one).
+        with psycopg.connect(url, autocommit=True) as ca:
+            out = {}
+            t = threading.Thread(target=timed, args=(ca, LONG, out))
+            t.start()
+            time.sleep(0.5)
+            busy0 = cpu()
+            time.sleep(0.5)
+            busy = cpu() - busy0  # (the statement is at work)
+            sent = time.time()
+            ca.cancel()
+            t.join(60)
+            answered = time.time() - sent
+            # The work stops at its operator's next batch, so the node is watched until a half second of it is quiet
+            # (a fixed wait could catch the tail of a batch); the time it took and the trace go in the report.
+            trace, rest_s = [], None
+            for _ in range(20):
+                c0 = cpu()
+                time.sleep(0.5)
+                trace.append(round(cpu() - c0, 2))
+                if trace[-1] < 0.1:  # (under a fifth of a core)
+                    rest_s = time.time() - sent
+                    break
+            info["cancel"] = {"answered_s": round(answered, 2), "rest_s": rest_s and round(rest_s, 2), "busy_cpu_s": round(busy, 2),
+                              "trace_cpu_per_half_s": trace, "said": out.get("message", "")[:120]}
+            checks["psycopg's cancel(): 57014 with Postgres's words, answered at once"] = out.get("sqlstate") == "57014" and answered < 3 and "canceling statement due to user request" in out.get("message", "")
+            checks["…and its work stops: the node is busy while it runs, and at rest (under a fifth of a core) within 10 s of the request"] = busy > 0.3 and rest_s is not None and rest_s < 10
+            checks["…and the connection carries on"] = first_error(ca, "SELECT 1") is None
+        r = subprocess.run(["timeout", "-s", "INT", "1", "psql", "-h", "127.0.0.1", "-p", str(pg), "-U", "u", "-d", "lake", "-X", "-c", LONG],
+                           capture_output=True, text=True, timeout=120)
+        info["psql"] = r.stderr[-200:]
+        checks["psql's Ctrl-C (SIGINT, the simple query protocol) cancels the statement: 57014 in Postgres's words"] = "canceling statement due to user request" in r.stderr
+
+        # A comment before a statement (dbt puts one before every statement): the same answers as without it,
+        # sent verbatim by psycopg (the extended protocol) and by psql (the simple one).
+        def answers(stmts):
+            got = []
+            with psycopg.connect(url, autocommit=True) as conn:
+                for s in stmts:
+                    try:
+                        cur = conn.execute(s)
+                        got.append([cur.statusmessage, cur.fetchall() if cur.description else []])
+                    except psycopg.Error as e:
+                        got.append(["error", e.sqlstate])
+            return got
+        words = ["BEGIN", "DECLARE cc CURSOR FOR SELECT 1 AS one", "FETCH 1 FROM cc", "SHOW transaction_isolation", "COMMIT"]
+        plain = answers(words)
+        commented = answers(["/* c */ BEGIN", "/* c */ DECLARE cc CURSOR FOR SELECT 1 AS one", "-- c\nFETCH 1 FROM cc", "/* c */ SHOW transaction_isolation", "-- c\nCOMMIT"])
+        info["comments"] = {"plain": plain, "commented": commented}
+        checks["a comment before BEGIN, DECLARE, FETCH, SHOW and COMMIT answers as it does without it (psycopg, verbatim)"] = \
+            commented == plain and plain[2][1] == [(1,)] and plain[3][1] == [("read committed",)]
+
+        def psql_run(*stmts):
+            args = ["psql", "-h", "127.0.0.1", "-p", str(pg), "-U", "u", "-d", "lake", "-X", "-A"]
+            for s in stmts:
+                args += ["-c", s]
+            return subprocess.run(args, capture_output=True, text=True, timeout=60)
+        commented_words = ["/* c */ " + words[0], "/* c */ " + words[1], "-- c\n" + words[2], "/* c */ " + words[3], "-- c\n" + words[4]]
+        plain_psql = psql_run(*words)
+        commented_psql = psql_run(*commented_words)
+        info["comments_psql"] = {"plain": plain_psql.stdout[-300:], "commented": commented_psql.stdout[-300:], "stderr": commented_psql.stderr[-300:]}
+        checks["a comment before those statements answers as it does without it, over psql"] = \
+            plain_psql.returncode == 0 and commented_psql.returncode == 0 and not commented_psql.stderr.strip() and commented_psql.stdout == plain_psql.stdout
+
+        # Whether a commented BEGIN really opens a transaction: its rows wait for COMMIT, and a ROLLBACK
+        # behind a comment takes them back. (A BEGIN answered and not kept would autocommit each INSERT.)
+        sql(A.port, "CREATE TABLE cmt (n INT)")
+        with psycopg.connect(url, autocommit=True) as w, psycopg.connect(url, autocommit=True) as other:
+            w.execute("/* c */ BEGIN")
+            w.execute("INSERT INTO cmt VALUES (1)")
+            inside = w.execute("SELECT count(*) FROM cmt").fetchone()[0]  # (its own write, in the transaction)
+            seen_before = other.execute("SELECT count(*) FROM cmt").fetchone()[0]
+            w.execute("-- c\nROLLBACK")
+            after_rollback = other.execute("SELECT count(*) FROM cmt").fetchone()[0]
+            w.execute("/* c */ BEGIN")
+            w.execute("INSERT INTO cmt VALUES (2)")
+            w.execute("-- c\nCOMMIT")
+            committed = other.execute("SELECT count(*) FROM cmt").fetchone()[0]
+        info["comment_transactions"] = {"inside": inside, "seen_before": seen_before, "after_rollback": after_rollback, "committed": committed}
+        checks["a commented BEGIN opens a transaction: its write is seen inside it only, a commented ROLLBACK takes it back, a commented COMMIT keeps the next"] = \
+            (inside, seen_before, after_rollback, committed) == (1, 0, 0, 1)
+
+        # A cancel request with another connection's key, or a pid no connection has, does nothing.
+        with psycopg.connect(url, autocommit=True) as cb:
+            out = {}
+            t = threading.Thread(target=timed, args=(cb, LONG, out))
+            t.start()
+            time.sleep(0.5)
+            for who, key in ((cb.info.backend_pid, 4242), (999999, 4242)):
+                with socket.create_connection(("127.0.0.1", pg)) as s:
+                    s.sendall(struct.pack("!IIII", 16, 80877102, who, key))  # (a CancelRequest: its length, code, pid and key)
+            time.sleep(1.0)
+            still_running = t.is_alive()
+            cb.cancel()
+            t.join(60)
+            checks["a cancel with a wrong key, or for a pid no connection has, stops nothing; the real key still does"] = still_running and out.get("sqlstate") == "57014"
+
+        # A cancelled statement fails its transaction, as an error would: 25P02 until it ends.
+        with psycopg.connect(url) as cx:
+            out = {}
+            t = threading.Thread(target=timed, args=(cx, LONG, out))
+            t.start()
+            time.sleep(0.5)
+            cx.cancel()
+            t.join(60)
+            checks["a cancelled statement fails its transaction: the next statement is 25P02"] = out.get("sqlstate") == "57014" and first_error(cx, "SELECT 1") == "25P02"
+        # A portal executed with max_rows = 2: PortalSuspended after each part, the rest on the next Execute.
+        types, values = portal_parts("SELECT id FROM big ORDER BY id LIMIT 5", 2)
+        checks["max_rows: a portal executed with max_rows = 2 gets PortalSuspended after each part, then the rest"] = types.count("s") == 2 and values == ["1", "2", "3", "4", "5"] and "C" in types
+        info["max_rows_types"] = "".join(types)
+
+        # Inside a transaction DECLARE reads the transaction's own writes, and nobody else's until COMMIT.
+        sql(A.port, "CREATE TABLE own (id BIGINT)")
+        sql(A.port, "INSERT INTO own VALUES (1)")
+        with psycopg.connect(url) as c:
+            cur = c.cursor()
+            cur.execute("INSERT INTO own VALUES (2), (3)")
+            cur.execute("DECLARE w CURSOR FOR SELECT count(*) AS n FROM own")
+            own_writes = cur.execute("FETCH 1 FROM w").fetchone()[0]
+            others = sql(A.port, "SELECT count(*) AS n FROM own")[0]["n"]
+            c.rollback()
+        checks["inside a transaction, DECLARE reads its own writes (3 rows); another connection sees the committed 1"] = own_writes == 3 and others == 1
+
+        # DECLARE is one row of pondra.history, as every statement a door runs is.
+        with psycopg.connect(url, autocommit=True) as a:
+            a.execute("DECLARE hist_probe CURSOR WITH HOLD FOR SELECT 1 AS hist_probe_col")
+            a.execute("CLOSE hist_probe")
+        rows = []
+        for _ in range(50):
+            rows = [r for r in sql(A.port, "SELECT * FROM pondra.history WHERE statement LIKE '%hist_probe%'") if r["statement"].upper().startswith("DECLARE")]
+            if rows:
+                break
+            time.sleep(0.2)
+        checks["DECLARE goes through audit::statement: one row of pondra.history"] = len(rows) == 1
+
+        # Grants: a user's DECLARE is checked against what it may read, as a query is (this makes the node
+        # require a sign-in, so it comes last).
+        sql(A.port, "CREATE USER ann PASSWORD 'ann-password-1'; GRANT SELECT ON own TO ann")  # (one request: the node is open until its first user)
+        with psycopg.connect(f"host=127.0.0.1 port={pg} user=ann password=ann-password-1 dbname=lake") as c:
+            allowed = first_error(c, "DECLARE g CURSOR FOR SELECT id FROM own", "FETCH 1 FROM g")
+            refused = first_error(c, "DECLARE g CURSOR FOR SELECT id FROM big")
+        checks["DECLARE is checked against the caller's grants: a table it may read works, one it may not is 42501"] = allowed is None and refused == "42501"
+        info["grants"] = {"allowed": allowed, "refused": refused}
+    finally:
+        node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"cursors": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
 def doors():
     """The doors matrix (ADR-036 §7): one list of features, each through every door — SQL over HTTP
     (a session), the Python client, the Postgres port (psycopg), Flight SQL (ADBC), the JavaScript
@@ -11559,7 +11912,7 @@ SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 4
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, cursors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -11587,7 +11940,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "cursors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -11600,7 +11953,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

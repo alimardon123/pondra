@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pondra as dbt and BI tools use it (ADR-030): its Postgres port, with Postgres's catalog.
 
-  clients_check.py [dbt,psql,sqlalchemy,jdbc,odbc,adbc,npgsql,params] [--port 8870] [--pg16 PORT]
+  clients_check.py [dbt,psql,sqlalchemy,psycopg,jdbc,odbc,adbc,npgsql,params] [--port 8870] [--pg16 PORT]
 
   (params takes a Postgres 16 running on PORT with --pg16, else starts one under the work folder.)
 
@@ -11,9 +11,12 @@
   then `dbt docs generate`; the same project against Postgres 16, and every model's rows alike.
 - psql: `\\dt`, `\\d`, `\\dv`, `\\dn`, `\\df`, `\\l`, `\\du` show the lake's tables, columns (types,
   NOT NULL, defaults, keys), views, schemas, functions and databases; `\\dT+` lists an enum type
-  with its labels in order, and `\\d` shows a column of it by the type's name.
+  with its labels in order, and `\\d` shows a column of it by the type's name; a cursor in a
+  transaction; Ctrl-C (SIGINT) on a running statement cancels it.
 - sqlalchemy: the inspector (schemas, tables, views, columns, primary keys, a view's definition,
   an enum type's labels), with psycopg 2 and 3; pandas' `to_sql` and `read_sql`.
+- psycopg: psycopg 3's named cursor (a server-side cursor, read a part at a time), its cursor
+  statements by hand (tags, MOVE, FETCH, CLOSE), and `conn.cancel()` on a running statement.
 - jdbc: pgjdbc's DatabaseMetaData (what DBeaver, Metabase and Tableau's JDBC connector call):
   catalogs, schemas, tables, columns, primary keys, then a query.
 - odbc: psqlODBC's catalog functions through pyodbc (what Tableau and Excel call): tables,
@@ -181,7 +184,15 @@ SETUP = ["CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR NOT NULL, scor
 
 def psql_check(pg):
     out = {c: psql(pg, c) for c in ("\\dt", "\\dt sales.*", "\\d users", "\\dv", "\\dn", "\\df", "\\l", "\\du", "\\d sales.orders", "\\d+ big", "\\dT+", "\\d moods")}
+    # A cursor in a transaction, and Ctrl-C (SIGINT, which psql answers with a cancel request) on a statement
+    # that runs until it is cancelled: both over psql's simple query protocol.
+    cursor = psql(pg, "BEGIN", "DECLARE c CURSOR FOR SELECT name FROM users ORDER BY id", "FETCH 1 FROM c", "COMMIT")
+    stop = subprocess.run(["timeout", "-s", "INT", "1", "psql", "-h", "127.0.0.1", "-p", str(pg), "-U", "u", "-d", "lake", "-X", "-c",
+                           "SELECT count(*) FROM range(1, 40000) a CROSS JOIN range(1, 40000) b WHERE a.value * b.value % 1000003 = 7"],
+                          capture_output=True, text=True, env={**os.environ, "PGPASSWORD": PASSWORD}, timeout=120)
     checks = {
+        "psql: a cursor in a transaction (DECLARE, FETCH, COMMIT)": "DECLARE CURSOR" in cursor and "ann" in cursor and "(1 row)" in cursor,
+        "psql: Ctrl-C cancels a running statement: 57014 in Postgres's words": "canceling statement due to user request" in stop.stderr,
         "\\dt lists the tables on the search path (public), \\dt sales.* another schema's": all(x in out["\\dt"] for x in ("public|events|table", "public|users|table"))
             and "sales|" not in out["\\dt"] and "sales|orders|table" in out["\\dt sales.*"],
         # (a string column is `text` here, as the catalog reports every string: Postgres 16 says `character varying`
@@ -227,6 +238,95 @@ def sqlalchemy_check(pg):
     return checks, said
 
 
+def psycopg_check(pg):
+    """psycopg 3 (what SQLAlchemy's psycopg driver and most Python code use): a named cursor reads a table
+    a part at a time, the cursor's statements by hand with their tags, and conn.cancel() stops a running
+    statement (57014) with the connection usable after it."""
+    import psycopg, threading
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake password={PASSWORD}"
+    checks = {}
+    with psycopg.connect(url, autocommit=True) as c:
+        c.execute("CREATE TABLE ten_k (id BIGINT)")
+        c.execute("INSERT INTO ten_k SELECT value FROM range(1, 10001)")
+    with psycopg.connect(url) as c:
+        with c.cursor(name="ten") as cur:
+            cur.itersize = 100
+            cur.execute("SELECT id FROM ten_k ORDER BY id")
+            ids = [row[0] for row in cur]
+        checks["psycopg: a named cursor reads 10,000 rows, 100 a part, in order"] = ids == list(range(1, 10001))
+        cur = c.cursor()
+        cur.execute("DECLARE d CURSOR FOR SELECT id FROM ten_k ORDER BY id")
+        cur.execute("MOVE 9995 FROM d")
+        moved = cur.statusmessage
+        cur.execute("FETCH FORWARD 5 FROM d")
+        got, tag = [r[0] for r in cur.fetchall()], cur.statusmessage
+        cur.execute("CLOSE d")
+        checks["psycopg: DECLARE, MOVE, FETCH, CLOSE by hand: the tags (MOVE 9995, FETCH 5, CLOSE CURSOR) and the rows"] = \
+            moved == "MOVE 9995" and tag == "FETCH 5" and got == list(range(9996, 10001)) and cur.statusmessage == "CLOSE CURSOR"
+    with psycopg.connect(url, autocommit=True) as c:
+        out = {}
+
+        def run():  # (a thread: the statement runs until conn.cancel() stops it)
+            try:
+                c.execute("SELECT count(*) FROM range(1, 40000) a CROSS JOIN range(1, 40000) b WHERE a.value * b.value % 1000003 = 7")
+                out["answer"] = "finished"
+            except psycopg.errors.QueryCanceled as e:
+                out["sqlstate"] = e.sqlstate
+
+        t = threading.Thread(target=run)
+        t.start()
+        time.sleep(0.5)
+        c.cancel()
+        t.join(60)
+        checks["psycopg: conn.cancel() stops a running statement (57014), and the connection carries on"] = out.get("sqlstate") == "57014" and c.execute("SELECT 1").fetchone() == (1,)
+    return checks, {}
+
+
+CURSORS_JAVA = r"""
+import java.sql.*;
+public class Cursors {
+  static final String LONG = "SELECT count(*) FROM range(1, 40000) a CROSS JOIN range(1, 40000) b WHERE a.value * b.value % 1000003 = 7"; // runs until cancelled (the filter stops count(*) from being answered from statistics)
+  // Statement.cancel() from another thread: the statement answers 57014, and the connection carries on.
+  static void cancel(String url, String name) throws Exception {
+    try (Connection c = DriverManager.getConnection(url, "u", "x")) {
+      Statement st = c.createStatement();
+      Thread t = new Thread(() -> { try { Thread.sleep(500); st.cancel(); } catch (Exception e) { System.out.println(name + "-cancel-threw=" + e); } });
+      t.start();
+      try { st.executeQuery(LONG); System.out.println(name + "-cancel=none"); }
+      catch (SQLException e) { System.out.println(name + "-cancel=" + e.getSQLState()); }
+      t.join();
+      ResultSet r = c.createStatement().executeQuery("SELECT 1");
+      r.next();
+      System.out.println(name + "-after=" + r.getInt(1));
+    }
+  }
+  public static void main(String[] a) throws Exception {
+    // getTransactionIsolation() sends SHOW TRANSACTION ISOLATION LEVEL (what Metabase asks before it adds a database).
+    try (Connection c = DriverManager.getConnection(a[0], "u", "x")) {
+      System.out.println("isolation=" + c.getTransactionIsolation());
+    }
+    cancel(a[0], "extended");                  // pgjdbc's default: Parse, Bind, Execute
+    cancel(a[0] + "?preferQueryMode=simple", "simple");  // the simple query protocol
+    try (Connection w = DriverManager.getConnection(a[0], "u", "x")) {
+      w.createStatement().execute("CREATE TABLE fetch_t (id BIGINT)");
+      w.createStatement().execute("INSERT INTO fetch_t SELECT value FROM range(1, 10001)");
+    }
+    // setFetchSize(100) with autocommit off: pgjdbc asks for 100 rows at a time through a portal (its log, on stderr).
+    try (Connection c = DriverManager.getConnection(a[0] + "?loggerLevel=DEBUG", "u", "x")) {
+      c.setAutoCommit(false);
+      Statement st = c.createStatement();
+      st.setFetchSize(100);
+      ResultSet r = st.executeQuery("SELECT id FROM fetch_t ORDER BY id");
+      long n = 0, sum = 0;
+      while (r.next()) { n++; sum += r.getLong(1); }
+      c.commit();
+      System.out.println("fetch=" + n + "|" + sum);
+    }
+  }
+}
+"""
+
+
 JAVA = r"""
 import java.sql.*;
 public class Meta {
@@ -260,19 +360,39 @@ def jdbc_check(pg, work):
     if not os.path.exists(jar):
         os.makedirs(os.path.dirname(jar), exist_ok=True)
         subprocess.run(["curl", "-sSLf", "-o", jar, "https://jdbc.postgresql.org/download/postgresql-42.7.4.jar"], check=True)
-    src = os.path.join(work, "Meta.java")
-    with open(src, "w") as f:
-        f.write(JAVA)
-    subprocess.run(["javac", "-d", work, src], check=True, capture_output=True)
-    r = subprocess.run(["java", "-cp", f"{work}:{jar}", "Meta", f"jdbc:postgresql://127.0.0.1:{pg}/lake"], capture_output=True, text=True, timeout=120)
+    sources = []
+    for name, text in (("Meta", JAVA), ("Cursors", CURSORS_JAVA)):
+        sources.append(os.path.join(work, f"{name}.java"))
+        with open(sources[-1], "w") as f:
+            f.write(text)
+    subprocess.run(["javac", "-d", work, *sources], check=True, capture_output=True)
+    url = f"jdbc:postgresql://127.0.0.1:{pg}/lake"
+    r = subprocess.run(["java", "-cp", f"{work}:{jar}", "Meta", url], capture_output=True, text=True, timeout=120)
     got = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+    # Cancels (both protocols), and a cursor-style read of 10,000 rows: each row once, in parts. pgjdbc logs
+    # what it sends and gets (its DEBUG log, through java.util.logging at ALL: the JDK's default drops it).
+    logging_conf = os.path.join(work, "logging.properties")
+    with open(logging_conf, "w") as f:
+        f.write("handlers=java.util.logging.ConsoleHandler\n.level=ALL\norg.postgresql.level=ALL\njava.util.logging.ConsoleHandler.level=ALL\n"
+                "java.util.logging.SimpleFormatter.format=%5$s%n\n")
+    r2 = subprocess.run(["java", f"-Djava.util.logging.config.file={logging_conf}", "-cp", f"{work}:{jar}", "Cursors", url],
+                        capture_output=True, text=True, timeout=300)
+    got2 = dict(line.split("=", 1) for line in r2.stdout.splitlines() if "=" in line)
+    parts = r2.stderr.count("PortalSuspended")  # (one per part the server sent: 100 for 10,000 rows at 100 a fetch, then the empty fetch)
+    print(json.dumps({"pgjdbc_portal_suspended": parts, "fetch": got2.get("fetch")}), flush=True)
     checks = {
         "pgjdbc: catalogs, schemas, tables and views": "lake|" in got.get("catalogs", "") and "sales|" in got.get("schemas", "") and "users|TABLE|" in got.get("tables", "") and "big|VIEW|" in got.get("tables", ""),
         "pgjdbc: columns (types, nullable, defaults), primary keys, functions": "id|int8|0|null|" in got.get("columns", "") and "name|varchar|0|" in got.get("columns", "")
             and "score|float8|1|0|" in got.get("columns", "") and got.get("keys") == "id|1|;" and "twice|" in got.get("functions", ""),
         "pgjdbc: a prepared query": got.get("query") == "bob|2.5|float8",
+        "pgjdbc: Statement.cancel() stops a running statement (57014), extended and simple protocol; the connection carries on":
+            got2.get("extended-cancel") == "57014" and got2.get("simple-cancel") == "57014" and got2.get("extended-after") == "1" and got2.get("simple-after") == "1",
+        "pgjdbc: setFetchSize(100) in a transaction over 10,000 rows: each row once": got2.get("fetch") == "10000|50005000",
+        "pgjdbc: setFetchSize(100): the answer comes in parts (PortalSuspended)": parts > 0,
+        "pgjdbc: getTransactionIsolation() (SHOW TRANSACTION ISOLATION LEVEL) answers read committed (2)": got2.get("isolation") == "2",
     }
-    return checks, ({} if all(checks.values()) else {"out": r.stdout[-1500:], "err": r.stderr[-1500:]})
+    said = {} if all(checks.values()) else {"out": r.stdout[-1500:], "err": r.stderr[-1500:], "cursors": (r2.stdout + r2.stderr)[-1500:]}
+    return checks, said
 
 
 def odbc_check(pg):
@@ -535,7 +655,7 @@ def params_part(pg, work, pg16):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("parts", nargs="?", default="dbt,psql,sqlalchemy,jdbc,odbc,adbc,npgsql,params")
+    ap.add_argument("parts", nargs="?", default="dbt,psql,sqlalchemy,psycopg,jdbc,odbc,adbc,npgsql,params")
     ap.add_argument("--port", type=int, default=8870)
     ap.add_argument("--pg16", type=int, default=None, help="a Postgres 16 already running on this port, for params (else one is started)")
     A = harness.A = ap.parse_args()
@@ -551,7 +671,7 @@ def main():
             sql(A.port, s)
         for part in A.parts.split(","):
             try:
-                checks, info = {"dbt": lambda: dbt_check(pg, work), "psql": lambda: psql_check(pg), "sqlalchemy": lambda: sqlalchemy_check(pg),
+                checks, info = {"dbt": lambda: dbt_check(pg, work), "psql": lambda: psql_check(pg), "sqlalchemy": lambda: sqlalchemy_check(pg), "psycopg": lambda: psycopg_check(pg),
                                 "jdbc": lambda: jdbc_check(pg, work), "odbc": lambda: odbc_check(pg), "adbc": lambda: adbc_check(pg), "npgsql": lambda: npgsql_check(pg, work),
                                 "params": lambda: params_part(pg, work, A.pg16)}[part]()
             except Exception as e:  # noqa: BLE001 (a part that couldn't run fails)
