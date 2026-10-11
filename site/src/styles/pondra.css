@@ -122,3 +122,14 @@ h1#_top { letter-spacing: -0.025em; font-weight: 700; }
 }
 .areas a:hover { border-color: var(--sl-color-accent); transform: translateY(-1px); }
 .areas a strong { display: block; color: var(--sl-color-white); font-size: var(--sl-text-base); margin-bottom: 0.25rem; }
+
+/* The feature map's index (components/FeatureIndex.astro): every group and feature at a glance. */
+.feature-index { display: grid; gap: 1.25rem 1.5rem; grid-template-columns: 1fr; margin: 1.5rem 0 2.5rem; }
+@media (min-width: 40rem) { .feature-index { grid-template-columns: repeat(2, 1fr); } }
+@media (min-width: 72rem) { .feature-index { grid-template-columns: repeat(3, 1fr); } }
+.feature-index section { border: 1px solid var(--sl-color-gray-5); border-radius: 0.75rem; padding: 0.9rem 1rem; }
+.feature-index .group { display: block; font-weight: 650; color: var(--sl-color-white); text-decoration: none; margin-bottom: 0.4rem; }
+.feature-index .group:hover { color: var(--sl-color-accent-high); }
+.feature-index ul { list-style: none; margin: 0; padding: 0; font-size: var(--sl-text-sm); line-height: 1.55; }
+.feature-index li a { color: var(--sl-color-gray-2); text-decoration: none; }
+.feature-index li a:hover { color: var(--sl-color-accent-high); text-decoration: underline; }
