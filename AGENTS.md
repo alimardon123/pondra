@@ -1912,7 +1912,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `describe`): `USE s | db | db.s`, `SET search_path` and `SET SCHEMA` set it, a session's alone
    (Flight SQL, MCP and `pondra sql` refuse it by name). A one-part name becomes the full name of
    the first place on the path that has it (the first place for a new one), and `current_database()`
-   and `current_schema()` their values, so the result cache, a spread query, the leader's writes, a
+   and `current_schema()` their values outside a view's body (invariant 286), so the result cache, a spread query, the leader's writes, a
    task's body, a view's stored SQL and history see full names and need no session. Stored SQL is
    read with `routines::expand_stored`, without the reader's path: a view made under `USE crm`
    reads crm whoever reads it, one made in public reads public under `USE crm`. CTEs, temporary
@@ -2028,6 +2028,25 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`logs/round34/nexmark-windows-by-key.json`). `harness.py refreshed`: "a burst's last row is answered within a
    few seconds…" (9.1 s without the early run); `harness.py pace`: "…beside eight views running their queries
    again…" fails with runs on the node's runtime.
+286. **A view's `current_schema()` is its reader's** (`path.rs`): `door` leaves `current_schema()`,
+   `current_database()` and `current_catalog()` in a `CREATE VIEW`'s or `ALTER VIEW … AS`'s query (not a
+   materialized or temporary view's: `Walk.view`), and `routines::expand_stored` puts in the reader's
+   session's values (`path::currents`; this lake's public with none), as Postgres reads a view. A query
+   read under a path of the session's own that reads such a view (`path::reads_current`, over the
+   views' stored text) runs on its node (`App::here_only`: the other nodes read it with no session)
+   and is never a remembered answer (`server::query`). The Postgres port no longer puts them in itself
+   (`pg_dialect`). `spark_sql('…')`'s text is Pondra's SQL before the path is written in
+   (`sparksql::inline` in `door`), and `SHOW COLUMNS FROM t` is placed. `harness.py use`: "a view's
+   current_schema() and current_database() are its reader's…", "a view made over Postgres keeps its
+   current_schema()…", "…a view's current_schema() asked to spread is crm's on every row", "…spark_sql('…')'s
+   text reads crm.t… SHOW COLUMNS…".
+287. **SQL's INSERT writes only into a table that is there** (`write::is_there`, `no_table`: 42P01, "no table
+   x"), as Postgres and DuckDB refuse it: in `on_node_listed`, looked at again once a follower holds what
+   its leader had (`seen_here`), and in `from_cli`. `CREATE TABLE … AS SELECT` defines its table first;
+   `POST /insert/{t}`, the bulk door, still makes one (`record`). A file, another engine's attached table
+   and a name this lake can't resolve go on to their own paths. `harness.py objects`: "an INSERT into a
+   name no table has is refused…"; `doors`: "an INSERT into no table, 42P01" at every door;
+   `history_check.py`: "an INSERT under a renamed table's old name is refused…".
 
 ## Tests: run these before and after any change
 
@@ -2684,11 +2703,12 @@ Known limits, in the order they matter:
     tables it would have made, Spark's function library, EXPLAIN's text (Pondra plans its own
     way), number literals typed DECIMAL (as Postgres and DuckDB do), strings read as `Utf8View`.
 
-Good next moves: `docs/roadmap.md` (2026-10-03) is the shortest path to 1.0, at the owner's bar
-("high quality, stable, workable, fully featured"): round 33 closes with the soak and environments;
-34 is SQL as people write it and scale on machines; 35 in-process and in the browser; 36 fitting
-in (databases attached, BI tools, measures in views); 37 is 1.0 (the promises, a security review,
-signed packages, the docs).
+Good next moves: `docs/roadmap.md` (2026-10-11) is one month to 1.0 (11-11), at the owner's bar
+("high quality, stable, workable, fully featured"): nine lanes side by side, each a thread that owns
+its files (engine and proof; in-process and the browser; the Postgres port; sources and outside
+catalogs; measures, the ontology and AI; SQL; durability and shipping; the console; the docs), a
+feature freeze on 10-31, a review week, then a release candidate under the soak. Edit only your
+lane's files (the project's `designs/one-month-to-1-0.md` lists them and each lane's numbers).
 
 ## Conventions
 
