@@ -187,7 +187,7 @@ struct Book {
     upkeep: bool,
 }
 
-static BOOK: LazyLock<Mutex<Book>> = LazyLock::new(Default::default);
+crate::per_node!(static BOOK: Mutex<Book> = Default::default());
 
 tokio::task_local! {
     /// Set by `at_once` around the statements that run at once in an open transaction (DDL, and the two steps of
@@ -423,7 +423,7 @@ fn aborted(why: &str) -> anyhow::Error {
 
 /// How long a transaction may sit idle before the idle timeout ends it (`PONDRA_TXN_IDLE_SECS`, 600).
 fn idle_limit() -> Duration {
-    Duration::from_secs(std::env::var("PONDRA_TXN_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(600))
+    Duration::from_secs(crate::env::or("PONDRA_TXN_IDLE_SECS", 600))
 }
 
 /// The error for a session whose transaction the idle timeout ended (25P03): its writes were dropped, so its statements
@@ -1115,7 +1115,7 @@ async fn insert_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: &str
 
 /// The test hook `PONDRA_TEST_AUTOCOMMIT_PAUSE_MS` (read once): an autocommitted write waits this long after it works its rows
 /// out, with its locks held and its table registered as appending (`tools/harness.py autocommit`'s gate check).
-static PAUSE: LazyLock<Option<Duration>> = LazyLock::new(|| std::env::var("PONDRA_TEST_AUTOCOMMIT_PAUSE_MS").ok()?.parse().ok().map(Duration::from_millis));
+static PAUSE: LazyLock<Option<Duration>> = LazyLock::new(|| crate::env::parse::<u64>("PONDRA_TEST_AUTOCOMMIT_PAUSE_MS").map(Duration::from_millis));
 
 async fn pause_for_tests() {
     if let Some(pause) = *PAUSE {

@@ -50,8 +50,9 @@ struct Cursor {
     bytes: usize,        // what its answer holds in memory, counted as pages.rs counts an answer
 }
 
-/// Each session's cursors, by name. A session with none has no entry.
-static CURSORS: LazyLock<Mutex<HashMap<String, HashMap<String, Cursor>>>> = LazyLock::new(Default::default);
+crate::per_node!(
+    /// Each session's cursors, by name. A session with none has no entry.
+    static CURSORS: Mutex<HashMap<String, HashMap<String, Cursor>>> = Mutex::new(HashMap::new()));
 
 const NO_SESSION: &str = "a cursor is a session's: a Postgres connection's, or an HTTP client's (send x-pondra-session: <id>)";
 
@@ -192,7 +193,7 @@ async fn declare_as(app: &App, name: &str, hold: bool, query: &str) -> Result<An
 /// Nothing held is dropped to make room; a client is still reading each cursor.
 fn budget() -> usize {
     let default = crate::store::ram().map_or(1 << 30, |ram| (ram / 4).min(1 << 30));
-    std::env::var("PONDRA_CURSORS_MB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(default, |mb| mb << 20)
+    crate::env::parse::<usize>("PONDRA_CURSORS_MB").map_or(default, |mb| mb << 20)
 }
 
 /// The refusal: what the node's cursors hold and what this answer needs, in MB, and the ways out. The

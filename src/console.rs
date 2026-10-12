@@ -141,7 +141,7 @@ static FILES: LazyLock<HashMap<String, Asset>> = LazyLock::new(|| {
 /// The scripts `PONDRA_CONSOLE_EXTENSIONS` names, read once.
 fn extensions() -> &'static [String] {
     static ALL: LazyLock<Vec<String>> = LazyLock::new(|| {
-        std::env::var_os("PONDRA_CONSOLE_EXTENSIONS").map(|v| std::env::split_paths(&v).filter_map(|p| match std::fs::read_to_string(&p) {
+        crate::env::os("PONDRA_CONSOLE_EXTENSIONS").map(|v| std::env::split_paths(&v).filter_map(|p| match std::fs::read_to_string(&p) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("console extension {}: {e}", p.display());
@@ -155,7 +155,7 @@ fn extensions() -> &'static [String] {
 /// `PONDRA_CONSOLE_DIR`, for working on the console: its files read from there on every request
 /// (as served: lean), so a change shows on a reload, without building the binary again.
 fn from_dir(name: &str) -> Option<Asset> {
-    let dir = std::env::var_os("PONDRA_CONSOLE_DIR")?;
+    let dir = crate::env::os("PONDRA_CONSOLE_DIR")?;
     let text = std::fs::read_to_string(std::path::Path::new(&dir).join(name)).ok()?;
     Some(match name.rsplit('.').next() {
         Some("js") => Asset::new(lean(&text), JS),
@@ -167,7 +167,7 @@ fn from_dir(name: &str) -> Option<Asset> {
 /// A node's console: its lake.
 pub async fn page(headers: HeaderMap) -> Response {
     static PAGE: LazyLock<Asset> = LazyLock::new(|| Asset::new(page_text(), "text/html; charset=utf-8"));
-    if std::env::var_os("PONDRA_CONSOLE_DIR").is_some() {
+    if crate::env::is_set("PONDRA_CONSOLE_DIR") {
         return Asset::new(page_text(), "text/html; charset=utf-8").serve(&headers);
     }
     PAGE.serve(&headers)
@@ -198,7 +198,7 @@ fn settings_file() -> Option<std::path::PathBuf> { settings_dir().map(|d| d.join
 /// This machine's folder for Pondra's settings (the console's, the Python chosen).
 pub fn settings_dir() -> Option<std::path::PathBuf> {
     let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
-    var("PONDRA_CONFIG_DIR").or_else(|| match () {
+    crate::env::os("PONDRA_CONFIG_DIR").map(std::path::PathBuf::from).or_else(|| match () {
         _ if cfg!(windows) => var("APPDATA").map(|d| d.join("pondra")),
         _ if cfg!(target_os = "macos") => var("HOME").map(|d| d.join("Library/Application Support/pondra")),
         _ => var("XDG_CONFIG_HOME").or_else(|| var("HOME").map(|d| d.join(".config"))).map(|d| d.join("pondra")),

@@ -51,7 +51,7 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), me: me.clone() });
         let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), cancels: cancels.clone() };
         let pg = Arc::new(Pg(backend, Arc::new(startup), cancel.clone()));
-        tokio::spawn(async move {
+        crate::panics::task(async move {
             let _ = socket.set_nodelay(true);
             let _ = pgwire::tokio::process_socket(socket, tls, pg).await;
             crate::temp::end(&session);
@@ -237,7 +237,7 @@ impl Backend {
         }
         let sql = crate::routines::expand(&self.app.lake, sql).await.map_err(user_error)?; // (macros: ADR-023)
         let sql = crate::asof::rewrite(&pg_dialect(&self.app.lake, &sql, user)).map_err(user_error)?.into_owned();
-        if std::env::var_os("PONDRA_DEBUG_PG").is_some() {
+        if crate::env::is_set("PONDRA_DEBUG_PG") {
             eprintln!("pg {user}: {sql}");
         }
         let statement = crate::write::first_word(&sql); // (dbt's leading comment is no part of the statement)
@@ -880,7 +880,7 @@ struct Pending {
     job: String,
 }
 
-static COPIES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, Pending>>> = std::sync::LazyLock::new(Default::default);
+crate::per_node!(static COPIES: std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, Pending>> = Default::default());
 
 #[async_trait]
 impl CopyHandler for Backend {
@@ -1139,6 +1139,6 @@ fn described(schema: &Schema, format: &Format) -> Vec<FieldInfo> {
 
 /// `PONDRA_TRACE_PG=1`: where a Postgres statement's time goes, on stderr.
 fn trace() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("PONDRA_TRACE_PG").is_some());
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env::is_set("PONDRA_TRACE_PG"));
     *ON
 }

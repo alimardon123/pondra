@@ -229,7 +229,7 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
     };
     let waiting: u64 = gone.iter().map(|f| f.rows).sum();
     let rows = meta.files.iter().map(|f| f.rows).sum::<u64>() + meta.sealed.as_ref().map_or(0, |s| s.rows);
-    let at_least = std::env::var("PONDRA_PURGE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+    let at_least = crate::env::or("PONDRA_PURGE_ROWS", 100_000);
     if upto <= after || (!now_anyway && meta.publish.is_empty() && waiting < at_least && waiting * 10 < rows) {
         // (nothing to purge yet; the old rows past the table's retention may still go)
         if settle(&mut meta, &mut dmeta, now, retain_ms) {
@@ -449,7 +449,7 @@ enum Kind {
 /// commits nothing, so what its other jobs wrote goes at once: left to the orphan sweep (a day
 /// on), a disk the lake had filled filled again with the files of the rounds that failed on it.
 async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result<Vec<DataFile>> {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    crate::per_node!(static NEXT: AtomicUsize = AtomicUsize::new(0));
     let paths = |f: &DataFile| std::iter::once(f.path.clone()).chain(f.delete_files().cloned()).collect::<Vec<_>>();
     // (a `Positions` job hands its files back with a delete file more: never theirs to delete)
     let given: std::collections::HashSet<String> = jobs.iter().flat_map(|j| match &j.kind {
@@ -718,7 +718,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     }
     // Only segments that were ALREADY below the floor `grace_ms` ago: a query that read a table's
     // metadata just before it was tiered may still be reading them.
-    static FLOORS: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+    crate::per_node!(static FLOORS: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> = std::sync::Mutex::new(std::collections::VecDeque::new()));
     let floor = {
         let mut floors = FLOORS.lock().unwrap();
         floors.push_back((crate::log::now_ms(), floor));
@@ -728,7 +728,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
         if floors[0].0 <= cutoff { floors[0].1 } else { 0 }
     };
     // (`--changelog-secs`: the log is also a change feed, kept that long for `/watch?after=` replays.)
-    let changelog = std::env::var("PONDRA_CHANGELOG_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1000;
+    let changelog = crate::env::or::<u64>("PONDRA_CHANGELOG_SECS", 0) * 1000;
     let log_cutoff = cutoff.min(crate::log::now_ms().saturating_sub(changelog));
     let (segs, kept): (Vec<(String, Segment)>, Vec<(String, Segment)>) = lake.cat.scan::<Segment>(&seg_key(1), &seg_key(floor + 1)).await?
         .into_iter().partition(|(_, s)| s.ts_ms < log_cutoff);
@@ -810,7 +810,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     use futures::TryStreamExt;
     const HOUR: u64 = 3_600_000;
     const DAY: u64 = 24 * HOUR;
-    static SWEPT: std::sync::LazyLock<std::sync::Mutex<(u64, std::collections::HashMap<String, u64>)>> = std::sync::LazyLock::new(Default::default);
+    crate::per_node!(static SWEPT: std::sync::Mutex<(u64, std::collections::HashMap<String, u64>)> = Default::default());
     let now = crate::log::now_ms();
     if now - SWEPT.lock().unwrap().0 < HOUR {
         return Ok(());
@@ -943,7 +943,7 @@ pub fn plain(props: WriterProperties) -> datafusion::parquet::arrow::arrow_write
 /// so scans are CPU-cheap (TPC-H runs 13-20% faster than on ZSTD, with files a third bigger).
 /// `zstd` where storage or bandwidth costs more than CPU; `snappy` or `none` also work.
 fn codec() -> Compression {
-    match std::env::var("PONDRA_CODEC").unwrap_or_default().to_lowercase().as_str() {
+    match crate::env::get("PONDRA_CODEC").unwrap_or_default().to_lowercase().as_str() {
         "zstd" => Compression::ZSTD(ZstdLevel::try_new(1).expect("a valid level")),
         "snappy" => Compression::SNAPPY,
         "none" => Compression::UNCOMPRESSED,

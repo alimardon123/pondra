@@ -25,7 +25,8 @@ use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::Result;
 use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, ListBuilder, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray};
 use datafusion::physical_plan::ExecutionPlan;
-use std::sync::{Arc, Mutex, OnceLock};
+use crate::reset::Once;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 pub const TABLE: &str = "pondra$history";
@@ -235,22 +236,22 @@ fn fnv(bytes: &[u8]) -> u64 {
 
 fn learn() -> Duration {
     static L: OnceLock<Duration> = OnceLock::new();
-    *L.get_or_init(|| Duration::from_millis(std::env::var("PONDRA_LEARN_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(100)))
+    *L.get_or_init(|| Duration::from_millis(crate::env::or("PONDRA_LEARN_MS", 100)))
 }
 
 fn slow() -> Duration {
     static S: OnceLock<Duration> = OnceLock::new();
-    *S.get_or_init(|| Duration::from_millis(std::env::var("PONDRA_SLOW_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(1000)))
+    *S.get_or_init(|| Duration::from_millis(crate::env::or("PONDRA_SLOW_MS", 1000)))
 }
 
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PONDRA_HISTORY").map_or(true, |v| !v.eq_ignore_ascii_case("off")))
+    *ON.get_or_init(|| crate::env::get("PONDRA_HISTORY").map_or(true, |v| !v.eq_ignore_ascii_case("off")))
 }
 
 fn rate() -> u64 {
     static R: OnceLock<u64> = OnceLock::new();
-    *R.get_or_init(|| std::env::var("PONDRA_HISTORY_RATE").ok().and_then(|r| r.parse().ok()).unwrap_or(500))
+    *R.get_or_init(|| crate::env::or("PONDRA_HISTORY_RATE", 500))
 }
 
 /// `text` at most `max` bytes, cut at a character's end.
@@ -300,19 +301,19 @@ pub fn ended(app: &App, class: &'static str, sql: &str, outcome: &'static str, e
         eprintln!("slow statement: {} ms, {user} by {door}{}: {}", took.as_millis(), note.nodes.map(|n| format!(" on {n} nodes")).unwrap_or_default(), cut(statement.replace('\n', " "), 300));
     }
     let line = Line { at: crate::log::now_ms(), id: crate::runs::new_id(), user, door, from, session: crate::temp::current(), class, statement, sql: sql.to_string(), outcome, error, ms: took.as_millis() as i64, note };
-    let tx = WRITER.get_or_init(|| writer(app, TABLE, crate::ddl::Ddl::HistoryLog, Duration::from_secs(1), batch));
+    let tx = WRITER.get_or(|| writer(app, TABLE, crate::ddl::Ddl::HistoryLog, Duration::from_secs(1), batch));
     let _ = tx.send(line);
 }
 
 /// Past this second's rate: this statement is counted, not written. The first statement of a
 /// second after one that skipped some writes a row saying how many.
 fn skipped() -> bool {
-    static SECOND: Mutex<(u64, u64, u64)> = Mutex::new((0, 0, 0)); // (the second, rows written in it, statements skipped in it)
+    crate::per_node!(static SECOND: Mutex<(u64, u64, u64)> = Mutex::new((0, 0, 0))); // (the second, rows written in it, statements skipped in it)
     let now = crate::log::now_ms() / 1000;
     let mut s = SECOND.lock().unwrap();
     if s.0 != now {
         let skipped = std::mem::replace(&mut *s, (now, 0, 0)).2;
-        if let Some(tx) = WRITER.get().filter(|_| skipped > 0) {
+        if let Some(tx) = WRITER.current().filter(|_| skipped > 0) {
             let statement = format!("({skipped} more statements that second, not written: PONDRA_HISTORY_RATE)");
             let _ = tx.send(Line { at: crate::log::now_ms(), id: crate::runs::new_id(), user: String::new(), door: "node", from: None, session: None, class: "skipped", statement, sql: String::new(), outcome: "ok", error: None, ms: 0, note: Note { rows: Some(skipped), ..Default::default() } });
         }
@@ -325,7 +326,7 @@ fn skipped() -> bool {
     full
 }
 
-static WRITER: OnceLock<tokio::sync::mpsc::UnboundedSender<Line>> = OnceLock::new();
+crate::per_node!(static WRITER: RwLock<Option<tokio::sync::mpsc::UnboundedSender<Line>>> = RwLock::new(None));
 
 fn columns() -> Vec<(String, String)> {
     use datafusion::arrow::datatypes::{DataType, TimeUnit};
@@ -342,7 +343,7 @@ fn columns() -> Vec<(String, String)> {
 pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
     match lake.cat.get::<TableMeta>(&table_key(TABLE)).await? {
         None => {
-            let days: u64 = std::env::var("PONDRA_HISTORY_DAYS").ok().and_then(|d| d.parse().ok()).unwrap_or(7);
+            let days: u64 = crate::env::or("PONDRA_HISTORY_DAYS", 7);
             let meta = TableMeta { columns: columns(), ttl: Some(("at".into(), days * 86400)), tiered: lake.visible(), ..Default::default() };
             lake.cat.commit(vec![(table_key(TABLE), json(&meta))], &[]).await?;
         }
@@ -459,11 +460,13 @@ fn relations(sql: &str) -> Option<Vec<String>> {
 pub fn writer<L: Send + Sync + 'static>(app: &App, table: &'static str, make: crate::ddl::Ddl, every: Duration, batch: fn(&App, &[L]) -> Result<RecordBatch>) -> tokio::sync::mpsc::UnboundedSender<L> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<L>();
     let app = app.clone();
-    crate::panics::spawn(async move {
+    keep(async move {
         let producer = format!("{}-{}", table.trim_start_matches("pondra$"), crate::runs::new_id());
         let (mut seq, mut made) = (0, false);
-        while let Some(first) = rx.recv().await {
-            tokio::time::sleep(every).await;
+        while let Some(first) = next(&mut rx).await {
+            if !ending() {
+                tokio::time::sleep(every).await;
+            }
             let mut lines = vec![first];
             while let Ok(l) = rx.try_recv() {
                 lines.push(l);
@@ -493,6 +496,42 @@ pub fn writer<L: Send + Sync + 'static>(app: &App, table: &'static str, make: cr
         }
     });
     tx
+}
+
+// This node's log writers (history, the audit log, the run log): each one's task, and whether its
+// node is stopping (`end_writers`).
+crate::per_node!(static WRITERS: Mutex<Vec<tokio::task::JoinHandle<()>>> = Mutex::new(Vec::new()));
+crate::per_node!(static ENDING: tokio::sync::watch::Sender<bool> = tokio::sync::watch::channel(false).0);
+
+/// Starts one of this node's log writers, kept for `end_writers`.
+pub(crate) fn keep(run: impl std::future::Future<Output = ()> + Send + 'static) {
+    let task = crate::panics::spawn(run);
+    WRITERS.lock().unwrap().push(task);
+}
+
+/// A log writer's next line: None once its node is stopping and every line sent before is taken.
+pub(crate) async fn next<L>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<L>) -> Option<L> {
+    let mut ending = ENDING.subscribe();
+    tokio::select! {
+        biased;
+        line = rx.recv() => return line,
+        _ = async { drop(ending.wait_for(|e| *e).await) } => {} // (its guard isn't Send: dropped here)
+    }
+    rx.close(); // (what was sent before stays to be taken; nothing more comes)
+    rx.recv().await
+}
+
+/// Is this node stopping (a log writer writes what it has at once, without waiting for more)?
+pub(crate) fn ending() -> bool {
+    *ENDING.borrow()
+}
+
+/// Writes what this node's log writers were sent, then ends them: `Node::stop`, while the node still
+/// leads, since their rows go through the log. 5 s at most; what is left then is lost, as at a kill.
+pub(crate) async fn end_writers() {
+    ENDING.send_replace(true);
+    let all = std::mem::take(&mut *WRITERS.lock().unwrap());
+    let _ = tokio::time::timeout(Duration::from_secs(5), futures::future::join_all(all)).await;
 }
 
 /// `pondra.history` as the caller may read it: every row for an admin, their own for anyone else.

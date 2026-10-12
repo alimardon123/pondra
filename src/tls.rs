@@ -44,7 +44,7 @@ pub fn init() -> Result<()> {
         let _ = TLS.set(load()?);
     }
     if PROXIES.get().is_none() {
-        let _ = PROXIES.set(ranges(&std::env::var(TRUSTED_PROXIES).unwrap_or_default()).context(TRUSTED_PROXIES)?);
+        let _ = PROXIES.set(ranges(&crate::env::get(TRUSTED_PROXIES).unwrap_or_default()).context(TRUSTED_PROXIES)?);
     }
     Ok(())
 }
@@ -56,13 +56,12 @@ pub fn on() -> bool { tls().is_some() }
 pub fn url(rest: &str) -> String { format!("{}://{rest}", if on() { "https" } else { "http" }) }
 
 fn load() -> Result<Option<Tls>> {
-    let var = |n: &str| std::env::var(n).ok().filter(|v| !v.is_empty());
-    let (Some(cert), Some(key)) = (var("PONDRA_TLS_CERT"), var("PONDRA_TLS_KEY")) else {
-        anyhow::ensure!(var("PONDRA_TLS_CERT").is_none() && var("PONDRA_TLS_KEY").is_none(), "--tls-cert and --tls-key go together");
+    let (Some(cert), Some(key)) = (crate::env::get("PONDRA_TLS_CERT"), crate::env::get("PONDRA_TLS_KEY")) else {
+        anyhow::ensure!(crate::env::get("PONDRA_TLS_CERT").is_none() && crate::env::get("PONDRA_TLS_KEY").is_none(), "--tls-cert and --tls-key go together");
         return Ok(None);
     };
     let read = |p: &str| std::fs::read(p).with_context(|| format!("reading {p}"));
-    let (pem, key_pem, ca) = (read(&cert)?, read(&key)?, var("PONDRA_TLS_CA").map(|p| read(&p)).transpose()?);
+    let (pem, key_pem, ca) = (read(&cert)?, read(&key)?, crate::env::get("PONDRA_TLS_CA").map(|p| read(&p)).transpose()?);
     let certs = CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>().with_context(|| format!("{cert}: not a PEM certificate"))?;
     anyhow::ensure!(!certs.is_empty(), "{cert} holds no certificate");
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
@@ -83,7 +82,7 @@ fn load() -> Result<Option<Tls>> {
         c.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         Ok(tokio_rustls::TlsAcceptor::from(Arc::new(c)))
     };
-    let optional = var("PONDRA_TLS").is_some_and(|v| v == "optional");
+    let optional = crate::env::get("PONDRA_TLS").is_some_and(|v| v == "optional");
     let tls = Tls { http: config(&[b"h2", b"http/1.1"])?, flight: config(&[b"h2"])?, other: config(&[])?, pem: pem.clone(), ca, key: key_pem, optional };
     Ok(Some(tls))
 }
@@ -133,7 +132,7 @@ impl Peer {
     /// `PONDRA_TRUSTED_PROXIES`, the client its `X-Forwarded-For` names. Anyone else's word for it is never taken.
     pub fn client(&self, headers: &axum::http::HeaderMap) -> std::net::IpAddr {
         static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        let key = KEY.get_or_init(|| std::env::var(CLIENT_KEY).ok().filter(|k| k.len() >= 16));
+        let key = KEY.get_or_init(|| crate::env::get(CLIENT_KEY).filter(|k| k.len() >= 16));
         named(headers, key.as_deref().filter(|_| self.local)).or_else(|| forwarded(headers, self.addr.ip(), proxies())).unwrap_or(self.addr.ip())
     }
 
@@ -148,7 +147,7 @@ impl Peer {
 static PROXIES: OnceLock<Vec<(std::net::IpAddr, u8)>> = OnceLock::new();
 
 fn proxies() -> &'static [(std::net::IpAddr, u8)] {
-    PROXIES.get_or_init(|| ranges(&std::env::var(TRUSTED_PROXIES).unwrap_or_default()).unwrap_or_default())
+    PROXIES.get_or_init(|| ranges(&crate::env::get(TRUSTED_PROXIES).unwrap_or_default()).unwrap_or_default())
 }
 
 /// `10.0.0.0/8, 192.168.1.5, fd00::/8` as (address, prefix length) pairs; an address alone is itself.
@@ -341,7 +340,7 @@ impl Doors {
                     }
                 };
                 let tx = tx.clone();
-                tokio::spawn(async move {
+                crate::panics::task(async move {
                     if let Ok(c) = accept(tcp, door).await {
                         let _ = tx.send(c).await;
                     }

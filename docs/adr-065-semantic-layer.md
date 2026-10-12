@@ -38,13 +38,47 @@ connector. Snowflake's semantic views are a new kind of object with its own DDL.
 
 ### 2. Key facts on views (L5-2)
 
-`ALTER VIEW v ADD CONSTRAINT name PRIMARY KEY | UNIQUE (cols) NOT ENFORCED`, and `FOREIGN KEY (cols)
-REFERENCES t (cols) NOT ENFORCED`, are facts about a view, kept at `vk/{view}` (a prefix of its own,
-invariant 104). They are listed as `key` and `link` parts, shown by `SHOW CREATE VIEW`, put in
-Postgres's `pg_constraint` (BI tools read relationships there), kept through `CREATE OR REPLACE
-VIEW` while their columns are still there, moved by a rename and gone with a drop. A view's key is
-what §3's join check and the ontology (E14) read. Nothing checks it: it is the writer's promise, as
-on Snowflake and Databricks.
+A view's PRIMARY KEY, UNIQUE and FOREIGN KEY are facts about its rows, said NOT ENFORCED: nothing
+checks them (a view holds no rows to check), as Oracle's view constraints (`RELY DISABLE NOVALIDATE`)
+and a table's NOT ENFORCED keys (ADR-057). They are written where a view is made, in its list, as a
+materialized view's expectations are, and added or dropped later:
+
+```sql
+CREATE VIEW sales.customers_v (
+  PRIMARY KEY (id) NOT ENFORCED,
+  CONSTRAINT customers_v_region_fkey FOREIGN KEY (region) REFERENCES sales.regions (code) NOT ENFORCED
+) AS SELECT id, name, region FROM sales.customers;
+
+ALTER VIEW sales.customers_v ADD CONSTRAINT customers_v_name_key UNIQUE (name) NOT ENFORCED;
+ALTER VIEW sales.customers_v DROP CONSTRAINT [IF EXISTS] customers_v_name_key;
+ALTER MATERIALIZED VIEW sales.daily ADD PRIMARY KEY (day) NOT ENFORCED;
+```
+
+- **Kept in the view's own entry**: a view's in its `q/` entry (`StoredView::facts`), a materialized
+  view's among its table's constraints (`TableMeta::constraints`, never enforced). So a rename moves
+  them, a drop takes them, a clone and a branch carry them, and no prefix or listing is added.
+- **Named as Postgres names a table's**: `{view}_pkey`, `{view}_{columns}_key`, `{view}_{columns}_fkey`.
+  Each names only the view's columns (a measure is no column: refused), a view has one PRIMARY KEY,
+  and a name is used once.
+- **Through `CREATE OR REPLACE VIEW`** (dbt makes views so on every run): a statement with a list
+  sets them as written; one without keeps them, and is refused by name when one names a column the
+  new query drops, with the `ALTER VIEW … DROP CONSTRAINT` to run first (the SQL review's rule, so
+  a suggestion run again keeps what the user added).
+- **`ADD CONSTRAINT IF NOT EXISTS name`** adds nothing when the name is there, so a file of them runs
+  twice safely (`pondra.suggest_ontology`'s statements).
+- **Shown everywhere a table's are**: `SHOW CREATE VIEW` and `pondra export` write the list (one
+  statement, so a project's file and a drop-and-run-again make the same view), `pondra.parts` lists
+  `key` and `link` parts, Postgres's `pg_constraint` and `information_schema.table_constraints`
+  have them (BI tools read relationships there), and §3's join check takes a view's key as a
+  table's.
+- **Refused by name**, each with the statement to write: one without NOT ENFORCED, a CHECK on a
+  stored view (a materialized view's checks are its expectations), a column it doesn't have (a
+  measure is none), a second PRIMARY KEY, a name taken, `ALTER VIEW` of a table, and `ALTER TABLE …
+  ADD CONSTRAINT` of a view (42809, pointing at `ALTER VIEW`). No `RELY`: the planner never uses a
+  fact (ADR-057 §4).
+- **Spelled as the SQL review settled** (`designs/ontology-as-a-schema.md`, Names), with two
+  additions it was asked about: the list form, and `SHOW CREATE VIEW` as that one statement rather
+  than `CREATE VIEW` and `ALTER VIEW` lines, because a project's file holds one statement per object.
 
 ### 3. Measures in views (E13 phase 1, L5-3)
 
@@ -75,13 +109,19 @@ SELECT region, MEASURE(per_customer) FROM sales WHERE day >= DATE '2026-01-01' G
   view's *base* instead: its FROM and WHERE, its dimensions by name, and each column a measure reads
   as a hidden column. Each measure becomes its expression over those columns, at the query's own
   GROUP BY (none given: the dimensions it selects). Per customer by region is that region's revenue
-  over its distinct customers, never an average of ratios. A query that names no measure reads the
-  default form, with SQL's meaning.
+  over its distinct customers, never an average of ratios. The base is then written in place
+  (`measures::flattened`): the query becomes the `GROUP BY` a person would write over the view's
+  tables, and plans as one (on three nodes the subquery cost a query about 3 ms more). It stays a
+  subquery only where writing it in could change a name's meaning: a name the base doesn't have
+  (outside ORDER BY's names of the query's own columns), a subquery, a window, DISTINCT, or an
+  unnamed item that isn't a plain column. A query that names no measure reads the default form, with
+  SQL's meaning.
 - **Expanded where SQL comes in, before anything plans it** (`measures::rewrite`, first in
   `routines::expand_with`'s tree stage, so the macros, DuckDB's spellings and enum casts of the
   inserted SQL are expanded after it). After it the query is a plain `GROUP BY`: spread, the result
-  cache, the guard and the join order work unchanged, and a query without measures pays one scan of
-  `q/` names.
+  cache, the guard and the join order work unchanged. A query without measures pays a look at the
+  lake's views with measures, kept per catalog version (`measures::own_views`, as `routines::listed`
+  keeps functions), and at an attached lake's only when the statement names that lake.
 - **No double counting.** When a view with measures is made, each of its joins must be `JOIN` or
   `LEFT JOIN … ON` equalities that cover a key of the joined table (its `PRIMARY KEY`, a `UNIQUE`,
   enforced or not, or a view's key fact from §2). The first relation may be anything. A `LEFT JOIN`
@@ -92,7 +132,14 @@ SELECT region, MEASURE(per_customer) FROM sales WHERE day >= DATE '2026-01-01' G
   isn't a measure; in a definition: GROUP BY, HAVING, DISTINCT, ORDER BY, LIMIT, a set operation, `*`,
   a subquery or window in a measure, a RIGHT, FULL, CROSS, NATURAL or comma join, a join not on a key,
   a measure named as a dimension, measures that refer to each other in a loop, measures over another
-  view's measures, and `AS MEASURE` in a materialized view (phase 2's rollups).
+  view's measures, a column list after the view's name (`CREATE VIEW v (a, b)`: name them in the
+  SELECT), and `AS MEASURE` in a materialized view (phase 2's rollups). A view of a view with
+  measures, and a materialized view of one, read it with `MEASURE(…)` as any query does.
+- **What a BI tool's own subquery does:** a tool that reads the view in a subquery of its own and
+  groups again (`SELECT region, sum(r) FROM (SELECT region, status, revenue AS r FROM sales) …`)
+  gets the subquery's rows at the subquery's grain, as SQL says; additive measures add up right, a
+  ratio does not. Tools that send `sum(m)` against the view itself (Tableau, Superset, Metabase) get
+  the measure.
 - **Other doors:** MCP's agents find measures with `find(kind => 'measure')` and query them as SQL;
   frames get `pondra.measure("m")`; the Postgres port lists measures as columns.
 
@@ -112,7 +159,26 @@ proposed from `pondra.history`) follow E13 after 1.0's freeze unless asked soone
    is a remembered answer. `harness.py find`: "a user granted one table…", "a user granted some
    columns…", "never a remembered answer…".
 
-(Invariants for §2 and §3 are added with their pull requests, from 346.)
+346. **A measure is worked out at the query's own grain, from the view's base rows, never from its
+   default form's** (`measures::rewrite`, first in `routines::expand_with`'s tree stage): a query naming
+   a measure reads the view's FROM and WHERE with the dimensions it uses and each column its measures
+   read, and each measure is its expression over those, grouped by the query's GROUP BY; the base is
+   then written in place (`measures::flattened`) unless that could change a name's meaning. Everything
+   after it sees a plain `GROUP BY` (spread, the result cache, the join order). `harness.py measures`:
+   "MEASURE() at the query's own grain…", "every way of naming a measure…", "spread over three nodes
+   == one node".
+347. **A view with measures joins only onto keys, so no row is counted twice** (`measures::check`, in
+   `ddl::create_view`): each JOIN or LEFT JOIN's equalities cover a PRIMARY KEY or UNIQUE of the table
+   or view it joins (NOT ENFORCED is enough); a query that joins the view to anything else is refused.
+   `harness.py measures`: "refused by name, and nothing made" ('not on a key', 'has no key', 'inside
+   the view').
+
+348. **A view's key facts are its own entry's, name only its columns, and nothing checks them**
+   (`facts.rs`): a stored view's in `StoredView::facts`, a materialized view's in its table's
+   constraints, never enforced; set by the statement that makes the view; a `CREATE OR REPLACE VIEW`
+   that drops a column one names is refused; one naming anything but the view's columns is refused.
+   `harness.py facts`: "kept through CREATE OR REPLACE…", "refused by name, and nothing made",
+   "SHOW CREATE VIEW run again after a drop makes the same view".
 
 ## Consequences
 

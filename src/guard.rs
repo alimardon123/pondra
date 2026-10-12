@@ -31,8 +31,8 @@ const WIRE: f64 = 3.0; // Arrow as a shuffle sends it (ZSTD) is about a third of
 /// at 17–54 ms apart, some 20 round trips; in one data centre that is a few milliseconds.
 const ROUND_TRIPS: f64 = 20.0;
 
-static LINKS: LazyLock<Mutex<HashMap<String, (Link, Instant)>>> = LazyLock::new(Default::default);
-static HERE: Mutex<Option<f64>> = Mutex::new(None); // bytes of tables read per second, one node
+crate::per_node!(static LINKS: Mutex<HashMap<String, (Link, Instant)>> = Default::default());
+crate::per_node!(static HERE: Mutex<Option<f64>> = Mutex::new(None)); // bytes of tables read per second, one node
 
 /// The body of `GET /cluster/probe?bytes=n`: bytes that don't compress (a link's measure).
 pub fn probe(bytes: usize) -> Vec<u8> {
@@ -47,7 +47,7 @@ pub fn probe(bytes: usize) -> Vec<u8> {
 /// shuffle waits for it. Measured every 10 minutes, or given (`PONDRA_LINK=ms,MB/s`); None when a
 /// node can't be measured.
 pub async fn slowest(nodes: &[String], me: &str) -> Option<Link> {
-    if let Some((ms, mb)) = std::env::var("PONDRA_LINK").ok().and_then(|v| Some((v.split_once(',')?.0.parse::<f64>().ok()?, v.split_once(',')?.1.parse::<f64>().ok()?))) {
+    if let Some((ms, mb)) = crate::env::get("PONDRA_LINK").and_then(|v| Some((v.split_once(',')?.0.parse::<f64>().ok()?, v.split_once(',')?.1.parse::<f64>().ok()?))) {
         return Some(Link { rtt: ms / 1e3, rate: mb * 1e6 }); // (`ms,MB/s`: a network known, or one to pretend)
     }
     let links = futures::future::join_all(nodes.iter().filter(|n| *n != me).map(|n| link(n))).await;
@@ -94,8 +94,8 @@ pub fn ran_spread(sql: &str, took: Duration) { note(&SPREAD_TOOK, sql, took) }
 /// A query's last three times, one way. A busy machine makes a run slower, never faster, so the
 /// best of them is what that way costs: one slow run doesn't turn the choice.
 type Times = Mutex<lru::LruCache<u64, Vec<f64>>>;
-static TOOK: LazyLock<Times> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())));
-static SPREAD_TOOK: LazyLock<Times> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())));
+crate::per_node!(static TOOK: Times = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+crate::per_node!(static SPREAD_TOOK: Times = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
 
 fn note(times: &Times, sql: &str, took: Duration) {
     let mut all = times.lock().unwrap();
@@ -130,10 +130,10 @@ fn key(sql: &str) -> u64 {
 /// here yet.
 pub fn pays(sql: &str, link: Link, moved: u64, steps: usize, bytes: u64, n: usize) -> bool {
     let known = best(&TOOK, sql);
-    let learned = std::env::var_os("PONDRA_LINK").is_none(); // (a network pretended: the model alone)
+    let learned = !crate::env::is_set("PONDRA_LINK"); // (a network pretended: the model alone)
     if let (Some(here), (Some(spread), runs), true) = (known, spread_runs(sql), learned) {
         if spread < here || runs >= 2 {
-            if std::env::var_os("PONDRA_DEBUG_SPREAD").is_some() {
+            if crate::env::is_set("PONDRA_DEBUG_SPREAD") {
                 eprintln!("spread: ran both ways, here {here:.3}s, spread {spread:.3}s ({runs} runs)");
             }
             return spread < here; // (it ran both ways: no need to guess)
@@ -142,7 +142,7 @@ pub fn pays(sql: &str, link: Link, moved: u64, steps: usize, bytes: u64, n: usiz
     let Some(here) = known.or_else(|| HERE.lock().unwrap().map(|rate| bytes as f64 / rate)) else { return false };
     let saved = here * (1.0 - 1.0 / n as f64);
     let cost = link.rtt * (2.0 + ROUND_TRIPS * steps as f64) + moved as f64 / WIRE / link.rate;
-    if std::env::var_os("PONDRA_DEBUG_SPREAD").is_some() {
+    if crate::env::is_set("PONDRA_DEBUG_SPREAD") {
         eprintln!("spread: here ~{here:.3}s, spread saves ~{saved:.3}s, costs ~{cost:.3}s ({:.1} MB in {steps} steps; {link:?})", moved as f64 / 1e6);
     }
     cost < saved

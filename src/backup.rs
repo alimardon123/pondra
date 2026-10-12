@@ -118,7 +118,7 @@ pub fn reads_only(stmt: &crate::write::Stmt) -> bool {
 /// pins are kept as a lake keeps them, hourly: one on lease that wasn't renewed goes, and one whose
 /// clone is gone (`branch::lapse`, `sweep`).
 pub async fn tend(lake: &Lake) -> Result<()> {
-    static LOOKED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+    crate::per_node!(static LOOKED: std::sync::Mutex<u64> = std::sync::Mutex::new(0));
     let now = crate::log::now_ms();
     {
         let mut looked = LOOKED.lock().unwrap();

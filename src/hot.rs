@@ -72,7 +72,7 @@ type Ranges = Arc<[ArrayRef; 4]>;
 
 impl Hot {
     pub fn new() -> Hot {
-        let gb = std::env::var("PONDRA_HOT_GB").ok().and_then(|g| g.parse::<f64>().ok());
+        let gb = crate::env::parse::<f64>("PONDRA_HOT_GB");
         let max = gb.map(|g| (g * (1u64 << 30) as f64) as usize).unwrap_or_else(|| crate::store::memory_limit() / 4); // (a quarter of the query memory: an eighth of RAM)
         Hot { max, state: Default::default(), slot: tokio::sync::Semaphore::new(1) }
     }
@@ -649,8 +649,9 @@ fn top_first(p: &Arc<dyn ExecutionPlan>, order: &[datafusion::physical_expr::Phy
     }
 }
 
-/// Batches scans skipped by their ranges (`/metrics`).
-pub static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+crate::per_node!(
+    /// Batches scans skipped by their ranges (`/metrics`).
+    pub static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
 
 /// Which of a partition's batches its scan's predicate may match, worked out again when a dynamic
 /// filter in it moves.

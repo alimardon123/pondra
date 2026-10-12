@@ -476,7 +476,7 @@ pub(crate) async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
     }
     for (k, v) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
         let name = &k[2..];
-        put(Kind::named("view"), name, format!("CREATE VIEW {} AS\n{}", quoted(name), v.sql.trim()), None, None);
+        put(Kind::named("view"), name, format!("CREATE VIEW {}{} AS\n{}", quoted(name), crate::facts::in_list(&v.facts), crate::measures::written(v.sql.trim())), None, None);
     }
     for (name, r) in crate::routines::listed(lake).await?.iter() {
         let kind = match r.what() {
@@ -1085,7 +1085,7 @@ async fn claim_to_record(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Wh
     // (the leader's answer keeps `keep`'s old key, "deploy": see there)
     record.n = claimed["deploy"].as_u64().context("an apply number")?;
     keep_files(&app.lake, record.n, &ask.files).await?;
-    let alive = tokio::spawn(beat(app.clone(), record.n));
+    let alive = crate::panics::task(beat(app.clone(), record.n));
     let out = statements(app, p, plan, &mut record, who, ask.test, &ask.secrets).await;
     alive.abort();
     if let Err(e) = &out {

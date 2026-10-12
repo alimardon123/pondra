@@ -284,6 +284,20 @@ impl Stmt {
     }
 }
 
+/// Puts a materialized view's expectations (JSON) in its options, through OR REPLACE's and IF NOT
+/// EXISTS's wrappers; false for a statement that isn't a materialized view's.
+fn expect_in(d: &mut crate::ddl::Ddl, expect: &str) -> bool {
+    use crate::ddl::Ddl;
+    match d {
+        Ddl::CreateMaterialized { options, .. } => {
+            options.insert("expect".into(), expect.into());
+            true
+        }
+        Ddl::Unless { then, .. } | Ddl::Replacing { then, .. } => expect_in(then, expect),
+        _ => false,
+    }
+}
+
 /// A view's query with its column list (`CREATE VIEW v (a, b) AS …`, TPC-H q15's form) given to
 /// its outputs: the select list's items renamed, so a materialized view keeps the shape `views.rs`
 /// reads; a query whose outputs can't be renamed one by one (`*`, `VALUES`) is put in a subquery
@@ -475,17 +489,20 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             _ => wrong(),
         });
     }
+    // A view's key facts in its list, and ALTER VIEW … ADD | DROP CONSTRAINT (ADR-065 §2), which the parser doesn't take.
+    if let Some(s) = crate::facts::parse(sql) {
+        return Some(s);
+    }
     // CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…) ON VIOLATION DROP ROW, …): its
     // expectations (ADR-036 §2), which the parser doesn't take.
     match crate::views::constraints(sql) {
         Ok(Some((rest, expect))) => {
+            let expect = serde_json::to_string(&expect).unwrap_or_default();
             return Some(match parse(&rest) {
-                Some(Stmt::Ddl(mut d)) if matches!(d[..], [Ddl::CreateMaterialized { .. }]) => {
-                    if let Some(Ddl::CreateMaterialized { options, .. }) = d.first_mut() {
-                        options.insert("expect".into(), serde_json::to_string(&expect).unwrap_or_default());
-                    }
-                    Stmt::Ddl(d)
-                }
+                Some(Stmt::Ddl(mut d)) if d.len() == 1 => match expect_in(&mut d[0], &expect) {
+                    true => Stmt::Ddl(d),
+                    false => Stmt::Invalid("CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…)) AS SELECT …".into()),
+                },
                 other => other.unwrap_or_else(|| Stmt::Invalid("CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…)) AS SELECT …".into())),
             });
         }
@@ -732,7 +749,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         }
         Statement::CreateView(v) if v.or_replace && v.if_not_exists => Stmt::Invalid("CREATE OR REPLACE VIEW … IF NOT EXISTS: one or the other".into()),
         Statement::CreateView(v) if v.temporary => Stmt::TempView(object(&v.name), view_sql(&v), v.or_replace, v.if_not_exists), // (the session's: `temp.rs`)
-        Statement::CreateView(v) => Stmt::Ddl(vec![unless(v.if_not_exists, &object(&v.name), "relation", Ddl::CreateView { name: object(&v.name), sql: view_sql(&v), replace: v.or_replace })]),
+        Statement::CreateView(v) => Stmt::Ddl(vec![unless(v.if_not_exists, &object(&v.name), "relation", Ddl::CreateView { name: object(&v.name), sql: view_sql(&v), replace: v.or_replace, facts: None })]),
         Statement::AttachDatabase { schema_name, database_file_name: ast::Expr::Value(v), .. } => match &v.value {
             ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir) => Stmt::Ddl(vec![Ddl::Attach { name: ident(&schema_name), dir: dir.clone(), read_only: false, endpoint: None }]),
             _ => return None,
@@ -1848,19 +1865,18 @@ async fn cli_key(lake: &Lake) -> Option<String> {
 }
 
 async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
-    let job = std::env::var("PONDRA_JOB").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
-    std::env::set_var("PONDRA_JOB", &job); // (if fenced, the process restarts: the same job again)
+    let job = job().to_string();
     // (A lake with no catalog yet can't be read: then the work is done once this process leads.)
     let (req, stmt, to) = match Lake::open(dir, false, false).await {
         Ok(lake) => {
             crate::ddl::sync(&lake, "", false).await?; // (lakes attached by ATTACH: read here too)
             let (other, table) = crate::ddl::resolve(&lake, &stmt.table()).await?;
             let (stmt, target) = (stmt.on(table.clone()), other.unwrap_or_else(|| lake.clone())); // (a write to an attached lake goes to its leader)
-            if ["PONDRA_TOKEN", "PONDRA_ADMIN_TOKEN", "PONDRA_NODE_KEY"].iter().all(|v| std::env::var(v).map_or(true, |t| t.is_empty())) {
+            if !crate::env::is_set("PONDRA_TOKEN") && !crate::env::is_set("PONDRA_ADMIN_TOKEN") && crate::cluster::node_key().is_none() {
                 // (no token: the lake's own key for its nodes, which whoever holds the lake can read; a
                 // leader on the network answers nothing unsigned. `cluster::http` sends it.)
                 if let Some(k) = cli_key(&target).await {
-                    std::env::set_var("PONDRA_NODE_KEY", k);
+                    crate::cluster::set_node_key(k);
                 }
             }
             (Some(prepare(&lake, &target, &table, &stmt, &job, true).await?), stmt, target.url.clone())
@@ -1917,7 +1933,7 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
                 }
                 let Some(Some(r)) = &req else { return Ok(j!({"duplicate": true})) };
                 // (test hook PONDRA_NO_DIRECT: act as if the leader were out of reach; `through_bucket` never goes over HTTP)
-                let direct = std::env::var("PONDRA_NO_DIRECT").is_err() && BUCKET.try_with(|_| ()).is_err();
+                let direct = !crate::env::is_set("PONDRA_NO_DIRECT") && BUCKET.try_with(|_| ()).is_err();
                 match if direct { Some(post(&t.addr, r).await) } else { None } {
                     Some(Ok(v)) => return summary(matches!(r, Request::Flush(_)), v),
                     Some(Err(e)) if !unreachable(&e) => return Err(e),
@@ -1939,7 +1955,7 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
                     // Another one-off writer took the catalog while this one was leading (both
                     // found the lake idle). Start over with the same job: whoever wins records it
                     // once, and the rest go through them.
-                    Err(e) if fenced(&e) && tries() < 5 => crate::cluster::restart("fenced while writing"),
+                    Err(e) if fenced(&e) && tries() < 5 => crate::cluster::restart_with("fenced while writing", &[("PONDRA_JOB", job.to_string()), ("PONDRA_TRIES", (tries() + 1).to_string())]),
                     r => r,
                 };
             }
@@ -2003,7 +2019,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
 /// records them with their lineage instead (the inbox, or no leader yet).
 pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
     let t = latest(&lake.store).await.ok()??;
-    if t.addr.is_empty() || !alive(&lake.store, &t).await || std::env::var_os("PONDRA_NO_DIRECT").is_some() {
+    if t.addr.is_empty() || !alive(&lake.store, &t).await || crate::env::is_set("PONDRA_NO_DIRECT") {
         return None;
     }
     crate::log::To::Leader(t.addr).reserve().await.ok()
@@ -2103,17 +2119,22 @@ fn fenced(e: &anyhow::Error) -> bool {
     e.downcast_ref::<slatedb::Error>().is_some_and(|e| matches!(e.kind(), slatedb::ErrorKind::Closed(_))) || format!("{e:#}").contains("newer DB client")
 }
 
-/// How many times this command has already started over (it re-runs itself, keeping `PONDRA_JOB`).
+/// How many times this command has already started over (it runs itself again, keeping its job).
 fn tries() -> u32 {
-    let n = std::env::var("PONDRA_TRIES").ok().and_then(|t| t.parse().ok()).unwrap_or(0);
-    std::env::set_var("PONDRA_TRIES", (n + 1).to_string());
-    n
+    crate::env::or("PONDRA_TRIES", 0)
+}
+
+/// This `pondra sql`'s job, the same for every statement it records: a run started over takes the
+/// job of the run before (`PONDRA_JOB`), so whoever wins the race records it once.
+fn job() -> &'static str {
+    static JOB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    JOB.get_or_init(|| crate::env::get("PONDRA_JOB").unwrap_or_else(|| uuid::Uuid::new_v4().to_string()))
 }
 
 /// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go.
 async fn lead(dir: &str, store: &Store, term: u64, req: Option<Option<Request>>, stmt: &Stmt, job: &str) -> Result<Value> {
     let s = store.clone();
-    let marks = tokio::spawn(async move {
+    let marks = crate::panics::task(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let _ = mark_alive(&s, term).await;

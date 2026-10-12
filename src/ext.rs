@@ -826,7 +826,7 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
     let secrets = list(lake).await?;
     let secret = covering(&secrets, url);
     let made_with = secret.as_ref().map_or("the node's own".to_string(), |(n, s)| format!("{n}:{}", s.sealed));
-    static MADE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+    crate::per_node!(static MADE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None));
     if MADE.lock().unwrap().get_or_insert_default().get(&root) == Some(&made_with) {
         return Ok(());
     }
@@ -1145,7 +1145,7 @@ pub async fn lent(lake: &Lake, urls: &[String]) -> Result<Vec<(String, Secret)>>
 /// The bearer token for a REST catalog, from the secret covering it: its TOKEN, or one its
 /// CLIENT_ID and CLIENT_SECRET get (OAuth's client credentials), kept until it expires.
 pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
-    static TOKENS: Mutex<Option<HashMap<String, (String, std::time::Instant)>>> = Mutex::new(None);
+    crate::per_node!(static TOKENS: Mutex<Option<HashMap<String, (String, std::time::Instant)>>> = Mutex::new(None));
     let Some((name, secret)) = covering(&list(lake).await?, url).filter(|(_, s)| s.kind == "iceberg") else { return Ok(None) };
     let p = open(&name, &secret)?;
     if let Some(t) = p.get("token") {
@@ -1637,9 +1637,10 @@ fn open_with(key: &[u8], sealed: &str) -> Option<Vec<u8>> {
     key.open_in_place(Nonce::try_assume_unique_for_key(nonce).ok()?, Aad::empty(), &mut data).ok().map(|p| p.to_vec())
 }
 
-/// Data keys unwrapped so far (by their wrapped form): a query using a secret again doesn't ask the
-/// key service again.
-static UNWRAPPED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<u8>>>> = std::sync::LazyLock::new(Default::default);
+crate::per_node!(
+    /// Data keys unwrapped so far (by their wrapped form): a query using a secret again doesn't ask the
+    /// key service again.
+    static UNWRAPPED: std::sync::Mutex<HashMap<String, Vec<u8>>> = Default::default());
 
 /// A data key wrapped by the master key: by `PONDRA_KMS_COMMAND wrap` (a key service: its key never
 /// leaves it), or sealed with the local master key (`PONDRA_SECRET_KEY`, else the admin token's, else
@@ -1665,7 +1666,7 @@ fn unwrap_key(wrapped: &str) -> Result<Vec<u8>> {
     Ok(key)
 }
 
-fn kms() -> Option<String> { std::env::var("PONDRA_KMS_COMMAND").ok().filter(|c| !c.trim().is_empty()) }
+fn kms() -> Option<String> { crate::env::get("PONDRA_KMS_COMMAND").filter(|c| !c.trim().is_empty()) }
 
 /// Run the key service's command (`<command> wrap|unwrap`, the input on stdin, the answer on stdout):
 /// `aws kms`, `gcloud kms`, `az keyvault key`, `vault write transit/…`, through a short script.
@@ -1683,7 +1684,7 @@ fn kms_run(cmd: &str, what: &str, input: &str) -> Result<String> {
 /// cluster with one has the same), or a key service? Never only this machine's own
 /// (`~/.pondra/secret.key`), which a node on another machine couldn't open with.
 pub fn shared_master() -> bool {
-    kms().is_some() || ["PONDRA_SECRET_KEY", "PONDRA_ADMIN_TOKEN"].iter().any(|v| std::env::var(v).is_ok_and(|k| !k.is_empty()))
+    kms().is_some() || crate::env::is_set("PONDRA_SECRET_KEY") || crate::env::is_set("PONDRA_ADMIN_TOKEN")
 }
 
 /// `plain` sealed with a data key of its own, which the master key wraps: (the sealed bytes, the
@@ -1731,10 +1732,10 @@ pub async fn rewrap(lake: &Lake) -> Result<usize> {
 /// cluster), else the admin token's (`admin_key`: every node of a cluster with one has it), else one
 /// made for this machine (`~/.pondra/secret.key`), enough for nodes that share it.
 fn master() -> Result<[u8; 32]> {
-    if let Some(k) = std::env::var("PONDRA_SECRET_KEY").ok().filter(|k| !k.is_empty()) {
+    if let Some(k) = crate::env::get("PONDRA_SECRET_KEY") {
         return Ok(sha256_of(&k));
     }
-    if let Some(t) = std::env::var("PONDRA_ADMIN_TOKEN").ok().filter(|t| !t.is_empty()) {
+    if let Some(t) = crate::env::get("PONDRA_ADMIN_TOKEN") {
         return Ok(admin_key(&t));
     }
     Ok(sha256_of(&machine_key()?))
@@ -1745,7 +1746,7 @@ fn master() -> Result<[u8; 32]> {
 /// one of them when a lake moved from it to `PONDRA_SECRET_KEY`; this machine's key only if an older
 /// release made it (`machine_key_if_made`).
 fn previous() -> Vec<[u8; 32]> {
-    let set = |var: &str| std::env::var(var).ok().filter(|k| !k.is_empty());
+    let set = crate::env::get;
     [
         set("PONDRA_SECRET_KEY_PREVIOUS").map(|k| sha256_of(&k)),
         set("PONDRA_ADMIN_TOKEN").map(|t| admin_key(&t)),
@@ -1765,9 +1766,9 @@ fn masters() -> Result<Vec<[u8; 32]>> {
 }
 
 /// The master key an admin token makes: PBKDF2 over the token, so a short token can't be guessed
-/// offline from what the bucket holds (the keys sealed by it). Worked out once a process per token.
+/// offline from what the bucket holds (the keys sealed by it). Worked out once a node per token.
 fn admin_key(token: &str) -> [u8; 32] {
-    static KEYS: std::sync::LazyLock<Mutex<HashMap<String, [u8; 32]>>> = std::sync::LazyLock::new(Default::default);
+    crate::per_node!(static KEYS: Mutex<HashMap<String, [u8; 32]>> = Mutex::new(HashMap::new()));
     if let Some(k) = KEYS.lock().unwrap().get(token) {
         return *k;
     }

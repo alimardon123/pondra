@@ -161,11 +161,27 @@ async fn view_parts(session: Option<&SessionContext>, l: &Lake, o: &Object, here
         None => vec![],
     };
     let comments = column_comments(l, &local).await?;
+    let stored = l.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(&local)).await?;
+    let measures: HashMap<String, String> = match &stored {
+        Some(v) => crate::measures::listed(&v.sql).into_iter().collect(), // (a view's measures are parts of their own, with their expressions)
+        None => HashMap::new(),
+    };
     let columns = columns.into_iter().filter(|(name, _)| partial.is_none_or(|cols| cols.contains(name)));
-    Ok(columns.map(|(name, ty)| {
+    let mut out: Vec<PartRow> = columns.map(|(name, ty)| {
         let comment = comments.get(&name).cloned();
-        part(o, "column", name, Some(ty), comment, None)
-    }).collect())
+        match measures.get(&name) {
+            Some(e) => part(o, "measure", name, Some(ty), comment, Some(e.clone())),
+            None => part(o, "column", name, Some(ty), comment, None),
+        }
+    }).collect();
+    // A view's key facts are listed as a table's are, unless a limited caller may not see the columns they name.
+    if partial.is_none() {
+        for c in stored.iter().flat_map(|v| &v.facts) {
+            let link = c.kind == crate::constraints::Kind::ForeignKey;
+            out.push(part(o, if link { "link" } else { "key" }, c.name.clone(), None, None, Some(c.def(&ident))));
+        }
+    }
+    Ok(out)
 }
 
 /// The name an object is reached by from this lake: its own name here, `lake.schema.name` in another.

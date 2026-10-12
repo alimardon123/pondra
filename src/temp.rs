@@ -103,7 +103,7 @@ pub struct Session {
     version: u64, // changes so far (`live.rs` watches them)
 }
 
-static SESSIONS: LazyLock<Mutex<HashMap<String, Session>>> = LazyLock::new(Default::default);
+crate::per_node!(static SESSIONS: Mutex<HashMap<String, Session>> = Default::default());
 static CHANGES: LazyLock<tokio::sync::watch::Sender<u64>> = LazyLock::new(|| tokio::sync::watch::channel(0).0);
 
 /// Any session's temporary tables or views changed (`live.rs` waits on it).
@@ -137,7 +137,7 @@ pub fn peek<T>(session: &str, f: impl FnOnce(&Session) -> Option<T>) -> Option<T
 
 /// How long a session may sit unused (`PONDRA_SESSION_IDLE_SECS`, 3600).
 fn idle() -> Duration {
-    Duration::from_secs(std::env::var("PONDRA_SESSION_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3600))
+    Duration::from_secs(crate::env::or("PONDRA_SESSION_IDLE_SECS", 3600))
 }
 
 /// Sessions idle for `PONDRA_SESSION_IDLE_SECS` end, as `end` ends them (a transaction rolled back,
@@ -388,7 +388,7 @@ async fn change(app: &App, s: &str, name: &str, stmt: &Stmt) -> Result<Value> {
 /// The table without the rows `gone` names, and with `new` (the table's columns, and the ids a
 /// changed row keeps): one change, within the memory temporary tables may take.
 fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<RecordBatch>) -> Result<()> {
-    static BUDGET: LazyLock<usize> = LazyLock::new(|| std::env::var("PONDRA_TEMP_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1024usize) << 20);
+    static BUDGET: LazyLock<usize> = LazyLock::new(|| crate::env::or("PONDRA_TEMP_MB", 1024usize) << 20);
     let others: usize = SESSIONS.lock().unwrap().iter().flat_map(|(k, x)| x.tables.iter().filter(move |(n, _)| k != s || *n != name)).map(|(_, t)| t.bytes()).sum();
     with(s, true, |x| {
         let t = x.tables.get_mut(name).with_context(|| format!("no temporary table {name}"))?;

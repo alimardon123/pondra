@@ -153,6 +153,7 @@ print(people.drop_nulls().rows(), people.drop_nulls(subset=["name"]).rows())
 | `group_by(...).agg(*aggs, **named)` | one row per key, with the aggregates. A string is SQL: `agg("sum(amount) AS s")` |
 | `group_by(...).len(name="len")` | the number of rows in each group |
 | `pondra.len()` | `count(*)`, for `agg` or `select` |
+| `pondra.measure(name)` | a view's measure, worked out at each group's own grain: `agg(pondra.measure("revenue"))` is `MEASURE(revenue)` |
 
 ```python
 print(orders.group_by("item").len().sort("item").rows())

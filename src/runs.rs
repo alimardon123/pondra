@@ -28,7 +28,7 @@ use datafusion::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringA
 use datafusion::sql::sqlparser::{keywords::Keyword, parser::Parser, tokenizer::Token};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 pub const TABLE: &str = "pondra$runs";
@@ -48,7 +48,7 @@ fn columns() -> Vec<(String, String)> {
 /// Leader: the run log's table, made the first time a node has a line for it (`Ddl::RunLog`).
 pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
     if lake.cat.get::<TableMeta>(&table_key(TABLE)).await?.is_none() {
-        let days: u64 = std::env::var("PONDRA_RUNS_DAYS").ok().and_then(|d| d.parse().ok()).unwrap_or(30);
+        let days: u64 = crate::env::or("PONDRA_RUNS_DAYS", 30);
         let meta = TableMeta { columns: columns(), key: vec!["id".into()], ttl: Some(("started".into(), days * 86400)), tiered: lake.visible(), ids: true, ..Default::default() };
         lake.cat.commit(vec![(table_key(TABLE), json(&meta))], &[]).await?;
     }
@@ -146,15 +146,15 @@ fn args_text(args: &RecordBatch) -> String {
 
 type Sent = (Line, Option<tokio::sync::oneshot::Sender<()>>);
 
-static WRITER: OnceLock<tokio::sync::mpsc::UnboundedSender<Sent>> = OnceLock::new();
+crate::per_node!(static WRITER: std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<Sent>>> = std::sync::RwLock::new(None));
 
 fn log(app: &App, line: Line, done: Option<tokio::sync::oneshot::Sender<()>>) {
     if app.log.is_none() {
         return; // (a read-only node writes nothing)
     }
-    let tx = WRITER.get_or_init(|| {
+    let tx = crate::reset::Once::get_or(&*WRITER, || {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        crate::panics::spawn(write(app.clone(), rx));
+        crate::history::keep(write(app.clone(), rx));
         tx
     });
     let _ = tx.send((line, done));
@@ -199,8 +199,10 @@ pub async fn wait(app: &App, id: &str) -> Result<()> {
 async fn write(app: App, mut rx: tokio::sync::mpsc::UnboundedReceiver<Sent>) {
     let producer = format!("runs-{}", new_id());
     let (mut seq, mut made) = (0, false);
-    while let Some((first, done)) = rx.recv().await {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    while let Some((first, done)) = crate::history::next(&mut rx).await {
+        if !crate::history::ending() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let (mut lines, mut dones) = (vec![first], vec![done]);
         while let Ok((l, done)) = rx.try_recv() {
             lines.retain(|x: &Line| x.id != l.id);
@@ -634,8 +636,8 @@ pub async fn drop_task(lake: &Lake, name: &str, if_exists: bool) -> Result<serde
 
 /// This lake's tasks, read again only after a commit.
 pub(crate) async fn tasks(lake: &Lake) -> Result<Arc<Vec<(String, Task)>>> {
-    static SEEN: OnceLock<Mutex<HashMap<String, (u64, Arc<Vec<(String, Task)>>)>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(Default::default);
+    crate::per_node!(static SEEN: Mutex<HashMap<String, (u64, Arc<Vec<(String, Task)>>)>> = Mutex::new(HashMap::new()));
+    let seen = &*SEEN;
     let version = lake.cat.version();
     if let (Some(v), Some((at, all))) = (version, seen.lock().unwrap().get(&lake.url)) {
         if *at == v {
@@ -682,7 +684,7 @@ pub fn schedule(app: App) {
                 running.lock().unwrap().insert(name.clone());
                 let (app, name, task) = (app.clone(), name.clone(), task.clone());
                 let ran = Ran(running.clone(), name.clone()); // (let go even if the tick panics: else it never ran again here)
-                tokio::spawn(async move {
+                crate::panics::task(async move {
                     run_tick(&app, &name, &task, tick).await;
                     drop(ran);
                 });

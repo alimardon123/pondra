@@ -1141,7 +1141,7 @@ async fn commit(app: &crate::server::App, lake: &std::sync::Arc<Lake>, commits: 
         match (e.contains(CONFLICT), e.contains(REFUSED)) {
             (true, _) => {
                 let lake = lake.clone();
-                tokio::spawn(async move { futures::future::join_all(files.iter().map(|f| lake.delete(f))).await }); // (never recorded)
+                crate::panics::task(async move { futures::future::join_all(files.iter().map(|f| lake.delete(f))).await }); // (never recorded)
                 conflict(e)
             }
             (_, true) => bad(e),

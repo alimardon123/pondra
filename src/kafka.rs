@@ -22,6 +22,7 @@
 use crate::auth::Role;
 use crate::log::{Ack, Src};
 use crate::query::schema;
+use crate::reset::Once;
 use crate::server::App;
 use crate::store::{seg_key, table_key, Segment, TableMeta};
 use anyhow::{anyhow, bail, ensure, Result};
@@ -101,10 +102,10 @@ pub async fn serve(app: App, addr: String, advertise: String) -> Result<()> {
     let (host, port) = advertise.rsplit_once(':').ok_or_else(|| anyhow!("--kafka-advertise is host:port"))?;
     let id = (advertise.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) & 0x7fff_ffff) as i32; // stable per address
     let me = Arc::new(Broker { id, host: host.into(), port: port.parse()? });
-    let _ = ME.set(serde_json::json!({"id": me.id, "host": me.host, "port": me.port}));
+    ME.set_once(serde_json::json!({"id": me.id, "host": me.host, "port": me.port}));
     while let Some((socket, _)) = doors.next().await {
         let (app, me) = (app.clone(), me.clone());
-        tokio::spawn(async move { conn(app, me, socket).await.map_err(|e| eprintln!("kafka client: {e:#}")) });
+        crate::panics::task(async move { conn(app, me, socket).await.map_err(|e| eprintln!("kafka client: {e:#}")) });
     }
     Ok(())
 }
@@ -118,7 +119,7 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
     let from = Some(peer.addr);
     let (mut rd, mut wr) = tokio::io::split(socket);
     let (tx, mut rx) = mpsc::channel::<Reply>(64);
-    let writer = tokio::spawn(async move {
+    let writer = crate::panics::task(async move {
         while let Some(reply) = rx.recv().await {
             if let Some(frame) = reply.await {
                 wr.write_all(&frame).await?;
@@ -1024,9 +1025,9 @@ fn now_ms() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX
 // (`kafka-group:{group}:{topic}` = offset + 1), written through the log like any append, so they
 // survive a change of leader (members then just join again).
 
-static GROUPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Group>>> = std::sync::LazyLock::new(Default::default);
-static ME: std::sync::OnceLock<Value> = std::sync::OnceLock::new(); // this node's broker, for `/cluster/kafka`
-static COORDINATOR: tokio::sync::OnceCell<(i32, String, i32)> = tokio::sync::OnceCell::const_new();
+crate::per_node!(static GROUPS: std::sync::Mutex<std::collections::HashMap<String, Group>> = Default::default());
+crate::per_node!(static ME: std::sync::RwLock<Option<Value>> = std::sync::RwLock::new(None)); // this node's broker, for `/cluster/kafka`
+crate::per_node!(static COORDINATOR: std::sync::RwLock<Option<(i32, String, i32)>> = std::sync::RwLock::new(None));
 
 const COORDINATOR_NOT_AVAILABLE: i16 = 15;
 const NOT_COORDINATOR: i16 = 16;
@@ -1035,7 +1036,7 @@ const UNKNOWN_MEMBER_ID: i16 = 25;
 const REBALANCE_IN_PROGRESS: i16 = 27;
 
 /// This node as a Kafka broker (the leader's is where followers send group requests).
-pub fn me() -> Value { ME.get().cloned().unwrap_or(Value::Null) }
+pub fn me() -> Value { ME.current().unwrap_or(Value::Null) }
 
 #[derive(Default)]
 struct Group {
@@ -1077,7 +1078,7 @@ impl Group {
         (self.joining, self.synced, self.round) = (true, false, self.round + 1);
         self.members.values_mut().for_each(|m| m.joined = false);
         let (group, round, start) = (group.to_string(), self.round, std::time::Instant::now());
-        tokio::spawn(async move {
+        crate::panics::task(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 let mut groups = GROUPS.lock().unwrap();
@@ -1135,7 +1136,16 @@ async fn find_coordinator(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Resul
     let transactions = ver >= 1 && r.i8()? == 1;
     let coordinator = match app.seq.is_some() {
         true => Some((me.id, me.host.clone(), me.port)),
-        false => COORDINATOR.get_or_try_init(|| leader_broker(app)).await.ok().cloned(),
+        false => match COORDINATOR.current() {
+            Some(c) => Some(c),
+            None => {
+                let found = leader_broker(app).await.ok();
+                if let Some(c) = &found {
+                    COORDINATOR.set_once(c.clone());
+                }
+                found
+            }
+        },
     };
     let mut w = vec![];
     if ver >= 1 {
