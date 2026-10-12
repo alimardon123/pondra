@@ -2130,10 +2130,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`node.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
    serves, it drains, makes what it committed durable, checkpoints, ends what it started
    (`panics::abort_all`), closes its catalog and steps down. Stopped while it starts, it gives its
-   term back without the durable wait. Either way the next node on the lake leads at once. The
-   command line is a caller of `Node`, never a second copy of it. `tools/node_check.py`: "a node
-   stopped once it serves gives its term back…" and "a node stopped while it starts gives its term
-   back too" (both ready in under 5 s; a kept term makes the next node wait out the 30 s lease).
+   term back without the durable wait. Either way the next node on the lake leads at once. A write
+   that meets the catalog its own stop closed fails, and is never taken for a fence
+   (`Catalog::fenced`): restarting there led the term again, and the followers waited out the lease
+   (`upgrade_check.py rolling`: a batch waited 5.8 s on #100's CI). The command line is a caller of
+   `Node`, never a second copy of it. `tools/node_check.py`: "a node stopped once it serves gives
+   its term back…" and "a node stopped while it starts gives its term back too" (both ready in
+   under 5 s; a kept term makes the next node wait out the 30 s lease).
 
 301. **A node stopped in a process leaves nothing of itself in it** (`reset.rs`, ADR-061 §3): every
    static that holds a node's or a lake's state is `per_node!`, set back by `reset()` when

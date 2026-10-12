@@ -1334,6 +1334,7 @@ pub struct Catalog {
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
     metas: Mutex<lru::LruCache<String, (u64, Arc<TableMeta>)>>, // tables' entries as parsed, by the commit that wrote them (`meta`)
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
+    closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
 }
 
 /// A scan in progress: the streamed changes it may still lay over its (older) view stay.
@@ -1675,7 +1676,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))), frozen: Default::default() }
+        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))), frozen: Default::default(), closing: Default::default() }
     }
 
     /// Leader: the recent frames plus a receiver for every frame from now on.
@@ -1927,10 +1928,10 @@ impl Catalog {
         Ok(match &self.db {
             // The leader answers from its in-memory catalog: committed writes only, never ones
             // in flight. Inline segment data is only asked for once its segment is committed.
-            Db_::Writer(db) if key.starts_with("d/") => db.get(key).await.map_err(fatal)?,
+            Db_::Writer(db) if key.starts_with("d/") => db.get(key).await.map_err(|e| self.fenced(e))?,
             Db_::Writer(db) => match self.mirror.load(Relaxed) {
                 true => self.overlay.lock().unwrap().get(key).and_then(|(_, v)| v.clone()),
-                false => db.get_with_options(key, &ReadOptions::new().with_durability_filter(DurabilityLevel::Remote)).await.map_err(fatal)?,
+                false => db.get_with_options(key, &ReadOptions::new().with_durability_filter(DurabilityLevel::Remote)).await.map_err(|e| self.fenced(e))?,
             },
             Db_::Reader(r) => {
                 let inline = key.starts_with("d/");
@@ -1968,7 +1969,7 @@ impl Catalog {
         let range = from.as_bytes().to_vec()..to.as_bytes().to_vec();
         let decode = |all: BTreeMap<String, Bytes>| -> Result<BTreeMap<String, Bytes>> { Ok(all) };
         let r = match &self.db {
-            Db_::Writer(db) if !self.mirror.load(Relaxed) => return decode(collect(db.scan_with_options(range, &ScanOptions::new().with_durability_filter(DurabilityLevel::Remote)).await.map_err(fatal)?).await?),
+            Db_::Writer(db) if !self.mirror.load(Relaxed) => return decode(collect(db.scan_with_options(range, &ScanOptions::new().with_durability_filter(DurabilityLevel::Remote)).await.map_err(|e| self.fenced(e))?).await?),
             Db_::Writer(_) => None,
             Db_::Reader(r) => Some(r),
         };
@@ -2024,6 +2025,7 @@ impl Catalog {
     /// Lets go of the catalog: its writer flushes what it holds and stops its background tasks, a
     /// reader its polling (`Node::stop`, ADR-061 §4: one process may open another lake after it).
     pub async fn close(&self) -> Result<()> {
+        self.closing.store(true, Relaxed);
         if let Some(upkeep) = &self.upkeep {
             upkeep.stop().await;
         }
@@ -2065,7 +2067,7 @@ impl Catalog {
         let mut id = self.order.lock().await;
         let c = ("c".to_string(), Bytes::from(json(&*id)));
         batch.put(&c.0, &c.1);
-        let handle = db.write(batch).await.map_err(fatal)?;
+        let handle = db.write(batch).await.map_err(|e| self.fenced(e))?;
         if let Some((_, v)) = puts.iter().find(|(k, _)| k == "n") {
             self.last_n.store(serde_json::from_slice(v)?, Relaxed);
         }
@@ -2077,6 +2079,18 @@ impl Catalog {
     }
 }
 
+
+impl Catalog {
+    /// `fatal`, unless this node's own stop closed the catalog: then the write or read in flight
+    /// fails and the stop goes on to give up the term. Restarting there led the term again, and its
+    /// followers waited out the lease (`upgrade_check.py rolling`: a batch waited 5.8 s).
+    fn fenced(&self, e: slatedb::Error) -> anyhow::Error {
+        if self.closing.load(Relaxed) {
+            return e.into();
+        }
+        fatal(e)
+    }
+}
 
 /// A writer that was fenced out (a new leader took over) must stop at once: it restarts and
 /// rejoins the cluster as a follower.
