@@ -6266,6 +6266,18 @@ def hot():
                 q(ask + f" -- warm {run}")
         held = hot_settled(A.port)
         checks["the table's columns are in memory"] = held > 0
+        # In memory a filter is sized from the files' ranges, as it is on disk (`hot::Known`): a
+        # range of 500 of the 200,000 seconds keeps about 500 rows, not every row.
+        physical = {r["plan_type"]: r["plan"] for r in q("EXPLAIN " + asks["a range of the time"][0])}.get("physical_plan", "")
+        expected = [int(m) for m in re.findall(r"FilterExec:.*?expected_rows=(\d+)", physical)]
+        seen["a range of the time, as planned"] = expected
+        checks["a range of the time is sized from the files' ranges (a few hundred rows expected, not all)"] = bool(expected) and max(expected) < 5000
+        # …and a string equal to a value from the table's distinct counts (`sketch.rs`): one of
+        # 200,000 values keeps a row or so, not a fifth of them.
+        physical = {r["plan_type"]: r["plan"] for r in q("EXPLAIN SELECT i FROM ev WHERE s = 'r5'")}.get("physical_plan", "")
+        expected = [int(m) for m in re.findall(r"FilterExec:.*?expected_rows=(\d+)", physical)]
+        seen["a string equal to a value, as planned"] = expected
+        checks["a string equal to a value is sized from the table's distinct counts (a few rows expected, not a fifth)"] = bool(expected) and max(expected) < 100
         for name, (ask, want, skips) in asks.items():
             before = skipped()
             got = q(ask)

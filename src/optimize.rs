@@ -638,7 +638,9 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     for r in rules.iter_mut().filter(|r| r.name() == "ProjectionPushdown") {
         *r = Arc::new(GuardedPushdown(r.clone()));
     }
-    let at = rules.iter().position(|r| r.name() == "join_selection").map_or(0, |i| i + 1);
+    let sides = rules.iter().position(|r| r.name() == "join_selection").unwrap_or(0);
+    rules.insert(sides, Arc::new(FilterShares)); // (the joins' sides are picked by their inputs' sizes)
+    let at = sides + 2;
     rules.insert(at, Arc::new(HavingBuilds));
     rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
     let end = rules.iter().position(|r| r.name() == "SanityCheckPlan").unwrap_or(rules.len());
@@ -673,6 +675,113 @@ impl PhysicalOptimizerRule for GuardedPushdown {
 
     fn schema_check(&self) -> bool {
         self.0.schema_check()
+    }
+}
+
+/// A filter whose condition DataFusion can't size (an OR, an IN list, a string equal to a value,
+/// LIKE, a function: its interval analysis takes none of them) keeps the share Pondra counts for it
+/// (`share`), as the join order does, in place of DataFusion's fifth. The joins then build on the
+/// side that is smaller: TPC-H q12 built its hash table on 1.5M orders, its other side the 31K
+/// lineitems an OR of ship modes leaves. A filter none of whose columns' counts or ranges are known
+/// keeps DataFusion's fifth. It runs just before DataFusion picks the joins' sides, and a share
+/// under 1% counts as 1%, the least a filter's estimate can say.
+#[derive(Debug)]
+struct FilterShares;
+
+impl PhysicalOptimizerRule for FilterShares {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_expr::intervals::utils::check_support;
+        use datafusion::physical_plan::filter::FilterExecBuilder;
+        use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+        plan.transform_up(|p| {
+            let Some(f) = p.downcast_ref::<FilterExec>() else { return Ok(Transformed::no(p)) };
+            if check_support(f.predicate(), &f.input().schema()) {
+                return Ok(Transformed::no(p)); // (DataFusion sizes it from its columns' ranges)
+            }
+            let stats = StatisticsContext::new().compute(f.input().as_ref(), &StatisticsArgs::new())?;
+            let conds = conds(f.predicate());
+            let kept = share(stats.as_ref(), &conds);
+            if kept == share(&Blind, &conds) {
+                return Ok(Transformed::no(p)); // (nothing known of its columns: DataFusion's guess stands, as before)
+            }
+            let percent = (kept * 100.0).round().clamp(1.0, 100.0) as u8;
+            if percent == f.default_selectivity() {
+                return Ok(Transformed::no(p));
+            }
+            Ok(Transformed::yes(Arc::new(FilterExecBuilder::from(f).with_default_selectivity(percent).build()?) as Arc<dyn ExecutionPlan>))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "FilterShares"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// Facts of nothing: what `share` keeps of a filter none of whose columns it knows.
+struct Blind;
+
+impl Facts<usize> for Blind {
+    fn rows(&self) -> u64 { 0 }
+    fn distinct(&self, _: &usize) -> Option<u64> { None }
+    fn span(&self, _: &usize) -> Option<(f64, f64)> { None }
+}
+
+impl Facts<usize> for datafusion::common::Statistics {
+    fn rows(&self) -> u64 { self.num_rows.get_value().map_or(0, |&n| n as u64) }
+    fn distinct(&self, k: &usize) -> Option<u64> { self.column_statistics.get(*k)?.distinct_count.get_value().map(|&n| n as u64) }
+    fn span(&self, k: &usize) -> Option<(f64, f64)> {
+        let c = self.column_statistics.get(*k)?;
+        Some((number(c.min_value.get_value()?)?, number(c.max_value.get_value()?)?))
+    }
+}
+
+/// A physical filter's conditions as the estimates count them, as `cond` counts a logical one's.
+fn conds(e: &Arc<dyn PhysicalExpr>) -> Vec<Cond<usize>> {
+    datafusion::physical_expr::split_conjunction(e).into_iter().map(physical_cond).collect()
+}
+
+fn physical_cond(e: &Arc<dyn PhysicalExpr>) -> Cond<usize> {
+    use datafusion::physical_expr::expressions::{BinaryExpr, CastExpr, InListExpr, Literal, NotExpr};
+    fn column(e: &Arc<dyn PhysicalExpr>) -> Option<usize> {
+        match e.downcast_ref::<PhysicalColumn>() {
+            Some(c) => Some(c.index()),
+            None => column(e.downcast_ref::<CastExpr>()?.expr()),
+        }
+    }
+    fn value(e: &Arc<dyn PhysicalExpr>) -> Option<&datafusion::common::ScalarValue> {
+        e.downcast_ref::<Literal>().map(|l| l.value())
+    }
+    if let Some(b) = e.downcast_ref::<BinaryExpr>() {
+        if *b.op() == Operator::Or {
+            return Cond::Any(datafusion::physical_expr::utils::split_disjunction(e).into_iter().map(conds).collect());
+        }
+        let (c, v, op) = match (column(b.left()), value(b.right()), column(b.right()), value(b.left())) {
+            (Some(c), Some(v), ..) => (c, v, *b.op()),
+            (.., Some(c), Some(v)) => match b.op().swap() {
+                Some(op) => (c, v, op),
+                None => return Cond::Other,
+            },
+            _ => return Cond::Other,
+        };
+        return match op {
+            Operator::Eq => Cond::Equal(c),
+            Operator::NotEq => Cond::Not(vec![Cond::Equal(c)]),
+            op => number(v).and_then(|v| bounds(op, v)).map_or(Cond::Other, |(lo, hi)| Cond::Bound(c, lo, hi)),
+        };
+    }
+    if let Some(l) = e.downcast_ref::<InListExpr>() {
+        let (Some(c), true) = (column(l.expr()), l.list().iter().all(|v| value(v).is_some())) else { return Cond::Other };
+        let within = Cond::Within(c, l.list().len());
+        return if l.negated() { Cond::Not(vec![within]) } else { within };
+    }
+    match e.downcast_ref::<NotExpr>() {
+        Some(n) => Cond::Not(conds(n.arg())),
+        None => Cond::Other,
     }
 }
 
@@ -792,18 +901,30 @@ fn bounds_whole(a: &AggregateExec) -> bool {
 }
 
 /// `x IN (SELECT k … GROUP BY k HAVING …)`: the few groups a HAVING keeps are the hash table, the
-/// table probes it. (Statistics can't tell how many groups a HAVING keeps, and DataFusion's guess,
-/// a fifth of the input, has it build on the table instead: 1.5 million orders, for 57 keys.)
+/// table probes it, and the rows that pass are few too, so a join above them builds on them whole
+/// rather than shuffling its other side. (Statistics can't tell how many groups a HAVING keeps:
+/// DataFusion takes all of them, so it built on the table instead, 1.5 million orders for 57 keys,
+/// and once a table's ranges said each order has its customer, shuffled 6 million lineitems to
+/// join the 57 orders' customers.)
 #[derive(Debug)]
 struct HavingBuilds;
 
 impl PhysicalOptimizerRule for HavingBuilds {
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_plan::joins::PartitionMode;
         plan.transform_up(|p| {
-            if let Some(j) = p.downcast_ref::<HashJoinExec>() {
-                if matches!(j.join_type(), JoinType::LeftSemi | JoinType::LeftAnti) && !j.null_aware && having(j.right()) && !having(j.left()) {
-                    return Ok(Transformed::yes(j.swap_inputs(*j.partition_mode())?));
-                }
+            let Some(j) = p.downcast_ref::<HashJoinExec>() else { return Ok(Transformed::no(p)) };
+            if matches!(j.join_type(), JoinType::LeftSemi | JoinType::LeftAnti) && !j.null_aware && having(j.right()) && !having(j.left()) {
+                return Ok(Transformed::yes(j.swap_inputs(*j.partition_mode())?));
+            }
+            if *j.join_type() != JoinType::Inner || *j.partition_mode() != PartitionMode::Partitioned {
+                return Ok(Transformed::no(p));
+            }
+            if few(j.left()) {
+                return Ok(Transformed::yes(j.builder().with_partition_mode(PartitionMode::CollectLeft).build_exec()?));
+            }
+            if few(j.right()) {
+                return Ok(Transformed::yes(j.swap_inputs(PartitionMode::CollectLeft)?));
             }
             Ok(Transformed::no(p))
         })
@@ -816,6 +937,26 @@ impl PhysicalOptimizerRule for HavingBuilds {
 
     fn schema_check(&self) -> bool {
         true
+    }
+}
+
+/// Does `p` give only the rows a HAVING's semi join let through (`having`), joined to no more than
+/// one row each (DataFusion's estimate of a join no bigger than that side's)?
+fn few(p: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    let rows = |p: &Arc<dyn ExecutionPlan>| StatisticsContext::new().compute(p.as_ref(), &StatisticsArgs::new()).ok().and_then(|s| s.num_rows.get_value().copied());
+    if let Some(j) = p.downcast_ref::<HashJoinExec>() {
+        return match j.join_type() {
+            JoinType::LeftSemi => having(j.right()) || few(j.left()),
+            JoinType::RightSemi => having(j.left()) || few(j.right()),
+            JoinType::Inner => [j.left(), j.right()].into_iter().any(|side| few(side) && matches!((rows(p), rows(side)), (Some(out), Some(rows)) if out <= rows)),
+            _ => false,
+        };
+    }
+    let passes = p.downcast_ref::<FilterExec>().is_some() || p.downcast_ref::<ProjectionExec>().is_some() || p.downcast_ref::<CoalescePartitionsExec>().is_some() || p.downcast_ref::<RepartitionExec>().is_some();
+    match p.children()[..] {
+        [c] if passes => few(c),
+        _ => false,
     }
 }
 
@@ -1341,68 +1482,135 @@ fn connect(keys: &[(Expr, Expr)], left: &DFSchema, right: &DFSchema) -> Result<V
     Ok(on)
 }
 
+/// A filter's condition as the estimates count it, whether it comes from a logical plan's
+/// expressions (`kept`, for the join order) or a physical plan's (`FilterShares`, for the joins'
+/// sides), so both count a filter alike. `K` names a column: by name in a logical plan, by its
+/// place in a physical one.
+#[derive(Debug, Clone, PartialEq)]
+enum Cond<K> {
+    Bound(K, f64, f64),     // (the column between these values, either end open)
+    Equal(K),               // (the column is one value)
+    Within(K, usize),       // (the column is one of so many values)
+    Any(Vec<Vec<Cond<K>>>), // (one of these conjunctions holds: an OR)
+    Not(Vec<Cond<K>>),      // (this conjunction doesn't hold)
+    Other,
+}
+
+/// What an estimate knows of a filter's input: its rows, and each column's distinct values and
+/// least and greatest value (as numbers: `number`).
+trait Facts<K> {
+    fn rows(&self) -> u64;
+    fn distinct(&self, k: &K) -> Option<u64>;
+    fn span(&self, k: &K) -> Option<(f64, f64)>;
+}
+
 /// The share of its rows a filter's conditions keep. `column = value` keeps one of the column's
 /// distinct values and `column IN (…)` as many as it lists; ranges on a column whose least and
-/// greatest values the catalog knows keep the part of that span they leave, both ends of one column
-/// together (a month of dates is a month of the table's years, not a quarter of them). Anything else
-/// keeps about a third. A third for every condition made a month of TPC-DS's dates look like a
-/// tenth of them, so its joins started from the sales instead.
-fn kept(s: &Size, conds: &[&Expr]) -> f64 {
+/// greatest values are known keep the part of that span they leave, both ends of one column
+/// together (a month of dates is a month of the table's years, not a quarter of them). An OR keeps
+/// what any of its sides keeps, a NOT what its side leaves. Anything else keeps about a third. A
+/// third for every condition made a month of TPC-DS's dates look like a tenth of them, so its joins
+/// started from the sales instead.
+fn share<K: Clone + Eq + std::hash::Hash>(facts: &impl Facts<K>, conds: &[Cond<K>]) -> f64 {
     const THIRD: f64 = 0.3;
+    let (mut share, mut left) = (1.0, std::collections::HashMap::<K, (f64, f64)>::new());
+    for c in conds {
+        share *= match c {
+            Cond::Bound(k, lo, hi) => match facts.span(k) {
+                Some(span) => {
+                    let b = left.entry(k.clone()).or_insert(span);
+                    *b = (b.0.max(*lo), b.1.min(*hi));
+                    continue;
+                }
+                None => THIRD,
+            },
+            Cond::Equal(k) => facts.distinct(k).map_or(THIRD, |d| 1.0 / d.max(1) as f64),
+            Cond::Within(k, n) => facts.distinct(k).map_or(THIRD, |d| (*n as f64 / d.max(1) as f64).min(1.0)),
+            Cond::Any(sides) => 1.0 - sides.iter().map(|s| 1.0 - self::share(facts, s)).product::<f64>(),
+            Cond::Not(side) => 1.0 - self::share(facts, side),
+            Cond::Other => THIRD,
+        };
+    }
+    for (k, (lo, hi)) in left {
+        let Some((min, max)) = facts.span(&k) else { continue };
+        let least = 1.0 / facts.distinct(&k).unwrap_or(facts.rows()).max(1) as f64; // (one value, at the least)
+        share *= if max > min { ((hi - lo) / (max - min)).clamp(least, 1.0) } else { 1.0 };
+    }
+    share
+}
+
+/// The bounds `column op value` leaves the column: `op` as written with the column on the left.
+fn bounds(op: Operator, v: f64) -> Option<(f64, f64)> {
+    let (inf, sup) = (f64::NEG_INFINITY, f64::INFINITY);
+    match op {
+        Operator::Gt | Operator::GtEq => Some((v, sup)),
+        Operator::Lt | Operator::LtEq => Some((inf, v)),
+        _ => None,
+    }
+}
+
+impl Facts<String> for Size {
+    fn rows(&self) -> u64 { self.rows }
+    fn distinct(&self, k: &String) -> Option<u64> { self.distinct.get(k).copied() }
+    fn span(&self, k: &String) -> Option<(f64, f64)> { self.spans.get(k).copied() }
+}
+
+/// The share of its rows a logical filter's conditions keep (`share`).
+fn kept(s: &Size, conds: &[&Expr]) -> f64 {
+    share(s, &conds.iter().map(|e| cond(e)).collect::<Vec<_>>())
+}
+
+/// A logical plan's condition as the estimates count it.
+fn cond(e: &Expr) -> Cond<String> {
     fn literal(e: &Expr) -> Option<f64> {
         match e {
             Expr::Literal(v, _) => number(v),
             _ => None,
         }
     }
-    fn column(e: &Expr) -> Option<&str> {
+    fn column(e: &Expr) -> Option<String> {
         match e {
-            Expr::Column(c) => Some(c.name.as_str()),
+            Expr::Column(c) => Some(c.name.clone()),
+            Expr::Alias(a) => column(&a.expr),
             Expr::Cast(c) => column(&c.expr),
             _ => None,
         }
     }
-    // A condition that bounds a column from below or above: the column, and the bounds it leaves.
-    fn bound(e: &Expr) -> Option<(&str, f64, f64)> {
-        let (inf, sup) = (f64::NEG_INFINITY, f64::INFINITY);
-        match e {
-            Expr::Between(b) if !b.negated => Some((column(&b.expr)?, literal(&b.low)?, literal(&b.high)?)),
-            Expr::BinaryExpr(b) => {
-                let (c, v, op) = match (column(&b.left), literal(&b.right)) {
-                    (Some(c), Some(v)) => (c, v, b.op),
-                    _ => (column(&b.right)?, literal(&b.left)?, b.op.swap()?),
-                };
-                match op {
-                    Operator::Gt | Operator::GtEq => Some((c, v, sup)),
-                    Operator::Lt | Operator::LtEq => Some((c, inf, v)),
-                    _ => None,
-                }
+    let all = |e: &Expr| split_conjunction(e).into_iter().map(cond).collect::<Vec<_>>();
+    match e {
+        Expr::Between(b) => match (column(&b.expr), literal(&b.low), literal(&b.high)) {
+            (Some(c), Some(lo), Some(hi)) if !b.negated => Cond::Bound(c, lo, hi),
+            (Some(c), Some(lo), Some(hi)) => Cond::Not(vec![Cond::Bound(c, lo, hi)]),
+            _ => Cond::Other,
+        },
+        Expr::BinaryExpr(b) if b.op == Operator::Or => Cond::Any(split_binary(e, Operator::Or).into_iter().map(all).collect()),
+        Expr::BinaryExpr(b) => {
+            let is_value = |e: &Expr| matches!(e, Expr::Literal(..));
+            let (c, v, op) = match (column(&b.left), &*b.right, b.op.swap()) {
+                (Some(c), r, _) if is_value(r) => (c, &*b.right, b.op),
+                (_, _, Some(op)) if is_value(&b.left) => match column(&b.right) {
+                    Some(c) => (c, &*b.left, op),
+                    None => return Cond::Other,
+                },
+                _ => return Cond::Other,
+            };
+            match op {
+                Operator::Eq => Cond::Equal(c),
+                Operator::NotEq => Cond::Not(vec![Cond::Equal(c)]),
+                op => match literal(v).and_then(|v| bounds(op, v)) {
+                    Some((lo, hi)) => Cond::Bound(c, lo, hi),
+                    None => Cond::Other,
+                },
             }
-            _ => None,
         }
+        Expr::InList(l) if l.list.iter().all(|v| matches!(v, Expr::Literal(..))) => match column(&l.expr) {
+            Some(c) if l.negated => Cond::Not(vec![Cond::Within(c, l.list.len())]),
+            Some(c) => Cond::Within(c, l.list.len()),
+            None => Cond::Other,
+        },
+        Expr::Not(inner) => Cond::Not(all(inner)),
+        _ => Cond::Other,
     }
-    let (mut share, mut left) = (1.0, std::collections::HashMap::<&str, (f64, f64)>::new());
-    for e in conds {
-        if let Some((c, lo, hi)) = bound(e).filter(|(c, ..)| s.spans.contains_key(*c)) {
-            let b = left.entry(c).or_insert(s.spans[c]);
-            *b = (b.0.max(lo), b.1.min(hi));
-            continue;
-        }
-        share *= match e {
-            Expr::BinaryExpr(b) if b.op == Operator::Eq && (literal(&b.left).is_some() || literal(&b.right).is_some()) => {
-                let other = if literal(&b.right).is_some() { &b.left } else { &b.right };
-                s.of(other).map_or(THIRD, |d| 1.0 / d.max(1) as f64)
-            }
-            Expr::InList(l) if !l.negated && l.list.iter().all(|v| literal(v).is_some()) => s.of(&l.expr).map_or(THIRD, |d| (l.list.len() as f64 / d.max(1) as f64).min(1.0)),
-            _ => THIRD,
-        };
-    }
-    for (c, (lo, hi)) in left {
-        let (min, max) = s.spans[c];
-        let least = 1.0 / s.distinct.get(c).copied().unwrap_or(s.rows).max(1) as f64; // (one value, at the least)
-        share *= if max > min { ((hi - lo) / (max - min)).clamp(least, 1.0) } else { 1.0 };
-    }
-    share
 }
 
 /// A value as a number on its column's own scale (dates in days, times in seconds), for spans.
@@ -1497,6 +1705,44 @@ mod tests {
         assert!((month * 73_049.0 - 30.0).abs() < 1.0, "{month}");
         assert!((kept(&dates, &[&col("d_year").eq(lit(1999))]) - 1.0 / 201.0).abs() < 1e-12);
         assert_eq!(kept(&dates, &[&col("d_year").is_not_null()]), 0.3);
+    }
+
+    /// An OR keeps what either side keeps, a NOT what its side leaves, and a name is a value too.
+    #[test]
+    fn ors_and_nots_keep_their_share() {
+        let modes = table(6_000_000, &[("mode", 7, 0.0, 0.0), ("day", 2_526, 0.0, 2_525.0)]);
+        let either = kept(&modes, &[&col("mode").eq(lit("MAIL")).or(col("mode").eq(lit("SHIP")))]);
+        assert!((either - (1.0 - (6.0f64 / 7.0).powi(2))).abs() < 1e-12, "{either}");
+        assert!((kept(&modes, &[&col("mode").not_eq(lit("AIR"))]) - 6.0 / 7.0).abs() < 1e-12);
+        assert!((kept(&modes, &[&col("mode").in_list(vec![lit("A"), lit("B")], true)]) - 5.0 / 7.0).abs() < 1e-12);
+        let year = kept(&modes, &[&Expr::Not(Box::new(col("day").lt(lit(365))))]);
+        assert!((year - (1.0 - 365.0 / 2_525.0)).abs() < 1e-12, "{year}");
+    }
+
+    /// A physical filter is counted as its logical one is: TPC-H q12's lineitems, a year of receipt
+    /// dates, two comparisons of dates and an OR of two of seven ship modes, keep under 1%.
+    #[test]
+    fn physical_filters_count_alike() {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::common::{stats::Precision, ColumnStatistics, ScalarValue, Statistics};
+        use datafusion::physical_expr::expressions::{binary, col as pcol, lit as plit};
+        let schema = Schema::new(vec![Field::new("receipt", DataType::Date32, false), Field::new("commit", DataType::Date32, false), Field::new("mode", DataType::Utf8, false)]);
+        let mut stats = Statistics::new_unknown(&schema);
+        stats.num_rows = Precision::Exact(6_000_000);
+        stats.column_statistics[0] = ColumnStatistics { min_value: Precision::Inexact(ScalarValue::Date32(Some(8_037))), max_value: Precision::Inexact(ScalarValue::Date32(Some(10_562))), ..ColumnStatistics::new_unknown() };
+        stats.column_statistics[2].distinct_count = Precision::Inexact(7);
+        let c = |n: &str| pcol(n, &schema).unwrap();
+        let date = |d: i32| plit(ScalarValue::Date32(Some(d)));
+        let and = |a, b| binary(a, Operator::And, b, &schema).unwrap();
+        let mode = |m: &str| binary(c("mode"), Operator::Eq, plit(m), &schema).unwrap();
+        let predicate = and(and(and(binary(c("receipt"), Operator::GtEq, date(8_766), &schema).unwrap(), binary(date(9_131), Operator::Gt, c("receipt"), &schema).unwrap()),
+            binary(c("receipt"), Operator::Gt, c("commit"), &schema).unwrap()), binary(mode("MAIL"), Operator::Or, mode("SHIP"), &schema).unwrap());
+        let got = share(&stats, &conds(&predicate));
+        let want = 365.0 / 2_525.0 * 0.3 * (1.0 - (6.0f64 / 7.0).powi(2));
+        assert!((got - want).abs() < 1e-12, "{got} {want}");
+        let logical = kept(&table(6_000_000, &[("receipt", 2_526, 8_037.0, 10_562.0), ("mode", 7, 0.0, 0.0)]),
+            &[&col("receipt").gt_eq(lit(8_766)), &lit(9_131).gt(col("receipt")), &col("receipt").gt(col("commit")), &col("mode").eq(lit("MAIL")).or(col("mode").eq(lit("SHIP")))]);
+        assert!((logical - want).abs() < 1e-12, "{logical} {want}");
     }
 
     /// Inventory joined to every date by its 261 dates keeps 261 of the dates' weeks, so a later

@@ -392,7 +392,7 @@ async fn read_files(lake: &Lake, ctx: &SessionContext, files: Vec<&DataFile>, me
 }
 
 fn hot_files(lake: &Lake, files: Vec<&DataFile>, meta: &TableMeta, schema: &SchemaRef) -> crate::hot::HotFiles {
-    let meta = TableMeta { columns: meta.columns.clone(), names: meta.names.clone(), key: meta.key.clone(), ..Default::default() }; // (what reading a file takes of its table)
+    let meta = TableMeta { columns: meta.columns.clone(), names: meta.names.clone(), key: meta.key.clone(), sketch: meta.sketch.clone(), ..Default::default() }; // (what reading a file takes of its table, and its distinct counts for the planner: `hot::known`)
     crate::hot::HotFiles { lake: lake.arc(), files: files.into_iter().cloned().collect(), schema: schema.clone(), meta }
 }
 
