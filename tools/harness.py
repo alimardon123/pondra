@@ -6278,6 +6278,14 @@ def hot():
         expected = [int(m) for m in re.findall(r"FilterExec:.*?expected_rows=(\d+)", physical)]
         seen["a string equal to a value, as planned"] = expected
         checks["a string equal to a value is sized from the table's distinct counts (a few rows expected, not a fifth)"] = bool(expected) and max(expected) < 100
+        # A NOT IN keeps one table that sees every row of its subquery (`SharedBuilds` hashes big
+        # joins a table a thread, never a null-aware one): hashed, the threads that never met the
+        # subquery's NULL kept their rows. 1,000 rows count as big here, so the 200,000 do.
+        big = "SET datafusion.optimizer.hash_join_single_partition_threshold_rows = 1000; "
+        not_in = [q(big + f"SELECT count(*) AS n FROM ev WHERE i NOT IN (SELECT x FROM (VALUES (1), ({v})) AS v(x))") for v in ("NULL", "2")]
+        seen["NOT IN"] = not_in
+        checks["NOT IN a subquery with a NULL keeps no row, its join's table shared however big (and without the NULL, every other row)"] = \
+            not_in == [[{"n": 0}], [{"n": n - 2}]]
         for name, (ask, want, skips) in asks.items():
             before = skipped()
             got = q(ask)

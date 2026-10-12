@@ -2110,6 +2110,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    past `retention_days` and once no clone of the backup is pinned before it; a run past the
    retention goes with its catalog (`_backups/{ms}-{commit}.json.zst`). A restore copies one run into
    an empty place, suspends its tasks and takes away what it made if it fails. `tools/backup_check.py`.
+292. **A join builds a table a thread only where that gives the same rows** (`optimize::SharedBuilds`): a
+   join whose side to build has a million rows or more, or whose rows are then grouped by its keys
+   alone, hashes both sides by the keys instead of building one table every thread probes; never a
+   NOT IN's (null-aware: its one table must see every NULL of the subquery, as DataFusion keeps it),
+   a HAVING's few groups (`HavingBuilds`) or a spread query's joins (its exchanges are the spread
+   analysis's). `harness.py hot`: "NOT IN a subquery with a NULL keeps no row…" fails with a NOT IN
+   hashed (the threads that never met the NULL keep their rows).
 337. **A file is loaded into a table once a version, and its record lands with its rows** (`copy.rs`,
    `adopt::file`, `log::Filing::also`): `COPY INTO t FROM '…'` loads each file under the job
    `load:{table, file, version}` (an e-tag, else size and time), so the bulk path's job mark keeps a
@@ -2203,6 +2210,48 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    name". And `cluster::alive` asks for `cluster/left` too: a leader's last mark, in flight as it stepped
    down, can land after `release` deleted it (`environments_check.py --s3`'s teardown).
 
+378. **A node a program started answers only that program** (`Auth::owned`, `App::open`,
+   `server::guard`). With `PONDRA_OWNER_KEY` (16 characters or more; the shell, `local()` and the project
+   commands make one), a request without the program's key (`x-pondra-owner`), a token or a user's
+   sign-in gets 401, "this node answers only the program that started it…". While no admin token is set,
+   the key is also the `admin` user's password at the doors that take one. `pondra sql` with no token
+   sends the lake's own key for its nodes. A lake folder such a node finds empty is made 0700.
+   `harness.py owned`: "a request without the program's key: 401…", "its Postgres port takes the
+   program's key as admin's password…", "the folder it made is its user's alone (0700)".
+379. **A lake served with tokens remembers it** (`users::mark_signed`, `signed`; `App::open`;
+   `cli.rs`'s first user). A leader with any token writes `z/signed` once, and nothing clears it
+   (`pondra token` is the way back in). A node with no token on such a lake is never open: an unsigned
+   request gets 401, "this lake has been served with tokens…". It makes no first user either, on the
+   network or not, so an accidental node never writes to a production lake. A key that can't be read
+   counts as signed. `/stats` says `signed`. `harness.py signed`: "a node started without the tokens
+   its lake was served with answers no one unsigned…", "…on the network with no token: still no one
+   unsigned, and it makes no user".
+380. **A password crosses only TLS from another machine** (`tls::may_send_password`,
+   `Peer::may_send_password`; `server::guard`, `login`; `dbserver::plain`). Under `PONDRA_TLS=optional`,
+   a plain connection from another machine may carry a token, never a password. HTTP Basic and
+   `POST /login` there get 403 naming https, at a node and at `pondra serve --lakes`, whose databases'
+   nodes see only this machine. Kafka's SASL/PLAIN and Flight's Basic handshake take the same hook.
+   Postgres's SCRAM never sends the password. The rule's cases are `tls::tests`, since one machine
+   can't make a connection from another.
+381. **Failed sign-ins are counted per address and user name** (`auth::Guesses`, `guessing`,
+   `guessed`; `Peer::client`). Past ten failures in a sliding minute, that pair is refused (429 with
+   `Retry-After` at HTTP), the right password too, until its minute has fewer. Each refusal
+   costs its 400 ms, as a wrong guess does. At most 10,000 pairs are held. Bearer tokens aren't
+   counted. The Postgres, Flight and Kafka doors take the same two hooks. Behind `pondra serve --lakes` the address is the client's, which the server names in
+   `x-pondra-client` with a key it gives its databases' nodes (`PONDRA_CLIENT_KEY`). A node takes that
+   header only from this machine and with that key, so no other process here can name an address, and
+   the server replaces what a client sent. Without it, ten wrong passwords from anyone locked the user out for everyone. The same
+   address decides what a page on this machine is (`Peer::from_here`: saving the console's settings, choosing a node's
+   Python), so behind the server a page from another machine can't do either (S28). From an address of
+   `PONDRA_TRUSTED_PROXIES` (your own load balancer), the client is the last address in `X-Forwarded-For`
+   that isn't one of them; anyone else's `X-Forwarded-For` is never read, and a host name there stops the
+   node at start.
+   `harness.py guesses`: "the eleventh is 429…", "another user from the same address still signs
+   in", "a process here naming another address (x-pondra-client) is still counted by its own", "…while
+   from another address cy signs in: the server names each client's address…", "…a page from another address doesn't, nor
+   chooses the Python (S28)", "behind a trusted proxy: ten wrong passwords from one client lock al out for that
+   client…", "…and what a client writes before its proxy's entry isn't taken".
+
 ## Tests: run these before and after any change
 
 ```bash
@@ -2213,6 +2262,7 @@ python3 tools/gates.py [--prepare]      # the gates (sqllogictest, TPC-H SF1 vs 
 python3 tools/harness.py guarded        # open nodes and pages from other sites, the row doors and the nodes' routes by grant, a forwarded change as its user, .py files an admin's
 python3 tools/surface.py --bin target/release/pondra --check docs/surface.json   # what 1.0 keeps (ADR-068): reports until the freeze, then fails on a name added or gone
 python3 tools/harness.py safety         # panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
+python3 tools/harness.py owned signed guesses   # a program's node answers only it; a lake served with tokens stays signed; failed sign-ins limited per address and name
 python3 tools/harness.py sealed         # the admin token as the master key: sealed from the first write, across nodes, rotation, the nodes' key refused
 python3 tools/harness.py first          # a node on the network with no token makes the lake's first user and prints its token once; pondra token; a follower answers no one
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up

@@ -643,10 +643,12 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let at = sides + 2;
     rules.insert(at, Arc::new(HavingBuilds));
     rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
+    rules.insert(at + 2, Arc::new(SharedBuilds)); // (after both: a HAVING's few groups and an as-of join are theirs)
     let end = rules.iter().position(|r| r.name() == "SanityCheckPlan").unwrap_or(rules.len());
     rules.insert(end, Arc::new(crate::hot::TopFirst)); // (after DataFusion's own sort pushdown)
     rules.insert(end, Arc::new(MinMaxBounds)); // (after the filters are pushed down)
     let filters = rules.iter().position(|r| r.name() == "FilterPushdown").unwrap_or(0);
+    rules.insert(filters + 1, Arc::new(FilterShares)); // (again: a filter pushed into a union's parts is a new one, at DataFusion's fifth)
     rules.insert(filters, Arc::new(WideTopN)); // (before the filters are pushed down: then they go into the scan)
     rules
 }
@@ -923,6 +925,119 @@ fn bounds_whole(a: &AggregateExec) -> bool {
     }
 }
 
+/// Which joins build one hash table that every thread probes (`CollectLeft`) and which hash both
+/// sides by their keys, a table to a thread (`Partitioned`), past DataFusion's sizes:
+/// - a side to build of a million rows or more is hashed (DataFusion's own rows threshold, which it
+///   reads only when a side's bytes are unknown): one thread builds a shared table, and a million rows
+///   take it longer than the shuffle (TPC-H q9's 1.5 million orders);
+/// - a join whose rows are then grouped by its keys and nothing else is hashed by them when its side to
+///   build has a sixteenth of its other side's rows or more: the grouping then needs no shuffle of its
+///   own, and each thread groups its own keys (TPC-H q13 counts 150,000 customers' orders). With fewer
+///   keys, grouping first leaves little to move.
+/// Never a HAVING's few groups (`HavingBuilds`: their estimate is the whole table's), a NOT IN
+/// (null-aware: one table sees every NULL), or a spread query's slices, whose exchanges are the spread
+/// analysis's (a broadcast side hashed would cross the network).
+#[derive(Debug)]
+struct SharedBuilds;
+
+impl PhysicalOptimizerRule for SharedBuilds {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_plan::aggregates::AggregateMode;
+        let most = config.optimizer.hash_join_single_partition_threshold_rows;
+        if most == 0 || plan.exists(|p| Ok(matches!(p.name(), "ShareExec" | "WholeExec")))? {
+            return Ok(plan); // (with no threshold every join already hashes both sides)
+        }
+        plan.transform_down(|p| {
+            if let Some(a) = p.downcast_ref::<AggregateExec>() {
+                let single = matches!(a.mode(), AggregateMode::Partial) && a.group_expr().is_single(); // (a `Single` one gathers its rows first)
+                let groups: Option<Vec<usize>> = a.group_expr().expr().iter().map(|(e, _)| e.downcast_ref::<PhysicalColumn>().map(|c| c.index())).collect();
+                let input = match groups {
+                    Some(groups) if single && !groups.is_empty() => grouped(a.input(), &groups)?,
+                    _ => None,
+                };
+                return match input {
+                    Some(input) => Ok(Transformed::yes(replace_children_if_necessary(p.clone(), vec![input])?)),
+                    None => Ok(Transformed::no(p)),
+                };
+            }
+            match p.downcast_ref::<HashJoinExec>() {
+                Some(j) if hashable(j) && rows(j.left()).is_some_and(|n| n >= most) => Ok(Transformed::yes(partitioned(j)?)),
+                _ => Ok(Transformed::no(p)),
+            }
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "shared_builds"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// `p` with the join it reads (through projections and filters) hashed by its keys, when `columns` of
+/// `p`'s rows are those keys and nothing else, and its sides aren't too far apart (`SharedBuilds`).
+fn grouped(p: &Arc<dyn ExecutionPlan>, columns: &[usize]) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let through = |projection: &Option<datafusion::physical_expr::projection::ProjectionRef>| match projection {
+        Some(kept) => columns.iter().map(|&c| kept[c]).collect(),
+        None => columns.to_vec(),
+    };
+    if let Some(j) = p.downcast_ref::<HashJoinExec>() {
+        let near = matches!((rows(j.left()), rows(j.right())), (Some(build), Some(probe)) if build >= probe / 16);
+        return Ok(match hashable(j) && near && keyed(j, &through(&j.projection)) {
+            true => Some(partitioned(j)?),
+            false => None,
+        });
+    }
+    let below: Option<Vec<usize>> = if let Some(projection) = p.downcast_ref::<ProjectionExec>() {
+        columns.iter().map(|&c| projection.expr()[c].expr.downcast_ref::<PhysicalColumn>().map(|c| c.index())).collect()
+    } else {
+        p.downcast_ref::<FilterExec>().map(|f| through(f.projection()))
+    };
+    let Some(below) = below else { return Ok(None) };
+    match grouped(p.children()[0], &below)? {
+        Some(input) => Ok(Some(replace_children_if_necessary(p.clone(), vec![input])?)),
+        None => Ok(None),
+    }
+}
+
+/// Are `columns` of a hash join's rows (before its projection) its keys, one for each, on a side its
+/// rows would be hashed by? (An inner join's keys are either side's: they are equal.)
+fn keyed(j: &HashJoinExec, columns: &[usize]) -> bool {
+    let left = j.left().schema().fields().len();
+    let index = |e: &Arc<dyn PhysicalExpr>| e.downcast_ref::<PhysicalColumn>().map(|c| c.index());
+    let keys: Vec<Vec<usize>> = j
+        .on()
+        .iter()
+        .map(|(l, r)| match j.join_type() {
+            JoinType::Inner => [index(l), index(r).map(|r| left + r)].into_iter().flatten().collect(),
+            JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => index(l).into_iter().collect(),
+            JoinType::Right => index(r).map(|r| left + r).into_iter().collect(),
+            JoinType::RightSemi | JoinType::RightAnti => index(r).into_iter().collect(),
+            _ => vec![],
+        })
+        .collect();
+    columns.len() == keys.len() && keys.iter().all(|k| k.iter().any(|c| columns.contains(c))) && columns.iter().all(|c| keys.iter().any(|k| k.contains(c)))
+}
+
+/// Does a join build one shared table that it may build a table a thread instead (`SharedBuilds`)?
+fn hashable(j: &HashJoinExec) -> bool {
+    use datafusion::physical_plan::joins::PartitionMode;
+    *j.partition_mode() == PartitionMode::CollectLeft && !j.null_aware && !few(j.left()) && !having(j.left())
+}
+
+fn partitioned(j: &HashJoinExec) -> Result<Arc<dyn ExecutionPlan>> {
+    j.builder().with_partition_mode(datafusion::physical_plan::joins::PartitionMode::Partitioned).build_exec()
+}
+
+/// The rows DataFusion expects of `p`.
+fn rows(p: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    StatisticsContext::new().compute(p.as_ref(), &StatisticsArgs::new()).ok().and_then(|s| s.num_rows.get_value().copied())
+}
+
 /// `x IN (SELECT k … GROUP BY k HAVING …)`: the few groups a HAVING keeps are the hash table, the
 /// table probes it, and the rows that pass are few too, so a join above them builds on them whole
 /// rather than shuffling its other side. (Statistics can't tell how many groups a HAVING keeps:
@@ -966,8 +1081,6 @@ impl PhysicalOptimizerRule for HavingBuilds {
 /// Does `p` give only the rows a HAVING's semi join let through (`having`), joined to no more than
 /// one row each (DataFusion's estimate of a join no bigger than that side's)?
 fn few(p: &Arc<dyn ExecutionPlan>) -> bool {
-    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
-    let rows = |p: &Arc<dyn ExecutionPlan>| StatisticsContext::new().compute(p.as_ref(), &StatisticsArgs::new()).ok().and_then(|s| s.num_rows.get_value().copied());
     if let Some(j) = p.downcast_ref::<HashJoinExec>() {
         return match j.join_type() {
             JoinType::LeftSemi => having(j.right()) || few(j.left()),
