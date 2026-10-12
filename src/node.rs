@@ -281,19 +281,26 @@ impl Node {
             });
             // Tier as soon as new rows commit — other engines see them in the Delta log a moment
             // later — but at most once every `tier_secs`, and at least every 5 × that (bulk
-            // inserts, compaction, retention).
+            // inserts, compaction, retention). Only a loud commit wakes it (`store::quiet`): the
+            // statements' history commits every second while anyone queries, and the round each
+            // one woke set a pace that held the lake's next write back up to `tier_secs`
+            // (freshness.py: Delta and Iceberg 1 s after the ack instead of 30 ms). So did the
+            // round's own commit, so what it waits past is the version the round left.
             if tier_secs > 0.0 {
                 let (a, mut hwm, period) = (app.clone(), lake.hwm.subscribe(), Duration::from_secs_f64(tier_secs));
                 panics::spawn(async move {
                     loop {
-                        let start = tokio::time::Instant::now();
-                        hwm.borrow_and_update();
+                        let (start, before) = (tokio::time::Instant::now(), *hwm.borrow_and_update());
                         let failed = a.tier_all(0).await.inspect_err(|e| eprintln!("background job failed: {e:#}")).is_err();
+                        // (rows that came while it ran may be loud ones it didn't take: they go at
+                        // the round's pace, as any commit did)
+                        let seen = (*hwm.borrow() == before).then(|| a.lake.cat.version()).flatten();
                         tokio::time::sleep_until(start + period).await;
                         // (right away if rows came meanwhile; a round that failed, say on a full
                         // disk, is tried again then too, not only once more rows come)
                         if !failed {
-                            let _ = tokio::time::timeout(period * 4, hwm.changed()).await;
+                            let loud = async { while hwm.changed().await.is_ok() && seen.is_some() && a.lake.cat.version() == seen {} };
+                            let _ = tokio::time::timeout(period * 4, loud).await;
                         }
                     }
                 });

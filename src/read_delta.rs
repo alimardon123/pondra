@@ -222,6 +222,11 @@ pub fn schema(root: &str, metadata: &Value) -> Result<(Vec<(String, String, Data
     Ok((columns, partitions, mode != "none"))
 }
 
+/// A Delta type Pondra doesn't read, and those it does.
+fn unread(t: &str) -> String {
+    format!("a Delta {t}, which Pondra doesn't read: it reads Delta's numbers, strings, binary, booleans, dates, timestamps, decimals, arrays and structs")
+}
+
 /// A Delta type as Arrow's.
 fn arrow_type(t: &Value) -> Result<DataType> {
     let item = |v: &Value, n: &str, nullable: bool| -> Result<Arc<Field>> { Ok(Arc::new(Field::new(n, arrow_type(v)?, nullable))) };
@@ -243,15 +248,15 @@ fn arrow_type(t: &Value) -> Result<DataType> {
                 let (p, s) = d[8..d.len() - 1].split_once(',').context("decimal(p, s)")?;
                 DataType::Decimal128(p.trim().parse()?, s.trim().parse()?)
             }
-            other => bail!("the type {other} isn't read yet"),
+            other => bail!("{}", unread(other)),
         },
         Value::Object(o) => match o.get("type").and_then(Value::as_str) {
             Some("array") => DataType::List(item(&o["elementType"], "element", o["containsNull"].as_bool().unwrap_or(true))?),
             Some("struct") => DataType::Struct(o["fields"].as_array().into_iter().flatten().map(|f| item(&f["type"], f["name"].as_str().unwrap_or_default(), true)).collect::<Result<Vec<_>>>()?.into()),
-            Some(other) => bail!("the type {other} isn't read yet"),
+            Some(other) => bail!("{}", unread(other)),
             None => bail!("a type without a name"),
         },
-        other => bail!("the type {other} isn't read"),
+        other => bail!("a type written as {other}, which Delta's protocol doesn't have"),
     })
 }
 
@@ -301,7 +306,7 @@ fn file(root: &str, add: &Value, partitions: &[String], types: &HashMap<&str, Da
                     Delete::Vector { path: format!("{root}/{dir}deletion_vector_{u}.bin"), offset: at, size }
                 }
                 "p" => Delete::Vector { path: unescape(where_), offset: at, size },
-                k => bail!("{rel}: a deletion vector stored as {k:?}, which isn't read yet"),
+                k => bail!("{rel}: a deletion vector of storage type '{k}', which Delta's protocol doesn't have (it has 'u', 'i' and 'p')"),
             }]
         }
     };

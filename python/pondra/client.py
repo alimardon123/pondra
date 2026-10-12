@@ -502,7 +502,7 @@ class Pondra:
 
     # ------------------------------------------------------------ rows in, rows out
 
-    def append(self, table, data, retries=None):
+    def append(self, table, data):
         """Append rows — a list of dicts, or a pandas / Polars / Arrow table — exactly once: sent
         again after a lost answer, on any node, it is recognised and not applied twice (for up to
         the connection's `retry_secs`)."""
@@ -532,8 +532,9 @@ class Pondra:
         return frame.write_table(name, mode)
 
     def lookup(self, table, key):
-        """The current row of one key of a keyed table (None if absent)."""
-        rows = json.loads(self._call("GET", f"/lookup/{table}/{key}"))
+        """The current row of one key of a keyed table (None if absent). The key is one URL segment,
+        escaped as JavaScript's `encodeURIComponent` escapes it: a space, `/`, `#` or `?` in it is fine."""
+        rows = json.loads(self._call("GET", f"/lookup/{table}/{urllib.parse.quote(str(key), safe='')}"))
         return rows[0] if rows else None
 
     def watch(self, table, after=None, changes=False):
@@ -717,7 +718,8 @@ def _params(params):
 
 
 def _with(options):
-    given = {k: v for k, v in options.items() if v not in (None, False, "")}
+    # (0 is a value: `0 in (None, False, "")` is true, since 0 == False, so it is tested one way at a time)
+    given = {k: v for k, v in options.items() if not (v is None or v is False or v == "")}
     return (" WITH (" + ", ".join(f"{k} = {_literal(v if not isinstance(v, (list, tuple)) else ', '.join(v))}" for k, v in given.items()) + ")") if given else ""
 
 
@@ -851,7 +853,7 @@ def local(dir="lake", port=None, token=None, flags=(), timeout=120, python=True)
     db.process, db.owner, deadline = proc, owner, time.time() + timeout
     while True:
         try:
-            db._call("GET", "/stats")
+            stats = db._call("GET", "/stats")
             db.retry_secs = 60
             break
         except (OSError, RuntimeError):
@@ -859,6 +861,21 @@ def local(dir="lake", port=None, token=None, flags=(), timeout=120, python=True)
                 db.close()
                 raise RuntimeError(f"the node didn't start; its log: {log}") from None
             time.sleep(0.05)
+    try:
+        ours = json.loads(stats).get("owner")  # (asked with our key; a node from before this check doesn't say: accepted)
+    except (ValueError, AttributeError):
+        ours = None
+    if ours is False:
+        # Another node answers on this port: ours failed to bind it. Stop ours (it may still be starting) and
+        # don't use the other one, whose lake isn't the one asked for. (Not db.close(): that would reach it.)
+        if proc.poll() is None:
+            proc.stdin.close()  # (closing its input stops it, as close() does)
+            try:
+                proc.wait(15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        raise RuntimeError(f"127.0.0.1:{port} is another node's, not the one this started (it failed to listen there); its log: {log}")
     atexit.register(db.close)
     return db
 

@@ -5,11 +5,17 @@
 //! of each key (sum, min, max).
 use crate::store::*;
 use anyhow::{bail, Result};
-use datafusion::arrow::array::{ArrayRef, Int64Array, UInt64Array};
+use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, UInt64Array, UnionArray};
+use datafusion::common::Column;
+use datafusion::logical_expr::{ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::prelude::*;
+use datafusion::common::utils::memory::RecordBatchMemoryCounter;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 
@@ -588,8 +594,9 @@ impl TableProvider for Table {
     }
 }
 
-/// Does a query (with the stored views it reads) name a keyed table's `_deleted` (`named`)?
-pub fn names_deleted(text: &str) -> bool { text.to_lowercase().contains("_deleted") }
+/// Does a query (with the stored views it reads) name a keyed table's `_deleted` (`named`)? As a
+/// word: a column of the query's own named `dbt_is_deleted` isn't it (dbt's snapshots write one).
+pub fn names_deleted(text: &str) -> bool { text.to_lowercase().split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == "_deleted") }
 
 /// A table as its users see it: append tables as files + log; keyed tables their current rows.
 /// `upto`: the log only that far (a distributed query reads every node's copy at one snapshot).
@@ -801,6 +808,41 @@ tokio::task_local! {
 /// Does this request carry tables of its own?
 pub fn sent() -> bool { SENT.try_with(|t| !t.is_empty()).unwrap_or(false) }
 
+tokio::task_local! {
+    /// The memory of the last answer a request collected (`collect`), counted until the request's body
+    /// is sent: an answer sent in pieces (`server::Rendered`) takes it over. Only the last one is kept:
+    /// an earlier statement's batches were dropped when that statement ended.
+    pub static HELD: std::cell::RefCell<Option<MemoryReservation>>;
+}
+
+/// An answer's batches, collected from a plan's partitions. They are counted in the query memory
+/// (DataFusion counts the operators', not what they hand back), so an answer bigger than the memory
+/// stops with 53200 instead of taking the node down.
+pub async fn collect(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>) -> Result<Vec<RecordBatch>> {
+    let held = MemoryConsumer::new("an answer").register(task.memory_pool());
+    let mut counted = RecordBatchMemoryCounter::new(); // (each buffer once: batches cut from one batch or page share theirs)
+    let mut stream = datafusion::physical_plan::execute_stream(plan, task)?;
+    let mut out = vec![];
+    while let Some(batch) = stream.try_next().await? {
+        if held.try_grow(counted.count_batch(&batch)).is_err() {
+            return Err(crate::codes::coded("53200", format!("the answer is bigger than this node's memory for queries ({} MB): ask for fewer rows (a LIMIT or a filter), or write them out with COPY (…) TO a file or folder", memory_limit() >> 20)));
+        }
+        out.push(batch);
+    }
+    keep_held(held);
+    Ok(out)
+}
+
+/// Keeps an answer's memory counted in the request's scope (`HELD`); a door with no scope of its own
+/// (Postgres, Flight, MCP) releases it when the answer is returned.
+fn keep_held(held: MemoryReservation) {
+    let mut held = Some(held);
+    let _ = HELD.try_with(|h| *h.borrow_mut() = held.take());
+}
+
+/// The memory of the answer a request kept, for the body that sends it (`server::answer`).
+pub fn take_held() -> Option<MemoryReservation> { HELD.try_with(|h| h.borrow_mut().take()).ok().flatten() }
+
 /// Batches as an Arrow IPC stream.
 pub fn ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
@@ -832,6 +874,78 @@ pub fn compact(b: RecordBatch) -> RecordBatch {
     RecordBatch::try_new_with_options(b.schema(), columns, &datafusion::arrow::array::RecordBatchOptions::new().with_row_count(Some(b.num_rows()))).unwrap_or(b)
 }
 
+/// `pondra_json_text(x)`: a union (what `json_get` answers: a number, a string, a list…) as the text
+/// of its value, which `->>` gives too. JSON, CSV, Parquet and the Postgres port can't write a union.
+static JSON_TEXT: std::sync::LazyLock<Arc<ScalarUDF>> = std::sync::LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(JsonText(Signature::any(1, Volatility::Immutable)))));
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonText(Signature);
+
+impl ScalarUDFImpl for JsonText {
+    fn name(&self) -> &str { "pondra_json_text" }
+    fn signature(&self) -> &Signature { &self.0 }
+    fn return_type(&self, _: &[DataType]) -> datafusion::error::Result<DataType> { Ok(DataType::Utf8) }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        use datafusion::arrow::array::Array;
+        let array = args.args[0].to_array(args.number_rows)?;
+        let Some(union) = array.as_any().downcast_ref::<UnionArray>() else {
+            return Err(datafusion::error::DataFusionError::Execution("pondra_json_text takes a union".into()));
+        };
+        Ok(ColumnarValue::Array(Arc::new(union_text(union)?)))
+    }
+}
+
+/// Registers `pondra_json_text` in a session (`store.rs`, `made`).
+pub fn register_json_text(ctx: &SessionContext) {
+    ctx.register_udf(JSON_TEXT.as_ref().clone());
+}
+
+/// A query's union columns planned as their text: every door plans through `sql`, so its schema,
+/// its rows and a table made of it all say Utf8. A query with no union column is returned as it is.
+fn text_unions(df: datafusion::dataframe::DataFrame) -> datafusion::error::Result<datafusion::dataframe::DataFrame> {
+    if !df.schema().fields().iter().any(|f| matches!(f.data_type(), DataType::Union(..))) {
+        return Ok(df);
+    }
+    let exprs: Vec<Expr> = df
+        .schema()
+        .iter()
+        .map(|(qualifier, f)| {
+            let column = Expr::Column(Column::from((qualifier, f)));
+            match f.data_type() {
+                DataType::Union(..) => JSON_TEXT.call(vec![column]).alias_qualified(qualifier.cloned(), f.name()), // (a join's two of one name stay two)
+                _ => column,
+            }
+        })
+        .collect();
+    df.select(exprs)
+}
+
+/// One union column's text: each row's value in the child its type id selects, NULL where that
+/// value is NULL or the child is of type Null. Sparse and dense unions alike (`value_offset`).
+fn union_text(u: &UnionArray) -> datafusion::arrow::error::Result<StringArray> {
+    use datafusion::arrow::array::Array;
+    use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
+    use std::collections::{hash_map::Entry, HashMap};
+    let options = FormatOptions::default();
+    let mut formats: HashMap<i8, ArrayFormatter<'_>> = HashMap::new(); // (one per child, made when first asked)
+    let mut out: Vec<Option<String>> = Vec::with_capacity(u.len());
+    for i in 0..u.len() {
+        let id = u.type_id(i);
+        let child = u.child(id);
+        let at = u.value_offset(i);
+        if child.data_type() == &DataType::Null || child.is_null(at) {
+            out.push(None);
+            continue;
+        }
+        let format = match formats.entry(id) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => v.insert(ArrayFormatter::try_new(child.as_ref(), &options)?),
+        };
+        out.push(Some(format.value(at).to_string()));
+    }
+    Ok(StringArray::from(out))
+}
+
 /// An Arrow IPC stream's batches (none for no bytes).
 pub fn read_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     if bytes.is_empty() {
@@ -856,9 +970,9 @@ pub async fn sql(ctx: &SessionContext, sql: &str) -> Result<datafusion::datafram
     if let Some(stmt) = crate::friendly::lambdas(sql).filter(|_| generic) {
         let plan = ctx.state().statement_to_plan(stmt).await?;
         read_only().verify_plan(&plan)?;
-        return Ok(ctx.execute_logical_plan(plan).await?);
+        return Ok(text_unions(ctx.execute_logical_plan(plan).await?)?);
     }
-    Ok(ctx.sql_with_options(sql, read_only()).await?)
+    Ok(text_unions(ctx.sql_with_options(sql, read_only()).await?)?)
 }
 
 /// A table of this lake in a session: `t` in the default schema (`public`), `s.t` in schema `s`,

@@ -23,7 +23,7 @@ read-only bucket keys are enough for it. Nodes started at the same instant agree
 | Role | What it does |
 |---|---|
 | **Leader** | Puts the writes in order (one number per commit), tiers, compacts, and cleans up. |
-| **Follower** | Takes writes and queries like the leader and passes the ordering to it. Runs its share of [streaming tasks](/pondra/guides/streaming/) and of big queries. |
+| **Follower** | Takes writes and queries like the leader and passes the ordering to it. Runs its share of [streaming tasks](/pondra/guides/views/#tasks-any-streaming-sql) and of big queries. |
 | **Reader** | SQL only. Any number of them, next to the writers. |
 
 ## Try it on one machine
@@ -104,7 +104,7 @@ A query over big tables can run across the nodes: each reads its share of the fi
 is the same as on one node. A node spreads a query only when that is faster. It weighs the bytes the
 plan would move, at the speed of its slowest link to the other nodes, against the time the other
 nodes would save, so a slow network never makes a query slower. `?spread=1` spreads a query anyway and
-`?spread=0` keeps it on the node. `GET /metrics` counts them.
+`?spread=0` keeps it on the node. `GET /metrics` counts them ([Observability](/pondra/guides/observability/) has every counter).
 
 ```python
 query = "SELECT user, count(*) AS n, round(sum(amount)) AS total FROM events GROUP BY user ORDER BY user"
@@ -229,7 +229,7 @@ kill $(cat cluster/node2.pid cluster/node3.pid cluster/reader.pid)
 - **Laptops** can join with `pondra serve` or `--reader` and leave again. After a full shutdown the
   first node started leads at once.
 - **Streaming tasks** with `shards` are dealt to the live nodes, and move when membership changes
-  ([streaming](/pondra/guides/streaming/#tasks-any-streaming-sql)).
+  ([streaming](/pondra/guides/views/#tasks-any-streaming-sql)).
 - **Every door** is on every node: `--pg`, `--kafka` and `--flight` are per node, so give each node
   the ones its clients use.
 

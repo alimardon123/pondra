@@ -205,7 +205,10 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
     let (out, note) = crate::history::noted(INSIDE.scope((), async {
         let _turn = quota.turn().await.map_err(|m| E::refusal("53000", m))?; // (insufficient_resources)
         match quota.timeout {
-            Some(t) => tokio::time::timeout(t, f).await.unwrap_or_else(|_| Err(E::refusal("57014", format!("quota: {}'s statements run at most {} s (STATEMENT_TIMEOUT); this one was stopped", quota.user, t.as_secs())))),
+            Some(t) => tokio::time::timeout(t, f).await.unwrap_or_else(|_| Err(E::refusal("57014", match quota.by_session {
+                true => "canceling statement due to statement timeout".to_string(), // (Postgres's own words: a client matches them)
+                false => format!("quota: {}'s statements run at most {} s (STATEMENT_TIMEOUT); this one was stopped", quota.user, t.as_secs()),
+            }))),
             None => f.await,
         }
     }))

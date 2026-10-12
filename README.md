@@ -190,10 +190,13 @@ SELECT user, sum(amount) FROM delta_scan('s3://my-bucket/lake/data/events') GROU
 SELECT count(*) FROM iceberg_scan('s3://my-bucket/lake/data/events/metadata/v42.metadata.json');
 ```
 
-Other engines read the table as of the last tiering round:
+Other engines read the table as of the last tiering round, which runs as soon as rows commit,
+at most once every `--tier-secs` (10 by default). A write after a quiet spell is there:
 
 - ~30 ms after the ack on local disk;
-- 3–10 s on R2 at the default `--tier-secs 2`, depending on how far away the bucket is.
+- 3–10 s after it on R2, depending on how far away the bucket is.
+
+Under a steady stream of writes, add up to `--tier-secs`.
 
 **And they append to it** through the node's Iceberg REST catalog, as they would through Polaris
 or Unity Catalog (Pondra's own catalog stays the one that counts):
@@ -392,7 +395,7 @@ differences entirely.
 | `write_outside.rs` | `INSERT` into an attached Delta table (a put-if-absent commit) or Iceberg v2 table (manifests and a metadata file, or a REST catalog's commit), exactly-once by job |
 | `copy.rs` | `COPY … TO` files anywhere or a topic; a big folder written by every node (`spmd::copy`) |
 | `kafka_client.rs`, `feeds.rs` | Other Kafka clusters: topics read as tables (spread by partition), rows written as records (SASL PLAIN/SCRAM, TLS), and materialized views fed by a topic, every record once |
-| `server.rs`, `main.rs` | HTTP API (axum) and CLI |
+| `server.rs`, `cli.rs` | HTTP API (axum) and the command line (`lib.rs` lists the modules; `main.rs` sets the allocator and calls `cli.rs`) |
 
 **Producer contract:** each producer has its own name, sends batches in order with increasing
 `seq`, one request in flight, to any node, retrying (on any node) until acknowledged. Retries of

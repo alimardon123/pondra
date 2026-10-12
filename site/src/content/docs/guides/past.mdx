@@ -1,0 +1,201 @@
+---
+title: A table's past
+description: Read a table as it was with AT, put it back with RESTORE, bring a dropped table back with UNDROP, copy a table without copying its files with CLONE, and choose how long the past is kept.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
+
+Every change to a table keeps the rows it replaced, for a while. So you can read a table as it was an
+hour ago, put back what a bad `UPDATE` did, bring back a table you dropped by mistake, or copy a table
+for a test without copying its files. This page covers those four things and how long the past lasts.
+
+## Read a table as it was
+
+Put `AT (…)` after a table's name to read it as it was at a commit, at a time, or some seconds before
+now. Every row also carries the commit that wrote it, in `_version`, so you can pick the commit you want
+from the rows themselves.
+
+```python
+import pondra, time
+db = pondra.connect("http://localhost:8080")
+db.sql("CREATE TABLE prices (item VARCHAR, price DOUBLE)")
+db.sql("INSERT INTO prices VALUES ('tea', 3.5), ('cake', 4.0)")
+v = db.sql("SELECT max(_version) AS v FROM prices").rows()[0]["v"]   # the commit that wrote these rows
+db.sql("UPDATE prices SET price = 3.8 WHERE item = 'tea'")
+print(db.sql(f"SELECT item, price FROM prices AT (VERSION => {v}) ORDER BY item").rows())
+```
+
+```text
+[{'item': 'cake', 'price': 4.0}, {'item': 'tea', 'price': 3.5}]
+```
+
+The three forms:
+
+| Form | Reads the table |
+|---|---|
+| `AT (VERSION => n)` | as it was after commit `n`, the number a row's `_version` shows |
+| `AT (TIMESTAMP => '2026-10-02 12:00:00')` | as it was at that time, in UTC |
+| `AT (OFFSET => -3600)` | as it was that many seconds ago (a negative number) |
+
+`AT` works wherever a table does: in a join (the same table at two moments, too), in a view, in
+`CREATE TABLE … AS`, in `INSERT … SELECT`, and with a `$parameter`. Delta's and Spark's words work as
+well, `FROM prices VERSION AS OF 3` and `FROM prices TIMESTAMP AS OF '…'`, and so does SQL:2011's
+`FOR SYSTEM_TIME AS OF`.
+
+To read a table as it was a moment ago, that moment has to be in the past. This example waits two
+seconds, changes a row, and reads the table as it was one second before now:
+
+```python
+db.sql("INSERT INTO prices VALUES ('pie', 9.0)")
+time.sleep(2)
+db.sql("UPDATE prices SET price = 9.5 WHERE item = 'pie'")
+print(db.sql("SELECT item, price FROM prices AT (OFFSET => -1) WHERE item = 'pie'").rows())
+```
+
+```text
+[{'item': 'pie', 'price': 9.0}]
+```
+
+A join can put the two moments side by side. Each row here is in the table now and as it was a second ago:
+
+<Ways sql={`SELECT n.item, n.price AS now, w.price AS a_second_ago
+FROM prices n JOIN prices AT (OFFSET => -1) w ON n.item = w.item
+ORDER BY n.item;`} />
+
+```text
++------+------+--------------+
+| item | now  | a_second_ago |
++------+------+--------------+
+| cake | 4.0  | 4.0          |
+| pie  | 9.5  | 9.0          |
+| tea  | 3.8  | 3.8          |
++------+------+--------------+
+```
+
+## Put back what a change did
+
+`RESTORE TABLE t TO VERSION AS OF n` (or `TO TIMESTAMP AS OF '…'`) makes a table's rows what they were
+at that point, in one change. A row changed since gets its old values back and keeps its `_row_id`. A row
+added since goes. A row deleted since comes back as a new row. A `RESTORE` is a change like any other, so
+another `RESTORE` undoes it.
+
+```python
+v = db.sql("SELECT max(_version) AS v FROM prices").rows()[0]["v"]
+db.sql("DELETE FROM prices WHERE item = 'cake'")
+db.sql("UPDATE prices SET price = 1.0 WHERE item = 'tea'")
+db.sql(f"RESTORE TABLE prices TO VERSION AS OF {v}")
+print(db.sql("SELECT item, price FROM prices ORDER BY item").rows())
+```
+
+```text
+[{'item': 'cake', 'price': 4.0}, {'item': 'pie', 'price': 9.5}, {'item': 'tea', 'price': 3.8}]
+```
+
+## Bring back a dropped table
+
+`DROP TABLE` keeps the table for a while, with its rows, ids and versions. `UNDROP TABLE` brings it back
+as it was. `pondra.dropped` lists the tables that can still come back.
+
+```sql
+CREATE TABLE notes (id BIGINT, body VARCHAR);
+INSERT INTO notes VALUES (1, 'keep me');
+DROP TABLE notes;
+SELECT name, rows_in_files FROM pondra.dropped WHERE name = 'notes';
+```
+
+```text
++-------+---------------+
+| name  | rows_in_files |
++-------+---------------+
+| notes | 1             |
++-------+---------------+
+```
+
+<Ways sql={`UNDROP TABLE notes;`} />
+
+```sql
+SELECT body FROM notes;
+```
+
+```text
++---------+
+| body    |
++---------+
+| keep me |
++---------+
+```
+
+- `UNDROP` takes the table dropped last under that name. It is refused while something else has the
+  name: rename that one first (`ALTER TABLE notes RENAME TO notes_new`), then `UNDROP TABLE notes`.
+- A table dropped with `DROP TABLE … PURGE` keeps nothing, and neither does one with
+  `retention = '0 seconds'`. `UNDROP` then says that no dropped table is kept.
+- After its keep time its files are deleted. Until then they stay where they are, and no new table
+  takes their folder.
+
+## Copy a table without copying its files
+
+`CREATE TABLE c CLONE t` (or `SHALLOW CLONE`) makes `c` with `t`'s rows as they are, changes and all.
+It copies no file: `c` lists `t`'s files where they are, and writes its own files beside them. From then
+on the two change apart. Neither one's merges, expiry or `DROP` deletes a file the other still reads.
+
+<Ways sql={`CREATE TABLE prices_test CLONE prices;`} />
+
+```sql
+UPDATE prices_test SET price = 0 WHERE item = 'tea';
+SELECT p.item, p.price AS real_price, t.price AS test_price FROM prices p JOIN prices_test t USING (item) ORDER BY p.item;
+```
+
+```text
++------+------------+------------+
+| item | real_price | test_price |
++------+------------+------------+
+| cake | 4.0        | 4.0        |
+| pie  | 9.5        | 9.5        |
+| tea  | 3.8        | 0.0        |
++------+------------+------------+
+```
+
+A clone isn't published for other engines (a copy made with `CREATE TABLE c AS SELECT * FROM t` is), and
+its past starts when it was made. To rebuild a table and check it before it replaces the old one, write
+the rebuild into a clone and `SWAP` the two: see [Write, audit, publish](/pondra/guides/tables/#write-audit-publish).
+
+## How long the past is kept
+
+A table's past is kept for its **retention**: a day unless you say otherwise. The retention decides how
+far `AT` reads back, and how long a dropped table stays for `UNDROP`. Set it when you create the table,
+or change it later. The units are `seconds`, `minutes`, `hours` or `days`, as in `'7 days'`.
+
+<Ways sql={`ALTER TABLE prices SET (retention = '2 days');`} />
+
+- `'0 seconds'` keeps nothing: a dropped table can't come back, and an earlier version is gone at the
+  next purge.
+- A changed row's old version stays in a file until a purge rewrites it, which happens once a hundred
+  thousand changed rows wait, or a tenth of the table (see [`PONDRA_PURGE_ROWS`](/pondra/reference/environment/)).
+  Its old versions stay for the retention, so `AT` can still read them.
+- A read that asks for a moment before the kept past is refused, and the error says from which version
+  the past is whole.
+
+<Aside type="caution">
+`AT` reads append tables only. A keyed table keeps only each key's newest row, so there is no earlier
+version to read: `AT` refuses it, and so does a history view, which keeps every version already. `AT`
+reads only this lake's own tables. Another lake's are read by a node of that lake.
+</Aside>
+
+```python
+db.sql("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR)")
+try:
+    db.sql("SELECT * FROM users AT (VERSION => 1)").rows()  # (a SELECT runs when its rows are asked for)
+except RuntimeError as e:
+    print(e)
+```
+
+```text
+500: users AT (…): a keyed table keeps only each key's newest version, so only append tables are read as they were
+```
+
+## See also
+
+- [Tables](/pondra/guides/tables/) for `CREATE TABLE`, `SWAP` and dropping a table.
+- [Change rows](/pondra/guides/change-rows/) for how a change keeps the old version.
+- [SQL statements](/pondra/sql/statements/#a-tables-past) for the syntax of each form.

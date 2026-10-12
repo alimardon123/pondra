@@ -38,6 +38,7 @@ A number that is left unset, or set to something that is not a number, takes its
 | `PONDRA_LEARN` | off | `on`: the planner uses what runs learned (`pondra.learned`); by default they are learned and listed, not used |
 | `PONDRA_USER_QUERIES` | none | how many statements a user without its own `MAX_QUERIES` runs at once on a node ([quotas](/pondra/guides/security/#quotas)) |
 | `PONDRA_USER_TIMEOUT` | none | how many seconds a statement of a user without its own `STATEMENT_TIMEOUT` may run |
+| `PONDRA_STATEMENT_TIMEOUT` | none | how long a statement may run when its session set no `statement_timeout`, as Postgres writes it (`30s`, `5min`; a bare number is milliseconds), for everyone: tokens, users and an open node's callers. A user's own limit, if shorter, wins |
 
 An empty value counts as not set. See [HTTP](/pondra/reference/http/#roles) for what each token may do.
 
@@ -53,7 +54,7 @@ PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 | `PONDRA_ENV` | the git branch's database | the environment the project commands use when none is named: `pondra apply`, `pondra plan`, `pondra status` and the rest. `--env` or the name after the command wins |
 | `PONDRA_HOME` | `~/.pondra` (from `HOME`, or `USERPROFILE` on Windows) | the folder where `pondra login` keeps the tokens it saved, in `login.json` |
 
-[`pondra ci init`](/pondra/guides/environments/#branches-and-environments-on-a-team) also makes three
+[`pondra ci init`](/pondra/guides/projects/#continuous-integration) also makes three
 GitHub secrets: `PONDRA_DEV_TOKEN` (for the server branches are made on), `PONDRA_TEST_TOKEN` (test's
 server) and `PONDRA_PROD_TOKEN` (in the `prod` environment, which a reviewer approves). The workflow it
 writes hands each job the one it needs as `PONDRA_TOKEN`; Pondra itself never reads them.
@@ -71,7 +72,10 @@ writes hands each job the one it needs as `PONDRA_TOKEN`; Pondra itself never re
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PONDRA_MEMORY_GB` | a third of the machine's memory | memory for queries, when `--memory-gb` is not given. A sort, join or aggregation that needs more spills to disk |
+| `PONDRA_MEMORY_GB` | a third of the machine's memory | memory for queries, when `--memory-gb` is not given. A sort, join or aggregation that needs more spills to disk. An answer counts in it until it is sent, and one bigger than it is refused with SQLSTATE `53200`, saying so: ask for fewer rows, or write them out with `COPY (…) TO` |
+| `PONDRA_QUERIES` | four a core, 16 at least | how many queries a node runs at once. The others wait their turn, in the order they came (`pondra_queries_running` and `pondra_queries_waiting` in [`/metrics`](/pondra/reference/http/)) |
+| `PONDRA_QUEUE_SECS` | `60` | how long a query waits for its turn. Past it, it is refused with SQLSTATE `53300`: try again, or ask another node |
+| `PONDRA_STREAM_MB` | `8` | an answer this big or bigger (as Arrow) is sent over HTTP in pieces as it is written, as JSON, CSV, TSV, NDJSON or Arrow, never as one body in memory. The bytes are the same either way |
 | `PONDRA_CACHE_DIR` | `<temp dir>/pondra-cache` | where a node keeps its local SSD copy of a lake's recent objects, what a shuffle spills, and a follower's copy of the log with `--ack replicated`. The same as `--cache-dir` |
 | `PONDRA_CACHE_GB` | 20, or a quarter of the free disk if that is less | the size of that SSD copy. `0` turns it off. The same as `--cache-gb` |
 | `PONDRA_CACHE_MB` | `1024` | the query read cache in memory |
@@ -119,6 +123,7 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 |---|---|---|
 | `PONDRA_GC_SECS` | `5` for the write-ahead log and `60` for manifests on a local disk; `60` for both on a bucket | how often the catalog's write-ahead-log objects and old manifests are cleared, and how old they must be. Set it to use one value for both |
 | `PONDRA_RUNS_DAYS` | `30` | how many days the run log, `pondra.runs`, keeps. Read when the log is first made |
+| `PONDRA_LOAD_RETENTION_SECS` | `5529600` (64 days) | how long `COPY INTO` remembers the files it loaded, so a file loaded again within it, unchanged, is skipped (`pondra.loads` lists them). Shorter for tests |
 | `PONDRA_BUCKET_REQUESTS` | `256` | how many requests a node sends a bucket at once to start with. It halves when the bucket answers 503 or 429, and grows back, up to four times this |
 | `PONDRA_FILE_VERSIONS` | `50` | how many versions of each of the lake's files are kept ([versions](/pondra/reference/http/#files)) |
 | `PONDRA_FILE_VERSIONS_DAYS` | `90` | how many days a file's versions are kept (its newest always is) |

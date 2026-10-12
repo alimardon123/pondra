@@ -80,10 +80,19 @@ def main():
     databases = {r[0] for r in rows if len(r) == 1}  # (.databases: one column)
     checks["…for that session only: nothing saved in the shell's lake"] = "lake" not in databases and {"shell", "other"} <= databases
     checks[".tables says each one's kind: a materialized view is one, not a BASE TABLE"] = ["shell", "public", "mv", "materialized view"] in rows and ["shell", "public", "t", "table"] in rows
+    # A mistyped command, or a folder of other things, is never made a lake (invariant 142, as serve).
+    here, cluttered = tempfile.mkdtemp(), tempfile.mkdtemp()
+    with open(os.path.join(cluttered, "notes.txt"), "w") as f:
+        f.write("mine")
+    typo = subprocess.run([BIN, "serv"], cwd=here, capture_output=True, text=True, timeout=60)
+    full = subprocess.run([BIN, cluttered], capture_output=True, text=True, timeout=60)
+    checks["a mistyped command isn't made a lake (did you mean pondra serve?), nor a folder of other things"] = \
+        typo.returncode != 0 and "did you mean `pondra serve`" in typo.stderr and os.listdir(here) == [] \
+        and full.returncode != 0 and "holds other things than a lake" in full.stderr and os.listdir(cluttered) == ["notes.txt"]
     ok = all(checks.values())
     print(json.dumps({"smoke": checks, "platform": sys.platform, "ok": ok}, indent=1))
     if not ok:
-        print(shell.stdout, shell.stderr, beside.stdout, beside.stderr, elsewhere.stdout, open(log.name).read()[-2000:], file=sys.stderr)
+        print(shell.stdout, shell.stderr, beside.stdout, beside.stderr, elsewhere.stdout, typo.stderr, full.stderr, open(log.name).read()[-2000:], file=sys.stderr)
         sys.exit(1)
 
 

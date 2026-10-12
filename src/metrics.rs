@@ -22,6 +22,24 @@ crate::per_node!(pub static SKEW_SPLITS: AtomicU64 = AtomicU64::new(0)); // hot 
 crate::per_node!(pub static RECEIVED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes this node's steps read (its share of the work)
 crate::per_node!(pub static WIRE: AtomicU64 = AtomicU64::new(0)); // bytes other nodes sent this node, compressed as sent (shuffles, gathered results)
 crate::per_node!(pub static WAIT_US: AtomicU64 = AtomicU64::new(0)); // time this node's steps waited for other nodes' buckets
+// (these two are the process's, not a node's: a stopped node's last queries still count themselves
+// down, and set back to 0 under them they would wrap)
+pub static RUNNING: AtomicU64 = AtomicU64::new(0); // queries running here now, each on one of PONDRA_QUERIES' turns
+pub static WAITING: AtomicU64 = AtomicU64::new(0); // queries waiting here for a turn
+
+/// Counts what is going on now: up while this guard lives (`Now::new`), down when it is dropped.
+pub struct Now(&'static AtomicU64);
+
+impl Now {
+    pub fn new(count: &'static AtomicU64) -> Self {
+        count.fetch_add(1, Relaxed);
+        Now(count)
+    }
+}
+
+impl Drop for Now {
+    fn drop(&mut self) { self.0.fetch_sub(1, Relaxed); }
+}
 
 pub fn add(c: &AtomicU64, n: u64) { c.fetch_add(n, Relaxed); }
 
@@ -42,6 +60,8 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("rows_in_total", "counter", "rows taken into the log here", &one(get(&ROWS_IN)));
     metric("queries_total", "counter", "SQL queries run here", &one(get(&QUERIES)));
     metric("query_errors_total", "counter", "SQL queries that failed", &one(get(&QUERY_ERRORS)));
+    metric("queries_running", "gauge", "SQL queries running here now, each on one of PONDRA_QUERIES' turns", &one(get(&RUNNING)));
+    metric("queries_waiting", "gauge", "SQL queries waiting here for a turn", &one(get(&WAITING)));
     metric("query_seconds_total", "counter", "time spent in SQL queries", &one(get(&QUERY_US) / 1e6));
     metric("spread_queries_total", "counter", "queries run across the cluster from here", &one(get(&SPREAD)));
     metric("shuffled_queries_total", "counter", "…of them with a shuffle", &one(get(&SHUFFLED)));
