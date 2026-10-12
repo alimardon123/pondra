@@ -1,4 +1,4 @@
-//! libpondra: a Pondra node in any language's process (ADR-061 §6, `designs/l2-step4-open.md`).
+//! pondra_lib: a Pondra node in any language's process (ADR-061 §6, `designs/l2-step4-open.md`).
 //! Seven functions over `pondra::library::Opened`; Python binds them with ctypes, and the packages'
 //! small `pondra` launcher calls `pondra_main`. Every entry catches a panic (unwinding across
 //! `extern "C"` is undefined) and says what failed through `pondra_last_error`. The library is never
@@ -44,7 +44,7 @@ unsafe fn text<'a>(p: *const c_char) -> anyhow::Result<Option<&'a str>> {
     if p.is_null() {
         return Ok(None);
     }
-    Ok(Some(CStr::from_ptr(p).to_str().map_err(|_| anyhow::anyhow!("a string given to libpondra isn't UTF-8"))?))
+    Ok(Some(CStr::from_ptr(p).to_str().map_err(|_| anyhow::anyhow!("a string given to Pondra's library isn't UTF-8"))?))
 }
 
 fn node(handle: u64) -> anyhow::Result<Arc<Opened>> {

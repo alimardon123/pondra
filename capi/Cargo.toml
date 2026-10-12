@@ -2,12 +2,13 @@
 name = "pondra-capi"
 version = "0.33.0"
 edition = "2021"
-description = "libpondra: a Pondra node in any language's process, through one C ABI (ADR-061 §6)"
+description = "pondra_lib: a Pondra node in any language's process, through one C ABI (ADR-061 §6)"
 license = "MIT OR Apache-2.0"
 publish = false
 
 [lib]
-name = "pondra" # (libpondra.so, libpondra.dylib, pondra.dll)
+name = "pondra_lib" # (libpondra_lib.so, libpondra_lib.dylib, pondra_lib.dll: a name apart from the program's, whose link-time
+# files a Windows build would otherwise write over, the two linking at once into one folder)
 crate-type = ["cdylib"]
 doctest = false
 

@@ -1,4 +1,4 @@
-"""`pondra.open()`: a node in this process, reached through libpondra's C ABI (ADR-061 step 4).
+"""`pondra.open()`: a node in this process, reached through its library's C ABI (pondra_lib) (ADR-061 step 4).
 
 The library is loaded with ctypes from `$PONDRA_LIBRARY`, or from `_lib/` beside this file, where a
 wheel that ships it puts it. A request goes to the node's router inside the library, not to a socket:
@@ -20,7 +20,7 @@ import warnings
 
 from . import client
 
-_NAME = {"darwin": "libpondra.dylib", "win32": "pondra.dll"}.get(sys.platform, "libpondra.so")
+_NAME = {"darwin": "libpondra_lib.dylib", "win32": "pondra_lib.dll"}.get(sys.platform, "libpondra_lib.so")
 _LIB = None  # the library, loaded by the first open
 _LIB_PID = None  # the process that loaded it (a fork's child has a copy without the library's threads)
 _FORKED = ("this process is a fork of the one that loaded pondra's library, and a fork's copy of it has none of its threads, "

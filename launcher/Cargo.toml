@@ -2,7 +2,7 @@
 name = "pondra-launcher"
 version = "0.33.0"
 edition = "2021"
-description = "Pondra's launcher: the `pondra` command of the packages, which loads libpondra and runs its program"
+description = "Pondra's launcher: the `pondra` command of the packages, which loads Pondra's library (pondra_lib) and runs its program"
 license = "MIT OR Apache-2.0"
 publish = false # (not on crates.io: the packages carry it)
 

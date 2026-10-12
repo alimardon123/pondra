@@ -4,7 +4,7 @@ python/pondra/inprocess.py, js/index.js).
 
   inprocess_check.py [--lib PATH] [--bin PATH] [--bench]
 
---lib is the library (libpondra.so, .dylib or pondra.dll), as PONDRA_LIBRARY; --bin the pondra program,
+--lib is the library (libpondra_lib.so, .dylib or pondra_lib.dll), as PONDRA_LIBRARY; --bin the pondra program,
 as PONDRA_BIN (`pondra.local()` and an `open()`'s launcher use it). Each check is a child process of this
 script, because a process holds one node and its settings are fixed by its first open; each Python child has
 this checkout's python/ first on its path. The JavaScript children (i to n) are in inprocess_check.mjs, run by
@@ -559,7 +559,7 @@ def bench(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--lib", help="the library (libpondra.so, .dylib or pondra.dll), as PONDRA_LIBRARY")
+    ap.add_argument("--lib", help="the library (libpondra_lib.so, .dylib or pondra_lib.dll), as PONDRA_LIBRARY")
     ap.add_argument("--bin", help="the pondra program, as PONDRA_BIN")
     ap.add_argument("--bench", action="store_true", help="also print the numbers (not asserted)")
     ap.add_argument("--child", help=argparse.SUPPRESS)

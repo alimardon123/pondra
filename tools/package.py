@@ -41,7 +41,7 @@ REPO = {"type": "git", "url": "git+https://github.com/alimardon123/pondra.git"} 
 
 
 def library_name(platform):
-    return {"windows": "pondra.dll", "macos": "libpondra.dylib"}.get(platform.split("-")[0], "libpondra.so")
+    return {"windows": "pondra_lib.dll", "macos": "libpondra_lib.dylib"}.get(platform.split("-")[0], "libpondra_lib.so")
 
 
 def wheel(lib, launcher, platform, out):
@@ -134,7 +134,7 @@ def npm_main(out):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", help="the built pondra program (the installers' archive)")
-    ap.add_argument("--lib", help="the built library (capi/: libpondra.so, libpondra.dylib, pondra.dll), for the wheel and npm; beside --bin if not given")
+    ap.add_argument("--lib", help="the built library (capi/: libpondra_lib.so, libpondra_lib.dylib, pondra_lib.dll), for the wheel and npm; beside --bin if not given")
     ap.add_argument("--launcher", help="the built launcher (launcher/: pondra-launcher), installed as `pondra` beside the library; beside --bin if not given")
     ap.add_argument("--platform", choices=PLATFORMS)
     ap.add_argument("--npm-main", action="store_true", help="also (or only) the `pondra` npm package")

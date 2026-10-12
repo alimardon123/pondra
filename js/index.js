@@ -628,7 +628,7 @@ async function library() {
   const { dirname, join } = await import("node:path");
   const os = { linux: "linux", darwin: "macos", win32: "windows" }[process.platform];
   const pkg = `pondra-${os}-${process.arch}`;
-  const file = { linux: "libpondra.so", darwin: "libpondra.dylib", win32: "pondra.dll" }[process.platform];
+  const file = { linux: "libpondra_lib.so", darwin: "libpondra_lib.dylib", win32: "pondra_lib.dll" }[process.platform];
   let beside = null;
   try {
     beside = join(dirname(createRequire(import.meta.url).resolve(`${pkg}/package.json`)), file);

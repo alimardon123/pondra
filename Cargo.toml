@@ -17,7 +17,7 @@ server = ["dep:http", "dep:slatedb", "dep:reqwest", "dep:tokio", "dep:axum", "de
           "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tower"]
 
 [workspace]
-members = ["capi", "launcher"] # (libpondra, the C ABI, and the launcher that loads it: `cargo build --workspace` builds them with the program, into one folder; a plain build at the root builds the program alone)
+members = ["capi", "launcher"] # (pondra_lib, the C ABI, and the launcher that loads it: `cargo build --workspace` builds them with the program, into one folder; a plain build at the root builds the program alone)
 
 [lib]
 doctest = false # (the modules' docs are prose and SQL, not Rust examples)

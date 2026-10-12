@@ -1,6 +1,6 @@
 //! The `pondra` command of the packages (ADR-061 §10).
 //!
-//! The wheel and the npm platform packages carry this program and `libpondra`, the same engine as a
+//! The wheel and the npm platform packages carry this program and Pondra's library (`pondra_lib`), the same engine as a
 //! library (`capi/`). The program loads the library at run time and calls its `pondra_main`, so one copy
 //! of the engine serves both the command line and `pondra.open()`. It is never linked to the library: the
 //! library is looked for where the packages put it, and a missing one is refused by name.
@@ -41,11 +41,11 @@ fn main() {
 /// The library's file name on this platform.
 fn library_name() -> &'static str {
     if cfg!(windows) {
-        "pondra.dll"
+        "pondra_lib.dll"
     } else if cfg!(target_os = "macos") {
-        "libpondra.dylib"
+        "libpondra_lib.dylib"
     } else {
-        "libpondra.so"
+        "libpondra_lib.so"
     }
 }
 
@@ -182,7 +182,7 @@ fn find_entry(handle: *mut c_void) -> *mut c_void {
 
 /// The library is in none of the places: say where it was looked for, and how to point at it.
 fn refuse_missing(looked: &[PathBuf]) -> ! {
-    let mut message = format!("libpondra wasn't found ({}). Looked in:", library_name());
+    let mut message = format!("Pondra's library wasn't found ({}). Looked in:", library_name());
     for place in looked {
         message.push_str(&format!("\n  {}", place.display()));
     }
@@ -302,7 +302,7 @@ mod tests {
         let tree = Tree::new("variable");
         let bin = tree.dir("bin");
         let beside = tree.file(&format!("bin/{}", library_name()));
-        let missing = PathBuf::from("/nonexistent/dev/libpondra.so");
+        let missing = PathBuf::from("/nonexistent/dev/libpondra_lib.so");
         let given = candidates(&bin, V, Some(missing.clone().into_os_string()));
         assert_eq!(given, vec![missing, beside.clone()]);
         // An empty variable is no variable.
