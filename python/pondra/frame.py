@@ -365,6 +365,12 @@ def col(name):
     return Expr(_ident(name), None if name == "*" else str(name).split(".")[-1])
 
 
+def measure(name):
+    """A view's measure, worked out at the step's own grain: `db.table("sales").group_by("region").agg(measure("revenue"))`
+    is `SELECT region, MEASURE(revenue) AS revenue FROM sales GROUP BY region` (ADR-065)."""
+    return Expr(f"MEASURE({_ident(name)})", str(name).split(".")[-1])
+
+
 def lit(value):
     if isinstance(value, Expr):
         return value

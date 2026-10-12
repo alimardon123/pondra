@@ -9024,6 +9024,18 @@ def flows():
     checks = {}
     refused = err("INSERT INTO orders VALUES (1, 'r0', 'u1', 500000, 'paid'), (2, 'r0', 'u1', 5, 'paid')", ports[1])
     checks["a row a FAIL expectation refuses fails its INSERT, naming it"] = bool(refused) and 'violates check constraint "small"' in refused
+    # OR REPLACE and IF NOT EXISTS keep a materialized view's CHECK expectations as a plain CREATE does (they were dropped)
+    # (the views are made before the rows: a row written after them goes through each view's CHECK)
+    q("CREATE TABLE tallies (id BIGINT, amount BIGINT)")
+    expect_check = "(CONSTRAINT pos CHECK (amount > 0) ON VIOLATION DROP ROW)"
+    rows_of = lambda v: [(r["id"], r["amount"]) for r in q(f"SELECT id, amount FROM {v} ORDER BY id")]
+    q(f"CREATE MATERIALIZED VIEW tallies_plain {expect_check} AS SELECT id, amount FROM tallies")
+    q("CREATE MATERIALIZED VIEW tallies_replaced AS SELECT id, amount FROM tallies")
+    q(f"CREATE OR REPLACE MATERIALIZED VIEW tallies_replaced {expect_check} AS SELECT id, amount FROM tallies")
+    q(f"CREATE MATERIALIZED VIEW IF NOT EXISTS tallies_unless {expect_check} AS SELECT id, amount FROM tallies")
+    q("INSERT INTO tallies VALUES (1, 5), (2, -3), (3, 0), (4, 7)")
+    checks["CREATE OR REPLACE MATERIALIZED VIEW and IF NOT EXISTS keep a CHECK ... ON VIOLATION DROP ROW: the rows a plain CREATE keeps"] = \
+        rows_of("tallies_plain") == [(1, 5), (4, 7)] and rows_of("tallies_replaced") == [(1, 5), (4, 7)] and rows_of("tallies_unless") == [(1, 5), (4, 7)]
     # (what a GROUP BY view's partial rows can't keep as they come runs its query again, ADR-059)
     whole = {
         "rich": ("SELECT * FROM gold WHERE total > 100", "region, buyer NULLS FIRST"),
@@ -11997,6 +12009,446 @@ await db.close?.();"""
     return f"{sum(bool(v) for v in checks.values())} of {len(checks)} find checks"
 
 
+def measures():
+    """Measures in views (ADR-065 §3, L5-3): `AS MEASURE` in a view's SELECT, `MEASURE(m)` at each query's own grain, against the GROUP BY written by hand, at every door; the refusals; what it costs."""
+    import datetime, psycopg
+    lake = new_lake()
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
+    q = lambda s, path="/sql": call(A.port, "POST", path, s.encode(), timeout=120)
+    def http(body):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", body.encode())
+        r = c.getresponse()
+        data = r.read()
+        return r.status, data.decode()[:400]
+    dsn = f"host=127.0.0.1 port={A.port + 10} user=pondra dbname=pondra"
+    def over_pg(s):
+        """The column names and the rows (dicts, NULLs kept) of a statement over the Postgres port."""
+        with psycopg.connect(dsn, autocommit=True) as c:
+            cur = c.execute(s)
+            names = [d.name for d in cur.description]
+            return names, [dict(zip(names, r)) for r in cur.fetchall()]
+    def tuples(rows, keys=None):
+        """Rows as tuples of their values: under `keys` (JSON leaves out NULLs, so a key a row lacks is None), else in each row's own key order; floats rounded to 6 places."""
+        pick = (lambda r: [r.get(k) for k in keys]) if keys else (lambda r: list(r.values()))
+        return [tuple(round(v, 6) if isinstance(v, float) else v for v in pick(r)) for r in rows]
+    same = lambda a, b, keys=None: sorted(tuples(a, keys), key=repr) == sorted(tuples(b, keys), key=repr)
+    ordered = lambda a, b: tuples(a) == tuples(b)
+    median = lambda xs: sorted(xs)[len(xs) // 2]
+    fresh = itertools.count(1)  # (the result cache answers a text it has seen at this catalog version: each timed run gets a comment of its own)
+    def ms(s):
+        """One run of `s`, in milliseconds."""
+        t0 = time.perf_counter()
+        q(f"{s} /* run {next(fresh)} */")
+        return (time.perf_counter() - t0) * 1000
+    def insert(table, rows):
+        for lo in range(0, len(rows), 500):
+            q(f"INSERT INTO {table} VALUES " + ", ".join(rows[lo:lo + 500]))
+    def customer(i):
+        region = None if i % 37 == 0 else ["north", "south", "east", "west"][i % 4]
+        return f"({i}, {'NULL' if region is None else repr(region)})"
+    def order(i):
+        when = datetime.datetime(2026, 1, 1) + datetime.timedelta(days=i % 40, hours=i % 24)
+        status = "void" if i % 17 == 0 else "paid" if i % 3 else "open"
+        return f"({i}, {(i * 7) % 230 + 1}, TIMESTAMP '{when:%Y-%m-%d %H:%M:%S}', {((i * 13) % 500) + 0.25 * (i % 4)!r}, '{status}')"
+    B = "FROM orders o LEFT JOIN customers c ON o.customer_id = c.id WHERE o.status <> 'void'"
+    SALES = ("CREATE VIEW sales AS SELECT o.ordered_at::date AS day, c.region, o.status, sum(o.amount) AS MEASURE revenue, "
+             "count(DISTINCT o.customer_id) AS MEASURE customers, revenue / customers AS MEASURE per_customer, count(*) AS MEASURE orders_n, "
+             "sum(net(o.amount)) AS MEASURE net_revenue FROM orders o LEFT JOIN customers c ON o.customer_id = c.id WHERE o.status <> 'void'")
+    MQ2 = "SELECT region, MEASURE(per_customer) AS pc FROM sales GROUP BY region"
+    H2 = f"SELECT c.region, sum(o.amount) / count(DISTINCT o.customer_id) AS pc {B} GROUP BY 1"
+    MQ3 = "SELECT region, MEASURE(revenue) AS r FROM sales GROUP BY region"
+    H3 = f"SELECT c.region, sum(o.amount) AS r {B} GROUP BY 1"
+    checks, info = {}, {}
+    for s in [
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY NOT ENFORCED, region VARCHAR)",
+        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, ordered_at TIMESTAMP, amount DOUBLE, status VARCHAR)",
+        "CREATE FUNCTION net(x DOUBLE) RETURNS DOUBLE IMMUTABLE RETURN x * 0.8",
+        "CREATE VIEW plain_view AS SELECT status, sum(amount) AS total FROM orders GROUP BY status",
+        SALES,
+    ]:
+        q(s)
+    insert("customers", [customer(i) for i in range(1, 201)])
+    insert("orders", [order(i) for i in range(1, 3001)])
+    followers = [Node(lake, A.port + i).start() for i in (1, 2)]  # two more nodes on the lake: check 11 spreads over all three
+    time.sleep(1)  # (the followers hear of each other: spread queries need them)
+
+    # 1. a read of the view as stored: its dimensions and each measure, grouped by every dimension
+    plain = q("SELECT * FROM sales")
+    plain_h = q(f"SELECT o.ordered_at::date AS day, c.region, o.status, sum(o.amount) AS revenue, count(DISTINCT o.customer_id) AS customers, sum(o.amount) / count(DISTINCT o.customer_id) AS per_customer, count(*) AS orders_n, sum(o.amount * 0.8) AS net_revenue {B} GROUP BY 1, 2, 3")
+    names, _ = over_pg("SELECT * FROM sales LIMIT 1")  # (the cursor's column names: a row with a NULL leaves its key out of JSON)
+    info["plain"] = [plain, plain_h, names]
+    checks["a plain read is the view at its own grain: its dimensions and measures, grouped by every dimension"] = same(plain, plain_h) \
+        and names == ["day", "region", "status", "revenue", "customers", "per_customer", "orders_n", "net_revenue"]
+
+    # 2. per customer by region is the region's revenue over its distinct customers, not an average of the view's ratios
+    m2, h2 = q(MQ2), q(H2)
+    avg2 = q("SELECT region, avg(per_customer) AS pc FROM (SELECT * FROM sales) s GROUP BY region")
+    info["per_customer"] = [m2, h2, avg2]
+    checks["MEASURE() at the query's own grain: per customer by region is the region's revenue over its distinct customers, never an average of the view's rows"] = \
+        same(m2, h2) and not same(m2, avg2)
+
+    # 3. every way of naming a measure is one answer
+    hand3 = q(H3)
+    forms = ["MEASURE(revenue)", "AGG(revenue)", "AGGREGATE(revenue)", "measure(revenue)", "sum(revenue)", "max(revenue)", "revenue", "sales.revenue"]
+    got3 = {x: q(f"SELECT region, {x} AS r FROM sales GROUP BY region") for x in forms}
+    info["forms"] = [got3, hand3]
+    checks["every way of naming a measure gives one answer: MEASURE, AGG, AGGREGATE, sum() as BI tools send it, the bare name, qualified"] = \
+        all(same(v, hand3) for v in got3.values())
+
+    # 4. the columns that read no measure group; with none, one row
+    st, st_h = q("SELECT status, MEASURE(orders_n) AS n FROM sales"), q(f"SELECT o.status, count(*) AS n {B} GROUP BY 1")
+    one, one_h = q("SELECT MEASURE(revenue) AS r, MEASURE(customers) AS c FROM sales"), q(f"SELECT sum(o.amount) AS r, count(DISTINCT o.customer_id) AS c {B}")
+    info["no_group"] = [st, st_h, one, one_h]
+    checks["with no GROUP BY, the columns that read no measure group; with none, one row"] = same(st, st_h) and same(one, one_h) and len(one) == 1
+
+    # 5. WHERE on a dimension, HAVING, ORDER BY and LIMIT on measures
+    top = q("SELECT region, MEASURE(revenue) AS r FROM sales WHERE day >= DATE '2026-01-20' GROUP BY region HAVING MEASURE(orders_n) > 10 ORDER BY MEASURE(revenue) DESC LIMIT 3")
+    top_h = q(f"SELECT c.region, sum(o.amount) AS r {B} AND o.ordered_at::date >= DATE '2026-01-20' GROUP BY 1 HAVING count(*) > 10 ORDER BY sum(o.amount) DESC LIMIT 3")
+    info["top"] = [top, top_h]
+    checks["WHERE on a dimension, HAVING, ORDER BY and LIMIT on measures"] = ordered(top, top_h)
+
+    # 6. grouped by an expression of a dimension
+    mo = q("SELECT date_trunc('month', day) AS m, MEASURE(customers) AS n FROM sales GROUP BY 1")
+    mo_h = q(f"SELECT date_trunc('month', o.ordered_at::date) AS m, count(DISTINCT o.customer_id) AS n {B} GROUP BY 1")
+    info["by_month"] = [mo, mo_h]
+    checks["grouped by an expression of a dimension"] = same(mo, mo_h)
+
+    # 7. a measure through the lake's own function
+    nr = q("SELECT status, MEASURE(net_revenue) AS n FROM sales GROUP BY status")
+    nr_h = q(f"SELECT o.status, sum(o.amount * 0.8) AS n {B} GROUP BY 1")
+    info["net"] = [nr, nr_h]
+    checks["a measure through the lake's own function"] = same(nr, nr_h)
+
+    # 8. a join no used column reads is left out of the query
+    plan_day = json.dumps(q("EXPLAIN SELECT day, MEASURE(revenue) AS r FROM sales GROUP BY day"))
+    plan_region = json.dumps(q("EXPLAIN SELECT region, MEASURE(revenue) AS r FROM sales GROUP BY region"))
+    info["explain"] = [plan_day, plan_region]
+    checks["a join nothing reads is left out"] = "customers" not in plan_day and "customers" in plan_region
+
+    # 9. a view and a CTE over the view with measures
+    q("CREATE VIEW by_region AS SELECT region, MEASURE(revenue) AS revenue FROM sales GROUP BY region")
+    by_region = q("SELECT * FROM by_region")
+    m9 = q("WITH t AS (SELECT region, MEASURE(revenue) AS r FROM sales GROUP BY region) SELECT max(r) AS m FROM t")
+    h9 = q(f"SELECT max(r) AS m FROM (SELECT c.region, sum(o.amount) AS r {B} GROUP BY 1) t")
+    info["views"] = [by_region, m9, h9]
+    checks["views and CTEs over a view with measures"] = same(by_region, hand3) and same(m9, h9)
+
+    # 10. rows written after are counted
+    before10 = q(MQ3)
+    insert("orders", [order(i) for i in range(3001, 3301)])
+    after10, h10 = q(MQ3), q(H3)
+    info["after_writes"] = [before10, after10, h10]
+    checks["rows written after are counted"] = same(after10, h10) and not same(after10, before10)
+
+    # 11. spread over three nodes == one node
+    def spreads():
+        m = metrics_of(A.port)
+        return m.get("pondra_spread_queries_total", 0) + m.get("pondra_shuffled_queries_total", 0)
+    until(lambda: _try(lambda: call(A.port + 1, "POST", "/sql", b"SELECT count(*) AS n FROM orders")), [{"n": 3300}], 30)
+    spread_queries = [MQ2, "SELECT status, MEASURE(orders_n) AS n FROM sales", "WITH t AS (SELECT region, MEASURE(revenue) AS r FROM sales GROUP BY region) SELECT max(r) AS m FROM t"]
+    before_spread = spreads()
+    spread = [(q(s, "/sql?spread=1"), q(s, "/sql?spread=0")) for s in spread_queries]
+    info["spread"] = [spread, [before_spread, spreads()]]  # (the spread counters: whether the queries spread)
+    checks["spread over three nodes == one node"] = all(same(a, b) for a, b in spread)
+
+    # 12. over Postgres: the same answers, and the catalog lists the view's columns and its definition
+    http_rows = q(MQ3)
+    _, pg_rows = over_pg(MQ3)
+    _, cat = over_pg("SELECT column_name FROM information_schema.columns WHERE table_name = 'sales' ORDER BY ordinal_position")
+    _, defs = over_pg("SELECT definition FROM pg_views WHERE viewname = 'sales'")
+    cols = [r["column_name"] for r in cat]
+    info["postgres"] = [http_rows, pg_rows, cols, defs]
+    checks["over Postgres: MEASURE answers as over HTTP, and the catalog lists the view's dimensions and measures"] = \
+        same(http_rows, pg_rows, ["region", "r"]) and cols == ["day", "region", "status", "revenue", "customers", "per_customer", "orders_n", "net_revenue"] \
+        and any("AS MEASURE revenue" in (r["definition"] or "") for r in defs)
+
+    # 18. frames: pondra.measure through a frame's steps (a filter is a CTE the measure is read through)
+    db = _client(A.port)
+    import pondra as pondra_client
+    frame = db.table("sales").filter(pondra_client.col("day") >= pondra_client.sql_expr("DATE '2026-01-20'")).group_by("region").agg(pondra_client.measure("revenue"))
+    try:
+        framed = [{k: v for k, v in r.items() if v is not None} for r in frame.rows()]  # (the client puts nulls back; the node's JSON leaves them out)
+    except Exception as e:  # (kept in info: the frame's SQL and why it failed)
+        framed = [{"error": str(e)[:300]}]
+    framed_h = q(f"SELECT c.region, sum(o.amount) AS revenue {B} AND o.ordered_at::date >= DATE '2026-01-20' GROUP BY 1")
+    info["frames"] = [frame.sql, framed, framed_h]
+    checks["frames: pondra.measure through a frame's steps answers as the SQL does"] = bool(framed) and same(framed, framed_h)
+
+    # 13. SHOW CREATE and pondra.objects show AS MEASURE; the statement makes the view again (after its drops)
+    shown = q("SHOW CREATE VIEW sales")[0]["definition"] or ""
+    listed_def = [r.get("definition") or "" for r in q("SELECT definition FROM pondra.objects WHERE name = 'sales'")]
+    q("DROP VIEW by_region")
+    q("DROP VIEW sales")
+    made = _raises_text(lambda: q(shown))  # ("" when it made the view)
+    again = _try(lambda: q(MQ2)) or []
+    info["show_create"] = [shown, listed_def, made, again]
+    checks["SHOW CREATE VIEW and pondra.objects show AS MEASURE, and the statement makes the view again"] = \
+        "AS MEASURE revenue" in shown and "pondra_measure" not in shown and any("AS MEASURE" in d for d in listed_def) \
+        and made == "" and same(again, q(H2))  # (the hand query again: check 10 wrote rows since h2)
+
+    # 14. pondra.parts lists each measure with its expression; find() finds them
+    parts = q("SELECT kind, name, definition FROM pondra.parts WHERE object = 'sales'")
+    measure_names = {r["name"] for r in parts if r["kind"] == "measure"}
+    column_names = {r["name"] for r in parts if r["kind"] == "column"}
+    rev_def = next((r.get("definition") or "" for r in parts if r["kind"] == "measure" and r["name"] == "revenue"), "")
+    found = q("SELECT * FROM pondra.find('revenue', kind => 'measure')")
+    metric = q("SELECT * FROM pondra.find('metric')")
+    info["parts"] = [parts, found, metric]
+    checks["pondra.parts lists each measure with its expression, and find(kind => 'measure') finds them"] = \
+        measure_names == {"revenue", "customers", "per_customer", "orders_n", "net_revenue"} and column_names == {"day", "region", "status"} \
+        and "sum(o.amount)" in rev_def and bool(found) and found[0]["name"] == "revenue" \
+        and any(r["kind"] == "measure" and r["is"] == "part" for r in metric)
+
+    # 15. refused by name, and nothing made
+    refusals = [
+        ("SELECT region FROM sales WHERE revenue > 5", "HAVING"),
+        ("SELECT sum(revenue * 2) AS x FROM sales", "inside sum"),
+        ("SELECT MEASURE(revenue) FROM sales s JOIN customers c ON s.region = c.region", "inside the view"),
+        ("SELECT MEASURE(nothing) FROM sales", "no measure nothing"),
+        ("SELECT MEASURE(total) FROM plain_view", "reads none"),
+        ("CREATE VIEW bad1 AS SELECT status, sum(amount) AS MEASURE m FROM orders GROUP BY status", "GROUP BY"),
+        ("CREATE VIEW bad2 AS SELECT o.status, sum(o.amount) AS MEASURE m FROM orders o RIGHT JOIN customers c ON o.customer_id = c.id", "LEFT JOIN"),
+        ("CREATE VIEW bad3 AS SELECT o.status, sum(o.amount) AS MEASURE m FROM orders o LEFT JOIN customers c ON o.status = c.region", "not on a key"),
+        ("CREATE VIEW bad4 AS SELECT o.status, sum(o.amount) AS MEASURE m FROM orders o LEFT JOIN orders o2 ON o.id = o2.id", "has no key"),
+        ("CREATE VIEW bad5 AS SELECT a + 1 AS MEASURE b, b + 1 AS MEASURE a FROM orders", "refer to each other"),
+        ("CREATE MATERIALIZED VIEW bad6 AS SELECT sum(amount) AS MEASURE m FROM orders", "materialized view"),
+        ("CREATE VIEW bad7 (s, m) AS SELECT status, sum(amount) AS MEASURE m FROM orders", "not in a list"),
+    ]
+    refused = [http(s) for s, _ in refusals]
+    info["refused"] = [[st_code, text[:200]] for st_code, text in refused]
+    no_bad = q("SELECT name FROM pondra.objects WHERE name LIKE 'bad%'")
+    checks["refused by name, and nothing made"] = all(st_code >= 400 and phrase in text for (st_code, text), (_, phrase) in zip(refused, refusals)) and no_bad == []
+
+    # 16. a query with measures costs what its GROUP BY written by hand costs (each run its own text: none from the result cache,
+    # which keys on the text as expanded; a measure's query is written anew there, without its comment, so each run names its column apart)
+    named = lambda s: s.replace(" AS pc ", f" AS pc_{next(fresh)} ")
+    for _ in range(3):
+        ms(named(MQ2)), ms(named(H2))
+    m_ms, h_ms = [], []
+    for _ in range(15):
+        m_ms.append(ms(named(MQ2)))
+        h_ms.append(ms(named(H2)))
+    measure_ms, hand_ms = median(m_ms), median(h_ms)
+    info["timing_ms"] = {"measure": round(measure_ms, 2), "hand": round(hand_ms, 2)}
+    checks["a query with measures costs what its GROUP BY written by hand costs"] = measure_ms <= hand_ms * 1.25 + 3
+
+    # 17. a query naming no measure pays nothing for 100 views with measures
+    CNT = "SELECT count(*) AS n FROM orders WHERE amount > 100"
+    before_ms = [ms(CNT) for _ in range(15)]
+    call(A.port, "POST", "/sql", ";\n".join(f"CREATE VIEW mv_{i} AS SELECT status, sum(amount) AS MEASURE m FROM orders" for i in range(100)).encode(), timeout=600)
+    after_ms = [ms(CNT) for _ in range(15)]
+    before_med, after_med = median(before_ms), median(after_ms)
+    info["no_measure_ms"] = {"before": round(before_med, 2), "after": round(after_med, 2)}
+    checks["a query naming no measure pays nothing for 100 views with measures"] = after_med <= before_med * 1.25 + 2
+
+    for n in followers + [node]:
+        n.kill()
+    ok = all(checks.values())
+    print(json.dumps({"measures": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(bool(v) for v in checks.values())} of {len(checks)} measures checks"
+
+
+def facts():
+    """Key facts on views (ADR-065 §2, L5-2): PRIMARY KEY, UNIQUE and FOREIGN KEY said NOT ENFORCED, kept with the view: listed, shown, moved and dropped with it, seen by Postgres and by a measure's join, refused by name where they can't hold, exported, and never checked."""
+    import psycopg
+    lake = new_lake()
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
+    dsn = f"host=127.0.0.1 port={A.port + 10} user=pondra dbname=pondra"
+    q = lambda s: call(A.port, "POST", "/sql", s.encode(), timeout=120)
+    def run(s):
+        """(status, text) of a statement sent to /sql: a refusal is a status of 400 or more, its words in the text."""
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", s.encode())
+        r = c.getresponse()
+        return r.status, r.read().decode()
+    def over_pg(s):
+        """The rows (dicts) of a statement over the Postgres port."""
+        with psycopg.connect(dsn, autocommit=True) as c:
+            cur = c.execute(s)
+            names = [d.name for d in cur.description]
+            return [dict(zip(names, r)) for r in cur.fetchall()]
+    def parts(obj):
+        """The key and link parts of an object (pondra.parts), as sorted (kind, name, definition)."""
+        rows = q(f"SELECT kind, name, definition FROM pondra.parts WHERE object = '{obj}'")
+        return sorted((r["kind"], r["name"], r.get("definition") or "") for r in rows if r["kind"] in ("key", "link"))
+    def shown(kind, name):
+        """SHOW CREATE of an object, as its statement."""
+        return q(f"SHOW CREATE {kind} {name}")[0]["definition"]
+    def made_now(names):
+        """The names, of these, that the lake holds (as pondra.objects lists them)."""
+        listed = q("SELECT name FROM pondra.objects WHERE name IN (" + ", ".join(f"'{n}'" for n in names) + ")")
+        return sorted(r["name"] for r in listed)
+
+    PK = "PRIMARY KEY (id) NOT ENFORCED"
+    FK = "FOREIGN KEY (region) REFERENCES regions(code) NOT ENFORCED"
+    for s in [
+        "CREATE TABLE regions (code VARCHAR PRIMARY KEY NOT ENFORCED, name VARCHAR)",
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY NOT ENFORCED, name VARCHAR, region VARCHAR)",
+        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, amount DOUBLE)",
+        "INSERT INTO regions VALUES ('north', 'North'), ('south', 'South'), ('east', 'East')",
+        "INSERT INTO customers VALUES (1, 'ann', 'north'), (2, 'bob', 'south'), (3, 'cy', 'north'), (4, 'dee', 'east')",
+        "INSERT INTO orders VALUES (1, 1, 10.0), (2, 2, 20.5), (3, 3, 5.0), (4, 1, 7.0), (5, 4, 3.0)",
+    ]:
+        q(s)
+    checks, info = {}, {}
+
+    # 1. a view's key and link made with it, listed as parts; find() finds the key
+    q("CREATE VIEW customers_v (PRIMARY KEY (id) NOT ENFORCED, CONSTRAINT customers_v_region_fkey FOREIGN KEY (region) REFERENCES regions (code) NOT ENFORCED) AS SELECT id, name, region FROM customers")
+    key_parts = sorted([("key", "customers_v_pkey", PK), ("link", "customers_v_region_fkey", FK)])
+    found = q("SELECT * FROM pondra.find('customers_v_pkey')")
+    info["parts"] = parts("customers_v")
+    checks["a view's key and link made with it are listed as parts with their definitions, and find() finds the key"] = \
+        parts("customers_v") == key_parts and any(r.get("name") == "customers_v_pkey" for r in found)
+
+    # 8. Postgres sees them: pg_constraint's p and f rows, and information_schema lists them for the view
+    pg_rows = over_pg("SELECT c.conname, c.contype FROM pg_constraint c JOIN pg_class r ON c.conrelid = r.oid WHERE r.relname = 'customers_v'")
+    info_rows = over_pg("SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'customers_v'")
+    info["pg"] = [pg_rows, info_rows]
+    checks["Postgres sees them: pg_constraint's p and f rows for the view, and information_schema.table_constraints lists them"] = \
+        sorted((r["conname"], r["contype"]) for r in pg_rows) == [("customers_v_pkey", "p"), ("customers_v_region_fkey", "f")] \
+        and sorted((r["constraint_name"], r["constraint_type"]) for r in info_rows) == [("customers_v_pkey", "PRIMARY KEY"), ("customers_v_region_fkey", "FOREIGN KEY")]
+
+    # 9a. a measure view joins a view whose PRIMARY KEY is a fact (its key is the join's)
+    joined = run("CREATE VIEW sales_v AS SELECT c.region, sum(o.amount) AS MEASURE revenue FROM orders o LEFT JOIN customers_v c ON o.customer_id = c.id")
+    run("DROP VIEW sales_v")
+    info["measure_join"] = joined
+    checks["a measure view joins onto a view whose PRIMARY KEY is a fact"] = joined[0] < 400
+
+    # 2. ALTER VIEW adds and drops one fact; IF NOT EXISTS and IF EXISTS say nothing twice; a bare DROP names what's missing
+    U = "customers_v_name_key"
+    ADD = f"ALTER VIEW customers_v ADD CONSTRAINT {U} UNIQUE (name) NOT ENFORCED"
+    added = run(ADD)[0]
+    added_again = run(ADD.replace("ADD CONSTRAINT", "ADD CONSTRAINT IF NOT EXISTS"))[0]
+    listed_once = [p for p in parts("customers_v") if p[1] == U]
+    dropped = run(f"ALTER VIEW customers_v DROP CONSTRAINT {U}")[0]
+    gone = not [p for p in parts("customers_v") if p[1] == U]
+    dropped_again = run(f"ALTER VIEW customers_v DROP CONSTRAINT IF EXISTS {U}")[0]
+    bare_status, bare_text = run(f"ALTER VIEW customers_v DROP CONSTRAINT {U}")
+    info["alter"] = [added, added_again, listed_once, dropped, dropped_again, bare_status, bare_text[:300]]
+    checks["ALTER VIEW adds and drops one fact: listed, IF NOT EXISTS and IF EXISTS say nothing twice, a bare DROP of a missing one is refused by name"] = \
+        added < 400 and added_again < 400 and listed_once == [("key", U, "UNIQUE (name) NOT ENFORCED")] and dropped < 400 and gone \
+        and dropped_again < 400 and bare_status >= 400 and U in bare_text
+
+    # 10. refused by name, and nothing made: each refusal's words, the catalog as it was
+    before_def, before_parts = shown("VIEW", "customers_v"), parts("customers_v")
+    q("CREATE MATERIALIZED VIEW mv_big (CONSTRAINT big CHECK (amount > 0) ON VIOLATION DROP ROW) AS SELECT id, amount FROM orders")
+    refusals = [
+        ("CREATE VIEW r1 (UNIQUE (name)) AS SELECT name FROM customers", ["write UNIQUE (name) NOT ENFORCED"]),
+        ("CREATE VIEW r2 (PRIMARY KEY (id)) AS SELECT id FROM customers", ["write PRIMARY KEY (id) NOT ENFORCED"]),
+        ("CREATE VIEW r3 (CONSTRAINT r3_c CHECK (id > 0)) AS SELECT id FROM customers", ["a view's CHECK"]),
+        ("CREATE VIEW r4 (PRIMARY KEY (nothing) NOT ENFORCED) AS SELECT id FROM customers", ["nothing", "does not exist"]),
+        ("CREATE VIEW r5 (PRIMARY KEY (id) NOT ENFORCED, CONSTRAINT r5_b PRIMARY KEY (name) NOT ENFORCED) AS SELECT id, name FROM customers", ["multiple primary keys", "r5"]),
+        ("ALTER VIEW customers_v ADD CONSTRAINT customers_v_pkey UNIQUE (name) NOT ENFORCED", ["already exists", "customers_v_pkey"]),
+        ("ALTER MATERIALIZED VIEW mv_big ADD CONSTRAINT big UNIQUE (amount) NOT ENFORCED", ["already exists", "big"]),
+        ("ALTER VIEW customers ADD CONSTRAINT customers_u UNIQUE (name) NOT ENFORCED", ["is a table", "ALTER TABLE"]),
+        ("ALTER TABLE customers_v ADD CONSTRAINT customers_v_u UNIQUE (name) NOT ENFORCED", ["ALTER VIEW customers_v"]),
+        ("ALTER VIEW nope ADD CONSTRAINT nope_u UNIQUE (id) NOT ENFORCED", ["nope", "does not exist"]),
+        ("ALTER VIEW customers_v ADD CONSTRAINT customers_v_c CHECK (id > 0)", ["a view's CHECK"]),
+        ("CREATE VIEW m_v (PRIMARY KEY (total) NOT ENFORCED) AS SELECT customer_id, sum(amount) AS MEASURE total FROM orders", ["total", "does not exist"]),
+        ("CREATE TEMP VIEW t_v (PRIMARY KEY (id) NOT ENFORCED) AS SELECT id FROM customers", ["temporary view"]),
+    ]
+    got = [(s, *run(s)) for s, _ in refusals]
+    info["refusals"] = [[status, text[:300]] for _, status, text in got]
+    refused_by_name = all(status >= 400 and all(w in text for w in words) for (_, status, text), (_, words) in zip(got, refusals))
+    missing_ok = run("ALTER VIEW IF EXISTS nope DROP CONSTRAINT nope_u")[0] < 400
+    pg_code, pg_msg = "", ""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        try:
+            c.execute("ALTER TABLE customers_v ADD CONSTRAINT customers_v_u UNIQUE (name) NOT ENFORCED")
+        except psycopg.Error as e:
+            pg_code, pg_msg = e.sqlstate or "", str(e)
+    info["pg_refused"] = [pg_code, pg_msg[:300]]
+    q("DROP MATERIALIZED VIEW mv_big")
+    unchanged = shown("VIEW", "customers_v") == before_def and parts("customers_v") == before_parts
+    checks["refused by name, its words naming it, and nothing made: the view's facts as they were (42809 over Postgres, pointing at ALTER VIEW)"] = \
+        refused_by_name and missing_ok and pg_code == "42809" and "ALTER VIEW customers_v" in pg_msg \
+        and made_now(["r1", "r2", "r3", "r4", "r5", "m_v", "t_v", "nope"]) == [] and unchanged
+
+    # 3. SHOW CREATE VIEW run again after a drop makes the same view, with the same parts
+    shown_1, parts_1 = shown("VIEW", "customers_v"), parts("customers_v")
+    q("DROP VIEW customers_v")
+    q(shown_1)
+    shown_2 = shown("VIEW", "customers_v")
+    info["show_create"] = [shown_1, shown_2]
+    checks["SHOW CREATE VIEW holds the list, and run again after a drop makes the same view with the same parts"] = \
+        PK in shown_1 and "customers_v_region_fkey" in shown_1 and shown_2 == shown_1 and parts("customers_v") == parts_1
+
+    # 4. kept through CREATE OR REPLACE while their columns are there; a column gone is refused by name
+    q("CREATE OR REPLACE VIEW customers_v (id, name, region) AS SELECT id, name, region FROM customers")
+    kept_by_list = parts("customers_v") == key_parts  # (a column list of the same names keeps them)
+    st_list, text_list = run("CREATE OR REPLACE VIEW customers_v (cid, name, region) AS SELECT id, name, region FROM customers")
+    info["list_refused"] = [st_list, text_list[:300]]
+    refused_list = st_list >= 400 and all(w in text_list for w in ["customers_v_pkey", "id", "DROP CONSTRAINT"]) and parts("customers_v") == key_parts
+    q("CREATE OR REPLACE VIEW customers_v AS SELECT id, name, region, 1 AS extra FROM customers")
+    kept_both = parts("customers_v") == key_parts
+    kept_def = shown("VIEW", "customers_v")
+    st, text = run("CREATE OR REPLACE VIEW customers_v AS SELECT id, name FROM customers")
+    info["replace_refused"] = [st, text[:300]]
+    refused_replace = st >= 400 and all(w in text for w in ["customers_v_region_fkey", "region", "DROP CONSTRAINT"]) and shown("VIEW", "customers_v") == kept_def
+    q("ALTER VIEW customers_v DROP CONSTRAINT customers_v_region_fkey")
+    q("CREATE OR REPLACE VIEW customers_v AS SELECT id, name FROM customers")
+    pk_stays = parts("customers_v") == [("key", "customers_v_pkey", PK)]
+    q("CREATE OR REPLACE VIEW customers_v (UNIQUE (name) NOT ENFORCED) AS SELECT id, name FROM customers")
+    only_listed = parts("customers_v") == [("key", U, "UNIQUE (name) NOT ENFORCED")]
+    checks["kept through CREATE OR REPLACE while their columns are there (a column list of the same names too; one renaming a fact's column is refused by name); one whose column is gone is refused; a list replaces them"] = \
+        kept_by_list and refused_list and kept_both and refused_replace and pk_stays and only_listed
+
+    # 5. moved by a rename, gone with a drop, and a view made without a list has none
+    before_rename = parts("customers_v")
+    q("ALTER VIEW customers_v RENAME TO clients_v")
+    moved = parts("clients_v") == before_rename and parts("customers_v") == []
+    q("DROP VIEW clients_v")
+    dropped_both = parts("clients_v") == [] and parts("customers_v") == []
+    q("CREATE VIEW customers_v AS SELECT id, name, region FROM customers")
+    no_list = parts("customers_v") == []
+    checks["moved by a rename, gone with a drop, and a view made without a list has no key"] = moved and dropped_both and no_list
+
+    # 9b. the same measure join onto a view with no key fact is refused: "has no key"
+    no_key = run("CREATE VIEW sales_bad AS SELECT c.region, sum(o.amount) AS MEASURE revenue FROM orders o LEFT JOIN customers_v c ON o.customer_id = c.id")
+    info["measure_no_key"] = no_key
+    checks["a measure view joining a view with no key fact is refused: has no key"] = no_key[0] >= 400 and "has no key" in no_key[1]
+
+    # 6. never checked: a PRIMARY KEY column with duplicates reads every row
+    q("CREATE VIEW dup_v (PRIMARY KEY (region) NOT ENFORCED) AS SELECT region FROM customers")
+    dup_rows = q("SELECT region FROM dup_v")
+    checks["never checked: a view whose PRIMARY KEY column has duplicate values reads all its rows"] = \
+        len(dup_rows) == 4 and sorted(r["region"] for r in dup_rows) == sorted(r["region"] for r in q("SELECT region FROM customers"))
+
+    # 7. a materialized view's facts: the GROUP BY key listed, ALTER adds one, SHOW CREATE runs again, rows keep flowing
+    q("CREATE MATERIALIZED VIEW region_totals (PRIMARY KEY (region) NOT ENFORCED) AS SELECT c.region, sum(o.amount) AS total FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region")
+    q("ALTER MATERIALIZED VIEW region_totals ADD UNIQUE (total) NOT ENFORCED")
+    mv_parts = parts("region_totals")
+    info["mv_parts"] = mv_parts
+    mv_listed = ("key", "region_totals_pkey", "PRIMARY KEY (region)") in mv_parts and ("key", "region_totals_total_key", "UNIQUE (total) NOT ENFORCED") in mv_parts
+    mv_shown = shown("MATERIALIZED VIEW", "region_totals")
+    q("DROP MATERIALIZED VIEW region_totals")
+    q(mv_shown)
+    mv_same = shown("MATERIALIZED VIEW", "region_totals") == mv_shown and parts("region_totals") == mv_parts
+    q("INSERT INTO orders VALUES (6, 2, 1.5)")
+    got_rows = sorted((r["region"], round(r["total"], 6)) for r in q("SELECT region, total FROM region_totals"))
+    want_rows = sorted((r["region"], round(r["total"], 6)) for r in q("SELECT c.region, sum(o.amount) AS total FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region"))
+    checks["a materialized view's facts: the GROUP BY key and ALTER's UNIQUE listed, SHOW CREATE runs again to the same view, rows keep flowing"] = \
+        mv_listed and mv_same and got_rows == want_rows and len(want_rows) == 3
+
+    # 11. export writes the list: the view made again with its key and link, then GET /export holds them
+    q("CREATE OR REPLACE VIEW customers_v (PRIMARY KEY (id) NOT ENFORCED, CONSTRAINT customers_v_region_fkey FOREIGN KEY (region) REFERENCES regions (code) NOT ENFORCED) AS SELECT id, name, region FROM customers")
+    exported = call(A.port, "GET", "/export")
+    text = next((t for t in exported.values() if "CREATE VIEW customers_v" in t), "")
+    info["export"] = text[:400]
+    checks["export writes them: the view's file holds its key and link"] = \
+        "CONSTRAINT customers_v_pkey PRIMARY KEY (id) NOT ENFORCED" in text and "CONSTRAINT customers_v_region_fkey FOREIGN KEY (region) REFERENCES regions(code) NOT ENFORCED" in text
+
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"facts": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(bool(v) for v in checks.values())} of {len(checks)} facts checks"
+
+
 def sparksql():
     """Spark SQL where PySpark code sends it (H8): `spark.sql(…)` read with Spark's grammar and
     turned into Pondra's SQL (`spark_sql('…')`): `"text"`, backticks, `LATERAL VIEW [OUTER]
@@ -14246,13 +14698,13 @@ def answers_big():
 # suite in parts side by side that end together. A section not listed counts as 5 s.
 SECS = {"memory": 255, "cursors": 15, "owned": 20, "signed": 20, "guesses": 15, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
-        "users": 15, "find": 15, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
+        "users": 15, "find": 15, "measures": 120, "facts": 90, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
         "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "ddlgaps": 40, "sqla": 30, "unique_doors": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, objects, registry, find, sequences, constraints, ddlgaps, sqla, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -14284,7 +14736,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "objects", "registry", "find", "sequences", "constraints", "ddlgaps", "sqla", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -14297,7 +14749,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
