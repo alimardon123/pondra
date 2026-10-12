@@ -2172,3 +2172,24 @@ fn spark_of(ctx: &SessionContext) -> Spark {
         names,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A catalog its own node's stop closed answers an error, never a restart (invariant 300):
+    /// taken for a fence, the write below would exec this test again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_by_its_own_stop_is_no_fence() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-closed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let store: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir)?);
+        let cat = Catalog::writer(store, ObjectStoreCacheOptions::default(), true).await?;
+        let _ = cat.write(vec![("t/a".into(), b"1".to_vec())], &[]).await?;
+        cat.close().await?;
+        assert!(cat.write(vec![("t/b".into(), b"2".to_vec())], &[]).await.is_err());
+        assert!(cat.get_raw("d/1").await.is_err());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+}
