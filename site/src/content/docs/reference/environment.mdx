@@ -130,6 +130,7 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 | `PONDRA_FILE_VERSIONS` | `50` | how many versions of each of the lake's files are kept ([versions](/pondra/reference/http/#files)) |
 | `PONDRA_FILE_VERSIONS_DAYS` | `90` | how many days a file's versions are kept (its newest always is) |
 | `PONDRA_PURGE_ROWS` | `100000` | after `UPDATE`, `DELETE` and `MERGE` on an append table, its files are rewritten without the old rows once this many, or a tenth of the table, are waiting. A table that publishes a format is rewritten every round |
+| `PONDRA_LOCK_LEASE_SECS` | `60` | how long a row lock lasts on the leader without word from the transaction or write that holds it. A write whose answer was lost keeps its rows locked this long, since it may still land; another writer of those rows waits, or reaches its `lock_timeout` |
 | `PONDRA_INLINE_KB` | `64`, or `1024` with `--ack replicated` and `--replicas` above 1 | a write smaller than this is carried inside the commit. A bigger one is written as its own object first |
 
 ## Python workers
