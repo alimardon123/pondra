@@ -32,6 +32,10 @@ Columns take these types. A list is written `type[]`, such as `FLOAT[]` for an e
 | `type[]` | | a list of one type |
 | an enum type, or `ENUM('a', 'b')` | | text, one of its labels ([enum types](#enum-types)) |
 
+A `DOUBLE` or `REAL` that meets a decimal, a column or a number such as `0.5`, makes it a `DOUBLE`, as
+Postgres and DuckDB do: `x > 0.5` and `x * 1.5` on a `DOUBLE` column are worked out in doubles. An
+`INSERT`'s `VALUES` are taken as their columns' types.
+
 A `TIMESTAMPTZ` written with an offset (`'2026-09-29 10:00:00+05'`) is stored as the instant it names,
 so it reads back as `2026-09-29T05:00:00Z`. A time may leave out its seconds, as in Postgres and
 DuckDB: `'2024-05-01 10:30'` is a timestamp in `INSERT`, `CAST`, `TIMESTAMP '…'` and comparisons.

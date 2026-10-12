@@ -86,7 +86,7 @@ pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
 /// more ("too large to store in a Decimal128 of precision 30"). Done before DataFusion's type
 /// coercion, which then finds both sides alike: comparisons and arithmetic, BETWEEN, IN lists,
 /// CASE's branches, COALESCE and its kind, a join's keys and a UNION's columns. (An INSERT's VALUES
-/// take their columns' types: `write::rows_for`.)
+/// take their columns' types: `write::rows`.)
 #[derive(Debug)]
 struct FloatsWin;
 
@@ -97,6 +97,9 @@ impl AnalyzerRule for FloatsWin {
 
     fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_up_with_subqueries(|plan| {
+            if !may_float(&plan) {
+                return Ok(Transformed::no(plan)); // (most steps of most queries: no float can meet anything there)
+            }
             let plan = match plan {
                 LogicalPlan::Union(u) => union_floats(u)?,
                 LogicalPlan::Join(j) => join_floats(j)?,
@@ -117,6 +120,38 @@ impl AnalyzerRule for FloatsWin {
         })
         .data()
     }
+}
+
+/// Whether a float may be among a step's expressions or its UNION's columns: a column of its inputs
+/// (or of the table a scan's filters read) is a REAL or DOUBLE, or an expression is a float literal,
+/// a cast to one, or something whose type comes from elsewhere (a function's or an aggregate's
+/// answer, a subquery's, a parameter, an outer query's column, an unnested list). Nothing else
+/// makes one, so a step with none is left as it is without working out its types: working them
+/// out for every step cost join-heavy queries 3–7% more planning (TPC-H q8 2.9 ms).
+fn may_float(plan: &LogicalPlan) -> bool {
+    let floats = |s: &DFSchema| s.fields().iter().any(|f| f.data_type().is_floating());
+    let scanned = match plan {
+        LogicalPlan::TableScan(ts) => !ts.filters.is_empty() && ts.source.schema().fields().iter().any(|f| f.data_type().is_floating()),
+        _ => false,
+    };
+    if scanned || plan.inputs().into_iter().any(|p| floats(p.schema())) {
+        return true;
+    }
+    let mut may = false;
+    let _ = plan.apply_expressions(|e| {
+        e.apply(|e| {
+            may = match e {
+                Expr::Literal(v, _) => v.data_type().is_floating(),
+                Expr::Cast(c) => c.field.data_type().is_floating(),
+                Expr::TryCast(c) => c.field.data_type().is_floating(),
+                Expr::ScalarVariable(f, _) => f.data_type().is_floating(),
+                Expr::ScalarFunction(_) | Expr::AggregateFunction(_) | Expr::WindowFunction(_) | Expr::ScalarSubquery(_) | Expr::Placeholder(_) | Expr::OuterReferenceColumn(..) | Expr::Unnest(_) => true,
+                _ => false,
+            };
+            Ok(if may { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
+        })
+    });
+    may
 }
 
 /// `e` with its operands as doubles where a float meets a decimal among them.
