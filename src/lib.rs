@@ -82,6 +82,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod past;
 #[cfg(feature = "server")] mod tls;
 #[cfg(feature = "server")] mod txn;
+#[cfg(feature = "server")] mod returning;
 #[cfg(feature = "server")] mod mcp;
 #[cfg(feature = "server")] mod pg;
 #[cfg(feature = "server")] mod path;
