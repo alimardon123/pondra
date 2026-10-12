@@ -8656,7 +8656,7 @@ def sequences():
     stepped = [q("SELECT nextval('o') AS v")[0]["v"] for _ in range(2)]  # (after a change, every node's block goes: a gap, as Postgres's CACHE leaves)
     info["o"] = [o, cur, before, none, after_set, restarted, stepped]
     checks["START 10 INCREMENT 5 in any order; currval the session's last (55000 before, none without a session); setval; RESTART; INCREMENT changed"] = \
-        o == [10, 15] and cur == 15 and before[1] == "55000" and none[0] == 500 and after_set == 105 and restarted == 7 and stepped[1] - stepped[0] == 2 and stepped[0] > restarted
+        o == [10, 15] and cur == 15 and before[1] == "55000" and none[0] == 409 and after_set == 105 and restarted == 7 and stepped[1] - stepped[0] == 2 and stepped[0] > restarted
     q("ALTER SEQUENCE o RENAME TO o2")
     renamed = (q("SELECT nextval('o2') AS v")[0]["v"], err("SELECT nextval('o') AS v")[1])
     q("CREATE SEQUENCE c AS smallint MAXVALUE 3 CYCLE")
