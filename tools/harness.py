@@ -10352,7 +10352,7 @@ def dialects():
     info["missed their refusal"] = missed
     checks["what a SET asks for is done, or refused by name with its SQLSTATE and the way out (SET ROLE, TRANSACTION, NAMES, DateStyle, @x, …)"] = not missed
     internal = [r["sql"][:80] for r in rows if not r["ok"] and r["sqlstate"] == "XX000"]
-    info["refused as XX000 (internal)"] = len(internal)
+    info["refused as XX000 (internal)"] = internal
     checks[f"at most {XX000} refusals are XX000 (an internal error) rather than a code that names what went wrong"] = len(internal) <= XX000
     node.kill()
     ok = all(checks.values())

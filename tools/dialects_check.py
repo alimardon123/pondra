@@ -166,7 +166,7 @@ CASES = [
     ("snowflake", "ALTER TABLE t_case_201 RENAME COLUMN label TO status_label"),
     ("snowflake", "ALTER TABLE t_case_201 ALTER COLUMN status_label SET DATA TYPE VARCHAR(200)"),
     ("snowflake", "ALTER TABLE t_case_202 RENAME TO t_case_203"),
-    ("snowflake", "COPY INTO t_case_203 FROM @my_stage/notes.csv FILE_FORMAT = (TYPE = CSV SKIP_HEADER = 1)"),
+    ("snowflake", "COPY INTO t_case_203 FROM @my_stage/notes.csv FILE_FORMAT = (TYPE = CSV SKIP_HEADER = 1)", ("0A000", "FROM 's3://")),
     ("snowflake", "CREATE OR REPLACE STREAM orders_stream ON TABLE orders"),
     ("snowflake", "CREATE OR REPLACE TASK refresh_totals WAREHOUSE = compute_wh SCHEDULE = '60 MINUTE' AS INSERT INTO t_case_201 (id, status_label, amount) SELECT id, status, amount FROM orders_stream"),
     # snowflake: sessions and admin
