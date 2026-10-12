@@ -810,10 +810,14 @@ def drain_check(new_bin, work, port):
     th.join()
     info["seconds to stop with PONDRA_DRAIN_SECS=1 and a longer query"] = round(took, 1)
     checks["…but for PONDRA_DRAIN_SECS at most"] = took < 4
-    # A leader stopped under load hands over at once; killed, its followers wait out the lease.
+    # A leader stopped under load hands over at once; killed, its followers wait out the lease. They
+    # are on other machines: each node has a temporary folder of its own, where its terms' lock files
+    # are (invariant 370), so none sees another's lock let go. On one machine a killed leader's lock is
+    # let go at once, and its follower leads at once (recorded below).
     lake = f"s3://{os.environ['PONDRA_BUCKET']}/drain-{os.getpid()}-{int(time.time())}" if A.s3 else os.path.join(work, "drain-cluster")
     info["the cluster's lake"] = lake
-    nodes = [Node(new_bin, lake, port + i, work).start() for i in range(3)]
+    machine = lambda name: os.makedirs(os.path.join(work, name), exist_ok=True) or {"TMPDIR": os.path.join(work, name)}
+    nodes = [Node(new_bin, lake, port + i, work, env=machine(f"tmp-{i}")).start() for i in range(3)]
     nodes[0].post("/tables/ev2", json.dumps([["producer", "Utf8"], ["seq", "Int64"], ["i", "Int64"]]))
     until(lambda: all(x.q("SELECT count(*) AS n FROM ev2") for x in nodes), 20)
     live = list(nodes)
@@ -842,7 +846,22 @@ def drain_check(new_bin, work, port):
     [x.stop() for x in live]
     if A.s3:
         gone(lake)
+    info["killed, its follower on the same machine leads after, s"] = killed_here(new_bin, work, port, machine("tmp-here"))
     return checks, info
+
+
+def killed_here(new_bin, work, port, env):
+    """How soon a follower sharing its leader's temporary folder leads once the leader is killed."""
+    nodes = [Node(new_bin, os.path.join(work, "drain-here"), port + i, work, env=env).start() for i in range(2)]
+    until(lambda: all(x.get("/stats")["role"] in ("leader", "follower") for x in nodes), 20)
+    leader = next(x for x in nodes if x.get("/stats")["role"] == "leader")
+    other = next(x for x in nodes if x is not leader)
+    t0 = time.time()
+    leader.stop("kill")
+    until(lambda: other.get("/stats", timeout=2)["role"] == "leader", 60)
+    took = round(time.time() - t0, 2)
+    other.stop()
+    return took
 
 
 def gone(lake):
