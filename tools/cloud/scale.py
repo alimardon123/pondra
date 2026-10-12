@@ -17,6 +17,8 @@ and spark_tpch.py times the same 22 queries over the same Parquet in the bucket.
 
 --local with no --data makes a small stand-in (a lineitem and an orders table, written by Pondra
 itself) and runs three queries over it: that checks the plumbing, it is not a benchmark.
+
+Export the same `PONDRA_ADMIN_TOKEN` as env.sh's before running it: `driver.call` sends it.
 """
 import argparse, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 
@@ -262,7 +264,7 @@ def main():
         if local:
             for t in tables:  # (the first node isn't up yet: this process leads the lake for a moment)
                 src = f"{data}/{t}/*.parquet" if os.path.isdir(f"{data}/{t}") else f"{data}/{t}.parquet"
-                pondra(cluster.lake, f"INSERT INTO {t} SELECT * FROM read_parquet('{src}')")
+                pondra(cluster.lake, f"CREATE TABLE {t} AS SELECT * FROM read_parquet('{src}')")
         for k in ks:
             print(f"== Pondra, {k} node{'s' * (k > 1)}", flush=True)
             out["pondra"][str(k)] = pondra_at(cluster, k, qs, base)

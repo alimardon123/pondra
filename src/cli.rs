@@ -196,6 +196,47 @@ pub(crate) enum Cmd {
         attach: Vec<String>,
         query: String,
     },
+    /// Back a lake up into a lake of its own: `pondra backup s3://b/prod s3://b/backups/prod`. Run
+    /// again, it copies only what changed since, and keeps what earlier runs need for
+    /// `--retention-days` (7 by default), so a restore can go back that far. The backup is read
+    /// like any lake, and written only by its next run. Works with no node running.
+    Backup {
+        /// The lake to back up (a folder or s3://bucket/prefix).
+        lake: String,
+        /// Where its backup is (a new place the first time, the same one after).
+        to: String,
+        /// How many days earlier runs stay restorable (7 the first time; the backup keeps the
+        /// last one given).
+        #[arg(long)]
+        retention_days: Option<u64>,
+    },
+    /// Make a lake again from its backup, in a new place: `pondra restore s3://b/backups/prod
+    /// s3://b/prod2 [--at '2026-10-12 03:00:00']` (its newest run at or before that time, in UTC).
+    /// Its tasks come back suspended (ALTER TASK name RESUME).
+    Restore {
+        /// The backup.
+        from: String,
+        /// The new lake's place: nothing there yet.
+        to: String,
+        /// Restore the newest run at or before this time: '2026-10-12 03:00:00' (UTC), RFC 3339,
+        /// or milliseconds since 1970. The newest run when left out.
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// Make a token for a user of a lake, and print it (once: the lake keeps only its hash). Through
+    /// the bucket, so no token is needed: whoever can write the lake's folder owns it. The lake's first
+    /// user is `pondra` (made by a node on the network with no token, which prints its token too).
+    /// `T=$(pondra token --dir lake)`.
+    Token {
+        #[arg(long, visible_alias = "lake")]
+        dir: String,
+        /// The user the token is for.
+        #[arg(long, default_value = "pondra")]
+        user: String,
+        /// The token's name, to drop it by (`DROP TOKEN name FOR user`); default `token-<unix seconds>`.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Lead a lake for a moment: make it if nothing is there yet, answer what waits in its inbox,
     /// let go. A node runs it for a lake nobody leads (`inbox::lead_once`, invariant 62).
     #[command(hide = true)]
@@ -265,6 +306,13 @@ pub(crate) async fn stopped(stdin: bool) {
 /// The lake this node serves (its catalog checkpointed when it stops).
 static MAIN: std::sync::OnceLock<Arc<store::Lake>> = std::sync::OnceLock::new();
 
+/// Does a node listen beyond this machine: `--addr`, or `--pg`, `--kafka` or `--flight` when given, on
+/// anything but 127.0.0.1, localhost or [::1]?
+fn on_network(addr: &str, others: [&Option<String>; 3]) -> bool {
+    let loopback = |a: &str| ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|x| a.starts_with(x));
+    !loopback(addr) || others.iter().any(|a| a.as_deref().is_some_and(|a| !loopback(a)))
+}
+
 pub fn main() {
     if std::env::args().nth(1).as_deref() == Some("service") && std::env::args().nth(2).as_deref() == Some("run") {
         service::run_from_manager(); // (what a service manager starts: becomes the node)
@@ -289,9 +337,55 @@ pub fn main() {
     }
 }
 
+/// The shell's lake, guessed as `serve PATH` guesses one (invariant 142): a word that isn't a folder
+/// and is a command with a letter left out or two swapped is that command mistyped, and a folder
+/// holding other things is never made a lake. (A word longer than a command is a name: `test2`.)
+async fn opened(lake: &str, given: bool) -> anyhow::Result<()> {
+    let path = std::path::Path::new(lake);
+    if lake.contains("://") || (!given && !path.exists()) {
+        return Ok(());
+    }
+    anyhow::ensure!(!path.is_file(), "{lake} is a file, and pondra opens a lake (a folder): run pondra, then read it with FROM '{lake}'");
+    if !path.exists() {
+        let commands = <Cli as clap::CommandFactory>::command();
+        if let Some(c) = commands.get_subcommands().filter(|c| !c.is_hide_set()).map(|c| c.get_name()).find(|c| mistyped(lake, c)) {
+            anyhow::bail!("no command {lake}: did you mean `pondra {c}`? (a new lake named {lake}: pondra ./{lake})");
+        }
+        return Ok(());
+    }
+    if dbserver::holds_lakes(lake).await? {
+        anyhow::bail!("{lake} holds lakes, each a database: open one (pondra {lake}/<name>), or serve them all (pondra serve --lakes {lake})");
+    }
+    let empty = std::fs::read_dir(lake).map_or(true, |mut d| d.next().is_none());
+    anyhow::ensure!(empty || dbserver::is_lake(lake).await?, "{lake} holds other things than a lake: open a lake in it (pondra {lake}/lake)");
+    Ok(())
+}
+
+/// Is `word` the command `c` with one letter left out, changed, or swapped with the next?
+fn mistyped(word: &str, c: &str) -> bool {
+    let (w, c): (Vec<char>, Vec<char>) = (word.chars().collect(), c.chars().collect());
+    if c.len() < 4 {
+        return false; // (`sq`, `fun`: a short name is as likely a lake's)
+    }
+    match c.len().checked_sub(w.len()) {
+        Some(0) => {
+            let off: Vec<usize> = (0..w.len()).filter(|&i| w[i] != c[i]).collect();
+            off.len() == 1 || (off.len() == 2 && off[1] == off[0] + 1 && w[off[0]] == c[off[1]] && w[off[1]] == c[off[0]])
+        }
+        Some(1) => (0..c.len()).any(|i| c[..i] == w[..i] && c[i + 1..] == w[i..]),
+        _ => false,
+    }
+}
+
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let Some(cmd) = cli.cmd else { return shell::run(&cli.lake.unwrap_or_else(|| "lake".into())).await };
+    store::inherit(); // (a lake led for a moment, reached as the process that asked reaches it)
+    let Some(cmd) = cli.cmd else {
+        let given = cli.lake.is_some();
+        let lake = cli.lake.unwrap_or_else(|| "lake".into());
+        opened(&lake, given).await?;
+        return shell::run(&lake).await;
+    };
     match cmd {
         Cmd::Serve { path, dir, databases, default, addr, advertise, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, tls_cert, tls_key, tls_ca, attach: attached, attach_found, stop_with_stdin, python } => {
             for (flag, var) in [(tls_cert, "PONDRA_TLS_CERT"), (tls_key, "PONDRA_TLS_KEY"), (tls_ca, "PONDRA_TLS_CA")] {
@@ -325,7 +419,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             };
             if many {
-                let one = [(flight.is_some(), "--flight"), (kafka.is_some(), "--kafka"), (!attached.is_empty(), "--attach"), (advertise.is_some(), "--advertise"), (attach_found.is_some(), "--attach-found")];
+                let one = [(flight.is_some(), "--flight"), (kafka.is_some(), "--kafka"), (kafka_advertise.is_some(), "--kafka-advertise"), (!attached.is_empty(), "--attach"), (advertise.is_some(), "--advertise"), (attach_found.is_some(), "--attach-found")];
                 if let Some((_, flag)) = one.iter().find(|(given, _)| *given) {
                     anyhow::bail!("{dir} holds several lakes, served as databases; {flag} is one lake's (serve that lake: pondra serve {dir}/<name> {flag} …)");
                 }
@@ -337,8 +431,9 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
                 let auth = Arc::new(auth::Auth::new(r, w, a));
-                let local = ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|x| addr.starts_with(x));
-                anyhow::ensure!(python.is_none() || auth.on() || local, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
+                let on_network = on_network(&addr, [&pg, &kafka, &flight]);
+                anyhow::ensure!(auth.on() || !on_network, "a folder of lakes served on {addr} answers anyone there: set --admin-token (each database's node takes it), or listen on 127.0.0.1");
+                anyhow::ensure!(python.is_none() || auth.on() || !on_network, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
                 // Each database's node gets the rest, as `pondra serve <lake>` would take them.
                 let mut node: Vec<String> = ["--flush-ms", &flush_ms.to_string(), "--task-ms", &task_ms.to_string(), "--retain-secs", &retain_secs.to_string(),
                     "--changelog-secs", &changelog_secs.to_string(), "--backlog", &backlog.to_string(), "--ack", &ack, "--replicas", &replicas.to_string()].map(String::from).to_vec();
@@ -354,12 +449,23 @@ async fn run() -> anyhow::Result<()> {
                 return dbserver::serve(dir, addr, pg, default, options, auth).await;
             }
             let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
-            let auth = Arc::new(auth::Auth::new(env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token.clone(), "PONDRA_ADMIN_TOKEN")));
+            let owner = std::env::var("PONDRA_OWNER_KEY").ok().filter(|k| k.len() >= 16); // (the same length rule `server::owner` uses)
+            if owner.is_some() && !dir.contains("://") && std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_none()) {
+                // (a lake the shell or `local()` just made is its user's alone, as a Postgres data folder is: its catalog holds the nodes' key)
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+            // (on the network a node is never open: with no token, its leader makes the lake's first user before it serves, below)
+            let on_network = on_network(&addr, [&pg, &kafka, &flight]);
+            let auth = auth::Auth::new(env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token.clone(), "PONDRA_ADMIN_TOKEN"));
+            let auth = Arc::new(auth.on_network(on_network).owned_by(owner));
             if let Some(t) = env(admin_token, "PONDRA_ADMIN_TOKEN") {
                 std::env::set_var("PONDRA_ADMIN_TOKEN", t); // (nodes call each other with it: cluster::http)
             }
-            let local = ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|a| addr.starts_with(a));
-            anyhow::ensure!(python.is_none() || auth.on() || local, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
+            anyhow::ensure!(python.is_none() || auth.on() || !on_network, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
             if let Some(gb) = cache_gb {
                 std::env::set_var("PONDRA_CACHE_GB", gb.to_string()); // read by Lake::open
             }
@@ -475,9 +581,29 @@ async fn run() -> anyhow::Result<()> {
             tr("the sequencer");
             python::init(python);
             let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock, retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
+            crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
             learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
+            // (a lake served with tokens is not one a node may make a first user of: an accidental node with none must
+            // not write to it, and is refused by `server.rs` instead)
+            if leader && on_network && !app.auth.on() && !users::signed(&app.lake).await {
+                // (on the network with no token nobody could sign in: the lake's first user is made before
+                // anyone is served, and its token said once. A failure stops the node; a restart tries again.)
+                let _guard = app.lock.lock().await;
+                match users::first_user(&app.lake).await {
+                    Ok(Some(token)) => eprintln!(
+                        "This lake now asks everyone to sign in: it is served on {addr} with no token.\n\
+                         Its first user is pondra, a superuser. Its token (shown once, kept only as a hash):\n  {token}\n\
+                         The console: http://{addr}/ (Sign in, with the token). Postgres: user pondra, the token as its password.\n\
+                         Another token: pondra token --dir {dir}. Or set --admin-token on every node."),
+                    Ok(None) => {}
+                    Err(e) => {
+                        cluster::release(&store, cluster.leader.n).await; // (another node may lead it: not one with no first user)
+                        return Err(e.context("a node on the network with no token makes the lake's first user before it serves, and that failed: set --admin-token, or listen on 127.0.0.1"));
+                    }
+                }
+            }
             if leader {
-                let (l, c) = (app.lake.clone(), app.cluster.clone()); // (beside serving, not before it: C5)
+                let (l, c, tokens) = (app.lake.clone(), app.cluster.clone(), app.auth.on()); // (beside serving, not before it: C5)
                 panics::spawn(async move {
                     let made = users::kept(&l).await == "none";
                     match users::make_keys(&l).await {
@@ -486,6 +612,15 @@ async fn run() -> anyhow::Result<()> {
                         // couldn't check the nodes' key, and held its new leader's calls 10 s)
                         Ok(()) if made => l.cat.checkpoint().await.unwrap_or_else(|e| eprintln!("checkpoint: {e:#}")),
                         Ok(()) => {}
+                    }
+                    if backup::frozen(&l) {
+                        return; // (a backup's secrets and keys stay as its runs wrote them: ADR-070)
+                    }
+                    if tokens {
+                        // (once, and for good: a node started by hand without them is then never open: `users::signed`)
+                        if let Err(e) = users::mark_signed(&l).await {
+                            eprintln!("the lake's tokens aren't remembered: {e:#}");
+                        }
                     }
                     match ext::rewrap(&l).await {
                         Ok(0) => {}
@@ -587,19 +722,26 @@ async fn run() -> anyhow::Result<()> {
                 });
                 // Tier as soon as new rows commit — other engines see them in the Delta log a moment
                 // later — but at most once every `tier_secs`, and at least every 5 × that (bulk
-                // inserts, compaction, retention).
+                // inserts, compaction, retention). Only a loud commit wakes it (`store::quiet`): the
+                // statements' history commits every second while anyone queries, and the round each
+                // one woke set a pace that held the lake's next write back up to `tier_secs`
+                // (freshness.py: Delta and Iceberg 1 s after the ack instead of 30 ms). So did the
+                // round's own commit, so what it waits past is the version the round left.
                 if tier_secs > 0.0 {
                     let (a, mut hwm, period) = (app.clone(), lake.hwm.subscribe(), Duration::from_secs_f64(tier_secs));
                     panics::spawn(async move {
                         loop {
-                            let start = tokio::time::Instant::now();
-                            hwm.borrow_and_update();
+                            let (start, before) = (tokio::time::Instant::now(), *hwm.borrow_and_update());
                             let failed = a.tier_all(0).await.inspect_err(|e| eprintln!("background job failed: {e:#}")).is_err();
+                            // (rows that came while it ran may be loud ones it didn't take: they go at
+                            // the round's pace, as any commit did)
+                            let seen = (*hwm.borrow() == before).then(|| a.lake.cat.version()).flatten();
                             tokio::time::sleep_until(start + period).await;
                             // (right away if rows came meanwhile; a round that failed, say on a full
                             // disk, is tried again then too, not only once more rows come)
                             if !failed {
-                                let _ = tokio::time::timeout(period * 4, hwm.changed()).await;
+                                let loud = async { while hwm.changed().await.is_ok() && seen.is_some() && a.lake.cat.version() == seen {} };
+                                let _ = tokio::time::timeout(period * 4, loud).await;
                             }
                         }
                     });
@@ -686,7 +828,10 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Catalog { dir, prefix } => {
             let lake = store::Lake::open(&dir, false, false).await?;
             match prefix.starts_with("d/") {
-                true => println!("{prefix}: {:?} bytes", lake.cat.get_raw(&prefix).await?.map(|b| b.len())), // inline data: binary
+                true => match lake.cat.get_raw(&prefix).await? {
+                    Some(b) => println!("{prefix}: {} bytes", b.len()), // inline data: binary
+                    None => println!("{prefix}: not in the catalog"),
+                },
                 false => {
                     for (k, v) in lake.cat.scan::<serde_json::Value>(&prefix, &format!("{prefix}\u{10ffff}")).await? {
                         println!("{k} {v}");
@@ -695,6 +840,14 @@ async fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Lead { dir } => write::lead_only(&dir).await?,
+        Cmd::Backup { lake, to, retention_days } => {
+            let stmt = write::Stmt::Ddl(vec![ddl::Ddl::BackupDatabase { database: None, to, retention_days }]);
+            println!("{}", serde_json::to_string_pretty(&write::from_cli(&lake, stmt).await?)?);
+        }
+        Cmd::Restore { from, to, at } => {
+            let at = at.as_deref().map(backup::instant).transpose()?;
+            println!("{}", serde_json::to_string_pretty(&backup::restore(&from, &to, at).await?)?);
+        }
         Cmd::Sql { dir, query, attach: attached } if write::checkpoint(&query) => {
             // (the leader's work; with nobody leading, the next node to start tiers the log)
             let store = store::open_store(&dir)?.1;
@@ -730,6 +883,22 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Token { dir, user, name } => {
+            let Ok(lake) = store::Lake::open(&dir, false, false).await else { anyhow::bail!("no lake at {dir} (pondra token takes a lake's folder, or its s3:// prefix)") };
+            let no_user = lake.cat.scan_raw("u/", "u0").await?.is_empty();
+            drop(lake); // (what follows opens it as it needs: through the inbox, or leading for a moment)
+            if user == "pondra" && no_user {
+                // (a lake with no user yet, as a follower on the network finds it: its first user, as a leader makes it)
+                let first = users::Change::Create { name: user.clone(), login: true, if_not_exists: true, verifier: None, superuser: true, limits: Default::default() };
+                write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(first))).await?;
+            }
+            let (token, hash) = users::new_token(&user);
+            let name = name.unwrap_or_else(|| format!("token-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())));
+            let change = users::Change::CreateToken { name: name.clone(), user: user.clone(), expires_secs: None, hash: Some(hash) };
+            write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(change))).await?; // (only the hash goes)
+            println!("{token}"); // (alone on stdout: `T=$(pondra token --dir lake)`)
+            eprintln!("a token for {user} (shown once; DROP TOKEN {name} FOR {user} takes it back)");
+        }
     }
     Ok(())
 }
@@ -761,4 +930,17 @@ where
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_command_mistyped() {
+        for (word, c) in [("serv", "serve"), ("sevre", "serve"), ("sorve", "serve"), ("aply", "apply"), ("stauts", "status")] {
+            assert!(super::mistyped(word, c), "{word} for {c}");
+        }
+        for (word, c) in [("serve", "serve"), ("test2", "test"), ("tests", "test"), ("sales", "apply"), ("sq", "sql"), ("lake", "plan")] {
+            assert!(!super::mistyped(word, c), "{word} isn't {c}");
+        }
+    }
 }

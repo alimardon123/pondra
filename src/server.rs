@@ -14,6 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use datafusion::arrow::ipc::reader::StreamReader;
+use datafusion::arrow::ipc::writer::StreamWriter;
+use datafusion::execution::memory_pool::MemoryReservation;
 use datafusion::arrow::{compute::concat_batches, json as arrow_json, record_batch::RecordBatch, util::pretty::pretty_format_batches};
 use futures::StreamExt;
 use serde::Deserialize;
@@ -115,6 +117,11 @@ pub fn router(app: App) -> Router {
             let seq = app.seq.as_ref().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
             Ok::<_, E>(Json(crate::txn::commit_here(&app.lake, seq, &app.lock, c).await?))
         }))
+        .route("/cluster/checked", post(|State(app): State<App>, body: Bytes| async move {
+            let seq = app.seq.clone().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
+            let (table, src, batch) = crate::constraints::decode(body)?;
+            Ok::<_, E>(Json(crate::constraints::leader(app.lake.clone(), seq, table, src, batch).await?))
+        }))
         .route("/cluster/iceberg", post(|State(app): State<App>, Json(c): Json<Vec<crate::iceberg::Commit>>| async move { Ok::<_, E>(Json(app.record_iceberg(c).await?)) }))
         .route_layer(middleware::from_fn_with_state(app.clone(), to_leader));
     Router::new()
@@ -125,7 +132,7 @@ pub fn router(app: App) -> Router {
         .route("/", get(crate::console::page))
         .route("/sql", post(sql))
         .route("/sql/pages/{id}", get(page))
-        .route("/mcp", post(crate::mcp::handle))
+        .route("/mcp", post(crate::mcp::handle).delete(crate::mcp::end))
         .route("/files/{*path}", put(put_file).get(get_file).delete(delete_file).post(restore_file))
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
@@ -294,7 +301,7 @@ async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result
 async fn session_python(method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>) -> Result<Json<Value>, E> {
     let id = crate::temp::id(&id); // (as the client's requests name it: its user's)
     if *role < crate::auth::Role::Admin {
-        return Err(E(anyhow::anyhow!("a session's Python is an admin's, as DO is")));
+        return Err(E(crate::codes::coded("42501", "a session's Python is an admin's, as DO is")));
     }
     Ok(Json(match method {
         axum::http::Method::DELETE => j!({"restarted": crate::python::end_session(&id)}),
@@ -318,9 +325,9 @@ async fn list_pythons(Query(q): Query<HashMap<String, String>>, role: axum::Exte
 
 /// `PUT /python` `{"path": …}`: run workers with that Python from now on (and next time: kept on
 /// this machine). From a page on this machine only, an admin's.
-async fn choose_python(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, .. }): axum::extract::ConnectInfo<crate::tls::Peer>, role: axum::Extension<crate::auth::Role>, Json(b): Json<Value>) -> Result<Json<Value>, E> {
-    if *role < crate::auth::Role::Admin || !from.ip().is_loopback() {
-        return Err(E(anyhow::anyhow!("which Python runs is chosen by an admin, on this machine")));
+async fn choose_python(axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, headers: axum::http::HeaderMap, role: axum::Extension<crate::auth::Role>, Json(b): Json<Value>) -> Result<Json<Value>, E> {
+    if *role < crate::auth::Role::Admin || !peer.from_here(&headers) {
+        return Err(E(crate::codes::coded("42501", "which Python runs is chosen by an admin, on this machine")));
     }
     Ok(Json(crate::python::choose(b["path"].as_str().unwrap_or_default()).await?))
 }
@@ -360,6 +367,9 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         if !peer.allowed() {
             return (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response(); // (`tls.rs`)
         }
+        if header.as_deref().is_some_and(|h| h.starts_with("Basic ")) && !peer.may_send_password() {
+            return (StatusCode::FORBIDDEN, crate::tls::PASSWORD_PLAIN).into_response(); // (under PONDRA_TLS=optional: a token may cross, a password never)
+        }
         if header.as_deref().is_some_and(|h| h.starts_with("Bearer pn_")) && !peer.may_be_node() {
             return (StatusCode::UNAUTHORIZED, "the nodes' key is taken only with a certificate the nodes' authority signed (PONDRA_TLS_CA)").into_response();
         }
@@ -389,6 +399,18 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     if starting && needed > crate::auth::Role::None && !node {
         let _ = app.lake.caught_up().await; // (a node that just started signs users in from what its leader had: `open`)
     }
+    // (a sign-in with a user's name and password is counted per address and name: past ten failures a minute
+    // that pair is refused at once, the right password too; a bearer token isn't counted: `auth::guessing`)
+    let client = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().map(|c| c.0.client(req.headers()));
+    let basic_by = header.as_deref().filter(|h| h.starts_with("Basic ")).map(|h| (basic_user(Some(h)), client));
+    if let Some((name, ip)) = &basic_by {
+        if let Some(wait) = crate::auth::guessing(*ip, name) {
+            let why = guessing_says(name, wait);
+            crate::audit::refused(&app, name, "http", from, &format!("{} {}", req.method(), req.uri().path()), &why);
+            tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does: refused at once, guesses would cost nothing)
+            return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
+        }
+    }
     let signed = match &header {
         Some(h) => crate::users::who(&app.lake, &app.auth, Some(h)).await,
         None => None,
@@ -402,6 +424,9 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             None => crate::auth::Principal::of(crate::auth::Role::Admin),
         },
         None if header.is_some() => {
+            if let Some((name, ip)) = &basic_by {
+                crate::auth::guessed(*ip, name);
+            }
             crate::audit::refused(&app, &basic_user(header.as_deref()), "http", from, &format!("{} {}", req.method(), req.uri().path()), "wrong token, or user name and password");
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
             return (StatusCode::UNAUTHORIZED, "wrong token, or user name and password").into_response();
@@ -414,6 +439,8 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let cloning = pin && who.access.as_ref().is_some_and(|a| a.clones().is_some());
     if who.role < needed && !cloning {
         return match who.role {
+            crate::auth::Role::None if header.is_none() && app.auth.owned() => (StatusCode::UNAUTHORIZED, "this node answers only the program that started it (the shell, local()): open the console from the link it printed, or start the node with --admin-token to connect other tools").into_response(),
+            crate::auth::Role::None if header.is_none() && !app.auth.on() && crate::users::signed(&app.lake).await => (StatusCode::UNAUTHORIZED, "this lake has been served with tokens: start the node with them (--admin-token, --write-token, --read-token), or sign in as a user").into_response(),
             crate::auth::Role::None => (StatusCode::UNAUTHORIZED, "sign in: a token, or a user's name and password").into_response(),
             _ => {
                 let why = match pin {
@@ -463,12 +490,26 @@ fn basic_user(header: Option<&str>) -> String {
     b.and_then(|b| String::from_utf8(b).ok()).and_then(|up| up.split_once(':').map(|(u, _)| u.to_string())).unwrap_or_default()
 }
 
+/// What a sign-in refused for its failures is told, with how long to wait (`auth::guessing`).
+fn guessing_says(user: &str, wait: u64) -> String { format!("too many failed sign-ins for {user} from this address: wait {wait} s") }
+
 /// `POST /login` `{"user", "password"}`: a session (`{"token": "ps_…", "until": ms}`) to send as
 /// `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`); the console's sign-in.
-async fn login(State(app): State<App>, body: Bytes) -> Response {
+async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let b: Value = serde_json::from_slice(&body).unwrap_or_default(); // (JSON, whatever its content type says)
     let (user, password) = (b["user"].as_str().unwrap_or_default(), b["password"].as_str().unwrap_or_default());
+    if !peer.may_send_password() {
+        return (StatusCode::FORBIDDEN, crate::tls::PASSWORD_PLAIN).into_response(); // (`tls.rs`)
+    }
+    let ip = Some(peer.client(&headers));
+    if let Some(wait) = crate::auth::guessing(ip, user) {
+        let why = guessing_says(user, wait);
+        crate::audit::refused(&app, user, "http", Some(peer.addr), "sign in", &why);
+        tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does)
+        return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
+    }
     if !crate::users::password_ok(&app.lake, user, password).await {
+        crate::auth::guessed(ip, user);
         crate::audit::refused(&app, user, "http", crate::auth::current().and_then(|p| p.from), "sign in", "wrong user name or password");
         tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
         return (StatusCode::UNAUTHORIZED, "wrong user name or password").into_response();
@@ -492,14 +533,20 @@ async fn whoami(State(app): State<App>) -> Json<Value> {
 }
 
 impl App {
-    /// Does nothing need a sign-in here? (No token set, and no user who signs in. A node that just
-    /// started asks once it holds what its leader had: a mirror seeded before the first user was
-    /// flushed knows of none.)
+    /// Does nothing need a sign-in here? (No token set, no user who signs in, and the node listens on
+    /// this machine only. A node on the network is never open: its leader made the lake's first user
+    /// before it served (`users::first_user`), and a follower of a lake with none yet refuses everyone
+    /// until one has a token (`pondra token`). Nor is a node a program started for itself (`owned`):
+    /// it answers only that program, a token or a user. A node that just started asks once it holds
+    /// what its leader had: a mirror seeded before the first user was flushed knows of none.)
     pub async fn open(&self) -> bool {
-        if self.auth.on() {
+        if self.auth.on() || self.auth.network() || self.auth.owned() {
             return false;
         }
         let _ = self.lake.caught_up().await; // (still catching up after 10 s: its own catalog decides)
+        if crate::users::signed(&self.lake).await {
+            return false; // (served with tokens once: a node started without them answers no one, `users::signed`)
+        }
         !crate::users::any(&self.lake).await
     }
 }
@@ -639,6 +686,39 @@ async fn replica(State(app): State<App>, Query(p): Query<AckParams>) -> Result<V
     Ok(app.replica.as_ref().ok_or(StatusCode::NOT_FOUND)?.serve(p.term, p.after))
 }
 
+tokio::task_local! {
+    /// Set while this task holds one of the node's query turns (`App::query_listed`).
+    static TURN: ();
+}
+
+/// The node's turns for queries: `PONDRA_QUERIES` run at once (4 a core, 16 at least), in the order
+/// they asked, and a query that waits `PONDRA_QUEUE_SECS` (60) for one is refused (53300). Without
+/// them a burst of clients ran at once, and the memory they used was DataFusion's to count only in
+/// part (see `query::collect`), so the node could run out of it.
+struct Turns {
+    turns: tokio::sync::Semaphore,
+    most: usize,
+    wait: Duration,
+}
+
+static TURNS: std::sync::LazyLock<Turns> = std::sync::LazyLock::new(|| {
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let most = std::env::var("PONDRA_QUERIES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or((4 * cores).max(16)).max(1);
+    let wait = std::env::var("PONDRA_QUEUE_SECS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(60.0);
+    Turns { turns: tokio::sync::Semaphore::new(most), most, wait: Duration::from_secs_f64(wait.max(0.0)) }
+});
+
+/// A turn for one query, once it is its turn (in line, counted as waiting), or 53300.
+async fn turn() -> anyhow::Result<(tokio::sync::SemaphorePermit<'static>, crate::metrics::Now)> {
+    let waiting = crate::metrics::Now::new(&crate::metrics::WAITING);
+    let got = tokio::time::timeout(TURNS.wait, TURNS.turns.acquire()).await;
+    drop(waiting);
+    match got {
+        Ok(Ok(permit)) => Ok((permit, crate::metrics::Now::new(&crate::metrics::RUNNING))),
+        _ => Err(crate::codes::coded("53300", format!("this node is running {} queries, its most at once (PONDRA_QUERIES): try again, or ask another node", TURNS.most))),
+    }
+}
+
 /// Each table's job, four at a time: the answers of those that worked, and a line for `failed`
 /// naming each that didn't.
 async fn each<'a, T>(jobs: Vec<impl std::future::Future<Output = (&'a String, anyhow::Result<T>)>>, failed: &mut Vec<String>) -> Vec<T> {
@@ -684,7 +764,17 @@ impl App {
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)
     }
 
+    /// A query on one of the node's turns (`TURNS`): a query run inside another one this task runs
+    /// (a procedure's, a view's) is served by the turn its caller holds, never waiting for one.
     async fn query_listed(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
+        if TURN.try_with(|_| ()).is_ok() {
+            return self.run_query(query, spread, files).await;
+        }
+        let _turn = turn().await?; // (held until the answer is made)
+        TURN.scope((), self.run_query(query, spread, files)).await
+    }
+
+    async fn run_query(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         crate::history::read_at(self.lake.visible()); // (its answer again: `t AT (VERSION => n)`)
@@ -719,7 +809,7 @@ impl App {
                 let (state, logical) = df.into_parts();
                 let logical = state.optimize(&logical)?; // (as `create_physical_plan`, the plan it optimized kept: what its filters were about, `learned.rs`)
                 let plan = state.query_planner().create_physical_plan(&logical, &state).await?;
-                let out = datafusion::physical_plan::collect(plan.clone(), task).await?;
+                let out = crate::query::collect(plan.clone(), task).await?;
                 crate::history::planned(&logical, &plan); // (its shape; a slow statement's plan, with what each operator did; what it learned)
                 let out = if explained { crate::history::explained(out)? } else { out };
                 anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(schema)] } else { out }) // (no rows: still its columns)
@@ -729,8 +819,16 @@ impl App {
                 Err(e) if format!("{e:#}").contains("Resources exhausted") => run(true).await?, // out of memory: try again frugally
                 r => r?,
             };
-            if self.cluster.nodes().len() > 1 && here.elapsed() >= Duration::from_millis(20) {
-                crate::guard::ran_here(query, crate::spmd::reads_sql(&self.lake, query).await?, here.elapsed()); // (how fast queries go here: `guard.rs`)
+            // How fast queries go here (`guard.rs`): every query's time, so a quick one is known to be
+            // quick and stays here, and the bytes it read only for one long enough to say what rate
+            // this node reads at. The time is taken before they are looked up, which isn't the query.
+            let took = here.elapsed();
+            if self.cluster.nodes().len() > 1 {
+                let bytes = match took >= Duration::from_millis(20) {
+                    true => crate::spmd::reads_sql(&self.lake, query).await.unwrap_or(0),
+                    false => 0,
+                };
+                crate::guard::ran_here(query, bytes, took);
             }
             Ok((out, false))
         };
@@ -781,6 +879,9 @@ impl App {
     /// Tier the tables with at least `min_rows` rows in the log (0: all of them), publish them
     /// for other engines, then expire what everything has consumed (leader).
     pub async fn tier_all(&self, min_rows: u64) -> anyhow::Result<u64> {
+        if crate::backup::frozen(&self.lake) {
+            return crate::backup::tend(&self.lake).await.map(|_| 0); // (its tables never change: only its clones' pins are kept)
+        }
         let _guard = self.lock.lock().await;
         let _tiering = self.seq.as_ref().map(|s| s.tiering()); // (writers paused by backpressure stay paused: `log::Pace`)
         let start = std::time::Instant::now();
@@ -809,12 +910,21 @@ impl App {
         let purge: Vec<_> = changed.iter().map(|t| async move { (t, crate::tier::purge(&self.lake, t, nodes, &self.cluster.addr, self.retain_ms, false).await) }).collect();
         each(purge, &mut failed).await;
         let tiered = start.elapsed();
-        crate::delta::publish_all(&self.lake).await?; // what other engines read, as soon as it's tiered
+        // A table whose publish fails is named by `publish_all`; it mustn't stop the merges and the
+        // retention below (storage would grow with no way out), so its error joins `failed` and the
+        // round carries on.
+        if let Err(e) = crate::delta::publish_all(&self.lake).await { // what other engines read, as soon as it's tiered
+            failed.push(format!("publish: {e:#}"));
+            crate::metrics::job_failed("publish");
+        }
         let first_publish = start.elapsed();
         // Then merges and compactions (published too, once done).
         let maintain: Vec<_> = untidy.iter().map(|t| async move { (t, crate::tier::maintain(&self.lake, t, nodes, &self.cluster.addr, false).await) }).collect();
         if each(maintain, &mut failed).await.contains(&true) {
-            crate::delta::publish_all(&self.lake).await?;
+            if let Err(e) = crate::delta::publish_all(&self.lake).await {
+                failed.push(format!("publish: {e:#}"));
+                crate::metrics::job_failed("publish");
+            }
         }
         let published = start.elapsed();
         // Retention every 10 s is plenty, and keeps its deletes off the path to fresh Delta versions.
@@ -876,6 +986,9 @@ impl App {
     }
 
     pub async fn run_tasks(&self) -> anyhow::Result<()> {
+        if crate::backup::frozen(&self.lake) {
+            return Ok(()); // (a backup's views and tasks follow nothing: ADR-070)
+        }
         crate::tasks::run_all(&self.lake, &self.cluster, self.log()?).await?;
         match &self.seq {
             Some(seq) => {
@@ -911,6 +1024,13 @@ struct AppendParams {
 
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
 async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
+    let start = std::time::Instant::now();
+    let out = append_rows(&app, &name, p, headers, body).await;
+    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
+    out
+}
+
+async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
     let log = app.log()?;
     if !p.producer.is_empty() && p.seq == 0 {
         return Err(E(anyhow::anyhow!(crate::log::SEQ_FROM_1))); // (0 is "nothing yet": its batch would be taken for a retry)
@@ -939,7 +1059,7 @@ async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
             crate::defaults::fill(&app.lake, &meta, batch, |c| absent.get(c).cloned()).await?
         }
     };
-    Ok(Json(log.append(name, Src { producer: p.producer, seq: p.seq, prev: p.prev }, batch).await?))
+    Ok(Json(log.append(name.to_string(), Src { producer: p.producer, seq: p.seq, prev: p.prev }, batch).await?))
 }
 
 #[derive(Deserialize)]
@@ -951,6 +1071,13 @@ struct InsertParams {
 /// the leader records the files, together with `job` so a retried job is applied once. Creates
 /// the table if missing.
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, query: String) -> Result<Json<Value>, E> {
+    let start = std::time::Instant::now();
+    let out = insert_rows(&app, &name, p, query).await;
+    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
+    out
+}
+
+async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.cluster.reader, "read-only node");
     if app.lake.cat.meta(&table_key(&name)).await?.is_none() {
         crate::auth::at_least(crate::auth::Role::Admin, "making a table")?; // (as CREATE TABLE is)
@@ -1008,7 +1135,8 @@ async fn change(State(app): State<App>, Json((sql, job, sent)): Json<(String, St
 fn cluster_call(app: &App, headers: &HeaderMap) -> bool {
     match headers.get("authorization").and_then(|v| v.to_str().ok()) {
         None => true,
-        Some(h) => h.strip_prefix("Bearer ").is_some_and(|b| b.starts_with("pn_") || app.auth.token_role(b) > crate::auth::Role::None),
+        // (a `pn_` key counts only without an admin token, as in `users::who`)
+        Some(h) => h.strip_prefix("Bearer ").is_some_and(|b| (b.starts_with("pn_") && !app.auth.admin_set()) || app.auth.token_role(b) > crate::auth::Role::None),
     }
 }
 
@@ -1110,7 +1238,8 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
     let session = crate::temp::of(&headers); // (its temporary tables: `temp.rs`)
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let vars = crate::auth::lent_vars(token); // (Python code a run lent a connection to: the run's variables)
-    let go = crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, Box::pin(sql_as(app, p, role, headers, body))))); // (boxed: a statement's future is big, and every layer around it would copy it)
+    // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
+    let go = crate::query::HELD.scope(Default::default(), crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, Box::pin(sql_as(app, p, role, headers, body)))))); // (boxed: a statement's future is big, and every layer around it would copy it)
     let (out, heard) = crate::routines::with_notices(crate::python::holder(vars.is_some(), go)).await; // (a lent token's code holds a slot: what it calls takes none)
     let mut r = out.unwrap_or_else(IntoResponse::into_response);
     if session.as_deref().is_some_and(crate::temp::holds) {
@@ -1147,7 +1276,9 @@ fn notices(heard: &[String]) -> Option<axum::http::HeaderValue> {
 /// The values are kept out of what that procedure says (its notices, its error, the run log).
 async fn secret(State(app): State<App>, Path(name): Path<String>, headers: axum::http::HeaderMap) -> Result<Json<Value>, E> {
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    ensure!(crate::auth::lent(token).is_some(), "only a procedure's code reads a secret: pondra.secret(name), in a Python procedure");
+    if crate::auth::lent(token).is_none() {
+        return Err(E(crate::codes::coded("42501", "only a procedure's code reads a secret: pondra.secret(name), in a Python procedure")));
+    }
     let values = crate::ext::reveal(&app.lake, &name.to_lowercase()).await?;
     crate::auth::revealed(token, values.iter().filter(|(k, _)| *k != "type" && *k != "scope").map(|(_, v)| v.clone()));
     Ok(Json(j!(values)))
@@ -1182,9 +1313,10 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
     }
     if let ([one], true, true, true, None, false) = (&crate::routines::split(&req.sql)[..], req.params.is_empty(), req.tables.is_empty(), req.views.is_empty(), crate::vars::change(&req.sql), crate::script::is(&req.sql)) {
+        let sent = one;
         let one = crate::routines::expand(&app.lake, &crate::vars::bound(one)?).await?; // (`$name`: the session's variables)
-        if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() && crate::txn::control(&one).is_none() && !crate::txn::open() && !crate::settings::is(&one) {
-            return Ok(crate::audit::statement(&app, &one, query(&app, &p, &one, who.files)).await?);
+        if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() && !crate::routines::several(&one) && crate::txn::control(&one).is_none() && !crate::txn::open() && !crate::settings::is(&one) {
+            return Ok(crate::audit::statement(&app, sent, query(&app, &p, &one, who.files)).await?); // (the audit log and history keep it as it was sent)
         }
     }
     let tables = Arc::new(req.tables);
@@ -1198,7 +1330,7 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     };
     own.inspect(|s| _ = crate::temp::end(s));
     match out? {
-        Outcome::Rows(batches) => Ok(([("content-type", content_type(p.format.as_deref()))], answer(&batches, &p)?).into_response()),
+        Outcome::Rows(batches) => Ok(answer(&batches, &p)?.respond(p.format.as_deref())),
         Outcome::Done(v) => Ok(Json(v).into_response()),
     }
 }
@@ -1230,8 +1362,10 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
     let asks = |text: &str| {
+        // (AT (OFFSET => -n) is n seconds before now: a moment that moves)
+        static OFFSET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*OFFSET\s*=>").expect("a regex"));
         let q = text.to_lowercase();
-        !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+        OFFSET.is_match(text) || !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
     };
     let volatile = files || limited || asks(query)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
@@ -1239,7 +1373,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
         || crate::routines::with_views(&app.lake, query).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)
         || crate::routines::volatile(&app.lake, query).await // (a Python function may answer differently each time)
         || (crate::path::current(&app.lake).is_some() && crate::path::reads_current(&app.lake, query).await); // (a view's current_schema() is its reader's: not one answer for every session)
-    let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
+    let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(run_sql(app, p, query, files).await?.respond(p.format.as_deref())) };
     let key = format!("{format}{}|{}|{query}", p.rows.map(|n| format!(":{n}")).unwrap_or_default(), p.spread.as_deref().unwrap_or(""));
     let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
     if let Some(body) = app.results.get(&key, version, stale) {
@@ -1250,12 +1384,21 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     let flight = app.results.flight(&key);
     let ticket = flight.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let mut slot = flight.1.lock().await;
-    if let (true, Some(body)) = (slot.0 >= ticket, &slot.1) {
+    if slot.0 >= ticket {
+        let Some(body) = &slot.1 else {
+            // (the run that covered it left nothing to share: a big answer, sent in pieces to its own
+            // caller, or an error; each one it covered runs on its own, beside the others)
+            drop(slot);
+            return Ok(run_sql(app, p, query, false).await?.respond(p.format.as_deref()));
+        };
         return Ok(respond(body.clone()));
     }
     (slot.0, slot.1) = (flight.0.load(std::sync::atomic::Ordering::Relaxed), None);
     let version = app.lake.version_for(query).await; // (read after `covers`: this run reads at least this)
-    let body = run_sql(app, p, query, false).await?;
+    let body = match run_sql(app, p, query, false).await? {
+        Rendered::Whole(body) => body,
+        pieces => return Ok(pieces.respond(p.format.as_deref())), // (a big answer: sent to its own caller only)
+    };
     if let Some(v) = version {
         app.results.put(key, v, body.clone());
     }
@@ -1264,7 +1407,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
 }
 
 /// Run a query (across the cluster if it's worth it) and format the result.
-async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<bytes::Bytes> {
+async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Rendered> {
     let batches = match files {
         true => app.query_as(&crate::asof::rewrite(query)?, Some("0"), true).await?, // (a file here: this node only)
         false => app.query(query, p.spread.as_deref()).await?,
@@ -1274,12 +1417,193 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
     answer(&batches, p)
 }
 
-/// Rows as `p` asks: `render`'s, a typed answer's first page as many rows as `?rows=` says.
-fn answer(batches: &[RecordBatch], p: &SqlParams) -> anyhow::Result<bytes::Bytes> {
-    match (p.format.as_deref(), p.rows) {
-        (Some("typed"), Some(n)) => Ok(typed(batches, n.clamp(1, MOST))?.into()),
-        (format, _) => render(batches, format),
+/// An answer as the HTTP door sends it: rendered whole (what `Results` keeps and the others asking at
+/// the same moment share), or as a body in pieces, for an answer too big to render as one (`stream`).
+enum Rendered {
+    Whole(bytes::Bytes),
+    Pieces(Body),
+}
+
+impl Rendered {
+    fn respond(self, format: Option<&str>) -> Response {
+        let body = match self {
+            Rendered::Whole(bytes) => Body::from(bytes),
+            Rendered::Pieces(body) => body,
+        };
+        ([("content-type", content_type(format))], body).into_response()
     }
+}
+
+/// Rows as `p` asks: `render`'s, a typed answer's first page as many rows as `?rows=` says, or, from
+/// `PONDRA_STREAM_MB` of Arrow up, in pieces (`stream`).
+fn answer(batches: &[RecordBatch], p: &SqlParams) -> anyhow::Result<Rendered> {
+    match (p.format.as_deref(), p.rows) {
+        (Some("typed"), Some(n)) => Ok(Rendered::Whole(typed(batches, n.clamp(1, MOST))?.into())),
+        (format, _) if streams(format) && big(batches) => Ok(Rendered::Pieces(stream(batches.to_vec(), format, crate::query::take_held())?)),
+        (format, _) => Ok(Rendered::Whole(render(batches, format)?)),
+    }
+}
+
+/// The formats an answer can be sent in pieces of (the others are rendered whole: a table, a typed
+/// answer, a Parquet or an Excel file is one thing to the reader).
+fn streams(format: Option<&str>) -> bool { !matches!(format, Some("table" | "typed" | "parquet" | "xlsx")) }
+
+/// Is an answer big enough to send in pieces: `PONDRA_STREAM_MB` (8) of Arrow, read once. 0 sends
+/// every answer in pieces (the tests compare the two ways).
+fn big(batches: &[RecordBatch]) -> bool {
+    static MB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("PONDRA_STREAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(8));
+    let mut counted = datafusion::common::utils::memory::RecordBatchMemoryCounter::new(); // (as `query::collect` counts it)
+    batches.iter().map(|b| counted.count_batch(b)).sum::<usize>() >= *MB << 20
+}
+
+/// An answer in pieces of about 1 MB of Arrow, each written as `render` writes its rows (`Encoding`),
+/// so the pieces together are the answer's bytes. The first piece is written before the body starts,
+/// so a format that can't write the answer's columns (a list in CSV) is refused as `render` refuses
+/// it, with its message; a failure later cuts the body short (no end of it is sent). The batches,
+/// and the memory counted for them, go when the last piece is written, or when the client goes.
+fn stream(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryReservation>) -> anyhow::Result<Body> {
+    let pieces: Vec<RecordBatch> = batches.iter().flat_map(piece_rows).collect();
+    let mut enc = Encoding::new(format);
+    let mut steps = pieces.into_iter().map(Some).chain(std::iter::once(None)); // (then the end)
+    let first = enc.step(steps.next().flatten().as_ref())?;
+    // The rest is written on the queries' runtime, at most two pieces ahead of the client: the
+    // node's own runtime keeps to appends and commits (invariant 231).
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(2);
+    crate::panics::aside(async move {
+        let _held = held;
+        for step in steps {
+            let bytes = enc.step(step.as_ref()).map(Bytes::from).map_err(std::io::Error::other);
+            let failed = bytes.is_err();
+            if tx.send(bytes).await.is_err() || failed {
+                break; // (its client went, or the rest can't be written)
+            }
+        }
+    });
+    let head = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(first)) });
+    let rest = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|piece| (piece, rx)) });
+    Ok(Body::from_stream(head.chain(rest)))
+}
+
+/// A batch cut into pieces of about 1 MB of Arrow (by its rows' average size). An empty batch is one
+/// empty piece, so that CSV's header comes with the first piece, as `render` writes it.
+fn piece_rows(b: &RecordBatch) -> Vec<RecordBatch> {
+    const PIECE: usize = 1 << 20;
+    let rows = b.num_rows();
+    if rows == 0 {
+        return vec![b.clone()];
+    }
+    let per_row = (b.get_array_memory_size() / rows).max(1);
+    let step = (PIECE / per_row).max(1);
+    (0..rows).step_by(step).map(|at| b.slice(at, step.min(rows - at))).collect()
+}
+
+/// The pieces of one answer in one format. Written together they are what `render` writes for the
+/// whole answer: JSON's brackets and commas across pieces, CSV's header once, one Arrow stream.
+struct Encoding {
+    shape: Shape,
+    begun: bool, // the first piece is written (JSON's "[" and CSV's header go with it)
+    rows: usize, // JSON rows written so far (a comma goes before each but the first)
+    arrow: Option<StreamWriter<Vec<u8>>>,
+}
+
+#[derive(Clone, Copy)]
+enum Shape {
+    Json,
+    Lines,
+    Csv(u8),
+    Arrow,
+}
+
+impl Encoding {
+    fn new(format: Option<&str>) -> Self {
+        let shape = match format {
+            Some("csv") => Shape::Csv(b','),
+            Some("tsv") => Shape::Csv(b'\t'),
+            Some("ndjson") => Shape::Lines,
+            Some("arrow") => Shape::Arrow,
+            _ => Shape::Json, // (as `render`: any other format is JSON)
+        };
+        Encoding { shape, begun: false, rows: 0, arrow: None }
+    }
+
+    /// The bytes of one piece.
+    fn piece(&mut self, b: &RecordBatch) -> anyhow::Result<Vec<u8>> {
+        match self.shape {
+            Shape::Json => {
+                let mut out = self.open();
+                for row in lines(b)?.split(|c| *c == b'\n').filter(|r| !r.is_empty()) {
+                    if self.rows > 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(row);
+                    self.rows += 1;
+                }
+                Ok(out)
+            }
+            Shape::Lines => lines(b),
+            Shape::Csv(delimiter) => {
+                let header = !std::mem::replace(&mut self.begun, true);
+                let mut w = datafusion::arrow::csv::WriterBuilder::new().with_header(header).with_delimiter(delimiter).build(Vec::new());
+                w.write(b)?;
+                Ok(w.into_inner())
+            }
+            Shape::Arrow => {
+                let mut w = match self.arrow.take() {
+                    Some(w) => w,
+                    None => StreamWriter::try_new(Vec::new(), &b.schema())?, // (its schema goes with the first piece)
+                };
+                w.write(&crate::query::compact(b.clone()))?;
+                let out = std::mem::take(w.get_mut());
+                self.arrow = Some(w);
+                Ok(out)
+            }
+        }
+    }
+
+    /// One step of the answer: a piece, or (None) what closes it.
+    fn step(&mut self, piece: Option<&RecordBatch>) -> anyhow::Result<Vec<u8>> {
+        match piece {
+            Some(b) => self.piece(b),
+            None => self.end(),
+        }
+    }
+
+    /// What closes the answer: JSON's "]" (after its "[", if no piece had rows), Arrow's end of stream.
+    fn end(&mut self) -> anyhow::Result<Vec<u8>> {
+        match self.shape {
+            Shape::Json => {
+                let mut out = self.open();
+                out.push(b']');
+                Ok(out)
+            }
+            Shape::Arrow => {
+                let mut w = match self.arrow.take() {
+                    Some(w) => w,
+                    None => StreamWriter::try_new(Vec::new(), &datafusion::arrow::datatypes::Schema::empty())?, // (no rows at all: as `query::ipc` writes them)
+                };
+                w.finish()?;
+                Ok(std::mem::take(w.get_mut()))
+            }
+            Shape::Lines | Shape::Csv(_) => Ok(vec![]),
+        }
+    }
+
+    /// JSON's "[", once: before the first piece's rows, or before the "]" when there are none.
+    fn open(&mut self) -> Vec<u8> {
+        if std::mem::replace(&mut self.begun, true) {
+            vec![]
+        } else {
+            b"[".to_vec()
+        }
+    }
+}
+
+/// A piece's rows as newline-delimited JSON (`render`'s own writer, one line a row).
+fn lines(b: &RecordBatch) -> anyhow::Result<Vec<u8>> {
+    let mut w = arrow_json::LineDelimitedWriter::new(Vec::new());
+    w.write_batches(&[b])?;
+    w.finish()?;
+    Ok(w.into_inner())
 }
 
 /// Rows as `?format=` asks: JSON, a text table, or Arrow IPC (straight into pandas, Polars and
@@ -1447,15 +1771,20 @@ async fn ready(State(app): State<App>) -> Response {
     }
 }
 
-async fn stats(State(app): State<App>) -> Json<Value> {
+async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<Value> {
     let c = &app.cluster;
     let role = if c.reader { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     let mut s = j!({"lake": crate::ddl::lake_name(&app.lake), "role": role, "leader": c.leader.addr, "term": c.leader.n, "nodes": c.nodes(),
                     "hwm": *app.lake.hwm.borrow(), "shard_runs": c.shard_runs.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     s["version"] = j!(crate::format::VERSION);
+    s["owner"] = j!(owner(&headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)
     s["format"] = j!(crate::format::of(&app.lake.cat).await.map(|f| f.format).unwrap_or_default()); // (the lake's: ADR-039)
     s["keys"] = j!(crate::users::kept(&app.lake).await); // (the lake's own keys: sealed by its master key, or in the clear)
+    // Background jobs that failed, by kind: a rising count is a stall (tiering, publishing, …) that
+    // otherwise shows only on this node's stderr.
+    s["background_failures"] = j!(crate::metrics::failures().into_iter().filter(|(_, n)| *n > 0).collect::<std::collections::BTreeMap<_, _>>());
+    s["signed"] = j!(crate::users::signed(&app.lake).await); // (served with tokens once: a node without them answers no one unsigned)
     if c.is_leader() {
         s["releases"] = j!(c.releases()); // (each live node's: a rolling upgrade's progress)
     }
@@ -1467,6 +1796,14 @@ async fn stats(State(app): State<App>) -> Json<Value> {
         s["commits"] = j!(ms.len());
         s["commit_ms_p50"] = j!(pct(0.5));
         s["commit_ms_p95"] = j!(pct(0.95));
+    }
+    if crate::auth::current().is_none_or(|p| p.role == crate::auth::Role::None) {
+        // (the cluster's names and addresses are a signed-in caller's; the rest is a probe's)
+        if let Some(o) = s.as_object_mut() {
+            for k in ["lake", "leader", "nodes", "releases"] {
+                o.remove(k);
+            }
+        }
     }
     Json(s)
 }
@@ -1481,14 +1818,21 @@ macro_rules! ensure {
 }
 use ensure;
 
-/// Any error becomes a 500 with its message.
+/// Any error becomes a response whose HTTP status follows its SQLSTATE: a client's bad request is a
+/// 4xx, a transient condition 503, a real fault 500 (`codes::http`). The message is the body and
+/// `x-pondra-sqlstate` the exact code (ADR-036 §4).
 pub struct E(anyhow::Error);
 impl<T: Into<anyhow::Error>> From<T> for E {
     fn from(e: T) -> Self { E(e.into()) }
 }
+impl std::fmt::Display for E {
+    // (the words a client is sent, so the audit log says what the client was told: `ext::said`)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", crate::ext::said(&self.0)) }
+}
 impl IntoResponse for E {
     fn into_response(self) -> Response {
         let code = crate::codes::of(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4)
-        (StatusCode::INTERNAL_SERVER_ERROR, [("x-pondra-sqlstate", code)], crate::ext::said(&self.0)).into_response()
+        let status = StatusCode::from_u16(crate::codes::http(code)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, [("x-pondra-sqlstate", code)], crate::ext::said(&self.0)).into_response()
     }
 }

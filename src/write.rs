@@ -135,7 +135,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 i.sequence = crate::seq::owned(lake, name, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
                 defaults.insert(c.clone(), format!("nextval('{}')", i.sequence.replace('\'', "''")));
             }
-            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, folder, tiered: lake.visible(), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
+            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, folder, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
         }
         Some(mut m) => {
             defaulted = false;
@@ -412,9 +412,10 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         ast::TableFactor::Table { name, .. } => Some(object(name)),
         _ => None,
     };
+    let head = head(sql);
     // OR REPLACE where replacing one would lose what it holds: refused, saying why.
     static NO_REPLACE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*CREATE\s+OR\s+REPLACE\s+(SCHEMA|DATABASE|USER|ROLE|SHARE|RECIPIENT)\b").expect("a regex"));
-    if let Some(c) = NO_REPLACE.captures(first_word(sql)) {
+    if let Some(c) = (head == "create").then(|| NO_REPLACE.captures(first_word(sql))).flatten() {
         let kind = c[1].to_uppercase();
         let lost = match kind.as_str() {
             "USER" | "ROLE" => "the rights given to it",
@@ -426,7 +427,6 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     }
     // The kinds below each begin with one of these words, so a query or a row's change goes past
     // them without being read again by each (every statement is read here more than once).
-    let head = first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_ascii_lowercase();
     let kinds = matches!(head.as_str(), "create" | "alter" | "drop" | "grant" | "revoke" | "comment" | "copy" | "attach");
     if let Some(s) = kinds.then(|| crate::shares::statement(sql)).flatten() {
         return Some(s); // (CREATE SHARE and RECIPIENT, GRANT SELECT ON SHARE: `shares.rs`, before users' GRANT)
@@ -463,7 +463,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     static EXTERNAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?is)^\s*CREATE\s+(\w+\s+){0,3}EXTERNAL\s+TABLE\b").expect("a regex")
     });
-    if let Some(m) = EXTERNAL.find(first_word(sql)) {
+    if let Some(m) = (head == "create").then(|| EXTERNAL.find(first_word(sql))).flatten() {
         use datafusion::sql::parser::{DFParserBuilder, Statement as DF};
         if m.as_str().split_whitespace().any(|w| w.eq_ignore_ascii_case("temp") || w.eq_ignore_ascii_case("temporary")) {
             return Some(Stmt::Invalid("CREATE TEMPORARY EXTERNAL TABLE: make a temporary view of the files instead (CREATE TEMP VIEW t AS SELECT * FROM read_parquet('…'))".into()));
@@ -510,24 +510,24 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
     }
     let name = |s: &str| s.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
-    if let Some(c) = VIEW_RENAME.captures(first_word(sql)) {
+    if let Some(c) = (head == "alter").then(|| VIEW_RENAME.captures(first_word(sql))).flatten() {
         return Some(Stmt::Ddl(vec![Ddl::RenameTable { name: name(&c[3]), to: name(&c[4]) }]));
     }
     // `ALTER MATERIALIZED VIEW v DETACH`: its rows stop following, and stay as a table of that name.
     static DETACH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+MATERIALIZED\s+VIEW\s+([\w."-]+)\s+DETACH\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = DETACH.captures(first_word(sql)) {
+    if let Some(c) = (head == "alter").then(|| DETACH.captures(first_word(sql))).flatten() {
         return Some(Stmt::Ddl(vec![Ddl::DetachView { name: name(&c[1]) }]));
     }
     // `CREATE TABLE c [SHALLOW] CLONE t` (Snowflake's, Databricks'): a table of t's files as they are now, copying none (ADR-043).
     static CLONE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?([\w."-]+)\s+(SHALLOW\s+)?CLONE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = CLONE.captures(first_word(sql)) {
+    if let Some(c) = (head == "create").then(|| CLONE.captures(first_word(sql))).flatten() {
         let d = Ddl::Clone { name: name(&c[2]), from: name(&c[4]) };
         return Some(Stmt::Ddl(vec![if c.get(1).is_some() { unless(true, &name(&c[2]), "relation", d) } else { d }]));
     }
     // `CREATE DATABASE b CLONE a [WITH (schemas = (x, y))] [WITH NO DATA]`: a branch of a, copying none
     // of its files (ADR-047). (The parser takes `CLONE a` alone.)
     static DB_CLONE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*CREATE\s+DATABASE\s+(IF\s+NOT\s+EXISTS\s+)?([\w"-]+)\s+(?:LOCATION\s+'((?:[^']|'')*)'\s+)?CLONE\s+([\w"-]+)((?:\s+WITH\s*\(\s*schemas\s*=\s*\([^)]*\)\s*\)|\s+WITH\s+NO\s+DATA)*)\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = DB_CLONE.captures(first_word(sql)) {
+    if let Some(c) = (head == "create").then(|| DB_CLONE.captures(first_word(sql))).flatten() {
         static SCHEMAS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)schemas\s*=\s*\(([^)]*)\)").expect("a regex"));
         let tail = c.get(5).map_or("", |m| m.as_str());
         let schemas = SCHEMAS.captures(tail).map(|s| s[1].split(',').map(|n| name(n.trim())).filter(|n| !n.is_empty()).collect()).unwrap_or_default();
@@ -537,23 +537,45 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     // `ALTER DATABASE b REFRESH [t, …]`: a branch's tables (all it took from its base, or those
     // named: a view stands for the tables it reads), and what follows them, as its base has them now (ADR-047).
     static DB_REFRESH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+REFRESH((?:\s+[\w".$-]+(?:\s*,\s*[\w".$-]+)*)?)\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = DB_REFRESH.captures(first_word(sql)) {
+    if let Some(c) = (head == "alter").then(|| DB_REFRESH.captures(first_word(sql))).flatten() {
         let tables = c[2].split(',').map(|t| name(t.trim())).filter(|t| !t.is_empty()).collect();
         return Some(Stmt::Ddl(vec![Ddl::Refresh { database: Some(name(&c[1])), tables }]));
     }
     // `ALTER DATABASE b SET (protected = true | false)`: a database's protection (ADR-058: `protect.rs`).
     static DB_PROTECT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+SET\s*\(\s*protected\s*=\s*(true|false)\s*\)\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = DB_PROTECT.captures(first_word(sql)) {
+    if let Some(c) = (head == "alter").then(|| DB_PROTECT.captures(first_word(sql))).flatten() {
         return Some(Stmt::Ddl(vec![Ddl::Protect { database: name(&c[1]), on: c[2].eq_ignore_ascii_case("true"), by: String::new() }]));
+    }
+    // `BACKUP DATABASE [b] TO 'url' [WITH (retention_days = n)]` and `RESTORE DATABASE b FROM 'url'
+    // [LOCATION 'dir'] [AT (TIMESTAMP => '…')]` (ADR-070: a backup is a lake, `backup.rs`).
+    static BACKUP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*BACKUP\s+DATABASE\s+(?:([\w"-]+)\s+)?TO\s+'((?:[^']|'')*)'(?:\s+WITH\s*\(\s*retention_days\s*=\s*(\d+)\s*\))?\s*;?\s*$"#).expect("a regex"));
+    static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*RESTORE\s+DATABASE\s+([\w"-]+)\s+FROM\s+'((?:[^']|'')*)'(?:\s+LOCATION\s+'((?:[^']|'')*)')?(?:\s+AT\s*\(\s*TIMESTAMP\s*=>\s*'((?:[^']|'')*)'\s*\))?\s*;?\s*$"#).expect("a regex"));
+    static BACKUP_ANY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(BACKUP|RESTORE)\s+DATABASE\b").expect("a regex"));
+    let text = |m: Option<regex::Match>| m.map(|m| m.as_str().replace("''", "'"));
+    let backups = matches!(head.as_str(), "backup" | "restore"); // (a query compiles none of these)
+    if let Some(c) = backups.then(|| BACKUP.captures(first_word(sql))).flatten() {
+        let retention_days = c.get(3).map(|d| d.as_str().parse::<u64>()).transpose();
+        let Ok(retention_days) = retention_days else { return Some(Stmt::Invalid("retention_days is a number of days".into())) };
+        return Some(Stmt::Ddl(vec![Ddl::BackupDatabase { database: c.get(1).map(|n| name(n.as_str())), to: c[2].replace("''", "'"), retention_days }]));
+    }
+    if let Some(c) = backups.then(|| RESTORE.captures(first_word(sql))).flatten() {
+        let at = match text(c.get(4)).map(|t| crate::backup::instant(&t)).transpose() {
+            Ok(at) => at,
+            Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
+        };
+        return Some(Stmt::Ddl(vec![Ddl::RestoreDatabase { name: name(&c[1]), from: c[2].replace("''", "'"), dir: text(c.get(3)), at }]));
+    }
+    if backups && BACKUP_ANY.is_match(first_word(sql)) {
+        return Some(Stmt::Invalid("a backup is written as BACKUP DATABASE [name] TO 'place' [WITH (retention_days = 7)], and restored as RESTORE DATABASE name FROM 'place' [LOCATION 'place'] [AT (TIMESTAMP => '2026-10-12 03:00:00')]".into()));
     }
     // `UNDROP TABLE t` (Snowflake's, Databricks'): the table dropped last under that name, back (ADR-043).
     static UNDROP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*UNDROP\s+TABLE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = UNDROP.captures(first_word(sql)) {
+    if let Some(c) = (head == "undrop").then(|| UNDROP.captures(first_word(sql))).flatten() {
         return Some(Stmt::Ddl(vec![Ddl::Undrop { name: name(&c[1]) }]));
     }
     // DuckDB's CREATE MACRO … IF NOT EXISTS (the parser takes only OR REPLACE): read without it, kept unless one is there.
     static MACRO_QUIET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+(OR\s+REPLACE\s+)?(TEMP\s+|TEMPORARY\s+)?MACRO\s+)IF\s+NOT\s+EXISTS\s+").expect("a regex"));
-    if let Some(c) = MACRO_QUIET.captures(first_word(sql)) {
+    if let Some(c) = (head == "create").then(|| MACRO_QUIET.captures(first_word(sql))).flatten() {
         if c.get(2).is_some() {
             return Some(Stmt::Invalid("CREATE OR REPLACE MACRO … IF NOT EXISTS: one or the other".into()));
         }
@@ -569,7 +591,8 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         });
     }
     // A table's layout as clauses (`PARTITION BY day(ts)`, `TTL ts + INTERVAL '1 hour'`, …): read as its options.
-    let sql = &match crate::layout::clauses(sql) {
+    let laid = if matches!(head.as_str(), "create" | "alter") { crate::layout::clauses(sql) } else { Ok(std::borrow::Cow::Borrowed(sql)) };
+    let sql = &match laid {
         Ok(sql) => sql,
         Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
     };
@@ -650,7 +673,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             Stmt::Update(relation(&u.table.relation)?, set.collect(), where_(&u.selection))
         }
         Statement::AlterTable(a) => match &a.operations[..] {
-            [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if c.options.iter().any(|o| matches!(o.option, ast::ColumnOption::NotNull | ast::ColumnOption::Default(_))) || !matches!(crate::seq::identity_of(c), Ok(None)) => {
+            [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if crate::defaults::fills_existing(c) || !matches!(crate::seq::identity_of(c), Ok(None)) => {
                 Stmt::Invalid(format!("ALTER TABLE {} ADD COLUMN {} … NOT NULL, DEFAULT or an identity: the rows already there would have no value for it (add it, then UPDATE {} SET {} = …)", a.name, c.name, a.name, c.name))
             }
             [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => Stmt::AddColumn(object(&a.name), ident(&c.name), sql_type(&c.data_type), *if_not_exists),
@@ -658,6 +681,12 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             [ast::AlterTableOperation::RenameColumn { old_column_name: from, new_column_name: to }] => alter(&a, from, Change::Rename(ident(to))),
             [ast::AlterTableOperation::DropColumn { column_names, if_exists, .. }] => Stmt::Ddl(column_names.iter().map(|c| Ddl::AlterColumn { table: object(&a.name), column: ident(c), change: Change::Drop { if_exists: *if_exists } }).collect()),
             [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetDataType { data_type, .. } }] => alter(&a, c, Change::Type(data_type.to_string())),
+            // (defaults and NOT NULL: `defaults.rs`; `SET DEFAULT NULL` is no default, as `DEFAULT NULL` in ADD COLUMN)
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetDefault { value } }] if crate::defaults::is_null(value) => alter(&a, c, Change::Default(None)),
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetDefault { value } }] => alter(&a, c, Change::Default(Some(value.to_string()))),
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::DropDefault }] => alter(&a, c, Change::Default(None)),
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetNotNull }] => alter(&a, c, Change::NotNull(true)),
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::DropNotNull }] => alter(&a, c, Change::NotNull(false)),
             [ast::AlterTableOperation::RenameTable { table_name }] => {
                 let to = table_name.to_string();
                 let to = to.trim_start_matches("TO ").trim_start_matches("AS ");
@@ -766,6 +795,12 @@ pub fn first_word(sql: &str) -> &str {
     }
 }
 
+/// The statement's first word, lowercased (`create` for `CREATE TABLE …`, past comments): what a
+/// statement's own regexes are looked at for, so a query compiles none of them.
+pub fn head(sql: &str) -> String {
+    first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_ascii_lowercase()
+}
+
 /// A column type as DataFusion plans it: bytes by any of their names (`BYTEA`), and JSON kept as
 /// text (`VARIANT`, `JSON`, `JSONB`: the JSON functions read it).
 pub fn sql_type(t: &ast::DataType) -> String {
@@ -865,7 +900,8 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
     }
     // (`PARTITION BY`, `CLUSTER BY`, `SEQUENCE BY`, `TTL` and `MERGE sum` came in as these options: `layout.rs`)
     if let o @ (ast::CreateTableOptions::Plain(_) | ast::CreateTableOptions::TableProperties(_)) = &c.table_options {
-        bail!("CREATE TABLE {} … {o}: a table's options go in WITH (name = value, …)", c.name);
+        // (MySQL's `ENGINE=…` and the like: a feature of another engine, refused by name with its SQLSTATE)
+        return Err(crate::codes::coded("0A000", format!("CREATE TABLE {} … {o}: a table's options go in WITH (name = value, …)", c.name)));
     }
     const OPTIONS: [&str; 7] = ["publish", "cluster_by", "partition_by", "ttl", "order_by", "merge", "retention"];
     if let Some(k) = opts.keys().find(|k| !OPTIONS.contains(&k.as_str())) {
@@ -971,18 +1007,18 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
     match stmt {
         Stmt::Insert(_, query) => Ok(query.clone()),
         Stmt::Update(t, set, cond) => {
-            ensure!(meta.merge.is_empty(), "merge tables combine rows per key: INSERT into them instead");
+            if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", "merge tables combine rows per key: INSERT into them instead of UPDATE")); }
             ensure!(set.iter().all(|(c, _)| !meta.key.contains(c) && meta.columns.iter().any(|(n, _)| n == c)), "UPDATE sets existing non-key columns");
             crate::seq::check_set(meta, &set.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
             let pick = |c: &str| match set.iter().find(|(s, _)| s == c) {
                 Some((_, e)) => format!("({e})"),
-                None if c == "_deleted" => "false".into(),
-                None => q(c),
+                None => q(c), // (`_deleted` too: an updated row keeps its own, as `change::select_as` does)
             };
             Ok(select(&pick, t, cond))
         }
         Stmt::Delete(t, cond) => {
-            ensure!(meta.merge.is_empty() && deletes, "DELETE needs an upsert table with a Boolean _deleted column");
+            if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", "merge tables combine rows per key: INSERT into them instead of DELETE")); }
+            ensure!(deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
         Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) => unreachable!("not a row write here"),
@@ -1104,6 +1140,7 @@ pub async fn follows(lake: &Lake, table: &str) -> Result<bool> {
 /// Run a row query here: its rows in the table's column order and types.
 pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
     let target = schema(&meta.columns)?;
+    let sql = &values_typed(sql, &target);
     let one; // (`nextval` numbers `VALUES` in their order, as Postgres does: one partition)
     let ctx = match crate::seq::calls(sql) {
         true => {
@@ -1134,6 +1171,34 @@ pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<R
     fields.extend(ids.schema().fields().iter().cloned());
     columns.extend(ids.columns().iter().cloned());
     Ok(RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), columns)?)
+}
+
+/// An INSERT's `VALUES` with each value for a DOUBLE, REAL or DECIMAL column cast to that column's
+/// type, as Postgres takes them. DataFusion first makes one type of a VALUES column's rows, and
+/// `1e20` and `1e-20`, both decimals to it, made a DECIMAL(38, 20) that couldn't hold the first,
+/// though the column was a DOUBLE. Values fill the table's columns as `rows` fills them.
+fn values_typed<'a>(sql: &'a str, target: &datafusion::arrow::datatypes::Schema) -> std::borrow::Cow<'a, str> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let typed = |t: &DataType| t.is_floating() || t.is_decimal();
+    let values = first_word(sql).get(..6).is_some_and(|w| w.eq_ignore_ascii_case("values"));
+    if !values || !target.fields().iter().any(|f| typed(f.data_type())) {
+        return sql.into();
+    }
+    let parse = |s: &str| Parser::new(&GenericDialect {}).try_with_sql(s).and_then(|mut p| p.parse_query());
+    let Ok(mut q) = parse(sql) else { return sql.into() };
+    let ast::SetExpr::Values(v) = q.body.as_mut() else { return sql.into() };
+    for row in &mut v.rows {
+        let skip_deleted = row.content.len() < target.fields().len();
+        let fields = target.fields().iter().filter(|f| !(skip_deleted && f.name() == "_deleted"));
+        for (e, f) in row.content.iter_mut().zip(fields).filter(|(_, f)| typed(f.data_type())) {
+            let Ok(cast) = Parser::new(&GenericDialect {}).try_with_sql(&format!("arrow_cast(NULL, '{}')", f.data_type())).and_then(|mut p| p.parse_expr()) else { continue };
+            let ast::Expr::Function(mut cast) = cast else { continue };
+            let ast::FunctionArguments::List(args) = &mut cast.args else { continue };
+            args.args[0] = ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(std::mem::replace(e, ast::Expr::Value(ast::Value::Null.into()))));
+            *e = ast::Expr::Function(cast);
+        }
+    }
+    crate::routines::sql(&Statement::Query(q)).into()
 }
 
 // ---------------------------------------------------------------- bulk INSERT into append tables
@@ -1225,14 +1290,15 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     if lake.cat.get::<u64>(&producer_key(&format!("job:{}", f.job))).await?.is_some() {
         return Ok(j!({"duplicate": true})); // the same job finished concurrently
     }
-    let new = TableMeta { columns: f.columns.clone(), publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() }; // (a table `POST /insert/{t}` makes starts at the log's end, as CREATE TABLE's does; SQL's INSERT needs one already: `is_there`)
+    let new = TableMeta { columns: f.columns.clone(), publish: default_publish(), ids: true, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), ..Default::default() }; // (a table `POST /insert/{t}` makes starts at the log's end, as CREATE TABLE's does; SQL's INSERT needs one already: `is_there`)
     let meta = lake.cat.get::<TableMeta>(&table_key(&f.table)).await?.unwrap_or_else(|| new.clone());
     // Types as the lake stores them, so a writer may name them its own way (`Utf8View`, `VARIANT`).
     let types = |c: &[(String, String)]| c.iter().map(|(_, t)| crate::query::dtype(t).map(|t| crate::query::type_name(&t)).unwrap_or_else(|_| t.clone())).collect::<Vec<_>>();
     ensure!(meta.key.is_empty(), "INSERT into a keyed table goes through the log");
     ensure!(!f.files.iter().any(|d| d.sys) || !follows(lake, &f.table).await?, "{AGAIN}: a materialized view or task of {} was made as it was written", f.table);
     let live: Vec<(String, String)> = meta.live().map(|(s, _, t)| (s.to_string(), t.to_string())).collect(); // (dropped columns aren't written)
-    ensure!(types(&live) == types(&f.columns), "query columns {:?} don't match table {}", f.columns, f.table);
+    let listed = |c: &[(String, String)]| c.iter().map(|(n, t)| format!("{} {}", meta.name_of(n), crate::objects::sql_type(t))).collect::<Vec<_>>().join(", ");
+    ensure!(types(&live) == types(&f.columns), "the rows' columns ({}) aren't {}'s ({}), in order and type; if the table changed while they were written, write them again", listed(&f.columns), f.table, listed(&live));
     let rows: u64 = f.files.iter().map(|f| f.rows).sum();
     let commit = crate::adopt::FileCommit { table: f.table.clone(), job: f.job.clone(), added: f.files, new: Some(new), ..Default::default() };
     Ok(match crate::adopt::file(lake, seq, &[commit]).await? {
@@ -1366,6 +1432,10 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     if let Stmt::Invalid(why) = stmt {
         bail!(why);
     }
+    // (a backup is read, and backed up itself; COPY … TO writes outside it: ADR-070)
+    if crate::backup::frozen(&app.lake) && !crate::backup::reads_only(&stmt) {
+        return Err(crate::backup::refused(Some(&app.lake.url)));
+    }
     if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt).await? {
         let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.cluster.nodes(), &app.cluster.addr).await?; // (a view of a folder: a new file in it)
         return Ok(j!({"rows": out["copied"]}));
@@ -1444,7 +1514,10 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
         }
         let target = other.clone().unwrap_or_else(|| lake.arc());
         let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files).await?;
-        let Some(o) = other else { return post_as(&app.cluster.leader.addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await };
+        let Some(o) = other else {
+            crate::cluster::signed(lake).await; // (the nodes' key, before a user's change goes to the leader)
+            return post_as(&app.cluster.leader.addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
+        };
         let out = deliver(&o.url, Some(Some(Request::Change(sql, job.clone(), sent))), &stmt, &job, false).await?;
         seen_there(&o, Some(producer_key(&format!("sql:{job}")))).await;
         return Ok(out);
@@ -1625,6 +1698,9 @@ impl Request {
 
 /// Leader: record one request (from the inbox, or a `pondra sql` leading for a moment).
 pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request) -> Result<Value> {
+    if crate::backup::frozen(lake) && !crate::backup::allowed(&req) {
+        return Err(crate::backup::refused(Some(&lake.url))); // (a backup takes its runs and its clones' pins: ADR-070)
+    }
     match req {
         Request::Files(f) => {
             let _guard = lock.lock().await;
@@ -1736,6 +1812,26 @@ async fn created(dir: &str, c: &ast::CreateTable) -> Result<Option<()>> {
     }
 }
 
+/// The lake's key for its nodes, for `pondra sql` with no token. A leader makes it beside serving
+/// (C5), so one that has just started may not have it in the bucket yet: while one leads and the key
+/// isn't there, the lake is read again every 200 ms, for 10 s at most (a node a program started
+/// answers nothing without it: S21).
+async fn cli_key(lake: &Lake) -> Option<String> {
+    for _ in 0..50 {
+        if let Ok(k) = crate::users::node_key(lake).await {
+            return Some(k);
+        }
+        let led = matches!(latest(&lake.store).await, Ok(Some(t)) if !t.addr.is_empty() && alive(&lake.store, &t).await);
+        match crate::users::kept(lake).await {
+            "none" if led => {} // (not made yet: wait for them)
+            _ => return crate::users::node_key(lake).await.ok(), // (made meanwhile, or no leader to wait for)
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        lake.refresh().await.ok()?;
+    }
+    None
+}
+
 async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
     let job = std::env::var("PONDRA_JOB").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
     std::env::set_var("PONDRA_JOB", &job); // (if fenced, the process restarts: the same job again)
@@ -1745,6 +1841,13 @@ async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
             crate::ddl::sync(&lake, "", false).await?; // (lakes attached by ATTACH: read here too)
             let (other, table) = crate::ddl::resolve(&lake, &stmt.table()).await?;
             let (stmt, target) = (stmt.on(table.clone()), other.unwrap_or_else(|| lake.clone())); // (a write to an attached lake goes to its leader)
+            if ["PONDRA_TOKEN", "PONDRA_ADMIN_TOKEN", "PONDRA_NODE_KEY"].iter().all(|v| std::env::var(v).map_or(true, |t| t.is_empty())) {
+                // (no token: the lake's own key for its nodes, which whoever holds the lake can read; a
+                // leader on the network answers nothing unsigned. `cluster::http` sends it.)
+                if let Some(k) = cli_key(&target).await {
+                    std::env::set_var("PONDRA_NODE_KEY", k);
+                }
+            }
             (Some(prepare(&lake, &target, &table, &stmt, &job, true).await?), stmt, target.url.clone())
         }
         Err(_) => (None, stmt, dir.to_string()),
@@ -1756,6 +1859,8 @@ tokio::task_local! {
     /// A key a request to another lake's leader goes with instead of this process's token: a
     /// branch's key in its base (`branch::keyed`).
     static BEARER: String;
+    /// Set while a request goes through the bucket alone (`through_bucket`): it is not sent over HTTP.
+    static BUCKET: ();
 }
 
 /// `send`, with `key` as its `Authorization` when given.
@@ -1768,6 +1873,13 @@ pub async fn send_as(dir: &str, req: Request, key: Option<&str>) -> Result<Value
 
 /// Have the leader of the lake at `dir` record `req` (made on this node), however it's reached.
 pub async fn send(dir: &str, req: Request) -> Result<Value> { deliver(dir, Some(Some(req)), &Stmt::Invalid(String::new()), "", false).await }
+
+/// Have the leader of the lake at `dir` record `req`, through the bucket alone: its inbox, or this
+/// process leading for a moment when nobody does. For a caller with no token (`pondra token`, which
+/// the leader would refuse over HTTP): whoever can write the bucket owns the lake (invariant 18).
+pub async fn through_bucket(dir: &str, req: Request) -> Result<Value> {
+    BUCKET.scope((), deliver(dir, Some(Some(req)), &Stmt::Invalid(String::new()), "", true)).await
+}
 
 /// Have the leader of the lake at `dir` record a write: over HTTP, through the bucket inbox if it
 /// can't be reached, or, when nobody leads, by leading for a moment: here (`one_off`: a `pondra
@@ -1789,7 +1901,8 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
                     req = Some(prepare(&lake, &lake, &stmt.table(), stmt, job, true).await?);
                 }
                 let Some(Some(r)) = &req else { return Ok(j!({"duplicate": true})) };
-                let direct = std::env::var("PONDRA_NO_DIRECT").is_err(); // (test hook: act as if the leader were out of reach)
+                // (test hook PONDRA_NO_DIRECT: act as if the leader were out of reach; `through_bucket` never goes over HTTP)
+                let direct = std::env::var("PONDRA_NO_DIRECT").is_err() && BUCKET.try_with(|_| ()).is_err();
                 match if direct { Some(post(&t.addr, r).await) } else { None } {
                     Some(Ok(v)) => return summary(matches!(r, Request::Flush(_)), v),
                     Some(Err(e)) if !unreachable(&e) => return Err(e),
@@ -1823,6 +1936,9 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
 /// result goes into `target`'s `table`. What its leader has to record (None: a retried job).
 /// `files`: the query may read local files (`FROM 'jan.parquet'`) — on the author's own machine.
 async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job: &str, files: bool) -> Result<Option<Request>> {
+    if crate::backup::frozen(target) && !crate::backup::reads_only(stmt) {
+        return Err(crate::backup::refused(Some(&target.url))); // (before a file is written into it: ADR-070)
+    }
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
     match stmt {
         Stmt::Create(c) => return Ok(Some(Request::Table(table.into(), create_spec(c, query, files).await?))),
@@ -1875,6 +1991,7 @@ pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
 pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>, d: crate::ddl::Ddl) -> Result<Value> {
     match d {
         crate::ddl::Ddl::Refresh { database, tables } => crate::branch::refresh(lake, seq, lock, database, tables).await,
+        d @ (crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. }) => crate::backup::statement(lake, lock, d).await,
         d => {
             let _guard = lock.lock().await;
             crate::ddl::apply(lake, d).await
@@ -1887,7 +2004,7 @@ pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>
 /// ENDPOINT, with the pondra secret's token or the branch's own key.
 async fn across(dir: &str, r: &crate::store::Reach, req: Option<Option<Request>>) -> Result<Value> {
     let Some(Some(req @ Request::Ddl(crate::ddl::Ddl::Pin { .. } | crate::ddl::Ddl::Unpin { .. }))) = req else {
-        bail!("{dir} is read with a read-only key here: it is written on its own server (ADR-058)");
+        bail!("{dir} is attached here read-only, with a key that only reads it: write it through its own server");
     };
     // (never sent without one: this server's own key, or its user's token, must not go to another
     // server; only a branch's own `pb_` key is meant for its base's leader)
@@ -1929,6 +2046,9 @@ async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value>
         None => call,
     };
     let res = call.send().await?;
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        bail!("the leader at {addr} asks for a sign-in: set PONDRA_TOKEN to one of the lake's tokens ({})", res.text().await?);
+    }
     ensure!(res.status().is_success(), "the leader at {addr}: {}", res.text().await?);
     Ok(res.json().await?)
 }

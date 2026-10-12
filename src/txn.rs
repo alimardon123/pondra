@@ -47,7 +47,7 @@ struct Txn {
 
 static TXNS: LazyLock<Mutex<HashMap<String, Txn>>> = LazyLock::new(Default::default);
 
-const NO_SESSION: &str = "a transaction is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>)";
+const NO_SESSION: &str = "a transaction is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>; over MCP, the Mcp-Session-Id that initialize gave; over Flight SQL, BeginTransaction)";
 
 /// The current session's open transaction's snapshot, if it has one: every read in it is as of then.
 pub fn snapshot() -> Option<u64> {
@@ -171,7 +171,7 @@ pub async fn statement(app: &crate::server::App, stmt: &Stmt, files: bool) -> Re
     let stored: TableMeta = lake.cat.get(&table_key(&name)).await?.with_context(|| format!("no table {name}"))?;
     let meta = stored.logical();
     ensure!(lake.cat.get::<crate::views::View>(&crate::views::view_key(&name)).await?.is_none() && meta.merge.is_empty(), "{name} is a view's: change the table it follows");
-    ensure!(meta.ids, "{name} holds rows from before row ids (made before Pondra 0.19): copy it once and change the copy");
+    ensure!(meta.ids, "{name} was made before Pondra 0.19, and its rows have no row ids, which a transaction's changes need: copy it once (CREATE TABLE t2 AS SELECT * FROM {name}) and change the copy");
     if let (Stmt::Update(_, set, Some(cond)), None) = (stmt, &insert) {
         if let Some((old, new)) = point_change(lake, &name, &stored, Some(snapshot), set, cond).await? {
             let n = new.iter().map(|b| b.num_rows()).sum::<usize>();
@@ -282,13 +282,16 @@ pub fn overlaid(ctx: &datafusion::prelude::SessionContext, table: &str, key: &[S
         df = df.filter(not(col(crate::sys::ROW_ID).in_list(ids, false)))?;
     }
     if !key.is_empty() {
-        // (a keyed table's row is its key's: an INSERT of a key there replaces it)
-        let keys: Vec<Vec<String>> = c.new.iter().chain(&c.old).flat_map(|b| keys_of(b, key).unwrap_or_default()).collect::<HashSet<_>>().into_iter().collect();
+        // (a keyed table's row is its key's: an INSERT of a key there replaces it. One IN list over the key as text, not an
+        // OR per key: a transaction that changed 12,000 keys made an expression 12,000 deep, and planning it overflowed the
+        // stack and took the node down. A key of several columns joins them with \u{1}, which no key's text holds in practice)
+        let keys: HashSet<String> = c.new.iter().chain(&c.old).flat_map(|b| keys_of(b, key).unwrap_or_default()).map(|k| k.join("\u{1}")).collect();
         if !keys.is_empty() {
-            let text = |k: &str| cast(col(k), DataType::Utf8);
-            let one = |k: &Vec<String>| key.iter().zip(k).map(|(c, v)| text(c).eq(lit(v.clone()))).reduce(Expr::and).unwrap_or(lit(true));
-            let any = keys.iter().map(one).reduce(Expr::or).unwrap_or(lit(false));
-            df = df.filter(not(any))?;
+            let text = match key {
+                [one] => cast(col(one), DataType::Utf8),
+                _ => datafusion::functions::expr_fn::concat_ws(lit("\u{1}"), key.iter().map(|k| cast(col(k), DataType::Utf8)).collect()),
+            };
+            df = df.filter(not(text.in_list(keys.into_iter().map(lit).collect(), false)))?;
         }
     }
     if !c.new.is_empty() {
@@ -489,3 +492,8 @@ pub async fn point_read(lake: &Lake, sql: &str) -> Result<Option<Vec<RecordBatch
     })
 }
 
+/// The current session's open transaction's id, if it has one (a cursor without HOLD lives as long as it).
+pub fn id() -> Option<String> {
+    let s = crate::temp::current()?;
+    TXNS.lock().unwrap().get(&s).map(|t| t.id.clone())
+}

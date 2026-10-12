@@ -38,6 +38,8 @@ fn by_words(text: &str) -> &'static str {
         _ if has("cannot insert a non-default value") || has("can only be updated to default") => "428C9", // generated_always
         _ if has("nextval: reached") => "2200H",                                                // sequence_generator_limit_exceeded
         _ if has("is not yet defined in this session") => "55000",                              // object_not_in_prerequisite_state
+        _ if has("is not a variable which can be viewed with 'show'") => "42704",                // undefined_object (Postgres: unrecognized configuration parameter)
+        _ if has("is a session's:") => "55000",                                                 // (a SET, BEGIN or TEMP table sent with no session: send x-pondra-session)
         _ if has("violates check constraint") => "23514",                                       // check_violation
         _ if has("is not null, and a row gives it no value") || has("violates not-null") => "23502", // not_null_violation
         _ if has("duplicate key") => "23505",                                                   // unique_violation
@@ -49,7 +51,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("table '") && has("not found") || has("no table ") || has("no table or view") || has("relation") && has("does not exist") => "42P01", // undefined_table
         _ if has("no schema ") || has("schema") && has("does not exist") => "3F000",            // invalid_schema_name
         _ if has("type \"") && has("does not exist") => "42704",                                // undefined_object (`types.rs`)
-        _ if has("because column") && has("uses it") => "2BP01",                                // dependent_objects_still_exist (DROP TYPE)
+        _ if has("because column") && (has("uses it") || has("use it")) => "2BP01",              // dependent_objects_still_exist (DROP TYPE)
         _ if has("already exists") || has("exists already") => "42P07",                        // duplicate_table
         _ if has("divide by zero") || has("division by zero") => "22012",                       // division_by_zero
         _ if has("overflow") || has("out of range") => "22003",                                 // numeric_value_out_of_range
@@ -78,6 +80,28 @@ pub fn named(name: &str) -> Option<&'static str> {
     NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, c)| *c)
 }
 
+/// The HTTP status nearest a SQLSTATE (ADR-036 §4). A client's own mistake — bad SQL, a value that
+/// breaks a constraint, a name that isn't there — is a 4xx, so a proxy, a monitor or a tool reads it
+/// as the user's error, not a server fault; a transient condition (catching up, a timeout, the
+/// bucket not answering) is 503, to try again; only a real fault (XX, 58, an unknown code) is 500.
+/// The body still carries the message and `x-pondra-sqlstate` the exact code, for a client that
+/// wants more than the class.
+pub fn http(code: &str) -> u16 {
+    match code {
+        "28P01" | "28000" => 401,                                         // invalid_authorization: sign in
+        "42501" => 403,                                                   // insufficient_privilege
+        "42P01" | "42703" | "42883" | "42704" | "3F000" | "3D000" => 404, // undefined table / column / function / type / schema / database
+        "42P07" | "23505" => 409,                                         // already exists, duplicate key
+        "53300" => 429,                                                   // too many of a user's queries at once (a quota)
+        "0A000" => 501,                                                   // feature_not_supported
+        "57014" | "57P03" | "58030" | "53200" => 503,                     // timeout, catching up / cut off, bucket or node silent, out of memory: try again
+        c if c.starts_with("40") || c.starts_with("55") || c.starts_with("2B") => 409, // serialize / deadlock, wrong state, still depended on
+        c if c.starts_with("08") || c.starts_with("53") || c.starts_with("57") => 503, // connection, resources, operator intervention
+        c if c.starts_with("22") || c.starts_with("23") || c.starts_with("25") || c.starts_with("42") || c.starts_with("P0") => 400, // a bad request (data, constraint, transaction state, syntax, a procedure's RAISE)
+        _ => 500,                                                         // XX, 58, unknown: a real fault
+    }
+}
+
 /// The gRPC status nearest a SQLSTATE (Flight SQL's errors).
 pub fn grpc(code: &str) -> tonic::Code {
     match code {
@@ -89,7 +113,7 @@ pub fn grpc(code: &str) -> tonic::Code {
         "57014" => tonic::Code::DeadlineExceeded,
         "53200" | "53300" => tonic::Code::ResourceExhausted,
         "0A000" => tonic::Code::Unimplemented,
-        "23514" | "23502" | "25006" => tonic::Code::FailedPrecondition,
+        "23514" | "23502" | "25006" | "25P01" | "25P02" => tonic::Code::FailedPrecondition, // (a transaction that isn't open, or failed)
         c if c.starts_with("42") || c.starts_with("22") => tonic::Code::InvalidArgument,
         _ => tonic::Code::Internal,
     }
@@ -108,9 +132,12 @@ mod tests {
         assert_eq!(of("permission denied: INSERT on t (GRANT INSERT ON t TO ann)"), "42501");
         assert_eq!(of("Invalid function 'nope'.\nDid you mean 'now'?"), "42883");
         assert_eq!(of("table t already exists"), "42P07");
+        assert_eq!(of("Error during planning: 'nope' is not a variable which can be viewed with 'SHOW'"), "42704");
+        assert_eq!(of("a transaction is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>)"), "55000");
         assert_eq!(of("External error: invalid input value for enum mood: \"angry\" (its labels: 'sad', 'ok')"), "22P02"); // (a bulk INSERT's stream)
         assert_eq!(of("type \"mood\" does not exist"), "42704");
         assert_eq!(of("cannot drop type mood because column t.m uses it"), "2BP01");
+        assert_eq!(of("cannot drop type mood because columns use it: a.m, b.n; drop or change them first"), "2BP01");
         assert_eq!(of(crate::cluster::CUT_OFF_SAYS), "57P03");
         assert_eq!(of(crate::store::CATCHING_UP), "57P03");
         assert_eq!(of("error sending request for url (http://10.0.0.2:8080/cluster/commit)"), "58030");
@@ -124,5 +151,41 @@ mod tests {
         assert_eq!(super::named("invalid_catalog_name"), Some("3D000"));
         assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("new row for relation \"t\" violates check constraint \"c\"".into(), "23514"))), "23514");
         assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("invalid input value for enum mood: \"x\"".into(), "22P02"))), "22P02");
+    }
+
+    #[test]
+    fn http_status() {
+        let h = super::http;
+        // A client's mistake is a 4xx, not a 500 a proxy or a monitor would read as a server fault.
+        assert_eq!(h("28P01"), 401); // sign in
+        assert_eq!(h("42501"), 403); // insufficient_privilege
+        assert_eq!(h("42P01"), 404); // undefined_table
+        assert_eq!(h("42703"), 404); // undefined_column
+        assert_eq!(h("42883"), 404); // undefined_function
+        assert_eq!(h("42704"), 404); // undefined_object (a type)
+        assert_eq!(h("3F000"), 404); // invalid_schema_name
+        assert_eq!(h("3D000"), 404); // invalid_catalog_name (unknown database)
+        assert_eq!(h("42P07"), 409); // duplicate_table
+        assert_eq!(h("23505"), 409); // unique_violation
+        assert_eq!(h("40001"), 409); // serialization_failure (retry)
+        assert_eq!(h("55000"), 409); // object_not_in_prerequisite_state
+        assert_eq!(h("2BP01"), 409); // dependent_objects_still_exist
+        assert_eq!(h("23514"), 400); // check_violation
+        assert_eq!(h("23502"), 400); // not_null_violation
+        assert_eq!(h("22P02"), 400); // invalid_text_representation
+        assert_eq!(h("22003"), 400); // numeric_value_out_of_range
+        assert_eq!(h("428C9"), 400); // generated_always
+        assert_eq!(h("42601"), 400); // syntax_error
+        assert_eq!(h("25006"), 400); // read_only_sql_transaction
+        assert_eq!(h("P0001"), 400); // raise_exception (a procedure's RAISE)
+        assert_eq!(h("53300"), 429); // too many of a user's queries at once
+        assert_eq!(h("0A000"), 501); // feature_not_supported
+        assert_eq!(h("57014"), 503); // query_canceled (timeout)
+        assert_eq!(h("57P03"), 503); // cannot_connect_now (catching up / cut off)
+        assert_eq!(h("58030"), 503); // io_error (bucket or node silent)
+        assert_eq!(h("53200"), 503); // out_of_memory
+        // Only a real fault stays a 500.
+        assert_eq!(h("XX000"), 500); // internal_error
+        assert_eq!(h("58000"), 500); // system_error
     }
 }

@@ -11,12 +11,13 @@
 //!
 //! A type is in a schema, under `ty/{schema.name}`; it is listed in `pondra.objects`, shown by
 //! `SHOW CREATE TYPE`, described by `COMMENT ON TYPE`, and isn't dropped while a column uses it.
-//! Postgres's catalog shows its columns as text (`pg_type` and `pg_enum` don't list it yet). Where SQL comes in, a cast to it is
-//! a cast to text (a literal checked against its labels) and `enum_range`, `enum_first` and
-//! `enum_last` are its labels (`rewrite`).
+//! Postgres's catalog lists it as Postgres does (`pg_type`, `pg_enum`, the column's type and
+//! `information_schema`: `pg_catalog.rs`), while the wire sends the values as text. Where SQL comes
+//! in, a cast to it is a cast to text (a literal checked against its labels) and `enum_range`,
+//! `enum_first` and `enum_last` are its labels (`rewrite`).
 use crate::store::{json, table_key, Lake, TableMeta};
 use crate::write::Stmt;
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::sql::sqlparser::ast::{self, Statement, VisitMut, VisitorMut};
@@ -79,10 +80,9 @@ pub fn statement(sql: &str) -> Option<Stmt> {
         return invalid("CREATE OR REPLACE TYPE: a type's columns keep their labels (ALTER TYPE … ADD VALUE adds one)".into());
     }
     if word == "DROP" {
+        // (CASCADE and RESTRICT are the same here: a drop never takes a column with it, so a type a column
+        // uses is refused by name whichever is written, and one no column uses is dropped either way)
         let d = DROP.captures(first)?;
-        if d.get(4).is_some_and(|w| w.as_str().eq_ignore_ascii_case("cascade")) {
-            return invalid("DROP TYPE … CASCADE would drop the columns of that type: drop or change them first".into());
-        }
         let names = d[2].split(',').map(|n| crate::seq::object_of(n.trim())).collect();
         return ddl(Change::Drop { names, if_exists: d.get(1).is_some() });
     }
@@ -167,10 +167,18 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
                     ensure!(if_exists, "type \"{n}\" does not exist");
                     continue;
                 };
-                if let Some((k, m)) = users(lake, &n).await?.into_iter().next() {
-                    let column = m.enums.iter().find(|(_, e)| e.of.as_deref() == Some(n.as_str())).map_or("", |(c, _)| m.name_of(c));
-                    bail!("cannot drop type {n} because column {}.{column} uses it", &k[2..]);
+                // Every column that uses the type, named as table.column (SQL's names), for the same message
+                // whichever way the drop was written.
+                let mut using = vec![];
+                for (k, m) in users(lake, &n).await? {
+                    for (c, e) in &m.enums {
+                        if e.of.as_deref() == Some(n.as_str()) && !m.dropped.contains(c) {
+                            using.push(format!("{}.{}", &k[2..], m.name_of(c)));
+                        }
+                    }
                 }
+                let (what, verb) = if using.len() == 1 { ("column", "uses") } else { ("columns", "use") };
+                ensure!(using.is_empty(), "cannot drop type {n} because {what} {verb} it: {}; drop or change them first", using.join(", "));
                 gone.push(n);
             }
             lake.cat.commit(vec![], &gone.iter().map(|n| key(n)).collect::<Vec<_>>()).await?;

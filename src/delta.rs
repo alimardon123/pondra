@@ -3,8 +3,8 @@
 //! Databricks, DuckDB, Polars, Trino, Athena, Snowflake. Iceberg is in `iceberg.rs`; Delta here.
 //! A table's Parquet files already live in `data/{table}/`; this keeps that folder's
 //! `_delta_log/` in step with the catalog: one JSON commit per change to the table's file list,
-//! plus a Parquet checkpoint every 10 commits so readers never replay a long log; the last 1,000
-//! versions are kept.
+//! plus a Parquet checkpoint every 10 commits so readers never replay a long log; the last 100
+//! versions are kept (`HISTORY`).
 //!
 //! The catalog stays the source of truth: a commit is derived only from what the catalog has
 //! already committed, so a crash can at worst leave the Delta log one step behind.
@@ -66,19 +66,43 @@ pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> 
     let print = |meta: &TableMeta| std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), json(meta));
     let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
     let changed: Vec<_> = tables.iter().filter(|(key, meta)| named.iter().any(|n| key[2..] == *n.table) || SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();
-    let jobs = changed.iter().flat_map(|(key, meta)| meta.publish.iter().filter(|f| refused(meta, f).is_none()).map(move |f| (&key[2..], meta, f.as_str())));
-    let states = futures::future::try_join_all(jobs.map(|(table, meta, format)| async move {
-        match format {
-            "delta" => publish(lake, table, meta).await,
-            _ => crate::iceberg::publish(lake, table, meta, named.iter().find(|n| n.table == table)).await,
+    // Each table's formats publish at once (Delta's PUTs must not add to Iceberg's freshness every
+    // round: `freshness.py --s3`), and the table's puts extend together only if all its formats
+    // succeed. One table that fails (a bucket error, a schema it can't yet publish) is named and
+    // left to the next round, and does not stop the other tables from publishing or being marked
+    // seen. The good tables are committed, and the failures are returned, so a caller that must
+    // publish (a DDL or a writer's commit) still sees them.
+    let done = futures::future::join_all(changed.iter().map(|(key, meta)| async move {
+        let table = &key[2..];
+        let formats = futures::future::join_all(meta.publish.iter().filter(|f| refused(meta, f).is_none()).map(|format| async move {
+            match format.as_str() {
+                "delta" => publish(lake, table, meta).await,
+                _ => crate::iceberg::publish(lake, table, meta, named.iter().find(|n| n.table == table)).await,
+            }
+        }))
+        .await;
+        let mut puts = vec![];
+        for r in formats {
+            match r {
+                Ok(state) => puts.extend(state),
+                Err(e) => return ((*key).clone(), meta, Err(format!("{table}: {e:#}"))),
+            }
         }
+        ((*key).clone(), meta, Ok(puts))
     }))
-    .await?;
-    let puts: Vec<(String, Vec<u8>)> = states.into_iter().flatten().collect();
+    .await;
+    let (mut puts, mut failed, mut seen): (Vec<(String, Vec<u8>)>, Vec<String>, Vec<(String, u64)>) = (vec![], vec![], vec![]);
+    for (key, meta, r) in done {
+        match r {
+            Ok(p) => { puts.extend(p); seen.push((key, print(meta))); }
+            Err(e) => failed.push(e),
+        }
+    }
     if !puts.is_empty() {
         lake.cat.commit(puts, &[]).await?; // (committed before the next round reads it)
     }
-    SEEN.lock().unwrap().extend(changed.iter().map(|(key, meta)| (key.clone(), print(meta))));
+    SEEN.lock().unwrap().extend(seen); // (only the tables that published: a failed one retries next round)
+    anyhow::ensure!(failed.is_empty(), "{}", failed.join("; "));
     Ok(())
 }
 

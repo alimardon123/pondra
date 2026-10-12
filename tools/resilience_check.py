@@ -385,9 +385,11 @@ def unmount(path):
 
 
 def fill(path):
-    """The disk at `path` full to its last byte, by a file `filler` (removed to make room again)."""
+    """The disk at `path` full, by a file `filler` (removed to make room again): to its last page, which
+    is what tmpfs counts. (Not a byte at a time: the nodes free pages as they go, and a byte a write takes
+    4,096 writes to fill each one. On one CI run the fill took 12 minutes where it takes 0.1 s here.)"""
     fd = os.open(os.path.join(path, "filler"), os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-    for size in (1 << 20, 4096, 1):
+    for size in (1 << 20, 4096):
         try:
             while os.write(fd, b"\0" * size):
                 pass
@@ -420,7 +422,9 @@ def disk(a):
         load = Load(nodes).start()
         time.sleep(a.secs / 2)
         load.phase, reads = "the disk full", len(load.reads)
+        t0 = time.time()
         fill(mnt)
+        info["the disk full: filling it (s)"] = round(time.time() - t0, 1)
         t0 = time.time()
         time.sleep(a.secs)
         info["the disk full: acks a second"] = round(load.since(t0) / (time.time() - t0), 1)
@@ -439,7 +443,9 @@ def disk(a):
         load.exactly_once("after the disk filled up")
         check("every node is still running", all(nd.alive() for nd in nodes), [nd.log for nd in nodes if not nd.alive()])
         drained = until(lambda: (st := stats(one_leader(nodes))) and st.get("untiered_rows") == 0, 90)
-        check("the log drains into files once there is room", drained, stats(one_leader(nodes) or nodes[0]))
+        if not check("the log drains into files once there is room", drained, stats(one_leader(nodes) or nodes[0])):
+            # (CI keeps the nodes' stderr as an artifact, which a session can't read: their last lines here)
+            info["undrained: each node's last lines"] = {nd.port: open(nd.log, errors="replace").read()[-1500:] for nd in nodes}
     finally:
         for nd in nodes:
             nd.kill()

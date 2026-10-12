@@ -4,6 +4,23 @@
 param([string]$root, [string]$dir)
 $ErrorActionPreference = 'Stop'
 $env:PONDRA_ARCHIVE = Join-Path $root 'dist\pondra-windows-x64.zip'
+$zipHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $env:PONDRA_ARCHIVE).Hash.ToLower()
+
+# an archive whose SHA-256 isn't the one given is refused, and nothing is installed
+$env:PONDRA_INSTALL = "${dir}-refused"
+$env:PONDRA_SHA256 = '0' * 64
+$refused = $false
+try {
+    Get-Content -Raw -LiteralPath (Join-Path $root 'install.ps1') | Invoke-Expression
+} catch {
+    $refused = $_.Exception.Message -match 'not installed'
+    if (-not $refused) { throw }
+}
+if (-not $refused) { throw 'install.ps1 installed an archive whose SHA-256 was wrong' }
+if (Test-Path -LiteralPath (Join-Path $env:PONDRA_INSTALL 'pondra.exe')) { throw 'the refused archive left pondra.exe behind' }
+
+# the same archive with its real SHA-256: installed
+$env:PONDRA_SHA256 = $zipHash
 $env:PONDRA_INSTALL = $dir
 Get-Content -Raw -LiteralPath (Join-Path $root 'install.ps1') | Invoke-Expression
 $found = (Get-Command pondra).Source

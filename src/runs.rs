@@ -261,6 +261,9 @@ async fn append(app: &App, producer: &str, seq: u64, lines: &[Line], made: &mut 
 pub fn mark_stopped(app: App) {
     crate::panics::spawn(async move {
         let since = now_ms();
+        if crate::backup::frozen(&app.lake) {
+            return; // (a backup runs nothing, and writes no run log: ADR-070)
+        }
         if let Err(e) = stopped(&app, since, Some(&app.cluster.addr)).await {
             eprintln!("runs whose node stopped: {e:#}");
         }
@@ -472,7 +475,7 @@ fn task_options(p: &mut Parser) -> Result<TaskOptions> {
         let v = match p.next_token().token {
             Token::SingleQuotedString(s) | Token::Number(s, _) => s,
             Token::Word(w) => w.value,
-            t => bail!("{k}: a value, not {t}"),
+            t => bail!("{k}: a value, not {t} (a number, a word or 'text' in quotes, such as 3, immutable or '10 minutes')"),
         };
         let secs = |v: &str| -> Result<u64> {
             match v.parse::<u64>() {
@@ -609,16 +612,23 @@ pub async fn create_task(lake: &Lake, name: &str, mut task: Task, replace: bool)
     Ok(out)
 }
 
+/// `DROP TASK name`: a scheduled task (`j/`) or a streaming one made over HTTP (`k/`, `tasks.rs`).
 pub async fn drop_task(lake: &Lake, name: &str, if_exists: bool) -> Result<serde_json::Value> {
     let name = crate::ddl::local(lake, name).with_context(|| format!("{name}: not this lake's"))?;
-    if lake.cat.get::<Task>(&task_key(&name)).await?.is_none() {
+    let (streaming, scheduled) = (crate::tasks::exists(lake, &name).await?, lake.cat.get::<Task>(&task_key(&name)).await?.is_some());
+    if !streaming && !scheduled {
         ensure!(if_exists, "no task {name}");
         return Ok(serde_json::json!({"dropped": false}));
     }
-    if let Some((f, _)) = tasks(lake).await?.iter().find(|(_, t)| t.after.contains(&name)) {
-        bail!("task {f} runs after {name}: drop {f} first, or make it again without it");
+    if scheduled {
+        if let Some((f, _)) = tasks(lake).await?.iter().find(|(_, t)| t.after.contains(&name)) {
+            bail!("task {f} runs after {name}: drop {f} first, or make it again without it");
+        }
+        lake.cat.commit(vec![], &[task_key(&name), tick_key(&name)]).await?;
     }
-    lake.cat.commit(vec![], &[task_key(&name), tick_key(&name)]).await?;
+    if streaming {
+        crate::tasks::drop_task(lake, &name).await?;
+    }
     Ok(serde_json::json!({"task": name, "dropped": true}))
 }
 
@@ -652,6 +662,9 @@ pub fn schedule(app: App) {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                 _ = WAKE.notified() => {}
+            }
+            if crate::backup::frozen(&app.lake) {
+                continue; // (a backup runs nothing: ADR-070)
             }
             let Ok(all) = tasks(&app.lake).await else { continue };
             for (name, task) in all.iter() {
@@ -831,7 +844,7 @@ pub fn every(text: &str) -> Result<Every> {
     if t.starts_with("cron ") || (fields.len() >= 5 && fields[0].chars().all(|c| c.is_ascii_digit() || "*/,-".contains(c))) {
         ensure!((5..=6).contains(&fields.len()), "cron: five fields (minute hour day month weekday) and a time zone");
         let tz = match fields.get(5) {
-            Some(z) => text.split_whitespace().last().unwrap_or(z).parse::<chrono_tz::Tz>().map_err(|e| anyhow::anyhow!("cron: time zone {z}: {e}"))?,
+            Some(z) => text.split_whitespace().last().unwrap_or(z).parse::<chrono_tz::Tz>().map_err(|e| anyhow::anyhow!("cron: time zone {z}: {e} (a time zone such as 'UTC' or 'Europe/Berlin')"))?,
             None => chrono_tz::UTC,
         };
         return Ok(Every::Cron(Box::new(Cron::parse(&fields[..5])?), tz));

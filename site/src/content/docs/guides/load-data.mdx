@@ -4,6 +4,7 @@ description: Put rows into tables with INSERT, append, files, DataFrames and Pos
 ---
 
 import { Tabs, TabItem, Aside, LinkCard } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 There are four ways to put rows into a table: SQL (`INSERT`), a client's `append` for streams of small
 batches, files and DataFrames for bulk loads, and Postgres tools' `COPY`. Whichever you use, a write is
@@ -16,7 +17,11 @@ files directly, and the node that receives the statement does the work.
 
 ```sql
 CREATE TABLE orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE);
-INSERT INTO orders VALUES (1, 'tea', 2, 7.0), (2, 'cake', 1, 4.5);
+```
+
+<Ways sql={`INSERT INTO orders VALUES (1, 'tea', 2, 7.0), (2, 'cake', 1, 4.5);`} />
+
+```sql
 INSERT INTO orders (id, item) VALUES (3, 'pie');
 INSERT INTO orders SELECT 10000 + value, 'bulk', 1, 1.5 FROM generate_series(1, 1000);
 ```
@@ -155,7 +160,7 @@ buckets, on HTTPS and in other engines' tables are in [Files and other lakes](/p
 
 <Aside type="caution">
 A node started with `pondra serve` never reads its own disk for a client's SQL, whoever asks: it refuses
-`FROM 'more.csv'` with "a file on the node's machine". Only the program that started a node (the shell,
+`FROM 'more.csv'` with "a path on the server's own disk". Only the program that started a node (the shell,
 `local()` in Python or JavaScript) and `pondra sql` read your files.
 </Aside>
 

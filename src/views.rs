@@ -562,7 +562,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         // (0.32 would read its partial rows as the view's: ADR-055)
         crate::format::require(lake, 2, "a materialized view that works its answers out as it is read (avg, stddev, HAVING, …)").await?;
     }
-    let mut meta = TableMeta { columns, key, merge, publish: default_publish(), ids: true, tiered: lake.visible(), history, finish: finish.clone(), ..Default::default() };
+    let mut meta = TableMeta { columns, key, merge, publish: default_publish(), ids: true, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), history, finish: finish.clone(), ..Default::default() };
     meta.publish = meta.publish.iter().filter(|f| crate::delta::refused(&meta, f).is_none()).cloned().collect(); // (said by `ddl`: `delta::left_out`)
     if !expect.is_empty() {
         expectations(lake, name, &source, &planned, &meta, &expect).await?;
@@ -785,6 +785,9 @@ fn event_time(plan: &LogicalPlan, window: &str) -> Option<String> {
 /// Leader: emit what the watermark has passed, once, for every window and session view (one
 /// that fails is tried again next round; the others go on).
 pub async fn emit_all(lake: &Lake, log: &crate::log::Log) -> Result<()> {
+    if crate::backup::frozen(lake) {
+        return Ok(()); // (a backup emits nothing: ADR-070)
+    }
     for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
         let done = match (&v.emit, &v.sessions, &v.once) {
             (Some(e), _, _) => emit(lake, log, &key[2..], &v, e).await,
@@ -990,7 +993,7 @@ async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Result<Vec<Str
             _ if meta.merge.is_empty() => None,
             _ if !alone(&plan(lake, &v).await?, true) => Some("reads other tables too"),
             _ if meta.merge.values().any(|f| !["sum", "count", crate::finish::MOMENTS].contains(&f.as_str())) => Some("keeps a min or max"),
-            _ if !meta.merge.values().any(|f| f == "count") => Some("has no count(*) to drop the groups a change empties"),
+            _ if !meta.merge.values().any(|f| f == "count") => Some("has no count(*) to drop the groups a change empties: make it again with count(*) among its columns, or WITH (refresh = 'by key')"),
             _ if meta.columns.iter().any(|(c, t)| meta.merge.contains_key(c) && t.starts_with("UInt")) => Some("adds up an unsigned column (it can't subtract)"),
             _ => None,
         };
@@ -1379,7 +1382,8 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
             tables.push(t);
         }
     }
-    ensure!(tables.len() == 2 && tables[0] == source, "join = 'streams': the query joins two append tables of this lake (it names {tables:?})");
+    let named = if tables.is_empty() { "none".to_string() } else { tables.join(", ") };
+    ensure!(tables.len() == 2 && tables[0] == source, "join = 'streams': the query joins {source} with one other append table of this lake (the append tables it reads: {named})");
     for t in &tables {
         let kept = lake.cat.get::<View>(&view_key(t)).await?.is_some_and(|v| v.rerun.is_some());
         ensure!(!kept, "{t} is kept by key: its rows are replaced as their groups are worked out again, and a stream join pairs each row once. Join its own source");

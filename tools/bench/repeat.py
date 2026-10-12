@@ -6,7 +6,7 @@
 A query whose answer changes from run to run shows up as wrong runs. TPC-H q15 did, on DOUBLE
 money: it compares each supplier's revenue with the max of the same revenues, both sums added up
 in a different order each run, so the top supplier matched itself only some of the time. The
-lake is loaded as `singlenode.py` loads it (one INSERT per table); `--hot` holds its columns in
+lake is loaded as `singlenode.py` loads it (one CREATE TABLE … AS per table); `--hot` holds its columns in
 memory, as singlenode's `pondra` does, and without it every run reads the Parquet files.
 """
 import argparse, json, os, shutil, sys, time

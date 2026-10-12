@@ -212,11 +212,16 @@ pub async fn settings() -> Response {
     ([("content-type", "application/json"), ("cache-control", "no-store")], body).into_response()
 }
 
-/// `PUT /console/settings`: keep them, for the page of someone on this machine (a request from
-/// another one is refused: the file is this machine's user's). At most 64 KB of JSON.
-pub async fn save_settings(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, .. }): axum::extract::ConnectInfo<crate::tls::Peer>, body: bytes::Bytes) -> Response {
-    if !from.ip().is_loopback() {
-        return (StatusCode::FORBIDDEN, "the console's settings are kept by a page on this machine only").into_response();
+/// `PUT /console/settings`: keep them, for the page of someone on this machine. They are this
+/// machine's (one file, shared by every lake and session opened here), so an admin writes them,
+/// and from this machine only — like choosing the Python (`choose_python`). On an open node the
+/// local console page is an admin and saves them; a web page the user visits is not (`guard`'s
+/// `auth::cross_site`), and a reverse proxy's loopback address no longer stands in for an admin token.
+/// Behind `pondra serve --lakes`, this machine is the client's address the server names (`Peer::from_here`).
+/// At most 64 KB of JSON.
+pub async fn save_settings(axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: bytes::Bytes) -> Response {
+    if *role < crate::auth::Role::Admin || !peer.from_here(&headers) {
+        return (StatusCode::FORBIDDEN, "the console's settings are saved by an admin, on a page on this machine").into_response();
     }
     if body.len() > 64 << 10 || serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&body).is_err() {
         return (StatusCode::BAD_REQUEST, "settings are one JSON object, at most 64 KB").into_response();

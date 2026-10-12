@@ -219,6 +219,15 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
         let since = chrono::DateTime::from_timestamp_millis(ms as i64).map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default();
         ensure!(!refused, "{t} AT (…): its past is kept from version {v} ({since}) on (its retention: ALTER TABLE {t} SET (retention = '7 days') keeps more from now on)");
     }
+    if let Some((v, ms)) = meta.made {
+        // (strictly before `v`: at `v` itself the table may already be there, as after CREATE TABLE)
+        let before = match at {
+            At::Version(n) => n < v as i64,
+            At::Time(us) => us < ms as i64 * 1000,
+        };
+        let made = chrono::DateTime::from_timestamp_millis(ms as i64).map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default();
+        ensure!(!before, "{t} AT (…): {t} was made at version {v} ({made}); it has no past before that");
+    }
     let ts = |us: i64| lit(ScalarValue::TimestampMicrosecond(Some(us), Some("UTC".into())));
     let user: Vec<Expr> = meta.columns.iter().map(|(c, _)| ident(c)).collect();
     let shown = |more: Vec<Expr>| user.iter().cloned().chain(more).collect::<Vec<_>>();
@@ -288,14 +297,28 @@ async fn when(lake: &Lake, spec: &Spec) -> Result<At> {
     })
 }
 
+static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)^\s*RESTORE\s+(?:TABLE\s+)?([\w."-]+)\s+(?:TO\s+)?(VERSION|TIMESTAMP)\s+AS\s+OF\s+(.+?)\s*;?\s*$"#).expect("a regex")
+});
+
+/// A RESTORE's text before its moment, and the moment (`$day` in it is bound by `routines::bind`:
+/// the parser doesn't read a RESTORE). None: not a RESTORE.
+pub fn restore_moment(sql: &str) -> Option<(&str, &str)> {
+    if crate::write::head(sql) != "restore" {
+        return None;
+    }
+    let moment = RESTORE.captures(sql)?.get(3)?;
+    Some((&sql[..moment.start()], moment.as_str()))
+}
+
 /// `RESTORE TABLE t TO VERSION AS OF n` (or `TIMESTAMP AS OF …`, Delta's words): t's rows as they
 /// were then, by one MERGE from `t AT (…)`. A row changed since gets its old values back (its
 /// `_row_id` kept), a row made since goes, a row deleted since comes back as a new row. It is a
 /// change like any, so it can be undone the same way. None: not a RESTORE.
 pub async fn restore(lake: &Lake, sql: &str) -> Result<Option<String>> {
-    static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?is)^\s*RESTORE\s+(?:TABLE\s+)?([\w."-]+)\s+(?:TO\s+)?(VERSION|TIMESTAMP)\s+AS\s+OF\s+(.+?)\s*;?\s*$"#).expect("a regex")
-    });
+    if crate::write::head(sql) != "restore" {
+        return Ok(None);
+    }
     let Some(c) = RESTORE.captures(sql) else { return Ok(None) };
     let name = c[1].split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
     let t = crate::ddl::local(lake, &name).ok_or_else(|| anyhow!("RESTORE {name}: a table of this lake (run it on a node of {name}'s)"))?;

@@ -174,6 +174,7 @@ impl Server {
         for v in ["PONDRA_TLS_CERT", "PONDRA_TLS_KEY", "PONDRA_TLS_CA"] {
             cmd.env_remove(v); // (a database's node listens on this machine only: TLS is the server's)
         }
+        cmd.env(crate::tls::CLIENT_KEY, client_key()); // (its `x-pondra-client` is taken only with it)
         cmd.env("PONDRA_SERVER_URL", format!("http://{}", self.addr)).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).kill_on_drop(true);
         let mut child = cmd.spawn().context("starting a database's node")?;
         let started = Instant::now();
@@ -365,6 +366,12 @@ async fn route(s: &Server, name: &str, path: &str, req: Request) -> Response {
     }
 }
 
+/// The key this server's `x-pondra-client` carries, made once a process and given to its databases' nodes.
+fn client_key() -> &'static str {
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
 // ---------------------------------------------------------------- Postgres
 
 /// A Postgres connection: its startup message says the database; from then on, the bytes go to
@@ -376,6 +383,11 @@ async fn plain(State(s): State<Shared>, axum::extract::ConnectInfo(peer): axum::
     if !peer.allowed() {
         return (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response();
     }
+    // (a password from another machine crosses only TLS, as a node's own door says: its node sees this machine)
+    let basic = req.headers().get("authorization").and_then(|h| h.to_str().ok()).is_some_and(|h| h.starts_with("Basic "));
+    if (basic || req.uri().path().ends_with("/login")) && !peer.may_send_password() {
+        return (StatusCode::FORBIDDEN, crate::tls::PASSWORD_PLAIN).into_response();
+    }
     if !s.auth.on() && !req.headers().contains_key("authorization") {
         if let Some(why) = crate::auth::cross_site(req.headers(), req.method(), Some(peer.addr), &s.addr) {
             return (StatusCode::FORBIDDEN, why).into_response();
@@ -384,6 +396,10 @@ async fn plain(State(s): State<Shared>, axum::extract::ConnectInfo(peer): axum::
     for k in ["origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "sec-fetch-user"] {
         req.headers_mut().remove(k);
     }
+    // (who the client is, for the node to count its failed sign-ins by, with the key this server gave its
+    // nodes: `Peer::client`, behind a trusted proxy the client it names; whatever the client said goes)
+    let client = format!("{} {}", client_key(), peer.client(req.headers()));
+    req.headers_mut().insert(crate::tls::CLIENT, client.parse().expect("a key and an address are a header value"));
     next.run(req).await
 }
 

@@ -650,11 +650,31 @@ class Frame:
 
     head = limit
 
-    def unique(self, subset=None, keep="any"):
-        if subset is None:
-            return self._step(lambda r: f"SELECT DISTINCT * FROM {r}")
-        keys = ", ".join(e.sql for e in _exprs(subset))
-        return self._step(lambda r: f"SELECT DISTINCT ON ({keys}) * FROM {r}")
+    def unique(self, subset=None, keep="any", maintain_order=False):
+        """The distinct rows, or, with `subset`, one row per distinct value of those columns. `keep`:
+        "any" (the engine's pick), "first" or "last" (the row of each value first or last in the sort),
+        or "none" (only the values that occur once). `first`, `last` and `maintain_order` need a sorted
+        frame: a frame has no first or last row until it is sorted."""
+        if keep not in ("any", "first", "last", "none"):
+            raise ValueError(f"unique(keep={keep!r}): any, first, last or none")
+        if keep == "any" and not maintain_order:  # (the engine's pick, as it always was)
+            if subset is None:
+                return self._step(lambda r: f"SELECT DISTINCT * FROM {r}")
+            keys = ", ".join(e.sql for e in _exprs(subset))
+            return self._step(lambda r: f"SELECT DISTINCT ON ({keys}) * FROM {r}")
+        if keep in ("first", "last") and not self._order:
+            raise ValueError(f"unique(keep={keep!r}): a frame has no row order until it is sorted (sort it first, or keep='any')")
+        if maintain_order and not self._order:
+            raise ValueError("unique(maintain_order=True): a frame has no row order until it is sorted (sort it first)")
+        keys = ", ".join(e.sql for e in _exprs(subset)) if subset is not None else ", ".join(_quote(c) for c in self.columns)
+        # (a window keeps one row of each value: DISTINCT ON wants its ORDER BY to begin with its keys,
+        # which a sort by other columns doesn't, so a sorted frame takes each value's row in its sort)
+        if keep == "none":
+            pick = f"count(*) OVER (PARTITION BY {keys})"
+        else:
+            order = _reversed(self._order) if keep == "last" else self._order
+            pick = f"row_number() OVER (PARTITION BY {keys} ORDER BY {', '.join(o for o, _ in order)})"
+        return self._step(lambda r: f"SELECT * EXCLUDE (__pondra_n) FROM (SELECT *, {pick} AS __pondra_n FROM {r}) WHERE __pondra_n = 1", self._kept())
 
     def sample(self, n=None, fraction=None, seed=None):
         """`n` rows, or about `fraction` of them, at random; with a `seed`, the same ones every time
@@ -687,6 +707,8 @@ class Frame:
         return self._step(lambda r: f"SELECT * FROM {r} WHERE {' AND '.join(f'{_quote(c)} IS NOT NULL' for c in cols)}", self._kept())
 
     def group_by(self, *keys, maintain_order=False):
+        if maintain_order:  # (a GROUP BY promises no order: refused by name, not ignored)
+            raise ValueError("group_by(maintain_order=True): groups come in no particular order here; sort the result by its keys (.sort(...))")
         return GroupBy(self, _exprs(_flat(keys)))
 
     def join(self, other, on=None, how="inner", left_on=None, right_on=None, suffix="_right"):
@@ -904,6 +926,13 @@ def trailing_order(sql):
         nulls = re.sub(r"\s+", " ", m.group(3).upper()) if m.group(3) else ("NULLS LAST" if way == "ASC" else "NULLS FIRST")
         out.append((f"{_quote(name)} {way} {nulls}", name))
     return out
+
+
+def _reversed(order):
+    """A sort turned around, for `unique(keep="last")`: each key's direction and nulls side flipped."""
+    def flip(m):
+        return f"{'DESC' if m.group(1) == 'ASC' else 'ASC'} NULLS {'LAST' if m.group(2) == 'FIRST' else 'FIRST'}"
+    return [(re.sub(r"(ASC|DESC) NULLS (FIRST|LAST)$", flip, sql), name) for sql, name in order]
 
 
 def _flat(xs):

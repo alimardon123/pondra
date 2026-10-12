@@ -64,9 +64,15 @@ pub fn join(schema: &str, table: &str) -> String {
 /// What a schema, table or view may be called: letters, digits, `_` and `-`. A dot separates the
 /// parts of a name; quotes, slashes and spaces would get in the way of paths and SQL.
 pub fn check(part: &str) -> Result<()> {
-    ensure!(!part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
-            "{part:?}: names are letters, digits, _ and - (a dot separates schema and table)");
-    Ok(())
+    let ok = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    if !part.is_empty() && part.chars().all(ok) {
+        return Ok(());
+    }
+    // (a table's name is its folder's name, and Windows refuses a quote or a slash in a file name: the
+    // name to write is the same one with each such character as `_`)
+    let fixed: String = part.chars().map(|c| if ok(c) { c } else { '_' }).collect();
+    let hint = if fixed.is_empty() { String::new() } else { format!(": a table's name is its folder's, and Windows refuses \" and / in file names; name it {fixed}") };
+    Err(crate::codes::coded("42602", format!("'{part}': names are letters, digits, _ and - (a dot separates schema and table){hint}")))
 }
 
 /// This lake's own name in three-part names: its folder's (or prefix's) last part (`mylake` of
@@ -225,6 +231,9 @@ pub enum Ddl {
     Pin { lake: String, ms: Option<u64>, #[serde(default, skip_serializing_if = "std::ops::Not::not")] lease: bool }, // a base's leader: keep the files a branch reads (lease: renewed by a branch on another server, let go when it isn't: `branch::lapse`)
     Unpin { lake: String },
     Refresh { database: Option<String>, tables: Vec<String> }, // ALTER DATABASE b REFRESH t, …: b's leader (ADR-047)
+    BackupDatabase { database: Option<String>, to: String, #[serde(default, skip_serializing_if = "Option::is_none")] retention_days: Option<u64> }, // BACKUP DATABASE [b] TO 'url': this lake's leader, beside its lock (ADR-070, `backup.rs`)
+    RestoreDatabase { name: String, from: String, #[serde(default, skip_serializing_if = "Option::is_none")] dir: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] at: Option<u64> }, // RESTORE DATABASE b FROM 'url': a new lake, attached
+    Backup(crate::backup::Take), // the backup's (or the restored lake's) leader: a run
     Protect { database: String, on: bool, #[serde(default)] by: String }, // ALTER DATABASE b SET (protected = …): b's leader (ADR-058, `protect.rs`)
     // (the wire op keeps the old word: a node of the last release sends it to the leader)
     #[serde(rename = "deploy")]
@@ -265,6 +274,8 @@ pub enum Change {
     Rename(String),
     Drop { if_exists: bool },
     Type(String),
+    Default(Option<String>), // SET DEFAULT expr (Some), DROP DEFAULT (None): `defaults::alter`
+    NotNull(bool),           // SET NOT NULL (true), DROP NOT NULL (false): `defaults::alter`
 }
 
 /// Leader: carry one out (under the lake's lock). Comments follow what it renames, and go with
@@ -283,6 +294,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
     // (this lake's own three-part names, as dbt writes them: `"lake"."schema"."t"` is `schema.t`)
     let here = |n: String| match n.split('.').collect::<Vec<_>>()[..] {
         [l, s, t] if l == lake_name(lake) => join(s, t),
+        [s, t] => join(s, t), // (`public.t` is `t`, invariant 49: `DROP TABLE public.t` found no table)
         _ => n,
     };
     let d = match d {
@@ -419,10 +431,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         }
         Ddl::DropView { name, if_exists } => drop_view(lake, &name, if_exists).await,
         Ddl::Attach { name, dir, read_only, endpoint } => {
-            check(&name)?;
-            ensure!(name != lake_name(lake), "this lake is called {name}: attach the other under another name");
-            ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach the other under another name");
-            ensure!(!crate::ext::is_attached(lake, &name).await?, "{name} is attached already, as another engine's tables");
+            attachable(lake, &name, false).await?;
             ensure!(endpoint.is_none() || read_only, "ENDPOINT goes with READ_ONLY: a database on another server is read with its bucket's read-only key and asked through its leader's URL");
             ensure!(endpoint.as_deref().is_none_or(|e| e.starts_with("http://") || e.starts_with("https://")), "ENDPOINT is its server's URL: https://…");
             if let Some(a) = lake.cat.get::<Attachment>(&attachment_key(&name)).await? {
@@ -452,6 +461,8 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Pin { lake: branch, ms, lease } => crate::branch::pin(lake, &branch, ms, lease).await,
         Ddl::Unpin { lake: branch } => crate::branch::unpin(lake, &branch).await,
         Ddl::Refresh { .. } => bail!("ALTER DATABASE … REFRESH is done by its database's leader (write::handle)"),
+        Ddl::BackupDatabase { .. } | Ddl::RestoreDatabase { .. } => bail!("BACKUP and RESTORE DATABASE are run by the leader beside its lock (write::ddl_here)"),
+        Ddl::Backup(t) => crate::backup::take(lake, t).await,
         Ddl::Protect { database, on, by } => crate::protect::set(lake, &database, on, &by).await,
         Ddl::Apply { claim, after, record } => crate::apply::keep(lake, claim, after, &record).await,
         Ddl::CreateDatabase { name, if_not_exists, dir, clone: None } => {
@@ -534,6 +545,20 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             Ok(j!({"detached": name}))
         }
     }
+}
+
+/// Whether a database can be attached here as `name`: a name of its own (not this lake's, a
+/// schema's or another engine's tables'), and (`fresh`: one about to be made) no database's.
+pub async fn attachable(lake: &Lake, name: &str, fresh: bool) -> Result<()> {
+    check(name)?;
+    ensure!(name != lake_name(lake), "this lake is called {name}: attach the other under another name");
+    ensure!(!has_schema(lake, name).await?, "a schema here is called {name}: attach the other under another name");
+    ensure!(!crate::ext::is_attached(lake, name).await?, "{name} is attached already, as another engine's tables");
+    if fresh {
+        let taken = lake.cat.get::<Attachment>(&attachment_key(name)).await?.is_some() || lake.attached.read().unwrap().iter().any(|(n, _)| n == name);
+        ensure!(!taken, "a database here is called {name} already: give the new one another name");
+    }
+    Ok(())
 }
 
 /// Where a lake to attach is, as its nodes open it: a bucket's URL, or a folder's full path (a
@@ -726,6 +751,14 @@ pub async fn sync(lake: &Lake, me: &str, follow: bool) -> Result<()> {
 /// After this node sent an `ATTACH` or `DETACH`: once its catalog shows it, as it does here. After
 /// `CREATE MATERIALIZED VIEW`: once it is filled from the rows already there (`views::fill_all`).
 pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
+    match d {
+        // (CREATE OR REPLACE makes what it says, so it is waited for as when made plainly; IF NOT
+        // EXISTS a materialized view only: one there already was filled when it was made, and a
+        // routine there already may differ from the one asked for)
+        Ddl::Replacing { then, .. } => return Box::pin(settle(lake, then, me)).await,
+        Ddl::Unless { then, .. } if matches!(**then, Ddl::CreateMaterialized { .. }) => return Box::pin(settle(lake, then, me)).await,
+        _ => {}
+    }
     if let Ddl::CreateMaterialized { name, .. } = d {
         let name = local(lake, name).unwrap_or_default();
         let open = crate::once::open(&name);
@@ -758,6 +791,8 @@ pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
                 Change::Rename(to) => m.stored(to).is_some(),
                 Change::Drop { .. } => m.stored(column).is_none(),
                 Change::Type(_) => true, // (the same names either way)
+                Change::Default(d) => m.stored(column).is_none_or(|s| m.defaults.get(s) == d.as_ref()),
+                Change::NotNull(on) => m.stored(column).is_none_or(|s| m.not_null.iter().any(|c| c == s) == *on),
             };
             if done {
                 break;
@@ -780,7 +815,7 @@ pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
         }
         return Ok(());
     }
-    let (Ddl::Attach { name, .. } | Ddl::Detach { name, .. } | Ddl::CreateDatabase { name, .. }) = d else { return Ok(()) };
+    let (Ddl::Attach { name, .. } | Ddl::Detach { name, .. } | Ddl::CreateDatabase { name, .. } | Ddl::RestoreDatabase { name, .. }) = d else { return Ok(()) };
     let want = !matches!(d, Ddl::Detach { .. });
     for _ in 0..100 {
         if lake.cat.get::<Attachment>(&attachment_key(name)).await?.is_some() == want {
@@ -829,7 +864,7 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Re
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{name} is materialized view {owner}'s: DROP MATERIALIZED VIEW {owner}");
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(name))).await?.is_none(), "{name} is a materialized view: DROP MATERIALIZED VIEW {name}");
     let readers = readers(lake, name).await?;
-    ensure!(readers.is_empty(), "{name} is used by {}: drop them first", readers.join(", "));
+    ensure!(readers.is_empty(), "{name} is read by {}: DROP TABLE {name} CASCADE drops them too, or drop them first", readers.join(", "));
     let keep_ms = meta.retention_secs.map_or(KEEP_MS, |s| s * 1000);
     let deleted = crate::sys::deleted(name);
     let mut puts = vec![];
@@ -1159,10 +1194,13 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
     let owner = name.strip_suffix("_final").unwrap_or(&name);
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none() && lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(&name))).await?.is_none(),
         "{name} is materialized view {owner}'s: its columns are its query's");
-    let readers = readers(lake, &name).await?;
-    ensure!(readers.is_empty(), "{name} is used by {}, which name its columns: drop them first", readers.join(", "));
     let system = |c: &str| crate::sys::NAMES.contains(&c) || c == "_old_version" || c == "_deleted" || c.contains('~');
     ensure!(!system(column), "{column} is a system column: it stays as it is");
+    if let c @ (Change::Default(_) | Change::NotNull(_)) = change {
+        return crate::defaults::alter(lake, &name, column, c).await; // (no name or type changes: a view that reads the table doesn't stop it)
+    }
+    let readers = readers(lake, &name).await?;
+    ensure!(readers.is_empty(), "{name} is used by {}, which name its columns: drop them first", readers.join(", "));
     let Some(stored) = m.stored(column).map(str::to_string) else {
         ensure!(matches!(change, Change::Drop { if_exists: true }), "{name} has no column {column}");
         return Ok(j!({"table": name, "unchanged": true}));
@@ -1210,6 +1248,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             m.columns[at].1 = crate::query::type_name(&new);
             j!({"column": column, "type": m.columns[at].1})
         }
+        Change::Default(_) | Change::NotNull(_) => unreachable!("defaults::alter takes them, above"),
     };
     let mut puts = vec![(table_key(&name), json(&m))];
     let del = crate::sys::deleted(&name);

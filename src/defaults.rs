@@ -3,10 +3,13 @@
 //! `DEFAULT`), a JSON row without the key, an Arrow batch or a `COPY` without the column. A NULL
 //! in a `NOT NULL` column (a key's columns are) is refused, naming the column, whichever door the
 //! write came in by: SQL, append, Kafka, Flight, `COPY`, `UPDATE`, `MERGE`.
-use crate::store::TableMeta;
-use anyhow::{bail, Result};
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, RecordBatch};
+use crate::ddl::Change;
+use crate::store::{Lake, TableMeta};
+use anyhow::{bail, ensure, Context, Result};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch};
 use datafusion::prelude::SessionContext;
+use datafusion::sql::sqlparser::ast;
+use serde_json::{json, Value};
 
 /// Refuse rows that leave a NOT NULL column empty. `rows` are under SQL's names; `meta` is as
 /// stored. A delete marker (`_deleted`) carries only its key, and passes.
@@ -65,7 +68,7 @@ pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
     let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
     let expr = CTX.parse_sql_expr(check, &schema)?;
     let value = CTX.create_physical_expr(expr, &schema)?.evaluate(rows)?.into_array(rows.num_rows())?;
-    let Some(b) = value.as_boolean_opt() else { bail!("CHECK ({check}) is not a condition: it gives {}, not true or false", value.data_type()) };
+    let Some(b) = value.as_boolean_opt() else { bail!("CHECK ({check}) is not a condition: it gives {}, not true or false (a condition, such as CHECK (amount > 0))", value.data_type()) };
     Ok(b.iter().map(|v| Some(v == Some(false))).collect())
 }
 
@@ -115,7 +118,7 @@ pub async fn validate(column: &str, sql_type: &str, expr: &str) -> Result<()> {
         Ok(b) if b.iter().map(|b| b.num_rows()).sum::<usize>() == 1 => {
             crate::query::strict(b[0].column(0), &crate::query::dtype(sql_type)?).map(|_| ()).map_err(|e| anyhow::anyhow!("{column} DEFAULT {expr}: {e}"))
         }
-        Ok(_) => bail!("{column} DEFAULT {expr}: one value, please"),
+        Ok(_) => bail!("{column} DEFAULT {expr}: a default is one value, not a query's rows (DEFAULT 0, DEFAULT now(), DEFAULT nextval('s'))"),
         Err(e) => bail!("{column} DEFAULT {expr}: {e} (a default is an expression of constants and built-in functions, such as now() or uuid())"),
     }
 }
@@ -155,4 +158,116 @@ pub fn absent_keys(meta: &TableMeta, lines: &[u8]) -> Result<std::collections::H
 /// the table's types after).
 pub fn sql_of(meta: &TableMeta, column: &str) -> Option<String> {
     Some(format!("({})", meta.defaults.get(meta.stored(column)?)?))
+}
+
+/// Is a DEFAULT the NULL literal (`DEFAULT NULL`, `NULL::text`, `CAST(NULL AS text)`)? Postgres keeps
+/// no default for it: a column added with one is NULL in the rows there, as one with none is.
+pub fn is_null(e: &ast::Expr) -> bool {
+    match e {
+        ast::Expr::Value(v) => matches!(v.value, ast::Value::Null),
+        ast::Expr::Nested(e) | ast::Expr::Cast { expr: e, .. } => is_null(e),
+        _ => false,
+    }
+}
+
+/// Does an ADD COLUMN owe the rows already there a value: NOT NULL, or a DEFAULT that isn't NULL?
+pub fn fills_existing(c: &ast::ColumnDef) -> bool {
+    c.options.iter().any(|o| match &o.option {
+        ast::ColumnOption::NotNull => true,
+        ast::ColumnOption::Default(e) => !is_null(e),
+        _ => false,
+    })
+}
+
+/// `ALTER TABLE t ALTER COLUMN c SET DEFAULT e | DROP DEFAULT | SET NOT NULL | DROP NOT NULL`
+/// (leader, under the lake's lock), with Postgres's meanings: a default is worked out for the rows
+/// written from now on, not for the rows there; SET NOT NULL is refused while a row there is NULL.
+/// Neither changes a name or a type, so a view that reads the table doesn't stop them.
+pub async fn alter(lake: &Lake, table: &str, column: &str, change: Change) -> Result<Value> {
+    let key = crate::store::table_key(table);
+    let mut m: TableMeta = lake.cat.get(&key).await?.with_context(|| format!("no table {table}"))?;
+    let stored = m.stored(column).map(str::to_string).with_context(|| format!("column \"{column}\" of relation \"{table}\" does not exist"))?;
+    ensure!(!m.identity.contains_key(&stored), "{column} is an identity column: its values come from its sequence, not a DEFAULT or NULL");
+    match change {
+        Change::Default(None) => {
+            m.defaults.remove(&stored); // (none there is no error)
+        }
+        Change::Default(Some(expr)) => {
+            let sql_type = m.columns.iter().find(|(c, _)| *c == stored).map(|(_, t)| t.clone()).unwrap_or_default();
+            validate(column, &sql_type, &expr).await?;
+            crate::seq::named_exist(lake, &expr).await?; // (DEFAULT nextval('s'): s is there)
+            m.defaults.insert(stored.clone(), expr);
+        }
+        Change::NotNull(false) => {
+            ensure!(!m.key.contains(&stored), "{column} is {table}'s key: a key is never NULL");
+            m.not_null.retain(|c| *c != stored);
+        }
+        Change::NotNull(true) => return set_not_null(lake, table, column, &stored, m).await,
+        _ => unreachable!("alter_column sends only defaults and NOT NULL here (ddl.rs)"),
+    }
+    lake.cat.commit(vec![(key, crate::store::json(&m))], &[]).await?;
+    Ok(json!({"table": table, "column": column}))
+}
+
+/// SET NOT NULL, as `constraints.rs` adds an enforced UNIQUE: the column is NOT NULL from now on,
+/// committed first, then one flush through the sequencer so the writes before it are in; then the
+/// rows there are counted, and a NULL among them puts the entry back and refuses.
+async fn set_not_null(lake: &Lake, table: &str, column: &str, stored: &str, mut m: TableMeta) -> Result<Value> {
+    let (key, before) = (crate::store::table_key(table), m.clone());
+    m.not_null.push(stored.to_string());
+    lake.cat.commit(vec![(key.clone(), crate::store::json(&m))], &[]).await?;
+    if let Some(to) = lake.to.get() {
+        to.block().await?; // (a flush through the sequencer: those before it are in)
+    }
+    let nulls = match count_nulls(lake, table, column).await {
+        Ok(n) => n,
+        Err(e) => {
+            lake.cat.commit(vec![(key, crate::store::json(&before))], &[]).await?;
+            return Err(e);
+        }
+    };
+    if nulls > 0 {
+        lake.cat.commit(vec![(key, crate::store::json(&before))], &[]).await?;
+        return Err(crate::codes::coded("23502", format!("column \"{column}\" of relation \"{table}\" contains null values ({nulls} rows): UPDATE {table} SET {column} = … WHERE {column} IS NULL first")));
+    }
+    Ok(json!({"table": table, "column": column, "not_null": true}))
+}
+
+/// The rows of `table` whose `column` is NULL, at the lake's visible commit.
+async fn count_nulls(lake: &Lake, table: &str, column: &str) -> Result<i64> {
+    let sql = format!("SELECT count(*) AS n FROM {} WHERE \"{}\" IS NULL", crate::write::sql_name(table), column.replace('"', "\"\""));
+    let ctx = crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?;
+    let found = crate::query::sql(&ctx, &sql).await?.collect().await?;
+    Ok(found.first().and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>()).map_or(0, |a| a.value(0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+
+    fn expr(sql: &str) -> ast::Expr { Parser::new(&GenericDialect {}).try_with_sql(sql).unwrap().parse_expr().unwrap() }
+
+    fn column(def: &str) -> ast::ColumnDef {
+        match &Parser::parse_sql(&GenericDialect {}, &format!("CREATE TABLE t ({def})")).unwrap()[0] {
+            ast::Statement::CreateTable(c) => c.columns[0].clone(),
+            _ => unreachable!("a CREATE TABLE"),
+        }
+    }
+
+    #[test]
+    fn null_defaults() {
+        // (Postgres's NULL spellings: no default at all, so ADD COLUMN owes the rows nothing)
+        for e in ["NULL", "NULL::text", "CAST(NULL AS varchar(200))", "(NULL)"] {
+            assert!(is_null(&expr(e)), "{e}");
+        }
+        for e in ["'z'", "0", "NULL + 1", "now()"] {
+            assert!(!is_null(&expr(e)), "{e}");
+        }
+        assert!(!fills_existing(&column("c varchar(200) DEFAULT NULL")));
+        assert!(!fills_existing(&column("c INT DEFAULT CAST(NULL AS INT)")));
+        assert!(fills_existing(&column("c INT DEFAULT 0")));
+        assert!(fills_existing(&column("c INT NOT NULL")));
+        assert!(fills_existing(&column("c INT NOT NULL DEFAULT NULL")));
+    }
 }

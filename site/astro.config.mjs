@@ -38,12 +38,12 @@ export default defineConfig({
       sidebar: [
         { label: 'Docs', items: [
           { label: 'Get started', items: ['start/install', 'start/first-lake', 'start/features', 'start/tour', 'start/shell', 'start/console'] },
-          { label: 'Data', collapsed: true, items: ['guides/tables', 'guides/load-data', 'guides/query', 'guides/change-rows', 'guides/files-and-other-lakes'] },
-          { label: 'Streams', collapsed: true, items: ['guides/streaming', 'guides/flows', 'guides/kafka'] },
-          { label: 'Python and code', collapsed: true, items: ['guides/dataframes', 'guides/pyspark', 'guides/functions-and-procedures', 'guides/workspace', 'guides/notebooks'] },
-          { label: 'Teams', collapsed: true, items: ['guides/environments', 'guides/sharing', 'guides/security'] },
-          { label: 'Connect', collapsed: true, items: ['guides/dbt-and-bi', 'guides/other-engines', 'guides/ai-and-files'] },
-          { label: 'Operate', collapsed: true, items: ['guides/clusters', 'guides/object-storage', 'guides/server', 'guides/deploy', 'guides/upgrades'] },
+          { label: 'Data', collapsed: true, items: ['guides/tables', 'guides/load-data', 'guides/query', 'guides/change-rows', 'guides/past', 'guides/files-and-other-lakes'] },
+          { label: 'Streams', collapsed: true, items: ['guides/views', 'guides/windows', 'guides/stream-joins', 'guides/flows', 'guides/kafka'] },
+          { label: 'Python and code', collapsed: true, items: ['guides/sql-and-python', 'guides/dataframes', 'guides/pyspark', 'guides/functions-and-procedures', 'guides/scripts', 'guides/workspace', 'guides/tasks', 'guides/notebooks'] },
+          { label: 'Teams', collapsed: true, items: ['guides/environments', 'guides/projects', 'guides/git', 'guides/sharing', 'guides/security'] },
+          { label: 'Connect', collapsed: true, items: ['guides/agents', 'guides/dbt-and-bi', 'guides/other-engines', 'guides/ai-and-files'] },
+          { label: 'Operate', collapsed: true, items: ['guides/clusters', 'guides/object-storage', 'guides/server', 'guides/deploy', 'guides/upgrades', 'guides/backups', 'guides/observability'] },
           { label: 'How it works', collapsed: true, items: ['concepts/how-it-works', 'concepts/lake-format', 'concepts/keyed-tables', 'concepts/freshness-and-guarantees', 'concepts/failures', 'concepts/performance', 'concepts/compared', 'concepts/design-notes'] },
         ] },
         { label: 'SQL', items: [
@@ -69,6 +69,7 @@ export default defineConfig({
     '/reference/system-columns': '/pondra/sql/system-tables/',
     '/reference/glossary': '/pondra/sql/glossary/',
     '/guides': '/pondra/start/features/',
+    '/guides/streaming': '/pondra/guides/views/',
   },
   vite: { server: { fs: { allow: ['..'] } } }, // (brand/, beside site/)
 });

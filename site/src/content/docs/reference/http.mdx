@@ -38,28 +38,31 @@ curl -s -H "Authorization: Bearer $PONDRA_TOKEN" -X POST http://localhost:8080/s
 
 ## Status codes
 
-Every answer has one of these codes. Errors that a route doesn't name below are `500`, with the
-message as the body.
+Every answer has one of these codes. An error that a route doesn't name below takes the status
+nearest its SQLSTATE, with the message as the body: the client's own mistake is a `4xx`, a condition
+worth retrying is `503`, and only a real fault is `500`.
 
 | Status | When | Body |
 |---|---|---|
 | `200` | the answer | the JSON or text the route describes |
 | `204` | a change with no answer: `PUT /console/settings`, an Iceberg table's commit or drop, a rename | empty |
 | `304` | a console file that hasn't changed, when `If-None-Match` names its `ETag` | empty |
-| `400` | a request the route can't use: a folder of lakes' bad name, an Iceberg `POST /v1/namespaces` (use `CREATE SCHEMA`), a Delta Sharing feature not yet offered | text, or an Iceberg or Delta Sharing error object |
+| `400` | a request the route can't use: a bad statement or value, a constraint it breaks, a folder of lakes' bad name, a Delta Sharing feature not yet offered | text, or an Iceberg or Delta Sharing error object |
 | `401` | no token, a wrong token, or a wrong user name or password. A `POST /login` with a wrong password is `401` too | `sign in: a token, or a user's name and password`, `wrong token, or user name and password`, `wrong user name or password` |
-| `403` | the token or user has too few rights for the route. Also a plain request from another machine when the node takes TLS | `this needs more rights than this token's or user's`, or the TLS message |
-| `404` | no such file, version, namespace or table; an unknown path; a folder's database that can't be started | the name, and the reason |
-| `409` | `PUT /files/{path}` with no `If-Match` to a path that exists; an Iceberg commit against a table that changed meanwhile (`CommitFailedException`) | the reason |
+| `403` | the token or user has too few rights for the route or the statement (`42501`). Also a plain request from another machine when the node takes TLS, and a browser page from another site on a node with no tokens | `this needs more rights than this token's or user's`, or the reason |
+| `404` | no such file, version, namespace, table, column, function, type, schema or database; an unknown path; a folder's database that can't be started | the name, and the reason |
+| `409` | something that is already there (a table, a duplicate key); a transaction that must be retried (`40001`); `PUT /files/{path}` with no `If-Match` to a path that exists; an Iceberg commit against a table that changed meanwhile (`CommitFailedException`) | the reason |
 | `410` | `GET /sql/pages/{id}` for an answer no longer kept | `this answer's rows are no longer kept here: run it again` |
 | `412` | `PUT /files/{path}` with an `If-Match` the file has moved past | the path and the change |
 | `422` | a JSON body that lacks a field the route needs, such as `POST /plan` without `files` | the field, as the JSON reader names it |
-| `500` | any other error, such as a bad statement or a refused statement | the message as text, and the `x-pondra-sqlstate` header |
+| `429` | a user's quota of queries at once, or a query that waited too long for one of the node's turns (`53300`) | the reason |
+| `500` | a fault of the node's own (`XX000`, `58…`) | the message as text |
+| `501` | a feature not yet supported (`0A000`) | what isn't supported, and what to do |
 | `502` | a folder of lakes can't reach a running database's node | the reason |
-| `503` | the node is stopping, or it leads but can't reach its bucket; `/ready` while it catches up | the reason; `Retry-After: 1` when the node is stopping or cut off |
+| `503` | the node is stopping, or it leads but can't reach its bucket; a query while it catches up (`57P03`), past its time (`57014`) or out of memory (`53200`); `/ready` while it catches up | the reason; `Retry-After: 1` when the node is stopping or cut off |
 
-A `500` carries a header with Postgres's code for the error, `x-pondra-sqlstate`, so a client can
-tell a syntax error from a conflict without reading the words. Only the `500` answers have it. The
+An error from a statement also carries Postgres's code for it in the header `x-pondra-sqlstate`, so
+a client can tell a syntax error from a missing table or a conflict without reading the words. The
 codes are listed in [error codes](/pondra/reference/postgres/#error-codes).
 
 ```bash
@@ -69,7 +72,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/sql/pages/none
 ```
 
 ```text
-HTTP/1.1 500 Internal Server Error
+HTTP/1.1 400 Bad Request
 x-pondra-sqlstate: 42601
 404
 410
@@ -77,7 +80,7 @@ x-pondra-sqlstate: 42601
 
 A node that is stopping answers every other path with `503` and `Retry-After: 1`: send the request
 to another node. A node that leads but can't reach its bucket answers `503` the same way, while
-another node takes over. A node that has just started answers queries `500` with
+another node takes over. A node that has just started answers queries `503` with
 `x-pondra-sqlstate: 57P03` until it has what its leader had. `GET /ready` says which of these holds
 (below).
 
@@ -104,7 +107,11 @@ query) and `tables` are for clients that send frames and data along; the clients
 
 A query answers a JSON array of rows, one object each. A column that is null in a row is left out
 of its object. A statement that isn't a query answers a JSON object, such as `{"rows": 2}` or
-`{"table": "t", "publish": []}`. Several statements in one request run in order.
+`{"table": "t", "publish": []}`. Several statements in one request run in order. An answer of 8 MB
+or more (`PONDRA_STREAM_MB`) comes in pieces as it is written (`Transfer-Encoding: chunked`), as
+JSON, CSV, TSV, NDJSON or Arrow; one bigger than the node's memory for queries is refused with
+SQLSTATE `53200` (`x-pondra-sqlstate`, HTTP `503`), and a query that waited too long for its turn
+with `53300` (HTTP `429`; [Environment](/pondra/reference/environment/#memory-and-disk)).
 
 `format=typed` is what [the console](/pondra/start/console/) uses: `{"columns": [{"name", "type"}],
 "rows": [[…], …], "total": N, "pages": "…"}`. Each row is a list in the columns' order, so two
@@ -375,7 +382,7 @@ token is refused, and so is a request with no token.
 ## Projects
 
 A project's files go to the node that holds the database, with the environment's values and the
-git commit: the command line sends them, and [apply a project](/pondra/guides/environments/#apply-a-project)
+git commit: the command line sends them, and [apply a project](/pondra/guides/projects/#apply-it)
 says what each request does. Every project route takes the same body:
 
 | Field | Meaning |

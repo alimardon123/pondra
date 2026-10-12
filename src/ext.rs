@@ -339,7 +339,15 @@ pub fn names(sql: &str) -> Vec<String> {
 pub fn said(e: &anyhow::Error) -> String {
     let mut out = String::new();
     for c in e.chain().map(|c| c.to_string()) {
-        let c = c.strip_prefix("External error: ").map(str::to_string).unwrap_or(c); // (DataFusion's wrapping of ours)
+        // Unwrap DataFusion's and Arrow's wrappers, repeatedly, so the inner message — the part a
+        // user can act on — leads, not an engine-internal label.
+        let mut c = c;
+        while let Some(inner) = ["External error: ", "Error during planning: ", "Arrow error: ", "Execution error: "]
+            .iter()
+            .find_map(|p| c.strip_prefix(p))
+        {
+            c = inner.to_string();
+        }
         if !out.contains(c.trim()) {
             out += if out.is_empty() { "" } else { ": " };
             out += &c;
@@ -409,6 +417,9 @@ pub async fn prime(lake: &Lake, tables: &[(String, TableMeta)]) -> Result<()> {
         for u in m.ext.as_ref().map(|s| s.urls.clone()).unwrap_or_default() {
             OWNER.scope(true, register(lake, &u)).await?;
         }
+        if let Some(s) = m.ext.as_ref().filter(|s| s.format == "iceberg" && s.options.contains_key("namespace")) {
+            OWNER.scope(true, crate::catalogs::prime(lake, s, m)).await?;
+        }
         keep(t, m);
     }
     Ok(())
@@ -421,6 +432,11 @@ pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
     if owner() || spec.urls.iter().all(|u| own_file(lake, u)) {
         return Ok(()); // (the lake's own files: whoever reads the lake reads them, as GET /files/… does)
     }
+    if let (Some(name), [url]) = (spec.options.get("catalog"), &spec.urls[..]) {
+        if crate::catalogs::signed(lake, name, url).await? {
+            return Ok(()); // (an AWS catalog: whoever may use its attachment's secret)
+        }
+    }
     let secrets = list(lake).await?;
     spec.urls.iter().try_for_each(|u| allowed(&secrets, u))
 }
@@ -431,17 +447,27 @@ fn own_file(lake: &Lake, u: &str) -> bool {
     u.starts_with(&area) && !u[area.len()..].split('/').any(|p| p == ".." || p == ".")
 }
 
+/// May the caller read `url`, a file a catalog named (a REST table's metadata), as `check` asks of a
+/// spec's own URLs? A catalog that vouches for its files' credentials is asked nothing here.
+pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
+    if owner() || own_file(lake, url) {
+        return Ok(());
+    }
+    allowed(&list(lake).await?, url)
+}
+
 fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
     match scheme(u).filter(|s| *s != "file") {
-        None => bail!("{u} is a file on the node's machine: only the program that started the node (the shell, local()) reads those"),
+        None => bail!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `local()`): read it there, or from a bucket (s3://, gs://, az://, https://)"),
         Some(_) => ensure!(covering(secrets, u).is_some(), "{}", uncovered(u)),
     }
     Ok(())
 }
 
 /// Another engine's table names its files wherever it likes (Iceberg's by their whole URL):
-/// each must be one this caller may read, as the table is.
-async fn check_files(lake: &Lake, m: &TableMeta) -> Result<()> {
+/// each must be one this caller may read, as the table is. A folder under `vouched` (a catalog's
+/// table's location, whose credentials its catalog vouched for) needs no secret.
+async fn check_files(lake: &Lake, m: &TableMeta, vouched: Option<&str>) -> Result<()> {
     if owner() {
         return Ok(());
     }
@@ -452,7 +478,9 @@ async fn check_files(lake: &Lake, m: &TableMeta) -> Result<()> {
             crate::scan::Delete::Inline { .. } => None,
         });
         std::iter::once(f.path.as_str()).chain(deletes)
-    }).map(|p| &p[..p.rfind('/').unwrap_or(p.len())]).collect();
+    }).map(|p| &p[..p.rfind('/').unwrap_or(p.len())])
+    .filter(|d| !vouched.is_some_and(|v| format!("{}/", d.replacen("s3a://", "s3://", 1)).starts_with(v))) // (`v` ends in `/`: a folder beside the location isn't in it)
+    .collect();
     folders.sort_unstable();
     folders.dedup();
     folders.into_iter().try_for_each(|d| allowed(&secrets, &format!("{d}/")))
@@ -477,11 +505,14 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
         "kafka" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::kafka_client::resolve(lake, &spec.urls[0]).await? }),
         "share" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::sharing::read(lake, spec).await? }), // (its files' links are the provider's: ADR-046)
         "delta" | "iceberg" => {
-            let m = match spec.format.as_str() {
-                "delta" => crate::read_delta::resolve(lake, &spec.urls[0], version("version")?).await?,
+            let (mut m, d) = match spec.format.as_str() {
+                "delta" => (crate::read_delta::resolve(lake, &spec.urls[0], version("version")?).await?, None),
                 _ => crate::read_iceberg::resolve(lake, &spec.urls[0], &spec.options).await?,
             };
-            check_files(lake, &m).await?;
+            check_files(lake, &m, d.as_ref().map(|d| d.prefix.as_str())).await?;
+            if let Some(d) = &d {
+                crate::catalogs::rehome(d, &mut m); // (its files are read through the table's own delegated store)
+            }
             return Ok(TableMeta { ext: Some(spec.clone()), ..m });
         }
         _ => {}
@@ -805,6 +836,7 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
 
 /// The store `url` is read through (made as `register` makes it), and its path there.
 pub async fn store(lake: &Lake, url: &str) -> Result<(Arc<dyn object_store_df::ObjectStore>, object_store_df::path::Path)> {
+    if let Some(found) = crate::catalogs::scoped(url) { return Ok(found); } // (a catalog's table's location, while it is read or written: its delegated store)
     register(lake, url).await?;
     let u = ListingTableUrl::parse(url)?;
     Ok((lake.rt.object_store(&u)?, u.prefix().clone()))
@@ -938,7 +970,7 @@ pub fn attached_table(all: &[(String, Attached)], parts: &[String]) -> Result<Op
         let options = BTreeMap::from([("share".to_string(), a.options.get("share").cloned().unwrap_or_default()), ("schema".to_string(), schema.to_string()), ("table".to_string(), t.clone())]);
         return Ok(Some(name(&Spec { urls: vec![a.url.clone()], format: "share".into(), options })));
     }
-    let endpoint = a.options.get("endpoint").cloned().or_else(|| a.url.starts_with("http").then(|| a.url.clone()));
+    let endpoint = crate::catalogs::endpoint(a);
     let spec = match endpoint {
         Some(endpoint) => {
             let (ns, t) = match rest {
@@ -950,6 +982,7 @@ pub fn attached_table(all: &[(String, Attached)], parts: &[String]) -> Result<Op
             if a.options.contains_key("endpoint") {
                 options.insert("warehouse".into(), a.url.clone());
             }
+            options.insert("catalog".into(), parts[0].clone()); // (the attachment's name: its settings, `catalogs::open`)
             Spec { urls: vec![endpoint.trim_end_matches('/').to_string()], format: "iceberg".into(), options }
         }
         None => Spec { urls: vec![std::iter::once(a.url.trim_end_matches('/')).chain(rest.iter().map(String::as_str)).collect::<Vec<_>>().join("/")], format: a.kind.clone(), options: BTreeMap::new() },
@@ -975,14 +1008,33 @@ pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTr
     if kind == "share" {
         options = crate::sharing::accept(lake, name, url, options).await?; // (its token kept as a secret)
     }
-    let known: &[&str] = if kind == "share" { &["share"] } else { &["endpoint", "secret", "read_only"] };
+    let iceberg_only = ["endpoint_type", "access_delegation_mode"];
+    ensure!(kind == "iceberg" || !options.keys().any(|k| iceberg_only.contains(&k.as_str())), "ENDPOINT_TYPE and ACCESS_DELEGATION_MODE are an Iceberg REST catalog's");
+    let known: &[&str] = match kind {
+        "share" => &["share"],
+        "iceberg" => &["endpoint", "secret", "read_only", "endpoint_type", "access_delegation_mode"],
+        _ => &["endpoint", "secret", "read_only"],
+    };
     if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
         bail!("ATTACH … (TYPE {kind}) has no option {k}: {}", known.join(", "));
     }
     ensure!(kind == "iceberg" || !options.contains_key("endpoint"), "ENDPOINT is an Iceberg REST catalog's");
+    if let Some(m) = options.get("access_delegation_mode") {
+        ensure!(m == "vended_credentials" || m == "none", "ACCESS_DELEGATION_MODE is vended_credentials or none, not {m}");
+    }
+    // An AWS catalog (Glue, S3 Tables) is signed with a TYPE s3 secret's keys, and its endpoint is AWS's
+    // for its region unless one is given (which also checks the type).
+    if let Some(t) = options.get("endpoint_type").cloned() {
+        crate::catalogs::service(&t)?; // (one it doesn't know: refused by name, before its secret is asked for)
+        let secret = options.get("secret").cloned().with_context(|| format!("ATTACH … (TYPE iceberg, ENDPOINT_TYPE {t}) needs SECRET name: a TYPE s3 secret with the AWS keys"))?;
+        let keys = crate::catalogs::aws_keys(lake, &secret).await?;
+        let at = crate::catalogs::aws_endpoint(&t, &crate::catalogs::region(url, &keys)?)?;
+        options.entry("endpoint".to_string()).or_insert(at);
+    }
     ensure!(!lake.attached.read().unwrap().iter().any(|(n, _)| n == name) && name != crate::ddl::lake_name(lake), "{name} is a lake's name here: attach under another name");
     // A REST catalog is reached with the secret whose scope covers it (never one named anywhere else).
-    if let Some(secret) = options.get("secret") {
+    // An AWS catalog's secret covers its buckets, not its endpoint, so it isn't checked against it.
+    if let Some(secret) = options.get("secret").filter(|_| !options.contains_key("endpoint_type")) {
         let at = options.get("endpoint").unwrap_or(&url.to_string()).clone();
         let found = list(lake).await?.into_iter().find(|(n, _)| n == secret).with_context(|| format!("no secret {secret}"))?;
         ensure!(covering(&[found.clone()], &at).is_some(), "secret {secret}'s SCOPE doesn't cover {at} (CREATE OR REPLACE SECRET {secret} (…, SCOPE '{at}'))");
@@ -1058,6 +1110,17 @@ fn reach_by(hit: Option<(String, Secret)>, secrets: &[(String, Secret)], dir: &s
 /// The same, with this lake's secrets.
 pub async fn reach(lake: &Lake, dir: &str, read_only: bool, endpoint: Option<&str>) -> Result<()> {
     reach_with(&list(lake).await?, dir, read_only, endpoint)
+}
+
+/// A place this lake copies itself to or from (a backup's, a restore's: ADR-070), reached with the
+/// bucket secret whose SCOPE covers it when one does, else with the environment's credentials. (Only
+/// on a hit: a place registered with none would hide a key a broader place was registered with.)
+pub async fn reach_place(lake: &Lake, dir: &str) -> Result<()> {
+    let secrets = list(lake).await?;
+    if let Some(hit) = covering(&secrets, dir) {
+        reach_by(Some(hit), &secrets, dir, false, None)?;
+    }
+    Ok(())
 }
 
 /// The bucket secrets covering `urls` (no temporary ones), for a branch to keep (`branch::make`). Whoever
@@ -1384,6 +1447,13 @@ fn copy_into_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Op
         }
     } else {
         match p.parse_literal_string() {
+            Ok(path) if path.starts_with('@') => {
+                // (Snowflake's stage: Pondra has none, it reads the files where they are)
+                let stage = path.split('/').next().unwrap_or(&path);
+                return Some(crate::write::Stmt::Invalid(format!(
+                    "COPY INTO {table} FROM {stage}: a stage isn't supported; name the files where they are: COPY INTO {table} FROM 's3://bucket/folder/*.csv' (FORMAT csv, HEADER true)"
+                )));
+            }
             Ok(path) => Source::Path(path),
             Err(_) => return invalid("the path is a string".into()),
         }
@@ -1524,14 +1594,19 @@ pub async fn reveal(lake: &Lake, name: &str) -> Result<BTreeMap<String, String>>
     Ok(values)
 }
 
+/// A secret's values, for the catalog that was attached with it (`catalogs.rs`).
+pub(crate) fn reveal_secret(name: &str, s: &Secret) -> Result<BTreeMap<String, String>> { open(name, s) }
+
 /// A secret's values: its data key unwrapped by the master key, then its values opened with it.
 fn open(name: &str, s: &Secret) -> Result<BTreeMap<String, String>> {
-    let damaged = || anyhow!("secret {name} was sealed with another master key: every node needs the same PONDRA_SECRET_KEY (or PONDRA_KMS_COMMAND)");
-    let key = match &s.key {
-        Some(wrapped) => unwrap_key(wrapped).map_err(|e| anyhow!("{}: {e:#}", damaged()))?,
-        None => master()?.to_vec(), // (sealed before round 29: by the master key itself)
+    let damaged = || anyhow!("secret {name} was sealed with another master key: every node needs the same PONDRA_SECRET_KEY or PONDRA_ADMIN_TOKEN (or PONDRA_KMS_COMMAND)");
+    let plain = match &s.key {
+        Some(wrapped) => {
+            let key = unwrap_key(wrapped).map_err(|e| anyhow!("{}: {e:#}", damaged()))?;
+            open_with(&key, &s.sealed).ok_or_else(damaged)?
+        }
+        None => masters()?.iter().find_map(|m| open_with(m, &s.sealed)).ok_or_else(damaged)?, // (sealed before round 29: by a master key itself)
     };
-    let plain = open_with(&key, &s.sealed).ok_or_else(damaged)?;
     Ok(serde_json::from_slice(&plain)?)
 }
 
@@ -1564,7 +1639,8 @@ fn open_with(key: &[u8], sealed: &str) -> Option<Vec<u8>> {
 static UNWRAPPED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<u8>>>> = std::sync::LazyLock::new(Default::default);
 
 /// A data key wrapped by the master key: by `PONDRA_KMS_COMMAND wrap` (a key service: its key never
-/// leaves it), or sealed with the local master key (`PONDRA_SECRET_KEY`, else this machine's).
+/// leaves it), or sealed with the local master key (`PONDRA_SECRET_KEY`, else the admin token's, else
+/// this machine's).
 fn wrap_key(key: &[u8]) -> Result<String> {
     match kms() {
         Some(cmd) => Ok(format!("kms:{}", kms_run(&cmd, "wrap", &B64.encode(key))?)),
@@ -1572,18 +1648,15 @@ fn wrap_key(key: &[u8]) -> Result<String> {
     }
 }
 
-/// A data key, unwrapped: by the key service for `kms:…`; else by the master key, or the previous
-/// one (`PONDRA_SECRET_KEY_PREVIOUS`) while keys move to a new one (`rewrap`).
+/// A data key, unwrapped: by the key service for `kms:…`; else by the master key, or one of the others
+/// that may have wrapped it (`masters`) while keys move to a new one (`rewrap`).
 fn unwrap_key(wrapped: &str) -> Result<Vec<u8>> {
     if let Some(k) = UNWRAPPED.lock().unwrap().get(wrapped) {
         return Ok(k.clone());
     }
     let key = match wrapped.strip_prefix("kms:") {
         Some(w) => B64.decode(kms_run(&kms().context("this secret's key was wrapped by a key service: set PONDRA_KMS_COMMAND")?, "unwrap", w)?)?,
-        None => match open_with(&master()?, wrapped) {
-            Some(k) => k,
-            None => previous().and_then(|p| open_with(&p, wrapped)).context("its key was wrapped by another master key")?,
-        },
+        None => masters()?.iter().find_map(|m| open_with(m, wrapped)).context("its key was wrapped by another master key: set the PONDRA_SECRET_KEY or PONDRA_ADMIN_TOKEN it was sealed with (or the old one as PONDRA_SECRET_KEY_PREVIOUS / PONDRA_ADMIN_TOKEN_PREVIOUS)")?,
     };
     UNWRAPPED.lock().unwrap().insert(wrapped.to_string(), key.clone());
     Ok(key)
@@ -1603,9 +1676,12 @@ fn kms_run(cmd: &str, what: &str, input: &str) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
-/// Is the master key one every node can have: `PONDRA_SECRET_KEY` or a key service, never only this
-/// machine's own (`~/.pondra/secret.key`), which a node on another machine couldn't open with?
-pub fn shared_master() -> bool { kms().is_some() || std::env::var("PONDRA_SECRET_KEY").is_ok_and(|k| !k.is_empty()) }
+/// Is the master key one every node can have: `PONDRA_SECRET_KEY`, the admin token (every node of a
+/// cluster with one has the same), or a key service? Never only this machine's own
+/// (`~/.pondra/secret.key`), which a node on another machine couldn't open with.
+pub fn shared_master() -> bool {
+    kms().is_some() || ["PONDRA_SECRET_KEY", "PONDRA_ADMIN_TOKEN"].iter().any(|v| std::env::var(v).is_ok_and(|k| !k.is_empty()))
+}
 
 /// `plain` sealed with a data key of its own, which the master key wraps: (the sealed bytes, the
 /// wrapped key). The lake's own keys are kept this way (`users::Kept`), as a secret's values are.
@@ -1635,7 +1711,7 @@ pub async fn rewrap(lake: &Lake) -> Result<usize> {
             },
             None => {
                 // (sealed by the master key itself, before round 29: sealed again, with a key of its own)
-                let plain = open_with(&master()?, &s.sealed).with_context(|| format!("secret {}", &k[2..]))?;
+                let plain = masters()?.iter().find_map(|m| open_with(m, &s.sealed)).with_context(|| format!("secret {}", &k[2..]))?;
                 (s.sealed, s.key) = { let (a, b) = seal_new(&plain)?; (a, Some(b)) };
             }
         }
@@ -1649,20 +1725,67 @@ pub async fn rewrap(lake: &Lake) -> Result<usize> {
 }
 
 /// The master key, when no key service is set: `PONDRA_SECRET_KEY` (the same on every node of a
-/// cluster), or one made for this machine (`~/.pondra/secret.key`), enough for nodes that share it.
+/// cluster), else the admin token's (`admin_key`: every node of a cluster with one has it), else one
+/// made for this machine (`~/.pondra/secret.key`), enough for nodes that share it.
 fn master() -> Result<[u8; 32]> {
-    let key = match std::env::var("PONDRA_SECRET_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => machine_key()?,
-    };
-    Ok(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, key.as_bytes()).as_ref().try_into().expect("32 bytes"))
+    if let Some(k) = std::env::var("PONDRA_SECRET_KEY").ok().filter(|k| !k.is_empty()) {
+        return Ok(sha256_of(&k));
+    }
+    if let Some(t) = std::env::var("PONDRA_ADMIN_TOKEN").ok().filter(|t| !t.is_empty()) {
+        return Ok(admin_key(&t));
+    }
+    Ok(sha256_of(&machine_key()?))
 }
 
-/// The master key before it changed (`PONDRA_SECRET_KEY_PREVIOUS`): keys it wrapped still open, and
-/// the leader rewraps them with the new one when it starts (`rewrap`).
-fn previous() -> Option<[u8; 32]> {
-    let k = std::env::var("PONDRA_SECRET_KEY_PREVIOUS").ok().filter(|k| !k.is_empty())?;
-    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, k.as_bytes()).as_ref().try_into().ok()
+/// The master keys before the one in use, which may have wrapped a data key: keys they wrapped still
+/// open, and the leader rewraps them with the new one when it starts (`rewrap`). The admin token is
+/// one of them when a lake moved from it to `PONDRA_SECRET_KEY`; this machine's key only if an older
+/// release made it (`machine_key_if_made`).
+fn previous() -> Vec<[u8; 32]> {
+    let set = |var: &str| std::env::var(var).ok().filter(|k| !k.is_empty());
+    [
+        set("PONDRA_SECRET_KEY_PREVIOUS").map(|k| sha256_of(&k)),
+        set("PONDRA_ADMIN_TOKEN").map(|t| admin_key(&t)),
+        set("PONDRA_ADMIN_TOKEN_PREVIOUS").map(|t| admin_key(&t)),
+        machine_key_if_made().map(|k| sha256_of(&k)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The master key in use first, then the others (`previous`): what may open a data key.
+fn masters() -> Result<Vec<[u8; 32]>> {
+    let mut all = vec![master()?];
+    all.extend(previous());
+    Ok(all)
+}
+
+/// The master key an admin token makes: PBKDF2 over the token, so a short token can't be guessed
+/// offline from what the bucket holds (the keys sealed by it). Worked out once a process per token.
+fn admin_key(token: &str) -> [u8; 32] {
+    static KEYS: std::sync::LazyLock<Mutex<HashMap<String, [u8; 32]>>> = std::sync::LazyLock::new(Default::default);
+    if let Some(k) = KEYS.lock().unwrap().get(token) {
+        return *k;
+    }
+    if token.chars().count() < 16 {
+        eprintln!("the admin token is short: it guards the lake's keys and secrets too (use 32 random characters or more)");
+    }
+    let mut key = [0u8; 32];
+    let rounds = std::num::NonZeroU32::new(100_000).expect("non-zero");
+    aws_lc_rs::pbkdf2::derive(aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA256, rounds, b"pondra: the master key from the admin token", token.as_bytes(), &mut key);
+    KEYS.lock().unwrap().insert(token.to_string(), key);
+    key
+}
+
+/// A key's SHA-256: the 32 bytes AES-256 takes.
+fn sha256_of(key: &str) -> [u8; 32] { aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, key.as_bytes()).as_ref().try_into().expect("32 bytes") }
+
+/// This machine's key if an older release made one (`machine_key`'s file): never made here.
+fn machine_key_if_made() -> Option<String> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let key = std::fs::read_to_string(std::path::PathBuf::from(home).join(".pondra").join("secret.key")).ok()?;
+    Some(key.trim().to_string()).filter(|k| !k.is_empty())
 }
 
 fn machine_key() -> Result<String> {

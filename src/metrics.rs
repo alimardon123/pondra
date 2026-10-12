@@ -22,8 +22,39 @@ pub static SKEW_SPLITS: AtomicU64 = AtomicU64::new(0); // hot partitions of shuf
 pub static RECEIVED: AtomicU64 = AtomicU64::new(0); // shuffle bytes this node's steps read (its share of the work)
 pub static WIRE: AtomicU64 = AtomicU64::new(0); // bytes other nodes sent this node, compressed as sent (shuffles, gathered results)
 pub static WAIT_US: AtomicU64 = AtomicU64::new(0); // time this node's steps waited for other nodes' buckets
+pub static RUNNING: AtomicU64 = AtomicU64::new(0); // queries running here now, each on one of PONDRA_QUERIES' turns
+pub static WAITING: AtomicU64 = AtomicU64::new(0); // queries waiting here for a turn
+
+/// Counts what is going on now: up while this guard lives (`Now::new`), down when it is dropped.
+pub struct Now(&'static AtomicU64);
+
+impl Now {
+    pub fn new(count: &'static AtomicU64) -> Self {
+        count.fetch_add(1, Relaxed);
+        Now(count)
+    }
+}
+
+impl Drop for Now {
+    fn drop(&mut self) { self.0.fetch_sub(1, Relaxed); }
+}
 
 pub fn add(c: &AtomicU64, n: u64) { c.fetch_add(n, Relaxed); }
+
+/// Background loops that fail without failing a request (tiering, publishing, window emission,
+/// streaming tasks, checkpoints): counted here, so a stall that otherwise shows only on stderr is
+/// visible in `/metrics` and `/stats`.
+static BG_FAILS: [(&str, AtomicU64); 5] =
+    [("tiering", AtomicU64::new(0)), ("publish", AtomicU64::new(0)), ("emission", AtomicU64::new(0)), ("tasks", AtomicU64::new(0)), ("checkpoint", AtomicU64::new(0))];
+
+pub fn job_failed(job: &str) {
+    if let Some((_, c)) = BG_FAILS.iter().find(|(k, _)| *k == job) {
+        c.fetch_add(1, Relaxed);
+    }
+}
+
+/// Each background job and how many times it has failed (for `/metrics` and `/stats`).
+pub fn failures() -> Vec<(&'static str, u64)> { BG_FAILS.iter().map(|(k, c)| (*k, c.load(Relaxed))).collect() }
 
 pub async fn render(app: &App) -> anyhow::Result<String> {
     let mut out = String::new();
@@ -42,6 +73,8 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("rows_in_total", "counter", "rows taken into the log here", &one(get(&ROWS_IN)));
     metric("queries_total", "counter", "SQL queries run here", &one(get(&QUERIES)));
     metric("query_errors_total", "counter", "SQL queries that failed", &one(get(&QUERY_ERRORS)));
+    metric("queries_running", "gauge", "SQL queries running here now, each on one of PONDRA_QUERIES' turns", &one(get(&RUNNING)));
+    metric("queries_waiting", "gauge", "SQL queries waiting here for a turn", &one(get(&WAITING)));
     metric("query_seconds_total", "counter", "time spent in SQL queries", &one(get(&QUERY_US) / 1e6));
     metric("spread_queries_total", "counter", "queries run across the cluster from here", &one(get(&SPREAD)));
     metric("shuffled_queries_total", "counter", "…of them with a shuffle", &one(get(&SHUFFLED)));
@@ -50,6 +83,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("files_skipped_total", "counter", "Parquet files queries skipped by min/max, unopened", &one(get(&FILES_SKIPPED)));
     let requests = [("write", &OBJECT_WRITES), ("list", &OBJECT_LISTS), ("delete", &OBJECT_DELETES)].map(|(op, c)| (format!("{{op=\"{op}\"}}"), get(c)));
     metric("object_requests_total", "counter", "object-store writes, lists and deletes this process made (what a bucket bills and rate-limits most)", &requests);
+    metric("background_failures_total", "counter", "background jobs (tiering, publishing, emission, tasks, checkpoints) that failed; a rising count is a stall to look at", &failures().iter().map(|(k, n)| (format!("{{job=\"{k}\"}}"), *n as f64)).collect::<Vec<_>>());
     let turns = crate::budget::turns();
     let label = |b: &str, l: &str| format!("{{bucket=\"{b}\",lake=\"{l}\"}}");
     metric("bucket_turns", "gauge", "requests this node may have at once at a bucket, or at another lake in it it reads (a branch's base: a quarter)", &turns.iter().map(|(b, l, n, _)| (label(b, l), *n as f64)).collect::<Vec<_>>());

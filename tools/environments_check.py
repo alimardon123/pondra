@@ -337,10 +337,15 @@ def environments_check(bin, work, port, root):
     q("CREATE DATABASE dev2 CLONE dev")
     checks["a branch of a branch answers as its base"] = until(lambda: rows(prod, every.replace("sales.orders", "dev2.sales.orders")) == dev_rows) is True
     checks["a database with branches can't be dropped first"] = "branches" in refused(prod, "DROP DATABASE dev")
+    for s in ("CREATE INDEX kv_v ON kv (v)", "CREATE INDEX orders_amount ON sales.orders (amount)", "CREATE TYPE mood AS ENUM ('ok', 'not')", "CREATE TYPE sales.stage AS ENUM ('new', 'won')"):
+        q(s)
     q("CREATE DATABASE sales_only CLONE prod WITH (schemas = (sales))")
     q("CREATE DATABASE fixtures CLONE prod WITH NO DATA")
-    checks["WITH (schemas = (sales)) takes that schema alone"] = rows(prod, "SELECT count(*) FROM sales_only.sales.orders") == rows(prod, "SELECT count(*) FROM sales.orders") \
-        and "not found" in refused(prod, "SELECT * FROM sales_only.k").lower() + refused(prod, "SELECT * FROM sales_only.public.k").lower()
+    taken = sorted(rows(prod, "SELECT kind, coalesce(schema, 'public') AS s, name FROM pondra.objects WHERE lake = 'sales_only' AND kind IN ('index', 'type')"))
+    print(f"  (sales_only's indexes and types: {taken})", flush=True)
+    checks["WITH (schemas = (sales)) takes that schema alone, its indexes and enum types too"] = rows(prod, "SELECT count(*) FROM sales_only.sales.orders") == rows(prod, "SELECT count(*) FROM sales.orders") \
+        and "not found" in refused(prod, "SELECT * FROM sales_only.k").lower() + refused(prod, "SELECT * FROM sales_only.public.k").lower() \
+        and taken == [("index", "sales", "orders_amount"), ("type", "sales", "stage")]
     checks["WITH NO DATA: the tables, empty"] = rows(prod, "SELECT count(*) FROM fixtures.sales.orders") == [(0,)]
     elsewhere = os.path.join(work, "y") if root.startswith("s3://") else "s3://b/y"
     checks["refused by name: a clone of a database not here, a branch where its base isn't (a bucket, a disk)"] = \
@@ -350,11 +355,17 @@ def environments_check(bin, work, port, root):
     for name in ["dev2", "dev", "sales_only", "fixtures"]:
         q(f"DROP DATABASE {name}")
     held = len(parquet(prod_dir))
-    for _ in range(3):
+
+    def let_go():
+        return not keys(dev_dir) and rows(prod, "SELECT name, branches FROM pondra.databases") == [("prod", 0)] and len(parquet(prod_dir)) < held
+    # (a tiering round after each retention period, until they go: three were too few on a busy
+    # runner now and then, PR #77's CI)
+    for _ in range(8):
         time.sleep(11)
         prod.post("/tier")
-    checks["DROP DATABASE: the branches' folders go, prod's pins with them, and prod lets the files they held go"] = \
-        not keys(dev_dir) and rows(prod, "SELECT name, branches FROM pondra.databases") == [("prod", 0)] and len(parquet(prod_dir)) < held
+        if let_go():
+            break
+    checks["DROP DATABASE: the branches' folders go, prod's pins with them, and prod lets the files they held go"] = let_go()
     checks["prod answers as it should after it all"] = rows(prod, "SELECT count(*) FROM sales.orders") == [(len([r for r in before if r[2] <= 900]) + 1,)]
     checks["(cloned in {:.1f} s)".format(took)] = True
     return checks
@@ -432,7 +443,9 @@ def signed_in_check(bin, work, port, root):
         and ddl({"op": "pin", "lake": loc, "ms": None}, {"Authorization": "Bearer pb_nope", "Content-Type": "application/json"}) != 200
 
     dev.q(f"ATTACH '{prod_dir}' AS prod2")  # (a database next door that signs in on its own)
-    status, _, text = dev.plain("POST", "/sql", "CREATE DATABASE x CLONE prod2")
+    # (a superuser of dev's, signed in, is not whoever runs the nodes: dev answers only its program unsigned)
+    dev.q("CREATE USER dan PASSWORD 'dan-password-1' SUPERUSER")
+    status, text = raw(port + 11, "POST", "/sql", "CREATE DATABASE x CLONE prod2", {"Authorization": "Basic " + base64.b64encode(b"dan:dan-password-1").decode()})
     cloning = refused(dev, "CREATE DATABASE x2 CLONE prod2")  # (the owner passes; prod refuses dev's own key)
     checks["CLONE of a database next door that signs in on its own: refused without its own rights, and saying where it is cloned"] = \
         status != 200 and "read and written through it" in text and "cloned on its own node" in cloning and "read and written through it" not in cloning and not keys(root + "/x") and not keys(root + "/x2")
@@ -525,7 +538,7 @@ def across_check(bin, work, port):
         dev.q(f"ATTACH 's3://acme-prod/prod' AS prod (READ_ONLY, ENDPOINT '{prod_url}')")
         checks["dev reads prod's tables through the attachment: prod's rows, as prod has them"] = rows(dev, "SELECT id, amount FROM prod.sales.orders ORDER BY id") == before
         writes = [refused(dev, "INSERT INTO prod.sales.orders VALUES (9, 9.0)"), refused(dev, "DELETE FROM prod.sales.orders WHERE id = 1")]
-        checks["a write to the attachment is refused by name: a read-only key here"] = all("read-only key" in w for w in writes)
+        checks["a write to the attachment is refused by name: attached here read-only"] = all("attached here read-only" in w for w in writes)
 
         # A user of dev granted CLONE on prod (attached here) branches it on dev and owns it. dev has no
         # token, but a user who signs in is limited by its own grants all the same: the grant alone lets dana.
@@ -577,11 +590,12 @@ def across_check(bin, work, port):
         prod.post("/tier")
         checks["prod moves on (rows changed, merged, purged, its past let go): ali still answers as before, from what prod pinned"] = \
             rows(ali, "SELECT id, amount FROM sales.orders ORDER BY id") == ali_before and rows(prod, "SELECT count(*) FROM sales.orders WHERE amount > 100") == [(4,)]
-        # The key ali keeps reads its base and nothing else: a statement on ali's own node (open: whoever asks
-        # is a superuser there, but not the program that started it) naming one of prod's files by URL, hr's,
-        # which ali never took, finds no secret to read it with.
+        # The key ali keeps reads its base and nothing else: a statement on ali's own node, by a superuser
+        # there who is not the program that started it, naming one of prod's files by URL, hr's, which ali
+        # never took, finds no secret to read it with.
         hr = next((k for k in parquet(prod_lake) if "hr.pay" in k), "")
-        status, text = raw(port + 2, "POST", "/sql", f"SELECT count(*) AS n FROM 's3://acme-prod/{hr}'", {})
+        ali.q("CREATE USER al PASSWORD 'al-password-1' SUPERUSER")
+        status, text = raw(port + 2, "POST", "/sql", f"SELECT count(*) AS n FROM 's3://acme-prod/{hr}'", {"Authorization": "Basic " + base64.b64encode(b"al:al-password-1").decode()})
         checks["the key ali was lent reads its base for ali's tables alone: a statement on ali's node naming prod's hr file by URL is refused"] = \
             hr != "" and status != 200 and "secret" in text.lower()
         if not checks["the key ali was lent reads its base for ali's tables alone: a statement on ali's node naming prod's hr file by URL is refused"]:

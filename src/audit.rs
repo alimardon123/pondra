@@ -190,6 +190,10 @@ impl Drop for Stopped<'_> {
     }
 }
 
+/// A failure's message that is a refusal of rights or quota (written whatever the classes), not a
+/// failure of the statement.
+fn refusal(m: &str) -> bool { ["permission denied", "needs a", "needs more rights", "sign in", "quota:"].iter().any(|r| m.contains(r)) }
+
 /// Run one statement a door was sent, within its user's quota (`users::Quota`), writing what
 /// came of it when its class is written (and a refusal always).
 pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, f: impl Future<Output = std::result::Result<T, E>>) -> std::result::Result<T, E> {
@@ -204,7 +208,10 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
     let (out, note) = crate::history::noted(INSIDE.scope((), async {
         let _turn = quota.turn().await.map_err(|m| E::refusal("53000", m))?; // (insufficient_resources)
         match quota.timeout {
-            Some(t) => tokio::time::timeout(t, f).await.unwrap_or_else(|_| Err(E::refusal("57014", format!("quota: {}'s statements run at most {} s (STATEMENT_TIMEOUT); this one was stopped", quota.user, t.as_secs())))),
+            Some(t) => tokio::time::timeout(t, f).await.unwrap_or_else(|_| Err(E::refusal("57014", match quota.by_session {
+                true => "canceling statement due to statement timeout".to_string(), // (Postgres's own words: a client matches them)
+                false => format!("quota: {}'s statements run at most {} s (STATEMENT_TIMEOUT); this one was stopped", quota.user, t.as_secs()),
+            }))),
             None => f.await,
         }
     }))
@@ -212,7 +219,7 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
     stopped.0 = None;
     let took = start.elapsed();
     let message = out.as_ref().err().map(|e| e.to_string());
-    let refused = message.as_ref().filter(|m| ["permission denied", "needs a", "needs more rights", "sign in", "quota:"].iter().any(|r| m.contains(r)));
+    let refused = message.as_ref().filter(|m| refusal(m));
     let outcome = match (&out, &refused) {
         (Ok(_), _) => "ok",
         (_, Some(_)) => "refused",
@@ -223,6 +230,21 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
     }
     crate::history::ended(app, class, sql, outcome, message, took, note); // (`pondra.history`)
     out
+}
+
+/// Rows a door took that takes rows, not SQL (`/append`, `/insert`): a line of the audit log as the
+/// INSERT it stands for, when writes are written (`PONDRA_AUDIT=…,write`), and always when refused.
+/// Not a statement, so not in `pondra.history` (an append can come thousands of times a second).
+pub fn rows(app: &App, door: &str, table: &str, error: Option<String>, took: std::time::Duration) {
+    let refused = error.as_deref().is_some_and(refusal);
+    let outcome = match (&error, refused) {
+        (None, _) => "ok",
+        (_, true) => "refused",
+        _ => "failed",
+    };
+    if on() && (written("write") || refused) {
+        log(app, "write", format!("INSERT INTO {table} (rows through {door})"), outcome, error, Some(took.as_millis() as i64));
+    }
 }
 
 /// A sign-in that failed, or a request its rights didn't cover (at a door, before any statement).

@@ -468,6 +468,9 @@ pub fn writer<L: Send + Sync + 'static>(app: &App, table: &'static str, make: cr
             while let Ok(l) = rx.try_recv() {
                 lines.push(l);
             }
+            if crate::backup::frozen(&app.lake) {
+                continue; // (a backup keeps no history or audit of its own reads: ADR-070)
+            }
             seq += 1;
             for attempt in 0.. {
                 let append = async {

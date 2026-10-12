@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """Pondra as dbt and BI tools use it (ADR-030): its Postgres port, with Postgres's catalog.
 
-  clients_check.py [dbt,psql,sqlalchemy,jdbc,odbc,adbc,npgsql] [--port 8870]
+  clients_check.py [dbt,psql,sqlalchemy,psycopg,jdbc,odbc,adbc,npgsql,params] [--port 8870] [--pg16 PORT]
+
+  (params and sqlalchemy compare with a Postgres 16 running on PORT with --pg16, else start one under the work folder.)
 
 - dbt: a project with seeds, a view, a table, incremental models (delete+insert, merge,
   append), a snapshot and data tests, run twice — the second time with changed seeds, so views
   and tables are replaced by renames and the incremental models take their incremental path —
   then `dbt docs generate`; the same project against Postgres 16, and every model's rows alike.
 - psql: `\\dt`, `\\d`, `\\dv`, `\\dn`, `\\df`, `\\l`, `\\du` show the lake's tables, columns (types,
-  NOT NULL, defaults, keys), views, schemas, functions and databases.
-- sqlalchemy: the inspector (schemas, tables, views, columns, primary keys, a view's definition),
-  with psycopg 2 and 3; pandas' `to_sql` and `read_sql`.
+  NOT NULL, defaults, keys), views, schemas, functions and databases; `\\dT+` lists an enum type
+  with its labels in order, and `\\d` shows a column of it by the type's name; a cursor in a
+  transaction; Ctrl-C (SIGINT) on a running statement cancels it.
+- sqlalchemy: the inspector (schemas, tables, views, columns, primary keys, a view's definition,
+  an enum type's labels), with psycopg 2 and 3; pandas' `to_sql` and `read_sql`; and the inspector's
+  reading of one table (named UNIQUE and CHECK constraints, defaults, identity, a sequence, indexes,
+  a view) against the same DDL on Postgres 16, which --pg16 names or the check starts.
+- psycopg: psycopg 3's named cursor (a server-side cursor, read a part at a time), its cursor
+  statements by hand (tags, MOVE, FETCH, CLOSE), and `conn.cancel()` on a running statement.
 - jdbc: pgjdbc's DatabaseMetaData (what DBeaver, Metabase and Tableau's JDBC connector call):
   catalogs, schemas, tables, columns, primary keys, then a query.
 - odbc: psqlODBC's catalog functions through pyodbc (what Tableau and Excel call): tables,
@@ -21,12 +29,21 @@
 - npgsql: Npgsql 4.0 (what Power BI Desktop's PostgreSQL connector carries) and 8: it loads the
   server's types on open (pg_type joined to pg_proc), then GetSchema's databases, tables, views
   and columns, and queries with a parameter.
+- params: psycopg 3 sends typed parameters (numeric, bytea, dates, times, timestamps with and
+  without a zone, uuid, json, jsonb, interval, text, boolean, float8), as text (`%t`) and binary
+  (`%b`): `SELECT %s` and an INSERT of each into a column of its type, read back, give Postgres
+  16's values and type codes, and `SELECT 70 + %s` with a Decimal gives the same. What Pondra
+  can't match is checked by name, as what it does: its results have no text, uuid, json or jsonb
+  type of their own (a text of the text sent), a uuid column is refused. A float8, infinities and
+  NaN included, is a float8 again, and `5 - $1` subtracts a negative one. A TIME and an INTERVAL print
+  as Postgres prints them.
 
 Needs: dbt-postgres (`PONDRA_DBT`, else `dbt` on PATH), Postgres 16's binaries
 (`PONDRA_PG_BIN`, else /usr/lib/postgresql/16/bin), java and javac with pgjdbc's jar
-(`PGJDBC_JAR`, else fetched once), psqlODBC with pyodbc, the .NET SDK (`dotnet`, with NuGet).
+(`PGJDBC_JAR`, else fetched once), psqlODBC with pyodbc, the .NET SDK (`dotnet`, with NuGet),
+psycopg 3 (`params` is skipped by name without it).
 """
-import argparse, json, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, contextlib, datetime as dt, decimal, json, math, os, pwd, re, shutil, subprocess, sys, tempfile, time, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -102,18 +119,27 @@ def rows_of(port, table, order, user):
     return [tuple(norm(v) for v in line.split("|")) for line in out.stdout.strip().splitlines()] if out.returncode == 0 else out.stderr.strip()
 
 
+@contextlib.contextmanager
+def postgres16(work, port):
+    """Postgres 16 on `port` for the length of the block, its data under `work` (UTF8, like the lake's
+    text; run as `claude` when this is root: initdb refuses root)."""
+    # A folder of its own each time: dbt and params both start one on the same port in one run, and the
+    # first one's data folder stayed behind (FileExistsError, so params never ran in the default run).
+    pg_dir = tempfile.mkdtemp(dir=work, prefix=f"pg16-{port}-")
+    if os.geteuid() == 0:
+        shutil.chown(pg_dir, "claude")
+    subprocess.run(as_owner([f"{PG_BIN}/initdb", "-D", f"{pg_dir}/data", "-E", "UTF8", "-A", "trust", "-U", "postgres"]), check=True, capture_output=True)
+    subprocess.run(as_owner([f"{PG_BIN}/pg_ctl", "-D", f"{pg_dir}/data", "-o", f"-p {port} -k {pg_dir} -c listen_addresses=127.0.0.1", "-l", f"{pg_dir}/log", "-w", "start"]), check=True, capture_output=True)
+    try:
+        yield
+    finally:
+        subprocess.run(as_owner([f"{PG_BIN}/pg_ctl", "-D", f"{pg_dir}/data", "-m", "immediate", "stop"]), capture_output=True)
+
+
 def dbt_check(node_pg, work):
     """The project against Pondra and against Postgres 16, run twice: the same rows."""
-    pg_dir = os.path.join(work, "pg16")
-    os.makedirs(pg_dir)
-    owner = "claude" if os.geteuid() == 0 else None  # (initdb refuses root)
-    run_as = ["runuser", "-u", owner, "--"] if owner else []
-    if owner:
-        shutil.chown(pg_dir, owner)
-    subprocess.run([*run_as, f"{PG_BIN}/initdb", "-D", f"{pg_dir}/data", "-A", "trust", "-U", "postgres"], check=True, capture_output=True)
     pg_port = node_pg + 1
-    subprocess.run([*run_as, f"{PG_BIN}/pg_ctl", "-D", f"{pg_dir}/data", "-o", f"-p {pg_port} -k {pg_dir} -c listen_addresses=127.0.0.1", "-l", f"{pg_dir}/log", "-w", "start"], check=True, capture_output=True)
-    try:
+    with postgres16(work, pg_port):
         roots = {"pondra": (os.path.join(work, "dbt-pondra"), node_pg, "u"), "postgres": (os.path.join(work, "dbt-pg"), pg_port, "postgres")}
         steps, got = {}, {}
         for who, (root, port, user) in roots.items():
@@ -143,8 +169,6 @@ def dbt_check(node_pg, work):
         failed = {k: v[1] for k, v in steps.items() if not v[0]}
         diffs = {t: {"pondra": got["pondra"][t], "postgres": got["postgres"][t]} for t in got["pondra"] if got["pondra"][t] != got["postgres"].get(t)}
         return checks, {"failed steps": failed, "differences": diffs}
-    finally:
-        subprocess.run([*run_as, f"{PG_BIN}/pg_ctl", "-D", f"{pg_dir}/data", "-m", "immediate", "stop"], capture_output=True)
 
 
 # ---------------------------------------------------------------- psql, SQLAlchemy, JDBC, ODBC
@@ -155,24 +179,37 @@ SETUP = ["CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR NOT NULL, scor
          "CREATE SCHEMA sales", "CREATE TABLE sales.orders (id BIGINT, total DOUBLE)",
          "CREATE FUNCTION twice(x BIGINT) RETURNS BIGINT AS 'x * 2'",
          "INSERT INTO users VALUES (1, 'ann', 1.5, TIMESTAMPTZ '2026-09-01 10:00:00+00'), (2, 'bob', 2.5, NULL)",
-         "INSERT INTO events VALUES (1, 12.5, TIMESTAMP '2026-09-01 10:00:00', ['a', 'b'])"]
+         "INSERT INTO events VALUES (1, 12.5, TIMESTAMP '2026-09-01 10:00:00', ['a', 'b'])",
+         "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')", "CREATE TABLE moods (id BIGINT PRIMARY KEY, feeling mood)", "INSERT INTO moods VALUES (1, 'ok')"]
 
 
 def psql_check(pg):
-    out = {c: psql(pg, c) for c in ("\\dt", "\\dt sales.*", "\\d users", "\\dv", "\\dn", "\\df", "\\l", "\\du", "\\d sales.orders", "\\d+ big")}
+    out = {c: psql(pg, c) for c in ("\\dt", "\\dt sales.*", "\\d users", "\\dv", "\\dn", "\\df", "\\l", "\\du", "\\d sales.orders", "\\d+ big", "\\dT+", "\\d moods")}
+    # A cursor in a transaction, and Ctrl-C (SIGINT, which psql answers with a cancel request) on a statement
+    # that runs until it is cancelled: both over psql's simple query protocol.
+    cursor = psql(pg, "BEGIN", "DECLARE c CURSOR FOR SELECT name FROM users ORDER BY id", "FETCH 1 FROM c", "COMMIT")
+    stop = subprocess.run(["timeout", "-s", "INT", "1", "psql", "-h", "127.0.0.1", "-p", str(pg), "-U", "u", "-d", "lake", "-X", "-c",
+                           "SELECT count(*) FROM range(1, 40000) a CROSS JOIN range(1, 40000) b WHERE a.value * b.value % 1000003 = 7"],
+                          capture_output=True, text=True, env={**os.environ, "PGPASSWORD": PASSWORD}, timeout=120)
     checks = {
+        "psql: a cursor in a transaction (DECLARE, FETCH, COMMIT)": "DECLARE CURSOR" in cursor and "ann" in cursor and "(1 row)" in cursor,
+        "psql: Ctrl-C cancels a running statement: 57014 in Postgres's words": "canceling statement due to user request" in stop.stderr,
         "\\dt lists the tables on the search path (public), \\dt sales.* another schema's": all(x in out["\\dt"] for x in ("public|events|table", "public|users|table"))
             and "sales|" not in out["\\dt"] and "sales|orders|table" in out["\\dt sales.*"],
+        # (a string column is `text` here, as the catalog reports every string: Postgres 16 says `character varying`
+        # for a VARCHAR, and this is the one place the answers differ on purpose)
         "\\d shows columns, Postgres's types, NOT NULL, defaults and the key": all(x in out["\\d users"] for x in
-            ("id|bigint||not null|", "name|character varying||not null|", "score|double precision|||0", "joined|timestamp with time zone|||", '"users_pkey" PRIMARY KEY, btree (id)')),
+            ("id|bigint||not null|", "name|text||not null|", "score|double precision|||0", "joined|timestamp with time zone|||", '"users_pkey" PRIMARY KEY, btree (id)')),
         "\\dv, \\dn, \\df, \\l, \\du": "public|big|view" in out["\\dv"] and "sales|" in out["\\dn"] and "twice|" in out["\\df"] and "lake|" in out["\\l"] and "u|" in out["\\du"],
-        "\\d of a table in a schema, and \\d+ of a view with its definition": "tags|character varying[]" in psql(pg, "\\d events") and "total|double precision" in out["\\d sales.orders"]
+        "\\d of a table in a schema, and \\d+ of a view with its definition": "tags|text[]" in psql(pg, "\\d events") and "total|double precision" in out["\\d sales.orders"]
             and "SELECT * FROM events WHERE amount > 10" in out["\\d+ big"],
+        "\\dT+ lists the enum type mood with its labels in order; \\d shows a column's type as mood": re.search(r"public\s*\|\s*mood\s*\|\s*mood\s*\|\s*4\s*\|\s*sad\s*\n\s*ok\s*\n\s*happy\s*\|", out["\\dT+"]) is not None
+            and out["\\dT+"].index("sad") < out["\\dT+"].index("ok") < out["\\dT+"].index("happy") and re.search(r"feeling\s*\|\s*mood\s*\|", out["\\d moods"]) is not None,
     }
     return checks, {k: v[:600] for k, v in out.items() if "ERROR" in v}
 
 
-def sqlalchemy_check(pg):
+def sqlalchemy_check(pg, port, work, pg16=None):
     import pandas as pd, sqlalchemy as sa
     checks, said = {}, {}
     for drv in ("psycopg2", "psycopg"):
@@ -185,16 +222,200 @@ def sqlalchemy_check(pg):
                 and listed["sales"] == ["orders"] and listed["views"] == ["big"]
             if not checks[f"{drv}: schemas, tables, views"]:
                 said[f"{drv} listed"] = listed
-            checks[f"{drv}: columns (types, nullable, defaults), the primary key, has_table"] = cols == {"id": ("BIGINT", False, None), "name": ("VARCHAR", False, None),
+            checks[f"{drv}: columns (types, nullable, defaults), the primary key, has_table"] = cols == {"id": ("BIGINT", False, None), "name": ("TEXT", False, None),  # (a string is TEXT here: see psql's \d)
                 "score": ("DOUBLE PRECISION", True, "0"), "joined": ("TIMESTAMP", True, None)} and insp.get_pk_constraint("users")["constrained_columns"] == ["id"] \
                 and insp.has_table("users") and not insp.has_table("nope") and insp.get_view_definition("big").startswith("SELECT")
+            from sqlalchemy.dialects import postgresql
+            feeling = {c["name"]: c["type"] for c in insp.get_columns("moods")}["feeling"]
+            enums = [(e["name"], e["schema"], e["labels"]) for e in insp.get_enums()]
+            checks[f"{drv}: get_enums() lists mood with its labels; a column of it is an ENUM of them"] = enums == [("mood", "public", ["sad", "ok", "happy"])] \
+                and isinstance(feeling, postgresql.ENUM) and feeling.enums == ["sad", "ok", "happy"]
+        except Exception as e:  # noqa: BLE001 (reported)
+            checks[f"{drv}: the inspector"] = False
+            said[drv] = str(e)[:800]
+        # (pandas creates its table inside a transaction, which Pondra refuses DDL in: it is checked apart from the inspector)
+        try:
             pd.DataFrame({"a": [1, 2], "b": ["x", "y"]}).to_sql(f"from_{drv}", eng, index=False, if_exists="replace")
             pd.DataFrame({"a": [3], "b": ["z"]}).to_sql(f"from_{drv}", eng, index=False, if_exists="append")
             checks[f"{drv}: pandas to_sql (replace, append) and read_sql"] = pd.read_sql(f"SELECT * FROM from_{drv} ORDER BY a", eng).to_dict("records") == [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}, {"a": 3, "b": "z"}]
         except Exception as e:  # noqa: BLE001 (reported)
-            checks[f"{drv}: the inspector"] = False
-            said[drv] = str(e)[:800]
+            checks[f"{drv}: pandas to_sql (replace, append) and read_sql"] = False
+            said[f"{drv} to_sql"] = str(e)[:800]
+    reflected, reflected_said = reflection_check(pg, port, work, pg16)
+    checks.update(reflected)
+    said.update(reflected_said)
     return checks, said
+
+
+def psycopg_check(pg):
+    """psycopg 3 (what SQLAlchemy's psycopg driver and most Python code use): a named cursor reads a table
+    a part at a time, the cursor's statements by hand with their tags, and conn.cancel() stops a running
+    statement (57014) with the connection usable after it."""
+    import psycopg, threading
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake password={PASSWORD}"
+    checks = {}
+    with psycopg.connect(url, autocommit=True) as c:
+        # A list of strings is text[] (1009) both in the result's description and in the catalog's
+        # pg_attribute, so a client that checks one against the other sees the same type.
+        result_type = c.execute("SELECT tags FROM events").description[0].type_code
+        catalog_type = c.execute("SELECT a.atttypid FROM pg_attribute a JOIN pg_class k ON k.oid = a.attrelid "
+                                 "WHERE k.relname = 'events' AND a.attname = 'tags'").fetchone()[0]
+        checks["psycopg: a list of strings is text[] (1009) in the result and in pg_attribute"] = result_type == 1009 and catalog_type == 1009
+        c.execute("CREATE TABLE ten_k (id BIGINT)")
+        c.execute("INSERT INTO ten_k SELECT value FROM range(1, 10001)")
+    with psycopg.connect(url) as c:
+        with c.cursor(name="ten") as cur:
+            cur.itersize = 100
+            cur.execute("SELECT id FROM ten_k ORDER BY id")
+            ids = [row[0] for row in cur]
+        checks["psycopg: a named cursor reads 10,000 rows, 100 a part, in order"] = ids == list(range(1, 10001))
+        cur = c.cursor()
+        cur.execute("DECLARE d CURSOR FOR SELECT id FROM ten_k ORDER BY id")
+        cur.execute("MOVE 9995 FROM d")
+        moved = cur.statusmessage
+        cur.execute("FETCH FORWARD 5 FROM d")
+        got, tag = [r[0] for r in cur.fetchall()], cur.statusmessage
+        cur.execute("CLOSE d")
+        checks["psycopg: DECLARE, MOVE, FETCH, CLOSE by hand: the tags (MOVE 9995, FETCH 5, CLOSE CURSOR) and the rows"] = \
+            moved == "MOVE 9995" and tag == "FETCH 5" and got == list(range(9996, 10001)) and cur.statusmessage == "CLOSE CURSOR"
+    with psycopg.connect(url, autocommit=True) as c:
+        out = {}
+
+        def run():  # (a thread: the statement runs until conn.cancel() stops it)
+            try:
+                c.execute("SELECT count(*) FROM range(1, 40000) a CROSS JOIN range(1, 40000) b WHERE a.value * b.value % 1000003 = 7")
+                out["answer"] = "finished"
+            except psycopg.errors.QueryCanceled as e:
+                out["sqlstate"] = e.sqlstate
+
+        t = threading.Thread(target=run)
+        t.start()
+        time.sleep(0.5)
+        c.cancel()
+        t.join(60)
+        checks["psycopg: conn.cancel() stops a running statement (57014), and the connection carries on"] = out.get("sqlstate") == "57014" and c.execute("SELECT 1").fetchone() == (1,)
+    return checks, {}
+
+
+CURSORS_JAVA = r"""
+import java.sql.*;
+public class Cursors {
+  static final String LONG = "SELECT count(*) FROM range(1, 40000) a CROSS JOIN range(1, 40000) b WHERE a.value * b.value % 1000003 = 7"; // runs until cancelled (the filter stops count(*) from being answered from statistics)
+  // Statement.cancel() from another thread: the statement answers 57014, and the connection carries on.
+  static void cancel(String url, String name) throws Exception {
+    try (Connection c = DriverManager.getConnection(url, "u", "x")) {
+      Statement st = c.createStatement();
+      Thread t = new Thread(() -> { try { Thread.sleep(500); st.cancel(); } catch (Exception e) { System.out.println(name + "-cancel-threw=" + e); } });
+      t.start();
+      try { st.executeQuery(LONG); System.out.println(name + "-cancel=none"); }
+      catch (SQLException e) { System.out.println(name + "-cancel=" + e.getSQLState()); }
+      t.join();
+      ResultSet r = c.createStatement().executeQuery("SELECT 1");
+      r.next();
+      System.out.println(name + "-after=" + r.getInt(1));
+    }
+  }
+  public static void main(String[] a) throws Exception {
+    // getTransactionIsolation() sends SHOW TRANSACTION ISOLATION LEVEL (what Metabase asks before it adds a database).
+    try (Connection c = DriverManager.getConnection(a[0], "u", "x")) {
+      System.out.println("isolation=" + c.getTransactionIsolation());
+    }
+    cancel(a[0], "extended");                  // pgjdbc's default: Parse, Bind, Execute
+    cancel(a[0] + "?preferQueryMode=simple", "simple");  // the simple query protocol
+    try (Connection w = DriverManager.getConnection(a[0], "u", "x")) {
+      w.createStatement().execute("CREATE TABLE fetch_t (id BIGINT)");
+      w.createStatement().execute("INSERT INTO fetch_t SELECT value FROM range(1, 10001)");
+    }
+    // setFetchSize(100) with autocommit off: pgjdbc asks for 100 rows at a time through a portal (its log, on stderr).
+    try (Connection c = DriverManager.getConnection(a[0] + "?loggerLevel=DEBUG", "u", "x")) {
+      c.setAutoCommit(false);
+      Statement st = c.createStatement();
+      st.setFetchSize(100);
+      ResultSet r = st.executeQuery("SELECT id FROM fetch_t ORDER BY id");
+      long n = 0, sum = 0;
+      while (r.next()) { n++; sum += r.getLong(1); }
+      c.commit();
+      System.out.println("fetch=" + n + "|" + sum);
+    }
+  }
+}
+"""
+# One table, made by the same DDL on Pondra and on Postgres 16: what SQLAlchemy's inspector reads back must agree.
+REFLECT = ["CREATE SCHEMA refl",
+           "CREATE TABLE refl.items (id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, code TEXT NOT NULL, qty INTEGER NOT NULL DEFAULT 0, "
+           "price DOUBLE PRECISION DEFAULT 1.5, note TEXT DEFAULT 'none', made TIMESTAMP DEFAULT now(), "
+           "CONSTRAINT items_code_key UNIQUE (code), CONSTRAINT items_qty_check CHECK (qty >= 0))",
+           "CREATE INDEX items_qty_idx ON refl.items (qty)",
+           "CREATE SEQUENCE refl.steps START 10 INCREMENT 2",
+           "CREATE VIEW refl.items_v AS SELECT id, code FROM refl.items"]
+
+
+def as_owner(args):
+    """Postgres refuses to run as root, so when we are root its tools run as the 'claude' user (setpriv:
+    runuser is not allowed everywhere)."""
+    if os.geteuid() != 0:
+        return args
+    user = pwd.getpwnam("claude")
+    return ["setpriv", f"--reuid={user.pw_uid}", f"--regid={user.pw_gid}", "--clear-groups", *args]
+
+
+def words(text):
+    """SQL's words, lower-cased and without its layout or ';': Postgres lays a view out its own way."""
+    return " ".join(text.lower().replace(";", " ").split())
+
+
+def inspector_answers(url):
+    """What SQLAlchemy's inspector says of refl.items, its view and its sequences, each cut to what both must agree on."""
+    import sqlalchemy as sa
+    eng = sa.create_engine(url)
+    try:
+        insp = sa.inspect(eng)
+        return {
+            "tables": insp.get_table_names(schema="refl"),
+            "views": insp.get_view_names(schema="refl"),
+            "sequences": sorted(insp.get_sequence_names(schema="refl")),
+            "view definition": words(insp.get_view_definition("items_v", schema="refl")),
+            # (Pondra's port has no json type, so it sends an identity's options as JSON text: read as the dict Postgres sends)
+            "columns": [(c["name"], str(c["type"]), c["nullable"], c["default"], json.loads(c["identity"]) if isinstance(c.get("identity"), str) else c.get("identity"))
+                        for c in insp.get_columns("items", schema="refl")],
+            "primary key": insp.get_pk_constraint("items", schema="refl")["constrained_columns"],
+            "unique constraints": [(u["name"], u["column_names"]) for u in insp.get_unique_constraints("items", schema="refl")],
+            "check constraints": [(c["name"], c["sqltext"]) for c in insp.get_check_constraints("items", schema="refl")],
+            # (Postgres also lists the index a UNIQUE makes, marked as that constraint's; Pondra has the constraint alone)
+            "indexes": sorted((i["name"], i["column_names"], i["unique"]) for i in insp.get_indexes("items", schema="refl") if not i.get("duplicates_constraint")),
+            "enums": insp.get_enums(schema="refl"),
+        }
+    finally:
+        eng.dispose()
+
+
+def reflection_check(pg, port, work, pg16=None):
+    """The inspector reads the same table on Pondra (its DDL over HTTP on `port`) as on Postgres 16 (the reference:
+    the one --pg16 names, else one started here)."""
+    name = "sqlalchemy: the inspector reads a table as Postgres 16 does (named UNIQUE and CHECK, defaults, identity, a sequence, indexes, a view)"
+    ref_port = pg16 or pg + 1
+    try:
+        with contextlib.nullcontext() if pg16 else postgres16(work, ref_port):
+            ours, theirs = reflected(pg, port, ref_port)
+    except Exception as e:  # noqa: BLE001 (reported)
+        return {name: False}, {"reflection": str(e)[:800]}
+    differ = {k: {"pondra": ours.get(k), "postgres 16": theirs[k]} for k in theirs if ours.get(k) != theirs[k]}
+    return {name: not differ}, ({"reflection differs": differ} if differ else {})
+
+
+def reflected(pg, port, ref_port):
+    """REFLECT run on both, then what the inspector says of each."""
+    import sqlalchemy as sa
+    for s in REFLECT:
+        sql(port, s)
+    ref = sa.create_engine(f"postgresql+psycopg2://postgres@127.0.0.1:{ref_port}/postgres")
+    with ref.begin() as c:
+        c.exec_driver_sql("DROP SCHEMA IF EXISTS refl CASCADE")  # (a Postgres given by --pg16 may hold an earlier run's)
+        for s in REFLECT:
+            c.exec_driver_sql(s)
+    ref.dispose()
+    return (inspector_answers(f"postgresql+psycopg2://u:{PASSWORD}@127.0.0.1:{pg}/lake"),
+            inspector_answers(f"postgresql+psycopg2://postgres@127.0.0.1:{ref_port}/postgres"))
 
 
 JAVA = r"""
@@ -230,19 +451,40 @@ def jdbc_check(pg, work):
     if not os.path.exists(jar):
         os.makedirs(os.path.dirname(jar), exist_ok=True)
         subprocess.run(["curl", "-sSLf", "-o", jar, "https://jdbc.postgresql.org/download/postgresql-42.7.4.jar"], check=True)
-    src = os.path.join(work, "Meta.java")
-    with open(src, "w") as f:
-        f.write(JAVA)
-    subprocess.run(["javac", "-d", work, src], check=True, capture_output=True)
-    r = subprocess.run(["java", "-cp", f"{work}:{jar}", "Meta", f"jdbc:postgresql://127.0.0.1:{pg}/lake"], capture_output=True, text=True, timeout=120)
+    sources = []
+    for name, text in (("Meta", JAVA), ("Cursors", CURSORS_JAVA)):
+        sources.append(os.path.join(work, f"{name}.java"))
+        with open(sources[-1], "w") as f:
+            f.write(text)
+    subprocess.run(["javac", "-d", work, *sources], check=True, capture_output=True)
+    url = f"jdbc:postgresql://127.0.0.1:{pg}/lake"
+    r = subprocess.run(["java", "-cp", f"{work}:{jar}", "Meta", url], capture_output=True, text=True, timeout=120)
     got = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+    # Cancels (both protocols), and a cursor-style read of 10,000 rows: each row once, in parts. pgjdbc logs
+    # what it sends and gets (its DEBUG log, through java.util.logging at ALL: the JDK's default drops it).
+    logging_conf = os.path.join(work, "logging.properties")
+    with open(logging_conf, "w") as f:
+        f.write("handlers=java.util.logging.ConsoleHandler\n.level=ALL\norg.postgresql.level=ALL\njava.util.logging.ConsoleHandler.level=ALL\n"
+                "java.util.logging.SimpleFormatter.format=%5$s%n\n")
+    r2 = subprocess.run(["java", f"-Djava.util.logging.config.file={logging_conf}", "-cp", f"{work}:{jar}", "Cursors", url],
+                        capture_output=True, text=True, timeout=300)
+    got2 = dict(line.split("=", 1) for line in r2.stdout.splitlines() if "=" in line)
+    parts = r2.stderr.count("PortalSuspended")  # (one per part the server sent: 100 for 10,000 rows at 100 a fetch, then the empty fetch)
+    print(json.dumps({"pgjdbc_portal_suspended": parts, "fetch": got2.get("fetch")}), flush=True)
     checks = {
         "pgjdbc: catalogs, schemas, tables and views": "lake|" in got.get("catalogs", "") and "sales|" in got.get("schemas", "") and "users|TABLE|" in got.get("tables", "") and "big|VIEW|" in got.get("tables", ""),
-        "pgjdbc: columns (types, nullable, defaults), primary keys, functions": "id|int8|0|null|" in got.get("columns", "") and "name|varchar|0|" in got.get("columns", "")
+        # (a VARCHAR is `text` here, every string being text in the catalog: psql's \d says so too)
+        "pgjdbc: columns (types, nullable, defaults), primary keys, functions": "id|int8|0|null|" in got.get("columns", "") and "name|text|0|null|" in got.get("columns", "")
             and "score|float8|1|0|" in got.get("columns", "") and got.get("keys") == "id|1|;" and "twice|" in got.get("functions", ""),
         "pgjdbc: a prepared query": got.get("query") == "bob|2.5|float8",
+        "pgjdbc: Statement.cancel() stops a running statement (57014), extended and simple protocol; the connection carries on":
+            got2.get("extended-cancel") == "57014" and got2.get("simple-cancel") == "57014" and got2.get("extended-after") == "1" and got2.get("simple-after") == "1",
+        "pgjdbc: setFetchSize(100) in a transaction over 10,000 rows: each row once": got2.get("fetch") == "10000|50005000",
+        "pgjdbc: setFetchSize(100): the answer comes in parts (PortalSuspended)": parts > 0,
+        "pgjdbc: getTransactionIsolation() (SHOW TRANSACTION ISOLATION LEVEL) answers read committed (2)": got2.get("isolation") == "2",
     }
-    return checks, ({} if all(checks.values()) else {"out": r.stdout[-1500:], "err": r.stderr[-1500:]})
+    said = {} if all(checks.values()) else {"out": r.stdout[-1500:], "err": r.stderr[-1500:], "cursors": (r2.stdout + r2.stderr)[-1500:]}
+    return checks, said
 
 
 def odbc_check(pg):
@@ -344,10 +586,170 @@ def npgsql_check(pg, work):
     return checks, said
 
 
+# ---------------------------------------------------------------- params (psycopg 3)
+
+def param_cases():
+    """(name, the value psycopg 3 sends, the column it is written to, what Pondra answers to a SELECT,
+    what it answers for a value stored and read back). Where those are None, Pondra answers as
+    Postgres 16 does. Where not, it is a named difference, held to exactly: Pondra has no text, uuid,
+    json or jsonb type of its own, so a value of one comes back as a text (25) of the text it was
+    sent."""
+    from psycopg.types.json import Json, Jsonb
+    utc = dt.timezone.utc
+    as_text = lambda s: ("value", s, 25)
+    js = '{"a": [1, 2]}'
+    return [
+        ("numeric", decimal.Decimal("15.7563"), "NUMERIC", None, None),
+        ("numeric, negative", decimal.Decimal("-4.24"), "NUMERIC", None, None),
+        ("bytea", b"\xff\x00\x01", "BYTEA", None, None),
+        ("date", dt.date(2020, 1, 1), "DATE", None, None),
+        ("time", dt.time(12, 34, 56, 789000), "TIME", None, None),
+        ("timestamp", dt.datetime(2020, 1, 1, 12, 0), "TIMESTAMP", None, None),
+        ("timestamptz", dt.datetime(2020, 1, 1, 12, 0, tzinfo=utc), "TIMESTAMPTZ", None, None),
+        ("interval", dt.timedelta(days=1, seconds=3, microseconds=4), "INTERVAL", None, None),
+        ("uuid", uuid.UUID("12345678-1234-5678-1234-567812345678"), "UUID", as_text("12345678-1234-5678-1234-567812345678"), None),
+        ("json", Json({"a": [1, 2]}), "JSON", as_text(js), as_text(js)),
+        ("jsonb", Jsonb({"a": [1, 2]}), "JSONB", as_text(js), as_text(js)),
+        ("text", "it's", "TEXT", None, None),
+        ("boolean", True, "BOOLEAN", None, None),
+        ("double precision", 2.5, "DOUBLE PRECISION", None, None),
+        ("double precision, negative", -2.5, "DOUBLE PRECISION", None, None),
+        ("double precision, infinity", float("inf"), "DOUBLE PRECISION", None, None),
+        ("double precision, -infinity", float("-inf"), "DOUBLE PRECISION", None, None),
+        ("double precision, NaN", float("nan"), "DOUBLE PRECISION", None, None),
+    ]
+
+
+def _psycopg(port, db, user):
+    """A psycopg 3 connection that reads text as text: Pondra speaks UTF-8 only, and a Postgres made
+    without an encoding (SQL_ASCII) would otherwise hand psycopg bytes for every text value."""
+    import psycopg
+    return psycopg.connect(f"host=127.0.0.1 port={port} dbname={db} user={user} password={PASSWORD} client_encoding=UTF8",
+                           autocommit=True, prepare_threshold=None)
+
+
+def _pg_answer(conn, sql, args=None):
+    """What the server answers one statement: ("value", its first value, that column's type code), or
+    ("error", SQLSTATE, the message's first line)."""
+    try:
+        cur = conn.execute(sql, args)
+        return ("value", cur.fetchone()[0], cur.description[0].type_code)
+    except Exception as e:  # noqa: BLE001 (a refusal is an answer too)
+        return ("error", getattr(e, "sqlstate", None) or type(e).__name__, str(e).splitlines()[0][:200])
+
+
+def _stored(conn, table, coltype, ph, value):
+    """INSERT the value into a column of its type, then SELECT it back. A column the server refuses
+    is an answer too: ("refused", SQLSTATE, the message's first line)."""
+    try:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute(f"CREATE TABLE {table} (v {coltype})")
+    except Exception as e:  # noqa: BLE001
+        return ("refused", getattr(e, "sqlstate", None) or type(e).__name__, str(e).splitlines()[0][:200])
+    try:
+        conn.execute(f"INSERT INTO {table} (v) VALUES ({ph})", [value])
+    except Exception as e:  # noqa: BLE001
+        return ("error", getattr(e, "sqlstate", None) or type(e).__name__, str(e).splitlines()[0][:200])
+    return _pg_answer(conn, f"SELECT v FROM {table}")
+
+
+def _key(answer):
+    """An answer as it is compared: a value with its Python type and its type code (NaN is equal to
+    NaN here, which Python's own == is not); an error or a refusal by its SQLSTATE alone (the messages
+    differ by server)."""
+    if answer[0] != "value":
+        return answer[:2]
+    value = "NaN" if isinstance(answer[1], float) and math.isnan(answer[1]) else answer[1]
+    return (answer[0], type(answer[1]), value, *answer[2:])
+
+
+def _note(differences, label, got, want):
+    if _key(got) != _key(want):
+        differences.append(f"{label}: Pondra's answer {got!r} / Postgres's answer {want!r}")
+
+
+def _psql_value(port, user, db, sql):
+    r = subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(port), "-U", user, "-d", db, "-X", "-A", "-t", "-c", sql],
+                       capture_output=True, text=True, env={**os.environ, "PGPASSWORD": PASSWORD}, timeout=60)
+    return r.stdout.strip() if r.returncode == 0 else "ERROR " + r.stderr.strip()
+
+
+def params_check(pg, pg16):
+    """psycopg 3 against Pondra and against Postgres 16: each type as a parameter of SELECT and of an
+    INSERT, text (%t) and binary (%b), with Postgres 16's values and type codes. Pondra's own answers
+    where it has no type of Postgres's are held to by name; every other difference is listed."""
+    try:
+        import psycopg  # noqa: F401 (the part is skipped by name without it)
+    except ImportError:
+        return {}, {"skipped": "psycopg 3 isn't installed (pip install 'psycopg[binary]'): params wasn't run"}
+    pondra, postgres = _psycopg(pg, "lake", "u"), _psycopg(pg16, "postgres", "postgres")
+    checks, differences = {}, []
+    cases = param_cases()
+    how = lambda named: "as Pondra answers it (a named difference)" if named else "as Postgres 16 has it"
+    for i, (name, value, coltype, select_as, stored_as) in enumerate(cases):
+        for ph in ("%t", "%b"):
+            want = _pg_answer(postgres, f"SELECT {ph}", [value])
+            got = _pg_answer(pondra, f"SELECT {ph}", [value])
+            checks[f"{name} {ph}: SELECT {ph}, {how(select_as)}"] = _key(got) == _key(select_as or want)
+            _note(differences, f"SELECT {ph} of {name}", got, want)
+            table = f"pm_{i:02d}_{ph[1]}"
+            want = _stored(postgres, table, coltype, ph, value)
+            got = _stored(pondra, table, coltype, ph, value)
+            if got[0] == "refused":  # (a column Pondra has no type for: named, and never written)
+                checks[f"{name} {ph}: a {coltype} column is refused by name (Pondra)"] = coltype in got[2]
+                if ph == "%t":
+                    differences.append(f"CREATE TABLE … (v {coltype}): Pondra's answer {got[2]!r} / Postgres's answer created the column")
+                continue
+            checks[f"{name} {ph}: INSERT {ph}, then SELECT, {how(stored_as)}"] = _key(got) == _key(stored_as or want)
+            _note(differences, f"INSERT {ph} of {name}, then SELECT", got, want)
+    for ph in ("%t", "%b"):  # a numeric parameter's arithmetic: the same result on both
+        got = _pg_answer(pondra, f"SELECT 70 + {ph}", [decimal.Decimal("4.24")])
+        want = _pg_answer(postgres, f"SELECT 70 + {ph}", [decimal.Decimal("4.24")])
+        checks[f"SELECT 70 + {ph} with Decimal('4.24') is Decimal('74.24') with type 1700, as Postgres 16 has it"] = \
+            _key(got) == _key(want) == _key(("value", decimal.Decimal("74.24"), 1700))
+        _note(differences, f"SELECT 70 + {ph} with Decimal('4.24')", got, want)
+    for ph in ("%t", "%b"):  # a float parameter after a minus still subtracts, as it does on Postgres 16
+        got = _pg_answer(pondra, f"SELECT 5 - {ph}", [-2.5])
+        want = _pg_answer(postgres, f"SELECT 5 - {ph}", [-2.5])
+        checks[f"SELECT 5 - {ph} with -2.5 is 7.5 with type 701, as Postgres 16 has it"] = _key(got) == _key(want) == _key(("value", 7.5, 701))
+        _note(differences, f"SELECT 5 - {ph} with -2.5", got, want)
+    for conn in (postgres, pondra):  # a numeric parameter that isn't a number: refused, and nothing it says runs
+        conn.execute("DROP TABLE IF EXISTS pm_inj")
+        conn.execute("CREATE TABLE pm_inj (v TEXT)")
+        conn.execute("INSERT INTO pm_inj VALUES ('kept')")
+    injection = "1; DROP TABLE pm_inj"
+    got = _pg_answer(pondra, "SELECT %s::numeric", [injection])
+    want = _pg_answer(postgres, "SELECT %s::numeric", [injection])
+    kept = _pg_answer(pondra, "SELECT v FROM pm_inj")
+    checks["a numeric parameter that isn't a number is refused (22P02), and the table it names stays"] = \
+        got[:2] == ("error", "22P02") and kept[0] == "value" and kept[1] == "kept"
+    _note(differences, "SELECT %s::numeric with '1; DROP TABLE pm_inj'", got, want)
+    names = {name: i for i, (name, *_rest) in enumerate(cases)}  # (a TIME and an INTERVAL as psql prints them)
+    for name in ("time", "interval"):
+        table = f"pm_{names[name]:02d}_b"
+        got = _psql_value(pg, "u", "lake", f"SELECT v FROM {table}")
+        want = _psql_value(pg16, "postgres", "postgres", f"SELECT v FROM {table}")
+        checks[f"psql prints a {name} as Postgres 16 does"] = got == want
+        if got != want:
+            differences.append(f"psql, SELECT v FROM a {name}: Pondra's answer {got!r} / Postgres's answer {want!r}")
+    pondra.close()
+    postgres.close()
+    return checks, {"differences": differences}
+
+
+def params_part(pg, work, pg16):
+    """params against the Postgres 16 given by --pg16, else one started for it here."""
+    if pg16:
+        return params_check(pg, pg16)
+    with postgres16(work, pg + 1):
+        return params_check(pg, pg + 1)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("parts", nargs="?", default="dbt,psql,sqlalchemy,jdbc,odbc,adbc,npgsql")
+    ap.add_argument("parts", nargs="?", default="dbt,psql,sqlalchemy,psycopg,jdbc,odbc,adbc,npgsql,params")
     ap.add_argument("--port", type=int, default=8870)
+    ap.add_argument("--pg16", type=int, default=None, help="a Postgres 16 already running on this port, for params (else one is started)")
     A = harness.A = ap.parse_args()
     A.s3, A.keep = False, False
     work = tempfile.mkdtemp(prefix="pondra-clients-")
@@ -361,8 +763,9 @@ def main():
             sql(A.port, s)
         for part in A.parts.split(","):
             try:
-                checks, info = {"dbt": lambda: dbt_check(pg, work), "psql": lambda: psql_check(pg), "sqlalchemy": lambda: sqlalchemy_check(pg),
-                                "jdbc": lambda: jdbc_check(pg, work), "odbc": lambda: odbc_check(pg), "adbc": lambda: adbc_check(pg), "npgsql": lambda: npgsql_check(pg, work)}[part]()
+                checks, info = {"dbt": lambda: dbt_check(pg, work), "psql": lambda: psql_check(pg), "sqlalchemy": lambda: sqlalchemy_check(pg, A.port, work, A.pg16), "psycopg": lambda: psycopg_check(pg),
+                                "jdbc": lambda: jdbc_check(pg, work), "odbc": lambda: odbc_check(pg), "adbc": lambda: adbc_check(pg), "npgsql": lambda: npgsql_check(pg, work),
+                                "params": lambda: params_part(pg, work, A.pg16)}[part]()
             except Exception as e:  # noqa: BLE001 (a part that couldn't run fails)
                 checks, info = {f"{part}: ran": False}, {"error": f"{type(e).__name__}: {str(e)[:1500]}"}
             results.update(checks)
@@ -373,8 +776,7 @@ def main():
         node.kill()
         shutil.rmtree(work, ignore_errors=True)
     ok = all(results.values())
-    if not ok:
-        print(json.dumps(said, indent=1, default=str)[:12000])
+    print(json.dumps(said, indent=1, default=str))  # (what each part said: its differences from the reference, its failures)
     print(json.dumps({"checks": len(results), "passed": sum(results.values()), "ok": ok}))
     sys.exit(0 if ok else 1)
 

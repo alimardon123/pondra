@@ -30,9 +30,10 @@ from .frame import Expr, Frame, GroupBy, coalesce, col, concat, concat_str, fn, 
 from .frame import all, count, first, last, len, max, mean, median, min, n_unique, sum  # noqa: A004 (Polars' names)
 
 __version__ = "0.33.0"
+# all, len, max, min and sum stay out of __all__: a star import would shadow Python's own (pondra.sum still works).
 __all__ = ["connect", "local", "current", "sql", "table", "read_parquet", "read_csv", "read_json", "read_delta", "read_iceberg", "call", "run", "secret", "parameters", "fn", "Pondra", "PondraError", "Result", "Run", "Frame", "Expr", "GroupBy", "col", "lit", "measure", "when",
            "sql_expr", "coalesce", "concat", "concat_str",
-           "all", "count", "first", "last", "len", "max", "mean", "median", "min", "n_unique", "sum"]
+           "count", "first", "last", "mean", "median", "n_unique"]
 
 
 def sql(query, job=None, **names):

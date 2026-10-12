@@ -62,7 +62,12 @@ fn install(name: &str, mut args: Vec<String>) -> Result<()> {
     ensure!(!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'), "a service's name is letters, digits, - and _");
     if args.iter().any(|a| a == "--help" || a == "-h") {
         use clap::CommandFactory;
-        return Ok(crate::cli::Cli::command().find_subcommand_mut("serve").expect("serve").print_help()?);
+        let mut cli = crate::cli::Cli::command();
+        cli.build(); // (each command's usage named in full: `pondra service install`)
+        let service = cli.find_subcommand_mut("service").expect("service");
+        service.find_subcommand_mut("install").expect("install").print_help()?;
+        println!("\nThe node runs `pondra serve` with the options given after --name:\n");
+        return Ok(cli.find_subcommand_mut("serve").expect("serve").print_help()?);
     }
     // (the options as `serve` takes them: a mistake is said now, not in a log at boot)
     let cli = crate::cli::Cli::try_parse_from(["pondra", "serve"].into_iter().map(String::from).chain(args.iter().cloned())).map_err(|e| anyhow::anyhow!("{}", e.render()))?;
@@ -105,7 +110,14 @@ async fn status(name: &str) -> Result<()> {
     // (the node itself: from this machine its HTTP port answers plainly, TLS or not)
     let addr = config.args.iter().position(|a| a == "--addr").and_then(|i| config.args.get(i + 1)).map_or("127.0.0.1:8080", |a| a.as_str());
     let port = addr.rsplit(':').next().unwrap_or("8080");
-    let asked = reqwest::Client::new().get(format!("http://127.0.0.1:{port}/stats")).timeout(std::time::Duration::from_secs(3)).send().await;
+    // (a node with tokens names the cluster's members to a token only: this shell's, if it has one)
+    let given = |v: &str| std::env::var(v).ok().filter(|t| !t.is_empty());
+    let token = given("PONDRA_TOKEN").or_else(|| given("PONDRA_ADMIN_TOKEN"));
+    let mut asking = reqwest::Client::new().get(format!("http://127.0.0.1:{port}/stats")).timeout(std::time::Duration::from_secs(3));
+    if let Some(t) = token {
+        asking = asking.bearer_auth(t);
+    }
+    let asked = asking.send().await;
     match asked {
         Ok(r) => match r.json::<serde_json::Value>().await {
             Ok(s) => println!("  node: {} of term {} (leader {}), {} node(s) in the cluster", s["role"].as_str().unwrap_or("?"), s["term"], s["leader"].as_str().unwrap_or("?"), s["nodes"].as_array().map_or(0, |n| n.len())),

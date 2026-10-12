@@ -131,6 +131,15 @@ sudo systemctl start pondra
 until curl -sf localhost:8080/ready; do sleep 1; done
 ```
 
+### Backups
+`BACKUP DATABASE TO 'place'` copies the whole database to another folder or bucket as of one moment, and run again copies only what changed; `RESTORE DATABASE` brings back any run it kept. [Backups](/pondra/guides/backups/)
+
+```sql
+CREATE TABLE pantry (item VARCHAR, qty INT);
+INSERT INTO pantry VALUES ('tea', 12);
+BACKUP DATABASE TO 'backups/features';
+```
+
 ### Health and metrics
 `/healthz` answers while the process runs, `/ready` while the node serves, `/metrics` in Prometheus format, and `/stats` in JSON says the node's role, term and leader. [HTTP API](/pondra/reference/http/#the-server)
 
@@ -660,7 +669,7 @@ curl -s -X POST "http://localhost:8080/sql?format=csv" -d "SELECT id, item, amou
 
 ### Statement history
 
-Every statement is a row of `pondra.history`, with its fingerprint, duration, rows and the commit it read, so you can find the slow queries. [System tables](/pondra/sql/system-tables/)
+Every statement is a row of `pondra.history`, with its fingerprint, duration, rows and the commit it read, so you can find the slow queries. [Observability](/pondra/guides/observability/)
 
 ```sql
 SELECT fingerprint, count(*) AS runs, avg(ms) AS ms FROM pondra.history
@@ -754,7 +763,7 @@ for row in itertools.islice(db.watch("stock", after=0, changes=True), 3):
 
 ### A table as it was
 
-`t AT (VERSION => n)`, `AT (TIMESTAMP => '…')` or `AT (OFFSET => -3600)` reads an append table as it was then, anywhere a table is read, joins included. [SQL statements](/pondra/sql/statements/#a-tables-past)
+`t AT (VERSION => n)`, `AT (TIMESTAMP => '…')` or `AT (OFFSET => -3600)` reads an append table as it was then, anywhere a table is read, joins included. [A table's past](/pondra/guides/past/#read-a-table-as-it-was)
 
 ```sql
 DECLARE $before BIGINT = (SELECT max(_version) FROM stock);
@@ -765,7 +774,7 @@ SELECT n.sku, w.qty AS was, n.qty AS now FROM stock n
 
 ### Restore a table
 
-`RESTORE TABLE t TO VERSION AS OF n` (or `TIMESTAMP AS OF '…'`) puts an append table back as it was then, in one change that can itself be undone. [SQL statements](/pondra/sql/statements/#tables)
+`RESTORE TABLE t TO VERSION AS OF n` (or `TIMESTAMP AS OF '…'`) puts an append table back as it was then, in one change that can itself be undone. [A table's past](/pondra/guides/past/#put-back-what-a-change-did)
 
 ```python
 v = db.sql("SELECT max(_version) AS v FROM stock").rows()[0]["v"]
@@ -776,7 +785,7 @@ print(db.sql("SELECT qty FROM stock WHERE sku = 'pie'").rows())
 
 ### Clone a table
 
-`CREATE TABLE c CLONE t` makes `c` with `t`'s rows as they are, copying no file, and the two change apart from then on. [SQL statements](/pondra/sql/statements/#a-tables-past)
+`CREATE TABLE c CLONE t` makes `c` with `t`'s rows as they are, copying no file, and the two change apart from then on. [A table's past](/pondra/guides/past/#copy-a-table-without-copying-its-files)
 
 ```sql
 CREATE TABLE ledger CLONE stock;
@@ -785,7 +794,7 @@ SELECT count(*) AS n FROM ledger;
 
 ### Drop and undrop a table
 
-`DROP TABLE` keeps the table for a day, or for its `retention`, so `UNDROP TABLE` brings it back with every row and version. [SQL statements](/pondra/sql/statements/#tables)
+`DROP TABLE` keeps the table for a day, or for its `retention`, so `UNDROP TABLE` brings it back with every row and version. [A table's past](/pondra/guides/past/#bring-back-a-dropped-table)
 
 ```sql
 ALTER TABLE ledger SET (retention = '2 hours');
@@ -799,7 +808,7 @@ Views that stay current as rows arrive: any query, windows and sessions by event
 
 ### Views kept current
 
-A materialized view is any query the node keeps current in the same commit as the rows, so a read never lags the table: here the two biggest clicks. [Streaming](/pondra/guides/streaming/#keep-a-query-up-to-date)
+A materialized view is any query the node keeps current in the same commit as the rows, so a read never lags the table: here the two biggest clicks. [Views kept current](/pondra/guides/views/#keep-a-query-up-to-date)
 
 ```sql
 CREATE TABLE clicks (user VARCHAR, page VARCHAR, ts TIMESTAMP, amount BIGINT);
@@ -811,7 +820,7 @@ CREATE MATERIALIZED VIEW biggest AS SELECT user, page, amount FROM clicks
 
 ### GROUP BY views
 
-A grouped view keeps one running row per group, updated by every commit, and any number of nodes add to it at once. [Streaming](/pondra/guides/streaming/#keep-a-query-up-to-date)
+A grouped view keeps one running row per group, updated by every commit, and any number of nodes add to it at once. [Views kept current](/pondra/guides/views/#keep-a-query-up-to-date)
 
 ```sql
 CREATE MATERIALIZED VIEW spend AS SELECT user, count(*) AS n, sum(amount) AS total
@@ -822,7 +831,7 @@ SELECT * FROM spend ORDER BY user;
 
 ### Tumbling windows
 
-`EMIT FINAL` keeps each group of event-time buckets once the watermark (the newest event time less `lateness`) has passed its end, instead of keeping running totals. [Streaming](/pondra/guides/streaming/#windows-each-group-once-its-over)
+`EMIT FINAL` keeps each group of event-time buckets once the watermark (the newest event time less `lateness`) has passed its end, instead of keeping running totals. [Windows and sessions](/pondra/guides/windows/#windows-each-group-once-its-over)
 
 ```sql
 CREATE MATERIALIZED VIEW per_minute WITH (lateness = '10 seconds') AS
@@ -832,7 +841,7 @@ CREATE MATERIALIZED VIEW per_minute WITH (lateness = '10 seconds') AS
 
 ### Sliding windows
 
-A window frame over the minutes a view keeps adds up the last five minutes at every minute, and each row is counted once, in its own minute. [Streaming](/pondra/guides/streaming/#sliding-windows)
+A window frame over the minutes a view keeps adds up the last five minutes at every minute, and each row is counted once, in its own minute. [Windows and sessions](/pondra/guides/windows/#sliding-windows)
 
 ```sql
 CREATE MATERIALIZED VIEW minutes AS
@@ -845,7 +854,7 @@ SELECT minute, user, sum(n) OVER (PARTITION BY user ORDER BY minute
 
 ### Session windows
 
-`GROUP BY … SESSION(ts, INTERVAL …)` keeps each key's rows with no gap longer than the interval as one session, and `EMIT FINAL` keeps each session once it is over, with `session_start` and `session_end`. [Streaming](/pondra/guides/streaming/#session-windows)
+`GROUP BY … SESSION(ts, INTERVAL …)` keeps each key's rows with no gap longer than the interval as one session, and `EMIT FINAL` keeps each session once it is over, with `session_start` and `session_end`. [Windows and sessions](/pondra/guides/windows/#session-windows)
 
 ```sql
 CREATE MATERIALIZED VIEW sessions WITH (lateness = '5 seconds') AS
@@ -855,7 +864,7 @@ CREATE MATERIALIZED VIEW sessions WITH (lateness = '5 seconds') AS
 
 ### Join two streams
 
-`join = 'streams'` pairs each row with the other table's rows as they arrive, in whichever order they come, each pair once; `within_secs` bounds how far apart they may be. [Streaming](/pondra/guides/streaming/#join-two-streams)
+`join = 'streams'` pairs each row with the other table's rows as they arrive, in whichever order they come, each pair once; `within_secs` bounds how far apart they may be. [Joins over streams](/pondra/guides/stream-joins/#join-two-streams)
 
 ```sql
 CREATE TABLE bids (user VARCHAR, amount DOUBLE, ts TIMESTAMP);
@@ -937,7 +946,7 @@ CREATE MATERIALIZED VIEW ledger_feed WITH (start = 'earliest') AS
 
 ### Live queries
 
-`db.live(query)` answers now, and again each time a commit changes what the query reads; it stops when you close it, and nothing runs on the node after that. [Streaming](/pondra/guides/streaming/#live-queries)
+`db.live(query)` answers now, and again each time a commit changes what the query reads; it stops when you close it, and nothing runs on the node after that. [Views kept current](/pondra/guides/views/#live-queries)
 
 ```python
 live = db.live("SELECT count(*) AS n FROM clicks")
@@ -948,7 +957,7 @@ print(next(live)); live.close()
 
 ### Streaming tasks
 
-A task runs any SQL over each commit's new rows and appends its result to a target table, exactly once; here it keeps each user's running total in `daily`. [Streaming](/pondra/guides/streaming/#tasks-any-streaming-sql)
+A task runs any SQL over each commit's new rows and appends its result to a target table, exactly once; here it keeps each user's running total in `daily`. [Views kept current](/pondra/guides/views/#tasks-any-streaming-sql)
 
 ```bash
 curl -s -X POST localhost:8080/sql -d "CREATE TABLE daily (user VARCHAR PRIMARY KEY, total BIGINT, n BIGINT)"
@@ -1001,7 +1010,7 @@ print(spark.table("measurements").where(F.col("celsius") > 20).groupBy("sensor")
 
 ### SQL naming your Python data
 
-A name in a query that isn't a table is read from your Python variables, and a pandas table travels with that one query. [Notebooks](/pondra/guides/notebooks/#your-variables-are-tables)
+A name in a query that isn't a table is read from your Python variables, and a pandas table travels with that one query. [SQL and Python together](/pondra/guides/sql-and-python/#name-a-frame-in-sql)
 
 ```python
 import pandas as pd
@@ -1148,7 +1157,7 @@ print("sensors:", len(by_sensor))
 
 ### Scripts: branch and loop
 
-A script branches with `IF` and loops with `FOR` over a query's rows, and it runs the same from every door. [SQL statements](/pondra/sql/statements/#scripts)
+A script branches with `IF` and loops with `FOR` over a query's rows, and it runs the same from every door. [Scripts and variables](/pondra/guides/scripts/#scripts)
 
 ```sql
 DECLARE $total = 0;
@@ -1163,7 +1172,7 @@ SELECT $total AS total;
 
 ### Scripts: error handlers
 
-`BEGIN … EXCEPTION WHEN … THEN` catches an error by its name, and `$error` holds its message. [SQL statements](/pondra/sql/statements/#scripts)
+`BEGIN … EXCEPTION WHEN … THEN` catches an error by its name, and `$error` holds its message. [Scripts and variables](/pondra/guides/scripts/#scripts)
 
 ```sql
 DECLARE $n = (SELECT count(*) FROM measurements);
@@ -1176,7 +1185,7 @@ END;
 
 ### Scripts: parallel and async
 
-`FOR … PARALLEL n` runs up to `n` passes at once, and `ASYNC` starts a statement that `AWAIT` waits for. [SQL statements](/pondra/sql/statements/#scripts)
+`FOR … PARALLEL n` runs up to `n` passes at once, and `ASYNC` starts a statement that `AWAIT` waits for. [Scripts and variables](/pondra/guides/scripts/#scripts)
 
 ```sql
 FOR p IN (SELECT value AS n FROM generate_series(1, 6)) PARALLEL 3 DO
@@ -1189,7 +1198,7 @@ SELECT count(*) AS n FROM jobs_log;
 
 ### Notebooks: SQL cells
 
-After `%load_ext pondra`, a `%%sql` cell runs its SQL on your connection and shows the answer as a frame. [Notebooks](/pondra/guides/notebooks/#sql-cells)
+After `%load_ext pondra`, a `%%sql` cell runs its SQL on your connection and shows the answer as a frame. [SQL and Python together](/pondra/guides/sql-and-python/#sql-cells-in-a-notebook)
 
 ```python norun
 %%sql
@@ -1236,7 +1245,7 @@ db.run("etl/measure.sql", id=8, sensor="east", celsius=8.0)
 
 ### Tasks on a schedule
 
-A task runs a statement on a schedule, and each tick runs once, even when the leader changes. [Functions and procedures](/pondra/guides/functions-and-procedures/#run-on-a-schedule)
+A task runs a statement on a schedule, and each tick runs once, even when the leader changes. [Tasks](/pondra/guides/tasks/#run-on-a-schedule)
 
 ```sql
 CREATE TASK nightly SCHEDULE 'cron 0 2 * * * UTC' AS CALL cleanup(current_date - 30);
@@ -1246,7 +1255,7 @@ DROP TASK nightly;
 
 ### Task graphs
 
-A task can run `AFTER` other tasks, and `WHEN` with `pondra.result` decides whether it runs. [Functions and procedures](/pondra/guides/functions-and-procedures/#run-tasks-in-order)
+A task can run `AFTER` other tasks, and `WHEN` with `pondra.result` decides whether it runs. [Tasks](/pondra/guides/tasks/#run-tasks-in-order)
 
 ```sql
 CREATE TASK tally SCHEDULE 'cron 0 3 * * * UTC' AS SELECT count(*) FROM measurements;
@@ -1532,7 +1541,7 @@ curl -s http://localhost:8080/v1/namespaces/default/tables
 
 ### MCP for agents
 
-`POST /mcp` takes a JSON-RPC call; this one runs the `query` tool with a SQL text. [MCP](/pondra/reference/mcp/)
+`POST /mcp` takes a JSON-RPC call; this one runs the `query` tool with a SQL text. [AI agents (MCP)](/pondra/guides/agents/)
 
 ```bash
 curl -s -X POST http://localhost:8080/mcp -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT count(*) AS n FROM notes"}}}'
@@ -1617,7 +1626,7 @@ DROP DATABASE dev;
 
 ### Projects: plan, apply, test
 
-A project is a folder of files that says what every object is: `pondra plan` shows what an apply would change, `pondra apply` makes the database match it, and `pondra test` runs the queries in `tests/`. [Branches and environments](/pondra/guides/environments/#apply-a-project)
+A project is a folder of files that says what every object is: `pondra plan` shows what an apply would change, `pondra apply` makes the database match it, and `pondra test` runs the queries in `tests/`. [Projects](/pondra/guides/projects/#apply-it)
 
 ```bash
 pondra init reviews && cd reviews
@@ -1628,7 +1637,7 @@ pondra plan --url http://127.0.0.1:8080 && pondra apply --url http://127.0.0.1:8
 
 ### Migrations
 
-A migration is a one-off step, such as a backfill, that runs once in each database after the objects an apply adds. [Branches and environments](/pondra/guides/environments/#apply-a-project)
+A migration is a one-off step, such as a backfill, that runs once in each database after the objects an apply adds. [Projects](/pondra/guides/projects/#apply-it)
 
 ```bash
 cd reviews
@@ -1639,7 +1648,7 @@ pondra apply --url http://127.0.0.1:8080
 
 ### Changes made by hand
 
-`pondra status` lists what differs from the files, and `pondra capture` writes the chosen changes into them. [Branches and environments](/pondra/guides/environments/#changes-made-in-the-database)
+`pondra status` lists what differs from the files, and `pondra capture` writes the chosen changes into them. [Projects](/pondra/guides/projects/#changes-made-in-the-database)
 
 ```bash
 cd reviews
@@ -1670,7 +1679,7 @@ pondra workspace push ws --url http://localhost:8080
 
 ### Protected databases
 
-On a protected database, a project's objects change only by an apply, and lifting the protection is an admin's audited statement. [Branches and environments](/pondra/guides/environments/#protected-production)
+On a protected database, a project's objects change only by an apply, and lifting the protection is an admin's audited statement. [Projects](/pondra/guides/projects/#protected-production)
 
 ```sql norun
 ALTER DATABASE qa SET (protected = true);
@@ -1679,7 +1688,7 @@ SELECT name, protected, lifted_at, lifted_by FROM pondra.databases;
 
 ### Git folders
 
-A project folder paired with a GitHub branch: the node commits, pulls and opens pull requests itself, with no `git` installed. [Branches and environments](/pondra/guides/environments/#git-folders)
+A project folder paired with a GitHub branch: the node commits, pulls and opens pull requests itself, with no `git` installed. [Git folders](/pondra/guides/git/)
 
 ```sql norun
 CALL git_checkout('sales', repository => 'https://github.com/acme/sales', branch => 'main');
@@ -1689,7 +1698,7 @@ CALL git_pull_request('sales', title => 'Discounts by channel');
 
 ### CI in one command
 
-`pondra ci init` sets up CI for the project: a workflow that tests each pull request's database, protects prod and makes the users CI signs in as. [Branches and environments](/pondra/guides/environments/#branches-and-environments-on-a-team)
+`pondra ci init` sets up CI for the project: a workflow that tests each pull request's database, protects prod and makes the users CI signs in as. [Projects](/pondra/guides/projects/#continuous-integration)
 
 ```bash norun
 pondra ci init

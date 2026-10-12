@@ -37,6 +37,8 @@ sharedStorage:
 # Tokens (read, write, admin) at every door. Made once and kept across upgrades, unless given;
 # `kubectl get secret <release>-pondra-tokens -o jsonpath='{.data.PONDRA_ADMIN_TOKEN}' | base64 -d`.
 # With Argo CD or Flux (which render without the cluster), give existingSecret.
+# With auth off, the nodes still listen on the network: the leader makes the lake's first user and
+# prints its token once (`kubectl logs`, `pondra token` makes another), as the container does.
 auth:
   enabled: true
   existingSecret: ""      # keys PONDRA_ADMIN_TOKEN, PONDRA_WRITE_TOKEN, PONDRA_READ_TOKEN
@@ -115,6 +117,8 @@ ingress:
   annotations: {}
   hosts: []               # e.g. [pondra.example.com]: the console and the HTTP API
   tls: []
+  # (with one, add {name: PONDRA_TRUSTED_PROXIES, value: "<its pods' range, e.g. 10.244.0.0/16>"} to extraEnv:
+  # failed sign-ins are then counted per client, not per ingress)
 
 podMonitor:               # (Prometheus Operator: each pod's GET /metrics, with the read token)
   enabled: false

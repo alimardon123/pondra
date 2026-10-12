@@ -20,7 +20,7 @@ use datafusion::arrow::array::{Array, AsArray, Int64Array};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, Result as DfResult};
 use datafusion::logical_expr::{async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl}, ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use datafusion::prelude::{create_udf, SessionContext};
+use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast;
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
@@ -99,6 +99,7 @@ pub struct Shape {
     pub max: i64,
     pub cache: i64,
     pub cycle: bool,
+    pub as_type: &'static str, // its type: BIGINT, INTEGER or SMALLINT (the catalog's `seqtypid`)
 }
 
 /// The options worked out, Postgres's defaults where none is given, and checked.
@@ -126,7 +127,7 @@ pub fn shape(declared: &[Opt]) -> Result<Shape> {
     let cache = last(|o| if let Opt::Cache(n) = o { Some(Some(*n)) } else { None }).flatten().unwrap_or(1);
     ensure!(cache >= 1, "CACHE ({cache}) must be greater than zero");
     let cycle = declared.iter().rev().find_map(|o| if let Opt::Cycle(c) = o { Some(*c) } else { None }).unwrap_or(false);
-    Ok(Shape { start, increment, min, max, cache, cycle })
+    Ok(Shape { start, increment, min, max, cache, cycle, as_type })
 }
 
 /// `CREATE SEQUENCE` again, as declared.
@@ -360,6 +361,38 @@ async fn find(lake: &Lake, name: &str) -> Result<Option<(String, Sequence)>> {
     let (other, local) = crate::ddl::resolve(lake, name).await?;
     ensure!(other.is_none(), "{name} is an attached lake's sequence: use it from a node of that lake");
     Ok(lake.cat.get::<Sequence>(&key(&local)).await?.map(|s| (local, s)))
+}
+
+/// Refused while the table a sequence went with is not live (dropped and kept for UNDROP, or gone):
+/// Postgres drops a SERIAL's sequence with its table, so its values stop with it (42P01). A table
+/// renamed keeps its sequence's name, and a clone shares it, so a live table that names the sequence
+/// (as an identity or a default) keeps it going. Checked where values are taken (`next`, `set`,
+/// `currval`), so `DROP SEQUENCE IF EXISTS` still finds it as it is.
+async fn gone_with(lake: &Lake, name: &str, s: &Sequence) -> Result<()> {
+    let Some((table, _)) = s.owned.as_deref().and_then(|o| o.rsplit_once('.')) else { return Ok(()) };
+    if lake.cat.get::<TableMeta>(&crate::store::table_key(table)).await?.is_some() {
+        return Ok(());
+    }
+    for (_, m) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
+        if m.identity.values().any(|i| i.sequence == name) {
+            return Ok(());
+        }
+    }
+    if used_by(lake, name).await?.is_some() {
+        return Ok(());
+    }
+    // (Postgres's own words for a missing relation: through `currval`'s UDF the typed code is lost, and
+    // `codes::by_words` reads "relation … does not exist" as 42P01 everywhere)
+    Err(crate::codes::coded("42P01", format!("relation \"{name}\" does not exist: it went with table {table}; UNDROP TABLE {table} brings both back")))
+}
+
+/// `currval`'s check: a sequence of that name must have a live table (see `gone_with`). A name with no
+/// sequence is left to the session's own answer.
+pub async fn check_current(lake: &Lake, name: &str) -> Result<()> {
+    match find(lake, name).await? {
+        Some((local, s)) => gone_with(lake, &local, &s).await,
+        None => Ok(()),
+    }
 }
 
 /// An identity column's sequence, made with its table (leader): `{table}_{column}_seq`, or the
@@ -701,7 +734,8 @@ const MOST: u64 = 1 << 20;
 
 /// `n` values of the sequence `name` for this node's rows, in order.
 pub async fn next(lake: &Lake, name: &str, n: usize) -> Result<Vec<i64>> {
-    let (name, s) = find(lake, name).await?.with_context(|| format!("relation \"{name}\" does not exist (CREATE SEQUENCE {name})"))?;
+    let (name, s) = find(lake, name).await?.ok_or_else(|| crate::codes::coded("42P01", format!("relation \"{name}\" does not exist (CREATE SEQUENCE {name})")))?;
+    gone_with(lake, &name, &s).await?;
     may_write(&name)?;
     let base = (shape(&s.declared)?.cache as u64).max(if lake.to.get().is_some() { FIRST } else { 1 });
     let mut blocks = lake.sequences.lock().await; // (one refill at a time: the others wait for it)
@@ -735,7 +769,8 @@ pub async fn next(lake: &Lake, name: &str, n: usize) -> Result<Vec<i64>> {
 /// `setval('s', value [, is_called])`: the sequence's next value is the one after `value` (or
 /// `value` itself when not called). Every node's block from before goes.
 async fn set(lake: &Lake, name: &str, value: i64, called: bool) -> Result<i64> {
-    let (name, _) = find(lake, name).await?.with_context(|| format!("relation \"{name}\" does not exist"))?;
+    let (name, s) = find(lake, name).await?.ok_or_else(|| crate::codes::coded("42P01", format!("relation \"{name}\" does not exist")))?;
+    gone_with(lake, &name, &s).await?;
     may_write(&name)?;
     submit(lake, Op::Set { name: name.clone(), value, called }).await?;
     lake.sequences.lock().await.remove(&name);
@@ -755,15 +790,46 @@ fn may_write(name: &str) -> Result<()> {
 pub fn register(ctx: &SessionContext, lake: Arc<Lake>) {
     let session = crate::temp::current();
     ctx.register_udf(AsyncScalarUDF::new(Arc::new(Counter { lake: lake.clone(), setval: false, session: session.clone(), signature: Signature::string(1, Volatility::Volatile) })).into_scalar_udf());
+    ctx.register_udf(AsyncScalarUDF::new(Arc::new(Current { lake: lake.clone(), session: session.clone(), signature: Signature::string(1, Volatility::Volatile) })).into_scalar_udf());
     ctx.register_udf(AsyncScalarUDF::new(Arc::new(Counter { lake, setval: true, session: session.clone(), signature: Signature::variadic_any(Volatility::Volatile) })).into_scalar_udf());
-    let current = move |args: &[ColumnarValue]| -> DfResult<ColumnarValue> {
-        let Some(session) = crate::temp::current().or(session.clone()) else { return exec_err!("currval is a session's: a Postgres connection's, or a client's (x-pondra-session)") };
-        let names = args[0].to_array(1)?;
+}
+
+/// `currval(name)`: the session's last `nextval` of the sequence. Asynchronous, so a sequence whose
+/// table is gone is refused as `nextval` refuses it (`seq::check_current`).
+#[derive(Debug)]
+struct Current {
+    lake: Arc<Lake>,
+    session: Option<String>,
+    signature: Signature,
+}
+
+impl PartialEq for Current {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.lake, &other.lake) }
+}
+impl Eq for Current {}
+impl std::hash::Hash for Current {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) { "currval".hash(h) }
+}
+
+impl ScalarUDFImpl for Current {
+    fn name(&self) -> &str { "currval" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _: &[DataType]) -> DfResult<DataType> { Ok(DataType::Int64) }
+    fn invoke_with_args(&self, _: ScalarFunctionArgs) -> DfResult<ColumnarValue> { exec_err!("currval is asynchronous") }
+}
+
+#[async_trait::async_trait]
+impl AsyncScalarUDFImpl for Current {
+    async fn invoke_async_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let Some(session) = crate::temp::current().or(self.session.clone()) else { return exec_err!("currval is a session's: a Postgres connection's, or a client's (x-pondra-session)") };
+        let names = args.args[0].to_array(args.number_rows)?;
         let names = datafusion::arrow::compute::cast(&names, &DataType::Utf8)?;
         let names = names.as_string::<i32>();
+        let err = |e: anyhow::Error| datafusion::error::DataFusionError::External(e.into());
         let mut out = vec![];
         for i in 0..names.len() {
             let name = names.value(i).to_lowercase();
+            check_current(&self.lake, &object_of(&name)).await.map_err(err)?;
             let got = crate::temp::with(&session, false, |x| Ok(x.currval.get(&name).copied())).ok().flatten();
             match got {
                 Some(v) => out.push(v),
@@ -771,8 +837,7 @@ pub fn register(ctx: &SessionContext, lake: Arc<Lake>) {
             }
         }
         Ok(ColumnarValue::Array(Arc::new(Int64Array::from(out))))
-    };
-    ctx.register_udf(create_udf("currval", vec![DataType::Utf8], DataType::Int64, Volatility::Volatile, Arc::new(current)));
+    }
 }
 
 /// `nextval(name)`, or `setval(name, value [, is_called])`.

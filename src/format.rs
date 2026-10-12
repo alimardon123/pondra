@@ -23,7 +23,9 @@ use std::time::Duration;
 /// The newest format this build reads and writes. 2: a materialized view that finishes its answers
 /// as it is read (`TableMeta::finish`, ADR-055) or runs its query again (`View::rerun`, ADR-056, 057).
 /// 3: the lake's own keys sealed by its master key (`users::Kept`, ADR-058).
-pub const FORMAT: u32 = 3;
+/// 4: a grant on another database (`users::On::Database`, `GRANT CLONE ON DATABASE`), which a node
+/// from before can't read: it took the lake for one nobody signs in to.
+pub const FORMAT: u32 = 4;
 
 /// The format every lake gets without asking: the mark itself (`raise`).
 const BASE: u32 = 1;
