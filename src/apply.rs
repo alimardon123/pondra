@@ -1085,7 +1085,7 @@ async fn claim_to_record(app: &App, p: &Project, plan: &Plan, ask: &Ask, who: Wh
     // (the leader's answer keeps `keep`'s old key, "deploy": see there)
     record.n = claimed["deploy"].as_u64().context("an apply number")?;
     keep_files(&app.lake, record.n, &ask.files).await?;
-    let alive = tokio::spawn(beat(app.clone(), record.n));
+    let alive = crate::panics::task(beat(app.clone(), record.n));
     let out = statements(app, p, plan, &mut record, who, ask.test, &ask.secrets).await;
     alive.abort();
     if let Err(e) = &out {

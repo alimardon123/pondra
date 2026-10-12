@@ -321,7 +321,7 @@ impl Kept {
     }
 }
 
-static ANSWERS: LazyLock<Mutex<Answers>> = LazyLock::new(|| Mutex::new(Answers { kept: lru::LruCache::unbounded(), bytes: 0 }));
+crate::per_node!(static ANSWERS: Mutex<Answers> = Mutex::new(Answers { kept: lru::LruCache::unbounded(), bytes: 0 }); clear = |m| { let mut a = m.lock().unwrap_or_else(|e| e.into_inner()); a.kept.clear(); a.bytes = 0; });
 
 impl Answers {
     fn get(&mut self, key: &[u8]) -> Option<&Kept> {
@@ -348,7 +348,7 @@ impl Answers {
     }
 
     fn keep(&mut self, key: Vec<u8>, answer: Kept, secs: u64) {
-        static BUDGET: LazyLock<usize> = LazyLock::new(|| std::env::var("PONDRA_FUNCTION_CACHE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(256usize) << 20);
+        static BUDGET: LazyLock<usize> = LazyLock::new(|| crate::env::or("PONDRA_FUNCTION_CACHE_MB", 256usize) << 20);
         self.bytes += answer.size() + key.len();
         if let Some((k, (_, old))) = self.kept.push(key, (std::time::Instant::now() + std::time::Duration::from_secs(secs), answer)) {
             self.bytes -= old.size() + k.len(); // (the key's answer before)

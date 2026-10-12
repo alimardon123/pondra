@@ -215,7 +215,7 @@ const LOAD_KNOWN: &[&str] = &["format", "header", "delim", "sep", "delimiter", "
 /// read once.
 fn retention_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| std::env::var("PONDRA_LOAD_RETENTION_SECS").ok().and_then(|v| v.parse::<u64>().ok()).map_or(64 * 24 * 3600 * 1000, |s| s * 1000))
+    *MS.get_or_init(|| crate::env::parse::<u64>("PONDRA_LOAD_RETENTION_SECS").map_or(64 * 24 * 3600 * 1000, |s| s * 1000))
 }
 
 /// A file loaded into a table, as its job names it (`load:` and this JSON). The folder, not the

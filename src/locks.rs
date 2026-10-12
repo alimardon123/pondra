@@ -312,12 +312,12 @@ impl Table {
 
 // ---------------------------------------------------------------- the lakes' tables
 
-static TABLES: LazyLock<Mutex<HashMap<String, Arc<Mutex<Table>>>>> = LazyLock::new(Default::default);
+crate::per_node!(static TABLES: Mutex<HashMap<String, Arc<Mutex<Table>>>> = Default::default());
 
 /// How long a holder's lock lasts without a request from it (`PONDRA_LOCK_LEASE_SECS`, 60). A transaction
 /// renews its locks every third of it (`txn::upkeep`), so an idle session keeps them while it lives.
 pub fn lease() -> Duration {
-    Duration::from_secs(std::env::var("PONDRA_LOCK_LEASE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60))
+    Duration::from_secs(crate::env::or("PONDRA_LOCK_LEASE_SECS", 60))
 }
 
 fn table(lake: &str) -> Arc<Mutex<Table>> {
@@ -819,7 +819,7 @@ impl Drop for Gate {
 }
 
 /// Set for a check that runs without the gate (`PONDRA_TEST_NO_GATE`, read once): `close` then closes nothing.
-static NO_GATE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("PONDRA_TEST_NO_GATE").is_some());
+static NO_GATE: LazyLock<bool> = LazyLock::new(|| crate::env::is_set("PONDRA_TEST_NO_GATE"));
 
 /// A writer that changes rows under the lake's lock (a transaction's COMMIT, a change, a file commit that takes rows back)
 /// closes `tables` before it reads or checks them (ADR-067 §7). No autocommitted write enters them meanwhile, and the

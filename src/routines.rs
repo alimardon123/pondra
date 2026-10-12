@@ -533,7 +533,7 @@ pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
 /// This lake's functions and procedures, by name: read again only after a commit (every query asks).
 pub async fn listed(lake: &Lake) -> Result<Arc<HashMap<String, Routine>>> {
     type Seen = Mutex<HashMap<String, (u64, Arc<HashMap<String, Routine>>)>>;
-    static SEEN: std::sync::LazyLock<Seen> = std::sync::LazyLock::new(Default::default);
+    crate::per_node!(static SEEN: Seen = Default::default());
     let version = lake.cat.version();
     if let (Some(v), Some((at, all))) = (version, SEEN.lock().unwrap().get(&lake.url)) {
         if *at == v {
@@ -1970,12 +1970,12 @@ fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a s
         if crate::workspace::is_run(name) {
             let args = args.to_vec();
             crate::workspace::arguments(app, &args).await?; // (its mistakes: said now, not only in the log)
-            tokio::spawn(crate::auth::carried(async move {
+            crate::panics::task(crate::auth::carried(async move {
                 let _ = Box::pin(crate::workspace::run(&app2, &args, who, job, Some(id2))).await;
             }));
         } else {
             let (local, r, row) = Box::pin(prepared(app, name, args, who)).await?;
-            tokio::spawn(crate::auth::carried(async move {
+            crate::panics::task(crate::auth::carried(async move {
                 let _ = Box::pin(run(&app2, local, r, row, who, job, Some(id2))).await; // (its outcome: the run log's)
             }));
         }

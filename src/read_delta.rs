@@ -11,7 +11,7 @@ use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::common::ScalarValue;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 /// The reader features read here (Delta's protocol, reader version 3).
 const FEATURES: &[&str] = &["columnMapping", "deletionVectors", "timestampNtz", "typeWidening", "typeWidening-preview", "v2Checkpoint", "vacuumProtocolCheck"];
@@ -56,9 +56,10 @@ fn logical(a: &Value) -> String {
     format!("{}|{}{}@{}", a["path"].as_str().unwrap_or_default(), dv["storageType"].as_str().unwrap_or_default(), dv["pathOrInlineDv"].as_str().unwrap_or_default(), dv["offset"])
 }
 
-/// Logs already replayed, by table and version: a commit, once written, never changes, so the
-/// next statement reads only the commits after the newest it knows.
-static SEEN: LazyLock<Mutex<lru::LruCache<String, Arc<Log>>>> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(16).unwrap())));
+crate::per_node!(
+    /// Logs already replayed, by table and version: a commit, once written, never changes, so the
+    /// next statement reads only the commits after the newest it knows.
+    static SEEN: Mutex<lru::LruCache<String, Arc<Log>>> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(16).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
 
 /// The table at `root` (its latest version, or `version`), as a table of files.
 pub async fn resolve(lake: &Lake, root: &str, version: Option<i64>) -> Result<TableMeta> {

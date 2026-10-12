@@ -35,7 +35,7 @@ pub struct Split {
 }
 
 /// Partitions bigger than this (and than twice the average) are shared out (`PONDRA_SKEW_MB`, 64).
-fn skew_bytes() -> u64 { std::env::var("PONDRA_SKEW_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(64) << 20 }
+fn skew_bytes() -> u64 { crate::env::or("PONDRA_SKEW_MB", 64u64) << 20 }
 
 /// The joins below `region` (what the nodes run: the plan below the coordinator's gather) a
 /// shuffle may share out partitions of. `exchange(p)`: which exchange `p` is, if it is one, and

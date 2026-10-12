@@ -17,7 +17,7 @@ use base64::{engine::general_purpose::STANDARD as B64, engine::general_purpose::
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 pub fn user_key(name: &str) -> String { format!("u/{name}") }
 pub const KEYS: &str = "z/auth"; // (the lake's own keys: sessions' signing key, and the nodes' key; `k/` is streaming tasks')
@@ -798,7 +798,7 @@ fn sealed(k: &Keys) -> Result<Kept> {
     Ok(Kept::Sealed { sealed, key })
 }
 
-static KEYS_HERE: LazyLock<Mutex<HashMap<String, Keys>>> = LazyLock::new(Default::default);
+crate::per_node!(static KEYS_HERE: Mutex<HashMap<String, Keys>> = Default::default());
 
 async fn keys(lake: &Lake) -> Result<Keys> {
     if let Some(k) = KEYS_HERE.lock().unwrap().get(&lake.url) {
@@ -875,10 +875,12 @@ pub async fn seal_keys(lake: &Lake) -> Result<()> {
     Ok(())
 }
 
-/// Lakes read as signed (`signed`): kept for good, since a lake that was served with tokens stays so.
-static SIGNED_LAKES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
-/// Lakes read as unsigned, and when (as `any` remembers its answers).
-static UNSIGNED_LAKES: LazyLock<Mutex<HashMap<String, (Option<u64>, std::time::Instant)>>> = LazyLock::new(Default::default);
+crate::per_node!(
+    /// Lakes read as signed (`signed`): kept for good, since a lake that was served with tokens stays so.
+    static SIGNED_LAKES: Mutex<HashSet<String>> = Default::default());
+crate::per_node!(
+    /// Lakes read as unsigned, and when (as `any` remembers its answers).
+    static UNSIGNED_LAKES: Mutex<HashMap<String, (Option<u64>, std::time::Instant)>> = Default::default());
 
 /// Leader, with a token set: the lake remembers it (once; nothing clears it, `pondra token` is the way back
 /// in). A node started without tokens on such a lake is never open, and makes no user (`signed`).
@@ -935,7 +937,7 @@ pub async fn node_key_made(lake: &Lake) -> Option<String> {
 }
 
 /// How long a signed-in session lasts: `PONDRA_SESSION_HOURS` (12).
-fn session_ms() -> u64 { std::env::var("PONDRA_SESSION_HOURS").ok().and_then(|h| h.parse::<f64>().ok()).map_or(12 * 3_600_000, |h| (h * 3_600_000.0) as u64) }
+fn session_ms() -> u64 { crate::env::parse::<f64>("PONDRA_SESSION_HOURS").map_or(12 * 3_600_000, |h| (h * 3_600_000.0) as u64) }
 
 /// `data` signed with the lake's key (base64url): what `vend.rs` puts in a file's link.
 pub async fn sign(lake: &Lake, data: &[u8]) -> Result<String> { Ok(B64U.encode(hmac256(&B64.decode(keys(lake).await?.session)?, data))) }
@@ -956,9 +958,10 @@ async fn session_user(lake: &Lake, token: &str) -> Option<String> {
     (v["x"].as_u64()? > crate::log::now_ms()).then(|| v["u"].as_str().map(String::from))?
 }
 
-/// Passwords checked lately (by their hash with the user's name): a minute, so a client that sends
-/// its password with every request (HTTP Basic) pays for SCRAM's hashing once.
-static VERIFIED: LazyLock<Mutex<HashMap<String, std::time::Instant>>> = LazyLock::new(Default::default);
+crate::per_node!(
+    /// Passwords checked lately (by their hash with the user's name): a minute, so a client that sends
+    /// its password with every request (HTTP Basic) pays for SCRAM's hashing once.
+    static VERIFIED: Mutex<HashMap<String, std::time::Instant>> = Default::default());
 
 /// Is this `user`'s password? (Its verifier checked, or remembered as checked.)
 pub async fn password_ok(lake: &Lake, user: &str, password: &str) -> bool {
@@ -1055,8 +1058,9 @@ impl Access {
     fn writes(&self) -> bool { self.grants.iter().any(|g| ["insert", "update", "delete"].contains(&g.privilege.as_str())) }
 }
 
-/// Users' access, by name, as of a catalog version (grants change seldom: a check is a lookup).
-static ACCESS: LazyLock<Mutex<HashMap<String, (Option<u64>, std::time::Instant, Arc<Access>, bool)>>> = LazyLock::new(Default::default);
+crate::per_node!(
+    /// Users' access, by name, as of a catalog version (grants change seldom: a check is a lookup).
+    static ACCESS: Mutex<HashMap<String, (Option<u64>, std::time::Instant, Arc<Access>, bool)>> = Default::default());
 
 fn forget() {
     ACCESS.lock().unwrap().clear();
@@ -1141,19 +1145,18 @@ pub fn quota() -> Quota {
     // (a session that set `statement_timeout` keeps its own, 0 included; one that set none gets the node's default)
     let session = match crate::settings::shown("statement_timeout") {
         Some(v) => pg_duration(&v),
-        None => std::env::var("PONDRA_STATEMENT_TIMEOUT").ok().and_then(|v| pg_duration(&v)),
+        None => crate::env::get("PONDRA_STATEMENT_TIMEOUT").and_then(|v| pg_duration(&v)),
     };
     let Some((user, a)) = p.and_then(|p| Some((p.name, p.access?))) else { return Quota { turns: None, timeout: session, user: String::new(), by_session: session.is_some() } };
-    let env = |v: &str| std::env::var(v).ok().and_then(|n| n.parse::<u64>().ok());
-    let most = a.limits.max_queries.map(u64::from).or_else(|| env("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
-    let timeout = a.limits.timeout_secs.or_else(|| env("PONDRA_USER_TIMEOUT")).filter(|s| *s > 0).map(std::time::Duration::from_secs);
+    let most = a.limits.max_queries.map(u64::from).or_else(|| crate::env::parse::<u64>("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
+    let timeout = a.limits.timeout_secs.or_else(|| crate::env::parse::<u64>("PONDRA_USER_TIMEOUT")).filter(|s| *s > 0).map(std::time::Duration::from_secs);
     // (the shorter of the session's and the user's is in force)
     let (timeout, by_session) = match (session, timeout) {
         (Some(s), Some(t)) if s >= t => (Some(t), false),
         (Some(s), _) => (Some(s), true),
         (None, t) => (t, false),
     };
-    static TURNS: LazyLock<Mutex<HashMap<String, (u32, Arc<tokio::sync::Semaphore>)>>> = LazyLock::new(Default::default);
+    crate::per_node!(static TURNS: Mutex<HashMap<String, (u32, Arc<tokio::sync::Semaphore>)>> = Default::default());
     let turns = most.map(|n| {
         let mut all = TURNS.lock().unwrap();
         let e = all.entry(user.clone()).or_insert_with(|| (n, Arc::new(tokio::sync::Semaphore::new(n as usize))));
@@ -1223,7 +1226,7 @@ pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::wri
     }
 }
 
-static ANY: LazyLock<Mutex<HashMap<String, (Option<u64>, std::time::Instant, bool)>>> = LazyLock::new(Default::default);
+crate::per_node!(static ANY: Mutex<HashMap<String, (Option<u64>, std::time::Instant, bool)>> = Default::default());
 
 /// Does the lake have a user who signs in (a password or a token)? Then a request with nothing
 /// signed is refused, as with a token set.
@@ -1263,6 +1266,10 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) ->
     let (user, password) = basic.split_once(':')?;
     sign_in(lake, auth, user, password).await
 }
+
+/// Is this sign-in's password a token, by `sign_in`'s own rule (a token's name, or a user's `pt_…`)? A token
+/// may cross a plain connection under `PONDRA_TLS=optional`, a password never (`tls::may_send_password`).
+pub fn is_token(user: &str, password: &str) -> bool { BUILT_IN.contains(&user) || password.starts_with("pt_") }
 
 /// A name and a password (or a token as the password): the Postgres, Kafka and Flight doors' and
 /// HTTP Basic's. The tokens' names (`admin`, `writer`, `reader`) take their tokens.

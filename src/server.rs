@@ -422,7 +422,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let basic_by = header.as_deref().filter(|h| h.starts_with("Basic ")).map(|h| (basic_user(Some(h)), client));
     if let Some((name, ip)) = &basic_by {
         if let Some(wait) = crate::auth::guessing(*ip, name) {
-            let why = guessing_says(name, wait);
+            let why = crate::auth::guessing_says(name, wait);
             crate::audit::refused(&app, name, "http", from, &format!("{} {}", req.method(), req.uri().path()), &why);
             tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does: refused at once, guesses would cost nothing)
             return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
@@ -507,9 +507,6 @@ fn basic_user(header: Option<&str>) -> String {
     b.and_then(|b| String::from_utf8(b).ok()).and_then(|up| up.split_once(':').map(|(u, _)| u.to_string())).unwrap_or_default()
 }
 
-/// What a sign-in refused for its failures is told, with how long to wait (`auth::guessing`).
-fn guessing_says(user: &str, wait: u64) -> String { format!("too many failed sign-ins for {user} from this address: wait {wait} s") }
-
 /// `POST /login` `{"user", "password"}`: a session (`{"token": "ps_…", "until": ms}`) to send as
 /// `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`); the console's sign-in.
 async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
@@ -520,7 +517,7 @@ async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::e
     }
     let ip = Some(peer.client(&headers));
     if let Some(wait) = crate::auth::guessing(ip, user) {
-        let why = guessing_says(user, wait);
+        let why = crate::auth::guessing_says(user, wait);
         crate::audit::refused(&app, user, "http", Some(peer.addr), "sign in", &why);
         tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does)
         return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
@@ -608,7 +605,7 @@ struct BeatParams {
 
 async fn beat(State(app): State<App>, Query(p): Query<BeatParams>, headers: axum::http::HeaderMap) -> Result<Json<(u64, Vec<String>)>, Response> {
     // Test hook: followers listed in the file $PONDRA_DROP_BEATS get no answer (a broken link to the leader).
-    let dropped = std::env::var("PONDRA_DROP_BEATS").map(|f| std::fs::read_to_string(f).unwrap_or_default()).unwrap_or_default();
+    let dropped = crate::env::get("PONDRA_DROP_BEATS").map(|f| std::fs::read_to_string(f).unwrap_or_default()).unwrap_or_default();
     if dropped.lines().any(|a| a == p.from) {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
@@ -723,8 +720,8 @@ struct Turns {
 
 static TURNS: std::sync::LazyLock<Turns> = std::sync::LazyLock::new(|| {
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
-    let most = std::env::var("PONDRA_QUERIES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or((4 * cores).max(16)).max(1);
-    let wait = std::env::var("PONDRA_QUEUE_SECS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(60.0);
+    let most = crate::env::or::<usize>("PONDRA_QUERIES", (4 * cores).max(16)).max(1);
+    let wait = crate::env::or::<f64>("PONDRA_QUEUE_SECS", 60.0);
     Turns { turns: tokio::sync::Semaphore::new(most), most, wait: Duration::from_secs_f64(wait.max(0.0)) }
 });
 
@@ -948,7 +945,7 @@ impl App {
         }
         let published = start.elapsed();
         // Retention every 10 s is plenty, and keeps its deletes off the path to fresh Delta versions.
-        static EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        crate::per_node!(static EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
         let now = crate::log::now_ms();
         if now - EXPIRED.load(std::sync::atomic::Ordering::Relaxed) >= 10_000 {
             EXPIRED.store(now, std::sync::atomic::Ordering::Relaxed);
@@ -1244,7 +1241,7 @@ struct SqlParams {
 /// Is this request from whoever started the node here (the shell: `PONDRA_OWNER_KEY`)? Then its
 /// SQL may read files on this machine, as `pondra sql` may (invariant 21: nobody else's).
 fn owner(headers: &axum::http::HeaderMap) -> bool {
-    static KEY: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("PONDRA_OWNER_KEY").ok().filter(|k| k.len() >= 16));
+    static KEY: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| crate::env::get("PONDRA_OWNER_KEY").filter(|k| k.len() >= 16));
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     crate::auth::lent(token).is_some_and(|l| l.1) // (a Python procedure the owner called)
         || KEY.as_deref().is_some_and(|k| headers.get("x-pondra-owner").is_some_and(|h| aws_lc_rs::constant_time::verify_slices_are_equal(h.as_bytes(), k.as_bytes()).is_ok()))
@@ -1474,7 +1471,7 @@ fn streams(format: Option<&str>) -> bool { !matches!(format, Some("table" | "typ
 /// Is an answer big enough to send in pieces: `PONDRA_STREAM_MB` (8) of Arrow, read once. 0 sends
 /// every answer in pieces (the tests compare the two ways).
 fn big(batches: &[RecordBatch]) -> bool {
-    static MB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("PONDRA_STREAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(8));
+    static MB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| crate::env::or("PONDRA_STREAM_MB", 8));
     let mut counted = datafusion::common::utils::memory::RecordBatchMemoryCounter::new(); // (as `query::collect` counts it)
     batches.iter().map(|b| counted.count_batch(b)).sum::<usize>() >= *MB << 20
 }

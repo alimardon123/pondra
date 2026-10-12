@@ -363,12 +363,14 @@ pub fn without_column(m: &mut TableMeta, stored: &str) { m.constraints.retain(|c
 
 // ---------------------------------------------------------------- the loading doors
 
-/// Each lake's lock, as its node's `App` holds it: `change::run` takes that lock for every change of
-/// the lake, so a checked append takes it too. `server::router` lends it (`share_lock`), keyed by the
-/// lake itself, so a checked append finds its own lake's lock and never another's. (A process serves
-/// one lake today; keyed anyway, so two lakes could not share one lock.) Weak, so a lake that is gone
-/// drops out of the list.
-static LOCKS: std::sync::Mutex<Vec<(Weak<Lake>, Arc<tokio::sync::Mutex<()>>)>> = std::sync::Mutex::new(Vec::new());
+crate::per_node!(
+    /// Each lake's lock, as its node's `App` holds it: `change::run` takes that lock for every change of
+    /// the lake, so a checked append takes it too. `server::router` lends it (`share_lock`), keyed by the
+    /// lake itself, so a checked append finds its own lake's lock and never another's. (A process serves
+    /// one lake today; keyed anyway, so two lakes could not share one lock.) Weak, so a lake that is gone
+    /// drops out of the list.
+    static LOCKS: std::sync::Mutex<Vec<(Weak<Lake>, Arc<tokio::sync::Mutex<()>>)>> = std::sync::Mutex::new(Vec::new())
+);
 
 /// This node's checked appends, one at a time: each is answered before the next is sent, so a
 /// producer's pipelined batches reach the leader in the order they were queued (invariant 29).
@@ -412,7 +414,7 @@ pub fn queue(lake: Arc<Lake>, meta: &TableMeta, table: String, src: Src, batch: 
 pub async fn leader(lake: Arc<Lake>, seq: Arc<Sequencer>, table: String, src: Src, batch: RecordBatch) -> Result<Ack> {
     // (no lock yet: this process's router isn't made, so the node is still starting; a retry reaches it)
     let lock = lock_of(&lake).ok_or_else(|| anyhow::anyhow!("{table}: the node is still starting, catching up with its leader: try again"))?;
-    let task = tokio::spawn(crate::panics::door(async move {
+    let task = crate::panics::task(crate::panics::door(async move {
         let _one = lock.lock().await;
         append(&lake, &seq, &table, src, batch).await
     }));

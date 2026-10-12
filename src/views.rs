@@ -807,8 +807,8 @@ pub async fn emit_all(lake: &Lake, log: &crate::log::Log) -> Result<()> {
 async fn newest(lake: &Lake, table: &str, time: &str) -> Result<Option<i64>> {
     use datafusion::arrow::{array::AsArray, compute::{cast, max}, datatypes::{DataType, TimeUnit, TimestampMicrosecondType}};
     use datafusion::common::ScalarValue;
-    use std::sync::{LazyLock, Mutex};
-    static SEEN: LazyLock<Mutex<std::collections::HashMap<String, (u64, Option<i64>)>>> = LazyLock::new(Default::default);
+    use std::sync::Mutex;
+    crate::per_node!(static SEEN: Mutex<std::collections::HashMap<String, (u64, Option<i64>)>> = Default::default());
     let key = format!("{}|{table}|{time}", lake.url);
     let meta: TableMeta = lake.cat.get(&table_key(table)).await?.with_context(|| format!("no table {table}"))?;
     let stored = meta.stored(time).unwrap_or(time).to_string(); // (files' ranges know it by its stored name: ADR-022)
@@ -844,8 +844,8 @@ async fn newest(lake: &Lake, table: &str, time: &str) -> Result<Option<i64>> {
 /// are kept too; off by default, since a table loaded in batches of older rows would see its next
 /// batch counted as late.
 pub(crate) async fn watermark(lake: &Lake, table: &str, time: &str, lateness_secs: u64, idle_secs: Option<u64>) -> Result<Option<i64>> {
-    use std::sync::{LazyLock, Mutex};
-    static SINCE: LazyLock<Mutex<std::collections::HashMap<String, (i64, u64)>>> = LazyLock::new(Default::default);
+    use std::sync::Mutex;
+    crate::per_node!(static SINCE: Mutex<std::collections::HashMap<String, (i64, u64)>> = Default::default());
     let Some(newest) = newest(lake, table, time).await? else { return Ok(None) };
     let wm = newest - (lateness_secs * 1_000_000) as i64;
     let Some(idle) = idle_secs else { return Ok(Some(wm)) };
@@ -1116,8 +1116,8 @@ pub struct Inline {
     pub unbounded: Vec<(String, View)>,                             // views whose filling doesn't end yet
 }
 
-static INLINE: std::sync::Mutex<BTreeMap<String, std::sync::Arc<Inline>>> = std::sync::Mutex::new(BTreeMap::new());
-static BOUNDED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new()); // (fills this process set `upto` for)
+crate::per_node!(static INLINE: std::sync::Mutex<BTreeMap<String, std::sync::Arc<Inline>>> = std::sync::Mutex::new(BTreeMap::new()));
+crate::per_node!(static BOUNDED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new())); // (fills this process set `upto` for)
 
 pub fn forget(lake: &Lake) { INLINE.lock().unwrap().remove(&lake.url); }
 

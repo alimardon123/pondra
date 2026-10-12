@@ -21,7 +21,7 @@ use slatedb::config::{CompactorOptions, DbReaderOptions, GarbageCollectorDirecto
 use slatedb::{Db, DbReader, DbReaderMode, ErrorKind, WriteBatch, WriteHandle};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -411,7 +411,7 @@ pub fn json<T: Serialize>(v: &T) -> Vec<u8> { serde_json::to_vec(v).expect("seri
 
 /// The open formats a new table is published in unless it says otherwise (the node's `--publish`).
 pub fn default_publish() -> Vec<String> {
-    std::env::var("PONDRA_PUBLISH").unwrap_or_default().split(',').filter(|f| !f.is_empty()).map(String::from).collect()
+    crate::env::get("PONDRA_PUBLISH").unwrap_or_default().split(',').filter(|f| !f.is_empty()).map(String::from).collect()
 }
 
 const TAIL_BYTES: usize = 256 << 20; // decoded log segments kept in memory, per node
@@ -422,14 +422,14 @@ const RECENT_BYTES: usize = 64 << 20; // …within this much memory (past it, a 
 // follower reads from its own view until it has caught up, instead of the leader buffering more)
 
 /// Query read cache in memory, MB (env PONDRA_CACHE_MB, default 1024).
-fn cache_mb() -> usize { std::env::var("PONDRA_CACHE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1024) }
+fn cache_mb() -> usize { crate::env::or("PONDRA_CACHE_MB", 1024) }
 
 /// The local SSD tier for a lake on object storage (`serve --cache-dir/--cache-gb`, or env
 /// PONDRA_CACHE_DIR / PONDRA_CACHE_GB): under the temp dir, 20 GB, or a quarter of the free disk
 /// if that is less (a notebook's sandbox may have a few GB). 0 GB turns it off.
 fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
-    let dir = std::env::var("PONDRA_CACHE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("pondra-cache"));
-    let bytes = match std::env::var("PONDRA_CACHE_GB").ok().and_then(|v| v.parse::<u64>().ok()) {
+    let dir = crate::env::get("PONDRA_CACHE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("pondra-cache"));
+    let bytes = match crate::env::parse::<u64>("PONDRA_CACHE_GB") {
         Some(gb) => gb << 30,
         None => space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
     };
@@ -494,7 +494,7 @@ impl std::fmt::Debug for Lake {
 /// hash tables and sort buffers, not the Parquet decoding and the batches in flight around them,
 /// so the node's own memory runs ahead of this number. The hot columns come out of it too.)
 pub fn memory_limit() -> usize {
-    let gb = std::env::var("PONDRA_MEMORY_GB").ok().and_then(|g| g.parse::<f64>().ok());
+    let gb = crate::env::parse::<f64>("PONDRA_MEMORY_GB");
     gb.map(|g| (g * (1u64 << 30) as f64) as usize).or_else(|| ram().map(|r| r / 3)).unwrap_or(4 << 30)
 }
 
@@ -590,7 +590,7 @@ pub struct Reach {
     pub secret: Option<String>, // (the bucket secret's name: who may use it reads the lake here, `users::across`)
 }
 
-static REACH: std::sync::RwLock<BTreeMap<String, Reach>> = std::sync::RwLock::new(BTreeMap::new());
+crate::per_node!(static REACH: std::sync::RwLock<BTreeMap<String, Reach>> = std::sync::RwLock::new(BTreeMap::new()));
 
 /// Say how `url` (a lake) is reached. Asked again (an attachment and a branch of it in one
 /// process), what the new one leaves out is kept, and read-only stays read-only.
@@ -610,7 +610,7 @@ pub fn reaches() -> String { serde_json::to_string(&*REACH.read().unwrap()).unwr
 
 /// The places the process that started this one could reach (`REACH_VAR`), as it reached them.
 pub fn inherit() {
-    let Ok(text) = std::env::var(REACH_VAR) else { return };
+    let Some(text) = crate::env::get(REACH_VAR) else { return };
     match serde_json::from_str::<BTreeMap<String, Reach>>(&text) {
         Ok(all) => all.into_iter().for_each(|(url, r)| reach_by(&url, r)),
         Err(e) => eprintln!("{REACH_VAR}: {e}"),
@@ -1203,7 +1203,7 @@ impl Lake {
             whole: u64, // …to here is in `segs`
             segs: BTreeMap<u64, Arc<Segment>>,
         }
-        static KNOWN: LazyLock<Mutex<std::collections::HashMap<String, Known>>> = LazyLock::new(Default::default);
+        crate::per_node!(static KNOWN: Mutex<std::collections::HashMap<String, Known>> = Default::default());
         let now = self.visible();
         let from = match KNOWN.lock().unwrap().get(&self.url) {
             Some(k) if k.start <= after + 1 && k.whole >= after => k.whole + 1, // (only what is new)
@@ -1329,6 +1329,7 @@ pub struct Catalog {
     streamed: AtomicU64,          // the last commit streamed to us; with the view: the whole lake
     hold: AtomicU64,              // commits before this one never arrived: read from the view alone
     follows: bool,                // follower / read-only node that gets the commit stream
+    upkeep: Option<Upkeep>,       // leader: the catalog's compactor and collector, stopped by `close`
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
     metas: Mutex<lru::LruCache<String, (u64, Arc<TableMeta>)>>, // tables' entries as parsed, by the commit that wrote them (`meta`)
@@ -1355,7 +1356,7 @@ type Write = (Arc<WriteHandle>, Arc<Delta>, oneshot::Sender<()>);
 
 enum Db_ {
     Writer(Db),
-    Reader(DbReader),
+    Reader(Arc<DbReader>), // (shared, so a catalog let go can still close it: `Drop for Catalog`)
 }
 
 /// One committed catalog write.
@@ -1483,13 +1484,14 @@ fn field(f: &mut Bytes) -> Result<Bytes> {
 
 /// A cold start's steps and their times, with `PONDRA_TRACE_START` (`tools/cold_trace.sh`, C5).
 pub fn trace(what: &str, since: std::time::Instant) {
-    if std::env::var_os("PONDRA_TRACE_START").is_some() {
+    if crate::env::is_set("PONDRA_TRACE_START") {
         eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
     }
 }
 
-/// Has the node begun to serve? (Then the catalog's upkeep starts: `upkeep`.)
-static SERVING: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::Sender::new(false));
+crate::per_node!(
+    /// Has the node begun to serve? (Then the catalog's upkeep starts: `upkeep`.)
+    static SERVING: watch::Sender<bool> = watch::Sender::new(false));
 
 /// The node serves now (`main.rs`).
 pub fn serving() { SERVING.send_replace(true); }
@@ -1508,20 +1510,69 @@ fn blocks() -> Arc<dyn slatedb::db_cache::DbCache> {
 /// The catalog's compactor and garbage collector, as SlateDB runs them beside a writer, started
 /// once the node serves (or after 10 s: a `pondra sql` writer never does), so a cold start waits
 /// for neither (C5). A failure in either stops the node, as one in the writer would.
-fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions, local: bool) {
-    crate::panics::spawn(async move {
+fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions, local: bool) -> Upkeep {
+    let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_options(compactor).build();
+    let gc = slatedb::GarbageCollectorBuilder::new("catalog", store.clone()).with_options(gc).build();
+    let (c, g) = (compactor.clone(), gc.clone());
+    let started = crate::panics::spawn(async move {
         let _ = tokio::time::timeout(Duration::from_secs(10), SERVING.subscribe().wait_for(|s| *s)).await;
         if local {
-            tokio::spawn(unpin(store.clone()));
+            crate::panics::task(unpin(store));
         }
-        let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_options(compactor).build();
-        let gc = slatedb::GarbageCollectorBuilder::new("catalog", store).with_options(gc).build();
-        let (a, b) = tokio::join!(compactor.run(), gc.run());
+        let (a, b) = tokio::join!(c.run(), g.run());
         if let Err(e) = a.and(b) {
             eprintln!("stopping: the catalog's compactor or garbage collector failed: {e}");
             std::process::abort();
         }
     });
+    // (SlateDB doesn't export the collector's type, so how the two stop is kept as a future to run)
+    let stop = Box::pin(async move {
+        let _ = tokio::join!(compactor.stop(), gc.stop());
+    });
+    Upkeep(Mutex::new(Some((started, stop))))
+}
+
+/// A catalog let go stops what SlateDB runs for it: a reader's polling, a writer's flushing and its
+/// upkeep. SlateDB's tasks outlive its handles, so a lake opened for a moment (a branch's base, a
+/// lake detached, a node stopped in a host's process) went on reading its manifest four times a
+/// second for the life of the process. (`close` does the same and waits for it: `Node::stop`.)
+impl Drop for Catalog {
+    fn drop(&mut self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return; // (no runtime: it ended, and SlateDB's tasks with it)
+        }
+        let db = match &self.db {
+            Db_::Writer(db) => Db_::Writer(db.clone()),
+            Db_::Reader(r) => Db_::Reader(r.clone()),
+        };
+        let upkeep = self.upkeep.take();
+        crate::panics::task(async move {
+            if let Some(upkeep) = upkeep {
+                upkeep.stop().await;
+            }
+            let _ = match db {
+                Db_::Writer(db) => db.close().await,
+                Db_::Reader(r) => r.close().await,
+            };
+        });
+    }
+}
+
+/// The catalog's upkeep, kept so a close can stop it. SlateDB runs the compactor and the collector
+/// in tasks of their own, which outlive the future that started them: stopped only with that
+/// future, they went on polling a closed lake (or one opened again) for the life of the process.
+struct Upkeep(Mutex<Option<(tokio::task::JoinHandle<()>, futures::future::BoxFuture<'static, ()>)>>);
+
+impl Upkeep {
+    /// Stops it, once: the task that starts the two first (so neither starts after this), then both.
+    async fn stop(&self) {
+        let taken = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some((started, stop)) = taken {
+            started.abort();
+            let _ = started.await;
+            stop.await;
+        }
+    }
 }
 
 /// SlateDB's compactor pins the files each compaction replaces with a checkpoint for 15 minutes
@@ -1557,7 +1608,7 @@ impl Catalog {
         // commits a second), and a disk they filled had no room to flush the catalog, so nothing
         // could ever clear it. (A follower reads the files of a manifest it polled 250 ms ago.)
         let every = |interval: u64, min_age: u64| Some(GarbageCollectorDirectoryOptions { interval: Some(Duration::from_secs(interval)), min_age: Duration::from_secs(min_age), dry_run: false });
-        let gc = std::env::var("PONDRA_GC_SECS").ok().and_then(|v| v.parse().ok());
+        let gc = crate::env::parse("PONDRA_GC_SECS");
         let (wal, secs) = (gc.unwrap_or(if local { 5 } else { 60 }), gc.unwrap_or(60));
         let compacted = if local { every(10, 60) } else { GarbageCollectorOptions::default().compacted_options };
         let garbage_collector_options = Some(GarbageCollectorOptions { wal_options: every(wal, wal), manifest_options: every(secs, secs), compacted_options: compacted, ..Default::default() });
@@ -1570,8 +1621,8 @@ impl Catalog {
         let db = Db::builder("catalog", store.clone()).with_settings(settings).with_db_cache(blocks()).with_block_cache_policy(flushed);
         let mut cat = Self::new(Db_::Writer(db.build().await?));
         trace("the catalog's writer open", t0);
-        upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local);
-        cat.replicas = std::env::var("PONDRA_REPLICAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        cat.upkeep = Some(upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local));
+        cat.replicas = crate::env::or("PONDRA_REPLICAS", 1);
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         let c = cat.get::<u64>("c").await?.unwrap_or(0);
         *cat.order.get_mut() = c + 1;
@@ -1597,7 +1648,7 @@ impl Catalog {
         let opts = DbReaderOptions { manifest_poll_interval: Duration::from_millis(250), skip_wal_replay: streamed, object_store_cache_options, ..Default::default() };
         // FollowLatest writes nothing, so readers work with read-only bucket credentials.
         let reader = DbReader::builder("catalog", store).with_reader_mode(DbReaderMode::FollowLatest).with_options(opts).with_db_cache(blocks());
-        let mut cat = Self::new(Db_::Reader(reader.build().await?));
+        let mut cat = Self::new(Db_::Reader(Arc::new(reader.build().await?)));
         cat.follows = streamed;
         cat.refresh().await?; // (one try at the in-memory catalog before serving; later refreshes retry)
         Ok(cat)
@@ -1624,7 +1675,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))), frozen: Default::default() }
+        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))), frozen: Default::default() }
     }
 
     /// Leader: the recent frames plus a receiver for every frame from now on.
@@ -1970,6 +2021,19 @@ impl Catalog {
         Ok(())
     }
 
+    /// Lets go of the catalog: its writer flushes what it holds and stops its background tasks, a
+    /// reader its polling (`Node::stop`, ADR-061 §4: one process may open another lake after it).
+    pub async fn close(&self) -> Result<()> {
+        if let Some(upkeep) = &self.upkeep {
+            upkeep.stop().await;
+        }
+        match &self.db {
+            Db_::Writer(db) => db.close().await?,
+            Db_::Reader(r) => r.close().await?,
+        }
+        Ok(())
+    }
+
     /// A new branch's leader (ADR-047): its commits number after its base's, whose rows it holds
     /// with their `_version`s.
     pub async fn start_after(&self, c: u64) {
@@ -2027,7 +2091,7 @@ fn fatal(e: slatedb::Error) -> anyhow::Error {
 /// Test hook: `PONDRA_CRASH=after_seg_put:0.05,after_parquet_put:0.2` aborts the process at
 /// that point with that probability, to prove crashes never lose or duplicate rows.
 pub fn maybe_crash(point: &str) {
-    let Ok(spec) = std::env::var("PONDRA_CRASH") else { return };
+    let Some(spec) = crate::env::get("PONDRA_CRASH") else { return };
     for (name, prob) in spec.split(',').filter_map(|p| p.split_once(':')) {
         let roll = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1e6;
         if name == point && roll < prob.parse().unwrap_or(0.0) {
@@ -2045,7 +2109,7 @@ pub fn maybe_crash(point: &str) {
 pub fn partitions() -> usize {
     static PARTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); // (every session asks: the cores are read from the cgroup's files)
     *PARTS.get_or_init(|| {
-        let cores = std::env::var("PONDRA_CORES").ok().and_then(|p| p.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
+        let cores = crate::env::parse("PONDRA_CORES").unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
         cores.min(memory_limit() / (24 << 20)).max(2)
     })
 }
