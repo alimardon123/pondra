@@ -10687,12 +10687,14 @@ def objects():
     q("INSERT IGNORE INTO keyed VALUES (2, 'x')")
     q("INSERT OR REPLACE INTO keyed VALUES (2, 'B'), (4, 'd')")
     upserted = q("SELECT id, v FROM keyed ORDER BY id")
-    refused = [http(s)[0] for s in ("INSERT OR ABORT INTO keyed VALUES (5, 'e')", "INSERT OVERWRITE TABLE keyed SELECT 6, 'f'",
-                                    "INSERT INTO keyed VALUES (7, 'g') RETURNING id", "UPDATE keyed SET v = 'h' WHERE id = 1 RETURNING id")]
-    info["keyed"] = [upserted, refused]
-    checks["INSERT OR IGNORE, INSERT IGNORE and INSERT OR REPLACE as ON CONFLICT; OR ABORT, OVERWRITE and RETURNING refused"] = \
-        upserted == [{"id": 1, "v": "a"}, {"id": 2, "v": "B"}, {"id": 3, "v": "c"}, {"id": 4, "v": "d"}] and refused == [500, 500, 500, 500] \
-        and q("SELECT count(*) AS n FROM keyed") == [{"n": 4}]
+    refused = [http(s)[0] for s in ("INSERT OR ABORT INTO keyed VALUES (5, 'e')", "INSERT OVERWRITE TABLE keyed SELECT 6, 'f'")]
+    returned = [q(s) for s in ("INSERT INTO keyed VALUES (7, 'g') RETURNING id", "UPDATE keyed SET v = 'h' WHERE id = 1 RETURNING id")]
+    after = q("SELECT id, v FROM keyed ORDER BY id")
+    info["keyed"] = [upserted, refused, returned, after]
+    checks["INSERT OR IGNORE, INSERT IGNORE and INSERT OR REPLACE as ON CONFLICT; OR ABORT and OVERWRITE refused, RETURNING answered"] = \
+        upserted == [{"id": 1, "v": "a"}, {"id": 2, "v": "B"}, {"id": 3, "v": "c"}, {"id": 4, "v": "d"}] and refused == [500, 500] \
+        and returned == [[{"id": 7}], [{"id": 1}]] \
+        and after == [{"id": 1, "v": "h"}, {"id": 2, "v": "B"}, {"id": 3, "v": "c"}, {"id": 4, "v": "d"}, {"id": 7, "v": "g"}]
     q("CREATE TABLE past (a BIGINT)")
     q("INSERT INTO past VALUES (1)")
     first = q("SELECT max(_version) AS v FROM past")[0]["v"]
