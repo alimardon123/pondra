@@ -470,6 +470,7 @@ pub struct Lake {
     pub rt: Arc<RuntimeEnv>,         // shared by all queries: object store registry + Parquet metadata cache
     tail: Mutex<Tail>, // decoded log rows
     pub tails: Mutex<(lru::LruCache<String, Arc<crate::query::Tail>>, usize)>, // tables' tails as queries read them (`query::Tail`); total bytes
+    kept: (Arc<Footers>, Arc<FileStatistics>), // DataFusion's caches of Parquet footers and of files' statistics (`rt`'s)
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: crate::serve::Groups,          // decoded row groups for key lookups
     pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
@@ -751,7 +752,11 @@ impl Lake {
         let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(memory_limit()));
         // (spills go to the OS temp dir; no listing kept past its statement: DataFusion's own
         // cache of them would hide a file added to a folder outside the lake, ADR-026)
-        let caches = datafusion::execution::cache::cache_manager::CacheManagerConfig::default().with_list_files_cache_limit(0);
+        // (Parquet footers and files' statistics kept by caches of our own, so `cached_bytes` can say
+        // what they hold: DataFusion's own, at its own limits)
+        use datafusion::execution::cache::cache_manager::{CacheManagerConfig, DEFAULT_FILE_STATISTICS_MEMORY_LIMIT, DEFAULT_METADATA_CACHE_LIMIT};
+        let kept = (Arc::new(Footers::new(DEFAULT_METADATA_CACHE_LIMIT).with_name("DefaultFileMetadataCache")), Arc::new(FileStatistics::new(DEFAULT_FILE_STATISTICS_MEMORY_LIMIT).with_name("DefaultFileStatisticsCache")));
+        let caches = CacheManagerConfig::default().with_list_files_cache_limit(0).with_file_metadata_cache(Some(kept.0.clone())).with_file_statistics_cache(Some(kept.1.clone()));
         let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).with_cache_manager(caches).build_arc()?;
         let disk = bucket.as_ref().and_then(|_| disk_tier(&url, &store));
         let mut cached_store = None;
@@ -779,7 +784,7 @@ impl Lake {
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new((lru::LruCache::unbounded(), 0)), kept, disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
@@ -1030,12 +1035,15 @@ impl Lake {
 
     /// What each of the node's bounded caches holds now, in bytes (`/metrics`' `cache_bytes`): what
     /// fills up to its limit is not memory the node is losing (`tools/soak.py`).
-    pub fn cached_bytes(&self) -> [(&'static str, usize); 4] {
+    pub fn cached_bytes(&self) -> [(&'static str, usize); 7] {
         [
             ("ranges", self.cached.as_ref().map_or(0, |c| c.held())),
             ("log", self.tail.lock().unwrap().bytes),
             ("tails", self.tails.lock().unwrap().1),
             ("lookups", self.groups.held()),
+            ("catalog_blocks", self.cat.cached()),
+            ("footers", self.kept.0.memory_used()),
+            ("statistics", self.kept.1.memory_used()),
         ]
     }
 
@@ -1336,6 +1344,7 @@ pub struct Catalog {
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
     flush_now: bool,              // a local lake's writer: each write's WAL flushed at once (`write`)
+    blocks: Vec<Blocks>,          // its block caches (`blocks`), for what they hold
 }
 
 /// A scan in progress: the streamed changes it may still lay over its (older) view stay.
@@ -1503,10 +1512,35 @@ pub fn serving() { SERVING.send_replace(true); }
 /// steady writes grew by the catalog's size until it held 640 MB for a cache it hardly reads:
 /// everything committed is in the overlay (`mirror`), and an inline segment's rows are read once
 /// and kept decoded (`Lake::tail`).
-fn blocks() -> Arc<dyn slatedb::db_cache::DbCache> {
-    use slatedb::db_cache::{moka::{MokaCache, MokaCacheOptions}, SplitCache};
-    let moka = |mb: u64| Some(Arc::new(MokaCache::new_with_opts(MokaCacheOptions { max_capacity: mb << 20, time_to_live: None, time_to_idle: None })) as Arc<dyn slatedb::db_cache::DbCache>);
-    Arc::new(SplitCache::new().with_block_cache(moka(32)).with_meta_cache(moka(32)).build())
+/// The caches are moka's, as SlateDB's own are, but they say what they hold (`Catalog::cached`), so
+/// a node's own memory doesn't count them (`tools/soak.py`).
+fn blocks() -> (Arc<dyn slatedb::db_cache::DbCache>, [Blocks; 2]) {
+    let (data, meta) = (Blocks::new(32), Blocks::new(32));
+    let cache = slatedb::db_cache::SplitCache::new().with_block_cache(Some(Arc::new(data.clone()))).with_meta_cache(Some(Arc::new(meta.clone()))).build();
+    (Arc::new(cache), [data, meta])
+}
+
+/// DataFusion's caches of Parquet footers and of files' statistics (`Lake::kept`).
+type Footers = datafusion::execution::cache::default_cache::DefaultCache<object_store_df::path::Path, datafusion::execution::cache::cache_manager::CachedFileMetadataEntry>;
+type FileStatistics = datafusion::execution::cache::default_cache::DefaultCache<datafusion::execution::cache::TableScopedPath, datafusion::execution::cache::cache_manager::CachedFileMetadata>;
+
+/// One of the catalog's block caches (`blocks`): SlateDB's `MokaCache`, whose weight it can say.
+#[derive(Clone)]
+struct Blocks(moka::future::Cache<slatedb::db_cache::CachedKey, slatedb::db_cache::CachedEntry>);
+
+impl Blocks {
+    fn new(mb: u64) -> Self { Blocks(moka::future::Cache::builder().weigher(|_, v: &slatedb::db_cache::CachedEntry| v.size() as u32).max_capacity(mb << 20).build()) }
+}
+
+#[async_trait::async_trait]
+impl slatedb::db_cache::DbCache for Blocks {
+    async fn get_block(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> { Ok(self.0.get(key).await) }
+    async fn get_index(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> { Ok(self.0.get(key).await) }
+    async fn get_filter(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> { Ok(self.0.get(key).await) }
+    async fn get_stats(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> { Ok(self.0.get(key).await) }
+    async fn insert(&self, key: slatedb::db_cache::CachedKey, value: slatedb::db_cache::CachedEntry) { self.0.insert(key, value).await }
+    async fn remove(&self, key: &slatedb::db_cache::CachedKey) { self.0.remove(key).await; }
+    fn entry_count(&self) -> u64 { self.0.entry_count() }
 }
 
 /// The catalog's compactor and garbage collector, as SlateDB runs them beside a writer, started
@@ -1623,9 +1657,11 @@ impl Catalog {
         let t0 = std::time::Instant::now();
         // (a flush's blocks stay out of the cache: everything committed is in the overlay already)
         let flushed = slatedb::BlockCachePolicy::default().with_flush_targets(&[slatedb::CacheTarget::Index, slatedb::CacheTarget::Filters]);
-        let db = Db::builder("catalog", store.clone()).with_settings(settings).with_db_cache(blocks()).with_block_cache_policy(flushed);
+        let (cache, held) = blocks();
+        let db = Db::builder("catalog", store.clone()).with_settings(settings).with_db_cache(cache).with_block_cache_policy(flushed);
         let mut cat = Self::new(Db_::Writer(db.build().await?));
         cat.flush_now = local;
+        cat.blocks = held.into();
         trace("the catalog's writer open", t0);
         cat.upkeep = Some(upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local));
         cat.replicas = crate::env::or("PONDRA_REPLICAS", 1);
@@ -1653,8 +1689,10 @@ impl Catalog {
     async fn reader(store: Store, streamed: bool, object_store_cache_options: ObjectStoreCacheOptions) -> Result<Self> {
         let opts = DbReaderOptions { manifest_poll_interval: Duration::from_millis(250), skip_wal_replay: streamed, object_store_cache_options, ..Default::default() };
         // FollowLatest writes nothing, so readers work with read-only bucket credentials.
-        let reader = DbReader::builder("catalog", store).with_reader_mode(DbReaderMode::FollowLatest).with_options(opts).with_db_cache(blocks());
+        let (cache, held) = blocks();
+        let reader = DbReader::builder("catalog", store).with_reader_mode(DbReaderMode::FollowLatest).with_options(opts).with_db_cache(cache);
         let mut cat = Self::new(Db_::Reader(Arc::new(reader.build().await?)));
+        cat.blocks = held.into();
         cat.follows = streamed;
         cat.refresh().await?; // (one try at the in-memory catalog before serving; later refreshes retry)
         Ok(cat)
@@ -1681,8 +1719,11 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))), frozen: Default::default(), closing: Default::default(), flush_now: false }
+        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))), frozen: Default::default(), closing: Default::default(), flush_now: false, blocks: vec![] }
     }
+
+    /// What the catalog's block caches hold, in bytes.
+    pub fn cached(&self) -> usize { self.blocks.iter().map(|b| b.0.weighted_size() as usize).sum() }
 
     /// Leader: the recent frames plus a receiver for every frame from now on.
     pub fn subscribe(&self) -> (Vec<Frame>, broadcast::Receiver<Frame>) {

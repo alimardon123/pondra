@@ -14,7 +14,7 @@ default = ["server"]
 server = ["dep:http", "dep:slatedb", "dep:reqwest", "dep:tokio", "dep:axum", "dep:toml", "dep:uuid", "dep:clap", "dep:mimalloc",
           "dep:chrono-tz", "dep:postgres-types", "dep:pgwire", "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:zstd",
           "dep:object_store", "dep:object_store_df", "dep:glob", "dep:aws-lc-rs", "dep:tokio-rustls",
-          "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tikv-jemallocator", "dep:tower"]
+          "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tikv-jemallocator", "dep:tower", "dep:moka"]
 
 [workspace]
 members = ["capi", "launcher"] # (pondra_lib, the C ABI, and the launcher that loads it: `cargo build --workspace` builds them with the program, into one folder; a plain build at the root builds the program alone)
@@ -30,6 +30,7 @@ required-features = ["server"] # (the program is a node's command line)
 parquet = { version = "59", default-features = false, features = ["snap", "zstd", "lz4"] }
 datafusion = { version = "55", default-features = false, features = ["parquet", "sql", "nested_expressions", "datetime_expressions", "string_expressions", "unicode_expressions", "regex_expressions", "crypto_expressions", "encoding_expressions"] }
 slatedb = { version = "0.16", default-features = false, features = ["aws", "moka"], optional = true } # moka: in-memory block cache (foyer adds a disk tier we don't need)
+moka = { version = "0.12.8", features = ["future"], optional = true } # (the catalog's block caches, as slatedb's own over the same moka, saying what they hold: `store::blocks`)
 arrow-ipc = { version = "59", features = ["zstd"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }

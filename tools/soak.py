@@ -20,8 +20,8 @@ and then, and what drifts over time measured.
   At the end the load stops and it checks: every acknowledged batch once and `kv` as the model,
   on every node; the views equal their rows; the log drained (no rows left untiered within two
   minutes); memory flat (each node process that lived ten samples: its own memory, less its
-  caches (the hot columns, and what `pondra_cache_bytes` counts), in the last tenth of its
-  life within 1.5x of its second tenth's, after the warm-up, plus 64 MB). It reports the
+  caches (the hot columns, and what `pondra_cache_bytes` counts), the lower quartile of the last
+  tenth of its life within 1.5x of its second tenth's, after the warm-up, plus 64 MB). It reports the
   lake's objects (data files, log segments, the catalog's) and every stop's longest wait.
   Prints the checks as JSON (and writes them to --out) and exits 1 if one fails.
 
@@ -32,7 +32,10 @@ Legs (a day where a machine lasts six hours: GitHub's runners, soak.yml): --save
 its checks, stops the nodes (followers, then the leader: drained, stepping down) and writes what
 the next leg needs (the lake, every producer's acknowledged batches, the model, the time so far) to
 STATE, keeping the lake; --resume STATE starts the next on that lake, the load going on where it
-stopped. The lake lives the whole day; each node process lives a leg at most.
+stopped. The lake lives the whole day; each node process lives a leg at most. A leg whose memory
+alone drifted still saves, so the day goes on and is checked whole. --steady stops and kills no
+node: each node process lives the whole leg, which is what memory over hours is measured on (the
+day's last leg: soak.yml).
 """
 import argparse, collections, json, os, random, shutil, sys, tempfile, threading, time, uuid
 
@@ -105,6 +108,7 @@ def main():
     ap.add_argument("--rate", type=int, default=500, help="rows a second into `ev`, in all")
     ap.add_argument("--batch", type=int, default=20, help="rows a batch (each batch is a commit: on a bucket, about an object write)")
     ap.add_argument("--failover-mins", type=float, default=0, help="a node stopped or killed this often (default: 8 times a run, at most hourly)")
+    ap.add_argument("--steady", action="store_true", help="no node stopped or killed: each node process lives the whole run")
     ap.add_argument("--bin", default=os.environ.get("PONDRA_BIN", os.path.join(HERE, "..", "target", "release", "pondra")))
     ap.add_argument("--s3", action="store_true")
     ap.add_argument("--keep", action="store_true", help="keep the lake and logs")
@@ -139,7 +143,7 @@ def main():
     images = lambda x: sum("restarting to rejoin" in line for line in open(x.log, errors="replace")) if os.path.exists(x.log) else 0
     timeline, moves, start = open(A.timeline, "w"), [], time.time()
     kinds = [("leader", "term"), ("leader", "kill"), ("follower", "term"), ("follower", "kill")]
-    next_move, last_list, samples, wrote, mark = start + every, 0, [], {}, start
+    next_move, last_list, samples, wrote, mark = start + (secs + 1 if A.steady else every), 0, [], {}, start
     while time.time() - start < secs:
         time.sleep(max(0, mark + (60 if secs > 600 else 10) - time.time()))
         leader = next((x for x in live if role_or(x, role) == "leader"), None)
@@ -197,24 +201,28 @@ def main():
                                                          and same("SELECT count(*) AS n FROM ev") and same("SELECT * FROM per_producer ORDER BY producer"))
     checks["the log drains: no rows left untiered two minutes after the load"] = bool(drained)
     # Memory: each process's own (a node started again, or restarted in place, is another) over its life, if it lived ten
-    # samples: the median of its last tenth against that of its second (the first is warm-up),
+    # samples: the lower quartile of its last tenth against that of its second (the first is warm-up),
     # less its hot columns: a cache of the columns read lately, which grows with the tables up to
     # its own limit (hot.rs) and gives memory back past three fifths of the machine; and less the
-    # node's other bounded caches (`pondra_cache_bytes`: objects' byte ranges, log rows, answers),
-    # which fill up to their limits.
+    # node's other bounded caches (`pondra_cache_bytes`: objects' byte ranges, log rows, answers,
+    # the catalog's blocks, files' footers and statistics), which fill up to their limits.
+    # The lower quartile, not the median: a sample a minute sometimes lands in a burst of work (a
+    # merge, a query) in the ten seconds before jemalloc gives it back, and on R2's leg 1 (#102's
+    # build) such bursts were 200-400 MB a minute apart. A burst raises a sample; memory kept
+    # raises them all, the lowest too.
     lives = collections.defaultdict(list)
     for s in samples:
         for port, pid in s["pids"].items():
             own = s.get("anon_mb", s["rss_mb"]).get(port)
             if own:
                 lives[(port, pid, s.get("images", {}).get(port, 0))].append(own - s.get("hot_mb", {}).get(port, 0) - s.get("cache_mb", {}).get(port, 0))
-    median = lambda xs: sorted(xs)[len(xs) // 2]
-    drift = {f"{port} (pid {pid}{f', after {n} restarts in place' if n else ''})": {"early_mb": median(xs[len(xs) // 10:max(2, 2 * len(xs) // 10)]), "late_mb": median(xs[-max(1, len(xs) // 10):]), "samples": len(xs)}
+    low = lambda xs: sorted(xs)[len(xs) // 4]
+    drift = {f"{port} (pid {pid}{f', after {n} restarts in place' if n else ''})": {"early_mb": low(xs[len(xs) // 10:max(2, 2 * len(xs) // 10)]), "late_mb": low(xs[-max(1, len(xs) // 10):]), "samples": len(xs)}
              for (port, pid, n), xs in lives.items() if len(xs) >= 10}
     info["memory"] = drift
     info["hot columns at the end, MB"] = samples[-1].get("hot_mb") if samples else None
     info["caches at the end, MB"] = samples[-1].get("cache_mb") if samples else None
-    checks["memory flat (its own, less its caches): each node's last tenth within 1.5x (+64 MB) of its second"] = bool(drift) and all(d["late_mb"] <= d["early_mb"] * 1.5 + 64 for d in drift.values())
+    checks["memory flat (its own, less its caches): each node's last tenth within 1.5x (+64 MB) of its second (lower quartiles)"] = bool(drift) and all(d["late_mb"] <= d["early_mb"] * 1.5 + 64 for d in drift.values())
     end = objects(lake)
     info["objects at the end"] = end
     info["object writes a second (every node)"] = round(sum(s["object_writes_per_s"] for s in samples[1:]) / max(1, len(samples) - 1), 1)
@@ -223,11 +231,12 @@ def main():
     # (followers first: the leader then drains, steps down, and the next leg's nodes lead at once)
     [x.stop() for x in sorted(live, key=lambda x: role_or(x, role) == "leader")]
     ok = all(checks.values())
+    correct = all(v for k, v in checks.items() if not k.startswith("memory"))  # (memory alone drifting: the day goes on)
     legs = was["legs"] + [{"ok": ok, "checks": checks, "minutes": info["minutes"]}]
     out = {"ok": ok and all(leg["ok"] for leg in legs), "checks": checks, "info": info, "lake": lake, **({"legs": legs} if len(legs) > 1 or A.save else {})}
     json.dump(out, open(A.out, "w"), indent=1)
     print(json.dumps(out, indent=1))
-    if A.save and ok:
+    if A.save and correct:
         json.dump({"lake": lake, "acked": dict(load.acked), "kv": ups.model, "kv_seq": ups.seq, "elapsed": was["elapsed"] + time.time() - start,
                    "moves": was["moves"] + len(moves), "legs": legs}, open(A.save, "w"))
     elif not A.keep:
