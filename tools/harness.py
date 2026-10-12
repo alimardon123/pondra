@@ -8398,12 +8398,15 @@ def guarded():
     write token's flushes and files only into tables that are there, in the log and their folders;
     nobody but the nodes adds to the lake's own records; a change a follower forwards runs as its
     user, reads included; a .py file is an admin's; a page of an answer is its asker's; /stats names
-    the cluster's nodes only to a signed-in caller; rows through /append and /insert are in the audit log."""
+    the cluster's nodes only to a signed-in caller; rows through /append and /insert are in the audit log;
+    rows through Flight's DoPut and Kafka's produce are taken as through /append, and a hidden table's rows
+    stream only to a superuser and are written by no statement."""
     import base64
+    import pyarrow as pa, pyarrow.flight as fl, confluent_kafka as ck
     P = A.port
     lake = new_lake()
     audit = {"PONDRA_AUDIT": "role,ddl,function,write"}  # (the writes too: rows through /append and /insert are in the log)
-    a = Node(lake, P, env=audit).start()
+    a = Node(lake, P, env=audit, flight=f"127.0.0.1:{P + 40}", kafka=f"127.0.0.1:{P + 41}").start()
     checks, info = {}, {}
 
     def ask(port, body, path="/sql", method="POST", auth=None, headers=None):
@@ -8442,9 +8445,11 @@ def guarded():
               "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
         ask(P, q)
     boss = basic("boss", "boss-password-1")
-    for q in ["CREATE USER bob PASSWORD 'bob-password-1'", "GRANT SELECT, INSERT, UPDATE ON orders TO bob"]:
+    for q in ["CREATE USER bob PASSWORD 'bob-password-1'", "GRANT SELECT, INSERT, UPDATE ON orders TO bob",
+              "CREATE USER carol PASSWORD 'carol-password-1'", "GRANT SELECT ON ALL TABLES TO carol"]:
         ask(P, q, auth=boss)
     bob = basic("bob", "bob-password-1")
+    carol = basic("carol", "carol-password-1")
     rows = json.dumps({"id": 7, "amount": 1.0})
     flush = lambda head: (lambda h: len(h).to_bytes(4, "little") + h)(json.dumps(head).encode())
     said = {
@@ -8501,6 +8506,72 @@ def guarded():
         return {(r["statement"], r["outcome"]) for r in got} if isinstance(got, list) else set()
     checks["rows through /append and /insert are in the audit log when writes are audited, and refused ones always"] = until(lambda: expect <= audited(), True, 15)
     info["audit"] = sorted(audited())
+    # Flight's DoPut and Kafka's produce ask the same check as /append, at their own doors (the user's grants
+    # decide, not the node's); a hidden table's rows stream to a superuser only, through DoGet and /watch alike
+    def put(table, auth, cols):
+        """One row DoPut to a table by its path, as the user: its acks, or the error it got."""
+        schema = pa.schema([(c, pa.int64() if c == "id" else pa.float64()) for c in cols])
+        row = pa.record_batch([pa.array([9], pa.int64()) if c == "id" else pa.array([1.0], pa.float64()) for c in cols], schema=schema)
+        try:
+            w, r = fl.FlightClient(f"grpc://127.0.0.1:{P + 40}").do_put(fl.FlightDescriptor.for_path(table), schema,
+                                                                       options=fl.FlightCallOptions(headers=[(b"authorization", auth.encode())]))
+            w.write_batch(row)
+            w.done_writing()
+            acks = []
+            while (buf := r.read()) is not None:
+                acks.append(json.loads(buf.to_pybytes()))
+            w.close()
+            return acks
+        except Exception as e:
+            return f"ERROR {e}"
+    said = {
+        "flight put, granted": put("orders", bob, ["id", "amount"]),
+        "flight put, not granted": put("hr", bob, ["id", "salary"]),
+        "flight put to the audit log, by a superuser": put("pondra$audit", boss, ["id", "amount"]),
+    }
+    sasl = lambda u, p: {"bootstrap.servers": f"127.0.0.1:{P + 41}", "security.protocol": "SASL_PLAINTEXT", "sasl.mechanisms": "PLAIN", "sasl.username": u, "sasl.password": p}
+    def produce(topic, u, p):
+        """One record as a user, signed in over Kafka's SASL/PLAIN: each delivery report's error ("None" when it was taken)."""
+        reports = []
+        prod = ck.Producer({**sasl(u, p), "message.timeout.ms": 8000})
+        prod.produce(topic, value=json.dumps({"id": 10}), on_delivery=lambda err, msg: reports.append(str(err)))  # (a column both tables have)
+        prod.flush(10)
+        return reports
+    said["kafka produce, granted"] = produce("orders", "bob", "bob-password-1")
+    said["kafka produce, not granted"] = produce("hr", "bob", "bob-password-1")
+    def get(table, auth):
+        """The first chunk of a table's rows as a user, over Flight's DoGet: STREAMED, or the error it got."""
+        try:
+            reader = fl.FlightClient(f"grpc://127.0.0.1:{P + 40}").do_get(fl.Ticket(json.dumps({"table": table}).encode()),
+                                                                          options=fl.FlightCallOptions(headers=[(b"authorization", auth.encode())], timeout=5))
+            next(iter(reader))
+            return "STREAMED"
+        except Exception as e:
+            return f"ERROR {e}"
+    said["flight get the audit log, carol"] = get("pondra$audit", carol)
+    def watch(table, auth):
+        """The start of GET /watch/{table} as a user, never waiting on a stream that goes on: its status and first bytes."""
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", P, timeout=5)
+        try:
+            c.request("GET", f"/watch/{table}", headers={"Authorization": auth})
+            r = c.getresponse()
+            return f"{r.status} {r.read1(300).decode(errors='replace')}"
+        except Exception as e:
+            return f"ERROR {e}"
+        finally:
+            c.close()
+    said["watch the audit log, carol"] = watch("pondra$audit", carol)
+    said["SQL insert into the audit log, by a superuser"] = ask(P, "INSERT INTO \"pondra$audit\" (statement) VALUES ('forged')", auth=boss)
+    info["doors"] = {k: str(v)[:300] for k, v in said.items()}  # (short: the info is printed when a check fails)
+    checks["Flight's DoPut and Kafka's produce take a user's rows as its grants say: another table, the lake's records: refused"] = \
+        isinstance(said["flight put, granted"], list) and len(said["flight put, granted"]) > 0 and said["flight put, granted"][0].get("rows") == 1 \
+        and "permission denied: INSERT on hr" in said["flight put, not granted"] and "written by Pondra alone" in said["flight put to the audit log, by a superuser"] \
+        and said["kafka produce, granted"] == ["None"] and "TOPIC_AUTHORIZATION_FAILED" in str(said["kafka produce, not granted"]) \
+        and ask(P, "SELECT count(*) AS n FROM hr", auth=boss) == [{"n": 1}]  # (nothing went into hr)
+    checks["a hidden table's rows (pondra$audit) stream to a superuser only: Flight's DoGet and /watch refuse a user granted every table"] = \
+        "is Pondra's own" in said["flight get the audit log, carol"] and said["watch the audit log, carol"].startswith("403") and "is Pondra's own" in said["watch the audit log, carol"]
+    checks["…and SQL writes none of them, a superuser's INSERT included"] = "written by Pondra alone" in str(said["SQL insert into the audit log, by a superuser"])
     a.kill(), b.kill()
     # A write token: rows into tables that are there, in the log and their folders; never the lake's records
     lake2 = new_lake()

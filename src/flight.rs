@@ -485,7 +485,7 @@ impl FlightSqlService for Sql {
         };
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(Status::from).peekable();
         let mut exists = self.0.lake.cat.get::<TableMeta>(&table_key(&table)).await.map_err(status)?.is_some();
-        crate::auth::check("insert", &crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(e.to_string()))?;
+        crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(e.to_string()))?; // (the row doors' one check)
         // ADBC's modes: create (fail if there), append (fail if not), replace, create_append.
         use arrow_flight::sql::{TableExistsOption as IfThere, TableNotExistOption as IfNot};
         let options = cmd.table_definition_options.unwrap_or_default();
@@ -534,6 +534,7 @@ impl FlightSqlService for Sql {
             [t, p, s] => (t.clone(), p.clone(), s.parse().map_err(|_| Status::invalid_argument("the first seq is a number"))?),
             _ => return Err(Status::invalid_argument("DoPut to a path: [table] or [table, producer, first seq]")),
         };
+        crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(e.to_string()))?; // (the row doors' one check)
         let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(input.map_err(Into::into)).map_err(Status::from);
         Ok(Response::new(append(&self.0, table, producer, seq, batches)?))
     }
