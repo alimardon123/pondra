@@ -555,7 +555,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     // not Pondra's yet, so refused by name with the ways it has, not with the parser's words.
     static PORTABLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(EXPORT|IMPORT)\s+DATABASE\b").expect("a regex"));
     if matches!(head.as_str(), "export" | "import") && PORTABLE.is_match(first_word(sql)) {
-        return Some(Stmt::Invalid("EXPORT DATABASE and IMPORT DATABASE are not supported yet: BACKUP DATABASE TO 'place' copies a database's rows and objects (RESTORE DATABASE name FROM 'place' brings it back), `pondra export DIR` writes its objects as SQL files, and COPY t TO 'dir/t.parquet' (FORMAT parquet) writes a table's rows".into()));
+        return Some(Stmt::Invalid("EXPORT DATABASE and IMPORT DATABASE are not supported yet: BACKUP DATABASE TO 'place' copies a database (RESTORE DATABASE name FROM 'place' brings it back), and COPY t TO 'dir/t.parquet' (FORMAT parquet) writes a table's rows".into()));
     }
     // `UNDROP TABLE t` (Snowflake's, Databricks'): the table dropped last under that name, back (ADR-043).
     static UNDROP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*UNDROP\s+TABLE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));

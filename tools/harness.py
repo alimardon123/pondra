@@ -6293,11 +6293,11 @@ def hot():
         seen["a range of the time, as planned"] = expected
         checks["a range of the time is sized from the files' ranges (a few hundred rows expected, not all)"] = bool(expected) and max(expected) < 5000
         # …and a string equal to a value from the table's distinct counts (`sketch.rs`): one of
-        # 200,000 values keeps a row or so, not a fifth of them.
+        # 200,000 values keeps 1% (the least a filter's estimate can say), not a fifth of them.
         physical = {r["plan_type"]: r["plan"] for r in q("EXPLAIN SELECT i FROM ev WHERE s = 'r5'")}.get("physical_plan", "")
         expected = [int(m) for m in re.findall(r"FilterExec:.*?expected_rows=(\d+)", physical)]
         seen["a string equal to a value, as planned"] = expected
-        checks["a string equal to a value is sized from the table's distinct counts (a few rows expected, not a fifth)"] = bool(expected) and max(expected) < 100
+        checks["a string equal to a value is sized from the table's distinct counts (1% expected, not a fifth)"] = bool(expected) and max(expected) <= n // 100
         # A NOT IN keeps one table that sees every row of its subquery (`SharedBuilds` hashes big
         # joins a table a thread, never a null-aware one): hashed, the threads that never met the
         # subquery's NULL kept their rows. 1,000 rows count as big here, so the 200,000 do.

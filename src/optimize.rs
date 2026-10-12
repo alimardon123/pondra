@@ -689,7 +689,7 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
         }
     }
     let sides = rules.iter().position(|r| r.name() == "join_selection").unwrap_or(0);
-    rules.insert(sides, Arc::new(FilterShares)); // (the joins' sides are picked by their inputs' sizes)
+    rules.insert(sides, Arc::new(FilterShares { apart: true })); // (the joins' sides are picked by their inputs' sizes)
     let at = sides + 2;
     rules.insert(at, Arc::new(HavingBuilds));
     rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
@@ -698,7 +698,7 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     rules.insert(end, Arc::new(crate::hot::TopFirst)); // (after DataFusion's own sort pushdown)
     rules.insert(end, Arc::new(MinMaxBounds)); // (after the filters are pushed down)
     let filters = rules.iter().position(|r| r.name() == "FilterPushdown").unwrap_or(0);
-    rules.insert(filters + 1, Arc::new(FilterShares)); // (again: a filter pushed into a union's parts is a new one, at DataFusion's fifth)
+    rules.insert(filters + 1, Arc::new(FilterShares { apart: false })); // (again: a filter pushed into a union's parts is a new one, at DataFusion's fifth)
     rules.insert(filters, Arc::new(WideTopN)); // (before the filters are pushed down: then they go into the scan)
     rules
 }
@@ -736,9 +736,16 @@ impl PhysicalOptimizerRule for GuardedPushdown {
 /// side that is smaller: TPC-H q12 built its hash table on 1.5M orders, its other side the 31K
 /// lineitems an OR of ship modes leaves. A filter none of whose columns' counts or ranges are known
 /// keeps DataFusion's fifth. It runs just before DataFusion picks the joins' sides, and a share
-/// under 1% counts as 1%, the least a filter's estimate can say.
+/// under 1% counts as 1%, the least a filter's estimate can say. So there (`apart`), a filter under
+/// 1% with conditions DataFusion sizes beside those it can't is two filters while the sides are
+/// picked: the ones it can't, at Pondra's share, under the ones it sizes by their columns' ranges,
+/// which can say less. TPC-DS q68's two days of three years keep 72 of 73,049 dates, counted 731 at
+/// 1%, and the joins above them built on 100,000 customers instead of the 2,000 rows they meet.
+/// DataFusion's `FilterPushdown`, right after, makes them one filter again (the second run sizes it).
 #[derive(Debug)]
-struct FilterShares;
+struct FilterShares {
+    apart: bool,
+}
 
 impl PhysicalOptimizerRule for FilterShares {
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
@@ -752,11 +759,15 @@ impl PhysicalOptimizerRule for FilterShares {
             let Some(kept) = input_share(f.input(), &conds(f.predicate()))? else {
                 return Ok(Transformed::no(p)); // (nothing known of its columns: DataFusion's guess stands, as before)
             };
-            let percent = (kept * 100.0).round().clamp(1.0, 100.0) as u8;
-            if percent == f.default_selectivity() {
+            if self.apart && kept < 0.01 {
+                if let Some(two) = apart(f)? {
+                    return Ok(Transformed::yes(two));
+                }
+            }
+            if percent(kept) == f.default_selectivity() {
                 return Ok(Transformed::no(p));
             }
-            Ok(Transformed::yes(Arc::new(FilterExecBuilder::from(f).with_default_selectivity(percent).build()?) as Arc<dyn ExecutionPlan>))
+            Ok(Transformed::yes(Arc::new(FilterExecBuilder::from(f).with_default_selectivity(percent(kept)).build()?) as Arc<dyn ExecutionPlan>))
         })
         .data()
     }
@@ -768,6 +779,29 @@ impl PhysicalOptimizerRule for FilterShares {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// A share as a filter's estimate says it: a whole percent, 1% at least.
+fn percent(kept: f64) -> u8 {
+    (kept * 100.0).round().clamp(1.0, 100.0) as u8
+}
+
+/// `f` as two filters (`FilterShares`): its conditions DataFusion can't size, at the share Pondra
+/// counts for them, under those it sizes from their columns' ranges. None unless it has both.
+fn apart(f: &FilterExec) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    use datafusion::physical_expr::intervals::utils::check_support;
+    use datafusion::physical_expr::{split_conjunction, utils::conjunction};
+    use datafusion::physical_plan::filter::FilterExecBuilder;
+    let schema = f.input().schema();
+    let (sized, rest): (Vec<_>, Vec<_>) = split_conjunction(f.predicate()).into_iter().cloned().partition(|c| check_support(c, &schema));
+    if sized.is_empty() || rest.is_empty() {
+        return Ok(None);
+    }
+    let rest = conjunction(rest);
+    let Some(kept) = input_share(f.input(), &conds(&rest))? else { return Ok(None) };
+    let below = FilterExecBuilder::from(f).with_predicate(rest).apply_projection(None)?.with_fetch(None).with_default_selectivity(percent(kept)).build()?;
+    let above = FilterExecBuilder::from(f).with_predicate(conjunction(sized)).with_input(Arc::new(below)).build()?;
+    Ok(Some(Arc::new(above)))
 }
 
 /// The share of `input`'s rows a filter's conditions keep, or None when nothing is known of their

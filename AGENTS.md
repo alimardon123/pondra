@@ -92,7 +92,10 @@ src/      62,500 lines of Rust in 108 files, one per concern (see the table in R
           friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225), objects.rs
           (one registry of every kind of object: ADR-049, invariant 227), find.rs (`pondra.parts` and
           `pondra.find`: every part of every object, and one search of objects, parts and concepts;
-          ADR-065, invariant 345), backup.rs (`BACKUP DATABASE`, `RESTORE DATABASE`: a backup is a lake;
+          ADR-065, invariant 345), measures.rs (measures in views: `sum(x) AS MEASURE m`, `MEASURE(m)` at
+          the query's own grain; ADR-065 §3, invariants 346–347) and facts.rs (a view's PRIMARY KEY, UNIQUE
+          and FOREIGN KEY, NOT ENFORCED; ADR-065 §2, invariant 348), backup.rs (`BACKUP DATABASE`,
+          `RESTORE DATABASE`: a backup is a lake;
           ADR-070, invariants 290, 291), seq.rs (sequences and
           identity columns: invariant 234), index.rs (indexes kept as objects: invariant 235),
           constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236),
@@ -2208,6 +2211,26 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    sees those columns and no other part of it, and that table's definition is not shown. Neither is a
    remembered answer. `harness.py find`: "a user granted one table…", "a user granted some columns…",
    "never a remembered answer…".
+346. **A measure is worked out at the query's own grain, from the view's base rows, never from its default
+   form's** (`measures::rewrite`, first in `routines::expand_with`'s tree stage): a query naming a measure
+   reads the view's FROM and WHERE with the dimensions it uses and each column its measures read, and each
+   measure is its expression over those, grouped by the query's GROUP BY; the base is then written in place
+   (`measures::flattened`) unless that could change a name's meaning. Everything after it sees a plain
+   `GROUP BY` (spread, the result cache, the join order). Only a one-argument `MEASURE`, `AGG` or `AGGREGATE`
+   is a measure call (`measures::measure_call`): Spark's and DuckDB's `aggregate(list, …)` go to the
+   planner. `harness.py measures`: "MEASURE() at the query's own grain…", "every way of naming a
+   measure…", "spread over three nodes == one node"; `dialects`' XX000 count.
+347. **A view with measures joins only onto keys, so no row is counted twice** (`measures::check`, in
+   `ddl::create_view`): each JOIN or LEFT JOIN's equalities cover a PRIMARY KEY or UNIQUE of the table or
+   view it joins (NOT ENFORCED is enough); a query that joins the view to anything else is refused.
+   `harness.py measures`: "refused by name, and nothing made" ('not on a key', 'has no key', 'inside the
+   view').
+348. **A view's key facts are its own entry's, name only its columns, and nothing checks them** (`facts.rs`):
+   a stored view's in `StoredView::facts`, a materialized view's in its table's constraints, never enforced;
+   set by the statement that makes the view; a `CREATE OR REPLACE VIEW` that drops a column one names is
+   refused; one naming anything but the view's columns is refused. `harness.py facts`: "kept through CREATE
+   OR REPLACE…", "refused by name, and nothing made", "SHOW CREATE VIEW run again after a drop makes the
+   same view".
 370. **A term's lock file says at once, on its machine only, that its claimer's process ended**
    (`cluster::new_lock`, `gone_here`, `relock`). A claim takes an OS lock (`File::try_lock`) on
    `{id}.lock` in the user's own folder of the temporary folder (`pondra-terms-{uid}`, 0700, used
@@ -2392,6 +2415,8 @@ python3 tools/harness.py enums          # CREATE TYPE … AS ENUM and ENUM('a', 
 python3 tools/harness.py constraints    # UNIQUE from every door and three nodes at once (23505), NOT ENFORCED facts, ADD/DROP CONSTRAINT, SHOW CREATE, the Postgres catalog
 python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
 python3 tools/harness.py find           # pondra.parts and pondra.find at every door (HTTP, Postgres, MCP, Python, JavaScript), as each user may see them; 1,000 tables and 200 views
+python3 tools/harness.py measures       # measures in views: the query's own grain, BI's sum(m), three nodes, Postgres, frames, refusals, cost against the hand-written GROUP BY
+python3 tools/harness.py facts          # a view's PRIMARY KEY, UNIQUE and FOREIGN KEY NOT ENFORCED: parts, ALTER VIEW, SHOW CREATE again, OR REPLACE, Postgres's catalog, refusals
 python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
