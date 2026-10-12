@@ -992,7 +992,7 @@ fn column_of(e: &Expr, rel: &str) -> Option<String> {
 /// `routines::listed` is: every query asks.
 async fn own_views(lake: &Lake) -> Result<Arc<HashMap<String, Arc<Definition>>>> {
     type Seen = Mutex<HashMap<String, (u64, Arc<HashMap<String, Arc<Definition>>>)>>;
-    static SEEN: LazyLock<Seen> = LazyLock::new(Default::default);
+    crate::per_node!(static SEEN: Seen = Default::default());
     let version = lake.cat.version();
     if let (Some(v), Some((at, all))) = (version, SEEN.lock().unwrap().get(&lake.url)) {
         if *at == v {
