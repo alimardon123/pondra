@@ -5,7 +5,7 @@
   "type": "module",
   "main": "index.js",
   "bin": { "pondra": "bin/pondra.js" },
-  "files": ["index.js", "bin/pondra.js", "README.md", "LICENSE-APACHE", "LICENSE-MIT"],
+  "files": ["index.js", "frame.js", "bin/pondra.js", "README.md", "LICENSE-APACHE", "LICENSE-MIT"],
   "engines": { "node": ">=18" },
   "license": "MIT OR Apache-2.0",
   "homepage": "https://alimardon123.github.io/pondra/",

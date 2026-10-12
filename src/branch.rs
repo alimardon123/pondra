@@ -608,7 +608,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
                 tables += 1;
                 puts.push((k.clone(), json(&meta)));
             }
-            "v" | "q" | "w" | "k" if !wanted(name) => {}
+            "v" | "q" | "w" | "k" | "ix" | "ty" if !wanted(name) => {} // (an index and an enum type are their schema's too)
             "ns" if !m.schemas.is_empty() && !m.schemas.iter().any(|s| s == name) => {}
             "p" | "w" if !m.data => {}
             "j" => {

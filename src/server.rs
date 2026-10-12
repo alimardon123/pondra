@@ -14,6 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use datafusion::arrow::ipc::reader::StreamReader;
+use datafusion::arrow::ipc::writer::StreamWriter;
+use datafusion::execution::memory_pool::MemoryReservation;
 use datafusion::arrow::{compute::concat_batches, json as arrow_json, record_batch::RecordBatch, util::pretty::pretty_format_batches};
 use futures::StreamExt;
 use serde::Deserialize;
@@ -641,6 +643,39 @@ async fn replica(State(app): State<App>, Query(p): Query<AckParams>) -> Result<V
     Ok(app.replica.as_ref().ok_or(StatusCode::NOT_FOUND)?.serve(p.term, p.after))
 }
 
+tokio::task_local! {
+    /// Set while this task holds one of the node's query turns (`App::query_listed`).
+    static TURN: ();
+}
+
+/// The node's turns for queries: `PONDRA_QUERIES` run at once (4 a core, 16 at least), in the order
+/// they asked, and a query that waits `PONDRA_QUEUE_SECS` (60) for one is refused (53300). Without
+/// them a burst of clients ran at once, and the memory they used was DataFusion's to count only in
+/// part (see `query::collect`), so the node could run out of it.
+struct Turns {
+    turns: tokio::sync::Semaphore,
+    most: usize,
+    wait: Duration,
+}
+
+static TURNS: std::sync::LazyLock<Turns> = std::sync::LazyLock::new(|| {
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let most = std::env::var("PONDRA_QUERIES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or((4 * cores).max(16)).max(1);
+    let wait = std::env::var("PONDRA_QUEUE_SECS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(60.0);
+    Turns { turns: tokio::sync::Semaphore::new(most), most, wait: Duration::from_secs_f64(wait.max(0.0)) }
+});
+
+/// A turn for one query, once it is its turn (in line, counted as waiting), or 53300.
+async fn turn() -> anyhow::Result<(tokio::sync::SemaphorePermit<'static>, crate::metrics::Now)> {
+    let waiting = crate::metrics::Now::new(&crate::metrics::WAITING);
+    let got = tokio::time::timeout(TURNS.wait, TURNS.turns.acquire()).await;
+    drop(waiting);
+    match got {
+        Ok(Ok(permit)) => Ok((permit, crate::metrics::Now::new(&crate::metrics::RUNNING))),
+        _ => Err(crate::codes::coded("53300", format!("this node is running {} queries, its most at once (PONDRA_QUERIES): try again, or ask another node", TURNS.most))),
+    }
+}
+
 /// Each table's job, four at a time: the answers of those that worked, and a line for `failed`
 /// naming each that didn't.
 async fn each<'a, T>(jobs: Vec<impl std::future::Future<Output = (&'a String, anyhow::Result<T>)>>, failed: &mut Vec<String>) -> Vec<T> {
@@ -686,7 +721,17 @@ impl App {
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)
     }
 
+    /// A query on one of the node's turns (`TURNS`): a query run inside another one this task runs
+    /// (a procedure's, a view's) is served by the turn its caller holds, never waiting for one.
     async fn query_listed(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
+        if TURN.try_with(|_| ()).is_ok() {
+            return self.run_query(query, spread, files).await;
+        }
+        let _turn = turn().await?; // (held until the answer is made)
+        TURN.scope((), self.run_query(query, spread, files)).await
+    }
+
+    async fn run_query(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         crate::history::read_at(self.lake.visible()); // (its answer again: `t AT (VERSION => n)`)
@@ -721,7 +766,7 @@ impl App {
                 let (state, logical) = df.into_parts();
                 let logical = state.optimize(&logical)?; // (as `create_physical_plan`, the plan it optimized kept: what its filters were about, `learned.rs`)
                 let plan = state.query_planner().create_physical_plan(&logical, &state).await?;
-                let out = datafusion::physical_plan::collect(plan.clone(), task).await?;
+                let out = crate::query::collect(plan.clone(), task).await?;
                 crate::history::planned(&logical, &plan); // (its shape; a slow statement's plan, with what each operator did; what it learned)
                 let out = if explained { crate::history::explained(out)? } else { out };
                 anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(schema)] } else { out }) // (no rows: still its columns)
@@ -731,8 +776,16 @@ impl App {
                 Err(e) if format!("{e:#}").contains("Resources exhausted") => run(true).await?, // out of memory: try again frugally
                 r => r?,
             };
-            if self.cluster.nodes().len() > 1 && here.elapsed() >= Duration::from_millis(20) {
-                crate::guard::ran_here(query, crate::spmd::reads_sql(&self.lake, query).await?, here.elapsed()); // (how fast queries go here: `guard.rs`)
+            // How fast queries go here (`guard.rs`): every query's time, so a quick one is known to be
+            // quick and stays here, and the bytes it read only for one long enough to say what rate
+            // this node reads at. The time is taken before they are looked up, which isn't the query.
+            let took = here.elapsed();
+            if self.cluster.nodes().len() > 1 {
+                let bytes = match took >= Duration::from_millis(20) {
+                    true => crate::spmd::reads_sql(&self.lake, query).await.unwrap_or(0),
+                    false => 0,
+                };
+                crate::guard::ran_here(query, bytes, took);
             }
             Ok((out, false))
         };
@@ -1127,7 +1180,8 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
     let session = crate::temp::of(&headers); // (its temporary tables: `temp.rs`)
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let vars = crate::auth::lent_vars(token); // (Python code a run lent a connection to: the run's variables)
-    let go = crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, Box::pin(sql_as(app, p, role, headers, body))))); // (boxed: a statement's future is big, and every layer around it would copy it)
+    // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
+    let go = crate::query::HELD.scope(Default::default(), crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, Box::pin(sql_as(app, p, role, headers, body)))))); // (boxed: a statement's future is big, and every layer around it would copy it)
     let (out, heard) = crate::routines::with_notices(crate::python::holder(vars.is_some(), go)).await; // (a lent token's code holds a slot: what it calls takes none)
     let mut r = out.unwrap_or_else(IntoResponse::into_response);
     if session.as_deref().is_some_and(crate::temp::holds) {
@@ -1199,9 +1253,10 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
     }
     if let ([one], true, true, true, None, false) = (&crate::routines::split(&req.sql)[..], req.params.is_empty(), req.tables.is_empty(), req.views.is_empty(), crate::vars::change(&req.sql), crate::script::is(&req.sql)) {
+        let sent = one;
         let one = crate::routines::expand(&app.lake, &crate::vars::bound(one)?).await?; // (`$name`: the session's variables)
         if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() && crate::txn::control(&one).is_none() && !crate::txn::open() && !crate::settings::is(&one) {
-            return Ok(crate::audit::statement(&app, &one, query(&app, &p, &one, who.files)).await?);
+            return Ok(crate::audit::statement(&app, sent, query(&app, &p, &one, who.files)).await?); // (the audit log and history keep it as it was sent)
         }
     }
     let tables = Arc::new(req.tables);
@@ -1215,7 +1270,7 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     };
     own.inspect(|s| _ = crate::temp::end(s));
     match out? {
-        Outcome::Rows(batches) => Ok(([("content-type", content_type(p.format.as_deref()))], answer(&batches, &p)?).into_response()),
+        Outcome::Rows(batches) => Ok(answer(&batches, &p)?.respond(p.format.as_deref())),
         Outcome::Done(v) => Ok(Json(v).into_response()),
     }
 }
@@ -1247,8 +1302,10 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
     let asks = |text: &str| {
+        // (AT (OFFSET => -n) is n seconds before now: a moment that moves)
+        static OFFSET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*OFFSET\s*=>").expect("a regex"));
         let q = text.to_lowercase();
-        !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+        OFFSET.is_match(text) || !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
     };
     let volatile = files || limited || asks(query)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
@@ -1256,7 +1313,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
         || crate::routines::with_views(&app.lake, query).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)
         || crate::routines::volatile(&app.lake, query).await // (a Python function may answer differently each time)
         || (crate::path::current(&app.lake).is_some() && crate::path::reads_current(&app.lake, query).await); // (a view's current_schema() is its reader's: not one answer for every session)
-    let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
+    let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(run_sql(app, p, query, files).await?.respond(p.format.as_deref())) };
     let key = format!("{format}{}|{}|{query}", p.rows.map(|n| format!(":{n}")).unwrap_or_default(), p.spread.as_deref().unwrap_or(""));
     let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
     if let Some(body) = app.results.get(&key, version, stale) {
@@ -1267,12 +1324,21 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     let flight = app.results.flight(&key);
     let ticket = flight.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let mut slot = flight.1.lock().await;
-    if let (true, Some(body)) = (slot.0 >= ticket, &slot.1) {
+    if slot.0 >= ticket {
+        let Some(body) = &slot.1 else {
+            // (the run that covered it left nothing to share: a big answer, sent in pieces to its own
+            // caller, or an error; each one it covered runs on its own, beside the others)
+            drop(slot);
+            return Ok(run_sql(app, p, query, false).await?.respond(p.format.as_deref()));
+        };
         return Ok(respond(body.clone()));
     }
     (slot.0, slot.1) = (flight.0.load(std::sync::atomic::Ordering::Relaxed), None);
     let version = app.lake.version_for(query).await; // (read after `covers`: this run reads at least this)
-    let body = run_sql(app, p, query, false).await?;
+    let body = match run_sql(app, p, query, false).await? {
+        Rendered::Whole(body) => body,
+        pieces => return Ok(pieces.respond(p.format.as_deref())), // (a big answer: sent to its own caller only)
+    };
     if let Some(v) = version {
         app.results.put(key, v, body.clone());
     }
@@ -1281,7 +1347,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
 }
 
 /// Run a query (across the cluster if it's worth it) and format the result.
-async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<bytes::Bytes> {
+async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Rendered> {
     let batches = match files {
         true => app.query_as(&crate::asof::rewrite(query)?, Some("0"), true).await?, // (a file here: this node only)
         false => app.query(query, p.spread.as_deref()).await?,
@@ -1291,12 +1357,193 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
     answer(&batches, p)
 }
 
-/// Rows as `p` asks: `render`'s, a typed answer's first page as many rows as `?rows=` says.
-fn answer(batches: &[RecordBatch], p: &SqlParams) -> anyhow::Result<bytes::Bytes> {
-    match (p.format.as_deref(), p.rows) {
-        (Some("typed"), Some(n)) => Ok(typed(batches, n.clamp(1, MOST))?.into()),
-        (format, _) => render(batches, format),
+/// An answer as the HTTP door sends it: rendered whole (what `Results` keeps and the others asking at
+/// the same moment share), or as a body in pieces, for an answer too big to render as one (`stream`).
+enum Rendered {
+    Whole(bytes::Bytes),
+    Pieces(Body),
+}
+
+impl Rendered {
+    fn respond(self, format: Option<&str>) -> Response {
+        let body = match self {
+            Rendered::Whole(bytes) => Body::from(bytes),
+            Rendered::Pieces(body) => body,
+        };
+        ([("content-type", content_type(format))], body).into_response()
     }
+}
+
+/// Rows as `p` asks: `render`'s, a typed answer's first page as many rows as `?rows=` says, or, from
+/// `PONDRA_STREAM_MB` of Arrow up, in pieces (`stream`).
+fn answer(batches: &[RecordBatch], p: &SqlParams) -> anyhow::Result<Rendered> {
+    match (p.format.as_deref(), p.rows) {
+        (Some("typed"), Some(n)) => Ok(Rendered::Whole(typed(batches, n.clamp(1, MOST))?.into())),
+        (format, _) if streams(format) && big(batches) => Ok(Rendered::Pieces(stream(batches.to_vec(), format, crate::query::take_held())?)),
+        (format, _) => Ok(Rendered::Whole(render(batches, format)?)),
+    }
+}
+
+/// The formats an answer can be sent in pieces of (the others are rendered whole: a table, a typed
+/// answer, a Parquet or an Excel file is one thing to the reader).
+fn streams(format: Option<&str>) -> bool { !matches!(format, Some("table" | "typed" | "parquet" | "xlsx")) }
+
+/// Is an answer big enough to send in pieces: `PONDRA_STREAM_MB` (8) of Arrow, read once. 0 sends
+/// every answer in pieces (the tests compare the two ways).
+fn big(batches: &[RecordBatch]) -> bool {
+    static MB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("PONDRA_STREAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(8));
+    let mut counted = datafusion::common::utils::memory::RecordBatchMemoryCounter::new(); // (as `query::collect` counts it)
+    batches.iter().map(|b| counted.count_batch(b)).sum::<usize>() >= *MB << 20
+}
+
+/// An answer in pieces of about 1 MB of Arrow, each written as `render` writes its rows (`Encoding`),
+/// so the pieces together are the answer's bytes. The first piece is written before the body starts,
+/// so a format that can't write the answer's columns (a list in CSV) is refused as `render` refuses
+/// it, with its message; a failure later cuts the body short (no end of it is sent). The batches,
+/// and the memory counted for them, go when the last piece is written, or when the client goes.
+fn stream(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryReservation>) -> anyhow::Result<Body> {
+    let pieces: Vec<RecordBatch> = batches.iter().flat_map(piece_rows).collect();
+    let mut enc = Encoding::new(format);
+    let mut steps = pieces.into_iter().map(Some).chain(std::iter::once(None)); // (then the end)
+    let first = enc.step(steps.next().flatten().as_ref())?;
+    // The rest is written on the queries' runtime, at most two pieces ahead of the client: the
+    // node's own runtime keeps to appends and commits (invariant 231).
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(2);
+    crate::panics::aside(async move {
+        let _held = held;
+        for step in steps {
+            let bytes = enc.step(step.as_ref()).map(Bytes::from).map_err(std::io::Error::other);
+            let failed = bytes.is_err();
+            if tx.send(bytes).await.is_err() || failed {
+                break; // (its client went, or the rest can't be written)
+            }
+        }
+    });
+    let head = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(first)) });
+    let rest = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|piece| (piece, rx)) });
+    Ok(Body::from_stream(head.chain(rest)))
+}
+
+/// A batch cut into pieces of about 1 MB of Arrow (by its rows' average size). An empty batch is one
+/// empty piece, so that CSV's header comes with the first piece, as `render` writes it.
+fn piece_rows(b: &RecordBatch) -> Vec<RecordBatch> {
+    const PIECE: usize = 1 << 20;
+    let rows = b.num_rows();
+    if rows == 0 {
+        return vec![b.clone()];
+    }
+    let per_row = (b.get_array_memory_size() / rows).max(1);
+    let step = (PIECE / per_row).max(1);
+    (0..rows).step_by(step).map(|at| b.slice(at, step.min(rows - at))).collect()
+}
+
+/// The pieces of one answer in one format. Written together they are what `render` writes for the
+/// whole answer: JSON's brackets and commas across pieces, CSV's header once, one Arrow stream.
+struct Encoding {
+    shape: Shape,
+    begun: bool, // the first piece is written (JSON's "[" and CSV's header go with it)
+    rows: usize, // JSON rows written so far (a comma goes before each but the first)
+    arrow: Option<StreamWriter<Vec<u8>>>,
+}
+
+#[derive(Clone, Copy)]
+enum Shape {
+    Json,
+    Lines,
+    Csv(u8),
+    Arrow,
+}
+
+impl Encoding {
+    fn new(format: Option<&str>) -> Self {
+        let shape = match format {
+            Some("csv") => Shape::Csv(b','),
+            Some("tsv") => Shape::Csv(b'\t'),
+            Some("ndjson") => Shape::Lines,
+            Some("arrow") => Shape::Arrow,
+            _ => Shape::Json, // (as `render`: any other format is JSON)
+        };
+        Encoding { shape, begun: false, rows: 0, arrow: None }
+    }
+
+    /// The bytes of one piece.
+    fn piece(&mut self, b: &RecordBatch) -> anyhow::Result<Vec<u8>> {
+        match self.shape {
+            Shape::Json => {
+                let mut out = self.open();
+                for row in lines(b)?.split(|c| *c == b'\n').filter(|r| !r.is_empty()) {
+                    if self.rows > 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(row);
+                    self.rows += 1;
+                }
+                Ok(out)
+            }
+            Shape::Lines => lines(b),
+            Shape::Csv(delimiter) => {
+                let header = !std::mem::replace(&mut self.begun, true);
+                let mut w = datafusion::arrow::csv::WriterBuilder::new().with_header(header).with_delimiter(delimiter).build(Vec::new());
+                w.write(b)?;
+                Ok(w.into_inner())
+            }
+            Shape::Arrow => {
+                let mut w = match self.arrow.take() {
+                    Some(w) => w,
+                    None => StreamWriter::try_new(Vec::new(), &b.schema())?, // (its schema goes with the first piece)
+                };
+                w.write(&crate::query::compact(b.clone()))?;
+                let out = std::mem::take(w.get_mut());
+                self.arrow = Some(w);
+                Ok(out)
+            }
+        }
+    }
+
+    /// One step of the answer: a piece, or (None) what closes it.
+    fn step(&mut self, piece: Option<&RecordBatch>) -> anyhow::Result<Vec<u8>> {
+        match piece {
+            Some(b) => self.piece(b),
+            None => self.end(),
+        }
+    }
+
+    /// What closes the answer: JSON's "]" (after its "[", if no piece had rows), Arrow's end of stream.
+    fn end(&mut self) -> anyhow::Result<Vec<u8>> {
+        match self.shape {
+            Shape::Json => {
+                let mut out = self.open();
+                out.push(b']');
+                Ok(out)
+            }
+            Shape::Arrow => {
+                let mut w = match self.arrow.take() {
+                    Some(w) => w,
+                    None => StreamWriter::try_new(Vec::new(), &datafusion::arrow::datatypes::Schema::empty())?, // (no rows at all: as `query::ipc` writes them)
+                };
+                w.finish()?;
+                Ok(std::mem::take(w.get_mut()))
+            }
+            Shape::Lines | Shape::Csv(_) => Ok(vec![]),
+        }
+    }
+
+    /// JSON's "[", once: before the first piece's rows, or before the "]" when there are none.
+    fn open(&mut self) -> Vec<u8> {
+        if std::mem::replace(&mut self.begun, true) {
+            vec![]
+        } else {
+            b"[".to_vec()
+        }
+    }
+}
+
+/// A piece's rows as newline-delimited JSON (`render`'s own writer, one line a row).
+fn lines(b: &RecordBatch) -> anyhow::Result<Vec<u8>> {
+    let mut w = arrow_json::LineDelimitedWriter::new(Vec::new());
+    w.write_batches(&[b])?;
+    w.finish()?;
+    Ok(w.into_inner())
 }
 
 /// Rows as `?format=` asks: JSON, a text table, or Arrow IPC (straight into pandas, Polars and
@@ -1464,13 +1711,14 @@ async fn ready(State(app): State<App>) -> Response {
     }
 }
 
-async fn stats(State(app): State<App>) -> Json<Value> {
+async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<Value> {
     let c = &app.cluster;
     let role = if c.reader { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     let mut s = j!({"lake": crate::ddl::lake_name(&app.lake), "role": role, "leader": c.leader.addr, "term": c.leader.n, "nodes": c.nodes(),
                     "hwm": *app.lake.hwm.borrow(), "shard_runs": c.shard_runs.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     s["version"] = j!(crate::format::VERSION);
+    s["owner"] = j!(owner(&headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)
     s["format"] = j!(crate::format::of(&app.lake.cat).await.map(|f| f.format).unwrap_or_default()); // (the lake's: ADR-039)
     s["keys"] = j!(crate::users::kept(&app.lake).await); // (the lake's own keys: sealed by its master key, or in the clear)
     if c.is_leader() {

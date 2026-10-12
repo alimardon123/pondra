@@ -49,7 +49,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     }
     let remote = scheme(to).is_some_and(|s| s != "file");
     match remote {
-        false => ensure!(owner(), "COPY … TO {to}: a file on the node's machine; only the program that started the node (the shell) writes those"),
+        false => ensure!(owner(), "COPY … TO {to}: a path on the server's own disk, which a client writes only through a node it started itself (the `pondra` shell, `pondra sql`, `local()`): write it there, or to a bucket (s3://, gs://, az://)"),
         true => {
             ensure!(owner() || covering(&list(lake).await?, to).is_some(), "{}", uncovered(to));
             register(lake, to).await?;
