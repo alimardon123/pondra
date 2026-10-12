@@ -133,6 +133,10 @@ pub struct TableMeta {
     /// door refuses a value its column's labels don't list.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub enums: BTreeMap<String, crate::types::Enum>,
+    /// Columns that hold text but are of another SQL type, by stored name: "uuid" (`types.rs`).
+    /// Every door refuses a value that isn't one of the type's, written its one way.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sql_types: BTreeMap<String, String>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ext: Option<crate::ext::Spec>,
@@ -220,6 +224,7 @@ impl TableMeta {
             identity: self.identity.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, i)| (n(c), i.clone())).collect(),
             constraints: self.constraints.iter().map(|c| c.named(&n)).collect(),
             enums: self.enums.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, e)| (n(c), e.clone())).collect(),
+            sql_types: self.sql_types.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, t)| (n(c), t.clone())).collect(),
             names: BTreeMap::new(),
             dropped: vec![],
             ..self.clone()
@@ -1021,6 +1026,7 @@ impl Lake {
         crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
         crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
         crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
+        crate::types::register(&ctx); // gen_random_uuid(), uuidv7(), pg_typeof(x)
         crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
         ctx
     }

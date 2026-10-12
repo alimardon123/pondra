@@ -40,7 +40,7 @@ serde_json = "1"
 anyhow = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"], optional = true } # pondra.toml (already built for slatedb's figment)
 bytes = "1"
-uuid = { version = "1", features = ["v4"], optional = true }
+uuid = { version = "1", features = ["v4", "v7"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 futures = "0.3"
 mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"], optional = true } # (as the library's, `capi/`: one build makes the program, the library and the launcher; in a program the linker turns it back into the fast form)

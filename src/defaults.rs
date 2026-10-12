@@ -16,12 +16,12 @@ use serde_json::{json, Value};
 pub fn check(meta: &TableMeta, table: &str, rows: &RecordBatch) -> Result<()> { check_named(meta, table, rows, true) }
 
 fn check_named(meta: &TableMeta, table: &str, rows: &RecordBatch, sql_names: bool) -> Result<()> {
-    if (meta.not_null.is_empty() && meta.checks.is_empty() && meta.enums.is_empty()) || rows.num_rows() == 0 {
+    if (meta.not_null.is_empty() && meta.checks.is_empty() && meta.enums.is_empty() && meta.sql_types.is_empty()) || rows.num_rows() == 0 {
         return Ok(());
     }
     let deleted = rows.column_by_name("_deleted").and_then(|d| d.as_boolean_opt().cloned());
     let marker = |i: usize| deleted.as_ref().is_some_and(|d| d.is_valid(i) && d.value(i));
-    crate::types::check(meta, rows, sql_names, &marker)?; // (an enum's labels)
+    crate::types::check(meta, rows, sql_names, &marker)?; // (an enum's labels, a uuid's form)
     if !meta.checks.is_empty() {
         // (under SQL's names, every column there: one a write leaves out is NULL, which passes)
         let named = match sql_names || !meta.mapped() {
@@ -75,7 +75,7 @@ pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
 /// A bulk INSERT's rows (under their stored names), checked as they stream into files.
 pub fn checked(rows: datafusion::execution::SendableRecordBatchStream, meta: &Option<TableMeta>, table: &str) -> datafusion::execution::SendableRecordBatchStream {
     use futures::StreamExt;
-    let Some(meta) = meta.clone().filter(|m| !m.not_null.is_empty() || !m.checks.is_empty() || !m.enums.is_empty()) else { return rows };
+    let Some(meta) = meta.clone().filter(|m| !m.not_null.is_empty() || !m.checks.is_empty() || !m.enums.is_empty() || !m.sql_types.is_empty()) else { return rows };
     let (schema, table) = (rows.schema(), table.to_string());
     let checked = rows.map(move |b| {
         let b = b?;
@@ -94,6 +94,7 @@ pub async fn values(lake: &crate::store::Lake, meta: &TableMeta, column: &str, n
     let Some(stored) = meta.stored(column) else { return Ok(None) };
     let (Some(expr), Some((_, _, t))) = (meta.defaults.get(stored), meta.live().find(|(s, _, _)| *s == stored)) else { return Ok(None) };
     let ctx = SessionContext::new();
+    crate::types::register(&ctx); // (gen_random_uuid(), uuidv7())
     if crate::seq::calls(expr) {
         crate::seq::register(&ctx, lake.arc()); // (an identity's `nextval('t_id_seq')`)
     }
@@ -106,6 +107,7 @@ pub async fn values(lake: &crate::store::Lake, meta: &TableMeta, column: &str, n
 /// A default's expression checked when the table is made: it gives one value of the column's type.
 pub async fn validate(column: &str, sql_type: &str, expr: &str) -> Result<()> {
     let ctx = SessionContext::new();
+    crate::types::register(&ctx); // (gen_random_uuid(), uuidv7())
     let one = |_: &[datafusion::logical_expr::ColumnarValue]| Ok(datafusion::logical_expr::ColumnarValue::Scalar(datafusion::common::ScalarValue::Int64(Some(1))));
     let int = datafusion::arrow::datatypes::DataType::Int64;
     ctx.register_udf(datafusion::prelude::create_udf("nextval", vec![datafusion::arrow::datatypes::DataType::Utf8], int, datafusion::logical_expr::Volatility::Volatile, std::sync::Arc::new(one))); // (its type: the sequence itself is looked for by `seq::named_exist`)
