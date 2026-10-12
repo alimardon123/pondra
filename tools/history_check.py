@@ -174,6 +174,35 @@ def history_check(bin, work, port):
     gone = refused(f"SELECT * FROM short AT (VERSION => {first})")
     checks["AT refused by name: a keyed table, a time before the table's retention kept"] = "keyed table" in keyed and "its past is kept from version" in gone
 
+    # AT (OFFSET => -n) is n seconds before now, so it moves: the same text asked again gives the new answer.
+    q("CREATE TABLE off (a BIGINT)")
+    q("INSERT INTO off VALUES (1)")
+    time.sleep(1.5)
+    q("UPDATE off SET a = 2")
+    time.sleep(1.2)
+    moved_first = rows("SELECT a FROM off AT (OFFSET => -1)")
+    q("UPDATE off SET a = 3")
+    time.sleep(1.2)
+    moved_second = rows("SELECT a FROM off AT (OFFSET => -1)")
+    checks["AT (OFFSET => -n) asked twice with a change between: the second answer shows the change (never a remembered answer)"] = moved_first == [(2,)] and moved_second == [(3,)]
+    # Asked again with no commit in between, a second later: a remembered answer from the first ask would
+    # still say 1, the value a second before the change, so this is the case that catches one.
+    q("CREATE TABLE off2 (a BIGINT)")
+    q("INSERT INTO off2 VALUES (1)")
+    time.sleep(1.5)
+    q("UPDATE off2 SET a = 2")
+    early = rows("SELECT a FROM off2 AT (OFFSET => -1)")
+    time.sleep(1.2)
+    late = rows("SELECT a FROM off2 AT (OFFSET => -1)")
+    checks["AT (OFFSET => -n) asked again with no change in between, a second later: the answer moves with the time"] = early == [(1,)] and late == [(2,)]
+
+    # AT before a table was made: refused by name, by its time (OFFSET) and by its version, as before its kept past.
+    q("CREATE TABLE young (a BIGINT)")
+    q("INSERT INTO young VALUES (1)")
+    then_time = refused("SELECT * FROM young AT (OFFSET => -3600)")
+    then_version = refused("SELECT * FROM young AT (VERSION => 1)")
+    checks["AT before the table was made: refused by name (OFFSET, VERSION)"] = "was made at version" in then_time and "was made at version" in then_version
+
     # RESTORE: the table as it was, by one change (ids of rows changed since kept, unchanged rows untouched).
     q("CREATE TABLE rs (id BIGINT, v VARCHAR)")
     q("INSERT INTO rs SELECT x, 'v' FROM generate_series(1, 5) AS s(x)")

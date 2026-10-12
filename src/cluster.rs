@@ -61,11 +61,13 @@ impl Cluster {
     pub async fn join(store: &Store, addr: &str, reader: bool) -> Result<Arc<Cluster>> {
         let leader = loop {
             match latest(store).await? {
-                Some(t) if t.addr == addr && !reader => {
-                    relock(&t); // ours, after a restart: the exec let go of its lock
+                Some(t) if reader => break t, // (we only read anyway)
+                // (ours, after a restart: the exec let go of its lock. A term that stepped down is over,
+                // and taken again it would look dead to everyone (`alive`): a new one, below)
+                Some(t) if t.addr == addr && !stepped_down(store, t.n).await => {
+                    relock(&t);
                     break t;
                 }
-                Some(t) if t.addr == addr || reader => break t, // ours, or we only read anyway
                 None if reader => break Term { n: 0, addr: String::new(), lock: String::new() },
                 Some(t) if alive(store, &t).await && !t.addr.is_empty() => break t,
                 Some(t) if alive(store, &t).await => tokio::time::sleep(Duration::from_secs(1)).await, // a `pondra sql` INSERT is recording: wait
@@ -467,7 +469,9 @@ pub async fn alive(store: &Store, t: &Term) -> bool {
         return false; // a claimer on this machine that ended can't be alive, whatever its mark says
     }
     match store.head(&Path::from(format!("cluster/alive/{:020}", t.n))).await {
-        Ok(m) => (crate::log::now_ms() as i64 - m.last_modified.timestamp_millis()) < 30_000,
+        // (a leader that stepped down isn't alive, whatever its mark says: its last mark, in flight
+        // as it stepped down, can land after `release` took it away)
+        Ok(m) => (crate::log::now_ms() as i64 - m.last_modified.timestamp_millis()) < 30_000 && !stepped_down(store, t.n).await,
         Err(_) => false,
     }
 }

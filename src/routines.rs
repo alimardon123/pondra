@@ -586,6 +586,12 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
     if !sql.contains('$') && !getvariable || makes_code(sql) {
         return Ok(sql.to_string()); // (a task's or a routine's `$day`: its own, each time it runs)
     }
+    if let Some((head, moment)) = crate::past::restore_moment(sql) {
+        // (`RESTORE TABLE t TO TIMESTAMP AS OF $before`: its moment bound as a query's column, the rest as written)
+        let one = bind_as(&format!("SELECT {moment} AS __moment"), params, numbered)?;
+        let moment = one.strip_prefix("SELECT ").and_then(|m| m.strip_suffix(" AS __moment")).context("a RESTORE's moment")?;
+        return Ok(format!("{head}{moment}"));
+    }
     let sql = &crate::sparksql::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
     let sql = &crate::past::syntax(sql); // (`t AT (VERSION => $v)`)
     let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
@@ -1982,5 +1988,13 @@ mod tests {
         let refused = |sql: &str| args("f", &call(sql)).err().map(|e| e.to_string()).unwrap_or_default();
         assert!(refused("f(day => 1, 2)").contains("by position come before those by name"));
         assert!(refused("f(day => 1, DAY => 2)").contains("day given twice"));
+    }
+
+    #[test]
+    fn a_restores_moment_is_bound() {
+        let values = HashMap::from([("before".to_string(), serde_json::json!({"sql": "TIMESTAMP '2026-10-02 12:00:00'"}))]);
+        let bound = bind("RESTORE TABLE sales.prices TO TIMESTAMP AS OF $before;", &values).unwrap();
+        assert_eq!(bound, "RESTORE TABLE sales.prices TO TIMESTAMP AS OF (TIMESTAMP '2026-10-02 12:00:00')");
+        assert!(bind("RESTORE TABLE t TO VERSION AS OF $v", &values).unwrap_err().to_string().contains("no value for $v"));
     }
 }

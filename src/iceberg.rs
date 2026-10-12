@@ -551,15 +551,14 @@ pub fn list_schema() -> String {
 /// as elsewhere (`Authorization: Bearer …`; a commit needs a writer's).
 pub fn rest() -> axum::Router<crate::server::App> {
     use axum::routing::{get, post};
-    let endpoints = ["GET /v1/{prefix}/namespaces", "GET /v1/{prefix}/namespaces/{namespace}", "HEAD /v1/{prefix}/namespaces/{namespace}",
+    let endpoints = ["GET /v1/{prefix}/namespaces", "POST /v1/{prefix}/namespaces", "GET /v1/{prefix}/namespaces/{namespace}", "HEAD /v1/{prefix}/namespaces/{namespace}", "DELETE /v1/{prefix}/namespaces/{namespace}",
         "GET /v1/{prefix}/namespaces/{namespace}/tables", "POST /v1/{prefix}/namespaces/{namespace}/tables", "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
         "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}", "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}",
         "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}", "POST /v1/{prefix}/tables/rename", "POST /v1/{prefix}/transactions/commit"];
-    let refuse = |what: &'static str| move || async move { Err::<axum::Json<Value>, _>(bad(format!("{what} in Pondra's SQL; other engines read its tables and append to them"))) };
     axum::Router::new()
         .route("/v1/config", get(move || async move { axum::Json(json!({"defaults": {}, "overrides": {}, "endpoints": endpoints})) }))
-        .route("/v1/namespaces", get(namespaces).post(refuse("CREATE SCHEMA")))
-        .route("/v1/namespaces/{ns}", get(namespace).head(namespace).delete(refuse("DROP SCHEMA")))
+        .route("/v1/namespaces", get(namespaces).post(create_namespace))
+        .route("/v1/namespaces/{ns}", get(namespace).head(namespace).delete(drop_namespace))
         .route("/v1/namespaces/{ns}/tables", get(tables).post(create))
         .route("/v1/namespaces/{ns}/tables/{table}", get(load).head(load).post(update).delete(drop_table))
         .route("/v1/tables/rename", post(rename))
@@ -615,6 +614,40 @@ async fn namespace(axum::extract::State(app): axum::extract::State<crate::server
     Ok(axum::Json(json!({"namespace": parts, "properties": {}})))
 }
 
+/// `POST /v1/namespaces`: `CREATE SCHEMA`, run as the caller (DDL: an admin's), in this lake: an
+/// attached lake's schemas are made by its own nodes, as in SQL. Its properties are none but
+/// `owner` (Spark's, the caller as in SQL); another is refused by name, since a schema keeps none.
+async fn create_namespace(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, body: bytes::Bytes) -> Reply {
+    let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the namespace: {e}")))?;
+    let parts: Vec<String> = asked["namespace"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
+    if let Some(p) = asked["properties"].as_object().and_then(|p| p.keys().find(|k| *k != "owner")) {
+        return Err(bad(format!("the namespace property {p}: Pondra's schemas keep no properties")));
+    }
+    if spaces(&app).await.iter().any(|(p, _, _)| *p == parts) {
+        return Err(refused(409, "AlreadyExistsException", format!("namespace {} already exists", parts.join("."))));
+    }
+    let [s] = &parts[..] else {
+        return Err(bad(format!("namespace {}: a schema of this database is one part; an attached database's schemas are made by its own nodes", parts.join("."))));
+    };
+    as_caller(&app, role, &format!("CREATE SCHEMA {}", quoted(s))).await?;
+    Ok(axum::Json(json!({"namespace": parts, "properties": {}})))
+}
+
+/// `DELETE /v1/namespaces/{ns}`: `DROP SCHEMA`, as the caller. One that holds anything is `409
+/// NamespaceNotEmptyException`, as the REST specification has it (`as_caller`).
+async fn drop_namespace(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path(ns): axum::extract::Path<String>) -> Result<axum::http::StatusCode, Refusal> {
+    let (parts, lake, schema) = space(&app, &ns).await?;
+    if !std::sync::Arc::ptr_eq(&lake, &app.lake) {
+        return Err(bad(format!("namespace {} is {}'s, an attached database: its schemas are dropped by its own nodes", parts.join("."), parts[0])));
+    }
+    as_caller(&app, role, &format!("DROP SCHEMA {}", quoted(&schema))).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+fn quoted(n: &str) -> String {
+    format!("\"{}\"", n.replace('"', "\"\""))
+}
+
 /// The tables with Iceberg metadata published.
 async fn tables(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path(ns): axum::extract::Path<String>) -> Reply {
     let (parts, lake, schema) = space(&app, &ns).await?;
@@ -626,7 +659,7 @@ async fn tables(axum::extract::State(app): axum::extract::State<crate::server::A
 
 /// A table's name as SQL says it, from its namespace (`spaces`).
 fn sql_name(app: &crate::server::App, parts: &[String], lake: &std::sync::Arc<Lake>, schema: &str, table: &str) -> String {
-    let q = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+    let q = quoted;
     match (std::sync::Arc::ptr_eq(lake, &app.lake), schema == crate::ddl::PUBLIC) {
         (true, true) => q(table),
         (true, false) => format!("{}.{}", q(schema), q(table)),
@@ -640,6 +673,7 @@ async fn as_caller(app: &crate::server::App, role: crate::auth::Role, sql: &str)
     Box::pin(crate::routines::one(app, sql, who, None)).await.map(|_| ()).map_err(|e| match format!("{e:#}") {
         e if e.contains("may not") => refused(403, "ForbiddenException", e),
         e if e.contains("already exists") => refused(409, "AlreadyExistsException", e),
+        e if e.contains("isn't empty") => refused(409, "NamespaceNotEmptyException", e),
         e => bad(e),
     })
 }
@@ -1054,7 +1088,8 @@ async fn keyed(lake: &Lake, name: &str, meta: &TableMeta, c: &mut Commit) -> Res
     let ctx = lake.session();
     let mut gone = vec![]; // (the keys it deletes, under their SQL names)
     for (f, by) in &c.equality {
-        anyhow::ensure!(by.iter().copied().collect::<std::collections::BTreeSet<_>>() == ids, "{}: an equality delete by fields {by:?}; {name} takes them by its key (fields {ids:?})", f.path);
+        let named = |by: &[i64]| by.iter().map(|i| usize::try_from(i - 1).ok().and_then(|i| meta.columns.get(i)).map_or_else(|| format!("field {i}"), |(c, _)| meta.name_of(c).to_string())).collect::<Vec<_>>().join(", ");
+        anyhow::ensure!(by.iter().copied().collect::<std::collections::BTreeSet<_>>() == ids, "{}: an equality delete by {}; {name} takes equality deletes by its key ({}) only", f.path, named(by), names.join(", "));
         let df = ctx.read_parquet(lake.full(&f.path), Default::default()).await?;
         gone.extend(df.select(names.iter().map(|n| ident(*n)).collect::<Vec<_>>())?.collect().await?);
     }
@@ -1209,7 +1244,7 @@ async fn parse(lake: &Lake, table: &str, meta: &Value, asked: &Value) -> Result<
                         }
                         continue;
                     }
-                    s => return Err(bad(format!("a manifest entry of status {s:?}"))),
+                    s => return Err(bad(format!("a manifest entry of status {}: Iceberg's are 0 (existing), 1 (added) and 2 (deleted)", s.map_or("none".into(), |s| s.to_string())))),
                 }
                 if !d["file_format"].as_str().unwrap_or_default().eq_ignore_ascii_case("parquet") {
                     return Err(bad(format!("{}: Pondra takes Parquet data files", d["file_path"])));
@@ -1273,7 +1308,8 @@ async fn check(lake: &Lake, c: &Commit) -> Result<()> {
     let st: Published = lake.cat.get(&format!("i/{}", c.table)).await?.unwrap_or_default();
     anyhow::ensure!(c.uuid.as_ref().is_none_or(|u| *u == st.uuid), "{CONFLICT}: it is another table now (a new uuid)");
     let main = st.snapshots.last().and_then(|(s, _)| s["snapshot-id"].as_i64());
-    anyhow::ensure!(c.parent.is_none_or(|p| p == main), "{CONFLICT}: main is snapshot {main:?} now, not {:?}", c.parent.flatten());
+    let snapshot = |s: Option<i64>| s.map_or("none".to_string(), |s| s.to_string());
+    anyhow::ensure!(c.parent.is_none_or(|p| p == main), "{CONFLICT}: main's snapshot is {} now, not {}", snapshot(main), snapshot(c.parent.flatten()));
     anyhow::ensure!(!st.snapshots.iter().any(|(s, _)| s["snapshot-id"].as_i64() == Some(c.snapshot)), "{CONFLICT}: snapshot id {} is taken", c.snapshot);
     Ok(())
 }

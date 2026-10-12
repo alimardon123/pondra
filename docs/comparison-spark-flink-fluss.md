@@ -169,7 +169,7 @@ biggest open risk is scale-out, and only a multi-machine benchmark can retire it
 | Unstructured and multimodal | ✓ files in the lake (`files('…')`, `file_read`), `BINARY` with hashing and base64, `VARIANT`, `Float32[]` vectors — published as Delta arrays and Iceberg lists | — | — | blob and variant types planned | ✓ Databricks file types, `ai_query` |
 | Connectors & ecosystem | Kafka protocol in and out (any Kafka client, Debezium), Postgres, HTTP; Delta + Iceberg out, an Iceberg REST catalog that other engines append through (round 25); files on S3/GCS/Azure/HTTPS, other engines' Delta and Iceberg tables and other Kafka clusters, read and written (round 23) | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
 | Operations & footprint | ✓ 1 binary, 44–49 MB idle, 0.02 s start | JVM cluster | JVM cluster + checkpoints | JVM + ZooKeeper + Flink tiering job | managed |
-| Governance & security | read / write / admin tokens (HTTP, Postgres, MCP); no TLS or per-table grants yet | via platforms | via platforms | SASL users (1.0); TLS planned | ✓ Unity Catalog |
+| Governance & security | users, roles and per-table grants at every door; TLS on every door and between nodes (plain only from the node's own machine); an audit log and quotas | via platforms | via platforms | SASL users (1.0); TLS planned | ✓ Unity Catalog |
 | Maturity | prototype | ✓ | ✓ | 1.0, a top-level Apache project | beta |
 
 ## Processing power

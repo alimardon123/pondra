@@ -3,5 +3,5 @@
 import { spawnSync } from "node:child_process";
 import { binary } from "../index.js";
 
-const r = spawnSync(binary(), process.argv.slice(2), { stdio: "inherit" });
+const r = spawnSync(await binary(), process.argv.slice(2), { stdio: "inherit" });
 process.exit(r.status ?? 1);
