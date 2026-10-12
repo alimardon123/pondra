@@ -14,10 +14,10 @@ artifact() { gh api "repos/$repo/actions/runs/$1/artifacts" --jq ".artifacts[] |
 for _ in $(seq ${WAIT_MINUTES:-75}); do
   # (the newest run that builds: one stopped by a newer push, or skipped for a label, has nothing)
   read -r run status < <(gh run list --repo "$repo" --workflow build.yml --commit "$sha" --limit 10 --json databaseId,status,conclusion --jq '[.[] | select(.conclusion != "cancelled" and .conclusion != "skipped")][0] | "\(.databaseId) \(.status)"' 2>/dev/null || true) || true
-  [ -n "${run:-}" ] && [ "$run" != null ] || { run=$(bash "$(dirname "$0")/ci_build.sh" "$sha"); status=completed; }
+  [ -n "${run:-}" ] && [ "$run" != null ] || { run=$(bash "$(dirname "$0")/ci_build.sh" "$sha" "pondra-$platform"); status=completed; }
   id=$([ -n "$run" ] && artifact "$run" || true)
   if [ -z "$id" ] && [ "$status" = completed ]; then # (a push to main that built nothing, reusing a pull request's run: that run's)
-    reused=$(bash "$(dirname "$0")/ci_build.sh" "$sha"); [ -z "$reused" ] || { run=$reused; id=$(artifact "$run" || true); }
+    reused=$(bash "$(dirname "$0")/ci_build.sh" "$sha" "pondra-$platform"); [ -z "$reused" ] || { run=$reused; id=$(artifact "$run" || true); }
   fi
   if [ -n "$id" ]; then
     mkdir -p dist

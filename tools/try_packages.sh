@@ -32,7 +32,12 @@ if [ "$platform" = windows-x64 ]; then
   [ -z "$CI" ] || powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$root/tools/try_install.ps1")" \
     "$(cygpath -w "$root")" "$(cygpath -w "$try/installed")"  # (it sets the user's PATH: in CI only)
 else
-  SHELL=/bin/bash HOME="$try" PONDRA_INSTALL="$try/installed" PONDRA_ARCHIVE="$root/dist/pondra-$platform.tar.gz" sh "$root/install.sh"
+  # an archive whose SHA-256 isn't the one given is refused, and nothing is installed
+  if PONDRA_SHA256=0000000000000000000000000000000000000000000000000000000000000000 SHELL=/bin/bash HOME="$try" PONDRA_INSTALL="$try/refused" PONDRA_ARCHIVE="$root/dist/pondra-$platform.tar.gz" sh "$root/install.sh" 2> "$try/refused.err"; then
+    echo "install.sh installed an archive whose SHA-256 was wrong" >&2; exit 1
+  fi
+  grep -q "not installed" "$try/refused.err" && [ ! -e "$try/refused/pondra" ] || { echo "install.sh didn't refuse the wrong SHA-256 as it should:" >&2; cat "$try/refused.err" >&2; exit 1; }
+  PONDRA_SHA256="$( (sha256sum "$root/dist/pondra-$platform.tar.gz" 2>/dev/null || shasum -a 256 "$root/dist/pondra-$platform.tar.gz") | cut -d' ' -f1)" SHELL=/bin/bash HOME="$try" PONDRA_INSTALL="$try/installed" PONDRA_ARCHIVE="$root/dist/pondra-$platform.tar.gz" sh "$root/install.sh"
   rc=$try/.bashrc; [ "$(uname -s)" != Darwin ] || rc=$try/.bash_profile
   found=$(env -i HOME="$try" PATH=/usr/bin:/bin bash -c ". '$rc' && command -v pondra && pondra --version")
   [ "$(echo "$found" | head -1)" = "$try/installed/pondra" ] || { echo "the installer left pondra off PATH: $found"; exit 1; }

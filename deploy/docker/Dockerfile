@@ -25,6 +25,9 @@ VOLUME /data
 # HTTP and the console; Postgres, Flight and Kafka when their flags are given
 EXPOSE 8080 5432 8815 9092
 ENTRYPOINT ["pondra"]
+# On the network with no token, the leader makes the lake's first user (`pondra`) and prints its
+# token once: `docker logs <container> | grep pt_`. Another: `docker exec <container> pondra token
+# --dir /data/lake` (the lake is /data/lake here: WORKDIR is /data). Or give PONDRA_ADMIN_TOKEN.
 CMD ["serve", "lake", "--addr", "0.0.0.0:8080"]
 
 # The same, with Python for `LANGUAGE python` functions and procedures (`--python auto`, which
@@ -42,6 +45,8 @@ WORKDIR /data
 VOLUME /data
 EXPOSE 8080 5432 8815 9092
 ENTRYPOINT ["tini", "--", "pondra"]
+# (--python needs a token: the first user's is printed once, `docker logs <container> | grep pt_`,
+# or give PONDRA_ADMIN_TOKEN; `docker exec <container> pondra token --dir /data/lake` makes another)
 CMD ["serve", "lake", "--addr", "0.0.0.0:8080", "--python", "auto"]
 
 # (the default target: the image without Python)

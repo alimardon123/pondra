@@ -24,6 +24,8 @@
   harness.py upserts             keyed tables published every round; other engines' upserts, deletes, equality deletes
   harness.py external            CREATE EXTERNAL TABLE: a named view of files, INSERT into a folder's, what it refuses
   harness.py server              pondra serve <folder of lakes>: each a database (Postgres, HTTP, joins, idle, restart)
+  harness.py first               a node on the network with no token makes the lake's first user and prints its token once; pondra token
+  harness.py sealed              the lake's keys and secrets sealed by an admin token alone: nodes, rotation, short tokens
   harness.py safety              panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
   harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
   harness.py stopped             a run whose node was killed under it: stopped, not running for good
@@ -31,6 +33,7 @@
   harness.py use                 USE and SET search_path: schemas and databases, views and tasks, Postgres, Python, the shell, three nodes
   harness.py answers_big         answers in pieces: the same bytes as whole; 3M rows over 0.25 GB (53200 past it); turns (53300)
   harness.py friendly            SQL as DuckDB's users write it (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, …) == DuckDB's answers, spread too
+  harness.py unique_doors        UNIQUE through every loading door (appends, Flight, COPY): 23505 whole, retries duplicates, order, three nodes
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -105,8 +108,8 @@ def clean_up():
 
 
 class Node:
-    def __init__(self, lake, port, reader=False, env=None, cwd=None, **flags):
-        self.args = [BIN, "serve", "--dir", lake, "--addr", f"127.0.0.1:{port}"] + (["--reader"] if reader else [])
+    def __init__(self, lake, port, reader=False, env=None, cwd=None, host="127.0.0.1", **flags):
+        self.args = [BIN, "serve", "--dir", lake, "--addr", f"{host}:{port}"] + (["--reader"] if reader else [])
         self.args += [f"--{k.replace('_', '-')}" + ("" if v is True or v == "true" else f"={v}") for k, v in flags.items()]  # (a bare flag for true)
         self.port, self.env, self.cwd, self.p = port, {**os.environ, **(env or {})}, cwd, None
         self.log = os.path.join(tempfile.gettempdir(), f"pondra-{port}-{uuid.uuid4().hex[:6]}.stderr")
@@ -651,7 +654,7 @@ def outside():
     spread = metrics_of(A.port + 1)["pondra_spread_queries_total"]
     q("CREATE TABLE eu AS SELECT * FROM %s WHERE region = 'eu'" % glob)
     joined = f"SELECT e.region, count(*) AS n, sum(l.amount) AS s FROM {glob} e JOIN eu l ON e.id = l.id GROUP BY e.region"
-    while len(call(A.port + 1, "GET", "/stats")["nodes"]) < 3:
+    while len(call(A.port + 1, "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.1)  # (node 1 has heard of the others)
     checks["spread over three nodes == one node, and joined with a lake table"] = (q(by_region, 1, spread=1) == want and q(joined, 1, spread=1) == q(joined, 1, spread=0)
         and metrics_of(A.port + 1)["pondra_spread_queries_total"] - spread == 2)
@@ -917,7 +920,7 @@ def catalogs():
         checks["…and its data file was written with the vended key"] = signed_with(m) == {"VK"} and any(
             meth in ("PUT", "POST") and p.startswith("/warehouse/sales/orders/data/") for meth, p, _ in seen[m:])
         # (e) Three nodes: the same query, spread, is the one node's answer.
-        until(lambda: len(call(A.port + 1, "GET", "/stats")["nodes"]), 3, 60)  # (node 1 has heard of the other two)
+        until(lambda: len(call(A.port + 1, "GET", "/stats").get("nodes", ())), 3, 60)  # (node 1 has heard of the other two)
         spreads = metrics_of(A.port + 1)["pondra_spread_queries_total"]
         one = q(ORDERS.format("ice"), 0, spread=0)
         three = q(ORDERS.format("ice"), 1, spread=1)
@@ -1112,7 +1115,7 @@ def kafkas():
             return ""
         except RuntimeError as e:
             return str(e)
-    while len(call(A.port + 1, "GET", "/stats")["nodes"]) < 3:
+    while len(call(A.port + 1, "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.1)
     checks = {}
     # A Pondra node as the other cluster: a topic is its table (one partition), tokens its passwords.
@@ -1534,7 +1537,7 @@ def fence():
     seg = call(A.port, "POST", "/append/events?producer=a&seq=1", rows("a", 1, 100))["seg"]
     b = Node(lake, A.port + 1, flush_ms=50).start()
     joined = call(A.port + 1, "GET", "/stats")["role"] == "follower"
-    while len(call(A.port + 1, "GET", "/stats")["nodes"]) < 2:  # b has heard from the leader
+    while len(call(A.port + 1, "GET", "/stats").get("nodes", ())) < 2:  # b has heard from the leader
         time.sleep(0.1)
     via_b = call(A.port + 1, "POST", "/append/events?producer=b&seq=1", rows("b", 1, 100))["seg"]  # forwarded
     a.p.send_signal(signal.SIGSTOP)
@@ -1634,7 +1637,7 @@ def insert_spread():
     lake = new_lake()
     ports = [A.port + 1 + i for i in range(3)]
     nodes = [Node(lake, p, env={"PONDRA_SPREAD_MB": "0"} if i == 0 else {}).start() for i, p in enumerate(ports)]
-    while len(call(ports[0], "GET", "/stats")["nodes"]) < 3:
+    while len(call(ports[0], "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.1)
     q = lambda s, job=None: call(ports[0], "POST", "/sql" + (f"?job={job}" if job else ""), s.encode(), timeout=600)
     one = lambda s: q(s)[0]
@@ -2432,7 +2435,7 @@ def finishes_on_three():
     q("CREATE MATERIALIZED VIEW stats AS SELECT region, avg(amount) AS mean, stddev(amount) AS sd FROM sales GROUP BY region HAVING count(*) > 1", 0)
     for k in range(6):  # (six files: a share for each node)
         q("INSERT INTO sales " + SALES_ROWS.format(k * 5000 + 1, k * 5000 + 5000), 0)
-    while len(call(at, "GET", "/stats")["nodes"]) < 3:  # (every node heard from)
+    while len(call(at, "GET", "/stats").get("nodes", ())) < 3:  # (every node heard from)
         time.sleep(0.2)
     joined = "SELECT s.region, s.mean, s.sd, count(*) AS n, sum(x.amount) AS total FROM sales x JOIN stats s ON x.region = s.region GROUP BY 1, 2, 3 ORDER BY 1"
     ran = lambda: (lambda m: m["pondra_spread_queries_total"] + m["pondra_shuffled_queries_total"])(metrics_of(at))
@@ -3264,7 +3267,7 @@ def scale():
     # Two more nodes: the same query spread over three.
     for p in (port + 1, port + 2):
         Node(lake, p).start()
-    while len(call(port, "GET", "/stats")["nodes"]) < 3:
+    while len(call(port, "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.2)
     spread = call(port, "POST", "/sql?spread=1", b"SELECT count(*) AS n, sum(v) AS s FROM ev WHERE k <> 'none'")[0]
     was_spread = metrics_of(port)["pondra_spread_queries_total"] >= 1
@@ -6247,7 +6250,7 @@ def history():
         checks["a statement its client stopped waiting for: stopped, by its door"] = [(r["outcome"], r["door"]) for r in stopped] == [("stopped", "http")]
         # A slow statement (every one on b): its plan, its operators' rows; spread, each node's share
         q("SELECT count(*) AS n FROM t WHERE k % 7 = 0 -- h-slow", 1)
-        while len(call(A.port + 1, "GET", "/stats")["nodes"]) < 3:
+        while len(call(A.port + 1, "GET", "/stats").get("nodes", ())) < 3:
             time.sleep(0.2)
         call(A.port + 1, "POST", "/sql?spread=1", b"SELECT v, count(*) AS n FROM t GROUP BY v ORDER BY n DESC, v LIMIT 3 -- h-spread")
         slow, spread = until("h-slow"), until("h-spread")
@@ -6486,7 +6489,7 @@ def learn():
         checks["the run after the first with facts is planned without them: the bar they are held to"] = len(plans) == 2
         # Spread over three nodes: each plans with the facts the coordinator sent, so none falls back
         deadline = time.time() + 30
-        while len(call(A.port, "GET", "/stats")["nodes"]) < 3 and time.time() < deadline:
+        while len(call(A.port, "GET", "/stats").get("nodes", ())) < 3 and time.time() < deadline:
             time.sleep(0.2)
         n, _ = timed(0, spread="1")
         spread_row = []
@@ -7263,6 +7266,120 @@ def server():
     return f"server: a folder of lakes as databases over Postgres and HTTP, created, dropped, idle-stopped, joined, restarted: all {len(checks)} checks pass"
 
 
+def first():
+    """A node on the network (its --addr, --pg, --flight or --kafka not on 127.0.0.1) with no token
+    makes the lake's first user, pondra, a superuser, and prints its token once, before it serves
+    anyone: otherwise every request would be an admin's. A restart makes no other user. `pondra token`
+    makes another through the bucket, with the node up or with none; the lake keeps only its hash. A
+    node on 127.0.0.1 stays open; `serve --lakes` on the network with no token refuses to start; a
+    node with an admin token makes no user at all. A node on the network is never open: a follower of
+    a lake with no user yet answers no one until `pondra token` makes one. `pondra sql` with no token
+    writes there with the lake's own key for its nodes."""
+    import re
+    import psycopg
+    checks = {}
+    port, pg = A.port, A.port + 10
+    lake = new_lake()
+
+    def answer(p, path, body=b"", token=None):  # (status and body: a refusal is an answer too)
+        c = http.client.HTTPConnection("127.0.0.1", p, timeout=30)
+        c.request("POST" if body else "GET", path, body, {"Authorization": f"Bearer {token}"} if token else {})
+        r = c.getresponse()
+        return r.status, r.read()
+
+    def token_in(log):  # (the token a node's log shows, if any)
+        m = re.search(r"pt_[A-Za-z0-9_-]+", open(log).read())
+        return m.group(0) if m else None
+
+    def in_lake(needle):  # (the lake's own files, as a reader of the bucket sees them)
+        for d, _, fs in os.walk(lake):
+            for f in fs:
+                try:
+                    with open(os.path.join(d, f), "rb") as fh:
+                        if needle in fh.read():
+                            return True
+                except OSError:
+                    pass
+        return False
+
+    def stop(node):  # (SIGTERM, as a scheduler stops it: a leader hands its term on at once)
+        node.p.send_signal(signal.SIGTERM)
+        node.p.wait(timeout=120)
+
+    n1 = Node(lake, port, host="0.0.0.0", pg=f"0.0.0.0:{pg}").start()
+    token = token_in(n1.log)
+    checks["a node on the network with no token makes user pondra and prints its token once: without it 401, with it 200 (HTTP and Postgres as pondra)"] = bool(token) \
+        and "Its first user is pondra, a superuser" in open(n1.log).read() and answer(port, "/sql", b"SELECT 1 AS x")[0] == 401 \
+        and json.loads(answer(port, "/sql", b"SELECT 1 AS x", token)[1]) == [{"x": 1}]
+    pg_ok = False
+    if token:
+        with psycopg.connect(f"host=127.0.0.1 port={pg} user=pondra password={token} dbname=lake", autocommit=True) as c:
+            pg_ok = c.execute("SELECT 1 AS x").fetchall() == [(1,)]
+    checks["...and as pondra over Postgres, with the token as its password (a wrong one refused)"] = pg_ok and _raises(
+        lambda: psycopg.connect(f"host=127.0.0.1 port={pg} user=pondra password=pt_nope dbname=lake", autocommit=True))
+
+    stop(n1)
+    n2 = Node(lake, port, host="0.0.0.0", pg=f"0.0.0.0:{pg}").start()
+    names = json.loads(answer(port, "/sql", b"SELECT name FROM pondra.users ORDER BY name", token)[1])
+    checks["started again, it makes no other user and prints no token"] = token_in(n2.log) is None and names == [{"name": "pondra"}]
+
+    made = subprocess.run([BIN, "token", "--dir", lake], capture_output=True, text=True, timeout=120)
+    t2 = made.stdout.strip()
+    checks["pondra token --dir gives another token that works, with the node up (through the inbox); its stdout is the token alone"] = made.returncode == 0 \
+        and t2.startswith("pt_") and "shown once" in made.stderr and answer(port, "/sql", b"SELECT 1 AS x", t2)[0] == 200 and made.stdout.count("\n") == 1
+    stop(n2)
+    made = subprocess.run([BIN, "token", "--dir", lake, "--name", "offline"], capture_output=True, text=True, timeout=120)
+    t3 = made.stdout.strip()
+    n3 = Node(lake, port, host="0.0.0.0", pg=f"0.0.0.0:{pg}").start()
+    checks["...and with no node (it leads for a moment): that token works too; nothing of any token is in the lake's files"] = made.returncode == 0 \
+        and t3.startswith("pt_") and answer(port, "/sql", b"SELECT 1 AS x", t3)[0] == 200 and not any(in_lake(t.encode()) for t in (token, t2, t3) if t)
+
+    # (pondra sql with no token, while that leader serves: it sends the lake's own key for its nodes)
+    answer(port, "/sql", b"CREATE TABLE w (x BIGINT)", t3)
+    bare = {k: v for k, v in os.environ.items() if k not in ("PONDRA_TOKEN", "PONDRA_ADMIN_TOKEN", "PONDRA_NODE_KEY", "PONDRA_OWNER_KEY")}
+    wrote = [subprocess.run([BIN, "sql", "--dir", lake, q], capture_output=True, text=True, timeout=120, env=bare) for q in ("INSERT INTO w VALUES (1)", "INSERT INTO w SELECT x + 1 FROM w")]
+    rows = lambda: json.loads(answer(port, "/sql", b"SELECT count(*) AS n FROM w", t3)[1])[0]["n"]
+    checks["pondra sql writes to a lake its leader on the network serves, with no token (the lake's own key for its nodes): a row through the log, then a bulk INSERT"] = \
+        all(w.returncode == 0 for w in wrote) and until(rows, 2) == 2
+
+    open_node = Node(new_lake(), port + 1).start()  # (127.0.0.1 only: open, as it always was)
+    made_open = answer(port + 1, "/sql", b"CREATE TABLE t AS SELECT 1 AS x")[0] == 200 and json.loads(answer(port + 1, "/sql", b"SELECT x FROM t")[1]) == [{"x": 1}]
+    checks["a node on 127.0.0.1 stays open: /sql with no token answers, and no token is made"] = made_open and token_in(open_node.log) is None
+    open_node.kill()
+
+    folder = tempfile.mkdtemp(prefix="pondra-first-")
+    subprocess.run([BIN, "sql", "--dir", os.path.join(folder, "sales"), "CREATE TABLE t AS SELECT 1 AS x"], check=True, capture_output=True)
+    refused = subprocess.run([BIN, "serve", "--lakes", folder, "--addr", f"0.0.0.0:{port + 2}"], capture_output=True, text=True, timeout=60)
+    shutil.rmtree(folder, ignore_errors=True)
+    checks["serve --lakes on 0.0.0.0 with no token refuses to start, naming --admin-token"] = refused.returncode != 0 and "--admin-token" in refused.stderr
+
+    admin = Node(new_lake(), port + 3, host="0.0.0.0", admin_token="adm-first-1").start()
+    names = json.loads(answer(port + 3, "/sql", b"SELECT name FROM pondra.users", "adm-first-1")[1])
+    checks["a node with --admin-token on 0.0.0.0 makes no user: its token answers, and no other does"] = names == [] and token_in(admin.log) is None \
+        and answer(port + 3, "/sql", b"SELECT 1 AS x")[0] == 401
+    admin.kill()
+    n3.kill()
+
+    # (a follower on the network beside a leader on 127.0.0.1, of a lake with no user yet: never open)
+    lone = new_lake()
+    ld = Node(lone, port + 4).start()
+    fl = Node(lone, port + 5, host="0.0.0.0").start()
+    before = answer(port + 5, "/sql", b"SELECT 1 AS x")[0], answer(port + 4, "/sql", b"SELECT 1 AS x")[0]
+    made = subprocess.run([BIN, "token", "--dir", lone], capture_output=True, text=True, timeout=120)
+    t4 = made.stdout.strip()
+    took = lambda p: answer(p, "/sql", b"SELECT 1 AS x", t4)[0]
+    checks["a follower on the network, of a lake with no user yet (its leader on 127.0.0.1), answers no one; pondra token makes user pondra and a token both nodes take"] = \
+        before == (401, 200) and made.returncode == 0 and t4.startswith("pt_") and until(lambda: took(port + 5), 200) == 200 and took(port + 4) == 200
+    fl.kill()
+    ld.kill()
+
+    ok = all(checks.values())
+    print(json.dumps({"first": checks, "ok": ok}, indent=1))
+    if not ok:
+        return False
+    return f"a node on the network makes the lake's first user and prints its token once, with pondra token beside it: all {len(checks)} checks pass"
+
+
 # ---------------------------------------------------------------- round 29, part 2 (ADR-035)
 
 def users():
@@ -7580,6 +7697,146 @@ def _lake_keys():
     return checks, info
 
 
+def sealed():
+    """The lake's own keys and its secrets sealed by an admin token alone (ADR-058, invariant 260): with
+    --admin-token and no PONDRA_SECRET_KEY the token is the master key (PBKDF2, `admin_key`); where a
+    token is set a node's own machine key and the nodes' key from the bucket open nothing; a new token,
+    the old one as PONDRA_ADMIN_TOKEN_PREVIOUS, rewraps the keys and the secrets; a lake whose users sign
+    in while its keys are in the clear says so, and a short admin token is said to be short."""
+    import base64, http.server, re, socketserver
+    here = tempfile.mkdtemp(prefix="pondra-sealed-")
+    open(os.path.join(here, "rates.csv"), "w").write("cur,rate\nEUR,1.1\nGBP,1.3\n")
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=here, **k)
+        def log_message(self, *a):
+            pass
+    web = socketserver.TCPServer(("127.0.0.1", 0), Quiet)
+    threading.Thread(target=web.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{web.server_address[1]}/"
+    token = lambda tag: f"{tag}-" + uuid.uuid4().hex + uuid.uuid4().hex  # (32 characters or more)
+    T1, T2, T3, T9 = token("one"), token("two"), token("three"), token("nine")
+    boss = "Basic " + base64.b64encode(b"boss:boss-password-1").decode()
+    read = f"SELECT cur FROM read_csv('{url}rates.csv') ORDER BY cur"
+    rows = [{"cur": "EUR"}, {"cur": "GBP"}]
+    own_home = lambda: tempfile.mkdtemp(prefix="pondra-home-")  # (a machine key of its own, as on another machine)
+    def node(lake, port, token=None, home=None, env=None):
+        flags = {"admin_token": token} if token else {}
+        e = {"PONDRA_SECRET_KEY": "", "PONDRA_ADMIN_TOKEN": "", "PONDRA_SECRET_KEY_PREVIOUS": "", "PONDRA_ADMIN_TOKEN_PREVIOUS": "", **({"HOME": home} if home else {}), **(env or {})}
+        return Node(lake, port, env=e, **flags).start()
+    def ask(port, auth, q, path="/sql"):
+        try:
+            return call(port, "POST", path, q.encode() if isinstance(q, str) else q, headers={"Authorization": auth} if auth else {})
+        except Exception as e:
+            return f"ERROR {e}"
+    def said(port, auth, q):  # (the statement's status, and the notices its door sent)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+        c.request("POST", "/sql", q.encode(), {"Authorization": auth})
+        r = c.getresponse()
+        r.read()
+        return r.status, " ".join(json.loads(r.getheader("x-pondra-notices") or "[]"))
+    def stats(port, auth):
+        try:
+            return call(port, "GET", "/stats", headers={"Authorization": auth})
+        except Exception:
+            return {}
+    z_of = lambda lake: subprocess.run([BIN, "catalog", "--dir", lake, "z/"], capture_output=True, text=True).stdout
+    def in_files(lake, needle=b'"node":"pn_'):  # (the catalog's own files, as a reader of the bucket sees them)
+        for d, _, fs in os.walk(lake):
+            for f in fs:
+                try:
+                    with open(os.path.join(d, f), "rb") as fh:
+                        if needle in fh.read():
+                            return True
+                except OSError:
+                    pass
+        return False
+    def log_has(n, text):
+        return lambda: text in open(n.log).read()
+    WARN = "whoever can read the bucket"
+    checks, info, nodes = {}, {}, []
+    # 1. With only an admin token, a new lake's keys are sealed from its first write
+    lake = new_lake()
+    t1 = f"Bearer {T1}"
+    n1 = node(lake, A.port, token=T1, home=own_home()); nodes.append(n1)
+    ask(A.port, t1, "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")
+    carol = said(A.port, t1, "CREATE USER carol PASSWORD 'carol-password-1'")  # (a sealed lake says nothing)
+    kept = until(lambda: stats(A.port, t1).get("keys"), "sealed", 60)
+    fmt = stats(A.port, t1).get("format")
+    info["sealed from the first write"] = {"keys": kept, "format": fmt, "carol": carol}
+    checks["with only an admin token, a new lake's own keys are sealed from its first write: nothing of them in the clear in its files"] = \
+        kept == "sealed" and fmt == 3 and not in_files(lake)
+    # 2. A secret made on one node is used on another with only the admin token, each with its own machine key
+    n2 = node(lake, A.port + 1, token=T1, home=own_home()); nodes.append(n2)
+    ask(A.port, t1, f"CREATE SECRET rates (TYPE http, BEARER_TOKEN 'tok-123456', SCOPE '{url}')")
+    on_two = until(lambda: ask(A.port + 1, t1, read), rows, 60)
+    info["used on another node"] = on_two
+    checks["a secret made on one node is used on another with only the admin token, each node with its own machine key"] = on_two == rows
+    # 3. Another admin token opens neither, and says so
+    n1.kill(); n2.kill()
+    n3 = node(lake, A.port + 2, token=T9, home=own_home()); nodes.append(n3)
+    named = until(log_has(n3, "PONDRA_ADMIN_TOKEN"), True, 20)
+    refused, deadline = "", time.time() + 90  # (a node that isn't the leader yet answers when it can)
+    while "PONDRA_ADMIN_TOKEN" not in (refused := str(ask(A.port + 2, f"Bearer {T9}", read))) and time.time() < deadline:
+        time.sleep(0.5)
+    info["another token"] = {"stderr named it": named, "read": refused[:400]}
+    checks["a node with another admin token opens neither, and says to set PONDRA_ADMIN_TOKEN"] = named is True and "PONDRA_ADMIN_TOKEN" in refused
+    n3.kill()
+    # 4. A new admin token, the old one as PONDRA_ADMIN_TOKEN_PREVIOUS: rewraps the keys and the secrets; then the new token alone opens them
+    n4 = node(lake, A.port, token=T2, home=own_home(), env={"PONDRA_ADMIN_TOKEN_PREVIOUS": T1}); nodes.append(n4)
+    rewrapped = until(lambda: "rewrapped 1 secret" in open(n4.log).read() and "the lake's own keys rewrapped" in open(n4.log).read(), True, 90)
+    n4.kill()
+    n5 = node(lake, A.port, token=T2, home=own_home()); nodes.append(n5)
+    session = ask(A.port, None, json.dumps({"user": "boss", "password": "boss-password-1"}), path="/login")
+    signed = until(lambda: ask(A.port, f"Bearer {session['token']}", read), rows, 90) if isinstance(session, dict) else session
+    alone = ask(A.port, f"Bearer {T2}", read)
+    info["rotated"] = {"rewrapped": rewrapped, "session": isinstance(session, dict), "read with the session": signed, "read with T2": alone}
+    checks["a new admin token, the old one as PONDRA_ADMIN_TOKEN_PREVIOUS, rewraps the keys and secrets; then the new token alone opens them: a session signs in, a secret is used"] = \
+        rewrapped is True and isinstance(session, dict) and signed == rows and alone == rows
+    n5.kill()
+    # 5. The nodes' key read from the bucket opens nothing where an admin token is set
+    lake5 = new_lake()
+    n6 = node(lake5, A.port, home=own_home()); nodes.append(n6)  # (no token: its keys in the clear)
+    ask(A.port, None, "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")
+    clear = until(lambda: stats(A.port, boss).get("keys"), "clear", 60)
+    found = re.search(r'"node":"(pn_[A-Za-z0-9_-]+)"', z_of(lake5))
+    pn = found.group(1) if found else ""
+    open_before = ask(A.port, f"Bearer {pn}", "SELECT 1 AS one")  # (the threat without a token: kept in info)
+    info["the nodes' key with no token"] = {"keys": clear, "answer": str(open_before)[:200]}
+    # 6. Keys in the clear where users sign in: said at the leader's start, and by CREATE USER, a password and a token
+    said_at_create = until(log_has(n6, WARN), True, 20)
+    created = said(A.port, boss, "CREATE USER ann PASSWORD 'ann-password-1'")
+    altered = said(A.port, boss, "ALTER USER ann PASSWORD 'ann-password-2'")
+    made = said(A.port, boss, "CREATE TOKEN t FOR ann")
+    info["notices"] = {"stderr": said_at_create, "create": created[1][:80], "alter": altered[1][:80], "token": made[1][:80], "sealed lake's create": carol[1][:80]}
+    checks["keys in the clear where users sign in: the leader says so, and CREATE USER, a password changed and a token made answer with a notice; a sealed lake's CREATE USER carries none"] = \
+        said_at_create is True and all(WARN in n[1] for n in (created, altered, made)) and WARN not in carol[1] and created[0] == 200
+    n6.kill()
+    # (the nodes' key, once an admin token is set on the lake: refused; the admin token answers; the keys get sealed)
+    n7 = node(lake5, A.port, token=T3, home=own_home()); nodes.append(n7)
+    pn_refused = str(ask(A.port, f"Bearer {pn}", "SELECT 1 AS one"))
+    t3_answer = until(lambda: ask(A.port, f"Bearer {T3}", "SELECT 1 AS one"), [{"one": 1}], 120)
+    sealed_now = until(lambda: stats(A.port, f"Bearer {T3}").get("keys"), "sealed", 120)
+    info["an admin token set"] = {"pn_": pn_refused[:120], "T3": str(t3_answer)[:120], "keys": sealed_now}
+    checks["with an admin token set, the nodes' key read from the bucket opens nothing (401), the admin token answers, and the keys are sealed"] = \
+        pn_refused.startswith("ERROR 401") and t3_answer == [{"one": 1}] and sealed_now == "sealed"
+    n7.kill()
+    # 7. A short admin token is said to be short
+    lake7 = new_lake()
+    n8 = node(lake7, A.port, token="short-1", home=own_home()); nodes.append(n8)
+    ask(A.port, "Bearer short-1", "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")
+    short = until(log_has(n8, "the admin token is short"), True, 20)
+    info["short token"] = short
+    checks["a short admin token is said to be short"] = short is True
+    n8.kill()
+    for n in nodes:
+        n.kill()
+    web.shutdown()
+    ok = all(checks.values())
+    print(json.dumps({"sealed": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
 def safety():
     """Safe to share, the rest of it (round 29, ADR-035 §5): a panic in a request is answered as an
     error, the node kept up (HTTP, Postgres, a query's own tasks); TLS on every door (HTTPS,
@@ -7640,6 +7897,40 @@ def safety():
     }
     checks["HTTPS answers; plain HTTP only from this machine, refused from another saying why"] = said["https"] == (200, '[{"x":1}]') and said["plain here"] == (200, '[{"x":1}]') \
         and (not away or (said["https away"] == (200, '[{"x":1}]') and said["plain away"][0] == 403 and "takes TLS" in said["plain away"][1]))
+
+    # A browser page the user visits is kept off an open node by `auth::cross_site` at the guard
+    # (its own test block is below, in `users`). Here we only check the settings endpoint's own
+    # belt: `web()` reaches it over plain HTTP from this machine, with or without a browser Origin.
+    def web(port, path, origin=None, host=None, body=b"SELECT 1 AS x", method="POST", secure=False):
+        # (plain HTTP from this machine, which an open node answers; the HTTPS checks above cover TLS.)
+        ctx = ssl.create_default_context(cafile=ca)
+        c = http.client.HTTPSConnection("127.0.0.1", port, context=ctx, timeout=60) if secure else http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        h = {}
+        if origin is not None:
+            h["Origin"] = origin
+        if host is not None:
+            h["Host"] = host  # (http.client keeps our Host when we set it: a rebind, as a browser sees it)
+        try:
+            c.request(method, path, body, h)
+            r = c.getresponse()
+            return r.status, r.read().decode(errors="replace")
+        except Exception as e:
+            return 0, f"{type(e).__name__}: {e}"
+    # PUT /console/settings is an admin's, from this machine (like choosing the Python): a web page
+    # the user visits can't overwrite them, and behind a reverse proxy a loopback address no longer
+    # stands in for a token. Its own PONDRA_CONFIG_DIR keeps the test off this machine's real settings.
+    cfg = tempfile.mkdtemp(prefix="pondra-settings-")
+    setn = Node(new_lake(), P + 50, env={"PONDRA_CONFIG_DIR": cfg}).start()
+    settings_said = {
+        "local admin (no origin)": web(P + 50, "/console/settings", body=b'{"theme":"dark"}', method="PUT"),
+        "cross-site": web(P + 50, "/console/settings", origin="https://evil.example", body=b'{"theme":"light"}', method="PUT"),
+        "read-back": web(P + 50, "/console/settings", body=b"", method="GET"),
+    }
+    info["settings"] = settings_said
+    checks["the console's settings are saved by a local admin only: a web page the user visits can't write them"] = \
+        settings_said["local admin (no origin)"][0] == 204 and settings_said["cross-site"][0] == 403 \
+        and '"theme":"dark"' in settings_said["read-back"][1] and "light" not in settings_said["read-back"][1]
+    setn.kill()
 
     def raw(port, chunks, source=None, wrap=False, first=None):
         s = socket.create_connection(("127.0.0.1", port), timeout=10, source_address=(source, 0) if source else None)
@@ -7778,11 +8069,13 @@ def guarded():
     row doors (/append, /insert) only as its grants say, never through the nodes' own routes; a
     write token's flushes and files only into tables that are there, in the log and their folders;
     nobody but the nodes adds to the lake's own records; a change a follower forwards runs as its
-    user, reads included; a .py file is an admin's."""
+    user, reads included; a .py file is an admin's; a page of an answer is its asker's; /stats names
+    the cluster's nodes only to a signed-in caller; rows through /append and /insert are in the audit log."""
     import base64
     P = A.port
     lake = new_lake()
-    a = Node(lake, P).start()
+    audit = {"PONDRA_AUDIT": "role,ddl,function,write"}  # (the writes too: rows through /append and /insert are in the log)
+    a = Node(lake, P, env=audit).start()
     checks, info = {}, {}
 
     def ask(port, body, path="/sql", method="POST", auth=None, headers=None):
@@ -7811,8 +8104,11 @@ def guarded():
     checks["…a page from another site, or a name rebound to this machine, gets 403 saying why"] = \
         all(refused(said[k]) for k in ("another site's page", "another site, by fetch metadata", "a form posted from elsewhere", "a name rebound here", "…same origin as itself")) \
         and "another site" in said["another site's page"] and "DNS rebinding" in said["a name rebound here"]
+    open_stats = ask(P, b"", path="/stats", method="GET")  # (no users yet: an open node)
+    checks["/stats on an open node: every field, the cluster's names too"] = \
+        isinstance(open_stats, dict) and {"lake", "leader", "nodes", "releases", "role", "version", "term", "format", "keys"} <= set(open_stats)
     # Users: the row doors and the nodes' own routes
-    b = Node(lake, P + 1).start()  # (a follower)
+    b = Node(lake, P + 1, env=audit).start()  # (a follower)
     basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
     for q in ["CREATE TABLE orders (id BIGINT, amount DOUBLE)", "CREATE TABLE hr (id BIGINT, salary DOUBLE)", "INSERT INTO hr VALUES (1, 100.0)",
               "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
@@ -7852,6 +8148,31 @@ def guarded():
     checks["a change a follower forwards runs as its user: a read it may not make refused, its own change made"] = \
         "permission denied: SELECT on hr" in str(forwarded["reads what it may not"]) and isinstance(forwarded["its own"], dict) and forwarded["its own"].get("updated") == 1 \
         and until(lambda: ask(P, "SELECT amount FROM orders WHERE id = 7", auth=boss), [{"amount": 5.0}], 10) == [{"amount": 5.0}]
+    # A page of an answer is its asker's: another user's request for its id is as if it were gone (pages.rs)
+    typed = ask(P, "SELECT id FROM orders ORDER BY id", path="/sql?format=typed", auth=bob)
+    pages = typed.get("pages") if isinstance(typed, dict) else None
+    mine = ask(P, b"", path=f"/sql/pages/{pages}", method="GET", auth=bob)
+    theirs = ask(P, b"", path=f"/sql/pages/{pages}", method="GET", auth=boss)
+    info["pages"] = {"bob's": mine, "boss's": theirs}
+    checks["a page of an answer is read only by whoever asked for it: another user gets 410"] = \
+        isinstance(mine, dict) and mine.get("rows") == [[7], [8]] and str(theirs).startswith("ERROR 410")
+    # /stats: an unsigned caller gets every field but the cluster's names and addresses (lake, leader, nodes,
+    # releases), which a signed-in caller gets (here a user; the admin token is checked on node c below)
+    names = {"lake", "leader", "nodes", "releases"}
+    anon, signed = ask(P, b"", path="/stats", method="GET"), ask(P, b"", path="/stats", method="GET", auth=boss)
+    info["stats"] = {"anyone": sorted(anon) if isinstance(anon, dict) else anon, "boss": sorted(signed) if isinstance(signed, dict) else signed}
+    checks["/stats: unsigned on a lake with users, no node names (lake, leader, nodes, releases); signed in, all of them"] = \
+        isinstance(anon, dict) and not (names & set(anon)) and {"role", "version", "term", "keys"} <= set(anon) \
+        and isinstance(signed, dict) and names <= set(signed)
+    # Rows through /append and /insert are in the audit log while writes are audited (PONDRA_AUDIT, above), and
+    # refused ones always. The log's lines reach it a moment later, in batches.
+    expect = {("INSERT INTO orders (rows through /append)", "ok"), ("INSERT INTO hr (rows through /append)", "refused"),
+              ("INSERT INTO orders (rows through /insert)", "ok"), ("INSERT INTO hr (rows through /insert)", "refused")}
+    def audited():
+        got = ask(P, "SELECT statement, outcome FROM pondra.audit WHERE statement LIKE '%rows through%' ORDER BY at", auth=boss)
+        return {(r["statement"], r["outcome"]) for r in got} if isinstance(got, list) else set()
+    checks["rows through /append and /insert are in the audit log when writes are audited, and refused ones always"] = until(lambda: expect <= audited(), True, 15)
+    info["audit"] = sorted(audited())
     a.kill(), b.kill()
     # A write token: rows into tables that are there, in the log and their folders; never the lake's records
     lake2 = new_lake()
@@ -7875,6 +8196,12 @@ def guarded():
         and "needs an admin" in said["a branch's row ids"] and "written by Pondra alone" in said["rows for the audit log"] and "making a table needs an admin" in said["files into no table"]
     checks["a .py file is an admin's to save (code a node runs); a .sql file a writer's"] = refused(said["a python file"]) and not str(said["a sql file"]).startswith("ERROR") \
         and not str(said["a python file, by an admin"]).startswith("ERROR")
+    # /stats on a node with a token and no users: unsigned, no node names; the admin token, all of them
+    c_anon, c_admin = ask(P + 2, b"", path="/stats", method="GET"), ask(P + 2, b"", path="/stats", method="GET", auth="Bearer adm")
+    info["stats on c"] = {"anyone": sorted(c_anon) if isinstance(c_anon, dict) else c_anon, "admin": sorted(c_admin) if isinstance(c_admin, dict) else c_admin}
+    checks["/stats with the admin token: the node names too; unsigned on a tokened node, none"] = \
+        isinstance(c_anon, dict) and not (names & set(c_anon)) and "role" in c_anon \
+        and isinstance(c_admin, dict) and {"lake", "leader", "nodes"} <= set(c_admin)
     c.kill()
     ok = all(checks.values())
     print(json.dumps({"guarded": checks, "ok": ok, "info": info}, indent=1, default=str))
@@ -7976,7 +8303,7 @@ def stopped():
     # A follower killed for good: the leader marks its run once it has been gone a minute (it reads
     # the log when a node leaves, not every 30 s).
     other = Node(lake, A.port + 1, env=env, python=sys.executable).start()
-    until(lambda: len(call(A.port, "GET", "/stats")["nodes"]), 2, 30)
+    until(lambda: len(call(A.port, "GET", "/stats").get("nodes", ())), 2, 30)
     gone_run = sql(A.port + 1, "SELECT pondra.start('slow', 600.0) AS run")[0]["run"]
     gone_running = until(lambda: status(gone_run).get("status"), "running", 30)
     other.kill()
@@ -8348,7 +8675,7 @@ def objects():
     again = http("CREATE TABLE t (a BIGINT)")
     as_again = http("CREATE TABLE t AS SELECT 9 AS a")
     quiet = q("CREATE TABLE IF NOT EXISTS t AS SELECT 9 AS a")
-    checks["CREATE TABLE of one there: refused (42P07), AS SELECT adds nothing, IF NOT EXISTS leaves it"] = again[:2] == (500, "42P07") and as_again[1] == "42P07" \
+    checks["CREATE TABLE of one there: refused (409, 42P07), AS SELECT adds nothing, IF NOT EXISTS leaves it"] = again[:2] == (409, "42P07") and as_again[1] == "42P07" \
         and quiet.get("exists") is True and q("SELECT count(*) AS n FROM t") == [{"n": 2}]
     q("CREATE OR REPLACE TABLE t AS SELECT 7 AS a")
     checks["CREATE OR REPLACE TABLE makes it anew"] = q("SELECT a FROM t") == [{"a": 7}]
@@ -8361,7 +8688,7 @@ def objects():
     call(A.port, "POST", "/insert/bulk_made?job=bm", b"SELECT 1 AS a")
     info["nope"] = [nope[:2], nope_select[:2], nope_read[:2], cli_nope.returncode, (cli_nope.stdout + cli_nope.stderr)[-200:]]
     checks["an INSERT into a name no table has is refused (42P01, naming it) over HTTP and pondra sql, nothing made; POST /insert/{t} still makes one"] = \
-        nope[:2] == (500, "42P01") and "no table nope" in str(nope[2]) and nope_select[1] == "42P01" and nope_read[1] == "42P01" \
+        nope[:2] == (404, "42P01") and "no table nope" in str(nope[2]) and nope_select[1] == "42P01" and nope_read[1] == "42P01" \
         and cli_nope.returncode != 0 and "no table nope" in cli_nope.stdout + cli_nope.stderr and q("SELECT count(*) AS n FROM bulk_made") == [{"n": 1}]
     q("CREATE VIEW v AS SELECT a FROM t")
     q("CREATE VIEW IF NOT EXISTS v AS SELECT a + 1 AS a FROM t")
@@ -8388,7 +8715,7 @@ def objects():
     q("CREATE FUNCTION IF NOT EXISTS twice(x BIGINT) RETURNS BIGINT RETURN x * 3")
     q("CREATE TASK tick SCHEDULE '1 hour' AS SELECT 1")
     q("CREATE TASK IF NOT EXISTS tick SCHEDULE '1 hour' AS SELECT 2")
-    checks["functions and tasks: IF NOT EXISTS leaves them"] = q("SELECT twice(5) AS x") == [{"x": 10}] and http("CREATE TASK tick SCHEDULE '1 hour' AS SELECT 3")[0] == 500
+    checks["functions and tasks: IF NOT EXISTS leaves them"] = q("SELECT twice(5) AS x") == [{"x": 10}] and http("CREATE TASK tick SCHEDULE '1 hour' AS SELECT 3")[0] == 409
     # Every other kind alike (IF NOT EXISTS leaves one, OR REPLACE replaces it, both at once
     # refused), and OR REPLACE refused where it would drop what's inside
     q("CREATE MACRO plus1(x) AS x + 1")
@@ -8419,8 +8746,8 @@ def objects():
     kept = [http(f"CREATE OR REPLACE {k}") for k in ("SCHEMA s1", "DATABASE d1", "USER u1 PASSWORD 'pw-0123456789'", "ROLE r1")]
     info.update({"macros": macros, "secrets": secrets, "externals": externals, "temps": temps, "kept": [str(k[2])[:160] for k in kept]})
     checks["macros, secrets, external tables, a session's temporary tables, views and secrets: IF NOT EXISTS, OR REPLACE, both refused"] = \
-        macros == [[{"x": 2}], [{"x": 4}], 500] and secrets == [True, 500, [{"scope": "http://127.0.0.1:9/c/"}], 500] \
-        and externals == [True, 500, [{"a": 1}], [{"a": "1"}], 500] and temps == [200, 200, {"secret": "ts", "temporary": True, "exists": True}, [{"a": 1}], [{"a": 3}], 500, 500, 500, 500]
+        macros == [[{"x": 2}], [{"x": 4}], 500] and secrets == [True, 409, [{"scope": "http://127.0.0.1:9/c/"}], 500] \
+        and externals == [True, 409, [{"a": 1}], [{"a": "1"}], 400] and temps == [200, 200, {"secret": "ts", "temporary": True, "exists": True}, [{"a": 1}], [{"a": 3}], 500, 500, 500, 500]
     checks["OR REPLACE of a schema, a database, a user or a role: refused, saying what it would drop"] = all(k[0] == 500 for k in kept) \
         and all("everything in it" in str(k[2]) for k in kept[:2]) and all("rights given to it" in str(k[2]) for k in kept[2:])
     # DETACH: rows stay, the flow stops, what follows keeps following the table
@@ -8578,7 +8905,7 @@ def sequences():
     ports = [A.port + 1 + i for i in range(3)]
     pg = A.port + 10
     nodes = [Node(lake, p, **({"pg": f"127.0.0.1:{pg}"} if i == 1 else {})).start() for i, p in enumerate(ports)]
-    while len(call(ports[0], "GET", "/stats")["nodes"]) < 3:
+    while len(call(ports[0], "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.1)
     h = {"x-pondra-session": "harness-sequences"}
     q = lambda s, port=ports[0], hh=h: call(port, "POST", "/sql", s.encode(), headers=hh, timeout=120)
@@ -8621,7 +8948,7 @@ def sequences():
     stepped = [q("SELECT nextval('o') AS v")[0]["v"] for _ in range(2)]  # (after a change, every node's block goes: a gap, as Postgres's CACHE leaves)
     info["o"] = [o, cur, before, none, after_set, restarted, stepped]
     checks["START 10 INCREMENT 5 in any order; currval the session's last (55000 before, none without a session); setval; RESTART; INCREMENT changed"] = \
-        o == [10, 15] and cur == 15 and before[1] == "55000" and none[0] == 500 and after_set == 105 and restarted == 7 and stepped[1] - stepped[0] == 2 and stepped[0] > restarted
+        o == [10, 15] and cur == 15 and before[1] == "55000" and none[0] == 409 and none[1] == "55000" and after_set == 105 and restarted == 7 and stepped[1] - stepped[0] == 2 and stepped[0] > restarted
     q("ALTER SEQUENCE o RENAME TO o2")
     renamed = (q("SELECT nextval('o2') AS v")[0]["v"], err("SELECT nextval('o') AS v")[1])
     q("CREATE SEQUENCE c AS smallint MAXVALUE 3 CYCLE")
@@ -8681,7 +9008,7 @@ def sequences():
     fresh = q("SELECT a FROM ser")
     listed = sorted(r["name"] for r in q("SELECT name FROM pondra.objects WHERE kind = 'sequence'"))
     info["owned"] = [no, undropped, gone, fresh, listed]
-    checks["DROP SEQUENCE refused while a DEFAULT or a table uses it; a missing one, a materialized view's nextval, TEMP and an added identity refused"] = all(r[0] == 500 for r in no)
+    checks["DROP SEQUENCE refused while a DEFAULT or a table uses it; a missing one, a materialized view's nextval, TEMP and an added identity refused"] = all(r[0] >= 400 for r in no)
     checks["an owned sequence: kept with a dropped table and its UNDROP, gone with PURGE, made again with the table; not listed apart"] = \
         undropped == [1, 2, 3] and gone[1] == "42P01" and fresh == [{"a": 1}] and listed == ["c", "e", "o2", "s"]
     # past a leader's kill, no value is handed out again
@@ -8716,7 +9043,7 @@ def constraints():
     ports = [A.port + 1 + i for i in range(3)]
     pg = A.port + 10
     nodes = [Node(lake, p, **({"pg": f"127.0.0.1:{pg}"} if i == 0 else {})).start() for i, p in enumerate(ports)]
-    while len(call(ports[0], "GET", "/stats")["nodes"]) < 3:
+    while len(call(ports[0], "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.1)
     temp = {"x-pondra-session": "harness-constraints"}
     q = lambda s, port=ports[0], hh=None: call(port, "POST", "/sql", s.encode(), timeout=120, headers=hh)
@@ -8784,20 +9111,29 @@ def constraints():
             pgs = None
         except psycopg.Error as e:
             pgs = e.sqlstate
-        try:
+        try:  # (a new id and email go in: a loading door's rows are checked on the leader, as a SQL write's are)
             with cur.copy("COPY users FROM STDIN") as cp:
                 cp.write("300\tcopy@x\tC\n")
             copied = None
         except psycopg.Error as e:
-            copied = str(e)[:200]
+            copied = e.sqlstate
+        try:  # (the same email again: refused by name, 23505)
+            with cur.copy("COPY users FROM STDIN") as cp:
+                cp.write("301\tcopy@x\tC\n")
+            copy_dup = None
+        except psycopg.Error as e:
+            copy_dup = e.sqlstate
     cli_ok = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO users VALUES (400, 'cli@x', 'Cli')"], capture_output=True, text=True, timeout=120)
     cli_dup = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO users VALUES (401, 'cli@x', 'Cli again')"], capture_output=True, text=True, timeout=120)
-    appended = [err('{"id": 500, "email": "app@x"}\n', p, "/append/users") for p in ports]
-    info["doors"] = [txn, pgs, copied, cli_ok.returncode, cli_ok.stderr[-200:], cli_dup.returncode, cli_dup.stderr[-200:], appended]
+    appended = [err(f'{{"id": {700 + k}, "email": "app{k}@x"}}\n', p, "/append/users") for k, p in enumerate(ports)]
+    appended_dup = [err('{"id": 800, "email": "copy@x"}\n', p, "/append/users") for p in ports]
+    new_ids = [r["id"] for r in q("SELECT id FROM users WHERE id >= 700 ORDER BY id")]
+    info["doors"] = [txn, pgs, copied, copy_dup, cli_ok.returncode, cli_ok.stderr[-200:], cli_dup.returncode, cli_dup.stderr[-200:], appended, appended_dup, new_ids]
     checks["a transaction's two rows of one value refused at COMMIT (23505); Postgres's INSERT (23505); pondra sql checks too"] = \
         txn == "23505" and pgs == "23505" and cli_ok.returncode == 0 and cli_dup.returncode != 0 and "unique constraint" in cli_dup.stderr
-    checks["the doors that skip the leader's check refuse the table, by name: an append on every node, COPY FROM STDIN"] = \
-        all(a[0] != 200 and "UNIQUE" in a[2] for a in appended) and copied is not None and "UNIQUE" in copied
+    checks["the loading doors take a table's rows, checked: an append on every node and COPY FROM STDIN add a new id and email (the rows are there); the same email again is refused by name (23505)"] = \
+        all(a[0] == 200 for a in appended) and copied is None and copy_dup == "23505" and \
+        all(d[1] == "23505" for d in appended_dup) and new_ids == [700, 701, 702]
     # NOT ENFORCED: facts, never checked; a reference must say so
     q("CREATE TABLE orders (id INT PRIMARY KEY NOT ENFORCED, user_id INT REFERENCES users (id) NOT ENFORCED, code TEXT UNIQUE NOT ENFORCED)")
     q("INSERT INTO orders VALUES (1, 1, 'x'), (1, 99, 'x')")
@@ -8827,7 +9163,7 @@ def constraints():
     missing = err("ALTER TABLE tags DROP CONSTRAINT one_tag")
     info["alter"] = [dup, now, again, long, missing]
     checks["ADD CONSTRAINT UNIQUE over a value twice refused (23505) and not kept; added over clean rows, every node refuses a duplicate; DROP CONSTRAINT lets it in; ADD CHECK; a name taken, one missing refused"] = \
-        dup[1] == "23505" and after_dup and all(r[1] == "23505" for r in now) and again[0] == 500 and long[1] == "23514" and missing[0] == 500 and \
+        dup[1] == "23505" and after_dup and all(r[1] == "23505" for r in now) and again[0] == 409 and long[1] == "23514" and missing[0] == 404 and \
         [r[1] for r in rows("tags")] == ["a", "b", "a"]
     # CREATE UNIQUE INDEX, as ORMs write a UNIQUE (Prisma's @unique)
     q('CREATE TABLE "User" (id INT, "email" TEXT)')
@@ -8919,8 +9255,8 @@ def enums():
     q("CREATE TABLE people (id INT, name TEXT, feeling mood)")
     q("CREATE TABLE t2 (id INT, size ENUM('s', 'm', 'l'))")
     info["types"] = [same, again, bad_types, temp_enum]
-    checks["CREATE TYPE … AS ENUM makes a type; IF NOT EXISTS again is fine; a repeat, an empty or duplicate label list, OR REPLACE and a temporary table's enum column are refused (500)"] = \
-        same[0] == 200 and again[0] == 500 and all(r[0] == 500 for r in bad_types) and temp_enum[0] == 500
+    checks["CREATE TYPE … AS ENUM makes a type; IF NOT EXISTS again is fine; a repeat, an empty or duplicate label list, OR REPLACE and a temporary table's enum column are refused (a repeat 409, the rest 500)"] = \
+        same[0] == 200 and again[0] == 409 and all(r[0] == 500 for r in bad_types) and temp_enum[0] == 500
     # Labels and NULL go in from every door; SELECT reads them back as text
     q("INSERT INTO people VALUES (1, 'Ann', 'happy'), (2, 'Bo', 'sad'), (3, 'Cy', NULL)")
     q("INSERT INTO people SELECT id + 10, name, feeling FROM people WHERE id = 2")
@@ -8973,7 +9309,7 @@ def enums():
     labels3 = q("SELECT enum_range(NULL::mood) AS r")[0]["r"]
     info["added"] = [early, labels2, meh, ine, again_add, labels3]
     checks["ALTER TYPE … ADD VALUE BEFORE or AFTER puts a label in its place (last after 'happy'); refused until added; IF NOT EXISTS is fine, a repeat refused"] = \
-        early[1] == "22P02" and labels2 == ["sad", "meh", "ok", "happy"] and meh[0] == 200 and ine[0] == 200 and again_add[0] == 500 and \
+        early[1] == "22P02" and labels2 == ["sad", "meh", "ok", "happy"] and meh[0] == 200 and ine[0] == 200 and again_add[0] == 409 and \
         labels3 == ["sad", "meh", "ok", "happy", "great"]
     # ALTER TABLE … ADD COLUMN of an enum type: its values are checked too (old rows read NULL)
     q("ALTER TABLE t2 ADD COLUMN m2 mood")
@@ -9001,7 +9337,7 @@ def enums():
     info["columns"] = [m2_bad, t2_rows, in_use, still, dropped, gone]
     checks["ADD COLUMN of an enum type checks its values; DROP TYPE is refused while a column uses it (2BP01), works once none does; IF EXISTS is fine"] = \
         m2_bad[1] == "22P02" and t2_rows == [[1, "m", None], [5, "s", "ok"]] and in_use[1] == "2BP01" and "uses it" in in_use[2] and \
-        still[0] == 500 and dropped[0] == 200 and gone[0] == 200
+        still[0] == 409 and dropped[0] == 200 and gone[0] == 200
     for n in nodes:
         n.kill()
     ok = all(checks.values())
@@ -9127,7 +9463,7 @@ def registry():
         notice[0] == 200 and "nothing is built" in notice[1] and again == (200, 'relation "visits_page_idx" already exists, skipping') \
         and pg == [{"indexname": "visits_lower", "indexdef": "CREATE INDEX visits_lower ON public.visits USING brin (lower(path)) WHERE (path IS NOT NULL)"},
                    {"indexname": "visits_page_idx", "indexdef": "CREATE INDEX visits_page_idx ON public.visits (path)"}] \
-        and renamed == ["clicks_lower_page", "orders_region_at_idx", "visits_lower", "visits_path"] and [r[0] for r in refused_ix] == [500] * 6 \
+        and renamed == ["clicks_lower_page", "orders_region_at_idx", "visits_lower", "visits_path"] and [r[0] for r in refused_ix] == [500, 500, 500, 500, 409, 409] \
         and "hnsw" in refused_ix[2][1] and "a view" in refused_ix[0][1] and "an index has the name" in refused_ix[4][1] \
         and after_column == ["clicks_lower_page", "orders_region_at_idx"] and after_table == after_column \
         and show("index", "sales.orders_region_at_idx") == "CREATE INDEX orders_region_at_idx ON sales.orders_2025 (region, at DESC);"
@@ -9214,7 +9550,7 @@ def registry():
         and {k["kind"] for k in kinds if k["is"] == "object" and k["on_clone"] == "leave"} == {"secret", "share", "recipient"}
     missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'", "COMMENT ON COLUMN eu_orders.region IS 'x'")]
     quiet = q("COMMENT IF EXISTS ON TABLE nothing_here IS 'x'")
-    checks["what isn't there: refused by name, or nothing with IF EXISTS"] = missing == [500, 500, 500, 500] and quiet.get("exists") is False
+    checks["what isn't there: refused by name (4xx), or nothing with IF EXISTS"] = all(400 <= s < 500 for s in missing) and quiet.get("exists") is False
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"registry": checks, "ok": ok, "info": info}, indent=1, default=str))
@@ -10639,6 +10975,80 @@ def attached():
     return "an attached lake read while its leader changes, tiers and purges rows: every read as of one commit"
 
 
+def dialects():
+    """What people from other databases type on their first days (round 34, L6): the statements of
+    `tools/dialects_check.py`, spelled as Postgres, DuckDB, Snowflake, Spark, MySQL, BigQuery and SQL
+    Server users spell them, each dialect's in a session of its own. Each runs or is refused with a
+    SQLSTATE, none takes the node down, and each dialect runs at least as many as it did when its
+    floor was set (FLOOR: raise it as spellings are added, never lower it). And what they found: a
+    table with columns named created_at, version and row_id, keyed or not, takes UPDATE, UPDATE …
+    FROM, DELETE, INSERT … ON CONFLICT and MERGE, its own columns kept apart from the system ones
+    (`change::select_as` named both `__o_created_at`, and every change of such a table failed)."""
+    import dialects_check
+    FLOOR = {"postgres": 41, "duckdb": 31, "snowflake": 13, "spark": 10, "mysql": 19, "bigquery": 12, "sqlserver": 6}
+    XX000 = 26  # (refusals that are internal errors: lower it as they get codes, never raise it)
+    lake = new_lake()
+    node = Node(lake, A.port).start()
+    q = lambda s: sql(A.port, s)
+    checks, info = {}, {}
+    # Columns named as the system's are: an append table and a keyed one, three rows each, then every kind of change.
+    cols = "created_at TIMESTAMP, version INT, row_id INT, v INT"
+    q(f"CREATE TABLE ap (id INT, {cols})")
+    q(f"CREATE TABLE kv (id INT PRIMARY KEY, {cols})")
+    for t in ("ap", "kv"):
+        q(f"INSERT INTO {t} VALUES (1, TIMESTAMP '2026-01-01 00:00:00', 10, 100, 1), (2, TIMESTAMP '2026-01-02 00:00:00', 20, 200, 2), (3, TIMESTAMP '2026-01-03 00:00:00', 30, 300, 3)")
+    ids = {t: q(f"SELECT id, _row_id FROM {t} ORDER BY id") for t in ("ap", "kv")}
+    errors = {}
+    for t in ("ap", "kv"):
+        for s_ in (f"UPDATE {t} SET v = v + 10 WHERE id = 1",
+                   f"UPDATE {t} SET v = s.v FROM (VALUES (2, 22)) AS s(id, v) WHERE {t}.id = s.id",
+                   f"DELETE FROM {t} WHERE id = 3",
+                   f"INSERT INTO {t} VALUES (4, TIMESTAMP '2026-01-04 00:00:00', 40, 400, 4)" + (" ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v" if t == "kv" else ""),
+                   f"MERGE INTO {t} USING (VALUES (4, 44), (5, 5)) AS s(id, v) ON {t}.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v "
+                   f"WHEN NOT MATCHED THEN INSERT VALUES (s.id, TIMESTAMP '2026-01-05 00:00:00', 50, 500, s.v)"):
+            try:
+                q(s_)
+            except Exception as e:
+                errors.setdefault(t, []).append(f"{s_[:40]}: {str(e)[:160]}")
+    if "kv" not in errors:
+        try:
+            q("INSERT INTO kv VALUES (5, TIMESTAMP '2026-01-05 00:00:00', 50, 500, 55) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v")
+        except Exception as e:
+            errors.setdefault("kv", []).append(str(e)[:160])
+    info["errors"] = errors
+    want = lambda last: [{"id": 1, "created_at": "2026-01-01T00:00:00", "version": 10, "row_id": 100, "v": 11},
+                         {"id": 2, "created_at": "2026-01-02T00:00:00", "version": 20, "row_id": 200, "v": 22},
+                         {"id": 4, "created_at": "2026-01-04T00:00:00", "version": 40, "row_id": 400, "v": 44},
+                         {"id": 5, "created_at": "2026-01-05T00:00:00", "version": 50, "row_id": 500, "v": last}]
+    got = {t: q(f"SELECT id, created_at, version, row_id, v FROM {t} ORDER BY id") for t in ("ap", "kv")}
+    info["rows"] = got
+    kept = {t: q(f"SELECT id, _row_id FROM {t} WHERE id IN (1, 2) ORDER BY id") == ids[t][:2] for t in ("ap", "kv")}
+    info["row ids kept"] = kept
+    checks["a table with columns named created_at, version and row_id takes UPDATE, UPDATE … FROM, DELETE, INSERT, MERGE (and ON CONFLICT, keyed): its own columns as written, changed rows keeping their _row_id"] = \
+        not errors and got["ap"] == want(5) and got["kv"] == want(55) and all(kept.values())
+    # The newcomers' statements, each dialect in its own session.
+    rows, downs = dialects_check.answer(node, A.port)
+    ran = {d: sum(r["ok"] for r in rows if r["dialect"] == d) for d in FLOOR}
+    info["ran"], info["downs"] = ran, downs
+    uncoded = [r["sql"][:80] for r in rows if not r["ok"] and not r["sqlstate"]]
+    info["refused without a SQLSTATE"] = uncoded
+    checks["no newcomer's statement takes the node down"] = downs == 0
+    checks["each refusal carries a SQLSTATE"] = not uncoded
+    checks["each dialect runs at least its floor of the newcomers' statements"] = all(ran[d] >= FLOOR[d] for d in FLOOR)
+    missed = [f"{r['sql'][:70]}: {r['sqlstate']} {r['message'][:120]}" for r in rows if r["expect"] and not dialects_check.met(r)]
+    info["missed their refusal"] = missed
+    checks["what a SET asks for is done, or refused by name with its SQLSTATE and the way out (SET ROLE, TRANSACTION, NAMES, DateStyle, @x, …)"] = not missed
+    internal = [r["sql"][:80] for r in rows if not r["ok"] and r["sqlstate"] == "XX000"]
+    info["refused as XX000 (internal)"] = internal
+    checks[f"at most {XX000} refusals are XX000 (an internal error) rather than a code that names what went wrong"] = len(internal) <= XX000
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"dialects": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"dialects: {sum(ran.values())} of {len(rows)} newcomers' statements run, the rest refused with a SQLSTATE; columns named as system ones change: all {len(checks)} checks pass"
+
+
 def publishing():
     """What can't be published as Delta or Iceberg is refused by name, never written wrong or
     skipped quietly: asked for, a column the format has no type for, a materialized view finished
@@ -10728,6 +11138,264 @@ def backpressure():
     if not all(checks.values()):
         sys.exit(1)
     return "writes wait for tiering only while it can run"
+
+
+def unique_doors():
+    """UNIQUE through every loading door (`constraints.rs`, `constraints::queue`): an append (JSON and
+    Arrow), Flight DoPut, COPY FROM STDIN, Kafka (INVALID_RECORD) and INSERT … VALUES refuse a value twice (23505) and a batch
+    whole, on one node and on three; a retried batch (its producer and seq) is a duplicate and never a
+    23505, not even one the plain path committed before the table got its UNIQUE; a producer's
+    pipelined batches commit in the order they were cut, through a refused batch that is sent again
+    (invariant 29), on the leader and on a follower; an identity column and a DEFAULT on a UNIQUE table
+    fill as they do on one without (an append and COPY); three nodes appending at once keep every id
+    once; a table without UNIQUE takes its appends as before (`plain_ms`: 2,000 one-row appends)."""
+    import pyarrow as pa, pyarrow.flight as fl, psycopg, concurrent.futures as cf
+    from collections import Counter
+    lake = new_lake()
+    P, fport, pgport = A.port, A.port + 30, A.port + 10
+    checks, info = {}, {}
+
+    def post(port, path, body, ctype=None):
+        """One POST: {status, code (x-pondra-sqlstate), text, ack (the JSON of a 200)}."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+        c.request("POST", path, body, {"content-type": ctype} if ctype else {})
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        if r.status == 200:
+            return {"status": 200, "code": None, "text": "", "ack": json.loads(data)}
+        return {"status": r.status, "code": r.getheader("x-pondra-sqlstate"), "text": data.decode()[:400], "ack": None}
+
+    ndjson = lambda rows: "".join(json.dumps(r) + "\n" for r in rows).encode()
+    arrow = "application/vnd.apache.arrow.stream"
+
+    def ipc(rows):
+        t = pa.table({"id": pa.array([i for i, _ in rows], pa.int64()), "name": pa.array([n for _, n in rows], pa.string())})
+        sink = pa.BufferOutputStream()
+        w = pa.ipc.new_stream(sink, t.schema)
+        w.write_table(t)
+        w.close()
+        return sink.getvalue().to_pybytes()
+
+    schema = pa.schema([("id", pa.int64()), ("name", pa.string())])
+
+    def fput(client, path, batches):
+        """A DoPut of `batches` (lists of (id, name)): (the acks read, the error text or None)."""
+        w, r = client.do_put(fl.FlightDescriptor.for_path(*path), schema)
+        acks, err = [], None
+        try:
+            for batch in batches:
+                w.write_batch(pa.record_batch([pa.array([i for i, _ in batch], pa.int64()), pa.array([n for _, n in batch], pa.string())], schema=schema))
+            w.done_writing()
+            while (buf := r.read()) is not None:
+                acks.append(json.loads(buf.to_pybytes()))
+        except (fl.FlightError, pa.ArrowException) as e:  # (a refusal comes as either, by its status)
+            err = str(e)
+        try:  # (a refusal can surface when the writer closes, not on a read: keep the first error seen)
+            w.close()
+        except (fl.FlightError, pa.ArrowException) as e:
+            err = err or str(e)
+        return acks, err
+
+    ids_of = lambda t, port: [r["id"] for r in sql(port, f"SELECT id FROM {t} ORDER BY id")]
+
+    def settle(f, want, secs=15):
+        """What `f` says once it is `want`, or after `secs`: a follower reads what its commit stream has brought."""
+        end, got = time.time() + secs, f()
+        while got != want and time.time() < end:
+            time.sleep(0.1)
+            got = f()
+        return got
+
+    def one_node():
+        node = Node(lake, P, flight=f"127.0.0.1:{fport}", pg=f"127.0.0.1:{pgport}", kafka=f"127.0.0.1:{P + 20}").start()
+        try:
+            flight = fl.FlightClient(f"grpc://127.0.0.1:{fport}")
+            sql(P, "CREATE TABLE u (id INT, name TEXT, UNIQUE (id))")
+            ok = post(P, "/append/u", ndjson([{"id": i, "name": "j"} for i in (1, 2, 3)]))
+            dup = post(P, "/append/u", ndjson([{"id": 2, "name": "x"}, {"id": 4, "name": "x"}]))
+            twice = post(P, "/append/u", ndjson([{"id": 5, "name": "x"}, {"id": 5, "name": "y"}]))
+            info["json"] = [ok["status"], dup["code"], dup["text"][:200], twice["code"], ids_of("u", P)]
+            checks["HTTP append (JSON): new ids go in; an id already there refuses the whole batch (23505, naming the id); an id twice refuses it too"] = \
+                ok["status"] == 200 and dup["code"] == "23505" and "(2)" in dup["text"] and twice["code"] == "23505" and ids_of("u", P) == [1, 2, 3]
+            a_ok = post(P, "/append/u", ipc([(10, "a"), (11, "b")]), arrow)
+            a_dup = post(P, "/append/u", ipc([(12, "c"), (10, "d")]), arrow)
+            a_twice = post(P, "/append/u", ipc([(13, "e"), (13, "f")]), arrow)
+            info["arrow"] = [a_ok["status"], a_dup["code"], a_twice["code"]]
+            checks["HTTP append (Arrow): new ids go in; a value already there, or a value twice, refuses the batch (23505) and 12 and 13 stay out"] = \
+                a_ok["status"] == 200 and a_dup["code"] == "23505" and a_twice["code"] == "23505" and not {12, 13} & set(ids_of("u", P))
+            _, f_err = fput(flight, ["u"], [[(20, "f"), (21, "f")]])
+            _, f_dup = fput(flight, ["u"], [[(22, "g")], [(20, "g")]])
+            info["flight"] = [f_err, f_dup]
+            checks["Flight DoPut: new ids go in; a value already there refuses its batch (23505), and the batch before it, acked by then, stays in"] = \
+                f_err is None and f_dup is not None and "duplicate key" in f_dup and ids_of("u", P).count(20) == 1 and 22 in ids_of("u", P)
+            a1, e1 = fput(flight, ["u", "fp", "1"], [[(30, "p")], [(31, "p")]])
+            a2, e2 = fput(flight, ["u", "fp", "1"], [[(30, "p")], [(31, "p")]])
+            info["flight_retry"] = [a1, e1, a2, e2]
+            checks["Flight DoPut with a producer and seq: the same batches sent again are duplicates (their acks say so), not 23505; the rows are once"] = \
+                e1 is None and e2 is None and [a.get("duplicate") for a in a2] == [True, True] and ids_of("u", P).count(30) == 1 and ids_of("u", P).count(31) == 1
+            h1 = post(P, "/append/u?producer=hp&seq=1", ndjson([{"id": 50, "name": "h"}]))
+            h2 = post(P, "/append/u?producer=hp&seq=1", ndjson([{"id": 50, "name": "h"}]))
+            checks["HTTP append with a producer and seq: the retry is a duplicate (its ack says so), not 23505, and the row is once"] = \
+                h1["status"] == 200 and h2["status"] == 200 and h2["ack"]["duplicate"] is True and ids_of("u", P).count(50) == 1
+            with psycopg.connect(f"host=127.0.0.1 port={pgport} user=u dbname=lake", autocommit=True) as conn:
+                cur = conn.cursor()
+                try:  # (a door that refuses the table by name, as the plain build does, is a failed check, not an abort)
+                    with cur.copy("COPY u FROM STDIN") as cp:
+                        cp.write("60\tc\n")
+                except psycopg.Error as e:
+                    info["copy_first"] = e.sqlstate
+                try:
+                    with cur.copy("COPY u FROM STDIN") as cp:
+                        cp.write("60\tc again\n")
+                    copy_dup = None
+                except psycopg.Error as e:
+                    copy_dup = e.sqlstate
+            ins = post(P, "/sql", b"INSERT INTO u VALUES (62, 'x'), (62, 'y')")
+            info["copy_insert"] = [copy_dup, ins["code"]]
+            checks["COPY FROM STDIN refuses a value already there (23505); INSERT … VALUES refuses a value twice (23505); the rows of the refused batches stay out"] = \
+                copy_dup == "23505" and ins["code"] == "23505" and 60 in ids_of("u", P) and 62 not in ids_of("u", P)
+            # Kafka: an idempotent producer's batch is a checked append too; a value already there is a bad
+            # record (INVALID_RECORD, which librdkafka doesn't send again), never a timeout it retries for ever
+            import confluent_kafka as ck
+
+            def produce(values):
+                errs = []
+                kp = ck.Producer({"bootstrap.servers": f"127.0.0.1:{P + 20}", "enable.idempotence": True, "linger.ms": 50, "message.timeout.ms": 20000})
+                for v in values:
+                    kp.produce("u", value=json.dumps(v), on_delivery=lambda e, m: errs.append(e and e.name()))
+                kp.flush(30)
+                return errs
+
+            k_ok, k_dup, k_after = produce([{"id": 90, "name": "k"}, {"id": 91, "name": "k"}]), produce([{"id": 90, "name": "again"}]), produce([{"id": 92, "name": "k"}])
+            info["kafka"] = [k_ok, k_dup, k_after]
+            checks["Kafka (an idempotent producer): new ids go in; an id already there is refused as INVALID_RECORD, not retried; the next producer's new id goes in; each id once"] = \
+                k_ok == [None, None] and k_dup == ["INVALID_RECORD"] and k_after == [None] and [ids_of("u", P).count(i) for i in (90, 91, 92)] == [1, 1, 1]
+            # invariant 29: pipelined batches, one refused (23505), the ones after it sent again
+            pipe = [[(70, "b1"), (71, "b1")], [(72, "b2"), (73, "b2")], [(1, "dup")], [(74, "b4"), (75, "b4")], [(76, "b5"), (77, "b5")]]
+            # the stream answers the batches it has, then stops at the refused one (seq 3): its two after it
+            # (seq 4, 5) are never taken, so the producer sends seq 3 again (fixed) and those two with it
+            p1_acks, p1 = fput(flight, ["u", "pipe", "1"], pipe)
+            p2_acks, p2 = fput(flight, ["u", "pipe", "3"], [[(78, "b3"), (79, "b3")], [(74, "b4"), (75, "b4")], [(76, "b5"), (77, "b5")]])
+            order = [r["id"] for r in sql(P, "SELECT id FROM u WHERE id BETWEEN 70 AND 79 ORDER BY _row_id")]
+            info["pipelined"] = [len(p1_acks), p1, len(p2_acks), p2, order]
+            checks["a pipelined Flight stream commits in the order its batches were cut, through a refused batch (23505) that is sent again with the ones after it: the two acked before it, then the resend's three, none a duplicate"] = \
+                p1 is not None and "duplicate key" in p1 and len(p1_acks) == 2 and p2 is None and len(p2_acks) == 3 and \
+                not any(a.get("duplicate") for a in p2_acks) and order == [70, 71, 72, 73, 78, 79, 74, 75, 76, 77]
+            # a batch the plain path committed before the table had its UNIQUE: sent again, a duplicate
+            sql(P, "CREATE TABLE pre (id INT, name TEXT)")
+            e_first = post(P, "/append/pre?producer=early&seq=1", ndjson([{"id": 1, "name": "e"}, {"id": 2, "name": "e"}]))
+            sql(P, "ALTER TABLE pre ADD CONSTRAINT pre_id UNIQUE (id)")
+            e_again = post(P, "/append/pre?producer=early&seq=1", ndjson([{"id": 1, "name": "e"}, {"id": 2, "name": "e"}]))
+            e_new = post(P, "/append/pre?producer=early&seq=2", ndjson([{"id": 2, "name": "again"}]))
+            info["before_unique"] = [e_first["status"], e_again["ack"] and e_again["ack"]["duplicate"], e_new["code"], ids_of("pre", P)]
+            checks["a batch the plain path committed before the table got its UNIQUE, sent again through the checked door, is a duplicate (not 23505); a new seq with a value there is refused"] = \
+                e_first["status"] == 200 and e_again["status"] == 200 and e_again["ack"]["duplicate"] is True and e_new["code"] == "23505" and ids_of("pre", P) == [1, 2]
+            # an identity column and a DEFAULT on a table with a UNIQUE, loaded as one without it is (the
+            # same appends and COPY on both): the identity's values are filled and unique, the DEFAULT applies
+            with psycopg.connect(f"host=127.0.0.1 port={pgport} user=u dbname=lake", autocommit=True) as conn:
+                cur = conn.cursor()
+                for t, unique in (("idu", ", UNIQUE (code)"), ("idp", "")):
+                    sql(P, f"CREATE TABLE {t} (id BIGINT GENERATED BY DEFAULT AS IDENTITY, code INT, name TEXT DEFAULT 'none'{unique})")
+                    post(P, f"/append/{t}", ndjson([{"code": 1}, {"code": 2, "name": "given"}]))
+                    try:
+                        with cur.copy(f"COPY {t} (code) FROM STDIN") as cp:
+                            cp.write("7\n8\n")
+                    except psycopg.Error as e:  # (refused by name on a build without the checked path: the rows stay out)
+                        info.setdefault("identity_copy_errors", {})[t] = e.sqlstate
+                    post(P, f"/append/{t}", ndjson([{"code": 9}]))
+                rows = {t: [(r["code"], r["name"]) for r in sql(P, f"SELECT code, name FROM {t} ORDER BY code")] for t in ("idu", "idp")}
+                ids = {t: [r["id"] for r in sql(P, f"SELECT id FROM {t}")] for t in ("idu", "idp")}
+                dup_append = post(P, "/append/idu", ndjson([{"code": 2}]))
+                try:
+                    with cur.copy("COPY idu (code) FROM STDIN") as cp:
+                        cp.write("8\n")
+                    dup_copy = None
+                except psycopg.Error as e:
+                    dup_copy = e.sqlstate
+            info["identity"] = [rows, ids, dup_append["code"], dup_copy]
+            want = [(1, "none"), (2, "given"), (7, "none"), (8, "none"), (9, "none")]
+            checks["an identity column and a DEFAULT on a table with UNIQUE are filled as on a table without it, through an append and COPY: ids unique and given, the DEFAULT in place; a code already there refused (23505) by either door"] = \
+                rows["idu"] == rows["idp"] == want and all(i is not None for t in ids for i in ids[t]) and len(set(ids["idu"])) == 5 and \
+                len(set(ids["idp"])) == 5 and dup_append["code"] == "23505" and dup_copy == "23505"
+            # a table without UNIQUE: the plain path, timed
+            sql(P, "CREATE TABLE plain (id INT, name TEXT)")
+            t0 = time.perf_counter()
+            plain_ok = all(post(P, "/append/plain", ndjson([{"id": i, "name": "p"}]))["status"] == 200 for i in range(2000))
+            info["plain_ms"] = round((time.perf_counter() - t0) * 1000)
+            checks["a table without UNIQUE takes 2,000 one-row appends as before"] = plain_ok and len(ids_of("plain", P)) == 2000
+        finally:
+            node.kill()
+
+    def three_nodes():
+        lake3 = new_lake()
+        ports = [P + 1 + i for i in range(3)]
+        nodes = [Node(lake3, p, flight=f"127.0.0.1:{fport + 1 + i}").start() for i, p in enumerate(ports)]
+        try:
+            while len(call(ports[0], "GET", "/stats").get("nodes", ())) < 3:
+                time.sleep(0.1)
+            sql(ports[0], "CREATE TABLE u3 (id INT, name TEXT, UNIQUE (id))")
+            shared = list(range(600))  # every node draws 3 of each batch's 10 ids from here: a third collide
+
+            def run_node(n):
+                rng, seq, out = random.Random(n), 1, []
+                for k in range(200):
+                    own = [100000 + (n * 200 + k) * 10 + j for j in range(7)]
+                    batch = own + rng.sample(shared, 3)
+                    rng.shuffle(batch)
+                    r = post(ports[n], f"/append/u3?producer=n{n}&seq={seq}", ndjson([{"id": i, "name": f"n{n}"} for i in batch]))
+                    if r["status"] == 200:
+                        seq += 1  # (a refused batch leaves its seq for the next: the producer's last seq is what committed)
+                    out.append((batch, r["status"], r["code"], seq - 1 if r["status"] == 200 else None))
+                return out
+
+            with cf.ThreadPoolExecutor(3) as ex:
+                results = list(ex.map(run_node, range(3)))
+            flat = [b for node in results for b in node]
+            went = [b for b in flat if b[1] == 200]
+            refused = [b for b in flat if b[1] != 200]
+            present = [r["id"] for r in sql(ports[0], "SELECT id FROM u3")]
+            ok_ids = {i for b, _, _, _ in went for i in b}
+            own_refused = {i for b, _, _, _ in refused for i in b if i >= 100000}
+            # (a follower reads what its commit stream has brought: a few ms behind the leader's acks)
+            counts = [settle(lambda p=p: sql(p, "SELECT count(*) AS n FROM u3")[0]["n"], len(present)) for p in ports]
+            info["race"] = {"batches": len(flat), "went": len(went), "refused": len(refused), "codes": sorted({str(c) for _, s, c, _ in flat if s != 200}),
+                            "rows": len(present), "counts": counts}
+            checks["three nodes appending at once, 200 batches each, a third of the ids shared: every id in the table once, every refused batch 23505 and out whole, every batch that went in all there"] = \
+                all(s in (200, 409) for _, s, _, _ in flat) and all(c in (None, "23505") for _, _, c, _ in flat) and len(refused) > 0 and \
+                not any(v > 1 for v in Counter(present).values()) and set(present) == ok_ids and len(present) == 10 * len(went) and not own_refused & set(present) and \
+                all(n == len(present) for n in info["race"]["counts"])
+            # a retry through another node is a duplicate (the same producer and seq, sent to a follower)
+            went_in = next((x for x in reversed(results[1]) if x[1] == 200), None)  # (none on a build that refuses the table)
+            if went_in:
+                b, _, _, s = went_in
+                again = post(ports[2], f"/append/u3?producer=n1&seq={s}", ndjson([{"id": i, "name": "n1"} for i in b]))
+            checks["a retry of a batch that went in, sent to another node, is a duplicate, not 23505"] = bool(went_in) and \
+                again["status"] == 200 and again["ack"]["duplicate"] is True
+            # invariant 29 on a follower: its Flight stream goes to the leader in order, through a refusal
+            fl2 = fl.FlightClient(f"grpc://127.0.0.1:{fport + 3}")
+            taken = present[0] if present else -1  # (a build that refuses the table has none: the refusal is then a miss)
+            f_err_acks, f_err = fput(fl2, ["u3", "fpipe", "1"], [[(900, "x")], [(taken, "x")], [(902, "x")]])
+            f_again_acks, f_again = fput(fl2, ["u3", "fpipe", "2"], [[(903, "x")], [(902, "x")]])
+            order = settle(lambda: [r["id"] for r in sql(ports[1], "SELECT id FROM u3 WHERE id IN (900, 901, 902, 903) ORDER BY _row_id")], [900, 903, 902])
+            info["follower_pipe"] = [len(f_err_acks), f_err, len(f_again_acks), f_again, order]
+            checks["a pipelined Flight stream to a follower reaches the leader in order: through a refusal, the batches after it sent again, committed in the order cut"] = \
+                f_err is not None and "duplicate key" in f_err and len(f_err_acks) == 1 and f_again is None and len(f_again_acks) == 2 and \
+                not any(a.get("duplicate") for a in f_again_acks) and order == [900, 903, 902]
+        finally:
+            for n in nodes:
+                n.kill()
+
+    for part in (one_node, three_nodes):
+        try:
+            part()
+        except Exception as e:  # (a section on a binary without the check records it, and goes on)
+            info.setdefault("errors", []).append(f"{part.__name__}: {e!r}"[:600])
+    ok = bool(checks) and all(checks.values()) and not info.get("errors")  # (a section that raised fails the run)
+    print(json.dumps({"unique_doors": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} unique checks"
 
 
 def raw_sql(port, q, fmt=None, timeout=900):
@@ -10885,13 +11553,13 @@ def answers_big():
 # suite in parts side by side that end together. A section not listed counts as 5 s.
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
-        "users": 15, "find": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
-        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "answers_big": 15}
+        "users": 15, "find": 15, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
+        "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "unique_doors": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, loads, reader, crash, load)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -10903,6 +11571,10 @@ def all_tests():
         out[t.__name__] = t()
         print(f"harness all: {t.__name__} took {time.time() - t0:.0f} s", file=sys.stderr, flush=True)
     print(json.dumps(out, indent=1))
+    # (a section that answers False failed: it printed its checks and went on, so the rest still run)
+    failed = [name for name, r in out.items() if r is False]
+    if failed:
+        sys.exit(f"harness all: failed: {', '.join(failed)}")
 
 
 def shard(sections, k, n):
@@ -10919,7 +11591,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "answers_big", "load", "loads", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -10932,7 +11604,9 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors}[A.mode]()
+        if result is False:
+            sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

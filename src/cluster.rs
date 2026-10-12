@@ -392,6 +392,25 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     });
 }
 
+/// The nodes' key in hand before this node calls its leader for a caller (`write::on_node_as`): a
+/// follower that just started may sign a user in, its catalog holding the users, a moment before the
+/// loop that reads the key (`cli.rs`) has it, and a call sent without it is refused as unsigned (CI's
+/// `harness.py guarded`, "a change a follower forwards…"). It waits 10 s at most, and not at all for a
+/// key sealed by a master key this node doesn't have: waiting won't help that one.
+pub async fn signed(lake: &crate::store::Lake) {
+    let set = |v: &str| std::env::var(v).is_ok_and(|t| !t.is_empty());
+    if set("PONDRA_TOKEN") || set("PONDRA_ADMIN_TOKEN") || set("PONDRA_NODE_KEY") {
+        return;
+    }
+    for _ in 0..40 {
+        match crate::users::node_key(lake).await {
+            Ok(k) => return std::env::set_var("PONDRA_NODE_KEY", k),
+            Err(e) if format!("{e:#}").contains("master key") => return,
+            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+}
+
 /// An HTTP client that carries no token of its own: the process serving a folder of databases (`dbserver.rs`) passes each client's on.
 pub fn http_bare() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -404,7 +423,10 @@ pub fn http_bare() -> &'static reqwest::Client {
 /// `PONDRA_TOKEN`.
 pub fn http() -> reqwest::Client {
     static CLIENT: std::sync::Mutex<Option<(Option<String>, reqwest::Client)>> = std::sync::Mutex::new(None);
-    let token = std::env::var("PONDRA_TOKEN").or_else(|_| std::env::var("PONDRA_ADMIN_TOKEN")).or_else(|_| std::env::var("PONDRA_NODE_KEY")).ok();
+    // (a variable set empty is no token, as the node takes it: compose passes an unset one on empty,
+    // and "Bearer " sent in place of the nodes' key left a follower unable to reach its leader)
+    let given = |v: &str| std::env::var(v).ok().filter(|t| !t.is_empty());
+    let token = given("PONDRA_TOKEN").or_else(|| given("PONDRA_ADMIN_TOKEN")).or_else(|| given("PONDRA_NODE_KEY"));
     let mut client = CLIENT.lock().unwrap();
     if let Some((t, c)) = client.as_ref().filter(|(t, _)| *t == token) {
         let _ = t;

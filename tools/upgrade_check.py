@@ -432,7 +432,11 @@ def ask(n, v, ids=None):
             refused = req("SELECT * FROM kv").status
         except urllib.error.HTTPError as e:
             refused = e.code
-        out["a user signs in"] = [json.dumps(json.loads(req("SELECT count(*) AS n FROM ev").read())), f"kv: {refused}"]
+        # ann lacks SELECT on kv: the refusal is the point, not its exact HTTP status, which 0.34
+        # corrected from a blanket 500 to the one its SQLSTATE asks for (42501 -> 403). Any 4xx/5xx
+        # is "refused"; a 200 (ann could suddenly read kv) still differs from it and fails, as it must.
+        kv = "refused" if refused >= 400 else str(refused)
+        out["a user signs in"] = [json.dumps(json.loads(req("SELECT count(*) AS n FROM ev").read())), f"kv: {kv}"]
     return out, ids
 
 
@@ -603,55 +607,55 @@ def until(what, secs, step=0.5):
 # ---------------------------------------------------------------- the lake's format
 
 def format_check(new_bin, work, port, old=None):
-    """The lake's format (ADR-039), this build posing as a later one for a node (PONDRA_TEST_FORMAT=4:
-    this build's format, 3, plus one); and a write that needs format 2 (ADR-055) against `old`, the
-    release before (version, binary)."""
+    """The lake's format (ADR-039), this build posing as a later one for a node (PONDRA_TEST_FORMAT=5:
+    this build's format, 4, plus one); and the writes that need formats 2 to 4 (ADR-055, ADR-058)
+    against `old`, the release before (version, binary)."""
     checks, info = {}, {}
     unsealed = {"PONDRA_SECRET_KEY": ""}  # (no shared master key: the lake's keys stay in the clear, so the format moves only for what this check asks)
-    lake, later = os.path.join(work, "format-lake"), {"PONDRA_TEST_FORMAT": "4", **unsealed}
+    lake, later = os.path.join(work, "format-lake"), {"PONDRA_TEST_FORMAT": "5", **unsealed}
     fmt = lambda n: n.get("/stats", timeout=5)["format"]
-    first = Node(new_bin, lake, port, work, env=unsealed).start()  # makes the lake
+    first = Node(new_bin, lake, port, work, env=unsealed, token=False).start()  # makes the lake
     checks["a lake this build makes has the mark (format 1) from the start, and moves past it only for what needs it"] = until(lambda: fmt(first) == 1, 3, step=0.1)
     first.q("CREATE TABLE t (x INT)")
     first.q("INSERT INTO t VALUES (1), (2)")
     first.stop()
-    a = Node(new_bin, lake, port, work, env=later).start()  # leads, and knows format 4
-    b = Node(new_bin, lake, port + 1, work, env=unsealed).start()  # follows, and knows format 3
+    a = Node(new_bin, lake, port, work, env=later, token=False).start()  # leads, and knows format 5
+    b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False).start()  # follows, and knows format 4
     time.sleep(22)  # (the leader's first two looks: it must not go past what the follower knows)
     info["with a node of each"] = {"leader's": fmt(a), "follower's": fmt(b), "releases": a.get("/stats")["releases"]}
     checks["a lake moves on only to the newest format every node knows"] = fmt(a) == 1 and fmt(b) == 1
     b.stop()
-    checks["…and on again once the node that didn't know the next one has gone"] = until(lambda: fmt(a) == 4, 40)
-    refused = lambda x, n=4: x.p.poll() not in (None, 0) and f"format {n}" in x.said() and "run Pondra" in x.said()
-    b = Node(new_bin, lake, port + 1, work, env=unsealed)
+    checks["…and on again once the node that didn't know the next one has gone"] = until(lambda: fmt(a) == 5, 40)
+    refused = lambda x, n=5: x.p.poll() not in (None, 0) and f"format {n}" in x.said() and "run Pondra" in x.said()
+    b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False)
     try:  # a node that doesn't know the lake's format: at once, or as soon as its view holds the format
         b.start()
         b.p.wait(20)
     except (Failed, subprocess.TimeoutExpired):
         pass
-    info["a follower that knows format 3 said"] = b.said()[-300:]
+    info["a follower that knows format 4 said"] = b.said()[-300:]
     checks["a node that doesn't know the lake's format refuses it, saying which release it needs"] = refused(b)
     b.stop("kill")
     code, said = cli(new_bin, lake, "SELECT count(*) AS n FROM t", ok=False)
-    checks["…and so does pondra sql"] = code != 0 and "format 4" in said
+    checks["…and so does pondra sql"] = code != 0 and "format 5" in said
     a.stop()
     t0 = time.time()
-    b = Node(new_bin, lake, port + 1, work, env=unsealed)
+    b = Node(new_bin, lake, port + 1, work, env=unsealed, token=False)
     try:  # (nobody leads: it would, and must give the term back)
         b.start()
     except Failed:
         pass
     b.stop("kill")
     t1 = time.time()
-    a = Node(new_bin, lake, port, work, env=later).start()
-    info["seconds"] = {"a node of format 3 refused to lead it": round(t1 - t0, 1), "then one of format 4 led it": round(time.time() - t1, 1)}
+    a = Node(new_bin, lake, port, work, env=later, token=False).start()
+    info["seconds"] = {"a node of format 4 refused to lead it": round(t1 - t0, 1), "then one of format 5 led it": round(time.time() - t1, 1)}
     checks["…without holding on to the leader's term: the next node leads at once"] = refused(b) and time.time() - t1 < 10
     checks["the lake reads as it did"] = a.q("SELECT count(*) AS n FROM t") == [{"n": 2}]
     a.stop()
-    if old:  # format 2's first need, a view that works its answers out as it is read (ADR-055); format 3's, the lake's own keys sealed (ADR-058)
+    if old:  # format 2's first need, a view that works its answers out as it is read (ADR-055); format 3's, the lake's own keys sealed; 4's, a grant on another database (ADR-058)
         v, old_bin = old
         lake = os.path.join(work, "format-views-lake")
-        n = Node(new_bin, lake, port, work, env=unsealed).start()
+        n = Node(new_bin, lake, port, work, env=unsealed, token=False).start()
         n.q("CREATE TABLE s (k VARCHAR, x DOUBLE)")
         n.q("CREATE MATERIALIZED VIEW totals AS SELECT k, sum(x) AS t FROM s GROUP BY k")
         plain = fmt(n)
@@ -660,17 +664,21 @@ def format_check(new_bin, work, port, old=None):
         n.stop()
         n = Node(new_bin, lake, port, work).start()  # (now with a master key every node shares: its leader seals the lake's own keys)
         sealed = until(lambda: fmt(n) == 3 and n.get("/stats", timeout=5)["keys"] == "sealed", 40)
-        info["formats"] = {"a view of sums": plain, "a view of averages": means, "the lake's own keys sealed": fmt(n)}
+        keys = fmt(n)
+        n.q(f"ATTACH '{os.path.join(work, 'format-other-lake')}' AS other")
+        n.q("CREATE USER brancher")
+        n.q("GRANT CLONE ON DATABASE other TO brancher")
+        info["formats"] = {"a view of sums": plain, "a view of averages": means, "the lake's own keys sealed": keys, "a grant on another database": fmt(n)}
         n.stop()
-        o = Node(old_bin, lake, port, work, env=unsealed)
+        o = Node(old_bin, lake, port, work, env=unsealed, token=False)
         try:
             o.start()
             o.p.wait(20)
         except (Failed, subprocess.TimeoutExpired):
             pass
         info[f"Pondra {v} said"] = o.said()[-300:]
-        checks[f"a view of averages moves the lake to format 2 (one of sums doesn't); its own keys sealed by a master key every node shares, to format 3; and Pondra {v} then refuses it by name"] = (
-            plain == 1 and means == 2 and bool(sealed) and refused(o, 3))
+        checks[f"a view of averages moves the lake to format 2 (one of sums doesn't); its own keys sealed by a master key every node shares, to 3; a grant on another database, to 4; and Pondra {v} then refuses it by name"] = (
+            plain == 1 and means == 2 and bool(sealed) and keys == 3 and info["formats"]["a grant on another database"] == 4 and refused(o, 4))
         o.stop("kill")
     return checks, info
 

@@ -142,7 +142,7 @@ def main():
     # Two more nodes: the same query spread over three, each pruning its share of the manifests.
     for p in (port + 1, port + 2):
         Node(lake, p).start()
-    while len(call(port, "GET", "/stats")["nodes"]) < 3:
+    while len(call(port, "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.2)
     s = time.time()
     spread = call(port, "POST", "/sql?spread=1", f"SELECT count(*) AS n, sum(v) AS s FROM events WHERE ts >= TIMESTAMP '{iso(now - DAY - 9)}' AND name <> 'bulk'".encode())[0]

@@ -117,6 +117,11 @@ pub fn router(app: App) -> Router {
             let seq = app.seq.as_ref().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
             Ok::<_, E>(Json(crate::txn::commit_here(&app.lake, seq, &app.lock, c).await?))
         }))
+        .route("/cluster/checked", post(|State(app): State<App>, body: Bytes| async move {
+            let seq = app.seq.clone().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
+            let (table, src, batch) = crate::constraints::decode(body)?;
+            Ok::<_, E>(Json(crate::constraints::leader(app.lake.clone(), seq, table, src, batch).await?))
+        }))
         .route("/cluster/iceberg", post(|State(app): State<App>, Json(c): Json<Vec<crate::iceberg::Commit>>| async move { Ok::<_, E>(Json(app.record_iceberg(c).await?)) }))
         .route_layer(middleware::from_fn_with_state(app.clone(), to_leader));
     Router::new()
@@ -296,7 +301,7 @@ async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result
 async fn session_python(method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>) -> Result<Json<Value>, E> {
     let id = crate::temp::id(&id); // (as the client's requests name it: its user's)
     if *role < crate::auth::Role::Admin {
-        return Err(E(anyhow::anyhow!("a session's Python is an admin's, as DO is")));
+        return Err(E(crate::codes::coded("42501", "a session's Python is an admin's, as DO is")));
     }
     Ok(Json(match method {
         axum::http::Method::DELETE => j!({"restarted": crate::python::end_session(&id)}),
@@ -322,7 +327,7 @@ async fn list_pythons(Query(q): Query<HashMap<String, String>>, role: axum::Exte
 /// this machine). From a page on this machine only, an admin's.
 async fn choose_python(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, .. }): axum::extract::ConnectInfo<crate::tls::Peer>, role: axum::Extension<crate::auth::Role>, Json(b): Json<Value>) -> Result<Json<Value>, E> {
     if *role < crate::auth::Role::Admin || !from.ip().is_loopback() {
-        return Err(E(anyhow::anyhow!("which Python runs is chosen by an admin, on this machine")));
+        return Err(E(crate::codes::coded("42501", "which Python runs is chosen by an admin, on this machine")));
     }
     Ok(Json(crate::python::choose(b["path"].as_str().unwrap_or_default()).await?))
 }
@@ -494,11 +499,13 @@ async fn whoami(State(app): State<App>) -> Json<Value> {
 }
 
 impl App {
-    /// Does nothing need a sign-in here? (No token set, and no user who signs in. A node that just
-    /// started asks once it holds what its leader had: a mirror seeded before the first user was
-    /// flushed knows of none.)
+    /// Does nothing need a sign-in here? (No token set, no user who signs in, and the node listens on
+    /// this machine only. A node on the network is never open: its leader made the lake's first user
+    /// before it served (`users::first_user`), and a follower of a lake with none yet refuses everyone
+    /// until one has a token (`pondra token`). A node that just started asks once it holds what its
+    /// leader had: a mirror seeded before the first user was flushed knows of none.)
     pub async fn open(&self) -> bool {
-        if self.auth.on() {
+        if self.auth.on() || self.auth.network() {
             return false;
         }
         let _ = self.lake.caught_up().await; // (still catching up after 10 s: its own catalog decides)
@@ -865,12 +872,21 @@ impl App {
         let purge: Vec<_> = changed.iter().map(|t| async move { (t, crate::tier::purge(&self.lake, t, nodes, &self.cluster.addr, self.retain_ms, false).await) }).collect();
         each(purge, &mut failed).await;
         let tiered = start.elapsed();
-        crate::delta::publish_all(&self.lake).await?; // what other engines read, as soon as it's tiered
+        // A table whose publish fails is named by `publish_all`; it mustn't stop the merges and the
+        // retention below (storage would grow with no way out), so its error joins `failed` and the
+        // round carries on.
+        if let Err(e) = crate::delta::publish_all(&self.lake).await { // what other engines read, as soon as it's tiered
+            failed.push(format!("publish: {e:#}"));
+            crate::metrics::job_failed("publish");
+        }
         let first_publish = start.elapsed();
         // Then merges and compactions (published too, once done).
         let maintain: Vec<_> = untidy.iter().map(|t| async move { (t, crate::tier::maintain(&self.lake, t, nodes, &self.cluster.addr, false).await) }).collect();
         if each(maintain, &mut failed).await.contains(&true) {
-            crate::delta::publish_all(&self.lake).await?;
+            if let Err(e) = crate::delta::publish_all(&self.lake).await {
+                failed.push(format!("publish: {e:#}"));
+                crate::metrics::job_failed("publish");
+            }
         }
         let published = start.elapsed();
         // Retention every 10 s is plenty, and keeps its deletes off the path to fresh Delta versions.
@@ -970,6 +986,13 @@ struct AppendParams {
 
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
 async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
+    let start = std::time::Instant::now();
+    let out = append_rows(&app, &name, p, headers, body).await;
+    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
+    out
+}
+
+async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
     let log = app.log()?;
     if !p.producer.is_empty() && p.seq == 0 {
         return Err(E(anyhow::anyhow!(crate::log::SEQ_FROM_1))); // (0 is "nothing yet": its batch would be taken for a retry)
@@ -998,7 +1021,7 @@ async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
             crate::defaults::fill(&app.lake, &meta, batch, |c| absent.get(c).cloned()).await?
         }
     };
-    Ok(Json(log.append(name, Src { producer: p.producer, seq: p.seq, prev: p.prev }, batch).await?))
+    Ok(Json(log.append(name.to_string(), Src { producer: p.producer, seq: p.seq, prev: p.prev }, batch).await?))
 }
 
 #[derive(Deserialize)]
@@ -1010,6 +1033,13 @@ struct InsertParams {
 /// the leader records the files, together with `job` so a retried job is applied once. Creates
 /// the table if missing.
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, query: String) -> Result<Json<Value>, E> {
+    let start = std::time::Instant::now();
+    let out = insert_rows(&app, &name, p, query).await;
+    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
+    out
+}
+
+async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.cluster.reader, "read-only node");
     if app.lake.cat.meta(&table_key(&name)).await?.is_none() {
         crate::auth::at_least(crate::auth::Role::Admin, "making a table")?; // (as CREATE TABLE is)
@@ -1067,7 +1097,8 @@ async fn change(State(app): State<App>, Json((sql, job, sent)): Json<(String, St
 fn cluster_call(app: &App, headers: &HeaderMap) -> bool {
     match headers.get("authorization").and_then(|v| v.to_str().ok()) {
         None => true,
-        Some(h) => h.strip_prefix("Bearer ").is_some_and(|b| b.starts_with("pn_") || app.auth.token_role(b) > crate::auth::Role::None),
+        // (a `pn_` key counts only without an admin token, as in `users::who`)
+        Some(h) => h.strip_prefix("Bearer ").is_some_and(|b| (b.starts_with("pn_") && !app.auth.admin_set()) || app.auth.token_role(b) > crate::auth::Role::None),
     }
 }
 
@@ -1207,7 +1238,9 @@ fn notices(heard: &[String]) -> Option<axum::http::HeaderValue> {
 /// The values are kept out of what that procedure says (its notices, its error, the run log).
 async fn secret(State(app): State<App>, Path(name): Path<String>, headers: axum::http::HeaderMap) -> Result<Json<Value>, E> {
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    ensure!(crate::auth::lent(token).is_some(), "only a procedure's code reads a secret: pondra.secret(name), in a Python procedure");
+    if crate::auth::lent(token).is_none() {
+        return Err(E(crate::codes::coded("42501", "only a procedure's code reads a secret: pondra.secret(name), in a Python procedure")));
+    }
     let values = crate::ext::reveal(&app.lake, &name.to_lowercase()).await?;
     crate::auth::revealed(token, values.iter().filter(|(k, _)| *k != "type" && *k != "scope").map(|(_, v)| v.clone()));
     Ok(Json(j!(values)))
@@ -1710,6 +1743,9 @@ async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<V
     s["owner"] = j!(owner(&headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)
     s["format"] = j!(crate::format::of(&app.lake.cat).await.map(|f| f.format).unwrap_or_default()); // (the lake's: ADR-039)
     s["keys"] = j!(crate::users::kept(&app.lake).await); // (the lake's own keys: sealed by its master key, or in the clear)
+    // Background jobs that failed, by kind: a rising count is a stall (tiering, publishing, …) that
+    // otherwise shows only on this node's stderr.
+    s["background_failures"] = j!(crate::metrics::failures().into_iter().filter(|(_, n)| *n > 0).collect::<std::collections::BTreeMap<_, _>>());
     if c.is_leader() {
         s["releases"] = j!(c.releases()); // (each live node's: a rolling upgrade's progress)
     }
@@ -1721,6 +1757,14 @@ async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<V
         s["commits"] = j!(ms.len());
         s["commit_ms_p50"] = j!(pct(0.5));
         s["commit_ms_p95"] = j!(pct(0.95));
+    }
+    if crate::auth::current().is_none_or(|p| p.role == crate::auth::Role::None) {
+        // (the cluster's names and addresses are a signed-in caller's; the rest is a probe's)
+        if let Some(o) = s.as_object_mut() {
+            for k in ["lake", "leader", "nodes", "releases"] {
+                o.remove(k);
+            }
+        }
     }
     Json(s)
 }
@@ -1735,14 +1779,21 @@ macro_rules! ensure {
 }
 use ensure;
 
-/// Any error becomes a 500 with its message.
+/// Any error becomes a response whose HTTP status follows its SQLSTATE: a client's bad request is a
+/// 4xx, a transient condition 503, a real fault 500 (`codes::http`). The message is the body and
+/// `x-pondra-sqlstate` the exact code (ADR-036 §4).
 pub struct E(anyhow::Error);
 impl<T: Into<anyhow::Error>> From<T> for E {
     fn from(e: T) -> Self { E(e.into()) }
 }
+impl std::fmt::Display for E {
+    // (the words a client is sent, so the audit log says what the client was told: `ext::said`)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", crate::ext::said(&self.0)) }
+}
 impl IntoResponse for E {
     fn into_response(self) -> Response {
         let code = crate::codes::of(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4)
-        (StatusCode::INTERNAL_SERVER_ERROR, [("x-pondra-sqlstate", code)], crate::ext::said(&self.0)).into_response()
+        let status = StatusCode::from_u16(crate::codes::http(code)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, [("x-pondra-sqlstate", code)], crate::ext::said(&self.0)).into_response()
     }
 }

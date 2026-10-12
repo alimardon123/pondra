@@ -5,6 +5,8 @@
 //! Answers are kept within `PONDRA_PAGES_MB` (256) in all, for 20 minutes after they were last
 //! read, the least lately read going first. A page of one no longer kept answers 410: the console
 //! then runs the query again for that page.
+//! Only whoever asked for an answer reads its pages: the id is a key to nothing else (S31), and
+//! another's request for it answers 410 as if it were gone.
 use datafusion::arrow::record_batch::RecordBatch;
 use std::collections::VecDeque;
 use std::sync::{LazyLock, Mutex};
@@ -12,6 +14,7 @@ use std::time::{Duration, Instant};
 
 struct Kept {
     id: String,
+    holder: String, // (who asked: `auth::holder`)
     batches: Vec<RecordBatch>,
     bytes: usize,
     used: Instant,
@@ -29,6 +32,7 @@ pub fn keep(batches: &[RecordBatch]) -> Option<String> {
         return None;
     }
     let id = uuid::Uuid::new_v4().simple().to_string(); // (random: an id is known only to whoever was sent the answer)
+    let holder = crate::auth::holder();
     let mut kept = KEPT.lock().unwrap();
     kept.retain(|k| k.used.elapsed() < IDLE);
     let mut total: usize = kept.iter().map(|k| k.bytes).sum();
@@ -36,14 +40,16 @@ pub fn keep(batches: &[RecordBatch]) -> Option<String> {
         let Some(k) = kept.pop_front() else { break };
         total -= k.bytes;
     }
-    kept.push_back(Kept { id: id.clone(), batches: batches.to_vec(), bytes, used: Instant::now() });
+    kept.push_back(Kept { id: id.clone(), holder, batches: batches.to_vec(), bytes, used: Instant::now() });
     Some(id)
 }
 
-/// Rows `from..from + n` of a kept answer (read now, so it is kept the longest), or none if it's gone.
+/// Rows `from..from + n` of a kept answer (read now, so it is kept the longest), or none if it's gone,
+/// or was asked for by someone else.
 pub fn page(id: &str, from: usize, n: usize) -> Option<Vec<RecordBatch>> {
+    let who = crate::auth::holder();
     let mut kept = KEPT.lock().unwrap();
-    let i = kept.iter().position(|k| k.id == id && k.used.elapsed() < IDLE)?;
+    let i = kept.iter().position(|k| k.id == id && k.holder == who && k.used.elapsed() < IDLE)?;
     let mut k = kept.remove(i)?;
     k.used = Instant::now();
     let (mut skip, mut left) = (from, n);
@@ -82,5 +88,14 @@ mod tests {
         let past = page(&id, 20, 4).unwrap();
         assert_eq!((past[0].num_columns(), xs(&past).len()), (1, 0)); // (its columns, no rows)
         assert!(page("gone", 0, 4).is_none());
+    }
+
+    #[test]
+    fn only_whoever_asked_reads_pages() {
+        use crate::auth::{Principal, Role, WHO};
+        let id = WHO.sync_scope(Principal::of(Role::Read), || keep(&[batch(0, 3)])).unwrap();
+        assert!(WHO.sync_scope(Principal::of(Role::Read), || page(&id, 0, 3)).is_some()); // (the same asker)
+        assert!(WHO.sync_scope(Principal::of(Role::Admin), || page(&id, 0, 3)).is_none()); // (another's: as if gone)
+        assert!(page(&id, 0, 3).is_none()); // (the node's own work is no asker of it)
     }
 }

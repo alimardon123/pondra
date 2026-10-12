@@ -272,7 +272,7 @@ fn statements(sql: &str) -> Result<Option<String>> {
     }
     let ends: Vec<usize> = (0..words.len()).map(|w| found[w + 1..].iter().flatten().map(|f| f.0).next().unwrap_or(t.toks.len())).collect();
     let part = |w: usize| found[w].map(|(_, from)| t.span(from, ends[w]).trim().trim_end_matches(';').trim().to_string());
-    let Some((on_at, _)) = found[0] else { bail!("{}: ON names the column", if pivot { "PIVOT" } else { "UNPIVOT" }) };
+    let Some((on_at, _)) = found[0] else { bail!("{}: ON names the column ({})", if pivot { "PIVOT" } else { "UNPIVOT" }, if pivot { "PIVOT orders ON item USING sum(amount)" } else { "UNPIVOT orders ON qty, amount INTO NAME field VALUE value" }) };
     let rel = t.span(t.next(first), on_at).trim().to_string();
     let tail = |from: usize| (from..words.len()).filter_map(|w| found[w].map(|(at, _)| t.span(at, ends[w]).trim().trim_end_matches(';').trim().to_string())).collect::<Vec<_>>().join(" ");
     if !pivot {
@@ -624,7 +624,7 @@ fn fetch(q: &mut Query) -> Result<()> {
     match &mut q.limit_clause {
         None => q.limit_clause = Some(LimitClause::LimitOffset { limit: Some(n), offset: None, limit_by: vec![] }),
         Some(LimitClause::LimitOffset { limit: l @ None, .. }) => *l = Some(n),
-        _ => bail!("FETCH FIRST and LIMIT together"),
+        _ => bail!("FETCH FIRST and LIMIT together: write one of them (LIMIT n, or FETCH FIRST n ROWS ONLY)"),
     }
     Ok(())
 }

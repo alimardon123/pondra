@@ -17,6 +17,7 @@ catalog` prints what the lake's catalog holds.
 | `pondra serve [PATH]` | run a node on a lake, or serve every lake in a folder as a database |
 | `pondra service install\|status\|uninstall` | keep a node running on this machine, at boot and after a stop ([deploy](/pondra/guides/deploy/#as-a-service-on-one-machine)) |
 | `pondra sql --dir LAKE "SQL"` | run one statement against the lake, with no server |
+| `pondra token --dir LAKE` | make a token for a user of the lake (`pondra` unless `--user` names another) and print it, once, with no node or token needed |
 | `pondra run FILE LAKE` | run a SQL file, its `$name` parameters taking the values you pass |
 | `pondra workspace pull\|push DIR LAKE` | the lake's files in a folder of yours, for git and your editor |
 | `pondra init`, `plan`, `status`, `capture`, `apply`, `test`, `export` | a project of files, made true in a database ([environments](/pondra/guides/projects/#apply-it)) |
@@ -146,7 +147,10 @@ The HTTP API, `/mcp` and the Iceberg REST catalog are on `--addr`.
 | `--write-token TOKEN` | `PONDRA_WRITE_TOKEN` | writing rows needs this one or the admin token |
 | `--admin-token TOKEN` | `PONDRA_ADMIN_TOKEN` | creating tables, views, tasks and functions needs this one |
 
-Give every node the same tokens. With none set there are no checks. A flag beats its environment
+Give every node the same tokens. With none set, a node on this machine only (127.0.0.1) has no
+checks, and a node that listens beyond it (`--addr`, `--pg`, `--kafka` or `--flight` on another
+address) is never open: its leader makes the lake's first user, `pondra`, before it serves anyone,
+and prints its token once on standard error. `pondra token` makes another. A flag beats its environment
 variable. See [HTTP](/pondra/reference/http/#roles) for what each role may do. Prefer the
 environment: a flag shows in the process list.
 
@@ -302,6 +306,15 @@ pondra backup notes backups/notes
 pondra restore backups/notes notes-again > /dev/null
 pondra sql --dir notes-again "SELECT name FROM pondra.tables"
 ```
+
+## pondra token
+
+`pondra token --dir LAKE` makes a token for a user of the lake and prints it alone on standard
+output, once: the lake keeps only its hash, so `T=$(pondra token --dir LAKE)` keeps it in a variable.
+It goes through the lake's folder, not through a node, so it works with the node up or down and
+needs no token of its own: whoever can write the lake's folder owns the lake. `--user NAME` makes it
+for another user (`pondra` by default, made first if the lake has no user yet), and `--name NAME`
+names it, for `DROP TOKEN NAME FOR USER` to take it back.
 
 ## pondra run
 
