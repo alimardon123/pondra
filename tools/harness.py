@@ -2839,10 +2839,13 @@ def refreshed():
         "final": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r3 WITH (refresh = 'full') AS SELECT date_bin(INTERVAL '1 day', ts) AS d, count(*) AS n FROM orders GROUP BY 1 EMIT FINAL")),
         "nonsense": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r4 WITH (refresh = 'sometimes') AS SELECT * FROM orders")),
     }
+    # (every view caught up with the last writes before its rows are kept: a view still running
+    # behind them when it was read came back from the restart with the rows it then worked out)
+    settled = same()
     stored = {name: q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST") for name, (_, by) in views.items()}
     node.kill()
     node = Node(lake, A.port, tier_secs=1).start()
-    restarted = all(_close(q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST"), stored[name]) for name, (_, by) in views.items())
+    restarted = all(settled.values()) and all(_close(q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST"), stored[name]) for name, (_, by) in views.items())
     q("INSERT INTO orders " + ORDER_ROWS.format(3001, 3400))
     after_restart = same()
     q("DROP MATERIALIZED VIEW top_names"); q("DROP MATERIALIZED VIEW asked")
@@ -2970,10 +2973,13 @@ def bykey():
     q("CREATE MATERIALIZED VIEW most AS SELECT region, max(customers) AS m FROM regulars GROUP BY region")
     most = _bykey_same(q, "most", "SELECT region, max(customers) AS m FROM regulars GROUP BY region", "region") and \
         q("SELECT refresh FROM pondra.flows WHERE name = 'most'")[0]["refresh"] == "by key"
+    # (every view caught up with the last writes before its rows are kept: a view still running
+    # behind them when it was read came back from the restart with the rows it then worked out)
+    settled = same()
     stored = {name: q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST") for name, (_, by) in views.items()}
     node.kill()
     node = Node(lake, A.port, tier_secs=1).start()
-    restarted = all(_close(q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST"), stored[name]) for name, (_, by) in views.items())
+    restarted = all(settled.values()) and all(_close(q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST"), stored[name]) for name, (_, by) in views.items())
     q("INSERT INTO orders " + ORDER_ROWS.format(3001, 3400))
     after_restart = same()
     q("DROP MATERIALIZED VIEW sizes"); q("DROP MATERIALIZED VIEW busy"); q("DROP MATERIALIZED VIEW most")
