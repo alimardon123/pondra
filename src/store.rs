@@ -1329,6 +1329,7 @@ pub struct Catalog {
     streamed: AtomicU64,          // the last commit streamed to us; with the view: the whole lake
     hold: AtomicU64,              // commits before this one never arrived: read from the view alone
     follows: bool,                // follower / read-only node that gets the commit stream
+    upkeep: Option<Upkeep>,       // leader: the catalog's compactor and collector, stopped by `close`
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
     metas: Mutex<lru::LruCache<String, (u64, Arc<TableMeta>)>>, // tables' entries as parsed, by the commit that wrote them (`meta`)
@@ -1355,7 +1356,7 @@ type Write = (Arc<WriteHandle>, Arc<Delta>, oneshot::Sender<()>);
 
 enum Db_ {
     Writer(Db),
-    Reader(DbReader),
+    Reader(Arc<DbReader>), // (shared, so a catalog let go can still close it: `Drop for Catalog`)
 }
 
 /// One committed catalog write.
@@ -1509,20 +1510,69 @@ fn blocks() -> Arc<dyn slatedb::db_cache::DbCache> {
 /// The catalog's compactor and garbage collector, as SlateDB runs them beside a writer, started
 /// once the node serves (or after 10 s: a `pondra sql` writer never does), so a cold start waits
 /// for neither (C5). A failure in either stops the node, as one in the writer would.
-fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions, local: bool) {
-    crate::panics::spawn(async move {
+fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions, local: bool) -> Upkeep {
+    let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_options(compactor).build();
+    let gc = slatedb::GarbageCollectorBuilder::new("catalog", store.clone()).with_options(gc).build();
+    let (c, g) = (compactor.clone(), gc.clone());
+    let started = crate::panics::spawn(async move {
         let _ = tokio::time::timeout(Duration::from_secs(10), SERVING.subscribe().wait_for(|s| *s)).await;
         if local {
-            crate::panics::task(unpin(store.clone()));
+            crate::panics::task(unpin(store));
         }
-        let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_options(compactor).build();
-        let gc = slatedb::GarbageCollectorBuilder::new("catalog", store).with_options(gc).build();
-        let (a, b) = tokio::join!(compactor.run(), gc.run());
+        let (a, b) = tokio::join!(c.run(), g.run());
         if let Err(e) = a.and(b) {
             eprintln!("stopping: the catalog's compactor or garbage collector failed: {e}");
             std::process::abort();
         }
     });
+    // (SlateDB doesn't export the collector's type, so how the two stop is kept as a future to run)
+    let stop = Box::pin(async move {
+        let _ = tokio::join!(compactor.stop(), gc.stop());
+    });
+    Upkeep(Mutex::new(Some((started, stop))))
+}
+
+/// A catalog let go stops what SlateDB runs for it: a reader's polling, a writer's flushing and its
+/// upkeep. SlateDB's tasks outlive its handles, so a lake opened for a moment (a branch's base, a
+/// lake detached, a node stopped in a host's process) went on reading its manifest four times a
+/// second for the life of the process. (`close` does the same and waits for it: `Node::stop`.)
+impl Drop for Catalog {
+    fn drop(&mut self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return; // (no runtime: it ended, and SlateDB's tasks with it)
+        }
+        let db = match &self.db {
+            Db_::Writer(db) => Db_::Writer(db.clone()),
+            Db_::Reader(r) => Db_::Reader(r.clone()),
+        };
+        let upkeep = self.upkeep.take();
+        crate::panics::task(async move {
+            if let Some(upkeep) = upkeep {
+                upkeep.stop().await;
+            }
+            let _ = match db {
+                Db_::Writer(db) => db.close().await,
+                Db_::Reader(r) => r.close().await,
+            };
+        });
+    }
+}
+
+/// The catalog's upkeep, kept so a close can stop it. SlateDB runs the compactor and the collector
+/// in tasks of their own, which outlive the future that started them: stopped only with that
+/// future, they went on polling a closed lake (or one opened again) for the life of the process.
+struct Upkeep(Mutex<Option<(tokio::task::JoinHandle<()>, futures::future::BoxFuture<'static, ()>)>>);
+
+impl Upkeep {
+    /// Stops it, once: the task that starts the two first (so neither starts after this), then both.
+    async fn stop(&self) {
+        let taken = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some((started, stop)) = taken {
+            started.abort();
+            let _ = started.await;
+            stop.await;
+        }
+    }
 }
 
 /// SlateDB's compactor pins the files each compaction replaces with a checkpoint for 15 minutes
@@ -1571,7 +1621,7 @@ impl Catalog {
         let db = Db::builder("catalog", store.clone()).with_settings(settings).with_db_cache(blocks()).with_block_cache_policy(flushed);
         let mut cat = Self::new(Db_::Writer(db.build().await?));
         trace("the catalog's writer open", t0);
-        upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local);
+        cat.upkeep = Some(upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local));
         cat.replicas = crate::env::or("PONDRA_REPLICAS", 1);
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         let c = cat.get::<u64>("c").await?.unwrap_or(0);
@@ -1598,7 +1648,7 @@ impl Catalog {
         let opts = DbReaderOptions { manifest_poll_interval: Duration::from_millis(250), skip_wal_replay: streamed, object_store_cache_options, ..Default::default() };
         // FollowLatest writes nothing, so readers work with read-only bucket credentials.
         let reader = DbReader::builder("catalog", store).with_reader_mode(DbReaderMode::FollowLatest).with_options(opts).with_db_cache(blocks());
-        let mut cat = Self::new(Db_::Reader(reader.build().await?));
+        let mut cat = Self::new(Db_::Reader(Arc::new(reader.build().await?)));
         cat.follows = streamed;
         cat.refresh().await?; // (one try at the in-memory catalog before serving; later refreshes retry)
         Ok(cat)
@@ -1625,7 +1675,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))), frozen: Default::default() }
+        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))), frozen: Default::default() }
     }
 
     /// Leader: the recent frames plus a receiver for every frame from now on.
@@ -1974,6 +2024,9 @@ impl Catalog {
     /// Lets go of the catalog: its writer flushes what it holds and stops its background tasks, a
     /// reader its polling (`Node::stop`, ADR-061 §4: one process may open another lake after it).
     pub async fn close(&self) -> Result<()> {
+        if let Some(upkeep) = &self.upkeep {
+            upkeep.stop().await;
+        }
         match &self.db {
             Db_::Writer(db) => db.close().await?,
             Db_::Reader(r) => r.close().await?,

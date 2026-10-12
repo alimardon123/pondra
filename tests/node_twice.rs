@@ -64,22 +64,28 @@ impl At {
     }
 }
 
-/// The process's open files and threads (Linux).
-fn held() -> (usize, usize) {
+/// The process's open files and threads (Linux), and the tasks alive on the runtime: a task left
+/// running (SlateDB's, which outlive its handles) holds no file or thread of its own.
+fn held() -> (usize, usize, usize) {
     let files = std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let threads = status.lines().find_map(|l| l.strip_prefix("Threads:")).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
-    (files, threads)
+    (files, threads, tokio::runtime::Handle::current().metrics().num_alive_tasks())
 }
 
-/// `held()` once it is no more than `bound` (each within 2), or the least seen in 10 s.
-async fn settled(bound: Option<(usize, usize)>) -> (usize, usize) {
+/// Within `bound`: files and threads within 2 each, tasks no more.
+fn within(now: (usize, usize, usize), bound: (usize, usize, usize)) -> bool {
+    now.0 <= bound.0 + 2 && now.1 <= bound.1 + 2 && now.2 <= bound.2
+}
+
+/// `held()` once it is within `bound`, or the least seen in 10 s.
+async fn settled(bound: Option<(usize, usize, usize)>) -> (usize, usize, usize) {
     let mut least = held();
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let now = held();
-        least = (least.0.min(now.0), least.1.min(now.1));
-        if bound.is_some_and(|b| now.0 <= b.0 + 2 && now.1 <= b.1 + 2) {
+        least = (least.0.min(now.0), least.1.min(now.1), least.2.min(now.2));
+        if bound.is_some_and(|b| within(now, b)) {
             return now;
         }
     }
@@ -144,8 +150,8 @@ fn run() {
         assert_eq!(at.in_history("marker_of_b", Some(BOSS)).await, 0, "A's history has none of B's");
         node.stop().await;
 
-        // Nothing left over: three more opens and stops hold no more files or threads. (Blocking
-        // threads go after a second idle, so the count is taken once it settles, within 10 s.)
+        // Nothing left over: three more opens and stops hold no more files, threads or tasks.
+        // (Blocking threads go after a second idle, so the count is taken once it settles, within 10 s.)
         let before = settled(None).await;
         for _ in 0..3 {
             let node = Node::open(Options::local(&a, &addr)).await.expect("lake A, again and again");
@@ -153,7 +159,7 @@ fn run() {
             node.stop().await;
         }
         let after = settled(Some(before)).await;
-        assert!(after.0 <= before.0 + 2 && after.1 <= before.1 + 2, "files and threads before {before:?}, after three more {after:?}");
+        assert!(within(after, before), "files, threads and tasks before {before:?}, after three more {after:?}");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
