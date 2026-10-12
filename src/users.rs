@@ -109,7 +109,9 @@ pub enum Change {
     Revoke { privileges: Vec<String>, on: On, columns: Vec<String>, from: Vec<String>, #[serde(default, skip_serializing_if = "Option::is_none")] database: Option<String> },
     GrantRole { roles: Vec<String>, to: Vec<String> },
     RevokeRole { roles: Vec<String>, from: Vec<String> },
-    CreateToken { name: String, user: String, expires_secs: Option<u64> },
+    // (`hash`: a token made by whoever asked, `pondra token`, which sends only its hash: the token
+    // itself never leaves that process)
+    CreateToken { name: String, user: String, expires_secs: Option<u64>, #[serde(default, skip_serializing_if = "Option::is_none")] hash: Option<String> },
     DropToken { name: String, user: String },
 }
 
@@ -327,7 +329,7 @@ fn token(w: &mut Words, create: bool) -> Result<Change> {
         None
     };
     w.done()?;
-    Ok(Change::CreateToken { name, user, expires_secs })
+    Ok(Change::CreateToken { name, user, expires_secs, hash: None })
 }
 
 /// `GRANT privileges [(columns)] ON [TABLE] t | SCHEMA s | ALL TABLES IN SCHEMA s | ALL TABLES |
@@ -424,10 +426,17 @@ fn plain(name: &str) -> Result<String> {
 
 /// Leader: carry out a change (under the lake's lock).
 pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
+    // (a password or a token made now opens the lake to whoever can read its keys in the clear)
+    let gives_access = match &c {
+        Change::Create { login, verifier, .. } => *login && verifier.is_some(),
+        Change::Alter { verifier, .. } => verifier.is_some(),
+        Change::CreateToken { .. } => true,
+        _ => false,
+    };
     let get = |n: &str| { let k = user_key(n); async move { lake.cat.get::<User>(&k).await } };
     let put = |n: &str, u: &User| (user_key(n), json(u));
     let must = |n: &str, u: Option<User>| u.ok_or_else(|| anyhow!("no user or role {n} (CREATE USER {n}, CREATE ROLE {n})"));
-    let out = match c {
+    let mut out = match c {
         Change::Create { name, login, if_not_exists, verifier, superuser, limits } => {
             if get(&name).await?.is_some() {
                 ensure!(if_not_exists, "{} {name} already exists", if login { "user" } else { "role" });
@@ -473,6 +482,9 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
         }
         Change::Grant { privileges, on, columns, to, database } => {
             let on = on_database(lake, on, database.as_deref(), &privileges)?;
+            if matches!(on, On::Database(_)) {
+                crate::format::require(lake, ACROSS, "a grant on another database").await?;
+            }
             let on = resolved(lake, on).await?;
             let mut puts = vec![];
             for n in &to {
@@ -538,18 +550,30 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             lake.cat.commit(puts, &[]).await?;
             j!({"revoked": roles, "from": from})
         }
-        Change::CreateToken { name, user, expires_secs } => {
+        Change::CreateToken { name, user, expires_secs, hash } => {
             let mut u = must(&user, get(&user).await?)?;
             ensure!(u.login, "{user} is a role: a token is a user's");
             ensure!(!u.tokens.iter().any(|t| t.name == name), "{user} already has a token {name} (DROP TOKEN {name} FOR {user})");
-            let mut secret = [0u8; 32];
-            aws_lc_rs::rand::fill(&mut secret).map_err(|_| anyhow!("no randomness"))?;
-            let token = format!("pt_{}_{}", B64U.encode(&user), B64U.encode(secret));
+            let (token, hash) = match hash {
+                // (made by whoever asked: its hash is all this keeps, checked to be one)
+                Some(h) => {
+                    ensure!(h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()), "a token's hash is SHA-256 in hex");
+                    (None, h)
+                }
+                None => {
+                    let (token, hash) = new_token(&user);
+                    (Some(token), hash)
+                }
+            };
             let now = crate::log::now_ms();
-            u.tokens.push(Token { name: name.clone(), hash: sha256(&token), created_ms: now, expires_ms: expires_secs.map(|s| now + s * 1000) });
+            u.tokens.push(Token { name: name.clone(), hash, created_ms: now, expires_ms: expires_secs.map(|s| now + s * 1000) });
             lake.cat.commit(vec![put(&user, &u)], &[]).await?;
             // (shown this once: only its hash is kept)
-            j!({"token": token, "name": name, "user": user, "expires": expires_secs.map(|s| now + s * 1000)})
+            let expires = expires_secs.map(|s| now + s * 1000);
+            match token {
+                Some(token) => j!({"token": token, "name": name, "user": user, "expires": expires}),
+                None => j!({"name": name, "user": user, "expires": expires}),
+            }
         }
         Change::DropToken { name, user } => {
             let mut u = must(&user, get(&user).await?)?;
@@ -561,8 +585,33 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
         }
     };
     forget();
+    if gives_access && exposed(lake).await {
+        out["notice"] = EXPOSED.into(); // (told through the door: `write.rs` passes a DDL answer's notice on)
+        eprintln!("{EXPOSED}");
+    }
     Ok(out)
 }
+
+/// The lake's first user, when it has no user or role at all: `pondra`, a superuser, and a token for
+/// it (`first`), returned to be shown once. A node on the network with no token makes it before it
+/// serves anyone (`cli.rs`), since otherwise whoever asks is an admin. None: the lake had users.
+pub async fn first_user(lake: &Lake) -> Result<Option<String>> {
+    if !lake.cat.scan_raw("u/", "u0").await?.is_empty() {
+        return Ok(None);
+    }
+    let user = crate::ddl::Ddl::Users(Change::Create { name: "pondra".into(), login: true, if_not_exists: true, verifier: None, superuser: true, limits: Limits::default() });
+    crate::ddl::apply(lake, user).await?;
+    let token = crate::ddl::Ddl::Users(Change::CreateToken { name: "first".into(), user: "pondra".into(), expires_secs: None, hash: None });
+    let out = crate::ddl::apply(lake, token).await?;
+    Ok(Some(out["token"].as_str().context("the first user's token")?.to_string()))
+}
+
+/// The sentence said where the lake's keys are in the clear and users sign in (`exposed`).
+const EXPOSED: &str = "the lake's own keys are in the clear in its bucket: whoever can read the bucket can sign in as anyone. Set --admin-token (or PONDRA_SECRET_KEY) on every node to seal them";
+
+/// Are the lake's own keys in the clear where users sign in? Then whoever can read the bucket can
+/// sign in as anyone (`EXPOSED`).
+async fn exposed(lake: &Lake) -> bool { any(lake).await && kept(lake).await == "clear" && !crate::ext::shared_master() }
 
 /// Whom a grant goes to: a user, a role, or `public` (every user: made when first granted to).
 async fn grantee(lake: &Lake, name: &str) -> Result<User> {
@@ -630,6 +679,16 @@ async fn resolved(lake: &Lake, on: On) -> Result<On> {
 // ---------------------------------------------------------------- passwords, tokens, sessions
 
 pub fn sha256(s: &str) -> String { digest::digest(&digest::SHA256, s.as_bytes()).as_ref().iter().map(|b| format!("{b:02x}")).collect() }
+
+/// A new token for `user`, as `CREATE TOKEN` makes it: `pt_<user>_<32 random bytes>` (base64url) and
+/// its SHA-256 (hex), the only part kept. The randomness can't fail on a machine that runs this.
+pub fn new_token(user: &str) -> (String, String) {
+    let mut secret = [0u8; 32];
+    aws_lc_rs::rand::fill(&mut secret).expect("randomness");
+    let token = format!("pt_{}_{}", B64U.encode(user), B64U.encode(secret));
+    let hash = sha256(&token);
+    (token, hash)
+}
 
 fn hmac256(key: &[u8], data: &[u8]) -> Vec<u8> { hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data).as_ref().to_vec() }
 
@@ -728,6 +787,10 @@ enum Kept {
 /// release before it would find none.
 pub const SEALED: u32 = 3;
 
+/// The format a grant on another database needs (`On::Database`): a node from before reads none of
+/// the users once one is there (`any`).
+pub const ACROSS: u32 = 4;
+
 fn sealed(k: &Keys) -> Result<Kept> {
     let (sealed, key) = crate::ext::seal(&serde_json::to_vec(k)?)?;
     Ok(Kept::Sealed { sealed, key })
@@ -753,7 +816,7 @@ async fn keys(lake: &Lake) -> Result<Keys> {
     let k = match found {
         Some(Kept::Clear(k)) => k,
         Some(Kept::Sealed { sealed, key }) => {
-            let plain = crate::ext::unseal(&sealed, &key).map_err(|e| anyhow!("the lake's own keys are sealed by a master key this node doesn't have ({e:#}): every node needs the same PONDRA_SECRET_KEY (or PONDRA_KMS_COMMAND)"))?;
+            let plain = crate::ext::unseal(&sealed, &key).map_err(|e| anyhow!("the lake's own keys are sealed by a master key this node doesn't have ({e:#}): every node needs the same PONDRA_SECRET_KEY or PONDRA_ADMIN_TOKEN (or PONDRA_KMS_COMMAND; the one before a change as PONDRA_SECRET_KEY_PREVIOUS or PONDRA_ADMIN_TOKEN_PREVIOUS)"))?;
             serde_json::from_slice(&plain)?
         }
         None => {
@@ -801,7 +864,11 @@ pub async fn seal_keys(lake: &Lake) -> Result<()> {
                 eprintln!("the lake's own keys rewrapped with the master key in use now");
             }
         }
-        _ => {}
+        _ => {
+            if exposed(lake).await {
+                eprintln!("{EXPOSED}"); // (once, as a leader starts: a user made later is said by its CREATE)
+            }
+        }
     }
     Ok(())
 }
@@ -1126,7 +1193,10 @@ pub async fn any(lake: &Lake) -> bool {
     if let Some(c) = ANY.lock().unwrap().get(&lake.url).filter(|c| fresh(lake, version, c.0, c.1)) {
         return c.2;
     }
-    let yes = lake.cat.scan::<User>("u/", "u0").await.map(|all| all.iter().any(|(_, u)| u.login && (u.verifier.is_some() || !u.tokens.is_empty()))).unwrap_or(false);
+    let yes = match lake.cat.scan::<User>("u/", "u0").await {
+        Ok(all) => all.iter().any(|(_, u)| u.login && (u.verifier.is_some() || !u.tokens.is_empty())),
+        Err(_) => return true, // (users that can't be read are taken for ones who sign in, and read again next time: open only when surely so)
+    };
     ANY.lock().unwrap().insert(lake.url.clone(), (version, std::time::Instant::now(), yes));
     yes
 }
@@ -1143,7 +1213,8 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) ->
         if role > Role::None {
             return Some(Principal::token(role));
         }
-        if token.starts_with("pn_") && keys(lake).await.is_ok_and(|k| aws_lc_rs::constant_time::verify_slices_are_equal(k.node.as_bytes(), token.as_bytes()).is_ok()) {
+        // (where an admin token is set the nodes call each other with it, so a `pn_` key read from the bucket opens nothing)
+        if token.starts_with("pn_") && !auth.admin_set() && keys(lake).await.is_ok_and(|k| aws_lc_rs::constant_time::verify_slices_are_equal(k.node.as_bytes(), token.as_bytes()).is_ok()) {
             return Some(Principal::token(Role::Admin));
         }
         let user = if token.starts_with("ps_") { session_user(lake, token).await? } else { token_user(lake, token).await? };

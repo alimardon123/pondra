@@ -1588,12 +1588,14 @@ pub(crate) fn reveal_secret(name: &str, s: &Secret) -> Result<BTreeMap<String, S
 
 /// A secret's values: its data key unwrapped by the master key, then its values opened with it.
 fn open(name: &str, s: &Secret) -> Result<BTreeMap<String, String>> {
-    let damaged = || anyhow!("secret {name} was sealed with another master key: every node needs the same PONDRA_SECRET_KEY (or PONDRA_KMS_COMMAND)");
-    let key = match &s.key {
-        Some(wrapped) => unwrap_key(wrapped).map_err(|e| anyhow!("{}: {e:#}", damaged()))?,
-        None => master()?.to_vec(), // (sealed before round 29: by the master key itself)
+    let damaged = || anyhow!("secret {name} was sealed with another master key: every node needs the same PONDRA_SECRET_KEY or PONDRA_ADMIN_TOKEN (or PONDRA_KMS_COMMAND)");
+    let plain = match &s.key {
+        Some(wrapped) => {
+            let key = unwrap_key(wrapped).map_err(|e| anyhow!("{}: {e:#}", damaged()))?;
+            open_with(&key, &s.sealed).ok_or_else(damaged)?
+        }
+        None => masters()?.iter().find_map(|m| open_with(m, &s.sealed)).ok_or_else(damaged)?, // (sealed before round 29: by a master key itself)
     };
-    let plain = open_with(&key, &s.sealed).ok_or_else(damaged)?;
     Ok(serde_json::from_slice(&plain)?)
 }
 
@@ -1627,7 +1629,8 @@ crate::per_node!(
     static UNWRAPPED: std::sync::Mutex<HashMap<String, Vec<u8>>> = Default::default());
 
 /// A data key wrapped by the master key: by `PONDRA_KMS_COMMAND wrap` (a key service: its key never
-/// leaves it), or sealed with the local master key (`PONDRA_SECRET_KEY`, else this machine's).
+/// leaves it), or sealed with the local master key (`PONDRA_SECRET_KEY`, else the admin token's, else
+/// this machine's).
 fn wrap_key(key: &[u8]) -> Result<String> {
     match kms() {
         Some(cmd) => Ok(format!("kms:{}", kms_run(&cmd, "wrap", &B64.encode(key))?)),
@@ -1635,18 +1638,15 @@ fn wrap_key(key: &[u8]) -> Result<String> {
     }
 }
 
-/// A data key, unwrapped: by the key service for `kms:…`; else by the master key, or the previous
-/// one (`PONDRA_SECRET_KEY_PREVIOUS`) while keys move to a new one (`rewrap`).
+/// A data key, unwrapped: by the key service for `kms:…`; else by the master key, or one of the others
+/// that may have wrapped it (`masters`) while keys move to a new one (`rewrap`).
 fn unwrap_key(wrapped: &str) -> Result<Vec<u8>> {
     if let Some(k) = UNWRAPPED.lock().unwrap().get(wrapped) {
         return Ok(k.clone());
     }
     let key = match wrapped.strip_prefix("kms:") {
         Some(w) => B64.decode(kms_run(&kms().context("this secret's key was wrapped by a key service: set PONDRA_KMS_COMMAND")?, "unwrap", w)?)?,
-        None => match open_with(&master()?, wrapped) {
-            Some(k) => k,
-            None => previous().and_then(|p| open_with(&p, wrapped)).context("its key was wrapped by another master key")?,
-        },
+        None => masters()?.iter().find_map(|m| open_with(m, wrapped)).context("its key was wrapped by another master key: set the PONDRA_SECRET_KEY or PONDRA_ADMIN_TOKEN it was sealed with (or the old one as PONDRA_SECRET_KEY_PREVIOUS / PONDRA_ADMIN_TOKEN_PREVIOUS)")?,
     };
     UNWRAPPED.lock().unwrap().insert(wrapped.to_string(), key.clone());
     Ok(key)
@@ -1666,9 +1666,12 @@ fn kms_run(cmd: &str, what: &str, input: &str) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
-/// Is the master key one every node can have: `PONDRA_SECRET_KEY` or a key service, never only this
-/// machine's own (`~/.pondra/secret.key`), which a node on another machine couldn't open with?
-pub fn shared_master() -> bool { kms().is_some() || crate::env::is_set("PONDRA_SECRET_KEY") }
+/// Is the master key one every node can have: `PONDRA_SECRET_KEY`, the admin token (every node of a
+/// cluster with one has the same), or a key service? Never only this machine's own
+/// (`~/.pondra/secret.key`), which a node on another machine couldn't open with.
+pub fn shared_master() -> bool {
+    kms().is_some() || crate::env::is_set("PONDRA_SECRET_KEY") || crate::env::is_set("PONDRA_ADMIN_TOKEN")
+}
 
 /// `plain` sealed with a data key of its own, which the master key wraps: (the sealed bytes, the
 /// wrapped key). The lake's own keys are kept this way (`users::Kept`), as a secret's values are.
@@ -1698,7 +1701,7 @@ pub async fn rewrap(lake: &Lake) -> Result<usize> {
             },
             None => {
                 // (sealed by the master key itself, before round 29: sealed again, with a key of its own)
-                let plain = open_with(&master()?, &s.sealed).with_context(|| format!("secret {}", &k[2..]))?;
+                let plain = masters()?.iter().find_map(|m| open_with(m, &s.sealed)).with_context(|| format!("secret {}", &k[2..]))?;
                 (s.sealed, s.key) = { let (a, b) = seal_new(&plain)?; (a, Some(b)) };
             }
         }
@@ -1712,20 +1715,67 @@ pub async fn rewrap(lake: &Lake) -> Result<usize> {
 }
 
 /// The master key, when no key service is set: `PONDRA_SECRET_KEY` (the same on every node of a
-/// cluster), or one made for this machine (`~/.pondra/secret.key`), enough for nodes that share it.
+/// cluster), else the admin token's (`admin_key`: every node of a cluster with one has it), else one
+/// made for this machine (`~/.pondra/secret.key`), enough for nodes that share it.
 fn master() -> Result<[u8; 32]> {
-    let key = match crate::env::get("PONDRA_SECRET_KEY") {
-        Some(k) => k,
-        None => machine_key()?,
-    };
-    Ok(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, key.as_bytes()).as_ref().try_into().expect("32 bytes"))
+    if let Some(k) = crate::env::get("PONDRA_SECRET_KEY") {
+        return Ok(sha256_of(&k));
+    }
+    if let Some(t) = crate::env::get("PONDRA_ADMIN_TOKEN") {
+        return Ok(admin_key(&t));
+    }
+    Ok(sha256_of(&machine_key()?))
 }
 
-/// The master key before it changed (`PONDRA_SECRET_KEY_PREVIOUS`): keys it wrapped still open, and
-/// the leader rewraps them with the new one when it starts (`rewrap`).
-fn previous() -> Option<[u8; 32]> {
-    let k = crate::env::get("PONDRA_SECRET_KEY_PREVIOUS")?;
-    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, k.as_bytes()).as_ref().try_into().ok()
+/// The master keys before the one in use, which may have wrapped a data key: keys they wrapped still
+/// open, and the leader rewraps them with the new one when it starts (`rewrap`). The admin token is
+/// one of them when a lake moved from it to `PONDRA_SECRET_KEY`; this machine's key only if an older
+/// release made it (`machine_key_if_made`).
+fn previous() -> Vec<[u8; 32]> {
+    let set = crate::env::get;
+    [
+        set("PONDRA_SECRET_KEY_PREVIOUS").map(|k| sha256_of(&k)),
+        set("PONDRA_ADMIN_TOKEN").map(|t| admin_key(&t)),
+        set("PONDRA_ADMIN_TOKEN_PREVIOUS").map(|t| admin_key(&t)),
+        machine_key_if_made().map(|k| sha256_of(&k)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The master key in use first, then the others (`previous`): what may open a data key.
+fn masters() -> Result<Vec<[u8; 32]>> {
+    let mut all = vec![master()?];
+    all.extend(previous());
+    Ok(all)
+}
+
+/// The master key an admin token makes: PBKDF2 over the token, so a short token can't be guessed
+/// offline from what the bucket holds (the keys sealed by it). Worked out once a node per token.
+fn admin_key(token: &str) -> [u8; 32] {
+    crate::per_node!(static KEYS: Mutex<HashMap<String, [u8; 32]>> = Mutex::new(HashMap::new()));
+    if let Some(k) = KEYS.lock().unwrap().get(token) {
+        return *k;
+    }
+    if token.chars().count() < 16 {
+        eprintln!("the admin token is short: it guards the lake's keys and secrets too (use 32 random characters or more)");
+    }
+    let mut key = [0u8; 32];
+    let rounds = std::num::NonZeroU32::new(100_000).expect("non-zero");
+    aws_lc_rs::pbkdf2::derive(aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA256, rounds, b"pondra: the master key from the admin token", token.as_bytes(), &mut key);
+    KEYS.lock().unwrap().insert(token.to_string(), key);
+    key
+}
+
+/// A key's SHA-256: the 32 bytes AES-256 takes.
+fn sha256_of(key: &str) -> [u8; 32] { aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, key.as_bytes()).as_ref().try_into().expect("32 bytes") }
+
+/// This machine's key if an older release made one (`machine_key`'s file): never made here.
+fn machine_key_if_made() -> Option<String> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let key = std::fs::read_to_string(std::path::PathBuf::from(home).join(".pondra").join("secret.key")).ok()?;
+    Some(key.trim().to_string()).filter(|k| !k.is_empty())
 }
 
 fn machine_key() -> Result<String> {

@@ -29,6 +29,7 @@ use Who::*;
 /// Every `PONDRA_*` name a node or the command line reads, and who it is for.
 pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_ADMIN_TOKEN", Node),
+    ("PONDRA_ADMIN_TOKEN_PREVIOUS", Node),
     ("PONDRA_AI_CALLS", Node),
     ("PONDRA_AI_KEY", Node),
     ("PONDRA_AI_MODEL", Node),

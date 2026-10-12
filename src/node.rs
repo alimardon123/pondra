@@ -171,6 +171,23 @@ impl Node {
         let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock, retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
         crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
         learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
+        if leader && app.auth.network() && !app.auth.on() {
+            // (on the network with no token nobody could sign in: the lake's first user is made before
+            // anyone is served, and its token said once. A failure stops the node; a restart tries again.)
+            let _guard = app.lock.lock().await;
+            match users::first_user(&app.lake).await {
+                Ok(Some(token)) => eprintln!(
+                    "This lake now asks everyone to sign in: it is served on {addr} with no token.\n\
+                     Its first user is pondra, a superuser. Its token (shown once, kept only as a hash):\n  {token}\n\
+                     The console: http://{addr}/ (Sign in, with the token). Postgres: user pondra, the token as its password.\n\
+                     Another token: pondra token --dir {dir}. Or set --admin-token on every node."),
+                Ok(None) => {}
+                Err(e) => {
+                    cluster::release(&store, cluster.leader.n).await; // (another node may lead it: not one with no first user)
+                    return Err(e.context("a node on the network with no token makes the lake's first user before it serves, and that failed: set --admin-token, or listen on 127.0.0.1"));
+                }
+            }
+        }
         if leader {
             let (l, c) = (app.lake.clone(), app.cluster.clone()); // (beside serving, not before it: C5)
             panics::spawn(async move {

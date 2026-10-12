@@ -25,7 +25,9 @@ commit, the one a release ships, so nothing compiles; `build` compiles this repo
 takes `bench-bin/pondra` from the bucket) and `runner`.
 
 It runs a `binary` job, one `node` job per node, and a `driver` job that generates the data with
-`tpchgen-cli`, loads it with `pondra sql` and runs `tools/cloud/actions/driver.py`. The results go
+`tpchgen-cli`, loads it with `pondra sql` and runs `tools/cloud/actions/driver.py`. The nodes
+listen on the network, so they answer only an admin token: each job works out the run's own from
+`R2_SECRET_ACCESS_KEY` and the run's id, masked in the logs, so no secret is added for it. The results go
 to `s3://<bucket>/bench-results/<run id>/results.json` (and every node's log next to it), and
 are attached to the run as an artifact.
 

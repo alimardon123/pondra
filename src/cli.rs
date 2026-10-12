@@ -196,6 +196,20 @@ pub(crate) enum Cmd {
         attach: Vec<String>,
         query: String,
     },
+    /// Make a token for a user of a lake, and print it (once: the lake keeps only its hash). Through
+    /// the bucket, so no token is needed: whoever can write the lake's folder owns it. The lake's first
+    /// user is `pondra` (made by a node on the network with no token, which prints its token too).
+    /// `T=$(pondra token --dir lake)`.
+    Token {
+        #[arg(long, visible_alias = "lake")]
+        dir: String,
+        /// The user the token is for.
+        #[arg(long, default_value = "pondra")]
+        user: String,
+        /// The token's name, to drop it by (`DROP TOKEN name FOR user`); default `token-<unix seconds>`.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Lead a lake for a moment: make it if nothing is there yet, answer what waits in its inbox,
     /// let go. A node runs it for a lake nobody leads (`inbox::lead_once`, invariant 62).
     #[command(hide = true)]
@@ -260,6 +274,13 @@ pub(crate) async fn stopped(stdin: bool) {
     }
     #[cfg(not(unix))]
     tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = closed => {} }
+}
+
+/// Does a node listen beyond this machine: `--addr`, or `--pg`, `--kafka` or `--flight` when given, on
+/// anything but 127.0.0.1, localhost or [::1]?
+fn on_network(addr: &str, others: [&Option<String>; 3]) -> bool {
+    let loopback = |a: &str| ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|x| a.starts_with(x));
+    !loopback(addr) || others.iter().any(|a| a.as_deref().is_some_and(|a| !loopback(a)))
 }
 
 pub fn main() {
@@ -376,8 +397,9 @@ async fn run() -> anyhow::Result<()> {
                 env::give(given)?;
                 tls::init()?; // (a certificate that can't be read: said now)
                 let auth = Arc::new(auth::Auth::new(r, w, a));
-                let local = ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|x| addr.starts_with(x));
-                anyhow::ensure!(python.is_none() || auth.on() || local, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
+                let on_network = on_network(&addr, [&pg, &kafka, &flight]);
+                anyhow::ensure!(auth.on() || !on_network, "a folder of lakes served on {addr} answers anyone there: set --admin-token (each database's node takes it), or listen on 127.0.0.1");
+                anyhow::ensure!(python.is_none() || auth.on() || !on_network, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
                 // Each database's node gets the rest, as `pondra serve <lake>` would take them.
                 let mut node: Vec<String> = ["--flush-ms", &flush_ms.to_string(), "--task-ms", &task_ms.to_string(), "--retain-secs", &retain_secs.to_string(),
                     "--changelog-secs", &changelog_secs.to_string(), "--backlog", &backlog.to_string(), "--ack", &ack, "--replicas", &replicas.to_string()].map(String::from).to_vec();
@@ -392,7 +414,10 @@ async fn run() -> anyhow::Result<()> {
                 let options = dbserver::Options { python, tier_secs: Some(tier_secs), reader, node };
                 return dbserver::serve(dir, addr, pg, default, options, auth).await;
             }
-            let auth = Arc::new(auth::Auth::new(token(read_token, "PONDRA_READ_TOKEN"), token(write_token, "PONDRA_WRITE_TOKEN"), token(admin_token.clone(), "PONDRA_ADMIN_TOKEN")));
+            // (on the network a node is never open: with no token, its leader makes the lake's first user before it serves, `node.rs`)
+            let on_network = on_network(&addr, [&pg, &kafka, &flight]);
+            let auth = auth::Auth::new(token(read_token, "PONDRA_READ_TOKEN"), token(write_token, "PONDRA_WRITE_TOKEN"), token(admin_token.clone(), "PONDRA_ADMIN_TOKEN"));
+            let auth = Arc::new(auth.on_network(on_network));
             if let Some(t) = token(admin_token, "PONDRA_ADMIN_TOKEN") {
                 given.push(("PONDRA_ADMIN_TOKEN", t)); // (nodes call each other with it: cluster::http)
             }
@@ -406,21 +431,7 @@ async fn run() -> anyhow::Result<()> {
             given.extend(cache_dir.map(|d| ("PONDRA_CACHE_DIR", d)));
             env::give(given)?;
             tls::init()?; // (a certificate that can't be read: said now)
-            let local = ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|a| addr.starts_with(a));
-            anyhow::ensure!(python.is_none() || auth.on() || local, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
-            if !auth.on() {
-                // No tokens: every request is an administrator. A loopback node is a local tool; a
-                // node reachable from elsewhere with no tokens is open to that network. Warn, naming
-                // each door that is exposed, so the first run on a server doesn't ship open silently.
-                let nonlocal = |a: &str| !["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|p| a.starts_with(p));
-                let doors = [(nonlocal(&addr), format!("HTTP on {addr}")), (pg.as_deref().is_some_and(nonlocal), format!("the Postgres port on {}", pg.as_deref().unwrap_or_default())),
-                    (kafka.as_deref().is_some_and(nonlocal), format!("Kafka on {}", kafka.as_deref().unwrap_or_default())), (flight.as_deref().is_some_and(nonlocal), format!("Flight on {}", flight.as_deref().unwrap_or_default()))];
-                let exposed: Vec<String> = doors.into_iter().filter(|(x, _)| *x).map(|(_, d)| d).collect();
-                if !exposed.is_empty() {
-                    eprintln!("warning: no tokens are set, so every request is treated as an administrator, and {} {} reachable beyond this machine. Set --admin-token (with --read-token and --write-token as needed), or listen on 127.0.0.1.",
-                        exposed.join(", "), if exposed.len() == 1 { "is" } else { "are" });
-                }
-            }
+            anyhow::ensure!(python.is_none() || auth.on() || !on_network, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
             // Stopped (Ctrl-C, SIGTERM from a scheduler scaling down, or the program that started
             // this node ending): drained first (`drain.rs`; a second signal stops at once), then the
             // next node leads at once instead of waiting out the lease. Watched from before the node
@@ -518,6 +529,22 @@ async fn run() -> anyhow::Result<()> {
                     println!("{}", pretty_format_batches(&batches)?);
                 }
             }
+        }
+        Cmd::Token { dir, user, name } => {
+            let Ok(lake) = store::Lake::open(&dir, false, false).await else { anyhow::bail!("no lake at {dir} (pondra token takes a lake's folder, or its s3:// prefix)") };
+            let no_user = lake.cat.scan_raw("u/", "u0").await?.is_empty();
+            drop(lake); // (what follows opens it as it needs: through the inbox, or leading for a moment)
+            if user == "pondra" && no_user {
+                // (a lake with no user yet, as a follower on the network finds it: its first user, as a leader makes it)
+                let first = users::Change::Create { name: user.clone(), login: true, if_not_exists: true, verifier: None, superuser: true, limits: Default::default() };
+                write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(first))).await?;
+            }
+            let (token, hash) = users::new_token(&user);
+            let name = name.unwrap_or_else(|| format!("token-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())));
+            let change = users::Change::CreateToken { name: name.clone(), user: user.clone(), expires_secs: None, hash: Some(hash) };
+            write::through_bucket(&dir, write::Request::Ddl(ddl::Ddl::Users(change))).await?; // (only the hash goes)
+            println!("{token}"); // (alone on stdout: `T=$(pondra token --dir lake)`)
+            eprintln!("a token for {user} (shown once; DROP TOKEN {name} FOR {user} takes it back)");
         }
     }
     Ok(())

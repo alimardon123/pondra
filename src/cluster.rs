@@ -393,6 +393,24 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     });
 }
 
+/// The nodes' key in hand before this node calls its leader for a caller (`write::on_node_as`): a
+/// follower that just started may sign a user in, its catalog holding the users, a moment before the
+/// loop that reads the key (`cli.rs`) has it, and a call sent without it is refused as unsigned (CI's
+/// `harness.py guarded`, "a change a follower forwards…"). It waits 10 s at most, and not at all for a
+/// key sealed by a master key this node doesn't have: waiting won't help that one.
+pub async fn signed(lake: &crate::store::Lake) {
+    if crate::env::is_set("PONDRA_TOKEN") || crate::env::is_set("PONDRA_ADMIN_TOKEN") || node_key().is_some() {
+        return;
+    }
+    for _ in 0..40 {
+        match crate::users::node_key(lake).await {
+            Ok(k) => return set_node_key(k),
+            Err(e) if format!("{e:#}").contains("master key") => return,
+            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+}
+
 /// An HTTP client that carries no token of its own: the process serving a folder of databases (`dbserver.rs`) passes each client's on.
 pub fn http_bare() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -418,6 +436,8 @@ pub fn set_node_key(k: String) { *NODE_KEY.write().unwrap_or_else(|e| e.into_inn
 /// `PONDRA_TOKEN`.
 pub fn http() -> reqwest::Client {
     crate::per_node!(static MINE: std::sync::Mutex<Option<(Option<String>, reqwest::Client)>> = std::sync::Mutex::new(None));
+    // (a variable set empty is no token, as `env::get` takes it: compose passes an unset one on empty,
+    // and "Bearer " sent in place of the nodes' key left a follower unable to reach its leader)
     let token = crate::env::get("PONDRA_TOKEN").or_else(|| crate::env::get("PONDRA_ADMIN_TOKEN")).or_else(node_key);
     let mut client = MINE.lock().unwrap();
     if let Some((t, c)) = client.as_ref().filter(|(t, _)| *t == token) {

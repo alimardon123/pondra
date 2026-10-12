@@ -398,7 +398,7 @@ def main():
         nodes = [harness.Node(lake, A.port + i, env=env, cwd=os.path.dirname(A.slt.rstrip("/"))).start() for i in range(A.nodes)]
         try:
             if A.nodes > 1:
-                while len(harness.call(A.port, "GET", "/stats")["nodes"]) < A.nodes:
+                while len(harness.call(A.port, "GET", "/stats").get("nodes", ())) < A.nodes:
                     time.sleep(0.1)
             counts, fails = run_file(path, A.port, A.nodes > 1)
         except Exception as e:

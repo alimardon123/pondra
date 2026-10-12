@@ -1435,7 +1435,10 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
         }
         let target = other.clone().unwrap_or_else(|| lake.arc());
         let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files).await?;
-        let Some(o) = other else { return post_as(&app.cluster.leader.addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await };
+        let Some(o) = other else {
+            crate::cluster::signed(lake).await; // (the nodes' key, before a user's change goes to the leader)
+            return post_as(&app.cluster.leader.addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
+        };
         let out = deliver(&o.url, Some(Some(Request::Change(sql, job.clone(), sent))), &stmt, &job, false).await?;
         seen_there(&o, Some(producer_key(&format!("sql:{job}")))).await;
         return Ok(out);
@@ -1735,6 +1738,13 @@ async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
             crate::ddl::sync(&lake, "", false).await?; // (lakes attached by ATTACH: read here too)
             let (other, table) = crate::ddl::resolve(&lake, &stmt.table()).await?;
             let (stmt, target) = (stmt.on(table.clone()), other.unwrap_or_else(|| lake.clone())); // (a write to an attached lake goes to its leader)
+            if !crate::env::is_set("PONDRA_TOKEN") && !crate::env::is_set("PONDRA_ADMIN_TOKEN") && crate::cluster::node_key().is_none() {
+                // (no token: the lake's own key for its nodes, which whoever holds the lake can read; a
+                // leader on the network answers nothing unsigned. `cluster::http` sends it.)
+                if let Ok(k) = crate::users::node_key(&target).await {
+                    crate::cluster::set_node_key(k);
+                }
+            }
             (Some(prepare(&lake, &target, &table, &stmt, &job, true).await?), stmt, target.url.clone())
         }
         Err(_) => (None, stmt, dir.to_string()),
@@ -1746,6 +1756,8 @@ tokio::task_local! {
     /// A key a request to another lake's leader goes with instead of this process's token: a
     /// branch's key in its base (`branch::keyed`).
     static BEARER: String;
+    /// Set while a request goes through the bucket alone (`through_bucket`): it is not sent over HTTP.
+    static BUCKET: ();
 }
 
 /// `send`, with `key` as its `Authorization` when given.
@@ -1758,6 +1770,13 @@ pub async fn send_as(dir: &str, req: Request, key: Option<&str>) -> Result<Value
 
 /// Have the leader of the lake at `dir` record `req` (made on this node), however it's reached.
 pub async fn send(dir: &str, req: Request) -> Result<Value> { deliver(dir, Some(Some(req)), &Stmt::Invalid(String::new()), "", false).await }
+
+/// Have the leader of the lake at `dir` record `req`, through the bucket alone: its inbox, or this
+/// process leading for a moment when nobody does. For a caller with no token (`pondra token`, which
+/// the leader would refuse over HTTP): whoever can write the bucket owns the lake (invariant 18).
+pub async fn through_bucket(dir: &str, req: Request) -> Result<Value> {
+    BUCKET.scope((), deliver(dir, Some(Some(req)), &Stmt::Invalid(String::new()), "", true)).await
+}
 
 /// Have the leader of the lake at `dir` record a write: over HTTP, through the bucket inbox if it
 /// can't be reached, or, when nobody leads, by leading for a moment: here (`one_off`: a `pondra
@@ -1779,7 +1798,8 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
                     req = Some(prepare(&lake, &lake, &stmt.table(), stmt, job, true).await?);
                 }
                 let Some(Some(r)) = &req else { return Ok(j!({"duplicate": true})) };
-                let direct = !crate::env::is_set("PONDRA_NO_DIRECT"); // (test hook: act as if the leader were out of reach)
+                // (test hook PONDRA_NO_DIRECT: act as if the leader were out of reach; `through_bucket` never goes over HTTP)
+                let direct = !crate::env::is_set("PONDRA_NO_DIRECT") && BUCKET.try_with(|_| ()).is_err();
                 match if direct { Some(post(&t.addr, r).await) } else { None } {
                     Some(Ok(v)) => return summary(matches!(r, Request::Flush(_)), v),
                     Some(Err(e)) if !unreachable(&e) => return Err(e),
@@ -1919,6 +1939,9 @@ async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value>
         None => call,
     };
     let res = call.send().await?;
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        bail!("the leader at {addr} asks for a sign-in: set PONDRA_TOKEN to one of the lake's tokens ({})", res.text().await?);
+    }
     ensure!(res.status().is_success(), "the leader at {addr}: {}", res.text().await?);
     Ok(res.json().await?)
 }
