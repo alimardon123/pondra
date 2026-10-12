@@ -111,14 +111,23 @@ pub fn task<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> t
 
 // What this node started (`spawn`, `task`, `aside`), so a node stopped in a process ends it all
 // (ADR-061 §4): the runtime outlives the node, and a loop left on it would go on writing its lake.
-crate::per_node!(static STARTED: std::sync::Mutex<Vec<tokio::task::AbortHandle>> = std::sync::Mutex::new(Vec::new()));
+crate::per_node!(static STARTED: std::sync::Mutex<Started> = std::sync::Mutex::new(Started { tasks: Vec::new(), prune_at: 0 }));
+
+#[derive(Default)]
+struct Started {
+    tasks: Vec<tokio::task::AbortHandle>,
+    /// How many before the finished ones are let go: twice what was left last time, so a task costs
+    /// O(1) on average however many stay running (1,000 connections open).
+    prune_at: usize,
+}
 
 fn tracked<T>(t: tokio::task::JoinHandle<T>) -> tokio::task::JoinHandle<T> {
     let mut started = STARTED.lock().unwrap_or_else(|e| e.into_inner());
-    if started.len().is_power_of_two() {
-        started.retain(|h| !h.is_finished()); // (finished ones let go now and then: a cost a task of O(1) on average)
+    if started.tasks.len() >= started.prune_at {
+        started.tasks.retain(|h| !h.is_finished());
+        started.prune_at = 64.max(2 * started.tasks.len());
     }
-    started.push(t.abort_handle());
+    started.tasks.push(t.abort_handle());
     t
 }
 
@@ -126,7 +135,7 @@ fn tracked<T>(t: tokio::task::JoinHandle<T>) -> tokio::task::JoinHandle<T> {
 /// back: a keep-alive left running would mark it alive again), but the one asking.
 pub fn abort_all() {
     let me = tokio::task::try_id();
-    for t in std::mem::take(&mut *STARTED.lock().unwrap_or_else(|e| e.into_inner())) {
+    for t in std::mem::take(&mut STARTED.lock().unwrap_or_else(|e| e.into_inner()).tasks) {
         if Some(t.id()) != me {
             t.abort();
         }

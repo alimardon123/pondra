@@ -28,7 +28,8 @@ pub const FORMAT: u32 = 3;
 /// The format every lake gets without asking: the mark itself (`raise`).
 const BASE: u32 = 1;
 
-/// `FORMAT`, unless a test says otherwise (`PONDRA_TEST_FORMAT`: a build of a later format).
+/// `FORMAT`, unless a test says otherwise (`PONDRA_TEST_FORMAT`: a build of a later format). The
+/// process's, not a node's: the build is the process's, and a test pretends to be another build.
 pub fn known() -> u32 {
     static KNOWN: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| crate::env::or("PONDRA_TEST_FORMAT", FORMAT));
     *KNOWN
