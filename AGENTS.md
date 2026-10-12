@@ -2171,6 +2171,38 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    reads is checked against the user's grants, as on the leader. `harness.py guarded`: "a change a
    follower forwards runs as its user…".
 
+375. **Where the nodes share an admin token and nothing else, it is the master key, and the nodes' key
+   opens nothing there** (`ext::master`, `admin_key`, `previous`; `users::who`, `server::cluster_call`):
+   with no `PONDRA_SECRET_KEY` or key service, the lake's own keys and its secrets are sealed by a key
+   PBKDF2 makes from the admin token (100,000 rounds, once a process), so nothing in the bucket signs
+   anyone in. A `pn_` key counts only on a node without an admin token (with one, nodes call each other
+   with it). The keys before a change still open (`PONDRA_SECRET_KEY_PREVIOUS`, the admin token when a
+   lake moved to `PONDRA_SECRET_KEY`, `PONDRA_ADMIN_TOKEN_PREVIOUS`, a machine's key only if its file is
+   there: never made for it), and the leader rewraps with the key in use. A lake whose users sign in
+   while its keys are in the clear says so at its leader's start and on every `CREATE USER … PASSWORD`,
+   `ALTER USER … PASSWORD` and `CREATE TOKEN`. `harness.py sealed`: "with only an admin token, a new
+   lake's own keys are sealed from its first write…", "…the nodes' key read from the bucket opens
+   nothing (401)…".
+
+376. **A node that listens beyond this machine is never open** (`Auth::network`, `App::open`,
+   `users::first_user`): its `--addr`, `--pg`, `--kafka` or `--flight` on anything but 127.0.0.1,
+   localhost or [::1] means every request signs in, tokens or not. With no token, its leader makes the
+   lake's first user, `pondra`, a superuser, before it serves, and prints its token once (only the hash
+   is kept); a failure stops the node. A follower of a lake with no user yet answers no one. `pondra
+   token --dir` makes a token here and sends only its hash, through the bucket (whoever can write the
+   bucket owns the lake: invariant 18), making `pondra` first on a lake with no user. `serve --lakes`
+   on the network with no token refuses to start. Users that can't be read are taken for ones who sign
+   in (`users::any`): a node from before a new kind of grant took the lake for open. `harness.py
+   first`: "a node on the network with no token makes user pondra…", "a follower on the network, of a
+   lake with no user yet…".
+
+377. **A grant on another database needs format 4** (`users::ACROSS`, `On::Database`): a node from
+   0.33 can't read a user holding one, so it waits until every node knows format 4. A new kind of grant
+   is stored as one an older node reads (a sequence's as `On::Table`), or waits for its format.
+   `upgrade_check.py format`: "…a grant on another database, to 4; and Pondra 0.33.0 then refuses it by
+   name". And `cluster::alive` asks for `cluster/left` too: a leader's last mark, in flight as it stepped
+   down, can land after `release` deleted it (`environments_check.py --s3`'s teardown).
+
 ## Tests: run these before and after any change
 
 ```bash
@@ -2181,6 +2213,8 @@ python3 tools/gates.py [--prepare]      # the gates (sqllogictest, TPC-H SF1 vs 
 python3 tools/harness.py guarded        # open nodes and pages from other sites, the row doors and the nodes' routes by grant, a forwarded change as its user, .py files an admin's
 python3 tools/surface.py --bin target/release/pondra --check docs/surface.json   # what 1.0 keeps (ADR-068): reports until the freeze, then fails on a name added or gone
 python3 tools/harness.py safety         # panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
+python3 tools/harness.py sealed         # the admin token as the master key: sealed from the first write, across nodes, rotation, the nodes' key refused
+python3 tools/harness.py first          # a node on the network with no token makes the lake's first user and prints its token once; pondra token; a follower answers no one
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
@@ -2303,7 +2337,7 @@ python3 tools/serve_bench.py --keys 2000000   # serving: point lookups and dashb
 ```
 
 The Python tools need `pip install -r tools/requirements.txt` (Python 3.11; the versions the
-suite last passed with). `.github/workflows/build.yml` builds on every push what a release ships:
+suite last passed with). `harness.py` exits non-zero when any section answers false, in `all` too. `.github/workflows/build.yml` builds on every push what a release ships:
 the dist profile for all five platforms (Linux with zig, for glibc 2.17), each tried there
 (`smoke.py`), packaged and its packages tried (`tools/try_packages.sh`; the Linux wheel on CentOS
 7 and Ubuntu 22.04 too); the Linux job then runs `harness.py all`, `frames_check.py` and a

@@ -201,6 +201,7 @@ can't read. Until something moves it, the release before still opens it.
 | 1 | 0.32 | every lake, as soon as a release that knows formats opens it |
 | 2 | 0.33 | a materialized view that works its answers out as it is read (`avg`, `stddev`, `HAVING`, …) |
 | 3 | 0.34 | a lake's own keys sealed by a master key every node shares (`PONDRA_SECRET_KEY` or `PONDRA_KMS_COMMAND`): from the first write in a lake the release makes, otherwise by its leader once every node knows format 3 |
+| 4 | 0.34 | a grant on another database (`GRANT … ON DATABASE`, `GRANT CLONE ON DATABASE`), which a node of 0.33 can't read: made only once every node knows format 4 |
 
 An older release refuses a newer lake by name, before it reads anything. The message has this shape,
 with the lake, its format and the release that wrote it filled in:
