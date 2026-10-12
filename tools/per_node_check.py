@@ -17,8 +17,12 @@ here by file, line and name, saying what to do. `--list` prints every static and
 
 Two more ways a node outlives its stop fail here too: a task started with `tokio::spawn` (or on a
 runtime's handle) outside `panics.rs`, which `Node::stop` can't end (start it with `panics::spawn`
-or `panics::task`), and `std::env::set_var` outside the program's own files (the environment is
-the process's: the next node, and every child process, would read it).
+or `panics::task`), and `std::env::set_var` anywhere (the environment is the process's: the next
+node and every child process would read it, and beside a library's host it is a data race).
+
+And every setting goes through `env.rs` (ADR-061 §8): a `PONDRA_*` name read with `std::env`
+anywhere else fails, so does a `"PONDRA_…"` name its NAMES table doesn't list, and a name the table
+lists that nothing reads.
 
 Only the standard library; it reads the source, not a build.
 """
@@ -45,6 +49,7 @@ PROCESS = {
     "copy.rs:MS": SETTING + " (PONDRA_LOAD_RETENTION_SECS)",
     "defaults.rs:CTX": "a session with no tables, for DEFAULT and CHECK expressions: nothing of a lake",
     "delta.rs:ONE": LOCK,
+    "env.rs:GIVEN": "what the process was given (open's options, the command line's flags): fixed by its first open (ADR-061 §8)",
     "ext.rs:CLIENT": "a client with no token, for other engines' REST catalogs: only its keep-alive sockets",
     "files.rs:SUBSTR": "a function's definition",
     "flight.rs:INFO": "what Flight SQL says of the server: constants",
@@ -84,6 +89,7 @@ PROCESS = {
     "tier.rs:SLOTS": SETTING + " (tiering's slots, sized by --memory-gb)",
     "tls.rs:TLS": SETTING + " (PONDRA_TLS_*)",
     "users.rs:MAKING": LOCK,
+    "write.rs:JOB": "`pondra sql`'s job: the process's, carried through its restarts (`cluster::restart_with`)",
 }
 
 # What a value nothing can change is made of: anything else (a crate's own type, a session, a client,
@@ -93,12 +99,12 @@ PLAIN = {"std", "sync", "collections", "time", "path", "num", "borrow", "regex",
          "str", "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
          "i128", "isize", "f32", "f64", "Duration", "PathBuf", "Path", "Regex", "Value", "Bytes", "Cow",
          "NonZeroUsize", "static"}
-# Where a node may set the environment: the program itself, before any node, and `pondra sql`'s own
-# process, which runs itself again with it (`write.rs`'s from_cli). By file, with the reason.
-SET_VAR = {
-    "cli.rs": "the program's options, set before its one node starts",
-    "write.rs": "`pondra sql`'s own process: its job and tries, kept when it runs itself again",
+# Where a `"PONDRA_…"` name isn't a setting anything reads, by file, with the reason.
+NOT_READ = {
+    "ci.rs": "GitHub secrets' names, which `pondra ci init` sets for a repository's workflows",
 }
+READ = re.compile(r"""\benv::var(?:_os)?\(\s*"PONDRA_""")
+NAME = re.compile(r'"(PONDRA_[A-Z0-9_]+)"')
 SPAWN = re.compile(r"\btokio::(?:task::)?spawn\(|Handle::(?:current|try_current)\(\)[^;]*?\.spawn\(")
 REGEX = re.compile(r"^(?:std::sync::)?LazyLock<(?:regex::)?Regex>$")
 STATIC = re.compile(r"\bstatic\s+(?:mut\s+)?([A-Z_][A-Z0-9_]*)\s*:")
@@ -216,9 +222,31 @@ def leaks():
                 code = line.split("//", 1)[0]
                 if SPAWN.search(code):
                     bad.append(f"src/{rel}:{n}: a task Node::stop can't end: start it with crate::panics::task (or panics::spawn for a loop the node can't do without)")
-                if "set_var(" in code and f not in SET_VAR:
-                    bad.append(f"src/{rel}:{n}: the environment is the process's, not the node's: keep it in a per_node! static (or add the file to SET_VAR in tools/per_node_check.py with why)")
+                if "set_var(" in code:
+                    bad.append(f"src/{rel}:{n}: the environment is the process's, not the node's: give a setting with crate::env::give, keep a node's state in a per_node! static, or pass a child process its environment with Command::env")
     return bad
+
+
+def settings():
+    """Settings read past `env.rs`, names it doesn't list, and names it lists that nothing reads."""
+    table = open(os.path.join(SRC, "env.rs"), encoding="utf-8").read()
+    table = table[table.index("pub const NAMES"):]
+    table = table[:table.index("];")]  # (the table alone: its tests name settings that aren't)
+    names, read, bad = set(re.findall(r'\(\s*"(PONDRA_[A-Z0-9_]+)"\s*,', table)), set(), []
+    for base, _, files in os.walk(SRC):
+        for f in sorted(files):
+            if not f.endswith(".rs") or f == "env.rs":
+                continue
+            path = os.path.join(base, f)
+            rel = os.path.relpath(path, SRC).replace(os.sep, "/")
+            for n, line in enumerate(tests_cut(open(path, encoding="utf-8").read()).split("\n"), 1):
+                if READ.search(line.split("//", 1)[0]):
+                    bad.append(f"src/{rel}:{n}: a setting read past env.rs: read it with crate::env::get (or os, parse, or, secs, flag, is_set)")
+                for name in NAME.findall(line):
+                    read.add(name)
+                    if name not in names and f not in NOT_READ:
+                        bad.append(f"src/{rel}:{n}: {name} isn't in env.rs's NAMES: add it there with who it is for (or the file to NOT_READ in tools/per_node_check.py with why)")
+    return bad + [f"src/env.rs: NAMES lists {name}, which nothing reads: take it out" for name in sorted(names - read)]
 
 
 def main():
@@ -235,7 +263,7 @@ def main():
         if not ok:
             bad.append(f"src/{rel}:{line} {name} ({ty}): {why}")
     stale = sorted(k for k in PROCESS if k not in keys)
-    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks()
+    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings()
     bad += more
     for b in bad if not args.list else more:
         print(f"FAIL {b}")

@@ -1721,8 +1721,7 @@ async fn created(dir: &str, c: &ast::CreateTable) -> Result<Option<()>> {
 }
 
 async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
-    let job = std::env::var("PONDRA_JOB").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
-    std::env::set_var("PONDRA_JOB", &job); // (if fenced, the process restarts: the same job again)
+    let job = job().to_string();
     // (A lake with no catalog yet can't be read: then the work is done once this process leads.)
     let (req, stmt, to) = match Lake::open(dir, false, false).await {
         Ok(lake) => {
@@ -1773,7 +1772,7 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
                     req = Some(prepare(&lake, &lake, &stmt.table(), stmt, job, true).await?);
                 }
                 let Some(Some(r)) = &req else { return Ok(j!({"duplicate": true})) };
-                let direct = std::env::var("PONDRA_NO_DIRECT").is_err(); // (test hook: act as if the leader were out of reach)
+                let direct = !crate::env::is_set("PONDRA_NO_DIRECT"); // (test hook: act as if the leader were out of reach)
                 match if direct { Some(post(&t.addr, r).await) } else { None } {
                     Some(Ok(v)) => return summary(matches!(r, Request::Flush(_)), v),
                     Some(Err(e)) if !unreachable(&e) => return Err(e),
@@ -1795,7 +1794,7 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
                     // Another one-off writer took the catalog while this one was leading (both
                     // found the lake idle). Start over with the same job: whoever wins records it
                     // once, and the rest go through them.
-                    Err(e) if fenced(&e) && tries() < 5 => crate::cluster::restart("fenced while writing"),
+                    Err(e) if fenced(&e) && tries() < 5 => crate::cluster::restart_with("fenced while writing", &[("PONDRA_JOB", job.to_string()), ("PONDRA_TRIES", (tries() + 1).to_string())]),
                     r => r,
                 };
             }
@@ -1847,7 +1846,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
 /// records them with their lineage instead (the inbox, or no leader yet).
 pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
     let t = latest(&lake.store).await.ok()??;
-    if t.addr.is_empty() || !alive(&lake.store, &t).await || std::env::var_os("PONDRA_NO_DIRECT").is_some() {
+    if t.addr.is_empty() || !alive(&lake.store, &t).await || crate::env::is_set("PONDRA_NO_DIRECT") {
         return None;
     }
     crate::log::To::Leader(t.addr).reserve().await.ok()
@@ -1943,11 +1942,16 @@ fn fenced(e: &anyhow::Error) -> bool {
     e.downcast_ref::<slatedb::Error>().is_some_and(|e| matches!(e.kind(), slatedb::ErrorKind::Closed(_))) || format!("{e:#}").contains("newer DB client")
 }
 
-/// How many times this command has already started over (it re-runs itself, keeping `PONDRA_JOB`).
+/// How many times this command has already started over (it runs itself again, keeping its job).
 fn tries() -> u32 {
-    let n = std::env::var("PONDRA_TRIES").ok().and_then(|t| t.parse().ok()).unwrap_or(0);
-    std::env::set_var("PONDRA_TRIES", (n + 1).to_string());
-    n
+    crate::env::or("PONDRA_TRIES", 0)
+}
+
+/// This `pondra sql`'s job, the same for every statement it records: a run started over takes the
+/// job of the run before (`PONDRA_JOB`), so whoever wins the race records it once.
+fn job() -> &'static str {
+    static JOB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    JOB.get_or_init(|| crate::env::get("PONDRA_JOB").unwrap_or_else(|| uuid::Uuid::new_v4().to_string()))
 }
 
 /// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go.

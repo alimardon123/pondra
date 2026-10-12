@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// How long a link lasts: `PONDRA_SHARE_URL_SECS` (900, at most a week: S3's limit).
-pub fn secs() -> u64 { std::env::var("PONDRA_SHARE_URL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(900).clamp(1, 7 * 86400) }
+pub fn secs() -> u64 { crate::env::or::<u64>("PONDRA_SHARE_URL_SECS", 900).clamp(1, 7 * 86400) }
 
 /// Links to these objects of the lake (`data/…`, as the lake names them) for `who`, and when they
 /// end (ms). `base` is where a node's links point (a lake on a disk): the sharing door's address.

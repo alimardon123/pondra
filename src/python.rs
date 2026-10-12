@@ -71,7 +71,7 @@ fn kept_choice() -> Option<std::path::PathBuf> { crate::console::settings_dir().
 async fn candidates() -> Vec<String> {
     let mut out: Vec<std::path::PathBuf> = vec![];
     let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
-    out.extend(var("PONDRA_PYTHON"));
+    out.extend(crate::env::os("PONDRA_PYTHON").map(std::path::PathBuf::from));
     out.extend(kept_choice().and_then(|f| std::fs::read_to_string(f).ok()).map(|p| p.trim().into()));
     let names: &[&str] = if cfg!(windows) { &["python.exe", "python3.exe"] } else { &["python3", "python"] };
     let bin = if cfg!(windows) { "" } else { "bin" };
@@ -109,7 +109,7 @@ pub async fn pythons() -> Vec<Value> { probe(candidates().await).await }
 
 async fn probe(paths: Vec<String>) -> Vec<Value> {
     const TRY: &str = "import sys, json, importlib.util as u\nr = {'version': sys.version.split()[0], 'pondra': bool(u.find_spec('pondra')), 'pyarrow': bool(u.find_spec('pyarrow'))}\ntry:\n    import pyarrow, pondra, pondra.worker\n    r['ok'] = True; r['pondra_version'] = getattr(pondra, '__version__', '')\nexcept BaseException as e:\n    r['ok'] = False; r['error'] = (type(e).__name__ + ': ' + str(e))[:300]\nprint(json.dumps(r))";
-    let limit = Duration::from_secs(env_u64("PONDRA_PYTHON_PROBE_SECS", 15));
+    let limit = Duration::from_secs(crate::env::or::<u64>("PONDRA_PYTHON_PROBE_SECS", 15));
     let probes = paths.into_iter().map(|path| async move {
         let run = tokio::process::Command::new(&path).args(["-c", TRY]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true).output();
         let mut v = match tokio::time::timeout(limit, run).await {
@@ -148,8 +148,6 @@ pub async fn choose(path: &str) -> Result<Value> {
     }
     Ok(probe)
 }
-
-fn env_u64(var: &str, default: u64) -> u64 { std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default) }
 
 struct Worker {
     child: Child,
@@ -227,7 +225,7 @@ async fn pool(packages: &str) -> Result<Arc<Pool>> {
         true => None,
         false => Some(install(&key).await?),
     };
-    let procedures = env_u64("PONDRA_PROCEDURES", 4 * cores() as u64).max(1) as usize;
+    let procedures = crate::env::or::<u64>("PONDRA_PROCEDURES", 4 * cores() as u64).max(1) as usize;
     let fresh = Arc::new(Pool { path, idle: Mutex::new(vec![]), functions: Arc::new(Semaphore::new(cores())), procedures: Arc::new(Semaphore::new(procedures)), busy: AtomicUsize::new(0), reaping: AtomicBool::new(false) });
     Ok(POOLS.lock().unwrap().entry(key).or_insert(fresh).clone())
 }
@@ -348,7 +346,7 @@ async fn spawn(path: Option<&str>) -> Result<Worker> {
     }
     let (input, output) = (child.stdin.take().expect("piped"), BufReader::new(child.stdout.take().expect("piped")));
     let mut w = Worker { child, input, output, idle_since: Instant::now(), said };
-    let limit = Duration::from_secs(env_u64("PONDRA_WORKER_START_SECS", 60));
+    let limit = Duration::from_secs(crate::env::or::<u64>("PONDRA_WORKER_START_SECS", 60));
     let hello = async {
         send(&mut w, &json!({"op": "hello"}), &[]).await?;
         recv(&mut w).await // (an older worker answers an error: it is alive all the same)
@@ -369,7 +367,7 @@ impl Lent {
     /// The worker back, unless it has grown past its memory (it is then stopped: a new one comes).
     fn give(mut self) {
         let Some(mut w) = self.worker.take() else { return };
-        if resident_mb(&w.child).is_some_and(|mb| mb > env_u64("PONDRA_WORKER_MB", 2048)) {
+        if resident_mb(&w.child).is_some_and(|mb| mb > crate::env::or::<u64>("PONDRA_WORKER_MB", 2048)) {
             return; // (dropped: killed)
         }
         w.idle_since = Instant::now();
@@ -379,7 +377,7 @@ impl Lent {
 
 /// Stop the workers idle for a minute (`PONDRA_WORKER_IDLE_SECS`); done when none is left.
 async fn reap(pool: Arc<Pool>) {
-    let idle = Duration::from_secs(env_u64("PONDRA_WORKER_IDLE_SECS", 60));
+    let idle = Duration::from_secs(crate::env::or::<u64>("PONDRA_WORKER_IDLE_SECS", 60));
     loop {
         tokio::time::sleep(Duration::from_secs(2).min(idle)).await;
         let mut ws = pool.idle.lock().unwrap();
@@ -599,9 +597,9 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
         }
     };
     kernel.as_mut().expect("a kernel").busy = false;
-    if resident_mb(&kernel.as_ref().expect("a kernel").worker.child).is_some_and(|mb| mb > env_u64("PONDRA_WORKER_MB", 2048)) {
+    if resident_mb(&kernel.as_ref().expect("a kernel").worker.child).is_some_and(|mb| mb > crate::env::or::<u64>("PONDRA_WORKER_MB", 2048)) {
         *kernel = None;
-        notice(format!("this session's Python grew past {} MB and was stopped: the next cell starts with no variables", env_u64("PONDRA_WORKER_MB", 2048)));
+        notice(format!("this session's Python grew past {} MB and was stopped: the next cell starts with no variables", crate::env::or::<u64>("PONDRA_WORKER_MB", 2048)));
     }
     KERNELS.lock().unwrap().entry(session.to_string()).and_modify(|e| e.1 = Instant::now());
     match answer.0.get("error").and_then(Value::as_str) {
@@ -637,7 +635,7 @@ pub fn end_session(session: &str) -> bool {
 
 /// Sessions' workers idle for `PONDRA_SESSION_IDLE_SECS` stop; once there are none, this stops.
 async fn reap_kernels() {
-    let idle = Duration::from_secs(env_u64("PONDRA_SESSION_IDLE_SECS", 3600));
+    let idle = Duration::from_secs(crate::env::or::<u64>("PONDRA_SESSION_IDLE_SECS", 3600));
     loop {
         tokio::time::sleep(idle.min(Duration::from_secs(30))).await;
         let mut all = KERNELS.lock().unwrap();

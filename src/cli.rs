@@ -336,12 +336,11 @@ async fn run() -> anyhow::Result<()> {
     };
     match cmd {
         Cmd::Serve { path, dir, databases, default, addr, advertise, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, tls_cert, tls_key, tls_ca, attach: attached, attach_found, stop_with_stdin, python } => {
-            for (flag, var) in [(tls_cert, "PONDRA_TLS_CERT"), (tls_key, "PONDRA_TLS_KEY"), (tls_ca, "PONDRA_TLS_CA")] {
-                if let Some(v) = flag {
-                    std::env::set_var(var, v); // (read by `tls.rs`)
-                }
-            }
-            tls::init()?; // (a certificate that can't be read: said now)
+            // The flags that are settings (`env.rs`) are given to the process at once, before anything
+            // reads them; its children get them too (a folder of lakes' databases, `pondra lead`).
+            let mut given: Vec<(&str, String)> = [("PONDRA_TLS_CERT", tls_cert), ("PONDRA_TLS_KEY", tls_key), ("PONDRA_TLS_CA", tls_ca)]
+                .into_iter().filter_map(|(var, flag)| Some((var, flag?))).collect();
+            let token = |flag: Option<String>, var: &str| flag.or_else(|| env::get(var)).filter(|t| !t.is_empty());
             // A lake, or a folder of lakes (each a database: `dbserver.rs`), by what the path holds.
             let (dir, many) = match (dir, databases) {
                 (Some(d), _) => {
@@ -371,13 +370,11 @@ async fn run() -> anyhow::Result<()> {
                 if let Some((_, flag)) = one.iter().find(|(given, _)| *given) {
                     anyhow::bail!("{dir} holds several lakes, served as databases; {flag} is one lake's (serve that lake: pondra serve {dir}/<name> {flag} …)");
                 }
-                let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
-                let (r, w, a) = (env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token, "PONDRA_ADMIN_TOKEN"));
-                for (var, v) in [("PONDRA_READ_TOKEN", &r), ("PONDRA_WRITE_TOKEN", &w), ("PONDRA_ADMIN_TOKEN", &a)] {
-                    if let Some(v) = v {
-                        std::env::set_var(var, v); // (each database's node takes them from here)
-                    }
-                }
+                let (r, w, a) = (token(read_token, "PONDRA_READ_TOKEN"), token(write_token, "PONDRA_WRITE_TOKEN"), token(admin_token, "PONDRA_ADMIN_TOKEN"));
+                // (each database's node takes the tokens from here)
+                given.extend([("PONDRA_READ_TOKEN", &r), ("PONDRA_WRITE_TOKEN", &w), ("PONDRA_ADMIN_TOKEN", &a)].into_iter().filter_map(|(var, t)| Some((var, t.clone()?))));
+                env::give(given)?;
+                tls::init()?; // (a certificate that can't be read: said now)
                 let auth = Arc::new(auth::Auth::new(r, w, a));
                 let local = ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|x| addr.starts_with(x));
                 anyhow::ensure!(python.is_none() || auth.on() || local, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
@@ -395,26 +392,22 @@ async fn run() -> anyhow::Result<()> {
                 let options = dbserver::Options { python, tier_secs: Some(tier_secs), reader, node };
                 return dbserver::serve(dir, addr, pg, default, options, auth).await;
             }
-            let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
-            let auth = Arc::new(auth::Auth::new(env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token.clone(), "PONDRA_ADMIN_TOKEN")));
-            if let Some(t) = env(admin_token, "PONDRA_ADMIN_TOKEN") {
-                std::env::set_var("PONDRA_ADMIN_TOKEN", t); // (nodes call each other with it: cluster::http)
+            let auth = Arc::new(auth::Auth::new(token(read_token, "PONDRA_READ_TOKEN"), token(write_token, "PONDRA_WRITE_TOKEN"), token(admin_token.clone(), "PONDRA_ADMIN_TOKEN")));
+            if let Some(t) = token(admin_token, "PONDRA_ADMIN_TOKEN") {
+                given.push(("PONDRA_ADMIN_TOKEN", t)); // (nodes call each other with it: cluster::http)
             }
+            given.extend(cache_gb.map(|gb| ("PONDRA_CACHE_GB", gb.to_string())).into_iter().chain(memory_gb.map(|gb| ("PONDRA_MEMORY_GB", gb.to_string())))); // (read by Lake::open)
+            given.extend([
+                ("PONDRA_PUBLISH", publish), // read by POST /tables
+                ("PONDRA_CHANGELOG_SECS", changelog_secs.to_string()), // read by tier::expire
+                ("PONDRA_FSYNC", fsync.to_string()), // read by replica::ReplicaLog::hold
+                ("PONDRA_REPLICAS", if ack == "replicated" { replicas.max(1) } else { 1 }.to_string()),
+            ]);
+            given.extend(cache_dir.map(|d| ("PONDRA_CACHE_DIR", d)));
+            env::give(given)?;
+            tls::init()?; // (a certificate that can't be read: said now)
             let local = ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|a| addr.starts_with(a));
             anyhow::ensure!(python.is_none() || auth.on() || local, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
-            if let Some(gb) = cache_gb {
-                std::env::set_var("PONDRA_CACHE_GB", gb.to_string()); // read by Lake::open
-            }
-            if let Some(gb) = memory_gb {
-                std::env::set_var("PONDRA_MEMORY_GB", gb.to_string()); // read by Lake::open
-            }
-            std::env::set_var("PONDRA_PUBLISH", publish); // read by POST /tables
-            std::env::set_var("PONDRA_CHANGELOG_SECS", changelog_secs.to_string()); // read by tier::expire
-            std::env::set_var("PONDRA_FSYNC", fsync.to_string()); // read by replica::ReplicaLog::hold
-            std::env::set_var("PONDRA_REPLICAS", if ack == "replicated" { replicas.max(1) } else { 1 }.to_string());
-            if let Some(d) = cache_dir {
-                std::env::set_var("PONDRA_CACHE_DIR", d);
-            }
             // Stopped (Ctrl-C, SIGTERM from a scheduler scaling down, or the program that started
             // this node ending): drained first (`drain.rs`; a second signal stops at once), then the
             // next node leads at once instead of waiting out the lease. Watched from before the node
@@ -457,7 +450,7 @@ async fn run() -> anyhow::Result<()> {
             anyhow::ensure!(lake.is_none() || url.is_none(), "run a script on a lake folder or on a node (--url), not both");
             let sql = std::fs::read_to_string(&file).map_err(|e| anyhow::anyhow!("{file}: {e}"))?;
             let body = serde_json::json!({"sql": sql, "params": shell::params(&params)?});
-            let token = token.or_else(|| std::env::var("PONDRA_TOKEN").ok());
+            let token = token.or_else(|| crate::env::get("PONDRA_TOKEN"));
             print!("{}", shell::script(lake.as_deref().unwrap_or("lake"), url.as_deref(), token.as_deref(), body).await?);
         }
         Cmd::Service { cmd } => service::command(cmd).await?,

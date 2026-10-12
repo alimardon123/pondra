@@ -229,7 +229,7 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
     };
     let waiting: u64 = gone.iter().map(|f| f.rows).sum();
     let rows = meta.files.iter().map(|f| f.rows).sum::<u64>() + meta.sealed.as_ref().map_or(0, |s| s.rows);
-    let at_least = std::env::var("PONDRA_PURGE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+    let at_least = crate::env::or("PONDRA_PURGE_ROWS", 100_000);
     if upto <= after || (!now_anyway && meta.publish.is_empty() && waiting < at_least && waiting * 10 < rows) {
         // (nothing to purge yet; the old rows past the table's retention may still go)
         if settle(&mut meta, &mut dmeta, now, retain_ms) {
@@ -728,7 +728,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
         if floors[0].0 <= cutoff { floors[0].1 } else { 0 }
     };
     // (`--changelog-secs`: the log is also a change feed, kept that long for `/watch?after=` replays.)
-    let changelog = std::env::var("PONDRA_CHANGELOG_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1000;
+    let changelog = crate::env::or::<u64>("PONDRA_CHANGELOG_SECS", 0) * 1000;
     let log_cutoff = cutoff.min(crate::log::now_ms().saturating_sub(changelog));
     let (segs, kept): (Vec<(String, Segment)>, Vec<(String, Segment)>) = lake.cat.scan::<Segment>(&seg_key(1), &seg_key(floor + 1)).await?
         .into_iter().partition(|(_, s)| s.ts_ms < log_cutoff);
@@ -943,7 +943,7 @@ pub fn plain(props: WriterProperties) -> datafusion::parquet::arrow::arrow_write
 /// so scans are CPU-cheap (TPC-H runs 13-20% faster than on ZSTD, with files a third bigger).
 /// `zstd` where storage or bandwidth costs more than CPU; `snappy` or `none` also work.
 fn codec() -> Compression {
-    match std::env::var("PONDRA_CODEC").unwrap_or_default().to_lowercase().as_str() {
+    match crate::env::get("PONDRA_CODEC").unwrap_or_default().to_lowercase().as_str() {
         "zstd" => Compression::ZSTD(ZstdLevel::try_new(1).expect("a valid level")),
         "snappy" => Compression::SNAPPY,
         "none" => Compression::UNCOMPRESSED,

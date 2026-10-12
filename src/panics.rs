@@ -84,7 +84,7 @@ fn queries() -> &'static tokio::runtime::Runtime {
 /// holds one), and a cap could leave none for files.
 pub fn runtime() -> tokio::runtime::Builder {
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
-    let most = std::env::var("PONDRA_BLOCKING_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(if cfg!(windows) { 512 } else { 16.max(4 * cores) });
+    let most = crate::env::or("PONDRA_BLOCKING_THREADS", if cfg!(windows) { 512 } else { 16.max(4 * cores) });
     let mut b = tokio::runtime::Builder::new_multi_thread();
     b.enable_all().thread_stack_size(8 << 20).thread_keep_alive(std::time::Duration::from_secs(1)).max_blocking_threads(most);
     b
@@ -143,7 +143,7 @@ pub fn said(p: &(dyn std::any::Any + Send)) -> String {
 pub fn test_function(ctx: &datafusion::prelude::SessionContext) {
     use datafusion::arrow::datatypes::DataType;
     use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
-    if std::env::var("PONDRA_TEST_PANICS").is_ok_and(|v| v == "1") {
+    if crate::env::flag("PONDRA_TEST_PANICS") {
         let f = |_: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> { panic!("pondra_panic() was called") };
         ctx.register_udf(create_udf("pondra_panic", vec![], DataType::Int64, Volatility::Volatile, std::sync::Arc::new(f)));
     }

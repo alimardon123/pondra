@@ -1636,7 +1636,7 @@ fn unwrap_key(wrapped: &str) -> Result<Vec<u8>> {
     Ok(key)
 }
 
-fn kms() -> Option<String> { std::env::var("PONDRA_KMS_COMMAND").ok().filter(|c| !c.trim().is_empty()) }
+fn kms() -> Option<String> { crate::env::get("PONDRA_KMS_COMMAND").filter(|c| !c.trim().is_empty()) }
 
 /// Run the key service's command (`<command> wrap|unwrap`, the input on stdin, the answer on stdout):
 /// `aws kms`, `gcloud kms`, `az keyvault key`, `vault write transit/…`, through a short script.
@@ -1652,7 +1652,7 @@ fn kms_run(cmd: &str, what: &str, input: &str) -> Result<String> {
 
 /// Is the master key one every node can have: `PONDRA_SECRET_KEY` or a key service, never only this
 /// machine's own (`~/.pondra/secret.key`), which a node on another machine couldn't open with?
-pub fn shared_master() -> bool { kms().is_some() || std::env::var("PONDRA_SECRET_KEY").is_ok_and(|k| !k.is_empty()) }
+pub fn shared_master() -> bool { kms().is_some() || crate::env::is_set("PONDRA_SECRET_KEY") }
 
 /// `plain` sealed with a data key of its own, which the master key wraps: (the sealed bytes, the
 /// wrapped key). The lake's own keys are kept this way (`users::Kept`), as a secret's values are.
@@ -1698,9 +1698,9 @@ pub async fn rewrap(lake: &Lake) -> Result<usize> {
 /// The master key, when no key service is set: `PONDRA_SECRET_KEY` (the same on every node of a
 /// cluster), or one made for this machine (`~/.pondra/secret.key`), enough for nodes that share it.
 fn master() -> Result<[u8; 32]> {
-    let key = match std::env::var("PONDRA_SECRET_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => machine_key()?,
+    let key = match crate::env::get("PONDRA_SECRET_KEY") {
+        Some(k) => k,
+        None => machine_key()?,
     };
     Ok(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, key.as_bytes()).as_ref().try_into().expect("32 bytes"))
 }
@@ -1708,7 +1708,7 @@ fn master() -> Result<[u8; 32]> {
 /// The master key before it changed (`PONDRA_SECRET_KEY_PREVIOUS`): keys it wrapped still open, and
 /// the leader rewraps them with the new one when it starts (`rewrap`).
 fn previous() -> Option<[u8; 32]> {
-    let k = std::env::var("PONDRA_SECRET_KEY_PREVIOUS").ok().filter(|k| !k.is_empty())?;
+    let k = crate::env::get("PONDRA_SECRET_KEY_PREVIOUS")?;
     aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, k.as_bytes()).as_ref().try_into().ok()
 }
 

@@ -43,7 +43,7 @@ fn spread_bytes() -> u64 { mb("PONDRA_SPREAD_MB", 256) }
 /// (`PONDRA_BROADCAST_MB`, 64; 0 slices every table).
 fn broadcast_bytes() -> u64 { mb("PONDRA_BROADCAST_MB", 64) }
 
-fn mb(var: &str, default: u64) -> u64 { std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default) << 20 }
+fn mb(var: &str, default: u64) -> u64 { crate::env::or(var, default) << 20 }
 
 /// One table's share on one node: manifests and files, and maybe the log tail (after..=upto).
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -645,7 +645,7 @@ async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tabl
                 forget(&job.id);
                 return Ok(refused("it wouldn't pay"));
             }
-            if std::env::var_os("PONDRA_DEBUG_SPREAD").is_some() {
+            if crate::env::is_set("PONDRA_DEBUG_SPREAD") {
                 let over = job.exchanges.iter().map(|x| displayable(x.plan.as_ref()).one_line().to_string().trim().to_string()).collect::<Vec<_>>();
                 eprintln!("spread: shuffled {how:?}{}: {over:?}", scheme.map(|s| format!(", by ranges of {:?}", s.columns)).unwrap_or_default());
             }
@@ -843,7 +843,7 @@ impl Job {
 
 /// Why a query runs on one node after all (`PONDRA_DEBUG_SPREAD=1` prints it on stderr).
 pub fn refused<T>(why: impl std::fmt::Display) -> Option<T> {
-    if std::env::var_os("PONDRA_DEBUG_SPREAD").is_some() {
+    if crate::env::is_set("PONDRA_DEBUG_SPREAD") {
         eprintln!("spread: not spread: {why}");
     }
     None

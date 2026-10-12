@@ -30,7 +30,7 @@ crate::per_node!(static ENDPOINT: std::sync::RwLock<Option<String>> = std::sync:
 pub fn set_endpoint(addr: &str) { ENDPOINT.set_once(crate::tls::url(&format!("{}/delta-sharing", addr.trim_end_matches('/')))); }
 
 pub fn endpoint() -> String {
-    match std::env::var("PONDRA_SHARING_URL").ok().filter(|u| !u.is_empty()) {
+    match crate::env::get("PONDRA_SHARING_URL") {
         Some(u) => u.trim_end_matches('/').to_string(),
         None => ENDPOINT.current().unwrap_or_else(|| "http://127.0.0.1:8080/delta-sharing".into()),
     }
@@ -362,7 +362,7 @@ async fn partitions(app: &App, t: &Shared) -> anyhow::Result<HashMap<String, Str
 /// node: their reads are GETs on the lake's bucket that no node's request budget sees (principle 7).
 fn quota(who: &str, n: usize) -> Result<(), Fail> {
     crate::per_node!(static USED: Mutex<Option<HashMap<String, (u64, usize)>>> = Mutex::new(None));
-    let most: usize = std::env::var("PONDRA_SHARE_FILES_PER_MINUTE").ok().and_then(|m| m.parse().ok()).unwrap_or(10_000);
+    let most: usize = crate::env::or("PONDRA_SHARE_FILES_PER_MINUTE", 10_000);
     let minute = crate::log::now_ms() / 60_000;
     let mut used = USED.lock().unwrap();
     let e = used.get_or_insert_default().entry(who.to_string()).or_insert((minute, 0));

@@ -220,7 +220,7 @@ impl Backend {
         }
         let sql = crate::routines::expand(&self.app.lake, sql).await.map_err(user_error)?; // (macros: ADR-023)
         let sql = crate::asof::rewrite(&pg_dialect(&self.app.lake, &sql, user)).map_err(user_error)?.into_owned();
-        if std::env::var_os("PONDRA_DEBUG_PG").is_some() {
+        if crate::env::is_set("PONDRA_DEBUG_PG") {
             eprintln!("pg {user}: {sql}");
         }
         if let Some(word) = crate::txn::control(&sql) {
@@ -928,7 +928,7 @@ impl Backend {
 
 /// `PONDRA_TRACE_PG=1`: where a Postgres statement's time goes, on stderr.
 fn trace() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("PONDRA_TRACE_PG").is_some());
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env::is_set("PONDRA_TRACE_PG"));
     *ON
 }
 

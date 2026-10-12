@@ -543,7 +543,7 @@ struct BeatParams {
 
 async fn beat(State(app): State<App>, Query(p): Query<BeatParams>, headers: axum::http::HeaderMap) -> Result<Json<(u64, Vec<String>)>, Response> {
     // Test hook: followers listed in the file $PONDRA_DROP_BEATS get no answer (a broken link to the leader).
-    let dropped = std::env::var("PONDRA_DROP_BEATS").map(|f| std::fs::read_to_string(f).unwrap_or_default()).unwrap_or_default();
+    let dropped = crate::env::get("PONDRA_DROP_BEATS").map(|f| std::fs::read_to_string(f).unwrap_or_default()).unwrap_or_default();
     if dropped.lines().any(|a| a == p.from) {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
@@ -658,8 +658,8 @@ struct Turns {
 
 static TURNS: std::sync::LazyLock<Turns> = std::sync::LazyLock::new(|| {
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
-    let most = std::env::var("PONDRA_QUERIES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or((4 * cores).max(16)).max(1);
-    let wait = std::env::var("PONDRA_QUEUE_SECS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(60.0);
+    let most = crate::env::or::<usize>("PONDRA_QUERIES", (4 * cores).max(16)).max(1);
+    let wait = crate::env::or::<f64>("PONDRA_QUEUE_SECS", 60.0);
     Turns { turns: tokio::sync::Semaphore::new(most), most, wait: Duration::from_secs_f64(wait.max(0.0)) }
 });
 
@@ -1149,7 +1149,7 @@ struct SqlParams {
 /// Is this request from whoever started the node here (the shell: `PONDRA_OWNER_KEY`)? Then its
 /// SQL may read files on this machine, as `pondra sql` may (invariant 21: nobody else's).
 fn owner(headers: &axum::http::HeaderMap) -> bool {
-    static KEY: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("PONDRA_OWNER_KEY").ok().filter(|k| k.len() >= 16));
+    static KEY: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| crate::env::get("PONDRA_OWNER_KEY").filter(|k| k.len() >= 16));
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     crate::auth::lent(token).is_some_and(|l| l.1) // (a Python procedure the owner called)
         || KEY.as_deref().is_some_and(|k| headers.get("x-pondra-owner").is_some_and(|h| aws_lc_rs::constant_time::verify_slices_are_equal(h.as_bytes(), k.as_bytes()).is_ok()))
@@ -1374,7 +1374,7 @@ fn streams(format: Option<&str>) -> bool { !matches!(format, Some("table" | "typ
 /// Is an answer big enough to send in pieces: `PONDRA_STREAM_MB` (8) of Arrow, read once. 0 sends
 /// every answer in pieces (the tests compare the two ways).
 fn big(batches: &[RecordBatch]) -> bool {
-    static MB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("PONDRA_STREAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(8));
+    static MB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| crate::env::or("PONDRA_STREAM_MB", 8));
     let mut counted = datafusion::common::utils::memory::RecordBatchMemoryCounter::new(); // (as `query::collect` counts it)
     batches.iter().map(|b| counted.count_batch(b)).sum::<usize>() >= *MB << 20
 }

@@ -306,7 +306,7 @@ fn unwatched(toml: &Toml, env: &str) -> bool {
 /// The environment meant: `--env` or the positional, `PONDRA_ENV`, else the git branch's database. With a
 /// `--url` or `--lake` it is pondra.toml's first environment (or dev).
 fn env_of(at: &Where, toml: &Toml, dir: &Path) -> Result<String> {
-    if let Some(e) = at.env.clone().or_else(|| std::env::var("PONDRA_ENV").ok()) {
+    if let Some(e) = at.env.clone().or_else(|| crate::env::get("PONDRA_ENV")) {
         return Ok(e);
     }
     if at.url.is_some() || at.lake.is_some() {
@@ -403,7 +403,7 @@ fn given(at: &Where, toml: &Toml, env: &str) -> bool {
 
 /// The token for a node at `base`: `--token`, `PONDRA_TOKEN`, else the one `pondra login` kept for that server.
 fn token_for(at: &Where, base: &str) -> Option<String> {
-    at.token.clone().or_else(|| std::env::var("PONDRA_TOKEN").ok()).or_else(|| saved(base))
+    at.token.clone().or_else(|| crate::env::get("PONDRA_TOKEN")).or_else(|| saved(base))
 }
 
 /// A node at `base`, as it is. Nothing is started.
@@ -417,7 +417,7 @@ pub(crate) async fn node(at: &Where, toml: &Toml, env: &str) -> Result<Node> {
     if let Some(lake) = lake_of(at, toml, env) {
         let (mut child, base, owner, log) = crate::shell::start(&lake)?;
         let http = crate::shell::up(&base, &mut child, &log).await?;
-        return Ok(Node { http, base, token: at.token.clone().or_else(|| std::env::var("PONDRA_TOKEN").ok()), owner, child: Some(child) });
+        return Ok(Node { http, base, token: at.token.clone().or_else(|| crate::env::get("PONDRA_TOKEN")), owner, child: Some(child) });
     }
     match address(at, toml, env) {
         Some(base) => Ok(node_at(at, base)),
@@ -510,7 +510,7 @@ async fn is_protected_db(node: &Node, env: &str) -> Result<bool> {
 // ---------------------------------------------------------------- login
 
 fn home() -> Result<PathBuf> {
-    if let Some(h) = std::env::var_os("PONDRA_HOME") {
+    if let Some(h) = crate::env::os("PONDRA_HOME") {
         return Ok(PathBuf::from(h));
     }
     let h = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).context("no home folder: set PONDRA_HOME")?;
@@ -613,9 +613,9 @@ async fn sign_in(base: &str, dbs: &[String], token: Option<String>, user: Option
 
 /// The token a user's password gets at `api`: asked for (or PONDRA_PASSWORD), then `POST /login`.
 async fn password_token(http: &reqwest::Client, api: &str, base: &str, user: &str) -> Result<String> {
-    let password = match std::env::var("PONDRA_PASSWORD") {
-        Ok(p) => p,
-        Err(_) => ask(&format!("{user}'s password for {base}: "), true)?,
+    let password = match crate::env::get("PONDRA_PASSWORD") {
+        Some(p) => p,
+        None => ask(&format!("{user}'s password for {base}: "), true)?,
     };
     let r = http.post(format!("{api}/login")).json(&json!({"user": user, "password": password})).send().await?;
     ensure!(r.status().is_success(), "{}", r.text().await?.trim());

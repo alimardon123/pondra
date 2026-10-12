@@ -411,7 +411,7 @@ pub fn json<T: Serialize>(v: &T) -> Vec<u8> { serde_json::to_vec(v).expect("seri
 
 /// The open formats a new table is published in unless it says otherwise (the node's `--publish`).
 pub fn default_publish() -> Vec<String> {
-    std::env::var("PONDRA_PUBLISH").unwrap_or_default().split(',').filter(|f| !f.is_empty()).map(String::from).collect()
+    crate::env::get("PONDRA_PUBLISH").unwrap_or_default().split(',').filter(|f| !f.is_empty()).map(String::from).collect()
 }
 
 const TAIL_BYTES: usize = 256 << 20; // decoded log segments kept in memory, per node
@@ -422,14 +422,14 @@ const RECENT_BYTES: usize = 64 << 20; // …within this much memory (past it, a 
 // follower reads from its own view until it has caught up, instead of the leader buffering more)
 
 /// Query read cache in memory, MB (env PONDRA_CACHE_MB, default 1024).
-fn cache_mb() -> usize { std::env::var("PONDRA_CACHE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1024) }
+fn cache_mb() -> usize { crate::env::or("PONDRA_CACHE_MB", 1024) }
 
 /// The local SSD tier for a lake on object storage (`serve --cache-dir/--cache-gb`, or env
 /// PONDRA_CACHE_DIR / PONDRA_CACHE_GB): under the temp dir, 20 GB, or a quarter of the free disk
 /// if that is less (a notebook's sandbox may have a few GB). 0 GB turns it off.
 fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
-    let dir = std::env::var("PONDRA_CACHE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("pondra-cache"));
-    let bytes = match std::env::var("PONDRA_CACHE_GB").ok().and_then(|v| v.parse::<u64>().ok()) {
+    let dir = crate::env::get("PONDRA_CACHE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("pondra-cache"));
+    let bytes = match crate::env::parse::<u64>("PONDRA_CACHE_GB") {
         Some(gb) => gb << 30,
         None => space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
     };
@@ -494,7 +494,7 @@ impl std::fmt::Debug for Lake {
 /// hash tables and sort buffers, not the Parquet decoding and the batches in flight around them,
 /// so the node's own memory runs ahead of this number. The hot columns come out of it too.)
 pub fn memory_limit() -> usize {
-    let gb = std::env::var("PONDRA_MEMORY_GB").ok().and_then(|g| g.parse::<f64>().ok());
+    let gb = crate::env::parse::<f64>("PONDRA_MEMORY_GB");
     gb.map(|g| (g * (1u64 << 30) as f64) as usize).or_else(|| ram().map(|r| r / 3)).unwrap_or(4 << 30)
 }
 
@@ -1447,7 +1447,7 @@ fn field(f: &mut Bytes) -> Result<Bytes> {
 
 /// A cold start's steps and their times, with `PONDRA_TRACE_START` (`tools/cold_trace.sh`, C5).
 pub fn trace(what: &str, since: std::time::Instant) {
-    if std::env::var_os("PONDRA_TRACE_START").is_some() {
+    if crate::env::is_set("PONDRA_TRACE_START") {
         eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
     }
 }
@@ -1521,7 +1521,7 @@ impl Catalog {
         // commits a second), and a disk they filled had no room to flush the catalog, so nothing
         // could ever clear it. (A follower reads the files of a manifest it polled 250 ms ago.)
         let every = |interval: u64, min_age: u64| Some(GarbageCollectorDirectoryOptions { interval: Some(Duration::from_secs(interval)), min_age: Duration::from_secs(min_age), dry_run: false });
-        let gc = std::env::var("PONDRA_GC_SECS").ok().and_then(|v| v.parse().ok());
+        let gc = crate::env::parse("PONDRA_GC_SECS");
         let (wal, secs) = (gc.unwrap_or(if local { 5 } else { 60 }), gc.unwrap_or(60));
         let compacted = if local { every(10, 60) } else { GarbageCollectorOptions::default().compacted_options };
         let garbage_collector_options = Some(GarbageCollectorOptions { wal_options: every(wal, wal), manifest_options: every(secs, secs), compacted_options: compacted, ..Default::default() });
@@ -1535,7 +1535,7 @@ impl Catalog {
         let mut cat = Self::new(Db_::Writer(db.build().await?));
         trace("the catalog's writer open", t0);
         upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local);
-        cat.replicas = std::env::var("PONDRA_REPLICAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        cat.replicas = crate::env::or("PONDRA_REPLICAS", 1);
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         let c = cat.get::<u64>("c").await?.unwrap_or(0);
         *cat.order.get_mut() = c + 1;
@@ -1998,7 +1998,7 @@ fn fatal(e: slatedb::Error) -> anyhow::Error {
 /// Test hook: `PONDRA_CRASH=after_seg_put:0.05,after_parquet_put:0.2` aborts the process at
 /// that point with that probability, to prove crashes never lose or duplicate rows.
 pub fn maybe_crash(point: &str) {
-    let Ok(spec) = std::env::var("PONDRA_CRASH") else { return };
+    let Some(spec) = crate::env::get("PONDRA_CRASH") else { return };
     for (name, prob) in spec.split(',').filter_map(|p| p.split_once(':')) {
         let roll = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1e6;
         if name == point && roll < prob.parse().unwrap_or(0.0) {
@@ -2016,7 +2016,7 @@ pub fn maybe_crash(point: &str) {
 pub fn partitions() -> usize {
     static PARTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); // (every session asks: the cores are read from the cgroup's files)
     *PARTS.get_or_init(|| {
-        let cores = std::env::var("PONDRA_CORES").ok().and_then(|p| p.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
+        let cores = crate::env::parse("PONDRA_CORES").unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
         cores.min(memory_limit() / (24 << 20)).max(2)
     })
 }

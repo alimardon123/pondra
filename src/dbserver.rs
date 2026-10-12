@@ -85,7 +85,7 @@ struct Server {
 
 type Shared = Arc<Server>;
 
-fn idle() -> Duration { Duration::from_secs(std::env::var("PONDRA_DATABASE_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(600)) }
+fn idle() -> Duration { Duration::from_secs(crate::env::or("PONDRA_DATABASE_IDLE_SECS", 600)) }
 
 /// Does `path` hold lakes rather than be one (`pondra serve data`: each a database)? Not when it
 /// holds one itself, or is new or empty (it becomes a lake).
@@ -171,6 +171,7 @@ impl Server {
         if let Some(t) = self.options.tier_secs {
             cmd.args(["--tier-secs", &t.to_string()]);
         }
+        cmd.envs(crate::env::given()); // (the tokens: `env.rs`)
         for v in ["PONDRA_TLS_CERT", "PONDRA_TLS_KEY", "PONDRA_TLS_CA"] {
             cmd.env_remove(v); // (a database's node listens on this machine only: TLS is the server's)
         }

@@ -348,7 +348,7 @@ impl Answers {
     }
 
     fn keep(&mut self, key: Vec<u8>, answer: Kept, secs: u64) {
-        static BUDGET: LazyLock<usize> = LazyLock::new(|| std::env::var("PONDRA_FUNCTION_CACHE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(256usize) << 20);
+        static BUDGET: LazyLock<usize> = LazyLock::new(|| crate::env::or("PONDRA_FUNCTION_CACHE_MB", 256usize) << 20);
         self.bytes += answer.size() + key.len();
         if let Some((k, (_, old))) = self.kept.push(key, (std::time::Instant::now() + std::time::Duration::from_secs(secs), answer)) {
             self.bytes -= old.size() + k.len(); // (the key's answer before)

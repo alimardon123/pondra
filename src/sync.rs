@@ -45,7 +45,7 @@ pub struct At {
 pub async fn command(cmd: Command) -> Result<()> {
     let (Command::Pull { dir, at } | Command::Push { dir, at }) = &cmd;
     anyhow::ensure!(at.lake.is_none() || at.url.is_none(), "sync with a lake folder or with a node (--url), not both");
-    let token = at.token.clone().or_else(|| std::env::var("PONDRA_TOKEN").ok());
+    let token = at.token.clone().or_else(|| crate::env::get("PONDRA_TOKEN"));
     let push = matches!(cmd, Command::Push { .. });
     let said = match &at.url {
         Some(url) => Node { http: reqwest::Client::new(), base: url.trim_end_matches('/').into(), token }.sync(Path::new(dir), push).await,

@@ -50,13 +50,12 @@ pub fn on() -> bool { tls().is_some() }
 pub fn url(rest: &str) -> String { format!("{}://{rest}", if on() { "https" } else { "http" }) }
 
 fn load() -> Result<Option<Tls>> {
-    let var = |n: &str| std::env::var(n).ok().filter(|v| !v.is_empty());
-    let (Some(cert), Some(key)) = (var("PONDRA_TLS_CERT"), var("PONDRA_TLS_KEY")) else {
-        anyhow::ensure!(var("PONDRA_TLS_CERT").is_none() && var("PONDRA_TLS_KEY").is_none(), "--tls-cert and --tls-key go together");
+    let (Some(cert), Some(key)) = (crate::env::get("PONDRA_TLS_CERT"), crate::env::get("PONDRA_TLS_KEY")) else {
+        anyhow::ensure!(crate::env::get("PONDRA_TLS_CERT").is_none() && crate::env::get("PONDRA_TLS_KEY").is_none(), "--tls-cert and --tls-key go together");
         return Ok(None);
     };
     let read = |p: &str| std::fs::read(p).with_context(|| format!("reading {p}"));
-    let (pem, key_pem, ca) = (read(&cert)?, read(&key)?, var("PONDRA_TLS_CA").map(|p| read(&p)).transpose()?);
+    let (pem, key_pem, ca) = (read(&cert)?, read(&key)?, crate::env::get("PONDRA_TLS_CA").map(|p| read(&p)).transpose()?);
     let certs = CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>().with_context(|| format!("{cert}: not a PEM certificate"))?;
     anyhow::ensure!(!certs.is_empty(), "{cert} holds no certificate");
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
@@ -77,7 +76,7 @@ fn load() -> Result<Option<Tls>> {
         c.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         Ok(tokio_rustls::TlsAcceptor::from(Arc::new(c)))
     };
-    let optional = var("PONDRA_TLS").is_some_and(|v| v == "optional");
+    let optional = crate::env::get("PONDRA_TLS").is_some_and(|v| v == "optional");
     let tls = Tls { http: config(&[b"h2", b"http/1.1"])?, flight: config(&[b"h2"])?, other: config(&[])?, pem: pem.clone(), ca, key: key_pem, optional };
     Ok(Some(tls))
 }

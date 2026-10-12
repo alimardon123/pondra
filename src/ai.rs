@@ -174,23 +174,23 @@ fn failed(embed: bool, e: &anyhow::Error) {
 /// many partitions on many nodes never storm a provider.
 fn turns() -> &'static tokio::sync::Semaphore {
     static TURNS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-    TURNS.get_or_init(|| tokio::sync::Semaphore::new(std::env::var("PONDRA_AI_CALLS").ok().and_then(|n| n.parse().ok()).filter(|&n| n > 0).unwrap_or(16)))
+    TURNS.get_or_init(|| tokio::sync::Semaphore::new(crate::env::parse::<usize>("PONDRA_AI_CALLS").filter(|&n| n > 0).unwrap_or(16)))
 }
 
 /// One request to the endpoint: the answers' texts, or the embeddings as JSON arrays, one per input.
 /// A 429, a 5xx or a request that never reached it is tried again, after what `Retry-After` says or
 /// half a second doubling each time; anything else (a 400: the model's name, say) fails at once.
 async fn call(embed: bool, inputs: &[&str], model: &str) -> anyhow::Result<Vec<Value>> {
-    let url = std::env::var("PONDRA_AI_URL").unwrap_or_else(|_| "http://127.0.0.1:11434/v1".into());
+    let url = crate::env::get("PONDRA_AI_URL").unwrap_or_else(|| "http://127.0.0.1:11434/v1".into());
     let (path, body) = match embed {
         true => ("embeddings", json!({"model": model, "input": inputs})),
         false => ("chat/completions", json!({"model": model, "messages": [{"role": "user", "content": inputs[0]}]})),
     };
-    let secs = std::env::var("PONDRA_AI_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let secs = crate::env::or("PONDRA_AI_TIMEOUT_SECS", 300);
     let mut wait = Duration::from_millis(500);
     for tries in 1.. {
         let mut req = crate::cluster::http_bare().post(format!("{}/{path}", url.trim_end_matches('/'))).json(&body).timeout(Duration::from_secs(secs)); // (not the nodes' client: its token is theirs alone)
-        if let Ok(key) = std::env::var("PONDRA_AI_KEY") {
+        if let Some(key) = crate::env::get("PONDRA_AI_KEY") {
             req = req.bearer_auth(key);
         }
         let reply = req.send().await;
@@ -229,8 +229,8 @@ async fn call(embed: bool, inputs: &[&str], model: &str) -> anyhow::Result<Vec<V
 
 fn default_model(embed: bool) -> String {
     match embed {
-        true => std::env::var("PONDRA_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text".into()),
-        false => std::env::var("PONDRA_AI_MODEL").unwrap_or_else(|_| "llama3.2".into()),
+        true => crate::env::get("PONDRA_EMBED_MODEL").unwrap_or_else(|| "nomic-embed-text".into()),
+        false => crate::env::get("PONDRA_AI_MODEL").unwrap_or_else(|| "llama3.2".into()),
     }
 }
 

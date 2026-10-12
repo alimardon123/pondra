@@ -236,22 +236,22 @@ fn fnv(bytes: &[u8]) -> u64 {
 
 fn learn() -> Duration {
     static L: OnceLock<Duration> = OnceLock::new();
-    *L.get_or_init(|| Duration::from_millis(std::env::var("PONDRA_LEARN_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(100)))
+    *L.get_or_init(|| Duration::from_millis(crate::env::or("PONDRA_LEARN_MS", 100)))
 }
 
 fn slow() -> Duration {
     static S: OnceLock<Duration> = OnceLock::new();
-    *S.get_or_init(|| Duration::from_millis(std::env::var("PONDRA_SLOW_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(1000)))
+    *S.get_or_init(|| Duration::from_millis(crate::env::or("PONDRA_SLOW_MS", 1000)))
 }
 
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PONDRA_HISTORY").map_or(true, |v| !v.eq_ignore_ascii_case("off")))
+    *ON.get_or_init(|| crate::env::get("PONDRA_HISTORY").map_or(true, |v| !v.eq_ignore_ascii_case("off")))
 }
 
 fn rate() -> u64 {
     static R: OnceLock<u64> = OnceLock::new();
-    *R.get_or_init(|| std::env::var("PONDRA_HISTORY_RATE").ok().and_then(|r| r.parse().ok()).unwrap_or(500))
+    *R.get_or_init(|| crate::env::or("PONDRA_HISTORY_RATE", 500))
 }
 
 /// `text` at most `max` bytes, cut at a character's end.
@@ -343,7 +343,7 @@ fn columns() -> Vec<(String, String)> {
 pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
     match lake.cat.get::<TableMeta>(&table_key(TABLE)).await? {
         None => {
-            let days: u64 = std::env::var("PONDRA_HISTORY_DAYS").ok().and_then(|d| d.parse().ok()).unwrap_or(7);
+            let days: u64 = crate::env::or("PONDRA_HISTORY_DAYS", 7);
             let meta = TableMeta { columns: columns(), ttl: Some(("at".into(), days * 86400)), tiered: lake.visible(), ..Default::default() };
             lake.cat.commit(vec![(table_key(TABLE), json(&meta))], &[]).await?;
         }

@@ -48,7 +48,7 @@ fn columns() -> Vec<(String, String)> {
 /// Leader: the run log's table, made the first time a node has a line for it (`Ddl::RunLog`).
 pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
     if lake.cat.get::<TableMeta>(&table_key(TABLE)).await?.is_none() {
-        let days: u64 = std::env::var("PONDRA_RUNS_DAYS").ok().and_then(|d| d.parse().ok()).unwrap_or(30);
+        let days: u64 = crate::env::or("PONDRA_RUNS_DAYS", 30);
         let meta = TableMeta { columns: columns(), key: vec!["id".into()], ttl: Some(("started".into(), days * 86400)), tiered: lake.visible(), ids: true, ..Default::default() };
         lake.cat.commit(vec![(table_key(TABLE), json(&meta))], &[]).await?;
     }

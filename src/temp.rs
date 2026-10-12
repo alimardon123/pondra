@@ -111,7 +111,7 @@ pub fn with<T>(session: &str, change: bool, f: impl FnOnce(&mut Session) -> Resu
 
 /// Sessions idle for `PONDRA_SESSION_IDLE_SECS` end; once there are none, this stops.
 async fn reap() {
-    let idle = Duration::from_secs(std::env::var("PONDRA_SESSION_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3600));
+    let idle = Duration::from_secs(crate::env::or("PONDRA_SESSION_IDLE_SECS", 3600));
     loop {
         tokio::time::sleep(idle.min(Duration::from_secs(60))).await;
         let mut all = SESSIONS.lock().unwrap();
@@ -329,7 +329,7 @@ async fn change(app: &App, s: &str, name: &str, stmt: &Stmt) -> Result<Value> {
 /// The table without the rows `gone` names, and with `new` (the table's columns, and the ids a
 /// changed row keeps): one change, within the memory temporary tables may take.
 fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<RecordBatch>) -> Result<()> {
-    static BUDGET: LazyLock<usize> = LazyLock::new(|| std::env::var("PONDRA_TEMP_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1024usize) << 20);
+    static BUDGET: LazyLock<usize> = LazyLock::new(|| crate::env::or("PONDRA_TEMP_MB", 1024usize) << 20);
     let others: usize = SESSIONS.lock().unwrap().iter().flat_map(|(k, x)| x.tables.iter().filter(move |(n, _)| k != s || *n != name)).map(|(_, t)| t.bytes()).sum();
     with(s, true, |x| {
         let t = x.tables.get_mut(name).with_context(|| format!("no temporary table {name}"))?;

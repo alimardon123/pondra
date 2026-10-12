@@ -99,7 +99,7 @@ crate::per_node!(static GATES: Mutex<HashMap<String, Arc<Gate>>> = Default::defa
 crate::per_node!(static SHARES: Mutex<HashMap<String, Vec<(String, Arc<Gate>)>>> = Default::default());
 
 /// Where a node's turns of a bucket start (`PONDRA_BUCKET_REQUESTS`).
-fn start() -> usize { std::env::var("PONDRA_BUCKET_REQUESTS").ok().and_then(|n| n.parse().ok()).unwrap_or(256usize).max(4) }
+fn start() -> usize { crate::env::or("PONDRA_BUCKET_REQUESTS", 256usize).max(4) }
 
 /// The bucket and the path of a lake on object storage (`s3://b/a/b` → `s3://b`, `a/b`).
 fn split(url: &str) -> Option<(String, String)> {

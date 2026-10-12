@@ -828,7 +828,7 @@ pub async fn node_key_made(lake: &Lake) -> Option<String> {
 }
 
 /// How long a signed-in session lasts: `PONDRA_SESSION_HOURS` (12).
-fn session_ms() -> u64 { std::env::var("PONDRA_SESSION_HOURS").ok().and_then(|h| h.parse::<f64>().ok()).map_or(12 * 3_600_000, |h| (h * 3_600_000.0) as u64) }
+fn session_ms() -> u64 { crate::env::parse::<f64>("PONDRA_SESSION_HOURS").map_or(12 * 3_600_000, |h| (h * 3_600_000.0) as u64) }
 
 /// `data` signed with the lake's key (base64url): what `vend.rs` puts in a file's link.
 pub async fn sign(lake: &Lake, data: &[u8]) -> Result<String> { Ok(B64U.encode(hmac256(&B64.decode(keys(lake).await?.session)?, data))) }
@@ -1034,12 +1034,11 @@ pub fn quota() -> Quota {
     // (a session that set `statement_timeout` keeps its own, 0 included; one that set none gets the node's default)
     let session = match crate::settings::shown("statement_timeout") {
         Some(v) => pg_duration(&v),
-        None => std::env::var("PONDRA_STATEMENT_TIMEOUT").ok().and_then(|v| pg_duration(&v)),
+        None => crate::env::get("PONDRA_STATEMENT_TIMEOUT").and_then(|v| pg_duration(&v)),
     };
     let Some((user, a)) = p.and_then(|p| Some((p.name, p.access?))) else { return Quota { turns: None, timeout: session, user: String::new(), by_session: session.is_some() } };
-    let env = |v: &str| std::env::var(v).ok().and_then(|n| n.parse::<u64>().ok());
-    let most = a.limits.max_queries.map(u64::from).or_else(|| env("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
-    let timeout = a.limits.timeout_secs.or_else(|| env("PONDRA_USER_TIMEOUT")).filter(|s| *s > 0).map(std::time::Duration::from_secs);
+    let most = a.limits.max_queries.map(u64::from).or_else(|| crate::env::parse::<u64>("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
+    let timeout = a.limits.timeout_secs.or_else(|| crate::env::parse::<u64>("PONDRA_USER_TIMEOUT")).filter(|s| *s > 0).map(std::time::Duration::from_secs);
     // (the shorter of the session's and the user's is in force)
     let (timeout, by_session) = match (session, timeout) {
         (Some(s), Some(t)) if s >= t => (Some(t), false),

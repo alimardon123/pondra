@@ -59,13 +59,11 @@ impl Drop for Busy {
 /// nodes) and the health checks.
 pub fn still_taken(path: &str) -> bool { path.starts_with("/cluster/") || matches!(path, "/healthz" | "/ready" | "/stats" | "/metrics") }
 
-fn secs(var: &str, default: f64) -> Duration { Duration::from_secs_f64(std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default)) }
-
 /// Drain: stop being ready, wait out the grace, then for the requests in flight (bounded).
 pub async fn drain() {
     DRAINING.store(true, SeqCst);
-    tokio::time::sleep(secs("PONDRA_DRAIN_GRACE_SECS", 0.0)).await;
-    let (start, most, count) = (tokio::time::Instant::now(), secs("PONDRA_DRAIN_SECS", 30.0), in_flight());
+    tokio::time::sleep(crate::env::secs("PONDRA_DRAIN_GRACE_SECS", 0.0)).await;
+    let (start, most, count) = (tokio::time::Instant::now(), crate::env::secs("PONDRA_DRAIN_SECS", 30.0), in_flight());
     while count.load(SeqCst) > 0 && start.elapsed() < most {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

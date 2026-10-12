@@ -405,7 +405,7 @@ crate::per_node!(static NODE_KEY: std::sync::RwLock<Option<String>> = std::sync:
 
 /// The key this node calls the others with: `PONDRA_NODE_KEY` as set, else the lake's own, once known.
 pub fn node_key() -> Option<String> {
-    std::env::var("PONDRA_NODE_KEY").ok().or_else(|| NODE_KEY.read().unwrap_or_else(|e| e.into_inner()).clone())
+    crate::env::get("PONDRA_NODE_KEY").or_else(|| NODE_KEY.read().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 /// This node learned the lake's key for its nodes (`node.rs`).
@@ -417,7 +417,7 @@ pub fn set_node_key(k: String) { *NODE_KEY.write().unwrap_or_else(|e| e.into_inn
 /// `PONDRA_TOKEN`.
 pub fn http() -> reqwest::Client {
     crate::per_node!(static MINE: std::sync::Mutex<Option<(Option<String>, reqwest::Client)>> = std::sync::Mutex::new(None));
-    let token = std::env::var("PONDRA_TOKEN").or_else(|_| std::env::var("PONDRA_ADMIN_TOKEN")).ok().or_else(node_key);
+    let token = crate::env::get("PONDRA_TOKEN").or_else(|| crate::env::get("PONDRA_ADMIN_TOKEN")).or_else(node_key);
     let mut client = MINE.lock().unwrap();
     if let Some((t, c)) = client.as_ref().filter(|(t, _)| *t == token) {
         let _ = t;
@@ -639,6 +639,12 @@ async fn stepped_down(store: &Store, n: u64) -> bool { store.head(&Path::from(fo
 /// Re-run this same binary with the same arguments: the new process re-reads its role.
 /// (By the path it was started with: if the binary was upgraded in place, the new one starts.)
 pub fn restart(why: &str) -> ! {
+    restart_with(why, &[])
+}
+
+/// `restart`, with settings of the command line's own for the next run (`pondra sql`'s job and its
+/// tries: `env.rs`), on top of what this process was given.
+pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
     eprintln!("restarting to rejoin the cluster: {why}");
     // (our claims' lock files say we're coming back: an exec, or a new process on Windows, lets go of
     // them for a moment, and nobody here may take that for our end: `gone_here`)
@@ -647,14 +653,14 @@ pub fn restart(why: &str) -> ! {
     }
     let mut args = std::env::args_os();
     let mut cmd = std::process::Command::new(args.next().expect("argv[0]"));
-    cmd.args(args);
+    cmd.args(args).envs(crate::env::given()).envs(carried.iter().map(|(k, v)| (k, v)));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         panic!("restart failed: {}", cmd.exec()); // replaces this process; only returns on failure
     }
     #[cfg(not(unix))]
-    if std::env::var_os("PONDRA_SUPERVISED").is_some() {
+    if crate::env::is_set("PONDRA_SUPERVISED") {
         std::process::exit(75); // (`pondra service`'s supervisor starts it again: one node, as exec keeps it elsewhere)
     }
     #[cfg(not(unix))]

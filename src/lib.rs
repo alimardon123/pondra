@@ -5,6 +5,7 @@
 // The parts every build has, a browser's too (feature `server` off): SQL's functions and
 // rewrites that need no lake.
 pub mod finish;
+pub mod env;
 pub mod reset;
 pub mod fsum;
 pub mod intervals;

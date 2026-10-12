@@ -141,7 +141,7 @@ pub fn refuse() -> Result<()> {
 
 /// Transactions idle for `PONDRA_TXN_IDLE_SECS` end, rolled back; once there are none, this stops.
 async fn reap() {
-    let idle = Duration::from_secs(std::env::var("PONDRA_TXN_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(600));
+    let idle = Duration::from_secs(crate::env::or("PONDRA_TXN_IDLE_SECS", 600));
     loop {
         tokio::time::sleep(idle.min(Duration::from_secs(30))).await;
         let mut all = TXNS.lock().unwrap();

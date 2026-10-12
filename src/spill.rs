@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 /// Rows held in memory before they go to disk (`PONDRA_SPILL_MB`, 64 by default).
 fn piece() -> usize {
-    std::env::var("PONDRA_SPILL_MB").ok().and_then(|m| m.parse::<usize>().ok()).unwrap_or(64) << 20
+    crate::env::or::<usize>("PONDRA_SPILL_MB", 64) << 20
 }
 
 /// Where a node keeps what it spills (`--cache-dir`, else the temp dir): one folder per job and
@@ -29,7 +29,7 @@ fn piece() -> usize {
 pub fn dir(job: &str) -> PathBuf {
     crate::per_node!(static ME: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
     let me = ME.get_or(|| uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string());
-    let base = std::env::var("PONDRA_CACHE_DIR").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("pondra-cache"));
+    let base = crate::env::get("PONDRA_CACHE_DIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("pondra-cache"));
     base.join("shuffle").join(match job.is_empty() {
         true => String::new(), // (the folder itself: sweeping and measuring)
         false => format!("{job}-{me}"),

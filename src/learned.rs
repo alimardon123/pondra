@@ -254,7 +254,7 @@ fn known_mut() -> std::sync::RwLockWriteGuard<'static, Known> { KNOWN.write().un
 /// Whether the planner uses this node's facts (`PONDRA_LEARN=on`; by default they are learned and
 /// kept, not used).
 fn on() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| matches!(std::env::var("PONDRA_LEARN").as_deref(), Ok("on" | "1" | "true")));
+    static ON: LazyLock<bool> = LazyLock::new(|| crate::env::flag("PONDRA_LEARN"));
     *ON
 }
 

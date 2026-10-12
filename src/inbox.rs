@@ -65,7 +65,7 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>) -> Result<Opti
 /// lake's catalog writer would outlive the moment in the node, and a later leader of it would
 /// fence it out.
 pub async fn lead_once(dir: &str) -> Result<()> {
-    let out = tokio::process::Command::new(std::env::current_exe()?).args(["lead", "--dir", dir])
+    let out = tokio::process::Command::new(std::env::current_exe()?).args(["lead", "--dir", dir]).envs(crate::env::given())
         .env_remove("PONDRA_JOB").env_remove("PONDRA_TRIES").stdin(std::process::Stdio::null()).output().await?;
     anyhow::ensure!(out.status.success(), "couldn't lead the lake at {dir}: {}", String::from_utf8_lossy(&out.stderr).trim());
     Ok(())
