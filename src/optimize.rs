@@ -1017,7 +1017,8 @@ fn bounds_whole(a: &AggregateExec) -> bool {
 /// - a join whose rows are then grouped by its keys and nothing else is hashed by them when its side to
 ///   build has a sixteenth of its other side's rows or more: the grouping then needs no shuffle of its
 ///   own, and each thread groups its own keys (TPC-H q13 counts 150,000 customers' orders). With fewer
-///   keys, grouping first leaves little to move.
+///   keys, grouping first leaves little to move;
+/// - a semi or anti join that only looks its keys up in a big table, many times over (`probed`).
 /// Never a HAVING's few groups (`HavingBuilds`: their estimate is the whole table's), a NOT IN
 /// (null-aware: one table sees every NULL), or a spread query's slices, whose exchanges are the spread
 /// analysis's (a broadcast side hashed would cross the network).
@@ -1045,7 +1046,7 @@ impl PhysicalOptimizerRule for SharedBuilds {
                 };
             }
             match p.downcast_ref::<HashJoinExec>() {
-                Some(j) if hashable(j) && rows(j.left()).is_some_and(|n| n >= most) => Ok(Transformed::yes(partitioned(j)?)),
+                Some(j) if hashable(j) && (rows(j.left()).is_some_and(|n| n >= most) || probed(j)) => Ok(Transformed::yes(partitioned(j)?)),
                 _ => Ok(Transformed::no(p)),
             }
         })
@@ -1104,6 +1105,17 @@ fn keyed(j: &HashJoinExec, columns: &[usize]) -> bool {
         })
         .collect();
     columns.len() == keys.len() && keys.iter().all(|k| k.iter().any(|c| columns.contains(c))) && columns.iter().all(|c| keys.iter().any(|k| k.contains(c)))
+}
+
+/// Does a semi or anti join probe a table of 50,000 rows or more with a million rows or more, and
+/// check nothing of a match but its keys? Each row of its other side then looks the table up and
+/// keeps nothing of it, and a table a thread is faster than one every thread probes: TPC-H q4's
+/// 58,000 orders, probed by 3.8 million lineitems, a tenth faster. A join that checks a filter for
+/// each match keeps DataFusion's choice: hashed, q21's two were 12% slower.
+fn probed(j: &HashJoinExec) -> bool {
+    matches!(j.join_type(), JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti)
+        && j.filter().is_none()
+        && matches!((rows(j.left()), rows(j.right())), (Some(build), Some(probe)) if build >= 50_000 && probe >= 1_000_000)
 }
 
 /// Does a join build one shared table that it may build a table a thread instead (`SharedBuilds`)?

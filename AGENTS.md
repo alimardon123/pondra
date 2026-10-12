@@ -2118,12 +2118,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    retention goes with its catalog (`_backups/{ms}-{commit}.json.zst`). A restore copies one run into
    an empty place, suspends its tasks and takes away what it made if it fails. `tools/backup_check.py`.
 292. **A join builds a table a thread only where that gives the same rows** (`optimize::SharedBuilds`): a
-   join whose side to build has a million rows or more, or whose rows are then grouped by its keys
-   alone, hashes both sides by the keys instead of building one table every thread probes; never a
-   NOT IN's (null-aware: its one table must see every NULL of the subquery, as DataFusion keeps it),
-   a HAVING's few groups (`HavingBuilds`) or a spread query's joins (its exchanges are the spread
-   analysis's). `harness.py hot`: "NOT IN a subquery with a NULL keeps no row…" fails with a NOT IN
-   hashed (the threads that never met the NULL keep their rows).
+   join whose side to build has a million rows or more, whose rows are then grouped by its keys
+   alone, or a semi or anti join checking only its keys of a table of 50,000 rows or more for a
+   million rows or more (TPC-H q4), hashes both sides by the keys instead of building one table
+   every thread probes; never a NOT IN's (null-aware: its one table must see every NULL of the
+   subquery, as DataFusion keeps it), a HAVING's few groups (`HavingBuilds`) or a spread query's
+   joins (its exchanges are the spread analysis's). `harness.py hot`: "NOT IN a subquery with a
+   NULL keeps no row…" fails with a NOT IN hashed (the threads that never met the NULL keep their
+   rows).
 300. **A node is started and stopped as an object, and a stop at any point gives back what it took**
    (`node.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
    serves, it drains, makes what it committed durable, checkpoints, ends what it started
