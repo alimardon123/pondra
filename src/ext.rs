@@ -1428,6 +1428,13 @@ fn copy_into_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Op
         }
     } else {
         match p.parse_literal_string() {
+            Ok(path) if path.starts_with('@') => {
+                // (Snowflake's stage: Pondra has none, it reads the files where they are)
+                let stage = path.split('/').next().unwrap_or(&path);
+                return Some(crate::write::Stmt::Invalid(format!(
+                    "COPY INTO {table} FROM {stage}: a stage isn't supported; name the files where they are: COPY INTO {table} FROM 's3://bucket/folder/*.csv' (FORMAT csv, HEADER true)"
+                )));
+            }
             Ok(path) => Source::Path(path),
             Err(_) => return invalid("the path is a string".into()),
         }

@@ -10622,6 +10622,80 @@ def attached():
     return "an attached lake read while its leader changes, tiers and purges rows: every read as of one commit"
 
 
+def dialects():
+    """What people from other databases type on their first days (round 34, L6): the statements of
+    `tools/dialects_check.py`, spelled as Postgres, DuckDB, Snowflake, Spark, MySQL, BigQuery and SQL
+    Server users spell them, each dialect's in a session of its own. Each runs or is refused with a
+    SQLSTATE, none takes the node down, and each dialect runs at least as many as it did when its
+    floor was set (FLOOR: raise it as spellings are added, never lower it). And what they found: a
+    table with columns named created_at, version and row_id, keyed or not, takes UPDATE, UPDATE …
+    FROM, DELETE, INSERT … ON CONFLICT and MERGE, its own columns kept apart from the system ones
+    (`change::select_as` named both `__o_created_at`, and every change of such a table failed)."""
+    import dialects_check
+    FLOOR = {"postgres": 41, "duckdb": 31, "snowflake": 13, "spark": 10, "mysql": 19, "bigquery": 12, "sqlserver": 6}
+    XX000 = 26  # (refusals that are internal errors: lower it as they get codes, never raise it)
+    lake = new_lake()
+    node = Node(lake, A.port).start()
+    q = lambda s: sql(A.port, s)
+    checks, info = {}, {}
+    # Columns named as the system's are: an append table and a keyed one, three rows each, then every kind of change.
+    cols = "created_at TIMESTAMP, version INT, row_id INT, v INT"
+    q(f"CREATE TABLE ap (id INT, {cols})")
+    q(f"CREATE TABLE kv (id INT PRIMARY KEY, {cols})")
+    for t in ("ap", "kv"):
+        q(f"INSERT INTO {t} VALUES (1, TIMESTAMP '2026-01-01 00:00:00', 10, 100, 1), (2, TIMESTAMP '2026-01-02 00:00:00', 20, 200, 2), (3, TIMESTAMP '2026-01-03 00:00:00', 30, 300, 3)")
+    ids = {t: q(f"SELECT id, _row_id FROM {t} ORDER BY id") for t in ("ap", "kv")}
+    errors = {}
+    for t in ("ap", "kv"):
+        for s_ in (f"UPDATE {t} SET v = v + 10 WHERE id = 1",
+                   f"UPDATE {t} SET v = s.v FROM (VALUES (2, 22)) AS s(id, v) WHERE {t}.id = s.id",
+                   f"DELETE FROM {t} WHERE id = 3",
+                   f"INSERT INTO {t} VALUES (4, TIMESTAMP '2026-01-04 00:00:00', 40, 400, 4)" + (" ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v" if t == "kv" else ""),
+                   f"MERGE INTO {t} USING (VALUES (4, 44), (5, 5)) AS s(id, v) ON {t}.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v "
+                   f"WHEN NOT MATCHED THEN INSERT VALUES (s.id, TIMESTAMP '2026-01-05 00:00:00', 50, 500, s.v)"):
+            try:
+                q(s_)
+            except Exception as e:
+                errors.setdefault(t, []).append(f"{s_[:40]}: {str(e)[:160]}")
+    if "kv" not in errors:
+        try:
+            q("INSERT INTO kv VALUES (5, TIMESTAMP '2026-01-05 00:00:00', 50, 500, 55) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v")
+        except Exception as e:
+            errors.setdefault("kv", []).append(str(e)[:160])
+    info["errors"] = errors
+    want = lambda last: [{"id": 1, "created_at": "2026-01-01T00:00:00", "version": 10, "row_id": 100, "v": 11},
+                         {"id": 2, "created_at": "2026-01-02T00:00:00", "version": 20, "row_id": 200, "v": 22},
+                         {"id": 4, "created_at": "2026-01-04T00:00:00", "version": 40, "row_id": 400, "v": 44},
+                         {"id": 5, "created_at": "2026-01-05T00:00:00", "version": 50, "row_id": 500, "v": last}]
+    got = {t: q(f"SELECT id, created_at, version, row_id, v FROM {t} ORDER BY id") for t in ("ap", "kv")}
+    info["rows"] = got
+    kept = {t: q(f"SELECT id, _row_id FROM {t} WHERE id IN (1, 2) ORDER BY id") == ids[t][:2] for t in ("ap", "kv")}
+    info["row ids kept"] = kept
+    checks["a table with columns named created_at, version and row_id takes UPDATE, UPDATE … FROM, DELETE, INSERT, MERGE (and ON CONFLICT, keyed): its own columns as written, changed rows keeping their _row_id"] = \
+        not errors and got["ap"] == want(5) and got["kv"] == want(55) and all(kept.values())
+    # The newcomers' statements, each dialect in its own session.
+    rows, downs = dialects_check.answer(node, A.port)
+    ran = {d: sum(r["ok"] for r in rows if r["dialect"] == d) for d in FLOOR}
+    info["ran"], info["downs"] = ran, downs
+    uncoded = [r["sql"][:80] for r in rows if not r["ok"] and not r["sqlstate"]]
+    info["refused without a SQLSTATE"] = uncoded
+    checks["no newcomer's statement takes the node down"] = downs == 0
+    checks["each refusal carries a SQLSTATE"] = not uncoded
+    checks["each dialect runs at least its floor of the newcomers' statements"] = all(ran[d] >= FLOOR[d] for d in FLOOR)
+    missed = [f"{r['sql'][:70]}: {r['sqlstate']} {r['message'][:120]}" for r in rows if r["expect"] and not dialects_check.met(r)]
+    info["missed their refusal"] = missed
+    checks["what a SET asks for is done, or refused by name with its SQLSTATE and the way out (SET ROLE, TRANSACTION, NAMES, DateStyle, @x, …)"] = not missed
+    internal = [r["sql"][:80] for r in rows if not r["ok"] and r["sqlstate"] == "XX000"]
+    info["refused as XX000 (internal)"] = internal
+    checks[f"at most {XX000} refusals are XX000 (an internal error) rather than a code that names what went wrong"] = len(internal) <= XX000
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"dialects": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"dialects: {sum(ran.values())} of {len(rows)} newcomers' statements run, the rest refused with a SQLSTATE; columns named as system ones change: all {len(checks)} checks pass"
+
+
 def publishing():
     """What can't be published as Delta or Iceberg is refused by name, never written wrong or
     skipped quietly: asked for, a column the format has no type for, a materialized view finished
@@ -10869,12 +10943,12 @@ def answers_big():
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
-        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "answers_big": 15}
+        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "answers_big": 15, "dialects": 20}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, loads, reader, crash, load)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -10902,7 +10976,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "answers_big", "load", "loads", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -10915,7 +10989,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):
