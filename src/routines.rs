@@ -808,6 +808,10 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
 /// `information_schema.schemata`, `secrets()`, `pondra.users` and `pondra.grants`, as Snowflake has them. (`SHOW FUNCTIONS` is every function a query may call,
 /// as DataFusion lists them: its own, and the Python ones; `SHOW TABLES` is DataFusion's.)
 fn show(sql: &str) -> Option<String> {
+    // (SHOW, and DESCRIBE / DESC SHARE: the only words the regexes below can start with; any other statement skips them.)
+    if !matches!(crate::write::head(sql).as_str(), "show" | "describe" | "desc") {
+        return None;
+    }
     if let Some(q) = crate::settings::show(sql) {
         return Some(q); // (`SHOW search_path`, `SHOW application_name`: the session's)
     }

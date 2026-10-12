@@ -313,6 +313,9 @@ pub fn dialect() -> Option<Box<dyn datafusion::sql::sqlparser::dialect::Dialect>
 /// as Postgres answers it (`search_path` is `public` until set). DataFusion's own (`datafusion.*`,
 /// `TIME ZONE`) and a name never set are left to DataFusion's `SHOW`.
 pub fn show(sql: &str) -> Option<String> {
+    if crate::write::head(sql) != "show" {
+        return None;
+    }
     static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^\s*show\s+([a-z_][a-z0-9_]*)\s*;?\s*$").expect("a regex"));
     let n = SHOW.captures(sql)?[1].to_lowercase();
     if name(&n).contains('.') {

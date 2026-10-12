@@ -398,9 +398,10 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         ast::TableFactor::Table { name, .. } => Some(object(name)),
         _ => None,
     };
+    let head = head(sql);
     // OR REPLACE where replacing one would lose what it holds: refused, saying why.
     static NO_REPLACE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*CREATE\s+OR\s+REPLACE\s+(SCHEMA|DATABASE|USER|ROLE|SHARE|RECIPIENT)\b").expect("a regex"));
-    if let Some(c) = NO_REPLACE.captures(first_word(sql)) {
+    if let Some(c) = (head == "create").then(|| NO_REPLACE.captures(first_word(sql))).flatten() {
         let kind = c[1].to_uppercase();
         let lost = match kind.as_str() {
             "USER" | "ROLE" => "the rights given to it",
@@ -412,7 +413,6 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     }
     // The kinds below each begin with one of these words, so a query or a row's change goes past
     // them without being read again by each (every statement is read here more than once).
-    let head = first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_ascii_lowercase();
     let kinds = matches!(head.as_str(), "create" | "alter" | "drop" | "grant" | "revoke" | "comment" | "copy" | "attach");
     if let Some(s) = kinds.then(|| crate::shares::statement(sql)).flatten() {
         return Some(s); // (CREATE SHARE and RECIPIENT, GRANT SELECT ON SHARE: `shares.rs`, before users' GRANT)
@@ -449,7 +449,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     static EXTERNAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?is)^\s*CREATE\s+(\w+\s+){0,3}EXTERNAL\s+TABLE\b").expect("a regex")
     });
-    if let Some(m) = EXTERNAL.find(first_word(sql)) {
+    if let Some(m) = (head == "create").then(|| EXTERNAL.find(first_word(sql))).flatten() {
         use datafusion::sql::parser::{DFParserBuilder, Statement as DF};
         if m.as_str().split_whitespace().any(|w| w.eq_ignore_ascii_case("temp") || w.eq_ignore_ascii_case("temporary")) {
             return Some(Stmt::Invalid("CREATE TEMPORARY EXTERNAL TABLE: make a temporary view of the files instead (CREATE TEMP VIEW t AS SELECT * FROM read_parquet('…'))".into()));
@@ -493,24 +493,24 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
     }
     let name = |s: &str| s.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
-    if let Some(c) = VIEW_RENAME.captures(first_word(sql)) {
+    if let Some(c) = (head == "alter").then(|| VIEW_RENAME.captures(first_word(sql))).flatten() {
         return Some(Stmt::Ddl(vec![Ddl::RenameTable { name: name(&c[3]), to: name(&c[4]) }]));
     }
     // `ALTER MATERIALIZED VIEW v DETACH`: its rows stop following, and stay as a table of that name.
     static DETACH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+MATERIALIZED\s+VIEW\s+([\w."-]+)\s+DETACH\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = DETACH.captures(first_word(sql)) {
+    if let Some(c) = (head == "alter").then(|| DETACH.captures(first_word(sql))).flatten() {
         return Some(Stmt::Ddl(vec![Ddl::DetachView { name: name(&c[1]) }]));
     }
     // `CREATE TABLE c [SHALLOW] CLONE t` (Snowflake's, Databricks'): a table of t's files as they are now, copying none (ADR-043).
     static CLONE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?([\w."-]+)\s+(SHALLOW\s+)?CLONE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = CLONE.captures(first_word(sql)) {
+    if let Some(c) = (head == "create").then(|| CLONE.captures(first_word(sql))).flatten() {
         let d = Ddl::Clone { name: name(&c[2]), from: name(&c[4]) };
         return Some(Stmt::Ddl(vec![if c.get(1).is_some() { unless(true, &name(&c[2]), "relation", d) } else { d }]));
     }
     // `CREATE DATABASE b CLONE a [WITH (schemas = (x, y))] [WITH NO DATA]`: a branch of a, copying none
     // of its files (ADR-047). (The parser takes `CLONE a` alone.)
     static DB_CLONE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*CREATE\s+DATABASE\s+(IF\s+NOT\s+EXISTS\s+)?([\w"-]+)\s+(?:LOCATION\s+'((?:[^']|'')*)'\s+)?CLONE\s+([\w"-]+)((?:\s+WITH\s*\(\s*schemas\s*=\s*\([^)]*\)\s*\)|\s+WITH\s+NO\s+DATA)*)\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = DB_CLONE.captures(first_word(sql)) {
+    if let Some(c) = (head == "create").then(|| DB_CLONE.captures(first_word(sql))).flatten() {
         static SCHEMAS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)schemas\s*=\s*\(([^)]*)\)").expect("a regex"));
         let tail = c.get(5).map_or("", |m| m.as_str());
         let schemas = SCHEMAS.captures(tail).map(|s| s[1].split(',').map(|n| name(n.trim())).filter(|n| !n.is_empty()).collect()).unwrap_or_default();
@@ -520,23 +520,23 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     // `ALTER DATABASE b REFRESH [t, …]`: a branch's tables (all it took from its base, or those
     // named: a view stands for the tables it reads), and what follows them, as its base has them now (ADR-047).
     static DB_REFRESH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+REFRESH((?:\s+[\w".$-]+(?:\s*,\s*[\w".$-]+)*)?)\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = DB_REFRESH.captures(first_word(sql)) {
+    if let Some(c) = (head == "alter").then(|| DB_REFRESH.captures(first_word(sql))).flatten() {
         let tables = c[2].split(',').map(|t| name(t.trim())).filter(|t| !t.is_empty()).collect();
         return Some(Stmt::Ddl(vec![Ddl::Refresh { database: Some(name(&c[1])), tables }]));
     }
     // `ALTER DATABASE b SET (protected = true | false)`: a database's protection (ADR-058: `protect.rs`).
     static DB_PROTECT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+SET\s*\(\s*protected\s*=\s*(true|false)\s*\)\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = DB_PROTECT.captures(first_word(sql)) {
+    if let Some(c) = (head == "alter").then(|| DB_PROTECT.captures(first_word(sql))).flatten() {
         return Some(Stmt::Ddl(vec![Ddl::Protect { database: name(&c[1]), on: c[2].eq_ignore_ascii_case("true"), by: String::new() }]));
     }
     // `UNDROP TABLE t` (Snowflake's, Databricks'): the table dropped last under that name, back (ADR-043).
     static UNDROP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*UNDROP\s+TABLE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
-    if let Some(c) = UNDROP.captures(first_word(sql)) {
+    if let Some(c) = (head == "undrop").then(|| UNDROP.captures(first_word(sql))).flatten() {
         return Some(Stmt::Ddl(vec![Ddl::Undrop { name: name(&c[1]) }]));
     }
     // DuckDB's CREATE MACRO … IF NOT EXISTS (the parser takes only OR REPLACE): read without it, kept unless one is there.
     static MACRO_QUIET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+(OR\s+REPLACE\s+)?(TEMP\s+|TEMPORARY\s+)?MACRO\s+)IF\s+NOT\s+EXISTS\s+").expect("a regex"));
-    if let Some(c) = MACRO_QUIET.captures(first_word(sql)) {
+    if let Some(c) = (head == "create").then(|| MACRO_QUIET.captures(first_word(sql))).flatten() {
         if c.get(2).is_some() {
             return Some(Stmt::Invalid("CREATE OR REPLACE MACRO … IF NOT EXISTS: one or the other".into()));
         }
@@ -552,7 +552,8 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         });
     }
     // A table's layout as clauses (`PARTITION BY day(ts)`, `TTL ts + INTERVAL '1 hour'`, …): read as its options.
-    let sql = &match crate::layout::clauses(sql) {
+    let laid = if matches!(head.as_str(), "create" | "alter") { crate::layout::clauses(sql) } else { Ok(std::borrow::Cow::Borrowed(sql)) };
+    let sql = &match laid {
         Ok(sql) => sql,
         Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
     };
@@ -747,6 +748,12 @@ pub fn first_word(sql: &str) -> &str {
             return s;
         }
     }
+}
+
+/// The statement's first word, lowercased (`create` for `CREATE TABLE …`, past comments): what a
+/// statement's own regexes are looked at for, so a query compiles none of them.
+pub fn head(sql: &str) -> String {
+    first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_ascii_lowercase()
 }
 
 /// A column type as DataFusion plans it: bytes by any of their names (`BYTEA`), and JSON kept as
