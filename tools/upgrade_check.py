@@ -242,10 +242,9 @@ def build(n, v, work):
     n.append("ev", "app", 1, [{"id": 1000 + i, "who": f"w{i % 7}", "amount": float(i % 100), "ts": iso(i), "n": i} for i in range(3000)])
     q("INSERT INTO ev SELECT value + 10000 AS id, 'bulk' AS who, CAST(value AS DOUBLE) AS amount, TIMESTAMP '2026-01-02 00:00:00' AS ts, CAST(value AS INT) AS n FROM range(0, 500)")
     q("INSERT INTO kv VALUES (1, 'a', 1), (2, 'b', 2), (3, 'c', 3), (4, 'd', 4)")
-    # (a key written twice: its later version is an UPDATE, which every release takes; a plain INSERT
-    # of a key the table holds is refused, 23505)
-    q("INSERT INTO dd VALUES (1, 'old', 10), (2, 'two', 5)")
-    q("UPDATE dd SET v = 'new', at = 20 WHERE id = 1")
+    # (a key written again goes through /append, which upserts in every release, as SQL's plain INSERT
+    # did before it refused a key the table holds, 23505; dd keeps each key's newest `at`)
+    n.append("dd", "dd", 1, [{"id": 1, "v": "new", "at": 20}, {"id": 1, "v": "old", "at": 10}, {"id": 2, "v": "two", "at": 5}])
     q("INSERT INTO pt VALUES (1, DATE '2026-01-01', 1.0), (2, DATE '2026-01-02', 2.0), (3, DATE '2026-01-03', 3.0), (4, DATE '2026-01-01', 4.0)")
     q("INSERT INTO ct SELECT value % 10 AS a, value % 7 AS b, CAST(value AS DOUBLE) AS v FROM range(0, 200)")
     q("INSERT INTO pub VALUES (1, 'one'), (2, 'two'), (3, 'three')")
@@ -264,8 +263,7 @@ def build(n, v, work):
     q("UPDATE kv SET v = 'B', n = 20 WHERE id = 2")
     q("DELETE FROM kv WHERE id = 3")
     q("UPDATE kv SET n = n + 100 WHERE id = 1")
-    q("UPDATE dd SET v = 'older', at = 5 WHERE id = 1")
-    q("UPDATE dd SET v = 'newer', at = 6 WHERE id = 2")
+    n.append("dd", "dd", 2, [{"id": 1, "v": "older", "at": 5}, {"id": 2, "v": "newer", "at": 6}])
     q("MERGE INTO pub USING (SELECT 2 AS id, 'TWO' AS v UNION ALL SELECT 4 AS id, 'four' AS v) s ON pub.id = s.id "
       "WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
     q("INSERT INTO quotes VALUES ('xyz', 19.0)")
@@ -342,9 +340,9 @@ def carry_on(n, v):
     q("INSERT INTO ev (id, who, amount, ts, n) SELECT value + 20000 AS id, 'bulk2' AS who, CAST(value AS DOUBLE) AS amount, TIMESTAMP '2026-01-03 00:00:00' AS ts, CAST(value AS INT) AS n FROM range(0, 100)")
     q("UPDATE ev SET amount = amount * 2 WHERE id IN (3, 1002, 10002, 30001)")  # a row in the log, in tiered files, in a bulk file, from pondra sql
     q("DELETE FROM ev WHERE id IN (4, 1003, 30002)")
-    q("INSERT INTO kv VALUES (4, 'D', 40), (5, 'e', 5)")
+    q("INSERT OR REPLACE INTO kv VALUES (4, 'D', 40), (5, 'e', 5)")  # (key 4 is there: a plain INSERT is refused, 23505)
     q("DELETE FROM kv WHERE id = 2")
-    q("INSERT INTO dd VALUES (2, 'newest', 7), (1, 'oldest', 1)")
+    n.append("dd", "dd", 3, [{"id": 2, "v": "newest", "at": 7}, {"id": 1, "v": "oldest", "at": 1}])
     q("MERGE INTO pub USING (SELECT 1 AS id, 'ONE' AS v UNION ALL SELECT 5 AS id, 'five' AS v) s ON pub.id = s.id "
       "WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
     n.append("totals", "parts", 3, [{"k": "a", "n": 4, "lo": 1}, {"k": "c", "n": 1, "lo": 9}])

@@ -293,27 +293,64 @@ fn is_point_type(stored: &str) -> bool {
 }
 
 /// A value of `columns` two new rows give (of two keys, in a keyed table: one key's rows are its
-/// versions), as Postgres's DETAIL writes it; None if there's none.
+/// versions), as Postgres's DETAIL writes it; None if there's none. The rows are hashed a column at a
+/// time, as a hash join hashes its keys, and only rows of one hash are compared (`hashed`); a type
+/// that can't be hashed or compared so, or two values sharing a 64-bit hash, goes the exact way.
 fn twice(new: &RecordBatch, columns: &[String], key: &[String]) -> Result<Option<String>> {
-    use datafusion::arrow::row::{RowConverter, SortField};
     let pick = |names: &[String]| names.iter().map(|c| new.column_by_name(c).cloned().ok_or_else(|| anyhow::anyhow!("no column {c}"))).collect::<Result<Vec<_>>>();
     let (values, keys) = (pick(columns)?, pick(key)?);
+    hashed(&values, &keys).or_else(|_| exactly(&values, &keys))
+}
+
+/// `twice` by each row's hash: a million new keys take tens of milliseconds, where hashing each
+/// row's bytes in turn (`exactly`) took a fifth of a second. Errs when it can't decide.
+fn hashed(values: &[datafusion::arrow::array::ArrayRef], keys: &[datafusion::arrow::array::ArrayRef]) -> Result<Option<String>> {
+    use datafusion::arrow::array::{make_comparator, DynComparator};
+    use datafusion::common::hash_utils::{create_hashes, RandomState};
+    let n = values.first().map_or(0, |v| v.len());
+    let mut hashes = vec![0u64; n];
+    create_hashes(values, &RandomState::with_seed(0), &mut hashes)?;
+    let comparators = |columns: &[datafusion::arrow::array::ArrayRef]| {
+        columns.iter().map(|c| make_comparator(c.as_ref(), c.as_ref(), Default::default())).collect::<std::result::Result<Vec<DynComparator>, _>>()
+    };
+    let (value, key) = (comparators(values)?, comparators(keys)?);
+    let equal = |columns: &[DynComparator], i: usize, j: usize| columns.iter().all(|c| c(i, j).is_eq());
+    let mut first = std::collections::HashMap::with_capacity_and_hasher(n, RandomState::with_seed(0)); // (each hash's first row)
+    for i in 0..n {
+        if values.iter().any(|v| v.is_null(i)) {
+            continue;
+        }
+        let j = *first.entry(hashes[i]).or_insert(i);
+        if j == i {
+            continue;
+        }
+        ensure!(equal(&value, i, j), "two values share a hash"); // (rare enough to go over every row again)
+        if keys.is_empty() || !equal(&key, i, j) {
+            return Ok(Some(shown(values, i)));
+        }
+    }
+    Ok(None)
+}
+
+/// `twice` by each row's bytes (`RowConverter`), for what `hashed` can't decide.
+fn exactly(values: &[datafusion::arrow::array::ArrayRef], keys: &[datafusion::arrow::array::ArrayRef]) -> Result<Option<String>> {
+    use datafusion::arrow::row::{RowConverter, SortField};
     let converter = |a: &[datafusion::arrow::array::ArrayRef]| RowConverter::new(a.iter().map(|a| SortField::new(a.data_type().clone())).collect());
-    let rows = converter(&values)?.convert_columns(&values)?;
+    let rows = converter(values)?.convert_columns(values)?;
     let key_rows = match keys.is_empty() {
         true => None,
-        false => Some(converter(&keys)?.convert_columns(&keys)?),
+        false => Some(converter(keys)?.convert_columns(keys)?),
     };
     // (rows held as references into the converted buffers: a Vec made for each row took a million-row INSERT's check 0.5–0.9 s)
-    let mut seen = std::collections::HashMap::with_capacity(new.num_rows());
-    for i in 0..new.num_rows() {
+    let mut seen = std::collections::HashMap::with_capacity(rows.num_rows());
+    for i in 0..rows.num_rows() {
         if values.iter().any(|v| v.is_null(i)) {
             continue;
         }
         let k = key_rows.as_ref().map(|k| k.row(i));
         if let Some(before) = seen.insert(rows.row(i), k) {
             if key_rows.is_none() || before != k {
-                return Ok(Some(shown(&values, i)));
+                return Ok(Some(shown(values, i)));
             }
         }
     }
@@ -613,4 +650,33 @@ pub fn decode(body: bytes::Bytes) -> Result<(String, Src, RecordBatch)> {
     let rows = crate::log::decode(body.get(4 + n..).ok_or_else(|| anyhow::anyhow!("an append cut short"))?)?;
     let batch = rows.into_iter().next().ok_or_else(|| anyhow::anyhow!("an append with no rows"))?;
     Ok((table, src, batch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+
+    fn ints(v: &[Option<i64>]) -> ArrayRef {
+        Arc::new(Int64Array::from(v.to_vec()))
+    }
+
+    #[test]
+    fn two_rows_of_one_value_are_found_by_their_hash_as_by_their_bytes() {
+        let names: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), Some("b"), None, Some("a")]));
+        let cases: Vec<(Vec<ArrayRef>, Vec<ArrayRef>, Option<&str>)> = vec![
+            (vec![ints(&[Some(1), Some(2), Some(3)])], vec![], None),
+            (vec![ints(&[Some(1), Some(2), Some(1)])], vec![], Some("1")),
+            (vec![ints(&[None, Some(2), None])], vec![], None), // (NULLs never meet)
+            (vec![names.clone()], vec![], Some("a")),
+            (vec![ints(&[Some(1), Some(1), Some(2), Some(2)]), names.clone()], vec![], None), // (two columns: each pair differs)
+            (vec![ints(&[Some(7), Some(7)])], vec![ints(&[Some(1), Some(1)])], None), // (UNIQUE: one key's versions)
+            (vec![ints(&[Some(7), Some(7)])], vec![ints(&[Some(1), Some(2)])], Some("7")), // (UNIQUE: two keys)
+        ];
+        for (values, keys, want) in cases {
+            let by_hash = hashed(&values, &keys).expect("decided");
+            assert_eq!(by_hash, exactly(&values, &keys).expect("decided"), "{values:?} {keys:?}");
+            assert_eq!(by_hash.as_deref(), want, "{values:?} {keys:?}");
+        }
+    }
 }

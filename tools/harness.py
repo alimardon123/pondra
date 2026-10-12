@@ -1041,7 +1041,7 @@ def clouds():
         sql(A.port, "CREATE TABLE t (id BIGINT, v VARCHAR)")
         rows = lambda lo, hi: "INSERT INTO t VALUES " + ", ".join(f"({i}, 'v{i % 7}')" for i in range(lo, hi))
         sql(A.port, rows(0, 1000))
-        until(lambda: sql(A.port + 1, "SELECT count(*) AS n FROM t"), [{"n": 1000}], 10)
+        until(lambda: _try(lambda: sql(A.port + 1, "SELECT count(*) AS n FROM t")), [{"n": 1000}], 10)  # (a follower may not hold t yet: 404 until it does)
         sql(A.port + 1, rows(1000, 2000))  # (a follower's write, sequenced by the leader)
         call(A.port, "POST", "/tier", timeout=300, headers={"x-pondra-owner": owner})
         want = lambda n: [{"n": n, "s": n * (n - 1) // 2}]
@@ -10340,6 +10340,10 @@ def waits():
     rrs = pf()
     rrs.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
     pl().execute("UPDATE acct SET balance = balance + 1 WHERE id = 9")
+    # (the follower holds that commit before the snapshot is taken: on a busy runner it may stream in after; within the
+    # 2 s idle end, which would end rrs's transaction)
+    seen = pf()
+    until(lambda: seen.execute("SELECT balance FROM acct WHERE id = 9").fetchone()[0], 1001, 1.5)
     rr_first = rrs.execute("SELECT balance FROM acct WHERE id = 9").fetchone()[0]
     pl().execute("UPDATE acct SET balance = balance + 1 WHERE id = 9")
     rr_second = rrs.execute("SELECT balance FROM acct WHERE id = 9").fetchone()[0]
