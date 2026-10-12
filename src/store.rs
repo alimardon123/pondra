@@ -2119,7 +2119,7 @@ impl Catalog {
             // millisecond for it. On a disk a write is a file whichever way; a bucket keeps the tick,
             // which lets writes made together share one PUT.)
             let db = db.clone();
-            tokio::spawn(async move { let _ = db.flush_with_options(FlushOptions { flush_type: FlushType::Wal }).await; });
+            crate::panics::task(async move { let _ = db.flush_with_options(FlushOptions { flush_type: FlushType::Wal }).await; });
         }
         if let Some((_, v)) = puts.iter().find(|(k, _)| k == "n") {
             self.last_n.store(serde_json::from_slice(v)?, Relaxed);
