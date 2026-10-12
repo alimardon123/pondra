@@ -20,6 +20,7 @@ db = pondra.connect("http://localhost:8080")
 |---|---|
 | `pondra.connect(url="http://127.0.0.1:8080", token=None, **options)` | a connection to a node, or to any of several (a list of URLs): with a token, or as a user (`user=`, `password=`: its password, or one of its tokens); over HTTPS, `ca=` names a PEM file to trust besides the system's (a node's own certificate) |
 | `pondra.local(dir="lake", port=None, token=None, flags=(), timeout=120, python=True)` | start a node on a lake here (a folder or `s3://bucket/prefix`) and connect to it |
+| `pondra.open(path=None, token=None, python=True, **settings)` | a node on a lake inside this Python process, through the library the package ships: no second process to start. With no `path`, a lake in a temporary folder that `close()` removes. `settings` are the node's [settings](/pondra/reference/environment/) by name (`memory_gb=2` is `PONDRA_MEMORY_GB`), fixed by the first open in a process; a misspelt one is refused, naming the nearest. One node at a time in a process: open another lake with `ATTACH`, or close this one first |
 | `pondra.current()` | the connection `pondra.sql` and its kin use |
 | `pondra.binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, the one pip installed, or the one on `PATH` |
 
@@ -77,6 +78,7 @@ local.close()
 | `db.producer`, `db.seq` | the name `append` writes under, and the sequence number of its last append |
 | `db.notices` | what the last statement's procedures printed, as a list of strings |
 | `db.position` | the commit a `watch` or `live` answer is as of: where to resume |
+| `db.console_url` | the console in a browser, as this connection. A node `local()` or `open()` started answers only this program, so the link carries its key (`#key=…`) and works while the node runs: keep it to yourself, as a token |
 
 ```python
 print(db.urls == [db.url], db.producer.startswith("py-"), db.session != "", db.notices)

@@ -173,14 +173,14 @@ impl CachedStore {
     async fn outside_get(&self, location: &Path, mut options: GetOptions) -> Result<GetResult> {
         let bridge = crate::bridge::Bridge(self.inner.clone());
         let at = format!("{}|{location}", self.id);
-        let seen = OUTSIDE.lock().unwrap().seen.get(&at).cloned();
+        let seen = OUTSIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).seen.get(&at).cloned();
         let (Some((listed, e_tag)), Some(range), false) = (seen, options.range.clone(), options.head) else {
             let r = bridge.get_opts(location, options).await?;
             self.saw(&r.meta);
             return Ok(r);
         };
         let key = format!("{at}|{listed}|{range:?}");
-        if let Some(entry) = OUTSIDE.lock().unwrap().ranges.get(&key).cloned() {
+        if let Some(entry) = OUTSIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ranges.get(&key).cloned() {
             return Ok(result(entry));
         }
         options.if_match = e_tag; // (changed since it was listed: an error, not another version's bytes)
@@ -189,7 +189,7 @@ impl CachedStore {
         let entry = (r.bytes().await?, meta, range);
         if version(&entry.1) == listed {
             // (a store without e-tags whose file changed meanwhile: read, not kept)
-            let mut o = OUTSIDE.lock().unwrap();
+            let mut o = OUTSIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             o.bytes += entry.0.len();
             if let Some((old, ..)) = o.ranges.put(key, entry.clone()) {
                 o.bytes -= old.len();
@@ -288,7 +288,7 @@ fn version(m: &ObjectMeta) -> String {
 /// What a listing or HEAD says an object outside the lakes is now (`Outside`).
 fn saw(id: &str, lakes: &[String], m: &ObjectMeta) {
     if !inside(lakes, &m.location, "") {
-        OUTSIDE.lock().unwrap().seen.put(format!("{id}|{}", m.location), (version(m), m.e_tag.clone()));
+        OUTSIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).seen.put(format!("{id}|{}", m.location), (version(m), m.e_tag.clone()));
     }
 }
 

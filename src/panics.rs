@@ -96,6 +96,14 @@ pub fn spawn<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> 
         match AssertUnwindSafe(f).catch_unwind().await {
             Ok(v) => v,
             Err(p) => {
+                if crate::library::on() {
+                    // (in a library the node stops, never the host's process; a restart in place unwinds
+                    // the task that asked for it, and its supervisor has been told already)
+                    if p.downcast_ref::<crate::library::Restarting>().is_none() {
+                        crate::library::failed(format!("a panic in the node's own work: {}", said(&*p)));
+                    }
+                    std::panic::resume_unwind(p)
+                }
                 eprintln!("stopping: a panic in the node's own work: {}", said(&*p));
                 std::process::abort()
             }
@@ -144,6 +152,9 @@ pub fn abort_all() {
 
 /// A panic's message.
 pub fn said(p: &(dyn std::any::Any + Send)) -> String {
+    if let Some(r) = p.downcast_ref::<crate::library::Restarting>() {
+        return r.to_string(); // (57P03: a request that met a node restarting in place asks again)
+    }
     let m = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
     format!("internal error: {}", m.unwrap_or_else(|| "a panic".into()))
 }

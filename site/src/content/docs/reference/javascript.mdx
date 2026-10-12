@@ -29,6 +29,7 @@ console.log(await db.sql("SELECT 1 AS one"));
 |---|---|
 | `connect(url = "http://127.0.0.1:8080", { token, user, password, onNotice, retrySecs, ca, fetch })` | a connection to a node, or to any of several (an array of URLs) |
 | `await local(dir = "lake", { port, token, flags, timeout, python, onNotice })` | start a node on a lake here (a folder or `s3://bucket/prefix`) and connect to it |
+| `await open(dir, { token, python, onNotice, ...settings })` | a node on a lake inside this process (Node, Bun, Deno), through the library the package ships: no second process to start. With no `dir`, a lake in a temporary folder that `close()` removes. `settings` are the node's [settings](/pondra/reference/environment/) by name (`memory_gb: 2` is `PONDRA_MEMORY_GB`), fixed by the first open in a process; a misspelt one is refused, naming the nearest. One node at a time in a process |
 | `await binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, or the one npm installed for this platform |
 
 | Option | Default | Meaning |
@@ -351,6 +352,7 @@ for await (const rows of db.live("SELECT count(*) AS n FROM orders")) {
 | `db.producer`, `db.seq` | the name `append` writes under, and its last sequence number |
 | `db.session` | this connection's session id: its temporary tables and views, and the variables of its `DO LANGUAGE python` blocks, live under it |
 | `db.position` | where the last `live` answer or `watch` batch is as of: a commit, the place to resume from |
+| `db.consoleUrl` | the console in a browser, as this connection. A node `local()` started answers only this program, so the link carries its key (`#key=…`) and works while the node runs: keep it to yourself, as a token |
 | `await db.request(method, path, body, type)` | one HTTP request to the node, as the methods above make them. Answers the `fetch` response, and throws on an error status with the text `status: message`; the error's `sqlstate` is Postgres's code for it (`23514`, `40001`…) |
 
 The members are read from the connection. `request` is for a path the methods don't cover:

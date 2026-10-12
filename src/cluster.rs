@@ -674,6 +674,9 @@ pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
     if let Ok(held) = HELD.lock() {
         held.values().for_each(|(_, f)| say(f, &format!("restarting {}", crate::log::now_ms())));
     }
+    if crate::library::on() {
+        crate::library::restart(why); // (in place: a library's host keeps its process)
+    }
     let mut args = std::env::args_os();
     let mut cmd = std::process::Command::new(args.next().expect("argv[0]"));
     cmd.args(args).envs(crate::env::given()).envs(carried.iter().map(|(k, v)| (k, v)));

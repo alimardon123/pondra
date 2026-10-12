@@ -4,6 +4,7 @@ use crate::*;
 use std::{future::Future, sync::{Arc, OnceLock}, time::Duration};
 
 /// What a node is started with: `pondra serve`'s options for one lake, worked out (cli.rs).
+#[derive(Clone)]
 pub struct Options {
     pub(crate) dir: String,
     /// The address the HTTP door listens on (`--addr`).
@@ -75,6 +76,8 @@ pub struct Node {
     held: Arc<Held>,
     /// The HTTP door, served on a task of its own: `serving` waits on it.
     served: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// What the door serves: a library's host calls it straight (`library::Opened::request`).
+    router: axum::Router,
 }
 
 impl Node {
@@ -377,7 +380,9 @@ impl Node {
             });
         }
         let role = if reader { "reader" } else if leader { "leader" } else { "follower" };
-        eprintln!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n);
+        if !crate::library::on() {
+            eprintln!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n); // (a library's host hears only of trouble)
+        }
         // No Nagle: a small answer goes out at once, not after the client's delayed ACK (the
         // Postgres, Kafka and Flight ports do the same).
         tr("listening");
@@ -389,9 +394,14 @@ impl Node {
             crate::panics::task(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
         }
         // (the HTTP door, a loop the node can't do without: a panic in it aborts, as invariant 178 says; `serving` waits on it)
-        let served = panics::spawn(async move { axum::serve(listener, server::router(app).into_make_service_with_connect_info::<tls::Peer>()).await.map_err(anyhow::Error::from) }); // (who asks: `console::save_settings`)
-        Ok(Node { held, served })
+        let router = server::router(app);
+        let door = router.clone();
+        let served = panics::spawn(async move { axum::serve(listener, door.into_make_service_with_connect_info::<tls::Peer>()).await.map_err(anyhow::Error::from) }); // (who asks: `console::save_settings`)
+        Ok(Node { held, served, router })
     }
+
+    /// What the HTTP door serves, for a request made in this process (`library::Opened::request`).
+    pub(crate) fn router(&self) -> axum::Router { self.router.clone() }
 
     /// Until the HTTP door stops. An error ends the program, as it did when `serve` ran the door inline.
     pub(crate) async fn serving(&mut self) -> anyhow::Result<()> {

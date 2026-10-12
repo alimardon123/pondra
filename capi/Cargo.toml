@@ -1,0 +1,26 @@
+[package]
+name = "pondra-capi"
+version = "0.33.0"
+edition = "2021"
+description = "pondra_lib: a Pondra node in any language's process, through one C ABI (ADR-061 §6)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "pondra_lib" # (libpondra_lib.so, libpondra_lib.dylib, pondra_lib.dll: a name apart from the program's, whose link-time
+# files a Windows build would otherwise write over, the two linking at once into one folder)
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+pondra = { path = ".." }
+anyhow = "1"
+bytes = "1"
+serde_json = "1"
+# local_dynamic_tls: a library's thread-locals are found through the loader (`__tls_get_addr`), never in
+# the static TLS block glibc keeps for the program's own (a kilobyte or two): mimalloc's initial-exec ones
+# marked the whole library STATIC_TLS, and Python refused it ("cannot allocate memory in static TLS block").
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2" # (dlsym: napi.rs finds Node-API's functions in the host process)

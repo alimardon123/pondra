@@ -41,7 +41,7 @@ static CHOSEN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 /// The Python to run workers with, looked for the first time it is needed.
 async fn exe() -> Result<String> {
     let given = EXE.get().and_then(|e| e.as_deref()).context("it was started without --python (start it with --python <python>, or --python auto)")?;
-    if let Some(p) = CHOSEN.read().unwrap().clone() {
+    if let Some(p) = CHOSEN.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
         return Ok(p);
     }
     if given != "auto" {
@@ -49,7 +49,7 @@ async fn exe() -> Result<String> {
     }
     static LOOKING: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
     let _one = LOOKING.lock().await;
-    if let Some(p) = CHOSEN.read().unwrap().clone() {
+    if let Some(p) = CHOSEN.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
         return Ok(p);
     }
     let found = pythons().await;
@@ -58,7 +58,7 @@ async fn exe() -> Result<String> {
         let tried: Vec<String> = found.iter().map(|p| format!("{} ({})", p["path"].as_str().unwrap_or("?"), p["error"].as_str().unwrap_or("no pondra or pyarrow"))).collect();
         bail!("no Python with the pondra package and pyarrow was found (tried: {}). Install them into one: <python> -m pip install pondra pyarrow; or start with --python <python>, or choose one in the console", if tried.is_empty() { "none found".into() } else { tried.join("; ") });
     };
-    *CHOSEN.write().unwrap() = Some(good.clone());
+    *CHOSEN.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(good.clone());
     Ok(good)
 }
 
@@ -75,7 +75,7 @@ async fn candidates() -> Vec<String> {
     out.extend(kept_choice().and_then(|f| std::fs::read_to_string(f).ok()).map(|p| p.trim().into()));
     let names: &[&str] = if cfg!(windows) { &["python.exe", "python3.exe"] } else { &["python3", "python"] };
     let bin = if cfg!(windows) { "" } else { "bin" };
-    if let Some(dir) = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.to_path_buf())) {
+    if let Some(dir) = crate::library::exe().ok().and_then(|e| Some(e.parent()?.to_path_buf())) {
         out.extend(names.iter().map(|n| dir.join(n)));
         out.extend(names.iter().filter_map(|n| Some(dir.parent()?.join(n)))); // (a Windows install's Scripts\ is beside its python.exe)
     }
@@ -126,7 +126,7 @@ async fn probe(paths: Vec<String>) -> Vec<Value> {
 /// The Python in use, and how it came to be: for the console's Python menu.
 pub fn current() -> Value {
     let given = EXE.get().and_then(|e| e.clone());
-    json!({"python": CHOSEN.read().unwrap().clone().or_else(|| given.clone().filter(|g| g != "auto")), "given": given, "worker": PYTHON.get()})
+    json!({"python": CHOSEN.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone().or_else(|| given.clone().filter(|g| g != "auto")), "given": given, "worker": PYTHON.get()})
 }
 
 /// Use `path` from now on (the console's Choose Python): it must work (pondra and pyarrow import);
@@ -137,7 +137,7 @@ pub async fn choose(path: &str) -> Result<Value> {
     ensure!(std::path::Path::new(path).is_file(), "{path}: no such Python");
     let probe = probe(vec![path.to_string()]).await.pop().context("no answer")?;
     ensure!(probe["ok"] == true, "{path} can't run Pondra's Python: {}", probe["error"].as_str().unwrap_or("it lacks the pondra package or pyarrow (<python> -m pip install pondra pyarrow)"));
-    *CHOSEN.write().unwrap() = Some(path.to_string());
+    *CHOSEN.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.to_string());
     if let Some(f) = kept_choice() {
         let _ = f.parent().map(std::fs::create_dir_all);
         let _ = std::fs::write(f, path);
