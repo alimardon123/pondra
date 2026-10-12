@@ -330,7 +330,6 @@ UNLISTED = {
     "PONDRA_CRASH": "injects crashes at named points, for harness.py crash",
     "PONDRA_DROP_BEATS": "drops heartbeats from the nodes a file names, for cluster.py isolate",
     "PONDRA_NO_DIRECT": "acts as if the leader were out of reach, for harness.py serverless",
-    "PONDRA_LOAD_RETENTION_SECS": "shortens how long COPY INTO remembers a file it loaded (64 days), for harness.py's COPY INTO checks",
     "load_ipython_extension": "IPython calls it for `%load_ext pondra`, which the Python reference shows",
     "expr": "frame.py's own helper (an Expr from a value or SQL), not one of Polars' names",
     "sql_type": "frame.py's own helper (a SQL type from a dtype), which client.py uses",
