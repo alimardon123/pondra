@@ -539,9 +539,10 @@ impl Sequencer {
     }
 }
 
-// Producers whose progress left the catalog (a view dropped: `emit:`, `join:`, `fill:`): the
-// sequencer forgets what it remembered of them, so a view made again under the name starts over.
-crate::per_node!(static FORGOTTEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new()));
+crate::per_node!(
+    /// Producers whose progress left the catalog (a view dropped: `emit:`, `join:`, `fill:`): the
+    /// sequencer forgets what it remembered of them, so a view made again under the name starts over.
+    static FORGOTTEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new()));
 
 pub fn forget_producers(names: impl IntoIterator<Item = String>) { FORGOTTEN.lock().unwrap().extend(names); }
 

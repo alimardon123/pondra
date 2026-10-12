@@ -223,8 +223,9 @@ impl PruningStatistics for View<'_> {
 
 // ---------------------------------------------------------------- reading
 
-// Decompressed metadata objects, newest used kept, up to 256 MB (they never change).
-crate::per_node!(static CACHE: Mutex<(lru::LruCache<String, Arc<Vec<u8>>>, usize)> = Mutex::new((lru::LruCache::unbounded(), 0)); clear = |m| { let mut c = m.lock().unwrap_or_else(|e| e.into_inner()); c.0.clear(); c.1 = 0; });
+crate::per_node!(
+    /// Decompressed metadata objects, newest used kept, up to 256 MB (they never change).
+    static CACHE: Mutex<(lru::LruCache<String, Arc<Vec<u8>>>, usize)> = Mutex::new((lru::LruCache::unbounded(), 0)); clear = |m| { let mut c = m.lock().unwrap_or_else(|e| e.into_inner()); c.0.clear(); c.1 = 0; });
 const CACHE_BYTES: usize = 256 << 20;
 
 async fn object(lake: &Lake, path: &str) -> Result<Arc<Vec<u8>>> {

@@ -336,13 +336,14 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
     });
 }
 
-// Follower or read-only node: follow the leader's commit stream (see `store.rs`). If it breaks,
-// reconnect; meanwhile our own catalog view keeps us correct, just a little behind. A follower
-// (`replica`) of a leader that replicates commits also keeps every change on local disk and
-// says so: that is what lets the leader acknowledge a write before the bucket has it.
-// Is the leader's commit stream down (`mirror`)? A read-only node then looks for a new leader.
-crate::per_node!(static STREAM_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
+crate::per_node!(
+    /// Is the leader's commit stream down (`mirror`)? A read-only node then looks for a new leader.
+    static STREAM_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
 
+/// Follower or read-only node: follow the leader's commit stream (see `store.rs`). If it breaks,
+/// reconnect; meanwhile our own catalog view keeps us correct, just a little behind. A follower
+/// (`replica`) of a leader that replicates commits also keeps every change on local disk and
+/// says so: that is what lets the leader acknowledge a write before the bucket has it.
 pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<ReplicaLog>>) {
     // Acks, coalesced: however many changes arrive meanwhile, one request says "up to here".
     let (held, mut to_ack) = tokio::sync::watch::channel((0u64, 0u64, 0u64)); // term, first, last

@@ -503,8 +503,9 @@ impl Drop for Kernel {
     }
 }
 
-// Each session's worker's process id: an interrupt reaches it while a cell holds its slot.
-crate::per_node!(static PIDS: Mutex<HashMap<String, u32>> = Default::default());
+crate::per_node!(
+    /// Each session's worker's process id: an interrupt reaches it while a cell holds its slot.
+    static PIDS: Mutex<HashMap<String, u32>> = Default::default());
 
 /// Interrupt `session`'s running cell: its worker gets SIGINT, and the cell ends with
 /// `KeyboardInterrupt`, its variables kept, as a notebook's kernel does. Windows has no such

@@ -107,8 +107,9 @@ async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> {
     Ok(crate::query::sql(&ctx, &crate::asof::rewrite(sql)?).await?.schema().as_arrow().clone())
 }
 
-// A CALL's answer, run when its flight was asked for, until its ticket reads it (10 minutes).
-crate::per_node!(static KEPT: std::sync::Mutex<std::collections::HashMap<String, (Vec<RecordBatch>, std::time::Instant)>> = Default::default());
+crate::per_node!(
+    /// A CALL's answer, run when its flight was asked for, until its ticket reads it (10 minutes).
+    static KEPT: std::sync::Mutex<std::collections::HashMap<String, (Vec<RecordBatch>, std::time::Instant)>> = Default::default());
 
 /// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER (or a CALL). Returns the rows written.
 async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {

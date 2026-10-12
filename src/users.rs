@@ -849,9 +849,10 @@ async fn session_user(lake: &Lake, token: &str) -> Option<String> {
     (v["x"].as_u64()? > crate::log::now_ms()).then(|| v["u"].as_str().map(String::from))?
 }
 
-// Passwords checked lately (by their hash with the user's name): a minute, so a client that sends
-// its password with every request (HTTP Basic) pays for SCRAM's hashing once.
-crate::per_node!(static VERIFIED: Mutex<HashMap<String, std::time::Instant>> = Default::default());
+crate::per_node!(
+    /// Passwords checked lately (by their hash with the user's name): a minute, so a client that sends
+    /// its password with every request (HTTP Basic) pays for SCRAM's hashing once.
+    static VERIFIED: Mutex<HashMap<String, std::time::Instant>> = Default::default());
 
 /// Is this `user`'s password? (Its verifier checked, or remembered as checked.)
 pub async fn password_ok(lake: &Lake, user: &str, password: &str) -> bool {
@@ -948,8 +949,9 @@ impl Access {
     fn writes(&self) -> bool { self.grants.iter().any(|g| ["insert", "update", "delete"].contains(&g.privilege.as_str())) }
 }
 
-// Users' access, by name, as of a catalog version (grants change seldom: a check is a lookup).
-crate::per_node!(static ACCESS: Mutex<HashMap<String, (Option<u64>, std::time::Instant, Arc<Access>, bool)>> = Default::default());
+crate::per_node!(
+    /// Users' access, by name, as of a catalog version (grants change seldom: a check is a lookup).
+    static ACCESS: Mutex<HashMap<String, (Option<u64>, std::time::Instant, Arc<Access>, bool)>> = Default::default());
 
 fn forget() {
     ACCESS.lock().unwrap().clear();

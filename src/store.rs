@@ -1452,8 +1452,9 @@ pub fn trace(what: &str, since: std::time::Instant) {
     }
 }
 
-// Has the node begun to serve? (Then the catalog's upkeep starts: `upkeep`.)
-crate::per_node!(static SERVING: watch::Sender<bool> = watch::Sender::new(false));
+crate::per_node!(
+    /// Has the node begun to serve? (Then the catalog's upkeep starts: `upkeep`.)
+    static SERVING: watch::Sender<bool> = watch::Sender::new(false));
 
 /// The node serves now (`main.rs`).
 pub fn serving() { SERVING.send_replace(true); }

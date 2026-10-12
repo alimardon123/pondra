@@ -625,8 +625,9 @@ fn top_first(p: &Arc<dyn ExecutionPlan>, order: &[datafusion::physical_expr::Phy
     }
 }
 
-// Batches scans skipped by their ranges (`/metrics`).
-crate::per_node!(pub static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
+crate::per_node!(
+    /// Batches scans skipped by their ranges (`/metrics`).
+    pub static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
 
 /// Which of a partition's batches its scan's predicate may match, worked out again when a dynamic
 /// filter in it moves.

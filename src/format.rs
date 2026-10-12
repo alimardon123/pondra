@@ -66,8 +66,9 @@ impl std::fmt::Display for Newer {
 
 impl std::error::Error for Newer {}
 
-// Did this process make its lake (open it to write with nothing ever committed there)?
-crate::per_node!(static MADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
+crate::per_node!(
+    /// Did this process make its lake (open it to write with nothing ever committed there)?
+    static MADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
 
 /// Did this process make its lake? (No release older than this build has read it.)
 pub fn made() -> bool { MADE.load(std::sync::atomic::Ordering::Relaxed) }
@@ -96,9 +97,10 @@ async fn set(lake: &Lake, to: u32) -> Result<()> {
     Ok(())
 }
 
-// What `raise` saw: 0 when it doesn't run in this process, 1 while it takes its first look, then
-// the newest format every node knows, plus 2.
-crate::per_node!(static READY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0));
+crate::per_node!(
+    /// What `raise` saw: 0 when it doesn't run in this process, 1 while it takes its first look, then
+    /// the newest format every node knows, plus 2.
+    static READY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0));
 
 /// Leader: before writing something an older release would read wrongly (`what`), move the lake to
 /// format `n`, or refuse by name while a node that doesn't know `n` runs. A leader that only just
@@ -132,9 +134,10 @@ pub fn said(headers: &axum::http::HeaderMap) -> (String, u32) {
     (get("x-pondra-version").unwrap_or_default(), get("x-pondra-format").and_then(|f| f.parse().ok()).unwrap_or(0))
 }
 
-// Commit streams open to other nodes, by the format each knows (read-only nodes don't
-// heartbeat: their stream is how the leader knows they are there).
-crate::per_node!(static STREAMS: std::sync::Mutex<std::collections::BTreeMap<u32, usize>> = std::sync::Mutex::new(std::collections::BTreeMap::new()));
+crate::per_node!(
+    /// Commit streams open to other nodes, by the format each knows (read-only nodes don't
+    /// heartbeat: their stream is how the leader knows they are there).
+    static STREAMS: std::sync::Mutex<std::collections::BTreeMap<u32, usize>> = std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
 /// Held by a commit stream for as long as it is open.
 pub struct Streamed(u32);

@@ -618,10 +618,11 @@ pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &
     Ok(())
 }
 
-// Each lake's tables, with the newest commit that changed each and when it was made, as far as the
-// log has been looked at: brought up to date from the commits since the last look (the first look
-// starts at the log's end, and a lake no view runs again for is let go).
-crate::per_node!(static CHANGED: Mutex<BTreeMap<String, (u64, HashMap<String, (u64, u64)>)>> = Mutex::new(BTreeMap::new()));
+crate::per_node!(
+    /// Each lake's tables, with the newest commit that changed each and when it was made, as far as the
+    /// log has been looked at: brought up to date from the commits since the last look (the first look
+    /// starts at the log's end, and a lake no view runs again for is let go).
+    static CHANGED: Mutex<BTreeMap<String, (u64, HashMap<String, (u64, u64)>)>> = Mutex::new(BTreeMap::new()));
 
 async fn look(lake: &Lake) -> Result<()> {
     let now = lake.visible();

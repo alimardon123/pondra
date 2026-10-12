@@ -1621,9 +1621,10 @@ fn open_with(key: &[u8], sealed: &str) -> Option<Vec<u8>> {
     key.open_in_place(Nonce::try_assume_unique_for_key(nonce).ok()?, Aad::empty(), &mut data).ok().map(|p| p.to_vec())
 }
 
-// Data keys unwrapped so far (by their wrapped form): a query using a secret again doesn't ask the
-// key service again.
-crate::per_node!(static UNWRAPPED: std::sync::Mutex<HashMap<String, Vec<u8>>> = Default::default());
+crate::per_node!(
+    /// Data keys unwrapped so far (by their wrapped form): a query using a secret again doesn't ask the
+    /// key service again.
+    static UNWRAPPED: std::sync::Mutex<HashMap<String, Vec<u8>>> = Default::default());
 
 /// A data key wrapped by the master key: by `PONDRA_KMS_COMMAND wrap` (a key service: its key never
 /// leaves it), or sealed with the local master key (`PONDRA_SECRET_KEY`, else this machine's).

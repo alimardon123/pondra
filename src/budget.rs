@@ -95,8 +95,9 @@ pub struct Budget {
 }
 
 crate::per_node!(static GATES: Mutex<HashMap<String, Arc<Gate>>> = Default::default());
-// Each bucket's shares: the path of another lake in it (`a/b`), and its turns.
-crate::per_node!(static SHARES: Mutex<HashMap<String, Vec<(String, Arc<Gate>)>>> = Default::default());
+crate::per_node!(
+    /// Each bucket's shares: the path of another lake in it (`a/b`), and its turns.
+    static SHARES: Mutex<HashMap<String, Vec<(String, Arc<Gate>)>>> = Default::default());
 
 /// Where a node's turns of a bucket start (`PONDRA_BUCKET_REQUESTS`).
 fn start() -> usize { crate::env::or("PONDRA_BUCKET_REQUESTS", 256usize).max(4) }

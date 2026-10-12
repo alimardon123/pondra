@@ -174,7 +174,7 @@ def statics():
                 line = text.count("\n", 0, m.start()) + 1
                 ty, end = type_of(text, m.end())
                 ty = resolved(ty, named)
-                before = text[max(0, text.rfind("\n", 0, m.start() - 1) - 200):m.start()]
+                before = text[max(0, m.start() - 4000):m.start()]  # (a long doc comment inside per_node! included)
                 if any(a <= m.start() < b for a, b in locals_):
                     how = "task_local"
                 elif re.search(r"per_node!\s*\(\s*(?:(?:#\[[^\]]*\]|///[^\n]*)\s*)*(?:pub(?:\([^)]*\))?\s+)?$", before):

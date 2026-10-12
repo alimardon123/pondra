@@ -14,8 +14,9 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-// Manifests already read, by path: a manifest, once written, never changes.
-crate::per_node!(static MANIFESTS: Mutex<lru::LruCache<String, Arc<Vec<Value>>>> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
+crate::per_node!(
+    /// Manifests already read, by path: a manifest, once written, never changes.
+    static MANIFESTS: Mutex<lru::LruCache<String, Arc<Vec<Value>>>> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
 
 /// The table at `url` (a table's folder or a metadata file), at its current snapshot or the one
 /// asked for: `version` (of its metadata), `snapshot_from_id`, `snapshot_from_timestamp`.

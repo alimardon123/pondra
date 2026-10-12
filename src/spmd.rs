@@ -593,8 +593,9 @@ async fn abandon(nodes: &[String], me: &str) {
     futures::future::join_all(asks).await;
 }
 
-// The id of the shuffle this node started last (for `abandon`).
-crate::per_node!(static LAST: Mutex<Option<String>> = Default::default());
+crate::per_node!(
+    /// The id of the shuffle this node started last (for `abandon`).
+    static LAST: Mutex<Option<String>> = Default::default());
 
 /// One attempt, planned each way in turn (`How`) until one splits correctly — and pays (`guard`:
 /// the ways after it move more). Keyed tables, and tables of attached lakes, are always read whole.
