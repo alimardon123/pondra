@@ -31,6 +31,7 @@
   harness.py use                 USE and SET search_path: schemas and databases, views and tasks, Postgres, Python, the shell, three nodes
   harness.py answers_big         answers in pieces: the same bytes as whole; 3M rows over 0.25 GB (53200 past it); turns (53300)
   harness.py friendly            SQL as DuckDB's users write it (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, …) == DuckDB's answers, spread too
+  harness.py unique_doors        UNIQUE through every loading door (appends, Flight, COPY): 23505 whole, retries duplicates, order, three nodes
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -8655,7 +8656,7 @@ def sequences():
     stepped = [q("SELECT nextval('o') AS v")[0]["v"] for _ in range(2)]  # (after a change, every node's block goes: a gap, as Postgres's CACHE leaves)
     info["o"] = [o, cur, before, none, after_set, restarted, stepped]
     checks["START 10 INCREMENT 5 in any order; currval the session's last (55000 before, none without a session); setval; RESTART; INCREMENT changed"] = \
-        o == [10, 15] and cur == 15 and before[1] == "55000" and none[0] == 500 and after_set == 105 and restarted == 7 and stepped[1] - stepped[0] == 2 and stepped[0] > restarted
+        o == [10, 15] and cur == 15 and before[1] == "55000" and none[0] == 409 and after_set == 105 and restarted == 7 and stepped[1] - stepped[0] == 2 and stepped[0] > restarted
     q("ALTER SEQUENCE o RENAME TO o2")
     renamed = (q("SELECT nextval('o2') AS v")[0]["v"], err("SELECT nextval('o') AS v")[1])
     q("CREATE SEQUENCE c AS smallint MAXVALUE 3 CYCLE")
@@ -8818,20 +8819,29 @@ def constraints():
             pgs = None
         except psycopg.Error as e:
             pgs = e.sqlstate
-        try:
+        try:  # (a new id and email go in: a loading door's rows are checked on the leader, as a SQL write's are)
             with cur.copy("COPY users FROM STDIN") as cp:
                 cp.write("300\tcopy@x\tC\n")
             copied = None
         except psycopg.Error as e:
-            copied = str(e)[:200]
+            copied = e.sqlstate
+        try:  # (the same email again: refused by name, 23505)
+            with cur.copy("COPY users FROM STDIN") as cp:
+                cp.write("301\tcopy@x\tC\n")
+            copy_dup = None
+        except psycopg.Error as e:
+            copy_dup = e.sqlstate
     cli_ok = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO users VALUES (400, 'cli@x', 'Cli')"], capture_output=True, text=True, timeout=120)
     cli_dup = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO users VALUES (401, 'cli@x', 'Cli again')"], capture_output=True, text=True, timeout=120)
-    appended = [err('{"id": 500, "email": "app@x"}\n', p, "/append/users") for p in ports]
-    info["doors"] = [txn, pgs, copied, cli_ok.returncode, cli_ok.stderr[-200:], cli_dup.returncode, cli_dup.stderr[-200:], appended]
+    appended = [err(f'{{"id": {700 + k}, "email": "app{k}@x"}}\n', p, "/append/users") for k, p in enumerate(ports)]
+    appended_dup = [err('{"id": 800, "email": "copy@x"}\n', p, "/append/users") for p in ports]
+    new_ids = [r["id"] for r in q("SELECT id FROM users WHERE id >= 700 ORDER BY id")]
+    info["doors"] = [txn, pgs, copied, copy_dup, cli_ok.returncode, cli_ok.stderr[-200:], cli_dup.returncode, cli_dup.stderr[-200:], appended, appended_dup, new_ids]
     checks["a transaction's two rows of one value refused at COMMIT (23505); Postgres's INSERT (23505); pondra sql checks too"] = \
         txn == "23505" and pgs == "23505" and cli_ok.returncode == 0 and cli_dup.returncode != 0 and "unique constraint" in cli_dup.stderr
-    checks["the doors that skip the leader's check refuse the table, by name: an append on every node, COPY FROM STDIN"] = \
-        all(a[0] != 200 and "UNIQUE" in a[2] for a in appended) and copied is not None and "UNIQUE" in copied
+    checks["the loading doors take a table's rows, checked: an append on every node and COPY FROM STDIN add a new id and email (the rows are there); the same email again is refused by name (23505)"] = \
+        all(a[0] == 200 for a in appended) and copied is None and copy_dup == "23505" and \
+        all(d[1] == "23505" for d in appended_dup) and new_ids == [700, 701, 702]
     # NOT ENFORCED: facts, never checked; a reference must say so
     q("CREATE TABLE orders (id INT PRIMARY KEY NOT ENFORCED, user_id INT REFERENCES users (id) NOT ENFORCED, code TEXT UNIQUE NOT ENFORCED)")
     q("INSERT INTO orders VALUES (1, 1, 'x'), (1, 99, 'x')")
@@ -10821,6 +10831,264 @@ def backpressure():
     return "writes wait for tiering only while it can run"
 
 
+def unique_doors():
+    """UNIQUE through every loading door (`constraints.rs`, `constraints::queue`): an append (JSON and
+    Arrow), Flight DoPut, COPY FROM STDIN, Kafka (INVALID_RECORD) and INSERT … VALUES refuse a value twice (23505) and a batch
+    whole, on one node and on three; a retried batch (its producer and seq) is a duplicate and never a
+    23505, not even one the plain path committed before the table got its UNIQUE; a producer's
+    pipelined batches commit in the order they were cut, through a refused batch that is sent again
+    (invariant 29), on the leader and on a follower; an identity column and a DEFAULT on a UNIQUE table
+    fill as they do on one without (an append and COPY); three nodes appending at once keep every id
+    once; a table without UNIQUE takes its appends as before (`plain_ms`: 2,000 one-row appends)."""
+    import pyarrow as pa, pyarrow.flight as fl, psycopg, concurrent.futures as cf
+    from collections import Counter
+    lake = new_lake()
+    P, fport, pgport = A.port, A.port + 30, A.port + 10
+    checks, info = {}, {}
+
+    def post(port, path, body, ctype=None):
+        """One POST: {status, code (x-pondra-sqlstate), text, ack (the JSON of a 200)}."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+        c.request("POST", path, body, {"content-type": ctype} if ctype else {})
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        if r.status == 200:
+            return {"status": 200, "code": None, "text": "", "ack": json.loads(data)}
+        return {"status": r.status, "code": r.getheader("x-pondra-sqlstate"), "text": data.decode()[:400], "ack": None}
+
+    ndjson = lambda rows: "".join(json.dumps(r) + "\n" for r in rows).encode()
+    arrow = "application/vnd.apache.arrow.stream"
+
+    def ipc(rows):
+        t = pa.table({"id": pa.array([i for i, _ in rows], pa.int64()), "name": pa.array([n for _, n in rows], pa.string())})
+        sink = pa.BufferOutputStream()
+        w = pa.ipc.new_stream(sink, t.schema)
+        w.write_table(t)
+        w.close()
+        return sink.getvalue().to_pybytes()
+
+    schema = pa.schema([("id", pa.int64()), ("name", pa.string())])
+
+    def fput(client, path, batches):
+        """A DoPut of `batches` (lists of (id, name)): (the acks read, the error text or None)."""
+        w, r = client.do_put(fl.FlightDescriptor.for_path(*path), schema)
+        acks, err = [], None
+        try:
+            for batch in batches:
+                w.write_batch(pa.record_batch([pa.array([i for i, _ in batch], pa.int64()), pa.array([n for _, n in batch], pa.string())], schema=schema))
+            w.done_writing()
+            while (buf := r.read()) is not None:
+                acks.append(json.loads(buf.to_pybytes()))
+        except (fl.FlightError, pa.ArrowException) as e:  # (a refusal comes as either, by its status)
+            err = str(e)
+        try:  # (a refusal can surface when the writer closes, not on a read: keep the first error seen)
+            w.close()
+        except (fl.FlightError, pa.ArrowException) as e:
+            err = err or str(e)
+        return acks, err
+
+    ids_of = lambda t, port: [r["id"] for r in sql(port, f"SELECT id FROM {t} ORDER BY id")]
+
+    def settle(f, want, secs=15):
+        """What `f` says once it is `want`, or after `secs`: a follower reads what its commit stream has brought."""
+        end, got = time.time() + secs, f()
+        while got != want and time.time() < end:
+            time.sleep(0.1)
+            got = f()
+        return got
+
+    def one_node():
+        node = Node(lake, P, flight=f"127.0.0.1:{fport}", pg=f"127.0.0.1:{pgport}", kafka=f"127.0.0.1:{P + 20}").start()
+        try:
+            flight = fl.FlightClient(f"grpc://127.0.0.1:{fport}")
+            sql(P, "CREATE TABLE u (id INT, name TEXT, UNIQUE (id))")
+            ok = post(P, "/append/u", ndjson([{"id": i, "name": "j"} for i in (1, 2, 3)]))
+            dup = post(P, "/append/u", ndjson([{"id": 2, "name": "x"}, {"id": 4, "name": "x"}]))
+            twice = post(P, "/append/u", ndjson([{"id": 5, "name": "x"}, {"id": 5, "name": "y"}]))
+            info["json"] = [ok["status"], dup["code"], dup["text"][:200], twice["code"], ids_of("u", P)]
+            checks["HTTP append (JSON): new ids go in; an id already there refuses the whole batch (23505, naming the id); an id twice refuses it too"] = \
+                ok["status"] == 200 and dup["code"] == "23505" and "(2)" in dup["text"] and twice["code"] == "23505" and ids_of("u", P) == [1, 2, 3]
+            a_ok = post(P, "/append/u", ipc([(10, "a"), (11, "b")]), arrow)
+            a_dup = post(P, "/append/u", ipc([(12, "c"), (10, "d")]), arrow)
+            a_twice = post(P, "/append/u", ipc([(13, "e"), (13, "f")]), arrow)
+            info["arrow"] = [a_ok["status"], a_dup["code"], a_twice["code"]]
+            checks["HTTP append (Arrow): new ids go in; a value already there, or a value twice, refuses the batch (23505) and 12 and 13 stay out"] = \
+                a_ok["status"] == 200 and a_dup["code"] == "23505" and a_twice["code"] == "23505" and not {12, 13} & set(ids_of("u", P))
+            _, f_err = fput(flight, ["u"], [[(20, "f"), (21, "f")]])
+            _, f_dup = fput(flight, ["u"], [[(22, "g")], [(20, "g")]])
+            info["flight"] = [f_err, f_dup]
+            checks["Flight DoPut: new ids go in; a value already there refuses its batch (23505), and the batch before it, acked by then, stays in"] = \
+                f_err is None and f_dup is not None and "duplicate key" in f_dup and ids_of("u", P).count(20) == 1 and 22 in ids_of("u", P)
+            a1, e1 = fput(flight, ["u", "fp", "1"], [[(30, "p")], [(31, "p")]])
+            a2, e2 = fput(flight, ["u", "fp", "1"], [[(30, "p")], [(31, "p")]])
+            info["flight_retry"] = [a1, e1, a2, e2]
+            checks["Flight DoPut with a producer and seq: the same batches sent again are duplicates (their acks say so), not 23505; the rows are once"] = \
+                e1 is None and e2 is None and [a.get("duplicate") for a in a2] == [True, True] and ids_of("u", P).count(30) == 1 and ids_of("u", P).count(31) == 1
+            h1 = post(P, "/append/u?producer=hp&seq=1", ndjson([{"id": 50, "name": "h"}]))
+            h2 = post(P, "/append/u?producer=hp&seq=1", ndjson([{"id": 50, "name": "h"}]))
+            checks["HTTP append with a producer and seq: the retry is a duplicate (its ack says so), not 23505, and the row is once"] = \
+                h1["status"] == 200 and h2["status"] == 200 and h2["ack"]["duplicate"] is True and ids_of("u", P).count(50) == 1
+            with psycopg.connect(f"host=127.0.0.1 port={pgport} user=u dbname=lake", autocommit=True) as conn:
+                cur = conn.cursor()
+                try:  # (a door that refuses the table by name, as the plain build does, is a failed check, not an abort)
+                    with cur.copy("COPY u FROM STDIN") as cp:
+                        cp.write("60\tc\n")
+                except psycopg.Error as e:
+                    info["copy_first"] = e.sqlstate
+                try:
+                    with cur.copy("COPY u FROM STDIN") as cp:
+                        cp.write("60\tc again\n")
+                    copy_dup = None
+                except psycopg.Error as e:
+                    copy_dup = e.sqlstate
+            ins = post(P, "/sql", b"INSERT INTO u VALUES (62, 'x'), (62, 'y')")
+            info["copy_insert"] = [copy_dup, ins["code"]]
+            checks["COPY FROM STDIN refuses a value already there (23505); INSERT … VALUES refuses a value twice (23505); the rows of the refused batches stay out"] = \
+                copy_dup == "23505" and ins["code"] == "23505" and 60 in ids_of("u", P) and 62 not in ids_of("u", P)
+            # Kafka: an idempotent producer's batch is a checked append too; a value already there is a bad
+            # record (INVALID_RECORD, which librdkafka doesn't send again), never a timeout it retries for ever
+            import confluent_kafka as ck
+
+            def produce(values):
+                errs = []
+                kp = ck.Producer({"bootstrap.servers": f"127.0.0.1:{P + 20}", "enable.idempotence": True, "linger.ms": 50, "message.timeout.ms": 20000})
+                for v in values:
+                    kp.produce("u", value=json.dumps(v), on_delivery=lambda e, m: errs.append(e and e.name()))
+                kp.flush(30)
+                return errs
+
+            k_ok, k_dup, k_after = produce([{"id": 90, "name": "k"}, {"id": 91, "name": "k"}]), produce([{"id": 90, "name": "again"}]), produce([{"id": 92, "name": "k"}])
+            info["kafka"] = [k_ok, k_dup, k_after]
+            checks["Kafka (an idempotent producer): new ids go in; an id already there is refused as INVALID_RECORD, not retried; the next producer's new id goes in; each id once"] = \
+                k_ok == [None, None] and k_dup == ["INVALID_RECORD"] and k_after == [None] and [ids_of("u", P).count(i) for i in (90, 91, 92)] == [1, 1, 1]
+            # invariant 29: pipelined batches, one refused (23505), the ones after it sent again
+            pipe = [[(70, "b1"), (71, "b1")], [(72, "b2"), (73, "b2")], [(1, "dup")], [(74, "b4"), (75, "b4")], [(76, "b5"), (77, "b5")]]
+            # the stream answers the batches it has, then stops at the refused one (seq 3): its two after it
+            # (seq 4, 5) are never taken, so the producer sends seq 3 again (fixed) and those two with it
+            p1_acks, p1 = fput(flight, ["u", "pipe", "1"], pipe)
+            p2_acks, p2 = fput(flight, ["u", "pipe", "3"], [[(78, "b3"), (79, "b3")], [(74, "b4"), (75, "b4")], [(76, "b5"), (77, "b5")]])
+            order = [r["id"] for r in sql(P, "SELECT id FROM u WHERE id BETWEEN 70 AND 79 ORDER BY _row_id")]
+            info["pipelined"] = [len(p1_acks), p1, len(p2_acks), p2, order]
+            checks["a pipelined Flight stream commits in the order its batches were cut, through a refused batch (23505) that is sent again with the ones after it: the two acked before it, then the resend's three, none a duplicate"] = \
+                p1 is not None and "duplicate key" in p1 and len(p1_acks) == 2 and p2 is None and len(p2_acks) == 3 and \
+                not any(a.get("duplicate") for a in p2_acks) and order == [70, 71, 72, 73, 78, 79, 74, 75, 76, 77]
+            # a batch the plain path committed before the table had its UNIQUE: sent again, a duplicate
+            sql(P, "CREATE TABLE pre (id INT, name TEXT)")
+            e_first = post(P, "/append/pre?producer=early&seq=1", ndjson([{"id": 1, "name": "e"}, {"id": 2, "name": "e"}]))
+            sql(P, "ALTER TABLE pre ADD CONSTRAINT pre_id UNIQUE (id)")
+            e_again = post(P, "/append/pre?producer=early&seq=1", ndjson([{"id": 1, "name": "e"}, {"id": 2, "name": "e"}]))
+            e_new = post(P, "/append/pre?producer=early&seq=2", ndjson([{"id": 2, "name": "again"}]))
+            info["before_unique"] = [e_first["status"], e_again["ack"] and e_again["ack"]["duplicate"], e_new["code"], ids_of("pre", P)]
+            checks["a batch the plain path committed before the table got its UNIQUE, sent again through the checked door, is a duplicate (not 23505); a new seq with a value there is refused"] = \
+                e_first["status"] == 200 and e_again["status"] == 200 and e_again["ack"]["duplicate"] is True and e_new["code"] == "23505" and ids_of("pre", P) == [1, 2]
+            # an identity column and a DEFAULT on a table with a UNIQUE, loaded as one without it is (the
+            # same appends and COPY on both): the identity's values are filled and unique, the DEFAULT applies
+            with psycopg.connect(f"host=127.0.0.1 port={pgport} user=u dbname=lake", autocommit=True) as conn:
+                cur = conn.cursor()
+                for t, unique in (("idu", ", UNIQUE (code)"), ("idp", "")):
+                    sql(P, f"CREATE TABLE {t} (id BIGINT GENERATED BY DEFAULT AS IDENTITY, code INT, name TEXT DEFAULT 'none'{unique})")
+                    post(P, f"/append/{t}", ndjson([{"code": 1}, {"code": 2, "name": "given"}]))
+                    try:
+                        with cur.copy(f"COPY {t} (code) FROM STDIN") as cp:
+                            cp.write("7\n8\n")
+                    except psycopg.Error as e:  # (refused by name on a build without the checked path: the rows stay out)
+                        info.setdefault("identity_copy_errors", {})[t] = e.sqlstate
+                    post(P, f"/append/{t}", ndjson([{"code": 9}]))
+                rows = {t: [(r["code"], r["name"]) for r in sql(P, f"SELECT code, name FROM {t} ORDER BY code")] for t in ("idu", "idp")}
+                ids = {t: [r["id"] for r in sql(P, f"SELECT id FROM {t}")] for t in ("idu", "idp")}
+                dup_append = post(P, "/append/idu", ndjson([{"code": 2}]))
+                try:
+                    with cur.copy("COPY idu (code) FROM STDIN") as cp:
+                        cp.write("8\n")
+                    dup_copy = None
+                except psycopg.Error as e:
+                    dup_copy = e.sqlstate
+            info["identity"] = [rows, ids, dup_append["code"], dup_copy]
+            want = [(1, "none"), (2, "given"), (7, "none"), (8, "none"), (9, "none")]
+            checks["an identity column and a DEFAULT on a table with UNIQUE are filled as on a table without it, through an append and COPY: ids unique and given, the DEFAULT in place; a code already there refused (23505) by either door"] = \
+                rows["idu"] == rows["idp"] == want and all(i is not None for t in ids for i in ids[t]) and len(set(ids["idu"])) == 5 and \
+                len(set(ids["idp"])) == 5 and dup_append["code"] == "23505" and dup_copy == "23505"
+            # a table without UNIQUE: the plain path, timed
+            sql(P, "CREATE TABLE plain (id INT, name TEXT)")
+            t0 = time.perf_counter()
+            plain_ok = all(post(P, "/append/plain", ndjson([{"id": i, "name": "p"}]))["status"] == 200 for i in range(2000))
+            info["plain_ms"] = round((time.perf_counter() - t0) * 1000)
+            checks["a table without UNIQUE takes 2,000 one-row appends as before"] = plain_ok and len(ids_of("plain", P)) == 2000
+        finally:
+            node.kill()
+
+    def three_nodes():
+        lake3 = new_lake()
+        ports = [P + 1 + i for i in range(3)]
+        nodes = [Node(lake3, p, flight=f"127.0.0.1:{fport + 1 + i}").start() for i, p in enumerate(ports)]
+        try:
+            while len(call(ports[0], "GET", "/stats")["nodes"]) < 3:
+                time.sleep(0.1)
+            sql(ports[0], "CREATE TABLE u3 (id INT, name TEXT, UNIQUE (id))")
+            shared = list(range(600))  # every node draws 3 of each batch's 10 ids from here: a third collide
+
+            def run_node(n):
+                rng, seq, out = random.Random(n), 1, []
+                for k in range(200):
+                    own = [100000 + (n * 200 + k) * 10 + j for j in range(7)]
+                    batch = own + rng.sample(shared, 3)
+                    rng.shuffle(batch)
+                    r = post(ports[n], f"/append/u3?producer=n{n}&seq={seq}", ndjson([{"id": i, "name": f"n{n}"} for i in batch]))
+                    if r["status"] == 200:
+                        seq += 1  # (a refused batch leaves its seq for the next: the producer's last seq is what committed)
+                    out.append((batch, r["status"], r["code"], seq - 1 if r["status"] == 200 else None))
+                return out
+
+            with cf.ThreadPoolExecutor(3) as ex:
+                results = list(ex.map(run_node, range(3)))
+            flat = [b for node in results for b in node]
+            went = [b for b in flat if b[1] == 200]
+            refused = [b for b in flat if b[1] != 200]
+            present = [r["id"] for r in sql(ports[0], "SELECT id FROM u3")]
+            ok_ids = {i for b, _, _, _ in went for i in b}
+            own_refused = {i for b, _, _, _ in refused for i in b if i >= 100000}
+            # (a follower reads what its commit stream has brought: a few ms behind the leader's acks)
+            counts = [settle(lambda p=p: sql(p, "SELECT count(*) AS n FROM u3")[0]["n"], len(present)) for p in ports]
+            info["race"] = {"batches": len(flat), "went": len(went), "refused": len(refused), "codes": sorted({str(c) for _, s, c, _ in flat if s != 200}),
+                            "rows": len(present), "counts": counts}
+            checks["three nodes appending at once, 200 batches each, a third of the ids shared: every id in the table once, every refused batch 23505 and out whole, every batch that went in all there"] = \
+                all(s in (200, 409) for _, s, _, _ in flat) and all(c in (None, "23505") for _, _, c, _ in flat) and len(refused) > 0 and \
+                not any(v > 1 for v in Counter(present).values()) and set(present) == ok_ids and len(present) == 10 * len(went) and not own_refused & set(present) and \
+                all(n == len(present) for n in info["race"]["counts"])
+            # a retry through another node is a duplicate (the same producer and seq, sent to a follower)
+            went_in = next((x for x in reversed(results[1]) if x[1] == 200), None)  # (none on a build that refuses the table)
+            if went_in:
+                b, _, _, s = went_in
+                again = post(ports[2], f"/append/u3?producer=n1&seq={s}", ndjson([{"id": i, "name": "n1"} for i in b]))
+            checks["a retry of a batch that went in, sent to another node, is a duplicate, not 23505"] = bool(went_in) and \
+                again["status"] == 200 and again["ack"]["duplicate"] is True
+            # invariant 29 on a follower: its Flight stream goes to the leader in order, through a refusal
+            fl2 = fl.FlightClient(f"grpc://127.0.0.1:{fport + 3}")
+            taken = present[0] if present else -1  # (a build that refuses the table has none: the refusal is then a miss)
+            f_err_acks, f_err = fput(fl2, ["u3", "fpipe", "1"], [[(900, "x")], [(taken, "x")], [(902, "x")]])
+            f_again_acks, f_again = fput(fl2, ["u3", "fpipe", "2"], [[(903, "x")], [(902, "x")]])
+            order = settle(lambda: [r["id"] for r in sql(ports[1], "SELECT id FROM u3 WHERE id IN (900, 901, 902, 903) ORDER BY _row_id")], [900, 903, 902])
+            info["follower_pipe"] = [len(f_err_acks), f_err, len(f_again_acks), f_again, order]
+            checks["a pipelined Flight stream to a follower reaches the leader in order: through a refusal, the batches after it sent again, committed in the order cut"] = \
+                f_err is not None and "duplicate key" in f_err and len(f_err_acks) == 1 and f_again is None and len(f_again_acks) == 2 and \
+                not any(a.get("duplicate") for a in f_again_acks) and order == [900, 903, 902]
+        finally:
+            for n in nodes:
+                n.kill()
+
+    for part in (one_node, three_nodes):
+        try:
+            part()
+        except Exception as e:  # (a section on a binary without the check records it, and goes on)
+            info.setdefault("errors", []).append(f"{part.__name__}: {e!r}"[:600])
+    ok = bool(checks) and all(checks.values()) and not info.get("errors")  # (a section that raised fails the run)
+    print(json.dumps({"unique_doors": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} unique checks"
+
+
 def raw_sql(port, q, fmt=None, timeout=900):
     """POST /sql as the wire has it: (status, content type, SQLSTATE header, body bytes)."""
     c = http_client.HTTPConnection("127.0.0.1", port, timeout=timeout)
@@ -10977,12 +11245,12 @@ def answers_big():
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
-        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "answers_big": 15, "dialects": 20}
+        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "answers_big": 15, "dialects": 20, "unique_doors": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -11010,7 +11278,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -11023,7 +11291,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

@@ -46,6 +46,7 @@ PROCESS = {
     "console.rs:FILES": "the console's files, built into the binary",
     "console.rs:PAGE": "the console's page, built into the binary",
     "console.rs:SERVER": "the server's page, built into the binary",
+    "constraints.rs:TURN": LOCK,
     "copy.rs:MS": SETTING + " (PONDRA_LOAD_RETENTION_SECS)",
     "defaults.rs:CTX": "a session with no tables, for DEFAULT and CHECK expressions: nothing of a lake",
     "delta.rs:ONE": LOCK,

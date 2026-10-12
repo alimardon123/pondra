@@ -169,6 +169,7 @@ impl Node {
         tr("the sequencer");
         python::init(python);
         let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock, retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
+        crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
         learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
         if leader {
             let (l, c) = (app.lake.clone(), app.cluster.clone()); // (beside serving, not before it: C5)
