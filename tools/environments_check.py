@@ -443,7 +443,9 @@ def signed_in_check(bin, work, port, root):
         and ddl({"op": "pin", "lake": loc, "ms": None}, {"Authorization": "Bearer pb_nope", "Content-Type": "application/json"}) != 200
 
     dev.q(f"ATTACH '{prod_dir}' AS prod2")  # (a database next door that signs in on its own)
-    status, _, text = dev.plain("POST", "/sql", "CREATE DATABASE x CLONE prod2")
+    # (a superuser of dev's, signed in, is not whoever runs the nodes: dev answers only its program unsigned)
+    dev.q("CREATE USER dan PASSWORD 'dan-password-1' SUPERUSER")
+    status, text = raw(port + 11, "POST", "/sql", "CREATE DATABASE x CLONE prod2", {"Authorization": "Basic " + base64.b64encode(b"dan:dan-password-1").decode()})
     cloning = refused(dev, "CREATE DATABASE x2 CLONE prod2")  # (the owner passes; prod refuses dev's own key)
     checks["CLONE of a database next door that signs in on its own: refused without its own rights, and saying where it is cloned"] = \
         status != 200 and "read and written through it" in text and "cloned on its own node" in cloning and "read and written through it" not in cloning and not keys(root + "/x") and not keys(root + "/x2")
@@ -588,11 +590,12 @@ def across_check(bin, work, port):
         prod.post("/tier")
         checks["prod moves on (rows changed, merged, purged, its past let go): ali still answers as before, from what prod pinned"] = \
             rows(ali, "SELECT id, amount FROM sales.orders ORDER BY id") == ali_before and rows(prod, "SELECT count(*) FROM sales.orders WHERE amount > 100") == [(4,)]
-        # The key ali keeps reads its base and nothing else: a statement on ali's own node (open: whoever asks
-        # is a superuser there, but not the program that started it) naming one of prod's files by URL, hr's,
-        # which ali never took, finds no secret to read it with.
+        # The key ali keeps reads its base and nothing else: a statement on ali's own node, by a superuser
+        # there who is not the program that started it, naming one of prod's files by URL, hr's, which ali
+        # never took, finds no secret to read it with.
         hr = next((k for k in parquet(prod_lake) if "hr.pay" in k), "")
-        status, text = raw(port + 2, "POST", "/sql", f"SELECT count(*) AS n FROM 's3://acme-prod/{hr}'", {})
+        ali.q("CREATE USER al PASSWORD 'al-password-1' SUPERUSER")
+        status, text = raw(port + 2, "POST", "/sql", f"SELECT count(*) AS n FROM 's3://acme-prod/{hr}'", {"Authorization": "Basic " + base64.b64encode(b"al:al-password-1").decode()})
         checks["the key ali was lent reads its base for ali's tables alone: a statement on ali's node naming prod's hr file by URL is refused"] = \
             hr != "" and status != 200 and "secret" in text.lower()
         if not checks["the key ali was lent reads its base for ali's tables alone: a statement on ali's node naming prod's hr file by URL is refused"]:

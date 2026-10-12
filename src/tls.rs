@@ -11,6 +11,9 @@
 //! - **Mutual TLS between nodes**: with `PONDRA_TLS_CA`, a node shows its certificate when it calls
 //!   another, and a request signed with the nodes' key is taken only over a connection whose
 //!   certificate that authority signed (`server::guard`). Clients may show one too; none is asked.
+//! - **Behind your own proxy** (`PONDRA_TRUSTED_PROXIES`): a request from one of its addresses is
+//!   counted by the client it names in `X-Forwarded-For` (`Peer::client`), so one client's failed
+//!   sign-ins don't lock a user out for everyone behind it.
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -39,6 +42,9 @@ fn tls() -> Option<&'static Tls> { TLS.get_or_init(|| load().unwrap_or_else(|e| 
 pub fn init() -> Result<()> {
     if TLS.get().is_none() {
         let _ = TLS.set(load()?);
+    }
+    if PROXIES.get().is_none() {
+        let _ = PROXIES.set(ranges(&std::env::var(TRUSTED_PROXIES).unwrap_or_default()).context(TRUSTED_PROXIES)?);
     }
     Ok(())
 }
@@ -117,6 +123,146 @@ impl Peer {
 
     /// Is it a node's (for the nodes' key)? With mutual TLS, only with the authority's certificate.
     pub fn may_be_node(&self) -> bool { self.signed || self.local || tls().is_none_or(|t| t.ca.is_none()) }
+
+    /// May a password cross this connection? (The rule of `may_send_password`, for a connection in hand.)
+    pub fn may_send_password(&self) -> bool { password_ok(self.tls, self.local, tls().is_some()) }
+
+    /// The address a request comes from, as failed sign-ins are counted (`auth::guessing`) and pages on
+    /// this machine are told apart (`from_here`): this connection's; from this machine, the client's that
+    /// `pondra serve --lakes` names (`CLIENT`) with the key it gave this node; from a proxy of
+    /// `PONDRA_TRUSTED_PROXIES`, the client its `X-Forwarded-For` names. Anyone else's word for it is never taken.
+    pub fn client(&self, headers: &axum::http::HeaderMap) -> std::net::IpAddr {
+        static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let key = KEY.get_or_init(|| std::env::var(CLIENT_KEY).ok().filter(|k| k.len() >= 16));
+        named(headers, key.as_deref().filter(|_| self.local)).or_else(|| forwarded(headers, self.addr.ip(), proxies())).unwrap_or(self.addr.ip())
+    }
+
+    /// Is the request a page's on this machine (saving the console's settings, choosing the Python a
+    /// node runs)? Behind `pondra serve --lakes` the connection is always this machine's, so the client's
+    /// own address decides.
+    pub fn from_here(&self, headers: &axum::http::HeaderMap) -> bool { self.client(headers).is_loopback() }
+}
+
+/// Your own load balancers and ingresses, as addresses and ranges (`PONDRA_TRUSTED_PROXIES`:
+/// `10.0.0.0/8,192.168.1.5`), read at start (`init`).
+static PROXIES: OnceLock<Vec<(std::net::IpAddr, u8)>> = OnceLock::new();
+
+fn proxies() -> &'static [(std::net::IpAddr, u8)] {
+    PROXIES.get_or_init(|| ranges(&std::env::var(TRUSTED_PROXIES).unwrap_or_default()).unwrap_or_default())
+}
+
+/// `10.0.0.0/8, 192.168.1.5, fd00::/8` as (address, prefix length) pairs; an address alone is itself.
+fn ranges(text: &str) -> Result<Vec<(std::net::IpAddr, u8)>> {
+    let one = |p: &str| -> Result<(std::net::IpAddr, u8)> {
+        let (addr, bits) = p.split_once('/').map_or((p, None), |(a, b)| (a, Some(b)));
+        let ip: std::net::IpAddr = addr.parse().with_context(|| format!("{p:?} is not an address or a range (10.0.0.0/8)"))?;
+        let most = if ip.is_ipv4() { 32 } else { 128 };
+        let bits = match bits {
+            None => most,
+            Some(b) => b.parse::<u8>().ok().filter(|b| *b <= most).with_context(|| format!("{p:?}: a range's length is 0 to {most}"))?,
+        };
+        Ok((ip.to_canonical(), bits))
+    };
+    text.split(',').map(str::trim).filter(|p| !p.is_empty()).map(one).collect()
+}
+
+/// Is `ip` in the range (`net`, `bits`)?
+fn within(ip: std::net::IpAddr, (net, bits): (std::net::IpAddr, u8)) -> bool {
+    use std::net::IpAddr::{V4, V6};
+    match (ip.to_canonical(), net) {
+        (V4(a), V4(n)) => bits == 0 || (u32::from(a) ^ u32::from(n)) >> (32 - bits as u32) == 0,
+        (V6(a), V6(n)) => bits == 0 || (u128::from(a) ^ u128::from(n)) >> (128 - bits as u32) == 0,
+        _ => false,
+    }
+}
+
+/// The client a trusted proxy names: in `X-Forwarded-For`, each proxy adds the address it was called
+/// from at the end, so the last address that isn't one of ours is the client (what comes before it is
+/// the client's own word). None from anyone else, or when a hop isn't an address.
+fn forwarded(headers: &axum::http::HeaderMap, from: std::net::IpAddr, proxies: &[(std::net::IpAddr, u8)]) -> Option<std::net::IpAddr> {
+    let ours = |ip: std::net::IpAddr| proxies.iter().any(|p| within(ip, *p));
+    if !ours(from) {
+        return None;
+    }
+    let hops: Vec<&str> = headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(str::trim).collect();
+    for hop in hops.into_iter().rev() {
+        // (some proxies add the port: `10.0.0.7:5123`, `[fd00::7]:5123`)
+        let ip = hop.parse::<std::net::IpAddr>().ok().or_else(|| hop.parse::<SocketAddr>().ok().map(|a| a.ip()))?.to_canonical();
+        if !ours(ip) {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+/// The address a `CLIENT` header names, when it carries `key` (`<key> <address>`).
+fn named(headers: &axum::http::HeaderMap, key: Option<&str>) -> Option<std::net::IpAddr> {
+    let (given, addr) = headers.get(CLIENT)?.to_str().ok()?.split_once(' ')?;
+    aws_lc_rs::constant_time::verify_slices_are_equal(given.as_bytes(), key?.as_bytes()).ok()?;
+    addr.parse().ok()
+}
+
+/// May a password cross a connection from `addr`? Over TLS, from this machine, or with no TLS set up at
+/// all. Under `PONDRA_TLS=optional` a plain connection from another machine may carry a token, never a
+/// password. Kafka's SASL/PLAIN and Flight's Basic handshake call it too.
+#[allow(dead_code)] // (no caller yet: the Kafka and Flight handshakes are the next to take it)
+pub fn may_send_password(secure: bool, addr: SocketAddr) -> bool { password_ok(secure, addr.ip().is_loopback(), tls().is_some()) }
+
+/// The rule behind both of `may_send_password`, on what they know (a plain function, so a test can
+/// state every case without setting TLS up, which can only be done once per process).
+fn password_ok(secure: bool, local: bool, tls_set_up: bool) -> bool { secure || local || !tls_set_up }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_password_crosses_only_tls_this_machine_or_with_no_tls_set_up() {
+        assert!(password_ok(true, false, true), "over TLS, from anywhere");
+        assert!(password_ok(false, true, true), "plain, from this machine");
+        assert!(password_ok(false, false, false), "plain from anywhere, with no TLS set up at all");
+        assert!(!password_ok(false, false, true), "plain from another machine, with TLS set up: a token only");
+    }
+
+    #[test]
+    fn a_client_named_is_taken_only_with_the_servers_key() {
+        let key = "0123456789abcdef0123";
+        let said = |v: &str| { let mut h = axum::http::HeaderMap::new(); h.insert(CLIENT, v.parse().unwrap()); h };
+        assert_eq!(named(&said(&format!("{key} 10.0.0.7")), Some(key)), Some([10, 0, 0, 7].into()), "the lakes server, with its key");
+        assert_eq!(named(&said("0123456789abcdef0124 10.0.0.7"), Some(key)), None, "another process here, with a key of its own");
+        assert_eq!(named(&said("10.0.0.7"), Some(key)), None, "an address alone");
+        assert_eq!(named(&said(&format!("{key} 10.0.0.7")), None), None, "a node no server gave a key (or a connection from another machine)");
+        let there = Peer { addr: SocketAddr::from(([10, 0, 0, 2], 9)), tls: true, signed: false, local: false };
+        assert_eq!(there.client(&said(&format!("{key} 10.0.0.7"))).to_string(), "10.0.0.2", "another machine's word isn't taken");
+    }
+
+    #[test]
+    fn a_trusted_proxy_names_its_client_and_no_one_else_does() {
+        let lb: std::net::IpAddr = [10, 0, 0, 2].into();
+        let ours = ranges("10.0.0.0/24, fd00::/8").unwrap();
+        let said = |v: &str| { let mut h = axum::http::HeaderMap::new(); h.insert("x-forwarded-for", v.parse().unwrap()); h };
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(forwarded(&said("203.0.113.9"), lb, &ours), Some(ip("203.0.113.9")), "the client our load balancer names");
+        assert_eq!(forwarded(&said("1.2.3.4, 203.0.113.9, 10.0.0.3"), lb, &ours), Some(ip("203.0.113.9")), "past our own proxies, not the client's own word before it");
+        assert_eq!(forwarded(&said("203.0.113.9:5123"), lb, &ours), Some(ip("203.0.113.9")), "with a port");
+        assert_eq!(forwarded(&said("203.0.113.9"), ip("192.0.2.1"), &ours), None, "from anyone else, not taken");
+        assert_eq!(forwarded(&said("not an address"), lb, &ours), None, "a hop that isn't an address");
+        assert_eq!(forwarded(&said("10.0.0.3"), lb, &ours), None, "only our proxies named: the connection's own address");
+        assert_eq!(forwarded(&said("203.0.113.9"), ip("::ffff:10.0.0.2"), &ours), Some(ip("203.0.113.9")), "an IPv4 proxy seen over IPv6");
+        assert_eq!(forwarded(&said("2001:db8::1"), ip("fd00::5"), &ours), Some(ip("2001:db8::1")), "IPv6 ranges");
+        assert_eq!(forwarded(&said("203.0.113.9"), lb, &[]), None, "none trusted by default");
+        assert!(ranges("0.0.0.0/0").unwrap().iter().all(|r| within(ip("8.8.8.8"), *r)), "a range of every address");
+        for bad in ["10.0.0.0/33", "lb.internal", "10.0.0.0/x"] {
+            assert!(ranges(bad).is_err(), "{bad} refused at start");
+        }
+    }
+
+    #[test]
+    fn a_plain_connection_from_this_machine_may_send_a_password() {
+        let local = SocketAddr::from(([127, 0, 0, 1], 9));
+        assert!(may_send_password(false, local));
+        assert!(Peer { addr: local, tls: false, signed: false, local: true }.may_send_password());
+    }
 }
 
 /// Postgres: is a client taken, TLS or not (`pg.rs`, `dbserver.rs`)?
@@ -124,6 +270,20 @@ pub fn pg_allowed(secure: bool, addr: SocketAddr) -> bool { Peer { addr, tls: se
 
 /// What a refused plain connection is told.
 pub const PLAIN: &str = "this node takes TLS from other machines (https://, sslmode=require, security.protocol=SSL)";
+
+/// What a password refused on a plain connection from another machine is told (`may_send_password`).
+pub const PASSWORD_PLAIN: &str = "a password crosses only TLS from another machine: use https://, or a token";
+
+/// The header `pondra serve --lakes` names its client's address in, on what it forwards to a database's
+/// node: that node sees only the server, on this machine (`Peer::client`). It reads `<key> <address>`,
+/// with the key the server gave the node in `CLIENT_KEY`, so no other process here can name an address.
+pub const CLIENT: &str = "x-pondra-client";
+
+/// The variable the lakes server gives each database's node the key of its `CLIENT` header in.
+pub const CLIENT_KEY: &str = "PONDRA_CLIENT_KEY";
+
+/// The proxies whose word for their clients' addresses is taken (`proxies`).
+pub const TRUSTED_PROXIES: &str = "PONDRA_TRUSTED_PROXIES";
 
 /// Postgres's acceptor, for `pgwire::tokio::process_socket`.
 pub fn pg() -> Option<tokio_rustls::TlsAcceptor> { tls().map(|t| t.other.clone()) }

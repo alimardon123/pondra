@@ -1806,6 +1806,26 @@ async fn created(dir: &str, c: &ast::CreateTable) -> Result<Option<()>> {
     }
 }
 
+/// The lake's key for its nodes, for `pondra sql` with no token. A leader makes it beside serving
+/// (C5), so one that has just started may not have it in the bucket yet: while one leads and the key
+/// isn't there, the lake is read again every 200 ms, for 10 s at most (a node a program started
+/// answers nothing without it: S21).
+async fn cli_key(lake: &Lake) -> Option<String> {
+    for _ in 0..50 {
+        if let Ok(k) = crate::users::node_key(lake).await {
+            return Some(k);
+        }
+        let led = matches!(latest(&lake.store).await, Ok(Some(t)) if !t.addr.is_empty() && alive(&lake.store, &t).await);
+        match crate::users::kept(lake).await {
+            "none" if led => {} // (not made yet: wait for them)
+            _ => return crate::users::node_key(lake).await.ok(), // (made meanwhile, or no leader to wait for)
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        lake.refresh().await.ok()?;
+    }
+    None
+}
+
 async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
     let job = std::env::var("PONDRA_JOB").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
     std::env::set_var("PONDRA_JOB", &job); // (if fenced, the process restarts: the same job again)
@@ -1818,7 +1838,7 @@ async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
             if ["PONDRA_TOKEN", "PONDRA_ADMIN_TOKEN", "PONDRA_NODE_KEY"].iter().all(|v| std::env::var(v).map_or(true, |t| t.is_empty())) {
                 // (no token: the lake's own key for its nodes, which whoever holds the lake can read; a
                 // leader on the network answers nothing unsigned. `cluster::http` sends it.)
-                if let Ok(k) = crate::users::node_key(&target).await {
+                if let Some(k) = cli_key(&target).await {
                     std::env::set_var("PONDRA_NODE_KEY", k);
                 }
             }

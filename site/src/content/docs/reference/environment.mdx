@@ -28,7 +28,8 @@ A number that is left unset, or set to something that is not a number, takes its
 | `PONDRA_SESSION_HOURS` | 12 | how long a user's session lasts (`POST /login`, a Flight handshake) |
 | `PONDRA_TLS_CERT`, `PONDRA_TLS_KEY` | none | a PEM certificate and its key, when `--tls-cert` and `--tls-key` are not given: every door takes [TLS](/pondra/guides/security/#tls), and nodes call each other over HTTPS |
 | `PONDRA_TLS_CA` | none | the authority that signed the nodes' certificates, when `--tls-ca` is not given: nodes show theirs to each other (mutual TLS), and the nodes' own key is taken only with one it signed |
-| `PONDRA_TLS` | plain from this machine only | `optional`: a node with a certificate takes plain connections from anywhere too |
+| `PONDRA_TLS` | plain from this machine only | `optional`: a node with a certificate takes plain connections from anywhere too, so clients can move to TLS: a token may cross them, a password never (HTTP Basic and `POST /login` get 403 there, naming https) |
+| `PONDRA_TRUSTED_PROXIES` | none | your own load balancers, ingresses or reverse proxies, as addresses and ranges (`10.0.0.0/8,192.168.1.5`). A request from one of them is counted by the client it names in `X-Forwarded-For` (the last address there that isn't one of these), so one client's failed sign-ins lock a user out only for that client. A name that isn't an address stops the node at start |
 | `PONDRA_AUDIT` | `role,ddl,function` | what the [audit log](/pondra/guides/security/#the-audit-log) keeps, by class: `role`, `ddl`, `function`, `write`, `read`, `misc`, `all`, or `off`. Refusals are always kept |
 | `PONDRA_AUDIT_DAYS` | `90` | how many days `pondra.audit` keeps. Read when the log is first made |
 | `PONDRA_HISTORY` | on | `off`: this node writes nothing to `pondra.history`, the row every statement leaves |
@@ -195,7 +196,8 @@ Do not set these. Pondra sets them for its own processes, and some are copies of
 
 | Variable | Set by | Meaning |
 |---|---|---|
-| `PONDRA_OWNER_KEY` | the shell, `pondra.local()` and `local()` in JavaScript | a random key that lets the program that started a node read files on this machine through it. Nobody else may |
+| `PONDRA_OWNER_KEY` | the shell, `pondra.local()` and `local()` in JavaScript | a random key: the node answers only the program that started it (and tokens and signed-in users), and lets that program read files on this machine through it. Nobody else may |
+| `PONDRA_CLIENT_KEY` | `pondra serve` on a folder of lakes, for each database's node | the key the server names each client's address with (`x-pondra-client`), so the node counts failed sign-ins by client and knows a page on this machine. A node takes that header only with this key |
 | `PONDRA_PUBLISH`, `PONDRA_CHANGELOG_SECS`, `PONDRA_FSYNC`, `PONDRA_REPLICAS` | `pondra serve`, from `--publish`, `--changelog-secs`, `--fsync`, `--ack` and `--replicas` | the flags' values, for the rest of the node. Setting them in the environment has no effect: `serve` overwrites them. Use the flags |
 | `PONDRA_TRIES` | `pondra sql` | how many times a write has started over after another node took the lake |
 | `PONDRA_SERVER_URL` | `pondra serve` on a folder of lakes, for each database's node | where the process that serves the folder is, for `DROP DATABASE` |
