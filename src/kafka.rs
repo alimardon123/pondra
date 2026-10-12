@@ -348,7 +348,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
     for _ in 0..r.len()? {
         let name = r.str()?;
         let meta: Option<TableMeta> = app.lake.cat.get::<TableMeta>(&table_key(&name)).await?.map(|m| m.logical()); // (JSON fields by SQL's names: ADR-022)
-        let allowed = who.role >= Role::Write && who.may("insert", &name);
+        let allowed = who.role >= Role::Write && crate::auth::WHO.sync_scope(who.clone(), || crate::auth::check_rows(&crate::auth::catalog_name(&name))).is_ok(); // (the row doors' one check)
         let mut parts = vec![];
         for _ in 0..r.len()? {
             let (index, records) = (r.i32()?, r.nbytes()?.unwrap_or_default());

@@ -50,8 +50,15 @@ impl Principal {
     /// May it use `privilege` on `table` (as SQL names it)? (Its role decides what kind of thing.)
     pub fn may(&self, privilege: &str, table: &str) -> bool { self.access.as_ref().is_none_or(|a| a.may(privilege, &catalog_name(table))) }
 
-    /// May it read every column of `table`? (What a stream of its rows needs: Kafka, Flight, lookups.)
-    pub fn may_read_all(&self, table: &str) -> bool { self.access.as_ref().is_none_or(|a| a.columns("select", &catalog_name(table)) == Some(None)) }
+    /// May it read every column of `table`? (What a stream of its rows needs: Kafka, Flight, lookups.) A
+    /// hidden table (the lake's records, a table's old versions) only a superuser streams: SQL reads the
+    /// records through `pondra.audit` and `pondra.history`, which show a user its own statements only.
+    pub fn may_read_all(&self, table: &str) -> bool {
+        if crate::sys::hidden(table) {
+            return self.role == Role::Admin && self.access.is_none();
+        }
+        self.access.as_ref().is_none_or(|a| a.columns("select", &catalog_name(table)) == Some(None))
+    }
 }
 
 tokio::task_local! {
@@ -83,6 +90,7 @@ pub fn carried<F: std::future::Future>(f: F) -> impl std::future::Future<Output 
 /// May the request being served read every column of `table`? Refused with why, if not.
 pub fn check_all(table: &str) -> Result<()> {
     match current() {
+        Some(p) if !p.may_read_all(table) && crate::sys::hidden(table) => bail!("permission denied: {table} is Pondra's own, and its rows stream to a superuser only"),
         Some(p) if !p.may_read_all(table) => bail!("permission denied: SELECT on every column of {table}, which a stream of its rows needs (GRANT SELECT ON {table} TO {})", p.name),
         _ => Ok(()),
     }
@@ -154,8 +162,9 @@ pub fn cross_site(h: &axum::http::HeaderMap, method: &axum::http::Method, from: 
 static MACHINE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(sysinfo::System::host_name);
 
 /// May the request being served add rows to `table` (as the catalog names it) through a door that
-/// takes rows, not SQL (`/append`, `/insert`)? Its INSERT grant, as SQL's `INSERT` asks; and never a
-/// system table (`$` in its name: `pondra$audit`, `t$deleted`), which only Pondra writes.
+/// takes rows, not SQL (`/append`, `/insert`, Flight's DoPut and ingest, Kafka's produce)? Its INSERT
+/// grant, as SQL's `INSERT` asks; and never a system table (`$` in its name: `pondra$audit`,
+/// `t$deleted`), which only Pondra writes.
 pub fn check_rows(table: &str) -> Result<()> {
     ensure!(!table.contains('$'), "{table} is written by Pondra alone");
     check("insert", table)
@@ -353,6 +362,7 @@ impl Auth {
             });
         }
         let (t, privileges) = needs(stmt);
+        ensure!(!crate::sys::hidden(&t), "{t} is written by Pondra alone"); // (the lake's records, a table's old versions: superusers too)
         privileges.iter().try_for_each(|p| check(p, &t))
     }
 }
