@@ -485,7 +485,7 @@ pub fn parse(url: &str) -> Result<(String, String)> {
 
 /// A client of the cluster at `url`, with the secret covering it (kept: its connections too).
 pub async fn client(lake: &crate::store::Lake, url: &str) -> Result<Arc<Client>> {
-    static CLIENTS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Arc<Client>>>> = std::sync::LazyLock::new(Default::default);
+    crate::per_node!(static CLIENTS: std::sync::Mutex<HashMap<String, Arc<Client>>> = Default::default());
     let (brokers, _) = parse(url)?;
     let secret = crate::ext::secret_for(lake, url).await?;
     let key = format!("{brokers}|{}", secret.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()).unwrap_or_default());

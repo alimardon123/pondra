@@ -5,6 +5,8 @@
 // The parts every build has, a browser's too (feature `server` off): SQL's functions and
 // rewrites that need no lake.
 pub mod finish;
+pub mod env;
+pub mod reset;
 pub mod fsum;
 pub mod intervals;
 pub mod xlsx;
@@ -71,6 +73,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod objects;
 #[cfg(feature = "server")] mod once;
 #[cfg(feature = "server")] mod metrics;
+#[cfg(feature = "server")] pub mod node;
 #[cfg(feature = "server")] mod optimize;
 #[cfg(feature = "server")] mod pages;
 #[cfg(feature = "server")] mod panics;

@@ -300,7 +300,7 @@ pub async fn apply(ctx: SessionContext) -> Result<SessionContext> {
 pub fn dialect() -> Option<Box<dyn datafusion::sql::sqlparser::dialect::Dialect>> {
     const KEY: &str = "datafusion.sql_parser.dialect";
     let session = crate::temp::current().and_then(|s| crate::temp::with(&s, false, |s| Ok(s.settings.get(KEY).cloned())).ok().flatten());
-    let node = || std::env::var("PONDRA_SQL_OPTIONS").ok()?.split(',').find_map(|kv| Some(kv.trim().split_once('=').filter(|(k, _)| *k == KEY)?.1.to_string()));
+    let node = || crate::env::get("PONDRA_SQL_OPTIONS")?.split(',').find_map(|kv| Some(kv.trim().split_once('=').filter(|(k, _)| *k == KEY)?.1.to_string()));
     datafusion::sql::sqlparser::dialect::dialect_from_str(session.or_else(node)?)
 }
 

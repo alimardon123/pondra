@@ -9,7 +9,7 @@
 //! another's request for it answers 410 as if it were gone.
 use datafusion::arrow::record_batch::RecordBatch;
 use std::collections::VecDeque;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 struct Kept {
@@ -20,10 +20,10 @@ struct Kept {
     used: Instant,
 }
 
-static KEPT: LazyLock<Mutex<VecDeque<Kept>>> = LazyLock::new(Default::default);
+crate::per_node!(static KEPT: Mutex<VecDeque<Kept>> = Default::default());
 const IDLE: Duration = Duration::from_secs(20 * 60);
 
-fn budget() -> usize { std::env::var("PONDRA_PAGES_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256) << 20 }
+fn budget() -> usize { crate::env::or::<usize>("PONDRA_PAGES_MB", 256) << 20 }
 
 /// Keep an answer: its id, or none when it alone is bigger than the budget.
 pub fn keep(batches: &[RecordBatch]) -> Option<String> {

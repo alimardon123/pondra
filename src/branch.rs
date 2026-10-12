@@ -484,12 +484,10 @@ pub async fn sweep(lake: &Lake) -> Result<()> {
 }
 
 /// How long a base keeps a pin on lease that isn't renewed (`PONDRA_PIN_LEASE_SECS`, 14 days).
-fn lease_ms() -> u64 { secs("PONDRA_PIN_LEASE_SECS", 14 * 86_400) * 1000 }
+fn lease_ms() -> u64 { crate::env::or::<u64>("PONDRA_PIN_LEASE_SECS", 14 * 86_400) * 1000 }
 
 /// How often a branch renews its pins on lease (`PONDRA_PIN_RENEW_SECS`, an hour).
-pub fn renew_every() -> std::time::Duration { std::time::Duration::from_secs(secs("PONDRA_PIN_RENEW_SECS", 3600)) }
-
-fn secs(name: &str, default: u64) -> u64 { std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default) }
+pub fn renew_every() -> std::time::Duration { std::time::Duration::from_secs(crate::env::or::<u64>("PONDRA_PIN_RENEW_SECS", 3600)) }
 
 /// A base's leader, each retention round: a pin on lease that wasn't renewed within
 /// `PONDRA_PIN_LEASE_SECS` goes. Its branch is on another server, which this lake can't look at

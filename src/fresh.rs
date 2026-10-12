@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 type Kept = (Arc<dyn ExecutionPlan>, Arc<TaskContext>);
-static PLANS: Mutex<BTreeMap<String, Kept>> = Mutex::new(BTreeMap::new());
+crate::per_node!(static PLANS: Mutex<BTreeMap<String, Kept>> = Mutex::new(BTreeMap::new()));
 
 /// `sql` with table `source` standing for just `rows` (as columns `s`), `prepare` given its logical
 /// plan first (a row-by-row view carries its ids through it; `kind` names what it does). Another

@@ -33,7 +33,7 @@ use datafusion::physical_plan::{displayable, ExecutionPlan, ExecutionPlanPropert
 use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Tables smaller than this aren't worth spreading (`PONDRA_SPREAD_MB`, 256).
@@ -43,7 +43,7 @@ fn spread_bytes() -> u64 { mb("PONDRA_SPREAD_MB", 256) }
 /// (`PONDRA_BROADCAST_MB`, 64; 0 slices every table).
 fn broadcast_bytes() -> u64 { mb("PONDRA_BROADCAST_MB", 64) }
 
-fn mb(var: &str, default: u64) -> u64 { std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default) << 20 }
+fn mb(var: &str, default: u64) -> u64 { crate::env::or(var, default) << 20 }
 
 /// One table's share on one node: manifests and files, and maybe the log tail (after..=upto).
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -593,8 +593,9 @@ async fn abandon(nodes: &[String], me: &str) {
     futures::future::join_all(asks).await;
 }
 
-/// The id of the shuffle this node started last (for `abandon`).
-static LAST: LazyLock<Mutex<Option<String>>> = LazyLock::new(Default::default);
+crate::per_node!(
+    /// The id of the shuffle this node started last (for `abandon`).
+    static LAST: Mutex<Option<String>> = Default::default());
 
 /// One attempt, planned each way in turn (`How`) until one splits correctly — and pays (`guard`:
 /// the ways after it move more). Keyed tables, and tables of attached lakes, are always read whole.
@@ -645,7 +646,7 @@ async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tabl
                 forget(&job.id);
                 return Ok(refused("it wouldn't pay"));
             }
-            if std::env::var_os("PONDRA_DEBUG_SPREAD").is_some() {
+            if crate::env::is_set("PONDRA_DEBUG_SPREAD") {
                 let over = job.exchanges.iter().map(|x| displayable(x.plan.as_ref()).one_line().to_string().trim().to_string()).collect::<Vec<_>>();
                 eprintln!("spread: shuffled {how:?}{}: {over:?}", scheme.map(|s| format!(", by ranges of {:?}", s.columns)).unwrap_or_default());
             }
@@ -747,7 +748,7 @@ struct Subquery {
     from: usize,
 }
 
-static JOBS: LazyLock<Mutex<HashMap<String, Arc<Job>>>> = LazyLock::new(Default::default);
+crate::per_node!(static JOBS: Mutex<HashMap<String, Arc<Job>>> = Default::default());
 
 impl Drop for Job {
     /// What the job spilled goes with it (the coordinator clears its own as soon as the last step
@@ -768,7 +769,7 @@ pub fn forget(id: &str) {
     crate::spill::clear(id);
 }
 
-static DROPPED: LazyLock<Mutex<HashMap<String, std::time::Instant>>> = LazyLock::new(Default::default);
+crate::per_node!(static DROPPED: Mutex<HashMap<String, std::time::Instant>> = Default::default());
 
 /// Forget finished shuffles (and delete what they spilled). Runs every half minute on every node,
 /// so a node that took part in a shuffle frees its scratch without being asked.
@@ -843,7 +844,7 @@ impl Job {
 
 /// Why a query runs on one node after all (`PONDRA_DEBUG_SPREAD=1` prints it on stderr).
 pub fn refused<T>(why: impl std::fmt::Display) -> Option<T> {
-    if std::env::var_os("PONDRA_DEBUG_SPREAD").is_some() {
+    if crate::env::is_set("PONDRA_DEBUG_SPREAD") {
         eprintln!("spread: not spread: {why}");
     }
     None

@@ -336,13 +336,14 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
     });
 }
 
+crate::per_node!(
+    /// Is the leader's commit stream down (`mirror`)? A read-only node then looks for a new leader.
+    static STREAM_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
+
 /// Follower or read-only node: follow the leader's commit stream (see `store.rs`). If it breaks,
 /// reconnect; meanwhile our own catalog view keeps us correct, just a little behind. A follower
 /// (`replica`) of a leader that replicates commits also keeps every change on local disk and
 /// says so: that is what lets the leader acknowledge a write before the bucket has it.
-/// Is the leader's commit stream down (`mirror`)? A read-only node then looks for a new leader.
-static STREAM_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<ReplicaLog>>) {
     // Acks, coalesced: however many changes arrive meanwhile, one request says "up to here".
     let (held, mut to_ack) = tokio::sync::watch::channel((0u64, 0u64, 0u64)); // term, first, last
@@ -398,13 +399,12 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
 /// `harness.py guarded`, "a change a follower forwards…"). It waits 10 s at most, and not at all for a
 /// key sealed by a master key this node doesn't have: waiting won't help that one.
 pub async fn signed(lake: &crate::store::Lake) {
-    let set = |v: &str| std::env::var(v).is_ok_and(|t| !t.is_empty());
-    if set("PONDRA_TOKEN") || set("PONDRA_ADMIN_TOKEN") || set("PONDRA_NODE_KEY") {
+    if crate::env::is_set("PONDRA_TOKEN") || crate::env::is_set("PONDRA_ADMIN_TOKEN") || node_key().is_some() {
         return;
     }
     for _ in 0..40 {
         match crate::users::node_key(lake).await {
-            Ok(k) => return std::env::set_var("PONDRA_NODE_KEY", k),
+            Ok(k) => return set_node_key(k),
             Err(e) if format!("{e:#}").contains("master key") => return,
             Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
         }
@@ -417,17 +417,29 @@ pub fn http_bare() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| reqwest::Client::builder().build().unwrap_or_default())
 }
 
+// The lake's key for its nodes (`users::node_key`), once this node knows it: what it calls the others
+// with when no token is set. The node's, not the process's environment: the next node in a process
+// serves another lake, whose nodes are never sent this one's key, and no child process inherits it.
+crate::per_node!(static NODE_KEY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
+
+/// The key this node calls the others with: `PONDRA_NODE_KEY` as set, else the lake's own, once known.
+pub fn node_key() -> Option<String> {
+    crate::env::get("PONDRA_NODE_KEY").or_else(|| NODE_KEY.read().unwrap_or_else(|e| e.into_inner()).clone())
+}
+
+/// This node learned the lake's key for its nodes (`node.rs`).
+pub fn set_node_key(k: String) { *NODE_KEY.write().unwrap_or_else(|e| e.into_inner()) = Some(k); }
+
 /// One HTTP client (connection pool) for all node-to-node traffic. It carries this process's
 /// token: a node's is the admin token, else the lake's own key for its nodes (`users::node_key`,
 /// known once the lake is open: the client is made again then); a `pondra sql` writer's is
 /// `PONDRA_TOKEN`.
 pub fn http() -> reqwest::Client {
-    static CLIENT: std::sync::Mutex<Option<(Option<String>, reqwest::Client)>> = std::sync::Mutex::new(None);
-    // (a variable set empty is no token, as the node takes it: compose passes an unset one on empty,
+    crate::per_node!(static MINE: std::sync::Mutex<Option<(Option<String>, reqwest::Client)>> = std::sync::Mutex::new(None));
+    // (a variable set empty is no token, as `env::get` takes it: compose passes an unset one on empty,
     // and "Bearer " sent in place of the nodes' key left a follower unable to reach its leader)
-    let given = |v: &str| std::env::var(v).ok().filter(|t| !t.is_empty());
-    let token = given("PONDRA_TOKEN").or_else(|| given("PONDRA_ADMIN_TOKEN")).or_else(|| given("PONDRA_NODE_KEY"));
-    let mut client = CLIENT.lock().unwrap();
+    let token = crate::env::get("PONDRA_TOKEN").or_else(|| crate::env::get("PONDRA_ADMIN_TOKEN")).or_else(node_key);
+    let mut client = MINE.lock().unwrap();
     if let Some((t, c)) = client.as_ref().filter(|(t, _)| *t == token) {
         let _ = t;
         return c.clone();
@@ -506,10 +518,12 @@ pub async fn release(store: &Store, n: u64) {
     discard(held);
 }
 
-/// The lock files of the terms this process claimed (or took back after a restart), each locked until
-/// the term is let go (`release`) or the process ends, however it ends: the OS lets go then. Keyed by
-/// term number. (A process holds one claim per term number: one lake at a time.)
-static HELD: Mutex<BTreeMap<u64, (PathBuf, std::fs::File)>> = Mutex::new(BTreeMap::new());
+crate::per_node!(
+    /// The lock files of the terms this node claimed (or took back after a restart), each locked until
+    /// the term is let go (`release`), the node's state is dropped as it stops (`reset`), or the process
+    /// ends, however it ends: the OS lets go at whichever comes first. Keyed by term number. (A node
+    /// holds one claim per term number: one lake at a time.)
+    static HELD: Mutex<BTreeMap<u64, (PathBuf, std::fs::File)>> = Mutex::new(BTreeMap::new()));
 
 /// This user's folder of claim lock files, in the temp folder: per user on macOS and Windows, and
 /// named by the user's id on Linux, where `/tmp` is shared. Made 0700, and used only while it is
@@ -648,6 +662,12 @@ async fn stepped_down(store: &Store, n: u64) -> bool { store.head(&Path::from(fo
 /// Re-run this same binary with the same arguments: the new process re-reads its role.
 /// (By the path it was started with: if the binary was upgraded in place, the new one starts.)
 pub fn restart(why: &str) -> ! {
+    restart_with(why, &[])
+}
+
+/// `restart`, with settings of the command line's own for the next run (`pondra sql`'s job and its
+/// tries: `env.rs`), on top of what this process was given.
+pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
     eprintln!("restarting to rejoin the cluster: {why}");
     // (our claims' lock files say we're coming back: an exec, or a new process on Windows, lets go of
     // them for a moment, and nobody here may take that for our end: `gone_here`)
@@ -656,14 +676,14 @@ pub fn restart(why: &str) -> ! {
     }
     let mut args = std::env::args_os();
     let mut cmd = std::process::Command::new(args.next().expect("argv[0]"));
-    cmd.args(args);
+    cmd.args(args).envs(crate::env::given()).envs(carried.iter().map(|(k, v)| (k, v)));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         panic!("restart failed: {}", cmd.exec()); // replaces this process; only returns on failure
     }
     #[cfg(not(unix))]
-    if std::env::var_os("PONDRA_SUPERVISED").is_some() {
+    if crate::env::is_set("PONDRA_SUPERVISED") {
         std::process::exit(75); // (`pondra service`'s supervisor starts it again: one node, as exec keeps it elsewhere)
     }
     #[cfg(not(unix))]

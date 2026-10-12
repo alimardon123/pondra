@@ -134,7 +134,7 @@ static OUTSIDE: std::sync::LazyLock<Mutex<Outside>> = std::sync::LazyLock::new(|
     Mutex::new(Outside { seen, ranges: lru::LruCache::unbounded(), bytes: 0 })
 });
 
-fn files_cache_bytes() -> usize { std::env::var("PONDRA_FILES_CACHE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(512) << 20 }
+fn files_cache_bytes() -> usize { crate::env::or("PONDRA_FILES_CACHE_MB", 512usize) << 20 }
 
 #[derive(Debug)]
 pub struct CachedStore {

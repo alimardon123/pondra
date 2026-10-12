@@ -469,17 +469,17 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                 branches = now.cat.scan::<crate::branch::Pin>("pn/", "pn0").await?.into_iter().map(|(_, p)| p.lake).collect();
             }
             ensure!(branches.is_empty(), "{name} has branches ({}): drop them first", branches.join(", "));
-            if target.is_none() && if_exists && std::env::var("PONDRA_SERVER_URL").is_err() {
+            if target.is_none() && if_exists && !crate::env::is_set("PONDRA_SERVER_URL") {
                 return Ok(j!({"database": name, "dropped": false, "notice": format!("database \"{name}\" does not exist, skipping")}));
             }
-            let dropped = match (std::env::var("PONDRA_SERVER_URL"), &bases, &target) {
-                (Ok(server), ..) => {
+            let dropped = match (crate::env::get("PONDRA_SERVER_URL"), &bases, &target) {
+                (Some(server), ..) => {
                     let r = crate::cluster::http().delete(format!("{server}/databases/{name}?if_exists={if_exists}")).send().await?;
                     let (ok, text) = (r.status().is_success(), r.text().await?);
                     ensure!(ok, "{text}");
                     serde_json::from_str(&text)?
                 }
-                (Err(_), Some(_), Some(t)) => {
+                (None, Some(_), Some(t)) => {
                     // A branch: its own objects alone are its (its bases' files are theirs).
                     delete_lake(&t.url).await?;
                     if lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_some() {
@@ -700,8 +700,9 @@ pub async fn attach_found(home: &Lake, folder: &str, me: &str) -> Vec<String> {
     found
 }
 
-/// The lakes this process attached because the catalog said so, per home lake.
-static FROM_SQL: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+crate::per_node!(
+    /// The lakes this process attached because the catalog said so, per home lake.
+    static FROM_SQL: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new()));
 
 /// Attach here the lakes the catalog lists (`ATTACH`), and let go of those it no longer does
 /// (`DETACH`). Lakes attached with `--attach` stay. One that can't be opened is skipped (and

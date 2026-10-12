@@ -103,7 +103,7 @@ pub fn operator() -> bool { current().is_some_and(|p| p.operator) }
 /// Does a node in this process take tokens? (Then nothing it serves is open, attached lakes included.)
 pub fn tokens_on() -> bool { TOKENS.load(std::sync::atomic::Ordering::Relaxed) }
 
-static TOKENS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+crate::per_node!(static TOKENS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
 
 /// The header that carries, with a change a node sends its leader, the user it is for: the leader
 /// runs it as that user, so its subqueries read with the user's grants, as where it came in. Only the
@@ -387,7 +387,7 @@ pub fn catalog_name(t: &str) -> String {
     }
 }
 
-static LENT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Lent>>> = std::sync::LazyLock::new(Default::default);
+crate::per_node!(static LENT: std::sync::Mutex<std::collections::HashMap<String, Lent>> = Default::default());
 
 pub fn lend(role: Role, files: bool) -> Lease {
     let token = format!("lease-{}", uuid::Uuid::new_v4().simple());
@@ -448,7 +448,11 @@ pub struct Guesses {
     failures: std::sync::Mutex<std::collections::HashMap<(std::net::IpAddr, String), std::collections::VecDeque<std::time::Instant>>>,
 }
 
-static GUESSED: std::sync::LazyLock<Guesses> = std::sync::LazyLock::new(Default::default);
+// (a node's own: two nodes in one process count apart, ADR-061 §3)
+crate::per_node!(static GUESSED: Guesses = Guesses::default(); clear = |g| {
+    let taken = std::mem::take(&mut *g.failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    drop(taken);
+});
 
 /// Seconds to wait before this address may try this user name again, when it has had ten failures in
 /// the last minute (None: it may try). A door that can't tell the address counts under 0.0.0.0.

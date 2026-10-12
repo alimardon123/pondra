@@ -172,7 +172,7 @@ pub struct Delegated {
 /// when the credentials change (a store keeps what it read of each file's version).
 fn stored(root: &str, made: &str, make: impl FnOnce() -> Result<Arc<dyn object_store_df::ObjectStore>>) -> Result<Arc<dyn object_store_df::ObjectStore>> {
     type Made = HashMap<String, (String, Arc<dyn object_store_df::ObjectStore>)>;
-    static MADE: Mutex<Option<Made>> = Mutex::new(None);
+    crate::per_node!(static MADE: Mutex<Option<Made>> = Mutex::new(None));
     if let Some((m, s)) = MADE.lock().unwrap().get_or_insert_default().get(root) {
         if m == made {
             return Ok(s.clone());

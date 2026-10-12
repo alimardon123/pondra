@@ -29,7 +29,7 @@ use std::sync::Arc;
 /// - a join whose smaller side is under 32 MB builds one hash table that every thread probes,
 ///   instead of shuffling both sides by key.
 pub fn config(mut config: SessionConfig) -> SessionConfig {
-    let user = std::env::var("PONDRA_SQL_OPTIONS").unwrap_or_default();
+    let user = crate::env::get("PONDRA_SQL_OPTIONS").unwrap_or_default();
     let defaults = "datafusion.sql_parser.parse_float_as_decimal=true,\
         datafusion.execution.time_zone=+00:00,\
         datafusion.optimizer.hash_join_single_partition_threshold=33554432,\
@@ -56,7 +56,7 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
         *r = Arc::new(crate::asof::KeepOuter(r.clone()));
     }
     let at = rules.iter().position(|r| r.name() == "push_down_filter").map_or(rules.len(), |i| i + 1);
-    let ordered = std::env::var("PONDRA_JOIN_ORDER").as_deref() != Ok("0");
+    let ordered = crate::env::get("PONDRA_JOIN_ORDER").as_deref() != Some("0");
     rules.insert(at, Arc::new(GroupOnlyJoined));
     if ordered {
         rules.insert(at, Arc::new(JoinOrder)); // (after the filters are down: they say how big each input is)
@@ -982,7 +982,7 @@ struct JoinOrder;
 /// default). The estimates are bounds, not counts, so a small difference between two orders is
 /// not a reason to overrule the one the query asked for.
 fn margin() -> u64 {
-    std::env::var("PONDRA_JOIN_ORDER").ok().and_then(|m| m.parse().ok()).unwrap_or(2).max(1)
+    crate::env::or::<u64>("PONDRA_JOIN_ORDER", 2).max(1)
 }
 
 impl OptimizerRule for JoinOrder {
@@ -1032,7 +1032,7 @@ impl OptimizerRule for JoinOrder {
         }
         // Both costed the same way.
         let (Some((_, was)), Some((now, order))) = (as_written(&plan, equality)?, best) else { return Ok(Transformed::no(plan)) };
-        if std::env::var_os("PONDRA_DEBUG_JOIN_ORDER").is_some() {
+        if crate::env::is_set("PONDRA_DEBUG_JOIN_ORDER") {
             let named: Vec<String> = leaves.iter().zip(&sizes).map(|(l, s)| format!("{} ({} rows{})", l.display(), s.rows, if s.learned { ", learned" } else { "" })).collect();
             eprintln!("join order: as written {was} rows moved, {now} in the order {order:?} of {named:?}");
         }

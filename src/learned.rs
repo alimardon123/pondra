@@ -245,7 +245,7 @@ struct Known {
     reading: bool,
 }
 
-static KNOWN: LazyLock<RwLock<Known>> = LazyLock::new(Default::default);
+crate::per_node!(static KNOWN: RwLock<Known> = Default::default());
 const KEPT: usize = 20_000; // (facts at most: a few MB)
 
 fn known() -> std::sync::RwLockReadGuard<'static, Known> { KNOWN.read().unwrap_or_else(|e| e.into_inner()) }
@@ -254,7 +254,7 @@ fn known_mut() -> std::sync::RwLockWriteGuard<'static, Known> { KNOWN.write().un
 /// Whether the planner uses this node's facts (`PONDRA_LEARN=on`; by default they are learned and
 /// kept, not used).
 fn on() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| matches!(std::env::var("PONDRA_LEARN").as_deref(), Ok("on" | "1" | "true")));
+    static ON: LazyLock<bool> = LazyLock::new(|| crate::env::flag("PONDRA_LEARN"));
     *ON
 }
 
@@ -444,8 +444,10 @@ fn refresh() {
         }
     }
     let done = Done;
-    let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
-    rt.spawn(async move {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    crate::panics::task(async move {
         let _done = done;
         // (rows reach the history a second or so after their runs, in any order: a minute back again)
         match read(&lake, since.saturating_sub(60_000_000)).await {
@@ -494,7 +496,7 @@ struct Runs {
     aside: bool,
 }
 
-static RUNS: LazyLock<Mutex<lru::LruCache<u64, Runs>>> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())));
+crate::per_node!(static RUNS: Mutex<lru::LruCache<u64, Runs>> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
 
 /// A query by its words, without its comments and spacing: asked again with a note in a comment (as
 /// tools and dashboards do), it is the same query. Its literals stay: other values filter otherwise.

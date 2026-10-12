@@ -71,7 +71,7 @@ impl ReplicaLog {
         let o = st.open.as_mut().expect("open");
         o.0.write_all(&term.to_le_bytes())?;
         o.0.write_all(&frame)?; // (the page cache survives a process crash; `--fsync`: a power loss too)
-        if std::env::var("PONDRA_FSYNC").is_ok_and(|v| v == "true") {
+        if crate::env::flag("PONDRA_FSYNC") {
             o.0.sync_data()?;
         }
         o.3 = o.3.max(d.id);
@@ -202,7 +202,7 @@ pub fn members(lake: Arc<Lake>, cluster: Arc<crate::cluster::Cluster>) {
 
 /// Where this node keeps its replica files: next to its SSD tier, per lake and per node.
 pub fn dir(lake_url: &str, addr: &str) -> PathBuf {
-    let base = std::env::var("PONDRA_CACHE_DIR").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("pondra-cache"));
+    let base = crate::env::get("PONDRA_CACHE_DIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("pondra-cache"));
     let clean = |s: &str| s.trim_start_matches("s3://").replace(['/', ':', '\\'], "_");
     base.join(format!("{}.replica", clean(lake_url))).join(clean(addr))
 }

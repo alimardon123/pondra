@@ -16,7 +16,8 @@ use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::Result;
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use crate::reset::Once;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 pub const TABLE: &str = "pondra$audit";
@@ -44,7 +45,7 @@ fn columns() -> Vec<(String, String)> {
 /// Leader: the table, made the first time a node has a line for it (`Ddl::AuditLog`).
 pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
     if lake.cat.get::<TableMeta>(&table_key(TABLE)).await?.is_none() {
-        let days: u64 = std::env::var("PONDRA_AUDIT_DAYS").ok().and_then(|d| d.parse().ok()).unwrap_or(90);
+        let days: u64 = crate::env::or("PONDRA_AUDIT_DAYS", 90);
         let meta = TableMeta { columns: columns(), ttl: Some(("at".into(), days * 86400)), tiered: lake.visible(), ..Default::default() };
         lake.cat.commit(vec![(table_key(TABLE), json(&meta))], &[]).await?;
     }
@@ -55,7 +56,7 @@ pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
 fn classes() -> &'static [String] {
     static C: OnceLock<Vec<String>> = OnceLock::new();
     C.get_or_init(|| {
-        let v = std::env::var("PONDRA_AUDIT").unwrap_or_else(|_| "role,ddl,function".into()).to_lowercase();
+        let v = crate::env::get("PONDRA_AUDIT").unwrap_or_else(|| "role,ddl,function".into()).to_lowercase();
         v.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()
     })
 }
@@ -268,13 +269,13 @@ fn log(app: &App, class: &'static str, statement: String, outcome: &'static str,
     write(app, Line { at: crate::log::now_ms(), user, door, from, class, statement, outcome, message, ms });
 }
 
-static WRITER: OnceLock<tokio::sync::mpsc::UnboundedSender<Line>> = OnceLock::new();
+crate::per_node!(static WRITER: RwLock<Option<tokio::sync::mpsc::UnboundedSender<Line>>> = RwLock::new(None));
 
 fn write(app: &App, line: Line) {
     if app.log.is_none() {
         return; // (a read-only node writes nothing: its own log says it)
     }
-    let tx = WRITER.get_or_init(|| crate::history::writer(app, TABLE, crate::ddl::Ddl::AuditLog, Duration::from_millis(50), batch));
+    let tx = WRITER.get_or(|| crate::history::writer(app, TABLE, crate::ddl::Ddl::AuditLog, Duration::from_millis(50), batch));
     let _ = tx.send(line);
 }
 

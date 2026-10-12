@@ -19,7 +19,7 @@ use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 /// A function's definition, as `POST /functions/<name>` gives it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -45,14 +45,14 @@ pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
 }
 
 type Cache = Mutex<HashMap<String, (std::time::Instant, Arc<Vec<(String, Udf)>>)>>;
-static SEEN: OnceLock<Cache> = OnceLock::new();
+crate::per_node!(static SEEN: Cache = Default::default());
 
 /// A function made or dropped here: the next query sees it (other nodes, within a second).
-pub fn forget(lake: &Lake) { SEEN.get_or_init(Default::default).lock().unwrap().remove(&lake.url); }
+pub fn forget(lake: &Lake) { SEEN.lock().unwrap().remove(&lake.url); }
 
 /// The lake's functions, as of a moment ago.
 async fn listed(lake: &Lake) -> Result<Arc<Vec<(String, Udf)>>> {
-    let seen = SEEN.get_or_init(Default::default);
+    let seen = &*SEEN;
     if let Some((at, fns)) = seen.lock().unwrap().get(&lake.url) {
         if at.elapsed() < std::time::Duration::from_secs(1) {
             return Ok(fns.clone());
@@ -116,8 +116,8 @@ async fn exchange(url: &str, batch: RecordBatch) -> Result<ArrayRef> {
 
 /// Connections are kept: one per server, shared by every query (gRPC multiplexes them).
 async fn channel(url: &str) -> Result<tonic::transport::Channel> {
-    static OPEN: OnceLock<Mutex<HashMap<String, tonic::transport::Channel>>> = OnceLock::new();
-    let open = OPEN.get_or_init(Default::default);
+    crate::per_node!(static OPEN: Mutex<HashMap<String, tonic::transport::Channel>> = Default::default());
+    let open = &*OPEN;
     if let Some(c) = open.lock().unwrap().get(url) {
         return Ok(c.clone());
     }
