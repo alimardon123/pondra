@@ -8704,12 +8704,14 @@ def begin():
     """Transactions (ADR-036 §5) and Postgres's error codes (§4): BEGIN … COMMIT as one commit
     from HTTP (a session), Python (`with con.transaction()`) and the Postgres port, on the leader
     and on a follower; reads see their own writes, others don't until COMMIT; ROLLBACK; a failed
-    statement fails the transaction (25P02); two transactions changing one row: the second is
-    refused with 40001; transfers between accounts from 8 clients at once, retried on 40001, keep the
-    total; a view follows every commit; constraints and errors with their SQLSTATE on every door."""
+    statement fails the transaction (25P02); two REPEATABLE READ transactions changing one row: the
+    second is refused with 40001; transfers between accounts from 8 clients at once (READ COMMITTED,
+    the default: they wait for each other's rows), retried on 40001 or 40P01, keep the total; a view
+    follows every commit; constraints and errors with their SQLSTATE on every door. `waits` checks the
+    locks themselves."""
     import psycopg
     lake = new_lake()
-    pga, pgb = A.port + 2000, A.port + 2001
+    pga, pgb = A.port + 100, A.port + 101  # (the Postgres ports: inside the 9500–9699 range the shared machine allows)
     a = Node(lake, A.port, tier_secs=0.5, pg=f"127.0.0.1:{pga}").start()
     b = Node(lake, A.port + 1, tier_secs=0.5, pg=f"127.0.0.1:{pgb}").start()
     q = lambda s, port=A.port: sql(port, s)
@@ -8726,6 +8728,16 @@ def begin():
     q("INSERT INTO prices VALUES ('tea', 3), ('cake', 5)")
     q("CREATE MATERIALIZED VIEW total AS SELECT 1 AS k, sum(balance) AS s, count(*) AS n FROM accounts GROUP BY 1")
     checks = {}
+    # A session name that isn't 8 to 128 letters, digits, - or _ is refused and says what one is (22023), never
+    # ignored: a BEGIN under one would run with no session at all (ADR-067 §10, `temp::of`).
+    short_id = http(A.port, "BEGIN", "dl-one")
+    long_id = http(A.port, "SELECT 1 AS one", "x" * 129)
+    odd_id = http(A.port, "SELECT 1 AS one", "bad name here")
+    good_id = http(A.port, "BEGIN", "session-ok-1")
+    http(A.port, "ROLLBACK", "session-ok-1")
+    checks["x-pondra-session of 8 to 128 letters, digits, - or _: a shorter, longer or other name is refused, saying what a name is (22023), never ignored; a name that is one works"] = \
+        short_id[:2] == (400, "22023") and "x-pondra-session: 8 to 128 letters, digits, - or _ (got 6)" in str(short_id[2]) \
+        and long_id[1] == "22023" and "(got 129)" in str(long_id[2]) and odd_id[1] == "22023" and good_id[0] == 200
     total = lambda port=A.port: q("SELECT sum(balance) AS s, count(*) AS n FROM accounts", port)[0]
     # Read your own writes; nobody else's until COMMIT; one commit.
     for port, where in ((A.port, "leader"), (A.port + 1, "follower")):
@@ -8734,7 +8746,7 @@ def begin():
         http(port, "UPDATE accounts SET balance = balance - 10 WHERE id = 1", s)
         http(port, "UPDATE accounts SET balance = balance + 10 WHERE id = 2", s)
         http(port, "INSERT INTO history VALUES (1, -10), (2, 10)", s)
-        http(port, "INSERT INTO prices VALUES ('tea', 4)", s)
+        http(port, "INSERT INTO prices VALUES ('tea', 4) ON CONFLICT (item) DO UPDATE SET price = excluded.price", s)  # (an upsert says so: a plain INSERT of an existing key is refused, 23505)
         mine = http(port, "SELECT id, balance FROM accounts WHERE id IN (1, 2) ORDER BY id", s)[2]
         theirs = q("SELECT id, balance FROM accounts WHERE id IN (1, 2) ORDER BY id", port)
         tea = http(port, "SELECT price FROM prices WHERE item = 'tea'", s)[2]
@@ -8765,14 +8777,15 @@ def begin():
     checks["a failed statement fails the transaction: 42P01, then 25P02 until it ends; COMMIT rolls it back"] = bad[1] == "42P01" and then[1] == "25P02" and end[2].get("transaction") == "rollback" and q("SELECT balance FROM accounts WHERE id = 3") == [{"balance": 1000}]
     # Two transactions change one row: the second to commit is refused, 40001.
     s1, s2 = "s-one-" + uuid.uuid4().hex[:8], "s-two-" + uuid.uuid4().hex[:8]
-    http(A.port, "BEGIN", s1); http(A.port + 1, "BEGIN", s2)
+    http(A.port, "BEGIN ISOLATION LEVEL REPEATABLE READ", s1); http(A.port + 1, "BEGIN ISOLATION LEVEL REPEATABLE READ", s2)
     http(A.port, "UPDATE accounts SET balance = balance + 5 WHERE id = 4", s1)
     http(A.port + 1, "UPDATE accounts SET balance = balance + 7 WHERE id = 4", s2)
     first, second = http(A.port, "COMMIT", s1), http(A.port + 1, "COMMIT", s2)
     checks["two transactions change one row: the first commits, the second gets 40001"] = first[0] == 200 and second[1] == "40001" and q("SELECT balance FROM accounts WHERE id = 4") == [{"balance": 1005}]
     # A keyed row: a one-key UPDATE in a transaction (no planning), and one changed since the snapshot.
     s1, s2 = "s-k1-" + uuid.uuid4().hex[:8], "s-k2-" + uuid.uuid4().hex[:8]
-    http(A.port, "BEGIN", s1); http(A.port + 1, "BEGIN", s2)
+    http(A.port, "BEGIN ISOLATION LEVEL REPEATABLE READ", s1); http(A.port + 1, "BEGIN ISOLATION LEVEL REPEATABLE READ", s2)
+    http(A.port + 1, "SELECT price FROM prices WHERE item = 'cake'", s2)  # (REPEATABLE READ's snapshot is its first statement's: before s1 commits)
     http(A.port, "UPDATE prices SET price = price + 1 WHERE item = 'cake'", s1)
     mine = http(A.port, "SELECT price FROM prices WHERE item = 'cake'", s1)[2]
     http(A.port, "COMMIT", s1)
@@ -8802,8 +8815,8 @@ def begin():
                         c.commit()
                         done[0] += 1
                         break
-                    except psycopg.errors.SerializationFailure:
-                        c.rollback(); retried[0] += 1
+                    except (psycopg.errors.SerializationFailure, psycopg.errors.DeadlockDetected):
+                        c.rollback(); retried[0] += 1  # (a deadlock is refused at once, as Postgres refuses it: retry)
                     except Exception as e:
                         c.rollback(); errors.append(str(e)[:200]); break
     ts = [threading.Thread(target=client, args=(k,)) for k in range(8)]
@@ -8846,6 +8859,127 @@ def begin():
         c.rollback()
         status.append(c.info.transaction_status.name)
     checks["the Postgres port reports the transaction's status (psycopg's IDLE, INTRANS, IDLE)"] = status == ["IDLE", "INTRANS", "IDLE"]
+    # DDL in a transaction runs at once, with a notice; savepoints (ADR-067 §8, §9): what dbt, pandas,
+    # SQLAlchemy and psycopg send. Each part uses names of its own (the tag), so the parts don't meet.
+    import pandas as pd, sqlalchemy as sa
+    dsn, tag, info = f"host=127.0.0.1 port={pga} user=u dbname=lake", uuid.uuid4().hex[:8], {}
+    ids = lambda t: sorted(r["id"] for r in q(f"SELECT id FROM {t}"))
+    def seed(c, name, end):  # BEGIN, CREATE TABLE, three INSERTs, then `end`: the notices the connection got
+        notes = []
+        c.add_notice_handler(lambda n: notes.append(n.message_primary))
+        c.execute("BEGIN")
+        c.execute(f"CREATE TABLE {name} (id INT, name VARCHAR)")
+        for i in (1, 2, 3):
+            c.execute(f"INSERT INTO {name} VALUES ({i}, 'n{i}')")
+        c.execute(end)
+        return notes
+    with psycopg.connect(dsn, autocommit=True) as c:  # dbt's seed, and COMMIT
+        notes = seed(c, f"seed_c_{tag}", "COMMIT")
+    checks["dbt's seed over psycopg: BEGIN, CREATE TABLE, three INSERTs, COMMIT: three rows, and the notice"] = ids(f"seed_c_{tag}") == [1, 2, 3] and any("CREATE TABLE ran at once" in m for m in notes)
+    with psycopg.connect(dsn, autocommit=True) as c:  # … and with ROLLBACK: the table stays, empty, and the notice says ROLLBACK won't undo it
+        notes = seed(c, f"seed_r_{tag}", "ROLLBACK")
+    checks["the same seed with ROLLBACK: the table is there and empty, and the notice says ROLLBACK won't undo it"] = ids(f"seed_r_{tag}") == [] and any("ROLLBACK won't undo it" in m for m in notes)
+    q(f"CREATE TABLE inc_{tag} (id INT, v INT)"); q(f"INSERT INTO inc_{tag} VALUES (1, 10), (2, 20)")
+    with psycopg.connect(dsn, autocommit=True) as c:  # dbt's incremental model: a temp table, a DELETE … USING it, an INSERT from it, COMMIT
+        for s in ["BEGIN", f"CREATE TEMP TABLE tmp_{tag} AS SELECT 2 AS id, 200 AS v UNION ALL SELECT 3, 300",
+                  f"DELETE FROM inc_{tag} USING tmp_{tag} WHERE inc_{tag}.id = tmp_{tag}.id", f"INSERT INTO inc_{tag} SELECT id, v FROM tmp_{tag}", "COMMIT"]:
+            c.execute(s)
+    rows = lambda: sorted((r["id"], r["v"]) for r in q(f"SELECT id, v FROM inc_{tag}"))
+    checks["dbt's incremental model: CREATE TEMP TABLE … AS, DELETE … USING it, INSERT … SELECT it, COMMIT: one change"] = rows() == [(1, 10), (2, 200), (3, 300)]
+    with psycopg.connect(dsn, autocommit=True) as c:  # … the same with ROLLBACK: the DELETE and the INSERT both undone
+        for s in ["BEGIN", f"DELETE FROM inc_{tag} WHERE id = 1", f"INSERT INTO inc_{tag} VALUES (4, 40)", "ROLLBACK"]:
+            c.execute(s)
+    checks["…and with ROLLBACK, its DELETE and INSERT are both undone"] = rows() == [(1, 10), (2, 200), (3, 300)]
+    with psycopg.connect(dsn, autocommit=True) as c:  # CREATE TABLE … AS in a transaction, then a kept INSERT
+        for s in ["BEGIN", f"CREATE TABLE ctas_{tag} AS SELECT id FROM inc_{tag} WHERE v >= 200", f"INSERT INTO ctas_{tag} VALUES (9)", "COMMIT"]:
+            c.execute(s)
+    checks["CREATE TABLE … AS in a transaction: its rows, and a kept INSERT after it, commit"] = ids(f"ctas_{tag}") == [2, 3, 9]
+    refused = {}  # the refusals: each by name, with its SQLSTATE and what to do
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("BEGIN"); c.execute(f"INSERT INTO inc_{tag} VALUES (5, 50)")
+        try:
+            c.execute(f"ALTER TABLE inc_{tag} ADD COLUMN x INT")
+        except psycopg.Error as e:
+            refused["written"] = (e.sqlstate, "COMMIT first" in str(e))
+        c.execute("ROLLBACK")
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        try:
+            c.execute(f"CREATE TABLE rr_{tag} (id INT)")
+        except psycopg.Error as e:
+            refused["repeatable"] = (e.sqlstate, "REPEATABLE READ" in str(e))
+        c.execute("ROLLBACK")
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("BEGIN READ ONLY")
+        try:
+            c.execute(f"CREATE TABLE ro_{tag} (id INT)")
+        except psycopg.Error as e:
+            refused["read only"] = e.sqlstate
+        c.execute("ROLLBACK")
+    checks["DDL on a table the transaction wrote: 0A000, saying COMMIT first; under REPEATABLE READ: 0A000, saying what to do; READ ONLY: 25006"] = \
+        refused == {"written": ("0A000", True), "repeatable": ("0A000", True), "read only": "25006"}
+    # Savepoints over psycopg's nested transactions: the inner one's writes and its error undone, the outer's kept.
+    q(f"CREATE TABLE sp_{tag} (id INT)")
+    with psycopg.connect(dsn, autocommit=True) as c:
+        with c.transaction():
+            c.execute(f"INSERT INTO sp_{tag} VALUES (1)")
+            try:
+                with c.transaction():
+                    c.execute(f"INSERT INTO sp_{tag} VALUES (2)")
+                    raise ValueError("inner")
+            except ValueError:
+                pass
+            try:
+                with c.transaction():
+                    c.execute(f"SELECT * FROM nope_{tag}")
+            except psycopg.errors.UndefinedTable:
+                pass
+            c.execute(f"INSERT INTO sp_{tag} VALUES (3)")
+    checks["savepoints over psycopg's nested transactions: the inner one's writes and its error undone, the outer's kept"] = ids(f"sp_{tag}") == [1, 3]
+    errs = {}
+    with psycopg.connect(dsn, autocommit=True) as c:
+        try:
+            c.execute("SAVEPOINT loose")
+        except psycopg.Error as e:
+            errs["outside"] = e.sqlstate
+        c.execute("BEGIN"); c.execute("SAVEPOINT here")
+        try:
+            c.execute("ROLLBACK TO SAVEPOINT nowhere")
+        except psycopg.Error as e:
+            errs["unknown"] = e.sqlstate
+        try:
+            c.execute("SELECT 1")
+        except psycopg.Error as e:
+            errs["after"] = e.sqlstate  # (an error aborts the transaction, as in Postgres)
+        c.execute("ROLLBACK")
+    checks["SAVEPOINT outside a transaction 25P01; ROLLBACK TO an unknown name 3B001, and the transaction is then failed (25P02)"] = errs == {"outside": "25P01", "unknown": "3B001", "after": "25P02"}
+    # pandas' to_sql over SQLAlchemy 2 on psycopg 3 and on psycopg2, and SQLAlchemy's create_all and begin_nested().
+    df = pd.DataFrame({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+    back = {}
+    for drv in ("psycopg", "psycopg2"):
+        eng = sa.create_engine(f"postgresql+{drv}://u@127.0.0.1:{pga}/lake")
+        df.to_sql(f"pd_{drv}_{tag}", eng, index=False)
+        back[drv] = pd.read_sql(f"SELECT id, name FROM pd_{drv}_{tag} ORDER BY id", eng).values.tolist() == df.values.tolist()
+        eng.dispose()
+    checks["pandas to_sql over SQLAlchemy on psycopg 3 and on psycopg2: the table made, its rows read back"] = back == {"psycopg": True, "psycopg2": True}
+    md = sa.MetaData()
+    t = sa.Table(f"sa_{tag}", md, sa.Column("id", sa.Integer, primary_key=True), sa.Column("v", sa.String(20)))
+    eng = sa.create_engine(f"postgresql+psycopg://u@127.0.0.1:{pga}/lake")
+    with eng.connect() as conn:
+        md.create_all(conn)
+        conn.commit()
+        with conn.begin_nested():
+            conn.execute(t.insert().values(id=1, v="a"))
+        try:
+            with conn.begin_nested():
+                conn.execute(t.insert().values(id=2, v="b"))
+                raise RuntimeError("inner")
+        except RuntimeError:
+            pass
+        conn.execute(t.insert().values(id=3, v="c"))
+        conn.commit()
+    eng.dispose()
+    checks["SQLAlchemy 2: create_all, then begin_nested() with one savepoint rolled back: rows 1 and 3"] = ids(f"sa_{tag}") == [1, 3]
     # A transaction that changed 12,000 keys reads its own rows: an OR per key made an expression 12,000 deep, and planning
     # it overflowed the stack and took the node down
     q("CREATE TABLE many (k BIGINT PRIMARY KEY, v BIGINT)")
@@ -8858,7 +8992,1024 @@ def begin():
         many == [[{"s": 12000, "n": 12000}], 200, [{"s": 12000}]]
     a.kill(); b.kill()
     ok = all(checks.values())
-    print(json.dumps({"begin": checks, "ok": ok, "info": {"transfers": done[0], "retried": retried[0], "errors": errors[:3], "codes": codes, "status": status, "many": many}}, indent=1, default=str))
+    print(json.dumps({"begin": checks, "ok": ok, "info": {"transfers": done[0], "retried": retried[0], "errors": errors[:3], "codes": codes, "status": status, "refused": refused, "errs": errs, "many": many}}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
+def autocommit():
+    """ADR-067 round 6 (rules 3, 6, 7). H2: a transaction whose UPDATE covers more than 10,000 rows locks none, so
+    a lock it takes later (SELECT … FOR UPDATE, then an UPDATE of that row) keeps the check point at its read, and
+    its COMMIT is refused with 40001 once another transaction changed the row (a keyed table and an append table).
+    Autocommit: 200 `UPDATE … v = v + 1` from the leader's Postgres port and 200 from the follower's, at once, add
+    up to 400; the same with two Python clients (a job each) add up to 400. Reports the follower's autocommit
+    point UPDATE p50 over 500 runs (for the binary in PONDRA_BIN, and for a comparison binary by a second run)."""
+    import psycopg
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
+    import pondra
+    lake = new_lake()
+    pga, pgb = A.port + 100, A.port + 101
+    a = Node(lake, A.port, tier_secs=0.5, pg=f"127.0.0.1:{pga}").start()
+    b = Node(lake, A.port + 1, tier_secs=0.5, pg=f"127.0.0.1:{pgb}").start()
+    q = lambda s, port=A.port: sql(port, s)
+    checks, info = {}, {}
+
+    def http(port, body, session=None):
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", body.encode(), {"x-pondra-session": session} if session else {})
+        r = c.getresponse()
+        data = r.read()
+        return r.status, r.getheader("x-pondra-sqlstate"), (json.loads(data) if data[:1] in (b"{", b"[") else data.decode())
+
+    q("CREATE TABLE big (k BIGINT PRIMARY KEY, v BIGINT)")
+    q("INSERT INTO big SELECT value AS k, 0 AS v FROM range(1, 12001)")  # (over LOCK_MAX: an UPDATE of all of them locks none)
+    q("CREATE TABLE bigapp (id BIGINT, v BIGINT)")
+    q("INSERT INTO bigapp SELECT value AS id, 0 AS v FROM range(1, 12001)")
+
+    def h2(table, all_rows, lock_sql, mine_sql, other_sql, sum_sql):
+        t1, t2 = f"h2-a-{uuid.uuid4().hex[:8]}", f"h2-b-{uuid.uuid4().hex[:8]}"
+        http(A.port, "BEGIN", t1)
+        big = http(A.port, all_rows, t1)
+        http(A.port, "BEGIN", t2)
+        other = http(A.port, other_sql, t2)
+        other_done = http(A.port, "COMMIT", t2)
+        locked = http(A.port, lock_sql, t1)
+        mine = http(A.port, mine_sql, t1)
+        done = http(A.port, "COMMIT", t1)
+        total = q(sum_sql)[0]["s"]
+        return big[0], other[0], other_done[0], locked[0], mine[0], done[1], total
+
+    keyed = h2("big", "UPDATE big SET v = v + 1", "SELECT k FROM big WHERE k = 1 FOR UPDATE",
+               "UPDATE big SET v = 5 WHERE k = 1", "UPDATE big SET v = 100 WHERE k = 1", "SELECT sum(v) AS s FROM big")
+    checks["H2, keyed: a transaction whose UPDATE covers 12,000 rows locks none; its FOR UPDATE and UPDATE of a row another transaction changed meanwhile: COMMIT 40001, and nothing of it lands"] = \
+        keyed == (200, 200, 200, 200, 200, "40001", 100)
+    append = h2("bigapp", "UPDATE bigapp SET v = v + 1", "SELECT id FROM bigapp WHERE id = 1 FOR UPDATE",
+                "UPDATE bigapp SET v = 5 WHERE id = 1", "UPDATE bigapp SET v = 100 WHERE id = 1", "SELECT sum(v) AS s FROM bigapp")
+    checks["H2, append: the same on an append table: COMMIT 40001, and nothing of it lands"] = append == (200, 200, 200, 200, 200, "40001", 100)
+
+    def batch(makers, n):
+        """Writers at once, each `n` one-row UPDATEs of the counter; returns the counter's value and any errors."""
+        q("UPDATE cnt SET v = 0 WHERE k = 1")
+        errs = []
+        def go(make):
+            try:
+                one = make()
+                for _ in range(n):
+                    one()
+            except Exception as e:  # (a failure is counted, not hidden)
+                errs.append(str(e)[:200])
+        threads = [threading.Thread(target=go, args=(f,)) for f in makers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return q("SELECT v FROM cnt WHERE k = 1")[0]["v"], errs
+
+    q("CREATE TABLE cnt (k BIGINT PRIMARY KEY, v BIGINT)")
+    q("INSERT INTO cnt VALUES (1, 0)")
+
+    def pg_writer(port):
+        def make():
+            conn = psycopg.connect(f"host=127.0.0.1 port={port} user=u dbname=lake", autocommit=True)
+            return lambda: conn.execute("UPDATE cnt SET v = v + 1 WHERE k = 1")
+        return make
+
+    def py_writer(port):
+        def make():
+            db = pondra.connect(f"http://127.0.0.1:{port}")
+            return lambda: db.sql("UPDATE cnt SET v = v + 1 WHERE k = 1")
+        return make
+
+    v, errs = batch([pg_writer(pga), pg_writer(pgb)], 200)
+    checks["autocommit: 200 UPDATEs from the leader's Postgres port and 200 from the follower's, at once: 400, no error"] = v == 400 and not errs
+    v, errs = batch([py_writer(A.port), py_writer(A.port + 1)], 200)
+    checks["autocommit: 200 from each of two Python clients (a job each, on the leader and a follower): 400, no error"] = v == 400 and not errs
+
+    # The follower's autocommit point UPDATE, 500 runs (the node in PONDRA_BIN, and by a second run the other binary).
+    lat = []
+    for _ in range(500):
+        t0 = time.perf_counter()
+        sql(A.port + 1, "UPDATE cnt SET v = v + 1 WHERE k = 1")
+        lat.append((time.perf_counter() - t0) * 1000)
+    lat.sort()
+    info["follower_autocommit_point_update_p50_ms"] = round(lat[len(lat) // 2], 3)
+    info["binary"] = BIN
+    ok = all(checks.values())
+    for node in (a, b):
+        node.kill()
+    print(json.dumps({"autocommit": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
+def round7():
+    """ADR-067 round 7: the gate (N1), refusals by name (N2), REPEATABLE READ's snapshot (N3, five times) and INSERT …
+    ON CONFLICT on an append table (N7). The nodes run with PONDRA_TEST_AUTOCOMMIT_PAUSE_MS=400: an autocommitted write
+    waits 400 ms after it works its rows out, with its locks held and its append in flight, so a MERGE of the same row
+    that comes meanwhile is the race. PONDRA_TEST_NO_GATE=1 (set in the environment) turns the gate off: the same run
+    then loses the MERGE, and the check expects that (the gate-off report). N9 is `waits`' idle COMMIT check."""
+    os.environ.setdefault("PONDRA_TEST_AUTOCOMMIT_PAUSE_MS", "400")
+    gate_off = os.environ.get("PONDRA_TEST_NO_GATE") is not None
+    lake = new_lake()
+    pga = A.port + 100
+    a = Node(lake, A.port, tier_secs=0.5, pg=f"127.0.0.1:{pga}").start()
+    q = lambda s, port=A.port: sql(port, s)
+    checks, info = {}, {"gate_off": gate_off}
+
+    def http(port, body, session=None):
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", body.encode(), {"x-pondra-session": session} if session else {})
+        r = c.getresponse()
+        data = r.read()
+        return r.status, r.getheader("x-pondra-sqlstate"), (json.loads(data) if data[:1] in (b"{", b"[") else data.decode())
+
+    # N1: an UPDATE of a keyed table (autocommitted) holds its row and its append is in flight for 400 ms. A MERGE of the
+    # same row meanwhile is a change under the lake's lock: with the gate it closes the table, waits for that append, and
+    # writes on top of it (10 + 10, then 100). Without the gate it reads the old row and writes 100 at once, and the
+    # UPDATE's append then lands over it: 20.
+    q("CREATE TABLE acct (id BIGINT PRIMARY KEY, bal BIGINT)")
+    q("INSERT INTO acct VALUES (1, 10)")
+    res = {}
+
+    def update():
+        t0 = time.time()
+        res["upd"] = http(A.port, "UPDATE acct SET bal = bal + 10 WHERE id = 1")
+        res["secs"] = round(time.time() - t0, 3)
+
+    t = threading.Thread(target=update)
+    t.start()
+    time.sleep(0.15)  # (the UPDATE is in its pause: its locks are held and its table is appending)
+    merged = http(A.port, "MERGE INTO acct t USING (SELECT 1 AS id, 100 AS bal) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET bal = s.bal")
+    t.join()
+    final = q("SELECT bal FROM acct WHERE id = 1")[0]["bal"]
+    info["n1"] = {"update": res["upd"][:2], "update_secs": res["secs"], "merge": merged[:2], "final": final}
+    checks["N1: an autocommitted UPDATE's append in flight when a MERGE of its row comes: the MERGE waits for the append and writes on top (100); with the gate off the UPDATE's append lands over the MERGE (20)"] = \
+        res["upd"][0] == 200 and merged[0] == 200 and final == (20 if gate_off else 100) and res["secs"] >= 0.35
+
+    # N2: an UPDATE of a key column, of a materialized view's table, and an UPDATE or DELETE of a merge table: refused by
+    # name (0A000), in a transaction and outside one.
+    q("CREATE TABLE totals (k VARCHAR PRIMARY KEY, n BIGINT, s BIGINT) WITH (merge = 'n:sum, s:sum')")  # (a merge table needs a function for every column but its key)
+    q("INSERT INTO totals VALUES ('a', 1, 1)")
+    q("CREATE TABLE apps (id BIGINT, v BIGINT)")
+    q("INSERT INTO apps VALUES (1, 1)")
+    q("CREATE MATERIALIZED VIEW apps_mv AS SELECT id, sum(v) AS total FROM apps GROUP BY id")
+    refused = {}
+    for name, stmt in [("key column", "UPDATE acct SET id = 2 WHERE id = 1"),
+                       ("view's table", "UPDATE apps_mv SET total = 5 WHERE id = 1"),
+                       ("merge table, UPDATE", "UPDATE totals SET n = 5 WHERE k = 'a'"),
+                       ("merge table, DELETE", "DELETE FROM totals WHERE k = 'a'")]:
+        outside = http(A.port, stmt)
+        tx = f"round7-n2-{len(refused)}"  # (a session name is 8 to 128 characters)
+        http(A.port, "BEGIN", tx)
+        inside = http(A.port, stmt, tx)
+        http(A.port, "ROLLBACK", tx)
+        refused[name] = [outside[1], inside[1]]
+    info["n2"] = refused
+    checks["N2: an UPDATE of a key column, of a materialized view's table, and an UPDATE or DELETE of a merge table: refused by name (0A000), in a transaction and outside one"] = \
+        all(v == ["0A000", "0A000"] for v in refused.values())
+    checks["N2: the acct row is unchanged by the refused key UPDATE (its id is still 1)"] = q("SELECT count(*) AS n FROM acct WHERE id = 1")[0]["n"] == 1
+
+    # N7: two transactions insert id 5 into an append table with ON CONFLICT (id) DO NOTHING. The second waits for the
+    # first's lock (its conflict target), and after the first COMMITs it reads that row and does nothing: one row.
+    q("CREATE TABLE onc (id BIGINT, v VARCHAR)")
+    t1, t2 = "round7-n7-first", "round7-n7-second"
+    http(A.port, "BEGIN", t1)
+    first = http(A.port, "INSERT INTO onc (id, v) VALUES (5, 'a') ON CONFLICT (id) DO NOTHING", t1)
+    http(A.port, "BEGIN", t2)
+    second = {}
+    th = threading.Thread(target=lambda: second.update(r=http(A.port, "INSERT INTO onc (id, v) VALUES (5, 'b') ON CONFLICT (id) DO NOTHING", t2)))
+    th.start()
+    time.sleep(0.5)
+    waited = th.is_alive()  # (still waiting for the first transaction's lock)
+    committed1 = http(A.port, "COMMIT", t1)
+    th.join(20)
+    committed2 = http(A.port, "COMMIT", t2)
+    onc_rows = q("SELECT count(*) AS n FROM onc WHERE id = 5")[0]["n"]
+    info["n7"] = {"first": first[:2], "second_waited": waited, "second": second.get("r", ("none",))[:2], "commit1": committed1[:2], "commit2": committed2[:2], "rows": onc_rows}
+    checks["N7: two transactions insert id 5 into an append table with ON CONFLICT (id) DO NOTHING: the second waits for the first's lock, and one row is there after both COMMIT"] = \
+        first[0] == 200 and waited and second.get("r", (0,))[0] == 200 and committed1[0] == 200 and committed2[0] == 200 and onc_rows == 1
+
+    # N3: a locking read in REPEATABLE READ keeps the snapshot BEGIN saw: a row another transaction changed after it is still
+    # read as it was by the transaction's next statement. Five runs, each on a table of its own.
+    runs = []
+    for run in range(5):
+        tab, r = f"rr{run}", f"round7-n3-{run}"
+        q(f"CREATE TABLE {tab} (id BIGINT PRIMARY KEY, v BIGINT)")
+        q(f"INSERT INTO {tab} VALUES (1, 0), (2, 0)")
+        http(A.port, "BEGIN ISOLATION LEVEL REPEATABLE READ", r)
+        before = http(A.port, f"SELECT v FROM {tab} WHERE id = 2", r)
+        other = http(A.port, f"UPDATE {tab} SET v = 5 WHERE id = 2")  # (autocommitted, after the transaction's snapshot)
+        locked = http(A.port, f"SELECT v FROM {tab} WHERE id = 1 FOR UPDATE", r)
+        after = http(A.port, f"SELECT v FROM {tab} WHERE id = 2", r)
+        done = http(A.port, "COMMIT", r)
+        seen = after[2][0]["v"] if after[0] == 200 and isinstance(after[2], list) and after[2] else None
+        runs.append({"before": before[2][0]["v"] if before[0] == 200 else before[:2], "locked": locked[0], "after": seen, "commit": done[0]})
+        runs[-1]["ok"] = before[0] == 200 and other[0] == 200 and locked[0] == 200 and seen == 0 and done[0] == 200
+    info["n3_runs"] = runs
+    checks["N3: REPEATABLE READ: a FOR UPDATE after another transaction's commit doesn't move the snapshot; the next read of a row it changed still shows the snapshot's value (0), in five runs"] = \
+        all(r["ok"] for r in runs) and len(runs) == 5
+
+    ok = all(checks.values())
+    a.kill()
+    print(json.dumps({"round7": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
+def waits():
+    """ADR-067 (transactions that wait): READ COMMITTED is the default, and a write locks the rows it
+    changes on the leader until its transaction ends. Checked: SHOW says what runs, and SERIALIZABLE is
+    refused by name; a write waits for another transaction's keyed row and append row, and writers
+    queued for one row are served first come, first served; a READ COMMITTED statement reads a commit
+    made after BEGIN, a REPEATABLE READ one doesn't; two transactions each waiting for the other's row:
+    the one that would close the loop gets 40P01 at once, and the other goes on; lock_timeout gives
+    55P03 (on the leader and through a follower) and the transaction refuses (25P02) until it ends; a
+    closed connection lets its locks go; eight clients' transfers under READ COMMITTED are never refused
+    with 40001 and keep the total; REPEATABLE READ's second commit gets 40001; READ ONLY refuses writes.
+    Round 35 (ADR-067 §3–§6) adds: READ ONLY through a comment and a WITH; a view's and a merge table's
+    refusals; SELECT … FOR UPDATE (waits, NOWAIT, SKIP LOCKED, plain outside a transaction, REPEATABLE
+    READ's changed row, refused shapes, an ORM's read-then-write); a comment before a transaction word,
+    over psql and HTTP; leases of 2 s with a session idle 5 s on a follower; the idle end at 2 s (a second
+    writer gets the row at once over HTTP and the Postgres port, the idle session's next statements are
+    refused 25P03 until ROLLBACK, and its UPDATE never lands)."""
+    import psycopg
+    lake = new_lake()
+    pga, pgb = A.port + 100, A.port + 101  # (the Postgres ports: inside the 9500–9699 range the shared machine allows)
+    a = Node(lake, A.port, tier_secs=0.5, pg=f"127.0.0.1:{pga}").start()
+    b = Node(lake, A.port + 1, tier_secs=0.5, pg=f"127.0.0.1:{pgb}").start()
+    checks, info, opened = {}, {}, []
+
+    def pg(port=pga):
+        c = psycopg.connect(f"host=127.0.0.1 port={port} user=u dbname=lake", autocommit=True)
+        opened.append(c)
+        return c
+
+    def code(c, stmt):
+        """The statement's SQLSTATE, or "ok" when it ran."""
+        try:
+            c.execute(stmt)
+            return "ok"
+        except psycopg.Error as e:
+            return getattr(e, "sqlstate", None) or str(e)[:80]
+
+    def in_thread(c, stmt):
+        """`stmt` on `c` in a thread, since it may wait: the thread, and what it got (`code`, `secs`)."""
+        out = {}
+        def go():
+            t0 = time.time()
+            out["code"] = code(c, stmt)
+            out["secs"] = round(time.time() - t0, 3)
+        th = threading.Thread(target=go)
+        th.start()
+        return th, out
+
+    def failure(c, stmt):
+        """The statement's SQLSTATE and its message, or ("ok", "") when it ran."""
+        try:
+            c.execute(stmt)
+            return "ok", ""
+        except psycopg.Error as e:
+            return getattr(e, "sqlstate", None) or "?", str(e)
+
+    def http(port, body, session=None):
+        """POST /sql: the status, the SQLSTATE header and the answer (JSON when it is)."""
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", body.encode(), {"x-pondra-session": session} if session else {})
+        r = c.getresponse()
+        data = r.read()
+        return r.status, r.getheader("x-pondra-sqlstate"), (json.loads(data) if data[:1] in (b"{", b"[") else data.decode())
+
+    q = lambda s, port=A.port: sql(port, s)
+    bal = lambda i, port=A.port: q(f"SELECT balance FROM accounts WHERE id = {i}", port)[0]["balance"]
+    price = lambda: q("SELECT price FROM prices WHERE item = 'cake'")[0]["price"]
+    q("CREATE TABLE accounts (id BIGINT, balance BIGINT CHECK (balance >= -1000))")
+    q("CREATE TABLE history (account BIGINT, delta BIGINT)")
+    q("CREATE TABLE prices (item VARCHAR PRIMARY KEY, price BIGINT)")
+    q("INSERT INTO accounts SELECT value AS id, 1000 AS balance FROM range(1, 31)")  # (ids up to 30: the checks below name 21 to 25)
+    q("INSERT INTO prices VALUES ('cake', 5)")
+
+    # The defaults, and the levels that aren't built.
+    c = pg()
+    shown = [c.execute(f"SHOW {n}").fetchone()[0] for n in ("transaction_isolation", "default_transaction_isolation", "transaction_read_only")]
+    checks["READ COMMITTED is the default: SHOW says read committed, and read-write"] = shown == ["read committed", "read committed", "off"]
+    c.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    rr_shown = c.execute("SHOW transaction_isolation").fetchone()[0]
+    c.execute("ROLLBACK")
+    refused = [code(c, "BEGIN ISOLATION LEVEL SERIALIZABLE"), code(c, "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE"), code(c, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")]
+    checks["REPEATABLE READ is what SHOW says it is; SERIALIZABLE is refused by name (0A000) in BEGIN, SET SESSION and SET TRANSACTION"] = rr_shown == "repeatable read" and refused == ["0A000"] * 3
+
+    # A keyed row: the second writer waits for the first's COMMIT, then adds to the price it left.
+    c1, c2 = pg(), pg()
+    c1.execute("BEGIN"); c1.execute("UPDATE prices SET price = price + 1 WHERE item = 'cake'")
+    c2.execute("BEGIN")
+    th, w = in_thread(c2, "UPDATE prices SET price = price + 10 WHERE item = 'cake'")
+    time.sleep(0.5)
+    waiting = th.is_alive()
+    c1.execute("COMMIT"); th.join(30); c2.execute("COMMIT")
+    checks["a keyed row: a write for a row another transaction holds waits for its COMMIT, then adds to the price left (5 + 1 + 10)"] = waiting and w["code"] == "ok" and price() == 16
+
+    # Queued for one row: first come, first served.
+    c1.execute("BEGIN"); c1.execute("UPDATE prices SET price = price + 1 WHERE item = 'cake'")
+    order = []
+    def turn(conn, name):
+        conn.execute("BEGIN")
+        conn.execute("UPDATE prices SET price = price + 1 WHERE item = 'cake'")
+        order.append(name)
+        conn.execute("COMMIT")
+    ths = []
+    for name in ("first", "second", "third"):
+        ths.append(threading.Thread(target=turn, args=(pg(), name)))
+        ths[-1].start()
+        time.sleep(0.5)  # (each one queues behind the one before)
+    queued = all(t.is_alive() for t in ths)
+    c1.execute("COMMIT")
+    [t.join(30) for t in ths]
+    checks["writers queued for one row are served first come, first served (each COMMIT lets the next in): 16 + 1 + 3"] = queued and order == ["first", "second", "third"] and price() == 20
+
+    # An append row, by its _row_id.
+    c1.execute("BEGIN"); c1.execute("UPDATE accounts SET balance = balance + 5 WHERE id = 4")
+    c2.execute("BEGIN")
+    th, w = in_thread(c2, "UPDATE accounts SET balance = balance + 5 WHERE id = 4")
+    time.sleep(0.5)
+    waiting = th.is_alive()
+    c1.execute("COMMIT"); th.join(30); c2.execute("COMMIT")
+    checks["an append row: the same wait, by its _row_id, and the balance left: 1000 + 5 + 5"] = waiting and w["code"] == "ok" and bal(4) == 1010
+
+    # What a statement reads: READ COMMITTED reads what committed after BEGIN; REPEATABLE READ doesn't.
+    c1.execute("BEGIN")
+    rc_before = c1.execute("SELECT balance FROM accounts WHERE id = 7").fetchone()[0]
+    c2.execute("UPDATE accounts SET balance = balance - 1 WHERE id = 7")
+    rc_after = c1.execute("SELECT balance FROM accounts WHERE id = 7").fetchone()[0]
+    c1.execute("COMMIT")
+    c3 = pg()
+    c3.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    rr_before = c3.execute("SELECT balance FROM accounts WHERE id = 8").fetchone()[0]
+    c2.execute("UPDATE accounts SET balance = balance - 1 WHERE id = 8")
+    rr_after = c3.execute("SELECT balance FROM accounts WHERE id = 8").fetchone()[0]
+    c3.execute("COMMIT")
+    checks["a READ COMMITTED statement reads a commit made after BEGIN; REPEATABLE READ's reads don't move"] = (rc_before, rc_after, rr_before, rr_after) == (1000, 999, 1000, 1000)
+
+    # Each waiting for the other's row: the loop is refused at once; the other goes on when it ends.
+    c1.execute("BEGIN"); c1.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 10")
+    c2.execute("BEGIN"); c2.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 11")
+    th, w = in_thread(c1, "UPDATE accounts SET balance = balance + 1 WHERE id = 11")  # waits for c2
+    time.sleep(0.5)
+    t0 = time.time()
+    loop = code(c2, "UPDATE accounts SET balance = balance + 1 WHERE id = 10")  # would close the loop
+    info["deadlock_refused_secs"] = round(time.time() - t0, 3)
+    c2.execute("ROLLBACK")
+    th.join(30)
+    c1.execute("COMMIT")
+    checks["two transactions each waiting for the other's row: the one that would close the loop gets 40P01 at once, and the other goes on"] = \
+        loop == "40P01" and info["deadlock_refused_secs"] < 1 and w["code"] == "ok" and q("SELECT id, balance FROM accounts WHERE id IN (10, 11) ORDER BY id") == [{"id": 10, "balance": 1001}, {"id": 11, "balance": 1001}]
+
+    # lock_timeout: on the leader, and through a follower (the leader answers the timeout).
+    c1.execute("BEGIN"); c1.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 12")
+    c2.execute("SET lock_timeout = '200ms'"); c2.execute("BEGIN")
+    t0 = time.time()
+    timed = code(c2, "UPDATE accounts SET balance = balance + 1 WHERE id = 12")
+    secs = time.time() - t0
+    after_timeout = code(c2, "SELECT 1")
+    c2.execute("ROLLBACK")
+    c3 = pg(pgb)
+    c3.execute("SET lock_timeout = '200ms'"); c3.execute("BEGIN")
+    timed_on_follower = code(c3, "UPDATE accounts SET balance = balance + 1 WHERE id = 12")
+    c3.execute("ROLLBACK")
+    c1.execute("COMMIT")
+    info["lock_timeout_secs"] = round(secs, 3)
+    checks["lock_timeout: a wait past it gives 55P03 (on the leader and through a follower); the transaction then refuses (25P02) until it ends"] = \
+        timed == "55P03" and 0.15 <= secs < 5 and after_timeout == "25P02" and timed_on_follower == "55P03"
+
+    # A closed connection lets its locks go.
+    c4 = pg()
+    c4.execute("BEGIN"); c4.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 13")
+    c4.close()
+    time.sleep(0.5)
+    c2.execute("SET lock_timeout = '2s'"); c2.execute("BEGIN")
+    t0 = time.time()
+    got = code(c2, "UPDATE accounts SET balance = balance + 1 WHERE id = 13")
+    secs = time.time() - t0
+    c2.execute("COMMIT")
+    checks["a closed connection lets its locks go: the next transaction's write doesn't wait for them, and only its own +1 lands"] = got == "ok" and secs < 1.5 and bal(13) == 1001
+
+    # REPEATABLE READ: no waiting, and the second commit of one row gets 40001.
+    c1.execute("BEGIN ISOLATION LEVEL REPEATABLE READ"); c2.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    c1.execute("UPDATE accounts SET balance = balance + 5 WHERE id = 15")
+    c2.execute("UPDATE accounts SET balance = balance + 7 WHERE id = 15")
+    first, second = code(c1, "COMMIT"), code(c2, "COMMIT")
+    checks["REPEATABLE READ: no waiting; the first to commit a row wins, the second gets 40001"] = first == "ok" and second == "40001" and bal(15) == 1005
+
+    # READ ONLY, per transaction and by default.
+    c5 = pg()
+    c5.execute("BEGIN READ ONLY")
+    ro = code(c5, "UPDATE accounts SET balance = balance + 1 WHERE id = 16")
+    ro_next = code(c5, "SELECT 1")  # (Postgres aborts the transaction too)
+    c5.execute("ROLLBACK")
+    c5.execute("BEGIN READ ONLY")
+    ro_read = c5.execute("SELECT balance FROM accounts WHERE id = 16").fetchone()[0]
+    c5.execute("COMMIT")
+    c5.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+    shown_ro = c5.execute("SHOW transaction_read_only").fetchone()[0]
+    default_ro = c5.execute("SHOW default_transaction_read_only").fetchone()[0]
+    outside = code(c5, "UPDATE accounts SET balance = balance + 1 WHERE id = 16")
+    c5.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
+    wrote = code(c5, "UPDATE accounts SET balance = balance + 1 WHERE id = 16")
+    c5.execute("SET default_transaction_read_only = on")
+    via_set = code(c5, "UPDATE accounts SET balance = balance + 1 WHERE id = 16")
+    checks["READ ONLY: a write refused (25006) and ends the transaction (25P02 after); default_transaction_read_only refuses writes outside one; SHOW says so"] = \
+        ro == "25006" and ro_next == "25P02" and ro_read == 1000 and shown_ro == "on" and default_ro == "on" and outside == "25006" and wrote == "ok" and via_set == "25006"
+
+    # Eight clients on both nodes, READ COMMITTED: transfers wait for each other's rows (and deadlocks
+    # are refused, and retried); none is refused with 40001, and the total is kept.
+    base = q("SELECT sum(balance) AS s FROM accounts")[0]["s"]
+    stop, done, errors, refused_retries = time.time() + 6, [0], [], []
+    def client(k):
+        rng = random.Random(k)
+        with pg(pga if k % 2 == 0 else pgb) as conn:
+            while time.time() < stop:
+                x, y, d = rng.randrange(1, 21), rng.randrange(1, 21), rng.randrange(1, 50)
+                if x == y:
+                    continue
+                for _ in range(50):
+                    try:
+                        conn.execute("BEGIN")
+                        conn.execute(f"UPDATE accounts SET balance = balance - {d} WHERE id = {x}")
+                        conn.execute(f"UPDATE accounts SET balance = balance + {d} WHERE id = {y}")
+                        conn.execute(f"INSERT INTO history VALUES ({x}, {-d}), ({y}, {d})")
+                        conn.execute("COMMIT")
+                        done[0] += 1
+                        break
+                    except psycopg.Error as e:
+                        conn.execute("ROLLBACK")
+                        refused_retries.append(e.sqlstate)
+                        if e.sqlstate not in ("40001", "40P01"):
+                            errors.append(str(e)[:200])
+                            break
+    ts = [threading.Thread(target=client, args=(k,)) for k in range(8)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    h = q("SELECT count(*) AS n, sum(delta) AS s FROM history")[0]
+    total = q("SELECT sum(balance) AS s FROM accounts")[0]["s"]
+    info["transfers"] = {"done": done[0], "refused_and_retried": {k: refused_retries.count(k) for k in sorted(set(refused_retries))}, "errors": errors[:3]}
+    checks["8 clients' transfers under READ COMMITTED on both nodes: none refused with 40001, the total kept, one history row each"] = \
+        refused_retries.count("40001") == 0 and total == base and h["s"] == 0 and h["n"] == 2 * done[0] and done[0] > 0 and not errors
+
+    # (a) READ ONLY holds whatever the statement's text starts with: a comment, or a WITH in front of a write.
+    c6 = pg()
+    c6.execute("BEGIN READ ONLY")
+    ro_comment = failure(c6, "/* c */ INSERT INTO history VALUES (902, 1)")
+    c6.execute("ROLLBACK")
+    c6.execute("BEGIN READ ONLY")
+    ro_with = failure(c6, "WITH x AS (SELECT 1 AS a) INSERT INTO history SELECT a, a FROM x")
+    c6.execute("COMMIT")  # (a failed transaction's COMMIT is a ROLLBACK: nothing is kept)
+    checks["READ ONLY refuses a write that a comment or a WITH in front of it hides (25006), and nothing of it is committed"] = \
+        ro_comment[0] == "25006" and ro_with[0] == "25006" and q("SELECT count(*) AS n FROM history WHERE account IN (902)")[0]["n"] == 0
+
+    # (c) A view's table and a merge table each say what they are; an INSERT into a merge table adds up.
+    # (with count(*): a view that follows accounts must drop its emptied groups, so the later UPDATEs of accounts pass)
+    q("CREATE MATERIALIZED VIEW bal_by_id AS SELECT id, sum(balance) AS total, count(*) AS n FROM accounts GROUP BY id")
+    q("CREATE TABLE mt (k VARCHAR PRIMARY KEY, n BIGINT) WITH (merge = 'n:sum')")
+    c7 = pg()
+    c7.execute("BEGIN")
+    view_msg = failure(c7, "UPDATE bal_by_id SET total = 1 WHERE id = 1")
+    c7.execute("ROLLBACK")
+    c7.execute("BEGIN")
+    merge_msg = failure(c7, "UPDATE mt SET n = 1 WHERE k = 'a'")
+    c7.execute("ROLLBACK")
+    c7.execute("BEGIN")
+    c7.execute("INSERT INTO mt VALUES ('a', 1)")
+    c7.execute("INSERT INTO mt VALUES ('a', 2)")
+    c7.execute("COMMIT")
+    merged = q("SELECT n FROM mt WHERE k = 'a'")
+    checks["a view's table and a merge table are refused by what they are (0A000, saying which); an INSERT into a merge table in a transaction adds up (3)"] = \
+        view_msg[0] == "0A000" and "is a view's" in view_msg[1] and merge_msg[0] == "0A000" and "is a merge table" in merge_msg[1] and merged == [{"n": 3}]
+
+    # (b) SET, then SET TRANSACTION in the same transaction: SET isn't a query, so the level still changes.
+    c8 = pg()
+    c8.execute("BEGIN")
+    c8.execute("SET lock_timeout = '1s'")
+    set_tx = code(c8, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+    set_tx_shown = c8.execute("SHOW transaction_isolation").fetchone()[0]
+    c8.execute("ROLLBACK")
+    checks["SET, then SET TRANSACTION in the same transaction: not refused (SET isn't a query); SHOW says repeatable read"] = set_tx == "ok" and set_tx_shown == "repeatable read"
+
+    # (d) SELECT … FOR UPDATE: waits for the holder's COMMIT and reads what it committed; NOWAIT; SKIP LOCKED;
+    # outside a transaction a plain read; the weaker locks; RR's changed row; refused shapes; an ORM's read-then-write.
+    before17 = bal(17)  # (the transfers above may have moved it: compare with what it was before this check)
+    c1.execute("BEGIN")
+    c1.execute("SELECT balance FROM accounts WHERE id = 17 FOR UPDATE")
+    c1.execute("UPDATE accounts SET balance = balance + 5 WHERE id = 17")
+    seen = {}
+    def reader():
+        conn = pg()
+        conn.execute("BEGIN")
+        t0 = time.time()
+        seen["row"] = conn.execute("SELECT balance FROM accounts WHERE id = 17 FOR UPDATE").fetchone()[0]
+        seen["secs"] = round(time.time() - t0, 3)
+        conn.execute("COMMIT")
+    th = threading.Thread(target=reader)
+    th.start()
+    time.sleep(0.5)
+    waiting = th.is_alive()
+    c1.execute("COMMIT")
+    th.join(30)
+    info["for_update_wait"] = {"before": before17, "read": seen.get("row"), "waited_secs": seen.get("secs")}
+    checks["SELECT … FOR UPDATE: a second one of the same row waits for the first's COMMIT, then reads what it committed (+5)"] = waiting and seen.get("row") == before17 + 5
+
+    c1.execute("BEGIN"); c1.execute("SELECT balance FROM accounts WHERE id = 18 FOR UPDATE")
+    c2.execute("BEGIN")
+    t0 = time.time()
+    nowait = code(c2, "SELECT balance FROM accounts WHERE id = 18 FOR UPDATE NOWAIT")
+    nowait_secs = round(time.time() - t0, 3)
+    c2.execute("ROLLBACK")
+    c1.execute("COMMIT")
+    checks["SELECT … FOR UPDATE NOWAIT: a row another transaction holds is refused at once (55P03)"] = nowait == "55P03" and nowait_secs < 1
+
+    c2.execute("BEGIN")
+    skip_in = code(c2, "SELECT balance FROM accounts WHERE id = 19 FOR UPDATE SKIP LOCKED")
+    c2.execute("ROLLBACK")
+    skip_out = code(c2, "SELECT balance FROM accounts WHERE id = 19 FOR UPDATE SKIP LOCKED")
+    checks["SKIP LOCKED is refused by name (0A000), in a transaction and outside one"] = skip_in == "0A000" and skip_out == "0A000"
+
+    before20 = bal(20)
+    plain = c2.execute("SELECT balance FROM accounts WHERE id = 20 FOR UPDATE").fetchall()
+    checks["SELECT … FOR UPDATE outside a transaction is a plain read: it returns the row"] = plain == [(before20,)]
+
+    c3 = pg()
+    c3.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    c3.execute("SELECT balance FROM accounts WHERE id = 20")  # (its snapshot is taken by its first statement: before the commit below)
+    q("UPDATE accounts SET balance = balance + 1 WHERE id = 21")  # (committed after c3's snapshot)
+    rr_changed = code(c3, "SELECT balance FROM accounts WHERE id = 21 FOR UPDATE")
+    c3.execute("ROLLBACK")
+    checks["REPEATABLE READ: a row changed since its snapshot is 40001 at SELECT … FOR UPDATE"] = rr_changed == "40001"
+
+    c1.execute("BEGIN"); c1.execute("SELECT balance FROM accounts WHERE id = 22 FOR NO KEY UPDATE")
+    c2.execute("BEGIN"); no_key = code(c2, "SELECT balance FROM accounts WHERE id = 22 FOR UPDATE NOWAIT"); c2.execute("ROLLBACK")
+    c1.execute("ROLLBACK")
+    c1.execute("BEGIN"); c1.execute("SELECT balance FROM accounts WHERE id = 23 FOR KEY SHARE")
+    c2.execute("BEGIN"); key_share = code(c2, "SELECT balance FROM accounts WHERE id = 23 FOR UPDATE NOWAIT"); c2.execute("ROLLBACK")
+    c1.execute("ROLLBACK")
+    checks["FOR NO KEY UPDATE and FOR KEY SHARE take the same lock here (exclusive, unlike Postgres's shared key lock): a NOWAIT of either is 55P03"] = no_key == "55P03" and key_share == "55P03"
+
+    refused_shapes = []
+    for stmt in ("SELECT a.balance FROM accounts a JOIN prices p ON true WHERE a.id = 24 FOR UPDATE",
+                 "SELECT count(*) FROM accounts WHERE id = 24 GROUP BY id FOR UPDATE",
+                 "SELECT DISTINCT balance FROM accounts WHERE id = 24 FOR UPDATE"):
+        c2.execute("BEGIN")
+        refused_shapes.append(code(c2, stmt))
+        c2.execute("ROLLBACK")
+    # (a subquery in WHERE is read at the snapshot and its table isn't locked, as in Postgres: it runs)
+    c2.execute("BEGIN")
+    sub_shape = code(c2, "SELECT balance FROM accounts WHERE id IN (SELECT id FROM accounts WHERE id = 24) FOR UPDATE")
+    c2.execute("ROLLBACK")
+    info["refused_shapes"] = refused_shapes + [sub_shape]
+    checks["SELECT … FOR UPDATE over a join, GROUP BY or DISTINCT is refused by name (0A000); a WHERE subquery runs"] = refused_shapes == ["0A000"] * 3 and sub_shape == "ok"
+
+    orm = psycopg.connect(f"host=127.0.0.1 port={pga} user=u dbname=lake")  # (not autocommit: psycopg opens each transaction)
+    before25 = bal(25)
+    got = orm.execute("SELECT balance FROM accounts WHERE id = %s FOR UPDATE", (25,)).fetchone()[0]
+    orm.execute("UPDATE accounts SET balance = %s WHERE id = %s", (got + 7, 25))
+    orm.commit()
+    orm.close()
+    checks["read-then-write as an ORM sends it (psycopg, parameters, SELECT … FOR UPDATE, UPDATE, commit): +7 lands once"] = got == before25 and bal(25) == before25 + 7
+
+    # (e) a comment in front of a transaction word (dbt's `/* {"app": "dbt"} */ commit;`), over psql and HTTP /sql.
+    with tempfile.NamedTemporaryFile("w", suffix=".sql", delete=False) as f:
+        f.write("/* c */ BEGIN;\nINSERT INTO history VALUES (900, 1);\n-- c\nCOMMIT;\n")
+    psql_run = subprocess.run(["psql", f"host=127.0.0.1 port={pga} user=u dbname=lake", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-f", f.name],
+                              capture_output=True, text=True, timeout=60)
+    os.unlink(f.name)
+    http_codes = [http(A.port, "/* c */ BEGIN", "ctl-http")[0], http(A.port, "INSERT INTO history VALUES (901, 1)", "ctl-http")[0], http(A.port, "-- c\nCOMMIT", "ctl-http")[0]]
+    info["psql"] = {"exit": psql_run.returncode, "stderr": psql_run.stderr[-200:]}
+    checks["a comment in front of a transaction word (/* c */ BEGIN; -- c, then COMMIT): over psql and over HTTP /sql the transaction commits"] = \
+        psql_run.returncode == 0 and http_codes == [200, 200, 200] and q("SELECT account FROM history WHERE account IN (900, 901) ORDER BY account") == [{"account": 900}, {"account": 901}]
+
+    # (f) a lease of 2 s and an idle holder: a session idle 5 s keeps its row (renewed by its leader or its
+    # follower), and another writer waits for it. Its own two nodes, on a follower and on their leader.
+    lake2 = new_lake()
+    lease_env = {"PONDRA_LOCK_LEASE_SECS": "2"}
+    la = Node(lake2, A.port + 2, tier_secs=0.5, pg=f"127.0.0.1:{A.port + 102}", env=lease_env).start()
+    lb = Node(lake2, A.port + 3, tier_secs=0.5, pg=f"127.0.0.1:{A.port + 103}", env=lease_env).start()
+    sql(A.port + 2, "CREATE TABLE held (id BIGINT, v BIGINT)")
+    sql(A.port + 2, "INSERT INTO held VALUES (1, 10)")
+    holder = psycopg.connect(f"host=127.0.0.1 port={A.port + 103} user=u dbname=lake", autocommit=True)  # (a follower)
+    waiter = pg(A.port + 102)
+    holder.execute("BEGIN"); holder.execute("UPDATE held SET v = v + 1 WHERE id = 1")
+    w2 = {}
+    def second():
+        waiter.execute("BEGIN")
+        w2["code"] = code(waiter, "UPDATE held SET v = v + 1 WHERE id = 1")
+        waiter.execute("COMMIT")
+    th2 = threading.Thread(target=second)
+    th2.start()
+    time.sleep(5)  # the holder is idle for 5 s: 2.5 leases
+    still_waiting = th2.is_alive()
+    holder_commit = code(holder, "COMMIT")
+    th2.join(30)
+    v_held = sql(A.port + 2, "SELECT v FROM held WHERE id = 1")[0]["v"]
+    checks["a lease of 2 s: a session idle 5 s on a follower keeps its row (renewed), another writer waits for it, and both commit (10 + 1 + 1)"] = \
+        still_waiting and holder_commit == "ok" and w2.get("code") == "ok" and v_held == 12
+    lb_role = call(A.port + 3, "GET", "/stats")["role"]
+    checks["the lease check's second node is a follower, so the holder's locks are the leader's to renew"] = lb_role == "follower"
+    holder.close()
+    waiter.close()
+    la.kill(); lb.kill()
+
+    # (g) the idle end (ADR-067 §4): a transaction idle for PONDRA_TXN_IDLE_SECS (2 s here) ends, its writes dropped
+    # and its row lock let go, so a second writer gets the row at once, not at lock_timeout. Its session's next
+    # statements are refused with 25P03 (Postgres's code for an idle transaction ended by its timeout) until a
+    # transaction word (ROLLBACK) ends that, and its UPDATE never lands. Over HTTP the holder is on a follower and
+    # the waiter on the leader; over the Postgres port the holder is on the leader and the waiter on the follower.
+    idle_env = {"PONDRA_TXN_IDLE_SECS": "2", "PONDRA_LOCK_LEASE_SECS": "2"}
+    lake3 = new_lake()
+    ix = Node(lake3, A.port + 4, tier_secs=0.5, pg=f"127.0.0.1:{A.port + 104}", env=idle_env).start()
+    iy = Node(lake3, A.port + 5, tier_secs=0.5, pg=f"127.0.0.1:{A.port + 105}", env=idle_env).start()
+    sql(A.port + 4, "CREATE TABLE held_k (id BIGINT PRIMARY KEY, v BIGINT)")
+    sql(A.port + 4, "INSERT INTO held_k SELECT value, 100 FROM range(1, 5)")
+
+    hold_h = "idle-holder"
+    http(A.port + 5, "BEGIN", hold_h)
+    http_hold = http(A.port + 5, "UPDATE held_k SET v = v + 100 WHERE id = 1", hold_h)
+    http(A.port + 4, "BEGIN", "idle-waiter")  # (the waiter's own transaction: a write outside one takes no lock to wait for)
+    http(A.port + 4, "SET lock_timeout = '20s'", "idle-waiter")
+    got_h = {}
+    def wait_h():
+        t0 = time.time()
+        got_h["r"] = http(A.port + 4, "UPDATE held_k SET v = v + 1 WHERE id = 1", "idle-waiter")
+        got_h["secs"] = round(time.time() - t0, 3)
+    th_h = threading.Thread(target=wait_h)
+    th_h.start()
+    time.sleep(0.5)
+    waited_h = th_h.is_alive()  # (the holder is not idle yet: the waiter is really waiting)
+    th_h.join(30)
+    waiter_h = http(A.port + 4, "COMMIT", "idle-waiter")  # (its +1 commits: its transaction isn't idle)
+    refused_h = http(A.port + 5, "UPDATE held_k SET v = v + 100 WHERE id = 1", hold_h)
+    refused_read_h = http(A.port + 5, "SELECT v FROM held_k WHERE id = 1", hold_h)
+    rolled_h = http(A.port + 5, "ROLLBACK", hold_h)
+    after_h = http(A.port + 5, "SELECT v FROM held_k WHERE id = 1", hold_h)
+    v1 = sql(A.port + 4, "SELECT v FROM held_k WHERE id = 1")[0]["v"]
+
+    hold_p = pg(A.port + 104)  # the holder: on the leader (autocommit connection, explicit BEGIN)
+    hold_p.execute("BEGIN")
+    p_hold = code(hold_p, "UPDATE held_k SET v = v + 100 WHERE id = 2")
+    waiter_p = pg(A.port + 105)  # the waiter: on the follower
+    waiter_p.execute("SET lock_timeout = '20s'")
+    waiter_p.execute("BEGIN")
+    got_p = {}
+    def wait_p():
+        t0 = time.time()
+        got_p["r"] = code(waiter_p, "UPDATE held_k SET v = v + 1 WHERE id = 2")
+        got_p["secs"] = round(time.time() - t0, 3)
+    th_p = threading.Thread(target=wait_p)
+    th_p.start()
+    time.sleep(0.5)
+    waited_p = th_p.is_alive()
+    th_p.join(30)
+    waiter_p.execute("COMMIT")  # (its +1 commits: its transaction isn't idle)
+    refused_p = code(hold_p, "UPDATE held_k SET v = v + 100 WHERE id = 2")
+    hold_p.execute("ROLLBACK")
+    usable_p = hold_p.execute("SELECT v FROM held_k WHERE id = 2").fetchone()[0]
+    v2 = sql(A.port + 4, "SELECT v FROM held_k WHERE id = 2")[0]["v"]
+    info["idle_end"] = {"http_waiter": {"secs": got_h.get("secs"), "status": got_h.get("r", (None,))[0]},
+                        "http_refused": refused_h[1], "http_refused_read": refused_read_h[1], "http_rollback": rolled_h[0],
+                        "http_row": v1, "pg_waiter": {"secs": got_p.get("secs"), "code": got_p.get("r")},
+                        "pg_refused": refused_p, "pg_row": v2}
+    checks["an idle transaction (PONDRA_TXN_IDLE_SECS=2) over HTTP, holder on a follower: a second writer on the leader waits, then gets the row within 10 s, not at lock_timeout (20 s)"] = \
+        http_hold[0] == 200 and waited_h and got_h.get("r", (None,))[0] == 200 and got_h.get("secs", 99) < 10
+    checks["…and the holder's next statements are refused 25P03 until ROLLBACK, and its UPDATE never landed: the row has the second writer's +1 only"] = \
+        refused_h[1] == "25P03" and refused_read_h[1] == "25P03" and rolled_h[0] == 200 and after_h[0] == 200 and v1 == 101
+    checks["…over the Postgres port, holder on the leader, waiter on the follower: the waiter gets the row within 10 s; the holder's next statement is refused 25P03; after ROLLBACK the connection is usable, and the row has the waiter's +1 only"] = \
+        p_hold == "ok" and waited_p and got_p.get("r") == "ok" and got_p.get("secs", 99) < 10 and refused_p == "25P03" and usable_p == 101 and v2 == 101
+    # A COMMIT after the idle end is refused, never a success (ADR-067 §10): the writes were dropped when the
+    # transaction went idle, so "COMMIT" would tell the client they landed. Over HTTP (the holder on the follower)
+    # and the Postgres port (on the leader); a ROLLBACK after it still answers ROLLBACK, and the rows keep theirs.
+    rows34 = lambda: q("SELECT id, v FROM held_k WHERE id IN (3, 4) ORDER BY id", A.port + 4)
+    before34 = rows34()
+    commit_h = "idle-committer"
+    http(A.port + 5, "BEGIN", commit_h)
+    upd_h = http(A.port + 5, "UPDATE held_k SET v = v + 100 WHERE id = 3", commit_h)
+    commit_p = pg(A.port + 104)  # (the Postgres port of lake3's leader, ix: held_k lives in lake3, not in pga's lake)
+    commit_p.execute("BEGIN")
+    upd_p = code(commit_p, "UPDATE held_k SET v = v + 100 WHERE id = 4")
+    time.sleep(3)  # (idle 2 s, and the upkeep tick after it)
+    refused_commit_h = http(A.port + 5, "COMMIT", commit_h)
+    rolled_commit_h = http(A.port + 5, "ROLLBACK", commit_h)
+    refused_commit_p = failure(commit_p, "COMMIT")
+    rolled_commit_p = code(commit_p, "ROLLBACK")
+    info["idle_commit"] = {"http_commit": refused_commit_h[:2], "http_message": refused_commit_h[2], "http_rollback": rolled_commit_h[0],
+                           "pg_commit": refused_commit_p[0], "pg_message": refused_commit_p[1], "pg_rollback": rolled_commit_p}
+    checks["a COMMIT after the idle end is refused 25P03 and says nothing was committed, over HTTP and the Postgres port, never a success; ROLLBACK after it answers ROLLBACK; no row changed"] = \
+        upd_h[0] == 200 and upd_p == "ok" and refused_commit_h[:2] == (400, "25P03") \
+        and "ended after 2 s idle (PONDRA_TXN_IDLE_SECS) and rolled back: nothing was committed" in str(refused_commit_h[2]) \
+        and refused_commit_p[0] == "25P03" and "nothing was committed" in refused_commit_p[1] \
+        and rolled_commit_h[0] == 200 and rolled_commit_p == "ok" and rows34() == before34
+    commit_p.close()
+    hold_p.close(); waiter_p.close()
+    ix.kill(); iy.kill()
+
+    # (h) the review's fixes (ADR-067 §3–§8): each check fails on a build without its fix. Lake5: a leader (+6), a
+    # follower (+7) and a reader's follower (+9), the idle end at 2 s throughout: a holder that goes quiet lets go,
+    # so the checks that need a holder to stay keep it busy with statements. Lake6: a leader (+8) and a follower (+10).
+    env5 = {"PONDRA_TXN_IDLE_SECS": "2", "PONDRA_LOCK_LEASE_SECS": "2"}
+    lake5 = new_lake()
+    rl = Node(lake5, A.port + 6, tier_secs=0.5, pg=f"127.0.0.1:{A.port + 106}", env=env5).start()
+    rf = Node(lake5, A.port + 7, tier_secs=0.5, pg=f"127.0.0.1:{A.port + 107}", env=env5).start()
+    rr = Node(lake5, A.port + 9, tier_secs=0.5, pg=f"127.0.0.1:{A.port + 109}", env=env5, read_token="r-tok", write_token="w-tok", admin_token="a-tok").start()
+    LP, FP = A.port + 6, A.port + 7
+    pl = lambda: pg(A.port + 106)  # a connection to the leader's Postgres port
+    pf = lambda: pg(A.port + 107)  # a connection to the follower's
+
+    # Counters written by INSERT … SELECT, in two forms (positional, and a column list), from both nodes: the rows
+    # are worked out again at the commit a lock is granted at, so no +100 is lost (ADR-067 §3).
+    sql(LP, "CREATE TABLE counters (k BIGINT PRIMARY KEY, n BIGINT)")
+    sql(LP, "INSERT INTO counters VALUES (1, 0)")
+    counter_errs = []
+    def count_up(port, stmt):
+        conn = pg(port)
+        for _ in range(50):
+            try:
+                conn.execute("BEGIN")
+                conn.execute(stmt)
+                conn.execute("COMMIT")
+            except psycopg.Error as e:
+                counter_errs.append(f"{getattr(e, 'sqlstate', None)}: {str(e)[:300]}")
+                return
+    # (ON CONFLICT … DO UPDATE: a plain INSERT of a key the table has is refused, 23505, as in Postgres; the upsert is the
+    # form that adds to a row, and it is worked out again at the grant as an UPDATE's is, `txn::changing`)
+    forms = [(LP + 100, "INSERT INTO counters SELECT k, n + 100 FROM counters WHERE k = 1 ON CONFLICT (k) DO UPDATE SET n = excluded.n"),
+             (FP + 100, "INSERT INTO counters (n, k) SELECT n + 100, k FROM counters WHERE k = 1 ON CONFLICT (k) DO UPDATE SET n = excluded.n")]
+    ths = [threading.Thread(target=count_up, args=f) for f in forms]
+    [t.start() for t in ths]
+    [t.join(300) for t in ths]
+    total = sql(LP, "SELECT n FROM counters WHERE k = 1")[0]["n"]
+    info["counters"] = {"errors": counter_errs[:5], "total": total}
+    checks["a counter written by INSERT … SELECT in two forms, from both nodes, 50 transactions each: no +100 lost (10,000)"] = counter_errs == [] and total == 10000
+
+    # Keys spelled differently lock the same row: a TIMESTAMP and a DECIMAL key, written by the one-key UPDATE and by
+    # an UPDATE with a condition; and a key with a quote (O'Brien) is found by a transaction's lookup and UPDATE.
+    sql(LP, "CREATE TABLE ledger (ts TIMESTAMP PRIMARY KEY, v BIGINT)")
+    sql(LP, "INSERT INTO ledger VALUES ('2026-01-01 00:00:00', 0)")
+    sql(LP, "CREATE TABLE rates (code DECIMAL(10,2) PRIMARY KEY, rate BIGINT)")
+    sql(LP, "INSERT INTO rates VALUES (1.5, 0)")
+    sql(LP, "CREATE TABLE people (name VARCHAR PRIMARY KEY, n BIGINT)")
+    sql(LP, "INSERT INTO people VALUES ('O''Brien', 1)")
+    h_ts, h_rate = pl(), pl()
+    h_ts.execute("BEGIN"); h_ts.execute("UPDATE ledger SET v = v + 1 WHERE ts = '2026-01-01 00:00:00'")
+    h_rate.execute("BEGIN"); h_rate.execute("UPDATE rates SET rate = rate + 1 WHERE code = 1.5")
+    w_ts, w_rate = pf(), pf()
+    w_ts.execute("BEGIN"); w_rate.execute("BEGIN")
+    th_ts, got_ts = in_thread(w_ts, "UPDATE ledger SET v = v + 10 WHERE ts = '2026-01-01 00:00:00' AND v >= 0")
+    th_rate, got_rate = in_thread(w_rate, "UPDATE rates SET rate = rate + 10 WHERE code = 1.50 AND rate >= 0")
+    time.sleep(0.5)
+    waited_keys = th_ts.is_alive() and th_rate.is_alive()
+    h_ts.execute("COMMIT"); h_rate.execute("COMMIT")
+    th_ts.join(30); th_rate.join(30)
+    w_ts.execute("COMMIT"); w_rate.execute("COMMIT")
+    v_ts = sql(LP, "SELECT v FROM ledger")[0]["v"]
+    rate = sql(LP, "SELECT rate FROM rates")[0]["rate"]
+    checks["a TIMESTAMP and a DECIMAL key spelled two ways lock one row: the waiter waits, then adds to what committed (1 + 10 each)"] = \
+        waited_keys and got_ts["code"] == "ok" and got_rate["code"] == "ok" and v_ts == 11 and rate == 11
+    ob = pl()
+    ob.execute("BEGIN")
+    ob.execute("UPDATE people SET n = n + 1 WHERE name = 'O''Brien'")
+    ob_seen = ob.execute("SELECT n FROM people WHERE name = 'O''Brien'").fetchone()[0]
+    ob.execute("COMMIT")
+    checks["a key with a quote (O'Brien): a transaction's UPDATE and lookup find the row, and it reads 2 after COMMIT"] = ob_seen == 2 and sql(LP, "SELECT n FROM people WHERE name = 'O''Brien'") == [{"n": 2}]
+
+    # A reader's locking read is refused (FOR UPDATE needs UPDATE, as in Postgres), and locks nothing.
+    rd = psycopg.connect(f"host=127.0.0.1 port={A.port + 109} user=reader password=r-tok dbname=lake", autocommit=True)
+    opened.append(rd)
+    rd.execute("BEGIN")
+    reader_lock = failure(rd, "SELECT v FROM ledger FOR UPDATE")
+    rd.execute("ROLLBACK")
+    checks["a reader's SELECT … FOR UPDATE is refused 42501 over the Postgres port: it needs UPDATE"] = reader_lock[0] == "42501"
+
+    # Over HTTP, a deadlock: the session whose wait closes the loop gets 40P01 and is refused 25P02 until ROLLBACK;
+    # the other goes on.
+    sql(LP, "CREATE TABLE dl (id BIGINT PRIMARY KEY, v BIGINT)")
+    sql(LP, "INSERT INTO dl SELECT value, 100 FROM range(1, 9)")
+    s1, s2 = "dl-session-one", "dl-session-two"  # (a session id is 8 to 128 characters: a shorter one isn't a session)
+    http(LP, "BEGIN", s1); http(LP, "UPDATE dl SET v = v + 1 WHERE id = 1", s1)
+    http(LP, "BEGIN", s2); http(LP, "UPDATE dl SET v = v + 1 WHERE id = 2", s2)
+    got_one = {}
+    th_one = threading.Thread(target=lambda: got_one.update(r=http(LP, "UPDATE dl SET v = v + 1 WHERE id = 2", s1)))
+    th_one.start()
+    time.sleep(0.5)
+    closing = http(LP, "UPDATE dl SET v = v + 1 WHERE id = 1", s2)
+    refused_next = http(LP, "SELECT v FROM dl WHERE id = 2", s2)
+    rolled_two = http(LP, "ROLLBACK", s2)
+    th_one.join(30)
+    one_commit = http(LP, "COMMIT", s1)
+    dl_rows = {r["id"]: r["v"] for r in sql(LP, "SELECT id, v FROM dl WHERE id IN (1, 2)")}
+    checks["over HTTP, a deadlock: the session whose wait closes the loop gets 40P01, its next statement is 25P02 until ROLLBACK, and the other goes on (101, 101)"] = \
+        closing[1] == "40P01" and refused_next[1] == "25P02" and rolled_two[0] == 200 and got_one.get("r", (None,))[0] == 200 and one_commit[0] == 200 and dl_rows == {1: 101, 2: 101}
+
+    # A statement waiting for a lock keeps its transaction past the idle timeout: the holder stays busy, the waiter
+    # waits 5 s (lock_timeout) and ends 55P03; its transaction is failed (25P02), not idled (25P03).
+    hb, wb = pl(), pf()
+    hb.execute("BEGIN"); hb.execute("UPDATE dl SET v = v + 1 WHERE id = 3")
+    wb.execute("BEGIN"); wb.execute("SET lock_timeout = '5s'")
+    th_wb, got_wb = in_thread(wb, "UPDATE dl SET v = v + 1 WHERE id = 3")
+    for _ in range(8):  # (the holder's statements keep it from being idle for 2 s)
+        time.sleep(0.7)
+        hb.execute("SELECT 1")
+    th_wb.join(30)
+    wb_next = failure(wb, "SELECT v FROM dl WHERE id = 3")
+    hb.execute("COMMIT")
+    wb.execute("ROLLBACK")
+    checks["a statement waiting 5 s for a lock keeps its transaction past PONDRA_TXN_IDLE_SECS=2: it ends 55P03, and the next statement is 25P02, not 25P03"] = \
+        got_wb["code"] == "55P03" and wb_next[0] == "25P02"
+
+    # SELECT … ORDER BY 1 LIMIT 1 FOR UPDATE locks the row it returns; a write to that row waits.
+    sql(LP, "CREATE TABLE q (id BIGINT PRIMARY KEY, status VARCHAR)")
+    sql(LP, "INSERT INTO q SELECT value, 'new' FROM range(1, 5)")
+    t1, t2 = pl(), pf()
+    t1.execute("BEGIN")
+    first = t1.execute("SELECT id FROM q WHERE status = 'new' ORDER BY 1 LIMIT 1 FOR UPDATE").fetchall()
+    t2.execute("BEGIN")
+    th_q, got_q = in_thread(t2, "UPDATE q SET status = 'taken' WHERE id = 1")
+    time.sleep(0.5)
+    waited_q = th_q.is_alive()
+    t1.execute("UPDATE q SET status = 'mine' WHERE id = 1"); t1.execute("COMMIT")
+    th_q.join(30); t2.execute("COMMIT")
+    checks["SELECT … ORDER BY 1 LIMIT 1 FOR UPDATE locks the row it returns (id 1): another transaction's write to it waits"] = \
+        first == [(1,)] and waited_q and got_q["code"] == "ok"
+
+    # Two workers, one on each node, take jobs with SELECT … LIMIT 1 FOR UPDATE, across tiered files: every job is
+    # taken once and all 40 are done.
+    sql(LP, "CREATE TABLE jobs (id BIGINT PRIMARY KEY, status VARCHAR)")
+    for lo in range(1, 41, 10):
+        sql(LP, f"INSERT INTO jobs SELECT value, 'new' FROM range({lo}, {lo + 10})")
+        time.sleep(0.7)  # (the leader tiers between the inserts: several files)
+    taken, worker_errors = {"a": [], "b": []}, []
+    def worker(name, port):
+        conn = pg(port)
+        try:
+            while True:
+                conn.execute("BEGIN")
+                row = conn.execute("SELECT id FROM jobs WHERE status = 'new' ORDER BY id LIMIT 1 FOR UPDATE").fetchone()
+                if row is None:
+                    conn.execute("COMMIT")
+                    return
+                conn.execute(f"UPDATE jobs SET status = 'done' WHERE id = {row[0]}")
+                conn.execute("COMMIT")
+                taken[name].append(row[0])
+        except Exception as e:  # (a worker that fails says so: the check below fails, rather than the other one finishing alone)
+            worker_errors.append(f"{name}: {e}")
+    ws = [threading.Thread(target=worker, args=(n, p)) for n, p in (("a", LP + 100), ("b", FP + 100))]
+    [w.start() for w in ws]
+    [w.join(300) for w in ws]
+    checks["two workers on two nodes take jobs with SELECT … LIMIT 1 FOR UPDATE across tiered files: each job taken once, all 40 done"] = \
+        sorted(taken["a"] + taken["b"]) == list(range(1, 41)) and sql(LP, "SELECT count(*) AS n FROM jobs WHERE status = 'done'")[0]["n"] == 40 and not worker_errors
+    info["job_workers_errors"] = worker_errors
+
+    # INSERT, then an UPDATE that waits for another commit on its row: it commits, without 40001.
+    sql(LP, "CREATE TABLE acct (id BIGINT PRIMARY KEY, balance BIGINT)")
+    sql(LP, "INSERT INTO acct SELECT value, 1000 FROM range(1, 11)")
+    sql(LP, "CREATE TABLE hist5 (account BIGINT, delta BIGINT)")
+    tb, ta = pl(), pf()
+    tb.execute("BEGIN"); tb.execute("UPDATE acct SET balance = balance + 100 WHERE id = 5")
+    ta.execute("BEGIN"); ta.execute("INSERT INTO hist5 VALUES (5, 1)")
+    th_a, got_a = in_thread(ta, "UPDATE acct SET balance = balance + 1 WHERE id = 5")
+    time.sleep(0.5)
+    waited_a = th_a.is_alive()
+    tb.execute("COMMIT")
+    th_a.join(30)
+    commit_a = code(ta, "COMMIT")
+    checks["an INSERT, then an UPDATE waiting for another commit on its row: the UPDATE commits without 40001 (1000 + 100 + 1)"] = \
+        waited_a and got_a["code"] == "ok" and commit_a == "ok" and sql(LP, "SELECT balance FROM acct WHERE id = 5")[0]["balance"] == 1101
+
+    # SAVEPOINT leaves the transaction open for the driver (its status says so); ROLLBACK WORK TO SAVEPOINT goes back.
+    sv = pl()
+    sv.execute("BEGIN"); sv.execute("SAVEPOINT s1")
+    sv_status = sv.info.transaction_status
+    sv.execute("UPDATE acct SET balance = balance + 7 WHERE id = 3")
+    back = failure(sv, "ROLLBACK WORK TO SAVEPOINT s1")
+    sv_back = sv.info.transaction_status
+    sv_bal = sv.execute("SELECT balance FROM acct WHERE id = 3").fetchone()[0]
+    sv_end = code(sv, "COMMIT")
+    checks["SAVEPOINT keeps the transaction open over the Postgres port (the status says so); ROLLBACK WORK TO SAVEPOINT goes back to it: the row has its old balance"] = \
+        sv_status == psycopg.pq.TransactionStatus.INTRANS and back[0] == "ok" and sv_back == psycopg.pq.TransactionStatus.INTRANS and sv_bal == 1000 and sv_end == "ok"
+
+    # REPEATABLE READ's snapshot is taken at its first statement: a commit after BEGIN and before it is seen, one after it isn't.
+    rrs = pf()
+    rrs.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    pl().execute("UPDATE acct SET balance = balance + 1 WHERE id = 9")
+    rr_first = rrs.execute("SELECT balance FROM acct WHERE id = 9").fetchone()[0]
+    pl().execute("UPDATE acct SET balance = balance + 1 WHERE id = 9")
+    rr_second = rrs.execute("SELECT balance FROM acct WHERE id = 9").fetchone()[0]
+    rrs.execute("COMMIT")
+    checks["REPEATABLE READ takes its snapshot at its first statement: a commit before it is seen (1001), one after it isn't (1001)"] = (rr_first, rr_second) == (1001, 1001)
+
+    # An UPDATE outside a transaction on a keyed row waits for the transaction holding it, then adds to what committed.
+    sql(LP, "CREATE TABLE prices2 (item VARCHAR PRIMARY KEY, price BIGINT)")
+    sql(LP, "INSERT INTO prices2 VALUES ('cake', 5)")
+    au_h, au_w = pl(), pf()
+    au_h.execute("BEGIN"); au_h.execute("UPDATE prices2 SET price = price + 10 WHERE item = 'cake'")
+    th_au, got_au = in_thread(au_w, "UPDATE prices2 SET price = price + 1 WHERE item = 'cake'")
+    time.sleep(0.5)
+    au_waited = th_au.is_alive()
+    au_h.execute("COMMIT")
+    th_au.join(30)
+    checks["an UPDATE outside a transaction on a keyed row waits for the transaction holding it, then adds to what it committed (5 + 10 + 1)"] = \
+        au_waited and got_au["code"] == "ok" and sql(LP, "SELECT price FROM prices2")[0]["price"] == 16
+
+    # A follower's transaction that lapses lets its locks go on the leader: /stats row_locks says so.
+    lk = pf()
+    lk.execute("BEGIN"); lk.execute("UPDATE dl SET v = v + 1 WHERE id = 4")
+    held_before = call(LP, "GET", "/stats")["row_locks"]
+    time.sleep(3.5)  # (idle 2 s: the follower ends it, and the leader releases its rows)
+    held_after = call(LP, "GET", "/stats")["row_locks"]
+    checks["a follower's transaction that lapses lets its row locks go on the leader: /stats row_locks is 1 while held, 0 after"] = held_before >= 1 and held_after == 0
+
+    # Across two nodes: a deadlock is found and answered once (40P01), and the other transaction goes on.
+    d1, d2 = pf(), pl()
+    d1.execute("BEGIN"); d1.execute("UPDATE dl SET v = v + 1 WHERE id = 5")
+    d2.execute("BEGIN"); d2.execute("UPDATE dl SET v = v + 1 WHERE id = 6")
+    th_d1, got_d1 = in_thread(d1, "UPDATE dl SET v = v + 1 WHERE id = 6")
+    time.sleep(0.5)
+    closing_d2 = code(d2, "UPDATE dl SET v = v + 1 WHERE id = 5")
+    d2.execute("ROLLBACK")
+    th_d1.join(30)
+    d1_end = code(d1, "COMMIT")
+    checks["a deadlock across two nodes is answered once: the wait that closes the loop gets 40P01, the other goes on and commits"] = \
+        closing_d2 == "40P01" and got_d1["code"] == "ok" and d1_end == "ok"
+
+    # A follower's ROLLBACK lets its locks go on the leader: the waiter there is granted within a second.
+    fr, lr = pf(), pl()
+    fr.execute("BEGIN"); fr.execute("UPDATE dl SET v = v + 1 WHERE id = 7")
+    lr.execute("BEGIN")
+    grant = {}
+    def wait_lr():
+        grant["r"] = code(lr, "UPDATE dl SET v = v + 1 WHERE id = 7")
+        grant["at"] = time.time()
+    th_lr = threading.Thread(target=wait_lr)
+    th_lr.start()
+    time.sleep(0.5)
+    t_roll = time.time()
+    fr.execute("ROLLBACK")
+    th_lr.join(30)
+    lr_end = code(lr, "COMMIT")
+    checks["a follower's ROLLBACK lets its locks go on the leader: the waiter there gets the row within 1 s"] = \
+        grant.get("r") == "ok" and grant.get("at", t_roll + 99) - t_roll < 1.0 and lr_end == "ok"
+
+    # A follower told to stop ends its lock waits at once (57P01), not at lock_timeout; its exit follows.
+    dr_h, dr_w = pl(), pf()
+    dr_h.execute("BEGIN"); dr_h.execute("UPDATE dl SET v = v + 1 WHERE id = 8")
+    dr_w.execute("BEGIN")
+    th_dr, got_dr = in_thread(dr_w, "UPDATE dl SET v = v + 1 WHERE id = 8")
+    time.sleep(0.5)
+    rf.p.send_signal(signal.SIGTERM)
+    th_dr.join(60)
+    dr_end = code(dr_h, "COMMIT")
+    checks["a follower told to stop ends its lock waits at once (57P01), not at lock_timeout"] = got_dr["code"] == "57P01" and got_dr["secs"] < 10 and dr_end == "ok"
+    try:
+        rf.p.wait(timeout=60)
+    except Exception:
+        pass
+    rf.kill()
+
+    # The leader killed mid-transaction (lake6: a leader on +8, a follower on +10): the transaction's write never
+    # lands, whatever its COMMIT says, and the follower that takes over takes writes.
+    lake6 = new_lake()
+    kl = Node(lake6, A.port + 8, tier_secs=0.5, pg=f"127.0.0.1:{A.port + 108}", env=env5).start()
+    kf = Node(lake6, A.port + 10, tier_secs=0.5, pg=f"127.0.0.1:{A.port + 110}", env=env5).start()
+    time.sleep(3)  # (the follower has heard its leader first: one that never has waits for the leader's mark to go stale, 30 s)
+    sql(A.port + 8, "CREATE TABLE kv (id BIGINT PRIMARY KEY, v BIGINT)")
+    sql(A.port + 8, "INSERT INTO kv VALUES (1, 100)")
+    kt = pg(A.port + 110)
+    kt.execute("BEGIN"); kt.execute("UPDATE kv SET v = v + 1 WHERE id = 1")
+    kl.kill()
+    lead_deadline = time.time() + 60  # (the lease: about 5 s, then the restart that makes the term)
+    new_role = None
+    while time.time() < lead_deadline:
+        try:
+            new_role = call(A.port + 10, "GET", "/stats")["role"]
+        except Exception:
+            new_role = None
+        if new_role == "leader":
+            break
+        time.sleep(0.5)
+    kt_commit = code(kt, "COMMIT")
+    kv_v = sql(A.port + 10, "SELECT v FROM kv WHERE id = 1")[0]["v"]
+    sql(A.port + 10, "UPDATE kv SET v = v + 5 WHERE id = 1")
+    info["leader_killed"] = {"new_role": new_role, "commit": kt_commit, "v": kv_v}
+    # Its COMMIT never succeeds: the takeover restarts the node, which closes the connection (the client sees the
+    # close, not a SQLSTATE), or the transaction went idle first (25P03, ADR-067 §10). Either way nothing landed.
+    checks["the leader killed mid-transaction: the follower takes over, the transaction's +1 never lands (no lost update), and its COMMIT is refused (never ok)"] = \
+        kt_commit != "ok" and kv_v == 100 and new_role == "leader"
+    checks["…and the new leader takes writes: 100 + 5"] = sql(A.port + 10, "SELECT v FROM kv WHERE id = 1")[0]["v"] == 105
+    kf.kill()
+    for n in (rl, rr):
+        n.kill()
+
+    for conn in opened:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    a.kill(); b.kill()
+    ok = all(checks.values())
+    print(json.dumps({"waits": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
         sys.exit(1)
 
@@ -12656,7 +13807,7 @@ SECS = {"memory": 255, "cursors": 15, "stopped": 78, "clouds": 66, "functions": 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, versions, stopped, flows, begin, doors, cursors, objects, registry, find, sequences, constraints, ddlgaps, sqla, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, versions, stopped, flows, begin, waits, doors, cursors, objects, registry, find, sequences, constraints, ddlgaps, sqla, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -12688,7 +13839,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "cursors", "objects", "registry", "find", "sequences", "constraints", "ddlgaps", "sqla", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "versions", "stopped", "flows", "begin", "autocommit", "round7", "waits", "doors", "cursors", "objects", "registry", "find", "sequences", "constraints", "ddlgaps", "sqla", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -12701,7 +13852,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "autocommit": autocommit, "round7": round7, "waits": waits, "doors": doors, "cursors": cursors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

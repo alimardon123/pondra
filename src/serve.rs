@@ -145,6 +145,8 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
                         eqs.push((c.value.clone(), None));
                     }
                     Value::Null => return Ok(None),
+                    // (a string's value, as written: `'O''Brien'` is `O'Brien`, not the text it was typed as)
+                    Value::SingleQuotedString(s) => eqs.push((c.value.clone(), Some(s.clone()))),
                     v => eqs.push((c.value.clone(), Some(v.to_string().trim_matches('\'').to_string()))),
                 },
                 _ => return Ok(None),
@@ -283,7 +285,7 @@ async fn newest_in_log(lake: &Lake, table: &str, meta: &TableMeta, keys: &[(&str
 }
 
 /// `lookup`, with the row's `_version` (the commit that wrote it) and `_created_at` (µs): what a
-/// transaction's change of one key needs (`txn::point_update`). None: no such row, or one from
+/// transaction's change of one key needs (`txn::point_change`). None: no such row, or one from
 /// before rows had their system columns in files.
 pub async fn lookup_versioned(lake: &Lake, table: &str, meta: &TableMeta, key: &[String]) -> Result<Option<(RecordBatch, u64, Option<i64>)>> {
     use datafusion::arrow::array::AsArray;

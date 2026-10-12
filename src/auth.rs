@@ -212,6 +212,15 @@ pub fn check(privilege: &str, table: &str) -> Result<()> {
     }
 }
 
+/// A locking read (`SELECT … FOR UPDATE`) takes the rows as an UPDATE would, so it needs what an UPDATE needs: a write
+/// token, or a user granted UPDATE on the table (Postgres asks the UPDATE privilege of FOR UPDATE, 42501 without it).
+pub fn may_lock(table: &str) -> Result<()> {
+    match current() {
+        Some(p) if p.access.is_none() && p.role < Role::Write => bail!("permission denied: FOR UPDATE on {table} needs UPDATE, and this token may only read"),
+        _ => check("update", &catalog_name(table)),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
 pub enum Role {
     None,

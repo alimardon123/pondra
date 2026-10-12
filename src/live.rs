@@ -98,7 +98,7 @@ pub async fn live(State(app): State<App>, Query(p): Query<Params>, headers: axum
 
 /// A live query made ready: its SQL prepared, the tables it reads found, as its session and caller.
 async fn watch(app: &App, headers: &axum::http::HeaderMap, sql: Option<&str>, kind: &str, body: &[u8], every: Duration, tag: String) -> anyhow::Result<Watch> {
-    let session = crate::temp::of(headers);
+    let session = crate::temp::of(headers)?;
     crate::temp::SESSION.scope(session.clone(), async {
         let req = match sql {
             Some(sql) => crate::routines::Request::read("", sql.as_bytes())?,
