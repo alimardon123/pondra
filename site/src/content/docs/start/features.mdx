@@ -302,6 +302,14 @@ CREATE VIEW big_events AS SELECT * FROM events WHERE amount > 5;
 SELECT * FROM big_events;
 ```
 
+### Measures
+A view can say a number once, as `AS MEASURE`, and each query gets it right at its own grain with `MEASURE(name)`. [Measures and key facts](/pondra/guides/measures/)
+
+```sql
+CREATE VIEW user_totals AS SELECT e.user AS person, sum(e.amount) AS MEASURE total FROM events e;
+SELECT person, MEASURE(total) AS total FROM user_totals GROUP BY person ORDER BY person;
+```
+
 ### Temporary tables
 `CREATE TEMP TABLE` makes a table that only your session sees, held in the node's memory, and it goes when the session ends. [SQL statements](/pondra/sql/statements/#views)
 
@@ -615,7 +623,7 @@ SELECT count(*) AS n FROM bids;
 
 ### Transactions
 
-`BEGIN` … `COMMIT` makes several statements one commit, all or nothing; each reads the lake as it was at `BEGIN`, and a conflicting commit is refused with `40001`. [Change rows](/pondra/guides/change-rows/#transactions)
+`BEGIN` … `COMMIT` makes several statements one commit, all or nothing. A transaction runs as `READ COMMITTED` with row locks, as in Postgres: a statement waits for a row another transaction is changing. `REPEATABLE READ` reads one snapshot and refuses a conflicting commit with `40001`. Savepoints work inside one, and DDL runs at once with a notice. [Change rows](/pondra/guides/change-rows/#transactions)
 
 ```sql
 CREATE TABLE accounts (id BIGINT PRIMARY KEY, owner VARCHAR, balance BIGINT);

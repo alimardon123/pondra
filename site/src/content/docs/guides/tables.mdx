@@ -121,7 +121,8 @@ JavaScript, `GET /lookup/users/2` over HTTP. `WITH (key = 'id')` says the same a
 
 A merge table has a key and combines the rows that share it, with `MERGE sum`, `count`, `min` or
 `max` on each column. Every column except the key needs one: `CREATE` refuses a table that leaves one out.
-You only `INSERT` into it.
+You only `INSERT` into it: `UPDATE` and `DELETE` are refused with SQLSTATE `0A000`, since its rows
+combine as they are read.
 
 ```sql
 CREATE TABLE totals (user VARCHAR PRIMARY KEY, n BIGINT MERGE sum, total DOUBLE MERGE sum);

@@ -146,6 +146,8 @@ SELECT * FROM spend ORDER BY user;
 
 A materialized view with `GROUP BY` is a merge table. It keeps one row of running totals per key,
 and any number of nodes can update it at once, with no shuffle between them.
+Its table is a merge table, so `UPDATE` and `DELETE` on it are refused (`0A000`). Change the view's source
+table instead: the view takes the change in, and adds it up.
 
 ```sql
 CREATE TABLE clicks (user VARCHAR, amount BIGINT);

@@ -27,6 +27,7 @@ Pages marked *(planned)* aren't written yet.
 | `tables.mdx` | `CREATE TABLE` and its layouts (keys, `PARTITION BY`, `CLUSTER BY`, `SEQUENCE BY`, `TTL`, merge columns), schemas, `ALTER TABLE`, `DROP`, `SWAP`; sequences, indexes, types and constraints in short | ADR-019, ADR-021, ADR-022, ADR-049 |
 | `load-data.mdx` | `INSERT`, exactly-once `append` (producer, seq), bulk loads with a job, `COPY FROM STDIN`, files into tables, `write_table` from pandas, Polars and Arrow | ADR-009, ADR-020 |
 | `query.mdx` | how a read sees the lake (snapshot, log tail), DuckDB's spellings, `ASOF JOIN`, `$name` parameters, the result cache, `EXPLAIN`, what runs learned, spreading over nodes | ADR-015, ADR-020, `src/friendly.rs` |
+| `measures.mdx` | `MEASURE` and measures in views, key facts (keys, uniques, references) declared on views | ADR-065 §2–3, `src/measures.rs`, `src/facts.rs` |
 | `change-rows.mdx` | `UPDATE`, `DELETE`, `MERGE`, jobs, system columns, the change feed, `BEGIN … COMMIT` | ADR-020, ADR-036 |
 | `past.mdx` | `AT (…)`, `RESTORE`, `UNDROP`, `CLONE`, how long the past is kept | ADR-043 |
 | `files-and-other-lakes.mdx` | files anywhere (`read_*`, globs, Hive folders, S3, GCS, Azure, HTTPS), `CREATE SECRET`, Delta and Iceberg read and written, `ATTACH`, `COPY … TO`, external tables | ADR-026, ADR-028 |

@@ -29,9 +29,9 @@ pondra serve lake --pg 127.0.0.1:5432
 
 `SELECT version()` answers `PostgreSQL 16.0 (Pondra on Apache DataFusion)`, and `SHOW server_version` answers `16.0`.
 
-Two things a driver may ask for are not offered. GSSAPI encryption (`gssencmode=require`) fails on
-the client, since the node doesn't offer it. A cancel request (psql's Ctrl-C, a driver's cancel) is
-accepted and does nothing, so it doesn't stop a statement: close the connection to stop one.
+GSSAPI encryption (`gssencmode=require`) isn't offered: it fails on the client. A cancel request (psql's
+Ctrl-C, a driver's `cancel()`) stops the statement that is running, with `57014`, and the connection goes
+on. In a transaction, the cancelled statement fails the transaction, as any failed statement does.
 
 The roles are the same as for [HTTP](/pondra/reference/http/#roles): `reader` may query, `writer` may
 also insert, update, delete and copy in, and `admin` may also create tables and other objects.
@@ -70,10 +70,11 @@ INSERT 0 2
 (2 rows)
 ```
 
-A driver's transactions are Pondra's: `BEGIN` … `COMMIT` is one commit, with snapshot isolation
-(Postgres's `REPEATABLE READ`), and the connection's status says when one is open, as drivers expect
-([Transactions](/pondra/guides/change-rows/#transactions)). `autocommit=True` makes every statement
-its own commit.
+A driver's transactions are Pondra's: `BEGIN` … `COMMIT` is one commit, at Postgres's default `READ COMMITTED`
+or at `REPEATABLE READ`. A statement that changes a row another transaction holds waits for it, as in
+Postgres. The connection's status says when a transaction is open, as drivers expect. The levels, the
+waits and the errors are in [Transactions](/pondra/guides/change-rows/#transactions). `autocommit=True`
+makes every statement its own commit.
 
 ## What runs
 
@@ -84,16 +85,17 @@ its own commit.
 | `CALL p(…)` | the procedure's rows, or `CALL`. What it prints comes as `NOTICE` messages, which psql shows |
 | `DO LANGUAGE python \| sql $$ … $$` | the block's rows, or the tag `DO`. What Python prints comes as `NOTICE` messages. It needs an admin, and Python needs a node started with `--python` |
 | `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT` | a transaction: its statements one commit |
-| `SAVEPOINT`, `RELEASE`, `ROLLBACK TO` | refused (`0A000`): a transaction commits or rolls back whole |
+| `SAVEPOINT`, `RELEASE`, `ROLLBACK TO` | savepoints, as Postgres has them. The connection stays in its transaction, so psycopg's nested `conn.transaction()` works. See [Transactions](/pondra/guides/change-rows/#savepoints) |
 | `SET`, `RESET`, `SHOW` | the connection's [settings](/pondra/sql/statements/#settings-and-prepared-statements): DataFusion's `datafusion.*` options checked and used by its queries, Postgres's names kept and shown |
 | `PREPARE`, `EXECUTE`, `DEALLOCATE` | the connection's prepared statements (a `DEALLOCATE` of a name the protocol prepared: accepted) |
-| `DISCARD`, `CLOSE` | accepted, and ignored |
-| `SHOW server_version`, `standard_conforming_strings`, `transaction_isolation`, `client_encoding` | a fixed answer, unless the connection set it |
+| `DECLARE`, `FETCH`, `MOVE`, `CLOSE` | cursors: a query's rows a part at a time. See [Cursors](#cursors) |
+| `DISCARD` | accepted, and ignored |
+| `SHOW server_version`, `standard_conforming_strings`, `client_encoding` | a fixed answer, unless the connection set it. `SHOW transaction_isolation` says the level a transaction runs at |
 | `SHOW TABLES` | the lake's tables and views, and the `information_schema` views |
 | `DESCRIBE t` | its columns and types, with Arrow's type names |
 
-A connection is a session: `CREATE TEMP TABLE`, temporary views, settings and prepared statements
-are the connection's own, and end when it closes. So do its Python variables: `DO LANGUAGE python` blocks on one connection share
+A connection is a session: `CREATE TEMP TABLE`, temporary views, settings, prepared statements and
+cursors are the connection's own, and end when it closes. So do its Python variables: `DO LANGUAGE python` blocks on one connection share
 them ([Functions and procedures](/pondra/guides/functions-and-procedures/#cells-that-share-variables)). A request with several statements, separated by `;`, runs them in order.
 
 ```bash
@@ -148,10 +150,12 @@ block can return, and how it fails.
 
 ## Parameters
 
-A driver's `$1`, `$2` (or `%s`) parameters are bound into the statement as literals: numbers as
-they are, anything else quoted. A parameter's type is what the client says, or what the query
-implies (`WHERE id = $1` takes `id`'s type). Arrays of `real`, `double precision`, `integer` and
-`bigint` are bound as arrays, for vector search.
+A driver's `$1`, `$2` (or `%s`) parameters are written into the statement as literals of their type, so a
+value can't change what the statement means. Integers and booleans go in as they are. A float is a
+`CAST` of its text, text is quoted, and a date, time, timestamp, interval, UUID, decimal or bytea is its
+literal. A value that doesn't read as its type is refused before anything runs (`22P02` or `22007`).
+A parameter's type is what the client says, or what the query implies (`WHERE id = $1` takes `id`'s
+type). Arrays of `real`, `double precision`, `integer` and `bigint` are bound as arrays, for vector search.
 
 ```python
 with psycopg.connect("host=localhost port=5432 user=admin dbname=lake", autocommit=True) as conn:
@@ -180,8 +184,9 @@ A column comes to the client as the Postgres type closest to its type in the lak
 | `TIMESTAMP` | `timestamp`, in microseconds, without a time zone |
 | `TIMESTAMPTZ` | `timestamptz`: an instant, sent in UTC |
 | `BYTEA`, `BINARY`, `VARBINARY`, `BLOB` | `bytea` |
-| a list (`VARCHAR[]`, `INT[]`, `FLOAT[]`) | a Postgres array, in text and binary format: a `VARCHAR[]` column shows as `character varying[]` |
-| `VARCHAR`, and every other type (structs, `JSON`, `VARIANT`) | `varchar`, as text |
+| a list (`VARCHAR[]`, `INT[]`, `FLOAT[]`) | a Postgres array, in text and binary format: a `VARCHAR[]` column is `text[]` |
+| `VARCHAR`, `JSON`, `VARIANT` | `text`. Pondra has one string type, with no length |
+| a struct, and any other type with no Postgres equal | `varchar`, as text |
 
 A struct reaches the client as its text. Cast in the query if a driver needs another type.
 
@@ -234,13 +239,72 @@ with psycopg.connect("host=localhost port=5432 user=admin dbname=lake", autocomm
 (5,)
 ```
 
+## Cursors
+
+A cursor reads a query's rows a part at a time: `DECLARE` it, `FETCH` or `MOVE` through it, and `CLOSE` it.
+psycopg's named cursors, SQLAlchemy's `stream_results` and pandas' `chunksize` work this way. A cursor belongs
+to its connection. It is kept whole on the node until it is closed or its transaction ends. A cursor without
+`WITH HOLD` ends with the transaction that declared it. `WITH HOLD` keeps it until `CLOSE`, or until the
+connection closes. The answers the node's cursors hold share one budget, `PONDRA_CURSORS_MB`: a `DECLARE`
+past it is refused (`53200`), and a cursor already open is never dropped to make room.
+
+Cursors go forward only. `SCROLL` and `BINARY` cursors and backward moves (`FETCH PRIOR`, `FETCH ABSOLUTE`)
+are refused by name (`0A000`, or `55000` for a backward move of a `NO SCROLL` cursor).
+
+```bash
+psql "postgresql://admin@localhost:5432/lake" <<'EOF'
+BEGIN;
+DECLARE by_id CURSOR FOR SELECT id, item FROM orders ORDER BY id;
+FETCH 2 FROM by_id;
+MOVE 1 FROM by_id;
+FETCH 1 FROM by_id;
+CLOSE by_id;
+COMMIT;
+EOF
+```
+
+```text
+BEGIN
+DECLARE CURSOR
+ id | item  
+----+-------
+  1 | tea
+  2 | cake
+(2 rows)
+
+MOVE 1
+ id | item  
+----+-------
+  4 | scone
+(1 row)
+
+CLOSE CURSOR
+COMMIT
+```
+
+A driver reads a big answer through its named cursor the same way. With psycopg, `itersize` says how many rows
+each `FETCH` asks for:
+
+```python
+with psycopg.connect("host=localhost port=5432 user=admin dbname=lake") as conn:
+    with conn.cursor(name="by_id") as cur:
+        cur.itersize = 2
+        cur.execute("SELECT id FROM orders ORDER BY id")
+        print([row[0] for row in cur])
+```
+
+```text
+[1, 2, 3, 4, 5]
+```
+
 ## The catalog
 
 Drivers and tools look at Postgres's catalog when they connect and when you browse. Pondra answers
 `pg_catalog` (`pg_type`, `pg_class`, `pg_namespace`, `pg_attribute`, `pg_index`, `pg_constraint`,
 `pg_proc`, `pg_database`, `pg_roles` and the other tables they read) and `information_schema`, with the
-lake's tables, views, schemas, functions and keys. That is what psql's backslash commands, SQLAlchemy,
-JDBC, ODBC and dbt read:
+lake's tables, views, schemas, functions and keys. It also has the enum types (`pg_enum`), the sequences
+(`pg_sequence`), `CHECK` constraints and identity columns, so a tool shows them as it would for Postgres.
+That is what psql's backslash commands, SQLAlchemy, JDBC, ODBC and dbt read:
 
 ```bash
 psql "postgresql://admin@localhost:5432/lake" -c '\dt' -c '\d orders'
@@ -257,7 +321,7 @@ psql "postgresql://admin@localhost:5432/lake" -c '\dt' -c '\d orders'
  Column |            Type             | Collation | Nullable | Default 
 --------+-----------------------------+-----------+----------+---------
  id     | bigint                      |           |          | 
- item   | character varying           |           |          | 
+ item   | text                        |           |          | 
  amount | double precision            |           |          | 
  ts     | timestamp without time zone |           |          | 
 ```
@@ -309,14 +373,20 @@ Python and `err.sqlstate` in JavaScript.
 |---|---|
 | `23514` | a row breaks a `CHECK`, or a view's expectation that fails writes |
 | `23502` | a `NOT NULL` column left empty |
-| `40001` | a transaction's row changed by another commit since it began: run it again |
-| `25P02` | a statement in a transaction that already failed |
+| `40001` | a row the transaction changed was changed by another commit since it read it (`REPEATABLE READ`, or a table with a `UNIQUE`): run the transaction again |
+| `40P01` | a wait that would close a loop of row waits: refused at once, and the other transaction goes on |
+| `55P03` | `lock_timeout` ran out while waiting for a row, or `NOWAIT` found the row held |
+| `25P02` | a statement in a transaction that already failed: until `ROLLBACK` |
+| `25P03` | a transaction ended while idle (`PONDRA_TXN_IDLE_SECS`). Its `COMMIT` says nothing was committed |
+| `25006` | a write in a `READ ONLY` transaction |
+| `25P01`, `3B001` | a savepoint statement outside a transaction; a `ROLLBACK TO` of a savepoint that doesn't exist |
+| `57014` | a statement cancelled by its client, or past a timeout |
 | `42P01`, `42703`, `42883` | no such table, column, function |
 | `42601` | a syntax error |
 | `42501` | a user's grants don't allow it |
 | `42P07` | a table or view of that name exists |
 | `22012`, `22003`, `22P02` | division by zero, a number out of range, a value that doesn't cast |
-| `57014`, `53200`, `53300` | a statement timeout; out of memory (an answer bigger than the node's memory for queries too); too many queries waiting at once |
-| `0A000` | not supported |
+| `53200`, `53300` | out of memory (an answer bigger than the node's memory for queries too; a `DECLARE` past `PONDRA_CURSORS_MB`); too many queries waiting at once |
+| `0A000` | not supported: `SERIALIZABLE`, `SKIP LOCKED`, a `SCROLL` cursor, and the other refusals named in the guides |
 | `XX000` | anything else |
 

@@ -9,6 +9,9 @@ statement, run by the node: `frame.sql` shows it. The methods use Polars' names,
 moves over with few changes. For PySpark's names, see
 [`pondra.spark`](/pondra/guides/pyspark/).
 
+`from pondra import *` leaves Python's own `sum`, `len`, `max`, `min` and `all` alone. The frame
+functions with those names are `pondra.sum`, `pondra.len` and the rest, so call them by the module's name.
+
 The examples on this page use two tables:
 
 ```sql
