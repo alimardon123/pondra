@@ -61,6 +61,8 @@ enum TableSpec {
         constraints: Vec<crate::constraints::Constraint>, // UNIQUE, and keys and references said NOT ENFORCED (`constraints.rs`)
         #[serde(default)]
         enums: BTreeMap<String, crate::types::Enum>, // enum columns: the labels each takes (`types.rs`)
+        #[serde(default)]
+        sql_types: BTreeMap<String, String>, // columns held as text of another SQL type: "uuid" (`types.rs`)
     },
 }
 
@@ -69,9 +71,9 @@ enum TableSpec {
 pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> {
     let name = &crate::ddl::new_name(lake, name).await?; // (its schema exists; `public.t` is `t`)
     ensure!(lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(name)).await?.is_none(), "{name} is a view");
-    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, mut defaults, properties, checks, retention, identity, constraints, enums) = match serde_json::from_str(spec)? {
-        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![], BTreeMap::new()),
-        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums),
+    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, mut defaults, properties, checks, retention, identity, constraints, enums, sql_types) = match serde_json::from_str(spec)? {
+        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![], BTreeMap::new(), BTreeMap::new()),
+        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types),
     };
     let retention = retention.as_deref().map(crate::ddl::retention).transpose()?;
     // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `query::dtype`).
@@ -106,6 +108,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     if let Some(c) = enums.keys().find(|c| !columns.iter().any(|(n, t)| n == *c && t == "Utf8")) {
         bail!("{c}: an enum column holds text (a column of the table, of type VARCHAR)");
     }
+    if let Some((c, t)) = sql_types.iter().find(|(c, t)| *t != "uuid" || !columns.iter().any(|(n, ty)| n == *c && ty == "Utf8")) {
+        bail!("{c} {t}: a uuid column holds text (a column of the table, of type VARCHAR)");
+    }
     for (c, expr) in &defaults {
         let t = &columns.iter().find(|(n, _)| n == c).expect("a column").1;
         ensure!(!identity.contains_key(c), "{c} is an identity column: its values come from its sequence, not a DEFAULT");
@@ -135,7 +140,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 i.sequence = crate::seq::owned(lake, name, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
                 defaults.insert(c.clone(), format!("nextval('{}')", i.sequence.replace('\'', "''")));
             }
-            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, folder, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
+            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, sql_types, folder, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
         }
         Some(mut m) => {
             defaulted = false;
@@ -169,6 +174,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                     }
                     if let Some(e) = enums.get(c) {
                         m.enums.insert(s.clone(), e.clone()); // (ALTER TABLE … ADD COLUMN c mood)
+                    }
+                    if let Some(t) = sql_types.get(c) {
+                        m.sql_types.insert(s.clone(), t.clone()); // (ALTER TABLE … ADD COLUMN c UUID)
                     }
                     m.columns.push((s, t.clone()));
                 }
@@ -838,14 +846,14 @@ pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::Fi
 }
 
 pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Result<String> {
-    let (as_text, mut enums) = crate::types::columns(from, &c.columns).await?; // (an enum column holds text: `types.rs`)
+    let (as_text, mut enums, mut sql_types) = crate::types::columns(from, &c.columns).await?; // (an enum or a uuid column holds text: `types.rs`)
     let declared = || declared_of(&as_text);
     let fields = match (&c.like, &c.query) {
         // `CREATE TABLE t LIKE s` takes s's columns and their types, as Postgres's does by default
         // (made with none, it was a table of no columns).
         (Some(ast::CreateTableLikeKind::Plain(l) | ast::CreateTableLikeKind::Parenthesized(l)), _) => {
             ensure!(c.columns.is_empty() && c.query.is_none(), "CREATE TABLE {} LIKE {}: columns or a query, or LIKE, not both", c.name, l.name);
-            enums = crate::types::of_table(from, &object(&l.name)).await; // (its enum columns are enums here too)
+            (enums, sql_types) = crate::types::of_table(from, &object(&l.name)).await; // (its enum and uuid columns are those here too)
             let sql = format!("SELECT * FROM {} LIMIT 0", l.name);
             crate::query::sql(&session(from, &sql, "").await?, &sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>()
         }
@@ -855,7 +863,12 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
             let ctx = if files { ctx.enable_url_table() } else { ctx };
             let fields = crate::query::sql(&ctx, &sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>();
             match c.columns.is_empty() {
-                true => fields,
+                true => {
+                    // (a column the query takes from a uuid is one here too: `CREATE TABLE t2 AS SELECT * FROM t`)
+                    let uuids = crate::pg_types::columns(from, &sql).await;
+                    sql_types.extend(fields.iter().zip(&uuids).filter(|(_, u)| **u).map(|(f, _)| (f.name().clone(), "uuid".to_string())));
+                    fields
+                }
                 false => {
                     ensure!(fields.len() == c.columns.len(), "CREATE TABLE {} names {} columns, and its query gives {}", c.name, c.columns.len(), fields.len());
                     declared().await?
@@ -921,7 +934,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
         columns.push(("_deleted".into(), "Boolean".into())); // (so DELETE works; writes leave it out)
     }
     let constraints = crate::constraints::declared(c, &table)?;
-    let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by"), "ttl": opts.get("ttl"), "partition_by": opts.get("partition_by"), "order_by": opts.get("order_by"), "not_null": not_null, "defaults": defaults, "checks": checks, "retention": opts.get("retention"), "identity": identity, "constraints": constraints, "enums": enums});
+    let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by"), "ttl": opts.get("ttl"), "partition_by": opts.get("partition_by"), "order_by": opts.get("order_by"), "not_null": not_null, "defaults": defaults, "checks": checks, "retention": opts.get("retention"), "identity": identity, "constraints": constraints, "enums": enums, "sql_types": sql_types});
     Ok(spec.to_string())
 }
 
@@ -970,13 +983,20 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
                 Ok(t) => crate::types::of(lake, t).await?,
                 Err(_) => None,
             };
-            let sql_type = if enumerated.is_some() { "VARCHAR" } else { sql_type }; // (an enum column holds text)
+            let held = match &declared {
+                Ok(t) => crate::types::sql_type(t)?,
+                Err(_) => None,
+            };
+            let sql_type = if enumerated.is_some() || held.is_some() { "VARCHAR" } else { sql_type }; // (an enum or a uuid column holds text)
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
             let mut columns = m.columns.clone();
             columns.push((column.to_string(), crate::query::type_name(ctx.table("t").await?.schema().field(0).data_type())));
             spec["columns"] = j!(columns);
             if let Some(e) = enumerated {
                 spec["enums"] = j!({column: e});
+            }
+            if let Some(t) = held {
+                spec["sql_types"] = j!({column: t});
             }
         }
         // (files written from now on follow them; the ones before keep their order until merged)

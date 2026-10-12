@@ -97,6 +97,17 @@ pub fn pg_of(t: &DataType) -> (u32, i32) {
     }
 }
 
+/// uuid's oid: a uuid column's type (`types.rs` holds it as text).
+pub const UUID: u32 = 2950;
+
+/// `pg_typeof(x)`: the name of the Postgres type a value of this Arrow type is sent as.
+pub fn type_of(t: &DataType) -> String {
+    match t {
+        DataType::Null => "unknown".into(), // (an untyped NULL, as Postgres says of one)
+        t => format_type(pg_of(t).0, -1).unwrap_or_else(|| "text".into()),
+    }
+}
+
 /// `format_type(oid, typmod)`.
 fn format_type(oid: u32, typmod: i32) -> Option<String> {
     let name = TYPES.iter().find(|t| t.0 == oid).map(|t| t.2.to_string()).or_else(|| arrays().find(|a| a.0 == oid).map(|a| a.2))?;
@@ -122,7 +133,7 @@ struct Rel {
     identity: BTreeMap<String, crate::seq::Identity>, // identity columns, by name (`attidentity`)
     constraints: Vec<crate::constraints::Constraint>, // UNIQUE, and keys said NOT ENFORCED (SQL's names)
     checks: Vec<(String, String)>, // CHECK constraints: (name, condition)
-    enums: BTreeMap<String, u32>, // enum columns (SQL's names): their type's oid (an inline ENUM('a') is text)
+    typed: BTreeMap<String, u32>, // columns of a type their Arrow type doesn't say (SQL's names): an enum's type's oid (an inline ENUM('a') is text), uuid's
     comment: Option<String>, // COMMENT ON the relation (`cm/relation/…`, `objects.rs`)
     comments: BTreeMap<String, String>, // COMMENT ON its columns, by SQL name (`cm/column/…` by the stored name)
     rows: u64,
@@ -131,10 +142,10 @@ struct Rel {
 
 impl Rel {
     /// A column's type as Postgres names it: (oid, typmod, length, -1 when it varies). An enum
-    /// column's own type; the type `pg_of` gives every other.
+    /// column's own type, a uuid column's; the type `pg_of` gives every other.
     fn column_type(&self, name: &str, t: &DataType) -> (u32, i32, i16) {
-        match self.enums.get(name) {
-            Some(oid) => (*oid, -1, ENUM_LENGTH),
+        match self.typed.get(name) {
+            Some(oid) => (*oid, -1, TYPES.iter().find(|x| x.0 == *oid).map_or(ENUM_LENGTH, |x| x.3)),
             None => {
                 let (typ, typmod) = pg_of(t);
                 (typ, typmod, TYPES.iter().find(|x| x.0 == typ).map_or(-1, |x| x.3))
@@ -268,14 +279,15 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
         let (rows, bytes) = m.files.iter().fold((0, 0), |(r, b), f| (r + f.rows, b + f.bytes));
         let sealed = m.sealed.clone().unwrap_or_default();
         let kind = if mvs.contains(name) { 'm' } else { 'r' };
-        // (an enum column is the type it was declared with, when the lake still has that type)
+        // (an enum column is the type it was declared with, when the lake still has that type; a uuid column is uuid)
         let enums = l.enums.iter().filter_map(|(c, e)| {
             let t = oid("ty", e.of.as_deref()?);
             types.iter().any(|x| x.oid == t).then(|| (c.clone(), t))
-        }).collect();
+        });
+        let typed = enums.chain(l.sql_types.iter().filter(|(_, t)| *t == "uuid").map(|(c, _)| (c.clone(), UUID))).collect();
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = l.columns.iter().filter_map(|(c, _)| Some((c.clone(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: None, identity: l.identity.clone(), constraints: l.constraints.clone(), checks: l.checks.clone(), enums, comment, comments, rows: rows + sealed.rows, bytes: bytes + sealed.bytes });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: None, identity: l.identity.clone(), constraints: l.constraints.clone(), checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows, bytes: bytes + sealed.bytes });
     }
     let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
     // (a view's columns are its query's: planned only when a client asks for columns, in a
@@ -296,16 +308,16 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
         };
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = cols.iter().filter_map(|(c, ..)| Some((c.clone(), notes.get(&format!("column/{name}/{c}"))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(crate::measures::written(&v.sql).into_owned()), identity: Default::default(), constraints: v.facts.clone(), checks: vec![], enums: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(crate::measures::written(&v.sql).into_owned()), identity: Default::default(), constraints: v.facts.clone(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
     }
     // The session's own temporary tables and views, in its temporary schema (as Postgres has them).
     let (temp_tables, temp_views) = crate::temp::listed();
     for (name, cols) in temp_tables {
         let cols = cols.iter().map(|(c, t)| (c.clone(), crate::query::dtype(t).unwrap_or(DataType::Utf8), false, None)).collect();
-        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'r', columns: cols, key: vec![], sql: None, identity: Default::default(), constraints: vec![], checks: vec![], enums: BTreeMap::new(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'r', columns: cols, key: vec![], sql: None, identity: Default::default(), constraints: vec![], checks: vec![], typed: BTreeMap::new(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });
     }
     for (name, sql) in temp_views {
-        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'v', columns: vec![], key: vec![], sql: Some(sql), identity: Default::default(), constraints: vec![], checks: vec![], enums: BTreeMap::new(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'v', columns: vec![], key: vec![], sql: Some(sql), identity: Default::default(), constraints: vec![], checks: vec![], typed: BTreeMap::new(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });
     }
     // Sequences (`sq/`): relations of their own, which an identity column counts by. One whose options
     // don't make sense (none can be made) is left out.
@@ -663,7 +675,7 @@ fn information_schema(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
         for (i, (name, t, not_null, default)) in r.columns.iter().enumerate() {
             let (typ, _, _) = r.column_type(name, t);
             let array = arrays().find(|a| a.0 == typ);
-            let data_type = match (r.enums.contains_key(name), array) {
+            let data_type = match (r.typed.get(name).is_some_and(|t| l.enum_type(*t).is_some()), array) {
                 (true, _) => "USER-DEFINED".to_string(), // (an enum: its type's schema and name, below)
                 (false, Some(_)) => "ARRAY".to_string(),
                 (false, None) => l.format_type(typ, -1).unwrap_or_else(|| "text".into()),
@@ -678,7 +690,7 @@ fn information_schema(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
                 _ => (n(), n(), n()),
             };
             let datetime = if matches!(typ, 1082) { i4(0) } else if matches!(typ, 1083 | 1114 | 1184) { i4(6) } else { n() };
-            let (udt_schema, udt) = match r.enums.get(name).and_then(|oid| l.enum_type(*oid)) {
+            let (udt_schema, udt) = match r.typed.get(name).and_then(|oid| l.enum_type(*oid)) {
                 Some(e) => (e.schema.clone(), e.name.clone()),
                 None => ("pg_catalog".to_string(), type_name(typ).unwrap_or_else(|| "text".into())),
             };

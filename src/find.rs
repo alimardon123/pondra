@@ -115,7 +115,7 @@ async fn stored_parts(l: &Lake, o: &Object, partial: Option<&HashSet<String>>) -
         if partial.is_some_and(|cols| !cols.contains(name) && !cols.contains(stored)) {
             continue;
         }
-        let ty = d.enums.get(name).map_or_else(|| sql_type(ty), |e| e.sql());
+        let ty = crate::types::shown(&d, name, ty);
         let comment = comments.get(stored).cloned();
         out.push(part(o, "column", name.clone(), Some(ty), comment, None));
     }

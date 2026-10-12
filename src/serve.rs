@@ -70,6 +70,9 @@ impl Point {
         crate::query::schema(&self.names.iter().map(|n| (n.clone(), types[n.as_str()].to_string())).collect::<Vec<_>>())
     }
 
+    /// Which of its columns are uuids (`pg_types`): its table's own, by name.
+    pub fn uuids(&self) -> Vec<bool> { self.names.iter().map(|n| self.meta.sql_types.get(n).is_some_and(|t| t == "uuid")).collect() }
+
     /// Its parameters' types (`$1`…, in order), as the key columns they stand for.
     pub fn parameters(&self, sql: &str) -> Vec<datafusion::arrow::datatypes::DataType> {
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
@@ -176,7 +179,9 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
     if names.is_empty() {
         return Ok(None);
     }
-    let key = meta.key.iter().map(|k| eqs.iter().find(|(c, _)| c == k).and_then(|(_, v)| v.clone())).collect();
+    // (a uuid key written another way Postgres takes, `'A0EE…'`, is looked up as the column holds it)
+    let uuid = |k: &String| meta.sql_types.get(k).is_some_and(|t| t == "uuid");
+    let key = meta.key.iter().map(|k| eqs.iter().find(|(c, _)| c == k).and_then(|(_, v)| v.clone()).map(|v| if uuid(k) { crate::types::uuid_of(&v).unwrap_or(v) } else { v })).collect();
     Ok(Some(Point { table, meta, names, key, params }))
 }
 

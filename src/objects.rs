@@ -512,7 +512,7 @@ pub(crate) fn table_sql(name: &str, m: &TableMeta) -> String {
             Some(i) => format!(" {}", i.sql()), // (its sequence is the table's: made with it)
             None => m.defaults.get(c).map(|d| format!(" DEFAULT {d}")).unwrap_or_default(),
         };
-        let ty = m.enums.get(c).map_or_else(|| sql_type(t), |e| e.sql()); // (an enum column: its type, not the text it holds)
+        let ty = crate::types::shown(m, c, t); // (an enum or a uuid column: its type, not the text it holds)
         format!("{} {ty}{merge}{null}{default}", ident(c))
     }).collect();
     if !m.key.is_empty() {
@@ -932,10 +932,15 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
     if let Some((c, _)) = was.iter().find(|(c, _)| enums.get(c) != old.enums.get(c)) {
         bail!("{table}.{c}: a column's enum can't change here (a type takes a new label with ALTER TYPE … ADD VALUE)");
     }
-    // Types widened, as ALTER COLUMN … TYPE does (and refuses, by name, one that would narrow).
+    let sql_types: BTreeMap<String, String> = serde_json::from_value(s["sql_types"].clone()).unwrap_or_default();
+    if let Some((c, _)) = was.iter().find(|(c, _)| sql_types.contains_key(c) && !old.sql_types.contains_key(c)) {
+        return Err(crate::codes::coded("42804", format!("{table}.{c} can't become a uuid: a column is a uuid only from when it is made, since the rows there were never checked as uuids")));
+    }
+    // Types widened, as ALTER COLUMN … TYPE does (and refuses, by name, one that would narrow); a uuid made text.
     let mut changed = vec![];
     for ((c, t), (_, new)) in was.iter().zip(&columns) {
-        if crate::query::dtype(t).ok() != crate::query::dtype(new).ok() {
+        let as_text = old.sql_types.contains_key(c) && !sql_types.contains_key(c);
+        if crate::query::dtype(t).ok() != crate::query::dtype(new).ok() || as_text {
             let written = create.columns.iter().find(|d| d.name.value == *c || d.name.value.to_lowercase() == *c).map_or_else(|| sql_type(new), |d| d.data_type.to_string());
             Box::pin(crate::ddl::apply(lake, Ddl::AlterColumn { table: table.clone(), column: c.clone(), change: crate::ddl::Change::Type(written) })).await?;
             changed.push(format!("{c} {}", sql_type(new)));

@@ -88,6 +88,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod pg;
 #[cfg(feature = "server")] mod path;
 #[cfg(feature = "server")] mod pg_catalog;
+#[cfg(feature = "server")] mod pg_types;
 #[cfg(feature = "server")] mod pg_values;
 #[cfg(feature = "server")] mod ci;
 #[cfg(feature = "server")] mod project;

@@ -219,6 +219,7 @@ impl Backend {
         if reader && crate::txn::open() && crate::txn::gate(&self.app.lake, sql).is_ok() {
             if let Some(b) = crate::txn::point_read(&self.app.lake, sql).await.map_err(user_error)? {
                 let schema = b.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
+                let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, sql).await);
                 return Ok(Response::Query(rows(&schema, b, format)?)); // (in a transaction: its own version, or its snapshot's)
             }
         }
@@ -231,7 +232,7 @@ impl Backend {
                     if trace() {
                         eprintln!("pg point: parse {} µs, row {} µs", t1.as_micros(), (t0.elapsed() - t1).as_micros());
                     }
-                    return Ok(Response::Query(rows(&b.schema(), vec![b], format)?));
+                    return Ok(Response::Query(rows(&crate::pg_types::typed(&b.schema(), &p.uuids()), vec![b], format)?));
                 }
             }
         }
@@ -258,6 +259,7 @@ impl Backend {
         let _busy = crate::txn::next(&self.app, &sql).await.map_err(user_error)?; // (a failed transaction takes nothing but its end; READ COMMITTED reads the newest commit; the guard keeps the transaction busy while this runs)
         if let Some(b) = crate::txn::locked_read(&self.app, &sql).await.map_err(user_error)? {
             let schema = b.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
+            let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, &bound).await);
             return Ok(Response::Query(rows(&schema, b, format)?)); // (a locking read in a transaction: the rows it locked)
         }
         if let Some(cmd) = crate::cursors::of(&sql) {
@@ -306,7 +308,8 @@ impl Backend {
         if let Some(r) = crate::returning::of(&sql) {
             // INSERT, UPDATE or DELETE … RETURNING: the rows it wrote, under its command's tag (`INSERT 0 3`)
             let b = Box::pin(crate::returning::run(&self.app, &r, role, false, None)).await.map_err(user_error)?;
-            let mut answer = rows(&b.schema(), vec![b], format)?;
+            let schema = crate::pg_types::typed(&b.schema(), &crate::pg_types::columns(&self.app.lake, &bound).await);
+            let mut answer = rows(&schema, vec![b], format)?;
             answer.command_tag = r.tag().into();
             return Ok(Response::Query(answer));
         }
@@ -339,6 +342,10 @@ impl Backend {
         let schema = match batches.first() {
             Some(b) => b.schema(),
             None => self.schema(&sql, user).await?,
+        };
+        let schema = match catalog {
+            true => schema,
+            false => crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, &bound).await), // (its uuids, from the statement as written)
         };
         Ok(Response::Query(rows(&schema, batches, format)?))
     }
@@ -471,6 +478,7 @@ impl Backend {
         let err = |e: anyhow::Error| user_error(e);
         let meta = self.app.lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&p.copy.table)).await.map_err(err)?.ok_or_else(|| err(anyhow::anyhow!("no table {}", p.copy.table)))?;
         let table = crate::query::schema(&meta.logical_columns()).map_err(err)?; // (SQL's names: ADR-022)
+        let uuids = meta.logical().sql_types;
         let given: Vec<String> = if p.copy.columns.is_empty() { table.fields().iter().map(|f| f.name().clone()).filter(|c| c != "_deleted").collect() } else { p.copy.columns.clone() }; // (as `SELECT *` shows it)
         let schema = Arc::new(Schema::new(given.iter().map(|c| table.field_with_name(c).cloned()).collect::<Result<Vec<_>, _>>().map_err(|e| err(e.into()))?));
         let null = regex::Regex::new(&format!("^{}$", regex::escape(&p.copy.null.clone().unwrap_or(if csv { String::new() } else { "\\N".into() })))).map_err(|e| err(e.into()))?;
@@ -483,6 +491,7 @@ impl Backend {
             // the table's columns in its order, those not given their DEFAULT, or null
             let cols = table.fields().iter().map(|f| b.column_by_name(f.name()).cloned().unwrap_or_else(|| datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows()))).collect();
             let b = RecordBatch::try_new(table.clone(), cols).map_err(|e| err(e.into()))?;
+            let b = crate::types::spelled(b, &uuids).map_err(err)?; // (`'A0EE…'` in a uuid column as Postgres reads it)
             let b = crate::defaults::fill(&self.app.lake, &meta, b.clone(), |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(b.num_rows()))).await.map_err(err)?;
             p.rows += b.num_rows() as u64;
             p.seq += 1;
@@ -618,8 +627,11 @@ fn rows(schema: &Schema, batches: Vec<RecordBatch>, format: &Format) -> PgWireRe
     let each = info.clone();
     let rows = batches.into_iter().flat_map(move |b| each_row(&b, &types, |cols, i| {
         let mut row = DataRowEncoder::new(each.clone());
-        for c in cols {
-            encode!(&mut row, c, i)?;
+        for (c, f) in cols.iter().zip(each.iter()) {
+            match *f.datatype() == Type::UUID && c.is_valid(i) {
+                true => row.encode_field(&PgUuid(c.as_string::<i32>().value(i).to_string()))?,
+                false => encode!(&mut row, c, i)?,
+            }
         }
         Ok(row.take_row())
     }));
@@ -628,7 +640,7 @@ fn rows(schema: &Schema, batches: Vec<RecordBatch>, format: &Format) -> PgWireRe
 
 /// Columns as Postgres sees them, and the Arrow types their values are sent as.
 fn fields(schema: &Schema, format: &dyn Fn(usize) -> FieldFormat) -> (Arc<Vec<FieldInfo>>, Vec<DataType>) {
-    let types: Vec<(Type, DataType)> = schema.fields().iter().enumerate().map(|(i, f)| pg_type(f.data_type(), format(i))).collect();
+    let types: Vec<(Type, DataType)> = schema.fields().iter().enumerate().map(|(i, f)| field_type(f, format(i))).collect();
     let info = schema.fields().iter().zip(&types).enumerate().map(|(i, (f, (t, _)))| FieldInfo::new(f.name().clone(), None, None, t.clone(), format(i))).collect();
     (Arc::new(info), types.into_iter().map(|(_, a)| a).collect())
 }
@@ -641,8 +653,17 @@ fn each_row<T>(b: &RecordBatch, types: &[DataType], mut row: impl FnMut(&[ArrayR
     }
 }
 
+/// A column's Postgres type and the Arrow type its values are sent as: a uuid's (`pg_types::typed`
+/// marks one), else its Arrow type's.
+fn field_type(f: &datafusion::arrow::datatypes::Field, format: FieldFormat) -> (Type, DataType) {
+    match crate::pg_types::is_uuid(f) {
+        true => (Type::UUID, DataType::Utf8),
+        false => pg_type(f.data_type(), format),
+    }
+}
+
 /// The Postgres type for an Arrow type, and the Arrow type its values are sent as.
-fn pg_type(t: &DataType, format: FieldFormat) -> (Type, DataType) {
+pub(crate) fn pg_type(t: &DataType, format: FieldFormat) -> (Type, DataType) {
     match t {
         DataType::Boolean => (Type::BOOL, DataType::Boolean),
         DataType::Int8 | DataType::Int16 | DataType::UInt8 => (Type::INT2, DataType::Int16),
@@ -820,6 +841,26 @@ impl postgres_types::ToSql for PgTime {
 impl pgwire::types::ToSqlText for PgTime {
     fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
         out.extend_from_slice(crate::pg_values::time_text(self.0).as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+}
+
+/// A uuid as Postgres sends it: its text, or its 16 bytes (a column holds the text: `types.rs`).
+#[derive(Debug)]
+struct PgUuid(String);
+
+impl postgres_types::ToSql for PgUuid {
+    fn to_sql(&self, _: &Type, out: &mut bytes::BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(uuid::Uuid::try_parse(&self.0)?.as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+    fn accepts(ty: &Type) -> bool { *ty == Type::UUID }
+    postgres_types::to_sql_checked!();
+}
+
+impl pgwire::types::ToSqlText for PgUuid {
+    fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(self.0.as_bytes());
         Ok(postgres_types::IsNull::No)
     }
 }
@@ -1169,6 +1210,17 @@ impl Backend {
     /// The types of `$1`, `$2`… as the query implies them (`WHERE id = $1`: id's type); text when
     /// it doesn't say.
     async fn param_types(&self, sql: &str) -> Vec<Type> {
+        let mut types = self.inferred(sql).await;
+        for i in crate::pg_types::params(&self.app.lake, sql).await {
+            if let Some(t) = types.get_mut(i).filter(|t| **t == Type::TEXT) {
+                *t = Type::UUID; // (a uuid's: asyncpg sends it as one, and `pg_values` takes it as Postgres's text or binary)
+            }
+        }
+        types
+    }
+
+    /// `param_types`, but for uuids (`pg_types`), which are text to the planner.
+    async fn inferred(&self, sql: &str) -> Vec<Type> {
         if let (None, Ok(Some(p))) = (crate::auth::limited(), crate::serve::point(&self.app.lake, sql).await) {
             return p.parameters(sql).iter().map(|t| pg_type(t, FieldFormat::Text).0).collect(); // (a key lookup's: its key's types, unplanned)
         }
@@ -1216,20 +1268,26 @@ impl Backend {
         }
         if crate::returning::of(sql).is_some() {
             // (its columns as `run` answers them: the same text, its macros and Postgres's forms written out)
+            let marks = crate::pg_types::columns(&self.app.lake, sql).await; // (its uuids, from the statement as written)
             let sql = crate::vars::bound(sql).map_err(user_error)?;
             let sql = crate::routines::expand(&self.app.lake, &sql).await.map_err(user_error)?;
             if let Some(r) = crate::returning::of(&pg_dialect(&self.app.lake, &sql, "")) {
                 let schema = crate::returning::columns(&self.app, &r).await.map_err(user_error)?;
+                let schema = crate::pg_types::typed(&schema, &marks);
                 return Ok((described(&schema, format), Columns::Kept { schema, given: false }));
             }
         }
         let point = match crate::auth::limited() {
-            None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| p.schema().ok()), // (a key lookup's columns, unplanned, first)
+            None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.uuids()))), // (a key lookup's columns, unplanned, first)
             Some(_) => None,
         };
         if point.is_none() && (session_command(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some() || crate::script::is(sql)) {
             return Ok((vec![], Columns::None)); // (a COPY's columns come with its data)
         }
+        let marks = match point {
+            Some(_) => vec![],
+            None => crate::pg_types::columns(&self.app.lake, sql).await, // (its uuids, from the statement as written, as `run` has them)
+        };
         let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: the connection's variable)
         let bound = crate::routines::expand(&self.app.lake, &bound).await.map_err(user_error)?; // (macros, DuckDB's forms: as `run` has them)
         let sql: &str = &bound;
@@ -1237,7 +1295,7 @@ impl Backend {
             Some(s) => s,
             None => {
                 let probe = (1..).take_while(|i| sql.contains(&format!("${i}"))).fold(sql.to_string(), |q, i| q.replace(&format!("${i}"), "NULL"));
-                self.schema(&probe, "").await?
+                crate::pg_types::typed(&self.schema(&probe, "").await?, &marks)
             }
         };
         Ok((described(&schema, format), Columns::Kept { schema, given: false }))
@@ -1263,7 +1321,7 @@ where
 
 /// A result's columns as Postgres describes them: each one's type, in the format the client asked for.
 fn described(schema: &Schema, format: &Format) -> Vec<FieldInfo> {
-    schema.fields().iter().enumerate().map(|(i, f)| FieldInfo::new(f.name().clone(), None, None, pg_type(f.data_type(), format.format_for(i)).0, format.format_for(i))).collect()
+    schema.fields().iter().enumerate().map(|(i, f)| FieldInfo::new(f.name().clone(), None, None, field_type(f, format.format_for(i)).0, format.format_for(i))).collect()
 }
 
 /// `PONDRA_TRACE_PG=1`: where a Postgres statement's time goes, on stderr.
