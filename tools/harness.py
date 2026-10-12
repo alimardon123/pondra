@@ -2153,6 +2153,25 @@ def kafka():
         sorted(holders) == [0, 1] and len(seen) == n + 1000
     if not checks["consumer groups (commit, hand-over via a follower, one holder)"]:
         print("groups:", len(first), len(rest), len(set(both)), min(rest, default=None), max(first, default=None), holders, len(seen))
+    # every node lists every live node as a broker, the same list: librdkafka drops a broker a
+    # Metadata reply leaves out, and a group's request in flight there with it (the group then
+    # never joined: 2 tries in 45 read nothing, bootstrapped with every node)
+    from confluent_kafka.admin import AdminClient
+    listed = [sorted((b.id, b.port) for b in AdminClient({**sasl("reader", "r-tok"), "bootstrap.servers": f"127.0.0.1:{kport + k}"}).list_topics(timeout=10).brokers.values())
+              for k in (0, 1)]
+    checks["every node's Metadata lists both nodes, alike"] = listed[0] == listed[1] and sorted(p for _, p in listed[0]) == [kport, kport + 1]
+    read_all = []
+    for g in range(10):
+        c = ck.Consumer({**sasl("reader", "r-tok"), "group.id": f"both{g}", "auto.offset.reset": "earliest", "bootstrap.servers": f"127.0.0.1:{kport},127.0.0.1:{kport + 1}"})
+        c.subscribe(["events"])
+        got, t_end = set(), time.time() + 30
+        while len(got) < n + 1000 and time.time() < t_end:
+            got.update(m.offset() for m in c.consume(1000, 0.5) if m.error() is None)
+        c.close()
+        read_all.append(len(got))
+    checks["10 groups bootstrapped with both nodes each read every record"] = read_all == [n + 1000] * 10
+    if not all(checks[k] for k in list(checks)[-2:]):
+        print("brokers listed:", listed, "groups read:", read_all)
     follower.kill()
     # tokens: a wrong password is refused; a read token can't produce
     failed = []
