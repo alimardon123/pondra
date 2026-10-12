@@ -11283,6 +11283,12 @@ def doors():
         c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
         c.request("PUT", f"/files/{path}", body.encode())
         assert c.getresponse().status == 200, path
+    backups = tempfile.mkdtemp(prefix="pondra-doors-backups-")  # (a backup goes in a place of its own: ADR-070)
+    atexit.register(shutil.rmtree, backups, True)
+    q(f"BACKUP DATABASE TO '{backups}/read'")
+    q(f"ATTACH '{backups}/read' AS d_bk")
+    def backed(place):
+        return any(f.endswith(".json.zst") for f in os.listdir(os.path.join(place, "_backups")))
     DOORS = ["http", "python", "postgres", "flight", "javascript", "mcp", "cli", "console"]
     shell_dir = tempfile.mkdtemp(prefix="pondra-doors-cwd-")  # (the shell attaches the lakes beside its folder: an empty one)
     def features(i):
@@ -11302,6 +11308,8 @@ def doors():
             "USE a schema": (["USE d_crm", "SELECT count(*) AS n FROM d_only"], lambda r: r[-1] == [[3]]),
             "a macro": (["SELECT d_twice(21) AS n"], lambda r: r[-1] == [[42]]),
             "a Git folder's status": (["SELECT path, change FROM pondra.git_status('d_git')"], lambda r: r[-1] == [["a.sql", "added"]]),
+            "a backup": ([f"BACKUP DATABASE TO '{backups}/door{i}'"], lambda r: backed(f"{backups}/door{i}")),
+            "a write to a backup refused, 25006": ([f"INSERT INTO d_bk.d_log VALUES ('door{i}', {i})"], lambda r: r == "25006"),
         }
     def rows_of(x):
         return [list(r.values()) if isinstance(r, dict) else list(r) for r in x] if isinstance(x, list) else x
@@ -11371,7 +11379,7 @@ def doors():
                 text = r["content"][0]["text"]
                 if r["isError"]:
                     m = re.search(r"\b(\d{2}[0-9A-Z]\d{2})\b", text)
-                    return m.group(1) if m and m.group(1) in ("23514", "42P01", "40001", "25P02") else "refused: " + text[:160]
+                    return m.group(1) if m and m.group(1) in ("23514", "42P01", "40001", "25P02", "25006") else "refused: " + text[:160]
                 got = json.loads(text)
                 out.append(rows_of(got["rows"]) if isinstance(got, dict) and "rows" in got else None)
         finally:
@@ -11409,7 +11417,7 @@ finally {{ await db.close?.(); }}"""
         return out
     # The shell prints its errors without a SQLSTATE (the header `x-pondra-sqlstate` carries it), so the
     # codes this matrix checks are named by the words of their messages.
-    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01")]
+    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01"), ("is a backup, so it is read-only", "25006")]
     def via_cli(stmts):
         # The shell on the lake, one process for the feature's statements: one session (`shell.rs`). It has no
         # `--url`, so it starts a node on the lake, which joins this one as a follower; its own address is an
@@ -11489,7 +11497,9 @@ def friendly():
     over the same rows: PIVOT and UNPIVOT (DuckDB's statements and the standard's), COLUMNS(…),
     `* RENAME`, ORDER BY ALL, FETCH FIRST, list comprehensions and lambdas, a struct's field,
     max_by and arg_min, string_split, json_extract, DuckDB's ASOF JOIN … ON, a select's alias in
-    its WHERE, SUMMARIZE; samples that sample (TABLESAMPLE was ignored); refusals by name; the
+    its WHERE, SUMMARIZE; a DOUBLE meeting a DECIMAL (a DOUBLE, as DuckDB and Postgres make it: it
+    was a DECIMAL(30, 15), which failed past 10^15) and an INSERT's VALUES of both; samples that
+    sample (TABLESAMPLE was ignored); refusals by name; the
     same answers spread over three nodes; and what `random_sql.py` found (`- -3` written again as
     a comment, a DISTINCT over a CASE refused, two IN lists of a column taken as sets of values,
     columns of one name on both sides of a join mixed up)."""
@@ -11508,7 +11518,10 @@ def friendly():
     setup = ["CREATE TABLE t (id INTEGER, k INTEGER, g VARCHAR, x DOUBLE, n DOUBLE, l INTEGER[], ts TIMESTAMP, j VARCHAR)",
              "INSERT INTO t VALUES " + ", ".join(row(i) for i in range(2000)),
              "CREATE TABLE q (k INTEGER, ts TIMESTAMP, p DOUBLE)",
-             "INSERT INTO q VALUES " + ", ".join(f"({k}, TIMESTAMP '{t0 + datetime.timedelta(minutes=37 * i + k)}', {i + k / 10})" for i in range(60) for k in range(6))]
+             "INSERT INTO q VALUES " + ", ".join(f"({k}, TIMESTAMP '{t0 + datetime.timedelta(minutes=37 * i + k)}', {i + k / 10})" for i in range(60) for k in range(6)),
+             # (doubles past 10^15 beside decimals: DataFusion made both a DECIMAL(30, 15), and failed)
+             "CREATE TABLE big (x DOUBLE, r REAL, d DECIMAL(38, 2))",
+             "INSERT INTO big VALUES (1e20, 1.5, 12.34), (0.7, 0.25, 0.5), (1e-20, NULL, 99999999999999999999.99), (-3e18, -2.5, -1.25), (NULL, 3, NULL)"]
     for s_ in setup:
         sql(A.port, s_)
         duck.execute(s_)
@@ -11572,6 +11585,10 @@ def friendly():
         "x IN (a column, …) AND x IN (…): not the lists' intersection (random_sql.py)": ("SELECT id FROM t WHERE g IN (g, 'z') AND g IN ('a', 'b')", True, False),
         "x IN (…) AND x NOT IN (NULL): no row (random_sql.py)": ("SELECT count(*) AS c FROM t WHERE g IN ('a', 'b') AND g NOT IN (NULL)", True, False),
         "columns of one name on both sides of a LEFT JOIN, filtered on its padded side (random_sql.py)": ("SELECT (t.ts - q.ts) AS d, t.k FROM t LEFT JOIN q ON t.id = q.k WHERE q.k IS DISTINCT FROM 3", True, False),
+        "a DOUBLE past 10^15 compared with decimals (=, >, <, BETWEEN, IN)": ("SELECT x, x = 0.7 AS e, x > 0.5 AS g, x < 1e30 AS l, x BETWEEN 0.5 AND 2.5 AS b, x IN (0.7, 2.5) AS i FROM big", True, False),
+        "…in arithmetic, a REAL's and a DECIMAL column's too": ("SELECT x * 1.5 AS a, x + 0.25 AS b, r * 2.5 AS c, d * x AS e, d + 0.01 AS f FROM big", True, False),
+        "…as CASE's branches, COALESCE, GREATEST and LEAST": ("SELECT CASE WHEN x > 1 THEN x ELSE 0.5 END AS c, coalesce(x, 0.5) AS o, greatest(x, 0.5) AS g, least(x, 2.5) AS l FROM big", True, False),
+        "…in a UNION and as a join's key": ("SELECT x FROM big UNION ALL SELECT 0.25 UNION ALL SELECT big.x FROM big JOIN (VALUES (0.7)) v(e) ON big.x = v.e", True, False),
     }
     checks, failed = {}, {}
     for name, (q, names, ordered) in same.items():

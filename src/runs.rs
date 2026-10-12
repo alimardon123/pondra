@@ -263,6 +263,9 @@ async fn append(app: &App, producer: &str, seq: u64, lines: &[Line], made: &mut 
 pub fn mark_stopped(app: App) {
     crate::panics::spawn(async move {
         let since = now_ms();
+        if crate::backup::frozen(&app.lake) {
+            return; // (a backup runs nothing, and writes no run log: ADR-070)
+        }
         if let Err(e) = stopped(&app, since, Some(&app.cluster.addr)).await {
             eprintln!("runs whose node stopped: {e:#}");
         }
@@ -654,6 +657,9 @@ pub fn schedule(app: App) {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                 _ = WAKE.notified() => {}
+            }
+            if crate::backup::frozen(&app.lake) {
+                continue; // (a backup runs nothing: ADR-070)
             }
             let Ok(all) = tasks(&app.lake).await else { continue };
             for (name, task) in all.iter() {

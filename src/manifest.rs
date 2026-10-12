@@ -352,6 +352,31 @@ pub async fn seal(lake: &Lake, table: &str, meta: &mut TableMeta) -> Result<bool
     Ok(true)
 }
 
+/// `files` sealed under `dir` of another lake's `store` (a backup's: ADR-070), as `seal` keeps them:
+/// manifests of up to `BIG` files and their list, each named by its contents, so a run that seals
+/// the same files again writes nothing new. What it names goes in `written`.
+pub async fn sealed_into(store: &crate::store::Store, dir: &str, files: &[DataFile], schema: &SchemaRef, written: &mut Vec<String>) -> Result<Sealed> {
+    async fn put(store: &crate::store::Store, dir: &str, value: &impl Serialize, written: &mut Vec<String>) -> Result<String> {
+        use object_store::ObjectStore;
+        let body = serde_json::to_vec(value)?;
+        let name = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &body).as_ref()[..16].iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let path = format!("{dir}/{name}.json.zst");
+        let opts = object_store::PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
+        match store.put_opts(&object_store::path::Path::from(path.as_str()), zstd::encode_all(&body[..], 3)?.into(), opts).await {
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("writing {path}"))),
+        }
+        written.push(path.clone());
+        Ok(path)
+    }
+    let mut list = vec![];
+    for chunk in files.chunks(BIG as usize) {
+        list.push(summary(put(store, dir, &chunk, written).await?, chunk, schema));
+    }
+    let (n, rows, bytes) = list.iter().fold((0, 0, 0), |(f, r, b), m| (f + m.files, r + m.rows, b + m.bytes));
+    Ok(Sealed { list: put(store, dir, &list, written).await?, files: n, rows, bytes })
+}
+
 /// Take manifests `which` (of `list`, the table's) apart: their files back inline, the list
 /// without them (a purge is about to replace some of their files; `seal` puts the rest away again).
 pub async fn unseal(lake: &Lake, table: &str, meta: &mut TableMeta, mut list: Vec<Manifest>, which: &[usize]) -> Result<()> {

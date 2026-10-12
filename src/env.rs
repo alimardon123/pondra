@@ -124,6 +124,7 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_TRIES", Command),
     ("PONDRA_NODE_KEY", Starter),
     ("PONDRA_OWNER_KEY", Starter),
+    ("PONDRA_REACH", Starter),
     ("PONDRA_SERVER_URL", Starter),
     ("PONDRA_SUPERVISED", Starter),
     ("PONDRA_CRASH", Test),

@@ -199,6 +199,9 @@ impl Node {
                     Ok(()) if made => l.cat.checkpoint().await.unwrap_or_else(|e| eprintln!("checkpoint: {e:#}")),
                     Ok(()) => {}
                 }
+                if backup::frozen(&l) {
+                    return; // (a backup's secrets and keys stay as its runs wrote them: ADR-070)
+                }
                 match ext::rewrap(&l).await {
                     Ok(0) => {}
                     Ok(n) => eprintln!("rewrapped {n} secret{} with the master key in use now", if n == 1 { "" } else { "s" }),

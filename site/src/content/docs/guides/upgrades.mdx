@@ -115,11 +115,14 @@ The cluster keeps serving and taking writes the whole time, with nodes of both r
 
 <Steps>
 
-1. Stop one follower (it drains), replace its binary, and start it again with the same options.
-2. Wait until its `GET /ready` answers 200.
-3. Do the same for each other follower, and for readers.
-4. Last, the leader: it steps down when it stops, and one of the upgraded followers leads at once.
-5. Check the leader's `GET /stats`: every node in `releases` says the new release.
+1. Back the lake up with the release still running: `BACKUP DATABASE TO 's3://other-bucket/backups/prod'`
+   ([backups](/pondra/guides/backups/)). A backup keeps the format it was written at, so the release you
+   are leaving can serve it if the upgrade goes wrong.
+2. Stop one follower (it drains), replace its binary, and start it again with the same options.
+3. Wait until its `GET /ready` answers 200.
+4. Do the same for each other follower, and for readers.
+5. Last, the leader: it steps down when it stops, and one of the upgraded followers leads at once.
+6. Check the leader's `GET /stats`: every node in `releases` says the new release.
 
 </Steps>
 
@@ -198,6 +201,7 @@ can't read. Until something moves it, the release before still opens it.
 | 1 | 0.32 | every lake, as soon as a release that knows formats opens it |
 | 2 | 0.33 | a materialized view that works its answers out as it is read (`avg`, `stddev`, `HAVING`, …) |
 | 3 | 0.34 | a lake's own keys sealed by a master key every node shares (`PONDRA_SECRET_KEY` or `PONDRA_KMS_COMMAND`): from the first write in a lake the release makes, otherwise by its leader once every node knows format 3 |
+| 4 | 0.34 | a grant on another database (`GRANT … ON DATABASE`, `GRANT CLONE ON DATABASE`), which a node of 0.33 can't read: made only once every node knows format 4 |
 
 An older release refuses a newer lake by name, before it reads anything. The message has this shape,
 with the lake, its format and the release that wrote it filled in:

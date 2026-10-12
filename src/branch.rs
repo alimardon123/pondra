@@ -141,7 +141,7 @@ pub fn id_of(url: &str) -> String {
     format!("{:012x}", h & 0xffff_ffff_ffff)
 }
 
-fn pin_key(branch: &str) -> String { format!("pn/{}", id_of(branch)) }
+pub(crate) fn pin_key(branch: &str) -> String { format!("pn/{}", id_of(branch)) }
 
 /// Is `name` (a table or view, `schema.t` or `t`) in the schemas a clone took (none: all)?
 fn took(schemas: &[String], name: &str) -> bool {
@@ -592,7 +592,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
             _ if deny.iter().any(|d| k.starts_with(d)) => {}
             "u" if away => {}
             "ld" if !m.data || !loads.iter().any(|p| k.starts_with(p.as_str())) => {}
-            "c" | "n" | "b" | "m" | BASES | "format" | crate::store::QUIET => {}
+            "c" | "n" | "b" | "m" | BASES | "format" | crate::store::QUIET | crate::backup::KEY => {} // (a clone of a backup is a database of its own)
             "t" if name.starts_with("pondra$") || !wanted(name) => {} // (the run log, audit, history: the branch's own)
             "t" => {
                 let mut meta: TableMeta = serde_json::from_slice(v).with_context(|| k.clone())?;
@@ -665,7 +665,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
 }
 
 /// The base's catalog at a version that holds `pin`, written at `at_ms` or later.
-async fn snapshot(base: &Lake, pin: &str, at_ms: u64) -> Result<BTreeMap<String, bytes::Bytes>> {
+pub(crate) async fn snapshot(base: &Lake, pin: &str, at_ms: u64) -> Result<BTreeMap<String, bytes::Bytes>> {
     let started = std::time::Instant::now();
     loop {
         let all = base.cat.scan_raw("", "\x7f").await?;

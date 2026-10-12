@@ -1,0 +1,170 @@
+---
+title: Backups
+description: Back a database up to another place with BACKUP DATABASE, keep it current with a nightly task, read it, and restore it as it was at any run you kept.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
+
+A backup is a copy of a whole database in a place of its own: another folder, another bucket or
+another provider. It holds everything the database does, as of one moment: its tables, the newest
+rows not yet in files, views, routines, tasks, users and grants, and sealed secrets. Run it again
+and it copies only what changed. Use one for what [`AT`, `UNDROP` and `CLONE`](/pondra/guides/past/)
+can't undo: a deleted folder, an emptied bucket, a closed account, a region that is down.
+
+## Back up a database
+
+`BACKUP DATABASE TO 'place'` copies this database to `place`, a folder (relative to where the node
+runs) or a URL such as `s3://other-bucket/backups/shop`. The place must be outside the database's
+own folder, and empty the first time: a backup never writes over a folder or a lake of anything else.
+It is an admin's statement, and it works from every door: SQL over HTTP, the Postgres
+port, the clients and the command line.
+
+```sql
+CREATE TABLE orders (id BIGINT, item VARCHAR, qty INT);
+INSERT INTO orders VALUES (1, 'tea', 2), (2, 'cake', 1);
+BACKUP DATABASE TO 'backups/shop';
+```
+
+```text
+{"backup": "/…/backups/shop", "of": "/…/lake", "run": "2026-10-12T03:00:00.412Z", "tables": 1,
+ "objects": 0, "bytes": 0, "copied": 0, "copied_bytes": 0, "runs": 1}
+```
+
+The answer says when the run was taken, how many tables it holds, how many files it names
+(`objects`, `bytes`) and copied this time (`copied`, `copied_bytes`), and how many runs the backup
+keeps. Rows this new are still in the log, which goes with the catalog, so there was no file to copy
+yet. The database keeps serving and taking writes while it runs: the backup is
+the database as of the moment it started.
+
+`BACKUP DATABASE name TO 'place'` backs up another database attached here instead.
+
+A place in another bucket or provider is written with the bucket secret whose `SCOPE` covers it
+([secrets](/pondra/guides/files-and-other-lakes/#files-in-buckets-and-over-https)), so a lake on R2
+can be backed up to S3; with no such secret, the node's own credentials are used.
+
+```sql norun
+CREATE SECRET backups_s3 (TYPE s3, KEY_ID 'AKIA…', SECRET '…', REGION 'eu-west-1', SCOPE 's3://acme-backups');
+BACKUP DATABASE TO 's3://acme-backups/shop';
+```
+
+## Run it again: only what changed
+
+A second backup to the same place copies only the files written since the first. Files never change
+under their names, so nothing already there is read again.
+
+```sql
+INSERT INTO orders VALUES (3, 'scone', 4);
+BACKUP DATABASE TO 'backups/shop';
+```
+
+Its answer says `"runs": 2`, and `copied` counts only the new objects.
+
+## Every night
+
+A task runs it on a schedule, like any other statement ([tasks](/pondra/guides/tasks/)):
+
+<Ways sql={`CREATE TASK nightly_backup SCHEDULE 'cron 0 3 * * * UTC' AS BACKUP DATABASE TO 'backups/shop';`} />
+
+A backup keeps each run restorable for seven days. Say how long with `WITH (retention_days = n)`; the
+backup keeps the last number it was given. Files no run within that time needs are deleted from the
+backup by a later run.
+
+<Ways sql={`BACKUP DATABASE TO 'backups/shop' WITH (retention_days = 30);`} />
+
+## Read a backup
+
+A backup is a database of its own: attach it and read it, or serve it with `pondra serve --dir
+backups/shop`. It is read-only: every write to it is refused with SQLSTATE `25006`, whatever door it
+comes through, and only its next `BACKUP DATABASE … TO` changes it.
+
+<Ways sql={`ATTACH 'backups/shop' AS shop_backup;`} />
+
+<Ways sql={`SELECT * FROM shop_backup.orders ORDER BY id;`} />
+
+```text
+id | item  | qty
+---+-------+----
+1  | tea   | 2
+2  | cake  | 1
+3  | scone | 4
+```
+
+To work on what a backup holds without changing it, branch it: `CREATE DATABASE shop_test CLONE
+shop_backup` makes a database you can write, with nothing copied ([branches](/pondra/guides/environments/)).
+
+## Restore
+
+`RESTORE DATABASE name FROM 'place'` copies the backup's newest run into a new database, beside this
+one (or at `LOCATION 'dir'`), and attaches it as `name`. `AT (TIMESTAMP => '…')` restores the newest
+run at or before that time, in UTC, instead.
+
+<Ways sql={`RESTORE DATABASE shop_restored FROM 'backups/shop';`} />
+
+<Ways sql={`SELECT count(*) AS orders FROM shop_restored.orders;`} />
+
+```text
+orders
+------
+3
+```
+
+```sql norun
+RESTORE DATABASE shop_monday FROM 's3://other-bucket/backups/shop' AT (TIMESTAMP => '2026-10-12 03:00:00');
+```
+
+A restore only reads the backup, and goes into a place that holds nothing yet. If it fails, it takes
+away what it made. The restored database's tasks are suspended, so a copy never starts sending mail
+or writing elsewhere on its own: resume each with `ALTER TASK name RESUME` once that copy should run
+them.
+
+## From the command line, with no node
+
+`pondra backup LAKE PLACE` and `pondra restore PLACE NEW` do the same with no node running: on a
+machine that can reach both places, or from a scheduler of your own. `pondra backup` reaches `PLACE`
+with the lake's secrets as `BACKUP DATABASE` does (set `PONDRA_SECRET_KEY` to open them); `pondra
+restore` reads and writes with the environment's credentials. `--at` takes a time in UTC, an RFC
+3339 time, or milliseconds.
+
+```bash
+pondra sql --dir till "CREATE TABLE t (a INT)"
+pondra sql --dir till "INSERT INTO t VALUES (1)"
+pondra backup till backups/till > /dev/null
+sleep 1; first=$(date -u '+%Y-%m-%d %H:%M:%S'); sleep 1
+pondra sql --dir till "INSERT INTO t VALUES (2)"
+pondra backup till backups/till > /dev/null
+pondra restore backups/till till-as-first --at "$first" > /dev/null
+pondra sql --dir till-as-first "SELECT count(*) AS rows FROM t"
+```
+
+```text
++------+
+| rows |
++------+
+| 1    |
++------+
+```
+
+## What a backup holds
+
+| | |
+|---|---|
+| Goes with every run | tables (and dropped tables still kept for `UNDROP`), the rows not yet in files, each table's past for `AT`, views, materialized views, routines, tasks, users, roles and grants, secrets (sealed), shares and recipients, sequences, indexes, types, comments, and the workspace's files |
+| Each database's own, never carried | the keys its nodes sign sessions and each other in with (a restored database makes new ones, so its users sign in again), what it published to Delta and Iceberg (a restored database publishes again), and the pins its branches hold |
+| Not in it | the databases attached to it: each is a database of its own, so back each one up (`BACKUP DATABASE sales TO …` from here backs up the attached `sales`) |
+
+Secrets stay sealed in a backup: restoring them needs the same master key (`PONDRA_SECRET_KEY`), which a
+backup never holds. Keep that key somewhere apart from the bucket.
+
+<Aside type="caution">
+A backup's files are copied through the node, so a backup in another provider costs that provider's
+egress, and the first run copies the whole database. There is no restore of one table yet: clone the
+backup and copy the table with `INSERT INTO t SELECT * FROM shop_test.t`. The workspace's files are
+kept as the newest run found them, not one version per run.
+</Aside>
+
+## Before an upgrade
+
+Take a backup before you move to a release that changes the lake's format ([upgrades](/pondra/guides/upgrades/)).
+A backup keeps the format it was written at, so the release you are leaving can still serve it if the
+upgrade goes wrong.

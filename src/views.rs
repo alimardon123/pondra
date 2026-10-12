@@ -785,6 +785,9 @@ fn event_time(plan: &LogicalPlan, window: &str) -> Option<String> {
 /// Leader: emit what the watermark has passed, once, for every window and session view (one
 /// that fails is tried again next round; the others go on).
 pub async fn emit_all(lake: &Lake, log: &crate::log::Log) -> Result<()> {
+    if crate::backup::frozen(lake) {
+        return Ok(()); // (a backup emits nothing: ADR-070)
+    }
     for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
         let done = match (&v.emit, &v.sessions, &v.once) {
             (Some(e), _, _) => emit(lake, log, &key[2..], &v, e).await,

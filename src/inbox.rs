@@ -66,7 +66,8 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>) -> Result<Opti
 /// fence it out.
 pub async fn lead_once(dir: &str) -> Result<()> {
     let out = tokio::process::Command::new(std::env::current_exe()?).args(["lead", "--dir", dir]).envs(crate::env::given())
-        .env_remove("PONDRA_JOB").env_remove("PONDRA_TRIES").stdin(std::process::Stdio::null()).output().await?;
+        .env_remove("PONDRA_JOB").env_remove("PONDRA_TRIES").env(crate::store::REACH_VAR, crate::store::reaches()) // (the keys this node reaches other places with)
+        .stdin(std::process::Stdio::null()).output().await?;
     anyhow::ensure!(out.status.success(), "couldn't lead the lake at {dir}: {}", String::from_utf8_lossy(&out.stderr).trim());
     Ok(())
 }

@@ -20,7 +20,7 @@ no Postgres, no ZooKeeper, no Kafka, no JVM. Runs on a local directory, any S3-c
 | Linux, macOS | `curl -fsSL https://github.com/alimardon123/pondra/releases/latest/download/install.sh \| sh` | `pondra` |
 | Python | `pip install pondra` (add `pyarrow` for pandas, Polars and Arrow) | `pondra`, `python -m pondra`, or `import pondra` |
 | Node | `npm install -g pondra` (or `npm install pondra` in a project) | `pondra`, or `npx pondra` with no install |
-| A container | `docker run -p 8080:8080 -v pondra:/data ghcr.io/alimardon123/pondra` | `http://localhost:8080`; a cluster: `deploy/compose`, Kubernetes: `deploy/helm/pondra` |
+| A container | `docker run -p 8080:8080 -v pondra:/data ghcr.io/alimardon123/pondra` | `http://localhost:8080`; sign in with the token its log shows once (`docker logs <container> \| grep pt_`); a cluster: `deploy/compose`, Kubernetes: `deploy/helm/pondra` |
 
 The installers put the binary in your own folder (`~/.local/bin`, or `%LOCALAPPDATA%\Programs\pondra`)
 and that folder on your PATH: no admin rights, nothing else to set up. pip puts `pondra` next to
@@ -78,7 +78,7 @@ cargo build --release
 ./target/release/pondra serve ./lake
 
 # A folder of lakes as databases: psql -d sales, or http://host:8080/db/sales/…
-./target/release/pondra serve ./data --pg 0.0.0.0:5432
+./target/release/pondra serve ./data --pg 0.0.0.0:5432 --admin-token "$TOKEN"   # on the network, a folder of lakes needs one
 
 # A cluster: the same command on each machine, same bucket. Every node takes writes and
 # queries; one of them (elected through the bucket) orders the commits; any can take over.
@@ -87,13 +87,16 @@ export AWS_ENDPOINT=https://<account>.r2.cloudflarestorage.com
 ./target/release/pondra serve s3://my-bucket/lake --addr 10.0.0.1:8080
 ./target/release/pondra serve s3://my-bucket/lake --addr 10.0.0.2:8080
 ./target/release/pondra serve s3://my-bucket/lake --addr 10.0.0.3:8080 --reader   # SQL only
+# On the network with no token, the leader makes user pondra and prints its token once;
+# `pondra token --dir s3://my-bucket/lake` makes another. Or give every node the same --admin-token.
 
 # Serverless, from any machine with the binary and bucket credentials — no node needed:
 ./target/release/pondra sql --dir s3://my-bucket/lake "SELECT count(*) FROM events"
 ./target/release/pondra sql --dir s3://my-bucket/lake "INSERT INTO sales SELECT * FROM 'jan.parquet'"
 ./target/release/pondra sql --dir s3://my-bucket/lake "UPDATE users SET plan = 'pro' WHERE id = 7"
 
-# SQL from anything that speaks Postgres, and from Python:
+# SQL from anything that speaks Postgres, and from Python. A door on the network asks for a sign-in:
+# user pondra and the token the node printed (or --admin-token).
 ./target/release/pondra serve ./lake --pg 0.0.0.0:5432      # psql, psycopg, SQLAlchemy, dbt, DBeaver, Tableau, Excel
 pip install ./python && python -c "import pondra; print(pondra.connect('http://127.0.0.1:8080').sql('SELECT 1').to_pandas())"
 

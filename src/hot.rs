@@ -495,7 +495,7 @@ impl TableProvider for HotFiles {
             parts.retain(|p| !p.is_empty());
             pieces.retain(|p| !p.is_empty());
             let memory = MemorySourceConfig::try_new(&parts, schema.clone(), None)?;
-            plans.push(DataSourceExec::from_data_source(HotSource { memory, pieces: Arc::new(pieces), predicate: None }));
+            plans.push(DataSourceExec::from_data_source(HotSource::new(memory, Arc::new(pieces), None)));
         }
         match plans.len() {
             0 => Ok(Arc::new(EmptyExec::new(schema))),
@@ -516,6 +516,18 @@ struct HotSource {
     memory: MemorySourceConfig,
     pieces: Arc<Vec<Vec<Piece>>>, // (each partition's batches')
     predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Each partition's statistics and then all of them, as the memory source works them out, kept
+    /// once worked out: it adds up every column of every batch, and planning asks again at every
+    /// step (a third of planning TPC-H q8 from memory). They don't change with the fetch or the
+    /// predicate, only with the batches and the columns.
+    stats: Arc<[std::sync::OnceLock<Arc<datafusion::common::Statistics>>]>,
+}
+
+impl HotSource {
+    fn new(memory: MemorySourceConfig, pieces: Arc<Vec<Vec<Piece>>>, predicate: Option<Arc<dyn PhysicalExpr>>) -> HotSource {
+        let stats = (0..=memory.partitions().len()).map(|_| std::sync::OnceLock::new()).collect();
+        HotSource { memory, pieces, predicate, stats }
+    }
 }
 
 impl DataSource for HotSource {
@@ -531,14 +543,26 @@ impl DataSource for HotSource {
     fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning { self.memory.output_partitioning() }
     fn eq_properties(&self) -> datafusion::physical_expr::EquivalenceProperties { self.memory.eq_properties() }
     fn scheduling_type(&self) -> datafusion::physical_plan::execution_plan::SchedulingType { self.memory.scheduling_type() }
-    fn partition_statistics(&self, partition: Option<usize>) -> datafusion::error::Result<Arc<datafusion::common::Statistics>> { self.memory.partition_statistics(partition) }
+    fn partition_statistics(&self, partition: Option<usize>) -> datafusion::error::Result<Arc<datafusion::common::Statistics>> {
+        let all = self.stats.len() - 1;
+        let slot = match partition {
+            Some(i) if i < all => &self.stats[i],
+            None => &self.stats[all],
+            Some(_) => return self.memory.partition_statistics(partition),
+        };
+        if let Some(s) = slot.get() {
+            return Ok(s.clone());
+        }
+        let s = self.memory.partition_statistics(partition)?;
+        Ok(slot.get_or_init(|| s).clone())
+    }
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> { Some(Arc::new(HotSource { memory: self.memory.clone().with_limit(limit), ..self.clone() })) }
     fn fetch(&self) -> Option<usize> { self.memory.fetch() }
     fn try_swapping_with_projection(&self, projection: &datafusion::physical_expr::projection::ProjectionExprs) -> datafusion::error::Result<Option<Arc<dyn DataSource>>> {
         // (a projection of plain columns: the batches and their order stay, and ranges go by name)
         let Some(projected) = self.memory.try_swapping_with_projection(projection)? else { return Ok(None) };
         let projected: Arc<dyn std::any::Any + Send + Sync> = projected;
-        Ok(projected.downcast::<MemorySourceConfig>().ok().map(|m| Arc::new(HotSource { memory: Arc::unwrap_or_clone(m), ..self.clone() }) as Arc<dyn DataSource>))
+        Ok(projected.downcast::<MemorySourceConfig>().ok().map(|m| Arc::new(HotSource::new(Arc::unwrap_or_clone(m), self.pieces.clone(), self.predicate.clone())) as Arc<dyn DataSource>))
     }
     fn try_pushdown_sort(&self, order: &[datafusion::physical_expr::PhysicalSortExpr]) -> datafusion::error::Result<datafusion::physical_plan::SortOrderPushdownResult<Arc<dyn DataSource>>> {
         // A top-N reads each partition's batches in the order its first key's ranges give, so its
@@ -562,7 +586,7 @@ impl DataSource for HotSource {
             pieces.push(order.iter().map(|&i| own[i].clone()).collect::<Vec<_>>());
         }
         let memory = MemorySourceConfig::try_new(&parts, self.memory.original_schema(), self.memory.projection().clone())?.with_limit(self.memory.fetch());
-        Ok(Inexact { inner: Arc::new(HotSource { memory, pieces: Arc::new(pieces), predicate: self.predicate.clone() }) })
+        Ok(Inexact { inner: Arc::new(HotSource::new(memory, Arc::new(pieces), self.predicate.clone())) })
     }
     fn try_pushdown_filters(&self, filters: Vec<Arc<dyn PhysicalExpr>>, _: &datafusion::common::config::ConfigOptions) -> datafusion::error::Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
         let below = vec![PushedDown::No; filters.len()];

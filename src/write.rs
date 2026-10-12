@@ -529,6 +529,28 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(c) = (head == "alter").then(|| DB_PROTECT.captures(first_word(sql))).flatten() {
         return Some(Stmt::Ddl(vec![Ddl::Protect { database: name(&c[1]), on: c[2].eq_ignore_ascii_case("true"), by: String::new() }]));
     }
+    // `BACKUP DATABASE [b] TO 'url' [WITH (retention_days = n)]` and `RESTORE DATABASE b FROM 'url'
+    // [LOCATION 'dir'] [AT (TIMESTAMP => '…')]` (ADR-070: a backup is a lake, `backup.rs`).
+    static BACKUP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*BACKUP\s+DATABASE\s+(?:([\w"-]+)\s+)?TO\s+'((?:[^']|'')*)'(?:\s+WITH\s*\(\s*retention_days\s*=\s*(\d+)\s*\))?\s*;?\s*$"#).expect("a regex"));
+    static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*RESTORE\s+DATABASE\s+([\w"-]+)\s+FROM\s+'((?:[^']|'')*)'(?:\s+LOCATION\s+'((?:[^']|'')*)')?(?:\s+AT\s*\(\s*TIMESTAMP\s*=>\s*'((?:[^']|'')*)'\s*\))?\s*;?\s*$"#).expect("a regex"));
+    static BACKUP_ANY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(BACKUP|RESTORE)\s+DATABASE\b").expect("a regex"));
+    let text = |m: Option<regex::Match>| m.map(|m| m.as_str().replace("''", "'"));
+    let backups = matches!(head.as_str(), "backup" | "restore"); // (a query compiles none of these)
+    if let Some(c) = backups.then(|| BACKUP.captures(first_word(sql))).flatten() {
+        let retention_days = c.get(3).map(|d| d.as_str().parse::<u64>()).transpose();
+        let Ok(retention_days) = retention_days else { return Some(Stmt::Invalid("retention_days is a number of days".into())) };
+        return Some(Stmt::Ddl(vec![Ddl::BackupDatabase { database: c.get(1).map(|n| name(n.as_str())), to: c[2].replace("''", "'"), retention_days }]));
+    }
+    if let Some(c) = backups.then(|| RESTORE.captures(first_word(sql))).flatten() {
+        let at = match text(c.get(4)).map(|t| crate::backup::instant(&t)).transpose() {
+            Ok(at) => at,
+            Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
+        };
+        return Some(Stmt::Ddl(vec![Ddl::RestoreDatabase { name: name(&c[1]), from: c[2].replace("''", "'"), dir: text(c.get(3)), at }]));
+    }
+    if backups && BACKUP_ANY.is_match(first_word(sql)) {
+        return Some(Stmt::Invalid("a backup is written as BACKUP DATABASE [name] TO 'place' [WITH (retention_days = 7)], and restored as RESTORE DATABASE name FROM 'place' [LOCATION 'place'] [AT (TIMESTAMP => '2026-10-12 03:00:00')]".into()));
+    }
     // `UNDROP TABLE t` (Snowflake's, Databricks'): the table dropped last under that name, back (ADR-043).
     static UNDROP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*UNDROP\s+TABLE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
     if let Some(c) = (head == "undrop").then(|| UNDROP.captures(first_word(sql))).flatten() {
@@ -1094,6 +1116,7 @@ pub async fn follows(lake: &Lake, table: &str) -> Result<bool> {
 /// Run a row query here: its rows in the table's column order and types.
 pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
     let target = schema(&meta.columns)?;
+    let sql = &values_typed(sql, &target);
     let one; // (`nextval` numbers `VALUES` in their order, as Postgres does: one partition)
     let ctx = match crate::seq::calls(sql) {
         true => {
@@ -1124,6 +1147,34 @@ pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<R
     fields.extend(ids.schema().fields().iter().cloned());
     columns.extend(ids.columns().iter().cloned());
     Ok(RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), columns)?)
+}
+
+/// An INSERT's `VALUES` with each value for a DOUBLE, REAL or DECIMAL column cast to that column's
+/// type, as Postgres takes them. DataFusion first makes one type of a VALUES column's rows, and
+/// `1e20` and `1e-20`, both decimals to it, made a DECIMAL(38, 20) that couldn't hold the first,
+/// though the column was a DOUBLE. Values fill the table's columns as `rows` fills them.
+fn values_typed<'a>(sql: &'a str, target: &datafusion::arrow::datatypes::Schema) -> std::borrow::Cow<'a, str> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let typed = |t: &DataType| t.is_floating() || t.is_decimal();
+    let values = first_word(sql).get(..6).is_some_and(|w| w.eq_ignore_ascii_case("values"));
+    if !values || !target.fields().iter().any(|f| typed(f.data_type())) {
+        return sql.into();
+    }
+    let parse = |s: &str| Parser::new(&GenericDialect {}).try_with_sql(s).and_then(|mut p| p.parse_query());
+    let Ok(mut q) = parse(sql) else { return sql.into() };
+    let ast::SetExpr::Values(v) = q.body.as_mut() else { return sql.into() };
+    for row in &mut v.rows {
+        let skip_deleted = row.content.len() < target.fields().len();
+        let fields = target.fields().iter().filter(|f| !(skip_deleted && f.name() == "_deleted"));
+        for (e, f) in row.content.iter_mut().zip(fields).filter(|(_, f)| typed(f.data_type())) {
+            let Ok(cast) = Parser::new(&GenericDialect {}).try_with_sql(&format!("arrow_cast(NULL, '{}')", f.data_type())).and_then(|mut p| p.parse_expr()) else { continue };
+            let ast::Expr::Function(mut cast) = cast else { continue };
+            let ast::FunctionArguments::List(args) = &mut cast.args else { continue };
+            args.args[0] = ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(std::mem::replace(e, ast::Expr::Value(ast::Value::Null.into()))));
+            *e = ast::Expr::Function(cast);
+        }
+    }
+    crate::routines::sql(&Statement::Query(q)).into()
 }
 
 // ---------------------------------------------------------------- bulk INSERT into append tables
@@ -1356,6 +1407,10 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     ensure!(!app.cluster.reader, "read-only node");
     if let Stmt::Invalid(why) = stmt {
         bail!(why);
+    }
+    // (a backup is read, and backed up itself; COPY … TO writes outside it: ADR-070)
+    if crate::backup::frozen(&app.lake) && !crate::backup::reads_only(&stmt) {
+        return Err(crate::backup::refused(Some(&app.lake.url)));
     }
     if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt).await? {
         let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.cluster.nodes(), &app.cluster.addr).await?; // (a view of a folder: a new file in it)
@@ -1619,6 +1674,9 @@ impl Request {
 
 /// Leader: record one request (from the inbox, or a `pondra sql` leading for a moment).
 pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request) -> Result<Value> {
+    if crate::backup::frozen(lake) && !crate::backup::allowed(&req) {
+        return Err(crate::backup::refused(Some(&lake.url))); // (a backup takes its runs and its clones' pins: ADR-070)
+    }
     match req {
         Request::Files(f) => {
             let _guard = lock.lock().await;
@@ -1833,6 +1891,9 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
 /// result goes into `target`'s `table`. What its leader has to record (None: a retried job).
 /// `files`: the query may read local files (`FROM 'jan.parquet'`) — on the author's own machine.
 async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job: &str, files: bool) -> Result<Option<Request>> {
+    if crate::backup::frozen(target) && !crate::backup::reads_only(stmt) {
+        return Err(crate::backup::refused(Some(&target.url))); // (before a file is written into it: ADR-070)
+    }
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
     match stmt {
         Stmt::Create(c) => return Ok(Some(Request::Table(table.into(), create_spec(c, query, files).await?))),
@@ -1885,6 +1946,7 @@ pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
 pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>, d: crate::ddl::Ddl) -> Result<Value> {
     match d {
         crate::ddl::Ddl::Refresh { database, tables } => crate::branch::refresh(lake, seq, lock, database, tables).await,
+        d @ (crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. }) => crate::backup::statement(lake, lock, d).await,
         d => {
             let _guard = lock.lock().await;
             crate::ddl::apply(lake, d).await
