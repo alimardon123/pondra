@@ -899,8 +899,9 @@ fn bytea_hex(hex: &str) -> Result<String> {
 }
 
 /// `x LIKE 'p' ESCAPE '/'` (ILIKE and NOT LIKE alike), rewritten to LIKE's own backslash escape: the
-/// pattern's `/%` becomes `\%`, and the ESCAPE goes. A pattern that isn't written out can't be
-/// rewritten, so it is refused. ESCAPE '\' is already LIKE's; ESCAPE '' turns escapes off.
+/// pattern's `/%` becomes `\%`, and the ESCAPE goes. A pattern of literals joined by `||` is one
+/// literal (SQLAlchemy's `startswith` sends `$1::VARCHAR || '%'`, its value bound in place); any other
+/// pattern can't be rewritten, so it is refused. ESCAPE '\' is already LIKE's; ESCAPE '' turns escapes off.
 fn like_escape(pattern: &mut Box<Expr>, escape: &mut Option<ValueWithSpan>) -> Result<()> {
     let esc = match escape.as_ref().map(|e| &e.value) {
         Some(Value::SingleQuotedString(c)) if c.as_str() != "\\" => c.clone(),
@@ -911,12 +912,26 @@ fn like_escape(pattern: &mut Box<Expr>, escape: &mut Option<ValueWithSpan>) -> R
         (Some(c), None) => Some(c),
         _ => return Err(crate::codes::coded("22025", "invalid escape string: an ESCAPE is one character, or '' for none")),
     };
+    if let Some(p) = written(pattern) {
+        **pattern = Expr::Value(Value::SingleQuotedString(p).into());
+    }
     let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(p), .. }) = pattern.as_mut() else {
         return Err(crate::codes::coded("0A000", "LIKE … ESCAPE '/' with a pattern that isn't written out: use \\ as the escape character"));
     };
     *p = backslash_pattern(p, esc_char)?;
     *escape = None;
     Ok(())
+}
+
+/// A pattern's text when it is string literals joined by `||`, each perhaps cast to a text type.
+fn written(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s) | Value::EscapedStringLiteral(s), .. }) => Some(s.clone()),
+        Expr::BinaryOp { left, op: BinaryOperator::StringConcat, right } => Some(written(left)? + &written(right)?),
+        Expr::Nested(e) => written(e),
+        Expr::Cast { expr, data_type: DataType::Varchar(_) | DataType::Text | DataType::String(_) | DataType::CharacterVarying(_), .. } => written(expr),
+        _ => None,
+    }
 }
 
 /// A LIKE pattern written with `esc` as its escape, as one with backslash: `esc%` is a literal `%`,

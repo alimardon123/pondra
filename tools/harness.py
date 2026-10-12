@@ -11319,7 +11319,7 @@ def sqla():
     `ddl.rs`): a number with an exponent as NUMERIC (`'1E-7'::numeric`); a bytea in its hex form
     (`'\\xff00'::bytea`, a bad one 22P02); INSERT … DEFAULT VALUES (every column's default, a NOT NULL one
     without a default refused 23502); LIKE … ESCAPE '/' (ILIKE and NOT LIKE too, a pattern that isn't
-    written out refused); a table named with a quote refused, the message saying why; a temporary table's
+    written out refused, literals joined by || taken); a table named with a quote refused, the message saying why; a temporary table's
     PRIMARY KEY (23505 for a repeat, 23502 for NULL, ON CONFLICT skips and replaces); a dropped table's
     sequence refused until UNDROP, and gone with a PURGE."""
     import psycopg
@@ -11386,6 +11386,12 @@ def sqla():
     info["like_column"] = nonlit[1:]
     checks["LIKE … ESCAPE '/' with a pattern that isn't written out: refused 0A000, saying to use \\"] = \
         nonlit[1] == "0A000" and "isn't written out" in nonlit[2]
+    # SQLAlchemy's startswith (get_schema_names): a parameter joined to '%', its value bound in place, over Postgres too
+    joined = q("SELECT 'pg_x' NOT LIKE 'pg/_' || '%' ESCAPE '/' AS a, 'pgxx' NOT LIKE CAST('pg/_' AS VARCHAR) || '%' ESCAPE '/' AS b")[0]
+    bound = conn.execute("SELECT %s::VARCHAR || '%%' AS p, 'pg_toast' LIKE %s::VARCHAR || '%%' ESCAPE '/' AS m", ("pg/_", "pg/_")).fetchone()
+    info["like_joined"] = (joined, bound)
+    checks["LIKE … ESCAPE '/' with a pattern of literals joined by || (SQLAlchemy's startswith), bound over Postgres too"] = \
+        joined == {"a": False, "b": True} and bound == ("pg/_%", True)
 
     # a name with a quote: refused (a table's folder takes its name, and Windows refuses a quote), and the name to write
     qn = err('CREATE TABLE "a""b" (x INT)')
@@ -13711,6 +13717,129 @@ def cursors():
         sys.exit(1)
 
 
+def prepared():
+    """Prepared statements on the Postgres port keep what they found (pg.rs, `Prepared`): their
+    parameters' types and their columns, worked out once, as Postgres settles them when a statement is
+    prepared. psycopg's prepared statements (libpq binds, describes and executes one each time it runs)
+    answer as the statements sent whole, in text and binary, NULLs and key lookups among them; a query
+    whose table gains a column is refused once with Postgres's 0A000, then answered with it (and a key
+    looked up whose row predates the column has it NULL, at every door); a FETCH is
+    described by its cursor each time; and a prepared query with a parameter takes about what the
+    statement sent whole takes (planned once a run, not three times)."""
+    import psycopg, statistics
+    lake = new_lake()
+    pg = A.port + 50
+    node = Node(lake, A.port, pg=f"127.0.0.1:{pg}").start()
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    checks, info = {}, {}
+    try:
+        sql(A.port, "CREATE TABLE t (id BIGINT, v TEXT)")
+        sql(A.port, "INSERT INTO t SELECT value, chr(97 + CAST(value % 5 AS INT)) FROM range(1, 1001)")
+        sql(A.port, "CREATE TABLE k (id BIGINT PRIMARY KEY, name TEXT, score DOUBLE)")
+        sql(A.port, "INSERT INTO k VALUES (1, 'ann', 1.5), (2, 'bo', 2.5), (3, NULL, NULL)")
+        queries = [
+            ("SELECT id, v FROM t WHERE id = %s", [(3,), (500,), (2000,)]),
+            ("SELECT count(*) AS n FROM t WHERE v = %s", [("b",), ("e",), ("z",)]),
+            ("SELECT id FROM t WHERE id > %s ORDER BY id LIMIT 3", [(None,), (997,), (10,)]),
+            ("SELECT * FROM k WHERE id = %s", [(2,), (3,), (9,)]),
+            ("SELECT id, v FROM t WHERE id < 0", [None, None, None]),
+            ("SELECT %s::int + 1 AS x, %s::text AS s", [(41, "a"), (None, None), (-1, "é")]),
+        ]
+
+        def answer(cur, q, args):
+            cur.execute(q, args, **({} if isinstance(cur, psycopg.ClientCursor) else {"prepare": True}))
+            return [(d.name, d.type_code) for d in cur.description], cur.fetchall()
+
+        with psycopg.connect(url, autocommit=True) as c:
+            for binary in (False, True):
+                whole, kept = {}, {}
+                for q, runs in queries:
+                    for i, args in enumerate(runs * 2):  # (each value twice: the second runs from what was kept)
+                        whole[(q, i)] = answer(psycopg.ClientCursor(c), q, args)
+                        kept[(q, i)] = answer(c.cursor(binary=binary), q, args)
+                differ = [k for k in whole if whole[k] != kept[k]]
+                info[f"differ ({'binary' if binary else 'text'})"] = differ[:3]
+                checks[f"prepared statements answer as the statements sent whole, {'in binary' if binary else 'in text'}: columns and rows, NULLs, a key lookup, no rows"] = not differ
+
+            for i in range(20):
+                c.execute("INSERT INTO t VALUES (%s, %s)", (5000 + i, "p"), prepare=True)
+            inserted = c.execute("SELECT count(*), min(id), max(id) FROM t WHERE v = 'p'").fetchone()
+            checks["a prepared INSERT writes each run's values"] = inserted == (20, 5000, 5019)
+
+            # A table altered under a prepared query: Postgres refuses the next run (0A000), and so does the node,
+            # once; then the statement is described afresh.
+            q = "SELECT * FROM k WHERE id = %s"
+            before = [c.execute(q, (1,), prepare=True).fetchall() for _ in range(3)]
+            sql(A.port, "ALTER TABLE k ADD COLUMN level BIGINT")
+            try:
+                c.execute(q, (1,), prepare=True)
+                refused = None
+            except psycopg.Error as e:
+                refused = e.sqlstate
+            after = c.execute(q, (1,), prepare=True)
+            after = ([d.name for d in after.description], after.fetchall())
+            info["altered"] = {"before": before, "refused": refused, "after": after}
+            checks["a prepared query whose table gains a column: refused once (0A000, as Postgres), then answered with it"] = \
+                before == [[(1, "ann", 1.5)]] * 3 and refused == "0A000" and after == (["id", "name", "score", "level"], [(1, "ann", 1.5, None)])
+
+            # A key's row written before the column was added (in the log) lacks it: every lookup fills it with NULL.
+            with c.transaction():
+                in_txn = c.execute("SELECT * FROM k WHERE id = 1").fetchall()
+            looked = {
+                "HTTP": sql(A.port, "SELECT * FROM k WHERE id = 1"),
+                "GET /lookup": call(A.port, "GET", "/lookup/k/1"),
+                "Postgres": c.execute("SELECT * FROM k WHERE id = 1").fetchall(),
+                "Postgres, in a transaction": in_txn,
+            }
+            info["looked up after ADD COLUMN"] = looked
+            checks["a key looked up after ADD COLUMN, its row from before it: the new column NULL (HTTP, GET /lookup, Postgres, in a transaction)"] = \
+                looked == {"HTTP": [{"id": 1, "name": "ann", "score": 1.5}], "GET /lookup": [{"id": 1, "name": "ann", "score": 1.5}],
+                           "Postgres": [(1, "ann", 1.5, None)], "Postgres, in a transaction": [(1, "ann", 1.5, None)]}
+
+        with psycopg.connect(url) as c:
+            q = "SELECT * FROM k WHERE id = %s"
+            c.execute(q, (2,), prepare=True)
+            c.execute(q, (2,), prepare=True)
+            c.commit()
+            sql(A.port, "ALTER TABLE k ADD COLUMN extra TEXT")
+            states = []
+            for stmt in (q, "SELECT 1"):
+                try:
+                    c.execute(stmt, (2,) if stmt == q else None, prepare=True)
+                    states.append(None)
+                except psycopg.Error as e:
+                    states.append(e.sqlstate)
+            c.rollback()
+            checks["…and in a transaction the refusal fails it (25P02 after), as any error does"] = states == ["0A000", "25P02"]
+
+            # A FETCH's columns are its cursor's, which a DECLARE may change: described each time, never kept.
+            fetched = []
+            for cols in ("id", "id, v"):
+                c.execute(f"DECLARE m CURSOR FOR SELECT {cols} FROM t ORDER BY id")
+                cur = c.execute("FETCH 1 FROM m", prepare=True)
+                fetched.append(([d.name for d in cur.description], cur.fetchall()))
+                c.execute("CLOSE m")
+            c.rollback()
+            checks["a prepared FETCH is described by its cursor each time (another DECLARE, other columns)"] = fetched == [(["id"], [(1,)]), (["id", "v"], [(1, "b")])]
+
+        # What it costs: a prepared query with a parameter against the statement sent whole, taking turns.
+        with psycopg.connect(url, autocommit=True) as c:
+            whole, kept, q = [], [], "SELECT count(*) FROM t WHERE id = %s"
+            cur = psycopg.ClientCursor(c)
+            for i in range(300):
+                t0 = time.perf_counter(); cur.execute(q, (i,)); cur.fetchall(); whole.append(time.perf_counter() - t0)
+                t0 = time.perf_counter(); c.execute(q, (i,), prepare=True).fetchall(); kept.append(time.perf_counter() - t0)
+            ms = lambda ts: round(statistics.median(ts[20:]) * 1000, 3)
+            info["ms (whole, prepared)"] = (ms(whole), ms(kept))
+            checks["a prepared query with a parameter takes about what it takes sent whole (median within 25%): planned once a run"] = ms(kept) <= ms(whole) * 1.25
+    finally:
+        node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"prepared": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
 def doors():
     """The doors matrix (ADR-036 §7): one list of features, each through every door — SQL over HTTP
     (a session), the Python client, the Postgres port (psycopg), Flight SQL (ADBC), the JavaScript
@@ -15082,7 +15211,7 @@ def pkey():
 # About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
 # prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
 # suite in parts side by side that end together. A section not listed counts as 5 s.
-SECS = {"memory": 255, "cursors": 15, "owned": 20, "signed": 20, "guesses": 15, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
+SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20, "guesses": 15, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "measures": 120, "facts": 90, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
         "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "ddlgaps": 40, "sqla": 30, "unique_doors": 60, "pkey": 60}
@@ -15090,7 +15219,7 @@ SECS = {"memory": 255, "cursors": 15, "owned": 20, "signed": 20, "guesses": 15, 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, prepared, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -15122,7 +15251,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -15135,7 +15264,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

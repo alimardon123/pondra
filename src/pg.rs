@@ -20,7 +20,7 @@ use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::results::{CopyCsvOptions, CopyEncoder, CopyResponse, CopyTextOptions, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore, ConnectionManager, PgWireServerHandlers, Type};
@@ -36,7 +36,7 @@ use std::sync::Arc;
 pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let tls = crate::tls::pg(); // (sslmode=require: `tls.rs`)
-    let parser = Arc::new(NoopQueryParser::new());
+    let parser = Arc::new(Parser);
     // One registry of connections for the server: a cancel request finds its connection's key here.
     let cancels = Arc::new(ConnectionManager::new());
     let cancel = Arc::new(DefaultCancelHandler::new(cancels.clone()));
@@ -65,7 +65,7 @@ struct Pg(Arc<Backend>, Arc<Startup>, Arc<DefaultCancelHandler>);
 
 struct Backend {
     app: App,
-    parser: Arc<NoopQueryParser>,
+    parser: Arc<Parser>,
     session: String,
     who: std::sync::Mutex<Option<crate::auth::Principal>>, // (whoever signed in)
     me: std::sync::Weak<Backend>,                          // (a statement runs on the queries' runtime: `told`)
@@ -918,9 +918,102 @@ impl CopyHandler for Backend {
     }
 }
 
+/// A statement as Parse gave it, and what was found of it once. Postgres settles a prepared statement's
+/// parameter types, and its columns, when it is prepared. Finding them here plans the query, and libpq's
+/// drivers (psycopg) bind, describe and execute a prepared statement every time it runs: each run
+/// planned it three times. Clones share what was found.
+#[derive(Clone)]
+pub struct Prepared {
+    sql: String,
+    found: Arc<Found>,
+}
+
+#[derive(Default)]
+struct Found {
+    types: tokio::sync::OnceCell<Vec<Type>>, // ($1, $2…: `param_types`, the first time they are asked for)
+    columns: std::sync::Mutex<Columns>,
+}
+
+/// What a statement's Describe found, for the next one.
+#[derive(Default)]
+enum Columns {
+    #[default]
+    Unknown,
+    /// No rows: a write or a session's command, as its text says.
+    None,
+    /// A query's columns. `given` once a Describe was answered from them, not found afresh: the client
+    /// reads the rows by them, so an answer whose columns differ is refused (`answered`).
+    Kept { schema: Arc<Schema>, given: bool },
+    /// Described each time: a cursor's FETCH (its cursor may be declared again), a SHOW, or a statement
+    /// whose columns changed once.
+    Each,
+}
+
+impl Prepared {
+    fn new(sql: String) -> Self { Prepared { sql, found: Default::default() } }
+
+    /// The columns a Describe of the portal answers without planning, if kept.
+    fn kept(&self, format: &Format) -> Option<Vec<FieldInfo>> {
+        match &mut *self.found.columns.lock().unwrap() {
+            Columns::None => Some(vec![]),
+            Columns::Kept { schema, given } => {
+                *given = true;
+                Some(described(schema, format))
+            }
+            Columns::Unknown | Columns::Each => None,
+        }
+    }
+
+    /// What its first Describe found, kept (a later one's never replaces it).
+    fn keep(&self, columns: Columns) {
+        let mut kept = self.found.columns.lock().unwrap();
+        if matches!(*kept, Columns::Unknown) {
+            *kept = columns;
+        }
+    }
+
+    /// An answer checked against the columns its Describe gave from what was kept: a query whose columns
+    /// changed since (a table altered, another search path) is refused, as Postgres refuses it (0A000),
+    /// and described afresh from then on. One that differs from a Describe found afresh is answered as
+    /// it was before anything was kept, and not kept.
+    fn answered(&self, out: &Response, format: &Format) -> PgWireResult<()> {
+        let mut kept = self.found.columns.lock().unwrap();
+        let (Columns::Kept { schema, given }, Response::Query(q)) = (&*kept, out) else { return Ok(()) };
+        if described(schema, format).iter().map(FieldInfo::datatype).eq(q.row_schema.iter().map(FieldInfo::datatype)) {
+            return Ok(());
+        }
+        let given = *given;
+        *kept = Columns::Each;
+        match given {
+            true => Err(PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "0A000".into(), "cached plan must not change result type".into())))),
+            false => Ok(()),
+        }
+    }
+}
+
+/// Parse keeps the statement's text; what it takes and answers is found when first asked (`Prepared`).
+struct Parser;
+
+#[async_trait]
+impl QueryParser for Parser {
+    type Statement = Prepared;
+
+    async fn parse_sql<C>(&self, _client: &C, sql: &str, _types: &[Option<Type>]) -> PgWireResult<Option<Prepared>>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        Ok(Some(Prepared::new(sql.to_string())))
+    }
+
+    // (Describe is answered by `do_describe_statement` and `do_describe_portal`, never from these.)
+    fn get_parameter_types(&self, _: &Prepared) -> PgWireResult<Vec<Type>> { Ok(vec![]) }
+
+    fn get_result_schema(&self, _: &Prepared, _: Option<&Format>) -> PgWireResult<Vec<FieldInfo>> { Ok(vec![]) }
+}
+
 /// `$1`, `$2`… replaced by the portal's values, each as a SQL literal of its type (`value`). A
 /// parameter's type is the client's, or else the one the query implies (`inferred`).
-fn bind(portal: &Portal<String>, inferred: &[Type]) -> PgWireResult<String> {
+fn bind(portal: &Portal<Prepared>, inferred: &[Type]) -> PgWireResult<String> {
     let mut values = Vec::with_capacity(portal.parameter_len());
     for i in 0..portal.parameter_len() {
         let t = portal.statement.parameter_types.get(i).cloned().flatten().filter(|t| *t != Type::UNKNOWN);
@@ -939,7 +1032,7 @@ fn bind(portal: &Portal<String>, inferred: &[Type]) -> PgWireResult<String> {
         };
         values.push(v.unwrap_or_else(|| "NULL".into()));
     }
-    Ok(crate::pg_values::substitute(&portal.statement.statement, &values))
+    Ok(crate::pg_values::substitute(&portal.statement.statement.sql, &values))
 }
 
 fn list<T: ToString>(v: Option<Vec<Option<T>>>) -> Option<String> {
@@ -980,8 +1073,8 @@ impl SimpleQueryHandler for Backend {
 
 #[async_trait]
 impl ExtendedQueryHandler for Backend {
-    type Statement = String;
-    type QueryParser = NoopQueryParser;
+    type Statement = Prepared;
+    type QueryParser = Parser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> { self.parser.clone() }
 
@@ -1019,34 +1112,53 @@ impl ExtendedQueryHandler for Backend {
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
         let user = client.metadata().get("user").cloned().unwrap_or_default();
-        if let Some(Ok(c)) = Copy::of(&portal.statement.statement).filter(|c| c.as_ref().is_ok_and(|c| !c.to)) {
+        let statement = &portal.statement.statement;
+        if let Some(Ok(c)) = Copy::of(&statement.sql).filter(|c| c.as_ref().is_ok_and(|c| !c.to)) {
             return crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.who(), self.copy_in(client, &user, c))).await;
         }
-        let inferred = crate::temp::SESSION.scope(Some(self.session.clone()), self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement, ""))).await;
-        self.told(client, &user, &bind(portal, &inferred)?, &portal.result_column_format).await
+        let inferred = crate::temp::SESSION.scope(Some(self.session.clone()), self.types(statement)).await;
+        let out = self.told(client, &user, &bind(portal, inferred)?, &portal.result_column_format).await?;
+        match statement.answered(&out, &portal.result_column_format) {
+            Ok(()) => Ok(out),
+            Err(e) => {
+                crate::temp::SESSION.sync_scope(Some(self.session.clone()), || crate::txn::failed(&e.to_string())); // (as any error fails a transaction: `caught`)
+                Err(e)
+            }
+        }
     }
 
     async fn do_describe_statement<C>(&self, _client: &mut C, stmt: &StoredStatement<Self::Statement>) -> PgWireResult<DescribeStatementResponse>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
-        let sql = pg_dialect(&self.app.lake, &stmt.statement, "");
-        crate::temp::SESSION.scope(Some(self.session.clone()), async { Ok(DescribeStatementResponse::new(self.param_types(&sql).await, self.describe(&sql, &Format::UnifiedText).await?)) }).await // (its temporary tables too)
+        let sql = pg_dialect(&self.app.lake, &stmt.statement.sql, "");
+        crate::temp::SESSION.scope(Some(self.session.clone()), async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement).await.to_vec(), self.describe(&sql, &Format::UnifiedText).await?.0)) }).await // (its temporary tables too)
     }
 
     async fn do_describe_portal<C>(&self, _client: &mut C, portal: &Portal<Self::Statement>) -> PgWireResult<DescribePortalResponse>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
+        let statement = &portal.statement.statement;
+        if let Some(fields) = statement.kept(&portal.result_column_format) {
+            return Ok(DescribePortalResponse::new(fields));
+        }
         crate::temp::SESSION.scope(Some(self.session.clone()), async {
-            let inferred = self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement, "")).await;
-            Ok(DescribePortalResponse::new(self.describe(&pg_dialect(&self.app.lake, &bind(portal, &inferred)?, ""), &portal.result_column_format).await?))
+            let inferred = self.types(statement).await;
+            let (fields, columns) = self.describe(&pg_dialect(&self.app.lake, &bind(portal, inferred)?, ""), &portal.result_column_format).await?;
+            statement.keep(columns);
+            Ok(DescribePortalResponse::new(fields))
         })
         .await
     }
 }
 
 impl Backend {
+    /// A statement's `param_types`, worked out once (`Prepared`).
+    async fn types<'a>(&self, statement: &'a Prepared) -> &'a [Type] {
+        statement.found.types.get_or_init(|| async { self.param_types(&pg_dialect(&self.app.lake, &statement.sql, "")).await }).await
+    }
+
     /// The types of `$1`, `$2`… as the query implies them (`WHERE id = $1`: id's type); text when
     /// it doesn't say.
     async fn param_types(&self, sql: &str) -> Vec<Type> {
@@ -1081,25 +1193,26 @@ impl Backend {
         }
     }
 
-    /// The columns a statement returns (none for writes and session commands).
-    async fn describe(&self, sql: &str, format: &Format) -> PgWireResult<Vec<FieldInfo>> {
+    /// The columns a statement returns (none for writes and session commands), and what of them a
+    /// prepared statement may keep (`Columns`).
+    async fn describe(&self, sql: &str, format: &Format) -> PgWireResult<(Vec<FieldInfo>, Columns)> {
         let sql = &self.placed(sql.to_string()).await?; // (the session's search path, as `run` has it)
         if let Some(cmd) = crate::cursors::of(sql) {
-            // FETCH's columns are its cursor's; DECLARE, MOVE and CLOSE send no rows.
+            // FETCH's columns are its cursor's (which a DECLARE may change); DECLARE, MOVE and CLOSE send no rows.
             let columns = crate::cursors::columns(&cmd.map_err(user_error)?).map_err(user_error)?;
-            return Ok(columns.map_or(vec![], |s| described(&s, format)));
+            return Ok((columns.map_or(vec![], |s| described(&s, format)), Columns::Each));
         }
         if let Some((_, column)) = show_column(sql) {
             // A SHOW sends one row of one text column (`session_command`): Describe must say so, or pgjdbc and
             // prepared psycopg statements fail on a row with no column description.
-            return Ok(vec![FieldInfo::new(column, None, None, Type::VARCHAR, FieldFormat::Text)]);
+            return Ok((vec![FieldInfo::new(column, None, None, Type::VARCHAR, FieldFormat::Text)], Columns::Each));
         }
         let point = match crate::auth::limited() {
             None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| p.schema().ok()), // (a key lookup's columns, unplanned, first)
             Some(_) => None,
         };
         if point.is_none() && (session_command(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some() || crate::script::is(sql)) {
-            return Ok(vec![]); // (a COPY's columns come with its data)
+            return Ok((vec![], Columns::None)); // (a COPY's columns come with its data)
         }
         let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: the connection's variable)
         let bound = crate::routines::expand(&self.app.lake, &bound).await.map_err(user_error)?; // (macros, DuckDB's forms: as `run` has them)
@@ -1111,7 +1224,7 @@ impl Backend {
                 self.schema(&probe, "").await?
             }
         };
-        Ok(described(&schema, format))
+        Ok((described(&schema, format), Columns::Kept { schema, given: false }))
     }
 }
 
@@ -1122,13 +1235,13 @@ impl Backend {
 fn cursor_portal<C>(client: &C, cursor: String)
 where
     C: ClientPortalStore,
-    C::PortalStore: PortalStore<Statement = String>,
+    C::PortalStore: PortalStore<Statement = Prepared>,
 {
     if crate::cursors::columns(&crate::cursors::Cmd::Fetch { name: cursor.clone(), rows: None }).is_err() {
         return; // (a DECLARE that failed: no cursor of that name)
     }
     let fetch = format!("FETCH ALL FROM \"{cursor}\"");
-    let statement = Arc::new(StoredStatement::new(cursor.clone(), fetch, vec![])); // (pgwire's struct is non-exhaustive: its constructor)
+    let statement = Arc::new(StoredStatement::new(cursor.clone(), Prepared::new(fetch), vec![])); // (pgwire's struct is non-exhaustive: its constructor)
     client.portal_store().put_portal(Arc::new(Portal::new_cursor(cursor, statement)));
 }
 
