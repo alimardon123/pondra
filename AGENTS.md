@@ -2097,6 +2097,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    written in the commit that records the file's rows, and the old version's job mark deleted there.
    Records follow the table's folder through renames, drops and clones, and go 64 days after their load
    (`PONDRA_LOAD_RETENTION_SECS`). `harness.py loads`.
+339. **Credentials a catalog vouches for reach its table's files and nothing else** (`catalogs.rs`): a
+   REST catalog's vended credentials, or an AWS catalog's secret, serve the table's location only while a
+   statement reads or writes that table (`catalogs::within`), through a store of its own
+   (`delegated://<id>/…`, `rehome`), never the bucket's store; a file another table's metadata names
+   outside that location needs a secret of its own (`ext::check_files`). An AWS catalog's tables are read
+   by whoever may use its secret. `harness.py catalogs`: "the vended key reads nothing else…", "…granted
+   USAGE on it, reads the rows".
 345. **`pondra.parts` and `pondra.find` show only what the caller may see** (`find::parts`, `find::found`):
    parts come only from the objects `objects::list` gave the caller; a user granted some columns of a table
    sees those columns and no other part of it, and that table's definition is not shown. Neither is a
@@ -2235,6 +2242,7 @@ python3 tools/harness.py writes                # PyIceberg (and Pondra) append t
 python3 tools/harness.py live                  # live queries: an answer per change of its tables, none for others, gone when closed; JavaScript
 python3 tools/harness.py temps                 # TEMP tables and views on 3 nodes: every statement, sessions (HTTP, Postgres, procedures), spread, idle end
 python3 tools/harness.py across                # UPDATE/DELETE/MERGE on an attached lake from a follower of another: sent rows, a file, a temp table, no leader
+python3 tools/harness.py catalogs              # AWS Glue, S3 Tables and REST catalogs that vend credentials: rows == PyIceberg's, the vended key reads nothing else, refusals, USAGE
 python3 tools/harness.py outside               # files on S3 and HTTP (moto): globs, CSV, JSON, Hive folders, spread, COPY … TO (spread too), secrets, who may read
 python3 tools/harness.py clouds                # GCS (sim_gcs.py) and Azure (Azurite) lakes and files: failover, COPY, a file changed beside a lake
 python3 tools/harness.py kafkas                # Apache Kafka 4 (~/kafka_2.13-*) and a Pondra node's port: topics as tables, COPY to a topic, feeds through kills, SASL
