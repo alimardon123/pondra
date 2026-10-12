@@ -29,7 +29,7 @@ for publish, port in (("iceberg,delta", 8801), ("", 8802)):
         ts = []
         for r in range(5):
             ks = random.sample(range(2_000_000), keys)
-            q("INSERT INTO kv VALUES " + ", ".join(f"({k}, 'u{r}', {k})" for k in ks))
+            q("INSERT OR REPLACE INTO kv VALUES " + ", ".join(f"({k}, 'u{r}', {k})" for k in ks))  # (upserts: a plain INSERT of a held key is refused)
             t0 = time.time(); call(port, "POST", "/tier"); ts.append(time.time() - t0)
         times[keys] = round(statistics.median(ts), 3)
     out[publish or "unpublished"] = times

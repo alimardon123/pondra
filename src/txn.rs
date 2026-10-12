@@ -6,9 +6,10 @@
 //!
 //! Under READ COMMITTED a write locks its rows on the leader (`locks.rs`, §3) until the transaction ends; a write over
 //! `LOCK_MAX` rows locks none. An enforced-UNIQUE table locks nothing: its COMMIT's check refuses a row changed since it was
-//! read (40001). A MERGE and an INSERT … ON CONFLICT lock their rows as an UPDATE does. `COMMIT` sends the writes to the leader in one request (`commit_here`), which checks them
-//! under the lake's lock and writes them as one flush (§6). Outside a transaction, a keyed table's UPDATE or DELETE is a
-//! transaction of its own (`autocommit`, §7), appended through the log under the job's producer.
+//! read (40001). A MERGE and an INSERT … ON CONFLICT lock their rows as an UPDATE does. `COMMIT` sends the writes to the leader
+//! in one request (`commit_here`), which checks them under the lake's lock and writes them as one flush (§6). Outside a
+//! transaction, a keyed table's UPDATE or DELETE, and a plain INSERT into a table whose key is checked, is a transaction of its
+//! own (`autocommit`, §7), appended through the log under the job's producer.
 //!
 //! A failed statement fails the transaction: until `ROLLBACK` (or `COMMIT`), every statement is refused with 25P02. DDL
 //! runs at once (`ddl_at_once`); savepoints are `Mark`s; a READ ONLY transaction refuses its writes (25006). An idle
@@ -944,6 +945,12 @@ pub async fn statement(app: &crate::server::App, stmt: &Stmt, files: bool) -> Re
     let (old, new, at, keys) = match insert {
         Some(query) => {
             let (rows, at, keys) = insert_rows(&l, &stored, &query, snapshot, files).await?;
+            if crate::constraints::key_checked(&stored) {
+                // A plain INSERT's keys are checked at the statement, where Postgres checks them, so a SAVEPOINT can roll the
+                // refusal back. The table is read as of `at` (the locks' grant: a key another transaction committed while this
+                // one waited is held), with this transaction's own writes over it. COMMIT checks them again (`write_changes`).
+                crate::constraints::key_check_at(lake, &name, &stored, None, &rows, Some(at)).await?;
+            }
             (vec![], vec![rows], at, keys)
         }
         None => change(&l, &stored, stmt, snapshot).await?,
@@ -953,13 +960,13 @@ pub async fn statement(app: &crate::server::App, stmt: &Stmt, files: bool) -> Re
     Ok(Some(out))
 }
 
-/// A keyed table's UPDATE or DELETE outside a transaction (ADR-067 §7): a transaction of its own that is this one statement,
-/// READ COMMITTED. Its rows are worked out and their keys locked under an owner of its own (`auto-…`, never a session's
-/// transaction), and worked out again if they moved; then its change is appended through the log. Its locks are held while
-/// the append is in flight, and go with its answer (`Hold`), or with their lease when no answer came; the table is registered as appending meanwhile, so a writer
-/// closing it (`locks::close`) waits for the append. It takes no lake lock and no session state. The producer is the job's
-/// (`sql:{job}`), so a retried one is a duplicate. MERGE and tables with an enforced UNIQUE don't come here
-/// (`write::on_node_listed`).
+/// A keyed table's UPDATE or DELETE, or a plain INSERT into a table whose key is checked, outside a transaction (ADR-067 §7):
+/// a transaction of its own that is this one statement, READ COMMITTED. Its rows are worked out and their keys locked under an
+/// owner of its own (`auto-…`, never a session's transaction), and worked out again if they moved; then its change is appended
+/// through the log. Its locks are held while the append is in flight, and go with its answer (`Hold`), or with their lease when no
+/// answer came; the table is registered as appending meanwhile, so a writer closing it (`locks::close`) waits for the append. It
+/// takes no lake lock and no session state. The producer is the job's (`sql:{job}`), so a retried one is a duplicate. MERGE and
+/// tables with an enforced UNIQUE don't come here (`write::on_node_listed`).
 pub async fn autocommit(app: &crate::server::App, stmt: &Stmt, job: &str) -> Result<Value> {
     let owner = format!("auto-{}", uuid::Uuid::new_v4().simple());
     let taken = AtomicBool::new(false);
@@ -971,6 +978,9 @@ pub async fn autocommit(app: &crate::server::App, stmt: &Stmt, job: &str) -> Res
 }
 
 async fn autocommit_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: &str, taken: &AtomicBool, hold: &mut Hold) -> Result<Value> {
+    if matches!(stmt, Stmt::Insert(..)) {
+        return insert_as(app, stmt, job, owner, taken, hold).await;
+    }
     let lake = &app.lake;
     let name = stmt.table();
     let stored = stored_table(lake, &name).await?;
@@ -1000,6 +1010,47 @@ async fn autocommit_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: 
         }
     };
     Ok(if ack.duplicate { j!({"duplicate": true}) } else { out })
+}
+
+/// A plain INSERT outside a transaction (`autocommit`). Its rows are worked out and their keys locked as an UPDATE's are, so two
+/// nodes inserting one new key at once wait for each other, and the second is refused (23505) once the first has committed. A
+/// job whose append is in is a duplicate, found before anything is worked out: its rows are in, and they would meet their own
+/// keys. An INSERT takes rows back from no one, so none of an UPDATE's or DELETE's checks apply (`refuse_change`,
+/// `views::can_follow`, `views::filling`). `key_check` runs under the locks; over `LOCK_MAX` keys no lock is taken, and the check
+/// still runs (the documented limit).
+async fn insert_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: &str, taken: &AtomicBool, hold: &mut Hold) -> Result<Value> {
+    let lake = &app.lake;
+    if crate::write::sent(lake, job).await? {
+        return Ok(j!({"duplicate": true}));
+    }
+    let name = stmt.table();
+    let stored = stored_table(lake, &name).await?;
+    let meta = stored.logical();
+    let sql = crate::write::rows_sql(&meta, stmt)?;
+    let files = crate::change::FILES.try_with(|f| *f).unwrap_or(false);
+    let l = Locks { app, name: &name, meta: &meta, owner: owner.to_string(), txn: false, locking: true, committed: true, wait: lock_wait(), taken };
+    let (batch, _, _) = insert_rows(&l, &stored, &sql, lake.visible(), files).await?;
+    // (the lock's grant brought this node up to its leader's commit, so a retry whose append landed while it waited is seen
+    // here: the check before the locks can't see it, and the key check would meet the job's own rows)
+    if crate::write::sent(lake, job).await? {
+        return Ok(j!({"duplicate": true}));
+    }
+    crate::constraints::key_check(lake, &name, &stored, None, &batch).await?; // (under the locks: the rows the other writer committed are here)
+    let n = batch.num_rows();
+    pause_for_tests().await;
+    let src = crate::log::Src { producer: format!("sql:{job}"), seq: 1, prev: None };
+    let log = app.log()?;
+    hold.sending(); // (from here its locks go with its answer, not before: the next writer must see this append)
+    let ack = match log.append(name.clone(), src, batch).await {
+        Ok(ack) => ack,
+        Err(e) => {
+            if crate::log::unanswered(&e) {
+                hold.lost(); // (no answer came: the append may still land, so its locks wait for their lease)
+            }
+            return Err(e);
+        }
+    };
+    Ok(if ack.duplicate { j!({"duplicate": true}) } else { j!({"rows": n}) })
 }
 
 /// The test hook `PONDRA_TEST_AUTOCOMMIT_PAUSE_MS` (read once): an autocommitted write waits this long after it works its rows
@@ -1431,7 +1482,7 @@ async fn write_changes(lake: &Lake, seq: &crate::log::Sequencer, c: Commit) -> R
             mine.extend(reads.keys.keys().filter(|k| is_on(k.as_slice())).cloned());
         }
         conflicts(lake, name, &meta, &reads, &mine).await?;
-        let (p, _) = crate::change::appends(lake, seq, name, &stored, old, new, &format!("txn:{}:{name}", c.id)).await?;
+        let (p, _) = crate::change::appends(lake, seq, name, &stored, old, new, &format!("txn:{}:{name}", c.id), true).await?; // (a plain INSERT's key is new at COMMIT too: `constraints.rs`)
         pending.extend(p);
     }
     if pending.is_empty() {

@@ -270,7 +270,8 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
             bail!("materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"); // (it reads them as they were)
         }
     }
-    commit(lake, seq, &table, &stored, old, new, job).await
+    let plain = matches!(stmt, crate::write::Stmt::Insert(..) | crate::write::Stmt::InsertInto(..)); // (a plain INSERT's keys must be new: `constraints.rs`)
+    commit(lake, seq, &table, &stored, old, new, job, plain).await
 }
 
 /// What an UPDATE, DELETE or MERGE of `table` changes, as of commit `upto`: the old versions of
@@ -410,9 +411,15 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
 
 /// The change as one commit: new versions and new rows into the table; the old versions into
 /// `{t}$deleted` (an append table) or as delete markers (a keyed one). `meta` as stored; the rows
-/// are under their SQL names (the log takes them so: `log::pack`).
-async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, job: &str) -> Result<Value> {
-    let (pending, (replaced, added, inserted)) = appends(lake, seq, table, meta, old, new, &format!("sql:{job}")).await?;
+/// are under their SQL names (the log takes them so: `log::pack`). `plain`: a plain INSERT's rows.
+#[allow(clippy::too_many_arguments)]
+async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, job: &str, plain: bool) -> Result<Value> {
+    // A retried job's change is in already: say so before the key check, which would find the
+    // change's own rows and refuse a retried plain INSERT (23505) where the job is a duplicate.
+    if !job.is_empty() && lake.cat.get::<u64>(&producer_key(&format!("sql:{job}"))).await?.unwrap_or(0) > 0 {
+        return Ok(j!({"duplicate": true}));
+    }
+    let (pending, (replaced, added, inserted)) = appends(lake, seq, table, meta, old, new, &format!("sql:{job}"), plain).await?;
     if pending.is_empty() {
         return Ok(j!({"rows": 0}));
     }
@@ -435,8 +442,10 @@ pub async fn submit(lake: &Lake, seq: &Sequencer, pending: &[Append]) -> Result<
 
 /// A change of `table` as appends, stamped (producer `{producer}` and `{producer}:deleted`, seq 1):
 /// and its counts, (rows replaced, rows added, of them new). None to append: nothing changes.
-#[allow(clippy::type_complexity)]
-pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, producer: &str) -> Result<(Vec<Append>, (usize, usize, usize))> {
+/// `plain`: the new rows are a plain INSERT's (their keys must be new: `constraints::check`); a
+/// loader's, a view's or a transaction's own changes are not.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, producer: &str, plain: bool) -> Result<(Vec<Append>, (usize, usize, usize))> {
     let rows = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
     let (replaced, added) = (rows(&old), rows(&new));
     if replaced + added == 0 {
@@ -458,8 +467,8 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta
     if let Some(n) = &new {
         crate::defaults::check(meta, table, n)?; // (an UPDATE may not empty a NOT NULL column)
     }
-    if crate::constraints::checked(meta) {
-        crate::constraints::check(lake, table, meta, old.as_ref(), new.as_ref()).await?; // (under the lake's lock: no other write of the table between)
+    if crate::constraints::needs_check(meta, plain) {
+        crate::constraints::check(lake, table, meta, old.as_ref(), new.as_ref(), plain).await?; // (under the lake's lock: no other write of the table between)
     }
     let inserted = new.as_ref().and_then(|n| Some(n.column_by_name(ROW_ID)?.null_count())).unwrap_or(0); // (new rows: no id yet)
     let src = |p: &str| Src { producer: format!("{producer}{p}"), seq: 1, prev: None };
@@ -495,16 +504,26 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta
     Ok((pending, (replaced, added, inserted)))
 }
 
-/// A keyed table's change as one batch for the log: its new versions, and the old rows no new version replaces, marked
+/// A keyed table's change as one batch for the log: its new versions, and the old rows whose key no new version has, marked
 /// deleted (`_deleted`, without `_version`). Under SQL's names, with `_row_id` and `_created_at`. None when no row
-/// is in either. Used by `appends` and by an autocommitted UPDATE or DELETE (`txn::autocommit`).
+/// is in either. Used by `appends` and by an autocommitted UPDATE, DELETE or INSERT (`txn::autocommit`). By key, not by
+/// `_row_id`: an UPDATE that moves a key frees the old one (its row keeps its id), and a DELETE and an INSERT of one key
+/// in one change leave the key to the new row.
 pub fn upserts(meta: &TableMeta, old: &[RecordBatch], new: &[RecordBatch]) -> Result<Option<RecordBatch>> {
     let ids = with_ids(&crate::query::schema(&meta.logical_columns())?);
     let new: Vec<RecordBatch> = new.iter().filter(|b| b.num_rows() > 0).map(|b| crate::query::conform(b, &ids)).collect::<Result<_>>()?;
-    let kept: std::collections::HashSet<i64> = new.iter().flat_map(ids_of).flatten().collect();
+    let key: Vec<String> = meta.key.iter().map(|c| meta.name_of(c).to_string()).collect(); // (the rows' SQL names)
+    // (the new rows as one batch, for `absent`: an old row is replaced only by a new row of its key)
+    let among = match new.is_empty() {
+        true => None,
+        false => Some(concat_batches(&ids, &new)?),
+    };
     let mut all = new;
     for o in old.iter().filter(|o| o.num_rows() > 0) {
-        let keep = BooleanArray::from(ids_of(o).iter().map(|id| Some(!id.is_some_and(|i| kept.contains(&i)))).collect::<Vec<_>>());
+        let keep = match &among {
+            Some(n) => crate::constraints::absent(o, n, &key)?,
+            None => BooleanArray::from(vec![true; o.num_rows()]),
+        };
         let gone = datafusion::arrow::compute::filter_record_batch(o, &keep)?;
         if gone.num_rows() > 0 {
             all.push(without(&mark_deleted(&gone)?, sys::VERSION)?);
@@ -512,12 +531,6 @@ pub fn upserts(meta: &TableMeta, old: &[RecordBatch], new: &[RecordBatch]) -> Re
     }
     let Some(s) = all.first().map(|b| b.schema()) else { return Ok(None) };
     Ok(Some(concat_batches(&s, &all.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?))
-}
-
-/// A batch's `_row_id`s.
-fn ids_of(b: &RecordBatch) -> Vec<Option<i64>> {
-    use datafusion::arrow::array::AsArray;
-    b.column_by_name(ROW_ID).map(|c| c.as_primitive::<datafusion::arrow::datatypes::Int64Type>().iter().collect()).unwrap_or_default()
 }
 
 /// A table's columns with the ids a changed row keeps (`_row_id`, `_created_at`).
@@ -738,6 +751,15 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
         }
     }
     let _ = VisitMut::visit(&mut stmts, &mut Rewrite { renamed: &renamed, kept: &kept });
+    // An INSERT's target is no table factor, so the visits above never see it: it is named as that
+    // lake names it, like the UPDATEs' and DELETEs' targets are (`plain` INSERTs into attached keyed tables).
+    for s in stmts.iter_mut() {
+        if let Statement::Insert(Insert { table: TableObject::TableName(name), .. }) = s {
+            if crate::write::object(name) == written {
+                *name = ObjectName::from(local.split('.').map(|p| Ident::with_quote('"', p)).collect::<Vec<_>>());
+            }
+        }
+    }
     Ok((stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join("; "), sent))
 }
 

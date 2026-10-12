@@ -99,8 +99,8 @@ SELECT * FROM visits ORDER BY page;
 +------+---+
 ```
 
-Without `ON CONFLICT`, an `INSERT` into a keyed table replaces the row. `MERGE` does the same jobs and
-more. MySQL's `ON DUPLICATE KEY UPDATE` is refused, with the Postgres form to use instead.
+Without `ON CONFLICT`, a plain `INSERT` of a key the table holds is refused. `INSERT OR REPLACE` replaces
+the row, as a load does, and `MERGE` does the same jobs and more. MySQL's `ON DUPLICATE KEY UPDATE` is refused, with the Postgres form to use instead.
 
 ## Empty a table
 

@@ -108,7 +108,7 @@ def history_check(bin, work, port):
     q("CREATE TABLE k (id BIGINT PRIMARY KEY, v VARCHAR) WITH (publish = 'delta')")
     q("INSERT INTO k VALUES (1, 'a'), (2, 'b'), (3, 'c')")
     tier()
-    q("INSERT INTO k VALUES (2, 'B')")
+    q("INSERT OR REPLACE INTO k VALUES (2, 'B')")  # (an upsert: a plain INSERT of key 2 is refused, 23505)
     q("DELETE FROM k WHERE id = 3")
     keyed = rows("SELECT id, v FROM k ORDER BY id")
     q("DROP TABLE k")

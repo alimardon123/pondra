@@ -8,6 +8,13 @@
 //! Every loading door (appends, Flight, `COPY`, Kafka) takes such a table's rows the same way: `queue`
 //! sends them to the leader, which checks them under the lake's lock and commits them as one change
 //! (`leader`), once per (producer, seq), as a retry of a committed batch is answered without a check.
+//!
+//! A table's key (an enforced PRIMARY KEY) is checked for a plain SQL INSERT and for a transaction's
+//! changes at COMMIT: a key the table holds is refused, as Postgres does. A plain INSERT is checked on
+//! the node that takes it, under the row locks of its keys (`txn::insert_as`), so two nodes inserting
+//! one new key at once wait for each other and the second is refused. A change keeps the keys it
+//! replaces or deletes, so an UPDATE or an upsert of a key still replaces its row, and the loading
+//! doors keep doing so, which is what a keyed stream is.
 use crate::log::{Ack, Append, Outcome, Sequencer, Src, To};
 use crate::store::{Lake, TableMeta};
 use anyhow::{bail, ensure, Result};
@@ -60,6 +67,15 @@ impl Constraint {
 
 /// Does a write to this table have to be checked on the leader (an enforced UNIQUE)?
 pub fn checked(meta: &TableMeta) -> bool { meta.constraints.iter().any(|c| c.enforced) }
+
+/// Does a plain INSERT into this table have its key checked on the leader? A keyed table's key is
+/// its PRIMARY KEY: a plain INSERT of a key the table holds is refused. A GROUP BY view's table
+/// (`merge`) combines a key's rows by design, so it has no such refusal.
+pub fn key_checked(meta: &TableMeta) -> bool { !meta.key.is_empty() && meta.merge.is_empty() }
+
+/// Does `check` have to see this write? Every write to a table with an enforced UNIQUE does; a plain
+/// INSERT does too when its table's key is checked (`key_checked`). Loaders and views pass `plain` false.
+pub fn needs_check(meta: &TableMeta, plain: bool) -> bool { checked(meta) || (plain && key_checked(meta)) }
 
 /// Refused at a door that writes rows without the leader's check: another engine's file commit into
 /// a table with an enforced UNIQUE (`adopt.rs`). The loading doors take such rows through `queue`,
@@ -158,19 +174,117 @@ fn deferred(c: &Option<ast::ConstraintCharacteristics>) -> Result<()> {
 /// updated row keeps its `_row_id`) would give an enforced UNIQUE's columns a value twice, among
 /// themselves or with a row the table keeps (every row but the `old` ones it replaces, and, in a
 /// keyed table, the rows of the keys it writes). NULLs are distinct, as in Postgres.
-pub async fn check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&RecordBatch>, new: Option<&RecordBatch>) -> Result<()> {
+///
+/// `plain`: the rows are a plain INSERT's. Then a keyed table's key must be new: two rows of one key
+/// are refused, and so is a key a live row of the table holds (`key_checked`). Nothing is replaced,
+/// so the rows of the keys they give stay.
+pub async fn check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&RecordBatch>, new: Option<&RecordBatch>, plain: bool) -> Result<()> {
     let Some(new) = new.filter(|n| n.num_rows() > 0) else { return Ok(()) };
     let named = meta.logical();
+    if plain && key_checked(meta) {
+        key_check(lake, table, meta, old, new).await?;
+    }
     for c in named.constraints.iter().filter(|c| c.enforced && c.kind == Kind::Unique) {
-        let violated = |key: String| crate::codes::coded("23505", format!("duplicate key value violates unique constraint \"{}\": Key ({})=({key}) already exists", c.name, c.columns.join(", ")));
         if let Some(key) = twice(new, &c.columns, &named.key)? {
-            return Err(violated(key));
+            return Err(violated(&c.name, &c.columns, key));
         }
-        if let Some(key) = kept(lake, table, &named, &c.columns, old, new).await? {
-            return Err(violated(key));
+        if let Some(key) = kept(lake, table, &named, &c.columns, old, new, plain).await? {
+            return Err(violated(&c.name, &c.columns, key));
         }
     }
     Ok(())
+}
+
+/// The 23505 a duplicate gives, with Postgres's words.
+fn violated(name: &str, columns: &[String], key: String) -> anyhow::Error {
+    crate::codes::coded("23505", format!("duplicate key value violates unique constraint \"{name}\": Key ({})=({key}) already exists", columns.join(", ")))
+}
+
+/// The PRIMARY KEY of a plain INSERT, or of a transaction's changes at COMMIT (`check`, `txn.rs`):
+/// two new rows of one key are refused, and so is a new key a live row of the table holds (`held`).
+/// A new row whose key one of the `old` rows had is no new key (an UPDATE keeps its key, a swap moves
+/// two keys between rows, a key the change deletes is free), so it is not looked up. Every new row
+/// still counts for the first test. `meta` is the table as it is stored; `new` and `old` are in SQL's
+/// column names. This is the table as the node has it now (COMMIT's check: `key_check_at` for the rest).
+pub async fn key_check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&RecordBatch>, new: &RecordBatch) -> Result<()> {
+    key_check_at(lake, table, meta, old, new, None).await
+}
+
+/// `key_check` against the table as it reads at commit `upto`, through the session's overlay (`held`). A plain INSERT in a
+/// transaction is checked this way at its statement, so Postgres's refusal comes there, where a SAVEPOINT can roll it back:
+/// its transaction's own writes count (a key it inserted is held, one it deleted is free). None: the table as this node has it.
+pub async fn key_check_at(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&RecordBatch>, new: &RecordBatch, upto: Option<u64>) -> Result<()> {
+    let name = format!("{}_pkey", table.rsplit('.').next().unwrap_or(table)); // (Postgres's name for a primary key that isn't named)
+    let key: Vec<String> = meta.key.iter().map(|c| meta.name_of(c).to_string()).collect(); // (SQL's names, as `logical` gives them)
+    if let Some(found) = twice(new, &key, &[])? {
+        return Err(violated(&name, &key, found));
+    }
+    let fresh = fresh_keys(new, old, &key)?;
+    if fresh.num_rows() > 0 {
+        if let Some(found) = held(lake, table, meta, &fresh, upto).await? {
+            return Err(violated(&name, &key, found));
+        }
+    }
+    Ok(())
+}
+
+/// The key columns (in the table's key order) of the new rows whose key no old row had, one row per
+/// key (the new rows' keys are distinct by now: `twice`).
+fn fresh_keys(new: &RecordBatch, old: Option<&RecordBatch>, key: &[String]) -> Result<RecordBatch> {
+    let keys = key.iter().map(|c| new.column_by_name(c).cloned().ok_or_else(|| anyhow::anyhow!("no column {c}"))).collect::<Result<Vec<_>>>()?;
+    let all = RecordBatch::try_from_iter(key.iter().map(String::as_str).zip(keys.iter().cloned()))?;
+    let Some(old) = old.filter(|o| o.num_rows() > 0) else { return Ok(all) };
+    Ok(datafusion::arrow::compute::filter_record_batch(&all, &absent(new, old, key)?)?)
+}
+
+/// For each row of `of`: is its key (the columns `key`) absent from `among`'s rows? `among`'s key
+/// columns are cast to `of`'s types first. A change uses it to tell which old rows a new version
+/// replaces: by key, so an UPDATE that moves a key frees the old one, and a DELETE and INSERT of one
+/// key in one change keep the key's new row.
+pub fn absent(of: &RecordBatch, among: &RecordBatch, key: &[String]) -> Result<datafusion::arrow::array::BooleanArray> {
+    use datafusion::arrow::row::{RowConverter, SortField};
+    let columns = |b: &RecordBatch| key.iter().map(|c| b.column_by_name(c).cloned().ok_or_else(|| anyhow::anyhow!("no column {c}"))).collect::<Result<Vec<_>>>();
+    let mine = columns(of)?;
+    let converter = RowConverter::new(mine.iter().map(|a| SortField::new(a.data_type().clone())).collect())?;
+    let theirs = columns(among)?.iter().zip(&mine).map(|(a, m)| datafusion::arrow::compute::cast(a, m.data_type())).collect::<std::result::Result<Vec<_>, _>>()?;
+    let held: std::collections::HashSet<Vec<u8>> = converter.convert_columns(&theirs)?.iter().map(|r| r.as_ref().to_vec()).collect();
+    Ok(datafusion::arrow::array::BooleanArray::from(converter.convert_columns(&mine)?.iter().map(|r| Some(!held.contains(r.as_ref()))).collect::<Vec<_>>()))
+}
+
+/// Is one of these keys (`keys`: the key columns in the table's key order, named as SQL names them, one
+/// row per key) held by a live row of `table`? A deleted key is free. A table without `order` and up to
+/// 1,000 keys of types the point lookup reads (integers, text) are looked up one by one
+/// (`serve::lookup_versioned`, on the stored `meta`: the log tail, then the files by their key ranges);
+/// more keys, or an `order` table (its lookups go through SQL: invariant 79), are one query, the keys as
+/// a table of their own, so the files' key ranges prune. Returns the first key held, as Postgres's
+/// DETAIL writes it. `upto` None reads the table as this node has it (the lookups where they can). Some(at)
+/// reads it as of commit `at` through the session's overlay, by the query alone: the lookups read neither
+/// a transaction's own writes nor a read point.
+pub async fn held(lake: &Lake, table: &str, meta: &TableMeta, keys: &RecordBatch, upto: Option<u64>) -> Result<Option<String>> {
+    let point = upto.is_none() && meta.ids && meta.order.is_none() && keys.num_rows() <= 1000 && meta.key.iter().all(|k| meta.columns.iter().any(|(c, t)| c == k && is_point_type(t)));
+    if point {
+        for i in 0..keys.num_rows() {
+            let values = keys.columns().iter().map(|c| datafusion::arrow::util::display::array_value_to_string(c, i)).collect::<std::result::Result<Vec<_>, _>>()?;
+            if crate::serve::lookup_versioned(lake, table, meta, &values).await?.is_some() {
+                return Ok(Some(shown(keys.columns(), i)));
+            }
+        }
+        return Ok(None);
+    }
+    let q = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
+    let names: Vec<String> = keys.schema().fields().iter().map(|f| f.name().clone()).collect();
+    let cols = names.iter().map(|c| format!("t.{}", q(c))).collect::<Vec<_>>().join(", ");
+    let on = names.iter().map(|c| format!("t.{0} = n.{0}", q(c))).collect::<Vec<_>>().join(" AND ");
+    let sql = format!("SELECT {cols} FROM {} AS t JOIN __pondra_keys AS n ON {on} LIMIT 1", crate::write::sql_name(table));
+    let ctx = crate::query::session_at(lake, &sql, "", Some(upto.unwrap_or_else(|| lake.visible()))).await?;
+    ctx.register_batch("__pondra_keys", keys.clone())?;
+    let found = crate::query::sql(&ctx, &sql).await?.collect().await?;
+    Ok(found.iter().find(|b| b.num_rows() > 0).map(|b| shown(b.columns(), 0)))
+}
+
+/// The types `serve::lookup_versioned` turns a key's text back into.
+fn is_point_type(stored: &str) -> bool {
+    matches!(stored, "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Utf8")
 }
 
 /// A value of `columns` two new rows give (of two keys, in a keyed table: one key's rows are its
@@ -200,8 +314,9 @@ fn twice(new: &RecordBatch, columns: &[String], key: &[String]) -> Result<Option
     Ok(None)
 }
 
-/// A value of `columns` a new row gives that a row the table keeps has already.
-async fn kept(lake: &Lake, table: &str, meta: &TableMeta, columns: &[String], old: Option<&RecordBatch>, new: &RecordBatch) -> Result<Option<String>> {
+/// A value of `columns` a new row gives that a row the table keeps has already. `plain`: the new rows
+/// are a plain INSERT's, which replace no row of their keys, so those rows count too.
+async fn kept(lake: &Lake, table: &str, meta: &TableMeta, columns: &[String], old: Option<&RecordBatch>, new: &RecordBatch, plain: bool) -> Result<Option<String>> {
     let q = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
     let on = columns.iter().map(|c| format!("t.{0} = n.{0}", q(c))).collect::<Vec<_>>().join(" AND ");
     let given = columns.iter().map(|c| format!("n.{} IS NOT NULL", q(c))).collect::<Vec<_>>().join(" AND ");
@@ -209,7 +324,7 @@ async fn kept(lake: &Lake, table: &str, meta: &TableMeta, columns: &[String], ol
     if old.is_some_and(|o| o.num_rows() > 0) {
         sql += &format!(" AND t.{0} NOT IN (SELECT {0} FROM __pondra_old)", crate::sys::ROW_ID); // (the rows the change replaces)
     }
-    if !meta.key.is_empty() {
+    if !meta.key.is_empty() && !plain {
         let same = meta.key.iter().map(|k| format!("w.{0} = t.{0}", q(k))).collect::<Vec<_>>().join(" AND ");
         sql += &format!(" AND NOT EXISTS (SELECT 1 FROM __pondra_new AS w WHERE {same})"); // (a key's new version replaces its row)
     }
@@ -442,7 +557,7 @@ async fn append(lake: &Lake, seq: &Sequencer, table: &str, src: Src, batch: Reco
     // (an empty batch still moves its producer's seq: `change::appends` has nothing to append for it)
     let mut pending = match batch.num_rows() {
         0 => vec![Append { table: table.into(), src: src.clone(), batch: RecordBatch::new_empty(crate::query::schema(&meta.logical_columns())?), ack: tokio::sync::oneshot::channel().0 }],
-        _ => crate::change::appends(lake, seq, table, &meta, vec![], vec![batch], "").await?.0,
+        _ => crate::change::appends(lake, seq, table, &meta, vec![], vec![batch], "", false).await?.0, // (a loader's rows: upserts)
     };
     let table_append = pending.first_mut().ok_or_else(|| anyhow::anyhow!("no rows for {table}"))?;
     table_append.src = src;

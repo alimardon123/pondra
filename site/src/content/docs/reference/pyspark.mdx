@@ -495,7 +495,7 @@ print(o.select("id", "qty").orderBy(F.asc("qty"), F.desc("id")).collect())
 | `option(key, value)`, `options(**kw)` | a writer option: CSV's `header` and `sep`, Parquet's `compression`. JSON takes none |
 | `partitionBy(*cols)` | one folder per value of the columns, as `k=v` folders |
 | `saveAsTable(name)` | a lake table: made, replaced (`overwrite`), or added to (`append`) |
-| `insertInto(name, overwrite=False)` | adds the rows to a lake table. `overwrite=True` replaces them |
+| `insertInto(name, overwrite=False)` | adds the rows to a lake table. `overwrite=True` replaces them. Into a keyed table a key it holds is refused (`23505`), as `INSERT` is |
 | `save(path)` | the files, or a Delta table, in a folder, in the format set |
 | `parquet(path)`, `csv(path)`, `json(path)`, `delta(path)` | the same, by format |
 

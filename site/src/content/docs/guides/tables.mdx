@@ -95,13 +95,14 @@ it, so a misspelt `cluser_by` never quietly does nothing.
 
 ### A keyed table: `PRIMARY KEY`
 
-With a key, `INSERT` is an upsert: a new row replaces the row with the same key. `UPDATE` and
-`DELETE` find rows by key.
+With a key, a plain `INSERT` of a key the table holds is refused (`23505`, as in Postgres). To replace
+the row, use `INSERT OR REPLACE` or `INSERT … ON CONFLICT`; a load (`append`, `COPY`, Kafka) replaces it
+too. `UPDATE` and `DELETE` find rows by key.
 
 ```sql
 CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
 INSERT INTO users VALUES (1, 'ann', 'free'), (2, 'bob', 'free');
-INSERT INTO users VALUES (2, 'bob', 'pro');
+INSERT OR REPLACE INTO users VALUES (2, 'bob', 'pro');
 DELETE FROM users WHERE id = 1;
 SELECT * FROM users;
 ```
@@ -147,7 +148,7 @@ arrive. A late row doesn't replace a newer one.
 ```sql
 CREATE TABLE positions (vehicle VARCHAR PRIMARY KEY, ts TIMESTAMP, lat DOUBLE, lon DOUBLE) SEQUENCE BY ts;
 INSERT INTO positions VALUES ('v1', TIMESTAMP '2026-09-27 10:05:00', 41.30, 69.28);
-INSERT INTO positions VALUES ('v1', TIMESTAMP '2026-09-27 10:01:00', 41.20, 69.20);
+INSERT OR REPLACE INTO positions VALUES ('v1', TIMESTAMP '2026-09-27 10:01:00', 41.20, 69.20);
 SELECT * FROM positions;
 ```
 
