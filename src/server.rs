@@ -841,6 +841,9 @@ impl App {
     /// Tier the tables with at least `min_rows` rows in the log (0: all of them), publish them
     /// for other engines, then expire what everything has consumed (leader).
     pub async fn tier_all(&self, min_rows: u64) -> anyhow::Result<u64> {
+        if crate::backup::frozen(&self.lake) {
+            return crate::backup::tend(&self.lake).await.map(|_| 0); // (its tables never change: only its clones' pins are kept)
+        }
         let _guard = self.lock.lock().await;
         let _tiering = self.seq.as_ref().map(|s| s.tiering()); // (writers paused by backpressure stay paused: `log::Pace`)
         let start = std::time::Instant::now();
@@ -945,6 +948,9 @@ impl App {
     }
 
     pub async fn run_tasks(&self) -> anyhow::Result<()> {
+        if crate::backup::frozen(&self.lake) {
+            return Ok(()); // (a backup's views and tasks follow nothing: ADR-070)
+        }
         crate::tasks::run_all(&self.lake, &self.cluster, self.log()?).await?;
         match &self.seq {
             Some(seq) => {

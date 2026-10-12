@@ -196,6 +196,33 @@ pub(crate) enum Cmd {
         attach: Vec<String>,
         query: String,
     },
+    /// Back a lake up into a lake of its own: `pondra backup s3://b/prod s3://b/backups/prod`. Run
+    /// again, it copies only what changed since, and keeps what earlier runs need for
+    /// `--retention-days` (7 by default), so a restore can go back that far. The backup is read
+    /// like any lake, and written only by its next run. Works with no node running.
+    Backup {
+        /// The lake to back up (a folder or s3://bucket/prefix).
+        lake: String,
+        /// Where its backup is (a new place the first time, the same one after).
+        to: String,
+        /// How many days earlier runs stay restorable (7 the first time; the backup keeps the
+        /// last one given).
+        #[arg(long)]
+        retention_days: Option<u64>,
+    },
+    /// Make a lake again from its backup, in a new place: `pondra restore s3://b/backups/prod
+    /// s3://b/prod2 [--at '2026-10-12 03:00:00']` (its newest run at or before that time, in UTC).
+    /// Its tasks come back suspended (ALTER TASK name RESUME).
+    Restore {
+        /// The backup.
+        from: String,
+        /// The new lake's place: nothing there yet.
+        to: String,
+        /// Restore the newest run at or before this time: '2026-10-12 03:00:00' (UTC), RFC 3339,
+        /// or milliseconds since 1970. The newest run when left out.
+        #[arg(long)]
+        at: Option<String>,
+    },
     /// Make a token for a user of a lake, and print it (once: the lake keeps only its hash). Through
     /// the bucket, so no token is needed: whoever can write the lake's folder owns it. The lake's first
     /// user is `pondra` (made by a node on the network with no token, which prints its token too).
@@ -352,6 +379,7 @@ fn mistyped(word: &str, c: &str) -> bool {
 
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    store::inherit(); // (a lake led for a moment, reached as the process that asked reaches it)
     let Some(cmd) = cli.cmd else {
         let given = cli.lake.is_some();
         let lake = cli.lake.unwrap_or_else(|| "lake".into());
@@ -574,6 +602,9 @@ async fn run() -> anyhow::Result<()> {
                         Ok(()) if made => l.cat.checkpoint().await.unwrap_or_else(|e| eprintln!("checkpoint: {e:#}")),
                         Ok(()) => {}
                     }
+                    if backup::frozen(&l) {
+                        return; // (a backup's secrets and keys stay as its runs wrote them: ADR-070)
+                    }
                     match ext::rewrap(&l).await {
                         Ok(0) => {}
                         Ok(n) => eprintln!("rewrapped {n} secret{} with the master key in use now", if n == 1 { "" } else { "s" }),
@@ -792,6 +823,14 @@ async fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Lead { dir } => write::lead_only(&dir).await?,
+        Cmd::Backup { lake, to, retention_days } => {
+            let stmt = write::Stmt::Ddl(vec![ddl::Ddl::BackupDatabase { database: None, to, retention_days }]);
+            println!("{}", serde_json::to_string_pretty(&write::from_cli(&lake, stmt).await?)?);
+        }
+        Cmd::Restore { from, to, at } => {
+            let at = at.as_deref().map(backup::instant).transpose()?;
+            println!("{}", serde_json::to_string_pretty(&backup::restore(&from, &to, at).await?)?);
+        }
         Cmd::Sql { dir, query, attach: attached } if write::checkpoint(&query) => {
             // (the leader's work; with nobody leading, the next node to start tiers the log)
             let store = store::open_store(&dir)?.1;

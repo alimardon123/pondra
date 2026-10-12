@@ -16,6 +16,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod audit;
 #[cfg(feature = "server")] mod ai;
 #[cfg(feature = "server")] mod avro;
+#[cfg(feature = "server")] mod backup;
 #[cfg(feature = "server")] mod branch;
 #[cfg(feature = "server")] mod bridge;
 #[cfg(feature = "server")] mod rerun;

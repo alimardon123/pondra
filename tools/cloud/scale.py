@@ -17,6 +17,8 @@ and spark_tpch.py times the same 22 queries over the same Parquet in the bucket.
 
 --local with no --data makes a small stand-in (a lineitem and an orders table, written by Pondra
 itself) and runs three queries over it: that checks the plumbing, it is not a benchmark.
+
+Export the same `PONDRA_ADMIN_TOKEN` as env.sh's before running it: `driver.call` sends it.
 """
 import argparse, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 

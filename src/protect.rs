@@ -134,7 +134,8 @@ fn ddl_touches(d: &Ddl) -> Vec<Touch> {
         Ddl::Users(c) => users(c),
         // (none of these is a project's: `apply::head` refuses the kinds a project can't declare)
         Ddl::CreateSchema { .. } | Ddl::CreateDatabase { .. } | Ddl::Branch(_) | Ddl::Pin { .. } | Ddl::Unpin { .. } | Ddl::Apply { .. } | Ddl::ExecuteTask { .. }
-        | Ddl::RunLog | Ddl::AuditLog | Ddl::HistoryLog | Ddl::Shares(_) | Ddl::Sequence(_) | Ddl::Index(_) | Ddl::Type(_) | Ddl::Protect { .. } => vec![],
+        | Ddl::RunLog | Ddl::AuditLog | Ddl::HistoryLog | Ddl::Shares(_) | Ddl::Sequence(_) | Ddl::Index(_) | Ddl::Type(_) | Ddl::Protect { .. }
+        | Ddl::BackupDatabase { .. } | Ddl::RestoreDatabase { .. } | Ddl::Backup(_) => vec![], // (a backup reads the database; a restore makes a new one)
     }
 }
 

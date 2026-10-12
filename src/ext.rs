@@ -1112,6 +1112,17 @@ pub async fn reach(lake: &Lake, dir: &str, read_only: bool, endpoint: Option<&st
     reach_with(&list(lake).await?, dir, read_only, endpoint)
 }
 
+/// A place this lake copies itself to or from (a backup's, a restore's: ADR-070), reached with the
+/// bucket secret whose SCOPE covers it when one does, else with the environment's credentials. (Only
+/// on a hit: a place registered with none would hide a key a broader place was registered with.)
+pub async fn reach_place(lake: &Lake, dir: &str) -> Result<()> {
+    let secrets = list(lake).await?;
+    if let Some(hit) = covering(&secrets, dir) {
+        reach_by(Some(hit), &secrets, dir, false, None)?;
+    }
+    Ok(())
+}
+
 /// The bucket secrets covering `urls` (no temporary ones), for a branch to keep (`branch::make`). Whoever
 /// may clone a database attached here lends its key without USAGE on it: the branch can't read its base
 /// without it, and CLONE is the grant that says who may (ADR-058). Lent, it reads the base and nothing

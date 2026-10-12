@@ -581,7 +581,7 @@ impl Tail {
 /// How this process reaches a lake on another server (ADR-058): the settings of the bucket key it
 /// is read with (a secret's, `ext::build`; None: the environment's), whether nothing here may write
 /// it, and where its leader is asked (a URL, with a TYPE pondra secret's token).
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct Reach {
     pub read_only: bool,
     pub params: Option<BTreeMap<String, String>>,
@@ -599,6 +599,22 @@ pub fn reach_by(url: &str, r: Reach) {
     let old = all.remove(url.trim_end_matches('/')).unwrap_or_default();
     let read_only = old.read_only || r.read_only;
     all.insert(url.trim_end_matches('/').to_string(), Reach { read_only, params: r.params.or(old.params), endpoint: r.endpoint.or(old.endpoint), token: r.token.or(old.token), secret: r.secret.or(old.secret) });
+}
+
+/// What this process knows of how to reach other places, for a process it starts to lead one of them
+/// for a moment (`inbox::lead_once`): it holds the same keys, so a backup in another bucket is written
+/// with the secret that reaches it (ADR-070).
+pub const REACH_VAR: &str = "PONDRA_REACH";
+
+pub fn reaches() -> String { serde_json::to_string(&*REACH.read().unwrap()).unwrap_or_default() }
+
+/// The places the process that started this one could reach (`REACH_VAR`), as it reached them.
+pub fn inherit() {
+    let Ok(text) = std::env::var(REACH_VAR) else { return };
+    match serde_json::from_str::<BTreeMap<String, Reach>>(&text) {
+        Ok(all) => all.into_iter().for_each(|(url, r)| reach_by(&url, r)),
+        Err(e) => eprintln!("{REACH_VAR}: {e}"),
+    }
 }
 
 /// How `url`, or a lake it is in, is reached (the longest registered prefix: `url` itself, or a
@@ -762,6 +778,7 @@ impl Lake {
         };
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
+        cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
         let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
@@ -992,7 +1009,7 @@ impl Lake {
         let config = crate::optimize::config(SessionConfig::new().with_information_schema(true).with_target_partitions(partitions)
             .with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::ddl::PUBLIC));
         let state = SessionStateBuilder::new().with_config(config).with_runtime_env(self.rt.clone()).with_default_features();
-        let mut state = state.with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
+        let mut state = state.with_analyzer_rules(crate::optimize::analyzer_rules()).with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
         state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::files::planner());
         state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::intervals::planner()); // (n * INTERVAL '37 seconds') // (SUBSTRING of bytes too)
         let mut ctx = SessionContext::new_with_state(state.build());
@@ -1082,6 +1099,9 @@ impl Lake {
 
     /// Write an object only if it does not exist yet: data is never overwritten.
     pub async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<()> {
+        if self.cat.frozen.load(Relaxed) {
+            return Err(crate::backup::refused(Some(&self.url))); // (a backup's objects are its runs': ADR-070)
+        }
         let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
         let bytes = Bytes::from(bytes);
         self.store.put_opts(&Path::from(path), bytes.clone().into(), opts).await?;
@@ -1110,6 +1130,15 @@ impl Lake {
         Ok(bytes)
     }
 
+    /// Where `path` is read whole, past the caches: this lake's bucket, or a branch's base's (a
+    /// backup copies through it, a piece at a time).
+    pub fn reader(&self, path: &str) -> Result<(Store, Path)> {
+        Ok(match crate::branch::split(path) {
+            Some((id, rest)) => (self.base_store(id)?, Path::from(rest)),
+            None => (self.store.clone(), Path::from(path)),
+        })
+    }
+
     /// A user's file's version, for `If-Match` (`GET /files` gives it): its e-tag and size, or
     /// (a store without e-tags) its time and size.
     pub async fn version(&self, path: &str) -> Result<String> { Ok(version_of(&self.store.head(&Path::from(path)).await?)) }
@@ -1126,6 +1155,9 @@ impl Lake {
     /// blind. Where the store can, the check and the write are one request (a conditional put).
     pub async fn replace(&self, path: &str, bytes: Vec<u8>, expect: &str) -> Result<String> {
         anyhow::ensure!(replaceable(path), "only the lake's files (files/…) are replaced");
+        if self.cat.frozen.load(Relaxed) {
+            return Err(crate::backup::refused(Some(&self.url))); // (ADR-070)
+        }
         static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()); // (a store with no conditional put: this node's saves one at a time)
         let _one = ONE.lock().await;
         let at = Path::from(path);
@@ -1152,6 +1184,9 @@ impl Lake {
     /// Remove a user's file (`files/`): the tables' own objects are removed by Pondra alone.
     pub async fn remove_file(&self, path: &str) -> Result<()> {
         anyhow::ensure!(replaceable(path), "only the lake's files (files/…) are removed this way");
+        if self.cat.frozen.load(Relaxed) {
+            return Err(crate::backup::refused(Some(&self.url))); // (ADR-070)
+        }
         self.store.head(&Path::from(path)).await?; // (not there: an error that says so)
         self.store.delete(&Path::from(path)).await?;
         Ok(())
@@ -1297,6 +1332,7 @@ pub struct Catalog {
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
     metas: Mutex<lru::LruCache<String, (u64, Arc<TableMeta>)>>, // tables' entries as parsed, by the commit that wrote them (`meta`)
+    pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
 }
 
 /// A scan in progress: the streamed changes it may still lay over its (older) view stay.
@@ -1588,7 +1624,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))) }
+        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))), frozen: Default::default() }
     }
 
     /// Leader: the recent frames plus a receiver for every frame from now on.
@@ -1951,6 +1987,9 @@ impl Catalog {
     /// waiting (pipelined commits: one round trip no longer blocks the next).
     pub async fn write(&self, puts: Vec<(String, Vec<u8>)>, deletes: &[String]) -> Result<oneshot::Receiver<()>> {
         let (Db_::Writer(db), Some(writes)) = (&self.db, &self.writes) else { bail!("read-only node") };
+        if self.frozen.load(Relaxed) && !crate::backup::may_write(puts.iter().map(|(k, _)| k).chain(deletes)) {
+            return Err(crate::backup::refused(None)); // (whatever door a write came through: ADR-070)
+        }
         let puts: Vec<(String, Bytes)> = puts.into_iter().map(|(k, v)| (k, v.into())).collect();
         let mut batch = WriteBatch::new();
         for (k, v) in &puts {

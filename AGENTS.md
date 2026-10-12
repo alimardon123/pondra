@@ -90,7 +90,8 @@ src/      62,500 lines of Rust in 108 files, one per concern (see the table in R
           friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225), objects.rs
           (one registry of every kind of object: ADR-049, invariant 227), find.rs (`pondra.parts` and
           `pondra.find`: every part of every object, and one search of objects, parts and concepts;
-          ADR-065, invariant 345), seq.rs (sequences and
+          ADR-065, invariant 345), backup.rs (`BACKUP DATABASE`, `RESTORE DATABASE`: a backup is a lake;
+          ADR-070, invariants 290, 291), seq.rs (sequences and
           identity columns: invariant 234), index.rs (indexes kept as objects: invariant 235),
           constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236),
           types.rs (enum types: invariant 242), and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
@@ -120,7 +121,8 @@ python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node)
 install.sh, install.ps1   the one-line installers each release carries (ADR-024)
 deploy/   the container image (docker/Dockerfile; tools/image.py lays out its context), a compose
           cluster (compose/) and the Helm chart (helm/pondra); ADR-041
-js/       the JavaScript client and the `pondra` npm package's files
+js/       the JavaScript client (`index.js`) and its frames (`frame.js`, Python's frames with nodejs-polars'
+          names), and the `pondra` npm package's files
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style),
           console-extension.js (what a console extension adds: a section, a tab, a view, an action)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
@@ -2090,6 +2092,24 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `pondra_queries_running` and `pondra_queries_waiting` count them. `harness.py answers_big`:
    two turns and four slow queries, two at once and the rest refused (53300) or answered after;
    one turn does for a PIVOT, which asks the data first.
+290. **A backup run copies one snapshot, and its commit names nothing it hasn't copied** (`backup::take`,
+   ADR-070): the database is pinned and its catalog read at a version that holds the pin
+   (`branch::snapshot`); every object that version names (files, delete files, manifests, the log's
+   segments, kept dropped tables') is in the backup before the one commit that writes the catalog,
+   the log's first (tiering lets them go; the pin holds files). A run stopped half way leaves the
+   previous run whole; its mark (`_backups/running`) has the next look before it copies. A branch's
+   base's files go under `data/_bases/<id>/`, its manifests sealed again under the backup's paths, so
+   a backup of a branch reads nothing of its base. The lake's own keys (`z/auth`), lent keys, pins and
+   published state are never carried (`backup::own`). `tools/backup_check.py`.
+291. **A backup is written only by its runs, and keeps every object of the runs it keeps**
+   (`backup::frozen`, `may_write`, ADR-070). Its catalog takes a commit only from a run (`RUN`), or
+   the pins and keys a lake keeps of its own; every door refuses a write by name (25006) before it is
+   made: SQL (`write::on_node_listed`, `prepare`), the leader's requests (`write::handle`), rows
+   (`log::queue`, `commit`), files (`Lake::put`, `replace`, `remove_file`). Its nodes run no tiering,
+   emission, streaming task, feed, task tick or history. An object a run stops naming is deleted only
+   past `retention_days` and once no clone of the backup is pinned before it; a run past the
+   retention goes with its catalog (`_backups/{ms}-{commit}.json.zst`). A restore copies one run into
+   an empty place, suspends its tasks and takes away what it made if it fails. `tools/backup_check.py`.
 337. **A file is loaded into a table once a version, and its record lands with its rows** (`copy.rs`,
    `adopt::file`, `log::Filing::also`): `COPY INTO t FROM '…'` loads each file under the job
    `load:{table, file, version}` (an e-tag, else size and time), so the bulk path's job mark keeps a
@@ -2151,6 +2171,38 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    reads is checked against the user's grants, as on the leader. `harness.py guarded`: "a change a
    follower forwards runs as its user…".
 
+375. **Where the nodes share an admin token and nothing else, it is the master key, and the nodes' key
+   opens nothing there** (`ext::master`, `admin_key`, `previous`; `users::who`, `server::cluster_call`):
+   with no `PONDRA_SECRET_KEY` or key service, the lake's own keys and its secrets are sealed by a key
+   PBKDF2 makes from the admin token (100,000 rounds, once a process), so nothing in the bucket signs
+   anyone in. A `pn_` key counts only on a node without an admin token (with one, nodes call each other
+   with it). The keys before a change still open (`PONDRA_SECRET_KEY_PREVIOUS`, the admin token when a
+   lake moved to `PONDRA_SECRET_KEY`, `PONDRA_ADMIN_TOKEN_PREVIOUS`, a machine's key only if its file is
+   there: never made for it), and the leader rewraps with the key in use. A lake whose users sign in
+   while its keys are in the clear says so at its leader's start and on every `CREATE USER … PASSWORD`,
+   `ALTER USER … PASSWORD` and `CREATE TOKEN`. `harness.py sealed`: "with only an admin token, a new
+   lake's own keys are sealed from its first write…", "…the nodes' key read from the bucket opens
+   nothing (401)…".
+
+376. **A node that listens beyond this machine is never open** (`Auth::network`, `App::open`,
+   `users::first_user`): its `--addr`, `--pg`, `--kafka` or `--flight` on anything but 127.0.0.1,
+   localhost or [::1] means every request signs in, tokens or not. With no token, its leader makes the
+   lake's first user, `pondra`, a superuser, before it serves, and prints its token once (only the hash
+   is kept); a failure stops the node. A follower of a lake with no user yet answers no one. `pondra
+   token --dir` makes a token here and sends only its hash, through the bucket (whoever can write the
+   bucket owns the lake: invariant 18), making `pondra` first on a lake with no user. `serve --lakes`
+   on the network with no token refuses to start. Users that can't be read are taken for ones who sign
+   in (`users::any`): a node from before a new kind of grant took the lake for open. `harness.py
+   first`: "a node on the network with no token makes user pondra…", "a follower on the network, of a
+   lake with no user yet…".
+
+377. **A grant on another database needs format 4** (`users::ACROSS`, `On::Database`): a node from
+   0.33 can't read a user holding one, so it waits until every node knows format 4. A new kind of grant
+   is stored as one an older node reads (a sequence's as `On::Table`), or waits for its format.
+   `upgrade_check.py format`: "…a grant on another database, to 4; and Pondra 0.33.0 then refuses it by
+   name". And `cluster::alive` asks for `cluster/left` too: a leader's last mark, in flight as it stepped
+   down, can land after `release` deleted it (`environments_check.py --s3`'s teardown).
+
 ## Tests: run these before and after any change
 
 ```bash
@@ -2161,6 +2213,8 @@ python3 tools/gates.py [--prepare]      # the gates (sqllogictest, TPC-H SF1 vs 
 python3 tools/harness.py guarded        # open nodes and pages from other sites, the row doors and the nodes' routes by grant, a forwarded change as its user, .py files an admin's
 python3 tools/surface.py --bin target/release/pondra --check docs/surface.json   # what 1.0 keeps (ADR-068): reports until the freeze, then fails on a name added or gone
 python3 tools/harness.py safety         # panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
+python3 tools/harness.py sealed         # the admin token as the master key: sealed from the first write, across nodes, rotation, the nodes' key refused
+python3 tools/harness.py first          # a node on the network with no token makes the lake's first user and prints its token once; pondra token; a follower answers no one
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
@@ -2182,6 +2236,7 @@ python3 tools/harness.py memory         # 240 small commits a second, no reader:
 python3 tools/harness.py pace           # a writer's acks beside 64 querying clients stay near its acks alone (queries on their own runtime)
 python3 tools/harness.py tails          # a table's log tail kept between queries: reads == a model while rows land, a transaction's snapshot, a column added, tiering
 python3 tools/harness.py answers_big    # big answers in pieces in every format == whole, an answer past the node's memory refused (53200), query turns (53300)
+python3 tools/backup_check.py           # BACKUP DATABASE twice (the second copies what is new), the source deleted, the backup served and restored (newest and --at the first run) == models, writes refused at every door, a run killed half way, a branch's backup, pondra backup/restore with no node, a dropped table kept, a bucket reached by its secret
 python3 tools/harness.py loads          # COPY INTO: each file once a version, through retries, two nodes, a kill; pondra.loads; renames, clones
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
@@ -2251,6 +2306,7 @@ python3 tools/bench/files_tpch.py --data ~/tpch/sf1-bench        # TPC-H from fi
 python3 tools/files_s3_check.py                # files in a real bucket (R2): a glob, the cache by version, a file changed, COPY there
 python3 tools/slt_check.py --slt <datafusion>/datafusion/sqllogictest/test_files [--nodes 3]   # DataFusion's sqllogictest: pass rate, failures grouped (D1)
 python3 tools/frames_check.py                  # pondra.frame == Polars (26 pipelines); one question asked 10 ways; a sort kept through steps
+python3 tools/js_frames_check.py --bin target/release/pondra   # JavaScript's frames == Python's (the same SQL text and rows), its reads and writes, and the client's calls next to Python's
 ~/venv-spark/bin/python tools/spark_check.py   # pondra.spark == PySpark 4.0.1 (55 pipelines, files and UDFs among them: values and column names)
 python3 tools/bench/tpch_frames.py --data ~/tpch/sf1-bench   # TPC-H: SQL == frames == PySpark code, 22 of 22
 python3 tools/bench/nexmark.py [--events 4000000] [--alone] # Nexmark's 20 queries: Pondra (== DuckDB) and Flink 2.3 (venv-flink)
@@ -2281,7 +2337,7 @@ python3 tools/serve_bench.py --keys 2000000   # serving: point lookups and dashb
 ```
 
 The Python tools need `pip install -r tools/requirements.txt` (Python 3.11; the versions the
-suite last passed with). `.github/workflows/build.yml` builds on every push what a release ships:
+suite last passed with). `harness.py` exits non-zero when any section answers false, in `all` too. `.github/workflows/build.yml` builds on every push what a release ships:
 the dist profile for all five platforms (Linux with zig, for glibc 2.17), each tried there
 (`smoke.py`), packaged and its packages tried (`tools/try_packages.sh`; the Linux wheel on CentOS
 7 and Ubuntu 22.04 too); the Linux job then runs `harness.py all`, `frames_check.py` and a
