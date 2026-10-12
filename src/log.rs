@@ -328,8 +328,12 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     drop(done.take()); // (sent in order; over HTTP they may still arrive out of order, rarely)
                     unanswered = true;
                     let response = request.await?;
+                    // (a 4xx is the leader's refusal, made before its sequencer took the flush; a 5xx, or a body lost on the
+                    // way, may come after it did, so the rows may still commit: lost, as a dropped reply is here)
+                    unanswered = !response.status().is_client_error();
+                    let outcome = response.error_for_status()?.json().await?;
                     unanswered = false;
-                    Ok(response.error_for_status()?.json().await?)
+                    Ok(outcome)
                 }
             }
         };

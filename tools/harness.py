@@ -9209,6 +9209,31 @@ def round7():
     checks["N3: REPEATABLE READ: a FOR UPDATE after another transaction's commit doesn't move the snapshot; the next read of a row it changed still shows the snapshot's value (0), in five runs"] = \
         all(r["ok"] for r in runs) and len(runs) == 5
 
+    # N10: the gate waits 5 s at most (`locks::GATE_WAIT`). Its writer holds the lake's lock meanwhile, and an append whose
+    # answer was lost keeps its table busy to its 60 s lease, so past 5 s the writer is refused (40001) and the lake goes
+    # on. A node whose autocommitted writes stay in flight 7 s stands in for the lost answer.
+    if not gate_off:
+        sp = A.port + 2
+        slow = Node(new_lake(), sp, env={"PONDRA_TEST_AUTOCOMMIT_PAUSE_MS": "7000"}).start()
+        sql(sp, "CREATE TABLE acct (id BIGINT PRIMARY KEY, bal BIGINT)")
+        sql(sp, "INSERT INTO acct VALUES (1, 10)")
+        merge = "MERGE INTO acct t USING (SELECT 1 AS id, 100 AS bal) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET bal = s.bal"
+        late = {}
+        th = threading.Thread(target=lambda: late.update(r=http(sp, "UPDATE acct SET bal = bal + 10 WHERE id = 1")))
+        th.start()
+        time.sleep(0.3)  # (the UPDATE is in its pause, its append in flight)
+        t0 = time.time()
+        capped = http(sp, merge)
+        capped_secs = round(time.time() - t0, 2)
+        other = http(sp, "CREATE TABLE other_t (x BIGINT)")  # (the lake's lock is free again while the UPDATE still pauses)
+        th.join()
+        again = http(sp, merge)
+        final = sql(sp, "SELECT bal FROM acct WHERE id = 1")[0]["bal"]
+        slow.kill()
+        info["n10"] = {"merge": capped[:2], "secs": capped_secs, "ddl": other[0], "update": late["r"][:2], "again": again[:2], "final": final}
+        checks["N10: a MERGE waits for an append in flight 5 s at most, then is refused (40001) and the lake's lock goes (a CREATE TABLE answers at once); after the append lands, the MERGE goes in (100)"] = \
+            capped[1] == "40001" and 4.5 <= capped_secs <= 6.5 and other[0] == 200 and late["r"][0] == 200 and again[0] == 200 and final == 100
+
     ok = all(checks.values())
     a.kill()
     print(json.dumps({"round7": checks, "ok": ok, "info": info}, indent=1, default=str))

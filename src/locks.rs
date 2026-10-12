@@ -826,7 +826,8 @@ static NO_GATE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("PONDRA_TEST_
 /// appends already in flight are waited for, so what the writer reads includes them all. An autocommitted write works its
 /// rows out first and appends them after, so without the gate a change made between the two would be overwritten. Hold
 /// the gate until the commit is made: dropping it opens the tables again. An appender whose lease lapses (60 s) no longer
-/// holds the gate.
+/// holds the gate. The wait is `GATE_WAIT` at most: the closer holds the lake's lock meanwhile, and an append whose answer
+/// was lost keeps its table busy to its lease, so past that the writer is refused (40001) and the lake goes on.
 pub async fn close(url: &str, tables: &[String]) -> Result<Gate> {
     let t = table(url);
     if *NO_GATE {
@@ -837,18 +838,24 @@ pub async fn close(url: &str, tables: &[String]) -> Result<Gate> {
         tables.iter().for_each(|n| table.close(n));
     }
     let gate = Gate { t: t.clone(), tables: tables.to_vec() }; // (opened when dropped, however the wait below ends)
+    let until = Instant::now() + GATE_WAIT;
     loop {
         let busy = {
             let table = t.lock().unwrap();
             let now = Instant::now();
-            tables.iter().any(|n| table.appending(n, now))
+            tables.iter().find(|n| table.appending(n, now)).cloned()
         };
-        if !busy {
-            return Ok(gate);
+        let Some(busy) = busy else { return Ok(gate) };
+        if Instant::now() >= until {
+            return Err(crate::codes::coded("40001", format!("could not serialize access due to concurrent update of {busy}: a write to it outside a transaction is still in flight (try again)")));
         }
         tokio::time::sleep(TICK).await;
     }
 }
+
+/// How long a writer under the lake's lock waits for the autocommitted appends in flight to its tables (`close`). They take
+/// milliseconds; only an append whose answer was lost keeps a table busy longer, to its lease.
+const GATE_WAIT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {
