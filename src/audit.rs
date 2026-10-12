@@ -16,7 +16,8 @@ use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::Result;
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use crate::reset::Once;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 pub const TABLE: &str = "pondra$audit";
@@ -246,13 +247,13 @@ fn log(app: &App, class: &'static str, statement: String, outcome: &'static str,
     write(app, Line { at: crate::log::now_ms(), user, door, from, class, statement, outcome, message, ms });
 }
 
-static WRITER: OnceLock<tokio::sync::mpsc::UnboundedSender<Line>> = OnceLock::new();
+crate::per_node!(static WRITER: RwLock<Option<tokio::sync::mpsc::UnboundedSender<Line>>> = RwLock::new(None));
 
 fn write(app: &App, line: Line) {
     if app.log.is_none() {
         return; // (a read-only node writes nothing: its own log says it)
     }
-    let tx = WRITER.get_or_init(|| crate::history::writer(app, TABLE, crate::ddl::Ddl::AuditLog, Duration::from_millis(50), batch));
+    let tx = WRITER.get_or(|| crate::history::writer(app, TABLE, crate::ddl::Ddl::AuditLog, Duration::from_millis(50), batch));
     let _ = tx.send(line);
 }
 

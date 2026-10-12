@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A node leaves nothing of itself in its process (ADR-061 §3, invariant 301).
 
-  statics_check.py [--list]
+  per_node_check.py [--list]
 
 One process may start a node, stop it and start another on another lake (`pondra.open`). So every
 static in `src/` (outside `#[cfg(test)]`) that can change once made must be one of:
@@ -14,6 +14,11 @@ static in `src/` (outside `#[cfg(test)]`) that can change once made must be one 
 A regex, a `task_local!` key and a value nothing can change once made (no lock, atomic, cell or
 channel in its type: a table of constants, or a setting read once) need neither. Anything else fails
 here by file, line and name, saying what to do. `--list` prints every static and how it passes.
+
+Two more ways a node outlives its stop fail here too: a task started with `tokio::spawn` (or on a
+runtime's handle) outside `panics.rs`, which `Node::stop` can't end (start it with `panics::spawn`
+or `panics::task`), and `std::env::set_var` outside the program's own files (the environment is
+the process's: the next node, and every child process, would read it).
 
 Only the standard library; it reads the source, not a build.
 """
@@ -85,6 +90,13 @@ PLAIN = {"std", "sync", "collections", "time", "path", "num", "borrow", "regex",
          "str", "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
          "i128", "isize", "f32", "f64", "Duration", "PathBuf", "Path", "Regex", "Value", "Bytes", "Cow",
          "NonZeroUsize", "static"}
+# Where a node may set the environment: the program itself, before any node, and `pondra sql`'s own
+# process, which runs itself again with it (`write.rs`'s from_cli). By file, with the reason.
+SET_VAR = {
+    "cli.rs": "the program's options, set before its one node starts",
+    "write.rs": "`pondra sql`'s own process: its job and tries, kept when it runs itself again",
+}
+SPAWN = re.compile(r"\btokio::(?:task::)?spawn\(|Handle::(?:current|try_current)\(\)[^;]*?\.spawn\(")
 REGEX = re.compile(r"^(?:std::sync::)?LazyLock<(?:regex::)?Regex>$")
 STATIC = re.compile(r"\bstatic\s+(?:mut\s+)?([A-Z_][A-Z0-9_]*)\s*:")
 
@@ -156,7 +168,7 @@ def statics():
                 before = text[max(0, text.rfind("\n", 0, m.start() - 1) - 200):m.start()]
                 if any(a <= m.start() < b for a, b in locals_):
                     how = "task_local"
-                elif re.search(r"per_node!\s*\(\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?$", before):
+                elif re.search(r"per_node!\s*\(\s*(?:(?:#\[[^\]]*\]|///[^\n]*)\s*)*(?:pub(?:\([^)]*\))?\s+)?$", before):
                     how = "per_node"
                 elif "macro_rules!" in text[max(0, m.start() - 300):m.start()] or "$name" in text[m.start():m.start() + 40]:
                     continue  # (a macro's own text, as `per_node!` writes a static)
@@ -182,7 +194,26 @@ def verdict(rel, name, ty, how, value):
         return f"PROCESS: {PROCESS[key]}", None
     if ty.startswith("&") or set(re.findall(r"[A-Za-z_]\w*", ty)) <= PLAIN:
         return "nothing changes it once made", None
-    return None, "a node's state? declare it with per_node!; or add it to PROCESS in tools/statics_check.py with why it outlives a node"
+    return None, "a node's state? declare it with per_node!; or add it to PROCESS in tools/per_node_check.py with why it outlives a node"
+
+
+def leaks():
+    """Tasks started where `Node::stop` can't end them, and the environment set by a node."""
+    bad = []
+    for base, _, files in os.walk(SRC):
+        for f in sorted(files):
+            if not f.endswith(".rs") or f == "panics.rs":
+                continue
+            path = os.path.join(base, f)
+            text = tests_cut(open(path, encoding="utf-8").read())
+            rel = os.path.relpath(path, SRC).replace(os.sep, "/")
+            for n, line in enumerate(text.split("\n"), 1):
+                code = line.split("//", 1)[0]
+                if SPAWN.search(code):
+                    bad.append(f"src/{rel}:{n}: a task Node::stop can't end: start it with crate::panics::task (or panics::spawn for a loop the node can't do without)")
+                if "set_var(" in code and f not in SET_VAR:
+                    bad.append(f"src/{rel}:{n}: the environment is the process's, not the node's: keep it in a per_node! static (or add the file to SET_VAR in tools/per_node_check.py with why)")
+    return bad
 
 
 def main():
@@ -199,8 +230,9 @@ def main():
         if not ok:
             bad.append(f"src/{rel}:{line} {name} ({ty}): {why}")
     stale = sorted(k for k in PROCESS if k not in keys)
-    bad += [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale]
-    for b in bad if not args.list else bad[len(bad) - len(stale):]:
+    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks()
+    bad += more
+    for b in bad if not args.list else more:
         print(f"FAIL {b}")
     print(f'{{"statics": {len(found)}, "failed": {len(bad)}, "ok": {str(not bad).lower()}}}')
     sys.exit(1 if bad else 0)

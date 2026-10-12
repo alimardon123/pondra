@@ -317,7 +317,7 @@ async fn spawn(path: Option<&str>) -> Result<Worker> {
     let said = Arc::new(Mutex::new(VecDeque::new()));
     if let Some(err) = child.stderr.take() {
         let said = said.clone();
-        tokio::spawn(async move {
+        crate::panics::task(async move {
             // Read to its end whatever it writes (bytes that aren't UTF-8, a line with no end): a
             // reader that stopped would leave its pipe full, and the worker stuck writing to it.
             let (mut err, mut line) = (BufReader::new(err), Vec::new());

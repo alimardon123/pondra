@@ -4,26 +4,35 @@ use crate::*;
 use std::{future::Future, sync::{Arc, OnceLock}, time::Duration};
 
 /// What a node is started with: `pondra serve`'s options for one lake, worked out (cli.rs).
-pub(crate) struct Options {
-    pub dir: String,
+pub struct Options {
+    pub(crate) dir: String,
     /// The address the HTTP door listens on (`--addr`).
-    pub listen: String,
+    pub(crate) listen: String,
     /// How the other nodes reach this one, if not `listen` (`--advertise`).
-    pub advertise: Option<String>,
-    pub reader: bool,
-    pub flush_ms: u64,
-    pub tier_secs: f64,
-    pub task_ms: u64,
-    pub retain_secs: u64,
-    pub backlog: u64,
-    pub pg: Option<String>,
-    pub kafka: Option<String>,
-    pub kafka_advertise: Option<String>,
-    pub flight: Option<String>,
-    pub attach: Vec<String>,
-    pub attach_found: Option<String>,
-    pub python: Option<String>,
-    pub auth: Arc<auth::Auth>,
+    pub(crate) advertise: Option<String>,
+    pub(crate) reader: bool,
+    pub(crate) flush_ms: u64,
+    pub(crate) tier_secs: f64,
+    pub(crate) task_ms: u64,
+    pub(crate) retain_secs: u64,
+    pub(crate) backlog: u64,
+    pub(crate) pg: Option<String>,
+    pub(crate) kafka: Option<String>,
+    pub(crate) kafka_advertise: Option<String>,
+    pub(crate) flight: Option<String>,
+    pub(crate) attach: Vec<String>,
+    pub(crate) attach_found: Option<String>,
+    pub(crate) python: Option<String>,
+    pub(crate) auth: Arc<auth::Auth>,
+}
+
+impl Options {
+    /// `pondra serve --lake dir --addr listen`, every other option as `serve`'s default: the node a
+    /// library opens (ADR-061 §2).
+    pub fn local(dir: &str, listen: &str) -> Options {
+        Options { dir: dir.into(), listen: listen.into(), advertise: None, reader: false, flush_ms: 0, tier_secs: 10.0, task_ms: 1000, retain_secs: 60, backlog: 10_000_000,
+                  pg: None, kafka: None, kafka_advertise: None, flight: None, attach: vec![], attach_found: None, python: None, auth: Arc::new(auth::Auth::new(None, None, None)) }
+    }
 }
 
 /// What a node holds as it starts (its term when it leads, then its lake), so a stop at any point gives back what was taken (ADR-061, invariant 300).
@@ -38,21 +47,30 @@ impl Held {
     /// racing it): what it committed is made durable, the catalog is checkpointed, and a leader gives up
     /// its term, so the next node leads at once instead of waiting out the lease (invariant 210). A node
     /// stopped before its lake is open gives up its term without the durable wait and the checkpoint.
+    /// In between, what the node started ends (ADR-061 §4): its loops, the HTTP door, then its
+    /// catalog's own work, so nothing of it writes the lake once its term is given back (a keep-alive
+    /// left running would write the leader's mark again).
     pub(crate) async fn stop(&self) {
-        if let Some((store, n)) = self.term.get() {
-            if let Some(l) = self.lake.get() {
-                // (what it committed in the bucket, with replicated acks too; the catalog's
-                // memtable written out: the next leader replays no WAL, C5)
-                let _ = tokio::time::timeout(Duration::from_secs(10), l.cat.wait_durable(l.cat.committed())).await;
-                let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.checkpoint()).await;
-            }
+        let (term, lake) = (self.term.get(), self.lake.get());
+        if let (Some(_), Some(l)) = (term, lake) {
+            // (what it committed in the bucket, with replicated acks too; the catalog's
+            // memtable written out: the next leader replays no WAL, C5)
+            let _ = tokio::time::timeout(Duration::from_secs(10), l.cat.wait_durable(l.cat.committed())).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.checkpoint()).await;
+        }
+        panics::abort_all();
+        if let Some(l) = lake {
+            let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.close()).await;
+        }
+        if let Some((store, n)) = term {
             cluster::step_down(store, *n).await;
         }
     }
 }
 
-/// A node serving one lake: started, serving, then stopped.
-pub(crate) struct Node {
+/// A node serving one lake: started, serving, then stopped. One at a time in a process, as often as
+/// wanted (ADR-061 §3).
+pub struct Node {
     /// What this node holds, given back by `stop`.
     held: Arc<Held>,
     /// The HTTP door, served on a task of its own: `serving` waits on it.
@@ -123,7 +141,7 @@ impl Node {
         tr("attachments synced");
         every(Duration::from_secs(1), move || { let (l, me) = (l.clone(), me.clone()); async move { ddl::sync(&l, &me, true).await } });
         let l = lake.clone();
-        tokio::spawn(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
+        crate::panics::task(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
         // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
         // a new leader first commits what they hold from the previous one.
         tr("warming");
@@ -131,9 +149,9 @@ impl Node {
         if let (true, Some(own)) = (leader, &replica) {
             // (the members are asked with the nodes' key: one that just restarted holds an
             // unsigned call until it has caught up, and it catches up from this leader)
-            if std::env::var_os("PONDRA_NODE_KEY").is_none() {
+            if cluster::node_key().is_none() {
                 if let Some(k) = users::node_key_made(&lake).await {
-                    std::env::set_var("PONDRA_NODE_KEY", k);
+                    cluster::set_node_key(k);
                 }
             }
             replica::recover(&lake, &addr, cluster.leader.n, Some(own)).await?;
@@ -197,7 +215,7 @@ impl Node {
             for _ in 0..600 {
                 match users::node_key(&l).await {
                     Ok(k) => {
-                        std::env::set_var("PONDRA_NODE_KEY", k); // (nodes call each other with it when no admin token is set: cluster::http)
+                        cluster::set_node_key(k); // (nodes call each other with it when no admin token is set: cluster::http)
                         return;
                     }
                     Err(e) if !said && format!("{e:#}").contains("master key") => {
@@ -332,7 +350,7 @@ impl Node {
         runs::mark_stopped(app.clone()); // (runs whose node stopped under them: `stopped`)
         if leader {
             let l = app.lake.clone(); // (what it inherited, replayed from the WAL, into every node's view)
-            tokio::spawn(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
+            crate::panics::task(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
         }
         // (the HTTP door, a loop the node can't do without: a panic in it aborts, as invariant 178 says; `serving` waits on it)
         let served = panics::spawn(async move { axum::serve(listener, server::router(app).into_make_service_with_connect_info::<tls::Peer>()).await.map_err(anyhow::Error::from) }); // (who asks: `console::save_settings`)
@@ -345,8 +363,27 @@ impl Node {
     }
 
     /// Once drained (`drain.rs`, run by the program first): gives back what the node holds (`Held::stop`).
-    pub(crate) async fn stop(&self) {
-        self.held.stop().await
+    /// `start` for a library: what the start takes is given back if it fails.
+    pub async fn open(o: Options) -> anyhow::Result<Node> {
+        let held = Arc::new(Held::default());
+        match Node::start(o, held.clone()).await {
+            Ok(node) => Ok(node),
+            Err(e) => {
+                held.stop().await;
+                reset::reset();
+                Err(e)
+            }
+        }
+    }
+
+    /// Stops the node, once the program drained it (`drain.rs`): its log writers write what they
+    /// were sent (through the log, so while it still leads), it gives back what it holds
+    /// (`Held::stop`), and its statics are set back (`reset`), so the next node in this process
+    /// starts as in a process of its own (ADR-061 §3, invariant 301).
+    pub async fn stop(self) {
+        history::end_writers().await;
+        self.held.stop().await;
+        reset::reset();
     }
 }
 

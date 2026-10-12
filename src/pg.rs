@@ -43,7 +43,7 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         let session = format!("pg-{}", uuid::Uuid::new_v4().simple());
         let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), me: me.clone() });
         let pg = Arc::new(Pg(backend.clone(), Arc::new(Startup { backend, scram: Default::default(), plain: Default::default() })));
-        tokio::spawn(async move {
+        crate::panics::task(async move {
             let _ = socket.set_nodelay(true);
             let _ = pgwire::tokio::process_socket(socket, tls, pg).await;
             crate::temp::end(&session);

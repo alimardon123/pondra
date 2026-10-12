@@ -1471,7 +1471,7 @@ fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions
     crate::panics::spawn(async move {
         let _ = tokio::time::timeout(Duration::from_secs(10), SERVING.subscribe().wait_for(|s| *s)).await;
         if local {
-            tokio::spawn(unpin(store.clone()));
+            crate::panics::task(unpin(store.clone()));
         }
         let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_options(compactor).build();
         let gc = slatedb::GarbageCollectorBuilder::new("catalog", store).with_options(gc).build();
@@ -1925,6 +1925,16 @@ impl Catalog {
         if self.flushed.load(Relaxed) != next {
             db.flush_with_options(FlushOptions { flush_type: FlushType::MemTable }).await?;
             self.flushed.store(next, Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Lets go of the catalog: its writer flushes what it holds and stops its background tasks, a
+    /// reader its polling (`Node::stop`, ADR-061 §4: one process may open another lake after it).
+    pub async fn close(&self) -> Result<()> {
+        match &self.db {
+            Db_::Writer(db) => db.close().await?,
+            Db_::Reader(r) => r.close().await?,
         }
         Ok(())
     }

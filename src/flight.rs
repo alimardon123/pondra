@@ -140,7 +140,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
     type Queued = Pin<Box<dyn std::future::Future<Output = anyhow::Result<crate::log::Ack>> + Send>>;
     let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<(Queued, RecordBatch, crate::log::Src), Status>>(256);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel(); // (acks are small; a client may read them only at the end)
-    tokio::spawn(async move {
+    crate::panics::task(async move {
         let mut batches = std::pin::pin!(batches);
         let meta: Option<TableMeta> = lake.cat.get(&table_key(&table)).await.ok().flatten();
         let Some((meta, schema)) = meta.and_then(|m| Some((m.clone(), crate::query::schema(&m.logical_columns()).ok()?))) else { // (SQL's names: ADR-022)
@@ -176,7 +176,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
         }
     });
     let (log, table) = (again, table2);
-    tokio::spawn(async move {
+    crate::panics::task(async move {
         while let Some(queued) = acks_rx.recv().await {
             let acked = match queued {
                 Ok((ack, batch, src)) => {

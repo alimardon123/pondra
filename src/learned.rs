@@ -444,8 +444,10 @@ fn refresh() {
         }
     }
     let done = Done;
-    let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
-    rt.spawn(async move {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    crate::panics::task(async move {
         let _done = done;
         // (rows reach the history a second or so after their runs, in any order: a minute back again)
         match read(&lake, since.saturating_sub(60_000_000)).await {

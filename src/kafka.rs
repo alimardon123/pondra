@@ -103,7 +103,7 @@ pub async fn serve(app: App, addr: String, advertise: String) -> Result<()> {
     ME.set_once(serde_json::json!({"id": me.id, "host": me.host, "port": me.port}));
     while let Some((socket, _)) = doors.next().await {
         let (app, me) = (app.clone(), me.clone());
-        tokio::spawn(async move { conn(app, me, socket).await.map_err(|e| eprintln!("kafka client: {e:#}")) });
+        crate::panics::task(async move { conn(app, me, socket).await.map_err(|e| eprintln!("kafka client: {e:#}")) });
     }
     Ok(())
 }
@@ -116,7 +116,7 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
     let from = Some(socket.peer().addr);
     let (mut rd, mut wr) = tokio::io::split(socket);
     let (tx, mut rx) = mpsc::channel::<Reply>(64);
-    let writer = tokio::spawn(async move {
+    let writer = crate::panics::task(async move {
         while let Some(reply) = rx.recv().await {
             if let Some(frame) = reply.await {
                 wr.write_all(&frame).await?;
@@ -1056,7 +1056,7 @@ impl Group {
         (self.joining, self.synced, self.round) = (true, false, self.round + 1);
         self.members.values_mut().for_each(|m| m.joined = false);
         let (group, round, start) = (group.to_string(), self.round, std::time::Instant::now());
-        tokio::spawn(async move {
+        crate::panics::task(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 let mut groups = GROUPS.lock().unwrap();

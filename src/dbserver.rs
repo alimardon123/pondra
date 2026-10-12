@@ -256,7 +256,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
                 let Ok((socket, _)) = listener.accept().await else { continue };
                 let _ = socket.set_nodelay(true);
                 let s = s.clone();
-                tokio::spawn(async move {
+                crate::panics::task(async move {
                     if let Err(e) = postgres(&s, socket).await {
                         eprintln!("postgres connection: {e:#}");
                     }

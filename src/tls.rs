@@ -181,7 +181,7 @@ impl Doors {
                     }
                 };
                 let tx = tx.clone();
-                tokio::spawn(async move {
+                crate::panics::task(async move {
                     if let Ok(c) = accept(tcp, door).await {
                         let _ = tx.send(c).await;
                     }

@@ -1952,7 +1952,7 @@ fn tries() -> u32 {
 /// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go.
 async fn lead(dir: &str, store: &Store, term: u64, req: Option<Option<Request>>, stmt: &Stmt, job: &str) -> Result<Value> {
     let s = store.clone();
-    let marks = tokio::spawn(async move {
+    let marks = crate::panics::task(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let _ = mark_alive(&s, term).await;

@@ -396,14 +396,27 @@ pub fn http_bare() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| reqwest::Client::builder().build().unwrap_or_default())
 }
 
+// The lake's key for its nodes (`users::node_key`), once this node knows it: what it calls the others
+// with when no token is set. The node's, not the process's environment: the next node in a process
+// serves another lake, whose nodes are never sent this one's key, and no child process inherits it.
+crate::per_node!(static NODE_KEY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
+
+/// The key this node calls the others with: `PONDRA_NODE_KEY` as set, else the lake's own, once known.
+pub fn node_key() -> Option<String> {
+    std::env::var("PONDRA_NODE_KEY").ok().or_else(|| NODE_KEY.read().unwrap_or_else(|e| e.into_inner()).clone())
+}
+
+/// This node learned the lake's key for its nodes (`node.rs`).
+pub fn set_node_key(k: String) { *NODE_KEY.write().unwrap_or_else(|e| e.into_inner()) = Some(k); }
+
 /// One HTTP client (connection pool) for all node-to-node traffic. It carries this process's
 /// token: a node's is the admin token, else the lake's own key for its nodes (`users::node_key`,
 /// known once the lake is open: the client is made again then); a `pondra sql` writer's is
 /// `PONDRA_TOKEN`.
 pub fn http() -> reqwest::Client {
-    static CLIENT: std::sync::Mutex<Option<(Option<String>, reqwest::Client)>> = std::sync::Mutex::new(None);
-    let token = std::env::var("PONDRA_TOKEN").or_else(|_| std::env::var("PONDRA_ADMIN_TOKEN")).or_else(|_| std::env::var("PONDRA_NODE_KEY")).ok();
-    let mut client = CLIENT.lock().unwrap();
+    crate::per_node!(static MINE: std::sync::Mutex<Option<(Option<String>, reqwest::Client)>> = std::sync::Mutex::new(None));
+    let token = std::env::var("PONDRA_TOKEN").or_else(|_| std::env::var("PONDRA_ADMIN_TOKEN")).ok().or_else(node_key);
+    let mut client = MINE.lock().unwrap();
     if let Some((t, c)) = client.as_ref().filter(|(t, _)| *t == token) {
         let _ = t;
         return c.clone();

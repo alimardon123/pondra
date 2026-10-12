@@ -58,7 +58,7 @@ pub async fn work<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static
 /// again) on the queries' runtime: appends and commits never wait behind it (invariant 231). A panic
 /// in it is that work's alone, as a request's is.
 pub fn aside<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
-    queries().spawn(f)
+    tracked(queries().spawn(f))
 }
 
 /// How long a request runs before the ones after it go to the queries' runtime: under load a
@@ -92,7 +92,7 @@ pub fn runtime() -> tokio::runtime::Builder {
 
 /// Start a loop the node can't do without: if it panics, the node stops.
 pub fn spawn<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
-    tokio::spawn(async move {
+    tracked(tokio::spawn(async move {
         match AssertUnwindSafe(f).catch_unwind().await {
             Ok(v) => v,
             Err(p) => {
@@ -100,7 +100,37 @@ pub fn spawn<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> 
                 std::process::abort()
             }
         }
-    })
+    }))
+}
+
+/// Start a task of the node's whose panic is its own (a connection's, work beside a request): what
+/// `tokio::spawn` was, but ended with the node (`tools/per_node_check.py` fails a `tokio::spawn`).
+pub fn task<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
+    tracked(tokio::spawn(f))
+}
+
+// What this node started (`spawn`, `task`, `aside`), so a node stopped in a process ends it all
+// (ADR-061 §4): the runtime outlives the node, and a loop left on it would go on writing its lake.
+crate::per_node!(static STARTED: std::sync::Mutex<Vec<tokio::task::AbortHandle>> = std::sync::Mutex::new(Vec::new()));
+
+fn tracked<T>(t: tokio::task::JoinHandle<T>) -> tokio::task::JoinHandle<T> {
+    let mut started = STARTED.lock().unwrap_or_else(|e| e.into_inner());
+    if started.len().is_power_of_two() {
+        started.retain(|h| !h.is_finished()); // (finished ones let go now and then: a cost a task of O(1) on average)
+    }
+    started.push(t.abort_handle());
+    t
+}
+
+/// Ends every task this node started (`Node::stop`, before its catalog closes and its term is given
+/// back: a keep-alive left running would mark it alive again), but the one asking.
+pub fn abort_all() {
+    let me = tokio::task::try_id();
+    for t in std::mem::take(&mut *STARTED.lock().unwrap_or_else(|e| e.into_inner())) {
+        if Some(t.id()) != me {
+            t.abort();
+        }
+    }
 }
 
 /// A panic's message.
