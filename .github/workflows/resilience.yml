@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        parts: ["storage cutoff", "clients doors flight server", "disk cache cli"]
+        parts: ["storage cutoff restart", "clients doors flight server", "disk cache cli"]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
