@@ -117,6 +117,11 @@ pub fn router(app: App) -> Router {
             let seq = app.seq.as_ref().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
             Ok::<_, E>(Json(crate::txn::commit_here(&app.lake, seq, &app.lock, c).await?))
         }))
+        .route("/cluster/checked", post(|State(app): State<App>, body: Bytes| async move {
+            let seq = app.seq.clone().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
+            let (table, src, batch) = crate::constraints::decode(body)?;
+            Ok::<_, E>(Json(crate::constraints::leader(app.lake.clone(), seq, table, src, batch).await?))
+        }))
         .route("/cluster/iceberg", post(|State(app): State<App>, Json(c): Json<Vec<crate::iceberg::Commit>>| async move { Ok::<_, E>(Json(app.record_iceberg(c).await?)) }))
         .route_layer(middleware::from_fn_with_state(app.clone(), to_leader));
     Router::new()
