@@ -8,6 +8,9 @@ once the fault is gone (how long it took is in `info`).
   500 and 503, PUTs applied and their replies lost, requests slowed and held, the bucket down for
   longer than a leader's lease.
 - **cutoff**: the leader alone cut off from the bucket while the others reach it: another leads.
+- **restart**: on a bucket as slow as R2, the leader killed and started again 2 s later, as its
+  service starts it (and as a container does, with a new temp folder): the next term is led, and
+  no node opens the lake as leader only to be fenced by another.
 - **clients**: the Python and JavaScript clients given every node's address, through a leader
   killed, a follower killed, a leader killed and back: no call fails; a transaction keeps to its
   node.
@@ -23,7 +26,7 @@ once the fault is gone (how long it took is in `info`).
   Python client and psycopg.
 - **cli**: `pondra sql` killed mid-INSERT, on local disk and a bucket, with a node and without.
 
-  resilience_check.py [storage] [cutoff] [clients] [doors] [flight] [disk] [cache] [server] [cli] [--secs 20]
+  resilience_check.py [storage] [cutoff] [restart] [clients] [doors] [flight] [disk] [cache] [server] [cli] [--secs 20]
   resilience_check.py --real [storage cutoff]   # the same faults in front of a real bucket (R2, S3)
 
 Needs moto's server, psycopg, confluent-kafka and pyarrow (tools/requirements.txt), Node.js for the
@@ -365,6 +368,49 @@ def cutoff(a):
         info["the cut-off leader back: roles"] = c.timeline.since(t1)
     finally:
         c.close()
+
+
+def restart(a):
+    """The leader killed and started again on its address 2 s later, as `pondra service` starts it
+    (Restart=always, RestartSec=2), on a bucket as slow as R2; then again with a temp folder of its
+    own, as a container starts again. The process that ended can't still be leading, so the node
+    takes the next term as it starts (`cluster::coming_back`). Taking its old term back, it opened
+    the lake while its followers' lease ran out, one of them took the next term, and both opened the
+    lake as leader in turn, the first fenced by the second: writes waited for both (12–15 s on
+    simulated R2, 21 s on R2)."""
+    c, fresh = Bucketed(a), tempfile.mkdtemp(prefix="pondra-tmp-")
+    try:
+        nodes, load = c.nodes, c.load
+        for p in c.proxies:
+            p.set(slow_ms=150)  # (about R2's: GETs 100 ms, PUTs 200)
+        time.sleep(a.secs / 2)
+        fenced = ("a catalog commit failed", "opening the lake as leader failed", "detected newer DB client")
+        for kill in (1, 2):
+            lead = until(lambda: one_leader(nodes), 60)
+            term, said = stats(lead)["term"], {nd.port: os.path.getsize(nd.log) for nd in nodes}
+            t0, load.phase = time.time(), f"the leader killed and back ({kill})"
+            lead.kill()
+            time.sleep(2)
+            if kill == 2:  # (a container started again: a new temp folder, with no lock file from before)
+                lead.env["TMPDIR"] = fresh
+            lead.start()
+            again = until(lambda: load.since(time.time() - 0.5) and one_leader(nodes), 60)
+            took = load.stall(t0, time.time())
+            now = again and (again.port, stats(again)["term"])
+            logs = {nd.port: open(nd.log, errors="replace").read()[said[nd.port]:] for nd in nodes}
+            lines = [f"{p}: {line}" for p, text in logs.items() for line in text.splitlines() if any(f in line for f in fenced)]
+            info[f"kill {kill}: roles"] = c.timeline.since(t0)
+            info[f"kill {kill}: the longest wait for an ack (s)"] = took
+            # (the node started again claims it as it starts, before its followers' lease runs out; a follower
+            # that got there first is as good)
+            check(f"kill {kill}: the next term is led", bool(now) and now[1] == term + 1, (now, lead.port, term))
+            check(f"kill {kill}: …and no node opened the lake as leader only to be fenced", not lines, lines[:4])
+            check(f"kill {kill}: …and writes went on within 12 s", took < 12, took)
+            time.sleep(a.secs / 2)
+        c.end(a.secs / 2)
+    finally:
+        c.close()
+        shutil.rmtree(fresh, ignore_errors=True)
 
 
 def small_disk(mb):
@@ -1070,7 +1116,7 @@ def cli(a):
                 harness.LAKES.remove(lake)
 
 
-PARTS = {"storage": storage, "cutoff": cutoff, "clients": clients, "doors": doors, "flight": flight, "disk": disk, "cache": cache, "server": server, "cli": cli}
+PARTS = {"storage": storage, "cutoff": cutoff, "restart": restart, "clients": clients, "doors": doors, "flight": flight, "disk": disk, "cache": cache, "server": server, "cli": cli}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

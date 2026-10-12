@@ -15,7 +15,8 @@
 //!   waiting out a lease, and a `pondra sql` INSERT never deposes a leader it merely can't reach.
 //!   A claimer also holds a lock file in this machine's temp folder (named in its term record), so
 //!   a process on the same machine knows at once that a killed claimer is gone; another machine
-//!   has no file to look at and waits for the mark.
+//!   has no file to look at and waits for the mark. A leader killed and started again takes the
+//!   next term: only its own restart takes its term back.
 use crate::replica::ReplicaLog;
 use crate::store::{Frame, Lake, Store};
 use anyhow::Result;
@@ -57,16 +58,23 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    /// Follow a live leader; lead if nobody leads (or the latest term is ours: we're restarting).
+    /// Follow a live leader; lead if nobody leads (or the latest term is ours, and we're coming back
+    /// from our own restart: `coming_back`).
     pub async fn join(store: &Store, addr: &str, reader: bool) -> Result<Arc<Cluster>> {
         let leader = loop {
             match latest(store).await? {
                 Some(t) if reader => break t, // (we only read anyway)
-                // (ours, after a restart: the exec let go of its lock. A term that stepped down is over,
-                // and taken again it would look dead to everyone (`alive`): a new one, below)
+                // (ours. A term that stepped down is over, and taken again it would look dead to
+                // everyone (`alive`): a new one, below. One we're coming back to after our own restart
+                // is taken back: the exec let go of its lock)
                 Some(t) if t.addr == addr && !stepped_down(store, t.n).await => {
-                    relock(&t);
-                    break t;
+                    if coming_back(&t) {
+                        relock(&t);
+                        break t;
+                    }
+                    if let Some(t) = claim(store, t.n + 1, addr).await? {
+                        break t; // (or someone else just did: look again)
+                    }
                 }
                 None if reader => break Term { n: 0, addr: String::new(), lock: String::new() },
                 Some(t) if alive(store, &t).await && !t.addr.is_empty() => break t,
@@ -623,6 +631,21 @@ fn gone_here(t: &Term) -> bool {
     let _ = std::io::Read::read_to_string(&mut f, &mut said);
     let restarting = said.strip_prefix("restarting ").and_then(|ms| ms.parse::<u64>().ok());
     !restarting.is_some_and(|ms| crate::log::now_ms().saturating_sub(ms) < 30_000)
+}
+
+/// Is this node coming back to its own term `t` after its own restart (an exec, Windows' new process,
+/// the service supervisor's)? Then the term's lock file here is still held by the process on its way
+/// out, or says `restarting`. Not when the process that claimed it ended (killed, and started again by
+/// its service), nor when the file isn't here (it ran with another temp folder: a container started
+/// again): taken back, the term's followers' lease ran out while the node opened the lake on a bucket,
+/// one of them took the next term, and both opened the lake as leader, the first fenced by the second
+/// (writes waited 12–15 s on simulated R2 for both). Such a node takes the next term as it starts. A
+/// term with no lock file to look at (an older release's) is taken back, as before.
+fn coming_back(t: &Term) -> bool {
+    match lock_path(t) {
+        Some(path) => path.exists() && !gone_here(t),
+        None => t.lock.is_empty() || lock_dir().is_none(), // (no file named, or no folder here to look in: can't tell)
+    }
 }
 
 /// Back after a restart, as the leader of term `t`: take its lock again (the exec, or the old
