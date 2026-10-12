@@ -8554,9 +8554,19 @@ def begin():
         c.rollback()
         status.append(c.info.transaction_status.name)
     checks["the Postgres port reports the transaction's status (psycopg's IDLE, INTRANS, IDLE)"] = status == ["IDLE", "INTRANS", "IDLE"]
+    # A transaction that changed 12,000 keys reads its own rows: an OR per key made an expression 12,000 deep, and planning
+    # it overflowed the stack and took the node down
+    q("CREATE TABLE many (k BIGINT PRIMARY KEY, v BIGINT)")
+    q("INSERT INTO many SELECT value AS k, 0 AS v FROM range(1, 12001)")
+    s = f"s-many-{uuid.uuid4().hex[:8]}"
+    http(A.port, "BEGIN", s)
+    http(A.port, "UPDATE many SET v = 1", s)
+    many = [http(A.port, "SELECT sum(v) AS s, count(*) AS n FROM many", s)[2], http(A.port, "COMMIT", s)[0], q("SELECT sum(v) AS s FROM many")]
+    checks["a transaction that changed 12,000 keys reads them (12,000 of 12,000) and commits; the node stays up"] = \
+        many == [[{"s": 12000, "n": 12000}], 200, [{"s": 12000}]]
     a.kill(); b.kill()
     ok = all(checks.values())
-    print(json.dumps({"begin": checks, "ok": ok, "info": {"transfers": done[0], "retried": retried[0], "errors": errors[:3], "codes": codes, "status": status}}, indent=1, default=str))
+    print(json.dumps({"begin": checks, "ok": ok, "info": {"transfers": done[0], "retried": retried[0], "errors": errors[:3], "codes": codes, "status": status, "many": many}}, indent=1, default=str))
     if not ok:
         sys.exit(1)
 
@@ -11938,7 +11948,7 @@ def answers_big():
 # About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
 # prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
 # suite in parts side by side that end together. A section not listed counts as 5 s.
-SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
+SECS = {"memory": 255, "cursors": 15, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
         "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "answers_big": 15, "dialects": 20, "unique_doors": 60}
