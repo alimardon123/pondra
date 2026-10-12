@@ -14,7 +14,7 @@ default = ["server"]
 server = ["dep:http", "dep:slatedb", "dep:reqwest", "dep:tokio", "dep:axum", "dep:toml", "dep:uuid", "dep:clap", "dep:mimalloc",
           "dep:chrono-tz", "dep:postgres-types", "dep:pgwire", "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:zstd",
           "dep:object_store", "dep:object_store_df", "dep:glob", "dep:aws-lc-rs", "dep:tokio-rustls",
-          "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service"]
+          "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tikv-jemallocator"]
 
 [lib]
 doctest = false # (the modules' docs are prose and SQL, not Rust examples)
@@ -39,7 +39,6 @@ bytes = "1"
 uuid = { version = "1", features = ["v4"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 futures = "0.3"
-mimalloc = { version = "0.1", default-features = false, optional = true }
 async-trait = "0.1"
 lru = "0.18"
 chrono = { version = "0.4", default-features = false } # (already built for object_store: ObjectMeta timestamps)
@@ -74,6 +73,12 @@ sysinfo = { version = "0.35", default-features = false, features = ["system"], o
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true } # (free disk space: statvfs)
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = { version = "0.7", optional = true, features = ["background_threads"] } # (the program's allocator on Linux: `main.rs`)
+
+[target.'cfg(not(all(target_os = "linux", target_env = "gnu")))'.dependencies]
+mimalloc = { version = "0.1", default-features = false, optional = true } # (the program's allocator but on Linux: `main.rs`)
 
 [target.'cfg(windows)'.dependencies]
 windows-service = { version = "0.8", optional = true } # (`pondra service` on Windows: the service manager's dispatcher; its windows-sys is already built for tokio)
