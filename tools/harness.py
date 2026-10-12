@@ -653,7 +653,7 @@ def outside():
     spread = metrics_of(A.port + 1)["pondra_spread_queries_total"]
     q("CREATE TABLE eu AS SELECT * FROM %s WHERE region = 'eu'" % glob)
     joined = f"SELECT e.region, count(*) AS n, sum(l.amount) AS s FROM {glob} e JOIN eu l ON e.id = l.id GROUP BY e.region"
-    while len(call(A.port + 1, "GET", "/stats")["nodes"]) < 3:
+    while len(call(A.port + 1, "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.1)  # (node 1 has heard of the others)
     checks["spread over three nodes == one node, and joined with a lake table"] = (q(by_region, 1, spread=1) == want and q(joined, 1, spread=1) == q(joined, 1, spread=0)
         and metrics_of(A.port + 1)["pondra_spread_queries_total"] - spread == 2)
@@ -919,7 +919,7 @@ def catalogs():
         checks["…and its data file was written with the vended key"] = signed_with(m) == {"VK"} and any(
             meth in ("PUT", "POST") and p.startswith("/warehouse/sales/orders/data/") for meth, p, _ in seen[m:])
         # (e) Three nodes: the same query, spread, is the one node's answer.
-        until(lambda: len(call(A.port + 1, "GET", "/stats")["nodes"]), 3, 60)  # (node 1 has heard of the other two)
+        until(lambda: len(call(A.port + 1, "GET", "/stats").get("nodes", ())), 3, 60)  # (node 1 has heard of the other two)
         spreads = metrics_of(A.port + 1)["pondra_spread_queries_total"]
         one = q(ORDERS.format("ice"), 0, spread=0)
         three = q(ORDERS.format("ice"), 1, spread=1)
@@ -1114,7 +1114,7 @@ def kafkas():
             return ""
         except RuntimeError as e:
             return str(e)
-    while len(call(A.port + 1, "GET", "/stats")["nodes"]) < 3:
+    while len(call(A.port + 1, "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.1)
     checks = {}
     # A Pondra node as the other cluster: a topic is its table (one partition), tokens its passwords.
@@ -1536,7 +1536,7 @@ def fence():
     seg = call(A.port, "POST", "/append/events?producer=a&seq=1", rows("a", 1, 100))["seg"]
     b = Node(lake, A.port + 1, flush_ms=50).start()
     joined = call(A.port + 1, "GET", "/stats")["role"] == "follower"
-    while len(call(A.port + 1, "GET", "/stats")["nodes"]) < 2:  # b has heard from the leader
+    while len(call(A.port + 1, "GET", "/stats").get("nodes", ())) < 2:  # b has heard from the leader
         time.sleep(0.1)
     via_b = call(A.port + 1, "POST", "/append/events?producer=b&seq=1", rows("b", 1, 100))["seg"]  # forwarded
     a.p.send_signal(signal.SIGSTOP)
@@ -1636,7 +1636,7 @@ def insert_spread():
     lake = new_lake()
     ports = [A.port + 1 + i for i in range(3)]
     nodes = [Node(lake, p, env={"PONDRA_SPREAD_MB": "0"} if i == 0 else {}).start() for i, p in enumerate(ports)]
-    while len(call(ports[0], "GET", "/stats")["nodes"]) < 3:
+    while len(call(ports[0], "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.1)
     q = lambda s, job=None: call(ports[0], "POST", "/sql" + (f"?job={job}" if job else ""), s.encode(), timeout=600)
     one = lambda s: q(s)[0]
@@ -2434,7 +2434,7 @@ def finishes_on_three():
     q("CREATE MATERIALIZED VIEW stats AS SELECT region, avg(amount) AS mean, stddev(amount) AS sd FROM sales GROUP BY region HAVING count(*) > 1", 0)
     for k in range(6):  # (six files: a share for each node)
         q("INSERT INTO sales " + SALES_ROWS.format(k * 5000 + 1, k * 5000 + 5000), 0)
-    while len(call(at, "GET", "/stats")["nodes"]) < 3:  # (every node heard from)
+    while len(call(at, "GET", "/stats").get("nodes", ())) < 3:  # (every node heard from)
         time.sleep(0.2)
     joined = "SELECT s.region, s.mean, s.sd, count(*) AS n, sum(x.amount) AS total FROM sales x JOIN stats s ON x.region = s.region GROUP BY 1, 2, 3 ORDER BY 1"
     ran = lambda: (lambda m: m["pondra_spread_queries_total"] + m["pondra_shuffled_queries_total"])(metrics_of(at))
@@ -3266,7 +3266,7 @@ def scale():
     # Two more nodes: the same query spread over three.
     for p in (port + 1, port + 2):
         Node(lake, p).start()
-    while len(call(port, "GET", "/stats")["nodes"]) < 3:
+    while len(call(port, "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.2)
     spread = call(port, "POST", "/sql?spread=1", b"SELECT count(*) AS n, sum(v) AS s FROM ev WHERE k <> 'none'")[0]
     was_spread = metrics_of(port)["pondra_spread_queries_total"] >= 1
@@ -6249,7 +6249,7 @@ def history():
         checks["a statement its client stopped waiting for: stopped, by its door"] = [(r["outcome"], r["door"]) for r in stopped] == [("stopped", "http")]
         # A slow statement (every one on b): its plan, its operators' rows; spread, each node's share
         q("SELECT count(*) AS n FROM t WHERE k % 7 = 0 -- h-slow", 1)
-        while len(call(A.port + 1, "GET", "/stats")["nodes"]) < 3:
+        while len(call(A.port + 1, "GET", "/stats").get("nodes", ())) < 3:
             time.sleep(0.2)
         call(A.port + 1, "POST", "/sql?spread=1", b"SELECT v, count(*) AS n FROM t GROUP BY v ORDER BY n DESC, v LIMIT 3 -- h-spread")
         slow, spread = until("h-slow"), until("h-spread")
@@ -6488,7 +6488,7 @@ def learn():
         checks["the run after the first with facts is planned without them: the bar they are held to"] = len(plans) == 2
         # Spread over three nodes: each plans with the facts the coordinator sent, so none falls back
         deadline = time.time() + 30
-        while len(call(A.port, "GET", "/stats")["nodes"]) < 3 and time.time() < deadline:
+        while len(call(A.port, "GET", "/stats").get("nodes", ())) < 3 and time.time() < deadline:
             time.sleep(0.2)
         n, _ = timed(0, spread="1")
         spread_row = []
@@ -8302,7 +8302,7 @@ def stopped():
     # A follower killed for good: the leader marks its run once it has been gone a minute (it reads
     # the log when a node leaves, not every 30 s).
     other = Node(lake, A.port + 1, env=env, python=sys.executable).start()
-    until(lambda: len(call(A.port, "GET", "/stats")["nodes"]), 2, 30)
+    until(lambda: len(call(A.port, "GET", "/stats").get("nodes", ())), 2, 30)
     gone_run = sql(A.port + 1, "SELECT pondra.start('slow', 600.0) AS run")[0]["run"]
     gone_running = until(lambda: status(gone_run).get("status"), "running", 30)
     other.kill()
@@ -8904,7 +8904,7 @@ def sequences():
     ports = [A.port + 1 + i for i in range(3)]
     pg = A.port + 10
     nodes = [Node(lake, p, **({"pg": f"127.0.0.1:{pg}"} if i == 1 else {})).start() for i, p in enumerate(ports)]
-    while len(call(ports[0], "GET", "/stats")["nodes"]) < 3:
+    while len(call(ports[0], "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.1)
     h = {"x-pondra-session": "harness-sequences"}
     q = lambda s, port=ports[0], hh=h: call(port, "POST", "/sql", s.encode(), headers=hh, timeout=120)
@@ -8947,7 +8947,7 @@ def sequences():
     stepped = [q("SELECT nextval('o') AS v")[0]["v"] for _ in range(2)]  # (after a change, every node's block goes: a gap, as Postgres's CACHE leaves)
     info["o"] = [o, cur, before, none, after_set, restarted, stepped]
     checks["START 10 INCREMENT 5 in any order; currval the session's last (55000 before, none without a session); setval; RESTART; INCREMENT changed"] = \
-        o == [10, 15] and cur == 15 and before[1] == "55000" and none[0] == 500 and after_set == 105 and restarted == 7 and stepped[1] - stepped[0] == 2 and stepped[0] > restarted
+        o == [10, 15] and cur == 15 and before[1] == "55000" and none[0] == 409 and none[1] == "55000" and after_set == 105 and restarted == 7 and stepped[1] - stepped[0] == 2 and stepped[0] > restarted
     q("ALTER SEQUENCE o RENAME TO o2")
     renamed = (q("SELECT nextval('o2') AS v")[0]["v"], err("SELECT nextval('o') AS v")[1])
     q("CREATE SEQUENCE c AS smallint MAXVALUE 3 CYCLE")
@@ -9042,7 +9042,7 @@ def constraints():
     ports = [A.port + 1 + i for i in range(3)]
     pg = A.port + 10
     nodes = [Node(lake, p, **({"pg": f"127.0.0.1:{pg}"} if i == 0 else {})).start() for i, p in enumerate(ports)]
-    while len(call(ports[0], "GET", "/stats")["nodes"]) < 3:
+    while len(call(ports[0], "GET", "/stats").get("nodes", ())) < 3:
         time.sleep(0.1)
     temp = {"x-pondra-session": "harness-constraints"}
     q = lambda s, port=ports[0], hh=None: call(port, "POST", "/sql", s.encode(), timeout=120, headers=hh)

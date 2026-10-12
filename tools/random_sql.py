@@ -138,7 +138,7 @@ def main():
         duck = duckdb.connect()
         try:
             if A.nodes > 1:
-                while len(harness.call(A.port, "GET", "/stats")["nodes"]) < A.nodes:
+                while len(harness.call(A.port, "GET", "/stats").get("nodes", ())) < A.nodes:
                     time.sleep(0.1)
             tables, made = g.tables()
             for s in made:
