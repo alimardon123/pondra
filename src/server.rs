@@ -1389,10 +1389,12 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // its answers remembered apart, run with its rights: a file here it reads is named in the
     // statement as expanded, or in a view it reads, and so never remembered.
     let asks = |text: &str| {
-        // (AT (OFFSET => -n) is n seconds before now: a moment that moves)
+        // (AT (OFFSET => -n) is n seconds before now: a moment that moves. Expanded, a table as it was
+        // is named `"at:…"`, which holds its AT (…) as written: `past::spelled`)
         static OFFSET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*OFFSET\s*=>").expect("a regex"));
+        let text = &format!("{text} {}", crate::past::spelled(text));
         let q = text.to_lowercase();
-        OFFSET.is_match(text) || !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+        OFFSET.is_match(text) || !crate::ext::names(text).is_empty() || ["now()", "today(", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
     };
     let volatile = limited || asks(query)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
