@@ -280,6 +280,20 @@ def external():
     checks["Parquet: a folder's files, declared columns by name, one they don't hold NULL (and IS NULL finds it)"] = q("SELECT name, id, n FROM p2 WHERE missing IS NULL AND n > 15") == [{"name": "b", "id": 2, "n": 20.0}]
     q("CREATE EXTERNAL TABLE j1 (b VARCHAR, a BIGINT) STORED AS JSON LOCATION 'j.json'")
     checks["JSON: declared columns by name, others left out"] = q("SELECT * FROM j1 ORDER BY a") == [{"b": "x", "a": 1}, {"b": "y", "a": 2}]
+    # The program that started the node has its answers remembered too (apart from anyone else's),
+    # but never a statement that reads files: a file here changes on its own.
+    import re
+    held = lambda: float(re.search(rb'pondra_cache_bytes\{cache="answers"\} (\S+)', call(A.port, "GET", "/metrics", headers=hdr)).group(1))
+    q("CREATE TABLE owned (a BIGINT)"); q("INSERT INTO owned VALUES (1), (2)")
+    before = held(); first = q("SELECT sum(a) AS s FROM owned"); after_lake = held(); again = q("SELECT sum(a) AS s FROM owned")
+    open(os.path.join(here, "seen.csv"), "w").write("v\n1\n")
+    read1 = q("SELECT sum(v) AS s FROM 'seen.csv'"); after_file = held()
+    open(os.path.join(here, "seen.csv"), "w").write("v\n1\n2\n")
+    read2 = q("SELECT sum(v) AS s FROM 'seen.csv'")
+    q("INSERT INTO owned VALUES (3)")
+    checks["the owner's answers are remembered, but not one that reads a file here: it is read again, changed"] = first == again == [{"s": 3}] and after_lake > before \
+        and read1 == [{"s": 1}] and read2 == [{"s": 3}] and after_file == after_lake and q("SELECT sum(a) AS s FROM owned") == [{"s": 6}]
+    q("DROP TABLE owned")
     q("CREATE EXTERNAL TABLE ev (id INT, name VARCHAR) STORED AS CSV LOCATION 'ev/' OPTIONS ('format.has_header' 'false')")
     empty = q("SELECT count(*) AS n FROM ev")
     q("INSERT INTO ev VALUES (1, 'one'), (2, 'two')")
@@ -6767,6 +6781,17 @@ def found():
     want = [{"id": 1, "amount": 99}, {"id": 4, "amount": 40}]
     seen["view"] = until(lambda: q("SELECT id, amount FROM eu ORDER BY id"), want, 15)
     checks["a filtered materialized view follows UPDATE and DELETE of its table"] = seen["view"] == want
+    # Functions that run only once simplified run with the optimizer off too (`optimize::Runnable`): an
+    # INSERT's VALUES for a DOUBLE column (Pondra writes arrow_cast), an UPDATE … FROM (coalesce), by hand
+    q("CREATE TABLE unopt (a INT, c DOUBLE)")
+    unopt = "SET datafusion.optimizer.max_passes = 0; INSERT INTO unopt VALUES (1, 2.0), (2, 1e20); "
+    seen["unoptimized"] = [_raises_text(lambda: q(unopt + "SELECT 1")), q("SELECT a, c FROM unopt ORDER BY a"),
+                           q("SET datafusion.optimizer.max_passes = 0; UPDATE unopt SET c = s.c FROM (SELECT 1 AS a, 3.5 AS c) s WHERE unopt.a = s.a; SELECT 1"),
+                           q("SELECT a, c FROM unopt ORDER BY a"),
+                           q("SET datafusion.optimizer.max_passes = 0; SELECT arrow_cast('2026-10-12', 'Date32') + 1 AS d, coalesce(NULL, 2) AS n")]
+    checks["with datafusion.optimizer.max_passes = 0, an INSERT into a DOUBLE column, UPDATE … FROM, arrow_cast and coalesce answer"] = \
+        seen["unoptimized"] == ["", [{"a": 1, "c": 2.0}, {"a": 2, "c": 1e20}], [{"Int64(1)": 1}], [{"a": 1, "c": 3.5}, {"a": 2, "c": 1e20}],
+                                [{"d": "2026-10-13", "n": 2}]]
     # A producer's batches count from seq=1: seq 0 would be taken for one already written.
     q("CREATE TABLE ev (user VARCHAR, n BIGINT)")
     zero = _raises_text(lambda: call(port, "POST", "/append/ev?producer=p&seq=0", b'{"user": "a", "n": 1}\n'))
@@ -11325,6 +11350,17 @@ def ddlgaps():
     info["cascade_task"] = [busy, busy_view]
     checks["DROP TABLE … CASCADE refused by name when a task reads it: nothing half dropped (its view still answers)"] = \
         busy[0] != 200 and "reads t_busy" in busy[2] and busy_view == 200
+    plain_busy = err("DROP TABLE t_busy")  # (a task among its readers: CASCADE would refuse too)
+    info["drop_task_reader"] = plain_busy
+    checks["DROP TABLE refused while a task reads it says to drop them first, offering no CASCADE (which drops views only)"] = \
+        plain_busy[0] != 200 and "drop them first" in plain_busy[2] and "CASCADE" not in plain_busy[2]
+    # Spark's TBLPROPERTIES with a dotted key written bare answers as the key quoted does, never as a parse error
+    q("CREATE TABLE t_props (id INT)")
+    bare = err("ALTER TABLE t_props SET TBLPROPERTIES (write.delete.mode = 'merge-on-read')")
+    quoted = err("ALTER TABLE t_props SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')")
+    info["tblproperties"] = [bare, quoted]
+    checks["TBLPROPERTIES (write.delete.mode = …) with the dotted key bare answers as the quoted key does (not 42601)"] = \
+        bare == quoted and bare[1] != "42601"
     # a table named with its schema, and a view named in capitals, are found and dropped too
     q("CREATE TABLE base_q (id INT)")
     q('CREATE VIEW "Up_V" AS SELECT id FROM base_q')
@@ -12350,6 +12386,14 @@ def measures():
     info["refused"] = [[st_code, text[:200]] for st_code, text in refused]
     no_bad = q("SELECT name FROM pondra.objects WHERE name LIKE 'bad%'")
     checks["refused by name, and nothing made"] = all(st_code >= 400 and phrase in text for (st_code, text), (_, phrase) in zip(refused, refusals)) and no_bad == []
+    # a dimension written as a qualified column takes its name, a word that is also a function's (`user`) too
+    q('CREATE TABLE ev_user ("user" TEXT, amount INT)')
+    q("INSERT INTO ev_user VALUES ('a', 1), ('a', 2), ('b', 5)")
+    made_user = http("CREATE VIEW ut AS SELECT e.user, sum(e.amount) AS MEASURE total FROM ev_user e")
+    by_user = q('SELECT "user", MEASURE(total) AS t FROM ut GROUP BY "user" ORDER BY 1') if made_user[0] == 200 else []
+    info["qualified_dimension"] = [made_user, by_user]
+    checks["a dimension written e.user (a qualified column, its word a function's too) is named user"] = \
+        made_user[0] == 200 and by_user == [{"user": "a", "t": 3}, {"user": "b", "t": 5}]
 
     # 16. a query with measures costs what its GROUP BY written by hand costs (each run its own text: none from the result cache,
     # which keys on the text as expanded; a measure's query is written anew there, without its comment, so each run names its column apart)

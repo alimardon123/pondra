@@ -77,7 +77,50 @@ pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     let mut rules = Analyzer::new().rules;
     let at = rules.iter().position(|r| r.name() == "type_coercion").unwrap_or(0);
     rules.insert(at, Arc::new(FloatsWin));
+    rules.push(Arc::new(Runnable)); // (after type coercion: a function's simplifier reads its arguments' types)
     rules
+}
+
+/// With `datafusion.optimizer.max_passes = 0` (DataFusion's way to see a plan unoptimized), every
+/// function call is written as what it runs as. `arrow_cast`, `coalesce`, `nvl2` and a few more exist
+/// only as the CAST or CASE the optimizer's simplifier makes of them, and failed with an internal
+/// error when it didn't run: Pondra writes `arrow_cast` itself (an INSERT's typed VALUES, a bound
+/// value) and `coalesce` (an UPDATE … FROM). With the optimizer on, its simplifier does this.
+#[derive(Debug)]
+struct Runnable;
+
+impl AnalyzerRule for Runnable {
+    fn name(&self) -> &str {
+        "pondra_runnable"
+    }
+
+    fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
+        use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
+        if config.optimizer.max_passes > 0 {
+            return Ok(plan);
+        }
+        let options = Arc::new(config.clone());
+        plan.transform_up_with_subqueries(|plan| {
+            let mut schema = datafusion::logical_expr::utils::merge_schema(&plan.inputs());
+            if let LogicalPlan::TableScan(ts) = &plan {
+                schema.merge(&DFSchema::try_from_qualified_schema(ts.table_name.clone(), &ts.source.schema())?);
+            }
+            let info = SimplifyContext::builder().with_schema(Arc::new(schema)).with_config_options(options.clone()).build();
+            let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan);
+            plan.map_expressions(|e| {
+                let name = names.save(&e);
+                let e = e.transform_up(|e| match e {
+                    Expr::ScalarFunction(f) => Ok(match f.func.simplify(f.args, &info)? {
+                        ExprSimplifyResult::Simplified(e) => Transformed::yes(e),
+                        ExprSimplifyResult::Original(args) => Transformed::no(Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction { func: f.func, args })),
+                    }),
+                    e => Ok(Transformed::no(e)),
+                })?;
+                Ok(e.update_data(|e| name.restore(e)))
+            })
+        })
+        .data()
+    }
 }
 
 /// A DOUBLE (or REAL) that meets a DECIMAL makes both DOUBLEs, as Postgres and DuckDB do: `price >

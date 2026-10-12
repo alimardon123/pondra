@@ -683,7 +683,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 61. **Only the program that started a node reads files through it** (`server::owner`: the key in
    `PONDRA_OWNER_KEY`, which the shell and `local()` make and send). Invariant 21 holds for
    everyone else. `smoke.py`: "the shell reads a file on this machine…" and "a node doesn't read
-   this machine's files for whoever asks".
+   this machine's files for whoever asks". Its answers are remembered apart from everyone else's
+   (`server::query`: `owner` in the key, run with its rights), and a statement that reads files
+   never is: once expanded it names them (`"ext:…"`), or a view it reads does. `harness.py
+   external`: "the owner's answers are remembered, but not one that reads a file here…".
 62. **A node never leads another lake in its own process** (`inbox::lead_once`): a write to an
    attached lake nobody leads, `CREATE DATABASE` and `ATTACH` of a new folder go through a `pondra
    lead` of their own (hidden), which leads for a moment, once, and ends. That lake's catalog writer would
@@ -2132,6 +2135,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    joins (its exchanges are the spread analysis's). `harness.py hot`: "NOT IN a subquery with a
    NULL keeps no row…" fails with a NOT IN hashed (the threads that never met the NULL keep their
    rows).
+295. **SQL answers with the optimizer off** (`optimize::Runnable`, the last analyzer rule): under
+   `datafusion.optimizer.max_passes = 0` every scalar function is replaced by what its simplifier
+   makes of it, as the optimizer would. `arrow_cast`, `coalesce` and `nvl2` run only as that CAST or
+   CASE, and Pondra writes `arrow_cast` (an INSERT's typed VALUES, a bound value) and `coalesce` (an
+   `UPDATE … FROM`) itself. `harness.py found`: "with datafusion.optimizer.max_passes = 0, an INSERT
+   into a DOUBLE column, UPDATE … FROM, arrow_cast and coalesce answer".
 300. **A node is started and stopped as an object, and a stop at any point gives back what it took**
    (`node.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
    serves, it drains, makes what it committed durable, checkpoints, ends what it started
@@ -2334,16 +2343,20 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `Host` that isn't an IP, `localhost`, the machine's name or `--advertise`'s is refused on every
    request: a rebinding page's GETs carry no `Origin`. `harness.py guarded`.
 
-373. **The row doors and the nodes' own routes take only what their caller may write**
-   (`auth::check_rows`, `flush_from_writer`, `files_from_writer`):
-   - `/append` and `/insert` ask the INSERT grant, as SQL's INSERT does. A table made through
-     `/insert` is an admin's, and no caller writes a `$` table there.
+373. **Every row door takes only what its caller may write, and the lake's records are Pondra's alone**
+   (`auth::check_rows`, `allows`, `may_read_all`, `flush_from_writer`, `files_from_writer`):
+   - `/append`, `/insert`, Flight's DoPut and ingest and Kafka's produce ask the INSERT grant, as SQL's
+     INSERT does. A table made through `/insert` is an admin's.
+   - No statement writes a `$` table (the lake's records, a table's old versions), a superuser's
+     included, and a `$` table's rows stream to a superuser only (Flight's DoGet, `/watch`, `/lookup`,
+     Kafka's fetch, MCP's changes); SQL reads the records through `pondra.audit` and `pondra.history`.
    - `/cluster/commit` and `/cluster/files` are the nodes' and write tokens', never a user's.
    - A write token's flush is rows in a segment of the log, never into the lake's records
      (`pondra$audit`, `history`, `runs`), and never moves a sequence or row ids. Its files go in
      their table's folder.
 
-   `harness.py guarded`.
+   `harness.py guarded`: "Flight's DoPut and Kafka's produce take a user's rows as its grants say…",
+   "a hidden table's rows (pondra$audit) stream to a superuser only…".
 
 374. **A change a follower sends its leader runs there as its user** (`write::post` names the user
    in `x-pondra-as`; `server::guard` takes it from the nodes' own calls only), so what the change
