@@ -421,10 +421,19 @@ async fn run() -> anyhow::Result<()> {
                 return dbserver::serve(dir, addr, pg, default, options, auth).await;
             }
             let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
+            let owner = std::env::var("PONDRA_OWNER_KEY").ok().filter(|k| k.len() >= 16); // (the same length rule `server::owner` uses)
+            if owner.is_some() && !dir.contains("://") && std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_none()) {
+                // (a lake the shell or `local()` just made is its user's alone, as a Postgres data folder is: its catalog holds the nodes' key)
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+                }
+            }
             // (on the network a node is never open: with no token, its leader makes the lake's first user before it serves, below)
             let on_network = on_network(&addr, [&pg, &kafka, &flight]);
             let auth = auth::Auth::new(env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token.clone(), "PONDRA_ADMIN_TOKEN"));
-            let auth = Arc::new(auth.on_network(on_network));
+            let auth = Arc::new(auth.on_network(on_network).owned_by(owner));
             if let Some(t) = env(admin_token, "PONDRA_ADMIN_TOKEN") {
                 std::env::set_var("PONDRA_ADMIN_TOKEN", t); // (nodes call each other with it: cluster::http)
             }
@@ -546,7 +555,9 @@ async fn run() -> anyhow::Result<()> {
             let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock, retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
             crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
             learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
-            if leader && on_network && !app.auth.on() {
+            // (a lake served with tokens is not one a node may make a first user of: an accidental node with none must
+            // not write to it, and is refused by `server.rs` instead)
+            if leader && on_network && !app.auth.on() && !users::signed(&app.lake).await {
                 // (on the network with no token nobody could sign in: the lake's first user is made before
                 // anyone is served, and its token said once. A failure stops the node; a restart tries again.)
                 let _guard = app.lock.lock().await;
@@ -564,7 +575,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
             if leader {
-                let (l, c) = (app.lake.clone(), app.cluster.clone()); // (beside serving, not before it: C5)
+                let (l, c, tokens) = (app.lake.clone(), app.cluster.clone(), app.auth.on()); // (beside serving, not before it: C5)
                 panics::spawn(async move {
                     let made = users::kept(&l).await == "none";
                     match users::make_keys(&l).await {
@@ -573,6 +584,12 @@ async fn run() -> anyhow::Result<()> {
                         // couldn't check the nodes' key, and held its new leader's calls 10 s)
                         Ok(()) if made => l.cat.checkpoint().await.unwrap_or_else(|e| eprintln!("checkpoint: {e:#}")),
                         Ok(()) => {}
+                    }
+                    if tokens {
+                        // (once, and for good: a node started by hand without them is then never open: `users::signed`)
+                        if let Err(e) = users::mark_signed(&l).await {
+                            eprintln!("the lake's tokens aren't remembered: {e:#}");
+                        }
                     }
                     match ext::rewrap(&l).await {
                         Ok(0) => {}
