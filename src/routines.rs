@@ -1933,7 +1933,12 @@ async fn run(app: &App, name: String, r: Routine, row: RecordBatch, who: Who, jo
             for (i, p) in r.params.iter().enumerate() {
                 values.insert((i + 1).to_string(), values[&p.name].clone()); // ($1: the first)
             }
-            Box::pin(crate::vars::own(values, script(app, &r.body, &HashMap::new(), &HashMap::new(), inner, job))).await // (a procedure's variables are its own)
+            let (given, views) = (HashMap::new(), HashMap::new());
+            let go = crate::vars::own(values, script(app, &r.body, &given, &views, inner, job)); // (a procedure's variables are its own)
+            match name == "do" || crate::auth::shows_code() {
+                true => Box::pin(go).await,
+                false => Box::pin(crate::script::unshown(go)).await, // (its errors don't quote its code to this caller: S27)
+            }
         }
     };
     let _ = log.end(app, &out, heard); // (written a moment later: a call doesn't wait for its log)

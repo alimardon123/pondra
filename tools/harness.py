@@ -7584,7 +7584,8 @@ def users():
     own key."""
     import base64, psycopg
     lake = new_lake()
-    a = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}", kafka=f"127.0.0.1:{A.port + 20}", flight=f"127.0.0.1:{A.port + 30}").start()
+    py = {"PYTHONPATH": os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")}  # (S27's Python procedure)
+    a = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}", kafka=f"127.0.0.1:{A.port + 20}", flight=f"127.0.0.1:{A.port + 30}", python=sys.executable, env=py).start()
     b = Node(lake, A.port + 1, env={"PONDRA_SESSION_HOURS": "0.0005"}).start()  # (a follower; its sessions last 1.8 s)
     checks = {}
 
@@ -7684,6 +7685,19 @@ def users():
         and "permission denied" in str(shown["export"]) and "INSERT INTO sales.refunds" in json.dumps(shown["export_boss"])
     checks["…a user granted APPLY on this database (it deploys them) is shown routines' code and the export"] = \
         "INSERT INTO sales.refunds" in json.dumps(shown["applier_routines"]) and "INSERT INTO sales.refunds" in json.dumps(shown["applier_export"])
+    # (…nor in a failed call's error: a statement by its number and line, a Python line by its number)
+    as_(A.port, boss, "CREATE PROCEDURE trips() LANGUAGE sql AS $$ SELECT 1 AS a; SELECT 1 / 0 AS hidden_marker_q $$")
+    as_(A.port, boss, "CREATE PROCEDURE trips_py() LANGUAGE python AS $$\nrate = 0\nhidden_marker_p = 1 / rate\n$$")
+    as_(A.port, boss, "CREATE FUNCTION trips_fn(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$\nzero = 0\nreturn x // zero  # hidden_marker_f\n$$")
+    grouped = "SELECT item, sum(trips_fn(id)) AS s FROM sales.orders GROUP BY item"  # (its batches run in DataFusion's own tasks)
+    failed = {"sql": as_(A.port, ann, "CALL trips()"), "sql_boss": as_(A.port, boss, "CALL trips()"),
+              "py": as_(A.port, ann, "CALL trips_py()"), "py_boss": as_(A.port, boss, "CALL trips_py()"),
+              "fn": as_(A.port, ann, grouped), "fn_boss": as_(A.port, boss, grouped)}
+    shown_info["failed"] = failed
+    checks["…nor in a failed call's error: ann's names the statement (statement 2) or the Python line (line 3) without its text, a function's in a GROUP BY too; an admin's quotes it (S27)"] = \
+        "statement 2" in str(failed["sql"]) and "hidden_marker_q" not in str(failed["sql"]) and "hidden_marker_q" in str(failed["sql_boss"]) \
+        and "line 3" in str(failed["py"]) and "hidden_marker_p" not in str(failed["py"]) and "hidden_marker_p" in str(failed["py_boss"]) \
+        and "line 3" in str(failed["fn"]) and "hidden_marker_f" not in str(failed["fn"]) and "hidden_marker_f" in str(failed["fn_boss"])
     # Tokens and sessions
     tok = as_(A.port, boss, "CREATE TOKEN ci FOR USER svc")
     short = as_(A.port, boss, "CREATE TOKEN brief FOR USER svc EXPIRES IN '1 second'")
