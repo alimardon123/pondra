@@ -58,15 +58,17 @@ jobs:
           ref: ${{ env.SHA }}
       - name: The build workflow's package for this commit (nothing, if no build run passed)
         id: ci
-        run: echo "run=$(bash tools/ci_build.sh "$SHA")" >> "$GITHUB_OUTPUT"
+        run: echo "run=$(bash tools/ci_build.sh "$SHA" pondra-linux-x64)" >> "$GITHUB_OUTPUT"
       - name: Its linux-x64 binary
         if: steps.ci.outputs.run != ''
         run: gh run download "${{ steps.ci.outputs.run }}" --name pondra-linux-x64 --dir dl && tar -xzf dl/pondra-linux-x64.tar.gz pondra
       - name: Rust, when no build run passed
         if: steps.ci.outputs.run == ''
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
       - if: steps.ci.outputs.run == ''
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: build # (main's build cache: the dependencies)
           save-if: false

@@ -62,6 +62,10 @@ tokio::task_local! {
 /// The principal of the request being served (None: no door set one: this process's own work).
 pub fn current() -> Option<Principal> { WHO.try_with(|p| p.clone()).ok() }
 
+/// Who the request being served is, as one string: an answer kept for it is read back only by the
+/// same (`pages.rs`). No principal is this process's own work, which keeps and reads its own.
+pub fn holder() -> String { current().map_or_else(|| "node".to_string(), |p| format!("{}|{:?}|{}", p.name, p.role, p.operator)) }
+
 /// `f` as the request that makes it, for work it starts and doesn't wait for (`pondra.start`): the
 /// same user (its grants) and session. A spawned task keeps no task-local, and with no principal a
 /// started procedure ran with its role's every right, past the user's grants.
@@ -221,11 +225,14 @@ pub struct Auth {
     read: Option<String>,
     write: Option<String>,
     admin: Option<String>,
+    /// Does the node listen beyond this machine (`--addr`, `--pg`, `--kafka` or `--flight`)? Then it is
+    /// never open, tokens or not (`App::open`).
+    network: bool,
 }
 
 impl Auth {
     pub fn new(read: Option<String>, write: Option<String>, admin: Option<String>) -> Auth {
-        let auth = Auth { read, write, admin };
+        let auth = Auth { read, write, admin, network: false };
         if auth.on() {
             TOKENS.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -233,6 +240,14 @@ impl Auth {
     }
 
     pub fn on(&self) -> bool { self.read.is_some() || self.write.is_some() || self.admin.is_some() }
+
+    /// This node listens beyond this machine (`network`).
+    pub fn on_network(self, network: bool) -> Auth { Auth { network, ..self } }
+
+    pub fn network(&self) -> bool { self.network }
+
+    /// Is an admin token set? Then the nodes call each other with it, and the nodes' key counts for nothing.
+    pub fn admin_set(&self) -> bool { self.admin.is_some() }
 
     /// The role a bearer token grants.
     pub fn role(&self, token: Option<&str>) -> Role {

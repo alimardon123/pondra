@@ -101,7 +101,7 @@ def run():
     out, t0 = {}, time.time()
     try:
         if A.nodes > 1:
-            while len(harness.call(A.port, "GET", "/stats")["nodes"]) < A.nodes:
+            while len(harness.call(A.port, "GET", "/stats").get("nodes", ())) < A.nodes:
                 time.sleep(0.1)
         for run in range(2 if A.hot else 0):  # (hot.rs takes a file on its second read)
             for n in names:

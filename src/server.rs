@@ -499,11 +499,13 @@ async fn whoami(State(app): State<App>) -> Json<Value> {
 }
 
 impl App {
-    /// Does nothing need a sign-in here? (No token set, and no user who signs in. A node that just
-    /// started asks once it holds what its leader had: a mirror seeded before the first user was
-    /// flushed knows of none.)
+    /// Does nothing need a sign-in here? (No token set, no user who signs in, and the node listens on
+    /// this machine only. A node on the network is never open: its leader made the lake's first user
+    /// before it served (`users::first_user`), and a follower of a lake with none yet refuses everyone
+    /// until one has a token (`pondra token`). A node that just started asks once it holds what its
+    /// leader had: a mirror seeded before the first user was flushed knows of none.)
     pub async fn open(&self) -> bool {
-        if self.auth.on() {
+        if self.auth.on() || self.auth.network() {
             return false;
         }
         let _ = self.lake.caught_up().await; // (still catching up after 10 s: its own catalog decides)
@@ -978,6 +980,13 @@ struct AppendParams {
 
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
 async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
+    let start = std::time::Instant::now();
+    let out = append_rows(&app, &name, p, headers, body).await;
+    crate::audit::rows(&app, "/append", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
+    out
+}
+
+async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
     let log = app.log()?;
     if !p.producer.is_empty() && p.seq == 0 {
         return Err(E(anyhow::anyhow!(crate::log::SEQ_FROM_1))); // (0 is "nothing yet": its batch would be taken for a retry)
@@ -1006,7 +1015,7 @@ async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
             crate::defaults::fill(&app.lake, &meta, batch, |c| absent.get(c).cloned()).await?
         }
     };
-    Ok(Json(log.append(name, Src { producer: p.producer, seq: p.seq, prev: p.prev }, batch).await?))
+    Ok(Json(log.append(name.to_string(), Src { producer: p.producer, seq: p.seq, prev: p.prev }, batch).await?))
 }
 
 #[derive(Deserialize)]
@@ -1018,6 +1027,13 @@ struct InsertParams {
 /// the leader records the files, together with `job` so a retried job is applied once. Creates
 /// the table if missing.
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, query: String) -> Result<Json<Value>, E> {
+    let start = std::time::Instant::now();
+    let out = insert_rows(&app, &name, p, query).await;
+    crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
+    out
+}
+
+async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.cluster.reader, "read-only node");
     if app.lake.cat.meta(&table_key(&name)).await?.is_none() {
         crate::auth::at_least(crate::auth::Role::Admin, "making a table")?; // (as CREATE TABLE is)
@@ -1075,7 +1091,8 @@ async fn change(State(app): State<App>, Json((sql, job, sent)): Json<(String, St
 fn cluster_call(app: &App, headers: &HeaderMap) -> bool {
     match headers.get("authorization").and_then(|v| v.to_str().ok()) {
         None => true,
-        Some(h) => h.strip_prefix("Bearer ").is_some_and(|b| b.starts_with("pn_") || app.auth.token_role(b) > crate::auth::Role::None),
+        // (a `pn_` key counts only without an admin token, as in `users::who`)
+        Some(h) => h.strip_prefix("Bearer ").is_some_and(|b| (b.starts_with("pn_") && !app.auth.admin_set()) || app.auth.token_role(b) > crate::auth::Role::None),
     }
 }
 
@@ -1735,6 +1752,14 @@ async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<V
         s["commit_ms_p50"] = j!(pct(0.5));
         s["commit_ms_p95"] = j!(pct(0.95));
     }
+    if crate::auth::current().is_none_or(|p| p.role == crate::auth::Role::None) {
+        // (the cluster's names and addresses are a signed-in caller's; the rest is a probe's)
+        if let Some(o) = s.as_object_mut() {
+            for k in ["lake", "leader", "nodes", "releases"] {
+                o.remove(k);
+            }
+        }
+    }
     Json(s)
 }
 
@@ -1754,6 +1779,10 @@ use ensure;
 pub struct E(anyhow::Error);
 impl<T: Into<anyhow::Error>> From<T> for E {
     fn from(e: T) -> Self { E(e.into()) }
+}
+impl std::fmt::Display for E {
+    // (the words a client is sent, so the audit log says what the client was told: `ext::said`)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", crate::ext::said(&self.0)) }
 }
 impl IntoResponse for E {
     fn into_response(self) -> Response {

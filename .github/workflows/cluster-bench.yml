@@ -82,9 +82,16 @@ jobs:
       matrix:
         i: ${{ fromJSON(needs.plan.outputs.nodes) }}
     steps:
+      - name: This run's token
+        # (the nodes listen on the network, so they answer only an admin token: this run's, worked out
+        # alike in every job from the bucket's secret and masked; a job's output can't carry a masked value)
+        run: |
+          t=$(printf '%s' "$AWS_SECRET_ACCESS_KEY:${{ github.run_id }}:cluster-bench" | sha256sum | cut -c1-48)
+          echo "::add-mask::$t"
+          echo "PONDRA_ADMIN_TOKEN=$t" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v7
         with: { name: pondra }
-      - uses: tailscale/github-action@v3
+      - uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3.3.0
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
           hostname: pondra-${{ github.run_id }}-${{ matrix.i }}
@@ -114,12 +121,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
+      - name: This run's token
+        # (the nodes' token, worked out as they work it out: the driver's calls and its `pondra sql` loads)
+        run: |
+          t=$(printf '%s' "$AWS_SECRET_ACCESS_KEY:${{ github.run_id }}:cluster-bench" | sha256sum | cut -c1-48)
+          echo "::add-mask::$t"
+          echo "PONDRA_ADMIN_TOKEN=$t" >> "$GITHUB_ENV"
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
       - uses: actions/download-artifact@v7
         with: { name: pondra }
-      - uses: tailscale/github-action@v3
+      - uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3.3.0
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
           hostname: pondra-${{ github.run_id }}-driver

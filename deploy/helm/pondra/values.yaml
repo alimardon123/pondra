@@ -37,6 +37,8 @@ sharedStorage:
 # Tokens (read, write, admin) at every door. Made once and kept across upgrades, unless given;
 # `kubectl get secret <release>-pondra-tokens -o jsonpath='{.data.PONDRA_ADMIN_TOKEN}' | base64 -d`.
 # With Argo CD or Flux (which render without the cluster), give existingSecret.
+# With auth off, the nodes still listen on the network: the leader makes the lake's first user and
+# prints its token once (`kubectl logs`, `pondra token` makes another), as the container does.
 auth:
   enabled: true
   existingSecret: ""      # keys PONDRA_ADMIN_TOKEN, PONDRA_WRITE_TOKEN, PONDRA_READ_TOKEN

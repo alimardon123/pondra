@@ -161,10 +161,11 @@ jobs:
       BIN: target/${{ matrix.target }}/dist/pondra${{ matrix.exe }}
     steps: &build # (every platform's, `build` below too)
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # (the key it had when every platform was the job `build`: main's caches stay theirs)
           shared-key: build
@@ -231,6 +232,27 @@ jobs:
     env:
       BIN: target/${{ matrix.target }}/dist/pondra${{ matrix.exe }}
     steps: *build
+
+  # The crate's own unit tests, beside linux-x64's build (they need a build of their own: the
+  # release profile on this machine, not the dist one zig links for glibc 2.17).
+  unit:
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' }}
+    name: unit tests
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: unit
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }} # (main's caches only, as the build's)
+      - run: cargo test --release --lib
 
   # The suite, on linux-x64's very binary, in three parts side by side: the quick correctness suite
   # (upserts, split brain, crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on
