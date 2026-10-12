@@ -1427,7 +1427,10 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
         }
         let target = other.clone().unwrap_or_else(|| lake.arc());
         let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files).await?;
-        let Some(o) = other else { return post_as(&app.cluster.leader.addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await };
+        let Some(o) = other else {
+            crate::cluster::signed(lake).await; // (the nodes' key, before a user's change goes to the leader)
+            return post_as(&app.cluster.leader.addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
+        };
         let out = deliver(&o.url, Some(Some(Request::Change(sql, job.clone(), sent))), &stmt, &job, false).await?;
         seen_there(&o, Some(producer_key(&format!("sql:{job}")))).await;
         return Ok(out);
