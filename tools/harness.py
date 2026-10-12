@@ -8121,7 +8121,8 @@ def sealed():
 def safety():
     """Safe to share, the rest of it (round 29, ADR-035 §5): a panic in a request is answered as an
     error, the node kept up (HTTP, Postgres, a query's own tasks); TLS on every door (HTTPS,
-    Postgres's sslmode, Kafka's SSL, Flight's grpc+tls), plain connections only from this machine,
+    Postgres's sslmode, Kafka's SSL, Flight's grpc+tls), plain connections only from this machine (under
+    PONDRA_TLS=optional from anywhere, carrying a token, never a password: HTTP Basic, POST /login, Kafka),
     nodes calling each other over HTTPS, the nodes' key only with the authority's certificate
     (mutual TLS); the audit log (what's written by default, values hidden, refusals at every door,
     a superuser's only); a user's quota (statements at once, and how long each may run) and a
@@ -8250,6 +8251,31 @@ def safety():
     checks["Postgres (sslmode=verify-full), Kafka (SSL) and Flight (grpc+tls) take TLS; plain from another machine refused"] = pg_ssl and b"Z\x00\x00\x00\x05I" in pg_tls \
         and kafka_tls[4:8] == struct.pack(">i", 7) and flight_tls == [{"x": 1}] \
         and (not away or (b"28000" in pg_away and b"takes TLS" in pg_away and kafka_away[:4] != struct.pack(">i", len(kafka_away) - 4) and not flight_away.startswith(b"\x00\x00")))
+
+    # Under PONDRA_TLS=optional a plain connection from another machine is taken, and carries a token, never a
+    # password (S29): HTTP Basic and POST /login 403, Kafka's SASL/PLAIN refused saying so; over TLS, or from
+    # this machine, the password signs in.
+    if away:
+        ot = "opt-admin-token-1"
+        o = Node(new_lake(), P + 2, kafka=f"127.0.0.1:{P + 22}", admin_token=ot, env={"PONDRA_TLS": "optional"}, **tls).start()
+        try:
+            http_(P + 2, "/sql", b"CREATE USER al PASSWORD 'al-password-1'", auth=f"Bearer {ot}")
+            al = "Basic " + base64.b64encode(b"al:al-password-1").decode()
+            opt = {"basic away": http_(P + 2, "/whoami", source=away, auth=al, method="GET"),
+                   "login away": http_(P + 2, "/login", json.dumps({"user": "al", "password": "al-password-1"}).encode(), source=away),
+                   "bearer away": http_(P + 2, "/whoami", source=away, auth=f"Bearer {ot}", method="GET"),
+                   "kafka password away": kafka_sign_in(P + 22, "al", "al-password-1", source=away),
+                   "kafka token away": kafka_sign_in(P + 22, "admin", ot, source=away),
+                   "kafka password away over TLS": kafka_sign_in(P + 22, "al", "al-password-1", source=away, cafile=ca),
+                   "kafka password here": kafka_sign_in(P + 22, "al", "al-password-1")}
+        finally:
+            o.kill()
+        info["optional"] = opt
+        plain = "a password crosses only TLS from another machine"
+        checks["under PONDRA_TLS=optional, a plain connection from another machine carries a token, never a password (HTTP Basic, /login, Kafka); over TLS or from here it does"] = \
+            opt["basic away"][0] == 403 and plain in opt["basic away"][1] and opt["login away"][0] == 403 and opt["bearer away"][0] == 200 \
+            and opt["kafka password away"][0] == 58 and plain in (opt["kafka password away"][1] or "") and "SASL_SSL" in (opt["kafka password away"][1] or "") \
+            and opt["kafka token away"] == (0, None) and opt["kafka password away over TLS"] == (0, None) and opt["kafka password here"] == (0, None)
 
     # Nodes over HTTPS: a follower with the same certificate joins, and its writes reach the leader
     b = Node(lake, P + 1, **tls).start()
@@ -8576,6 +8602,38 @@ def reply(port, method, path, body=b"", headers=None, source=None, host="127.0.0
     return r.status, {k.lower(): v for k, v in r.getheaders()}, text
 
 
+def kafka_sign_in(port, user, password, source=None, cafile=None):
+    """(error code, message) of a SASL/PLAIN sign-in on a node's Kafka port, by hand: SaslHandshake v1, then
+    SaslAuthenticate v1 (0: signed in; 58: refused, saying why). `source` is this machine's address to call
+    from; `cafile` connects over TLS (SASL_SSL) with that authority."""
+    import socket, ssl, struct
+    def frame(key, corr, body):
+        msg = struct.pack(">hhih", key, 1, corr, 7) + b"harness" + body
+        return struct.pack(">i", len(msg)) + msg
+    def read(s):
+        def exactly(n):
+            got = b""
+            while len(got) < n:
+                d = s.recv(n - len(got))
+                if not d:
+                    raise OSError("the node closed the connection")
+                got += d
+            return got
+        return exactly(struct.unpack(">i", exactly(4))[0])
+    s = socket.create_connection(("127.0.0.1", port), timeout=30, source_address=(source, 0) if source else None)
+    if cafile:
+        s = ssl.create_default_context(cafile=cafile).wrap_socket(s, server_hostname="127.0.0.1")
+    try:
+        s.sendall(frame(17, 1, struct.pack(">h", 5) + b"PLAIN"))
+        read(s)
+        auth = b"\0" + user.encode() + b"\0" + password.encode()
+        s.sendall(frame(36, 2, struct.pack(">i", len(auth)) + auth))
+        r = read(s)
+        err, n = struct.unpack(">hh", r[4:8])
+        return err, (r[8:8 + n].decode() if n >= 0 else None)
+    finally:
+        s.close()
+
 def signed():
     """A lake served with tokens remembers it (S26, invariant 379): its leader with a token writes z/signed
     once. A node started by hand afterwards without the tokens answers no one unsigned, saying why (401);
@@ -8640,8 +8698,8 @@ def signed():
 def guesses():
     """A limit on failed sign-ins per address and user name (S30, invariant 381): ten wrong passwords for a
     user from one address in a minute, and the eleventh is refused at once (429, Retry-After), the right
-    password too, on HTTP Basic and on POST /login. Another user from the same address still signs in, and
-    the same user from another address does; a bearer token isn't counted. Behind a proxy of
+    password too, on HTTP Basic, on POST /login and on Kafka's SASL/PLAIN, one count across them. Another user
+    from the same address still signs in, and the same user from another address does; a bearer token isn't counted. Behind a proxy of
     PONDRA_TRUSTED_PROXIES and behind `pondra serve --lakes`, each client is counted by its own address, and
     only a page on this machine saves the console's settings or chooses the Python (S28)."""
     import base64, socket
@@ -8650,9 +8708,9 @@ def guesses():
     bearer = {"Authorization": f"Bearer {token}"}
     basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
     checks, info = {}, {}
-    a = Node(new_lake(), P, admin_token=token).start()
+    a = Node(new_lake(), P, admin_token=token, kafka=f"127.0.0.1:{P + 7}").start()
     try:
-        for q in ["CREATE USER al PASSWORD 'al-password-1'", "CREATE USER bo PASSWORD 'bo-password-1'"]:
+        for q in ["CREATE USER al PASSWORD 'al-password-1'", "CREATE USER bo PASSWORD 'bo-password-1'", "CREATE USER dee PASSWORD 'dee-password-1'"]:
             reply(P, "POST", "/sql", q.encode(), headers=bearer)
         wrong = [reply(P, "GET", "/whoami", headers={"Authorization": basic("al", f"guess-{i}")})[0] for i in range(10)]
         eleventh = reply(P, "GET", "/whoami", headers={"Authorization": basic("al", "guess-11")})
@@ -8681,6 +8739,16 @@ def guesses():
         checks["a bearer admin token still works"] = admin[0] == 200
         if not isinstance(other, str):
             checks["the same user from another address signs in"] = other[0] == 200
+        # Kafka's SASL/PLAIN counts with the same count: dee's ten wrong passwords there, and al's over HTTP above
+        K = P + 7
+        k_wrong = [kafka_sign_in(K, "dee", f"guess-{i}") for i in range(10)]
+        kafka = {"wrong": k_wrong, "eleventh": kafka_sign_in(K, "dee", "dee-password-1"), "al": kafka_sign_in(K, "al", "al-password-1"),
+                 "bo": kafka_sign_in(K, "bo", "bo-password-1"), "admin token": kafka_sign_in(K, "admin", token)}
+        info["kafka"] = kafka
+        checks["Kafka's SASL/PLAIN: ten wrong passwords for dee refused, and the right one after them refused saying why"] = \
+            k_wrong == [(58, "wrong user name or password")] * 10 and kafka["eleventh"][0] == 58 and "too many failed sign-ins for dee" in (kafka["eleventh"][1] or "")
+        checks["…one count across the doors: al, locked out over HTTP, is refused over Kafka; bo and the admin token sign in there"] = \
+            kafka["al"][0] == 58 and "too many failed sign-ins for al" in (kafka["al"][1] or "") and kafka["bo"] == (0, None) and kafka["admin token"] == (0, None)
     finally:
         a.kill()
     # Behind your own proxy (here this machine is it: PONDRA_TRUSTED_PROXIES=127.0.0.0/8), each client is counted
