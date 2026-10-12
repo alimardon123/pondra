@@ -692,18 +692,14 @@ impl PhysicalOptimizerRule for FilterShares {
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::physical_expr::intervals::utils::check_support;
         use datafusion::physical_plan::filter::FilterExecBuilder;
-        use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
         plan.transform_up(|p| {
             let Some(f) = p.downcast_ref::<FilterExec>() else { return Ok(Transformed::no(p)) };
             if check_support(f.predicate(), &f.input().schema()) {
                 return Ok(Transformed::no(p)); // (DataFusion sizes it from its columns' ranges)
             }
-            let stats = StatisticsContext::new().compute(f.input().as_ref(), &StatisticsArgs::new())?;
-            let conds = conds(f.predicate());
-            let kept = share(stats.as_ref(), &conds);
-            if kept == share(&Blind, &conds) {
+            let Some(kept) = input_share(f.input(), &conds(f.predicate()))? else {
                 return Ok(Transformed::no(p)); // (nothing known of its columns: DataFusion's guess stands, as before)
-            }
+            };
             let percent = (kept * 100.0).round().clamp(1.0, 100.0) as u8;
             if percent == f.default_selectivity() {
                 return Ok(Transformed::no(p));
@@ -720,6 +716,33 @@ impl PhysicalOptimizerRule for FilterShares {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// The share of `input`'s rows a filter's conditions keep, or None when nothing is known of their
+/// columns. A union's parts count apart, each with its own facts, weighed by its rows: a table with
+/// rows still in its log is its log tail and its files side by side (`query::plain_scan`), and the
+/// tail knows no column's count, so merged together they knew none (TPC-H q12's ship modes over a
+/// lineitem with a tail: a fifth of 6 million rows, not the 31K they are).
+fn input_share(input: &Arc<dyn ExecutionPlan>, conds: &[Cond<usize>]) -> Result<Option<f64>> {
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    let parts = match input.downcast_ref::<UnionExec>() {
+        Some(u) => u.inputs().clone(),
+        None => vec![input.clone()],
+    };
+    let blind = share(&Blind, conds);
+    let mut counted = vec![];
+    for part in &parts {
+        let stats = StatisticsContext::new().compute(part.as_ref(), &StatisticsArgs::new())?;
+        counted.push((stats.num_rows.get_value().map_or(0.0, |&n| n as f64), share(stats.as_ref(), conds)));
+    }
+    if counted.iter().all(|&(_, share)| share == blind) {
+        return Ok(None);
+    }
+    let rows: f64 = counted.iter().map(|&(n, _)| n).sum();
+    Ok(Some(match rows > 0.0 {
+        true => counted.iter().map(|&(n, share)| n * share).sum::<f64>() / rows,
+        false => counted.iter().map(|&(_, share)| share).sum::<f64>() / counted.len() as f64, // (no part says its rows)
+    }))
 }
 
 /// Facts of nothing: what `share` keeps of a filter none of whose columns it knows.

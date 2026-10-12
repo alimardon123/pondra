@@ -8913,6 +8913,12 @@ def objects():
     checks["an INSERT into a name no table has is refused (42P01, naming it) over HTTP and pondra sql, nothing made; POST /insert/{t} still makes one"] = \
         nope[:2] == (404, "42P01") and "no table nope" in str(nope[2]) and nope_select[1] == "42P01" and nope_read[1] == "42P01" \
         and cli_nope.returncode != 0 and "no table nope" in cli_nope.stdout + cli_nope.stderr and q("SELECT count(*) AS n FROM bulk_made") == [{"n": 1}]
+    # DuckDB's EXPORT DATABASE and IMPORT DATABASE are not Pondra's yet (ADR-071): refused by name
+    # with the ways it has (0A000), not with the parser's words.
+    exported, imported = http("EXPORT DATABASE 'out'"), http("IMPORT DATABASE 'out'")
+    info["export"] = [exported[:2], imported[:2]]
+    checks["EXPORT DATABASE and IMPORT DATABASE refused by name (0A000), naming BACKUP DATABASE and COPY"] = \
+        exported[1] == imported[1] == "0A000" and all(w in str(r[2]) for r in (exported, imported) for w in ("EXPORT DATABASE", "BACKUP DATABASE", "COPY"))
     q("CREATE VIEW v AS SELECT a FROM t")
     q("CREATE VIEW IF NOT EXISTS v AS SELECT a + 1 AS a FROM t")
     kept = q("SELECT a FROM v")
