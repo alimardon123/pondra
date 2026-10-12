@@ -465,7 +465,8 @@ pub async fn ask(packages: &str, kind: Use, head: Value, parts: Vec<Vec<u8>>, li
         Ok(a) => {
             lent.give();
             match a.0.get("error").and_then(Value::as_str) {
-                Some(e) => bail!("{e}"),
+                Some(e) if crate::auth::shows_code() => bail!("{e}"),
+                Some(e) => bail!("{}", unquoted(e)), // (S27: a caller not shown the routine's code isn't shown its lines in an error)
                 None => Ok(a),
             }
         }
@@ -645,5 +646,26 @@ async fn reap_kernels() {
         if all.is_empty() {
             return;
         }
+    }
+}
+
+/// A worker's error without the code it quotes, for a caller not shown it (S27): `failure` in worker.py ends it
+/// with `  line 3: <the line>` for each place in the body, which become `  line 3`. Here for a procedure (and its
+/// run's log) and in `ext::said` for every door, since a function's batches may run where no caller is known.
+pub(crate) fn unquoted(error: &str) -> String {
+    let line = |l: &str| match l.strip_prefix("  line ").and_then(|r| r.split_once(": ")) {
+        Some((n, _)) if n.chars().all(|c| c.is_ascii_digit()) => format!("  line {n}"),
+        _ => l.to_string(),
+    };
+    error.lines().map(line).collect::<Vec<_>>().join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn an_error_shown_without_its_code_keeps_its_lines_numbers() {
+        let said = "ZeroDivisionError: division by zero\n  line 2: total = secret_rate / 0\n  line 5: return helper(x)";
+        assert_eq!(super::unquoted(said), "ZeroDivisionError: division by zero\n  line 2\n  line 5");
+        assert_eq!(super::unquoted("ValueError: a line: with a colon"), "ValueError: a line: with a colon");
     }
 }

@@ -145,7 +145,7 @@ pub fn router(app: App) -> Router {
         .route("/console/{*file}", get(crate::console::file))
         .route("/functions", get(list_functions))
         .route("/kinds", get(|| async { Json(crate::objects::kinds()) }))
-        .route("/routines", get(|State(app): State<App>| async move { Ok::<_, E>(Json(j!(*crate::routines::listed(&app.lake).await?))) }))
+        .route("/routines", get(routines_shown))
         .route("/secrets/{name}", get(secret))
         .route("/stats", get(stats))
         .route("/healthz", get(|| async { "ok" })) // (the process answers: a liveness probe)
@@ -160,7 +160,7 @@ pub fn router(app: App) -> Router {
         .route("/export", get(|State(app): State<App>, Query(q): Query<HashMap<String, String>>| async move {
             Ok::<_, E>(Json(match q.get("database") {
                 Some(name) => crate::apply::export_attached(&app.lake, name).await?,
-                None => crate::apply::export(&app.lake).await?,
+                None => crate::apply::export_here(&app.lake).await?,
             }))
         }))
         .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::console::objects(&app.lake).await?)) }))
@@ -345,6 +345,20 @@ async fn format_python(Json(b): Json<Value>) -> Result<Json<Value>, E> {
 async fn list_functions(State(app): State<App>) -> Result<Json<Value>, E> {
     let fns = app.lake.cat.scan::<crate::udf::Udf>("f/", "f0").await?;
     Ok(Json(j!(fns.into_iter().map(|(k, u)| (k[2..].to_string(), serde_json::to_value(u).unwrap_or_default())).collect::<serde_json::Map<_, _>>())))
+}
+
+/// `GET /routines`: every routine's name, parameters and result; its code only to whoever is shown code
+/// (a user granted some tables needs the first three to call one, never the body: S27).
+async fn routines_shown(State(app): State<App>) -> Result<Json<Value>, E> {
+    let all = crate::routines::listed(&app.lake).await?;
+    if crate::auth::shows_code() {
+        return Ok(Json(j!(*all)));
+    }
+    let mut hidden = (*all).clone();
+    for r in hidden.values_mut() {
+        r.body.clear();
+    }
+    Ok(Json(j!(hidden)))
 }
 
 /// Who asks (see `auth.rs`, `users.rs`): a token, a user's token, session or password; the

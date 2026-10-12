@@ -219,11 +219,8 @@ fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
             }
         }
         let here = crate::ddl::lake_name(lake);
-        let mut all = crate::ddl::listed(lake).await?;
-        let limit = crate::auth::limited();
-        if let Some(a) = &limit {
-            all.retain(|o| a.may("select", &if o.lake == here { join(&o.schema, &o.name) } else { format!("{}.{}", o.lake, join(&o.schema, &o.name)) }));
-        }
+        let all = crate::ddl::listed(lake).await?;
+        let limit = crate::auth::limited(); // (`listed` keeps a user's rows to what it may read)
         Ok(all.into_iter().map(|o| {
             let local = join(&o.schema, &o.name);
             let named = if o.lake == here { name_sql(&local) } else { format!("{}.{}.{}", ident(&o.lake), ident(&o.schema), ident(&o.name)) };
@@ -311,7 +308,7 @@ fn routines(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
                     (R::Table, _) => "table function",
                     _ => "function",
                 };
-                Object::new(kind, &name, n, (name == here).then(|| routine_sql(&name_sql(n), r)))
+                Object::new(kind, &name, n, (name == here && crate::auth::shows_code()).then(|| routine_sql(&name_sql(n), r)))
             }));
         }
         Ok(out)
@@ -324,7 +321,7 @@ fn tasks(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
         let mut out = vec![];
         for (name, l) in lakes(lake).await {
             for (k, t) in l.cat.scan::<crate::runs::Task>("j/", "j0").await? {
-                out.push(Object::new("task", &name, &k[2..], (name == here).then(|| task_sql(&name_sql(&k[2..]), &t))));
+                out.push(Object::new("task", &name, &k[2..], (name == here && crate::auth::shows_code()).then(|| task_sql(&name_sql(&k[2..]), &t))));
             }
         }
         Ok(out)
@@ -1004,6 +1001,7 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
         "user" => "a user's password and tokens are never shown (CREATE USER … PASSWORD '…')",
         "recipient" => "a recipient's token is shown once, when it is made (ALTER RECIPIENT … ROTATE TOKEN gives it another)",
         "external table" => "its statement isn't kept as written yet (its query is in pondra.tables)",
+        _ if !crate::auth::shows_code() && matches!(o.family(), "routine" | "task") => "its code is shown to an admin, a token, a superuser, or a user with APPLY or CLONE on this database",
         _ if crate::auth::limited().is_some() => "its statement names every column, and you may read only some of them",
         _ => "made with its materialized view",
     }))?;

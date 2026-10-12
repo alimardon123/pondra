@@ -462,8 +462,8 @@ pub async fn run(app: &App, sql: &str, views: &HashMap<String, String>, who: Who
             let flow = match r.beside(s.as_ref(), *at, path).await {
                 Err(e) if one && s.plain().is_some() => return Err(e),
                 Err(e) if one => return Err(e.context(format!("line {}", line(sql, r.at)))),
-                Err(e) if s.plain().is_some() => return Err(e.context(format!("statement {}: {}", i + 1, short(s.plain().unwrap_or_default())))),
-                Err(e) => return Err(e.context(format!("line {}", line(sql, r.at))).context(format!("statement {}: {}", i + 1, short(&sql[*at..end_of(&steps, i, sql)])))),
+                Err(e) if s.plain().is_some() => return Err(e.context(statement(i, s.plain().unwrap_or_default()))),
+                Err(e) => return Err(e.context(format!("line {}", line(sql, r.at))).context(statement(i, &sql[*at..end_of(&steps, i, sql)]))),
                 Ok(f) => f,
             };
             match flow {
@@ -490,7 +490,26 @@ fn text_of(col: &dyn Array) -> Result<Option<String>> {
 fn end_of(steps: &Steps, i: usize, sql: &str) -> usize { steps.get(i + 1).map_or(sql.len(), |(at, _)| *at) }
 fn line(text: &str, at: usize) -> usize { text[..at.min(text.len())].matches('\n').count() + 1 }
 
+tokio::task_local! {
+    /// Set while a stored procedure's statements run for a caller who isn't shown its code (S27).
+    static UNSHOWN: ();
+}
+
+/// Run `go` with its errors quoting none of the code they come from: a statement is named by its
+/// number (and line, in a block), a condition or a query as `…`. A stored procedure called by a user who isn't shown
+/// its code (`auth::shows_code`) runs so, or a failed call would show that user what listings hide.
+pub async fn unshown<T>(go: impl std::future::Future<Output = T>) -> T { UNSHOWN.scope((), go).await }
+
+fn quoted() -> bool { UNSHOWN.try_with(|_| ()).is_err() }
+
+/// The `i`th statement, as an error names it: its number and its first 80 characters (its number alone inside `unshown`).
+fn statement(i: usize, s: &str) -> String { if quoted() { format!("statement {}: {}", i + 1, short(s)) } else { format!("statement {}", i + 1) } }
+
+/// A piece of the script, as an error quotes it: its first 80 characters, or `…` inside `unshown`.
 fn short(s: &str) -> String {
+    if !quoted() {
+        return "…".into();
+    }
     let s = s.trim().trim_end_matches(';').split_whitespace().collect::<Vec<_>>().join(" ");
     if s.chars().count() > 80 { format!("{}…", s.chars().take(80).collect::<String>()) } else { s }
 }
