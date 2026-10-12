@@ -288,7 +288,7 @@ EXCEPTIONS = {
     "plan text": "EXPLAIN prints Pondra's plan, made with rules and scans of its own (optimize.rs, scan.rs): the text differs where the answers agree",
     "a write explained": "EXPLAIN of an INSERT, UPDATE, DELETE or COPY: Pondra's writes aren't DataFusion's plans",
     "the runner's own": "a table or function DataFusion's runner makes in Rust before the file runs (range_partitioned, table_with_metadata, union_table, async_abs, …): no SQL in the file makes it",
-    "the node's memory": "datafusion.runtime.* (memory limit, spill folder, caches) is the node's, set as it starts (PONDRA_MEMORY_MB, PONDRA_SPILL_DIR), not a session's",
+    "the node's memory": "datafusion.runtime.* (memory limit, spill folder, caches) is the node's, set as it starts (--memory-gb, TMPDIR), not a session's",
     "microseconds": "a table's TIMESTAMP keeps microseconds, as Postgres, Delta and Iceberg do; DataFusion's keeps nanoseconds, which the answer shows",
     "an order not asked for": "the same rows in another order, from a query with no ORDER BY: SQL leaves the order open, and Pondra's plans give another",
     "interval arithmetic": "`n * INTERVAL '1 hour'` and `INTERVAL … / n`, which DataFusion refuses and Pondra computes as Postgres does",

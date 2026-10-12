@@ -56,7 +56,7 @@ pub fn listed() -> (Vec<(String, Vec<(String, String)>)>, Vec<(String, String)>)
     (x.tables.iter().map(|(n, t)| (n.clone(), t.columns.clone())).collect(), x.views.iter().map(|(n, v)| (n.clone(), v.clone())).collect())
 }
 
-const NO_SESSION: &str = "a temporary table or view is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>)";
+const NO_SESSION: &str = "a temporary table or view is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>, 8 to 128 letters, digits, - or _)";
 
 struct Table {
     columns: Vec<(String, String)>, // (name, Arrow type), as a lake table's
@@ -227,7 +227,7 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
             return Ok(Some(j!({"view": name, "temporary": true})));
         }
         Stmt::TempSecret(name, params, replace, quiet) => {
-            let s = session.context("a temporary secret is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>)")?;
+            let s = session.context("a temporary secret is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>, 8 to 128 letters, digits, - or _)")?;
             let secret = crate::ext::temporary(name, params.clone())?;
             let kept = with(&s, true, |x| {
                 if *quiet && x.secrets.contains_key(name) {

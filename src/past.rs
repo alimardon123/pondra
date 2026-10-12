@@ -304,6 +304,9 @@ static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| 
 /// A RESTORE's text before its moment, and the moment (`$day` in it is bound by `routines::bind`:
 /// the parser doesn't read a RESTORE). None: not a RESTORE.
 pub fn restore_moment(sql: &str) -> Option<(&str, &str)> {
+    if crate::write::head(sql) != "restore" {
+        return None;
+    }
     let moment = RESTORE.captures(sql)?.get(3)?;
     Some((&sql[..moment.start()], moment.as_str()))
 }
@@ -313,6 +316,9 @@ pub fn restore_moment(sql: &str) -> Option<(&str, &str)> {
 /// `_row_id` kept), a row made since goes, a row deleted since comes back as a new row. It is a
 /// change like any, so it can be undone the same way. None: not a RESTORE.
 pub async fn restore(lake: &Lake, sql: &str) -> Result<Option<String>> {
+    if crate::write::head(sql) != "restore" {
+        return Ok(None);
+    }
     let Some(c) = RESTORE.captures(sql) else { return Ok(None) };
     let name = c[1].split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
     let t = crate::ddl::local(lake, &name).ok_or_else(|| anyhow!("RESTORE {name}: a table of this lake (run it on a node of {name}'s)"))?;

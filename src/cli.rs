@@ -408,6 +408,19 @@ async fn run() -> anyhow::Result<()> {
             tls::init()?; // (a certificate that can't be read: said now)
             let local = ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|a| addr.starts_with(a));
             anyhow::ensure!(python.is_none() || auth.on() || local, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
+            if !auth.on() {
+                // No tokens: every request is an administrator. A loopback node is a local tool; a
+                // node reachable from elsewhere with no tokens is open to that network. Warn, naming
+                // each door that is exposed, so the first run on a server doesn't ship open silently.
+                let nonlocal = |a: &str| !["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|p| a.starts_with(p));
+                let doors = [(nonlocal(&addr), format!("HTTP on {addr}")), (pg.as_deref().is_some_and(nonlocal), format!("the Postgres port on {}", pg.as_deref().unwrap_or_default())),
+                    (kafka.as_deref().is_some_and(nonlocal), format!("Kafka on {}", kafka.as_deref().unwrap_or_default())), (flight.as_deref().is_some_and(nonlocal), format!("Flight on {}", flight.as_deref().unwrap_or_default()))];
+                let exposed: Vec<String> = doors.into_iter().filter(|(x, _)| *x).map(|(_, d)| d).collect();
+                if !exposed.is_empty() {
+                    eprintln!("warning: no tokens are set, so every request is treated as an administrator, and {} {} reachable beyond this machine. Set --admin-token (with --read-token and --write-token as needed), or listen on 127.0.0.1.",
+                        exposed.join(", "), if exposed.len() == 1 { "is" } else { "are" });
+                }
+            }
             // Stopped (Ctrl-C, SIGTERM from a scheduler scaling down, or the program that started
             // this node ending): drained first (`drain.rs`; a second signal stops at once), then the
             // next node leads at once instead of waiting out the lease. Watched from before the node

@@ -577,7 +577,7 @@ pub async fn export_attached(lake: &Lake, name: &str) -> Result<BTreeMap<String,
         ensure!(a.clones_of(name), "permission denied: {name}'s objects are read here with CLONE on it (GRANT CLONE ON DATABASE {name} TO …)");
     }
     let other = lake.attached.read().unwrap().iter().find(|(n, _)| n == name).map(|(_, l)| l.clone());
-    let other = other.with_context(|| format!("database \"{name}\" isn't attached here"))?;
+    let other = other.ok_or_else(|| crate::codes::coded("3D000", format!("database \"{name}\" isn't attached here")))?;
     export(&other).await
 }
 
@@ -1027,7 +1027,9 @@ pub(crate) async fn authorize(app: &App, who: Who, applier: bool) -> Result<()> 
     let db = crate::ddl::lake_name(&app.lake);
     match crate::protect::protected(&app.lake).await? {
         true => ensure!(applier || crate::auth::operator() || app.open().await, "permission denied: {db} is protected: an apply needs APPLY (GRANT APPLY ON DATABASE {db} TO …), or an admin lifts the protection first (ALTER DATABASE {db} SET (protected = false))"),
-        false => ensure!(who.role >= crate::auth::Role::Admin || applier, "an apply changes what the database is: it needs an admin token or APPLY (a plan or a test runs as you are)"),
+        false if !(who.role >= crate::auth::Role::Admin || applier) =>
+            return Err(crate::codes::coded("42501", "permission denied: an apply changes what the database is, so it needs an admin token or APPLY (a plan or a test runs as you are)")),
+        false => {}
     }
     Ok(())
 }
