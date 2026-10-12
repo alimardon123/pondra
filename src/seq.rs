@@ -99,6 +99,7 @@ pub struct Shape {
     pub max: i64,
     pub cache: i64,
     pub cycle: bool,
+    pub as_type: &'static str, // its type: BIGINT, INTEGER or SMALLINT (the catalog's `seqtypid`)
 }
 
 /// The options worked out, Postgres's defaults where none is given, and checked.
@@ -126,7 +127,7 @@ pub fn shape(declared: &[Opt]) -> Result<Shape> {
     let cache = last(|o| if let Opt::Cache(n) = o { Some(Some(*n)) } else { None }).flatten().unwrap_or(1);
     ensure!(cache >= 1, "CACHE ({cache}) must be greater than zero");
     let cycle = declared.iter().rev().find_map(|o| if let Opt::Cycle(c) = o { Some(*c) } else { None }).unwrap_or(false);
-    Ok(Shape { start, increment, min, max, cache, cycle })
+    Ok(Shape { start, increment, min, max, cache, cycle, as_type })
 }
 
 /// `CREATE SEQUENCE` again, as declared.

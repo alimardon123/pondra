@@ -132,7 +132,7 @@ pub fn router(app: App) -> Router {
         .route("/", get(crate::console::page))
         .route("/sql", post(sql))
         .route("/sql/pages/{id}", get(page))
-        .route("/mcp", post(crate::mcp::handle))
+        .route("/mcp", post(crate::mcp::handle).delete(crate::mcp::end))
         .route("/files/{*path}", put(put_file).get(get_file).delete(delete_file).post(restore_file))
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))

@@ -109,16 +109,40 @@ pub fn with<T>(session: &str, change: bool, f: impl FnOnce(&mut Session) -> Resu
     Ok(out)
 }
 
-/// Sessions idle for `PONDRA_SESSION_IDLE_SECS` end; once there are none, this stops.
+/// How long a session may sit unused (`PONDRA_SESSION_IDLE_SECS`, 3600).
+fn idle() -> Duration {
+    Duration::from_secs(crate::env::or("PONDRA_SESSION_IDLE_SECS", 3600))
+}
+
+/// Sessions idle for `PONDRA_SESSION_IDLE_SECS` end, as `end` ends them (a transaction rolled back,
+/// its Python and temporary tables gone); once there are none, this stops.
 async fn reap() {
-    let idle = Duration::from_secs(crate::env::or("PONDRA_SESSION_IDLE_SECS", 3600));
     loop {
-        tokio::time::sleep(idle.min(Duration::from_secs(60))).await;
-        let mut all = SESSIONS.lock().unwrap();
-        all.retain(|_, x| x.used.is_some_and(|u| u.elapsed() < idle));
-        if all.is_empty() {
+        tokio::time::sleep(idle().min(Duration::from_secs(60))).await;
+        let stale: Vec<String> = SESSIONS.lock().unwrap().iter().filter(|(_, x)| !x.used.is_some_and(|u| u.elapsed() < idle())).map(|(s, _)| s.clone()).collect();
+        for session in &stale {
+            end(session);
+        }
+        if SESSIONS.lock().unwrap().is_empty() {
             return;
         }
+    }
+}
+
+/// Does this node hold the session: made, used within the idle time, and not ended? One that has
+/// gone idle ends here, as `reap` would end it (its transaction rolled back).
+pub fn live(session: &str) -> bool {
+    let fresh = SESSIONS.lock().unwrap().get(session).is_some_and(|x| x.used.is_some_and(|u| u.elapsed() < idle()));
+    if !fresh {
+        end(session);
+    }
+    fresh
+}
+
+/// The session was used just now: its idle time starts again.
+pub fn touch(session: &str) {
+    if let Some(x) = SESSIONS.lock().unwrap().get_mut(session) {
+        x.used = Some(Instant::now());
     }
 }
 
@@ -141,6 +165,7 @@ pub fn secrets() -> Vec<(String, crate::ext::Secret)> {
 /// End a session: its temporary tables and views are gone, and its Python (`python::ask_session`).
 pub fn end(session: &str) -> bool {
     crate::txn::end(session); // (its transaction, if open: rolled back)
+    crate::cursors::end(session); // (its cursors go with it: `cursors.rs`)
     let python = crate::python::end_session(session); // (its Python's variables too)
     let gone = SESSIONS.lock().unwrap().remove(session).is_some() || python;
     if gone {
