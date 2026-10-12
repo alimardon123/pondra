@@ -117,6 +117,8 @@ ingress:
   annotations: {}
   hosts: []               # e.g. [pondra.example.com]: the console and the HTTP API
   tls: []
+  # (with one, add {name: PONDRA_TRUSTED_PROXIES, value: "<its pods' range, e.g. 10.244.0.0/16>"} to extraEnv:
+  # failed sign-ins are then counted per client, not per ingress)
 
 podMonitor:               # (Prometheus Operator: each pod's GET /metrics, with the read token)
   enabled: false

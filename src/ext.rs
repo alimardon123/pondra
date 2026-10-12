@@ -353,7 +353,10 @@ pub fn said(e: &anyhow::Error) -> String {
             out += &c;
         }
     }
-    readable(&out)
+    match crate::auth::shows_code() {
+        true => readable(&out),
+        false => crate::python::unquoted(&readable(&out)), // (a Python routine's lines, quoted wherever its batch ran: S27)
+    }
 }
 
 pub fn readable(text: &str) -> String {

@@ -328,6 +328,8 @@ UNLISTED = {
     "PONDRA_TEST_FORMAT": "a build posing as a later lake format, for upgrade_check.py",
     "PONDRA_TEST_PANICS": "turns on pondra_panic(), for harness.py safety",
     "PONDRA_CRASH": "injects crashes at named points, for harness.py crash",
+    "PONDRA_TEST_NO_GATE": "turns the row locks' gate off, to show the lost update it prevents, for harness.py round7",
+    "PONDRA_TEST_AUTOCOMMIT_PAUSE_MS": "holds an autocommitted write between its rows and its append, for harness.py round7 and autocommit",
     "PONDRA_DROP_BEATS": "drops heartbeats from the nodes a file names, for cluster.py isolate",
     "PONDRA_NO_DIRECT": "acts as if the leader were out of reach, for harness.py serverless",
     "load_ipython_extension": "IPython calls it for `%load_ext pondra`, which the Python reference shows",

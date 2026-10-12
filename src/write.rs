@@ -1414,9 +1414,24 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     if let Some(out) = crate::temp::statement(app, &stmt, files).await? {
         return Ok(out); // (the session's own tables and views: on this node, in memory)
     }
+    // DDL in an open transaction runs at once, as a commit of its own (ADR-067 §7); the notice follows its success. A
+    // CREATE TABLE … AS's steps run at once too (`at_once`), so they are not kept.
+    if let Some(note) = Box::pin(crate::txn::ddl_at_once(app, &stmt)).await? {
+        let out = Box::pin(crate::txn::at_once(run_listed(app, stmt, job, files))).await?;
+        if out["exists"] != true && out["unchanged"] != true {
+            crate::routines::heard(&note); // (IF NOT EXISTS left the table as it was: nothing ran)
+        }
+        return Ok(out);
+    }
     if let Some(out) = Box::pin(crate::txn::statement(app, &stmt, files)).await? {
         return Ok(out); // (in a transaction: kept until COMMIT, ADR-036 §5)
     }
+    run_listed(app, stmt, job, files).await
+}
+
+/// A statement once the session's own tables and its transaction have had their turn (`on_node_listed`): written here
+/// or by the leader.
+async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
     ensure!(!app.cluster.reader, "read-only node");
     if let Stmt::Invalid(why) = stmt {
         bail!(why);
@@ -1539,6 +1554,13 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
         _ => {}
     }
     let meta = lake.cat.get::<TableMeta>(&table_key(&table)).await?.map(|m| m.logical()); // (rows under SQL's names: the log keeps them stored, `log::pack`)
+    // A keyed table's UPDATE or DELETE outside a transaction is a transaction of its own (ADR-067 §7): it locks the keys
+    // it changes, so a change worked out from a snapshot can't overwrite a commit that landed meanwhile. Its producer is
+    // the job, so a retry of it is a duplicate. (MERGE and UNIQUE tables never get here: `changes` sends them to the leader.)
+    let keyed = meta.as_ref().is_some_and(|m| !m.key.is_empty());
+    if keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..)) {
+        return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job))).await;
+    }
     let sql = match (&meta, &stmt) {
         (Some(m), _) if through_log(m, &stmt) => rows_sql(m, &stmt)?,
         (_, Stmt::Insert(_, query)) => {
@@ -1561,18 +1583,7 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
         _ => bail!("UPDATE and DELETE need a keyed table (append tables only take INSERTs)"),
     };
     let meta = meta.expect("a table");
-    let point = match &stmt {
-        // (one key's UPDATE: its row from the serving path, no planning, ADR-036 §6)
-        Stmt::Update(_, set, Some(cond)) => match lake.cat.get::<TableMeta>(&table_key(&table)).await? {
-            Some(stored) => Box::pin(crate::txn::point_change(lake, &table, &stored, None, set, cond)).await?.map(|(_, new)| new),
-            None => None,
-        },
-        _ => None,
-    };
-    let batch = match point {
-        Some(new) if !new.is_empty() => new.into_iter().next().expect("a row"),
-        _ => rows(&open(session(lake, &sql, "").await?), &meta, &sql).await?,
-    };
+    let batch = rows(&open(session(lake, &sql, "").await?), &meta, &sql).await?;
     let n = batch.num_rows();
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
     Ok(if ack.duplicate { j!({"duplicate": true}) } else { j!({"rows": n}) })
@@ -1801,6 +1812,26 @@ async fn created(dir: &str, c: &ast::CreateTable) -> Result<Option<()>> {
     }
 }
 
+/// The lake's key for its nodes, for `pondra sql` with no token. A leader makes it beside serving
+/// (C5), so one that has just started may not have it in the bucket yet: while one leads and the key
+/// isn't there, the lake is read again every 200 ms, for 10 s at most (a node a program started
+/// answers nothing without it: S21).
+async fn cli_key(lake: &Lake) -> Option<String> {
+    for _ in 0..50 {
+        if let Ok(k) = crate::users::node_key(lake).await {
+            return Some(k);
+        }
+        let led = matches!(latest(&lake.store).await, Ok(Some(t)) if !t.addr.is_empty() && alive(&lake.store, &t).await);
+        match crate::users::kept(lake).await {
+            "none" if led => {} // (not made yet: wait for them)
+            _ => return crate::users::node_key(lake).await.ok(), // (made meanwhile, or no leader to wait for)
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        lake.refresh().await.ok()?;
+    }
+    None
+}
+
 async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
     let job = std::env::var("PONDRA_JOB").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
     std::env::set_var("PONDRA_JOB", &job); // (if fenced, the process restarts: the same job again)
@@ -1813,7 +1844,7 @@ async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
             if ["PONDRA_TOKEN", "PONDRA_ADMIN_TOKEN", "PONDRA_NODE_KEY"].iter().all(|v| std::env::var(v).map_or(true, |t| t.is_empty())) {
                 // (no token: the lake's own key for its nodes, which whoever holds the lake can read; a
                 // leader on the network answers nothing unsigned. `cluster::http` sends it.)
-                if let Ok(k) = crate::users::node_key(&target).await {
+                if let Some(k) = cli_key(&target).await {
                     std::env::set_var("PONDRA_NODE_KEY", k);
                 }
             }

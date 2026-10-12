@@ -837,6 +837,7 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
         metas.push((t.clone(), meta));
     }
     let _guard = lock.lock().await;
+    let _gate = crate::locks::close(&lake.url, &all).await?; // (the tables it brings: no autocommitted write lands in them meanwhile, ADR-067 §7)
     // This lake's counters past the base's, then a number of its own: every table here starts
     // after it (invariant 50), and its own rows of these tables before it are left behind.
     let now = seq.number().await?;

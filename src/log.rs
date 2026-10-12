@@ -145,7 +145,34 @@ pub struct Append {
     pub table: String,
     pub src: Src,
     pub batch: RecordBatch, // may be empty: then only the producer's seq advances
-    pub ack: oneshot::Sender<Result<Ack, String>>,
+    pub ack: oneshot::Sender<Result<Ack, Refusal>>,
+}
+
+/// Why an append failed, as its producer hears it. `lost`: the flush went out and no answer came back (the request failed
+/// in transit, the sequencer's reply was lost), so the append may still commit (ADR-067 §7: its row locks wait for their lease).
+#[derive(Debug)]
+pub struct Refusal {
+    pub why: String,
+    pub lost: bool,
+}
+
+impl From<String> for Refusal {
+    fn from(why: String) -> Refusal {
+        Refusal { why, lost: false }
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// Does an append's error say its answer never came (`Refusal::lost`)?
+pub fn unanswered(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Refusal>().is_some_and(|r| r.lost)
 }
 
 pub struct Log {
@@ -262,7 +289,13 @@ impl Log {
         let (ack, rx) = oneshot::channel();
         crate::metrics::add(&crate::metrics::ROWS_IN, batch.num_rows() as u64);
         self.tx.send(Append { table, src, batch, ack }).await.map_err(|_| anyhow!("log closed"))?;
-        Ok(Either::Left(async move { rx.await?.map_err(|e| anyhow!(e)) }))
+        Ok(Either::Left(async move {
+            match rx.await {
+                Ok(answer) => Ok(answer?),
+                // (the batcher ended before it answered: the append may have gone to the sequencer)
+                Err(_) => Err(Refusal { why: "the answer to the append was lost".into(), lost: true }.into()),
+            }
+        }))
     }
 }
 
@@ -272,6 +305,9 @@ impl Log {
 async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<oneshot::Receiver<()>>, done: oneshot::Sender<()>) {
     let (mut done, mut waits) = (Some(done), 0);
     while !pending.is_empty() {
+        // (set while the flush is with the leader or the sequencer and no answer has come back: an error then is a lost
+        // answer, and the appends in it may still commit. Errors before that, and an HTTP response, are answers)
+        let mut unanswered = false;
         let outcome = async {
             stamp(lake, to, &mut pending).await?;
             let f = pack(lake, &pending).await?;
@@ -280,18 +316,29 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
             }
             match to {
                 To::Local(seq) => {
-                    let outcome = seq.enqueue(f).await?;
+                    unanswered = true;
+                    let reply = seq.enqueue(f).await?;
                     drop(done.take());
-                    anyhow::Ok(outcome.await?)
+                    let outcome = reply.await?;
+                    unanswered = false;
+                    anyhow::Ok(outcome)
                 }
                 To::Leader(addr) => {
                     let request = http().post(crate::tls::url(&format!("{addr}/cluster/commit"))).body(encode_flush(&f)?).send();
                     drop(done.take()); // (sent in order; over HTTP they may still arrive out of order, rarely)
-                    Ok(request.await?.error_for_status()?.json().await?)
+                    unanswered = true;
+                    let response = request.await?;
+                    // (a 4xx is the leader's refusal, made before its sequencer took the flush; a 5xx, or a body lost on the
+                    // way, may come after it did, so the rows may still commit: lost, as a dropped reply is here)
+                    unanswered = !response.status().is_client_error();
+                    let outcome = response.error_for_status()?.json().await?;
+                    unanswered = false;
+                    Ok(outcome)
                 }
             }
         };
-        match outcome.await {
+        let outcome = outcome.await;
+        match outcome {
             Ok(Outcome::Acks(acks)) => {
                 for (a, ack) in pending.drain(..).zip(acks) {
                     let answered = answer(&a, ack);
@@ -300,7 +347,7 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
             }
             Ok(Outcome::Refused(why)) => {
                 for a in pending.drain(..) {
-                    let _ = a.ack.send(Err(why.clone())); // (a sequence's answer, or a backup's: ADR-070)
+                    let _ = a.ack.send(Err(why.clone().into())); // (a sequence's answer, or a backup's: ADR-070)
                 }
             }
             Ok(Outcome::Retry(retried)) => {
@@ -324,18 +371,19 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                 for a in pending.drain(..) {
                     let rows = BTreeMap::from([(a.table.clone(), vec![a.batch.clone()])]);
                     match crate::views::derive(lake, &rows).await {
-                        Err(e) if crate::views::refused(&e) => drop(a.ack.send(Err(format!("{e:#}")))),
+                        Err(e) if crate::views::refused(&e) => drop(a.ack.send(Err(format!("{e:#}").into()))),
                         _ => kept.push(a),
                     }
                 }
                 if kept.len() == n {
-                    kept.drain(..).for_each(|a| drop(a.ack.send(Err(format!("{e:#}"))))); // (refused together only: all of them)
+                    kept.drain(..).for_each(|a| drop(a.ack.send(Err(format!("{e:#}").into())))); // (refused together only: all of them)
                 }
                 pending = kept;
             }
             Err(e) => {
                 for a in pending.drain(..) {
-                    let _ = a.ack.send(Err(format!("{e:#}"))); // the producer retries, maybe elsewhere
+                    // (the producer retries, maybe elsewhere; an answer lost on the way is `lost`: its locks wait for their lease)
+                    let _ = a.ack.send(Err(Refusal { why: format!("{e:#}"), lost: unanswered }));
                 }
             }
         }
@@ -343,10 +391,10 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
 }
 
 /// An append's answer: its ack, or why the sequencer refused it.
-fn answer(a: &Append, ack: Ack) -> Result<Ack, String> {
+fn answer(a: &Append, ack: Ack) -> Result<Ack, Refusal> {
     match (ack.refused, ack.gone) {
-        (true, _) => Err(format!("{} has a UNIQUE constraint: it takes rows through SQL's INSERT, UPDATE and MERGE, which check them on the leader", a.table)),
-        (_, true) => Err(format!("no table {}", a.table)),
+        (true, _) => Err(format!("{} has a UNIQUE constraint: it takes rows through SQL's INSERT, UPDATE and MERGE, which check them on the leader", a.table).into()),
+        (_, true) => Err(format!("no table {}", a.table).into()),
         _ => Ok(ack),
     }
 }
