@@ -479,7 +479,13 @@ async fn run() -> anyhow::Result<()> {
             let mut stop = panics::spawn(stopped(stop_with_stdin));
             let held = Arc::new(node::Held::default()); // (what the start takes, given back by a stop: `node.rs`)
             let mut node = tokio::select! {
-                started = node::Node::start(node::Options { dir, listen: addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth }, held.clone()) => started?,
+                started = node::Node::start(node::Options { dir, listen: addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth }, held.clone()) => match started {
+                    Ok(node) => node,
+                    Err(e) => {
+                        held.stop().await; // (a start that fails gives back what it took too, as `Node::open` does: the next node leads at once)
+                        return Err(e);
+                    }
+                },
                 // (a node stopped while it starts gives back what it took so far, a leader its term, so
                 // the next node leads at once; there is no drain here, since nothing serves yet)
                 _ = &mut stop => {

@@ -462,7 +462,7 @@ pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
 }
 
 pub struct Lake {
-    pub url: String, // absolute local dir or "s3://bucket/prefix" (gs://, az://, abfss:// too)
+    pub url: String, // absolute local dir or "s3://bucket/prefix" (gs://, az://, abfss:// too; memory://id in this process)
     pub store: Store,
     pub cat: Catalog,
     pub hwm: watch::Sender<u64>, // the last committed segment this node knows of
@@ -788,7 +788,7 @@ impl Lake {
         let disk = bucket.as_ref().filter(|_| !memory).and_then(|_| disk_tier(&url, &store));
         let mut cached_store = None;
         if let Some((bucket_url, held)) = bucket.as_ref().filter(|_| memory) {
-            rt.register_object_store(&url::Url::parse(bucket_url)?, held.clone()); // (in memory already: read as it is)
+            rt.register_object_store(&url::Url::parse(bucket_url)?, Arc::new(crate::bridge::Bridge(held.clone()))); // (in memory already: read as it is)
         } else if let Some((bucket_url, s3)) = bucket {
             let prefix = url.trim_start_matches(&bucket_url).trim_start_matches('/').to_string();
             let cached = Arc::new(crate::cache::CachedStore::new(s3, cache_mb() << 20, disk.clone().map(|d| (d, prefix.clone())), &prefix));

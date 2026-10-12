@@ -11,6 +11,10 @@ b. "a node stopped while it starts gives its term back too": a node is stopped a
    says `start: the lease` (its term taken, its lake not yet open). It must exit 0 without ever
    printing `serving`, and the next node on the folder must be ready in under 5 s. A try that serves
    before the stop lands is made again on a new folder, up to five times.
+c. "a door whose port is taken stops the start, and gives the term back": a node started with `--pg` on
+   a port this script holds must exit non-zero, never print `serving`, and name `--pg` and the address
+   in what it says (beside a Postgres on 5432, psql would otherwise talk to that one); the next node on
+   the folder must be ready in under 5 s.
 
 Each node has a temporary folder of its own (TMPDIR), as on a machine of its own. Sharing one, a
 term's lock file shows the next node that the stopped one is gone, and neither check could tell a
@@ -19,7 +23,7 @@ term given back from one kept.
 Only the standard library. Every node is this script's child: it is stopped by its standard input,
 and killed by its own pid if that doesn't end it. No other process is touched.
 """
-import argparse, itertools, os, shutil, subprocess, sys, tempfile, time, urllib.request
+import argparse, itertools, os, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # (this machine's own node: never a proxy)
@@ -34,7 +38,7 @@ def fresh(name):
     return os.path.join(work, "lake")
 
 
-def launch(bin_, lake, port, trace=False):
+def launch(bin_, lake, port, trace=False, more=()):
     """A node on `lake` at `port`, stopped by its standard input. With `trace`, its start steps go to
     its standard error (read by the caller); otherwise its log goes to a file beside the lake."""
     env = dict(os.environ)
@@ -52,7 +56,7 @@ def launch(bin_, lake, port, trace=False):
         log = open(os.path.join(os.path.dirname(lake), f"node-{port}.log"), "w")
         logs.append(log)
         err = log
-    node = subprocess.Popen([bin_, "serve", "--lake", lake, "--addr", f"127.0.0.1:{port}", "--stop-with-stdin"],
+    node = subprocess.Popen([bin_, "serve", "--lake", lake, "--addr", f"127.0.0.1:{port}", "--stop-with-stdin", *more],
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err, env=env)
     children.append(node)
     return node
@@ -147,6 +151,40 @@ def check_b(bin_, ports):
     return False, "A served before the stop landed, in five tries"
 
 
+def check_c(bin_, ports):
+    lake = fresh("c")
+    held = socket.socket()
+    held.bind(("127.0.0.1", 0))
+    held.listen()
+    taken = f"127.0.0.1:{held.getsockname()[1]}"
+    try:
+        a = launch(bin_, lake, next(ports), trace=True, more=("--pg", taken))
+        out = []
+        reader = threading.Thread(target=lambda: out.append(a.stderr.read()), daemon=True)  # (the node never waits on a full pipe)
+        reader.start()
+        try:
+            code = a.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            code = stop(a)
+            return False, f"the node was still running 60 s on, with its Postgres port taken (stopped: exit {code})"
+        reader.join(10)
+        said = b"".join(out).decode(errors="replace")
+    finally:
+        held.close()
+    if code == 0:
+        return False, "the node exited 0 with its Postgres port taken"
+    if " serving " in said:
+        return False, "the node served with its Postgres port taken"
+    if f"--pg {taken}" not in said:
+        return False, f"its error doesn't name --pg {taken}: {said.strip().splitlines()[-1:]}"
+    secs, _ = next_node_ready(bin_, lake, ports)
+    if secs is None:
+        return False, "B never answered /ready in 60 s"
+    if secs >= WITHIN:
+        return False, f"B ready in {secs:.1f} s, not under {WITHIN:g} s: A didn't give its term back"
+    return True, f"exited {code} naming --pg {taken}; B ready in {secs:.1f} s"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bin", default=os.environ.get("PONDRA_BIN") or os.path.join(HERE, "..", "target", "release", "pondra"))
@@ -158,7 +196,8 @@ def main():
         sys.exit(1)
     ports = itertools.count(A.port)
     labels = [("a", "a node stopped once it serves gives its term back: the next leads at once", check_a),
-              ("b", "a node stopped while it starts gives its term back too", check_b)]
+              ("b", "a node stopped while it starts gives its term back too", check_b),
+              ("c", "a door whose port is taken stops the start, and gives the term back", check_c)]
     failed = False
     try:
         for _, label, fn in labels:

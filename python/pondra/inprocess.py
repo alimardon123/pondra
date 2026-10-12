@@ -152,13 +152,13 @@ def _body(lib, answer):
 def open(path=None, token=None, python=True, **settings):
     """Open a node on a lake in this process, and connect to it: no server and no second process.
     `path` is a folder or s3://bucket/prefix; with none, or `":memory:"` as DuckDB spells it, a lake
-    held in this process's memory: nothing on disk, and gone at close(). It returns the connection `connect()` and `local()` return, so
-    frames, `sql`, `write_table` and the rest work the same. Its SQL may read files on this machine,
-    as `local()`'s may. `settings` are the node's settings by name (`memory_gb=2` is
-    PONDRA_MEMORY_GB), fixed by the first open in a process. One node at a time in a process: open
-    another lake with ATTACH, or close this one first. Python procedures run with this Python
-    (`python=False`: none). A request waits for the node's answer however long it takes: there is no
-    socket to time out."""
+    held in this process's memory: nothing on disk, and gone at close(). It returns the connection
+    `connect()` and `local()` return, so frames, `sql`, `write_table` and the rest work the same. Its
+    SQL may read files on this machine, as `local()`'s may. `settings` are the node's settings by
+    name (`memory_gb=2` is PONDRA_MEMORY_GB), fixed by the first open in a process. One node at a
+    time in a process: open another lake with ATTACH, or close this one first. Python procedures run
+    with this Python (`python=False`: none). A request waits for the node's answer however long it
+    takes: there is no socket to time out."""
     lib = _library()  # (first: a missing library leaves no folder behind)
     lake = ":memory:" if path is None else os.fspath(path)
     if "://" not in lake and lake != ":memory:":

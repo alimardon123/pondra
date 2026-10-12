@@ -206,10 +206,11 @@ impl Opened {
     }
 
     /// Opens a node from a JSON object of options (`pondra_open`'s, `designs/l2-step4-open.md`): its
-    /// own keys `lake` (a folder, a bucket's URL, or `:memory:`, the default: a lake held in this process's
-    /// memory until close), `addr`, `owner`, `python` and `attach`, and every other key a setting by name (`memory_gb` is `PONDRA_MEMORY_GB`; `launcher` is
-    /// `PONDRA_LAUNCHER`), given through `env::give`, so a misspelt one is refused naming the nearest and
-    /// a changed one naming what changed.
+    /// own keys `lake` (a folder, a bucket's URL, or `:memory:`, the default: a lake held in this
+    /// process's memory until close), `addr`, `owner`, `python` and `attach`, and every other key a
+    /// setting by name (`memory_gb` is `PONDRA_MEMORY_GB`; `launcher` is `PONDRA_LAUNCHER`), given
+    /// through `env::give`, so a misspelt one is refused naming the nearest and a changed one naming
+    /// what changed.
     pub fn open_json(json: &str) -> anyhow::Result<Opened> {
         use anyhow::Context;
         let mut o: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).context("the options are a JSON object")?;
@@ -356,7 +357,11 @@ async fn supervise(options: Options, state: Arc<Mutex<State>>, router: Arc<Mutex
                             return failed_until_closed(&set, why, &mut events, first.take()).await;
                         }
                         Some(Event::Close) | None => {
+                            let t0 = std::time::Instant::now();
                             crate::drain::drain().await; // (its requests in flight answered: the router stays till then)
+                            if crate::env::is_set("PONDRA_TRACE_START") {
+                                eprintln!("stop: drained {:.2} s", t0.elapsed().as_secs_f64());
+                            }
                             router.lock().unwrap_or_else(PoisonError::into_inner).take();
                             node.stop().await;
                             set(State::Closed);
