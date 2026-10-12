@@ -217,9 +217,10 @@ pub async fn settings() -> Response {
 /// and from this machine only — like choosing the Python (`choose_python`). On an open node the
 /// local console page is an admin and saves them; a web page the user visits is not (`guard`'s
 /// `auth::cross_site`), and a reverse proxy's loopback address no longer stands in for an admin token.
+/// Behind `pondra serve --lakes`, this machine is the client's address the server names (`Peer::from_here`).
 /// At most 64 KB of JSON.
-pub async fn save_settings(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, .. }): axum::extract::ConnectInfo<crate::tls::Peer>, role: axum::Extension<crate::auth::Role>, body: bytes::Bytes) -> Response {
-    if *role < crate::auth::Role::Admin || !from.ip().is_loopback() {
+pub async fn save_settings(axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: bytes::Bytes) -> Response {
+    if *role < crate::auth::Role::Admin || !peer.from_here(&headers) {
         return (StatusCode::FORBIDDEN, "the console's settings are saved by an admin, on a page on this machine").into_response();
     }
     if body.len() > 64 << 10 || serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&body).is_err() {

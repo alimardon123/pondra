@@ -228,11 +228,16 @@ pub struct Auth {
     /// Does the node listen beyond this machine (`--addr`, `--pg`, `--kafka` or `--flight`)? Then it is
     /// never open, tokens or not (`App::open`).
     network: bool,
+    /// The key of the program that started the node for itself (the shell, `local()`, the project commands:
+    /// `PONDRA_OWNER_KEY`), if one did. Then it is never open either: only that program (its key), a token
+    /// or a user signs in, and the key is the admin's password at the doors that take one (Postgres's
+    /// `admin`, while no admin token is set).
+    owner: Option<String>,
 }
 
 impl Auth {
     pub fn new(read: Option<String>, write: Option<String>, admin: Option<String>) -> Auth {
-        let auth = Auth { read, write, admin, network: false };
+        let auth = Auth { read, write, admin, network: false, owner: None };
         if auth.on() {
             TOKENS.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -249,6 +254,11 @@ impl Auth {
     /// Is an admin token set? Then the nodes call each other with it, and the nodes' key counts for nothing.
     pub fn admin_set(&self) -> bool { self.admin.is_some() }
 
+    /// This node was started by a program for itself, which signs its requests with this key (`owner`).
+    pub fn owned_by(self, owner: Option<String>) -> Auth { Auth { owner, ..self } }
+
+    pub fn owned(&self) -> bool { self.owner.is_some() }
+
     /// The role a bearer token grants.
     pub fn role(&self, token: Option<&str>) -> Role {
         if let Some((role, _)) = lent(token) {
@@ -260,11 +270,11 @@ impl Auth {
         }
     }
 
-    /// The role one of the three tokens grants (compared in constant time), or None.
+    /// The role one of the three tokens (or the program's key: an admin's) grants, compared in constant time, or None.
     pub fn token_role(&self, token: &str) -> Role {
         let is = |t: &Option<String>| t.as_ref().is_some_and(|t| aws_lc_rs::constant_time::verify_slices_are_equal(t.as_bytes(), token.as_bytes()).is_ok());
         match () {
-            _ if is(&self.admin) => Role::Admin,
+            _ if is(&self.admin) || is(&self.owner) => Role::Admin,
             _ if is(&self.write) => Role::Write,
             _ if is(&self.read) => Role::Read,
             _ => Role::None,
@@ -277,7 +287,7 @@ impl Auth {
     /// The token a Postgres user name stands for (the password it must send).
     pub fn token_for(&self, user: &str) -> Option<String> {
         match user {
-            "admin" => self.admin.clone(),
+            "admin" => self.admin.clone().or_else(|| self.owner.clone()),
             "writer" => self.write.clone(),
             _ => self.read.clone(),
         }
@@ -409,4 +419,132 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) { LENT.lock().unwrap().remove(&self.0); }
+}
+
+/// Failed sign-ins per address and user name (S30, invariant 381): ten in a minute, and that pair is
+/// refused at once (the right password too) until its minute has fewer. Per pair, not per address: behind
+/// one proxy or load balancer, ten wrong passwords from anyone would lock everyone out. A bearer token
+/// isn't counted: it is random, so guessing one isn't the risk.
+const TRIES: usize = 10;
+const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
+const PAIRS: usize = 10_000; // (the pairs held at once: when full, the one whose newest failure is oldest goes)
+
+#[derive(Default)]
+pub struct Guesses {
+    failures: std::sync::Mutex<std::collections::HashMap<(std::net::IpAddr, String), std::collections::VecDeque<std::time::Instant>>>,
+}
+
+static GUESSED: std::sync::LazyLock<Guesses> = std::sync::LazyLock::new(Default::default);
+
+/// Seconds to wait before this address may try this user name again, when it has had ten failures in
+/// the last minute (None: it may try). A door that can't tell the address counts under 0.0.0.0.
+pub fn guessing(addr: Option<std::net::IpAddr>, user: &str) -> Option<u64> { GUESSED.guessing_at(addr, user, std::time::Instant::now()) }
+
+/// A failed sign-in of this address and user name, now.
+pub fn guessed(addr: Option<std::net::IpAddr>, user: &str) { GUESSED.guessed_at(addr, user, std::time::Instant::now()) }
+
+impl Guesses {
+    fn key(addr: Option<std::net::IpAddr>, user: &str) -> (std::net::IpAddr, String) {
+        (addr.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)), user.to_string())
+    }
+
+    fn guessing_at(&self, addr: Option<std::net::IpAddr>, user: &str, now: std::time::Instant) -> Option<u64> {
+        let key = Self::key(addr, user);
+        let mut all = self.failures.lock().unwrap();
+        let times = all.get_mut(&key)?;
+        while times.front().is_some_and(|t| now.saturating_duration_since(*t) >= MINUTE) {
+            times.pop_front();
+        }
+        let n = times.len();
+        if n < TRIES {
+            if n == 0 {
+                all.remove(&key);
+            }
+            return None;
+        }
+        // (the pair has fewer than ten again once its (n - 9)th failure, the one `TRIES` back from the
+        // newest, is a minute old)
+        let until = times[n - TRIES];
+        let left = MINUTE.saturating_sub(now.saturating_duration_since(until));
+        Some(left.as_secs_f64().ceil().max(1.0) as u64)
+    }
+
+    fn guessed_at(&self, addr: Option<std::net::IpAddr>, user: &str, now: std::time::Instant) {
+        let key = Self::key(addr, user);
+        let mut all = self.failures.lock().unwrap();
+        if !all.contains_key(&key) && all.len() >= PAIRS {
+            // (full: the pair whose newest failure is oldest goes; a scan, and only when full)
+            let oldest = all.iter().min_by_key(|(_, times)| times.back().copied()).map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                all.remove(&k);
+            }
+        }
+        let times = all.entry(key).or_default();
+        while times.front().is_some_and(|t| now.saturating_duration_since(*t) >= MINUTE) {
+            times.pop_front();
+        }
+        times.push_back(now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::{Duration, Instant};
+
+    fn ip(last: u8) -> Option<IpAddr> { Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))) }
+
+    #[test]
+    fn ten_failures_refuse_the_pair_for_a_minute() {
+        let (g, t) = (Guesses::default(), Instant::now());
+        for _ in 0..9 {
+            g.guessed_at(ip(1), "al", t);
+        }
+        assert_eq!(g.guessing_at(ip(1), "al", t), None, "nine failures: it may still try");
+        g.guessed_at(ip(1), "al", t);
+        let wait = g.guessing_at(ip(1), "al", t).expect("ten failures: refused");
+        assert!((1..=60).contains(&wait), "the wait is at most a minute, was {wait}");
+    }
+
+    #[test]
+    fn another_user_or_address_is_free() {
+        let (g, t) = (Guesses::default(), Instant::now());
+        for _ in 0..10 {
+            g.guessed_at(ip(1), "al", t);
+        }
+        assert_eq!(g.guessing_at(ip(1), "bo", t), None, "another user from the same address");
+        assert_eq!(g.guessing_at(ip(2), "al", t), None, "the same user from another address");
+    }
+
+    #[test]
+    fn old_failures_expire() {
+        let (g, t) = (Guesses::default(), Instant::now());
+        for _ in 0..10 {
+            g.guessed_at(ip(1), "al", t);
+        }
+        assert!(g.guessing_at(ip(1), "al", t + Duration::from_secs(59)).is_some(), "a minute not yet over");
+        assert_eq!(g.guessing_at(ip(1), "al", t + Duration::from_secs(61)), None, "a minute over: free again");
+    }
+
+    #[test]
+    fn a_door_that_cannot_tell_the_address_counts_under_zero() {
+        let (g, t) = (Guesses::default(), Instant::now());
+        for _ in 0..10 {
+            g.guessed_at(None, "al", t);
+        }
+        assert!(g.guessing_at(None, "al", t).is_some());
+        assert!(g.guessing_at(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), "al", t).is_some());
+    }
+
+    #[test]
+    fn the_pairs_held_are_at_most_ten_thousand() {
+        let (g, t) = (Guesses::default(), Instant::now());
+        for i in 0..PAIRS + 5 {
+            g.guessed_at(ip(1), &format!("u{i}"), t + Duration::from_millis(i as u64));
+        }
+        let all = g.failures.lock().unwrap();
+        assert_eq!(all.len(), PAIRS);
+        assert!(!all.contains_key(&Guesses::key(ip(1), "u0")), "the oldest pair went");
+    }
 }

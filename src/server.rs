@@ -325,8 +325,8 @@ async fn list_pythons(Query(q): Query<HashMap<String, String>>, role: axum::Exte
 
 /// `PUT /python` `{"path": …}`: run workers with that Python from now on (and next time: kept on
 /// this machine). From a page on this machine only, an admin's.
-async fn choose_python(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, .. }): axum::extract::ConnectInfo<crate::tls::Peer>, role: axum::Extension<crate::auth::Role>, Json(b): Json<Value>) -> Result<Json<Value>, E> {
-    if *role < crate::auth::Role::Admin || !from.ip().is_loopback() {
+async fn choose_python(axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, headers: axum::http::HeaderMap, role: axum::Extension<crate::auth::Role>, Json(b): Json<Value>) -> Result<Json<Value>, E> {
+    if *role < crate::auth::Role::Admin || !peer.from_here(&headers) {
         return Err(E(crate::codes::coded("42501", "which Python runs is chosen by an admin, on this machine")));
     }
     Ok(Json(crate::python::choose(b["path"].as_str().unwrap_or_default()).await?))
@@ -367,6 +367,9 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         if !peer.allowed() {
             return (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response(); // (`tls.rs`)
         }
+        if header.as_deref().is_some_and(|h| h.starts_with("Basic ")) && !peer.may_send_password() {
+            return (StatusCode::FORBIDDEN, crate::tls::PASSWORD_PLAIN).into_response(); // (under PONDRA_TLS=optional: a token may cross, a password never)
+        }
         if header.as_deref().is_some_and(|h| h.starts_with("Bearer pn_")) && !peer.may_be_node() {
             return (StatusCode::UNAUTHORIZED, "the nodes' key is taken only with a certificate the nodes' authority signed (PONDRA_TLS_CA)").into_response();
         }
@@ -396,6 +399,18 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     if starting && needed > crate::auth::Role::None && !node {
         let _ = app.lake.caught_up().await; // (a node that just started signs users in from what its leader had: `open`)
     }
+    // (a sign-in with a user's name and password is counted per address and name: past ten failures a minute
+    // that pair is refused at once, the right password too; a bearer token isn't counted: `auth::guessing`)
+    let client = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().map(|c| c.0.client(req.headers()));
+    let basic_by = header.as_deref().filter(|h| h.starts_with("Basic ")).map(|h| (basic_user(Some(h)), client));
+    if let Some((name, ip)) = &basic_by {
+        if let Some(wait) = crate::auth::guessing(*ip, name) {
+            let why = guessing_says(name, wait);
+            crate::audit::refused(&app, name, "http", from, &format!("{} {}", req.method(), req.uri().path()), &why);
+            tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does: refused at once, guesses would cost nothing)
+            return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
+        }
+    }
     let signed = match &header {
         Some(h) => crate::users::who(&app.lake, &app.auth, Some(h)).await,
         None => None,
@@ -409,6 +424,9 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             None => crate::auth::Principal::of(crate::auth::Role::Admin),
         },
         None if header.is_some() => {
+            if let Some((name, ip)) = &basic_by {
+                crate::auth::guessed(*ip, name);
+            }
             crate::audit::refused(&app, &basic_user(header.as_deref()), "http", from, &format!("{} {}", req.method(), req.uri().path()), "wrong token, or user name and password");
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
             return (StatusCode::UNAUTHORIZED, "wrong token, or user name and password").into_response();
@@ -421,6 +439,8 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let cloning = pin && who.access.as_ref().is_some_and(|a| a.clones().is_some());
     if who.role < needed && !cloning {
         return match who.role {
+            crate::auth::Role::None if header.is_none() && app.auth.owned() => (StatusCode::UNAUTHORIZED, "this node answers only the program that started it (the shell, local()): open the console from the link it printed, or start the node with --admin-token to connect other tools").into_response(),
+            crate::auth::Role::None if header.is_none() && !app.auth.on() && crate::users::signed(&app.lake).await => (StatusCode::UNAUTHORIZED, "this lake has been served with tokens: start the node with them (--admin-token, --write-token, --read-token), or sign in as a user").into_response(),
             crate::auth::Role::None => (StatusCode::UNAUTHORIZED, "sign in: a token, or a user's name and password").into_response(),
             _ => {
                 let why = match pin {
@@ -470,12 +490,26 @@ fn basic_user(header: Option<&str>) -> String {
     b.and_then(|b| String::from_utf8(b).ok()).and_then(|up| up.split_once(':').map(|(u, _)| u.to_string())).unwrap_or_default()
 }
 
+/// What a sign-in refused for its failures is told, with how long to wait (`auth::guessing`).
+fn guessing_says(user: &str, wait: u64) -> String { format!("too many failed sign-ins for {user} from this address: wait {wait} s") }
+
 /// `POST /login` `{"user", "password"}`: a session (`{"token": "ps_…", "until": ms}`) to send as
 /// `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`); the console's sign-in.
-async fn login(State(app): State<App>, body: Bytes) -> Response {
+async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let b: Value = serde_json::from_slice(&body).unwrap_or_default(); // (JSON, whatever its content type says)
     let (user, password) = (b["user"].as_str().unwrap_or_default(), b["password"].as_str().unwrap_or_default());
+    if !peer.may_send_password() {
+        return (StatusCode::FORBIDDEN, crate::tls::PASSWORD_PLAIN).into_response(); // (`tls.rs`)
+    }
+    let ip = Some(peer.client(&headers));
+    if let Some(wait) = crate::auth::guessing(ip, user) {
+        let why = guessing_says(user, wait);
+        crate::audit::refused(&app, user, "http", Some(peer.addr), "sign in", &why);
+        tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does)
+        return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
+    }
     if !crate::users::password_ok(&app.lake, user, password).await {
+        crate::auth::guessed(ip, user);
         crate::audit::refused(&app, user, "http", crate::auth::current().and_then(|p| p.from), "sign in", "wrong user name or password");
         tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
         return (StatusCode::UNAUTHORIZED, "wrong user name or password").into_response();
@@ -502,13 +536,17 @@ impl App {
     /// Does nothing need a sign-in here? (No token set, no user who signs in, and the node listens on
     /// this machine only. A node on the network is never open: its leader made the lake's first user
     /// before it served (`users::first_user`), and a follower of a lake with none yet refuses everyone
-    /// until one has a token (`pondra token`). A node that just started asks once it holds what its
-    /// leader had: a mirror seeded before the first user was flushed knows of none.)
+    /// until one has a token (`pondra token`). Nor is a node a program started for itself (`owned`):
+    /// it answers only that program, a token or a user. A node that just started asks once it holds
+    /// what its leader had: a mirror seeded before the first user was flushed knows of none.)
     pub async fn open(&self) -> bool {
-        if self.auth.on() || self.auth.network() {
+        if self.auth.on() || self.auth.network() || self.auth.owned() {
             return false;
         }
         let _ = self.lake.caught_up().await; // (still catching up after 10 s: its own catalog decides)
+        if crate::users::signed(&self.lake).await {
+            return false; // (served with tokens once: a node started without them answers no one, `users::signed`)
+        }
         !crate::users::any(&self.lake).await
     }
 }
@@ -1746,6 +1784,7 @@ async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<V
     // Background jobs that failed, by kind: a rising count is a stall (tiering, publishing, …) that
     // otherwise shows only on this node's stderr.
     s["background_failures"] = j!(crate::metrics::failures().into_iter().filter(|(_, n)| *n > 0).collect::<std::collections::BTreeMap<_, _>>());
+    s["signed"] = j!(crate::users::signed(&app.lake).await); // (served with tokens once: a node without them answers no one unsigned)
     if c.is_leader() {
         s["releases"] = j!(c.releases()); // (each live node's: a rolling upgrade's progress)
     }

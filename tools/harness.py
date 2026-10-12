@@ -256,8 +256,11 @@ def external():
     lake, here, owner = new_lake(), tempfile.mkdtemp(prefix="pondra-ext-"), uuid.uuid4().hex
     tier = os.path.join(here, "tier")
     node = Node(lake, A.port, env={"PONDRA_OWNER_KEY": owner}, cwd=here, **({"cache_dir": tier} if A.s3 else {})).start()
+    # A node on the same lake that no program started for itself: a non-owner's requests go to it.
+    other = Node(lake, A.port + 2, env={"PONDRA_OWNER_KEY": ""}, cwd=here, **({"cache_dir": tier + "3"} if A.s3 else {})).start()
+    hdr = {"x-pondra-owner": owner}  # (the node answers only its program: its requests carry this)
     def q(s):
-        return call(A.port, "POST", "/sql", s.encode(), headers={"x-pondra-owner": owner})
+        return call(A.port, "POST", "/sql", s.encode(), headers=hdr)
     def err(s):
         try:
             q(s)
@@ -301,7 +304,7 @@ def external():
             "gzip": err("CREATE EXTERNAL TABLE b2 STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.compression' 'gzip')"), "none": err("CREATE EXTERNAL TABLE b3 STORED AS CSV LOCATION 'nothing.csv'"),
             "temp": err("CREATE TEMPORARY EXTERNAL TABLE b4 STORED AS CSV LOCATION 'a.csv'"), "option": err("CREATE EXTERNAL TABLE b5 STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.null_regex' 'x')"),
             "view": (q("CREATE VIEW v AS SELECT 1 AS a"), err("INSERT INTO v VALUES (2)"))[1],
-            "not owner": _raises_text(lambda: call(A.port, "POST", "/sql", b"CREATE EXTERNAL TABLE z STORED AS PARQUET LOCATION 'dir/'"))}
+            "not owner": _raises_text(lambda: call(other.port, "POST", "/sql", b"CREATE EXTERNAL TABLE z STORED AS PARQUET LOCATION 'dir/'"))}
     checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
         "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no files" in said["none"] \
         and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "through a node it started itself" in said["not owner"]
@@ -314,34 +317,34 @@ def external():
     q("DETACH wh")
     # The lake's own files (PUT /files/…) are the lake's: whoever reads the lake reads them as a
     # table too, and nothing else of its folder (ADR-032); /objects says what each object is.
-    call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n1,x\n")
-    area = call(A.port, "GET", "/objects")["files"]
-    anyone = lambda s: call(A.port, "POST", "/sql", s.encode())
-    mine = anyone(f"SELECT * FROM read_csv('{area}reports/q1.csv')")
+    call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n1,x\n", headers=hdr)
+    area = call(A.port, "GET", "/objects", headers=hdr)["files"]
+    anyone = lambda s: call(other.port, "POST", "/sql", s.encode())  # (a non-owner's request: to the node no program started)
+    mine = q(f"SELECT * FROM read_csv('{area}reports/q1.csv')")
     outside = [_raises_text(lambda: anyone(f"SELECT * FROM read_csv('{area}../catalog/x.csv')")), _raises_text(lambda: anyone(f"SELECT * FROM read_csv('{area[:-len('files/')]}other.csv')"))]
-    kinds = {o["name"]: o["kind"] for o in call(A.port, "GET", "/objects")["objects"]}
+    kinds = {o["name"]: o["kind"] for o in call(A.port, "GET", "/objects", headers=hdr)["objects"]}
     q("CREATE TABLE kinds_t (a BIGINT)"); q("CREATE MATERIALIZED VIEW mv_kinds AS SELECT a, count(*) AS n FROM kinds_t GROUP BY a")
-    listed = {r["name"]: r["kind"] for r in call(A.port, "POST", "/sql", b"SELECT name, kind FROM pondra.tables")}
-    shown = [r["name"] for r in call(A.port, "POST", "/sql", b"SHOW MATERIALIZED VIEWS")]
+    listed = {r["name"]: r["kind"] for r in q("SELECT name, kind FROM pondra.tables")}
+    shown = [r["name"] for r in q("SHOW MATERIALIZED VIEWS")]
     q("DROP MATERIALIZED VIEW mv_kinds"); q("DROP TABLE kinds_t")
     checks["the lake's own files read as a table by any reader, and nothing else of its folder; /objects and pondra.tables say each object's kind (a materialized view's too)"] = mine == [{"a": 1, "b": "x"}] \
         and all(("through a node it started itself" if not A.s3 else "no secret covers") in e for e in outside) and kinds.get("ev") == "files" and kinds.get("v") == "view" \
         and listed.get("ev") == "external table" and listed.get("v") == "view" and listed.get("mv_kinds") == "materialized view" and shown == ["mv_kinds"]
     reader = Node(lake, A.port + 1, reader=True, cwd=here, **({"cache_dir": tier + "2"} if A.s3 else {})).start()
-    count = lambda port: call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_csv('{area}reports/q1.csv')".encode())[0]["n"]
-    etag = lambda: urllib.request.urlopen(f"http://127.0.0.1:{A.port}/files/reports/q1.csv").headers["etag"]
+    count = lambda port: call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_csv('{area}reports/q1.csv')".encode(), headers=hdr)[0]["n"]
+    etag = lambda: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/files/reports/q1.csv", headers=hdr)).headers["etag"]
     before, v1 = (count(A.port), count(A.port + 1)), etag()
-    blind = _raises_text(lambda: call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n9,z\n"))
-    put = call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n1,x\n2,y\n3,z\n", headers={"if-match": v1})
-    stale = _raises_text(lambda: call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n7,q\n", headers={"if-match": v1}))
+    blind = _raises_text(lambda: call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n9,z\n", headers=hdr))
+    put = call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n1,x\n2,y\n3,z\n", headers={**hdr, "if-match": v1})
+    stale = _raises_text(lambda: call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n7,q\n", headers={**hdr, "if-match": v1}))
     after = until(lambda: (count(A.port), count(A.port + 1)), (3, 3))
     checks["a lake's file is replaced by its version (If-Match); without one, or with an old one, refused (409, 412); both nodes read the new rows"] = \
         before == (1, 1) and "409" in blind and "412" in stale and put.get("version") == etag().strip('"') and after == (3, 3) \
-        and call(A.port, "GET", "/files/reports/q1.csv") == b"a,b\n1,x\n2,y\n3,z\n"
-    call(A.port, "PUT", "/files/tmp/x.txt", b"bye")
-    gone = call(A.port, "DELETE", "/files/tmp/x.txt")
-    checks["a lake's file is deleted (and is gone from files())"] = gone == {"removed": "files/tmp/x.txt"} and "404" in _raises_text(lambda: call(A.port, "GET", "/files/tmp/x.txt")) \
-        and not call(A.port, "POST", "/sql", b"SELECT path FROM files('tmp/')")
+        and call(A.port, "GET", "/files/reports/q1.csv", headers=hdr) == b"a,b\n1,x\n2,y\n3,z\n"
+    call(A.port, "PUT", "/files/tmp/x.txt", b"bye", headers=hdr)
+    gone = call(A.port, "DELETE", "/files/tmp/x.txt", headers=hdr)
+    checks["a lake's file is deleted (and is gone from files())"] = gone == {"removed": "files/tmp/x.txt"} and "404" in _raises_text(lambda: call(A.port, "GET", "/files/tmp/x.txt", headers=hdr)) \
+        and not q("SELECT path FROM files('tmp/')")
     if A.s3:  # (the SSD tier: a lake on object storage; a table's files are kept there, as they never change)
         kept = lambda: [os.path.relpath(os.path.join(d, f), t) for t in (tier, tier + "2") for d, _, fs in os.walk(t) for f in fs]
         q("CREATE TABLE tiered AS SELECT 1 AS a")
@@ -349,6 +352,7 @@ def external():
         checks["the lake's files are never kept in the SSD tier (they change in place; a table's files, kept there, never do)"] = any(not k.startswith("files") for k in kept()) \
             and not any(k.startswith("files" + os.sep) or (os.sep + "files" + os.sep) in k for k in kept())
     reader.kill()
+    other.kill()
     node.kill()
     shutil.rmtree(here, ignore_errors=True)
     ok = all(checks.values())
@@ -491,15 +495,18 @@ def loads():
     sn = Node(s3lake, A.port + 10, env=s3env).start()
     sq = lambda s: call(A.port + 10, "POST", "/sql", s.encode(), headers={"x-pondra-owner": owner_key})
     sq("CREATE TABLE s3orders (id BIGINT, amount BIGINT)")
+    # A node on the same lake that no program started for itself: a non-owner's request goes to it.
+    other = Node(s3lake, A.port + 11, env={**s3env, "PONDRA_OWNER_KEY": ""}, cache_dir=os.path.join(d, "tier-other")).start()
     no_secret = ""
     try:
-        call(A.port + 10, "POST", "/sql", f"COPY INTO s3orders FROM 's3://loads/in/' (FORMAT csv, HEADER true)".encode())
+        call(other.port, "POST", "/sql", f"COPY INTO s3orders FROM 's3://loads/in/' (FORMAT csv, HEADER true)".encode())
     except RuntimeError as e:
         no_secret = str(e)
     checks["11a. files on S3 with no covering secret: refused (ext::check's text)"] = "no secret covers s3://loads" in no_secret
     sq("CREATE SECRET loads_s3 (TYPE s3, KEY_ID 'k', SECRET 's', ENDPOINT 'http://127.0.0.1:%d', SCOPE 's3://loads')" % s3p)
     loaded = sq("COPY INTO s3orders FROM 's3://loads/in/' (FORMAT csv, HEADER true)")
     checks["11b. with the secret: the files load, once"] = loaded["rows"] == 2 and sq("SELECT count(*) AS n FROM s3orders") == [{"n": 2}] and sq("COPY INTO s3orders FROM 's3://loads/in/' (FORMAT csv, HEADER true)")["rows"] == 0
+    other.kill()
     sn.kill()
     # Check 7's second half: a user without SELECT on orders gets none of its loads (or a refusal by
     # name); granted SELECT, it lists them
@@ -610,15 +617,22 @@ def outside():
     env = {"PONDRA_SECRET_KEY": "one key for the cluster", "PONDRA_OWNER_KEY": owner_key, "AWS_ENDPOINT": f"http://127.0.0.1:{s3p}",
            "AWS_ACCESS_KEY_ID": "k", "AWS_SECRET_ACCESS_KEY": "s", "AWS_REGION": "us-east-1", "AWS_ALLOW_HTTP": "true"}  # (the owner's own credentials)
     pgp = A.port + 52
-    nodes = [Node(lake, A.port + i, env={**env, "PONDRA_SPREAD_MB": "0"} if i == 0 else env, **({"pg": f"127.0.0.1:{pgp}"} if i == 1 else {})).start() for i in range(3)]  # (node 0 spreads a COPY of these few files)
+    # (the nodes share one admin token, as a cluster does: the node the last checks start carries another key and calls them with it,
+    # and an owned node answers only its program, a token or a user; node 1 has a reader's token, for the spread checks)
+    nodes = [Node(lake, A.port + i, env={**env, "PONDRA_SPREAD_MB": "0"} if i == 0 else env, admin_token="a", **({"pg": f"127.0.0.1:{pgp}", "read_token": "rtok"} if i == 1 else {})).start() for i in range(3)]  # (node 0 spreads a COPY of these few files)
+    # (a non-owner's requests carry the cluster's admin token: an admin, but not the program that started the node)
+    signed, admin = {"x-pondra-owner": owner_key}, {"authorization": "Bearer a"}
 
-    def q(s, i=0, owner=False, spread=None):
+    def q(s, i=0, owner=True, spread=None):  # (the owner's calls: the owned nodes answer only their program, so they carry its key)
         path = "/sql" + (f"?spread={spread}" if spread is not None else "")
-        return call(A.port + i, "POST", path, s.encode(), headers={"x-pondra-owner": owner_key} if owner else {})
+        return call(A.port + i, "POST", path, s.encode(), headers=signed if owner else {})
 
-    def refused(s, i=0, owner=False):
+    def refused(s, i=0, owner=False):  # (a non-owner's request, as the cluster's admin; `owner=True` sends the program's key instead)
         try:
-            q(s, i, owner)
+            if owner:
+                q(s, i, True)
+            else:
+                call(A.port + i, "POST", "/sql", s.encode(), headers=admin)
             return ""
         except RuntimeError as e:
             return str(e)
@@ -637,7 +651,7 @@ def outside():
     checks["CREATE SECRET: listed by secrets() without its values, sealed in the catalog"] = sealed and q("SELECT * FROM secrets() ORDER BY name", 1) == [
         {"name": "ext_s3", "type": "s3", "scope": "s3://ext"}, {"name": "web", "type": "http", "scope": "http://127.0.0.1:%d" % webp}]
     checks["one secret a bucket: another scope in it, or the same one, refused"] = all("a bucket is read with one secret" in refused(
-        f"CREATE SECRET s{i} (TYPE s3, KEY_ID 'x', SECRET 'y', SCOPE '{s}')") for i, s in enumerate(["s3://ext/sales", "s3://ext"]))
+        f"CREATE SECRET s{i} (TYPE s3, KEY_ID 'x', SECRET 'y', SCOPE '{s}')", owner=True) for i, s in enumerate(["s3://ext/sales", "s3://ext"]))
     checks["a Parquet glob, a folder, a list of files == pyarrow"] = (q(by_region, 1) == want and q(by_region.replace(glob, "read_parquet('s3://ext/sales/2026/')"), 2) == want
         and q(f"SELECT count(*) AS n FROM read_parquet(['s3://ext/sales/2026/part-0.parquet', 's3://ext/sales/2026/part-3.parquet'])") == [{"n": 4000}]
         and q(f"SELECT count(*) AS n, count(note) AS notes FROM {glob}") == [{"n": len(sales), "notes": sum(r["note"] is not None for r in sales)}])
@@ -648,17 +662,19 @@ def outside():
         and q("SELECT count(*) AS n FROM read_parquet('s3://ext/hive/**/*.parquet', hive_partitioning => true) WHERE day = '2026-01-02'") == [{"n": 3}]
         and q("SELECT count(*) AS n FROM read_parquet('s3://ext/hive_null/') WHERE k IS NULL") == [{"n": 2}] and q("SELECT count(*) AS n FROM read_parquet('s3://ext/hive_null/') WHERE k = 'x'") == [{"n": 3}]
         and q("SELECT count(k) AS n, count(*) AS rows FROM read_parquet('s3://ext/hive_null/')") == [{"n": 3, "rows": 5}])
-    before = metrics_of(A.port)
+    before = metrics_of(A.port, signed)
     march = q(f"SELECT count(*) AS n FROM {glob} WHERE day >= '2026-03-01' AND day < '2026-04-01'", spread=0)
-    after = metrics_of(A.port)
+    after = metrics_of(A.port, signed)
     checks["a filter skips files by their footers' ranges"] = march == [{"n": 2000}] and after["pondra_files_skipped_total"] - before["pondra_files_skipped_total"] == 3
-    spread = metrics_of(A.port + 1)["pondra_spread_queries_total"]
+    spread = metrics_of(A.port + 1, signed)["pondra_spread_queries_total"]
     q("CREATE TABLE eu AS SELECT * FROM %s WHERE region = 'eu'" % glob)
     joined = f"SELECT e.region, count(*) AS n, sum(l.amount) AS s FROM {glob} e JOIN eu l ON e.id = l.id GROUP BY e.region"
-    while len(call(A.port + 1, "GET", "/stats").get("nodes", ())) < 3:
-        time.sleep(0.1)  # (node 1 has heard of the others)
-    checks["spread over three nodes == one node, and joined with a lake table"] = (q(by_region, 1, spread=1) == want and q(joined, 1, spread=1) == q(joined, 1, spread=0)
-        and metrics_of(A.port + 1)["pondra_spread_queries_total"] - spread == 2)
+    until(lambda: len(call(A.port + 1, "GET", "/stats", headers=admin).get("nodes", ())), 3, 30)  # (node 1 has heard of the others: /stats names them to a signed-in caller)
+    # A program's own requests run on their node alone (`run_sql`: files), so the spread is asked with a reader's token.
+    reader_hdr = {"authorization": "Bearer rtok"}
+    spread_as_reader = lambda s, spread: call(A.port + 1, "POST", f"/sql?spread={spread}", s.encode(), headers=reader_hdr)
+    checks["spread over three nodes == one node, and joined with a lake table"] = (spread_as_reader(by_region, 1) == want and spread_as_reader(joined, 1) == spread_as_reader(joined, 0)
+        and metrics_of(A.port + 1, signed)["pondra_spread_queries_total"] - spread == 2)
     q("INSERT INTO eu SELECT * FROM %s WHERE region = 'eu' AND id < 100" % glob)
     eu = [r for r in sales if r["region"] == "eu"]
     checks["CREATE TABLE … AS and INSERT … SELECT from files"] = q("SELECT count(*) AS n FROM eu") == [{"n": len(eu) + sum(1 for r in eu if r["id"] < 100)}]
@@ -674,7 +690,7 @@ def outside():
     put("drop/x/1.parquet", parquet(pa.table({"x": [7, 8, 9]})))  # (as big as it was: its bytes were read, and kept by their version)
     checks["a file changed under its name, or one more in a folder: the next query, at once, reads them as they are now"] = (before == [{"s": 13}] and q(total) == [{"s": 50}]
         and small == [{"n": 3, "m": 3, "s": 6}] and more == [{"n": 5003, "m": 4999, "s": 12497506}] and _try(lambda: q(xs, 1)) == [{"n": 5003, "m": 4999, "s": 12497524}])
-    checks["refused by name: an unknown option, a compressed file, an unknown format"] = all(w in refused(s) for s, w in [
+    checks["refused by name: an unknown option, a compressed file, an unknown format"] = all(w in refused(s, owner=True) for s, w in [
         ("SELECT * FROM read_csv('s3://ext/drop/orders.csv', bogus => 1)", "no option bogus"), ("SELECT * FROM 's3://ext/x.csv.gz'", "compressed"), ("SELECT * FROM 's3://ext/x.xlsx'", "which format")])
     # COPY … TO: files out, in each format, read back by pyarrow and by Pondra.
     got = lambda key: s3.get_object(Bucket="ext", Key=key)["Body"].read()
@@ -691,7 +707,7 @@ def outside():
     q("CREATE TABLE spread_me (id BIGINT, amount BIGINT)")
     for i in range(3):
         q(f"INSERT INTO spread_me SELECT id, amount FROM {glob} WHERE id % 3 = {i}", 1)  # (from one node: a file each, not merged away)
-        call(A.port, "POST", "/tier", timeout=600)
+        call(A.port, "POST", "/tier", timeout=600, headers={"x-pondra-owner": owner_key})
     q("INSERT INTO spread_me VALUES " + ", ".join(f"({i}, {i})" for i in range(10)))  # (in the log only, for now)
     copied = q("COPY spread_me TO 's3://ext/out/lake/' (FORMAT parquet)")
     lake_rows = [{"n": len(sales) + 10, "s": sum(r["amount"] for r in sales) + sum(range(10))}]
@@ -708,10 +724,6 @@ def outside():
         and [json.loads(l) for l in got("out/events.json").decode().splitlines()] == [{"k": "a", "v": 1}, {"k": "b", "v": 2}, {"k": "a", "v": 3}])
     q("COPY (SELECT 1 AS a) TO 's3://ext/out/eu.parquet'")
     checks["…a file there already is replaced"] = pq.read_table(io.BytesIO(got("out/eu.parquet"))).to_pylist() == [{"a": 1}]
-    import psycopg
-    with psycopg.connect(f"host=127.0.0.1 port={pgp} user=u dbname=lake", autocommit=True) as c:
-        c.execute("COPY (SELECT 2 AS b) TO 's3://ext/out/pg.parquet'")
-    checks["…from the Postgres port too"] = pq.read_table(io.BytesIO(got("out/pg.parquet"))).to_pylist() == [{"b": 2}]
     mine = tempfile.mkdtemp(prefix="pondra-copy-")
     checks["…to a bucket no secret covers: refused, but the node's owner may"] = ("no secret covers" in refused("COPY eu TO 's3://elsewhere/eu.parquet'")
         and "through a node it started itself" in refused(f"COPY eu TO '{mine}/eu.parquet'")
@@ -731,7 +743,14 @@ def outside():
     checks["a node with another key can't open the secret, and says why"] = "same PONDRA_SECRET_KEY" in refused_as(by_region, "r")
     other.kill()
     q("DROP SECRET ext_s3")
+    until(lambda: call(A.port, "POST", "/sql", b"SELECT count(*) AS n FROM secrets()", headers=admin), [{"n": 1}], 20)  # (and has let the dropped one go)
     checks["DROP SECRET: refused again"] = "no secret covers" in refused(by_region)
+    # (over Postgres as the cluster's admin, its token the password, with a secret for the bucket again: the one above is dropped)
+    import psycopg
+    q("CREATE SECRET pg_s3 (TYPE s3, KEY_ID 'k', SECRET 's', ENDPOINT 'http://127.0.0.1:%d', SCOPE 's3://ext')" % s3p)
+    with psycopg.connect(f"host=127.0.0.1 port={pgp} user=admin password=a dbname=lake", autocommit=True) as c:
+        c.execute("COPY (SELECT 2 AS b) TO 's3://ext/out/pg.parquet'")
+    checks["…from the Postgres port too"] = pq.read_table(io.BytesIO(got("out/pg.parquet"))).to_pylist() == [{"b": 2}]
     [n.kill() for n in nodes]
     sim.kill()
     server.shutdown()
@@ -998,6 +1017,7 @@ def clouds():
     key = json.dumps({"gcs_base_url": f"http://127.0.0.1:{gport}", "disable_oauth": True, "client_email": "", "private_key": "", "private_key_id": ""})
     conn = f"DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey={AZURITE_KEY};BlobEndpoint=http://127.0.0.1:{aport}/devstoreaccount1;"
     owner = uuid.uuid4().hex
+    sql = lambda port, s: call(port, "POST", "/sql", s.encode(), headers={"x-pondra-owner": owner})  # (these nodes answer their program only: its key)
     env = {"GOOGLE_SERVICE_ACCOUNT_KEY": key, "GOOGLE_ALLOW_HTTP": "true", "AZURE_STORAGE_USE_EMULATOR": "true", "AZURITE_BLOB_STORAGE_URL": f"http://127.0.0.1:{aport}", "PONDRA_OWNER_KEY": owner}
     stores = [("gcs", "gs", f"CREATE SECRET ext_gcs (TYPE gcs, SERVICE_ACCOUNT_KEY '{key}', ENDPOINT 'http://127.0.0.1:{gport}', SCOPE 'gs://ext')")]
     azurite = os.environ.get("AZURITE") or shutil.which("azurite-blob") or next(iter(glob_.glob(os.path.expanduser("~/azurite/node_modules/.bin/azurite-blob"))), None)
@@ -1022,7 +1042,7 @@ def clouds():
         sql(A.port, rows(0, 1000))
         until(lambda: sql(A.port + 1, "SELECT count(*) AS n FROM t"), [{"n": 1000}], 10)
         sql(A.port + 1, rows(1000, 2000))  # (a follower's write, sequenced by the leader)
-        call(A.port, "POST", "/tier", timeout=300)
+        call(A.port, "POST", "/tier", timeout=300, headers={"x-pondra-owner": owner})
         want = lambda n: [{"n": n, "s": n * (n - 1) // 2}]
         read = lambda port: sql(port, "SELECT count(*) AS n, sum(id) AS s FROM t")
         tiered = call(A.port, "POST", "/sql", f"SELECT count(*) AS n FROM '{lake}/data/t/*.parquet'".encode(), headers={"x-pondra-owner": owner})  # (the lake's files, as files)
@@ -3634,9 +3654,9 @@ def shuffle_checks(port):
     return out
 
 
-def metrics_of(port):
+def metrics_of(port, headers=None):
     out = {}
-    for line in call(port, "GET", "/metrics").decode().splitlines():
+    for line in call(port, "GET", "/metrics", headers=headers).decode().splitlines():
         if line and not line.startswith("#"):
             name, v = line.rsplit(" ", 1)
             out[name] = float(v)
@@ -5253,7 +5273,7 @@ def names():
     missing = [n for n in names_ if not _try(lambda n=n: works(n))]
     checks[f"every name in dataframe-api.md's table exists and runs ({len(names_)} names)"] = len(names_) > 40 and not missing
     # an answer's columns named as other engines name them, where DataFusion would refuse the query
-    cols = lambda q: [c["name"] for c in call(A.port, "POST", "/sql?format=typed&rows=1", q.encode())["columns"]]
+    cols = lambda q: [c["name"] for c in call(A.port, "POST", "/sql?format=typed&rows=1", q.encode(), headers={"x-pondra-owner": owner})["columns"]]
     named = [cols("SELECT x::int FROM t"), cols("SELECT x::int, * FROM t"), cols("SELECT id, * FROM t"), cols("SELECT id, id FROM t"), cols("SELECT CAST(x AS INT), x FROM t")]
     checks["a cast is named as its column (Postgres), or as written beside a column of that name (Snowflake, DuckDB); a column twice runs, the one named twice as id_1"] = \
         named == [["x"], ["x::INT", "id", "name", "x"], ["id_1", "id", "name", "x"], ["id", "id_1"], ["CAST(x AS INT)", "x"]]
@@ -6214,7 +6234,7 @@ def across():
     again = q(steps[0].format(t="b.t", fix="", src="", drop=""), h=h, job="across-0")
     checks["a retried job applies once"] = again.get("duplicate") is True and sql(A.port + 2, "SELECT v FROM t WHERE id = 1") == [{"v": "a!"}]
     b.kill()
-    idle = call(A.port + 1, "POST", "/sql", b"UPDATE b.t SET v = 'idle' WHERE id = 6", timeout=180)  # (once its leader's lease lapses)
+    idle = call(A.port + 1, "POST", "/sql", b"UPDATE b.t SET v = 'idle' WHERE id = 6", timeout=180, headers={"x-pondra-owner": owner})  # (once its leader's lease lapses)
     seen = until(lambda: q("SELECT v FROM b.t WHERE id = 6", A.port), [{"v": "idle"}], 30)  # (another node: once it reads that lake's catalog again)
     checks["with nobody leading that lake: this node leads it for the moment it takes"] = idle.get("updated") == 1 and seen == [{"v": "idle"}]
     [n.kill() for n in a]
@@ -8406,6 +8426,278 @@ def guarded():
     c.kill()
     ok = all(checks.values())
     print(json.dumps({"guarded": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+def owned():
+    """A node a program started for itself (the shell, local(): PONDRA_OWNER_KEY) answers only that
+    program, a token or a user (the security review's S21): another process on the machine gets 401,
+    saying why; the probes still answer; pondra sql writes to its lake with the lake's own key; the
+    folder it made is its user's alone; a superuser who isn't the program can't read this machine's
+    files."""
+    owner = uuid.uuid4().hex
+    mine = {"x-pondra-owner": owner}
+    # (a folder this test makes, empty, as the shell and local() leave one: new_lake's own is already 0700)
+    lake = os.path.join(tempfile.mkdtemp(prefix="pondra-"), "lake")
+    LAKES.append(os.path.dirname(lake))
+    os.makedirs(lake, exist_ok=True)
+    checks, info = {}, {}
+
+    def refused(f):
+        """f()'s answer, or the text of the error it raised."""
+        try:
+            return f()
+        except RuntimeError as e:
+            return str(e)
+
+    pgp = A.port + 54
+    a = Node(lake, A.port, env={"PONDRA_OWNER_KEY": owner}, pg=f"127.0.0.1:{pgp}").start()
+    b = None
+    try:
+        without = refused(lambda: call(A.port, "POST", "/sql", b"SELECT 1 AS x"))
+        info["without the key"] = without
+        checks["a request without the program's key: 401, saying the node answers only the program that started it"] = without.startswith("401") and "answers only the program" in without
+        checks["the program's own requests are answered"] = refused(lambda: call(A.port, "POST", "/sql", b"SELECT 1 AS x", headers=mine)) == [{"x": 1}]
+        probes = [refused(lambda: call(A.port, "GET", path)) for path in ("/ready", "/stats")]
+        checks["the probes still answer without it"] = not any(isinstance(p, str) for p in probes)
+        wrong = refused(lambda: call(A.port, "POST", "/sql", b"SELECT 1 AS x", headers={"x-pondra-owner": uuid.uuid4().hex}))
+        info["wrong key"] = wrong
+        checks["a wrong key: 401"] = wrong.startswith("401")
+        call(A.port, "POST", "/sql", b"CREATE TABLE t (id BIGINT)", headers=mine)
+        env = {k: v for k, v in os.environ.items() if k not in ("PONDRA_TOKEN", "PONDRA_ADMIN_TOKEN", "PONDRA_NODE_KEY", "PONDRA_OWNER_KEY")}
+        cli = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO t VALUES (7)"], capture_output=True, text=True, timeout=120, env=env)
+        count = until(lambda: refused(lambda: call(A.port, "POST", "/sql", b"SELECT count(*) AS n FROM t", headers=mine)), [{"n": 1}], 10)
+        info["pondra sql"] = {"exit": cli.returncode, "stderr": cli.stderr[-500:], "count": count}
+        checks["pondra sql writes to its lake while it runs, with the lake's own key"] = cli.returncode == 0 and count == [{"n": 1}]
+        if os.name != "nt":
+            mode = os.stat(lake).st_mode & 0o777
+            info["folder mode"] = oct(mode)
+            checks["the folder it made is its user's alone (0700)"] = mode == 0o700
+        # A superuser who is not the program can't read this machine's files: its grants aren't the program's key.
+        import base64
+        call(A.port, "POST", "/sql", b"CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER", headers=mine)
+        boss = {"Authorization": "Basic " + base64.b64encode(b"boss:boss-password-1").decode()}
+        boss_read = refused(lambda: call(A.port, "POST", "/sql", b"SELECT * FROM read_csv('/etc/hostname')", headers=boss))
+        info["a superuser's read of /etc/hostname"] = boss_read
+        checks["a superuser who is not the program is refused this machine's file, saying why"] = "through a node it started itself" in boss_read
+        checks["…and the program's own read of the same file answers"] = isinstance(refused(lambda: call(A.port, "POST", "/sql", b"SELECT * FROM read_csv('/etc/hostname')", headers=mine)), list)
+        # Its Postgres port takes the program's key as admin's password (the console's link holds it), and nothing unsigned.
+        import psycopg
+        def pg(dsn):
+            try:
+                with psycopg.connect(f"host=127.0.0.1 port={pgp} dbname=lake {dsn}", autocommit=True, connect_timeout=10) as c:
+                    return c.execute("SELECT count(*) AS n FROM t").fetchall()
+            except psycopg.Error as e:
+                return str(e)
+        pg_tries = {"the key": pg(f"user=admin password={owner}"), "nothing": pg("user=admin"), "another key": pg(f"user=admin password={uuid.uuid4().hex}"),
+                    "the key as another name's": pg(f"user=writer password={owner}")}
+        info["postgres"] = pg_tries
+        checks["its Postgres port takes the program's key as admin's password, and refuses no password, another key or another name"] = \
+            pg_tries["the key"] == [(1,)] and all(isinstance(pg_tries[k], str) for k in ("nothing", "another key", "the key as another name's"))
+        b = Node(new_lake(), A.port + 1).start()  # (no program's key: open on this machine, as before)
+        checks["a node without a program's key on 127.0.0.1 is still open"] = refused(lambda: call(A.port + 1, "POST", "/sql", b"SELECT 1 AS x")) == [{"x": 1}]
+    finally:
+        a.kill()
+        if b:
+            b.kill()
+    ok = all(checks.values())
+    print(json.dumps({"owned": checks, "ok": ok, **({} if ok else {"info": info})}, indent=1, default=str))
+    return ok
+
+
+def reply(port, method, path, body=b"", headers=None, source=None, host="127.0.0.1"):
+    """(status, headers in lower case, text): a refusal is an answer too. `source` is this machine's address
+    to call from (127.0.0.2 is this machine too, on Linux: another address for a node that counts by one);
+    `host` the address to call (this machine's own network address is not loopback, as another machine's isn't)."""
+    c = http.client.HTTPConnection(host, port, timeout=30, source_address=source)
+    c.request(method, path, body, headers or {})
+    r = c.getresponse()
+    text = r.read().decode(errors="replace")
+    return r.status, {k.lower(): v for k, v in r.getheaders()}, text
+
+
+def signed():
+    """A lake served with tokens remembers it (S26, invariant 379): its leader with a token writes z/signed
+    once. A node started by hand afterwards without the tokens answers no one unsigned, saying why (401);
+    its probes answer, and a user made where the tokens were signs in and reads. Such a node makes no
+    first user, not even on the network (an accidental node must not write to a production lake). A
+    lake no token ever reached is still open."""
+    import base64
+    P = A.port
+    token = "sekret-admin-token-1"
+    bearer = {"Authorization": f"Bearer {token}"}
+    basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    stop = lambda node: (node.p.send_signal(signal.SIGTERM), node.p.wait(timeout=120))  # (drained, and its commits durable)
+    as_json = lambda text: json.loads(text) if text[:1] in ("[", "{") else text
+    lake = new_lake()
+    checks, info = {}, {}
+    served = Node(lake, P, admin_token=token).start()
+    try:
+        setup = [reply(P, "POST", "/sql", q.encode(), headers=bearer)[0] for q in
+                 ["CREATE TABLE t (x INT)", "INSERT INTO t VALUES (1)", "CREATE USER al PASSWORD 'al-password-1'", "GRANT SELECT ON t TO al"]]
+        info["setup"] = setup
+        marked = until(lambda: json.loads(reply(P, "GET", "/stats", headers=bearer)[2]).get("signed"), True, 30)  # (the leader writes z/signed beside serving)
+        checks["a leader with a token marks the lake as served with them (/stats: signed)"] = marked is True
+    finally:
+        stop(served)
+    bare = Node(lake, P + 1).start()  # (127.0.0.1, no token: the lake was served with tokens)
+    try:
+        unsigned = reply(P + 1, "POST", "/sql", b"SELECT x FROM t")
+        ready = until(lambda: reply(P + 1, "GET", "/ready")[0], 200, 20)
+        as_al = reply(P + 1, "POST", "/sql", b"SELECT x FROM t", headers={"Authorization": basic("al", "al-password-1")})
+        info["without tokens"] = {"unsigned": [unsigned[0], unsigned[2][:200]], "ready": ready, "al": [as_al[0], as_al[2][:200]]}
+        checks["a node started without the tokens its lake was served with answers no one unsigned: 401, saying so"] = \
+            unsigned[0] == 401 and "served with tokens" in unsigned[2]
+        checks["…its probes still answer (/ready)"] = ready == 200
+        checks["…a user made where the tokens were signs in and reads the table"] = as_al[0] == 200 and as_json(as_al[2]) == [{"x": 1}]
+    finally:
+        stop(bare)
+    # On the network, with no token: the first-user step must not make pondra (a lake with users, and one without)
+    net = Node(lake, P + 2, host="0.0.0.0").start()
+    try:
+        net_unsigned = reply(P + 2, "POST", "/sql", b"SELECT x FROM t")
+        checks["…on the network with no token: still no one unsigned, and it makes no user"] = net_unsigned[0] == 401 and "served with tokens" in net_unsigned[2]
+    finally:
+        stop(net)
+    again = Node(lake, P + 3, admin_token=token).start()
+    try:
+        names = reply(P + 3, "POST", "/sql", b"SELECT name FROM pondra.users ORDER BY name", headers=bearer)
+        info["users"] = names[2][:200]
+        checks["started again with the token, the lake's users are the ones made there: no pondra"] = as_json(names[2]) == [{"name": "al"}]
+    finally:
+        again.kill()
+    open_node = Node(new_lake(), P + 4).start()  # (a lake no token reached: open on 127.0.0.1, as ever)
+    try:
+        open_ok = reply(P + 4, "POST", "/sql", b"SELECT 1 AS x")
+        checks["a lake no token ever reached is still open: an unsigned SELECT answers"] = open_ok[0] == 200 and as_json(open_ok[2]) == [{"x": 1}]
+    finally:
+        open_node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"signed": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+def guesses():
+    """A limit on failed sign-ins per address and user name (S30, invariant 381): ten wrong passwords for a
+    user from one address in a minute, and the eleventh is refused at once (429, Retry-After), the right
+    password too, on HTTP Basic and on POST /login. Another user from the same address still signs in, and
+    the same user from another address does; a bearer token isn't counted. Behind a proxy of
+    PONDRA_TRUSTED_PROXIES and behind `pondra serve --lakes`, each client is counted by its own address, and
+    only a page on this machine saves the console's settings or chooses the Python (S28)."""
+    import base64, socket
+    P = A.port
+    token = "gss-admin-token-1"
+    bearer = {"Authorization": f"Bearer {token}"}
+    basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    checks, info = {}, {}
+    a = Node(new_lake(), P, admin_token=token).start()
+    try:
+        for q in ["CREATE USER al PASSWORD 'al-password-1'", "CREATE USER bo PASSWORD 'bo-password-1'"]:
+            reply(P, "POST", "/sql", q.encode(), headers=bearer)
+        wrong = [reply(P, "GET", "/whoami", headers={"Authorization": basic("al", f"guess-{i}")})[0] for i in range(10)]
+        eleventh = reply(P, "GET", "/whoami", headers={"Authorization": basic("al", "guess-11")})
+        right = reply(P, "GET", "/whoami", headers={"Authorization": basic("al", "al-password-1")})
+        login = reply(P, "POST", "/login", json.dumps({"user": "al", "password": "al-password-1"}).encode(), headers={"Content-Type": "application/json"})
+        bo = reply(P, "GET", "/whoami", headers={"Authorization": basic("bo", "bo-password-1")})
+        # (a process here naming another address, as the lakes server does without its key: not taken)
+        named = reply(P, "GET", "/whoami", headers={"Authorization": basic("al", "al-password-1"), "x-pondra-client": "0123456789abcdef0123456789abcdef 10.9.9.9"})
+        bare = reply(P, "GET", "/whoami", headers={"Authorization": basic("al", "al-password-1"), "x-pondra-client": "10.9.9.9"})
+        forwarded = reply(P, "GET", "/whoami", headers={"Authorization": basic("al", "al-password-1"), "X-Forwarded-For": "203.0.113.10"})
+        admin = reply(P, "POST", "/sql", b"SELECT 1 AS x", headers=bearer)
+        try:  # (another address, this machine's 127.0.0.2: on Linux; elsewhere there is none to call from)
+            other = reply(P, "GET", "/whoami", headers={"Authorization": basic("al", "al-password-1")}, source=("127.0.0.2", 0))
+        except OSError as e:
+            other = f"no 127.0.0.2 here: {e}"
+        info.update({"wrong": wrong, "eleventh": [eleventh[0], eleventh[1].get("retry-after"), eleventh[2][:120]], "right": [right[0], right[2][:80]],
+                     "login": [login[0], login[2][:80]], "bo": [bo[0], bo[2][:80]], "named": [named[0], bare[0]], "forwarded": forwarded[0], "admin": admin[0], "other address": other if isinstance(other, str) else other[0]})
+        checks["ten wrong passwords for al are 401 each"] = wrong == [401] * 10
+        checks["the eleventh is 429, saying why, with Retry-After in seconds (at most a minute)"] = eleventh[0] == 429 \
+            and "too many failed sign-ins for al" in eleventh[2] and eleventh[1].get("retry-after", "").isdigit() and 1 <= int(eleventh[1]["retry-after"]) <= 60
+        checks["the right password for al is refused too, until its minute has fewer failures"] = right[0] == 429
+        checks["POST /login for al with the right password is refused too"] = login[0] == 429
+        checks["another user from the same address still signs in"] = bo[0] == 200 and '"bo"' in bo[2]
+        checks["a process here naming another address (x-pondra-client) is still counted by its own"] = named[0] == 429 and bare[0] == 429
+        checks["…and so is one sending X-Forwarded-For, with no PONDRA_TRUSTED_PROXIES"] = forwarded[0] == 429
+        checks["a bearer admin token still works"] = admin[0] == 200
+        if not isinstance(other, str):
+            checks["the same user from another address signs in"] = other[0] == 200
+    finally:
+        a.kill()
+    # Behind your own proxy (here this machine is it: PONDRA_TRUSTED_PROXIES=127.0.0.0/8), each client is counted
+    # by the address the proxy names, the last one in X-Forwarded-For, not by the proxy's.
+    b = Node(new_lake(), P + 1, admin_token=token, env={"PONDRA_TRUSTED_PROXIES": "127.0.0.0/8"}).start()
+    try:
+        reply(P + 1, "POST", "/sql", b"CREATE USER al PASSWORD 'al-password-1'", headers=bearer)
+        via = lambda hops, pw: reply(P + 1, "GET", "/whoami", headers={"Authorization": basic("al", pw), "X-Forwarded-For": hops})[0]
+        wrong_b = [via("203.0.113.9", f"guess-{i}") for i in range(10)]
+        proxied = {"wrong": wrong_b, "locked": via("203.0.113.9", "al-password-1"), "another client": via("203.0.113.10", "al-password-1"),
+                   "its own word before the proxy's": via("203.0.113.10, 203.0.113.9", "al-password-1")}
+        info["behind a trusted proxy"] = proxied
+        checks["behind a trusted proxy: ten wrong passwords from one client lock al out for that client (429)…"] = wrong_b == [401] * 10 and proxied["locked"] == 429
+        checks["…while another client behind it signs in as al"] = proxied["another client"] == 200
+        checks["…and what a client writes before its proxy's entry isn't taken"] = proxied["its own word before the proxy's"] == 429
+    finally:
+        b.kill()
+    try:
+        bad = subprocess.run([BIN, "serve", "--dir", new_lake(), "--addr", f"127.0.0.1:{P + 2}"], env={**os.environ, "PONDRA_TRUSTED_PROXIES": "lb.internal"},
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30, text=True)
+        refused = [bad.returncode, bad.stderr.strip()[-200:]]
+    except subprocess.TimeoutExpired:
+        refused = [None, "still serving after 30 s"]
+    info["a proxy named by its host name"] = refused
+    checks["PONDRA_TRUSTED_PROXIES with a host name: refused at start, naming it"] = refused[0] not in (0, None) and "PONDRA_TRUSTED_PROXIES" in refused[1] and "lb.internal" in refused[1]
+    if isinstance(other, str):
+        ok = all(checks.values())
+        print(json.dumps({"guesses": checks, "ok": ok, "info": info}, indent=1, default=str))
+        return ok
+    # Through `pondra serve --lakes`: a database's node sees only the server, on this machine, so the server
+    # names each client's address (x-pondra-client); counted by the server's address, ten wrong passwords
+    # from anyone would lock the user out for everyone.
+    folder, lp = new_lake(), P + 20
+    def network_address():  # (this machine's address on its network, if it has one: a page from it isn't this machine's loopback)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+            try:
+                u.connect(("10.255.255.255", 1))
+                ip = u.getsockname()[0]
+            except OSError:
+                return None
+        return None if ip.startswith("127.") else ip
+    net = network_address()
+    config = tempfile.mkdtemp(prefix="pondra-guesses-config-")  # (the console's settings saved here, not in the machine's)
+    with open(f"/tmp/pondra-{lp}-guesses.stderr", "w") as log:
+        srv = subprocess.Popen([BIN, "serve", "--lakes", folder, "--addr", f"{'0.0.0.0' if net else '127.0.0.1'}:{lp}", "--admin-token", token],
+                               stdout=subprocess.DEVNULL, stderr=log, env={**os.environ, "PONDRA_CONFIG_DIR": config})
+    try:
+        def make():
+            try:
+                return reply(lp, "POST", "/sql", b"CREATE USER cy PASSWORD 'cy-password-1'", headers=bearer)[0]
+            except OSError:
+                return None  # (the server not up yet)
+        made = until(make, 200, 60)
+        wrong = [reply(lp, "GET", "/whoami", headers={"Authorization": basic("cy", f"guess-{i}")})[0] for i in range(10)]
+        here = reply(lp, "GET", "/whoami", headers={"Authorization": basic("cy", "cy-password-1")})[0]
+        there = reply(lp, "GET", "/whoami", headers={"Authorization": basic("cy", "cy-password-1")}, source=("127.0.0.2", 0))[0]
+        said = reply(lp, "GET", "/whoami", headers={"Authorization": basic("cy", "cy-password-1"), "x-pondra-client": "anything 10.9.9.9"})[0]
+        info["lakes server"] = {"made": made, "wrong": wrong, "here": here, "there": there, "said": said}
+        if net:  # (S28: a database's node behind the server sees only this machine, so the server's word decides what a page here is)
+            json_admin = {**bearer, "Content-Type": "application/json"}
+            saved = reply(lp, "PUT", "/db/lake/console/settings", b'{"theme": "dark"}', headers=json_admin)[0]
+            saved_there = reply(lp, "PUT", "/db/lake/console/settings", b'{"theme": "light"}', headers=json_admin, host=net)
+            python_there = reply(lp, "PUT", "/db/lake/python", json.dumps({"path": sys.executable}).encode(), headers=json_admin, host=net)
+            info["lakes server"].update({"network address": net, "settings saved here": saved, "settings from the network address": saved_there[:3:2],
+                                         "python from the network address": python_there[:3:2]})
+            checks["through pondra serve --lakes: a page here saves the console's settings, a page from another address doesn't, nor chooses the Python (S28)"] = \
+                saved == 204 and saved_there[0] == 403 and python_there[0] != 200 and "on this machine" in python_there[2]
+        checks["through pondra serve --lakes: ten wrong passwords for cy from one address, and the right one is refused from it (429)…"] = \
+            made == 200 and wrong == [401] * 10 and here == 429
+        checks["…while from another address cy signs in: the server names each client's address to its databases' nodes"] = there == 200
+        checks["…and what a client says of its own address goes no further than the server"] = said == 429
+    finally:
+        srv.send_signal(signal.SIGTERM)
+        srv.wait(timeout=60)
+        shutil.rmtree(config, ignore_errors=True)
+    ok = all(checks.values())
+    print(json.dumps({"guesses": checks, "ok": ok, "info": info}, indent=1, default=str))
     return ok
 
 
@@ -12648,7 +12940,7 @@ def answers_big():
 # About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
 # prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
 # suite in parts side by side that end together. A section not listed counts as 5 s.
-SECS = {"memory": 255, "cursors": 15, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
+SECS = {"memory": 255, "cursors": 15, "owned": 20, "signed": 20, "guesses": 15, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
         "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "ddlgaps": 40, "sqla": 30, "unique_doors": 60}
@@ -12656,7 +12948,7 @@ SECS = {"memory": 255, "cursors": 15, "stopped": 78, "clouds": 66, "functions": 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, versions, stopped, flows, begin, doors, cursors, objects, registry, find, sequences, constraints, ddlgaps, sqla, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, objects, registry, find, sequences, constraints, ddlgaps, sqla, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -12688,7 +12980,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "cursors", "objects", "registry", "find", "sequences", "constraints", "ddlgaps", "sqla", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "objects", "registry", "find", "sequences", "constraints", "ddlgaps", "sqla", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -12701,7 +12993,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
