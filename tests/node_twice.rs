@@ -112,12 +112,16 @@ fn run() {
         assert_eq!(at.one("SELECT count(*) AS n FROM t", Some(ANN)).await, 3, "ann reads t on A");
         assert!(at.sql("SELECT 1 AS one", None).await.is_err(), "A has users: nobody unsigned");
         assert!(at.in_history("INSERT INTO t", Some(BOSS)).await > 0, "A's history has its INSERT");
-        assert!(at.metric("queries_total", Some(BOSS)).await > 0.0);
+        let queries_of_a = at.metric("queries_total", Some(BOSS)).await;
+        assert!(queries_of_a > 1.0, "A counted its queries: {queries_of_a}");
         node.stop().await;
 
         // Lake B, on the same port (A's door is closed): nothing of A.
         let node = Node::open(Options::local(&b, &addr)).await.expect("lake B, on A's port");
-        assert_eq!(at.metric("queries_total", None).await, 0.0, "B's counters start at 0");
+        // (B's start asks pondra.runs once for runs its address left running, `runs::mark_stopped`,
+        // which counts as a query here, as soon as it has run: 0 or 1, never A's)
+        let queries_of_b = at.metric("queries_total", None).await;
+        assert!(queries_of_b <= 1.0, "B's counters start at 0: {queries_of_b} queries (A ran {queries_of_a})");
         assert_eq!(at.metric("rows_in_total", None).await, 0.0, "B's counters start at 0");
         assert_eq!(at.metric("hot_bytes", None).await, 0.0, "B holds none of A's columns in memory");
         assert!(at.sql("SELECT 1 AS one", None).await.is_ok(), "B has no users: open to the machine, as a new lake is");
