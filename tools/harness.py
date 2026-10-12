@@ -11053,7 +11053,7 @@ def unique_doors():
             info["race"] = {"batches": len(flat), "went": len(went), "refused": len(refused), "codes": sorted({str(c) for _, s, c, _ in flat if s != 200}),
                             "rows": len(present), "counts": counts}
             checks["three nodes appending at once, 200 batches each, a third of the ids shared: every id in the table once, every refused batch 23505 and out whole, every batch that went in all there"] = \
-                all(s in (200, 500) for _, s, _, _ in flat) and all(c in (None, "23505") for _, _, c, _ in flat) and len(refused) > 0 and \
+                all(s in (200, 409) for _, s, _, _ in flat) and all(c in (None, "23505") for _, _, c, _ in flat) and len(refused) > 0 and \
                 not any(v > 1 for v in Counter(present).values()) and set(present) == ok_ids and len(present) == 10 * len(went) and not own_refused & set(present) and \
                 all(n == len(present) for n in info["race"]["counts"])
             # a retry through another node is a duplicate (the same producer and seq, sent to a follower)
