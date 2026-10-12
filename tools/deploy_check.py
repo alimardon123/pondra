@@ -108,8 +108,8 @@ def printed(log):
     return m.group(0) if m else None
 
 
-def metric(port, name):
-    for line in http(port, "/metrics").splitlines():
+def metric(port, name, token=None):
+    for line in http(port, "/metrics", token=token).splitlines():
         if line.startswith(name + " ") or line.startswith(name + "{"):
             return float(line.rsplit(" ", 1)[1])
 
@@ -150,7 +150,7 @@ def image(a):
         info["owners"] = owners
         check("everything it keeps is under /data, the image user's own; the key readable by it alone",
               all(l.split()[0] == "65532" for l in owners.splitlines()) and "600 /data/.pondra/secret.key" in owners, owners)
-        query_memory = metric(port, "pondra_memory_limit_bytes")
+        query_memory = metric(port, "pondra_memory_limit_bytes", token)  # (a node on the network answers /metrics to a token only)
         info["query memory in a 1 GB container (bytes)"] = query_memory
         check("its queries are sized by the container's memory, not the host's", query_memory and query_memory <= limit / 2, query_memory)
         key = look("sha256sum /data/.pondra/secret.key")

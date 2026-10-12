@@ -423,7 +423,10 @@ pub fn http_bare() -> &'static reqwest::Client {
 /// `PONDRA_TOKEN`.
 pub fn http() -> reqwest::Client {
     static CLIENT: std::sync::Mutex<Option<(Option<String>, reqwest::Client)>> = std::sync::Mutex::new(None);
-    let token = std::env::var("PONDRA_TOKEN").or_else(|_| std::env::var("PONDRA_ADMIN_TOKEN")).or_else(|_| std::env::var("PONDRA_NODE_KEY")).ok();
+    // (a variable set empty is no token, as the node takes it: compose passes an unset one on empty,
+    // and "Bearer " sent in place of the nodes' key left a follower unable to reach its leader)
+    let given = |v: &str| std::env::var(v).ok().filter(|t| !t.is_empty());
+    let token = given("PONDRA_TOKEN").or_else(|| given("PONDRA_ADMIN_TOKEN")).or_else(|| given("PONDRA_NODE_KEY"));
     let mut client = CLIENT.lock().unwrap();
     if let Some((t, c)) = client.as_ref().filter(|(t, _)| *t == token) {
         let _ = t;
