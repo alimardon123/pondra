@@ -2,7 +2,7 @@
 //! start another, on another lake (`pondra.open`), so every static that holds a node's or a lake's
 //! state is declared with `per_node!`, and `Node::stop` calls `reset()` last. A static declared that
 //! way registers itself the first time it is used, so one never used costs nothing, and none can be
-//! left out of the reset by forgetting to add it to a list. `tools/statics_check.py` fails a static
+//! left out of the reset by forgetting to add it to a list. `tools/per_node_check.py` fails a static
 //! that is neither `per_node!` nor known to outlive a node.
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
