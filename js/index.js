@@ -1,9 +1,11 @@
 // Pondra from JavaScript: SQL, exactly-once appends, key lookups and change feeds, over a node's
 // HTTP API. No dependencies (Node 18+, or any runtime with fetch: the client runs in browsers, Deno
-// and Bun too; `local` and `binary` need Node, and load its modules when they are called).
+// and Bun too; `local` and `binary` need Node, `open` needs Node, Bun or Deno (it loads the library with
+// `process.dlopen`), and they load their modules when they are called).
 //
-//   import { local, connect } from "pondra";
+//   import { local, open, connect } from "pondra";
 //   const db = await local("lake");                 // a node on ./lake, here; or
+//   const db = await open("lake");                  // the same node, run in this process (no second one); or
 //   const db = connect("http://127.0.0.1:8080");    // one running somewhere
 //   await db.sql("CREATE TABLE events (user VARCHAR, amount BIGINT)");
 //   await db.append("events", [{ user: "ann", amount: 5 }]);
@@ -448,16 +450,31 @@ export class Pondra {
     }
   }
 
-  /** End this connection's session (its temporary tables and views), and stop the node `local()` started:
-   * closing its input stops it (it hands the lake on at once), on every OS; it would stop the same way if
-   * this process were killed. It waits up to 15 seconds for the node to stop, then kills it. Takes no
-   * argument. */
+  /** The console, in a browser, as this connection. A node `local()` started answers only its
+   *  program, so the link carries its key (`#key=…`); the page keeps it for its tab, and it works
+   *  while the node runs. Keep it to yourself, as a token. */
+  get consoleUrl() {
+    return this.owner ? `${this.url}/#key=${this.owner}` : `${this.url}/`;
+  }
+
+  /** End this connection's session (its temporary tables and views), then stop the node it reaches:
+   * `local()`'s, by closing its input (it hands the lake on at once), on every OS; it would stop the same way
+   * if this process were killed. It waits up to 15 seconds for that node to stop, then kills it. A node
+   * `open()` made in this process is closed instead: drained, its term given back, and a temporary lake
+   * removed. Takes no argument. */
   async close(...more) {
     if (more.length) throw new Error("close() takes no argument");
     const retrySecs = this.retrySecs;
     this.retrySecs = 0; // (a node that's gone isn't waited for here)
     await this.request("DELETE", `/sessions/${this.session}`).catch(() => {});
     this.retrySecs = retrySecs;
+    if (this.opened) { // (a node open() made here: a second close() finds nothing to stop)
+      const opened = this.opened;
+      this.opened = null;
+      this.retrySecs = 0; // (a closed node refuses at once)
+      await opened();
+      return;
+    }
     const node = this.process;
     if (!node || node.exitCode !== null || node.signalCode !== null) return;
     const exited = new Promise((resolve) => node.once("exit", resolve));
@@ -519,6 +536,80 @@ export async function local(dir = "lake", { port, token, flags = [], timeout = 1
   }
 }
 
+/** Open a node on a lake in this process, and connect to it: no server and no second process. `dir` is a
+ * folder or s3://bucket/prefix, as `local()` takes; with none, a lake in a temporary folder that `close()`
+ * removes (DuckDB's `:memory:`). It returns the connection `connect()` and `local()` return, so frames, `sql`,
+ * `writeTable` and the rest work the same. Its SQL may read files on this machine, as `local()`'s may.
+ * `settings` are the node's settings by name (`memory_gb: 2` is PONDRA_MEMORY_GB), fixed by the first open
+ * in a process. One node at a time in a process: open another lake with ATTACH, or close this one first. It
+ * is closed when this process ends (`process.exit()` too), if `close()` wasn't called. Python's functions and procedures run with a
+ * Python here that has the `pondra` package, as `local()`'s do (`python: false`: none). */
+export async function open(dir, { token, python = true, onNotice, ...settings } = {}) {
+  const addon = await nativeModule(); // (first: a missing library leaves no folder behind)
+  const port = await freePort();
+  const owner = randomUUID().replaceAll("-", ""); // (with it, this process's SQL reads files here: invariant 61)
+  const { mkdirSync, mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join, resolve } = await import("node:path");
+  const temp = dir == null; // (no folder named: a temporary one, which close() removes)
+  let lake = temp ? mkdtempSync(join(tmpdir(), "pondra-")) : dir;
+  if (!lake.includes("://")) {
+    mkdirSync(lake, { recursive: true });
+    lake = resolve(lake);
+  }
+  const launcher = await binary().catch(() => null); // (only an ATTACH of a lake nobody leads needs it)
+  // (a setting as text, String(true) being "true"; a list, `attach: ["sales=/data/sales"]`, as it is)
+  const given = Object.fromEntries(Object.entries(settings).filter(([, v]) => v != null).map(([k, v]) => [k, Array.isArray(v) ? v.map(String) : String(v)]));
+  const options = {
+    ...given,
+    lake, addr: `127.0.0.1:${port}`, owner, // (these win over a setting of the same name)
+    ...(temp && { temporary: true }), // (the library removes the folder once the node lets go of it)
+    ...(python && { python: "auto" }),
+    ...(launcher && { launcher }),
+  };
+  let handle;
+  try {
+    handle = await addon.open(JSON.stringify(options));
+  } catch (e) {
+    if (temp) rmSync(lake, { recursive: true, force: true }); // (the node never took it)
+    throw e;
+  }
+  const db = new Pondra(`http://127.0.0.1:${port}`, { token, ...(onNotice !== undefined && { onNotice }) });
+  db.owner = owner;
+  db.lake = lake; // (where the lake is: a temporary one's folder, for a caller that wants to see it)
+  db.opened = closer(addon, handle);
+  return db;
+}
+
+// The nodes open() made here and nothing closed yet. `process.exit()` ends Node without the cleanup hook the
+// library adds (that hook closes them when the process simply ends, or a worker thread does), so the
+// process's `exit` event closes them, on this thread: drained, the term given back, a temporary lake removed.
+const stillOpen = new Set();
+let exitHooked = false;
+
+/** How open()'s node is closed (`db.close()`): until it is, the process's exit closes it. */
+function closer(addon, handle) {
+  if (!exitHooked) {
+    exitHooked = true;
+    process.on("exit", () => {
+      for (const h of stillOpen) {
+        try {
+          addon.closeSync(h);
+        } catch {
+          // (the process is ending: there is no one left to tell)
+        }
+      }
+      stillOpen.clear();
+    });
+  }
+  const close = () => {
+    stillOpen.delete(handle);
+    return addon.close(handle);
+  };
+  stillOpen.add(handle);
+  return close;
+}
+
 /** The `pondra` executable: $PONDRA_BIN, or the one npm installed for this platform. Async, as it loads
  * Node's module resolver only when it is asked. */
 export async function binary() {
@@ -527,6 +618,45 @@ export async function binary() {
   const os = { linux: "linux", darwin: "macos", win32: "windows" }[process.platform];
   const exe = process.platform === "win32" ? "pondra.exe" : "pondra";
   return createRequire(import.meta.url).resolve(`pondra-${os}-${process.arch}/${exe}`);
+}
+
+/** The library's file: $PONDRA_LIBRARY, else the one beside the launcher in this platform's npm package. */
+async function library() {
+  if (process.env.PONDRA_LIBRARY) return process.env.PONDRA_LIBRARY;
+  const { existsSync } = await import("node:fs");
+  const { createRequire } = await import("node:module");
+  const { dirname, join } = await import("node:path");
+  const os = { linux: "linux", darwin: "macos", win32: "windows" }[process.platform];
+  const pkg = `pondra-${os}-${process.arch}`;
+  const file = { linux: "libpondra_lib.so", darwin: "libpondra_lib.dylib", win32: "pondra_lib.dll" }[process.platform];
+  let beside = null;
+  try {
+    beside = join(dirname(createRequire(import.meta.url).resolve(`${pkg}/package.json`)), file);
+  } catch {
+    // (the package isn't installed here: the error below says what to do)
+  }
+  if (beside && existsSync(beside)) return beside;
+  throw new Error(`open() needs the library from the ${pkg} package (npm install pondra brings it), or PONDRA_LIBRARY naming it`);
+}
+
+// The library's exports, loaded by the first open in this process. While it loads this is a promise, so
+// opens made at once share one load; a load that fails is tried again by the next open.
+let native = null;
+
+async function nativeModule() {
+  native ??= loadNative().catch((e) => {
+    native = null;
+    throw e;
+  });
+  return native;
+}
+
+/** The library is a Node-API module: `process.dlopen` loads it, and it closes any node still open when this
+ * process's environment ends. */
+async function loadNative() {
+  const module = { exports: {} };
+  process.dlopen(module, await library());
+  return module.exports;
 }
 
 /** A port nothing listens on here, for `local`'s node. */

@@ -99,8 +99,8 @@ SELECT * FROM visits ORDER BY page;
 +------+---+
 ```
 
-Without `ON CONFLICT`, an `INSERT` into a keyed table replaces the row. `MERGE` does the same jobs and
-more. MySQL's `ON DUPLICATE KEY UPDATE` is refused, with the Postgres form to use instead.
+Without `ON CONFLICT`, a plain `INSERT` of a key the table holds is refused. `INSERT OR REPLACE` replaces
+the row, as a load does, and `MERGE` does the same jobs and more. MySQL's `ON DUPLICATE KEY UPDATE` is refused, with the Postgres form to use instead.
 
 ## Empty a table
 
@@ -371,8 +371,10 @@ UPDATE orders SET qty = 9 WHERE id = 1;
 `tea_orders` now holds order 1 with `qty` 9. Change an order's `item` and it leaves the view or joins it.
 
 Some views can't take a row back: one that keeps a `min` or `max`, one that emits windows or sessions,
-one that joins another table, and streaming tasks. While one of them reads a table, a change to the
-table is refused, with the reason. Drop the view, or make it one that adds up.
+one that joins another table, and streaming tasks. While one of them reads a table, a change that takes
+rows back is refused, with the reason. Drop the view, or make it one that adds up. A change that matches
+no row isn't refused: an `UPDATE` or `DELETE` that matches nothing answers `0`, and a `MERGE` that only
+inserts is followed as an `INSERT`.
 
 ```python
 db.sql("CREATE MATERIALIZED VIEW biggest AS SELECT item, max(qty) AS most FROM orders GROUP BY item")
@@ -386,6 +388,10 @@ db.sql("DROP VIEW biggest")
 ```text
 500: orders's rows can't change while these follow it: view biggest (keeps a min or max). Drop them first, or change a copy of the table
 ```
+
+A merge table takes `INSERT`s only. Its rows add up as they are read: that covers a table with `MERGE`
+columns, and a `GROUP BY` view's table. `UPDATE` and `DELETE` on one are refused with SQLSTATE `0A000`, so
+write the change as rows that add up to it (an `INSERT`).
 
 ## Temporary tables
 
@@ -409,9 +415,8 @@ The change to `picks` left `stock` alone: `tea` is 0 in the copy and 17 in the t
 
 ## Transactions
 
-`BEGIN` … `COMMIT` makes several statements one commit: all of them or none, the views that
-follow the tables moving with it. Inside, every statement reads the lake as it was at `BEGIN`, with
-the transaction's own writes over it, and nobody else sees those writes until `COMMIT`.
+`BEGIN` … `COMMIT` makes several statements one commit: all of them or none, with the views that
+follow the tables moving with it. Nobody else sees the transaction's writes until `COMMIT`.
 
 ```python
 import pondra
@@ -449,8 +454,11 @@ print(db.sql("SELECT id, balance FROM accounts ORDER BY id").rows())
 [{'id': 1, 'balance': 70}, {'id': 2, 'balance': 80}]
 ```
 
-Over the Postgres port a connection is the session, so drivers' transactions work as they do with
-Postgres (psycopg's `with conn.transaction()`, JDBC's `setAutoCommit(false)`):
+A transaction belongs to a session: a Postgres connection, an HTTP client that sends the same
+`x-pondra-session` header, an MCP client with its `Mcp-Session-Id`, or a Flight SQL transaction from
+`BeginTransaction`. The Python and JavaScript clients keep one session per connection. Closing it rolls
+its transaction back. Over the Postgres port the connection is the session, so drivers' transactions
+work as they do with Postgres (psycopg's `with conn.transaction()`, JDBC's `setAutoCommit(false)`):
 
 ```sql norun
 BEGIN;
@@ -459,21 +467,139 @@ INSERT INTO history VALUES (1, -10);
 COMMIT;
 ```
 
-Over HTTP, send the statements of one transaction with the same `x-pondra-session` header (the
-Python and JavaScript clients do), or all of them in one request: `BEGIN; …; COMMIT`.
+Over HTTP, send the statements of one transaction with the same `x-pondra-session` header, or all of
+them in one request: `BEGIN; …; COMMIT`.
 
-**Isolation.** A transaction is snapshot isolation, Postgres's `REPEATABLE READ`: it reads one
-snapshot, and if another commit changed a row it changes (by row; a keyed table's, by key) after
-that snapshot, its `COMMIT` is refused with `40001` (`could not serialize access due to concurrent
-update`), the first to commit winning. Run it again: `PondraError.sqlstate == "40001"` in Python,
-psycopg's `SerializationFailure`, pgbench's `--max-tries`.
+### Isolation levels
+
+A transaction runs as `READ COMMITTED` unless it asks for another level, as in Postgres.
+
+| Level | What a statement reads | A row another transaction is changing |
+|---|---|---|
+| `READ COMMITTED` (the default) | the newest commit when the statement starts | the statement waits for that transaction to end, then changes the row as it was left |
+| `REPEATABLE READ` | the newest commit when the transaction's first statement starts | nothing waits. If another commit changed a row after that snapshot, the `COMMIT` is refused with `40001` |
+| `SERIALIZABLE` | refused (`0A000`): `REPEATABLE READ` is snapshot isolation, which allows write skew | |
+
+Ask for a level with `BEGIN ISOLATION LEVEL REPEATABLE READ`, with `SET TRANSACTION ISOLATION LEVEL`
+before the transaction's first statement, or for a whole session with
+`SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL`. `READ UNCOMMITTED` runs as `READ COMMITTED`,
+as it does in Postgres. `SHOW transaction_isolation` says what runs. `BEGIN READ ONLY` refuses every
+write with `25006`.
+
+After `40001`, run the transaction again: `PondraError.sqlstate == "40001"` in Python, psycopg's
+`SerializationFailure`, pgbench's `--max-tries`.
+
+### Waiting for a row
+
+Two transactions that change the same row never both build on its old value. The second one waits for
+the first to end, then changes the row as the first left it. Waiting is first come, first served. This
+example uses two connections, so two sessions, each with its own transaction:
+
+```python
+import threading
+import time
+
+first = pondra.connect("http://localhost:8080")
+second = pondra.connect("http://localhost:8080")
+
+first.sql("BEGIN")
+first.sql("UPDATE accounts SET balance = balance + 1 WHERE id = 2")  # first holds account 2's row
+
+def change_later():
+    second.sql("BEGIN")
+    started = time.time()
+    second.sql("UPDATE accounts SET balance = balance + 10 WHERE id = 2")  # waits here for first
+    print("second waited:", time.time() - started >= 1)
+    second.sql("COMMIT")
+
+thread = threading.Thread(target=change_later)
+thread.start()
+time.sleep(1)  # (second's change is waiting now)
+first.sql("COMMIT")
+thread.join()
+print(db.sql("SELECT id, balance FROM accounts ORDER BY id").rows())
+```
+
+```text
+second waited: True
+[{'id': 1, 'balance': 70}, {'id': 2, 'balance': 91}]
+```
+
+An `UPDATE`, `DELETE`, `MERGE` or `INSERT … ON CONFLICT` locks the rows it changes until its transaction
+ends. A plain `INSERT` into an append table locks nothing: new rows can't meet another transaction's. A
+table with a `UNIQUE` constraint takes no row locks either: its `COMMIT` refuses a row another commit
+changed with `40001` instead.
+`SELECT … FOR UPDATE` locks the rows it returns. With `NOWAIT` it refuses at once with `55P03` instead
+of waiting. `SKIP LOCKED` is refused by name (`0A000`).
+
+A wait can end in three ways besides a commit:
+
+- A wait that would close a loop (A waits for B's row while B waits for A's) is refused at once with
+  `40P01`, and the other transaction goes on.
+- `SET lock_timeout = '2s'` bounds a wait. Past it, the statement fails with `55P03`.
+- A statement cancelled by its client (psql's Ctrl-C, a driver's cancel) fails with `57014`.
+
+Any of these fails the transaction, as any failed statement does: until `ROLLBACK`, its next statements
+are refused with `25P02`.
+
+### Savepoints
+
+`SAVEPOINT name` marks a point in the transaction. `ROLLBACK TO SAVEPOINT name` undoes the writes made
+after it and keeps the transaction open, and `RELEASE SAVEPOINT name` forgets the mark and keeps the
+writes. A `ROLLBACK TO` clears a failed transaction, so the statements after it run.
+
+```python
+with db.transaction():
+    db.sql("INSERT INTO accounts VALUES (3, 100)")
+    db.sql("SAVEPOINT before_fee")
+    db.sql("UPDATE accounts SET balance = balance - 30 WHERE id = 3")
+    db.sql("ROLLBACK TO SAVEPOINT before_fee")
+print(db.sql("SELECT id, balance FROM accounts WHERE id = 3").rows())
+```
+
+```text
+[{'id': 3, 'balance': 100}]
+```
+
+A row lock taken after a savepoint stays held until the transaction ends, even if `ROLLBACK TO` undid the
+write that took it. Another transaction can wait longer than it would in Postgres because of that.
+A savepoint outside a transaction is refused (`25P01`), and an unknown name is `3B001`.
+
+### Tables in a transaction
+
+`CREATE`, `ALTER` and `DROP` aren't part of a transaction here. Each runs at once as its own commit, and
+`ROLLBACK` doesn't undo it. The client gets a notice that says so. This lets a tool that wraps a
+`CREATE TABLE` and the `INSERT`s after it in one transaction, such as dbt, pandas' `to_sql` or SQLAlchemy,
+work as it does with Postgres:
+
+```python
+with db.transaction():
+    db.sql("CREATE TABLE fees (id BIGINT, amount BIGINT)")
+    db.sql("INSERT INTO fees VALUES (1, 5)")
+print(db.sql("SELECT count(*) AS n FROM fees").rows())
+```
+
+```text
+CREATE TABLE ran at once: DDL isn't part of a transaction here, and ROLLBACK won't undo it
+[{'n': 1}]
+```
+
+Two kinds of DDL are refused (`0A000`): DDL on a table the transaction has already written to, and any
+DDL under `REPEATABLE READ`. `COMMIT` first, or run the DDL before `BEGIN`.
+
+### Idle transactions
+
+A transaction with no statement for `PONDRA_TXN_IDLE_SECS` (600 seconds) ends. Its writes are dropped
+and its row locks let go, so other writers aren't kept waiting. The session's next statement is refused
+with `25P03`, and so is its `COMMIT`, which says that nothing was committed. `ROLLBACK` ends the refusal.
+A statement that is still running is not idle, and a wait for a row counts as running.
 
 <Aside type="note">
-A transaction is kept in the memory of the node its session talks to, and sent to the leader as
-one request at `COMMIT`. `CREATE`, `ALTER` and `DROP` aren't part of one (refused inside, `0A000`),
-nor are savepoints. One idle for `PONDRA_TXN_IDLE_SECS` (600) ends, rolled back, as does one whose
-connection closes.
+A transaction's writes are kept in the memory of the node its session talks to, and its row locks are held
+by the leader. Keep one session on one node. Behind a load balancer, pin the client to one node (see
+[HTTP](/pondra/reference/http/)).
 </Aside>
+
 
 ## What to know
 

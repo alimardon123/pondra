@@ -260,7 +260,7 @@ def environments_check(bin, work, port, root):
     dev.q("UPDATE sales.orders SET amount = 0 WHERE id BETWEEN 21 AND 25")
     dev.q("DELETE FROM sales.orders WHERE id BETWEEN 26 AND 30")
     dev.q("INSERT INTO k VALUES (4, 'dev')")
-    dev.q("INSERT INTO kv VALUES (1, 'dev')")
+    dev.q("INSERT OR REPLACE INTO kv VALUES (1, 'dev')")  # (an upsert: a plain INSERT of key 1 is refused, 23505)
     for _ in range(2):
         dev.post("/tier")
     model = {r[2]: r for r in before}
@@ -310,7 +310,7 @@ def environments_check(bin, work, port, root):
     dev.q("ALTER DATABASE dev REFRESH kv")        # (from dev itself)
     checks["ALTER DATABASE dev REFRESH t: t and its view as prod has them now (ids, versions, the log tail); other tables as they were"] = \
         rows(dev, every) == now_rows and rows(dev, totals_sql) == now_totals and rows(dev, kv) == now_kv and rows(dev, keyed) == own_k
-    dev.q("INSERT INTO kv VALUES (1, 'after')")
+    dev.q("INSERT OR REPLACE INTO kv VALUES (1, 'after')")  # (an upsert: what dev writes after is newer)
     dev.q("INSERT INTO sales.orders VALUES (6001, 6.0)")
     dev.q("UPDATE sales.orders SET amount = 9 WHERE id = 3001")
     for _ in range(2):

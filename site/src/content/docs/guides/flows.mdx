@@ -131,7 +131,7 @@ us      1       12
 `ALTER MATERIALIZED VIEW v DETACH` stops `v` following its tables and keeps what it holds, as a
 table of the same name. From then on it is a table like any other: it takes `INSERT`s, and what
 follows it keeps following it. A `GROUP BY` view's table stays a merge table, its rows combining
-as they are read. A view that keeps windows is refused, since the windows still open would be
+as they are read, so `UPDATE` and `DELETE` on it are refused (`0A000`). A view that keeps windows is refused, since the windows still open would be
 left half counted.
 
 ```sql

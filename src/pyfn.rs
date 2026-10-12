@@ -32,7 +32,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 /// strings as plain Utf8; `VARIANT` and `JSON` are JSON text. Worked out once per type.
 pub async fn arrow_of(sql_type: &str) -> Result<DataType> {
     static SEEN: LazyLock<Mutex<HashMap<String, DataType>>> = LazyLock::new(Default::default);
-    if let Some(t) = SEEN.lock().unwrap().get(sql_type) {
+    if let Some(t) = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(sql_type) {
         return Ok(t.clone());
     }
     let t = match is_json(Some(sql_type)) {
@@ -42,7 +42,7 @@ pub async fn arrow_of(sql_type: &str) -> Result<DataType> {
             plain(df.schema().field(0).data_type())
         }
     };
-    SEEN.lock().unwrap().insert(sql_type.to_string(), t.clone());
+    SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(sql_type.to_string(), t.clone());
     Ok(t)
 }
 

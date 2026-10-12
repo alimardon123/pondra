@@ -59,7 +59,7 @@ The code assumes one node per process. An audit of `src/` (2026-10-11) found wha
    instead of aborting. Callers get 57P03 with that reason, and `open` again starts over. The
    compactor's failure and the format watch (invariant 207) do the same. No signal handlers, no
    standard input.
-6. **One C ABI for every language** (`libpondra`): `pondra_open(options_json)`,
+6. **One C ABI for every language** (`pondra_lib`): `pondra_open(options_json)`,
    `pondra_request(handle, method, path, headers, body)`, `pondra_free`, `pondra_close`,
    `pondra_last_error`, and `pondra_main(argc, argv)` for the launcher. Every entry catches a panic
    and returns an error (unwinding across `extern "C"` is undefined). The library is never unloaded.
@@ -89,7 +89,7 @@ The code assumes one node per process. An audit of `src/` (2026-10-11) found wha
    launcher's path from the options). A process that forks after `open` (Python's `multiprocessing`
    on Linux) finds the handle closed in the child and must open again; the docs say to use `spawn`.
 10. **The packages carry the library and a small launcher.** The wheel and the npm packages hold
-    `libpondra` and a `pondra` launcher that calls `pondra_main` (found beside it: `$ORIGIN`,
+    `pondra_lib` and a `pondra` launcher that calls `pondra_main` (found beside it: `$ORIGIN`,
     `@loader_path`), so the engine is in them once. The installers and the release keep the single
     static binary. The library is built for glibc 2.17 as the binary is (invariant 48).
 

@@ -91,14 +91,16 @@ impl Point {
         let schema = self.schema()?;
         let row = lookup(lake, &self.table, &self.meta, &key.join(",")).await?;
         Ok(Some(match row {
-            Some(r) => crate::query::conform(&r.project(&self.names.iter().map(|n| r.schema().index_of(n)).collect::<Result<Vec<_>, _>>()?)?, &schema)?,
+            Some(r) => crate::query::conform(&r, &schema)?, // (by name: a row from before an ADD COLUMN lacks it)
             None => RecordBatch::new_empty(schema),
         }))
     }
 }
 
-/// `sql` as a point query, if it is one (`Point`): worked out once per catalog version (a
-/// prepared statement's lookups are parsed and described once, not three times each).
+/// `sql` as a point query, if it is one (`Point`): worked out once per catalog version. Not per
+/// `visible()`, which only the log's segments move: an `ALTER TABLE` or a tiering round left a kept
+/// `Point` with the table's old columns and files. A node whose catalog has no version (a follower
+/// between seeds) works it out each time.
 pub async fn point(lake: &Lake, sql: &str) -> Result<Option<Arc<Point>>> {
     type Seen = lru::LruCache<(String, String), (u64, Option<Arc<Point>>)>;
     crate::per_node!(static SEEN: Mutex<Seen> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).expect("non-zero"))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
@@ -106,7 +108,8 @@ pub async fn point(lake: &Lake, sql: &str) -> Result<Option<Arc<Point>>> {
     if !head.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("select")) {
         return Ok(None); // (most statements: no parse)
     }
-    let (key, now) = ((lake.url.clone(), sql.to_string()), lake.visible());
+    let Some(now) = lake.cat.version() else { return Ok(point_of(lake, sql).await?.map(Arc::new)) };
+    let key = (lake.url.clone(), sql.to_string());
     if let Some((v, p)) = SEEN.lock().unwrap().get(&key) {
         if *v == now {
             return Ok(p.clone());

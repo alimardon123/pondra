@@ -224,11 +224,14 @@ async fn metadata(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Result<Vec<u8
     if ver >= 3 {
         w.put_i32(0);
     }
-    w.put_i32(1); // brokers: this node
-    w.put_i32(me.id);
-    put_str(&mut w, &me.host);
-    w.put_i32(me.port);
-    w.put_i16(-1); // rack
+    let brokers = brokers(app, me).await;
+    w.put_i32(brokers.len() as i32);
+    for (id, host, port) in &brokers {
+        w.put_i32(*id);
+        put_str(&mut w, host);
+        w.put_i32(*port);
+        w.put_i16(-1); // rack
+    }
     if ver >= 2 {
         put_str(&mut w, "pondra"); // cluster id
     }
@@ -1027,6 +1030,7 @@ fn now_ms() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX
 
 crate::per_node!(static GROUPS: std::sync::Mutex<std::collections::HashMap<String, Group>> = Default::default());
 crate::per_node!(static ME: std::sync::RwLock<Option<Value>> = std::sync::RwLock::new(None)); // this node's broker, for `/cluster/kafka`
+crate::per_node!(static PEERS: std::sync::Mutex<std::collections::HashMap<String, Value>> = Default::default()); // other live nodes' brokers, by node address (`brokers`)
 crate::per_node!(static COORDINATOR: std::sync::RwLock<Option<(i32, String, i32)>> = std::sync::RwLock::new(None));
 
 const COORDINATOR_NOT_AVAILABLE: i16 = 15;
@@ -1160,6 +1164,42 @@ async fn find_coordinator(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Resul
     put_str(&mut w, &host);
     w.put_i32(port);
     Ok(w)
+}
+
+/// Every live node's broker, this node's too, by id: the same list from every node. A client
+/// drops each broker a Metadata reply leaves out, and what it had in flight there with it
+/// (librdkafka destroys the handle): listed alone, a follower that carried a group's metadata
+/// request left the group waiting for an answer that never came, and it never joined. Each
+/// node's broker is asked of it once (`/cluster/kafka`, `null` for a node without `--kafka`)
+/// and forgotten when it leaves the live members.
+async fn brokers(app: &App, me: &Broker) -> Vec<(i32, String, i32)> {
+    let nodes = app.cluster.nodes();
+    let known = {
+        let mut peers = PEERS.lock().unwrap();
+        peers.retain(|node, _| nodes.contains(node));
+        peers.clone()
+    };
+    let asked = nodes.iter().filter(|n| **n != app.cluster.addr && !known.contains_key(*n)).map(|n| async move {
+        let url = crate::tls::url(&format!("{n}/cluster/kafka"));
+        let answer = crate::cluster::http().get(url).timeout(Duration::from_millis(500)).send().await;
+        (n.clone(), match answer.and_then(|r| r.error_for_status()) {
+            Ok(r) => r.json::<Value>().await.ok(),
+            Err(_) => None, // (not cached: asked again next time)
+        })
+    });
+    let found = futures::future::join_all(asked).await;
+    let mut peers = PEERS.lock().unwrap();
+    peers.extend(found.into_iter().filter_map(|(node, b)| Some((node, b?))));
+    let mut all = vec![(me.id, me.host.clone(), me.port)];
+    for b in peers.values() {
+        if let (Some(id), Some(host), Some(port)) = (b["id"].as_i64(), b["host"].as_str(), b["port"].as_i64()) {
+            if id as i32 != me.id {
+                all.push((id as i32, host.into(), port as i32));
+            }
+        }
+    }
+    all.sort();
+    all
 }
 
 async fn leader_broker(app: &App) -> Result<(i32, String, i32)> {

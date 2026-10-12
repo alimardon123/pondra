@@ -124,13 +124,25 @@ with its `_change_type`, `_row_id` and `_version`, and the `position` to ask fro
 the oldest change the node still keeps; leave `after` out to start from now. An agent that watches a table
 keeps the last `position` and asks from there. On a keyed table the change type is `upsert`.
 
+## Transactions
+
+Calls can share a transaction. The MCP client keeps the `Mcp-Session-Id` that `initialize` gives, and a
+`write` of `BEGIN` opens a transaction in that session. The calls after it run in the transaction until a
+`write` of `COMMIT` commits it or `ROLLBACK` drops it. The [MCP reference](/pondra/reference/mcp/#sessions-and-transactions)
+has the rules, such as how long a session lasts.
+
+A session lives on the node that made it. Behind a load balancer, pin each MCP client to one node, with the
+balancer's session affinity or a route of its own for the agent. A call that reaches another node gets `404`: that
+transaction can't be reached from there, and nothing in it is committed. Initialize again to go on.
+
 ## When a tool fails
 
 A tool that fails doesn't stop the agent: it answers with `isError: true` and the reason, with Postgres's
 code in front (`SQLSTATE 23514: …` for a row that breaks a check). The agent can read it and act on it.
 
-- A transaction isn't kept across calls. `query` refuses `BEGIN` with `SQLSTATE 0A000`. Put the steps that
-  must succeed together in one procedure, and call it once.
+- `query` refuses `BEGIN`, `COMMIT` and `ROLLBACK` with `SQLSTATE 25006`: send transactions through `write`,
+  in one session ([above](#transactions)). Or put the steps that must succeed together in one procedure, and
+  call it once.
 - What a procedure prints comes back as `notices` in its answer. If it fails after printing, the error says
   what it printed (`it printed:`), so the agent sees how far it got.
 

@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Pondra's packages, from a built binary: a Python wheel, npm packages and the binary alone (what
-the one-line installers, install.sh and install.ps1, download) for one platform.
+"""Pondra's packages for one platform, from what a build made: a Python wheel and npm packages (the
+library and its launcher), and the program alone (what the one-line installers, install.sh and
+install.ps1, download).
 
   package.py --bin target/x86_64-unknown-linux-gnu/dist/pondra --platform linux-x64 --out dist/
+  package.py --bin … --lib PATH --launcher PATH …   # the library and the launcher from elsewhere
   package.py --npm-main --out dist/        # the `pondra` npm package itself (once, any platform)
 
-The wheel is what `pip install pondra` gets: the Python client (`python/pondra`) and the binary,
-installed next to Python as the `pondra` command (a "scripts" entry, as maturin's bin wheels do),
-where `pondra.local()` finds it. The npm packages follow esbuild's pattern: `pondra` holds the
-JavaScript client and depends, optionally, on `pondra-<platform>` packages that each hold one
-binary, so npm installs only the one that fits. No build tools beyond Python and npm.
+The library and the launcher are taken from beside the program (`cargo build --workspace` puts the
+three in one folder) unless --lib and --launcher name them. The wheel is what `pip install pondra`
+gets: the Python client (`python/pondra`), the library in `pondra/_lib/` (where `pondra.open()` loads
+it) and the launcher, installed next to Python as the `pondra` command (a "scripts" entry, as maturin's
+bin wheels do), which loads the same library and runs the program from it (ADR-061 §10): one copy of
+the engine for both. The npm packages follow
+esbuild's pattern: `pondra` holds the JavaScript client and depends, optionally, on
+`pondra-<platform>` packages that each hold the launcher and the library side by side, so npm installs
+only the one that fits. No build tools beyond Python and npm.
 """
 import argparse, base64, hashlib, json, os, shutil, subprocess, sys, tarfile, tempfile, zipfile
 
@@ -34,14 +40,18 @@ LICENSES = ["LICENSE-APACHE", "LICENSE-MIT"]  # (MIT OR Apache-2.0, at the user'
 REPO = {"type": "git", "url": "git+https://github.com/alimardon123/pondra.git"}  # (npm's provenance checks it's this repository)
 
 
-def wheel(binary, platform, out):
+def library_name(platform):
+    return {"windows": "pondra_lib.dll", "macos": "libpondra_lib.dylib"}.get(platform.split("-")[0], "libpondra_lib.so")
+
+
+def wheel(lib, launcher, platform, out):
     v, tags = version(), PLATFORMS[platform][0]
     name = f"pondra-{v}-py3-none-{tags}.whl"
     exe = "pondra.exe" if platform.startswith("windows") else "pondra"
     readme = open(os.path.join(ROOT, "python", "README.md"), encoding="utf-8").read()  # (PyPI's page: short, its own)
     meta = "\n".join([
         "Metadata-Version: 2.4", "Name: pondra", f"Version: {v}",
-        "Summary: Pondra, a streamhouse in one binary: the binary, and a Python client", "Author: Alimardon",
+        "Summary: Pondra, a streamhouse in one binary: the engine, in this process or beside it, and a Python client", "Author: Alimardon",
         "License-Expression: MIT OR Apache-2.0", "License-File: LICENSE-APACHE", "License-File: LICENSE-MIT",
         "Project-URL: Documentation, https://alimardon123.github.io/pondra/", "Project-URL: Repository, https://github.com/alimardon123/pondra",
         "Keywords: lakehouse,streaming,sql,dataframe,iceberg,delta,kafka,datafusion",
@@ -51,7 +61,8 @@ def wheel(binary, platform, out):
     src = os.path.join(ROOT, "python")
     client = sorted(os.path.relpath(os.path.join(d, f), src).replace(os.sep, "/") for d, _, fs in os.walk(os.path.join(src, "pondra")) for f in fs if f.endswith(".py"))
     files = {**{p: open(os.path.join(src, p), "rb").read() for p in client},  # (the client, its frames, pondra.spark, the worker and plpy)
-             f"pondra-{v}.data/scripts/{exe}": open(binary, "rb").read(),
+             f"pondra/_lib/{library_name(platform)}": open(lib, "rb").read(),
+             f"pondra-{v}.data/scripts/{exe}": open(launcher, "rb").read(),
              f"pondra-{v}.dist-info/METADATA": meta.encode(), f"pondra-{v}.dist-info/WHEEL": wheel_file.encode(),
              **{f"pondra-{v}.dist-info/licenses/{n}": open(os.path.join(ROOT, n), "rb").read() for n in LICENSES}}
     digest = lambda b: "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(b).digest()).rstrip(b"=").decode()
@@ -94,14 +105,15 @@ def npm_pack(folder, out):
     return subprocess.run([npm, "pack", "--pack-destination", os.path.abspath(out)], cwd=folder, check=True, capture_output=True, text=True).stdout.strip().splitlines()[-1]
 
 
-def npm_platform(binary, platform, out):
+def npm_platform(lib, launcher, platform, out):
     _, os_, cpu = PLATFORMS[platform]
-    exe = "pondra.exe" if platform.startswith("windows") else "pondra"
+    exe, library = "pondra.exe" if platform.startswith("windows") else "pondra", library_name(platform)
     with tempfile.TemporaryDirectory() as d:
-        shutil.copy2(binary, os.path.join(d, exe))
+        shutil.copy2(launcher, os.path.join(d, exe))  # (the launcher finds the library beside it)
         os.chmod(os.path.join(d, exe), 0o755)
-        json.dump({"name": f"pondra-{platform}", "version": version(), "description": f"The pondra binary for {platform}: install `pondra` instead",
-                   "os": [os_], "cpu": [cpu], "files": [exe, *LICENSES], "license": "MIT OR Apache-2.0", "repository": REPO}, open(os.path.join(d, "package.json"), "w"), indent=2)
+        shutil.copy2(lib, os.path.join(d, library))
+        json.dump({"name": f"pondra-{platform}", "version": version(), "description": f"Pondra's engine for {platform}: install `pondra` instead",
+                   "os": [os_], "cpu": [cpu], "files": [exe, library, *LICENSES], "license": "MIT OR Apache-2.0", "repository": REPO}, open(os.path.join(d, "package.json"), "w"), indent=2)
         for n in LICENSES:
             shutil.copy2(os.path.join(ROOT, n), d)
         return npm_pack(d, out)
@@ -121,13 +133,22 @@ def npm_main(out):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", help="the built pondra binary")
+    ap.add_argument("--bin", help="the built pondra program (the installers' archive)")
+    ap.add_argument("--lib", help="the built library (capi/: libpondra_lib.so, libpondra_lib.dylib, pondra_lib.dll), for the wheel and npm; beside --bin if not given")
+    ap.add_argument("--launcher", help="the built launcher (launcher/: pondra-launcher), installed as `pondra` beside the library; beside --bin if not given")
     ap.add_argument("--platform", choices=PLATFORMS)
     ap.add_argument("--npm-main", action="store_true", help="also (or only) the `pondra` npm package")
     ap.add_argument("--out", default="dist")
     A = ap.parse_args()
     os.makedirs(A.out, exist_ok=True)
-    made = [wheel(A.bin, A.platform, A.out), npm_platform(A.bin, A.platform, A.out), archive(A.bin, A.platform, A.out)] if A.bin else []
+    if A.bin:  # (the library and the launcher beside the program, as cargo builds the workspace into one folder)
+        here, exe = os.path.dirname(os.path.abspath(A.bin)), ".exe" if A.platform.startswith("windows") else ""
+        A.lib = A.lib or os.path.join(here, library_name(A.platform))
+        A.launcher = A.launcher or os.path.join(here, f"pondra-launcher{exe}")
+        missing = [p for p in (A.lib, A.launcher) if not os.path.isfile(p)]
+        if missing:
+            sys.exit(f"no {' or '.join(missing)}: the wheel and npm carry the library and its launcher (cargo build --workspace builds them)")
+    made = [wheel(A.lib, A.launcher, A.platform, A.out), npm_platform(A.lib, A.launcher, A.platform, A.out), archive(A.bin, A.platform, A.out)] if A.bin else []
     made += [npm_main(A.out)] if A.npm_main else []
     print("\n".join(made))
     sys.exit(0 if made else 1)

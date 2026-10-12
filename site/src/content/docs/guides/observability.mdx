@@ -68,7 +68,8 @@ To count the statements of one kind:
 
 ### Group the runs of one query
 
-`statement` is the text as sent, with secrets hidden. `fingerprint` is the same text with its literals taken out, so the
+`statement` is the text as you sent it, with secrets hidden: before any rewriting, such as a macro's
+expansion. The plan shows what actually ran. `fingerprint` is the same text with its literals taken out, so the
 runs of one query, with different values, share a fingerprint. Group by it to find the queries that take
 the most time:
 
@@ -130,6 +131,15 @@ ProjectionExec: expr=[__async_fn_0@0 as x], metrics=[output_rows=1, elapsed_comp
   AsyncFuncExec: async_expr=[async_expr(name=__async_fn_0, expr=nap(1))], metrics=[output_rows=1, elapsed_compute=1ns, output_bytes=8.0 B, output_batches=1]
     PlaceholderRowExec: expected_rows=1, metrics=[]
 ```
+
+## Queries take turns
+
+A node runs `PONDRA_QUERIES` queries at once (four a core, and at least 16). A query that comes while
+they are all busy waits its turn, in the order the queries came, for up to `PONDRA_QUEUE_SECS` (60 by
+default). Past that it is refused with SQLSTATE `53300` (HTTP `429`): try again, or send it to another
+node. Two gauges in `GET /metrics` show the line: `pondra_queries_running` and `pondra_queries_waiting`.
+Watch the waiting one. If it stays above zero, the node has more queries than its turns: spread the
+queries over more nodes, or raise `PONDRA_QUERIES` if the node's memory allows it.
 
 ## Settings
 

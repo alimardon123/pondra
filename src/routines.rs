@@ -765,13 +765,16 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     let sql = &crate::branch::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
     let sql = &crate::past::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
     let sql = &crate::friendly::text(sql)?.into_owned(); // (`PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON: as SQL that parses)
+    let marked = crate::measures::text(sql); // (`sum(x) AS MEASURE revenue`: an alias that parses, ADR-065 §3)
+    let sql: &str = &marked;
     let all = listed(lake).await?;
     let outside = crate::ext::attached(lake).await?;
     let named = |n: &String| crate::ddl::mentions(sql, n);
     let expands = all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) || views.keys().any(named) || FROM_FIRST.is_match(sql) || crate::ext::mentions(sql)
         || outside.iter().any(|(n, _)| named(n)) || sql.contains("pondra_at(");
     let as_written = || Ok(named_apart(sql).unwrap_or_else(|| sql.to_string()));
-    if !expands && !crate::friendly::wanted(sql) && !crate::types::wanted(sql) {
+    let measured = crate::measures::wanted(lake, sql).await?; // (a view with measures read, or a measure named)
+    if !expands && !measured && !crate::friendly::wanted(sql) && !crate::types::wanted(sql) {
         return as_written();
     }
     // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
@@ -782,6 +785,8 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
         false => Err(e),
     });
     let Ok(mut stmts) = parsed else { return if expands { Ok(sql.to_string()) } else { as_written() } };
+    // Measures first, at the query's own grain (ADR-065 §3): what they put in (a view's FROM, its macros) is expanded below.
+    let expands = (measured && crate::measures::rewrite(lake, sql, &mut stmts).await?) || expands;
     let columns = match expands {
         true => columns(lake, &stmts, &all).await?,
         false => HashMap::new(),

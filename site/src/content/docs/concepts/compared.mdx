@@ -31,8 +31,9 @@ Per machine, in the main areas, Pondra measured ahead of Spark and Flink:
   that wrote the rows, with expectations that keep, drop or refuse rows: no stage lags another, where
   Databricks' pipelines, Snowflake's dynamic tables and chained Flink jobs each lag the stage before
   ([Flows](/pondra/guides/flows/)).
-- **A database's behaviour:** `BEGIN` … `COMMIT` as one commit with snapshot isolation, Postgres's
-  error codes on every door, and key lookups through the Postgres port in about 0.2 ms. pgbench's own
+- **A database's behaviour:** `BEGIN` … `COMMIT` as one commit, at Postgres's `READ COMMITTED` with row
+  locks (or `REPEATABLE READ`), savepoints, Postgres's error codes on every door, and key lookups through the
+  Postgres port in about 0.2 ms. pgbench's own
   TPC-B script runs with its balances right.
 
 At cluster scale, and in breadth, it is not there yet:
@@ -140,8 +141,9 @@ top-level project in August 2026 and released 1.0 on 2026-09-21. You pair it wit
   job, all on the JVM. Pondra is one binary, and object storage is its only state.
 - **Like for like, the fast paths match.** Pondra's nodes see a write 10 to 15 ms after the
   acknowledgement, as Fluss's TabletServers serve theirs in milliseconds.
-- **The lake tables don't.** Pondra's Delta and Iceberg versions trail the acknowledgement by about
-  a second on local disk and 3 to 10 seconds on R2. Fluss's lake tables trail by 3 minutes by
+- **The lake tables trail a little.** Pondra's Delta and Iceberg versions trail the acknowledgement
+  by under a tenth of a second at the median on local disk (a write during a tiering round waits for
+  the next one) and by 3 to 10 seconds on R2. Fluss's lake tables trail by 3 minutes by
   default. Fluss can be set lower, and so can Pondra.
 - Pondra already has the Postgres protocol and MCP, which are on Fluss's roadmap.
 
@@ -247,9 +249,9 @@ Pondra hasn't been measured against Snowflake.
 - **Governance.** Users, roles and grants down to a column, TLS on every door and between nodes, an
   audit log and quotas are built ([Security](/pondra/guides/security/)). Single sign-on, row filters
   and masking policies aren't, and Unity Catalog's and Snowflake's governance go further.
-- **Transactions.** Snapshot isolation, first committer wins (40001 to the other, to try again) where
-  Postgres would wait on a row's lock: under heavy contention on one row, most transactions retry.
-  Flight SQL's own transactions and savepoints aren't taken.
+- **Transactions.** `SERIALIZABLE` isn't built: a program that asks for it is refused, not given snapshot
+  isolation. Row locks are kept by the leader, so a write in a transaction on another node costs a round trip
+  to it.
 - **Kafka.** One partition per topic and no transactions, so Kafka Streams and Flink's exactly-once
   Kafka sinks are not covered.
 - **Other databases.** Reading and writing Postgres or MySQL as attached databases, and streaming their

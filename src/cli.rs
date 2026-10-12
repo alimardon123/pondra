@@ -442,7 +442,7 @@ async fn run() -> anyhow::Result<()> {
                 let options = dbserver::Options { python, tier_secs: Some(tier_secs), reader, node };
                 return dbserver::serve(dir, addr, pg, default, options, auth).await;
             }
-            let owner = env::get("PONDRA_OWNER_KEY").filter(|k| k.len() >= 16); // (the same length rule `server::owner` uses)
+            let owner = env::get("PONDRA_OWNER_KEY").filter(|k| k.len() >= 16); // (16 characters at least, as a library's: `library.rs`)
             if owner.is_some() && !dir.contains("://") && std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_none()) {
                 // (a lake the shell or `local()` just made is its user's alone, as a Postgres data folder is: its catalog holds the nodes' key)
                 #[cfg(unix)]

@@ -325,13 +325,6 @@ def glossary_checks():
 # UNLISTED with its reason, one by one, never a pattern.
 DOCS = os.path.join(ROOT, "site", "src", "content", "docs")
 UNLISTED = {
-    "PONDRA_TEST_FORMAT": "a build posing as a later lake format, for upgrade_check.py",
-    "PONDRA_TEST_PANICS": "turns on pondra_panic(), for harness.py safety",
-    "PONDRA_CRASH": "injects crashes at named points, for harness.py crash",
-    "PONDRA_TEST_NO_GATE": "turns the row locks' gate off, to show the lost update it prevents, for harness.py round7",
-    "PONDRA_TEST_AUTOCOMMIT_PAUSE_MS": "holds an autocommitted write between its rows and its append, for harness.py round7 and autocommit",
-    "PONDRA_DROP_BEATS": "drops heartbeats from the nodes a file names, for cluster.py isolate",
-    "PONDRA_NO_DIRECT": "acts as if the leader were out of reach, for harness.py serverless",
     "load_ipython_extension": "IPython calls it for `%load_ext pondra`, which the Python reference shows",
     "expr": "frame.py's own helper (an Expr from a value or SQL), not one of Polars' names",
     "sql_type": "frame.py's own helper (a SQL type from a dtype), which client.py uses",
@@ -381,10 +374,16 @@ def _public(path, classes):
     return out
 
 
+def _settings():
+    """src/env.rs's table, the one list of every PONDRA_* name a node reads: {name: who}."""
+    text = open(os.path.join(ROOT, "src", "env.rs"), encoding="utf-8").read()
+    return dict(re.findall(r'\("(PONDRA_[A-Z0-9_]+)",\s*(\w+)\)', text))
+
+
 def _variables():
-    """Every PONDRA_* variable the node or a client reads: the name as a string of its own."""
-    out = set()
-    for d in ["src", "python/pondra", "js"]:
+    """Every PONDRA_* variable a user may set: the node's settings but its tests' hooks, and what a client reads."""
+    out = {n for n, who in _settings().items() if who != "Test"}
+    for d in ["python/pondra", "js"]:
         for base, _, files in os.walk(os.path.join(ROOT, d)):
             for f in files:
                 if f.endswith((".rs", ".py", ".js")) and "node_modules" not in base:
@@ -399,6 +398,7 @@ def coverage():
     http = _text("reference/http.mdx", "reference/iceberg-rest.mdx")
     named = {_shape(m.group(0)) for m in re.finditer(r"/[A-Za-z0-9_{}*.\-/]*", http)}
     cli = _text("reference/cli.mdx")
+    env = _text("reference/environment.mdx")
     commands = _commands() if os.path.exists(BIN) else {}
     checks = {
         "reference/http.mdx": sorted(r for r in _routes() if _shape(r) not in named),
@@ -406,7 +406,8 @@ def coverage():
         "reference/python.mdx": sorted(n for n in _public("python/pondra/client.py", {"Pondra", "Result", "Run", "Vars"}) | _public("python/pondra/__init__.py", ()) if not word(n, _text("reference/python.mdx"))),
         "reference/frames.mdx": sorted(n for n in _public("python/pondra/frame.py", {"Frame", "Expr", "_Str", "_Dt", "GroupBy", "Merge"}) if not word(n, _text("reference/frames.mdx"))),
         "reference/javascript.mdx": sorted(n for n in set(re.findall(r"^\s{2}(?:async\s+)?\*?([a-zA-Z]\w*)\s*\(", open(os.path.join(ROOT, "js", "index.js"), encoding="utf-8").read(), re.M)) - {"constructor", "if", "for", "while", "switch", "catch"} if not word(n, _text("reference/javascript.mdx"))),
-        "reference/environment.mdx": sorted(v for v in _variables() if v not in _text("reference/environment.mdx")),
+        "reference/environment.mdx": sorted(v for v in _variables() if not word(v, env))
+        + sorted(f"{v} (no such setting)" for v in set(re.findall(r"^\| `(PONDRA_[A-Z0-9_]+)`", env, re.M)) - set(_settings()) - _variables()),
     }
     checks = {p: [n for n in missing if n not in UNLISTED] for p, missing in checks.items()}
     return [{"page": os.path.join(DOCS, p), "ran": 0, "ok": not missing, **({} if not missing else {"error": "doesn't name: " + ", ".join(missing)})} for p, missing in checks.items()]
