@@ -1,10 +1,11 @@
 // What `npm install pondra` gives, tried: the binary for this platform is found, a node starts on
-// a new lake, and a table, an exactly-once append, a view, a query, parameters and a procedure work.
+// a new lake, and a table, an exactly-once append, a view, a query, parameters and a procedure work;
+// and open() runs a node in this process from the library the platform's package carries.
 import { mkdtempSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { local } from "pondra";
+import { local, open } from "pondra";
 
 // The package's page on npm: its own short README (install, an example, what it does, the docs).
 const readme = readFileSync(join(dirname(createRequire(import.meta.url).resolve("pondra")), "README.md"), "utf8");
@@ -27,4 +28,15 @@ try {
   console.log("ok:", JSON.stringify(rows));
 } finally {
   await db.close();
+}
+
+const inside = await open(); // (a lake in a temporary folder, in this process)
+try {
+  await inside.sql("CREATE TABLE m (x INT)");
+  await inside.sql("INSERT INTO m VALUES (1), (2)");
+  const n = await inside.sql("SELECT count(*) AS n FROM m");
+  if (Number(n[0].n) !== 2) throw new Error(JSON.stringify(n));
+  console.log("ok: open() in this process,", Number(n[0].n), "rows");
+} finally {
+  await inside.close();
 }

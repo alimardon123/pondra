@@ -1521,6 +1521,9 @@ fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions
         }
         let (a, b) = tokio::join!(c.run(), g.run());
         if let Err(e) = a.and(b) {
+            if crate::library::on() {
+                return crate::library::failed(format!("the catalog's compactor or garbage collector failed: {e}"));
+            }
             eprintln!("stopping: the catalog's compactor or garbage collector failed: {e}");
             std::process::abort();
         }
@@ -2095,6 +2098,9 @@ pub fn maybe_crash(point: &str) {
     for (name, prob) in spec.split(',').filter_map(|p| p.split_once(':')) {
         let roll = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1e6;
         if name == point && roll < prob.parse().unwrap_or(0.0) {
+            if crate::library::on() {
+                panic!("PONDRA_CRASH at {point}"); // (a library's node fails, its host stays: a vital loop's panic)
+            }
             eprintln!("PONDRA_CRASH: aborting at {point}");
             std::process::abort();
         }

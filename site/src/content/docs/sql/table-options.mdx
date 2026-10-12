@@ -13,7 +13,8 @@ parentheses: `publish = (delta, iceberg)`. Names aren't case sensitive.
 you get depends on the key:
 
 - **Append table**: no key. Every row is kept.
-- **Keyed table** (upsert table): a `PRIMARY KEY`. A new row with an existing key replaces the old one.
+- **Keyed table** (upsert table): a `PRIMARY KEY`. A plain `INSERT` of a key it holds is refused (`23505`);
+  an upsert (`INSERT OR REPLACE`, `ON CONFLICT`, `MERGE`) or a load replaces the old row.
 - **Merge table**: a key, and `MERGE` on every other column. Rows with the same key combine.
 
 | Clause | For | Meaning |
@@ -67,7 +68,7 @@ CREATE TABLE sessions (user_id BIGINT PRIMARY KEY, seen TIMESTAMP, page VARCHAR)
 SEQUENCE BY seen
 TTL seen + INTERVAL '1 hour';
 INSERT INTO sessions VALUES (1, now(), '/home');
-INSERT INTO sessions VALUES (1, TIMESTAMP '2000-01-01 00:00:00', '/old');
+INSERT OR REPLACE INTO sessions VALUES (1, TIMESTAMP '2000-01-01 00:00:00', '/old');
 SELECT user_id, page FROM sessions;
 ```
 

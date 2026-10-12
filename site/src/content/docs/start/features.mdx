@@ -163,12 +163,12 @@ INSERT INTO events VALUES ('ann', 5, TIMESTAMP '2026-09-29 10:00:00'),
 ```
 
 ### Keyed table
-With `PRIMARY KEY`, an `INSERT` replaces the row with the same key, and `UPDATE` and `DELETE` find rows by key. `db.lookup` reads one key without planning a query. [Keyed tables](/pondra/concepts/keyed-tables/)
+With `PRIMARY KEY`, a plain `INSERT` of a key the table holds is refused (`23505`, as in Postgres); an upsert (`INSERT OR REPLACE`, `ON CONFLICT`) replaces the row, and `UPDATE` and `DELETE` find rows by key. `db.lookup` reads one key without planning a query. [Keyed tables](/pondra/concepts/keyed-tables/)
 
 ```sql
 CREATE TABLE customers (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
 INSERT INTO customers VALUES (1, 'ann', 'free'), (2, 'bob', 'free');
-INSERT INTO customers VALUES (2, 'bob', 'pro');
+INSERT OR REPLACE INTO customers VALUES (2, 'bob', 'pro');
 ```
 
 ### Latest row by event time
@@ -177,7 +177,7 @@ INSERT INTO customers VALUES (2, 'bob', 'pro');
 ```sql
 CREATE TABLE readings (sensor VARCHAR PRIMARY KEY, ts TIMESTAMP, value DOUBLE) SEQUENCE BY ts;
 INSERT INTO readings VALUES ('s1', TIMESTAMP '2026-09-27 10:05:00', 41.3);
-INSERT INTO readings VALUES ('s1', TIMESTAMP '2026-09-27 10:01:00', 41.2);
+INSERT OR REPLACE INTO readings VALUES ('s1', TIMESTAMP '2026-09-27 10:01:00', 41.2);
 SELECT * FROM readings;
 ```
 
@@ -300,6 +300,14 @@ SHOW CREATE TABLE prices;
 ```sql
 CREATE VIEW big_events AS SELECT * FROM events WHERE amount > 5;
 SELECT * FROM big_events;
+```
+
+### Measures
+A view can say a number once, as `AS MEASURE`, and each query gets it right at its own grain with `MEASURE(name)`. [Measures and key facts](/pondra/guides/measures/)
+
+```sql
+CREATE VIEW user_totals AS SELECT e.user AS person, sum(e.amount) AS MEASURE total FROM events e;
+SELECT person, MEASURE(total) AS total FROM user_totals GROUP BY person ORDER BY person;
 ```
 
 ### Temporary tables
@@ -615,7 +623,7 @@ SELECT count(*) AS n FROM bids;
 
 ### Transactions
 
-`BEGIN` … `COMMIT` makes several statements one commit, all or nothing; each reads the lake as it was at `BEGIN`, and a conflicting commit is refused with `40001`. [Change rows](/pondra/guides/change-rows/#transactions)
+`BEGIN` … `COMMIT` makes several statements one commit, all or nothing. A transaction runs as `READ COMMITTED` with row locks, as in Postgres: a statement waits for a row another transaction is changing. `REPEATABLE READ` reads one snapshot and refuses a conflicting commit with `40001`. Savepoints work inside one, and DDL runs at once with a notice. [Change rows](/pondra/guides/change-rows/#transactions)
 
 ```sql
 CREATE TABLE accounts (id BIGINT PRIMARY KEY, owner VARCHAR, balance BIGINT);

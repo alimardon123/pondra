@@ -181,7 +181,7 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      - name: Build
+      - name: Build # (the program, the library and its launcher, into one folder: the packages carry the two, the archive the program)
         env:
           # (jemalloc, Linux's allocator, takes the build machine's page size and won't start on a
           # kernel with bigger pages: arm64 kernels use 4, 16 or 64 KB (a Raspberry Pi 5, some RHEL),
@@ -191,9 +191,9 @@ jobs:
           if [ -n "${{ matrix.zig }}" ]; then
             pip install ziglang cargo-zigbuild
             # (zig's linker says, on every build, that it ignores the -Wl,-O1 rustc passes it: not a warning of ours)
-            RUSTFLAGS="-A linker_messages" cargo zigbuild --profile dist --target ${{ matrix.zig }}
+            RUSTFLAGS="-A linker_messages" cargo zigbuild --profile dist --target ${{ matrix.zig }} --workspace
           else
-            cargo build --profile dist --target ${{ matrix.target }}
+            cargo build --profile dist --target ${{ matrix.target }} --workspace
           fi
       - run: python tools/smoke.py "$BIN" # (on this OS: the shell, SQL, and memory read without /proc)
       # The pip and npm packages and the installers' archive, installed and tried as on a user's

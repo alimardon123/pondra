@@ -51,6 +51,9 @@ PROCESS = {
     "defaults.rs:CTX": "a session with no tables, for DEFAULT and CHECK expressions: nothing of a lake",
     "dbserver.rs:KEY": "the key a lakes server gives its databases' nodes (`client_key`): one a process, made once",
     "delta.rs:ONE": LOCK,
+    "library.rs:LIBRARY": "what the process is: a library's, from its first open (ADR-061 §5)",
+    "library.rs:R": "a library's runtime, kept for the next open: its threads are the process's, as the queries' runtime's are",
+    "library.rs:SUPERVISOR": "the supervisor of the node open now, which outlives each start of that node (a restart in place)",
     "env.rs:GIVEN": "what the process was given (open's options, the command line's flags): fixed by its first open (ADR-061 §8)",
     "ext.rs:CLIENT": "a client with no token, for other engines' REST catalogs: only its keep-alive sockets",
     "files.rs:SUBSTR": "a function's definition",
@@ -262,6 +265,20 @@ def settings():
     return bad + [f"src/env.rs: NAMES lists {name}, which nothing reads: take it out" for name in sorted(names - read)]
 
 
+def poisoned(found):
+    """A process's lock read with `.unwrap()`: a library's node restarting in place unwinds through
+    whatever lock it holds (`library::restart`), and the next start must still read it."""
+    bad = []
+    for rel, line, name, ty, how, value in found:
+        if how != "static" or f"{rel.rsplit('/', 1)[-1]}:{name}" not in PROCESS or not re.search(r"(?<!tokio::sync::)\b(Mutex|RwLock)<", ty):
+            continue
+        text = tests_cut(open(os.path.join(SRC, rel), encoding="utf-8").read())
+        for m in re.finditer(rf"\b{name}\s*\.\s*(?:lock|read|write)\(\)\s*\.\s*unwrap\(\)", text):
+            n = text.count("\n", 0, m.start()) + 1
+            bad.append(f"src/{rel}:{n}: {name} is the process's and may be poisoned by a restart in place: read it with .unwrap_or_else(PoisonError::into_inner)")
+    return bad
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--list", action="store_true", help="every static and how it passes")
@@ -276,7 +293,7 @@ def main():
         if not ok:
             bad.append(f"src/{rel}:{line} {name} ({ty}): {why}")
     stale = sorted(k for k in PROCESS if k not in keys)
-    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings()
+    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings() + poisoned(found)
     bad += more
     for b in bad if not args.list else more:
         print(f"FAIL {b}")

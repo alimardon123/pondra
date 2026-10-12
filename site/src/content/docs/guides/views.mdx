@@ -159,8 +159,9 @@ view this way; `WITH (refresh = 'incremental')` refuses a view the rows alone ca
 
 <Aside type="caution">
 A view kept from each write's rows, not run again, can't take a row back if it keeps a `min` or
-`max`, reads another table, or is a window, session or stream join. An `UPDATE` or `DELETE` of its
-source is refused while it exists. `DROP MATERIALIZED VIEW name` first, or change a copy of the table.
+`max`, reads another table, or is a window, session or stream join. An `UPDATE` or `DELETE` that changes
+rows of its source is refused while it exists. One that matches no row answers `0`, and a `MERGE` that
+only inserts is followed as an `INSERT`. `DROP MATERIALIZED VIEW name` first, or change a copy of the table.
 A view that runs its query again follows any change. To change a view's query,
 `CREATE OR REPLACE MATERIALIZED VIEW` makes it again from the rows already there. A materialized
 view may follow another, in the same commit: see [Flows](/pondra/guides/flows/).
@@ -184,7 +185,7 @@ row to arrive. This is Flink's deduplication by event time.
 ```sql
 CREATE TABLE latest (k BIGINT PRIMARY KEY, ts BIGINT, v VARCHAR) SEQUENCE BY ts;
 INSERT INTO latest VALUES (1, 100, 'new');
-INSERT INTO latest VALUES (1, 50, 'old');
+INSERT OR REPLACE INTO latest VALUES (1, 50, 'old');
 SELECT * FROM latest;
 ```
 
@@ -217,9 +218,19 @@ holds each user's running total. Make a task before the rows it should see arriv
 
 <Aside type="caution">
 A task's target must have exactly the columns the SQL returns. If the target doesn't exist, the
-task makes it from the query's output. A streaming task can't be dropped yet. It sees new rows only,
-so a table's rows can't be changed while a task follows it.
+task makes it from the query's output. It sees new rows only, so a table's rows can't be changed
+while a task follows it.
 </Aside>
+
+Stop a task with `DROP TASK`. It runs no more rows once the drop commits:
+
+```sql
+DROP TASK running_totals;
+```
+
+```text
+{"task":"running_totals","dropped":true}
+```
 
 ## Follow new rows
 

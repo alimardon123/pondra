@@ -76,6 +76,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod once;
 #[cfg(feature = "server")] mod metrics;
 #[cfg(feature = "server")] pub mod node;
+#[cfg(feature = "server")] pub mod library;
 #[cfg(feature = "server")] mod optimize;
 #[cfg(feature = "server")] mod pages;
 #[cfg(feature = "server")] mod panics;

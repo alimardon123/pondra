@@ -5,23 +5,32 @@ description: Tables with a PRIMARY KEY that keep one current row per key, and th
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 
-A table with a `PRIMARY KEY` keeps one current row per key: write a key again and its row is
-replaced. Use one for the latest state of things (users, devices, prices, counters). A table without
-a key is an **append table**: it keeps every row you write.
+A table with a `PRIMARY KEY` keeps one current row per key. A plain `INSERT` of a key the table already
+holds is refused, as Postgres refuses it; to replace a key's row, upsert it. Use a keyed table for the
+latest state of things (users, devices, prices, counters). A table without a key is an **append
+table**: it keeps every row you write.
 
-## Make one, and write a key again
+## Make one, and replace a key
 
 ```sql
 CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
 INSERT INTO users VALUES (1, 'ann', 'free'), (2, 'bob', 'free');
 ```
 
-Writing key 1 again is an upsert, from SQL or from a client's `append`:
+A plain `INSERT` of key 1 again is refused, with the same words Postgres uses:
+
+```text
+ERROR: duplicate key value violates unique constraint "users_pkey"
+DETAIL: Key (id)=(1) already exists
+```
+
+To replace the row, upsert it: `INSERT OR REPLACE` from SQL, or a client's `append`, which replaces a
+key's row too:
 
 <Tabs syncKey="lang">
   <TabItem label="SQL">
     ```sql
-    INSERT INTO users VALUES (1, 'ann', 'pro');
+    INSERT OR REPLACE INTO users VALUES (1, 'ann', 'pro');
     ```
   </TabItem>
   <TabItem label="Python">
@@ -146,6 +155,8 @@ SELECT * FROM spend ORDER BY user;
 
 A materialized view with `GROUP BY` is a merge table. It keeps one row of running totals per key,
 and any number of nodes can update it at once, with no shuffle between them.
+Its table is a merge table, so `UPDATE` and `DELETE` on it are refused (`0A000`). Change the view's source
+table instead: the view takes the change in, and adds it up.
 
 ```sql
 CREATE TABLE clicks (user VARCHAR, amount BIGINT);
@@ -195,7 +206,7 @@ in that column wins, however late it arrives. This is what Flink calls deduplica
 ```sql
 CREATE TABLE readings (sensor VARCHAR PRIMARY KEY, ts TIMESTAMP, temp DOUBLE) SEQUENCE BY ts;
 INSERT INTO readings VALUES ('s1', TIMESTAMP '2026-09-29 10:00:00', 20.0);
-INSERT INTO readings VALUES ('s1', TIMESTAMP '2026-09-29 09:00:00', 18.0);
+INSERT OR REPLACE INTO readings VALUES ('s1', TIMESTAMP '2026-09-29 09:00:00', 18.0);
 SELECT * FROM readings;
 ```
 
@@ -245,9 +256,9 @@ Three rounds of updating 1,000 keys leave three files and 1,000 rows:
 CREATE TABLE counters (id BIGINT PRIMARY KEY, n BIGINT);
 INSERT INTO counters SELECT x AS id, 1 AS n FROM generate_series(1, 1000) t(x);
 CHECKPOINT;
-INSERT INTO counters SELECT x AS id, 2 AS n FROM generate_series(1, 1000) t(x);
+INSERT OR REPLACE INTO counters SELECT x AS id, 2 AS n FROM generate_series(1, 1000) t(x);
 CHECKPOINT;
-INSERT INTO counters SELECT x AS id, 3 AS n FROM generate_series(1, 1000) t(x);
+INSERT OR REPLACE INTO counters SELECT x AS id, 3 AS n FROM generate_series(1, 1000) t(x);
 CHECKPOINT;
 SELECT count(*) AS keys, min(n) AS lowest FROM counters;
 ```
@@ -278,7 +289,7 @@ in any partition, so a row that moves to another day still has one current versi
 CREATE TABLE visits (id BIGINT PRIMARY KEY, user VARCHAR, ts TIMESTAMP, page VARCHAR)
   PARTITION BY day(ts) CLUSTER BY (user);
 INSERT INTO visits VALUES (1, 'ann', TIMESTAMP '2026-09-28 10:00:00', '/a'), (2, 'bob', TIMESTAMP '2026-09-28 11:00:00', '/b');
-INSERT INTO visits VALUES (1, 'ann', TIMESTAMP '2026-09-29 09:00:00', '/c');
+INSERT OR REPLACE INTO visits VALUES (1, 'ann', TIMESTAMP '2026-09-29 09:00:00', '/c');
 SELECT id, page FROM visits ORDER BY id;
 ```
 

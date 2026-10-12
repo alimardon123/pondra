@@ -221,6 +221,8 @@ RESTORE TABLE prices TO TIMESTAMP AS OF $before;
 | Rename a table | `ALTER TABLE t RENAME TO u` |
 | Drop a column | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` |
 | Widen a column | `ALTER TABLE t ALTER COLUMN c TYPE BIGINT` |
+| Set or drop a default, or NOT NULL | `ALTER TABLE t ALTER COLUMN c SET DEFAULT 'free'`, `DROP DEFAULT`, `SET NOT NULL`, `DROP NOT NULL`. A default is worked out for the rows written from now on, not for the rows there |
+| Several actions in one statement | `ALTER TABLE t ADD COLUMN a INT, DROP COLUMN b` |
 | Add a constraint | `ALTER TABLE t ADD [CONSTRAINT name] UNIQUE (column, …) \| CHECK (condition) \| FOREIGN KEY (…) REFERENCES u (…) NOT ENFORCED` |
 | Drop a constraint | `ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name` |
 | Change the layout | `ALTER TABLE t CLUSTER BY (user)`, `ALTER TABLE t TTL ts + INTERVAL '2 hours'`, `ALTER TABLE t SEQUENCE BY ts` |
@@ -245,8 +247,9 @@ BigQuery's, Snowflake's and Databricks' words. `PARTITIONED BY (c)` (Spark's), `
 `DATE(ts)` and `TIMESTAMP_TRUNC(ts, DAY)` (BigQuery's) and `date_trunc('day', ts)` are the same
 partitions. A clause and the option it stands for, both given, are refused.
 
-A table without a primary key is an append table. With a key, a new row replaces the old one with the
-same key. The options are on [table options](/pondra/sql/table-options/). An `ALTER TABLE`
+A table without a primary key is an append table. With a key, a plain `INSERT` of a key the table holds is
+refused (`23505`, as in Postgres); an upsert (`ON CONFLICT`, `INSERT OR REPLACE`, `MERGE`) or a load replaces
+the old row. The options are on [table options](/pondra/sql/table-options/). An `ALTER TABLE`
 rewrites no file: old rows read a new column as null.
 
 `NOT NULL` and `DEFAULT` are enforced on every door: `INSERT`, `POST /append`, `COPY`, Flight,
@@ -396,7 +399,7 @@ SELECT name, definition FROM pondra.objects WHERE kind = 'index';
 
 | Statement | Syntax |
 |---|---|
-| Insert | `INSERT INTO t [(column, …)] VALUES (…), …` or `INSERT INTO t [(column, …)] SELECT …` |
+| Insert | `INSERT INTO t [(column, …)] VALUES (…), …` or `INSERT INTO t [(column, …)] SELECT …`; on a keyed table, a key the table holds (or two rows of one key) is refused with `23505`, the whole statement |
 | Insert, on a key that exists | `INSERT … ON CONFLICT (key) DO NOTHING`, or `… ON CONFLICT (key) DO UPDATE SET column = t.column + excluded.column` (Postgres's) |
 | The same, shorter | `INSERT OR IGNORE INTO t …` (`ON CONFLICT DO NOTHING`), `INSERT OR REPLACE INTO t …` (every column the rows give replaces the row's), as DuckDB and SQLite write them; MySQL's `INSERT IGNORE` too |
 | Update | `UPDATE t SET column = expression [, …] [FROM other o] [WHERE condition]` |
@@ -436,14 +439,17 @@ SELECT * FROM visits ORDER BY id;
 
 | Statement | Syntax |
 |---|---|
-| Begin | `BEGIN [TRANSACTION \| WORK] [ISOLATION LEVEL …]`, `START TRANSACTION` |
+| Begin | `BEGIN [TRANSACTION \| WORK] [ISOLATION LEVEL …] [READ ONLY \| READ WRITE]`, `START TRANSACTION` |
+| Set the level | `SET TRANSACTION ISOLATION LEVEL READ COMMITTED \| REPEATABLE READ`, before the first statement; `SET SESSION CHARACTERISTICS AS TRANSACTION …` for the session |
 | Commit | `COMMIT`, `END` |
 | Roll back | `ROLLBACK`, `ABORT` |
+| Savepoint | `SAVEPOINT name`, `RELEASE [SAVEPOINT] name`, `ROLLBACK [WORK \| TRANSACTION] TO [SAVEPOINT] name` |
 
-The statements between `BEGIN` and `COMMIT` are one commit, read their own writes, and see the lake
-as it was at `BEGIN` (snapshot isolation). A row another commit changed since then refuses `COMMIT`
-with `40001`: run it again. `ISOLATION LEVEL …` after `BEGIN` is taken for the drivers that send it,
-and every transaction is snapshot isolation whatever it names. See
+The statements between `BEGIN` and `COMMIT` are one commit, and they read their own writes. A transaction
+runs at `READ COMMITTED` unless it asks otherwise: each statement reads the newest commit when it starts.
+`REPEATABLE READ` reads the commit that was newest at its first statement, and a `COMMIT` that finds a row
+changed since then is refused with `40001`. `SERIALIZABLE` is refused (`0A000`). A write locks the rows it
+changes until the transaction ends, and another transaction that wants them waits. See
 [Transactions](/pondra/guides/change-rows/#transactions).
 
 ```sql
@@ -621,7 +627,8 @@ DROP SCHEMA sales CASCADE;
 
 | Statement | Syntax |
 |---|---|
-| Stored view | `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v [(c1, c2, …)] AS SELECT …`: a query run over the tables as they are when read. `OR REPLACE` is how a stored view's query changes; `ALTER VIEW … AS SELECT` is refused |
+| Stored view | `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v [(c1, c2, … \| PRIMARY KEY (…) NOT ENFORCED, UNIQUE (…) NOT ENFORCED, FOREIGN KEY (…) REFERENCES t (…) NOT ENFORCED)] AS SELECT …`: a query run over the tables as they are when read. A select list may name a measure with `expr AS MEASURE name` ([measures and key facts](/pondra/guides/measures/)). `OR REPLACE` is how a stored view's query changes; `ALTER VIEW … AS SELECT` is refused |
+| Key facts | `ALTER VIEW v ADD [CONSTRAINT [IF NOT EXISTS] name] PRIMARY KEY (…) \| UNIQUE (…) \| FOREIGN KEY (…) REFERENCES t (…) NOT ENFORCED` and `ALTER VIEW v DROP CONSTRAINT [IF EXISTS] name`: facts about the view's rows, never checked. A materialized view takes the same with `ALTER MATERIALIZED VIEW` ([measures and key facts](/pondra/guides/measures/#key-facts-on-views)) |
 | Materialized view | `CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t … [EMIT FINAL]`: kept up to date as rows arrive; it may follow another materialized view ([Flows](/pondra/guides/flows/)). `EMIT FINAL` keeps each group of a time bucket (or `SESSION(ts, INTERVAL …)`) once it is over ([windows](/pondra/guides/windows/#windows-each-group-once-its-over)) |
 | Temporary | `CREATE [OR REPLACE] TEMP TABLE [IF NOT EXISTS] t AS SELECT …`, `CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] v AS SELECT …`: a session's own |
 | Rename | `ALTER VIEW v RENAME TO w`: a stored view, not a materialized one |
@@ -987,7 +994,7 @@ text is the node's own, it is shown in code:
 | `UPDATE` or `DELETE` on a merge table | refused: its rows combine as they are read, so `INSERT` the change instead and the key's rows take it in |
 | `UPDATE` that sets a key column | refused: `UPDATE sets existing non-key columns`; the key names the row |
 | a column called `_row_id`, `_version`, `_created_at` or `_updated_at` | refused: every table has them already |
-| `DROP TABLE` while a view or task reads the table | refused, naming them: `acc is used by materialized view mv_acc, view vdep: drop them first` |
+| `DROP TABLE` while a view or task reads the table | refused, naming it: `acc is read by view vacc: DROP TABLE acc CASCADE drops them too, or drop them first`. `DROP TABLE t CASCADE` drops the views that read it, deepest first, and then the table. A task that reads it is refused by `CASCADE` too (`DROP … CASCADE drops views only`): `DROP TASK` it first |
 | a change to a table a window, session, join or min/max view follows | refused, with the view's name, because such a view cannot take a row back |
 | a `FOREIGN KEY` or `REFERENCES` without `NOT ENFORCED` | refused: a reference isn't checked yet |
 | `UNIQUE NULLS NOT DISTINCT` | a parser error: `Expected: ',' or ')' after column definition, found: NULLS` |
@@ -995,8 +1002,11 @@ text is the node's own, it is shown in code:
 | `ALTER TABLE … ADD PRIMARY KEY` | refused: `a table's key is made with it (CREATE TABLE … PRIMARY KEY)`; `PRIMARY KEY (…) NOT ENFORCED` adds it as a fact |
 | `POST /append`, `COPY … FROM STDIN`, Kafka, Flight or another engine's commit into a table with a `UNIQUE` | refused, by name: only SQL's writes are checked on the leader |
 | `CREATE UNIQUE INDEX` on an expression, or with `WHERE` or `INCLUDE`; `CREATE INDEX … USING hnsw \| ivfflat \| bm25` | refused by name ([Indexes](#indexes): a unique index on columns is a `UNIQUE` constraint; any other index is kept, nothing is built) |
-| `SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO` | refused: `savepoints aren't supported: a transaction commits or rolls back whole` |
-| `CREATE`, `ALTER`, `DROP` inside `BEGIN` … `COMMIT` | refused (`0A000`): `this statement isn't part of a transaction here: run it before BEGIN or after COMMIT` |
+| `SAVEPOINT` or `RELEASE` outside a transaction | refused (`25P01`): `SAVEPOINT can only be used in transaction blocks` |
+| `ROLLBACK TO` an unknown savepoint | refused (`3B001`) and the transaction fails until its `ROLLBACK` |
+| `SERIALIZABLE`, in `BEGIN`, `SET TRANSACTION` or a session's default | refused (`0A000`): REPEATABLE READ is snapshot isolation, which allows write skew |
+| `SKIP LOCKED` | refused (`0A000`): a locked row is waited for, or refused at once with `NOWAIT` (`55P03`) |
+| `CREATE`, `ALTER`, `DROP` inside `BEGIN` … `COMMIT` on a table the transaction has written, or under `REPEATABLE READ` | refused (`0A000`): `COMMIT` first, or run it before `BEGIN`. Otherwise it runs at once, as its own commit, with a notice; `ROLLBACK` doesn't undo it |
 | `ON CONFLICT ON CONSTRAINT name` | refused: `name the columns instead, ON CONFLICT (id) …` |
 | `TRUNCATE a, b` | refused: `TRUNCATE one table at a time` |
 | `INSERT OR ABORT` | refused: `Pondra takes INSERT OR IGNORE and INSERT OR REPLACE, or ON CONFLICT (…) DO …` |
@@ -1004,8 +1014,9 @@ text is the node's own, it is shown in code:
 | `CREATE TEMPORARY SEQUENCE` | refused: `isn't taken yet: a sequence is the lake's (CREATE SEQUENCE)` |
 | `CREATE SEQUENCE … OWNED BY t.c` | refused: `an identity column owns its sequence (GENERATED BY DEFAULT AS IDENTITY)` |
 | `ALTER TYPE … RENAME VALUE` | refused: `rows keep the text they were written with (files are never rewritten); add the new label, UPDATE the rows to it` |
-| `DROP TYPE … CASCADE` while a column uses the type | refused (`2BP01`), as `DROP TYPE` is: `cannot drop type t because column tbl.c uses it: …; drop or change them first`. With no column using it, `CASCADE` drops it |
-| `ALTER TABLE … ALTER COLUMN … SET NOT NULL`, `DROP NOT NULL`, `SET DEFAULT` | not implemented (`0A000`): `This feature is not implemented: Unsupported SQL statement: …` |
+| `DROP TYPE … CASCADE` while a column uses the type | refused (`2BP01`), as `DROP TYPE` is: `cannot drop type mood because column uses it: tm.m; drop or change them first`. With no column using it, `CASCADE` drops it |
+| `ALTER TABLE t ALTER COLUMN c SET NOT NULL` while a row has NULL in `c` | refused, naming the rows: `column "c" of relation "t" contains null values (1 rows): UPDATE t SET c = … WHERE c IS NULL first` |
+| `SET name = value` sent alone over HTTP | refused (`55000`): a setting is a session's. Send `x-pondra-session: <id>` with the statements that use it, or use a client's session |
 | `ALTER VIEW v AS SELECT …` | not implemented, the same message; use `CREATE OR REPLACE VIEW v AS SELECT …` |
 | `PRAGMA`, `INSTALL`, `LOAD`, `CREATE TRIGGER`, `LOCK TABLE`, `VACUUM`, `CREATE EXTENSION`, `DISCARD ALL`, `CLOSE ALL` | not implemented over HTTP, the same message. The [Postgres port](/pondra/reference/postgres/) takes `DISCARD` and `CLOSE` and ignores them |
 | `ALTER TABLE t SET TBLPROPERTIES (k = v)` with a name not listed | refused, naming it: `k: ALTER TABLE … SET takes publish, cluster_by, ttl, order_by and retention, and other engines' properties (write.delete.mode = 'merge-on-read')` |

@@ -70,6 +70,7 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_INLINE_KB", Node),
     ("PONDRA_JOIN_ORDER", Node),
     ("PONDRA_KMS_COMMAND", Node),
+    ("PONDRA_LAUNCHER", Node),
     ("PONDRA_LEARN", Node),
     ("PONDRA_LEARN_MS", Node),
     ("PONDRA_LINK", Node),

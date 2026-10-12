@@ -35,7 +35,8 @@ INSERT INTO orders SELECT 10000 + value, 'bulk', 1, 1.5 FROM generate_series(1, 
   query.
 - Many small `INSERT … VALUES` statements don't make many small files: the rows are gathered into one
   file per table each time the lake tiers its newest rows to Parquet.
-- Into a keyed table, `INSERT` is an upsert (see [Tables](/pondra/guides/tables/)).
+- Into a keyed table, a plain `INSERT` of a key the table holds is refused; `append`, `COPY` and Kafka
+  replace the row (see [Tables](/pondra/guides/tables/)).
 
 ## Append rows from code
 

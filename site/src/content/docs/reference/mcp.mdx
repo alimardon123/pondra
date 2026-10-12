@@ -15,8 +15,8 @@ read [AI agents (MCP)](/pondra/guides/agents/).
 | Tool | Arguments | Does |
 |---|---|---|
 | `list_tables` | none | every table and view: its name (`schema.table` outside `public`, `lake.table` for an attached lake), its columns and their types, its kind, and a view's SQL. The kind is `append`, `upsert` (a primary key: the newest row per key wins), `merge` (rows per key combine, as `sum`) or `view` |
-| `query` | `sql` | runs one query and answers `{"rows": […], "total_rows": N}`: the first 1000 rows, and the count of all. A statement that writes is refused: `this is a write: use the write tool` |
-| `write` | `sql`, `job` (optional) | runs `INSERT`, `UPDATE`, `DELETE` (on any table) and `CALL`, and `CREATE`, `ALTER` or `DROP` of tables, views, materialized views and schemas. It is committed and durable when it answers. `job` is an id for the write: sent again with the same id, it is applied once |
+| `query` | `sql` | runs one query and answers `{"rows": […], "total_rows": N}`: the first 1000 rows, and the count of all. A statement that writes, or is `BEGIN`, `COMMIT` or `ROLLBACK`, is refused (`SQLSTATE 25006`): `this changes data or a transaction: use the write tool` |
+| `write` | `sql`, `job` (optional) | runs `INSERT`, `UPDATE`, `DELETE` (on any table) and `CALL`, `CREATE`, `ALTER` or `DROP` of tables, views, materialized views and schemas, and `BEGIN`, `COMMIT` and `ROLLBACK`. Outside a transaction, a write is committed and durable when it answers. `job` is an id for the write: sent again with the same id, it is applied once. Inside a session's transaction, it is committed at `COMMIT` ([below](#sessions-and-transactions)) |
 | `changes` | `table`, `after` (optional) | what was committed to a table after a position: every insert, update and delete, about 1000 rows at a time, and the `position` to ask from next |
 | `find` | `text`, `kind` (optional) | finds tables, views, columns, keys, links, routines and every other object or part by its name, comment or definition, and Pondra's concepts by other products' names: the rows `pondra.find(text)` gives in SQL |
 
@@ -72,9 +72,8 @@ text, which the agent can read and act on (`no tool nosuch`, `this token may not
 SQL error), after Postgres's code for it: `SQLSTATE 23514: new row for relation "t" violates check
 constraint …` ([error codes](/pondra/reference/postgres/#error-codes)).
 
-MCP has no session, so a transaction is refused by name. `query` answers `BEGIN` with `SQLSTATE 0A000`
-and `Unsupported SQL statement: BEGIN`. `write` refuses it as a statement that isn't a write, with
-`SQLSTATE XX000`. A procedure that does the work as one call takes its place.
+A `write` of `BEGIN`, `COMMIT` or `ROLLBACK` with no session is refused (`SQLSTATE 0A000`): a transaction needs
+one. Send several statements in one `write` call with no session, `BEGIN; …; COMMIT`, and they run as one transaction.
 
 ```bash
 mcp() {
@@ -95,8 +94,55 @@ mcp '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"query","arg
 {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"rows\":1}"}],"isError":false}}
 {"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"rows\":1}"}],"isError":false}}
 {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"{\"rows\":[{\"id\":1,\"body\":\"hello agent\"},{\"id\":2,\"body\":\"none\"}],\"total_rows\":2}"}],"isError":false}}
-{"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"SQLSTATE XX000: this is a write: use the write tool"}],"isError":true}}
+{"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"SQLSTATE 25006: this changes data or a transaction: use the write tool"}],"isError":true}}
 ```
+
+## Sessions and transactions
+
+`initialize` gives the client an `Mcp-Session-Id`, in the answer's headers. The calls that send that header
+back share one session, and a transaction lasts as long as its session:
+
+- `write` with `BEGIN` opens a transaction in the session. Later `write` and `query` calls in it run in the
+  transaction: a `query` reads its snapshot and its own writes. `write` with `COMMIT` commits it, and
+  `ROLLBACK` drops it. A failed statement fails the transaction, and its later statements are refused (`25P02`)
+  until `ROLLBACK`.
+- The session ends with `DELETE /mcp` and its `Mcp-Session-Id`, or when it has been idle for
+  `PONDRA_SESSION_IDLE_SECS` (3600 seconds). Ending a session rolls back its transaction.
+- A request with an id the node doesn't hold (never made there, ended, or idle too long) is `404` with the
+  JSON-RPC error `-32001`. Send `initialize` again. `DELETE` of such an id is `404` too. A malformed id is
+  `400` (`-32600`).
+- A request with no `Mcp-Session-Id` is stateless: each call stands alone.
+- A session lives on the node that made it. Behind a load balancer, pin an MCP client to one node: a call that
+  reaches another node gets `404`.
+
+```bash
+SID=$(curl -s -D - -o /dev/null -X POST localhost:8080/mcp -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}' \
+  | tr -d '\r' | awk 'tolower($1) == "mcp-session-id:" {print $2}')
+call() {
+  curl -s -X POST localhost:8080/mcp -H 'content-type: application/json' -H "mcp-session-id: $SID" -d "$1"
+  echo
+}
+call '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write","arguments":{"sql":"BEGIN"}}}'
+call '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"write","arguments":{"sql":"INSERT INTO notes VALUES (3, '"'"'in a transaction'"'"')"}}}'
+call '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT count(*) AS n FROM notes"}}}'
+call '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"write","arguments":{"sql":"ROLLBACK"}}}'
+call '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT count(*) AS n FROM notes"}}}'
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE localhost:8080/mcp -H "mcp-session-id: $SID"
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE localhost:8080/mcp -H "mcp-session-id: $SID"
+```
+
+```text
+{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"transaction\":\"begin\"}"}],"isError":false}}
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"rows\":1,\"updated\":0,\"deleted\":0,\"inserted\":1}"}],"isError":false}}
+{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"rows\":[{\"n\":3}],\"total_rows\":1}"}],"isError":false}}
+{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"{\"transaction\":\"rollback\"}"}],"isError":false}}
+{"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"{\"rows\":[{\"n\":2}],\"total_rows\":1}"}],"isError":false}}
+204
+404
+```
+
+Behind a load balancer, see [AI agents](/pondra/guides/agents/#transactions) for the one-node setting.
 
 ## Tokens
 

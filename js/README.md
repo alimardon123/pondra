@@ -12,8 +12,8 @@ the bucket is the only state.
 
 This package installs the `pondra` binary for your platform and a small JavaScript client (no
 dependencies; Node 18+). The client also runs in browsers, Deno and Bun, wherever `fetch` does; `local`
-and `binary` need Node, and `ca` (the authority that signs an `https` node's certificate) needs Node 22.19
-or later.
+and `binary` need Node, `open` needs Node, Bun or Deno, and `ca` (the authority that signs an `https` node's
+certificate) needs Node 22.19 or later.
 
 ```bash
 npm install pondra        # in a project; or npm install -g pondra, or npx pondra with no install
@@ -33,6 +33,19 @@ for await (const rows of db.live("SELECT count(*) AS n FROM events")) {
 }
 await db.call("send_report", "2026-09-27");              // a stored procedure (SQL or Python)
 await db.close();
+```
+
+`open()` runs the node in this process instead, so there is no second process to start. It works in Node, Bun
+and Deno, and returns the same connection. `close()` stops the node and gives its term back; a temporary lake
+(made when `open` gets no folder) is removed. `local()` still starts a node beside your program.
+
+```js
+import { open } from "pondra";
+
+const db = await open();                                 // a lake in a temporary folder, removed by close()
+await db.sql("CREATE TABLE t (a INT)");
+await db.close();
+const kept = await open("lake");                         // a folder or s3://bucket/prefix, kept after close()
 ```
 
 A frame is a query written in JavaScript: each step is a CTE of the SQL the node runs, so the plan

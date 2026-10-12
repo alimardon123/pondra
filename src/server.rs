@@ -399,14 +399,14 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         let who = crate::auth::Principal::of(crate::auth::Role::None).at("http", from);
         return match crate::panics::door(crate::auth::WHO.scope(who, next.run(req))).await {
             Ok(r) => r,
-            Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+            Err(m) => E(anyhow::anyhow!(m)).into_response(),
         };
     }
     if req.uri().path().starts_with("/delta-sharing/") {
         // (a recipient's token or a file's signed link, which the door checks: never a user's sign-in)
         return match crate::panics::door(next.run(req)).await {
             Ok(r) => r,
-            Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+            Err(m) => E(anyhow::anyhow!(m)).into_response(),
         };
     }
     let needed = crate::auth::Auth::needed(req.uri().path(), req.method().as_str());
@@ -434,7 +434,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     };
     let who = match signed {
         Some(p) => p,
-        None if owner(req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
+        None if owner(&app.auth, req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
         None if starting && needed == crate::auth::Role::None => crate::auth::Principal::of(crate::auth::Role::None), // (a probe while it catches up: answered, never held)
         None if app.open().await => match crate::auth::cross_site(req.headers(), req.method(), from, &app.cluster.addr) {
             Some(why) => return (StatusCode::FORBIDDEN, why).into_response(), // (a browser's page from elsewhere: `auth::cross_site`)
@@ -490,7 +490,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     };
     match if heavy { crate::panics::work(run).await } else { crate::panics::door(run).await } {
         Ok(r) => r,
-        Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(), // (and the node stays up)
+        Err(m) => E(anyhow::anyhow!(m)).into_response(), // (and the node stays up)
     }
 }
 
@@ -1193,8 +1193,8 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
     let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
     if meta.merge.is_empty() && meta.ttl.is_none() && meta.order.is_none() {
-        let names: Vec<&str> = meta.columns.iter().map(|(c, _)| c.as_str()).filter(|c| *c != "_deleted").collect(); // (as `SELECT *` shows it)
-        let row = crate::serve::lookup(lake, &name, &meta, &key).await?.map(|r| r.project(&names.iter().map(|n| r.schema().index_of(n)).collect::<Result<Vec<_>, _>>()?)).transpose()?;
+        let shown = crate::query::schema(&meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect::<Vec<_>>())?; // (as `SELECT *` shows it)
+        let row = crate::serve::lookup(lake, &name, &meta, &key).await?.map(|r| crate::query::conform(&r, &shown)).transpose()?; // (by name: a row from before an ADD COLUMN lacks it)
         let row = row.map(|r| meta.to_logical(&r)).transpose()?;
         let mut w = arrow_json::ArrayWriter::new(Vec::new());
         w.write_batches(&row.iter().collect::<Vec<_>>())?;
@@ -1238,20 +1238,20 @@ struct SqlParams {
     rows: Option<usize>,    // typed: the rows of the first page (the console's rows a page; `SHOWN` if not said)
 }
 
-/// Is this request from whoever started the node here (the shell: `PONDRA_OWNER_KEY`)? Then its
-/// SQL may read files on this machine, as `pondra sql` may (invariant 21: nobody else's).
-fn owner(headers: &axum::http::HeaderMap) -> bool {
-    static KEY: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| crate::env::get("PONDRA_OWNER_KEY").filter(|k| k.len() >= 16));
+/// Is this request from whoever started the node here (the shell's or `local()`'s `PONDRA_OWNER_KEY`, a
+/// library's host's key: the node's `Auth::owned_by`)? Then its SQL may read files on this machine, as
+/// `pondra sql` may (invariant 21: nobody else's).
+fn owner(auth: &crate::auth::Auth, headers: &axum::http::HeaderMap) -> bool {
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     crate::auth::lent(token).is_some_and(|l| l.1) // (a Python procedure the owner called)
-        || KEY.as_deref().is_some_and(|k| headers.get("x-pondra-owner").is_some_and(|h| aws_lc_rs::constant_time::verify_slices_are_equal(h.as_bytes(), k.as_bytes()).is_ok()))
+        || headers.get("x-pondra-owner").and_then(|h| h.to_str().ok()).is_some_and(|h| auth.is_owner(h))
 }
 
 /// `POST /sql`: statements (SQL, or JSON with `$name` parameters, or that and tables of the
 /// caller's own: `routines::Request`), run in order; the last one's answer. A single query as it
 /// was sent may be answered from `Results`.
 async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
-    let files = owner(&headers); // (the program that started this node: its files, and URLs no secret covers)
+    let files = owner(&app.auth, &headers); // (the program that started this node: its files, and URLs no secret covers)
     let session = match crate::temp::of(&headers) { // (its temporary tables: `temp.rs`)
         Ok(session) => session,
         Err(e) => return E::from(e).into_response(), // (a session name that isn't one: refused, saying what one is)
@@ -1316,7 +1316,7 @@ async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extensi
         Some("capture") => Verb::Capture,
         _ => Verb::Apply,
     };
-    let who = crate::routines::Who { role: role.0, files: owner(&headers), depth: 0 };
+    let who = crate::routines::Who { role: role.0, files: owner(&app.auth, &headers), depth: 0 };
     Ok(Json(crate::apply::ask(&app, verb, ask, who).await?))
 }
 
@@ -1327,7 +1327,7 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     // (a Python procedure's own calls, through the token lent to it; anyone else's is a first call)
     let lent = crate::auth::lent(headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "))).is_some();
     let depth = headers.get("x-pondra-depth").filter(|_| lent).and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0);
-    let who = Who { role: role.0, files: owner(&headers), depth };
+    let who = Who { role: role.0, files: owner(&app.auth, &headers), depth };
     if let Some(seg) = p.after {
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
@@ -1798,7 +1798,7 @@ async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<V
                     "hwm": *app.lake.hwm.borrow(), "shard_runs": c.shard_runs.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     s["version"] = j!(crate::format::VERSION);
-    s["owner"] = j!(owner(&headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)
+    s["owner"] = j!(owner(&app.auth, &headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)
     s["format"] = j!(crate::format::of(&app.lake.cat).await.map(|f| f.format).unwrap_or_default()); // (the lake's: ADR-039)
     s["keys"] = j!(crate::users::kept(&app.lake).await); // (the lake's own keys: sealed by its master key, or in the clear)
     // Background jobs that failed, by kind: a rising count is a stall (tiering, publishing, …) that

@@ -46,12 +46,13 @@ nodes see it a few milliseconds later ([freshness and guarantees](/pondra/concep
 
 ## 2. A keyed table
 
-Give a table a `PRIMARY KEY` and `INSERT` becomes an upsert: one current row per key.
+Give a table a `PRIMARY KEY` and it keeps one current row per key: a plain `INSERT` of a key it holds is
+refused, as in Postgres, and `INSERT OR REPLACE` replaces the row.
 
 ```sql
 CREATE TABLE customers (id BIGINT PRIMARY KEY, name VARCHAR, city VARCHAR);
 INSERT INTO customers VALUES (1, 'ann', 'Tashkent'), (2, 'bob', 'Paris');
-INSERT INTO customers VALUES (2, 'bob', 'Rome');
+INSERT OR REPLACE INTO customers VALUES (2, 'bob', 'Rome');
 ```
 
 ```python
