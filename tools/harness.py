@@ -1358,7 +1358,7 @@ def tails():
         insert(i)
         check(f"after insert {i}")
     s = f"tail-{uuid.uuid4().hex[:8]}"
-    http("BEGIN", s)
+    http("BEGIN ISOLATION LEVEL REPEATABLE READ", s)  # (a snapshot held: READ COMMITTED, the default, reads each statement's newest)
     snapshot = http("SELECT count(*) AS n FROM t", s)[0]["n"]
     for i in range(40, 50):
         insert(i)
