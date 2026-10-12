@@ -4,7 +4,7 @@
 # of the newest release is upgraded to this build a node at a time under load
 # (tools/upgrade_check.py all); a table's past: UNDROP and retention (tools/history_check.py, ADR-043);
 # branch databases on disk and in a bucket (tools/environments_check.py, ADR-047); a project in Git
-# deployed to them (tools/project_check.py); Git folders (tools/git_check.py, ADR-060 §8). In two halves side by side: the releases' checks, and the rest.
+# deployed to them (tools/project_check.py); Git folders (tools/git_check.py, ADR-060 §8); backups (tools/backup_check.py, ADR-070). In two halves side by side: the releases' checks, and the rest.
 # build.yml calls it once a pull request's build is done (the label `ci` or `full-ci`): it tries
 # the binary that run made, so nothing is compiled here. By hand too.
 name: upgrade
@@ -79,6 +79,11 @@ jobs:
         run: |
           set -o pipefail
           python3 tools/git_check.py --new target/release/pondra --work "$RUNNER_TEMP/git" | tee git.json
+      - name: Backups (BACKUP DATABASE, RESTORE DATABASE, pondra backup and restore)
+        if: matrix.part != 'releases'
+        run: |
+          set -o pipefail
+          python3 tools/backup_check.py --new target/release/pondra --work "$RUNNER_TEMP/backup" | tee backup.json
       - name: A leader stopped on a bucket (simulated R2) hands over at once; branches in a bucket
         if: matrix.part != 'releases'
         run: |
@@ -96,6 +101,7 @@ jobs:
             upgrade.json
             upgrade-s3.json
             history.json
+            backup.json
             environments.json
             environments-s3.json
             environments-across.json
