@@ -1773,7 +1773,7 @@ pub async fn point_read(lake: &Lake, sql: &str) -> Result<Option<Vec<RecordBatch
     let Some(key) = p.key.iter().cloned().collect::<Option<Vec<String>>>() else { return Ok(None) };
     let schema = p.schema()?;
     Ok(match current(lake, &p.table, &p.meta, &key, Some(snapshot)).await? {
-        Current::Row(r) => Some(vec![crate::query::conform(&r.project(&p.names.iter().map(|n| r.schema().index_of(n)).collect::<Result<Vec<_>, _>>()?)?, &schema)?]),
+        Current::Row(r) => Some(vec![crate::query::conform(&r, &schema)?]),
         Current::Gone => Some(vec![RecordBatch::new_empty(schema)]),
         Current::Changed => None,
     })
