@@ -617,8 +617,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         // What a write may say that Pondra doesn't do is refused by name, never read and dropped:
         // INSERT OVERWRITE appended, and RETURNING answered no rows.
         Statement::Insert(ast::Insert { overwrite: true, .. }) => Stmt::Invalid("INSERT OVERWRITE: write BEGIN; DELETE FROM t; INSERT INTO t …; COMMIT (one commit), or CREATE OR REPLACE TABLE t AS …".into()),
+        // (the doors that answer rows take RETURNING before they get here: `returning.rs`)
         Statement::Insert(ast::Insert { returning: Some(_), .. }) | Statement::Update(ast::Update { returning: Some(_), .. }) | Statement::Delete(ast::Delete { returning: Some(_), .. }) => {
-            Stmt::Invalid(format!("{} … RETURNING isn't taken yet: read the rows with a SELECT after it", first_word(&text).split_whitespace().next().unwrap_or("INSERT")))
+            Stmt::Invalid(format!("{} … RETURNING isn't supported here: send it to a node (Postgres, POST /sql, Flight SQL, MCP), or read the rows with a SELECT after it", first_word(&text).split_whitespace().next().unwrap_or("INSERT")))
         }
         // DuckDB's and SQLite's INSERT OR IGNORE and INSERT OR REPLACE, and MySQL's INSERT IGNORE:
         // ON CONFLICT DO NOTHING, and DO UPDATE of every column the rows give. (Read and then
@@ -1587,7 +1588,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job))).await;
     }
     let sql = match (&meta, &stmt) {
-        (Some(m), _) if through_log(m, &stmt) => rows_sql(m, &stmt)?,
+        (Some(m), _) if through_log(m, &stmt) || crate::returning::asked() => rows_sql(m, &stmt)?, // (a RETURNING's rows: worked out here)
         (_, Stmt::Insert(_, query)) => {
             let to = app.to();
             let stamped = stamp(lake, &table, Some(&to)).await?;
@@ -1609,6 +1610,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     };
     let meta = meta.expect("a table");
     let batch = rows(&open(session(lake, &sql, "").await?), &meta, &sql).await?;
+    crate::returning::wrote(&[], std::slice::from_ref(&batch));
     let n = batch.num_rows();
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
     Ok(if ack.duplicate { j!({"duplicate": true}) } else { j!({"rows": n}) })
@@ -1641,7 +1643,7 @@ async fn everywhere(app: &crate::server::App, table: &str, query: &str, job: &st
 
 /// The statement as the leader's to carry out (`change.rs`), if it is one: an UPDATE or DELETE of
 /// an append table, or a MERGE.
-async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
+pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
     let (Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_) | Stmt::Insert(..)) = stmt else { return Ok(None) };
     let (other, table) = match crate::ddl::resolve(lake, &stmt.table()).await {
         Err(_) if matches!(stmt, Stmt::Insert(..)) => return Ok(None), // (an INSERT's own path names what it can't find, or finds an attached lake's)

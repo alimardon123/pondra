@@ -713,17 +713,31 @@ fn unalias(s: &mut Statement) -> Result<()> {
         Statement::Delete(d) => {
             let _ = VisitMut::visit(&mut d.selection, &mut r);
             let _ = VisitMut::visit(&mut d.using, &mut r);
+            returning(&mut d.returning, &mut r);
         }
         Statement::Update(u) => {
             let _ = VisitMut::visit(&mut u.assignments, &mut r);
             let _ = VisitMut::visit(&mut u.from, &mut r);
             let _ = VisitMut::visit(&mut u.selection, &mut r);
+            returning(&mut u.returning, &mut r);
         }
         _ => {}
     }
     match r.shadow {
         Some(n) => Err(crate::codes::coded("0A000", format!("{alias} is the alias of {table} here, and another relation of this statement is named {n}: give that one another name"))),
         None => Ok(()),
+    }
+}
+
+/// A RETURNING list's references to the alias, `t.*` too, written as the table's name (`returning.rs` reads them so).
+fn returning(items: &mut Option<Vec<SelectItem>>, r: &mut Renamed) {
+    let _ = VisitMut::visit(items, r);
+    for item in items.iter_mut().flatten() {
+        if let SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(n), _) = item {
+            if n.0.len() == 1 && n.0[0].as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case(&r.alias)) {
+                *n = ObjectName::from(vec![Ident::new(&r.table)]);
+            }
+        }
     }
 }
 
