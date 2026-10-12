@@ -6663,14 +6663,15 @@ def learn():
         checks["the same answer either way"] = len(answers) == 1
         best_with, best_without = min(t for _, t in with_facts), min(t for _, t in without)
         checks["no slower with what was learned"] = best_with <= best_without * 1.25 + 0.05
-        # The bar: b's second run of the query with facts was planned without them, so its runs show two plans
-        deadline, plans = time.time() + 20, set()
-        while len(plans) < 2 and time.time() < deadline:
-            time.sleep(0.5)
-            plans = {r["plan_id"] for r in q(f"SELECT plan_id FROM pondra.history WHERE node = '127.0.0.1:{A.port + 1}' "
-                                              "AND statement LIKE 'SELECT count(*) AS n FROM products%'") if r.get("plan_id")}
-        seen["b's plans"] = sorted(plans)
-        checks["the run after the first with facts is planned without them: the bar they are held to"] = len(plans) == 2
+        # The bar: b's second run of the query with facts was planned without them. b prints each join order it
+        # weighs, its customers marked when their rows were learned: after the first order weighed with them, one
+        # without. (Not by plan_id, a plan's shape: with its inputs sized, either order is a join of an `id` scan
+        # and orders, then another `id` scan, alike.)
+        weighed = [l for l in open(b.log, errors="replace").read().splitlines() if l.startswith("join order:") and "SubqueryAlias: c (" in l]
+        learned_at = next((i for i, l in enumerate(weighed) if "rows, learned)" in l), None)
+        bar = [l for l in weighed[learned_at + 1:] if "rows, learned)" not in l] if learned_at is not None else []
+        seen["b's orders weighed, and without the facts after them"] = [len(weighed), len(bar)]
+        checks["the run after the first with facts is planned without them: the bar they are held to"] = bool(bar)
         # Spread over three nodes: each plans with the facts the coordinator sent, so none falls back
         deadline = time.time() + 30
         while len(call(A.port, "GET", "/stats").get("nodes", ())) < 3 and time.time() < deadline:
