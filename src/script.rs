@@ -297,7 +297,7 @@ impl<'a> Reader<'a> {
             // (a `)` with nothing open is where no step starts: taking none, the loop went on for good)
             if self.i == i {
                 let x = self.t[i];
-                bail!("line {}: {} where a statement starts", self.line(x.at), &self.text[x.at..x.end]);
+                bail!("line {}: {} where a statement starts (a statement starts with a word such as SELECT, IF or LOOP, or $x = …)", self.line(x.at), &self.text[x.at..x.end]);
             }
         }
     }
@@ -469,7 +469,7 @@ pub async fn run(app: &App, sql: &str, views: &HashMap<String, String>, who: Who
             match flow {
                 Flow::Next => {}
                 Flow::Return => break,
-                Flow::Leave(l) | Flow::Iterate(l) => bail!("LEAVE or ITERATE {} outside a loop or a block of that name", l.unwrap_or_default()),
+                Flow::Leave(l) | Flow::Iterate(l) => bail!("LEAVE or ITERATE {} outside a loop or a block of that name (give the loop a label: outer: LOOP … END LOOP, and LEAVE outer inside it)", l.unwrap_or_default()),
             }
         }
         r.settle().await.map_err(|e| e.context(format!("line {}", line(sql, r.at))))?; // (what it started with ASYNC ends before it does)
@@ -1069,7 +1069,7 @@ impl Step for Async {
                 let out = match (out, child.settle().await) {
                     (Err(e), _) | (_, Err(e)) => Err(e),
                     (Ok(Flow::Next), _) => Ok(()),
-                    (Ok(_), _) => Err(anyhow::anyhow!("LEAVE, ITERATE and RETURN can't leave an ASYNC statement: it runs apart")),
+                    (Ok(_), _) => Err(anyhow::anyhow!("LEAVE, ITERATE and RETURN can't leave an ASYNC statement: it runs apart (keep the loop inside it, as ASYNC BEGIN LOOP … END LOOP; END, and RETURN after AWAIT)")),
                 };
                 (at, h, out)
             }));
@@ -1346,7 +1346,7 @@ impl Step for Execute {
                 for (i, name) in self.into.iter().enumerate() {
                     match first {
                         Some(b) if i < b.num_columns() => r.set(name, b.column(i).slice(0, 1).as_ref()).await?,
-                        Some(b) => bail!("INTO ${name}: the answer has {} columns", b.num_columns()),
+                        Some(b) => bail!("INTO ${name}: the answer has {} columns (one variable per column: INTO $a, $b for two columns)", b.num_columns()),
                         None => Box::pin(crate::vars::apply(r.app, crate::vars::Change::Set { name: name.clone(), value: "NULL".into() })).await.map(|_| ())?,
                     }
                 }

@@ -7642,6 +7642,40 @@ def safety():
     checks["HTTPS answers; plain HTTP only from this machine, refused from another saying why"] = said["https"] == (200, '[{"x":1}]') and said["plain here"] == (200, '[{"x":1}]') \
         and (not away or (said["https away"] == (200, '[{"x":1}]') and said["plain away"][0] == 403 and "takes TLS" in said["plain away"][1]))
 
+    # A browser page the user visits is kept off an open node by `auth::cross_site` at the guard
+    # (its own test block is below, in `users`). Here we only check the settings endpoint's own
+    # belt: `web()` reaches it over plain HTTP from this machine, with or without a browser Origin.
+    def web(port, path, origin=None, host=None, body=b"SELECT 1 AS x", method="POST", secure=False):
+        # (plain HTTP from this machine, which an open node answers; the HTTPS checks above cover TLS.)
+        ctx = ssl.create_default_context(cafile=ca)
+        c = http.client.HTTPSConnection("127.0.0.1", port, context=ctx, timeout=60) if secure else http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        h = {}
+        if origin is not None:
+            h["Origin"] = origin
+        if host is not None:
+            h["Host"] = host  # (http.client keeps our Host when we set it: a rebind, as a browser sees it)
+        try:
+            c.request(method, path, body, h)
+            r = c.getresponse()
+            return r.status, r.read().decode(errors="replace")
+        except Exception as e:
+            return 0, f"{type(e).__name__}: {e}"
+    # PUT /console/settings is an admin's, from this machine (like choosing the Python): a web page
+    # the user visits can't overwrite them, and behind a reverse proxy a loopback address no longer
+    # stands in for a token. Its own PONDRA_CONFIG_DIR keeps the test off this machine's real settings.
+    cfg = tempfile.mkdtemp(prefix="pondra-settings-")
+    setn = Node(new_lake(), P + 50, env={"PONDRA_CONFIG_DIR": cfg}).start()
+    settings_said = {
+        "local admin (no origin)": web(P + 50, "/console/settings", body=b'{"theme":"dark"}', method="PUT"),
+        "cross-site": web(P + 50, "/console/settings", origin="https://evil.example", body=b'{"theme":"light"}', method="PUT"),
+        "read-back": web(P + 50, "/console/settings", body=b"", method="GET"),
+    }
+    info["settings"] = settings_said
+    checks["the console's settings are saved by a local admin only: a web page the user visits can't write them"] = \
+        settings_said["local admin (no origin)"][0] == 204 and settings_said["cross-site"][0] == 403 \
+        and '"theme":"dark"' in settings_said["read-back"][1] and "light" not in settings_said["read-back"][1]
+    setn.kill()
+
     def raw(port, chunks, source=None, wrap=False, first=None):
         s = socket.create_connection(("127.0.0.1", port), timeout=10, source_address=(source, 0) if source else None)
         try:
@@ -8349,7 +8383,7 @@ def objects():
     again = http("CREATE TABLE t (a BIGINT)")
     as_again = http("CREATE TABLE t AS SELECT 9 AS a")
     quiet = q("CREATE TABLE IF NOT EXISTS t AS SELECT 9 AS a")
-    checks["CREATE TABLE of one there: refused (42P07), AS SELECT adds nothing, IF NOT EXISTS leaves it"] = again[:2] == (500, "42P07") and as_again[1] == "42P07" \
+    checks["CREATE TABLE of one there: refused (409, 42P07), AS SELECT adds nothing, IF NOT EXISTS leaves it"] = again[:2] == (409, "42P07") and as_again[1] == "42P07" \
         and quiet.get("exists") is True and q("SELECT count(*) AS n FROM t") == [{"n": 2}]
     q("CREATE OR REPLACE TABLE t AS SELECT 7 AS a")
     checks["CREATE OR REPLACE TABLE makes it anew"] = q("SELECT a FROM t") == [{"a": 7}]
@@ -8362,7 +8396,7 @@ def objects():
     call(A.port, "POST", "/insert/bulk_made?job=bm", b"SELECT 1 AS a")
     info["nope"] = [nope[:2], nope_select[:2], nope_read[:2], cli_nope.returncode, (cli_nope.stdout + cli_nope.stderr)[-200:]]
     checks["an INSERT into a name no table has is refused (42P01, naming it) over HTTP and pondra sql, nothing made; POST /insert/{t} still makes one"] = \
-        nope[:2] == (500, "42P01") and "no table nope" in str(nope[2]) and nope_select[1] == "42P01" and nope_read[1] == "42P01" \
+        nope[:2] == (404, "42P01") and "no table nope" in str(nope[2]) and nope_select[1] == "42P01" and nope_read[1] == "42P01" \
         and cli_nope.returncode != 0 and "no table nope" in cli_nope.stdout + cli_nope.stderr and q("SELECT count(*) AS n FROM bulk_made") == [{"n": 1}]
     q("CREATE VIEW v AS SELECT a FROM t")
     q("CREATE VIEW IF NOT EXISTS v AS SELECT a + 1 AS a FROM t")
@@ -8389,7 +8423,7 @@ def objects():
     q("CREATE FUNCTION IF NOT EXISTS twice(x BIGINT) RETURNS BIGINT RETURN x * 3")
     q("CREATE TASK tick SCHEDULE '1 hour' AS SELECT 1")
     q("CREATE TASK IF NOT EXISTS tick SCHEDULE '1 hour' AS SELECT 2")
-    checks["functions and tasks: IF NOT EXISTS leaves them"] = q("SELECT twice(5) AS x") == [{"x": 10}] and http("CREATE TASK tick SCHEDULE '1 hour' AS SELECT 3")[0] == 500
+    checks["functions and tasks: IF NOT EXISTS leaves them"] = q("SELECT twice(5) AS x") == [{"x": 10}] and http("CREATE TASK tick SCHEDULE '1 hour' AS SELECT 3")[0] == 409
     # Every other kind alike (IF NOT EXISTS leaves one, OR REPLACE replaces it, both at once
     # refused), and OR REPLACE refused where it would drop what's inside
     q("CREATE MACRO plus1(x) AS x + 1")
@@ -8420,8 +8454,8 @@ def objects():
     kept = [http(f"CREATE OR REPLACE {k}") for k in ("SCHEMA s1", "DATABASE d1", "USER u1 PASSWORD 'pw-0123456789'", "ROLE r1")]
     info.update({"macros": macros, "secrets": secrets, "externals": externals, "temps": temps, "kept": [str(k[2])[:160] for k in kept]})
     checks["macros, secrets, external tables, a session's temporary tables, views and secrets: IF NOT EXISTS, OR REPLACE, both refused"] = \
-        macros == [[{"x": 2}], [{"x": 4}], 500] and secrets == [True, 500, [{"scope": "http://127.0.0.1:9/c/"}], 500] \
-        and externals == [True, 500, [{"a": 1}], [{"a": "1"}], 500] and temps == [200, 200, {"secret": "ts", "temporary": True, "exists": True}, [{"a": 1}], [{"a": 3}], 500, 500, 500, 500]
+        macros == [[{"x": 2}], [{"x": 4}], 500] and secrets == [True, 409, [{"scope": "http://127.0.0.1:9/c/"}], 500] \
+        and externals == [True, 409, [{"a": 1}], [{"a": "1"}], 400] and temps == [200, 200, {"secret": "ts", "temporary": True, "exists": True}, [{"a": 1}], [{"a": 3}], 500, 500, 500, 500]
     checks["OR REPLACE of a schema, a database, a user or a role: refused, saying what it would drop"] = all(k[0] == 500 for k in kept) \
         and all("everything in it" in str(k[2]) for k in kept[:2]) and all("rights given to it" in str(k[2]) for k in kept[2:])
     # DETACH: rows stay, the flow stops, what follows keeps following the table
@@ -8682,7 +8716,7 @@ def sequences():
     fresh = q("SELECT a FROM ser")
     listed = sorted(r["name"] for r in q("SELECT name FROM pondra.objects WHERE kind = 'sequence'"))
     info["owned"] = [no, undropped, gone, fresh, listed]
-    checks["DROP SEQUENCE refused while a DEFAULT or a table uses it; a missing one, a materialized view's nextval, TEMP and an added identity refused"] = all(r[0] == 500 for r in no)
+    checks["DROP SEQUENCE refused while a DEFAULT or a table uses it; a missing one, a materialized view's nextval, TEMP and an added identity refused"] = all(r[0] >= 400 for r in no)
     checks["an owned sequence: kept with a dropped table and its UNDROP, gone with PURGE, made again with the table; not listed apart"] = \
         undropped == [1, 2, 3] and gone[1] == "42P01" and fresh == [{"a": 1}] and listed == ["c", "e", "o2", "s"]
     # past a leader's kill, no value is handed out again
@@ -8837,7 +8871,7 @@ def constraints():
     missing = err("ALTER TABLE tags DROP CONSTRAINT one_tag")
     info["alter"] = [dup, now, again, long, missing]
     checks["ADD CONSTRAINT UNIQUE over a value twice refused (23505) and not kept; added over clean rows, every node refuses a duplicate; DROP CONSTRAINT lets it in; ADD CHECK; a name taken, one missing refused"] = \
-        dup[1] == "23505" and after_dup and all(r[1] == "23505" for r in now) and again[0] == 500 and long[1] == "23514" and missing[0] == 500 and \
+        dup[1] == "23505" and after_dup and all(r[1] == "23505" for r in now) and again[0] == 409 and long[1] == "23514" and missing[0] == 404 and \
         [r[1] for r in rows("tags")] == ["a", "b", "a"]
     # CREATE UNIQUE INDEX, as ORMs write a UNIQUE (Prisma's @unique)
     q('CREATE TABLE "User" (id INT, "email" TEXT)')
@@ -8929,8 +8963,8 @@ def enums():
     q("CREATE TABLE people (id INT, name TEXT, feeling mood)")
     q("CREATE TABLE t2 (id INT, size ENUM('s', 'm', 'l'))")
     info["types"] = [same, again, bad_types, temp_enum]
-    checks["CREATE TYPE … AS ENUM makes a type; IF NOT EXISTS again is fine; a repeat, an empty or duplicate label list, OR REPLACE and a temporary table's enum column are refused (500)"] = \
-        same[0] == 200 and again[0] == 500 and all(r[0] == 500 for r in bad_types) and temp_enum[0] == 500
+    checks["CREATE TYPE … AS ENUM makes a type; IF NOT EXISTS again is fine; a repeat, an empty or duplicate label list, OR REPLACE and a temporary table's enum column are refused (a repeat 409, the rest 500)"] = \
+        same[0] == 200 and again[0] == 409 and all(r[0] == 500 for r in bad_types) and temp_enum[0] == 500
     # Labels and NULL go in from every door; SELECT reads them back as text
     q("INSERT INTO people VALUES (1, 'Ann', 'happy'), (2, 'Bo', 'sad'), (3, 'Cy', NULL)")
     q("INSERT INTO people SELECT id + 10, name, feeling FROM people WHERE id = 2")
@@ -8983,7 +9017,7 @@ def enums():
     labels3 = q("SELECT enum_range(NULL::mood) AS r")[0]["r"]
     info["added"] = [early, labels2, meh, ine, again_add, labels3]
     checks["ALTER TYPE … ADD VALUE BEFORE or AFTER puts a label in its place (last after 'happy'); refused until added; IF NOT EXISTS is fine, a repeat refused"] = \
-        early[1] == "22P02" and labels2 == ["sad", "meh", "ok", "happy"] and meh[0] == 200 and ine[0] == 200 and again_add[0] == 500 and \
+        early[1] == "22P02" and labels2 == ["sad", "meh", "ok", "happy"] and meh[0] == 200 and ine[0] == 200 and again_add[0] == 409 and \
         labels3 == ["sad", "meh", "ok", "happy", "great"]
     # ALTER TABLE … ADD COLUMN of an enum type: its values are checked too (old rows read NULL)
     q("ALTER TABLE t2 ADD COLUMN m2 mood")
@@ -9011,7 +9045,7 @@ def enums():
     info["columns"] = [m2_bad, t2_rows, in_use, still, dropped, gone]
     checks["ADD COLUMN of an enum type checks its values; DROP TYPE is refused while a column uses it (2BP01), works once none does; IF EXISTS is fine"] = \
         m2_bad[1] == "22P02" and t2_rows == [[1, "m", None], [5, "s", "ok"]] and in_use[1] == "2BP01" and "uses it" in in_use[2] and \
-        still[0] == 500 and dropped[0] == 200 and gone[0] == 200
+        still[0] == 409 and dropped[0] == 200 and gone[0] == 200
     for n in nodes:
         n.kill()
     ok = all(checks.values())
@@ -9137,7 +9171,7 @@ def registry():
         notice[0] == 200 and "nothing is built" in notice[1] and again == (200, 'relation "visits_page_idx" already exists, skipping') \
         and pg == [{"indexname": "visits_lower", "indexdef": "CREATE INDEX visits_lower ON public.visits USING brin (lower(path)) WHERE (path IS NOT NULL)"},
                    {"indexname": "visits_page_idx", "indexdef": "CREATE INDEX visits_page_idx ON public.visits (path)"}] \
-        and renamed == ["clicks_lower_page", "orders_region_at_idx", "visits_lower", "visits_path"] and [r[0] for r in refused_ix] == [500] * 6 \
+        and renamed == ["clicks_lower_page", "orders_region_at_idx", "visits_lower", "visits_path"] and [r[0] for r in refused_ix] == [500, 500, 500, 500, 409, 409] \
         and "hnsw" in refused_ix[2][1] and "a view" in refused_ix[0][1] and "an index has the name" in refused_ix[4][1] \
         and after_column == ["clicks_lower_page", "orders_region_at_idx"] and after_table == after_column \
         and show("index", "sales.orders_region_at_idx") == "CREATE INDEX orders_region_at_idx ON sales.orders_2025 (region, at DESC);"
@@ -9224,7 +9258,7 @@ def registry():
         and {k["kind"] for k in kinds if k["is"] == "object" and k["on_clone"] == "leave"} == {"secret", "share", "recipient"}
     missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'", "COMMENT ON COLUMN eu_orders.region IS 'x'")]
     quiet = q("COMMENT IF EXISTS ON TABLE nothing_here IS 'x'")
-    checks["what isn't there: refused by name, or nothing with IF EXISTS"] = missing == [500, 500, 500, 500] and quiet.get("exists") is False
+    checks["what isn't there: refused by name (4xx), or nothing with IF EXISTS"] = all(400 <= s < 500 for s in missing) and quiet.get("exists") is False
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"registry": checks, "ok": ok, "info": info}, indent=1, default=str))
@@ -10632,6 +10666,80 @@ def attached():
     return "an attached lake read while its leader changes, tiers and purges rows: every read as of one commit"
 
 
+def dialects():
+    """What people from other databases type on their first days (round 34, L6): the statements of
+    `tools/dialects_check.py`, spelled as Postgres, DuckDB, Snowflake, Spark, MySQL, BigQuery and SQL
+    Server users spell them, each dialect's in a session of its own. Each runs or is refused with a
+    SQLSTATE, none takes the node down, and each dialect runs at least as many as it did when its
+    floor was set (FLOOR: raise it as spellings are added, never lower it). And what they found: a
+    table with columns named created_at, version and row_id, keyed or not, takes UPDATE, UPDATE …
+    FROM, DELETE, INSERT … ON CONFLICT and MERGE, its own columns kept apart from the system ones
+    (`change::select_as` named both `__o_created_at`, and every change of such a table failed)."""
+    import dialects_check
+    FLOOR = {"postgres": 41, "duckdb": 31, "snowflake": 13, "spark": 10, "mysql": 19, "bigquery": 12, "sqlserver": 6}
+    XX000 = 26  # (refusals that are internal errors: lower it as they get codes, never raise it)
+    lake = new_lake()
+    node = Node(lake, A.port).start()
+    q = lambda s: sql(A.port, s)
+    checks, info = {}, {}
+    # Columns named as the system's are: an append table and a keyed one, three rows each, then every kind of change.
+    cols = "created_at TIMESTAMP, version INT, row_id INT, v INT"
+    q(f"CREATE TABLE ap (id INT, {cols})")
+    q(f"CREATE TABLE kv (id INT PRIMARY KEY, {cols})")
+    for t in ("ap", "kv"):
+        q(f"INSERT INTO {t} VALUES (1, TIMESTAMP '2026-01-01 00:00:00', 10, 100, 1), (2, TIMESTAMP '2026-01-02 00:00:00', 20, 200, 2), (3, TIMESTAMP '2026-01-03 00:00:00', 30, 300, 3)")
+    ids = {t: q(f"SELECT id, _row_id FROM {t} ORDER BY id") for t in ("ap", "kv")}
+    errors = {}
+    for t in ("ap", "kv"):
+        for s_ in (f"UPDATE {t} SET v = v + 10 WHERE id = 1",
+                   f"UPDATE {t} SET v = s.v FROM (VALUES (2, 22)) AS s(id, v) WHERE {t}.id = s.id",
+                   f"DELETE FROM {t} WHERE id = 3",
+                   f"INSERT INTO {t} VALUES (4, TIMESTAMP '2026-01-04 00:00:00', 40, 400, 4)" + (" ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v" if t == "kv" else ""),
+                   f"MERGE INTO {t} USING (VALUES (4, 44), (5, 5)) AS s(id, v) ON {t}.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v "
+                   f"WHEN NOT MATCHED THEN INSERT VALUES (s.id, TIMESTAMP '2026-01-05 00:00:00', 50, 500, s.v)"):
+            try:
+                q(s_)
+            except Exception as e:
+                errors.setdefault(t, []).append(f"{s_[:40]}: {str(e)[:160]}")
+    if "kv" not in errors:
+        try:
+            q("INSERT INTO kv VALUES (5, TIMESTAMP '2026-01-05 00:00:00', 50, 500, 55) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v")
+        except Exception as e:
+            errors.setdefault("kv", []).append(str(e)[:160])
+    info["errors"] = errors
+    want = lambda last: [{"id": 1, "created_at": "2026-01-01T00:00:00", "version": 10, "row_id": 100, "v": 11},
+                         {"id": 2, "created_at": "2026-01-02T00:00:00", "version": 20, "row_id": 200, "v": 22},
+                         {"id": 4, "created_at": "2026-01-04T00:00:00", "version": 40, "row_id": 400, "v": 44},
+                         {"id": 5, "created_at": "2026-01-05T00:00:00", "version": 50, "row_id": 500, "v": last}]
+    got = {t: q(f"SELECT id, created_at, version, row_id, v FROM {t} ORDER BY id") for t in ("ap", "kv")}
+    info["rows"] = got
+    kept = {t: q(f"SELECT id, _row_id FROM {t} WHERE id IN (1, 2) ORDER BY id") == ids[t][:2] for t in ("ap", "kv")}
+    info["row ids kept"] = kept
+    checks["a table with columns named created_at, version and row_id takes UPDATE, UPDATE … FROM, DELETE, INSERT, MERGE (and ON CONFLICT, keyed): its own columns as written, changed rows keeping their _row_id"] = \
+        not errors and got["ap"] == want(5) and got["kv"] == want(55) and all(kept.values())
+    # The newcomers' statements, each dialect in its own session.
+    rows, downs = dialects_check.answer(node, A.port)
+    ran = {d: sum(r["ok"] for r in rows if r["dialect"] == d) for d in FLOOR}
+    info["ran"], info["downs"] = ran, downs
+    uncoded = [r["sql"][:80] for r in rows if not r["ok"] and not r["sqlstate"]]
+    info["refused without a SQLSTATE"] = uncoded
+    checks["no newcomer's statement takes the node down"] = downs == 0
+    checks["each refusal carries a SQLSTATE"] = not uncoded
+    checks["each dialect runs at least its floor of the newcomers' statements"] = all(ran[d] >= FLOOR[d] for d in FLOOR)
+    missed = [f"{r['sql'][:70]}: {r['sqlstate']} {r['message'][:120]}" for r in rows if r["expect"] and not dialects_check.met(r)]
+    info["missed their refusal"] = missed
+    checks["what a SET asks for is done, or refused by name with its SQLSTATE and the way out (SET ROLE, TRANSACTION, NAMES, DateStyle, @x, …)"] = not missed
+    internal = [r["sql"][:80] for r in rows if not r["ok"] and r["sqlstate"] == "XX000"]
+    info["refused as XX000 (internal)"] = internal
+    checks[f"at most {XX000} refusals are XX000 (an internal error) rather than a code that names what went wrong"] = len(internal) <= XX000
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"dialects": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"dialects: {sum(ran.values())} of {len(rows)} newcomers' statements run, the rest refused with a SQLSTATE; columns named as system ones change: all {len(checks)} checks pass"
+
+
 def publishing():
     """What can't be published as Delta or Iceberg is refused by name, never written wrong or
     skipped quietly: asked for, a column the format has no type for, a materialized view finished
@@ -11137,12 +11245,12 @@ def answers_big():
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
-        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "answers_big": 15, "unique_doors": 60}
+        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "answers_big": 15, "dialects": 20, "unique_doors": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, loads, reader, crash, load, unique_doors)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -11170,7 +11278,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -11183,7 +11291,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

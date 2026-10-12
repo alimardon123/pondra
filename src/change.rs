@@ -305,7 +305,7 @@ async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)
     let mut items = vec![];
     if insert.is_none() {
         items.extend(cols.iter().map(|c| format!("{a}.{} AS {}", q(c), q(&format!("__o_{c}")))));
-        items.extend([ROW_ID, sys::CREATED, sys::VERSION].iter().map(|c| format!("{a}.{} AS {}", q(c), q(&format!("__o{c}")))));
+        items.extend([ROW_ID, sys::CREATED, sys::VERSION].iter().map(|c| format!("{a}.{} AS {}", q(c), q(&format!("__s{c}"))))); // (`__s`: a column of the table named `created_at` is `__o_created_at`)
     }
     if let Some(set) = set {
         items.extend(cols.iter().map(|c| match set.iter().find(|(s, _)| s == *c) {
@@ -338,7 +338,7 @@ fn part(all: &RecordBatch, meta: &TableMeta, prefix: &str, ids: bool) -> Result<
     if ids {
         let old = if prefix == "__o_" { vec![sys::VERSION] } else { vec![] };
         for c in [ROW_ID, sys::CREATED].into_iter().chain(old) {
-            let v = get(&format!("__o{c}"))?;
+            let v = get(&format!("__s{c}"))?;
             fields.push(Arc::new(Field::new(c, v.data_type().clone(), true)));
             columns.push(v);
         }
