@@ -92,7 +92,7 @@ jobs:
       - name: npm (the platform packages first, then `pondra`, which depends on them)
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }} # (empty: npm takes this workflow's OIDC token, as for 0.22.1)
+          NODE_AUTH_TOKEN: "" # (setup-node's placeholder otherwise; empty, as 0.33.0 was published, npm takes the OIDC token)
         run: |
-          npm install -g npm@latest # (trusted publishing needs npm 11.5.1 or later)
-          bash tools/npm_publish.sh --provenance
+          npm install -g npm@12.2.0 # (trusted publishing needs 11.5.1 or later; the build's dry run uses the same)
+          bash tools/npm_publish.sh --provenance # (this workflow's OIDC token signs in: no token is kept for npm)
