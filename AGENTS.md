@@ -71,7 +71,8 @@ src/      62,500 lines of Rust in 108 files, one per concern (see the table in R
           `cli.rs` is the command line (its subcommands and what each starts) and `main.rs` sets the
           allocator and calls it (ADR-061); `node.rs` is a node started and stopped as an object,
           `reset.rs` (`per_node!`: a node's statics set back when it stops) and `env.rs` every
-          setting, from one table (ADR-061 step 2); round 25 added
+          setting, from one table (ADR-061 step 2); `library.rs` a node in a host's process (its
+          supervisor, restarts in place, requests to its router; ADR-061); round 25 added
           live.rs (live queries) and temp.rs (a session's temporary tables and views); round 31 vars.rs
           (SQL variables and a file's declared parameters, ADR-037, ADR-044) and script.rs (a script's
           blocks, branches, loops and handlers, ADR-045); round 26
@@ -121,13 +122,15 @@ site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how
 python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node): `client.py`, frames
           (`frame.py`, Polars' names), `spark/` (PySpark's names), `worker.py` (a node's warm
           Python worker: functions' batches and procedures' calls, ADR-027), `plpy.py` (PL/Python's
-          `plpy`), `magic.py` (`%%sql`), `__main__.py` (`python -m pondra`, and `--add-to-path`);
-          without pyarrow, rows come as JSON (ADR-024)
+          `plpy`), `magic.py` (`%%sql`), `__main__.py` (`python -m pondra`, and `--add-to-path`),
+          `inprocess.py` (`pondra.open()` over the library); without pyarrow, rows come as JSON (ADR-024)
 install.sh, install.ps1   the one-line installers each release carries (ADR-024)
 deploy/   the container image (docker/Dockerfile; tools/image.py lays out its context), a compose
           cluster (compose/) and the Helm chart (helm/pondra); ADR-041
-js/       the JavaScript client (`index.js`) and its frames (`frame.js`, Python's frames with nodejs-polars'
-          names), and the `pondra` npm package's files
+js/       the JavaScript client (`index.js`, and `open()`: the library through Node-API) and its frames
+          (`frame.js`, Python's frames with nodejs-polars' names), and the `pondra` npm package's files
+capi/     `pondra_lib`: the C ABI (seven functions) and `napi.rs`, the same library as a Node-API module
+launcher/ the packages' `pondra`: finds the library and runs it (ADR-061)
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style),
           console-extension.js (what a console extension adds: a section, a tab, a view, an action)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
@@ -2163,6 +2166,61 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    nearest one). `tools/per_node_check.py` fails a `PONDRA_*` name read past `env.rs` (by its text,
    or through a constant that names it), a name its `NAMES` doesn't list, a listed name nothing
    reads, and any `set_var`. `cargo test --lib env::`.
+303. **A node in a library never takes its host's process down** (`library.rs`, ADR-061 §5): what the
+   program does by exec, abort or exit, a library does to the node alone. `cluster::restart_with`
+   halts the node and starts it again in place (`library::restart`: its lock file says
+   `restarting`, then a `Restarting` unwind that `panics::spawn` lets go and a door answers as 57P03);
+   a vital loop's panic, the catalog's compactor failing and a lake newer than the build stop the
+   node with the reason (`library::failed`), and every request is then 57P03 with it until it is
+   opened again. A supervisor thread restarts it after 0.5, 1, 2, 4 and 8 s, and gives up after five
+   restarts within a minute. A process static that is a `Mutex` is read with
+   `lock().unwrap_or_else(PoisonError::into_inner)`, since a restart unwinds through it.
+   `tests/node_library.rs`: a node in process follows a leader that is killed, restarts and leads,
+   and its write lands once; `PONDRA_CRASH` in a vital loop is 57P03, then the lake opens again with
+   its rows. `tools/per_node_check.py` fails a process mutex read with `.unwrap()`.
+
+304. **What a node starts, it starts with the launcher** (`library::exe()`): `pondra lead` and the
+   Python workers' search use the `pondra` program the packages carry (`PONDRA_LAUNCHER`, an
+   option of `open`), never `current_exe()`, which in a library is the host (Python, Node). A
+   library without one refuses by name what needs it.
+
+305. **An in-process request goes to the node's router as its owner, on the library's runtime, and a
+   fork is refused** (`library::Opened::request`, `capi/`, `python/pondra/inprocess.py`): the router
+   the node serves, never a socket, from 127.0.0.1 with the owner's key, so every check the HTTP
+   door makes holds (invariants 21, 61); the node is `owned_by` that key (`Auth`, the one place a
+   node's owner key is kept), so its loopback door answers only its host, as a node `local()` starts
+   does; on the library's own runtime, never the caller's thread (a host's thread may have 512 KB of
+   stack, invariant 195); while the node starts, restarts or has failed, 503 with 57P03 and the
+   reason. Its body comes a piece at a time as the node writes it (`pondra_read`, one or two pieces
+   ahead), each copied out before the next, so the library never holds a second copy of an answer: 10 M rows into
+   pandas take `pondra.open()` 1.77 s and 517 MB, `local()` 2.22 s and 524 MB with its node's (the median of five). Answers that stream for ever (`/live`,
+   `/watch`) go to the loopback door. Every C entry
+   catches a panic (unwinding across `extern "C"` is undefined) and says why through
+   `pondra_last_error`. A child forked after `open` is refused by name, the request and an open
+   alike: it shares its parent's node. `tools/inprocess_check.py`: SQL, frames, pandas, a file on
+   this machine, a live query, a lake reopened, a second open, a misspelt or changed setting, 50
+   opens and closes (threads, files and idle wakeups back where they were), a fork.
+
+306. **The packages run the library through a launcher, and the library is found where it was installed**
+   (`launcher/`, `tools/package.py`, ADR-061 §6): the wheel and the npm package carry `pondra_lib` and a small
+   `pondra` program that loads it and calls `pondra_main`, so the program and `pondra.open()` are one build. The
+   launcher looks in one order: `PONDRA_LIBRARY`, beside itself, the site-packages folder holding
+   `pondra-<its version>.dist-info` (two Pythons in one prefix never mix versions), then `..` (`pip install
+   --target`); none found, it says where it looked and exits 127. The archive and the container image keep the
+   program whole. Both are built for glibc 2.17 (invariant 48). `tools/try_packages.sh`: `pondra --version`
+   and a query through the installed launcher, without and with pyarrow, on every OS.
+
+307. **The library is also a Node-API module, and links nothing of Node's** (`capi/src/napi.rs`, `js/index.js`
+   `open`): `process.dlopen` loads `pondra_lib` itself, which finds its 17 Node-API functions in the host when
+   loaded (`dlsym(RTLD_DEFAULT)`, `GetProcAddress` on Windows), so Python and the launcher load the same file
+   and never call them. Every symbol it needs from outside is glibc's or libgcc's, by version, so nothing of
+   Node's (zlib, OpenSSL, libuv) binds to its own; it defines its ABI, `napi_register_module_v1` and crc-fast's C API. `open` and `close` run on libuv's pool, never the event loop; the process's `exit` event closes
+   a node still open (`closeSync`: `process.exit()` runs no cleanup hooks), a cleanup hook per environment closes
+   the nodes it opened when it simply ends (a worker thread too), and a lake opened as `temporary` is removed by
+   the library once the node has let it go. A node in a library prints nothing when all goes well. `tools/inprocess_check.py`
+   (i–o): SQL, frames, a file and a live query from Node; a lake reopened; 20 opens and closes; a process that
+   calls `process.exit()`, and one that just ends, without `close()` (its temporary lake gone either way); Bun; the
+   library's dynamic symbols (only its ABI defined but a dependency's C API, nothing needed unversioned).
 318. **SQL's plain INSERT never replaces a row of its key** (`constraints::key_check`, `key_check_over`,
    `txn::autocommit`, `txn::ByKey`): an INSERT without ON CONFLICT or OR REPLACE | IGNORE into a table
    with a PRIMARY KEY (not a merge table) is refused 23505, in Postgres's words, when two of its rows
@@ -2395,6 +2453,8 @@ python3 tools/harness.py first          # a node on the network with no token ma
 python3 tools/node_check.py             # a node stopped once it serves, or while it starts, gives its term back: the next leads at once
 python3 tools/per_node_check.py         # every static per_node! or said to outlive a node; no task Node::stop can't end; settings only through env.rs
 cargo test --release --test node_twice  # two lakes in one process, one after the other: nothing of the first in the second
+cargo test --release --test node_library       # a node in process: restarts in place, a vital loop's panic answered as 57P03, opened again
+python3 tools/inprocess_check.py --lib <pondra_lib> --bin <pondra> [--bench]   # pondra.open() in Python and open() in Node and Bun: every way in, 50 opens, a fork, a process gone without close; --bench: open, idle memory, 10 M rows into pandas against local() and DuckDB
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
