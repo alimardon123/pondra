@@ -82,6 +82,7 @@ Pages marked *(planned)* aren't written yet.
 | `server.mdx` | `pondra serve --lakes`: a folder of lakes as databases, local or in a bucket | ADR-030, ADR-032 |
 | `deploy.mdx` | the container image, Compose, the Helm chart, `pondra service` | ADR-041, `deploy/` |
 | `upgrades.mdx` | stopping without dropping work, `/healthz` and `/ready`, rolling upgrades, the lake's format | ADR-039 |
+| `backups.mdx` | `BACKUP DATABASE`, `RESTORE DATABASE`, `pondra backup` and `restore`, runs and their retention, reading and cloning a backup, what a backup holds | ADR-070, `src/backup.rs` |
 | `observability.mdx` | `pondra.history`, slow statements and their plans, `/metrics`, `/stats` | ADR-048, ADR-050 |
 
 ### How it works (`concepts/`)

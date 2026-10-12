@@ -43,7 +43,7 @@ export default defineConfig({
           { label: 'Python and code', collapsed: true, items: ['guides/sql-and-python', 'guides/dataframes', 'guides/pyspark', 'guides/functions-and-procedures', 'guides/scripts', 'guides/workspace', 'guides/tasks', 'guides/notebooks'] },
           { label: 'Teams', collapsed: true, items: ['guides/environments', 'guides/projects', 'guides/git', 'guides/sharing', 'guides/security'] },
           { label: 'Connect', collapsed: true, items: ['guides/agents', 'guides/dbt-and-bi', 'guides/other-engines', 'guides/ai-and-files'] },
-          { label: 'Operate', collapsed: true, items: ['guides/clusters', 'guides/object-storage', 'guides/server', 'guides/deploy', 'guides/upgrades', 'guides/observability'] },
+          { label: 'Operate', collapsed: true, items: ['guides/clusters', 'guides/object-storage', 'guides/server', 'guides/deploy', 'guides/upgrades', 'guides/backups', 'guides/observability'] },
           { label: 'How it works', collapsed: true, items: ['concepts/how-it-works', 'concepts/lake-format', 'concepts/keyed-tables', 'concepts/freshness-and-guarantees', 'concepts/failures', 'concepts/performance', 'concepts/compared', 'concepts/design-notes'] },
         ] },
         { label: 'SQL', items: [

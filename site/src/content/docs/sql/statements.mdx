@@ -591,6 +591,8 @@ A script's blocks, branches, loops, handlers and parallel statements are explain
 | Compare two tables | `SELECT * FROM pondra.diff('a', 'b')`: the rows of `b` that differ from `a`, with `_change_type` |
 | Attach a lake | `ATTACH 'dir' AS name`; `ATTACH 'url' AS name (READ_ONLY [, ENDPOINT 'https://…'])` for a lake on another server, read with the secret whose `SCOPE` covers it and written there only ([production apart](/pondra/guides/environments/#production-on-a-server-of-its-own)); `ATTACH 'url' AS name (TYPE delta \| iceberg \| kafka, …)` for other engines |
 | Detach | `DETACH [IF EXISTS] name` |
+| Back up a database | `BACKUP DATABASE [name] TO 'place' [WITH (retention_days = n)]`: this database (or one attached here) copied to a lake at `place`, as of one moment; run again, only what changed. A backup is read-only (25006) but to its next run ([backups](/pondra/guides/backups/)) |
+| Restore a backup | `RESTORE DATABASE name FROM 'place' [LOCATION 'dir'] [AT (TIMESTAMP => '…')]`: the backup's newest run (at or before that time, in UTC) copied into a new database, attached as `name`, its tasks suspended |
 
 A table is `t` (in schema `public`), `s.t`, or `lake.s.t`. With `USE s`, a name with one part is
 the session's schema's ([settings](#settings-and-prepared-statements)). Names are letters, digits, `_`

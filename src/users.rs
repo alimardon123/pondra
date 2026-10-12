@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub fn user_key(name: &str) -> String { format!("u/{name}") }
-const KEYS: &str = "z/auth"; // (the lake's own keys: sessions' signing key, and the nodes' key; `k/` is streaming tasks')
+pub const KEYS: &str = "z/auth"; // (the lake's own keys: sessions' signing key, and the nodes' key; `k/` is streaming tasks')
 /// The names the three tokens sign in as over Postgres and Kafka: no user may take them.
 pub const BUILT_IN: [&str; 3] = ["admin", "writer", "reader"];
 

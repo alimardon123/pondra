@@ -283,6 +283,26 @@ With a node running, the answer is the node's, such as `{"checkpoint":true,"rows
 When the lake's node has tokens, set `PONDRA_ADMIN_TOKEN` first: the command sends `PONDRA_TOKEN` or
 `PONDRA_ADMIN_TOKEN` to the node.
 
+## pondra backup and pondra restore
+
+`pondra backup LAKE PLACE` backs the lake up to `PLACE` (a folder or a bucket URL), as
+[`BACKUP DATABASE`](/pondra/guides/backups/) does, with no node needed: a node running the lake pins
+it while the copy is made, and if none runs, this process does. Run again to the same place, it copies
+only what changed. `pondra restore PLACE NEW` copies the backup's newest run into a new lake at `NEW`.
+Both print their answer as JSON.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--retention-days N` (backup) | 7, then the last given | how many days earlier runs stay restorable |
+| `--at TIME` (restore) | the newest run | restore the newest run at or before `TIME`: `'2026-10-12 03:00:00'` (UTC), RFC 3339, or milliseconds |
+
+```bash
+pondra sql --dir notes "CREATE TABLE t (a INT)"
+pondra backup notes backups/notes
+pondra restore backups/notes notes-again > /dev/null
+pondra sql --dir notes-again "SELECT name FROM pondra.tables"
+```
+
 ## pondra run
 
 `pondra run FILE LAKE` runs a SQL file: its statements in order, and `$name` in them takes the

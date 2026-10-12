@@ -90,7 +90,8 @@ src/      62,500 lines of Rust in 108 files, one per concern (see the table in R
           friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225), objects.rs
           (one registry of every kind of object: ADR-049, invariant 227), find.rs (`pondra.parts` and
           `pondra.find`: every part of every object, and one search of objects, parts and concepts;
-          ADR-065, invariant 345), seq.rs (sequences and
+          ADR-065, invariant 345), backup.rs (`BACKUP DATABASE`, `RESTORE DATABASE`: a backup is a lake;
+          ADR-070, invariants 290, 291), seq.rs (sequences and
           identity columns: invariant 234), index.rs (indexes kept as objects: invariant 235),
           constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236),
           types.rs (enum types: invariant 242), and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
@@ -2090,6 +2091,24 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `pondra_queries_running` and `pondra_queries_waiting` count them. `harness.py answers_big`:
    two turns and four slow queries, two at once and the rest refused (53300) or answered after;
    one turn does for a PIVOT, which asks the data first.
+290. **A backup run copies one snapshot, and its commit names nothing it hasn't copied** (`backup::take`,
+   ADR-070): the database is pinned and its catalog read at a version that holds the pin
+   (`branch::snapshot`); every object that version names (files, delete files, manifests, the log's
+   segments, kept dropped tables') is in the backup before the one commit that writes the catalog,
+   the log's first (tiering lets them go; the pin holds files). A run stopped half way leaves the
+   previous run whole; its mark (`_backups/running`) has the next look before it copies. A branch's
+   base's files go under `data/_bases/<id>/`, its manifests sealed again under the backup's paths, so
+   a backup of a branch reads nothing of its base. The lake's own keys (`z/auth`), lent keys, pins and
+   published state are never carried (`backup::own`). `tools/backup_check.py`.
+291. **A backup is written only by its runs, and keeps every object of the runs it keeps**
+   (`backup::frozen`, `may_write`, ADR-070). Its catalog takes a commit only from a run (`RUN`), or
+   the pins and keys a lake keeps of its own; every door refuses a write by name (25006) before it is
+   made: SQL (`write::on_node_listed`, `prepare`), the leader's requests (`write::handle`), rows
+   (`log::queue`, `commit`), files (`Lake::put`, `replace`, `remove_file`). Its nodes run no tiering,
+   emission, streaming task, feed, task tick or history. An object a run stops naming is deleted only
+   past `retention_days` and once no clone of the backup is pinned before it; a run past the
+   retention goes with its catalog (`_backups/{ms}-{commit}.json.zst`). A restore copies one run into
+   an empty place, suspends its tasks and takes away what it made if it fails. `tools/backup_check.py`.
 337. **A file is loaded into a table once a version, and its record lands with its rows** (`copy.rs`,
    `adopt::file`, `log::Filing::also`): `COPY INTO t FROM '…'` loads each file under the job
    `load:{table, file, version}` (an e-tag, else size and time), so the bulk path's job mark keeps a
@@ -2182,6 +2201,7 @@ python3 tools/harness.py memory         # 240 small commits a second, no reader:
 python3 tools/harness.py pace           # a writer's acks beside 64 querying clients stay near its acks alone (queries on their own runtime)
 python3 tools/harness.py tails          # a table's log tail kept between queries: reads == a model while rows land, a transaction's snapshot, a column added, tiering
 python3 tools/harness.py answers_big    # big answers in pieces in every format == whole, an answer past the node's memory refused (53200), query turns (53300)
+python3 tools/backup_check.py           # BACKUP DATABASE twice (the second copies what is new), the source deleted, the backup served and restored (newest and --at the first run) == models, writes refused at every door, a run killed half way, a branch's backup, pondra backup/restore with no node, a dropped table kept, a bucket reached by its secret
 python3 tools/harness.py loads          # COPY INTO: each file once a version, through retries, two nodes, a kill; pondra.loads; renames, clones
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what

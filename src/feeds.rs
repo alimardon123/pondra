@@ -52,6 +52,9 @@ pub fn start(app: App) {
         let mut hwm = app.lake.hwm.subscribe();
         loop {
             let _ = tokio::time::timeout(Duration::from_secs(5), hwm.changed()).await; // (catalog changes, and now and then for nodes coming and going)
+            if crate::backup::frozen(&app.lake) {
+                continue; // (a backup reads no topic: ADR-070)
+            }
             let feeds = match app.lake.cat.scan::<Feed>("fd/", "fd0").await {
                 Ok(f) => f,
                 Err(e) => {

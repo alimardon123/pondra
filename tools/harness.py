@@ -10315,6 +10315,12 @@ def doors():
         c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
         c.request("PUT", f"/files/{path}", body.encode())
         assert c.getresponse().status == 200, path
+    backups = tempfile.mkdtemp(prefix="pondra-doors-backups-")  # (a backup goes in a place of its own: ADR-070)
+    atexit.register(shutil.rmtree, backups, True)
+    q(f"BACKUP DATABASE TO '{backups}/read'")
+    q(f"ATTACH '{backups}/read' AS d_bk")
+    def backed(place):
+        return any(f.endswith(".json.zst") for f in os.listdir(os.path.join(place, "_backups")))
     DOORS = ["http", "python", "postgres", "flight", "javascript", "mcp"]
     def features(i):
         k = 10 * i + 1  # (each door its own keys)
@@ -10333,6 +10339,8 @@ def doors():
             "USE a schema": (["USE d_crm", "SELECT count(*) AS n FROM d_only"], lambda r: r[-1] == [[3]]),
             "a macro": (["SELECT d_twice(21) AS n"], lambda r: r[-1] == [[42]]),
             "a Git folder's status": (["SELECT path, change FROM pondra.git_status('d_git')"], lambda r: r[-1] == [["a.sql", "added"]]),
+            "a backup": ([f"BACKUP DATABASE TO '{backups}/door{i}'"], lambda r: backed(f"{backups}/door{i}")),
+            "a write to a backup refused, 25006": ([f"INSERT INTO d_bk.d_log VALUES ('door{i}', {i})"], lambda r: r == "25006"),
         }
     def rows_of(x):
         return [list(r.values()) if isinstance(r, dict) else list(r) for r in x] if isinstance(x, list) else x
@@ -10392,7 +10400,7 @@ def doors():
             text = r["content"][0]["text"]
             if r["isError"]:
                 m = re.search(r"\b(\d{2}[0-9A-Z]\d{2})\b", text)
-                return m.group(1) if m and m.group(1) in ("23514", "42P01", "40001", "25P02") else "refused: " + text[:160]
+                return m.group(1) if m and m.group(1) in ("23514", "42P01", "40001", "25P02", "25006") else "refused: " + text[:160]
             got = json.loads(text)
             out.append(rows_of(got["rows"]) if isinstance(got, dict) and "rows" in got else None)
         return out

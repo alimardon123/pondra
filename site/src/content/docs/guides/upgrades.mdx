@@ -115,11 +115,14 @@ The cluster keeps serving and taking writes the whole time, with nodes of both r
 
 <Steps>
 
-1. Stop one follower (it drains), replace its binary, and start it again with the same options.
-2. Wait until its `GET /ready` answers 200.
-3. Do the same for each other follower, and for readers.
-4. Last, the leader: it steps down when it stops, and one of the upgraded followers leads at once.
-5. Check the leader's `GET /stats`: every node in `releases` says the new release.
+1. Back the lake up with the release still running: `BACKUP DATABASE TO 's3://other-bucket/backups/prod'`
+   ([backups](/pondra/guides/backups/)). A backup keeps the format it was written at, so the release you
+   are leaving can serve it if the upgrade goes wrong.
+2. Stop one follower (it drains), replace its binary, and start it again with the same options.
+3. Wait until its `GET /ready` answers 200.
+4. Do the same for each other follower, and for readers.
+5. Last, the leader: it steps down when it stops, and one of the upgraded followers leads at once.
+6. Check the leader's `GET /stats`: every node in `releases` says the new release.
 
 </Steps>
 
