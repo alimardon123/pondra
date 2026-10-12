@@ -7638,6 +7638,52 @@ def users():
     run = until(lambda: as_(A.port, boss, f"SELECT status FROM pondra.runs WHERE id = '{started[0]['r']}'") if isinstance(started, list) else None, [{"status": "failed"}], 20)
     checks["a procedure started without waiting (pondra.start) has its caller's grants, as a CALL has"] = "permission denied: SELECT on hr" in str(called) \
         and run == [{"status": "failed"}] and as_(A.port, boss, "SELECT count(*) AS n FROM sales.refunds") == [{"n": 1}]
+    # S27: a user is shown only the tables it may read, and no routine's code (an admin sees it all)
+    as_(A.port, boss, "CREATE TASK tick SCHEDULE '1 hour' AS SELECT 1")  # (a task whose statement no user is shown)
+    # (information_schema.routines and pg_catalog are the Postgres port's: over HTTP they are DataFusion's own)
+    def pg_as(u, p, q):
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user={u} password={p} dbname=lake", connect_timeout=10) as c:
+                return c.execute(q).fetchall()
+        except Exception as e:
+            return f"ERROR {e}"
+    shown = {
+        "objects": as_(A.port, ann, b"", method="GET", path="/objects"),
+        "routines": as_(A.port, ann, b"", method="GET", path="/routines"),
+        "boss_routines": as_(A.port, boss, b"", method="GET", path="/routines"),
+        "defined": pg_as("ann", "ann-password-1", "SELECT routine_definition AS d FROM information_schema.routines WHERE routine_name = 'leak'"),
+        "boss_defined": pg_as("boss", "boss-password-1", "SELECT routine_definition AS d FROM information_schema.routines WHERE routine_name = 'leak'"),
+        "prosrc": pg_as("ann", "ann-password-1", "SELECT prosrc AS d FROM pg_catalog.pg_proc WHERE proname = 'leak'"),
+        "object": as_(A.port, ann, "SELECT definition AS d FROM pondra.objects WHERE name = 'leak'"),
+        "show": as_(A.port, ann, "SHOW CREATE PROCEDURE leak"),
+        "boss_show": as_(A.port, boss, "SHOW CREATE PROCEDURE leak"),
+        "routine_body": as_(A.port, ann, "SELECT body AS d FROM pondra.routines WHERE name = 'leak'"),
+        "routine_body_boss": as_(A.port, boss, "SELECT body AS d FROM pondra.routines WHERE name = 'leak'"),
+        "statement": as_(A.port, ann, "SELECT statement AS d FROM pondra.tasks WHERE name = 'tick'"),
+        "statement_boss": as_(A.port, boss, "SELECT statement AS d FROM pondra.tasks WHERE name = 'tick'"),
+        "export": as_(A.port, ann, b"", method="GET", path="/export"),
+        "export_boss": as_(A.port, boss, b"", method="GET", path="/export"),
+    }
+    # (a user granted APPLY on this database deploys its routines, so it is shown their code and the export)
+    as_(A.port, boss, "CREATE USER dee PASSWORD 'dee-password-1'")
+    here = as_(A.port, boss, "SELECT current_database() AS d")[0]["d"]
+    shown["applier_granted"] = as_(A.port, boss, f'GRANT APPLY ON DATABASE "{here}" TO dee')  # (quoted: the lake's folder name has a '-')
+    dee = basic("dee", "dee-password-1")
+    shown["applier_routines"] = as_(A.port, dee, b"", method="GET", path="/routines")
+    shown["applier_export"] = as_(A.port, dee, b"", method="GET", path="/export")
+    names = sorted(o["name"] for o in shown["objects"]["objects"]) if isinstance(shown["objects"], dict) else shown["objects"]
+    shown_info = {k: v for k, v in shown.items() if k != "objects"} | {"objects": names}
+    checks["a user is shown only the tables it may read (GET /objects) and no routine's code: /routines, information_schema, pg_proc, pondra.objects, SHOW CREATE (S27); an admin all of it"] = \
+        names == ["notes", "orders"] and isinstance(shown["routines"], dict) and shown["routines"].get("leak", {}).get("body") == "" \
+        and "INSERT INTO sales.refunds" in json.dumps(shown["boss_routines"]) and shown["defined"] == [(None,)] and shown["prosrc"] == [(None,)] \
+        and shown["object"] == [{}] and "shown to an admin" in str(shown["show"]) and "INSERT INTO sales.refunds" in json.dumps(shown["boss_show"]) \
+        and "INSERT INTO sales.refunds" in str(shown["boss_defined"])  # (the node's JSON leaves out nulls: a NULL is [{}]; Postgres gives None)
+    checks["S27, beyond the listings: pondra.routines' body and pondra.tasks' statement shown to no user, GET /export (every routine's code) refused to one; an admin gets them all"] = \
+        shown["routine_body"] == [{}] and "INSERT INTO sales.refunds" in json.dumps(shown["routine_body_boss"]) \
+        and shown["statement"] == [{}] and "SELECT 1" in json.dumps(shown["statement_boss"]) \
+        and "permission denied" in str(shown["export"]) and "INSERT INTO sales.refunds" in json.dumps(shown["export_boss"])
+    checks["…a user granted APPLY on this database (it deploys them) is shown routines' code and the export"] = \
+        "INSERT INTO sales.refunds" in json.dumps(shown["applier_routines"]) and "INSERT INTO sales.refunds" in json.dumps(shown["applier_export"])
     # Tokens and sessions
     tok = as_(A.port, boss, "CREATE TOKEN ci FOR USER svc")
     short = as_(A.port, boss, "CREATE TOKEN brief FOR USER svc EXPIRES IN '1 second'")
@@ -7741,7 +7787,7 @@ def users():
     checks["revoked (a column, a role) and dropped: at once on the leader and a follower; pondra.grants says what stands"] = revoked == [True, True] and still == [{"id": 1}, {"id": 2}] \
         and no_role is True and gone == [True, True] and {"grantee": "analyst", "privilege": "SELECT", "on_name": "sales.orders", "columns": "id, amount"} in grants
     info = {"said": said, "wrote": wrote, "pg": pg_said, "kafka": kafka_said, "flight": flight_said[1:], "grants": grants, "revoked": [revoked, still, no_role, gone],
-            "tokens": [by_token, expired, by_session, tampered, ended, dropped_token]}
+            "tokens": [by_token, expired, by_session, tampered, ended, dropped_token], "shown": shown_info}
     a.kill(), b.kill()  # (the ports free for the next test of `all`)
     ok = all(checks.values())
     print(json.dumps({"users": checks, "ok": ok, "info": info}, indent=1, default=str))
