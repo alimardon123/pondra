@@ -1708,6 +1708,9 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
     if let Some(steps) = Box::pin(steps(app, sql, who)).await? {
         return Box::pin(run_steps(app, steps, who, job)).await; // (several statements: an ALTER's actions, a DROP's views)
     }
+    if let Some(r) = crate::returning::of(sql) {
+        return Ok(Outcome::Rows(vec![Box::pin(crate::returning::run(app, &r, who.role, who.files, job)).await?])); // (INSERT … RETURNING: the rows it wrote)
+    }
     if let Some(stmt) = crate::write::parse(sql) {
         app.auth.allows(who.role, &stmt)?;
         return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files).await?));

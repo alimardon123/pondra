@@ -303,6 +303,13 @@ impl Backend {
                 crate::routines::Outcome::Done(_) => Ok(Response::Execution(Tag::new(if crate::routines::do_of(&sql).is_some() { "DO" } else { "CALL" }))),
             };
         }
+        if let Some(r) = crate::returning::of(&sql) {
+            // INSERT, UPDATE or DELETE … RETURNING: the rows it wrote, under its command's tag (`INSERT 0 3`)
+            let b = Box::pin(crate::returning::run(&self.app, &r, role, false, None)).await.map_err(user_error)?;
+            let mut answer = rows(&b.schema(), vec![b], format)?;
+            answer.command_tag = r.tag().into();
+            return Ok(Response::Query(answer));
+        }
         if let Some(stmt) = crate::write::parse(&sql) {
             self.app.auth.allows(role, &stmt).map_err(user_error)?;
             let tag = command_tag(&sql, &stmt);
@@ -1206,6 +1213,15 @@ impl Backend {
             // A SHOW sends one row of one text column (`session_command`): Describe must say so, or pgjdbc and
             // prepared psycopg statements fail on a row with no column description.
             return Ok((vec![FieldInfo::new(column, None, None, Type::VARCHAR, FieldFormat::Text)], Columns::Each));
+        }
+        if crate::returning::of(sql).is_some() {
+            // (its columns as `run` answers them: the same text, its macros and Postgres's forms written out)
+            let sql = crate::vars::bound(sql).map_err(user_error)?;
+            let sql = crate::routines::expand(&self.app.lake, &sql).await.map_err(user_error)?;
+            if let Some(r) = crate::returning::of(&pg_dialect(&self.app.lake, &sql, "")) {
+                let schema = crate::returning::columns(&self.app, &r).await.map_err(user_error)?;
+                return Ok((described(&schema, format), Columns::Kept { schema, given: false }));
+            }
         }
         let point = match crate::auth::limited() {
             None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| p.schema().ok()), // (a key lookup's columns, unplanned, first)

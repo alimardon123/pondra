@@ -153,6 +153,7 @@ enum State {
 
 struct Txn {
     id: String,             // (also the owner of its locks on the leader)
+    job: Option<String>,    // what names its commit, when a job does (`alone`): sent again, it is a duplicate
     lake: String,           // the lake's url: where its locks are
     level: Level,
     read_only: bool,
@@ -349,7 +350,7 @@ pub async fn command(app: &crate::server::App, word: &str, sql: &str) -> Result<
             }
             None => Ok(("ROLLBACK", Some("there is no transaction in progress".into()))),
         },
-        _ => commit(app, &s).await,
+        _ => commit(app, &s).await.map(|(tag, warning, _)| (tag, warning)),
     }
 }
 
@@ -444,22 +445,23 @@ fn begin(app: &crate::server::App, s: &str, sql: &str) -> Result<(&'static str, 
     let (level, read_only) = plan(&begin_modes(sql)?)?;
     let level = level.map_or_else(default_level, Ok)?;
     let read_only = read_only.unwrap_or_else(default_read_only);
-    if !start(app, s, level, read_only) {
+    if !start(app, s, level, read_only, None) {
         return Ok(("BEGIN", Some("there is already a transaction in progress".into())));
     }
     Ok(("BEGIN", None))
 }
 
 /// Opens a transaction for session `s` (false: it has one). Its snapshot is taken at its first statement (as Postgres
-/// takes it: `gate`), so this is a placeholder until then. Starts the upkeep loop if none runs.
-fn start(app: &crate::server::App, s: &str, level: Level, read_only: bool) -> bool {
+/// takes it: `gate`), so this is a placeholder until then. Starts the upkeep loop if none runs. Its id is new each time; a
+/// `job` names its commit instead (`alone`).
+fn start(app: &crate::server::App, s: &str, level: Level, read_only: bool, job: Option<String>) -> bool {
     let mut book = BOOK.lock().unwrap();
     if book.txns.contains_key(s) {
         return false;
     }
-    let id = uuid::Uuid::new_v4().simple().to_string();
+    let id = uuid::Uuid::new_v4().simple().to_string(); // (fresh each time: a leader refuses locks to an id that ended)
     let txn = Txn {
-        id, lake: app.lake.url.clone(), level, read_only, snapshot: app.lake.visible(), ran: false, leader: leader_of(app),
+        id, job, lake: app.lake.url.clone(), level, read_only, snapshot: app.lake.visible(), ran: false, leader: leader_of(app),
         locked: false, state: State::Open, tables: BTreeMap::new(), by_key: BTreeMap::new(), reads: BTreeMap::new(), marks: vec![], failed: None,
         used: Instant::now(), busy: 0, next: -1,
     };
@@ -1015,6 +1017,7 @@ pub async fn statement(app: &crate::server::App, stmt: &Stmt, files: bool) -> Re
         }
         None => change(&l, &stored, stmt, snapshot).await?,
     };
+    crate::returning::wrote(&old, &new);
     let out = tally(&old, &new);
     keep(&name, &meta.key, old, new, at, keys, &id)?;
     Ok(Some(out))
@@ -1052,6 +1055,7 @@ async fn autocommit_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: 
     }
     let l = Locks { app, name: &name, meta: &meta, owner: owner.to_string(), txn: false, locking: true, committed: true, wait: lock_wait(), taken };
     let (old, new, _, _) = change(&l, &stored, stmt, lake.visible()).await?;
+    crate::returning::wrote(&old, &new);
     let out = tally(&old, &new);
     let Some(batch) = crate::change::upserts(&stored, &old, &new)? else {
         return Ok(j!({"rows": 0, "updated": 0, "deleted": 0, "inserted": 0})); // (no row matched)
@@ -1096,6 +1100,7 @@ async fn insert_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: &str
         return Ok(j!({"duplicate": true}));
     }
     crate::constraints::key_check(lake, &name, &stored, None, &batch).await?; // (under the locks: the rows the other writer committed are here)
+    crate::returning::wrote(&[], std::slice::from_ref(&batch));
     let n = batch.num_rows();
     pause_for_tests().await;
     let src = crate::log::Src { producer: format!("sql:{job}"), seq: 1, prev: None };
@@ -1460,6 +1465,9 @@ fn too_many(table: &str) -> anyhow::Error {
 #[derive(Serialize, Deserialize)]
 pub struct Commit {
     pub id: String,
+    /// What names its commit when a job does (`alone`), in place of `id`, which owns its locks: a job sent again is a duplicate.
+    #[serde(default)]
+    pub job: Option<String>,
     #[serde(default)]
     pub reads: BTreeMap<String, Reads>,
     pub tables: Vec<(String, String, String)>,
@@ -1492,18 +1500,20 @@ fn unipc(s: &str) -> Result<Vec<RecordBatch>> {
 
 /// Sends the transaction's writes to the leader, here or over HTTP, and ends the transaction: its locks go (`release_txn`)
 /// whatever the answer. A failed send lets go too, and the lease covers a send that never arrived.
-async fn commit(app: &crate::server::App, s: &str) -> Result<(&'static str, Option<String>)> {
-    let Some(t) = BOOK.lock().unwrap().txns.remove(s) else { return Ok(("COMMIT", Some("there is no transaction in progress".into()))) };
+/// COMMIT: the tag and warning Postgres gives, and what the leader answered (`duplicate`: a job's commit sent again).
+async fn commit(app: &crate::server::App, s: &str) -> Result<(&'static str, Option<String>, Value)> {
+    let Some(t) = BOOK.lock().unwrap().txns.remove(s) else { return Ok(("COMMIT", Some("there is no transaction in progress".into()), j!({}))) };
     if t.failed.is_some() {
         release_txn(&t);
-        return Ok(("ROLLBACK", None));
+        return Ok(("ROLLBACK", None, j!({})));
     }
     if t.tables.values().all(|c| c.new.is_empty() && c.old.is_empty()) {
         release_txn(&t); // (it only read)
-        return Ok(("COMMIT", None));
+        return Ok(("COMMIT", None, j!({})));
     }
     let c = Commit {
         id: t.id.clone(),
+        job: t.job.clone(),
         reads: t.reads.clone(),
         tables: t.tables.iter().map(|(n, c)| Ok((n.clone(), ipc(&fresh(c.new.clone())?)?, ipc(&c.old)?))).collect::<Result<_>>()?,
     };
@@ -1514,9 +1524,51 @@ async fn commit(app: &crate::server::App, s: &str) -> Result<(&'static str, Opti
     if sent.is_err() {
         release_txn(&t);
     }
-    sent?;
+    let sent = sent?;
     crate::write::seen_here(app).await; // (the next statement here reads it)
-    Ok(("COMMIT", None))
+    Ok(("COMMIT", None, sent))
+}
+
+/// What a job names a transaction of its own (`alone`): its commit is producer `txn:{this}:{table}`.
+fn as_job(job: &str) -> String { format!("job-{job}") }
+
+/// Did a job's transaction of its own (`alone`) commit its changes to `table`? (As this node's catalog has it.)
+pub async fn committed(lake: &Lake, job: &str, table: &str) -> Result<bool> {
+    Ok(lake.cat.get::<u64>(&crate::store::producer_key(&format!("txn:{}:{table}", as_job(job)))).await?.unwrap_or(0) > 0)
+}
+
+/// A write run as a transaction of its own, for its RETURNING (`returning.rs`): BEGIN, the statement and COMMIT, in the caller's
+/// session (none open there: its temporary tables and settings are read as the statement's own would be), or one of its own.
+/// It is for a change the leader would otherwise work out (`write::changes`): here its rows are worked out where they can be
+/// returned, and they still land in one commit. A COMMIT refused with 40001 runs it again, three times at most, since nothing
+/// has been answered yet (as Postgres works an UPDATE out again on the newest version of a row it waited for). A job names the
+/// transaction's commit, so its commit sent again is a duplicate.
+pub async fn alone(app: &crate::server::App, sql: &str, job: Option<String>, files: bool) -> Result<Value> {
+    let caller = crate::temp::SESSION.try_with(|s| s.clone()).ok().flatten();
+    let s = caller.clone().unwrap_or_else(crate::temp::of_script);
+    let job = job.map(|j| as_job(&j));
+    let run = async {
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let stmt = crate::write::parse(sql).context("not a write")?;
+            start(app, &s, Level::Committed, false, job.clone());
+            let out = Box::pin(crate::write::on_node_as(app, stmt, None, files)).await?; // (refused: the session's end rolls it back)
+            match commit(app, &s).await {
+                Ok((_, _, sent)) => return Ok(if sent["duplicate"] == true { j!({"duplicate": true}) } else { out }),
+                Err(e) if crate::codes::of(&e) == "40001" && tries < 3 => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    let out = crate::temp::SESSION.scope(Some(s.clone()), run).await;
+    match caller {
+        Some(_) => end(&s), // (refused before its COMMIT: rolled back, the session kept)
+        None => {
+            crate::temp::end(&s);
+        }
+    }
+    out
 }
 
 /// Leader: checks the transaction against what committed since the points it read at, and writes it as one flush (a
@@ -1557,7 +1609,7 @@ async fn write_changes(lake: &Lake, seq: &crate::log::Sequencer, c: Commit) -> R
             mine.extend(reads.keys.keys().filter(|k| is_on(k.as_slice())).cloned());
         }
         conflicts(lake, name, &meta, &reads, &mine).await?;
-        let (p, _) = crate::change::appends(lake, seq, name, &stored, old, new, &format!("txn:{}:{name}", c.id), true).await?; // (a plain INSERT's key is new at COMMIT too: `constraints.rs`)
+        let (p, _) = crate::change::appends(lake, seq, name, &stored, old, new, &format!("txn:{}:{name}", c.job.as_ref().unwrap_or(&c.id)), true).await?; // (a plain INSERT's key is new at COMMIT too: `constraints.rs`)
         pending.extend(p);
     }
     if pending.is_empty() {

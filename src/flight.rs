@@ -132,6 +132,14 @@ crate::per_node!(
 /// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER (or a CALL). Returns the rows written.
 async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
     no_sql_transaction(sql)?;
+    if crate::returning::of(sql).is_some() {
+        // (sent as an update, a write with RETURNING answers how many rows it wrote)
+        let who = crate::routines::Who { role, files: false, depth: 0 };
+        return match crate::routines::one(app, sql, who, None).await.map_err(status)? {
+            crate::routines::Outcome::Rows(b) => Ok(b.iter().map(|b| b.num_rows() as i64).sum()),
+            crate::routines::Outcome::Done(_) => Ok(0),
+        };
+    }
     if crate::routines::runs_procedure(sql) {
         let who = crate::routines::Who { role, files: false, depth: 0 };
         crate::routines::one(app, sql, who, None).await.map_err(status)?;
@@ -397,8 +405,8 @@ impl FlightSqlService for Sql {
         let role = allowed(&self.0, &req, Role::Read)?;
         no_sql_transaction(&q.query)?;
         let txn = q.transaction_id.as_deref(); // (the transaction the statement runs in, if it names one)
-        if crate::routines::runs_procedure(&q.query) {
-            // A CALL (or DO): run now, as every door runs one; the ticket reads back what it answered.
+        if crate::routines::runs_procedure(&q.query) || crate::returning::of(&q.query).is_some() {
+            // A CALL (or DO), or a write with RETURNING: run now, as every door runs one; the ticket reads back what it answered.
             let who = crate::routines::Who { role, files: false, depth: 0 };
             let out = within(txn, async { crate::routines::one(&self.0, &q.query, who, None).await.map_err(status) }).await?;
             let batches = match out {
