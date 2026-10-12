@@ -62,6 +62,12 @@ enum Action {
 }
 
 impl Merge {
+    /// The columns an INSERT … ON CONFLICT is on, when it is one (`Upsert::on`): its conflict target, whose values the rows it
+    /// writes lock on an append table (`txn::conflict_keys`).
+    pub fn on_columns(&self) -> Option<&[String]> {
+        self.upsert.as_ref().map(|u| u.on.as_slice()).filter(|on| !on.is_empty())
+    }
+
     /// The privileges on its table it needs: what its clauses do (`auth::allows`).
     pub fn privileges(&self) -> Vec<&'static str> {
         let mut all: Vec<&'static str> = self.clauses.iter().map(|c| match c.action {
@@ -240,6 +246,8 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
     if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", format!("{table} is a merge table: its rows add up as they're read, so UPDATE and DELETE aren't taken; insert rows that add up to the change"))); }
     let append = meta.key.is_empty();
     ensure!(meta.ids || !append, "{table} was made before Pondra 0.19, and its rows have no row ids, which UPDATE, DELETE and MERGE need: copy it once (CREATE TABLE t2 AS SELECT * FROM {table}) and change the copy");
+    // (ADR-067 §7: autocommitted appends to this table land before this change reads it, or after it: never between)
+    let _gate = crate::locks::close(&lake.url, std::slice::from_ref(&table)).await?;
     let upto = lake.visible(); // (one snapshot for every query below: the lock keeps its files)
     let point = match &stmt {
         crate::write::Stmt::Update(_, set, Some(cond)) if !append => crate::txn::point_change(lake, &table, &stored, None, set, cond).await?, // (one key: no planning, ADR-036 §6)
@@ -270,7 +278,10 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
 /// (keeping their `_row_id` and `_created_at`) and new rows. A temporary table's too (`temp.rs`).
 pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, stmt: &crate::write::Stmt, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
     Ok(match stmt {
-        crate::write::Stmt::Update(_, set, cond) => update(lake, table, meta, set, cond, upto).await?,
+        crate::write::Stmt::Update(_, set, cond) => {
+            crate::txn::refuse_change(lake, table, meta, stmt).await?;
+            update(lake, table, meta, set, cond, upto).await?
+        }
         crate::write::Stmt::Delete(_, cond) => (select(lake, table, meta, &[], &format!("FROM {} {}", from(table), filter(cond)), upto).await?.0, vec![]),
         crate::write::Stmt::Merge(m) => merge(lake, table, meta, m, upto).await?,
         crate::write::Stmt::Insert(_, query) => (vec![], vec![crate::write::rows(&session(lake, query, upto).await?, meta, query).await?]), // (a checked table's: `constraints.rs`)
@@ -466,16 +477,11 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta
             pending.push(append(&sys::deleted(table), as_deleted(&old)?, src(":deleted")));
         }
     } else {
-        // Keyed: delete markers are the old rows no new version replaces, marked.
-        let kept: std::collections::HashSet<i64> = new.iter().flat_map(|n| ids_of(n)).flatten().collect();
-        let gone = |o: &RecordBatch| -> Result<RecordBatch> {
-            let keep = BooleanArray::from(ids_of(o).iter().map(|id| Some(!id.is_some_and(|i| kept.contains(&i)))).collect::<Vec<_>>());
-            Ok(datafusion::arrow::compute::filter_record_batch(o, &keep)?)
-        };
-        let marked = old.map(|o| gone(&o)).transpose()?.map(|o| mark_deleted(&o)).transpose()?.map(|o| without(&o, sys::VERSION)).transpose()?;
-        let all: Vec<RecordBatch> = new.into_iter().chain(marked).collect();
-        let s = all[0].schema();
-        pending.push(append(table, concat_batches(&s, &all.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?, src("")));
+        let none: &[RecordBatch] = &[];
+        let (old, new) = (old.as_ref().map_or(none, std::slice::from_ref), new.as_ref().map_or(none, std::slice::from_ref));
+        if let Some(batch) = upserts(meta, old, new)? {
+            pending.push(append(table, batch, src("")));
+        }
     }
     for a in pending.iter_mut().filter(|a| a.batch.num_rows() > 0) {
         let first = loop {
@@ -487,6 +493,25 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta
         a.batch = sys::stamp(&a.batch, first)?;
     }
     Ok((pending, (replaced, added, inserted)))
+}
+
+/// A keyed table's change as one batch for the log: its new versions, and the old rows no new version replaces, marked
+/// deleted (`_deleted`, without `_version`). Under SQL's names, with `_row_id` and `_created_at`. None when no row
+/// is in either. Used by `appends` and by an autocommitted UPDATE or DELETE (`txn::autocommit`).
+pub fn upserts(meta: &TableMeta, old: &[RecordBatch], new: &[RecordBatch]) -> Result<Option<RecordBatch>> {
+    let ids = with_ids(&crate::query::schema(&meta.logical_columns())?);
+    let new: Vec<RecordBatch> = new.iter().filter(|b| b.num_rows() > 0).map(|b| crate::query::conform(b, &ids)).collect::<Result<_>>()?;
+    let kept: std::collections::HashSet<i64> = new.iter().flat_map(ids_of).flatten().collect();
+    let mut all = new;
+    for o in old.iter().filter(|o| o.num_rows() > 0) {
+        let keep = BooleanArray::from(ids_of(o).iter().map(|id| Some(!id.is_some_and(|i| kept.contains(&i)))).collect::<Vec<_>>());
+        let gone = datafusion::arrow::compute::filter_record_batch(o, &keep)?;
+        if gone.num_rows() > 0 {
+            all.push(without(&mark_deleted(&gone)?, sys::VERSION)?);
+        }
+    }
+    let Some(s) = all.first().map(|b| b.schema()) else { return Ok(None) };
+    Ok(Some(concat_batches(&s, &all.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?))
 }
 
 /// A batch's `_row_id`s.

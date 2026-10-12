@@ -116,6 +116,10 @@ pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> {
             all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: Some(v.sql) });
         }
     }
+    if let Some(a) = crate::auth::limited() {
+        let here = lake_name(lake);
+        all.retain(|o| a.may("select", &if o.lake == here { join(&o.schema, &o.name) } else { format!("{}.{}", o.lake, join(&o.schema, &o.name)) })); // (a user's: what it may read, at every listing: S27)
+    }
     Ok(all)
 }
 

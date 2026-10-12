@@ -437,7 +437,7 @@ impl FlightSqlService for Sql {
         allowed(&self.0, &req, Role::Read)?;
         let id = format!("fl-{}", uuid::Uuid::new_v4().simple()); // (the client's handle; its session is the caller's own, named by it)
         crate::temp::with(&crate::temp::id(&id), false, |_| Ok(())).map_err(status)?; // (held as a session: an idle one ends, its transaction rolled back, as `temp::reap` does)
-        crate::temp::SESSION.scope(Some(crate::temp::id(&id)), crate::txn::command(&self.0, "BEGIN")).await.map_err(status)?;
+        crate::temp::SESSION.scope(Some(crate::temp::id(&id)), crate::txn::command(&self.0, "BEGIN", "BEGIN")).await.map_err(status)?;
         Ok(ActionBeginTransactionResult { transaction_id: id.into_bytes().into() })
     }
 
@@ -449,7 +449,8 @@ impl FlightSqlService for Sql {
             _ => return Err(Status::invalid_argument("EndTransaction: commit or rollback")),
         };
         let session = in_txn(&q.transaction_id)?;
-        let out = crate::temp::SESSION.scope(Some(session.clone()), crate::txn::command(&self.0, word)).await;
+        // (no statement text: COMMIT and ROLLBACK take none, only BEGIN's modes do)
+        let out = crate::temp::SESSION.scope(Some(session.clone()), crate::txn::command(&self.0, word, "")).await;
         crate::temp::end(&session); // (the session ends with its transaction, committed or not)
         let (tag, _) = out.map_err(status)?;
         if word == "COMMIT" && tag == "ROLLBACK" {

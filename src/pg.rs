@@ -216,7 +216,7 @@ impl Backend {
         let bound = self.placed(bound.into_owned()).await?; // (the session's search path: full names, ahead of the key lookup)
         let sql: &str = &bound;
         let reader = crate::auth::current().is_some_and(|p| p.role >= crate::auth::Role::Read);
-        if reader && crate::txn::open() && crate::txn::refuse().is_ok() {
+        if reader && crate::txn::open() && crate::txn::gate(&self.app.lake, sql).is_ok() {
             if let Some(b) = crate::txn::point_read(&self.app.lake, sql).await.map_err(user_error)? {
                 let schema = b.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
                 return Ok(Response::Query(rows(&schema, b, format)?)); // (in a transaction: its own version, or its snapshot's)
@@ -240,18 +240,26 @@ impl Backend {
         if crate::env::is_set("PONDRA_DEBUG_PG") {
             eprintln!("pg {user}: {sql}");
         }
-        if let Some(word) = crate::txn::control(crate::write::first_word(&sql)) {
-            // BEGIN, COMMIT, ROLLBACK: this connection's transaction (ADR-036 §5). From the first word:
-            // dbt's leading comment (`/* {"app": "dbt"} */ commit`) is no part of the statement.
-            let (tag, warning) = crate::txn::command(&self.app, word).await.map_err(user_error)?;
-            crate::cursors::sweep(); // (a COMMIT or ROLLBACK ends the cursors without HOLD: their answers go now)
+        let statement = crate::write::first_word(&sql); // (dbt's leading comment is no part of the statement)
+        if let Some(word) = crate::txn::control(statement) {
+            // BEGIN, COMMIT, ROLLBACK: this connection's transaction (ADR-036 §5)
+            let answer = crate::txn::command(&self.app, word, statement).await;
+            crate::cursors::sweep(); // (a COMMIT or ROLLBACK ends the cursors without HOLD: their answers go now, refused or not)
+            let (tag, warning) = answer.map_err(user_error)?;
             warning.iter().for_each(|w| crate::routines::heard(&format!("WARNING: {w}")));
-            return Ok(match tag {
-                "BEGIN" => Response::TransactionStart(Tag::new(tag)), // (the client sees it: ReadyForQuery's status)
+            // (the client sees each one in ReadyForQuery's status: a savepoint leaves the transaction open, ROLLBACK TO
+            // reopens it after a failure, and only BEGIN and COMMIT or ROLLBACK start and end it)
+            return Ok(match word {
+                "BEGIN" | "ROLLBACK TO" => Response::TransactionStart(Tag::new(tag)),
+                "SAVEPOINT" | "RELEASE" => Response::Execution(Tag::new(tag)),
                 _ => Response::TransactionEnd(Tag::new(tag)),
             });
         }
-        crate::txn::refuse().map_err(user_error)?; // (a failed transaction takes nothing but its end)
+        let _busy = crate::txn::next(&self.app, &sql).await.map_err(user_error)?; // (a failed transaction takes nothing but its end; READ COMMITTED reads the newest commit; the guard keeps the transaction busy while this runs)
+        if let Some(b) = crate::txn::locked_read(&self.app, &sql).await.map_err(user_error)? {
+            let schema = b.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
+            return Ok(Response::Query(rows(&schema, b, format)?)); // (a locking read in a transaction: the rows it locked)
+        }
         if let Some(cmd) = crate::cursors::of(&sql) {
             // DECLARE, FETCH, MOVE, CLOSE: this connection's cursors (cursors.rs). Before the settings and
             // session commands, which read CLOSE as their own.
@@ -414,13 +422,20 @@ impl Backend {
     }
 
     /// `COPY t FROM STDIN`: what is to come, noted on the connection (`on_copy_data` gathers it).
-    async fn copy_in<C: ClientInfo>(&self, client: &mut C, _user: &str, c: Copy) -> PgWireResult<Response> {
+    async fn copy_in<C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, _user: &str, c: Copy) -> PgWireResult<Response> {
         let refuse = |why: &str| Err(user_error(anyhow::anyhow!("{why}")));
         if c.query.is_some() || c.format == "binary" {
             return refuse("COPY FROM STDIN takes a table, in text or CSV");
         }
         let stmt = crate::write::parse(&format!("INSERT INTO {} SELECT 1", c.table)).ok_or_else(|| user_error(anyhow::anyhow!("COPY: no table {}", c.table)))?;
         self.app.auth.allows(crate::auth::current().map_or(crate::auth::Role::None, |p| p.role), &stmt).map_err(user_error)?;
+        // In a transaction the rows go to the log as they come, not into the transaction's kept writes (as DDL does,
+        // ADR-067 §7): READ ONLY and a failed transaction refuse the COPY (25006, 25P02), and a notice says it ran at once.
+        crate::txn::gate(&self.app.lake, &format!("COPY {} FROM STDIN", c.table)).map_err(user_error)?;
+        if crate::txn::open() {
+            let note = "COPY ran at once: it isn't part of a transaction here, and ROLLBACK won't undo it";
+            let _ = client.send(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), note.into()).into())).await;
+        }
         let (other, table) = crate::ddl::resolve(&self.app.lake, &c.table).await.map_err(user_error)?;
         if other.is_some() {
             return refuse("COPY into an attached lake: INSERT INTO it instead");
@@ -556,7 +571,7 @@ fn session_command(sql: &str) -> Option<Response> {
         }
         "SHOW" if show_column(sql).is_some() => {
             let (name, column) = show_column(sql)?;
-            setting(&column, &crate::settings::shown(&name).unwrap_or_else(|| match name.as_str() {
+            setting(&column, &crate::txn::shown(&name).or_else(|| crate::settings::shown(&name)).unwrap_or_else(|| match name.as_str() {
                 "search_path" => "public".into(), // (no session path: this lake's public, as Postgres's `"$user", public` in its usual setup)
                 s if s.contains("standard_conforming_strings") => "on".into(),
                 s if s.contains("transaction") => "read committed".into(),
@@ -955,7 +970,7 @@ impl SimpleQueryHandler for Backend {
         let mut out = vec![];
         for q in crate::routines::split(query).iter().map(|q| q.trim()) {
             out.push(match Copy::of(q) {
-                Some(Ok(c)) if !c.to => crate::auth::WHO.scope(self.who(), self.copy_in(client, &user, c)).await?,
+                Some(Ok(c)) if !c.to => crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.who(), self.copy_in(client, &user, c))).await?,
                 _ => self.told(client, &user, q, &Format::UnifiedText).await?,
             });
         }
@@ -1005,7 +1020,7 @@ impl ExtendedQueryHandler for Backend {
     {
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         if let Some(Ok(c)) = Copy::of(&portal.statement.statement).filter(|c| c.as_ref().is_ok_and(|c| !c.to)) {
-            return crate::auth::WHO.scope(self.who(), self.copy_in(client, &user, c)).await;
+            return crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.who(), self.copy_in(client, &user, c))).await;
         }
         let inferred = crate::temp::SESSION.scope(Some(self.session.clone()), self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement, ""))).await;
         self.told(client, &user, &bind(portal, &inferred)?, &portal.result_column_format).await

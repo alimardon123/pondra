@@ -1009,7 +1009,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("returns", r(&|_, r| r.returns.clone())),
         ("volatility", r(&|_, r| (r.kind != Kind::Procedure).then(|| r.with.volatility.clone().unwrap_or_else(|| if r.python() { "volatile" } else { "as its body" }.into())))),
         ("options", r(&|_, r| Some(serde_json::to_string(&r.with).unwrap_or_default()).filter(|o| o != "{}"))),
-        ("body", r(&|_, r| Some(r.body.clone()))),
+        ("body", r(&|_, r| crate::auth::shows_code().then(|| r.body.clone()))), // (a routine's code: S27)
     ])?;
     let all = tasks(lake).await?;
     let mut ticks = vec![];
@@ -1024,7 +1024,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("schedule", t(&|_, (_, x)| Some(x.schedule.clone()).filter(|s| !s.is_empty()))),
         ("after", t(&|_, (_, x)| Some(x.after.join(", ")).filter(|s| !s.is_empty()))),
         ("when", t(&|_, (_, x)| x.when.clone())),
-        ("statement", t(&|_, (_, x)| Some(x.sql.clone()))),
+        ("statement", t(&|_, (_, x)| crate::auth::shows_code().then(|| x.sql.clone()))), // (a task's statement: S27)
         ("options", t(&|_, (_, x)| (!x.with.plain()).then(|| serde_json::to_string(&x.with).unwrap_or_default()))),
         ("state", t(&|_, (_, x)| Some(if x.suspended { "suspended" } else { "started" }.into()))),
         ("last_tick", at(&|i, _| ticks[i].as_ref().map(|t| t.at))),
@@ -1035,10 +1035,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
     let mem = |b: RecordBatch| -> Result<Arc<dyn datafusion::catalog::TableProvider>> { Ok(Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
     // (every table and view, of what kind: `information_schema.tables` knows only BASE TABLE and VIEW;
     // rows and bytes in its files, so rows still in the log count once written out)
-    let mut all = crate::ddl::listed(lake).await?;
-    if let Some(a) = crate::auth::limited() {
-        all.retain(|o| a.may("select", &if o.lake == crate::ddl::lake_name(lake) { crate::ddl::join(&o.schema, &o.name) } else { format!("{}.{}", o.lake, crate::ddl::join(&o.schema, &o.name)) })); // (a user's: what it may read)
-    }
+    let all = crate::ddl::listed(lake).await?; // (a user's: what it may read)
     let l = |f: &dyn Fn(&crate::ddl::Listed) -> Option<String>| Arc::new(all.iter().map(f).collect::<StringArray>()) as ArrayRef;
     let n = |f: &dyn Fn(&TableMeta) -> u64| Arc::new(all.iter().map(|o| o.meta.as_ref().map(|m| f(m) as i64)).collect::<Int64Array>()) as ArrayRef;
     let sealed = |m: &TableMeta| m.sealed.clone().unwrap_or_default();

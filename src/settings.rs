@@ -99,16 +99,14 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
         }
         // What other statements called SET ask for is done as asked, or refused by name: a SET
         // answered and not done would be a quiet lie (principle 10).
-        Statement::Set(Set::SetTransaction { modes, snapshot, .. }) => {
+        Statement::Set(Set::SetTransaction { modes, snapshot, session: for_session }) => {
+            // SET TRANSACTION (the open transaction) and SET SESSION CHARACTERISTICS (the session's levels):
+            // ADR-067 §1. An imported snapshot isn't built, so it is refused by name.
             if snapshot.is_some() {
-                return Err(crate::codes::coded("0A000", "SET TRANSACTION SNAPSHOT: a transaction reads the commit its BEGIN saw, never another's"));
+                return Err(crate::codes::coded("0A000", "SET TRANSACTION SNAPSHOT isn't built here"));
             }
-            for m in &modes {
-                match m {
-                    ast::TransactionMode::IsolationLevel(ast::TransactionIsolationLevel::Serializable) => return Err(crate::codes::coded("0A000", SERIALIZABLE)),
-                    ast::TransactionMode::AccessMode(ast::TransactionAccessMode::ReadOnly) => return Err(crate::codes::coded("0A000", READ_ONLY)),
-                    _ => {} // (READ COMMITTED, READ UNCOMMITTED, REPEATABLE READ, SNAPSHOT, READ WRITE: a snapshot is each of them or stronger, as the standard allows)
-                }
+            if let Some(w) = crate::txn::modes(&modes, for_session)? {
+                crate::routines::heard(&format!("WARNING: {w}"));
             }
             Done::Said("SET")
         }
@@ -211,8 +209,6 @@ const ONE_WAY: &[(&str, &[&str], &str, &str)] = &[
     ("client_encoding", &["utf8", "utf-8", "unicode", "utf8mb4", "utf8mb3"], "22023", "text is UTF-8 here: SET client_encoding = 'UTF8'"),
     ("standard_conforming_strings", &["on", "true", "1"], "22023", "a backslash in '…' is itself here, as Postgres has it by default; E'a\\nb' writes an escape"),
     ("autocommit", &["on", "true", "1"], "22023", "each statement commits on its own here: BEGIN … COMMIT makes several one"),
-    ("transaction_read_only", &["off", "false", "0"], "0A000", READ_ONLY),
-    ("default_transaction_read_only", &["off", "false", "0"], "0A000", READ_ONLY),
     ("transaction_isolation", &["read committed", "read uncommitted", "repeatable read"], "0A000", SERIALIZABLE),
     ("default_transaction_isolation", &["read committed", "read uncommitted", "repeatable read"], "0A000", SERIALIZABLE),
 ];
@@ -224,8 +220,7 @@ const THE_NODES: &[(&str, &str)] = &[
     ("temp_directory", "spill files go to the system's temporary folder (TMPDIR)"),
 ];
 
-pub const SERIALIZABLE: &str = "SERIALIZABLE isn't kept here: a transaction is one snapshot, and a row another commit changed meanwhile refuses its COMMIT (40001), as Postgres's REPEATABLE READ does: SET TRANSACTION ISOLATION LEVEL REPEATABLE READ";
-pub const READ_ONLY: &str = "a read-only transaction isn't kept here: a session writes as far as its sign-in may, so sign in as a user granted SELECT only for reads that can't write";
+pub const SERIALIZABLE: &str = "SERIALIZABLE isn't kept here: REPEATABLE READ is snapshot isolation, which allows write skew; ask for it with SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"; // (`txn.rs` says it too)
 
 /// Is this value of a setting one `ONE_WAY` refuses? (Its SQLSTATE and why.) `DateStyle` takes any
 /// order of days and months, but only ISO's output.
@@ -328,7 +323,7 @@ pub fn show(sql: &str) -> Option<String> {
 /// A Postgres setting the current session set (`SHOW name`).
 pub fn shown(n: &str) -> Option<String> {
     let s = crate::temp::current()?;
-    crate::temp::with(&s, false, |s| Ok(s.settings.get(&name(n)).cloned())).ok().flatten()
+    crate::temp::peek(&s, |x| x.settings.get(&name(n)).cloned()) // (a peek: reading a setting makes no session)
 }
 
 /// `EXECUTE`'s arguments put where `$1`, `$2`, … are.

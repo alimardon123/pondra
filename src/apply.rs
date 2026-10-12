@@ -569,6 +569,14 @@ pub async fn export(lake: &Lake) -> Result<BTreeMap<String, String>> {
     Ok(files)
 }
 
+/// `GET /export`: this database as a project's files. It holds every routine's code, task's statement and grant,
+/// so only whoever is shown code gets it (S27: `pondra diff` and `pondra export` as an admin, APPLY or CLONE ON
+/// DATABASE); an attached database is `export_attached`'s.
+pub async fn export_here(lake: &Lake) -> Result<BTreeMap<String, String>> {
+    ensure!(crate::auth::shows_code(), "permission denied: this database's export (its routines' code, tasks and grants) is an admin's, or needs APPLY or CLONE on it");
+    export(lake).await
+}
+
 /// `GET /export?database=prod`: a database attached here, as a project's files. `pondra diff` compares a branch
 /// with its base this way when the base is on another server (ADR-058). Its objects are what a clone of it holds,
 /// so CLONE on it is enough.
