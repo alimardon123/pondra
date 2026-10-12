@@ -45,7 +45,6 @@ PROCESS = {
     "copy.rs:MS": SETTING + " (PONDRA_LOAD_RETENTION_SECS)",
     "defaults.rs:CTX": "a session with no tables, for DEFAULT and CHECK expressions: nothing of a lake",
     "delta.rs:ONE": LOCK,
-    "drain.rs:IN_FLIGHT": GAUGE,
     "ext.rs:CLIENT": "a client with no token, for other engines' REST catalogs: only its keep-alive sockets",
     "files.rs:SUBSTR": "a function's definition",
     "flight.rs:INFO": "what Flight SQL says of the server: constants",
@@ -187,6 +186,8 @@ def verdict(rel, name, ty, how, value):
     """How a static passes, or None: what it must be."""
     key = f"{rel.rsplit('/', 1)[-1]}:{name}"
     if how == "per_node":
+        if key in PROCESS:
+            return None, "declared per_node!, so not the process's: take it out of PROCESS in tools/per_node_check.py"
         if re.match(r"(?:std::sync::atomic::)?Atomic", ty) and not re.search(r"::new\(\s*(0|false)\s*\)", value):
             return None, "a per_node! atomic starts at 0 or false (what reset() sets it back to)"
         return "per_node", None
