@@ -3280,10 +3280,30 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "tonic",
+ "tower",
  "url",
  "uuid",
  "windows-service",
  "zstd",
+]
+
+[[package]]
+name = "pondra-capi"
+version = "0.33.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "libc",
+ "mimalloc",
+ "pondra",
+ "serde_json",
+]
+
+[[package]]
+name = "pondra-launcher"
+version = "0.33.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

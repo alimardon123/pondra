@@ -273,6 +273,11 @@ impl Auth {
 
     pub fn owned(&self) -> bool { self.owner.is_some() }
 
+    /// Is `key` the key of the program that started this node (`owned_by`)? Compared in constant time.
+    pub fn is_owner(&self, key: &str) -> bool {
+        self.owner.as_ref().is_some_and(|k| aws_lc_rs::constant_time::verify_slices_are_equal(k.as_bytes(), key.as_bytes()).is_ok())
+    }
+
     /// The role a bearer token grants.
     pub fn role(&self, token: Option<&str>) -> Role {
         if let Some((role, _)) = lent(token) {

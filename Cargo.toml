@@ -14,7 +14,10 @@ default = ["server"]
 server = ["dep:http", "dep:slatedb", "dep:reqwest", "dep:tokio", "dep:axum", "dep:toml", "dep:uuid", "dep:clap", "dep:mimalloc",
           "dep:chrono-tz", "dep:postgres-types", "dep:pgwire", "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:zstd",
           "dep:object_store", "dep:object_store_df", "dep:glob", "dep:aws-lc-rs", "dep:tokio-rustls",
-          "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service"]
+          "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tower"]
+
+[workspace]
+members = ["capi", "launcher"] # (libpondra, the C ABI, and the launcher that loads it: `cargo build --workspace` builds them with the program, into one folder; a plain build at the root builds the program alone)
 
 [lib]
 doctest = false # (the modules' docs are prose and SQL, not Rust examples)
@@ -31,6 +34,7 @@ arrow-ipc = { version = "59", features = ["zstd"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 axum = { version = "0.8", optional = true }
+tower = { version = "0.5", default-features = false, features = ["util"], optional = true } # (a library's request handed to the router: `library.rs`; already built for axum)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -39,7 +43,7 @@ bytes = "1"
 uuid = { version = "1", features = ["v4"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 futures = "0.3"
-mimalloc = { version = "0.1", default-features = false, optional = true }
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"], optional = true } # (as the library's, `capi/`: one build makes the program, the library and the launcher; in a program the linker turns it back into the fast form)
 async-trait = "0.1"
 lru = "0.18"
 chrono = { version = "0.4", default-features = false } # (already built for object_store: ObjectMeta timestamps)

@@ -1,5 +1,5 @@
-"""The client: a node over HTTP (`connect`), or one started here (`local`). Queries become frames
-(`frame.py`); writes, scripts and procedures run at once."""
+"""The client: a node over HTTP (`connect`), one started here (`local`), or one in this process (`open`,
+`inprocess.py`). Queries become frames (`frame.py`); writes, scripts and procedures run at once."""
 import atexit
 import base64, contextlib
 import importlib.util
@@ -157,7 +157,9 @@ class Pondra:
             url = self._held or self.url
             req = urllib.request.Request(url + path, data=body if method == "POST" else None, headers=h, method=method)
             try:
-                r = self._open(req, timeout=None if stream else self.timeout)
+                # (a node in this process answers through its router, with no socket; an answer that streams goes to the loopback port)
+                inproc = None if stream else getattr(self, "_inproc", None)
+                r = (inproc or self._open)(req, timeout=None if stream else self.timeout)
                 out = r if stream else r.read()
             except urllib.error.HTTPError as e:
                 self._reached = True
@@ -335,6 +337,13 @@ class Pondra:
         if wait:
             return self._run(f"CALL run({_literal(where)}{given})", job=job)
         return Run(self, self._run(f"SELECT pondra.start('run', {_literal(where)}{given})", job=job).rows()[0]["run"])
+
+    @property
+    def console_url(self):
+        """The console, in a browser, as this connection. A node `local()` or `open()` started answers
+        only its program, so the link carries its key (`#key=…`); the page keeps it for its tab, and it
+        works while the node runs. Keep it to yourself, as a token."""
+        return f"{self.url}/#key={self.owner}" if getattr(self, "owner", None) else f"{self.url}/"
 
     @property
     def vars(self):
@@ -593,8 +602,9 @@ class Pondra:
 
     def close(self):
         """End this connection's session (its temporary tables and views), and stop the node
-        `local()` started: closing its input stops it (it hands the lake on at once), on every OS;
-        it would stop the same way if Python were killed."""
+        `local()` started or close the node `open()` made here (a temporary lake of `open()` is
+        removed). Closing a `local()` node's input stops it (it hands the lake on at once), on every
+        OS; it would stop the same way if Python were killed."""
         retry_secs, self.retry_secs = self.retry_secs, 0  # (a node that's gone isn't waited for here)
         try:
             self._call("DELETE", f"/sessions/{self.session}")
@@ -609,6 +619,9 @@ class Pondra:
             except subprocess.TimeoutExpired:
                 p.kill()
                 p.wait()
+        if getattr(self, "_handle", None) is not None:  # (a node `open()` made here)
+            from . import inprocess
+            inprocess.close(self)
 
     def __enter__(self):
         return self

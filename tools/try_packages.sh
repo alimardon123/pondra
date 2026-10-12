@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The packages tools/package.py made in dist/ for one platform, installed as users get them and
-# tried: the wheel in a new virtualenv, without pyarrow and then with it (tools/package_check.py);
+# tried: the wheel in a new virtualenv, without pyarrow and then with it (tools/package_check.py), with
+# uv, and with pip's --target;
 # the npm packages in a new project (tools/package_check.mjs); and the one-line installer with
 # this build's binary, which must leave `pondra` on PATH. CI runs it on each OS (Git Bash on Windows).
 #
@@ -22,6 +23,13 @@ uvpy=$try/uvenv/bin/python && [ -x "$uvpy" ] || uvpy=$try/uvenv/Scripts/python.e
 python -m uv pip install -q --python "$uvpy" "$root"/dist/*.whl
 "$uvpy" -c "import pondra, subprocess; print('uv:', subprocess.run([pondra.binary(), '--version'], capture_output=True, text=True, check=True).stdout.strip())"
 python -m uv tool run --from "$(ls "$root"/dist/*.whl)" pondra --version
+# pip install --target: the launcher, in target/bin, finds the library in target/pondra/_lib
+python -m pip install -q --target "$try/target" "$root"/dist/*.whl
+launcher=
+for candidate in "$try"/target/bin/pondra "$try"/target/bin/pondra.exe "$try"/target/Scripts/pondra.exe; do
+  [ -f "$candidate" ] && launcher=$candidate && break
+done
+[ -n "$launcher" ] && "$launcher" --version || { echo "pip install --target: no pondra that answers ($(ls "$try/target"))" >&2; exit 1; }
 
 (cd "$try" && npm init -y > /dev/null &&
   npm install "$root"/dist/pondra-"$platform"-*.tgz "$root"/dist/pondra-[0-9]*.tgz &&

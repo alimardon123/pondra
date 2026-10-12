@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""What `pip install pondra` gives, tried: the binary is found, a node starts on a new lake, and a
-table, an exactly-once append, a view, a query, a frame, a Python procedure and function work. Run where the
-wheel is installed (CI, and containers with old and new Linux).
+"""What `pip install pondra` gives, tried: the `pondra` command is found, a node starts on a new lake, and a
+table, an exactly-once append, a view, a query, a frame, a Python procedure and function work; and a node in
+this process (`pondra.open()`, from the library the wheel ships) answers too. Run where the wheel is
+installed (CI, and containers with old and new Linux).
 
 Without pyarrow (`pip install pondra` alone), what needs none: rows, one value and a text table
 as JSON and text; SQL procedures; `python -m pondra` (the binary wherever pip put it) and
@@ -108,4 +109,9 @@ if arrow:
         print("--python auto:", chosen["python"], f"({sum(p['ok'] for p in chosen['pythons'])} of {len(chosen['pythons'])} Pythons work)")
     finally:
         node.stdin.close(); node.wait(timeout=30)
+# The same engine in this process: the library the wheel ships, which the `pondra` command loads too.
+with pondra.open() as db:
+    db.sql("CREATE TABLE t (id BIGINT)")
+    db.append("t", [{"id": 1}, {"id": 2}])
+    assert db.sql("SELECT count(*) AS n FROM t").rows() == [{"n": 2}]
 print("ok:", rows)
