@@ -51,7 +51,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("table '") && has("not found") || has("no table ") || has("no table or view") || has("relation") && has("does not exist") => "42P01", // undefined_table
         _ if has("no schema ") || has("schema") && has("does not exist") => "3F000",            // invalid_schema_name
         _ if has("type \"") && has("does not exist") => "42704",                                // undefined_object (`types.rs`)
-        _ if has("because column") && has("uses it") => "2BP01",                                // dependent_objects_still_exist (DROP TYPE)
+        _ if has("because column") && (has("uses it") || has("use it")) => "2BP01",              // dependent_objects_still_exist (DROP TYPE)
         _ if has("already exists") || has("exists already") => "42P07",                        // duplicate_table
         _ if has("divide by zero") || has("division by zero") => "22012",                       // division_by_zero
         _ if has("overflow") || has("out of range") => "22003",                                 // numeric_value_out_of_range
@@ -113,7 +113,7 @@ pub fn grpc(code: &str) -> tonic::Code {
         "57014" => tonic::Code::DeadlineExceeded,
         "53200" | "53300" => tonic::Code::ResourceExhausted,
         "0A000" => tonic::Code::Unimplemented,
-        "23514" | "23502" | "25006" => tonic::Code::FailedPrecondition,
+        "23514" | "23502" | "25006" | "25P01" | "25P02" => tonic::Code::FailedPrecondition, // (a transaction that isn't open, or failed)
         c if c.starts_with("42") || c.starts_with("22") => tonic::Code::InvalidArgument,
         _ => tonic::Code::Internal,
     }
@@ -137,6 +137,7 @@ mod tests {
         assert_eq!(of("External error: invalid input value for enum mood: \"angry\" (its labels: 'sad', 'ok')"), "22P02"); // (a bulk INSERT's stream)
         assert_eq!(of("type \"mood\" does not exist"), "42704");
         assert_eq!(of("cannot drop type mood because column t.m uses it"), "2BP01");
+        assert_eq!(of("cannot drop type mood because columns use it: a.m, b.n; drop or change them first"), "2BP01");
         assert_eq!(of(crate::cluster::CUT_OFF_SAYS), "57P03");
         assert_eq!(of(crate::store::CATCHING_UP), "57P03");
         assert_eq!(of("error sending request for url (http://10.0.0.2:8080/cluster/commit)"), "58030");

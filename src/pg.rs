@@ -12,7 +12,7 @@ use crate::server::App;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Schema, TimeUnit, TimestampMicrosecondType};
+use datafusion::arrow::datatypes::{DataType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, IntervalMonthDayNanoType, IntervalUnit, Schema, Time64MicrosecondType, TimeUnit, TimestampMicrosecondType};
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::{stream, Sink, SinkExt};
 use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
@@ -21,9 +21,13 @@ use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::results::{CopyCsvOptions, CopyEncoder, CopyResponse, CopyTextOptions, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
+use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
+use pgwire::api::store::PortalStore;
+use pgwire::api::{ClientInfo, ClientPortalStore, ConnectionManager, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone};
+use pgwire::messages::extendedquery::{Describe, Execute, TARGET_TYPE_BYTE_PORTAL};
+use pgwire::messages::simplequery::Query;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -33,6 +37,9 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let tls = crate::tls::pg(); // (sslmode=require: `tls.rs`)
     let parser = Arc::new(NoopQueryParser::new());
+    // One registry of connections for the server: a cancel request finds its connection's key here.
+    let cancels = Arc::new(ConnectionManager::new());
+    let cancel = Arc::new(DefaultCancelHandler::new(cancels.clone()));
     loop {
         let (socket, _) = listener.accept().await?;
         if crate::drain::draining() {
@@ -42,7 +49,8 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         // A connection is a session: its temporary tables end with it (`temp.rs`).
         let session = format!("pg-{}", uuid::Uuid::new_v4().simple());
         let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), me: me.clone() });
-        let pg = Arc::new(Pg(backend.clone(), Arc::new(Startup { backend, scram: Default::default(), plain: Default::default() })));
+        let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), cancels: cancels.clone() };
+        let pg = Arc::new(Pg(backend, Arc::new(startup), cancel.clone()));
         tokio::spawn(async move {
             let _ = socket.set_nodelay(true);
             let _ = pgwire::tokio::process_socket(socket, tls, pg).await;
@@ -51,7 +59,9 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     }
 }
 
-struct Pg(Arc<Backend>, Arc<Startup>);
+/// A connection's handlers: the statements' (`Backend`), the sign-in (`Startup`), and the cancel
+/// requests' (one for the server: `serve`).
+struct Pg(Arc<Backend>, Arc<Startup>, Arc<DefaultCancelHandler>);
 
 struct Backend {
     app: App,
@@ -66,6 +76,7 @@ impl PgWireServerHandlers for Pg {
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> { self.0.clone() }
     fn copy_handler(&self) -> Arc<impl CopyHandler> { self.0.clone() }
     fn startup_handler(&self) -> Arc<impl StartupHandler> { self.1.clone() }
+    fn cancel_handler(&self) -> Arc<impl CancelHandler> { self.2.clone() }
 }
 
 /// Signing in: SCRAM-SHA-256 against the user's verifier (`users::Scram`), or a role's token; with
@@ -74,6 +85,7 @@ struct Startup {
     backend: Arc<Backend>,
     scram: tokio::sync::Mutex<Option<(crate::users::Scram, String)>>, // (the exchange so far, and whose)
     plain: tokio::sync::Mutex<bool>, // (a token asked for as a plain password)
+    cancels: Arc<ConnectionManager>, // (the server's connections, by the key a cancel request names)
 }
 
 fn params() -> DefaultServerParameterProvider {
@@ -106,7 +118,7 @@ impl StartupHandler for Startup {
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
                 if app.open().await {
                     *self.backend.who.lock().unwrap() = Some(crate::auth::Principal::of(crate::auth::Role::Admin).at("postgres", Some(client.socket_addr())));
-                    return finish(client).await;
+                    return finish(client, &self.cancels).await;
                 }
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
                 // (a user with only tokens, a service's: its token as a password, asked for plainly)
@@ -123,7 +135,7 @@ impl StartupHandler for Startup {
                     return Err(wrong(&user));
                 };
                 *self.backend.who.lock().unwrap() = Some(who.at("postgres", Some(client.socket_addr())));
-                return finish(client).await;
+                return finish(client, &self.cancels).await;
             }
             PgWireFrontendMessage::PasswordMessageFamily(m) => {
                 let user = client.metadata().get("user").cloned().unwrap_or_default();
@@ -155,7 +167,7 @@ impl StartupHandler for Startup {
                         let Some(who) = who else { return Err(wrong(&user)) };
                         *self.backend.who.lock().unwrap() = Some(who.at("postgres", Some(client.socket_addr())));
                         client.send(PgWireBackendMessage::Authentication(Authentication::SASLFinal(reply.into_bytes().into()))).await?;
-                        return finish(client).await;
+                        return finish(client, &self.cancels).await;
                     }
                 }
             }
@@ -166,7 +178,7 @@ impl StartupHandler for Startup {
 }
 
 /// Signed in: Postgres's parameters, a key to cancel with, ready for queries.
-async fn finish<C>(client: &mut C) -> PgWireResult<()>
+async fn finish<C>(client: &mut C, cancels: &Arc<ConnectionManager>) -> PgWireResult<()>
 where
     C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     C::Error: Debug,
@@ -174,7 +186,12 @@ where
 {
     use pgwire::api::PidSecretKeyGenerator;
     let (pid, key) = pgwire::api::RandomPidSecretKeyGenerator::default().generate(client);
-    client.set_pid_and_secret_key(pid, key);
+    client.set_pid_and_secret_key(pid, key.clone());
+    // The connection's cancel handle, under its key: a cancel request fires the statement running now
+    // (pgwire races each query with it). The guard unregisters the key when the connection ends.
+    let (handle, guard) = cancels.register(pid, key);
+    client.session_extensions().insert(handle);
+    client.session_extensions().insert(guard);
     pgwire::api::auth::finish_authentication(client, &params()).await
 }
 
@@ -223,9 +240,11 @@ impl Backend {
         if std::env::var_os("PONDRA_DEBUG_PG").is_some() {
             eprintln!("pg {user}: {sql}");
         }
-        if let Some(word) = crate::txn::control(&sql) {
-            // BEGIN, COMMIT, ROLLBACK: this connection's transaction (ADR-036 §5)
+        if let Some(word) = crate::txn::control(crate::write::first_word(&sql)) {
+            // BEGIN, COMMIT, ROLLBACK: this connection's transaction (ADR-036 §5). From the first word:
+            // dbt's leading comment (`/* {"app": "dbt"} */ commit`) is no part of the statement.
             let (tag, warning) = crate::txn::command(&self.app, word).await.map_err(user_error)?;
+            crate::cursors::sweep(); // (a COMMIT or ROLLBACK ends the cursors without HOLD: their answers go now)
             warning.iter().for_each(|w| crate::routines::heard(&format!("WARNING: {w}")));
             return Ok(match tag {
                 "BEGIN" => Response::TransactionStart(Tag::new(tag)), // (the client sees it: ReadyForQuery's status)
@@ -233,6 +252,20 @@ impl Backend {
             });
         }
         crate::txn::refuse().map_err(user_error)?; // (a failed transaction takes nothing but its end)
+        if let Some(cmd) = crate::cursors::of(&sql) {
+            // DECLARE, FETCH, MOVE, CLOSE: this connection's cursors (cursors.rs). Before the settings and
+            // session commands, which read CLOSE as their own.
+            let role = crate::auth::current().map_or(crate::auth::Role::None, |p| p.role);
+            return Ok(match crate::cursors::run(&self.app, cmd.map_err(user_error)?, role).await.map_err(user_error)? {
+                crate::cursors::Answer::Rows(batches) => {
+                    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
+                    let mut answer = rows(&schema, batches, format)?;
+                    answer.command_tag = "FETCH".into(); // (its command tag: "FETCH n", the rows counted as they go out)
+                    Response::Query(answer)
+                }
+                crate::cursors::Answer::Tag(tag) => Response::Execution(Tag::new(&tag)),
+            });
+        }
         if crate::settings::is(&sql) {
             // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: this connection's (round 31)
             return match crate::settings::statement(&self.app.lake, &sql).await {
@@ -250,7 +283,7 @@ impl Backend {
         }
         let role = crate::auth::current().map_or(crate::auth::Role::None, |p| p.role);
         if role < crate::auth::Role::Read {
-            return Err(user_error(anyhow::anyhow!("sign in first")));
+            return Err(user_error(crate::codes::coded("28000", "sign in first")));
         }
         if crate::routines::runs_procedure(&sql) {
             let who = crate::routines::Who { role, files: false, depth: 0 };
@@ -332,6 +365,14 @@ impl Backend {
 
     /// Whoever signed in on this connection (nobody, before).
     fn who(&self) -> crate::auth::Principal { self.who.lock().unwrap().clone().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None)) }
+
+    /// A statement pgwire cancelled (a cancel request, psql's Ctrl-C) is dropped before it reaches
+    /// `caught`, which would fail its transaction: here it does, as the error would have.
+    fn cancelled<T>(&self, out: &PgWireResult<T>) {
+        if matches!(out, Err(PgWireError::QueryCanceled)) {
+            crate::temp::SESSION.sync_scope(Some(self.session.clone()), || crate::txn::failed("canceling statement due to user request"));
+        }
+    }
 
     /// `COPY … TO STDOUT`: the rows, one COPY message each.
     async fn copy_out(&self, c: Copy) -> PgWireResult<Response> {
@@ -498,19 +539,24 @@ fn session_command(sql: &str) -> Option<Response> {
     if crate::script::is(sql) {
         return None; // (`BEGIN … END` that opens a block is a script's)
     }
-    let first = sql.split_whitespace().next()?.to_uppercase();
-    let setting = |v: &str| {
-        let field = Arc::new(vec![FieldInfo::new("setting".into(), None, None, Type::VARCHAR, FieldFormat::Text)]);
+    // (past a comment: dbt's. A word that is only a no-op here is refused when a comment came before it,
+    // as it was before this: a `BEGIN` answered as if it began a transaction would autocommit what follows.)
+    let commented = crate::write::first_word(sql) != sql.trim_start();
+    let first = crate::write::first_word(sql).split_whitespace().next()?.to_uppercase();
+    let setting = |column: &str, v: &str| {
+        let field = Arc::new(vec![FieldInfo::new(column.into(), None, None, Type::VARCHAR, FieldFormat::Text)]);
         let mut row = DataRowEncoder::new(field.clone());
         row.encode_field(&v).ok()?;
         Some(Response::Query(QueryResponse::new(field, stream::iter([Ok(row.take_row())]))))
     };
     match first.as_str() {
         "START" if crate::routines::start_of(sql).is_some() => None, // (`START CALL p(…)`: a run started)
-        "SET" | "RESET" | "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "DISCARD" | "DEALLOCATE" | "CLOSE" => Some(Response::Execution(Tag::new(&first))),
-        "SHOW" if !sql.to_lowercase().contains("tables") && !sql.to_lowercase().contains("datafusion.") && !sql.to_lowercase().trim_end_matches(';').trim().ends_with(" all") => {
-            let name = sql.split_whitespace().skip(1).collect::<Vec<_>>().join(" ").trim_end_matches(';').to_lowercase();
-            setting(&crate::settings::shown(&name).unwrap_or_else(|| match name.as_str() {
+        "SET" | "RESET" | "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "DISCARD" | "DEALLOCATE" | "CLOSE" if !commented => {
+            Some(Response::Execution(Tag::new(&first)))
+        }
+        "SHOW" if show_column(sql).is_some() => {
+            let (name, column) = show_column(sql)?;
+            setting(&column, &crate::settings::shown(&name).unwrap_or_else(|| match name.as_str() {
                 "search_path" => "public".into(), // (no session path: this lake's public, as Postgres's `"$user", public` in its usual setup)
                 s if s.contains("standard_conforming_strings") => "on".into(),
                 s if s.contains("transaction") => "read committed".into(),
@@ -522,6 +568,25 @@ fn session_command(sql: &str) -> Option<Response> {
         }
         _ => None,
     }
+}
+
+/// A `SHOW` that `session_command` answers: the setting's name, and the column its one row comes back in.
+/// Postgres names that column after the parameter (`SHOW TRANSACTION ISOLATION LEVEL` is
+/// `transaction_isolation`), and pgjdbc and psycopg read the row by that name, so Describe must say it too.
+fn show_column(sql: &str) -> Option<(String, String)> {
+    let sql = crate::write::first_word(sql); // (from its first word: a comment before it is no part of the setting's name)
+    let first = sql.split_whitespace().next()?.to_uppercase();
+    let lower = sql.to_lowercase();
+    if first != "SHOW" || lower.contains("tables") || lower.contains("datafusion.") || lower.trim_end_matches(';').trim().ends_with(" all") {
+        return None;
+    }
+    let name = sql.split_whitespace().skip(1).collect::<Vec<_>>().join(" ").trim_end_matches(';').to_lowercase();
+    let column = match name.as_str() {
+        "transaction isolation level" => "transaction_isolation".to_string(),
+        "time zone" => "timezone".to_string(),
+        _ => name.replace(' ', "_"),
+    };
+    Some((name, column))
 }
 
 /// Result rows, each column as the Postgres type closest to its Arrow type — encoded a batch at a
@@ -568,14 +633,18 @@ fn pg_type(t: &DataType, format: FieldFormat) -> (Type, DataType) {
         DataType::Decimal256(..) if format == FieldFormat::Text => (Type::NUMERIC, DataType::Utf8),
         DataType::Decimal256(..) => (Type::FLOAT8, DataType::Float64),
         DataType::Date32 | DataType::Date64 => (Type::DATE, DataType::Date32),
+        DataType::Time32(_) | DataType::Time64(_) => (Type::TIME, DataType::Time64(TimeUnit::Microsecond)), // (`time`, as `micros_time` gives it)
+        DataType::Interval(_) => (Type::INTERVAL, DataType::Interval(IntervalUnit::MonthDayNano)), // (`PgInterval`: Postgres's text and binary)
         DataType::Timestamp(_, Some(_)) => (Type::TIMESTAMPTZ, DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))), // (an instant: sent in UTC)
         DataType::Timestamp(..) => (Type::TIMESTAMP, DataType::Timestamp(TimeUnit::Microsecond, None)),
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => (Type::BYTEA, DataType::Binary),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => (Type::TEXT, DataType::Utf8), // (text, as Postgres names a string expression's type)
         // Lists as Postgres's arrays (drivers give them as lists); of other things, as text.
         DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
             let of = |t: DataType| DataType::List(Arc::new(datafusion::arrow::datatypes::Field::new("item", t, true)));
             match f.data_type() {
-                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => (Type::VARCHAR_ARRAY, of(DataType::Utf8)),
+                // (text[], as the catalog's pg_attribute and pg_type give a list of strings: pg_catalog.rs)
+                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => (Type::TEXT_ARRAY, of(DataType::Utf8)),
                 DataType::Int8 | DataType::Int16 | DataType::UInt8 => (Type::INT2_ARRAY, of(DataType::Int16)),
                 DataType::Int32 | DataType::UInt16 => (Type::INT4_ARRAY, of(DataType::Int32)),
                 DataType::Int64 | DataType::UInt64 => (Type::INT8_ARRAY, of(DataType::Int64)),
@@ -610,6 +679,8 @@ macro_rules! encode {
             DataType::Float32 => row.encode_field(&c.as_primitive::<Float32Type>().value(i)),
             DataType::Float64 => row.encode_field(&c.as_primitive::<Float64Type>().value(i)),
             DataType::Date32 => row.encode_field(&c.as_primitive::<Date32Type>().value_as_date(i)),
+            DataType::Time64(_) => row.encode_field(&PgTime(c.as_primitive::<Time64MicrosecondType>().value(i))),
+            DataType::Interval(_) => row.encode_field(&PgInterval::of(c.as_primitive::<IntervalMonthDayNanoType>().value(i))),
             DataType::Timestamp(_, Some(_)) => row.encode_field(&c.as_primitive::<TimestampMicrosecondType>().value_as_datetime(i).map(|t| t.and_utc())),
             DataType::Timestamp(..) => row.encode_field(&c.as_primitive::<TimestampMicrosecondType>().value_as_datetime(i)),
             DataType::Binary => row.encode_field(&c.as_binary::<i32>().value(i)),
@@ -671,6 +742,62 @@ impl postgres_types::ToSql for Numeric {
 impl pgwire::types::ToSqlText for Numeric {
     fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
         out.extend_from_slice(self.0.as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+}
+
+/// An INTERVAL as Postgres sends it: its text (`interval_text`) or its binary (microseconds, days,
+/// months, in that order).
+#[derive(Debug)]
+struct PgInterval {
+    months: i64,
+    days: i64,
+    micros: i64,
+}
+
+impl PgInterval {
+    fn of(v: datafusion::arrow::datatypes::IntervalMonthDayNano) -> Self {
+        Self { months: v.months.into(), days: v.days.into(), micros: v.nanoseconds / 1000 }
+    }
+}
+
+impl postgres_types::ToSql for PgInterval {
+    fn to_sql(&self, _: &Type, out: &mut bytes::BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        use bytes::BufMut;
+        out.put_i64(self.micros);
+        out.put_i32(self.days as i32);
+        out.put_i32(self.months as i32);
+        Ok(postgres_types::IsNull::No)
+    }
+    fn accepts(ty: &Type) -> bool { *ty == Type::INTERVAL }
+    postgres_types::to_sql_checked!();
+}
+
+impl pgwire::types::ToSqlText for PgInterval {
+    fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(crate::pg_values::interval_text(self.months, self.days, self.micros).as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+}
+
+/// A TIME as Postgres sends it: its text (`time_text`, as few fraction digits as the value needs)
+/// or its binary (microseconds since midnight, which is what `NaiveTime` sends too).
+#[derive(Debug)]
+struct PgTime(i64);
+
+impl postgres_types::ToSql for PgTime {
+    fn to_sql(&self, _: &Type, out: &mut bytes::BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        use bytes::BufMut;
+        out.put_i64(self.0);
+        Ok(postgres_types::IsNull::No)
+    }
+    fn accepts(ty: &Type) -> bool { *ty == Type::TIME }
+    postgres_types::to_sql_checked!();
+}
+
+impl pgwire::types::ToSqlText for PgTime {
+    fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(crate::pg_values::time_text(self.0).as_bytes());
         Ok(postgres_types::IsNull::No)
     }
 }
@@ -776,11 +903,11 @@ impl CopyHandler for Backend {
     }
 }
 
-/// `$1`, `$2`… replaced by the portal's values: numbers as they are, anything else quoted. A
+/// `$1`, `$2`… replaced by the portal's values, each as a SQL literal of its type (`value`). A
 /// parameter's type is the client's, or else the one the query implies (`inferred`).
 fn bind(portal: &Portal<String>, inferred: &[Type]) -> PgWireResult<String> {
-    let mut sql = portal.statement.statement.clone();
-    for i in (0..portal.parameter_len()).rev() {
+    let mut values = Vec::with_capacity(portal.parameter_len());
+    for i in 0..portal.parameter_len() {
         let t = portal.statement.parameter_types.get(i).cloned().flatten().filter(|t| *t != Type::UNKNOWN);
         let t = t.or_else(|| inferred.get(i).cloned()).unwrap_or(Type::UNKNOWN);
         let v = match t {
@@ -788,21 +915,16 @@ fn bind(portal: &Portal<String>, inferred: &[Type]) -> PgWireResult<String> {
             Type::INT2 => portal.parameter::<i16>(i, &t)?.map(|v| v.to_string()),
             Type::INT4 => portal.parameter::<i32>(i, &t)?.map(|v| v.to_string()),
             Type::INT8 => portal.parameter::<i64>(i, &t)?.map(|v| v.to_string()),
-            Type::FLOAT4 => portal.parameter::<f32>(i, &t)?.map(|v| v.to_string()),
-            Type::FLOAT8 => portal.parameter::<f64>(i, &t)?.map(|v| v.to_string()),
             // arrays (embeddings for vector search): DataFusion's `[a, b, …]`
             Type::FLOAT4_ARRAY => list(portal.parameter::<Vec<Option<f32>>>(i, &t)?),
             Type::FLOAT8_ARRAY => list(portal.parameter::<Vec<Option<f64>>>(i, &t)?),
             Type::INT4_ARRAY => list(portal.parameter::<Vec<Option<i32>>>(i, &t)?),
             Type::INT8_ARRAY => list(portal.parameter::<Vec<Option<i64>>>(i, &t)?),
-            _ => portal.parameter::<String>(i, &Type::VARCHAR)?.map(|s| match s.parse::<f64>() {
-                Ok(_) if t == Type::UNKNOWN => s,
-                _ => format!("'{}'", s.replace('\'', "''")),
-            }),
+            _ => crate::pg_values::value(&t, portal.parameters[i].as_deref(), portal.parameter_format.is_binary(i)).map_err(user_error)?,
         };
-        sql = sql.replace(&format!("${}", i + 1), &v.unwrap_or_else(|| "NULL".into()));
+        values.push(v.unwrap_or_else(|| "NULL".into()));
     }
-    Ok(sql)
+    Ok(crate::pg_values::substitute(&portal.statement.statement, &values))
 }
 
 fn list<T: ToString>(v: Option<Vec<Option<T>>>) -> Option<String> {
@@ -812,6 +934,19 @@ fn list<T: ToString>(v: Option<Vec<Option<T>>>) -> Option<String> {
 
 #[async_trait]
 impl SimpleQueryHandler for Backend {
+    // pgwire races each statement with a cancel request (psql's Ctrl-C): see `cancelled`.
+    async fn on_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let out = self._on_query(client, query).await;
+        self.cancelled(&out);
+        out
+    }
+
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -834,6 +969,35 @@ impl ExtendedQueryHandler for Backend {
     type QueryParser = NoopQueryParser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> { self.parser.clone() }
+
+    // (pgwire races the portal's statement with a cancel request, as it does a simple query: `cancelled`.)
+    async fn on_execute<C>(&self, client: &mut C, message: Execute) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let out = self._on_execute(client, message).await;
+        self.cancelled(&out);
+        out
+    }
+
+    // (psycopg describes the portal named after a DECLARE'd cursor right after the DECLARE: `cursor_portal`
+    // makes it when asked, as Postgres has it.)
+    async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = message.name.clone().unwrap_or_default();
+        if message.target_type == TARGET_TYPE_BYTE_PORTAL && client.portal_store().get_portal(&name).is_none() {
+            crate::temp::SESSION.sync_scope(Some(self.session.clone()), || cursor_portal(&*client, name));
+        }
+        self._on_describe(client, message).await
+    }
 
     async fn do_query<C>(&self, client: &mut C, portal: &Portal<Self::Statement>, _max_rows: usize) -> PgWireResult<Response>
     where
@@ -875,7 +1039,7 @@ impl Backend {
             return p.parameters(sql).iter().map(|t| pg_type(t, FieldFormat::Text).0).collect(); // (a key lookup's: its key's types, unplanned)
         }
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
-        let mut types = vec![Type::VARCHAR; n];
+        let mut types = vec![Type::TEXT; n]; // (text when the query doesn't say, as the doc above has it)
         if n > 0 && session_command(sql).is_none() && !crate::settings::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() && !crate::script::is(sql) {
             let plan = async {
                 let sql = crate::routines::expand(&self.app.lake, sql).await.ok()?;
@@ -905,6 +1069,16 @@ impl Backend {
     /// The columns a statement returns (none for writes and session commands).
     async fn describe(&self, sql: &str, format: &Format) -> PgWireResult<Vec<FieldInfo>> {
         let sql = &self.placed(sql.to_string()).await?; // (the session's search path, as `run` has it)
+        if let Some(cmd) = crate::cursors::of(sql) {
+            // FETCH's columns are its cursor's; DECLARE, MOVE and CLOSE send no rows.
+            let columns = crate::cursors::columns(&cmd.map_err(user_error)?).map_err(user_error)?;
+            return Ok(columns.map_or(vec![], |s| described(&s, format)));
+        }
+        if let Some((_, column)) = show_column(sql) {
+            // A SHOW sends one row of one text column (`session_command`): Describe must say so, or pgjdbc and
+            // prepared psycopg statements fail on a row with no column description.
+            return Ok(vec![FieldInfo::new(column, None, None, Type::VARCHAR, FieldFormat::Text)]);
+        }
         let point = match crate::auth::limited() {
             None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| p.schema().ok()), // (a key lookup's columns, unplanned, first)
             Some(_) => None,
@@ -922,8 +1096,30 @@ impl Backend {
                 self.schema(&probe, "").await?
             }
         };
-        Ok(schema.fields().iter().enumerate().map(|(i, f)| FieldInfo::new(f.name().clone(), None, None, pg_type(f.data_type(), format.format_for(i)).0, format.format_for(i))).collect())
+        Ok(described(&schema, format))
     }
+}
+
+/// A DECLARE that ran makes a portal of the cursor's name, as Postgres does: psycopg describes it right
+/// after DECLARE to learn a named cursor's columns, and pgwire answers only for a portal it holds. The
+/// portal's statement is the cursor's own FETCH, which Describe answers with the cursor's columns, so it
+/// is only as good as the cursor: a cursor that is gone describes as an error (34000).
+fn cursor_portal<C>(client: &C, cursor: String)
+where
+    C: ClientPortalStore,
+    C::PortalStore: PortalStore<Statement = String>,
+{
+    if crate::cursors::columns(&crate::cursors::Cmd::Fetch { name: cursor.clone(), rows: None }).is_err() {
+        return; // (a DECLARE that failed: no cursor of that name)
+    }
+    let fetch = format!("FETCH ALL FROM \"{cursor}\"");
+    let statement = Arc::new(StoredStatement::new(cursor.clone(), fetch, vec![])); // (pgwire's struct is non-exhaustive: its constructor)
+    client.portal_store().put_portal(Arc::new(Portal::new_cursor(cursor, statement)));
+}
+
+/// A result's columns as Postgres describes them: each one's type, in the format the client asked for.
+fn described(schema: &Schema, format: &Format) -> Vec<FieldInfo> {
+    schema.fields().iter().enumerate().map(|(i, f)| FieldInfo::new(f.name().clone(), None, None, pg_type(f.data_type(), format.format_for(i)).0, format.format_for(i))).collect()
 }
 
 /// `PONDRA_TRACE_PG=1`: where a Postgres statement's time goes, on stderr.
@@ -931,4 +1127,3 @@ fn trace() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("PONDRA_TRACE_PG").is_some());
     *ON
 }
-
