@@ -50,7 +50,7 @@ tokio::task_local! {
     static GIVEN: Given;
 }
 
-const NO_SESSION: &str = "a variable is a session's: a Postgres connection's, the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>), or a script's (send it with the statements that use it)";
+const NO_SESSION: &str = "a variable is a session's: a Postgres connection's, the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>, 8 to 128 letters, digits, - or _), or a script's (send it with the statements that use it)";
 
 /// What a statement does to a variable.
 pub enum Change {

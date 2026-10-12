@@ -339,7 +339,15 @@ pub fn names(sql: &str) -> Vec<String> {
 pub fn said(e: &anyhow::Error) -> String {
     let mut out = String::new();
     for c in e.chain().map(|c| c.to_string()) {
-        let c = c.strip_prefix("External error: ").map(str::to_string).unwrap_or(c); // (DataFusion's wrapping of ours)
+        // Unwrap DataFusion's and Arrow's wrappers, repeatedly, so the inner message — the part a
+        // user can act on — leads, not an engine-internal label.
+        let mut c = c;
+        while let Some(inner) = ["External error: ", "Error during planning: ", "Arrow error: ", "Execution error: "]
+            .iter()
+            .find_map(|p| c.strip_prefix(p))
+        {
+            c = inner.to_string();
+        }
         if !out.contains(c.trim()) {
             out += if out.is_empty() { "" } else { ": " };
             out += &c;
@@ -1428,6 +1436,13 @@ fn copy_into_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Op
         }
     } else {
         match p.parse_literal_string() {
+            Ok(path) if path.starts_with('@') => {
+                // (Snowflake's stage: Pondra has none, it reads the files where they are)
+                let stage = path.split('/').next().unwrap_or(&path);
+                return Some(crate::write::Stmt::Invalid(format!(
+                    "COPY INTO {table} FROM {stage}: a stage isn't supported; name the files where they are: COPY INTO {table} FROM 's3://bucket/folder/*.csv' (FORMAT csv, HEADER true)"
+                )));
+            }
             Ok(path) => Source::Path(path),
             Err(_) => return invalid("the path is a string".into()),
         }

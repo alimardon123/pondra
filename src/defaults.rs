@@ -65,7 +65,7 @@ pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
     let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
     let expr = CTX.parse_sql_expr(check, &schema)?;
     let value = CTX.create_physical_expr(expr, &schema)?.evaluate(rows)?.into_array(rows.num_rows())?;
-    let Some(b) = value.as_boolean_opt() else { bail!("CHECK ({check}) is not a condition: it gives {}, not true or false", value.data_type()) };
+    let Some(b) = value.as_boolean_opt() else { bail!("CHECK ({check}) is not a condition: it gives {}, not true or false (a condition, such as CHECK (amount > 0))", value.data_type()) };
     Ok(b.iter().map(|v| Some(v == Some(false))).collect())
 }
 
@@ -115,7 +115,7 @@ pub async fn validate(column: &str, sql_type: &str, expr: &str) -> Result<()> {
         Ok(b) if b.iter().map(|b| b.num_rows()).sum::<usize>() == 1 => {
             crate::query::strict(b[0].column(0), &crate::query::dtype(sql_type)?).map(|_| ()).map_err(|e| anyhow::anyhow!("{column} DEFAULT {expr}: {e}"))
         }
-        Ok(_) => bail!("{column} DEFAULT {expr}: one value, please"),
+        Ok(_) => bail!("{column} DEFAULT {expr}: a default is one value, not a query's rows (DEFAULT 0, DEFAULT now(), DEFAULT nextval('s'))"),
         Err(e) => bail!("{column} DEFAULT {expr}: {e} (a default is an expression of constants and built-in functions, such as now() or uuid())"),
     }
 }

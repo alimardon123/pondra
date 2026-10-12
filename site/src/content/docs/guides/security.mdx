@@ -11,6 +11,17 @@ private network. To share it, start the node with **tokens**. There are three, o
 every door checks them: HTTP, the Python and JavaScript clients, Postgres, Kafka, Arrow Flight, MCP
 and the Iceberg REST catalog.
 
+<Aside type="caution" title="A node with no tokens is for this machine">
+A node with no tokens is open only on a loopback address (127.0.0.1, the default): there it is an
+administrator to every process on the machine. A node that listens beyond this machine is never open.
+With no token, its leader makes the lake's first user, `pondra`, before it serves anyone, and prints
+that user's token once at start; `pondra token --dir LAKE` makes another. A web page you visit
+**cannot** drive an open node or read its answers, because a browser's cross-site request, and a
+request whose host could have been rebound to the node, are refused. Only the node's own console page, opened from the node's
+own address, may drive it. To let another tool in, give the node a token. This holds only for an
+open node; with tokens on, a browser can't carry one cross-site, so the token check does the work.
+</Aside>
+
 | Role | May |
 |---|---|
 | **read** | query: `SELECT`, key lookups, `watch` and `live`, MCP reads, the Iceberg catalog's reads, metrics, and `GET /files` |

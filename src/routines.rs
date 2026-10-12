@@ -377,7 +377,7 @@ fn options(p: &mut Parser, o: &mut Options) -> Result<()> {
             true => match p.next_token().token {
                 Token::SingleQuotedString(s) | Token::Number(s, _) => s,
                 Token::Word(w) => w.value.to_lowercase(),
-                t => bail!("{k}: a value, not {t}"),
+                t => bail!("{k}: a value, not {t} (a number, a word or 'text' in quotes, such as 3, immutable or '10 minutes')"),
             },
             false => "true".into(),
         };
@@ -637,7 +637,12 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
         }
         ControlFlow::<()>::Continue(())
     });
-    ensure!(missing.is_empty(), "no value for {} (give it one, or declare it: DECLARE {} = …)", missing.join(", "), missing[0]);
+    if let Some(first) = missing.first() {
+        let n = first.trim_start_matches('$');
+        let literal = |v: String| if v.parse::<f64>().is_ok() { v } else { format!("'{}'", v.replace('\'', "''")) };
+        let setting = crate::settings::shown(n).map(|v| format!("; SET {n} = … made a setting, not a variable: ${n} = {} makes one", literal(v))).unwrap_or_default();
+        return Err(crate::codes::coded("42P02", format!("no value for {} (give it one, or declare it: DECLARE {first} = …{setting})", missing.join(", ")))); // (undefined_parameter)
+    }
     Ok(text(&stmts))
 }
 
@@ -803,6 +808,10 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
 /// `information_schema.schemata`, `secrets()`, `pondra.users` and `pondra.grants`, as Snowflake has them. (`SHOW FUNCTIONS` is every function a query may call,
 /// as DataFusion lists them: its own, and the Python ones; `SHOW TABLES` is DataFusion's.)
 fn show(sql: &str) -> Option<String> {
+    // (SHOW, and DESCRIBE / DESC SHARE: the only words the regexes below can start with; any other statement skips them.)
+    if !matches!(crate::write::head(sql).as_str(), "show" | "describe" | "desc") {
+        return None;
+    }
     if let Some(q) = crate::settings::show(sql) {
         return Some(q); // (`SHOW search_path`, `SHOW application_name`: the session's)
     }
