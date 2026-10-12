@@ -4,13 +4,13 @@
 
 `pondra` is `pondra.open()` (a lake held in memory), `folder` is `pondra.open(<a new folder>)`, `duckdb` is
 `duckdb.connect()`. Each engine runs in a process of its own, `--runs` times; a time is the median. What is
-measured, in that process: importing and opening up to the first answer of `SELECT 1`; a table of `--rows` rows
-made from a series; a grouped aggregate and a key's row over it (warm: the median of several, each a new text so
-no answer is remembered); 500 one-row INSERTs; the process's memory after the load; and, with `--tpch`, its 8
-tables loaded from Parquet and the 22 queries run once cold and once warm (the warm total is reported). With
-`--settle`, each engine waits that long after each load before its queries, so a lake's merges after a load
-don't count in them. Pondra
-finds its library through PONDRA_LIBRARY (target/release/libpondra_lib.so here by default).
+measured, in that process: importing and opening up to the first answer of `SELECT 1`, and the process's memory
+then (idle); a table of `--rows` rows made from a series; a grouped aggregate and a key's row over it (warm: the
+median of several, each a new text so no answer is remembered); 500 one-row INSERTs; the process's memory after
+the load; and, with `--tpch`, its 8 tables loaded from Parquet and the 22 queries run once cold and once warm (the
+warm total is reported). With `--settle`, each engine waits that long after each load before its queries, so a
+lake's merges after a load don't count in them. Pondra finds its library through PONDRA_LIBRARY
+(target/release/libpondra_lib.so here by default).
 """
 import argparse, json, os, statistics, subprocess, sys, tempfile, time
 
@@ -50,6 +50,7 @@ def child(engine):
     out["open"] = time.perf_counter() - t0 - out["import"]
     q("SELECT 1")
     out["first answer"] = time.perf_counter() - t0
+    out["memory idle (MB)"] = rss_mb()
     t = time.perf_counter()
     do(f"CREATE TABLE t AS {series}")
     out["load series"] = time.perf_counter() - t
