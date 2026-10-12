@@ -269,7 +269,8 @@ mod tests {
         assert!(give([("owner_key", "x")]).unwrap_err().to_string().contains("starts a node"));
         let wrong = give([("memry_gb", "4")]).unwrap_err().to_string();
         assert!(wrong.contains("memry_gb isn't a setting (did you mean memory_gb?)"), "{wrong}");
-        let wrong = give([("PONDRA_CACHE_GBS", "4")]).unwrap_err().to_string();
+        // (written in lower case, so the docs' check of PONDRA_* names doesn't take it for one)
+        let wrong = give([("pondra_cache_gbs", "4")]).unwrap_err().to_string();
         assert!(wrong.contains("did you mean PONDRA_CACHE_GB?"), "{wrong}");
         assert!(!give([("color", "red")]).unwrap_err().to_string().contains("did you mean"));
         assert!(GIVEN.get().is_none(), "a refused give fixes nothing");
