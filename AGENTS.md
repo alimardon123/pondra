@@ -69,7 +69,10 @@ src/      62,500 lines of Rust in 108 files, one per concern (see the table in R
           the modules: the four every build has (`finish`, `fsum`, `intervals`, `xlsx`: no lake, so a
           browser build shares them) and the rest under feature `server` (on by default: the node);
           `cli.rs` is the command line (its subcommands and what each starts) and `main.rs` sets the
-          allocator and calls it (ADR-061); round 25 added
+          allocator and calls it (ADR-061); `node.rs` is a node started and stopped as an object,
+          `reset.rs` (`per_node!`: a node's statics set back when it stops) and `env.rs` every
+          setting, from one table (ADR-061 step 2); `library.rs` a node in a host's process (its
+          supervisor, restarts in place, requests to its router; ADR-061); round 25 added
           live.rs (live queries) and temp.rs (a session's temporary tables and views); round 31 vars.rs
           (SQL variables and a file's declared parameters, ADR-037, ADR-044) and script.rs (a script's
           blocks, branches, loops and handlers, ADR-045); round 26
@@ -90,7 +93,10 @@ src/      62,500 lines of Rust in 108 files, one per concern (see the table in R
           friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225), objects.rs
           (one registry of every kind of object: ADR-049, invariant 227), find.rs (`pondra.parts` and
           `pondra.find`: every part of every object, and one search of objects, parts and concepts;
-          ADR-065, invariant 345), backup.rs (`BACKUP DATABASE`, `RESTORE DATABASE`: a backup is a lake;
+          ADR-065, invariant 345), measures.rs (measures in views: `sum(x) AS MEASURE m`, `MEASURE(m)` at
+          the query's own grain; ADR-065 §3, invariants 346–347) and facts.rs (a view's PRIMARY KEY, UNIQUE
+          and FOREIGN KEY, NOT ENFORCED; ADR-065 §2, invariant 348), backup.rs (`BACKUP DATABASE`,
+          `RESTORE DATABASE`: a backup is a lake;
           ADR-070, invariants 290, 291), seq.rs (sequences and
           identity columns: invariant 234), index.rs (indexes kept as objects: invariant 235),
           constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236),
@@ -116,13 +122,15 @@ site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how
 python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node): `client.py`, frames
           (`frame.py`, Polars' names), `spark/` (PySpark's names), `worker.py` (a node's warm
           Python worker: functions' batches and procedures' calls, ADR-027), `plpy.py` (PL/Python's
-          `plpy`), `magic.py` (`%%sql`), `__main__.py` (`python -m pondra`, and `--add-to-path`);
-          without pyarrow, rows come as JSON (ADR-024)
+          `plpy`), `magic.py` (`%%sql`), `__main__.py` (`python -m pondra`, and `--add-to-path`),
+          `inprocess.py` (`pondra.open()` over the library); without pyarrow, rows come as JSON (ADR-024)
 install.sh, install.ps1   the one-line installers each release carries (ADR-024)
 deploy/   the container image (docker/Dockerfile; tools/image.py lays out its context), a compose
           cluster (compose/) and the Helm chart (helm/pondra); ADR-041
-js/       the JavaScript client (`index.js`) and its frames (`frame.js`, Python's frames with nodejs-polars'
-          names), and the `pondra` npm package's files
+js/       the JavaScript client (`index.js`, and `open()`: the library through Node-API) and its frames
+          (`frame.js`, Python's frames with nodejs-polars' names), and the `pondra` npm package's files
+capi/     `pondra_lib`: the C ABI (seven functions) and `napi.rs`, the same library as a Node-API module
+launcher/ the packages' `pondra`: finds the library and runs it (ADR-061)
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style),
           console-extension.js (what a console extension adds: a section, a tab, a view, an action)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
@@ -1298,7 +1306,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`txn::overlaid`); a new path that reads tables for a session must too, or refuse inside a
    transaction. Writes are kept by `txn::keep`, and `COMMIT` is `Request::Txn` → `commit_here`
    under the lake's lock: the conflict check (40001), then `change::appends` for every table, one
-   `change::submit`. `tools/harness.py begin`; `tools/bench/pgbench.py`.
+   `change::submit`. Its default is READ COMMITTED: each statement reads the newest commit, and its
+   writes take row locks on the leader (ADR-067, invariants 322–325); REPEATABLE READ is the
+   snapshot of its first statement. `tools/harness.py begin`; `tools/bench/pgbench.py`.
 187. **A key lookup isn't planned, on any door** (ADR-036 §6): `serve::point` recognises one (a
    literal or a parameter); Postgres answers it before anything else in `pg::run`, its `Describe`
    and parameter types from it too; in a transaction `txn::point_read`; a one-key UPDATE of a keyed
@@ -2110,6 +2120,152 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    past `retention_days` and once no clone of the backup is pinned before it; a run past the
    retention goes with its catalog (`_backups/{ms}-{commit}.json.zst`). A restore copies one run into
    an empty place, suspends its tasks and takes away what it made if it fails. `tools/backup_check.py`.
+292. **A join builds a table a thread only where that gives the same rows** (`optimize::SharedBuilds`): a
+   join whose side to build has a million rows or more, whose rows are then grouped by its keys
+   alone, or a semi or anti join checking only its keys of a table of 50,000 rows or more for a
+   million rows or more (TPC-H q4), hashes both sides by the keys instead of building one table
+   every thread probes; never a NOT IN's (null-aware: its one table must see every NULL of the
+   subquery, as DataFusion keeps it), a HAVING's few groups (`HavingBuilds`) or a spread query's
+   joins (its exchanges are the spread analysis's). `harness.py hot`: "NOT IN a subquery with a
+   NULL keeps no row…" fails with a NOT IN hashed (the threads that never met the NULL keep their
+   rows).
+300. **A node is started and stopped as an object, and a stop at any point gives back what it took**
+   (`node.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
+   serves, it drains, makes what it committed durable, checkpoints, ends what it started
+   (`panics::abort_all`), closes its catalog and steps down. Stopped while it starts, it gives its
+   term back without the durable wait. Either way the next node on the lake leads at once. A write
+   that meets the catalog its own stop closed fails, and is never taken for a fence
+   (`Catalog::fenced`): restarting there led the term again, and the followers waited out the lease
+   (`upgrade_check.py rolling`: a batch waited 5.8 s on #100's CI). The command line is a caller of
+   `Node`, never a second copy of it. `tools/node_check.py`: "a node stopped once it serves gives
+   its term back…" and "a node stopped while it starts gives its term back too" (both ready in
+   under 5 s; a kept term makes the next node wait out the 30 s lease).
+
+301. **A node stopped in a process leaves nothing of itself in it** (`reset.rs`, ADR-061 §3): every
+   static that holds a node's or a lake's state is `per_node!`, set back by `reset()` when
+   `Node::stop` ends; its writers end first, its Python workers stop, and what `panics::spawn`
+   started is aborted. A gauge whose guards count themselves down (`metrics::RUNNING`, `WAITING`)
+   stays the process's, and the drain counts each node's requests on a counter of that node's own
+   (`drain::IN_FLIGHT`), as failed sign-ins are counted per node (`auth::Guesses`). SlateDB's tasks
+   outlive its handles, so a catalog let go closes what SlateDB runs for it (`Drop for Catalog`: a
+   reader's polling, a writer's flushing, the compactor and the collector `close` stops too): a lake
+   opened for a moment (a branch's base, a lake detached) read its manifest four times a second for
+   the life of the process. `tools/per_node_check.py` fails a static that is neither `per_node!` nor
+   in its list of what outlives a node, with the reason, and a `tokio::spawn` outside `panics.rs`.
+   `tests/node_twice.rs`: lake B after lake A in one process has none of A's users, tables, history,
+   counters, format or hot columns, and three more opens leave no threads, files or tasks behind
+   (the runtime's alive tasks: with the compactor and collector left running, 13 then 19).
+
+302. **Every setting is read through `env.rs`, from one table of names** (ADR-061 §8): what the
+   process was given (`open`'s options, the command line's flags: `env::give`), else the
+   environment, and an empty value is no value. Nothing sets the environment (`set_var`): beside a
+   library's host it is a data race, so a Pondra process it starts gets what it was given as its
+   environment (`env::given()`), and `pondra sql`'s job and tries go to its next run through
+   `cluster::restart_with`. The first `give` fixes the settings; a later one may repeat a setting,
+   never change one, and each it would change is named, as is a name that isn't a setting (with the
+   nearest one). `tools/per_node_check.py` fails a `PONDRA_*` name read past `env.rs` (by its text,
+   or through a constant that names it), a name its `NAMES` doesn't list, a listed name nothing
+   reads, and any `set_var`. `cargo test --lib env::`.
+303. **A node in a library never takes its host's process down** (`library.rs`, ADR-061 §5): what the
+   program does by exec, abort or exit, a library does to the node alone. `cluster::restart_with`
+   halts the node and starts it again in place (`library::restart`: its lock file says
+   `restarting`, then a `Restarting` unwind that `panics::spawn` lets go and a door answers as 57P03);
+   a vital loop's panic, the catalog's compactor failing and a lake newer than the build stop the
+   node with the reason (`library::failed`), and every request is then 57P03 with it until it is
+   opened again. A supervisor thread restarts it after 0.5, 1, 2, 4 and 8 s, and gives up after five
+   restarts within a minute. A process static that is a `Mutex` is read with
+   `lock().unwrap_or_else(PoisonError::into_inner)`, since a restart unwinds through it.
+   `tests/node_library.rs`: a node in process follows a leader that is killed, restarts and leads,
+   and its write lands once; `PONDRA_CRASH` in a vital loop is 57P03, then the lake opens again with
+   its rows. `tools/per_node_check.py` fails a process mutex read with `.unwrap()`.
+
+304. **What a node starts, it starts with the launcher** (`library::exe()`): `pondra lead` and the
+   Python workers' search use the `pondra` program the packages carry (`PONDRA_LAUNCHER`, an
+   option of `open`), never `current_exe()`, which in a library is the host (Python, Node). A
+   library without one refuses by name what needs it.
+
+305. **An in-process request goes to the node's router as its owner, on the library's runtime, and a
+   fork is refused** (`library::Opened::request`, `capi/`, `python/pondra/inprocess.py`): the router
+   the node serves, never a socket, from 127.0.0.1 with the owner's key, so every check the HTTP
+   door makes holds (invariants 21, 61); the node is `owned_by` that key (`Auth`, the one place a
+   node's owner key is kept), so its loopback door answers only its host, as a node `local()` starts
+   does; on the library's own runtime, never the caller's thread (a host's thread may have 512 KB of
+   stack, invariant 195); while the node starts, restarts or has failed, 503 with 57P03 and the
+   reason. Its body comes a piece at a time as the node writes it (`pondra_read`, one or two pieces
+   ahead), each copied out before the next, so the library never holds a second copy of an answer: 10 M rows into
+   pandas take `pondra.open()` 1.77 s and 517 MB, `local()` 2.22 s and 524 MB with its node's (the median of five). Answers that stream for ever (`/live`,
+   `/watch`) go to the loopback door. Every C entry
+   catches a panic (unwinding across `extern "C"` is undefined) and says why through
+   `pondra_last_error`. A child forked after `open` is refused by name, the request and an open
+   alike: it shares its parent's node. `tools/inprocess_check.py`: SQL, frames, pandas, a file on
+   this machine, a live query, a lake reopened, a second open, a misspelt or changed setting, 50
+   opens and closes (threads, files and idle wakeups back where they were), a fork.
+
+306. **The packages run the library through a launcher, and the library is found where it was installed**
+   (`launcher/`, `tools/package.py`, ADR-061 §6): the wheel and the npm package carry `pondra_lib` and a small
+   `pondra` program that loads it and calls `pondra_main`, so the program and `pondra.open()` are one build. The
+   launcher looks in one order: `PONDRA_LIBRARY`, beside itself, the site-packages folder holding
+   `pondra-<its version>.dist-info` (two Pythons in one prefix never mix versions), then `..` (`pip install
+   --target`); none found, it says where it looked and exits 127. The archive and the container image keep the
+   program whole. Both are built for glibc 2.17 (invariant 48). `tools/try_packages.sh`: `pondra --version`
+   and a query through the installed launcher, without and with pyarrow, on every OS.
+
+307. **The library is also a Node-API module, and links nothing of Node's** (`capi/src/napi.rs`, `js/index.js`
+   `open`): `process.dlopen` loads `pondra_lib` itself, which finds its 17 Node-API functions in the host when
+   loaded (`dlsym(RTLD_DEFAULT)`, `GetProcAddress` on Windows), so Python and the launcher load the same file
+   and never call them. Every symbol it needs from outside is glibc's or libgcc's, by version, so nothing of
+   Node's (zlib, OpenSSL, libuv) binds to its own; it defines its ABI, `napi_register_module_v1` and crc-fast's C API. `open` and `close` run on libuv's pool, never the event loop; the process's `exit` event closes
+   a node still open (`closeSync`: `process.exit()` runs no cleanup hooks), a cleanup hook per environment closes
+   the nodes it opened when it simply ends (a worker thread too), and a lake opened as `temporary` is removed by
+   the library once the node has let it go. A node in a library prints nothing when all goes well. `tools/inprocess_check.py`
+   (i–o): SQL, frames, a file and a live query from Node; a lake reopened; 20 opens and closes; a process that
+   calls `process.exit()`, and one that just ends, without `close()` (its temporary lake gone either way); Bun; the
+   library's dynamic symbols (only its ABI defined but a dependency's C API, nothing needed unversioned).
+318. **SQL's plain INSERT never replaces a row of its key** (`constraints::key_check`, `key_check_over`,
+   `txn::autocommit`, `txn::ByKey`): an INSERT without ON CONFLICT or OR REPLACE | IGNORE into a table
+   with a PRIMARY KEY (not a merge table) is refused 23505, in Postgres's words, when two of its rows
+   share a key or a live row holds one. Outside a transaction it runs as one of its own under its keys'
+   row locks, so of two nodes inserting one new key, one wins. In a transaction it is checked at its
+   statement over the transaction's kept keys (`ByKey`: its own rows' keys held, the keys it took away
+   free, never a pass over its kept rows) and again at COMMIT. A retried job's INSERT is a duplicate
+   (`write::sent`). A CREATE TABLE AS refused for a key leaves no table. ON CONFLICT, MERGE, INSERT OR
+   REPLACE | IGNORE, the loading doors and views keep upserting, and a change replaces old rows by key,
+   not `_row_id` (`change::upserts`). `pondra sql` and an attached lake's INSERT check without locks.
+   `harness.py pkey`.
+322. **Row locks are a schedule, never the authority** (`locks.rs`, `txn::commit_here`, ADR-067
+   §4–6): they live in the leader's memory only, by table and key (an append table's by `_row_id`),
+   with a lease of `PONDRA_LOCK_LEASE_SECS` (60) that each lock request renews; a new leader starts
+   with none, and a transaction's locks go once its commit is visible on the leader. COMMIT still
+   checks under the lake's lock that every row it changed is at the version it read, so a lost or
+   lapsed lock, or a writer that takes none (a loading door, a UNIQUE table's write), makes a COMMIT
+   refuse 40001 and never loses an update. Waits are first come, first served; a wait that would
+   close a loop is 40P01 at once; `lock_timeout` is 55P03. `harness.py waits`.
+323. **READ COMMITTED reads the newest commit at each statement, and a write that waited is worked
+   out again at its grant** (`txn::next`, `locks::passes`, ADR-067 §1–3): a write locks the rows it
+   would change and runs again from the commit its locks were granted at, for as long as a pass
+   locks a row it hadn't held (`LOCK_MAX`); under REPEATABLE READ the first changed row is 40001,
+   and its snapshot is taken at its first statement that isn't a setting. SERIALIZABLE is refused by
+   name (0A000), never run as less. A statement over 10,000 rows locks none (COMMIT's check keeps it
+   right), and a `FOR UPDATE` over that many is refused. A key is named by its stored type's text
+   (`key_text`), so two spellings of one key lock one row. `harness.py waits`, `begin`, `round7`.
+324. **An autocommitted UPDATE or DELETE of a keyed table never lands over a change made under the
+   lake's lock** (`txn::autocommit`, `locks::take`, `locks::close`, ADR-067 §7): it registers as
+   appending to its table in the request that grants its locks, and every writer that changes rows
+   under the lake's lock (`txn::commit_here`, `change::run`, `iceberg::record`, `branch::refresh`)
+   closes the table's gate first, waiting for the appends in flight. Its locks go once its append is
+   answered; an answer lost in transit, or a server error from the leader (`log::Refusal::lost`:
+   only a 4xx is the leader's own refusal), keeps them to the lease, since the append may still
+   land. A closer waits at most 5 s (`GATE_WAIT`) for the appends in flight, then refuses with
+   40001; no writer marked appending takes the lake's lock or waits for it (it waits for its row
+   locks before it is marked, and backpressure never pauses commits while a closer holds the lock).
+   `harness.py round7` (`PONDRA_TEST_NO_GATE=1` shows the lost update), `autocommit`.
+325. **DDL in a transaction runs at once and says so, and an idle transaction ends, never
+   autocommitted** (`txn.rs`, ADR-067 §8–10): a DDL statement commits on its own with a notice that
+   ROLLBACK won't undo it (refused on a table the transaction wrote, and under REPEATABLE READ); a
+   savepoint keeps the transaction's kept writes and reads (`Mark`), and the row locks taken after
+   it stay to the end; after `PONDRA_TXN_IDLE_SECS` (600) without a statement the kept writes and
+   the locks go, and every statement but BEGIN, COMMIT and ROLLBACK is refused 25P03 (a COMMIT too,
+   saying nothing was committed). `harness.py begin`, `waits`.
 337. **A file is loaded into a table once a version, and its record lands with its rows** (`copy.rs`,
    `adopt::file`, `log::Filing::also`): `COPY INTO t FROM '…'` loads each file under the job
    `load:{table, file, version}` (an e-tag, else size and time), so the bulk path's job mark keeps a
@@ -2129,6 +2285,26 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    sees those columns and no other part of it, and that table's definition is not shown. Neither is a
    remembered answer. `harness.py find`: "a user granted one table…", "a user granted some columns…",
    "never a remembered answer…".
+346. **A measure is worked out at the query's own grain, from the view's base rows, never from its default
+   form's** (`measures::rewrite`, first in `routines::expand_with`'s tree stage): a query naming a measure
+   reads the view's FROM and WHERE with the dimensions it uses and each column its measures read, and each
+   measure is its expression over those, grouped by the query's GROUP BY; the base is then written in place
+   (`measures::flattened`) unless that could change a name's meaning. Everything after it sees a plain
+   `GROUP BY` (spread, the result cache, the join order). Only a one-argument `MEASURE`, `AGG` or `AGGREGATE`
+   is a measure call (`measures::measure_call`): Spark's and DuckDB's `aggregate(list, …)` go to the
+   planner. `harness.py measures`: "MEASURE() at the query's own grain…", "every way of naming a
+   measure…", "spread over three nodes == one node"; `dialects`' XX000 count.
+347. **A view with measures joins only onto keys, so no row is counted twice** (`measures::check`, in
+   `ddl::create_view`): each JOIN or LEFT JOIN's equalities cover a PRIMARY KEY or UNIQUE of the table or
+   view it joins (NOT ENFORCED is enough); a query that joins the view to anything else is refused.
+   `harness.py measures`: "refused by name, and nothing made" ('not on a key', 'has no key', 'inside the
+   view').
+348. **A view's key facts are its own entry's, name only its columns, and nothing checks them** (`facts.rs`):
+   a stored view's in `StoredView::facts`, a materialized view's in its table's constraints, never enforced;
+   set by the statement that makes the view; a `CREATE OR REPLACE VIEW` that drops a column one names is
+   refused; one naming anything but the view's columns is refused. `harness.py facts`: "kept through CREATE
+   OR REPLACE…", "refused by name, and nothing made", "SHOW CREATE VIEW run again after a drop makes the
+   same view".
 370. **A term's lock file says at once, on its machine only, that its claimer's process ended**
    (`cluster::new_lock`, `gone_here`, `relock`). A claim takes an OS lock (`File::try_lock`) on
    `{id}.lock` in the user's own folder of the temporary folder (`pondra-terms-{uid}`, 0700, used
@@ -2203,6 +2379,74 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    name". And `cluster::alive` asks for `cluster/left` too: a leader's last mark, in flight as it stepped
    down, can land after `release` deleted it (`environments_check.py --s3`'s teardown).
 
+378. **A node a program started answers only that program** (`Auth::owned`, `App::open`,
+   `server::guard`). With `PONDRA_OWNER_KEY` (16 characters or more; the shell, `local()` and the project
+   commands make one), a request without the program's key (`x-pondra-owner`), a token or a user's
+   sign-in gets 401, "this node answers only the program that started it…". While no admin token is set,
+   the key is also the `admin` user's password at the doors that take one. `pondra sql` with no token
+   sends the lake's own key for its nodes. A lake folder such a node finds empty is made 0700.
+   `harness.py owned`: "a request without the program's key: 401…", "its Postgres port takes the
+   program's key as admin's password…", "the folder it made is its user's alone (0700)".
+379. **A lake served with tokens remembers it** (`users::mark_signed`, `signed`; `App::open`;
+   `cli.rs`'s first user). A leader with any token writes `z/signed` once, and nothing clears it
+   (`pondra token` is the way back in). A node with no token on such a lake is never open: an unsigned
+   request gets 401, "this lake has been served with tokens…". It makes no first user either, on the
+   network or not, so an accidental node never writes to a production lake. A key that can't be read
+   counts as signed. `/stats` says `signed`. `harness.py signed`: "a node started without the tokens
+   its lake was served with answers no one unsigned…", "…on the network with no token: still no one
+   unsigned, and it makes no user".
+380. **A password crosses only TLS from another machine** (`tls::may_send_password`,
+   `Peer::may_send_password`; `server::guard`, `login`; `dbserver::plain`). Under `PONDRA_TLS=optional`,
+   a plain connection from another machine may carry a token, never a password. HTTP Basic and
+   `POST /login` there get 403 naming https, at a node and at `pondra serve --lakes`, whose databases'
+   nodes see only this machine. Kafka's SASL/PLAIN and Flight's Basic handshake take the same hook.
+   Postgres's SCRAM never sends the password. The rule's cases are `tls::tests`, since one machine
+   can't make a connection from another.
+381. **Failed sign-ins are counted per address and user name** (`auth::Guesses`, `guessing`,
+   `guessed`; `Peer::client`). Past ten failures in a sliding minute, that pair is refused (429 with
+   `Retry-After` at HTTP), the right password too, until its minute has fewer. Each refusal
+   costs its 400 ms, as a wrong guess does. At most 10,000 pairs are held. Bearer tokens aren't
+   counted. The Postgres, Flight and Kafka doors take the same two hooks. Behind `pondra serve --lakes` the address is the client's, which the server names in
+   `x-pondra-client` with a key it gives its databases' nodes (`PONDRA_CLIENT_KEY`). A node takes that
+   header only from this machine and with that key, so no other process here can name an address, and
+   the server replaces what a client sent. Without it, ten wrong passwords from anyone locked the user out for everyone. The same
+   address decides what a page on this machine is (`Peer::from_here`: saving the console's settings, choosing a node's
+   Python), so behind the server a page from another machine can't do either (S28). From an address of
+   `PONDRA_TRUSTED_PROXIES` (your own load balancer), the client is the last address in `X-Forwarded-For`
+   that isn't one of them; anyone else's `X-Forwarded-For` is never read, and a host name there stops the
+   node at start.
+   `harness.py guesses`: "the eleventh is 429…", "another user from the same address still signs
+   in", "a process here naming another address (x-pondra-client) is still counted by its own", "…while
+   from another address cy signs in: the server names each client's address…", "…a page from another address doesn't, nor
+   chooses the Python (S28)", "behind a trusted proxy: ten wrong passwords from one client lock al out for that
+   client…", "…and what a client writes before its proxy's entry isn't taken".
+382. **A user is shown what it may use, at every listing** (`ddl::listed`, `auth::shows_code`). A user
+   granted some tables is listed only the tables and views it may SELECT, and that filter lives in
+   `ddl::listed` alone, so `GET /objects`, `pondra.tables`, `SHOW VIEWS`, `pondra.objects` and
+   `pondra.parts` agree. A routine's code and a task's statement are shown only to a token, a superuser,
+   an open node, or a user with APPLY or CLONE ON DATABASE, who holds them anyway: `GET /routines`,
+   `pondra.routines.body`, `pondra.tasks.statement`, `pondra.objects`, `information_schema.routines`,
+   `pg_proc.prosrc` and `SHOW CREATE` follow `shows_code`, and `GET /export` (every routine's code, task
+   and grant) asks it. Anyone else sees a routine's name, parameters and result, enough to call it; a CALL
+   still runs as its caller (invariant 84), and its errors quote no code: a stored procedure runs for such a
+   caller inside `script::unshown` (a statement by its number, a condition as `…`), and a Python routine's
+   `  line 3: <the line>` is cut to `  line 3` (`python::unquoted`) in `python::ask` and in `ext::said`, where
+   every door words an error (a function's batches may run where no caller is known). A user granted some tables saw every table's name and every
+   routine's code before. `harness.py users`: "a user is shown only the tables it may read (GET /objects)
+   and no routine's code…", "S27, beyond the listings…" (both fail on the build before),
+   "…a user granted APPLY on this database (it deploys them) is shown routines' code and the export", "…nor in a
+   failed call's error…".
+
+395. **RETURNING answers the rows the write worked out, never rows read back** (`returning.rs`: `wrote`
+   from `write::run_listed`, `txn::autocommit_as`, `insert_as` and `txn::statement`). A change the
+   leader would work out (`write::changes`) runs as a transaction of its own (`txn::alone`) in the
+   caller's session, so its rows are worked out where they are answered and land in one commit. Its
+   job names that commit (`Commit.job`), never the transaction's id, which owns its locks. Everything
+   that refuses is checked before the write: the table, the items (42703), and SELECT on the table
+   (42501). A job sent again is refused 55000, never answered with no rows. `harness.py returning`:
+   "a job's INSERT … RETURNING into a UNIQUE table and a keyed one, sent again: refused 55000, not
+   23505" (55P03 with the job as the transaction's id), "a user granted INSERT but not SELECT…".
+
 ## Tests: run these before and after any change
 
 ```bash
@@ -2213,8 +2457,14 @@ python3 tools/gates.py [--prepare]      # the gates (sqllogictest, TPC-H SF1 vs 
 python3 tools/harness.py guarded        # open nodes and pages from other sites, the row doors and the nodes' routes by grant, a forwarded change as its user, .py files an admin's
 python3 tools/surface.py --bin target/release/pondra --check docs/surface.json   # what 1.0 keeps (ADR-068): reports until the freeze, then fails on a name added or gone
 python3 tools/harness.py safety         # panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
+python3 tools/harness.py owned signed guesses   # a program's node answers only it; a lake served with tokens stays signed; failed sign-ins limited per address and name
 python3 tools/harness.py sealed         # the admin token as the master key: sealed from the first write, across nodes, rotation, the nodes' key refused
 python3 tools/harness.py first          # a node on the network with no token makes the lake's first user and prints its token once; pondra token; a follower answers no one
+python3 tools/node_check.py             # a node stopped once it serves, or while it starts, gives its term back: the next leads at once
+python3 tools/per_node_check.py         # every static per_node! or said to outlive a node; no task Node::stop can't end; settings only through env.rs
+cargo test --release --test node_twice  # two lakes in one process, one after the other: nothing of the first in the second
+cargo test --release --test node_library       # a node in process: restarts in place, a vital loop's panic answered as 57P03, opened again
+python3 tools/inprocess_check.py --lib <pondra_lib> --bin <pondra> [--bench]   # pondra.open() in Python and open() in Node and Bun: every way in, 50 opens, a fork, a process gone without close; --bench: open, idle memory, 10 M rows into pandas against local() and DuckDB
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
@@ -2249,13 +2499,20 @@ python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, la
 python3 tools/harness.py sequences      # nextval on three nodes (every value once), identity columns from every door, ALWAYS, owned sequences, a leader's kill
 python3 tools/harness.py enums          # CREATE TYPE … AS ENUM and ENUM('a', 'b') columns: labels from every door (22P02), casts, enum_range, ADD VALUE, RENAME, DROP while used
 python3 tools/harness.py constraints    # UNIQUE from every door and three nodes at once (23505), NOT ENFORCED facts, ADD/DROP CONSTRAINT, SHOW CREATE, the Postgres catalog
+python3 tools/harness.py pkey           # a plain INSERT of a held key: 23505 at every door, two nodes at once, transactions and savepoints, upserts still upsert, CTAS, pondra sql
+python3 tools/harness.py returning      # INSERT/UPDATE/DELETE … RETURNING at every door == Postgres: ORMs (Django, SQLAlchemy), keys, UNIQUE, upserts, transactions, a follower, jobs (55000), grants (42501)
 python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
 python3 tools/harness.py find           # pondra.parts and pondra.find at every door (HTTP, Postgres, MCP, Python, JavaScript), as each user may see them; 1,000 tables and 200 views
+python3 tools/harness.py measures       # measures in views: the query's own grain, BI's sum(m), three nodes, Postgres, frames, refusals, cost against the hand-written GROUP BY
+python3 tools/harness.py facts          # a view's PRIMARY KEY, UNIQUE and FOREIGN KEY NOT ENFORCED: parts, ALTER VIEW, SHOW CREATE again, OR REPLACE, Postgres's catalog, refusals
 python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow
 python3 tools/harness.py begin          # BEGIN … COMMIT from every door, read-your-writes, 40001 and retries, 25P02, SQLSTATEs
+python3 tools/harness.py waits          # READ COMMITTED and row locks: waits in order, 40P01, lock_timeout, FOR UPDATE, leases, idle ends (25P03), a leader killed mid-transaction
+python3 tools/harness.py autocommit     # autocommitted keyed UPDATEs from two nodes and two clients at once; a change over 10,000 rows locks none
+python3 tools/harness.py round7         # the gate (PONDRA_TEST_NO_GATE=1 shows the lost update); refused key, view and merge-table changes; ON CONFLICT waits
 python3 tools/bench/pgbench.py          # pgbench's own TPC-B script, 1 and 4 clients: the balances agree (--postgres: Postgres too)
 python3 tools/bench/flow.py             # what a flow of 0 to 3 views costs ingest; every stage right when acknowledged
 python3 tools/bench/footprint.py        # install size, start to first answer, idle memory: Pondra, DuckDB, Polars, Spark, Flink (a venv with pyspark, apache-flink)

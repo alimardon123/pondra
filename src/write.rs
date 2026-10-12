@@ -568,6 +568,12 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if backups && BACKUP_ANY.is_match(first_word(sql)) {
         return Some(Stmt::Invalid("a backup is written as BACKUP DATABASE [name] TO 'place' [WITH (retention_days = 7)], and restored as RESTORE DATABASE name FROM 'place' [LOCATION 'place'] [AT (TIMESTAMP => '2026-10-12 03:00:00')]".into()));
     }
+    // DuckDB's `EXPORT DATABASE 'dir'` and `IMPORT DATABASE 'dir'` (a folder of a database's files):
+    // not Pondra's yet, so refused by name with the ways it has, not with the parser's words.
+    static PORTABLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(EXPORT|IMPORT)\s+DATABASE\b").expect("a regex"));
+    if matches!(head.as_str(), "export" | "import") && PORTABLE.is_match(first_word(sql)) {
+        return Some(Stmt::Invalid("EXPORT DATABASE and IMPORT DATABASE are not supported yet: BACKUP DATABASE TO 'place' copies a database (RESTORE DATABASE name FROM 'place' brings it back), and COPY t TO 'dir/t.parquet' (FORMAT parquet) writes a table's rows".into()));
+    }
     // `UNDROP TABLE t` (Snowflake's, Databricks'): the table dropped last under that name, back (ADR-043).
     static UNDROP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*UNDROP\s+TABLE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
     if let Some(c) = (head == "undrop").then(|| UNDROP.captures(first_word(sql))).flatten() {

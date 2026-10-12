@@ -6307,6 +6307,26 @@ def hot():
                 q(ask + f" -- warm {run}")
         held = hot_settled(A.port)
         checks["the table's columns are in memory"] = held > 0
+        # In memory a filter is sized from the files' ranges, as it is on disk (`hot::Known`): a
+        # range of 500 of the 200,000 seconds keeps about 500 rows, not every row.
+        physical = {r["plan_type"]: r["plan"] for r in q("EXPLAIN " + asks["a range of the time"][0])}.get("physical_plan", "")
+        expected = [int(m) for m in re.findall(r"FilterExec:.*?expected_rows=(\d+)", physical)]
+        seen["a range of the time, as planned"] = expected
+        checks["a range of the time is sized from the files' ranges (a few hundred rows expected, not all)"] = bool(expected) and max(expected) < 5000
+        # …and a string equal to a value from the table's distinct counts (`sketch.rs`): one of
+        # 200,000 values keeps 1% (the least a filter's estimate can say), not a fifth of them.
+        physical = {r["plan_type"]: r["plan"] for r in q("EXPLAIN SELECT i FROM ev WHERE s = 'r5'")}.get("physical_plan", "")
+        expected = [int(m) for m in re.findall(r"FilterExec:.*?expected_rows=(\d+)", physical)]
+        seen["a string equal to a value, as planned"] = expected
+        checks["a string equal to a value is sized from the table's distinct counts (1% expected, not a fifth)"] = bool(expected) and max(expected) <= n // 100
+        # A NOT IN keeps one table that sees every row of its subquery (`SharedBuilds` hashes big
+        # joins a table a thread, never a null-aware one): hashed, the threads that never met the
+        # subquery's NULL kept their rows. 1,000 rows count as big here, so the 200,000 do.
+        big = "SET datafusion.optimizer.hash_join_single_partition_threshold_rows = 1000; "
+        not_in = [q(big + f"SELECT count(*) AS n FROM ev WHERE i NOT IN (SELECT x FROM (VALUES (1), ({v})) AS v(x))") for v in ("NULL", "2")]
+        seen["NOT IN"] = not_in
+        checks["NOT IN a subquery with a NULL keeps no row, its join's table shared however big (and without the NULL, every other row)"] = \
+            not_in == [[{"n": 0}], [{"n": n - 2}]]
         for name, (ask, want, skips) in asks.items():
             before = skipped()
             got = q(ask)
@@ -6664,14 +6684,15 @@ def learn():
         checks["the same answer either way"] = len(answers) == 1
         best_with, best_without = min(t for _, t in with_facts), min(t for _, t in without)
         checks["no slower with what was learned"] = best_with <= best_without * 1.25 + 0.05
-        # The bar: b's second run of the query with facts was planned without them, so its runs show two plans
-        deadline, plans = time.time() + 20, set()
-        while len(plans) < 2 and time.time() < deadline:
-            time.sleep(0.5)
-            plans = {r["plan_id"] for r in q(f"SELECT plan_id FROM pondra.history WHERE node = '127.0.0.1:{A.port + 1}' "
-                                              "AND statement LIKE 'SELECT count(*) AS n FROM products%'") if r.get("plan_id")}
-        seen["b's plans"] = sorted(plans)
-        checks["the run after the first with facts is planned without them: the bar they are held to"] = len(plans) == 2
+        # The bar: b's second run of the query with facts was planned without them. b prints each join order it
+        # weighs, its customers marked when their rows were learned: after the first order weighed with them, one
+        # without. (Not by plan_id, a plan's shape: with its inputs sized, either order is a join of an `id` scan
+        # and orders, then another `id` scan, alike.)
+        weighed = [l for l in open(b.log, errors="replace").read().splitlines() if l.startswith("join order:") and "SubqueryAlias: c (" in l]
+        learned_at = next((i for i, l in enumerate(weighed) if "rows, learned)" in l), None)
+        bar = [l for l in weighed[learned_at + 1:] if "rows, learned)" not in l] if learned_at is not None else []
+        seen["b's orders weighed, and without the facts after them"] = [len(weighed), len(bar)]
+        checks["the run after the first with facts is planned without them: the bar they are held to"] = bool(bar)
         # Spread over three nodes: each plans with the facts the coordinator sent, so none falls back
         deadline = time.time() + 30
         while len(call(A.port, "GET", "/stats").get("nodes", ())) < 3 and time.time() < deadline:
@@ -10534,6 +10555,12 @@ def objects():
     checks["an INSERT into a name no table has is refused (42P01, naming it) over HTTP and pondra sql, nothing made; POST /insert/{t} still makes one"] = \
         nope[:2] == (404, "42P01") and "no table nope" in str(nope[2]) and nope_select[1] == "42P01" and nope_read[1] == "42P01" \
         and cli_nope.returncode != 0 and "no table nope" in cli_nope.stdout + cli_nope.stderr and q("SELECT count(*) AS n FROM bulk_made") == [{"n": 1}]
+    # DuckDB's EXPORT DATABASE and IMPORT DATABASE are not Pondra's yet (ADR-071): refused by name
+    # with the ways it has (0A000), not with the parser's words.
+    exported, imported = http("EXPORT DATABASE 'out'"), http("IMPORT DATABASE 'out'")
+    info["export"] = [exported[:2], imported[:2]]
+    checks["EXPORT DATABASE and IMPORT DATABASE refused by name (0A000), naming BACKUP DATABASE and COPY"] = \
+        exported[1] == imported[1] == "0A000" and all(w in str(r[2]) for r in (exported, imported) for w in ("EXPORT DATABASE", "BACKUP DATABASE", "COPY"))
     q("CREATE VIEW v AS SELECT a FROM t")
     q("CREATE VIEW IF NOT EXISTS v AS SELECT a + 1 AS a FROM t")
     kept = q("SELECT a FROM v")

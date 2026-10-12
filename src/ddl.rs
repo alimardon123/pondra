@@ -939,9 +939,13 @@ pub fn retention(text: &str) -> Result<u64> {
 async fn undrop(lake: &Lake, name: &str) -> Result<Value> {
     let taken = lake.cat.get::<TableMeta>(&table_key(name)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(name)).await?.is_some()
         || lake.cat.get::<Value>(&crate::views::view_key(name)).await?.is_some();
-    ensure!(!taken, "{name} exists: rename it (ALTER TABLE {name} RENAME TO …), then UNDROP TABLE {name}");
+    if taken {
+        return Err(crate::codes::coded("42P07", format!("{name} exists: rename it (ALTER TABLE {name} RENAME TO …), then UNDROP TABLE {name}")));
+    }
     let mut kept: Vec<(String, Dropped)> = lake.cat.scan::<Dropped>(&format!("dt/{name}/"), &format!("dt/{name}0")).await?;
-    let Some((key, d)) = kept.pop() else { bail!("no dropped table {name} is kept (pondra.dropped lists those that are)") };
+    let Some((key, d)) = kept.pop() else {
+        return Err(crate::codes::coded("42P01", format!("no dropped table {name} is kept (pondra.dropped lists those that are)")));
+    };
     let at = lake.visible();
     let mut puts = vec![];
     for (t, meta) in [(name.to_string(), Some(d.meta)), (crate::sys::deleted(name), d.deleted)] {

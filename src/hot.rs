@@ -30,6 +30,7 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::parquet::arrow::{arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder}, ProjectionMask};
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{stats::Precision, ScalarValue};
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::physical_expr::{DynamicFilterTracking, PhysicalExpr};
 use datafusion::physical_optimizer::pruning::{PruningPredicateBuilder, PruningStatistics};
@@ -438,6 +439,7 @@ pub struct HotFiles {
     pub files: Vec<DataFile>,
     pub schema: SchemaRef,
     pub meta: TableMeta, // (what reading a file takes of its table: its columns, their names, the key)
+    pub known: Arc<HashMap<String, Known>>, // (what the planner knows of the table's columns: `Known`)
 }
 
 impl std::fmt::Debug for HotFiles {
@@ -495,7 +497,7 @@ impl TableProvider for HotFiles {
             parts.retain(|p| !p.is_empty());
             pieces.retain(|p| !p.is_empty());
             let memory = MemorySourceConfig::try_new(&parts, schema.clone(), None)?;
-            plans.push(DataSourceExec::from_data_source(HotSource::new(memory, Arc::new(pieces), None)));
+            plans.push(DataSourceExec::from_data_source(HotSource::new(memory, Arc::new(pieces), None, self.known.clone())));
         }
         match plans.len() {
             0 => Ok(Arc::new(EmptyExec::new(schema))),
@@ -506,6 +508,30 @@ impl TableProvider for HotFiles {
 
 /// A batch's place: its file's columns' ranges, and which of its batches it is.
 type Piece = (Arc<HashMap<String, Ranges>>, usize);
+
+/// What the planner knows of a column of the batches: the table's least and greatest value and
+/// how many values it holds, as the table gives them to the join order (`query::Pruned::count`:
+/// its files' footers and its sketch), so a filter or a join over the batches is sized alike there
+/// and here. Without them DataFusion took a range of dates for every row, and a nation's name for
+/// a fifth of the nations. They are the catalog's, the same on every node whatever it holds in
+/// memory.
+#[derive(Debug, Clone, Default)]
+pub struct Known {
+    range: Option<(ScalarValue, ScalarValue)>,
+    distinct: Option<usize>,
+}
+
+/// A table's statistics as `Known`, by column name. Ranges only of numbers, dates and times: the
+/// estimates measure no other (a string's least and greatest value sized nothing, and each plan
+/// copied them at every step it asked for statistics).
+pub fn known(stats: &datafusion::common::Statistics, schema: &Schema) -> HashMap<String, Known> {
+    let measured = |t: &DataType| t.is_numeric() || matches!(t, DataType::Date32 | DataType::Date64 | DataType::Timestamp(..));
+    let column = |f: &FieldRef, c: &datafusion::common::ColumnStatistics| Known {
+        range: c.min_value.get_value().cloned().zip(c.max_value.get_value().cloned()).filter(|(lo, hi)| measured(f.data_type()) && !lo.is_null() && !hi.is_null()),
+        distinct: c.distinct_count.get_value().copied(),
+    };
+    schema.fields().iter().zip(&stats.column_statistics).map(|(f, c)| (f.name().clone(), column(f, c))).filter(|(_, k)| k.range.is_some() || k.distinct.is_some()).collect()
+}
 
 /// The hot batches of a scan, as DataFusion's memory source reads them, skipping each batch the
 /// scan's filters rule out by its ranges. The filters stay above (rows are filtered there): here
@@ -521,12 +547,14 @@ struct HotSource {
     /// step (a third of planning TPC-H q8 from memory). They don't change with the fetch or the
     /// predicate, only with the batches and the columns.
     stats: Arc<[std::sync::OnceLock<Arc<datafusion::common::Statistics>>]>,
+    /// What the planner knows of each column (`Known`), by name.
+    known: Arc<HashMap<String, Known>>,
 }
 
 impl HotSource {
-    fn new(memory: MemorySourceConfig, pieces: Arc<Vec<Vec<Piece>>>, predicate: Option<Arc<dyn PhysicalExpr>>) -> HotSource {
+    fn new(memory: MemorySourceConfig, pieces: Arc<Vec<Vec<Piece>>>, predicate: Option<Arc<dyn PhysicalExpr>>, known: Arc<HashMap<String, Known>>) -> HotSource {
         let stats = (0..=memory.partitions().len()).map(|_| std::sync::OnceLock::new()).collect();
-        HotSource { memory, pieces, predicate, stats }
+        HotSource { memory, pieces, predicate, stats, known }
     }
 }
 
@@ -553,8 +581,22 @@ impl DataSource for HotSource {
         if let Some(s) = slot.get() {
             return Ok(s.clone());
         }
-        let s = self.memory.partition_statistics(partition)?;
-        Ok(slot.get_or_init(|| s).clone())
+        let mut s = Arc::unwrap_or_clone(self.memory.partition_statistics(partition)?);
+        let schema = self.memory.original_schema();
+        let names: Vec<&str> = match self.memory.projection() {
+            Some(p) => p.iter().map(|&i| schema.field(i).name().as_str()).collect(),
+            None => schema.fields().iter().map(|f| f.name().as_str()).collect(),
+        };
+        for (c, name) in s.column_statistics.iter_mut().zip(names) {
+            let Some(k) = self.known.get(name) else { continue };
+            if let Some((lo, hi)) = &k.range {
+                (c.min_value, c.max_value) = (Precision::Inexact(lo.clone()), Precision::Inexact(hi.clone()));
+            }
+            if let (Some(d), Some(&rows)) = (k.distinct, s.num_rows.get_value()) {
+                c.distinct_count = Precision::Inexact(d.min(rows).max(1));
+            }
+        }
+        Ok(slot.get_or_init(|| Arc::new(s)).clone())
     }
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> { Some(Arc::new(HotSource { memory: self.memory.clone().with_limit(limit), ..self.clone() })) }
     fn fetch(&self) -> Option<usize> { self.memory.fetch() }
@@ -562,7 +604,7 @@ impl DataSource for HotSource {
         // (a projection of plain columns: the batches and their order stay, and ranges go by name)
         let Some(projected) = self.memory.try_swapping_with_projection(projection)? else { return Ok(None) };
         let projected: Arc<dyn std::any::Any + Send + Sync> = projected;
-        Ok(projected.downcast::<MemorySourceConfig>().ok().map(|m| Arc::new(HotSource::new(Arc::unwrap_or_clone(m), self.pieces.clone(), self.predicate.clone())) as Arc<dyn DataSource>))
+        Ok(projected.downcast::<MemorySourceConfig>().ok().map(|m| Arc::new(HotSource::new(Arc::unwrap_or_clone(m), self.pieces.clone(), self.predicate.clone(), self.known.clone())) as Arc<dyn DataSource>))
     }
     fn try_pushdown_sort(&self, order: &[datafusion::physical_expr::PhysicalSortExpr]) -> datafusion::error::Result<datafusion::physical_plan::SortOrderPushdownResult<Arc<dyn DataSource>>> {
         // A top-N reads each partition's batches in the order its first key's ranges give, so its
@@ -586,7 +628,7 @@ impl DataSource for HotSource {
             pieces.push(order.iter().map(|&i| own[i].clone()).collect::<Vec<_>>());
         }
         let memory = MemorySourceConfig::try_new(&parts, self.memory.original_schema(), self.memory.projection().clone())?.with_limit(self.memory.fetch());
-        Ok(Inexact { inner: Arc::new(HotSource::new(memory, Arc::new(pieces), self.predicate.clone())) })
+        Ok(Inexact { inner: Arc::new(HotSource::new(memory, Arc::new(pieces), self.predicate.clone(), self.known.clone())) })
     }
     fn try_pushdown_filters(&self, filters: Vec<Arc<dyn PhysicalExpr>>, _: &datafusion::common::config::ConfigOptions) -> datafusion::error::Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
         let below = vec![PushedDown::No; filters.len()];
