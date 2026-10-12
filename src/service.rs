@@ -325,6 +325,20 @@ mod os {
 
     fn xml(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;") }
 
+    /// Stop and unload a service, and wait until launchd has let it go. `bootout` answers while launchd
+    /// still holds the job, as its node drains, and a `bootstrap` of the same label then fails with "5:
+    /// Input/output error" (`deploy_check.py service`, installed again, now and then on CI's macOS).
+    /// Waits as long as the plist lets the node take to stop (`ExitTimeOut`), and a little more.
+    fn bootout(domain: &str, name: &str) {
+        use std::time::{Duration, Instant};
+        let target = format!("{domain}/{name}");
+        let _ = Run::new("launchctl").args(["bootout", &target]).output();
+        let deadline = Instant::now() + Duration::from_secs(65);
+        while Instant::now() < deadline && Run::new("launchctl").args(["print", &target]).output().is_ok_and(|o| o.status.success()) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
     pub fn install(name: &str, exe: &Path, file: &Path) -> Result<String> {
         let system = system();
         let (plist, domain, log) = places(name, system)?;
@@ -345,7 +359,7 @@ mod os {
             user.as_ref().map_or(String::new(), |(u, ..)| format!("<key>UserName</key><string>{}</string>\n", xml(u))),
             xml(&log.to_string_lossy()), xml(&log.to_string_lossy()),
         );
-        let _ = Run::new("launchctl").args(["bootout", &format!("{domain}/{name}")]).output(); // (installed again: the new settings)
+        bootout(&domain, name); // (installed again: the new settings)
         std::fs::create_dir_all(plist.parent().expect("a folder"))?;
         std::fs::write(&plist, text)?;
         manage(Run::new("launchctl").args(["enable", &format!("{domain}/{name}")]))?;
@@ -358,7 +372,7 @@ mod os {
 
     pub fn uninstall(name: &str, file: &Path) -> Result<()> {
         let (plist, domain, _) = places(name, file.starts_with("/etc"))?;
-        let _ = Run::new("launchctl").args(["bootout", &format!("{domain}/{name}")]).output();
+        bootout(&domain, name);
         if plist.exists() {
             std::fs::remove_file(&plist)?;
         }
