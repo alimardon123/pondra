@@ -21,7 +21,7 @@ use crate::{constraints::Kind, ddl, routines, store::{self, Lake}, write};
 
 /// The alias a measure is stored under: `sum(x) AS MEASURE m` is kept as `sum(x) AS "pondra_measure:m"`.
 pub const MARK: &str = "pondra_measure:";
-/// `MEASURE`, `AGG` and `AGGREGATE` take one measure by name, unless the lake has a function of that name.
+/// `MEASURE`, `AGG` and `AGGREGATE` take one measure by name, unless the lake has a function of that name (see `measure_call`).
 const CALLS: &str = "measure agg aggregate";
 /// Aggregates BI tools put around a measure (`sum(m)`): what they mean is the measure itself.
 const PLAIN_USES: &str = "sum min max avg any_value";
@@ -440,11 +440,6 @@ impl<'a> Uses<'a> {
         Uses { d, alias, over, routine, found: Vec::new(), depth: 0 }
     }
 
-    /// A call of `MEASURE`, `AGG` or `AGGREGATE`, unless the lake has a function of that name.
-    fn calls(&self, name: &str) -> bool {
-        listed_in(CALLS, name) && !(self.routine)(name)
-    }
-
     /// The measure a bare reference names: `revenue`, or `v.revenue` where `v` is the view's name here.
     fn measure_ref(&self, e: &Expr) -> Option<String> {
         let name = match e {
@@ -480,7 +475,7 @@ impl<'a> Uses<'a> {
         let Expr::Function(f) = e else { return Ok(None) };
         let name = write::object(&f.name);
         let arg = single_arg(f);
-        if self.calls(&name) {
+        if measure_call(f, self.routine) {
             let Some(arg) = arg else { bail!("{name}() takes one measure of {}", self.alias) };
             return self.measure_ref(arg).map(Some).ok_or_else(|| anyhow!("no measure {arg} in {} (its measures: {})", self.alias, self.names()));
         }
@@ -543,6 +538,18 @@ impl VisitorMut for Uses<'_> {
 }
 
 /// The one argument of a call with nothing else on it: no DISTINCT, no ORDER BY inside, no FILTER and no OVER.
+/// A call of `MEASURE`, `AGG` or `AGGREGATE` with one argument at most, unless the lake has a function of that name. With more,
+/// it is another engine's function of that name (Spark's and DuckDB's `aggregate(list, …)`), left for the planner to answer.
+fn measure_call(f: &ast::Function, routine: &dyn Fn(&str) -> bool) -> bool {
+    let name = write::object(&f.name);
+    let one = match &f.args {
+        ast::FunctionArguments::List(list) => list.args.len() <= 1,
+        ast::FunctionArguments::None => true,
+        ast::FunctionArguments::Subquery(_) => false,
+    };
+    one && listed_in(CALLS, &name) && !routine(&name)
+}
+
 fn single_arg(f: &ast::Function) -> Option<&Expr> {
     let ast::FunctionArguments::List(list) = &f.args else { return None };
     if list.duplicate_treatment.is_some() || !list.clauses.is_empty() || f.filter.is_some() || f.over.is_some() {
@@ -885,8 +892,7 @@ impl VisitorMut for Leftover<'_> {
 
     fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<anyhow::Error> {
         let Expr::Function(f) = e else { return ControlFlow::Continue(()) };
-        let name = write::object(&f.name);
-        if listed_in(CALLS, &name) && !(self.routine)(&name) {
+        if measure_call(f, self.routine) {
             return ControlFlow::Break(anyhow!("MEASURE(...) reads a measure of a view with measures, and this query reads none"));
         }
         ControlFlow::Continue(())
@@ -1254,6 +1260,13 @@ mod tests {
         let (changed, sql) = rewritten_with("SELECT agg(x) FROM orders", &agg).expect("left alone");
         assert!(!changed && sql.contains("agg(x)"), "{sql}");
         assert!(rewritten("SELECT agg(x) FROM orders").is_err(), "without the function, a call of no measure is refused");
+    }
+
+    #[test]
+    fn an_aggregate_of_several_arguments_is_another_engines_function() {
+        let sql = "SELECT aggregate(array(1, 2, 3), 0, (acc, x) -> acc + x) AS total";
+        let (changed, out) = rewritten(sql).expect("left for the planner");
+        assert!(!changed && out.contains("aggregate("), "{out}");
     }
 
     #[test]
