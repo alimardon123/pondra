@@ -15,6 +15,8 @@
    files Polars reads back, a folder by `partition_by` too.
 7. What writing the docs found (round 26): `//`'s types, `sample(seed=)`, the set operations,
    `explain()` and `show()`, `read_csv`'s SQL option names.
+8. Polars' `unique(keep=…)` and `maintain_order`: taken where the frame is sorted, refused by name where
+   it isn't; `group_by(maintain_order=True)` refused by name.
 
   frames_check.py [--only name,…] [--port 8830]      (pondra.spark vs PySpark: spark_check.py)
 """
@@ -89,6 +91,17 @@ def pipelines():
     add("join_asof backward by", lambda c, o, u, q: o.filter(col("item").is_in(["tea", "cake"])).sort("ts").join_asof(q.sort("at"), left_on="ts", right_on="at", by="item").select("id", "px"),
         lambda o, u, q: o.filter(pl.col("item").is_in(["tea", "cake"])).sort("ts").join_asof(q.sort("at"), left_on="ts", right_on="at", by="item").select("id", "px"))
     add("unique", lambda c, o, u, q: o.select("user", "item").unique(), lambda o, u, q: o.select("user", "item").unique())
+    add("unique(keep='none') on a subset: the values that occur once", lambda c, o, u, q: o.filter(col("id") < 300).select("id", "user", "item").unique(["user", "item"], keep="none"),
+        lambda o, u, q: o.filter(pl.col("id") < 300).select("id", "user", "item").unique(["user", "item"], keep="none"))
+    add("unique(keep='none') of every column", lambda c, o, u, q: o.filter(col("id") < 300).select("user", "item", "qty").unique(keep="none"),
+        lambda o, u, q: o.filter(pl.col("id") < 300).select("user", "item", "qty").unique(keep="none"))
+    add("sort, then unique(keep='first') on a subset, the sort kept", lambda c, o, u, q: o.sort(["user", "id"]).select("id", "user", "item").unique("user", keep="first", maintain_order=True),
+        lambda o, u, q: o.sort(["user", "id"]).select("id", "user", "item").unique("user", keep="first", maintain_order=True), True)
+    add("sort, then unique(keep='last'), descending with nulls last", lambda c, o, u, q: o.sort(["user", "qty", "id"], descending=[False, True, False], nulls_last=[False, True, False])
+        .select("id", "user", "qty").unique("user", keep="last", maintain_order=True),
+        lambda o, u, q: o.sort(["user", "qty", "id"], descending=[False, True, False], nulls_last=[False, True, False]).select("id", "user", "qty").unique("user", keep="last", maintain_order=True), True)
+    add("sort, then unique(keep='last') of every column", lambda c, o, u, q: o.sort(["user", "item"]).select("user", "item").unique(keep="last", maintain_order=True),
+        lambda o, u, q: o.sort(["user", "item"]).select("user", "item").unique(keep="last", maintain_order=True), True)
     add("drop, rename, cast", lambda c, o, u, q: o.drop("ts", "region").rename({"qty": "n"}).cast({"n": pl.Float64}),
         lambda o, u, q: o.drop("ts", "region").rename({"qty": "n"}).cast({"n": pl.Float64}))
     add("when / then / otherwise", lambda c, o, u, q: o.select("id", when(col("qty") > 6).then(lit("big")).when(col("qty") > 2).then(lit("mid")).otherwise(lit("small")).alias("size")),
@@ -346,6 +359,40 @@ def found(con, tmp):
     return checks
 
 
+# ---------------------------------------------------------------- 8. keep and maintain_order: taken or refused
+
+def keeps(con):
+    """Polars' `unique(keep=…)`, `maintain_order` and `group_by(maintain_order=…)`: taken where a frame
+    has a row order (it is sorted), refused by name where it has none, and never ignored."""
+    o = con.table("orders")
+
+    def refused(f):
+        try:
+            f()
+        except ValueError as e:
+            return str(e)
+        return None
+
+    unsorted = "a frame has no row order until it is sorted"
+    checks = {
+        "unique(keep='first') on an unsorted frame: refused, saying why": refused(lambda: o.unique("user", keep="first")) == f"unique(keep='first'): {unsorted} (sort it first, or keep='any')",
+        "unique(keep='last') on an unsorted frame: refused, saying why": refused(lambda: o.unique("user", keep="last")) == f"unique(keep='last'): {unsorted} (sort it first, or keep='any')",
+        "unique(keep='x'): refused by name": refused(lambda: o.unique("user", keep="x")) == "unique(keep='x'): any, first, last or none",
+        "unique(maintain_order=True) on an unsorted frame: refused": refused(lambda: o.unique("user", maintain_order=True)) == f"unique(maintain_order=True): {unsorted} (sort it first)",
+        "group_by(maintain_order=True): refused by name": refused(lambda: o.group_by("user", maintain_order=True))
+            == "group_by(maintain_order=True): groups come in no particular order here; sort the result by its keys (.sort(...))",
+        "group_by(maintain_order=False): as it always was": o.group_by("user", maintain_order=False).len().select(pondra.len()).item() == 40,
+    }
+    # (keep='any' with maintain_order on a sorted frame has no Polars answer to compare with: one row per user,
+    # the first of each in the sort, in the sort's order)
+    first_id = {}
+    for r in o.select("id", "user").sort("id").rows():
+        first_id.setdefault(r["user"], r["id"])
+    got = o.sort(["user", "id"]).select("id", "user").unique("user", maintain_order=True).rows()
+    checks["unique(maintain_order=True) on a sorted frame: one row per value, the first in the sort"] = [r["id"] for r in got] == [first_id[u] for u in sorted(first_id)]
+    return checks
+
+
 def _made_again(con, name):
     """Is `name` a materialized view? Making another under its name says it exists already; a
     stored view of that name is refused as one ("is a (stored) view")."""
@@ -398,10 +445,13 @@ def main():
         print(json.dumps({"files": filed}, ensure_ascii=False), flush=True)
         fixed = found(con, tmp)
         print(json.dumps({"found": fixed}, ensure_ascii=False), flush=True)
+        held = keeps(con)
+        print(json.dumps({"keeps": held}, ensure_ascii=False), flush=True)
         kept.update(fixed)
         kept.update(wrote)
         kept.update(named)
         kept.update(filed)
+        kept.update(held)
         ok = all(results.values()) and all(v is True for v in ways.values()) and all(kept.values())
         print(json.dumps({"pipelines_equal": sum(results.values()), "pipelines": len(results), "ways_equal": sum(v is True for v in ways.values()), "ways": len(ways), "ok": ok}))
         sys.exit(0 if ok else 1)

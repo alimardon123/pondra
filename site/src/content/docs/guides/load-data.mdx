@@ -160,7 +160,7 @@ buckets, on HTTPS and in other engines' tables are in [Files and other lakes](/p
 
 <Aside type="caution">
 A node started with `pondra serve` never reads its own disk for a client's SQL, whoever asks: it refuses
-`FROM 'more.csv'` with "a file on the node's machine". Only the program that started a node (the shell,
+`FROM 'more.csv'` with "a path on the server's own disk". Only the program that started a node (the shell,
 `local()` in Python or JavaScript) and `pondra sql` read your files.
 </Aside>
 

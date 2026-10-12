@@ -4,7 +4,7 @@
 //! A table's Parquet files already live in `data/{table}/`; this keeps that folder's
 //! `_delta_log/` in step with the catalog: one JSON commit per change to the table's file list,
 //! plus a Parquet checkpoint every 10 commits so readers never replay a long log; the last 100
-//! versions are kept.
+//! versions are kept (`HISTORY`).
 //!
 //! The catalog stays the source of truth: a commit is derived only from what the catalog has
 //! already committed, so a crash can at worst leave the Delta log one step behind.

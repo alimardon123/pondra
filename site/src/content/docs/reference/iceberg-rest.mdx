@@ -52,7 +52,9 @@ version for up to `--tier-secs`. `POST /tier` (with the admin token) writes the 
 |---|---|
 | `GET /v1/config` | the catalog's settings and the list of endpoints it serves. Clients read it to know what to ask for |
 | `GET /v1/namespaces` | every namespace |
+| `POST /v1/namespaces` | make one, as `CREATE SCHEMA` does, in this database (an attached one's are made by its own nodes). A property other than `owner` is refused, since a schema keeps none. `409 AlreadyExistsException` if it is there |
 | `GET`, `HEAD /v1/namespaces/{ns}` | one namespace. `404 NoSuchNamespaceException` if there is none |
+| `DELETE /v1/namespaces/{ns}` | `DROP SCHEMA`. `204`; `409 NamespaceNotEmptyException` while it holds anything |
 | `GET /v1/namespaces/{ns}/tables` | the tables of a namespace that publish Iceberg |
 | `GET`, `HEAD /v1/namespaces/{ns}/tables/{table}` | load a table: `metadata-location`, the current metadata, and `config`. `404 NoSuchTableException` if there is none |
 | `POST /v1/namespaces/{ns}/tables/{table}` | commit an append or a change of rows. See [appending](#appending) |
@@ -63,13 +65,8 @@ version for up to `--tier-secs`. `POST /tier` (with the admin token) writes the 
 
 The paths have no prefix: `/v1/namespaces`, not `/v1/{prefix}/namespaces`. `GET /v1/config` names
 the endpoints as the REST specification writes them, with `{prefix}`, and sets no prefix, so an engine
-calls the paths above. These are refused, each with a `400 BadRequestException` whose message names
-the SQL that does it:
-
-| Request | Do this in Pondra's SQL |
-|---|---|
-| `POST /v1/namespaces` | `CREATE SCHEMA` |
-| `DELETE /v1/namespaces/{ns}` | `DROP SCHEMA` |
+calls the paths above. Each runs as the SQL it stands for, with the caller's rights: making and dropping
+namespaces and tables is an admin's.
 
 Errors come in the REST API's shape, `{"error": {"message": …, "type": …, "code": …}}`, with the
 status the table gives. The sign-in and route checks answer first, as plain text: no token or a wrong

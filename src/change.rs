@@ -236,16 +236,10 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
     let stored: TableMeta = lake.cat.get(&table_key(&table)).await?.with_context(|| format!("no table {table}"))?;
     let meta = stored.logical(); // (the change's SQL names columns as SQL knows them: ADR-022)
     let view = lake.cat.get::<crate::views::View>(&crate::views::view_key(&table)).await?;
-    ensure!(view.is_none() && meta.merge.is_empty(), "{table} is a view's: change the table it follows");
+    ensure!(view.is_none(), "{table} is a view's: change the table it follows");
+    if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", format!("{table} is a merge table: its rows add up as they're read, so UPDATE and DELETE aren't taken; insert rows that add up to the change"))); }
     let append = meta.key.is_empty();
-    ensure!(meta.ids || !append, "{table} holds rows from before row ids (made before Pondra 0.19): copy it once (CREATE TABLE t2 AS SELECT * FROM {table}) and change the copy");
-    if !matches!(stmt, crate::write::Stmt::Insert(..)) {
-        // (an INSERT takes no row back: what follows the table takes its rows as any write's)
-        crate::views::can_follow(lake, &table, append).await?;
-        if let Some(v) = crate::views::filling(lake, &table).await? {
-            bail!("materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"); // (it reads them as they were)
-        }
-    }
+    ensure!(meta.ids || !append, "{table} was made before Pondra 0.19, and its rows have no row ids, which UPDATE, DELETE and MERGE need: copy it once (CREATE TABLE t2 AS SELECT * FROM {table}) and change the copy");
     let upto = lake.visible(); // (one snapshot for every query below: the lock keeps its files)
     let point = match &stmt {
         crate::write::Stmt::Update(_, set, Some(cond)) if !append => crate::txn::point_change(lake, &table, &stored, None, set, cond).await?, // (one key: no planning, ADR-036 §6)
@@ -255,6 +249,19 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
         Some(p) => p,
         None => rows_of(lake, &table, &meta, &stmt, upto).await?,
     };
+    // Only a change that takes rows back asks what follows the table: one of no rows is answered as
+    // Postgres does (DELETE 0), and one that only adds rows (an INSERT, a MERGE that matched none)
+    // is followed as any write's rows are. (dbt deletes a model's matching keys on every run.)
+    let takes_back = old.iter().any(|b| b.num_rows() > 0);
+    if !takes_back && new.iter().all(|b| b.num_rows() == 0) {
+        return Ok(j!({"rows": 0}));
+    }
+    if takes_back {
+        crate::views::can_follow(lake, &table, append).await?;
+        if let Some(v) = crate::views::filling(lake, &table).await? {
+            bail!("materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"); // (it reads them as they were)
+        }
+    }
     commit(lake, seq, &table, &stored, old, new, job).await
 }
 
@@ -303,7 +310,8 @@ async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)
     if let Some(set) = set {
         items.extend(cols.iter().map(|c| match set.iter().find(|(s, _)| s == *c) {
             Some((_, e)) => format!("({e}) AS {}", q(&format!("__n_{c}"))),
-            None if *c == "_deleted" => format!("false AS {}", q("__n__deleted")), // (a keyed table's row stays)
+            // (an unchanged column keeps the row's own value: a keyed table's `_deleted` too, so an
+            // updated row isn't marked deleted, and rows not deleted keep NULL)
             None => format!("{a}.{} AS {}", q(c), q(&format!("__n_{c}"))),
         }));
     }

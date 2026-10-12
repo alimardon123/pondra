@@ -21,18 +21,19 @@ Or let your code start one for you, in the background, and stop it when you're d
   <TabItem label="Python">
     ```python norun
     import pondra
-    db = pondra.local("lake")   # starts a node on ./lake
+    db = pondra.local("lake", port=8080)   # starts a node on ./lake, at localhost:8080
     ```
   </TabItem>
   <TabItem label="JavaScript">
     ```js norun
     import { local } from "pondra";
-    const db = await local("lake");
+    const db = await local("lake", { port: 8080 });   // a node on ./lake, at localhost:8080
     ```
   </TabItem>
 </Tabs>
 
-The examples below talk to a node at `localhost:8080`. Open `http://localhost:8080` in a browser and
+Without a port, `local()` takes a free one, and `db` already talks to it. The examples below talk to
+a node at `localhost:8080`. Open `http://localhost:8080` in a browser and
 you get [the console](/pondra/start/console/): the lake's tables, and cells for SQL and Python.
 
 ## Make a table and write rows

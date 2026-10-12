@@ -458,7 +458,7 @@ pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
 
 fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
     match scheme(u).filter(|s| *s != "file") {
-        None => bail!("{u} is a file on the node's machine: only the program that started the node (the shell, local()) reads those"),
+        None => bail!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `local()`): read it there, or from a bucket (s3://, gs://, az://, https://)"),
         Some(_) => ensure!(covering(secrets, u).is_some(), "{}", uncovered(u)),
     }
     Ok(())

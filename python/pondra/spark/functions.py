@@ -28,7 +28,7 @@ def expr(sql):
 def _f(name, *cols, sql=None, label=None):
     cs = [c if isinstance(c, Column) else _col(c) for c in cols]
     inner = ", ".join(c.sql for c in cs)
-    return Column(f"{sql or name}({inner})", label or f"{name}({', '.join(c.name for c in cs)})")
+    return Column(f"{sql or name}({inner})", label or f"{name}({', '.join(c._name for c in cs)})")
 
 
 def udf(f=None, returnType="string", *, useArrow=None):
@@ -83,7 +83,7 @@ def count(c):
 
 def countDistinct(c, *more):
     cs = [x if isinstance(x, Column) else _col(x) for x in (c, *more)]
-    return Column(f"count(DISTINCT {', '.join(x.sql for x in cs)})", f"count(DISTINCT {', '.join(x.name for x in cs)})")
+    return Column(f"count(DISTINCT {', '.join(x.sql for x in cs)})", f"count(DISTINCT {', '.join(x._name for x in cs)})")
 
 
 count_distinct = countDistinct
@@ -102,11 +102,19 @@ def max(c):  # noqa: A001
 
 
 def first(c, ignorenulls=False):
-    return _f("first", c, sql="first_value")
+    return _first_last("first", "first_value", c, ignorenulls)
 
 
 def last(c, ignorenulls=False):
-    return _f("last", c, sql="last_value")
+    return _first_last("last", "last_value", c, ignorenulls)
+
+
+def _first_last(name, sql, c, ignorenulls):
+    """PySpark's first and last: `ignorenulls` skips NULLs (`IGNORE NULLS`). Its name has no flag,
+    as PySpark's has none either."""
+    x = c if isinstance(c, Column) else _col(c)
+    skip = " IGNORE NULLS" if ignorenulls else ""
+    return Column(f"{sql}({x.sql}){skip}", f"{name}({x._name})")
 
 
 def stddev(c):
@@ -127,7 +135,7 @@ def abs(c):  # noqa: A001
 
 def round(c, scale=0):  # noqa: A001
     x = c if isinstance(c, Column) else _col(c)
-    return Column(f"round({x.sql}, {int(scale)})", f"round({x.name}, {int(scale)})")
+    return Column(f"round({x.sql}, {int(scale)})", f"round({x._name}, {int(scale)})")
 
 
 def sqrt(c):
@@ -138,13 +146,21 @@ def exp(c):
     return _f("EXP", c, sql="exp")
 
 
-def log(c):
-    return _f("ln", c)
+def log(arg1, arg2=None):
+    """PySpark's log: `log(c)` is the natural log, `log(base, c)` the log in `base`, a float (`2.0`,
+    as PySpark takes it). A value of 0 or less is NULL, as Spark answers it, not -inf or NaN."""
+    if arg2 is None:
+        x = _col(arg1)
+        return Column(f"CASE WHEN {x.sql} > 0 THEN ln({x.sql}) END", f"ln({x._name})")
+    if not isinstance(arg1, float):
+        raise TypeError("log(base, c): the base is a float, as PySpark takes it (2.0, not 2)")
+    x = _col(arg2)
+    return Column(f"CASE WHEN {x.sql} > 0 THEN log({_lit(arg1).sql}, {x.sql}) END", f"LOG({arg1}, {x._name})")
 
 
 def pow(c, p):  # noqa: A001
     x, y = (v if isinstance(v, Column) else _lit(v) if not isinstance(v, str) else _col(v) for v in (c, p))
-    return Column(f"power({x.sql}, {y.sql})", f"POWER({x.name}, {y.name})")
+    return Column(f"power({x.sql}, {y.sql})", f"POWER({x._name}, {y._name})")
 
 
 def floor(c):
@@ -188,49 +204,74 @@ def rtrim(c):
 
 
 def substring(c, pos, length):
-    x = _col(c) if isinstance(c, str) else c
-    return Column(f"substr({x.sql}, {int(pos)}, {int(length)})", f"substring({x.name}, {pos}, {length})")
+    x = _col(c)
+    return Column(f"substr({x.sql}, {int(pos)}, {int(length)})", f"substring({x._name}, {pos}, {length})")
 
 
 def concat(*cols):
     """Null if any part is (PySpark's), unlike SQL's concat()."""
     cs = [c if isinstance(c, Column) else _col(c) for c in cols]
-    return Column("(" + " || ".join(c.sql for c in cs) + ")", f"concat({', '.join(c.name for c in cs)})")
+    return Column("(" + " || ".join(c.sql for c in cs) + ")", f"concat({', '.join(c._name for c in cs)})")
 
 
 def concat_ws(sep, *cols):
     cs = [c if isinstance(c, Column) else _col(c) for c in cols]
-    return Column(f"concat_ws({_lit(sep).sql}, {', '.join(c.sql for c in cs)})", f"concat_ws({sep}, {', '.join(c.name for c in cs)})")
+    return Column(f"concat_ws({_lit(sep).sql}, {', '.join(c.sql for c in cs)})", f"concat_ws({sep}, {', '.join(c._name for c in cs)})")
 
 
 def regexp_replace(c, pattern, replacement):
-    x = _col(c) if isinstance(c, str) else c
-    return Column(f"regexp_replace({x.sql}, {_lit(pattern).sql}, {_lit(replacement).sql}, 'g')", f"regexp_replace({x.name}, {pattern}, {replacement}, 1)")
+    x = _col(c)
+    return Column(f"regexp_replace({x.sql}, {_lit(pattern).sql}, {_lit(replacement).sql}, 'g')", f"regexp_replace({x._name}, {pattern}, {replacement}, 1)")
 
 
 def regexp_extract(c, pattern, idx):
-    x = _col(c) if isinstance(c, str) else c
-    return Column(f"coalesce((regexp_match({x.sql}, {_lit(pattern).sql}))[{int(idx)}], '')", f"regexp_extract({x.name}, {pattern}, {idx})")
+    """PySpark's regexp_extract: group `idx` of the first match, '' when there is no match or the
+    group took no part, and NULL for a NULL. Group 0 is the whole match: the pattern goes in one more
+    group, which regexp_match then gives first."""
+    x = _col(c)
+    group, pat = int(idx), pattern
+    if group == 0:
+        group, pat = 1, f"({pattern})"
+    got = f"coalesce((regexp_match({x.sql}, {_lit(pat).sql}))[{group}], '')"
+    return Column(f"CASE WHEN {x.sql} IS NULL THEN NULL ELSE {got} END", f"regexp_extract({x._name}, {pattern}, {idx})")
 
 
-def split(c, pattern):
-    x = _col(c) if isinstance(c, str) else c
-    return Column(f"string_to_array({x.sql}, {_lit(pattern).sql})", f"split({x.name}, {pattern}, -1)")
+def split(c, pattern, limit=-1):
+    """PySpark's split: `pattern` is a regular expression, and a `limit` above 0 keeps that many parts,
+    the last one holding the rest of the text. DataFusion has no regex split, so each match is marked
+    with U+0001 and the text cut there. A text that already holds U+0001 is an error (the CAST below
+    fails with its message), never a cut in the wrong place."""
+    x = _col(c)
+    pat = _lit(pattern).sql
+    checked = (f"CASE WHEN CAST(CASE WHEN strpos({x.sql}, chr(1)) > 0 THEN 'split: text holds U+0001' ELSE '0' END AS INT) = 0 "
+               f"THEN {x.sql} END")
+    cut = f"string_to_array(regexp_replace({checked}, {pat}, chr(1), 'g'), chr(1))"
+    n = int(limit)
+    if n <= 0:
+        sql = f"CASE WHEN {x.sql} = '' THEN make_array('') ELSE {cut} END"
+    else:
+        # (each match marked on both sides, so the parts after the (n-1)th match, joined back with
+        # their marks gone, are the rest of the text, separators and all)
+        marked = f"string_to_array(regexp_replace({checked}, {_lit('(' + pattern + ')').sql}, chr(1) || '$1' || chr(1), 'g'), chr(1))"
+        rest = f"array_to_string(array_slice({marked}, {2 * n - 1}, CAST(array_length({marked}) AS BIGINT)), '')"
+        sql = (f"CASE WHEN {x.sql} = '' THEN make_array('') WHEN array_length({cut}) > {n} "
+               f"THEN array_append(array_slice({cut}, 1, {n - 1}), {rest}) ELSE {cut} END")
+    return Column(sql, f"split({x._name}, {pattern}, {n})")
 
 
 def date_trunc(fmt, c):
-    x = _col(c) if isinstance(c, str) else c
-    return Column(f"date_trunc({_lit(fmt.lower()).sql}, {x.sql})", f"date_trunc({fmt}, {x.name})")
+    x = _col(c)
+    return Column(f"date_trunc({_lit(fmt.lower()).sql}, {x.sql})", f"date_trunc({fmt}, {x._name})")
 
 
 def to_date(c, fmt=None):
-    x = _col(c) if isinstance(c, str) else c
-    return Column(f"to_date({x.sql})" if fmt is None else f"to_date({x.sql}, {_lit(_chrono(fmt)).sql})", f"to_date({x.name})")
+    x = _col(c)
+    return Column(f"to_date({x.sql})" if fmt is None else f"to_date({x.sql}, {_lit(_chrono(fmt)).sql})", f"to_date({x._name})")
 
 
 def to_timestamp(c, fmt=None):
-    x = _col(c) if isinstance(c, str) else c
-    return Column(f"to_timestamp({x.sql})" if fmt is None else f"to_timestamp({x.sql}, {_lit(_chrono(fmt)).sql})", f"to_timestamp({x.name})")
+    x = _col(c)
+    return Column(f"to_timestamp({x.sql})" if fmt is None else f"to_timestamp({x.sql}, {_lit(_chrono(fmt)).sql})", f"to_timestamp({x._name})")
 
 
 def _chrono(fmt):
@@ -241,7 +282,7 @@ def _chrono(fmt):
 
 
 def _part(name, part, plus=""):
-    return lambda c: Column(f"CAST(date_part('{part}', {(_col(c) if isinstance(c, str) else c).sql}){plus} AS INT)", f"{name}({(_col(c) if isinstance(c, str) else c).name})")
+    return lambda c: Column(f"CAST(date_part('{part}', {(_col(c)).sql}){plus} AS INT)", f"{name}({(_col(c))._name})")
 
 
 year, month, dayofmonth, hour, minute, second = (_part(n, p) for n, p in (("year", "year"), ("month", "month"), ("dayofmonth", "day"), ("hour", "hour"), ("minute", "minute"), ("second", "second")))
@@ -249,13 +290,13 @@ dayofweek = _part("dayofweek", "dow", " + 1")  # (Sunday = 1)
 
 
 def datediff(end, start):
-    e, s = (_col(x) if isinstance(x, str) else x for x in (end, start))
-    return Column(f"CAST(CAST({e.sql} AS DATE) - CAST({s.sql} AS DATE) AS INT)", f"datediff({e.name}, {s.name})")
+    e, s = (_col(x) for x in (end, start))
+    return Column(f"CAST(CAST({e.sql} AS DATE) - CAST({s.sql} AS DATE) AS INT)", f"datediff({e._name}, {s._name})")
 
 
 def date_add(c, days):
-    x = _col(c) if isinstance(c, str) else c
-    return Column(f"CAST(CAST({x.sql} AS DATE) + INTERVAL '{int(days)} days' AS DATE)", f"date_add({x.name}, {days})")
+    x = _col(c)
+    return Column(f"CAST(CAST({x.sql} AS DATE) + INTERVAL '{int(days)} days' AS DATE)", f"date_add({x._name}, {days})")
 
 
 def date_sub(c, days):
@@ -291,15 +332,15 @@ def dense_rank():
 
 
 def lag(c, offset=1, default=None):
-    x = _col(c) if isinstance(c, str) else c
+    x = _col(c)
     d = "" if default is None else f", {_lit(default).sql}"
-    return Column(f"lag({x.sql}, {int(offset)}{d})", f"lag({x.name}, {offset}, {default})")
+    return Column(f"lag({x.sql}, {int(offset)}{d})", f"lag({x._name}, {offset}, {default})")
 
 
 def lead(c, offset=1, default=None):
-    x = _col(c) if isinstance(c, str) else c
+    x = _col(c)
     d = "" if default is None else f", {_lit(default).sql}"
-    return Column(f"lead({x.sql}, {int(offset)}{d})", f"lead({x.name}, {offset}, {default})")
+    return Column(f"lead({x.sql}, {int(offset)}{d})", f"lead({x._name}, {offset}, {default})")
 
 
 def broadcast(df):
