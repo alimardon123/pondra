@@ -1633,6 +1633,13 @@ pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<
 }
 
 async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
+    if let Some(cmd) = crate::cursors::of(sql) {
+        // DECLARE, FETCH, MOVE, CLOSE: the session's cursors (cursors.rs). Before the script's check: DECLARE reads as one.
+        return Ok(match crate::cursors::run(app, cmd?, who.role).await? {
+            crate::cursors::Answer::Rows(batches) => Outcome::Rows(batches),
+            crate::cursors::Answer::Tag(tag) => Outcome::Done(j!({"command": tag})),
+        });
+    }
     if crate::script::is(sql) {
         return Box::pin(crate::script::run(app, sql, &HashMap::new(), who, job)).await; // (a block, a branch, a loop, PRINT…: ADR-045)
     }
