@@ -81,7 +81,7 @@ def binary(v, url, cache):
     path = os.path.join(cache, v, exe)
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        data = urllib.request.urlopen(url, timeout=600).read()
+        data = fetched(url)
         with tarfile.open(fileobj=io.BytesIO(data)) as t:
             member = next(m for m in t.getmembers() if os.path.basename(m.name) == exe and m.isfile())
             with open(path + ".part", "wb") as f:
@@ -89,6 +89,18 @@ def binary(v, url, cache):
         os.chmod(path + ".part", 0o755)
         os.replace(path + ".part", path)
     return path
+
+
+def fetched(url):
+    """A release's package, asked again when GitHub's download answers a server error or the
+    connection fails (a 500 there once failed the upgrade job half way, its lakes all fine)."""
+    for wait in (2, 4, 8, 16, None):
+        try:
+            return urllib.request.urlopen(url, timeout=600).read()
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+            if wait is None or (isinstance(e, urllib.error.HTTPError) and e.code < 500):
+                raise
+            time.sleep(wait)
 
 
 # ---------------------------------------------------------------- a node
