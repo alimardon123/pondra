@@ -155,7 +155,7 @@ pub(crate) enum Cmd {
         #[arg(long)]
         attach_found: Option<String>,
         /// Stop, as on Ctrl-C, when standard input closes: when the program that started this
-        /// node ends, however it ends (`pondra.local()` in Python and JavaScript, the shell).
+        /// node ends, however it ends (a node `connect()` starts beside a Python or JavaScript program, the shell).
         #[arg(long)]
         stop_with_stdin: bool,
         /// Run Python functions and procedures (`LANGUAGE python`) with this Python, which has the

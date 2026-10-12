@@ -421,7 +421,7 @@ To keep a name for files instead of spelling the reader out each time, see
 [`CREATE EXTERNAL TABLE`](/pondra/sql/statements/#external-tables).
 
 A path on the node's machine is read only by the program that started the node: the shell,
-`pondra.local()` or `pondra sql`. A query over HTTP is refused.
+`pondra.connect("lake")` or `pondra sql`. A query over HTTP is refused.
 
 ```bash
 printf 'id,name\n1,tea\n2,cake\n' > sales.csv
@@ -429,7 +429,7 @@ printf 'id,name\n1,tea\n2,cake\n' > sales.csv
 
 ```python
 import pondra
-db = pondra.local("scratch")
+db = pondra.connect("scratch")
 print(db.sql("SELECT * FROM read_csv('sales.csv', header => true) ORDER BY id").rows())
 db.close()
 ```

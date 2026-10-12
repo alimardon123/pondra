@@ -60,22 +60,36 @@ The code assumes one node per process. An audit of `src/` (2026-10-11) found wha
    compactor's failure and the format watch (invariant 207) do the same. No signal handlers, no
    standard input.
 6. **One C ABI for every language** (`pondra_lib`): `pondra_open(options_json)`,
-   `pondra_request(handle, method, path, headers, body)`, `pondra_free`, `pondra_close`,
-   `pondra_last_error`, and `pondra_main(argc, argv)` for the launcher. Every entry catches a panic
-   and returns an error (unwinding across `extern "C"` is undefined). The library is never unloaded.
+   `pondra_request(handle, method, path, headers, body)` (started at once), `pondra_wait(answer,
+   wait_ms)` for its head, `pondra_read(answer, piece, wait_ms)` for its body a piece at a time,
+   `pondra_free`, `pondra_close`, `pondra_last_error`, and `pondra_main(argc, argv)` for the launcher.
+   A wait is a slice (2: not yet), so a host sees its own signals between them: Ctrl-C, a notebook's
+   Interrupt; freeing an answer early stops its work, as a client's going does. Every entry catches a
+   panic and returns an error (unwinding across `extern "C"` is undefined). The library is never
+   unloaded.
 7. **A request goes straight to the node's router**, as its owner from 127.0.0.1 (invariant 61), so
-   everything the HTTP API does works in process, with the same checks. Answers that stream (`/live`,
-   the commit stream, big downloads) go to the node's own loopback port, which it opens anyway.
-   That port takes what `local()`'s does today: 127.0.0.1 only, and the owner key for files on the
+   everything the HTTP API does works in process, with the same checks, answers that stream (`/live`,
+   `/watch`, big downloads) included (ADR-072). The node's own loopback port is for what lives outside
+   the host's process: the console in a browser, Python's workers calling back, other processes on
+   the lake. That port takes what `local()`'s did: 127.0.0.1 only, and the owner key for files on the
    machine (invariant 61). A node opened with no tokens is open to that machine's other users, as
-   `local()`'s is; giving `open` a token closes it.
+   `local()`'s was; giving it a token closes it.
+   - **One way in** (ADR-072, from 0.34): `connect(target)` in Python and JavaScript. No target, or
+     `":memory:"`, is a lake in memory; a folder or a bucket's URL is that lake, its node in this
+     process; `http(s)://` is a node somewhere. A process holds one node: the same lake connected again
+     is another connection to it (closed with the last), and another lake, a second memory lake, a
+     fork's child's lake or any lake where the install has no library gets a node beside the process
+     (`pondra serve --stop-with-stdin`, what `local()` started). `local()` and `open()` warn until 1.0.
    - **Python** binds the ABI with `ctypes` (no compiled extension; the call releases the GIL).
-     `pondra.open(path)` returns the same connection `connect()` and `local()` return, so frames,
+     `pondra.connect(path)` returns the same connection a node's URL gives, so frames,
      `db.sql`, `write_table` and the rest work unchanged. Arrow answers go to pyarrow, pandas and
      Polars from the answer's own buffer.
-   - **Node** has no foreign-function interface of its own, so a small addon opens and closes the
-     node (off the event loop) and the client speaks HTTP to its loopback port.
-   - `pondra.open()` with no path, or `":memory:"` as DuckDB spells it, holds its lake in this
+   - **Node** has no foreign-function interface of its own, so the library is a Node-API module too
+     (Node, Bun, Deno): `open` and `close` run off the event loop, and `request`, `read` and `free` run
+     on the library's runtime and come back through one thread-safe function per env, held only while
+     a call waits. The client's `fetch` is the module's: a `Response` whose body is read as the node
+     writes it.
+   - `pondra.connect()` with no path, or `":memory:"` as DuckDB spells it, holds its lake in this
      process's memory: the same lake code over an object store in memory (`memory://<id>`), nothing
      written to disk but what a query spills when memory runs short, let go at `close`. `pondra
      :memory:` and `pondra serve :memory:` are the same from the command line. No other process

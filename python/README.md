@@ -21,7 +21,7 @@ pip install "pondra[arrow]"   # with pyarrow: answers as pandas, Polars and Arro
 import pondra
 from pondra import col
 
-db = pondra.local("lake")    # a node on ./lake, in the background; it stops when Python does
+db = pondra.connect("lake")    # a node on ./lake, in this process; it stops when Python does
 db.sql("CREATE TABLE events (user VARCHAR, amount BIGINT)")
 db.append("events", [{"user": "ann", "amount": 5}, {"user": "bo", "amount": 3}])  # exactly once
 db.sql("SELECT user, sum(amount) AS total FROM events GROUP BY user").to_pandas()

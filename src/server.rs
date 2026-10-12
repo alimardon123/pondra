@@ -456,7 +456,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let cloning = pin && who.access.as_ref().is_some_and(|a| a.clones().is_some());
     if who.role < needed && !cloning {
         return match who.role {
-            crate::auth::Role::None if header.is_none() && app.auth.owned() => (StatusCode::UNAUTHORIZED, "this node answers only the program that started it (the shell, local()): open the console from the link it printed, or start the node with --admin-token to connect other tools").into_response(),
+            crate::auth::Role::None if header.is_none() && app.auth.owned() => (StatusCode::UNAUTHORIZED, "this node answers only the program that started it (the shell, connect()): open the console from the link it printed, or start the node with --admin-token to connect other tools").into_response(),
             crate::auth::Role::None if header.is_none() && !app.auth.on() && crate::users::signed(&app.lake).await => (StatusCode::UNAUTHORIZED, "this lake has been served with tokens: start the node with them (--admin-token, --write-token, --read-token), or sign in as a user").into_response(),
             crate::auth::Role::None => (StatusCode::UNAUTHORIZED, "sign in: a token, or a user's name and password").into_response(),
             _ => {

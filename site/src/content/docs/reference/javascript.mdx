@@ -6,10 +6,11 @@ description: The pondra npm package, with every method of a connection, its argu
 import { Aside } from '@astrojs/starlight/components';
 
 The `pondra` package is a small client for a node's HTTP API. It has no dependencies and runs on
-Node 18 or later, or on any runtime with `fetch`. It is an ES module. `connect` reaches a node that
-is running and returns its connection, a `Pondra` (`new Pondra(url, options)` does the same), and
-`local` starts one on a folder and connects to it. A query is a [frame](#frames), with
-nodejs-polars' names for Python's frames: the same steps send the same SQL text from both clients.
+Node 18 or later, or on any runtime with `fetch`. It is an ES module. `connect` is the one way in: it
+reaches a node that is running, or opens a lake and runs its node inside this process. It returns the
+connection at once, a `Pondra` (`new Pondra(url, options)` does the same for a node). A query is a
+[frame](#frames), with nodejs-polars' names for Python's frames: the same steps send the same SQL text
+from both clients.
 See [names](/pondra/reference/names/).
 
 ```js
@@ -27,23 +28,46 @@ console.log(await db.sql("SELECT 1 AS one"));
 
 | Call | Meaning |
 |---|---|
-| `connect(url = "http://127.0.0.1:8080", { token, user, password, onNotice, retrySecs, ca, fetch })` | a connection to a node, or to any of several (an array of URLs) |
-| `await local(dir = "lake", { port, token, flags, timeout, python, onNotice })` | start a node on a lake here (a folder or `s3://bucket/prefix`) and connect to it |
-| `await open(dir, { token, python, onNotice, ...settings })` | a node on a lake inside this process (Node, Bun, Deno), through the library the package ships: no second process to start. With no `dir`, or `":memory:"` as DuckDB spells it, a lake held in this process's memory: nothing on disk, and gone at `close()`. `settings` are the node's [settings](/pondra/reference/environment/) by name (`memory_gb: 2` is `PONDRA_MEMORY_GB`), fixed by the first open in a process; a misspelt one is refused, naming the nearest. One node at a time in a process |
+| `connect(target, options)` | the one way in: a connection to the lake or node `target` names, with the three kinds below. It returns at once, and `await db.ready` waits for a lake's node |
 | `await binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, or the one npm installed for this platform |
+
+`target` says what to connect to:
+
+- **Nothing, or `":memory:"`** (as DuckDB spells it): a new lake held in this process's memory, gone at `close()`.
+- **A folder, or a bucket's URL** (`s3://`, `gs://`, `az://`): that lake. Its node runs in this process (Node, Bun,
+  Deno), through the library the package ships, so there is no second process to start. Its SQL may read and write
+  files on this machine, and Python's functions and procedures run with a Python here that has the `pondra` package
+  (`python: false`: none). The other options are the node's [settings](/pondra/reference/environment/) by name:
+  `memory_gb: 2` is `PONDRA_MEMORY_GB`, fixed by the first node a process opens.
+- **`http://` or `https://`** (or an array of them, any of a cluster's nodes): a node running somewhere, with the
+  options below.
+
+`connect` answers at once. A lake's node opens meanwhile, and the first call waits for it. `await db.ready` waits
+for it explicitly, and throws why it didn't open. A process holds one such node at a time: the same lake connected
+again is another connection to it, and another lake connected while one is open gets a node of its own beside the
+process. `close()` ends the connection; the node stops with the last one, or when the process ends (`process.exit()`
+too). `local()` and `open()` still work, with a warning, until 1.0.
+
+A connection to a node takes these options:
 
 | Option | Default | Meaning |
 |---|---|---|
 | `token` | none | sent as `Authorization: Bearer …`; the token's role decides what the connection may do |
 | `user`, `password` | none | sign in as a [user](/pondra/guides/security/#users-roles-and-grants) instead: its name and password (or one of its tokens) |
 | `onNotice` | `console.log` | called with each line a procedure printed. `null` keeps them quiet |
-| `port` | a free port | the port `local`'s node listens on (`127.0.0.1`). A port another node holds throws, naming the port; `db.url` is where the node is |
-| `flags` | `[]` | more `pondra serve` options, such as `["--memory-gb", "2"]` |
-| `timeout` | 120 | seconds `local` waits for the node to start. (`timeoutMs` throws, naming `timeout`) |
-| `python` | `true` | give the node a Python, for Python functions and procedures, if this machine has one with the `pondra` package (`--python auto`); `false` for none |
 | `retrySecs` | 60 | how long a call keeps trying while no node answers it (0: once) |
 | `ca` | none | a PEM file of the authority that signs an `https` node's certificate. This process trusts it from the first request, as `NODE_EXTRA_CA_CERTS` would. Node 22.19 or later has the call for it; older Nodes throw, naming the two ways round it |
 | `fetch` | the global `fetch` | a function used in place of it, for TLS of your own (Bun's, an undici `Agent`, Deno's client). It brings its own certificates, so `ca` doesn't apply to it |
+
+A lake takes these options, with its folder or bucket:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `token` | none | sent with the requests, as for a node |
+| `python` | `true` | give the node a Python, for Python functions and procedures, if this machine has one with the `pondra` package (`--python auto`); `false` for none |
+| `port` | a free port | the port the node listens on (`127.0.0.1`), for the console and other programs; `db.url` is where it is once `db.ready` |
+| `onNotice` | `console.log` | called with each line a procedure printed. `null` keeps them quiet |
+| any setting, by name | none | `memory_gb: 2` is `PONDRA_MEMORY_GB`: the node's [settings](/pondra/reference/environment/), fixed by the first node a process opens; a misspelt one is refused, naming the nearest |
 
 Given a cluster's nodes, a connection rides out one going away, as the
 [Python client](/pondra/reference/python/#connect) does: a call no node ran goes to the next node,
@@ -56,15 +80,14 @@ tables, settings, variables), calls go to it alone; if it goes, the next call fa
 const db = connect(["http://10.0.0.1:8080", "http://10.0.0.2:8080", "http://10.0.0.3:8080"]);
 ```
 
-`local` stops its node on `db.close()` or when the process exits, and the lake stays. Because this
-program started the node, its SQL may read and write files on this machine
-(`SELECT * FROM read_csv('jan.csv')`). Its standard error goes to `pondra-<port>.log` in the temp
-folder: a node that doesn't start throws `the node didn't start; its log: <path>`, and the log says why.
+Because this program started the node, its SQL may read and write files on this machine
+(`SELECT * FROM read_csv('jan.csv')`). A node beside this process writes its standard error to `pondra-<port>.log`
+in the temp folder: one that doesn't start throws `the node didn't start; its log: <path>`, and the log says why.
 
 ```js
-import { local } from "pondra";
+import { connect } from "pondra";
 
-const db = await local("scratch");
+const db = connect("scratch", { memory_gb: 2 });
 console.log(await db.sql("SELECT 1 AS one"));
 await db.close();
 ```
@@ -352,7 +375,7 @@ for await (const rows of db.live("SELECT count(*) AS n FROM orders")) {
 | `db.producer`, `db.seq` | the name `append` writes under, and its last sequence number |
 | `db.session` | this connection's session id: its temporary tables and views, and the variables of its `DO LANGUAGE python` blocks, live under it |
 | `db.position` | where the last `live` answer or `watch` batch is as of: a commit, the place to resume from |
-| `db.consoleUrl` | the console in a browser, as this connection. A node `local()` started answers only this program, so the link carries its key (`#key=…`) and works while the node runs: keep it to yourself, as a token |
+| `db.consoleUrl` | the console in a browser, as this connection. A lake's node that `connect()` opened answers only this program, so the link carries its key (`#key=…`) and works while the node runs: keep it to yourself, as a token |
 | `await db.request(method, path, body, type)` | one HTTP request to the node, as the methods above make them. Answers the `fetch` response, and throws on an error status with the text `status: message`; the error's `sqlstate` is Postgres's code for it (`23514`, `40001`…) |
 
 The members are read from the connection. `request` is for a path the methods don't cover:
@@ -383,8 +406,8 @@ null
 ## Close
 
 `await db.close()` takes no argument. It ends the connection's session, so its temporary tables
-and views go, and so do the variables of its `DO LANGUAGE python` blocks. It also stops the node
-`local` started: it waits up to 15 seconds for the node to stop, then kills it.
+and views go, and so do the variables of its `DO LANGUAGE python` blocks. It also stops the lake's
+node once no other connection to it is open; a node beside this process gets 15 seconds to stop, then is killed.
 
 ```js
 import { connect } from "pondra";

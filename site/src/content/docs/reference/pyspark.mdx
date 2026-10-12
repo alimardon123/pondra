@@ -37,7 +37,7 @@ orders.write.mode("overwrite").saveAsTable("orders")
 | `spark.catalog.tableExists(name)` | `True` or `False` |
 | `spark.catalog.dropTempView(name)` | forgets a temporary view. `True` if there was one |
 | `spark.read`, `spark.udf` | the readers of files and the Python functions: see [Readers](#readers) and [Python functions](/pondra/guides/pyspark/#python-functions) |
-| `spark.stop()` | ends the session. A session from `local()` also stops the node it started; a remote one leaves its node running. It is the last example on this page |
+| `spark.stop()` | ends the session. A session on a lake opened here also closes its connection, and the node stops with the last one; a remote one leaves its node running. It is the last example on this page |
 
 ```python
 print(spark.catalog.tableExists("orders"), spark.catalog.tableExists("nope"))
@@ -501,7 +501,7 @@ print(o.select("id", "qty").orderBy(F.asc("qty"), F.desc("id")).collect())
 
 ```python
 import pondra
-here = SparkSession(pondra.local("pyspark-files"))   # files are written on this machine, so this session is started here
+here = SparkSession(pondra.connect("pyspark-files"))   # files are written on this machine, so this session is started here
 menu = here.createDataFrame([(1, "tea", 3.5), (2, "cake", 4.5)], ["id", "item", "price"])
 menu.write.mode("overwrite").option("header", True).csv("menu_csv")
 menu.write.mode("overwrite").option("compression", "snappy").parquet("menu_parquet")
@@ -666,7 +666,7 @@ False BIGINT VARCHAR
 
 ## Ending the session
 
-`spark.stop()` ends the session. This page's session is a remote one, so its node keeps running; a session from `local()` stops its node too. Nothing after it on this page uses a session.
+`spark.stop()` ends the session. This page's session is a remote one, so its node keeps running; a session on a lake opened here stops its node too. Nothing after it on this page uses a session.
 
 ```python
 spark.stop()

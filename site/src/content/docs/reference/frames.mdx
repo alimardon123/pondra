@@ -294,7 +294,7 @@ print(top_rows.to_pandas().shape, top_rows.to_polars().height)
 writers. For the files, `mode` is `"append"` or `"overwrite"`; without it the folder must be empty.
 For Delta and Iceberg, `mode` is `"error"` (refuse if the folder holds a table), `"append"`,
 `"overwrite"` or `"ignore"`. A path on this machine is written only by a node that
-`pondra.local` started; a URL needs an admin token and a secret.
+`pondra.connect` opened here; a URL needs an admin token and a secret.
 
 `update`, `delete` and `merge` change a table, so call them on `db.table(name)`. The `merge`
 builder has these steps, then `run()`:
@@ -334,10 +334,10 @@ print(copy.sort("id").select("id", "qty", "amount").rows())
 ```
 
 A write takes a path, a folder or a name. Files are written on this machine, so this example uses a
-connection that `pondra.local` started here, which the node's own program owns:
+connection that `pondra.connect` opened here, which the node's own program owns:
 
 ```python
-here = pondra.local("frame-files")
+here = pondra.connect("frame-files")
 menu = here.sql("SELECT * FROM (VALUES (1, 'tea'), (2, 'cake')) AS t(id, item)")
 menu.write_parquet("menu.parquet")
 menu.write_csv("menu.csv")

@@ -1,12 +1,12 @@
 // Pondra from JavaScript: SQL, exactly-once appends, key lookups and change feeds, over a node's
 // HTTP API. No dependencies (Node 18+, or any runtime with fetch: the client runs in browsers, Deno
-// and Bun too; `local` and `binary` need Node, `open` needs Node, Bun or Deno (it loads the library with
-// `process.dlopen`), and they load their modules when they are called).
+// and Bun too; a lake connected here needs Node, Bun or Deno (its node loads the library with
+// `process.dlopen`), and its modules load when it is connected).
 //
-//   import { local, open, connect } from "pondra";
-//   const db = await local("lake");                 // a node on ./lake, here; or
-//   const db = await open("lake");                  // the same node, run in this process (no second one); or
-//   const db = connect("http://127.0.0.1:8080");    // one running somewhere
+//   import { connect } from "pondra";
+//   const db = connect();                           // a lake in memory, in this process; or
+//   const db = connect("lake");                     // ./lake (or s3://bucket/prefix), its node in this process; or
+//   const db = connect("http://127.0.0.1:8080");    // a node running somewhere
 //   await db.sql("CREATE TABLE events (user VARCHAR, amount BIGINT)");
 //   await db.append("events", [{ user: "ann", amount: 5 }]);
 //   console.log(await db.sql("SELECT user, sum(amount) AS total FROM events WHERE amount > $min GROUP BY user", { min: 1 }));
@@ -142,6 +142,7 @@ export class Pondra {
    * unrun, hands it to the next of `urls`; one that may have run it does so only if `again` (it
    * can't be applied twice: GETs unless said otherwise), until `retrySecs` have passed. */
   async request(method, path, body, type, again = method === "GET") {
+    if (this.ready) await this.ready; // (a lake connect() is still opening: its node first)
     if (this.ca) await (this.trusting ??= trustCa(this.ca)); // (the CA file, read and trusted once for this connection)
     const headers = { "x-pondra-session": this.session, ...(this.token ? { authorization: `Bearer ${this.token}` } : this.basic && { authorization: this.basic }), ...(type && { "content-type": type }), ...(this.owner && { "x-pondra-owner": this.owner }) };
     const deadline = Date.now() + this.retrySecs * 1000;
@@ -171,7 +172,7 @@ export class Pondra {
         this.held = null;
         throw Object.assign(new Error(`the node holding this connection's session (${url}) is gone, and its transaction, temporary tables, settings and variables with it; what was sent to it last may or may not have been applied (${error.message})`), { sqlstate: GONE, cause: error });
       }
-      if (Date.now() > deadline || (this.process && (this.process.exitCode !== null || this.process.signalCode !== null))) throw error; // (out of time, or the node `local()` started has stopped)
+      if (Date.now() > deadline || (this.process && (this.process.exitCode !== null || this.process.signalCode !== null))) throw error; // (out of time, or the node `connect()` started beside this process has stopped)
       this.url = this.urls[(this.urls.indexOf(url) + 1) % this.urls.length];
       if (tried % this.urls.length === 0) { // (each node tried once: a moment before the next round)
         await sleep(Math.max(0, Math.min(wait, deadline - Date.now())));
@@ -450,25 +451,26 @@ export class Pondra {
     }
   }
 
-  /** The console, in a browser, as this connection. A node `local()` started answers only its
+  /** The console, in a browser, as this connection. A node `connect()` started answers only its
    *  program, so the link carries its key (`#key=…`); the page keeps it for its tab, and it works
    *  while the node runs. Keep it to yourself, as a token. */
   get consoleUrl() {
     return this.owner ? `${this.url}/#key=${this.owner}` : `${this.url}/`;
   }
 
-  /** End this connection's session (its temporary tables and views), then stop the node it reaches:
-   * `local()`'s, by closing its input (it hands the lake on at once), on every OS; it would stop the same way
-   * if this process were killed. It waits up to 15 seconds for that node to stop, then kills it. A node
-   * `open()` made in this process is closed instead: drained, its term given back, and a lake in memory
-   * let go. Takes no argument. */
+  /** End this connection's session (its temporary tables and views), then close the node `connect()` started
+   * for it. In this process, once no other connection to it is open: drained, its term given back, and a lake
+   * in memory let go. Beside this process, by closing its input (it hands the lake on at once), on every OS; it
+   * would stop the same way if this process were killed. It waits up to 15 seconds for that node to stop, then
+   * kills it. Takes no argument. */
   async close(...more) {
     if (more.length) throw new Error("close() takes no argument");
+    if (this.ready && !(await this.ready.then(() => true, () => false))) return; // (its node never opened: nothing to close)
     const retrySecs = this.retrySecs;
     this.retrySecs = 0; // (a node that's gone isn't waited for here)
     await this.request("DELETE", `/sessions/${this.session}`).catch(() => {});
     this.retrySecs = retrySecs;
-    if (this.opened) { // (a node open() made here: a second close() finds nothing to stop)
+    if (this.opened) { // (a node in this process: a second close() finds nothing to let go)
       const opened = this.opened;
       this.opened = null;
       this.retrySecs = 0; // (a closed node refuses at once)
@@ -485,39 +487,122 @@ export class Pondra {
   }
 }
 
-export const connect = (url, options) => new Pondra(url, options);
+/** The one way in to Pondra. `target` is:
+ * - none, or ":memory:" as DuckDB spells it: a new lake in this process's memory, gone at `close()`;
+ * - a folder, or a bucket's URL (s3://, gs://, az://): that lake;
+ * - "http://…" or "https://…" (or an array of them: any of a cluster's nodes): a node running somewhere, and
+ *   `options` are the connection's (`token`, `user`, `password`, `ca`, `fetch`, `retrySecs`, `onNotice`).
+ * A lake's node runs in this process, through the library (Node, Bun, Deno): its SQL may read files on this
+ * machine, Python's functions and procedures run with a Python here that has the `pondra` package (`python:
+ * false`: none), it listens on 127.0.0.1 at `port` (any free one if none: the console's, and other programs'),
+ * and the other options are its settings by name (`memory_gb: 2` is PONDRA_MEMORY_GB). A process
+ * holds one such node, and the same lake connected again is another connection to it. Another lake connected
+ * while it is open gets a node of its own beside this process, which stops with it; so does every lake where
+ * this install has no library. It answers at once: the node opens meanwhile, and the first call waits for it
+ * (`await db.ready` waits, and throws why if it didn't open). It is closed with `close()`, or when this process
+ * ends (`process.exit()` too). */
+export function connect(target, options = {}) {
+  if (Array.isArray(target) || /^https?:\/\//.test(target ?? "")) return new Pondra(target, options);
+  const { token, python = true, port, onNotice, ...settings } = options;
+  const db = new Pondra("http://127.0.0.1", { token, ...(onNotice !== undefined && { onNotice }) });
+  const go = () => opening(db, target ?? ":memory:", { python, port }, settings);
+  db.ready = turn = turn.then(go, go);
+  db.ready.catch(() => {}); // (not unhandled: the first call, or `ready`, says why)
+  return db;
+}
 
-/** Start a node on a lake here — a folder, or s3://bucket/prefix — and connect to it. It stops
- * when this process exits, or with `close()`; the lake stays. Its SQL may read files on this
- * machine (`SELECT * FROM 'jan.csv'`), as DuckDB's may; its Python functions and procedures run
- * with a Python here that has the `pondra` package, if there is one (`python: false`: none).
- * `timeout`: seconds to wait for the node to start (120), as Python's `local(timeout=120)`. Its
- * standard error goes to `pondra-<port>.log` in the temp folder: a node that doesn't start says where. */
-export async function local(dir = "lake", { port, token, flags = [], timeout = 120, python = true, onNotice, timeoutMs } = {}) {
-  if (timeoutMs !== undefined) throw new Error("local({ timeoutMs }): it is { timeout } now, in seconds, as Python's");
+// The node this process holds (one at a time: ADR-061) and the connections open to it, and the lakes'
+// openings and closings one after another, so two connect()s at once agree on who holds what.
+let held = null;
+let turn = Promise.resolve();
+
+/** Opens `lake` for `db` (connect()'s): another connection to the node held here, a node in this process,
+ * or one beside it. */
+async function opening(db, lake, { python, port }, settings) {
+  if (!lake.includes("://") && lake !== ":memory:") {
+    const { mkdirSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    mkdirSync(lake, { recursive: true });
+    lake = resolve(lake);
+  }
+  db.lake = lake; // (where the lake is: a folder, a bucket's URL, or ":memory:")
+  if (!(held && lake !== ":memory:" && held.lake === lake)) {
+    const addon = held ? null : await nativeModule().catch(() => null); // (no library: a node beside this process)
+    // (a worker thread's connect() finds the library holding another thread's node: it says so, by name)
+    const node = addon && (await here(addon, lake, { python, port }, settings).catch((e) => (/open in this process already/.test(e.message) ? null : Promise.reject(e))));
+    if (!node) return beside(db, lake, { python, port, env: settingsEnv(settings) });
+    held = node;
+  }
+  const node = held;
+  node.connections++;
+  db.urls = [node.url];
+  db.url = node.url;
+  db.fetch = node.fetch;
+  db.owner = node.owner;
+  db.opened = () => { // (`close()`: the last connection to the node closes it)
+    if (--node.connections) return Promise.resolve();
+    const close = () => {
+      if (held === node) held = null;
+      return node.close();
+    };
+    return (turn = turn.then(close, close));
+  };
+  return db;
+}
+
+/** A node on `lake` in this process (its first connect()). Its settings are fixed by the first node a process
+ * opens: a later one may repeat them, never change one. */
+async function here(addon, lake, { python, port }, settings) {
+  port ??= await freePort();
+  const owner = randomUUID().replaceAll("-", ""); // (with it, this process's SQL reads files here: invariant 61)
+  const launcher = await binary().catch(() => null); // (only an ATTACH of a lake nobody leads needs it)
+  // (a setting as text, String(true) being "true"; a list, `attach: ["sales=/data/sales"]`, as it is)
+  const given = Object.fromEntries(Object.entries(settings).filter(([, v]) => v != null).map(([k, v]) => [k, Array.isArray(v) ? v.map(String) : String(v)]));
+  const options = {
+    ...given,
+    lake, addr: `127.0.0.1:${port}`, owner, // (these win over a setting of the same name)
+    ...(python && { python: "auto" }),
+    ...(launcher && { launcher }),
+  };
+  const handle = await addon.open(JSON.stringify(options));
+  // (every call goes to the node inside this process, no socket: its port is the console's, and Python's workers')
+  return { lake, url: `http://127.0.0.1:${port}`, owner, fetch: inProcess(addon, handle), close: closer(addon, handle), connections: 0 };
+}
+
+/** Settings by name as the variables a node beside this process reads (`memory_gb` is PONDRA_MEMORY_GB). */
+const settingsEnv = (settings) =>
+  Object.fromEntries(Object.entries(settings).filter(([, v]) => v != null).map(([k, v]) => [`PONDRA_${k.toUpperCase()}`, Array.isArray(v) ? v.join(",") : String(v)]));
+
+/** Starts a node on `dir` — a folder, s3://bucket/prefix, or ":memory:" — in a process of its own, for `db`.
+ * It stops when this process exits, or with `close()`; a folder's or a bucket's lake stays. Its SQL may read
+ * files on this machine (`SELECT * FROM 'jan.csv'`), as DuckDB's may; its Python functions and procedures run
+ * with a Python here that has the `pondra` package, if there is one (`python: false`: none). `timeout`: seconds
+ * to wait for the node to start (120). Its standard error goes to `pondra-<port>.log` in the temp folder: a node
+ * that doesn't start says where. */
+async function beside(db, dir, { port, flags = [], timeout = 120, python = true, env = {} } = {}) {
   const { spawn } = await import("node:child_process");
   const fs = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
   const exe = await binary();
   port ??= await freePort();
-  if (!dir.includes("://")) fs.mkdirSync(dir, { recursive: true });
+  if (!dir.includes("://") && dir !== ":memory:") fs.mkdirSync(dir, { recursive: true });
   const log = join(tmpdir(), `pondra-${port}.log`);
   const errors = fs.openSync(log, "a");
   const args = ["serve", "--dir", dir, "--addr", `127.0.0.1:${port}`, "--stop-with-stdin", ...(python ? ["--python", "auto"] : []), ...flags];
   const owner = randomUUID().replaceAll("-", ""); // (with it, the node lets this process's SQL read files here)
-  const node = spawn(exe, args, { stdio: ["pipe", "ignore", errors], env: { ...process.env, PONDRA_OWNER_KEY: owner } });
+  const node = spawn(exe, args, { stdio: ["pipe", "ignore", errors], env: { ...process.env, ...env, PONDRA_OWNER_KEY: owner } });
   fs.closeSync(errors); // (the node has its own copy of the log's file)
   let failed = null;
   node.on("error", (e) => (failed = e)); // (no binary, say)
-  const db = new Pondra(`http://127.0.0.1:${port}`, { token, retrySecs: 0, ...(onNotice !== undefined && { onNotice }) });
-  db.process = node;
-  db.owner = owner;
   process.on("exit", () => node.stdin.end());
+  const url = `http://127.0.0.1:${port}`;
+  const probe = new Pondra(url, { retrySecs: 0 }); // (asks with the node's key whether it is up, and ours)
+  probe.owner = owner;
   for (const until = Date.now() + timeout * 1000; ; await sleep(50)) {
     let ours;
     try {
-      ours = await (await db.request("GET", "/stats")).json().then((s) => s?.owner, () => undefined); // (asked with our key; a node from before this check doesn't say)
+      ours = await (await probe.request("GET", "/stats")).json().then((s) => s?.owner, () => undefined); // (a node from before this check doesn't say)
     } catch {
       if (failed || node.exitCode !== null || Date.now() > until) {
         if (node.pid && node.exitCode === null) node.stdin.end(); // (still running: closing its input stops it, as close() does)
@@ -531,54 +616,96 @@ export async function local(dir = "lake", { port, token, flags = [], timeout = 1
       if (node.pid && node.exitCode === null) node.stdin.end(); // (closing its input stops it, as close() does)
       throw new Error(`127.0.0.1:${port} is another node's, not the one this started (it failed to listen there); its log: ${log}`);
     }
-    db.retrySecs = 60;
+    db.urls = [url];
+    db.url = url;
+    db.process = node;
+    db.owner = owner;
     return db;
   }
 }
 
-/** Open a node on a lake in this process, and connect to it: no server and no second process. `dir` is a
- * folder or s3://bucket/prefix, as `local()` takes; with none, or `":memory:"` as DuckDB spells it, a lake held
- * in this process's memory: nothing on disk, and gone at `close()`. It returns the connection `connect()` and `local()` return, so frames, `sql`,
- * `writeTable` and the rest work the same. Its SQL may read files on this machine, as `local()`'s may.
- * `settings` are the node's settings by name (`memory_gb: 2` is PONDRA_MEMORY_GB), fixed by the first open
- * in a process. One node at a time in a process: open another lake with ATTACH, or close this one first. It
- * is closed when this process ends (`process.exit()` too), if `close()` wasn't called. Python's functions and procedures run with a
- * Python here that has the `pondra` package, as `local()`'s do (`python: false`: none). */
-export async function open(dir, { token, python = true, onNotice, ...settings } = {}) {
-  const addon = await nativeModule(); // (first: a missing library leaves no folder behind)
-  const port = await freePort();
-  const owner = randomUUID().replaceAll("-", ""); // (with it, this process's SQL reads files here: invariant 61)
-  const { mkdirSync } = await import("node:fs");
-  const { resolve } = await import("node:path");
-  let lake = dir ?? ":memory:"; // (none named: a lake in this process's memory, gone at close())
-  if (!lake.includes("://") && lake !== ":memory:") {
-    mkdirSync(lake, { recursive: true });
-    lake = resolve(lake);
-  }
-  const launcher = await binary().catch(() => null); // (only an ATTACH of a lake nobody leads needs it)
-  // (a setting as text, String(true) being "true"; a list, `attach: ["sales=/data/sales"]`, as it is)
-  const given = Object.fromEntries(Object.entries(settings).filter(([, v]) => v != null).map(([k, v]) => [k, Array.isArray(v) ? v.map(String) : String(v)]));
-  const options = {
-    ...given,
-    lake, addr: `127.0.0.1:${port}`, owner, // (these win over a setting of the same name)
-    ...(python && { python: "auto" }),
-    ...(launcher && { launcher }),
-  };
-  const handle = await addon.open(JSON.stringify(options));
-  const db = new Pondra(`http://127.0.0.1:${port}`, { token, ...(onNotice !== undefined && { onNotice }) });
-  db.owner = owner;
-  db.lake = lake; // (where the lake is: a folder, a bucket's URL, or ":memory:")
-  db.opened = closer(addon, handle);
-  return db;
+// What goes at 1.0 says so once a process.
+const warned = new Set();
+function goes(name, instead) {
+  if (warned.has(name)) return;
+  warned.add(name);
+  process.emitWarning(`pondra's ${name}() goes at 1.0: ${instead}`, "DeprecationWarning");
 }
 
-// The nodes open() made here and nothing closed yet. `process.exit()` ends Node without the cleanup hook the
+/** `connect(dir)` before 0.34: a node on a lake here, in a process of its own. It goes at 1.0. */
+export async function local(dir = "lake", { port, token, flags = [], timeout = 120, python = true, onNotice, timeoutMs } = {}) {
+  if (timeoutMs !== undefined) throw new Error("local({ timeoutMs }): it is { timeout } now, in seconds, as Python's");
+  goes("local", "connect(dir) opens the lake, its node in this process");
+  const db = new Pondra("http://127.0.0.1", { token, ...(onNotice !== undefined && { onNotice }) });
+  return beside(db, dir, { port, flags, timeout, python });
+}
+
+/** `connect(dir)` before 0.34 (awaited). It goes at 1.0. */
+export async function open(dir, options = {}) {
+  goes("open", "await connect(dir).ready is the same (and connect() alone a lake in memory)");
+  return connect(dir ?? ":memory:", options).ready;
+}
+
+// Statuses whose answers have no body (a Response refuses one).
+const NO_BODY = new Set([204, 205, 304]);
+
+/** fetch, for a node in this process: a request goes straight to the node's router inside this process, with no
+ * socket, and its answer's body is read a piece at a time as the node writes it (a live query's answers, a
+ * watched table's rows). Read to its end, cancelled, or collected unread, a body is let go of, and the work
+ * writing it stops, as when a client goes. */
+function inProcess(addon, handle) {
+  const unread = new FinalizationRegistry((id) => addon.free(id));
+  return async (url, { method = "GET", body = null, headers = {} } = {}) => {
+    const { pathname, search } = new URL(url);
+    const sent = body == null || typeof body === "string" || body instanceof Uint8Array ? body : new Uint8Array(await new Response(body).arrayBuffer());
+    const [status, head, id, first] = await addon.request(handle, method, pathname + search, JSON.stringify(headers), sent);
+    const init = { status, headers: JSON.parse(head) };
+    if (!id || NO_BODY.has(status)) { // (the body came whole with its head, as most do)
+      if (id) addon.free(id);
+      return new Response(NO_BODY.has(status) ? null : first, init);
+    }
+    let start = first;
+    let left = id; // (0 once let go of)
+    const letGo = () => {
+      left = 0;
+      unread.unregister(stream);
+    };
+    const stream = new ReadableStream({
+      async pull(c) {
+        if (start) {
+          c.enqueue(start);
+          start = null;
+          return;
+        }
+        try {
+          let piece = addon.read(left); // (a piece written already comes at once; else a promise of the next)
+          if (piece instanceof Promise) piece = await piece;
+          if (piece === null) {
+            letGo();
+            c.close();
+          } else c.enqueue(piece);
+        } catch (e) {
+          letGo(); // (a failed body is let go of by the library)
+          throw e;
+        }
+      },
+      cancel() {
+        if (left) addon.free(left);
+        letGo();
+      },
+    });
+    unread.register(stream, id, stream);
+    return new Response(stream, init);
+  };
+}
+
+// The nodes opened in this process and nothing closed yet. `process.exit()` ends Node without the cleanup hook the
 // library adds (that hook closes them when the process simply ends, or a worker thread does), so the
 // process's `exit` event closes them, on this thread: drained, the term given back, a lake in memory let go.
 const stillOpen = new Set();
 let exitHooked = false;
 
-/** How open()'s node is closed (`db.close()`): until it is, the process's exit closes it. */
+/** How a node in this process is closed (its last connection's `close()`): until it is, the process's exit closes it. */
 function closer(addon, handle) {
   if (!exitHooked) {
     exitHooked = true;
@@ -627,7 +754,7 @@ async function library() {
     // (the package isn't installed here: the error below says what to do)
   }
   if (beside && existsSync(beside)) return beside;
-  throw new Error(`open() needs the library from the ${pkg} package (npm install pondra brings it), or PONDRA_LIBRARY naming it`);
+  throw new Error(`a node in this process needs the library from the ${pkg} package (npm install pondra brings it), or PONDRA_LIBRARY naming it`);
 }
 
 // The library's exports, loaded by the first open in this process. While it loads this is a promise, so
@@ -650,7 +777,7 @@ async function loadNative() {
   return module.exports;
 }
 
-/** A port nothing listens on here, for `local`'s node. */
+/** A port nothing listens on here, for a node connect() starts. */
 async function freePort() {
   const { createServer } = await import("node:net");
   return new Promise((resolve, reject) => {

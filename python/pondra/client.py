@@ -1,5 +1,5 @@
-"""The client: a node over HTTP (`connect`), one started here (`local`), or one in this process (`open`,
-`inprocess.py`). Queries become frames (`frame.py`); writes, scripts and procedures run at once."""
+"""The client: `connect()` to a node over HTTP, or to a lake, its node in this process (`inprocess.py`) or
+beside it (`_child`). Queries become frames (`frame.py`); writes, scripts and procedures run at once."""
 import atexit
 import base64, contextlib
 import importlib.util
@@ -39,7 +39,7 @@ def current():
     if _inside == "function":
         raise RuntimeError("a function has no connection to the lake (a query may run it over millions of rows on every node): read the rows as its arguments, or do it in a procedure")
     if (_current or _last) is None:
-        raise RuntimeError("no connection yet: pondra.connect(url) or pondra.local(dir) first")
+        raise RuntimeError("no connection yet: pondra.connect(…) first")
     return _current or _last
 
 
@@ -150,16 +150,16 @@ class Pondra:
         elif self._basic:
             h["Authorization"] = self._basic
         if getattr(self, "owner", None):
-            h["x-pondra-owner"] = self.owner  # (the node `local()` started: its SQL may read files here)
+            h["x-pondra-owner"] = self.owner  # (a node `connect()` started: its SQL may read files here)
         again = method == "GET" if again is None else again
         deadline, wait, tried = time.monotonic() + self.retry_secs, 0.1, 0
         while True:
             url = self._held or self.url
             req = urllib.request.Request(url + path, data=body if method == "POST" else None, headers=h, method=method)
             try:
-                # (a node in this process answers through its router, with no socket; an answer that streams goes to the loopback port)
-                inproc = None if stream else getattr(self, "_inproc", None)
-                r = (inproc or self._open)(req, timeout=None if stream else self.timeout)
+                # (a node in this process answers through its router, with no socket, answers that stream too)
+                inproc = getattr(self, "_inproc", None)
+                r = inproc(req, stream=stream) if inproc else self._open(req, timeout=None if stream else self.timeout)
                 out = r if stream else r.read()
             except urllib.error.HTTPError as e:
                 self._reached = True
@@ -186,7 +186,7 @@ class Pondra:
                 raise PondraError(f"the node holding this connection's session ({url}) is gone, and its transaction, temporary tables, settings and "
                                   f"variables with it; what was sent to it last may or may not have been applied ({error})", _GONE) from None
             if time.monotonic() > deadline or getattr(self, "process", None) and self.process.poll() is not None:
-                raise error  # (out of time, or the node `local()` started has stopped)
+                raise error  # (out of time, or the node `connect()` started beside this process has stopped)
             tried += 1
             self.url = self.urls[(self.urls.index(url) + 1) % len(self.urls)] if url in self.urls else self.urls[0]
             if tried % len(self.urls) == 0:  # (each node tried once: a moment before the next round)
@@ -289,7 +289,7 @@ class Pondra:
     def read_parquet(self, source, hive_partitioning=None, **options):
         """Parquet files as a frame, read where the node runs each time it's asked for rows: a
         URL (`s3://`, `gs://`, `az://`, `https://`), a folder, a glob or a list of them; with
-        `local()`, this machine's paths too. SQL's `read_parquet`: a URL needs a secret covering it
+        a lake `connect()` opened here, this machine's paths too. SQL's `read_parquet`: a URL needs a secret covering it
         (`CREATE SECRET`), unless the node is yours. (Polars' `scan_parquet` is the same.)"""
         return self._scan("read_parquet", source, dict(options, hive_partitioning=hive_partitioning))
 
@@ -340,7 +340,7 @@ class Pondra:
 
     @property
     def console_url(self):
-        """The console, in a browser, as this connection. A node `local()` or `open()` started answers
+        """The console, in a browser, as this connection. A node `connect()` started answers
         only its program, so the link carries its key (`#key=…`); the page keeps it for its tab, and it
         works while the node runs. Keep it to yourself, as a token."""
         return f"{self.url}/#key={self.owner}" if getattr(self, "owner", None) else f"{self.url}/"
@@ -553,12 +553,16 @@ class Pondra:
         (insert, update_preimage, update_postimage, delete), `_row_id` and `_version`.
         Each yielded row is a dict; `self.position` is where to resume."""
         path = f"/watch/{table}?marks=true" + (f"&after={after}" if after is not None else "") + ("&changes=true" if changes else "")
-        for line in self._call("GET", path, stream=True):
-            row = json.loads(line)
-            if "_after" in row and len(row) == 1:
-                self.position = row["_after"]
-                continue
-            yield row
+        r = self._call("GET", path, stream=True)
+        try:
+            for line in r:
+                row = json.loads(line)
+                if "_after" in row and len(row) == 1:
+                    self.position = row["_after"]
+                    continue
+                yield row
+        finally:
+            r.close()  # (stopping the loop ends the watch on the node)
 
     def live(self, query, every_ms=None, **params):
         """A query's answer now, and again each time a commit changes a table it reads (ADR-028):
@@ -601,9 +605,9 @@ class Pondra:
         self._run("COMMIT")
 
     def close(self):
-        """End this connection's session (its temporary tables and views), and stop the node
-        `local()` started or close the node `open()` made here (and a lake of `open()` held in
-        memory with it). Closing a `local()` node's input stops it (it hands the lake on at once), on every
+        """End this connection's session (its temporary tables and views), and close the node
+        `connect()` started for it: in this process when no other connection is open to it (and a lake
+        in memory with it), or beside it, by closing its input (it hands the lake on at once), on every
         OS; it would stop the same way if Python were killed."""
         retry_secs, self.retry_secs = self.retry_secs, 0  # (a node that's gone isn't waited for here)
         try:
@@ -842,25 +846,47 @@ def _module_of(f, lambda_name="udf"):
     return head + "\n".join(dict.fromkeys(imports)) + "\n" + "\n".join(consts) + "\n\n" + "\n\n".join(sources) + "\n"
 
 
-def connect(url="http://127.0.0.1:8080", token=None, **kw):
-    """A connection to a node: with a token (`token=`), or as a user (`user=`, `password=`: its
-    password, or one of its tokens)."""
-    return Pondra(url, token, **kw)
+def connect(target=None, token=None, **options):
+    """The one way in to Pondra. `target` is:
+    - none, or `":memory:"` as DuckDB spells it: a new lake in this process's memory, gone at close();
+    - a folder, or a bucket's URL (s3://, gs://, az://): that lake;
+    - `http://` or `https://` (or a list of them: any of a cluster's nodes): a node running somewhere,
+      with a token (`token=`) or as a user (`user=`, `password=`; `options` are `Pondra`'s).
+    A lake's node runs in this process (`inprocess.py`): no server, no second process. Its SQL may read
+    files on this machine, its Python procedures run with this Python (`python=False`: none), it
+    listens on 127.0.0.1 at `port=` (any free one if none: the console's, and other programs'), and
+    `options` are its settings by name (`memory_gb=2` is PONDRA_MEMORY_GB). A process holds one such
+    node, and the same lake connected again is another connection to it. Another lake connected while
+    it is open gets a node of its own beside this process, which stops with it; so does every lake
+    where this install has no library. The node closes with `close()`, or when Python exits."""
+    if target is not None and not isinstance(target, (list, tuple)):
+        target = os.fspath(target)
+    if isinstance(target, (list, tuple)) or (target or "").startswith(("http://", "https://")):
+        return Pondra(target, token, **options)
+    from . import inprocess
+    return inprocess.connect(target, token, **options)
 
 
 def local(dir="lake", port=None, token=None, flags=(), timeout=120, python=True):
-    """Start a node on a lake here — a folder, or s3://bucket/prefix — and connect to it. It stops
-    when Python exits, or with `close()`; the lake stays. Its SQL may read files on this machine
-    (`SELECT * FROM 'jan.csv'`), as DuckDB's may, and its Python procedures run with this Python
-    (`python=False`: none). `flags`: more `pondra serve` options, such as `["--memory-gb", "2"]`."""
+    """`connect(dir)` before 0.34: a node on a lake here, in a process of its own. It goes at 1.0."""
+    warnings.warn("pondra.local() goes at 1.0: pondra.connect(dir) opens the lake, its node in this process", DeprecationWarning, stacklevel=2)
+    return _child(dir, port, token, flags, timeout, python)
+
+
+def _child(dir="lake", port=None, token=None, flags=(), timeout=120, python=True, env=None):
+    """Start a node on a lake here — a folder, s3://bucket/prefix, or `:memory:` — in a process of its own,
+    and connect to it. It stops when Python exits, or with `close()`; a folder's or a bucket's lake stays.
+    Its SQL may read files on this machine (`SELECT * FROM 'jan.csv'`), as DuckDB's may, and its Python
+    procedures run with this Python (`python=False`: none). `flags`: more `pondra serve` options, such as
+    `["--memory-gb", "2"]`; `env`: settings by their variables' names."""
     port, owner = port or _free_port(), uuid.uuid4().hex
-    if "://" not in dir:
+    if "://" not in dir and dir != ":memory:":
         os.makedirs(dir, exist_ok=True)
     log = os.path.join(tempfile.gettempdir(), f"pondra-{port}.log")
     with open(log, "ab") as err:
         args = [binary(), "serve", "--dir", dir, "--addr", f"127.0.0.1:{port}", "--stop-with-stdin", *(["--python", sys.executable] if python else []), *flags]
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # (so its procedures import this very package)
-        env = {**os.environ, "PONDRA_OWNER_KEY": owner, "PYTHONPATH": os.pathsep.join(p for p in (here, os.environ.get("PYTHONPATH")) if p)}
+        env = {**os.environ, **(env or {}), "PONDRA_OWNER_KEY": owner, "PYTHONPATH": os.pathsep.join(p for p in (here, os.environ.get("PYTHONPATH")) if p)}
         proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err, env=env)
     db = Pondra(f"http://127.0.0.1:{port}", token, retry_secs=0)
     db.process, db.owner, deadline = proc, owner, time.time() + timeout

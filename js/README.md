@@ -11,18 +11,18 @@ the bucket is the only state.
 [Releases](https://github.com/alimardon123/pondra/releases) · MIT OR Apache-2.0
 
 This package installs the `pondra` binary for your platform and a small JavaScript client (no
-dependencies; Node 18+). The client also runs in browsers, Deno and Bun, wherever `fetch` does; `local`
-and `binary` need Node, `open` needs Node, Bun or Deno, and `ca` (the authority that signs an `https` node's
-certificate) needs Node 22.19 or later.
+dependencies; Node 18+). The client also runs in browsers, Deno and Bun, wherever `fetch` does; a lake
+(`connect` on a folder or bucket) needs Node, Bun or Deno, `binary` needs Node, and `ca` (the authority that signs an `https`
+node's certificate) needs Node 22.19 or later.
 
 ```bash
 npm install pondra        # in a project; or npm install -g pondra, or npx pondra with no install
 ```
 
 ```js
-import { local } from "pondra";
+import { connect } from "pondra";
 
-const db = await local("lake");                          // a node on ./lake
+const db = connect("lake");                          // a node on ./lake
 await db.sql("CREATE TABLE events (user VARCHAR, amount BIGINT)");
 await db.append("events", [{ user: "ann", amount: 5 }]); // exactly once
 console.log(await db.sql("SELECT user, sum(amount) AS total FROM events GROUP BY user"));
@@ -35,17 +35,17 @@ await db.call("send_report", "2026-09-27");              // a stored procedure (
 await db.close();
 ```
 
-`open()` runs the node in this process instead, so there is no second process to start. It works in Node, Bun
-and Deno, and returns the same connection. `close()` stops the node and gives its term back; with no folder,
-`open` holds the lake in this process's memory, as DuckDB's `:memory:` does, and `close()` lets it go. `local()` still starts a node beside your program.
+`connect("lake")` runs the node in this process, so there is no second process to start. It works in Node, Bun
+and Deno. `close()` stops the node and gives its term back. With no folder, `connect()` holds the lake in this
+process's memory, as DuckDB's `:memory:` does, and `close()` lets it go.
 
 ```js
-import { open } from "pondra";
+import { connect } from "pondra";
 
-const db = await open();                                 // a lake in memory (":memory:"), gone at close()
+const db = connect();                                 // a lake in memory (":memory:"), gone at close()
 await db.sql("CREATE TABLE t (a INT)");
 await db.close();
-const kept = await open("lake");                         // a folder or s3://bucket/prefix, kept after close()
+const kept = connect("lake");                         // a folder or s3://bucket/prefix, kept after close()
 ```
 
 A frame is a query written in JavaScript: each step is a CTE of the SQL the node runs, so the plan
@@ -55,9 +55,9 @@ to the node's answer for it (a refusal rejects there, naming what it refused); r
 `db.table(name)`.
 
 ```js
-import { col, local } from "pondra";
+import { col, connect } from "pondra";
 
-const db = await local("lake");
+const db = connect("lake");
 const big = db.table("events").filter(col("amount").gt(3)).groupBy("user").agg(col("amount").sum().alias("total"));
 await big.writeTable("big_spenders");                     // a table made from the frame
 console.log(await db.readParquet("sales/*.parquet").limit(5)); // files as a frame: awaiting runs it
@@ -80,7 +80,7 @@ console at `http://localhost:8080`.
 - **Files and other engines' tables:** `read_parquet`, `read_csv`, `read_json`, `read_delta` and
   `read_iceberg` on S3, GCS, Azure and HTTPS. Tables are published as Delta and Iceberg for
   Spark, DuckDB and Polars to read.
-- **SQL and Python as one:** functions and procedures in Python run on the node (`local()` gives
+- **SQL and Python as one:** functions and procedures in Python run on the node (`connect("lake")` gives
   it a Python with the `pondra` package if this machine has one), and frames in the Python client.
 - **Every client:**
   - Postgres: psql, dbt, and BI tools;

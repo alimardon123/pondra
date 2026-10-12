@@ -16,7 +16,7 @@ from pondra.spark import SparkSession, functions as F, Window   # was: from pysp
 ## Connect
 
 `.remote()` takes a node's address. `.master("local[*]")` starts a node on a lake here, the way
-`pondra.local()` does (`.config("spark.pondra.lake", "path")` names the folder, default `./lake`).
+`pondra.connect("lake")` does (`.config("spark.pondra.lake", "path")` names the folder, default `./lake`).
 
 <Tabs>
   <TabItem label="A node">
@@ -199,7 +199,7 @@ python3 udfs.py
   4 1.50
 ```
 
-The node needs Python for this: `pondra serve --python auto` (a node from `local()` has it).
+The node needs Python for this: `pondra serve --python auto` (a node from `connect()` has it).
 
 ## Streaming
 

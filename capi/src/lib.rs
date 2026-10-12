@@ -1,5 +1,5 @@
 //! pondra_lib: a Pondra node in any language's process (ADR-061 §6, `designs/l2-step4-open.md`).
-//! Seven functions over `pondra::library::Opened`; Python binds them with ctypes, and the packages'
+//! Eight functions over `pondra::library::Opened`; Python binds them with ctypes, and the packages'
 //! small `pondra` launcher calls `pondra_main`. Every entry catches a panic (unwinding across
 //! `extern "C"` is undefined) and says what failed through `pondra_last_error`. The library is never
 //! unloaded, and a handle is a number, never a pointer: a closed or unknown one is refused by name.
@@ -75,6 +75,23 @@ fn close_node(handle: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A request's headers, given as a JSON object (NULL or none: no headers): the C ABI's and Node-API's alike.
+fn headers_from(json: Option<&str>) -> anyhow::Result<Vec<(String, String)>> {
+    let Some(json) = json else { return Ok(vec![]) };
+    let map: BTreeMap<String, serde_json::Value> = serde_json::from_str(json).map_err(|e| anyhow::anyhow!("a request's headers are a JSON object: {e}"))?;
+    Ok(map.into_iter().map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect())
+}
+
+/// An answer's headers as a JSON object.
+fn headers_json(headers: Vec<(String, String)>) -> String {
+    serde_json::Value::Object(headers.into_iter().map(|(k, v)| (k, v.into())).collect()).to_string()
+}
+
+/// How long a call may wait: milliseconds, or as long as it takes when negative.
+fn within(wait_ms: i64) -> Option<std::time::Duration> {
+    u64::try_from(wait_ms).ok().map(std::time::Duration::from_millis)
+}
+
 /// A piece of an answer's body, where the library holds it until the next `pondra_read` of its answer
 /// or `pondra_free`.
 #[repr(C)]
@@ -83,57 +100,79 @@ pub struct PondraPiece {
     pub len: usize,
 }
 
-/// An answer's head: its status and its headers as a JSON object. Its body is read a piece at a time
-/// with `pondra_read`, as the node writes it. Freed with `pondra_free`. One thread at a time reads or
-/// frees an answer; requests on several threads at once each have their own.
+/// An answer: its status (0 until `pondra_wait` has its head) and its headers as a JSON object (NULL until
+/// then). Its body is read a piece at a time with `pondra_read`, as the node writes it. Freed with
+/// `pondra_free`. One thread at a time waits on, reads or frees an answer; requests on several threads at
+/// once each have their own.
 #[repr(C)]
 pub struct PondraAnswer {
     pub status: u16,
     pub headers_json: *mut c_char,
 }
 
-/// What a `PondraAnswer` pointer points into: the head, the body still to read and the piece last read.
-/// `answer` is first, so a pointer to it is a pointer to the whole.
+/// What a `PondraAnswer` pointer points into: the head, the request while its head is to come, then the
+/// body still to read and the piece last read. `answer` is first, so a pointer to it is a pointer to the
+/// whole.
 #[repr(C)]
 struct Held {
     answer: PondraAnswer,
-    body: pondra::library::Body,
+    asked: Option<pondra::library::Asked>,
+    body: Option<pondra::library::Body>,
     piece: bytes::Bytes,
 }
 
 /// One request to the node, as the HTTP API takes it (`method`, `path` with its query, headers as a
-/// JSON object or NULL, the body): its answer once the node has its head, or NULL.
+/// JSON object or NULL, the body), started at once: its answer, whose head `pondra_wait` waits for, or
+/// NULL.
 #[no_mangle]
 pub unsafe extern "C" fn pondra_request(handle: u64, method: *const c_char, path: *const c_char, headers_json: *const c_char, body: *const u8, len: usize) -> *mut PondraAnswer {
     caught(std::ptr::null_mut(), || {
         let method = text(method)?.unwrap_or("GET");
         let path = text(path)?.ok_or_else(|| anyhow::anyhow!("pondra_request needs a path"))?;
-        let headers: Vec<(String, String)> = match text(headers_json)? {
-            None => vec![],
-            Some(h) => serde_json::from_str::<BTreeMap<String, serde_json::Value>>(h)?
-                .into_iter().map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect(),
-        };
+        let headers = headers_from(text(headers_json)?)?;
         let body = if body.is_null() || len == 0 { vec![] } else { std::slice::from_raw_parts(body, len).to_vec() };
-        let pondra::library::Answer { status, headers, body } = node(handle)?.request(method, path, &headers, body)?;
-        let headers: serde_json::Map<String, serde_json::Value> = headers.into_iter().map(|(k, v)| (k, v.into())).collect();
-        let headers_json = CString::new(serde_json::Value::Object(headers).to_string())?.into_raw();
-        let answer = PondraAnswer { status, headers_json };
-        Ok(Box::into_raw(Box::new(Held { answer, body, piece: bytes::Bytes::new() })) as *mut PondraAnswer)
+        let asked = node(handle)?.ask(method, path, &headers, body)?;
+        let answer = PondraAnswer { status: 0, headers_json: std::ptr::null_mut() };
+        Ok(Box::into_raw(Box::new(Held { answer, asked: Some(asked), body: None, piece: bytes::Bytes::new() })) as *mut PondraAnswer)
     })
 }
 
-/// The next piece of an answer's body, waiting for the node to write it: 1 with the piece in `out`
-/// (the library's until the next read of this answer or `pondra_free`), 0 at the body's end, or -1 when
-/// its work failed (`pondra_last_error` says why). Freeing an answer before its end ends its work.
+/// Waits for an answer's head, `wait_ms` at most (negative: as long as it takes): 1 once its `status` and
+/// `headers_json` are there, 2 if not yet (a host waits in slices, so it sees its own signals: Ctrl-C), or
+/// -1 when the request failed (`pondra_last_error` says why).
 #[no_mangle]
-pub unsafe extern "C" fn pondra_read(answer: *mut PondraAnswer, out: *mut PondraPiece) -> i32 {
+pub unsafe extern "C" fn pondra_wait(answer: *mut PondraAnswer, wait_ms: i64) -> i32 {
+    caught(-1, || {
+        anyhow::ensure!(!answer.is_null(), "pondra_wait takes an answer");
+        let held = &mut *(answer as *mut Held);
+        let Some(asked) = held.asked.as_mut() else {
+            anyhow::ensure!(held.body.is_some(), "this answer's request failed");
+            return Ok(1);
+        };
+        let Some(got) = pondra::library::wait(asked, within(wait_ms)) else { return Ok(2) };
+        held.asked = None;
+        let pondra::library::Answer { status, headers, body } = got?;
+        held.answer = PondraAnswer { status, headers_json: CString::new(headers_json(headers))?.into_raw() };
+        held.body = Some(body);
+        Ok(1)
+    })
+}
+
+/// The next piece of an answer's body, `wait_ms` at most for the node to write it (negative: as long as
+/// it takes): 1 with the piece in `out` (the library's until the next read of this answer or
+/// `pondra_free`), 0 at the body's end, 2 if not written yet, or -1 when its work failed
+/// (`pondra_last_error` says why). Freeing an answer before its end ends its work.
+#[no_mangle]
+pub unsafe extern "C" fn pondra_read(answer: *mut PondraAnswer, out: *mut PondraPiece, wait_ms: i64) -> i32 {
     caught(-1, || {
         anyhow::ensure!(!answer.is_null() && !out.is_null(), "pondra_read takes an answer and a piece to fill");
         let held = &mut *(answer as *mut Held);
         held.piece = bytes::Bytes::new(); // (the last piece goes before the next is waited for)
-        match held.body.next() {
-            None => Ok(0),
-            Some(piece) => {
+        let body = held.body.as_mut().ok_or_else(|| anyhow::anyhow!("pondra_read: wait for the answer's head first (pondra_wait)"))?;
+        match pondra::library::wait(body.recv(), within(wait_ms)) {
+            None => Ok(2),
+            Some(None) => Ok(0),
+            Some(Some(piece)) => {
                 held.piece = piece?;
                 *out = PondraPiece { data: held.piece.as_ptr(), len: held.piece.len() };
                 Ok(1)
@@ -142,13 +181,16 @@ pub unsafe extern "C" fn pondra_read(answer: *mut PondraAnswer, out: *mut Pondra
     })
 }
 
-/// Frees an answer `pondra_request` gave (NULL is nothing).
+/// Frees an answer `pondra_request` gave (NULL is nothing). Before its head or its body's end, its work
+/// stops, as a client's does when it goes.
 #[no_mangle]
 pub unsafe extern "C" fn pondra_free(answer: *mut PondraAnswer) {
     caught((), || {
         if !answer.is_null() {
             let held = Box::from_raw(answer as *mut Held);
-            drop(CString::from_raw(held.answer.headers_json));
+            if !held.answer.headers_json.is_null() {
+                drop(CString::from_raw(held.answer.headers_json));
+            }
         }
         Ok(())
     })
