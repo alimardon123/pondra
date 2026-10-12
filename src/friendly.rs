@@ -16,7 +16,7 @@
 //! What needs the data (a PIVOT's values, a FROM's columns) is asked with a query of its own, as
 //! the caller, before the tree is rewritten: a first pass collects the questions, a second takes
 //! the answers in the same order (`Asks`).
-use crate::store::Lake;
+use crate::store::{Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::sql::sqlparser::ast::*;
 use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::{Token, Tokenizer}};
@@ -36,7 +36,16 @@ pub fn wanted(sql: &str) -> bool {
     static WORDS: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list)\s*\(|\)\s*\.\s*[a-z_]").expect("a regex")
     });
-    WORDS.is_match(sql) || alias_in_where(sql)
+    // (a materialized view whose query is in parentheses, dbt's `AS (SELECT …)`: nothing else in its
+    // text is a friendly form, so `unparen` is what it needs)
+    static PAREN_VIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*create\s+(?:or\s+replace\s+)?materialized\s+view\b.*?\bas\s*\(").expect("a regex"));
+    // (the forms the rewrites below take: a timestamp's one-digit zone, a number with an exponent, a
+    // bytea's hex form, `(a, b) IN (SELECT …)`, a DELETE or UPDATE with an alias, a character type's
+    // Postgres name, DEFAULT VALUES, LIKE … ESCAPE)
+    static MORE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|'\\x|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|^\s*(?:delete\s+from|update)\s+[\w."]+\s+(?:as\s+)?\w+\s|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'"#).expect("a regex")
+    });
+    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || alias_in_where(sql)
 }
 
 /// Whether a name given with `AS` comes up again after a WHERE (a select's alias it may use).
@@ -358,6 +367,15 @@ struct Level {
 /// whether any was.
 pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
     let before = stmts.to_vec();
+    // (dbt's `AS (SELECT …)`: a materialized view's query is read as `first_table` reads it, a SELECT
+    // of its own; done here, not in the visitor, which doesn't reach a view's query)
+    for s in stmts.iter_mut() {
+        if let Statement::CreateView(CreateView { materialized: true, query, .. }) = s {
+            unparen(query);
+        }
+        unalias(s)?; // (`DELETE FROM t AS d`: `d.col` is `t.col` in the rows' query, which names the table)
+        default_values(lake, s).await?;
+    }
     let mut f = Friendly { asks: Asks::Collect(Vec::new()), with: Vec::new(), orders: Vec::new(), selects: Vec::new(), names: Vec::new() };
     // (a stored view keeps its text: it is expanded as it is read, as its functions are)
     let kept = |s: &Statement| matches!(s, Statement::CreateMacro { .. } | Statement::CreateView(CreateView { materialized: false, .. }));
@@ -603,18 +621,316 @@ impl VisitorMut for Friendly {
     }
 
     fn post_visit_statement(&mut self, s: &mut Statement) -> ControlFlow<anyhow::Error> {
-        if let (false, Statement::CreateTable(c)) = (self.collecting(), s) {
-            for col in c.columns.iter_mut() {
-                if matches!(col.data_type, DataType::JSON | DataType::JSONB) {
-                    col.data_type = DataType::Text; // (JSON is text, as VARIANT is: `->`, `->>`, json_get read it)
+        if self.collecting() {
+            return ControlFlow::Continue(());
+        }
+        match s {
+            Statement::CreateTable(c) => {
+                for col in c.columns.iter_mut() {
+                    if matches!(col.data_type, DataType::JSON | DataType::JSONB) {
+                        col.data_type = DataType::Text; // (JSON is text, as VARIANT is: `->`, `->>`, json_get read it)
+                    }
+                    spell(&mut col.data_type);
                 }
             }
+            Statement::AlterTable(a) => {
+                for op in a.operations.iter_mut() {
+                    match op {
+                        AlterTableOperation::AddColumn { column_def, .. } => spell(&mut column_def.data_type),
+                        AlterTableOperation::AlterColumn { op: AlterColumnOperation::SetDataType { data_type, .. }, .. } => spell(data_type),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
         ControlFlow::Continue(())
     }
 }
 
 fn or_break(r: Result<()>) -> ControlFlow<anyhow::Error> { r.map_or_else(ControlFlow::Break, ControlFlow::Continue) }
+
+/// `(SELECT …)` as a query is the query itself: Postgres takes both, and a view's query must be a
+/// SELECT. Only a query with nothing of its own around the parentheses (WITH, ORDER BY, LIMIT,
+/// OFFSET, FETCH, locks) is taken out of them; repeated while it is still one.
+fn unparen(q: &mut Query) {
+    while let SetExpr::Query(inner) = q.body.as_ref() {
+        if q.with.is_some() || q.order_by.is_some() || q.limit_clause.is_some() || q.fetch.is_some() || !q.locks.is_empty() {
+            return;
+        }
+        *q = (**inner).clone();
+    }
+}
+
+/// `DELETE FROM t AS d …` and `UPDATE t AS u …`: the target's alias comes off, and the references to
+/// it are written as the table's own name, which is what change.rs builds its query over (`d.id` had
+/// no `d` there, so a correlated EXISTS failed). Refused when another relation of the statement is
+/// visibly named the alias or the table: the rename would be caught by it.
+fn unalias(s: &mut Statement) -> Result<()> {
+    let target = match s {
+        Statement::Delete(d) => match &mut d.from {
+            FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t.first_mut(),
+        },
+        Statement::Update(u) => Some(&mut u.table),
+        _ => None,
+    };
+    let Some(TableWithJoins { relation: TableFactor::Table { name, alias, .. }, .. }) = target else { return Ok(()) };
+    let Some(alias) = alias.take() else { return Ok(()) };
+    let table = name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.clone()).unwrap_or_default();
+    let alias = alias.name.value;
+    if alias.eq_ignore_ascii_case(&table) {
+        return Ok(());
+    }
+    // (the target itself is not visited: its name is the table's now)
+    let mut r = Renamed { alias: alias.clone(), table: table.clone(), shadow: None };
+    match s {
+        Statement::Delete(d) => {
+            let _ = VisitMut::visit(&mut d.selection, &mut r);
+            let _ = VisitMut::visit(&mut d.using, &mut r);
+        }
+        Statement::Update(u) => {
+            let _ = VisitMut::visit(&mut u.assignments, &mut r);
+            let _ = VisitMut::visit(&mut u.from, &mut r);
+            let _ = VisitMut::visit(&mut u.selection, &mut r);
+        }
+        _ => {}
+    }
+    match r.shadow {
+        Some(n) => Err(crate::codes::coded("0A000", format!("{alias} is the alias of {table} here, and another relation of this statement is named {n}: give that one another name"))),
+        None => Ok(()),
+    }
+}
+
+/// Renames one alias's references to a table's name, and notes a relation of the statement that is
+/// visibly named the alias or the table (the rename would be caught by it).
+struct Renamed {
+    alias: String,
+    table: String,
+    shadow: Option<String>,
+}
+
+impl VisitorMut for Renamed {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, t: &mut TableFactor) -> ControlFlow<()> {
+        match visible(t) {
+            Some(n) if n.eq_ignore_ascii_case(&self.alias) || n.eq_ignore_ascii_case(&self.table) => {
+                self.shadow = Some(n);
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    }
+
+    fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        if let Expr::CompoundIdentifier(parts) = e {
+            if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case(&self.alias) {
+                parts[0] = Ident::new(&self.table);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// The name a relation is visible by in its statement: its alias, else its table's last name part.
+fn visible(t: &TableFactor) -> Option<String> {
+    match t {
+        TableFactor::Table { alias: Some(a), .. } | TableFactor::Derived { alias: Some(a), .. } => Some(a.name.value.clone()),
+        TableFactor::Table { name, .. } => name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.clone()),
+        _ => None,
+    }
+}
+
+/// `(a, b) IN (SELECT …)` as `EXISTS (SELECT 1 FROM (SELECT …) AS __in(__c1, __c2) WHERE __in.__c1 =
+/// a AND __in.__c2 = b)`. A NULL comparison drops the row in a WHERE, as the IN's NULL did; elsewhere
+/// the EXISTS is false where the IN would be NULL. NOT IN is refused: a NULL in the subquery changes
+/// its answer, which NOT EXISTS doesn't keep.
+fn row_in(e: &Expr) -> Result<Option<String>> {
+    let Expr::InSubquery { expr: left, subquery, negated } = e else { return Ok(None) };
+    let Expr::Tuple(items) = left.as_ref() else { return Ok(None) };
+    if *negated {
+        return Err(crate::codes::coded("0A000", format!("({}) NOT IN (subquery): a NULL in the subquery changes NOT IN's answer, and NOT EXISTS doesn't keep that: write NOT EXISTS (SELECT 1 … WHERE …) with what a NULL means for you", items.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "))));
+    }
+    let cols: Vec<String> = (1..=items.len()).map(|i| format!("__c{i}")).collect();
+    let same: Vec<String> = items.iter().zip(&cols).map(|(a, c)| format!("__in.{c} = {a}")).collect();
+    Ok(Some(format!("EXISTS (SELECT 1 FROM ({subquery}) AS __in({}) WHERE {})", cols.join(", "), same.join(" AND "))))
+}
+
+/// Postgres's names for types DataFusion doesn't read as written, as the names it reads.
+fn spell(t: &mut DataType) {
+    let spelled = match t {
+        DataType::CharacterVarying(n) | DataType::CharVarying(n) => Some(DataType::Varchar(n.take())),
+        DataType::Character(n) => Some(DataType::Char(n.take())),
+        _ => None,
+    };
+    if let Some(s) = spelled {
+        *t = s;
+    }
+}
+
+/// A string literal written the way its type reads it, where DataFusion doesn't read Postgres's
+/// spelling: a timestamp's zone of one hour digit (`-0`, `+5`) gets two (`-00:00`, `+05:00`), since
+/// Arrow reads `±HH`, `±HHMM` and `±HH:MM` only; a NUMERIC's exponent is written out (`1E-7` is
+/// `0.0000001`); a bytea's hex form (`\xff00`) is `decode(…, 'hex')`. Some(text): the whole literal
+/// is `text` instead.
+fn literal(t: &DataType, s: &mut String) -> Result<Option<String>> {
+    match t {
+        DataType::Timestamp(..) => {
+            static ZONE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(.*\d:\d{2}(?::\d{2}(?:\.\d+)?)?)([+-])(\d)$").expect("a regex"));
+            let fixed = ZONE.captures(s).map(|c| format!("{}{}0{}:00", &c[1], &c[2], &c[3]));
+            if let Some(f) = fixed {
+                *s = f;
+            }
+        }
+        DataType::Bytea => {
+            if let Some(hex) = s.strip_prefix("\\x") {
+                return bytea_hex(hex).map(Some);
+            }
+        }
+        _ if numeric(t) => {
+            if let Some(plain) = plain_decimal(s)? {
+                *s = plain;
+            }
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
+/// NUMERIC or DECIMAL, with or without its precision and scale.
+fn numeric(t: &DataType) -> bool { matches!(t, DataType::Numeric(_) | DataType::Decimal(_) | DataType::Dec(_)) }
+
+/// A typed literal or cast in Postgres's spelling (`literal`, `spell`), fixed in place; Some(text)
+/// when the whole expression is `text` instead.
+fn typed_literal(e: &mut Expr) -> Result<Option<String>> {
+    match e {
+        Expr::Cast { data_type, expr: inner, .. } => {
+            spell(data_type);
+            match inner.as_mut() {
+                Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => literal(data_type, s),
+                // (`1E-7::numeric`: the number itself, as its plain digits)
+                Expr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) if numeric(data_type) => {
+                    if let Some(plain) = plain_decimal(n)? {
+                        *n = plain;
+                    }
+                    Ok(None)
+                }
+                _ => Ok(None),
+            }
+        }
+        Expr::TypedString(TypedString { data_type, value, .. }) => {
+            spell(data_type);
+            let Value::SingleQuotedString(s) = &mut value.value else { return Ok(None) };
+            literal(data_type, s)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// A number written with an exponent, as plain digits (`1E-7` is `0.0000001`, `-2.5e3` is `-2500`):
+/// the digits move, no float, so it is exact. None when `s` isn't such a number. Past 10,000 digits
+/// of shift it is refused (22003), as Postgres's own limit is far beyond what this would write out.
+fn plain_decimal(s: &str) -> Result<Option<String>> {
+    let t = s.trim();
+    let (sign, body) = match t.strip_prefix('-') {
+        Some(b) => ("-", b),
+        None => ("", t.strip_prefix('+').unwrap_or(t)),
+    };
+    let Some((mant, exp)) = body.split_once(['e', 'E']) else { return Ok(None) };
+    let Ok(exp) = exp.parse::<i64>() else { return Ok(None) };
+    let (int, frac) = mant.split_once('.').unwrap_or((mant, ""));
+    if (int.is_empty() && frac.is_empty()) || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) {
+        return Ok(None);
+    }
+    if exp.abs() > 10_000 {
+        return Err(crate::codes::coded("22003", "numeric field overflow: an exponent past 10,000 digits"));
+    }
+    let digits = format!("{int}{frac}");
+    let point = int.len() as i64 + exp; // (where the decimal point falls among `digits`)
+    let out = if point <= 0 {
+        format!("0.{}{digits}", "0".repeat((-point) as usize))
+    } else if point as usize >= digits.len() {
+        format!("{digits}{}", "0".repeat(point as usize - digits.len()))
+    } else {
+        format!("{}.{}", &digits[..point as usize], &digits[point as usize..])
+    };
+    // (no leading zeros left over from the digits' own: `0001E2` is 100)
+    let trimmed = out.trim_start_matches('0');
+    let out = if trimmed.is_empty() || trimmed.starts_with('.') { format!("0{trimmed}") } else { trimmed.to_string() };
+    Ok(Some(format!("{sign}{out}")))
+}
+
+/// A bytea's hex form (the digits after `\x`) as `decode(…, 'hex')`, which reads two digits a byte.
+/// Refused as Postgres refuses it (22P02): a digit that isn't hex, or an odd number of digits.
+fn bytea_hex(hex: &str) -> Result<String> {
+    if let Some(bad) = hex.chars().find(|c| !c.is_ascii_hexdigit()) {
+        return Err(crate::codes::coded("22P02", format!("invalid hexadecimal digit: \"{bad}\"")));
+    }
+    if hex.len() % 2 != 0 {
+        return Err(crate::codes::coded("22P02", "invalid hexadecimal data: odd number of digits"));
+    }
+    Ok(format!("decode('{hex}', 'hex')"))
+}
+
+/// `x LIKE 'p' ESCAPE '/'` (ILIKE and NOT LIKE alike), rewritten to LIKE's own backslash escape: the
+/// pattern's `/%` becomes `\%`, and the ESCAPE goes. A pattern that isn't written out can't be
+/// rewritten, so it is refused. ESCAPE '\' is already LIKE's; ESCAPE '' turns escapes off.
+fn like_escape(pattern: &mut Box<Expr>, escape: &mut Option<ValueWithSpan>) -> Result<()> {
+    let esc = match escape.as_ref().map(|e| &e.value) {
+        Some(Value::SingleQuotedString(c)) if c.as_str() != "\\" => c.clone(),
+        _ => return Ok(()),
+    };
+    let esc_char = match (esc.chars().next(), esc.chars().nth(1)) {
+        (None, _) => None,
+        (Some(c), None) => Some(c),
+        _ => return Err(crate::codes::coded("22025", "invalid escape string: an ESCAPE is one character, or '' for none")),
+    };
+    let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(p), .. }) = pattern.as_mut() else {
+        return Err(crate::codes::coded("0A000", "LIKE … ESCAPE '/' with a pattern that isn't written out: use \\ as the escape character"));
+    };
+    *p = backslash_pattern(p, esc_char)?;
+    *escape = None;
+    Ok(())
+}
+
+/// A LIKE pattern written with `esc` as its escape, as one with backslash: `esc%` is a literal `%`,
+/// a literal `\` is `\\`, the rest as written.
+fn backslash_pattern(pattern: &str, esc: Option<char>) -> Result<String> {
+    let mut out = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if Some(c) == esc {
+            let Some(next) = chars.next() else {
+                return Err(crate::codes::coded("22025", "LIKE pattern must not end with escape character"));
+            };
+            if matches!(next, '%' | '_' | '\\') {
+                out.push('\\'); // (the next one is a literal here, not a wildcard)
+            }
+            out.push(next);
+        } else if c == '\\' {
+            out.push_str("\\\\");
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// `INSERT INTO t DEFAULT VALUES` as `INSERT INTO t VALUES (DEFAULT, …)`, one DEFAULT per column, so
+/// defaults and identity columns fill the row as they do for any INSERT. Only a lake table; a
+/// temporary table's INSERT is its own path (`temp.rs`), so it is left as it is.
+async fn default_values(lake: &Lake, s: &mut Statement) -> Result<()> {
+    let Statement::Insert(ins) = s else { return Ok(()) };
+    if ins.source.is_some() || !ins.assignments.is_empty() {
+        return Ok(());
+    }
+    let TableObject::TableName(name) = &ins.table else { return Ok(()) };
+    let Some(meta) = lake.cat.get::<TableMeta>(&crate::store::table_key(&crate::write::object(name))).await? else { return Ok(()) };
+    let columns = meta.logical_columns().iter().filter(|(c, _)| c != "_deleted").count();
+    let Statement::Query(query) = Parser::parse_sql(&GenericDialect {}, &format!("VALUES ({})", vec!["DEFAULT"; columns].join(", ")))?.remove(0) else { return Ok(()) };
+    ins.source = Some(query);
+    Ok(())
+}
 
 /// `FETCH FIRST n ROWS ONLY` as `LIMIT n`.
 fn fetch(q: &mut Query) -> Result<()> {
@@ -679,6 +995,17 @@ fn args(f: &Function) -> Vec<&Expr> {
 
 /// One expression's own forms.
 fn expression(e: &mut Expr) -> Result<()> {
+    if let Expr::Like { pattern, escape_char, .. } | Expr::ILike { pattern, escape_char, .. } = e {
+        return like_escape(pattern, escape_char);
+    }
+    if let Some(text) = typed_literal(e)? {
+        *e = expr(&text)?; // (a literal in Postgres's spelling, as the expression DataFusion reads)
+        return Ok(());
+    }
+    if let Some(text) = row_in(e)? {
+        *e = expr(&text)?;
+        return Ok(());
+    }
     match e {
         // `({'a': 1}).a`, `f(x).a`: a field of a struct that isn't a column, as `…['a']`
         Expr::CompoundFieldAccess { root, access_chain } if !matches!(**root, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
@@ -1272,6 +1599,38 @@ mod tests {
         assert_eq!(text("PIVOT t ON g USING sum(x) GROUP BY id").unwrap(), "SELECT * FROM (SELECT id, g, x FROM t) AS __pivot PIVOT (sum(x) FOR g IN (ANY)) ");
         assert_eq!(text("UNPIVOT t ON a, b INTO NAME k VALUE v ORDER BY 1").unwrap(), "SELECT * FROM t UNPIVOT (v FOR k IN (a, b)) ORDER BY 1");
         assert_eq!(text("SELECT 'a lambda: no', 1").unwrap(), "SELECT 'a lambda: no', 1");
+    }
+
+    #[test]
+    fn parenthesized_queries() {
+        // (dbt's `AS (SELECT …)`: the parentheses come off, as many as there are, and nothing else does)
+        let mut q = query("((SELECT a FROM t))").unwrap();
+        unparen(&mut q);
+        assert_eq!(q.to_string(), "SELECT a FROM t");
+        let mut q = query("(SELECT a FROM t ORDER BY a)").unwrap();
+        unparen(&mut q);
+        assert_eq!(q.to_string(), "SELECT a FROM t ORDER BY a");
+        let mut q = query("(SELECT a FROM t) ORDER BY a").unwrap();
+        unparen(&mut q);
+        assert!(q.to_string().starts_with("(SELECT"), "{q}");
+    }
+
+    #[test]
+    fn exponents_bytea_and_like_escapes() {
+        // (a number with an exponent is its plain digits, exactly; None when it has none)
+        assert_eq!(plain_decimal("1E-7").unwrap().as_deref(), Some("0.0000001"));
+        assert_eq!(plain_decimal("-2.5e3").unwrap().as_deref(), Some("-2500"));
+        assert_eq!(plain_decimal("0001e2").unwrap().as_deref(), Some("100"));
+        assert_eq!(plain_decimal("12.5").unwrap(), None);
+        // (a bytea's hex form reads two digits a byte; Postgres's refusals for the rest)
+        assert_eq!(bytea_hex("ff00").unwrap(), "decode('ff00', 'hex')");
+        assert!(bytea_hex("f").is_err() && bytea_hex("fg").is_err());
+        // (LIKE's pattern with `/` as the escape, as backslash: `/%` is a literal %, `//` a literal /)
+        assert_eq!(backslash_pattern("a/%b", Some('/')).unwrap(), "a\\%b");
+        assert_eq!(backslash_pattern("a//b", Some('/')).unwrap(), "a/b");
+        assert_eq!(backslash_pattern("a\\b", Some('/')).unwrap(), "a\\\\b");
+        assert_eq!(backslash_pattern("a\\b", None).unwrap(), "a\\\\b");
+        assert!(backslash_pattern("a/", Some('/')).is_err());
     }
 
     #[test]

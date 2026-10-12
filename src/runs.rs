@@ -612,16 +612,23 @@ pub async fn create_task(lake: &Lake, name: &str, mut task: Task, replace: bool)
     Ok(out)
 }
 
+/// `DROP TASK name`: a scheduled task (`j/`) or a streaming one made over HTTP (`k/`, `tasks.rs`).
 pub async fn drop_task(lake: &Lake, name: &str, if_exists: bool) -> Result<serde_json::Value> {
     let name = crate::ddl::local(lake, name).with_context(|| format!("{name}: not this lake's"))?;
-    if lake.cat.get::<Task>(&task_key(&name)).await?.is_none() {
+    let (streaming, scheduled) = (crate::tasks::exists(lake, &name).await?, lake.cat.get::<Task>(&task_key(&name)).await?.is_some());
+    if !streaming && !scheduled {
         ensure!(if_exists, "no task {name}");
         return Ok(serde_json::json!({"dropped": false}));
     }
-    if let Some((f, _)) = tasks(lake).await?.iter().find(|(_, t)| t.after.contains(&name)) {
-        bail!("task {f} runs after {name}: drop {f} first, or make it again without it");
+    if scheduled {
+        if let Some((f, _)) = tasks(lake).await?.iter().find(|(_, t)| t.after.contains(&name)) {
+            bail!("task {f} runs after {name}: drop {f} first, or make it again without it");
+        }
+        lake.cat.commit(vec![], &[task_key(&name), tick_key(&name)]).await?;
     }
-    lake.cat.commit(vec![], &[task_key(&name), tick_key(&name)]).await?;
+    if streaming {
+        crate::tasks::drop_task(lake, &name).await?;
+    }
     Ok(serde_json::json!({"task": name, "dropped": true}))
 }
 

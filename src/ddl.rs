@@ -61,9 +61,15 @@ pub fn join(schema: &str, table: &str) -> String {
 /// What a schema, table or view may be called: letters, digits, `_` and `-`. A dot separates the
 /// parts of a name; quotes, slashes and spaces would get in the way of paths and SQL.
 pub fn check(part: &str) -> Result<()> {
-    ensure!(!part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
-            "'{part}': names are letters, digits, _ and - (a dot separates schema and table)");
-    Ok(())
+    let ok = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    if !part.is_empty() && part.chars().all(ok) {
+        return Ok(());
+    }
+    // (a table's name is its folder's name, and Windows refuses a quote or a slash in a file name: the
+    // name to write is the same one with each such character as `_`)
+    let fixed: String = part.chars().map(|c| if ok(c) { c } else { '_' }).collect();
+    let hint = if fixed.is_empty() { String::new() } else { format!(": a table's name is its folder's, and Windows refuses \" and / in file names; name it {fixed}") };
+    Err(crate::codes::coded("42602", format!("'{part}': names are letters, digits, _ and - (a dot separates schema and table){hint}")))
 }
 
 /// This lake's own name in three-part names: its folder's (or prefix's) last part (`mylake` of
@@ -264,6 +270,8 @@ pub enum Change {
     Rename(String),
     Drop { if_exists: bool },
     Type(String),
+    Default(Option<String>), // SET DEFAULT expr (Some), DROP DEFAULT (None): `defaults::alter`
+    NotNull(bool),           // SET NOT NULL (true), DROP NOT NULL (false): `defaults::alter`
 }
 
 /// Leader: carry one out (under the lake's lock). Comments follow what it renames, and go with
@@ -282,6 +290,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
     // (this lake's own three-part names, as dbt writes them: `"lake"."schema"."t"` is `schema.t`)
     let here = |n: String| match n.split('.').collect::<Vec<_>>()[..] {
         [l, s, t] if l == lake_name(lake) => join(s, t),
+        [s, t] => join(s, t), // (`public.t` is `t`, invariant 49: `DROP TABLE public.t` found no table)
         _ => n,
     };
     let d = match d {
@@ -762,6 +771,8 @@ pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
                 Change::Rename(to) => m.stored(to).is_some(),
                 Change::Drop { .. } => m.stored(column).is_none(),
                 Change::Type(_) => true, // (the same names either way)
+                Change::Default(d) => m.stored(column).is_none_or(|s| m.defaults.get(s) == d.as_ref()),
+                Change::NotNull(on) => m.stored(column).is_none_or(|s| m.not_null.iter().any(|c| c == s) == *on),
             };
             if done {
                 break;
@@ -831,7 +842,7 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Re
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{name} is materialized view {owner}'s: DROP MATERIALIZED VIEW {owner}");
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(name))).await?.is_none(), "{name} is a materialized view: DROP MATERIALIZED VIEW {name}");
     let readers = readers(lake, name).await?;
-    ensure!(readers.is_empty(), "{name} is used by {}: drop them first", readers.join(", "));
+    ensure!(readers.is_empty(), "{name} is read by {}: DROP TABLE {name} CASCADE drops them too, or drop them first", readers.join(", "));
     let keep_ms = meta.retention_secs.map_or(KEEP_MS, |s| s * 1000);
     let deleted = crate::sys::deleted(name);
     let mut puts = vec![];
@@ -1161,10 +1172,13 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
     let owner = name.strip_suffix("_final").unwrap_or(&name);
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none() && lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(&name))).await?.is_none(),
         "{name} is materialized view {owner}'s: its columns are its query's");
-    let readers = readers(lake, &name).await?;
-    ensure!(readers.is_empty(), "{name} is used by {}, which name its columns: drop them first", readers.join(", "));
     let system = |c: &str| crate::sys::NAMES.contains(&c) || c == "_old_version" || c == "_deleted" || c.contains('~');
     ensure!(!system(column), "{column} is a system column: it stays as it is");
+    if let c @ (Change::Default(_) | Change::NotNull(_)) = change {
+        return crate::defaults::alter(lake, &name, column, c).await; // (no name or type changes: a view that reads the table doesn't stop it)
+    }
+    let readers = readers(lake, &name).await?;
+    ensure!(readers.is_empty(), "{name} is used by {}, which name its columns: drop them first", readers.join(", "));
     let Some(stored) = m.stored(column).map(str::to_string) else {
         ensure!(matches!(change, Change::Drop { if_exists: true }), "{name} has no column {column}");
         return Ok(j!({"table": name, "unchanged": true}));
@@ -1212,6 +1226,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             m.columns[at].1 = crate::query::type_name(&new);
             j!({"column": column, "type": m.columns[at].1})
         }
+        Change::Default(_) | Change::NotNull(_) => unreachable!("defaults::alter takes them, above"),
     };
     let mut puts = vec![(table_key(&name), json(&m))];
     let del = crate::sys::deleted(&name);

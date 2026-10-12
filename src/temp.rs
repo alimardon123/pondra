@@ -63,6 +63,7 @@ struct Table {
     rows: Vec<RecordBatch>,         // its columns, then its system columns (`sys.rs`)
     next: i64,                      // the next row id
     version: i64,                   // the last change's number (its rows' `_version`)
+    key: Vec<String>,               // the PRIMARY KEY's columns: no two rows repeat them, none is NULL
 }
 
 impl Table {
@@ -305,14 +306,14 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
         return Ok(j!({"table": name, "temporary": true, "unchanged": true}));
     }
     let spec: Value = serde_json::from_str(&crate::write::create_spec(c, &app.lake, files).await?)?;
-    let keyed = spec["key"].as_array().is_some_and(|k| !k.is_empty()) || spec["merge"].as_object().is_some_and(|m| !m.is_empty());
-    ensure!(!keyed, "{name}: a temporary table keeps its rows as they come (PRIMARY KEY and merge are a lake table's)");
+    let key: Vec<String> = serde_json::from_value(spec["key"].clone()).unwrap_or_default(); // (PRIMARY KEY: checked as rows come, `check_key`)
+    ensure!(spec["merge"].as_object().is_none_or(|m| m.is_empty()), "{name}: a merge table is a lake table's (a temporary table keeps its rows as they come)");
     ensure!(spec["enums"].as_object().is_none_or(|e| e.is_empty()), "{name}: a temporary table's columns are plain types (an enum column is a lake table's)");
     ensure!(!spec["constraints"].as_array().is_some_and(|k| k.iter().any(|k| k["enforced"] == true)), "{name}: a temporary table keeps its rows as they come (UNIQUE is a lake table's; NOT ENFORCED keeps none)");
     let columns: Vec<(String, String)> = serde_json::from_value(spec["columns"].clone())?;
     let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::write::stored(&crate::query::dtype(t)?))))).collect::<Result<Vec<_>>>()?;
     ensure!(columns.iter().all(|(c, _)| !crate::sys::NAMES.contains(&c.as_str())), "{}: system columns (every table has them)", crate::sys::NAMES.join(", "));
-    with(s, true, |x| Ok(x.tables.insert(name.clone(), Table { columns, rows: vec![], next: 1, version: 0 })))?;
+    with(s, true, |x| Ok(x.tables.insert(name.clone(), Table { columns, rows: vec![], next: 1, version: 0, key })))?;
     let rows = match &c.query {
         Some(q) => insert(app, s, &name, None, &q.to_string(), files).await?["rows"].clone(),
         None => j!(0),
@@ -340,8 +341,8 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
 
 /// UPDATE, DELETE or MERGE: what changes, worked out as for a lake table, applied here.
 async fn change(app: &App, s: &str, name: &str, stmt: &Stmt) -> Result<Value> {
-    let columns = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| t.columns.clone()).with_context(|| format!("no temporary table {name}"))?;
-    let meta = TableMeta { columns, ids: true, ..Default::default() };
+    let (columns, key) = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.columns.clone(), t.key.clone())).with_context(|| format!("no temporary table {name}"))?;
+    let meta = TableMeta { columns, ids: true, key, ..Default::default() }; // (a key: an ON CONFLICT without a column list is on it)
     let (old, new) = crate::change::rows_of(&app.lake, name, &meta, stmt, app.lake.visible()).await?;
     let count = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
     let inserted: usize = new.iter().map(|b| b.column_by_name(crate::sys::ROW_ID).map_or(b.num_rows(), |c| c.null_count())).sum();
@@ -385,9 +386,37 @@ fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<RecordBatch>) -> Resu
             let columns = columns.iter().zip(schema.fields()).map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type())).collect::<Result<_, _>>()?; // (as the table's types)
             rows.push(RecordBatch::try_new(schema.clone(), columns)?);
         }
+        check_key(name, &t.columns, &t.key, &rows)?;
         let bytes: usize = rows.iter().map(|b| b.get_array_memory_size()).sum();
         ensure!(others + bytes <= *BUDGET, "temporary tables on this node would hold {} MB, past PONDRA_TEMP_MB ({} MB): a lake table holds more", (others + bytes) >> 20, *BUDGET >> 20);
         (t.rows, t.version) = (rows, version);
         Ok(())
     })
+}
+
+/// A temporary table's PRIMARY KEY, checked over every row as a change leaves them: no NULL in a key
+/// column (23502), and no two rows with the same key, within one INSERT too (23505, named `{name}_pkey`
+/// as Postgres names it).
+fn check_key(name: &str, columns: &[(String, String)], key: &[String], rows: &[RecordBatch]) -> Result<()> {
+    if key.is_empty() {
+        return Ok(());
+    }
+    let at: Vec<usize> = key.iter().map(|k| columns.iter().position(|(c, _)| c == k).with_context(|| format!("key column {k}"))).collect::<Result<_>>()?;
+    let mut seen = HashSet::new();
+    for b in rows {
+        for r in 0..b.num_rows() {
+            let mut values = Vec::with_capacity(at.len());
+            for (k, &i) in key.iter().zip(&at) {
+                let c = b.column(i);
+                if c.is_null(r) {
+                    return Err(crate::codes::coded("23502", format!("null value in column \"{k}\" of relation \"{name}\" violates not-null constraint")));
+                }
+                values.push(datafusion::arrow::util::display::array_value_to_string(c, r)?);
+            }
+            if !seen.insert(values.clone()) {
+                return Err(crate::codes::coded("23505", format!("duplicate key value violates unique constraint \"{name}_pkey\": Key ({})=({}) already exists", key.join(", "), values.join(", "))));
+            }
+        }
+    }
+    Ok(())
 }

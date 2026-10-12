@@ -656,7 +656,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             Stmt::Update(relation(&u.table.relation)?, set.collect(), where_(&u.selection))
         }
         Statement::AlterTable(a) => match &a.operations[..] {
-            [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if c.options.iter().any(|o| matches!(o.option, ast::ColumnOption::NotNull | ast::ColumnOption::Default(_))) || !matches!(crate::seq::identity_of(c), Ok(None)) => {
+            [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if crate::defaults::fills_existing(c) || !matches!(crate::seq::identity_of(c), Ok(None)) => {
                 Stmt::Invalid(format!("ALTER TABLE {} ADD COLUMN {} … NOT NULL, DEFAULT or an identity: the rows already there would have no value for it (add it, then UPDATE {} SET {} = …)", a.name, c.name, a.name, c.name))
             }
             [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => Stmt::AddColumn(object(&a.name), ident(&c.name), sql_type(&c.data_type), *if_not_exists),
@@ -664,6 +664,12 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             [ast::AlterTableOperation::RenameColumn { old_column_name: from, new_column_name: to }] => alter(&a, from, Change::Rename(ident(to))),
             [ast::AlterTableOperation::DropColumn { column_names, if_exists, .. }] => Stmt::Ddl(column_names.iter().map(|c| Ddl::AlterColumn { table: object(&a.name), column: ident(c), change: Change::Drop { if_exists: *if_exists } }).collect()),
             [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetDataType { data_type, .. } }] => alter(&a, c, Change::Type(data_type.to_string())),
+            // (defaults and NOT NULL: `defaults.rs`; `SET DEFAULT NULL` is no default, as `DEFAULT NULL` in ADD COLUMN)
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetDefault { value } }] if crate::defaults::is_null(value) => alter(&a, c, Change::Default(None)),
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetDefault { value } }] => alter(&a, c, Change::Default(Some(value.to_string()))),
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::DropDefault }] => alter(&a, c, Change::Default(None)),
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetNotNull }] => alter(&a, c, Change::NotNull(true)),
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::DropNotNull }] => alter(&a, c, Change::NotNull(false)),
             [ast::AlterTableOperation::RenameTable { table_name }] => {
                 let to = table_name.to_string();
                 let to = to.trim_start_matches("TO ").trim_start_matches("AS ");
@@ -877,7 +883,8 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
     }
     // (`PARTITION BY`, `CLUSTER BY`, `SEQUENCE BY`, `TTL` and `MERGE sum` came in as these options: `layout.rs`)
     if let o @ (ast::CreateTableOptions::Plain(_) | ast::CreateTableOptions::TableProperties(_)) = &c.table_options {
-        bail!("CREATE TABLE {} … {o}: a table's options go in WITH (name = value, …)", c.name);
+        // (MySQL's `ENGINE=…` and the like: a feature of another engine, refused by name with its SQLSTATE)
+        return Err(crate::codes::coded("0A000", format!("CREATE TABLE {} … {o}: a table's options go in WITH (name = value, …)", c.name)));
     }
     const OPTIONS: [&str; 7] = ["publish", "cluster_by", "partition_by", "ttl", "order_by", "merge", "retention"];
     if let Some(k) = opts.keys().find(|k| !OPTIONS.contains(&k.as_str())) {
