@@ -91,6 +91,11 @@ pub fn check_all(table: &str) -> Result<()> {
 /// A user's grants, if the request being served is a user's who isn't a superuser.
 pub fn limited() -> Option<Arc<crate::users::Access>> { current().and_then(|p| p.access) }
 
+/// Whether the request being served is shown routines' code and tasks' statements (S27): a token, a superuser,
+/// an open node, and a user who could hold them anyway (APPLY deploys them, CLONE ON DATABASE copies them into
+/// a branch it owns). A user granted some tables is shown their names and parameters only.
+pub fn shows_code() -> bool { limited().is_none_or(|a| a.applies() || a.clones().is_some_and(|s| s.is_empty())) }
+
 /// Is the request being served from whoever runs the nodes (`Principal::token`)? (None: work no
 /// door started, a task's included, is not: whoever made the task may be anyone.)
 pub fn operator() -> bool { current().is_some_and(|p| p.operator) }
@@ -209,6 +214,15 @@ pub fn check(privilege: &str, table: &str) -> Result<()> {
     match limited() {
         Some(a) if !a.may(privilege, table) => bail!("permission denied: {} on {table} (GRANT {} ON {table} TO {})", privilege.to_uppercase(), privilege.to_uppercase(), current().map(|p| p.name).unwrap_or_default()),
         _ => Ok(()),
+    }
+}
+
+/// A locking read (`SELECT … FOR UPDATE`) takes the rows as an UPDATE would, so it needs what an UPDATE needs: a write
+/// token, or a user granted UPDATE on the table (Postgres asks the UPDATE privilege of FOR UPDATE, 42501 without it).
+pub fn may_lock(table: &str) -> Result<()> {
+    match current() {
+        Some(p) if p.access.is_none() && p.role < Role::Write => bail!("permission denied: FOR UPDATE on {table} needs UPDATE, and this token may only read"),
+        _ => check("update", &catalog_name(table)),
     }
 }
 

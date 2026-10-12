@@ -334,7 +334,7 @@ CASES = [
     ("postgres", "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"),
     ("postgres", "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"),
     ("postgres", "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", ("0A000", "ISOLATION LEVEL REPEATABLE READ")),
-    ("postgres", "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY", ("0A000", "granted SELECT only")),
+    ("postgres", "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"),  # (a session's transactions are read-only, 25006 on a write: ADR-067)
     ("postgres", "SET default_transaction_isolation = 'serializable'", ("0A000", "ISOLATION LEVEL REPEATABLE READ")),
     ("postgres", "SET client_encoding = 'LATIN1'", ("22023", "client_encoding = 'UTF8'")),
     ("postgres", "SET client_encoding = 'UTF8'"),

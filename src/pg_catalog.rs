@@ -596,7 +596,7 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
             let names: Vec<String> = r.params.iter().map(|p| p.name.clone()).collect();
             vec![o(*oid), s(name.clone()), o(schema_oid(schema)), o(owner), o(lang), f4(100.0), f4(if r.kind == Kind::Table { 1000.0 } else { 0.0 }), o(0), s("-"), s(kind), b(false), b(false), b(false),
                 b(r.kind == Kind::Table), s("v"), s("u"), i2(r.params.len() as i16), i2(r.params.iter().filter(|p| p.default.is_some()).count() as i16), o(rettype),
-                ScalarValue::List(ScalarValue::new_list_nullable(&args, &OID)), n(), n(), texts(&names), s(r.body.clone()), n(), n(), n()]
+                ScalarValue::List(ScalarValue::new_list_nullable(&args, &OID)), n(), n(), texts(&names), if crate::auth::shows_code() { s(r.body.clone()) } else { n() }, n(), n(), n()]
         }).chain(type_functions().into_iter().map(|f| vec![o(oid("tf", &f)), s(f.clone()), o(11), o(10), o(12), f4(1.0), f4(0.0), o(0), s("-"), s("f"), b(false), b(false), b(true),
             b(false), s("i"), s("s"), i2(1), i2(0), o(0), ScalarValue::List(ScalarValue::new_list_nullable(&[o(0)], &OID)), n(), n(), n(), s(f), n(), n(), n()])).collect())?));
     out.push(("pg_database", table(&[("oid", OID), ("datname", TEXT), ("datdba", OID), ("encoding", INT4), ("datlocprovider", TEXT), ("datistemplate", BOOL), ("datallowconn", BOOL),
@@ -761,7 +761,7 @@ fn information_schema(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
         l.routines.iter().map(|(oid, schema, name, r)| {
             let procedure = r.kind == crate::routines::Kind::Procedure;
             vec![db(), s(schema.clone()), s(format!("{name}_{oid}")), db(), s(schema.clone()), s(name.clone()), s(if procedure { "PROCEDURE" } else { "FUNCTION" }), r.returns.clone().map_or(n(), s),
-                s(if r.language == "python" { "EXTERNAL" } else { "SQL" }), s(r.body.clone()), s(if r.language.is_empty() { "SQL".to_string() } else { r.language.to_uppercase() }), s("NO")]
+                s(if r.language == "python" { "EXTERNAL" } else { "SQL" }), if crate::auth::shows_code() { s(r.body.clone()) } else { n() }, s(if r.language.is_empty() { "SQL".to_string() } else { r.language.to_uppercase() }), s("NO")]
         }).collect())?));
     out.push(("sequences", table(&[("sequence_catalog", TEXT), ("sequence_schema", TEXT), ("sequence_name", TEXT), ("data_type", TEXT), ("numeric_precision", INT4),
         ("numeric_precision_radix", INT4), ("numeric_scale", INT4), ("start_value", TEXT), ("minimum_value", TEXT), ("maximum_value", TEXT), ("increment", TEXT), ("cycle_option", TEXT)],

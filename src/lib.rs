@@ -57,6 +57,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod kafka;
 #[cfg(feature = "server")] mod kafka_client;
 #[cfg(feature = "server")] mod live;
+#[cfg(feature = "server")] mod locks;
 #[cfg(feature = "server")] mod serve;
 #[cfg(feature = "server")] mod settings;
 #[cfg(feature = "server")] mod shares;

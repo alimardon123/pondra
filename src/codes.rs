@@ -58,6 +58,9 @@ fn by_words(text: &str) -> &'static str {
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
         _ if has("can't reach the bucket") || has("catching up with its leader") => "57P03",   // cannot_connect_now (a leader cut off, a node just started: ask another node)
         _ if has("error sending request") => "58030",                                           // io_error (the bucket or another node didn't answer: try again)
+        _ if has("deadlock detected") => "40P01",                                               // deadlock_detected (`locks.rs`)
+        _ if has("lock timeout") || has("could not obtain lock") => "55P03",                    // lock_not_available (a lock wait, or NOWAIT)
+        _ if has("this node is stopping") => "57P01",                                           // admin_shutdown (a drain ends a wait)
         _ if has("statement timeout") || has("canceling statement") || has("timed out") => "57014", // query_canceled
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)
@@ -113,7 +116,7 @@ pub fn grpc(code: &str) -> tonic::Code {
         "57014" => tonic::Code::DeadlineExceeded,
         "53200" | "53300" => tonic::Code::ResourceExhausted,
         "0A000" => tonic::Code::Unimplemented,
-        "23514" | "23502" | "25006" | "25P01" | "25P02" => tonic::Code::FailedPrecondition, // (a transaction that isn't open, or failed)
+        "23514" | "23502" | "25006" | "25P01" | "25P02" | "25P03" => tonic::Code::FailedPrecondition, // (a transaction that isn't open, failed, or idle-ended)
         c if c.starts_with("42") || c.starts_with("22") => tonic::Code::InvalidArgument,
         _ => tonic::Code::Internal,
     }
@@ -151,6 +154,12 @@ mod tests {
         assert_eq!(super::named("invalid_catalog_name"), Some("3D000"));
         assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("new row for relation \"t\" violates check constraint \"c\"".into(), "23514"))), "23514");
         assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("invalid input value for enum mood: \"x\"".into(), "22P02"))), "22P02");
+        // (a lock refusal a follower reads back as words keeps its code: "canceling statement" is a cancel, 57014, otherwise)
+        assert_eq!(of("the leader at http://10.0.0.1:8080: canceling statement due to lock timeout"), "55P03");
+        assert_eq!(of("deadlock detected: this write waits for a row another transaction holds"), "40P01");
+        assert_eq!(of("could not obtain lock on a row: it is held by another transaction (NOWAIT)"), "55P03");
+        assert_eq!(of("this node is stopping: its lock waits end, and its transaction with them"), "57P01");
+        assert_eq!(of("canceling statement due to statement timeout"), "57014");
     }
 
     #[test]

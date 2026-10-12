@@ -62,13 +62,13 @@ fn alias_in_where(sql: &str) -> bool {
 
 /// `sql` with what the parser can't read as it is written turned into what it can.
 pub fn text(sql: &str) -> Result<Cow<'_, str>> {
-    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b").expect("a regex"));
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b").expect("a regex"));
     if !LOOK.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
     let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
     s = comprehensions(&s)?;
-    for pass in [lambda_words, asof_on, using_sample] {
+    for pass in [lambda_words, asof_on, using_sample, lock_words] {
         if let Some(t) = Tokens::of(&s) {
             s = t.edit(pass(&t)?);
         }
@@ -237,6 +237,32 @@ fn using_sample(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
             true => edits.push((t.at[i], t.at.get(t.next(end)).copied().unwrap_or(t.sql.len()), format!("WHERE pondra_sample({spec}) AND "))),
             false => edits.push((t.at[i], t.at.get(end).copied().unwrap_or(t.sql.len()), format!("WHERE pondra_sample({spec}) "))),
         }
+    }
+    Ok(edits)
+}
+
+/// Postgres's weaker row locks, `FOR NO KEY UPDATE` and `FOR KEY SHARE`, as the `FOR UPDATE` and `FOR SHARE`
+/// the parser reads: they take the same locks here (ADR-067 §3).
+fn lock_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
+    let mut edits = Vec::new();
+    for i in (0..t.toks.len()).filter(|&i| t.word(i, Keyword::FOR)) {
+        let (mut at, mut ids, mut words) = (i, Vec::new(), Vec::new());
+        for _ in 0..3 {
+            let j = t.next(at);
+            let Some(Token::Word(w)) = t.toks.get(j) else { break };
+            words.push(w.value.to_uppercase());
+            ids.push(j);
+            at = j;
+        }
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        let (len, with) = if words.starts_with(&["NO", "KEY", "UPDATE"]) {
+            (3, "FOR UPDATE")
+        } else if words.starts_with(&["KEY", "SHARE"]) {
+            (2, "FOR SHARE")
+        } else {
+            continue;
+        };
+        edits.push((t.at[i], t.end(ids[len - 1]), with.to_string()));
     }
     Ok(edits)
 }
