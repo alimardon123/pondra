@@ -205,36 +205,43 @@ fn violated(name: &str, columns: &[String], key: String) -> anyhow::Error {
 /// A new row whose key one of the `old` rows had is no new key (an UPDATE keeps its key, a swap moves
 /// two keys between rows, a key the change deletes is free), so it is not looked up. Every new row
 /// still counts for the first test. `meta` is the table as it is stored; `new` and `old` are in SQL's
-/// column names. This is the table as the node has it now (COMMIT's check: `key_check_at` for the rest).
+/// column names. The table is read as this node has it now.
 pub async fn key_check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&RecordBatch>, new: &RecordBatch) -> Result<()> {
-    key_check_at(lake, table, meta, old, new, None).await
+    let kept: Vec<Option<bool>> = match old.filter(|o| o.num_rows() > 0) {
+        None => vec![None; new.num_rows()], // (a plain INSERT's: nothing taken away, and no key's text to make)
+        Some(o) => {
+            let key: Vec<String> = meta.key.iter().map(|c| meta.name_of(c).to_string()).collect();
+            let gone: std::collections::HashSet<String> = crate::txn::key_texts(o, &key)?.into_iter().collect();
+            crate::txn::key_texts(new, &key)?.iter().map(|k| gone.contains(k).then_some(false)).collect()
+        }
+    };
+    key_check_over(lake, table, meta, new, &kept).await
 }
 
-/// `key_check` against the table as it reads at commit `upto`, through the session's overlay (`held`). A plain INSERT in a
-/// transaction is checked this way at its statement, so Postgres's refusal comes there, where a SAVEPOINT can roll it back:
-/// its transaction's own writes count (a key it inserted is held, one it deleted is free). None: the table as this node has it.
-pub async fn key_check_at(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&RecordBatch>, new: &RecordBatch, upto: Option<u64>) -> Result<()> {
+/// `key_check`, told what the writer kept of the table for each new row's key (`kept`, as `txn::ByKey::kept` answers): Some(true) a
+/// row it keeps holds the key (refused), Some(false) it took the table's row of it away (free), None neither (looked up in the table
+/// as this node has it now, `held`). A plain INSERT in a transaction is checked this way at its statement, as Postgres checks it,
+/// so a SAVEPOINT can roll the refusal back. Under READ COMMITTED its keys are its locks by then, so a key another transaction
+/// committed while it waited is held; COMMIT checks every key again either way.
+pub async fn key_check_over(lake: &Lake, table: &str, meta: &TableMeta, new: &RecordBatch, kept: &[Option<bool>]) -> Result<()> {
     let name = format!("{}_pkey", table.rsplit('.').next().unwrap_or(table)); // (Postgres's name for a primary key that isn't named)
     let key: Vec<String> = meta.key.iter().map(|c| meta.name_of(c).to_string()).collect(); // (SQL's names, as `logical` gives them)
     if let Some(found) = twice(new, &key, &[])? {
         return Err(violated(&name, &key, found));
     }
-    let fresh = fresh_keys(new, old, &key)?;
+    let columns = key.iter().map(|c| new.column_by_name(c).cloned().ok_or_else(|| anyhow::anyhow!("no column {c}"))).collect::<Result<Vec<_>>>()?;
+    if let Some(i) = kept.iter().position(|k| *k == Some(true)) {
+        return Err(violated(&name, &key, shown(&columns, i)));
+    }
+    // (the key columns, in the table's key order, of the rows whose key is neither: one row per key by now, `twice`)
+    let all = RecordBatch::try_from_iter(key.iter().map(String::as_str).zip(columns))?;
+    let fresh = datafusion::arrow::compute::filter_record_batch(&all, &datafusion::arrow::array::BooleanArray::from(kept.iter().map(|k| Some(k.is_none())).collect::<Vec<_>>()))?;
     if fresh.num_rows() > 0 {
-        if let Some(found) = held(lake, table, meta, &fresh, upto).await? {
+        if let Some(found) = held(lake, table, meta, &fresh).await? {
             return Err(violated(&name, &key, found));
         }
     }
     Ok(())
-}
-
-/// The key columns (in the table's key order) of the new rows whose key no old row had, one row per
-/// key (the new rows' keys are distinct by now: `twice`).
-fn fresh_keys(new: &RecordBatch, old: Option<&RecordBatch>, key: &[String]) -> Result<RecordBatch> {
-    let keys = key.iter().map(|c| new.column_by_name(c).cloned().ok_or_else(|| anyhow::anyhow!("no column {c}"))).collect::<Result<Vec<_>>>()?;
-    let all = RecordBatch::try_from_iter(key.iter().map(String::as_str).zip(keys.iter().cloned()))?;
-    let Some(old) = old.filter(|o| o.num_rows() > 0) else { return Ok(all) };
-    Ok(datafusion::arrow::compute::filter_record_batch(&all, &absent(new, old, key)?)?)
 }
 
 /// For each row of `of`: is its key (the columns `key`) absent from `among`'s rows? `among`'s key
@@ -252,16 +259,14 @@ pub fn absent(of: &RecordBatch, among: &RecordBatch, key: &[String]) -> Result<d
 }
 
 /// Is one of these keys (`keys`: the key columns in the table's key order, named as SQL names them, one
-/// row per key) held by a live row of `table`? A deleted key is free. A table without `order` and up to
-/// 1,000 keys of types the point lookup reads (integers, text) are looked up one by one
-/// (`serve::lookup_versioned`, on the stored `meta`: the log tail, then the files by their key ranges);
-/// more keys, or an `order` table (its lookups go through SQL: invariant 79), are one query, the keys as
-/// a table of their own, so the files' key ranges prune. Returns the first key held, as Postgres's
-/// DETAIL writes it. `upto` None reads the table as this node has it (the lookups where they can). Some(at)
-/// reads it as of commit `at` through the session's overlay, by the query alone: the lookups read neither
-/// a transaction's own writes nor a read point.
-pub async fn held(lake: &Lake, table: &str, meta: &TableMeta, keys: &RecordBatch, upto: Option<u64>) -> Result<Option<String>> {
-    let point = upto.is_none() && meta.ids && meta.order.is_none() && keys.num_rows() <= 1000 && meta.key.iter().all(|k| meta.columns.iter().any(|(c, t)| c == k && is_point_type(t)));
+/// row per key) held by a live row of `table`, as this node has it now? A deleted key is free. A table
+/// without `order` and up to 1,000 keys of types the point lookup reads (integers, text) are looked up one
+/// by one (`serve::lookup_versioned`, on the stored `meta`: the log tail, then the files by their key
+/// ranges); more keys, or an `order` table (its lookups go through SQL: invariant 79), are one query, the
+/// keys as a table of their own, so the files' key ranges prune. Returns the first key held, as Postgres's
+/// DETAIL writes it.
+pub async fn held(lake: &Lake, table: &str, meta: &TableMeta, keys: &RecordBatch) -> Result<Option<String>> {
+    let point = meta.ids && meta.order.is_none() && keys.num_rows() <= 1000 && meta.key.iter().all(|k| meta.columns.iter().any(|(c, t)| c == k && is_point_type(t)));
     if point {
         for i in 0..keys.num_rows() {
             let values = keys.columns().iter().map(|c| datafusion::arrow::util::display::array_value_to_string(c, i)).collect::<std::result::Result<Vec<_>, _>>()?;
@@ -276,7 +281,7 @@ pub async fn held(lake: &Lake, table: &str, meta: &TableMeta, keys: &RecordBatch
     let cols = names.iter().map(|c| format!("t.{}", q(c))).collect::<Vec<_>>().join(", ");
     let on = names.iter().map(|c| format!("t.{0} = n.{0}", q(c))).collect::<Vec<_>>().join(" AND ");
     let sql = format!("SELECT {cols} FROM {} AS t JOIN __pondra_keys AS n ON {on} LIMIT 1", crate::write::sql_name(table));
-    let ctx = crate::query::session_at(lake, &sql, "", Some(upto.unwrap_or_else(|| lake.visible()))).await?;
+    let ctx = crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?;
     ctx.register_batch("__pondra_keys", keys.clone())?;
     let found = crate::query::sql(&ctx, &sql).await?.collect().await?;
     Ok(found.iter().find(|b| b.num_rows() > 0).map(|b| shown(b.columns(), 0)))
@@ -299,13 +304,14 @@ fn twice(new: &RecordBatch, columns: &[String], key: &[String]) -> Result<Option
         true => None,
         false => Some(converter(&keys)?.convert_columns(&keys)?),
     };
-    let mut seen = std::collections::HashMap::new();
+    // (rows held as references into the converted buffers: a Vec made for each row took a million-row INSERT's check 0.5–0.9 s)
+    let mut seen = std::collections::HashMap::with_capacity(new.num_rows());
     for i in 0..new.num_rows() {
         if values.iter().any(|v| v.is_null(i)) {
             continue;
         }
-        let k = key_rows.as_ref().map(|k| k.row(i).as_ref().to_vec());
-        if let Some(before) = seen.insert(rows.row(i).as_ref().to_vec(), k.clone()) {
+        let k = key_rows.as_ref().map(|k| k.row(i));
+        if let Some(before) = seen.insert(rows.row(i), k) {
             if key_rows.is_none() || before != k {
                 return Ok(Some(shown(&values, i)));
             }
