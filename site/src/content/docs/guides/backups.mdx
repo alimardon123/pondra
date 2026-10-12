@@ -4,6 +4,7 @@ description: Back a database up to another place with BACKUP DATABASE, keep it c
 ---
 
 import { Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 A backup is a copy of a whole database in a place of its own: another folder, another bucket or
 another provider. It holds everything the database does, as of one moment: its tables, the newest
@@ -63,17 +64,13 @@ Its answer says `"runs": 2`, and `copied` counts only the new objects.
 
 A task runs it on a schedule, like any other statement ([tasks](/pondra/guides/tasks/)):
 
-```sql
-CREATE TASK nightly_backup SCHEDULE 'cron 0 3 * * * UTC' AS BACKUP DATABASE TO 'backups/shop';
-```
+<Ways sql={`CREATE TASK nightly_backup SCHEDULE 'cron 0 3 * * * UTC' AS BACKUP DATABASE TO 'backups/shop';`} />
 
 A backup keeps each run restorable for seven days. Say how long with `WITH (retention_days = n)`; the
 backup keeps the last number it was given. Files no run within that time needs are deleted from the
 backup by a later run.
 
-```sql
-BACKUP DATABASE TO 'backups/shop' WITH (retention_days = 30);
-```
+<Ways sql={`BACKUP DATABASE TO 'backups/shop' WITH (retention_days = 30);`} />
 
 ## Read a backup
 
@@ -81,10 +78,9 @@ A backup is a database of its own: attach it and read it, or serve it with `pond
 backups/shop`. It is read-only: every write to it is refused with SQLSTATE `25006`, whatever door it
 comes through, and only its next `BACKUP DATABASE … TO` changes it.
 
-```sql
-ATTACH 'backups/shop' AS shop_backup;
-SELECT * FROM shop_backup.orders ORDER BY id;
-```
+<Ways sql={`ATTACH 'backups/shop' AS shop_backup;`} />
+
+<Ways sql={`SELECT * FROM shop_backup.orders ORDER BY id;`} />
 
 ```text
 id | item  | qty
@@ -103,10 +99,9 @@ shop_backup` makes a database you can write, with nothing copied ([branches](/po
 one (or at `LOCATION 'dir'`), and attaches it as `name`. `AT (TIMESTAMP => '…')` restores the newest
 run at or before that time, in UTC, instead.
 
-```sql
-RESTORE DATABASE shop_restored FROM 'backups/shop';
-SELECT count(*) AS orders FROM shop_restored.orders;
-```
+<Ways sql={`RESTORE DATABASE shop_restored FROM 'backups/shop';`} />
+
+<Ways sql={`SELECT count(*) AS orders FROM shop_restored.orders;`} />
 
 ```text
 orders

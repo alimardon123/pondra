@@ -121,7 +121,8 @@ python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node)
 install.sh, install.ps1   the one-line installers each release carries (ADR-024)
 deploy/   the container image (docker/Dockerfile; tools/image.py lays out its context), a compose
           cluster (compose/) and the Helm chart (helm/pondra); ADR-041
-js/       the JavaScript client and the `pondra` npm package's files
+js/       the JavaScript client (`index.js`) and its frames (`frame.js`, Python's frames with nodejs-polars'
+          names), and the `pondra` npm package's files
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style),
           console-extension.js (what a console extension adds: a section, a tab, a view, an action)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
@@ -2271,6 +2272,7 @@ python3 tools/bench/files_tpch.py --data ~/tpch/sf1-bench        # TPC-H from fi
 python3 tools/files_s3_check.py                # files in a real bucket (R2): a glob, the cache by version, a file changed, COPY there
 python3 tools/slt_check.py --slt <datafusion>/datafusion/sqllogictest/test_files [--nodes 3]   # DataFusion's sqllogictest: pass rate, failures grouped (D1)
 python3 tools/frames_check.py                  # pondra.frame == Polars (26 pipelines); one question asked 10 ways; a sort kept through steps
+python3 tools/js_frames_check.py --bin target/release/pondra   # JavaScript's frames == Python's (the same SQL text and rows), its reads and writes, and the client's calls next to Python's
 ~/venv-spark/bin/python tools/spark_check.py   # pondra.spark == PySpark 4.0.1 (55 pipelines, files and UDFs among them: values and column names)
 python3 tools/bench/tpch_frames.py --data ~/tpch/sf1-bench   # TPC-H: SQL == frames == PySpark code, 22 of 22
 python3 tools/bench/nexmark.py [--events 4000000] [--alone] # Nexmark's 20 queries: Pondra (== DuckDB) and Flink 2.3 (venv-flink)
