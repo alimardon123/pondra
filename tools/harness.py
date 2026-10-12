@@ -10449,7 +10449,9 @@ def friendly():
     over the same rows: PIVOT and UNPIVOT (DuckDB's statements and the standard's), COLUMNS(…),
     `* RENAME`, ORDER BY ALL, FETCH FIRST, list comprehensions and lambdas, a struct's field,
     max_by and arg_min, string_split, json_extract, DuckDB's ASOF JOIN … ON, a select's alias in
-    its WHERE, SUMMARIZE; samples that sample (TABLESAMPLE was ignored); refusals by name; the
+    its WHERE, SUMMARIZE; a DOUBLE meeting a DECIMAL (a DOUBLE, as DuckDB and Postgres make it: it
+    was a DECIMAL(30, 15), which failed past 10^15) and an INSERT's VALUES of both; samples that
+    sample (TABLESAMPLE was ignored); refusals by name; the
     same answers spread over three nodes; and what `random_sql.py` found (`- -3` written again as
     a comment, a DISTINCT over a CASE refused, two IN lists of a column taken as sets of values,
     columns of one name on both sides of a join mixed up)."""
@@ -10468,7 +10470,10 @@ def friendly():
     setup = ["CREATE TABLE t (id INTEGER, k INTEGER, g VARCHAR, x DOUBLE, n DOUBLE, l INTEGER[], ts TIMESTAMP, j VARCHAR)",
              "INSERT INTO t VALUES " + ", ".join(row(i) for i in range(2000)),
              "CREATE TABLE q (k INTEGER, ts TIMESTAMP, p DOUBLE)",
-             "INSERT INTO q VALUES " + ", ".join(f"({k}, TIMESTAMP '{t0 + datetime.timedelta(minutes=37 * i + k)}', {i + k / 10})" for i in range(60) for k in range(6))]
+             "INSERT INTO q VALUES " + ", ".join(f"({k}, TIMESTAMP '{t0 + datetime.timedelta(minutes=37 * i + k)}', {i + k / 10})" for i in range(60) for k in range(6)),
+             # (doubles past 10^15 beside decimals: DataFusion made both a DECIMAL(30, 15), and failed)
+             "CREATE TABLE big (x DOUBLE, r REAL, d DECIMAL(38, 2))",
+             "INSERT INTO big VALUES (1e20, 1.5, 12.34), (0.7, 0.25, 0.5), (1e-20, NULL, 99999999999999999999.99), (-3e18, -2.5, -1.25), (NULL, 3, NULL)"]
     for s_ in setup:
         sql(A.port, s_)
         duck.execute(s_)
@@ -10532,6 +10537,10 @@ def friendly():
         "x IN (a column, …) AND x IN (…): not the lists' intersection (random_sql.py)": ("SELECT id FROM t WHERE g IN (g, 'z') AND g IN ('a', 'b')", True, False),
         "x IN (…) AND x NOT IN (NULL): no row (random_sql.py)": ("SELECT count(*) AS c FROM t WHERE g IN ('a', 'b') AND g NOT IN (NULL)", True, False),
         "columns of one name on both sides of a LEFT JOIN, filtered on its padded side (random_sql.py)": ("SELECT (t.ts - q.ts) AS d, t.k FROM t LEFT JOIN q ON t.id = q.k WHERE q.k IS DISTINCT FROM 3", True, False),
+        "a DOUBLE past 10^15 compared with decimals (=, >, <, BETWEEN, IN)": ("SELECT x, x = 0.7 AS e, x > 0.5 AS g, x < 1e30 AS l, x BETWEEN 0.5 AND 2.5 AS b, x IN (0.7, 2.5) AS i FROM big", True, False),
+        "…in arithmetic, a REAL's and a DECIMAL column's too": ("SELECT x * 1.5 AS a, x + 0.25 AS b, r * 2.5 AS c, d * x AS e, d + 0.01 AS f FROM big", True, False),
+        "…as CASE's branches, COALESCE, GREATEST and LEAST": ("SELECT CASE WHEN x > 1 THEN x ELSE 0.5 END AS c, coalesce(x, 0.5) AS o, greatest(x, 0.5) AS g, least(x, 2.5) AS l FROM big", True, False),
+        "…in a UNION and as a join's key": ("SELECT x FROM big UNION ALL SELECT 0.25 UNION ALL SELECT big.x FROM big JOIN (VALUES (0.7)) v(e) ON big.x = v.e", True, False),
     }
     checks, failed = {}, {}
     for name, (q, names, ordered) in same.items():

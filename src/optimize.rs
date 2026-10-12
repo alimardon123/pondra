@@ -3,8 +3,8 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchema, NullEquality, Result};
 use datafusion::logical_expr::utils::{can_hash, conjunction, disjunction, find_valid_equijoin_key_pair, split_binary, split_conjunction};
-use datafusion::logical_expr::{build_join_schema, Aggregate, Expr, Filter, Join, JoinConstraint, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, Projection, SubqueryAlias};
-use datafusion::optimizer::{optimizer::ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
+use datafusion::logical_expr::{ExprSchemable, build_join_schema, Aggregate, Expr, Filter, Join, JoinConstraint, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, Projection, SubqueryAlias};
+use datafusion::optimizer::{analyzer::{Analyzer, AnalyzerRule}, optimizer::ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 use datafusion::common::config::ConfigOptions;
 use datafusion::physical_optimizer::{optimizer::PhysicalOptimizer, PhysicalOptimizerRule};
 use datafusion::physical_expr::expressions::{lit, Column as PhysicalColumn, DynamicFilterPhysicalExpr};
@@ -70,6 +70,132 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     rules.push(Arc::new(CheapFirst));
     rules.push(Arc::new(AsyncBelow)); // (last: after COUNT(DISTINCT) became a GROUP BY)
     rules
+}
+
+/// DataFusion's analyzer rules, with Pondra's before its type coercion.
+pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+    let mut rules = Analyzer::new().rules;
+    let at = rules.iter().position(|r| r.name() == "type_coercion").unwrap_or(0);
+    rules.insert(at, Arc::new(FloatsWin));
+    rules
+}
+
+/// A DOUBLE (or REAL) that meets a DECIMAL makes both DOUBLEs, as Postgres and DuckDB do: `price >
+/// 9.99` compares doubles. DataFusion made both a DECIMAL(30, 15) instead, which cast every row of
+/// the column (TPC-H q6 compares a DOUBLE with three decimals) and failed on any value of 10^15 or
+/// more ("too large to store in a Decimal128 of precision 30"). Done before DataFusion's type
+/// coercion, which then finds both sides alike: comparisons and arithmetic, BETWEEN, IN lists,
+/// CASE's branches, COALESCE and its kind, a join's keys and a UNION's columns. (An INSERT's VALUES
+/// take their columns' types: `write::rows_for`.)
+#[derive(Debug)]
+struct FloatsWin;
+
+impl AnalyzerRule for FloatsWin {
+    fn name(&self) -> &str {
+        "pondra_floats_win"
+    }
+
+    fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> Result<LogicalPlan> {
+        plan.transform_up_with_subqueries(|plan| {
+            let plan = match plan {
+                LogicalPlan::Union(u) => union_floats(u)?,
+                LogicalPlan::Join(j) => join_floats(j)?,
+                plan => Transformed::no(plan),
+            };
+            plan.transform_data(|plan| {
+                let mut schema = datafusion::logical_expr::utils::merge_schema(&plan.inputs());
+                if let LogicalPlan::TableScan(ts) = &plan {
+                    schema.merge(&DFSchema::try_from_qualified_schema(ts.table_name.clone(), &ts.source.schema())?);
+                }
+                let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan); // (a column keeps the name its expression gave it)
+                let t = plan.map_expressions(|e| {
+                    let name = names.save(&e);
+                    Ok(e.transform_up(|e| expr_floats(e, &schema))?.update_data(|e| name.restore(e)))
+                })?;
+                if t.transformed { t.map_data(|p| p.recompute_schema()) } else { Ok(t) } // (a node above reads the types its columns have now)
+            })
+        })
+        .data()
+    }
+}
+
+/// `e` with its operands as doubles where a float meets a decimal among them.
+fn expr_floats(mut e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
+    use Operator::*;
+    let changed = match &mut e {
+        Expr::BinaryExpr(b) if b.op.is_numerical_operators() || matches!(b.op, Eq | NotEq | Lt | LtEq | Gt | GtEq | IsDistinctFrom | IsNotDistinctFrom) => {
+            as_doubles(vec![&mut *b.left, &mut *b.right], schema)
+        }
+        Expr::Between(b) => as_doubles(vec![&mut *b.expr, &mut *b.low, &mut *b.high], schema),
+        Expr::InList(i) => as_doubles(std::iter::once(&mut *i.expr).chain(i.list.iter_mut()).collect(), schema),
+        Expr::Case(c) => {
+            let results = c.when_then_expr.iter_mut().map(|(_, t)| &mut **t).chain(c.else_expr.as_deref_mut());
+            let mut changed = as_doubles(results.collect(), schema);
+            if let Some(base) = c.expr.as_deref_mut() {
+                changed |= as_doubles(std::iter::once(base).chain(c.when_then_expr.iter_mut().map(|(w, _)| &mut **w)).collect(), schema);
+            }
+            changed
+        }
+        Expr::ScalarFunction(f) if matches!(f.name(), "coalesce" | "nullif" | "greatest" | "least" | "nvl" | "ifnull") => as_doubles(f.args.iter_mut().collect(), schema),
+        _ => false,
+    };
+    Ok(if changed { Transformed::yes(e) } else { Transformed::no(e) })
+}
+
+/// The decimals among `es` cast to DOUBLE when a float is among them too (whether any changed).
+fn as_doubles(es: Vec<&mut Expr>, schema: &DFSchema) -> bool {
+    let types: Vec<Option<DataType>> = es.iter().map(|e| (**e).get_type(schema).ok()).collect();
+    if !types.iter().flatten().any(DataType::is_floating) || !types.iter().flatten().any(DataType::is_decimal) {
+        return false;
+    }
+    for (e, t) in es.into_iter().zip(&types) {
+        if t.as_ref().is_some_and(DataType::is_decimal) {
+            *e = std::mem::take(e).cast_to(&DataType::Float64, schema).expect("a decimal casts to a double");
+        }
+    }
+    true
+}
+
+/// A join's keys as doubles where a float meets a decimal.
+fn join_floats(mut j: Join) -> Result<Transformed<LogicalPlan>> {
+    let (left, right) = (j.left.schema().clone(), j.right.schema().clone());
+    let mut changed = false;
+    for (l, r) in j.on.iter_mut() {
+        let (lt, rt) = (l.get_type(&left)?, r.get_type(&right)?);
+        if lt.is_floating() && rt.is_decimal() {
+            *r = std::mem::take(r).cast_to(&DataType::Float64, &right)?;
+            changed = true;
+        } else if lt.is_decimal() && rt.is_floating() {
+            *l = std::mem::take(l).cast_to(&DataType::Float64, &left)?;
+            changed = true;
+        }
+    }
+    Ok(Transformed::new_transformed(LogicalPlan::Join(j), changed))
+}
+
+/// A UNION's columns as doubles where one input has a float and another a decimal there: the
+/// inputs with the decimal read it as a double.
+fn union_floats(u: datafusion::logical_expr::Union) -> Result<Transformed<LogicalPlan>> {
+    let width = u.schema.fields().len();
+    let mixed: Vec<bool> = (0..width).map(|i| {
+        let types = || u.inputs.iter().map(|p| p.schema().field(i).data_type());
+        types().any(DataType::is_floating) && types().any(DataType::is_decimal)
+    }).collect();
+    if !mixed.contains(&true) {
+        return Ok(Transformed::no(LogicalPlan::Union(u)));
+    }
+    let inputs = u.inputs.into_iter().map(|p| {
+        let wanted = |i: usize| mixed[i] && p.schema().field(i).data_type().is_decimal();
+        if !(0..width).any(wanted) {
+            return Ok(p);
+        }
+        let columns = p.schema().iter().enumerate().map(|(i, (q, f))| {
+            let c = Expr::Column(Column::new(q.cloned(), f.name()));
+            if wanted(i) { Ok(c.cast_to(&DataType::Float64, p.schema())?.alias_qualified(q.cloned(), f.name())) } else { Ok(c) }
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(LogicalPlan::Projection(Projection::try_new(columns, p)?)))
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(Transformed::yes(LogicalPlan::Union(datafusion::logical_expr::Union::try_new_with_loose_types(inputs)?)))
 }
 
 /// `to_timestamp(…)` and its `_seconds`, `_millis`, `_micros` and `_nanos` answer a `TIMESTAMP`

@@ -1009,7 +1009,7 @@ impl Lake {
         let config = crate::optimize::config(SessionConfig::new().with_information_schema(true).with_target_partitions(partitions)
             .with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::ddl::PUBLIC));
         let state = SessionStateBuilder::new().with_config(config).with_runtime_env(self.rt.clone()).with_default_features();
-        let mut state = state.with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
+        let mut state = state.with_analyzer_rules(crate::optimize::analyzer_rules()).with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
         state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::files::planner());
         state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::intervals::planner()); // (n * INTERVAL '37 seconds') // (SUBSTRING of bytes too)
         let mut ctx = SessionContext::new_with_state(state.build());

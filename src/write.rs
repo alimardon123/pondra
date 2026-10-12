@@ -1109,6 +1109,7 @@ pub async fn follows(lake: &Lake, table: &str) -> Result<bool> {
 /// Run a row query here: its rows in the table's column order and types.
 pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
     let target = schema(&meta.columns)?;
+    let sql = &values_typed(sql, &target);
     let one; // (`nextval` numbers `VALUES` in their order, as Postgres does: one partition)
     let ctx = match crate::seq::calls(sql) {
         true => {
@@ -1139,6 +1140,34 @@ pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<R
     fields.extend(ids.schema().fields().iter().cloned());
     columns.extend(ids.columns().iter().cloned());
     Ok(RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), columns)?)
+}
+
+/// An INSERT's `VALUES` with each value for a DOUBLE, REAL or DECIMAL column cast to that column's
+/// type, as Postgres takes them. DataFusion first makes one type of a VALUES column's rows, and
+/// `1e20` and `1e-20`, both decimals to it, made a DECIMAL(38, 20) that couldn't hold the first,
+/// though the column was a DOUBLE. Values fill the table's columns as `rows` fills them.
+fn values_typed<'a>(sql: &'a str, target: &datafusion::arrow::datatypes::Schema) -> std::borrow::Cow<'a, str> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let typed = |t: &DataType| t.is_floating() || t.is_decimal();
+    let values = first_word(sql).get(..6).is_some_and(|w| w.eq_ignore_ascii_case("values"));
+    if !values || !target.fields().iter().any(|f| typed(f.data_type())) {
+        return sql.into();
+    }
+    let parse = |s: &str| Parser::new(&GenericDialect {}).try_with_sql(s).and_then(|mut p| p.parse_query());
+    let Ok(mut q) = parse(sql) else { return sql.into() };
+    let ast::SetExpr::Values(v) = q.body.as_mut() else { return sql.into() };
+    for row in &mut v.rows {
+        let skip_deleted = row.content.len() < target.fields().len();
+        let fields = target.fields().iter().filter(|f| !(skip_deleted && f.name() == "_deleted"));
+        for (e, f) in row.content.iter_mut().zip(fields).filter(|(_, f)| typed(f.data_type())) {
+            let Ok(cast) = Parser::new(&GenericDialect {}).try_with_sql(&format!("arrow_cast(NULL, '{}')", f.data_type())).and_then(|mut p| p.parse_expr()) else { continue };
+            let ast::Expr::Function(mut cast) = cast else { continue };
+            let ast::FunctionArguments::List(args) = &mut cast.args else { continue };
+            args.args[0] = ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(std::mem::replace(e, ast::Expr::Value(ast::Value::Null.into()))));
+            *e = ast::Expr::Function(cast);
+        }
+    }
+    crate::routines::sql(&Statement::Query(q)).into()
 }
 
 // ---------------------------------------------------------------- bulk INSERT into append tables
