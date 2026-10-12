@@ -632,11 +632,61 @@ fn cost(e: &Expr, schema: &DFSchema) -> usize {
     total
 }
 
+/// A hash join reads its other side while its table is built, a megabyte a thread ahead
+/// (DataFusion's `BufferExec`), where that side groups, sorts or windows before its first row:
+/// otherwise it starts only once the table is built, so two halves that each group millions of rows
+/// ran one after the other (TPC-DS q59's, each grouping 2.9 million sales: 198 ms, 138 ms at once).
+/// Never where that side streams its rows (scans, joins over scans): read early, it only takes cores
+/// from the build and runs before the join's filter is ready (TPC-DS q22 1.4×, q90 1.7× slower with
+/// every join's other side read early). In DataFusion's place for that (`HashJoinBuffering`), whose
+/// setting, when given, still reads every join's other side early. Never in a spread query's
+/// slices, whose exchanges are the spread analysis's: `BufferExec` is no operator it knows.
+#[derive(Debug)]
+struct EarlyProbes;
+
+impl PhysicalOptimizerRule for EarlyProbes {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_plan::buffer::BufferExec;
+        if plan.exists(|p| Ok(matches!(p.name(), "ShareExec" | "WholeExec")))? {
+            return Ok(plan);
+        }
+        let every = config.execution.hash_join_buffering_capacity; // (the user's: every join, this far ahead)
+        plan.transform_up(|p| {
+            let Some(j) = p.downcast_ref::<HashJoinExec>() else { return Ok(Transformed::no(p)) };
+            let (build, probe) = (j.left().clone(), j.right().clone()); // (DataFusion's probe side is the right)
+            if probe.is::<BufferExec>() || every == 0 && !waits(&probe)? {
+                return Ok(Transformed::no(p));
+            }
+            let early: Arc<dyn ExecutionPlan> = Arc::new(BufferExec::new(probe, if every > 0 { every } else { 1 << 20 }));
+            Ok(Transformed::yes(replace_children_if_necessary(p, vec![build, early])?))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "EarlyProbes"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// Whether a plan gives its first row only once it has read all its input: it groups, sorts or
+/// windows somewhere.
+fn waits(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
+    plan.exists(|p| Ok(p.is::<AggregateExec>() || p.is::<SortExec>() || p.name() == "WindowAggExec"))
+}
+
 /// DataFusion's physical rules, with Pondra's placed where they work best.
 pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules = PhysicalOptimizer::new().rules;
-    for r in rules.iter_mut().filter(|r| r.name() == "ProjectionPushdown") {
-        *r = Arc::new(GuardedPushdown(r.clone()));
+    for r in rules.iter_mut() {
+        match r.name() {
+            "ProjectionPushdown" => *r = Arc::new(GuardedPushdown(r.clone())),
+            "HashJoinBuffering" => *r = Arc::new(EarlyProbes),
+            _ => {}
+        }
     }
     let sides = rules.iter().position(|r| r.name() == "join_selection").unwrap_or(0);
     rules.insert(sides, Arc::new(FilterShares)); // (the joins' sides are picked by their inputs' sizes)

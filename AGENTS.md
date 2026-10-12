@@ -1298,7 +1298,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`txn::overlaid`); a new path that reads tables for a session must too, or refuse inside a
    transaction. Writes are kept by `txn::keep`, and `COMMIT` is `Request::Txn` → `commit_here`
    under the lake's lock: the conflict check (40001), then `change::appends` for every table, one
-   `change::submit`. `tools/harness.py begin`; `tools/bench/pgbench.py`.
+   `change::submit`. Its default is READ COMMITTED: each statement reads the newest commit, and its
+   writes take row locks on the leader (ADR-067, invariants 322–325); REPEATABLE READ is the
+   snapshot of its first statement. `tools/harness.py begin`; `tools/bench/pgbench.py`.
 187. **A key lookup isn't planned, on any door** (ADR-036 §6): `serve::point` recognises one (a
    literal or a parameter); Postgres answers it before anything else in `pg::run`, its `Describe`
    and parameter types from it too; in a transaction `txn::point_read`; a one-key UPDATE of a keyed
@@ -2117,6 +2119,40 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    a HAVING's few groups (`HavingBuilds`) or a spread query's joins (its exchanges are the spread
    analysis's). `harness.py hot`: "NOT IN a subquery with a NULL keeps no row…" fails with a NOT IN
    hashed (the threads that never met the NULL keep their rows).
+322. **Row locks are a schedule, never the authority** (`locks.rs`, `txn::commit_here`, ADR-067
+   §4–6): they live in the leader's memory only, by table and key (an append table's by `_row_id`),
+   with a lease of `PONDRA_LOCK_LEASE_SECS` (60) that each lock request renews; a new leader starts
+   with none, and a transaction's locks go once its commit is visible on the leader. COMMIT still
+   checks under the lake's lock that every row it changed is at the version it read, so a lost or
+   lapsed lock, or a writer that takes none (a loading door, a UNIQUE table's write), makes a COMMIT
+   refuse 40001 and never loses an update. Waits are first come, first served; a wait that would
+   close a loop is 40P01 at once; `lock_timeout` is 55P03. `harness.py waits`.
+323. **READ COMMITTED reads the newest commit at each statement, and a write that waited is worked
+   out again at its grant** (`txn::next`, `locks::passes`, ADR-067 §1–3): a write locks the rows it
+   would change and runs again from the commit its locks were granted at, for as long as a pass
+   locks a row it hadn't held (`LOCK_MAX`); under REPEATABLE READ the first changed row is 40001,
+   and its snapshot is taken at its first statement that isn't a setting. SERIALIZABLE is refused by
+   name (0A000), never run as less. A statement over 10,000 rows locks none (COMMIT's check keeps it
+   right), and a `FOR UPDATE` over that many is refused. A key is named by its stored type's text
+   (`key_text`), so two spellings of one key lock one row. `harness.py waits`, `begin`, `round7`.
+324. **An autocommitted UPDATE or DELETE of a keyed table never lands over a change made under the
+   lake's lock** (`txn::autocommit`, `locks::take`, `locks::close`, ADR-067 §7): it registers as
+   appending to its table in the request that grants its locks, and every writer that changes rows
+   under the lake's lock (`txn::commit_here`, `change::run`, `iceberg::record`, `branch::refresh`)
+   closes the table's gate first, waiting for the appends in flight. Its locks go once its append is
+   answered; an answer lost in transit, or a server error from the leader (`log::Refusal::lost`:
+   only a 4xx is the leader's own refusal), keeps them to the lease, since the append may still
+   land. A closer waits at most 5 s (`GATE_WAIT`) for the appends in flight, then refuses with
+   40001; no writer marked appending takes the lake's lock or waits for it (it waits for its row
+   locks before it is marked, and backpressure never pauses commits while a closer holds the lock).
+   `harness.py round7` (`PONDRA_TEST_NO_GATE=1` shows the lost update), `autocommit`.
+325. **DDL in a transaction runs at once and says so, and an idle transaction ends, never
+   autocommitted** (`txn.rs`, ADR-067 §8–10): a DDL statement commits on its own with a notice that
+   ROLLBACK won't undo it (refused on a table the transaction wrote, and under REPEATABLE READ); a
+   savepoint keeps the transaction's kept writes and reads (`Mark`), and the row locks taken after
+   it stay to the end; after `PONDRA_TXN_IDLE_SECS` (600) without a statement the kept writes and
+   the locks go, and every statement but BEGIN, COMMIT and ROLLBACK is refused 25P03 (a COMMIT too,
+   saying nothing was committed). `harness.py begin`, `waits`.
 337. **A file is loaded into a table once a version, and its record lands with its rows** (`copy.rs`,
    `adopt::file`, `log::Filing::also`): `COPY INTO t FROM '…'` loads each file under the job
    `load:{table, file, version}` (an e-tag, else size and time), so the bulk path's job mark keeps a
@@ -2251,6 +2287,22 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    from another address cy signs in: the server names each client's address…", "…a page from another address doesn't, nor
    chooses the Python (S28)", "behind a trusted proxy: ten wrong passwords from one client lock al out for that
    client…", "…and what a client writes before its proxy's entry isn't taken".
+382. **A user is shown what it may use, at every listing** (`ddl::listed`, `auth::shows_code`). A user
+   granted some tables is listed only the tables and views it may SELECT, and that filter lives in
+   `ddl::listed` alone, so `GET /objects`, `pondra.tables`, `SHOW VIEWS`, `pondra.objects` and
+   `pondra.parts` agree. A routine's code and a task's statement are shown only to a token, a superuser,
+   an open node, or a user with APPLY or CLONE ON DATABASE, who holds them anyway: `GET /routines`,
+   `pondra.routines.body`, `pondra.tasks.statement`, `pondra.objects`, `information_schema.routines`,
+   `pg_proc.prosrc` and `SHOW CREATE` follow `shows_code`, and `GET /export` (every routine's code, task
+   and grant) asks it. Anyone else sees a routine's name, parameters and result, enough to call it; a CALL
+   still runs as its caller (invariant 84), and its errors quote no code: a stored procedure runs for such a
+   caller inside `script::unshown` (a statement by its number, a condition as `…`), and a Python routine's
+   `  line 3: <the line>` is cut to `  line 3` (`python::unquoted`) in `python::ask` and in `ext::said`, where
+   every door words an error (a function's batches may run where no caller is known). A user granted some tables saw every table's name and every
+   routine's code before. `harness.py users`: "a user is shown only the tables it may read (GET /objects)
+   and no routine's code…", "S27, beyond the listings…" (both fail on the build before),
+   "…a user granted APPLY on this database (it deploys them) is shown routines' code and the export", "…nor in a
+   failed call's error…".
 
 ## Tests: run these before and after any change
 
@@ -2306,6 +2358,9 @@ python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHE
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow
 python3 tools/harness.py begin          # BEGIN … COMMIT from every door, read-your-writes, 40001 and retries, 25P02, SQLSTATEs
+python3 tools/harness.py waits          # READ COMMITTED and row locks: waits in order, 40P01, lock_timeout, FOR UPDATE, leases, idle ends (25P03), a leader killed mid-transaction
+python3 tools/harness.py autocommit     # autocommitted keyed UPDATEs from two nodes and two clients at once; a change over 10,000 rows locks none
+python3 tools/harness.py round7         # the gate (PONDRA_TEST_NO_GATE=1 shows the lost update); refused key, view and merge-table changes; ON CONFLICT waits
 python3 tools/bench/pgbench.py          # pgbench's own TPC-B script, 1 and 4 clients: the balances agree (--postgres: Postgres too)
 python3 tools/bench/flow.py             # what a flow of 0 to 3 views costs ingest; every stage right when acknowledged
 python3 tools/bench/footprint.py        # install size, start to first answer, idle memory: Pondra, DuckDB, Polars, Spark, Flink (a venv with pyspark, apache-flink)
