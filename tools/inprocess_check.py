@@ -10,8 +10,8 @@ script, because a process holds one node and its settings are fixed by its first
 this checkout's python/ first on its path. The JavaScript children (i to n) are in inprocess_check.mjs, run by
 Node, or by Bun for n (RUNNERS); o reads the library's symbols here, with nm.
 
-a. "pondra.open() with no path: SQL, a frame, pandas in and out, a file here, a live query, and the
-   folder gone at close"
+a. "pondra.open() with no path: SQL, a frame, pandas in and out, a file here, a live query; its lake held
+   in memory, with nothing written in the temporary folder or here, and a new open a new lake"
 b. "a lake opened, written, closed and opened again in this process: its rows"
 c. "a second open while one is open is refused by name"
 d. "a misspelt setting is refused naming the nearest"
@@ -19,13 +19,13 @@ e. "a setting changed on a later open is refused naming it"
 f. "50 opens and closes leave no threads or open files" (Linux)
 g. "a fork's child is refused by name (a query, an open), and the parent still answers" (Linux and macOS)
 h. "the library asks for no static TLS, so any process loads it" (Linux)
-i. "open() in JavaScript with no path: SQL, a frame, writeTable, a file here, a live query, and the folder
-   gone at close" (Node)
+i. "open() in JavaScript with no path: SQL, a frame, writeTable, a file here, a live query; its lake held in
+   memory, with nothing written in the temporary folder or here" (Node)
 j. "JavaScript: a lake opened, written, closed and opened again: its rows; a second open, a misspelt setting
    and a changed one refused by name" (Node)
 k. "JavaScript: 20 opens and closes leave no threads or open files" (Node, Linux)
-l. "a Node process that calls process.exit() without close() closes its node: the temporary lake is gone" (Node)
-m. "a Node program that ends without close() closes its node (the cleanup hook): the temporary lake is gone" (Node)
+l. "a Node process that calls process.exit() without close() closes its node: its lake's term given back" (Node)
+m. "a Node program that ends without close() closes its node (the cleanup hook): its lake's term given back" (Node)
 n. "Bun: open() answers SQL" (Bun, when it is installed)
 o. "the library defines its ABI, and needs only glibc and libgcc by version: nothing of a host binds to it" (Linux, nm)
 
@@ -80,7 +80,6 @@ def refusal(*args, **settings):
 def child_sql():
     import pondra
     db = pondra.open()
-    temp = db.lake
     db.sql("CREATE TABLE t (id INT, name TEXT)")
     db.sql("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
     facts = {"count": db.sql("SELECT count(*) AS n FROM t").rows()[0]["n"], "pandas": None, "polars": None}
@@ -109,10 +108,20 @@ def child_sql():
             return e.code
     facts["door"] = {"without": door({}), "with": door({"x-pondra-owner": db.owner})}
     facts["console"] = db.console_url == f"{db.url}/#key={db.owner}"
-    facts["temp_while_open"] = os.path.isdir(temp)
+    facts["lake"], facts["while_open"] = db.lake, written_here()
     db.close()
-    facts["temp_after_close"] = os.path.isdir(temp)
+    facts["after_close"] = written_here()
+    db = pondra.open(":memory:")
+    facts["fresh"] = db.sql("SELECT count(*) AS n FROM information_schema.tables WHERE table_name = 't'").rows()[0]["n"]
+    db.close()
     return facts
+
+
+def written_here():
+    """What is in the temporary folder, which is also the current one: a child that asks is given a new, empty
+    one (`run_child`, HERE)."""
+    root = tempfile.gettempdir()
+    return sorted(os.path.relpath(os.path.join(d, n), root) for d, dirs, files in os.walk(root) for n in dirs + files)
 
 
 def child_reopen():
@@ -333,7 +342,9 @@ def judge_sql(f):
         yield None, "Polars: polars or pyarrow isn't installed"
     else:
         yield f["polars"] == 3, f"Polars: {f['polars']} rows (3)"
-    yield f["temp_while_open"] and not f["temp_after_close"], "the temporary folder is there while open, and gone after close"
+    yield f["lake"] == ":memory:" and not f["while_open"] and not f["after_close"], \
+        f"its lake ({f['lake']}) is held in memory: nothing written in the temporary folder or here, open or closed: {f['while_open'] + f['after_close'] or 'none'}"
+    yield f["fresh"] == 0, f"open(':memory:') after close is a new lake: {f['fresh']} tables named t (0)"
 
 
 def judge_reopen(f):
@@ -386,7 +397,8 @@ def judge_js_sql(f):
         yield None, "a live query: no such method"
     else:
         yield f["live"] == 3, f"a live query's first answer: {f['live']} (3)"
-    yield not f["exists_after_close"], "the temporary folder is gone after close()"
+    yield f["lake"] == ":memory:" and not f["while_open"] and not f["after_close"], \
+        f"its lake ({f['lake']}) is held in memory: nothing written in the temporary folder or here, open or closed: {f['while_open'] + f['after_close'] or 'none'}"
 
 
 def judge_js_reopen(f):
@@ -411,12 +423,14 @@ def judge_js_cycles(f):
 
 def judge_js_exit(f):
     # (the child's exit status is checked by run_child: a process that exits with an error is a FAIL)
-    yield not os.path.exists(f["lake"]), f"a Node process that ends without close(): its temporary lake is gone ({f['lake']})"
+    left = os.path.join(f["lake"], "cluster", "left")
+    yield os.path.isdir(left) and bool(os.listdir(left)), f"a Node process that ends without close(): its node stepped down, giving its term back ({left})"
+    shutil.rmtree(os.path.dirname(f["lake"]), ignore_errors=True)
 
 
 def judge_js_bun(f):
     yield f["count"] == 3, f"Bun: CREATE, an append and a count: {f['count']} rows (3)"
-    yield not f["exists_after_close"], "Bun: the temporary folder is gone after close()"
+    yield f["lake"] == ":memory:", f"Bun: with no folder, a lake in memory ({f['lake']})"
 
 
 def library_symbols(args):
@@ -449,10 +463,11 @@ def judge_symbols(f):
     yield not f["loose"], f"what it needs ({f['needs']}): only glibc's and libgcc's, by version; unversioned: {f['loose'] or 'none'}"
 
 
+HERE = {"sql", "js_sql"}  # (children given a temporary folder of their own, which is their current folder too)
 DIRECT = {"symbols": library_symbols}  # (checks read in this process, with no child: see run_child)
 
 CHECKS = [  # (child, label, judge)
-    ("sql", "pondra.open() with no path: SQL, a frame, pandas in and out, a file here, a live query, and the folder gone at close", judge_sql),
+    ("sql", "pondra.open() with no path: SQL, a frame, pandas in and out, a file here, a live query; its lake in memory, nothing on disk", judge_sql),
     ("reopen", "a lake opened, written, closed and opened again in this process: its rows", judge_reopen),
     ("second", "a second open while one is open is refused by name", judge_second),
     ("misspelt", "a misspelt setting is refused naming the nearest", judge_misspelt),
@@ -460,11 +475,11 @@ CHECKS = [  # (child, label, judge)
     ("cycles", "50 opens and closes leave no threads or open files", judge_cycles),
     ("fork", "a fork's child is refused by name (a query, an open), and the parent still answers", judge_fork),
     ("tls", "the library asks for no static TLS, so any process loads it", judge_tls),
-    ("js_sql", "open() in JavaScript with no path: SQL, a frame, writeTable, a file here, a live query, and the folder gone at close", judge_js_sql),
+    ("js_sql", "open() in JavaScript with no path: SQL, a frame, writeTable, a file here, a live query; its lake in memory, nothing on disk", judge_js_sql),
     ("js_reopen", "JavaScript: a lake opened, written, closed and opened again: its rows; a second open, a misspelt setting and a changed one refused by name", judge_js_reopen),
     ("js_cycles", "JavaScript: 20 opens and closes leave no threads or open files", judge_js_cycles),
-    ("js_exit", "a Node process that calls process.exit() without close() closes its node: the temporary lake is gone", judge_js_exit),
-    ("js_end", "a Node program that ends without close() closes its node (the cleanup hook): the temporary lake is gone", judge_js_exit),
+    ("js_exit", "a Node process that calls process.exit() without close() closes its node: its lake's term given back", judge_js_exit),
+    ("js_end", "a Node program that ends without close() closes its node (the cleanup hook): its lake's term given back", judge_js_exit),
     ("js_bun", "Bun: open() answers SQL", judge_js_bun),
     ("symbols", "the library defines its ABI, and needs only glibc and libgcc by version: nothing of a host binds to it", judge_symbols),
 ]
@@ -501,10 +516,16 @@ def run_child(name, args):
         env["PONDRA_BIN"] = os.path.abspath(args.bin)
     runtime = RUNNERS.get(name)
     command = [RUNTIMES[runtime], MJS, name] if runtime else [sys.executable, os.path.abspath(__file__), "--child", name]
+    here = tempfile.mkdtemp(prefix="inprocess-here-") if name in HERE else None  # (its temporary folder and its current one: empty)
+    if here:
+        env.update(TMPDIR=here, TEMP=here, TMP=here)
     try:
-        done = subprocess.run(command, env=env, capture_output=True, text=True, timeout=900)
+        done = subprocess.run(command, env=env, capture_output=True, text=True, timeout=900, cwd=here)
     except subprocess.TimeoutExpired:
         return None, "timed out after 900 s"
+    finally:
+        if here:
+            shutil.rmtree(here, ignore_errors=True)
     line = next((ln for ln in done.stdout.splitlines() if ln.startswith("FACTS ")), None)
     if done.returncode or line is None:
         return None, done.stderr.strip()[-600:] or f"exit {done.returncode}, no answer"

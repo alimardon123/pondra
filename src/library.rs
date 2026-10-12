@@ -107,9 +107,9 @@ pub struct Opened {
     /// The key that makes a request the owner's (invariant 61), given by its host (`pondra.open` gives its
     /// connection's) or made at open: what [`Opened::request`] signs with.
     owner: Option<String>,
-    /// A lake made for this node alone (`temporary` in the options: `pondra.open()` with no path), removed
-    /// once the node has let go of it, by whichever close comes: the host's, or Node's at its end.
-    temporary: Mutex<Option<std::path::PathBuf>>,
+    /// A lake held in this process's memory (`:memory:`: `pondra.open()` with no path), let go of once
+    /// the node has stopped, by whichever close comes: the host's, or Node's at its end.
+    memory: Option<String>,
 }
 
 /// An answer to [`Opened::request`]: its status and headers once the node has them, and its body as the
@@ -158,7 +158,9 @@ const PAUSES: [f64; 5] = [0.5, 1.0, 2.0, 4.0, 8.0];
 impl Opened {
     /// Opens a node in this process, once it serves (or has failed to, saying why). One at a time: a
     /// second open while one is open is refused by name.
-    pub fn open(options: Options) -> anyhow::Result<Opened> {
+    pub fn open(mut options: Options) -> anyhow::Result<Opened> {
+        options.dir = crate::store::place(&options.dir); // (`:memory:`: a new lake in this process's memory)
+        let memory = crate::store::in_memory(&options.dir).then(|| options.dir.clone());
         let (events, rx) = mpsc::unbounded_channel();
         {
             let mut s = SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner);
@@ -178,7 +180,7 @@ impl Opened {
                 return Err(e.into());
             }
         };
-        let opened = Opened { state, router, events, thread: Mutex::new(Some(thread)), owner: None, temporary: Mutex::new(None) };
+        let opened = Opened { state, router, events, thread: Mutex::new(Some(thread)), owner: None, memory };
         match started.recv() {
             Ok(Ok(())) => Ok(opened),
             Ok(Err(why)) => Err(anyhow::anyhow!(why)), // (`opened` dropped: closed)
@@ -198,14 +200,14 @@ impl Opened {
             let _ = t.join();
             SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).take();
         }
-        if let Some(dir) = self.temporary.lock().unwrap_or_else(PoisonError::into_inner).take() {
-            let _ = std::fs::remove_dir_all(dir);
+        if let Some(lake) = &self.memory {
+            crate::store::forget_memory(lake);
         }
     }
 
     /// Opens a node from a JSON object of options (`pondra_open`'s, `designs/l2-step4-open.md`): its
-    /// own keys `lake`, `addr`, `owner`, `python`, `attach` and `temporary` (the lake is removed at
-    /// close), and every other key a setting by name (`memory_gb` is `PONDRA_MEMORY_GB`; `launcher` is
+    /// own keys `lake` (a folder, a bucket's URL, or `:memory:`, the default: a lake held in this process's
+    /// memory until close), `addr`, `owner`, `python` and `attach`, and every other key a setting by name (`memory_gb` is `PONDRA_MEMORY_GB`; `launcher` is
     /// `PONDRA_LAUNCHER`), given through `env::give`, so a misspelt one is refused naming the nearest and
     /// a changed one naming what changed.
     pub fn open_json(json: &str) -> anyhow::Result<Opened> {
@@ -213,7 +215,7 @@ impl Opened {
         let mut o: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).context("the options are a JSON object")?;
         o.retain(|_, v| !v.is_null());
         let text = |v: serde_json::Value| v.as_str().map_or_else(|| v.to_string(), str::to_string);
-        let lake = o.remove("lake").map(text).context("the options name no lake: a folder, or a bucket's URL")?;
+        let lake = o.remove("lake").map(text).unwrap_or_else(|| ":memory:".into());
         let addr = match o.remove("addr").map(text) {
             Some(a) => a,
             None => std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.to_string(), // (a free port, let go for the node)
@@ -221,8 +223,6 @@ impl Opened {
         let owner = o.remove("owner").map(text).unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
         anyhow::ensure!(owner.len() >= 16, "an owner key has 16 characters at least");
         let python = o.remove("python").map(text);
-        let temporary = o.remove("temporary").is_some_and(|v| v.as_bool() == Some(true) || v.as_str() == Some("true"));
-        anyhow::ensure!(!temporary || !lake.contains("://"), "a temporary lake is a folder on this machine, not {lake}");
         let attach = match o.remove("attach") {
             Some(serde_json::Value::Array(a)) => a.into_iter().map(text).collect(),
             Some(v) => vec![text(v)],
@@ -241,9 +241,6 @@ impl Opened {
         options.auth = Arc::new(auth.owned_by(Some(owner.clone())));
         let mut opened = Opened::open(options)?;
         opened.owner = Some(owner);
-        if temporary {
-            *opened.temporary.get_mut().unwrap_or_else(PoisonError::into_inner) = Some(lake.into());
-        }
         Ok(opened)
     }
 

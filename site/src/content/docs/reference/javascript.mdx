@@ -29,7 +29,7 @@ console.log(await db.sql("SELECT 1 AS one"));
 |---|---|
 | `connect(url = "http://127.0.0.1:8080", { token, user, password, onNotice, retrySecs, ca, fetch })` | a connection to a node, or to any of several (an array of URLs) |
 | `await local(dir = "lake", { port, token, flags, timeout, python, onNotice })` | start a node on a lake here (a folder or `s3://bucket/prefix`) and connect to it |
-| `await open(dir, { token, python, onNotice, ...settings })` | a node on a lake inside this process (Node, Bun, Deno), through the library the package ships: no second process to start. With no `dir`, a lake in a temporary folder that `close()` removes. `settings` are the node's [settings](/pondra/reference/environment/) by name (`memory_gb: 2` is `PONDRA_MEMORY_GB`), fixed by the first open in a process; a misspelt one is refused, naming the nearest. One node at a time in a process |
+| `await open(dir, { token, python, onNotice, ...settings })` | a node on a lake inside this process (Node, Bun, Deno), through the library the package ships: no second process to start. With no `dir`, or `":memory:"` as DuckDB spells it, a lake held in this process's memory: nothing on disk, and gone at `close()`. `settings` are the node's [settings](/pondra/reference/environment/) by name (`memory_gb: 2` is `PONDRA_MEMORY_GB`), fixed by the first open in a process; a misspelt one is refused, naming the nearest. One node at a time in a process |
 | `await binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, or the one npm installed for this platform |
 
 | Option | Default | Meaning |

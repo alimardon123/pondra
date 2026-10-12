@@ -10,7 +10,8 @@ use std::sync::Arc;
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) cmd: Option<Cmd>,
-    /// With no command: the lake the SQL shell opens (a folder or s3://bucket/prefix; default ./lake).
+    /// With no command: the lake the SQL shell opens (a folder, s3://bucket/prefix, or :memory: for one held in
+    /// memory until the shell ends; default ./lake).
     lake: Option<String>,
 }
 
@@ -28,7 +29,8 @@ pub(crate) enum Cmd {
     /// idle (PONDRA_DATABASE_IDLE_SECS, 600); `CREATE DATABASE` makes another.
     Serve {
         /// The lake (a folder, or s3://bucket/prefix, its credentials from the AWS_* variables), or
-        /// a folder of lakes. Default: this folder. A new or empty one becomes a lake.
+        /// a folder of lakes. Default: this folder. A new or empty one becomes a lake. `:memory:`:
+        /// a lake held in this node's memory, gone when it stops.
         path: Option<String>,
         /// For scripts and services, nothing guessed: exactly this lake (made if it isn't there).
         #[arg(long = "lake", alias = "dir", value_name = "LAKE", conflicts_with_all = ["path", "databases"])]
@@ -379,7 +381,7 @@ async fn run() -> anyhow::Result<()> {
     store::inherit(); // (a lake led for a moment, reached as the process that asked reaches it)
     let Some(cmd) = cli.cmd else {
         let given = cli.lake.is_some();
-        let lake = cli.lake.unwrap_or_else(|| "lake".into());
+        let lake = store::place(&cli.lake.unwrap_or_else(|| "lake".into())); // (`pondra :memory:`: a lake in the node's memory)
         opened(&lake, given).await?;
         return shell::run(&lake).await;
     };
@@ -391,6 +393,7 @@ async fn run() -> anyhow::Result<()> {
                 .into_iter().filter_map(|(var, flag)| Some((var, flag?))).collect();
             let token = |flag: Option<String>, var: &str| flag.or_else(|| env::get(var)).filter(|t| !t.is_empty());
             // A lake, or a folder of lakes (each a database: `dbserver.rs`), by what the path holds.
+            let (path, dir) = (path.map(|p| store::place(&p)), dir.map(|d| store::place(&d))); // (`:memory:`: in this process's memory)
             let (dir, many) = match (dir, databases) {
                 (Some(d), _) => {
                     // (one letter from --lakes: a mix-up is said, never served)

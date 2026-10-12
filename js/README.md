@@ -36,13 +36,13 @@ await db.close();
 ```
 
 `open()` runs the node in this process instead, so there is no second process to start. It works in Node, Bun
-and Deno, and returns the same connection. `close()` stops the node and gives its term back; a temporary lake
-(made when `open` gets no folder) is removed. `local()` still starts a node beside your program.
+and Deno, and returns the same connection. `close()` stops the node and gives its term back; with no folder,
+`open` holds the lake in this process's memory, as DuckDB's `:memory:` does, and `close()` lets it go. `local()` still starts a node beside your program.
 
 ```js
 import { open } from "pondra";
 
-const db = await open();                                 // a lake in a temporary folder, removed by close()
+const db = await open();                                 // a lake in memory (":memory:"), gone at close()
 await db.sql("CREATE TABLE t (a INT)");
 await db.close();
 const kept = await open("lake");                         // a folder or s3://bucket/prefix, kept after close()

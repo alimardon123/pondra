@@ -570,6 +570,7 @@ pub async fn attachable(lake: &Lake, name: &str, fresh: bool) -> Result<()> {
 /// Nothing there yet (no catalog): a new, empty lake is made there, as DuckDB's ATTACH makes a
 /// new database file.
 async fn lake_dir(dir: &str) -> Result<(String, bool)> {
+    let dir = &crate::store::place(dir); // (`:memory:`: a new lake in memory, which only opening makes: `inbox::lead_once`)
     if !dir.contains("://") {
         std::fs::create_dir_all(dir).with_context(|| format!("no folder {dir}"))?;
     }
@@ -622,8 +623,8 @@ pub async fn delete_lake(dir: &str) -> Result<()> {
 }
 
 pub async fn has_catalog(dir: &str) -> Result<bool> {
-    if !dir.contains("://") && !std::path::Path::new(dir).exists() {
-        return Ok(false);
+    if (!dir.contains("://") && !std::path::Path::new(dir).exists()) || (crate::store::in_memory(dir) && !crate::store::memory_held(dir)) {
+        return Ok(false); // (asking a lake in memory that nothing here opened would make an empty one)
     }
     let store = crate::store::open_store(dir)?.1;
     Ok(futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog")))).await.transpose()?.is_some())

@@ -632,6 +632,11 @@ pub fn reach_of(url: &str) -> Option<Reach> {
 /// read them: `AWS_*` (`AWS_ENDPOINT` for R2 and MinIO), `GOOGLE_*`, `AZURE_*`. A lake on another
 /// server is read with the key its attachment names (`reach_of`), and a read-only one refuses writes.
 pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
+    if in_memory(url) {
+        let url = url.trim_end_matches('/').to_string();
+        let held = MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(url.clone()).or_insert_with(|| Arc::new(Counted(Arc::new(object_store::memory::InMemory::new())))).clone();
+        return Ok((url.clone(), held.clone(), Some((url, held)))); // (DataFusion reads its files at their URLs, as a bucket's)
+    }
     let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
         std::fs::create_dir_all(url)?;
         let dir = std::fs::canonicalize(url)?.to_string_lossy().trim_start_matches(r"\\?\").to_string(); // (Windows verbatim prefix)
@@ -658,6 +663,32 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     let store: Store = if prefix.is_empty() { whole.clone() } else { Arc::new(PrefixStore::new(whole.clone(), prefix)) };
     Ok((url.trim_end_matches('/').to_string(), Arc::new(Counted(store)), Some((root, whole))))
 }
+
+/// Lakes held in this process's memory (`memory://name`, DuckDB's `:memory:`), by place: every open
+/// of one here is the same store until `forget_memory`, so a node that restarts in place finds its
+/// lake as it left it. Nothing of one is on disk, and no other process reaches it. (Not `per_node!`:
+/// a restart in place resets those.)
+static MEMORY: std::sync::LazyLock<Mutex<HashMap<String, Store>>> = std::sync::LazyLock::new(Default::default);
+
+/// Is `url` a lake held in this process's memory?
+pub fn in_memory(url: &str) -> bool { url.starts_with("memory://") }
+
+/// Is a lake held in this process's memory at `url`? (Opening one there makes it.)
+pub fn memory_held(url: &str) -> bool { MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(url.trim_end_matches('/')) }
+
+/// Is `store` a lake held in this process's memory? Every open of one gives the same store.
+pub fn held_in_memory(store: &Store) -> bool { MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().any(|s| Arc::ptr_eq(s, store)) }
+
+/// A lake's place as given: `:memory:` (DuckDB's word) is a new lake in this process's memory.
+pub fn place(lake: &str) -> String {
+    match lake {
+        ":memory:" => format!("memory://{}", uuid::Uuid::new_v4().simple()),
+        _ => lake.to_string(),
+    }
+}
+
+/// Let a lake in memory go (the library's close, once its node has stopped): its memory with it.
+pub fn forget_memory(url: &str) { MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(url.trim_end_matches('/')); }
 
 /// A lake's bucket, as DataFusion names its store (`s3://bucket`), or None for a folder.
 pub fn bucket_url(url: &str) -> Option<String> {
@@ -747,15 +778,18 @@ impl Lake {
 
     pub async fn open(url: &str, writer: bool, streamed: bool) -> Result<Arc<Lake>> {
         let (url, store, bucket) = open_store(url)?;
-        let local = bucket.is_none();
+        let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
+        let local = bucket.is_none() || memory;
         let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(memory_limit()));
         // (spills go to the OS temp dir; no listing kept past its statement: DataFusion's own
         // cache of them would hide a file added to a folder outside the lake, ADR-026)
         let caches = datafusion::execution::cache::cache_manager::CacheManagerConfig::default().with_list_files_cache_limit(0);
         let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).with_cache_manager(caches).build_arc()?;
-        let disk = bucket.as_ref().and_then(|_| disk_tier(&url, &store));
+        let disk = bucket.as_ref().filter(|_| !memory).and_then(|_| disk_tier(&url, &store));
         let mut cached_store = None;
-        if let Some((bucket_url, s3)) = bucket {
+        if let Some((bucket_url, held)) = bucket.as_ref().filter(|_| memory) {
+            rt.register_object_store(&url::Url::parse(bucket_url)?, held.clone()); // (in memory already: read as it is)
+        } else if let Some((bucket_url, s3)) = bucket {
             let prefix = url.trim_start_matches(&bucket_url).trim_start_matches('/').to_string();
             let cached = Arc::new(crate::cache::CachedStore::new(s3, cache_mb() << 20, disk.clone().map(|d| (d, prefix.clone())), &prefix));
             rt.register_object_store(&url::Url::parse(&bucket_url)?, cached.clone());
