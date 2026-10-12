@@ -3,6 +3,13 @@
 #
 #   docker compose -f deploy/compose/compose.yaml up -d
 #
+# The nodes listen on the network with no token, so the lake's first user is made when the leader
+# starts: `pondra`, a superuser, and its token printed once in the log (only its hash is kept).
+# Get it with `docker compose logs | grep pt_` (whichever node led first shows it), or make another
+# any time with `docker compose exec node1 pondra token --dir /data/lake` (through the bucket: it
+# works with the nodes up or down). Or set PONDRA_ADMIN_TOKEN in a .env file beside this one, and
+# the nodes take that token instead: no user is made.
+#
 # The console is at http://localhost:8080, Postgres at localhost:5432, Arrow Flight at
 # localhost:8815 and Kafka at localhost:9092; the other two nodes at 8081/5433/8816/9093 and
 # 8082/5434/8817/9094. The lake is a volume the nodes share. To keep it in a bucket instead, set

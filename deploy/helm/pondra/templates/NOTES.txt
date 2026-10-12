@@ -17,4 +17,9 @@ Postgres, inside the cluster: {{ $full }}.{{ .Release.Namespace }}.svc:{{ .Value
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $full }} 5432 && psql "host=localhost user=admin dbname=lake"
 {{- end }}
 
-Which node leads, and who is in the cluster (with the port forwarded): curl -s localhost:8080/stats
+Which node leads, and who is in the cluster (with the port forwarded):
+{{- if .Values.auth.enabled }}
+  curl -s -H "Authorization: Bearer $(kubectl -n {{ .Release.Namespace }} get secret {{ include "pondra.tokensSecret" . }} -o jsonpath='{.data.PONDRA_ADMIN_TOKEN}' | base64 -d)" localhost:8080/stats
+{{- else }}
+  curl -s localhost:8080/stats
+{{- end }}

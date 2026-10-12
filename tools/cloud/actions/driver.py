@@ -14,17 +14,21 @@ results.json has, per query, the three times, how each ran (shuffled, gathered, 
 the nodes sent each other and how long their steps waited for it; plus the network, the load
 time and every node's /metrics. Standalone on purpose: a bench repo needs only this file,
 the queries and the workflow.
+
+The nodes are on the network, so they answer only a token: PONDRA_ADMIN_TOKEN (the workflow gives
+the same one to every node and to this driver, and to the `pondra sql` loads it runs).
 """
 import argparse, http.client, itertools, json, os, re, subprocess, sys, time
 
 TABLES = ["region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem"]
 RUNS = itertools.count()
+TOKEN = os.environ.get("PONDRA_ADMIN_TOKEN", "")
 
 
 def call(node, method, path, body=b"", timeout=3600):
     host, port = node.rsplit(":", 1)
     c = http.client.HTTPConnection(host, int(port), timeout=timeout)
-    c.request(method, path, body)
+    c.request(method, path, body, {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {})
     r = c.getresponse()
     data = r.read()
     if r.status != 200:

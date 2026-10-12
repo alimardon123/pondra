@@ -547,7 +547,7 @@ def spread(root, expected, port):
     out = {}
     try:
         harness.sql(port, f"CREATE SECRET formats (TYPE s3, KEY_ID 'k', SECRET 's', ENDPOINT 'http://127.0.0.1:{port + 50}', SCOPE 's3://formats')")
-        while len(harness.call(port + 1, "GET", "/stats")["nodes"]) < 3:
+        while len(harness.call(port + 1, "GET", "/stats").get("nodes", ())) < 3:
             time.sleep(0.1)
         for t in tables:
             want, kind = expected[t], t.split(":")[0]
