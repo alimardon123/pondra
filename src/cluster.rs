@@ -495,7 +495,7 @@ pub async fn release(store: &Store, n: u64) {
 
 // The lock files of the terms this process claimed (or took back after a restart), each locked until
 // the term is let go (`release`) or the process ends, however it ends: the OS lets go then. Keyed by
-// term number. (A process holds one claim per term number: one lake at a time.)
+// term number. (A node holds one claim per term number: one lake at a time.)
 crate::per_node!(static HELD: Mutex<BTreeMap<u64, (PathBuf, std::fs::File)>> = Mutex::new(BTreeMap::new()));
 
 /// This user's folder of claim lock files, in the temp folder: per user on macOS and Windows, and

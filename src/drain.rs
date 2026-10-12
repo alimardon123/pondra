@@ -16,34 +16,41 @@
 //!    at once (`main.rs`). Everything acknowledged was durable already (`--ack durable`) or is held
 //!    by the followers (`--ack replicated`), so nothing waits on the bucket here.
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 crate::per_node!(static DRAINING: AtomicBool = AtomicBool::new(false));
-static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+// (each request holds its own node's count: one that outlives its node's stop counts down that
+// node's, never the next one's in the process)
+crate::per_node!(static IN_FLIGHT: RwLock<Arc<AtomicUsize>> = RwLock::default());
+
+/// This node's requests in flight.
+fn in_flight() -> Arc<AtomicUsize> { IN_FLIGHT.read().unwrap_or_else(|e| e.into_inner()).clone() }
 
 /// Is this node stopping?
 pub fn draining() -> bool { DRAINING.load(SeqCst) }
 
 /// Held by a request's work while it runs (`panics::door`): counted if it came before the drain.
-pub struct Busy(bool);
+pub struct Busy(Option<Arc<AtomicUsize>>);
 
 impl Busy {
     pub fn new() -> Busy {
         // (counted, then the flag read: with `drain` storing the flag, then reading the count, one of
         // them sees the other, so no request that came before the drain goes uncounted)
-        IN_FLIGHT.fetch_add(1, SeqCst);
+        let count = in_flight();
+        count.fetch_add(1, SeqCst);
         if draining() {
-            IN_FLIGHT.fetch_sub(1, SeqCst);
-            return Busy(false);
+            count.fetch_sub(1, SeqCst);
+            return Busy(None);
         }
-        Busy(true)
+        Busy(Some(count))
     }
 }
 
 impl Drop for Busy {
     fn drop(&mut self) {
-        if self.0 {
-            IN_FLIGHT.fetch_sub(1, SeqCst);
+        if let Some(count) = &self.0 {
+            count.fetch_sub(1, SeqCst);
         }
     }
 }
@@ -58,11 +65,11 @@ fn secs(var: &str, default: f64) -> Duration { Duration::from_secs_f64(std::env:
 pub async fn drain() {
     DRAINING.store(true, SeqCst);
     tokio::time::sleep(secs("PONDRA_DRAIN_GRACE_SECS", 0.0)).await;
-    let (start, most) = (tokio::time::Instant::now(), secs("PONDRA_DRAIN_SECS", 30.0));
-    while IN_FLIGHT.load(SeqCst) > 0 && start.elapsed() < most {
+    let (start, most, count) = (tokio::time::Instant::now(), secs("PONDRA_DRAIN_SECS", 30.0), in_flight());
+    while count.load(SeqCst) > 0 && start.elapsed() < most {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let left = IN_FLIGHT.load(SeqCst);
+    let left = count.load(SeqCst);
     if left > 0 {
         eprintln!("stopping with {left} request{} still running after {:?} (PONDRA_DRAIN_SECS)", if left == 1 { "" } else { "s" }, most);
     }
