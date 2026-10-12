@@ -20,7 +20,7 @@ catalog` prints what the lake's catalog holds.
 | `pondra token --dir LAKE` | make a token for a user of the lake (`pondra` unless `--user` names another) and print it, once, with no node or token needed |
 | `pondra run FILE LAKE` | run a SQL file, its `$name` parameters taking the values you pass |
 | `pondra workspace pull\|push DIR LAKE` | the lake's files in a folder of yours, for git and your editor |
-| `pondra init`, `plan`, `status`, `capture`, `apply`, `test`, `export` | a project of files, made true in a database ([environments](/pondra/guides/environments/#apply-a-project)) |
+| `pondra init`, `plan`, `status`, `capture`, `apply`, `test`, `export` | a project of files, made true in a database ([environments](/pondra/guides/projects/#apply-it)) |
 | `pondra login`, `branch`, `switch`, `diff`, `ci init` | a server's token kept; a Git branch and its database; what a branch changes; CI set up |
 | `pondra catalog --dir LAKE PREFIX` | print catalog entries |
 | `pondra --version`, `pondra --help` | the version, and help for any command |
@@ -385,7 +385,7 @@ pulled 0, removed 0 here
 ## pondra plan, apply and the project's commands
 
 A project is a folder with `pondra.toml`, `objects/`, `migrations/`, `seeds/` and `tests/`
-([apply a project](/pondra/guides/environments/#apply-a-project)). Each command reads it from
+([apply a project](/pondra/guides/projects/#apply-it)). Each command reads it from
 `--project` (this folder by default) and talks to an environment's node.
 
 | Command | Does |

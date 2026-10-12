@@ -1,0 +1,179 @@
+---
+title: SQL and Python together
+description: Mix SQL and Python in one program. Use a query as a frame, name a frame in SQL, send pandas data with a query, run %%sql cells, put Python in DO blocks and call Python functions from SQL.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Pondra runs one SQL engine behind both languages, so you can mix them freely. A query can be a
+string or a frame. A Python variable can be a table in SQL. A SQL answer stays a frame until you ask
+for its rows. This page shows the ways the two meet. Each one's rules are on the guide it links to.
+
+Some data for the examples:
+
+```sql
+CREATE TABLE orders (id BIGINT, user VARCHAR, item VARCHAR, qty INT, price DOUBLE);
+INSERT INTO orders VALUES
+  (1, 'ann', 'tea', 2, 3.5), (2, 'bob', 'cake', 1, 4.5), (3, 'ann', 'tea', 1, 3.5), (4, 'cy', 'coffee', 3, 3.0);
+```
+
+```python
+import pondra
+import pandas as pd
+
+db = pondra.connect("http://localhost:8080")
+```
+
+## A query is a frame
+
+`db.sql(query)` runs a query and gives you a frame, so you can keep going in Python. The frame runs
+when you ask for its rows. Anything that isn't a query, such as an `INSERT`, a `CREATE` or a `CALL`,
+runs at once.
+
+```python
+spent = db.sql("SELECT user, sum(qty * price) AS spent FROM orders GROUP BY user")
+spent.sort("spent", descending=True).rows()
+```
+
+```text
+[{'user': 'ann', 'spent': 10.5}, {'user': 'cy', 'spent': 9.0}, {'user': 'bob', 'spent': 4.5}]
+```
+
+The frame's methods are in [DataFrames](/pondra/guides/dataframes/).
+
+## Name a frame in SQL
+
+A name in your SQL that isn't a table is looked up among your Python variables. A frame becomes part
+of the same statement, so it still runs on the node's data.
+
+```python
+recent = db.sql("SELECT * FROM orders WHERE qty > 1")
+db.sql("SELECT r.user, sum(r.qty * r.price) AS spent FROM recent r GROUP BY r.user ORDER BY r.user").rows()
+```
+
+```text
+[{'user': 'ann', 'spent': 7.0}, {'user': 'cy', 'spent': 9.0}]
+```
+
+To name things yourself, pass a frame by keyword and write `{name}` in the SQL. Other keywords are
+`$name` parameters, which the node binds and never pastes into the text:
+
+```python
+db.sql("SELECT id, user, qty FROM {r} WHERE qty > $min ORDER BY id", r=recent, min=2).rows()
+```
+
+```text
+[{'id': 4, 'user': 'cy', 'qty': 3}]
+```
+
+A table in the lake wins over a Python variable of the same name.
+
+## Send pandas data with a query
+
+A pandas, Polars or Arrow table is sent along with the query that reads it, for that query only. The
+lake keeps nothing. Here a table of targets lives in Python and joins the orders:
+
+```python
+targets = pd.DataFrame({"user": ["ann", "bob", "cy"], "target": [10, 5, 20]})
+db.sql("""SELECT o.user, sum(o.qty * o.price) AS spent, t.target
+          FROM orders o JOIN targets t USING (user)
+          GROUP BY o.user, t.target ORDER BY o.user""").to_pandas()
+```
+
+```text
+  user  spent  target
+0  ann   10.5      10
+1  bob    4.5       5
+2   cy    9.0      20
+```
+
+To keep the data, write it to a table. [Loading data](/pondra/guides/load-data/) shows every way.
+
+## Save a frame as a table
+
+`write_table` on a frame makes a table from its rows, as `CREATE TABLE … AS SELECT` does. Views and
+the other modes are in [DataFrames](/pondra/guides/dataframes/#save-a-frame).
+
+```python
+spent.write_table("spend_by_user")
+db.table("spend_by_user").sort("user").rows()
+```
+
+```text
+[{'user': 'ann', 'spent': 10.5}, {'user': 'bob', 'spent': 4.5}, {'user': 'cy', 'spent': 9.0}]
+```
+
+## Python in SQL: DO LANGUAGE python
+
+`DO LANGUAGE python` runs a block of Python once, from SQL or from a client. In it, `db` is the caller's
+connection, so the block can read and write like any client. Its last line is its answer.
+
+```sql
+DO LANGUAGE python $$
+totals = db.sql("SELECT user, sum(qty * price) AS spent FROM orders GROUP BY user")
+totals.write_table("spend_by_user", mode="overwrite")
+print("saved", len(totals.rows()), "users")
+db.table("spend_by_user").sort("user").rows()
+$$;
+```
+
+```text
+[{"user":"ann","spent":10.5},{"user":"bob","spent":4.5},{"user":"cy","spent":9.0}]
+```
+
+Who may run a block, what it prints and how sessions keep its variables are in
+[Run code once](/pondra/guides/functions-and-procedures/#run-code-once-do).
+
+## Python functions in SQL
+
+A Python function, made with `@db.function` or `CREATE FUNCTION … LANGUAGE python`, is called from
+SQL like any other function. See [Python functions](/pondra/guides/functions-and-procedures/#python-functions).
+
+## SQL cells in a notebook
+
+In a notebook, `%load_ext pondra` adds `%%sql`. The cell runs as SQL on your newest connection, from
+`pondra.local()` or `pondra.connect()`, and shows its answer as a frame. Set the notebook up in
+[Notebooks](/pondra/guides/notebooks/).
+
+```python norun
+%load_ext pondra
+```
+
+```python norun
+%%sql
+SELECT user, sum(qty * price) AS spent FROM orders GROUP BY user ORDER BY spent DESC
+```
+
+```text
+  user  spent
+0  ann   10.5
+1   cy    9.0
+2  bob    4.5
+```
+
+To keep the answer instead of showing it, name it with `<<`. It becomes a frame in a Python variable
+that later cells can use, in SQL or in Python. A one-line query is `%sql`:
+
+```python norun
+%%sql top <<
+SELECT user, sum(qty * price) AS spent FROM orders GROUP BY user ORDER BY spent DESC
+```
+
+```python norun
+top.filter("spent > 5").to_pandas()
+```
+
+```text
+  user  spent
+0  ann   10.5
+1   cy    9.0
+```
+
+```python norun
+%sql SELECT count(*) AS n FROM orders
+```
+
+<Aside type="caution">
+A `%%sql` cell needs a connection made first, by `pondra.local(…)` or `pondra.connect(…)`. Without one
+it stops with `no connection yet: pondra.local(…) or pondra.connect(…) first`.
+</Aside>

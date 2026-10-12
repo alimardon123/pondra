@@ -1,0 +1,291 @@
+---
+title: Views kept current
+description: Materialized views that stay current as rows arrive and change, filled from the rows already there, and kept by key or run again when the rows alone can't keep them.
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A materialized view is a query the node keeps current as rows arrive and change. Most views take each
+new row, and each change, in the same commit as the rows, so a read never lags behind its table. A few,
+such as a median or a top N, catch up a moment after the commit: see
+[kept by key](#medians-and-distinct-counts-kept-by-key) and [run whole](#anything-else-run-whole).
+Use a view where you would otherwise run the same query again and again.
+
+`EMIT FINAL` keeps each time window once it is over, instead of its running total: see
+[Windows and sessions](/pondra/guides/windows/).
+
+## Keep a query up to date
+
+Make a table with a few rows in it. A view can start from rows that are already there.
+
+```sql
+CREATE TABLE clicks (user VARCHAR, page VARCHAR, ts TIMESTAMP, amount BIGINT);
+INSERT INTO clicks VALUES
+  ('ann', 'home', '2026-09-29 10:00:05', 1),
+  ('bob', 'home', '2026-09-29 10:00:40', 2),
+  ('ann', 'cart', '2026-09-29 10:01:10', 3);
+```
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    CREATE MATERIALIZED VIEW spend AS
+      SELECT user, count(*) AS n, sum(amount) AS total FROM clicks GROUP BY user;
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.connect("http://localhost:8080")
+    db.view("spend", "SELECT user, count(*) AS n, sum(amount) AS total FROM clicks GROUP BY user", materialized=True)
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    await db.view("spend", "SELECT user, count(*) AS n, sum(amount) AS total FROM clicks GROUP BY user", { materialized: true });
+    ```
+  </TabItem>
+</Tabs>
+
+Now write more rows. The view already has them when the write is acknowledged:
+
+```sql
+INSERT INTO clicks VALUES ('ann', 'checkout', '2026-09-29 10:02:00', 5);
+SELECT * FROM spend ORDER BY user;
+```
+
+```text
+user  n  total
+ann   3  9
+bob   1  2
+```
+
+A view without `GROUP BY` (a filter, a projection, a join) appends its rows to its own table. A
+view with `GROUP BY` keeps one running row per group, and any number of nodes add to it at once.
+A view of a filter or a projection also follows an `UPDATE` or `DELETE` of its table: a row that
+changes is changed in the view, and a row that no longer matches leaves it (see
+[Change rows](/pondra/guides/change-rows/#views-follow)).
+
+A grouped view takes the aggregates you would write by hand: `count`, `sum`, `avg`, `min`, `max`,
+`stddev` and `variance` (and their `_samp` and `_pop` forms), `bool_and` and `bool_or`, any
+expression over them, `HAVING`, and `ORDER BY … LIMIT`. Its table keeps running totals as rows
+arrive (sums, counts, and a variance's moments), and each read works the answers out from them, so
+they are as current as the rows:
+
+```sql
+CREATE MATERIALIZED VIEW habits AS
+  SELECT user, count(*) AS n, avg(amount) AS mean, stddev_pop(amount) AS spread
+  FROM clicks GROUP BY user HAVING count(*) > 1;
+SELECT * FROM habits;
+```
+
+```text
+user  n  mean  spread
+ann   3  3.0   1.632993161855452
+```
+
+### Medians and distinct counts: kept by key
+
+`count(DISTINCT …)`, `median`, percentiles, `string_agg` and `array_agg` need every row of a group,
+not running totals. A view of them is **kept by key**: after each commit, the groups its rows
+touched are worked out again from the table, and only those. Nothing is held in memory, and a
+write costs a read of its own groups' rows, not of the table.
+
+```sql
+CREATE MATERIALIZED VIEW reach AS
+  SELECT page, count(DISTINCT user) AS users, median(amount) AS typical
+  FROM clicks GROUP BY page;
+SELECT * FROM reach ORDER BY page;
+```
+
+```text
+page      users  typical
+cart      1      3.0
+checkout  1      5.0
+home      2      1.5
+```
+
+Such a view is current a moment after the commit, not in it: read the table when you need the
+answer as of your own write. `WITH (lag = '1 minute')` works it out at most once a minute, and
+`WITH (refresh = 'by key')` keeps a grouped view this way if it reads one table, with no join or
+subquery, and selects the columns it groups by.
+
+Windows split by a column the view selects are kept by key too, a key at a time: the latest row of
+each user, the top three of each page. So are windows over tables joined on that column, such as
+each auction's winning bid from `auctions JOIN bids ON auctions.id = bids.auction`.
+
+```sql
+CREATE MATERIALIZED VIEW last_click AS
+  SELECT user, page, amount FROM (
+    SELECT *, row_number() OVER (PARTITION BY user ORDER BY ts DESC) AS n FROM clicks
+  ) WHERE n = 1;
+SELECT * FROM last_click ORDER BY user;
+```
+
+```text
+user  page      amount
+ann   checkout  5
+bob   home      2
+```
+
+### Anything else: run whole
+
+Every other query is a materialized view too: a top N (`ORDER BY … LIMIT`), a window over every row,
+`DISTINCT`, a subquery over its own table, a median across a join, or a filter on `now()`. Its query
+runs whole again after a commit changes a table it reads, at most so often that its runs take a
+tenth of the time (a query of 50 ms is current within half a second; one of 10 s, within 100 s),
+and once those tables have been still for a second it runs then, as long as its runs take at most
+half the time, so the last rows of a burst don't wait out that tenth. A view that calls `now()`, or reads another lake or files, also runs every
+minute, or every `lag`.
+
+```sql
+CREATE MATERIALIZED VIEW biggest AS
+  SELECT user, page, amount FROM clicks ORDER BY amount DESC LIMIT 2;
+SELECT * FROM biggest ORDER BY amount DESC;
+```
+
+```text
+user  page      amount
+ann   checkout  5
+ann   cart      3
+```
+
+A row that comes out the same stays as it is, so the view's [change feed](/pondra/guides/change-rows/)
+shows only what moved. `pondra.flows` says how each view is kept (`refresh`: `incremental`,
+`by key` or `full`), why (`reason`), and which tables it follows. `WITH (refresh = 'full')` runs any
+view this way; `WITH (refresh = 'incremental')` refuses a view the rows alone can't keep.
+
+<Aside type="caution">
+A view kept from each write's rows, not run again, can't take a row back if it keeps a `min` or
+`max`, reads another table, or is a window, session or stream join. An `UPDATE` or `DELETE` of its
+source is refused while it exists. `DROP MATERIALIZED VIEW name` first, or change a copy of the table.
+A view that runs its query again follows any change. To change a view's query,
+`CREATE OR REPLACE MATERIALIZED VIEW` makes it again from the rows already there. A materialized
+view may follow another, in the same commit: see [Flows](/pondra/guides/flows/).
+</Aside>
+
+### From a frame
+
+A [frame](/pondra/guides/dataframes/) becomes a view the same way:
+
+```python
+by_page = db.table("clicks").group_by("page").agg(pondra.len().alias("views"))
+by_page.to_view("views_by_page", materialized=True)
+db.sql("SELECT * FROM views_by_page ORDER BY page").rows()
+```
+
+## Keep the newest row by event time
+
+A keyed table with `SEQUENCE BY` keeps, for each key, the row with the latest event time, not the last
+row to arrive. This is Flink's deduplication by event time.
+
+```sql
+CREATE TABLE latest (k BIGINT PRIMARY KEY, ts BIGINT, v VARCHAR) SEQUENCE BY ts;
+INSERT INTO latest VALUES (1, 100, 'new');
+INSERT INTO latest VALUES (1, 50, 'old');
+SELECT * FROM latest;
+```
+
+```text
+k  ts   v
+1  100  new
+```
+
+## Tasks: any streaming SQL
+
+A view covers filters, joins and aggregates. A **task** runs any SQL over the new rows of a table
+whenever a commit brings some, and appends the result to a target table, exactly once. The SQL may
+read the target too, which is how a task keeps state. Make the target in SQL, keyed or not, then make
+the task with HTTP:
+
+```sql
+CREATE TABLE totals (user VARCHAR PRIMARY KEY, total BIGINT, n BIGINT);
+```
+
+```bash
+curl -s -X POST localhost:8080/tasks/running_totals -d '{
+  "source": "clicks", "target": "totals", "key": ["user"],
+  "sql": "SELECT c.user, coalesce(max(t.total), 0) + sum(c.amount) AS total, coalesce(max(t.n), 0) + count(*) AS n FROM clicks c LEFT JOIN totals t ON c.user = t.user GROUP BY c.user"
+}'
+```
+
+The task runs over each commit's new rows and writes one row per user to `totals`, so `totals`
+holds each user's running total. Make a task before the rows it should see arrive. Add
+`"shards": 4, "shard_by": "user"` to spread the state over the nodes by the hash of a column.
+
+<Aside type="caution">
+A task's target must have exactly the columns the SQL returns. If the target doesn't exist, the
+task makes it from the query's output. A streaming task can't be dropped yet. It sees new rows only,
+so a table's rows can't be changed while a task follows it.
+</Aside>
+
+## Follow new rows
+
+`watch` streams a table's new rows the moment they commit, including a keyed table's upserts and
+deletes. `changes` adds every `UPDATE` and `DELETE`, each row with its `_change_type`.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    import threading
+    feed = db.watch("clicks")
+    threading.Timer(0.3, lambda: db.append("clicks", [{"user": "cy", "page": "home", "ts": "2026-09-29T10:03:00", "amount": 4}])).start()
+    print(next(feed))
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    const feed = db.watch("clicks");
+    setTimeout(() => db.append("clicks", [{ user: "dee", page: "home", ts: "2026-09-29T10:04:00", amount: 1 }]), 300);
+    console.log((await feed.next()).value);
+    await feed.return();
+    ```
+  </TabItem>
+  <TabItem label="Shell">
+    ```bash norun
+    curl -N "localhost:8080/watch/clicks"                 # new rows, as they commit (NDJSON)
+    curl -N "localhost:8080/watch/clicks?changes=true"    # every change
+    curl -N "localhost:8080/watch/clicks?after=1234"      # replay from a position first
+    ```
+  </TabItem>
+</Tabs>
+
+A replay with `after` goes back as far as the node keeps its log: start it with
+`--changelog-secs 86400` to keep a day.
+
+### Live queries
+
+A **live query** sends its answer now and again within milliseconds of each commit that changes
+it. It isn't sent again when the answer comes out the same, and commits to other tables don't wake it.
+Nothing runs on the node once the client goes away.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    live = db.live("SELECT count(*) AS n FROM clicks")
+    print(next(live))                       # the answer now
+    db.append("clicks", [{"user": "eve", "page": "cart", "ts": "2026-09-29T10:05:00", "amount": 2}])
+    print(next(live))                       # and again after the commit
+    live.close()
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    const live = db.live("SELECT count(*) AS n FROM clicks");
+    console.log((await live.next()).value);
+    await db.append("clicks", [{ user: "fay", page: "cart", ts: "2026-09-29T10:06:00", amount: 2 }]);
+    console.log((await live.next()).value);
+    await live.return();
+    ```
+  </TabItem>
+</Tabs>
+
+In an app, loop over it: `for rows in db.live(sql): redraw(rows)`, or
+`for await (const rows of db.live(sql))` in JavaScript. The Postgres port can't push an answer, so
+it has no live queries.

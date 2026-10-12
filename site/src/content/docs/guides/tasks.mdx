@@ -1,0 +1,115 @@
+---
+title: Tasks
+description: Run a statement on a schedule, or after other tasks in a graph with retries, timeouts and a result each step can read. Pause, resume and see what ran.
+---
+
+A **task** runs a statement for you, either on a timer (`SCHEDULE`) or after other tasks (`AFTER`).
+The leader runs each tick once, and a failover neither skips a tick nor runs it twice. Use a task
+for a job that should happen by itself: a nightly load, or a chain of steps where each waits for
+the one before. The statement is usually a `CALL` of a procedure
+([Functions and procedures](/pondra/guides/functions-and-procedures/)) or a script
+([Scripts and variables](/pondra/guides/scripts/)). The syntax of each task statement is in
+[SQL statements](/pondra/sql/statements/#functions-procedures-and-tasks).
+
+Some data and a procedure for the examples:
+
+```sql
+CREATE TABLE orders (id BIGINT, ts TIMESTAMP);
+INSERT INTO orders VALUES
+  (1, TIMESTAMP '2026-09-28 09:00:00'),
+  (2, TIMESTAMP '2026-09-29 10:00:00'),
+  (3, TIMESTAMP '2026-09-29 11:00:00');
+CREATE TABLE order_counts (day DATE, orders BIGINT);
+CREATE PROCEDURE count_day($day DATE) AS BEGIN
+  INSERT INTO order_counts SELECT $day, count(*) FROM orders WHERE ts::DATE = $day;
+END;
+```
+
+## Run on a schedule
+
+```sql
+CREATE TASK nightly SCHEDULE 'cron 0 2 * * * UTC' AS CALL count_day(current_date - 1);
+CREATE TASK refresh SCHEDULE '5 minutes' AS CALL count_day(current_date);
+SHOW TASKS;
+```
+
+- **A schedule** is `'5 minutes'`, `'every 30 seconds'` or `'1 HOUR'`, or a cron line with an optional
+  time zone: `'cron 0 2 * * * Europe/Berlin'`.
+- **Missed ticks.** Ticks missed while no node led run once, as the latest of them.
+- **Who runs it.** A scheduled task's statement runs as an admin.
+- **Look at them** with `SHOW TASKS` or the table `pondra.tasks`, which has each task's schedule or
+  what it follows, its state, and its last run's status and result.
+- **Stop one** with `DROP TASK name`.
+
+```sql
+DROP TASK refresh;
+DROP TASK nightly;
+```
+
+## Run tasks in order
+
+A task can run **after** other tasks instead of on a schedule of its own. A scheduled task and the
+tasks that follow it form a graph, and each of its ticks is one run of the graph. A task runs once
+everything it follows has ended well in that run, so a failure stops what comes after it.
+
+```sql
+CREATE TASK count_orders SCHEDULE 'cron 0 2 * * * UTC' AS BEGIN
+  DECLARE PARAMETER $day DATE = current_date - 1;
+  SELECT count(*) FROM orders WHERE ts::DATE = $day;
+END;
+CREATE TASK load_counts AFTER count_orders
+  WHEN pondra.result('count_orders') > 0
+  WITH (retries = 2, retry_delay = '1 minute', timeout = '1 hour')
+AS BEGIN
+  DECLARE PARAMETER $day DATE = current_date - 1;
+  INSERT INTO order_counts VALUES ($day, pondra.result('count_orders'));
+  RETURN (SELECT count(*) FROM order_counts);
+END;
+CREATE TASK report AFTER load_counts AS PRINT 'days loaded: ' || pondra.result('load_counts');
+EXECUTE TASK count_orders (day => DATE '2026-09-29');
+```
+
+```text
+{"task":"count_orders","run":"task-count_orders-1791747661016"}
+```
+
+`EXECUTE TASK` answers at once with the run's id, and the graph runs in the background. Its `day` value reaches every task
+of the graph that declares `$day`, so `load_counts` above loads 2026-09-29, not yesterday.
+
+- **`WHEN` is checked first.** When it is false the task is `skipped`, and the tasks after it still run.
+- **`pondra.result('t')`** is what task `t` answered in this run of the graph: its `RETURN`, or the
+  first value of its last query. It is NULL when `t` gave nothing.
+- **`EXECUTE TASK name (…)`** starts a graph now, from its first task, with values for the `$name`s its
+  tasks declare. A scheduled run gives none, so each task takes its own default from
+  `DECLARE PARAMETER`. It is refused while that task's last run is still going.
+- **Retries.** `retries = n` runs a failed task again with the same job, so what a try wrote lands
+  once. `retry_delay` waits between tries (10 seconds by default), and `timeout` fails a try that runs
+  longer.
+- **`on_failure`** names a procedure. Once a task has failed for good, that procedure is called with
+  the task's name and its error.
+- **A graph has one start.** `CREATE TASK` refuses a graph with two starts or a loop.
+- **Dropping.** `DROP TASK` refuses a task that another task runs after: drop the later tasks first.
+
+## Pause and resume
+
+`ALTER TASK name SUSPEND` stops a task, and `ALTER TASK name RESUME` starts it again. A suspended task
+has no ticks of its own. In a graph, neither it nor the tasks after it run. `EXECUTE TASK` still runs
+it.
+
+```sql
+ALTER TASK count_orders SUSPEND;
+ALTER TASK count_orders RESUME;
+```
+
+## See what ran
+
+Each task run is a row of `pondra.runs`, with the id `task-<name>-<tick>`. The tick is the same for
+every task in one run of a graph. The columns are in
+[See what ran](/pondra/guides/functions-and-procedures/#see-what-ran).
+
+```sql
+SELECT name, after, state, last_status, last_result FROM pondra.tasks;
+DROP TASK report;
+DROP TASK load_counts;
+DROP TASK count_orders;
+```
