@@ -439,6 +439,7 @@ pub struct HotFiles {
     pub files: Vec<DataFile>,
     pub schema: SchemaRef,
     pub meta: TableMeta, // (what reading a file takes of its table: its columns, their names, the key)
+    pub known: Arc<HashMap<String, Known>>, // (what the planner knows of the table's columns: `Known`)
 }
 
 impl std::fmt::Debug for HotFiles {
@@ -460,13 +461,10 @@ impl TableProvider for HotFiles {
             None => self.schema.as_ref().clone(),
         });
         let deletes = self.meta.key.is_empty(); // (a keyed table's positions are older versions its own reads pass over)
-        let (mut cached, mut cold, mut hot) = (vec![], vec![], vec![]);
+        let (mut cached, mut cold) = (vec![], vec![]);
         for f in &self.files {
             match self.lake.hot.get(&key(f, deletes), &schema) {
-                Some((batches, ranges)) => {
-                    cached.extend(batches.into_iter().enumerate().map(|(i, b)| (b, (ranges.clone(), i))));
-                    hot.push(f);
-                }
+                Some((batches, ranges)) => cached.extend(batches.into_iter().enumerate().map(|(i, b)| (b, (ranges.clone(), i)))),
                 None => cold.push(f),
             }
         }
@@ -499,7 +497,7 @@ impl TableProvider for HotFiles {
             parts.retain(|p| !p.is_empty());
             pieces.retain(|p| !p.is_empty());
             let memory = MemorySourceConfig::try_new(&parts, schema.clone(), None)?;
-            plans.push(DataSourceExec::from_data_source(HotSource::new(memory, Arc::new(pieces), None, Arc::new(known(&hot, &self.meta, &schema)))));
+            plans.push(DataSourceExec::from_data_source(HotSource::new(memory, Arc::new(pieces), None, self.known.clone())));
         }
         match plans.len() {
             0 => Ok(Arc::new(EmptyExec::new(schema))),
@@ -511,39 +509,28 @@ impl TableProvider for HotFiles {
 /// A batch's place: its file's columns' ranges, and which of its batches it is.
 type Piece = (Arc<HashMap<String, Ranges>>, usize);
 
-/// What the planner knows of a column of the batches: the least and greatest value of the files
-/// they came from, as their footers gave them (`DataFile::stats`), and how many values it holds,
-/// as the table's sketch counts them (`TableMeta::sketch`) and no more than its range holds. The
-/// same facts the table gives the join order (`query::Pruned::count`), so a filter or a join over
-/// the batches is sized alike there and here (without them DataFusion took a range of dates for
-/// every row, and a nation's name for a fifth of the nations).
+/// What the planner knows of a column of the batches: the table's least and greatest value and
+/// how many values it holds, as the table gives them to the join order (`query::Pruned::count`:
+/// its files' footers and its sketch), so a filter or a join over the batches is sized alike there
+/// and here. Without them DataFusion took a range of dates for every row, and a nation's name for
+/// a fifth of the nations. They are the catalog's, the same on every node whatever it holds in
+/// memory.
 #[derive(Debug, Clone, Default)]
-struct Known {
+pub struct Known {
     range: Option<(ScalarValue, ScalarValue)>,
-    distinct: Option<u64>,
+    distinct: Option<usize>,
 }
 
-fn known(files: &[&DataFile], meta: &TableMeta, schema: &Schema) -> HashMap<String, Known> {
-    let range = |field: &FieldRef| {
-        let parse = |v: &String| ScalarValue::try_from_string(v.clone(), field.data_type()).ok();
-        let mut range: Option<(ScalarValue, ScalarValue)> = None;
-        for f in files {
-            let (lo, hi) = f.stats.get(field.name())?;
-            let (lo, hi) = (parse(lo)?, parse(hi)?);
-            range = Some(match range {
-                Some((a, b)) => (if lo < a { lo } else { a }, if hi > b { hi } else { b }),
-                None => (lo, hi),
-            });
-        }
-        range.filter(|(lo, hi)| !lo.is_null() && !hi.is_null())
+/// A table's statistics as `Known`, by column name. Ranges only of numbers, dates and times: the
+/// estimates measure no other (a string's least and greatest value sized nothing, and each plan
+/// copied them at every step it asked for statistics).
+pub fn known(stats: &datafusion::common::Statistics, schema: &Schema) -> HashMap<String, Known> {
+    let measured = |t: &DataType| t.is_numeric() || matches!(t, DataType::Date32 | DataType::Date64 | DataType::Timestamp(..));
+    let column = |f: &FieldRef, c: &datafusion::common::ColumnStatistics| Known {
+        range: c.min_value.get_value().cloned().zip(c.max_value.get_value().cloned()).filter(|(lo, hi)| measured(f.data_type()) && !lo.is_null() && !hi.is_null()),
+        distinct: c.distinct_count.get_value().copied(),
     };
-    let column = |field: &FieldRef| {
-        let range = range(field);
-        let sketched = meta.sketch.get(field.name()).and_then(|s| crate::sketch::estimate(s));
-        let spanned = range.as_ref().and_then(|(lo, hi)| crate::manifest::span(lo, hi));
-        Known { distinct: [sketched, spanned].into_iter().flatten().min(), range }
-    };
-    schema.fields().iter().map(|f| (f.name().clone(), column(f))).filter(|(_, k)| k.range.is_some() || k.distinct.is_some()).collect()
+    schema.fields().iter().zip(&stats.column_statistics).map(|(f, c)| (f.name().clone(), column(f, c))).filter(|(_, k)| k.range.is_some() || k.distinct.is_some()).collect()
 }
 
 /// The hot batches of a scan, as DataFusion's memory source reads them, skipping each batch the
@@ -606,7 +593,7 @@ impl DataSource for HotSource {
                 (c.min_value, c.max_value) = (Precision::Inexact(lo.clone()), Precision::Inexact(hi.clone()));
             }
             if let (Some(d), Some(&rows)) = (k.distinct, s.num_rows.get_value()) {
-                c.distinct_count = Precision::Inexact((d as usize).min(rows).max(1));
+                c.distinct_count = Precision::Inexact(d.min(rows).max(1));
             }
         }
         Ok(slot.get_or_init(|| Arc::new(s)).clone())

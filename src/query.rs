@@ -388,19 +388,19 @@ async fn read_files(lake: &Lake, ctx: &SessionContext, files: Vec<&DataFile>, me
     if !lake.hot.on() {
         return files_once(lake, ctx, &files, meta, schema).await;
     }
-    Ok(ctx.read_table(Arc::new(hot_files(lake, files, meta, schema)))?)
+    Ok(ctx.read_table(Arc::new(hot_files(lake, files, meta, schema, Default::default())))?)
 }
 
-fn hot_files(lake: &Lake, files: Vec<&DataFile>, meta: &TableMeta, schema: &SchemaRef) -> crate::hot::HotFiles {
-    let meta = TableMeta { columns: meta.columns.clone(), names: meta.names.clone(), key: meta.key.clone(), sketch: meta.sketch.clone(), ..Default::default() }; // (what reading a file takes of its table, and its distinct counts for the planner: `hot::known`)
-    crate::hot::HotFiles { lake: lake.arc(), files: files.into_iter().cloned().collect(), schema: schema.clone(), meta }
+fn hot_files(lake: &Lake, files: Vec<&DataFile>, meta: &TableMeta, schema: &SchemaRef, known: Arc<std::collections::HashMap<String, crate::hot::Known>>) -> crate::hot::HotFiles {
+    let meta = TableMeta { columns: meta.columns.clone(), names: meta.names.clone(), key: meta.key.clone(), ..Default::default() }; // (what reading a file takes of its table)
+    crate::hot::HotFiles { lake: lake.arc(), files: files.into_iter().cloned().collect(), schema: schema.clone(), meta, known }
 }
 
 /// An append table that never changed, read through the hot columns, as a plan: its log tail and
 /// its files side by side, as `raw` reads them. Planned here, not as a query of its own: that
 /// query's optimizer passes are the ones the whole query runs over it again anyway, and they were
 /// a sixth of a dashboard query's time while rows streamed in.
-async fn plain_scan(lake: &Lake, state: &dyn datafusion::catalog::Session, name: &str, meta: &TableMeta, upto: Option<u64>, projection: Option<&Vec<usize>>) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+async fn plain_scan(lake: &Lake, state: &dyn datafusion::catalog::Session, name: &str, meta: &TableMeta, upto: Option<u64>, projection: Option<&Vec<usize>>, known: Arc<std::collections::HashMap<String, crate::hot::Known>>) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
     use datafusion::datasource::memory::MemorySourceConfig;
     let schema = read_schema(&meta.columns)?;
     let sys = meta.columns.iter().any(|(c, _)| c == crate::sys::ROW_ID);
@@ -410,7 +410,7 @@ async fn plain_scan(lake: &Lake, state: &dyn datafusion::catalog::Session, name:
         parts.push(MemorySourceConfig::try_new_exec(&[tail], schema.clone(), projection.cloned())?);
     }
     if !meta.files.is_empty() {
-        parts.push(hot_files(lake, meta.files.iter().collect(), meta, &schema).scan(state, projection, &[], None).await?);
+        parts.push(hot_files(lake, meta.files.iter().collect(), meta, &schema, known).scan(state, projection, &[], None).await?);
     }
     if parts.is_empty() {
         parts.push(MemorySourceConfig::try_new_exec(&[vec![]], schema, projection.cloned())?);
@@ -727,7 +727,10 @@ impl TableProvider for Pruned {
         let all: Vec<usize> = (0..self.schema.fields().len()).collect();
         let plain = !meta.changed && range.is_none() && meta.key.is_empty() && meta.ext.is_none() && self.lake.hot.on();
         let plan = match plain {
-            true => plain_scan(&self.lake, state, &self.name, &meta, upto, projection).await.map_err(e)?,
+            true => {
+                let known = Arc::new(crate::hot::known(self.stats.get_or_init(|| self.count()), &self.schema));
+                plain_scan(&self.lake, state, &self.name, &meta, upto, projection, known).await.map_err(e)?
+            }
             false => self.planned(&meta, range, projection.unwrap_or(&all), upto).await?,
         };
         let Some((rows, bytes)) = self.share else { return Ok(plan) };
