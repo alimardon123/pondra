@@ -68,12 +68,16 @@ jobs:
           PLAN: ${{ inputs.plan }}
           LEG: ${{ inputs.leg }}
         run: |
+          if [ "$LEG" -gt 1 ] && [ ! -f before/soak-state.json ]; then
+            echo "::error::the leg before saved no state (a check of its rows failed): the day stops there"; exit 1
+          fi
           pip install -q $(grep -E '^boto3' tools/requirements.txt | sed 's/ *#.*//')
           read -r hours rate batch nodes storage legs < <(python3 -c "import json, os; p = json.loads(os.environ['PLAN']); print(min(5.5, float(p['hours'])), p['rate'], p['batch'], p['nodes'], p['storage'], p['legs'])")
           python3 tools/soak.py --hours "$hours" --rate "$rate" --batch "$batch" --nodes "$nodes" --bin ./pondra \
             $([ "$storage" = r2 ] && echo --s3) --out soak.json --timeline soak-timeline.jsonl \
             $([ "$LEG" -gt 1 ] && echo --resume before/soak-state.json) \
-            $([ "$LEG" -lt "$legs" ] && echo --save soak-state.json)
+            $([ "$LEG" -lt "$legs" ] && echo --save soak-state.json) \
+            $([ "$legs" -gt 1 ] && [ "$LEG" -eq "$legs" ] && echo --steady)
       - name: The nodes' logs, beside the results
         if: always()
         run: mkdir -p logs && cp /tmp/pondra-soak-*/*.log logs/ 2>/dev/null || true
