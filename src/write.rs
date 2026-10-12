@@ -656,7 +656,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             Stmt::Update(relation(&u.table.relation)?, set.collect(), where_(&u.selection))
         }
         Statement::AlterTable(a) => match &a.operations[..] {
-            [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if c.options.iter().any(|o| matches!(o.option, ast::ColumnOption::NotNull | ast::ColumnOption::Default(_))) || !matches!(crate::seq::identity_of(c), Ok(None)) => {
+            [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if crate::defaults::fills_existing(c) || !matches!(crate::seq::identity_of(c), Ok(None)) => {
                 Stmt::Invalid(format!("ALTER TABLE {} ADD COLUMN {} … NOT NULL, DEFAULT or an identity: the rows already there would have no value for it (add it, then UPDATE {} SET {} = …)", a.name, c.name, a.name, c.name))
             }
             [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => Stmt::AddColumn(object(&a.name), ident(&c.name), sql_type(&c.data_type), *if_not_exists),
@@ -664,6 +664,12 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             [ast::AlterTableOperation::RenameColumn { old_column_name: from, new_column_name: to }] => alter(&a, from, Change::Rename(ident(to))),
             [ast::AlterTableOperation::DropColumn { column_names, if_exists, .. }] => Stmt::Ddl(column_names.iter().map(|c| Ddl::AlterColumn { table: object(&a.name), column: ident(c), change: Change::Drop { if_exists: *if_exists } }).collect()),
             [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetDataType { data_type, .. } }] => alter(&a, c, Change::Type(data_type.to_string())),
+            // (defaults and NOT NULL: `defaults.rs`; `SET DEFAULT NULL` is no default, as `DEFAULT NULL` in ADD COLUMN)
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetDefault { value } }] if crate::defaults::is_null(value) => alter(&a, c, Change::Default(None)),
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetDefault { value } }] => alter(&a, c, Change::Default(Some(value.to_string()))),
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::DropDefault }] => alter(&a, c, Change::Default(None)),
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetNotNull }] => alter(&a, c, Change::NotNull(true)),
+            [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::DropNotNull }] => alter(&a, c, Change::NotNull(false)),
             [ast::AlterTableOperation::RenameTable { table_name }] => {
                 let to = table_name.to_string();
                 let to = to.trim_start_matches("TO ").trim_start_matches("AS ");
@@ -877,7 +883,8 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
     }
     // (`PARTITION BY`, `CLUSTER BY`, `SEQUENCE BY`, `TTL` and `MERGE sum` came in as these options: `layout.rs`)
     if let o @ (ast::CreateTableOptions::Plain(_) | ast::CreateTableOptions::TableProperties(_)) = &c.table_options {
-        bail!("CREATE TABLE {} … {o}: a table's options go in WITH (name = value, …)", c.name);
+        // (MySQL's `ENGINE=…` and the like: a feature of another engine, refused by name with its SQLSTATE)
+        return Err(crate::codes::coded("0A000", format!("CREATE TABLE {} … {o}: a table's options go in WITH (name = value, …)", c.name)));
     }
     const OPTIONS: [&str; 7] = ["publish", "cluster_by", "partition_by", "ttl", "order_by", "merge", "retention"];
     if let Some(k) = opts.keys().find(|k| !OPTIONS.contains(&k.as_str())) {
@@ -1788,6 +1795,26 @@ async fn created(dir: &str, c: &ast::CreateTable) -> Result<Option<()>> {
     }
 }
 
+/// The lake's key for its nodes, for `pondra sql` with no token. A leader makes it beside serving
+/// (C5), so one that has just started may not have it in the bucket yet: while one leads and the key
+/// isn't there, the lake is read again every 200 ms, for 10 s at most (a node a program started
+/// answers nothing without it: S21).
+async fn cli_key(lake: &Lake) -> Option<String> {
+    for _ in 0..50 {
+        if let Ok(k) = crate::users::node_key(lake).await {
+            return Some(k);
+        }
+        let led = matches!(latest(&lake.store).await, Ok(Some(t)) if !t.addr.is_empty() && alive(&lake.store, &t).await);
+        match crate::users::kept(lake).await {
+            "none" if led => {} // (not made yet: wait for them)
+            _ => return crate::users::node_key(lake).await.ok(), // (made meanwhile, or no leader to wait for)
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        lake.refresh().await.ok()?;
+    }
+    None
+}
+
 async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
     let job = job().to_string();
     // (A lake with no catalog yet can't be read: then the work is done once this process leads.)
@@ -1799,7 +1826,7 @@ async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
             if !crate::env::is_set("PONDRA_TOKEN") && !crate::env::is_set("PONDRA_ADMIN_TOKEN") && crate::cluster::node_key().is_none() {
                 // (no token: the lake's own key for its nodes, which whoever holds the lake can read; a
                 // leader on the network answers nothing unsigned. `cluster::http` sends it.)
-                if let Ok(k) = crate::users::node_key(&target).await {
+                if let Some(k) = cli_key(&target).await {
                     crate::cluster::set_node_key(k);
                 }
             }

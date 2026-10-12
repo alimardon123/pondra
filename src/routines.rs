@@ -1687,6 +1687,9 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
             crate::settings::Done::Run(sql) => Box::pin(one_of(app, &sql, who, job)).await,
         };
     }
+    if let Some(steps) = Box::pin(steps(app, sql, who)).await? {
+        return Box::pin(run_steps(app, steps, who, job)).await; // (several statements: an ALTER's actions, a DROP's views)
+    }
     if let Some(stmt) = crate::write::parse(sql) {
         app.auth.allows(who.role, &stmt)?;
         return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files).await?));
@@ -1698,6 +1701,121 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
         true => app.query_as(&crate::asof::rewrite(sql)?, Some("0"), true).await?, // (a file here: this node only)
         false => app.query(sql, None).await?,
     }))
+}
+
+/// A statement Postgres does in one go that is taken one part at a time, each part a statement of its
+/// own, with its notice: `ALTER TABLE t a1, a2` (Postgres applies the actions as one; here each is
+/// its own commit) and `DROP TABLE t CASCADE` (the views that read it, deepest first, then it). Every
+/// part is checked before the first runs, so a refusal changes nothing. None: `sql` is neither.
+async fn steps(app: &App, sql: &str, who: Who) -> Result<Option<Vec<(String, Option<String>)>>> {
+    let parts = match verb(sql) {
+        v if v.eq_ignore_ascii_case("alter") => alter_steps(sql),
+        v if v.eq_ignore_ascii_case("drop") => cascade_steps(&app.lake, sql).await?,
+        _ => None,
+    };
+    let Some(parts) = parts else { return Ok(None) };
+    for (part, _) in &parts {
+        match crate::write::parse(part) {
+            Some(Stmt::Invalid(why)) => bail!("{why}"),
+            Some(stmt) => {
+                app.auth.allows(who.role, &stmt)?;
+                if let Stmt::Ddl(ds) = &stmt {
+                    for d in ds {
+                        crate::protect::check_ddl(&app.lake, d).await?;
+                    }
+                }
+            }
+            None => bail!("{part}: not taken as one statement: write it alone"),
+        }
+    }
+    Ok(Some(parts))
+}
+
+/// The statement's first word, past leading comments (`write::first_word` gives the rest of the text).
+fn verb(sql: &str) -> &str {
+    crate::write::first_word(sql).split_whitespace().next().unwrap_or_default()
+}
+
+/// Whether `steps` takes `sql` apart: an ALTER TABLE with several actions, a DROP with CASCADE. The
+/// fast path of `server::sql_as` (a statement `write::parse` doesn't know, sent to the query path)
+/// leaves these to `one_of`; the first word is looked at first, so other statements pay nothing.
+pub fn several(sql: &str) -> bool {
+    let word = verb(sql);
+    if !(word.eq_ignore_ascii_case("alter") || word.eq_ignore_ascii_case("drop")) {
+        return false;
+    }
+    match Parser::parse_sql(&GenericDialect {}, sql).as_deref() {
+        Ok([Statement::AlterTable(a)]) => a.operations.len() > 1,
+        Ok([Statement::Drop { cascade, .. }]) => *cascade,
+        _ => false,
+    }
+}
+
+/// `ALTER TABLE t a1, a2, …` as one statement per action, when there is more than one.
+fn alter_steps(sql: &str) -> Option<Vec<(String, Option<String>)>> {
+    let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return None };
+    let [Statement::AlterTable(a)] = &mut stmts[..] else { return None };
+    if a.operations.len() < 2 {
+        return None;
+    }
+    let ops = std::mem::take(&mut a.operations);
+    Some(ops.into_iter().map(|op| {
+        let mut one = a.clone();
+        one.operations = vec![op];
+        (crate::routines::sql(&Statement::AlterTable(one)), None) // (`sql`: a default of `- -3` would otherwise read back as a comment)
+    }).collect())
+}
+
+/// `DROP TABLE t CASCADE` / `DROP VIEW v CASCADE`: the views that read the dropped object, each after
+/// the views that read it (Postgres's order), then the object itself. A task that reads it can't be
+/// dropped by this statement, and says so before anything runs.
+async fn cascade_steps(lake: &Lake, sql: &str) -> Result<Option<Vec<(String, Option<String>)>>> {
+    let Ok(stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(None) };
+    let [Statement::Drop { object_type, if_exists, names, cascade: true, .. }] = &stmts[..] else { return Ok(None) };
+    let [name] = &names[..] else { return Ok(None) };
+    let kind = match object_type {
+        ast::ObjectType::Table => "TABLE",
+        ast::ObjectType::View => "VIEW",
+        _ => return Ok(None),
+    };
+    let Some(local) = crate::ddl::local(lake, &crate::write::object(name)) else { return Ok(None) }; // (another lake's: its own path)
+    let mut out = vec![];
+    views_reading(lake, &local, 0, &mut out).await?;
+    let ifx = if *if_exists { "IF EXISTS " } else { "" };
+    out.push((format!("DROP {kind} {ifx}{name}"), None));
+    Ok(Some(out))
+}
+
+/// The views that read `name`, deepest first (each one's readers before it), with the notice a drop
+/// of each gives: `drop cascades to view v1`.
+async fn views_reading(lake: &Lake, name: &str, depth: usize, out: &mut Vec<(String, Option<String>)>) -> Result<()> {
+    ensure!(depth < 16, "{name}: views that read views that read it, 16 deep: drop them by hand");
+    for r in crate::ddl::readers(lake, name).await? {
+        let (kind, view) = match (r.strip_prefix("materialized view "), r.strip_prefix("view ")) {
+            (Some(v), _) => ("MATERIALIZED VIEW", v),
+            (None, Some(v)) => ("VIEW", v),
+            _ => bail!("{r} reads {name}: DROP … CASCADE drops views only: drop it first"),
+        };
+        let drop = format!("DROP {kind} {}", crate::write::sql_name(view)); // (quoted as stored: a view named "V" stays V)
+        if out.iter().any(|(s, _)| *s == drop) {
+            continue; // (read by two views: dropped once)
+        }
+        Box::pin(views_reading(lake, view, depth + 1, out)).await?; // (a view of a view: the future recurses)
+        out.push((drop, Some(format!("drop cascades to {} {view}", kind.to_lowercase()))));
+    }
+    Ok(())
+}
+
+/// Runs the steps one after another, each with its notice and its own job part (`{job}:{i}`).
+async fn run_steps(app: &App, steps: Vec<(String, Option<String>)>, who: Who, job: Option<String>) -> Result<Outcome> {
+    let mut last = None;
+    for (i, (step, notice)) in steps.iter().enumerate() {
+        if let Some(n) = notice {
+            heard(n);
+        }
+        last = Some(Box::pin(one_of(app, step, who, job.as_ref().map(|j| format!("{j}:{i}")))).await?);
+    }
+    last.context("no statement to run")
 }
 
 /// A script's statements, each in turn; the last one's outcome. With a `job`, each gets its own

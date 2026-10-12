@@ -131,7 +131,10 @@ fn unique(name: Option<String>, columns: Vec<String>, u: &ast::UniqueConstraint,
 
 fn foreign(name: Option<String>, columns: Vec<String>, f: &ast::ForeignKeyConstraint, table: &str) -> Result<Constraint> {
     let refs = format!("REFERENCES {}", f.foreign_table);
-    ensure!(informational(&f.characteristics), "{} {refs}: a reference isn't checked yet; say NOT ENFORCED to keep it as a fact about the data (BI tools and the planner read it)", columns.join(", "));
+    if !informational(&f.characteristics) {
+        // (a feature not taken yet, not a fault: SQLSTATE 0A000, as the other "not taken" refusals)
+        return Err(crate::codes::coded("0A000", format!("{} {refs}: a reference isn't checked yet; say NOT ENFORCED to keep it as a fact about the data (BI tools and the planner read it)", columns.join(", "))));
+    }
     let to = (crate::write::object(&f.foreign_table), f.referred_columns.iter().map(crate::write::ident).collect());
     Ok(fact(name, Kind::ForeignKey, columns, Some(to), table))
 }

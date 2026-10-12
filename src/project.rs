@@ -171,6 +171,10 @@ pub struct Where {
     /// A token for it (also PONDRA_TOKEN).
     #[arg(long)]
     token: Option<String>,
+    /// The key of a node this command started (`--watch` reaches it by its address): such a node answers only
+    /// the program that started it (`x-pondra-owner`). Never a flag.
+    #[arg(skip)]
+    owner: Option<String>,
 }
 
 impl Where {
@@ -409,7 +413,7 @@ fn token_for(at: &Where, base: &str) -> Option<String> {
 /// A node at `base`, as it is. Nothing is started.
 fn node_at(at: &Where, base: String) -> Node {
     let token = token_for(at, &base);
-    Node { http: reqwest::Client::new(), base, token, owner: String::new(), child: None }
+    Node { http: reqwest::Client::new(), base, token, owner: at.owner.clone().unwrap_or_default(), child: None }
 }
 
 /// The node an environment is served by. A lake's node is started for the command and stopped when it ends.
@@ -756,7 +760,7 @@ async fn run(cmd: Command) -> Result<(String, bool)> {
         Command::Export { dir, at } => export(dir.as_deref().unwrap_or("."), &at).await.map(|s| (s, true)),
         Command::Diff { target, at, against } => diff(&at.with(target), against).await,
         Command::Ci { cmd: Ci::Init { project, force } } => {
-            let at = Where { env: None, project, url: None, lake: None, token: None };
+            let at = Where { env: None, project, url: None, lake: None, token: None, owner: None };
             crate::ci::init(&at, force).await.map(|()| (String::new(), true)) // (its lines are printed as each step is done)
         }
     }
@@ -1089,7 +1093,7 @@ async fn watch_env(at: &Where, run: Run, applies: Option<usize>) -> Result<()> {
     // (a lake's node is started once and kept while it watches: each apply goes to it by its address, and its
     // console stays up at the address printed)
     let target = match node.child {
-        Some(_) => Where { env: Some(env.clone()), url: Some(node.base.clone()), lake: None, ..at.clone() },
+        Some(_) => Where { env: Some(env.clone()), url: Some(node.base.clone()), lake: None, owner: Some(node.owner.clone()), ..at.clone() },
         None => Where { env: Some(env.clone()), ..at.clone() },
     };
     let mut last = files(dir)?; // (what the last apply was of)
@@ -1287,7 +1291,7 @@ mod tests {
 
     #[test]
     fn local_is_the_projects_lake() {
-        let at = |url: Option<&str>| Where { env: None, project: "proj".into(), url: url.map(String::from), lake: None, token: None };
+        let at = |url: Option<&str>| Where { env: None, project: "proj".into(), url: url.map(String::from), lake: None, token: None, owner: None };
         let t = parse("[project]\nserver = \"https://pondra.acme.com\"\n");
         assert_eq!(lake_of(&at(None), &t, LOCAL), Some(Path::new("proj").join("lake").to_string_lossy().into_owned()));
         assert!(given(&at(None), &t, LOCAL)); // (nothing made on the server: no clone of prod)

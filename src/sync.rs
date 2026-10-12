@@ -48,11 +48,11 @@ pub async fn command(cmd: Command) -> Result<()> {
     let token = at.token.clone().or_else(|| crate::env::get("PONDRA_TOKEN"));
     let push = matches!(cmd, Command::Push { .. });
     let said = match &at.url {
-        Some(url) => Node { http: reqwest::Client::new(), base: url.trim_end_matches('/').into(), token }.sync(Path::new(dir), push).await,
+        Some(url) => Node { http: reqwest::Client::new(), base: url.trim_end_matches('/').into(), token, owner: None }.sync(Path::new(dir), push).await,
         None => {
-            let (mut child, base, _, log) = crate::shell::start(at.lake.as_deref().unwrap_or("lake"))?;
+            let (mut child, base, key, log) = crate::shell::start(at.lake.as_deref().unwrap_or("lake"))?;
             let r = match crate::shell::up(&base, &mut child, &log).await {
-                Ok(http) => Node { http, base, token }.sync(Path::new(dir), push).await,
+                Ok(http) => Node { http, base, token, owner: Some(key) }.sync(Path::new(dir), push).await,
                 Err(e) => Err(e),
             };
             crate::shell::stop(&mut child);
@@ -74,13 +74,22 @@ struct Node {
     http: reqwest::Client,
     base: String,
     token: Option<String>,
+    owner: Option<String>, // the key of a node this command started: it answers only its program
 }
 
 impl Node {
     fn req(&self, method: reqwest::Method, rel: &str) -> reqwest::RequestBuilder {
         let mut url = reqwest::Url::parse(&self.base).expect("a node's address");
         url.path_segments_mut().expect("an http address").push("files").extend(rel.split('/'));
-        let r = self.http.request(method, url);
+        self.signed(self.http.request(method, url))
+    }
+
+    /// A request as whoever runs the command: its token, and its key to a node it started.
+    fn signed(&self, r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let r = match &self.owner {
+            Some(k) => r.header("x-pondra-owner", k),
+            None => r,
+        };
         match &self.token {
             Some(t) => r.bearer_auth(t),
             None => r,
@@ -89,11 +98,7 @@ impl Node {
 
     /// The lake's files, by their path under `files/`.
     async fn list(&self) -> Result<Vec<String>> {
-        let mut r = self.http.post(format!("{}/sql", self.base)).json(&json!({"sql": "SELECT path FROM files()"}));
-        if let Some(t) = &self.token {
-            r = r.bearer_auth(t);
-        }
-        let r = r.send().await?;
+        let r = self.signed(self.http.post(format!("{}/sql", self.base)).json(&json!({"sql": "SELECT path FROM files()"}))).send().await?;
         anyhow::ensure!(r.status().is_success(), "listing the lake's files: {}", r.text().await?.trim());
         let rows: Vec<Value> = r.json().await?;
         Ok(rows.iter().filter_map(|row| row["path"].as_str()?.strip_prefix("files/").map(String::from)).filter(|p| !hidden(p)).collect())

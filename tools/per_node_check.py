@@ -21,7 +21,7 @@ or `panics::task`), and `std::env::set_var` anywhere (the environment is the pro
 node and every child process would read it, and beside a library's host it is a data race).
 
 And every setting goes through `env.rs` (ADR-061 §8): a `PONDRA_*` name read with `std::env`
-anywhere else fails, so does a `"PONDRA_…"` name its NAMES table doesn't list, and a name the table
+anywhere else fails (by its text, or a constant that names it), so does a `"PONDRA_…"` name its NAMES table doesn't list, and a name the table
 lists that nothing reads.
 
 Only the standard library; it reads the source, not a build.
@@ -49,6 +49,7 @@ PROCESS = {
     "constraints.rs:TURN": LOCK,
     "copy.rs:MS": SETTING + " (PONDRA_LOAD_RETENTION_SECS)",
     "defaults.rs:CTX": "a session with no tables, for DEFAULT and CHECK expressions: nothing of a lake",
+    "dbserver.rs:KEY": "the key a lakes server gives its databases' nodes (`client_key`): one a process, made once",
     "delta.rs:ONE": LOCK,
     "env.rs:GIVEN": "what the process was given (open's options, the command line's flags): fixed by its first open (ADR-061 §8)",
     "ext.rs:CLIENT": "a client with no token, for other engines' REST catalogs: only its keep-alive sockets",
@@ -88,6 +89,8 @@ PROCESS = {
     "store.rs:SPARK": "Spark's functions, made against a session with nothing of a lake",
     "temp.rs:CHANGES": "a counter live queries wait on: it only grows, so a waiter never misses a change",
     "tier.rs:SLOTS": SETTING + " (tiering's slots, sized by --memory-gb)",
+    "tls.rs:KEY": SETTING + " (PONDRA_CLIENT_KEY, which the lakes server gives each database's node)",
+    "tls.rs:PROXIES": SETTING + " (PONDRA_TRUSTED_PROXIES)",
     "tls.rs:TLS": SETTING + " (PONDRA_TLS_*)",
     "users.rs:MAKING": LOCK,
     "write.rs:JOB": "`pondra sql`'s job: the process's, carried through its restarts (`cluster::restart_with`)",
@@ -105,6 +108,8 @@ NOT_READ = {
     "ci.rs": "GitHub secrets' names, which `pondra ci init` sets for a repository's workflows",
 }
 READ = re.compile(r"""\benv::var(?:_os)?\(\s*"PONDRA_""")
+READ_BY = re.compile(r"\benv::var(?:_os)?\(\s*(?:[a-z_]+::)*([A-Z_][A-Z0-9_]*)\s*\)")  # (through a constant's name)
+CONST = re.compile(r'\bconst\s+([A-Z_][A-Z0-9_]*)\s*:\s*&(?:\'static\s+)?str\s*=\s*"(PONDRA_[A-Z0-9_]+)"')
 NAME = re.compile(r'"(PONDRA_[A-Z0-9_]+)"')
 SPAWN = re.compile(r"\btokio::(?:task::)?spawn\(|Handle::(?:current|try_current)\(\)[^;]*?\.spawn\(")
 REGEX = re.compile(r"^(?:std::sync::)?LazyLock<(?:regex::)?Regex>$")
@@ -234,14 +239,21 @@ def settings():
     table = table[table.index("pub const NAMES"):]
     table = table[:table.index("];")]  # (the table alone: its tests name settings that aren't)
     names, read, bad = set(re.findall(r'\(\s*"(PONDRA_[A-Z0-9_]+)"\s*,', table)), set(), []
+    sources = {}
+    for base, _, files in os.walk(SRC):
+        for f in sorted(files):
+            if f.endswith(".rs"):
+                sources[os.path.join(base, f)] = tests_cut(open(os.path.join(base, f), encoding="utf-8").read())
+    named = {c: v for text in sources.values() for c, v in CONST.findall(text)}  # (constants that are a setting's name)
     for base, _, files in os.walk(SRC):
         for f in sorted(files):
             if not f.endswith(".rs") or f == "env.rs":
                 continue
             path = os.path.join(base, f)
             rel = os.path.relpath(path, SRC).replace(os.sep, "/")
-            for n, line in enumerate(tests_cut(open(path, encoding="utf-8").read()).split("\n"), 1):
-                if READ.search(line.split("//", 1)[0]):
+            for n, line in enumerate(sources[path].split("\n"), 1):
+                code = line.split("//", 1)[0]
+                if READ.search(code) or any(c in named for c in READ_BY.findall(code)):
                     bad.append(f"src/{rel}:{n}: a setting read past env.rs: read it with crate::env::get (or os, parse, or, secs, flag, is_set)")
                 for name in NAME.findall(line):
                     read.add(name)

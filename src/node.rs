@@ -171,7 +171,9 @@ impl Node {
         let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock, retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
         crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
         learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
-        if leader && app.auth.network() && !app.auth.on() {
+        // (a lake served with tokens is not one a node may make a first user of: an accidental node with none must
+        // not write to it, and is refused by `server.rs` instead)
+        if leader && app.auth.network() && !app.auth.on() && !users::signed(&app.lake).await {
             // (on the network with no token nobody could sign in: the lake's first user is made before
             // anyone is served, and its token said once. A failure stops the node; a restart tries again.)
             let _guard = app.lock.lock().await;
@@ -189,7 +191,7 @@ impl Node {
             }
         }
         if leader {
-            let (l, c) = (app.lake.clone(), app.cluster.clone()); // (beside serving, not before it: C5)
+            let (l, c, tokens) = (app.lake.clone(), app.cluster.clone(), app.auth.on()); // (beside serving, not before it: C5)
             panics::spawn(async move {
                 let made = users::kept(&l).await == "none";
                 match users::make_keys(&l).await {
@@ -201,6 +203,12 @@ impl Node {
                 }
                 if backup::frozen(&l) {
                     return; // (a backup's secrets and keys stay as its runs wrote them: ADR-070)
+                }
+                if tokens {
+                    // (once, and for good: a node started by hand without them is then never open: `users::signed`)
+                    if let Err(e) = users::mark_signed(&l).await {
+                        eprintln!("the lake's tokens aren't remembered: {e:#}");
+                    }
                 }
                 match ext::rewrap(&l).await {
                     Ok(0) => {}

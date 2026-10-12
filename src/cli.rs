@@ -442,10 +442,19 @@ async fn run() -> anyhow::Result<()> {
                 let options = dbserver::Options { python, tier_secs: Some(tier_secs), reader, node };
                 return dbserver::serve(dir, addr, pg, default, options, auth).await;
             }
+            let owner = env::get("PONDRA_OWNER_KEY").filter(|k| k.len() >= 16); // (the same length rule `server::owner` uses)
+            if owner.is_some() && !dir.contains("://") && std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_none()) {
+                // (a lake the shell or `local()` just made is its user's alone, as a Postgres data folder is: its catalog holds the nodes' key)
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+                }
+            }
             // (on the network a node is never open: with no token, its leader makes the lake's first user before it serves, `node.rs`)
             let on_network = on_network(&addr, [&pg, &kafka, &flight]);
             let auth = auth::Auth::new(token(read_token, "PONDRA_READ_TOKEN"), token(write_token, "PONDRA_WRITE_TOKEN"), token(admin_token.clone(), "PONDRA_ADMIN_TOKEN"));
-            let auth = Arc::new(auth.on_network(on_network));
+            let auth = Arc::new(auth.on_network(on_network).owned_by(owner));
             if let Some(t) = token(admin_token, "PONDRA_ADMIN_TOKEN") {
                 given.push(("PONDRA_ADMIN_TOKEN", t)); // (nodes call each other with it: cluster::http)
             }

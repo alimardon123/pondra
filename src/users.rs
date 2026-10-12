@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex};
 
 pub fn user_key(name: &str) -> String { format!("u/{name}") }
 pub const KEYS: &str = "z/auth"; // (the lake's own keys: sessions' signing key, and the nodes' key; `k/` is streaming tasks')
+/// Set once a lake has been served with tokens (S26, invariant 379): a node started by hand without them is not open.
+const SIGNED: &str = "z/signed";
 /// The names the three tokens sign in as over Postgres and Kafka: no user may take them.
 pub const BUILT_IN: [&str; 3] = ["admin", "writer", "reader"];
 
@@ -871,6 +873,46 @@ pub async fn seal_keys(lake: &Lake) -> Result<()> {
         }
     }
     Ok(())
+}
+
+crate::per_node!(
+    /// Lakes read as signed (`signed`): kept for good, since a lake that was served with tokens stays so.
+    static SIGNED_LAKES: Mutex<HashSet<String>> = Default::default());
+crate::per_node!(
+    /// Lakes read as unsigned, and when (as `any` remembers its answers).
+    static UNSIGNED_LAKES: Mutex<HashMap<String, (Option<u64>, std::time::Instant)>> = Default::default());
+
+/// Leader, with a token set: the lake remembers it (once; nothing clears it, `pondra token` is the way back
+/// in). A node started without tokens on such a lake is never open, and makes no user (`signed`).
+pub async fn mark_signed(lake: &Lake) -> Result<()> {
+    if lake.cat.get::<Value>(SIGNED).await?.is_none() {
+        lake.cat.commit(vec![(SIGNED.into(), json(&j!({"at_ms": crate::log::now_ms()})))], &[]).await?;
+    }
+    Ok(())
+}
+
+/// Has the lake been served with tokens (`mark_signed`)? Then a request with nothing signed is refused, saying
+/// so, by a node with no tokens of its own (`server.rs`). A key that can't be read counts as signed, and is
+/// read again next time (as `any` takes users that can't be read).
+pub async fn signed(lake: &Lake) -> bool {
+    if SIGNED_LAKES.lock().unwrap().contains(&lake.url) {
+        return true;
+    }
+    let version = lake.cat.version();
+    if UNSIGNED_LAKES.lock().unwrap().get(&lake.url).is_some_and(|c| fresh(lake, version, c.0, c.1)) {
+        return false;
+    }
+    match lake.cat.get::<Value>(SIGNED).await {
+        Ok(Some(_)) => {
+            SIGNED_LAKES.lock().unwrap().insert(lake.url.clone());
+            true
+        }
+        Ok(None) => {
+            UNSIGNED_LAKES.lock().unwrap().insert(lake.url.clone(), (version, std::time::Instant::now()));
+            false
+        }
+        Err(_) => true,
+    }
 }
 
 /// How the lake's own keys are kept: "sealed", "clear", or "none" yet (`/stats`).

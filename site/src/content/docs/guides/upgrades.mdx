@@ -10,6 +10,40 @@ upgrade simple: replace the nodes one at a time while the cluster keeps serving 
 A new release opens every older release's lake, and an older release refuses a lake that a newer
 one has moved on.
 
+## Before you upgrade
+
+<Steps>
+
+1. Read the release notes' **Before you upgrade** for each release you pass, and the table of formats
+   below: a release that moves the lake to a newer format is one you can't go back from once it has.
+2. For such a release, keep a copy of the lake to go back to. Stop every node (each drains, as below),
+   copy the lake's folder or bucket prefix (`cp -a`, `aws s3 sync`, `gsutil -m rsync -r`, `rclone sync`),
+   and start the nodes again. A copy taken while nodes run can miss a file a merge replaced meanwhile.
+3. Upgrade one node at a time, as the next sections show.
+
+</Steps>
+
+## Upgrading to 0.34
+
+<Aside type="caution" title="Sign-in, from 0.34">
+
+- **A node on the network with no token now asks everyone to sign in.** A node that listens beyond this
+  machine (`--addr 0.0.0.0:8080`, a container, a server) used to answer anyone as an admin. Its leader
+  now makes the lake's first user, `pondra`, before it serves, and prints its token once on its standard
+  error; `pondra token --dir LAKE` makes another, with the node up or down. Before you upgrade such a
+  cluster, give every node `--admin-token` (they all need the same one), or read the token from the new
+  leader's log. Run `pondra token` once a 0.34 node leads: a 0.33 leader can't record it.
+- **With an admin token and no `PONDRA_SECRET_KEY`, the admin token is the master key.** It seals the
+  lake's own keys and its secrets, so every node needs the same admin token, as it already did to call
+  the others. To change it, start the leader with the new one and the old one in
+  `PONDRA_ADMIN_TOKEN_PREVIOUS`: it rewraps what the old one sealed.
+- **A node the shell or `local()` starts answers only that program**, a token or a signed-in user. Open
+  its console from the link the shell prints.
+- **A grant on another database** (`GRANT … ON DATABASE`, `GRANT CLONE ON DATABASE prod TO …`) moves the
+  lake to format 4, once every node runs 0.34 (a 0.33 node can't read it).
+
+</Aside>
+
 ## Which release, which lake format
 
 Every node's `GET /stats` says its release (`version`) and the lake's format (`format`). The leader
@@ -200,7 +234,7 @@ can't read. Until something moves it, the release before still opens it.
 |---|---|---|
 | 1 | 0.32 | every lake, as soon as a release that knows formats opens it |
 | 2 | 0.33 | a materialized view that works its answers out as it is read (`avg`, `stddev`, `HAVING`, …) |
-| 3 | 0.34 | a lake's own keys sealed by a master key every node shares (`PONDRA_SECRET_KEY` or `PONDRA_KMS_COMMAND`): from the first write in a lake the release makes, otherwise by its leader once every node knows format 3 |
+| 3 | 0.34 | a lake's own keys sealed by a master key every node shares (`PONDRA_SECRET_KEY`, `PONDRA_KMS_COMMAND`, or the admin token when neither is set): from the first write in a lake the release makes, otherwise by its leader once every node knows format 3 |
 | 4 | 0.34 | a grant on another database (`GRANT … ON DATABASE`, `GRANT CLONE ON DATABASE`), which a node of 0.33 can't read: made only once every node knows format 4 |
 
 An older release refuses a newer lake by name, before it reads anything. The message has this shape,
