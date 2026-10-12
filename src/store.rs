@@ -1335,6 +1335,7 @@ pub struct Catalog {
     metas: Mutex<lru::LruCache<String, (u64, Arc<TableMeta>)>>, // tables' entries as parsed, by the commit that wrote them (`meta`)
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
+    flush_now: bool,              // a local lake's writer: each write's WAL flushed at once (`write`)
 }
 
 /// A scan in progress: the streamed changes it may still lay over its (older) view stay.
@@ -1624,6 +1625,7 @@ impl Catalog {
         let flushed = slatedb::BlockCachePolicy::default().with_flush_targets(&[slatedb::CacheTarget::Index, slatedb::CacheTarget::Filters]);
         let db = Db::builder("catalog", store.clone()).with_settings(settings).with_db_cache(blocks()).with_block_cache_policy(flushed);
         let mut cat = Self::new(Db_::Writer(db.build().await?));
+        cat.flush_now = local;
         trace("the catalog's writer open", t0);
         cat.upkeep = Some(upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local));
         cat.replicas = crate::env::or("PONDRA_REPLICAS", 1);
@@ -1679,7 +1681,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))), frozen: Default::default(), closing: Default::default() }
+        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))), frozen: Default::default(), closing: Default::default(), flush_now: false }
     }
 
     /// Leader: the recent frames plus a receiver for every frame from now on.
@@ -2071,6 +2073,13 @@ impl Catalog {
         let c = ("c".to_string(), Bytes::from(json(&*id)));
         batch.put(&c.0, &c.1);
         let handle = db.write(batch).await.map_err(|e| self.fenced(e))?;
+        if self.flush_now {
+            // (its WAL written now, not at the next tick of `flush_interval`: a commit waited about a
+            // millisecond for it. On a disk a write is a file whichever way; a bucket keeps the tick,
+            // which lets writes made together share one PUT.)
+            let db = db.clone();
+            tokio::spawn(async move { let _ = db.flush_with_options(FlushOptions { flush_type: FlushType::Wal }).await; });
+        }
         if let Some((_, v)) = puts.iter().find(|(k, _)| k == "n") {
             self.last_n.store(serde_json::from_slice(v)?, Relaxed);
         }
