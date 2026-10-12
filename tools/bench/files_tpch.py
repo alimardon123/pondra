@@ -6,7 +6,7 @@
 
 The 22 queries, each run `--runs` times (the best time counts), over two copies of one data set:
 
-- `lake`: a lake's tables, loaded with one INSERT per table from `--data`, its in-memory columns
+- `lake`: a lake's tables, loaded with one CREATE TABLE … AS per table from `--data`, its in-memory columns
   off (PONDRA_HOT_GB=0) so that every query reads Parquet, as it does from the files;
 - `files`: Parquet files outside the lake, as stored views (`CREATE VIEW lineitem AS SELECT * FROM
   '<folder>/*.parquet'`), listed again by every query (a file may change under its name).
@@ -65,7 +65,7 @@ def main():
     harness.A = argparse.Namespace(s3=False, keep=False, port=A.port)
     owner, results = uuid.uuid4().hex, {}
     stores = A.stores.split(",")
-    load = lambda lake, env: [subprocess.run([harness.BIN, "sql", "--dir", lake, f"INSERT INTO {t} SELECT * FROM '{os.path.join(A.data, t)}.parquet'"],
+    load = lambda lake, env: [subprocess.run([harness.BIN, "sql", "--dir", lake, f"CREATE TABLE {t} AS SELECT * FROM '{os.path.join(A.data, t)}.parquet'"],
                                              check=True, capture_output=True, env={**os.environ, **env}) for t in TABLES]
     files = tempfile.mkdtemp(prefix="pondra-files-")
     harness.LAKES.append(files)

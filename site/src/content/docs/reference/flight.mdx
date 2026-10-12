@@ -326,19 +326,19 @@ import adbc_driver_flightsql.dbapi as flightsql
 token = os.environ["PONDRA_TOKEN"]
 
 # pyarrow: the handshake, or the header itself
-client = flight.FlightClient("grpc://db.example.com:8815")
+client = flight.FlightClient("grpc+tls://db.example.com:8815")
 options = flight.FlightCallOptions(headers=[client.authenticate_basic_token("writer", token)])
 # options = flight.FlightCallOptions(headers=[(b"authorization", f"Bearer {token}".encode())])
 print(client.do_get(flight.Ticket(b'{"sql": "SELECT 1 AS one"}'), options=options).read_all())
 
 # ADBC: the header, or the user name and password (the password is the token)
 conn = flightsql.connect(
-    "grpc://db.example.com:8815",
+    "grpc+tls://db.example.com:8815",
     db_kwargs={"adbc.flight.sql.authorization_header": f"Bearer {token}"},
     autocommit=True,
 )
 conn = flightsql.connect(
-    "grpc://db.example.com:8815",
+    "grpc+tls://db.example.com:8815",
     db_kwargs={"username": "writer", "password": token},
     autocommit=True,
 )

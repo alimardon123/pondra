@@ -13,7 +13,9 @@ session and node.
 PySpark lives only in /home/claude/venv-spark; run this with its Python. Java 21 is required.
 """
 import argparse
+import contextlib
 import datetime
+import io
 import json
 import math
 import os
@@ -29,6 +31,8 @@ import time
 os.environ["TZ"] = "UTC"
 if hasattr(time, "tzset"):
     time.tzset()
+# PySpark's Python workers (pandas UDFs) need pyarrow: use this interpreter, which has it.
+os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "python"))  # the pondra client
@@ -504,6 +508,174 @@ def p_udf_group_by(spark, F, Window):
     return spark.table("orders").groupBy(size("item").alias("size")).agg(F.count("*").alias("n"))
 
 
+def p_sha2_number_literal(spark, F, Window):  # a number where PySpark takes a literal (F.sha2(c, 256))
+    return spark.table("orders").where(F.col("id") <= 20).select("id", F.sha2(F.col("item"), 256).alias("h"))
+
+
+def p_column_name_call(spark, F, Window):  # Column.name("x") is alias("x") (PySpark's name)
+    return spark.table("orders").where(F.col("id") <= 20).select(F.col("id").name("order_id"), F.col("qty").alias("q"))
+
+
+def p_sort_kept_through_steps(spark, F, Window):  # a sort survives withColumn and select that keep its columns
+    return (spark.table("orders").orderBy(F.desc("price"), F.asc("id"))
+            .withColumn("total", F.col("qty") * F.col("price"))
+            .select("id", "price", "total").limit(40))
+
+
+def p_sort_kept_through_rename(spark, F, Window):  # …and a rename: the sort follows the column's new name
+    # (descending: the rows come in ascending id order, so a sort that was lost would show)
+    return (spark.table("orders").orderBy(F.desc("id")).withColumnRenamed("id", "order_id")
+            .select("order_id", "user", "item").limit(25))
+
+
+def p_orderBy_after_select_dropped(spark, F, Window):  # PySpark sorts by a column a select dropped; Pondra refuses by name
+    return spark.table("orders").select("user", "item").orderBy("id").collect()
+
+
+def p_sort_replaced_refused(spark, F, Window):  # PySpark sorts by a column's old values after replacing it; Pondra refuses
+    return spark.table("orders").orderBy("id").withColumn("id", -F.col("id")).collect()
+
+
+def p_alias_qualified_columns(spark, F, Window):  # df.alias("o"): F.col("o.id") and df["x"] resolve in select and where
+    o = spark.table("orders").alias("o")
+    return (o.where(F.col("o.qty") > 15)
+            .select(F.col("o.id"), o["user"], o.item, F.col("o.price").alias("p")))
+
+
+def p_column_by_attribute(spark, F, Window):  # df.x and df["x"] in select, next to a plain name
+    orders = spark.table("orders")
+    return orders.where(F.col("id") <= 40).select(orders.id, orders["item"], orders.qty.alias("q"))
+
+
+def p_sample_seed(spark, F, Window):  # the same seed, in each of PySpark's forms, gives the same rows; another seed others.
+    # Each engine draws its own rows, so only these shapes are compared, not the rows themselves.
+    orders = spark.table("orders")
+    a = [r["id"] for r in orders.sample(fraction=0.3, seed=7).collect()]
+    b = [r["id"] for r in orders.sample(0.3, 7).collect()]
+    c = [r["id"] for r in orders.sample(False, 0.3, 7).collect()]
+    d = [r["id"] for r in orders.sample(fraction=0.3, seed=8).collect()]
+    return {"same_seed_same_rows": a == b == c, "other_seed_other_rows": a != d, "about_a_third": 0.2 < len(a) / 2000 < 0.4}
+
+
+def p_sample_fraction_one(spark, F, Window):
+    return spark.table("orders").sample(fraction=1.0, seed=5).count()
+
+
+def p_sample_with_replacement_refused(spark, F, Window):  # PySpark draws with replacement; Pondra refuses by name
+    return spark.table("orders").sample(True, 0.5, 3).collect()
+
+
+def p_sample_int_argument_raises(spark, F, Window):  # PySpark takes a float fraction: sample(1) is a TypeError
+    return spark.table("orders").sample(1).collect()
+
+
+def p_first_last_ignorenulls(spark, F, Window):  # first and last skip NULLs with ignorenulls=True, and keep them without it
+    rows = [(1, 1, None), (1, 2, "b"), (1, 3, None), (1, 4, "d"), (1, 5, None), (2, 1, None), (2, 2, None)]
+    df = spark.createDataFrame(rows, "k int, i int, s string")
+    w = Window.partitionBy("k").orderBy("i").rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)
+    return df.select("k", "i", F.first("s", ignorenulls=True).over(w).alias("first_kept"), F.first("s").over(w).alias("first_any"),
+                     F.last("s", ignorenulls=True).over(w).alias("last_kept"), F.last("s").over(w).alias("last_any"))
+
+
+def p_log_base_and_nonpositive(spark, F, Window):  # log(c) is ln, log(2.0, c) is base 2; 0, below 0 and NULL give NULL
+    df = spark.createDataFrame([(8.0,), (0.0,), (-1.0,), (None,), (2.5,)], "x double")
+    return df.select(F.log(F.col("x")), F.log(2.0, F.col("x")))
+
+
+def p_log_int_base_raises(spark, F, Window):  # PySpark takes the base as a float: log(2, c) is a TypeError
+    return spark.createDataFrame([(8.0,)], "x double").select(F.log(2, F.col("x"))).collect()
+
+
+def p_regexp_extract_groups(spark, F, Window):  # group 0 is the whole match; an unmatched group is ''; NULL stays NULL
+    df = spark.createDataFrame([("a-1",), ("xyz",), ("",), (None,), ("#",)], "s string")
+    pat = "([a-z])(-[0-9]+)?"
+    return df.select(F.regexp_extract("s", pat, 0), F.regexp_extract("s", pat, 1).alias("g1"), F.regexp_extract("s", pat, 2).alias("g2"))
+
+
+def p_split_regex_and_limit(spark, F, Window):  # split takes a regular expression; a limit keeps that many parts, the last the rest
+    rows = [("a1b22c",), ("xyz",), ("",), (None,), ("1a",), ("a1",), ("a,;b1c;d",), ("a1b22c333",), ("q1q",)]
+    df = spark.createDataFrame(rows, "s string")
+    return df.select(F.split("s", "[0-9]+"), F.split("s", "[0-9]+", 1).alias("one"), F.split("s", "[0-9]+", 2).alias("two"),
+                     F.split("s", "[0-9]+", 3).alias("three"), F.split("s", "[,;]+", 2).alias("sep2"))
+
+
+def p_drop_every_column(spark, F, Window):  # dropping every column leaves no columns, and the rows are still there
+    empty = spark.table("orders").where(F.col("id") <= 30).select("id", "item").drop("id", "item")
+    return {"columns": list(empty.columns), "count": empty.count(), "rows": len(empty.collect())}
+
+
+def p_show_vertical_no_columns_raises(spark, F, Window):  # PySpark can't show a record of no columns: both refuse
+    spark.table("orders").where(F.col("id") <= 3).select("id").drop("id").show(vertical=True)
+
+
+def p_show_vertical(spark, F, Window):  # show(vertical=True): -RECORD blocks, PySpark's widths, cuts, NULLs and the footer
+    rows = [(1, "tea", None, 2.5, True), (22, "a much longer string value here", "x", 3.0, False), (333, "", "yz", None, None)]
+    df = spark.createDataFrame(rows, "id int, item string, z string, f double, b boolean")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        df.show(vertical=True)
+        df.show(truncate=5, vertical=True)
+        df.show(n=1, vertical=True)
+        df.show(truncate=False, vertical=True)
+        df.where(F.col("id") < 0).show(vertical=True)
+    return buf.getvalue()
+
+
+def p_union_by_name_missing(spark, F, Window):  # allowMissingColumns: a column one side lacks is NULL there; the left's come first
+    left = spark.table("orders").where(F.col("id") <= 5).select("id", "item")
+    right = spark.table("orders").where(F.col("id") <= 3).select("id", "qty", F.col("price").alias("p"))
+    return left.unionByName(right, allowMissingColumns=True)
+
+
+def p_union_by_name_differing_raises(spark, F, Window):  # without allowMissingColumns, PySpark refuses differing columns; so does Pondra
+    left = spark.table("orders").select("id", "item")
+    right = spark.table("orders").select("id", "qty")
+    return left.unionByName(right).collect()
+
+
+def p_alias_quotes_and_literals(spark, F, Window):  # "a." in a string or a quoted name is data; only the alias's qualifier goes
+    df = spark.createDataFrame([(1, "x@a.com", "o.k"), (2, "y@b.com", "q"), (3, "z@a.com", None)], "id int, email string, note string")
+    by_alias = df.alias("a").where(F.col("a.email").like("%a.com")).select(F.col("a.email"), F.lit("a.b").alias("lit"))
+    # a column named a.b (PySpark's `a.b` in backticks), read through the alias
+    dotted = (df.alias("a").toDF("id", "a.b", "note").where(F.col("`a.b`").like("%a.com"))
+              .select(F.col("`a.b`").alias("email"), F.lit("a.b").alias("lit")))
+    return by_alias.union(dotted)
+
+
+def _row_class(spark):
+    """PySpark's Row, or Pondra's, by the session that is asked."""
+    if type(spark).__module__.startswith("pondra"):
+        from pondra.spark import Row
+    else:
+        from pyspark.sql import Row
+    return Row
+
+
+def p_row_repr(spark, F, Window):  # positional rows print as <Row(…)>, named ones as Row(k=v)
+    R = _row_class(spark)
+    return [repr(R(1, "x")), repr(R(id=1, name="x")), repr(R())]
+
+
+def self_stop_keeps_active(_spark, F, Window):
+    """stop() of a session that isn't the active one leaves the active one be, and stop() of the
+    active one clears it. Pondra's contract alone: PySpark has one default session, nothing to compare."""
+    from pondra.spark import SparkSession as Session
+
+    class _Con:
+        def close(self):
+            pass
+
+    active, other = Session(_Con()), Session(_Con())
+    Session._active = active
+    try:
+        other.stop()
+        kept = Session.getActiveSession() is active
+        active.stop()
+        return kept and Session.getActiveSession() is None
+    finally:
+        Session._active = None
+
+
 PIPELINES = [
     ("select", False, "frame", p_select),
     ("selectExpr", False, "frame", p_select_expr),
@@ -560,6 +732,31 @@ PIPELINES = [
     ("udf_register_then_sql", False, "frame", p_udf_register_sql),
     ("pandas_udf", False, "frame", p_pandas_udf),
     ("udf_in_groupBy", False, "frame", p_udf_group_by),
+    ("sha2_number_literal", False, "frame", p_sha2_number_literal),
+    ("column_name_call", False, "frame", p_column_name_call),
+    ("row_repr_positional_and_named", None, "value", p_row_repr),
+    ("stop_keeps_the_active_session", None, "self", self_stop_keeps_active),
+    ("sort_kept_through_steps", True, "frame", p_sort_kept_through_steps),
+    ("sort_kept_through_rename", True, "frame", p_sort_kept_through_rename),
+    ("orderBy_after_select_dropped_refused", None, "refused", p_orderBy_after_select_dropped),
+    ("sort_replaced_refused", None, "refused", p_sort_replaced_refused),
+    ("alias_qualified_columns", False, "frame", p_alias_qualified_columns),
+    ("column_by_attribute", False, "frame", p_column_by_attribute),
+    ("sample_seed_forms", None, "value", p_sample_seed),
+    ("sample_fraction_one_count", None, "value", p_sample_fraction_one),
+    ("sample_with_replacement_refused", None, "refused", p_sample_with_replacement_refused),
+    ("sample_int_argument_raises", None, "raises", p_sample_int_argument_raises),
+    ("first_last_ignorenulls", False, "frame", p_first_last_ignorenulls),
+    ("log_base_and_nonpositive_null", False, "frame", p_log_base_and_nonpositive),
+    ("log_int_base_raises", None, "raises", p_log_int_base_raises),
+    ("regexp_extract_groups", False, "frame", p_regexp_extract_groups),
+    ("split_regex_and_limit", False, "frame", p_split_regex_and_limit),
+    ("drop_every_column", None, "value", p_drop_every_column),
+    ("union_by_name_allow_missing", False, "frame", p_union_by_name_missing),
+    ("union_by_name_differing_raises", None, "raises", p_union_by_name_differing_raises),
+    ("show_vertical_records", None, "value", p_show_vertical),
+    ("show_vertical_no_columns_raises", None, "raises", p_show_vertical_no_columns_raises),
+    ("alias_quotes_and_literals", False, "frame", p_alias_quotes_and_literals),
 ]
 
 
@@ -572,8 +769,50 @@ def _run_side(fn, spark, F, Window, kind):
     return None, val
 
 
+def _force(val):
+    """A DataFrame runs (both engines answer lazily); anything else is already a value."""
+    if hasattr(val, "collect"):
+        val.collect()
+
+
+def _raised(fn, spark, F, Window):
+    """How `fn` failed on one side (`Type: message`), or None if it didn't."""
+    try:
+        _force(fn(spark, F, Window))
+    except Exception as e:  # noqa: BLE001 (what it raised is the answer)
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
 def run_pipeline(name, ordered, kind, fn, real_spark, pon_spark):
+    """Kinds: `frame` and `value` (the same answer from both engines), `refused` (PySpark answers,
+    Pondra refuses by name with NotImplementedError), `raises` (both refuse the same call), `self`
+    (Pondra's own contract, no PySpark side: its answer is True)."""
     out = {"name": name}
+    if kind == "self":
+        try:
+            out["equal"] = bool(fn(None, PF, PWindow))
+        except Exception as e:  # noqa: BLE001
+            out["equal"], out["detail"] = False, f"pondra error: {type(e).__name__}: {e}"
+        out["names_equal"] = True
+        return out
+    if kind == "refused":
+        real = _raised(fn, real_spark, RF, RWindow)
+        if real is not None:
+            out["equal"], out["names_equal"], out["detail"] = False, False, f"pyspark error: {real}"
+            return out
+        pon = _raised(fn, pon_spark, PF, PWindow)
+        ok = pon is not None and pon.startswith("NotImplementedError:")
+        out["equal"], out["names_equal"] = ok, ok
+        out["refused"] = ok
+        out["detail"] = pon if ok else f"pondra did not refuse by name: {pon or 'it answered'}"
+        return out
+    if kind == "raises":
+        real, pon = _raised(fn, real_spark, RF, RWindow), _raised(fn, pon_spark, PF, PWindow)
+        out["equal"], out["names_equal"] = real is not None and pon is not None, True
+        if not out["equal"]:
+            out["detail"] = f"pyspark: {real or 'no error'}; pondra: {pon or 'no error'}"
+        return out
     try:
         real_names, real_data = _run_side(fn, real_spark, RF, RWindow, kind)
     except Exception as e:  # noqa: BLE001 (the failure itself is the report)
@@ -631,7 +870,8 @@ def main():
         results = [run_pipeline(name, ordered, kind, fn, real_spark, pon_spark) for name, ordered, kind, fn in pipelines]
         for r in results:
             print(json.dumps(r), flush=True)
-        summary = {"equal": sum(r["equal"] for r in results), "names_equal": sum(r["names_equal"] for r in results), "total": len(results)}
+        summary = {"equal": sum(r["equal"] for r in results), "names_equal": sum(r["names_equal"] for r in results),
+                   "refused": sum(bool(r.get("refused")) for r in results), "total": len(results)}
         print(json.dumps(summary), flush=True)
     finally:
         if real_spark is not None:

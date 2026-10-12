@@ -19,7 +19,7 @@ The data: tpchgen-cli's Parquet with money columns as DOUBLE (not every engine c
 DECIMAL alike) and 122,880-row row groups. Two ways to run, compared like with like:
 
 - from files, every query: `duckdb`, `clickhouse`, `polars`, `polars-streaming`, `daft` and `bodo`
-  read the Parquet files; `pondra-cold` reads its lake's (loaded with one INSERT per table), with
+  read the Parquet files; `pondra-cold` reads its lake's (loaded with one CREATE TABLE … AS per table), with
   its in-memory columns off (PONDRA_HOT_GB=0);
 - from memory: `duckdb-native` loads the tables into DuckDB first, `clickhouse-native` into
   MergeTree tables (merged; `hits` sorted by ClickBench's own key for ClickHouse, TPC-H's tables
@@ -299,13 +299,13 @@ def run_engine(engine, python, qs_left, env):
 
 
 def pondra_lake():
-    """Load the data into a new Pondra lake: one INSERT per table, as a user would."""
+    """Load the data into a new Pondra lake: one CREATE TABLE … AS per table, as a user would."""
     sys.path.insert(0, os.path.join(HERE, ".."))
     import harness
     lake = tempfile.mkdtemp(prefix="pondra-tpch-")
     t0 = time.time()
     for t in tables():
-        subprocess.run([harness.BIN, "sql", "--dir", lake, f"INSERT INTO {t} SELECT * FROM '{os.path.join(A.data, t)}.parquet'"], check=True, capture_output=True)
+        subprocess.run([harness.BIN, "sql", "--dir", lake, f"CREATE TABLE {t} AS SELECT * FROM '{os.path.join(A.data, t)}.parquet'"], check=True, capture_output=True)
     return lake, time.time() - t0
 
 
