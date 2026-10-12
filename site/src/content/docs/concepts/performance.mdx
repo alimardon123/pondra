@@ -237,9 +237,10 @@ generated rows.
 | Idle memory | 104 to 109 MB: about 56 MB its own, 51 MB its binary's code mapped from disk | 50 MB, Python's included | 43 MB | 538 to 549 MB | 585 to 594 MB |
 | After the query | 106 to 109 MB | 51 MB | 61 MB | 567 to 573 MB | 744 to 746 MB |
 
-Most of a node's own idle memory is its allocator's huge pages: turned off
-(`MIMALLOC_ARENA_EAGER_COMMIT=0`), it is 12 MB, but ClickBench from memory ran 9% slower and
-TPC-H 3%, so they stay on.
+The table was measured with mimalloc as the allocator. Since 0.34 a node on Linux uses jemalloc,
+which gives back memory that has been free for ten seconds; side by side it idles about 25 MB lower,
+and under a steady stream of writes its memory levels off where mimalloc's kept growing. macOS and
+Windows keep mimalloc.
 
 DuckDB and Polars run inside your process and are the smaller ones; Pondra is a server (with a log,
 a catalog, a lake and eight doors), and starts as fast as they do. The JVM engines take seconds to

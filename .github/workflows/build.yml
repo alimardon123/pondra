@@ -182,6 +182,11 @@ jobs:
         with:
           node-version: 22
       - name: Build # (the program, the library and its launcher, into one folder: the packages carry the two, the archive the program)
+        env:
+          # (jemalloc, Linux's allocator, takes the build machine's page size and won't start on a
+          # kernel with bigger pages: arm64 kernels use 4, 16 or 64 KB (a Raspberry Pi 5, some RHEL),
+          # so arm64's is built for 64 KB pages, which runs on all three)
+          AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE: "16"
         run: |
           if [ -n "${{ matrix.zig }}" ]; then
             pip install ziglang cargo-zigbuild

@@ -1475,15 +1475,16 @@ def pace():
 
 
 def memory():
-    """A node keeps few threads, and its own memory doesn't run away, under a steady stream of small
+    """A node keeps few threads, and its own memory levels off, under a steady stream of small
     commits (the soak's, ten times as often): four producers append 10-row batches, each a commit,
     with no reader. On a local lake each file read and write is a blocking task, often enough that
     tokio's pool kept every thread it had started (about 90 on 4 cores), each with its own heap: a
-    node grew 180 → 920 MB in ten minutes at this pace (the 24-hour soak's 2–5 MB a minute) while
-    what it held stayed at 80–90 MB. With four blocking threads a core, 16 at least
-    (`panics::runtime`), it peaks near 300–400 MB in the first minutes and then comes down;
-    `PONDRA_BLOCKING_THREADS=512` fails the threads' check. Its own memory is RssAnon less what its
-    bounded caches hold (`pondra_hot_bytes`, `pondra_cache_bytes`)."""
+    node grew 180 → 920 MB in ten minutes at this pace while what it held stayed at 80–90 MB. Four
+    blocking threads a core, 16 at least (`panics::runtime`), slowed that; `PONDRA_BLOCKING_THREADS=512`
+    fails the threads' check. mimalloc still kept what the node freed (190 → 310 MB from the second
+    minute to the fourth); jemalloc, the program's allocator on Linux (`main.rs`), gives it back and
+    levels off at 120–130 MB by the third, and mimalloc fails the memory check. Its own memory is
+    RssAnon less what its bounded caches hold (`pondra_hot_bytes`, `pondra_cache_bytes`)."""
     SECS_RUN = 240  # how long the producers run; the node's memory is sampled every 10 s meanwhile
     lake = new_lake()
     node = Node(lake, A.port, env={"PONDRA_HOT_GB": "0"}).start()
@@ -1539,7 +1540,7 @@ def memory():
     checks = {
         "the producers' commits went in (at least 100 a second)": rate >= 100,
         f"a node under small commits keeps at most four blocking threads a core, 16 at least ({allowed} threads in all)": most <= allowed,
-        "its own memory doesn't run away: its last minute within 1.5x (+64 MB) of its second (the soak's rule)": late <= early * 1.5 + 64,
+        "its own memory levels off: its last minute at most 48 MB over its second": late <= early + 48,
     }
     for name, good in checks.items():
         print(f"memory: {name}: {'OK' if good else 'FAIL'}")
