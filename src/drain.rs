@@ -66,4 +66,5 @@ pub async fn drain() {
     if left > 0 {
         eprintln!("stopping with {left} request{} still running after {:?} (PONDRA_DRAIN_SECS)", if left == 1 { "" } else { "s" }, most);
     }
+    crate::locks::release_all(); // (the transactions' row locks go to their leaders now: other waits end at once, not at the lease)
 }

@@ -31,12 +31,31 @@ tokio::task_local! {
     pub static SESSION: Option<String>;
 }
 
-/// The session a request names (`x-pondra-session`), or that of the caller whose procedure sent it.
-pub fn of(headers: &axum::http::HeaderMap) -> Option<String> {
-    let named = headers.get("x-pondra-session").and_then(|v| v.to_str().ok());
-    let named = named.filter(|s| (8..=128).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+/// The session a request names (`x-pondra-session`), or that of the caller whose procedure sent it. A name
+/// that isn't 8 to 128 letters, digits, - or _ is refused and says so: it is never ignored, which would leave
+/// the request in no session at all.
+pub fn of(headers: &axum::http::HeaderMap) -> anyhow::Result<Option<String>> {
+    let named = match headers.get("x-pondra-session") {
+        None => None,
+        Some(v) => Some(name(v)?),
+    };
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    crate::auth::lent_session(token).or(named.map(id)) // (a procedure's own client names one: its caller's wins)
+    Ok(crate::auth::lent_session(token).or(named.map(|n| id(&n)))) // (a procedure's own client names one: its caller's wins)
+}
+
+/// A session name `x-pondra-session` carries (see `of`): the name, or the reason it is refused (22023).
+fn name(v: &axum::http::HeaderValue) -> anyhow::Result<String> {
+    const SAYS: &str = "x-pondra-session: 8 to 128 letters, digits, - or _";
+    let Ok(s) = v.to_str() else {
+        return Err(crate::codes::coded("22023", format!("{SAYS} (got a value that isn't text)")));
+    };
+    if !(8..=128).contains(&s.len()) {
+        return Err(crate::codes::coded("22023", format!("{SAYS} (got {})", s.len())));
+    }
+    if !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(crate::codes::coded("22023", format!("{SAYS} (got a name with other characters)")));
+    }
+    Ok(s.to_string())
 }
 
 /// The session a client's id names: its user's (another who names the same id has a session of its own).
@@ -108,6 +127,12 @@ pub fn with<T>(session: &str, change: bool, f: impl FnOnce(&mut Session) -> Resu
         crate::panics::spawn(reap()); // (only while there are sessions)
     }
     Ok(out)
+}
+
+/// Looks at a session's state without making it: a session that doesn't exist is None, and nothing is kept for it
+/// (a read of a setting must not start a session, as `with` does).
+pub fn peek<T>(session: &str, f: impl FnOnce(&Session) -> Option<T>) -> Option<T> {
+    SESSIONS.lock().unwrap().get(session).and_then(f)
 }
 
 /// How long a session may sit unused (`PONDRA_SESSION_IDLE_SECS`, 3600).
@@ -240,7 +265,15 @@ pub fn views(sql: &str) -> Vec<(String, String)> {
 pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Value>> {
     let session = current();
     match stmt {
-        Stmt::Create(c) if c.temporary => return create(app, &session.context(NO_SESSION)?, c, files).await.map(Some),
+        Stmt::Create(c) if c.temporary => {
+            // (in an open transaction it runs at once too, as DDL does: `txn::temp_at_once` refuses REPEATABLE READ and says so)
+            let note = crate::txn::temp_at_once()?;
+            let out = create(app, &session.context(NO_SESSION)?, c, files).await?;
+            if let (Some(n), false) = (note, out["unchanged"] == true) {
+                crate::routines::heard(&n); // (IF NOT EXISTS left it as it was: nothing ran)
+            }
+            return Ok(Some(out));
+        }
         Stmt::TempView(name, sql, replace, quiet) => {
             let s = session.context(NO_SESSION)?;
             ensure!(!name.contains('.'), "{name}: a temporary view's name has no schema (it is the session's)");

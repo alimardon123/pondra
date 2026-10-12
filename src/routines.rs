@@ -1620,16 +1620,29 @@ pub(crate) fn dollar_tag(s: &str) -> Option<&str> {
 pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
     if let Some(word) = crate::txn::control(sql) {
         // BEGIN, COMMIT, ROLLBACK: the session's transaction (ADR-036 §5)
-        let (tag, warning) = crate::audit::statement(app, sql, Box::pin(crate::txn::command(app, word))).await?; // (on the heap: procedures call procedures deep)
+        let (tag, warning) = crate::audit::statement(app, sql, Box::pin(crate::txn::command(app, word, sql))).await?; // (on the heap: procedures call procedures deep)
         warning.iter().for_each(|w| heard(&format!("WARNING: {w}")));
         return Ok(Outcome::Done(j!({"transaction": tag.to_lowercase()})));
     }
-    crate::txn::refuse()?; // (a failed transaction takes nothing but its end)
-    let out = crate::audit::statement(app, sql, one_of(app, sql, who, job)).await;
+    // (the gate runs inside the audited statement, so a refusal there is audited and fails the transaction too: a write
+    // in a READ ONLY one (25006) leaves it failed, and the next statement gets 25P02)
+    let out = crate::audit::statement(app, sql, Box::pin(async move {
+        let busy = crate::txn::next(app, sql).await?; // (a failed transaction takes nothing but its end; READ COMMITTED reads the newest commit; the guard keeps the transaction busy while this runs)
+        crate::txn::began(busy.id(), one_or_locked(app, sql, who, job)).await // (the transaction it began in: a write that outlives it is refused, 25000)
+    }))
+    .await;
     if let Err(e) = &out {
         crate::txn::failed(&crate::ext::said(e)); // (in a transaction: it fails with the statement)
     }
     out
+}
+
+/// One statement's outcome, a locking read in a transaction (`txn::locked_read`) first: its rows, locked.
+async fn one_or_locked(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
+    match crate::txn::locked_read(app, sql).await? {
+        Some(rows) => Ok(Outcome::Rows(rows)),
+        None => one_of(app, sql, who, job).await,
+    }
 }
 
 async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {

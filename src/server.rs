@@ -122,6 +122,9 @@ pub fn router(app: App) -> Router {
             let (table, src, batch) = crate::constraints::decode(body)?;
             Ok::<_, E>(Json(crate::constraints::leader(app.lake.clone(), seq, table, src, batch).await?))
         }))
+        .route("/cluster/lock", post(|State(app): State<App>, Json(r): Json<crate::locks::Req>| async move {
+            Ok::<_, E>(Json(crate::locks::serve(&app.lake, r).await?))
+        }))
         .route("/cluster/iceberg", post(|State(app): State<App>, Json(c): Json<Vec<crate::iceberg::Commit>>| async move { Ok::<_, E>(Json(app.record_iceberg(c).await?)) }))
         .route_layer(middleware::from_fn_with_state(app.clone(), to_leader));
     Router::new()
@@ -584,11 +587,14 @@ async fn proxy(addr: &str, req: Request) -> anyhow::Result<Response> {
         out = out.header("content-type", ct);
     }
     let res = out.send().await?;
-    let (status, ct) = (res.status(), res.headers().get("content-type").cloned());
+    // (the leader's answer as it is: its status, content type and the x-pondra- headers, the SQLSTATE and notices among
+    // them, which a client of this node reads)
+    let status = res.status();
+    let kept: Vec<_> = res.headers().iter().filter(|(k, _)| k.as_str() == "content-type" || k.as_str().starts_with("x-pondra-")).map(|(k, v)| (k.clone(), v.clone())).collect();
     let mut resp = Response::new(Body::from(res.bytes().await?));
     *resp.status_mut() = status;
-    if let Some(ct) = ct {
-        resp.headers_mut().insert("content-type", ct);
+    for (k, v) in kept {
+        resp.headers_mut().append(k, v);
     }
     Ok(resp)
 }
@@ -1249,7 +1255,10 @@ fn owner(headers: &axum::http::HeaderMap) -> bool {
 /// was sent may be answered from `Results`.
 async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let files = owner(&headers); // (the program that started this node: its files, and URLs no secret covers)
-    let session = crate::temp::of(&headers); // (its temporary tables: `temp.rs`)
+    let session = match crate::temp::of(&headers) { // (its temporary tables: `temp.rs`)
+        Ok(session) => session,
+        Err(e) => return E::from(e).into_response(), // (a session name that isn't one: refused, saying what one is)
+    };
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let vars = crate::auth::lent_vars(token); // (Python code a run lent a connection to: the run's variables)
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
@@ -1802,6 +1811,7 @@ async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<V
     if c.is_leader() {
         s["releases"] = j!(c.releases()); // (each live node's: a rolling upgrade's progress)
     }
+    s["row_locks"] = j!(crate::locks::count(&app.lake.url)); // (ADR-067 §3: the row locks this lake's leader holds now)
     if let Some(seq) = &app.seq {
         s["untiered_rows"] = j!(app.lake.backlog.load(std::sync::atomic::Ordering::Relaxed));
         let mut ms = seq.commit_ms.lock().unwrap().clone();
