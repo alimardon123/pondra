@@ -69,7 +69,9 @@ src/      62,500 lines of Rust in 108 files, one per concern (see the table in R
           the modules: the four every build has (`finish`, `fsum`, `intervals`, `xlsx`: no lake, so a
           browser build shares them) and the rest under feature `server` (on by default: the node);
           `cli.rs` is the command line (its subcommands and what each starts) and `main.rs` sets the
-          allocator and calls it (ADR-061); round 25 added
+          allocator and calls it (ADR-061); `node.rs` is a node started and stopped as an object,
+          `reset.rs` (`per_node!`: a node's statics set back when it stops) and `env.rs` every
+          setting, from one table (ADR-061 step 2); round 25 added
           live.rs (live queries) and temp.rs (a session's temporary tables and views); round 31 vars.rs
           (SQL variables and a file's declared parameters, ADR-037, ADR-044) and script.rs (a script's
           blocks, branches, loops and handlers, ADR-045); round 26
@@ -2119,6 +2121,40 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    a HAVING's few groups (`HavingBuilds`) or a spread query's joins (its exchanges are the spread
    analysis's). `harness.py hot`: "NOT IN a subquery with a NULL keeps no row…" fails with a NOT IN
    hashed (the threads that never met the NULL keep their rows).
+300. **A node is started and stopped as an object, and a stop at any point gives back what it took**
+   (`node.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
+   serves, it drains, makes what it committed durable, checkpoints, ends what it started
+   (`panics::abort_all`), closes its catalog and steps down. Stopped while it starts, it gives its
+   term back without the durable wait. Either way the next node on the lake leads at once. The
+   command line is a caller of `Node`, never a second copy of it. `tools/node_check.py`: "a node
+   stopped once it serves gives its term back…" and "a node stopped while it starts gives its term
+   back too" (both ready in under 5 s; a kept term makes the next node wait out the 30 s lease).
+
+301. **A node stopped in a process leaves nothing of itself in it** (`reset.rs`, ADR-061 §3): every
+   static that holds a node's or a lake's state is `per_node!`, set back by `reset()` when
+   `Node::stop` ends; its writers end first, its Python workers stop, and what `panics::spawn`
+   started is aborted. A gauge whose guards count themselves down (`metrics::RUNNING`, `WAITING`)
+   stays the process's, and the drain counts each node's requests on a counter of that node's own
+   (`drain::IN_FLIGHT`), as failed sign-ins are counted per node (`auth::Guesses`). SlateDB's tasks
+   outlive its handles, so a catalog let go closes what SlateDB runs for it (`Drop for Catalog`: a
+   reader's polling, a writer's flushing, the compactor and the collector `close` stops too): a lake
+   opened for a moment (a branch's base, a lake detached) read its manifest four times a second for
+   the life of the process. `tools/per_node_check.py` fails a static that is neither `per_node!` nor
+   in its list of what outlives a node, with the reason, and a `tokio::spawn` outside `panics.rs`.
+   `tests/node_twice.rs`: lake B after lake A in one process has none of A's users, tables, history,
+   counters, format or hot columns, and three more opens leave no threads, files or tasks behind
+   (the runtime's alive tasks: with the compactor and collector left running, 13 then 19).
+
+302. **Every setting is read through `env.rs`, from one table of names** (ADR-061 §8): what the
+   process was given (`open`'s options, the command line's flags: `env::give`), else the
+   environment, and an empty value is no value. Nothing sets the environment (`set_var`): beside a
+   library's host it is a data race, so a Pondra process it starts gets what it was given as its
+   environment (`env::given()`), and `pondra sql`'s job and tries go to its next run through
+   `cluster::restart_with`. The first `give` fixes the settings; a later one may repeat a setting,
+   never change one, and each it would change is named, as is a name that isn't a setting (with the
+   nearest one). `tools/per_node_check.py` fails a `PONDRA_*` name read past `env.rs` (by its text,
+   or through a constant that names it), a name its `NAMES` doesn't list, a listed name nothing
+   reads, and any `set_var`. `cargo test --lib env::`.
 322. **Row locks are a schedule, never the authority** (`locks.rs`, `txn::commit_here`, ADR-067
    §4–6): they live in the leader's memory only, by table and key (an append table's by `_row_id`),
    with a lease of `PONDRA_LOCK_LEASE_SECS` (60) that each lock request renews; a new leader starts
@@ -2317,6 +2353,9 @@ python3 tools/harness.py safety         # panics answered as errors, TLS at ever
 python3 tools/harness.py owned signed guesses   # a program's node answers only it; a lake served with tokens stays signed; failed sign-ins limited per address and name
 python3 tools/harness.py sealed         # the admin token as the master key: sealed from the first write, across nodes, rotation, the nodes' key refused
 python3 tools/harness.py first          # a node on the network with no token makes the lake's first user and prints its token once; pondra token; a follower answers no one
+python3 tools/node_check.py             # a node stopped once it serves, or while it starts, gives its term back: the next leads at once
+python3 tools/per_node_check.py         # every static per_node! or said to outlive a node; no task Node::stop can't end; settings only through env.rs
+cargo test --release --test node_twice  # two lakes in one process, one after the other: nothing of the first in the second
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
