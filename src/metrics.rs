@@ -43,10 +43,11 @@ impl Drop for Now {
 
 pub fn add(c: &AtomicU64, n: u64) { c.fetch_add(n, Relaxed); }
 
-/// Background loops that fail without failing a request (tiering, publishing, window emission,
-/// streaming tasks, checkpoints): counted here, so a stall that otherwise shows only on stderr is
-/// visible in `/metrics` and `/stats`.
-crate::per_node!(static BG_FAILS: [(&str, AtomicU64); 5] =
+crate::per_node!(
+    /// Background loops that fail without failing a request (tiering, publishing, window emission,
+    /// streaming tasks, checkpoints): counted here, so a stall that otherwise shows only on stderr is
+    /// visible in `/metrics` and `/stats`.
+    static BG_FAILS: [(&str, AtomicU64); 5] =
     [("tiering", AtomicU64::new(0)), ("publish", AtomicU64::new(0)), ("emission", AtomicU64::new(0)), ("tasks", AtomicU64::new(0)), ("checkpoint", AtomicU64::new(0))];
     clear = |all| all.iter().for_each(|(_, c)| c.store(0, Relaxed)));
 
