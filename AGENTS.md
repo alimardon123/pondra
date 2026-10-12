@@ -2158,6 +2158,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    nearest one). `tools/per_node_check.py` fails a `PONDRA_*` name read past `env.rs` (by its text,
    or through a constant that names it), a name its `NAMES` doesn't list, a listed name nothing
    reads, and any `set_var`. `cargo test --lib env::`.
+318. **SQL's plain INSERT never replaces a row of its key** (`constraints::key_check`, `key_check_over`,
+   `txn::autocommit`, `txn::ByKey`): an INSERT without ON CONFLICT or OR REPLACE | IGNORE into a table
+   with a PRIMARY KEY (not a merge table) is refused 23505, in Postgres's words, when two of its rows
+   share a key or a live row holds one. Outside a transaction it runs as one of its own under its keys'
+   row locks, so of two nodes inserting one new key, one wins. In a transaction it is checked at its
+   statement over the transaction's kept keys (`ByKey`: its own rows' keys held, the keys it took away
+   free, never a pass over its kept rows) and again at COMMIT. A retried job's INSERT is a duplicate
+   (`write::sent`). A CREATE TABLE AS refused for a key leaves no table. ON CONFLICT, MERGE, INSERT OR
+   REPLACE | IGNORE, the loading doors and views keep upserting, and a change replaces old rows by key,
+   not `_row_id` (`change::upserts`). `pondra sql` and an attached lake's INSERT check without locks.
+   `harness.py pkey`.
 322. **Row locks are a schedule, never the authority** (`locks.rs`, `txn::commit_here`, ADR-067
    §4–6): they live in the leader's memory only, by table and key (an append table's by `_row_id`),
    with a lease of `PONDRA_LOCK_LEASE_SECS` (60) that each lock request renews; a new leader starts
@@ -2413,6 +2424,7 @@ python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, la
 python3 tools/harness.py sequences      # nextval on three nodes (every value once), identity columns from every door, ALWAYS, owned sequences, a leader's kill
 python3 tools/harness.py enums          # CREATE TYPE … AS ENUM and ENUM('a', 'b') columns: labels from every door (22P02), casts, enum_range, ADD VALUE, RENAME, DROP while used
 python3 tools/harness.py constraints    # UNIQUE from every door and three nodes at once (23505), NOT ENFORCED facts, ADD/DROP CONSTRAINT, SHOW CREATE, the Postgres catalog
+python3 tools/harness.py pkey           # a plain INSERT of a held key: 23505 at every door, two nodes at once, transactions and savepoints, upserts still upsert, CTAS, pondra sql
 python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
 python3 tools/harness.py find           # pondra.parts and pondra.find at every door (HTTP, Postgres, MCP, Python, JavaScript), as each user may see them; 1,000 tables and 200 views
 python3 tools/harness.py measures       # measures in views: the query's own grain, BI's sum(m), three nodes, Postgres, frames, refusals, cost against the hand-written GROUP BY
