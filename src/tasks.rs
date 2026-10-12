@@ -100,6 +100,18 @@ pub async fn create(lake: &Lake, name: &str, task: &Task) -> Result<()> {
     lake.cat.commit(puts, &[]).await
 }
 
+/// Whether a streaming task of this name is there (`DROP TASK` drops one of either kind).
+pub async fn exists(lake: &Lake, name: &str) -> Result<bool> { Ok(lake.cat.get::<Task>(&task_key(name)).await?.is_some()) }
+
+/// `DROP TASK` of a streaming task (leader, under the lake's lock): its entry and its shards'
+/// progress go in one commit, so `run_all` finds no task and runs nothing more. A run already
+/// computed commits what it read, or is refused once the progress it read is gone (compare-and-swap).
+pub async fn drop_task(lake: &Lake, name: &str) -> Result<()> {
+    let Some(task) = lake.cat.get::<Task>(&task_key(name)).await? else { return Ok(()) };
+    let gone: Vec<String> = std::iter::once(task_key(name)).chain(producers(name, &task).iter().map(|p| producer_key(p))).collect();
+    lake.cat.commit(vec![], &gone).await
+}
+
 /// The rows whose `col` hashes to `shard` (fixed seed: every node agrees).
 fn shard_rows(b: &RecordBatch, col: &str, shard: u32, shards: u32) -> Result<RecordBatch> {
     let Some(array) = b.column_by_name(col) else { bail!("no column {col}") };
