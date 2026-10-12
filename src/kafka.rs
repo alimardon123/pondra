@@ -82,6 +82,8 @@ const UNSUPPORTED_VERSION: i16 = 35;
 const OUT_OF_ORDER_SEQUENCE: i16 = 45;
 const TRANSACTIONS_UNSUPPORTED: i16 = 53; // (TRANSACTIONAL_ID_AUTHORIZATION_FAILED: not retried)
 const SASL_FAILED: i16 = 58;
+/// What a password sent in the clear from another machine is told (`tls::may_send_password`).
+const PASSWORD_PLAIN: &str = "a password crosses only TLS from another machine: connect with SASL_SSL, or sign in with a token";
 const INVALID_RECORD: i16 = 87;
 const POLICY_VIOLATION: i16 = 44;
 const REQUEST_TIMED_OUT: i16 = 7; // (retried; "possibly written": an idempotent producer's retry applies once)
@@ -112,7 +114,8 @@ type Reply = BoxFuture<'static, Option<Vec<u8>>>; // a response frame, or None (
 /// One client connection. Requests are read and started in order (produced rows are queued at
 /// once), and their responses are written in that order as each completes: many in flight.
 async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()> {
-    let from = Some(socket.peer().addr);
+    let peer = socket.peer();
+    let from = Some(peer.addr);
     let (mut rd, mut wr) = tokio::io::split(socket);
     let (tx, mut rx) = mpsc::channel::<Reply>(64);
     let writer = tokio::spawn(async move {
@@ -128,7 +131,7 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
         ensure!((0..=128 << 20).contains(&size), "request of {size} bytes");
         let mut buf = vec![0; size as usize];
         rd.read_exact(&mut buf).await?;
-        let reply = request(&app, &me, &mut who, Bytes::from(buf)).await?;
+        let reply = request(&app, &me, &mut who, &peer, Bytes::from(buf)).await?;
         if tx.send(reply).await.is_err() {
             break;
         }
@@ -137,7 +140,7 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
     writer.await?
 }
 
-async fn request(app: &App, me: &Broker, who: &mut crate::auth::Principal, buf: Bytes) -> Result<Reply> {
+async fn request(app: &App, me: &Broker, who: &mut crate::auth::Principal, peer: &crate::tls::Peer, buf: Bytes) -> Result<Reply> {
     let mut r = Rd { b: buf, at: 0 };
     let (key, ver, corr) = (r.i16()?, r.i16()?, r.i32()?);
     r.nstr()?; // client id
@@ -153,7 +156,7 @@ async fn request(app: &App, me: &Broker, who: &mut crate::auth::Principal, buf: 
         API_VERSIONS => done(api_versions(if supported { ver } else { 0 }, supported)),
         METADATA => done(metadata(app, me, ver, &mut r).await?),
         SASL_HANDSHAKE => done(sasl_handshake(&mut r)?),
-        SASL_AUTHENTICATE => done(sasl_authenticate(app, who, ver, &mut r).await?),
+        SASL_AUTHENTICATE => done(sasl_authenticate(app, who, peer, ver, &mut r).await?),
         INIT_PRODUCER_ID => done(init_producer_id(&mut r)?),
         PRODUCE => produce(app, who, ver, &mut r).await?.map(move |body| body.map(|b| frame(corr, b))).boxed(),
         LIST_OFFSETS => done(list_offsets(app, ver, &mut r).await?),
@@ -270,26 +273,45 @@ fn sasl_handshake(r: &mut Rd) -> Result<Vec<u8>> {
 }
 
 /// SASL/PLAIN: "\0user\0password": a user and its password (or one of its tokens), or a role's
-/// name (`reader`, `writer`, `admin`) and its token (`users::sign_in`).
-async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
+/// name (`reader`, `writer`, `admin`) and its token (`users::sign_in`). As on HTTP, a password crosses
+/// only TLS from another machine, a token may under `PONDRA_TLS=optional` (`tls::may_send_password`), and
+/// past ten failures a minute for a user from one address, that pair is refused (`auth::guessing`).
+async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, peer: &crate::tls::Peer, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     let auth = r.nbytes()?.unwrap_or_default();
     let parts: Vec<&[u8]> = auth.split(|&b| b == 0).collect();
     let (user, password) = match parts[..] {
-        [_, user, password] => (String::from_utf8_lossy(user).to_string(), password),
-        _ => (String::new(), &b""[..]),
+        [_, user, password] => (String::from_utf8_lossy(user).to_string(), String::from_utf8_lossy(password).to_string()),
+        _ => (String::new(), String::new()),
     };
-    let signed = match app.open().await {
-        true => Some(crate::auth::Principal::of(Role::Admin)),
-        false => crate::users::sign_in(&app.lake, &app.auth, &user, &String::from_utf8_lossy(password)).await,
+    let ip = Some(peer.addr.ip());
+    let refused = if app.open().await {
+        *who = crate::auth::Principal::of(Role::Admin).at("kafka", who.from);
+        None
+    } else if !peer.may_send_password() && !crate::users::is_token(&user, &password) {
+        Some(PASSWORD_PLAIN.to_string())
+    } else if let Some(wait) = crate::auth::guessing(ip, &user) {
+        Some(crate::auth::guessing_says(&user, wait))
+    } else {
+        match crate::users::sign_in(&app.lake, &app.auth, &user, &password).await {
+            Some(p) => {
+                *who = p.at("kafka", who.from);
+                None
+            }
+            None => {
+                crate::auth::guessed(ip, &user);
+                Some("wrong user name or password".to_string())
+            }
+        }
     };
-    let ok = signed.is_some();
-    match signed {
-        Some(p) => *who = p.at("kafka", who.from),
-        None => crate::audit::refused(app, &user, "kafka", who.from, "sign in", "wrong user name or password"),
+    if let Some(why) = &refused {
+        crate::audit::refused(app, &user, "kafka", who.from, "sign in", why);
+        if why != PASSWORD_PLAIN {
+            tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time, as on HTTP)
+        }
     }
     let mut w = vec![];
-    w.put_i16(if ok { 0 } else { SASL_FAILED });
-    put_nstr(&mut w, (!ok).then_some("wrong user name or password"));
+    w.put_i16(if refused.is_none() { 0 } else { SASL_FAILED });
+    put_nstr(&mut w, refused.as_deref());
     w.put_i32(0); // auth bytes
     if ver >= 1 {
         w.put_i64(0); // session lifetime: unlimited

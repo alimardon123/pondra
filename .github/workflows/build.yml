@@ -203,7 +203,7 @@ jobs:
             "apt-get update -qq && apt-get install -y -qq python3-pip > /dev/null && pip install -q dist/*.whl pyarrow && python3 tools/package_check.py"
       - name: The release's npm publish, tried (--dry-run, with the npm the release uses)
         if: matrix.platform == 'linux-x64'
-        run: npm install -g npm@latest && bash tools/npm_publish.sh --dry-run
+        run: npm install -g npm@12.2.0 && bash tools/npm_publish.sh --dry-run # (the release's npm: release.yml)
       - uses: actions/upload-artifact@v6 # (what release.yml publishes, and cluster-bench.yml can run)
         with:
           name: pondra-${{ matrix.platform }}

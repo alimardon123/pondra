@@ -134,6 +134,9 @@ def main():
     ups = Upserts(live, rate=2, model={int(k): v for k, v in was.get("kv", {}).items()}, seq=was.get("kv_seq", 0))
     ups.start()
     role = lambda x: x.get("/stats", timeout=5)["role"]
+    # (a node that restarts to rejoin the cluster execs itself: a new process under the same pid, so each
+    # one is told apart by how many such restarts its log holds)
+    images = lambda x: sum("restarting to rejoin" in line for line in open(x.log, errors="replace")) if os.path.exists(x.log) else 0
     timeline, moves, start = open(A.timeline, "w"), [], time.time()
     kinds = [("leader", "term"), ("leader", "kill"), ("follower", "term"), ("follower", "kill")]
     next_move, last_list, samples, wrote, mark = start + every, 0, [], {}, start
@@ -148,7 +151,7 @@ def main():
         span, wrote = time.time() - (samples[-1]["at"] if samples else start), now_wrote
         if not A.s3 or time.time() - last_list > 1800:
             listed, last_list = objects(lake), time.time()
-        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "pids": {x.port: x.p.pid for x in live},
+        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
                 "untiered_rows": stats.get("untiered_rows"), "commit_ms_p95": stats.get("commit_ms_p95"),
                 "longest_ack_s": load.longest(mark), "acked": sum(load.acked.values()),
                 "torn": len(load.torn), **({"objects": listed} if listed else {})}
@@ -193,7 +196,7 @@ def main():
                                                          and live[0].q("SELECT count(*) AS n FROM tens") == live[0].q("SELECT count(*) AS n FROM ev WHERE i = 0 AND seq % 10 = 0")
                                                          and same("SELECT count(*) AS n FROM ev") and same("SELECT * FROM per_producer ORDER BY producer"))
     checks["the log drains: no rows left untiered two minutes after the load"] = bool(drained)
-    # Memory: each process's own (a node started again is another) over its life, if it lived ten
+    # Memory: each process's own (a node started again, or restarted in place, is another) over its life, if it lived ten
     # samples: the median of its last tenth against that of its second (the first is warm-up),
     # less its hot columns: a cache of the columns read lately, which grows with the tables up to
     # its own limit (hot.rs) and gives memory back past three fifths of the machine; and less the
@@ -204,10 +207,10 @@ def main():
         for port, pid in s["pids"].items():
             own = s.get("anon_mb", s["rss_mb"]).get(port)
             if own:
-                lives[(port, pid)].append(own - s.get("hot_mb", {}).get(port, 0) - s.get("cache_mb", {}).get(port, 0))
+                lives[(port, pid, s.get("images", {}).get(port, 0))].append(own - s.get("hot_mb", {}).get(port, 0) - s.get("cache_mb", {}).get(port, 0))
     median = lambda xs: sorted(xs)[len(xs) // 2]
-    drift = {f"{port} (pid {pid})": {"early_mb": median(xs[len(xs) // 10:max(2, 2 * len(xs) // 10)]), "late_mb": median(xs[-max(1, len(xs) // 10):]), "samples": len(xs)}
-             for (port, pid), xs in lives.items() if len(xs) >= 10}
+    drift = {f"{port} (pid {pid}{f', after {n} restarts in place' if n else ''})": {"early_mb": median(xs[len(xs) // 10:max(2, 2 * len(xs) // 10)]), "late_mb": median(xs[-max(1, len(xs) // 10):]), "samples": len(xs)}
+             for (port, pid, n), xs in lives.items() if len(xs) >= 10}
     info["memory"] = drift
     info["hot columns at the end, MB"] = samples[-1].get("hot_mb") if samples else None
     info["caches at the end, MB"] = samples[-1].get("cache_mb") if samples else None

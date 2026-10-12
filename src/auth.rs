@@ -457,6 +457,9 @@ pub fn guessing(addr: Option<std::net::IpAddr>, user: &str) -> Option<u64> { GUE
 /// A failed sign-in of this address and user name, now.
 pub fn guessed(addr: Option<std::net::IpAddr>, user: &str) { GUESSED.guessed_at(addr, user, std::time::Instant::now()) }
 
+/// What a sign-in refused for its failures is told, with how long to wait (`guessing`), at every door.
+pub fn guessing_says(user: &str, wait: u64) -> String { format!("too many failed sign-ins for {user} from this address: wait {wait} s") }
+
 impl Guesses {
     fn key(addr: Option<std::net::IpAddr>, user: &str) -> (std::net::IpAddr, String) {
         (addr.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)), user.to_string())

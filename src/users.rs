@@ -1264,6 +1264,10 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) ->
     sign_in(lake, auth, user, password).await
 }
 
+/// Is this sign-in's password a token, by `sign_in`'s own rule (a token's name, or a user's `pt_…`)? A token
+/// may cross a plain connection under `PONDRA_TLS=optional`, a password never (`tls::may_send_password`).
+pub fn is_token(user: &str, password: &str) -> bool { BUILT_IN.contains(&user) || password.starts_with("pt_") }
+
 /// A name and a password (or a token as the password): the Postgres, Kafka and Flight doors' and
 /// HTTP Basic's. The tokens' names (`admin`, `writer`, `reader`) take their tokens.
 pub async fn sign_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Option<Principal> {

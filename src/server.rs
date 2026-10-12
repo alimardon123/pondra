@@ -422,7 +422,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let basic_by = header.as_deref().filter(|h| h.starts_with("Basic ")).map(|h| (basic_user(Some(h)), client));
     if let Some((name, ip)) = &basic_by {
         if let Some(wait) = crate::auth::guessing(*ip, name) {
-            let why = guessing_says(name, wait);
+            let why = crate::auth::guessing_says(name, wait);
             crate::audit::refused(&app, name, "http", from, &format!("{} {}", req.method(), req.uri().path()), &why);
             tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does: refused at once, guesses would cost nothing)
             return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
@@ -507,9 +507,6 @@ fn basic_user(header: Option<&str>) -> String {
     b.and_then(|b| String::from_utf8(b).ok()).and_then(|up| up.split_once(':').map(|(u, _)| u.to_string())).unwrap_or_default()
 }
 
-/// What a sign-in refused for its failures is told, with how long to wait (`auth::guessing`).
-fn guessing_says(user: &str, wait: u64) -> String { format!("too many failed sign-ins for {user} from this address: wait {wait} s") }
-
 /// `POST /login` `{"user", "password"}`: a session (`{"token": "ps_…", "until": ms}`) to send as
 /// `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`); the console's sign-in.
 async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
@@ -520,7 +517,7 @@ async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::e
     }
     let ip = Some(peer.client(&headers));
     if let Some(wait) = crate::auth::guessing(ip, user) {
-        let why = guessing_says(user, wait);
+        let why = crate::auth::guessing_says(user, wait);
         crate::audit::refused(&app, user, "http", Some(peer.addr), "sign in", &why);
         tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does)
         return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
