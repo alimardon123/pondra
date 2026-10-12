@@ -2437,6 +2437,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    "…a user granted APPLY on this database (it deploys them) is shown routines' code and the export", "…nor in a
    failed call's error…".
 
+395. **RETURNING answers the rows the write worked out, never rows read back** (`returning.rs`: `wrote`
+   from `write::run_listed`, `txn::autocommit_as`, `insert_as` and `txn::statement`). A change the
+   leader would work out (`write::changes`) runs as a transaction of its own (`txn::alone`) in the
+   caller's session, so its rows are worked out where they are answered and land in one commit. Its
+   job names that commit (`Commit.job`), never the transaction's id, which owns its locks. Everything
+   that refuses is checked before the write: the table, the items (42703), and SELECT on the table
+   (42501). A job sent again is refused 55000, never answered with no rows. `harness.py returning`:
+   "a job's INSERT … RETURNING into a UNIQUE table and a keyed one, sent again: refused 55000, not
+   23505" (55P03 with the job as the transaction's id), "a user granted INSERT but not SELECT…".
+
 ## Tests: run these before and after any change
 
 ```bash
@@ -2490,6 +2500,7 @@ python3 tools/harness.py sequences      # nextval on three nodes (every value on
 python3 tools/harness.py enums          # CREATE TYPE … AS ENUM and ENUM('a', 'b') columns: labels from every door (22P02), casts, enum_range, ADD VALUE, RENAME, DROP while used
 python3 tools/harness.py constraints    # UNIQUE from every door and three nodes at once (23505), NOT ENFORCED facts, ADD/DROP CONSTRAINT, SHOW CREATE, the Postgres catalog
 python3 tools/harness.py pkey           # a plain INSERT of a held key: 23505 at every door, two nodes at once, transactions and savepoints, upserts still upsert, CTAS, pondra sql
+python3 tools/harness.py returning      # INSERT/UPDATE/DELETE … RETURNING at every door == Postgres: ORMs (Django, SQLAlchemy), keys, UNIQUE, upserts, transactions, a follower, jobs (55000), grants (42501)
 python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
 python3 tools/harness.py find           # pondra.parts and pondra.find at every door (HTTP, Postgres, MCP, Python, JavaScript), as each user may see them; 1,000 tables and 200 views
 python3 tools/harness.py measures       # measures in views: the query's own grain, BI's sum(m), three nodes, Postgres, frames, refusals, cost against the hand-written GROUP BY
