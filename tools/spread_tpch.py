@@ -35,7 +35,7 @@ def lake_of():
     lake = harness.tempfile.mkdtemp(prefix="pondra-spreadtpch-")
     harness.LAKES.append(lake)
     for t in TABLES:
-        subprocess.run([harness.BIN, "sql", "--dir", lake, f"INSERT INTO {t} SELECT * FROM '{os.path.join(A.data, t)}.parquet'"], check=True, capture_output=True)
+        subprocess.run([harness.BIN, "sql", "--dir", lake, f"CREATE TABLE {t} AS SELECT * FROM '{os.path.join(A.data, t)}.parquet'"], check=True, capture_output=True)
     return lake
 
 

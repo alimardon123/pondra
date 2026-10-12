@@ -1001,19 +1001,51 @@ fn span(s: u64) -> String {
 }
 
 /// The quota of the statement being run (its user's `Limits`): a turn among its statements on this
-/// node, and how long it may take. Tokens and superusers have none.
+/// node, and how long it may take. Tokens and superusers have no turns, but a session's
+/// `statement_timeout` still applies to them.
 pub struct Quota {
     turns: Option<(Arc<tokio::sync::Semaphore>, u32)>,
     pub timeout: Option<std::time::Duration>,
     pub user: String,
+    /// The timeout in force is the session's (or the node's default), not the user's own.
+    pub by_session: bool,
+}
+
+/// A Postgres duration setting as Postgres reads it: a bare number is milliseconds; else a number
+/// and a unit (us, ms, s, min, h, d), spaces allowed between. 0 (or nothing) is no limit.
+fn pg_duration(v: &str) -> Option<std::time::Duration> {
+    let v = v.trim().trim_matches('\'').trim();
+    let (n, unit) = v.split_at(v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len()));
+    let n: u64 = n.parse().ok()?;
+    let micros = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "ms" => n.checked_mul(1_000)?,
+        "us" => n,
+        "s" => n.checked_mul(1_000_000)?,
+        "min" => n.checked_mul(60_000_000)?,
+        "h" => n.checked_mul(3_600_000_000)?,
+        "d" => n.checked_mul(86_400_000_000)?,
+        _ => return None,
+    };
+    (micros > 0).then(|| std::time::Duration::from_micros(micros))
 }
 
 pub fn quota() -> Quota {
     let p = crate::auth::current();
-    let Some((user, a)) = p.and_then(|p| Some((p.name, p.access?))) else { return Quota { turns: None, timeout: None, user: String::new() } };
+    // (a session that set `statement_timeout` keeps its own, 0 included; one that set none gets the node's default)
+    let session = match crate::settings::shown("statement_timeout") {
+        Some(v) => pg_duration(&v),
+        None => std::env::var("PONDRA_STATEMENT_TIMEOUT").ok().and_then(|v| pg_duration(&v)),
+    };
+    let Some((user, a)) = p.and_then(|p| Some((p.name, p.access?))) else { return Quota { turns: None, timeout: session, user: String::new(), by_session: session.is_some() } };
     let env = |v: &str| std::env::var(v).ok().and_then(|n| n.parse::<u64>().ok());
     let most = a.limits.max_queries.map(u64::from).or_else(|| env("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
     let timeout = a.limits.timeout_secs.or_else(|| env("PONDRA_USER_TIMEOUT")).filter(|s| *s > 0).map(std::time::Duration::from_secs);
+    // (the shorter of the session's and the user's is in force)
+    let (timeout, by_session) = match (session, timeout) {
+        (Some(s), Some(t)) if s >= t => (Some(t), false),
+        (Some(s), _) => (Some(s), true),
+        (None, t) => (t, false),
+    };
     static TURNS: LazyLock<Mutex<HashMap<String, (u32, Arc<tokio::sync::Semaphore>)>>> = LazyLock::new(Default::default);
     let turns = most.map(|n| {
         let mut all = TURNS.lock().unwrap();
@@ -1023,7 +1055,7 @@ pub fn quota() -> Quota {
         }
         (e.1.clone(), n)
     });
-    Quota { turns, timeout, user }
+    Quota { turns, timeout, user, by_session }
 }
 
 impl Quota {
@@ -1226,5 +1258,18 @@ mod tests {
         assert_eq!(p("DROP USER IF EXISTS ann")["if_exists"], true);
         assert_eq!(p("CREATE TABLE t (a INT)"), j!(null));
         assert_eq!(p("CREATE SECRET s (TYPE s3)"), j!(null));
+    }
+
+    #[test]
+    fn pg_durations() {
+        use std::time::Duration;
+        assert_eq!(pg_duration("1000"), Some(Duration::from_secs(1)));
+        assert_eq!(pg_duration("500ms"), Some(Duration::from_millis(500)));
+        assert_eq!(pg_duration("'5 s'"), Some(Duration::from_secs(5)));
+        assert_eq!(pg_duration("1min"), Some(Duration::from_secs(60)));
+        assert_eq!(pg_duration("250us"), Some(Duration::from_micros(250)));
+        assert_eq!(pg_duration("0"), None);
+        assert_eq!(pg_duration(""), None);
+        assert_eq!(pg_duration("abc"), None);
     }
 }

@@ -3,7 +3,8 @@
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
 works this way) and `docs/adr-028-one-vocabulary-and-open-writes.md` (the latest round;
 `docs/adr-029-anyones-compute-one-catalog.md`, phase 1 built in round 27, phase 2 in round 28).
-`docs/prototype-status.md` has the measured numbers and what's left.
+`docs/adr-068-what-1-0-keeps.md` says what 1.0 promises to keep, and `docs/adr-061-pondra-in-your-process.md`
+how the crate is a library under the program. `docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
 
@@ -19,7 +20,7 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~55,200 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650; Python functions, procedures on workers, the run log and tasks, round 24, 1,400; outside appends, live queries, temporary tables, answers kept and changes across lakes, round 25, 1,200; other engines' changes as written, round 28, 1,300).
+5. **Short, simple, readable code** — without losing functionality. ~62,500 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650; Python functions, procedures on workers, the run log and tasks, round 24, 1,400; outside appends, live queries, temporary tables, answers kept and changes across lakes, round 25, 1,200; other engines' changes as written, round 28, 1,300).
    If a change makes a file much longer, look for the simpler shape first.
 6. **Scale-out is the point** (the owner, 2026-09-27): running across machines is what sets
    Pondra apart from single-node engines (DuckDB, Polars, Daft, Bodo) and makes it leaner than
@@ -64,7 +65,11 @@ The owner's design principles, which every change must respect:
 ## Layout
 
 ```
-src/      55,200 lines of Rust in 101 files, one per concern (see the table in README.md); round 25 added
+src/      62,500 lines of Rust in 108 files, one per concern (see the table in README.md); `lib.rs` lists
+          the modules: the four every build has (`finish`, `fsum`, `intervals`, `xlsx`: no lake, so a
+          browser build shares them) and the rest under feature `server` (on by default: the node);
+          `cli.rs` is the command line (its subcommands and what each starts) and `main.rs` sets the
+          allocator and calls it (ADR-061); round 25 added
           live.rs (live queries) and temp.rs (a session's temporary tables and views); round 31 vars.rs
           (SQL variables and a file's declared parameters, ADR-037, ADR-044) and script.rs (a script's
           blocks, branches, loops and handlers, ADR-045); round 26
@@ -83,7 +88,9 @@ src/      55,200 lines of Rust in 101 files, one per concern (see the table in R
           ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043) and history.rs (every
           statement a row of `pondra.history`, slow ones with plans and traces, ADR-048); round 34
           friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225), objects.rs
-          (one registry of every kind of object: ADR-049, invariant 227), seq.rs (sequences and
+          (one registry of every kind of object: ADR-049, invariant 227), find.rs (`pondra.parts` and
+          `pondra.find`: every part of every object, and one search of objects, parts and concepts;
+          ADR-065, invariant 345), seq.rs (sequences and
           identity columns: invariant 234), index.rs (indexes kept as objects: invariant 235),
           constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236),
           types.rs (enum types: invariant 242), and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
@@ -471,7 +478,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    follower that has never reached its leader (`Cluster::heard`) waits for that too; only
    members that lost a leader they were talking to use the 5 s lease.
    A one-off writer claims with an empty address, keeps its mark fresh while it works, and
-   deletes it when done. Nodes and other writers wait for it; they never follow it.
+   deletes it when done. Nodes and other writers wait for it; they never follow it. On the
+   claimer's own machine nobody waits: a term names its lock file (invariant 370), and a free one
+   means its process ended, so the next node or writer there claims at once.
 18. **The inbox is just another door to the leader.** Its requests carry the same exactly-once
    keys as HTTP (a bulk INSERT's job id, a flush's `(producer, seq)`), and only a process that
    leads answers them (`inbox::drain`, from the leader loop or a one-off writer that leads). A
@@ -611,7 +620,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `query::register_views` again). A `ViewTable` keeps the table it was planned over; planned
    over whole tables, a spread query over a view counted every row once per node
    (`harness.py schemas`: "queries over views spread" fails without it).
-52. **A follower that finds no catalog starts over** (`main.rs`: `cluster::restart`). A new lake's
+52. **A follower that finds no catalog starts over** (`cli.rs`: `cluster::restart`). A new lake's
    leader may not have made it yet, or may have died first; the restart waits for the one or
    takes over from the other when its mark is stale. Exiting instead lost a node of the R2
    cluster bench (`cluster.py race`: "a leader that never made the catalog").
@@ -640,7 +649,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    change empties goes); a row-by-row view over the table alone carries each source row's
    `_row_id` and `_created_at` (`View::ids`, `carry`) and drops its rows of old versions into
    `{view}$deleted`. Windows and sessions emitted once, min/max, joins and tasks can't take a row
-   back: refused. `harness.py changes`: the view checks and "refused: …".
+   back: refused. Only a change that takes a row back is asked (`change::run`, after its rows are
+   worked out): one that matches nothing is `rows: 0`, and one that only adds rows (a MERGE that
+   matched none) is followed as an INSERT is; dbt deletes a model's matching keys on every run.
+   `harness.py changes`: the view checks and "refused: …"; `found`: "dbt's snapshots…".
 58. **A purge covers only changes whose old rows are in files, and a read skips only what the
    entry it read says is purged** (`tier::purge`: up to both tables' `tiered`; `TableMeta::purges`;
    a slice gets the coordinator's mark, `Part::purged`). A `{t}$deleted` file goes only once every
@@ -701,6 +713,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    than here doesn't decide alone (`guard::spread_runs`: the other nodes saw the query cold), so
    the model decides until a second agrees; one slow first run kept the cluster bench's q1 on one
    node for good (`harness.py guard`: "one spread run slower than here doesn't decide alone").
+   Every run here is timed (`server::query_listed`), however quick: kept only past 20 ms, a query
+   learned spread was never known to be faster here, and the third node of `harness.py guard`
+   spread it now and then. Only the bytes it read, for this node's rate, wait for a run of 20 ms.
 73. **`pondra_object_requests_total` counts what the store was asked to do** (`store::Counted`), not
    what SlateDB tried: a local disk refuses SlateDB's tagged PUT before writing, and it tries again
    untagged; the refusal isn't counted.
@@ -1020,14 +1035,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `PONDRA_SESSION_IDLE_SECS`, or past `PONDRA_WORKER_MB`; another session, and a block with none,
    share nothing. Its variables (`GET`) and restart (`DELETE /sessions/{id}/python`) are an
    admin's. `harness.py procedures`; `console_check.py` (Variables, Restart, the admin check).
-142. **`pondra serve PATH` guesses only the unambiguous** (`main.rs`): a folder holding other things
+142. **`pondra serve PATH` guesses only the unambiguous** (`cli.rs`): a folder holding other things
    is never made a lake, the current folder only when named; `--lake` on a folder of lakes and
    `--lakes` on a lake are refused with the command meant; one lake's options (`--flight`,
    `--kafka`, `--attach`, `--advertise`, `--attach-found`) are refused with `--lakes`, and every
    other reaches each database's node (`Options.node`). A folder whose first node has claimed a
    term but not yet made the catalog is a lake being made (`dbserver::is_lake`): nodes started at
-   once on a new folder by its name all join it (two of three exited). `harness.py server`,
-   `cluster.py race`.
+   once on a new folder by its name all join it (two of three exited). The shell's lake is guessed
+   the same way (`cli::opened`): a word that isn't a folder and is a command with a letter left out
+   or two swapped is refused with the command meant, and a folder holding other things, or lakes, is
+   never made one. `harness.py server`, `cluster.py race`, `smoke.py` ("a mistyped command isn't
+   made a lake…").
 143. **A database's node isn't stopped while in use** (`dbserver::Busy`): an open Postgres
    connection or an HTTP request (until its answer's last byte) holds it; idle time counts from
    when the last one ended; `reap` checks again under the lock before it stops one. `harness.py
@@ -1099,8 +1117,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `reserve`), never from commit numbers; a log row's place is `log::ord` (segment << 24, then its
    row), and a segment with more of a table's rows than that takes the numbers after it
    (`log::span`), which a Kafka fetch looks back over. `harness.py ids`.
-156. **The REST catalog makes, renames and drops tables as the SQL does** (`iceberg::create`,
-   `drop_table`, `rename`): each is the statement, run as the caller (DDL: an admin's); what
+156. **The REST catalog makes, renames and drops tables and namespaces as the SQL does**
+   (`iceberg::create`, `drop_table`, `rename`, `create_namespace`, `drop_namespace`): each is the
+   statement, run as the caller (DDL: an admin's); a namespace's properties but `owner`, and a
+   namespace not empty (409), are refused by name; what
    Pondra's tables can't be (a type, a spec of two fields or by bucket, a descending order, a
    staged create) is refused by name, and a table made answers its first published version.
    `harness.py adopted`.
@@ -1315,7 +1335,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    holds runs through Python (`db.sql`, which sends it along); a SQL cell named (`%%sql df <<`, the
    console's **→ name**) leaves `df = db.sql(…)` in Python, a frame, not a copy. Only a single query
    is named: a write never runs twice.
-195. **The work runs on an 8 MB stack on every OS** (`main.rs`): Windows gives its main thread 1 MB;
+195. **The work runs on an 8 MB stack on every OS** (`cli.rs`): Windows gives its main thread 1 MB;
    a session's making and DataFusion's planning need more there than Linux's main thread lets on.
    Tokio's workers get 8 MB too (`thread_stack_size`): at its 2 MB, the dist build's
    "procedures calling procedures stop 16 deep" (`harness.py procedures`) overflowed one and
@@ -1483,8 +1503,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `UNDROP` reads the log from its end (invariant 50). `tools/history_check.py`.
 217. **`t AT (…)` reads only a past the table still holds, or says so** (`past.rs`, `tier::settle`).
    A purge drops `{t}$deleted` files only past the table's retention, and moves
-   `TableMeta::past_from` to the newest it dropped. A moment before that, and any keyed table, is
-   refused by name, never answered with fewer rows. `tools/history_check.py`: "AT refused by name…".
+   `TableMeta::past_from` to the newest it dropped. A moment before that, or before the table was
+   made (`TableMeta::made`), and any keyed table, is refused by name, never answered with fewer rows.
+   `tools/history_check.py`: "AT refused by name…", "AT before the table was made…".
 218. **A file in a folder a clone shares is deleted only by the orphan sweep, once no table lists it**
    (`TableMeta::shares`, `tier::expire`, `collect_orphans`): never as one table's garbage, since the
    source's merges, the clone's merges and a `DROP` of either would take files the other reads. The
@@ -1912,7 +1933,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `describe`): `USE s | db | db.s`, `SET search_path` and `SET SCHEMA` set it, a session's alone
    (Flight SQL, MCP and `pondra sql` refuse it by name). A one-part name becomes the full name of
    the first place on the path that has it (the first place for a new one), and `current_database()`
-   and `current_schema()` their values, so the result cache, a spread query, the leader's writes, a
+   and `current_schema()` their values outside a view's body (invariant 286), so the result cache, a spread query, the leader's writes, a
    task's body, a view's stored SQL and history see full names and need no session. Stored SQL is
    read with `routines::expand_stored`, without the reader's path: a view made under `USE crm`
    reads crm whoever reads it, one made in public reads public under `USE crm`. CTEs, temporary
@@ -2028,13 +2049,117 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`logs/round34/nexmark-windows-by-key.json`). `harness.py refreshed`: "a burst's last row is answered within a
    few seconds…" (9.1 s without the early run); `harness.py pace`: "…beside eight views running their queries
    again…" fails with runs on the node's runtime.
+286. **A view's `current_schema()` is its reader's** (`path.rs`): `door` leaves `current_schema()`,
+   `current_database()` and `current_catalog()` in a `CREATE VIEW`'s or `ALTER VIEW … AS`'s query (not a
+   materialized or temporary view's: `Walk.view`), and `routines::expand_stored` puts in the reader's
+   session's values (`path::currents`; this lake's public with none), as Postgres reads a view. A query
+   read under a path of the session's own that reads such a view (`path::reads_current`, over the
+   views' stored text) runs on its node (`App::here_only`: the other nodes read it with no session)
+   and is never a remembered answer (`server::query`). The Postgres port no longer puts them in itself
+   (`pg_dialect`). `spark_sql('…')`'s text is Pondra's SQL before the path is written in
+   (`sparksql::inline` in `door`), and `SHOW COLUMNS FROM t` is placed. `harness.py use`: "a view's
+   current_schema() and current_database() are its reader's…", "a view made over Postgres keeps its
+   current_schema()…", "…a view's current_schema() asked to spread is crm's on every row", "…spark_sql('…')'s
+   text reads crm.t… SHOW COLUMNS…".
+287. **SQL's INSERT writes only into a table that is there** (`write::is_there`, `no_table`: 42P01, "no table
+   x"), as Postgres and DuckDB refuse it: in `on_node_listed`, looked at again once a follower holds what
+   its leader had (`seen_here`), and in `from_cli`. `CREATE TABLE … AS SELECT` defines its table first;
+   `POST /insert/{t}`, the bulk door, still makes one (`record`). A file, another engine's attached table
+   and a name this lake can't resolve go on to their own paths. `harness.py objects`: "an INSERT into a
+   name no table has is refused…"; `doors`: "an INSERT into no table, 42P01" at every door;
+   `history_check.py`: "an INSERT under a renamed table's old name is refused…".
+288. **An answer is counted until it is sent, and a big one goes in pieces** (`query::collect`,
+   `server::answer`, `stream`). A query's answer counts in the node's memory for queries as its
+   batches come, each buffer once (`RecordBatchMemoryCounter`: a page's batches share their
+   strings' buffers), and one that would pass it is refused (53200) instead of growing the node
+   past it. Over HTTP the count is held (`query::HELD`) until the body's last byte is sent. An
+   answer of `PONDRA_STREAM_MB` (8) or more as Arrow goes as JSON, CSV, TSV, NDJSON or Arrow in
+   pieces of about 1 MB, written on the queries' runtime a piece or two ahead of the client, never
+   rendered whole. Only a whole body is remembered (`Results`) or handed to the requests that
+   waited for the same query; those a streamed run covered run on their own. The Postgres port,
+   Flight and MCP let the count go when the answer is made. `harness.py answers_big`: every
+   format's pieces == the whole answer; an answer bigger than a 0.25 GB node's memory refused
+   (53200), the node answering after; 3M rows' peak at least half their JSON under rendering them
+   whole (442 MB against 715 when written).
+289. **A node runs at most `PONDRA_QUERIES` queries at once** (`server::TURNS`: four a core, 16 at
+   least), the rest in the order they asked, and one that waits `PONDRA_QUEUE_SECS` (60) is
+   refused (53300: a client asks again, or another node). A query run inside one this task runs (a
+   procedure's, a script's, a probe of DuckDB's spellings) uses its caller's turn (`TURN`), never
+   waiting for one its caller holds; the cluster's own calls (a spread query's shares and stages)
+   take none, or a coordinator holding every turn would wait for shares waiting for one.
+   `pondra_queries_running` and `pondra_queries_waiting` count them. `harness.py answers_big`:
+   two turns and four slow queries, two at once and the rest refused (53300) or answered after;
+   one turn does for a PIVOT, which asks the data first.
+337. **A file is loaded into a table once a version, and its record lands with its rows** (`copy.rs`,
+   `adopt::file`, `log::Filing::also`): `COPY INTO t FROM '…'` loads each file under the job
+   `load:{table, file, version}` (an e-tag, else size and time), so the bulk path's job mark keeps a
+   retry, a second statement and a failover to one load; the record `ld/{folder}/{sha256(file)}` is
+   written in the commit that records the file's rows, and the old version's job mark deleted there.
+   Records follow the table's folder through renames, drops and clones, and go 64 days after their load
+   (`PONDRA_LOAD_RETENTION_SECS`). `harness.py loads`.
+339. **Credentials a catalog vouches for reach its table's files and nothing else** (`catalogs.rs`): a
+   REST catalog's vended credentials, or an AWS catalog's secret, serve the table's location only while a
+   statement reads or writes that table (`catalogs::within`), through a store of its own
+   (`delegated://<id>/…`, `rehome`), never the bucket's store; a file another table's metadata names
+   outside that location needs a secret of its own (`ext::check_files`). An AWS catalog's tables are read
+   by whoever may use its secret. `harness.py catalogs`: "the vended key reads nothing else…", "…granted
+   USAGE on it, reads the rows".
+345. **`pondra.parts` and `pondra.find` show only what the caller may see** (`find::parts`, `find::found`):
+   parts come only from the objects `objects::list` gave the caller; a user granted some columns of a table
+   sees those columns and no other part of it, and that table's definition is not shown. Neither is a
+   remembered answer. `harness.py find`: "a user granted one table…", "a user granted some columns…",
+   "never a remembered answer…".
+370. **A term's lock file says at once, on its machine only, that its claimer's process ended**
+   (`cluster::new_lock`, `gone_here`, `relock`). A claim takes an OS lock (`File::try_lock`) on
+   `{id}.lock` in the user's own folder of the temporary folder (`pondra-terms-{uid}`, 0700, used
+   only while it is the user's alone), and names `id` in its term (`Term.lock`, 32 hex characters,
+   never a path). The OS lets go when the process ends, however it ends. A node or writer on that
+   machine that finds the latest term's lock free takes the term as over without waiting out its
+   mark (invariant 17's 30 s), unless the file says `restarting` from the last 30 s: a leader that
+   execs to rejoin (`restart`) says so first and takes the lock back (`relock`). Another machine, or
+   another user, finds no file, and the mark decides as before; a member that heard its leader keeps
+   the 5 s lease. `smoke.py`: "a node killed, the next writer on this machine writes at once (the OS
+   let go of its term)"; `harness.py serverless`: the INSERT after the leader's kill under 10 s, and
+   "a writer with another temporary folder still waits".
+
+371. **What 1.0 keeps is a file the build checks** (`docs/surface.json`, `tools/surface.py` in
+   `build.yml`'s suite; ADR-068). The command line, HTTP routes, SQL functions and system tables,
+   SQLSTATEs, kinds, metrics and the clients' names are read from the build. Until the freeze the
+   check reports. From `--write --promise` on, a name added fails until the file lists it, and a
+   name gone fails, unless it was deprecated and the release is a new major.
+
+372. **An open node answers no page from another site, and no name rebound to it**
+   (`auth::cross_site`, in `server::guard` and the folder server's `plain`). With no token and no
+   user, a request is refused when its `Sec-Fetch-Site` or `Origin` names another site. A GET
+   navigation is the one exception: it opens the console in the user's own tab. From this machine, a
+   `Host` that isn't an IP, `localhost`, the machine's name or `--advertise`'s is refused on every
+   request: a rebinding page's GETs carry no `Origin`. `harness.py guarded`.
+
+373. **The row doors and the nodes' own routes take only what their caller may write**
+   (`auth::check_rows`, `flush_from_writer`, `files_from_writer`):
+   - `/append` and `/insert` ask the INSERT grant, as SQL's INSERT does. A table made through
+     `/insert` is an admin's, and no caller writes a `$` table there.
+   - `/cluster/commit` and `/cluster/files` are the nodes' and write tokens', never a user's.
+   - A write token's flush is rows in a segment of the log, never into the lake's records
+     (`pondra$audit`, `history`, `runs`), and never moves a sequence or row ids. Its files go in
+     their table's folder.
+
+   `harness.py guarded`.
+
+374. **A change a follower sends its leader runs there as its user** (`write::post` names the user
+   in `x-pondra-as`; `server::guard` takes it from the nodes' own calls only), so what the change
+   reads is checked against the user's grants, as on the leader. `harness.py guarded`: "a change a
+   follower forwards runs as its user…".
 
 ## Tests: run these before and after any change
 
 ```bash
 cargo build --release
+cargo test --release --lib [filter]     # unit tests (the tests are the library's; --bin pondra runs none)
 python3 tools/harness.py all            # upsert, fence/split-brain, bulk insert, reader, crash, load
 python3 tools/gates.py [--prepare]      # the gates (sqllogictest, TPC-H SF1 vs DuckDB, vs Postgres, Nexmark): a row in logs/gates/README.md; exit 1 on a drop
+python3 tools/harness.py guarded        # open nodes and pages from other sites, the row doors and the nodes' routes by grant, a forwarded change as its user, .py files an admin's
+python3 tools/surface.py --bin target/release/pondra --check docs/surface.json   # what 1.0 keeps (ADR-068): reports until the freeze, then fails on a name added or gone
 python3 tools/harness.py safety         # panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
@@ -2056,6 +2181,8 @@ python3 tools/harness.py backpressure   # writes wait for tiering past --backlog
 python3 tools/harness.py memory         # 240 small commits a second, no reader: the node's threads stay few and its own memory doesn't run away
 python3 tools/harness.py pace           # a writer's acks beside 64 querying clients stay near its acks alone (queries on their own runtime)
 python3 tools/harness.py tails          # a table's log tail kept between queries: reads == a model while rows land, a transaction's snapshot, a column added, tiering
+python3 tools/harness.py answers_big    # big answers in pieces in every format == whole, an answer past the node's memory refused (53200), query turns (53300)
+python3 tools/harness.py loads          # COPY INTO: each file once a version, through retries, two nodes, a kill; pondra.loads; renames, clones
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
 python3 tools/harness.py plans          # EXPLAIN's expected rows, history's fingerprint, plan_id, version, reads, writes, misestimate; what a run learned and pondra.learned
@@ -2068,6 +2195,7 @@ python3 tools/harness.py sequences      # nextval on three nodes (every value on
 python3 tools/harness.py enums          # CREATE TYPE … AS ENUM and ENUM('a', 'b') columns: labels from every door (22P02), casts, enum_range, ADD VALUE, RENAME, DROP while used
 python3 tools/harness.py constraints    # UNIQUE from every door and three nodes at once (23505), NOT ENFORCED facts, ADD/DROP CONSTRAINT, SHOW CREATE, the Postgres catalog
 python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
+python3 tools/harness.py find           # pondra.parts and pondra.find at every door (HTTP, Postgres, MCP, Python, JavaScript), as each user may see them; 1,000 tables and 200 views
 python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
@@ -2114,6 +2242,7 @@ python3 tools/harness.py writes                # PyIceberg (and Pondra) append t
 python3 tools/harness.py live                  # live queries: an answer per change of its tables, none for others, gone when closed; JavaScript
 python3 tools/harness.py temps                 # TEMP tables and views on 3 nodes: every statement, sessions (HTTP, Postgres, procedures), spread, idle end
 python3 tools/harness.py across                # UPDATE/DELETE/MERGE on an attached lake from a follower of another: sent rows, a file, a temp table, no leader
+python3 tools/harness.py catalogs              # AWS Glue, S3 Tables and REST catalogs that vend credentials: rows == PyIceberg's, the vended key reads nothing else, refusals, USAGE
 python3 tools/harness.py outside               # files on S3 and HTTP (moto): globs, CSV, JSON, Hive folders, spread, COPY … TO (spread too), secrets, who may read
 python3 tools/harness.py clouds                # GCS (sim_gcs.py) and Azure (Azurite) lakes and files: failover, COPY, a file changed beside a lake
 python3 tools/harness.py kafkas                # Apache Kafka 4 (~/kafka_2.13-*) and a Pondra node's port: topics as tables, COPY to a topic, feeds through kills, SASL
@@ -2125,9 +2254,11 @@ python3 tools/frames_check.py                  # pondra.frame == Polars (26 pipe
 ~/venv-spark/bin/python tools/spark_check.py   # pondra.spark == PySpark 4.0.1 (55 pipelines, files and UDFs among them: values and column names)
 python3 tools/bench/tpch_frames.py --data ~/tpch/sf1-bench   # TPC-H: SQL == frames == PySpark code, 22 of 22
 python3 tools/bench/nexmark.py [--events 4000000] [--alone] # Nexmark's 20 queries: Pondra (== DuckDB) and Flink 2.3 (venv-flink)
+python3 tools/bench/fluss_bench.py --fluss ~/fluss-1.0.0  # Fluss 1.0 side by side: start, memory, appends, acks, freshness, scans, upserts, lookups (pip install pyfluss==1.0.0)
 python3 tools/smoke.py target/release/pondra   # what CI runs on Windows, macOS and Linux (stdlib only)
 python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # shell, local(), kill -9, wheel, npm, notebook; glibc 2.17 + Ubuntu 22.04
 python3 tools/bench/repeat.py --data ~/tpch/sf1-bench --query 15 --runs 20 [--hot]   # one query many times vs DuckDB
+python3 tools/bench/ab_compare.py --a OLD_BIN --b NEW_BIN --data ~/tpch/sf1   # two builds side by side on TPC-H, queries alternating, both load orders: B/A wall and CPU, answers equal
 python3 tools/bench/outside_append.py            # what another engine's append costs the node (ADR-028's copy; ADR-029's before/after)
 python3 tools/asof_check.py                    # ASOF JOIN == DuckDB's: 4 directions and more, one node and 3, 4 ways of planning
 python3 tools/stream_check.py                  # one stream, window + session + as-of views: every click once; clicks/s; emission delay
@@ -2684,16 +2815,19 @@ Known limits, in the order they matter:
     tables it would have made, Spark's function library, EXPLAIN's text (Pondra plans its own
     way), number literals typed DECIMAL (as Postgres and DuckDB do), strings read as `Utf8View`.
 
-Good next moves: `docs/roadmap.md` (2026-10-03) is the shortest path to 1.0, at the owner's bar
-("high quality, stable, workable, fully featured"): round 33 closes with the soak and environments;
-34 is SQL as people write it and scale on machines; 35 in-process and in the browser; 36 fitting
-in (databases attached, BI tools, measures in views); 37 is 1.0 (the promises, a security review,
-signed packages, the docs).
+Good next moves: `docs/roadmap.md` (2026-10-11) is one month to 1.0 (11-11), at the owner's bar
+("high quality, stable, workable, fully featured"): nine lanes side by side, each a thread that owns
+its files (engine and proof; in-process and the browser; the Postgres port; sources and outside
+catalogs; measures, the ontology and AI; SQL; durability and shipping; the console; the docs), a
+feature freeze on 10-31, a review week, then a release candidate under the soak. Edit only your
+lane's files (the project's `designs/one-month-to-1-0.md` lists them and each lane's numbers).
 
 ## Conventions
 
 - Comments explain *why*, in plain English; the code shows *what*. Keep functions small.
 - No new dependencies without a real reason; no new always-on services, ever.
+- A new module is one line in `lib.rs`: `#[cfg(feature = "server")] mod x;`, or `pub mod x;` in the
+  first block when it needs no lake and builds for WebAssembly. A new subcommand goes in `cli.rs`.
 - Every new invariant gets a test in `tools/` that would fail without it.
 - Docs live in `docs/`; a design change means a new ADR, not an edit to an old one.
 - Backward compatibility is promised from the production-ready release (1.0) on (ADR-032 §8): the

@@ -195,10 +195,13 @@ is in [A table's past](/pondra/guides/past/).
 ```sql
 CREATE TABLE prices (item VARCHAR, price DOUBLE);
 INSERT INTO prices VALUES ('tea', 3.5), ('cake', 4.0);
+DECLARE $before TIMESTAMP = now();
 UPDATE prices SET price = 3.8 WHERE item = 'tea';
-SELECT item, price FROM prices AT (OFFSET => -3600);
+SELECT item, price, _version FROM prices ORDER BY item;
+SELECT item, price FROM prices AT (TIMESTAMP => $before);
+SELECT n.item, w.price AS was, n.price AS now FROM prices n JOIN prices AT (TIMESTAMP => $before) w ON n.item = w.item;
 CREATE TABLE prices_test CLONE prices;
-RESTORE TABLE prices TO TIMESTAMP AS OF '2026-10-02 12:00:00';
+RESTORE TABLE prices TO TIMESTAMP AS OF $before;
 ```
 
 ## Tables

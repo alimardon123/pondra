@@ -133,6 +133,9 @@ pub fn pays(sql: &str, link: Link, moved: u64, steps: usize, bytes: u64, n: usiz
     let learned = std::env::var_os("PONDRA_LINK").is_none(); // (a network pretended: the model alone)
     if let (Some(here), (Some(spread), runs), true) = (known, spread_runs(sql), learned) {
         if spread < here || runs >= 2 {
+            if std::env::var_os("PONDRA_DEBUG_SPREAD").is_some() {
+                eprintln!("spread: ran both ways, here {here:.3}s, spread {spread:.3}s ({runs} runs)");
+            }
             return spread < here; // (it ran both ways: no need to guess)
         }
     }

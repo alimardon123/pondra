@@ -137,7 +137,7 @@ def main():
     print(json.dumps({"network": net}, indent=1), flush=True)
     t0 = time.time()
     for t in TABLES:
-        subprocess.run([A.bin, "sql", "--dir", A.lake, f"INSERT INTO {t} SELECT * FROM '{os.path.join(A.data, t)}.parquet'"], check=True)
+        subprocess.run([A.bin, "sql", "--dir", A.lake, f"CREATE TABLE {t} AS SELECT * FROM '{os.path.join(A.data, t)}.parquet'"], check=True)
     load_s = round(time.time() - t0, 1)
     settle_s = settle(nodes)
     results = {}

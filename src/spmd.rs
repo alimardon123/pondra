@@ -328,9 +328,9 @@ async fn finish(ctx: &SessionContext, plan: &Arc<dyn ExecutionPlan>, cut: Option
         false => vec![crate::spill::chain(parts, schema.clone())],
     };
     let input = Arc::new(StreamingTableExec::try_new(schema, parts, None, [], false, None)?) as Arc<dyn ExecutionPlan>;
-    let Some(cut) = cut else { return Ok(datafusion::physical_plan::collect(input, ctx.task_ctx()).await?) };
+    let Some(cut) = cut else { return Ok(crate::query::collect(input, ctx.task_ctx()).await?) };
     let plan = plan.clone().transform_down(|p| Ok(if Arc::ptr_eq(&p, cut) { Transformed::yes(replace_children_if_necessary(p, vec![input.clone()])?) } else { Transformed::no(p) }))?.data;
-    Ok(datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?)
+    Ok(crate::query::collect(plan, ctx.task_ctx()).await?)
 }
 
 /// The tables of this lake a query reads that aren't sliced, as this node sees them now.

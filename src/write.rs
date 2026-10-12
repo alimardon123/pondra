@@ -135,7 +135,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 i.sequence = crate::seq::owned(lake, name, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
                 defaults.insert(c.clone(), format!("nextval('{}')", i.sequence.replace('\'', "''")));
             }
-            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, folder, tiered: lake.visible(), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
+            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, folder, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
         }
         Some(mut m) => {
             defaulted = false;
@@ -961,18 +961,18 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
     match stmt {
         Stmt::Insert(_, query) => Ok(query.clone()),
         Stmt::Update(t, set, cond) => {
-            ensure!(meta.merge.is_empty(), "merge tables combine rows per key: INSERT into them instead");
+            if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", "merge tables combine rows per key: INSERT into them instead of UPDATE")); }
             ensure!(set.iter().all(|(c, _)| !meta.key.contains(c) && meta.columns.iter().any(|(n, _)| n == c)), "UPDATE sets existing non-key columns");
             crate::seq::check_set(meta, &set.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
             let pick = |c: &str| match set.iter().find(|(s, _)| s == c) {
                 Some((_, e)) => format!("({e})"),
-                None if c == "_deleted" => "false".into(),
-                None => q(c),
+                None => q(c), // (`_deleted` too: an updated row keeps its own, as `change::select_as` does)
             };
             Ok(select(&pick, t, cond))
         }
         Stmt::Delete(t, cond) => {
-            ensure!(meta.merge.is_empty() && deletes, "DELETE needs an upsert table with a Boolean _deleted column");
+            if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", "merge tables combine rows per key: INSERT into them instead of DELETE")); }
+            ensure!(deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
         Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) => unreachable!("not a row write here"),
@@ -1215,14 +1215,15 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     if lake.cat.get::<u64>(&producer_key(&format!("job:{}", f.job))).await?.is_some() {
         return Ok(j!({"duplicate": true})); // the same job finished concurrently
     }
-    let new = TableMeta { columns: f.columns.clone(), publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() }; // (a table `POST /insert/{t}` makes starts at the log's end, as CREATE TABLE's does; SQL's INSERT needs one already: `is_there`)
+    let new = TableMeta { columns: f.columns.clone(), publish: default_publish(), ids: true, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), ..Default::default() }; // (a table `POST /insert/{t}` makes starts at the log's end, as CREATE TABLE's does; SQL's INSERT needs one already: `is_there`)
     let meta = lake.cat.get::<TableMeta>(&table_key(&f.table)).await?.unwrap_or_else(|| new.clone());
     // Types as the lake stores them, so a writer may name them its own way (`Utf8View`, `VARIANT`).
     let types = |c: &[(String, String)]| c.iter().map(|(_, t)| crate::query::dtype(t).map(|t| crate::query::type_name(&t)).unwrap_or_else(|_| t.clone())).collect::<Vec<_>>();
     ensure!(meta.key.is_empty(), "INSERT into a keyed table goes through the log");
     ensure!(!f.files.iter().any(|d| d.sys) || !follows(lake, &f.table).await?, "{AGAIN}: a materialized view or task of {} was made as it was written", f.table);
     let live: Vec<(String, String)> = meta.live().map(|(s, _, t)| (s.to_string(), t.to_string())).collect(); // (dropped columns aren't written)
-    ensure!(types(&live) == types(&f.columns), "query columns {:?} don't match table {}", f.columns, f.table);
+    let listed = |c: &[(String, String)]| c.iter().map(|(n, t)| format!("{} {}", meta.name_of(n), crate::objects::sql_type(t))).collect::<Vec<_>>().join(", ");
+    ensure!(types(&live) == types(&f.columns), "the rows' columns ({}) aren't {}'s ({}), in order and type; if the table changed while they were written, write them again", listed(&f.columns), f.table, listed(&live));
     let rows: u64 = f.files.iter().map(|f| f.rows).sum();
     let commit = crate::adopt::FileCommit { table: f.table.clone(), job: f.job.clone(), added: f.files, new: Some(new), ..Default::default() };
     Ok(match crate::adopt::file(lake, seq, &[commit]).await? {
@@ -1877,7 +1878,7 @@ pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>
 /// ENDPOINT, with the pondra secret's token or the branch's own key.
 async fn across(dir: &str, r: &crate::store::Reach, req: Option<Option<Request>>) -> Result<Value> {
     let Some(Some(req @ Request::Ddl(crate::ddl::Ddl::Pin { .. } | crate::ddl::Ddl::Unpin { .. }))) = req else {
-        bail!("{dir} is read with a read-only key here: it is written on its own server (ADR-058)");
+        bail!("{dir} is attached here read-only, with a key that only reads it: write it through its own server");
     };
     // (never sent without one: this server's own key, or its user's token, must not go to another
     // server; only a branch's own `pb_` key is meant for its base's leader)
