@@ -417,6 +417,9 @@ pub async fn prime(lake: &Lake, tables: &[(String, TableMeta)]) -> Result<()> {
         for u in m.ext.as_ref().map(|s| s.urls.clone()).unwrap_or_default() {
             OWNER.scope(true, register(lake, &u)).await?;
         }
+        if let Some(s) = m.ext.as_ref().filter(|s| s.format == "iceberg" && s.options.contains_key("namespace")) {
+            OWNER.scope(true, crate::catalogs::prime(lake, s, m)).await?;
+        }
         keep(t, m);
     }
     Ok(())
@@ -429,6 +432,11 @@ pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
     if owner() || spec.urls.iter().all(|u| own_file(lake, u)) {
         return Ok(()); // (the lake's own files: whoever reads the lake reads them, as GET /files/… does)
     }
+    if let (Some(name), [url]) = (spec.options.get("catalog"), &spec.urls[..]) {
+        if crate::catalogs::signed(lake, name, url).await? {
+            return Ok(()); // (an AWS catalog: whoever may use its attachment's secret)
+        }
+    }
     let secrets = list(lake).await?;
     spec.urls.iter().try_for_each(|u| allowed(&secrets, u))
 }
@@ -437,6 +445,15 @@ pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
 fn own_file(lake: &Lake, u: &str) -> bool {
     let area = format!("{}/files/", lake.url.trim_end_matches('/'));
     u.starts_with(&area) && !u[area.len()..].split('/').any(|p| p == ".." || p == ".")
+}
+
+/// May the caller read `url`, a file a catalog named (a REST table's metadata), as `check` asks of a
+/// spec's own URLs? A catalog that vouches for its files' credentials is asked nothing here.
+pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
+    if owner() || own_file(lake, url) {
+        return Ok(());
+    }
+    allowed(&list(lake).await?, url)
 }
 
 fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
@@ -448,8 +465,9 @@ fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
 }
 
 /// Another engine's table names its files wherever it likes (Iceberg's by their whole URL):
-/// each must be one this caller may read, as the table is.
-async fn check_files(lake: &Lake, m: &TableMeta) -> Result<()> {
+/// each must be one this caller may read, as the table is. A folder under `vouched` (a catalog's
+/// table's location, whose credentials its catalog vouched for) needs no secret.
+async fn check_files(lake: &Lake, m: &TableMeta, vouched: Option<&str>) -> Result<()> {
     if owner() {
         return Ok(());
     }
@@ -460,7 +478,9 @@ async fn check_files(lake: &Lake, m: &TableMeta) -> Result<()> {
             crate::scan::Delete::Inline { .. } => None,
         });
         std::iter::once(f.path.as_str()).chain(deletes)
-    }).map(|p| &p[..p.rfind('/').unwrap_or(p.len())]).collect();
+    }).map(|p| &p[..p.rfind('/').unwrap_or(p.len())])
+    .filter(|d| !vouched.is_some_and(|v| format!("{}/", d.replacen("s3a://", "s3://", 1)).starts_with(v))) // (`v` ends in `/`: a folder beside the location isn't in it)
+    .collect();
     folders.sort_unstable();
     folders.dedup();
     folders.into_iter().try_for_each(|d| allowed(&secrets, &format!("{d}/")))
@@ -485,11 +505,14 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
         "kafka" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::kafka_client::resolve(lake, &spec.urls[0]).await? }),
         "share" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::sharing::read(lake, spec).await? }), // (its files' links are the provider's: ADR-046)
         "delta" | "iceberg" => {
-            let m = match spec.format.as_str() {
-                "delta" => crate::read_delta::resolve(lake, &spec.urls[0], version("version")?).await?,
+            let (mut m, d) = match spec.format.as_str() {
+                "delta" => (crate::read_delta::resolve(lake, &spec.urls[0], version("version")?).await?, None),
                 _ => crate::read_iceberg::resolve(lake, &spec.urls[0], &spec.options).await?,
             };
-            check_files(lake, &m).await?;
+            check_files(lake, &m, d.as_ref().map(|d| d.prefix.as_str())).await?;
+            if let Some(d) = &d {
+                crate::catalogs::rehome(d, &mut m); // (its files are read through the table's own delegated store)
+            }
             return Ok(TableMeta { ext: Some(spec.clone()), ..m });
         }
         _ => {}
@@ -813,6 +836,7 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
 
 /// The store `url` is read through (made as `register` makes it), and its path there.
 pub async fn store(lake: &Lake, url: &str) -> Result<(Arc<dyn object_store_df::ObjectStore>, object_store_df::path::Path)> {
+    if let Some(found) = crate::catalogs::scoped(url) { return Ok(found); } // (a catalog's table's location, while it is read or written: its delegated store)
     register(lake, url).await?;
     let u = ListingTableUrl::parse(url)?;
     Ok((lake.rt.object_store(&u)?, u.prefix().clone()))
@@ -946,7 +970,7 @@ pub fn attached_table(all: &[(String, Attached)], parts: &[String]) -> Result<Op
         let options = BTreeMap::from([("share".to_string(), a.options.get("share").cloned().unwrap_or_default()), ("schema".to_string(), schema.to_string()), ("table".to_string(), t.clone())]);
         return Ok(Some(name(&Spec { urls: vec![a.url.clone()], format: "share".into(), options })));
     }
-    let endpoint = a.options.get("endpoint").cloned().or_else(|| a.url.starts_with("http").then(|| a.url.clone()));
+    let endpoint = crate::catalogs::endpoint(a);
     let spec = match endpoint {
         Some(endpoint) => {
             let (ns, t) = match rest {
@@ -958,6 +982,7 @@ pub fn attached_table(all: &[(String, Attached)], parts: &[String]) -> Result<Op
             if a.options.contains_key("endpoint") {
                 options.insert("warehouse".into(), a.url.clone());
             }
+            options.insert("catalog".into(), parts[0].clone()); // (the attachment's name: its settings, `catalogs::open`)
             Spec { urls: vec![endpoint.trim_end_matches('/').to_string()], format: "iceberg".into(), options }
         }
         None => Spec { urls: vec![std::iter::once(a.url.trim_end_matches('/')).chain(rest.iter().map(String::as_str)).collect::<Vec<_>>().join("/")], format: a.kind.clone(), options: BTreeMap::new() },
@@ -983,14 +1008,33 @@ pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTr
     if kind == "share" {
         options = crate::sharing::accept(lake, name, url, options).await?; // (its token kept as a secret)
     }
-    let known: &[&str] = if kind == "share" { &["share"] } else { &["endpoint", "secret", "read_only"] };
+    let iceberg_only = ["endpoint_type", "access_delegation_mode"];
+    ensure!(kind == "iceberg" || !options.keys().any(|k| iceberg_only.contains(&k.as_str())), "ENDPOINT_TYPE and ACCESS_DELEGATION_MODE are an Iceberg REST catalog's");
+    let known: &[&str] = match kind {
+        "share" => &["share"],
+        "iceberg" => &["endpoint", "secret", "read_only", "endpoint_type", "access_delegation_mode"],
+        _ => &["endpoint", "secret", "read_only"],
+    };
     if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
         bail!("ATTACH … (TYPE {kind}) has no option {k}: {}", known.join(", "));
     }
     ensure!(kind == "iceberg" || !options.contains_key("endpoint"), "ENDPOINT is an Iceberg REST catalog's");
+    if let Some(m) = options.get("access_delegation_mode") {
+        ensure!(m == "vended_credentials" || m == "none", "ACCESS_DELEGATION_MODE is vended_credentials or none, not {m}");
+    }
+    // An AWS catalog (Glue, S3 Tables) is signed with a TYPE s3 secret's keys, and its endpoint is AWS's
+    // for its region unless one is given (which also checks the type).
+    if let Some(t) = options.get("endpoint_type").cloned() {
+        crate::catalogs::service(&t)?; // (one it doesn't know: refused by name, before its secret is asked for)
+        let secret = options.get("secret").cloned().with_context(|| format!("ATTACH … (TYPE iceberg, ENDPOINT_TYPE {t}) needs SECRET name: a TYPE s3 secret with the AWS keys"))?;
+        let keys = crate::catalogs::aws_keys(lake, &secret).await?;
+        let at = crate::catalogs::aws_endpoint(&t, &crate::catalogs::region(url, &keys)?)?;
+        options.entry("endpoint".to_string()).or_insert(at);
+    }
     ensure!(!lake.attached.read().unwrap().iter().any(|(n, _)| n == name) && name != crate::ddl::lake_name(lake), "{name} is a lake's name here: attach under another name");
     // A REST catalog is reached with the secret whose scope covers it (never one named anywhere else).
-    if let Some(secret) = options.get("secret") {
+    // An AWS catalog's secret covers its buckets, not its endpoint, so it isn't checked against it.
+    if let Some(secret) = options.get("secret").filter(|_| !options.contains_key("endpoint_type")) {
         let at = options.get("endpoint").unwrap_or(&url.to_string()).clone();
         let found = list(lake).await?.into_iter().find(|(n, _)| n == secret).with_context(|| format!("no secret {secret}"))?;
         ensure!(covering(&[found.clone()], &at).is_some(), "secret {secret}'s SCOPE doesn't cover {at} (CREATE OR REPLACE SECRET {secret} (…, SCOPE '{at}'))");
@@ -1531,6 +1575,9 @@ pub async fn reveal(lake: &Lake, name: &str) -> Result<BTreeMap<String, String>>
     values.entry("type".into()).or_insert(s.kind.clone());
     Ok(values)
 }
+
+/// A secret's values, for the catalog that was attached with it (`catalogs.rs`).
+pub(crate) fn reveal_secret(name: &str, s: &Secret) -> Result<BTreeMap<String, String>> { open(name, s) }
 
 /// A secret's values: its data key unwrapped by the master key, then its values opened with it.
 fn open(name: &str, s: &Secret) -> Result<BTreeMap<String, String>> {

@@ -4,6 +4,7 @@ description: UPDATE, DELETE, MERGE and INSERT … ON CONFLICT on any table, a ro
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
 
 Every table takes `UPDATE`, `DELETE` and `MERGE`, not only keyed ones. Nothing is rewritten when a row
 changes: the new version is written like any new row, and the old one is hidden from every read.
@@ -109,7 +110,11 @@ too, use `DROP TABLE`.
 ```sql
 CREATE TABLE scratch (a BIGINT);
 INSERT INTO scratch VALUES (1), (2);
-TRUNCATE scratch;
+```
+
+<Ways sql={`TRUNCATE scratch;`} />
+
+```sql
 SELECT count(*) AS n FROM scratch;
 ```
 
@@ -131,12 +136,13 @@ INSERT INTO stock VALUES ('tea', 10, ''), ('cake', 5, ''), ('pie', 2, ''), ('jam
 CREATE TABLE deliveries (sku VARCHAR, qty INT);
 INSERT INTO deliveries VALUES ('tea', 5), ('cake', -5), ('pie', 20), ('milk', 12);
 
-MERGE INTO stock t USING deliveries s ON t.sku = s.sku
+```
+
+<Ways sql={`MERGE INTO stock t USING deliveries s ON t.sku = s.sku
   WHEN MATCHED AND t.qty + s.qty <= 0 THEN DELETE
   WHEN MATCHED THEN UPDATE SET qty = t.qty + s.qty
   WHEN NOT MATCHED THEN INSERT (sku, qty, note) VALUES (s.sku, s.qty, 'new')
-  WHEN NOT MATCHED BY SOURCE AND t.qty < 10 THEN UPDATE SET note = 'no delivery';
-```
+  WHEN NOT MATCHED BY SOURCE AND t.qty < 10 THEN UPDATE SET note = 'no delivery';`} />
 
 `MERGE` answers with how many rows it updated, deleted and inserted:
 
