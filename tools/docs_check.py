@@ -3,7 +3,8 @@
 against a fresh node, so the docs can't fall behind the code.
 
   python3 tools/docs_check.py                      # every page under site/src/content/docs
-  python3 tools/docs_check.py site/src/content/docs/guides/streaming.mdx
+  python3 tools/docs_check.py site/src/content/docs/guides/views.mdx
+  python3 tools/docs_check.py --links              # every link between pages lands on a page and a heading
   python3 tools/docs_check.py --write-glossary     # docs/glossary.md and the site's glossary, written from GET /kinds
 
 A page gets its own lake and a node on the ports the docs use: HTTP 8080, Postgres 5432, Kafka
@@ -18,8 +19,10 @@ the page's session (a page's cells share their variables, as a console's do).
 A block whose info string says `norun` is shown but not run: things that can't run here (a real
 cluster, Windows, credentials, a command that serves until stopped). Other languages (text,
 json, toml, yaml, …) are never run.
+A `<Ways sql={`…`} />` component is one more `sql` block: its SQL runs as one statement. Its five
+ways (site/src/ways.json) are checked once a run, by ways_check.
 """
-import argparse, json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request
+import argparse, json, os, re, shutil, socket, subprocess, sys, tempfile, textwrap, threading, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -47,14 +50,25 @@ for line in sys.stdin:
 """
 
 
+WAYS_ELEMENT = re.compile(r"<Ways\b([^>]*?)\bsql=\{`(.*?)`\}", re.S)
+
+
+def ways_sql(raw):
+    """The SQL in a `<Ways sql={`…`} />` as it reads. Text that starts on the backtick's line has no
+    indentation there, so only the lines after it are dedented."""
+    first, _, rest = raw.partition("\n")
+    return "\n".join([first.strip(), textwrap.dedent(rest)]).strip()
+
+
 def blocks(text):
-    """The page's frontmatter (a dict) and its fenced code blocks: (language, info, code, line)."""
+    """The page's frontmatter (a dict) and its code blocks, fenced and `<Ways>`: (language, info, code, line),
+    in page order."""
     front = {}
     if text.startswith("---\n"):
         end = text.index("\n---", 4)
         import yaml
         front = yaml.safe_load(text[4:end]) or {}
-    out, lines, i = [], text.split("\n"), 0
+    out, lines, i, fenced = [], text.split("\n"), 0, set()
     while i < len(lines):
         m = FENCE.match(lines[i])
         if not m:
@@ -66,8 +80,14 @@ def blocks(text):
             body.append(lines[j][len(indent):] if lines[j].startswith(indent) else lines[j].lstrip())
             j += 1
         out.append((lang.lower(), info, "\n".join(body), i + 1))
+        fenced.update(range(i, j + 1))  # (code shown in a fence is text, not a component)
         i = j + 1
-    return front, out
+    # The components are looked for outside the fences, with their lines kept, so a line number is the page's.
+    outside = "\n".join("" if n in fenced else line for n, line in enumerate(lines))
+    for m in WAYS_ELEMENT.finditer(outside):
+        info = "norun" if re.search(r"\bnorun\b", m.group(1)) else ""
+        out.append(("sql", info, ways_sql(m.group(2)), outside.count("\n", 0, m.start()) + 1))
+    return front, sorted(out, key=lambda b: b[3])
 
 
 def free(port):
@@ -207,6 +227,43 @@ def logs(work):
     """The ends of the logs a page's examples wrote (its own nodes'), to see why one failed."""
     found = sorted(os.path.join(d, f) for d, _, fs in os.walk(work) for f in fs if f.endswith(".log") and f != "node.log")
     return "".join(f"\n--- {os.path.relpath(p, work)}:\n" + open(p, errors="replace").read()[-1200:] for p in found)[-6000:]
+
+
+WAYS_JSON = os.path.join(ROOT, "site", "src", "ways.json")
+WAYS_PREFIX = {  # (what a Python or JavaScript way needs first: its own connection)
+    "python": 'import pondra\ndb = pondra.connect("http://localhost:8080")\n',
+    "js": 'import { connect } from "pondra";\nconst db = connect("http://localhost:8080");\n',
+}
+
+
+def ways_check(verbose):
+    """Every way in site/src/ways.json runs its query and its statement on a fresh node. The Ways component
+    shows these templates, so a way that breaks breaks every page that shows one. The filled templates go
+    into a page of their own, which check_page runs with the same runners (and the same node) as any page."""
+    spec = json.load(open(WAYS_JSON, encoding="utf-8"))
+    lines, spots = [], {}  # (the page's lines; each fence's first line -> the way and its kind)
+    for way in spec["ways"]:
+        samples = [("query", way["query"], "SELECT 1 AS one"),
+                   ("statement", way["statement"], f"CREATE TABLE ways_check_{way['label'].lower()} (id BIGINT)")]
+        for kind, template, sample in samples:
+            code = WAYS_PREFIX.get(way["lang"], "") + template.replace("{sql}", sample)  # (check_page moves the ports)
+            spots[len(lines) + 1] = (way["label"], kind)
+            lines += [f"```{way['lang']}", *code.split("\n"), "```", ""]
+    folder = tempfile.mkdtemp(prefix="pondra-ways-")
+    try:
+        path = os.path.join(folder, "ways.md")
+        open(path, "w", encoding="utf-8").write("\n".join(lines))
+        r = check_page(path, verbose)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    if r["ok"]:
+        return {"page": WAYS_JSON, "ran": r.get("ran", 0), "ok": True}
+    if "failed" in r:
+        label, kind = spots[int(r["failed"].rsplit(":", 1)[1])]
+        error = f"the {label} way's {kind} ({r['lang']}): {r['error']}"
+    else:
+        error = r.get("error", "")
+    return {"page": WAYS_JSON, "ran": r.get("ran", 0), "ok": False, "error": error}
 
 
 GLOSSARY_MD = os.path.join(ROOT, "docs", "glossary.md")
@@ -354,6 +411,58 @@ def coverage():
     return [{"page": os.path.join(DOCS, p), "ran": 0, "ok": not missing, **({} if not missing else {"error": "doesn't name: " + ", ".join(missing)})} for p, missing in checks.items()]
 
 
+def slug(heading):
+    """A heading's anchor as Starlight makes it (github-slugger): lower case, punctuation gone, spaces as -."""
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", heading).strip().lower()
+    return re.sub(r"[^\w\- ]", "", text).replace(" ", "-")
+
+
+def anchors(path):
+    """Every anchor a page has: its headings' slugs (a repeated one numbered, as github-slugger does)."""
+    seen, out, fenced = {}, set(), False
+    for line in open(path, encoding="utf-8").read().split("\n"):
+        if FENCE.match(line):
+            fenced = not fenced
+        elif not fenced and (m := re.match(r"^#{1,6}\s+(.*?)\s*#*\s*$", line)):
+            base = slug(m.group(1))
+            n = seen.get(base, 0)
+            seen[base] = n + 1
+            out.add(base if n == 0 else f"{base}-{n}")
+    return out
+
+
+def links():
+    """Each page as a report: ok when every link to another page of the site lands on a page (or a
+    redirect) and, when it names one, a heading there. A page moved or a section renamed fails here."""
+    config = open(os.path.join(ROOT, "site", "astro.config.mjs"), encoding="utf-8").read()
+    redirects = set(re.findall(r"^\s*'(/[^']+)':\s*'/pondra/", config, re.M))
+    found, out = {}, []
+    def target(page):
+        if page not in found:
+            hit = [os.path.join(DOCS, page + ext) for ext in (".mdx", ".md", "/index.mdx", "/index.md")]
+            found[page] = next((h for h in hit if os.path.exists(h)), None)
+        return found[page]
+    for d, _, fs in os.walk(DOCS):
+        for f in sorted(fs):
+            if not f.endswith((".md", ".mdx")):
+                continue
+            path, bad = os.path.join(d, f), []
+            text = open(path, encoding="utf-8").read()
+            for link in re.findall(r"""(?:\]\(|href=["'])/pondra/([^)"'\s]*)""", text):
+                page, _, anchor = link.partition("#")
+                page = page.strip("/")
+                if not page or page.startswith(("assets", "_astro")) or "." in page.split("/")[-1]:
+                    continue
+                to = target(page)
+                if to is None:
+                    if "/" + page not in redirects:
+                        bad.append(f"/pondra/{link} (no such page)")
+                elif anchor and anchor not in anchors(to):
+                    bad.append(f"/pondra/{link} (no such heading)")
+            out.append({"page": path, "ran": 0, "ok": not bad, **({"error": "\n".join(sorted(set(bad)))} if bad else {})})
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="*", help="pages or folders to check (default: every page of the site, and the glossary)")
@@ -361,6 +470,7 @@ def main():
     ap.add_argument("--offset", type=int, default=0, help="move every port by this much (and the examples' too), to run beside another check")
     ap.add_argument("--write-glossary", action="store_true", help="write docs/glossary.md and the site's glossary from GET /kinds, and stop")
     ap.add_argument("--coverage", action="store_true", help="only check that the references name everything (also run with every page)")
+    ap.add_argument("--links", action="store_true", help="only check that every link between pages lands on a page and a heading (also run with every page)")
     a = ap.parse_args()
     for name in PORTS:
         PORTS[name] = DOC_PORTS[name] + a.offset
@@ -371,7 +481,7 @@ def main():
             open(path, "w", encoding="utf-8").write(text)
             print(f"wrote {os.path.relpath(path, ROOT)}", flush=True)
         sys.exit(0)
-    everything = not a.paths and not a.coverage
+    everything = not a.paths and not a.coverage and not a.links
     if everything:
         a.paths = [os.path.join(ROOT, "site", "src", "content", "docs")]
     pages = []
@@ -388,6 +498,12 @@ def main():
         print(f"{mark} {os.path.relpath(page, ROOT)} ({r.get('ran', 0)} examples)", flush=True)
         if not r["ok"]:
             print(f"     at {r.get('failed', '?')} ({r.get('lang', '')}):\n{r.get('error', '')}\n", flush=True)
+    if everything or any("<Ways" in open(p, encoding="utf-8").read() for p in pages):
+        r = ways_check(a.verbose)
+        results.append(r)
+        print(f"{'ok  ' if r['ok'] else 'FAIL'} {os.path.relpath(WAYS_JSON, ROOT)} (every way runs)", flush=True)
+        if not r["ok"]:
+            print(f"     {r['error']}\n", flush=True)
     if everything or any(os.path.abspath(p) in GLOSSARY_FILES for p in a.paths):
         for r in glossary_checks():
             results.append(r)
@@ -400,6 +516,11 @@ def main():
             print(f"{'ok  ' if r['ok'] else 'FAIL'} {os.path.relpath(r['page'], ROOT)} (names everything its door has)", flush=True)
             if not r["ok"]:
                 print(f"     {r['error']}\n", flush=True)
+    if everything or a.links:
+        for r in links():
+            results.append(r)
+            if not r["ok"]:
+                print(f"FAIL {os.path.relpath(r['page'], ROOT)} (links)\n     {r['error']}\n", flush=True)
     bad = [r for r in results if not r["ok"]]
     print(json.dumps({"pages": len(results), "examples": sum(r.get("ran", 0) for r in results), "failed": [os.path.relpath(r["page"], ROOT) for r in bad], "ok": not bad}))
     sys.exit(1 if bad else 0)

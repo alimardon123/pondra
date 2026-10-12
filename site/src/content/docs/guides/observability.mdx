@@ -1,0 +1,193 @@
+---
+title: Observability
+description: Every statement in pondra.history, the plans of slow ones, the nodes' state at GET /stats, and counters for Prometheus at GET /metrics.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
+
+A lake keeps a record of what it does in three places. Every statement is a row of `pondra.history`,
+which you read with SQL. Each node's state is at `GET /stats`, and its counters are at `GET /metrics`,
+in the format Prometheus reads. Recording never makes a statement wait: its row is written a second or so after the
+statement ends, off the statement's own path.
+
+| To find out | Look at |
+|---|---|
+| What ran, who ran it, through which door, and how long it took | `pondra.history` |
+| Why a statement was slow | its `plan` and `trace` in `pondra.history`, and a line in the node's log |
+| Whether the nodes are up, and who leads | `GET /stats`, and `GET /ready` |
+| How many requests, rows and queries a node handled | `GET /metrics` |
+| Who did what, and what was refused | `pondra.audit`, in [Security](/pondra/guides/security/#the-audit-log) |
+
+## Every statement is a row of pondra.history
+
+Each statement a door is sent is one row: from SQL over HTTP, Postgres, Arrow Flight, MCP, the shell
+or a client. The row holds who ran it, through which door, on which node and in which session, when
+it started, how long it took, how many rows it answered and how it ended. [System tables](/pondra/sql/system-tables/)
+lists every column.
+
+Set up a table to query:
+
+```sql
+CREATE TABLE orders (id BIGINT, item VARCHAR, amount DOUBLE);
+INSERT INTO orders VALUES (1, 'tea', 7.0), (2, 'cake', 4.5), (3, 'tea', 3.5);
+```
+
+Run a query, then read the history. The row shows up a second or so later, so the example waits:
+
+```python
+import pondra, time
+db = pondra.connect("http://localhost:8080")
+db.sql("SELECT item, sum(amount) AS total FROM orders GROUP BY item ORDER BY item").rows()
+time.sleep(2)
+for row in db.sql("SELECT door, class, outcome, statement FROM pondra.history ORDER BY at DESC LIMIT 3").rows():
+    print(row)
+```
+
+```text
+{'door': 'http', 'class': 'query', 'outcome': 'ok', 'statement': 'SELECT item, sum(amount) AS total FROM orders GROUP BY item ORDER BY item'}
+{'door': 'http', 'class': 'write', 'outcome': 'ok', 'statement': 'INSERT INTO orders VALUES (1, \'tea\', 7.0), (2, \'cake\', 4.5), (3, \'tea\', 3.5)'}
+{'door': 'http', 'class': 'ddl', 'outcome': 'ok', 'statement': 'CREATE TABLE orders (id BIGINT, item VARCHAR, amount DOUBLE)'}
+```
+
+`class` says what kind of statement it was (`read`, `write`, `ddl`, `function`, `role` or `misc`), and
+`outcome` says whether it worked. A failed statement is always kept, with its `error`. An admin reads every row; anyone
+else reads only their own.
+
+To count the statements of one kind:
+
+<Ways sql={`SELECT class, count(*) AS n FROM pondra.history WHERE statement LIKE 'INSERT INTO orders%' GROUP BY class;`} />
+
+```text
++-------+---+
+| class | n |
++-------+---+
+| write | 1 |
++-------+---+
+```
+
+### Group the runs of one query
+
+`statement` is the text as sent, with secrets hidden. `fingerprint` is the same text with its literals taken out, so the
+runs of one query, with different values, share a fingerprint. Group by it to find the queries that take
+the most time:
+
+```sql
+SELECT fingerprint, count(*) AS runs, avg(ms) AS avg_ms, max(misestimate) AS worst
+FROM pondra.history WHERE outcome = 'ok' GROUP BY fingerprint ORDER BY avg_ms DESC LIMIT 5;
+```
+
+```text
++------------------+------+--------+
+| fingerprint      | runs | avg_ms |
++------------------+------+--------+
+| 2c4138e9020fdb72 | 1    | 26.0   |
+| 744cf046bdd2687a | 1    | 21.0   |
+| ffeec5e2586360b5 | 1    | 7.0    |
++------------------+------+--------+
+```
+
+`misestimate` is set for a query that took 100 ms or more: how many times more, or fewer, rows its
+worst join produced than the planner expected. `40` means forty times off. `plan_id` is the shape of the
+plan that ran, and `reads` and `writes` name the tables and views a statement used.
+
+## Slow statements keep their plan
+
+A statement slower than `PONDRA_SLOW_MS` (1000 ms by default) keeps its plan in its row. The plan shows
+each step with the rows the planner expected beside the rows the step gave, and its time. A statement
+that ran across several nodes also keeps its `trace`: how long each node took for its share. The node
+writes a line to its log as well (`slow statement: …`), with the time, the user, the door and the statement.
+
+To see one, here is a function that takes over a second, as a slow step in a real query would:
+
+```sql
+CREATE FUNCTION nap(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$
+import time
+time.sleep(1.2)
+return x
+$$;
+```
+
+```python
+db.sql("SELECT nap(1) AS x").rows()
+time.sleep(2)
+print(db.sql("SELECT ms >= 1000 AS slow, plan IS NOT NULL AS has_plan FROM pondra.history WHERE statement LIKE 'SELECT%nap%'").rows())
+```
+
+```text
+[{'slow': True, 'has_plan': True}]
+```
+
+The plan is text, one line per step. Here is the plan of the slow statement above:
+
+```python
+for row in db.sql("SELECT plan FROM pondra.history WHERE ms >= 1000 ORDER BY at DESC LIMIT 1").rows():
+    print(row["plan"])
+```
+
+```text
+ProjectionExec: expr=[__async_fn_0@0 as x], metrics=[output_rows=1, elapsed_compute=4.36µs, output_bytes=8.0 B, output_batches=1, expr_0_eval_time=1.99µs]
+  AsyncFuncExec: async_expr=[async_expr(name=__async_fn_0, expr=nap(1))], metrics=[output_rows=1, elapsed_compute=1ns, output_bytes=8.0 B, output_batches=1]
+    PlaceholderRowExec: expected_rows=1, metrics=[]
+```
+
+## Settings
+
+These variables are set on the node, with `pondra serve` or in its environment. They're all listed in
+[Environment variables](/pondra/reference/environment/).
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PONDRA_HISTORY` | on | `off`: the node writes no rows to `pondra.history` |
+| `PONDRA_SLOW_MS` | `1000` | a statement this slow keeps its plan and trace, and writes a line to the log |
+| `PONDRA_HISTORY_RATE` | `500` | at most this many rows a second a node writes. Past it, the fast statements that went well are counted in one row, with `class = 'skipped'`. Slow and failed statements are always written |
+| `PONDRA_HISTORY_DAYS` | `7` | how many days of history are kept. Read when the table is first made |
+
+Nothing waits for the history. A statement hands its row to a writer on its own node, so a slow disk
+or a busy bucket delays the rows, never the statement.
+
+## Counters for Prometheus: GET /metrics
+
+`GET /metrics` answers this node's counters since it started, in Prometheus' text format. Each one has
+a `# HELP` line that says what it counts:
+
+```bash
+curl -s localhost:8080/metrics | grep '^# HELP pondra_quer'
+```
+
+```text
+# HELP pondra_queries_total SQL queries run here
+# HELP pondra_query_errors_total SQL queries that failed
+# HELP pondra_query_seconds_total time spent in SQL queries
+```
+
+The counters cover the rows a node took into the log, the queries it ran and how many failed, the time
+spent in queries, the queries it spread across the nodes, the files a query read and the ones it skipped
+by their ranges, and the requests it made to the bucket. `pondra_object_requests_total` is split by
+`op` (`write`, `list`, `delete`): those are what a bucket bills and rate-limits. With tokens on, a read
+token is needed to read `/metrics`. [Deploy](/pondra/guides/deploy/) shows a Prometheus scrape of a cluster.
+
+## The state of a node: GET /stats
+
+`GET /stats` needs no token, so a load balancer can poll it. It answers as JSON:
+
+- `lake` is the lake's name, and `role` is `leader`, `follower` or `reader` (a read-only node, which never
+  leads, runs tasks or takes writes).
+- `leader` is the address of the leader and `term` its election number. `nodes` lists the live nodes.
+- `hwm` is the newest commit this node has seen, and `version` and `format` are the release and the
+  lake's format.
+- On the leader, `commits`, `commit_ms_p50` and `commit_ms_p95` say how long recent commits took, and
+  `untiered_rows` how many rows wait to become Parquet.
+
+```bash
+curl -s localhost:8080/stats | python3 -c 'import json, sys; s = json.load(sys.stdin); print(s["lake"], s["role"], len(s["nodes"]))'
+```
+
+```text
+lake leader 1
+```
+
+Two probes sit beside it. `GET /healthz` answers `ok` while the process runs. `GET /ready` answers
+`ready` when the node can serve, and `503` while it is stopping, while it catches up with its leader
+after it starts, or when it can't reach the bucket.
+

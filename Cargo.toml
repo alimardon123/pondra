@@ -11,7 +11,7 @@ publish = false # (not on crates.io yet: pip and npm carry the binary)
 default = ["server"]
 # A node: the catalog in the bucket, the doors (HTTP, Postgres, Kafka, Flight), the cluster and the
 # command line. Without it the library is the parts a browser build shares (`src/lib.rs`).
-server = ["dep:slatedb", "dep:reqwest", "dep:tokio", "dep:axum", "dep:toml", "dep:uuid", "dep:clap", "dep:mimalloc",
+server = ["dep:http", "dep:slatedb", "dep:reqwest", "dep:tokio", "dep:axum", "dep:toml", "dep:uuid", "dep:clap", "dep:mimalloc",
           "dep:chrono-tz", "dep:postgres-types", "dep:pgwire", "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:zstd",
           "dep:object_store", "dep:object_store_df", "dep:glob", "dep:aws-lc-rs", "dep:tokio-rustls",
           "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service"]
@@ -45,6 +45,7 @@ lru = "0.18"
 chrono = { version = "0.4", default-features = false } # (already built for object_store: ObjectMeta timestamps)
 chrono-tz = { version = "0.10", default-features = false, optional = true } # (already built for arrow: time zones; tasks' cron schedules)
 url = "2"
+http = { version = "1", optional = true } # (an AWS catalog's requests signed by object_store's signer, which takes http's; already built for reqwest)
 datafusion-functions-json = "0.55" # json_get(…), ->, ->> over JSON strings (Kafka raw values, semi-structured columns)
 datafusion-spark = "55.1" # Spark's functions DataFusion doesn't name itself (format_string, pmod, parse_url…): PySpark's vocabulary in SQL
 regex = "1" # (COPY FROM: its NULL string; already built for arrow-csv)

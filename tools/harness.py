@@ -737,6 +737,240 @@ def outside():
     return f"files outside the lake (S3, a web server, this machine), secrets: all {len(checks)} checks pass"
 
 
+def _unchunk(rfile):
+    """A request body sent in chunks (Transfer-Encoding: chunked), read whole."""
+    body = b""
+    while True:
+        size = int(rfile.readline().split(b";")[0].strip(), 16)
+        if size == 0:
+            while rfile.readline() not in (b"\r\n", b"\n", b""):  # (trailers, then a blank line)
+                pass
+            return body
+        body += rfile.read(size)
+        rfile.readline()  # (the line that ends each chunk)
+
+
+def _forwarding_proxy(port, target, seen):
+    """A proxy to `target` (moto) that passes each request on as it came. `seen` gets (method, path, access
+    key) for every one: the key it was signed with, so a test sees which key read or wrote a file."""
+    import http.server, re, urllib.parse
+    hop = {"connection", "keep-alive", "transfer-encoding", "expect", "content-length", "host"}  # (http.client sets the last two)
+
+    class Proxy(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def relay(self):
+            self.close_connection = True  # (one request a connection: every answer says so)
+            if "chunked" in self.headers.get("transfer-encoding", ""):
+                body = _unchunk(self.rfile)
+            else:
+                body = self.rfile.read(int(self.headers.get("content-length", 0)))
+            signed = re.search(r"Credential=([^/,]+)/", self.headers.get("authorization", ""))
+            seen.append((self.command, urllib.parse.urlsplit(self.path).path, signed.group(1) if signed else None))
+            conn = http.client.HTTPConnection("127.0.0.1", target, timeout=120)
+            conn.request(self.command, self.path, body=body, headers={k: v for k, v in self.headers.items() if k.lower() not in hop})
+            up = conn.getresponse()
+            data = up.read()
+            self.send_response(up.status)
+            for k, v in up.getheaders():
+                if k.lower() not in hop | {"server", "date"}:
+                    self.send_header(k, v)
+            # (a HEAD's answer has no body, but its length is the object's: moto's own)
+            self.send_header("Content-Length", up.getheader("Content-Length", "0") if self.command == "HEAD" else str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+
+        do_GET = do_PUT = do_POST = do_HEAD = do_DELETE = relay
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Proxy)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def _rest_sim(port, flags):
+    """A catalog simulator (tools/sim_iceberg_rest.py) on `port`, once it answers /_stats (no sign-in needed)."""
+    import urllib.request
+    err = tempfile.TemporaryFile()  # (its errors, if it stops)
+    sim = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim_iceberg_rest.py"), "--port", str(port), *flags],
+                           stdout=subprocess.DEVNULL, stderr=err)
+    atexit.register(sim.kill)
+    for _ in range(300):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/_stats", timeout=2).read()
+            return sim
+        except OSError:
+            if sim.poll() is not None:
+                err.seek(0)
+                raise RuntimeError(f"the catalog simulator on port {port} stopped: {err.read().decode(errors='replace')[-2000:]}")
+            time.sleep(0.1)
+    raise RuntimeError(f"the catalog simulator on port {port} did not answer")
+
+
+def catalogs():
+    """Iceberg REST catalogs as the AWS ones and the credential-vending ones are (ADR-026, ADR-028): a catalog
+    that vends the table's storage credentials, which a node may use for that table's location only; AWS
+    Glue and S3 Tables, every request signed with SigV4 (a service, a region and a key; a Glue account id
+    as the warehouse; an encoded ARN as the prefix); and what they refuse, by name. PyIceberg writes the
+    tables to a local S3 (moto). The nodes read and write them through a proxy that records the key each
+    request was signed with, and every answer is PyIceberg's rows: on one node and on three."""
+    import datetime, decimal, socket, urllib.parse, urllib.request
+    import boto3, botocore.exceptions, pyarrow as pa
+    from pyiceberg.catalog.sql import SqlCatalog
+    moto_p, proxy_p, rest_p, glue_p, s3t_p = (A.port + 80 + i for i in range(5))
+    for port in (moto_p, proxy_p, rest_p, glue_p, s3t_p, A.port, A.port + 1, A.port + 2):
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", port)) == 0:  # (a server left from a run that died would answer with its tables)
+                raise RuntimeError(f"port {port} is already in use")
+    # The warehouse's bucket is "warehouse": S3 (and moto, and R2) refuse a name under three letters, so "wh" is out.
+    WH, ARN = "s3://warehouse", "arn:aws:s3tables:us-east-1:111122223333:bucket/sales"
+    here = tempfile.mkdtemp(prefix="pondra-catalogs-")
+    db = os.path.join(here, "catalog.db")  # (the SQL catalog's sqlite file: PyIceberg's, the simulators read it)
+    said = tempfile.TemporaryFile()
+    moto = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim_r2.py"), "--port", str(moto_p), "--zero"],
+                            stdout=subprocess.DEVNULL, stderr=said)
+    atexit.register(moto.kill)
+    s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{moto_p}", region_name="us-east-1", aws_access_key_id="admin", aws_secret_access_key="adminsecret")
+    for _ in range(600):  # (a first import of moto on a fresh machine takes a while)
+        if moto.poll() is not None:
+            said.seek(0)
+            raise RuntimeError(f"the S3 simulator (sim_r2.py) stopped: {said.read().decode(errors='replace')[-2000:]}")
+        try:
+            s3.create_bucket(Bucket="warehouse")
+            break
+        except botocore.exceptions.EndpointConnectionError:
+            time.sleep(0.1)
+    admin = {"s3.endpoint": f"http://127.0.0.1:{moto_p}", "s3.access-key-id": "admin", "s3.secret-access-key": "adminsecret",
+             "s3.region": "us-east-1", "s3.force-virtual-addressing": "false"}  # (path-style: moto takes the bucket from the path)
+    cat = SqlCatalog("local", uri=f"sqlite:///{db}", warehouse=WH, **admin)
+    cat.create_namespace("sales")
+    rng = random.Random(29)
+    orders_schema = pa.schema([("id", pa.int64()), ("customer", pa.string()), ("placed", pa.date32()), ("amount", pa.decimal128(10, 2)), ("qty", pa.int32())])
+    orders = [{"id": i, "customer": None if i % 50 == 7 else rng.choice(["ann", "bo", "cy", "dee"]),
+               "placed": datetime.date(2026, 1, 1) + datetime.timedelta(days=rng.randrange(300)),
+               "amount": decimal.Decimal(rng.randrange(100000)).scaleb(-2), "qty": rng.randrange(1, 9)} for i in range(300)]
+    cat.create_table(("sales", "orders"), schema=orders_schema, location=f"{WH}/sales/orders").append(pa.Table.from_pylist(orders, schema=orders_schema))
+    returns_schema = pa.schema([("id", pa.int64()), ("order_id", pa.int64()), ("reason", pa.string())])
+    cat.create_table(("sales", "returns"), schema=returns_schema, location=f"{WH}/sales/returns").append(
+        pa.Table.from_pylist([{"id": i, "order_id": i * 7, "reason": ["late", "damaged", "wrong"][i % 3]} for i in range(3)], schema=returns_schema))
+
+    def pyiceberg_rows():
+        """The orders as PyIceberg reads them now, in SQL's text: a date as its day, a decimal as its digits."""
+        got = cat.load_table(("sales", "orders")).scan().to_arrow().to_pylist()
+        return sorted(({k: v.isoformat() if isinstance(v, datetime.date) else str(v) if isinstance(v, decimal.Decimal) else v
+                        for k, v in r.items() if v is not None} for r in got), key=lambda r: r["id"])  # (Pondra's JSON leaves NULLs out)
+
+    seen, sims, nodes, proxy = [], [], [], None
+    ORDERS = "SELECT id, customer, placed, CAST(amount AS VARCHAR) AS amount, qty FROM {}.sales.orders ORDER BY id"  # (a decimal as its digits, as PyIceberg's rows say it)
+    s3_flags = ["--warehouse", WH, "--db", db, "--s3-endpoint", f"http://127.0.0.1:{moto_p}", "--s3-key", "admin:adminsecret"]
+
+    def q(s, i=0, spread=None):
+        path = "/sql" + (f"?spread={spread}" if spread is not None else "")
+        return call(A.port + i, "POST", path, s.encode())
+
+    def refused(s):
+        return _raises_text(lambda: q(s))
+
+    def signed_with(since, under="/warehouse/sales/orders/"):
+        """The keys that signed the requests under the orders' location, from `seen[since]` on."""
+        return {k for _, p, k in seen[since:] if p.startswith(under)}
+
+    def stats(port):
+        return json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/_stats").read())
+
+    checks = {}
+    try:
+        proxy = _forwarding_proxy(proxy_p, moto_p, seen)
+        sims += [_rest_sim(rest_p, [*s3_flags, "--vend", "VK:VS:VT", "--vend-endpoint", f"http://127.0.0.1:{proxy_p}"]),
+                 _rest_sim(glue_p, [*s3_flags, "--sigv4", "glue:us-east-1:AK:AS", "--prefix", "catalogs/123456789012", "--warehouse-id", "123456789012"]),
+                 _rest_sim(s3t_p, [*s3_flags, "--sigv4", "s3tables:us-east-1:AK:AS", "--prefix", urllib.parse.quote(ARN, safe="")])]
+        lake = new_lake()
+        env = {"PONDRA_SECRET_KEY": "one key for the cluster"}
+        nodes += [Node(lake, A.port + i, env=env, **({"cache_dir": os.path.join(here, f"tier{i}")} if A.s3 else {})).start() for i in range(3)]
+        # (a) The vending catalog: the node holds no S3 secret, and reads with the vended key alone.
+        q(f"CREATE SECRET cat (TYPE iceberg, CLIENT_ID 'pondra', CLIENT_SECRET 's3cret', SCOPE 'http://127.0.0.1:{rest_p}')")
+        q(f"ATTACH 'http://127.0.0.1:{rest_p}' AS ice (TYPE iceberg)")
+        m = len(seen)
+        checks["a vending catalog: the table reads == PyIceberg's rows, with no S3 secret on the node"] = \
+            q(ORDERS.format("ice")) == pyiceberg_rows() and q("SELECT count(*) AS n FROM ice.sales.returns") == [{"n": 3}]
+        checks["…every request under the table's location was signed with the vended key, and the client asked for vended credentials"] = \
+            signed_with(m) == {"VK"} and stats(rest_p)["delegation_headers"] >= 1
+        # (b) Those credentials open nothing else: a file of the table's location needs a secret that covers it.
+        checks["the vended key reads nothing else: a file under the table's location is refused, no secret covers it"] = \
+            "no secret covers" in refused(f"SELECT count(*) AS n FROM read_parquet('{WH}/sales/orders/data/*.parquet')")
+        # (c) A catalog that vends nothing: the same table is refused, naming its files' location.
+        q(f"ATTACH 'http://127.0.0.1:{rest_p}' AS ice2 (TYPE iceberg, ACCESS_DELEGATION_MODE 'none')")
+        checks["ACCESS_DELEGATION_MODE 'none': the table's files are refused by name, with their location"] = \
+            f"no secret covers {WH}/" in refused("SELECT * FROM ice2.sales.orders")
+        # (d) A write through the vended key: PyIceberg reads the rows back, and the data file was written with that key.
+        m = len(seen)
+        before = pyiceberg_rows()
+        q("INSERT INTO ice.sales.orders VALUES (100001, 'ann', DATE '2026-03-01', CAST(12.50 AS DECIMAL(10,2)), 2), "
+          "(100002, NULL, DATE '2026-03-02', CAST(7.25 AS DECIMAL(10,2)), 1)")
+        after = pyiceberg_rows()
+        added = [{"id": 100001, "customer": "ann", "placed": "2026-03-01", "amount": "12.50", "qty": 2},
+                 {"id": 100002, "placed": "2026-03-02", "amount": "7.25", "qty": 1}]
+        checks["INSERT through the vended key: PyIceberg reads the two rows back, beside the others"] = after[:len(before)] == before and after[len(before):] == added
+        checks["…and its data file was written with the vended key"] = signed_with(m) == {"VK"} and any(
+            meth in ("PUT", "POST") and p.startswith("/warehouse/sales/orders/data/") for meth, p, _ in seen[m:])
+        # (e) Three nodes: the same query, spread, is the one node's answer.
+        until(lambda: len(call(A.port + 1, "GET", "/stats")["nodes"]), 3, 60)  # (node 1 has heard of the other two)
+        spreads = metrics_of(A.port + 1)["pondra_spread_queries_total"]
+        one = q(ORDERS.format("ice"), 0, spread=0)
+        three = q(ORDERS.format("ice"), 1, spread=1)
+        checks["three nodes: the query spread (?spread=1) == one node's answer == PyIceberg's rows"] = \
+            three == one == pyiceberg_rows() and metrics_of(A.port + 1)["pondra_spread_queries_total"] > spreads
+        # (f) AWS Glue: SigV4 on every catalog request, the data signed with the secret's key.
+        q(f"CREATE SECRET aws (TYPE s3, KEY_ID 'AK', SECRET 'AS', REGION 'us-east-1', ENDPOINT 'http://127.0.0.1:{proxy_p}', URL_STYLE 'path', USE_SSL false)")
+        q(f"ATTACH '123456789012' AS glue (TYPE iceberg, ENDPOINT_TYPE glue, ENDPOINT 'http://127.0.0.1:{glue_p}', SECRET aws)")
+        m = len(seen)
+        checks["AWS Glue: the rows == PyIceberg's, and the data was read with the secret's key"] = \
+            q(ORDERS.format("glue")) == pyiceberg_rows() and signed_with(m) == {"AK"}
+        # (g) S3 Tables: the bucket's ARN as the catalog, its prefix an encoded ARN, signed for s3tables.
+        q(f"ATTACH '{ARN}' AS s3t (TYPE iceberg, ENDPOINT_TYPE s3_tables, ENDPOINT 'http://127.0.0.1:{s3t_p}', SECRET aws)")
+        m = len(seen)
+        checks["AWS S3 Tables: the rows == PyIceberg's, and the data was read with the secret's key"] = \
+            q(ORDERS.format("s3t")) == pyiceberg_rows() and signed_with(m) == {"AK"}
+        # (f, again) A wrong key: one secret a bucket (invariant 98), so `aws` goes first; the catalog's 403 says why.
+        q("DROP SECRET aws")
+        q(f"CREATE SECRET aws_bad (TYPE s3, KEY_ID 'AK-WRONG', SECRET 'AS', REGION 'us-east-1', ENDPOINT 'http://127.0.0.1:{proxy_p}', URL_STYLE 'path', USE_SSL false)")
+        why = _raises_text(lambda: q(f"ATTACH '123456789012' AS glue_bad (TYPE iceberg, ENDPOINT_TYPE glue, ENDPOINT 'http://127.0.0.1:{glue_p}', SECRET aws_bad)")) \
+            or refused("SELECT * FROM glue_bad.sales.orders")
+        checks["AWS Glue with another key: refused, and the message says 403 (the catalog's answer)"] = any(w in why for w in ("403", "signature", "Forbidden"))
+        # (h) Refused by name, before anything is attached.
+        checks["ENDPOINT_TYPE glue with no SECRET: refused by name, saying SECRET"] = "SECRET" in refused("ATTACH '1234' AS nosecret (TYPE iceberg, ENDPOINT_TYPE glue)")
+        checks["an ENDPOINT_TYPE it doesn't know: refused by name, listing glue and s3_tables"] = \
+            all(w in refused("ATTACH '1234' AS badtype (TYPE iceberg, ENDPOINT_TYPE bigquery)") for w in ("glue", "s3_tables"))
+        # (i) An AWS catalog's tables are read by whoever may use its secret, and no one else.
+        q(f"CREATE SECRET aws (TYPE s3, KEY_ID 'AK', SECRET 'AS', REGION 'us-east-1', ENDPOINT 'http://127.0.0.1:{proxy_p}', URL_STYLE 'path', USE_SSL false)")
+        import base64
+        basic = lambda u, p: {"Authorization": "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()}
+        boss, ann = basic("boss", "boss-password-1"), basic("ann", "ann-password-1")
+        q("CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")  # (then everyone signs in)
+        call(A.port, "POST", "/sql", b"CREATE USER ann PASSWORD 'ann-password-1'", headers=boss)
+        said = _raises_text(lambda: call(A.port, "POST", "/sql", ORDERS.format("glue").encode(), headers=ann))
+        checks["a user without USAGE on the AWS catalog's secret: refused by name"] = "aws" in said and "USAGE" in said
+        call(A.port, "POST", "/sql", b"GRANT USAGE ON SECRET aws TO ann", headers=boss)
+        checks["…granted USAGE on it, reads the rows"] = _try(lambda: call(A.port, "POST", "/sql", ORDERS.format("glue").encode(), headers=ann)) == pyiceberg_rows()
+        if not checks["a user without USAGE on the AWS catalog's secret: refused by name"]:
+            print("refused:", said)
+    finally:
+        for n in nodes:
+            n.kill()
+        for p in sims + [moto]:
+            p.kill()
+        if proxy:
+            proxy.shutdown()
+        shutil.rmtree(here, ignore_errors=True)
+    ok = all(checks.values())
+    print(json.dumps({"catalogs": checks, "ok": ok}, indent=1, ensure_ascii=False))
+    if not ok:
+        sys.exit(1)
+    return f"Iceberg REST catalogs (vended credentials, Glue and S3 Tables over SigV4): all {len(checks)} checks pass"
+
+
 AZURITE_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="  # (Azurite's well-known account key)
 
 
@@ -10385,12 +10619,12 @@ def backpressure():
 SECS = {"memory": 255, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12, "learn": 12,
-        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "attached": 10, "use_path": 40}
+        "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, loads, reader, crash, load)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, users, secrets, safety, guarded, versions, stopped, flows, begin, doors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, publishing, backpressure, loads, reader, crash, load)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -10418,7 +10652,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "loads", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "guarded", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "publishing", "backpressure", "load", "loads", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -10431,7 +10665,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "loads": loads, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "guarded": guarded, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "publishing": publishing, "backpressure": backpressure, "load": load, "loads": loads, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):
