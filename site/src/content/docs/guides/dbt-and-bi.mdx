@@ -117,8 +117,8 @@ restart.
 - **Indexes:** a keyed table's primary key shows as an index. `CREATE INDEX` is accepted and kept as
   an object (it shows in `pg_indexes`), but nothing is built for it: the files' column ranges do the
   finding. See [Indexes](/pondra/sql/statements/#indexes).
-- **Transactions:** the statements between `BEGIN` and `COMMIT` are one commit, with snapshot
-  isolation. `COMMIT` fails with `40001` if another commit changed a row they changed, and a failed
-  statement fails the whole transaction: `COMMIT` then rolls it back. See
+- **Transactions:** the statements between `BEGIN` and `COMMIT` are one commit, `READ COMMITTED`
+  with row locks by default, as in Postgres (`REPEATABLE READ` refuses a conflicting `COMMIT` with
+  `40001`). A failed statement fails the whole transaction: `COMMIT` then rolls it back. See
   [Transactions](/pondra/guides/change-rows/#transactions).
 </Aside>

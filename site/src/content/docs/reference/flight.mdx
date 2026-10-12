@@ -23,22 +23,21 @@ checked here.
 
 | Command | What it does |
 |---|---|
-| `CommandStatementQuery` | runs a query. A write statement sent this way (as a DB-API `execute` does) runs at once and answers one row: `rows`, the number of rows it wrote. A `CALL` runs at once too, and its ticket answers what the procedure returned |
+| `CommandStatementQuery` | runs a query. A write statement sent this way (as a DB-API `execute` does) answers one row: `rows`, the number of rows it wrote. It runs in the connection's transaction, or at once with autocommit on (see [Transactions](#transactions)). A `CALL` runs at once too, and its ticket answers what the procedure returned |
 | `CommandStatementUpdate` | runs a write statement (`CREATE`, `ALTER`, `DROP`, `INSERT`, `UPDATE`, `DELETE`) and answers with the row count. Needs the `write` role |
 | `CommandStatementIngest` | bulk load: Arrow batches into a table, in one of four [modes](#bulk-ingest). A table that does not exist is created from the batches' schema, which needs the `admin` role. `db_schema_name` picks the schema |
 | `CommandGetCatalogs` | one catalog: the lake's name |
 | `CommandGetDbSchemas` | the lake's schemas |
 | `CommandGetTables` | tables (type `TABLE`) and views (type `VIEW`), with their columns if the client asks |
 | `CommandGetTableTypes` | the two types: `TABLE` and `VIEW` |
-| `CommandGetSqlInfo` | the server's name (`Pondra`), version, Arrow version (1.3), that it is not read-only, and that it has no transactions (Flight SQL's are not taken yet: use the Postgres port or HTTP for `BEGIN` … `COMMIT`) |
+| `CommandGetSqlInfo` | the server's name (`Pondra`), version, Arrow version (1.3), that it is not read-only, and that it takes transactions ([below](#transactions)) |
 
 An error is a gRPC status near its meaning (`NOT_FOUND` for no such table, `FAILED_PRECONDITION`
 for a `CHECK`, `ABORTED` for a conflict…), with Postgres's code in its metadata as
 `x-pondra-sqlstate`. ADBC shows it in the error's `details`.
 
 Flight SQL's other commands are not implemented: prepared statements (so bound parameters too), keys,
-transactions and savepoints, and cancelling a query. Each answers `Unimplemented`. Put values in the
-SQL text instead, and use [HTTP](/pondra/reference/http/#run-sql) or the Postgres port for `BEGIN` … `COMMIT`.
+savepoints, and cancelling a query. Each answers `Unimplemented`. Put values in the SQL text instead.
 A statement's writes and queries follow the same [roles](/pondra/reference/http/#roles) as HTTP.
 
 ```python
@@ -62,6 +61,40 @@ with conn.cursor() as cur:
 ```
 
 A write's answer is one row, `rows`, so `fetchall()` gives `[(2,)]`. `cur.rowcount` stays `-1`.
+
+### Transactions
+
+Flight SQL's own transaction actions run a transaction. `BeginTransaction` answers a `transaction_id`. A
+query or an update that carries that id runs in the transaction: its reads see the transaction's snapshot
+and its own writes, and nobody else sees the writes until `EndTransaction` commits them. `EndTransaction`
+with commit or rollback ends the transaction. The isolation levels, the row waits and the errors are the
+same as on every door: [Transactions](/pondra/guides/change-rows/#transactions).
+
+ADBC's DB-API connection starts with autocommit off, so its first write opens a server transaction, and
+`commit()` or `rollback()` ends it. Connect with `autocommit=True` to make each statement its own commit,
+as the examples on this page do.
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+tx = flightsql.connect("grpc://localhost:8815")  # autocommit off: a transaction
+with tx.cursor() as cur:
+    cur.execute("INSERT INTO events VALUES (3, 'view', 0.0)")
+tx.rollback()  # the insert is undone
+with tx.cursor() as cur:
+    cur.execute("SELECT count(*) AS n FROM events")
+    print(cur.fetchall())
+tx.close()
+```
+
+```text
+[(2,)]
+```
+
+`BEGIN`, `COMMIT` and `ROLLBACK` aren't run as SQL over Flight (`0A000`): the actions do that job. A bulk
+ingest inside a transaction is refused (`0A000`): ingest outside it, or `INSERT` the rows in it. An action
+for a transaction that is not open (ended, idle, or never begun) is refused (`25P01`). A `COMMIT` of a
+transaction that failed rolls it back and answers `25P02`, so the client learns it did not commit.
 
 ### Bulk ingest
 
@@ -296,9 +329,9 @@ print(info.schema.names, info.endpoints[0].ticket.ticket)
 
 ## Calls it doesn't take
 
-`GetSchema`, `PollFlightInfo` and `DoExchange` answer `Unimplemented`, and `DoAction` refuses every
-action with `INVALID_ARGUMENT`. For a schema, call `GetFlightInfo` with a `{"sql": …}` or
-`{"table": …}` command, as above.
+`GetSchema`, `PollFlightInfo` and `DoExchange` answer `Unimplemented`. `DoAction` takes two actions,
+`BeginTransaction` and `EndTransaction` ([above](#transactions)); any other action answers `Unimplemented`,
+naming it. For a schema, call `GetFlightInfo` with a `{"sql": …}` or `{"table": …}` command, as above.
 
 ## Tokens
 

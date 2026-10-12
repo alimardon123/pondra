@@ -86,13 +86,13 @@ objects and positions for arrays. A path that isn't there gives `NULL`.
 | `json_get_bool(doc, path…)` | the boolean |
 | `json_get_array(doc, path…)` | the array |
 | `json_get_json(doc, path…)` | the value as JSON text |
-| `json_get(doc, path…)` | the value as a JSON value (see the caution below) |
+| `json_get(doc, path…)` | the value as text: a number or string as itself, an object or list as its JSON text. The same text at every door (see the caution below) |
 | `json_as_text(doc, path…)` | the value as text, whatever its type |
 | `json_contains(doc, path…)` | true if the path exists |
 | `json_length(doc, path…)` | the length of the array or object |
 | `json_object_keys(doc, path…)` | the keys of the object |
 | `json_from_scalar(x)` | a JSON value made from a number, text or boolean (cast a decimal to `DOUBLE` first) |
-| `json_union_to_text(v)` | the JSON text of a JSON value, from `json_get`, `->` or `json_from_scalar`: a text keeps its quotes |
+| `json_union_to_text(v)` | the JSON text of a value from `json_get`, `->` or `json_from_scalar`: a string keeps its quotes |
 | `doc -> path` | the same as `json_get`; chain it: `doc -> 'a' -> 'b'` |
 | `doc ->> path` | the same as `json_as_text` |
 
@@ -122,9 +122,9 @@ The typed getters don't convert: `json_get_str` on a number is `NULL`, and `json
 `4.5` is `NULL`. Use `json_get_float` for any number, or `->>` to read anything as text and
 `CAST` it.
 
-`->` and `json_get` give a JSON value, not text, so they can be chained to go deeper. Finish with
-`->>`, a typed getter or `json_union_to_text`. Over HTTP, a JSON value selected as it is fails with
-`Json error: Unsupported data type`.
+`->` and `json_get` answer the value as text, the same text `->>` gives, at every door. So they chain to
+go deeper: `doc -> 'user' -> 'name'`. Use `json_union_to_text` when you want a string's quotes kept, as JSON
+writes them.
 </Aside>
 
 `json_union_to_text` turns a JSON value into its text, and `json_from_scalar` makes one from a

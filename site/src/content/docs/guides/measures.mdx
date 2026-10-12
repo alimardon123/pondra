@@ -1,0 +1,140 @@
+---
+title: Measures and key facts
+description: Define a metric once in a view with MEASURE, so every query, BI tool and agent gets it right at any grain, and record a view's keys as facts.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Ways from '../../../components/Ways.astro';
+
+A measure is a number a view says once: revenue, customers, revenue per customer. You write it in the
+view's `SELECT` as `AS MEASURE`. A query then asks for it by name, and Pondra works it out at that
+query's own grain. Revenue per customer by region is the region's revenue over its distinct
+customers, never an average of the view's rows.
+
+A view can also say which of its columns are keys, as facts: `PRIMARY KEY`, `UNIQUE` and `FOREIGN KEY`,
+each `NOT ENFORCED`. Nothing checks a fact. Tools read them to learn how the rows relate.
+
+## Define a measure
+
+Two tables: customers have a key, and orders point at them.
+
+```sql
+CREATE TABLE customers (id BIGINT PRIMARY KEY, name VARCHAR, region VARCHAR);
+INSERT INTO customers VALUES (1, 'ann', 'north'), (2, 'bob', 'north'), (3, 'cy', 'south');
+CREATE TABLE orders (id BIGINT, customer_id BIGINT, ordered_at TIMESTAMP, amount DOUBLE, status VARCHAR);
+INSERT INTO orders VALUES
+  (1, 1, TIMESTAMP '2026-01-05 09:00:00', 10.0, 'paid'),
+  (2, 1, TIMESTAMP '2026-01-05 15:00:00', 20.0, 'paid'),
+  (3, 2, TIMESTAMP '2026-01-06 11:00:00', 30.0, 'paid'),
+  (4, 3, TIMESTAMP '2026-01-06 12:00:00', 40.0, 'open'),
+  (5, 3, TIMESTAMP '2026-01-07 08:00:00', 50.0, 'void');
+```
+
+Now the view. The plain columns are its dimensions: the things a query groups by. The `AS MEASURE`
+columns are its measures, each named once.
+
+```sql
+CREATE VIEW sales AS
+SELECT o.ordered_at::date AS day, c.region, o.status,
+       sum(o.amount)                 AS MEASURE revenue,
+       count(DISTINCT o.customer_id) AS MEASURE customers,
+       revenue / customers           AS MEASURE per_customer
+FROM orders o LEFT JOIN customers c ON o.customer_id = c.id
+WHERE o.status <> 'void';
+```
+
+A view with measures is an ordinary view. You list it, grant it, comment on it and drop it the same way.
+
+## Query a measure at any grain
+
+Name the measure with `MEASURE(name)` and group by whatever you want to see. By region:
+
+<Ways sql={`SELECT region, MEASURE(revenue) AS revenue, MEASURE(customers) AS customers, MEASURE(per_customer) AS per_customer FROM sales GROUP BY region ORDER BY region`} />
+
+```text
+[{"region":"north","revenue":60.0,"customers":2,"per_customer":30.0},{"region":"south","revenue":40.0,"customers":1,"per_customer":40.0}]
+```
+
+By day:
+
+<Ways sql={`SELECT day, MEASURE(revenue) AS revenue, MEASURE(customers) AS customers FROM sales GROUP BY day ORDER BY day`} />
+
+```text
+[{"day":"2026-01-05","revenue":30.0,"customers":1},{"day":"2026-01-06","revenue":70.0,"customers":2}]
+```
+
+Over every row, with no `GROUP BY`:
+
+<Ways sql={`SELECT MEASURE(revenue) AS revenue, MEASURE(customers) AS customers, MEASURE(per_customer) AS per_customer FROM sales`} />
+
+```text
+[{"revenue":100.0,"customers":3,"per_customer":33.333333333333336}]
+```
+
+A ratio is computed over its group. The `per_customer` for `north` is the north's revenue over its two
+distinct customers. Pondra never averages the view's own `per_customer` values, which would give a
+different number.
+
+BI tools and agents often send `sum(revenue)`, `max(revenue)` or the bare name `revenue`. Each of them
+gets the measure, at the grain of their own `GROUP BY`. `MEASURE`, `AGG` and `AGGREGATE` are the same
+thing.
+
+## Read the view as it is
+
+Read as stored, a view with measures shows its default form: its dimensions and each measure, grouped by
+every dimension. A preview in a BI tool, or Postgres's catalog, sees a normal table with these columns, so
+those tools need no special client.
+
+<Ways sql={`SELECT * FROM sales ORDER BY day, region, status`} />
+
+```text
+[{"day":"2026-01-05","region":"north","status":"paid","revenue":30.0,"customers":1,"per_customer":30.0},{"day":"2026-01-06","region":"north","status":"paid","revenue":30.0,"customers":1,"per_customer":30.0},{"day":"2026-01-06","region":"south","status":"open","revenue":40.0,"customers":1,"per_customer":40.0}]
+```
+
+## What is refused
+
+A measure is refused where it would count a row twice or has no single value per row. Each refusal says
+what to write instead:
+
+| You write | Refused with | Write instead |
+|---|---|---|
+| `SELECT region, MEASURE(revenue) AS r FROM sales WHERE revenue > 5 GROUP BY region` | `measure revenue has no value per row: filter it in HAVING` | `HAVING MEASURE(revenue) > 5` after the `GROUP BY` |
+| `SELECT region, sum(revenue * 2) AS x FROM sales GROUP BY region` | `measure revenue inside sum(...): use MEASURE(revenue) alone, or a measure of its own` | `MEASURE(revenue) * 2`, or a measure of its own in the view |
+| `SELECT MEASURE(revenue) FROM sales s JOIN customers c ON s.region = c.region` | `a query with measures reads its view alone: join inside the view, where its joins are checked` | Put the join in the view's `FROM` |
+| `SELECT MEASURE(nothing) FROM sales` | `no measure nothing in sales (its measures: revenue, customers, per_customer)` | The name of one of the view's measures |
+| `CREATE VIEW … AS SELECT status, sum(amount) AS MEASURE m FROM orders GROUP BY status` | `a view with measures has no GROUP BY: its dimensions are its grouping` | Drop the `GROUP BY`: the plain columns are the grouping |
+| `CREATE VIEW … FROM orders o LEFT JOIN customers c ON o.status = c.region` | `customers is joined on (region), not on a key ((id)): a join in a view with measures must be many-to-one` | Join on the table's key: `ON o.customer_id = c.id` |
+| `CREATE VIEW … FROM orders o LEFT JOIN orders o2 ON o.id = o2.id` | `orders has no key (a PRIMARY KEY or UNIQUE; NOT ENFORCED is enough): a join to it could count rows twice` | Join only onto a table or view that has a key |
+
+<Aside type="caution">
+A materialized view can't have measures yet (`AS MEASURE` there is refused). Make a view with measures,
+and a materialized view of `MEASURE(…)` over it.
+</Aside>
+
+## Key facts on views
+
+A view can say its keys as facts, the way a table does. Nothing checks them, because a view holds no rows
+of its own to check.
+
+```sql
+CREATE VIEW customer_list (PRIMARY KEY (id) NOT ENFORCED) AS SELECT id, name, region FROM customers;
+ALTER VIEW customer_list ADD CONSTRAINT customer_list_name_key UNIQUE (name) NOT ENFORCED;
+SHOW CREATE VIEW customer_list;
+```
+
+```text
+[{"definition":"CREATE VIEW customer_list (\n  CONSTRAINT customer_list_pkey PRIMARY KEY (id) NOT ENFORCED,\n  CONSTRAINT customer_list_name_key UNIQUE (name) NOT ENFORCED\n) AS\nSELECT id, name, region FROM customers;"}]
+```
+
+- `ALTER VIEW v DROP CONSTRAINT name` removes one. `ALTER VIEW v ADD CONSTRAINT IF NOT EXISTS name …`
+  adds nothing when the name is there, so a file of them runs twice safely.
+- `CREATE OR REPLACE VIEW` keeps the facts while their columns are still in the view. One that drops a
+  column a fact names is refused, and the message says which `DROP CONSTRAINT` to run first.
+- `FOREIGN KEY (col) REFERENCES t (col) NOT ENFORCED` works the same way.
+
+The facts show in `SHOW CREATE VIEW`, in [`pondra.parts`](/pondra/sql/system-tables/#parts-and-finding-things)
+as `key` and `link` parts, and in Postgres's `pg_constraint`, where BI tools read relationships. A measure's
+join onto a view takes the view's `PRIMARY KEY` as a key.
+
+To find every measure and key in a lake, use `pondra.find` (see the [system tables](/pondra/sql/system-tables/#parts-and-finding-things)),
+or let an agent do it through MCP (see [agents](/pondra/guides/agents/#find-what-the-data-means)).
