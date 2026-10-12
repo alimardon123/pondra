@@ -205,7 +205,7 @@ here.close()
 | Method | Meaning |
 |---|---|
 | `db.append(table, data)` | append rows exactly once: a list of dicts, or a pandas, Polars or Arrow table. A retry after a lost answer is recognised and not applied twice. Each connection numbers its appends (`db.seq`) |
-| `db.write_table(name, data, mode="create")` | rows into a table: `data` is a frame, SQL text, or pandas, Polars or Arrow data (or a list of dicts). `mode` is `"create"`, `"append"` or `"overwrite"` |
+| `db.write_table(name, data, mode="create")` | rows into a table: `data` is a frame, SQL text, or pandas, Polars or Arrow data (or a list of dicts). `mode` is `"create"`, `"append"` or `"overwrite"`. `"append"` is a plain `INSERT … SELECT`: into a keyed table, a key it holds is refused (`23505`), so use `db.append` (which replaces) or an upsert in SQL |
 | `db.lookup(table, key)` | the current row of one key of a keyed table, or `None`. A composite key is its values, comma-separated, in the key's column order |
 
 `append` answers with a dict. `seg` and `row` say where in the log the rows went, and `block` is the

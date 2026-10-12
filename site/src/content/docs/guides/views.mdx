@@ -184,7 +184,7 @@ row to arrive. This is Flink's deduplication by event time.
 ```sql
 CREATE TABLE latest (k BIGINT PRIMARY KEY, ts BIGINT, v VARCHAR) SEQUENCE BY ts;
 INSERT INTO latest VALUES (1, 100, 'new');
-INSERT INTO latest VALUES (1, 50, 'old');
+INSERT OR REPLACE INTO latest VALUES (1, 50, 'old');
 SELECT * FROM latest;
 ```
 

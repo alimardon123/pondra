@@ -277,7 +277,7 @@ print(top_rows.to_pandas().shape, top_rows.to_polars().height)
 | Method | Meaning |
 |---|---|
 | `to_view(name, temporary=False, materialized=False, replace=None, **options)` | save the frame as a view others read by name. `materialized=True` keeps it up to date, and `options` are a materialized view's: `window`, `size_secs`, and the rest of [table options](/pondra/sql/table-options/#materialized-views). `temporary=True` keeps it to this connection |
-| `write_table(name, mode="create")` | rows into a table: `create` (`CREATE TABLE … AS`), `append` (`INSERT … SELECT`), `overwrite` (a new table in its place) |
+| `write_table(name, mode="create")` | rows into a table: `create` (`CREATE TABLE … AS`), `append` (`INSERT … SELECT`, a plain insert: into a keyed table a key it holds is refused, `23505`; `db.append` or `MERGE` replaces), `overwrite` (a new table in its place) |
 | `write_parquet(path, partition_by=None, mode=None)` | Parquet files: a file, or a folder if `path` ends in `/` or `partition_by` names columns |
 | `write_csv(path, separator=None, include_header=True, partition_by=None, mode=None)` | CSV files |
 | `write_json(path, partition_by=None, mode=None)` | JSON lines |

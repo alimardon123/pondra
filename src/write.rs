@@ -995,7 +995,7 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
 
 /// The rows a write to a keyed table upserts: the INSERT's query, the updated rows, or the rows
 /// to delete (marked `_deleted`). Keys never change; merge tables only take INSERTs.
-fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
+pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
     let q = |c: &str| format!("\"{c}\"");
     // (a changed row keeps its `_row_id` and `_created_at`: `sys.rs`)
     let select = |pick: &dyn Fn(&str) -> String, table: &str, cond: &Option<String>| {
@@ -1236,6 +1236,10 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
 
 /// Whether the leader has recorded this INSERT's files already.
 async fn recorded(lake: &Lake, job: &str) -> Result<bool> { Ok(lake.cat.get::<u64>(&producer_key(&format!("job:{job}"))).await?.is_some()) }
+
+/// Has a job's plain INSERT (its log flush, producer `sql:{job}`) been recorded? A retry of it is a
+/// duplicate, so the key check doesn't meet the job's own rows.
+pub(crate) async fn sent(lake: &Lake, job: &str) -> Result<bool> { Ok(lake.cat.get::<u64>(&producer_key(&format!("sql:{job}"))).await?.unwrap_or(0) > 0) }
 
 /// Each partition of a query planned in `ctx` from now on writes its own files, in the order its
 /// rows come: data that arrives in order (by time, by key) lands in files that each hold a narrow
@@ -1500,7 +1504,13 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         if let Some(q) = &c.query {
             let (name, query) = (object(&c.name), q.to_string());
             Box::pin(on_node_as(app, Stmt::Define(name.clone(), create_spec(c, lake, files).await?), Some(job.clone()), files)).await?;
-            return Box::pin(on_node_as(app, Stmt::Insert(name, query), Some(job), files)).await;
+            let out = Box::pin(on_node_as(app, Stmt::Insert(name.clone(), query), Some(job), files)).await;
+            if out.as_ref().is_err_and(|e| crate::codes::of(e) == "23505") {
+                // Refused (two rows of one key, or a key the table can't take): nothing lands, so the table goes too, purged:
+                // it never held a row, so it isn't kept for UNDROP.
+                Box::pin(on_node_as(app, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name, if_exists: true, purge: true }]), None, false)).await?;
+            }
+            return out;
         }
     }
     // Another engine's table, attached (`ATTACH … (TYPE delta | iceberg)`): its next version,
@@ -1564,12 +1574,16 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         }
         _ => {}
     }
-    let meta = lake.cat.get::<TableMeta>(&table_key(&table)).await?.map(|m| m.logical()); // (rows under SQL's names: the log keeps them stored, `log::pack`)
+    let stored = lake.cat.get::<TableMeta>(&table_key(&table)).await?; // (a plain INSERT's routing reads it as stored)
+    let meta = stored.as_ref().map(|m| m.logical()); // (rows under SQL's names: the log keeps them stored, `log::pack`)
     // A keyed table's UPDATE or DELETE outside a transaction is a transaction of its own (ADR-067 §7): it locks the keys
     // it changes, so a change worked out from a snapshot can't overwrite a commit that landed meanwhile. Its producer is
     // the job, so a retry of it is a duplicate. (MERGE and UNIQUE tables never get here: `changes` sends them to the leader.)
+    // A plain INSERT into a table whose key is checked (`constraints::key_checked`) is one too: its key must be new, and its
+    // locks make two nodes' INSERTs of one new key wait for each other (`txn::autocommit_as`).
     let keyed = meta.as_ref().is_some_and(|m| !m.key.is_empty());
-    if keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..)) {
+    let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(crate::constraints::key_checked);
+    if (keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..))) || key_insert {
         return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job))).await;
     }
     let sql = match (&meta, &stmt) {
@@ -1638,11 +1652,14 @@ async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
     if let (Stmt::Update(_, set, _), Some(m)) = (stmt, &meta) {
         crate::seq::check_set(&m.logical(), &set.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
     }
-    // (a table with an enforced UNIQUE: every write is checked on the leader, `constraints.rs`)
+    // (a table with an enforced UNIQUE: every write is checked on the leader, `constraints.rs`; a
+    // keyed table's plain INSERT too, since its key must be new)
     let checked = meta.as_ref().is_some_and(crate::constraints::checked);
     let append = meta.is_some_and(|m| m.key.is_empty());
     Ok(match stmt {
+        // (a plain INSERT into a keyed table is no change here: `on_node_listed` sends it to `txn::autocommit`, under its locks)
         Stmt::Insert(..) if !checked => None,
+        Stmt::Insert(..) => stmt.change_sql(),
         _ if append || checked || matches!(stmt, Stmt::Merge(_)) => stmt.change_sql(),
         _ => None,
     })
@@ -1799,7 +1816,11 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
             let lake = Lake::open(dir, false, false).await?;
             let (name, query) = (object(&c.name), c.query.as_ref().expect("a query").to_string());
             Box::pin(one_from_cli(dir, Stmt::Define(name.clone(), create_spec(&c, &lake, true).await?))).await?;
-            Box::pin(one_from_cli(dir, Stmt::Insert(name, query))).await
+            let out = Box::pin(one_from_cli(dir, Stmt::Insert(name.clone(), query))).await;
+            if out.as_ref().is_err_and(|e| crate::codes::of(e) == "23505") {
+                Box::pin(one_from_cli(dir, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name, if_exists: true, purge: true }]))).await?; // (refused: nothing lands, nor the table; purged: never kept for UNDROP)
+            }
+            out
         }
         Stmt::Ddl(ddls) => {
             let mut out = j!({});
@@ -1964,13 +1985,22 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         let (sql, sent) = crate::change::for_leader(query, target, &t, &t, &sql, files).await?; // (files here: this machine's)
         return Ok(Some(Request::Change(sql, job.into(), sent)));
     }
-    let meta = target.cat.get::<TableMeta>(&table_key(table)).await?.map(|m| m.logical());
+    let stored = target.cat.get::<TableMeta>(&table_key(table)).await?;
+    let meta = stored.as_ref().map(|m| m.logical());
     let log = meta.as_ref().is_some_and(|m| through_log(m, stmt));
     match (meta, stmt) {
         (Some(m), _) if log => {
             let sql = rows_sql(&m, stmt)?;
             let batch = rows(&open(session(query, &sql, "").await?), &m, &sql).await?;
             crate::defaults::check(&m, table, &batch)?; // (NOT NULL: as a node's own log checks its rows)
+            if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && crate::constraints::key_checked(s)) {
+                if sent(target, job).await? {
+                    return Ok(None); // (a retry: `deliver` answers it as a duplicate)
+                }
+                // (no row lock here, unlike a node's own plain INSERT (`txn::autocommit_as`): `pondra sql` and an attached
+                // lake's INSERT write without one, so two writers of one new key can both pass this check. A documented race.)
+                crate::constraints::key_check(target, table, s, None, &batch).await?; // (the keys are new: checked here, where the rows are)
+            }
             let (ack, _) = tokio::sync::oneshot::channel();
             let append = Append { table: table.into(), src: Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch, ack };
             Ok(Some(Request::Flush(encode_flush(&pack(target, &[append]).await?)?.into())))

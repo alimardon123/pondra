@@ -134,7 +134,7 @@ class Load:
         while not self.stop.is_set():
             key = random.randrange(1000)
             try:
-                sql(random.choice(self.nodes).port, f"INSERT INTO k VALUES ({key}, {random.randrange(2 ** 31)})")
+                sql(random.choice(self.nodes).port, f"INSERT OR REPLACE INTO k VALUES ({key}, {random.randrange(2 ** 31)})")  # (an upsert: a held key)
                 self.ack("k")
                 with self.lock:
                     self.keys.add(key)

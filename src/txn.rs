@@ -6,9 +6,10 @@
 //!
 //! Under READ COMMITTED a write locks its rows on the leader (`locks.rs`, §3) until the transaction ends; a write over
 //! `LOCK_MAX` rows locks none. An enforced-UNIQUE table locks nothing: its COMMIT's check refuses a row changed since it was
-//! read (40001). A MERGE and an INSERT … ON CONFLICT lock their rows as an UPDATE does. `COMMIT` sends the writes to the leader in one request (`commit_here`), which checks them
-//! under the lake's lock and writes them as one flush (§6). Outside a transaction, a keyed table's UPDATE or DELETE is a
-//! transaction of its own (`autocommit`, §7), appended through the log under the job's producer.
+//! read (40001). A MERGE and an INSERT … ON CONFLICT lock their rows as an UPDATE does. `COMMIT` sends the writes to the leader
+//! in one request (`commit_here`), which checks them under the lake's lock and writes them as one flush (§6). Outside a
+//! transaction, a keyed table's UPDATE or DELETE, and a plain INSERT into a table whose key is checked, is a transaction of its
+//! own (`autocommit`, §7), appended through the log under the job's producer.
 //!
 //! A failed statement fails the transaction: until `ROLLBACK` (or `COMMIT`), every statement is refused with 25P02. DDL
 //! runs at once (`ddl_at_once`); savepoints are `Mark`s; a READ ONLY transaction refuses its writes (25006). An idle
@@ -41,6 +42,61 @@ use std::time::{Duration, Instant};
 struct Changes {
     new: Vec<RecordBatch>,
     old: Vec<RecordBatch>,
+}
+
+/// A keyed table's kept rows by key, as text (`key_texts`): how many of the transaction's own rows hold each key (`live`, over
+/// `Changes::new`), and the keys of the table's rows it replaced or deleted (`gone`, over `Changes::old`). `keep` keeps it as it
+/// keeps the rows, and ROLLBACK TO makes it again from the rows it puts back (a savepoint holds rows only, so taking one costs
+/// what it did). A plain INSERT's check and a read's overlay ask it rather than go over every row kept: when the check did, a
+/// transaction of 2,000 one-row INSERTs took 4.9 ms an INSERT by its end, against 0.9 ms at its start.
+#[derive(Default)]
+struct ByKey {
+    key: Vec<String>, // (SQL's names)
+    live: HashMap<String, u32>,
+    gone: HashSet<String>,
+}
+
+impl ByKey {
+    /// The keys of a table's kept rows, worked out from them.
+    fn of(key: &[String], c: Option<&Changes>) -> Result<ByKey> {
+        let mut by = ByKey { key: key.to_vec(), ..Default::default() };
+        if let Some(c) = c {
+            c.old.iter().try_for_each(|b| by.taken(b))?;
+            c.new.iter().try_for_each(|b| by.added(b))?;
+        }
+        Ok(by)
+    }
+
+    /// The transaction's own rows `b` are kept.
+    fn added(&mut self, b: &RecordBatch) -> Result<()> {
+        key_texts(b, &self.key)?.into_iter().for_each(|k| *self.live.entry(k).or_default() += 1);
+        Ok(())
+    }
+
+    /// The transaction's own rows `b` are replaced (by a new version, or deleted).
+    fn dropped(&mut self, b: &RecordBatch) -> Result<()> {
+        for k in key_texts(b, &self.key)? {
+            if let Some(n) = self.live.get_mut(&k) {
+                *n -= 1;
+                if *n == 0 {
+                    self.live.remove(&k);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The table's rows `b` are replaced or deleted.
+    fn taken(&mut self, b: &RecordBatch) -> Result<()> {
+        self.gone.extend(key_texts(b, &self.key)?);
+        Ok(())
+    }
+
+    /// For each key (`key_texts`): Some(true) a row the transaction keeps holds it, Some(false) it took the table's row of it
+    /// away, None neither (`constraints::key_check_over`).
+    fn kept(&self, keys: &[String]) -> Vec<Option<bool>> {
+        keys.iter().map(|k| if self.live.contains_key(k) { Some(true) } else { self.gone.contains(k).then_some(false) }).collect()
+    }
 }
 
 /// READ COMMITTED or REPEATABLE READ (ADR-067 §1). READ UNCOMMITTED is READ COMMITTED, as in Postgres.
@@ -106,6 +162,7 @@ struct Txn {
     locked: bool,           // it holds row locks
     state: State,
     tables: BTreeMap<String, Changes>,
+    by_key: BTreeMap<String, ByKey>, // (a keyed table's kept rows' keys: `ByKey`)
     reads: BTreeMap<String, Reads>,
     marks: Vec<Mark>,       // its savepoints, oldest first (ADR-067 §9)
     failed: Option<String>,
@@ -329,6 +386,7 @@ fn rollback_to(s: &str, sql: &str) -> Result<(&'static str, Option<String>)> {
     on_open(s, "ROLLBACK TO SAVEPOINT", "ROLLBACK", |t| {
         let i = mark_of(t, &name)?;
         let Mark { tables, reads, .. } = t.marks[i].clone();
+        t.by_key = t.by_key.iter().map(|(name, b)| Ok((name.clone(), ByKey::of(&b.key, tables.get(name))?))).collect::<Result<_>>()?;
         (t.tables, t.reads) = (tables, reads);
         t.marks.truncate(i + 1);
         t.failed = None;
@@ -402,7 +460,7 @@ fn start(app: &crate::server::App, s: &str, level: Level, read_only: bool) -> bo
     let id = uuid::Uuid::new_v4().simple().to_string();
     let txn = Txn {
         id, lake: app.lake.url.clone(), level, read_only, snapshot: app.lake.visible(), ran: false, leader: leader_of(app),
-        locked: false, state: State::Open, tables: BTreeMap::new(), reads: BTreeMap::new(), marks: vec![], failed: None,
+        locked: false, state: State::Open, tables: BTreeMap::new(), by_key: BTreeMap::new(), reads: BTreeMap::new(), marks: vec![], failed: None,
         used: Instant::now(), busy: 0, next: -1,
     };
     book.txns.insert(s.to_string(), txn);
@@ -687,7 +745,7 @@ async fn upkeep() {
                     gone.push(place(t));
                     t.locked = false;
                 }
-                (t.state, t.tables, t.reads, t.marks) = (State::Ended(Instant::now()), BTreeMap::new(), BTreeMap::new(), vec![]);
+                (t.state, t.tables, t.by_key, t.reads, t.marks) = (State::Ended(Instant::now()), BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), vec![]);
             }
             book.txns.retain(|_, t| !matches!(t.state, State::Ended(at) if at.elapsed() >= ENDED_FOR));
             let holding: Vec<Place> = book.txns.values().filter(|t| t.locked && t.state == State::Open).map(place).collect();
@@ -807,7 +865,8 @@ async fn insert_rows(l: &Locks<'_>, stored: &TableMeta, query: &str, snapshot: u
         let ctx = if files { ctx.enable_url_table() } else { ctx };
         let rows = crate::write::rows(&ctx, l.meta, query).await?;
         crate::defaults::check(stored, l.name, &rows)?;
-        let keys = write_keys(l.meta, &[], std::slice::from_ref(&rows))?;
+        // (over `LOCK_MAX` rows nothing is locked, `passes`, so their keys' text would be made for nothing)
+        let keys = if rows.num_rows() > LOCK_MAX { vec![] } else { write_keys(l.meta, &[], std::slice::from_ref(&rows))? };
         Ok((rows, keys))
     })
     .await
@@ -944,22 +1003,30 @@ pub async fn statement(app: &crate::server::App, stmt: &Stmt, files: bool) -> Re
     let (old, new, at, keys) = match insert {
         Some(query) => {
             let (rows, at, keys) = insert_rows(&l, &stored, &query, snapshot, files).await?;
+            if crate::constraints::key_checked(&stored) {
+                // A plain INSERT's keys are checked at the statement, where Postgres checks them, so a SAVEPOINT can roll the
+                // refusal back: a key this transaction's own rows hold is refused, one it took away is free (`ByKey`), and the
+                // rest are looked up in the table as it is now. COMMIT checks them again (`write_changes`).
+                let texts = key_texts(&rows, &meta.key)?;
+                let kept = with_txn(|t| t.by_key.get(&name).map(|by| by.kept(&texts))).flatten().unwrap_or_else(|| vec![None; texts.len()]);
+                crate::constraints::key_check_over(lake, &name, &stored, &rows, &kept).await?;
+            }
             (vec![], vec![rows], at, keys)
         }
         None => change(&l, &stored, stmt, snapshot).await?,
     };
     let out = tally(&old, &new);
-    keep(&name, old, new, at, keys, &id)?;
+    keep(&name, &meta.key, old, new, at, keys, &id)?;
     Ok(Some(out))
 }
 
-/// A keyed table's UPDATE or DELETE outside a transaction (ADR-067 §7): a transaction of its own that is this one statement,
-/// READ COMMITTED. Its rows are worked out and their keys locked under an owner of its own (`auto-…`, never a session's
-/// transaction), and worked out again if they moved; then its change is appended through the log. Its locks are held while
-/// the append is in flight, and go with its answer (`Hold`), or with their lease when no answer came; the table is registered as appending meanwhile, so a writer
-/// closing it (`locks::close`) waits for the append. It takes no lake lock and no session state. The producer is the job's
-/// (`sql:{job}`), so a retried one is a duplicate. MERGE and tables with an enforced UNIQUE don't come here
-/// (`write::on_node_listed`).
+/// A keyed table's UPDATE or DELETE, or a plain INSERT into a table whose key is checked, outside a transaction (ADR-067 §7):
+/// a transaction of its own that is this one statement, READ COMMITTED. Its rows are worked out and their keys locked under an
+/// owner of its own (`auto-…`, never a session's transaction), and worked out again if they moved; then its change is appended
+/// through the log. Its locks are held while the append is in flight, and go with its answer (`Hold`), or with their lease when no
+/// answer came; the table is registered as appending meanwhile, so a writer closing it (`locks::close`) waits for the append. It
+/// takes no lake lock and no session state. The producer is the job's (`sql:{job}`), so a retried one is a duplicate. MERGE and
+/// tables with an enforced UNIQUE don't come here (`write::on_node_listed`).
 pub async fn autocommit(app: &crate::server::App, stmt: &Stmt, job: &str) -> Result<Value> {
     let owner = format!("auto-{}", uuid::Uuid::new_v4().simple());
     let taken = AtomicBool::new(false);
@@ -971,6 +1038,9 @@ pub async fn autocommit(app: &crate::server::App, stmt: &Stmt, job: &str) -> Res
 }
 
 async fn autocommit_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: &str, taken: &AtomicBool, hold: &mut Hold) -> Result<Value> {
+    if matches!(stmt, Stmt::Insert(..)) {
+        return insert_as(app, stmt, job, owner, taken, hold).await;
+    }
     let lake = &app.lake;
     let name = stmt.table();
     let stored = stored_table(lake, &name).await?;
@@ -1002,6 +1072,47 @@ async fn autocommit_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: 
     Ok(if ack.duplicate { j!({"duplicate": true}) } else { out })
 }
 
+/// A plain INSERT outside a transaction (`autocommit`). Its rows are worked out and their keys locked as an UPDATE's are, so two
+/// nodes inserting one new key at once wait for each other, and the second is refused (23505) once the first has committed. A
+/// job whose append is in is a duplicate, found before anything is worked out: its rows are in, and they would meet their own
+/// keys. An INSERT takes rows back from no one, so none of an UPDATE's or DELETE's checks apply (`refuse_change`,
+/// `views::can_follow`, `views::filling`). `key_check` runs under the locks; over `LOCK_MAX` keys no lock is taken, and the check
+/// still runs (the documented limit).
+async fn insert_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: &str, taken: &AtomicBool, hold: &mut Hold) -> Result<Value> {
+    let lake = &app.lake;
+    if crate::write::sent(lake, job).await? {
+        return Ok(j!({"duplicate": true}));
+    }
+    let name = stmt.table();
+    let stored = stored_table(lake, &name).await?;
+    let meta = stored.logical();
+    let sql = crate::write::rows_sql(&meta, stmt)?;
+    let files = crate::change::FILES.try_with(|f| *f).unwrap_or(false);
+    let l = Locks { app, name: &name, meta: &meta, owner: owner.to_string(), txn: false, locking: true, committed: true, wait: lock_wait(), taken };
+    let (batch, _, _) = insert_rows(&l, &stored, &sql, lake.visible(), files).await?;
+    // (the lock's grant brought this node up to its leader's commit, so a retry whose append landed while it waited is seen
+    // here: the check before the locks can't see it, and the key check would meet the job's own rows)
+    if crate::write::sent(lake, job).await? {
+        return Ok(j!({"duplicate": true}));
+    }
+    crate::constraints::key_check(lake, &name, &stored, None, &batch).await?; // (under the locks: the rows the other writer committed are here)
+    let n = batch.num_rows();
+    pause_for_tests().await;
+    let src = crate::log::Src { producer: format!("sql:{job}"), seq: 1, prev: None };
+    let log = app.log()?;
+    hold.sending(); // (from here its locks go with its answer, not before: the next writer must see this append)
+    let ack = match log.append(name.clone(), src, batch).await {
+        Ok(ack) => ack,
+        Err(e) => {
+            if crate::log::unanswered(&e) {
+                hold.lost(); // (no answer came: the append may still land, so its locks wait for their lease)
+            }
+            return Err(e);
+        }
+    };
+    Ok(if ack.duplicate { j!({"duplicate": true}) } else { j!({"rows": n}) })
+}
+
 /// The test hook `PONDRA_TEST_AUTOCOMMIT_PAUSE_MS` (read once): an autocommitted write waits this long after it works its rows
 /// out, with its locks held and its table registered as appending (`tools/harness.py autocommit`'s gate check).
 static PAUSE: LazyLock<Option<Duration>> = LazyLock::new(|| crate::env::parse::<u64>("PONDRA_TEST_AUTOCOMMIT_PAUSE_MS").map(Duration::from_millis));
@@ -1014,7 +1125,7 @@ async fn pause_for_tests() {
 
 /// Keeps a statement's writes in its transaction. A statement that outlived its transaction (the id it captured is not the
 /// open one's) is refused (25000), never written into the next one (ADR-067 §1).
-fn keep(table: &str, old: Vec<RecordBatch>, new: Vec<RecordBatch>, at: u64, keys: Option<Keys>, id: &str) -> Result<()> {
+fn keep(table: &str, key: &[String], old: Vec<RecordBatch>, new: Vec<RecordBatch>, at: u64, keys: Option<Keys>, id: &str) -> Result<()> {
     let s = crate::temp::current().context(NO_SESSION)?;
     let mut book = BOOK.lock().unwrap();
     let t = book.txns.get_mut(&s).filter(|t| t.state == State::Open).context("no transaction in progress")?;
@@ -1022,13 +1133,19 @@ fn keep(table: &str, old: Vec<RecordBatch>, new: Vec<RecordBatch>, at: u64, keys
         return Err(ended_since());
     }
     let c = t.tables.entry(table.to_string()).or_default();
+    let mut by = (!key.is_empty()).then(|| t.by_key.entry(table.to_string()).or_insert_with(|| ByKey { key: key.to_vec(), ..Default::default() }));
     let mut mine = HashSet::new(); // (rows of its own it replaces: no `_version`)
     for b in old.iter().filter(|b| b.num_rows() > 0) {
         let ids = b.column_by_name(crate::sys::ROW_ID).context("old rows' ids")?.as_primitive::<Int64Type>();
         let versions = b.column_by_name(crate::sys::VERSION).context("old rows' versions")?;
         let theirs = BooleanArray::from((0..b.num_rows()).map(|i| Some(versions.is_valid(i))).collect::<Vec<_>>());
         mine.extend((0..b.num_rows()).filter(|&i| !versions.is_valid(i)).map(|i| ids.value(i)));
-        c.old.push(datafusion::arrow::compute::filter_record_batch(b, &theirs)?);
+        let taken = datafusion::arrow::compute::filter_record_batch(b, &theirs)?;
+        if let Some(by) = by.as_mut() {
+            by.taken(&taken)?;
+            by.dropped(&datafusion::arrow::compute::filter_record_batch(b, &datafusion::arrow::compute::not(&theirs)?)?)?;
+        }
+        c.old.push(taken);
     }
     if !mine.is_empty() {
         for b in c.new.iter_mut() {
@@ -1049,7 +1166,11 @@ fn keep(table: &str, old: Vec<RecordBatch>, new: Vec<RecordBatch>, at: u64, keys
                 }
             });
         }
-        c.new.push(set(&b, crate::sys::ROW_ID, Arc::new(Int64Array::from(ids)))?);
+        let kept = set(&b, crate::sys::ROW_ID, Arc::new(Int64Array::from(ids)))?;
+        if let Some(by) = by.as_mut() {
+            by.added(&kept)?;
+        }
+        c.new.push(kept);
     }
     note(t.reads.entry(table.to_string()).or_default(), keys, at);
     t.used = Instant::now();
@@ -1113,7 +1234,8 @@ fn fresh(new: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
 /// they are left out, as `SELECT *` leaves them).
 pub fn overlaid(ctx: &datafusion::prelude::SessionContext, table: &str, key: &[String], base: Arc<dyn datafusion::catalog::TableProvider>, sys: bool) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
     use datafusion::prelude::*;
-    let Some(c) = with_txn(|t| t.tables.get(table).cloned()).flatten() else { return Ok(base) };
+    let kept = |t: &Txn| t.by_key.get(table).map(|by| by.live.keys().chain(&by.gone).cloned().collect::<HashSet<String>>()).unwrap_or_default();
+    let Some((c, keys)) = with_txn(|t| t.tables.get(table).map(|c| (c.clone(), kept(t)))).flatten() else { return Ok(base) };
     let schema = base.schema();
     let mut df = ctx.read_table(base)?;
     let ids: Vec<Expr> = c.old.iter().chain(&c.new).filter_map(|b| b.column_by_name(crate::sys::ROW_ID)).flat_map(|c| c.as_primitive::<Int64Type>().iter().flatten().filter(|i| *i >= 0).collect::<Vec<_>>()).map(lit).collect();
@@ -1124,7 +1246,7 @@ pub fn overlaid(ctx: &datafusion::prelude::SessionContext, table: &str, key: &[S
         // (a keyed table's row is its key's: an INSERT of a key there replaces it. One IN list over the key as text, not an
         // OR per key: a transaction that changed 12,000 keys made an expression 12,000 deep, and planning it overflowed the
         // stack and took the node down. A key of several columns joins them with KEY_SEP (\u{1}), which no key's text holds in practice)
-        let keys: HashSet<String> = c.new.iter().chain(&c.old).flat_map(|b| keys_of(b, key).unwrap_or_default()).map(|k| k.join(KEY_SEP)).collect();
+        // (the kept rows' keys, `ByKey`: as `key_texts` writes them)
         if !keys.is_empty() {
             let text = match key {
                 [one] => cast(col(one), DataType::Utf8),
@@ -1143,6 +1265,10 @@ pub fn overlaid(ctx: &datafusion::prelude::SessionContext, table: &str, key: &[S
     }
     Ok(df.into_view())
 }
+
+/// Each row's key as one text: its columns' (`keys_of`) joined by KEY_SEP. The overlay's IN list, `ByKey` and a plain
+/// INSERT's check (`constraints::key_check`) name a key so.
+pub(crate) fn key_texts(b: &RecordBatch, key: &[String]) -> Result<Vec<String>> { Ok(keys_of(b, key)?.into_iter().map(|k| k.join(KEY_SEP)).collect()) }
 
 /// Each row's key, as text.
 fn keys_of(b: &RecordBatch, key: &[String]) -> Result<Keys> {
@@ -1431,7 +1557,7 @@ async fn write_changes(lake: &Lake, seq: &crate::log::Sequencer, c: Commit) -> R
             mine.extend(reads.keys.keys().filter(|k| is_on(k.as_slice())).cloned());
         }
         conflicts(lake, name, &meta, &reads, &mine).await?;
-        let (p, _) = crate::change::appends(lake, seq, name, &stored, old, new, &format!("txn:{}:{name}", c.id)).await?;
+        let (p, _) = crate::change::appends(lake, seq, name, &stored, old, new, &format!("txn:{}:{name}", c.id), true).await?; // (a plain INSERT's key is new at COMMIT too: `constraints.rs`)
         pending.extend(p);
     }
     if pending.is_empty() {
@@ -1656,6 +1782,24 @@ pub async fn point_read(lake: &Lake, sql: &str) -> Result<Option<Vec<RecordBatch
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_transactions_keys_are_kept_as_its_rows_are() {
+        use datafusion::arrow::array::StringArray;
+        let rows = |ids: &[i64], names: &[&str]| RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef), ("name", Arc::new(StringArray::from(names.to_vec())) as ArrayRef)]).expect("a batch");
+        let key = vec!["id".to_string(), "name".to_string()];
+        let mut by = ByKey { key: key.clone(), ..Default::default() };
+        by.added(&rows(&[1, 2], &["a", "b"])).expect("added");
+        by.taken(&rows(&[3], &["c"])).expect("taken");
+        let texts = key_texts(&rows(&[1, 3, 4], &["a", "c", "a"]), &key).expect("texts");
+        assert_eq!(by.kept(&texts), vec![Some(true), Some(false), None], "its own row's key, one it took away, neither");
+        by.dropped(&rows(&[1], &["a"])).expect("dropped");
+        assert_eq!(by.kept(&texts), vec![None, Some(false), None], "a row of its own replaced or deleted frees its key");
+        // (made again from the rows, as ROLLBACK TO does, it is the same)
+        let c = Changes { new: vec![rows(&[2], &["b"])], old: vec![rows(&[3], &["c"])] };
+        let again = ByKey::of(&key, Some(&c)).expect("made again");
+        assert_eq!((again.live, again.gone), (by.live, by.gone));
+    }
 
     #[test]
     fn begin_takes_its_modes_and_refuses_what_is_not_built() {

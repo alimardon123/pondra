@@ -58,7 +58,7 @@ def sharing_check(bin, work, port, s3):
     q("INSERT INTO sales.orders SELECT x, CASE WHEN x % 3 = 0 THEN 'EU' WHEN x % 3 = 1 THEN 'US' ELSE 'UK' END, x * 1.5 FROM generate_series(1, 3000) AS s(x)")
     q("CREATE TABLE kv (id BIGINT PRIMARY KEY, v VARCHAR, n BIGINT)")
     q("INSERT INTO kv VALUES (1, 'a', 1), (2, 'b', 2), (3, 'c', 3)")
-    q("INSERT INTO kv VALUES (2, 'b2', 20)")
+    q("INSERT OR REPLACE INTO kv VALUES (2, 'b2', 20)")  # (an upsert: a plain INSERT of key 2 is refused, 23505)
     q("CREATE TABLE secret_table (id BIGINT)")
     tier()
 

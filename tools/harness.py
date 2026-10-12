@@ -34,6 +34,7 @@
   harness.py answers_big         answers in pieces: the same bytes as whole; 3M rows over 0.25 GB (53200 past it); turns (53300)
   harness.py friendly            SQL as DuckDB's users write it (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, …) == DuckDB's answers, spread too
   harness.py unique_doors        UNIQUE through every loading door (appends, Flight, COPY): 23505 whole, retries duplicates, order, three nodes
+  harness.py pkey                PRIMARY KEY: a plain INSERT of a key the table holds is refused (23505) at every SQL door; upserts and loaders still upsert
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py cursors             DECLARE, FETCH, MOVE, CLOSE on the Postgres port; cancelling a running statement (psycopg, psql)
   harness.py all                 quick run of everything
@@ -1040,7 +1041,7 @@ def clouds():
         sql(A.port, "CREATE TABLE t (id BIGINT, v VARCHAR)")
         rows = lambda lo, hi: "INSERT INTO t VALUES " + ", ".join(f"({i}, 'v{i % 7}')" for i in range(lo, hi))
         sql(A.port, rows(0, 1000))
-        until(lambda: sql(A.port + 1, "SELECT count(*) AS n FROM t"), [{"n": 1000}], 10)
+        until(lambda: _try(lambda: sql(A.port + 1, "SELECT count(*) AS n FROM t")), [{"n": 1000}], 10)  # (a follower may not hold t yet: 404 until it does)
         sql(A.port + 1, rows(1000, 2000))  # (a follower's write, sequenced by the leader)
         call(A.port, "POST", "/tier", timeout=300, headers={"x-pondra-owner": owner})
         want = lambda n: [{"n": n, "s": n * (n - 1) // 2}]
@@ -1372,7 +1373,7 @@ def tails():
         cols, vals = ("(id, s, x)", f"({i}, 's{i}', {i}), ({i + 100000}, NULL, NULL)") if x else ("(id, s)", f"({i}, 's{i}'), ({i + 100000}, NULL)")
         q(f"INSERT INTO t {cols} VALUES {vals}")
         model.extend([(i, f"s{i}", i if x else None), (i + 100000, None, None)])
-        q(f"INSERT INTO kv VALUES ({i % 7}, {i})")
+        q(f"INSERT OR REPLACE INTO kv VALUES ({i % 7}, {i})")  # (an upsert: keys repeat)
         kv[i % 7] = i
     for i in range(40):
         insert(i)
@@ -2803,7 +2804,7 @@ def refreshed():
     later = True
     q("INSERT INTO orders " + ORDER_ROWS.format(501, 2500))  # a bulk INSERT: a file commit
     q("INSERT INTO orders VALUES ('south', 'c1', NULL, 196.5, TIMESTAMP '2026-10-05 00:00:00'), (NULL, 'c4', 'k2', 1.5, TIMESTAMP '2026-10-05 02:00:00')")
-    q("INSERT INTO prices VALUES (2, 25), (5, 50)")  # (an upsert and a new key)
+    q("INSERT OR REPLACE INTO prices VALUES (2, 25), (5, 50)")  # (an upsert and a new key)
     inserted = same()
     q("UPDATE orders SET amount = amount * 2 WHERE customer = 'c3'")
     q("DELETE FROM orders WHERE customer = 'c5' OR region IS NULL")
@@ -5903,7 +5904,7 @@ def upserts():
     same = lambda want: until(lambda: _try(lambda: (ours(), *theirs())), (want,) * 4, 30)
     rounds = []
     for stmt, want in (("INSERT INTO kv VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')", [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")]),
-                       ("INSERT INTO kv VALUES (2, 'B'), (6, 'f')", [(1, "a"), (2, "B"), (3, "c"), (4, "d"), (5, "e"), (6, "f")]),
+                       ("INSERT OR REPLACE INTO kv VALUES (2, 'B'), (6, 'f')", [(1, "a"), (2, "B"), (3, "c"), (4, "d"), (5, "e"), (6, "f")]),
                        ("DELETE FROM kv WHERE k = 4", [(1, "a"), (2, "B"), (3, "c"), (5, "e"), (6, "f")])):
         q(stmt)
         rounds.append(same(want) == (want,) * 4)
@@ -10370,6 +10371,10 @@ def waits():
     rrs = pf()
     rrs.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
     pl().execute("UPDATE acct SET balance = balance + 1 WHERE id = 9")
+    # (the follower holds that commit before the snapshot is taken: on a busy runner it may stream in after; within the
+    # 2 s idle end, which would end rrs's transaction)
+    seen = pf()
+    until(lambda: seen.execute("SELECT balance FROM acct WHERE id = 9").fetchone()[0], 1001, 1.5)
     rr_first = rrs.execute("SELECT balance FROM acct WHERE id = 9").fetchone()[0]
     pl().execute("UPDATE acct SET balance = balance + 1 WHERE id = 9")
     rr_second = rrs.execute("SELECT balance FROM acct WHERE id = 9").fetchone()[0]
@@ -10926,10 +10931,10 @@ def constraints():
     # A keyed table: a key's new version may keep its value; another key may not take it
     q("CREATE TABLE accounts (id INT PRIMARY KEY, handle TEXT, CONSTRAINT one_handle UNIQUE (handle))")
     q("INSERT INTO accounts VALUES (1, 'ann'), (2, 'bo')")
-    q("INSERT INTO accounts VALUES (1, 'ann')")  # (an upsert of its own row)
+    q("INSERT OR REPLACE INTO accounts VALUES (1, 'ann')")  # (an upsert of its own row: a plain INSERT of a held key is refused)
     q("UPDATE accounts SET handle = 'bob' WHERE id = 2")
     keyed = [err("INSERT INTO accounts VALUES (3, 'ann')"), err("UPDATE accounts SET handle = 'ann' WHERE id = 2")]
-    q("INSERT INTO accounts VALUES (2, 'bo'), (3, 'bob')")  # (2 lets 'bob' go as 3 takes it, in one statement)
+    q("INSERT OR REPLACE INTO accounts VALUES (2, 'bo'), (3, 'bob')")  # (2 lets 'bob' go as 3 takes it, in one statement)
     info["keyed"] = [keyed, rows("accounts")]
     checks["a keyed table: a key's upsert keeps its value; another key taking it is refused; a value let go and taken in one statement holds"] = \
         all(r[1] == "23505" for r in keyed) and rows("accounts") == [[1, "ann"], [2, "bo"], [3, "bob"]]
@@ -14712,18 +14717,380 @@ def answers_big():
     return "big answers go in pieces that are the whole's bytes, count in the query memory, and take turns"
 
 
+def pkey():
+    """A table's PRIMARY KEY (`constraints.rs`, `change.rs`): a plain SQL INSERT of a key the table holds
+    is refused (23505, Postgres's words) at every SQL door, on one node and on three: HTTP (a follower
+    too), the Postgres port, Flight SQL, MCP, `pondra sql` (also with no leader), a procedure and a task.
+    Two rows of one key in one INSERT (VALUES and SELECT) are refused whole, and CREATE TABLE … AS SELECT
+    with two rows of one key leaves no table. A deleted key is free again (before and after tiering), a
+    transaction's COMMIT refuses a key it holds, and an order_by table is keyed too. The upserts keep
+    upserting: ON CONFLICT, INSERT OR REPLACE and OR IGNORE, MERGE, /append, COPY FROM STDIN and a Kafka
+    produce. A plain INSERT takes its keys' row locks on the leader (`txn::autocommit_as`): two nodes
+    inserting the same new key at once, the second waits for the first and is refused (at its INSERT, as
+    Postgres does). A transaction's plain INSERT is refused at its statement when the key is held as the
+    transaction sees it (its own kept writes count; a SAVEPOINT can roll the refusal back), and COMMIT checks
+    again: a change moving a key onto a held one is refused, and a DELETE and an INSERT of one key in one
+    transaction keep the new row. An UPDATE of a key column is refused by name (0A000), so a key moves by a
+    DELETE and an INSERT. A CREATE TABLE … AS SELECT refused by its key is purged, not kept for UNDROP."""
+    import psycopg, concurrent.futures as cf, urllib.request
+    import adbc_driver_flightsql.dbapi as adbc
+    import confluent_kafka as ck
+    lake = new_lake()
+    P, pg, kport, fport = A.port, A.port + 10, A.port + 20, A.port + 30
+    nodes = [Node(lake, P, flight=f"127.0.0.1:{fport}", pg=f"127.0.0.1:{pg}", kafka=f"127.0.0.1:{kport}").start()]
+    nodes += [Node(lake, P + i).start() for i in (1, 2)]
+    while len(call(P, "GET", "/stats")["nodes"]) < 3:
+        time.sleep(0.1)
+    q = lambda s, port=P: call(port, "POST", "/sql", s.encode(), timeout=120)
+    names = lambda port=P: {r["id"]: r["name"] for r in q("SELECT id, name FROM people", port)}
+
+    def err(s, port=P, path="/sql"):
+        """(status, x-pondra-sqlstate, the body's start) of a statement; (200, None, '') when it went in."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+        c.request("POST", path, s.encode(), {})
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        return (r.status, r.getheader("x-pondra-sqlstate"), data[:500]) if r.status != 200 else (200, None, "")
+
+    def mcp_write(sql):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "write", "arguments": {"sql": sql}}}).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{P}/mcp", data=body, headers={"content-type": "application/json"})
+        res = json.loads(urllib.request.urlopen(req).read())["result"]
+        return res["isError"], res["content"][0]["text"]
+
+    refused = lambda e: e[0] == 409 and e[1] == "23505"  # (409: a duplicate, by its SQLSTATE's class in `codes.rs`)
+    dup_words = lambda text: "duplicate key value violates unique constraint" in text
+    checks, info = {}, {}
+
+    q("CREATE TABLE people (id BIGINT PRIMARY KEY, name VARCHAR)")
+    q("INSERT INTO people VALUES (1, 'ann'), (2, 'bob')")
+    # The plain refusal at each door
+    http_one = err("INSERT INTO people VALUES (1, 'again')")
+    for _ in range(100):  # (the follower checks the keys it has: the commit that made key 2 must have reached it)
+        if 2 in names(P + 1):
+            break
+        time.sleep(0.1)
+    http_follower = err("INSERT INTO people VALUES (2, 'again')", P + 1)
+    info["http"] = [http_one, http_follower]
+    checks["HTTP: a plain INSERT of a key the table holds is refused (23505, people_pkey, Key (id)=(1) already exists), from a follower too"] = \
+        refused(http_one) and refused(http_follower) and "people_pkey" in http_one[2] and "Key (id)=(1) already exists" in http_one[2] and names() == {1: "ann", 2: "bob"}
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+        try:
+            conn.execute("INSERT INTO people VALUES (1, 'pg')")
+            pg_err = None
+        except psycopg.Error as e:
+            pg_err = (e.sqlstate, str(e))
+    info["postgres"] = pg_err
+    checks["the Postgres port: the same refusal, SQLSTATE 23505 and the same words"] = bool(pg_err) and pg_err[0] == "23505" and "people_pkey" in pg_err[1]
+    conn = adbc.connect(f"grpc://127.0.0.1:{fport}", autocommit=True)
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO people VALUES (1, 'flight')")
+        fl_err = None
+    except Exception as e:
+        fl_err = str(e)
+    info["flight_sql"] = fl_err
+    checks["Flight SQL (ADBC): the same refusal, with the same words"] = bool(fl_err) and dup_words(fl_err)
+    mcp_err, mcp_text = mcp_write("INSERT INTO people VALUES (1, 'mcp')")
+    info["mcp"] = [mcp_err, mcp_text[:200]]
+    checks["MCP's write tool: the same refusal, with the same words"] = mcp_err and dup_words(mcp_text)
+    cli_dup = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO people VALUES (1, 'cli')"], capture_output=True, text=True, timeout=120)
+    cli_new = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO people VALUES (3, 'cli')"], capture_output=True, text=True, timeout=120)
+    info["cli"] = [cli_dup.returncode, cli_dup.stderr[-200:], cli_new.returncode]
+    checks["pondra sql: refused by the same words (exit 1); a new key goes in"] = cli_dup.returncode != 0 and dup_words(cli_dup.stderr) and cli_new.returncode == 0 and names()[3] == "cli"
+    q("CREATE PROCEDURE add_person(i BIGINT, n VARCHAR) LANGUAGE sql AS $$ INSERT INTO people VALUES ($i, $n) $$")
+    proc_dup = err("CALL add_person(1, 'proc')")
+    q("CALL add_person(4, 'proc')")
+    info["procedure"] = proc_dup
+    checks["inside a procedure: the same refusal (23505); the procedure's new key goes in"] = refused(proc_dup) and dup_words(proc_dup[2]) and names()[4] == "proc"
+    q("CREATE TASK pk_tick SCHEDULE '1 second' AS INSERT INTO people VALUES (1, 'task')")
+    failed = []
+    for _ in range(100):  # (a tick a second: its failed run within 30 s)
+        failed = q("SELECT status, error FROM pondra.runs WHERE routine = 'pk_tick' AND status = 'failed' LIMIT 1")
+        if failed:
+            break
+        time.sleep(0.3)
+    q("DROP TASK pk_tick")
+    info["task"] = failed
+    checks["inside a task: each tick is refused the same way (its run is failed, with the words); the row stays as it was"] = \
+        bool(failed) and dup_words(failed[0]["error"]) and names()[1] == "ann"
+
+    # Two rows of one key in one INSERT: refused whole
+    two_values = err("INSERT INTO people VALUES (5, 'x'), (5, 'y')")
+    q("CREATE TABLE src_dup (k BIGINT, n VARCHAR)")
+    q("INSERT INTO src_dup VALUES (7, 'a'), (7, 'b'), (8, 'c')")
+    two_select = err("INSERT INTO people SELECT k, n FROM src_dup")
+    info["two_in_one"] = [two_values, two_select]
+    checks["two rows of one key in one INSERT (VALUES, or SELECT): 23505, and nothing of the statement lands"] = \
+        refused(two_values) and refused(two_select) and not {5, 7, 8} & set(names())
+
+    # The upserts keep upserting
+    q("INSERT INTO people VALUES (1, 'ann pro') ON CONFLICT (id) DO UPDATE SET name = excluded.name")
+    q("INSERT INTO people VALUES (2, 'lost') ON CONFLICT (id) DO NOTHING")
+    q("INSERT OR REPLACE INTO people VALUES (2, 'bob v2')")
+    q("INSERT OR IGNORE INTO people VALUES (1, 'ignored')")
+    q("MERGE INTO people t USING (SELECT 1 AS id, 'merged' AS name) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET name = s.name")
+    got = names()
+    info["upserts"] = got
+    checks["ON CONFLICT DO UPDATE and DO NOTHING, INSERT OR REPLACE and OR IGNORE, MERGE still upsert"] = got[1] == "merged" and got[2] == "bob v2"
+
+    # Loading doors: still upserts
+    post = err('{"id": 1, "name": "append"}\n', P, "/append/people")
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+        with conn.cursor().copy("COPY people FROM STDIN") as cp:
+            cp.write("1\tcopy\n")
+    kp = ck.Producer({"bootstrap.servers": f"127.0.0.1:{kport}", "enable.idempotence": True, "linger.ms": 50, "message.timeout.ms": 20000})
+    kafka_errs = []
+    kp.produce("people", value=json.dumps({"id": 1, "name": "kafka"}), on_delivery=lambda e, m: kafka_errs.append(e and e.name()))
+    kp.flush(30)
+    info["loaders"] = [post, kafka_errs]
+    checks["/append, COPY FROM STDIN and a Kafka produce still upsert a key the table holds (each goes in)"] = \
+        post[0] == 200 and kafka_errs == [None] and names()[1] == "kafka"
+
+    # A deleted key is free again, before and after tiering
+    q("DELETE FROM people WHERE id = 2")
+    gone = names()
+    q("INSERT INTO people VALUES (2, 'back')")
+    q("DELETE FROM people WHERE id = 1")
+    call(P, "POST", "/tier", timeout=600)
+    q("INSERT INTO people VALUES (1, 'after tiering')")
+    info["deleted"] = [gone, names()]
+    checks["a deleted key can be inserted again, its delete marker in the log or tiered into files"] = 2 not in gone and names()[2] == "back" and names()[1] == "after tiering"
+
+    # A retried job (the same job id, after a lost answer): its plain INSERT is a duplicate, not a refusal
+    def mcp_job(sql, job):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "write", "arguments": {"sql": sql, "job": job}}}).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{P}/mcp", data=body, headers={"content-type": "application/json"})
+        res = json.loads(urllib.request.urlopen(req).read())["result"]
+        return res["isError"], res["content"][0]["text"]
+    job_first = mcp_job("INSERT INTO people VALUES (400, 'job')", "pk-job-400")
+    job_again = mcp_job("INSERT INTO people VALUES (400, 'job')", "pk-job-400")
+    info["retried_job"] = [job_first, job_again]
+    checks["a retried job's plain INSERT answers duplicate, not 23505 (its own row holds the key); its row goes in once"] = \
+        job_first[0] is False and job_again[0] is False and "duplicate" in job_again[1] and names().get(400) == "job"
+
+    # Two nodes, the leader (P, started first) and a follower (P + 1), insert the same 50 new keys at once: one INSERT per key per
+    # node, both statements started together. A plain INSERT takes its keys' row locks on the leader, so the second waits for the
+    # first to commit and is then refused (23505): exactly one of each pair goes in, each key holds one row, and its value is its
+    # winner's.
+    roles = (call(P, "GET", "/stats")["role"], call(P + 1, "GET", "/stats")["role"])
+    def race(k):
+        start = threading.Barrier(2)
+        def go(port):
+            start.wait()
+            return err(f"INSERT INTO people VALUES ({k}, 'race{port}')", port)
+        with cf.ThreadPoolExecutor(2) as ex:
+            return dict(zip((P, P + 1), ex.map(go, (P, P + 1))))
+    races = {k: race(k) for k in range(1000, 1050)}
+    winners = {k: [port for port, r in outcome.items() if r[0] == 200] for k, outcome in races.items()}
+    refusals = [r for outcome in races.values() for r in outcome.values() if r[0] != 200]
+    counted = q("SELECT count(*) AS n, count(DISTINCT id) AS d FROM people WHERE id BETWEEN 1000 AND 1049")[0]
+    got = names()
+    info["race"] = [roles, sum(len(w) for w in winners.values()), len(refusals), sorted({r[1] for r in refusals}), counted]
+    checks["two nodes (the leader and a follower) inserting the same 50 new keys at once: exactly 50 go in and 50 are refused (23505); each key holds one row, and its value is its winner's"] = \
+        roles == ("leader", "follower") and all(len(w) == 1 for w in winners.values()) and len(refusals) == 50 and all(refused(r) for r in refusals) \
+        and counted == {"n": 50, "d": 50} and all(got[k] == f"race{winners[k][0]}" for k in races)
+
+    # A change's keys at COMMIT (`constraints::key_check`, with the change's old rows): a change moving a
+    # key onto one the table holds is refused; a swap of two keys, a key the transaction deleted or
+    # replaced, an upsert of a held key and a key a change moves away all commit; a plain INSERT of a
+    # key the transaction inserted earlier, or one the table holds, is refused at its statement (23505)
+    q("CREATE TABLE moves (id BIGINT PRIMARY KEY, n VARCHAR)")
+    q("INSERT INTO moves VALUES (1, 'a'), (2, 'b'), (3, 'c'), (5, 'e')")
+
+    def txn(*stmts):
+        """The statements in one transaction over the Postgres port: None, or (SQLSTATE, where it failed)."""
+        with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+            cur = conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                for s in stmts:
+                    cur.execute(s)
+            except psycopg.Error as e:
+                return (e.sqlstate, "statement")
+            try:
+                cur.execute("COMMIT")
+            except psycopg.Error as e:
+                return (e.sqlstate, "commit")
+            return None
+
+    mv = lambda: {r["id"]: r["n"] for r in q("SELECT id, n FROM moves")}
+    moved_onto = txn("UPDATE moves SET id = 2 WHERE id = 1")  # (an UPDATE of a key column: refused by name, 0A000)
+    swap = txn("UPDATE moves SET id = 3 - id WHERE id IN (1, 2)")
+    swapped = mv()
+    deleted_then_inserted = txn("DELETE FROM moves WHERE id = 3", "INSERT INTO moves VALUES (3, 'again')")
+    twice_in_txn = txn("INSERT INTO moves VALUES (7, 'x')", "INSERT INTO moves VALUES (7, 'y')")
+    replaced = txn("INSERT OR REPLACE INTO moves VALUES (5, 'replaced')")
+    conflicted = txn("INSERT INTO moves VALUES (5, 'conflict') ON CONFLICT (id) DO UPDATE SET n = excluded.n")
+    held_plain = txn("INSERT INTO moves VALUES (5, 'held')")
+    freed = txn("UPDATE moves SET id = 10 WHERE id = 5")
+    final = mv()
+    info["moves"] = [moved_onto, swap, swapped, deleted_then_inserted, twice_in_txn, replaced, conflicted, held_plain, freed, final]
+    checks["an UPDATE of a key column (a move, a swap) is refused by name (0A000); a key the transaction deleted and inserted again, an upsert of a held key commit; a plain INSERT of a held key, or of a key the transaction inserted earlier, is refused at its statement (23505)"] = \
+        moved_onto == ("0A000", "statement") and swap == ("0A000", "statement") and deleted_then_inserted is None and twice_in_txn == ("23505", "statement") \
+        and replaced is None and conflicted is None and held_plain == ("23505", "statement") and freed == ("0A000", "statement") \
+        and final == {1: "a", 2: "b", 3: "again", 5: "conflict"}
+
+    # Two transactions inserting the same new key: the second's INSERT waits for the first to commit (its row lock), and its
+    # COMMIT is refused (23505) at the check; one row stays, the first's
+    first, second = psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True), psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True)
+    c1, c2 = first.cursor(), second.cursor()
+    c1.execute("BEGIN")
+    c1.execute("INSERT INTO people VALUES (1500, 'first')")
+    c2.execute("BEGIN")
+    waited = {}
+    def second_insert():
+        try:
+            c2.execute("INSERT INTO people VALUES (1500, 'second')")
+            waited["ok"] = True
+        except psycopg.Error as e:
+            waited["err"] = e.sqlstate
+    t = threading.Thread(target=second_insert)
+    t.start()
+    t.join(1.5)
+    blocked = t.is_alive()  # (still waiting on the first transaction's lock)
+    c1.execute("COMMIT")
+    t.join(60)
+    waited_err = waited.get("err")  # (the second INSERT was refused at its statement: the key the first committed is held)
+    try:
+        c2.execute("SELECT 1")  # (the refused INSERT failed the second transaction: its next statement is refused too)
+        after_refusal = None
+    except psycopg.Error as e:
+        after_refusal = e.sqlstate
+    try:
+        c2.execute("COMMIT")  # (a failed transaction's COMMIT is its ROLLBACK, which is no error)
+        second_commit = None
+    except psycopg.Error as e:
+        second_commit = e.sqlstate
+    first.close()
+    second.close()
+    info["two_txns"] = [blocked, waited, after_refusal, second_commit, names().get(1500)]
+    checks["two transactions inserting one new key: the second's INSERT waits for the first to commit, and is refused at that INSERT (23505); its next statement is 25P02; the first's row stays"] = \
+        blocked and waited_err == "23505" and after_refusal == "25P02" and second_commit is None and names().get(1500) == "first"
+
+    # A DELETE and an INSERT of one key in one transaction: the key has the new row (its delete marker doesn't shadow it)
+    q("INSERT INTO people VALUES (1600, 'old')")
+    delete_insert = txn("DELETE FROM people WHERE id = 1600", "INSERT INTO people VALUES (1600, 'new')")
+    info["delete_insert"] = [delete_insert, names().get(1600)]
+    checks["DELETE then INSERT of one key in one transaction, COMMIT: the key has the new row"] = delete_insert is None and names().get(1600) == "new"
+
+    # A SAVEPOINT rolls back a refused INSERT, as the programs that retry an insert on a key need (Django's get_or_create):
+    # the INSERT of a held key is refused at its statement, ROLLBACK TO SAVEPOINT clears the failure, and the next INSERT
+    # goes in. Only the new key's row lands.
+    before_sp = names().get(1)
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        cur.execute("SAVEPOINT s")
+        try:
+            cur.execute("INSERT INTO people VALUES (1, 'savepoint')")  # (key 1 is held)
+            sp_refused = None
+        except psycopg.Error as e:
+            sp_refused = e.sqlstate
+        cur.execute("ROLLBACK TO SAVEPOINT s")
+        cur.execute("INSERT INTO people VALUES (1700, 'after savepoint')")
+        cur.execute("COMMIT")
+    info["savepoint"] = [sp_refused, before_sp, names().get(1), names().get(1700)]
+    checks["BEGIN, SAVEPOINT, a plain INSERT of a held key refused at the INSERT (23505), ROLLBACK TO SAVEPOINT, a new key's INSERT, COMMIT: only the new key's row lands"] = \
+        sp_refused == "23505" and names().get(1) == before_sp and names().get(1700) == "after savepoint"
+
+    # A bulk INSERT … SELECT of new keys (past 1,000 keys: one query over the table, not a lookup each)
+    # and a VALUES with several keys: a held key among them refuses the whole statement
+    q("CREATE TABLE bulk (id BIGINT PRIMARY KEY, n VARCHAR)")
+    q("INSERT INTO bulk SELECT x AS id, 'a' AS n FROM generate_series(1, 5000) t(x)")
+    bulk_held = err("INSERT INTO bulk SELECT x AS id, 'b' AS n FROM generate_series(4990, 6000) t(x)")
+    bulk_values = err("INSERT INTO bulk VALUES (6001, 'x'), (1, 'x'), (9999, 'x')")
+    bulk_free = err("INSERT INTO bulk SELECT x AS id, 'c' AS n FROM generate_series(5001, 6000) t(x)")
+    bulk_rows = q("SELECT count(*) AS n FROM bulk")
+    info["bulk"] = [bulk_held, bulk_values, bulk_free, bulk_rows]
+    checks["a bulk INSERT … SELECT with a held key among 1,010 keys, and a VALUES with one among three: each refused whole (23505); 1,000 new keys go in"] = \
+        refused(bulk_held) and refused(bulk_values) and bulk_free[0] == 200 and bulk_rows == [{"n": 6000}]
+
+    # An attached lake's keyed table: its plain INSERT is checked here, where its rows are, then its leader records them
+    shop = new_lake()
+    nodes.append(Node(shop, P + 6).start())
+    q("CREATE TABLE stock (id BIGINT PRIMARY KEY, qty BIGINT)", P + 6)
+    q("INSERT INTO stock VALUES (1, 100)", P + 6)
+    q(f"ATTACH '{shop}' AS shop")
+    attached_held = err("INSERT INTO shop.stock VALUES (1, 5)")
+    attached_new = err("INSERT INTO shop.stock VALUES (2, 5)")
+    info["attached"] = [attached_held, attached_new]
+    checks["an attached lake's keyed table: a plain INSERT of a key it holds is refused (23505); a new key goes in and reads back"] = \
+        refused(attached_held) and attached_new[0] == 200 and q("SELECT qty FROM shop.stock WHERE id = 2") == [{"qty": 5}]
+
+    # A transaction: its INSERT of a key the table holds is refused at the statement (23505), and the transaction keeps nothing of it
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        cur.execute("INSERT INTO people VALUES (300, 'txn')")
+        try:
+            cur.execute("INSERT INTO people VALUES (1, 'txn dup')")
+            txn = None
+        except psycopg.Error as e:
+            txn = e.sqlstate
+        cur.execute("ROLLBACK")  # (the refused statement failed the transaction: it ends here)
+        cur.execute("BEGIN")
+        cur.execute("INSERT INTO people VALUES (302, 'txn ok')")
+        cur.execute("COMMIT")
+    info["txn"] = txn
+    checks["a transaction whose INSERT takes a key the table holds: the INSERT is refused at its statement (23505), the transaction keeps nothing of it, and a clean one commits"] = \
+        txn == "23505" and 300 not in names() and names().get(302) == "txn ok"
+
+    # order_by: a keyed table, its plain INSERT refused whatever the event time
+    q("CREATE TABLE events (id BIGINT PRIMARY KEY, ts BIGINT, v VARCHAR) WITH (order_by = 'ts')")
+    q("INSERT INTO events VALUES (1, 10, 'a')")
+    ev_plain = err("INSERT INTO events VALUES (1, 5, 'older')")
+    q("INSERT OR REPLACE INTO events VALUES (1, 5, 'older upsert')")
+    ev_after_older = q("SELECT v FROM events WHERE id = 1")
+    q("INSERT OR REPLACE INTO events VALUES (1, 20, 'newer')")
+    info["order_by"] = [ev_plain, ev_after_older]
+    checks["an order_by table is keyed too: a plain INSERT of a key it holds is refused whatever its time; an upsert keeps the latest time"] = \
+        refused(ev_plain) and ev_after_older == [{"v": "a"}] and q("SELECT v FROM events WHERE id = 1") == [{"v": "newer"}]
+
+    # CREATE TABLE … AS SELECT with a key: two rows of one key leave no table
+    ctas = q("CREATE TABLE people_copy (id BIGINT PRIMARY KEY, n VARCHAR) AS SELECT id, name AS n FROM people")
+    ctas_dup = err("CREATE TABLE dup_copy (id BIGINT PRIMARY KEY, n VARCHAR) AS SELECT k, n FROM src_dup")
+    no_table = err("SELECT count(*) AS n FROM dup_copy")
+    # The table it refused never held a row, so it is purged: not kept for UNDROP. An ordinary DROP is kept (the control).
+    q("CREATE TABLE kept_control (id BIGINT)")
+    q("DROP TABLE kept_control")
+    undrop_control = err("UNDROP TABLE kept_control")
+    undrop_dup = err("UNDROP TABLE dup_copy")
+    info["ctas"] = [ctas, ctas_dup, no_table, undrop_control[0], undrop_dup]
+    checks["CREATE TABLE … PRIMARY KEY AS SELECT: a key's rows once go in; two rows of one key are refused (23505) and the table isn't left behind, nor kept for UNDROP (an ordinary DROP is: the control)"] = \
+        q("SELECT count(*) AS n FROM people_copy") == q("SELECT count(*) AS n FROM people") and refused(ctas_dup) and no_table[0] == 404 \
+        and undrop_control[0] == 200 and undrop_dup[0] != 200
+
+    # pondra sql with no leader: it leads for a moment, and refuses the same way
+    for n in nodes:
+        n.kill()
+    led_dup = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO people VALUES (1, 'nobody leads')"], capture_output=True, text=True, timeout=120)
+    led_new = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO people VALUES (900, 'nobody leads')"], capture_output=True, text=True, timeout=120)
+    read = subprocess.run([BIN, "sql", "--dir", lake, "SELECT name FROM people WHERE id = 900"], capture_output=True, text=True, timeout=120)
+    info["no_leader"] = [led_dup.returncode, led_dup.stderr[-200:], led_new.returncode, read.stdout[-200:]]
+    checks["pondra sql with no leader running: refused by the same words; a new key goes in and reads back"] = \
+        led_dup.returncode != 0 and dup_words(led_dup.stderr) and led_new.returncode == 0 and "nobody leads" in read.stdout
+
+    ok = all(checks.values())
+    print(json.dumps({"pkey": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} PRIMARY KEY checks"
+
+
 # About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
 # prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
 # suite in parts side by side that end together. A section not listed counts as 5 s.
 SECS = {"memory": 255, "cursors": 15, "owned": 20, "signed": 20, "guesses": 15, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "measures": 120, "facts": 90, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
-        "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "ddlgaps": 40, "sqla": 30, "unique_doors": 60}
+        "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "ddlgaps": 40, "sqla": 30, "unique_doors": 60, "pkey": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -14755,7 +15122,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -14768,7 +15135,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
