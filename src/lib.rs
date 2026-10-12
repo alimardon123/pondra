@@ -23,6 +23,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod auth;
 #[cfg(feature = "server")] mod budget;
 #[cfg(feature = "server")] mod cache;
+#[cfg(feature = "server")] mod catalogs;
 #[cfg(feature = "server")] mod change;
 #[cfg(feature = "server")] mod codes;
 #[cfg(feature = "server")] mod copy;

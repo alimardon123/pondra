@@ -357,8 +357,16 @@ pub async fn put_new(lake: &Lake, url: &str, body: Vec<u8>) -> Result<bool> {
 /// …`replace`: the snapshot holds only the new files (an overwrite).
 pub async fn iceberg(lake: &Lake, spec: &crate::ext::Spec, df: datafusion::prelude::DataFrame, job: &str, replace: bool) -> Result<Value> {
     let url = spec.urls[0].trim_end_matches('/');
+    let (at, meta, d) = crate::read_iceberg::current(lake, url, &spec.options).await?;
+    crate::catalogs::within(d, written(lake, spec, df, job, replace, at, meta)).await
+}
+
+/// Write a table's files and commit their snapshot, on top of its current metadata (`at`, `meta`),
+/// as often as another writer's commit makes it wait. Run where the catalog's credentials for the
+/// table's location are in scope (`iceberg`).
+async fn written(lake: &Lake, spec: &crate::ext::Spec, df: datafusion::prelude::DataFrame, job: &str, replace: bool, mut at: String, mut meta: Value) -> Result<Value> {
+    let url = spec.urls[0].trim_end_matches('/');
     let rest = spec.options.contains_key("namespace");
-    let (mut at, mut meta) = crate::read_iceberg::current(lake, url, &spec.options).await?;
     if done(&meta, job) {
         return Ok(json!({"duplicate": true}));
     }
@@ -453,7 +461,7 @@ pub async fn iceberg(lake: &Lake, spec: &crate::ext::Spec, df: datafusion::prelu
             return Ok(json!({"rows": rows, "snapshot": snapshot_id}));
         }
         // Another writer committed first: on top of theirs (our files stay; the lists are new).
-        (at, meta) = crate::read_iceberg::current(lake, url, &spec.options).await?;
+        (at, meta, _) = crate::read_iceberg::current(lake, url, &spec.options).await?;
         if done(&meta, job) {
             return Ok(json!({"duplicate": true}));
         }
