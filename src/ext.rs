@@ -339,7 +339,15 @@ pub fn names(sql: &str) -> Vec<String> {
 pub fn said(e: &anyhow::Error) -> String {
     let mut out = String::new();
     for c in e.chain().map(|c| c.to_string()) {
-        let c = c.strip_prefix("External error: ").map(str::to_string).unwrap_or(c); // (DataFusion's wrapping of ours)
+        // Unwrap DataFusion's and Arrow's wrappers, repeatedly, so the inner message — the part a
+        // user can act on — leads, not an engine-internal label.
+        let mut c = c;
+        while let Some(inner) = ["External error: ", "Error during planning: ", "Arrow error: ", "Execution error: "]
+            .iter()
+            .find_map(|p| c.strip_prefix(p))
+        {
+            c = inner.to_string();
+        }
         if !out.contains(c.trim()) {
             out += if out.is_empty() { "" } else { ": " };
             out += &c;

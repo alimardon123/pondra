@@ -178,7 +178,7 @@ async fn log_of(app: &App, t: &Shared, version: Option<i64>) -> Result<(String, 
     let root = format!("{}/{folder}", lake.url.trim_end_matches('/'));
     let log = crate::read_delta::replay(lake, &root, version).await.map_err(|e| match version {
         Some(v) => invalid(format!("{}.{} has no version {v} to read: {e:#}", t.schema, t.name)),
-        None => Fail(StatusCode::SERVICE_UNAVAILABLE, "TEMPORARILY_UNAVAILABLE", format!("{}.{} isn't published yet (it is with the lake's next tiering round): {e:#}", t.schema, t.name)),
+        None => Fail(StatusCode::SERVICE_UNAVAILABLE, "TEMPORARILY_UNAVAILABLE", format!("{}.{} isn't available to share yet; its newest rows are still being written to the open format, so try again shortly: {e:#}", t.schema, t.name)),
     })?;
     Ok((folder, log))
 }
@@ -290,7 +290,7 @@ async fn query(State(app): State<App>, c: Caller, Path((share, schema, table)): 
             (Some(v), _) => Some(v),
             (None, Some(ts)) => Some(version_at(&app, t, ts, false).await?),
         };
-        ensure_not(ask["startingVersion"].is_number() || ask["endingVersion"].is_number(), "a range of versions (startingVersion) is a table's changes, which come in a later round: ask for a version")?;
+        ensure_not(ask["startingVersion"].is_number() || ask["endingVersion"].is_number(), "startingVersion/endingVersion asks for a change stream, which this share doesn't serve; request a single version or timestamp instead")?;
         let (folder, log) = log_of(&app, t, at).await?;
         let delta = delta_form(&c, t, &log)?;
         let files = files(&app, &c, t, &folder, &log, delta, ask["limitHint"].as_u64()).await?;
@@ -306,7 +306,7 @@ async fn query(State(app): State<App>, c: Caller, Path((share, schema, table)): 
 fn ensure_not(bad: bool, why: &str) -> Result<(), Fail> { if bad { Err(invalid(why.into())) } else { Ok(()) } }
 
 async fn changes(State(app): State<App>, c: Caller, Path((share, schema, table)): Path<(String, String, String)>) -> Response {
-    let r: Result<String, Fail> = Err(Fail(StatusCode::BAD_REQUEST, "FEATURE_NOT_SUPPORTED", "a table's changes come in a later round: query a version of a table shared WITH HISTORY".into()));
+    let r: Result<String, Fail> = Err(Fail(StatusCode::BAD_REQUEST, "FEATURE_NOT_SUPPORTED", "this share serves table versions, not a change data feed; query a specific version (a table shared WITH HISTORY can be read at any past version)".into()));
     c.audit(&app, &format!("changes of {share}.{schema}.{table}"), &r, |_| String::new());
     r.into_response()
 }
