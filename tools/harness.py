@@ -9275,7 +9275,7 @@ def enums():
     cascade_free = err("DROP TYPE rank CASCADE")
     rank_gone = err("DROP TYPE rank")
     info["cascade_free"] = [cascade_free, rank_gone]
-    checks["DROP TYPE … CASCADE drops a type no column uses (a plain DROP after finds none, 500)"] = cascade_free[0] == 200 and rank_gone[0] == 500
+    checks["DROP TYPE … CASCADE drops a type no column uses (a plain DROP after finds none, 404)"] = cascade_free[0] == 200 and rank_gone[0] == 404
     q("CREATE TYPE tint AS ENUM ('x', 'y')")
     q("CREATE TABLE tint_t (id INT, c tint)")
     casc = err("DROP TYPE tint CASCADE")
