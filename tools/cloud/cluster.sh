@@ -6,7 +6,8 @@
 #
 # hosts.txt: one "user@host private_ip" per line. env.sh: the bucket's credentials, sourced on
 # each machine (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT, AWS_REGION, and LAKE,
-# e.g. s3://my-bucket/bench). The binary is target/dist/pondra (or $PONDRA_BIN), copied over.
+# e.g. s3://my-bucket/bench) and PONDRA_ADMIN_TOKEN (any long random text, `openssl rand -hex 24`,
+# the same on every machine: the nodes listen on the network, and answer only it). The binary is target/dist/pondra (or $PONDRA_BIN), copied over.
 # Each node serves HTTP on 8080, Flight on 8815 and Kafka on 9092.
 set -euo pipefail
 cmd=$1 hosts=$2 env=${3:-}

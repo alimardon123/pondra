@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub fn user_key(name: &str) -> String { format!("u/{name}") }
-const KEYS: &str = "z/auth"; // (the lake's own keys: sessions' signing key, and the nodes' key; `k/` is streaming tasks')
+pub const KEYS: &str = "z/auth"; // (the lake's own keys: sessions' signing key, and the nodes' key; `k/` is streaming tasks')
 /// Set once a lake has been served with tokens (S26, invariant 379): a node started by hand without them is not open.
 const SIGNED: &str = "z/signed";
 /// The names the three tokens sign in as over Postgres and Kafka: no user may take them.

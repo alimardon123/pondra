@@ -250,6 +250,9 @@ impl Log {
     /// Queue rows now and get their ack later: rows queued one after another commit in that
     /// order, so a client can have several batches in flight (the Kafka protocol does).
     pub async fn queue(&self, table: String, src: Src, batch: RecordBatch) -> Result<impl std::future::Future<Output = Result<Ack>> + use<>> {
+        if crate::backup::frozen(&self.lake) {
+            return Err(crate::backup::refused(Some(&self.lake.url))); // (every door's rows: HTTP, Kafka, Flight, COPY)
+        }
         if let Some(m) = self.lake.cat.get::<TableMeta>(&table_key(&table)).await? {
             if crate::constraints::checked(&m) {
                 return Ok(Either::Right(crate::constraints::queue(self.lake.clone(), &m, table, src, batch)?)); // (an enforced UNIQUE: checked on the leader, `constraints.rs`)
@@ -297,7 +300,7 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
             }
             Ok(Outcome::Refused(why)) => {
                 for a in pending.drain(..) {
-                    let _ = a.ack.send(Err(why.clone())); // (a sequence's answer: never an append's)
+                    let _ = a.ack.send(Err(why.clone())); // (a sequence's answer, or a backup's: ADR-070)
                 }
             }
             Ok(Outcome::Retry(retried)) => {
@@ -553,6 +556,14 @@ pub fn forget_producers(names: impl IntoIterator<Item = String>) { FORGOTTEN.loc
 /// be committed, the next batch can follow; acks go out once this one is.
 #[allow(clippy::too_many_arguments)]
 async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mut HashMap<String, u64>, sequences: &mut crate::seq::Held, held: &Held, batch: Vec<(Flush, oneshot::Sender<Outcome>)>, ms: &Arc<Mutex<Vec<f64>>>, slot: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
+    if crate::backup::frozen(lake) {
+        // (a backup takes no rows, blocks or sequences' values: only its runs write it, ADR-070)
+        let why = format!("{:#}", crate::backup::refused(Some(&lake.url)));
+        for (_, reply) in batch {
+            let _ = reply.send(Outcome::Refused(why.clone()));
+        }
+        return Ok(());
+    }
     let (mut puts, mut seqs, mut replies) = (vec![], HashMap::<String, u64>::new(), vec![]);
     let mut lost: Vec<String> = vec![]; // (keys the filings of this commit delete: `Filing::gone`)
     let (mut inline, mut inline_parts) = (vec![], BTreeMap::<String, Vec<(u64, u64, u64)>>::new()); // all inline flushes: one segment

@@ -3224,7 +3224,7 @@ def schemas():
     q("DROP TABLE dbo.t", 2)
     q("CREATE TABLE dbo.t (k BIGINT, v DOUBLE)", 1)
     time.sleep(0.5)
-    checks["DROP refused while a view reads it; after the drop, a new table of its name is empty"] = "used by" in (used or "") and view_owned is not None \
+    checks["DROP refused while a view reads it; after the drop, a new table of its name is empty"] = "is read by" in (used or "") and "CASCADE" in (used or "") and view_owned is not None \
         and n("dbo.big") == 0 and all(n("dbo.t", i) == 0 for i in range(3)) and err("SELECT * FROM dbo.small") is not None and err("DROP TABLE nope") is not None \
         and q("DROP TABLE IF EXISTS nope")["dropped"] is False
     # DROP SCHEMA: refused while it holds anything, unless CASCADE
@@ -9322,7 +9322,7 @@ def objects():
     engine = http("CREATE TABLE laid4 (ts TIMESTAMP) ENGINE = MergeTree")
     info["laid"] = [shape, twice[2], engine[2]]
     checks["PARTITION BY, PARTITIONED BY and CLUSTER BY are the table's options; given twice, or ENGINE =, refused"] = \
-        shape == {"laid": ("day(ts)", ["user_id", "url"]), "laid2": ("user_id", ["ts"])} and twice[0] == 500 and engine[0] == 500
+        shape == {"laid": ("day(ts)", ["user_id", "url"]), "laid2": ("user_id", ["ts"])} and twice[0] == 500 and engine[0] == 501  # (ENGINE =: not taken, 0A000)
     # A table's layout as clauses, in any order and beside WITH (the SQL review's 1A, `layout.rs`)
     q("CREATE TABLE lay_s (user_id BIGINT PRIMARY KEY, seen TIMESTAMP, page VARCHAR) CLUSTER BY (page) TTL seen + INTERVAL '1 hour' "
       "PARTITION BY day(seen) SEQUENCE BY seen WITH (publish = (delta, iceberg), retention = '7 days')")
@@ -9648,7 +9648,7 @@ def constraints():
     q("CREATE TEMP TABLE fine (a INT UNIQUE NOT ENFORCED)", hh=temp)
     info["facts"] = [facts, no]
     checks["NOT ENFORCED keeps a fact and checks nothing (a PRIMARY KEY makes no key); a reference, NULLS NOT DISTINCT, DEFERRABLE, two keys, a temporary table's UNIQUE and a missing column refused"] = \
-        facts == [[1, 1, "x"], [1, 99, "x"]] and all(r[0] == 500 for r in no)
+        facts == [[1, 1, "x"], [1, 99, "x"]] and no[0][:2] == (501, "0A000") and all(r[0] == 500 for r in no[1:])  # (a reference: not taken yet, 0A000)
     # ALTER TABLE … ADD | DROP CONSTRAINT
     q("CREATE TABLE tags (id INT, tag TEXT)")
     q("INSERT INTO tags VALUES (1, 'a'), (2, 'a'), (3, 'b')")
@@ -9718,6 +9718,391 @@ def constraints():
     if not ok:
         sys.exit(1)
     return f"{sum(checks.values())} of {len(checks)} constraint checks"
+
+
+def ddlgaps():
+    """The DDL that dbt and Postgres users write (`friendly.rs`, `defaults.rs`, `ddl.rs`, `tasks.rs`): ADD
+    COLUMN … DEFAULT NULL on a table with rows; CREATE MATERIALIZED VIEW IF NOT EXISTS and OR REPLACE
+    answer with their rows; a view's query in parentheses is made, filled and follows an INSERT;
+    ALTER COLUMN SET and DROP DEFAULT, SET and DROP NOT NULL with Postgres's meanings (a view on the table
+    doesn't stop them); DROP TASK of a streaming task stops it; a timestamp's one-digit zone; DROP TABLE
+    … CASCADE (the views on it, deepest first; RESTRICT names them); character varying(n); ALTER TABLE
+    with several actions; (a, b) IN (SELECT …) in a DELETE; DELETE and UPDATE with an alias and a
+    correlated EXISTS."""
+    import psycopg
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 2
+    node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+    q = lambda s: call(port, "POST", "/sql", s.encode(), timeout=120)
+    def err(s):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        data = r.read().decode()
+        return (r.status, r.getheader("x-pondra-sqlstate"), data[:300]) if r.status != 200 else (200, None, "")
+    conn = psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True)
+    def pg_state(s):  # None when the statement ran, else its SQLSTATE
+        try:
+            conn.execute(s)
+            return None
+        except psycopg.Error as e:
+            return e.sqlstate
+    def count(t):
+        return q(f"SELECT count(*) AS n FROM {t}")[0]["n"]
+    def eventually(f, secs=10):
+        end = time.time() + secs
+        while True:
+            try:
+                return f()
+            except Exception:
+                if time.time() > end:
+                    raise
+                time.sleep(0.1)
+    def grown(t, n):  # t's count once it is n (a view fills, a task flows, in a moment); None if it isn't
+        def f():
+            c = count(t)
+            if c != n:
+                raise ValueError(f"{t} has {c}, not {n}")
+            return c
+        try:
+            return eventually(f)
+        except Exception:
+            return None
+    checks, info = {}, {}
+
+    # ADD COLUMN … DEFAULT NULL on a table with rows: Postgres adds NULLs; a real DEFAULT still refused
+    q("CREATE TABLE people (id INT, name TEXT)")
+    q("INSERT INTO people VALUES (1, 'Ann'), (2, 'Bo')")
+    added = [pg_state("ALTER TABLE people ADD COLUMN full_name varchar(200) DEFAULT NULL"),
+             pg_state("ALTER TABLE people ADD COLUMN nick TEXT DEFAULT NULL::text"),
+             pg_state("ALTER TABLE people ADD COLUMN age INT DEFAULT CAST(NULL AS INT)")]
+    real = pg_state("ALTER TABLE people ADD COLUMN city TEXT DEFAULT 'none'")
+    pg_state("INSERT INTO people (id, name) VALUES (3, 'Cy')")
+    info["people"] = conn.execute("SELECT id, full_name, nick, age FROM people ORDER BY id").fetchall()
+    checks["ADD COLUMN … DEFAULT NULL on a table with rows: added, NULLs; a real DEFAULT there is still refused"] = \
+        added == [None, None, None] and real is not None and \
+        [list(r) for r in info["people"]] == [[1, None, None, None], [2, None, None, None], [3, None, None, None]]
+
+    # CREATE MATERIALIZED VIEW IF NOT EXISTS (and OR REPLACE): a fresh view answers with its rows at once
+    q("CREATE TABLE facts (id INT, v INT)")
+    q("INSERT INTO facts SELECT i, i * 2 FROM range(20000) t(i)")
+    counts = []
+    for i in range(20):
+        q(f"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_ine_{i} AS SELECT * FROM facts")
+        counts.append(count(f"mv_ine_{i}"))
+    replaced = []
+    for i in range(5):
+        q(f"CREATE OR REPLACE MATERIALIZED VIEW mv_rep_{i} AS SELECT * FROM facts")
+        replaced.append(count(f"mv_rep_{i}"))
+    again = q("CREATE MATERIALIZED VIEW IF NOT EXISTS mv_ine_0 AS SELECT * FROM facts")
+    info["if_not_exists"] = [counts, replaced, again]
+    checks["CREATE MATERIALIZED VIEW IF NOT EXISTS: its rows are there when it answers (20 fresh views, counted at once)"] = counts == [20000] * 20
+    checks["CREATE OR REPLACE MATERIALIZED VIEW: its rows are there when it answers (5 fresh views, counted at once)"] = replaced == [20000] * 5
+
+    # A view's query in parentheses, as dbt writes it: made, filled, and it follows an INSERT
+    q("CREATE MATERIALIZED VIEW mv_paren AS (SELECT id, v FROM facts)")
+    q("CREATE MATERIALIZED VIEW mv_nested AS ((SELECT id, v FROM facts WHERE v >= 0))")
+    made = [count("mv_paren"), count("mv_nested")]
+    q("INSERT INTO facts VALUES (50000, 1)")
+    followed = [grown(v, 20001) for v in ("mv_paren", "mv_nested")]
+    info["paren"] = [made, followed]
+    checks["a materialized view AS (SELECT …): made, filled, follows an INSERT (and ((SELECT …)) too)"] = made == [20000, 20000] and followed == [20001, 20001]
+
+    # ALTER COLUMN SET / DROP DEFAULT and SET / DROP NOT NULL, with a view on the table
+    q("CREATE TABLE nn (id INT, c INT, d TEXT)")
+    q("INSERT INTO nn VALUES (1, 1, 'a'), (2, NULL, 'b')")
+    q("CREATE VIEW vnn AS SELECT id, c FROM nn")
+    refused_nn = err("ALTER TABLE nn ALTER COLUMN c SET NOT NULL")  # 23502 while NULLs are there
+    null_still = pg_state("INSERT INTO nn VALUES (3, NULL, 'x')") is None  # the refused SET left c nullable
+    q("UPDATE nn SET c = 0 WHERE c IS NULL")
+    set_nn = err("ALTER TABLE nn ALTER COLUMN c SET NOT NULL")
+    refused_insert = pg_state("INSERT INTO nn VALUES (4, NULL, 'd')")  # 23502 now
+    drop_nn = pg_state("ALTER TABLE nn ALTER c DROP NOT NULL")  # without COLUMN
+    insert_nullable = pg_state("INSERT INTO nn VALUES (4, NULL, 'd')")
+    set_default = err("ALTER TABLE nn ALTER COLUMN d SET DEFAULT 'z'")  # the view on nn doesn't stop it
+    show_set = json.dumps(q("SHOW CREATE TABLE nn"))
+    q("INSERT INTO nn (id, c) VALUES (5, 5)")
+    got_z = q("SELECT d FROM nn WHERE id = 5")[0]["d"]
+    dropped_default = pg_state("ALTER TABLE nn ALTER COLUMN d DROP DEFAULT")
+    show_drop = json.dumps(q("SHOW CREATE TABLE nn"))
+    q("INSERT INTO nn (id, c) VALUES (6, 6)")
+    got_null = q("SELECT d FROM nn WHERE id = 6")[0].get("d")
+    info["not_null"] = {"refused": refused_nn, "set": set_nn, "insert": refused_insert, "drop": drop_nn, "view_still": q("SELECT count(*) AS n FROM vnn")[0]["n"]}
+    checks["SET NOT NULL refused (23502) while a NULL is there, NULLs still taken after; UPDATE, then SET works; a NULL refused (23502)"] = \
+        refused_nn[1] == "23502" and "contains null values" in refused_nn[2] and null_still and set_nn == (200, None, "") and refused_insert == "23502"
+    checks["ALTER TABLE t ALTER c DROP NOT NULL (no COLUMN): the NULL insert works; a view on the table doesn't stop SET NOT NULL"] = \
+        drop_nn is None and insert_nullable is None and set_default[0] == 200
+    checks["SET DEFAULT 'z' gives the default to new rows; DROP DEFAULT gives NULL; SHOW CREATE TABLE shows DEFAULT after SET, not after DROP"] = \
+        got_z == "z" and dropped_default is None and got_null is None and "DEFAULT 'z'" in show_set and "DEFAULT 'z'" not in show_drop
+    # A key's NOT NULL stays; a DROP of it is refused by name
+    q("CREATE TABLE kk (id INT PRIMARY KEY, v INT)")
+    key_drop = err("ALTER TABLE kk ALTER COLUMN id DROP NOT NULL")
+    info["key_drop"] = key_drop
+    checks["DROP NOT NULL of a key column refused by name (a key is never NULL)"] = key_drop[0] != 200 and "a key is never NULL" in key_drop[2]
+
+    # DROP TASK of a streaming task (POST /tasks/{name}): rows flow, DROP TASK stops them
+    q("CREATE TABLE ev (id INT, v INT)")
+    call(port, "POST", "/tasks/mirror", json.dumps({"source": "ev", "target": "ev_out", "sql": "SELECT id, v FROM ev"}).encode())
+    q("INSERT INTO ev VALUES (1, 10), (2, 20)")
+    flowed = grown("ev_out", 2)
+    dropped = q("DROP TASK mirror")
+    q("INSERT INTO ev VALUES (3, 30)")
+    time.sleep(2)
+    stopped = count("ev_out")
+    quiet = q("DROP TASK IF EXISTS mirror")
+    plain_again = err("DROP TASK mirror")
+    info["task"] = [flowed, dropped, stopped, quiet, plain_again]
+    checks["DROP TASK of a streaming task: rows flowed, then stopped; DROP TASK IF EXISTS of it again is quiet"] = \
+        flowed == 2 and dropped.get("dropped") is True and stopped == 2 and quiet.get("dropped") is False and plain_again[0] != 200 and "no task mirror" in plain_again[2]
+    info["objects_task_rows"] = [r for r in q("SELECT name FROM pondra.objects") if r.get("name") == "mirror"]
+
+    # A zone of one hour digit (`-0`, `+5`) is read as its hours, as UTC (Arrow reads only two digits)
+    zones = q("SELECT TIMESTAMP '2020-01-01 00:00:00-0' AS a, TIMESTAMP '2020-01-01 00:00:00+5' AS b, TIMESTAMPTZ '2020-01-01 00:00:00+5' AS c")[0]
+    info["zones"] = zones
+    checks["TIMESTAMP '…-0' and '…+5': read as UTC and +05:00 (TIMESTAMPTZ too)"] = \
+        zones == {"a": "2020-01-01T00:00:00", "b": "2019-12-31T19:00:00", "c": "2019-12-31T19:00:00Z"}
+
+    # DROP TABLE t CASCADE drops the views that read it, deepest first, then t; RESTRICT names them
+    q("CREATE TABLE base_t (id INT, v INT)")
+    q("INSERT INTO base_t VALUES (1, 10), (2, 20)")
+    q("CREATE VIEW v_one AS SELECT id, v FROM base_t")
+    q("CREATE VIEW v_two AS SELECT id FROM v_one")
+    q("CREATE MATERIALIZED VIEW mv_base AS SELECT * FROM base_t")
+    restrict = err("DROP TABLE base_t")
+    kept = [count("base_t"), count("v_two"), count("mv_base")]
+    cascade = err("DROP TABLE base_t CASCADE")
+    gone = [err("SELECT * FROM v_two")[0] != 200, err("SELECT * FROM mv_base")[0] != 200, err("SELECT * FROM base_t")[0] != 200]
+    info["cascade"] = {"restrict": restrict, "kept": kept, "cascade": cascade, "gone": gone}
+    checks["DROP TABLE t CASCADE drops the views on it (a view of a view too), then t; RESTRICT refuses naming them"] = \
+        restrict[0] != 200 and "CASCADE drops them too" in restrict[2] and kept == [2, 2, 2] and cascade[0] == 200 and all(gone)
+    # a task reads the table: the whole statement is refused by name, and the view on the table stays
+    q("CREATE TABLE t_busy (id INT, v INT)")
+    q("CREATE VIEW v_busy AS SELECT * FROM t_busy")
+    call(port, "POST", "/tasks/tk_busy", json.dumps({"source": "t_busy", "target": "t_busy_out", "sql": "SELECT id, v FROM t_busy"}).encode())
+    busy = err("DROP TABLE t_busy CASCADE")
+    busy_view = err("SELECT count(*) AS n FROM v_busy")[0]
+    info["cascade_task"] = [busy, busy_view]
+    checks["DROP TABLE … CASCADE refused by name when a task reads it: nothing half dropped (its view still answers)"] = \
+        busy[0] != 200 and "reads t_busy" in busy[2] and busy_view == 200
+    # a table named with its schema, and a view named in capitals, are found and dropped too
+    q("CREATE TABLE base_q (id INT)")
+    q('CREATE VIEW "Up_V" AS SELECT id FROM base_q')
+    named = [err("DROP TABLE public.base_q CASCADE"), err('SELECT * FROM "Up_V"')[0]]
+    info["cascade_named"] = named
+    checks["…a table named with its schema, and a view named in capitals, go too (DROP TABLE public.t CASCADE)"] = \
+        named[0][0] == 200 and named[1] != 200
+    # public is the default schema: a DROP that names it finds the table or view
+    q("CREATE TABLE plain_q (id INT)")
+    q("CREATE VIEW plain_v AS SELECT id FROM plain_q")
+    plain = [err("DROP VIEW public.plain_v"), err("DROP TABLE IF EXISTS public.plain_q"), err("SELECT * FROM plain_q")[0]]
+    info["public_drops"] = plain
+    checks["DROP VIEW public.v and DROP TABLE public.t drop them (public.t is t)"] = plain[0][0] == 200 and plain[1][0] == 200 and plain[2] != 200
+    # several actions are written back as text one by one: a default of - -3 stays 3, not a comment
+    q("CREATE TABLE neg (id INT, a INT, b INT)")
+    both = err("ALTER TABLE neg ALTER COLUMN a SET DEFAULT - -3, ALTER COLUMN b SET DEFAULT 1")
+    q("INSERT INTO neg (id) VALUES (1)")
+    info["negated"] = [both, q("SELECT a, b FROM neg")]
+    checks["ALTER TABLE t a1, a2 with a default of - -3: both kept, the first 3"] = \
+        both[0] == 200 and info["negated"][1] == [{"a": 3, "b": 1}]
+
+    # character varying(n), Postgres's name for varchar, in CREATE TABLE, ADD COLUMN and a cast
+    q("CREATE TABLE cv (s character varying(200), c character(3), n INT)")
+    q("ALTER TABLE cv ADD COLUMN s2 character varying(50)")
+    q("INSERT INTO cv (s, c, n, s2) VALUES ('abc', 'x', 1, 'q')")
+    cv = q("SELECT s, s2, CAST('zz' AS character varying(5)) AS z FROM cv")[0]
+    info["varchar"] = cv
+    checks["character varying(200) in CREATE TABLE, ADD COLUMN and a cast (character(3) too)"] = \
+        cv == {"s": "abc", "s2": "q", "z": "zz"}
+
+    # ALTER TABLE with several actions: each applied; one that can't run refuses the whole statement
+    q("CREATE TABLE am (id INT)")
+    q("INSERT INTO am VALUES (1), (2)")
+    several = err("ALTER TABLE am ADD COLUMN a INT, ADD COLUMN b TEXT")
+    added = q("SELECT id, a, b FROM am ORDER BY id")
+    refused_many = err("ALTER TABLE am ADD COLUMN c INT, ADD COLUMN d INT NOT NULL")
+    c_missing = err("SELECT c FROM am")[0] != 200
+    info["alter_actions"] = [several, len(added), refused_many]
+    checks["ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b TEXT: both added; one with an action that can't run: refused, nothing added"] = \
+        several == (200, None, "") and len(added) == 2 and refused_many[0] != 200 and c_missing
+
+    # (a, b) IN (SELECT …) deletes those rows, keyed and append; NOT IN is refused naming NOT EXISTS
+    q("CREATE TABLE rk (k1 INT, k2 INT, v INT, PRIMARY KEY (k1, k2))")
+    q("CREATE TABLE ra (k1 INT, k2 INT, v INT)")
+    q("INSERT INTO rk VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30)")
+    q("INSERT INTO ra VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30)")
+    q("CREATE TABLE ds (k1 INT, k2 INT)")
+    q("INSERT INTO ds VALUES (1, 2), (2, 1), (1, 2)")
+    q("DELETE FROM rk WHERE (k1, k2) IN (SELECT DISTINCT k1, k2 FROM ds)")
+    q("DELETE FROM ra WHERE (k1, k2) IN (SELECT DISTINCT k1, k2 FROM ds)")
+    rk_left = [r["v"] for r in q("SELECT v FROM rk ORDER BY v")]
+    ra_left = [r["v"] for r in q("SELECT v FROM ra ORDER BY v")]
+    not_in = err("DELETE FROM ra WHERE (k1, k2) NOT IN (SELECT k1, k2 FROM ds)")
+    info["row_in"] = [rk_left, ra_left, not_in]
+    checks["DELETE … WHERE (k1, k2) IN (SELECT …) deletes those rows (keyed and append); NOT IN refused naming NOT EXISTS"] = \
+        rk_left == [10] and ra_left == [10] and not_in[0] != 200 and "NOT EXISTS" in not_in[2]
+
+    # DELETE and UPDATE with an alias and a correlated EXISTS (append and keyed), and a self-reference
+    q("CREATE TABLE da (id INT, v INT)")
+    q("INSERT INTO da VALUES (1, 1), (2, 2), (3, 3)")
+    q("CREATE TABLE dk (id INT PRIMARY KEY, v INT)")
+    q("INSERT INTO dk VALUES (1, 1), (2, 2), (3, 3)")
+    q("CREATE TABLE s_ids (id INT)")
+    q("INSERT INTO s_ids VALUES (2), (3)")
+    q("UPDATE da AS u SET v = 0 WHERE EXISTS (SELECT 1 FROM s_ids WHERE s_ids.id = u.id)")
+    q("UPDATE dk AS u SET v = 0 WHERE EXISTS (SELECT 1 FROM s_ids WHERE s_ids.id = u.id)")
+    upd = [[r["v"] for r in q(f"SELECT v FROM {t} ORDER BY id")] for t in ("da", "dk")]
+    q("DELETE FROM da AS d WHERE EXISTS (SELECT 1 FROM s_ids WHERE s_ids.id = d.id)")
+    q("DELETE FROM dk AS d WHERE EXISTS (SELECT 1 FROM s_ids WHERE s_ids.id = d.id)")
+    da_left = [r["id"] for r in q("SELECT id FROM da ORDER BY id")]
+    dk_left = [r["id"] for r in q("SELECT id FROM dk ORDER BY id")]
+    q("CREATE TABLE sa (id INT, v INT)")
+    q("INSERT INTO sa VALUES (1, 5), (1, 7), (2, 3)")
+    q("CREATE TABLE sk (id INT PRIMARY KEY, v INT)")
+    q("INSERT INTO sk VALUES (1, 5), (2, 7), (3, 3)")
+    q("DELETE FROM sa AS d WHERE EXISTS (SELECT 1 FROM sa AS o WHERE o.id = d.id AND o.v > d.v)")
+    q("DELETE FROM sk AS d WHERE EXISTS (SELECT 1 FROM sk AS o WHERE o.v > d.v)")
+    sa_left = [[r["id"], r["v"]] for r in q("SELECT id, v FROM sa ORDER BY id, v")]
+    sk_left = [r["id"] for r in q("SELECT id FROM sk ORDER BY id")]
+    info["alias"] = [upd, da_left, dk_left, sa_left, sk_left]
+    checks["DELETE / UPDATE with an alias and a correlated EXISTS (append and keyed), and a self-reference"] = \
+        upd == [[1, 0, 0], [1, 0, 0]] and da_left == [1] and dk_left == [1] and sa_left == [[1, 7], [2, 3]] and sk_left == [2]
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"ddlgaps": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} DDL checks"
+
+
+def sqla():
+    """What SQLAlchemy's dialect suite and dbt send (`friendly.rs`, `defaults.rs`, `seq.rs`, `temp.rs`,
+    `ddl.rs`): a number with an exponent as NUMERIC (`'1E-7'::numeric`); a bytea in its hex form
+    (`'\\xff00'::bytea`, a bad one 22P02); INSERT … DEFAULT VALUES (every column's default, a NOT NULL one
+    without a default refused 23502); LIKE … ESCAPE '/' (ILIKE and NOT LIKE too, a pattern that isn't
+    written out refused); a table named with a quote refused, the message saying why; a temporary table's
+    PRIMARY KEY (23505 for a repeat, 23502 for NULL, ON CONFLICT skips and replaces); a dropped table's
+    sequence refused until UNDROP, and gone with a PURGE."""
+    import psycopg
+    from decimal import Decimal
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 2
+    node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+    sess = "sqla-session"
+    q = lambda s: call(port, "POST", "/sql", s.encode(), timeout=120)
+    qs = lambda s: call(port, "POST", "/sql", s.encode(), timeout=120, headers={"x-pondra-session": sess})
+    def err(s, session=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {"x-pondra-session": session} if session else {})
+        r = c.getresponse()
+        data = r.read().decode()
+        return (r.status, r.getheader("x-pondra-sqlstate"), data[:400]) if r.status != 200 else (200, None, "")
+    conn = psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True)
+    def pg_state(c, s):  # None when the statement ran, else its SQLSTATE
+        try:
+            c.execute(s)
+            return None
+        except psycopg.Error as e:
+            return e.sqlstate
+    def count(t):
+        return q(f"SELECT count(*) AS n FROM {t}")[0]["n"]
+    checks, info = {}, {}
+
+    # '1E-7'::numeric: the value, as a literal with an exponent and as a number with one
+    num = q("SELECT '1E-7'::numeric AS a, 1E-7::numeric AS b, CAST('2.5E3' AS DECIMAL(10,2)) AS c, '-1.5e2'::numeric AS d")[0]
+    info["numeric"] = num
+    checks["'1E-7'::numeric is 0.0000001 (a number written with an exponent too; CAST to DECIMAL(10,2) and a negative one)"] = \
+        Decimal(str(num["a"])) == Decimal("0.0000001") and Decimal(str(num["b"])) == Decimal("0.0000001") \
+        and Decimal(str(num["c"])) == Decimal("2500") and Decimal(str(num["d"])) == Decimal("-150")
+
+    # '\xff00'::bytea is two bytes (its hex form); a bad hex form is 22P02; other strings keep their meaning
+    by = q(r"SELECT '\xff00'::bytea = decode('ff00', 'hex') AS hex, 'abc'::bytea = decode('616263', 'hex') AS plain")[0]
+    bad_odd, bad_digit = err(r"SELECT '\xf'::bytea"), err(r"SELECT '\xfg'::bytea")
+    info["bytea"] = [by, bad_odd[1:2], bad_digit[1:2]]
+    checks["'\\xff00'::bytea is its two bytes; an odd or non-hex digit is 22P02; 'abc'::bytea is as before"] = \
+        by["hex"] is True and by["plain"] is True and bad_odd[1] == "22P02" and bad_digit[1] == "22P02"
+
+    # INSERT INTO t DEFAULT VALUES: each column's default, identity included; NOT NULL without one is 23502
+    q("CREATE TABLE dv (id INT GENERATED BY DEFAULT AS IDENTITY, v TEXT DEFAULT 'x')")
+    q("INSERT INTO dv DEFAULT VALUES")
+    q("INSERT INTO dv DEFAULT VALUES")
+    dv = q("SELECT id, v FROM dv ORDER BY id")
+    q("CREATE TABLE dvn (id INT GENERATED BY DEFAULT AS IDENTITY, n INT NOT NULL)")
+    dvn = err("INSERT INTO dvn DEFAULT VALUES")
+    info["default_values"] = [dv, dvn[1], count("dvn")]
+    checks["INSERT INTO t DEFAULT VALUES: a default and an identity filled; NOT NULL without a default refused 23502, nothing written"] = \
+        dv == [{"id": 1, "v": "x"}, {"id": 2, "v": "x"}] and dvn[1] == "23502" and count("dvn") == 0
+    checks["INSERT … DEFAULT VALUES over Postgres: the identity goes on from the last row"] = \
+        pg_state(conn, "INSERT INTO dv DEFAULT VALUES") is None and [r[0] for r in conn.execute("SELECT id FROM dv ORDER BY id").fetchall()] == [1, 2, 3]
+
+    # LIKE … ESCAPE '/': a/% is a literal %, a// a literal /; ILIKE and NOT LIKE alike; a pattern not written out refused
+    lk = q("SELECT 'a%b' LIKE 'a/%b' ESCAPE '/' AS t, 'axb' LIKE 'a/%b' ESCAPE '/' AS f, 'A%B' ILIKE 'a/%b' ESCAPE '/' AS ci, "
+           "'a%b' NOT LIKE 'a/%b' ESCAPE '/' AS nl, 'a/b' LIKE 'a//b' ESCAPE '/' AS sl")[0]
+    info["like"] = lk
+    checks["LIKE … ESCAPE '/' (ILIKE and NOT LIKE too): /% is a literal %, // a literal /"] = \
+        lk == {"t": True, "f": False, "ci": True, "nl": False, "sl": True}
+    q("CREATE TABLE lk (p TEXT)")
+    q("INSERT INTO lk VALUES ('a/%b')")
+    nonlit = err("SELECT count(*) AS n FROM lk WHERE 'a%b' LIKE p ESCAPE '/'")
+    info["like_column"] = nonlit[1:]
+    checks["LIKE … ESCAPE '/' with a pattern that isn't written out: refused 0A000, saying to use \\"] = \
+        nonlit[1] == "0A000" and "isn't written out" in nonlit[2]
+
+    # a name with a quote: refused (a table's folder takes its name, and Windows refuses a quote), and the name to write
+    qn = err('CREATE TABLE "a""b" (x INT)')
+    info["quote_name"] = qn
+    checks["CREATE TABLE \"a\"\"b\": refused, saying why (Windows, a folder's name) and what to write (a_b)"] = \
+        qn[0] != 200 and "Windows" in qn[2] and "a_b" in qn[2]
+
+    # a temporary table's PRIMARY KEY: a repeat or a NULL key refused; ON CONFLICT skips or replaces
+    qs("CREATE TEMP TABLE tp (id INT PRIMARY KEY, v TEXT)")
+    qs("INSERT INTO tp VALUES (1, 'a'), (2, 'b')")
+    dup = err("INSERT INTO tp VALUES (1, 'z')", sess)
+    dup_batch = err("INSERT INTO tp VALUES (3, 'c'), (3, 'd')", sess)
+    nul = err("INSERT INTO tp VALUES (NULL, 'n')", sess)
+    qs("INSERT INTO tp VALUES (1, 'new') ON CONFLICT (id) DO NOTHING")
+    qs("INSERT INTO tp VALUES (2, 'upd') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
+    tp_rows = qs("SELECT id, v FROM tp ORDER BY id")
+    info["temp_key"] = [dup[1:], dup_batch[1:], nul[1:], tp_rows]
+    checks["temporary table PRIMARY KEY: a repeat (also within one INSERT) 23505, NULL 23502; ON CONFLICT skips or replaces"] = \
+        dup[1] == "23505" and "Key (id)=(1) already exists" in dup[2] and dup_batch[1] == "23505" and nul[1] == "23502" \
+        and tp_rows == [{"id": 1, "v": "a"}, {"id": 2, "v": "upd"}]
+    tpc = psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True)
+    tpc.execute("CREATE TEMP TABLE tpc (id INT PRIMARY KEY, v TEXT)")
+    tpc.execute("INSERT INTO tpc VALUES (1, 'a')")
+    try:
+        tpc.execute("INSERT INTO tpc VALUES (1, 'z')")
+        pg_dup, pg_msg = None, ""
+    except psycopg.Error as e:
+        pg_dup, pg_msg = e.sqlstate, str(e)
+    tpc.execute("INSERT INTO tpc VALUES (2, 'b') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
+    pg_rows = [tuple(r) for r in tpc.execute("SELECT id, v FROM tpc ORDER BY id").fetchall()]
+    info["temp_key_pg"] = [pg_dup, pg_msg[:200], pg_rows]
+    checks["temporary table PRIMARY KEY over Postgres: a repeat 23505 naming the key; ON CONFLICT DO UPDATE"] = \
+        pg_dup == "23505" and "Key (id)=(1) already exists" in pg_msg and pg_rows == [(1, "a"), (2, "b")]
+
+    # a dropped table's sequence: refused until UNDROP (numbering where it left off); a PURGE takes it
+    q("CREATE TABLE sq_t (id SERIAL, v TEXT)")
+    q("INSERT INTO sq_t (v) VALUES ('a')")
+    nv = q("SELECT nextval('sq_t_id_seq') AS n")[0]["n"]
+    q("DROP TABLE sq_t")
+    gone = err("SELECT nextval('sq_t_id_seq')")
+    setg = err("SELECT setval('sq_t_id_seq', 10)")
+    q("UNDROP TABLE sq_t")
+    back = q("SELECT nextval('sq_t_id_seq') AS n")[0]["n"]
+    info["sequence"] = [nv, gone[1:], setg[1:], back]
+    checks["a dropped table's SERIAL sequence: nextval and setval refused 42P01 naming UNDROP; UNDROP brings it back, numbering on"] = \
+        nv == 2 and gone[1] == "42P01" and "UNDROP TABLE sq_t" in gone[2] and setg[1] == "42P01" and back == 3
+    q("CREATE TABLE sq_p (id SERIAL, v TEXT)")
+    q("DROP TABLE sq_p PURGE")
+    purged = err("SELECT nextval('sq_p_id_seq')")
+    info["purged_sequence"] = purged[1:]
+    checks["DROP TABLE … PURGE takes its SERIAL sequence with it: nextval refused"] = purged[0] != 200
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"sqla": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} SQL checks"
 
 
 def enums():
@@ -11575,6 +11960,12 @@ def doors():
         c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
         c.request("PUT", f"/files/{path}", body.encode())
         assert c.getresponse().status == 200, path
+    backups = tempfile.mkdtemp(prefix="pondra-doors-backups-")  # (a backup goes in a place of its own: ADR-070)
+    atexit.register(shutil.rmtree, backups, True)
+    q(f"BACKUP DATABASE TO '{backups}/read'")
+    q(f"ATTACH '{backups}/read' AS d_bk")
+    def backed(place):
+        return any(f.endswith(".json.zst") for f in os.listdir(os.path.join(place, "_backups")))
     DOORS = ["http", "python", "postgres", "flight", "javascript", "mcp", "cli", "console"]
     shell_dir = tempfile.mkdtemp(prefix="pondra-doors-cwd-")  # (the shell attaches the lakes beside its folder: an empty one)
     def features(i):
@@ -11594,6 +11985,8 @@ def doors():
             "USE a schema": (["USE d_crm", "SELECT count(*) AS n FROM d_only"], lambda r: r[-1] == [[3]]),
             "a macro": (["SELECT d_twice(21) AS n"], lambda r: r[-1] == [[42]]),
             "a Git folder's status": (["SELECT path, change FROM pondra.git_status('d_git')"], lambda r: r[-1] == [["a.sql", "added"]]),
+            "a backup": ([f"BACKUP DATABASE TO '{backups}/door{i}'"], lambda r: backed(f"{backups}/door{i}")),
+            "a write to a backup refused, 25006": ([f"INSERT INTO d_bk.d_log VALUES ('door{i}', {i})"], lambda r: r == "25006"),
         }
     def rows_of(x):
         return [list(r.values()) if isinstance(r, dict) else list(r) for r in x] if isinstance(x, list) else x
@@ -11663,7 +12056,7 @@ def doors():
                 text = r["content"][0]["text"]
                 if r["isError"]:
                     m = re.search(r"\b(\d{2}[0-9A-Z]\d{2})\b", text)
-                    return m.group(1) if m and m.group(1) in ("23514", "42P01", "40001", "25P02") else "refused: " + text[:160]
+                    return m.group(1) if m and m.group(1) in ("23514", "42P01", "40001", "25P02", "25006") else "refused: " + text[:160]
                 got = json.loads(text)
                 out.append(rows_of(got["rows"]) if isinstance(got, dict) and "rows" in got else None)
         finally:
@@ -11701,7 +12094,7 @@ finally {{ await db.close?.(); }}"""
         return out
     # The shell prints its errors without a SQLSTATE (the header `x-pondra-sqlstate` carries it), so the
     # codes this matrix checks are named by the words of their messages.
-    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01")]
+    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01"), ("is a backup, so it is read-only", "25006")]
     def via_cli(stmts):
         # The shell on the lake, one process for the feature's statements: one session (`shell.rs`). It has no
         # `--url`, so it starts a node on the lake, which joins this one as a follower; its own address is an
@@ -11781,7 +12174,9 @@ def friendly():
     over the same rows: PIVOT and UNPIVOT (DuckDB's statements and the standard's), COLUMNS(…),
     `* RENAME`, ORDER BY ALL, FETCH FIRST, list comprehensions and lambdas, a struct's field,
     max_by and arg_min, string_split, json_extract, DuckDB's ASOF JOIN … ON, a select's alias in
-    its WHERE, SUMMARIZE; samples that sample (TABLESAMPLE was ignored); refusals by name; the
+    its WHERE, SUMMARIZE; a DOUBLE meeting a DECIMAL (a DOUBLE, as DuckDB and Postgres make it: it
+    was a DECIMAL(30, 15), which failed past 10^15) and an INSERT's VALUES of both; samples that
+    sample (TABLESAMPLE was ignored); refusals by name; the
     same answers spread over three nodes; and what `random_sql.py` found (`- -3` written again as
     a comment, a DISTINCT over a CASE refused, two IN lists of a column taken as sets of values,
     columns of one name on both sides of a join mixed up)."""
@@ -11800,7 +12195,10 @@ def friendly():
     setup = ["CREATE TABLE t (id INTEGER, k INTEGER, g VARCHAR, x DOUBLE, n DOUBLE, l INTEGER[], ts TIMESTAMP, j VARCHAR)",
              "INSERT INTO t VALUES " + ", ".join(row(i) for i in range(2000)),
              "CREATE TABLE q (k INTEGER, ts TIMESTAMP, p DOUBLE)",
-             "INSERT INTO q VALUES " + ", ".join(f"({k}, TIMESTAMP '{t0 + datetime.timedelta(minutes=37 * i + k)}', {i + k / 10})" for i in range(60) for k in range(6))]
+             "INSERT INTO q VALUES " + ", ".join(f"({k}, TIMESTAMP '{t0 + datetime.timedelta(minutes=37 * i + k)}', {i + k / 10})" for i in range(60) for k in range(6)),
+             # (doubles past 10^15 beside decimals: DataFusion made both a DECIMAL(30, 15), and failed)
+             "CREATE TABLE big (x DOUBLE, r REAL, d DECIMAL(38, 2))",
+             "INSERT INTO big VALUES (1e20, 1.5, 12.34), (0.7, 0.25, 0.5), (1e-20, NULL, 99999999999999999999.99), (-3e18, -2.5, -1.25), (NULL, 3, NULL)"]
     for s_ in setup:
         sql(A.port, s_)
         duck.execute(s_)
@@ -11864,6 +12262,10 @@ def friendly():
         "x IN (a column, …) AND x IN (…): not the lists' intersection (random_sql.py)": ("SELECT id FROM t WHERE g IN (g, 'z') AND g IN ('a', 'b')", True, False),
         "x IN (…) AND x NOT IN (NULL): no row (random_sql.py)": ("SELECT count(*) AS c FROM t WHERE g IN ('a', 'b') AND g NOT IN (NULL)", True, False),
         "columns of one name on both sides of a LEFT JOIN, filtered on its padded side (random_sql.py)": ("SELECT (t.ts - q.ts) AS d, t.k FROM t LEFT JOIN q ON t.id = q.k WHERE q.k IS DISTINCT FROM 3", True, False),
+        "a DOUBLE past 10^15 compared with decimals (=, >, <, BETWEEN, IN)": ("SELECT x, x = 0.7 AS e, x > 0.5 AS g, x < 1e30 AS l, x BETWEEN 0.5 AND 2.5 AS b, x IN (0.7, 2.5) AS i FROM big", True, False),
+        "…in arithmetic, a REAL's and a DECIMAL column's too": ("SELECT x * 1.5 AS a, x + 0.25 AS b, r * 2.5 AS c, d * x AS e, d + 0.01 AS f FROM big", True, False),
+        "…as CASE's branches, COALESCE, GREATEST and LEAST": ("SELECT CASE WHEN x > 1 THEN x ELSE 0.5 END AS c, coalesce(x, 0.5) AS o, greatest(x, 0.5) AS g, least(x, 2.5) AS l FROM big", True, False),
+        "…in a UNION and as a join's key": ("SELECT x FROM big UNION ALL SELECT 0.25 UNION ALL SELECT big.x FROM big JOIN (VALUES (0.7)) v(e) ON big.x = v.e", True, False),
     }
     checks, failed = {}, {}
     for name, (q, names, ordered) in same.items():
@@ -11973,7 +12375,7 @@ def dialects():
     (`change::select_as` named both `__o_created_at`, and every change of such a table failed)."""
     import dialects_check
     FLOOR = {"postgres": 41, "duckdb": 31, "snowflake": 13, "spark": 10, "mysql": 19, "bigquery": 12, "sqlserver": 6}
-    XX000 = 26  # (refusals that are internal errors: lower it as they get codes, never raise it)
+    XX000 = 24  # (refusals that are internal errors: lower it as they get codes, never raise it)
     lake = new_lake()
     node = Node(lake, A.port).start()
     q = lambda s: sql(A.port, s)
@@ -12541,12 +12943,12 @@ def answers_big():
 SECS = {"memory": 255, "cursors": 15, "owned": 20, "signed": 20, "guesses": 15, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
-        "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "unique_doors": 60}
+        "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "ddlgaps": 40, "sqla": 30, "unique_doors": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, objects, registry, find, sequences, constraints, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, objects, registry, find, sequences, constraints, ddlgaps, sqla, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -12578,7 +12980,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "objects", "registry", "find", "sequences", "constraints", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "objects", "registry", "find", "sequences", "constraints", "ddlgaps", "sqla", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -12591,7 +12993,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "objects": objects, "registry": registry, "find": find, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

@@ -879,6 +879,9 @@ impl App {
     /// Tier the tables with at least `min_rows` rows in the log (0: all of them), publish them
     /// for other engines, then expire what everything has consumed (leader).
     pub async fn tier_all(&self, min_rows: u64) -> anyhow::Result<u64> {
+        if crate::backup::frozen(&self.lake) {
+            return crate::backup::tend(&self.lake).await.map(|_| 0); // (its tables never change: only its clones' pins are kept)
+        }
         let _guard = self.lock.lock().await;
         let _tiering = self.seq.as_ref().map(|s| s.tiering()); // (writers paused by backpressure stay paused: `log::Pace`)
         let start = std::time::Instant::now();
@@ -983,6 +986,9 @@ impl App {
     }
 
     pub async fn run_tasks(&self) -> anyhow::Result<()> {
+        if crate::backup::frozen(&self.lake) {
+            return Ok(()); // (a backup's views and tasks follow nothing: ADR-070)
+        }
         crate::tasks::run_all(&self.lake, &self.cluster, self.log()?).await?;
         match &self.seq {
             Some(seq) => {
@@ -1309,7 +1315,7 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     if let ([one], true, true, true, None, false) = (&crate::routines::split(&req.sql)[..], req.params.is_empty(), req.tables.is_empty(), req.views.is_empty(), crate::vars::change(&req.sql), crate::script::is(&req.sql)) {
         let sent = one;
         let one = crate::routines::expand(&app.lake, &crate::vars::bound(one)?).await?; // (`$name`: the session's variables)
-        if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() && crate::txn::control(&one).is_none() && !crate::txn::open() && !crate::settings::is(&one) {
+        if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() && !crate::routines::several(&one) && crate::txn::control(&one).is_none() && !crate::txn::open() && !crate::settings::is(&one) {
             return Ok(crate::audit::statement(&app, sent, query(&app, &p, &one, who.files)).await?); // (the audit log and history keep it as it was sent)
         }
     }
