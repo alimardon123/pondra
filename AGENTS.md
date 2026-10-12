@@ -451,7 +451,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    tier.
 11. **Catalog memtable flushes are rationed:** one loop, every 5 s, only if something committed,
    plus one when a leader takes over (followers' views read no WAL and need it). Each flush is a
-   level-0 file; flushing on every tiering call stalled writes for 9 s at a time (round 6).
+   level-0 file; flushing on every tiering call stalled writes for 9 s at a time (round 6). The WAL
+   is another matter: a local lake's writer flushes it at each write (`Catalog::write`: `flush_now`),
+   since a commit waited about a millisecond for `flush_interval`'s tick; a bucket keeps the tick, so
+   writes made together share one PUT (principle 7).
 12. **A tiering round is: fold + commit, publish, then maintain.** Merges and compactions come
    after the fresh rows are committed and published, in their own commit. A table with no new
    rows is skipped (no empty commit); `expire` moves its `tiered` mark along every 10 s — don't
@@ -2436,6 +2439,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and no routine's code…", "S27, beyond the listings…" (both fail on the build before),
    "…a user granted APPLY on this database (it deploys them) is shown routines' code and the export", "…nor in a
    failed call's error…".
+
+383. **On Linux the program gives memory back** (`main.rs`: jemalloc with its background threads;
+   `build.yml` builds arm64 for 64 KB pages). Under a steady stream of small commits mimalloc kept
+   the pages each thread freed: at 240 commits a second a node grew about 50 MB a minute while what
+   it held levelled off. jemalloc's threads give back what has been free for ten seconds. macOS and
+   Windows keep mimalloc. An allocator change shows TPC-H, TPC-DS and `harness.py memory` before and
+   after. `harness.py memory`: "its own memory levels off…" fails on mimalloc.
 
 395. **RETURNING answers the rows the write worked out, never rows read back** (`returning.rs`: `wrote`
    from `write::run_listed`, `txn::autocommit_as`, `insert_as` and `txn::statement`). A change the

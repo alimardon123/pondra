@@ -358,19 +358,22 @@ tokio::task_local! {
 
 /// `f`, a query a door asked for, planned with this node's facts as its runs so far say (`ran`);
 /// and how. A plan made outside it uses none.
-pub async fn planning<F: std::future::Future>(sql: &str, f: F) -> (F::Output, Planned) {
+/// (not `async`, as `ext::listing`: its future would hold `f` twice)
+pub fn planning<F: std::future::Future>(sql: &str, f: F) -> impl std::future::Future<Output = (F::Output, Planned)> {
+    use futures::{future::Either, FutureExt};
     if !on() {
-        return (f.await, Planned::Plain);
+        return Either::Left(f.map(|out| (out, Planned::Plain)));
     }
     let used = Arc::new(AtomicBool::new(false));
     let plan = Arc::new(Planning { given: None, sql: sql.into(), verdict: OnceLock::new(), used: used.clone(), held: AtomicBool::new(false) });
-    let out = PLAN.scope(plan.clone(), f).await;
-    let planned = match (plan.held.load(Ordering::Relaxed), used.load(Ordering::Relaxed)) {
-        (true, _) => Planned::Bar,
-        (false, true) => Planned::Used,
-        (false, false) => Planned::Plain,
-    };
-    (out, planned)
+    Either::Right(PLAN.scope(plan.clone(), f).map(move |out| {
+        let planned = match (plan.held.load(Ordering::Relaxed), used.load(Ordering::Relaxed)) {
+            (true, _) => Planned::Bar,
+            (false, true) => Planned::Used,
+            (false, false) => Planned::Plain,
+        };
+        (out, planned)
+    }))
 }
 
 /// `f`, a spread query's slice, planned with the facts its coordinator planned with and no others, so

@@ -39,10 +39,12 @@ pub async fn scope<F: std::future::Future>(owner: bool, f: F) -> F::Output {
 }
 
 /// Run `f` listing each table of files once (within a statement already doing so: as it is).
-pub async fn listing<F: std::future::Future>(f: F) -> F::Output {
+/// (not `async`: its future would hold `f` twice, once per arm, and a query's is over 400 KB)
+pub fn listing<F: std::future::Future>(f: F) -> impl std::future::Future<Output = F::Output> {
+    use futures::future::Either;
     match LISTED.try_with(|_| ()) {
-        Ok(()) => f.await,
-        Err(_) => LISTED.scope(Default::default(), f).await,
+        Ok(()) => Either::Left(f),
+        Err(_) => Either::Right(LISTED.scope(Default::default(), f)),
     }
 }
 

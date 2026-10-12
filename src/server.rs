@@ -798,7 +798,12 @@ impl App {
         let explained = crate::write::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
         let run = async {
             let nodes = if spread == Some("0") || self.here_only(query).await { vec![] } else { self.cluster.nodes() };
-            match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
+            // (boxed, and only with nodes to spread over: its future is 300 KB, which every query on one node carried)
+            let spread_out = match nodes.len() > 1 {
+                true => Box::pin(crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1"))).await,
+                false => Ok(None),
+            };
+            match spread_out {
                 Ok(Some(batches)) => {
                     crate::guard::ran_spread(query, start.elapsed());
                     crate::history::spread(nodes.len());
