@@ -2103,7 +2103,7 @@ The design is in ADR-007; the on-disk layout and how to read it without Pondra a
 
 | Change | Effect |
 |---|---|
-| **Delta Lake publishing:** each tiering round writes each table's `_delta_log/` (JSON commit, checkpoint every 10 versions, last 1,000 versions kept), derived from committed catalog state, put-if-absent | Any Delta reader sees the lake. Checked against delta-rs 1.6.4, Polars 1.44.2 and DuckDB 1.5.5 on local disk, simulated R2 and real R2, across 1,250 versions with checkpoints and log cleanup |
+| **Delta Lake publishing:** each tiering round writes each table's `_delta_log/` (JSON commit, checkpoint every 10 versions, last 100 versions kept now, 1,000 then), derived from committed catalog state, put-if-absent | Any Delta reader sees the lake. Checked against delta-rs 1.6.4, Polars 1.44.2 and DuckDB 1.5.5 on local disk, simulated R2 and real R2, across 1,250 versions with checkpoints and log cleanup |
 | **Tiering starts when rows commit** (at most every `--tier-secs`, default 2, fractions allowed), commits fresh rows before merges and compactions, and does up to 4 tables at once | New row → Delta version: **17 ms** on local disk (was 10 s + a round) |
 | **SSD tier per node** (`--cache-dir`, `--cache-gb 20`): write-through, read-through, prefetched from the commit stream, warmed at start | Queries on R2 read local disk, not the bucket |
 | **Followers and serving nodes hold the whole catalog in memory**, kept current by the commit stream | No catalog reads from the bucket on the query path |
