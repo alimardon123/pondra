@@ -12346,6 +12346,20 @@ def sqla():
         asked[0][1] == "42P01" and asked[2][1] == "42P01" and [list(r.values()) for r in asked[1][2]] == port_rel == [["dv", "r"]] \
         and asked[3][2] == asked[5][2] == [{"data_type": "Int32"}] and [list(r.values()) for r in asked[4][2]] == port_typ == [["integer"]] \
         and asked[6][:2] == (400, "22023")
+
+    # VARCHAR(n) in Postgres's catalog, as Postgres 16 shows it: format_type with the length (atttypmod n + 4),
+    # information_schema's lengths (bytes at UTF-8's four a character); text has none. Over the port and over HTTP.
+    q("CREATE TABLE vc (s VARCHAR(5), t TEXT)")
+    ft = "SELECT attname, format_type(atttypid, atttypmod) AS ty, atttypmod FROM pg_attribute WHERE attrelid = 'vc'::regclass AND attnum > 0 ORDER BY attnum"
+    isc = ("SELECT column_name, data_type, character_maximum_length, character_octet_length, udt_name FROM information_schema.columns "
+           "WHERE table_name = 'vc' ORDER BY ordinal_position")
+    seen = {"port": [[list(r) for r in conn.execute(s).fetchall()] for s in (ft, isc)],
+            "http": [[list(r.values()) for r in at(s, "postgres")[2]] for s in (ft, isc)]}
+    info["varchar_catalog"] = seen
+    want = [[["s", "character varying(5)", 9], ["t", "text", -1]],
+            [["s", "character varying", 5, 20, "varchar"], ["t", "text", None, 1073741824, "text"]]]
+    checks["VARCHAR(5) in Postgres's catalog as Postgres 16 shows it (format_type, atttypmod 9, information_schema's lengths), over the port and ?catalog=postgres"] = \
+        seen["port"] == seen["http"] == want
     node.kill()
 
     # A user granted one table, and another's column, sees those in Postgres's catalog and nothing else, over the
@@ -13230,17 +13244,15 @@ BI_EXCEPTIONS = {
                    "attnum both qualified (a.attnum) and unqualified, so Pondra answers XX000 'ambiguous'",
 }
 
-# What Postgres 16 answers on the same data, written as literals (computed on a Postgres 16.15 server, database bi). One
-# difference is Pondra's on purpose: a VARCHAR(n) column is text, as in DuckDB (Pondra keeps strings as one type and no
-# declared length; the `pg_catalog` section checks it), so `note` reads text where Postgres 16 says character varying.
+# What Postgres 16 answers on the same data, written as literals (computed on a Postgres 16.15 server, database bi).
 BI_GRAFANA_TABLES = ["regions", "sales", "sales_by_region", "crm.customers"]  # showTables, in the order its ORDER BY gives
-BI_GRAFANA_SALES = [("amount", "double precision"), ("id", "bigint"), ("note", "text"), ("product", "text"),
+BI_GRAFANA_SALES = [("amount", "double precision"), ("id", "bigint"), ("note", "character varying"), ("product", "text"),
                     ("qty", "integer"), ("ref", "uuid"), ("region", "text"), ("ts", "timestamp without time zone")]
 BI_METABASE_TABLES = [("crm", "customers", "TABLE", None), ("public", "regions", "TABLE", None),
                       ("public", "sales", "TABLE", "one row a sale"), ("public", "sales_by_region", "VIEW", None)]
 BI_METABASE_SALES = [("id", "int8", 0, True, None), ("ts", "timestamp", 1, False, None), ("region", "text", 2, False, None),
                      ("product", "text", 3, False, None), ("amount", "float8", 4, False, "in euros"),
-                     ("qty", "int4", 5, False, None), ("ref", "uuid", 6, False, None), ("note", "text", 7, False, None)]
+                     ("qty", "int4", 5, False, None), ("ref", "uuid", 6, False, None), ("note", "varchar", 7, False, None)]
 # Superset's time-range charts: [row count, digest] (bi_digest), by statement key.
 BI_SUPERSET = {"superset:45": ("day", 356, "9cbded7090574f0e"), "superset:46": ("week", 56, "4149781711f54944"),
                "superset:47": ("month", 12, "ac21e38aff619dea"), "superset:48": ("hour", 8544, "4686040d6f2da882"),
@@ -13431,7 +13443,7 @@ def bi():
               lambda: [tuple(r[:4]) for r in results["metabase:sync-11"]] == BI_METABASE_TABLES
               and any(r[0] == "public" and r[1] == "sales" and r[4] is not None for r in results["metabase:sync-11"]))
         check("Metabase's field sync (statement 13) gives each column of sales its database type (int8, timestamp, text, float8, "
-              "int4, uuid; a VARCHAR(n) text), pk? true for id only, and amount's comment",
+              "int4, uuid, varchar), pk? true for id only, and amount's comment",
               lambda: [(r[0], r[1], r[2], r[5], r[6]) for r in results["metabase:sync-13"]
                        if r[3] == "public" and r[4] == "sales"] == BI_METABASE_SALES)
         for key, (grain, count, digest) in BI_SUPERSET.items():

@@ -155,6 +155,8 @@ fn format_type(oid: u32, typmod: i32) -> Option<String> {
     let name = TYPES.iter().find(|t| t.0 == oid).map(|t| t.2.to_string()).or_else(|| arrays().find(|a| a.0 == oid).map(|a| a.2))?;
     Some(match (oid, typmod) {
         (1700, m) if m >= 4 => format!("numeric({},{})", (m - 4) >> 16, (m - 4) & 0xffff),
+        (1043, m) if m >= 4 => format!("character varying({})", m - 4), // (a VARCHAR(n) column: n + 4, as Postgres keeps it)
+        (1042, m) if m >= 4 => format!("character({})", m - 4),
         _ => name,
     })
 }
@@ -175,7 +177,7 @@ struct Rel {
     identity: BTreeMap<String, crate::seq::Identity>, // identity columns, by name (`attidentity`)
     constraints: Vec<crate::constraints::Constraint>, // UNIQUE, and keys said NOT ENFORCED (SQL's names)
     checks: Vec<(String, String)>, // CHECK constraints: (name, condition)
-    typed: BTreeMap<String, u32>, // columns of a type their Arrow type doesn't say (SQL's names): an enum's type's oid (an inline ENUM('a') is text), uuid's
+    typed: BTreeMap<String, (u32, i32)>, // columns of a type their Arrow type doesn't say (SQL's names), with its typmod: an enum's type (an inline ENUM('a') is text), uuid, VARCHAR(n)
     comment: Option<String>, // COMMENT ON the relation (`cm/relation/…`, `objects.rs`)
     comments: BTreeMap<String, String>, // COMMENT ON its columns, by SQL name (`cm/column/…` by the stored name)
     rows: u64,
@@ -184,10 +186,10 @@ struct Rel {
 
 impl Rel {
     /// A column's type as Postgres names it: (oid, typmod, length, -1 when it varies). An enum
-    /// column's own type, a uuid column's; the type `pg_of` gives every other.
+    /// column's own type, a uuid column's, a VARCHAR(n)'s with its length; the type `pg_of` gives every other.
     fn column_type(&self, name: &str, t: &DataType) -> (u32, i32, i16) {
         match self.typed.get(name) {
-            Some(oid) => (*oid, -1, TYPES.iter().find(|x| x.0 == *oid).map_or(ENUM_LENGTH, |x| x.3)),
+            Some(&(oid, typmod)) => (oid, typmod, TYPES.iter().find(|x| x.0 == oid).map_or(ENUM_LENGTH, |x| x.3)),
             None => {
                 let (typ, typmod) = pg_of(t);
                 (typ, typmod, TYPES.iter().find(|x| x.0 == typ).map_or(-1, |x| x.3))
@@ -387,12 +389,17 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         let (rows, bytes) = m.files.iter().fold((0, 0), |(r, b), f| (r + f.rows, b + f.bytes));
         let sealed = m.sealed.clone().unwrap_or_default();
         let kind = if mvs.contains_key(name) { 'm' } else { 'r' };
-        // (an enum column is the type it was declared with, when the lake still has that type; a uuid column is uuid)
+        // (an enum column is the type it was declared with, when the lake still has that type; a uuid column is
+        // uuid; a VARCHAR(n) column character varying(n), its typmod n + 4 as Postgres keeps it)
         let enums = l.enums.iter().filter_map(|(c, e)| {
             let t = oid("ty", e.of.as_deref()?);
-            types.iter().any(|x| x.oid == t).then(|| (c.clone(), t))
+            types.iter().any(|x| x.oid == t).then(|| (c.clone(), (t, -1)))
         });
-        let typed = enums.chain(l.sql_types.iter().filter(|(_, t)| *t == "uuid").map(|(c, _)| (c.clone(), UUID))).collect();
+        let held = l.sql_types.iter().filter_map(|(c, t)| match t.as_str() {
+            "uuid" => Some((c.clone(), (UUID, -1))),
+            t => crate::types::length(t).map(|n| (c.clone(), (1043, n as i32 + 4))),
+        });
+        let typed = enums.chain(held).collect();
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = l.columns.iter().filter_map(|(c, _)| Some((c.clone(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
         rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: mvs.get(name).cloned(), identity: l.identity.clone(), constraints: l.constraints.clone(), checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
@@ -877,9 +884,9 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
     let mut cols = vec![];
     for r in &l.rels {
         for (i, (name, t, not_null, default)) in r.columns.iter().enumerate() {
-            let (typ, _, _) = r.column_type(name, t);
+            let (typ, typmod, _) = r.column_type(name, t);
             let array = arrays().find(|a| a.0 == typ);
-            let data_type = match (r.typed.get(name).is_some_and(|t| l.enum_type(*t).is_some()), array) {
+            let data_type = match (r.typed.get(name).is_some_and(|t| l.enum_type(t.0).is_some()), array) {
                 (true, _) => "USER-DEFINED".to_string(), // (an enum: its type's schema and name, below)
                 (false, Some(_)) => "ARRAY".to_string(),
                 (false, None) => l.format_type(typ, -1).unwrap_or_else(|| "text".into()),
@@ -894,7 +901,7 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
                 _ => (n(), n(), n()),
             };
             let datetime = if matches!(typ, 1082) { i4(0) } else if matches!(typ, 1083 | 1114 | 1184) { i4(6) } else { n() };
-            let (udt_schema, udt) = match r.typed.get(name).and_then(|oid| l.enum_type(*oid)) {
+            let (udt_schema, udt) = match r.typed.get(name).and_then(|t| l.enum_type(t.0)) {
                 Some(e) => (e.schema.clone(), e.name.clone()),
                 None => ("pg_catalog".to_string(), type_name(typ).unwrap_or_else(|| "text".into())),
             };
@@ -905,8 +912,14 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
                 (Some(id), Some(sh)) => (s(if id.always { "ALWAYS" } else { "BY DEFAULT" }), s(sh.start.to_string()), s(sh.increment.to_string()), s(sh.max.to_string()), s(sh.min.to_string()), yes(sh.cycle)),
                 _ => (n(), n(), n(), n(), n(), n()),
             };
+            // (a VARCHAR(n)'s length, and its bytes at UTF-8's four a character, as Postgres says; text's 1 GB)
+            let (chars, octets) = match (typ, typmod) {
+                (1042 | 1043, m) if m >= 4 => (i4(m - 4), i4((m - 4) * 4)),
+                (25 | 1043, _) => (n(), i4(1_073_741_824)),
+                _ => (n(), n()),
+            };
             cols.push(vec![db(), s(r.schema.clone()), s(r.name.clone()), s(name.clone()), i4(i as i32 + 1), default.clone().map_or(n(), s), yes(!(*not_null || r.key.contains(name))), s(data_type),
-                n(), if matches!(typ, 25 | 1043) { i4(1_073_741_824) } else { n() }, precision, radix, scale, datetime, n(), n(), n(), n(), n(), n(), n(), n(), n(), n(), n(), db(), s(udt_schema), s(udt),
+                chars, octets, precision, radix, scale, datetime, n(), n(), n(), n(), n(), n(), n(), n(), n(), n(), n(), db(), s(udt_schema), s(udt),
                 n(), n(), n(), n(), s((i + 1).to_string()), s("NO"), yes(identity.is_some()), generation, start, increment, maximum, minimum, cycle, s("NEVER"), n(), yes(r.kind == 'r')]);
         }
     }
