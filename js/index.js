@@ -465,6 +465,8 @@ export class Pondra {
     const name = (await this.sql("SELECT current_database() AS d"))[0].d.replace(/"/g, '""');
     await this.sql(`ALTER DATABASE "${name}" SET LOCATION '${String(target).replace(/'/g, "''")}'`);
     await this.sql("SELECT 1"); // (its retries wait out the move: the node starts again on the target)
+    const failed = (await (await this.request("GET", "/stats")).json()).move_failed; // (a move that failed: the lake stays in memory)
+    if (failed) throw new Error(`the lake stays in memory: ${failed}`);
   }
 
   /** End this connection's session (its temporary tables and views), then close the node `connect()` started

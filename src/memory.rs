@@ -35,6 +35,19 @@ const LOCK_FILE: &str = ".lock";
 /// on disk, and no other process reaches it. (Not `per_node!`: a restart in place resets those.)
 static MEMORY: std::sync::LazyLock<Mutex<HashMap<String, Store>>> = std::sync::LazyLock::new(Default::default);
 
+crate::per_node!(
+    /// Why the last move of this node's lake failed (`move_failed`): the host starts the node again on the lake
+    /// in memory after it, so the flag belongs to the node that starts next, and goes when that node stops.
+    pub static MOVE_FAILED: Mutex<Option<String>> = Default::default());
+
+/// A move that failed (`settle`): said on stderr, and kept for the node that starts again on the lake in memory,
+/// which says so in `/stats`. The host calls it after the node stopped (`Node::stop` sets its statics back).
+pub fn move_failed(to: &str, e: &anyhow::Error) {
+    let why = format!("moving the lake to {to} failed: {e:#}");
+    eprintln!("{why}; it stays in memory");
+    *MOVE_FAILED.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
+}
+
 /// Is `url` a lake held in this process's memory?
 pub fn in_memory(url: &str) -> bool { url.starts_with("memory://") }
 
@@ -514,7 +527,7 @@ pub async fn set_location(lake: &Lake, database: &str, to: &str) -> anyhow::Resu
         }
     }
     if let Some(e) = failed {
-        undo(&dest, &copied).await;
+        clear(&dest).await;
         return Err(e.context(format!("copying the lake to {to}")));
     }
     crate::node::move_lake(crate::node::Move { from: lake.url.clone(), to: to.clone(), copied })?;
@@ -553,10 +566,12 @@ async fn copy_at(from: &Store, to: &Store, at: &Path, create: bool) -> anyhow::R
     Ok(Some((e_tag, size)))
 }
 
-/// Takes away what a move copied before it failed, so the target is left as it was.
-async fn undo(dest: &Store, copied: &Copied) {
-    for at in copied.keys() {
-        let _ = dest.delete(&Path::from(at.as_str())).await;
+/// Takes away every object at the target, so a move that failed leaves it as it was: empty, as pass 1 found
+/// it. A listing, not what the copies named: a failed copy may have written part of an object.
+async fn clear(dest: &Store) {
+    let listed: Vec<Path> = dest.list(None).map_ok(|meta| meta.location).try_collect().await.unwrap_or_default();
+    for at in listed {
+        let _ = dest.delete(&at).await;
     }
 }
 
@@ -566,6 +581,17 @@ async fn undo(dest: &Store, copied: &Copied) {
 pub async fn settle(m: &crate::node::Move) -> anyhow::Result<()> {
     let from = MEMORY.lock().unwrap_or_else(PoisonError::into_inner).get(m.from.trim_end_matches('/')).cloned().context("the lake to move is no longer in memory")?;
     let dest = crate::store::open_store(&m.to)?.1;
+    if let Err(e) = settle_into(&from, &dest, m).await {
+        // (a failed second pass leaves the lake in memory, whole, and nothing of the move at the target)
+        clear(&dest).await;
+        return Err(e);
+    }
+    forget_memory(&m.from);
+    Ok(())
+}
+
+/// The copies and deletes of pass 2 (`settle`), which a failure of any of them undoes.
+async fn settle_into(from: &Store, dest: &Store, m: &crate::node::Move) -> anyhow::Result<()> {
     let now: Vec<ObjectMeta> = from.list(None).try_collect().await?;
     let (mut keep, mut changed) = (BTreeSet::new(), vec![]);
     for meta in now {
@@ -584,6 +610,11 @@ pub async fn settle(m: &crate::node::Move) -> anyhow::Result<()> {
         .buffer_unordered(16)
         .try_collect::<Vec<()>>()
         .await?;
+    // (test hook: a second pass that fails, as a full disk would. After its copies, not the first one: a pass
+    // with nothing changed copies nothing, and the hook must still fail it)
+    if crate::store::crash_rolled("move_settle") {
+        anyhow::bail!("PONDRA_CRASH at move_settle");
+    }
     let stale: Vec<Path> = dest
         .list(None)
         .map_ok(|meta| meta.location)
@@ -596,7 +627,6 @@ pub async fn settle(m: &crate::node::Move) -> anyhow::Result<()> {
     for at in &stale {
         dest.delete(at).await?;
     }
-    forget_memory(&m.from);
     Ok(())
 }
 

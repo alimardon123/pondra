@@ -509,12 +509,14 @@ async fn run() -> anyhow::Result<()> {
                         std::process::exit(0);
                     }
                     // The lake moves: its requests answered and the node stopped, its objects settled on the
-                    // target, and the node started again there, on the same port.
+                    // target, and the node started again there, on the same port. A move that fails leaves
+                    // the lake in memory: the node starts again on it, on the same port, and says why.
                     Some(m) = moves.recv() => {
                         drain::drain().await;
                         node.stop().await;
                         if let Err(e) = crate::memory::settle(&m).await {
-                            anyhow::bail!("moving the lake to {}: {e:#}", m.to);
+                            crate::memory::move_failed(&m.to, &e);
+                            continue;
                         }
                         options.dir = m.to;
                     }

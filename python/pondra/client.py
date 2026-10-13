@@ -678,6 +678,9 @@ class Pondra:
         target = os.fspath(target).replace("'", "''")
         self._run(f"ALTER DATABASE \"{name}\" SET LOCATION '{target}'")
         self._run("SELECT 1")  # (its retries wait out the move: the node starts again on the target)
+        failed = json.loads(self._call("GET", "/stats")).get("move_failed")  # (a move that failed: the lake stays in memory)
+        if failed:
+            raise RuntimeError(f"the lake stays in memory: {failed}")
 
     def close(self):
         """End this connection's session (its temporary tables and views), and close the node

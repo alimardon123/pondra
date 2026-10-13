@@ -300,6 +300,17 @@ impl Node {
         if cluster.is_leader() && !cluster.reader {
             runs::schedule(app.clone()); // (tasks: the leader runs their ticks)
         }
+        if cluster.is_leader() && !cluster.reader && !backup::frozen(&lake) {
+            // (a lake opened somewhere it didn't publish from — moved by SET LOCATION, or copied — publishes its
+            // Iceberg tables here at once: `iceberg::Published::location`; for the rest a pass that finds nothing new)
+            let (a, l) = (app.clone(), lake.clone());
+            panics::task(async move {
+                let _lock = a.lock.lock().await; // (the lock tiering publishes under: `server::tier_all`)
+                if let Err(e) = crate::delta::publish_all(&l).await {
+                    eprintln!("publishing at start: {e:#}");
+                }
+            });
+        }
         // A door whose port is taken stops the start, as HTTP's does: beside a Postgres on 5432, psql would
         // otherwise talk to that one. (Each door binds again a moment later; handing it this listener is cleaner.)
         for (flag, door) in [("pg", &pg), ("kafka", &kafka), ("flight", &flight)] {

@@ -13,11 +13,12 @@ use crate::write::Request;
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bytes::Bytes;
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::panic::AssertUnwindSafe;
 
 /// The catalog entry that makes a lake a backup.
 pub const KEY: &str = "bk";
@@ -213,13 +214,84 @@ async fn backup(lake: &Lake, lock: &tokio::sync::Mutex<()>, database: Option<&st
         }
     };
     let out = tokio::select! {
-        out = Box::pin(crate::write::send(&to, Request::Ddl(Ddl::Backup(take)))) => out,
+        // (a lake held in this process's memory is taken here: no `pondra lead` of its own can reach it)
+        out = async { if crate::store::in_memory(&source.url) { take_here(&to, take).await } else { Box::pin(crate::write::send(&to, Request::Ddl(Ddl::Backup(take)))).await } } => out, // (boxed: `send` leads back here through `deliver`)
         _ = renew => unreachable!(),
     };
     if let Err(e) = ask(Ddl::Unpin { lake: pin.clone() }).await {
         eprintln!("letting go of the pin {pin} in {}: {e:#} (its hourly sweep lets it go)", source.url);
     }
     out.with_context(|| format!("backing up {} to {to}", source.url))
+}
+
+/// A backup of a lake held in this process's memory, taken here: a `pondra lead` of its own can't reach that
+/// memory (invariant 62's one exception). The backup is led for this run alone, as a one-off writer leads
+/// (`write::deliver`): a term claimed with no address, its mark kept fresh, let go at the end. Its catalog's
+/// writer is closed on every path, a panic's too, so no writer of another lake stays in this node for that
+/// lake's next leader to fence.
+async fn take_here(to: &str, t: Take) -> Result<Value> {
+    let store = crate::store::open_store(to)?.1;
+    let term = one_off_term(&store, to).await?;
+    let marks = Marks(crate::panics::task({
+        let (store, n) = (store.clone(), term.n);
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let _ = crate::cluster::mark_alive(&store, n).await;
+            }
+        }
+    }));
+    let out = match Lake::open(to, true, false).await {
+        Ok(lake) => {
+            let run = AssertUnwindSafe(take_led(&lake, t, term.n)).catch_unwind().await;
+            if let Err(e) = lake.cat.close().await {
+                eprintln!("closing the backup at {to}: {e:#}"); // (said, not returned: the run's own answer goes out)
+            }
+            drop(lake);
+            run
+        }
+        Err(e) => Ok(Err(e)),
+    };
+    drop(marks); // (its mark stops before the term is let go, so no mark lands after it)
+    crate::cluster::release(&store, term.n).await;
+    match out {
+        Ok(run) => run,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// A one-off writer's mark, kept fresh until it is dropped. Dropped with the run cancelled too, so the term
+/// goes stale (as a crashed writer's does) rather than looking alive for ever: a dropped `JoinHandle` aborts nothing.
+struct Marks(tokio::task::JoinHandle<()>);
+
+impl Drop for Marks {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The run, led under `term` (a new leader recovers before it takes writes: invariant 15).
+async fn take_led(lake: &Lake, t: Take, term: u64) -> Result<Value> {
+    crate::replica::recover(lake, "", term, None).await?;
+    take(lake, t).await
+}
+
+/// The term a one-off writer claims for the backup at `to` (`write::deliver`'s loop): one that is none's, or
+/// that another one-off writer holds, which is waited for. A node serving the backup can't be asked here.
+async fn one_off_term(store: &Store, to: &str) -> Result<crate::cluster::Term> {
+    loop {
+        match crate::cluster::latest(store).await? {
+            Some(t) if crate::cluster::alive(store, &t).await => {
+                ensure!(t.addr.is_empty(), "{to} is served by a node, which can't read a lake in this process's memory: back up somewhere else, or stop that node");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            t => {
+                if let Some(term) = crate::cluster::claim(store, t.map_or(1, |t| t.n + 1), "").await? {
+                    return Ok(term);
+                }
+            }
+        }
+    }
 }
 
 /// `RESTORE DATABASE name FROM 'url' [AT (TIMESTAMP => …)]` and `pondra restore`: a new lake at

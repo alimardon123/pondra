@@ -2220,17 +2220,23 @@ fn fatal(e: slatedb::Error) -> anyhow::Error {
 /// Test hook: `PONDRA_CRASH=after_seg_put:0.05,after_parquet_put:0.2` aborts the process at
 /// that point with that probability, to prove crashes never lose or duplicate rows.
 pub fn maybe_crash(point: &str) {
-    let Some(spec) = crate::env::get("PONDRA_CRASH") else { return };
-    for (name, prob) in spec.split(',').filter_map(|p| p.split_once(':')) {
-        let roll = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1e6;
-        if name == point && roll < prob.parse().unwrap_or(0.0) {
-            if crate::library::on() {
-                panic!("PONDRA_CRASH at {point}"); // (a library's node fails, its host stays: a vital loop's panic)
-            }
-            eprintln!("PONDRA_CRASH: aborting at {point}");
-            std::process::abort();
+    if crash_rolled(point) {
+        if crate::library::on() {
+            panic!("PONDRA_CRASH at {point}"); // (a library's node fails, its host stays: a vital loop's panic)
         }
+        eprintln!("PONDRA_CRASH: aborting at {point}");
+        std::process::abort();
     }
+}
+
+/// Whether `PONDRA_CRASH` names `point` and its roll comes up: `maybe_crash`'s test, for a point that
+/// fails an operation (`memory::settle`'s second pass) rather than the process.
+pub fn crash_rolled(point: &str) -> bool {
+    let Some(spec) = crate::env::get("PONDRA_CRASH") else { return false };
+    spec.split(',').filter_map(|p| p.split_once(':')).any(|(name, prob)| {
+        let roll = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1e6;
+        name == point && roll < prob.parse().unwrap_or(0.0)
+    })
 }
 
 /// How many partitions a query runs in here: one per core (`PONDRA_CORES` stands for another

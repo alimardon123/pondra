@@ -400,7 +400,9 @@ async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<M
                             set(State::Restarting(format!("moving the lake to {}", m.to)));
                             node.stop().await;
                             if let Err(e) = crate::memory::settle(&m).await {
-                                return failed_until_closed(&set, format!("moving the lake to {}: {e:#}", m.to), &mut events, first.take()).await;
+                                // (the lake stays in memory: the node starts again on it, and says why in `/stats`)
+                                crate::memory::move_failed(&m.to, &e);
+                                continue;
                             }
                             options.dir = m.to;
                             continue;

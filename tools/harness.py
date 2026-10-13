@@ -15833,6 +15833,7 @@ def doors():
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
     import pondra
     lake = new_lake()
+    lake_db = os.path.basename(lake.rstrip("/")).lower()  # (the database's name: its folder's last part, as `lake_name` makes it)
     pgp, fp = A.port + 2000, A.port + 30
     node = Node(lake, A.port, pg=f"127.0.0.1:{pgp}", flight=f"127.0.0.1:{fp}", tier_secs=0.5).start()
     q = lambda s: sql(A.port, s)
@@ -15877,6 +15878,7 @@ def doors():
             "a Git folder's status": (["SELECT path, change FROM pondra.git_status('d_git')"], lambda r: r[-1] == [["a.sql", "added"]]),
             "a backup": ([f"BACKUP DATABASE TO '{backups}/door{i}'"], lambda r: backed(f"{backups}/door{i}")),
             "a write to a backup refused, 25006": ([f"INSERT INTO d_bk.d_log VALUES ('door{i}', {i})"], lambda r: r == "25006"),
+            "SET LOCATION of a lake on disk, 0A000": ([f"ALTER DATABASE \"{lake_db}\" SET LOCATION '{backups}/moved{i}'"], lambda r: r == "0A000"),
         }
     def rows_of(x):
         return [list(r.values()) if isinstance(r, dict) else list(r) for r in x] if isinstance(x, list) else x
@@ -17209,7 +17211,9 @@ def memorylake():
     none is lost or doubled. The lake's objects are at the target, where another node opens them. The lake
     spills to disk past a 10 KB budget here, so its spilled files move too. Refused by name: a database
     that isn't this one, a folder holding other things (nothing of the lake is written there), a lake on
-    disk (0A000). The library's `pondra.connect()` in this process is moved the same way when it is built."""
+    disk (0A000). The library's `pondra.connect()` in this process is moved the same way when it is built. A
+    published Iceberg table is published again at the new place; a move whose second pass fails leaves the lake
+    in memory with every row (and says so in /stats and to db.save); BACKUP of a lake in memory runs here."""
     import pathlib
     P, nodes, checks = A.port, [], {}
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -17231,6 +17235,33 @@ def memorylake():
             "totals": sql(port, "SELECT k, c, s FROM totals WHERE k <> 'w' ORDER BY k"),
             "file": call(port, "GET", "/files/notes/a.txt"),
         }
+
+    def pub_metadata(folder):
+        """The newest Iceberg metadata file of the table `pub` in a folder (highest N), or None."""
+        d = os.path.join(folder, "data", "pub", "metadata")
+        names = [n for n in os.listdir(d) if n.startswith("v") and n.endswith(".metadata.json")] if os.path.isdir(d) else []
+        return os.path.join(d, max(names, key=lambda n: int(n[1:].split(".")[0]))) if names else None
+
+    def pub_at_target(folder):
+        """Whether the newest metadata of `pub` names `folder` (and no memory:// path is left in it)."""
+        path = pub_metadata(folder)
+        try:
+            text = open(path).read() if path else ""
+            return bool(text) and json.loads(text)["location"].startswith(os.path.realpath(folder)) and "memory://" not in text
+        except (OSError, ValueError, KeyError):
+            return False
+
+    def pub_rows_at(folder):
+        """The rows PyIceberg reads from `pub`'s newest metadata at `folder`; None when PyIceberg isn't there."""
+        try:
+            from pyiceberg.table import StaticTable
+        except ImportError:
+            return None
+        try:
+            return StaticTable.from_metadata(pub_metadata(folder)).scan().to_arrow().num_rows
+        except Exception as e:  # (a check that fails, not the section: what PyIceberg said is shown)
+            print(f"memorylake: PyIceberg couldn't read pub at {folder}: {e!r}"[:400], file=sys.stderr)
+            return -1
 
     def more(f, before, secs=20):
         """Whether f() comes above `before` within `secs` (a task's ticks, polled)."""
@@ -17268,6 +17299,9 @@ def memorylake():
         sql(P, "CREATE MATERIALIZED VIEW totals AS SELECT k, count(*) AS c, sum(n) AS s FROM orders GROUP BY k")
         sql(P, "CREATE SEQUENCE ids")
         sql(P, "CREATE TABLE ticks (at TIMESTAMP)")
+        sql(P, "CREATE TABLE pub (id BIGINT, v VARCHAR) WITH (publish = 'iceberg')")
+        sql(P, "INSERT INTO pub VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')")
+        call(P, "POST", "/tier", timeout=600)  # (tiered and published: its Iceberg metadata names the lake's place now)
         sql(P, "CREATE PROCEDURE mark() LANGUAGE sql AS $$ INSERT INTO ticks SELECT now() $$")
         sql(P, "CREATE TASK tick SCHEDULE '1 second' AS CALL mark()")
         call(P, "PUT", "/files/notes/a.txt", b"hello lake\n")
@@ -17319,6 +17353,11 @@ def memorylake():
             and bool(lake_objects(target, "files/notes/")))
         status, hdrs, _ = reply(P, "POST", "/sql", f"ALTER DATABASE {target_name} SET LOCATION '{new_lake()}'".encode())
         checks["a lake on disk is not moved this way (0A000)"] = status != 200 and hdrs.get("x-pondra-sqlstate") == "0A000"
+        # The Iceberg table is published again where the lake is now: its newest metadata names the target, no
+        # memory:// path is left in it, and PyIceberg reads its rows there.
+        pub_moved = until(lambda: pub_at_target(target), True, 20)
+        pub_rows = pub_rows_at(target)
+        checks["a published Iceberg table is published again at the target (its metadata names the target, PyIceberg reads its rows)"] = pub_moved and pub_rows in (5, None)
 
         # Stopped, and opened again from the target by another node: the same lake.
         final = answers(P)
@@ -17336,13 +17375,44 @@ def memorylake():
         db = _client(P + 2)
         db.sql("CREATE TABLE pts (v BIGINT)")
         db.sql("INSERT INTO pts VALUES (1), (2), (3)")
+        # BACKUP of a lake in memory runs in this process: the backup reads back its rows (ADR-070, invariant 62).
+        backed = new_lake()
+        sql(P + 2, "BACKUP DATABASE TO '" + backed + "'")
+        listed = os.listdir(os.path.join(backed, "_backups")) if os.path.isdir(os.path.join(backed, "_backups")) else []
+        sql(P + 2, f"ATTACH '{backed}' AS bk")
+        bk_rows = sql(P + 2, "SELECT count(*) AS n FROM bk.pts")[0]["n"]
+        sql(P + 2, "DETACH bk")
+        checks["BACKUP of a lake in memory runs in this process, and the backup reads back its rows"] = any(f.endswith(".json.zst") for f in listed) and bk_rows == 3
         t3 = new_lake()
         db.save(t3)
         db.sql("INSERT INTO pts VALUES (4)")
         py_rows = [str(r["v"]) for r in db.sql("SELECT v FROM pts ORDER BY v").rows()]
         checks["db.save(target) in Python: the lake there, and the same connection goes on"] = py_rows == ["1", "2", "3", "4"] and bool(lake_objects(t3, "catalog/"))
 
+        # A move whose second pass fails (PONDRA_CRASH=move_settle:1, a full disk's stand-in): the lake stays in memory,
+        # whole, says why in /stats, and the target is left empty; db.save says so too.
+        bad = Node(":memory:", P + 4, env={**env, "PONDRA_CRASH": "move_settle:1"}).start()
+        nodes.append(bad)
+        sql(P + 4, "CREATE TABLE kept (v BIGINT)")
+        sql(P + 4, "INSERT INTO kept VALUES (1), (2), (3)")
+        bad_name = call(P + 4, "GET", "/stats")["lake"]
+        bad_target = new_lake()
+        reply(P + 4, "POST", "/sql", f"ALTER DATABASE \"{bad_name}\" SET LOCATION '{bad_target}'".encode())
+        back = until(lambda: lake_now(P + 4), bad_name, 60) == bad_name
+        bad_stats = call(P + 4, "GET", "/stats", timeout=10) if back else {}
+        checks["a move whose second pass fails leaves the lake in memory with every row, says why in /stats, and nothing at the target"] = (
+            back and bool(bad_stats.get("move_failed")) and sql(P + 4, "SELECT v FROM kept ORDER BY v") == [{"v": 1}, {"v": 2}, {"v": 3}]
+            and not lake_objects(bad_target, "catalog/") and not lake_objects(bad_target, "data/"))
+        said = ""
+        try:
+            _client(P + 4).save(new_lake())
+        except Exception as e:
+            said = str(e)
+        checks["…and db.save raises, saying so"] = "stays in memory" in said
+
         # JavaScript: db.save(target) from a script of its own, on a memory node of its own.
+        if not shutil.which("node"):
+            checks["(skipped: node isn't on PATH, so the JavaScript check didn't run)"] = True
         if shutil.which("node"):
             js_node = Node(":memory:", P + 3, env=env).start()
             nodes.append(js_node)
@@ -17369,6 +17439,8 @@ def memorylake():
 
         # The library in this process: pondra.connect() and its save, when the library is built.
         lib = os.environ.get("PONDRA_LIBRARY") or os.path.join(root, "target", "release", {"darwin": "libpondra_lib.dylib", "win32": "pondra_lib.dll"}.get(sys.platform, "libpondra_lib.so"))
+        if not os.path.exists(lib):
+            checks["(skipped: the library isn't built, so pondra.connect() in this process didn't run)"] = True
         if os.path.exists(lib):
             t5 = new_lake()
             code = "\n".join([

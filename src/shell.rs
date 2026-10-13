@@ -126,7 +126,7 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
     if tty {
         let others = databases(&http, base).await.unwrap_or_default();
         let others = if others.len() > 1 { format!(" Databases: {}.", others.join(", ")) } else { String::new() };
-        eprintln!("Pondra {} on {dir}, also at {base}.{others} End each statement with ;  .tables and .databases list them, .quit leaves.", env!("CARGO_PKG_VERSION"));
+        eprintln!("Pondra {} on {dir}, also at {base}.{others} End each statement with ;  .tables and .databases list them, .save <folder> keeps a lake in memory there, .quit leaves.", env!("CARGO_PKG_VERSION"));
         eprintln!("The console, as this shell: {base}/#key={key}"); // (its key: the page then reads this machine's files as the shell does, and only while the shell runs)
     }
     let (mut sql, mut failed) = (String::new(), false);
@@ -137,6 +137,16 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
         }
         let mut line = String::new();
         let end = std::io::stdin().lock().read_line(&mut line)? == 0;
+        if let Some(target) = sql.is_empty().then(|| save_target(&line)).flatten() {
+            if let Err(e) = save(&http, base, key, &session, node, log, &target).await {
+                eprintln!("Error: {e:#}");
+                failed = true;
+            }
+            if end {
+                break;
+            }
+            continue;
+        }
         match (sql.is_empty(), line.trim()) {
             (true, ".quit" | ".exit" | "\\q") => break,
             (true, ".databases") => line = format!("{DATABASES};"),
@@ -178,6 +188,34 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
         }
     }
     Ok(failed && !tty)
+}
+
+/// The target of a `.save` line (`.save <target>`, its quotes optional), if the line is one.
+fn save_target(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix(".save")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim().trim_matches(|c: char| c == '\'' || c == '"').to_string())
+}
+
+/// `.save <target>`: the lake held in memory moves to `target` (`ALTER DATABASE … SET LOCATION`), and the shell
+/// waits until the node serves there. A move that failed leaves the lake in memory, and `/stats` says why.
+async fn save(http: &reqwest::Client, base: &str, key: &str, session: &str, node: &mut Child, log: &Path, target: &str) -> Result<()> {
+    anyhow::ensure!(!target.is_empty(), ".save needs a folder or a bucket's URL: .save <target>");
+    let rows: Vec<serde_json::Value> = http.post(format!("{base}/sql")).header("x-pondra-owner", key).body("SELECT current_database() AS d").send().await?.json().await?;
+    let name = rows.first().and_then(|r| r["d"].as_str()).ok_or_else(|| anyhow::anyhow!("this database's name isn't known"))?;
+    let statement = format!("ALTER DATABASE \"{}\" SET LOCATION '{}'", name.replace('"', "\"\""), target.replace('\'', "''"));
+    let answer = http.post(format!("{base}/sql?format=table")).header("x-pondra-owner", key).header("x-pondra-session", session).body(statement).send().await?;
+    let (ok, heard, body) = (answer.status().is_success(), notices(answer.headers()), answer.text().await?);
+    print!("{heard}");
+    anyhow::ensure!(ok, "{}", body.trim());
+    println!("{}", body.trim_end());
+    // (the node moves and starts again on the target: its answer waits for it, as a statement sent meanwhile does)
+    let http = up(base, node, log).await?;
+    let stats: serde_json::Value = http.get(format!("{base}/stats")).header("x-pondra-owner", key).send().await?.json().await?;
+    match stats["move_failed"].as_str() {
+        Some(why) => anyhow::bail!("the lake stays in memory: {why}"),
+        None => println!("Saved: the lake is at {target} now."),
+    }
+    Ok(())
 }
 
 /// Stop the node by closing its input (`--stop-with-stdin`): it hands the lake on at once, rather
