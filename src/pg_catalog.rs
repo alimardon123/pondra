@@ -317,7 +317,11 @@ async fn log_rows(lake: &Lake, metas: &[(String, TableMeta)]) -> Result<BTreeMap
 
 async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<Lakes> {
     let schemas = crate::ddl::schemas(lake).await?;
-    let mvs: std::collections::HashSet<String> = lake.cat.scan::<serde_json::Value>("v/", "v0").await?.into_iter().map(|(k, _)| k[2..].to_string()).collect();
+    // (a materialized view's query as it was written: `pg_matviews.definition` and `pg_get_viewdef`, as `View::query` gives it)
+    let mvs: BTreeMap<String, String> = lake.cat.scan::<serde_json::Value>("v/", "v0").await?.into_iter().map(|(k, v)| {
+        let sql = ["written", "sql"].iter().find_map(|f| v.get(f)?.as_str()).unwrap_or_default();
+        (k[2..].to_string(), sql.to_string())
+    }).collect();
     let types = enum_types(lake).await?;
     let members = members_of(&lake.cat.scan::<crate::users::User>("u/", "u0").await?, user);
     // COMMENT ON, as `objects.rs` keeps it (`cm/relation/{name}`, `cm/column/{name}/{stored column}`).
@@ -341,7 +345,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         }).collect();
         let (rows, bytes) = m.files.iter().fold((0, 0), |(r, b), f| (r + f.rows, b + f.bytes));
         let sealed = m.sealed.clone().unwrap_or_default();
-        let kind = if mvs.contains(name) { 'm' } else { 'r' };
+        let kind = if mvs.contains_key(name) { 'm' } else { 'r' };
         // (an enum column is the type it was declared with, when the lake still has that type; a uuid column is uuid)
         let enums = l.enums.iter().filter_map(|(c, e)| {
             let t = oid("ty", e.of.as_deref()?);
@@ -350,7 +354,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         let typed = enums.chain(l.sql_types.iter().filter(|(_, t)| *t == "uuid").map(|(c, _)| (c.clone(), UUID))).collect();
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = l.columns.iter().filter_map(|(c, _)| Some((c.clone(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: None, identity: l.identity.clone(), constraints: l.constraints.clone(), checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: mvs.get(name).cloned(), identity: l.identity.clone(), constraints: l.constraints.clone(), checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
     }
     let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
     // (a view's columns are its query's: planned only when a client asks for columns, in a
@@ -707,7 +711,7 @@ fn tables(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, A
     add!("pg_views", &[("schemaname", TEXT), ("viewname", TEXT), ("viewowner", TEXT), ("definition", TEXT)],
         rel_rows('v').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), s(r.sql.clone().unwrap_or_default())]).collect());
     add!("pg_matviews", &[("schemaname", TEXT), ("matviewname", TEXT), ("matviewowner", TEXT), ("tablespace", TEXT), ("hasindexes", BOOL), ("ispopulated", BOOL), ("definition", TEXT)],
-        rel_rows('m').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), n(), b(!r.key.is_empty()), b(true), s("")]).collect());
+        rel_rows('m').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), n(), b(!r.key.is_empty() || l.indexes.iter().any(|i| i.table == r.oid)), b(true), s(r.sql.clone().unwrap_or_default())]).collect());
     add!("pg_proc", &[("oid", OID), ("proname", TEXT), ("pronamespace", OID), ("proowner", OID), ("prolang", OID), ("procost", DataType::Float32), ("prorows", DataType::Float32),
         ("provariadic", OID), ("prosupport", TEXT), ("prokind", TEXT), ("prosecdef", BOOL), ("proleakproof", BOOL), ("proisstrict", BOOL), ("proretset", BOOL), ("provolatile", TEXT),
         ("proparallel", TEXT), ("pronargs", INT2), ("pronargdefaults", INT2), ("prorettype", OID), ("proargtypes", list(OID)), ("proallargtypes", list(OID)), ("proargmodes", list(TEXT)),

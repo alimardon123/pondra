@@ -865,8 +865,8 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
             match c.columns.is_empty() {
                 true => {
                     // (a column the query takes from a uuid is one here too: `CREATE TABLE t2 AS SELECT * FROM t`)
-                    let uuids = crate::pg_types::columns(from, &sql).await;
-                    sql_types.extend(fields.iter().zip(&uuids).filter(|(_, u)| **u).map(|(f, _)| (f.name().clone(), "uuid".to_string())));
+                    let shape = crate::pg_types::columns(from, &sql).await;
+                    sql_types.extend(fields.iter().zip(&shape.uuids).filter(|(_, u)| **u).map(|(f, _)| (f.name().clone(), "uuid".to_string())));
                     fields
                 }
                 false => {
@@ -1307,7 +1307,8 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
         Some(reserved) => crate::sys::stamp_stream(rows, next.clone(), reserved),
         None => Ok(rows),
     });
-    let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 1_000_000, &[], true, partition.as_deref()));
+    // (files of up to 4M rows, as a merge writes them: `maintain` leaves them alone)
+    let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 4_000_000, &[], true, partition.as_deref()));
     Ok((columns, futures::future::try_join_all(writes).await?.concat()))
 }
 

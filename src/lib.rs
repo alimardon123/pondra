@@ -90,6 +90,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod pg_catalog;
 #[cfg(feature = "server")] mod pg_formats;
 #[cfg(feature = "server")] mod pg_functions;
+#[cfg(feature = "server")] mod pg_names;
 #[cfg(feature = "server")] mod pg_text;
 #[cfg(feature = "server")] mod pg_types;
 #[cfg(feature = "server")] mod pg_values;

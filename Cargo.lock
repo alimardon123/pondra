@@ -3301,6 +3301,7 @@ dependencies = [
  "mimalloc",
  "pondra",
  "serde_json",
+ "tikv-jemallocator",
  "tokio",
 ]
 

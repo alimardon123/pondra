@@ -7,23 +7,26 @@
 use crate::store::{DataFile, TableMeta};
 use base64::Engine;
 use datafusion::arrow::array::{Array, RecordBatch};
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Schema};
 use std::collections::BTreeMap;
 
 const P: u32 = 8; // 2^8 registers
 const M: usize = 1 << P;
 
-/// A sketch of each of the first 32 columns that can be a join key: whole numbers, strings,
-/// dates, decimals.
-pub fn of(batches: &[RecordBatch]) -> BTreeMap<String, String> {
-    let Some(first) = batches.first() else { return BTreeMap::new() };
-    let schema = first.schema();
-    let key = |t: &DataType| t.is_integer() || matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Date32 | DataType::Date64 | DataType::Decimal128(..));
-    let mut out = BTreeMap::new();
-    for (i, f) in schema.fields().iter().enumerate().take(32).filter(|(_, f)| key(f.data_type()) && !crate::sys::NAMES.contains(&f.name().as_str())) {
-        let mut regs = [0u8; M];
-        for b in batches {
-            let c = b.column(i);
+/// A sketch of each of the first 32 columns that can be a join key (whole numbers, strings, dates,
+/// decimals), made a batch at a time as a file is written (`tier::Encoding`).
+pub struct Sketches(Vec<(usize, String, [u8; M])>);
+
+impl Sketches {
+    pub fn new(schema: &Schema) -> Self {
+        let key = |t: &DataType| t.is_integer() || matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Date32 | DataType::Date64 | DataType::Decimal128(..));
+        let columns = schema.fields().iter().enumerate().take(32).filter(|(_, f)| key(f.data_type()) && !crate::sys::NAMES.contains(&f.name().as_str()));
+        Sketches(columns.map(|(i, f)| (i, f.name().clone(), [0u8; M])).collect())
+    }
+
+    pub fn add(&mut self, b: &RecordBatch) {
+        for (i, _, regs) in &mut self.0 {
+            let c = b.column(*i);
             let mut hashes = vec![0u64; c.len()];
             if datafusion::common::hash_utils::create_hashes_with_hasher([c], &datafusion::common::hash_utils::HLL_RANDOM_STATE, &mut hashes).is_err() {
                 continue;
@@ -33,9 +36,9 @@ pub fn of(batches: &[RecordBatch]) -> BTreeMap<String, String> {
                 regs[at] = regs[at].max((rest.leading_zeros() + 1).min(64 - P + 1) as u8);
             }
         }
-        out.insert(f.name().clone(), base64::engine::general_purpose::STANDARD.encode(regs));
     }
-    out
+
+    pub fn done(self) -> BTreeMap<String, String> { self.0.into_iter().map(|(_, name, regs)| (name, base64::engine::general_purpose::STANDARD.encode(regs))).collect() }
 }
 
 fn registers(text: &str) -> Option<Vec<u8>> {
