@@ -87,7 +87,7 @@ PROCESS = {
     "runs.rs:WRITTEN": SIGNAL,
     "server.rs:TURNS": SETTING + " (PONDRA_QUERIES, PONDRA_QUEUE_SECS; a stopped node's last queries give their turns back to it)",
     "service.rs:CONFIG": "the Windows service's file, set by its entry point once a process",
-    "store.rs:MEMORY": "the lakes held in this process's memory: a node restarting in place finds its own; the library's close lets it go (`forget_memory`)",
+    "memory.rs:MEMORY": "the lakes held in this process's memory: a node restarting in place finds its own; the library's close lets it go (`forget_memory`)",
     "store.rs:ONE": LOCK,
     "store.rs:PARTS": SETTING + " (PONDRA_CORES, --memory-gb)",
     "store.rs:RAM": "the machine's memory, or its container's",
