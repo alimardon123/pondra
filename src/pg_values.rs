@@ -206,6 +206,13 @@ pub(crate) fn interval_text(months: i64, days: i64, micros: i64) -> String {
     parts.join(" ")
 }
 
+/// A timestamp as Postgres writes it in ISO style: `2026-01-01 00:00:00`, `…12:34:56.5`, and `+00` after
+/// an instant (always in UTC here).
+pub(crate) fn stamp_text(at: chrono::NaiveDateTime, zoned: bool) -> String {
+    let micros = at.time().signed_duration_since(chrono::NaiveTime::MIN).num_microseconds().unwrap_or(0);
+    format!("{} {}{}", at.format("%Y-%m-%d"), time_text(micros), if zoned { "+00" } else { "" })
+}
+
 /// A time of day as Postgres writes it: `12:34:56.789`, with no fraction for a whole second.
 pub(crate) fn time_text(us: i64) -> String { clock(us.unsigned_abs()) }
 
@@ -463,6 +470,15 @@ mod tests {
         assert_eq!(time_text(45_296_000_000), "12:34:56");
         assert_eq!(time_text(0), "00:00:00");
         assert_eq!(time_text(86_399_999_999), "23:59:59.999999");
+    }
+
+    #[test]
+    fn stamp_text_cuts_the_fraction_and_marks_a_zone_as_postgres_does() {
+        let at = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").unwrap();
+        assert_eq!(stamp_text(at("2026-01-01 00:00:00"), false), "2026-01-01 00:00:00");
+        assert_eq!(stamp_text(at("2026-01-07 13:05:09.5"), false), "2026-01-07 13:05:09.5");
+        assert_eq!(stamp_text(at("2026-01-07 13:05:09.123456"), true), "2026-01-07 13:05:09.123456+00");
+        assert_eq!(stamp_text(at("2026-01-01 00:00:00"), true), "2026-01-01 00:00:00+00");
     }
 
     #[test]

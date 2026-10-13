@@ -94,6 +94,18 @@ fn params() -> DefaultServerParameterProvider {
     params
 }
 
+/// A sign-in refused outright: FATAL, SQLSTATE 28000, with why (the connection ends with it).
+fn fatal(why: String) -> PgWireError { PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28000".into(), why))) }
+
+/// A sign-in refused for its failures from this address (`auth::guessing`), the right password too: it is
+/// audited as HTTP's is, and waits 400 ms first, as a wrong guess does.
+async fn guessing_refused(app: &App, user: &str, from: Option<std::net::SocketAddr>, wait: u64) -> PgWireError {
+    let why = crate::auth::guessing_says(user, wait);
+    crate::audit::refused(app, user, "postgres", from, "sign in", &why);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    fatal(why)
+}
+
 #[async_trait]
 impl StartupHandler for Startup {
     async fn on_startup<C>(&self, client: &mut C, message: PgWireFrontendMessage) -> PgWireResult<()>
@@ -105,6 +117,7 @@ impl StartupHandler for Startup {
         use pgwire::messages::startup::Authentication;
         let app = &self.backend.app;
         let from = Some(client.socket_addr());
+        let ip = from.map(|a| a.ip()); // (failed sign-ins are counted per address and user name: `auth::guessing`)
         let wrong = |user: &str| {
             crate::audit::refused(app, user, "postgres", from, "sign in", "wrong user name or password");
             PgWireError::InvalidPassword(user.to_string())
@@ -112,7 +125,7 @@ impl StartupHandler for Startup {
         match message {
             PgWireFrontendMessage::Startup(ref startup) => {
                 if !crate::tls::pg_allowed(client.is_secure(), client.socket_addr()) {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28000".into(), crate::tls::PLAIN.into()))));
+                    return Err(fatal(crate::tls::PLAIN.into()));
                 }
                 pgwire::api::auth::protocol_negotiation(client, startup).await?;
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
@@ -130,7 +143,18 @@ impl StartupHandler for Startup {
             PgWireFrontendMessage::PasswordMessageFamily(m) if *self.plain.lock().await => {
                 let user = client.metadata().get("user").cloned().unwrap_or_default();
                 let password = m.into_password()?.password;
+                let token = crate::users::is_token(&user, &password);
+                // (a user's password crosses only TLS from another machine; a token may, as `tls.rs` says)
+                if !token && !crate::tls::may_send_password(client.is_secure(), client.socket_addr()) {
+                    return Err(fatal(crate::tls::PASSWORD_PLAIN.into()));
+                }
+                if let Some(wait) = crate::auth::guessing(ip, &user) {
+                    return Err(guessing_refused(app, &user, from, wait).await);
+                }
                 let Some(who) = crate::users::sign_in(&app.lake, &app.auth, &user, &password).await else {
+                    if !token {
+                        crate::auth::guessed(ip, &user); // (a token isn't guessed: it is random)
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     return Err(wrong(&user));
                 };
@@ -142,6 +166,10 @@ impl StartupHandler for Startup {
                 let mut scram = self.scram.lock().await;
                 match scram.take() {
                     None => {
+                        // (refused before SCRAM answers: a user who failed ten times in a minute from this address)
+                        if let Some(wait) = crate::auth::guessing(ip, &user) {
+                            return Err(guessing_refused(app, &user, from, wait).await);
+                        }
                         let first = m.into_sasl_initial_response()?;
                         let text = String::from_utf8_lossy(first.data.as_deref().unwrap_or_default()).to_string();
                         // (a token's role: its token as the password; a user: its verifier; nobody: one no password fits)
@@ -157,6 +185,10 @@ impl StartupHandler for Startup {
                         let last = m.into_sasl_response()?;
                         let text = String::from_utf8_lossy(&last.data).to_string();
                         let Ok(reply) = exchange.last(&text) else {
+                            // (a built-in name's password is its token, random and never guessed)
+                            if !crate::users::BUILT_IN.contains(&user.as_str()) {
+                                crate::auth::guessed(ip, &user);
+                            }
                             tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time)
                             return Err(wrong(&user));
                         };
@@ -724,8 +756,7 @@ macro_rules! encode {
             DataType::Date32 => row.encode_field(&c.as_primitive::<Date32Type>().value_as_date(i)),
             DataType::Time64(_) => row.encode_field(&PgTime(c.as_primitive::<Time64MicrosecondType>().value(i))),
             DataType::Interval(_) => row.encode_field(&PgInterval::of(c.as_primitive::<IntervalMonthDayNanoType>().value(i))),
-            DataType::Timestamp(_, Some(_)) => row.encode_field(&c.as_primitive::<TimestampMicrosecondType>().value_as_datetime(i).map(|t| t.and_utc())),
-            DataType::Timestamp(..) => row.encode_field(&c.as_primitive::<TimestampMicrosecondType>().value_as_datetime(i)),
+            DataType::Timestamp(_, zone) => row.encode_field(&c.as_primitive::<TimestampMicrosecondType>().value_as_datetime(i).map(|at| PgStamp { at, zoned: zone.is_some() })),
             DataType::Binary => row.encode_field(&c.as_binary::<i32>().value(i)),
             DataType::List(f) => match f.data_type() {
                 DataType::Utf8 => row.encode_field(&c.as_list::<i32>().value(i).as_string::<i32>().iter().map(|v| v.map(str::to_string)).collect::<Vec<_>>()),
@@ -841,6 +872,34 @@ impl postgres_types::ToSql for PgTime {
 impl pgwire::types::ToSqlText for PgTime {
     fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
         out.extend_from_slice(crate::pg_values::time_text(self.0).as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+}
+
+/// A TIMESTAMP or TIMESTAMPTZ as Postgres sends it: in ISO text with as few fraction digits as the value
+/// needs (`2026-01-01 00:00:00`, where pgwire writes `…00.000000`), an instant with `+00`; in binary as
+/// chrono's. Another DateStyle, or a year before 1, is pgwire's.
+#[derive(Debug)]
+struct PgStamp {
+    at: chrono::NaiveDateTime,
+    zoned: bool,
+}
+
+impl postgres_types::ToSql for PgStamp {
+    fn to_sql(&self, ty: &Type, out: &mut bytes::BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        if self.zoned { self.at.and_utc().to_sql(ty, out) } else { self.at.to_sql(ty, out) }
+    }
+    fn accepts(ty: &Type) -> bool { matches!(*ty, Type::TIMESTAMP | Type::TIMESTAMPTZ) }
+    postgres_types::to_sql_checked!();
+}
+
+impl pgwire::types::ToSqlText for PgStamp {
+    fn to_sql_text(&self, ty: &Type, out: &mut bytes::BytesMut, o: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        use chrono::Datelike;
+        if !o.date_style.trim_start().to_ascii_uppercase().starts_with("ISO") || self.at.year() < 1 {
+            return if self.zoned { self.at.and_utc().to_sql_text(ty, out, o) } else { self.at.to_sql_text(ty, out, o) };
+        }
+        out.extend_from_slice(crate::pg_values::stamp_text(self.at, self.zoned).as_bytes());
         Ok(postgres_types::IsNull::No)
     }
 }
@@ -1180,7 +1239,8 @@ impl ExtendedQueryHandler for Backend {
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
         let sql = pg_dialect(&self.app.lake, &stmt.statement.sql, "");
-        crate::temp::SESSION.scope(Some(self.session.clone()), async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement).await.to_vec(), self.describe(&sql, &Format::UnifiedText).await?.0)) }).await // (its temporary tables too)
+        let out = crate::temp::SESSION.scope(Some(self.session.clone()), async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement).await.to_vec(), self.describe(&sql, &Format::UnifiedText).await?.0)) }).await; // (its temporary tables too)
+        self.noted(&stmt.statement.sql, out).await
     }
 
     async fn do_describe_portal<C>(&self, _client: &mut C, portal: &Portal<Self::Statement>) -> PgWireResult<DescribePortalResponse>
@@ -1191,17 +1251,29 @@ impl ExtendedQueryHandler for Backend {
         if let Some(fields) = statement.kept(&portal.result_column_format) {
             return Ok(DescribePortalResponse::new(fields));
         }
-        crate::temp::SESSION.scope(Some(self.session.clone()), async {
+        let mut sent = statement.sql.clone(); // (what the history says it ran: the statement with its values, once bound)
+        let out = crate::temp::SESSION.scope(Some(self.session.clone()), async {
             let inferred = self.types(statement).await;
-            let (fields, columns) = self.describe(&pg_dialect(&self.app.lake, &bind(portal, inferred)?, ""), &portal.result_column_format).await?;
+            sent = bind(portal, inferred)?;
+            let (fields, columns) = self.describe(&pg_dialect(&self.app.lake, &sent, ""), &portal.result_column_format).await?;
             statement.keep(columns);
             Ok(DescribePortalResponse::new(fields))
         })
-        .await
+        .await;
+        self.noted(&sent, out).await
     }
 }
 
 impl Backend {
+    /// A Describe that failed: the client gives up on the statement at that error, so it never runs, and it
+    /// is recorded here as failed, as `caught` records every statement that runs (`audit::statement`: the
+    /// history and the audit log). Metabase's and DBeaver's catalog queries failed this way, unrecorded.
+    async fn noted<T>(&self, sql: &str, out: PgWireResult<T>) -> PgWireResult<T> {
+        let Err(e) = out else { return out };
+        let failed = crate::audit::statement(&self.app, sql, async { Err::<T, _>(e) });
+        crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.who(), failed)).await
+    }
+
     /// A statement's `param_types`, worked out once (`Prepared`).
     async fn types<'a>(&self, statement: &'a Prepared) -> &'a [Type] {
         statement.found.types.get_or_init(|| async { self.param_types(&pg_dialect(&self.app.lake, &statement.sql, "")).await }).await

@@ -198,7 +198,7 @@ async fn of(lake: &Lake, name: &str, known: &mut Known, depth: usize) -> Option<
     let lake = other.as_deref().unwrap_or(lake);
     if let Ok(Some(m)) = lake.cat.meta(&table_key(&local)).await {
         let l = m.described(); // (SQL's names, as `SELECT *` shows them)
-        return Some(l.columns.iter().filter(|(c, _)| !l.marker(c)).map(|(c, _)| (c.clone(), l.sql_types.get(c).is_some_and(|t| t == "uuid"))).collect());
+        return Some(l.columns.iter().filter(|(c, _)| !l.marker(c)).map(|(c, _)| (c.clone(), l.uuid(c))).collect());
     }
     let view = match depth < 4 {
         true => lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(&local)).await.ok()??,
