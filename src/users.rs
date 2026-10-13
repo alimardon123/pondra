@@ -265,6 +265,7 @@ fn parse(mut w: Words) -> Result<Change> {
                 if w.is("password") {
                     let p = w.string()?;
                     ensure!(p.chars().count() >= 8, "a password has at least 8 characters");
+                    ensure!(!crate::sso::shaped(&p), "a password shaped like a JSON Web Token (eyJ…, three parts) is taken for an identity provider's token, so it would never sign in: choose another");
                     verifier = Some(Verifier::of(&p));
                 } else if w.is("superuser") {
                     superuser = Some(true);

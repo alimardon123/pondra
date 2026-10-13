@@ -135,10 +135,12 @@ impl StartupHandler for Startup {
                 }
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
                 // (a user with only tokens, a service's, or one an identity provider signs in: its token
-                // as a password, asked for plainly; ADR-074)
+                // as a password, asked for plainly; ADR-074. A name no user has is asked so only where a
+                // password may cross: it may be a mistyped name, and its password would come in the clear)
                 let user = client.metadata().get("user").cloned().unwrap_or_default();
                 let tokens_only = !crate::users::BUILT_IN.contains(&user.as_str()) && crate::users::verifier(&app.lake, &user).await.is_none()
-                    && (crate::users::principal(&app.lake, &user).await.is_ok() || crate::sso::anyone(&app.lake).await);
+                    && (crate::users::principal(&app.lake, &user).await.is_ok()
+                        || (crate::tls::may_send_password(client.is_secure(), client.socket_addr()) && crate::sso::anyone(&app.lake).await));
                 *self.plain.lock().await = tokens_only;
                 client.send(PgWireBackendMessage::Authentication(if tokens_only { Authentication::CleartextPassword } else { Authentication::SASL(vec!["SCRAM-SHA-256".into()]) })).await?;
             }

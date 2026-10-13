@@ -9481,6 +9481,15 @@ def sso():
             whoami(bearer_of(pondra_t)) == (200, ana) and reply(P, "POST", "/sql", b"SELECT 1 AS one", headers=bearer)[0] == 200 \
             and whoami({"Authorization": basic("al", "al-password-1")}) == (200, "al")
 
+        # 8b. Two providers of one issuer: a listed one first in name order (aaa) doesn't hide acme's USERS 'any'.
+        made_aaa = reply(P, "POST", "/sql", f"CREATE IDENTITY PROVIDER aaa (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'))".encode(), headers=bearer)[0]
+        cy_now = token_for(cy, {"groups": ["analysts"]})
+        shadow = [whoami(bearer_of(cy_now)), read_t(bearer_of(cy_now)), whoami(bearer_of(token_for(ana)))]
+        dropped_aaa = reply(P, "POST", "/sql", b"DROP IDENTITY PROVIDER aaa", headers=bearer)[0]
+        info["two providers of one issuer: made, cy's /whoami, cy's read, ana's /whoami, dropped"] = [made_aaa, shadow[0], shadow[1][0], str(shadow[1][1])[:120], shadow[2], dropped_aaa]
+        checks["two providers of one issuer, aaa (listed) before acme (USERS 'any'): cy, made nowhere, still signs in and reads t, and ana too"] = \
+            made_aaa == 200 and shadow[0] == (200, cy) and shadow[1] == (200, [{"x": 1}]) and shadow[2] == (200, ana) and dropped_aaa == 200
+
         # 9. DROP: the provider's tokens stop at once, and the lake stays signed.
         before_drop = whoami(bearer_of(now_t))
         call(P, "POST", "/sql", b"DROP IDENTITY PROVIDER acme", headers=bearer)

@@ -64,7 +64,7 @@ provider itself holds nothing secret and has a `SHOW CREATE` that runs again aft
 
 Several providers may exist (one for people, one for services, or two companies'). A token is
 matched to the providers whose issuer is its `iss` and whose audiences hold its `aud`, in name
-order, and the first one whose checks pass signs it in.
+order, and the first one whose checks pass and that signs its user in signs it in (§3).
 
 ### 2. How a token is checked (invariant 409)
 
@@ -101,6 +101,10 @@ and the leader isn't asked.
   makes the person a member of it for that sign-in. Values naming no role are ignored. So IT keeps
   who is in which group, and an admin grants to the roles. A claimed role that is a superuser's makes
   a superuser, as membership does today.
+- **Several providers of one issuer** (another application's `CLIENT_ID`, another user claim, one
+  listed and one `'any'`): each is tried in name order, and the first whose checks pass and that signs
+  the token's user in is taken, so a listed provider never hides an `'any'` one. When none signs it in,
+  the first one's refusal is said.
 - **The principal** is built by `users::principal` with the claimed roles added, and cached by name
   and roles for the catalog version, as today. The history, the audit log, quotas and ownership see
   the user's name, as for any user.

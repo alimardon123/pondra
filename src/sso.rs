@@ -304,7 +304,20 @@ pub async fn check(lake: &Lake, token: &str) -> Option<Result<Claimed>> {
         Ok(p) => p,
         Err(e) => return Some(Err(e)),
     };
-    Some(checked(&providers, token, crate::log::now_ms() as f64 / 1000.0).await)
+    let found = match checked(&providers, token, crate::log::now_ms() as f64 / 1000.0).await {
+        Ok(found) => found,
+        Err(e) => return Some(Err(e)),
+    };
+    // (several providers of one issuer: a listed one names a user not made here, and another, USERS
+    // 'any', signs it in; the first that signs its user in, else the first, whose refusal the door says)
+    if found.len() > 1 {
+        for c in &found {
+            if crate::users::claimed(lake, c).await.is_ok() {
+                return Some(Ok(c.clone()));
+            }
+        }
+    }
+    found.into_iter().next().map(Ok)
 }
 
 /// Why a provider's token signs no one in, for the door to say (None: it isn't one, or it signs someone in).
@@ -316,7 +329,8 @@ pub async fn why(lake: &Lake, token: &str) -> Option<String> {
     Some(format!("the identity provider's token: {e:#}"))
 }
 
-async fn checked(providers: &[(String, Provider)], token: &str, now: f64) -> Result<Claimed> {
+/// Whom each provider of the token's issuer whose checks pass says it names, in name order (never none).
+async fn checked(providers: &[(String, Provider)], token: &str, now: f64) -> Result<Vec<Claimed>> {
     let mut parts = token.splitn(3, '.');
     let (h, c, s) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
     let part = |p: &str, what: &str| -> Result<Value> {
@@ -330,7 +344,7 @@ async fn checked(providers: &[(String, Provider)], token: &str, now: f64) -> Res
     ensure!(header.get("crit").is_none(), "its header names extensions it needs understood (crit), which aren't"); // (RFC 7515 §4.1.11)
     let iss = claims["iss"].as_str().context("it names no issuer (iss)")?;
     let signature = B64U.decode(s).ok().context("its signature isn't base64url")?;
-    let mut why = None;
+    let (mut why, mut found) = (None, vec![]);
     for (name, p) in providers.iter().filter(|(_, p)| p.issuer == iss) {
         if !audience_ok(p, &claims["aud"]) {
             why.get_or_insert_with(|| format!("its audience ({}) is none of identity provider {name}'s (CLIENT_ID, AUDIENCE)", claims["aud"]));
@@ -342,11 +356,12 @@ async fn checked(providers: &[(String, Provider)], token: &str, now: f64) -> Res
         ensure!(exp + LEEWAY > now, "it expired {} s ago", (now - exp).round());
         ensure!(claims["nbf"].as_f64().is_none_or(|nbf| nbf - LEEWAY <= now), "it isn't valid yet (nbf)");
         match claimed(name, p, &claims, exp) {
-            Ok(c) => return Ok(c),
+            Ok(c) => found.push(c),
             Err(e) => why = Some(format!("{e:#}")), // (another provider of this issuer may name the user by another claim)
         }
     }
-    bail!(why.unwrap_or_else(|| format!("no identity provider here has issuer {iss}")))
+    ensure!(!found.is_empty(), why.unwrap_or_else(|| format!("no identity provider here has issuer {iss}")));
+    Ok(found)
 }
 
 fn audience_ok(p: &Provider, aud: &Value) -> bool {
@@ -579,7 +594,7 @@ mod tests {
         let claims = j!({"iss": "https://idp.example", "aud": "pondra", "exp": now + 300.0, "email": "Ana@Acme.com", "groups": ["analysts", "x"]});
         let rs = |m: &[u8]| { let mut s = vec![0; rsa.public_modulus_len()]; rsa.sign(&RSA_PKCS1_SHA256, &rng, m, &mut s).unwrap(); s };
         let t = token(j!({"alg": "RS256", "kid": "r1"}), claims.clone(), rs);
-        let c = checked(&p, &t, now).await.unwrap();
+        let c = checked(&p, &t, now).await.unwrap().remove(0);
         assert_eq!((c.user.as_str(), c.roles.clone(), c.provider.as_str(), c.any), ("ana@acme.com", vec!["analysts".to_string(), "x".into()], "okta", false));
         let es = |m: &[u8]| ec.sign(&rng, m).unwrap().as_ref().to_vec();
         assert!(checked(&p, &token(j!({"alg": "ES256", "kid": "e1"}), claims.clone(), es), now).await.is_ok());
@@ -605,7 +620,10 @@ mod tests {
         // two providers of one issuer: the first names its users by a claim this token lacks, the second signs it in
         let upn = Provider { user_claim: "upn".into(), ..provider(false) };
         let both = vec![("azure".to_string(), upn), ("okta".to_string(), provider(false))];
-        assert_eq!(checked(&both, &good, now).await.unwrap().provider, "okta");
+        assert_eq!(checked(&both, &good, now).await.unwrap().iter().map(|c| c.provider.as_str()).collect::<Vec<_>>(), ["okta"]);
+        // and both, when both name it: the door takes the first that signs its user in (`check`)
+        let two = vec![("acme".to_string(), provider(false)), ("staff".to_string(), provider(true))];
+        assert_eq!(checked(&two, &good, now).await.unwrap().iter().map(|c| (c.provider.as_str(), c.any)).collect::<Vec<_>>(), [("acme", false), ("staff", true)]);
     }
 
     #[test]
