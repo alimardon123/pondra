@@ -57,9 +57,9 @@ pondra run report.sql daily --min 4
 `pondra.connect("lake")` opens a lake from inside your program, with its node in this process; the node stops when you call `close()` or the program ends. [Python client](/pondra/reference/python/)
 
 ```python
-db = pondra.connect("local-py")
-print(db.sql("SELECT 1 AS one").rows())
-db.close()
+lake = pondra.connect("local-py")
+print(lake.sql("SELECT 1 AS one").rows())
+lake.close()
 ```
 
 ### JavaScript: connect()

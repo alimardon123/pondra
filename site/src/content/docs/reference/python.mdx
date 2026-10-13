@@ -73,9 +73,9 @@ db = pondra.connect("https://lake.example.com", token="your-token")
 ```
 
 ```python
-db = pondra.connect("scratch", memory_gb=2)
-print(db.sql("SELECT 1 AS one").rows())
-db.close()
+lake = pondra.connect("scratch", memory_gb=2)
+print(lake.sql("SELECT 1 AS one").rows())
+lake.close()
 ```
 
 ```text
