@@ -1385,21 +1385,25 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
         }
     }
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
-    // or may read a file on this machine).
+    // or reads files: they change on their own). The program that started the node (`files`) has
+    // its answers remembered apart, run with its rights: a file here it reads is named in the
+    // statement as expanded, or in a view it reads, and so never remembered.
     let asks = |text: &str| {
-        // (AT (OFFSET => -n) is n seconds before now: a moment that moves)
+        // (AT (OFFSET => -n) is n seconds before now: a moment that moves. Expanded, a table as it was
+        // is named `"at:…"`, which holds its AT (…) as written: `past::spelled`)
         static OFFSET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*OFFSET\s*=>").expect("a regex"));
+        let text = &format!("{text} {}", crate::past::spelled(text));
         let q = text.to_lowercase();
-        OFFSET.is_match(text) || !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+        OFFSET.is_match(text) || !crate::ext::names(text).is_empty() || ["now()", "today(", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
     };
-    let volatile = files || limited || asks(query)
+    let volatile = limited || asks(query)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
         || crate::settings::any() // (and its settings may change the answer)
         || crate::routines::with_views(&app.lake, query).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)
         || crate::routines::volatile(&app.lake, query).await // (a Python function may answer differently each time)
         || (crate::path::current(&app.lake).is_some() && crate::path::reads_current(&app.lake, query).await); // (a view's current_schema() is its reader's: not one answer for every session)
     let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(run_sql(app, p, query, files).await?.respond(p.format.as_deref())) };
-    let key = format!("{format}{}|{}|{query}", p.rows.map(|n| format!(":{n}")).unwrap_or_default(), p.spread.as_deref().unwrap_or(""));
+    let key = format!("{format}{}|{}|{}|{query}", p.rows.map(|n| format!(":{n}")).unwrap_or_default(), p.spread.as_deref().unwrap_or(""), if files { "owner" } else { "" });
     let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
     if let Some(body) = app.results.get(&key, version, stale) {
         return Ok(respond(body));
@@ -1414,13 +1418,13 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
             // (the run that covered it left nothing to share: a big answer, sent in pieces to its own
             // caller, or an error; each one it covered runs on its own, beside the others)
             drop(slot);
-            return Ok(run_sql(app, p, query, false).await?.respond(p.format.as_deref()));
+            return Ok(run_sql(app, p, query, files).await?.respond(p.format.as_deref()));
         };
         return Ok(respond(body.clone()));
     }
     (slot.0, slot.1) = (flight.0.load(std::sync::atomic::Ordering::Relaxed), None);
     let version = app.lake.version_for(query).await; // (read after `covers`: this run reads at least this)
-    let body = match run_sql(app, p, query, false).await? {
+    let body = match run_sql(app, p, query, files).await? {
         Rendered::Whole(body) => body,
         pieces => return Ok(pieces.respond(p.format.as_deref())), // (a big answer: sent to its own caller only)
     };

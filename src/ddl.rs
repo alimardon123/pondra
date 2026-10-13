@@ -869,7 +869,12 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Re
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{name} is materialized view {owner}'s: DROP MATERIALIZED VIEW {owner}");
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(name))).await?.is_none(), "{name} is a materialized view: DROP MATERIALIZED VIEW {name}");
     let readers = readers(lake, name).await?;
-    ensure!(readers.is_empty(), "{name} is read by {}: DROP TABLE {name} CASCADE drops them too, or drop them first", readers.join(", "));
+    if !readers.is_empty() {
+        // (CASCADE drops views only: with a task among the readers, it would refuse too)
+        let views_only = readers.iter().all(|r| r.starts_with("view ") || r.starts_with("materialized view "));
+        let how = if views_only { format!("DROP TABLE {name} CASCADE drops them too, or drop them first") } else { "drop them first".to_string() };
+        bail!("{name} is read by {}: {how}", readers.join(", "));
+    }
     let keep_ms = meta.retention_secs.map_or(KEEP_MS, |s| s * 1000);
     let deleted = crate::sys::deleted(name);
     let mut puts = vec![];

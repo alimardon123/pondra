@@ -293,6 +293,9 @@ EXCEPTIONS = {
     "an order not asked for": "the same rows in another order, from a query with no ORDER BY: SQL leaves the order open, and Pondra's plans give another",
     "interval arithmetic": "`n * INTERVAL '1 hour'` and `INTERVAL … / n`, which DataFusion refuses and Pondra computes as Postgres does",
     "FETCH FIRST": "`FETCH FIRST | NEXT n ROWS ONLY`, standard SQL that DataFusion refuses and Pondra takes, as Postgres and DuckDB do (friendly.rs)",
+    "temporary tables": "`CREATE TEMPORARY TABLE`, which DataFusion refuses and Pondra keeps for its session, a key and NOT NULL included (temp.rs)",
+    "LIKE … ESCAPE": "LIKE with an escape character other than a backslash, which DataFusion refuses and Pondra answers as Postgres does",
+    "UPDATE … FROM": "`UPDATE t SET … FROM other WHERE …`, which DataFusion refuses and Pondra runs, as Postgres does",
 }
 RUNNER_FUNCTIONS = {"async_abs"}  # (async_udf.slt's: registered by the runner)
 MADE = re.compile(r"\s*(?:create\s+(?:or\s+replace\s+)?(?:(?:temp|temporary|external|unbounded|materialized)\s+)*(?:table|view)\s+(?:if\s+not\s+exists\s+)?|select\b.*?\binto\s+)(\"[^\"]+\"|[\w.]+)", re.I | re.S)
@@ -305,6 +308,12 @@ def exception(sql, why, made):
         return "interval arithmetic"
     if why == "an error was expected" and re.search(r"\bfetch\s+(first|next)\b", sql, re.I):
         return "FETCH FIRST"
+    if why == "an error was expected" and re.match(r"\s*create\s+temp(orary)?\s+table\b", sql, re.I):
+        return "temporary tables"
+    if why == "an error was expected" and re.search(r"\blike\b.*\bescape\s+'[^'\\]'", sql, re.I | re.S):
+        return "LIKE … ESCAPE"
+    if why == "an error was expected" and re.match(r"\s*update\b.*\bset\b.*\bfrom\b", outermost(sql), re.I | re.S):
+        return "UPDATE … FROM"
     if explain and why.startswith("answer differs"):
         return "plan text"
     if explain and "DML not supported" in why:

@@ -62,13 +62,13 @@ fn alias_in_where(sql: &str) -> bool {
 
 /// `sql` with what the parser can't read as it is written turned into what it can.
 pub fn text(sql: &str) -> Result<Cow<'_, str>> {
-    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b").expect("a regex"));
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b").expect("a regex"));
     if !LOOK.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
     let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
     s = comprehensions(&s)?;
-    for pass in [lambda_words, asof_on, using_sample, lock_words] {
+    for pass in [lambda_words, asof_on, using_sample, lock_words, property_keys] {
         if let Some(t) = Tokens::of(&s) {
             s = t.edit(pass(&t)?);
         }
@@ -263,6 +263,48 @@ fn lock_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
             continue;
         };
         edits.push((t.at[i], t.end(ids[len - 1]), with.to_string()));
+    }
+    Ok(edits)
+}
+
+/// Spark's `TBLPROPERTIES (write.delete.mode = 'merge-on-read')`: a dotted key written bare, which the
+/// parser reads only quoted, quoted (`'write.delete.mode' = …`), so the property is refused or kept by
+/// its name as the quoted one is, never as a statement that doesn't parse.
+fn property_keys(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
+    let mut edits = Vec::new();
+    for i in (0..t.toks.len()).filter(|&i| t.word(i, Keyword::TBLPROPERTIES)) {
+        let mut at = t.next(i);
+        if t.toks.get(at) != Some(&Token::LParen) {
+            continue;
+        }
+        loop {
+            // (one entry: `word(.word)* =`, then its value up to a comma or the closing parenthesis)
+            let first = t.next(at);
+            let mut last = first;
+            let mut dotted = false;
+            while matches!(t.toks.get(last), Some(Token::Word(w)) if w.quote_style.is_none()) && t.toks.get(last + 1) == Some(&Token::Period) {
+                dotted = true;
+                last += 2;
+            }
+            if dotted && matches!(t.toks.get(last), Some(Token::Word(w)) if w.quote_style.is_none()) && t.toks.get(t.next(last)) == Some(&Token::Eq) {
+                edits.push((t.at[first], t.end(last), format!("'{}'", t.span(first, last + 1))));
+            }
+            let mut depth = 0;
+            at = last;
+            while let Some(tok) = t.toks.get(at) {
+                match tok {
+                    Token::LParen => depth += 1,
+                    Token::RParen if depth == 0 => break,
+                    Token::RParen => depth -= 1,
+                    Token::Comma if depth == 0 => break,
+                    _ => {}
+                }
+                at += 1;
+            }
+            if t.toks.get(at) != Some(&Token::Comma) {
+                break;
+            }
+        }
     }
     Ok(edits)
 }
@@ -1654,6 +1696,11 @@ mod tests {
         assert_eq!(text("PIVOT t ON g USING sum(x) GROUP BY id").unwrap(), "SELECT * FROM (SELECT id, g, x FROM t) AS __pivot PIVOT (sum(x) FOR g IN (ANY)) ");
         assert_eq!(text("UNPIVOT t ON a, b INTO NAME k VALUE v ORDER BY 1").unwrap(), "SELECT * FROM t UNPIVOT (v FOR k IN (a, b)) ORDER BY 1");
         assert_eq!(text("SELECT 'a lambda: no', 1").unwrap(), "SELECT 'a lambda: no', 1");
+        assert_eq!(
+            text("ALTER TABLE t SET TBLPROPERTIES (write.delete.mode = 'merge-on-read', 'a.b' = '1', c = 2)").unwrap(),
+            "ALTER TABLE t SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read', 'a.b' = '1', c = 2)"
+        );
+        assert_eq!(text("SELECT tblproperties.x FROM tblproperties").unwrap(), "SELECT tblproperties.x FROM tblproperties");
     }
 
     #[test]
