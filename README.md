@@ -42,7 +42,7 @@ pondra                      # a SQL shell on ./lake (or: pondra my-lake, pondra 
 ```python
 import pondra
 from pondra import col
-db = pondra.local("lake")   # a node on ./lake, in the background; it stops when Python does
+db = pondra.connect("lake")   # a node on ./lake, in this process; it stops when Python does
 db.sql("CREATE TABLE events (user VARCHAR, amount BIGINT)")
 db.append("events", [{"user": "ann", "amount": 5}])
 db.sql("SELECT user, sum(amount) AS total FROM events GROUP BY user").to_pandas()
@@ -53,16 +53,15 @@ db.sql("SELECT * FROM top WHERE amount > $min", min=1).to_polars()   # SQL reads
 ```
 
 ```js
-import { local } from "pondra";
-const db = await local("lake");
+import { connect } from "pondra";
+const db = connect("lake");
 await db.sql("SELECT 42 AS answer");
 ```
 
 `examples/quickstart.ipynb` is the same in a notebook: tables, a view that keeps itself current,
 new rows as they commit, a point-in-time join, frames and `%%sql` cells, functions and procedures
-in SQL and Python, another engine appending, and a live answer. The shell and `local()` start a node with
-`--stop-with-stdin`: it stops when the shell or program that started it exits — or is killed —
-and hands the lake on at once, so the next one opens it straight away.
+in SQL and Python, another engine appending, and a live answer. The shell and `pondra.connect("lake")` start a node that stops when the shell or program that
+started it exits, or is killed, and hands the lake on at once, so the next one opens it straight away.
 
 To keep a node running on a machine, starting at boot and again if it stops: `pondra service
 install --lake s3://bucket/lake --addr 0.0.0.0:8080` (systemd, launchd or a Windows service;
@@ -160,7 +159,7 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
   Postgres the user name picks the role (`reader`, `writer`, `admin`) and the password is its
   token. Whatever the token, SQL sent to a node never touches the node's own disk (no `COPY …
   TO`, no `CREATE EXTERNAL TABLE` over local files); only `pondra sql` reads local files, on its own machine, and
-  so does the shell's (or `local()`'s) node for the program that started it, by a key only that
+  so does the shell's (or `connect()`'s) node for the program that started it, by a key only that
   program knows (`FROM 'D:\data\jan.csv'`).
 - `--attach name=dir`: read (and write through its leader) another lake as a database of its
   own: `name.table`, `name.schema.table`. This lake's own name is its folder's. In SQL, `ATTACH
@@ -175,9 +174,9 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
 - `--python /usr/bin/python3`: run Python functions and procedures (`LANGUAGE python`) with this
   Python, which has the `pondra` package and pyarrow, on warm workers beside the node (one per
   core at most, gone after `PONDRA_WORKER_IDLE_SECS`, 60, idle; `PONDRA_WORKER_MB` 2048 each;
-  `PONDRA_PROCEDURES` at once, four per core). `--python auto` (the shell's, and `local()` in
-  JavaScript) finds one. They run any code on the machine, so only an admin token makes one, and
-  a node without tokens takes `--python` only on 127.0.0.1 (Python's `local()` passes its own).
+  `PONDRA_PROCEDURES` at once, four per core). `--python auto` (the shell's, and JavaScript's
+  `connect()`) finds one. They run any code on the machine, so only an admin token makes one, and
+  a node without tokens takes `--python` only on 127.0.0.1 (Python's `connect()` passes its own).
 - `--cache-dir`, `--cache-gb 20`: the local SSD tier for lakes on object storage. 0 turns it off.
 - `--retain-secs 60`: how long replaced files and consumed log segments are kept.
 - `--backlog 10000000`: rows allowed to wait for tiering before commits pause.
@@ -260,7 +259,7 @@ The same from Python: `db.read_parquet(url)`, `read_csv`, `read_json`, `read_del
 `df.write.mode("overwrite").format("delta").save(url)`.
 
 - **Stores:** `s3://` (AWS, R2, MinIO), `gs://`, `az://` / `abfss://`, `http(s)://`, and the
-  machine's own paths — those only for the program that started the node (the shell, `local()`).
+  machine's own paths — those only for the program that started the node (the shell, or a lake's `connect()`).
   A URL no secret covers is refused, unless that same program asks.
 - **Formats:** Parquet, CSV/TSV, JSON lines; Delta (checkpoints of every kind, deletion vectors,
   column mapping) and Iceberg v1–v3 (position and equality deletes, deletion vectors, field ids,
@@ -309,7 +308,7 @@ differences entirely.
 | SQL writes | `INSERT … SELECT/VALUES`, `UPDATE … SET … WHERE`, `DELETE … WHERE` and `MERGE INTO t USING s ON … WHEN [NOT] MATCHED [BY SOURCE] …` on every table (an attached lake's too), on any node, over Postgres, or with `pondra sql` on any machine; from a local file in the shell (`MERGE INTO t USING 'new.csv' …`). A change is one commit from one snapshot, exactly-once with a job id; views, the change feed and Delta/Iceberg readers follow it | Delta/Iceberg MERGE, Snowflake DML, Fluss 1.0's UPDATE/DELETE by condition |
 | System columns | every row has `_row_id` (kept through an UPDATE or MERGE), `_version` (the commit that wrote it), `_created_at`, `_updated_at`: `SELECT _row_id, * FROM t`; `SELECT *` leaves them out | Postgres `ctid`/`xmin`, Iceberg v3 row lineage, Delta row tracking |
 | Postgres protocol | `--pg`: psql, psycopg 2/3, asyncpg, SQLAlchemy + pandas (tested); JDBC/BI tools by the same protocol. `COPY t FROM STDIN` (text, CSV; psql's `\copy`, psycopg's `cursor.copy`) and `COPY (query) TO STDOUT` (text, CSV, binary); the ADBC Postgres driver reads results as Arrow that way. For speed, Arrow Flight SQL | a Postgres-compatible serving layer |
-| Python and JavaScript | `pip install pondra` / `npm install pondra`: `local()` starts a node here, `connect()` reaches one; `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `view(name, sql)` (`materialized=True`: kept up to date, as `CREATE MATERIALIZED VIEW`), `write_table()`, `watch()`, `live()`, `lookup()`, `$name` parameters, `run("model.sql", …)`, `call(procedure, …)`: the same names as SQL and frames (ADR-025, ADR-028) | PySpark / PyFlink clients for the common jobs |
+| Python and JavaScript | `pip install pondra` / `npm install pondra`: `connect("lake")` opens a lake with its node here, `connect(url)` reaches one; `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `view(name, sql)` (`materialized=True`: kept up to date, as `CREATE MATERIALIZED VIEW`), `write_table()`, `watch()`, `live()`, `lookup()`, `$name` parameters, `run("model.sql", …)`, `call(procedure, …)`: the same names as SQL and frames (ADR-025, ADR-028) | PySpark / PyFlink clients for the common jobs |
 | Live queries | `GET /live?sql=…` (`db.live(sql)` in Python, `for await (const rows of db.live(sql))` in JavaScript): the answer now, then again within milliseconds of each commit that changes it — not for commits to other tables, and not when the answer comes out the same. Nothing runs once the client goes | PGlite's live queries, a dashboard's polling |
 | Temporary tables | `CREATE TEMP TABLE t AS …`, `CREATE TEMP VIEW v AS …`: a session's own (a Postgres connection, or a client's), in the node's memory; `INSERT`, `UPDATE`, `DELETE`, `MERGE` and joins with the lake's tables; gone when the session ends | Postgres / DuckDB temporary tables |
 | DataFrames, and SQL mixed with them | `pondra.frame`: Polars' lazy API (`db.table("orders").filter(col("amount") > 100).group_by("user").agg(col("amount").sum())`), each step a CTE of one SQL statement (`frame.sql`) that runs, spreads and is remembered like any query. `pondra.spark`: PySpark's names over the same frames (`from pondra.spark import SparkSession, functions as F, Window`), PySpark's meanings where they differ (null order, `/`, column names). Either way round: `db.sql(…)` is a frame; SQL names Python frames and pandas / Polars / Arrow data by their variable names (or `{name}`); frame methods take SQL snippets; `to_view()` makes a frame a view every client reads; `%load_ext pondra` gives notebooks `%%sql` cells. All 22 TPC-H queries give the same answers as SQL, as frames and as PySpark code; 51 PySpark pipelines (files read and written too) give PySpark's own answers and column names | Polars / PySpark on a lake, SQLMesh / dbt's Python models |
@@ -435,7 +434,7 @@ python3 tools/harness.py changes                # UPDATE/DELETE/MERGE vs a model
 python3 tools/harness.py deal                   # a keyed table's and a view's first tiering round on 3 nodes: deleted keys stay deleted
 python3 tools/harness.py guard                  # a query spreads only when it pays: a slow link keeps it on one node, a fast one spreads it
 python3 tools/smoke.py <pondra>                 # a first run on any OS (stdlib only): the shell, SQL, memory figures
-python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # the shell, local(), the wheel, npm, the notebook; glibc 2.17 and Ubuntu 22.04
+python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # the shell, connect(), the wheel, npm, the notebook; glibc 2.17 and Ubuntu 22.04
 bash tools/try_packages.sh linux-x64            # dist/'s packages as users get them: pip without and with pyarrow, python -m pondra, npm, the installer
 bash tools/npm_publish.sh --dry-run             # the release's npm publish, tried
 python3 tools/bench/repeat.py --data <tpch> --query 15 --runs 20       # one TPC-H query many times, every answer against DuckDB's

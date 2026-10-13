@@ -507,7 +507,7 @@ $$;
 ```
 
 - The node needs Python: start it with `--python auto` (the Python that has the `pondra` package) or
-  `--python /path/to/python`. `pondra.local()` does this for you.
+  `--python /path/to/python`. `pondra.connect("lake")` does this for you.
 - A Python cell needs an admin token, since it runs code on the node. With no tokens set, the node
   listens only on `127.0.0.1`, and anyone who can reach it is its admin.
 - A notebook is a session, and its Python cells run on one Python worker kept for that session, in one

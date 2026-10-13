@@ -84,7 +84,7 @@ pub struct Node {
     held: Arc<Held>,
     /// The HTTP door, served on a task of its own: `serving` waits on it.
     served: tokio::task::JoinHandle<anyhow::Result<()>>,
-    /// What the door serves: a library's host calls it straight (`library::Opened::request`).
+    /// What the door serves: a library's host calls it straight (`library::Opened::ask`).
     router: axum::Router,
 }
 
@@ -415,7 +415,7 @@ impl Node {
         Ok(Node { held, served, router })
     }
 
-    /// What the HTTP door serves, for a request made in this process (`library::Opened::request`).
+    /// What the HTTP door serves, for a request made in this process (`library::Opened::ask`).
     pub(crate) fn router(&self) -> axum::Router { self.router.clone() }
 
     /// Until the HTTP door stops. An error ends the program, as it did when `serve` ran the door inline.

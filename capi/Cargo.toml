@@ -16,7 +16,9 @@ doctest = false
 pondra = { path = ".." }
 anyhow = "1"
 bytes = "1"
+futures = "0.3"
 serde_json = "1"
+tokio = { version = "1", features = ["sync"] } # (a body's read ended when JavaScript lets it go: napi.rs)
 # local_dynamic_tls: a library's thread-locals are found through the loader (`__tls_get_addr`), never in
 # the static TLS block glibc keeps for the program's own (a kilobyte or two): mimalloc's initial-exec ones
 # marked the whole library STATIC_TLS, and Python refused it ("cannot allocate memory in static TLS block").

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """What `pip install pondra` gives, tried: the `pondra` command is found, a node starts on a new lake, and a
-table, an exactly-once append, a view, a query, a frame, a Python procedure and function work; and a node in
-this process (`pondra.open()`, from the library the wheel ships) answers too. Run where the wheel is
+table, an exactly-once append, a view, a query, a frame, a Python procedure and function work, with the lake's
+node in this process (`pondra.connect(lake)`, from the library the wheel ships); and a lake in memory answers too. Run where the wheel is
 installed (CI, and containers with old and new Linux).
 
 Without pyarrow (`pip install pondra` alone), what needs none: rows, one value and a text table
@@ -19,7 +19,7 @@ arrow = importlib.util.find_spec("pyarrow") is not None
 lake = os.path.join(tempfile.mkdtemp(prefix="pondra-check-"), "lake")
 version = subprocess.run([pondra.binary(), "--version"], capture_output=True, text=True).stdout.strip()
 print(version, "(with pyarrow)" if arrow else "(no pyarrow)")
-with pondra.local(lake, python=arrow) as db:
+with pondra.connect(lake, python=arrow) as db:
     db.sql("CREATE TABLE t (id BIGINT, v VARCHAR)")
     db.view("per_v", "SELECT v, count(*) AS n FROM t GROUP BY v", materialized=True)  # (kept up to date)
     db.append("t", [{"id": 1, "v": "a"}, {"id": 2, "v": "b"}, {"id": 3, "v": "a"}])
@@ -109,8 +109,8 @@ if arrow:
         print("--python auto:", chosen["python"], f"({sum(p['ok'] for p in chosen['pythons'])} of {len(chosen['pythons'])} Pythons work)")
     finally:
         node.stdin.close(); node.wait(timeout=30)
-# The same engine in this process: the library the wheel ships, which the `pondra` command loads too.
-with pondra.open() as db:
+# A lake in memory, in this process: the library the wheel ships, which the `pondra` command loads too.
+with pondra.connect() as db:
     db.sql("CREATE TABLE t (id BIGINT)")
     db.append("t", [{"id": 1}, {"id": 2}])
     assert db.sql("SELECT count(*) AS n FROM t").rows() == [{"n": 2}]

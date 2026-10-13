@@ -1,5 +1,5 @@
-"""`%load_ext pondra`: SQL cells in a notebook, on the newest connection (`pondra.local` or
-`pondra.connect`), naming the notebook's Python frames and data as tables.
+"""`%load_ext pondra`: SQL cells in a notebook, on the newest connection
+(`pondra.connect`), naming the notebook's Python frames and data as tables.
 
     %%sql                       ->  shows the answer (a frame)
     %%sql top_users <<          ->  the frame goes into `top_users` instead
@@ -15,7 +15,7 @@ def register(ipython):
     def sql(line, cell=None):
         from . import client
         if client._last is None:
-            raise RuntimeError("no connection yet: pondra.local(…) or pondra.connect(…) first")
+            raise RuntimeError("no connection yet: pondra.connect(…) first")
         target = None
         if cell is not None:
             m = re.fullmatch(r"\s*(\w+)\s*<<\s*", line)

@@ -323,7 +323,7 @@ class _Builder:
     def getOrCreate(self):
         if SparkSession._active is None:
             token = self.options.get("spark.pondra.token")
-            con = _client.connect(self.url, token) if self.url else _client.local(self.options.get("spark.pondra.lake", "lake"), token=token)
+            con = _client.connect(self.url, token) if self.url else _client.connect(self.options.get("spark.pondra.lake", "lake"), token=token)
             SparkSession._active = SparkSession(con)
         return SparkSession._active
 
@@ -490,7 +490,7 @@ class _Catalog:
 
 class _Reader:
     """`spark.read`: files anywhere (ADR-026: `s3://`, `gs://`, `az://`, `https://`, and a
-    `pondra.local` session's own machine), as SQL's `read_parquet`, `read_csv` and `read_json`
+    own machine, for a lake opened here), as SQL's `read_parquet`, `read_csv` and `read_json`
     read them, with Spark's options and defaults: a folder's `k=v` folders are columns; CSV has no
     header and every column a string unless `header` and `inferSchema` say otherwise. An option
     Pondra doesn't take is refused by name, never ignored."""

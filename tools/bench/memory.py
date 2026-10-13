@@ -2,7 +2,7 @@
 
     python3 tools/bench/memory.py [--rows 10000000] [--tpch ~/tpch/sf1] [--runs 3] [--only pondra,folder,duckdb] [--settle 20]
 
-`pondra` is `pondra.open()` (a lake held in memory), `folder` is `pondra.open(<a new folder>)`, `duckdb` is
+`pondra` is `pondra.connect()` (a lake held in memory), `folder` is `pondra.connect(<a new folder>)`, `duckdb` is
 `duckdb.connect()`. Each engine runs in a process of its own, `--runs` times; a time is the median. What is
 measured, in that process: importing and opening up to the first answer of `SELECT 1`, and the process's memory
 then (idle); a table of `--rows` rows made from a series; a grouped aggregate and a key's row over it (warm: the
@@ -43,7 +43,7 @@ def child(engine):
         import pondra
         out["import"] = time.perf_counter() - t0
         folder = tempfile.mkdtemp(prefix="pondra-bench-") if engine == "folder" else None
-        con = pondra.open(folder)
+        con = pondra.connect(folder)
         q = lambda s: con.sql(s).to_arrow()
         do = lambda s: con.sql(s)
         series = f"SELECT x AS id, x % 1000 AS k, (x * 7919 % 100003) / 100.0 AS v FROM range({A.rows}) AS g(x)"

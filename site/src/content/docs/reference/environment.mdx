@@ -65,8 +65,8 @@ writes hands each job the one it needs as `PONDRA_TOKEN`; Pondra itself never re
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PONDRA_BIN` | the binary the package installed, or the one on `PATH` | the `pondra` executable that the Python and JavaScript clients start with `local()` |
-| `PONDRA_LIBRARY` | the library the package installed (`pondra/_lib/`) | the Pondra library `pondra.open()` loads into Python |
+| `PONDRA_BIN` | the binary the package installed, or the one on `PATH` | the `pondra` executable that the Python and JavaScript clients start nodes with |
+| `PONDRA_LIBRARY` | the library the package installed (`pondra/_lib/`) | the Pondra library `pondra.connect()` loads into Python |
 | `PONDRA_PYTHON` | none | the first Python that `--python auto` tries. It needs the `pondra` package and pyarrow. `auto` then tries the one chosen in the [console](/pondra/start/console/#which-python), those beside the `pondra` binary, those on the `PATH`, Windows' `py` launcher's, and Anaconda's and Miniconda's (their environments too), all at once, and takes the first that works |
 | `PONDRA_PYTHON_PROBE_SECS` | `15` | how long `--python auto` (and the console's **Choose the Python…**) waits for each Python it tries. One that doesn't answer in time, such as a broken install, is passed over |
 | `PONDRA_WORKER_START_SECS` | `60` | how long a new Python worker has to start and answer. Past it, the error says so, with what the worker printed |
@@ -197,14 +197,14 @@ Do not set these. Pondra sets them for its own processes, and some are copies of
 
 | Variable | Set by | Meaning |
 |---|---|---|
-| `PONDRA_OWNER_KEY` | the shell, `pondra.local()` and `local()` in JavaScript | a random key: the node answers only the program that started it (and tokens and signed-in users), and lets that program read files on this machine through it. Nobody else may |
+| `PONDRA_OWNER_KEY` | the shell, `pondra.connect("lake")`, and `connect("lake")` in JavaScript | a random key: the node answers only the program that started it (and tokens and signed-in users), and lets that program read files on this machine through it. Nobody else may |
 | `PONDRA_CLIENT_KEY` | `pondra serve` on a folder of lakes, for each database's node | the key the server names each client's address with (`x-pondra-client`), so the node counts failed sign-ins by client and knows a page on this machine. A node takes that header only with this key |
 | `PONDRA_PUBLISH`, `PONDRA_CHANGELOG_SECS`, `PONDRA_FSYNC`, `PONDRA_REPLICAS` | `pondra serve`, from `--publish`, `--changelog-secs`, `--fsync`, `--ack` and `--replicas` | the flags' values, for the rest of the node. Setting them in the environment has no effect: `serve` overwrites them. Use the flags |
 | `PONDRA_TRIES` | `pondra sql` | how many times a write has started over after another node took the lake |
 | `PONDRA_SERVER_URL` | `pondra serve` on a folder of lakes, for each database's node | where the process that serves the folder is, for `DROP DATABASE` |
 | `PONDRA_NODE_KEY` | `pondra serve`, from the lake's own key, when this isn't set | the key nodes call each other with when no admin or other token is set. Every node of a lake has the same one |
 | `PONDRA_REACH` | a node, for a `pondra lead` it starts to write a backup | the places this node reaches with a secret (a backup in another bucket), and how, so the process it starts reaches them the same way |
-| `PONDRA_LAUNCHER` | `pondra.open()`, for the node it opens in the process | the `pondra` executable the node starts its helpers with (a `pondra lead` of a lake nobody leads). A library has no executable of its own to start again |
+| `PONDRA_LAUNCHER` | `pondra.connect()`, for the node it opens in the process | the `pondra` executable the node starts its helpers with (a `pondra lead` of a lake nobody leads). A library has no executable of its own to start again |
 | `PONDRA_SUPERVISED` | `pondra service`, for the node it starts | `1`: a service manager runs the node. A node that must restart to rejoin exits with status 75, and the manager starts it again |
 
 ## Debugging

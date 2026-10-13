@@ -37,7 +37,7 @@ one has moved on.
   lake's own keys and its secrets, so every node needs the same admin token, as it already did to call
   the others. To change it, start the leader with the new one and the old one in
   `PONDRA_ADMIN_TOKEN_PREVIOUS`: it rewraps what the old one sealed.
-- **A node the shell or `local()` starts answers only that program**, a token or a signed-in user. Open
+- **A node the shell or a `connect()` starts answers only that program**, a token or a signed-in user. Open
   its console from the link the shell prints.
 - **A grant on another database** (`GRANT … ON DATABASE`, `GRANT CLONE ON DATABASE prod TO …`) moves the
   lake to format 4, once every node runs 0.34 (a 0.33 node can't read it).

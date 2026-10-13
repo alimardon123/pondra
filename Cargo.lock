@@ -3295,10 +3295,12 @@ version = "0.33.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "futures",
  "libc",
  "mimalloc",
  "pondra",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

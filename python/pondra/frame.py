@@ -838,7 +838,7 @@ class Frame:
         """Its rows into Parquet outside the lake (SQL's `COPY … TO`): a file, or a folder of files
         when `path` ends in `/` or `partition_by` names columns (Hive-style folders). A folder
         holding files takes `mode="append"` or `"overwrite"`. A URL needs a secret covering it and
-        an admin's token; with `local()`, this machine's paths too. (Polars' `sink_parquet`.)"""
+        an admin's token; with a lake `connect()` opened here, this machine's paths too. (Polars' `sink_parquet`.)"""
         return self._sink(path, "parquet", partition_by, mode)
 
     def write_csv(self, path, separator=None, include_header=True, partition_by=None, mode=None):

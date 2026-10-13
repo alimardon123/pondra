@@ -9,7 +9,7 @@ install.ps1, download).
 
 The library and the launcher are taken from beside the program (`cargo build --workspace` puts the
 three in one folder) unless --lib and --launcher name them. The wheel is what `pip install pondra`
-gets: the Python client (`python/pondra`), the library in `pondra/_lib/` (where `pondra.open()` loads
+gets: the Python client (`python/pondra`), the library in `pondra/_lib/` (where `pondra.connect()` loads
 it) and the launcher, installed next to Python as the `pondra` command (a "scripts" entry, as maturin's
 bin wheels do), which loads the same library and runs the program from it (ADR-061 §10): one copy of
 the engine for both. The npm packages follow

@@ -760,7 +760,7 @@ SELECT taxed(100) AS t;
 
 `COPY table TO …` is short for `COPY (SELECT * FROM table) TO …`. A URL needs a secret whose `SCOPE`
 covers it (a user's query, one it has `USAGE` on), and only an admin may write files. A path on a
-machine is written only by the program that started the node: the shell, `local()`, or `pondra sql`.
+machine is written only by the program that started the node: the shell, a lake opened with `connect()` in Python or JavaScript, or `pondra sql`.
 Each secret is sealed with a key of its own, which the master key (`PONDRA_SECRET_KEY`, or a key
 service: `PONDRA_KMS_COMMAND`) wraps; `SELECT * FROM secrets()` lists their names and scopes, never
 their values.
@@ -870,7 +870,7 @@ copied, and `information_schema` lists the table as a `VIEW`.
   table's format. A partitioned table writes into `day=…/` folders. `INSERT INTO t (col) VALUES …` fills the
   other columns with `NULL`.
 - **Who reads the files.** A path on the node's machine is read and written only by the program that started
-  the node: the shell or `pondra.local()`. A URL needs a [secret](#files-and-secrets) that covers it, as for
+  the node: the shell or `pondra.connect("lake")`. A URL needs a [secret](#files-and-secrets) that covers it, as for
   `read_parquet`.
 
 ```bash

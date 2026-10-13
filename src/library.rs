@@ -9,9 +9,10 @@
 //! node starts (`pondra lead`, Python looked for beside it) are the program the packages give
 //! ([`exe`]), never the host's own executable.
 //!
-//! A host reaches the node through [`Opened::request`], straight to its router as its owner (the C
-//! ABI, `capi/`, and `pondra.open` in Python: `designs/l2-step4-open.md`), and through the loopback
-//! door the node opens anyway for answers that stream.
+//! A host reaches the node through [`Opened::ask`], straight to its router as its owner (the C ABI,
+//! `capi/`, for Python's `pondra.open`, and its Node-API module for JavaScript's: `designs/l2-step4-open.md`),
+//! answers that stream included. The loopback door the node opens is for what lives outside the host's
+//! process: the console in a browser, Python's workers calling back, other processes on the lake.
 use crate::node::{Node, Options};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -100,19 +101,19 @@ pub enum State {
 /// A node in this process, kept by its supervisor across restarts until it is closed.
 pub struct Opened {
     state: Arc<Mutex<State>>,
-    /// The node's router while it runs (`Node::router`): what [`Opened::request`] calls.
+    /// The node's router while it runs (`Node::router`): what [`Opened::ask`] calls.
     router: Arc<Mutex<Option<axum::Router>>>,
     events: mpsc::UnboundedSender<Event>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The key that makes a request the owner's (invariant 61), given by its host (`pondra.open` gives its
-    /// connection's) or made at open: what [`Opened::request`] signs with.
+    /// connection's) or made at open: what [`Opened::ask`] signs with.
     owner: Option<String>,
     /// A lake held in this process's memory (`:memory:`: `pondra.open()` with no path), let go of once
     /// the node has stopped, by whichever close comes: the host's, or Node's at its end.
     memory: Option<String>,
 }
 
-/// An answer to [`Opened::request`]: its status and headers once the node has them, and its body as the
+/// An answer to [`Opened::ask`]: its status and headers once the node has them, and its body as the
 /// node writes it.
 pub struct Answer {
     pub status: u16,
@@ -127,10 +128,11 @@ pub struct Answer {
 pub struct Body(mpsc::Receiver<Option<anyhow::Result<bytes::Bytes>>>);
 
 impl Body {
-    /// The next piece, waiting for it, or `None` at the end. Any thread may wait: no runtime of its own
-    /// is needed. A body whose work ended before its end (a panic) is an error, never a shorter answer.
-    pub fn next(&mut self) -> Option<anyhow::Result<bytes::Bytes>> {
-        match futures::executor::block_on(self.0.recv()) {
+    /// The next piece, or `None` at the end. A body whose work ended before its end (a panic) is an
+    /// error, never a shorter answer. Dropped before it is ready, nothing is lost: the piece stays for the
+    /// next call.
+    pub async fn recv(&mut self) -> Option<anyhow::Result<bytes::Bytes>> {
+        match self.0.recv().await {
             Some(piece) => piece,
             None => Some(Err(anyhow::anyhow!("the answer's work ended before its end"))),
         }
@@ -144,6 +146,24 @@ impl Body {
         Body(rx)
     }
 }
+
+/// A request on its way ([`Opened::ask`]): its answer, once the node has its head. Dropped before then,
+/// the request's work stops, as a client's does when it goes.
+pub type Asked = futures::future::BoxFuture<'static, anyhow::Result<Answer>>;
+
+/// Waits on this thread for `work`, `within` at most (`None`: as long as it takes), and `None` if it isn't
+/// done by then. A host waits in slices to look at its own signals between them: Python's Ctrl-C, a
+/// notebook's Interrupt. Never on a runtime's own thread.
+pub fn wait<T>(work: impl std::future::Future<Output = T>, within: Option<Duration>) -> Option<T> {
+    match within {
+        None => Some(futures::executor::block_on(work)),
+        Some(d) => runtime().block_on(async move { tokio::time::timeout(d, work).await }).ok(), // (its timer made on the runtime)
+    }
+}
+
+/// Runs `work` on the library's runtime: what the Node-API module waits for there (a request's head, a
+/// body's next piece) is sent back to JavaScript's thread when it is done.
+pub fn spawn(work: impl std::future::Future<Output = ()> + Send + 'static) { drop(runtime().spawn(work)); }
 
 /// The runtime a library's nodes run on, made by the first open and kept for the next: its threads
 /// are the process's, as the queries' runtime's are (`panics::queries`).
@@ -238,19 +258,19 @@ impl Opened {
         let mut options = Options::local(&lake, &addr);
         options.python = python;
         options.attach = attach;
-        // (its loopback door answers only its host, with the key, as a node `local()` starts does: S21)
+        // (its loopback door answers only its host, with the key, as a node `connect()` starts beside its program does: S21)
         options.auth = Arc::new(auth.owned_by(Some(owner.clone())));
         let mut opened = Opened::open(options)?;
         opened.owner = Some(owner);
         Ok(opened)
     }
 
-    /// One request, as the HTTP API takes it (`path` with its query), answered whole: straight to the
-    /// node's router, as its owner from this machine, so everything the API does works here with the
-    /// same checks (invariants 21, 61). It runs on the library's runtime, never on the caller's thread
-    /// (a host's thread may have a small stack, invariant 195, and no runtime). While the node starts,
-    /// restarts or has failed, the answer is 503 57P03 with the reason, which clients ask again on.
-    pub fn request(&self, method: &str, path: &str, headers: &[(String, String)], body: Vec<u8>) -> anyhow::Result<Answer> {
+    /// One request, as the HTTP API takes it (`path` with its query), started now: straight to the node's
+    /// router, as its owner from this machine, so everything the API does works here with the same checks
+    /// (invariants 21, 61). Its work runs on the library's runtime, never on the caller's thread (a host's
+    /// thread may have a small stack, invariant 195, and no runtime). While the node starts, restarts or has
+    /// failed, the answer is 503 57P03 with the reason, which clients ask again on.
+    pub fn ask(&self, method: &str, path: &str, headers: &[(String, String)], body: Vec<u8>) -> anyhow::Result<Asked> {
         let router = self.router.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let Some(router) = router else {
             let why = match self.state() {
@@ -259,7 +279,7 @@ impl Opened {
                 State::Starting | State::Running => "the node is starting".into(),
             };
             let headers = vec![("x-pondra-sqlstate".into(), "57P03".into()), ("content-type".into(), "text/plain; charset=utf-8".into())];
-            return Ok(Answer { status: 503, headers, body: Body::whole(why.into()) });
+            return Ok(futures::future::ready(Ok(Answer { status: 503, headers, body: Body::whole(why.into()) })).boxed());
         };
         let mut req = http::Request::builder().method(method).uri(path);
         for (k, v) in headers {
@@ -271,35 +291,65 @@ impl Opened {
         let mut req = req.body(axum::body::Body::from(body))?;
         let from = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
         req.extensions_mut().insert(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, tls: false, signed: false, local: true }));
-        // (the work runs on the library's runtime; its head comes back first, then its body's pieces, one or
-        // two ahead of the reader, a piece of `None` marking the end)
         let (head, headed) = futures::channel::oneshot::channel();
         let (pieces, body) = mpsc::channel(2);
-        runtime().spawn(async move {
-            use futures::StreamExt;
-            use tower::ServiceExt;
-            let (parts, body) = router.oneshot(req).await.unwrap_or_else(|never| match never {}).into_parts();
-            if head.send(parts).is_err() {
-                return;
+        runtime().spawn(answer(router, req, head, pieces));
+        Ok(async move {
+            let parts = headed.await.map_err(|_| anyhow::anyhow!("the request's work ended before it was answered"))?;
+            let headers = parts.headers.iter().filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string()))).collect();
+            Ok(Answer { status: parts.status.as_u16(), headers, body: Body(body) })
+        }
+        .boxed())
+    }
+}
+
+/// A request's work, on the library's runtime. Its head goes back once the node has it, with what the
+/// body holds already sent ahead of it, as far as the channel holds (most answers are whole by then, so a
+/// host reads them in the head's own wake); then the rest of the body a piece at a time, one or two ahead
+/// of the reader, a piece of `None` marking the end. Whoever asked going (the head or the body let go of)
+/// stops the work, as a client's going does.
+async fn answer(router: axum::Router, req: http::Request<axum::body::Body>, mut head: futures::channel::oneshot::Sender<http::response::Parts>, pieces: mpsc::Sender<Option<anyhow::Result<bytes::Bytes>>>) {
+    use futures::StreamExt;
+    use tower::ServiceExt;
+    let answered = tokio::select! {
+        answered = router.oneshot(req) => answered.unwrap_or_else(|never| match never {}),
+        () = head.cancellation() => return,
+    };
+    let (parts, body) = answered.into_parts();
+    // (empty pieces are left out; a failed one is the last)
+    let stream = body.into_data_stream().filter_map(|piece| futures::future::ready(match piece {
+        Ok(p) if p.is_empty() => None,
+        Ok(p) => Some(Ok(p)),
+        Err(e) => Some(Err(anyhow::Error::from(e))),
+    }));
+    let mut stream = std::pin::pin!(stream);
+    let (mut ahead, mut done) = (None, false);
+    while !done {
+        let Some(piece) = stream.next().now_or_never() else { break }; // (not written yet)
+        done = !matches!(piece, Some(Ok(_)));
+        match pieces.try_send(piece) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(piece)) => {
+                ahead = Some(piece);
+                break;
             }
-            let mut stream = body.into_data_stream();
-            while let Some(piece) = stream.next().await {
-                let (piece, failed) = match piece {
-                    Ok(p) if p.is_empty() => continue,
-                    Ok(p) => (Ok(p), false),
-                    Err(e) => (Err(anyhow::Error::from(e)), true),
-                };
-                // (the reader gone, the stream goes with this task, and its work with it; a failed piece is the last)
-                if pieces.send(Some(piece)).await.is_err() || failed {
-                    return;
-                }
-            }
-            let _ = pieces.send(None).await;
-        });
-        // (any thread may wait for it: no runtime of its own needed, as `block_on` of tokio's would)
-        let parts = futures::executor::block_on(headed).map_err(|_| anyhow::anyhow!("the request's work ended before it was answered"))?;
-        let headers = parts.headers.iter().filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string()))).collect();
-        Ok(Answer { status: parts.status.as_u16(), headers, body: Body(body) })
+            Err(mpsc::error::TrySendError::Closed(_)) => return,
+        }
+    }
+    if head.send(parts).is_err() {
+        return;
+    }
+    if let Some(piece) = ahead {
+        if pieces.send(piece).await.is_err() {
+            return;
+        }
+    }
+    while !done {
+        let piece = stream.next().await;
+        done = !matches!(piece, Some(Ok(_)));
+        if pieces.send(piece).await.is_err() {
+            return; // (the reader gone, the stream goes with this task, and its work with it)
+        }
     }
 }
 
