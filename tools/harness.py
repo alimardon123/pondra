@@ -1406,7 +1406,10 @@ def tails():
         check(f"after insert {i}, a column added")
     added = q("SELECT count(*) AS n, count(x) AS c, sum(x) AS s FROM t")[0]
     want_added = {"n": len(model), "c": sum(1 for *_, x in model if x is not None), "s": sum(x for *_, x in model if x is not None)}
+    decoded = lambda: float(re.search(rb'pondra_cache_bytes\{cache="log"\} (\S+)', call(A.port, "GET", "/metrics")).group(1))
+    before_tiering = decoded()
     call(A.port, "POST", "/tier", timeout=600)
+    after_tiering = decoded()  # (no read in between: the commit that moved the marks let them go)
     check("after tiering")
     for i in range(60, 70):
         insert(i, x=True)
@@ -1416,11 +1419,12 @@ def tails():
         "every read == the model while rows stream in (two tables, one keyed)": not wrong,
         "a transaction reads its snapshot while other reads move past it": held == snapshot == 80,
         "rows from before an added column read it as NULL": added == want_added,
+        "decoded log rows go when their table is tiered, with no read since": before_tiering > 0 and after_tiering == 0,
     }
     for name, good in checks.items():
         print(f"tails: {name}: {'OK' if good else 'FAIL'}")
     if not all(checks.values()):
-        print(f"tails: wrong {wrong[:3]}, snapshot {snapshot} held {held}, added {added} (want {want_added})")
+        print(f"tails: wrong {wrong[:3]}, snapshot {snapshot} held {held}, added {added} (want {want_added}), decoded {before_tiering} then {after_tiering}")
         sys.exit(1)
     return "a table's log tail kept between queries: reads == the model, a transaction's snapshot, columns added, tiering"
 
