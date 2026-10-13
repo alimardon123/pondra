@@ -575,6 +575,16 @@ async fn clear(dest: &Store) {
     }
 }
 
+/// Removes the folders under `dir` that hold nothing, deepest first: what a cleared folder target keeps.
+fn prune_empty(dir: &FsPath) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            prune_empty(&entry.path());
+            let _ = std::fs::remove_dir(entry.path()); // (fails, and so stays, unless it is empty)
+        }
+    }
+}
+
 /// Pass 2, once the host has stopped the node (`node::Move`): the target is made equal to the lake as it is
 /// now. What changed since pass 1 read it is copied again, what is new copied, what the lake no longer holds
 /// taken away there, and the lake in memory let go.
@@ -584,6 +594,9 @@ pub async fn settle(m: &crate::node::Move) -> anyhow::Result<()> {
     if let Err(e) = settle_into(&from, &dest, m).await {
         // (a failed second pass leaves the lake in memory, whole, and nothing of the move at the target)
         clear(&dest).await;
+        if !m.to.contains("://") {
+            prune_empty(FsPath::new(&m.to)); // (a folder keeps the folders its objects were in)
+        }
         return Err(e);
     }
     forget_memory(&m.from);

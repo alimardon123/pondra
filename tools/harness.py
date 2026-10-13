@@ -15947,8 +15947,8 @@ def doors():
                 r = json.loads(urllib.request.urlopen(urllib.request.Request(mcp, data=body, headers={"content-type": "application/json", "mcp-session-id": sid}), timeout=60).read())["result"]
                 text = r["content"][0]["text"]
                 if r["isError"]:
-                    m = re.search(r"\b(\d{2}[0-9A-Z]\d{2})\b", text)
-                    return m.group(1) if m and m.group(1) in ("23514", "42P01", "40001", "25P02", "25006") else "refused: " + text[:160]
+                    code = next((c for c in re.findall(r"\b([0-9][0-9A-Z]{4})\b", text) if c in ("23514", "42P01", "40001", "25P02", "25006", "0A000")), None)
+                    return code or "refused: " + text[:160]
                 got = json.loads(text)
                 out.append(rows_of(got["rows"]) if isinstance(got, dict) and "rows" in got else None)
         finally:
@@ -15986,7 +15986,7 @@ finally {{ await db.close?.(); }}"""
         return out
     # The shell prints its errors without a SQLSTATE (the header `x-pondra-sqlstate` carries it), so the
     # codes this matrix checks are named by the words of their messages.
-    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01"), ("is a backup, so it is read-only", "25006")]
+    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01"), ("is a backup, so it is read-only", "25006"), ("SET LOCATION moves a lake held in memory", "0A000")]
     def via_cli(stmts):
         # The shell on the lake, one process for the feature's statements: one session (`shell.rs`). It has no
         # `--url`, so it starts a node on the lake, which joins this one as a follower; its own address is an
@@ -17398,8 +17398,15 @@ def memorylake():
         bad_name = call(P + 4, "GET", "/stats")["lake"]
         bad_target = new_lake()
         reply(P + 4, "POST", "/sql", f"ALTER DATABASE \"{bad_name}\" SET LOCATION '{bad_target}'".encode())
-        back = until(lambda: lake_now(P + 4), bad_name, 60) == bad_name
-        bad_stats = call(P + 4, "GET", "/stats", timeout=10) if back else {}
+        def failed_why():
+            """Why the move failed, once the node serves again and says so (/stats), else None."""
+            try:
+                return call(P + 4, "GET", "/stats", timeout=2).get("move_failed")
+            except Exception:
+                return None
+        why = until(lambda: bool(failed_why()), True, 60) and failed_why()
+        back = lake_now(P + 4) == bad_name
+        bad_stats = {"move_failed": why}
         checks["a move whose second pass fails leaves the lake in memory with every row, says why in /stats, and nothing at the target"] = (
             back and bool(bad_stats.get("move_failed")) and sql(P + 4, "SELECT v FROM kept ORDER BY v") == [{"v": 1}, {"v": 2}, {"v": 3}]
             and not lake_objects(bad_target, "catalog/") and not lake_objects(bad_target, "data/"))
