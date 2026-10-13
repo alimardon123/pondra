@@ -434,7 +434,7 @@ mod tests {
     fn averages_and_expressions_are_finished_when_read() {
         let (partial, finish) = split_of("SELECT t.k, avg(x) AS a, round(sum(x) / count(*), 2) AS r FROM t GROUP BY t.k HAVING count(*) > 1 ORDER BY a DESC LIMIT 3", &["k", "a", "r"]).unwrap();
         assert_eq!(partial, "SELECT t.k AS \"k\", sum(x) AS \"__sum_1\", count(x) AS \"__count_2\", count(*) AS \"__count\" FROM t GROUP BY 1");
-        assert_eq!(finish, "SELECT \"k\" AS \"k\", \"__sum_1\" / NULLIF(\"__count_2\", 0) AS \"a\", round(\"__sum_1\" / \"__count\", 2) AS \"r\" FROM __partial WHERE \"__count\" > 1 ORDER BY a DESC LIMIT 3");
+        assert_eq!(finish, "SELECT \"k\" AS \"k\", pondra_avg_of(\"__sum_1\", \"__count_2\") AS \"a\", round(\"__sum_1\" / \"__count\", 2) AS \"r\" FROM __partial WHERE \"__count\" > 1 ORDER BY a DESC LIMIT 3");
     }
 
     #[test]
