@@ -45,7 +45,7 @@ newest logged; a round's run replaces them.
 | **Fits in** | the Postgres ecosystem | dbt == Postgres 16's rows; psql, SQLAlchemy, pgjdbc, psqlODBC, ADBC, Npgsql (`clients_check.py`); Spark and PyIceberg write | Metabase, Superset, Grafana, Tableau, DBeaver, Power BI checked; Postgres and MySQL attached with changes streamed in | L3, L4, L5 |
 | **Every feature through every door** (principle 10) | engines with one or two ways in | the doors matrix (`harness.py doors`): one list of features through SQL over HTTP, Python, the Postgres port, Flight SQL, JavaScript and MCP, each cell right or refused by name | JavaScript has no frames, `write_table` or `read_*` (35); a table with an enforced `UNIQUE` is refused by the loading doors (appends, Kafka, Flight, `COPY`) and Flight SQL and MCP hold no transaction (36); Kafka topics have one partition and no transactions (36); enum types are text in Postgres's catalog (36); the command line and the console in the matrix (37) | L2, L3, L8 |
 | **Easy to change and extend** (principle 9) | closed platforms | one registry of every kind of object; the console's `register.*` and extensions; one check at every door | `INSTALL` / `LOAD` extensions (ADR-031, proposed) | the owner's call |
-| **Safe** | — | users and grants to a column, TLS everywhere, an audit log, quotas, every door fuzzed | a security review | L7 |
+| **Safe** | — | users and grants to a column, TLS everywhere, an audit log, quotas, every door fuzzed | a security review; single sign-on, by the freeze (the owner, 10-13); row filters and column masks after 1.0 | L7 |
 | **Runs anywhere** | — | Linux (glibc 2.17), macOS, Windows; pip, npm, installers, a container, Helm, `pondra service` | Homebrew, winget, signed binaries; an upgrade guide | L7 |
 
 ## One month to 1.0
@@ -101,6 +101,8 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
   snappy at any scale. **J4:** connections (`CREATE CONNECTION`). **J5, J7:** a workspace exported
   whole, and ETL as code, a canvas and YAML over one definition, as plugins.
 - **E12:** sharing with other companies (ADR-046, proposed). **E13**'s rollups, before J6.
+- **Governance** (the owner, 2026-10-13, after single sign-on by the freeze; `reviews/platform-comparison.md`'s
+  governance row): row filters and column masks, as Databricks' Unity Catalog and Snowflake's Horizon have them.
 - **From the OLAP engines** (`designs/realtime-olap-comparison.md`): a query over a table answered from a
   materialized view that covers it, without naming it; HLL and quantiles as merge states for merge tables
   and adding-up views; `VARIANT` as a real type with its paths as columns (Parquet's shredding) and a
