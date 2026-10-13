@@ -3,7 +3,7 @@
 and how many per second, while new rows keep arriving?
   serve_bench.py [--keys 2000000] [--nodes 1] [--secs 5] [--threads 1,8,32]
   serve_bench.py --users 50,100,200,400 [--events 5000000] [--secs 10]   # dashboards while writes land
-  serve_bench.py --tpch ~/tpch/sf1 [--queries q6] [--nodes 3] [--writes] [--cache] [--steps 50,100,200,400] [--alone 35] [--out FILE]
+  serve_bench.py --tpch ~/tpch/sf1 [--queries q6] [--nodes 3] [--writes] [--cache] [--door http|pg] [--steps 50,100,200,400] [--alone 35] [--out FILE]
       # TPC-H SF1 as Parquet: answers checked against DuckDB's, then fresh statements under load (tpch_params.py)
 Prints one JSON line per measurement."""
 import argparse, datetime, decimal, io, json, math, os, random, shutil, statistics, subprocess, sys, tempfile, threading, time
@@ -469,25 +469,35 @@ def tpch_steps(ports, bodies, writes, queries):
     """The load steps: `clients` clients for --secs, spread round-robin over the nodes by loadgen, each
     statement drawn from `bodies`. Each step prints its QPS, errors, p50 and p99, each query's own (by
     label), and with --writes the freshness and write acks of the batches sent in it."""
-    exe = loadgen()
-    assert exe, "needs Go (tools/loadgen.go)"
-    urls = ",".join(f"http://127.0.0.1:{p}/sql" for p in ports)
+    if A.door == "pg":  # (the Postgres port: tools/pgload.py, a connection a client)
+        dsns = ",".join(f"postgresql://u@127.0.0.1:{pg_port(p)}/lake" for p in ports)
+        load = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "pgload.py"), "--dsns", dsns, "--bodies", bodies, "--keys", str(TPCH_KEYS)]
+        load_args = lambda clients: load + ["-c", str(clients), "--secs", str(A.secs)]
+    else:
+        exe = loadgen()
+        assert exe, "needs Go (tools/loadgen.go)"
+        urls = ",".join(f"http://127.0.0.1:{p}/sql" for p in ports)
+        load_args = lambda clients: [exe, "-urls", urls, "-bodies", bodies, "-keys", str(TPCH_KEYS), "-c", str(clients), "-secs", str(A.secs)]
     cache = "on: as it is, parameters repeat" if A.cache else "off: every request's statement is new"
     for i, clients in enumerate(int(x) for x in A.steps.split(",")):
         if writes:
             writes.step = i
-        r = subprocess.run([exe, "-urls", urls, "-bodies", bodies, "-keys", str(TPCH_KEYS), "-c", str(clients), "-secs", str(A.secs)],
-                           capture_output=True, text=True, check=True)
+        r = subprocess.run(load_args(clients), capture_output=True, text=True, check=True)
         got = json.loads(r.stdout)
         if writes:
             writes.step = None
             writes.settle(i)
         by = [{k: round(v, 2) if k.endswith("_ms") else v for k, v in b.items()} for b in got["by"]]
-        rec = {"nodes": len(ports), "queries": queries, "result_cache": cache, "clients": clients, "secs": round(got["secs"], 1), "qps": got["qps"], "errors": got["errors"],
+        rec = {"nodes": len(ports), "door": A.door, "queries": queries, "result_cache": cache, "clients": clients, "secs": round(got["secs"], 1), "qps": got["qps"], "errors": got["errors"],
                "p50_ms": round(got["p50_ms"], 2), "p99_ms": round(got["p99_ms"], 2), "by": by, "per_url": got.get("per_url")}
         if writes:
             rec.update(writes.report(i, got["secs"]))  # (the step lasts until its last answer: so do its writes)
         emit(rec, step=True)
+
+
+def pg_port(port):
+    """A node's Postgres port (--door pg): its HTTP port's, 100 up."""
+    return port + 100
 
 
 def machine():
@@ -507,7 +517,8 @@ def tpch(data):
     assert all(q in tpch_params.QUERIES for q in queries), f"--queries: any of {','.join(tpch_params.QUERIES)}"
     DOC.update(machine())
     lake = harness.new_lake()
-    nodes = [Node(lake, A.port + i, reader=(i > 0)).start() for i in range(A.nodes)]
+    pg = lambda p: {"pg": f"127.0.0.1:{pg_port(p)}"} if A.door == "pg" else {}
+    nodes = [Node(lake, A.port + i, reader=(i > 0), **pg(A.port + i)).start() for i in range(A.nodes)]
     ports = [nd.port for nd in nodes]
     work = tempfile.mkdtemp(prefix="pondra-tpch-")
     try:
@@ -560,6 +571,7 @@ if __name__ == "__main__":
     ap.add_argument("--check", type=int, default=20, help="with --tpch: statements per query checked against DuckDB")
     ap.add_argument("--statements", type=int, default=1000, help="with --tpch: statements per query in the load's file")
     ap.add_argument("--alone", type=int, default=0, help="with --tpch: time N statements of each query alone, on the node and on DuckDB")
+    ap.add_argument("--door", default="http", choices=["http", "pg"], help="with --tpch: the load's clients over HTTP (tools/loadgen.go) or the Postgres port (tools/pgload.py, asyncpg)")
     ap.add_argument("--seed", type=int, default=1, help="with --tpch: the parameters' random seed")
     ap.add_argument("--out", default="", help="with --tpch: write everything as one JSON document")
     ap.add_argument("--threads", default="1,8,32,64")

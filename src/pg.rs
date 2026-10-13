@@ -369,7 +369,7 @@ impl Backend {
                     None => return Err(e),
                 },
             },
-            false => self.app.query(&sql, None).await.map_err(user_error)?,
+            false => self.answer(&sql).await.map_err(user_error)?,
         };
         let schema = match batches.first() {
             Some(b) => b.schema(),
@@ -529,6 +529,29 @@ impl Backend {
             self.app.log().map_err(err)?.append(p.copy.table.clone(), src, b).await.map_err(err)?;
         }
         Ok(())
+    }
+
+    /// A query's answer, remembered as HTTP's are (`App::remembers`): a dashboard's repeated query is a
+    /// lookup until the next commit, however many connections ask. Never in a transaction (its own
+    /// writes and snapshot). Kept as Arrow, so each connection sends it in its own formats.
+    async fn answer(&self, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
+        use crate::server::Kept;
+        let version = match crate::txn::open() {
+            true => None,
+            false => self.app.remembers(sql).await,
+        };
+        let Some(version) = version else { return self.app.query(sql, None).await };
+        let run = || async {
+            let batches = self.app.query(sql, None).await?;
+            Ok(match batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= 1 << 20 {
+                true => Kept::Bytes(crate::query::ipc(&batches)?.into()),
+                false => Kept::Own(batches), // (a big answer: `Results` keeps none past 1 MB, nor encodes it to find out)
+            })
+        };
+        match self.app.remembered(format!("pg|{sql}"), sql, version, None, run).await? {
+            Kept::Bytes(b) => crate::query::read_ipc(&b),
+            Kept::Own(batches) => Ok(batches),
+        }
     }
 
     /// A query's result columns, without running it.
