@@ -647,10 +647,12 @@ def numpy_params(url):
     con = dbapi.connect(url)
     con.autocommit = True
     cur = con.cursor()
-    cur.execute("SELECT $1 + 1 AS x, $2 AS flag", (np.int64(41), np.bool_(True)))
+    cur.execute("SELECT $1 + 1 AS x, $2 AS flag, $3 AS at, $4 AS took",
+                (np.int64(41), np.bool_(True), np.datetime64("2024-01-02T03:04:05.123456789"), np.timedelta64(1500, "ms")))
     got = cur.fetchall()
     con.close()
-    return got == [(42, True)], f"numpy scalars as parameters: {got}"
+    want = [(42, True, datetime.datetime(2024, 1, 2, 3, 4, 5, 123456), datetime.timedelta(seconds=1.5))]
+    return got == want, f"numpy scalars as parameters (a datetime64 in nanoseconds, a timedelta64): {got}"
 
 
 def non_finite_params(url):
@@ -663,6 +665,41 @@ def non_finite_params(url):
     con.close()
     a, b, c = got[0]
     return a != a and b == float("inf") and c == float("-inf"), f"NaN, inf and -inf as parameters: {got}"
+
+
+# What a cursor reads, as text: each answer's column names, type codes and rows (`rows_without_pyarrow`).
+ROWS_PROBE = r"""
+import json, sys
+if sys.argv[2] == "without":
+    sys.modules["pyarrow"] = None  # (as if it weren't installed: the client's find_spec answers None)
+from pondra import dbapi
+con = dbapi.connect(sys.argv[1])
+con.autocommit = True
+cur = con.cursor()
+out = []
+for sql in sys.argv[3:]:
+    cur.execute(sql)
+    rows = cur.fetchall()
+    out.append([[(d[0], getattr(d[1], "name", d[1])) for d in cur.description], len(rows), repr(rows[:3]), repr(rows[-1:])])
+print(json.dumps(out))
+"""
+
+
+def rows_without_pyarrow(url):
+    """Without pyarrow a cursor reads the node's typed JSON: the same columns (one NULL in every row too,
+    and an empty answer's), types, values and row count as with it, past the first page's 10,000 rows too."""
+    queries = ["SELECT NULL::INT AS a, 1 AS b, CAST('1.50' AS DECIMAL(10, 2)) AS d, DATE '2024-01-02' AS dt, "
+               "TIMESTAMP '2024-01-02 03:04:05.123456' AS ts, 9007199254740993 AS big, 'x' AS s, TRUE AS t, 2.5::DOUBLE AS f",
+               "SELECT * FROM (VALUES (NULL, 1), (2, 3)) AS v(a, b)",
+               f"SELECT id, v FROM {DBAPI_TABLE} WHERE false",
+               "SELECT value AS n FROM generate_series(1, 25000) ORDER BY value"]
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(HERE), "python")}
+    said = {how: subprocess.run([sys.executable, "-c", ROWS_PROBE, url, how, *queries], capture_output=True, text=True, env=env, timeout=120)
+            for how in ("with", "without")}
+    if any(r.returncode for r in said.values()):
+        return False, "; ".join(f"{how}: {first_line(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else r.returncode)}" for how, r in said.items())
+    got = {how: json.loads(r.stdout) for how, r in said.items()}
+    return got["with"] == got["without"], f"without pyarrow {got['without'][:2]}" + ("" if got["with"] == got["without"] else f", with it {got['with'][:2]}")
 
 
 def echo_off(url):
@@ -700,6 +737,7 @@ DBAPI_CHECKS = [
     ("dbapi.positional_parameters", positional_params),
     ("dbapi.numpy_scalars_as_parameters", numpy_params),
     ("dbapi.non_finite_floats_as_parameters", non_finite_params),
+    ("dbapi.rows_without_pyarrow", rows_without_pyarrow),
     ("dbapi.echo_off_by_default", echo_off),
     ("dbapi.node_gone_is_operational_error", dead_node),
 ]

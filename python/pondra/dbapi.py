@@ -1,7 +1,8 @@
 """PEP 249 (the Python Database API, version 2.0) over `pondra.connect()`: a connection is a session
 of its own on a node, and a cursor runs statements on it. SQLAlchemy (`dialect.py`) and other DB-API
 tools use this. It imports only the standard library and `pondra`; rows come from pyarrow when it is
-installed, as `Result` gets them, and as the node's JSON rows (names only) when it isn't.
+installed, as `Result` gets them, and as the node's typed JSON when it isn't (every column named and typed,
+an empty answer's too, and values made Python's by their types).
 
     from pondra import dbapi
     con = dbapi.connect("http://127.0.0.1:8080", token="…")   # or a folder, or no target: a lake in memory
@@ -12,10 +13,12 @@ installed, as `Result` gets them, and as the node's JSON rows (names only) when 
     cur.fetchall()
 """
 import datetime
+import decimal
+import json
 import re
 import time
 
-from .client import PondraError, _code, connect as _connect
+from .client import PondraError, _code, _has_arrow, connect as _connect
 
 apilevel = "2.0"
 threadsafety = 1  # threads may share this module, not a connection
@@ -185,6 +188,51 @@ def _type_code(t):
     return str(t)
 
 
+# Without pyarrow: the node's typed JSON names each column's Arrow type (`Int64`, `Decimal128(10, 2)`,
+# `Timestamp(µs, "UTC")`), and gives decimals, and integers past 2^53, as text.
+_KINDS = ((STRING, ("Utf8", "LargeUtf8")), (BINARY, ("Binary", "LargeBinary", "FixedSizeBinary")),
+          (NUMBER, ("Boolean", "Int", "UInt", "Float", "Decimal")), (DATETIME, ("Date", "Time", "Duration", "Interval")))
+_FRACTION = re.compile(r"(\.\d{6})\d+")  # (a datetime holds microseconds; Python before 3.11 reads no more digits)
+
+
+def _code_of(name):
+    return next((code for code, starts in _KINDS if name.startswith(starts)), name)
+
+
+def _from_text(name):
+    """How a typed JSON value of an Arrow type becomes Python's, or None to keep it as it came."""
+    iso = lambda v: _FRACTION.sub(r"\1", v[:-1] + "+00:00" if v.endswith("Z") else v)
+    if name.startswith("Decimal"):
+        return decimal.Decimal
+    if name in ("Int64", "UInt64"):
+        return int  # (text past 2^53, a number otherwise)
+    if name.startswith("Date"):
+        return lambda v: datetime.date.fromisoformat(v[:10])
+    if name.startswith("Timestamp"):
+        return lambda v: datetime.datetime.fromisoformat(iso(v))
+    if name.startswith("Time"):
+        return lambda v: datetime.time.fromisoformat(iso(v))
+    return None
+
+
+def _typed(client, answer):
+    """A typed JSON answer as (description, rows): every column, in order, with its type; the rows past the
+    first page read from the answer the node keeps (`GET /sql/pages/{id}`)."""
+    rows = answer["rows"]
+    while len(rows) < answer["total"]:
+        if not answer.get("pages"):
+            raise OperationalError(f"an answer of {answer['total']} rows is too big for the node to keep in pages: install pyarrow to read it")
+        more = json.loads(client._call("GET", f"/sql/pages/{answer['pages']}?from={len(rows)}&rows=100000"))
+        if not more["rows"]:
+            break
+        rows += more["rows"]
+    names = [c["type"] for c in answer["columns"]]
+    made = [_from_text(n) for n in names]
+    rows = [tuple(v if v is None or f is None else f(v) for v, f in zip(r, made)) for r in rows]
+    description = [(c["name"], _code_of(c["type"]), None, None, None, None, True) for c in answer["columns"]]
+    return description, rows
+
+
 def _description(schema):
     import pyarrow as pa
     out = []
@@ -291,7 +339,10 @@ class Connection:
                 self._execute(_BEGIN[self.isolation_level])
             # (catalog=postgres: pg_catalog and information_schema answered as the Postgres port answers them,
             # since a DB-API caller speaks Postgres: SQLAlchemy's inspector, has_table, pandas' to_sql)
-            answer = self._client._run(sql, {str(i + 1): v for i, v in enumerate(params or ())}, catalog="postgres")
+            answer = self._client._run(sql, {str(i + 1): v for i, v in enumerate(params or ())}, catalog="postgres",
+                                       format=None if _has_arrow() else "typed")
+            if isinstance(answer, dict) and {"columns", "rows", "total"} <= answer.keys():  # (rows, not a write's outcome)
+                answer = _typed(self._client, answer)
         except (PondraError, OSError) as e:
             raise _error(e) from e
         if word in _STARTS:
@@ -375,9 +426,8 @@ class Cursor:
         if isinstance(answer, dict):
             self.description, self.rowcount = None, answer.get("rows", -1)
             return
-        if answer._rows is not None:  # JSON rows (no pyarrow): names only, from the first row
-            self._answer = answer._rows
-            self.description = [(k, None, None, None, None, None, True) for k in answer._rows[0]] if answer._rows else None
+        if isinstance(answer, tuple):  # (no pyarrow: the typed JSON's columns and rows, as tuples)
+            self.description, self._answer = answer
         else:  # (Arrow came back, so pyarrow is here)
             table = _tidy(answer.to_arrow())
             self._answer = table
@@ -394,8 +444,7 @@ class Cursor:
         self._alive()
         size = self._size()
         if isinstance(self._answer, list):
-            names = [d[0] for d in self.description] if self.description else []
-            rows = [tuple(r[k] for k in names) for r in self._answer[self._pos:self._pos + n]]
+            rows = self._answer[self._pos:self._pos + n]
         else:
             part = self._answer.slice(self._pos, min(n, size - self._pos))
             columns = [_python_values(c) for c in part.columns]

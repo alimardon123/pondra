@@ -294,11 +294,12 @@ class Pondra:
             body += [struct.pack("<Q", len(b)), b]
         return self._call("POST", path, b"".join(body), {"content-type": "application/vnd.pondra.request"}, again=again)
 
-    def _run(self, sql, params=None, sent=None, job=None, views=None, catalog=None):
-        """Run statements now: the last one's rows (`Result`) or outcome (a dict)."""
+    def _run(self, sql, params=None, sent=None, job=None, views=None, catalog=None, format=None):
+        """Run statements now: the last one's rows (`Result`) or outcome (a dict); with `format="typed"`,
+        the node's typed JSON as a dict (columns named and typed, then rows: the DB-API's without pyarrow)."""
         if job is None and self._job:
             job = f"{self._job}:{next(self._jobs)}"  # (a procedure's writes: its caller's job, each its own)
-        out = self._post(sql, params, sent, job, views, catalog=catalog)
+        out = self._post(sql, params, sent, job, views, format=format, catalog=catalog)
         if out[:1] == b"{":
             return json.loads(out)
         return Result(rows=_json_rows(out)) if out[:1] == b"[" else Result(out)
@@ -1071,10 +1072,12 @@ def _bound(frame, name, value):
 def _param(v):
     """A parameter for the node: JSON's own values as they are; dates, times and decimals as SQL. A numpy
     scalar (an int64 from a frame) is the Python value it stands for, known by its type's module so numpy is
-    never imported. A float that isn't finite is SQL, since JSON has no NaN. A time is a TIME, not text, and
-    an aware datetime a TIMESTAMPTZ, its offset kept."""
+    never imported; a datetime64 or timedelta64 in microseconds first (in nanoseconds `item()` is an int). A
+    float that isn't finite is SQL, since JSON has no NaN. A time is a TIME, not text, and an aware datetime a
+    TIMESTAMPTZ, its offset kept."""
     if type(v).__module__ == "numpy" and hasattr(v, "item") and getattr(v, "ndim", 0) == 0:
-        v = v.item()
+        kind = v.dtype.kind
+        v = (v.astype("datetime64[us]" if kind == "M" else "timedelta64[us]") if kind in "Mm" else v).item()
     if isinstance(v, float) and not math.isfinite(v):
         return {"sql": _literal(v)}
     if isinstance(v, _dt.time):
