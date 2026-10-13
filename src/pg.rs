@@ -543,10 +543,11 @@ impl Backend {
         let Some(version) = version else { return self.app.query(sql, None).await };
         let run = || async {
             let batches = self.app.query(sql, None).await?;
-            Ok(match batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= 1 << 20 {
-                true => Kept::Bytes(crate::query::ipc(&batches)?.into()),
-                false => Kept::Own(batches), // (a big answer: `Results` keeps none past 1 MB, nor encodes it to find out)
-            })
+            let keep = match batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= 1 << 20 {
+                true => Some(crate::query::ipc(&batches)?.into()),
+                false => None, // (a big answer: `Results` keeps none past 1 MB, nor encodes it to find out)
+            };
+            Ok((keep, batches)) // (its own caller takes the batches as they are: never decoded again)
         };
         match self.app.remembered(format!("pg|{sql}"), sql, version, None, run).await? {
             Kept::Bytes(b) => crate::query::read_ipc(&b),

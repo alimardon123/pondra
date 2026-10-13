@@ -1391,19 +1391,21 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     let key = format!("{format}{}|{}|{}|{query}", p.rows.map(|n| format!(":{n}")).unwrap_or_default(), p.spread.as_deref().unwrap_or(""), if files { "owner" } else { "" });
     let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
     let run = || async {
-        Ok(match run_sql(app, p, query, files).await? {
-            Rendered::Whole(body) => Kept::Bytes(body),
-            pieces => Kept::Own(pieces), // (a big answer: sent to its own caller only)
-        })
+        let rendered = run_sql(app, p, query, files).await?;
+        let keep = match &rendered {
+            Rendered::Whole(body) => Some(body.clone()),
+            Rendered::Pieces(_) => None, // (a big answer: sent to its own caller only)
+        };
+        Ok((keep, rendered))
     };
     Ok(match app.remembered(key, query, version, stale, run).await? {
         Kept::Bytes(body) => respond(body),
-        Kept::Own(pieces) => pieces.respond(p.format.as_deref()),
+        Kept::Own(rendered) => rendered.respond(p.format.as_deref()),
     })
 }
 
-/// An answer `App::remembered` gives: the bytes a run kept (remembered, or shared by the identical
-/// queries asking at the same moment), or one a run kept for its own caller alone.
+/// An answer `App::remembered` gives: the bytes another run kept (remembered, or shared by the
+/// identical queries asking at the same moment), or the answer this caller's own run made.
 pub(crate) enum Kept<T> {
     Bytes(bytes::Bytes),
     Own(T),
@@ -1437,12 +1439,14 @@ impl App {
 
     /// The answer under `key` at `version` (`remembers`): remembered, or made by `run`, once for
     /// everyone asking at the same moment. Each run covers everyone who arrived before it started, so
-    /// no one gets an answer older than the lake they arrived at. A run's bytes are kept and shared;
-    /// one that leaves none (an error, or `Kept::Own`) leaves each caller it covered to run on its own.
+    /// no one gets an answer older than the lake they arrived at. A run gives its own caller's answer
+    /// and the bytes to keep and share, when it has them; one that leaves none (an error, or a big
+    /// answer) leaves each caller it covered to run on its own. Its own caller takes its answer as it
+    /// is: the Postgres port never decodes the bytes it just encoded.
     pub(crate) async fn remembered<T, F, Fut>(&self, key: String, query: &str, version: u64, stale: Option<Duration>, run: F) -> anyhow::Result<Kept<T>>
     where
         F: Fn() -> Fut,
-        Fut: std::future::Future<Output = anyhow::Result<Kept<T>>>,
+        Fut: std::future::Future<Output = anyhow::Result<(Option<bytes::Bytes>, T)>>,
     {
         if let Some(body) = self.results.get(&key, version, stale) {
             return Ok(Kept::Bytes(body));
@@ -1453,20 +1457,20 @@ impl App {
         if slot.0 >= ticket {
             let Some(body) = &slot.1 else {
                 drop(slot); // (each it covered runs on its own, beside the others)
-                return run().await;
+                return Ok(Kept::Own(run().await?.1));
             };
             return Ok(Kept::Bytes(body.clone()));
         }
         (slot.0, slot.1) = (flight.0.load(std::sync::atomic::Ordering::Relaxed), None);
         let version = self.lake.version_for(query).await; // (read after `covers`: this run reads at least this)
-        let out = run().await?;
-        if let Kept::Bytes(body) = &out {
+        let (keep, own) = run().await?;
+        if let Some(body) = keep {
             if let Some(v) = version {
                 self.results.put(key, v, body.clone());
             }
-            slot.1 = Some(body.clone());
+            slot.1 = Some(body);
         }
-        Ok(out)
+        Ok(Kept::Own(own))
     }
 }
 
