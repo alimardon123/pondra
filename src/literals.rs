@@ -122,6 +122,11 @@ fn fold(e: &Expr, ctx: &SimplifyContext) -> Option<ScalarValue> {
                 (DataType::Timestamp(..), Some(s)) => ScalarValue::Utf8(Some(s)),
                 _ => v,
             };
+            // (a cast to an integer rounds a fraction, as the planned path's `casts::Rounds` has it)
+            let v = match c.field.data_type().is_integer() && crate::casts::fractional(&v.data_type()) {
+                true => ScalarValue::try_from_array(&crate::casts::whole(&v.to_array().ok()?).ok()?, 0).ok()?,
+                false => v,
+            };
             v.cast_to(c.field.data_type()).ok() // (a cast that fails is the planned path's error to report)
         }
         _ => None,
@@ -270,6 +275,14 @@ mod tests {
         for sql in ["VALUES (1)", "VALUES (-1)", "VALUES ((-5))", "VALUES (9223372036854775807)", "VALUES (1.5)", "VALUES ('12')", "VALUES ('x')"] {
             agree(&int, sql).await;
         }
+        // (a fraction cast to an integer rounds on both paths: a decimal half away from zero, a float half to even)
+        for sql in ["VALUES (2.5)", "VALUES (-2.5)", "VALUES (CAST(2.5 AS INT))", "VALUES (CAST(-2.5 AS BIGINT))", "VALUES ((-2.5)::bigint)", "VALUES (2.5::double::int)", "VALUES (3.5::double::int)"] {
+            agree(&int, sql).await;
+        }
+        let (_, rows) = both(&int, "VALUES (CAST(2.5 AS INT)), (CAST(-2.5 AS INT)), (2.5::double::int), (3.5::double::int)").await.expect("literal");
+        let rows = rows.expect("rows");
+        let got: Vec<ScalarValue> = (0..4).map(|i| ScalarValue::try_from_array(rows.column(0).as_ref(), i).unwrap()).collect();
+        assert_eq!(got, [3, -3, 2, 4].map(|n| ScalarValue::Int64(Some(n))));
         agree(&[("v", "Int16")], "VALUES (70000)").await;
     }
 

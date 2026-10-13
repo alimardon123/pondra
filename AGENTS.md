@@ -99,7 +99,9 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           `RESTORE DATABASE`: a backup is a lake;
           ADR-070, invariants 290, 291), seq.rs (sequences and
           identity columns: invariant 234), index.rs (indexes kept as objects: invariant 235),
-          constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236),
+          constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236), literals.rs
+          (an INSERT's literal rows without a session or a plan: invariant 401), casts.rs (a cast to an integer
+          rounds: invariant 293),
           types.rs (enum types: invariant 242), and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
           237–239); learned.rs (what a run learned about its filters, ADR-050: invariant 244);
           environments (ADR-047): branch.rs (`CREATE DATABASE dev CLONE prod`, REFRESH: invariant
@@ -2298,14 +2300,20 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 318. **SQL's plain INSERT never replaces a row of its key** (`constraints::key_check`, `key_check_over`,
    `txn::autocommit`, `txn::ByKey`): an INSERT without ON CONFLICT or OR REPLACE | IGNORE into a table
    with a PRIMARY KEY (not a merge table) is refused 23505, in Postgres's words, when two of its rows
-   share a key or a live row holds one. Outside a transaction it runs as one of its own under its keys'
+   share a key or a live row holds one. A MERGE's and an `ON CONFLICT` on another column's inserted keys
+   must be new too (`change::run`), checked by lookups unless the MERGE matches on the key alone with
+   source columns of the key's type (`Merge::key_sources`, `compared_as_keys`), which checks only its own
+   new rows (`constraints::distinct_keys`); a SET of a key column is 0A000. An upsert's conflict columns
+   are cast to the table's types before a conflict is looked for (`Upsert::merge`), so a conflict is
+   looked for under the key the row is written as. Outside a transaction it runs as one of its own under its keys'
    row locks, so of two nodes inserting one new key, one wins. In a transaction it is checked at its
    statement over the transaction's kept keys (`ByKey`: its own rows' keys held, the keys it took away
    free, never a pass over its kept rows) and again at COMMIT. A retried job's INSERT is a duplicate
-   (`write::sent`). A CREATE TABLE AS refused for a key leaves no table. ON CONFLICT, MERGE, INSERT OR
+   (`write::sent`). A CREATE TABLE AS refused for a key leaves no table. ON CONFLICT, a MERGE's matched rows, INSERT OR
    REPLACE | IGNORE, the loading doors and views keep upserting, and a change replaces old rows by key,
    not `_row_id` (`change::upserts`). `pondra sql` and an attached lake's INSERT check without locks.
-   `harness.py pkey`.
+   `harness.py pkey`: "a MERGE that inserts a key the table holds is refused…", "…compares a key in another
+   type (7002.5 against BIGINT)…".
 322. **Row locks are a schedule, never the authority** (`locks.rs`, `txn::commit_here`, ADR-067
    §4–6): they live in the leader's memory only, by table and key (an append table's by `_row_id`),
    with a lease of `PONDRA_LOCK_LEASE_SECS` (60) that each lock request renews; a new leader starts
@@ -2573,6 +2581,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    over 1 MB is its caller's alone. `harness.py remembered`: one run for five asks from two connections,
    a commit, a transaction's own write, now() and temporary tables, a setting, parameters in text and
    binary, a user's grants.
+401. **An INSERT's literal rows are DataFusion's, without its planner** (`literals.rs`, from `write::rows_of`):
+   a `VALUES` of literals, casts of them and the statement's time functions is built as the planner would
+   build it (its own `sql_to_expr` and `simplify`, one start time a statement, the session's
+   `optimize::config`, `query::seconds`, `values_typed`'s casts, a cast to an integer rounded as
+   `casts::Rounds` rounds it), and anything else (another call, arithmetic, a placeholder, a cast that
+   fails, two types in a column, a session's own settings) is planned. Only how the batch is made changes,
+   never where it goes. `cargo test --lib literals` compares both paths value by value.
 
 405. **A temporary secret only an admin or the node's owner made reaches past the public internet**
    (`public.rs`, `ext::temporary`, `For::Public`): anyone else's is refused `PROVIDER credential_chain`
