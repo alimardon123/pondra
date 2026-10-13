@@ -3,11 +3,13 @@
 //! runs about 1.5x faster hot). Files never change, so nothing here goes stale.
 //!
 //! Filled in the background, one file at a time, within `PONDRA_HOT_GB` (default: a quarter of
-//! RAM; 0 turns it off), and only for a file a second scan came back to: data read once — a
-//! backfill, a consumer reading the log through, a one-off report — passes through without
-//! costing the CPU that decoding it would. When full, the cache makes room only by dropping
-//! columns nobody read for a minute: a working set bigger than memory is read from Parquet as
-//! before, instead of being churned through the cache.
+//! RAM; 0 turns it off), and only for a file a second scan came back to (a lake held in memory
+//! loads on the first, as it is there to be read again): data read once — a backfill, a consumer
+//! reading the log through, a one-off report — passes through without costing the CPU that
+//! decoding it would. A table whose columns are held keeps each file it writes as written (`put`),
+//! so its new files and a merge's are read from memory at once. When full, the cache makes room
+//! only by dropping columns nobody read for a minute: a working set bigger than memory is read
+//! from Parquet as before, instead of being churned through the cache.
 //!
 //! A file with a lineage (another engine's, or written without a leader) gets its rows' system
 //! columns from it here, and an append table's file with rows deleted is held without them: both
@@ -22,7 +24,7 @@
 use crate::store::{DataFile, Lake, Lineage, TableMeta};
 use anyhow::Result;
 use datafusion::arrow::array::{new_null_array, Array, ArrayData, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchOptions, TimestampMicrosecondArray};
-use datafusion::arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::file_format::options::ReadOptions;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
@@ -176,13 +178,13 @@ impl Hot {
         let guess = (file.bytes as usize).max(1 << 20) * 3; // decoded LZ4 Parquet: roughly 3x (checked after)
         // Queries come first: what they hold now is off the cache's budget, so a node under load
         // keeps its memory for them (both are bounded by `--memory-gb`).
-        let (reserved, limit) = lake.memory();
-        let room = self.max.min(limit.saturating_sub(reserved));
+        let room = self.room_for(&lake);
         let key = key(&file, deletes);
+        let memory = crate::store::in_memory(&lake.url);
         let fields: Vec<FieldRef> = {
             let mut s = self.state.lock().unwrap();
             let missing: Vec<FieldRef> = fields.into_iter().filter(|f| !s.cols.contains_key(&(key.clone(), f.name().clone()))).collect();
-            if missing.is_empty() || s.busy.contains(&key) || !s.twice(&key) || !s.room(guess, room) {
+            if missing.is_empty() || s.busy.contains(&key) || !(memory || s.twice(&key)) || !s.room(guess, room) {
                 return;
             }
             s.busy.insert(key.clone());
@@ -209,6 +211,77 @@ impl Hot {
             }
         });
     }
+
+    /// The most the cache may hold now: its budget, less what queries hold.
+    pub fn room_for(&self, lake: &Lake) -> usize {
+        let (reserved, limit) = lake.memory();
+        self.max.min(limit.saturating_sub(reserved))
+    }
+
+    /// The columns of `schema` (by name) that the table's files under `folder` are held with here,
+    /// each with the type it is held as: what a new file of the table keeps (`tier::Encoding`).
+    /// Empty when hot is off or none of the table is held.
+    pub fn columns(&self, folder: &str, schema: &Schema) -> Vec<FieldRef> {
+        if !self.on() {
+            return vec![];
+        }
+        let s = self.state.lock().unwrap();
+        let prefix = format!("data/{folder}/"); // (the slash: table `t` doesn't take `t2`'s files)
+        let files: Vec<&String> = s.rows.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(&prefix)).map(|(k, _)| k).collect();
+        schema
+            .fields()
+            .iter()
+            .filter_map(|f| {
+                let held = files.iter().find_map(|file| s.cols.get(&(file.to_string(), f.name().clone()))?.arrays.first().map(|a| a.data_type().clone()))?;
+                Some(Arc::new(Field::new(f.name(), held, true)))
+            })
+            .collect()
+    }
+
+    /// Holds the columns a write kept of the file it wrote at `path`: `columns`' fields, each with its
+    /// arrays in the order written. They are held as `decode` would hold them, so a scan reads the
+    /// file from here at once, and a merge's file takes the replaced files' place (`forget`), rather
+    /// than each new file being read cold twice first.
+    pub fn put(&self, path: &str, fields: &[FieldRef], columns: Vec<Vec<ArrayRef>>, room: usize) {
+        if !self.on() || fields.is_empty() {
+            return;
+        }
+        // The Parquet reader cuts a file into batches of `BATCH` rows, whatever its writes were cut at:
+        // a later `load` of more of its columns must find the same batches, or it gives up.
+        let Some(cut) = columns.iter().map(|arrays| cut_batches(arrays)).collect::<Option<Vec<_>>>() else { return };
+        let lens = |c: &[ArrayRef]| c.iter().map(|a| a.len()).collect::<Vec<usize>>();
+        let rows = lens(&cut[0]);
+        if cut.iter().any(|c| lens(c) != rows) {
+            return;
+        }
+        let held: Vec<(Vec<ArrayRef>, Option<Ranges>, usize)> = cut
+            .into_iter()
+            .map(|c| {
+                let ranges = ranges(&c);
+                let arrays = whole(c);
+                let bytes = size(&arrays);
+                (arrays, ranges, bytes)
+            })
+            .collect();
+        let total: usize = held.iter().map(|h| h.2).sum();
+        let mut s = self.state.lock().unwrap();
+        if s.rows.contains_key(path) || !s.room(total, room) {
+            return;
+        }
+        s.rows.insert(path.to_string(), rows);
+        for (f, (arrays, ranges, bytes)) in fields.iter().zip(held) {
+            s.used += bytes;
+            s.cols.insert((path.to_string(), f.name().clone()), Col { arrays: Arc::new(arrays), ranges, bytes, read: Instant::now() });
+        }
+    }
+}
+
+/// A column's arrays as batches of `BATCH` rows, the last one shorter: slices of one concatenated array.
+fn cut_batches(arrays: &[ArrayRef]) -> Option<Vec<ArrayRef>> {
+    let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+    let all = datafusion::arrow::compute::concat(&refs).ok()?;
+    let n = all.len();
+    Some((0..n).step_by(BATCH).map(|at| all.slice(at, BATCH.min(n - at))).collect())
 }
 
 impl State {
@@ -760,4 +833,41 @@ impl PruningStatistics for Skip {
     fn null_counts(&self, column: &datafusion::common::Column) -> Option<ArrayRef> { self.ranges(column.name()).map(|r| r[2].clone()) }
     fn row_counts(&self) -> Option<ArrayRef> { self.pieces.first().and_then(|(r, _)| r.keys().next().cloned()).and_then(|c| self.ranges(&c)).map(|r| r[3].clone()) }
     fn contained(&self, _: &datafusion::common::Column, _: &HashSet<datafusion::common::ScalarValue>) -> Option<BooleanArray> { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{AsArray, StringViewArray};
+    use datafusion::arrow::datatypes::Int64Type;
+
+    fn names_and_types(fields: Vec<FieldRef>) -> Vec<(String, DataType)> {
+        fields.iter().map(|f| (f.name().to_string(), f.data_type().clone())).collect()
+    }
+
+    #[test]
+    fn put_holds_a_file_in_the_readers_batches() {
+        let hot = Hot { max: 1 << 30, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
+        // Three writes of different sizes: the file is still read in batches of 8,192 rows.
+        let pieces = [(0i64, 5_000i64), (5_000, 20_000), (25_000, 3)];
+        let ints: Vec<ArrayRef> = pieces.iter().map(|&(from, n)| Arc::new(Int64Array::from_iter_values(from..from + n)) as ArrayRef).collect();
+        let strings: Vec<ArrayRef> = pieces.iter().map(|&(from, n)| Arc::new(StringViewArray::from_iter_values((from..from + n).map(|v| format!("s{v}")))) as ArrayRef).collect();
+        let fields: Vec<FieldRef> = vec![Arc::new(Field::new("i", DataType::Int64, true)), Arc::new(Field::new("s", DataType::Utf8View, true))];
+        hot.put("data/t/x.parquet", &fields, vec![ints, strings], 1 << 30);
+
+        let schema = Arc::new(Schema::new(fields.iter().map(|f| f.as_ref().clone()).collect::<Vec<Field>>()));
+        let (batches, ranges) = hot.get("data/t/x.parquet", &schema).expect("held");
+        assert_eq!(batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), [8192, 8192, 8192, 427]);
+        let values: Vec<i64> = batches.iter().flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec()).collect();
+        assert_eq!(values, (0..25_003).collect::<Vec<i64>>());
+        let texts: Vec<String> = batches.iter().flat_map(|b| b.column(1).as_string_view().iter().map(|s| s.unwrap_or_default().to_string()).collect::<Vec<_>>()).collect();
+        assert!(texts.iter().enumerate().all(|(i, s)| *s == format!("s{i}")));
+        assert!(ranges.get("i").is_some());
+        assert!(ranges.get("s").is_none());
+
+        // The table's folder holds them; another table whose name starts the same doesn't.
+        let held = hot.columns("t", &schema);
+        assert_eq!(names_and_types(held), vec![("i".to_string(), DataType::Int64), ("s".to_string(), DataType::Utf8View)]);
+        assert!(hot.columns("t2", &schema).is_empty());
+    }
 }

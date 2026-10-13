@@ -10,6 +10,8 @@ use crate::store::*;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use datafusion::arrow::array::{Array, ArrayRef};
+use datafusion::arrow::datatypes::FieldRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::parquet::arrow::ArrowWriter;
@@ -982,7 +984,8 @@ pub fn storable(batch: &RecordBatch) -> Result<RecordBatch> {
 pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys: &[String], stats: bool) -> Result<Option<DataFile>> {
     let Some(first) = batches.iter().find(|b| b.num_rows() > 0) else { return Ok(None) };
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
-    let mut file = Encoding::new(meta.as_ref(), first, keys, stats)?;
+    let hot = lake.hot.columns(meta.as_ref().map_or(table, |m| m.folder(table)), &first.schema());
+    let mut file = Encoding::new(meta.as_ref(), first, keys, stats, hot)?;
     let batches = batches.to_vec();
     let file = blocking(move || {
         batches.iter().try_for_each(|b| file.write(b))?;
@@ -1003,22 +1006,37 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + '
 /// out at 63.8, and were merged.
 const FILE_BYTES: usize = 128 << 20;
 
+/// Most of a file's hot columns kept while it is written (`Encoding::keep`): a bulk INSERT's partitions
+/// write their files at once, and these copies sit outside the cache's budget until the file is put.
+/// A bigger file is read from Parquet as before, and loaded for its next reads.
+const HOT_KEEP: usize = 64 << 20;
+
 /// A Parquet file being written a batch at a time (`write` on a blocking thread), with what its
-/// entry will say of it. It holds the file's encoded bytes, never its rows.
+/// entry will say of it. It holds the file's encoded bytes, never its rows, and the hot columns the
+/// table is held with: `hot` (each one's batch column index and the type it is held as) and `kept`
+/// (each one's arrays so far), which `put` hands to `hot::Hot::put`.
 struct Encoding {
     w: ArrowWriter<Vec<u8>>,
     ids: datafusion::arrow::datatypes::SchemaRef,
     rows: usize,
     sys: bool,
     seen: Option<(crate::manifest::Seen, crate::sketch::Sketches)>, // (`stats`: append tables)
+    hot: Vec<(usize, FieldRef)>,
+    kept: Vec<Vec<ArrayRef>>,
+    kept_bytes: usize,
 }
 
 impl Encoding {
-    /// A file of rows like `first`'s (it isn't written yet).
-    fn new(meta: Option<&TableMeta>, first: &RecordBatch, keys: &[String], stats: bool) -> Result<Self> {
+    /// A file of rows like `first`'s (it isn't written yet). `hot` are the table's columns held here
+    /// (`hot::Hot::columns`): a file whose rows lack one of them keeps none, and `load` reads it later.
+    fn new(meta: Option<&TableMeta>, first: &RecordBatch, keys: &[String], stats: bool, hot: Vec<FieldRef>) -> Result<Self> {
         let ids = field_ids(meta, &storable(&first.slice(0, 0))?.schema());
         let seen = stats.then(|| (crate::manifest::Seen::new(first.schema()), crate::sketch::Sketches::new(&first.schema())));
-        Ok(Encoding { w: writer(ids.clone(), keys)?, ids, rows: 0, sys: first.schema().index_of(crate::sys::ROW_ID).is_ok(), seen })
+        let schema = first.schema();
+        let at = |f: FieldRef| Some((schema.index_of(f.name()).ok()?, f));
+        let hot: Vec<(usize, FieldRef)> = hot.into_iter().map(at).collect::<Option<_>>().unwrap_or_default();
+        let kept = vec![vec![]; hot.len()];
+        Ok(Encoding { w: writer(ids.clone(), keys)?, ids, rows: 0, sys: schema.index_of(crate::sys::ROW_ID).is_ok(), seen, hot, kept, kept_bytes: 0 })
     }
 
     fn write(&mut self, b: &RecordBatch) -> Result<()> {
@@ -1026,9 +1044,27 @@ impl Encoding {
             seen.add(b)?;
             sketches.add(b);
         }
+        self.keep(b);
         self.w.write(&storable(b)?.with_schema(self.ids.clone())?)?;
         self.rows += b.num_rows();
         Ok(())
+    }
+
+    /// Keeps the batch's hot columns as the table holds them: the table's types, not `storable`'s text
+    /// for intervals. Past `HOT_KEEP`, or when a cast fails, none are kept (the file is read from Parquet).
+    fn keep(&mut self, b: &RecordBatch) {
+        let cols: Option<Vec<ArrayRef>> = self.hot.iter().map(|(i, f)| datafusion::arrow::compute::cast(b.column(*i), f.data_type()).ok()).collect();
+        let bytes: usize = cols.iter().flatten().map(|c| c.get_array_memory_size()).sum();
+        match cols {
+            Some(cols) if self.kept_bytes + bytes <= HOT_KEEP => {
+                self.kept_bytes += bytes;
+                self.kept.iter_mut().zip(cols).for_each(|(k, c)| k.push(c));
+            }
+            _ => {
+                self.hot.clear();
+                self.kept.clear();
+            }
+        }
     }
 
     /// Its size so far, encoded.
@@ -1047,12 +1083,19 @@ impl Encoding {
         Ok((buf, DataFile { rows: rows as u64, bytes, stats, nulls, sketch, sys, ..Default::default() }))
     }
 
-    /// The file finished and put in the table's folder.
-    async fn put(self, lake: &Lake, table: &str, meta: Option<&TableMeta>) -> Result<DataFile> {
+    /// The file finished and put in the table's folder, and its hot columns held there (a table whose
+    /// columns are in memory reads the new file from memory at once).
+    async fn put(mut self, lake: &Lake, table: &str, meta: Option<&TableMeta>) -> Result<DataFile> {
+        let hot: Vec<FieldRef> = self.hot.iter().map(|(_, f)| f.clone()).collect();
+        let kept = std::mem::take(&mut self.kept);
         let (buf, file) = blocking(move || self.finish()).await?;
         let path = format!("data/{}/{}.parquet", meta.map_or(table, |m| m.folder(table)), uuid::Uuid::new_v4());
         lake.put(&path, buf).await?;
         maybe_crash("after_parquet_put");
+        if !hot.is_empty() {
+            let (cache, room, held) = (lake.hot.clone(), lake.hot.room_for(lake), path.clone());
+            blocking(move || Ok(cache.put(&held, &hot, kept, room))).await?;
+        }
         Ok(DataFile { path, ..file })
     }
 }
@@ -1098,7 +1141,11 @@ pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBa
         }
         let mut file = match open.take() {
             Some(file) => file,
-            None => Encoding::new(meta.as_ref(), &b, keys, stats)?,
+            None => {
+                // (a file's hot columns are the table's held ones when it is opened)
+                let hot = lake.hot.columns(meta.as_ref().map_or(table, |m| m.folder(table)), &b.schema());
+                Encoding::new(meta.as_ref(), &b, keys, stats, hot)?
+            }
         };
         let file = blocking(move || file.write(&b).map(|_| file)).await?;
         match file.rows >= max_rows || file.bytes() >= FILE_BYTES {
@@ -1174,7 +1221,7 @@ mod tests {
             RecordBatch::try_new(schema.clone(), columns).unwrap()
         };
         let batches: Vec<RecordBatch> = [0, 300_000, 600_000].into_iter().map(batch).collect();
-        let mut file = Encoding::new(None, &batches[0], &["i".to_string()], true).unwrap();
+        let mut file = Encoding::new(None, &batches[0], &["i".to_string()], true, vec![]).unwrap();
         batches.iter().try_for_each(|b| file.write(b)).unwrap();
         let (buf, entry) = file.finish().unwrap();
         let groups = SerializedFileReader::new(bytes::Bytes::from(buf)).unwrap().metadata().num_row_groups();
