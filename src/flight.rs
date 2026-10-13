@@ -385,13 +385,34 @@ impl FlightSqlService for Sql {
         let open = self.0.open().await;
         let token = match self.0.auth.token_role(&password) {
             _ if open => password,
-            Role::None => match crate::users::sign_in(&self.0.lake, &self.0.auth, &user, &password).await {
-                Some(p) if p.role > Role::None => crate::users::session(&self.0.lake, &p.name).await.map_err(status)?.0,
-                _ => {
-                    crate::audit::refused(&self.0, &user, "flight", req.extensions().get::<crate::tls::Peer>().map(|p| p.addr), "sign in", "wrong user name or password");
-                    return Err(Status::unauthenticated("wrong user name or password"));
+            Role::None => {
+                // (a user's password crosses only TLS from another machine, as `tls.rs` says; a token may. The
+                // connection's `Peer` says both, as HTTP's does, and no peer at all refuses a password.)
+                let peer = req.extensions().get::<crate::tls::Peer>().copied();
+                let from = peer.map(|p| p.addr);
+                let ip = from.map(|a| a.ip());
+                let by_token = crate::users::is_token(&user, &password);
+                if !by_token && !peer.is_some_and(|p| p.may_send_password()) {
+                    return Err(Status::unauthenticated(crate::tls::PASSWORD_PLAIN));
                 }
-            },
+                if let Some(wait) = crate::auth::guessing(ip, &user) {
+                    let why = crate::auth::guessing_says(&user, wait);
+                    crate::audit::refused(&self.0, &user, "flight", from, "sign in", &why);
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (as a wrong guess does)
+                    return Err(Status::unauthenticated(why));
+                }
+                match crate::users::sign_in(&self.0.lake, &self.0.auth, &user, &password).await {
+                    Some(p) if p.role > Role::None => crate::users::session(&self.0.lake, &p.name).await.map_err(status)?.0,
+                    _ => {
+                        if !by_token {
+                            crate::auth::guessed(ip, &user); // (a token isn't guessed: it is random)
+                        }
+                        crate::audit::refused(&self.0, &user, "flight", from, "sign in", "wrong user name or password");
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time, as HTTP's and Postgres's do)
+                        return Err(Status::unauthenticated("wrong user name or password"));
+                    }
+                }
+            }
             _ => password,
         };
         let mut res: Response<Out<HandshakeResponse>> = Response::new(Box::pin(futures::stream::iter([Ok(HandshakeResponse { protocol_version: 0, payload: token.clone().into_bytes().into() })])));

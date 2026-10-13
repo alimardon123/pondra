@@ -8817,8 +8817,10 @@ def signed():
 def guesses():
     """A limit on failed sign-ins per address and user name (S30, invariant 381): ten wrong passwords for a
     user from one address in a minute, and the eleventh is refused at once (429, Retry-After), the right
-    password too, on HTTP Basic, on POST /login and on Kafka's SASL/PLAIN, one count across them. Another user
-    from the same address still signs in, and the same user from another address does; a bearer token isn't counted. Behind a proxy of
+    password too, on HTTP Basic, on POST /login, on Kafka's SASL/PLAIN, on the Postgres port and on Flight's Basic
+    handshake, one count across them (the Postgres port 28P01 and Flight UNAUTHENTICATED for the ten, then 28000
+    and refused). Another user from the same address still signs in, and the same user from another address does;
+    a bearer token, or a token sent as a password, isn't counted. Behind a proxy of
     PONDRA_TRUSTED_PROXIES and behind `pondra serve --lakes`, each client is counted by its own address, and
     only a page on this machine saves the console's settings or chooses the Python (S28)."""
     import base64, socket
@@ -8893,6 +8895,67 @@ def guesses():
         refused = [None, "still serving after 30 s"]
     info["a proxy named by its host name"] = refused
     checks["PONDRA_TRUSTED_PROXIES with a host name: refused at start, naming it"] = refused[0] not in (0, None) and "PONDRA_TRUSTED_PROXIES" in refused[1] and "lb.internal" in refused[1]
+    # The Postgres port and Flight's Basic handshake count the same way (pg.rs, flight.rs): ten wrong passwords for
+    # dana (Postgres) and fran (Flight) from this address are 28P01 and UNAUTHENTICATED, the eleventh is refused at
+    # once saying why, and so is the right password; eli signs in at once. A token isn't counted: ten wrong tokens
+    # for svc stay wrong passwords, and svc's right token signs in. Each refusal is audited.
+    import psycopg, adbc_driver_flightsql.dbapi as adbc
+    c = Node(new_lake(), P + 3, admin_token=token, pg=f"127.0.0.1:{P + 13}", flight=f"127.0.0.1:{P + 33}").start()
+    try:
+        for q in ["CREATE USER dana PASSWORD 'dana-password-1'", "CREATE USER eli PASSWORD 'eli-password-1'", "CREATE USER fran PASSWORD 'fran-password-1'", "CREATE USER svc"]:
+            reply(P + 3, "POST", "/sql", q.encode(), headers=bearer)
+        svc_token = call(P + 3, "POST", "/sql", b"CREATE TOKEN pg FOR USER svc", headers=bearer)["token"]
+        def pg_said(user, password):  # ("ok", or the server's message: psycopg gives no SQLSTATE for a failed connection)
+            try:
+                with psycopg.connect(f"host=127.0.0.1 port={P + 13} user={user} password={password} dbname=lake connect_timeout=10") as conn:
+                    conn.execute("SELECT 1")
+                return "ok"
+            except psycopg.Error as e:
+                return str(e).strip()
+        def fl_said(user, password):  # ("ok", or the error's text, with the status's name in it)
+            try:
+                conn = adbc.connect(f"grpc://127.0.0.1:{P + 33}", db_kwargs={"username": user, "password": password})
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT 1 AS one")
+                    cur.fetchall()
+                    cur.close()
+                finally:
+                    conn.close()
+                return "ok"
+            except Exception as e:
+                return str(e).strip()
+        pg_wrong = [pg_said("dana", f"guess-{i}") for i in range(10)]
+        pg_eleventh, pg_right, pg_eli = pg_said("dana", "guess-11"), pg_said("dana", "dana-password-1"), pg_said("eli", "eli-password-1")
+        fl_wrong = [fl_said("fran", f"guess-{i}") for i in range(10)]
+        fl_eleventh, fl_right, fl_eli = fl_said("fran", "guess-11"), fl_said("fran", "fran-password-1"), fl_said("eli", "eli-password-1")
+        svc_pg = [pg_said("svc", f"pt_c3Zj_wrong-{i}") for i in range(11)]
+        svc_fl = [fl_said("svc", f"pt_c3Zj_wrong-{i}") for i in range(11)]
+        svc_right = [pg_said("svc", svc_token), fl_said("svc", svc_token)]
+        logged = []
+        for _ in range(40):  # (written a moment later, in batches)
+            logged = call(P + 3, "POST", "/sql", b"SELECT door, \"user\", message FROM pondra.audit WHERE outcome = 'refused' ORDER BY at", headers=bearer)
+            if sum((r["message"] or "").startswith("too many") for r in logged) >= 4:
+                break
+            time.sleep(0.5)
+        audited = sorted((r["door"], r["user"]) for r in logged if (r["message"] or "").startswith("too many"))
+        info["postgres and flight"] = {"pg wrong": pg_wrong[0][:140], "pg eleventh": pg_eleventh[:140], "pg right": pg_right[:140], "pg eli": pg_eli,
+                                       "flight wrong": fl_wrong[0][:140], "flight eleventh": fl_eleventh[:140], "flight right": fl_right[:140], "flight eli": fl_eli,
+                                       "svc": [svc_pg[0][:140], svc_fl[0][:140], svc_right], "audited": audited}
+        too_many = lambda who, text: f"too many failed sign-ins for {who} from this address" in text
+        checks["Postgres: ten wrong passwords for dana are refused as wrong (FATAL: password authentication failed); the eleventh is refused saying why, and so is the right password"] = \
+            all("FATAL" in w and 'uthentication failed for user "dana"' in w for w in pg_wrong) and "FATAL" in pg_eleventh and too_many("dana", pg_eleventh) \
+            and "FATAL" in pg_right and too_many("dana", pg_right)
+        checks["Postgres: another user, eli, signs in at once"] = pg_eli == "ok"
+        checks["Flight: the same for fran over the Basic handshake: ten wrong passwords refused as wrong, the eleventh and the right one saying why"] = \
+            all("wrong user name or password" in w for w in fl_wrong) and too_many("fran", fl_eleventh) and too_many("fran", fl_right)
+        checks["Flight: another user, eli, signs in at once"] = fl_eli == "ok"
+        checks["a token isn't counted: eleven wrong tokens for svc on each door stay wrong passwords, and its right token signs in"] = \
+            all('uthentication failed for user "svc"' in w for w in svc_pg) and all("wrong user name or password" in w for w in svc_fl) and svc_right == ["ok", "ok"]
+        checks["each refusal is audited: postgres dana and flight fran, the eleventh and the right password (pondra.audit)"] = \
+            audited == [("flight", "fran"), ("flight", "fran"), ("postgres", "dana"), ("postgres", "dana")]
+    finally:
+        c.kill()
     if isinstance(other, str):
         ok = all(checks.values())
         print(json.dumps({"guesses": checks, "ok": ok, "info": info}, indent=1, default=str))
@@ -12139,6 +12202,276 @@ def uuids():
     if not ok:
         sys.exit(1)
     return f"{sum(checks.values())} of {len(checks)} UUID checks"
+
+
+# The sample data the BI tools' statements were captured against (copied from /tmp/claude-0/bi/PREAMBLE.md, "Sample
+# data"; split at each ';'), then the role and the sequence the tools' statements name.
+BI_SAMPLE = """
+CREATE TABLE sales (id BIGINT PRIMARY KEY, ts TIMESTAMP NOT NULL, region TEXT, product TEXT, amount DOUBLE PRECISION, qty INTEGER, ref UUID DEFAULT gen_random_uuid(), note VARCHAR(40));
+INSERT INTO sales (id, ts, region, product, amount, qty, note)
+  SELECT value, TIMESTAMP '2026-01-01 00:00:00' + value * INTERVAL '7 minutes',
+         CASE value % 4 WHEN 0 THEN 'north' WHEN 1 THEN 'south' WHEN 2 THEN 'east' ELSE 'west' END,
+         'p' || (value % 13), (value % 1000) / 10.0, CAST(value % 7 AS INTEGER), NULL
+  FROM generate_series(1, 20000);
+CREATE TABLE regions (region TEXT PRIMARY KEY, manager TEXT);
+INSERT INTO regions VALUES ('north','Ann'),('south','Bo'),('east','Cy'),('west','Di');
+CREATE SCHEMA crm;
+CREATE TABLE crm.customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL, created DATE);
+INSERT INTO crm.customers VALUES (1,'a','2026-01-02'),(2,'b','2026-02-03');
+CREATE VIEW sales_by_region AS SELECT region, sum(amount) AS total, count(*) AS n FROM sales GROUP BY region;
+COMMENT ON TABLE sales IS 'one row a sale';
+COMMENT ON COLUMN sales.amount IS 'in euros';
+CREATE ROLE analyst;
+GRANT SELECT ON sales TO analyst;
+CREATE SEQUENCE sales_seq;
+"""
+
+# The four tools, with the versions their run scripts give. Each tool's statements go over one connection, as its user
+# and database (an open node takes any user name).
+BI_TOOLS = {"grafana": "Grafana 13.2.3", "metabase": "Metabase 0.64.1.6", "superset": "Superset 6.1.0", "dbeaver": "DBeaver 2.0.49"}
+
+# Statements Postgres 16 itself refuses (psql at 127.0.0.1:5416 on the same data): key -> (why, the SQLSTATE Postgres gives).
+# Pondra must refuse each one too, with the same SQLSTATE.
+BI_PG_REFUSES = {
+    "grafana:18": ("Grafana's $__interval macro, sent unquoted: 1d is a number with letters after it", "42601"),
+    "dbeaver:G11": ("pgAgent's job list: the pgagent schema is not on this server", "42P01"),
+    "dbeaver:G12": ("pgAgent's job classes: the same missing schema", "42P01"),
+}
+
+# Statements Pondra can't answer, where the fix belongs elsewhere: key -> why. Each one is kept as a failure in info.
+BI_EXCEPTIONS = {
+    "dbeaver:D5": "row_number() ... AS attnum beside a.*, which has an attnum of its own: DataFusion's schema then holds "
+                   "attnum both qualified (a.attnum) and unqualified, so Pondra answers XX000 'ambiguous'",
+}
+
+# What Postgres 16 answers on the same data, written as literals (computed on a Postgres 16.15 server, database bi). One
+# difference is Pondra's on purpose: a VARCHAR(n) column is text, as in DuckDB (Pondra keeps strings as one type and no
+# declared length; the `pg_catalog` section checks it), so `note` reads text where Postgres 16 says character varying.
+BI_GRAFANA_TABLES = ["regions", "sales", "sales_by_region", "crm.customers"]  # showTables, in the order its ORDER BY gives
+BI_GRAFANA_SALES = [("amount", "double precision"), ("id", "bigint"), ("note", "text"), ("product", "text"),
+                    ("qty", "integer"), ("ref", "uuid"), ("region", "text"), ("ts", "timestamp without time zone")]
+BI_METABASE_TABLES = [("crm", "customers", "TABLE", None), ("public", "regions", "TABLE", None),
+                      ("public", "sales", "TABLE", "one row a sale"), ("public", "sales_by_region", "VIEW", None)]
+BI_METABASE_SALES = [("id", "int8", 0, True, None), ("ts", "timestamp", 1, False, None), ("region", "text", 2, False, None),
+                     ("product", "text", 3, False, None), ("amount", "float8", 4, False, "in euros"),
+                     ("qty", "int4", 5, False, None), ("ref", "uuid", 6, False, None), ("note", "text", 7, False, None)]
+# Superset's time-range charts: [row count, digest] (bi_digest), by statement key.
+BI_SUPERSET = {"superset:45": ("day", 356, "9cbded7090574f0e"), "superset:46": ("week", 56, "4149781711f54944"),
+               "superset:47": ("month", 12, "ac21e38aff619dea"), "superset:48": ("hour", 8544, "4686040d6f2da882"),
+               "superset:49": ("year", 4, "2c3b27d88ad11053"), "superset:50": ("quarter", 4, "2c3b27d88ad11053")}
+BI_TYPE_NAMES = ["bool", "bytea", "char", "date", "float4", "float8", "int2", "int4", "int8", "interval", "json", "jsonb",
+                 "numeric", "text", "timestamp", "timestamptz", "uuid", "varchar"]
+BI_TYPE_REPEATS = {"_pg_user_mappings": 2}  # the one name Postgres 16 lists twice (in two schemas); every other name once
+TS = "TIMESTAMP '2026-01-07 13:05:09.123456'"  # (a Wednesday)
+BI_TO_CHAR = [(f"SELECT to_char({TS}, '{form}')", text) for form, text in [
+    ("YYYY-MM-DD HH24:MI:SS", "2026-01-07 13:05:09"), ("YYYY-MM-DD HH24:MI:SS.US", "2026-01-07 13:05:09.123456"),
+    ("DD Mon YYYY", "07 Jan 2026"), ("Day", "Wednesday"), ("yyyy-mm-dd", "2026-01-07"), ("FMMonth", "January"),
+    ("HH12:MI AM", "01:05 PM"), ("IYYY-IW", "2026-02"), ("Q", "1"), ('YYYY"Q"Q', "2026Q1")]]
+BI_TO_DATE = [
+    ("SELECT to_char(to_date('07 Jan 2026', 'DD Mon YYYY'), 'YYYY-MM-DD')", "2026-01-07"),
+    ("SELECT to_char(to_timestamp('2026-01-07 13:05:09', 'YYYY-MM-DD HH24:MI:SS'), 'YYYY-MM-DD HH24:MI:SS')", "2026-01-07 13:05:09")]
+BI_HELPERS = [
+    ("SELECT format('%I.%I', 'crm', 'Sales')", 'crm."Sales"'),
+    ("SELECT format('%s|%L|%L', 'a', NULL, 'it''s')", "a|NULL|'it''s'"),
+    ("SELECT quote_ident('Sales')", '"Sales"'),
+    ("SELECT quote_literal('a\\b')", r"E'a\\b'"),
+    ("SELECT quote_nullable(NULL)", "NULL"),
+    ("SELECT array_to_string(parse_ident('crm.\"Sales\"'), '|')", "crm|Sales"),  # (parse_ident's answer, as its parts)
+]
+
+
+def bi_digest(rows):
+    """[row count, the first 16 hex digits of sha256]: each row's values joined by '|' (a float rounded to 6 places,
+    a timestamp with a zone taken as UTC, a date as midnight), the lines sorted and joined by newlines. Postgres 16's
+    answers were digested the same way, so the two can be compared without writing out every row."""
+    import datetime, decimal, hashlib
+
+    def text(v):
+        if isinstance(v, bool):
+            return str(v)
+        if isinstance(v, (int, float, decimal.Decimal)):
+            return repr(round(float(v), 6))
+        if isinstance(v, datetime.datetime):
+            if v.tzinfo is not None:
+                v = v.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            return v.isoformat()
+        if isinstance(v, datetime.date):
+            return v.isoformat() + "T00:00:00"
+        return "" if v is None else str(v)
+
+    lines = sorted("|".join(text(v) for v in r) for r in rows)
+    return [len(lines), hashlib.sha256("\n".join(lines).encode()).hexdigest()[:16]]
+
+
+def bi():
+    """What Grafana, Metabase, Superset and DBeaver send, word for word: tools/bi_statements.json holds every distinct
+    statement the four tools sent to the Postgres port (with their parameters, DBeaver's `?` as `$n`). The section loads
+    the sample data, then runs each statement as its tool did, one connection a tool, and checks that each answers, that
+    the statements Postgres 16 refuses are refused with its SQLSTATE, and that what the tools read is what Postgres 16
+    gives on the same data: Grafana's table and column lists, Metabase's table and field sync, Superset's time-range
+    charts (six grains and a DATE range, as digests of the rows) and pgjdbc's type-name lookups, which give one row a
+    type name. The to_char, to_date, to_timestamp, format, quote and parse_ident answers are Postgres 16's, written in."""
+    import collections, psycopg
+
+    corpus = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bi_statements.json"), encoding="utf-8"))
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 10
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    checks, info, results, refused = {}, {}, {}, {}
+    node = extra = None
+
+    def check(name, fn):
+        """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def connect():
+        return psycopg.connect(url, autocommit=True, cursor_factory=psycopg.RawCursor)
+
+    def failed(conn, x):
+        """The SQLSTATE and the start of the error. A transaction the statement broke is ended, so the next one stands alone."""
+        if conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
+            conn.execute("ROLLBACK")
+        return f"{x.sqlstate or type(x).__name__}: {str(x)[:300]}"
+
+    def run(conn, e):
+        """One statement as its tool sent it: its parameters, with a lookup's answer read on this same connection."""
+        params = []
+        for p in e.get("params", []):
+            if isinstance(p, dict) and "lookup" in p:
+                found = conn.execute(p["lookup"]).fetchall()
+                p = found[0][0] if found else None
+            params.append(p)
+        cur = conn.cursor()
+        if params:
+            cur.execute(e["sql"], params)
+        else:
+            cur.execute(e["sql"])
+        return cur.fetchall() if cur.description else None
+
+    def load():
+        """The sample data, its role and its sequence, one statement at a time: every one that answers counts."""
+        errors = []
+        with connect() as c:
+            for s in (x.strip() for x in BI_SAMPLE.split(";")):
+                if s:
+                    try:
+                        c.execute(s)
+                    except psycopg.Error as x:
+                        errors.append(f"{s[:70]}: {failed(c, x)}")
+        if errors:
+            info["sample data errors"] = errors
+        return not errors
+
+    def answer_all():
+        """Every corpus statement, per tool over one connection, in the order the tool sent it."""
+        for tool in BI_TOOLS:
+            conn = connect()
+            try:
+                for e in (x for x in corpus if x["tool"] == tool):
+                    key = e["key"]
+                    try:
+                        results[key] = run(conn, e)
+                        if key in BI_PG_REFUSES:
+                            refused[key] = None
+                            info.setdefault("postgres refuses", {})[key] = {"why": BI_PG_REFUSES[key][0], "pondra": "answered"}
+                        elif key in BI_EXCEPTIONS:
+                            info.setdefault("exceptions", {})[key] = {"why": BI_EXCEPTIONS[key], "pondra": "answered"}
+                    except psycopg.Error as x:
+                        why = failed(conn, x)
+                        if key in BI_PG_REFUSES:
+                            refused[key] = x.sqlstate
+                            info.setdefault("postgres refuses", {})[key] = {"why": BI_PG_REFUSES[key][0], "pondra": why}
+                        elif key in BI_EXCEPTIONS:
+                            info.setdefault("exceptions", {})[key] = {"why": BI_EXCEPTIONS[key], "pondra": why}
+                        else:
+                            info[key] = why
+            finally:
+                conn.close()
+
+    def same(pairs, label):
+        """Each statement's one value against Postgres 16's text; the ones that differ are kept in info under label."""
+        differ = []
+        for sql, want in pairs:
+            try:
+                got = extra.execute(sql).fetchone()[0]
+            except psycopg.Error as x:
+                got = failed(extra, x)
+            if got != want:
+                differ.append({"sql": sql, "postgres": want, "pondra": got})
+        if differ:
+            info[label] = differ
+        return not differ
+
+    def type_names_once():
+        """pgjdbc's type cache: each common type name once, and no name more often than Postgres 16 lists it."""
+        counts = collections.Counter(r[2] for r in results["dbeaver:D6"])
+        return all(counts[n] == 1 for n in BI_TYPE_NAMES) and all(v <= BI_TYPE_REPEATS.get(k, 1) for k, v in counts.items())
+
+    try:
+        node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+        check("the sample data loads: its tables, view, comments, role and sequence (every statement answers)", load)
+        answer_all()
+        extra = connect()
+        d8 = next(e for e in corpus if e["key"] == "dbeaver:D8")
+        try:
+            results["dbeaver:D8 int4"] = extra.execute(d8["sql"], ["int4"]).fetchall()
+        except psycopg.Error as x:
+            info["dbeaver:D8 int4"] = failed(extra, x)
+
+        counts = {}
+        for tool, version in BI_TOOLS.items():
+            keys = [e["key"] for e in corpus if e["tool"] == tool]
+            answering = [k for k in keys if k not in BI_PG_REFUSES and k not in BI_EXCEPTIONS]
+            counts[tool] = {"statements": len(keys), "answering": len(answering),
+                            "postgres refuses": [k for k in keys if k in BI_PG_REFUSES],
+                            "exceptions": [k for k in keys if k in BI_EXCEPTIONS]}
+            n = len(answering)
+            checks[f"every statement {version} sends answers ({n} of {n})"] = all(k in results for k in answering)
+        info["corpus"] = counts
+        n = len(BI_PG_REFUSES)
+        checks[f"statements Postgres 16 refuses are refused too, with the same SQLSTATE ({n} of {n})"] = all(
+            refused.get(k) == code for k, (_, code) in BI_PG_REFUSES.items())
+
+        check("Grafana's table list (showTables) gives regions, sales, sales_by_region and crm.customers, in Postgres 16's order",
+              lambda: [r[0] for r in results["grafana:21"]] == BI_GRAFANA_TABLES)
+        check("Grafana's column list for sales (getSchema with parse_ident('sales')) gives its 8 columns with Postgres 16's types",
+              lambda: sorted(map(tuple, results["grafana:22"])) == sorted(BI_GRAFANA_SALES))
+        check("Metabase's table sync (statement 11) gives sales, regions, sales_by_region and crm.customers with Postgres 16's "
+              "types and comments, and sales' estimated row count is not NULL",
+              lambda: [tuple(r[:4]) for r in results["metabase:sync-11"]] == BI_METABASE_TABLES
+              and any(r[0] == "public" and r[1] == "sales" and r[4] is not None for r in results["metabase:sync-11"]))
+        check("Metabase's field sync (statement 13) gives each column of sales its database type (int8, timestamp, text, float8, "
+              "int4, uuid; a VARCHAR(n) text), pk? true for id only, and amount's comment",
+              lambda: [(r[0], r[1], r[2], r[5], r[6]) for r in results["metabase:sync-13"]
+                       if r[3] == "public" and r[4] == "sales"] == BI_METABASE_SALES)
+        for key, (grain, count, digest) in BI_SUPERSET.items():
+            check(f"Superset's {grain} time-range chart (TO_TIMESTAMP) gives the rows Postgres 16 gives (sorted, values rounded to 6 places)",
+                  lambda key=key, count=count, digest=digest: bi_digest(results[key]) == [count, digest])
+        check("Superset's month chart on crm.customers with a DATE time range (TO_DATE) gives the rows Postgres 16 gives",
+              lambda: bi_digest(results["superset:64"]) == [2, "5f3d2dc382607bc9"])
+        check("pgjdbc's type cache (DBeaver D6) has one row per type name, as Postgres 16's does (its one repeat, _pg_user_mappings, twice)",
+              type_names_once)
+        check("pgjdbc's oid lookup (DBeaver D8) finds int4 as one row and no type named mood, as Postgres 16 does",
+              lambda: [r[1] for r in results["dbeaver:D8 int4"]] == ["int4"] and results["dbeaver:D8"] == [])
+        check("to_char gives Postgres 16's text for ten templates, from YYYY-MM-DD HH24:MI:SS to YYYY\"Q\"Q",
+              lambda: same(BI_TO_CHAR, "to_char"))
+        check("to_date and to_timestamp read their text as Postgres 16 does", lambda: same(BI_TO_DATE, "to_date and to_timestamp"))
+        check("format, quote_ident, quote_literal, quote_nullable and parse_ident give Postgres 16's answers",
+              lambda: same(BI_HELPERS, "format and quoting"))
+    finally:
+        if extra is not None:
+            extra.close()
+        if node is not None:
+            node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"bi": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} BI checks"
 
 
 # The object kinds `registry()` doesn't make itself, and where each is checked (grepped: each named
@@ -16193,7 +16526,7 @@ def pkey():
 # About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
 # prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
 # suite in parts side by side that end together. A section not listed counts as 5 s.
-SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20, "guesses": 15, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
+SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20, "guesses": 30, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "measures": 120, "facts": 90, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
         "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "ddlgaps": 40, "sqla": 30, "unique_doors": 60, "pkey": 60}
@@ -16201,7 +16534,7 @@ SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20,
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, bi, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -16233,7 +16566,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "bi", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -16246,7 +16579,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "bi": bi, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

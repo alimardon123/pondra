@@ -1244,7 +1244,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             j!({"dropped": column})
         }
         Change::Type(sql_type) => {
-            let uuid = m.sql_types.get(&stored).is_some_and(|t| t == "uuid");
+            let uuid = m.uuid(&stored);
             if sql_type.trim().eq_ignore_ascii_case("uuid") {
                 if !uuid {
                     return Err(crate::codes::coded("42804", format!("{column} can't become a uuid: a column is a uuid only from when it is made, since the rows there were never checked as uuids (a new UUID column can take them: UPDATE … SET new = {column}::uuid)")));

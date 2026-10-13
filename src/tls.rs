@@ -203,8 +203,8 @@ fn named(headers: &axum::http::HeaderMap, key: Option<&str>) -> Option<std::net:
 
 /// May a password cross a connection from `addr`? Over TLS, from this machine, or with no TLS set up at
 /// all. Under `PONDRA_TLS=optional` a plain connection from another machine may carry a token, never a
-/// password. Kafka's SASL/PLAIN and Flight's Basic handshake call it too.
-#[allow(dead_code)] // (no caller yet: the Kafka and Flight handshakes are the next to take it)
+/// password. Postgres's cleartext sign-in calls it (`pg.rs`); Flight's Basic handshake and Kafka's SASL/PLAIN
+/// use its `Peer`'s method, the same rule (`Peer::may_send_password`).
 pub fn may_send_password(secure: bool, addr: SocketAddr) -> bool { password_ok(secure, addr.ip().is_loopback(), tls().is_some()) }
 
 /// The rule behind both of `may_send_password`, on what they know (a plain function, so a test can

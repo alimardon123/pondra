@@ -1,0 +1,1521 @@
+[
+ {
+  "key": "grafana:01",
+  "tool": "grafana",
+  "purpose": "panel: daily sum, range as text",
+  "sql": "SELECT floor(extract(epoch from ts)/86400)*86400 AS \"time\", sum(amount) AS total FROM sales WHERE ts BETWEEN '2026-01-01T00:00:00Z' AND '2026-03-31T23:59:59.999Z' GROUP BY 1 ORDER BY 1"
+ },
+ {
+  "key": "grafana:02",
+  "tool": "grafana",
+  "purpose": "panel: daily sum, range as timestamps",
+  "sql": "SELECT floor(extract(epoch from ts)/86400)*86400 AS \"time\", sum(amount) AS total FROM sales WHERE ts >= TIMESTAMP '2026-01-01 00:00:00' AND ts <= TIMESTAMP '2026-03-31 23:59:59.999' GROUP BY 1 ORDER BY 1"
+ },
+ {
+  "key": "grafana:03",
+  "tool": "grafana",
+  "purpose": "panel: daily sum by region (metric column)",
+  "sql": "SELECT floor(extract(epoch from ts)/86400)*86400 AS \"time\", region AS metric, sum(amount) AS value FROM sales WHERE ts BETWEEN '2026-01-01T00:00:00Z' AND '2026-03-31T23:59:59.999Z' GROUP BY 1, 2 ORDER BY 1"
+ },
+ {
+  "key": "grafana:04",
+  "tool": "grafana",
+  "purpose": "panel: daily sum by region",
+  "sql": "SELECT floor(extract(epoch from ts)/86400)*86400 AS \"time\", region, sum(amount) FROM sales WHERE ts >= TIMESTAMP '2026-01-01 00:00:00' AND ts <= TIMESTAMP '2026-03-31 23:59:59.999' GROUP BY 1, 2 ORDER BY 1, 2"
+ },
+ {
+  "key": "grafana:05",
+  "tool": "grafana",
+  "purpose": "panel: hourly sum for product p1, range as text",
+  "sql": "SELECT floor(extract(epoch from ts)/3600)*3600 AS \"time\", sum(amount) AS total FROM sales WHERE ts BETWEEN '2026-01-01T00:00:00Z' AND '2026-03-31T23:59:59.999Z' AND product = 'p1' GROUP BY 1 ORDER BY 1"
+ },
+ {
+  "key": "grafana:06",
+  "tool": "grafana",
+  "purpose": "panel: hourly sum for product p1, range as timestamps",
+  "sql": "SELECT floor(extract(epoch from ts)/3600)*3600 AS \"time\", sum(amount) FROM sales WHERE ts >= TIMESTAMP '2026-01-01 00:00:00' AND ts <= TIMESTAMP '2026-03-31 23:59:59.999' AND product = 'p1' GROUP BY 1 ORDER BY 1"
+ },
+ {
+  "key": "grafana:07",
+  "tool": "grafana",
+  "purpose": "panel: hourly sum, range as text",
+  "sql": "SELECT floor(extract(epoch from ts)/3600)*3600 AS \"time\", sum(amount) AS total FROM sales WHERE ts BETWEEN '2026-01-01T00:00:00Z' AND '2026-03-31T23:59:59.999Z' GROUP BY 1 ORDER BY 1"
+ },
+ {
+  "key": "grafana:08",
+  "tool": "grafana",
+  "purpose": "panel: hourly sum, range as timestamps",
+  "sql": "SELECT floor(extract(epoch from ts)/3600)*3600 AS \"time\", sum(amount) FROM sales WHERE ts >= TIMESTAMP '2026-01-01 00:00:00' AND ts <= TIMESTAMP '2026-03-31 23:59:59.999' GROUP BY 1 ORDER BY 1"
+ },
+ {
+  "key": "grafana:09",
+  "tool": "grafana",
+  "purpose": "panel: daily sum from epoch seconds (subquery)",
+  "sql": "SELECT floor((e)/86400)*86400 AS \"time\", sum(amount) AS total FROM (SELECT CAST(EXTRACT(EPOCH FROM ts) AS BIGINT) AS e, amount FROM sales) t WHERE e >= 1767225600 AND e <= 1775001599 GROUP BY 1 ORDER BY 1"
+ },
+ {
+  "key": "grafana:10",
+  "tool": "grafana",
+  "purpose": "panel: daily sum from epoch seconds",
+  "sql": "SELECT floor(e/86400)*86400 AS \"time\", sum(amount) FROM (SELECT CAST(EXTRACT(EPOCH FROM ts) AS BIGINT) AS e, amount FROM sales) t WHERE e >= 1767225600 AND e <= 1775001599 GROUP BY 1 ORDER BY 1"
+ },
+ {
+  "key": "grafana:11",
+  "tool": "grafana",
+  "purpose": "table panel: count and mean by region, range as text",
+  "sql": "SELECT region, count(*) AS n, avg(amount) AS mean FROM sales WHERE ts BETWEEN '2026-01-01T00:00:00Z' AND '2026-03-31T23:59:59.999Z' GROUP BY region ORDER BY region"
+ },
+ {
+  "key": "grafana:12",
+  "tool": "grafana",
+  "purpose": "table panel: count and mean by region, range as timestamps",
+  "sql": "SELECT region, count(*) AS n, avg(amount) AS mean FROM sales WHERE ts >= TIMESTAMP '2026-01-01 00:00:00' AND ts <= TIMESTAMP '2026-03-31 23:59:59.999' GROUP BY region ORDER BY region"
+ },
+ {
+  "key": "grafana:13",
+  "tool": "grafana",
+  "purpose": "template variable: the regions",
+  "sql": "SELECT DISTINCT region FROM sales ORDER BY 1"
+ },
+ {
+  "key": "grafana:14",
+  "tool": "grafana",
+  "purpose": "panel: the range as text beside a count",
+  "sql": "SELECT '2026-01-01T00:00:00Z' AS from_ts, '2026-03-31T23:59:59.999Z' AS to_ts, count(*) AS n FROM sales WHERE ts BETWEEN '2026-01-01T00:00:00Z' AND '2026-03-31T23:59:59.999Z'"
+ },
+ {
+  "key": "grafana:15",
+  "tool": "grafana",
+  "purpose": "panel: the range as timestamps beside a count",
+  "sql": "SELECT '2026-01-01T00:00:00Z' AS from_ts, '2026-03-31T23:59:59.999Z' AS to_ts, count(*) AS n FROM sales WHERE ts >= TIMESTAMP '2026-01-01 00:00:00' AND ts <= TIMESTAMP '2026-03-31 23:59:59.999'"
+ },
+ {
+  "key": "grafana:16",
+  "tool": "grafana",
+  "purpose": "panel: hourly count",
+  "sql": "SELECT floor(extract(epoch from ts)/3600)*3600 AS \"time\", count(*) AS n FROM sales WHERE ts BETWEEN '2026-01-01T00:00:00Z' AND '2026-03-31T23:59:59.999Z' GROUP BY 1 ORDER BY 1"
+ },
+ {
+  "key": "grafana:17",
+  "tool": "grafana",
+  "purpose": "macro $__interval quoted, as a value",
+  "sql": "SELECT '1d' AS iv, count(*) AS n FROM sales WHERE ts BETWEEN '2026-01-01T00:00:00Z' AND '2026-03-31T23:59:59.999Z'"
+ },
+ {
+  "key": "grafana:18",
+  "tool": "grafana",
+  "purpose": "macro $__interval bare (Grafana sends 1d unquoted)",
+  "sql": "SELECT 1d AS iv, count(*) AS n FROM sales WHERE ts BETWEEN '2026-01-01T00:00:00Z' AND '2026-03-31T23:59:59.999Z'"
+ },
+ {
+  "key": "grafana:19",
+  "tool": "grafana",
+  "purpose": "health check: server version",
+  "sql": "SELECT current_setting('server_version_num')::int/100 as version"
+ },
+ {
+  "key": "grafana:20",
+  "tool": "grafana",
+  "purpose": "health check: TimescaleDB version",
+  "sql": "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'"
+ },
+ {
+  "key": "grafana:21",
+  "tool": "grafana",
+  "purpose": "query builder: the table list (showTables)",
+  "sql": "SELECT\n    CASE WHEN \n          quote_ident(table_schema) IN (\n          SELECT\n            CASE WHEN trim(s[i]) = '\"$user\"' THEN user ELSE trim(s[i]) END\n          FROM\n            generate_series(\n              array_lower(string_to_array(current_setting('search_path'),','),1),\n              array_upper(string_to_array(current_setting('search_path'),','),1)\n            ) as i,\n            string_to_array(current_setting('search_path'),',') s\n          )\n      THEN quote_ident(table_name)\n      ELSE quote_ident(table_schema) || '.' || quote_ident(table_name)\n    END AS \"table\"\n    FROM information_schema.tables\n    WHERE quote_ident(table_schema) NOT IN ('information_schema',\n                             'pg_catalog',\n                             '_timescaledb_cache',\n                             '_timescaledb_catalog',\n                             '_timescaledb_internal',\n                             '_timescaledb_config',\n                             'timescaledb_information',\n                             'timescaledb_experimental')\n    ORDER BY CASE WHEN \n          quote_ident(table_schema) IN (\n          SELECT\n            CASE WHEN trim(s[i]) = '\"$user\"' THEN user ELSE trim(s[i]) END\n          FROM\n            generate_series(\n              array_lower(string_to_array(current_setting('search_path'),','),1),\n              array_upper(string_to_array(current_setting('search_path'),','),1)\n            ) as i,\n            string_to_array(current_setting('search_path'),',') s\n          ) THEN 0 ELSE 1 END, 1"
+ },
+ {
+  "key": "grafana:22",
+  "tool": "grafana",
+  "purpose": "query builder: columns of sales (getSchema)",
+  "sql": "SELECT quote_ident(column_name) AS \"column\", data_type AS \"type\"\n    FROM information_schema.columns\n    WHERE\n      CASE WHEN array_length(parse_ident('sales'),1) = 2\n        THEN quote_ident(table_schema) = (parse_ident('sales'))[1]\n          AND quote_ident(table_name) = (parse_ident('sales'))[2]\n        ELSE quote_ident(table_name) = 'sales'\n          AND \n          quote_ident(table_schema) IN (\n          SELECT\n            CASE WHEN trim(s[i]) = '\"$user\"' THEN user ELSE trim(s[i]) END\n          FROM\n            generate_series(\n              array_lower(string_to_array(current_setting('search_path'),','),1),\n              array_upper(string_to_array(current_setting('search_path'),','),1)\n            ) as i,\n            string_to_array(current_setting('search_path'),',') s\n          )\n      END"
+ },
+ {
+  "key": "grafana:23",
+  "tool": "grafana",
+  "purpose": "query builder: columns of regions (getSchema)",
+  "sql": "SELECT quote_ident(column_name) AS \"column\", data_type AS \"type\"\n    FROM information_schema.columns\n    WHERE\n      CASE WHEN array_length(parse_ident('regions'),1) = 2\n        THEN quote_ident(table_schema) = (parse_ident('regions'))[1]\n          AND quote_ident(table_name) = (parse_ident('regions'))[2]\n        ELSE quote_ident(table_name) = 'regions'\n          AND \n          quote_ident(table_schema) IN (\n          SELECT\n            CASE WHEN trim(s[i]) = '\"$user\"' THEN user ELSE trim(s[i]) END\n          FROM\n            generate_series(\n              array_lower(string_to_array(current_setting('search_path'),','),1),\n              array_upper(string_to_array(current_setting('search_path'),','),1)\n            ) as i,\n            string_to_array(current_setting('search_path'),',') s\n          )\n      END"
+ },
+ {
+  "key": "grafana:24",
+  "tool": "grafana",
+  "purpose": "query builder: columns of crm.customers (getSchema)",
+  "sql": "SELECT quote_ident(column_name) AS \"column\", data_type AS \"type\"\n    FROM information_schema.columns\n    WHERE\n      CASE WHEN array_length(parse_ident('crm.customers'),1) = 2\n        THEN quote_ident(table_schema) = (parse_ident('crm.customers'))[1]\n          AND quote_ident(table_name) = (parse_ident('crm.customers'))[2]\n        ELSE quote_ident(table_name) = 'crm.customers'\n          AND \n          quote_ident(table_schema) IN (\n          SELECT\n            CASE WHEN trim(s[i]) = '\"$user\"' THEN user ELSE trim(s[i]) END\n          FROM\n            generate_series(\n              array_lower(string_to_array(current_setting('search_path'),','),1),\n              array_upper(string_to_array(current_setting('search_path'),','),1)\n            ) as i,\n            string_to_array(current_setting('search_path'),',') s\n          )\n      END"
+ },
+ {
+  "key": "grafana:25",
+  "tool": "grafana",
+  "purpose": "query builder: columns of sales_by_region (getSchema)",
+  "sql": "SELECT quote_ident(column_name) AS \"column\", data_type AS \"type\"\n    FROM information_schema.columns\n    WHERE\n      CASE WHEN array_length(parse_ident('sales_by_region'),1) = 2\n        THEN quote_ident(table_schema) = (parse_ident('sales_by_region'))[1]\n          AND quote_ident(table_name) = (parse_ident('sales_by_region'))[2]\n        ELSE quote_ident(table_name) = 'sales_by_region'\n          AND \n          quote_ident(table_schema) IN (\n          SELECT\n            CASE WHEN trim(s[i]) = '\"$user\"' THEN user ELSE trim(s[i]) END\n          FROM\n            generate_series(\n              array_lower(string_to_array(current_setting('search_path'),','),1),\n              array_upper(string_to_array(current_setting('search_path'),','),1)\n            ) as i,\n            string_to_array(current_setting('search_path'),',') s\n          )\n      END"
+ },
+ {
+  "key": "grafana:26",
+  "tool": "grafana",
+  "purpose": "query builder: schemas",
+  "sql": "SELECT schema_name FROM information_schema.schemata ORDER BY 1"
+ },
+ {
+  "key": "grafana:27",
+  "tool": "grafana",
+  "purpose": "query builder: tables and views",
+  "sql": "SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','pg_catalog') ORDER BY 1, 2"
+ },
+ {
+  "key": "grafana:28",
+  "tool": "grafana",
+  "purpose": "query builder: columns of four tables",
+  "sql": "SELECT table_schema, table_name, column_name, data_type FROM information_schema.columns WHERE table_name IN ('sales','regions','customers','sales_by_region') ORDER BY 1, 2, ordinal_position"
+ },
+ {
+  "key": "metabase:sync-01",
+  "tool": "metabase",
+  "purpose": "connection: names its session",
+  "sql": "SET application_name = 'Metabase v0.64.1.6 [38cd8aff-6cab-42a6-833a-66bf33a45074]'"
+ },
+ {
+  "key": "metabase:sync-02",
+  "tool": "metabase",
+  "purpose": "connection check",
+  "sql": "SELECT 1"
+ },
+ {
+  "key": "metabase:sync-03",
+  "tool": "metabase",
+  "purpose": "connection: isolation level",
+  "sql": "SHOW TRANSACTION ISOLATION LEVEL"
+ },
+ {
+  "key": "metabase:sync-04",
+  "tool": "metabase",
+  "purpose": "connection: current database",
+  "sql": "select current_catalog"
+ },
+ {
+  "key": "metabase:sync-05",
+  "tool": "metabase",
+  "purpose": "empty query the driver sends",
+  "sql": ""
+ },
+ {
+  "key": "metabase:sync-06",
+  "tool": "metabase",
+  "purpose": "metadata reads: isolation level, set for the read",
+  "sql": "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"
+ },
+ {
+  "key": "metabase:sync-07",
+  "tool": "metabase",
+  "purpose": "metadata reads: isolation level, set back",
+  "sql": "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"
+ },
+ {
+  "key": "metabase:sync-08",
+  "tool": "metabase",
+  "purpose": "sync: the database timezone",
+  "sql": "show timezone"
+ },
+ {
+  "key": "metabase:sync-09",
+  "tool": "metabase",
+  "purpose": "sync-tables: schemas (getSchemas)",
+  "sql": "SELECT nspname AS \"TABLE_SCHEM\", current_database() AS \"TABLE_CATALOG\" FROM pg_catalog.pg_namespace  WHERE nspname <> 'pg_toast' AND (nspname !~ '^pg_temp_'  OR nspname = (pg_catalog.current_schemas(true))[1]) AND (nspname !~ '^pg_toast_temp_'  OR nspname = replace((pg_catalog.current_schemas(true))[1], 'pg_temp_', 'pg_toast_temp_'))  ORDER BY \"TABLE_SCHEM\""
+ },
+ {
+  "key": "metabase:sync-10",
+  "tool": "metabase",
+  "purpose": "sync-tables: table privileges (getTables)",
+  "sql": "with table_privileges as (  select    NULL as role,    t.schemaname as schema,    t.objectname as table,    pg_catalog.has_any_column_privilege(current_user, '\"' || replace(t.schemaname, '\"', '\"\"') || '\"' || '.' || '\"' || replace(t.objectname, '\"', '\"\"') || '\"',  'update') as update,    pg_catalog.has_any_column_privilege(current_user, '\"' || replace(t.schemaname, '\"', '\"\"') || '\"' || '.' || '\"' || replace(t.objectname, '\"', '\"\"') || '\"',  'select') as select,    pg_catalog.has_any_column_privilege(current_user, '\"' || replace(t.schemaname, '\"', '\"\"') || '\"' || '.' || '\"' || replace(t.objectname, '\"', '\"\"') || '\"',  'insert') as insert,    pg_catalog.has_table_privilege(     current_user, '\"' || replace(t.schemaname, '\"', '\"\"') || '\"' || '.' || '\"' || replace(t.objectname, '\"', '\"\"') || '\"',  'delete') as delete  from (    select schemaname, tablename as objectname from pg_catalog.pg_tables    union    select schemaname, viewname as objectname from pg_catalog.pg_views    union    select schemaname, matviewname as objectname from pg_catalog.pg_matviews  ) t  where t.schemaname !~ '^pg_'    and t.schemaname <> 'information_schema'    and pg_catalog.has_schema_privilege(current_user, t.schemaname, 'usage') ) select t.* from table_privileges t"
+ },
+ {
+  "key": "metabase:sync-11",
+  "tool": "metabase",
+  "purpose": "sync-tables: tables, comments, row estimates",
+  "sql": "SELECT \"n\".\"nspname\" AS \"schema\", \"c\".\"relname\" AS \"name\", CASE \"c\".\"relkind\" WHEN 'r' THEN 'TABLE' WHEN 'p' THEN 'PARTITIONED TABLE' WHEN 'v' THEN 'VIEW' WHEN 'f' THEN 'FOREIGN TABLE' WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE NULL END AS \"type\", \"d\".\"description\" AS \"description\", NULLIF(\"stat\".\"n_live_tup\", $1) AS \"estimated_row_count\" FROM \"pg_catalog\".\"pg_class\" AS \"c\" INNER JOIN \"pg_catalog\".\"pg_namespace\" AS \"n\" ON \"c\".\"relnamespace\" = \"n\".\"oid\" LEFT JOIN \"pg_catalog\".\"pg_description\" AS \"d\" ON (\"c\".\"oid\" = \"d\".\"objoid\") AND (\"d\".\"objsubid\" = $2) AND (\"d\".\"classoid\" = 'pg_class'::regclass) LEFT JOIN \"pg_stat_user_tables\" AS \"stat\" ON (\"n\".\"nspname\" = \"stat\".\"schemaname\") AND (\"c\".\"relname\" = \"stat\".\"relname\") WHERE (\"c\".\"relnamespace\" = \"n\".\"oid\") AND (\"n\".\"nspname\" !~ $3) AND (\"n\".\"nspname\" <> $4) AND c.relkind in ('r', 'p', 'v', 'f', 'm') AND (\"n\".\"nspname\" IN ($5, $6)) ORDER BY \"type\" ASC, \"schema\" ASC, \"name\" ASC",
+  "params": [
+   0,
+   0,
+   "^pg_",
+   "information_schema",
+   "public",
+   "crm"
+  ]
+ },
+ {
+  "key": "metabase:sync-12",
+  "tool": "metabase",
+  "purpose": "field sync: enum types",
+  "sql": "SELECT nspname, typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.oid IN (SELECT DISTINCT enumtypid FROM pg_enum e)"
+ },
+ {
+  "key": "metabase:sync-13",
+  "tool": "metabase",
+  "purpose": "sync-fields: columns, types, primary keys, comments",
+  "sql": "SELECT \"c\".\"column_name\" AS \"name\", CASE WHEN \"c\".\"udt_schema\" IN ('public', 'pg_catalog') THEN FORMAT('%s', \"c\".\"udt_name\") ELSE FORMAT('\"%s\".\"%s\"', \"c\".\"udt_schema\", \"c\".\"udt_name\") END AS \"database-type\", \"c\".\"ordinal_position\" - 1 AS \"database-position\", \"c\".\"table_schema\" AS \"table-schema\", \"c\".\"table_name\" AS \"table-name\", \"pk\".\"column_name\" IS NOT NULL AS \"pk?\", COL_DESCRIPTION(CAST(CAST(FORMAT('%I.%I', CAST(\"c\".\"table_schema\" AS TEXT), CAST(\"c\".\"table_name\" AS TEXT)) AS REGCLASS) AS OID), \"c\".\"ordinal_position\") AS \"field-comment\", ((\"column_default\" IS NULL) OR (LOWER(\"column_default\") = 'null')) AND (\"is_nullable\" = 'NO') AND NOT (((\"column_default\" IS NOT NULL) AND (\"column_default\" LIKE '%nextval(%')) OR (\"is_identity\" <> 'NO')) AS \"database-required\", \"column_default\" AS \"database-default\", ((\"column_default\" IS NOT NULL) AND (\"column_default\" LIKE '%nextval(%')) OR (\"is_identity\" <> 'NO') AS \"database-is-auto-increment\", \"is_generated\" = $1 AS \"database-is-generated\", \"is_nullable\" = 'YES' AS \"database-is-nullable\" FROM \"information_schema\".\"columns\" AS \"c\" LEFT JOIN (SELECT \"tc\".\"table_schema\", \"tc\".\"table_name\", \"kc\".\"column_name\" FROM \"information_schema\".\"table_constraints\" AS \"tc\" INNER JOIN \"information_schema\".\"key_column_usage\" AS \"kc\" ON (\"tc\".\"constraint_name\" = \"kc\".\"constraint_name\") AND (\"tc\".\"table_schema\" = \"kc\".\"table_schema\") AND (\"tc\".\"table_name\" = \"kc\".\"table_name\") WHERE \"tc\".\"constraint_type\" = 'PRIMARY KEY') AS \"pk\" ON (\"c\".\"table_schema\" = \"pk\".\"table_schema\") AND (\"c\".\"table_name\" = \"pk\".\"table_name\") AND (\"c\".\"column_name\" = \"pk\".\"column_name\") WHERE c.table_schema !~ '^information_schema|catalog_history|pg_' AND (\"c\".\"table_schema\" IN ($2)) UNION ALL SELECT \"pa\".\"attname\" AS \"name\", CASE WHEN \"ptn\".\"nspname\" IN ('public', 'pg_catalog') THEN FORMAT('%s', \"pt\".\"typname\") ELSE FORMAT('\"%s\".\"%s\"', \"ptn\".\"nspname\", \"pt\".\"typname\") END AS \"database-type\", \"pa\".\"attnum\" - 1 AS \"database-position\", \"pn\".\"nspname\" AS \"table-schema\", \"pc\".\"relname\" AS \"table-name\", FALSE AS \"pk?\", NULL AS \"field-comment\", FALSE AS \"database-required\", NULL AS \"database-default\", FALSE AS \"database-is-auto-increment\", FALSE AS \"database-is-generated\", FALSE AS \"database-is-nullable\" FROM \"pg_catalog\".\"pg_class\" AS \"pc\" INNER JOIN \"pg_catalog\".\"pg_namespace\" AS \"pn\" ON \"pn\".\"oid\" = \"pc\".\"relnamespace\" INNER JOIN \"pg_catalog\".\"pg_attribute\" AS \"pa\" ON \"pa\".\"attrelid\" = \"pc\".\"oid\" INNER JOIN \"pg_catalog\".\"pg_type\" AS \"pt\" ON \"pt\".\"oid\" = \"pa\".\"atttypid\" INNER JOIN \"pg_catalog\".\"pg_namespace\" AS \"ptn\" ON \"ptn\".\"oid\" = \"pt\".\"typnamespace\" WHERE (\"pc\".\"relkind\" = 'm') AND (\"pa\".\"attnum\" >= 1) AND (\"pn\".\"nspname\" IN ($3)) ORDER BY \"table-schema\" ASC, \"table-name\" ASC, \"database-position\" ASC",
+  "params": [
+   "ALWAYS",
+   "public",
+   "public"
+  ]
+ },
+ {
+  "key": "metabase:sync-14",
+  "tool": "metabase",
+  "purpose": "read-only transaction for the sync's reads",
+  "sql": "BEGIN READ ONLY"
+ },
+ {
+  "key": "metabase:sync-15",
+  "tool": "metabase",
+  "purpose": "end of that transaction",
+  "sql": "ROLLBACK"
+ },
+ {
+  "key": "metabase:sync-16",
+  "tool": "metabase",
+  "purpose": "sync-fks: foreign keys",
+  "sql": "SELECT \"fk_ns\".\"nspname\" AS \"fk-table-schema\", \"fk_table\".\"relname\" AS \"fk-table-name\", \"fk_column\".\"attname\" AS \"fk-column-name\", \"pk_ns\".\"nspname\" AS \"pk-table-schema\", \"pk_table\".\"relname\" AS \"pk-table-name\", \"pk_column\".\"attname\" AS \"pk-column-name\" FROM \"pg_constraint\" AS \"c\" INNER JOIN \"pg_class\" AS \"fk_table\" ON \"c\".\"conrelid\" = \"fk_table\".\"oid\" INNER JOIN \"pg_namespace\" AS \"fk_ns\" ON \"c\".\"connamespace\" = \"fk_ns\".\"oid\" INNER JOIN \"pg_attribute\" AS \"fk_column\" ON \"c\".\"conrelid\" = \"fk_column\".\"attrelid\" INNER JOIN \"pg_class\" AS \"pk_table\" ON \"c\".\"confrelid\" = \"pk_table\".\"oid\" INNER JOIN \"pg_namespace\" AS \"pk_ns\" ON \"pk_table\".\"relnamespace\" = \"pk_ns\".\"oid\" INNER JOIN \"pg_attribute\" AS \"pk_column\" ON \"c\".\"confrelid\" = \"pk_column\".\"attrelid\" WHERE fk_ns.nspname !~ '^information_schema|catalog_history|pg_' AND (\"c\".\"contype\" = 'f'::char) AND (\"fk_column\".\"attnum\" = ANY(c.conkey)) AND (\"pk_column\".\"attnum\" = ANY(c.confkey)) AND (\"fk_ns\".\"nspname\" IN ($1, $2)) ORDER BY \"fk-table-schema\" ASC, \"fk-table-name\" ASC",
+  "params": [
+   "public",
+   "crm"
+  ]
+ },
+ {
+  "key": "metabase:ui-01",
+  "tool": "metabase",
+  "purpose": "native question: count by region",
+  "sql": "-- Metabase:: userID: 1 queryType: native queryHash: 21297ec06d8d783eee4101a8f7f6c6c6e2a14f27fe5775eb32aefeee7630e54a\nSELECT region, count(*) FROM sales GROUP BY region ORDER BY region"
+ },
+ {
+  "key": "metabase:ui-02",
+  "tool": "metabase",
+  "purpose": "native question: first row, base types",
+  "sql": "-- Metabase:: userID: 1 queryType: native queryHash: b0b49bc7610ebb2a999a5b03ef0f95b45e3fa57aeecea45540742f2593dcc94a\nSELECT id, ts, amount, qty, ref FROM sales ORDER BY id LIMIT 1"
+ },
+ {
+  "key": "metabase:ui-03",
+  "tool": "metabase",
+  "purpose": "question (MBQL): row count of sales",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: 32efca465ebd64eeb5896e3b1acd44646f1f34b3e742cf032caef33c99333121\nSELECT COUNT(*) AS \"count\" FROM \"public\".\"sales\""
+ },
+ {
+  "key": "metabase:ui-04",
+  "tool": "metabase",
+  "purpose": "question (MBQL): row count of the view",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: 192efd82b3a5697ae2cc154de502b33ef87176e15a7b827e2164c8062b5f8322\nSELECT COUNT(*) AS \"count\" FROM \"public\".\"sales_by_region\""
+ },
+ {
+  "key": "metabase:ui-05",
+  "tool": "metabase",
+  "purpose": "question (MBQL): row count of crm.customers",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: 009488fb7cfbd031982077fdcd30fefbfd608eec3989dd7f3b1b8d30afd7f93a\nSELECT COUNT(*) AS \"count\" FROM \"crm\".\"customers\""
+ },
+ {
+  "key": "metabase:ui-06",
+  "tool": "metabase",
+  "purpose": "question (MBQL): sum of amount by region",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: 3a185a2ff53918511bdb030c84436d24a2fed3aac1bbc083853b1e3c2475de6c\nSELECT \"__mb_source\".\"region\" AS \"region\", SUM(\"__mb_source\".\"amount\") AS \"sum\" FROM (SELECT id, ts, region, product, amount, qty, ref FROM sales) AS \"__mb_source\" GROUP BY \"__mb_source\".\"region\" ORDER BY \"__mb_source\".\"region\" ASC"
+ },
+ {
+  "key": "metabase:ui-07",
+  "tool": "metabase",
+  "purpose": "question (MBQL): count by month",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: 430ab1a8b4f66be3d9f1f176fbee3af05cd06c91fa57946987556ca13ee5dab4\nSELECT DATE_TRUNC('month', \"__mb_source\".\"ts\") AS \"ts\", COUNT(*) AS \"count\" FROM (SELECT id, ts, region, product, amount, qty, ref FROM sales) AS \"__mb_source\" GROUP BY DATE_TRUNC('month', \"__mb_source\".\"ts\") ORDER BY DATE_TRUNC('month', \"__mb_source\".\"ts\") ASC"
+ },
+ {
+  "key": "metabase:ui-08",
+  "tool": "metabase",
+  "purpose": "question (MBQL): count by week",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: c555fb4199db9610d2cf9cd22be003f81571b57f552064da78dcaead0aa5c308\nSELECT (DATE_TRUNC('week', (\"__mb_source\".\"ts\" + INTERVAL '1 day')) + INTERVAL '-1 day') AS \"ts\", COUNT(*) AS \"count\" FROM (SELECT id, ts, region, product, amount, qty, ref FROM sales) AS \"__mb_source\" GROUP BY (DATE_TRUNC('week', (\"__mb_source\".\"ts\" + INTERVAL '1 day')) + INTERVAL '-1 day') ORDER BY (DATE_TRUNC('week', (\"__mb_source\".\"ts\" + INTERVAL '1 day')) + INTERVAL '-1 day') ASC"
+ },
+ {
+  "key": "metabase:ui-09",
+  "tool": "metabase",
+  "purpose": "question (MBQL): count by day of week",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: d34378b00c4fe4dac446d66a6f20bb398543e4d04d5d0c19fee6294dce5e7838\nSELECT (CAST(extract(dow from \"__mb_source\".\"ts\") AS integer) + 1) AS \"ts\", COUNT(*) AS \"count\" FROM (SELECT id, ts, region, product, amount, qty, ref FROM sales) AS \"__mb_source\" GROUP BY (CAST(extract(dow from \"__mb_source\".\"ts\") AS integer) + 1) ORDER BY (CAST(extract(dow from \"__mb_source\".\"ts\") AS integer) + 1) ASC"
+ },
+ {
+  "key": "metabase:ui-10",
+  "tool": "metabase",
+  "purpose": "question (MBQL): count by hour",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: e157f723edda6622939c8f6501724d2cab45dee80ae1a9f74f5c5c77250e4aee\nSELECT CAST(extract(hour from \"__mb_source\".\"ts\") AS integer) AS \"ts\", COUNT(*) AS \"count\" FROM (SELECT id, ts, region, product, amount, qty, ref FROM sales) AS \"__mb_source\" GROUP BY CAST(extract(hour from \"__mb_source\".\"ts\") AS integer) ORDER BY CAST(extract(hour from \"__mb_source\".\"ts\") AS integer) ASC"
+ },
+ {
+  "key": "metabase:ui-11",
+  "tool": "metabase",
+  "purpose": "question (MBQL): count filtered to north",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: 3c2ec6aedc4028a00acab72aacb2c2a0a19d1646c028317e89dcf247a79d9a31\nSELECT COUNT(*) AS \"count\" FROM (SELECT id, ts, region, product, amount, qty, ref FROM sales) AS \"__mb_source\" WHERE \"__mb_source\".\"region\" = 'north'"
+ },
+ {
+  "key": "metabase:ui-12",
+  "tool": "metabase",
+  "purpose": "question (MBQL): count between two dates",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: d3982f87c6f61fa8cf17e42fd7de6a5f9e6997413f09c3c8de25bc2532fca12e\nSELECT COUNT(*) AS \"count\" FROM (SELECT id, ts, region, product, amount, qty, ref FROM sales) AS \"__mb_source\" WHERE \"__mb_source\".\"ts\" BETWEEN TIMESTAMP '2026-01-05 00:00:00' AND TIMESTAMP '2026-01-20 00:00:00'"
+ },
+ {
+  "key": "metabase:ui-13",
+  "tool": "metabase",
+  "purpose": "question (MBQL): distinct refs, average, min and max",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: 454838e4dc5f21630112e4a79b3dabdb6f1f8ce69a6c9c570a03469c9101da40\nSELECT count(distinct \"__mb_source\".\"ref\") AS \"count\", AVG(\"__mb_source\".\"amount\") AS \"avg\", MIN(\"__mb_source\".\"ts\") AS \"min\", MAX(\"__mb_source\".\"ts\") AS \"max\" FROM (SELECT id, ts, region, product, amount, qty, ref FROM sales) AS \"__mb_source\""
+ },
+ {
+  "key": "metabase:ui-14",
+  "tool": "metabase",
+  "purpose": "question (MBQL): running count by month",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: 5cd0c45fe491412264e6c69a0b5f59cb73dfc725e2dc804626b0e1b58721952e\nSELECT \"__mb_source\".\"ts\" AS \"ts\", SUM(COUNT(*)) OVER (ORDER BY \"__mb_source\".\"ts\" ASC ROWS UNBOUNDED PRECEDING) AS \"count\" FROM (SELECT DATE_TRUNC('month', \"__mb_source\".\"ts\") AS \"ts\" FROM (SELECT id, ts, region, product, amount, qty, ref FROM sales) AS \"__mb_source\") AS \"__mb_source\" GROUP BY \"__mb_source\".\"ts\" ORDER BY \"__mb_source\".\"ts\" ASC"
+ },
+ {
+  "key": "metabase:ui-15",
+  "tool": "metabase",
+  "purpose": "question (MBQL): count of one uuid",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: ab08fb07be8cca9e7ed489adbabdc79e73b5c654a74e595cd63a5a306da13cfb\nSELECT COUNT(*) AS \"count\" FROM (SELECT id, ts, region, product, amount, qty, ref FROM sales) AS \"__mb_source\" WHERE \"__mb_source\".\"ref\" = '39d787ae-39ca-4d3f-84d0-385df61e02df'"
+ },
+ {
+  "key": "metabase:ui-16",
+  "tool": "metabase",
+  "purpose": "question (MBQL): count by manager (join to regions)",
+  "sql": "-- Metabase:: userID: 1 queryType: MBQL queryHash: f4458a232e7e8f20036bc58086815009c76537b38f6734937b385b97281f1c15\nSELECT \"r\".\"manager\" AS \"r__manager\", COUNT(*) AS \"count\" FROM (SELECT id, ts, region, product, amount, qty, ref FROM sales) AS \"__mb_source\" LEFT JOIN (SELECT region, manager FROM regions) AS \"r\" ON \"__mb_source\".\"region\" = \"r\".\"region\" GROUP BY \"r\".\"manager\" ORDER BY \"r\".\"manager\" ASC"
+ },
+ {
+  "key": "superset:01",
+  "tool": "superset",
+  "purpose": "transaction start (Superset's connection)",
+  "sql": "BEGIN"
+ },
+ {
+  "key": "superset:02",
+  "tool": "superset",
+  "purpose": "connection: hstore type lookup (a startup probe)",
+  "sql": "SELECT t.oid, typarray\nFROM pg_type t JOIN pg_namespace ns\n    ON typnamespace = ns.oid\nWHERE typname = 'hstore'"
+ },
+ {
+  "key": "superset:03",
+  "tool": "superset",
+  "purpose": "transaction end",
+  "sql": "ROLLBACK"
+ },
+ {
+  "key": "superset:04",
+  "tool": "superset",
+  "purpose": "connection: server version (Superset's engine check)",
+  "sql": "select pg_catalog.version()"
+ },
+ {
+  "key": "superset:05",
+  "tool": "superset",
+  "purpose": "connection: current schema",
+  "sql": "select current_schema()"
+ },
+ {
+  "key": "superset:06",
+  "tool": "superset",
+  "purpose": "connection: isolation level",
+  "sql": "show transaction isolation level"
+ },
+ {
+  "key": "superset:07",
+  "tool": "superset",
+  "purpose": "connection: string literal rules",
+  "sql": "show standard_conforming_strings"
+ },
+ {
+  "key": "superset:08",
+  "tool": "superset",
+  "purpose": "connection ping",
+  "sql": "SELECT 1"
+ },
+ {
+  "key": "superset:09",
+  "tool": "superset",
+  "purpose": "schema list (get_schema_names)",
+  "sql": "SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg_%' ORDER BY nspname"
+ },
+ {
+  "key": "superset:10",
+  "tool": "superset",
+  "purpose": "table and view names (get_table_names, get_view_names)",
+  "sql": "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind in ('r', 'p')"
+ },
+ {
+  "key": "superset:11",
+  "tool": "superset",
+  "purpose": "table and view names (get_table_names, get_view_names)",
+  "sql": "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'f'"
+ },
+ {
+  "key": "superset:12",
+  "tool": "superset",
+  "purpose": "table and view names (get_table_names, get_view_names)",
+  "sql": "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('v', 'm')"
+ },
+ {
+  "key": "superset:13",
+  "tool": "superset",
+  "purpose": "a table's oid (table metadata)",
+  "sql": "SELECT c.oid\n            FROM pg_catalog.pg_class c\n            LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n            WHERE (n.nspname = 'public')\n            AND c.relname = 'sales' AND c.relkind in\n            ('r', 'v', 'm', 'f', 'p')"
+ },
+ {
+  "key": "superset:14",
+  "tool": "superset",
+  "purpose": "columns, types and defaults of a table (get_columns)",
+  "sql": "SELECT a.attname,\n              pg_catalog.format_type(a.atttypid, a.atttypmod),\n              (\n                SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid)\n                FROM pg_catalog.pg_attrdef d\n                WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum\n                AND a.atthasdef\n              ) AS DEFAULT,\n              a.attnotnull,\n              a.attrelid as table_oid,\n              pgd.description as comment,\n              a.attgenerated as generated,\n                              (SELECT json_build_object(\n                    'always', a.attidentity = 'a',\n                    'start', s.seqstart,\n                    'increment', s.seqincrement,\n                    'minvalue', s.seqmin,\n                    'maxvalue', s.seqmax,\n                    'cache', s.seqcache,\n                    'cycle', s.seqcycle)\n                FROM pg_catalog.pg_sequence s\n                JOIN pg_catalog.pg_class c on s.seqrelid = c.\"oid\"\n                WHERE c.relkind = 'S'\n                AND a.attidentity != ''\n                AND s.seqrelid = pg_catalog.pg_get_serial_sequence(\n                    a.attrelid::regclass::text, a.attname\n                )::regclass::oid\n                ) as identity_options                \n            FROM pg_catalog.pg_attribute a\n            LEFT JOIN pg_catalog.pg_description pgd ON (\n                pgd.objoid = a.attrelid AND pgd.objsubid = a.attnum)\n            WHERE a.attrelid = 1590730383\n            AND a.attnum > 0 AND NOT a.attisdropped\n            ORDER BY a.attnum"
+ },
+ {
+  "key": "superset:15",
+  "tool": "superset",
+  "purpose": "column types, base types and lengths",
+  "sql": "SELECT t.typname as \"name\",\n               pg_catalog.format_type(t.typbasetype, t.typtypmod) as \"attype\",\n               not t.typnotnull as \"nullable\",\n               t.typdefault as \"default\",\n               pg_catalog.pg_type_is_visible(t.oid) as \"visible\",\n               n.nspname as \"schema\"\n            FROM pg_catalog.pg_type t\n               LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace\n            WHERE t.typtype = 'd'"
+ },
+ {
+  "key": "superset:16",
+  "tool": "superset",
+  "purpose": "enum labels of a table's columns",
+  "sql": "SELECT t.typname as \"name\",\n               -- no enum defaults in 8.4 at least\n               -- t.typdefault as \"default\",\n               pg_catalog.pg_type_is_visible(t.oid) as \"visible\",\n               n.nspname as \"schema\",\n               e.enumlabel as \"label\"\n            FROM pg_catalog.pg_type t\n                 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace\n                 LEFT JOIN pg_catalog.pg_enum e ON t.oid = e.enumtypid\n            WHERE t.typtype = 'e'\n        ORDER BY \"schema\", \"name\", e.oid"
+ },
+ {
+  "key": "superset:17",
+  "tool": "superset",
+  "purpose": "primary-key columns (get_pk_constraint)",
+  "sql": "SELECT a.attname\n                FROM pg_attribute a JOIN (\n                    SELECT unnest(ix.indkey) attnum,\n                           generate_subscripts(ix.indkey, 1) ord\n                    FROM pg_index ix\n                    WHERE ix.indrelid = 1590730383 AND ix.indisprimary\n                    ) k ON a.attnum=k.attnum\n                WHERE a.attrelid = 1590730383\n                ORDER BY k.ord"
+ },
+ {
+  "key": "superset:18",
+  "tool": "superset",
+  "purpose": "primary-key constraint name",
+  "sql": "SELECT conname\n           FROM  pg_catalog.pg_constraint r\n           WHERE r.conrelid = 1590730383 AND r.contype = 'p'\n           ORDER BY 1"
+ },
+ {
+  "key": "superset:19",
+  "tool": "superset",
+  "purpose": "constraint definitions (get_foreign_keys)",
+  "sql": "SELECT r.conname,\n                pg_catalog.pg_get_constraintdef(r.oid, true) as condef,\n                n.nspname as conschema\n          FROM  pg_catalog.pg_constraint r,\n                pg_namespace n,\n                pg_class c\n\n          WHERE r.conrelid = 1590730383 AND\n                r.contype = 'f' AND\n                c.oid = confrelid AND\n                n.oid = c.relnamespace\n          ORDER BY 1"
+ },
+ {
+  "key": "superset:20",
+  "tool": "superset",
+  "purpose": "indexes of a table (get_indexes)",
+  "sql": "SELECT\n                  i.relname as relname,\n                  ix.indisunique, ix.indexprs,\n                  a.attname, a.attnum, c.conrelid, ix.indkey::varchar,\n                  ix.indoption::varchar, i.reloptions, am.amname,\n                  pg_get_expr(ix.indpred, ix.indrelid),\n                  ix.indnkeyatts as indnkeyatts\n              FROM\n                  pg_class t\n                        join pg_index ix on t.oid = ix.indrelid\n                        join pg_class i on i.oid = ix.indexrelid\n                        left outer join\n                            pg_attribute a\n                            on t.oid = a.attrelid and a.attnum = ANY(ix.indkey)\n                        left outer join\n                            pg_constraint c\n                            on (ix.indrelid = c.conrelid and\n                                ix.indexrelid = c.conindid and\n                                c.contype in ('p', 'u', 'x'))\n                        left outer join\n                            pg_am am\n                            on i.relam = am.oid\n              WHERE\n                  t.relkind IN ('r', 'v', 'f', 'm', 'p')\n                  and t.oid = 1590730383\n                  and ix.indisprimary = 'f'\n              ORDER BY\n                  t.relname,\n                  i.relname"
+ },
+ {
+  "key": "superset:21",
+  "tool": "superset",
+  "purpose": "table comment",
+  "sql": "SELECT\n                pgd.description as table_comment\n            FROM\n                pg_catalog.pg_description pgd\n            WHERE\n                pgd.objsubid = 0 AND\n                pgd.objoid = 1590730383"
+ },
+ {
+  "key": "superset:22",
+  "tool": "superset",
+  "purpose": "unique and check constraints of a table",
+  "sql": "SELECT conname FROM pg_catalog.pg_constraint r WHERE r.conrelid = (SELECT oid FROM pg_class WHERE relname='sales') AND r.contype = 'p'"
+ },
+ {
+  "key": "superset:23",
+  "tool": "superset",
+  "purpose": "session: search path set to the schema",
+  "sql": "set search_path = \"public\""
+ },
+ {
+  "key": "superset:24",
+  "tool": "superset",
+  "purpose": "connection: backend pid",
+  "sql": "SELECT pg_backend_pid()"
+ },
+ {
+  "key": "superset:25",
+  "tool": "superset",
+  "purpose": "SQL Lab: sums by region (Superset adds its LIMIT)",
+  "sql": "SELECT\n  region,\n  SUM(amount)\nFROM sales\nGROUP BY\n  region\nLIMIT 100001"
+ },
+ {
+  "key": "superset:26",
+  "tool": "superset",
+  "purpose": "SQL Lab: first rows as written (Superset replaces the LIMIT)",
+  "sql": "SELECT\n  id,\n  region,\n  amount\nFROM sales\nORDER BY\n  id\nLIMIT 100001"
+ },
+ {
+  "key": "superset:27",
+  "tool": "superset",
+  "purpose": "SQL Lab: rows with queryLimit 5 (LIMIT 6)",
+  "sql": "SELECT\n  id,\n  region,\n  amount\nFROM sales\nORDER BY\n  id\nLIMIT 6"
+ },
+ {
+  "key": "superset:28",
+  "tool": "superset",
+  "purpose": "SQL Lab: uuid column with queryLimit 3 (LIMIT 4)",
+  "sql": "SELECT\n  ref\nFROM sales\nORDER BY\n  id\nLIMIT 4"
+ },
+ {
+  "key": "superset:29",
+  "tool": "superset",
+  "purpose": "SQL Lab: uuid column as written (Superset replaces the LIMIT)",
+  "sql": "SELECT\n  ref\nFROM sales\nORDER BY\n  id\nLIMIT 100001"
+ },
+ {
+  "key": "superset:30",
+  "tool": "superset",
+  "purpose": "constraint key columns of a table",
+  "sql": "SELECT\n                cons.conname as name,\n                cons.conkey as key,\n                a.attnum as col_num,\n                a.attname as col_name\n            FROM\n                pg_catalog.pg_constraint cons\n                join pg_attribute a\n                  on cons.conrelid = a.attrelid AND\n                    a.attnum = ANY(cons.conkey)\n            WHERE\n                cons.conrelid = 1590730383 AND\n                cons.contype = 'u'"
+ },
+ {
+  "key": "superset:31",
+  "tool": "superset",
+  "purpose": "constraint definitions of a table",
+  "sql": "SELECT\n                cons.conname as name,\n                pg_get_constraintdef(cons.oid) as src\n            FROM\n                pg_catalog.pg_constraint cons\n            WHERE\n                cons.conrelid = 1590730383 AND\n                cons.contype = 'c'"
+ },
+ {
+  "key": "superset:32",
+  "tool": "superset",
+  "purpose": "table exists check (has_table)",
+  "sql": "select relname from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and relname='sales'"
+ },
+ {
+  "key": "superset:33",
+  "tool": "superset",
+  "purpose": "column preview: first 1000 timestamps",
+  "sql": "SELECT\n  ts\nFROM public.sales\nWHERE\n  NOT ts IS NULL\nLIMIT 1000"
+ },
+ {
+  "key": "superset:34",
+  "tool": "superset",
+  "purpose": "a table's oid (table metadata)",
+  "sql": "SELECT c.oid\n            FROM pg_catalog.pg_class c\n            LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n            WHERE (n.nspname = 'crm')\n            AND c.relname = 'customers' AND c.relkind in\n            ('r', 'v', 'm', 'f', 'p')"
+ },
+ {
+  "key": "superset:35",
+  "tool": "superset",
+  "purpose": "columns, types and defaults of a table (get_columns)",
+  "sql": "SELECT a.attname,\n              pg_catalog.format_type(a.atttypid, a.atttypmod),\n              (\n                SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid)\n                FROM pg_catalog.pg_attrdef d\n                WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum\n                AND a.atthasdef\n              ) AS DEFAULT,\n              a.attnotnull,\n              a.attrelid as table_oid,\n              pgd.description as comment,\n              a.attgenerated as generated,\n                              (SELECT json_build_object(\n                    'always', a.attidentity = 'a',\n                    'start', s.seqstart,\n                    'increment', s.seqincrement,\n                    'minvalue', s.seqmin,\n                    'maxvalue', s.seqmax,\n                    'cache', s.seqcache,\n                    'cycle', s.seqcycle)\n                FROM pg_catalog.pg_sequence s\n                JOIN pg_catalog.pg_class c on s.seqrelid = c.\"oid\"\n                WHERE c.relkind = 'S'\n                AND a.attidentity != ''\n                AND s.seqrelid = pg_catalog.pg_get_serial_sequence(\n                    a.attrelid::regclass::text, a.attname\n                )::regclass::oid\n                ) as identity_options                \n            FROM pg_catalog.pg_attribute a\n            LEFT JOIN pg_catalog.pg_description pgd ON (\n                pgd.objoid = a.attrelid AND pgd.objsubid = a.attnum)\n            WHERE a.attrelid = 149053932\n            AND a.attnum > 0 AND NOT a.attisdropped\n            ORDER BY a.attnum"
+ },
+ {
+  "key": "superset:36",
+  "tool": "superset",
+  "purpose": "primary-key columns (get_pk_constraint)",
+  "sql": "SELECT a.attname\n                FROM pg_attribute a JOIN (\n                    SELECT unnest(ix.indkey) attnum,\n                           generate_subscripts(ix.indkey, 1) ord\n                    FROM pg_index ix\n                    WHERE ix.indrelid = 149053932 AND ix.indisprimary\n                    ) k ON a.attnum=k.attnum\n                WHERE a.attrelid = 149053932\n                ORDER BY k.ord"
+ },
+ {
+  "key": "superset:37",
+  "tool": "superset",
+  "purpose": "primary-key constraint name",
+  "sql": "SELECT conname\n           FROM  pg_catalog.pg_constraint r\n           WHERE r.conrelid = 149053932 AND r.contype = 'p'\n           ORDER BY 1"
+ },
+ {
+  "key": "superset:38",
+  "tool": "superset",
+  "purpose": "constraint definitions (get_foreign_keys)",
+  "sql": "SELECT r.conname,\n                pg_catalog.pg_get_constraintdef(r.oid, true) as condef,\n                n.nspname as conschema\n          FROM  pg_catalog.pg_constraint r,\n                pg_namespace n,\n                pg_class c\n\n          WHERE r.conrelid = 149053932 AND\n                r.contype = 'f' AND\n                c.oid = confrelid AND\n                n.oid = c.relnamespace\n          ORDER BY 1"
+ },
+ {
+  "key": "superset:39",
+  "tool": "superset",
+  "purpose": "indexes of a table (get_indexes)",
+  "sql": "SELECT\n                  i.relname as relname,\n                  ix.indisunique, ix.indexprs,\n                  a.attname, a.attnum, c.conrelid, ix.indkey::varchar,\n                  ix.indoption::varchar, i.reloptions, am.amname,\n                  pg_get_expr(ix.indpred, ix.indrelid),\n                  ix.indnkeyatts as indnkeyatts\n              FROM\n                  pg_class t\n                        join pg_index ix on t.oid = ix.indrelid\n                        join pg_class i on i.oid = ix.indexrelid\n                        left outer join\n                            pg_attribute a\n                            on t.oid = a.attrelid and a.attnum = ANY(ix.indkey)\n                        left outer join\n                            pg_constraint c\n                            on (ix.indrelid = c.conrelid and\n                                ix.indexrelid = c.conindid and\n                                c.contype in ('p', 'u', 'x'))\n                        left outer join\n                            pg_am am\n                            on i.relam = am.oid\n              WHERE\n                  t.relkind IN ('r', 'v', 'f', 'm', 'p')\n                  and t.oid = 149053932\n                  and ix.indisprimary = 'f'\n              ORDER BY\n                  t.relname,\n                  i.relname"
+ },
+ {
+  "key": "superset:40",
+  "tool": "superset",
+  "purpose": "constraint key columns of a table",
+  "sql": "SELECT\n                cons.conname as name,\n                cons.conkey as key,\n                a.attnum as col_num,\n                a.attname as col_name\n            FROM\n                pg_catalog.pg_constraint cons\n                join pg_attribute a\n                  on cons.conrelid = a.attrelid AND\n                    a.attnum = ANY(cons.conkey)\n            WHERE\n                cons.conrelid = 149053932 AND\n                cons.contype = 'u'"
+ },
+ {
+  "key": "superset:41",
+  "tool": "superset",
+  "purpose": "constraint definitions of a table",
+  "sql": "SELECT\n                cons.conname as name,\n                pg_get_constraintdef(cons.oid) as src\n            FROM\n                pg_catalog.pg_constraint cons\n            WHERE\n                cons.conrelid = 149053932 AND\n                cons.contype = 'c'"
+ },
+ {
+  "key": "superset:42",
+  "tool": "superset",
+  "purpose": "table comment",
+  "sql": "SELECT\n                pgd.description as table_comment\n            FROM\n                pg_catalog.pg_description pgd\n            WHERE\n                pgd.objsubid = 0 AND\n                pgd.objoid = 149053932"
+ },
+ {
+  "key": "superset:43",
+  "tool": "superset",
+  "purpose": "table exists check (has_table)",
+  "sql": "select relname from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='crm' and relname='customers'"
+ },
+ {
+  "key": "superset:44",
+  "tool": "superset",
+  "purpose": "column preview: first 1000 dates",
+  "sql": "SELECT\n  created\nFROM crm.customers\nWHERE\n  NOT created IS NULL\nLIMIT 1000"
+ },
+ {
+  "key": "superset:45",
+  "tool": "superset",
+  "purpose": "chart: time series, day grain, time range (TO_TIMESTAMP)",
+  "sql": "SELECT\n  DATE_TRUNC('DAY', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nWHERE\n  ts >= TO_TIMESTAMP('2026-01-01 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')\n  AND ts < TO_TIMESTAMP('2026-03-31 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')\nGROUP BY\n  region,\n  DATE_TRUNC('DAY', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:46",
+  "tool": "superset",
+  "purpose": "chart: time series, week grain, time range (TO_TIMESTAMP)",
+  "sql": "SELECT\n  DATE_TRUNC('WEEK', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nWHERE\n  ts >= TO_TIMESTAMP('2026-01-01 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')\n  AND ts < TO_TIMESTAMP('2026-03-31 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')\nGROUP BY\n  region,\n  DATE_TRUNC('WEEK', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:47",
+  "tool": "superset",
+  "purpose": "chart: time series, month grain, time range (TO_TIMESTAMP)",
+  "sql": "SELECT\n  DATE_TRUNC('MONTH', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nWHERE\n  ts >= TO_TIMESTAMP('2026-01-01 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')\n  AND ts < TO_TIMESTAMP('2026-03-31 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')\nGROUP BY\n  region,\n  DATE_TRUNC('MONTH', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:48",
+  "tool": "superset",
+  "purpose": "chart: time series, hour grain, time range (TO_TIMESTAMP)",
+  "sql": "SELECT\n  DATE_TRUNC('HOUR', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nWHERE\n  ts >= TO_TIMESTAMP('2026-01-01 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')\n  AND ts < TO_TIMESTAMP('2026-03-31 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')\nGROUP BY\n  region,\n  DATE_TRUNC('HOUR', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:49",
+  "tool": "superset",
+  "purpose": "chart: time series, year grain, time range (TO_TIMESTAMP)",
+  "sql": "SELECT\n  DATE_TRUNC('YEAR', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nWHERE\n  ts >= TO_TIMESTAMP('2026-01-01 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')\n  AND ts < TO_TIMESTAMP('2026-03-31 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')\nGROUP BY\n  region,\n  DATE_TRUNC('YEAR', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:50",
+  "tool": "superset",
+  "purpose": "chart: time series, quarter grain, time range (TO_TIMESTAMP)",
+  "sql": "SELECT\n  DATE_TRUNC('QUARTER', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nWHERE\n  ts >= TO_TIMESTAMP('2026-01-01 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')\n  AND ts < TO_TIMESTAMP('2026-03-31 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')\nGROUP BY\n  region,\n  DATE_TRUNC('QUARTER', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:51",
+  "tool": "superset",
+  "purpose": "chart: time series, day grain, no time filter",
+  "sql": "SELECT\n  DATE_TRUNC('DAY', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nGROUP BY\n  region,\n  DATE_TRUNC('DAY', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:52",
+  "tool": "superset",
+  "purpose": "chart: time series, week grain, no time filter",
+  "sql": "SELECT\n  DATE_TRUNC('WEEK', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nGROUP BY\n  region,\n  DATE_TRUNC('WEEK', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:53",
+  "tool": "superset",
+  "purpose": "chart: time series, month grain, no time filter",
+  "sql": "SELECT\n  DATE_TRUNC('MONTH', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nGROUP BY\n  region,\n  DATE_TRUNC('MONTH', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:54",
+  "tool": "superset",
+  "purpose": "chart: time series, hour grain, no time filter",
+  "sql": "SELECT\n  DATE_TRUNC('HOUR', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nGROUP BY\n  region,\n  DATE_TRUNC('HOUR', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:55",
+  "tool": "superset",
+  "purpose": "chart: time series, year grain, no time filter",
+  "sql": "SELECT\n  DATE_TRUNC('YEAR', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nGROUP BY\n  region,\n  DATE_TRUNC('YEAR', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:56",
+  "tool": "superset",
+  "purpose": "chart: time series, quarter grain, no time filter",
+  "sql": "SELECT\n  DATE_TRUNC('QUARTER', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nGROUP BY\n  region,\n  DATE_TRUNC('QUARTER', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:57",
+  "tool": "superset",
+  "purpose": "chart: time series, month grain, plain >= and < filter",
+  "sql": "SELECT\n  DATE_TRUNC('MONTH', ts) AS __timestamp,\n  region AS region,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nWHERE\n  ts >= '2026-01-01 00:00:00' AND ts < '2026-03-31 00:00:00'\nGROUP BY\n  region,\n  DATE_TRUNC('MONTH', ts)\nLIMIT 10000"
+ },
+ {
+  "key": "superset:58",
+  "tool": "superset",
+  "purpose": "chart: metrics of the table, filtered by region",
+  "sql": "SELECT\n  COUNT(*) AS \"COUNT(*)\",\n  AVG(amount) AS \"AVG(amount)\",\n  COUNT(DISTINCT product) AS \"COUNT_DISTINCT(product)\"\nFROM public.sales\nWHERE\n  region IN ('north', 'south')\nLIMIT 10000"
+ },
+ {
+  "key": "superset:59",
+  "tool": "superset",
+  "purpose": "chart: metrics by region, filtered by region",
+  "sql": "SELECT\n  region AS region,\n  COUNT(*) AS \"COUNT(*)\",\n  AVG(amount) AS \"AVG(amount)\",\n  COUNT(DISTINCT product) AS \"COUNT_DISTINCT(product)\"\nFROM public.sales\nWHERE\n  region IN ('north', 'south')\nGROUP BY\n  region\nLIMIT 10000"
+ },
+ {
+  "key": "superset:60",
+  "tool": "superset",
+  "purpose": "chart: big number, row count",
+  "sql": "SELECT\n  COUNT(*) AS \"COUNT(*)\"\nFROM public.sales\nLIMIT 10000"
+ },
+ {
+  "key": "superset:61",
+  "tool": "superset",
+  "purpose": "chart: table by product, sum of amount",
+  "sql": "SELECT\n  product AS product,\n  SUM(amount) AS \"SUM(amount)\"\nFROM public.sales\nGROUP BY\n  product\nORDER BY\n  \"SUM(amount)\" DESC\nLIMIT 3"
+ },
+ {
+  "key": "superset:62",
+  "tool": "superset",
+  "purpose": "session: search path set to the schema",
+  "sql": "set search_path = \"crm\""
+ },
+ {
+  "key": "superset:63",
+  "tool": "superset",
+  "purpose": "chart: table of customer names, count",
+  "sql": "SELECT\n  name AS name,\n  COUNT(*) AS \"COUNT(*)\"\nFROM crm.customers\nGROUP BY\n  name\nLIMIT 100"
+ },
+ {
+  "key": "superset:64",
+  "tool": "superset",
+  "purpose": "chart: time series, month grain, DATE column time range (TO_DATE)",
+  "sql": "SELECT\n  DATE_TRUNC('MONTH', created) AS __timestamp,\n  COUNT(*) AS \"COUNT(*)\"\nFROM crm.customers\nWHERE\n  created >= TO_DATE('2026-01-01', 'YYYY-MM-DD')\n  AND created < TO_DATE('2026-03-31', 'YYYY-MM-DD')\nGROUP BY\n  DATE_TRUNC('MONTH', created)\nLIMIT 100"
+ },
+ {
+  "key": "dbeaver:A1",
+  "tool": "dbeaver",
+  "purpose": "Name the connection (DBeaver's client name)",
+  "sql": "SET application_name = 'DBeaver - Main'"
+ },
+ {
+  "key": "dbeaver:A2",
+  "tool": "dbeaver",
+  "purpose": "Read the server version string",
+  "sql": "SELECT version()"
+ },
+ {
+  "key": "dbeaver:A3",
+  "tool": "dbeaver",
+  "purpose": "Check that pg_enum exists (feature probe, server 12+)",
+  "sql": "SELECT * FROM pg_catalog.pg_enum WHERE 1<>1 LIMIT 1"
+ },
+ {
+  "key": "dbeaver:A4",
+  "tool": "dbeaver",
+  "purpose": "Check that pg_class has reltype (feature probe)",
+  "sql": "SELECT reltype FROM pg_catalog.pg_class WHERE 1<>1 LIMIT 1"
+ },
+ {
+  "key": "dbeaver:A5",
+  "tool": "dbeaver",
+  "purpose": "Read the connected database's row from pg_database (the only database listed by default)",
+  "sql": "SELECT db.oid,db.* FROM pg_catalog.pg_database db WHERE datname=$1",
+  "params": [
+   "lake"
+  ]
+ },
+ {
+  "key": "dbeaver:A6",
+  "tool": "dbeaver",
+  "purpose": "Preload one server setting (standard_conforming_strings)",
+  "sql": "select * from pg_catalog.pg_settings where name=$1",
+  "params": [
+   "standard_conforming_strings"
+  ]
+ },
+ {
+  "key": "dbeaver:A7",
+  "tool": "dbeaver",
+  "purpose": "Load the database's data types (base types and enums, not array or table types)",
+  "sql": "SELECT t.oid,t.*,c.relkind,format_type(nullif(t.typbasetype, 0), t.typtypmod) as base_type_name, d.description FROM pg_catalog.pg_type t LEFT OUTER JOIN pg_catalog.pg_type et ON et.oid=t.typelem LEFT OUTER JOIN pg_catalog.pg_class c ON c.oid=t.typrelid LEFT OUTER JOIN pg_catalog.pg_description d ON t.oid=d.objoid WHERE t.typname IS NOT NULL AND (c.relkind IS NULL OR c.relkind = 'c') AND (et.typcategory IS NULL OR et.typcategory <> 'C')"
+ },
+ {
+  "key": "dbeaver:A8",
+  "tool": "dbeaver",
+  "purpose": "List databases; sent only when 'Show all databases' is ticked (default off, so not sent on connect)",
+  "sql": "SELECT db.oid,db.* FROM pg_catalog.pg_database db WHERE 1 = 1 AND datallowconn AND NOT datistemplate OR db.datname =$1 ORDER BY db.datname",
+  "params": [
+   "lake"
+  ]
+ },
+ {
+  "key": "dbeaver:A9",
+  "tool": "dbeaver",
+  "purpose": "Size of the connected database (one database listed: WHERE db.oid=?)",
+  "sql": "SELECT db.datname,pg_database_size(db.oid) FROM pg_catalog.pg_database db WHERE db.oid=$1",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_database WHERE datname = 'lake'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:A10",
+  "tool": "dbeaver",
+  "purpose": "Template databases (for the Create database dialog)",
+  "sql": "SELECT db.datname FROM pg_catalog.pg_database db WHERE datistemplate"
+ },
+ {
+  "key": "dbeaver:A11",
+  "tool": "dbeaver",
+  "purpose": "Read the session's search_path from pg_settings",
+  "sql": "SELECT reset_val FROM pg_settings WHERE name = 'search_path'"
+ },
+ {
+  "key": "dbeaver:A12",
+  "tool": "dbeaver",
+  "purpose": "The current schema and the session user",
+  "sql": "SELECT current_schema(),session_user"
+ },
+ {
+  "key": "dbeaver:A13",
+  "tool": "dbeaver",
+  "purpose": "Put the active schema first on the search path (the default is public)",
+  "sql": "SET search_path = public"
+ },
+ {
+  "key": "dbeaver:A14",
+  "tool": "dbeaver",
+  "purpose": "The database's comment (Details of the database)",
+  "sql": "select description from pg_shdescription join pg_database on objoid = pg_database.oid where datname = $1",
+  "params": [
+   "lake"
+  ]
+ },
+ {
+  "key": "dbeaver:A15",
+  "tool": "dbeaver",
+  "purpose": "All server settings (Administer > Configuration)",
+  "sql": "select * from pg_catalog.pg_settings"
+ },
+ {
+  "key": "dbeaver:A16",
+  "tool": "dbeaver",
+  "purpose": "Connection.getCatalog() as pgjdbc runs it (only when DBeaver asks the connection for its catalog)",
+  "sql": "select current_catalog"
+ },
+ {
+  "key": "dbeaver:A17",
+  "tool": "dbeaver",
+  "purpose": "Connection.getSchema() as pgjdbc runs it",
+  "sql": "select current_schema()"
+ },
+ {
+  "key": "dbeaver:A18",
+  "tool": "dbeaver",
+  "purpose": "Connection ping: pgjdbc's isValid() sends an empty simple query",
+  "sql": ""
+ },
+ {
+  "key": "dbeaver:B1",
+  "tool": "dbeaver",
+  "purpose": "The schema list (no schema filter by default; utility schemas hidden in the navigator)",
+  "sql": "SELECT n.oid,n.*,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass  ORDER BY nspname"
+ },
+ {
+  "key": "dbeaver:B2",
+  "tool": "dbeaver",
+  "purpose": "The oid of one schema (readSchemaInfo)",
+  "sql": "SELECT s.oid as schema_id from pg_catalog.pg_namespace s WHERE s.nspname =$1",
+  "params": [
+   "crm"
+  ]
+ },
+ {
+  "key": "dbeaver:B3",
+  "tool": "dbeaver",
+  "purpose": "Default privileges of a schema",
+  "sql": "SELECT * FROM pg_default_acl WHERE defaclnamespace = $1",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'public'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:B4",
+  "tool": "dbeaver",
+  "purpose": "Table inheritance links inside a schema (cacheTableInheritance)",
+  "sql": "SELECT i.inhrelid relid, pc.relnamespace parent_ns, pc.oid parent_oid, i.inhseqno FROM pg_catalog.pg_inherits i, pg_class rc, pg_class pc WHERE rc.oid=i.inhrelid AND rc.relnamespace=$1 AND pc.oid=i.inhparent",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'public'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:B5",
+  "tool": "dbeaver",
+  "purpose": "Table and index sizes for a schema (the Statistics tab)",
+  "sql": "select c.oid,pg_catalog.pg_total_relation_size(c.oid) as total_rel_size,pg_catalog.pg_relation_size(c.oid) as rel_size FROM pg_class c WHERE c.relnamespace=$1",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'public'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C1",
+  "tool": "dbeaver",
+  "purpose": "tables, views and sequences of public (navigator)",
+  "sql": "SELECT c.oid,c.*,d.description,pg_catalog.pg_get_expr(c.relpartbound, c.oid) as partition_expr,  pg_catalog.pg_get_partkeydef(c.oid) as partition_key FROM pg_catalog.pg_class c LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=c.oid AND d.objsubid=0 AND d.classoid='pg_class'::regclass WHERE c.relnamespace=$1 AND c.relkind not in ('i','I','c')",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'public'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C2",
+  "tool": "dbeaver",
+  "purpose": "One table by name (opening sales)",
+  "sql": "SELECT c.oid,c.*,d.description,pg_catalog.pg_get_expr(c.relpartbound, c.oid) as partition_expr,  pg_catalog.pg_get_partkeydef(c.oid) as partition_key FROM pg_catalog.pg_class c LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=c.oid AND d.objsubid=0 AND d.classoid='pg_class'::regclass WHERE c.relnamespace=$1 AND c.relkind not in ('i','I','c') AND relname=$2",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'public'"
+   },
+   "sales"
+  ]
+ },
+ {
+  "key": "dbeaver:C3",
+  "tool": "dbeaver",
+  "purpose": "Tables of schema crm",
+  "sql": "SELECT c.oid,c.*,d.description,pg_catalog.pg_get_expr(c.relpartbound, c.oid) as partition_expr,  pg_catalog.pg_get_partkeydef(c.oid) as partition_key FROM pg_catalog.pg_class c LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=c.oid AND d.objsubid=0 AND d.classoid='pg_class'::regclass WHERE c.relnamespace=$1 AND c.relkind not in ('i','I','c')",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'crm'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C4",
+  "tool": "dbeaver",
+  "purpose": "Columns of sales in order, with defaults, comments and the owned sequence (dep.objid)",
+  "sql": "SELECT c.relname,a.*,pg_catalog.pg_get_expr(ad.adbin, ad.adrelid, true) as def_value,dsc.description,dep.objid FROM pg_catalog.pg_attribute a INNER JOIN pg_catalog.pg_class c ON (a.attrelid=c.oid) LEFT OUTER JOIN pg_catalog.pg_attrdef ad ON (a.attrelid=ad.adrelid AND a.attnum = ad.adnum) LEFT OUTER JOIN pg_catalog.pg_description dsc ON (c.oid=dsc.objoid AND a.attnum = dsc.objsubid) LEFT OUTER JOIN pg_depend dep on dep.refobjid = a.attrelid AND dep.deptype = 'i' and dep.refobjsubid = a.attnum and dep.classid = dep.refclassid WHERE NOT a.attisdropped AND c.relkind not in ('i','I','c') AND c.oid=$1 ORDER BY a.attnum",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C5",
+  "tool": "dbeaver",
+  "purpose": "Columns of every table in public (loaded when the schema's tables are cached)",
+  "sql": "SELECT c.relname,a.*,pg_catalog.pg_get_expr(ad.adbin, ad.adrelid, true) as def_value,dsc.description,dep.objid FROM pg_catalog.pg_attribute a INNER JOIN pg_catalog.pg_class c ON (a.attrelid=c.oid) LEFT OUTER JOIN pg_catalog.pg_attrdef ad ON (a.attrelid=ad.adrelid AND a.attnum = ad.adnum) LEFT OUTER JOIN pg_catalog.pg_description dsc ON (c.oid=dsc.objoid AND a.attnum = dsc.objsubid) LEFT OUTER JOIN pg_depend dep on dep.refobjid = a.attrelid AND dep.deptype = 'i' and dep.refobjsubid = a.attnum and dep.classid = dep.refclassid WHERE NOT a.attisdropped AND c.relkind not in ('i','I','c') AND c.relnamespace=$1 ORDER BY a.attnum",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'public'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C6",
+  "tool": "dbeaver",
+  "purpose": "Primary, unique, foreign key and check constraints of public",
+  "sql": "SELECT c.oid,c.*,t.relname as tabrelname,rt.relnamespace as refnamespace,d.description, case when c.contype='c' then \"substring\"(pg_get_constraintdef(c.oid), 7) else null end consrc_copy FROM pg_catalog.pg_constraint c INNER JOIN pg_catalog.pg_class t ON t.oid=c.conrelid LEFT OUTER JOIN pg_catalog.pg_class rt ON rt.oid=c.confrelid LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=c.oid AND d.objsubid=0 AND d.classoid='pg_constraint'::regclass WHERE t.relnamespace=$1 ORDER BY c.oid",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'public'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C7",
+  "tool": "dbeaver",
+  "purpose": "Constraints of sales (the table's Constraints and Foreign keys tabs)",
+  "sql": "SELECT c.oid,c.*,t.relname as tabrelname,rt.relnamespace as refnamespace,d.description, case when c.contype='c' then \"substring\"(pg_get_constraintdef(c.oid), 7) else null end consrc_copy FROM pg_catalog.pg_constraint c INNER JOIN pg_catalog.pg_class t ON t.oid=c.conrelid LEFT OUTER JOIN pg_catalog.pg_class rt ON rt.oid=c.confrelid LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=c.oid AND d.objsubid=0 AND d.classoid='pg_constraint'::regclass WHERE c.conrelid=$1 ORDER BY c.oid",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C8",
+  "tool": "dbeaver",
+  "purpose": "Definition text of the primary key (the constraint's DDL)",
+  "sql": "SELECT pg_catalog.pg_get_constraintdef($1)",
+  "params": [
+   {
+    "lookup": "SELECT c.oid FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid WHERE t.relname = 'sales' AND c.contype = 'p'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C9",
+  "tool": "dbeaver",
+  "purpose": "Indexes of sales (plain and expression indexes), with sizes and scan counts",
+  "sql": "SELECT i.*,i.indkey as keys,c.relname,c.relnamespace,c.relam,c.reltablespace,tc.relname as tabrelname,dsc.description,pg_catalog.pg_get_expr(i.indpred, i.indrelid) as pred_expr,pg_catalog.pg_get_expr(i.indexprs, i.indrelid, true) as expr,pg_catalog.pg_relation_size(i.indexrelid) as index_rel_size,pg_catalog.pg_stat_get_numscans(i.indexrelid) as index_num_scans  FROM pg_catalog.pg_index i INNER JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid INNER JOIN pg_catalog.pg_class tc ON tc.oid=i.indrelid LEFT OUTER JOIN pg_catalog.pg_description dsc ON i.indexrelid=dsc.objoid WHERE  i.indrelid=$1 ORDER BY tabrelname, c.relname",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C10",
+  "tool": "dbeaver",
+  "purpose": "Indexes of every table in public",
+  "sql": "SELECT i.*,i.indkey as keys,c.relname,c.relnamespace,c.relam,c.reltablespace,tc.relname as tabrelname,dsc.description,pg_catalog.pg_get_expr(i.indpred, i.indrelid) as pred_expr,pg_catalog.pg_get_expr(i.indexprs, i.indrelid, true) as expr,pg_catalog.pg_relation_size(i.indexrelid) as index_rel_size,pg_catalog.pg_stat_get_numscans(i.indexrelid) as index_num_scans  FROM pg_catalog.pg_index i INNER JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid INNER JOIN pg_catalog.pg_class tc ON tc.oid=i.indrelid LEFT OUTER JOIN pg_catalog.pg_description dsc ON i.indexrelid=dsc.objoid WHERE  c.relnamespace=$1 ORDER BY tabrelname, c.relname",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'public'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C11",
+  "tool": "dbeaver",
+  "purpose": "Definition of one index (CREATE INDEX text)",
+  "sql": "SELECT pg_catalog.pg_get_indexdef($1)",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales_region_idx'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C12",
+  "tool": "dbeaver",
+  "purpose": "Text of an expression index's column (used when the column number is 0)",
+  "sql": "select pg_catalog.pg_get_indexdef($1, $2, true)",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales_double_idx'"
+   },
+   1
+  ]
+ },
+ {
+  "key": "dbeaver:C13",
+  "tool": "dbeaver",
+  "purpose": "Schemas holding a foreign key that points at crm.customers (the 'referenced by' list)",
+  "sql": "SELECT DISTINCT connamespace FROM pg_catalog.pg_constraint WHERE confrelid=$1",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'customers'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C14",
+  "tool": "dbeaver",
+  "purpose": "Parent tables of sales (inheritance)",
+  "sql": "SELECT i.*,c.relnamespace FROM pg_catalog.pg_inherits i,pg_catalog.pg_class c WHERE i.inhrelid=$1 AND c.oid=i.inhparent ORDER BY i.inhseqno",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C15",
+  "tool": "dbeaver",
+  "purpose": "Child tables of sales (inheritance)",
+  "sql": "SELECT i.*,c.relnamespace FROM pg_catalog.pg_inherits i,pg_catalog.pg_class c WHERE i.inhparent=$1 AND c.oid=i.inhrelid",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C16",
+  "tool": "dbeaver",
+  "purpose": "Partition bound of sales (null for a plain table)",
+  "sql": "select pg_get_expr(c.relpartbound, c.oid, true) as partition_range from \"pg_catalog\".pg_class c where relname = $1 and relnamespace = $2;",
+  "params": [
+   "sales",
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'public'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C17",
+  "tool": "dbeaver",
+  "purpose": "Row-level security policies of sales",
+  "sql": "select * from pg_catalog.pg_policies where schemaname=$1 and tablename=$2",
+  "params": [
+   "public",
+   "sales"
+  ]
+ },
+ {
+  "key": "dbeaver:C18",
+  "tool": "dbeaver",
+  "purpose": "Size of sales on disk (total and heap)",
+  "sql": "select pg_catalog.pg_total_relation_size($1) as total_rel_size,pg_catalog.pg_relation_size($2) as rel_size",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales'"
+   },
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C19",
+  "tool": "dbeaver",
+  "purpose": "Triggers of sales (internal triggers left out)",
+  "sql": "SELECT x.oid,x.*,p.pronamespace as func_schema_id,d.description FROM pg_catalog.pg_trigger x LEFT OUTER JOIN pg_catalog.pg_proc p ON p.oid=x.tgfoid LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=x.oid AND d.objsubid=0 WHERE x.tgrelid = $1 AND NOT x.tgisinternal",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C20",
+  "tool": "dbeaver",
+  "purpose": "Rewrite rules of sales (the table's own rules, not the view _RETURN rule)",
+  "sql": "SELECT r.oid,r.*, pg_get_ruledef(r.oid) AS definition FROM pg_rewrite r WHERE r.ev_class=$1 AND r.rulename <> '_RETURN'::name",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C21",
+  "tool": "dbeaver",
+  "purpose": "Foreign-table details (sales is not one, so no row)",
+  "sql": "SELECT * FROM pg_catalog.pg_foreign_table WHERE ftrelid=$1",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C22",
+  "tool": "dbeaver",
+  "purpose": "The view's definition (pg_get_viewdef), shown as the view's source",
+  "sql": "SELECT pg_get_viewdef($1, true)",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales_by_region'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C23",
+  "tool": "dbeaver",
+  "purpose": "What sales depends on: its owned sequence and its indexes (the Dependencies tab)",
+  "sql": "SELECT DISTINCT dep.deptype, dep.classid, dep.refobjid, cl.relkind, attr.attname,pg_get_expr(ad.adbin, ad.adrelid) adefval, CASE WHEN cl.relkind IS NOT NULL THEN cl.relkind::text || COALESCE(dep.objsubid::text, '')::text WHEN tg.oid IS NOT NULL THEN 'T'::text WHEN ty.oid IS NOT NULL THEN 'y'::text WHEN ns.oid IS NOT NULL THEN 'n'::text WHEN pr.oid IS NOT NULL THEN 'p'::text WHEN la.oid IS NOT NULL THEN 'l'::text WHEN rw.oid IS NOT NULL THEN 'R'::text WHEN co.oid IS NOT NULL THEN 'C'::text || contype::text WHEN ad.oid IS NOT NULL THEN 'A'::text ELSE '' END AS type, COALESCE(coc.relname, clrw.relname, tgr.relname) AS ownertable, CASE WHEN cl.relname IS NOT NULL AND att.attname IS NOT NULL THEN cl.relname || '.' || att.attname ELSE COALESCE(cl.relname, co.conname, pr.proname, tg.tgname, ty.typname, la.lanname, rw.rulename, ns.nspname) END AS refname, COALESCE(nsc.nspname, nso.nspname, nsp.nspname, nst.nspname, nsrw.nspname, tgrn.nspname) AS nspname FROM pg_depend dep LEFT JOIN pg_class cl ON dep.refobjid=cl.oid LEFT JOIN pg_attribute att ON dep.refobjid=att.attrelid AND dep.objsubid=att.attnum LEFT JOIN pg_namespace nsc ON cl.relnamespace=nsc.oid LEFT JOIN pg_proc pr ON dep.refobjid=pr.oid LEFT JOIN pg_namespace nsp ON pr.pronamespace=nsp.oid LEFT JOIN pg_trigger tg ON dep.refobjid=tg.oid LEFT JOIN pg_class tgr ON tg.tgrelid=tgr.oid LEFT JOIN pg_namespace tgrn ON tgr.relnamespace=tgrn.oid LEFT JOIN pg_type ty ON dep.refobjid=ty.oid LEFT JOIN pg_namespace nst ON ty.typnamespace=nst.oid LEFT JOIN pg_constraint co ON dep.refobjid=co.oid LEFT JOIN pg_class coc ON co.conrelid=coc.oid LEFT JOIN pg_namespace nso ON co.connamespace=nso.oid LEFT JOIN pg_rewrite rw ON dep.refobjid=rw.oid LEFT JOIN pg_class clrw ON clrw.oid=rw.ev_class LEFT JOIN pg_namespace nsrw ON clrw.relnamespace=nsrw.oid LEFT JOIN pg_language la ON dep.refobjid=la.oid LEFT JOIN pg_namespace ns ON dep.refobjid=ns.oid LEFT JOIN pg_attrdef ad ON ad.oid=dep.refobjid LEFT JOIN pg_attribute attr ON attr.attrelid=ad.adrelid and attr.attnum=ad.adnum WHERE dep.objid=$1 ORDER BY type",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'sales'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:C24",
+  "tool": "dbeaver",
+  "purpose": "The sequence's settings (pg_sequences) for sales_seq",
+  "sql": "SELECT * from pg_catalog.pg_sequences WHERE schemaname=$1 AND sequencename=$2",
+  "params": [
+   "public",
+   "sales_seq"
+  ]
+ },
+ {
+  "key": "dbeaver:D1",
+  "tool": "dbeaver",
+  "purpose": "The data types of public (enums and base types; not table row types or array types)",
+  "sql": "SELECT t.oid,t.*,c.relkind,format_type(nullif(t.typbasetype, 0), t.typtypmod) as base_type_name, d.description FROM pg_catalog.pg_type t LEFT OUTER JOIN pg_catalog.pg_type et ON et.oid=t.typelem LEFT OUTER JOIN pg_catalog.pg_class c ON c.oid=t.typrelid LEFT OUTER JOIN pg_catalog.pg_description d ON t.oid=d.objoid WHERE t.typname IS NOT NULL AND (c.relkind IS NULL OR c.relkind = 'c') AND (et.typcategory IS NULL OR et.typcategory <> 'C') AND t.typnamespace=$1 ",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'public'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:D2",
+  "tool": "dbeaver",
+  "purpose": "One data type by oid (the enum mood)",
+  "sql": "SELECT t.oid,t.*,c.relkind,format_type(nullif(t.typbasetype, 0), t.typtypmod) as base_type_name FROM pg_catalog.pg_type t LEFT OUTER JOIN pg_class c ON c.oid=t.typrelid LEFT OUTER JOIN pg_catalog.pg_description d ON t.oid=d.objoid WHERE t.oid=$1 ",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_type WHERE typname = 'mood'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:D3",
+  "tool": "dbeaver",
+  "purpose": "The labels of enum mood, in order",
+  "sql": "SELECT e.enumlabel \nFROM pg_catalog.pg_enum e\nWHERE e.enumtypid=$1\nORDER BY e.enumsortorder",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_type WHERE typname = 'mood'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:D4",
+  "tool": "dbeaver",
+  "purpose": "Every enum label in the database, loaded with the types",
+  "sql": "SELECT * FROM pg_catalog.pg_enum"
+ },
+ {
+  "key": "dbeaver:D5",
+  "tool": "dbeaver",
+  "purpose": "Attributes of crm.customers' row type (a composite)",
+  "sql": "SELECT c.relname,row_number() OVER (ORDER BY a.attnum) as attnum,a.*,pg_catalog.pg_get_expr(ad.adbin, ad.adrelid, true) as def_value,dsc.description FROM pg_catalog.pg_attribute a INNER JOIN pg_catalog.pg_class c ON (a.attrelid=c.oid) LEFT OUTER JOIN pg_catalog.pg_attrdef ad ON (a.attrelid=ad.adrelid AND a.attnum = ad.adnum) LEFT OUTER JOIN pg_catalog.pg_description dsc ON (c.oid=dsc.objoid AND a.attnum = dsc.objsubid) WHERE a.attnum > 0 AND NOT a.attisdropped AND c.oid=$1 ORDER BY a.attnum",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_class WHERE relname = 'customers'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:D6",
+  "tool": "dbeaver",
+  "purpose": "pgjdbc's cache of SQL type codes for every type on the search path",
+  "sql": "SELECT typinput='pg_catalog.array_in'::regproc as is_array, typtype, typname, pg_type.oid   FROM pg_catalog.pg_type   LEFT JOIN (select ns.oid as nspoid, ns.nspname, r.r from pg_namespace as ns join ( select s.r, (current_schemas(false))[s.r] as nspname from generate_series(1, array_upper(current_schemas(false), 1)) as s(r) ) as r using ( nspname ) ) as sp ON sp.nspoid = typnamespace  ORDER BY sp.r, pg_type.oid DESC;"
+ },
+ {
+  "key": "dbeaver:D7",
+  "tool": "dbeaver",
+  "purpose": "pgjdbc's name lookup for an enum type's oid (when a result column has one)",
+  "sql": "SELECT n.nspname = ANY(current_schemas(true)), n.nspname, t.typname FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid WHERE t.oid = $1",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_type WHERE typname = 'mood'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:D8",
+  "tool": "dbeaver",
+  "purpose": "pgjdbc's oid lookup for a type named mood",
+  "sql": "SELECT pg_type.oid, typname   FROM pg_catalog.pg_type   LEFT   JOIN (select ns.oid as nspoid, ns.nspname, r.r  from pg_namespace as ns  join ( select s.r, (current_schemas(false))[s.r] as nspname  from generate_series(1, array_upper(current_schemas(false), 1)) as s(r) ) as r  using ( nspname )  ) as sp  ON sp.nspoid = typnamespace  WHERE typname = $1  ORDER BY sp.r, pg_type.oid DESC LIMIT 1;",
+  "params": [
+   "mood"
+  ]
+ },
+ {
+  "key": "dbeaver:D9",
+  "tool": "dbeaver",
+  "purpose": "type names outside pg_toast (replayed; not DBeaver's native path)",
+  "sql": "SELECT t.typname,t.oid FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON (t.typnamespace = n.oid)  WHERE n.nspname  != 'pg_toast' AND  (t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM pg_catalog.pg_class c WHERE c.oid = t.typrelid))"
+ },
+ {
+  "key": "dbeaver:E1",
+  "tool": "dbeaver",
+  "purpose": "Every role (the Roles node)",
+  "sql": "SELECT a.oid,a.*,pd.description FROM pg_catalog.pg_roles a \nleft join pg_catalog.pg_shdescription pd on a.oid = pd.objoid\nORDER BY a.rolname"
+ },
+ {
+  "key": "dbeaver:E2",
+  "tool": "dbeaver",
+  "purpose": "Roles that analyst is a member of, as the role's Members tab reads them (roleid=?)",
+  "sql": "SELECT * FROM pg_catalog.pg_auth_members WHERE roleid=$1",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_roles WHERE rolname = 'analyst'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:E3",
+  "tool": "dbeaver",
+  "purpose": "Roles whose member is analyst (member=?)",
+  "sql": "SELECT * FROM pg_catalog.pg_auth_members WHERE member=$1",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_roles WHERE rolname = 'analyst'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:E4",
+  "tool": "dbeaver",
+  "purpose": "Per-role settings (ALTER ROLE ",
+  "sql": "select s.setconfig, pd.datname from pg_catalog.pg_db_role_setting s left join pg_catalog.pg_database pd on s.setdatabase = pd.oid where s.setrole = $1",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_roles WHERE rolname = 'analyst'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:E5",
+  "tool": "dbeaver",
+  "purpose": "Table privileges granted to analyst",
+  "sql": "SELECT * FROM information_schema.table_privileges WHERE table_catalog=$1 AND grantee=$2 UNION ALL SELECT pg_catalog.pg_get_userbyid(acl.grantor) AS grantor, pg_catalog.pg_get_userbyid(acl.grantee) AS grantee, current_database() AS table_catalog, n.nspname AS table_schema, c.relname AS table_name, acl.privilege_type, CASE WHEN acl.is_grantable THEN 'YES' ELSE 'NO' END AS is_grantable, 'NO' AS with_hierarchy FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS acl WHERE c.relacl IS NOT NULL AND c.relkind IN ('r', 'v', 'f', 'p') AND acl.privilege_type in ('MAINTAIN') AND acl.grantee = $3;",
+  "params": [
+   "lake",
+   "analyst",
+   {
+    "lookup": "SELECT oid FROM pg_roles WHERE rolname = 'analyst'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:E6",
+  "tool": "dbeaver",
+  "purpose": "Routine privileges granted to analyst",
+  "sql": "SELECT * FROM information_schema.routine_privileges WHERE specific_catalog=$1 AND grantee=$2",
+  "params": [
+   "lake",
+   "analyst"
+  ]
+ },
+ {
+  "key": "dbeaver:E7",
+  "tool": "dbeaver",
+  "purpose": "Schema, sequence and materialized view privileges granted to analyst",
+  "sql": "SELECT * FROM (\n\tSELECT DISTINCT relnamespace,\n\trelacl,\n\trelname,\n\trelkind,\n(aclexplode(relacl)).grantee as granteeI\nFROM\n\tpg_class\nWHERE\n\trelacl IS NOT NULL\n\tAND relnamespace IN (\nSELECT oid\nFROM pg_namespace\nWHERE nspname NOT LIKE 'pg_%' AND nspname != 'information_schema')\nUNION ALL\nSELECT DISTINCT\n\tn.oid AS relnamespace,\n\tnspacl AS relacl,\n\tn.nspname AS relname,\n\tcast('C' as \"char\") AS relkind,\n(aclexplode(nspacl)).grantee as granteeI\nFROM\n\tpg_catalog.pg_namespace n\nWHERE\n\tn.nspacl IS NOT NULL \n\t) AS tr\nWHERE pg_get_userbyid(tr.granteeI) = $1 AND tr.relkind IN('S', 'm', 'C')",
+  "params": [
+   "analyst"
+  ]
+ },
+ {
+  "key": "dbeaver:F1",
+  "tool": "dbeaver",
+  "purpose": "Functions and procedures of public (the Procedures node)",
+  "sql": "SELECT p.oid as poid,p.*,pg_catalog.pg_get_expr(p.proargdefaults, 0) as arg_defaults,d.description\nFROM pg_catalog.pg_proc p\nLEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=p.oid and d.classoid='pg_proc'::regclass  AND d.objsubid = 0\nWHERE p.pronamespace=$1\nORDER BY p.proname",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'public'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:F2",
+  "tool": "dbeaver",
+  "purpose": "The source of function add_one (pg_get_functiondef)",
+  "sql": "SELECT pg_get_functiondef($1)",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_proc WHERE proname = 'add_one'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:F3",
+  "tool": "dbeaver",
+  "purpose": "The body text of add_one, when pg_get_functiondef is not used",
+  "sql": "SELECT prosrc FROM pg_proc where oid = $1",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_proc WHERE proname = 'add_one'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:F4",
+  "tool": "dbeaver",
+  "purpose": "Aggregates of public (none in the sample)",
+  "sql": "SELECT p.oid AS proc_oid,p.proname AS proc_name,a.*\nFROM pg_catalog.pg_aggregate a,pg_catalog.pg_proc p\nWHERE p.oid=a.aggfnoid AND p.pronamespace=$1\nORDER BY p.proname",
+  "params": [
+   {
+    "lookup": "SELECT oid FROM pg_namespace WHERE nspname = 'public'"
+   }
+  ]
+ },
+ {
+  "key": "dbeaver:G1",
+  "tool": "dbeaver",
+  "purpose": "Index access methods (btree, hash, gist...)",
+  "sql": "SELECT am.oid,am.* FROM pg_catalog.pg_am am \nORDER BY am.oid"
+ },
+ {
+  "key": "dbeaver:G2",
+  "tool": "dbeaver",
+  "purpose": "Encodings the database converts between",
+  "sql": "SELECT c.contoencoding as encid,pg_catalog.pg_encoding_to_char(c.contoencoding) as encname\nFROM pg_catalog.pg_conversion c\nGROUP BY c.contoencoding\nORDER BY 2\n"
+ },
+ {
+  "key": "dbeaver:G3",
+  "tool": "dbeaver",
+  "purpose": "Collations",
+  "sql": "SELECT c.oid,c.* FROM pg_catalog.pg_collation c \nORDER BY c.oid"
+ },
+ {
+  "key": "dbeaver:G4",
+  "tool": "dbeaver",
+  "purpose": "Procedural languages",
+  "sql": "SELECT l.oid,l.* FROM pg_catalog.pg_language l \nORDER BY l.oid"
+ },
+ {
+  "key": "dbeaver:G5",
+  "tool": "dbeaver",
+  "purpose": "Foreign data wrappers",
+  "sql": "SELECT l.oid,l.*,p.pronamespace as handler_schema_id \nFROM pg_catalog.pg_foreign_data_wrapper l\nLEFT OUTER JOIN pg_catalog.pg_proc p ON p.oid=l.fdwhandler \nORDER BY l.fdwname"
+ },
+ {
+  "key": "dbeaver:G6",
+  "tool": "dbeaver",
+  "purpose": "Foreign servers",
+  "sql": "SELECT l.oid,l.* FROM pg_catalog.pg_foreign_server l\nORDER BY l.srvname"
+ },
+ {
+  "key": "dbeaver:G7",
+  "tool": "dbeaver",
+  "purpose": "Tablespaces, with their location",
+  "sql": "SELECT t.oid,t.*,pg_tablespace_location(t.oid) loc\nFROM pg_catalog.pg_tablespace t \nORDER BY t.oid"
+ },
+ {
+  "key": "dbeaver:G8",
+  "tool": "dbeaver",
+  "purpose": "Extensions the server can install",
+  "sql": "SELECT name,default_version,installed_version,comment FROM pg_catalog.pg_available_extensions ORDER BY name"
+ },
+ {
+  "key": "dbeaver:G9",
+  "tool": "dbeaver",
+  "purpose": "Event triggers",
+  "sql": "SELECT pet.*, d.description FROM pg_catalog.pg_event_trigger pet\nLEFT OUTER JOIN pg_catalog.pg_description d ON pet.\"oid\" = d.objoid"
+ },
+ {
+  "key": "dbeaver:G10",
+  "tool": "dbeaver",
+  "purpose": "Extensions installed in the database, with the tables each one configures",
+  "sql": "SELECT \n e.oid,\n cfg.tbls,\n  n.nspname as schema_name,\n e.* \nFROM \n pg_catalog.pg_extension e \n join pg_namespace n on n.oid =e.extnamespace\n left join  (\n         select\n            ARRAY_AGG(ns.nspname || '.' ||  cls.relname) tbls, oid_ext\n          from\n            (\n            select\n                unnest(e1.extconfig) oid , e1.oid oid_ext\n            from\n                pg_catalog.pg_extension e1 ) c \n                join    pg_class cls on cls.oid = c.oid \n                join pg_namespace ns on ns.oid = cls.relnamespace\n            group by oid_ext        \n         ) cfg on cfg.oid_ext = e.oid\nORDER BY e.oid"
+ },
+ {
+  "key": "dbeaver:G11",
+  "tool": "dbeaver",
+  "purpose": "pgAgent's job list",
+  "sql": "SELECT * FROM pgagent.pga_job"
+ },
+ {
+  "key": "dbeaver:G12",
+  "tool": "dbeaver",
+  "purpose": "pgAgent's job classes (same condition as G11)",
+  "sql": "SELECT * FROM pgagent.pga_jobclass"
+ },
+ {
+  "key": "dbeaver:H1",
+  "tool": "dbeaver",
+  "purpose": "Sessions on the server (Administer > Sessions), idle ones left out",
+  "sql": "SELECT sa.* FROM pg_catalog.pg_stat_activity sa where sa.state is null or sa.state not like 'idle%'"
+ },
+ {
+  "key": "dbeaver:I1",
+  "tool": "dbeaver",
+  "purpose": "Data tab: first page of sales (page size set on Execute)",
+  "sql": "SELECT * FROM public.sales"
+ },
+ {
+  "key": "dbeaver:I3",
+  "tool": "dbeaver",
+  "purpose": "Data tab's row count for sales",
+  "sql": "SELECT COUNT(*) FROM public.sales"
+ },
+ {
+  "key": "dbeaver:I4",
+  "tool": "dbeaver",
+  "purpose": "Data tab of the view sales_by_region, first page",
+  "sql": "SELECT * FROM public.sales_by_region"
+ },
+ {
+  "key": "dbeaver:I5",
+  "tool": "dbeaver",
+  "purpose": "Row count for the view sales_by_region",
+  "sql": "SELECT COUNT(*) FROM public.sales_by_region"
+ },
+ {
+  "key": "dbeaver:I6",
+  "tool": "dbeaver",
+  "purpose": "Data tab: first page of sales with LIMIT (only if maxrows.sql is set)",
+  "sql": "SELECT * FROM public.sales\nLIMIT 200"
+ },
+ {
+  "key": "dbeaver:I7",
+  "tool": "dbeaver",
+  "purpose": "Second page with 'use SQL for max rows' on: LIMIT with OFFSET",
+  "sql": "SELECT * FROM public.sales\nLIMIT 200 OFFSET 200"
+ },
+ {
+  "key": "dbeaver:I8",
+  "tool": "dbeaver",
+  "purpose": "Data tab of crm.customers, first page",
+  "sql": "SELECT * FROM crm.customers"
+ }
+]
