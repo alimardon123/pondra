@@ -11,7 +11,7 @@ round is complete.
 
 ## Where Pondra stands
 
-Rounds 17 to 33 are released (0.33.0).
+Rounds 17 to 34 are released (0.34.0).
 One binary is a streaming store, a lakehouse and a SQL engine: exactly-once ingest from eight doors,
 Parquet in your bucket, SQL spread over any number of nodes, flows of views, windows and as-of
 joins, other engines reading and writing its tables, users and grants, TLS, transactions, a
@@ -41,7 +41,7 @@ newest logged; a round's run replaces them.
 | **Cheap to run**: what a stream costs the bucket | Kafka, WarpStream, Buffer | On a simulated bucket with R2's latency (one 4-core VM, `logs/round34/cost-steady.json`): one node taking 13 MiB/s of 1 KB values through the Kafka port made 8.7 writes and 6.3 reads a second, $121 a month in requests at S3's list prices ($109 at R2's); three nodes at 16 MiB/s $247 ($222); one node at S3's latency, 26 MiB/s, $216 ($194). Requests come per commit round, not per byte. OpenData puts Buffer at about $91 a month at 30 MB/s, WarpStream $1,300 and self-hosted Kafka $8,500 | 30 MiB/s itself, on real R2 (`limits-r2.yml`'s nightly cost job: this VM's cores went to the producers and the simulator); fewer writes a round (a segment per node and a catalog write per round); followers reading other nodes' segments from the commit stream instead of the bucket; bytes between the nodes, on Google Cloud | L1 |
 | **Never loses data** | Kafka, Flink | kill -9 and injected crashes, every event once; failovers in both ack modes; every release's lake since 0.22 opens; 64 writers and 16 readers, 0 torn reads; the 24-hour soak's first leg on R2 (4.8 hours, 8 nodes stopped or killed): 43,138 batches, none lost or twice, 0 torn reads of 423,085 | the soak's other legs, logged, and its memory check (Lightweight) | L7 |
 | **Right answers** | every engine | sqllogictest 98% of records not named an exception; TPC-H 22/22 on 1, 3 and 6 nodes; TPC-DS 99/99 == DuckDB on one node and three; 100,000 random queries, one node == three == DuckDB | — | holds (L6) |
-| **Fast points and writes** | Postgres for serving | lookups 0.13 ms over HTTP, 0.22 ms over the Postgres port (Postgres 0.08) (`logs/gates/2026-10-03-postgres.txt`); a writer's 19,900 rows a second beside 400 readers, acks 5 ms (`logs/round34/users-writes.json`); another node sees a write 7 ms later | pgbench 198 transactions a second on one client but 168 on four (Postgres 1,793); a one-row INSERT 2.4 ms (Postgres 0.24) | L3 |
+| **Fast points and writes** | Postgres for serving | lookups 0.13 ms over HTTP, 0.22 ms over the Postgres port (Postgres 0.08) (`logs/gates/2026-10-03-postgres.txt`); a writer's 19,900 rows a second beside 400 readers, acks 5 ms (`logs/round34/users-writes.json`); another node sees a write 7 ms later; TPC-H SF1's statements repeating as a dashboard's do, on one 4-core node: 11,775 a second at 100 clients and 11,149 at 400 over HTTP, p99 under 100 ms, 7,983 at 100 over the Postgres port (`logs/round34/serve-vs-reyden.json`) | every statement new: 38 Q6 a second, one Q6 twice DuckDB's time; pgbench 198 transactions a second on one client but 168 on four (Postgres 1,793); a one-row INSERT 2.4 ms (Postgres 0.24) | L3 |
 | **Fits in** | the Postgres ecosystem | dbt == Postgres 16's rows; psql, SQLAlchemy, pgjdbc, psqlODBC, ADBC, Npgsql (`clients_check.py`); Spark and PyIceberg write | Metabase, Superset, Grafana, Tableau, DBeaver, Power BI checked; Postgres and MySQL attached with changes streamed in | L3, L4, L5 |
 | **Every feature through every door** (principle 10) | engines with one or two ways in | the doors matrix (`harness.py doors`): one list of features through SQL over HTTP, Python, the Postgres port, Flight SQL, JavaScript and MCP, each cell right or refused by name | JavaScript has no frames, `write_table` or `read_*` (35); a table with an enforced `UNIQUE` is refused by the loading doors (appends, Kafka, Flight, `COPY`) and Flight SQL and MCP hold no transaction (36); Kafka topics have one partition and no transactions (36); enum types are text in Postgres's catalog (36); the command line and the console in the matrix (37) | L2, L3, L8 |
 | **Easy to change and extend** (principle 9) | closed platforms | one registry of every kind of object; the console's `register.*` and extensions; one check at every door | `INSTALL` / `LOAD` extensions (ADR-031, proposed) | the owner's call |
@@ -53,8 +53,8 @@ newest logged; a round's run replaces them.
 The owner, 2026-10-11: 1.0 in a month, finished and polished, built by many threads at once, each
 led by one that designs, reviews and answers for its result. So rounds 35 to 37 run side by side as
 **lanes**, one thread each, every lane owning its files (the list, with each lane's reserved numbers,
-is `designs/one-month-to-1-0.md` in the project's files). Rounds 17 to 33 are released; round 34
-(SQL as people write it, the proof runs) is merged and ships as 0.34.0.
+is `designs/one-month-to-1-0.md` in the project's files). Rounds 17 to 34 are released; round 34
+(SQL as people write it, the proof runs) shipped as 0.34.0 on 10-14.
 
 | Date | |
 |---|---|

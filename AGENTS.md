@@ -2795,13 +2795,32 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-10-10, round 33 complete: 0.33.0)
+## State of the work (2026-10-14, round 34 complete: 0.34.0)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
 round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/`, round 26's in `logs/round26/`, round 27's in `logs/round27/`, round 28's in `logs/round28/`, round 29's in `logs/round29/`, round 30's in `logs/round30/`, round 31's in `logs/round31/` and round 32's in `logs/round32/`; from round 33 on, each pull request's checks are in its body and its one-page review, and the gates' rows in `logs/gates/`.
+
+**Round 34 (0.34.0, the first weekly release of the month to 1.0): SQL as people write it, safe on
+a network, the tools people use.** Safety: a node listening beyond its machine is never open (376),
+one a program started answers only it (378), the row doors and the nodes' routes take only what the
+caller may write (373, 374, 408), the admin token as the master key (375), passwords only over TLS
+from elsewhere and sign-ins counted (380, 381), a user shown only what it may use (382), temporary
+secrets on the public internet only (405, 406). In a process: `connect()` and a lake in memory
+(ADR-061, ADR-072: 300–307), the library on jemalloc (383), bulk loads a batch at a time (5 s for
+TPC-H SF1's tables, 21 s before). Fits in: SQLAlchemy, the DB-API, Alembic and a dbt adapter,
+Grafana's, Metabase's, Superset's and DBeaver's statements answered as Postgres 16 answers them,
+Postgres's column names and remembered answers on its port (399, 400), READ COMMITTED with row locks
+(322–325), `RETURNING` (395), `UUID` (396). SQL: 281 statements as newcomers type them, `USE`, IN
+and EXISTS outside a WHERE (297), avg over a DECIMAL rounded (296), `VARCHAR(n)` (298), a plain
+INSERT never replacing a key's row (318), `pondra.parts` and `pondra.find` (345). Engine: TPC-H SF1
+from memory level with DuckDB's own tables, joins sized from what the tables know, Nexmark's views
+answering 7× sooner, a lake's only node killed and writable again in 0.1 s (370, 384), backups
+(ADR-070: 290, 291), `COPY INTO` (337), Glue, S3 Tables and vended credentials (339), what a stream
+costs its bucket. Left for later rounds: the scale runs on machines (Google Cloud), the soak's 24
+hours on R2, the browser and ADR-072 §8.
 
 **Round 33 (0.33.0): sure, shared and kept current**, with much of round 34's SQL done beside it.
 Safety: the 24-hour soak's first leg on R2 (4.8 hours, eight nodes stopped or killed, 43,138
