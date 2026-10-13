@@ -2172,9 +2172,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    is 2, 3.5 is 4); Arrow's cast drops it. `casts::Rounds`, an analyzer rule after type coercion,
    puts `pondra_whole` in every `CAST`, `::`, `TRY_CAST` and `arrow_cast` of a decimal with places
    or a float to an integer type, the casts coercion adds included, so every node, view and door
-   plans it alike; a value written into an integer column is rounded the same way (`query::strict`).
-   Spark's `DIV` drops the fraction before its cast (`sparksql`). `harness.py found`: "a cast of a
-   decimal to an integer rounds…".
+   plans it alike; a value written into an integer column is rounded the same way (`query::strict`,
+   an UPDATE's and a MERGE's rows too: `change::part`), so a key an `ON CONFLICT` or a MERGE checks is
+   the key written. Spark's `DIV` drops the fraction before its cast (`sparksql`). `harness.py found`:
+   "a cast of a decimal to an integer rounds…"; `pkey`: "a MERGE that compares a key in another
+   type…" (a MERGE wrote 7002.5 as 7002, an INSERT as 7003).
 295. **SQL answers with the optimizer off** (`optimize::Runnable`, the last analyzer rule): under
    `datafusion.optimizer.max_passes = 0` every scalar function is replaced by what its simplifier
    makes of it, as the optimizer would. `arrow_cast`, `coalesce` and `nvl2` run only as that CAST or
