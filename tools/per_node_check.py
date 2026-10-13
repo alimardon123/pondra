@@ -82,6 +82,7 @@ PROCESS = {
     "python.rs:LOOKING": LOCK,
     "python.rs:PYTHON": "what the process's Python (EXE's or CHOSEN's) said of itself",
     "query.rs:JSON_TEXT": "a function's definition (pondra_json_text), the same for every lake",
+    "casts.rs:WHOLE": "a function's definition (pondra_whole), the same for every lake",
     "reset.rs:USED": "what reset() sets back: every per-node static used since the process started",
     "runs.rs:WAKE": SIGNAL,
     "runs.rs:WRITTEN": SIGNAL,
