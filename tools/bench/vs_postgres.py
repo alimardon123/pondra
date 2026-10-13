@@ -16,7 +16,7 @@ A = ap.parse_args()
 os.makedirs(A.work, exist_ok=True)
 OWNER = "benchmark-owner-key-0123456789"
 PG = "host=127.0.0.1 port=5499 user=postgres dbname=postgres"
-PD = "host=127.0.0.1 port=5498 user=u dbname=lake"
+PD = f"host=127.0.0.1 port=5498 user=admin password={OWNER} dbname=lake"  # (a node its program started answers only it: its key is the admin's password)
 LINEITEM = A.lineitem
 Q = {n: open(os.path.join(HERE, "tpch-queries", f"{n}.sql")).read().strip().rstrip(";") for n in ("q1", "q6")}
 lake = os.path.join(A.work, "lake")
