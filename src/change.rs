@@ -184,6 +184,100 @@ pub fn upsert_of(target: String, upsert: Upsert, sql: String) -> Merge {
     Merge { sql, target, alias, source: String::new(), on: String::new(), clauses: vec![], semi: false, upsert: Some(upsert) }
 }
 
+impl Merge {
+    /// The source column each key column is matched on, in the key's order: the ON is `t.k = s.c` (either way round)
+    /// for every key column once, and nothing else. None for any other ON.
+    pub fn key_sources(&self, meta: &TableMeta) -> Option<Vec<(String, (String, String))>> {
+        let on = expr(&self.on)?;
+        let mut terms = vec![];
+        conjuncts(&on, &mut terms);
+        let mut matched: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+        for e in terms {
+            let ast::Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } = e else { return None };
+            let (k, source) = [(left, right), (right, left)].into_iter().find_map(|(t, s)| {
+                let (q, k) = qualified(t)?;
+                let source = qualified(s)?;
+                (q == self.alias && meta.key.contains(&k) && source.0 != self.alias).then_some((k, source))
+            })?;
+            if matched.insert(k, source).is_some() {
+                return None;
+            }
+        }
+        meta.key.iter().map(|k| matched.get(k).map(|s| (k.clone(), s.clone()))).collect()
+    }
+
+    /// Does this match on the key alone, so that the rows it inserts have keys no row holds (`run` then looks none up)? An
+    /// upsert whose conflict target is the key (or names none). A MERGE whose ON is `key_sources`, and whose WHEN NOT
+    /// MATCHED inserts write each key column the source column it is matched on: `NOT EXISTS` then says no row holds the
+    /// key they write. Anything else is false, and its rows are checked by lookups.
+    pub fn on_key(&self, meta: &TableMeta) -> bool {
+        if let Some(u) = &self.upsert {
+            return u.on.is_empty() || (u.on.len() == meta.key.len() && meta.key.iter().all(|k| u.on.contains(k)));
+        }
+        let Some(sources) = self.key_sources(meta) else { return false };
+        // (an INSERT without a column list fills the table's columns in order, as `merge` reads it)
+        let all: Vec<String> = meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect();
+        self.clauses.iter().filter(|c| c.kind == Kind::NotMatched).all(|c| match &c.action {
+            Action::Insert(columns, values) => {
+                let given = if columns.is_empty() { &all } else { columns };
+                sources.iter().all(|(k, source)| {
+                    let value = given.iter().position(|g| g == k).and_then(|i| values.get(i)).and_then(|v| expr(v)).and_then(|v| qualified(&v));
+                    value.as_ref() == Some(source)
+                })
+            }
+            _ => false,
+        })
+    }
+}
+
+/// A SQL expression read back from its text (a MERGE's ON and its insert values are kept as text).
+fn expr(text: &str) -> Option<ast::Expr> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    Parser::new(&GenericDialect {}).try_with_sql(text).ok()?.parse_expr().ok()
+}
+
+/// The terms an AND joins, through parentheses (any other condition is one term).
+fn conjuncts<'a>(e: &'a ast::Expr, out: &mut Vec<&'a ast::Expr>) {
+    match e {
+        ast::Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
+            conjuncts(left, out);
+            conjuncts(right, out);
+        }
+        ast::Expr::Nested(inner) => conjuncts(inner, out),
+        e => out.push(e),
+    }
+}
+
+/// `q.c` as (q, c), each read as SQL reads a name (`write::ident`); None for anything else.
+fn qualified(e: &ast::Expr) -> Option<(String, String)> {
+    match e {
+        ast::Expr::CompoundIdentifier(p) if p.len() == 2 => Some((crate::write::ident(&p[0]), crate::write::ident(&p[1]))),
+        _ => None,
+    }
+}
+
+/// Does the ON compare each key column with its source column in the key's own type, or both as text? `t.id = s.id` with
+/// `s.id` a DECIMAL compares as decimals and matches no row, but the value inserted is cast to the key's type (2.5 becomes
+/// 2, a row that's there): so such a MERGE's keys are checked by lookups, as a plain INSERT's are. The source's types are
+/// those its columns have, planned with `LIMIT 0`.
+async fn compared_as_keys(lake: &Lake, meta: &TableMeta, sources: &[(String, (String, String))], m: &Merge, upto: u64) -> Result<bool> {
+    let cols: Vec<String> = sources.iter().map(|(_, (a, c))| format!("{}.{}", q(a), q(c))).collect();
+    let sql = format!("SELECT {} FROM {} LIMIT 0", cols.join(", "), m.source);
+    let df = session(lake, &sql, upto).await?.sql(&sql).await?;
+    let fields = df.schema().fields();
+    Ok(sources.iter().zip(fields.iter()).all(|((k, _), f)| {
+        let key = meta.columns.iter().find(|(c, _)| c == k).map(|(_, t)| crate::query::dtype(t));
+        matches!(key, Some(Ok(t)) if same_key_type(&t, f.data_type()))
+    }))
+}
+
+/// Are a key column's type and its source's the same, or both text (`Utf8`, `Utf8View`, `LargeUtf8`)? Then the ON
+/// compares them as the key compares.
+fn same_key_type(key: &DataType, source: &DataType) -> bool {
+    let text = |t: &DataType| matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8);
+    key == source || (text(key) && text(source))
+}
+
 impl Upsert {
     /// The MERGE this is, for a table of these columns: a row whose `on` columns match one of the
     /// table's updates it (DO UPDATE) or is skipped (DO NOTHING); the others are inserted.
@@ -195,8 +289,18 @@ impl Upsert {
         let on = if self.on.is_empty() { meta.key.clone() } else { self.on.clone() };
         ensure!(!on.is_empty(), "INSERT … ON CONFLICT: name the columns a conflict is on (ON CONFLICT (id) …), or give {} a PRIMARY KEY", m.target);
         ensure!(on.iter().all(|c| columns.contains(c)), "INSERT … ON CONFLICT ({}): the rows must give those columns", on.join(", "));
-        let (a, x) = (q(&m.alias), "excluded");
-        let source = format!("({}) AS {x} ({})", self.query, columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", "));
+        let (a, x, u) = (q(&m.alias), "excluded", "__u");
+        // The conflict columns are cast to the table's types before a conflict is checked, as Postgres casts an INSERT's
+        // values first: `excluded` holds the cast keys, so a DECIMAL 7003.5 for a BIGINT key is the key 7003 and conflicts
+        // with it. (The other columns are cast as they are written; a list's type has no spelling `arrow_cast` reads back.)
+        let cast: Vec<String> = columns.iter().map(|c| {
+            let value = match meta.columns.iter().find(|(n, _)| n == c).map(|(_, t)| crate::query::dtype(t)) {
+                Some(Ok(t)) if on.contains(c) && !matches!(t, DataType::List(_)) => format!("arrow_cast({u}.{}, '{t}')", q(c)),
+                _ => format!("{u}.{}", q(c)),
+            };
+            format!("{value} AS {}", q(c))
+        }).collect();
+        let source = format!("(SELECT {} FROM ({}) AS {u} ({})) AS {x}", cast.join(", "), self.query, columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", "));
         let on_sql = on.iter().map(|c| format!("{a}.{} = {x}.{}", q(c), q(c))).collect::<Vec<_>>().join(" AND ");
         let insert = Clause { kind: Kind::NotMatched, when: None, action: Action::Insert(columns.clone(), columns.iter().map(|c| format!("{x}.{}", q(c))).collect()) };
         let mut clauses = vec![];
@@ -270,7 +374,23 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
             bail!("materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"); // (it reads them as they were)
         }
     }
-    let plain = matches!(stmt, crate::write::Stmt::Insert(..) | crate::write::Stmt::InsertInto(..)); // (a plain INSERT's keys must be new: `constraints.rs`)
+    // A plain INSERT's keys must be new (23505: `constraints.rs`), and so must the keys a MERGE inserts. One that matches on
+    // the key alone, comparing it in the key's own type, inserts only rows whose key no row holds, so nothing is looked up;
+    // a MERGE's must still differ from each other (an upsert's keep their own rule: a key's last row wins).
+    let plain = match &stmt {
+        crate::write::Stmt::Insert(..) | crate::write::Stmt::InsertInto(..) => true,
+        crate::write::Stmt::Merge(m) if m.upsert.is_some() => !m.on_key(&meta),
+        crate::write::Stmt::Merge(m) => match m.key_sources(&meta) {
+            Some(sources) => !(m.on_key(&meta) && compared_as_keys(lake, &meta, &sources, m, upto).await?),
+            None => true,
+        },
+        _ => false,
+    };
+    if let crate::write::Stmt::Merge(m) = &stmt {
+        if !plain && m.upsert.is_none() && crate::constraints::key_checked(&stored) {
+            crate::constraints::distinct_keys(&stored, &table, &new)?;
+        }
+    }
     commit(lake, seq, &table, &stored, old, new, job, plain).await
 }
 
@@ -391,7 +511,10 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
             (Action::Insert(..), Kind::Matched | Kind::NotMatchedBySource) => bail!("MERGE: INSERT goes with WHEN NOT MATCHED"),
             (Action::Update(_) | Action::Delete, Kind::NotMatched) => bail!("MERGE: WHEN NOT MATCHED takes an INSERT"),
             (Action::Update(set), _) => {
-                ensure!(set.iter().all(|(c, _)| meta.columns.iter().any(|(n, _)| n == c) && !meta.key.contains(c) && !sys::NAMES.contains(&c.as_str())), "MERGE: UPDATE sets the table's own columns (not its key)");
+                if let Some((c, _)) = set.iter().find(|(c, _)| meta.key.contains(c)) {
+                    return Err(crate::codes::coded("0A000", format!("{what}: UPDATE of {table}'s key column {c} isn't taken here: delete the row, then insert it with its new key")));
+                }
+                ensure!(set.iter().all(|(c, _)| meta.columns.iter().any(|(n, _)| n == c) && !sys::NAMES.contains(&c.as_str())), "{}: UPDATE sets the table's own columns", what);
                 select_as(lake, meta, Some(set), None, &rest, upto, &a).await?
             }
             (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a).await?,
@@ -770,3 +893,86 @@ pub fn unpack(sent: &Sent) -> Result<Vec<(String, Vec<RecordBatch>)>> {
 
 use base64::Engine;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+
+    fn merge(sql: &str) -> Merge {
+        let ast::Statement::Merge(m) = Parser::parse_sql(&GenericDialect {}, sql).expect("parses").pop().expect("a statement") else { panic!("not a MERGE") };
+        merge_of(&m).expect("a MERGE Pondra takes")
+    }
+
+    fn table(key: &[&str], columns: &[&str]) -> TableMeta {
+        TableMeta {
+            key: key.iter().map(|c| c.to_string()).collect(),
+            columns: columns.iter().map(|c| (c.to_string(), "Int64".to_string())).collect(),
+            ..Default::default()
+        }
+    }
+
+    const SOURCE: &str = "USING (SELECT 1 AS id, 'a' AS v) s";
+
+    #[test]
+    fn a_merge_matching_on_the_key_alone_is_found_so() {
+        let k = table(&["id"], &["id", "v"]);
+        let yes = [
+            format!("MERGE INTO k t {SOURCE} ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"),
+            format!("MERGE INTO k t {SOURCE} ON s.id = t.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"),
+            format!("MERGE INTO k t {SOURCE} ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"),
+        ];
+        for sql in &yes {
+            assert!(merge(sql).on_key(&k), "{sql}");
+        }
+        let no = [
+            format!("MERGE INTO k t {SOURCE} ON t.v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"),
+            format!("MERGE INTO k t {SOURCE} ON t.id = s.id AND t.v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"),
+            format!("MERGE INTO k t {SOURCE} ON t.id = s.id OR t.v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"),
+            format!("MERGE INTO k t {SOURCE} ON id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"),
+            format!("MERGE INTO k t {SOURCE} ON t.id = t.id + 0 WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"),
+            // (the key is matched on one source column and written from another: the rows it inserts may be held)
+            format!("MERGE INTO k t {SOURCE} ON t.id = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"),
+            format!("MERGE INTO k t {SOURCE} ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id + 0, s.v)"),
+            format!("MERGE INTO k t {SOURCE} ON t.id = s.id WHEN NOT MATCHED THEN INSERT (v) VALUES (s.v)"),
+        ];
+        for sql in &no {
+            assert!(!merge(sql).on_key(&k), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_composite_key_needs_every_column_once() {
+        let k = table(&["a", "b"], &["a", "b", "v"]);
+        let insert = "WHEN NOT MATCHED THEN INSERT (a, b) VALUES (s.a, s.b)";
+        assert!(merge(&format!("MERGE INTO k t USING (SELECT 1 AS a, 2 AS b) s ON t.a = s.a AND s.b = t.b {insert}")).on_key(&k));
+        assert!(!merge(&format!("MERGE INTO k t USING (SELECT 1 AS a, 2 AS b) s ON t.a = s.a {insert}")).on_key(&k), "one column of two");
+        assert!(!merge(&format!("MERGE INTO k t USING (SELECT 1 AS a, 2 AS b) s ON t.a = s.a AND t.a = s.b {insert}")).on_key(&k), "a column twice");
+    }
+
+    #[test]
+    fn text_that_is_no_condition_is_not_on_the_key() {
+        let k = table(&["id"], &["id", "v"]);
+        let m = Merge { sql: String::new(), target: "k".into(), alias: "t".into(), source: String::new(), on: "t.id = = s.id".into(), clauses: vec![], semi: false, upsert: None };
+        assert!(!m.on_key(&k));
+    }
+
+    #[test]
+    fn an_upsert_is_on_the_key_when_it_conflicts_on_the_key() {
+        let k = table(&["id"], &["id", "v"]);
+        let upsert = |on: &[&str]| Upsert { columns: vec![], query: "SELECT 1 AS id, 'a' AS v".into(), on: on.iter().map(|c| c.to_string()).collect(), update: None };
+        assert!(upsert_of("k".into(), upsert(&[]), String::new()).on_key(&k), "no conflict target: the key");
+        assert!(upsert_of("k".into(), upsert(&["id"]), String::new()).on_key(&k));
+        assert!(!upsert_of("k".into(), upsert(&["v"]), String::new()).on_key(&k), "another column");
+    }
+
+    #[test]
+    fn a_key_is_compared_in_its_own_type_or_as_text() {
+        assert!(same_key_type(&DataType::Int64, &DataType::Int64));
+        assert!(same_key_type(&DataType::Utf8, &DataType::Utf8View));
+        assert!(same_key_type(&DataType::LargeUtf8, &DataType::Utf8));
+        assert!(!same_key_type(&DataType::Int64, &DataType::Decimal128(10, 1)), "2.5 compares as a decimal");
+        assert!(!same_key_type(&DataType::Int64, &DataType::Int32));
+        assert!(!same_key_type(&DataType::Utf8, &DataType::Int64));
+    }
+}

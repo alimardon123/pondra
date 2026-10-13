@@ -222,17 +222,34 @@ pub async fn key_check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&
     key_check_over(lake, table, meta, new, &kept).await
 }
 
+/// The key's name and its columns in SQL's names, after checking that no two of `new`'s rows share a key: refused as a plain
+/// INSERT's are (23505 with `{table}_pkey` and Postgres's words).
+fn key_once(table: &str, meta: &TableMeta, new: &RecordBatch) -> Result<(String, Vec<String>)> {
+    let name = format!("{}_pkey", table.rsplit('.').next().unwrap_or(table)); // (Postgres's name for a primary key that isn't named)
+    let key: Vec<String> = meta.key.iter().map(|c| meta.name_of(c).to_string()).collect(); // (SQL's names, as `logical` gives them)
+    if let Some(found) = twice(new, &key, &[])? {
+        return Err(violated(&name, &key, found));
+    }
+    Ok((name, key))
+}
+
+/// A change's new rows of one key are refused as a plain INSERT's are (`key_once`). `change::run` calls it for a MERGE whose
+/// inserts match on the key alone: those are not looked up, so this is their only check.
+pub fn distinct_keys(meta: &TableMeta, table: &str, new: &[RecordBatch]) -> Result<()> {
+    let rows: Vec<&RecordBatch> = new.iter().filter(|b| b.num_rows() > 0).collect();
+    let Some(first) = rows.first() else { return Ok(()) };
+    let schema = first.schema(); // (an update's rows carry their ids and an insert's don't: conformed to one schema)
+    let all = datafusion::arrow::compute::concat_batches(&schema, &rows.iter().map(|b| crate::query::conform(b, &schema)).collect::<Result<Vec<_>>>()?)?;
+    key_once(table, meta, &all).map(|_| ())
+}
+
 /// `key_check`, told what the writer kept of the table for each new row's key (`kept`, as `txn::ByKey::kept` answers): Some(true) a
 /// row it keeps holds the key (refused), Some(false) it took the table's row of it away (free), None neither (looked up in the table
 /// as this node has it now, `held`). A plain INSERT in a transaction is checked this way at its statement, as Postgres checks it,
 /// so a SAVEPOINT can roll the refusal back. Under READ COMMITTED its keys are its locks by then, so a key another transaction
 /// committed while it waited is held; COMMIT checks every key again either way.
 pub async fn key_check_over(lake: &Lake, table: &str, meta: &TableMeta, new: &RecordBatch, kept: &[Option<bool>]) -> Result<()> {
-    let name = format!("{}_pkey", table.rsplit('.').next().unwrap_or(table)); // (Postgres's name for a primary key that isn't named)
-    let key: Vec<String> = meta.key.iter().map(|c| meta.name_of(c).to_string()).collect(); // (SQL's names, as `logical` gives them)
-    if let Some(found) = twice(new, &key, &[])? {
-        return Err(violated(&name, &key, found));
-    }
+    let (name, key) = key_once(table, meta, new)?;
     let columns = key.iter().map(|c| new.column_by_name(c).cloned().ok_or_else(|| anyhow::anyhow!("no column {c}"))).collect::<Result<Vec<_>>>()?;
     if let Some(i) = kept.iter().position(|k| *k == Some(true)) {
         return Err(violated(&name, &key, shown(&columns, i)));
