@@ -12766,6 +12766,24 @@ def bi():
         check("to_date and to_timestamp read their text as Postgres 16 does", lambda: same(BI_TO_DATE, "to_date and to_timestamp"))
         check("format, quote_ident, quote_literal, quote_nullable and parse_ident give Postgres 16's answers",
               lambda: same(BI_HELPERS, "format and quoting"))
+
+        def matview():
+            """A materialized view as DBeaver's and dbt's catalog queries read it: its query as written in pg_matviews and
+            pg_get_viewdef (the same text); a GROUP BY view's groups are its key (an index, as pg_index lists it), and an
+            index made on a row-by-row one shows in hasindexes."""
+            extra.execute("CREATE MATERIALIZED VIEW region_totals AS SELECT region, sum(amount) AS total FROM sales GROUP BY region")
+            extra.execute("CREATE MATERIALIZED VIEW big_sales AS SELECT region, product, amount FROM sales WHERE amount > 10")
+            has = lambda v: extra.execute(f"SELECT hasindexes FROM pg_matviews WHERE matviewname = '{v}'").fetchone()
+            before = has("big_sales")
+            extra.execute("CREATE INDEX big_sales_region ON big_sales (region)")
+            after = has("big_sales")
+            row = extra.execute("SELECT definition, hasindexes FROM pg_matviews WHERE matviewname = 'region_totals'").fetchone()
+            viewdef = extra.execute("SELECT pg_get_viewdef('region_totals'::regclass)").fetchone()
+            info["materialized view"] = {"row-by-row before and after an index": (before, after), "pg_matviews": row, "pg_get_viewdef": viewdef}
+            return before == (False,) and after == (True,) and row is not None and "sum(amount)" in row[0] and "GROUP BY region" in row[0] \
+                and row[1] is True and viewdef == (row[0],)
+        check("a materialized view's query as written, in pg_matviews.definition and pg_get_viewdef, and an index on it in hasindexes",
+              matview)
     finally:
         if extra is not None:
             extra.close()
