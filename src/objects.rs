@@ -111,6 +111,7 @@ pub static KINDS: &[Kind] = &[
     Kind { name: "database", family: "database", verbs: &["CREATE", "CLONE", "ATTACH", "DETACH", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "a/", privileges: &["CLONE"], on_clone: OnClone::Copy, project: Some("a database is each environment's: an attached lake or catalog goes in pondra.toml ([env.prod] attach.events = { type = \"kafka\", url = \"…\" })"), order: 0, secret: false, about: "another lake this one reads, attached by name, or a branch cloned from one", also: &["catalog", "lake", "workspace"] },
     Kind { name: "share", family: "share", verbs: &["CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COMMENT ON", "SHOW CREATE"], prefix: "sh/", privileges: READ, on_clone: OnClone::Leave, project: Some(SHARES_PROJECT), order: 0, secret: false, about: "tables handed to other companies at published versions, through links that end", also: &["Delta Share", "data share"] },
     Kind { name: "recipient", family: "recipient", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON"], prefix: "sr/", privileges: &[], on_clone: OnClone::Leave, project: Some(SHARES_PROJECT), order: 0, secret: false, about: "a company that a share is granted to, with the token it reads with", also: &["data consumer"] },
+    Kind { name: "identity provider", family: "identity provider", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ip/", privileges: &[], on_clone: OnClone::Copy, project: Some("an identity provider is each environment's, as its users are: CREATE IDENTITY PROVIDER in each database"), order: 0, secret: false, about: "the company's sign-in (Okta, Entra ID, Google, Keycloak), whose tokens sign people in at every door", also: &["single sign-on", "SSO", "OpenID Connect", "OIDC", "security integration"] },
 ];
 
 /// The parts: stored inside one object, and listed beside the kinds.
@@ -162,7 +163,7 @@ type Lister = for<'a> fn(&'a Lake) -> BoxFuture<'a, Result<Vec<Object>>>;
 
 /// Each family's objects, read from the catalog alone (no query run).
 static FAMILIES: &[(&str, Lister)] = &[("schema", schemas), ("relation", relations), ("relation", sequences), ("relation", indexes), ("type", types), ("routine", routines), ("task", tasks), ("secret", secrets), ("user", users), ("database", databases),
-    ("share", shares), ("recipient", recipients)];
+    ("share", shares), ("recipient", recipients), ("identity provider", providers)];
 
 /// Every object of this lake and the lakes attached to it, with its comment, as the caller may see
 /// them (a user limited by grants: the tables it may read, and no secrets, users or roles).
@@ -346,6 +347,16 @@ fn secrets(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
             out.extend(crate::ext::list(&l).await?.into_iter().map(|(n, _)| Object::new("secret", &name, &n, None))); // (values are never shown)
         }
         Ok(out)
+    })
+}
+
+fn providers(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
+    Box::pin(async move {
+        if crate::auth::limited().is_some() {
+            return Ok(vec![]); // (an admin's to list, as users are)
+        }
+        let here = crate::ddl::lake_name(lake);
+        Ok(crate::sso::all(lake).await?.iter().map(|(n, p)| Object::new("identity provider", &here, n, Some(p.sql(n)))).collect())
     })
 }
 
@@ -791,6 +802,7 @@ async fn there(lake: &Lake, key: &str) -> Result<bool> {
         "database" => has(crate::ddl::attachment_key(name)).await? || has(format!("o/{name}")).await?,
         "share" => has(crate::shares::share_key(name)).await?,
         "recipient" => has(crate::shares::recipient_key(name)).await?,
+        "identity provider" => has(crate::sso::key(name)).await?,
         _ => false,
     })
 }

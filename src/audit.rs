@@ -86,7 +86,7 @@ pub fn class(sql: &str) -> &'static str {
     let about = |o: &[&str]| words.iter().skip(1).take(4).any(|w| o.contains(&w.as_str()));
     match first {
         "GRANT" | "REVOKE" => "role",
-        "CREATE" | "ALTER" | "DROP" if about(&["USER", "ROLE", "TOKEN", "SECRET", "SHARE", "RECIPIENT"]) => "role",
+        "CREATE" | "ALTER" | "DROP" if about(&["USER", "ROLE", "TOKEN", "SECRET", "SHARE", "RECIPIENT", "PROVIDER"]) => "role",
         "ATTACH" if sql.to_uppercase().contains("TOKEN") => "role", // (a share's profile: its token is a secret)
         "ALTER" if about(&["DATABASE"]) && sql.to_lowercase().contains("protected") => "role", // (who may change a protected database's projects: ADR-058)
         "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "ATTACH" | "DETACH" | "COMMENT" | "UNDROP" | "OPTIMIZE" | "VACUUM" | "CHECKPOINT" => "ddl",

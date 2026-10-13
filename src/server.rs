@@ -155,6 +155,8 @@ pub fn router(app: App) -> Router {
         .route("/ready", get(ready))
         .route("/login", post(login).layer(axum::extract::DefaultBodyLimit::max(64 << 10))) // (asked before any sign-in: a small body)
         .route("/whoami", get(whoami))
+        .route("/sso", get(|State(app): State<App>| async move { Json(crate::sso::listed(&app.lake).await) }))
+        .route("/.well-known/oauth-protected-resource", get(protected_resource))
         .route("/plan", post(apply))
         .route("/apply", post(apply))
         .route("/test", post(apply))
@@ -444,9 +446,15 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             if let Some((name, ip)) = &basic_by {
                 crate::auth::guessed(*ip, name);
             }
-            crate::audit::refused(&app, &basic_user(header.as_deref()), "http", from, &format!("{} {}", req.method(), req.uri().path()), "wrong token, or user name and password");
+            // (an identity provider's token says why it was refused: expired, another audience, no such user here)
+            let why = match token.map(str::to_string).or_else(|| basic_password(header.as_deref())) {
+                Some(t) => crate::sso::why(&app.lake, &t).await,
+                None => None,
+            };
+            let why = why.unwrap_or_else(|| "wrong token, or user name and password".into());
+            crate::audit::refused(&app, &basic_user(header.as_deref()), "http", from, &format!("{} {}", req.method(), req.uri().path()), &why);
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
-            return (StatusCode::UNAUTHORIZED, "wrong token, or user name and password").into_response();
+            return challenge(&app, req.uri().path(), req.headers(), (StatusCode::UNAUTHORIZED, why).into_response()).await;
         }
         None => crate::auth::Principal::of(crate::auth::Role::None),
     };
@@ -458,7 +466,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         return match who.role {
             crate::auth::Role::None if header.is_none() && app.auth.owned() => (StatusCode::UNAUTHORIZED, "this node answers only the program that started it (the shell, connect()): open the console from the link it printed, or start the node with --admin-token to connect other tools").into_response(),
             crate::auth::Role::None if header.is_none() && !app.auth.on() && crate::users::signed(&app.lake).await => (StatusCode::UNAUTHORIZED, "this lake has been served with tokens: start the node with them (--admin-token, --write-token, --read-token), or sign in as a user").into_response(),
-            crate::auth::Role::None => (StatusCode::UNAUTHORIZED, "sign in: a token, or a user's name and password").into_response(),
+            crate::auth::Role::None => challenge(&app, req.uri().path(), req.headers(), (StatusCode::UNAUTHORIZED, "sign in: a token, or a user's name and password").into_response()).await,
             _ => {
                 let why = match pin {
                     true => "a pin needs CLONE on this database or a schema of it (GRANT CLONE ON DATABASE … TO …)",
@@ -505,6 +513,35 @@ fn basic_user(header: Option<&str>) -> String {
     use base64::Engine;
     let b = header.and_then(|h| h.strip_prefix("Basic ")).and_then(|b| base64::engine::general_purpose::STANDARD.decode(b.trim()).ok());
     b.and_then(|b| String::from_utf8(b).ok()).and_then(|up| up.split_once(':').map(|(u, _)| u.to_string())).unwrap_or_default()
+}
+
+/// The password in a Basic header (an identity provider's token sent as one says why it was refused).
+fn basic_password(header: Option<&str>) -> Option<String> {
+    use base64::Engine;
+    let b = header.and_then(|h| h.strip_prefix("Basic ")).and_then(|b| base64::engine::general_purpose::STANDARD.decode(b.trim()).ok())?;
+    String::from_utf8(b).ok()?.split_once(':').map(|(_, p)| p.to_string())
+}
+
+/// A 401 for MCP says where its identity providers are (RFC 9728, as MCP's clients look for them):
+/// `WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource"`.
+async fn challenge(app: &App, path: &str, headers: &axum::http::HeaderMap, mut r: Response) -> Response {
+    if path.starts_with("/mcp") && crate::sso::all(&app.lake).await.is_ok_and(|p| !p.is_empty()) {
+        let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or(&app.cluster.addr);
+        if let Ok(v) = format!("Bearer resource_metadata=\"{}\"", crate::tls::url(&format!("{host}/.well-known/oauth-protected-resource"))).parse() {
+            r.headers_mut().insert("www-authenticate", v);
+        }
+    }
+    r
+}
+
+/// `GET /.well-known/oauth-protected-resource`: what MCP's clients read to sign in (RFC 9728): this
+/// node's MCP and the identity providers that sign its users in. 404 without one.
+async fn protected_resource(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+    let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or(&app.cluster.addr).to_string();
+    match crate::sso::resource(&app.lake, &crate::tls::url(&format!("{host}/mcp"))).await {
+        Some(v) => Json(v).into_response(),
+        None => (StatusCode::NOT_FOUND, "no identity provider signs users in here (CREATE IDENTITY PROVIDER)").into_response(),
+    }
 }
 
 /// `POST /login` `{"user", "password"}`: a session (`{"token": "ps_…", "until": ms}`) to send as

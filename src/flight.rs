@@ -126,8 +126,16 @@ async fn sign_in(app: &App, header: Option<&str>, peer: Option<crate::tls::Peer>
         Some(p) => p,
         None if app.open().await => crate::auth::Principal::of(Role::Admin),
         None => {
+            // (an identity provider's token says why it was refused, as HTTP's 401 does)
+            let why = match header.and_then(|h| h.strip_prefix("Bearer ")) {
+                Some(t) => crate::sso::why(&app.lake, t.trim()).await,
+                None => None,
+            };
             if header.is_some() {
-                crate::audit::refused(app, "", "flight", from, "sign in", "wrong token");
+                crate::audit::refused(app, "", "flight", from, "sign in", why.as_deref().unwrap_or("wrong token"));
+            }
+            if let Some(why) = why {
+                return Err(Status::unauthenticated(why));
             }
             crate::auth::Principal::of(Role::None)
         }
@@ -173,9 +181,14 @@ async fn password_sign_in(app: &App, user: &str, password: &str, peer: Option<cr
             if !by_token {
                 crate::auth::guessed(ip, user); // (a token isn't guessed: it is random)
             }
-            crate::audit::refused(app, user, "flight", from, "sign in", "wrong user name or password");
+            let why = match by_token {
+                true => crate::sso::why(&app.lake, password).await,
+                false => None,
+            };
+            let why = why.unwrap_or_else(|| "wrong user name or password".into());
+            crate::audit::refused(app, user, "flight", from, "sign in", &why);
             tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time, as HTTP's and Postgres's do)
-            Err(Status::unauthenticated("wrong user name or password"))
+            Err(Status::unauthenticated(why))
         }
     }
 }

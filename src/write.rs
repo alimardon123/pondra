@@ -442,6 +442,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(s) = kinds.then(|| crate::users::statement(sql)).flatten() {
         return Some(s); // (CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN: `users.rs`)
     }
+    if let Some(s) = kinds.then(|| crate::sso::statement(sql)).flatten() {
+        return Some(s); // (CREATE and DROP IDENTITY PROVIDER: `sso.rs`)
+    }
     if let Some(s) = kinds.then(|| crate::ext::statement(sql)).flatten() {
         return Some(s); // (CREATE SECRET: values of any kind; DROP SECRET)
     }

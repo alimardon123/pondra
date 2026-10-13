@@ -268,13 +268,26 @@ async fn metadata(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Result<Vec<u8
     Ok(w)
 }
 
+/// PLAIN, and OAUTHBEARER for a bearer token: an identity provider's (ADR-074; `sasl.oauthbearer.method=oidc`).
 fn sasl_handshake(r: &mut Rd) -> Result<Vec<u8>> {
     let mechanism = r.str()?;
     let mut w = vec![];
-    w.put_i16(if mechanism == "PLAIN" { 0 } else { 33 }); // UNSUPPORTED_SASL_MECHANISM
-    w.put_i32(1);
+    w.put_i16(if mechanism == "PLAIN" || mechanism == "OAUTHBEARER" { 0 } else { 33 }); // UNSUPPORTED_SASL_MECHANISM
+    w.put_i32(2);
     put_str(&mut w, "PLAIN");
+    put_str(&mut w, "OAUTHBEARER");
     Ok(w)
+}
+
+/// OAUTHBEARER's first message (RFC 7628): `n,,` then `\x01auth=Bearer <token>\x01\x01`. None: PLAIN's.
+fn bearer(auth: &[u8]) -> Option<String> {
+    if !(auth.starts_with(b"n,") || auth.starts_with(b"y,")) {
+        return None;
+    }
+    let text = std::str::from_utf8(auth).ok()?;
+    let value = text.split('\x01').find_map(|kv| kv.strip_prefix("auth="))?;
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim().to_string())
 }
 
 /// SASL/PLAIN: "\0user\0password": a user and its password (or one of its tokens), or a role's
@@ -284,14 +297,25 @@ fn sasl_handshake(r: &mut Rd) -> Result<Vec<u8>> {
 async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, peer: &crate::tls::Peer, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     let auth = r.nbytes()?.unwrap_or_default();
     let parts: Vec<&[u8]> = auth.split(|&b| b == 0).collect();
-    let (user, password) = match parts[..] {
+    let (mut user, password) = match parts[..] {
         [_, user, password] => (String::from_utf8_lossy(user).to_string(), String::from_utf8_lossy(password).to_string()),
         _ => (String::new(), String::new()),
     };
     let ip = Some(peer.addr.ip());
+    let token = bearer(&auth);
     let refused = if app.open().await {
         *who = crate::auth::Principal::of(Role::Admin).at("kafka", who.from);
         None
+    } else if let Some(token) = &token {
+        // (a bearer token, as HTTP takes one: an identity provider's, or Pondra's own; never a guess)
+        match crate::users::who(&app.lake, &app.auth, Some(&format!("Bearer {token}"))).await {
+            Some(p) => {
+                user = p.name.clone();
+                *who = p.at("kafka", who.from);
+                None
+            }
+            None => Some(crate::sso::why(&app.lake, token).await.unwrap_or_else(|| "wrong token".to_string())),
+        }
     } else if !peer.may_send_password() && !crate::users::is_token(&user, &password) {
         Some(PASSWORD_PLAIN.to_string())
     } else if let Some(wait) = crate::auth::guessing(ip, &user) {
@@ -303,8 +327,15 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, peer: &c
                 None
             }
             None => {
-                crate::auth::guessed(ip, &user);
-                Some("wrong user name or password".to_string())
+                let by_token = crate::users::is_token(&user, &password);
+                if !by_token {
+                    crate::auth::guessed(ip, &user); // (a token isn't guessed: it is random, as on HTTP and Postgres)
+                }
+                let why = match by_token {
+                    true => crate::sso::why(&app.lake, &password).await, // (an identity provider's says why)
+                    false => None,
+                };
+                Some(why.unwrap_or_else(|| "wrong user name or password".to_string()))
             }
         }
     };

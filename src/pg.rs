@@ -134,9 +134,11 @@ impl StartupHandler for Startup {
                     return finish(client, &self.cancels).await;
                 }
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
-                // (a user with only tokens, a service's: its token as a password, asked for plainly)
+                // (a user with only tokens, a service's, or one an identity provider signs in: its token
+                // as a password, asked for plainly; ADR-074)
                 let user = client.metadata().get("user").cloned().unwrap_or_default();
-                let tokens_only = !crate::users::BUILT_IN.contains(&user.as_str()) && crate::users::verifier(&app.lake, &user).await.is_none() && crate::users::principal(&app.lake, &user).await.is_ok();
+                let tokens_only = !crate::users::BUILT_IN.contains(&user.as_str()) && crate::users::verifier(&app.lake, &user).await.is_none()
+                    && (crate::users::principal(&app.lake, &user).await.is_ok() || crate::sso::anyone(&app.lake).await);
                 *self.plain.lock().await = tokens_only;
                 client.send(PgWireBackendMessage::Authentication(if tokens_only { Authentication::CleartextPassword } else { Authentication::SASL(vec!["SCRAM-SHA-256".into()]) })).await?;
             }
@@ -156,6 +158,11 @@ impl StartupHandler for Startup {
                         crate::auth::guessed(ip, &user); // (a token isn't guessed: it is random)
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    if let Some(why) = crate::sso::why(&app.lake, &password).await {
+                        // (an identity provider's token says why it was refused, as HTTP's 401 does)
+                        crate::audit::refused(app, &user, "postgres", from, "sign in", &why);
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28P01".into(), format!("password authentication failed for user \"{user}\": {why}")))));
+                    }
                     return Err(wrong(&user));
                 };
                 *self.backend.who.lock().unwrap() = Some(who.at("postgres", Some(client.socket_addr())));
