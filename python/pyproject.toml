@@ -13,6 +13,15 @@ dependencies = []
 [project.optional-dependencies]
 arrow = ["pyarrow"]
 
+# SQLAlchemy's dialects (pondra/dialect.py): `create_engine("pondra://…")`, `pondra+http://…`, `pondra+psycopg://…`.
+# tools/package.py writes the wheel's entry_points.txt from this table.
+[project.entry-points."sqlalchemy.dialects"]
+pondra = "pondra.dialect:PondraDialect"
+"pondra.pondra" = "pondra.dialect:PondraDialect"
+"pondra.http" = "pondra.dialect:PondraHttpDialect"
+"pondra.https" = "pondra.dialect:PondraHttpsDialect"
+"pondra.psycopg" = "pondra.dialect:PondraDialect_psycopg"
+
 [build-system]
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
