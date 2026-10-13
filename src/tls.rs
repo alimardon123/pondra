@@ -131,9 +131,26 @@ impl Peer {
     /// `pondra serve --lakes` names (`CLIENT`) with the key it gave this node; from a proxy of
     /// `PONDRA_TRUSTED_PROXIES`, the client its `X-Forwarded-For` names. Anyone else's word for it is never taken.
     pub fn client(&self, headers: &axum::http::HeaderMap) -> std::net::IpAddr {
-        static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        let key = KEY.get_or_init(|| crate::env::get(CLIENT_KEY).filter(|k| k.len() >= 16));
-        named(headers, key.as_deref().filter(|_| self.local)).or_else(|| forwarded(headers, self.addr.ip(), proxies())).unwrap_or(self.addr.ip())
+        named(headers, server_key().filter(|_| self.local)).or_else(|| forwarded(headers, self.addr.ip(), proxies())).unwrap_or(self.addr.ip())
+    }
+
+    /// The scheme and host a browser reached this node at, for a sign-in's redirect address (ADR-074 §5):
+    /// the one `pondra serve --lakes` names (`ORIGIN`, with the key it gave this node); from a proxy of
+    /// `PONDRA_TRUSTED_PROXIES`, its `X-Forwarded-Proto` and `X-Forwarded-Host`; else this connection's
+    /// scheme and the request's `Host`. (A provider sends a code only to an address registered with it.)
+    pub fn origin(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+        let said = |name: &str| headers.get(name)?.to_str().ok()?.split(',').next().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let named = said(ORIGIN).and_then(|v| v.split_once(' ').map(|(k, o)| (k.to_string(), o.to_string())));
+        if let (Some((given, origin)), Some(key)) = (named, server_key().filter(|_| self.local)) {
+            if aws_lc_rs::constant_time::verify_slices_are_equal(given.as_bytes(), key.as_bytes()).is_ok() {
+                return Some(origin);
+            }
+        }
+        let proxied = proxies().iter().any(|p| within(self.addr.ip(), *p));
+        let scheme = proxied.then(|| said("x-forwarded-proto")).flatten().unwrap_or_else(|| if self.tls { "https" } else { "http" }.to_string());
+        let host = proxied.then(|| said("x-forwarded-host")).flatten().or_else(|| said("host"))?;
+        let plain = !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'));
+        (matches!(scheme.as_str(), "http" | "https") && plain).then(|| format!("{scheme}://{host}"))
     }
 
     /// Is the request a page's on this machine (saving the console's settings, choosing the Python a
@@ -277,6 +294,16 @@ pub const PASSWORD_PLAIN: &str = "a password crosses only TLS from another machi
 /// node: that node sees only the server, on this machine (`Peer::client`). It reads `<key> <address>`,
 /// with the key the server gave the node in `CLIENT_KEY`, so no other process here can name an address.
 pub const CLIENT: &str = "x-pondra-client";
+
+/// The header `pondra serve --lakes` names the scheme and host its client reached it at in, and the
+/// database's path (`<key> https://host:port/db/name`), as `CLIENT` names the client (`Peer::origin`).
+pub const ORIGIN: &str = "x-pondra-origin";
+
+/// The key `pondra serve --lakes` gave this node for its `CLIENT` and `ORIGIN` headers (none: no such server).
+fn server_key() -> Option<&'static str> {
+    static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| crate::env::get(CLIENT_KEY).filter(|k| k.len() >= 16)).as_deref()
+}
 
 /// The variable the lakes server gives each database's node the key of its `CLIENT` header in.
 pub const CLIENT_KEY: &str = "PONDRA_CLIENT_KEY";

@@ -503,7 +503,12 @@ impl FlightSqlService for Sql {
         let open = self.0.open().await;
         let token = match self.0.auth.token_role(&password) {
             Role::None if !open => match caller(&req) {
-                who if who.role > Role::None => crate::users::session(&self.0.lake, &who.name).await.map_err(status)?.0,
+                who if who.role > Role::None => match crate::sso::check(&self.0.lake, &password).await {
+                    Some(Ok(c)) => crate::users::session_of(&self.0.lake, &c).await, // (a provider's: its session names it, ADR-074 §5)
+                    _ => crate::users::session(&self.0.lake, &who.name).await,
+                }
+                .map_err(status)?
+                .0,
                 _ => return Err(Status::unauthenticated("wrong user name or password")),
             },
             _ => password,

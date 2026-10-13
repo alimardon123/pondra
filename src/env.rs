@@ -119,6 +119,7 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_WORKER_MB", Node),
     ("PONDRA_WORKER_START_SECS", Node),
     ("PONDRA_WRITE_TOKEN", Node),
+    ("PONDRA_BROWSER", Command),
     ("PONDRA_ENV", Command),
     ("PONDRA_HOME", Command),
     ("PONDRA_JOB", Command),

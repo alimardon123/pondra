@@ -421,7 +421,7 @@ A project is a folder with `pondra.toml`, `objects/`, `migrations/`, `seeds/` an
 | `pondra apply --no-test`, `--prune` | skip tests/; drop the objects the project no longer declares |
 | `pondra test [ENV]` | run tests/: any row a query returns is a failure (exit 1 if one fails) |
 | `pondra export [DIR]` | the environment's objects as a project's files (pondra.toml kept if DIR has one) |
-| `pondra login [URL] [--token T \| --user U] [--project DIR]` | keep a token for a server in `~/.pondra` (`PONDRA_HOME`). `--user U` signs in as a user instead: its password is asked for, or read from `PONDRA_PASSWORD`. With no URL, for each server pondra.toml names (in `--project`, this folder by default). Asked for when neither is given |
+| `pondra login [URL] [--token T \| --user U \| --provider P] [--project DIR]` | keep a token for a server in `~/.pondra` (`PONDRA_HOME`). `--user U` signs in as a user instead: its password is asked for, or read from `PONDRA_PASSWORD`. Given neither, a server with an identity provider is signed in through it in the browser (`--provider P` picks one when it has several; `PONDRA_BROWSER` opens it), and any other asks for a token. With no URL, for each server pondra.toml names (in `--project`, this folder by default). `pondra run`, the project commands and the Python and JavaScript clients use the token kept for a server when given none |
 | `pondra branch NAME [--from DB]` | start a branch: the Git branch NAME (switched to) and a database of its name, cloned from `[env.dev] clone`, else prod, with no file copied |
 | `pondra switch NAME` | `git switch NAME`, and its database made if it isn't there |
 | `pondra branch` | the branches' databases: where each came from, when, who made it; `*` marks yours |
