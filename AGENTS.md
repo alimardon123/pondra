@@ -66,7 +66,7 @@ The owner's design principles, which every change must respect:
 
 ```
 src/      82,000 lines of Rust in 131 files, one per concern (see the table in README.md); `lib.rs` lists
-          the modules: the ones every build has (`finish`, `fsum`, `avg`, `intervals`, `xlsx`, …: no lake, so a
+          the modules: the ones every build has (`finish`, `fsum`, `avg`, `casts`, `intervals`, `xlsx`, …: no lake, so a
           browser build shares them) and the rest under feature `server` (on by default: the node);
           `cli.rs` is the command line (its subcommands and what each starts) and `main.rs` sets the
           allocator and calls it (ADR-061); `node.rs` is a node started and stopped as an object,
@@ -1696,7 +1696,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    no query plans it again, and one that already has holds its own batches. Kept until the budget
    needed room, a busy table's merges filled it with files nobody could read (Durability's soak:
    537 MB after 25 minutes, of a table of a few tens). `harness.py hot`: "a merge's replaced files
-   leave memory".
+   leave memory". A table whose columns are held keeps each file it writes as written (`tier::Encoding` → `Hot::put`, in the
+   reader's 8,192-row batches, at most 64 MB a file outside the budget until it is put), so a merge's file
+   takes the replaced files' place at once; a lake held in memory loads a file on its first read.
+   `harness.py hot`: "rows tiered into a hot table's file are held at once".
 234. **A sequence's values are durable before any is handed out, and only the sequencer moves it**
    (`seq.rs`, `sq/{name}`): `nextval` takes a block in a commit of the sequencer's own (`Flush::sequence`,
    `seq::Held`), answered once durable, so a value given out is never given again, through a
@@ -2162,6 +2165,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    joins (its exchanges are the spread analysis's). `harness.py hot`: "NOT IN a subquery with a
    NULL keeps no row…" fails with a NOT IN hashed (the threads that never met the NULL keep their
    rows).
+293. **A cast to an integer rounds a fraction as Postgres and DuckDB do** (`casts.rs`): a decimal half
+   away from zero (`CAST(2.5 AS INT)` is 3, -2.5 is -3), a float half to even (`2.5::DOUBLE::INT`
+   is 2, 3.5 is 4); Arrow's cast drops it. `casts::Rounds`, an analyzer rule after type coercion,
+   puts `pondra_whole` in every `CAST`, `::`, `TRY_CAST` and `arrow_cast` of a decimal with places
+   or a float to an integer type, the casts coercion adds included, so every node, view and door
+   plans it alike; a value written into an integer column is rounded the same way (`query::strict`).
+   Spark's `DIV` drops the fraction before its cast (`sparksql`). `harness.py found`: "a cast of a
+   decimal to an integer rounds…".
 295. **SQL answers with the optimizer off** (`optimize::Runnable`, the last analyzer rule): under
    `datafusion.optimizer.max_passes = 0` every scalar function is replaced by what its simplifier
    makes of it, as the optimizer would. `arrow_cast`, `coalesce` and `nvl2` run only as that CAST or

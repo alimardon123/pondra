@@ -9,6 +9,7 @@ pub mod env;
 pub mod reset;
 pub mod fsum;
 pub mod avg;
+pub mod casts;
 pub mod intervals;
 pub mod xlsx;
 
