@@ -191,14 +191,23 @@ fn send(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
     Box::pin(FlightDataEncoderBuilder::new().with_schema(schema).build(stream).map_err(Status::from))
 }
 
-/// Run a query (spread over the cluster when it pays), with its schema.
+/// The same schema with every column nullable. The plan's nullability and the run's differ where the
+/// optimizer folds an expression (`upper('x')` becomes a literal, never NULL), and clients compare the two.
+fn nullable(schema: &Schema) -> Schema {
+    let fields = schema.fields().iter().map(|f| f.as_ref().clone().with_nullable(true)).collect::<Vec<_>>();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+/// Run a query (spread over the cluster when it pays), with its schema. The batches take that schema,
+/// so the stream says what its header and the flight's info say.
 async fn query(app: &App, sql: &str) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
     let sql = &crate::routines::expand(&app.lake, sql).await?; // (macros: ADR-023)
     let batches = crate::audit::statement(app, sql, app.query(sql, None)).await?;
     let schema = match batches.first() {
-        Some(b) => b.schema(),
+        Some(b) => Arc::new(nullable(&b.schema())),
         None => Arc::new(planned(app, sql).await?),
     };
+    let batches = batches.into_iter().map(|b| RecordBatch::try_new(schema.clone(), b.columns().to_vec())).collect::<Result<Vec<_>, _>>()?;
     Ok((schema, batches))
 }
 
@@ -208,7 +217,7 @@ async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> { planned(a
 
 async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> {
     let ctx = crate::query::session(&app.lake, sql, "").await?;
-    Ok(crate::query::sql(&ctx, &crate::asof::rewrite(sql)?).await?.schema().as_arrow().clone())
+    Ok(nullable(crate::query::sql(&ctx, &crate::asof::rewrite(sql)?).await?.schema().as_arrow()))
 }
 
 /// A statement's answer, as its ticket names it: a CALL's kept answer, a write's row count, or a
