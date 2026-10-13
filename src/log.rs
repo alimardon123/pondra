@@ -620,7 +620,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
     }
     let (views, blocks) = (crate::views::inline(lake).await?, *block);
     puts.extend(crate::views::bound(lake, &views, *next)); // (views made since: their filling ends before this commit)
-    let mut takes = None; // (only sequences' blocks taken: a commit no read sees)
+    let mut takes = None; // (only numbers taken, sequences' blocks, row ids' blocks, a bulk write's commit: a commit no read sees)
     for (mut f, reply) in batch {
         if let Some(op) = f.sequence.take() {
             takes = Some(takes.unwrap_or(true) && matches!(op, crate::seq::Op::Take { .. }));
@@ -630,6 +630,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
         }
         if f.reserve > 0 || f.block || f.blocks > 0 {
             // (numbers no segment will take: gaps in the log's sequence, which nothing minds)
+            takes = Some(takes.unwrap_or(true));
             let ack = Ack { seg: *next, ms: now_ms(), block: *block, ..Default::default() };
             *next += f.reserve;
             *block += f.block as u64 + f.blocks;
