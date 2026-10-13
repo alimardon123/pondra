@@ -10,10 +10,10 @@ use crate::store::{Lake, TableMeta};
 use crate::users::On;
 use anyhow::Result;
 use datafusion::arrow::array::{new_null_array, Array, ArrayRef, AsArray, RecordBatch, StringArray, UInt32Array};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, TimeUnit};
 use datafusion::catalog::{MemTable, MemorySchemaProvider, SchemaProvider};
 use datafusion::common::ScalarValue;
-use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{self, VisitMut, VisitorMut};
 use std::collections::{BTreeMap, BTreeSet};
@@ -64,7 +64,7 @@ pub async fn over_http(lake: &Lake, sql: &str) -> Result<Vec<RecordBatch>> {
 /// Does this query read Postgres's catalog, or say something only Postgres says?
 pub fn wanted(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pg_", "information_schema", "::reg", "operator(", "format_type(", "current_user", "session_user", "current_schemas", "to_regtype", "to_regclass", "collate", "obj_description", "col_description", "current_setting", "has_table_privilege", "has_schema_privilege"]
+    ["pg_", "information_schema", "::reg", "operator(", "format_type(", "current_user", "session_user", "current_schemas", "to_regtype", "to_regclass", "collate", "obj_description", "col_description", "current_setting", "has_table_privilege", "has_schema_privilege", "json_build_object("]
         .iter().any(|w| s.contains(w))
 }
 
@@ -141,6 +141,10 @@ pub fn pg_of(t: &DataType) -> (u32, i32) {
 
 /// uuid's oid: a uuid column's type (`types.rs` holds it as text).
 pub const UUID: u32 = 2950;
+
+/// json's and jsonb's oids: a column of either type (`types.rs` holds it as text).
+pub const JSON: u32 = 114;
+pub const JSONB: u32 = 3802;
 
 /// `pg_typeof(x)`: the name of the Postgres type a value of this Arrow type is sent as.
 pub fn type_of(t: &DataType) -> String {
@@ -397,6 +401,8 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         });
         let held = l.sql_types.iter().filter_map(|(c, t)| match t.as_str() {
             "uuid" => Some((c.clone(), (UUID, -1))),
+            "json" => Some((c.clone(), (JSON, -1))),
+            "jsonb" => Some((c.clone(), (JSONB, -1))),
             t => crate::types::length(t).map(|n| (c.clone(), (1043, n as i32 + 4))),
         });
         let typed = enums.chain(held).collect();
@@ -1070,6 +1076,7 @@ struct PgFn {
     signature: Signature,
     returns: fn(&[DataType]) -> DataType,
     body: Arc<Body>,
+    marks: Option<&'static str>, // the Postgres type its answers' column is marked with (`pg_types::MARK`): "json"
 }
 
 impl std::fmt::Debug for PgFn {
@@ -1087,6 +1094,15 @@ impl ScalarUDFImpl for PgFn {
     fn name(&self) -> &str { self.name }
     fn signature(&self) -> &Signature { &self.signature }
     fn return_type(&self, args: &[DataType]) -> datafusion::error::Result<DataType> { Ok((self.returns)(args)) }
+    // (the mark rides on the field the function returns, so a projection of it keeps it: the port sends json as json)
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> datafusion::error::Result<FieldRef> {
+        let types: Vec<DataType> = args.arg_fields.iter().map(|f| f.data_type().clone()).collect();
+        let field = Field::new(self.name, (self.returns)(&types), true);
+        Ok(Arc::new(match self.marks {
+            Some(mark) => field.with_metadata([(crate::pg_types::MARK.to_string(), mark.to_string())].into()),
+            None => field,
+        }))
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let n = args.number_rows;
         let arrays = args.args.iter().map(|a| a.to_array(n)).collect::<datafusion::error::Result<Vec<_>>>()?;
@@ -1100,7 +1116,13 @@ fn udf(name: &'static str, returns: fn(&[DataType]) -> DataType, body: impl Fn(&
 
 /// A function of Postgres's over whole columns: `body` gets every argument as an array of the rows' values.
 pub(crate) fn function(name: &'static str, signature: Signature, returns: fn(&[DataType]) -> DataType, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
-    ScalarUDF::new_from_impl(PgFn { name, signature, returns, body: Arc::new(body) })
+    ScalarUDF::new_from_impl(PgFn { name, signature, returns, body: Arc::new(body), marks: None })
+}
+
+/// `udf`, whose answers are JSON text: the column they make is marked json, so the port sends it as json.
+fn json_udf(name: &'static str, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
+    let signature = Signature::one_of(vec![TypeSignature::Nullary, TypeSignature::VariadicAny], Volatility::Stable);
+    ScalarUDF::new_from_impl(PgFn { name, signature, returns: |_| DataType::Utf8, body: Arc::new(body), marks: Some("json") })
 }
 
 /// An argument as text (NULL where it is), whatever string or number type it came as.
@@ -1415,7 +1437,7 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
         })))
     }));
     // SQLAlchemy's identity query: its options as JSON, and the sequence a column counts by.
-    ctx.register_udf(udf("json_build_object", to_text, |a, n| {
+    ctx.register_udf(json_udf("json_build_object", |a, n| {
         let rows = (0..n).map(|i| json_build(a, i)).collect::<datafusion::error::Result<Vec<_>>>()?;
         Ok(texts_out(rows.into_iter().map(Some)))
     }));
@@ -1425,7 +1447,7 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
         Ok(texts_out((0..n).map(|i| serial_sequence(&lk, tables[i].as_deref()?, columns[i].as_deref()?))))
     }));
     // The identity options `identity_of` puts in place of SQLAlchemy's subquery: (attrelid, attname, attidentity).
-    ctx.register_udf(udf("identity_options", to_text, move |a, n| {
+    ctx.register_udf(json_udf("identity_options", move |a, n| {
         let (relids, columns, kinds) = (int_arg(&a[0])?, text_arg(&a[1])?, text_arg(&a[2])?);
         Ok(texts_out((0..n).map(|i| identity_options(&l, relids[i]? as u32, columns[i].as_deref()?, kinds[i].as_deref()?))))
     }));

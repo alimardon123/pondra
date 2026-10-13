@@ -13204,6 +13204,317 @@ def uuids():
     return f"{sum(checks.values())} of {len(checks)} UUID checks"
 
 
+def jsons():
+    """JSON and JSONB columns keep their type (`TableMeta::sql_types`, as uuid's do; `types.rs`, `pg_types.rs`). The lake
+    holds the text as it was written, and every write door refuses a value that isn't JSON with 22P02, writing nothing:
+    SQL over HTTP and the Postgres port (INSERT, UPDATE), POST /append, COPY FROM STDIN and `pondra sql`. A valid value is
+    taken and read back as written. The Postgres port answers them as Postgres does (json 114, jsonb 3802), so psycopg
+    hands over dicts and lists, in text and binary cursors, for a column, RETURNING, a view and a literal cast alike, and
+    takes psycopg's Json and Jsonb parameters. `'x'::json` is 22P02 (TRY_CAST NULL); pg_typeof says json and jsonb; the
+    catalog says so too; SHOW CREATE TABLE says JSON and JSONB and runs again after a DROP; ADD COLUMN keeps the type; ALTER
+    COLUMN … TYPE JSON on a text column is refused 42804. json_build_object's answer is typed json, through a projection
+    as well. SQLAlchemy's JSON and JSONB columns and an Identity column round-trip over psycopg and over HTTP (`pondra+http`,
+    where the dialect reads the identity's options from their JSON text), and the inspector reports JSON, JSONB and the
+    identity as a dict."""
+    import psycopg
+    from psycopg.types.json import Json, Jsonb
+    import sqlalchemy as sa
+    from sqlalchemy.dialects import postgresql
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
+    from pondra import dialect
+    dialect.register()  # (the dialect names, as the wheel's entry points make them known)
+
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 10
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    GOOD = {"doc": '{"a": 1, "b": [1, 2]}', "docb": '{"k": "v"}'}  # (valid JSON, written as it is here)
+    BAD = ["not json", '{"a": ', "{'a': 1}"]  # (not JSON: refused at every write door)
+    CATALOG = [("doc", "json", 114), ("docb", "jsonb", 3802), ("id", "integer", 23), ("note", "text", 25)]
+    checks, info = {}, {}
+    node = None
+
+    def check(name, fn):
+        """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def q(s):
+        return call(port, "POST", "/sql", s.encode(), timeout=120)
+
+    def err(s, path="/sql"):
+        """(status, x-pondra-sqlstate, the body) of a POST; (200, None, '') when it went through."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", path, s.encode(), {})
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        return (r.status, r.getheader("x-pondra-sqlstate"), data) if r.status != 200 else (200, None, "")
+
+    def http_refused(s, path="/sql"):
+        status, code, _ = err(s, path)
+        return status != 200 and code == "22P02"
+
+    def pg_write(s):
+        """The SQLSTATE the Postgres port answers a statement with, None when it went in."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            try:
+                conn.execute(s)
+                return None
+            except psycopg.Error as e:
+                return e.sqlstate
+
+    def pg_rows(s):
+        with psycopg.connect(url, autocommit=True) as conn:
+            return conn.execute(s).fetchall()
+
+    def first_typed(s):
+        """The first column of the first row through psycopg, and its type code (114 for json, 3802 for jsonb)."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            cur = conn.execute(s)
+            return cur.fetchone()[0], cur.description[0].type_code
+
+    def copy_into(cols, line):
+        """COPY FROM STDIN of one text line: None when it went in, else the SQLSTATE."""
+        try:
+            with psycopg.connect(url, autocommit=True) as conn:
+                with conn.cursor() as cur, cur.copy(f"COPY j ({cols}) FROM STDIN") as cp:
+                    cp.write(line)
+            return None
+        except psycopg.Error as e:
+            return e.sqlstate
+
+    def cli(s):
+        return subprocess.run([BIN, "sql", "--dir", lake, s], capture_output=True, text=True, timeout=120)
+
+    def cli_refused(s):
+        p = cli(s)
+        if p.returncode != 0 and "invalid input syntax for type json" in p.stderr:
+            return True
+        info.setdefault("pondra sql, not refused for a json value", []).append([s[:90], p.returncode, p.stderr[-300:]])
+        return False
+
+    def cli_ok(s):
+        p = cli(s)
+        if p.returncode != 0:
+            info.setdefault("pondra sql, refused", []).append([s[:90], p.returncode, p.stderr[-300:]])
+        return p.returncode == 0
+
+    def lit(s):
+        return "'" + s.replace("'", "''") + "'"
+
+    def text_of(rs):
+        return " ".join(str(v) for r in rs for v in r.values())  # (a SHOW CREATE's text, whatever its column is called)
+
+    def attrs(table):
+        """(name, format_type, type oid) of each column of a table, from the Postgres port's catalog, sorted by name."""
+        return sorted(pg_rows("SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.atttypid FROM pg_attribute a "
+                              f"JOIN pg_class c ON a.attrelid = c.oid WHERE c.relname = '{table}' AND a.attnum > 0"))
+
+    def snap():
+        """Every row as the node holds it (note, doc, docb), sorted: what a refused write must leave as it was."""
+        return sorted((r.get("note") or "", r.get("doc") or "", r.get("docb") or "") for r in q("SELECT note, doc, docb FROM j"))
+
+    # Each write door with one bad value in one column (doc or docb): refused with 22P02.
+    attempts = {
+        "INSERT": lambda c, b: http_refused(f"INSERT INTO j (id, note, {c}) VALUES (900, 'good', {lit(GOOD[c])}), (901, 'bad', {lit(b)})"),
+        "UPDATE": lambda c, b: http_refused(f"UPDATE j SET {c} = {lit(b)} WHERE note = 'one'"),
+        "Postgres INSERT": lambda c, b: pg_write(f"INSERT INTO j (id, note, {c}) VALUES (901, 'bad', {lit(b)})") == "22P02",
+        "Postgres UPDATE": lambda c, b: pg_write(f"UPDATE j SET {c} = {lit(b)} WHERE note = 'one'") == "22P02",
+        "POST /append": lambda c, b: http_refused(json.dumps({"id": 902, "note": "bad", c: b}) + "\n", "/append/j"),
+        "COPY FROM STDIN": lambda c, b: copy_into(f"id, note, {c}", f"903\tbad\t{b}\n") == "22P02",
+        "pondra sql INSERT": lambda c, b: cli_refused(f"INSERT INTO j (id, note, {c}) VALUES (904, 'bad', {lit(b)})"),
+        "pondra sql UPDATE": lambda c, b: cli_refused(f"UPDATE j SET {c} = {lit(b)} WHERE note = 'one'"),
+    }
+
+    def refused_everywhere():
+        failed = {}
+        for c in ("doc", "docb"):
+            for door, attempt in attempts.items():
+                for b in BAD:
+                    before = snap()
+                    refused = attempt(c, b)
+                    if not refused or snap() != before:
+                        failed[f"{door} {c} {b}"] = refused
+        info["refusals that failed (door, column, value: refused)"] = failed
+        return not failed
+
+    def accepted_everywhere():
+        sent = {}
+        sent["INSERT"] = err(f"INSERT INTO j (id, note, doc, docb) VALUES (1000, 'ok-ins', {lit(GOOD['doc'])}, {lit(GOOD['docb'])})")[0] == 200
+        sent["POST /append"] = err(json.dumps({"id": 1001, "note": "ok-app", **GOOD}) + "\n", "/append/j")[0] == 200
+        sent["COPY FROM STDIN"] = copy_into("id, note, doc, docb", f"1002\tok-copy\t{GOOD['doc']}\t{GOOD['docb']}\n") is None
+        sent["Postgres INSERT"] = pg_write(f"INSERT INTO j (id, note, doc, docb) VALUES (1003, 'ok-pg', {lit(GOOD['doc'])}, {lit(GOOD['docb'])})") is None
+        sent["pondra sql INSERT"] = cli_ok(f"INSERT INTO j (id, note, doc, docb) VALUES (1004, 'ok-cli', {lit(GOOD['doc'])}, {lit(GOOD['docb'])})")
+        sent["UPDATE"] = err("UPDATE j SET docb = '[7]' WHERE note = 'ok-ins'")[0] == 200
+        sent["Postgres UPDATE"] = pg_write("UPDATE j SET doc = '[8]' WHERE note = 'ok-pg'") is None
+        sent["pondra sql UPDATE"] = cli_ok("UPDATE j SET doc = '[9]' WHERE note = 'ok-cli'")
+        back = {r["note"]: (json.loads(r["doc"]), json.loads(r["docb"])) for r in q("SELECT note, doc, docb FROM j WHERE note LIKE 'ok-%'")}
+        d, b = json.loads(GOOD["doc"]), json.loads(GOOD["docb"])
+        want = {"ok-ins": (d, [7]), "ok-app": (d, b), "ok-copy": (d, b), "ok-pg": ([8], b), "ok-cli": ([9], b)}
+        info["accepted (door: ok), then read back over HTTP (note: doc, docb)"] = [sent, back]
+        return all(sent.values()) and back == want
+
+    def psycopg_reads():
+        """Text and binary cursors, a column, *, a key lookup, RETURNING, a view and literal casts: dicts and lists, typed."""
+        q("CREATE VIEW jv AS SELECT id, doc, docb, note FROM j")
+        d, b = json.loads(GOOD["doc"]), json.loads(GOOD["docb"])
+        out = {}
+        with psycopg.connect(url, autocommit=True) as conn:
+            cur = conn.execute("SELECT doc, docb, note FROM j WHERE id = 1")
+            out["select"] = (cur.fetchone(), [x.type_code for x in cur.description])
+            with conn.cursor(binary=True) as bc:
+                bc.execute("SELECT doc, docb, note FROM j WHERE id = 1")
+                out["select, binary"] = (bc.fetchone(), [x.type_code for x in bc.description])
+            cur = conn.execute("SELECT * FROM j WHERE id = %s", (1,))
+            out["select * by key"] = (cur.fetchone(), [x.type_code for x in cur.description])
+            cur = conn.execute("SELECT doc, docb FROM j WHERE id = 2")
+            out["select NULLs"] = (cur.fetchone(), [x.type_code for x in cur.description])
+            cur = conn.execute("INSERT INTO j (id, note, doc, docb) VALUES (2000, 'ret', '[1, 2]', '{\"x\": true}') RETURNING doc, docb")
+            out["RETURNING"] = (cur.fetchone(), [x.type_code for x in cur.description])
+            cur = conn.execute("SELECT doc, docb FROM jv WHERE id = 1")
+            out["view"] = (cur.fetchone(), [x.type_code for x in cur.description])
+            cur = conn.execute("SELECT '{\"x\": [1]}'::json AS a, CAST('{}' AS JSONB) AS b")
+            out["literal casts"] = (cur.fetchone(), [x.type_code for x in cur.description])
+        want = {
+            "select": ((d, b, "one"), [114, 3802, 25]),
+            "select, binary": ((d, b, "one"), [114, 3802, 25]),
+            "select * by key": ((1, d, b, "one"), [23, 114, 3802, 25]),
+            "select NULLs": ((None, None), [114, 3802]),
+            "RETURNING": (([1, 2], {"x": True}), [114, 3802]),
+            "view": ((d, b), [114, 3802]),
+            "literal casts": (({"x": [1]}, {}), [114, 3802]),
+        }
+        http_text = q("SELECT doc, docb FROM j WHERE id = 1")  # (over HTTP, the text as it was written)
+        info["psycopg: (row, type codes) by read; HTTP's text of row 1"] = [out, http_text]
+        return all(out[k] == v for k, v in want.items()) and http_text == [{"doc": GOOD["doc"], "docb": GOOD["docb"]}]
+
+    def json_params():
+        """psycopg's Json and Jsonb parameters, as text (%s) and as binary (%b), written and read back equal."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.execute("INSERT INTO j (id, note, doc, docb) VALUES (%s, %s, %s, %s)",
+                         (3000, "param-text", Json({"p": [1, 2]}), Jsonb({"q": None})))
+            conn.execute("INSERT INTO j (id, note, doc, docb) VALUES (%b, %b, %b, %b)",
+                         (3001, "param-bin", Json({"p": [3]}), Jsonb({"r": "s"})))
+            text = conn.execute("SELECT id, doc, docb FROM j WHERE id IN (3000, 3001) ORDER BY id").fetchall()
+            with conn.cursor(binary=True) as bc:
+                bc.execute("SELECT id, doc, docb FROM j WHERE id IN (3000, 3001) ORDER BY id")
+                binary = bc.fetchall()
+        info["parameters: rows read back as text, then as binary"] = [text, binary]
+        want = [(3000, {"p": [1, 2]}, {"q": None}), (3001, {"p": [3]}, {"r": "s"})]
+        return text == want and binary == want
+
+    def bad_literals():
+        http = [err("SELECT 'x'::json AS v")[1], err("SELECT CAST('x' AS JSONB) AS v")[1]]
+        port_codes = [pg_write("SELECT 'x'::json"), pg_write("SELECT CAST('x' AS JSONB)")]
+        tried = q("SELECT TRY_CAST('x' AS JSON) AS v")[0].get("v")  # (Pondra's own: Postgres 16 has no TRY_CAST; the JSON answer leaves a NULL out)
+        info["'x'::json and CAST('x' AS JSONB): SQLSTATE over HTTP, then the port; TRY_CAST('x' AS JSON) over HTTP"] = [http, port_codes, tried]
+        return http == ["22P02", "22P02"] and port_codes == ["22P02", "22P02"] and tried is None
+
+    def typeof():
+        h = q("SELECT pg_typeof(doc) AS a, pg_typeof(docb) AS b FROM j WHERE id = 1")[0]
+        p = pg_rows("SELECT pg_typeof(doc), pg_typeof(docb) FROM j WHERE id = 1")[0]
+        info["pg_typeof(doc), pg_typeof(docb): over HTTP, then the port"] = [h, p]
+        return h == {"a": "json", "b": "jsonb"} and p == ("json", "jsonb")
+
+    def json_function():
+        """json_build_object's answer is typed json: a dict over psycopg, directly and through a projection."""
+        direct = first_typed("SELECT json_build_object('a', 1) AS x")
+        projected = first_typed("SELECT x FROM (SELECT json_build_object('a', 1) AS x) AS s")
+        info["json_build_object: (value, type code) directly, then through a projection"] = [direct, projected]
+        return direct == ({"a": 1}, 114) and projected == ({"a": 1}, 114)
+
+    def catalog():
+        isc = pg_rows("SELECT column_name, data_type, udt_name FROM information_schema.columns WHERE table_name = 'j' ORDER BY column_name")
+        info["pg_attribute (name, format_type, oid); information_schema (name, data_type, udt_name)"] = [attrs("j"), isc]
+        return attrs("j") == CATALOG and isc == [("doc", "json", "json"), ("docb", "jsonb", "jsonb"), ("id", "integer", "int4"),
+                                                  ("note", "text", "text")]
+
+    def show_create():
+        shown = text_of(q("SHOW CREATE TABLE j"))
+        info["SHOW CREATE TABLE j"] = shown
+        shows = re.search(r'\bdoc"?\s+JSON\b', shown) and re.search(r'\bdocb"?\s+JSONB\b', shown)
+        q("DROP TABLE j")
+        q(shown)  # the text again: a table of its own, with its json columns
+        same = attrs("j") == CATALOG
+        bad = err("INSERT INTO j (id, note, doc) VALUES (1, 'shown-bad', 'not json')")
+        info["shown again: the catalog's columns, 'not json' (sqlstate)"] = [same, bad[1]]
+        return bool(shows) and same and bad[1] == "22P02"
+
+    def sa_round_trip(engine):
+        """A table SQLAlchemy makes: an Identity id, a JSON and a JSONB column and a text one. Two rows, one with None,
+        read back (None as None), and the inspector's answers: JSON, JSONB, and the identity's options as a dict."""
+        md = sa.MetaData()
+        t = sa.Table("jsons_sa", md, sa.Column("id", sa.Integer, sa.Identity(), primary_key=True),
+                     sa.Column("doc", sa.JSON), sa.Column("docb", postgresql.JSONB), sa.Column("note", sa.String(20)))
+        with engine.begin() as c:
+            c.exec_driver_sql("DROP TABLE IF EXISTS jsons_sa")
+        md.create_all(engine)
+        with engine.begin() as c:
+            c.execute(t.insert(), [{"doc": {"k": [1, 2]}, "docb": {"k": "v"}, "note": "s1"},
+                                   {"doc": None, "docb": None, "note": "s2"}])
+        with engine.connect() as c:
+            back = [tuple(r) for r in c.execute(sa.select(t).order_by(t.c.id))]
+        cols = {c["name"]: c for c in sa.inspect(engine).get_columns("jsons_sa")}
+        ident = cols["id"].get("identity")
+        info[f"SQLAlchemy over {engine.url.drivername}: rows; types of doc and docb; identity"] = [back, str(cols["doc"]["type"]),
+                                                                                                str(cols["docb"]["type"]), ident]
+        engine.dispose()
+        return (back == [(1, {"k": [1, 2]}, {"k": "v"}, "s1"), (2, None, None, "s2")]
+                and str(cols["doc"]["type"]) == "JSON" and str(cols["docb"]["type"]) == "JSONB"
+                and isinstance(ident, dict) and ident.get("start") == 1)
+
+    def add_column():
+        q("ALTER TABLE j ADD COLUMN extra JSON")
+        bad = err("INSERT INTO j (id, note, extra) VALUES (4000, 'add-bad', 'not json')")
+        q(f"INSERT INTO j (id, note, extra) VALUES (4001, 'add-good', {lit(GOOD['doc'])})")
+        got = first_typed("SELECT extra FROM j WHERE note = 'add-good'")
+        kind = [a for a in attrs("j") if a[0] == "extra"]
+        info["ADD COLUMN extra JSON: 'not json' (sqlstate); the good value read back (value, type code); its catalog entry"] = [bad[1], got, kind]
+        return bad[1] == "22P02" and got == (json.loads(GOOD["doc"]), 114) and kind == [("extra", "json", 114)]
+
+    def alter_to_json():
+        """A text column can't become JSON in place (its rows were never checked): 42804, and the column stays text. Its own
+        table, so no view names j's columns (a view's refusal is a separate one)."""
+        q("CREATE TABLE jt (id INT PRIMARY KEY, note TEXT)")
+        refused = err("ALTER TABLE jt ALTER COLUMN note TYPE JSON")
+        still = err("INSERT INTO jt (id, note) VALUES (1, 'not json, but text')")[0] == 200
+        info["ALTER COLUMN note TYPE JSON: (status, sqlstate, body); a text value that isn't JSON still taken"] = [refused, still]
+        return refused[1] == "42804" and still
+
+    try:
+        node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+        check("CREATE TABLE j (doc JSON, docb JSONB): pg_attribute 114 and 3802, format_type json and jsonb, "
+              "information_schema data_type and udt_name json and jsonb, as Postgres 16 gives them", lambda: q("CREATE TABLE j (id INT PRIMARY KEY, doc JSON, docb JSONB, note TEXT)") is not None and catalog())
+        check("SHOW CREATE TABLE says JSON and JSONB; run again after a DROP it makes the same table, its json columns the same", show_create)
+        check("setup: two rows, one with JSON, one with NULLs", lambda: err(f"INSERT INTO j (id, note, doc, docb) VALUES (1, 'one', {lit(GOOD['doc'])}, {lit(GOOD['docb'])}), (2, 'two', NULL, NULL)")[0] == 200)
+        check("a value that isn't JSON is refused 22P02 by every write door (INSERT, UPDATE over HTTP and the port, POST /append, "
+              "COPY FROM STDIN, pondra sql), in doc and in docb, and nothing is written", refused_everywhere)
+        check("a valid JSON value is taken by every write door and read back over HTTP as it was written", accepted_everywhere)
+        check("psycopg, text and binary cursors: doc and docb come as dicts and lists typed 114 and 3802 (a column, *, a key lookup, "
+              "NULLs, RETURNING, a view, literal casts); note stays str; HTTP's answer is the text as written", psycopg_reads)
+        check("psycopg's Json and Jsonb parameters, as text (%s) and binary (%b), are written and read back equal", json_params)
+        check("'x'::json and CAST('x' AS JSONB) are 22P02 over HTTP and the port; TRY_CAST('x' AS JSON) is NULL", bad_literals)
+        check("pg_typeof(doc) is 'json' and pg_typeof(docb) 'jsonb', over HTTP and the port", typeof)
+        check("json_build_object's answer is typed json (a dict over psycopg), directly and through a projection", json_function)
+        check("SQLAlchemy over psycopg: JSON and JSONB columns and an Identity column round-trip (dicts, None as None); "
+              "the inspector says JSON, JSONB and the identity as a dict", lambda: sa_round_trip(sa.create_engine(f"postgresql+psycopg://u@127.0.0.1:{pg}/lake")))
+        check("SQLAlchemy over HTTP (pondra+http): the same round trip; the identity's options read from their JSON text as a dict",
+              lambda: sa_round_trip(sa.create_engine(f"pondra+http://127.0.0.1:{port}")))
+        check("ALTER TABLE ADD COLUMN extra JSON is json (catalog); 'not json' is 22P02; a valid value is read back as a dict", add_column)
+        check("ALTER COLUMN note TYPE JSON on a text column is refused 42804; the column stays text", alter_to_json)
+    finally:
+        if node is not None:
+            node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"jsons": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} JSON checks"
+
+
 # The sample data the BI tools' statements were captured against (copied from /tmp/claude-0/bi/PREAMBLE.md, "Sample
 # data"; split at each ';'), then the role and the sequence the tools' statements name.
 BI_SAMPLE = """
@@ -17629,7 +17940,7 @@ SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20,
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, jsons, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -17661,7 +17972,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "jsons", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -17674,7 +17985,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "jsons": jsons, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

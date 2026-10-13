@@ -8,6 +8,7 @@
 //! With tokens set or users made (`users.rs`), a client signs in with SCRAM-SHA-256, as Postgres's
 //! own: a user with its password (or one of its tokens), or `reader`, `writer`, `admin` with that
 //! role's token. Each statement runs as whoever signed in (`auth::WHO`).
+use crate::pg_types::Ty;
 use crate::server::App;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
@@ -273,7 +274,7 @@ impl Backend {
                     if trace() {
                         eprintln!("pg point: parse {} µs, row {} µs", t1.as_micros(), (t0.elapsed() - t1).as_micros());
                     }
-                    return Ok(Response::Query(rows(&crate::pg_types::typed(&b.schema(), &p.uuids().into()), vec![b], format)?));
+                    return Ok(Response::Query(rows(&crate::pg_types::typed(&b.schema(), &p.types().into()), vec![b], format)?));
                 }
             }
         }
@@ -439,6 +440,7 @@ impl Backend {
         };
         let format = if c.format == "binary" { FieldFormat::Binary } else { FieldFormat::Text };
         let (info, types) = fields(&schema, &|_| format);
+        let pg_types: Vec<Type> = info.iter().map(|f| f.datatype().clone()).collect();
         let mut enc = match c.format.as_str() {
             "binary" => CopyEncoder::new_binary(info.clone()),
             "csv" => CopyEncoder::new_csv(info.clone(), CopyCsvOptions { delimiter: c.delimiter.unwrap_or(',').to_string().as_str().into(), null_string: c.null.clone().unwrap_or_default().as_str().into(), ..Default::default() }),
@@ -449,8 +451,8 @@ impl Backend {
             bytes::Bytes::from(names + "\n")
         });
         let mut rows = batches.into_iter().flat_map(move |b| each_row(&b, &types, |cols, i| {
-            for col in cols {
-                encode!(&mut enc, col, i)?;
+            for (col, t) in cols.iter().zip(&pg_types) {
+                field!(&mut enc, col, i, t)?;
             }
             Ok(enc.take_copy())
         }));
@@ -683,10 +685,7 @@ fn rows(schema: &Schema, batches: Vec<RecordBatch>, format: &Format) -> PgWireRe
     let rows = batches.into_iter().flat_map(move |b| each_row(&b, &types, |cols, i| {
         let mut row = DataRowEncoder::new(each.clone());
         for (c, f) in cols.iter().zip(each.iter()) {
-            match *f.datatype() == Type::UUID && c.is_valid(i) {
-                true => row.encode_field(&PgUuid(c.as_string::<i32>().value(i).to_string()))?,
-                false => encode!(&mut row, c, i)?,
-            }
+            field!(&mut row, c, i, f.datatype())?;
         }
         Ok(row.take_row())
     }));
@@ -708,12 +707,14 @@ fn each_row<T>(b: &RecordBatch, types: &[DataType], mut row: impl FnMut(&[ArrayR
     }
 }
 
-/// A column's Postgres type and the Arrow type its values are sent as: a uuid's (`pg_types::typed`
-/// marks one), else its Arrow type's.
+/// A column's Postgres type and the Arrow type its values are sent as: a uuid's, json's or jsonb's
+/// (`pg_types::typed` marks one), else its Arrow type's.
 fn field_type(f: &datafusion::arrow::datatypes::Field, format: FieldFormat) -> (Type, DataType) {
-    match crate::pg_types::is_uuid(f) {
-        true => (Type::UUID, DataType::Utf8),
-        false => pg_type(f.data_type(), format),
+    match crate::pg_types::marked_type(f) {
+        Some(Ty::Uuid) => (Type::UUID, DataType::Utf8),
+        Some(Ty::Json) => (Type::JSON, DataType::Utf8),
+        Some(Ty::Jsonb) => (Type::JSONB, DataType::Utf8),
+        None => pg_type(f.data_type(), format),
     }
 }
 
@@ -798,6 +799,24 @@ macro_rules! encode {
     }};
 }
 use encode;
+
+/// One column's value in a row or a COPY's line, as its Postgres type sends it: a uuid, json or jsonb as its
+/// own type (`PgUuid`, `PgJson`), anything else as its Arrow type says (`encode!`). `t` is the column's type.
+macro_rules! field {
+    ($row:expr, $c:expr, $i:expr, $t:expr) => {{
+        let (c, i, t): (&datafusion::arrow::array::ArrayRef, usize, &Type) = ($c, $i, $t);
+        if c.is_null(i) {
+            encode!($row, c, i)
+        } else if *t == Type::UUID {
+            $row.encode_field(&PgUuid(c.as_string::<i32>().value(i).to_string()))
+        } else if *t == Type::JSON || *t == Type::JSONB {
+            $row.encode_field(&PgJson(c.as_string::<i32>().value(i).to_string()))
+        } else {
+            encode!($row, c, i)
+        }
+    }};
+}
+use field;
 
 /// A DECIMAL as Postgres's NUMERIC: its text as it is, or the binary form (base-10000 digits
 /// around the point) that binary results and `COPY … (FORMAT binary)` carry.
@@ -930,6 +949,30 @@ impl pgwire::types::ToSqlText for PgStamp {
 /// A uuid as Postgres sends it: its text, or its 16 bytes (a column holds the text: `types.rs`).
 #[derive(Debug)]
 struct PgUuid(String);
+
+/// A json or jsonb value as Postgres sends it: its text, and for jsonb the version byte 1 before it, as
+/// Postgres's binary jsonb has it (a column holds the text: `types.rs`).
+#[derive(Debug)]
+struct PgJson(String);
+
+impl postgres_types::ToSql for PgJson {
+    fn to_sql(&self, ty: &Type, out: &mut bytes::BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        if *ty == Type::JSONB {
+            out.extend_from_slice(&[1]);
+        }
+        out.extend_from_slice(self.0.as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+    fn accepts(ty: &Type) -> bool { *ty == Type::JSON || *ty == Type::JSONB }
+    postgres_types::to_sql_checked!();
+}
+
+impl pgwire::types::ToSqlText for PgJson {
+    fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(self.0.as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+}
 
 impl postgres_types::ToSql for PgUuid {
     fn to_sql(&self, _: &Type, out: &mut bytes::BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
@@ -1376,7 +1419,7 @@ impl Backend {
             }
         }
         let point = match crate::auth::limited() {
-            None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.uuids().into()))), // (a key lookup's columns, unplanned, first)
+            None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.types().into()))), // (a key lookup's columns, unplanned, first)
             Some(_) => None,
         };
         if point.is_none() && (session_command(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some() || crate::script::is(sql)) {

@@ -133,7 +133,7 @@ pub struct TableMeta {
     /// door refuses a value its column's labels don't list.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub enums: BTreeMap<String, crate::types::Enum>,
-    /// Columns that hold text but are of another SQL type, by stored name: "uuid", "varchar(n)"
+    /// Columns that hold text but are of another SQL type, by stored name: "uuid", "json", "jsonb", "varchar(n)"
     /// (`types.rs`). Every door refuses a value that isn't one of the type's, written its one way.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sql_types: BTreeMap<String, String>,

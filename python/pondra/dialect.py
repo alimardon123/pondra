@@ -14,6 +14,7 @@ points (python/pyproject.toml's `sqlalchemy.dialects`), so `pip install pondra s
 installs; `register()` makes the same names known without them (tests, and a checkout run from its folder).
 Where Alembic is installed, its migrations run on Pondra as on Postgres (`PondraImpl`, at the end).
 """
+import json
 import re
 import uuid
 
@@ -88,6 +89,15 @@ class _PondraUUID(PGUuid):
         return None
 
 
+def _identity_as_dict(row):
+    """A column's row as a dict, its identity's options read from their JSON text when they come as text."""
+    row = dict(row)
+    options = row.get("identity_options")
+    if isinstance(options, str):
+        row["identity_options"] = json.loads(options)
+    return row
+
+
 class _SpacedNumbers:
     """An int2vector or oidvector (an index's columns, `indkey`; its options, `indoption`) as Postgres prints
     one and the Postgres port's catalog answers it: its numbers, space-separated (`1 2`). SQLAlchemy reads
@@ -129,6 +139,11 @@ class _Parts:
     def get_table_options(self, connection, table_name, schema=None, **kw):
         """Pondra's table options, read back from SHOW CREATE TABLE (what WITH (…) wrote)."""
         return _options_of(connection, self.identifier_preparer, table_name, schema)
+
+    def _get_columns_info(self, rows, domains, enums, schema):
+        """An identity column's options come as JSON text over HTTP and in process, where no driver decodes it.
+        The port types them json, so psycopg hands over a dict already; SQLAlchemy and Alembic read a dict."""
+        return super()._get_columns_info([_identity_as_dict(row) for row in rows], domains, enums, schema)
 
 
 class PondraDialect(_Parts, PGDialect):
