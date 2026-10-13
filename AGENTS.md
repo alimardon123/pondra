@@ -1661,7 +1661,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    class merged on its own, eight files at a time): merging the newest small files into everything
    before them rewrote a streamed table every minute or so, and every query read it cold from
    Parquet until the hot columns had it again. `harness.py tiering`: "a merged file kept while eight
-   more merge".
+   more merge". A bulk write's and a merge's files are cut at 4M rows or 128 MB (`tier::FILE_BYTES`), past every
+   class, encoded a batch at a time on blocking threads (`tier::Encoding`): cut at 64 MB they came
+   out at 63.8 and a load was merged again at once (TPC-H SF1's CTAS 21 s, now 5 s).
 231. **A request's queries run on a runtime of their own once another has run a while** (`panics::work`,
    `server::queries`: `/sql`, `/mcp`, `/live`, pages, bulk inserts, a spread query's stages and
    shares, tiering jobs; every Postgres statement): appends, commits, heartbeats and the commit
@@ -2273,6 +2275,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (i–o): SQL, frames, a file and a live query from Node; a lake reopened; 20 opens and closes; a process that
    calls `process.exit()`, and one that just ends, without `close()` (its temporary lake gone either way); Bun; the
    library's dynamic symbols (only its ABI defined but a dependency's C API, nothing needed unversioned).
+   A node in a library prints nothing when all goes well: a slow statement too goes only to `pondra.history`
+   (`history::ended`; `inprocess_check.py` p).
 318. **SQL's plain INSERT never replaces a row of its key** (`constraints::key_check`, `key_check_over`,
    `txn::autocommit`, `txn::ByKey`): an INSERT without ON CONFLICT or OR REPLACE | IGNORE into a table
    with a PRIMARY KEY (not a merge table) is refused 23505, in Postgres's words, when two of its rows
@@ -2493,7 +2497,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    "…a user granted APPLY on this database (it deploys them) is shown routines' code and the export", "…nor in a
    failed call's error…".
 
-383. **On Linux the program gives memory back** (`main.rs`: jemalloc with its background threads;
+383. **On Linux a node gives memory back** (`main.rs` for the program, `capi/src/lib.rs` for the library that
+   the packages' `pondra` and `connect()` run: jemalloc with its background threads, dlopen's thread-locals;
    `build.yml` builds arm64 for 64 KB pages). Under a steady stream of small commits mimalloc kept
    the pages each thread freed: at 240 commits a second a node grew about 50 MB a minute while what
    it held levelled off. jemalloc's threads give back what has been free for ten seconds. macOS and
