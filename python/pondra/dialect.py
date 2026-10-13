@@ -12,6 +12,7 @@ order_by = …), and Inspector.get_table_options reads them back from SHOW CREAT
 SQLAlchemy is imported only here; the client never needs it. The wheel declares the dialects as entry
 points (python/pyproject.toml's `sqlalchemy.dialects`), so `pip install pondra sqlalchemy` is all a user
 installs; `register()` makes the same names known without them (tests, and a checkout run from its folder).
+Where Alembic is installed, its migrations run on Pondra as on Postgres (`PondraImpl`, at the end).
 """
 import re
 import uuid
@@ -211,3 +212,23 @@ def register():
     """Make the dialects' names known to SQLAlchemy, as the wheel's entry points do."""
     for name, dialect in _DIALECTS.items():
         registry.register(name, __name__, dialect.__name__)
+
+
+# Alembic finds a dialect's migration code by its name, so where Alembic is installed Pondra's is
+# Postgres's with two changes. DDL in a transaction runs at once (ROLLBACK doesn't undo it: ADR-067),
+# so Alembic isn't told it can roll a failed migration's DDL back. And its version table is kept
+# without a key: Alembic moves its one row from version to version with an UPDATE of that key, which
+# a keyed table refuses (delete the row, then insert it), while an UPDATE of a plain table's row works.
+try:
+    from alembic.ddl.postgresql import PostgresqlImpl
+except ImportError:
+    PostgresqlImpl = None
+
+if PostgresqlImpl is not None:
+    class PondraImpl(PostgresqlImpl):
+        __dialect__ = "pondra"
+        transactional_ddl = False
+
+        def version_table_impl(self, *, version_table, version_table_schema, version_table_pk, **kw):
+            return super().version_table_impl(version_table=version_table, version_table_schema=version_table_schema,
+                                              version_table_pk=False, **kw)

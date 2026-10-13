@@ -6,6 +6,7 @@ Starts its own node (--bin) on a new lake in a temporary folder, and runs the ch
 `pondra+http` (the node's HTTP door), `pondra+psycopg` (the Postgres port), and `pondra:///folder` in this
 process when --lib names a pondra_lib (without it, that form is listed under not_run). Prints one
 JSON document: each check's ok and what it found, the costs (reported, not judged) and what was not run.
+With Alembic installed, migrations run through its own commands over HTTP and in this process.
 Exits 1 if any check is false. A check that a door can't answer is false and says what the door answered:
 that is the finding, not a crash of the tool.
 
@@ -739,6 +740,63 @@ def dead_node(_url):
         con.close()
 
 
+# ---------------------------------------------------------------- Alembic
+
+# Two revisions as a user writes them: a table, then a column, an index and a renamed column.
+MIGRATIONS = {
+    "a1": ("""op.create_table("mig_users", sa.Column("id", sa.Integer, primary_key=True), sa.Column("name", sa.String(50), nullable=False))""",
+           """op.drop_table("mig_users")"""),
+    "b2": ("""op.add_column("mig_users", sa.Column("email", sa.String(100)))
+    op.create_index("mig_users_email", "mig_users", ["email"])
+    op.alter_column("mig_users", "name", new_column_name="full_name")""",
+           """op.alter_column("mig_users", "full_name", new_column_name="name")
+    op.drop_index("mig_users_email", "mig_users")
+    op.drop_column("mig_users", "email")"""),
+}
+
+
+def alembic_migrations(url, root):
+    """`alembic init`, two revisions, upgrade, downgrade and upgrade again through Alembic's own commands and env.py;
+    then autogenerate finds nothing to change, and the lake is left at base for the next form."""
+    from alembic import command
+    from alembic.autogenerate import compare_metadata
+    from alembic.config import Config
+    from alembic.migration import MigrationContext
+    where = tempfile.mkdtemp(prefix="alembic-", dir=root)
+    command.init(Config(f"{where}/alembic.ini"), f"{where}/migrations")
+    cfg = Config(f"{where}/alembic.ini")
+    cfg.set_main_option("script_location", f"{where}/migrations")
+    cfg.set_main_option("sqlalchemy.url", url)
+    for rev, (up, down) in MIGRATIONS.items():
+        made = command.revision(cfg, rev, rev_id=rev, head=None if rev == "a1" else "a1")
+        src = open(made.path).read()
+        for word, body in (("upgrade", up), ("downgrade", down)):
+            src = src.replace(f'def {word}() -> None:\n    """{word.capitalize()} schema."""\n    pass', f"def {word}() -> None:\n    {body}")
+        open(made.path, "w").write(src)
+    engine = create_engine(url)
+    def at():
+        with engine.connect() as c:
+            version = [r[0] for r in c.execute(text("SELECT version_num FROM alembic_version"))]
+        found = inspect(engine)
+        return version, [c["name"] for c in found.get_columns("mig_users")] if found.has_table("mig_users") else None
+    seen = []
+    for step, target in (("upgrade", "a1"), ("upgrade", "head"), ("downgrade", "a1"), ("downgrade", "base"), ("upgrade", "head")):
+        getattr(command, step)(cfg, target)
+        seen.append((f"{step} {target}", *at()))
+    md = sqlalchemy.MetaData()
+    Table("mig_users", md, Column("id", Integer, primary_key=True), Column("full_name", String(50), nullable=False),
+          Column("email", String(100)), sqlalchemy.Index("mig_users_email", "email"))
+    with engine.connect() as c:
+        only = {"include_name": lambda name, kind, _parent: kind != "table" or name == "mig_users"}  # (the lake's other tables aside)
+        diff = compare_metadata(MigrationContext.configure(c, opts=only), md)
+    command.downgrade(cfg, "base")
+    engine.dispose()
+    want = [("upgrade a1", ["a1"], ["id", "name"]), ("upgrade head", ["b2"], ["id", "full_name", "email"]),
+            ("downgrade a1", ["a1"], ["id", "name"]), ("downgrade base", [], None),
+            ("upgrade head", ["b2"], ["id", "full_name", "email"])]
+    return seen == want and diff == [], {"steps": seen, "autogenerate": [str(d) for d in diff]}
+
+
 DBAPI_CHECKS = [
     ("dbapi.begin_on_first_statement", begin_first),
     ("dbapi.commit_and_rollback_send_only_when_begun", quiet_unless_begun),
@@ -874,7 +932,13 @@ def main():
         else:
             run.not_run.append("in-process (pondra:///folder with the library in this process): no --lib given; "
                                "no pondra_lib is built here")
-        run.not_run.append("alembic upgrade and downgrade: alembic is not installed here (not installed for this run)")
+        try:
+            import alembic  # noqa: F401
+            run.check("http.alembic_upgrade_downgrade_autogenerate", alembic_migrations, f"pondra+http://127.0.0.1:{http}", root)
+            if args.lib:
+                run.check("in_process.alembic_upgrade_downgrade_autogenerate", alembic_migrations, f"pondra:///{root}/lake2", root)
+        except ImportError:
+            run.not_run.append("alembic upgrade and downgrade: alembic is not installed (pip install alembic)")
     finally:
         if node is not None:
             stop_node(node)

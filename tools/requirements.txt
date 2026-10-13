@@ -19,6 +19,7 @@ psycopg[binary]==3.3.6
 psycopg2-binary==2.9.13
 asyncpg==0.31.0
 SQLAlchemy==2.0.54
+alembic==1.20.0  # (tools/sqla_check.py: migrations through Alembic)
 confluent-kafka==2.15.1
 kafka-python==3.0.11
 adbc-driver-flightsql==1.12.0
