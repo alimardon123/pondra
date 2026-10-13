@@ -10852,7 +10852,7 @@ def objects():
     checks["SEQUENCE BY, TTL and MERGE sum are the table's options, in any order beside WITH; ALTER TABLE … TTL; mistakes refused"] = \
         laid == {"lay_s": ("day(seen)", ["page"], "seen", ["seen", 7200], {}, ["delta", "iceberg"]),
                  "lay_t": (None, [], None, None, {"amount": "sum", "n": "count"}, [])} \
-        and totals == [{"region": "eu", "amount": 8.0, "n": 2}] and wrong == [500, 500, 500]
+        and totals == [{"region": "eu", "amount": 8.0, "n": 2}] and wrong == [500, 500, 400]  # (the last refused as the table's definition: 42P16)
     q("CREATE TABLE keyed (id BIGINT PRIMARY KEY, v VARCHAR)")
     q("INSERT INTO keyed VALUES (1, 'a'), (2, 'b')")
     q("INSERT OR IGNORE INTO keyed VALUES (1, 'x'), (3, 'c')")
