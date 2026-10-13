@@ -15,6 +15,7 @@ import argparse, json, multiprocessing as mp, os, random, sys, time, urllib.requ
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness
 from harness import Node, call, pct
+from prices import LABEL, OPS, PRICES, dollars_a_month
 
 A = None
 
@@ -35,12 +36,6 @@ def produce(port, name, n, q):
             p.poll(0)
     left = p.flush(120)
     q.put((name, time.time() - t, left))
-
-
-# Dollars per million requests of each class, and per GB a month (list prices, 2026-10; DELETE free).
-PRICES = {"s3": {"write": 5.00, "list": 5.00, "read": 0.40, "delete": 0, "gb_month": 0.023},
-          "r2": {"write": 4.50, "list": 4.50, "read": 0.36, "delete": 0, "gb_month": 0.015}}
-OPS, MONTH = ("write", "list", "read", "delete"), 30 * 86400
 
 
 def steady(port, name, rate, until, q):
@@ -102,11 +97,8 @@ def kept():
 
 def cost(per_s, grew):
     """What requests at `per_s` a second, and keeping `grew` bytes a second for a day, cost a month."""
-    out = {}
-    for where, price in PRICES.items():
-        reqs = sum(per_s.get(op, 0) * price[op] for op in OPS) * MONTH / 1e6
-        out[where] = {"requests_usd_month": round(reqs, 2), "a_day_kept_usd_month": round(grew * 86400 / 1e9 * price["gb_month"], 2)}
-    return out
+    return {where: {"requests_usd_month": round(dollars_a_month(per_s, 0, where), 2),
+                    "a_day_kept_usd_month": round(dollars_a_month({}, grew * 86400 / 1e9, where), 2)} for where in PRICES}
 
 
 def measure_steady(lake, ports):
@@ -134,7 +126,7 @@ def measure_steady(lake, ports):
             "in_mib_s": round(in_rows * values / max(sent, 1) / (1 << 20), 1), "in_rows_s": round(in_rows),
             "requests_per_s_nodes": nodes, "requests_per_s_bucket": sim or None,
             "bucket_grew_mb_s": round(grew / 1e6, 2), "kept_bytes_a_row": round(files["bytes"] / max(files["rows"], 1)),
-            "kept_gb_a_day": round(kept_s * 86400 / 1e9, 1), "cost": cost(sim or nodes, kept_s), "unflushed": unflushed,
+            "kept_gb_a_day": round(kept_s * 86400 / 1e9, 1), "cost": cost(sim or nodes, kept_s), "prices": LABEL, "unflushed": unflushed,
             # (every acknowledged value once: one still unacknowledged when its producer gave up may have landed)
             "exactly_once": got["n"] == got["uniq"] and sent - unflushed <= got["n"] <= sent}
 

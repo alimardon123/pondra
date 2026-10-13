@@ -3090,24 +3090,41 @@ def sums():
     """sum(DOUBLE) is the true sum rounded once, whatever order its rows are added in (`fsum.rs`):
     equal to Python's math.fsum, grouped or not, over files and the log tail, on every node. With
     DataFusion's own sum, [1e16, 1, -1e16] added up to 0, and TPC-H q15, which compares a sum with
-    the max of the same sums, found its row only some of the time."""
+    the max of the same sums, found its row only some of the time. avg over a DECIMAL is rounded at
+    its last place (`avg.rs`), as Python's Decimal rounds it: DataFusion's cut the rest off."""
     import math
+    from decimal import Decimal, ROUND_HALF_UP
     lake = new_lake()
     nodes = [Node(lake, A.port + i, tier_secs=0.25).start() for i in range(3)]
     q = lambda s, p=A.port: sql(p, s)
-    q("CREATE TABLE m (k BIGINT, i BIGINT, v DOUBLE, d DECIMAL(12, 2))")
-    rnd, want, rows = random.Random(7), {}, []
+    q("CREATE TABLE m (k BIGINT, i BIGINT, v DOUBLE, d DECIMAL(12, 2), c DECIMAL(15, 2))")
+    rnd, want, cents, rows = random.Random(7), {}, {}, []
     for n in range(20_000):  # magnitudes 1e-3 to 1e12: a plain running sum depends on the order
-        k, v = n % 40, rnd.uniform(-1, 1) * 10 ** rnd.randint(-3, 12)
-        rows.append({"k": k, "i": n, "v": v, "d": f"{n % 1000}.25"})
+        k, v, c = n % 40, rnd.uniform(-1, 1) * 10 ** rnd.randint(-3, 12), Decimal(rnd.randint(-100_000, 100_000)) / 100
+        rows.append({"k": k, "i": n, "v": v, "d": f"{n % 1000}.25", "c": str(c)})
         want.setdefault(k, []).append(v)
+        cents.setdefault(k, []).append(c)
     for b in range(0, len(rows), 2_500):  # in batches: some become Parquet files, some stay in the log
         call(A.port, "POST", f"/append/m?producer=p&seq={b + 1}", "".join(json.dumps(r) + "\n" for r in rows[b:b + 2_500]).encode())
         time.sleep(0.2)
     q("CREATE TABLE edge (k BIGINT, v DOUBLE)")
     edge_rows = [(1, 1e16), (1, 1.0), (1, -1e16), (2, 1e308), (2, 1e308), (2, -1e308), (3, None)]
     call(A.port, "POST", "/append/edge?producer=e&seq=1", "".join(json.dumps({"k": k, "v": v}) + "\n" for k, v in edge_rows).encode())
+    q("CREATE TABLE ties (k BIGINT, c DECIMAL(15, 2))")  # 0.01 / 32 = 0.0003125: a tie at the sixth place
+    tie_rows = [(1, "0.01")] + [(1, "0")] * 31 + [(2, "-0.01")] + [(2, "0")] * 31 + [(3, "0.01"), (3, "0.01"), (3, "0")] + [(4, None)]
+    call(A.port, "POST", "/append/ties?producer=t&seq=1", "".join(json.dumps({"k": k, "c": c}) + "\n" for k, c in tie_rows).encode())
     total = math.fsum(v for vs in want.values() for v in vs)
+    places = lambda cs: str((sum(cs) / len(cs)).quantize(Decimal("0.000001"), ROUND_HALF_UP))
+    averages = [(q("SELECT CAST(avg(c) AS VARCHAR) AS a FROM m", n.port)[0]["a"], {r["k"]: r["a"] for r in q("SELECT k, CAST(avg(c) AS VARCHAR) AS a FROM m GROUP BY k", n.port)})
+                for n in nodes for _ in range(2)]
+    spread = {r["k"]: r["a"] for r in call(A.port, "POST", "/sql?spread=1", b"SELECT k, CAST(avg(c) AS VARCHAR) AS a FROM m GROUP BY k")}
+    avg_over = {r["k"]: r["a"] for r in q("SELECT DISTINCT k, CAST(avg(c) OVER (PARTITION BY k) AS VARCHAR) AS a FROM m")}
+    avg_sliding = q("SELECT i, c, CAST(avg(c) OVER (ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS VARCHAR) AS a FROM m WHERE k = 0 ORDER BY i")
+    tied = {r["k"]: r.get("a") for r in q("SELECT k, CAST(avg(c) AS VARCHAR) AS a FROM ties GROUP BY k")}
+    tied_distinct = {r["k"]: r.get("d") for r in q("SELECT k, CAST(avg(DISTINCT c) AS VARCHAR) AS d FROM ties GROUP BY k")}
+    avg_type = q("SELECT arrow_typeof(avg(c)) AS t FROM m")[0] | q("SELECT arrow_typeof(avg(CAST(c AS DECIMAL(38, 2)))) AS wide FROM m")[0]
+    q("CREATE MATERIALIZED VIEW c_avg AS SELECT k, avg(c) AS a FROM m GROUP BY k")  # (finished from its sum and count)
+    viewed = {r["k"]: r["a"] for r in q("SELECT k, CAST(a AS VARCHAR) AS a FROM c_avg")}
     every = [(q("SELECT sum(v) AS s FROM m", n.port)[0]["s"], {r["k"]: r["s"] for r in q("SELECT k, sum(v) AS s FROM m GROUP BY k", n.port)})
              for n in nodes for _ in range(3)]
     over = {r["k"]: r["s"] for r in q("SELECT DISTINCT k, sum(v) OVER (PARTITION BY k) AS s FROM m")}
@@ -3124,13 +3141,20 @@ def sums():
         "a sliding window takes values back out": all(math.isclose(r["s"], math.fsum(x["v"] for x in sliding[max(0, j - 2):j + 1]), rel_tol=1e-9, abs_tol=1e-6) for j, r in enumerate(sliding)),
         "integers, decimals and DISTINCT keep DataFusion's sum; FILTER works": types["i"] == "Int64" and types["d"].startswith("Decimal128(22, 2)") and types["v"] == types["dv"] == "Float64"
                                                                               and types["f"] == math.fsum(want[3]) and types.get("none") is None,
+        "avg(DECIMAL) rounded at its last place == Python's Decimal, whole and per group, on every node, spread and in a materialized view":
+            all(a == places([c for cs in cents.values() for c in cs]) and g == {k: places(cs) for k, cs in cents.items()} for a, g in averages)
+            and spread == avg_over == viewed == {k: places(cs) for k, cs in cents.items()},
+        "…in a sliding window, DISTINCT, ties away from zero, and its type DataFusion's":
+            all(r["a"] == places([Decimal(x["c"]) for x in avg_sliding[max(0, j - 2):j + 1]]) for j, r in enumerate(avg_sliding))
+            and tied == {1: "0.000313", 2: "-0.000313", 3: "0.006667", 4: None} and tied_distinct == {1: "0.005000", 2: "-0.005000", 3: "0.005000", 4: None}
+            and avg_type == {"t": "Decimal128(19, 6)", "wide": "Decimal128(38, 6)"},
     }
     ok = all(checks.values())
     print(json.dumps({"sums": checks, "ok": ok}, indent=1))
     if not ok:
-        print(total, every[0][0], edge, big, types)
+        print(total, every[0][0], edge, big, types, averages[0][0], tied, tied_distinct, avg_type, avg_sliding[:4])
         sys.exit(1)
-    return "sum(DOUBLE): the true sum rounded once in any order (== math.fsum), grouped, windowed, on every node; NULLs, overflow, sliding windows and other types as before"
+    return "sum(DOUBLE): the true sum rounded once in any order (== math.fsum), grouped, windowed, on every node; NULLs, overflow, sliding windows and other types as before; avg(DECIMAL) rounded at its last place"
 
 
 def schemas():

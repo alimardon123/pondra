@@ -163,7 +163,7 @@ impl Split {
     /// The finish's SQL, once the partial query's types are known: `decimal` says whether a column of
     /// it is a decimal, and `casts` the type each answer column is cast to, if any (Arrow's name).
     pub fn finish(&self, decimal: impl Fn(&str) -> bool, casts: &[Option<String>]) -> String {
-        // (an average divides a sum by a count: as decimals for a decimal sum, else as doubles)
+        // (an average divides a sum by a count: as `avg` does for a decimal sum, else as doubles)
         let mut q = self.finish.clone();
         if let ast::SetExpr::Select(s) = q.body.as_mut() {
             for (item, to) in s.projection.iter_mut().zip(casts) {
@@ -177,8 +177,11 @@ impl Split {
                 if lower(&f.name) == AVG {
                     let a = args(f);
                     let (s, n) = (a[0].to_string(), a[1].to_string());
-                    let sum = if decimal(s.trim_matches('"')) { s } else { format!("CAST({s} AS DOUBLE)") };
-                    *x = expr(&format!("{sum} / NULLIF({n}, 0)")).expect("an average");
+                    let average = match decimal(s.trim_matches('"')) {
+                        true => format!("pondra_avg_of({s}, {n})"),
+                        false => format!("CAST({s} AS DOUBLE) / NULLIF({n}, 0)"),
+                    };
+                    *x = expr(&average).expect("an average");
                 }
             }
             ControlFlow::<()>::Continue(())

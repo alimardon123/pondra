@@ -66,7 +66,7 @@ The owner's design principles, which every change must respect:
 
 ```
 src/      62,500 lines of Rust in 108 files, one per concern (see the table in README.md); `lib.rs` lists
-          the modules: the four every build has (`finish`, `fsum`, `intervals`, `xlsx`: no lake, so a
+          the modules: the ones every build has (`finish`, `fsum`, `avg`, `intervals`, `xlsx`, …: no lake, so a
           browser build shares them) and the rest under feature `server` (on by default: the node);
           `cli.rs` is the command line (its subcommands and what each starts) and `main.rs` sets the
           allocator and calls it (ADR-061); `node.rs` is a node started and stopped as an object,
@@ -315,7 +315,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   term, when its standard input closes.
 - **`sum` over DOUBLE is order-independent** (`fsum.rs`): it replaces DataFusion's `sum` in every
   session; Float64 sums carry a second double with the rounding errors (state: two columns),
-  other types go to DataFusion's.
+  other types go to DataFusion's. **`avg` over a DECIMAL is rounded at its last place** (`avg.rs`),
+  where DataFusion's cut it off.
 - **Rows that change** (round 19, ADR-020, `change.rs`, `sys.rs`). Every row has system columns:
   `_row_id` (stamped as it enters the log or a bulk INSERT's files, from blocks of ids the leader
   hands out as commit numbers: `Ids`, `Flush::reserve`), `_version` (its commit), `_created_at`,
@@ -2148,6 +2149,19 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    CASE, and Pondra writes `arrow_cast` (an INSERT's typed VALUES, a bound value) and `coalesce` (an
    `UPDATE … FROM`) itself. `harness.py found`: "with datafusion.optimizer.max_passes = 0, an INSERT
    into a DOUBLE column, UPDATE … FROM, arrow_cast and coalesce answer".
+296. **An avg over a DECIMAL is rounded at its last place, in a query and in a view alike** (`avg.rs`):
+   DataFusion's accumulators work it out one place further and `RoundedAvg` rounds that place away, half
+   away from zero, keeping DataFusion's type, decimal(p + 4, s + 4); a materialized view finishes its avg
+   from its kept sum and count with `pondra_avg_of`, the same arithmetic (`finish.rs`). Decimals over 24
+   digits keep DataFusion's answer, cut off, in both. TPC-H q1's `avg(l_quantity)` came back 25.522005 for
+   25.5220058…; `harness.py sums`: "avg(DECIMAL) rounded at its last place == Python's Decimal… and in a
+   materialized view" and "…ties away from zero"; `finishes`: "an avg of a DECIMAL is exact".
+297. **`x IN (subquery)` and `EXISTS` outside a WHERE are three-valued** (`optimize::SubqueriesMarked`):
+   in a projection or an aggregate each becomes a left mark join, as a WHERE's does; when either side can
+   be NULL, an uncorrelated IN asks one scalar subquery whether the values hold a NULL, and a correlated one
+   adds a mark join that also matches NULLs, so "no match" and "unknown" stay apart. Only plans DataFusion
+   couldn't run are rewritten. `harness.py friendly`: the eight IN and EXISTS forms == DuckDB's answers,
+   spread too.
 300. **A node is started and stopped as an object, and a stop at any point gives back what it took**
    (`node.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
    serves, it drains, makes what it committed durable, checkpoints, ends what it started
@@ -2584,7 +2598,7 @@ python3 tools/harness.py alter                 # ALTER TABLE ADD COLUMN under lo
 python3 tools/harness.py windows               # event-time windows closed by the data's time, emitted once, late rows, a leader restart
 python3 tools/harness.py sessions              # session windows emitted once, whole; late rows; a leader restart
 python3 tools/harness.py asof                  # ASOF JOIN over a stream (a view), ad hoc, over Postgres; refusals
-python3 tools/harness.py sums                  # sum(DOUBLE) == math.fsum, whole, grouped, windowed, on every node
+python3 tools/harness.py sums                  # sum(DOUBLE) == math.fsum, whole, grouped, windowed, on every node; avg(DECIMAL) rounded == Python's Decimal
 python3 tools/harness.py schemas               # schemas, three-part names, attached lakes, DDL, stored and materialized views, drops
 python3 tools/harness.py changes               # UPDATE/DELETE/MERGE vs a model on 3 nodes: row ids, views, change feed, purges, Delta, spread
 python3 tools/harness.py deal                  # a keyed table's and a view's first tiering round on 3 nodes: deleted keys stay deleted

@@ -8,6 +8,7 @@ pub mod finish;
 pub mod env;
 pub mod reset;
 pub mod fsum;
+pub mod avg;
 pub mod intervals;
 pub mod xlsx;
 
