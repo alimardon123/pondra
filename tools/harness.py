@@ -5352,6 +5352,18 @@ def names():
     checks["two subqueries of one column's name, max(id) beside (SELECT max(id) FROM t), id + 1 thrice and id * 2 beside id::DOUBLE * 2 run, named as written (DuckDB); subqueries apart keep theirs"] = \
         apart == [["(SELECT count(*) FROM t)", "(SELECT count(*) FROM t WHERE id > 1)"], ["max(t.id)", "(SELECT max(id) FROM t)"],
                   ["t.id + Int64(1)", "id + 1", "id + 1_1"], ["max(t.id)", "min(t.id)"], ["t.id * Int64(2)", "id::DOUBLE * 2", "CAST(id AS DOUBLE) * 2"]]
+    # aggregates that differ only by a cast: DataFusion names both sum(t.id), and refused the query
+    alone = lambda q: [list(r.values()) for r in db.sql(q).rows()]
+    sets = [["sum(id)", "sum(id::DOUBLE)"], ["min(x)", "min(x::INT)", "max(x::INT)"], ["count(DISTINCT id)", "count(DISTINCT id::TEXT)", "count(DISTINCT x::INT)"],
+            ["round(sum(x))", "round(sum(x::INT))"]]
+    together = [alone(f"SELECT {', '.join(s)} FROM t")[0] for s in sets]
+    each = [[alone(f"SELECT {e} FROM t")[0][0] for e in s] for s in sets]
+    having = cols("SELECT sum(id::DOUBLE) FROM t HAVING sum(id) > 0"), alone("SELECT sum(id::DOUBLE) FROM t HAVING sum(id) > 0")
+    grouped = alone("SELECT id % 3 AS g, sum(id), sum(id::DOUBLE) FROM t GROUP BY 1 HAVING sum(id::DOUBLE) > 0 ORDER BY sum(id::DOUBLE) DESC")
+    window = alone("SELECT sum(id) OVER (), sum(id::DOUBLE) OVER () FROM t LIMIT 1")
+    checks["aggregates that differ only by a cast (sum(id) and sum(id::DOUBLE); min(x), min(x::INT) and max(x::INT); three count(DISTINCT …); round(sum(…)) twice) each answer as alone, in HAVING, ORDER BY and a window too, named as written"] = \
+        together == each and cols(f"SELECT {', '.join(sets[0])} FROM t") == ["sum(t.id)", "sum(id::DOUBLE)"] and having == (["sum(id::DOUBLE)"], [[500500.0]]) \
+        and grouped == [[1, 167167, 167167.0], [0, 166833, 166833.0], [2, 166500, 166500.0]] and window == [[500500, 500500.0]]
     # each fallback equals its standard name
     sql_pairs = {"read_parquet": ["parquet_scan"], "read_csv": ["read_csv_auto"], "read_json": ["read_json_auto", "read_ndjson"], "read_delta": ["delta_scan"], "read_iceberg": ["iceberg_scan"]}
     checks["SQL: parquet_scan, read_csv_auto, read_json_auto, read_ndjson, delta_scan, iceberg_scan == Pondra's names"] = \

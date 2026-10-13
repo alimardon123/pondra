@@ -1262,8 +1262,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    its column or, beside another of that name, as written, a column named twice `id_1`, and a
    scalar subquery named as another item (DataFusion names it by its column: two of `count(*)`) or
    an expression written twice (or but for a cast, which DataFusion's names leave out), as written;
-   a query that needs no name given is sent as written.
-   `harness.py names`.
+   a query that needs no name given is sent as written. Calls that differ only by a cast
+   (`sum(id), sum(id::DOUBLE)`, which an aggregate refused as two of `sum(t.id)`) are told apart
+   (`routines::casts_apart`): each later form's arguments that cast a column go in `coalesce(…)`,
+   once, twice, …, alike in the SELECT, HAVING, QUALIFY and ORDER BY, and the planner takes the
+   coalesce out again. `harness.py names`.
 176. **One check at every door** (`auth::WHO`, ADR-035): HTTP, Postgres, Kafka and Flight each work
    out a `Principal` (a token's role, or a user's grants) and run the request inside `WHO.scope`;
    anything that reads tables for it (`query::guarded`), writes (`auth::allows`), streams rows

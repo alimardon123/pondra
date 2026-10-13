@@ -569,7 +569,7 @@ impl VisitorMut for Casts {
 }
 
 /// `name(args…)` as SQL's tree has a call.
-fn function(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+pub fn function(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
     ast::Expr::Function(ast::Function {
         name: ast::ObjectName::from(vec![ast::Ident::new(name)]),
         uses_odbc_syntax: false,

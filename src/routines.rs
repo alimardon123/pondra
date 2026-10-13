@@ -962,8 +962,7 @@ pub fn rows_apart(sql: &str) -> std::borrow::Cow<'_, str> {
 /// - a scalar subquery DataFusion would name as another item (it names one by its column: two of
 ///   `count(*)`, `max(q)` beside `(SELECT max(q) FROM t)`), and an expression written again
 ///   (`q + 1, q + 1`, or but for a cast: `q * 2, q::DOUBLE * 2`), are named as written, as DuckDB
-///   names them. (An aggregate's are named before this name is given: `sum(c), sum(c::DOUBLE)` is
-///   still refused, by DataFusion's planner.)
+///   names them (`sum(c), sum(c::DOUBLE)` too, whose aggregates `casts_apart` tells apart).
 ///
 /// (A column the ORDER BY names qualified, `ORDER BY o.ts`, is one more of the SELECT's: DataFusion
 /// adds it, so a cast of `ts` is then named as written too.)
@@ -975,7 +974,136 @@ fn output_names(q: &mut ast::Query) -> bool {
         }).collect(),
         _ => vec![],
     };
-    select_names(&mut q.body, &sorted)
+    select_names(&mut q.body, &sorted) | casts_apart(q)
+}
+
+/// A call's text as DataFusion names it, near enough to compare: without its casts (`CAST(c AS
+/// DOUBLE) * 2` is named as `c * 2` is), lower-cased, unquoted.
+fn said(e: &Expr) -> String {
+    let mut e = e.clone();
+    let _ = visit_expressions_mut(&mut e, |x| {
+        if let Expr::Cast { expr, .. } = x {
+            *x = (**expr).clone();
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    e.to_string().to_lowercase().replace('"', "")
+}
+
+/// A name's qualifiers (`t.`), left out where names are compared (`max(q)` is named `max(t.q)`).
+static QUALIFIER: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\b[a-z_][a-z0-9_]*\.").expect("a regex"));
+
+/// Calls of a SELECT that differ only by a cast, told apart; true if any was. DataFusion names a cast
+/// as what it casts, so `sum(c)` and `sum(c::DOUBLE)`, or `min(ts)` and `min(ts::DATE)`, are both
+/// `sum(t.c)` or `min(t.ts)`, and an aggregate (or a window) refuses two columns of one name, which
+/// DuckDB and Postgres both answer. So each later form's arguments that cast a column are wrapped in
+/// `coalesce(…)`, once for the second form, twice for the third: a coalesce of one argument is that
+/// argument, and the planner takes it out again (`coalesce`'s `simplify`), so only the name differs.
+/// Every place that calls a form (the SELECT's items, HAVING, QUALIFY, ORDER BY) is wrapped alike, so
+/// they still name one aggregate, and an item wrapped that had no name is named as written; a
+/// subquery's calls are its own.
+fn casts_apart(q: &mut ast::Query) -> bool {
+    // (each call of this query, not of its subqueries, after its arguments: so `round(sum(c::DOUBLE))`
+    // is met after its `sum`, in both walks)
+    struct Calls<F>(usize, F);
+    impl<F: FnMut(&mut ast::Function)> VisitorMut for Calls<F> {
+        type Break = ();
+        fn pre_visit_query(&mut self, _: &mut ast::Query) -> ControlFlow<()> {
+            self.0 += 1;
+            ControlFlow::Continue(())
+        }
+        fn post_visit_query(&mut self, _: &mut ast::Query) -> ControlFlow<()> {
+            self.0 -= 1;
+            ControlFlow::Continue(())
+        }
+        fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+            if let (0, Expr::Function(f)) = (self.0, e) {
+                (self.1)(f);
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    fn calls(q: &mut ast::Query, each: impl FnMut(&mut ast::Function)) {
+        let ast::Query { body, order_by, .. } = q;
+        let ast::SetExpr::Select(s) = body.as_mut() else { return };
+        let mut walk = Calls(0, each);
+        for item in &mut s.projection {
+            if let ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } = item {
+                let _ = e.visit(&mut walk);
+            }
+        }
+        for e in s.having.iter_mut().chain(s.qualify.iter_mut()) {
+            let _ = e.visit(&mut walk);
+        }
+        if let Some(ast::OrderBy { kind: ast::OrderByKind::Expressions(all), .. }) = order_by {
+            for o in all {
+                let _ = o.expr.visit(&mut walk);
+            }
+        }
+    }
+    // (an argument that casts a column: a cast of a value alone may be one a function needs as written)
+    fn casts(a: &FunctionArg) -> bool {
+        let (FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) | FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. }) = a else { return false };
+        let (mut cast, mut column) = (false, false);
+        let _ = ast::visit_expressions(e, |x| {
+            cast |= matches!(x, Expr::Cast { .. });
+            column |= matches!(x, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
+            ControlFlow::<()>::Continue(())
+        });
+        cast && column
+    }
+    let args = |f: &ast::Function| match &f.args {
+        FunctionArguments::List(l) => l.args.clone(),
+        _ => vec![],
+    };
+    // Each call as written (its qualifiers left out: `sum(t.c)` is `sum(c)`), and as DataFusion names it.
+    let mut met: Vec<(String, String, bool)> = vec![];
+    calls(q, |f| {
+        let e = Expr::Function(f.clone());
+        met.push((QUALIFIER.replace_all(&e.to_string().to_lowercase(), "").into_owned(), QUALIFIER.replace_all(&said(&e), "").into_owned(), args(f).iter().any(casts)));
+    });
+    let mut forms: HashMap<&str, Vec<(&str, bool)>> = HashMap::new();
+    for (written, named, cast) in &met {
+        let all = forms.entry(named).or_default();
+        if !all.iter().any(|(w, _)| w == written) {
+            all.push((written, *cast));
+        }
+    }
+    // (how many times each later form's casts are wrapped: the forms without a cast name themselves)
+    let times: HashMap<&str, usize> = forms.into_values().filter(|all| all.len() > 1)
+        .flat_map(|all| all.into_iter().filter(|(_, cast)| *cast).enumerate().map(|(i, (w, _))| (w, i + 1)))
+        .collect();
+    if times.is_empty() {
+        return false;
+    }
+    let mut n = 0;
+    let times: Vec<usize> = met.iter().map(|(w, ..)| times.get(w.as_str()).copied().unwrap_or(0)).collect();
+    let items = |q: &ast::Query| match &*q.body {
+        ast::SetExpr::Select(s) => s.projection.iter().map(|i| i.to_string()).collect(),
+        _ => vec![],
+    };
+    let written: Vec<String> = items(q);
+    calls(q, |f| {
+        if let FunctionArguments::List(l) = &mut f.args {
+            for a in l.args.iter_mut().filter(|a| casts(a)) {
+                if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) | FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. } = a {
+                    *e = (0..times[n]).fold(e.clone(), |e, _| crate::types::function("coalesce", vec![e]));
+                }
+            }
+        }
+        n += 1;
+    });
+    // (an item whose calls were wrapped, and that had no name, is named as written)
+    if let ast::SetExpr::Select(s) = q.body.as_mut() {
+        for (item, written) in s.projection.iter_mut().zip(written) {
+            if let ast::SelectItem::UnnamedExpr(e) = item {
+                if e.to_string() != written {
+                    *item = ast::SelectItem::ExprWithAlias { expr: e.clone(), alias: ast::Ident::with_quote('"', written) };
+                }
+            }
+        }
+    }
+    true
 }
 
 fn select_names(body: &mut ast::SetExpr, sorted: &[String]) -> bool {
@@ -993,18 +1121,6 @@ fn select_names(body: &mut ast::SetExpr, sorted: &[String]) -> bool {
             Expr::Cast { expr, .. } => cast(expr).or_else(|| column(expr).map(|c| c.1)),
             _ => None,
         }
-    }
-    // (an expression's text, compared as DataFusion's names of it would be: they leave out casts,
-    // so `CAST(c AS DOUBLE) * 2` is named as `c * 2` is)
-    fn said(e: &Expr) -> String {
-        let mut e = e.clone();
-        let _ = visit_expressions_mut(&mut e, |x| {
-            if let Expr::Cast { expr, .. } = x {
-                *x = (**expr).clone();
-            }
-            ControlFlow::<()>::Continue(())
-        });
-        e.to_string().to_lowercase().replace('"', "")
     }
     // (a scalar subquery's column: its alias, name or text; "" when it can't be told)
     fn inner(q: &ast::Query) -> String {
@@ -1051,7 +1167,6 @@ fn select_names(body: &mut ast::SetExpr, sorted: &[String]) -> bool {
             }
             // What each item may be named, and whether it is a subquery's (compared without the
             // qualifiers: `max(q)` is named `max(t.q)`, and so is `(SELECT max(q) FROM t)`).
-            static QUALIFIER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\b[a-z_][a-z0-9_]*\.").expect("a regex"));
             let mut keys: Vec<Option<(bool, String)>> = s.projection.iter().zip(&names).map(|(i, n)| match (i, n) {
                 (UnnamedExpr(Expr::Subquery(q)), _) => Some((true, inner(q))),
                 (UnnamedExpr(e), None) => Some((false, said(e))),
@@ -2215,5 +2330,14 @@ mod tests {
         let bound = bind("RESTORE TABLE sales.prices TO TIMESTAMP AS OF $before;", &values).unwrap();
         assert_eq!(bound, "RESTORE TABLE sales.prices TO TIMESTAMP AS OF (TIMESTAMP '2026-10-02 12:00:00')");
         assert!(bind("RESTORE TABLE t TO VERSION AS OF $v", &values).unwrap_err().to_string().contains("no value for $v"));
+    }
+
+    #[test]
+    fn calls_that_differ_by_a_cast_are_told_apart() {
+        assert_eq!(named_apart("SELECT sum(c), sum(c::DOUBLE), sum(CAST(c AS INT)) FROM t HAVING sum(c::DOUBLE) > 0").unwrap(),
+                   "SELECT sum(c), sum(coalesce(c::DOUBLE)) AS \"sum(c::DOUBLE)\", sum(coalesce(coalesce(CAST(c AS INT)))) AS \"sum(CAST(c AS INT))\" FROM t HAVING sum(coalesce(c::DOUBLE)) > 0");
+        // (a subquery's calls are its own; a cast of a value alone, and calls that differ otherwise, are left as written)
+        assert_eq!(named_apart("SELECT sum(c), (SELECT sum(c::DOUBLE) FROM u) AS s FROM t"), None);
+        assert_eq!(named_apart("SELECT max(c), max(d::INT) FROM t HAVING f(max(c), 0.5::DOUBLE) > f(max(c), 0.5)"), None);
     }
 }
