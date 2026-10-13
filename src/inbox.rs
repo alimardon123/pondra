@@ -65,6 +65,8 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>) -> Result<Opti
 /// lake's catalog writer would outlive the moment in the node, and a later leader of it would
 /// fence it out.
 pub async fn lead_once(dir: &str) -> Result<()> {
+    // (another process would lead a lake of its own memory, gone when it ends)
+    anyhow::ensure!(!crate::store::in_memory(dir), "{dir} is in a process's memory, where a lake is made by opening it (pondra.open(), pondra :memory:) and led by that process alone: attach or make a database in a folder or a bucket");
     let out = tokio::process::Command::new(crate::library::exe()?).args(["lead", "--dir", dir]).envs(crate::env::given())
         .env_remove("PONDRA_JOB").env_remove("PONDRA_TRIES").env(crate::store::REACH_VAR, crate::store::reaches()) // (the keys this node reaches other places with)
         .stdin(std::process::Stdio::null()).output().await?;

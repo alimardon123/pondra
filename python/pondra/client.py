@@ -602,8 +602,8 @@ class Pondra:
 
     def close(self):
         """End this connection's session (its temporary tables and views), and stop the node
-        `local()` started or close the node `open()` made here (a temporary lake of `open()` is
-        removed). Closing a `local()` node's input stops it (it hands the lake on at once), on every
+        `local()` started or close the node `open()` made here (and a lake of `open()` held in
+        memory with it). Closing a `local()` node's input stops it (it hands the lake on at once), on every
         OS; it would stop the same way if Python were killed."""
         retry_secs, self.retry_secs = self.retry_secs, 0  # (a node that's gone isn't waited for here)
         try:

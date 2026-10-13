@@ -75,8 +75,11 @@ The code assumes one node per process. An audit of `src/` (2026-10-11) found wha
      Polars from the answer's own buffer.
    - **Node** has no foreign-function interface of its own, so a small addon opens and closes the
      node (off the event loop) and the client speaks HTTP to its loopback port.
-   - `pondra.open()` with no path opens a lake in a temporary folder, removed at `close`: DuckDB's
-     `:memory:`.
+   - `pondra.open()` with no path, or `":memory:"` as DuckDB spells it, holds its lake in this
+     process's memory: the same lake code over an object store in memory (`memory://<id>`), nothing
+     written to disk but what a query spills when memory runs short, let go at `close`. `pondra
+     :memory:` and `pondra serve :memory:` are the same from the command line. No other process
+     reaches it, so none leads it (the hidden `pondra lead` refuses one, invariant 62).
 8. **Every setting is read through one function, from one table of names** (`PONDRA_*`: the options
    given to `open`, then the environment). Setting the environment while a host already runs threads
    (Jupyter, any Python) is a data race, which is why Rust 2024 marks `set_var` unsafe, so a library

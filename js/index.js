@@ -460,8 +460,8 @@ export class Pondra {
   /** End this connection's session (its temporary tables and views), then stop the node it reaches:
    * `local()`'s, by closing its input (it hands the lake on at once), on every OS; it would stop the same way
    * if this process were killed. It waits up to 15 seconds for that node to stop, then kills it. A node
-   * `open()` made in this process is closed instead: drained, its term given back, and a temporary lake
-   * removed. Takes no argument. */
+   * `open()` made in this process is closed instead: drained, its term given back, and a lake in memory
+   * let go. Takes no argument. */
   async close(...more) {
     if (more.length) throw new Error("close() takes no argument");
     const retrySecs = this.retrySecs;
@@ -537,8 +537,8 @@ export async function local(dir = "lake", { port, token, flags = [], timeout = 1
 }
 
 /** Open a node on a lake in this process, and connect to it: no server and no second process. `dir` is a
- * folder or s3://bucket/prefix, as `local()` takes; with none, a lake in a temporary folder that `close()`
- * removes (DuckDB's `:memory:`). It returns the connection `connect()` and `local()` return, so frames, `sql`,
+ * folder or s3://bucket/prefix, as `local()` takes; with none, or `":memory:"` as DuckDB spells it, a lake held
+ * in this process's memory: nothing on disk, and gone at `close()`. It returns the connection `connect()` and `local()` return, so frames, `sql`,
  * `writeTable` and the rest work the same. Its SQL may read files on this machine, as `local()`'s may.
  * `settings` are the node's settings by name (`memory_gb: 2` is PONDRA_MEMORY_GB), fixed by the first open
  * in a process. One node at a time in a process: open another lake with ATTACH, or close this one first. It
@@ -548,12 +548,10 @@ export async function open(dir, { token, python = true, onNotice, ...settings } 
   const addon = await nativeModule(); // (first: a missing library leaves no folder behind)
   const port = await freePort();
   const owner = randomUUID().replaceAll("-", ""); // (with it, this process's SQL reads files here: invariant 61)
-  const { mkdirSync, mkdtempSync, rmSync } = await import("node:fs");
-  const { tmpdir } = await import("node:os");
-  const { join, resolve } = await import("node:path");
-  const temp = dir == null; // (no folder named: a temporary one, which close() removes)
-  let lake = temp ? mkdtempSync(join(tmpdir(), "pondra-")) : dir;
-  if (!lake.includes("://")) {
+  const { mkdirSync } = await import("node:fs");
+  const { resolve } = await import("node:path");
+  let lake = dir ?? ":memory:"; // (none named: a lake in this process's memory, gone at close())
+  if (!lake.includes("://") && lake !== ":memory:") {
     mkdirSync(lake, { recursive: true });
     lake = resolve(lake);
   }
@@ -563,27 +561,20 @@ export async function open(dir, { token, python = true, onNotice, ...settings } 
   const options = {
     ...given,
     lake, addr: `127.0.0.1:${port}`, owner, // (these win over a setting of the same name)
-    ...(temp && { temporary: true }), // (the library removes the folder once the node lets go of it)
     ...(python && { python: "auto" }),
     ...(launcher && { launcher }),
   };
-  let handle;
-  try {
-    handle = await addon.open(JSON.stringify(options));
-  } catch (e) {
-    if (temp) rmSync(lake, { recursive: true, force: true }); // (the node never took it)
-    throw e;
-  }
+  const handle = await addon.open(JSON.stringify(options));
   const db = new Pondra(`http://127.0.0.1:${port}`, { token, ...(onNotice !== undefined && { onNotice }) });
   db.owner = owner;
-  db.lake = lake; // (where the lake is: a temporary one's folder, for a caller that wants to see it)
+  db.lake = lake; // (where the lake is: a folder, a bucket's URL, or ":memory:")
   db.opened = closer(addon, handle);
   return db;
 }
 
 // The nodes open() made here and nothing closed yet. `process.exit()` ends Node without the cleanup hook the
 // library adds (that hook closes them when the process simply ends, or a worker thread does), so the
-// process's `exit` event closes them, on this thread: drained, the term given back, a temporary lake removed.
+// process's `exit` event closes them, on this thread: drained, the term given back, a lake in memory let go.
 const stillOpen = new Set();
 let exitHooked = false;
 
