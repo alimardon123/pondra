@@ -3259,6 +3259,7 @@ dependencies = [
  "glob",
  "http",
  "http-body-util",
+ "jiter",
  "libc",
  "lru",
  "lz4_flex",

@@ -1,25 +1,28 @@
-//! Postgres's JSON operators on JSON text (round 35): `#>` and `#>>` (a path), `@>` and `<@` (containment),
-//! `?`, `?|` and `?&` (existence). datafusion-functions-json reads a path as one key and plans none of the
-//! others, so they are planned here, ahead of its planner (`Lake::made`), when the left side is text. `->`,
-//! `->>` and every operator on another type keep the planning they have. The answers follow Postgres 16:
-//! a document's text is kept as written (`types.rs`), so `#>` answers the value's text as the document has it.
+//! Postgres's JSON operators on JSON text (round 35): `->` (a value as JSON text), `#>` and `#>>` (a path), `@>` and
+//! `<@` (containment), `?`, `?|` and `?&` (existence). datafusion-functions-json reads a path as one key and plans none
+//! of the others, so they are planned here, ahead of its planner (`Lake::made`), when the left side is text. `->>` and
+//! every operator on another type keep the planning they have. The answers follow Postgres 16: a document's text is
+//! kept as written (`types.rs`), so `->` and `#>` answer the value's text as the document has it. Text that isn't JSON
+//! answers NULL where a walk meets it; `@>`, `<@`, `?`, `?|` and `?&` read the whole document and refuse it (22P02).
+//! `text` groups the operators the way Postgres does, where SQL comes in (`path::door`).
 use crate::pg_catalog::{function, text_arg, texts_out};
 use crate::types::{is_json, json_of};
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
+use datafusion::arrow::array::{Array, ArrayAccessor, ArrayRef, AsArray, BooleanArray, StringArray};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Int64Type};
 use datafusion::common::{DFSchema, Result, ScalarValue};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::expr::{Alias, ScalarFunction};
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
 use datafusion::logical_expr::{Expr, ExprSchemable, ScalarUDF, Signature, Volatility};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast::{BinaryOperator, Statement};
+use datafusion::sql::sqlparser::ast::{self, BinaryOperator, VisitMut, VisitorMut};
 use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::parser::Parser;
-use serde_json::value::RawValue;
+use jiter::{Jiter, Peek};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
 
 pub fn planner() -> Arc<dyn ExprPlanner> { Arc::new(Operators) }
@@ -29,29 +32,30 @@ struct Operators;
 
 impl ExprPlanner for Operators {
     fn plan_binary_op(&self, e: RawBinaryExpr, schema: &DFSchema) -> Result<PlannerResult<RawBinaryExpr>> {
-        let Some((name, both_text, swap)) = operator(&e.op) else { return Ok(PlannerResult::Original(e)) };
+        let Some((name, both_text)) = operator(&e.op) else { return Ok(PlannerResult::Original(e)) };
         let text = |x: &Expr| x.get_type(schema).is_ok_and(|t| matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8));
         if !text(&e.left) || (both_text && !text(&e.right)) {
-            return Ok(PlannerResult::Original(e)); // (an array's @> stays DataFusion's)
+            return Ok(PlannerResult::Original(e)); // (an array's @> stays DataFusion's, a JSON union's -> stays functions-json's)
         }
         // The column's title is what functions-json gives it (`doc #>> '{b,0}'`), so a default name doesn't change.
         let alias = format!("{} {} {}", as_title(&e.left), e.op, as_title(&e.right));
-        let args = if swap { vec![e.right, e.left] } else { vec![e.left, e.right] };
-        let call = Expr::ScalarFunction(ScalarFunction::new_udf(named(name), args));
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(named(name), vec![e.left, e.right]));
         Ok(PlannerResult::Planned(Expr::Alias(Alias::new(call, None::<&str>, alias))))
     }
 }
 
-/// The function an operator calls, whether both sides must be text, and whether its sides swap (`<@`).
-fn operator(op: &BinaryOperator) -> Option<(&'static str, bool, bool)> {
+/// The function an operator calls, and whether both sides must be text. `->` takes a text key or an integer index,
+/// so only its left side must be text.
+fn operator(op: &BinaryOperator) -> Option<(&'static str, bool)> {
     Some(match op {
-        BinaryOperator::HashArrow => ("pg_json_path", false, false),
-        BinaryOperator::HashLongArrow => ("pg_json_path_text", false, false),
-        BinaryOperator::AtArrow => ("pg_jsonb_contains", true, false),
-        BinaryOperator::ArrowAt => ("pg_jsonb_contains", true, true),
-        BinaryOperator::Question => ("pg_jsonb_exists", false, false),
-        BinaryOperator::QuestionPipe => ("pg_jsonb_exists_any", false, false),
-        BinaryOperator::QuestionAnd => ("pg_jsonb_exists_all", false, false),
+        BinaryOperator::Arrow => ("json_object_field", false),
+        BinaryOperator::HashArrow => ("pondra_json_path", false),
+        BinaryOperator::HashLongArrow => ("pondra_json_path_text", false),
+        BinaryOperator::AtArrow => ("jsonb_contains", true),
+        BinaryOperator::ArrowAt => ("jsonb_contained", true),
+        BinaryOperator::Question => ("jsonb_exists", false),
+        BinaryOperator::QuestionPipe => ("jsonb_exists_any", false),
+        BinaryOperator::QuestionAnd => ("jsonb_exists_all", false),
         _ => return None,
     })
 }
@@ -68,55 +72,42 @@ fn as_title(e: &Expr) -> String {
     }
 }
 
-/// The six functions the operators call. `register` adds them to every session; the planner calls them by name.
+/// The functions the operators call, by Postgres's names where Postgres has them (`jsonb_contains`, `json_object_field`
+/// and its aliases); the path ones keep `pondra_` names, as `pondra_json` does. `register` adds them to every session.
 static FUNCTIONS: LazyLock<Vec<Arc<ScalarUDF>>> = LazyLock::new(|| {
     let two = || Signature::any(2, Volatility::Immutable);
     vec![
-        Arc::new(function("pg_json_path", two(), |_| DataType::Utf8, |a, n| path(a, n, false).map_err(fail))),
-        Arc::new(function("pg_json_path_text", two(), |_| DataType::Utf8, |a, n| path(a, n, true).map_err(fail))),
-        Arc::new(function("pg_jsonb_contains", two(), |_| DataType::Boolean, |a, n| contains_all(a, n).map_err(fail))),
-        Arc::new(function("pg_jsonb_exists", two(), |_| DataType::Boolean, |a, n| exists(a, n).map_err(fail))),
-        Arc::new(function("pg_jsonb_exists_any", two(), |_| DataType::Boolean, |a, n| any_all(a, n, false).map_err(fail))),
-        Arc::new(function("pg_jsonb_exists_all", two(), |_| DataType::Boolean, |a, n| any_all(a, n, true).map_err(fail))),
+        Arc::new(function("json_object_field", two(), |_| DataType::Utf8, |a, n| field(a, n).map_err(fail)).with_aliases(["jsonb_object_field", "json_array_element", "jsonb_array_element"])),
+        Arc::new(function("pondra_json_path", two(), |_| DataType::Utf8, |a, n| path(a, n, false).map_err(fail))),
+        Arc::new(function("pondra_json_path_text", two(), |_| DataType::Utf8, |a, n| path(a, n, true).map_err(fail))),
+        Arc::new(function("jsonb_contains", two(), |_| DataType::Boolean, |a, n| contains_all(a, n).map_err(fail))),
+        Arc::new(function("jsonb_contained", two(), |_| DataType::Boolean, |a, n| contained(a, n).map_err(fail))),
+        Arc::new(function("jsonb_exists", two(), |_| DataType::Boolean, |a, n| exists(a, n).map_err(fail))),
+        Arc::new(function("jsonb_exists_any", two(), |_| DataType::Boolean, |a, n| any_all(a, n, false).map_err(fail))),
+        Arc::new(function("jsonb_exists_all", two(), |_| DataType::Boolean, |a, n| any_all(a, n, true).map_err(fail))),
     ]
 });
 
-/// The function called `name` (one of the six above).
+/// The function called `name` (one of the ones above, or an alias of one).
 fn named(name: &str) -> Arc<ScalarUDF> {
     FUNCTIONS.iter().find(|f| f.name() == name).cloned().expect("pg_json.rs calls only the functions it makes")
 }
 
-/// Adds the six functions to a session, so `pg_json_path(…)` and the rest can be called by name.
+/// Adds the functions to a session, so `json_object_field(…)`, `jsonb_contains(…)` and the rest can be called by name.
 pub fn register(ctx: &SessionContext) {
     for f in FUNCTIONS.iter() {
         ctx.register_udf(f.as_ref().clone());
     }
 }
 
-/// A query whose text has a `?` operator (`?`, `?|`, `?&`). SQL is read with the generic dialect, which reads `?` as a
-/// placeholder, so such a query is read as Postgres's dialect reads it and planned from that tree, as
-/// `friendly::lambdas`' are (`query::sql`). None for any other text, and for text the generic dialect reads.
-pub fn statement(sql: &str) -> Option<datafusion::sql::parser::Statement> {
-    if !sql.contains('?') || Parser::parse_sql(&GenericDialect {}, sql).is_ok() {
-        return None;
-    }
-    let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).ok()?;
-    if !matches!(stmts.as_slice(), [Statement::Query(_)]) {
-        return None;
-    }
-    Some(datafusion::sql::parser::Statement::Statement(Box::new(stmts.remove(0))))
-}
-
 /// An error a function raises, carrying its SQLSTATE to the door (`codes::of`).
 fn fail(e: anyhow::Error) -> DataFusionError { DataFusionError::External(e.into()) }
 
-/// `s` as a JSON document, or Postgres's refusal (22P02) when it isn't one.
-fn valid(s: &str) -> anyhow::Result<()> {
-    if is_json(s) { Ok(()) } else { Err(json_of(s).unwrap_err()) }
+/// `s` parsed, for containment and existence: a document that isn't JSON is refused (22P02, in `json_of`'s words).
+fn document(s: &str) -> anyhow::Result<Value> {
+    json_of(s)?;
+    Ok(serde_json::from_str(s)?)
 }
-
-/// `s` parsed, for containment and existence.
-fn document(s: &str) -> anyhow::Result<Value> { serde_json::from_str(s).map_err(|_| json_of(s).unwrap_err()) }
 
 /// A path or a list of keys, one per row: a text-array literal (`'{b,0}'`) or a list (`ARRAY['b', '0']`). None where
 /// the argument is NULL, and a NULL element is None inside the list.
@@ -209,69 +200,185 @@ fn unescape(s: &str) -> String {
 
 const JSON_SPACE: &[char] = &[' ', '\t', '\n', '\r'];
 
+/// One step of a path, as an operator takes it. `->` takes a text key (`Key`, an object's member only) or an integer
+/// (`Index`, an array's element, negative from the end); `#>` takes each element as text (`Path`): a key of an object,
+/// or an index of an array when it spells one.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Key(&'a str),
+    Index(i64),
+    Path(&'a str),
+}
+
 /// `#>` (`text` false) and `#>>` (true): what the path reaches in each document, NULL where it reaches nothing.
 fn path(a: &[ArrayRef], n: usize, text: bool) -> anyhow::Result<ArrayRef> {
     let (docs, paths) = (text_arg(&a[0])?, lists(&a[1])?);
-    let out = (0..n).map(|i| -> anyhow::Result<Option<String>> {
-        match (&docs[i], &paths[i]) {
-            (Some(doc), Some(steps)) => {
-                valid(doc)?;
-                Ok(walk(doc, steps)?.and_then(|raw| if text { unquoted(raw) } else { Some(raw.to_string()) }))
-            }
-            _ => Ok(None),
-        }
+    let out = (0..n).map(|i| {
+        let (Some(doc), Some(elements)) = (&docs[i], &paths[i]) else { return None };
+        let steps: Option<Vec<Step>> = elements.iter().map(|e| e.as_deref().map(Step::Path)).collect();
+        let raw = find(doc, &steps?)?;
+        if text { unquoted(raw) } else { Some(raw.to_string()) }
     });
-    Ok(texts_out(out.collect::<anyhow::Result<Vec<_>>>()?))
+    Ok(texts_out(out.collect::<Vec<_>>()))
 }
 
-/// The text of the value a path reaches from `doc`, as written: the whole document (trimmed of its spaces) for an
-/// empty path, None where the path reaches nothing or a step is NULL. Each level is read by its own parse, so
-/// the text returned is the document's own bytes, not a re-serialization.
-fn walk<'a>(doc: &'a str, steps: &[Option<String>]) -> anyhow::Result<Option<&'a str>> {
-    let Some((step, rest)) = steps.split_first() else { return Ok(Some(doc.trim_matches(JSON_SPACE))) };
-    let Some(step) = step else { return Ok(None) };
-    let found: Option<&'a RawValue> = match doc.trim_start_matches(JSON_SPACE).as_bytes().first().copied() {
-        // (a duplicate key's last value wins, as the map keeps the last it reads)
-        Some(b'{') => serde_json::from_str::<BTreeMap<String, &'a RawValue>>(doc)?.get(step).copied(),
-        Some(b'[') => {
-            let items: Vec<&'a RawValue> = serde_json::from_str(doc)?;
-            index(step, items.len()).map(|i| items[i])
-        }
-        _ => None, // (a scalar has no steps)
-    };
-    match found {
-        Some(raw) => walk(raw.get(), rest),
-        None => Ok(None),
+/// `->`, and `json_array_element` and its kin: the value at a text key of an object or an integer index of an array,
+/// as JSON text. Each row reads its own document; NULL where a key is NULL or the document has nothing there.
+fn field(a: &[ArrayRef], n: usize) -> anyhow::Result<ArrayRef> {
+    // A table's text is a string view, and a batch of one is read where it lies: a copy of every document per batch
+    // cost `->` half its speed on a million rows.
+    if a[0].data_type() == &DataType::Utf8View {
+        return field_of(a[0].as_string_view(), &a[1], n);
+    }
+    let docs = cast(&a[0], &DataType::Utf8)?;
+    field_of(docs.as_string::<i32>(), &a[1], n)
+}
+
+/// `field` over a column of documents, whichever string array holds them.
+fn field_of<'a, D>(docs: D, key: &ArrayRef, n: usize) -> anyhow::Result<ArrayRef>
+where
+    D: ArrayAccessor<Item = &'a str> + Array + Copy,
+{
+    if is_integer(key.data_type()) {
+        let keys = cast(key, &DataType::Int64)?;
+        let keys = keys.as_primitive::<Int64Type>();
+        return Ok(each_row(docs, n, |i| keys.is_valid(i).then(|| Step::Index(keys.value(i)))));
+    }
+    let keys = cast(key, &DataType::Utf8)?;
+    let keys = keys.as_string::<i32>();
+    Ok(each_row(docs, n, |i| keys.is_valid(i).then(|| Step::Key(keys.value(i)))))
+}
+
+/// One step per row over a column of documents, as text. `step(i)` is row `i`'s step, None where its key is NULL.
+fn each_row<'a, 's, D>(docs: D, n: usize, step: impl Fn(usize) -> Option<Step<'s>>) -> ArrayRef
+where
+    D: ArrayAccessor<Item = &'a str> + Array + Copy,
+{
+    let out = (0..n).map(|i| if docs.is_null(i) { None } else { step(i).and_then(|s| find(docs.value(i), &[s])) });
+    Arc::new(StringArray::from_iter(out))
+}
+
+fn is_integer(d: &DataType) -> bool {
+    matches!(d, DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64)
+}
+
+/// The value a path reaches in `doc`, as written. An empty path is the document itself, which must be JSON; any other
+/// path is read a step at a time, and text that isn't JSON where a step looks answers None without being validated.
+fn find<'a>(doc: &'a str, steps: &[Step]) -> Option<&'a str> {
+    if steps.is_empty() {
+        return is_json(doc).then(|| doc.trim_matches(JSON_SPACE));
+    }
+    walk(doc, steps)
+}
+
+/// The value at `steps` in `doc`. Each step's value is a slice of the document before it, so the answer is the
+/// document's own text.
+fn walk<'a>(doc: &'a str, steps: &[Step]) -> Option<&'a str> {
+    match steps.split_first() {
+        None => Some(doc.trim_matches(JSON_SPACE)),
+        Some((step, rest)) => walk(child(doc, *step)?, rest),
     }
 }
 
-/// An array index as Postgres reads one: an optional sign, then digits, where a negative one counts from the end
-/// (`-1` is the last). None when it isn't a whole number or lies outside the array.
-fn index(step: &str, len: usize) -> Option<usize> {
-    let (negative, digits) = match step.as_bytes().first().copied() {
-        Some(b'-') => (true, &step[1..]),
-        Some(b'+') => (false, &step[1..]),
-        _ => (false, step),
+/// The value one step reaches in `doc`, as written, or None.
+fn child<'a>(doc: &'a str, step: Step) -> Option<&'a str> {
+    match step {
+        Step::Key(key) => member(doc, key),
+        Step::Index(at) => element(doc, at),
+        Step::Path(text) => match doc.trim_start_matches(JSON_SPACE).as_bytes().first()? {
+            b'{' => member(doc, text),
+            b'[' => element(doc, index_of(text)?),
+            _ => None,
+        },
+    }
+}
+
+/// The value of the object `doc`'s last member named `key`, as written: Postgres takes a duplicate key's last, so the
+/// whole object is read. Values it skips are not built into anything.
+fn member<'a>(doc: &'a str, key: &str) -> Option<&'a str> {
+    let mut jiter = Jiter::new(doc.as_bytes());
+    if jiter.peek().ok()? != Peek::Object {
+        return None;
+    }
+    let mut found = None;
+    // (each key is compared as it is read, so the borrow of jiter's text ends before the next read)
+    let mut next = jiter.known_object().ok()?.map(|name| name == key);
+    while let Some(is_key) = next {
+        let peek = jiter.peek().ok()?;
+        let start = jiter.current_index();
+        jiter.known_skip(peek).ok()?;
+        if is_key {
+            found = Some((start, jiter.current_index()));
+        }
+        next = jiter.next_key().ok()?.map(|name| name == key);
+    }
+    let (start, end) = found?;
+    doc.get(start..end).map(|value| value.trim_matches(JSON_SPACE))
+}
+
+/// The element `at` of the array `doc`, as written; a negative index counts from the end, and an index past the array
+/// is None.
+fn element<'a>(doc: &'a str, at: i64) -> Option<&'a str> {
+    let mut jiter = Jiter::new(doc.as_bytes());
+    if jiter.peek().ok()? != Peek::Array {
+        return None;
+    }
+    let at = if at < 0 { array_len(doc)? as i64 + at } else { at };
+    if at < 0 {
+        return None;
+    }
+    let mut peek = jiter.known_array().ok()??;
+    for _ in 0..at {
+        jiter.known_skip(peek).ok()?;
+        peek = jiter.array_step().ok()??;
+    }
+    let start = jiter.current_index();
+    jiter.known_skip(peek).ok()?;
+    doc.get(start..jiter.current_index()).map(|value| value.trim_matches(JSON_SPACE))
+}
+
+/// The number of elements of the array `doc`, read through once more (a negative index counts from the end, as
+/// functions-json does). `Jiter` can't be copied, so the count reads its own reader.
+fn array_len(doc: &str) -> Option<usize> {
+    let mut jiter = Jiter::new(doc.as_bytes());
+    let mut peek = jiter.known_array().ok()?;
+    let mut len = 0;
+    while let Some(p) = peek {
+        jiter.known_skip(p).ok()?;
+        len += 1;
+        peek = jiter.array_step().ok()?;
+    }
+    Some(len)
+}
+
+/// An array index as `#>` reads a path element: an optional sign, then digits (`+1`, `01`, `-0` and `-1` as Postgres
+/// reads them). None when it isn't a whole number.
+fn index_of(text: &str) -> Option<i64> {
+    let (sign, digits) = match text.as_bytes().first()? {
+        b'-' => (-1, &text[1..]),
+        b'+' => (1, &text[1..]),
+        _ => (1, text),
     };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let n: i64 = digits.parse().ok()?;
-    let value = if negative { -n } else { n };
-    let at = if value < 0 { len as i64 + value } else { value };
-    (0..len as i64).contains(&at).then_some(at as usize)
+    digits.parse::<i64>().ok().map(|n| sign * n)
 }
 
-/// `#>>`'s text for a value's text: a JSON string's content, unescaped; a JSON null is NULL; anything else as written.
+/// `#>>`'s text for a value's text: a JSON string's content, unescaped by jiter; a JSON null is NULL; anything else
+/// as written.
 fn unquoted(raw: &str) -> Option<String> {
-    match raw {
-        "null" => None,
-        s if s.starts_with('"') => serde_json::from_str(s).ok(),
-        s => Some(s.to_string()),
+    if raw == "null" {
+        return None;
     }
+    if raw.starts_with('"') {
+        let mut jiter = Jiter::new(raw.as_bytes());
+        return jiter.known_str().ok().map(str::to_string);
+    }
+    Some(raw.to_string())
 }
 
-/// `@>` and `<@`: does the left document contain the right (`<@` swaps them before the call)?
+/// `@>` and `<@`: does the left document contain the right?
 fn contains_all(a: &[ArrayRef], n: usize) -> anyhow::Result<ArrayRef> {
     let (lefts, rights) = (text_arg(&a[0])?, text_arg(&a[1])?);
     let out = (0..n).map(|i| -> anyhow::Result<Option<bool>> {
@@ -282,6 +389,9 @@ fn contains_all(a: &[ArrayRef], n: usize) -> anyhow::Result<ArrayRef> {
     });
     Ok(Arc::new(BooleanArray::from(out.collect::<anyhow::Result<Vec<_>>>()?)))
 }
+
+/// `<@`, which is `@>` with its sides swapped (`jsonb_contained(a, b)` is `jsonb_contains(b, a)`).
+fn contained(a: &[ArrayRef], n: usize) -> anyhow::Result<ArrayRef> { contains_all(&[a[1].clone(), a[0].clone()], n) }
 
 /// Does `have` contain `want`? Objects by their keys, arrays by each element of `want` lying in some element of
 /// `have`. Only at the top does an array also contain a scalar equal to one of its elements.
@@ -299,11 +409,21 @@ fn is_scalar(v: &Value) -> bool { !matches!(v, Value::Array(_) | Value::Object(_
 /// Two scalars are the same: numbers as numbers (`1` is `1.0`), strings, booleans and null by value.
 fn same_scalar(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
+        (Value::Number(x), Value::Number(y)) => same_number(x, y),
         (Value::String(x), Value::String(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Null, Value::Null) => true,
         _ => false,
+    }
+}
+
+/// Integers are compared exactly, as Postgres compares them (`9007199254740993` is not `9007199254740992`); anything
+/// else as a float.
+fn same_number(x: &serde_json::Number, y: &serde_json::Number) -> bool {
+    match (x.as_i64(), y.as_i64(), x.as_u64(), y.as_u64()) {
+        (Some(a), Some(b), _, _) => a == b,
+        (_, _, Some(a), Some(b)) => a == b,
+        _ => x.as_f64() == y.as_f64(),
     }
 }
 
@@ -347,16 +467,282 @@ fn any_all(a: &[ArrayRef], n: usize, all: bool) -> anyhow::Result<ArrayRef> {
     Ok(Arc::new(BooleanArray::from(out.collect::<anyhow::Result<Vec<_>>>()?)))
 }
 
+// ---- Postgres's grouping of the JSON operators, where SQL comes in (`path::door`) ----
+//
+// sqlparser's generic dialect ranks `->` and its kin below `=`, `IS`, `LIKE`, `IN`, `BETWEEN` and `||`. Postgres ranks
+// them above all of those (its `Op`, 70, with `||`, `|`, `&`, `#`, `<<` and `>>`), and below `+`. So `doc ->> 'a' = 'x'`
+// reads as `doc ->> ('a' = 'x')` and fails. Here each JSON operator's operands are regrouped the way Postgres groups
+// them, and the operator is nested, so the text reads the same under the generic dialect in every later stage.
+
+/// Postgres's rank of `Op`: the JSON operators and `||` share it, and it is left-associative.
+const OP: u8 = 70;
+
+/// The text with its JSON operators grouped as Postgres groups them: `doc ->> 'a' = 'x'` reads as
+/// `(doc ->> 'a') = 'x'`, and `doc ? 'a'` as `jsonb_exists(doc, 'a')`. Text that needs neither (and any text neither
+/// dialect reads) comes back borrowed, as it was.
+pub fn text(sql: &str) -> Cow<'_, str> {
+    const OPERATORS: [&str; 5] = ["->", "#>", "@>", "<@", "?"];
+    if !OPERATORS.iter().any(|op| sql.contains(op)) {
+        return Cow::Borrowed(sql);
+    }
+    let grouped = match Parser::parse_sql(&GenericDialect {}, sql) {
+        Ok(stmts) => regrouped(stmts),
+        // (the generic dialect reads `?` as a placeholder, so text with one is read as Postgres's dialect reads it)
+        Err(_) if sql.contains('?') => questions(sql),
+        Err(_) => None,
+    };
+    grouped.map_or(Cow::Borrowed(sql), Cow::Owned)
+}
+
+/// The statements with each JSON operator regrouped where Postgres groups it differently. None when none was.
+fn regrouped(mut stmts: Vec<ast::Statement>) -> Option<String> {
+    let mut moved = false;
+    let _ = ast::visit_expressions_mut(&mut stmts, |e| {
+        if is_json_op(e) {
+            moved |= regroup_at(e);
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    moved.then(|| written(&stmts))
+}
+
+/// Text with a `?`, `?|` or `?&`, read as Postgres's dialect reads it (so its JSON operators are grouped right).
+/// Each `?` becomes the call Postgres names it for, a top-level `?` in a SELECT list is named `?column?`, and every
+/// other JSON operator is nested, so the generic dialect reads the text the same way.
+fn questions(sql: &str) -> Option<String> {
+    let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).ok()?;
+    let _ = stmts.visit(&mut Questions);
+    Some(written(&stmts))
+}
+
+/// The rewrite `questions` makes, in one walk over the statements.
+struct Questions;
+
+impl VisitorMut for Questions {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &mut ast::Query) -> ControlFlow<()> {
+        if let ast::SetExpr::Select(select) = q.body.as_mut() {
+            let items = std::mem::take(&mut select.projection);
+            select.projection = items
+                .into_iter()
+                .map(|item| match item {
+                    ast::SelectItem::UnnamedExpr(e) if is_question(&e) => ast::SelectItem::ExprWithAlias { expr: unquestion(e), alias: ast::Ident::with_quote('"', "?column?") },
+                    other => other,
+                })
+                .collect();
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, e: &mut ast::Expr) -> ControlFlow<()> {
+        if is_question(e) {
+            *e = unquestion(take(e));
+        } else if is_json_op(e) {
+            *e = ast::Expr::Nested(Box::new(take(e)));
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn written(stmts: &[ast::Statement]) -> String { stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n") }
+
+/// Regroups one JSON operator node in place. True when its grouping changed; the node is then nested where it was moved.
+fn regroup_at(e: &mut ast::Expr) -> bool {
+    let ast::Expr::BinaryOp { left, op, right } = e else { return false };
+    let (l, r) = (take(&mut **left), take(&mut **right));
+    let mut moved = false;
+    let out = group(op, l, r, &mut moved);
+    *e = if moved { out } else { unnest(out) };
+    moved
+}
+
+/// `left op right` for a JSON operator, grouped as Postgres groups it. `moved` is set when the grouping changed. A JSON
+/// operator built here is nested (`json`), so the generic dialect reads it as one operand.
+fn group(op: &BinaryOperator, left: ast::Expr, right: ast::Expr, moved: &mut bool) -> ast::Expr {
+    // Only `->` has a lambda form (`x -> …`), so only it is checked for one; the other JSON operators take any key.
+    if matches!(op, BinaryOperator::Arrow) && lambda_like(&left, &right) {
+        return json(op, left, right); // (a lambda whose body uses its name: left as it was)
+    }
+    // A left operand that binds looser than `op` gives it its own right-most operand: `x = doc -> 'a' || 'b'` is
+    // `x = ((doc -> 'a') || 'b')`. Checked first, since the operator's key runs on through the right side.
+    if rank(&left).is_some_and(|r| r < OP) && last(&left).is_some() {
+        *moved = true;
+        return map_last(left, |operand| group(op, operand, right, moved));
+    }
+    // A right operand that binds looser than `op` gives it its own left-most operand: `doc -> 'a' || 'b' = 'x'` is
+    // `((doc -> 'a') || 'b') = 'x'`.
+    if rank(&right).is_some_and(|r| r <= OP) && first(&right).is_some() {
+        *moved = true;
+        return map_first(right, |operand| group(op, left, operand, moved));
+    }
+    json(op, left, right)
+}
+
+/// A JSON operator as the text writes it: nested, so the generic dialect reads it as one operand.
+fn json(op: &BinaryOperator, left: ast::Expr, right: ast::Expr) -> ast::Expr {
+    ast::Expr::Nested(Box::new(ast::Expr::BinaryOp { left: Box::new(left), op: op.clone(), right: Box::new(right) }))
+}
+
+fn unnest(e: ast::Expr) -> ast::Expr {
+    match e {
+        ast::Expr::Nested(inner) => *inner,
+        other => other,
+    }
+}
+
+/// `x -> …` is a lambda when the left side is a bare name the body uses; such an arrow is never JSON's.
+fn lambda_like(left: &ast::Expr, right: &ast::Expr) -> bool {
+    let ast::Expr::Identifier(name) = left else { return false };
+    let mut used = false;
+    let _ = ast::visit_expressions(right, |e| {
+        used |= matches!(e, ast::Expr::Identifier(n) if n.value == name.value);
+        ControlFlow::<()>::Continue(())
+    });
+    used
+}
+
+/// Postgres's rank of an operator or predicate (`gram.y`, as sqlparser's PostgreSQL dialect numbers it); None for an
+/// operand.
+fn rank(e: &ast::Expr) -> Option<u8> {
+    use ast::Expr as X;
+    Some(match e {
+        X::BinaryOp { op, .. } => pg_rank(op),
+        X::IsNull(_) | X::IsNotNull(_) | X::IsTrue(_) | X::IsFalse(_) | X::IsNotTrue(_) | X::IsNotFalse(_) | X::IsUnknown(_) | X::IsNotUnknown(_) | X::IsDistinctFrom(..) | X::IsNotDistinctFrom(..) => 40,
+        X::Like { .. } | X::ILike { .. } | X::SimilarTo { .. } | X::InList { .. } | X::InSubquery { .. } | X::Between { .. } => 60,
+        _ => return None,
+    })
+}
+
+fn pg_rank(op: &BinaryOperator) -> u8 {
+    match op {
+        BinaryOperator::Or => 10,
+        BinaryOperator::And => 20,
+        BinaryOperator::Eq | BinaryOperator::NotEq | BinaryOperator::Lt | BinaryOperator::Gt | BinaryOperator::LtEq | BinaryOperator::GtEq => 50,
+        BinaryOperator::Plus | BinaryOperator::Minus => 80,
+        BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Modulo => 90,
+        BinaryOperator::PGExp => 100,
+        _ => OP, // (`||`, `|`, `&`, `#`, `<<`, `>>` and the JSON operators: Postgres's `Op`)
+    }
+}
+
+/// The operand at the left end of an operator or predicate (for `IS NULL`, its one operand).
+fn first(e: &ast::Expr) -> Option<&ast::Expr> {
+    use ast::Expr as X;
+    match e {
+        X::BinaryOp { left: x, .. } | X::IsDistinctFrom(x, _) | X::IsNotDistinctFrom(x, _) | X::Between { expr: x, .. } | X::Like { expr: x, .. } | X::ILike { expr: x, .. } | X::SimilarTo { expr: x, .. } | X::InList { expr: x, .. } | X::InSubquery { expr: x, .. } => Some(&**x),
+        X::IsNull(x) | X::IsNotNull(x) | X::IsTrue(x) | X::IsFalse(x) | X::IsNotTrue(x) | X::IsNotFalse(x) | X::IsUnknown(x) | X::IsNotUnknown(x) => Some(&**x),
+        _ => None,
+    }
+}
+
+/// The operand at the right end of an operator or predicate. A LIKE with an escape character has none (its escape is
+/// a value, not an operand), nor does a list or an `IS` test.
+fn last(e: &ast::Expr) -> Option<&ast::Expr> {
+    use ast::Expr as X;
+    match e {
+        X::BinaryOp { right: x, .. } | X::IsDistinctFrom(_, x) | X::IsNotDistinctFrom(_, x) | X::Between { high: x, .. } => Some(&**x),
+        X::Like { pattern: x, escape_char: None, .. } | X::ILike { pattern: x, escape_char: None, .. } | X::SimilarTo { pattern: x, escape_char: None, .. } => Some(&**x),
+        _ => None,
+    }
+}
+
+/// `e` with its left-most operand replaced by `f` of it. Called only where `first` finds one.
+fn map_first(e: ast::Expr, f: impl FnOnce(ast::Expr) -> ast::Expr) -> ast::Expr {
+    use ast::Expr as X;
+    match e {
+        X::BinaryOp { left, op, right } => X::BinaryOp { left: Box::new(f(*left)), op, right },
+        X::IsDistinctFrom(l, r) => X::IsDistinctFrom(Box::new(f(*l)), r),
+        X::IsNotDistinctFrom(l, r) => X::IsNotDistinctFrom(Box::new(f(*l)), r),
+        X::Between { expr, negated, low, high } => X::Between { expr: Box::new(f(*expr)), negated, low, high },
+        X::Like { negated, any, expr, pattern, escape_char } => X::Like { negated, any, expr: Box::new(f(*expr)), pattern, escape_char },
+        X::ILike { negated, any, expr, pattern, escape_char } => X::ILike { negated, any, expr: Box::new(f(*expr)), pattern, escape_char },
+        X::SimilarTo { negated, expr, pattern, escape_char } => X::SimilarTo { negated, expr: Box::new(f(*expr)), pattern, escape_char },
+        X::InList { expr, list, negated } => X::InList { expr: Box::new(f(*expr)), list, negated },
+        X::InSubquery { expr, subquery, negated } => X::InSubquery { expr: Box::new(f(*expr)), subquery, negated },
+        X::IsNull(x) => X::IsNull(Box::new(f(*x))),
+        X::IsNotNull(x) => X::IsNotNull(Box::new(f(*x))),
+        X::IsTrue(x) => X::IsTrue(Box::new(f(*x))),
+        X::IsFalse(x) => X::IsFalse(Box::new(f(*x))),
+        X::IsNotTrue(x) => X::IsNotTrue(Box::new(f(*x))),
+        X::IsNotFalse(x) => X::IsNotFalse(Box::new(f(*x))),
+        X::IsUnknown(x) => X::IsUnknown(Box::new(f(*x))),
+        X::IsNotUnknown(x) => X::IsNotUnknown(Box::new(f(*x))),
+        other => other,
+    }
+}
+
+/// `e` with its right-most operand replaced by `f` of it. Called only where `last` finds one.
+fn map_last(e: ast::Expr, f: impl FnOnce(ast::Expr) -> ast::Expr) -> ast::Expr {
+    use ast::Expr as X;
+    match e {
+        X::BinaryOp { left, op, right } => X::BinaryOp { left, op, right: Box::new(f(*right)) },
+        X::IsDistinctFrom(l, r) => X::IsDistinctFrom(l, Box::new(f(*r))),
+        X::IsNotDistinctFrom(l, r) => X::IsNotDistinctFrom(l, Box::new(f(*r))),
+        X::Between { expr, negated, low, high } => X::Between { expr, negated, low, high: Box::new(f(*high)) },
+        X::Like { negated, any, expr, pattern, escape_char } => X::Like { negated, any, expr, pattern: Box::new(f(*pattern)), escape_char },
+        X::ILike { negated, any, expr, pattern, escape_char } => X::ILike { negated, any, expr, pattern: Box::new(f(*pattern)), escape_char },
+        X::SimilarTo { negated, expr, pattern, escape_char } => X::SimilarTo { negated, expr, pattern: Box::new(f(*pattern)), escape_char },
+        other => other,
+    }
+}
+
+/// The JSON operators Postgres groups as its `Op` (`->` and `->>`, `#>` and `#>>`, `@>`, `<@`, `?`, `?|` and `?&`).
+fn is_json_op(e: &ast::Expr) -> bool {
+    matches!(
+        e,
+        ast::Expr::BinaryOp {
+            op: BinaryOperator::Arrow
+                | BinaryOperator::LongArrow
+                | BinaryOperator::HashArrow
+                | BinaryOperator::HashLongArrow
+                | BinaryOperator::AtArrow
+                | BinaryOperator::ArrowAt
+                | BinaryOperator::Question
+                | BinaryOperator::QuestionPipe
+                | BinaryOperator::QuestionAnd,
+            ..
+        }
+    )
+}
+
+fn is_question(e: &ast::Expr) -> bool { matches!(e, ast::Expr::BinaryOp { op: BinaryOperator::Question | BinaryOperator::QuestionPipe | BinaryOperator::QuestionAnd, .. }) }
+
+/// `?`, `?|` or `?&` as the call Postgres names for it; any other expression as it is.
+fn unquestion(e: ast::Expr) -> ast::Expr {
+    match e {
+        ast::Expr::BinaryOp { left, op: BinaryOperator::Question, right } => crate::types::function("jsonb_exists", vec![*left, *right]),
+        ast::Expr::BinaryOp { left, op: BinaryOperator::QuestionPipe, right } => crate::types::function("jsonb_exists_any", vec![*left, *right]),
+        ast::Expr::BinaryOp { left, op: BinaryOperator::QuestionAnd, right } => crate::types::function("jsonb_exists_all", vec![*left, *right]),
+        other => other,
+    }
+}
+
+/// The expression at `e`, leaving a NULL behind (for a rewrite that moves it).
+fn take(e: &mut ast::Expr) -> ast::Expr { std::mem::replace(e, ast::Expr::value(ast::Value::Null)) }
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn elements(v: &[&str]) -> Vec<Option<String>> { v.iter().map(|s| Some(s.to_string())).collect() }
 
+    /// The steps of a path literal (`{b,0}`), as `#>` takes them.
+    fn steps_of(path: &str) -> Vec<Option<String>> { array_literal(path).unwrap() }
+
     /// `#>` (or `#>>`) of a document at a path literal, as the functions answer it.
     fn at(doc: &str, path: &str, text: bool) -> Option<String> {
-        walk(doc, &array_literal(path).unwrap()).unwrap().and_then(|raw| if text { unquoted(raw) } else { Some(raw.to_string()) })
+        let elements = steps_of(path);
+        let steps: Option<Vec<Step>> = elements.iter().map(|e| e.as_deref().map(Step::Path)).collect();
+        let raw = find(doc, &steps?)?;
+        if text { unquoted(raw) } else { Some(raw.to_string()) }
     }
+
+    /// `->` with one step of the given kind.
+    fn arrow(doc: &str, step: Step) -> Option<String> { find(doc, &[step]).map(str::to_string) }
+
+    /// The statement `sql` reads as after `text`.
+    fn grouped(sql: &str) -> String { text(sql).into_owned() }
 
     #[test]
     fn path_literals_read_as_postgres_reads_them() {
@@ -399,6 +785,56 @@ mod tests {
     }
 
     #[test]
+    fn arrow_takes_a_duplicate_keys_last_value() {
+        assert_eq!(arrow(r#"{"a":1,"b":2,"a":3}"#, Step::Key("a")).as_deref(), Some("3"));
+        assert_eq!(arrow(r#"{"a": [1, {"x": 2}], "a": {"y": 3}}"#, Step::Key("a")).as_deref(), Some(r#"{"y": 3}"#));
+        assert_eq!(arrow(r#"{ "a" : 1 }"#, Step::Key("a")).as_deref(), Some("1"), "a value after spaces starts at its first character");
+    }
+
+    #[test]
+    fn arrow_text_key_on_an_array_is_null() {
+        assert_eq!(arrow("[1,2]", Step::Key("0")), None, "a text key never reaches an array (Postgres: NULL even for '0')");
+        assert_eq!(arrow("[1,2]", Step::Path("0")).as_deref(), Some("1"), "a path element does reach one");
+        assert_eq!(arrow(r#"{"0":"zero"}"#, Step::Key("0")).as_deref(), Some(r#""zero""#), "a text key names an object's member");
+    }
+
+    #[test]
+    fn arrow_integer_on_an_object_is_null() {
+        assert_eq!(arrow(r#"{"1":"one"}"#, Step::Index(1)), None, "an integer never names an object's member");
+        assert_eq!(arrow("[10,20,30]", Step::Index(1)).as_deref(), Some("20"));
+        assert_eq!(arrow("[10,20,30]", Step::Index(3)), None, "past the end");
+    }
+
+    #[test]
+    fn arrow_negative_index_counts_from_the_end() {
+        let doc = r#"{"b":[1,{"k":"v"},[3]]}"#;
+        assert_eq!(find(doc, &[Step::Key("b"), Step::Index(-1)]), Some("[3]"));
+        assert_eq!(find(doc, &[Step::Key("b"), Step::Index(-2)]), Some(r#"{"k":"v"}"#));
+        assert_eq!(find(doc, &[Step::Key("b"), Step::Index(-3)]), Some("1"));
+        assert_eq!(find(doc, &[Step::Key("b"), Step::Index(-4)]), None);
+        assert_eq!(find("[]", &[Step::Index(-1)]), None, "an empty array has no last element");
+    }
+
+    #[test]
+    fn text_that_is_not_json_is_null() {
+        assert_eq!(arrow("not json", Step::Key("a")), None);
+        assert_eq!(arrow("{", Step::Key("a")), None);
+        assert_eq!(arrow("[1,", Step::Index(0)).as_deref(), Some("1"), "a value read before the text goes wrong still answers");
+        assert_eq!(at("not json", "{a}", false), None);
+        assert_eq!(at("not json", "{a}", true), None);
+        assert_eq!(find("not json", &[]), None, "the empty path refuses a document that isn't JSON");
+    }
+
+    #[test]
+    fn containment_compares_integers_exactly() {
+        let c = |have: &str, want: &str| contains(&document(have).unwrap(), &document(want).unwrap(), true);
+        assert!(!c(r#"{"x": 9007199254740993}"#, r#"{"x": 9007199254740992}"#), "exact integers differ past 2^53");
+        assert!(c(r#"{"x": 9007199254740993}"#, r#"{"x": 9007199254740993}"#));
+        assert!(c("1", "1.0"), "an integer and a float with the same value");
+        assert!(!c("-1", "18446744073709551615"), "a negative and a big positive integer");
+    }
+
+    #[test]
     fn path_answers_are_the_text_as_written() {
         let doc = r#"  {"a": 1.0 , "b" :  {"x" : 1 }, "s": "a\"b", "u": "aéb", "n": null}  "#;
         assert_eq!(at(doc, "{}", false).as_deref(), Some(r#"{"a": 1.0 , "b" :  {"x" : 1 }, "s": "a\"b", "u": "aéb", "n": null}"#), "the empty path, spaces at the ends trimmed");
@@ -433,7 +869,6 @@ mod tests {
         assert!(!c(r#"{"a":[1]}"#, r#"{"a":1}"#), "an array never contains a scalar that isn't top-level");
         assert!(!c(r#"[{"a":1}]"#, r#"{"a":1}"#), "an array never contains an object");
         assert!(!c(r#"{"a":1}"#, r#"[{"a":1}]"#), "an object never contains an array");
-        assert!(c("1", "1.0"), "1 is 1.0");
         assert!(c(r#"{"a": 1.0}"#, r#"{"a": 1}"#));
         assert!(c("{}", "{}"), "empty objects");
         assert!(c("[]", "[]"), "empty arrays");
@@ -480,34 +915,70 @@ mod tests {
     }
 
     #[test]
-    fn index_takes_signs_and_digits() {
-        assert_eq!(index("1", 3), Some(1));
-        assert_eq!(index("-1", 3), Some(2));
-        assert_eq!(index("-3", 3), Some(0));
-        assert_eq!(index("-4", 3), None);
-        assert_eq!(index("3", 3), None);
-        assert_eq!(index("-0", 3), Some(0));
-        assert_eq!(index("", 3), None);
-        assert_eq!(index("-", 3), None);
-        assert_eq!(index("1e2", 300), None);
-        assert_eq!(index("99999999999999999999", 3), None, "too big for an index");
+    fn index_of_takes_signs_and_digits() {
+        assert_eq!(index_of("1"), Some(1));
+        assert_eq!(index_of("-1"), Some(-1));
+        assert_eq!(index_of("+1"), Some(1));
+        assert_eq!(index_of("01"), Some(1));
+        assert_eq!(index_of("-0"), Some(0));
+        assert_eq!(index_of(""), None);
+        assert_eq!(index_of("-"), None);
+        assert_eq!(index_of("1e2"), None);
+        assert_eq!(index_of("1.0"), None);
+        assert_eq!(index_of("99999999999999999999"), None, "too big for an index");
     }
 
     #[test]
-    fn question_operators_are_read_as_postgres_reads_them() {
-        assert!(statement("SELECT doc ?| ARRAY['a'] FROM t").is_some());
-        assert!(statement("SELECT doc ? 'a' AS x, doc ?& '{a}' FROM t WHERE doc ? 'b'").is_some());
-        assert!(statement("SELECT 'a?b' FROM t").is_none(), "a ? in a string is the generic dialect's, and it reads it");
-        assert!(statement("SELECT 1 FROM t; SELECT doc ? 'a' FROM t").is_none(), "one query only");
-        // (sqlparser's PostgreSQL dialect reads `doc ?| FROM t`, a missing right operand, as a query: Postgres
-        // refuses it as a syntax error (42601), Pondra answers 42703 from planning. A known limit, not tested here.)
+    fn text_groups_right_side_operators_as_postgres_does() {
+        assert_eq!(grouped("SELECT doc ->> 'a' = 'x' FROM t"), "SELECT (doc ->> 'a') = 'x' FROM t");
+        assert_eq!(grouped("SELECT * FROM t WHERE doc -> 'zz' IS NULL"), "SELECT * FROM t WHERE (doc -> 'zz') IS NULL");
+        assert_eq!(grouped("SELECT doc #>> '{b,0}' = '1' FROM t"), "SELECT (doc #>> '{b,0}') = '1' FROM t");
+        assert_eq!(grouped("SELECT doc ->> 'a' LIKE 'x%' FROM t"), "SELECT (doc ->> 'a') LIKE 'x%' FROM t");
+        assert_eq!(grouped("SELECT doc ->> 'a' IN ('x', 'y') FROM t"), "SELECT (doc ->> 'a') IN ('x', 'y') FROM t");
+        assert_eq!(grouped("SELECT doc ->> 'a' || 'y' FROM t"), "SELECT (doc ->> 'a') || 'y' FROM t");
+        assert_eq!(grouped("SELECT doc -> 'a' || 'b' = 'x' FROM t"), "SELECT (doc -> 'a') || 'b' = 'x' FROM t");
     }
 
     #[test]
-    fn refuses_what_is_not_json() {
-        let e = document("not json").unwrap_err();
-        assert_eq!(crate::codes::of(&e), "22P02");
-        assert!(e.to_string().starts_with("invalid input syntax for type json"));
-        assert_eq!(crate::codes::of(&valid("{").unwrap_err()), "22P02");
+    fn text_groups_left_side_operators_as_postgres_does() {
+        assert_eq!(grouped("SELECT * FROM t WHERE 'x' = doc ->> 'a'"), "SELECT * FROM t WHERE 'x' = (doc ->> 'a')");
+        assert_eq!(grouped("SELECT x = doc -> 'a' || 'b' FROM t"), "SELECT x = (doc -> 'a') || 'b' FROM t");
+        assert_eq!(grouped("SELECT doc -> 'a' -> 'b' = 'x' FROM t"), "SELECT (doc -> 'a' -> 'b') = 'x' FROM t");
+        assert_eq!(grouped("SELECT 'z' || doc -> 'a' = 'x' FROM t"), "SELECT ('z' || doc -> 'a') = 'x' FROM t");
+    }
+
+    #[test]
+    fn text_reads_question_operators_as_postgres_does() {
+        // (`?` is a placeholder to the generic dialect, and so is the `?` of `?|` and `?&`: text with any of them is
+        // read as Postgres's dialect reads it, each operator becoming the call Postgres names for it)
+        assert_eq!(grouped("SELECT doc ? 'a' FROM t"), r#"SELECT jsonb_exists(doc, 'a') AS "?column?" FROM t"#);
+        assert_eq!(grouped("SELECT * FROM t WHERE doc ? 'a' AND doc ->> 'a' = 'x'"), "SELECT * FROM t WHERE jsonb_exists(doc, 'a') AND (doc ->> 'a') = 'x'");
+        assert_eq!(grouped("SELECT * FROM t WHERE doc ?| ARRAY['a', 'b']"), "SELECT * FROM t WHERE jsonb_exists_any(doc, ARRAY['a', 'b'])");
+        assert_eq!(grouped("SELECT * FROM t WHERE doc ?& '{a}'"), "SELECT * FROM t WHERE jsonb_exists_all(doc, '{a}')");
+    }
+
+    #[test]
+    fn text_groups_column_keys_as_postgres_does() {
+        // (no lambda form: `->>` and `#>>` take any key, a column too)
+        assert_eq!(grouped("SELECT * FROM t WHERE doc ->> col = 'x'"), "SELECT * FROM t WHERE (doc ->> col) = 'x'");
+        assert_eq!(grouped("SELECT * FROM t WHERE doc -> col = 'x'"), "SELECT * FROM t WHERE (doc -> col) = 'x'");
+        assert_eq!(grouped("SELECT * FROM t WHERE doc #>> keys = 'x'"), "SELECT * FROM t WHERE (doc #>> keys) = 'x'");
+    }
+
+    #[test]
+    fn lambdas_are_left_alone() {
+        let lambda = "SELECT list_filter(l, y -> y > 0 AND y < 4) FROM t";
+        assert!(matches!(text(lambda), Cow::Borrowed(_)), "a lambda's body is a column, never a key");
+        assert!(matches!(text("SELECT list_transform(l, x -> 'p' || x) FROM t"), Cow::Borrowed(_)), "a lambda whose body uses its name");
+        assert!(matches!(text("SELECT list_transform(l, x -> x * 2) FROM t"), Cow::Borrowed(_)));
+        assert_eq!(grouped("SELECT list_transform(l, x -> col || x) FROM t"), "SELECT list_transform(l, x -> col || x) FROM t", "a lambda whose body uses its name, with a column in it: as it was");
+    }
+
+    #[test]
+    fn text_without_a_rewrite_is_borrowed() {
+        assert!(matches!(text("SELECT ARRAY[1,2] @> ARRAY[1]"), Cow::Borrowed(_)), "an array's containment is DataFusion's");
+        assert!(matches!(text("SELECT doc -> 'a' FROM t"), Cow::Borrowed(_)), "a JSON operator already grouped the way Postgres groups it");
+        assert!(matches!(text("SELECT 1 FROM t"), Cow::Borrowed(_)), "no JSON operator at all");
+        assert!(matches!(text("SELECT doc ->> 'a' = 'x' FROM t WHERE doc"), Cow::Owned(_)));
     }
 }

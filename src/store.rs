@@ -1102,7 +1102,7 @@ impl Lake {
         crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
         crate::types::register(&ctx); // gen_random_uuid(), uuidv7(), pg_typeof(x)
         crate::pg_functions::register(&ctx); // format(), array_upper(), to_char(ts, 'YYYY-MM'): what Postgres's clients send
-        crate::pg_json::register(&ctx); // pg_json_path(…), pg_jsonb_contains(…): what those operators call
+        crate::pg_json::register(&ctx); // jsonb_contains(…), json_object_field(…), pondra_json_path(…): the names the operators call, by Postgres's where it has them
         crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
         ctx
     }

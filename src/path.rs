@@ -153,6 +153,7 @@ pub fn set_schema(sql: &str) -> Option<String> {
 /// as their values. `skip` names what is not a table (a client's frames). Text with nothing to
 /// change comes back as it came.
 pub async fn door(lake: &Lake, sql: &str, skip: &HashSet<String>) -> Result<String> {
+    let sql = &crate::pg_json::text(sql); // (`doc ->> 'a' = 'x'`, `doc ? 'a'`: Postgres's JSON operators grouped and read as Postgres does)
     if crate::temp::current().is_none() && (is_use(sql) || set_schema(sql).is_some()) {
         return Err(coded("0A000", crate::settings::NO_SESSION)); // (Flight SQL and MCP hold no session: refused by name, at once)
     }

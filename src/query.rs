@@ -975,13 +975,12 @@ pub fn read_only() -> datafusion::execution::context::SQLOptions {
 
 /// A user's query planned (`read_only`), with a higher-order function's `x -> …` as a lambda
 /// (`friendly::lambdas`: the generic dialect's text keeps it as JSON's arrow, so it is planned from
-/// the tree), and a query with a `?` operator read as Postgres's dialect reads it (`pg_json::statement`).
-/// A session in another dialect reads its own lambdas, and its own strings: read as the
+/// the tree). A session in another dialect reads its own lambdas, and its own strings: read as the
 /// generic dialect, Databricks' `"a"` became a column.
 pub async fn sql(ctx: &SessionContext, sql: &str) -> Result<datafusion::dataframe::DataFrame> {
     use datafusion::config::Dialect;
     let generic = matches!(ctx.state().config().options().sql_parser.dialect, Dialect::Generic);
-    if let Some(stmt) = crate::friendly::lambdas(sql).or_else(|| crate::pg_json::statement(sql)).filter(|_| generic) {
+    if let Some(stmt) = crate::friendly::lambdas(sql).filter(|_| generic) {
         let plan = ctx.state().statement_to_plan(stmt).await?;
         read_only().verify_plan(&plan)?;
         return Ok(text_unions(ctx.execute_logical_plan(plan).await?)?);

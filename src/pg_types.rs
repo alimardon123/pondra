@@ -441,9 +441,12 @@ impl<'a> Trace<'a> {
             }
             Expr::Cast { data_type, .. } => of_type(data_type),
             Expr::Nested(e) => self.expr(e, rels),
+            // (`doc -> 'a'` and `doc #> '{a}'` answer a document's own type; `->>` and `#>>` answer text)
+            Expr::BinaryOp { left, op: ast::BinaryOperator::Arrow | ast::BinaryOperator::HashArrow, .. } => self.document(left, rels),
             Expr::Function(f) => match object(&f.name).as_str() {
                 "gen_random_uuid" | "uuidv4" | "uuidv7" | "uuid" | "pondra_uuid" => Some(Ty::Uuid),
                 "pondra_json" | "json_get_json" => Some(Ty::Json),
+                "json_object_field" | "jsonb_object_field" | "json_array_element" | "jsonb_array_element" | "pondra_json_path" => first_arg(f).and_then(|a| self.document(a, rels)),
                 "nullif" => first_arg(f).and_then(|a| self.expr(a, rels)),
                 "coalesce" => args(f).and_then(|a| same(a.iter().filter(|a| !null(a)).map(|a| self.expr(a, rels)))),
                 "pg_typeof" => {
@@ -458,6 +461,9 @@ impl<'a> Trace<'a> {
             _ => None,
         }
     }
+
+    /// The type of a JSON operator's document: json or jsonb as the document is, and none for anything else.
+    fn document(&self, e: &Expr, rels: &[Rel]) -> Option<Ty> { self.expr(e, rels).filter(|t| matches!(t, Ty::Json | Ty::Jsonb)) }
 
     /// The type of column `c` (qualified by `q`): only when it is found, and of the same type wherever it is
     /// (a join's USING names it on both sides). Relations whose columns are unknown don't count: the
@@ -624,6 +630,10 @@ mod tests {
         assert_eq!(cols("SELECT t.* FROM t, s.o"), [Some(Ty::Uuid), None, Some(Ty::Uuid), Some(Ty::Json)]);
         assert_eq!(cols("SELECT name::uuid, gen_random_uuid(), uuidv7(), 'x', CAST(name AS UUID) FROM t"), [Some(Ty::Uuid), Some(Ty::Uuid), Some(Ty::Uuid), None, Some(Ty::Uuid)]);
         assert_eq!(cols("SELECT doc, name::json, '{}'::json, CAST(name AS JSONB), pondra_json(name), json_get_json(doc, 'a') FROM t"), [Some(Ty::Json), Some(Ty::Json), Some(Ty::Json), Some(Ty::Jsonb), Some(Ty::Json), Some(Ty::Json)]);
+        // (`->` and `#>` answer their document's type, json or jsonb; `->>` and `#>>` text; a text document has none)
+        assert_eq!(cols("SELECT doc -> 'a', doc #> '{a}', doc ->> 'a', doc #>> '{a}', name -> 'a' FROM t"), [Some(Ty::Json), Some(Ty::Json), None, None, None]);
+        assert_eq!(cols("SELECT b -> 'a', b -> 'a' -> 'b', (b #> '{a}') -> 0 FROM s.o"), [Some(Ty::Jsonb), Some(Ty::Jsonb), Some(Ty::Jsonb)]);
+        assert_eq!(cols("SELECT json_object_field(doc, 'a'), jsonb_array_element(b, 0), pondra_json_path(doc, '{a}') FROM t, s.o"), [Some(Ty::Json), Some(Ty::Jsonb), Some(Ty::Json)]);
         assert_eq!(cols("WITH c AS (SELECT parent AS p FROM t) SELECT p FROM c"), [Some(Ty::Uuid)]);
         assert_eq!(cols("WITH c AS (SELECT doc FROM t) SELECT doc FROM c"), [Some(Ty::Json)]);
         assert_eq!(cols("SELECT q.a FROM (SELECT id FROM t) AS q(a)"), [Some(Ty::Uuid)]);

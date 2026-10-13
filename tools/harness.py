@@ -13217,7 +13217,10 @@ def jsons():
     as well. SQLAlchemy's JSON and JSONB columns and an Identity column round-trip over psycopg and over HTTP (`pondra+http`,
     where the dialect reads the identity's options from their JSON text), and the inspector reports JSON, JSONB and the
     identity as a dict. Postgres 16's JSON operators (`pg_json.rs`) answer as Postgres does on a JSON and a TEXT column,
-    over HTTP and the port: #> and #>> with a text path or ARRAY, @> and <@, ?, ?| and ?&; -> and ->> stay as they were."""
+    over HTTP and the port: #> and #>> with a text path or ARRAY, @> and <@, ?, ?| and ?&. `->` answers the value as JSON text
+    (a string keeps its quotes; the port gives json's own value), `->>` text; the operators in a WHERE clause group as
+    Postgres groups them, with no parentheses; the functions answer by their Postgres names; and a spread query over three
+    nodes equals one node's answer."""
     import psycopg
     from psycopg.types.json import Json, Jsonb
     import sqlalchemy as sa
@@ -13234,6 +13237,7 @@ def jsons():
     CATALOG = [("doc", "json", 114), ("docb", "jsonb", 3802), ("id", "integer", 23), ("note", "text", 25)]
     checks, info = {}, {}
     node = None
+    extras = []  # (two more nodes on the lake, for the spread check: stopped at the end)
 
     def check(name, fn):
         """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
@@ -13243,8 +13247,8 @@ def jsons():
             checks[name] = False
             info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
 
-    def q(s):
-        return call(port, "POST", "/sql", s.encode(), timeout=120)
+    def q(s, h=None):
+        return call(port, "POST", "/sql", s.encode(), timeout=120, headers=h or {})
 
     def err(s, path="/sql"):
         """(status, x-pondra-sqlstate, the body) of a POST; (200, None, '') when it went through."""
@@ -13501,9 +13505,17 @@ def jsons():
               ("COL ?| ARRAY['zz']", False), ("COL ?& ARRAY['a','c']", True), ("COL ?& ARRAY['a','zz']", False),
               ("COL ?| '{zz,c}'", True), ("COL ?& '{}'", True), ("COL ?| '{}'", False),
               ("'[\"foo\", \"bar\"]' ? 'foo'", True), ("'[\"foo\", [\"bar\"]]' ? 'bar'", False), ("'\"foo\"' ? 'foo'", True)]
-    # What main (before these operators) answers for -> and ->>, over HTTP and the port (the same row).
+    # Postgres 16's -> and ->> on row 1 (JP): (expression, the JSON text over HTTP, the value psycopg gives for json, the
+    # text cast of the port's value). `->` answers JSON, so a string keeps its quotes over HTTP and psycopg hands over
+    # json's own value; a JSON null is None to psycopg, so the text cast (which says 'null') is checked too.
+    ARROW_CASES = [("doc -> 'a'", '"x"', "x"), ("doc -> 'c'", '{"d": null}', {"d": None}), ("doc -> 'b'", "[1, 2]", [1, 2]),
+                   ("doc -> 'b' -> 0", "1", 1), ("doc -> 'b' -> -1", "2", 2), ("doc -> 'c' -> 'd'", "null", None),
+                   ("doc -> 'zz'", None, None), ("doc -> 'a' -> 'b'", None, None), ("doc -> 'b' -> '0'", None, None),
+                   ("doc -> 'a' ->> 'b'", None, None), ("doc -> 'c' ->> 'd'", None, None),
+                   ("doc ->> 'a'", "x", "x"), ("doc ->> 'c'", '{"d": null}', '{"d": null}'), ("doc ->> 'zz'", None, None),
+                   ("t -> 'a'", '"x"', '"x"'), ("t -> 'b' -> 0", "1", "1"), ("t ->> 'a'", "x", "x")]
+    # The same answers as one row (`->` and `->>` as Postgres 16 gives them; the port's values, which are json's for `->`).
     ARROWS = ["a", "at", "c", "ct", "b", "z", "b0", "ta", "tat"]
-    ARROWS_WANT = ["x", "x", '{"d": null}', '{"d": null}', "[1, 2]", None, "1", "x", "x"]
     ARROWS_SQL = ("SELECT doc -> 'a' AS a, doc ->> 'a' AS at, doc -> 'c' AS c, doc ->> 'c' AS ct, doc -> 'b' AS b, doc ->> 'zz' AS z, "
                   "doc -> 'b' -> 0 AS b0, t -> 'a' AS ta, t ->> 'a' AS tat FROM jp WHERE id = 1")
 
@@ -13520,16 +13532,18 @@ def jsons():
         q("INSERT INTO jbad (id, t) VALUES (1, 'not json')")
         return q("SELECT count(*) AS n FROM jp")[0]["n"] == 2
 
-    def answers(cases, over):
-        """Each case on the JSON column and on the TEXT column of row 1, read by `over`: the cases that differ from Postgres 16."""
+    def answers(cases, over, as_text=False):
+        """Each case on the JSON column and on the TEXT column of row 1, read by `over`: the cases that differ from Postgres 16.
+        `as_text` casts each answer to text first: psycopg decodes a JSON answer to Python's value (1, a dict), which the
+        expectations, written as text, don't name."""
         wrong = {}
         for col in ("doc", "t"):
             for expr, want in cases:
                 sql = expr.replace("COL", col)
-                got = over(f"SELECT {sql} AS v FROM jp WHERE id = 1")
+                got = over(f"SELECT {f'({sql})::text' if as_text else sql} AS v FROM jp WHERE id = 1")
                 if got != want:
                     wrong[sql] = [got, want]
-        info[f"{over.__name__}: cases that differ from Postgres 16 (expression: [got, Postgres's])"] = wrong
+        info[f"{over.__name__}{' as text' if as_text else ''}: cases that differ from Postgres 16 (expression: [got, Postgres's])"] = wrong
         return not wrong
 
     def null_documents():
@@ -13542,18 +13556,121 @@ def jsons():
         return all(v is None for v in got)
 
     def not_json_text():
-        """A TEXT value that isn't JSON is 22P02 for each operator, over HTTP and the port, and the rows are read as before."""
-        exprs = ["t #> '{a}'", "t #>> '{a}'", "t @> '{}'", "t <@ '{}'", "t ? 'a'", "t ?| ARRAY['a']", "t ?& ARRAY['a']"]
-        codes = {e: [err(f"SELECT {e} AS v FROM jbad WHERE id = 1")[1], pg_write(f"SELECT {e} FROM jbad WHERE id = 1")] for e in exprs}
-        info["not JSON in a TEXT column: [HTTP's SQLSTATE, the port's] per operator"] = codes
-        return all(v == ["22P02", "22P02"] for v in codes.values())
+        """A TEXT value that isn't JSON: -> , ->>, #> and #>> answer NULL where the walk meets the text (it reads only what
+        it needs, so the text is never validated), over HTTP and the port. @>, <@, ?, ?| and ?& read the whole document
+        and are 22P02, over HTTP and the port."""
+        nulls = ["t -> 'a'", "t ->> 'a'", "t #> '{a}'", "t #>> '{a}'"]
+        refused = ["t @> '{}'", "t <@ '{}'", "t ? 'a'", "t ?| ARRAY['a']", "t ?& ARRAY['a']"]
+        got = {e: [q(f"SELECT {e} AS v FROM jbad WHERE id = 1")[0].get("v"), pg_rows(f"SELECT {e} FROM jbad WHERE id = 1")[0][0]] for e in nulls}
+        codes = {e: [err(f"SELECT {e} AS v FROM jbad WHERE id = 1")[1], pg_write(f"SELECT {e} FROM jbad WHERE id = 1")] for e in refused}
+        info["not JSON in a TEXT column: [HTTP, the port] per NULL answer; [HTTP's SQLSTATE, the port's] per refusal"] = [got, codes]
+        return all(v == [None, None] for v in got.values()) and all(v == ["22P02", "22P02"] for v in codes.values())
 
-    def arrows_as_main():
-        """doc -> 'a', doc ->> 'a' and the rest answer what main answers, over HTTP and the port (unchanged)."""
+    def arrows_as_postgres():
+        """The -> and ->> of ARROWS_SQL, over HTTP then the port, as Postgres 16 answers them (-> is JSON, ->> text)."""
         http = [q(ARROWS_SQL)[0].get(n) for n in ARROWS]
         port = list(pg_rows(ARROWS_SQL)[0])
+        want_http = ['"x"', "x", '{"d": null}', '{"d": null}', "[1, 2]", None, "1", '"x"', "x"]
+        want_port = ["x", "x", {"d": None}, '{"d": null}', [1, 2], None, 1, '"x"', "x"]
         info["-> and ->>, over HTTP then the port: the answers"] = [http, port]
-        return http == ARROWS_WANT and port == ARROWS_WANT
+        return http == want_http and port == want_port
+
+    def arrow_cases():
+        """Each case of ARROW_CASES: the JSON text over HTTP, the value psycopg gives, and the port's text cast, all as Postgres 16."""
+        http = {e: q(f"SELECT {e} AS v FROM jp WHERE id = 1")[0].get("v") for e, _, _ in ARROW_CASES}
+        typed = {e: pg_rows(f"SELECT {e} FROM jp WHERE id = 1")[0][0] for e, _, _ in ARROW_CASES}
+        texted = {e: pg_rows(f"SELECT CAST(({e}) AS TEXT) FROM jp WHERE id = 1")[0][0] for e, _, _ in ARROW_CASES}
+        wrong = {e: [http[e], typed[e], texted[e]] for e, text, value in ARROW_CASES if http[e] != text or typed[e] != value or texted[e] != text}
+        info["-> cases that differ from Postgres 16 (expression: [HTTP, the port's value, the port's text])"] = wrong
+        return not wrong
+
+    def variant():
+        """A VARIANT column holds JSON text, so its -> answers as a JSON column's does (Postgres has no VARIANT: Pondra's own answer)."""
+        q("CREATE TABLE jvar (id INT PRIMARY KEY, v VARIANT)")
+        q(f"INSERT INTO jvar (id, v) VALUES (1, {lit(JP)})")
+        got = q("SELECT v -> 'a' AS a, v ->> 'a' AS at, v -> 'b' -> 0 AS b0 FROM jvar WHERE id = 1")[0]
+        info["VARIANT: v -> 'a', v ->> 'a', v -> 'b' -> 0, over HTTP"] = got
+        return got == {"a": '"x"', "at": "x", "b0": "1"}
+
+    # The JSON operators in a WHERE clause, written without parentheses: Postgres 16 groups each as it groups it (above
+    # =, IS, LIKE, IN and ||), and the port answers the same rows (ids of jp).
+    GROUPED = [("doc ->> 'a' = 'x'", [1]), ("'x' = doc ->> 'a'", [1]), ("doc -> 'zz' IS NULL", [1, 2]),
+               ("doc #>> '{b,0}' = '1'", [1]), ("doc ->> 'a' LIKE 'x%'", [1]), ("doc ->> 'a' IN ('x', 'y')", [1]),
+               ("doc ? 'a' AND doc ->> 'a' = 'x'", [1])]
+
+    def grouping():
+        http = {w: [r["id"] for r in q(f"SELECT id FROM jp WHERE {w} ORDER BY id")] for w, _ in GROUPED}
+        port = {w: [r[0] for r in pg_rows(f"SELECT id FROM jp WHERE {w} ORDER BY id")] for w, _ in GROUPED}
+        concat = (q("SELECT doc ->> 'a' || 'y' AS v FROM jp WHERE id = 1")[0].get("v"), pg_rows("SELECT doc ->> 'a' || 'y' FROM jp WHERE id = 1")[0][0])
+        info["WHERE without parentheses: the ids over HTTP, then the port; doc ->> 'a' || 'y' over HTTP, then the port"] = [http, port, concat]
+        return all(http[w] == want and port[w] == want for w, want in GROUPED) and concat == ("xy", "xy")
+
+    def functions_by_name():
+        """Each function answers as its operator does (their Postgres names): HTTP's text, and the port's booleans."""
+        sql = ("SELECT jsonb_contains(doc, '{\"b\": [2]}') AS a, jsonb_contained('{\"a\": \"x\"}', doc) AS b, jsonb_exists(doc, 'a') AS c, "
+               "jsonb_exists_any(doc, ARRAY['zz', 'c']) AS d, jsonb_exists_all(doc, ARRAY['a', 'zz']) AS e, json_object_field(doc, 'a') AS f, "
+               "jsonb_object_field(doc, 'c') AS g, json_array_element('[10, 20]', 1) AS h, jsonb_array_element('[10, 20]', -2) AS i FROM jp WHERE id = 1")
+        http = q(sql)[0]
+        port = pg_rows(sql)[0]
+        want = {"a": True, "b": True, "c": True, "d": True, "e": False, "f": '"x"', "g": '{"d": null}', "h": "20", "i": "10"}
+        info["functions by name: HTTP's row, then the port's row"] = [http, port]
+        return http == want and tuple(port[:5]) == (True, True, True, True, False)
+
+    def materialized():
+        """A materialized view of JSON operators is filled, then follows an INSERT into its table."""
+        y = '{"a": "y", "b": [5]}'
+        q("CREATE TABLE jmsrc (id INT PRIMARY KEY, doc JSON)")
+        q(f"INSERT INTO jmsrc (id, doc) VALUES (1, {lit(JP)}), (2, NULL)")
+        q("CREATE MATERIALIZED VIEW jm AS SELECT id, doc -> 'a' AS a, doc #>> '{b,0}' AS b0 FROM jmsrc")
+        filled = [(r["id"], r.get("a"), r.get("b0")) for r in q("SELECT id, a, b0 FROM jm ORDER BY id")]
+        q(f"INSERT INTO jmsrc (id, doc) VALUES (3, {lit(y)})")
+        followed = [(r["id"], r.get("a"), r.get("b0")) for r in q("SELECT id, a, b0 FROM jm ORDER BY id")]
+        want = [(1, '"x"', "1"), (2, None, None)]
+        info["materialized view, filled, then after an INSERT: (id, a, b0) over HTTP"] = [filled, followed]
+        return filled == want and followed == want + [(3, '"y"', "5")]
+
+    def use_json():
+        """`doc ? 'a'` under USE of a schema, the table in that schema: the search path reaches it, and the names it writes
+        in full (path.rs) make the same statement under the session."""
+        b1 = '{"b": 1}'
+        q("CREATE SCHEMA jsx")
+        q("CREATE TABLE jsx.jq (id INT PRIMARY KEY, doc JSON)")
+        q(f"INSERT INTO jsx.jq (id, doc) VALUES (1, {lit(JP)}), (2, {lit(b1)})")
+        h = {"x-pondra-session": "jsons-use-json"}
+        q("USE jsx", h)
+        got = q("SELECT id FROM jq WHERE doc ? 'a' AND doc ->> 'a' = 'x' ORDER BY id", h)
+        arrow = q("SELECT doc -> 'a' AS v FROM jq WHERE id = 1", h)[0].get("v")
+        info["USE jsx: doc ? 'a' AND doc ->> 'a' = 'x' (rows), then doc -> 'a'"] = [got, arrow]
+        return got == [{"id": 1}] and arrow == '"x"'
+
+    def json_spread():
+        """3,000 documents, queried with -> , #>> , @> and an unparenthesised =: one node's answer, three nodes' answer, and
+        Python's count of the same rows, all equal (the rows are in files and the log tail; `spread=1` forces the plan)."""
+        q("CREATE TABLE jbig (id INT PRIMARY KEY, doc JSON)")
+        docs = [{"id": i, "a": f"x{i % 7}", "b": [i, 2], "k": {"n": i * 3}} for i in range(1, 3001)]
+        call(port, "POST", "/append/jbig", ("\n".join(json.dumps({"id": d["id"], "doc": json.dumps(d)}) for d in docs) + "\n").encode(), timeout=120)
+        extras.extend(Node(lake, port + k, tier_secs=1).start() for k in (2, 3))
+        for p in (port + 2, port + 3):  # (each follower has the rows before the query asks it)
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                try:
+                    if call(p, "POST", "/sql", b"SELECT count(*) AS n FROM jbig")[0]["n"] == 3000:
+                        break
+                except Exception:
+                    pass  # (not up yet: asked again)
+                time.sleep(0.5)
+        spread_sql = ("SELECT a, count(*) AS n, sum(s) AS total FROM (SELECT doc ->> 'a' AS a, CAST(doc #>> '{k,n}' AS BIGINT) AS s "
+                      "FROM jbig WHERE doc @> '{\"a\": \"x3\"}' OR doc #>> '{b,0}' = '7') AS r GROUP BY a ORDER BY a")
+        want_groups = {}
+        for d in docs:
+            if d["a"] == "x3" or d["b"][0] == 7:
+                n, total = want_groups.get(d["a"], (0, 0))
+                want_groups[d["a"]] = (n + 1, total + d["k"]["n"])
+        want = [{"a": a, "n": n, "total": t} for a, (n, t) in sorted(want_groups.items())]
+        one = call(port, "POST", "/sql?spread=0", spread_sql.encode(), timeout=120)
+        three = call(port, "POST", "/sql?spread=1", spread_sql.encode(), timeout=120)
+        info["spread over three nodes, one node, and Python: rows"] = [three, one, want]
+        return three == one == want
 
     def arrays_untouched():
         """ARRAY[1,2,3] @> ARRAY[2] is DataFusion's array containment, and still true."""
@@ -13562,13 +13679,10 @@ def jsons():
         return http is True and port is True
 
     def in_where():
-        """The operators in a WHERE clause find the rows they name, over HTTP and the port.
-
-        The comparisons are parenthesised: sqlparser ranks = and IS above #>> and the other JSON
-        operators, so `doc #>> '{c,d}' IS NULL` parses as `doc #>> ('{c,d}' IS NULL)`. Postgres 16
-        groups it as `(doc #>> '{c,d}') IS NULL`, and Pondra's parser does not yet (a known limit)."""
-        http = [r["id"] for r in q("SELECT id FROM jp WHERE t ?| ARRAY['zz','c'] AND (doc #>> '{c,d}') IS NULL ORDER BY id")]
-        port = [r[0] for r in pg_rows("SELECT id FROM jp WHERE doc @> '{\"a\": \"x\"}' AND (t #>> '{b,0}') = '1' ORDER BY id")]
+        """The operators in a WHERE clause find the rows they name, over HTTP and the port, with no parentheses: `doc #>> '{c,d}'
+        IS NULL` is `(doc #>> '{c,d}') IS NULL`, as Postgres 16 groups it (path::door's text, `pg_json::text`)."""
+        http = [r["id"] for r in q("SELECT id FROM jp WHERE t ?| ARRAY['zz','c'] AND doc #>> '{c,d}' IS NULL ORDER BY id")]
+        port = [r[0] for r in pg_rows("SELECT id FROM jp WHERE doc @> '{\"a\": \"x\"}' AND t #>> '{b,0}' = '1' ORDER BY id")]
         info["WHERE with the operators: rows over HTTP, then the port"] = [http, port]
         return http == [1] and port == [1]
 
@@ -13599,7 +13713,7 @@ def jsons():
               "paths: what Postgres 16 answers (a found JSON null is the text null, a missing path NULL, '{}' the whole document)",
               lambda: answers(PATHS, over_http))
         check("#> and #>> over the Postgres port (psycopg), on a JSON and a TEXT column: the same answers, as text",
-              lambda: answers(PATHS, over_port))
+              lambda: answers(PATHS, over_port, as_text=True))
         check("@> and <@ over HTTP and the port, on a JSON and a TEXT column: what Postgres 16 answers (nested objects and arrays, "
               "a top-level scalar in an array, 1 and 1.0, empty objects and arrays, null)",
               lambda: answers(CONTAINS, over_http) and answers(CONTAINS, over_port))
@@ -13607,14 +13721,31 @@ def jsons():
               "in an array, a scalar string, a nested array, an empty list, a list of keys)",
               lambda: answers(EXISTS, over_http) and answers(EXISTS, over_port))
         check("a NULL document or text answers NULL to each operator, over HTTP and the port", null_documents)
-        check("a TEXT value that isn't JSON is 22P02 from #>, #>>, @>, <@, ?, ?| and ?&, over HTTP and the port", not_json_text)
-        check("doc -> 'a', doc ->> 'a' and the rest answer what main answers, over HTTP and the port (unchanged)", arrows_as_main)
+        check("a TEXT value that isn't JSON: -> , ->>, #> and #>> answer NULL, @>, <@, ?, ?| and ?& are 22P02, over HTTP and the port",
+              not_json_text)
+        check("-> and ->>, over HTTP then the port, as Postgres 16 answers them (-> is JSON: quotes kept over HTTP, json's value to psycopg)",
+              arrows_as_postgres)
+        check("-> on a JSON and a TEXT column, over HTTP, the port's json value and the port's text cast: Postgres 16's answers "
+              "(strings, objects, arrays, numbers, a JSON null, a missing key, a negative index, a path into a scalar, a text key on an array)",
+              arrow_cases)
+        check("a VARIANT column: v -> 'a', v ->> 'a' and v -> 'b' -> 0 answer as a JSON column's do, over HTTP", variant)
+        check("the operators in a WHERE clause, and doc ->> 'a' || 'y', with no parentheses: the rows and the text, over HTTP and the port",
+              grouping)
+        check("the operators in a WHERE clause find the rows they name, over HTTP and the port (a JSON null and an IS NULL unparenthesised)",
+              in_where)
+        check("jsonb_contains, jsonb_contained, jsonb_exists, jsonb_exists_any, jsonb_exists_all, json_object_field, jsonb_object_field, "
+              "json_array_element and jsonb_array_element answer as their operators do, over HTTP and the port", functions_by_name)
+        check("a materialized view of doc -> 'a' and doc #>> '{b,0}' is filled, and follows an INSERT into its table", materialized)
+        check("under USE of a schema, doc ? 'a' and doc ->> 'a' = 'x' find the schema's table (the search path reaches it)", use_json)
+        check("a spread query over three nodes, with ->>, #>> and @> over 3,000 documents: equal to one node's answer and to Python's",
+              json_spread)
         check("ARRAY[1,2,3] @> ARRAY[2] still answers true, over HTTP and the port (DataFusion's array containment is untouched)",
               arrays_untouched)
-        check("the operators in a WHERE clause find the rows they name, over HTTP and the port", in_where)
     finally:
         if node is not None:
             node.kill()
+        for extra in extras:
+            extra.kill()
     ok = all(checks.values())
     print(json.dumps({"jsons": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
@@ -16653,8 +16784,9 @@ def doors():
             "USE a schema": (["USE d_crm", "SELECT count(*) AS n FROM d_only"], lambda r: r[-1] == [[3]]),
             "a macro": (["SELECT d_twice(21) AS n"], lambda r: r[-1] == [[42]]),
             # (Postgres's JSON operators on a column: text and CASE answers, so every door shows them alike)
-            "JSON path and containment": (["SELECT doc #>> '{a,b,1}' AS v, CASE WHEN doc @> '{\"k\": 1}' THEN 'yes' ELSE 'no' END AS c FROM d_json WHERE id = 1"],
-                                          lambda r: r[-1] == [["y", "yes"]]),
+            "JSON path and containment": (["SELECT doc -> 'k' AS k FROM d_json WHERE doc ->> 'k' = '1' AND id = 1",
+                                           "SELECT doc #>> '{a,b,1}' AS v, CASE WHEN doc @> '{\"k\": 1}' THEN 'yes' ELSE 'no' END AS c FROM d_json WHERE id = 1"],
+                                          lambda r: r[-1] == [["y", "yes"]] and r[0] in ([["1"]], [[1]])),
             "a Git folder's status": (["SELECT path, change FROM pondra.git_status('d_git')"], lambda r: r[-1] == [["a.sql", "added"]]),
             "a backup": ([f"BACKUP DATABASE TO '{backups}/door{i}'"], lambda r: backed(f"{backups}/door{i}")),
             "a write to a backup refused, 25006": ([f"INSERT INTO d_bk.d_log VALUES ('door{i}', {i})"], lambda r: r == "25006"),
