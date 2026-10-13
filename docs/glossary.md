@@ -10,6 +10,8 @@ Generated from `pondra.kinds` (`src/objects.rs`): don't edit it here; `python3 t
 
 **function**: a named computation, in SQL or Python, run per row, per batch or in a query. Other products call it UDF, user-defined function.
 
+**identity provider**: the company's sign-in (Okta, Entra ID, Google, Keycloak), whose tokens sign people in at every door. Other products call it single sign-on, SSO, OpenID Connect, OIDC, security integration.
+
 **index**: a named set of a table's columns, kept as a definition: nothing is built.
 
 **macro**: a named SQL expression or query, expanded where it is written. Other products call it SQL macro.

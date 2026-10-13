@@ -115,6 +115,9 @@ pub enum Change {
     // itself never leaves that process)
     CreateToken { name: String, user: String, expires_secs: Option<u64>, #[serde(default, skip_serializing_if = "Option::is_none")] hash: Option<String> },
     DropToken { name: String, user: String },
+    // (single sign-on, ADR-074: `sso.rs`)
+    CreateProvider { name: String, provider: crate::sso::Provider, replace: bool, if_not_exists: bool },
+    DropProvider { name: String, if_exists: bool },
 }
 
 const PRIVILEGES: [&str; 7] = ["select", "insert", "update", "delete", "usage", "clone", "apply"]; // (CLONE: a database's or a schema's, ADR-058; APPLY: a database's)
@@ -262,6 +265,7 @@ fn parse(mut w: Words) -> Result<Change> {
                 if w.is("password") {
                     let p = w.string()?;
                     ensure!(p.chars().count() >= 8, "a password has at least 8 characters");
+                    ensure!(!crate::sso::shaped(&p), "a password shaped like a JSON Web Token (eyJ…, three parts) is taken for an identity provider's token, so it would never sign in: choose another");
                     verifier = Some(Verifier::of(&p));
                 } else if w.is("superuser") {
                     superuser = Some(true);
@@ -416,10 +420,13 @@ fn on_database(lake: &Lake, on: On, database: Option<&str>, privileges: &[String
     Ok(On::Database(d.to_string()))
 }
 
-/// A user's or role's name: a plain one, not the tokens' (`admin`, `writer`, `reader`).
+/// A user's or role's name: a plain one, or an address quoted (`"ana@acme.com"`, as an identity provider
+/// names its users: ADR-074); not the tokens' (`admin`, `writer`, `reader`).
 fn plain(name: &str) -> Result<String> {
-    ensure!(!name.is_empty() && name.len() <= 63 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.starts_with(|c: char| c.is_ascii_digit()),
-        "{name}: a user's or role's name is letters, digits and _, at most 63");
+    let word = name.len() <= 63 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.starts_with(|c: char| c.is_ascii_digit());
+    let address = name.len() <= 128 && name.chars().all(|c| c.is_ascii_alphanumeric() || "_.@+-|".contains(c)) && name.starts_with(|c: char| c.is_ascii_alphanumeric());
+    ensure!(!name.is_empty() && (word || address), "{name}: a user's or role's name is letters, digits and _ (at most 63), or an address quoted (\"ana@acme.com\", at most 128)");
+    ensure!(word || !name.chars().any(|c| c.is_ascii_uppercase()), "\"{name}\": an address is written in lower case (\"{}\"), as an identity provider's names are compared", name.to_lowercase());
     ensure!(!BUILT_IN.contains(&name), "{name} is the {name} token's name (`pondra serve --{}-token`): pick another", if name == "reader" { "read" } else if name == "writer" { "write" } else { "admin" });
     Ok(name.to_string())
 }
@@ -432,7 +439,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
     let gives_access = match &c {
         Change::Create { login, verifier, .. } => *login && verifier.is_some(),
         Change::Alter { verifier, .. } => verifier.is_some(),
-        Change::CreateToken { .. } => true,
+        Change::CreateToken { .. } | Change::CreateProvider { .. } => true,
         _ => false,
     };
     let get = |n: &str| { let k = user_key(n); async move { lake.cat.get::<User>(&k).await } };
@@ -585,6 +592,8 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             lake.cat.commit(vec![put(&user, &u)], &[]).await?;
             j!({"token": name, "user": user, "dropped": true})
         }
+        Change::CreateProvider { name, provider, replace, if_not_exists } => crate::sso::create(lake, name, provider, replace, if_not_exists).await?,
+        Change::DropProvider { name, if_exists } => crate::sso::drop(lake, &name, if_exists).await?,
     };
     forget();
     if gives_access && exposed(lake).await {
@@ -885,10 +894,15 @@ crate::per_node!(
 /// Leader, with a token set: the lake remembers it (once; nothing clears it, `pondra token` is the way back
 /// in). A node started without tokens on such a lake is never open, and makes no user (`signed`).
 pub async fn mark_signed(lake: &Lake) -> Result<()> {
-    if lake.cat.get::<Value>(SIGNED).await?.is_none() {
-        lake.cat.commit(vec![(SIGNED.into(), json(&j!({"at_ms": crate::log::now_ms()})))], &[]).await?;
+    if let Some(mark) = signed_mark(lake).await? {
+        lake.cat.commit(vec![mark], &[]).await?;
     }
     Ok(())
+}
+
+/// The mark `mark_signed` writes, when the lake has none yet: to go in another commit (an identity provider's).
+pub async fn signed_mark(lake: &Lake) -> Result<Option<(String, Vec<u8>)>> {
+    Ok(lake.cat.get::<Value>(SIGNED).await?.is_none().then(|| (SIGNED.into(), json(&j!({"at_ms": crate::log::now_ms()})))))
 }
 
 /// Has the lake been served with tokens (`mark_signed`)? Then a request with nothing signed is refused, saying
@@ -1062,38 +1076,69 @@ crate::per_node!(
     /// Users' access, by name, as of a catalog version (grants change seldom: a check is a lookup).
     static ACCESS: Mutex<HashMap<String, (Option<u64>, std::time::Instant, Arc<Access>, bool)>> = Default::default());
 
-fn forget() {
+pub(crate) fn forget() {
     ACCESS.lock().unwrap().clear();
     ANY.lock().unwrap().clear();
+    UNSIGNED_LAKES.lock().unwrap().clear();
 }
 
 /// The principal `user` signs in as: a superuser's rights are the admin token's; anyone else's
 /// are its grants.
-pub async fn principal(lake: &Lake, user: &str) -> Result<Principal> {
+pub async fn principal(lake: &Lake, user: &str) -> Result<Principal> { principal_with(lake, user, &[], false).await }
+
+/// Whom an identity provider's token signs in as (ADR-074, invariant 410): a user made here (never a
+/// role), or one the provider vouches for (`USERS 'any'`) with public's grants; and, with either, the
+/// roles here that its roles claim names.
+pub async fn claimed(lake: &Lake, c: &crate::sso::Claimed) -> Result<Principal> {
+    ensure!(!BUILT_IN.contains(&c.user.as_str()), "it names {}, a token's name, which no identity provider signs in as", c.user);
+    match lake.cat.get::<User>(&user_key(&c.user)).await? {
+        Some(u) => ensure!(u.login, "{} is a role, and no one signs in as a role", c.user),
+        None => ensure!(c.any, "no user {} here: CREATE USER \"{}\" (identity provider {} signs in only the users made here, unless it is made with USERS 'any')", c.user, c.user, c.provider),
+    }
+    principal_with(lake, &c.user, &c.roles, c.any).await
+}
+
+/// `user`'s principal, with `claimed` roles besides its own (those of them that are roles here); `unmade`:
+/// a user not made here may be (it has public's grants and those roles').
+async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: bool) -> Result<Principal> {
     let version = lake.cat.version();
-    let cached = ACCESS.lock().unwrap().get(user).filter(|c| fresh(lake, version, c.0, c.1)).map(|c| (c.2.clone(), c.3));
+    let id = std::iter::once(user).chain(claimed.iter().map(String::as_str)).collect::<Vec<_>>().join("\0"); // (cached by the roles claimed too)
+    let cached = ACCESS.lock().unwrap().get(&id).filter(|c| fresh(lake, version, c.0, c.1)).map(|c| (c.2.clone(), c.3));
     let (access, superuser) = match cached {
         Some(c) => c,
         None => {
-            let me = lake.cat.get::<User>(&user_key(user)).await?.ok_or_else(|| anyhow!("no user {user}"))?;
+            let me = match lake.cat.get::<User>(&user_key(user)).await? {
+                Some(u) => u,
+                None if unmade => User { login: true, ..Default::default() },
+                None => bail!("no user {user}"),
+            };
             let mut grants = vec![];
             let mut seen = HashSet::new();
-            let mut todo = vec![("public".to_string(), None), (user.to_string(), Some(me.clone()))];
+            // (a name, the user if read, and whether a token claimed it: only a role counts then)
+            let mut todo = vec![("public".to_string(), None, false), (user.to_string(), Some(me.clone()), false)];
+            todo.extend(claimed.iter().map(|r| (r.clone(), None, true)));
             let mut superuser = me.superuser;
-            while let Some((n, u)) = todo.pop() {
+            while let Some((n, u, claim)) = todo.pop() {
+                if seen.contains(&n) {
+                    continue;
+                }
+                let u = match u {
+                    Some(u) => Some(u),
+                    None => lake.cat.get::<User>(&user_key(&n)).await?,
+                };
+                if claim && u.as_ref().is_none_or(|u| u.login) {
+                    continue; // (a claimed name that is no role here, or a user's: no one becomes another user by a group's name)
+                }
                 if !seen.insert(n.clone()) || seen.len() > 64 {
                     continue;
                 }
-                let Some(u) = (match u {
-                    Some(u) => Some(u),
-                    None => lake.cat.get::<User>(&user_key(&n)).await?,
-                }) else { continue };
+                let Some(u) = u else { continue };
                 superuser |= u.superuser && n != "public";
                 grants.extend(u.grants.iter().cloned());
-                todo.extend(u.roles.iter().map(|r| (r.clone(), None)));
+                todo.extend(u.roles.iter().map(|r| (r.clone(), None, false)));
             }
             let access = Arc::new(Access { grants, names: seen, limits: me.limits });
-            ACCESS.lock().unwrap().insert(user.to_string(), (version, std::time::Instant::now(), access.clone(), superuser));
+            ACCESS.lock().unwrap().insert(id, (version, std::time::Instant::now(), access.clone(), superuser));
             (access, superuser)
         }
     };
@@ -1182,7 +1227,7 @@ impl Quota {
 /// Is what was worked out at catalog version `then` (at `at`) still so? On the leader, until the
 /// catalog changes; elsewhere (a follower's version may not move with every commit it is sent), a
 /// second at most.
-fn fresh(lake: &Lake, now: Option<u64>, then: Option<u64>, at: std::time::Instant) -> bool {
+pub(crate) fn fresh(lake: &Lake, now: Option<u64>, then: Option<u64>, at: std::time::Instant) -> bool {
     (lake.cat.is_writer() && now.is_some() && now == then) || at.elapsed() < std::time::Duration::from_secs(1)
 }
 
@@ -1228,15 +1273,15 @@ pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::wri
 
 crate::per_node!(static ANY: Mutex<HashMap<String, (Option<u64>, std::time::Instant, bool)>> = Default::default());
 
-/// Does the lake have a user who signs in (a password or a token)? Then a request with nothing
-/// signed is refused, as with a token set.
+/// Does the lake have a user who signs in (a password or a token), or an identity provider? Then a
+/// request with nothing signed is refused, as with a token set.
 pub async fn any(lake: &Lake) -> bool {
     let version = lake.cat.version();
     if let Some(c) = ANY.lock().unwrap().get(&lake.url).filter(|c| fresh(lake, version, c.0, c.1)) {
         return c.2;
     }
     let yes = match lake.cat.scan::<User>("u/", "u0").await {
-        Ok(all) => all.iter().any(|(_, u)| u.login && (u.verifier.is_some() || !u.tokens.is_empty())),
+        Ok(all) => all.iter().any(|(_, u)| u.login && (u.verifier.is_some() || !u.tokens.is_empty())) || !crate::sso::all(lake).await.is_ok_and(|p| p.is_empty()),
         Err(_) => return true, // (users that can't be read are taken for ones who sign in, and read again next time: open only when surely so)
     };
     ANY.lock().unwrap().insert(lake.url.clone(), (version, std::time::Instant::now(), yes));
@@ -1255,6 +1300,9 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) ->
         if role > Role::None {
             return Some(Principal::token(role));
         }
+        if let Some(c) = crate::sso::check(lake, token).await {
+            return claimed(lake, &c.ok()?).await.ok(); // (an identity provider's: ADR-074)
+        }
         // (where an admin token is set the nodes call each other with it, so a `pn_` key read from the bucket opens nothing)
         if token.starts_with("pn_") && !auth.admin_set() && keys(lake).await.is_ok_and(|k| aws_lc_rs::constant_time::verify_slices_are_equal(k.node.as_bytes(), token.as_bytes()).is_ok()) {
             return Some(Principal::token(Role::Admin));
@@ -1269,7 +1317,7 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) ->
 
 /// Is this sign-in's password a token, by `sign_in`'s own rule (a token's name, or a user's `pt_…`)? A token
 /// may cross a plain connection under `PONDRA_TLS=optional`, a password never (`tls::may_send_password`).
-pub fn is_token(user: &str, password: &str) -> bool { BUILT_IN.contains(&user) || password.starts_with("pt_") }
+pub fn is_token(user: &str, password: &str) -> bool { BUILT_IN.contains(&user) || password.starts_with("pt_") || crate::sso::shaped(password) }
 
 /// A name and a password (or a token as the password): the Postgres, Kafka and Flight doors' and
 /// HTTP Basic's. The tokens' names (`admin`, `writer`, `reader`) take their tokens.
@@ -1277,6 +1325,11 @@ pub async fn sign_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password
     if BUILT_IN.contains(&user) {
         let role = auth.token_role(password);
         return (role > Role::None && auth.token_for(user).is_some_and(|t| aws_lc_rs::constant_time::verify_slices_are_equal(t.as_bytes(), password.as_bytes()).is_ok())).then(|| Principal::token(role));
+    }
+    if let Some(c) = crate::sso::check(lake, password).await {
+        // (an identity provider's token as the password: it signs in only the user it names)
+        let c = c.ok().filter(|c| c.user == user.to_lowercase())?;
+        return claimed(lake, &c).await.ok();
     }
     let ok = match password.starts_with("pt_") {
         true => token_user(lake, password).await.as_deref() == Some(user),

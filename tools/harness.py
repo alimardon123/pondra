@@ -26,6 +26,7 @@
   harness.py server              pondra serve <folder of lakes>: each a database (Postgres, HTTP, joins, idle, restart)
   harness.py first               a node on the network with no token makes the lake's first user and prints its token once; pondra token
   harness.py sealed              the lake's keys and secrets sealed by an admin token alone: nodes, rotation, short tokens
+  harness.py sso                 identity providers: CREATE IDENTITY PROVIDER, JWTs at every door, refusals, USERS 'any', keys fetched and dropped
   harness.py safety              panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
   harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
   harness.py stopped             a run whose node was killed under it: stopped, not running for good
@@ -8985,10 +8986,11 @@ def reply(port, method, path, body=b"", headers=None, source=None, host="127.0.0
     return r.status, {k.lower(): v for k, v in r.getheaders()}, text
 
 
-def kafka_sign_in(port, user, password, source=None, cafile=None):
-    """(error code, message) of a SASL/PLAIN sign-in on a node's Kafka port, by hand: SaslHandshake v1, then
+def kafka_sign_in(port, user, password, source=None, cafile=None, mechanism="PLAIN"):
+    """(error code, message) of a SASL sign-in on a node's Kafka port, by hand: SaslHandshake v1, then
     SaslAuthenticate v1 (0: signed in; 58: refused, saying why). `source` is this machine's address to call
-    from; `cafile` connects over TLS (SASL_SSL) with that authority."""
+    from; `cafile` connects over TLS (SASL_SSL) with that authority. `mechanism` OAUTHBEARER sends `password` as
+    a bearer token (RFC 7628; `user` is then unused): how an identity provider's token goes (ADR-074)."""
     import socket, ssl, struct
     def frame(key, corr, body):
         msg = struct.pack(">hhih", key, 1, corr, 7) + b"harness" + body
@@ -9007,9 +9009,10 @@ def kafka_sign_in(port, user, password, source=None, cafile=None):
     if cafile:
         s = ssl.create_default_context(cafile=cafile).wrap_socket(s, server_hostname="127.0.0.1")
     try:
-        s.sendall(frame(17, 1, struct.pack(">h", 5) + b"PLAIN"))
+        name = mechanism.encode()
+        s.sendall(frame(17, 1, struct.pack(">h", len(name)) + name))
         read(s)
-        auth = b"\0" + user.encode() + b"\0" + password.encode()
+        auth = b"n,,\x01auth=Bearer " + password.encode() + b"\x01\x01" if mechanism == "OAUTHBEARER" else b"\0" + user.encode() + b"\0" + password.encode()
         s.sendall(frame(36, 2, struct.pack(">i", len(auth)) + auth))
         r = read(s)
         err, n = struct.unpack(">hh", r[4:8])
@@ -9313,6 +9316,290 @@ def guesses():
         shutil.rmtree(config, ignore_errors=True)
     ok = all(checks.values())
     print(json.dumps({"guesses": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+def sso():
+    """Single sign-on (ADR-074, invariants 409–412, src/sso.rs): a provider made by CREATE IDENTITY PROVIDER (a
+    superuser's: its issuer is asked for its keys first, and the lake is marked as signed), and the JWTs its keys
+    sign. A token whose signature, issuer, audience, expiry and user claim check out signs in at every door (HTTP's
+    Bearer and Basic, Postgres, Kafka's PLAIN and OAUTHBEARER, Flight, MCP): as a user made here (USERS 'listed', the
+    default), or with USERS 'any' as anyone the provider vouches for, with the roles its ROLES_CLAIM names that are
+    roles here. A refused token says why at every door (HTTP's 401, Kafka's 58, Postgres's 28P01, Flight's
+    UNAUTHENTICATED). Keys are fetched once, again when a token names a kid they lack (at most once a minute) or
+    when they are an hour old, and a key the provider has dropped is refused once they are fetched again.
+    The provider is tools/fake_idp.py: real keys and real tokens, so these checks run what a provider sends."""
+    import base64, socket, statistics
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import fake_idp
+    import psycopg, adbc_driver_flightsql.dbapi as adbc
+    P, PG, KAFKA, FLIGHT = A.port, A.port + 13, A.port + 7, A.port + 33  # (the ports guesses() derives)
+    token = "sso-admin-token-1"
+    bearer = {"Authorization": f"Bearer {token}"}
+    bearer_of = lambda t: {"Authorization": f"Bearer {t}"}
+    basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    stop = lambda node: (node.p.send_signal(signal.SIGTERM), node.p.wait(timeout=120))  # (drained, its term given back)
+    ana, eve, cy, bo = "ana@acme.com", "eve@acme.com", "cy@acme.com", "bo@acme.com"
+    srv = fake_idp.start(0)
+    issuer = srv.issuer
+    checks, info, started = {}, {}, []
+
+    def token_for(email, claims=None, **body):
+        """A token naming `email`: aud pondra, verified, an hour, unless its claims or body say otherwise."""
+        return srv.idp.mint({"ttl": 3600, "claims": {"aud": "pondra", "email": email, "email_verified": True, **(claims or {})}, **body})
+
+    def whoami(headers):
+        """(status, the user /whoami names, or the refusal's text)."""
+        st, _, text = reply(P, "GET", "/whoami", headers=headers)
+        return st, (json.loads(text)["user"] if st == 200 else text)
+
+    def read_t(headers, sql="SELECT x FROM t"):
+        """(status, the rows, or the refusal's text) of a query over HTTP."""
+        st, _, text = reply(P, "POST", "/sql", sql.encode(), headers=headers)
+        return st, (json.loads(text) if st == 200 else text)
+
+    def pg_as(user, password, sql="SELECT x FROM t"):
+        """The rows over the Postgres port, or the error's text."""
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={PG} user={user} password={password} dbname=lake connect_timeout=10") as conn:
+                return conn.execute(sql).fetchall()
+        except psycopg.Error as e:
+            return str(e).strip()
+
+    def flight_as(user, password, sql="SELECT x FROM t"):
+        """The rows over Flight SQL (ADBC's Basic handshake), or the error's text."""
+        try:
+            conn = adbc.connect(f"grpc://127.0.0.1:{FLIGHT}", db_kwargs={"username": user, "password": password})
+            try:
+                cur = conn.cursor()
+                cur.execute(sql)
+                rows = cur.fetchall()
+                cur.close()
+                return rows
+            finally:
+                conn.close()
+        except Exception as e:
+            return str(e).strip()
+
+    def mcp_rows(t, sql="SELECT x FROM t"):
+        """The query tool's rows over MCP, or its error's text."""
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "query", "arguments": {"sql": sql}}}).encode()
+        r = json.loads(reply(P, "POST", "/mcp", body, headers={"content-type": "application/json", "authorization": f"Bearer {t}"})[2])["result"]
+        return r["content"][0]["text"] if r["isError"] else json.loads(r["content"][0]["text"])["rows"]
+
+    lake = new_lake()
+    try:
+        # 1. Before any provider, on a lake that starts open: the metadata is 404 and nobody is listed.
+        open_node = Node(lake, P).start()
+        started.append(open_node)
+        checks["before any provider: GET /.well-known/oauth-protected-resource is 404, and GET /sso lists none"] = \
+            reply(P, "GET", "/.well-known/oauth-protected-resource")[0] == 404 and json.loads(reply(P, "GET", "/sso")[2]) == {"providers": []}
+
+        # 2. Made on the open node (no token needed): the issuer is asked once for discovery and keys, /sso lists it,
+        # the lake is marked signed, and an unsigned request is refused. Then the lake runs with a token.
+        made = reply(P, "POST", "/sql", f"CREATE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), ROLES_CLAIM 'groups')".encode())
+        info["CREATE"] = made[2][:200]
+        checks["CREATE IDENTITY PROVIDER acme answers 200, and the node asked the issuer for its discovery document and its keys once each"] = \
+            made[0] == 200 and srv.idp.stats["discovery_fetches"] == 1 and srv.idp.stats["jwks_fetches"] == 1
+        listed = json.loads(reply(P, "GET", "/sso")[2])["providers"]
+        info["GET /sso right after CREATE"] = listed
+        checks["GET /sso lists acme (its name, label and issuer), with no sign-in"] = [(p["name"], p["label"], p["issuer"]) for p in listed] == [("acme", "acme", issuer)]
+        signed_now = json.loads(reply(P, "GET", "/stats")[2]).get("signed")
+        unsigned = reply(P, "POST", "/sql", b"SELECT 1 AS one")
+        info["signed after CREATE, and an unsigned SELECT"] = [signed_now, unsigned[0], unsigned[2][:160]]
+        checks["making a provider marks the lake signed (/stats: signed), so an unsigned request is 401 from then on"] = signed_now is True and unsigned[0] == 401
+        stop(open_node)
+        node = Node(lake, P, admin_token=token, pg=f"127.0.0.1:{PG}", kafka=f"127.0.0.1:{KAFKA}", flight=f"127.0.0.1:{FLIGHT}").start()
+        started.append(node)
+        mcp_body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode()
+        no_mcp = reply(P, "POST", "/mcp", mcp_body, headers={"content-type": "application/json"})
+        meta = reply(P, "GET", "/.well-known/oauth-protected-resource")
+        checks["POST /mcp with no sign-in is 401 with WWW-Authenticate naming the resource metadata, which names the issuer as its authorization server"] = \
+            no_mcp[0] == 401 and "/.well-known/oauth-protected-resource" in no_mcp[1].get("www-authenticate", "") \
+            and meta[0] == 200 and json.loads(meta[2])["authorization_servers"] == [issuer]
+        objects = call(P, "POST", "/sql", b"SELECT kind, name FROM pondra.objects WHERE kind = 'identity provider'", headers=bearer)
+        shown = call(P, "POST", "/sql", b"SHOW CREATE IDENTITY PROVIDER acme", headers=bearer)[0]["definition"]
+        call(P, "POST", "/sql", b"DROP IDENTITY PROVIDER acme", headers=bearer)
+        call(P, "POST", "/sql", shown.encode(), headers=bearer)
+        again = call(P, "POST", "/sql", b"SHOW CREATE IDENTITY PROVIDER acme", headers=bearer)[0]["definition"]
+        info["SHOW CREATE"] = shown
+        checks["pondra.objects lists acme as an identity provider, and SHOW CREATE's statement, run after a DROP, makes the same provider"] = \
+            objects == [{"kind": "identity provider", "name": "acme"}] and again == shown
+
+        # 3. Refused by name, and nothing made.
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        dead = closed.getsockname()[1]
+        closed.close()  # (a port nothing listens on)
+        attempts = {
+            "an http issuer that isn't this machine": ("CREATE IDENTITY PROVIDER web (ISSUER 'http://idp.example.com', CLIENT_ID 'pondra')", "an https:// address"),
+            "an issuer that doesn't answer": (f"CREATE IDENTITY PROVIDER dead (ISSUER 'http://127.0.0.1:{dead}', CLIENT_ID 'pondra')", "asked for its keys"),
+            "USERS 'some'": (f"CREATE IDENTITY PROVIDER some (ISSUER '{issuer}', CLIENT_ID 'pondra', USERS 'some')", "USERS 'some'"),
+            "an unknown option": (f"CREATE IDENTITY PROVIDER colour (ISSUER '{issuer}', CLIENT_ID 'pondra', COLOUR 'red')", "COLOUR"),
+            "ALTER IDENTITY PROVIDER": ("ALTER IDENTITY PROVIDER acme SET (LABEL 'x')", "CREATE OR REPLACE"),
+            "a second CREATE of acme": (f"CREATE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra2')", "already exists"),
+        }
+        said = {}
+        for what, (statement, phrase) in attempts.items():
+            st, _, text = reply(P, "POST", "/sql", statement.encode(), headers=bearer)
+            said[what] = (st, text[:200], st != 200 and phrase in text)
+        info["refusals"] = said
+        left = json.loads(reply(P, "GET", "/sso")[2])["providers"]
+        kept = call(P, "POST", "/sql", b"SHOW CREATE IDENTITY PROVIDER acme", headers=bearer)[0]["definition"]
+        checks["refused by name, and nothing made: an http issuer off this machine, an issuer that doesn't answer, USERS 'some', an unknown option, ALTER, a second CREATE; acme is the one provider, unchanged"] = \
+            all(v[2] for v in said.values()) and [p["name"] for p in left] == ["acme"] and "CLIENT_ID 'pondra'" in kept and "pondra2" not in kept
+
+        # 4. A user made here signs in with a token at every door, and reads what its grants allow.
+        setup = [reply(P, "POST", "/sql", q.encode(), headers=bearer)[0] for q in (
+            'CREATE USER "ana@acme.com"', 'CREATE USER "eve@acme.com"', "CREATE USER al PASSWORD 'al-password-1'",
+            "CREATE TABLE t (x INT)", "INSERT INTO t VALUES (1)", 'GRANT SELECT ON t TO "ana@acme.com"')]
+        info["setup"] = setup
+        ana_t, ana_aud, ana_es = token_for(ana), token_for(ana, {"aud": "api://pondra"}), token_for(ana, alg="ES256")
+        doors = {"http bearer": read_t(bearer_of(ana_t)), "http basic": read_t({"Authorization": basic(ana, ana_t)}),
+                 "postgres": pg_as(ana, ana_t), "flight": flight_as(ana, ana_t), "mcp": mcp_rows(ana_t), "whoami": whoami(bearer_of(ana_t))}
+        info["ana's token, each door"] = doors
+        checks["a token for ana@acme.com (made here) reads t over HTTP Bearer and Basic, Postgres, Flight and MCP, and /whoami names it"] = \
+            doors["http bearer"] == (200, [{"x": 1}]) and doors["http basic"] == (200, [{"x": 1}]) and doors["postgres"] == [(1,)] \
+            and doors["flight"] == [(1,)] and doors["mcp"] == [{"x": 1}] and doors["whoami"] == (200, ana)
+        kafka_plain = kafka_sign_in(KAFKA, ana, ana_t)
+        kafka_bearer = kafka_sign_in(KAFKA, "", ana_t, mechanism="OAUTHBEARER")
+        info["kafka: PLAIN, OAUTHBEARER"] = [kafka_plain, kafka_bearer]
+        checks["…Kafka's SASL PLAIN (the token as the password) and OAUTHBEARER sign it in"] = kafka_plain == (0, None) and kafka_bearer == (0, None)
+        checks["…a token whose audience is an API's (api://pondra), and an ES256 token, sign ana in too"] = whoami(bearer_of(ana_aud)) == (200, ana) and whoami(bearer_of(ana_es)) == (200, ana)
+
+        # 5. Refused, each saying why: at HTTP (401's body), Kafka (OAUTHBEARER's message), Postgres (the password
+        # refused, 28P01) and Flight (its handshake's UNAUTHENTICATED).
+        cases = [
+            ("expired", token_for(ana, ttl=-120), ana, "expired"),
+            ("not yet valid (nbf an hour on)", token_for(ana, {"nbf": int(time.time()) + 3600}), ana, "isn't valid yet"),
+            ("another audience", token_for(ana, {"aud": "api://other"}), ana, "audience"),
+            ("another issuer", token_for(ana, {"iss": "https://evil.example"}), ana, "no identity provider here has issuer"),
+            ("an unverified email", token_for(ana, {"email_verified": False}), ana, "isn't verified"),
+            ("alg none", token_for(ana, alg="none"), ana, "isn't taken"),
+            ("alg HS256", token_for(ana, alg="HS256"), ana, "isn't taken"),
+            ("a stranger's key under a JWKS kid", token_for(ana, sign_with="stranger"), ana, "isn't its issuer's"),
+            ("a user made nowhere", token_for(bo), bo, "no user bo@acme.com here"),
+        ]
+        phrase_of = {what: phrase for what, _, _, phrase in cases}
+        http_said, kafka_said, plain_said, pg_said, flight_said = {}, {}, {}, {}, {}
+        for what, t, user, _ in cases:
+            st, _, text = reply(P, "GET", "/whoami", headers=bearer_of(t))
+            http_said[what] = (st, text)
+            code, msg = kafka_sign_in(KAFKA, "", t, mechanism="OAUTHBEARER")
+            kafka_said[what] = (code, msg or "")
+            code, msg = kafka_sign_in(KAFKA, user, t)
+            plain_said[what] = (code, msg or "")
+            pg_said[what] = pg_as(user, t)
+            flight_said[what] = flight_as(user, t)
+        info["refused over HTTP"] = {w: [s, t[:160]] for w, (s, t) in http_said.items()}
+        info["refused over Kafka"] = {w: [c, m[:160]] for w, (c, m) in kafka_said.items()}
+        info["refused over Kafka's PLAIN"] = {w: [c, m[:160]] for w, (c, m) in plain_said.items()}
+        info["refused over Postgres"] = {w: (v[:160] if isinstance(v, str) else v) for w, v in pg_said.items()}
+        info["refused over Flight"] = {w: (v[:160] if isinstance(v, str) else v) for w, v in flight_said.items()}
+        checks["refused over HTTP with 401, the body saying why: expired, not yet valid, another audience or issuer, unverified email, alg none, HS256, a stranger's key, a user made nowhere"] = \
+            all(st == 401 and phrase_of[w] in text for w, (st, text) in http_said.items())
+        checks["refused over Kafka's OAUTHBEARER and PLAIN (the token as the password) with 58, the message saying why, for each of the same"] = \
+            all(code == 58 and phrase_of[w] in msg for said in (kafka_said, plain_said) for w, (code, msg) in said.items())
+        # (a user made nowhere is asked for SCRAM, as any name that isn't a user is: the port never sees its token)
+        checks["refused over Postgres for each, the error saying why: password authentication failed for the user, and the reason (but for a user made nowhere)"] = \
+            all(isinstance(v, str) and "password authentication failed" in v.lower() and (phrase_of[w] in v or w == "a user made nowhere") for w, v in pg_said.items())
+        checks["refused over Flight for each, the handshake's error saying why"] = \
+            all(isinstance(v, str) and phrase_of[w] in v for w, v in flight_said.items())
+        eve_t = token_for(eve)
+        eve_who, eve_read = whoami(bearer_of(eve_t)), read_t(bearer_of(eve_t))
+        checks["a token for eve@acme.com (made here, granted nothing on t) signs in, and its SELECT of t is refused: permission denied"] = \
+            eve_who == (200, eve) and eve_read[0] != 200 and "permission denied" in str(eve_read[1])
+        mismatch = whoami({"Authorization": basic(ana, eve_t)})
+        checks["Basic as ana with eve's token is refused (401): a token signs in only the user it names"] = mismatch[0] == 401
+
+        # 6. USERS 'any': anyone the provider vouches for signs in, with public's grants and the roles its claim names
+        # that are roles here (a claimed name that is a login user gives nothing).
+        setup = [reply(P, "POST", "/sql", q.encode(), headers=bearer)[0] for q in (
+            "CREATE ROLE analysts", "GRANT SELECT ON t TO analysts", "CREATE USER boss PASSWORD 'boss-password-1'", "GRANT SELECT ON t TO boss")]
+        info["setup, USERS any"] = setup
+        asks = srv.idp.stats["jwks_fetches"]
+        replaced = reply(P, "POST", "/sql", f"CREATE OR REPLACE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), USERS 'any', ROLES_CLAIM 'groups')".encode(), headers=bearer)
+        asked_at = time.time()  # (the node asked its issuer before it answered: a minute counts from here)
+        info["CREATE OR REPLACE"] = [replaced[0], srv.idp.stats["jwks_fetches"] - asks]
+        cy_groups, cy_none = token_for(cy, {"groups": ["analysts"]}), token_for(cy)
+        cy_nosuch, cy_boss = token_for(cy, {"groups": ["nosuchrole"]}), token_for(cy, {"groups": ["boss"]})
+        cy_seen = [whoami(bearer_of(cy_groups)), read_t(bearer_of(cy_groups)), pg_as(cy, cy_groups)]
+        info["USERS any: cy with groups [analysts]: /whoami, HTTP read, Postgres read"] = [cy_seen[0], cy_seen[1][0], str(cy_seen[1][1])[:120], str(cy_seen[2])[:160]]
+        checks["USERS 'any': cy@acme.com, with no user made here, signs in with groups [analysts] and reads t over HTTP and Postgres"] = \
+            replaced[0] == 200 and cy_seen[0] == (200, cy) and cy_seen[1] == (200, [{"x": 1}]) and cy_seen[2] == [(1,)]
+        others = {w: (whoami(bearer_of(t)), read_t(bearer_of(t))) for w, t in (("no groups", cy_none), ("nosuchrole", cy_nosuch), ("boss, a login user", cy_boss))}
+        info["USERS any: the other tokens"] = {w: [who, rd[0], str(rd[1])[:120]] for w, (who, rd) in others.items()}
+        checks["…without groups, or naming nosuchrole or boss (a login user), cy signs in but reads nothing of t"] = \
+            all(who == (200, cy) and rd[0] != 200 and "permission denied" in str(rd[1]) for who, rd in others.values())
+
+        # 7. Keys. A provider's keys are kept an hour, and asked again when a token names a kid they lack, at most once a
+        # minute: a new key signs in once a minute has passed since the node last asked, and a key the provider drops
+        # is refused once the node has asked again.
+        old = token_for(ana)  # signed by rsa1, the key the provider drops below
+        asks = srv.idp.stats["jwks_fetches"]
+        srv.idp.rotate({"drop_old": True})  # from now on only the newest RSA key and ec1 are published
+        new = token_for(ana)  # signed by the new key (rsa2)
+        dropped_meanwhile = whoami(bearer_of(old))  # (the node still has rsa1, as its keys are kept an hour: ADR-074 §2)
+        new_early = whoami(bearer_of(new))
+        info["keys"] = {"a dropped key, before the node asks again": dropped_meanwhile, "a new key, within a minute of the last ask": [new_early[0], str(new_early[1])[:160]]}
+        checks["a new key is refused at once while the node asked for its keys less than a minute ago, saying so"] = \
+            new_early[0] == 401 and "has no key rsa2" in new_early[1] and "less than a minute ago" in new_early[1]
+        time.sleep(max(0.0, asked_at + 61 - time.time()))  # a minute since the node last asked
+        before_flood = srv.idp.stats["jwks_fetches"]
+        flood = [reply(P, "GET", "/whoami", headers=bearer_of(srv.idp.mint({"alg": "ES256", "kid": f"nope-{i}", "sign_with": "stranger",
+                 "claims": {"aud": "pondra", "email": ana, "email_verified": True}}))) for i in range(20)]
+        flood_asks = srv.idp.stats["jwks_fetches"] - before_flood
+        checks["20 tokens whose kids the keys lack are each refused, saying which kid is missing, and the node asks the provider at most once more"] = \
+            all(f[0] == 401 and f"nope-{i}" in f[2] for i, f in enumerate(flood)) and flood_asks <= 1
+        new_now = whoami(bearer_of(new))
+        checks["…then the new key signs ana in, the node having asked for its keys once in all"] = new_now == (200, ana) and srv.idp.stats["jwks_fetches"] - asks == 1
+        old_now = whoami(bearer_of(old))
+        checks["a key the provider dropped is refused once the node has asked for its keys again"] = old_now[0] == 401 and "has no key rsa1" in old_now[1]
+
+        # 8. Pondra's own tokens, the admin token and a password user are as they were; what a token's sign-in costs.
+        now_t = token_for(ana)
+        times = []
+        for _ in range(200):
+            t0 = time.perf_counter()
+            reply(P, "GET", "/whoami", headers=bearer_of(now_t))
+            times.append(time.perf_counter() - t0)
+        info["GET /whoami with a token: median of 200, ms"] = round(statistics.median(times) * 1000, 2)
+        pondra_t = call(P, "POST", "/sql", b'CREATE TOKEN ana_pondra FOR USER "ana@acme.com"', headers=bearer)["token"]
+        checks["a Pondra token for ana (CREATE TOKEN), the admin token and a password user (al, with its password) still sign in as before"] = \
+            whoami(bearer_of(pondra_t)) == (200, ana) and reply(P, "POST", "/sql", b"SELECT 1 AS one", headers=bearer)[0] == 200 \
+            and whoami({"Authorization": basic("al", "al-password-1")}) == (200, "al")
+
+        # 8b. Two providers of one issuer: a listed one first in name order (aaa) doesn't hide acme's USERS 'any'.
+        made_aaa = reply(P, "POST", "/sql", f"CREATE IDENTITY PROVIDER aaa (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'))".encode(), headers=bearer)[0]
+        cy_now = token_for(cy, {"groups": ["analysts"]})
+        shadow = [whoami(bearer_of(cy_now)), read_t(bearer_of(cy_now)), whoami(bearer_of(token_for(ana)))]
+        dropped_aaa = reply(P, "POST", "/sql", b"DROP IDENTITY PROVIDER aaa", headers=bearer)[0]
+        info["two providers of one issuer: made, cy's /whoami, cy's read, ana's /whoami, dropped"] = [made_aaa, shadow[0], shadow[1][0], str(shadow[1][1])[:120], shadow[2], dropped_aaa]
+        checks["two providers of one issuer, aaa (listed) before acme (USERS 'any'): cy, made nowhere, still signs in and reads t, and ana too"] = \
+            made_aaa == 200 and shadow[0] == (200, cy) and shadow[1] == (200, [{"x": 1}]) and shadow[2] == (200, ana) and dropped_aaa == 200
+
+        # 9. DROP: the provider's tokens stop at once, and the lake stays signed.
+        before_drop = whoami(bearer_of(now_t))
+        call(P, "POST", "/sql", b"DROP IDENTITY PROVIDER acme", headers=bearer)
+        after_drop = whoami(bearer_of(now_t))
+        gone = json.loads(reply(P, "GET", "/sso")[2])["providers"]
+        meta_gone = reply(P, "GET", "/.well-known/oauth-protected-resource")[0]
+        mcp_gone = reply(P, "POST", "/mcp", mcp_body, headers={"content-type": "application/json"})
+        info["after DROP"] = {"before": before_drop, "after": [after_drop[0], str(after_drop[1])[:160]], "/sso": gone, "metadata": meta_gone,
+                              "MCP 401 header": mcp_gone[1].get("www-authenticate"), "MCP status": mcp_gone[0]}
+        checks["DROP IDENTITY PROVIDER acme: a token that signed in just before is refused (401), GET /sso lists none, the metadata is 404, and MCP's 401 names none"] = \
+            before_drop == (200, ana) and after_drop[0] == 401 and gone == [] and meta_gone == 404 and "resource_metadata" not in mcp_gone[1].get("www-authenticate", "")
+        stop(node)
+        bare = Node(lake, P).start()  # no token, on a lake served with tokens: it must not open
+        started.append(bare)
+        checks["…and the lake stays signed: a node started with no token answers an unsigned request with 401, and /stats says signed"] = \
+            reply(P, "POST", "/sql", b"SELECT 1 AS one")[0] == 401 and json.loads(reply(P, "GET", "/stats")[2]).get("signed") is True
+    finally:
+        for n in started:
+            n.kill()
+        fake_idp.stop(srv)
+    ok = all(checks.values())
+    print(json.dumps({"sso": checks, "ok": ok, "info": info}, indent=1, default=str))
     return ok
 
 
@@ -13135,7 +13422,7 @@ def bi():
 # The object kinds `registry()` doesn't make itself, and where each is checked (grepped: each named
 # section or tool makes the kind and asserts on it). A kind added to KINDS without a check fails there.
 ELSEWHERE = {"external table": "harness.py external", "type": "harness.py enums", "secret": "harness.py secrets", "user": "harness.py users",
-             "database": "this section's branches, environments_check.py", "share": "sharing_check.py", "recipient": "sharing_check.py"}
+             "database": "this section's branches, environments_check.py", "share": "sharing_check.py", "recipient": "sharing_check.py", "identity provider": "harness.py sso"}
 
 
 def registry():
@@ -16847,14 +17134,17 @@ def pkey():
     Two rows of one key in one INSERT (VALUES and SELECT) are refused whole, and CREATE TABLE … AS SELECT
     with two rows of one key leaves no table. A deleted key is free again (before and after tiering), a
     transaction's COMMIT refuses a key it holds, and an order_by table is keyed too. The upserts keep
-    upserting: ON CONFLICT, INSERT OR REPLACE and OR IGNORE, MERGE, /append, COPY FROM STDIN and a Kafka
-    produce. A plain INSERT takes its keys' row locks on the leader (`txn::autocommit_as`): two nodes
+    upserting: ON CONFLICT, INSERT OR REPLACE and OR IGNORE, a MERGE's matched rows, /append, COPY FROM
+    STDIN and a Kafka produce. A plain INSERT takes its keys' row locks on the leader (`txn::autocommit_as`): two nodes
     inserting the same new key at once, the second waits for the first and is refused (at its INSERT, as
     Postgres does). A transaction's plain INSERT is refused at its statement when the key is held as the
     transaction sees it (its own kept writes count; a SAVEPOINT can roll the refusal back), and COMMIT checks
     again: a change moving a key onto a held one is refused, and a DELETE and an INSERT of one key in one
     transaction keep the new row. An UPDATE of a key column is refused by name (0A000), so a key moves by a
-    DELETE and an INSERT. A CREATE TABLE … AS SELECT refused by its key is purged, not kept for UNDROP."""
+    DELETE and an INSERT. A CREATE TABLE … AS SELECT refused by its key is purged, not kept for UNDROP.
+    A MERGE's inserted keys must be new as a plain INSERT's are (23505, on a follower too, and in a
+    transaction at COMMIT), though a MERGE matched on the key still updates and inserts; a MERGE that SETs
+    a key column is refused by name (0A000)."""
     import psycopg, concurrent.futures as cf, urllib.request
     import adbc_driver_flightsql.dbapi as adbc
     import confluent_kafka as ck
@@ -16957,6 +17247,62 @@ def pkey():
     got = names()
     info["upserts"] = got
     checks["ON CONFLICT DO UPDATE and DO NOTHING, INSERT OR REPLACE and OR IGNORE, MERGE still upsert"] = got[1] == "merged" and got[2] == "bob v2"
+
+    # A MERGE's inserted keys must be new, as a plain INSERT's are (`change::run`): one that matches on another column looks
+    # each inserted key up, one that matches on the key alone, in the key's own type, checks its own new rows. A MERGE
+    # matched on the key still updates and inserts (dbt's shape), and a SET of a key column is refused by name (0A000).
+    q("CREATE TABLE mrg (id BIGINT PRIMARY KEY, v VARCHAR)")
+    q("INSERT INTO mrg VALUES (7001, 'a'), (7002, 'b'), (7003, 'c')")
+    mrg_rows = lambda port=P: {r["id"]: r["v"] for r in q("SELECT id, v FROM mrg", port)}
+    for _ in range(100):  # (the follower sees the table and its rows once the commit reaches it)
+        if set(mrg_rows(P + 1)) == {7001, 7002, 7003}:
+            break
+        time.sleep(0.1)
+    mrg_before = mrg_rows()
+    mrg_v = err("MERGE INTO mrg t USING (SELECT 7002 AS id, 'zz' AS v) s ON t.v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
+    mrg_follower = err("MERGE INTO mrg t USING (SELECT 7003 AS id, 'mm' AS v) s ON t.v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)", P + 1)
+    mrg_two = err("MERGE INTO mrg t USING (SELECT 7004 AS id, 'p' AS v UNION ALL SELECT 7004, 'q') s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
+    mrg_conflict = err("INSERT INTO mrg VALUES (7003, 'yy') ON CONFLICT (v) DO NOTHING")
+    mrg_after_refusals = mrg_rows()
+    info["merge_inserts"] = [mrg_v, mrg_follower, mrg_two, mrg_conflict, mrg_after_refusals]
+    checks["a MERGE that inserts a key the table holds is refused (23505) and changes no row: matched on another column (on a follower too), two source rows of one new key, ON CONFLICT on another column"] = \
+        refused(mrg_v) and refused(mrg_follower) and refused(mrg_two) and refused(mrg_conflict) and mrg_after_refusals == mrg_before == {7001: "a", 7002: "b", 7003: "c"}
+
+    # In a transaction the MERGE's insert is refused at COMMIT (its statement can't see the key it writes): the row stays
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        try:
+            cur.execute("MERGE INTO mrg t USING (SELECT 7002 AS id, 'tt' AS v) s ON t.v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
+            cur.execute("COMMIT")
+            mrg_txn = None
+        except psycopg.Error as e:
+            mrg_txn = e.sqlstate  # (the transaction is over: nothing to roll back)
+    info["merge_txn"] = [mrg_txn, mrg_rows().get(7002)]
+    checks["a MERGE in a transaction that inserts a key the table holds: refused (23505), and the row is as it was"] = mrg_txn == "23505" and mrg_rows()[7002] == "b"
+
+    # A key the ON compares in another type: 7002.5 against BIGINT's keys compares as decimals and matches no row, yet the
+    # inserted value is cast to the key's type (7002), a row that's there. Such a MERGE is checked by lookups.
+    mrg_dec = err("MERGE INTO mrg t USING (SELECT 7002.5 AS id, 'y' AS v) s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
+    info["merge_decimal"] = [mrg_dec, mrg_rows()]
+    # An INSERT's value is cast to the key's type before its conflict is checked (as Postgres does): 7003.5 is the key 7003,
+    # which is held, so DO NOTHING keeps its row (Pondra's cast truncates, Postgres rounds: 7004 there).
+    ins_nothing = err("INSERT INTO mrg SELECT 7003.5 AS id, 'y' AS v ON CONFLICT (id) DO NOTHING")
+    info["merge_decimal_nothing"] = [ins_nothing, mrg_rows()]
+    checks["a MERGE that compares a key in another type (7002.5 against BIGINT) and inserts it: refused (23505), the table as it was; an INSERT of 7003.5 ON CONFLICT DO NOTHING keeps 7003"] = \
+        refused(mrg_dec) and mrg_rows() == {7001: "a", 7002: "b", 7003: "c"} and ins_nothing[0] == 200
+
+    mrg_dbt = q("MERGE INTO mrg t USING (SELECT 7001 AS id, 'a2' AS v UNION ALL SELECT 7005, 'e') s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
+    mrg_key_set = err("MERGE INTO mrg t USING (SELECT 7001 AS id) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET id = 7009")
+    info["merge_dbt"] = [mrg_dbt, mrg_key_set, mrg_rows()]
+    checks["a MERGE matched on the key updates and inserts (dbt's shape); a SET of the key is refused by name (0A000), the table unchanged"] = \
+        mrg_rows() == {7001: "a2", 7002: "b", 7003: "c", 7005: "e"} and mrg_key_set[1] == "0A000" and mrg_rows()[7001] == "a2"
+
+    # An INSERT of 7003.5 with ON CONFLICT DO UPDATE takes the cast key too: it updates 7003 (counted as updated), no row is inserted
+    ins_update = q("INSERT INTO mrg VALUES (7003.5, 'u') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
+    info["merge_decimal_update"] = [ins_update, mrg_rows()]
+    checks["an INSERT of 7003.5 with ON CONFLICT DO UPDATE updates 7003 (counted as updated, none inserted), the other rows as they were"] = \
+        ins_update.get("updated") == 1 and ins_update.get("inserted") == 0 and mrg_rows() == {7001: "a2", 7002: "b", 7003: "u", 7005: "e"}
 
     # Loading doors: still upserts
     post = err('{"id": 1, "name": "append"}\n', P, "/append/people")
@@ -17486,7 +17832,7 @@ def memorylake():
 # About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
 # prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
 # suite in parts side by side that end together. A section not listed counts as 5 s.
-SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20, "guesses": 30, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
+SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20, "sso": 83, "guesses": 30, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "measures": 120, "facts": 90, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
         "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "ddlgaps": 40, "sqla": 30, "unique_doors": 60, "pkey": 60, "memorylake": 60}
@@ -17494,7 +17840,7 @@ SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20,
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -17526,7 +17872,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "memorylake"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "memorylake"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -17539,7 +17885,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "memorylake": memorylake}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "memorylake": memorylake}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

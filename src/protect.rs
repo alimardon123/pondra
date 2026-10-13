@@ -146,7 +146,8 @@ fn users(c: &crate::users::Change) -> Vec<Touch> {
     match c {
         Change::Alter { name, .. } | Change::Drop { name, .. } => vec![Touch::Roles(vec![name.clone()])],
         Change::Grant { to: roles, .. } | Change::Revoke { from: roles, .. } => vec![Touch::Roles(roles.clone())],
-        Change::Create { .. } | Change::GrantRole { .. } | Change::RevokeRole { .. } | Change::CreateToken { .. } | Change::DropToken { .. } => vec![],
+        Change::Create { .. } | Change::GrantRole { .. } | Change::RevokeRole { .. } | Change::CreateToken { .. } | Change::DropToken { .. }
+        | Change::CreateProvider { .. } | Change::DropProvider { .. } => vec![],
     }
 }
 

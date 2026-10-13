@@ -11,7 +11,7 @@ use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 use datafusion::arrow::compute::concat_batches;
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{self, Statement};
@@ -457,6 +457,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     }
     if let Some(s) = kinds.then(|| crate::users::statement(sql)).flatten() {
         return Some(s); // (CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN: `users.rs`)
+    }
+    if let Some(s) = kinds.then(|| crate::sso::statement(sql)).flatten() {
+        return Some(s); // (CREATE and DROP IDENTITY PROVIDER: `sso.rs`)
     }
     if let Some(s) = kinds.then(|| crate::ext::statement(sql)).flatten() {
         return Some(s); // (CREATE SECRET: values of any kind; DROP SECRET)
@@ -1202,6 +1205,11 @@ pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<R
     let batches = crate::query::sql(ctx, &crate::asof::rewrite(&crate::routines::rows_apart(sql))?).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok(RecordBatch::new_empty(target)) };
     let all = concat_batches(&first.schema(), &batches)?;
+    fit(&target, &all)
+}
+
+/// A query's rows as the table's columns, in its order and types (`rows`, and the literal rows of `literals.rs`).
+pub fn fit(target: &SchemaRef, all: &RecordBatch) -> Result<RecordBatch> {
     // An UPDATE's rows end with the ids they keep (`sys.rs`): those go along, by name.
     let kept: Vec<usize> = (0..all.num_columns()).filter(|&i| [crate::sys::ROW_ID, crate::sys::CREATED].contains(&all.schema().field(i).name().as_str())).collect();
     let values: Vec<usize> = (0..all.num_columns()).filter(|i| !kept.contains(i)).collect();
@@ -1219,6 +1227,19 @@ pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<R
     fields.extend(ids.schema().fields().iter().cloned());
     columns.extend(ids.columns().iter().cloned());
     Ok(RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), columns)?)
+}
+
+/// An INSERT's rows into `meta`'s table, from `sql` (its rows' query). A `VALUES` of literals is built here as
+/// DataFusion would plan it, with no session (`literals.rs`); anything else is planned in a session of `lake` as
+/// of `upto` (`files`: this machine's files too), as `rows` plans it.
+pub async fn rows_of(lake: &Lake, meta: &TableMeta, sql: &str, upto: Option<u64>, files: bool) -> Result<RecordBatch> {
+    let target = schema(&meta.columns)?;
+    if let Some(all) = crate::literals::literal_rows(sql, &target) {
+        return fit(&target, &all);
+    }
+    let ctx = crate::query::session_at(lake, sql, "", upto).await?;
+    let ctx = if files { ctx.enable_url_table() } else { ctx };
+    rows(&ctx, meta, sql).await
 }
 
 /// An INSERT's `VALUES` with each value for a DOUBLE, REAL or DECIMAL column cast to that column's
@@ -1662,7 +1683,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         _ => bail!("UPDATE and DELETE need a keyed table (append tables only take INSERTs)"),
     };
     let meta = meta.expect("a table");
-    let batch = rows(&open(session(lake, &sql, "").await?), &meta, &sql).await?;
+    let batch = rows_of(lake, &meta, &sql, None, files).await?;
     crate::returning::wrote(&[], std::slice::from_ref(&batch));
     let n = batch.num_rows();
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
@@ -2046,7 +2067,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
     match (meta, stmt) {
         (Some(m), _) if log => {
             let sql = rows_sql(&m, stmt)?;
-            let batch = rows(&open(session(query, &sql, "").await?), &m, &sql).await?;
+            let batch = rows_of(query, &m, &sql, None, files).await?;
             crate::defaults::check(&m, table, &batch)?; // (NOT NULL: as a node's own log checks its rows)
             if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && crate::constraints::key_checked(s)) {
                 if sent(target, job).await? {

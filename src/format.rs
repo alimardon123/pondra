@@ -25,7 +25,9 @@ use std::time::Duration;
 /// 3: the lake's own keys sealed by its master key (`users::Kept`, ADR-058).
 /// 4: a grant on another database (`users::On::Database`, `GRANT CLONE ON DATABASE`), which a node
 /// from before can't read: it took the lake for one nobody signs in to.
-pub const FORMAT: u32 = 4;
+/// 5: an identity provider (`sso::Provider`, ADR-074), which a node from before ignores: it takes the
+/// provider's tokens for nobody's and, with no other user, the lake for one nobody signs in to.
+pub const FORMAT: u32 = 5;
 
 /// The format every lake gets without asking: the mark itself (`raise`).
 const BASE: u32 = 1;
