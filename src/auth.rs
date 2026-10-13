@@ -358,7 +358,7 @@ impl Auth {
             "files" => Role::Write,
             "" | "console" => Role::None, // (the console's page and files: they hold no data, and ask for a token)
             "stats" | "healthz" | "ready" => Role::None, // (health checks: load balancers and the tests poll them)
-            "login" | "whoami" => Role::None, // (signing in; and who one is)
+            "login" | "whoami" | "sso" | ".well-known" => Role::None, // (signing in, and where to: ADR-074; and who one is)
             "secrets" => Role::None, // (a procedure's lent token only: `server::secret`)
             "v1" if method == "POST" || method == "DELETE" => Role::Write, // (another engine's append: ADR-028; its tables made, dropped and renamed: ADR-029, as the SQL's rights say)
             "sql" | "lookup" | "watch" | "live" | "sessions" | "mcp" | "v1" | "metrics" | "routines" | "objects" | "kinds" | "plan" | "apply" | "test" | "status" | "capture" | "export" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog; an apply, not its plan, needs an admin: `apply::ask`)
