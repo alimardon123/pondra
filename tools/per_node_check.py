@@ -43,6 +43,7 @@ PROCESS = {
     "audit.rs:C": SETTING + " (PONDRA_AUDIT)",
     "cache.rs:OUTSIDE": "files outside the lakes, kept by the version each was listed at (invariant 96): nothing of a lake's own",
     "cluster.rs:CLIENT": "a client with no token (`http_bare`): only its keep-alive sockets",
+    "codes.rs:SEEN": "the SQLSTATE codes other nodes answered with, each kept once as a &'static: the same five letters for every node",
     "console.rs:FILES": "the console's files, built into the binary",
     "console.rs:PAGE": "the console's page, built into the binary",
     "console.rs:SERVER": "the server's page, built into the binary",
