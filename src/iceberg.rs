@@ -330,6 +330,16 @@ fn forget(st: &mut Published) -> Vec<(Value, String)> {
     std::mem::take(&mut st.snapshots)
 }
 
+/// Whether a published table names a place other than this lake's (the lake was moved or copied: invariant
+/// 310), from the catalog alone, so a leader starting on a lake that stayed where it was loads no manifests.
+pub async fn elsewhere(lake: &Lake) -> bool {
+    let here = lake.full("data/");
+    match lake.cat.scan::<Published>("i/", "i0").await {
+        Ok(published) => published.iter().any(|(_, st)| !st.location.is_empty() && !st.location.starts_with(&here)),
+        Err(_) => true, // (unread: the pass finds out)
+    }
+}
+
 /// One Iceberg manifest added by version `v` (snapshot `id`): `files` (`content` 0), or the
 /// position-delete files that name them (1), each with its partition (under the layout's spec;
 /// a delete file holds one partition's, as the files it names do). A file an earlier version

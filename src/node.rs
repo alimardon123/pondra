@@ -302,9 +302,13 @@ impl Node {
         }
         if cluster.is_leader() && !cluster.reader && !backup::frozen(&lake) {
             // (a lake opened somewhere it didn't publish from — moved by SET LOCATION, or copied — publishes its
-            // Iceberg tables here at once: `iceberg::Published::location`; for the rest a pass that finds nothing new)
+            // Iceberg tables here at once: `iceberg::Published::location`. Only then: the pass loads every
+            // published table's manifests, and a lake that stayed where it was has nothing new for it)
             let (a, l) = (app.clone(), lake.clone());
             panics::task(async move {
+                if !crate::iceberg::elsewhere(&l).await {
+                    return;
+                }
                 let _lock = a.lock.lock().await; // (the lock tiering publishes under: `server::tier_all`)
                 if let Err(e) = crate::delta::publish_all(&l).await {
                     eprintln!("publishing at start: {e:#}");
