@@ -181,7 +181,7 @@ def main():
         made = deltas["write"]
         if not A.s3 or time.time() - last_list > 1800:
             listed, last_list = objects(lake), time.time()
-        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "requests_per_s": rates, "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "queries": {p: [int(g.get("pondra_queries_running", 0)), int(g.get("pondra_queries_waiting", 0))] for p, g in got.items()}, "reads": load.reads[0], "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
+        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "requests_per_s": rates, "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "queries": {p: [int(g.get(f"pondra_queries_{k}", 0)) for k in ("running", "waiting", "total")] + [int(g.get("pondra_query_errors_total", 0))] for p, g in got.items()}, "reads": load.reads[0], "hwm": {x.port: hwm_of(x) for x in live}, "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
                 "untiered_rows": stats.get("untiered_rows"), "commit_ms_p95": stats.get("commit_ms_p95"),
                 "longest_ack_s": load.longest(mark), "acked": sum(load.acked.values()),
                 "torn": len(load.torn), **({"objects": listed} if listed else {})}
@@ -291,6 +291,14 @@ def remove(lake):
         keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
         if keys:
             s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+
+
+def hwm_of(x):
+    """The newest commit a node has heard of (`/stats`), or None: a follower whose stream stopped stays put."""
+    try:
+        return x.get("/stats", timeout=5)["hwm"]
+    except Exception:
+        return None
 
 
 def role_or(x, role):
