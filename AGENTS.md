@@ -20,7 +20,7 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~62,500 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650; Python functions, procedures on workers, the run log and tasks, round 24, 1,400; outside appends, live queries, temporary tables, answers kept and changes across lakes, round 25, 1,200; other engines' changes as written, round 28, 1,300).
+5. **Short, simple, readable code** — without losing functionality. ~82,000 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650; Python functions, procedures on workers, the run log and tasks, round 24, 1,400; outside appends, live queries, temporary tables, answers kept and changes across lakes, round 25, 1,200; other engines' changes as written, round 28, 1,300).
    If a change makes a file much longer, look for the simpler shape first.
 6. **Scale-out is the point** (the owner, 2026-09-27): running across machines is what sets
    Pondra apart from single-node engines (DuckDB, Polars, Daft, Bodo) and makes it leaner than
@@ -65,7 +65,7 @@ The owner's design principles, which every change must respect:
 ## Layout
 
 ```
-src/      62,500 lines of Rust in 108 files, one per concern (see the table in README.md); `lib.rs` lists
+src/      82,000 lines of Rust in 131 files, one per concern (see the table in README.md); `lib.rs` lists
           the modules: the ones every build has (`finish`, `fsum`, `avg`, `intervals`, `xlsx`, …: no lake, so a
           browser build shares them) and the rest under feature `server` (on by default: the node);
           `cli.rs` is the command line (its subcommands and what each starts) and `main.rs` sets the
@@ -123,7 +123,8 @@ python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node)
           (`frame.py`, Polars' names), `spark/` (PySpark's names), `worker.py` (a node's warm
           Python worker: functions' batches and procedures' calls, ADR-027), `plpy.py` (PL/Python's
           `plpy`), `magic.py` (`%%sql`), `__main__.py` (`python -m pondra`, and `--add-to-path`),
-          `inprocess.py` (`pondra.open()` over the library); without pyarrow, rows come as JSON (ADR-024)
+          `inprocess.py` (`pondra.open()` over the library), `dbapi.py` (PEP 249 over `connect()`),
+          `dialect.py` (SQLAlchemy's dialects and Alembic's), `dbt-pondra/` (dbt's adapter); without pyarrow, rows come as JSON (ADR-024)
 install.sh, install.ps1   the one-line installers each release carries (ADR-024)
 deploy/   the container image (docker/Dockerfile; tools/image.py lays out its context), a compose
           cluster (compose/) and the Helm chart (helm/pondra); ADR-041
@@ -2498,6 +2499,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and no routine's code…", "S27, beyond the listings…" (both fail on the build before),
    "…a user granted APPLY on this database (it deploys them) is shown routines' code and the export", "…nor in a
    failed call's error…".
+   Postgres's catalog (`pg_catalog::lakes`: `pg_class`, `pg_attribute`, `information_schema`, on the
+   port and over `?catalog=postgres`) keeps the same rule, columns granted one by one included
+   (`harness.py sqla`: "a user granted one table and one column of another…").
 
 383. **On Linux a node gives memory back** (`main.rs` for the program, `capi/src/lib.rs` for the library that
    the packages' `pondra` and `connect()` run: jemalloc with its background threads, dlopen's thread-locals;
@@ -2536,6 +2540,49 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`pg_types::typed`, oid 2950), and Describe and the answer agree. `harness.py uuids`: "SQL reads
    upper case, braces and no hyphens as Postgres does…" (a key lookup found nothing before
    `serve::point` read its key so), "what isn't a uuid … is refused 22P02 by every write door…".
+
+399. **The Postgres port names an answer's columns as Postgres 16 does, and never names one wrongly**
+   (`pg_names.rs`, `pg_types::columns`, `pg_names::shown`). The names come from the statement as
+   written: its SELECT list (the leftmost of a set operation) or RETURNING, by Postgres's
+   `FigureColname` (`count(*)` is `count`, `1` is `?column?`, a cast takes its type's name). They go
+   into each field's metadata (`pg_name`), so rows, plans and the other doors keep DataFusion's names.
+   Where a name's place can't be known (two runs of `*`, a count that doesn't fit), the answer keeps
+   DataFusion's names. A Describe names its columns as running the statement does. `harness.py
+   colnames`: Postgres 16's names over psycopg three ways (extended, prepared, simple), the rows as HTTP
+   answers them.
+
+400. **The Postgres port remembers an answer as HTTP does, from one definition** (`App::remembers`,
+   `App::remembered`, `pg::answer`): the same statement as bound, at the same catalog version, gets the
+   same answer, and identical statements asking at once share one run. Never inside a transaction, never
+   for what may answer otherwise (`remembers`' list), never for a user granted some tables. An answer
+   over 1 MB is its caller's alone. `harness.py remembered`: one run for five asks from two connections,
+   a commit, a transaction's own write, now() and temporary tables, a setting, parameters in text and
+   binary, a user's grants.
+
+405. **A temporary secret only an admin or the node's owner made reaches past the public internet**
+   (`public.rs`, `ext::temporary`, `For::Public`): anyone else's is refused `PROVIDER credential_chain`
+   (the node's own credentials) and `TYPE kafka` when made. Its stores ask only public addresses: one
+   written in the URL or as an endpoint is checked at build and at each statement (`public::check`), a
+   name as it resolves (`Names`: refused if any address isn't public) and every redirect (`Connector`).
+   A session holding one runs its queries on its node (`temp::holds_secrets` in `App::here_only`): a
+   spread query's shares have no session and would register stores without it. Behind an `HTTP(S)_PROXY`
+   the proxy resolves names. `harness.py reached`.
+
+406. **A scope covers a URL whole or followed by `/`, `?` or `#`** (`ext::within`, wherever a secret's
+   scope is matched): `http://127.0.0.1:979` isn't port 9790, `s3://data` isn't `s3://data-other`.
+   `harness.py reached`, `cargo test --lib ext::`.
+
+407. **What a Kafka door reads is bounded before it is held** (`kafka::decompress`, `MOST`): a produce
+   request's batches 256 MB decompressed in all, a fetched batch 256 MB, a batch's records as many as
+   its bytes can hold, and a request before sign-in 1 MB. `cargo test --lib kafka::`.
+
+408. **A load asks the grants of what it does** (`auth::check_load`, `check_changes`): every row door
+   (`/append`, Flight's DoPut, Kafka's produce, Postgres's `COPY`) asks INSERT, UPDATE too for a keyed
+   table's rows (they replace a held key's, as Postgres asks UPDATE for `ON CONFLICT DO UPDATE`), and
+   DELETE for rows marked `_deleted` (a tombstone, a Debezium delete). Another engine's commit through
+   the Iceberg catalog asks DELETE when it takes files out or adds deletes, and UPDATE when it upserts
+   into a keyed table (`iceberg::prepare`). A token's role and the node's own work ask nothing more.
+   `harness.py guarded`: "S11: …" (both fail without it).
 
 ## Tests: run these before and after any change
 
@@ -2592,6 +2639,13 @@ python3 tools/harness.py uuids          # UUID columns: every door's refusals (2
 python3 tools/harness.py constraints    # UNIQUE from every door and three nodes at once (23505), NOT ENFORCED facts, ADD/DROP CONSTRAINT, SHOW CREATE, the Postgres catalog
 python3 tools/harness.py pkey           # a plain INSERT of a held key: 23505 at every door, two nodes at once, transactions and savepoints, upserts still upsert, CTAS, pondra sql
 python3 tools/harness.py returning      # INSERT/UPDATE/DELETE … RETURNING at every door == Postgres: ORMs (Django, SQLAlchemy), keys, UNIQUE, upserts, transactions, a follower, jobs (55000), grants (42501)
+python3 tools/harness.py colnames       # the Postgres port names answer columns as Postgres 16 does, three protocols, rows == HTTP's
+python3 tools/harness.py remembered     # the Postgres port's remembered answers: once for identical asks, a commit, transactions, now(), temp tables, settings, grants
+python3 tools/harness.py reached        # a reader's temporary secret reaches only public addresses (names as they resolve, redirects); scopes on a boundary
+python3 tools/harness.py sqla           # Postgres's catalog over HTTP (?catalog=postgres) == the port's; a user's grants in pg_class and information_schema
+python3 tools/sqla_check.py --bin <pondra> --lib <pondra_lib> [--postgres <url>]   # SQLAlchemy (ORM, Core, inspector, pandas, Alembic) and pondra.dbapi on every door == Postgres 16
+pytest python/dbt-pondra/tests           # dbt's adapter suite and the adapter's own (PONDRA_BIN: the node)
+python3 tools/serve_bench.py --tpch ~/tpch/sf1 [--cache] [--door pg] [--writes] [--alone 35]   # serving like Lakehouse//RT: TPC-H SF1 under 50 to 400 clients, answers == DuckDB's
 python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
 python3 tools/harness.py find           # pondra.parts and pondra.find at every door (HTTP, Postgres, MCP, Python, JavaScript), as each user may see them; 1,000 tables and 200 views
 python3 tools/harness.py measures       # measures in views: the query's own grain, BI's sum(m), three nodes, Postgres, frames, refusals, cost against the hand-written GROUP BY
