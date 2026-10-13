@@ -70,6 +70,7 @@ PROCESS = {
     "main.rs:ALLOC": "the allocator: one a process, the program's (ADR-061 §1)",
     "metrics.rs:RUNNING": "a gauge of the process's queries running now: a stopped node's last ones count themselves down (set back to 0, it would wrap)",
     "metrics.rs:WAITING": "a gauge of the process's queries waiting for a turn, as RUNNING",
+    "node.rs:MOVER": "the host's end of a lake's moves (`node::mover`): taken by each host before its node starts, so it outlives the node it starts; a stopped host's receiver closes it",
     "optimize.rs:NEXT": COUNTER,
     "panics.rs:NEXT": COUNTER,
     "panics.rs:R": "the queries' runtime, one a process (ADR-061 §4): the node's tasks on it end with the node, the runtime doesn't",

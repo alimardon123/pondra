@@ -235,6 +235,7 @@ pub enum Ddl {
     Pin { lake: String, ms: Option<u64>, #[serde(default, skip_serializing_if = "std::ops::Not::not")] lease: bool }, // a base's leader: keep the files a branch reads (lease: renewed by a branch on another server, let go when it isn't: `branch::lapse`)
     Unpin { lake: String },
     Refresh { database: Option<String>, tables: Vec<String> }, // ALTER DATABASE b REFRESH t, …: b's leader (ADR-047)
+    SetLocation { database: String, to: String }, // ALTER DATABASE m SET LOCATION 'dir': a lake in memory moved there (memory.rs)
     BackupDatabase { database: Option<String>, to: String, #[serde(default, skip_serializing_if = "Option::is_none")] retention_days: Option<u64> }, // BACKUP DATABASE [b] TO 'url': this lake's leader, beside its lock (ADR-070, `backup.rs`)
     RestoreDatabase { name: String, from: String, #[serde(default, skip_serializing_if = "Option::is_none")] dir: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] at: Option<u64> }, // RESTORE DATABASE b FROM 'url': a new lake, attached
     Backup(crate::backup::Take), // the backup's (or the restored lake's) leader: a run
@@ -465,6 +466,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Pin { lake: branch, ms, lease } => crate::branch::pin(lake, &branch, ms, lease).await,
         Ddl::Unpin { lake: branch } => crate::branch::unpin(lake, &branch).await,
         Ddl::Refresh { .. } => bail!("ALTER DATABASE … REFRESH is done by its database's leader (write::handle)"),
+        Ddl::SetLocation { .. } => bail!("ALTER DATABASE … SET LOCATION is done by its database's leader (memory::set_location)"),
         Ddl::BackupDatabase { .. } | Ddl::RestoreDatabase { .. } => bail!("BACKUP and RESTORE DATABASE are run by the leader beside its lock (write::ddl_here)"),
         Ddl::Backup(t) => crate::backup::take(lake, t).await,
         Ddl::Protect { database, on, by } => crate::protect::set(lake, &database, on, &by).await,

@@ -476,29 +476,48 @@ async fn run() -> anyhow::Result<()> {
             // this node ending): drained first (`drain.rs`; a second signal stops at once), then the
             // next node leads at once instead of waiting out the lease. Watched from before the node
             // starts, so a stop while it starts is seen too (invariant 46).
-            let mut stop = panics::spawn(stopped(stop_with_stdin));
-            let held = Arc::new(node::Held::default()); // (what the start takes, given back by a stop: `node.rs`)
-            let mut node = tokio::select! {
-                started = node::Node::start(node::Options { dir, listen: addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth }, held.clone()) => match started {
-                    Ok(node) => node,
-                    Err(e) => {
-                        held.stop().await; // (a start that fails gives back what it took too, as `Node::open` does: the next node leads at once)
-                        return Err(e);
+            // (a pinned future, not a task: `Node::stop` ends every task a node started, and a moved node
+            // starts again, so the selects below poll this one alone)
+            let mut stop = Box::pin(stopped(stop_with_stdin));
+            let mut moves = node::mover(); // (a lake moving to another place: `memory::set_location`)
+            let mut options = node::Options { dir, listen: addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth };
+            loop {
+                let held = Arc::new(node::Held::default()); // (what the start takes, given back by a stop: `node.rs`)
+                let mut node = tokio::select! {
+                    started = node::Node::start(options.clone(), held.clone()) => match started {
+                        Ok(node) => node,
+                        Err(e) => {
+                            held.stop().await; // (a start that fails gives back what it took too, as `Node::open` does: the next node leads at once)
+                            return Err(e);
+                        }
+                    },
+                    // (a node stopped while it starts gives back what it took so far, a leader its term, so
+                    // the next node leads at once; there is no drain here, since nothing serves yet)
+                    _ = &mut stop => {
+                        held.stop().await;
+                        std::process::exit(0);
                     }
-                },
-                // (a node stopped while it starts gives back what it took so far, a leader its term, so
-                // the next node leads at once; there is no drain here, since nothing serves yet)
-                _ = &mut stop => {
-                    held.stop().await;
-                    std::process::exit(0);
-                }
-            };
-            tokio::select! {
-                served = node.serving() => served?,
-                _ = &mut stop => {
-                    tokio::select! { _ = drain::drain() => {}, _ = stopped(false) => {} }
-                    node.stop().await;
-                    std::process::exit(0);
+                };
+                tokio::select! {
+                    served = node.serving() => {
+                        served?;
+                        break;
+                    }
+                    _ = &mut stop => {
+                        tokio::select! { _ = drain::drain() => {}, _ = stopped(false) => {} }
+                        node.stop().await;
+                        std::process::exit(0);
+                    }
+                    // The lake moves: its requests answered and the node stopped, its objects settled on the
+                    // target, and the node started again there, on the same port.
+                    Some(m) = moves.recv() => {
+                        drain::drain().await;
+                        node.stop().await;
+                        if let Err(e) = crate::memory::settle(&m).await {
+                            anyhow::bail!("moving the lake to {}: {e:#}", m.to);
+                        }
+                        options.dir = m.to;
+                    }
                 }
             }
         }

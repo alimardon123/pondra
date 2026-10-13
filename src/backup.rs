@@ -158,7 +158,7 @@ pub async fn statement(lake: &Lake, lock: &tokio::sync::Mutex<()>, d: Ddl) -> Re
 /// A backup or a restored lake goes in a place of its own: never inside this lake or one attached
 /// here, nor around one (their own collection of what they don't name would take its objects). A
 /// backup attached here, to be read, takes its next run.
-fn apart(lake: &Lake, to: &str) -> Result<()> {
+pub(crate) fn apart(lake: &Lake, to: &str) -> Result<()> {
     let mut lakes = vec![lake.arc()];
     lakes.extend(lake.attached.read().unwrap().iter().map(|(_, l)| l.clone()));
     for l in lakes.iter().filter(|l| !(l.url == to && frozen(l))) {
@@ -239,7 +239,7 @@ pub async fn restore(from: &str, to: &str, at: Option<u64>) -> Result<Value> {
 }
 
 /// Nothing at `dir` yet (a restore that fails takes away what it made there, and only that).
-async fn empty(dir: &str) -> Result<bool> {
+pub(crate) async fn empty(dir: &str) -> Result<bool> {
     if !dir.contains("://") {
         let path = std::path::Path::new(dir);
         return Ok(!path.exists() || std::fs::read_dir(path)?.next().is_none());

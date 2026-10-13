@@ -36,6 +36,35 @@ impl Options {
     }
 }
 
+/// A lake moving to another place (`memory::set_location`): the host stops the node, settles the lake's
+/// objects there (`memory::settle`) and starts the node again on `to`. `copied` is what the first pass copied.
+pub struct Move {
+    pub from: String,
+    pub to: String,
+    pub copied: crate::memory::Copied,
+}
+
+/// Where a lake's moves go: the host of the node open now, which took them with `mover`. Not `per_node!`:
+/// a host outlives each node it starts (the program's, a library's supervisor's).
+static MOVER: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Move>>> = std::sync::Mutex::new(None);
+
+/// The host's end of the moves: taken once, before it starts its node.
+pub fn mover() -> tokio::sync::mpsc::UnboundedReceiver<Move> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    *MOVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+    rx
+}
+
+/// Can this node's lake be moved: a host took `mover` and is still there?
+pub fn movable() -> bool { MOVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().is_some_and(|s| !s.is_closed()) }
+
+/// Hands a move to the host, which answers for it once the node has begun to stop.
+pub fn move_lake(m: Move) -> anyhow::Result<()> {
+    let sent = MOVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().map(|s| s.send(m).is_ok()).unwrap_or(false);
+    anyhow::ensure!(sent, "this node can't move its lake: it was started without a host that restarts it");
+    Ok(())
+}
+
 /// What a node holds as it starts (its term when it leads, then its lake), so a stop at any point gives back what was taken (ADR-061, invariant 300).
 #[derive(Default)]
 pub(crate) struct Held {
