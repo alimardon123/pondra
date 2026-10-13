@@ -27,6 +27,12 @@
 //! `uuid` (`pg_types.rs`). `gen_random_uuid()` and
 //! `uuidv4()` are DataFusion's `uuid()`; `uuidv7()` (Postgres 18's) starts with the time, so a key
 //! of them comes in order and files hold narrow ranges of it.
+//!
+//! `VARCHAR(n)` (`CHARACTER VARYING(n)`, `NVARCHAR(n)`) is text whose values are at most `n`
+//! characters, as Postgres, Snowflake and Spark hold one: kept as `varchar(n)` in `sql_types`, and
+//! every door refuses a longer value (`check`: 22001), but for trailing spaces, which Postgres
+//! takes and cuts (kept here). Its length only grows (`ALTER COLUMN … TYPE VARCHAR(m)`, m ≥ n, or
+//! to plain text); a column holding text gets none, since its rows were never checked against one.
 use crate::store::{json, table_key, Lake, TableMeta};
 use crate::write::Stmt;
 use anyhow::{ensure, Context, Result};
@@ -253,7 +259,7 @@ pub async fn of_table(lake: &Lake, name: &str) -> (BTreeMap<String, Enum>, BTree
     }
 }
 
-/// A table's declared columns with every enum's and uuid's type said as text (what its files
+/// A table's declared columns with every enum's, uuid's and VARCHAR(n)'s type said as text (what its files
 /// hold), the enums by column, and the other SQL types by column (`sql_types`).
 pub async fn columns(lake: &Lake, cols: &[ast::ColumnDef]) -> Result<(Vec<ast::ColumnDef>, BTreeMap<String, Enum>, BTreeMap<String, String>)> {
     let (mut out, mut enums, mut sql_types) = (cols.to_vec(), BTreeMap::new(), BTreeMap::new());
@@ -262,7 +268,7 @@ pub async fn columns(lake: &Lake, cols: &[ast::ColumnDef]) -> Result<(Vec<ast::C
             enums.insert(crate::write::ident(&c.name), e);
             c.data_type = ast::DataType::Varchar(None);
         } else if let Some(t) = sql_type(&c.data_type)? {
-            sql_types.insert(crate::write::ident(&c.name), t.to_string());
+            sql_types.insert(crate::write::ident(&c.name), t);
             c.data_type = ast::DataType::Varchar(None);
         }
     }
@@ -279,17 +285,50 @@ pub fn shown(m: &TableMeta, column: &str, arrow: &str) -> String {
     }
 }
 
-/// A column's declared type, if it is one held as text that isn't an enum: `uuid`. An array of
-/// uuids is refused by name (a list's items aren't checked yet).
-pub fn sql_type(t: &ast::DataType) -> Result<Option<&'static str>> {
-    use ast::ArrayElemTypeDef as A;
+/// A column's declared type, if it is one held as text that isn't an enum: `uuid`, or `varchar(n)`
+/// for a length (`VARCHAR(n)`, `CHARACTER VARYING(n)`, `NVARCHAR(n)`). An array of uuids is refused
+/// by name (a list's items aren't checked yet).
+pub fn sql_type(t: &ast::DataType) -> Result<Option<String>> {
+    use ast::{ArrayElemTypeDef as A, CharacterLength as L, DataType as D};
     match t {
-        ast::DataType::Uuid => Ok(Some("uuid")),
-        ast::DataType::Array(A::AngleBracket(e) | A::SquareBracket(e, _) | A::Parenthesis(e)) if matches!(**e, ast::DataType::Uuid) => {
+        D::Uuid => Ok(Some("uuid".into())),
+        D::Varchar(Some(L::IntegerLength { length, .. }))
+        | D::CharacterVarying(Some(L::IntegerLength { length, .. }))
+        | D::CharVarying(Some(L::IntegerLength { length, .. }))
+        | D::Nvarchar(Some(L::IntegerLength { length, .. })) => match *length {
+            0 => Err(crate::codes::coded("22023", format!("{t}: a length is at least 1"))),
+            n => Ok(Some(format!("varchar({n})"))),
+        },
+        D::Array(A::AngleBracket(e) | A::SquareBracket(e, _) | A::Parenthesis(e)) if matches!(**e, D::Uuid) => {
             Err(crate::codes::coded("0A000", "UUID[]: an array of uuids isn't kept yet (TEXT[] holds them as text, or a table of its own holds one a row)"))
         }
         _ => Ok(None),
     }
+}
+
+/// A type as `ALTER COLUMN … TYPE` writes it, as `sql_type` keeps it (None for one it doesn't, or
+/// one it can't read).
+pub fn declared(written: &str) -> Result<Option<String>> {
+    match Parser::new(&GenericDialect {}).try_with_sql(written).and_then(|mut p| p.parse_data_type()) {
+        Ok(t) => sql_type(&t),
+        Err(_) => Ok(None),
+    }
+}
+
+/// A column held as `had` (None: as plain text) may be declared `wanted` from now on: its rows were
+/// checked against that, or against a shorter length.
+pub fn grows(had: Option<&str>, wanted: &str) -> bool {
+    had == Some(wanted) || matches!((had.and_then(length), length(wanted)), (Some(k), Some(n)) if n >= k)
+}
+
+/// The most characters a `varchar(n)` column's values have.
+pub fn length(t: &str) -> Option<usize> {
+    t.strip_prefix("varchar(")?.strip_suffix(')')?.parse().ok()
+}
+
+/// `v` is longer than `n` characters, but for trailing spaces (Postgres takes those, and cuts them).
+fn too_long(v: &str, n: usize) -> bool {
+    v.len() > n && v.trim_end_matches(' ').chars().count() > n
 }
 
 /// `s` is a uuid as Postgres writes one, the only way a uuid column holds it: 36 characters, lower
@@ -331,8 +370,9 @@ fn refused_uuid(column: &str, s: &str) -> String {
     }
 }
 
-/// Every door's rows (`defaults::check`): a value its column's enum doesn't list is refused, the
-/// writer's alone (Postgres's 22P02). `marker`: a keyed table's delete markers carry no values.
+/// Every door's rows (`defaults::check`): a value its column's enum doesn't list, or that isn't a
+/// uuid written the one way, is refused (Postgres's 22P02), and one longer than its VARCHAR(n)
+/// (22001), the writer's alone. `marker`: a keyed table's delete markers carry no values.
 pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn Fn(usize) -> bool) -> Result<()> {
     for (stored, e) in &meta.enums {
         let Some(c) = rows.column_by_name(if sql_names { meta.name_of(stored) } else { stored }) else { continue };
@@ -350,13 +390,20 @@ pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn
     }
     for (stored, t) in &meta.sql_types {
         let Some(c) = rows.column_by_name(if sql_names { meta.name_of(stored) } else { stored }) else { continue };
-        if t != "uuid" || c.null_count() == c.len() {
+        let limit = length(t);
+        if (t != "uuid" && limit.is_none()) || c.null_count() == c.len() {
             continue; // (a type a newer release keeps: its own nodes check it)
         }
         let text = datafusion::arrow::compute::cast(c, &DataType::Utf8)?;
         let text = text.as_string::<i32>();
-        if let Some(i) = (0..text.len()).find(|&i| text.is_valid(i) && !is_uuid(text.value(i)) && !marker(i)) {
-            return Err(anyhow::Error::new(crate::views::Violation(refused_uuid(meta.name_of(stored), text.value(i)), "22P02")));
+        let refused = |i: usize| text.is_valid(i) && !marker(i) && match limit { None => !is_uuid(text.value(i)), Some(n) => too_long(text.value(i), n) };
+        if let Some(i) = (0..text.len()).find(|&i| refused(i)) {
+            let (column, v) = (meta.name_of(stored), text.value(i));
+            let refusal = match limit {
+                None => crate::views::Violation(refused_uuid(column, v), "22P02"),
+                Some(n) => crate::views::Violation(format!("value too long for type character varying({n}) (column {column}: a value of {} characters)", v.chars().count()), "22001"),
+            };
+            return Err(anyhow::Error::new(refusal));
         }
     }
     Ok(())

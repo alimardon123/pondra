@@ -140,7 +140,9 @@ pub fn of(k: &ast::TableConstraint, table: &str) -> Result<Option<Constraint>> {
 }
 
 fn unique(name: Option<String>, columns: Vec<String>, u: &ast::UniqueConstraint, table: &str) -> Result<Constraint> {
-    ensure!(!matches!(u.nulls_distinct, ast::NullsDistinctOption::NotDistinct), "UNIQUE NULLS NOT DISTINCT isn't taken yet: a UNIQUE column holds any number of NULLs, as by default");
+    if matches!(u.nulls_distinct, ast::NullsDistinctOption::NotDistinct) {
+        return Err(crate::codes::coded("0A000", "UNIQUE NULLS NOT DISTINCT isn't taken yet: a UNIQUE column holds any number of NULLs, as by default"));
+    }
     deferred(&u.characteristics)?;
     Ok(Constraint { name: name.unwrap_or_else(|| format!("{table}_{}_key", columns.join("_"))), kind: Kind::Unique, columns, references: None, enforced: !informational(&u.characteristics) })
 }
@@ -164,8 +166,10 @@ fn fact(name: Option<String>, kind: Kind, columns: Vec<String>, references: Opti
 }
 
 fn deferred(c: &Option<ast::ConstraintCharacteristics>) -> Result<()> {
-    ensure!(!matches!(c, Some(c) if c.deferrable == Some(true)), "DEFERRABLE: a constraint is checked at each statement");
-    Ok(())
+    match c {
+        Some(c) if c.deferrable == Some(true) => Err(crate::codes::coded("0A000", "DEFERRABLE: a constraint is checked at each statement")),
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------- the check

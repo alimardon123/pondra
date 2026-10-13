@@ -24,6 +24,8 @@ Columns take these types. A list is written `type[]`, such as `FLOAT[]` for an e
 | `REAL`, `DOUBLE` | | 32 and 64-bit floating point |
 | `DECIMAL(p, s)` | | exact numbers; `0.07` in SQL is a decimal |
 | `VARCHAR` | `TEXT`, `STRING` | text |
+| `VARCHAR(n)` | `CHARACTER VARYING(n)`, `NVARCHAR(n)` | text of at most `n` characters |
+| `UUID` | | a uuid, kept as text written one way: lower case with hyphens |
 | `BOOLEAN` | | true or false |
 | `DATE`, `TIME`, `TIMESTAMP` | | `TIMESTAMP` is a wall-clock time with no zone, kept in microseconds |
 | `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | an instant, kept and shown in UTC with its zone: `2026-09-29T05:00:00Z` |
@@ -43,7 +45,10 @@ DuckDB: `'2024-05-01 10:30'` is a timestamp in `INSERT`, `CAST`, `TIMESTAMP '…
 [dates and times](/pondra/sql/functions/#dates-and-times).
 
 A value that doesn't cast to its column's type is refused, and the error names the value: `'abc'` into
-a `BIGINT` is an error, never a `NULL`. `substr`, `substring(b FROM 2 FOR 1)` and `byte_length` work
+a `BIGINT` is an error, never a `NULL`. A value longer than its `VARCHAR(n)` is refused with Postgres's
+22001 at every door (spaces at its end past `n` are taken, and kept). A length only grows: `ALTER TABLE t ALTER COLUMN c TYPE
+VARCHAR(m)` takes an `m` at least `n`, or `TEXT`, which drops it; a `TEXT` column never takes one, since
+its rows were never checked against it. `substr`, `substring(b FROM 2 FOR 1)` and `byte_length` work
 on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
 
 ### Enum types

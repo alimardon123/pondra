@@ -62,8 +62,17 @@ enum TableSpec {
         #[serde(default)]
         enums: BTreeMap<String, crate::types::Enum>, // enum columns: the labels each takes (`types.rs`)
         #[serde(default)]
-        sql_types: BTreeMap<String, String>, // columns held as text of another SQL type: "uuid" (`types.rs`)
+        sql_types: BTreeMap<String, String>, // columns held as text of another SQL type: "uuid", "varchar(n)" (`types.rs`)
     },
+}
+
+/// A table's definition refused: invalid_table_definition (42P16) unless the error says its own
+/// code, never an internal error (XX000, which HTTP answers 500).
+fn definition(e: anyhow::Error) -> anyhow::Error {
+    match crate::codes::of(&e) {
+        "XX000" => crate::codes::coded("42P16", format!("{e:#}")),
+        _ => e,
+    }
 }
 
 /// Leader: create a table (sent again for an existing one, `publish` changes). The caller holds
@@ -75,55 +84,62 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![], BTreeMap::new(), BTreeMap::new()),
         TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types),
     };
-    let retention = retention.as_deref().map(crate::ddl::retention).transpose()?;
-    // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `query::dtype`).
-    let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::query::dtype(t)?)))).collect::<Result<Vec<_>>>()?;
-    let ttl = ttl.map(|t| -> Result<(String, u64)> {
-        let (c, s) = t.split_once(':').ok_or_else(|| anyhow::anyhow!("ttl: \"column:seconds\""))?;
-        ensure!(!key.is_empty() && columns.iter().any(|(n, ty)| n == c && (ty.starts_with("Timestamp") || ty.starts_with("Date"))), "TTL: a timestamp or date column of a keyed table");
-        Ok((c.to_string(), s.trim().parse()?))
-    }).transpose()?;
-    schema(&columns)?; // validate types
-    ensure!(columns.iter().all(|(c, _)| !crate::sys::NAMES.contains(&c.as_str()) && c != "_old_version"), "{} are system columns: every table has them (`SELECT _row_id, * FROM t`)", crate::sys::NAMES.join(", "));
-    ensure!(merge.values().all(|f| ["sum", "count", "min", "max", crate::finish::MOMENTS].contains(&f.as_str())), "MERGE: sum, count, min or max"); // (moments: a view's variance, `finish.rs`; an ALTER of its table sends them back)
-    ensure!(merge.is_empty() || !key.is_empty(), "MERGE needs a key: a merge table combines the rows of each key");
-    ensure!(merge.keys().all(|c| columns.iter().any(|(n, _)| n == c)), "MERGE: columns of the table");
-    if let Some((c, _)) = columns.iter().find(|(c, _)| !merge.is_empty() && !key.contains(c) && !merge.contains_key(c)) {
-        bail!("a merge table combines every column but its key: {c} needs a merge function too ({c} … MERGE sum|count|min|max)");
+    // (what the definition gets wrong is the statement's: 42P16 when it says no code of its own)
+    let (retention, columns, ttl) = async {
+        let retention = retention.as_deref().map(crate::ddl::retention).transpose()?;
+        // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `query::dtype`).
+        let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::query::dtype(t)?)))).collect::<Result<Vec<_>>>()?;
+        let ttl = ttl.map(|t| -> Result<(String, u64)> {
+            let (c, s) = t.split_once(':').ok_or_else(|| anyhow::anyhow!("ttl: \"column:seconds\""))?;
+            ensure!(!key.is_empty() && columns.iter().any(|(n, ty)| n == c && (ty.starts_with("Timestamp") || ty.starts_with("Date"))), "TTL: a timestamp or date column of a keyed table");
+            Ok((c.to_string(), s.trim().parse()?))
+        }).transpose()?;
+        schema(&columns)?; // validate types
+        ensure!(columns.iter().all(|(c, _)| !crate::sys::NAMES.contains(&c.as_str()) && c != "_old_version"), "{} are system columns: every table has them (`SELECT _row_id, * FROM t`)", crate::sys::NAMES.join(", "));
+        ensure!(merge.values().all(|f| ["sum", "count", "min", "max", crate::finish::MOMENTS].contains(&f.as_str())), "MERGE: sum, count, min or max"); // (moments: a view's variance, `finish.rs`; an ALTER of its table sends them back)
+        ensure!(merge.is_empty() || !key.is_empty(), "MERGE needs a key: a merge table combines the rows of each key");
+        ensure!(merge.keys().all(|c| columns.iter().any(|(n, _)| n == c)), "MERGE: columns of the table");
+        if let Some((c, _)) = columns.iter().find(|(c, _)| !merge.is_empty() && !key.contains(c) && !merge.contains_key(c)) {
+            bail!("a merge table combines every column but its key: {c} needs a merge function too ({c} … MERGE sum|count|min|max)");
+        }
+        ensure!(publish.iter().flatten().all(|f| ["delta", "iceberg"].contains(&f.as_str())), "publish formats: delta, iceberg");
+        // (A keyed table takes them too: each tiering round's newest rows go into a file per
+        // partition, sorted by cluster_by, then the key; reads let a newer round's key shadow an older
+        // round's wherever its partition, `query::upsert_view`.)
+        ensure!(cluster.iter().flatten().all(|c| columns.iter().any(|(n, _)| n == c)), "CLUSTER BY: columns of the table");
+        ensure!(order.is_none() || (!key.is_empty() && merge.is_empty()), "SEQUENCE BY: a keyed table's (PRIMARY KEY), whose rows replace each other");
+        ensure!(order.iter().all(|o| columns.iter().any(|(n, _)| n == o) && !key.contains(o)), "SEQUENCE BY: a column of the table, not its key");
+        if let Some(p) = &partition {
+            crate::tier::check_partition(p, &columns)?;
+        }
+        ensure!(not_null.iter().chain(defaults.keys()).chain(identity.keys()).all(|c| columns.iter().any(|(n, _)| n == c)), "NOT NULL, DEFAULT and identity: columns of the table");
+        if let Some(c) = constraints.iter().flat_map(|k| &k.columns).find(|c| !columns.iter().any(|(n, _)| n == *c)) {
+            return Err(crate::codes::coded("42703", format!("column \"{c}\" named in a constraint does not exist")));
+        }
+        if let Some(c) = enums.keys().find(|c| !columns.iter().any(|(n, t)| n == *c && t == "Utf8")) {
+            bail!("{c}: an enum column holds text (a column of the table, of type VARCHAR)");
+        }
+        let held = |t: &str| t == "uuid" || crate::types::length(t).is_some();
+        if let Some((c, t)) = sql_types.iter().find(|(c, t)| !held(t) || !columns.iter().any(|(n, ty)| n == *c && ty == "Utf8")) {
+            bail!("{c} {t}: a uuid or VARCHAR(n) column holds text (a column of the table, of type VARCHAR)");
+        }
+        for (c, expr) in &defaults {
+            let t = &columns.iter().find(|(n, _)| n == c).expect("a column").1;
+            ensure!(!identity.contains_key(c), "{c} is an identity column: its values come from its sequence, not a DEFAULT");
+            crate::defaults::validate(c, t, expr).await?;
+            crate::seq::named_exist(lake, expr).await?; // (DEFAULT nextval('s'): s is there)
+        }
+        if let Some((c, t)) = columns.iter().find(|(c, t)| identity.contains_key(c) && !["Int16", "Int32", "Int64"].contains(&t.as_str())) {
+            bail!("{c} is an identity column: it counts in smallint, integer or bigint, not {t}");
+        }
+        let empty = RecordBatch::new_empty(schema(&columns)?);
+        for (n, c) in &checks {
+            crate::defaults::breaking(&empty, c).with_context(|| format!("CONSTRAINT {n} CHECK ({c})"))?; // (a condition over its columns)
+        }
+        Ok((retention, columns, ttl))
     }
-    ensure!(publish.iter().flatten().all(|f| ["delta", "iceberg"].contains(&f.as_str())), "publish formats: delta, iceberg");
-    // (A keyed table takes them too: each tiering round's newest rows go into a file per
-    // partition, sorted by cluster_by, then the key; reads let a newer round's key shadow an older
-    // round's wherever its partition, `query::upsert_view`.)
-    ensure!(cluster.iter().flatten().all(|c| columns.iter().any(|(n, _)| n == c)), "CLUSTER BY: columns of the table");
-    ensure!(order.is_none() || (!key.is_empty() && merge.is_empty()), "SEQUENCE BY: a keyed table's (PRIMARY KEY), whose rows replace each other");
-    ensure!(order.iter().all(|o| columns.iter().any(|(n, _)| n == o) && !key.contains(o)), "SEQUENCE BY: a column of the table, not its key");
-    if let Some(p) = &partition {
-        crate::tier::check_partition(p, &columns)?;
-    }
-    ensure!(not_null.iter().chain(defaults.keys()).chain(identity.keys()).all(|c| columns.iter().any(|(n, _)| n == c)), "NOT NULL, DEFAULT and identity: columns of the table");
-    if let Some(c) = constraints.iter().flat_map(|k| &k.columns).find(|c| !columns.iter().any(|(n, _)| n == *c)) {
-        bail!("column \"{c}\" named in a constraint does not exist");
-    }
-    if let Some(c) = enums.keys().find(|c| !columns.iter().any(|(n, t)| n == *c && t == "Utf8")) {
-        bail!("{c}: an enum column holds text (a column of the table, of type VARCHAR)");
-    }
-    if let Some((c, t)) = sql_types.iter().find(|(c, t)| *t != "uuid" || !columns.iter().any(|(n, ty)| n == *c && ty == "Utf8")) {
-        bail!("{c} {t}: a uuid column holds text (a column of the table, of type VARCHAR)");
-    }
-    for (c, expr) in &defaults {
-        let t = &columns.iter().find(|(n, _)| n == c).expect("a column").1;
-        ensure!(!identity.contains_key(c), "{c} is an identity column: its values come from its sequence, not a DEFAULT");
-        crate::defaults::validate(c, t, expr).await?;
-        crate::seq::named_exist(lake, expr).await?; // (DEFAULT nextval('s'): s is there)
-    }
-    if let Some((c, t)) = columns.iter().find(|(c, t)| identity.contains_key(c) && !["Int16", "Int32", "Int64"].contains(&t.as_str())) {
-        bail!("{c} is an identity column: it counts in smallint, integer or bigint, not {t}");
-    }
-    let empty = RecordBatch::new_empty(schema(&columns)?);
-    for (n, c) in &checks {
-        crate::defaults::breaking(&empty, c).with_context(|| format!("CONSTRAINT {n} CHECK ({c})"))?; // (a condition over its columns)
-    }
+    .await
+    .map_err(definition)?;
     // (a key's columns are NOT NULL too: a row with no key has nothing to be found by)
     let not_null: Vec<String> = columns.iter().map(|(c, _)| c).filter(|c| not_null.contains(c) || key.contains(c) || identity.contains_key(*c)).cloned().collect();
     let mut defaulted = publish.is_none(); // (a new table published as the node's --publish says)
@@ -885,7 +901,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
         _ => vec![],
     }).collect();
     key.extend(c.columns.iter().filter(|c| c.options.iter().any(|o| matches!(&o.option, ast::ColumnOption::PrimaryKey(pk) if !crate::constraints::informational(&pk.characteristics)))).map(|c| c.name.value.clone()));
-    let identity: BTreeMap<String, crate::seq::Identity> = c.columns.iter().filter_map(|c| crate::seq::identity_of(c).transpose().map(|i| i.map(|i| (c.name.value.clone(), i)))).collect::<Result<_>>()?;
+    let identity: BTreeMap<String, crate::seq::Identity> = c.columns.iter().filter_map(|c| crate::seq::identity_of(c).transpose().map(|i| i.map(|i| (c.name.value.clone(), i)))).collect::<Result<_>>().map_err(definition)?;
     let not_null: Vec<String> = c.columns.iter().filter(|c| c.options.iter().any(|o| matches!(o.option, ast::ColumnOption::NotNull))).map(|c| c.name.value.clone()).collect();
     let defaults: BTreeMap<String, String> = c.columns.iter().filter_map(|c| c.options.iter().find_map(|o| match &o.option {
         ast::ColumnOption::Default(e) => Some((c.name.value.clone(), e.to_string())),
@@ -925,7 +941,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
     }
     const OPTIONS: [&str; 7] = ["publish", "cluster_by", "partition_by", "ttl", "order_by", "merge", "retention"];
     if let Some(k) = opts.keys().find(|k| !OPTIONS.contains(&k.as_str())) {
-        bail!("CREATE TABLE … WITH ({k} = …): tables take {}", OPTIONS.join(", "));
+        return Err(crate::codes::coded("22023", format!("CREATE TABLE … WITH ({k} = …): tables take {}", OPTIONS.join(", ")))); // (invalid_parameter_value, as Postgres refuses an option it doesn't know)
     }
     let list = |k: &str| opts.get(k).map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>());
     let merge: BTreeMap<String, String> = list("merge").unwrap_or_default().iter().filter_map(|m| m.split_once(':')).map(|(c, f)| (c.into(), f.into())).collect();
@@ -933,7 +949,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
     if !key.is_empty() && merge.is_empty() && !columns.iter().any(|(c, _)| c == "_deleted") {
         columns.push(("_deleted".into(), "Boolean".into())); // (so DELETE works; writes leave it out)
     }
-    let constraints = crate::constraints::declared(c, &table)?;
+    let constraints = crate::constraints::declared(c, &table).map_err(definition)?;
     let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by"), "ttl": opts.get("ttl"), "partition_by": opts.get("partition_by"), "order_by": opts.get("order_by"), "not_null": not_null, "defaults": defaults, "checks": checks, "retention": opts.get("retention"), "identity": identity, "constraints": constraints, "enums": enums, "sql_types": sql_types});
     Ok(spec.to_string())
 }
@@ -987,7 +1003,7 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
                 Ok(t) => crate::types::sql_type(t)?,
                 Err(_) => None,
             };
-            let sql_type = if enumerated.is_some() || held.is_some() { "VARCHAR" } else { sql_type }; // (an enum or a uuid column holds text)
+            let sql_type = if enumerated.is_some() || held.is_some() { "VARCHAR" } else { sql_type }; // (an enum, a uuid or a VARCHAR(n) column holds text)
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
             let mut columns = m.columns.clone();
             columns.push((column.to_string(), crate::query::type_name(ctx.table("t").await?.schema().field(0).data_type())));
@@ -2122,7 +2138,15 @@ async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value>
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
         bail!("the leader at {addr} asks for a sign-in: set PONDRA_TOKEN to one of the lake's tokens ({})", res.text().await?);
     }
-    ensure!(res.status().is_success(), "the leader at {addr}: {}", res.text().await?);
+    if !res.status().is_success() {
+        // (the leader's refusal keeps its SQLSTATE: a follower's client tells it apart as the leader's would)
+        let code = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).and_then(crate::codes::received);
+        let said = format!("the leader at {addr}: {}", res.text().await?);
+        return Err(match code {
+            Some(code) => crate::codes::coded(code, said),
+            None => anyhow::anyhow!("{said}"),
+        });
+    }
     Ok(res.json().await?)
 }
 

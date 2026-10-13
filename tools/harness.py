@@ -11160,11 +11160,12 @@ def constraints():
                            "CREATE TABLE bad6 (a INT, UNIQUE (b))", "CREATE TABLE bad7 (a INT PRIMARY KEY, b INT PRIMARY KEY)",
                            "CREATE TABLE bad8 (a INT, PRIMARY KEY (a), PRIMARY KEY (a))")]
     no.append(err("CREATE TEMP TABLE bad5 (a INT UNIQUE)", hh=temp))
+    no.append(err("CREATE TABLE bad9 (a INT, ts TIMESTAMP) WITH (order_by = 'ts')", ports[2]))  # (the leader's refusal, through a follower)
     q("CREATE TEMP TABLE fine (a INT UNIQUE NOT ENFORCED)", hh=temp)
     info["facts"] = [facts, no]
-    checks["NOT ENFORCED keeps a fact and checks nothing (a PRIMARY KEY makes no key); a reference, NULLS NOT DISTINCT, DEFERRABLE, two keys (42P16, as Postgres: two columns' keys too), a temporary table's UNIQUE and a missing column refused"] = \
-        facts == [[1, 1, "x"], [1, 99, "x"]] and no[0][:2] == (501, "0A000") and all(no[i][:2] == (400, "42P16") for i in (3, 5, 6)) and \
-        all(no[i][0] == 500 for i in (1, 2, 4, 7))  # (a reference: not taken yet, 0A000)
+    checks["NOT ENFORCED keeps a fact and checks nothing (a PRIMARY KEY makes no key); refused, each with its SQLSTATE: a reference, NULLS NOT DISTINCT, DEFERRABLE and a temporary table's UNIQUE (0A000), two keys (42P16, as Postgres: two columns' keys too), a missing column (42703), and the leader's refusal through a follower (42P16)"] = \
+        facts == [[1, 1, "x"], [1, 99, "x"]] and all(no[i][:2] == (501, "0A000") for i in (0, 1, 2, 7)) and \
+        all(no[i][:2] == (400, "42P16") for i in (3, 5, 6, 8)) and no[4][:2] == (404, "42703")
     # ALTER TABLE … ADD | DROP CONSTRAINT
     q("CREATE TABLE tags (id INT, tag TEXT)")
     q("INSERT INTO tags VALUES (1, 'a'), (2, 'a'), (3, 'b')")
@@ -11242,8 +11243,8 @@ def ddlgaps():
     answer with their rows; a view's query in parentheses is made, filled and follows an INSERT;
     ALTER COLUMN SET and DROP DEFAULT, SET and DROP NOT NULL with Postgres's meanings (a view on the table
     doesn't stop them); DROP TASK of a streaming task stops it; a timestamp's one-digit zone; DROP TABLE
-    … CASCADE (the views on it, deepest first; RESTRICT names them); character varying(n); ALTER TABLE
-    with several actions; (a, b) IN (SELECT …) in a DELETE; DELETE and UPDATE with an alias and a
+    … CASCADE (the views on it, deepest first; RESTRICT names them); character varying(n), and VARCHAR(n)
+    checked at every door; refused definitions and bodies with their codes; ALTER TABLE with several actions; (a, b) IN (SELECT …) in a DELETE; DELETE and UPDATE with an alias and a
     correlated EXISTS."""
     import psycopg
     lake = new_lake()
@@ -11440,6 +11441,54 @@ def ddlgaps():
     info["varchar"] = cv
     checks["character varying(200) in CREATE TABLE, ADD COLUMN and a cast (character(3) too)"] = \
         cv == {"s": "abc", "s2": "q", "z": "zz"}
+
+    # VARCHAR(n): a longer value refused at every door (22001), as Postgres refuses it, but for
+    # trailing spaces; kept by SHOW CREATE and ADD COLUMN; its length only grows
+    def posted(path, body, kind):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", path, body, {"content-type": kind})
+        r = c.getresponse()
+        r.read()
+        return (r.status, r.getheader("x-pondra-sqlstate"))
+    q("CREATE TABLE vn (id INT, name VARCHAR(5), code CHARACTER VARYING(3))")
+    q("INSERT INTO vn VALUES (1, 'héllo', 'ab  '), (2, 'ab     ', NULL)")  # (5 characters in 6 bytes; spaces past the length)
+    made = q("SHOW CREATE TABLE vn")[0]["definition"]
+    def copied(line):
+        try:
+            with conn.cursor().copy("COPY vn FROM STDIN") as cp:
+                cp.write(line)
+            return None
+        except psycopg.Error as e:
+            return e.sqlstate
+    long = {"sql": err("INSERT INTO vn VALUES (3, 'toolong', 'x')")[:2], "postgres": pg_state("INSERT INTO vn VALUES (3, 'x', 'abcd')"),
+            "update": err("UPDATE vn SET name = 'longer' WHERE id = 1")[:2], "copy": copied("3\ttoolong\tx\n"),
+            "append": posted("/append/vn", b'{"id": 3, "name": "toolong"}\n', "application/x-ndjson"),
+            "merge": err("MERGE INTO vn USING (SELECT 1 AS id) s ON vn.id = s.id WHEN MATCHED THEN UPDATE SET code = 'abcd'")[:2]}
+    q("ALTER TABLE vn ADD COLUMN tag VARCHAR(2)")
+    long["added"] = err("INSERT INTO vn (id, tag) VALUES (4, 'abc')")[:2]
+    q("ALTER TABLE vn ALTER COLUMN name TYPE VARCHAR(10)")
+    q("ALTER TABLE vn ALTER COLUMN code TYPE TEXT")
+    q("INSERT INTO vn (id, name, code) VALUES (5, 'longer', 'abcdef')")
+    q("CREATE TABLE vt (s TEXT)")
+    narrow = [err("ALTER TABLE vn ALTER COLUMN name TYPE VARCHAR(3)")[:2], err("ALTER TABLE vt ALTER COLUMN s TYPE VARCHAR(5)")[:2],
+              err("CREATE TABLE v0 (s VARCHAR(0))")[:2]]
+    grown = q("SHOW CREATE TABLE vn")[0]["definition"]
+    info["varchar(n)"] = [made, long, narrow, grown]
+    checks["VARCHAR(n): a longer value refused (22001) by INSERT, Postgres, UPDATE, MERGE, COPY, an append and an added column; "
+           "trailing spaces taken; SHOW CREATE keeps it; its length grows, or goes, and never narrows or comes to text there (42804)"] = \
+        "VARCHAR(5)" in made and "VARCHAR(3)" in made and \
+        all(v in ((400, "22001"), "22001") for v in long.values()) and \
+        q("SELECT id, name, code FROM vn ORDER BY id") == [{"id": 1, "name": "héllo", "code": "ab  "}, {"id": 2, "name": "ab     "}, {"id": 5, "name": "longer", "code": "abcdef"}] and \
+        narrow[:2] == [(400, "42804")] * 2 and narrow[2] == (400, "22023") and "VARCHAR(10)" in grown and "VARCHAR(3)" not in grown and "VARCHAR(2)" in grown
+
+    # A table's definition refused says why with a code, never as a fault of the node (500); a body
+    # that isn't JSON too
+    refused = [err("CREATE TABLE ob (a INT, ts TIMESTAMP) WITH (order_by = 'ts')")[:2], err("CREATE TABLE ob (a INT) WITH (cluser_by = 'a')")[:2],
+               posted("/sql", b'{"sql": NaN}', "application/json"), posted("/sql", b"SELECT 1", "application/json"),
+               posted("/append/vn", b'{"id": "one"}\n', "application/x-ndjson"), posted("/append/vn", b"not rows", "application/vnd.apache.arrow.stream")]
+    info["refused definitions"] = refused
+    checks["a table's definition refused with its SQLSTATE (order_by without a key 42P16, an option it doesn't take 22023), a body that isn't JSON or rows that aren't the table's 22P02: each 400"] = \
+        refused == [(400, "42P16"), (400, "22023")] + [(400, "22P02")] * 4
 
     # ALTER TABLE with several actions: each applied; one that can't run refuses the whole statement
     q("CREATE TABLE am (id INT)")

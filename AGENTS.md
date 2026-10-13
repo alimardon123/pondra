@@ -1313,7 +1313,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 185. **Every error has Postgres's code** (`codes.rs`, ADR-036 §4): a new kind of error a client
    should tell apart gets a typed `Coded` or words `codes::by_words` knows, and a test in
    `codes::tests`. Postgres sends it, HTTP's `x-pondra-sqlstate`, Flight's metadata, the clients'
-   `sqlstate`.
+   `sqlstate`. What the writer got wrong is never the node's 500: a table's definition refused is
+   42P16 unless it says a code of its own (`write::definition`), an option a table doesn't take
+   22023, a feature not taken 0A000, and a request's body or rows that can't be read 22P02
+   (`Request::read`, `server::append_rows`). A refusal a follower forwards from its leader keeps the
+   leader's code (`write::post_as`, `codes::received`). `harness.py constraints`, `ddlgaps`.
 186. **A transaction is a session's, kept where the session is, and one commit** (`txn.rs`, ADR-036
    §5): every read in it goes through `query::session_at`, which takes its snapshot and its overlay
    (`txn::overlaid`); a new path that reads tables for a session must too, or refuse inside a
@@ -2165,6 +2169,15 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    adds a mark join that also matches NULLs, so "no match" and "unknown" stay apart. Only plans DataFusion
    couldn't run are rewritten. `harness.py friendly`: the eight IN and EXISTS forms == DuckDB's answers,
    spread too.
+298. **A VARCHAR(n) holds at most n characters, and every door checks it** (`types.rs`,
+   `TableMeta::sql_types`: `varchar(n)` by stored name, as a uuid is kept; ADD COLUMN and `LIKE`
+   keep it): `defaults::check` refuses a longer value with Postgres's 22001, but for trailing
+   spaces (Postgres takes those and cuts them; they are kept here). A length only grows (`ALTER
+   COLUMN … TYPE VARCHAR(m)`, m ≥ n, or to text, which drops it); a column holding text never takes
+   one (42804), since its rows were never checked, and `CREATE OR ALTER TABLE` refuses that before it
+   changes anything (`types::grows`). `CHAR(n)` is still plain text. `harness.py ddlgaps`:
+   "VARCHAR(n): a longer value refused (22001) by INSERT, Postgres, UPDATE, MERGE, COPY, an append and
+   an added column…".
 300. **A node is started and stopped as an object, and a stop at any point gives back what it took**
    (`node.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
    serves, it drains, makes what it committed durable, checkpoints, ends what it started

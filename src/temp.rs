@@ -357,7 +357,9 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
     let key: Vec<String> = serde_json::from_value(spec["key"].clone()).unwrap_or_default(); // (PRIMARY KEY: checked as rows come, `check_key`)
     ensure!(spec["merge"].as_object().is_none_or(|m| m.is_empty()), "{name}: a merge table is a lake table's (a temporary table keeps its rows as they come)");
     ensure!(spec["enums"].as_object().is_none_or(|e| e.is_empty()), "{name}: a temporary table's columns are plain types (an enum column is a lake table's)");
-    ensure!(!spec["constraints"].as_array().is_some_and(|k| k.iter().any(|k| k["enforced"] == true)), "{name}: a temporary table keeps its rows as they come (UNIQUE is a lake table's; NOT ENFORCED keeps none)");
+    if spec["constraints"].as_array().is_some_and(|k| k.iter().any(|k| k["enforced"] == true)) {
+        return Err(crate::codes::coded("0A000", format!("{name}: a temporary table keeps its rows as they come (UNIQUE is a lake table's; NOT ENFORCED keeps none)")));
+    }
     let columns: Vec<(String, String)> = serde_json::from_value(spec["columns"].clone())?;
     let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::write::stored(&crate::query::dtype(t)?))))).collect::<Result<Vec<_>>>()?;
     ensure!(columns.iter().all(|(c, _)| !crate::sys::NAMES.contains(&c.as_str())), "{}: system columns (every table has them)", crate::sys::NAMES.join(", "));

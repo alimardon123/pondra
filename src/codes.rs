@@ -29,6 +29,22 @@ impl std::error::Error for Coded {}
 /// `code`: an error with that SQLSTATE.
 pub fn coded(code: &'static str, message: impl Into<String>) -> anyhow::Error { anyhow::Error::new(Coded(code, message.into())) }
 
+/// A code another node answered with (`x-pondra-sqlstate`), as one of this node's: five digits or
+/// capital letters, each kept once (a code is `&'static`). XX000 says nothing, so it is none.
+pub fn received(code: &str) -> Option<&'static str> {
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> = std::sync::LazyLock::new(Default::default);
+    if code.len() != 5 || code == "XX000" || !code.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_uppercase()) {
+        return None;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = seen.get(code) {
+        return Some(c);
+    }
+    let c: &'static str = Box::leak(code.to_string().into_boxed_str());
+    seen.insert(c);
+    Some(c)
+}
+
 /// The code an error's words point to (the first that matches, most particular first).
 fn by_words(text: &str) -> &'static str {
     let t = text.to_lowercase();
@@ -125,6 +141,11 @@ pub fn grpc(code: &str) -> tonic::Code {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn received_from_another_node() {
+        assert_eq!([super::received("42P16"), super::received("42P16"), super::received("XX000"), super::received("4"), super::received("42p16")], [Some("42P16"), Some("42P16"), None, None, None]);
+    }
+
     #[test]
     fn known_by_words() {
         let of = |s: &str| super::of(&anyhow::anyhow!("{s}"));

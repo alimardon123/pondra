@@ -1576,7 +1576,12 @@ impl Request {
     /// The body as it came: SQL; JSON (`{"sql": …, "params": {…}}`); or, with tables of its own,
     /// `application/vnd.pondra.request`: the JSON's length (4 bytes, little-endian), the JSON
     /// (`"tables"`: their names), then each table as its length (8 bytes) and an Arrow IPC stream.
+    /// A body that can't be read is the caller's mistake (22P02), not the node's.
     pub fn read(kind: &str, body: &[u8]) -> Result<Request> {
+        Self::parse(kind, body).map_err(|e| crate::codes::coded("22P02", format!("the request's body can't be read: {e:#}")))
+    }
+
+    fn parse(kind: &str, body: &[u8]) -> Result<Request> {
         #[derive(Deserialize)]
         struct Head {
             sql: String,
