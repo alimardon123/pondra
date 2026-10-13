@@ -3090,24 +3090,41 @@ def sums():
     """sum(DOUBLE) is the true sum rounded once, whatever order its rows are added in (`fsum.rs`):
     equal to Python's math.fsum, grouped or not, over files and the log tail, on every node. With
     DataFusion's own sum, [1e16, 1, -1e16] added up to 0, and TPC-H q15, which compares a sum with
-    the max of the same sums, found its row only some of the time."""
+    the max of the same sums, found its row only some of the time. avg over a DECIMAL is rounded at
+    its last place (`avg.rs`), as Python's Decimal rounds it: DataFusion's cut the rest off."""
     import math
+    from decimal import Decimal, ROUND_HALF_UP
     lake = new_lake()
     nodes = [Node(lake, A.port + i, tier_secs=0.25).start() for i in range(3)]
     q = lambda s, p=A.port: sql(p, s)
-    q("CREATE TABLE m (k BIGINT, i BIGINT, v DOUBLE, d DECIMAL(12, 2))")
-    rnd, want, rows = random.Random(7), {}, []
+    q("CREATE TABLE m (k BIGINT, i BIGINT, v DOUBLE, d DECIMAL(12, 2), c DECIMAL(15, 2))")
+    rnd, want, cents, rows = random.Random(7), {}, {}, []
     for n in range(20_000):  # magnitudes 1e-3 to 1e12: a plain running sum depends on the order
-        k, v = n % 40, rnd.uniform(-1, 1) * 10 ** rnd.randint(-3, 12)
-        rows.append({"k": k, "i": n, "v": v, "d": f"{n % 1000}.25"})
+        k, v, c = n % 40, rnd.uniform(-1, 1) * 10 ** rnd.randint(-3, 12), Decimal(rnd.randint(-100_000, 100_000)) / 100
+        rows.append({"k": k, "i": n, "v": v, "d": f"{n % 1000}.25", "c": str(c)})
         want.setdefault(k, []).append(v)
+        cents.setdefault(k, []).append(c)
     for b in range(0, len(rows), 2_500):  # in batches: some become Parquet files, some stay in the log
         call(A.port, "POST", f"/append/m?producer=p&seq={b + 1}", "".join(json.dumps(r) + "\n" for r in rows[b:b + 2_500]).encode())
         time.sleep(0.2)
     q("CREATE TABLE edge (k BIGINT, v DOUBLE)")
     edge_rows = [(1, 1e16), (1, 1.0), (1, -1e16), (2, 1e308), (2, 1e308), (2, -1e308), (3, None)]
     call(A.port, "POST", "/append/edge?producer=e&seq=1", "".join(json.dumps({"k": k, "v": v}) + "\n" for k, v in edge_rows).encode())
+    q("CREATE TABLE ties (k BIGINT, c DECIMAL(15, 2))")  # 0.01 / 32 = 0.0003125: a tie at the sixth place
+    tie_rows = [(1, "0.01")] + [(1, "0")] * 31 + [(2, "-0.01")] + [(2, "0")] * 31 + [(3, "0.01"), (3, "0.01"), (3, "0")] + [(4, None)]
+    call(A.port, "POST", "/append/ties?producer=t&seq=1", "".join(json.dumps({"k": k, "c": c}) + "\n" for k, c in tie_rows).encode())
     total = math.fsum(v for vs in want.values() for v in vs)
+    places = lambda cs: str((sum(cs) / len(cs)).quantize(Decimal("0.000001"), ROUND_HALF_UP))
+    averages = [(q("SELECT CAST(avg(c) AS VARCHAR) AS a FROM m", n.port)[0]["a"], {r["k"]: r["a"] for r in q("SELECT k, CAST(avg(c) AS VARCHAR) AS a FROM m GROUP BY k", n.port)})
+                for n in nodes for _ in range(2)]
+    spread = {r["k"]: r["a"] for r in call(A.port, "POST", "/sql?spread=1", b"SELECT k, CAST(avg(c) AS VARCHAR) AS a FROM m GROUP BY k")}
+    avg_over = {r["k"]: r["a"] for r in q("SELECT DISTINCT k, CAST(avg(c) OVER (PARTITION BY k) AS VARCHAR) AS a FROM m")}
+    avg_sliding = q("SELECT i, c, CAST(avg(c) OVER (ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS VARCHAR) AS a FROM m WHERE k = 0 ORDER BY i")
+    tied = {r["k"]: r.get("a") for r in q("SELECT k, CAST(avg(c) AS VARCHAR) AS a FROM ties GROUP BY k")}
+    tied_distinct = {r["k"]: r.get("d") for r in q("SELECT k, CAST(avg(DISTINCT c) AS VARCHAR) AS d FROM ties GROUP BY k")}
+    avg_type = q("SELECT arrow_typeof(avg(c)) AS t FROM m")[0] | q("SELECT arrow_typeof(avg(CAST(c AS DECIMAL(38, 2)))) AS wide FROM m")[0]
+    q("CREATE MATERIALIZED VIEW c_avg AS SELECT k, avg(c) AS a FROM m GROUP BY k")  # (finished from its sum and count)
+    viewed = {r["k"]: r["a"] for r in q("SELECT k, CAST(a AS VARCHAR) AS a FROM c_avg")}
     every = [(q("SELECT sum(v) AS s FROM m", n.port)[0]["s"], {r["k"]: r["s"] for r in q("SELECT k, sum(v) AS s FROM m GROUP BY k", n.port)})
              for n in nodes for _ in range(3)]
     over = {r["k"]: r["s"] for r in q("SELECT DISTINCT k, sum(v) OVER (PARTITION BY k) AS s FROM m")}
@@ -3124,13 +3141,20 @@ def sums():
         "a sliding window takes values back out": all(math.isclose(r["s"], math.fsum(x["v"] for x in sliding[max(0, j - 2):j + 1]), rel_tol=1e-9, abs_tol=1e-6) for j, r in enumerate(sliding)),
         "integers, decimals and DISTINCT keep DataFusion's sum; FILTER works": types["i"] == "Int64" and types["d"].startswith("Decimal128(22, 2)") and types["v"] == types["dv"] == "Float64"
                                                                               and types["f"] == math.fsum(want[3]) and types.get("none") is None,
+        "avg(DECIMAL) rounded at its last place == Python's Decimal, whole and per group, on every node, spread and in a materialized view":
+            all(a == places([c for cs in cents.values() for c in cs]) and g == {k: places(cs) for k, cs in cents.items()} for a, g in averages)
+            and spread == avg_over == viewed == {k: places(cs) for k, cs in cents.items()},
+        "…in a sliding window, DISTINCT, ties away from zero, and its type DataFusion's":
+            all(r["a"] == places([Decimal(x["c"]) for x in avg_sliding[max(0, j - 2):j + 1]]) for j, r in enumerate(avg_sliding))
+            and tied == {1: "0.000313", 2: "-0.000313", 3: "0.006667", 4: None} and tied_distinct == {1: "0.005000", 2: "-0.005000", 3: "0.005000", 4: None}
+            and avg_type == {"t": "Decimal128(19, 6)", "wide": "Decimal128(38, 6)"},
     }
     ok = all(checks.values())
     print(json.dumps({"sums": checks, "ok": ok}, indent=1))
     if not ok:
-        print(total, every[0][0], edge, big, types)
+        print(total, every[0][0], edge, big, types, averages[0][0], tied, tied_distinct, avg_type, avg_sliding[:4])
         sys.exit(1)
-    return "sum(DOUBLE): the true sum rounded once in any order (== math.fsum), grouped, windowed, on every node; NULLs, overflow, sliding windows and other types as before"
+    return "sum(DOUBLE): the true sum rounded once in any order (== math.fsum), grouped, windowed, on every node; NULLs, overflow, sliding windows and other types as before; avg(DECIMAL) rounded at its last place"
 
 
 def schemas():
@@ -5322,6 +5346,25 @@ def names():
     named = [cols("SELECT x::int FROM t"), cols("SELECT x::int, * FROM t"), cols("SELECT id, * FROM t"), cols("SELECT id, id FROM t"), cols("SELECT CAST(x AS INT), x FROM t")]
     checks["a cast is named as its column (Postgres), or as written beside a column of that name (Snowflake, DuckDB); a column twice runs, the one named twice as id_1"] = \
         named == [["x"], ["x::INT", "id", "name", "x"], ["id_1", "id", "name", "x"], ["id", "id_1"], ["CAST(x AS INT)", "x"]]
+    apart = [cols("SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM t WHERE id > 1)"), cols("SELECT max(id), (SELECT max(id) FROM t) FROM t"),
+             cols("SELECT id + 1, id + 1, id + 1 FROM t"), cols("SELECT (SELECT max(id) FROM t), (SELECT min(id) FROM t)"),
+             cols("SELECT id * 2, id::DOUBLE * 2, CAST(id AS DOUBLE) * 2 FROM t"), cols("SELECT NULL, NULL, count(*), count(*) FROM t")]
+    checks["two subqueries of one column's name, max(id) beside (SELECT max(id) FROM t), id + 1 thrice and id * 2 beside id::DOUBLE * 2 run, named as written (DuckDB); subqueries apart keep theirs; NULL and count(*) twice, which DataFusion names as written, run too"] = \
+        apart == [["(SELECT count(*) FROM t)", "(SELECT count(*) FROM t WHERE id > 1)"], ["max(t.id)", "(SELECT max(id) FROM t)"],
+                  ["t.id + Int64(1)", "id + 1", "id + 1_1"], ["max(t.id)", "min(t.id)"], ["t.id * Int64(2)", "id::DOUBLE * 2", "CAST(id AS DOUBLE) * 2"],
+                  ["NULL", "NULL_1", "count(*)", "count(*)_1"]]
+    # aggregates that differ only by a cast: DataFusion names both sum(t.id), and refused the query
+    alone = lambda q: [list(r.values()) for r in db.sql(q).rows()]
+    sets = [["sum(id)", "sum(id::DOUBLE)"], ["min(x)", "min(x::INT)", "max(x::INT)"], ["count(DISTINCT id)", "count(DISTINCT id::TEXT)", "count(DISTINCT x::INT)"],
+            ["round(sum(x))", "round(sum(x::INT))"]]
+    together = [alone(f"SELECT {', '.join(s)} FROM t")[0] for s in sets]
+    each = [[alone(f"SELECT {e} FROM t")[0][0] for e in s] for s in sets]
+    having = cols("SELECT sum(id::DOUBLE) FROM t HAVING sum(id) > 0"), alone("SELECT sum(id::DOUBLE) FROM t HAVING sum(id) > 0")
+    grouped = alone("SELECT id % 3 AS g, sum(id), sum(id::DOUBLE) FROM t GROUP BY 1 HAVING sum(id::DOUBLE) > 0 ORDER BY sum(id::DOUBLE) DESC")
+    window = alone("SELECT sum(id) OVER (), sum(id::DOUBLE) OVER () FROM t LIMIT 1")
+    checks["aggregates that differ only by a cast (sum(id) and sum(id::DOUBLE); min(x), min(x::INT) and max(x::INT); three count(DISTINCT …); round(sum(…)) twice) each answer as alone, in HAVING, ORDER BY and a window too, named as written"] = \
+        together == each and cols(f"SELECT {', '.join(sets[0])} FROM t") == ["sum(t.id)", "sum(id::DOUBLE)"] and having == (["sum(id::DOUBLE)"], [[500500.0]]) \
+        and grouped == [[1, 167167, 167167.0], [0, 166833, 166833.0], [2, 166500, 166500.0]] and window == [[500500, 500500.0]]
     # each fallback equals its standard name
     sql_pairs = {"read_parquet": ["parquet_scan"], "read_csv": ["read_csv_auto"], "read_json": ["read_json_auto", "read_ndjson"], "read_delta": ["delta_scan"], "read_iceberg": ["iceberg_scan"]}
     checks["SQL: parquet_scan, read_csv_auto, read_json_auto, read_ndjson, delta_scan, iceberg_scan == Pondra's names"] = \
@@ -6173,7 +6216,8 @@ def temps():
     a query), INSERT, UPDATE (a row keeps its _row_id), DELETE, MERGE, TEMP VIEW, DROP; they shadow
     a lake table; another session doesn't see them; a spread query reading one runs on its node
     with the same answer; not answered from the result cache; a procedure sees its caller's;
-    a Postgres connection's end with it; close() and idleness end a session; without one, refused."""
+    a Postgres connection's end with it; SHOW CREATE makes them again; close() and idleness end a
+    session; without one, refused."""
     import psycopg
     lake = new_lake()
     env = {"PYTHONPATH": os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"), "PONDRA_SESSION_IDLE_SECS": "3"}
@@ -6219,10 +6263,17 @@ def temps():
         pg.execute("CREATE TEMP TABLE t1 (a INT)")
         pg.execute("INSERT INTO t1 VALUES (1), (2)")
         mine = pg.execute("SELECT sum(a) FROM t1 WHERE a > %s", (0,)).fetchall()  # (described, then run: both in the connection's session)
+        pg.execute("CREATE TEMPORARY VIEW tv1 AS SELECT a FROM t1")
+        shown_pg = pg.execute("SHOW CREATE VIEW tv1").fetchall()
     time.sleep(0.5)
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:
-        gone = _raises_text(lambda: pg.execute("SELECT * FROM t1").fetchall())
-    checks["Postgres: a connection's own, gone when it ends"] = mine == [(3,)] and "t1" in gone
+        gone = [_raises_text(lambda: pg.execute(f"SELECT * FROM {t}").fetchall()) for t in ("t1", "tv1")]
+    checks["Postgres: a connection's own (a table, a view), gone when it ends"] = mine == [(3,)] and "t1" in gone[0] and "tv1" in gone[1]
+    shown = [rows("SHOW CREATE VIEW mine"), rows("SHOW CREATE TABLE picked"), _raises_text(lambda: rows("SHOW CREATE VIEW mine", other))]
+    checks["SHOW CREATE of a session's temporary view or table makes it again, over HTTP and Postgres; another session's isn't shown"] = \
+        shown[0][0]["definition"].startswith("CREATE TEMPORARY VIEW mine AS SELECT") and "picked" in shown[0][0]["definition"] and \
+        shown[1][0]["definition"].startswith("CREATE TEMPORARY TABLE picked (id BIGINT, note ") and "no view mine" in shown[2] and \
+        shown_pg[0][0] == "CREATE TEMPORARY VIEW tv1 AS SELECT a FROM t1;"
     session = db.session
     db.close()
     closed = _raises_text(lambda: call(A.port, "POST", "/sql", b"SELECT * FROM picked", headers={"x-pondra-session": session}))
@@ -6235,7 +6286,7 @@ def temps():
     ok = all(checks.values())
     print(json.dumps({"temps": checks, "ok": ok}, indent=1))
     if not ok:
-        print(got, before, joined, spread, cached, shadow, unseen, no_session, lake_view, mine, gone, closed, idled)
+        print(got, before, joined, spread, cached, shadow, unseen, no_session, lake_view, mine, gone, shown, shown_pg, closed, idled)
         sys.exit(1)
     return f"temps: a session's own tables and views, every statement, on its node: all {len(checks)} checks pass"
 
@@ -7136,6 +7187,25 @@ def found():
     seen["json_get_flight"] = (flown_jg, jt_err[:300], jt_rows)
     checks["a JSON value json_get returns is a string over Flight (1, x, [1,2], NULL), and a table made of it keeps the text"] = \
         flown_jg.get("type") == "string" and flown_jg.get("rows") == [{"i": "1", "s": "x", "l": "[1,2]", "n": None}] and not jt_err and jt_rows == jrow
+    # A JSON or a struct's field read from a keyed table, and from a table with a renamed column (L3): DataFusion's
+    # push_down_leaf_projections takes the field down to the scan, and refused the plan as ambiguous when the table's
+    # read aliased a column to its own name (`query::named`).
+    q("CREATE TABLE jkeyed (id INT PRIMARY KEY, doc JSON, s STRUCT<a INT>)")
+    q("""INSERT INTO jkeyed VALUES (1, '{"a": 1, "b": "x"}', named_struct('a', 5))""")
+    q("CREATE TABLE jrenamed (id INT, d JSON, e INT)")
+    q("""INSERT INTO jrenamed VALUES (1, '{"a": 2}', 7)""")
+    q("ALTER TABLE jrenamed RENAME COLUMN d TO doc")
+    def tried(s):
+        try:
+            return q(s)
+        except Exception as e:
+            return str(e)[:200]
+    fields = [tried(s) for s in ("SELECT doc->'a' AS a, doc->>'b' AS b, json_get_int(doc, 'a') AS i, s['a'] AS f FROM jkeyed",
+                                 "SELECT id, doc->>'b' AS b, get_field(s, 'a') AS f FROM jkeyed WHERE id = 1",
+                                 "SELECT id, doc, doc->'a' AS a, e FROM jrenamed")]
+    seen["fields"] = fields
+    checks["a JSON or a struct's field read from a keyed table, and from a table with a renamed column"] = fields == [
+        [{"a": "1", "b": "x", "i": 1, "f": 5}], [{"id": 1, "b": "x", "f": 5}], [{"id": 1, "doc": '{"a": 2}', "a": "2", "e": 7}]]
     # A merge table takes INSERTs only: UPDATE and DELETE are refused as the merge table's own, not a view's. (4 + 2 is 6,
     # so an UPDATE to 5 that went through would show.)
     q("CREATE TABLE totals (k BIGINT PRIMARY KEY, n BIGINT MERGE sum)")
@@ -11065,7 +11135,7 @@ def objects():
     checks["SEQUENCE BY, TTL and MERGE sum are the table's options, in any order beside WITH; ALTER TABLE … TTL; mistakes refused"] = \
         laid == {"lay_s": ("day(seen)", ["page"], "seen", ["seen", 7200], {}, ["delta", "iceberg"]),
                  "lay_t": (None, [], None, None, {"amount": "sum", "n": "count"}, [])} \
-        and totals == [{"region": "eu", "amount": 8.0, "n": 2}] and wrong == [500, 500, 500]
+        and totals == [{"region": "eu", "amount": 8.0, "n": 2}] and wrong == [500, 500, 400]  # (the last refused as the table's definition: 42P16)
     q("CREATE TABLE keyed (id BIGINT PRIMARY KEY, v VARCHAR)")
     q("INSERT INTO keyed VALUES (1, 'a'), (2, 'b')")
     q("INSERT OR IGNORE INTO keyed VALUES (1, 'x'), (3, 'c')")
@@ -11370,12 +11440,15 @@ def constraints():
     facts = rows("orders")
     no = [err(x) for x in ("CREATE TABLE bad1 (a INT REFERENCES users (id))", "CREATE TABLE bad2 (a INT, UNIQUE NULLS NOT DISTINCT (a))",
                            "CREATE TABLE bad3 (a INT UNIQUE DEFERRABLE)", "CREATE TABLE bad4 (a INT PRIMARY KEY, b INT, PRIMARY KEY (b) NOT ENFORCED)",
-                           "CREATE TABLE bad6 (a INT, UNIQUE (b))")]
+                           "CREATE TABLE bad6 (a INT, UNIQUE (b))", "CREATE TABLE bad7 (a INT PRIMARY KEY, b INT PRIMARY KEY)",
+                           "CREATE TABLE bad8 (a INT, PRIMARY KEY (a), PRIMARY KEY (a))")]
     no.append(err("CREATE TEMP TABLE bad5 (a INT UNIQUE)", hh=temp))
+    no.append(err("CREATE TABLE bad9 (a INT, ts TIMESTAMP) WITH (order_by = 'ts')", ports[2]))  # (the leader's refusal, through a follower)
     q("CREATE TEMP TABLE fine (a INT UNIQUE NOT ENFORCED)", hh=temp)
     info["facts"] = [facts, no]
-    checks["NOT ENFORCED keeps a fact and checks nothing (a PRIMARY KEY makes no key); a reference, NULLS NOT DISTINCT, DEFERRABLE, two keys, a temporary table's UNIQUE and a missing column refused"] = \
-        facts == [[1, 1, "x"], [1, 99, "x"]] and no[0][:2] == (501, "0A000") and all(r[0] == 500 for r in no[1:])  # (a reference: not taken yet, 0A000)
+    checks["NOT ENFORCED keeps a fact and checks nothing (a PRIMARY KEY makes no key); refused, each with its SQLSTATE: a reference, NULLS NOT DISTINCT, DEFERRABLE and a temporary table's UNIQUE (0A000), two keys (42P16, as Postgres: two columns' keys too), a missing column (42703), and the leader's refusal through a follower (42P16)"] = \
+        facts == [[1, 1, "x"], [1, 99, "x"]] and all(no[i][:2] == (501, "0A000") for i in (0, 1, 2, 7)) and \
+        all(no[i][:2] == (400, "42P16") for i in (3, 5, 6, 8)) and no[4][:2] == (404, "42703")
     # ALTER TABLE … ADD | DROP CONSTRAINT
     q("CREATE TABLE tags (id INT, tag TEXT)")
     q("INSERT INTO tags VALUES (1, 'a'), (2, 'a'), (3, 'b')")
@@ -11453,8 +11526,8 @@ def ddlgaps():
     answer with their rows; a view's query in parentheses is made, filled and follows an INSERT;
     ALTER COLUMN SET and DROP DEFAULT, SET and DROP NOT NULL with Postgres's meanings (a view on the table
     doesn't stop them); DROP TASK of a streaming task stops it; a timestamp's one-digit zone; DROP TABLE
-    … CASCADE (the views on it, deepest first; RESTRICT names them); character varying(n); ALTER TABLE
-    with several actions; (a, b) IN (SELECT …) in a DELETE; DELETE and UPDATE with an alias and a
+    … CASCADE (the views on it, deepest first; RESTRICT names them); character varying(n), and VARCHAR(n)
+    checked at every door; refused definitions and bodies with their codes; ALTER TABLE with several actions; (a, b) IN (SELECT …) in a DELETE; DELETE and UPDATE with an alias and a
     correlated EXISTS."""
     import psycopg
     lake = new_lake()
@@ -11651,6 +11724,54 @@ def ddlgaps():
     info["varchar"] = cv
     checks["character varying(200) in CREATE TABLE, ADD COLUMN and a cast (character(3) too)"] = \
         cv == {"s": "abc", "s2": "q", "z": "zz"}
+
+    # VARCHAR(n): a longer value refused at every door (22001), as Postgres refuses it, but for
+    # trailing spaces; kept by SHOW CREATE and ADD COLUMN; its length only grows
+    def posted(path, body, kind):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", path, body, {"content-type": kind})
+        r = c.getresponse()
+        r.read()
+        return (r.status, r.getheader("x-pondra-sqlstate"))
+    q("CREATE TABLE vn (id INT, name VARCHAR(5), code CHARACTER VARYING(3))")
+    q("INSERT INTO vn VALUES (1, 'héllo', 'ab  '), (2, 'ab     ', NULL)")  # (5 characters in 6 bytes; spaces past the length)
+    made = q("SHOW CREATE TABLE vn")[0]["definition"]
+    def copied(line):
+        try:
+            with conn.cursor().copy("COPY vn FROM STDIN") as cp:
+                cp.write(line)
+            return None
+        except psycopg.Error as e:
+            return e.sqlstate
+    long = {"sql": err("INSERT INTO vn VALUES (3, 'toolong', 'x')")[:2], "postgres": pg_state("INSERT INTO vn VALUES (3, 'x', 'abcd')"),
+            "update": err("UPDATE vn SET name = 'longer' WHERE id = 1")[:2], "copy": copied("3\ttoolong\tx\n"),
+            "append": posted("/append/vn", b'{"id": 3, "name": "toolong"}\n', "application/x-ndjson"),
+            "merge": err("MERGE INTO vn USING (SELECT 1 AS id) s ON vn.id = s.id WHEN MATCHED THEN UPDATE SET code = 'abcd'")[:2]}
+    q("ALTER TABLE vn ADD COLUMN tag VARCHAR(2)")
+    long["added"] = err("INSERT INTO vn (id, tag) VALUES (4, 'abc')")[:2]
+    q("ALTER TABLE vn ALTER COLUMN name TYPE VARCHAR(10)")
+    q("ALTER TABLE vn ALTER COLUMN code TYPE TEXT")
+    q("INSERT INTO vn (id, name, code) VALUES (5, 'longer', 'abcdef')")
+    q("CREATE TABLE vt (s TEXT)")
+    narrow = [err("ALTER TABLE vn ALTER COLUMN name TYPE VARCHAR(3)")[:2], err("ALTER TABLE vt ALTER COLUMN s TYPE VARCHAR(5)")[:2],
+              err("CREATE TABLE v0 (s VARCHAR(0))")[:2]]
+    grown = q("SHOW CREATE TABLE vn")[0]["definition"]
+    info["varchar(n)"] = [made, long, narrow, grown]
+    checks["VARCHAR(n): a longer value refused (22001) by INSERT, Postgres, UPDATE, MERGE, COPY, an append and an added column; "
+           "trailing spaces taken; SHOW CREATE keeps it; its length grows, or goes, and never narrows or comes to text there (42804)"] = \
+        "VARCHAR(5)" in made and "VARCHAR(3)" in made and \
+        all(v in ((400, "22001"), "22001") for v in long.values()) and \
+        q("SELECT id, name, code FROM vn ORDER BY id") == [{"id": 1, "name": "héllo", "code": "ab  "}, {"id": 2, "name": "ab     "}, {"id": 5, "name": "longer", "code": "abcdef"}] and \
+        narrow[:2] == [(400, "42804")] * 2 and narrow[2] == (400, "22023") and "VARCHAR(10)" in grown and "VARCHAR(3)" not in grown and "VARCHAR(2)" in grown
+
+    # A table's definition refused says why with a code, never as a fault of the node (500); a body
+    # that isn't JSON too
+    refused = [err("CREATE TABLE ob (a INT, ts TIMESTAMP) WITH (order_by = 'ts')")[:2], err("CREATE TABLE ob (a INT) WITH (cluser_by = 'a')")[:2],
+               posted("/sql", b'{"sql": NaN}', "application/json"), posted("/sql", b"SELECT 1", "application/json"),
+               posted("/append/vn", b'{"id": "one"}\n', "application/x-ndjson"), posted("/append/vn", b"not rows", "application/vnd.apache.arrow.stream")]
+    info["refused definitions"] = refused
+    checks["a table's definition refused with its SQLSTATE (order_by without a key 42P16, an option it doesn't take 22023), a body that isn't JSON or rows that aren't the table's 22P02: each 400"] = \
+        refused == [(400, "42P16"), (400, "22023")] + [(400, "22P02")] * 4
 
     # ALTER TABLE with several actions: each applied; one that can't run refuses the whole statement
     q("CREATE TABLE am (id INT)")
@@ -15930,7 +16051,8 @@ def friendly():
     sample (TABLESAMPLE was ignored); refusals by name; the
     same answers spread over three nodes; and what `random_sql.py` found (`- -3` written again as
     a comment, a DISTINCT over a CASE refused, two IN lists of a column taken as sets of values,
-    columns of one name on both sides of a join mixed up)."""
+    columns of one name on both sides of a join mixed up); `IN` and `EXISTS` subqueries in a SELECT
+    list, a CASE and an aggregate, NULLs and all."""
     import datetime, decimal, duckdb, pyarrow as pa
     lake = new_lake()
     import psycopg
@@ -16017,6 +16139,15 @@ def friendly():
         "…in arithmetic, a REAL's and a DECIMAL column's too": ("SELECT x * 1.5 AS a, x + 0.25 AS b, r * 2.5 AS c, d * x AS e, d + 0.01 AS f FROM big", True, False),
         "…as CASE's branches, COALESCE, GREATEST and LEAST": ("SELECT CASE WHEN x > 1 THEN x ELSE 0.5 END AS c, coalesce(x, 0.5) AS o, greatest(x, 0.5) AS g, least(x, 2.5) AS l FROM big", True, False),
         "…in a UNION and as a join's key": ("SELECT x FROM big UNION ALL SELECT 0.25 UNION ALL SELECT big.x FROM big JOIN (VALUES (0.7)) v(e) ON big.x = v.e", True, False),
+        # (IN and EXISTS outside a WHERE couldn't be planned: `optimize::SubqueriesMarked`)
+        "x IN (SELECT …) in a SELECT list, NULLs among its values": ("SELECT id, x IN (SELECT n FROM t WHERE id < 30) AS i FROM t WHERE id < 40", True, False),
+        "x NOT IN (SELECT …) in a SELECT list, NULLs among its values": ("SELECT id, x NOT IN (SELECT n FROM t WHERE id < 30) AS i FROM t WHERE id < 40", True, False),
+        "a NULL x IN (SELECT …), and a NULL x IN no rows": ("SELECT id, n IN (SELECT k FROM t WHERE id < 50) AS i, n IN (SELECT k FROM t WHERE id < 0) AS e FROM t WHERE id < 25", True, False),
+        "x IN (SELECT …) with no NULL among its values": ("SELECT id, k IN (SELECT k FROM t WHERE g = 'a' AND k < 3) AS i FROM t WHERE id < 50", True, False),
+        "x IN (SELECT …) correlated, NULLs on both sides": ("SELECT id, n IN (SELECT t2.n FROM t t2 WHERE t2.k = t.k AND t2.id < 40) AS i FROM t WHERE id < 60", True, False),
+        "EXISTS and NOT EXISTS correlated, in a SELECT list": ("SELECT id, EXISTS (SELECT 1 FROM q WHERE q.k = t.k AND q.p > t.x) AS e, NOT EXISTS (SELECT 1 FROM q WHERE q.k = t.k + 3) AS n FROM t WHERE id < 100", True, False),
+        "IN (SELECT …) in a CASE": ("SELECT id, CASE WHEN g IN (SELECT g FROM t WHERE k = 3 AND id < 10) THEN 'in' ELSE 'out' END AS c FROM t WHERE id < 30", True, False),
+        "IN and EXISTS in an aggregate's FILTER and argument": ("SELECT k, count(*) FILTER (WHERE x IN (SELECT n FROM t WHERE id < 100)) AS c, sum(CASE WHEN EXISTS (SELECT 1 FROM q WHERE q.k = t.k AND q.p > 50) THEN 1 ELSE 0 END) AS s FROM t GROUP BY k", True, False),
     }
     checks, failed = {}, {}
     for name, (q, names, ordered) in same.items():
@@ -16044,7 +16175,8 @@ def friendly():
     checks["refused by name: FETCH … PERCENT, max_by(…) OVER, a JSON path that isn't a literal"] = "PERCENT" in refused[0] and "first_value" in refused[1] and "literal" in refused[2]
     spread = ["PIVOT (SELECT k, g, x FROM t) ON g USING sum(x) GROUP BY k", "SELECT min(COLUMNS(*)) FROM (SELECT id, x, n FROM t)",
               "SELECT id, [y * 2 FOR y IN l IF y > 0] AS d FROM t", "SELECT g, max_by(id, x), arg_min(id, x) FROM t GROUP BY g",
-              "SELECT t.id, q.p FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts", "UNPIVOT (SELECT id, x, n FROM t) ON x, n INTO NAME col VALUE val"]
+              "SELECT t.id, q.p FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts", "UNPIVOT (SELECT id, x, n FROM t) ON x, n INTO NAME col VALUE val",
+              "SELECT id, x IN (SELECT n FROM t WHERE id < 300) AS i, EXISTS (SELECT 1 FROM q WHERE q.k = t.k AND q.p > t.x) AS e FROM t"]
     apart = {q: (sorted(ours(q, spread=1)[1], key=repr), sorted(ours(q, spread=0)[1], key=repr)) for q in spread}
     checks["spread over three nodes == one node"] = all(a == b for a, b in apart.values())
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:  # (described, then run)

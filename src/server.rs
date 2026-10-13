@@ -1065,17 +1065,21 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
     let meta = app.lake.cat.meta(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
     let schema = schema(&meta.logical_columns())?; // (rows come under SQL's names; the log keeps stored ones: ADR-022)
     let arrow = headers.get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"application/vnd.apache.arrow"));
-    let (batches, given) = if arrow {
-        // Columns by name, cast to the table's types (pandas, Polars and Arrow differ in string
-        // types); a column left out takes its DEFAULT, or is null (as in JSON), e.g. `_deleted`,
-        // or one added since.
-        let ipc = StreamReader::try_new(&body[..], None)?;
-        let given: Vec<String> = ipc.schema().fields().iter().map(|f| f.name().clone()).collect();
-        let ipc = ipc.collect::<Result<Vec<_>, _>>()?;
-        (ipc.iter().map(|b| crate::query::conform(b, &schema)).collect::<anyhow::Result<Vec<_>>>()?, Some(given))
-    } else {
-        (arrow_json::ReaderBuilder::new(schema.clone()).build(&body[..])?.collect::<Result<Vec<_>, _>>()?, None)
+    let read = || -> anyhow::Result<_> {
+        Ok(if arrow {
+            // Columns by name, cast to the table's types (pandas, Polars and Arrow differ in string
+            // types); a column left out takes its DEFAULT, or is null (as in JSON), e.g. `_deleted`,
+            // or one added since.
+            let ipc = StreamReader::try_new(&body[..], None)?;
+            let given: Vec<String> = ipc.schema().fields().iter().map(|f| f.name().clone()).collect();
+            let ipc = ipc.collect::<Result<Vec<_>, _>>()?;
+            (ipc.iter().map(|b| crate::query::conform(b, &schema)).collect::<anyhow::Result<Vec<_>>>()?, Some(given))
+        } else {
+            (arrow_json::ReaderBuilder::new(schema.clone()).build(&body[..])?.collect::<Result<Vec<_>, _>>()?, None)
+        })
     };
+    // (rows that can't be read as the table's are the sender's: 22P02, never the node's 500)
+    let (batches, given) = read().map_err(|e| crate::codes::coded("22P02", format!("the rows can't be read as {name}'s: {e:#}")))?;
     let batch = concat_batches(&schema, &batches)?;
     let batch = match (crate::defaults::any(&meta), given) {
         (false, _) => batch,

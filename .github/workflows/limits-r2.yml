@@ -8,6 +8,10 @@ name: limits-r2
 # listing the lake or the bucket whole after the first minute, and keys many nodes add starting
 # with a random part. The numbers are logged: the JSON goes to the job log and to the artifact.
 #
+# A second job then measures what a steady stream costs the bucket: `tools/kafka_bench.py --steady 30`
+# (30 MiB of 1 KB values a second through the Kafka port, 30 s to warm up, 90 s measured) on one node
+# and on three, the bucket's requests a second by the class R2 and S3 bill them in, and dollars a month.
+#
 # Nightly on main, and by hand. The bucket and its keys are the cluster bench's secrets (R2_*). The
 # lakes go under limits/ in the bucket and are deleted after every run, whatever happened (R2's free
 # tier is 10 GB).
@@ -79,3 +83,43 @@ jobs:
           name: limits-r2-logs
           path: /tmp/pondra-*.stderr
           if-no-files-found: ignore
+
+  cost:
+    name: what a steady 30 MiB/s costs the bucket on R2
+    needs: check # (after the limits: they share the bucket)
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PONDRA_TEST_PREFIX: cost/
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: boto3 and the Kafka client
+        run: pip install -r <(grep -iE '^(boto3|confluent-kafka)' tools/requirements.txt)
+      - name: This commit's Linux binary (the build workflow's)
+        run: |
+          bash tools/ci_artifact.sh linux-x64 "$SHA"
+          mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
+      - name: One node, then three
+        env:
+          PONDRA_BIN: ${{ github.workspace }}/bin/pondra
+        run: |
+          python tools/kafka_bench.py --s3 --nodes 1 --producers 16 --steady 30 > cost-r2-1-node.json
+          python tools/kafka_bench.py --s3 --nodes 3 --producers 24 --steady 30 --port 18480 > cost-r2-3-nodes.json
+      - name: The numbers, in the job log
+        if: always()
+        run: |
+          cat cost-r2-*.json || echo "(no cost-r2-*.json: the runs didn't reach their end)"
+      - name: The numbers, as an artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cost-r2
+          path: cost-r2-*.json
+          if-no-files-found: ignore
+      - name: The lakes deleted, whatever happened
+        if: always()
+        run: aws s3 rm "s3://$PONDRA_BUCKET/cost/" --recursive --only-show-errors

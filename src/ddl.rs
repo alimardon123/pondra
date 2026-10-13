@@ -1250,9 +1250,9 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             j!({"dropped": column})
         }
         Change::Type(sql_type) => {
-            let uuid = m.uuid(&stored);
-            if sql_type.trim().eq_ignore_ascii_case("uuid") {
-                if !uuid {
+            let (held, declared) = (m.sql_types.get(&stored).cloned(), crate::types::declared(&sql_type)?);
+            if declared.as_deref() == Some("uuid") {
+                if held.as_deref() != Some("uuid") {
                     return Err(crate::codes::coded("42804", format!("{column} can't become a uuid: a column is a uuid only from when it is made, since the rows there were never checked as uuids (a new UUID column can take them: UPDATE … SET new = {column}::uuid)")));
                 }
                 return Ok(j!({"table": name, "unchanged": true}));
@@ -1262,17 +1262,29 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             let new = crate::write::stored(ctx.table("t").await?.schema().field(0).data_type());
             let at = m.columns.iter().position(|(c, _)| *c == stored).expect("a live column");
             let old = crate::query::dtype(&m.columns[at].1)?;
-            if old == new && (uuid || m.enums.contains_key(&stored)) {
-                // (a uuid or an enum is text held one way: as text, every row reads as it did, as Postgres casts them)
-                m.sql_types.remove(&stored);
-                m.enums.remove(&stored);
-            } else if old == new {
-                return Ok(j!({"table": name, "unchanged": true}));
+            if let Some(wanted) = declared.filter(|_| old == new) {
+                // A length on text only grows: the rows there were checked against the one it had.
+                match (held.as_deref().and_then(crate::types::length), crate::types::length(&wanted)) {
+                    (Some(k), Some(n)) if n == k => return Ok(j!({"table": name, "unchanged": true})),
+                    (Some(k), Some(n)) if n > k => {}
+                    (Some(k), _) => return Err(crate::codes::coded("42804", format!("{column} is VARCHAR({k}): its length only grows, since its rows may be {k} characters long (VARCHAR({k}) or more, or TEXT)"))),
+                    (None, _) => return Err(crate::codes::coded("42804", format!("{column} can't take a length: a column's length holds only from when it is made, since the rows there were never checked against one (a new {} column can take them: UPDATE … SET new = {column})", wanted.to_uppercase()))),
+                }
+                m.sql_types.insert(stored.clone(), wanted.clone());
+                j!({"column": column, "type": wanted.to_uppercase()})
+            } else {
+                if old == new && (held.is_some() || m.enums.contains_key(&stored)) {
+                    // (a uuid, a length or an enum is text held a way: as text, every row reads as it did, as Postgres casts them)
+                    m.sql_types.remove(&stored);
+                    m.enums.remove(&stored);
+                } else if old == new {
+                    return Ok(j!({"table": name, "unchanged": true}));
+                }
+                ensure!(old == new || widens(&old, &new), "{column} is {old}: a column's type can only widen (a smaller integer to a bigger one, FLOAT to DOUBLE, a DECIMAL to more digits), which every file already written still reads as");
+                ensure!(old == new || partition != Some(stored.as_str()), "{column} is {name}'s partition_by column: its type stays");
+                m.columns[at].1 = crate::query::type_name(&new);
+                j!({"column": column, "type": m.columns[at].1})
             }
-            ensure!(old == new || widens(&old, &new), "{column} is {old}: a column's type can only widen (a smaller integer to a bigger one, FLOAT to DOUBLE, a DECIMAL to more digits), which every file already written still reads as");
-            ensure!(old == new || partition != Some(stored.as_str()), "{column} is {name}'s partition_by column: its type stays");
-            m.columns[at].1 = crate::query::type_name(&new);
-            j!({"column": column, "type": m.columns[at].1})
         }
         Change::Default(_) | Change::NotNull(_) => unreachable!("defaults::alter takes them, above"),
     };

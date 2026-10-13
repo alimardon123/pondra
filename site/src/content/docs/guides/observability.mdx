@@ -174,7 +174,7 @@ curl -s localhost:8080/metrics | grep '^# HELP pondra_quer'
 The counters cover the rows a node took into the log, the queries it ran and how many failed, the time
 spent in queries, the queries it spread across the nodes, the files a query read and the ones it skipped
 by their ranges, and the requests it made to the bucket. `pondra_object_requests_total` is split by
-`op` (`write`, `list`, `delete`): those are what a bucket bills and rate-limits. With tokens on, a read
+`op` (`write`, `list`, `delete`, `read`): what a bucket bills and rate-limits. With tokens on, a read
 token is needed to read `/metrics`. [Deploy](/pondra/guides/deploy/) shows a Prometheus scrape of a cluster.
 
 ## The state of a node: GET /stats

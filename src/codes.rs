@@ -29,6 +29,22 @@ impl std::error::Error for Coded {}
 /// `code`: an error with that SQLSTATE.
 pub fn coded(code: &'static str, message: impl Into<String>) -> anyhow::Error { anyhow::Error::new(Coded(code, message.into())) }
 
+/// A code another node answered with (`x-pondra-sqlstate`), as one of this node's: five digits or
+/// capital letters, each kept once (a code is `&'static`). XX000 says nothing, so it is none.
+pub fn received(code: &str) -> Option<&'static str> {
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> = std::sync::LazyLock::new(Default::default);
+    if code.len() != 5 || code == "XX000" || !code.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_uppercase()) {
+        return None;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = seen.get(code) {
+        return Some(c);
+    }
+    let c: &'static str = Box::leak(code.to_string().into_boxed_str());
+    seen.insert(c);
+    Some(c)
+}
+
 /// The code an error's words point to (the first that matches, most particular first).
 fn by_words(text: &str) -> &'static str {
     let t = text.to_lowercase();
@@ -53,6 +69,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("type \"") && has("does not exist") => "42704",                                // undefined_object (`types.rs`)
         _ if has("because column") && (has("uses it") || has("use it")) => "2BP01",              // dependent_objects_still_exist (DROP TYPE)
         _ if has("already exists") || has("exists already") => "42P07",                        // duplicate_table
+        _ if has("multiple primary keys") => "42P16",                                          // invalid_table_definition
         _ if has("divide by zero") || has("division by zero") => "22012",                       // division_by_zero
         _ if has("overflow") || has("out of range") => "22003",                                 // numeric_value_out_of_range
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
@@ -125,6 +142,11 @@ pub fn grpc(code: &str) -> tonic::Code {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn received_from_another_node() {
+        assert_eq!([super::received("42P16"), super::received("42P16"), super::received("XX000"), super::received("4"), super::received("42p16")], [Some("42P16"), Some("42P16"), None, None, None]);
+    }
+
+    #[test]
     fn known_by_words() {
         let of = |s: &str| super::of(&anyhow::anyhow!("{s}"));
         assert_eq!(of("Error during planning: table 'datafusion.public.nope' not found"), "42P01");
@@ -135,6 +157,7 @@ mod tests {
         assert_eq!(of("permission denied: INSERT on t (GRANT INSERT ON t TO ann)"), "42501");
         assert_eq!(of("Invalid function 'nope'.\nDid you mean 'now'?"), "42883");
         assert_eq!(of("table t already exists"), "42P07");
+        assert_eq!(of("multiple primary keys for table \"t\" are not allowed"), "42P16");
         assert_eq!(of("Error during planning: 'nope' is not a variable which can be viewed with 'SHOW'"), "42704");
         assert_eq!(of("a transaction is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>)"), "55000");
         assert_eq!(of("External error: invalid input value for enum mood: \"angry\" (its labels: 'sad', 'ok')"), "22P02"); // (a bulk INSERT's stream)

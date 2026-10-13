@@ -163,7 +163,7 @@ impl Split {
     /// The finish's SQL, once the partial query's types are known: `decimal` says whether a column of
     /// it is a decimal, and `casts` the type each answer column is cast to, if any (Arrow's name).
     pub fn finish(&self, decimal: impl Fn(&str) -> bool, casts: &[Option<String>]) -> String {
-        // (an average divides a sum by a count: as decimals for a decimal sum, else as doubles)
+        // (an average divides a sum by a count: as `avg` does for a decimal sum, else as doubles)
         let mut q = self.finish.clone();
         if let ast::SetExpr::Select(s) = q.body.as_mut() {
             for (item, to) in s.projection.iter_mut().zip(casts) {
@@ -177,8 +177,11 @@ impl Split {
                 if lower(&f.name) == AVG {
                     let a = args(f);
                     let (s, n) = (a[0].to_string(), a[1].to_string());
-                    let sum = if decimal(s.trim_matches('"')) { s } else { format!("CAST({s} AS DOUBLE)") };
-                    *x = expr(&format!("{sum} / NULLIF({n}, 0)")).expect("an average");
+                    let average = match decimal(s.trim_matches('"')) {
+                        true => format!("pondra_avg_of({s}, {n})"),
+                        false => format!("CAST({s} AS DOUBLE) / NULLIF({n}, 0)"),
+                    };
+                    *x = expr(&average).expect("an average");
                 }
             }
             ControlFlow::<()>::Continue(())
@@ -431,7 +434,7 @@ mod tests {
     fn averages_and_expressions_are_finished_when_read() {
         let (partial, finish) = split_of("SELECT t.k, avg(x) AS a, round(sum(x) / count(*), 2) AS r FROM t GROUP BY t.k HAVING count(*) > 1 ORDER BY a DESC LIMIT 3", &["k", "a", "r"]).unwrap();
         assert_eq!(partial, "SELECT t.k AS \"k\", sum(x) AS \"__sum_1\", count(x) AS \"__count_2\", count(*) AS \"__count\" FROM t GROUP BY 1");
-        assert_eq!(finish, "SELECT \"k\" AS \"k\", \"__sum_1\" / NULLIF(\"__count_2\", 0) AS \"a\", round(\"__sum_1\" / \"__count\", 2) AS \"r\" FROM __partial WHERE \"__count\" > 1 ORDER BY a DESC LIMIT 3");
+        assert_eq!(finish, "SELECT \"k\" AS \"k\", pondra_avg_of(\"__sum_1\", \"__count_2\") AS \"a\", round(\"__sum_1\" / \"__count\", 2) AS \"r\" FROM __partial WHERE \"__count\" > 1 ORDER BY a DESC LIMIT 3");
     }
 
     #[test]

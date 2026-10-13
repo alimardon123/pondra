@@ -65,6 +65,8 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     if ordered {
         rules.insert(at, Arc::new(OuterLast)); // (the inner joins it gathers are the order's to choose)
     }
+    let marked = rules.iter().position(|r| r.name() == "decorrelate_predicate_subquery").map_or(0, |i| i + 1);
+    rules.insert(marked, Arc::new(SubqueriesMarked)); // (before DataFusion's scalar subqueries become joins: it makes one)
     rules.insert(0, Arc::new(InListOfRows)); // (before DataFusion's simplifier meets two lists of one column)
     rules.insert(0, Arc::new(Seconds)); // (before a literal is folded into a timestamp)
     rules.push(Arc::new(CheapFirst));
@@ -641,6 +643,138 @@ impl OptimizerRule for InListOfRows {
             .map(|t| t.update_data(|e| name.restore(e)))
         })
     }
+}
+
+/// `x IN (SELECT …)` and `EXISTS (SELECT …)` in a SELECT list, a CASE or an aggregate's argument,
+/// as a mark join under it: each row of the input marked by whether the subquery has a match for
+/// it, as DataFusion does for one in a WHERE it can't make a semi join of (under an OR). Elsewhere
+/// DataFusion leaves them, and planning failed ("Physical plan does not support logical expression
+/// InSubquery"). A mark is true or false, but `x IN (…)` is NULL where no row matches and `x`, or a
+/// value the subquery gave, is NULL (`1 IN (2, NULL)`): where either may be NULL, a second mark
+/// says whether some row's comparison was NULL. A subquery that can't be pulled up stays, and fails
+/// as before.
+#[derive(Debug)]
+struct SubqueriesMarked;
+
+impl OptimizerRule for SubqueriesMarked {
+    fn name(&self) -> &str {
+        "subqueries_marked"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::TopDown)
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        let plan = plan.map_subqueries(|s| s.transform_down(|p| self.rewrite(p, config)))?.data;
+        if !matches!(plan, LogicalPlan::Projection(_) | LogicalPlan::Aggregate(_)) {
+            return Ok(Transformed::no(plan));
+        }
+        let mut asks = false;
+        plan.apply_expressions(|e| {
+            asks = e.exists(|e| Ok(matches!(e, Expr::InSubquery(_) | Expr::Exists(_))))?;
+            Ok(if asks { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
+        })?;
+        if !asks {
+            return Ok(Transformed::no(plan));
+        }
+        let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan); // (the plan above reads its columns by name)
+        let mut input = plan.inputs()[0].clone();
+        let mut changed = false;
+        let mut exprs = Vec::new();
+        for e in plan.expressions() {
+            let name = names.save(&e);
+            let e = e.transform_up(|e| match marks(&input, &e, config)? {
+                Some((joined, mark)) => {
+                    input = joined;
+                    Ok(Transformed::yes(mark))
+                }
+                None => Ok(Transformed::no(e)),
+            })?;
+            changed |= e.transformed;
+            exprs.push(name.restore(e.data));
+        }
+        if !changed {
+            return Ok(Transformed::no(plan));
+        }
+        Ok(Transformed::yes(plan.with_new_exprs(exprs, vec![input])?))
+    }
+}
+
+/// `input` joined to an `IN` or `EXISTS` subquery's marks, and what stands for the subquery's
+/// answer over them; nothing for any other expression, or a subquery that can't be pulled up.
+fn marks(input: &LogicalPlan, e: &Expr, config: &dyn OptimizerConfig) -> Result<Option<(LogicalPlan, Expr)>> {
+    use datafusion::logical_expr::{lit, when};
+    let (subquery, eq, negated) = match e {
+        Expr::Exists(x) => (&x.subquery, None, x.negated),
+        Expr::InSubquery(x) => {
+            let Some(y) = x.subquery.subquery.head_output_expr()? else { return Ok(None) };
+            (&x.subquery, Some(((*x.expr).clone(), y)), x.negated)
+        }
+        _ => return Ok(None),
+    };
+    let alias = || config.alias_generator().next("__marked_sq");
+    let Some((joined, matched)) = mark_join(input, &subquery.subquery, eq.clone(), false, alias())? else { return Ok(None) };
+    let null = || Expr::Literal(datafusion::scalar::ScalarValue::Boolean(None), None);
+    let (joined, answer) = match &eq {
+        Some((x, _)) if x.nullable(input.schema())? || subquery.subquery.schema().field(0).is_nullable() => {
+            if subquery.outer_ref_columns.is_empty() {
+                // (one row for the whole subquery: 0 empty, 1 rows but no NULL, 2 a NULL among them;
+                // a NULL x adds 1, so 2 or more is unknown)
+                let x_null = when(x.clone().is_null(), lit(1i64)).otherwise(lit(0i64))?;
+                (joined, when(matched, lit(true)).when((nulls_found(&subquery.subquery)? + x_null).gt_eq(lit(2i64)), null()).otherwise(lit(false))?)
+            } else {
+                // (per row, on the subquery's own conditions: whether any comparison was NULL)
+                let Some((joined, unknown)) = mark_join(&joined, &subquery.subquery, eq.clone(), true, alias())? else { return Ok(None) };
+                (joined, when(matched, lit(true)).when(unknown, null()).otherwise(lit(false))?)
+            }
+        }
+        _ => (joined, matched),
+    };
+    Ok(Some((joined, if negated { !answer } else { answer })))
+}
+
+/// A scalar subquery saying whether `subquery` (which reads nothing of the query around it) gave
+/// no rows (0), rows but no NULL in its first column (1), or a NULL there (2).
+fn nulls_found(subquery: &LogicalPlan) -> Result<Expr> {
+    use datafusion::functions_aggregate::expr_fn::count;
+    use datafusion::logical_expr::{lit, when};
+    let y = Expr::Column(Column::from(subquery.schema().qualified_field(0)));
+    let counted = LogicalPlanBuilder::from(subquery.clone())
+        .aggregate(Vec::<Expr>::new(), vec![count(lit(1)).alias("n"), count(y).alias("v")])?
+        .project(vec![when(Expr::Column(Column::from_name("v")).lt(Expr::Column(Column::from_name("n"))), lit(2i64)).when(Expr::Column(Column::from_name("n")).gt(lit(0i64)), lit(1i64)).otherwise(lit(0i64))?])?
+        .build()?;
+    Ok(Expr::ScalarSubquery(datafusion::logical_expr::Subquery { subquery: Arc::new(counted), outer_ref_columns: vec![], spans: Default::default() }))
+}
+
+/// `left` LEFT MARK JOIN the subquery, pulled up as DataFusion pulls one up for a semi join: on
+/// `x = y` (with `unknown`, on that comparison being true or NULL) and the subquery's correlated
+/// conditions. The mark is the column `mark` of the alias.
+fn mark_join(left: &LogicalPlan, subquery: &LogicalPlan, eq: Option<(Expr, Expr)>, unknown: bool, alias: String) -> Result<Option<(LogicalPlan, Expr)>> {
+    use datafusion::logical_expr::expr_rewriter::{create_col_from_scalar_expr, replace_col};
+    use datafusion::optimizer::decorrelate::PullUpCorrelatedExpr;
+    let in_predicate = eq.clone().map(|(x, y)| x.eq(y));
+    let mut pull_up = PullUpCorrelatedExpr::new().with_exists_sub_query(eq.is_none()).with_in_predicate_opt(in_predicate);
+    let pulled = subquery.clone().rewrite(&mut pull_up).data()?;
+    if !pull_up.can_pull_up {
+        return Ok(None);
+    }
+    let right = LogicalPlanBuilder::from(pulled).alias(alias.clone())?.build()?;
+    let correlated: std::collections::BTreeSet<Column> = pull_up.correlated_subquery_cols_map.values().flatten().cloned().collect();
+    let renamed: Vec<Column> = correlated.iter().map(|c| Column::new(Some(alias.clone()), &c.name)).collect();
+    let map: std::collections::HashMap<&Column, &Column> = correlated.iter().zip(renamed.iter()).collect();
+    let mut on = Vec::new();
+    if let Some((x, y)) = eq {
+        let y = Expr::Column(create_col_from_scalar_expr(&y, alias.clone())?);
+        let equal = x.clone().eq(y.clone());
+        on.push(if unknown { equal.or(x.is_null()).or(y.is_null()) } else { equal });
+    }
+    for f in pull_up.join_filters {
+        on.push(replace_col(f, &map)?);
+    }
+    let on = conjunction(on).unwrap_or_else(|| datafusion::logical_expr::lit(true));
+    let joined = LogicalPlanBuilder::from(left.clone()).join_on(right, JoinType::LeftMark, Some(on))?.build()?;
+    Ok(Some((joined, Expr::Column(Column::new(Some(alias), "mark")))))
 }
 
 /// A value that isn't NULL, perhaps cast.

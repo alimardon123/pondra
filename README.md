@@ -144,7 +144,7 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
   commit, at most this often (a table with a million rows waiting: within a second). Pondra's own
   reads see every commit at once; each run is a few object-store writes per busy table, so a
   bucket's bill and rate limits (S3: 3,500 writes a second per prefix) favour fewer. Fractions are
-  fine (`0.25`). `GET /metrics` counts the writes, lists and deletes (`pondra_object_requests_total`).
+  fine (`0.25`). `GET /metrics` counts the requests to the bucket by kind (`pondra_object_requests_total`).
 - `--pg 0.0.0.0:5432`: also speak the Postgres protocol (with `COPY … TO STDOUT` and `COPY … FROM STDIN`).
 - `--kafka 0.0.0.0:9092`: also speak the Kafka protocol (`--kafka-advertise host:port` if clients
   must reach this node at another address than `--addr`'s host).

@@ -66,7 +66,7 @@ The owner's design principles, which every change must respect:
 
 ```
 src/      62,500 lines of Rust in 108 files, one per concern (see the table in README.md); `lib.rs` lists
-          the modules: the four every build has (`finish`, `fsum`, `intervals`, `xlsx`: no lake, so a
+          the modules: the ones every build has (`finish`, `fsum`, `avg`, `intervals`, `xlsx`, …: no lake, so a
           browser build shares them) and the rest under feature `server` (on by default: the node);
           `cli.rs` is the command line (its subcommands and what each starts) and `main.rs` sets the
           allocator and calls it (ADR-061); `node.rs` is a node started and stopped as an object,
@@ -315,7 +315,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   term, when its standard input closes.
 - **`sum` over DOUBLE is order-independent** (`fsum.rs`): it replaces DataFusion's `sum` in every
   session; Float64 sums carry a second double with the rounding errors (state: two columns),
-  other types go to DataFusion's.
+  other types go to DataFusion's. **`avg` over a DECIMAL is rounded at its last place** (`avg.rs`),
+  where DataFusion's cut it off.
 - **Rows that change** (round 19, ADR-020, `change.rs`, `sys.rs`). Every row has system columns:
   `_row_id` (stamped as it enters the log or a bulk INSERT's files, from blocks of ids the leader
   hands out as commit numbers: `Ids`, `Flush::reserve`), `_version` (its commit), `_created_at`,
@@ -734,7 +735,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    spread it now and then. Only the bytes it read, for this node's rate, wait for a run of 20 ms.
 73. **`pondra_object_requests_total` counts what the store was asked to do** (`store::Counted`), not
    what SlateDB tried: a local disk refuses SlateDB's tagged PUT before writing, and it tries again
-   untagged; the refusal isn't counted.
+   untagged; the refusal isn't counted. Both of a lake's clients are counted (its store, and the
+   bucket's client that scans and the SSD tier's misses use; a request goes through one of them),
+   in the classes a bucket bills: writes (each part of a multipart upload too), lists, deletes and
+   reads. `kafka_bench.py --steady` prices them against `sim_r2.py`'s own count (within 0.5%).
 74. **A column keeps the name it was first written under** (`TableMeta::columns`); SQL's names are
    `names` and `dropped` over it (`TableMeta::logical`). Everything users write goes in by SQL's
    names and into the log by stored names (`log::pack` → `to_stored`), and a name SQL no longer
@@ -1255,8 +1259,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    objects (users, grants, flows, an extension's) add a kind, not a tree. `console_check.py` (`work`).
 175. **An answer's columns are named apart** (`routines::output_names`): a query DataFusion would
    refuse for two columns of one name (`SELECT ts::date, *`, `SELECT id, *`) runs, a cast named as
-   its column or, beside another of that name, as written, a column named twice `id_1`; a query
-   that needs no name given is sent as written. `harness.py names`.
+   its column or, beside another of that name, as written, a column named twice `id_1`, and a
+   scalar subquery named as another item (DataFusion names it by its column: two of `count(*)`) or
+   an expression written twice (or but for a cast, which DataFusion's names leave out), as written,
+   or with `_1` when DataFusion names the first as written too (`NULL`, `count(*)`: no literal or
+   cast in it; `harness.py minmax`'s INSERT of two NULLs failed without it);
+   a query that needs no name given is sent as written. Calls that differ only by a cast
+   (`sum(id), sum(id::DOUBLE)`, which an aggregate refused as two of `sum(t.id)`) are told apart
+   (`routines::casts_apart`): each later form's arguments that cast a column go in `coalesce(…)`,
+   once, twice, …, alike in the SELECT, HAVING, QUALIFY and ORDER BY, and the planner takes the
+   coalesce out again. `harness.py names`.
 176. **One check at every door** (`auth::WHO`, ADR-035): HTTP, Postgres, Kafka and Flight each work
    out a `Principal` (a token's role, or a user's grants) and run the request inside `WHO.scope`;
    anything that reads tables for it (`query::guarded`), writes (`auth::allows`), streams rows
@@ -1306,7 +1318,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 185. **Every error has Postgres's code** (`codes.rs`, ADR-036 §4): a new kind of error a client
    should tell apart gets a typed `Coded` or words `codes::by_words` knows, and a test in
    `codes::tests`. Postgres sends it, HTTP's `x-pondra-sqlstate`, Flight's metadata, the clients'
-   `sqlstate`.
+   `sqlstate`. What the writer got wrong is never the node's 500: a table's definition refused is
+   42P16 unless it says a code of its own (`write::definition`), an option a table doesn't take
+   22023, a feature not taken 0A000, and a request's body or rows that can't be read 22P02
+   (`Request::read`, `server::append_rows`). A refusal a follower forwards from its leader keeps the
+   leader's code (`write::post_as`, `codes::received`). `harness.py constraints`, `ddlgaps`.
 186. **A transaction is a session's, kept where the session is, and one commit** (`txn.rs`, ADR-036
    §5): every read in it goes through `query::session_at`, which takes its snapshot and its overlay
    (`txn::overlaid`); a new path that reads tables for a session must too, or refuse inside a
@@ -1647,7 +1663,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    class merged on its own, eight files at a time): merging the newest small files into everything
    before them rewrote a streamed table every minute or so, and every query read it cold from
    Parquet until the hot columns had it again. `harness.py tiering`: "a merged file kept while eight
-   more merge".
+   more merge". A bulk write's and a merge's files are cut at 4M rows or 128 MB (`tier::FILE_BYTES`), past every
+   class, encoded a batch at a time on blocking threads (`tier::Encoding`): cut at 64 MB they came
+   out at 63.8 and a load was merged again at once (TPC-H SF1's CTAS 21 s, now 5 s).
 231. **A request's queries run on a runtime of their own once another has run a while** (`panics::work`,
    `server::queries`: `/sql`, `/mcp`, `/live`, pages, bulk inserts, a spread query's stages and
    shares, tiering jobs; every Postgres statement): appends, commits, heartbeats and the commit
@@ -2145,6 +2163,28 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    CASE, and Pondra writes `arrow_cast` (an INSERT's typed VALUES, a bound value) and `coalesce` (an
    `UPDATE … FROM`) itself. `harness.py found`: "with datafusion.optimizer.max_passes = 0, an INSERT
    into a DOUBLE column, UPDATE … FROM, arrow_cast and coalesce answer".
+296. **An avg over a DECIMAL is rounded at its last place, in a query and in a view alike** (`avg.rs`):
+   DataFusion's accumulators work it out one place further and `RoundedAvg` rounds that place away, half
+   away from zero, keeping DataFusion's type, decimal(p + 4, s + 4); a materialized view finishes its avg
+   from its kept sum and count with `pondra_avg_of`, the same arithmetic (`finish.rs`). Decimals over 24
+   digits keep DataFusion's answer, cut off, in both. TPC-H q1's `avg(l_quantity)` came back 25.522005 for
+   25.5220058…; `harness.py sums`: "avg(DECIMAL) rounded at its last place == Python's Decimal… and in a
+   materialized view" and "…ties away from zero"; `finishes`: "an avg of a DECIMAL is exact".
+297. **`x IN (subquery)` and `EXISTS` outside a WHERE are three-valued** (`optimize::SubqueriesMarked`):
+   in a projection or an aggregate each becomes a left mark join, as a WHERE's does; when either side can
+   be NULL, an uncorrelated IN asks one scalar subquery whether the values hold a NULL, and a correlated one
+   adds a mark join that also matches NULLs, so "no match" and "unknown" stay apart. Only plans DataFusion
+   couldn't run are rewritten. `harness.py friendly`: the eight IN and EXISTS forms == DuckDB's answers,
+   spread too.
+298. **A VARCHAR(n) holds at most n characters, and every door checks it** (`types.rs`,
+   `TableMeta::sql_types`: `varchar(n)` by stored name, as a uuid is kept; ADD COLUMN and `LIKE`
+   keep it): `defaults::check` refuses a longer value with Postgres's 22001, but for trailing
+   spaces (Postgres takes those and cuts them; they are kept here). A length only grows (`ALTER
+   COLUMN … TYPE VARCHAR(m)`, m ≥ n, or to text, which drops it); a column holding text never takes
+   one (42804), since its rows were never checked, and `CREATE OR ALTER TABLE` refuses that before it
+   changes anything (`types::grows`). `CHAR(n)` is still plain text. `harness.py ddlgaps`:
+   "VARCHAR(n): a longer value refused (22001) by INSERT, Postgres, UPDATE, MERGE, COPY, an append and
+   an added column…".
 300. **A node is started and stopped as an object, and a stop at any point gives back what it took**
    (`node.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
    serves, it drains, makes what it committed durable, checkpoints, ends what it started
@@ -2237,6 +2277,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (i–o): SQL, frames, a file and a live query from Node; a lake reopened; 20 opens and closes; a process that
    calls `process.exit()`, and one that just ends, without `close()` (its temporary lake gone either way); Bun; the
    library's dynamic symbols (only its ABI defined but a dependency's C API, nothing needed unversioned).
+   A node in a library prints nothing when all goes well: a slow statement too goes only to `pondra.history`
+   (`history::ended`; `inprocess_check.py` p).
 318. **SQL's plain INSERT never replaces a row of its key** (`constraints::key_check`, `key_check_over`,
    `txn::autocommit`, `txn::ByKey`): an INSERT without ON CONFLICT or OR REPLACE | IGNORE into a table
    with a PRIMARY KEY (not a merge table) is refused 23505, in Postgres's words, when two of its rows
@@ -2457,7 +2499,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    "…a user granted APPLY on this database (it deploys them) is shown routines' code and the export", "…nor in a
    failed call's error…".
 
-383. **On Linux the program gives memory back** (`main.rs`: jemalloc with its background threads;
+383. **On Linux a node gives memory back** (`main.rs` for the program, `capi/src/lib.rs` for the library that
+   the packages' `pondra` and `connect()` run: jemalloc with its background threads, dlopen's thread-locals;
    `build.yml` builds arm64 for 64 KB pages). Under a steady stream of small commits mimalloc kept
    the pages each thread freed: at 240 commits a second a node grew about 50 MB a minute while what
    it held levelled off. jemalloc's threads give back what has been free for ten seconds. macOS and
@@ -2581,7 +2624,7 @@ python3 tools/harness.py alter                 # ALTER TABLE ADD COLUMN under lo
 python3 tools/harness.py windows               # event-time windows closed by the data's time, emitted once, late rows, a leader restart
 python3 tools/harness.py sessions              # session windows emitted once, whole; late rows; a leader restart
 python3 tools/harness.py asof                  # ASOF JOIN over a stream (a view), ad hoc, over Postgres; refusals
-python3 tools/harness.py sums                  # sum(DOUBLE) == math.fsum, whole, grouped, windowed, on every node
+python3 tools/harness.py sums                  # sum(DOUBLE) == math.fsum, whole, grouped, windowed, on every node; avg(DECIMAL) rounded == Python's Decimal
 python3 tools/harness.py schemas               # schemas, three-part names, attached lakes, DDL, stored and materialized views, drops
 python3 tools/harness.py changes               # UPDATE/DELETE/MERGE vs a model on 3 nodes: row ids, views, change feed, purges, Delta, spread
 python3 tools/harness.py deal                  # a keyed table's and a view's first tiering round on 3 nodes: deleted keys stay deleted
@@ -2632,6 +2675,7 @@ python3 tools/harness.py flight                # Arrow Flight (pyarrow) and Flig
 python3 tools/metadata_bench.py [--files 1000000]   # a million files: commits, pruning, a restart, 3 nodes
 python3 tools/flight_bench.py                  # Flight in, out, and the log as a stream
 python3 tools/kafka_bench.py [--flag ack=replicated] [--kafka ~/kafka_2.13-4.3.1]   # Kafka ingest throughput and latency, 3 nodes; --kafka: the same producers into an Apache Kafka broker
+python3 tools/kafka_bench.py --s3 --steady 30 [--nodes 3]   # a steady 30 MiB/s through the Kafka port: the bucket's requests a second by class and dollars a month on S3 and R2
 python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP SDK (pip install mcp) against a node
 python3 tools/keyed_bench.py                   # keyed-table compaction: bytes written, correctness
 python3 tools/cluster.py race | isolate | split | spread

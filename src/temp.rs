@@ -75,6 +75,21 @@ pub fn listed() -> (Vec<(String, Vec<(String, String)>)>, Vec<(String, String)>)
     (x.tables.iter().map(|(n, t)| (n.clone(), t.columns.clone())).collect(), x.views.iter().map(|(n, v)| (n.clone(), v.clone())).collect())
 }
 
+/// The statement that makes one of the current session's temporary views or tables again, and its
+/// kind (`SHOW CREATE`: the session's come first, as `pg_temp` is first on Postgres's path).
+pub fn made(name: &str) -> Option<(&'static str, String)> {
+    use crate::objects::{ident, list_sql, sql_type};
+    peek(&current()?, |x| match (x.views.get(name), x.tables.get(name)) {
+        (Some(sql), _) => Some(("view", format!("CREATE TEMPORARY VIEW {} AS {sql}", ident(name)))),
+        (None, Some(t)) => {
+            let mut parts: Vec<String> = t.columns.iter().map(|(c, ty)| format!("{} {}", ident(c), sql_type(ty))).collect();
+            parts.extend((!t.key.is_empty()).then(|| format!("PRIMARY KEY ({})", list_sql(&t.key))));
+            Some(("table", format!("CREATE TEMPORARY TABLE {} ({})", ident(name), parts.join(", "))))
+        }
+        _ => None,
+    })
+}
+
 const NO_SESSION: &str = "a temporary table or view is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>, 8 to 128 letters, digits, - or _)";
 
 struct Table {
@@ -349,7 +364,9 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
     let key: Vec<String> = serde_json::from_value(spec["key"].clone()).unwrap_or_default(); // (PRIMARY KEY: checked as rows come, `check_key`)
     ensure!(spec["merge"].as_object().is_none_or(|m| m.is_empty()), "{name}: a merge table is a lake table's (a temporary table keeps its rows as they come)");
     ensure!(spec["enums"].as_object().is_none_or(|e| e.is_empty()), "{name}: a temporary table's columns are plain types (an enum column is a lake table's)");
-    ensure!(!spec["constraints"].as_array().is_some_and(|k| k.iter().any(|k| k["enforced"] == true)), "{name}: a temporary table keeps its rows as they come (UNIQUE is a lake table's; NOT ENFORCED keeps none)");
+    if spec["constraints"].as_array().is_some_and(|k| k.iter().any(|k| k["enforced"] == true)) {
+        return Err(crate::codes::coded("0A000", format!("{name}: a temporary table keeps its rows as they come (UNIQUE is a lake table's; NOT ENFORCED keeps none)")));
+    }
     let columns: Vec<(String, String)> = serde_json::from_value(spec["columns"].clone())?;
     let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::write::stored(&crate::query::dtype(t)?))))).collect::<Result<Vec<_>>>()?;
     ensure!(columns.iter().all(|(c, _)| !crate::sys::NAMES.contains(&c.as_str())), "{}: system columns (every table has them)", crate::sys::NAMES.join(", "));

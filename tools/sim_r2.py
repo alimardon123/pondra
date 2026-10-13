@@ -13,7 +13,9 @@ The store's limits (C5), when asked for: more than N writes a second to a bucket
 as R2 does. A key is written by a PUT of an object or a multipart upload's completion: an upload's
 start and its parts, and a bulk delete (a POST to the bucket itself), write none (R2's documents say
 only "concurrent writes to the same key"; limits-r2.yml logs what R2 itself refuses). Refusals per
-second are in the stats (`second`: [writes, 503s, 429s]).
+second are in the stats (`second`: [writes, 503s, 429s]). `ops` counts requests as a bucket bills them:
+`write` (PUT, a multipart upload's start, parts and end, a copy: class A), `list` (class A), `read`
+(GET and HEAD: class B) and `delete` (one, or a bulk delete's POST: free).
 """
 import argparse, json, math, random, threading, time, urllib.parse
 from collections import Counter
@@ -31,7 +33,7 @@ ap.add_argument("--writes-per-sec", type=int, default=0, help="503 SlowDown abov
 ap.add_argument("--key-writes-per-sec", type=int, default=0, help="429 for a key written again within the second (1: R2's)")
 a = ap.parse_args()
 
-counts, lock = Counter(), threading.Lock()
+counts, ops, lock = Counter(), Counter(), threading.Lock()
 seconds, last_write = {}, {}  # (second -> [writes, 503s, 429s]; key -> when last written)
 backend = DomainDispatcherApplication(create_backend_app)
 
@@ -41,13 +43,16 @@ def app(environ, start_response):
     if path == "/__sim/stats":
         start_response("200 OK", [("Content-Type", "application/json")])
         with lock:
-            return [json.dumps({**counts, "second": {str(k): v for k, v in sorted(seconds.items())}}).encode()]
+            return [json.dumps({**counts, "ops": ops, "second": {str(k): v for k, v in sorted(seconds.items())}}).encode()]
     kind = "PUT" if method in ("PUT", "POST", "DELETE") else ("LIST" if "list-type" in environ.get("QUERY_STRING", "") else "GET")
     t0 = time.time()
     refuse, q = None, urllib.parse.parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
     keyed = (method == "PUT" and "partNumber" not in q) or (method == "POST" and "uploadId" in q)
+    op = ("delete" if method == "DELETE" or (method == "POST" and "delete" in q) else "write" if method in ("PUT", "POST")
+          else "list" if kind == "LIST" else "read")
     with lock:
         counts[kind] += 1
+        ops[op] += 1
         if method in ("PUT", "POST"):
             sec = seconds.setdefault(int(t0), [0, 0, 0])
             sec[0] += 1
@@ -66,7 +71,7 @@ def app(environ, start_response):
         p50 = a.put_p50 if kind == "PUT" else a.get_p50
         time.sleep(math.exp(math.log(p50) + a.sigma * random.gauss(0, 1)) / 1000)
     if a.trace:
-        print(f"{t0:.3f} {kind:4} {environ.get('PATH_INFO', '')}?{environ.get('QUERY_STRING', '')[:60]}", flush=True)
+        print(f"{t0:.3f} {op:6} {environ.get('PATH_INFO', '')}?{environ.get('QUERY_STRING', '')[:60]}", flush=True)
     return backend(environ, start_response)
 
 

@@ -133,8 +133,8 @@ pub struct TableMeta {
     /// door refuses a value its column's labels don't list.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub enums: BTreeMap<String, crate::types::Enum>,
-    /// Columns that hold text but are of another SQL type, by stored name: "uuid" (`types.rs`).
-    /// Every door refuses a value that isn't one of the type's, written its one way.
+    /// Columns that hold text but are of another SQL type, by stored name: "uuid", "varchar(n)"
+    /// (`types.rs`). Every door refuses a value that isn't one of the type's, written its one way.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sql_types: BTreeMap<String, String>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
@@ -672,7 +672,9 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
         whole = Arc::new(ReadOnly(whole, url.trim_end_matches('/').to_string())); // (before the prefix: the lake's store and the bucket's refuse alike)
     }
     let store: Store = if prefix.is_empty() { whole.clone() } else { Arc::new(PrefixStore::new(whole.clone(), prefix)) };
-    Ok((url.trim_end_matches('/').to_string(), Arc::new(Counted(store)), Some((root, whole))))
+    // (the bucket's client, which scans and the SSD tier's misses go through, is counted apart:
+    // each request goes through one of the two)
+    Ok((url.trim_end_matches('/').to_string(), Arc::new(Counted(store)), Some((root, Arc::new(Counted(whole)) as Store))))
 }
 
 /// Lakes held in this process's memory (`memory://name`, DuckDB's `:memory:`), by place: every open
@@ -727,9 +729,12 @@ impl ObjectStore for Counted {
     }
     async fn put_multipart_opts(&self, at: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
         crate::metrics::add(&crate::metrics::OBJECT_WRITES, 1);
-        self.0.put_multipart_opts(at, opts).await
+        Ok(Box::new(CountedParts(self.0.put_multipart_opts(at, opts).await?)))
     }
-    async fn get_opts(&self, at: &Path, opts: object_store::GetOptions) -> object_store::Result<object_store::GetResult> { self.0.get_opts(at, opts).await }
+    async fn get_opts(&self, at: &Path, opts: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+        crate::metrics::add(&crate::metrics::OBJECT_READS, 1); // (a HEAD too: billed as a GET)
+        self.0.get_opts(at, opts).await
+    }
     fn delete_stream(&self, at: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
         use futures::StreamExt;
         self.0.delete_stream(at.inspect(|_| crate::metrics::add(&crate::metrics::OBJECT_DELETES, 1)).boxed())
@@ -746,6 +751,23 @@ impl ObjectStore for Counted {
         crate::metrics::add(&crate::metrics::OBJECT_WRITES, 1);
         self.0.copy_opts(from, to, opts).await
     }
+}
+
+/// A multipart upload's parts and its completion, each a request the bucket bills as a write.
+#[derive(Debug)]
+struct CountedParts(Box<dyn object_store::MultipartUpload>);
+
+#[async_trait::async_trait]
+impl object_store::MultipartUpload for CountedParts {
+    fn put_part(&mut self, data: object_store::PutPayload) -> object_store::UploadPart {
+        crate::metrics::add(&crate::metrics::OBJECT_WRITES, 1);
+        self.0.put_part(data)
+    }
+    async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+        crate::metrics::add(&crate::metrics::OBJECT_WRITES, 1);
+        self.0.complete().await
+    }
+    async fn abort(&mut self) -> object_store::Result<()> { self.0.abort().await }
 }
 
 /// What a node still catching up with its leader answers (57P03: it ran nothing, ask again or
@@ -1073,6 +1095,7 @@ impl Lake {
         crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
         crate::asof::register(&ctx); // (ASOF JOIN's marker)
         crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
+        crate::avg::register(&ctx); // avg(DECIMAL): rounded at its last place
         crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
         crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
         crate::types::register(&ctx); // gen_random_uuid(), uuidv7(), pg_typeof(x)
