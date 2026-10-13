@@ -7418,7 +7418,9 @@ def server():
     env = {**os.environ, "PONDRA_DATABASE_IDLE_SECS": "3"}
     def start(how=()):
         log = open(f"/tmp/pondra-{port}-server-{uuid.uuid4().hex[:6]}.stderr", "w")  # (its databases' nodes write here too: CI keeps it when a check fails)
-        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5"], env=env, stdout=subprocess.DEVNULL, stderr=log)
+        # (a database stops once its log is tiered, and a node's own records — the history, the audit log — commit
+        # quietly, tiered at the latest every 4 × --tier-secs: 4 s here, not the default's 40)
+        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5", "--tier-secs", "1"], env=env, stdout=subprocess.DEVNULL, stderr=log)
         until(lambda: _try(lambda: call(port, "GET", "/databases") is not None), True, 30)
         return p
     srv = start()
@@ -12196,12 +12198,22 @@ def remembered():
     Q = "SELECT count(*) AS n, sum(amount) AS s FROM r_t WHERE id % 3 = 1"
     a, b = psycopg.connect(url, autocommit=True), psycopg.connect(url, autocommit=True)
 
-    # 1. Five asks from two connections at one version: run once, the same answer each time.
+    # 1. Five asks from two connections at one version: run once, the same answer each time. Between
+    # them a statement the audit log keeps: its line lands 50 ms later, a commit no read sees (`store::quiet`;
+    # loud, it made CI's asks straddle the CREATE TABLE's line now and then).
     before = ran()
-    got = [c.execute(Q).fetchall() for c in (a, a, a, b, b)]
+    got = [a.execute(Q).fetchall()]
     runs = ran() - before
-    info["asked five times from two connections: runs"] = runs
-    checks["a query asked again, from another connection too, at one version: run once, the same answer"] = runs == 1 and all(g == got[0] for g in got) and got[0][0][0] == 334
+    try:
+        q("CREATE TABLE r_t (id BIGINT)")  # (42P07: a failed DDL statement, a line of the audit log and nothing else)
+    except Exception:
+        pass
+    time.sleep(0.3)
+    before = ran()
+    got += [c.execute(Q).fetchall() for c in (a, a, b, b)]
+    runs += ran() - before
+    info["asked five times from two connections, the audit log written between: runs"] = runs
+    checks["a query asked again, from another connection too, at one version (the audit log written between): run once, the same answer"] = runs == 1 and all(g == got[0] for g in got) and got[0][0][0] == 334
 
     # 2. A commit: the next ask runs again and sees the new row; HTTP agrees.
     a.execute("INSERT INTO r_t VALUES (1000000, 2.0)")  # (1000000 % 3 == 1)

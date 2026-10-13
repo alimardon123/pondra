@@ -29,8 +29,7 @@ use crate::reset::Once;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-pub const TABLE: &str = "pondra$history";
-pub const KEY: &str = "t/pondra$history"; // (`table_key(TABLE)`: commits only to it are quiet, `store::quiet`)
+pub const TABLE: &str = "pondra$history"; // (commits only to it are quiet: `store::RECORDS`)
 
 /// What a statement's work noted while it ran: what it answered, where, and how.
 #[derive(Default)]
