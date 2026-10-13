@@ -15,6 +15,18 @@
 //! `information_schema`: `pg_catalog.rs`), while the wire sends the values as text. Where SQL comes
 //! in, a cast to it is a cast to text (a literal checked against its labels) and `enum_range`,
 //! `enum_first` and `enum_last` are its labels (`rewrite`).
+//!
+//! `UUID` is held as text too, as Delta, Spark, Snowflake and BigQuery hold one: every reader and
+//! client reads a string, and it compares, sorts and joins as one. Each table keeps which columns
+//! are uuids (`TableMeta::sql_types`), and every door refuses a value that isn't a uuid written
+//! Postgres's one way, lower case with hyphens (`check`), so two spellings of one uuid never meet.
+//! SQL reads the other spellings Postgres takes as it does, and writes them that way: a cast to
+//! `uuid` (`'A0EE…'::uuid`, `pondra_uuid`), a string compared with a uuid or written into one
+//! (`pg_types::rewrite`), and the Postgres port's `COPY` (`spelled`); the loading doors of Pondra's
+//! own (JSON, Arrow, Kafka) take the one way. The Postgres port sends a uuid column as Postgres's
+//! `uuid` (`pg_types.rs`). `gen_random_uuid()` and
+//! `uuidv4()` are DataFusion's `uuid()`; `uuidv7()` (Postgres 18's) starts with the time, so a key
+//! of them comes in order and files hold narrow ranges of it.
 use crate::store::{json, table_key, Lake, TableMeta};
 use crate::write::Stmt;
 use anyhow::{ensure, Context, Result};
@@ -228,27 +240,95 @@ pub async fn of(lake: &Lake, t: &ast::DataType) -> Result<Option<Enum>> {
     })
 }
 
-/// A table's enum columns by SQL's names (`CREATE TABLE t LIKE s`): none when it has none, or
-/// isn't this lake's table.
-pub async fn of_table(lake: &Lake, name: &str) -> BTreeMap<String, Enum> {
-    let Ok((None, local)) = crate::ddl::resolve(lake, name).await else { return BTreeMap::new() };
+/// A table's enum columns and its other SQL types' columns by SQL's names (`CREATE TABLE t LIKE
+/// s`): none when it has none, or isn't this lake's table.
+pub async fn of_table(lake: &Lake, name: &str) -> (BTreeMap<String, Enum>, BTreeMap<String, String>) {
+    let Ok((None, local)) = crate::ddl::resolve(lake, name).await else { return Default::default() };
     match lake.cat.get::<TableMeta>(&table_key(&local)).await {
-        Ok(Some(m)) => m.logical().enums,
-        _ => BTreeMap::new(),
+        Ok(Some(m)) => {
+            let l = m.logical();
+            (l.enums, l.sql_types)
+        }
+        _ => Default::default(),
     }
 }
 
-/// A table's declared columns with every enum's type said as text (what its files hold), and the
-/// enums by column.
-pub async fn columns(lake: &Lake, cols: &[ast::ColumnDef]) -> Result<(Vec<ast::ColumnDef>, BTreeMap<String, Enum>)> {
-    let (mut out, mut enums) = (cols.to_vec(), BTreeMap::new());
+/// A table's declared columns with every enum's and uuid's type said as text (what its files
+/// hold), the enums by column, and the other SQL types by column (`sql_types`).
+pub async fn columns(lake: &Lake, cols: &[ast::ColumnDef]) -> Result<(Vec<ast::ColumnDef>, BTreeMap<String, Enum>, BTreeMap<String, String>)> {
+    let (mut out, mut enums, mut sql_types) = (cols.to_vec(), BTreeMap::new(), BTreeMap::new());
     for c in out.iter_mut() {
         if let Some(e) = of(lake, &c.data_type).await? {
             enums.insert(crate::write::ident(&c.name), e);
             c.data_type = ast::DataType::Varchar(None);
+        } else if let Some(t) = sql_type(&c.data_type)? {
+            sql_types.insert(crate::write::ident(&c.name), t.to_string());
+            c.data_type = ast::DataType::Varchar(None);
         }
     }
-    Ok((out, enums))
+    Ok((out, enums, sql_types))
+}
+
+/// A column's type as SQL writes it (`SHOW CREATE`, `pondra.parts`): an enum's, `UUID`, or what its
+/// Arrow type is (`objects::sql_type`). `m` and `column` alike by stored or alike by SQL's names.
+pub fn shown(m: &TableMeta, column: &str, arrow: &str) -> String {
+    match (m.enums.get(column), m.sql_types.get(column)) {
+        (Some(e), _) => e.sql(),
+        (None, Some(t)) => t.to_uppercase(),
+        (None, None) => crate::objects::sql_type(arrow),
+    }
+}
+
+/// A column's declared type, if it is one held as text that isn't an enum: `uuid`. An array of
+/// uuids is refused by name (a list's items aren't checked yet).
+pub fn sql_type(t: &ast::DataType) -> Result<Option<&'static str>> {
+    use ast::ArrayElemTypeDef as A;
+    match t {
+        ast::DataType::Uuid => Ok(Some("uuid")),
+        ast::DataType::Array(A::AngleBracket(e) | A::SquareBracket(e, _) | A::Parenthesis(e)) if matches!(**e, ast::DataType::Uuid) => {
+            Err(crate::codes::coded("0A000", "UUID[]: an array of uuids isn't kept yet (TEXT[] holds them as text, or a table of its own holds one a row)"))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `s` is a uuid as Postgres writes one, the only way a uuid column holds it: 36 characters, lower
+/// case, hyphens after the 8th, 12th, 16th and 20th digits.
+pub fn is_uuid(s: &str) -> bool {
+    s.len() == 36 && s.bytes().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_digit() || (b'a'..=b'f').contains(&b) })
+}
+
+/// Any spelling of a uuid Postgres takes (upper case, braces, no hyphens), written the one way;
+/// refused as Postgres refuses it (22P02).
+pub fn uuid_of(s: &str) -> Result<String> {
+    match uuid::Uuid::try_parse(s) {
+        Ok(u) => Ok(u.hyphenated().to_string()),
+        Err(_) => Err(crate::codes::coded("22P02", format!("invalid input syntax for type uuid: \"{s}\""))),
+    }
+}
+
+/// `b`'s uuid columns (`sql_types`, by `b`'s names) written the one way, from any spelling Postgres
+/// takes, as Postgres's `COPY` reads them; what isn't a uuid is refused (22P02). A column already
+/// written so is left as it is (nearly always: a pass over its values).
+pub fn spelled(b: RecordBatch, sql_types: &BTreeMap<String, String>) -> Result<RecordBatch> {
+    let mut cols = b.columns().to_vec();
+    for (i, f) in b.schema().fields().iter().enumerate() {
+        let Some(a) = cols[i].as_string_opt::<i32>().filter(|_| sql_types.get(f.name()).is_some_and(|t| t == "uuid")) else { continue };
+        if a.iter().flatten().all(is_uuid) {
+            continue;
+        }
+        let one_way: datafusion::arrow::array::StringArray = a.iter().map(|v| v.map(uuid_of).transpose()).collect::<Result<_>>()?;
+        cols[i] = std::sync::Arc::new(one_way);
+    }
+    Ok(RecordBatch::try_new(b.schema(), cols)?)
+}
+
+/// Why a uuid column refuses a value: not a uuid, or one written another way than the column holds.
+fn refused_uuid(column: &str, s: &str) -> String {
+    match uuid_of(s) {
+        Ok(u) => format!("invalid input syntax for type uuid: \"{s}\" (column {column} holds a uuid one way, lower case with hyphens: write '{u}', or cast it, '{s}'::uuid)"),
+        Err(_) => format!("invalid input syntax for type uuid: \"{s}\" (column {column} holds uuids)"),
+    }
 }
 
 /// Every door's rows (`defaults::check`): a value its column's enum doesn't list is refused, the
@@ -268,33 +348,53 @@ pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn
             return Err(anyhow::Error::new(crate::views::Violation(message, "22P02")));
         }
     }
+    for (stored, t) in &meta.sql_types {
+        let Some(c) = rows.column_by_name(if sql_names { meta.name_of(stored) } else { stored }) else { continue };
+        if t != "uuid" || c.null_count() == c.len() {
+            continue; // (a type a newer release keeps: its own nodes check it)
+        }
+        let text = datafusion::arrow::compute::cast(c, &DataType::Utf8)?;
+        let text = text.as_string::<i32>();
+        if let Some(i) = (0..text.len()).find(|&i| text.is_valid(i) && !is_uuid(text.value(i)) && !marker(i)) {
+            return Err(anyhow::Error::new(crate::views::Violation(refused_uuid(meta.name_of(stored), text.value(i)), "22P02")));
+        }
+    }
     Ok(())
 }
 
 /// Could `sql` name a type of one's own, in a cast or one of the enum functions? (Only then is
 /// it parsed for one: the built-in types' names are left alone.)
 pub fn wanted(sql: &str) -> bool {
-    static NAMED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?i)(?:::|\bas)\s*"?([a-z_][a-z0-9_]*)"?\s*(?:[.]\s*"?([a-z_][a-z0-9_]*))?|\benum_(?:range|first|last)\s*\("#).expect("a regex"));
+    static NAMED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?i)(?:::|\bas)\s*"?([a-z_][a-z0-9_]*)"?\s*(?:[.]\s*"?([a-z_][a-z0-9_]*))?|\b(?:enum_(?:range|first|last)|pg_typeof)\s*\(|'(\{?[0-9a-fA-F]{8}-?(?:[0-9a-fA-F]{4}-?){3}[0-9a-fA-F]{12}\}?)'"#).expect("a regex"));
     const BUILT_IN: &[&str] = &["int", "integer", "bigint", "smallint", "tinyint", "int2", "int4", "int8", "hugeint", "ubigint", "uinteger", "usmallint", "utinyint", "float", "float4",
         "float8", "real", "double", "decimal", "numeric", "dec", "text", "varchar", "char", "character", "string", "bpchar", "bool", "boolean", "date", "time", "timestamp", "timestamptz",
         "datetime", "interval", "json", "jsonb", "uuid", "bytea", "blob", "binary", "varbinary", "bytes", "regclass", "regtype", "regproc", "regnamespace", "oid", "name", "variant", "bit"];
     NAMED.captures_iter(sql).any(|c| match (c.get(1), c.get(2)) {
-        (None, _) => true, // (enum_range(…))
+        _ if c.get(3).is_some() => c.get(3).is_some_and(|s| !is_uuid(s.as_str())), // (`'A0EE…'`: read as a uuid where one is compared with it or written into one)
+        (None, _) => true, // (enum_range(…), pg_typeof(…))
         (Some(_), Some(_)) => true,
-        (Some(n), None) => !BUILT_IN.contains(&n.as_str().to_lowercase().as_str()),
+        (Some(n), None) => n.as_str().eq_ignore_ascii_case("uuid") || !BUILT_IN.contains(&n.as_str().to_lowercase().as_str()), // (a cast to uuid: written as text)
     })
 }
 
 /// Where SQL comes in: a cast to an enum type is a cast to text (a literal one of its labels, or
 /// refused as Postgres refuses it), and `enum_range(NULL::t)`, `enum_first`, `enum_last` its
-/// labels. Whether anything changed.
+/// labels. A cast to `uuid` is the uuid written the one way a column holds it: a literal at once
+/// (`'A0EE…'::uuid` is `'a0ee…'`), anything else by `pondra_uuid(x)` (`TRY_CAST`: `pondra_uuid(x,
+/// true)`, NULL for what isn't one). A string compared with a uuid or written into one is read as one, and
+/// `pg_typeof(x)` of one is 'uuid' (`pg_types::rewrite`), before the casts it may read are written out.
+/// Whether anything changed.
 pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
-    let mut f = Casts { types: HashMap::new(), named: vec![], labelled: vec![], failed: None };
+    let mut read = false;
+    for s in stmts.iter_mut() {
+        read |= crate::pg_types::rewrite(lake, s).await; // (strings read as uuids, pg_typeof)
+    }
+    let mut f = Casts { types: HashMap::new(), named: vec![], labelled: vec![], uuids: false, collecting: true, failed: None };
     for s in stmts.iter_mut() {
         let _ = s.visit(&mut f); // (the first pass only collects the names)
     }
-    if f.named.is_empty() {
-        return Ok(false);
+    if f.named.is_empty() && !f.uuids {
+        return Ok(read);
     }
     for n in std::mem::take(&mut f.named) {
         if let Ok(Some((_, t))) = find(lake, &n).await {
@@ -304,9 +404,10 @@ pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
     if let Some(n) = f.labelled.iter().find(|n| !f.types.contains_key(*n)) {
         return Err(crate::codes::coded("42704", format!("type \"{n}\" does not exist"))); // (not DataFusion's "Invalid function 'enum_range'")
     }
-    if f.types.is_empty() {
-        return Ok(false);
+    if f.types.is_empty() && !f.uuids {
+        return Ok(read);
     }
+    f.collecting = false;
     for s in stmts.iter_mut() {
         let _ = s.visit(&mut f);
     }
@@ -320,6 +421,8 @@ struct Casts {
     types: HashMap<String, Type>, // the names found, by their name as written (`crate::write::object`)
     named: Vec<String>,
     labelled: Vec<String>, // the types `enum_range` and its kin name, which must be there
+    uuids: bool,           // a cast to uuid was found
+    collecting: bool,      // the first pass, which only finds what is named
     failed: Option<anyhow::Error>,
 }
 
@@ -347,7 +450,35 @@ impl VisitorMut for Casts {
         if self.failed.is_some() {
             return ControlFlow::Break(());
         }
-        let collecting = self.types.is_empty();
+        let collecting = self.collecting;
+        if let ast::Expr::Cast { data_type: ast::DataType::Uuid, expr, kind, .. } = e {
+            if collecting {
+                self.uuids = true;
+                return ControlFlow::Continue(());
+            }
+            let trying = matches!(kind, ast::CastKind::TryCast | ast::CastKind::SafeCast);
+            let literal = match expr.as_ref() {
+                ast::Expr::Value(ast::ValueWithSpan { value: ast::Value::SingleQuotedString(text), .. }) => Some(text.clone()),
+                _ => None,
+            };
+            let written = match literal.map(|text| uuid_of(&text)) {
+                Some(Ok(u)) => ast::Expr::value(ast::Value::SingleQuotedString(u)),
+                Some(Err(_)) if trying => ast::Expr::value(ast::Value::Null),
+                Some(Err(err)) => {
+                    self.failed = Some(err);
+                    return ControlFlow::Break(());
+                }
+                None => {
+                    let mut args = vec![std::mem::replace(expr.as_mut(), ast::Expr::value(ast::Value::Null))];
+                    if trying {
+                        args.push(ast::Expr::value(ast::Value::Boolean(true)));
+                    }
+                    function("pondra_uuid", args)
+                }
+            };
+            *e = written;
+            return ControlFlow::Continue(());
+        }
         if let ast::Expr::Function(f) = e {
             let word = f.name.to_string().to_lowercase();
             if matches!(word.as_str(), "enum_range" | "enum_first" | "enum_last") {
@@ -388,6 +519,89 @@ impl VisitorMut for Casts {
         }
         ControlFlow::Continue(())
     }
+}
+
+/// `name(args…)` as SQL's tree has a call.
+fn function(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+    ast::Expr::Function(ast::Function {
+        name: ast::ObjectName::from(vec![ast::Ident::new(name)]),
+        uses_odbc_syntax: false,
+        parameters: ast::FunctionArguments::None,
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args.into_iter().map(|a| ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(a))).collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    })
+}
+
+/// The functions every session has for these types: `gen_random_uuid()` and `uuidv4()` (DataFusion's
+/// `uuid()` by Postgres's names), `uuidv7()`, `pondra_uuid(text [, try])` (a cast to uuid: `rewrite`)
+/// and `pg_typeof(x)`.
+pub fn register(ctx: &datafusion::prelude::SessionContext) {
+    use datafusion::logical_expr::{Signature, TypeSignature, Volatility};
+    let uuid = datafusion::functions::string::uuid();
+    ctx.register_udf(uuid.as_ref().clone().with_aliases(["gen_random_uuid", "uuidv4"]));
+    ctx.register_udf(made("uuidv7", Signature::nullary(Volatility::Volatile), |_, n| {
+        Ok(std::sync::Arc::new(datafusion::arrow::array::StringArray::from_iter_values((0..n).map(|_| uuid::Uuid::now_v7().hyphenated().to_string()))))
+    }));
+    let text = || TypeSignature::String(1);
+    let trying = TypeSignature::Exact(vec![DataType::Utf8, DataType::Boolean]);
+    ctx.register_udf(made("pondra_uuid", Signature::one_of(vec![text(), trying], Volatility::Immutable), |a, _| {
+        let text = datafusion::arrow::compute::cast(&a[0], &DataType::Utf8)?;
+        let trying = a.get(1).is_some_and(|t| t.as_boolean_opt().is_some_and(|t| t.is_valid(0) && t.value(0)));
+        let out = text.as_string::<i32>().iter().map(|v| match v.map(uuid_of) {
+            Some(Ok(u)) => Ok(Some(u)),
+            Some(Err(_)) if trying => Ok(None),
+            Some(Err(e)) => Err(datafusion::error::DataFusionError::Execution(e.to_string())),
+            None => Ok(None),
+        }).collect::<datafusion::error::Result<datafusion::arrow::array::StringArray>>()?;
+        Ok(std::sync::Arc::new(out))
+    }));
+    ctx.register_udf(made("pg_typeof", Signature::any(1, Volatility::Immutable), |a, n| {
+        let name = crate::pg_catalog::type_of(a[0].data_type());
+        Ok(std::sync::Arc::new(datafusion::arrow::array::StringArray::from_iter_values((0..n).map(|_| name.clone()))))
+    }));
+}
+
+type Body = fn(&[datafusion::arrow::array::ArrayRef], usize) -> datafusion::error::Result<datafusion::arrow::array::ArrayRef>;
+
+/// A function of `register`'s: text out, its rows' count known (a function of no arguments needs it).
+#[derive(Debug)]
+struct Made {
+    name: &'static str,
+    signature: datafusion::logical_expr::Signature,
+    body: Body,
+}
+
+// (one of each name: its name says which, never its code's address)
+impl PartialEq for Made {
+    fn eq(&self, other: &Self) -> bool { self.name == other.name }
+}
+
+impl Eq for Made {}
+
+impl std::hash::Hash for Made {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) { self.name.hash(h) }
+}
+
+impl datafusion::logical_expr::ScalarUDFImpl for Made {
+    fn name(&self) -> &str { self.name }
+    fn signature(&self) -> &datafusion::logical_expr::Signature { &self.signature }
+    fn return_type(&self, _: &[DataType]) -> datafusion::error::Result<DataType> { Ok(DataType::Utf8) }
+    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> datafusion::error::Result<datafusion::logical_expr::ColumnarValue> {
+        let n = args.number_rows;
+        let arrays = args.args.iter().map(|a| a.to_array(n)).collect::<datafusion::error::Result<Vec<_>>>()?;
+        Ok(datafusion::logical_expr::ColumnarValue::Array((self.body)(&arrays, n)?))
+    }
+}
+
+fn made(name: &'static str, signature: datafusion::logical_expr::Signature, body: Body) -> datafusion::logical_expr::ScalarUDF {
+    datafusion::logical_expr::ScalarUDF::new_from_impl(Made { name, signature, body })
 }
 
 /// `CREATE TYPE name AS ENUM (…)`, as `SHOW CREATE TYPE` writes it.

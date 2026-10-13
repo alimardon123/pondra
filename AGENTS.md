@@ -683,7 +683,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 61. **Only the program that started a node reads files through it** (`server::owner`: the key in
    `PONDRA_OWNER_KEY`, which the shell and `local()` make and send). Invariant 21 holds for
    everyone else. `smoke.py`: "the shell reads a file on this machine…" and "a node doesn't read
-   this machine's files for whoever asks".
+   this machine's files for whoever asks". Its answers are remembered apart from everyone else's
+   (`server::query`: `owner` in the key, run with its rights), and a statement that reads files
+   never is: once expanded it names them (`"ext:…"`), or a view it reads does. `harness.py
+   external`: "the owner's answers are remembered, but not one that reads a file here…".
 62. **A node never leads another lake in its own process** (`inbox::lead_once`): a write to an
    attached lake nobody leads, `CREATE DATABASE` and `ATTACH` of a new folder go through a `pondra
    lead` of their own (hidden), which leads for a moment, once, and ends. That lake's catalog writer would
@@ -1635,7 +1638,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`plain_scan`: the rows `raw` reads), any other table as before. Conforming every segment again
    for each query, a batch a segment, made dashboards three times as costly while rows streamed in.
    `harness.py tails`: every read == a model while rows land, a transaction's snapshot held while
-   other reads move past it, rows from before an added column, through tiering.
+   other reads move past it, rows from before an added column, through tiering. The decoded segments
+   under it (`store::Tail`, 256 MB at most) go up to a table's new mark as soon as the node sees the
+   commit that moved it (`Lake::arrived`), read or not: kept until a read, a table only written after
+   one read held them (`fluss_bench.py`: 267 MB of a node's 740 once idle). `harness.py tails`:
+   "decoded log rows go when their table is tiered, with no read since".
 230. **A merge's file waits for files of its size** (`tier::class`: under 4 MB, 16 MB, 64 MB, each
    class merged on its own, eight files at a time): merging the newest small files into everything
    before them rewrote a streamed table every minute or so, and every query read it cold from
@@ -2132,6 +2139,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    joins (its exchanges are the spread analysis's). `harness.py hot`: "NOT IN a subquery with a
    NULL keeps no row…" fails with a NOT IN hashed (the threads that never met the NULL keep their
    rows).
+295. **SQL answers with the optimizer off** (`optimize::Runnable`, the last analyzer rule): under
+   `datafusion.optimizer.max_passes = 0` every scalar function is replaced by what its simplifier
+   makes of it, as the optimizer would. `arrow_cast`, `coalesce` and `nvl2` run only as that CAST or
+   CASE, and Pondra writes `arrow_cast` (an INSERT's typed VALUES, a bound value) and `coalesce` (an
+   `UPDATE … FROM`) itself. `harness.py found`: "with datafusion.optimizer.max_passes = 0, an INSERT
+   into a DOUBLE column, UPDATE … FROM, arrow_cast and coalesce answer".
 300. **A node is started and stopped as an object, and a stop at any point gives back what it took**
    (`node.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
    serves, it drains, makes what it committed durable, checkpoints, ends what it started
@@ -2334,16 +2347,20 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `Host` that isn't an IP, `localhost`, the machine's name or `--advertise`'s is refused on every
    request: a rebinding page's GETs carry no `Origin`. `harness.py guarded`.
 
-373. **The row doors and the nodes' own routes take only what their caller may write**
-   (`auth::check_rows`, `flush_from_writer`, `files_from_writer`):
-   - `/append` and `/insert` ask the INSERT grant, as SQL's INSERT does. A table made through
-     `/insert` is an admin's, and no caller writes a `$` table there.
+373. **Every row door takes only what its caller may write, and the lake's records are Pondra's alone**
+   (`auth::check_rows`, `allows`, `may_read_all`, `flush_from_writer`, `files_from_writer`):
+   - `/append`, `/insert`, Flight's DoPut and ingest and Kafka's produce ask the INSERT grant, as SQL's
+     INSERT does. A table made through `/insert` is an admin's.
+   - No statement writes a `$` table (the lake's records, a table's old versions), a superuser's
+     included, and a `$` table's rows stream to a superuser only (Flight's DoGet, `/watch`, `/lookup`,
+     Kafka's fetch, MCP's changes); SQL reads the records through `pondra.audit` and `pondra.history`.
    - `/cluster/commit` and `/cluster/files` are the nodes' and write tokens', never a user's.
    - A write token's flush is rows in a segment of the log, never into the lake's records
      (`pondra$audit`, `history`, `runs`), and never moves a sequence or row ids. Its files go in
      their table's folder.
 
-   `harness.py guarded`.
+   `harness.py guarded`: "Flight's DoPut and Kafka's produce take a user's rows as its grants say…",
+   "a hidden table's rows (pondra$audit) stream to a superuser only…".
 
 374. **A change a follower sends its leader runs there as its user** (`write::post` names the user
    in `x-pondra-as`; `server::guard` takes it from the nodes' own calls only), so what the change
@@ -2447,6 +2464,15 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    Windows keep mimalloc. An allocator change shows TPC-H, TPC-DS and `harness.py memory` before and
    after. `harness.py memory`: "its own memory levels off…" fails on mimalloc.
 
+384. **A leader killed and started again takes the next term; only its own restart takes its term back**
+   (`cluster::coming_back`): a node whose address leads the latest term takes it back only when the
+   term's lock file here is still held or says `restarting` (invariant 370's file: an exec, Windows'
+   new process, the supervisor's restart). Killed and started again by its service, or in a new
+   container (no file here), it claims the next term as it starts. Taken back, its followers' lease ran
+   out while it opened the lake on a bucket, one of them claimed the next term, and both opened the
+   lake as leader in turn, the first fenced (writes waited 12–15 s on simulated R2, 21 s on R2).
+   `resilience_check.py restart`: "kill 1: …and no node opened the lake as leader only to be fenced".
+
 395. **RETURNING answers the rows the write worked out, never rows read back** (`returning.rs`: `wrote`
    from `write::run_listed`, `txn::autocommit_as`, `insert_as` and `txn::statement`). A change the
    leader would work out (`write::changes`) runs as a transaction of its own (`txn::alone`) in the
@@ -2456,6 +2482,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (42501). A job sent again is refused 55000, never answered with no rows. `harness.py returning`:
    "a job's INSERT … RETURNING into a UNIQUE table and a keyed one, sent again: refused 55000, not
    23505" (55P03 with the job as the transaction's id), "a user granted INSERT but not SELECT…".
+
+396. **A uuid column holds one spelling, and every door checks it** (`types.rs`,
+   `TableMeta::sql_types`): lower case with hyphens, so it compares, sorts and joins as text;
+   `defaults::check` refuses anything else (22P02). SQL reads the other spellings Postgres takes as it
+   does, found by their place in the statement, never by their text (`pg_types::rewrite`: a cast, a
+   string compared with a uuid or written into one), and so do key lookups (`serve::point`) and the
+   Postgres port's COPY (`types::spelled`). A column becomes a uuid only when made (42804 after): its
+   rows were never checked. The Postgres port sends a column it traces to a uuid as Postgres's `uuid`
+   (`pg_types::typed`, oid 2950), and Describe and the answer agree. `harness.py uuids`: "SQL reads
+   upper case, braces and no hyphens as Postgres does…" (a key lookup found nothing before
+   `serve::point` read its key so), "what isn't a uuid … is refused 22P02 by every write door…".
 
 ## Tests: run these before and after any change
 
@@ -2508,6 +2545,7 @@ python3 tools/harness.py refreshed      # views run whole (ORDER BY … LIMIT, w
 python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
 python3 tools/harness.py sequences      # nextval on three nodes (every value once), identity columns from every door, ALWAYS, owned sequences, a leader's kill
 python3 tools/harness.py enums          # CREATE TYPE … AS ENUM and ENUM('a', 'b') columns: labels from every door (22P02), casts, enum_range, ADD VALUE, RENAME, DROP while used
+python3 tools/harness.py uuids          # UUID columns: every door's refusals (22P02), Postgres's spellings, uuidv7, pg_typeof, psycopg/asyncpg/SQLAlchemy as uuid.UUID, COPY, CTAS, ALTER TYPE
 python3 tools/harness.py constraints    # UNIQUE from every door and three nodes at once (23505), NOT ENFORCED facts, ADD/DROP CONSTRAINT, SHOW CREATE, the Postgres catalog
 python3 tools/harness.py pkey           # a plain INSERT of a held key: 23505 at every door, two nodes at once, transactions and savepoints, upserts still upsert, CTAS, pondra sql
 python3 tools/harness.py returning      # INSERT/UPDATE/DELETE … RETURNING at every door == Postgres: ORMs (Django, SQLAlchemy), keys, UNIQUE, upserts, transactions, a follower, jobs (55000), grants (42501)

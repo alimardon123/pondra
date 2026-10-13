@@ -280,6 +280,20 @@ def external():
     checks["Parquet: a folder's files, declared columns by name, one they don't hold NULL (and IS NULL finds it)"] = q("SELECT name, id, n FROM p2 WHERE missing IS NULL AND n > 15") == [{"name": "b", "id": 2, "n": 20.0}]
     q("CREATE EXTERNAL TABLE j1 (b VARCHAR, a BIGINT) STORED AS JSON LOCATION 'j.json'")
     checks["JSON: declared columns by name, others left out"] = q("SELECT * FROM j1 ORDER BY a") == [{"b": "x", "a": 1}, {"b": "y", "a": 2}]
+    # The program that started the node has its answers remembered too (apart from anyone else's),
+    # but never a statement that reads files: a file here changes on its own.
+    import re
+    held = lambda: float(re.search(rb'pondra_cache_bytes\{cache="answers"\} (\S+)', call(A.port, "GET", "/metrics", headers=hdr)).group(1))
+    q("CREATE TABLE owned (a BIGINT)"); q("INSERT INTO owned VALUES (1), (2)")
+    before = held(); first = q("SELECT sum(a) AS s FROM owned"); after_lake = held(); again = q("SELECT sum(a) AS s FROM owned")
+    open(os.path.join(here, "seen.csv"), "w").write("v\n1\n")
+    read1 = q("SELECT sum(v) AS s FROM 'seen.csv'"); after_file = held()
+    open(os.path.join(here, "seen.csv"), "w").write("v\n1\n2\n")
+    read2 = q("SELECT sum(v) AS s FROM 'seen.csv'")
+    q("INSERT INTO owned VALUES (3)")
+    checks["the owner's answers are remembered, but not one that reads a file here: it is read again, changed"] = first == again == [{"s": 3}] and after_lake > before \
+        and read1 == [{"s": 1}] and read2 == [{"s": 3}] and after_file == after_lake and q("SELECT sum(a) AS s FROM owned") == [{"s": 6}]
+    q("DROP TABLE owned")
     q("CREATE EXTERNAL TABLE ev (id INT, name VARCHAR) STORED AS CSV LOCATION 'ev/' OPTIONS ('format.has_header' 'false')")
     empty = q("SELECT count(*) AS n FROM ev")
     q("INSERT INTO ev VALUES (1, 'one'), (2, 'two')")
@@ -1392,7 +1406,10 @@ def tails():
         check(f"after insert {i}, a column added")
     added = q("SELECT count(*) AS n, count(x) AS c, sum(x) AS s FROM t")[0]
     want_added = {"n": len(model), "c": sum(1 for *_, x in model if x is not None), "s": sum(x for *_, x in model if x is not None)}
+    decoded = lambda: float(re.search(rb'pondra_cache_bytes\{cache="log"\} (\S+)', call(A.port, "GET", "/metrics")).group(1))
+    before_tiering = decoded()
     call(A.port, "POST", "/tier", timeout=600)
+    after_tiering = decoded()  # (no read in between: the commit that moved the marks let them go)
     check("after tiering")
     for i in range(60, 70):
         insert(i, x=True)
@@ -1402,11 +1419,12 @@ def tails():
         "every read == the model while rows stream in (two tables, one keyed)": not wrong,
         "a transaction reads its snapshot while other reads move past it": held == snapshot == 80,
         "rows from before an added column read it as NULL": added == want_added,
+        "decoded log rows go when their table is tiered, with no read since": before_tiering > 0 and after_tiering == 0,
     }
     for name, good in checks.items():
         print(f"tails: {name}: {'OK' if good else 'FAIL'}")
     if not all(checks.values()):
-        print(f"tails: wrong {wrong[:3]}, snapshot {snapshot} held {held}, added {added} (want {want_added})")
+        print(f"tails: wrong {wrong[:3]}, snapshot {snapshot} held {held}, added {added} (want {want_added}), decoded {before_tiering} then {after_tiering}")
         sys.exit(1)
     return "a table's log tail kept between queries: reads == the model, a transaction's snapshot, columns added, tiering"
 
@@ -2840,10 +2858,13 @@ def refreshed():
         "final": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r3 WITH (refresh = 'full') AS SELECT date_bin(INTERVAL '1 day', ts) AS d, count(*) AS n FROM orders GROUP BY 1 EMIT FINAL")),
         "nonsense": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r4 WITH (refresh = 'sometimes') AS SELECT * FROM orders")),
     }
+    # (every view caught up with the last writes before its rows are kept: a view still running
+    # behind them when it was read came back from the restart with the rows it then worked out)
+    settled = same()
     stored = {name: q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST") for name, (_, by) in views.items()}
     node.kill()
     node = Node(lake, A.port, tier_secs=1).start()
-    restarted = all(_close(q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST"), stored[name]) for name, (_, by) in views.items())
+    restarted = all(settled.values()) and all(_close(q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST"), stored[name]) for name, (_, by) in views.items())
     q("INSERT INTO orders " + ORDER_ROWS.format(3001, 3400))
     after_restart = same()
     q("DROP MATERIALIZED VIEW top_names"); q("DROP MATERIALIZED VIEW asked")
@@ -2971,10 +2992,13 @@ def bykey():
     q("CREATE MATERIALIZED VIEW most AS SELECT region, max(customers) AS m FROM regulars GROUP BY region")
     most = _bykey_same(q, "most", "SELECT region, max(customers) AS m FROM regulars GROUP BY region", "region") and \
         q("SELECT refresh FROM pondra.flows WHERE name = 'most'")[0]["refresh"] == "by key"
+    # (every view caught up with the last writes before its rows are kept: a view still running
+    # behind them when it was read came back from the restart with the rows it then worked out)
+    settled = same()
     stored = {name: q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST") for name, (_, by) in views.items()}
     node.kill()
     node = Node(lake, A.port, tier_secs=1).start()
-    restarted = all(_close(q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST"), stored[name]) for name, (_, by) in views.items())
+    restarted = all(settled.values()) and all(_close(q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST"), stored[name]) for name, (_, by) in views.items())
     q("INSERT INTO orders " + ORDER_ROWS.format(3001, 3400))
     after_restart = same()
     q("DROP MATERIALIZED VIEW sizes"); q("DROP MATERIALIZED VIEW busy"); q("DROP MATERIALIZED VIEW most")
@@ -6767,6 +6791,17 @@ def found():
     want = [{"id": 1, "amount": 99}, {"id": 4, "amount": 40}]
     seen["view"] = until(lambda: q("SELECT id, amount FROM eu ORDER BY id"), want, 15)
     checks["a filtered materialized view follows UPDATE and DELETE of its table"] = seen["view"] == want
+    # Functions that run only once simplified run with the optimizer off too (`optimize::Runnable`): an
+    # INSERT's VALUES for a DOUBLE column (Pondra writes arrow_cast), an UPDATE … FROM (coalesce), by hand
+    q("CREATE TABLE unopt (a INT, c DOUBLE)")
+    unopt = "SET datafusion.optimizer.max_passes = 0; INSERT INTO unopt VALUES (1, 2.0), (2, 1e20); "
+    seen["unoptimized"] = [_raises_text(lambda: q(unopt + "SELECT 1")), q("SELECT a, c FROM unopt ORDER BY a"),
+                           q("SET datafusion.optimizer.max_passes = 0; UPDATE unopt SET c = s.c FROM (SELECT 1 AS a, 3.5 AS c) s WHERE unopt.a = s.a; SELECT 1"),
+                           q("SELECT a, c FROM unopt ORDER BY a"),
+                           q("SET datafusion.optimizer.max_passes = 0; SELECT arrow_cast('2026-10-12', 'Date32') + 1 AS d, coalesce(NULL, 2) AS n")]
+    checks["with datafusion.optimizer.max_passes = 0, an INSERT into a DOUBLE column, UPDATE … FROM, arrow_cast and coalesce answer"] = \
+        seen["unoptimized"] == ["", [{"a": 1, "c": 2.0}, {"a": 2, "c": 1e20}], [{"Int64(1)": 1}], [{"a": 1, "c": 3.5}, {"a": 2, "c": 1e20}],
+                                [{"d": "2026-10-13", "n": 2}]]
     # A producer's batches count from seq=1: seq 0 would be taken for one already written.
     q("CREATE TABLE ev (user VARCHAR, n BIGINT)")
     zero = _raises_text(lambda: call(port, "POST", "/append/ev?producer=p&seq=0", b'{"user": "a", "n": 1}\n'))
@@ -11325,6 +11360,17 @@ def ddlgaps():
     info["cascade_task"] = [busy, busy_view]
     checks["DROP TABLE … CASCADE refused by name when a task reads it: nothing half dropped (its view still answers)"] = \
         busy[0] != 200 and "reads t_busy" in busy[2] and busy_view == 200
+    plain_busy = err("DROP TABLE t_busy")  # (a task among its readers: CASCADE would refuse too)
+    info["drop_task_reader"] = plain_busy
+    checks["DROP TABLE refused while a task reads it says to drop them first, offering no CASCADE (which drops views only)"] = \
+        plain_busy[0] != 200 and "drop them first" in plain_busy[2] and "CASCADE" not in plain_busy[2]
+    # Spark's TBLPROPERTIES with a dotted key written bare answers as the key quoted does, never as a parse error
+    q("CREATE TABLE t_props (id INT)")
+    bare = err("ALTER TABLE t_props SET TBLPROPERTIES (write.delete.mode = 'merge-on-read')")
+    quoted = err("ALTER TABLE t_props SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')")
+    info["tblproperties"] = [bare, quoted]
+    checks["TBLPROPERTIES (write.delete.mode = …) with the dotted key bare answers as the quoted key does (not 42601)"] = \
+        bare == quoted and bare[1] != "42601"
     # a table named with its schema, and a view named in capitals, are found and dropped too
     q("CREATE TABLE base_q (id INT)")
     q('CREATE VIEW "Up_V" AS SELECT id FROM base_q')
@@ -11711,6 +11757,428 @@ def enums():
     if not ok:
         sys.exit(1)
     return f"{sum(checks.values())} of {len(checks)} enum checks"
+
+
+def uuids():
+    """UUID columns, kept as their canonical text (36 characters, lower-case hex, hyphens at 8, 13, 18 and 23).
+    `DEFAULT gen_random_uuid()` as a PRIMARY KEY gives each row its own version-4 id. Every write door (INSERT,
+    INSERT … SELECT, UPDATE, POST /append, the Postgres port, `pondra sql`) refuses what isn't a uuid ('nope', a
+    digit short) with 22P02, writing nothing, and takes a canonical value and reads it back. SQL reads the other
+    spellings Postgres takes (upper case, braces, no hyphens) as it does: written into a uuid column, the canonical
+    form is kept, and compared with one, `id = 'A0EE…'` finds the row (a key lookup too); so does the Postgres port's
+    COPY, while POST /append, a loading door of Pondra's own, refuses them. CREATE TABLE … AS keeps a uuid column one. Casts normalize upper case and refuse 'nope' (CAST is 22P02, TRY_CAST NULL); uuidv7() is version
+    7, distinct and time-ordered (its first 48 bits are the Unix milliseconds); pg_typeof says 'uuid' over HTTP and
+    the Postgres port. The Postgres port sends uuid columns as Postgres's uuid (oid 2950), so psycopg returns
+    uuid.UUID (text, binary, RETURNING, DECLARE and named cursors) and takes them as parameters; asyncpg and
+    SQLAlchemy's Uuid(as_uuid=True) work the same. The catalog says uuid; SHOW CREATE TABLE shows UUID and runs again
+    after a DROP; ADD COLUMN and RENAME COLUMN keep the type; ALTER COLUMN … TYPE and CREATE OR ALTER refuse a
+    VARCHAR turned into one (42804) and turn a uuid into text."""
+    import asyncio
+    import psycopg
+    import sqlalchemy as sa
+    from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+    try:
+        import asyncpg
+    except ImportError:
+        asyncpg = None
+
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 10
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    V4 = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+    V7 = r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"  # (version digit 14, variant digit 19)
+    UPPER = "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11"
+    BAD = ["nope", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1"]  # (not a uuid: refused at every door)
+    SPELLED = [str.upper, lambda u: "{" + u + "}", lambda u: u.replace("-", "")]  # (a uuid another way: as Postgres reads it)
+    fresh = lambda: str(uuid.uuid4())
+    g = {k: fresh() for k in ("ins", "sel", "app", "pgi", "cli", "ref_ins", "ref_sel", "ref_app")}
+    checks, info = {}, {}
+    node = None
+
+    def check(name, fn):
+        """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def q(s):
+        return call(port, "POST", "/sql", s.encode(), timeout=120)
+
+    def err(s, path="/sql"):
+        """(status, x-pondra-sqlstate, the whole body) of a POST; (200, None, '') when it went through."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", path, s.encode(), {})
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        return (r.status, r.getheader("x-pondra-sqlstate"), data) if r.status != 200 else (200, None, "")
+
+    def pg_write(s):
+        """The SQLSTATE the Postgres port answers a statement with, None when it went in."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            try:
+                conn.execute(s)
+                return None
+            except psycopg.Error as e:
+                return e.sqlstate
+
+    def pg_rows(s):
+        with psycopg.connect(url, autocommit=True) as conn:
+            return conn.execute(s).fetchall()
+
+    def cli(s):
+        return subprocess.run([BIN, "sql", "--dir", lake, s], capture_output=True, text=True, timeout=120)
+
+    def cli_refused(s):
+        """pondra sql refused the statement for a uuid (its message is kept in info when it did not). The command
+        line says a refusal's message only, never its SQLSTATE, so the words of the 22P02 error are what's matched."""
+        p = cli(s)
+        if p.returncode != 0 and "invalid input syntax for type uuid" in p.stderr:
+            return True
+        info.setdefault("pondra sql, not refused for a uuid", []).append([s[:90], p.returncode, p.stderr[-300:]])
+        return False
+
+    def cli_ok(s):
+        p = cli(s)
+        if p.returncode != 0:
+            info.setdefault("pondra sql, refused", []).append([s[:90], p.returncode, p.stderr[-300:]])
+        return p.returncode == 0
+
+    def snap():
+        """Every row as the node holds it (name, id, ref), sorted: what a refused write must leave as it was."""
+        return sorted((r.get("name") or "", r.get("id") or "", r.get("ref") or "") for r in q("SELECT name, id, ref FROM u"))
+
+    def http_refused(s, path="/sql"):
+        status, code, _ = err(s, path)
+        return status != 200 and code == "22P02"
+
+    def pg_refused(s):
+        return pg_write(s) == "22P02"
+
+    def text_of(rs):
+        return " ".join(str(v) for r in rs for v in r.values())  # (a SHOW CREATE's text, whatever its column is called)
+
+    # Each door's statement with a bad value in it: refused with 22P02, and the table left as it was.
+    attempts = {
+        "INSERT": lambda b: http_refused(f"INSERT INTO u (id, name) VALUES ('{fresh()}', 'good'), ('{b}', 'bad')"),
+        "INSERT … SELECT": lambda b: http_refused(f"INSERT INTO u (id, name) SELECT '{b}', 'bad' FROM range(1)"),
+        "UPDATE": lambda b: http_refused(f"UPDATE u SET ref = '{b}' WHERE name = 'a'"),
+        "POST /append": lambda b: http_refused(f'{{"id": "{fresh()}", "name": "good"}}\n{{"id": "{b}", "name": "bad"}}\n', "/append/u"),
+        "Postgres INSERT": lambda b: pg_refused(f"INSERT INTO u (id, name) VALUES ('{fresh()}', 'good'), ('{b}', 'bad')"),
+        "Postgres UPDATE": lambda b: pg_refused(f"UPDATE u SET ref = '{b}' WHERE name = 'a'"),
+        "pondra sql INSERT": lambda b: cli_refused(f"INSERT INTO u (id, name) VALUES ('{fresh()}', 'good'), ('{b}', 'bad')"),
+        "pondra sql UPDATE": lambda b: cli_refused(f"UPDATE u SET ref = '{b}' WHERE name = 'a'"),
+    }
+
+    def default_ids():
+        q("INSERT INTO u (name) VALUES ('a'), ('b')")
+        got = q("SELECT id, name FROM u WHERE name IN ('a', 'b') ORDER BY name")
+        info["default ids"] = got
+        ids = [r["id"] for r in got]
+        return len(ids) == 2 and all(re.fullmatch(V4, i) for i in ids) and ids[0] != ids[1]
+
+    def refused_everywhere():
+        failed = {}
+        for door, attempt in attempts.items():
+            for b in BAD:
+                before = snap()
+                refused = attempt(b)
+                if not refused or snap() != before:
+                    failed[f"{door} {b}"] = refused
+        for spell in SPELLED:  # (a loading door takes the column's own form only)
+            before = snap()
+            b = spell(fresh())
+            if not attempts["POST /append"](b) or snap() != before:
+                failed[f"POST /append {b}"] = False
+        info["refusals that failed (door and value: refused)"] = failed
+        return not failed
+
+    def spelled_as_postgres():
+        """Each SQL door writes another spelling as the canonical form, compares it as one, and leaves text alone."""
+        ids = {door: fresh() for door in ("INSERT", "INSERT … SELECT", "Postgres INSERT", "pondra sql INSERT", "UPDATE", "Postgres UPDATE", "pondra sql UPDATE")}
+        sent = {}
+        for i, (door, u) in enumerate(ids.items()):
+            s = SPELLED[i % len(SPELLED)](u)
+            name = f"sp-{i}"
+            if door == "INSERT":
+                sent[door] = err(f"INSERT INTO u (id, name) VALUES ('{s}', '{name}')")[0] == 200
+            elif door == "INSERT … SELECT":
+                sent[door] = err(f"INSERT INTO u (id, name) SELECT '{s}', '{name}' FROM range(1)")[0] == 200
+            elif door == "Postgres INSERT":
+                sent[door] = pg_write(f"INSERT INTO u (id, name) VALUES ('{s}', '{name}')") is None
+            elif door == "pondra sql INSERT":
+                sent[door] = cli_ok(f"INSERT INTO u (id, name) VALUES ('{s}', '{name}')")
+            else:  # an UPDATE: a row of its own first, then its ref set the other way
+                q(f"INSERT INTO u (id, name) VALUES ('{fresh()}', '{name}')")
+                stmt = f"UPDATE u SET ref = '{s}' WHERE name = '{name}'"
+                sent[door] = {"UPDATE": lambda: err(stmt)[0] == 200, "Postgres UPDATE": lambda: pg_write(stmt) is None, "pondra sql UPDATE": lambda: cli_ok(stmt)}[door]()
+        back = {r["name"]: r.get("ref") if r["name"] in ("sp-4", "sp-5", "sp-6") else r.get("id") for r in q("SELECT name, id, ref FROM u WHERE name LIKE 'sp-%'")}
+        want = {f"sp-{i}": u for i, u in enumerate(ids.values())}
+        # compared: an upper-case literal finds the canonical row, over HTTP and Postgres; text stays text
+        u0 = ids["INSERT"]
+        found = [r["name"] for r in q(f"SELECT name FROM u WHERE id = '{u0.upper()}' OR ref IN ('{{{ids['UPDATE']}}}')")]
+        pg_found = pg_rows(f"SELECT name FROM u WHERE id = '{u0.upper()}'")
+        q(f"INSERT INTO u (id, name) VALUES ('{fresh()}', '{u0.upper()}')")  # (a name that looks like a uuid)
+        text = [r["name"] for r in q(f"SELECT name FROM u WHERE name = '{u0.upper()}'")]
+        info["other spellings: sent (door: ok), read back, found by an upper-case literal (HTTP, Postgres), a text column"] = [sent, back, sorted(found), pg_found, text]
+        return all(sent.values()) and back == want and sorted(found) == ["sp-0", "sp-4"] and pg_found == [("sp-0",)] and text == [u0.upper()]
+
+    def accepted_everywhere():
+        sent = {}
+        sent["INSERT"] = err(f"INSERT INTO u (id, name) VALUES ('{g['ins']}', 'ok-ins')")[0] == 200
+        sent["INSERT … SELECT"] = err(f"INSERT INTO u (id, name) SELECT '{g['sel']}', 'ok-sel' FROM range(1)")[0] == 200
+        sent["UPDATE"] = err(f"UPDATE u SET ref = '{g['ref_ins']}' WHERE name = 'ok-ins'")[0] == 200
+        sent["POST /append"] = err(f'{{"id": "{g["app"]}", "name": "ok-app"}}\n', "/append/u")[0] == 200
+        sent["Postgres INSERT"] = pg_write(f"INSERT INTO u (id, name) VALUES ('{g['pgi']}', 'ok-pg')") is None
+        sent["Postgres UPDATE"] = pg_write(f"UPDATE u SET ref = '{g['ref_sel']}' WHERE name = 'ok-sel'") is None
+        sent["pondra sql INSERT"] = cli_ok(f"INSERT INTO u (id, name) VALUES ('{g['cli']}', 'ok-cli')")
+        sent["pondra sql UPDATE"] = cli_ok(f"UPDATE u SET ref = '{g['ref_app']}' WHERE name = 'ok-app'")
+        back = {r["name"]: (r.get("id"), r.get("ref")) for r in q("SELECT name, id, ref FROM u WHERE name LIKE 'ok-%'")}
+        want = {"ok-ins": (g["ins"], g["ref_ins"]), "ok-sel": (g["sel"], g["ref_sel"]), "ok-app": (g["app"], g["ref_app"]),
+                "ok-pg": (g["pgi"], None), "ok-cli": (g["cli"], None)}
+        info["accepted (door: ok), then read back (name: id, ref)"] = [sent, back]
+        return all(sent.values()) and back == want
+
+    def copy_and_ctas():
+        a, b = fresh(), fresh()
+        with psycopg.connect(url, autocommit=True) as conn:
+            with conn.cursor() as cur, cur.copy("COPY u (id, name) FROM STDIN") as cp:
+                cp.write(f"{a.upper()}\tcp-a\n{{{b}}}\tcp-b\n")
+            try:
+                with conn.cursor() as cur, cur.copy("COPY u (id, name) FROM STDIN") as cp:
+                    cp.write(f"{fresh()}\tcp-c\nnope\tcp-d\n")
+                bad = None
+            except psycopg.Error as e:
+                bad = e.sqlstate
+        got = {r["name"]: r["id"] for r in q("SELECT name, id FROM u WHERE name LIKE 'cp-%'")}
+        q("CREATE TABLE u2 AS SELECT id, name, ref FROM u")
+        with psycopg.connect(url, autocommit=True) as conn:
+            cur = conn.execute("SELECT id, name FROM u2 WHERE name = 'cp-a'")
+            row, codes = cur.fetchall(), [d.type_code for d in cur.description]
+        nope = err("INSERT INTO u2 (id, name) VALUES ('nope', 'x')")[:2]
+        shown = text_of(q("SHOW CREATE TABLE u2"))
+        info["COPY: rows read back, 'nope' (sqlstate); CREATE TABLE u2 AS: psycopg row and type codes, 'nope' (status, sqlstate), SHOW CREATE"] = [got, bad, row, codes, nope, shown]
+        return (got == {"cp-a": a, "cp-b": b} and bad == "22P02" and row == [(uuid.UUID(a), "cp-a")] and codes == [2950, 25]
+                and nope[1] == "22P02" and bool(re.search(r'\bref"?\s+UUID\b', shown)))
+
+    def casts():
+        up = q("SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid AS a")[0].get("a")
+        refused = err("SELECT CAST('nope' AS UUID) AS x")
+        tried = q("SELECT TRY_CAST('nope' AS UUID) AS x")[0].get("x")  # (the node leaves NULL keys out)
+        info["casts: upper case, CAST 'nope' (status, sqlstate), TRY_CAST 'nope'"] = [up, refused[:2], tried]
+        return up == "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" and refused[1] == "22P02" and tried is None
+
+    def v7():
+        vals = [r["v"] for r in q("SELECT uuidv7() AS v FROM range(20)")]
+        ms = [int(v.replace("-", "")[:12], 16) for v in vals]  # the first 48 bits: Unix milliseconds
+        info["uuidv7(): the first two"] = vals[:2]
+        return (len(vals) == 20 and len(set(vals)) == 20 and all(re.fullmatch(V7, v) for v in vals)
+                and all(abs(m / 1000 - time.time()) < 60 for m in ms))
+
+    def typeof():
+        # (the brief's 'x'::uuid is not a uuid: a canonical literal stands in for it)
+        sel = ("SELECT pg_typeof(id) AS a, pg_typeof(name) AS b, pg_typeof('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid) AS c, "
+               "pg_typeof(uuidv7()) AS d FROM u LIMIT 1")
+        h = q(sel)[0]
+        p = pg_rows(sel)[0]
+        bare = q("SELECT pg_typeof(id) FROM u LIMIT 1")  # (named as written, as any item without an alias)
+        info["pg_typeof over HTTP, then psycopg, then without an alias"] = [h, p, bare]
+        return (h["a"] == h["c"] == h["d"] == "uuid" and h["b"] != "uuid" and p[0] == p[2] == p[3] == "uuid" and p[1] != "uuid"
+                and bare == [{"pg_typeof(id)": "uuid"}])
+
+    def psycopg_select():
+        s = "SELECT id, name, ref FROM u WHERE name = 'ok-ins'"
+        with psycopg.connect(url, autocommit=True) as conn:
+            cur = conn.execute(s)
+            rows, codes = cur.fetchall(), [d.type_code for d in cur.description]
+            with conn.cursor(binary=True) as bc:
+                bc.execute(s)
+                brows, bcodes = bc.fetchall(), [d.type_code for d in bc.description]
+        info["psycopg SELECT: rows, type codes (text), type codes (binary)"] = [rows, codes, bcodes]
+        want = [(uuid.UUID(g["ins"]), "ok-ins", uuid.UUID(g["ref_ins"]))]
+        return rows == want and brows == want and codes == [2950, 25, 2950] and bcodes == codes
+
+    def psycopg_returning():
+        with psycopg.connect(url, autocommit=True) as conn:
+            ret = conn.execute("INSERT INTO u (name) VALUES ('ret') RETURNING id").fetchone()[0]
+        info["INSERT … RETURNING id, through psycopg"] = repr(ret)
+        return isinstance(ret, uuid.UUID)
+
+    def psycopg_cursors():
+        with psycopg.connect(url) as conn:  # a transaction: DECLARE and a named cursor need one
+            with conn.cursor() as cur:
+                cur.execute("DECLARE uc CURSOR FOR SELECT id FROM u WHERE name = 'ok-ins'")
+                cur.execute("FETCH 1 FROM uc")
+                declared = cur.fetchone()[0]
+            with conn.cursor(name="nc") as cur:
+                cur.execute("SELECT id FROM u WHERE name = 'ok-ins'")
+                named = cur.fetchone()[0]
+        info["DECLARE/FETCH, then a named cursor: their ids"] = [repr(declared), repr(named)]
+        want = uuid.UUID(g["ins"])
+        return declared == want and named == want
+
+    def params():
+        rid = uuid.UUID(g["ins"])
+        s = "SELECT name FROM u WHERE id = %s"
+        with psycopg.connect(url, autocommit=True) as conn:
+            plain = conn.execute(s, (rid,)).fetchall()
+            prepared = [conn.execute(s, (rid,), prepare=True).fetchall() for _ in range(3)]
+            with conn.cursor(binary=True) as bc:
+                bc.execute(s, (rid,))
+                binary = bc.fetchall()
+        info["parameters: plain, prepared (3 runs), binary cursor"] = [plain, prepared, binary]
+        want = [("ok-ins",)]
+        return plain == want and all(p == want for p in prepared) and binary == want
+
+    def asyncpg_types():
+        async def run(rid):
+            conn = await asyncpg.connect(host="127.0.0.1", port=pg, user="u", database="lake")
+            try:
+                a = await conn.fetchrow("SELECT name, id FROM u WHERE id = $1", rid)
+                b = await conn.fetchrow("SELECT name FROM u WHERE id = $1::UUID", rid)
+                c = await conn.fetchrow("INSERT INTO u (name, ref) VALUES ($1, $2) RETURNING id", "d", rid)
+                return dict(a), dict(b), dict(c)
+            finally:
+                await conn.close()
+        rid = uuid.UUID(g["ins"])
+        a, b, c = asyncio.run(run(rid))
+        info["asyncpg rows: SELECT $1, SELECT $1::UUID, INSERT … RETURNING"] = [a, b, c]
+        return a == {"name": "ok-ins", "id": rid} and b == {"name": "ok-ins"} and isinstance(c["id"], uuid.UUID)
+
+    def orm():
+        class Base(DeclarativeBase):
+            pass
+
+        class Thing(Base):
+            __tablename__ = "orm_things"
+            id: Mapped[uuid.UUID] = mapped_column(sa.Uuid(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()"))
+            name: Mapped[str] = mapped_column(sa.String)
+
+        engine = sa.create_engine(f"postgresql+psycopg://u@127.0.0.1:{pg}/lake")
+        try:
+            Base.metadata.create_all(engine)
+            info["SQLAlchemy table made by"] = "create_all"
+        except Exception as e:
+            info["SQLAlchemy table made by"] = f"SQL, after create_all was refused: {str(e)[:300]}"
+            q("CREATE TABLE IF NOT EXISTS orm_things (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR)")
+        with Session(engine) as s:
+            a, b = Thing(name="orm-a"), Thing(name="orm-b")
+            s.add_all([a, b])
+            s.flush()  # the ids come back from RETURNING here
+            ids = [a.id, b.id]
+            s.commit()
+        with Session(engine) as s:
+            back = s.get(Thing, ids[0])
+            found = s.query(Thing).filter(Thing.id.in_(ids)).all()
+            names = sorted(t.name for t in found)
+        engine.dispose()
+        info["ORM ids after flush"] = [repr(i) for i in ids]
+        return all(isinstance(i, uuid.UUID) for i in ids) and back is not None and back.name == "orm-a" and names == ["orm-a", "orm-b"]
+
+    def catalog():
+        with psycopg.connect(url, autocommit=True) as conn:
+            oids = conn.execute("SELECT a.atttypid FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+                                "WHERE c.relname = 'u' AND a.attname = 'id'").fetchall()
+            types = dict(conn.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'u'").fetchall())
+        info["catalog: pg_attribute.atttypid of id; information_schema types of u"] = [oids, types]
+        return oids == [(2950,)] and types.get("id") == "uuid"
+
+    def show_create():
+        shown = text_of(q("SHOW CREATE TABLE u"))
+        info["SHOW CREATE TABLE u"] = shown
+        shows = re.search(r'\bid"?\s+UUID\b', shown) and re.search(r'\bref"?\s+UUID\b', shown)
+        q("DROP TABLE u")
+        q(shown)  # the text again: a table of its own, with its uuid columns
+        bad = err("INSERT INTO u (id, name) VALUES ('nope', 'shown-bad')")
+        good = fresh()
+        q(f"INSERT INTO u (id, name) VALUES ('{good}', 'shown-good')")
+        got = [r["id"] for r in q("SELECT id FROM u WHERE name = 'shown-good'")]
+        info["shown again: 'nope' (status, sqlstate), the good id read back"] = [bad[:2], got]
+        return bool(shows) and bad[1] == "22P02" and got == [good]
+
+    def add_column():
+        q("ALTER TABLE u ADD COLUMN other UUID")
+        bad = err(f"INSERT INTO u (id, name, other) VALUES ('{fresh()}', 'add-bad', 'nope')")
+        o = fresh()
+        q(f"INSERT INTO u (id, name, other) VALUES ('{fresh()}', 'add-good', '{o}')")
+        got = q("SELECT other FROM u WHERE name = 'add-good'")
+        info["ADD COLUMN other: 'nope' (status, sqlstate), the good value read back"] = [bad[:2], got]
+        return bad[1] == "22P02" and got == [{"other": o}]
+
+    def rename_column():
+        r = fresh()
+        q(f"INSERT INTO u (id, name, ref) VALUES ('{fresh()}', 'ren', '{r}')")
+        q("ALTER TABLE u RENAME COLUMN ref TO parent")
+        bad = err(f"INSERT INTO u (id, name, parent) VALUES ('{fresh()}', 'ren-bad', 'nope')")
+        with psycopg.connect(url, autocommit=True) as conn:
+            got = conn.execute("SELECT parent FROM u WHERE name = 'ren'").fetchall()
+        info["RENAME COLUMN ref TO parent: 'nope' (status, sqlstate), psycopg's parent"] = [bad[:2], got]
+        return bad[1] == "22P02" and got == [(uuid.UUID(r),)] and not q("SELECT name FROM u WHERE name = 'ren-bad'")
+
+    def create_or_alter():
+        refused = err("CREATE OR ALTER TABLE u (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name UUID, parent UUID, other UUID)")
+        still_text = err(f"INSERT INTO u (id, name) VALUES ('{fresh()}', 'still text')")[0] == 200  # (name is still a VARCHAR)
+        info["CREATE OR ALTER name UUID: (status, sqlstate), the body"] = [refused[:2], refused[2][:300]]
+        return refused[1] == "42804" and "a column is a uuid only from when it is made" in refused[2] and still_text
+
+    def alter_type():
+        """ALTER COLUMN … TYPE: text never becomes a uuid (42804); a uuid to UUID is no change; a uuid to TEXT is text from then
+        on (Postgres casts it so), and so is one CREATE OR ALTER declares VARCHAR."""
+        to_uuid = err("ALTER TABLE u ALTER COLUMN name TYPE UUID")
+        same = err("ALTER TABLE u ALTER COLUMN other TYPE UUID")[0]
+        to_text = err("ALTER TABLE u ALTER COLUMN parent TYPE TEXT")[0]
+        nope = err(f"INSERT INTO u (id, name, parent) VALUES ('{fresh()}', 'as-text', 'nope')")[0]
+        with psycopg.connect(url, autocommit=True) as conn:
+            cur = conn.execute("SELECT parent, other FROM u WHERE name = 'as-text'")
+            codes = [d.type_code for d in cur.description]
+        declared = err("CREATE OR ALTER TABLE u (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR, parent VARCHAR, other VARCHAR)")[0]
+        other = err(f"INSERT INTO u (id, name, other) VALUES ('{fresh()}', 'other-text', 'nope')")[0]
+        shown = text_of(q("SHOW CREATE TABLE u"))
+        info["ALTER COLUMN name TYPE UUID (status, sqlstate); other TYPE UUID; parent TYPE TEXT; 'nope' into parent; "
+             "type codes of parent, other; CREATE OR ALTER other VARCHAR; 'nope' into other; SHOW CREATE"] = [to_uuid[:2], same, to_text, nope, codes, declared, other, shown]
+        return (to_uuid[1] == "42804" and same == to_text == nope == declared == other == 200 and codes == [25, 2950]
+                and re.search(r'\bid"?\s+UUID\b', shown) and not re.search(r'\b(parent|other)"?\s+UUID\b', shown))
+
+    try:
+        node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+        q("CREATE TABLE u (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR, ref UUID)")
+        check("DEFAULT gen_random_uuid() as PRIMARY KEY: two INSERTed rows get two distinct version-4 ids", default_ids)
+        check("what isn't a uuid ('nope', a digit short) is refused 22P02 by every write door, and nothing is written: "
+              "INSERT, INSERT … SELECT, UPDATE, POST /append, Postgres, pondra sql; POST /append refuses the other spellings too", refused_everywhere)
+        check("every write door takes a canonical uuid and the rows read back with their ids and refs", accepted_everywhere)
+        check("SQL reads upper case, braces and no hyphens as Postgres does: written canonical by every SQL door (INSERT, "
+              "INSERT … SELECT, UPDATE, Postgres, pondra sql), found by id = 'A0EE…' (HTTP, Postgres), text left alone", spelled_as_postgres)
+        check("COPY FROM STDIN reads them as Postgres's does ('nope' refused 22P02); CREATE TABLE … AS SELECT keeps its uuid columns "
+              "(psycopg gets uuid.UUID, 'nope' refused, SHOW CREATE says UUID)", copy_and_ctas)
+        check("casts: upper case normalizes; CAST('nope') is 22P02; TRY_CAST('nope') is NULL", casts)
+        check("uuidv7(): 20 distinct version-7 ids (variant 8-b), first 48 bits within 60 s of now", v7)
+        check("pg_typeof is 'uuid' for a uuid column, a uuid cast and uuidv7(), not for varchar (HTTP and psycopg)", typeof)
+        check("psycopg SELECT gives uuid.UUID for uuid columns (type codes 2950, text 25), in text and binary", psycopg_select)
+        check("psycopg INSERT … RETURNING id gives a uuid.UUID", psycopg_returning)
+        check("psycopg DECLARE/FETCH cursor and named cursor give uuid.UUID", psycopg_cursors)
+        check("psycopg parameters: a uuid.UUID finds its row, plain, prepared (3 runs) and on a binary cursor", params)
+        if asyncpg is None:
+            info["asyncpg"] = "not installed"
+        else:
+            check("asyncpg: uuid.UUID parameters ($1, $1::UUID) find the row; INSERT … RETURNING id gives a uuid.UUID", asyncpg_types)
+        check("SQLAlchemy 2 Uuid(as_uuid=True): table made, two flushed objects get uuid.UUID ids, read back by id", orm)
+        check("catalog: pg_attribute.atttypid of id is 2950, information_schema data_type 'uuid'", catalog)
+        check("SHOW CREATE TABLE shows UUID; after DROP TABLE its text makes a table that refuses 'nope' and takes a good id", show_create)
+        check("ALTER TABLE ADD COLUMN other UUID: upper case refused, a canonical value taken and read back", add_column)
+        check("RENAME COLUMN ref TO parent keeps it a uuid: 'nope' refused, psycopg returns uuid.UUID", rename_column)
+        check("CREATE OR ALTER TABLE turning the VARCHAR name into UUID is refused 42804, and the column stays text", create_or_alter)
+        check("ALTER COLUMN … TYPE: VARCHAR to UUID refused 42804, UUID to UUID no change, UUID to TEXT is text from then on "
+              "(psycopg 25, 'nope' taken), as is CREATE OR ALTER's VARCHAR", alter_type)
+    finally:
+        if node is not None:
+            node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"uuids": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} UUID checks"
 
 
 # The object kinds `registry()` doesn't make itself, and where each is checked (grepped: each named
@@ -12350,6 +12818,14 @@ def measures():
     info["refused"] = [[st_code, text[:200]] for st_code, text in refused]
     no_bad = q("SELECT name FROM pondra.objects WHERE name LIKE 'bad%'")
     checks["refused by name, and nothing made"] = all(st_code >= 400 and phrase in text for (st_code, text), (_, phrase) in zip(refused, refusals)) and no_bad == []
+    # a dimension written as a qualified column takes its name, a word that is also a function's (`user`) too
+    q('CREATE TABLE ev_user ("user" TEXT, amount INT)')
+    q("INSERT INTO ev_user VALUES ('a', 1), ('a', 2), ('b', 5)")
+    made_user = http("CREATE VIEW ut AS SELECT e.user, sum(e.amount) AS MEASURE total FROM ev_user e")
+    by_user = q('SELECT "user", MEASURE(total) AS t FROM ut GROUP BY "user" ORDER BY 1') if made_user[0] == 200 else []
+    info["qualified_dimension"] = [made_user, by_user]
+    checks["a dimension written e.user (a qualified column, its word a function's too) is named user"] = \
+        made_user[0] == 200 and by_user == [{"user": "a", "t": 3}, {"user": "b", "t": 5}]
 
     # 16. a query with measures costs what its GROUP BY written by hand costs (each run its own text: none from the result cache,
     # which keys on the text as expanded; a measure's query is written anew there, without its comment, so each run names its column apart)
@@ -15773,7 +16249,7 @@ SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20,
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -15805,7 +16281,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -15818,7 +16294,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

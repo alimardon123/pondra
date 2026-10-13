@@ -10,9 +10,7 @@ import ctypes
 import io
 import json
 import os
-import shutil
 import sys
-import tempfile
 import urllib.error
 import urllib.parse
 import uuid
@@ -153,25 +151,22 @@ def _body(lib, answer):
 
 def open(path=None, token=None, python=True, **settings):
     """Open a node on a lake in this process, and connect to it: no server and no second process.
-    `path` is a folder or s3://bucket/prefix; with no path, a lake in a temporary folder that close()
-    removes (DuckDB's `:memory:`). It returns the connection `connect()` and `local()` return, so
-    frames, `sql`, `write_table` and the rest work the same. Its SQL may read files on this machine,
-    as `local()`'s may. `settings` are the node's settings by name (`memory_gb=2` is
-    PONDRA_MEMORY_GB), fixed by the first open in a process. One node at a time in a process: open
-    another lake with ATTACH, or close this one first. Python procedures run with this Python
-    (`python=False`: none). A request waits for the node's answer however long it takes: there is no
-    socket to time out."""
+    `path` is a folder or s3://bucket/prefix; with none, or `":memory:"` as DuckDB spells it, a lake
+    held in this process's memory: nothing on disk, and gone at close(). It returns the connection
+    `connect()` and `local()` return, so frames, `sql`, `write_table` and the rest work the same. Its
+    SQL may read files on this machine, as `local()`'s may. `settings` are the node's settings by
+    name (`memory_gb=2` is PONDRA_MEMORY_GB), fixed by the first open in a process. One node at a
+    time in a process: open another lake with ATTACH, or close this one first. Python procedures run
+    with this Python (`python=False`: none). A request waits for the node's answer however long it
+    takes: there is no socket to time out."""
     lib = _library()  # (first: a missing library leaves no folder behind)
-    temp = tempfile.mkdtemp(prefix="pondra-") if path is None else None
-    lake = temp or os.fspath(path)
-    if "://" not in lake:
+    lake = ":memory:" if path is None else os.fspath(path)
+    if "://" not in lake and lake != ":memory:":
         os.makedirs(lake, exist_ok=True)
         lake = os.path.abspath(lake)
     port, owner = client._free_port(), uuid.uuid4().hex
     options = {name: _text(value) for name, value in settings.items() if value is not None}
     options.update(lake=lake, addr=f"127.0.0.1:{port}", owner=owner)  # (these win over a setting of the same name)
-    if temp:
-        options["temporary"] = True  # (the library removes it once the node lets go of it)
     if python:
         options["python"] = sys.executable
     try:
@@ -180,21 +175,19 @@ def open(path=None, token=None, python=True, **settings):
         pass  # (no pondra program here: only an ATTACH of a lake nobody leads needs one)
     handle = lib.pondra_open(json.dumps(options).encode())
     if not handle:
-        if temp:
-            shutil.rmtree(temp, ignore_errors=True)
         raise RuntimeError(_last_error())
     db = client.Pondra(f"http://127.0.0.1:{port}", token)
     db.owner, db._handle, db._pid = owner, handle, os.getpid()
-    db.lake = lake  # (where the lake is: a temporary one's folder, for a caller that wants to see it)
+    db.lake = lake  # (where the lake is: a folder, a bucket's URL, or ":memory:")
     db._inproc = opener(db)
     atexit.register(db.close)
     return db
 
 
 def close(db):
-    """Close the node `open()` made (`Pondra.close()` calls this), and with it a temporary lake. In a
-    fork's child it does nothing: the node and its temporary folder are its parent's, and the child must
-    not stop or remove them."""
+    """Close the node `open()` made (`Pondra.close()` calls this), and with it a lake in memory. In a
+    fork's child it does nothing: the node and its lake are its parent's, and the child must not stop
+    them."""
     if db._pid != os.getpid():
         return
     if db._handle is not None:

@@ -187,6 +187,13 @@ pub fn table_factor(lake: &Lake, t: &mut ast::TableFactor) -> Result<bool> {
 /// Does this (expanded) SQL read a table as it was? Such a query runs on its node alone.
 pub fn mentioned(sql: &str) -> bool { sql.contains("\"at:") }
 
+/// The `t AT (… => …)` that each table as it was in this (expanded) SQL stands for, as written: its
+/// moment is worked out as the query runs, so `server::query` looks there for one that moves.
+pub fn spelled(sql: &str) -> String {
+    let spec = |n: &String| serde_json::from_slice::<Spec>(&B64.decode(n.trim_start_matches("at:")).ok()?).ok();
+    names(sql).iter().filter_map(spec).map(|s| format!("{} AT ({} => {})", s.table, s.at.to_uppercase(), s.expr)).collect::<Vec<_>>().join(" ")
+}
+
 /// The tables as they were that `sql` reads, by their names in it.
 pub fn names(sql: &str) -> Vec<String> {
     static NAMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#""(at:[A-Za-z0-9_-]+)""#).expect("a regex"));

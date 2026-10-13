@@ -53,18 +53,26 @@ impl Held {
     /// left running would write the leader's mark again).
     pub(crate) async fn stop(&self) {
         let (term, lake) = (self.term.get(), self.lake.get());
-        if let (Some(_), Some(l)) = (term, lake) {
+        let t0 = std::time::Instant::now();
+        let tr = |w: &str| if crate::env::is_set("PONDRA_TRACE_START") { eprintln!("stop: {w} {:.2} s", t0.elapsed().as_secs_f64()) };
+        // (a lake in memory goes with its node: no other node will read what it made durable)
+        if let (Some(_), Some(l)) = (term, lake.filter(|l| !store::in_memory(&l.url))) {
             // (what it committed in the bucket, with replicated acks too; the catalog's
             // memtable written out: the next leader replays no WAL, C5)
             let _ = tokio::time::timeout(Duration::from_secs(10), l.cat.wait_durable(l.cat.committed())).await;
+            tr("durable");
             let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.checkpoint()).await;
+            tr("checkpoint");
         }
         panics::abort_all();
+        tr("tasks");
         if let Some(l) = lake {
             let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.close()).await;
+            tr("catalog");
         }
         if let Some((store, n)) = term {
             cluster::step_down(store, *n).await;
+            tr("term");
         }
     }
 }
@@ -148,7 +156,7 @@ impl Node {
         // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
         // a new leader first commits what they hold from the previous one.
         tr("warming");
-        let replica = if reader { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr))?) };
+        let replica = if reader || store::in_memory(&dir) { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr))?) }; // (a lake in memory has no followers to hold changes for)
         if let (true, Some(own)) = (leader, &replica) {
             // (the members are asked with the nodes' key: one that just restarted holds an
             // unsigned call until it has caught up, and it catches up from this leader)
@@ -262,6 +270,13 @@ impl Node {
         });
         if cluster.is_leader() && !cluster.reader {
             runs::schedule(app.clone()); // (tasks: the leader runs their ticks)
+        }
+        // A door whose port is taken stops the start, as HTTP's does: beside a Postgres on 5432, psql would
+        // otherwise talk to that one. (Each door binds again a moment later; handing it this listener is cleaner.)
+        for (flag, door) in [("pg", &pg), ("kafka", &kafka), ("flight", &flight)] {
+            if let Some(a) = door {
+                std::net::TcpListener::bind(a.as_str()).map_err(|e| anyhow::anyhow!("--{flag} {a}: {e}"))?;
+            }
         }
         if let Some(pg_addr) = pg {
             let a = app.clone();

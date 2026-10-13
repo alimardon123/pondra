@@ -101,7 +101,7 @@ def postgres(a, day):
     finally:
         subprocess.run([*user, os.path.join(pg, "pg_ctl"), "-D", data, "-m", "fast", "stop"], capture_output=True)
         shutil.rmtree(data, ignore_errors=True)
-    return {"details": got}
+    return {"details": got, **({"failed": True} if r.returncode else {})}
 
 
 def nexmark(a, day):
@@ -138,6 +138,8 @@ def drops(now, before):
             out.append(f"TPC-H {f}: {n} s, {b} s before")
     if g(now, "tpch", "answers") is not None and g(now, "tpch", "answers") < 22:
         out.append(f"TPC-H: {g(now, 'tpch', 'answers')} of 22 answers as DuckDB's")
+    if g(now, "postgres", "failed"):
+        out.append("vs Postgres: failed (its log says why)")
     if g(now, "pgbench", "balances_right") is False:
         out.append("pgbench: balances wrong")
     if g(now, "nexmark", "answers") is False:

@@ -5,15 +5,17 @@
 //   node tools/inprocess_check.mjs <child>
 //
 // The library is found as open() finds it: PONDRA_LIBRARY, else the platform's npm package.
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { col, open } from "../js/index.js";
 
 // (writeSync, not console.log: js_exit ends the process right after its line, and a pipe may be asynchronous)
 const emit = (facts) => writeSync(1, `FACTS ${JSON.stringify(facts)}\n`);
 const scratch = () => mkdtempSync(join(tmpdir(), "inprocess-check-"));
 const settle = () => new Promise((r) => setTimeout(r, 1000)); // (a socket the node closed is let go a moment after)
+// What is in the temporary folder, which is also the current one: inprocess_check.py gives js_sql a new, empty one.
+const writtenHere = () => readdirSync(tmpdir(), { recursive: true }).map((p) => relative(tmpdir(), join(tmpdir(), p))).sort();
 
 // The message of an open that is refused, or null when it opens (and is closed again).
 async function refusal(dir, settings) {
@@ -49,8 +51,9 @@ async function js_sql() {
     live = Number(answer[0].n);
     break;
   }
+  const whileOpen = writtenHere();
   await db.close();
-  return { lake, rows, frame, written, file_rows: fileRows, live, exists_after_close: existsSync(lake) };
+  return { lake, rows, frame, written, file_rows: fileRows, live, while_open: whileOpen, after_close: writtenHere() };
 }
 
 async function js_reopen() {
@@ -95,15 +98,15 @@ async function js_cycles() {
 }
 
 async function js_exit() {
-  const db = await open();
+  const db = await open(join(scratch(), "lake")); // (a folder: what its node leaves there says it was closed)
   await db.sql("CREATE TABLE e (id INT)");
   await db.sql("INSERT INTO e VALUES (1)");
   emit({ lake: db.lake });
-  process.exit(0); // (no close(): the exit event closes the node, which removes its temporary lake)
+  process.exit(0); // (no close(): the exit event closes the node, which steps down from its lake)
 }
 
 async function js_end() {
-  const db = await open();
+  const db = await open(join(scratch(), "lake"));
   await db.sql("CREATE TABLE e (id INT)");
   await db.sql("INSERT INTO e VALUES (1)");
   emit({ lake: db.lake }); // (no close(), and nothing left to do: Node ends, and the library's cleanup hook closes the node)
@@ -115,7 +118,7 @@ async function js_bun() {
   const count = Number((await db.sql("SELECT count(*) AS n FROM t"))[0].n);
   const lake = db.lake;
   await db.close();
-  return { count, exists_after_close: existsSync(lake) };
+  return { count, lake };
 }
 
 const CHILDREN = { js_sql, js_reopen, js_cycles, js_exit, js_end, js_bun };

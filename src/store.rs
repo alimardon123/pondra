@@ -133,6 +133,10 @@ pub struct TableMeta {
     /// door refuses a value its column's labels don't list.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub enums: BTreeMap<String, crate::types::Enum>,
+    /// Columns that hold text but are of another SQL type, by stored name: "uuid" (`types.rs`).
+    /// Every door refuses a value that isn't one of the type's, written its one way.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sql_types: BTreeMap<String, String>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ext: Option<crate::ext::Spec>,
@@ -220,6 +224,7 @@ impl TableMeta {
             identity: self.identity.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, i)| (n(c), i.clone())).collect(),
             constraints: self.constraints.iter().map(|c| c.named(&n)).collect(),
             enums: self.enums.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, e)| (n(c), e.clone())).collect(),
+            sql_types: self.sql_types.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, t)| (n(c), t.clone())).collect(),
             names: BTreeMap::new(),
             dropped: vec![],
             ..self.clone()
@@ -462,7 +467,7 @@ pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
 }
 
 pub struct Lake {
-    pub url: String, // absolute local dir or "s3://bucket/prefix" (gs://, az://, abfss:// too)
+    pub url: String, // absolute local dir or "s3://bucket/prefix" (gs://, az://, abfss:// too; memory://id in this process)
     pub store: Store,
     pub cat: Catalog,
     pub hwm: watch::Sender<u64>, // the last committed segment this node knows of
@@ -547,8 +552,10 @@ pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
 
 /// Decoded log rows, each table's by segment, `TAIL_BYTES` at most. A table's log is read only
 /// after its `tiered` mark (a read that began before reads its own from the store), so its rows up
-/// to the mark go as soon as a read finds it moved, and past the limit the oldest segment goes.
-/// Kept by recent use instead, every node held 256 MB of rows long since in files.
+/// to the mark go when the node sees the commit that moved it (`arrived`), or a read finds it
+/// moved, and past the limit the oldest segment goes. Kept by recent use instead, every node held
+/// 256 MB of rows long since in files; kept until a read, a table read once and then only
+/// written held them too (fluss_bench: 267 MB of a node's 740 once it was idle).
 #[derive(Default)]
 struct Tail {
     rows: std::collections::HashMap<String, BTreeMap<u64, Rows>>,
@@ -633,6 +640,11 @@ pub fn reach_of(url: &str) -> Option<Reach> {
 /// read them: `AWS_*` (`AWS_ENDPOINT` for R2 and MinIO), `GOOGLE_*`, `AZURE_*`. A lake on another
 /// server is read with the key its attachment names (`reach_of`), and a read-only one refuses writes.
 pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
+    if in_memory(url) {
+        let url = url.trim_end_matches('/').to_string();
+        let held = MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(url.clone()).or_insert_with(|| Arc::new(Counted(Arc::new(object_store::memory::InMemory::new())))).clone();
+        return Ok((url.clone(), held.clone(), Some((url, held)))); // (DataFusion reads its files at their URLs, as a bucket's)
+    }
     let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
         std::fs::create_dir_all(url)?;
         let dir = std::fs::canonicalize(url)?.to_string_lossy().trim_start_matches(r"\\?\").to_string(); // (Windows verbatim prefix)
@@ -659,6 +671,32 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     let store: Store = if prefix.is_empty() { whole.clone() } else { Arc::new(PrefixStore::new(whole.clone(), prefix)) };
     Ok((url.trim_end_matches('/').to_string(), Arc::new(Counted(store)), Some((root, whole))))
 }
+
+/// Lakes held in this process's memory (`memory://name`, DuckDB's `:memory:`), by place: every open
+/// of one here is the same store until `forget_memory`, so a node that restarts in place finds its
+/// lake as it left it. Nothing of one is on disk, and no other process reaches it. (Not `per_node!`:
+/// a restart in place resets those.)
+static MEMORY: std::sync::LazyLock<Mutex<HashMap<String, Store>>> = std::sync::LazyLock::new(Default::default);
+
+/// Is `url` a lake held in this process's memory?
+pub fn in_memory(url: &str) -> bool { url.starts_with("memory://") }
+
+/// Is a lake held in this process's memory at `url`? (Opening one there makes it.)
+pub fn memory_held(url: &str) -> bool { MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(url.trim_end_matches('/')) }
+
+/// Is `store` a lake held in this process's memory? Every open of one gives the same store.
+pub fn held_in_memory(store: &Store) -> bool { MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().any(|s| Arc::ptr_eq(s, store)) }
+
+/// A lake's place as given: `:memory:` (DuckDB's word) is a new lake in this process's memory.
+pub fn place(lake: &str) -> String {
+    match lake {
+        ":memory:" => format!("memory://{}", uuid::Uuid::new_v4().simple()),
+        _ => lake.to_string(),
+    }
+}
+
+/// Let a lake in memory go (the library's close, once its node has stopped): its memory with it.
+pub fn forget_memory(url: &str) { MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(url.trim_end_matches('/')); }
 
 /// A lake's bucket, as DataFusion names its store (`s3://bucket`), or None for a folder.
 pub fn bucket_url(url: &str) -> Option<String> {
@@ -748,7 +786,8 @@ impl Lake {
 
     pub async fn open(url: &str, writer: bool, streamed: bool) -> Result<Arc<Lake>> {
         let (url, store, bucket) = open_store(url)?;
-        let local = bucket.is_none();
+        let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
+        let local = bucket.is_none() || memory;
         let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(memory_limit()));
         // (spills go to the OS temp dir; no listing kept past its statement: DataFusion's own
         // cache of them would hide a file added to a folder outside the lake, ADR-026)
@@ -758,9 +797,11 @@ impl Lake {
         let kept = (Arc::new(Footers::new(DEFAULT_METADATA_CACHE_LIMIT).with_name("DefaultFileMetadataCache")), Arc::new(FileStatistics::new(DEFAULT_FILE_STATISTICS_MEMORY_LIMIT).with_name("DefaultFileStatisticsCache")));
         let caches = CacheManagerConfig::default().with_list_files_cache_limit(0).with_file_metadata_cache(Some(kept.0.clone())).with_file_statistics_cache(Some(kept.1.clone()));
         let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).with_cache_manager(caches).build_arc()?;
-        let disk = bucket.as_ref().and_then(|_| disk_tier(&url, &store));
+        let disk = bucket.as_ref().filter(|_| !memory).and_then(|_| disk_tier(&url, &store));
         let mut cached_store = None;
-        if let Some((bucket_url, s3)) = bucket {
+        if let Some((bucket_url, held)) = bucket.as_ref().filter(|_| memory) {
+            rt.register_object_store(&url::Url::parse(bucket_url)?, Arc::new(crate::bridge::Bridge(held.clone()))); // (in memory already: read as it is)
+        } else if let Some((bucket_url, s3)) = bucket {
             let prefix = url.trim_start_matches(&bucket_url).trim_start_matches('/').to_string();
             let cached = Arc::new(crate::cache::CachedStore::new(s3, cache_mb() << 20, disk.clone().map(|d| (d, prefix.clone())), &prefix));
             rt.register_object_store(&url::Url::parse(&bucket_url)?, cached.clone());
@@ -878,8 +919,13 @@ impl Lake {
                         }
                     }
                 }
-                (Some("t/"), disk) if disk.is_some() || self.hot.on() => {
+                (Some("t/"), disk) => {
+                    let decoded = self.tail.lock().unwrap().rows.contains_key(&key[2..]);
+                    if !(decoded || disk.is_some() || self.hot.on()) {
+                        continue;
+                    }
                     let Ok(m) = serde_json::from_slice::<TableMeta>(value) else { continue };
+                    self.tail.lock().unwrap().forget(&key[2..], m.tiered); // (rows now in files: no read asks for them again)
                     self.hot.forget(&m.garbage);
                     // (files a tiering round writes; not a bulk load's big files, which only the queries that need them read)
                     if let Some(disk) = disk {
@@ -1026,6 +1072,7 @@ impl Lake {
         crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
         crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
         crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
+        crate::types::register(&ctx); // gen_random_uuid(), uuidv7(), pg_typeof(x)
         crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
         ctx
     }
@@ -2119,7 +2166,7 @@ impl Catalog {
             // millisecond for it. On a disk a write is a file whichever way; a bucket keeps the tick,
             // which lets writes made together share one PUT.)
             let db = db.clone();
-            crate::panics::task(async move { let _ = db.flush_with_options(FlushOptions { flush_type: FlushType::Wal }).await; });
+            crate::panics::task(async move { let _ = db.flush_with_options(FlushOptions { flush_type: FlushType::Wal }).await; }); // (a node stopped in a process ends it: ADR-061)
         }
         if let Some((_, v)) = puts.iter().find(|(k, _)| k == "n") {
             self.last_n.store(serde_json::from_slice(v)?, Relaxed);

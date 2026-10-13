@@ -465,7 +465,11 @@ pub fn writer<L: Send + Sync + 'static>(app: &App, table: &'static str, make: cr
         let (mut seq, mut made) = (0, false);
         while let Some(first) = next(&mut rx).await {
             if !ending() {
-                tokio::time::sleep(every).await;
+                let mut stop = ENDING.subscribe();
+                tokio::select! {
+                    _ = tokio::time::sleep(every) => {}
+                    _ = async { drop(stop.wait_for(|e| *e).await) } => {} // (a node stopping writes what it has at once: a close waited out the second)
+                }
             }
             let mut lines = vec![first];
             while let Ok(l) = rx.try_recv() {

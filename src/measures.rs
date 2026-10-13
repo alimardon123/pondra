@@ -170,6 +170,11 @@ fn dimension_name(expr: &Expr) -> Result<String> {
     match expr {
         Expr::Identifier(i) => Ok(write::ident(i)),
         Expr::CompoundIdentifier(parts) => parts.last().map(write::ident).ok_or_else(|| anyhow!("name the dimension {expr} (... AS name)")),
+        // (`e.user`: a word that is also a function with no arguments, `user`, makes the parser read the
+        // whole name as a call of it, which SQL plans as the column)
+        Expr::Function(f) if matches!(f.args, ast::FunctionArguments::None) && f.name.0.len() > 1 && f.over.is_none() => {
+            f.name.0.last().and_then(|p| p.as_ident()).map(write::ident).ok_or_else(|| anyhow!("name the dimension {expr} (... AS name)"))
+        }
         _ => bail!("name the dimension {expr} (... AS name)"),
     }
 }
@@ -1129,6 +1134,14 @@ mod tests {
 
     fn rewritten(sql: &str) -> Result<(bool, String)> {
         rewritten_with(sql, &|_: &str| false)
+    }
+
+    #[test]
+    fn a_qualified_column_names_its_dimension() {
+        // (`user` after the dot is read as a call of the function `user`: still the column's name)
+        let d = Definition::parse(&text("SELECT e.user, e.region, sum(e.amount) AS MEASURE total FROM events e")).expect("parses").expect("has measures");
+        assert_eq!(d.dimensions.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["user", "region"]);
+        assert!(Definition::parse(&text("SELECT e.x + 1, sum(e.amount) AS MEASURE total FROM events e")).is_err());
     }
 
     #[test]

@@ -570,6 +570,7 @@ pub async fn attachable(lake: &Lake, name: &str, fresh: bool) -> Result<()> {
 /// Nothing there yet (no catalog): a new, empty lake is made there, as DuckDB's ATTACH makes a
 /// new database file.
 async fn lake_dir(dir: &str) -> Result<(String, bool)> {
+    let dir = &crate::store::place(dir); // (`:memory:`: a new lake in memory, which only opening makes: `inbox::lead_once`)
     if !dir.contains("://") {
         std::fs::create_dir_all(dir).with_context(|| format!("no folder {dir}"))?;
     }
@@ -622,8 +623,8 @@ pub async fn delete_lake(dir: &str) -> Result<()> {
 }
 
 pub async fn has_catalog(dir: &str) -> Result<bool> {
-    if !dir.contains("://") && !std::path::Path::new(dir).exists() {
-        return Ok(false);
+    if (!dir.contains("://") && !std::path::Path::new(dir).exists()) || (crate::store::in_memory(dir) && !crate::store::memory_held(dir)) {
+        return Ok(false); // (asking a lake in memory that nothing here opened would make an empty one)
     }
     let store = crate::store::open_store(dir)?.1;
     Ok(futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog")))).await.transpose()?.is_some())
@@ -869,7 +870,12 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Re
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{name} is materialized view {owner}'s: DROP MATERIALIZED VIEW {owner}");
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(name))).await?.is_none(), "{name} is a materialized view: DROP MATERIALIZED VIEW {name}");
     let readers = readers(lake, name).await?;
-    ensure!(readers.is_empty(), "{name} is read by {}: DROP TABLE {name} CASCADE drops them too, or drop them first", readers.join(", "));
+    if !readers.is_empty() {
+        // (CASCADE drops views only: with a task among the readers, it would refuse too)
+        let views_only = readers.iter().all(|r| r.starts_with("view ") || r.starts_with("materialized view "));
+        let how = if views_only { format!("DROP TABLE {name} CASCADE drops them too, or drop them first") } else { "drop them first".to_string() };
+        bail!("{name} is read by {}: {how}", readers.join(", "));
+    }
     let keep_ms = meta.retention_secs.map_or(KEEP_MS, |s| s * 1000);
     let deleted = crate::sys::deleted(name);
     let mut puts = vec![];
@@ -1244,16 +1250,27 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             j!({"dropped": column})
         }
         Change::Type(sql_type) => {
+            let uuid = m.sql_types.get(&stored).is_some_and(|t| t == "uuid");
+            if sql_type.trim().eq_ignore_ascii_case("uuid") {
+                if !uuid {
+                    return Err(crate::codes::coded("42804", format!("{column} can't become a uuid: a column is a uuid only from when it is made, since the rows there were never checked as uuids (a new UUID column can take them: UPDATE … SET new = {column}::uuid)")));
+                }
+                return Ok(j!({"table": name, "unchanged": true}));
+            }
             let ctx = datafusion::prelude::SessionContext::new();
             ctx.sql(&format!("CREATE TABLE t (c {sql_type})")).await?;
             let new = crate::write::stored(ctx.table("t").await?.schema().field(0).data_type());
             let at = m.columns.iter().position(|(c, _)| *c == stored).expect("a live column");
             let old = crate::query::dtype(&m.columns[at].1)?;
-            if old == new {
+            if old == new && (uuid || m.enums.contains_key(&stored)) {
+                // (a uuid or an enum is text held one way: as text, every row reads as it did, as Postgres casts them)
+                m.sql_types.remove(&stored);
+                m.enums.remove(&stored);
+            } else if old == new {
                 return Ok(j!({"table": name, "unchanged": true}));
             }
-            ensure!(widens(&old, &new), "{column} is {old}: a column's type can only widen (a smaller integer to a bigger one, FLOAT to DOUBLE, a DECIMAL to more digits), which every file already written still reads as");
-            ensure!(partition != Some(stored.as_str()), "{column} is {name}'s partition_by column: its type stays");
+            ensure!(old == new || widens(&old, &new), "{column} is {old}: a column's type can only widen (a smaller integer to a bigger one, FLOAT to DOUBLE, a DECIMAL to more digits), which every file already written still reads as");
+            ensure!(old == new || partition != Some(stored.as_str()), "{column} is {name}'s partition_by column: its type stays");
             m.columns[at].1 = crate::query::type_name(&new);
             j!({"column": column, "type": m.columns[at].1})
         }

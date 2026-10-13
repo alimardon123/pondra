@@ -23,7 +23,16 @@ lake = os.path.join(A.work, "lake")
 subprocess.run(["rm", "-rf", lake])
 node = subprocess.Popen([A.bin, "serve", lake, "--addr", "127.0.0.1:8820", "--pg", "127.0.0.1:5498"],
                         env={**os.environ, "PONDRA_OWNER_KEY": OWNER}, stdout=subprocess.DEVNULL, stderr=open(os.path.join(A.work, "node.log"), "w"))
-time.sleep(3)
+import atexit; atexit.register(lambda: node.poll() is None and (node.terminate(), node.wait()))  # (a failed run leaves no node on its ports)
+for _ in range(120):  # ready, or gone (its ports taken): never another node's answers
+    if node.poll() is not None:
+        raise SystemExit(f"the node stopped: {open(os.path.join(A.work, 'node.log')).read()[-500:]}")
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", 8820, timeout=1); c.request("GET", "/ready")
+        if c.getresponse().status == 200: break
+    except OSError:
+        pass
+    time.sleep(0.25)
 def http_sql(s):
     c = http.client.HTTPConnection("127.0.0.1", 8820, timeout=3600); c.request("POST", "/sql", s.encode(), {"x-pondra-owner": OWNER}); r = c.getresponse(); d = r.read()
     if r.status != 200: raise RuntimeError(d[:500])
