@@ -76,6 +76,7 @@ writes hands each job the one it needs as `PONDRA_TOKEN`; Pondra itself never re
 | Variable | Default | Meaning |
 |---|---|---|
 | `PONDRA_MEMORY_GB` | a third of the machine's memory | memory for queries, when `--memory-gb` is not given. A sort, join or aggregation that needs more spills to disk. An answer counts in it until it is sent, and one bigger than it is refused with SQLSTATE `53200`, saying so: ask for fewer rows, or write them out with `COPY (…) TO` |
+| `PONDRA_MEMORY_LAKE_GB` | a quarter of the machine's memory | what a lake held in memory (`connect()`, `:memory:`) keeps in memory. Past it, its new files and log go to a folder of the process's own in the temporary directory, removed when the lake is closed, instead of the process running out of memory |
 | `PONDRA_QUERIES` | four a core, 16 at least | how many queries a node runs at once. The others wait their turn, in the order they came (`pondra_queries_running` and `pondra_queries_waiting` in [`/metrics`](/pondra/reference/http/)) |
 | `PONDRA_QUEUE_SECS` | `60` | how long a query waits for its turn. Past it, it is refused with SQLSTATE `53300`: try again, or ask another node |
 | `PONDRA_STREAM_MB` | `8` | an answer this big or bigger (as Arrow) is sent over HTTP in pieces as it is written, as JSON, CSV, TSV, NDJSON or Arrow, never as one body in memory. The bytes are the same either way |
