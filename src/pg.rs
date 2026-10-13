@@ -264,7 +264,7 @@ impl Backend {
                     if trace() {
                         eprintln!("pg point: parse {} µs, row {} µs", t1.as_micros(), (t0.elapsed() - t1).as_micros());
                     }
-                    return Ok(Response::Query(rows(&crate::pg_types::typed(&b.schema(), &p.uuids()), vec![b], format)?));
+                    return Ok(Response::Query(rows(&crate::pg_types::typed(&b.schema(), &p.uuids().into()), vec![b], format)?));
                 }
             }
         }
@@ -375,10 +375,8 @@ impl Backend {
             Some(b) => b.schema(),
             None => self.schema(&sql, user).await?,
         };
-        let schema = match catalog {
-            true => schema,
-            false => crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, &bound).await), // (its uuids, from the statement as written)
-        };
+        // (its uuids and Postgres names, from the statement as written; a catalog query has names only)
+        let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, &bound).await);
         Ok(Response::Query(rows(&schema, batches, format)?))
     }
 
@@ -673,7 +671,7 @@ fn rows(schema: &Schema, batches: Vec<RecordBatch>, format: &Format) -> PgWireRe
 /// Columns as Postgres sees them, and the Arrow types their values are sent as.
 fn fields(schema: &Schema, format: &dyn Fn(usize) -> FieldFormat) -> (Arc<Vec<FieldInfo>>, Vec<DataType>) {
     let types: Vec<(Type, DataType)> = schema.fields().iter().enumerate().map(|(i, f)| field_type(f, format(i))).collect();
-    let info = schema.fields().iter().zip(&types).enumerate().map(|(i, (f, (t, _)))| FieldInfo::new(f.name().clone(), None, None, t.clone(), format(i))).collect();
+    let info = schema.fields().iter().zip(&types).enumerate().map(|(i, (f, (t, _)))| FieldInfo::new(crate::pg_names::shown(f).to_string(), None, None, t.clone(), format(i))).collect();
     (Arc::new(info), types.into_iter().map(|(_, a)| a).collect())
 }
 
@@ -1239,7 +1237,7 @@ impl ExtendedQueryHandler for Backend {
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
         let sql = pg_dialect(&self.app.lake, &stmt.statement.sql, "");
-        let out = crate::temp::SESSION.scope(Some(self.session.clone()), async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement).await.to_vec(), self.describe(&sql, &Format::UnifiedText).await?.0)) }).await; // (its temporary tables too)
+        let out = crate::temp::SESSION.scope(Some(self.session.clone()), async { Ok(DescribeStatementResponse::new(self.types(&stmt.statement).await.to_vec(), self.describe(&sql, &stmt.statement.sql, &Format::UnifiedText).await?.0)) }).await; // (its temporary tables too)
         self.noted(&stmt.statement.sql, out).await
     }
 
@@ -1255,7 +1253,7 @@ impl ExtendedQueryHandler for Backend {
         let out = crate::temp::SESSION.scope(Some(self.session.clone()), async {
             let inferred = self.types(statement).await;
             sent = bind(portal, inferred)?;
-            let (fields, columns) = self.describe(&pg_dialect(&self.app.lake, &sent, ""), &portal.result_column_format).await?;
+            let (fields, columns) = self.describe(&pg_dialect(&self.app.lake, &sent, ""), &sent, &portal.result_column_format).await?;
             statement.keep(columns);
             Ok(DescribePortalResponse::new(fields))
         })
@@ -1325,9 +1323,12 @@ impl Backend {
     }
 
     /// The columns a statement returns (none for writes and session commands), and what of them a
-    /// prepared statement may keep (`Columns`).
-    async fn describe(&self, sql: &str, format: &Format) -> PgWireResult<(Vec<FieldInfo>, Columns)> {
+    /// prepared statement may keep (`Columns`). `sql` is what is planned (rewritten for Postgres's catalog);
+    /// `written` is the statement as the client sent it, whose uuids and column names are the answer's, as
+    /// `run` has them (a rewrite turns `current_user` into a literal, and the literal has no name of its own).
+    async fn describe(&self, sql: &str, written: &str, format: &Format) -> PgWireResult<(Vec<FieldInfo>, Columns)> {
         let sql = &self.placed(sql.to_string()).await?; // (the session's search path, as `run` has it)
+        let written = self.placed(written.to_string()).await?;
         if let Some(cmd) = crate::cursors::of(sql) {
             // FETCH's columns are its cursor's (which a DECLARE may change); DECLARE, MOVE and CLOSE send no rows.
             let columns = crate::cursors::columns(&cmd.map_err(user_error)?).map_err(user_error)?;
@@ -1340,7 +1341,7 @@ impl Backend {
         }
         if crate::returning::of(sql).is_some() {
             // (its columns as `run` answers them: the same text, its macros and Postgres's forms written out)
-            let marks = crate::pg_types::columns(&self.app.lake, sql).await; // (its uuids, from the statement as written)
+            let marks = crate::pg_types::columns(&self.app.lake, &written).await; // (its uuids, from the statement as written)
             let sql = crate::vars::bound(sql).map_err(user_error)?;
             let sql = crate::routines::expand(&self.app.lake, &sql).await.map_err(user_error)?;
             if let Some(r) = crate::returning::of(&pg_dialect(&self.app.lake, &sql, "")) {
@@ -1350,15 +1351,15 @@ impl Backend {
             }
         }
         let point = match crate::auth::limited() {
-            None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.uuids()))), // (a key lookup's columns, unplanned, first)
+            None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.uuids().into()))), // (a key lookup's columns, unplanned, first)
             Some(_) => None,
         };
         if point.is_none() && (session_command(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some() || crate::script::is(sql)) {
             return Ok((vec![], Columns::None)); // (a COPY's columns come with its data)
         }
         let marks = match point {
-            Some(_) => vec![],
-            None => crate::pg_types::columns(&self.app.lake, sql).await, // (its uuids, from the statement as written, as `run` has them)
+            Some(_) => Default::default(),
+            None => crate::pg_types::columns(&self.app.lake, &written).await, // (its uuids, from the statement as written, as `run` has them)
         };
         let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: the connection's variable)
         let bound = crate::routines::expand(&self.app.lake, &bound).await.map_err(user_error)?; // (macros, DuckDB's forms: as `run` has them)
@@ -1393,7 +1394,7 @@ where
 
 /// A result's columns as Postgres describes them: each one's type, in the format the client asked for.
 fn described(schema: &Schema, format: &Format) -> Vec<FieldInfo> {
-    schema.fields().iter().enumerate().map(|(i, f)| FieldInfo::new(f.name().clone(), None, None, field_type(f, format.format_for(i)).0, format.format_for(i))).collect()
+    schema.fields().iter().enumerate().map(|(i, f)| FieldInfo::new(crate::pg_names::shown(f).to_string(), None, None, field_type(f, format.format_for(i)).0, format.format_for(i))).collect()
 }
 
 /// `PONDRA_TRACE_PG=1`: where a Postgres statement's time goes, on stderr.

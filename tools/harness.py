@@ -11863,6 +11863,136 @@ def enums():
     return f"{sum(checks.values())} of {len(checks)} enum checks"
 
 
+def colnames():
+    """The Postgres port names each answer column as Postgres 16 does (`FigureColname`, src/pg_names.rs), not as
+    DataFusion does (`count(*)`, `Int64(1)`, `oid_1`): `count(*)` is `count`, `'1'::int` is `int4`, `1` is `?column?`,
+    a CASE takes its ELSE's name, `c.oid, c.*` over pg_catalog.pg_collation names two columns `oid`, and an UPDATE's
+    RETURNING names its items as a SELECT does. psycopg sees those names three ways: a plain execute (the extended
+    protocol), the same statement prepared and run twice, and the simple protocol (`pgconn.exec_`, then each column's
+    `fname`). The rows are unchanged: the same values HTTP answers for the same statements. HTTP keeps DataFusion's
+    names (`count(*)`, `a` and `a_1`, `Int64(1)`), so the change is the Postgres port's alone."""
+    import psycopg
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 10
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    # Each statement with the names Postgres 16 printed for it (psycopg's cursor.description), over a table
+    # t (a int, b int, c text, x int, ts timestamp, arr bigint[]) that the test makes and fills with three rows.
+    COLNAMES = [
+        ("SELECT c.oid, c.* FROM pg_catalog.pg_collation c", ["oid", "oid", "collname", "collnamespace", "collowner", "collprovider", "collisdeterministic", "collencoding", "collcollate", "collctype", "colliculocale", "collicurules", "collversion"]),
+        ("SELECT count(*) FROM t", ["count"]),
+        ("SELECT sum(a), max(a) FROM t", ["sum", "max"]),
+        ("SELECT 1", ["?column?"]),
+        ("SELECT a + b FROM t", ["?column?"]),
+        ("SELECT NULL", ["?column?"]),
+        ("SELECT a::text FROM t", ["a"]),
+        ("SELECT '1'::int", ["int4"]),
+        ("SELECT CAST(1 AS bigint)", ["int8"]),
+        ("SELECT CASE WHEN a > 1 THEN b ELSE x END FROM t", ["x"]),
+        ("SELECT CASE WHEN a > 1 THEN 1 ELSE 2 END FROM t", ["case"]),
+        ("SELECT (SELECT max(a) FROM t)", ["max"]),
+        ("SELECT now()", ["now"]),
+        ("SELECT ARRAY[1, 2]", ["array"]),
+        ("SELECT current_timestamp", ["current_timestamp"]),
+        ("SELECT current_user", ["current_user"]),
+        ("SELECT EXTRACT(year FROM ts) FROM t", ["extract"]),
+        ("SELECT trim(' a ')", ["btrim"]),
+        ("SELECT substring('abc' FROM 1 FOR 2)", ["substring"]),
+        ("SELECT ts AT TIME ZONE 'UTC' FROM t", ["timezone"]),
+        ('SELECT a AS "Foo" FROM t', ["Foo"]),
+        ("SELECT a AS foo FROM t", ["foo"]),
+        ("SELECT a, a FROM t", ["a", "a"]),
+        ("SELECT *, a FROM t", ["a", "b", "c", "x", "ts", "arr", "a"]),
+        ("SELECT a FROM t UNION SELECT b FROM t", ["a"]),
+        ("SELECT x IS NULL FROM t", ["?column?"]),
+        ("SELECT coalesce(a, 1) FROM t", ["coalesce"]),
+        ("SELECT row_number() OVER (ORDER BY a) FROM t", ["row_number"]),
+        ("WITH c AS (SELECT a FROM t) SELECT count(*) FROM c", ["count"]),
+        ("UPDATE t SET b = b WHERE a = 1 RETURNING a, b + 1, c::text", ["a", "?column?", "c"]),
+    ]
+    # Statements whose rows HTTP answers the same way (ordered, so the two answers can be compared as they are).
+    SAME_ROWS = ["SELECT count(*) FROM t", "SELECT sum(a), max(a) FROM t", "SELECT a + b FROM t ORDER BY a",
+                 "SELECT CASE WHEN a > 1 THEN b ELSE x END FROM t ORDER BY a", "SELECT (SELECT max(a) FROM t)", "SELECT a::text FROM t ORDER BY a"]
+    checks, info = {}, {}
+    node = None
+
+    def check(name, fn):
+        """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def q(s):
+        return call(port, "POST", "/sql", s.encode(), timeout=120)
+
+    def ways(conn, s):
+        """The names psycopg sees for `s` in each way: 'plain' (a plain execute, the extended protocol), 'prepared'
+        (the statement prepared and run twice) and 'simple' (`pgconn.exec_`, each column's `fname`). A statement
+        that errors is kept as its error, which no name list equals."""
+        try:
+            plain = [c.name for c in conn.execute(s).description]
+            prepared = [[c.name for c in conn.execute(s, prepare=True).description] for _ in range(2)]
+            res = conn.pgconn.exec_(s.encode())
+            return {"plain": plain, "prepared": prepared, "simple": [res.fname(i).decode() for i in range(res.nfields)]}
+        except psycopg.Error as e:
+            return {"error": f"{type(e).__name__}: {str(e).splitlines()[0]}"}
+
+    try:
+        node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+        q("CREATE TABLE t (a INT, b INT, c TEXT, x INT, ts TIMESTAMP, arr BIGINT[])")
+        q("INSERT INTO t VALUES (1, 2, 'x', 3, TIMESTAMP '2026-01-01 00:00:00', NULL), "
+          "(2, 5, 'y', 4, TIMESTAMP '2026-01-02 00:00:00', NULL), (3, 7, 'z', NULL, NULL, NULL)")
+        with psycopg.connect(url, autocommit=True) as conn:
+            seen = {s: ways(conn, s) for s, _ in COLNAMES}
+
+        def sent(way):
+            """Every statement sends Postgres 16's names in `way`; the ones that don't are kept in info."""
+            bad = {}
+            for s, want in COLNAMES:
+                wanted = [want, want] if way == "prepared" else want
+                got = seen[s].get("error") or seen[s][way]
+                if got != wanted:
+                    bad[s] = {"want": wanted, "got": got}
+            if bad:
+                info[f"{way} names that differ"] = bad
+            return not bad
+
+        check(f"extended protocol (cur.execute): all {len(COLNAMES)} statements send Postgres 16's names, c.oid, c.* over "
+              "pg_collation included (two oids), count(*) as count, CASE as its ELSE's name", lambda: sent("plain"))
+        check("prepared (prepare=True, run twice): the same names both times, Postgres 16's", lambda: sent("prepared"))
+        check("simple protocol (pgconn.exec_, then each column's fname): Postgres 16's names", lambda: sent("simple"))
+
+        def rows_same():
+            """The Postgres port's rows for SAME_ROWS are HTTP's, value for value."""
+            with psycopg.connect(url, autocommit=True) as conn:
+                pg_rows = {s: [[str(v) for v in r] for r in conn.execute(s).fetchall()] for s in SAME_ROWS}
+            http_rows = {s: [[str(v) for v in r.values()] for r in q(s)] for s in SAME_ROWS}
+            if pg_rows != http_rows:
+                info["rows that differ"] = {"pg": pg_rows, "http": http_rows}
+            return pg_rows == http_rows
+
+        check(f"rows: the Postgres port's answers to {len(SAME_ROWS)} statements are HTTP's, value for value", rows_same)
+
+        def http_names():
+            """HTTP keeps DataFusion's names for the same statements: count(*), a and a_1, Int64(1)."""
+            got = {s: list(q(s)[0].keys()) for s in ("SELECT count(*) FROM t", "SELECT a, a FROM t", "SELECT 1")}
+            want = {"SELECT count(*) FROM t": ["count(*)"], "SELECT a, a FROM t": ["a", "a_1"], "SELECT 1": ["Int64(1)"]}
+            if got != want:
+                info["HTTP names that differ"] = {"want": want, "got": got}
+            return got == want
+
+        check("HTTP keeps DataFusion's names: count(*), a and a_1, Int64(1) (the change is the Postgres port's alone)", http_names)
+    finally:
+        if node is not None:
+            node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"colnames": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} column-name checks"
+
+
 def uuids():
     """UUID columns, kept as their canonical text (36 characters, lower-case hex, hyphens at 8, 13, 18 and 23).
     `DEFAULT gen_random_uuid()` as a PRIMARY KEY gives each row its own version-4 id. Every write door (INSERT,
@@ -16623,7 +16753,7 @@ SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20,
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, bi, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -16655,7 +16785,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "bi", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -16668,7 +16798,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "bi": bi, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
