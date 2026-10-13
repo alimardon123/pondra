@@ -16,7 +16,7 @@ A = ap.parse_args()
 os.makedirs(A.work, exist_ok=True)
 OWNER = "benchmark-owner-key-0123456789"
 PG = "host=127.0.0.1 port=5499 user=postgres dbname=postgres"
-PD = "host=127.0.0.1 port=5498 user=u dbname=lake"
+PD = f"host=127.0.0.1 port=5498 user=admin password={OWNER} dbname=lake"  # (a node its program started answers only it: its key is the admin's password)
 LINEITEM = A.lineitem
 Q = {n: open(os.path.join(HERE, "tpch-queries", f"{n}.sql")).read().strip().rstrip(";") for n in ("q1", "q6")}
 lake = os.path.join(A.work, "lake")
@@ -100,6 +100,7 @@ for n, q in Q.items():
     with psycopg.connect(PG, autocommit=True) as c:
         pg_s = best(lambda: c.execute(q).fetchall())
     with psycopg.connect(PD, autocommit=True) as c:
+        c.execute("SET datafusion.execution.batch_size = 8192")  # (DataFusion's own; a session with a setting has its answers worked out each time, never remembered: Postgres keeps none either)
         pd_s = best(lambda: c.execute(q).fetchall())
     out[f"TPC-H {n.upper()} on SF1 lineitem, best of 3 (s)"] = {"Postgres": pg_s, "Pondra": pd_s}
 node.terminate(); node.wait()

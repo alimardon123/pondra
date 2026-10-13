@@ -15,6 +15,24 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
 
+**Round 34 complete (2026-10-14): 0.34.0**, the first weekly release of the month to 1.0. A node on
+a network is never open (its leader makes the first user and prints its token once), the row doors
+and the nodes' own routes take only what their caller may write, and temporary secrets reach only
+the public internet. `connect()` opens a lake in the program's own process, in memory or on disk.
+SQLAlchemy, the DB-API, Alembic and a dbt adapter work, and what Grafana, Metabase, Superset and
+DBeaver send is answered as Postgres 16 answers it (211 statements, `harness.py bi`). Transactions
+are READ COMMITTED with row locks, and `RETURNING`, `UUID`, `BACKUP DATABASE`, `COPY INTO`, Glue,
+S3 Tables and vended credentials came too. Gates (`logs/gates/README.md`, 2026-10-13), on one
+4-core machine: TPC-H SF1 from memory 1.08 s against DuckDB 1.5.5's own tables at 1.15 s, from
+files 2.06 s against 2.19 s (medians of three, 22 answers right each time); Nexmark's 20 views over
+2M events right, the last answer 6 to 14 s after the stream (q18 the last, as before); pgbench 141
+and 221 transactions a second on one and four clients, balances right; sqllogictest 22,721 records
+passed, the ten fewer than 0.33.0 all records Pondra now answers on purpose, each a named exception
+(a SELECT naming two items alike, IN and EXISTS outside a WHERE, avg over a DECIMAL rounded).
+Measured side by side with 0.33.0 on the same machine, a key lookup over the Postgres port and
+pgbench's one client are as fast or faster. What a user sees is in `.github/release.md`; each
+change's checks in its pull request.
+
 **Round 33 complete (2026-10-10): 0.33.0.** Each database read and written under its own sign-in;
 branches (`CREATE DATABASE dev CLONE prod`, zero copy, `REFRESH`) and projects planned, deployed and
 tested (`pondra plan`, `pondra deploy`); sharing with other companies over Delta Sharing; every

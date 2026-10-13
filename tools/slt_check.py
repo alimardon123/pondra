@@ -296,14 +296,24 @@ EXCEPTIONS = {
     "temporary tables": "`CREATE TEMPORARY TABLE`, which DataFusion refuses and Pondra keeps for its session, a key and NOT NULL included (temp.rs)",
     "LIKE … ESCAPE": "LIKE with an escape character other than a backslash, which DataFusion refuses and Pondra answers as Postgres does",
     "UPDATE … FROM": "`UPDATE t SET … FROM other WHERE …`, which DataFusion refuses and Pondra runs, as Postgres does",
+    "names apart": "a SELECT list naming two items alike (`count(1), count(1)`, a call and its call over a cast), which DataFusion refuses and Pondra answers, naming the second apart (invariant 175)",
+    "IN outside a WHERE": "`x IN (SELECT …)` and `EXISTS (…)` in a SELECT list, a CASE or an aggregate, which DataFusion can't run and Pondra answers with SQL's NULLs",
+    "avg rounded": "`avg` over a DECIMAL rounds its last place, as Postgres and DuckDB do; DataFusion cuts it off",
 }
 RUNNER_FUNCTIONS = {"async_abs"}  # (async_udf.slt's: registered by the runner)
 MADE = re.compile(r"\s*(?:create\s+(?:or\s+replace\s+)?(?:(?:temp|temporary|external|unbounded|materialized)\s+)*(?:table|view)\s+(?:if\s+not\s+exists\s+)?|select\b.*?\binto\s+)(\"[^\"]+\"|[\w.]+)", re.I | re.S)
 
 
-def exception(sql, why, made):
-    """The named exception a failed record is, if any (`made`: the tables the file makes)."""
+def exception(sql, why, made, pattern=""):
+    """The named exception a failed record is, if any (`made`: the tables the file makes; `pattern`: the error
+    the record expects)."""
     explain = re.match(r"\s*explain\b", sql, re.I)
+    if why == "an error was expected" and (re.search(r"unique expression names|duplicate unqualified field name", pattern) or twice(sql)):
+        return "names apart"
+    if why == "an error was expected" and re.search(r"does not support logical expression (InSubquery|Exists)", pattern):
+        return "IN outside a WHERE"
+    if why.startswith("answer differs") and re.search(r"\bavg\s*\(", sql, re.I) and last_place(why):
+        return "avg rounded"
     if why == "an error was expected" and re.search(r"interval\s+'[^']*'\s*[*/]|[*]\s*interval\s+'", sql, re.I):
         return "interval arithmetic"
     if why == "an error was expected" and re.search(r"\bfetch\s+(first|next)\b", sql, re.I):
@@ -329,6 +339,28 @@ def exception(sql, why, made):
     if why.startswith("answer differs (in another order)") and not re.search(r"\border\s+by\b", outermost(sql), re.I):
         return "an order not asked for"
     return None
+
+
+def twice(sql):
+    """Whether a SELECT list (outside its parentheses) holds one item twice, as `count(1), count(1)`."""
+    m = re.match(r"\s*(?:explain\s+)?select\s+(.*?)\s+from\b", sql, re.I | re.S)
+    items, depth, item = [], 0, ""
+    for c in (m.group(1) + "," if m else ""):
+        depth += (c == "(") - (c == ")")
+        if c == "," and depth == 0:
+            items.append(" ".join(item.split()).lower())
+            item = ""
+        else:
+            item += c
+    return len(items) != len(set(items))
+
+
+def last_place(why):
+    """Whether an answer differs from the one wanted only by one in a decimal's last place."""
+    got, _, want = why.partition(", want ")
+    numbers = lambda s: re.findall(r"-?\d+\.\d+", s)
+    a, b = numbers(got), numbers(want)
+    return bool(a) and len(a) == len(b) and a != b and all(x == y or (len(x) == len(y) and abs(float(x) - float(y)) <= 1.5 * 10 ** -len(x.split(".")[1])) for x, y in zip(a, b))
 
 
 def outermost(sql):
@@ -373,7 +405,7 @@ def run_file(path, port, spread):
                     counts["error_text_differs"] += 1
             else:
                 ok, why = False, text
-        named = None if ok else exception(sql, why, made)
+        named = None if ok else exception(sql, why, made, " ".join(header[1:]) if header[:1] == ["error"] else "")
         counts["passed" if ok else "excepted" if named else "failed"] += 1
         if not ok:
             failures.append({"file": os.path.basename(path), "line": line, "sql": sql[:300], "why": why[:500], **({"exception": named} if named else {})})

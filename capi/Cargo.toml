@@ -1,6 +1,6 @@
 [package]
 name = "pondra-capi"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2021"
 description = "pondra_lib: a Pondra node in any language's process, through one C ABI (ADR-061 §6)"
 license = "MIT OR Apache-2.0"

@@ -1,6 +1,6 @@
 [package]
 name = "pondra-launcher"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2021"
 description = "Pondra's launcher: the `pondra` command of the packages, which loads Pondra's library (pondra_lib) and runs its program"
 license = "MIT OR Apache-2.0"
