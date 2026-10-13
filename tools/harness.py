@@ -16827,14 +16827,17 @@ def pkey():
     Two rows of one key in one INSERT (VALUES and SELECT) are refused whole, and CREATE TABLE … AS SELECT
     with two rows of one key leaves no table. A deleted key is free again (before and after tiering), a
     transaction's COMMIT refuses a key it holds, and an order_by table is keyed too. The upserts keep
-    upserting: ON CONFLICT, INSERT OR REPLACE and OR IGNORE, MERGE, /append, COPY FROM STDIN and a Kafka
-    produce. A plain INSERT takes its keys' row locks on the leader (`txn::autocommit_as`): two nodes
+    upserting: ON CONFLICT, INSERT OR REPLACE and OR IGNORE, a MERGE's matched rows, /append, COPY FROM
+    STDIN and a Kafka produce. A plain INSERT takes its keys' row locks on the leader (`txn::autocommit_as`): two nodes
     inserting the same new key at once, the second waits for the first and is refused (at its INSERT, as
     Postgres does). A transaction's plain INSERT is refused at its statement when the key is held as the
     transaction sees it (its own kept writes count; a SAVEPOINT can roll the refusal back), and COMMIT checks
     again: a change moving a key onto a held one is refused, and a DELETE and an INSERT of one key in one
     transaction keep the new row. An UPDATE of a key column is refused by name (0A000), so a key moves by a
-    DELETE and an INSERT. A CREATE TABLE … AS SELECT refused by its key is purged, not kept for UNDROP."""
+    DELETE and an INSERT. A CREATE TABLE … AS SELECT refused by its key is purged, not kept for UNDROP.
+    A MERGE's inserted keys must be new as a plain INSERT's are (23505, on a follower too, and in a
+    transaction at COMMIT), though a MERGE matched on the key still updates and inserts; a MERGE that SETs
+    a key column is refused by name (0A000)."""
     import psycopg, concurrent.futures as cf, urllib.request
     import adbc_driver_flightsql.dbapi as adbc
     import confluent_kafka as ck
@@ -16937,6 +16940,62 @@ def pkey():
     got = names()
     info["upserts"] = got
     checks["ON CONFLICT DO UPDATE and DO NOTHING, INSERT OR REPLACE and OR IGNORE, MERGE still upsert"] = got[1] == "merged" and got[2] == "bob v2"
+
+    # A MERGE's inserted keys must be new, as a plain INSERT's are (`change::run`): one that matches on another column looks
+    # each inserted key up, one that matches on the key alone, in the key's own type, checks its own new rows. A MERGE
+    # matched on the key still updates and inserts (dbt's shape), and a SET of a key column is refused by name (0A000).
+    q("CREATE TABLE mrg (id BIGINT PRIMARY KEY, v VARCHAR)")
+    q("INSERT INTO mrg VALUES (7001, 'a'), (7002, 'b'), (7003, 'c')")
+    mrg_rows = lambda port=P: {r["id"]: r["v"] for r in q("SELECT id, v FROM mrg", port)}
+    for _ in range(100):  # (the follower sees the table and its rows once the commit reaches it)
+        if set(mrg_rows(P + 1)) == {7001, 7002, 7003}:
+            break
+        time.sleep(0.1)
+    mrg_before = mrg_rows()
+    mrg_v = err("MERGE INTO mrg t USING (SELECT 7002 AS id, 'zz' AS v) s ON t.v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
+    mrg_follower = err("MERGE INTO mrg t USING (SELECT 7003 AS id, 'mm' AS v) s ON t.v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)", P + 1)
+    mrg_two = err("MERGE INTO mrg t USING (SELECT 7004 AS id, 'p' AS v UNION ALL SELECT 7004, 'q') s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
+    mrg_conflict = err("INSERT INTO mrg VALUES (7003, 'yy') ON CONFLICT (v) DO NOTHING")
+    mrg_after_refusals = mrg_rows()
+    info["merge_inserts"] = [mrg_v, mrg_follower, mrg_two, mrg_conflict, mrg_after_refusals]
+    checks["a MERGE that inserts a key the table holds is refused (23505) and changes no row: matched on another column (on a follower too), two source rows of one new key, ON CONFLICT on another column"] = \
+        refused(mrg_v) and refused(mrg_follower) and refused(mrg_two) and refused(mrg_conflict) and mrg_after_refusals == mrg_before == {7001: "a", 7002: "b", 7003: "c"}
+
+    # In a transaction the MERGE's insert is refused at COMMIT (its statement can't see the key it writes): the row stays
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        try:
+            cur.execute("MERGE INTO mrg t USING (SELECT 7002 AS id, 'tt' AS v) s ON t.v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
+            cur.execute("COMMIT")
+            mrg_txn = None
+        except psycopg.Error as e:
+            mrg_txn = e.sqlstate  # (the transaction is over: nothing to roll back)
+    info["merge_txn"] = [mrg_txn, mrg_rows().get(7002)]
+    checks["a MERGE in a transaction that inserts a key the table holds: refused (23505), and the row is as it was"] = mrg_txn == "23505" and mrg_rows()[7002] == "b"
+
+    # A key the ON compares in another type: 7002.5 against BIGINT's keys compares as decimals and matches no row, yet the
+    # inserted value is cast to the key's type (7002), a row that's there. Such a MERGE is checked by lookups.
+    mrg_dec = err("MERGE INTO mrg t USING (SELECT 7002.5 AS id, 'y' AS v) s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
+    info["merge_decimal"] = [mrg_dec, mrg_rows()]
+    # An INSERT's value is cast to the key's type before its conflict is checked (as Postgres does): 7003.5 is the key 7003,
+    # which is held, so DO NOTHING keeps its row (Pondra's cast truncates, Postgres rounds: 7004 there).
+    ins_nothing = err("INSERT INTO mrg SELECT 7003.5 AS id, 'y' AS v ON CONFLICT (id) DO NOTHING")
+    info["merge_decimal_nothing"] = [ins_nothing, mrg_rows()]
+    checks["a MERGE that compares a key in another type (7002.5 against BIGINT) and inserts it: refused (23505), the table as it was; an INSERT of 7003.5 ON CONFLICT DO NOTHING keeps 7003"] = \
+        refused(mrg_dec) and mrg_rows() == {7001: "a", 7002: "b", 7003: "c"} and ins_nothing[0] == 200
+
+    mrg_dbt = q("MERGE INTO mrg t USING (SELECT 7001 AS id, 'a2' AS v UNION ALL SELECT 7005, 'e') s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
+    mrg_key_set = err("MERGE INTO mrg t USING (SELECT 7001 AS id) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET id = 7009")
+    info["merge_dbt"] = [mrg_dbt, mrg_key_set, mrg_rows()]
+    checks["a MERGE matched on the key updates and inserts (dbt's shape); a SET of the key is refused by name (0A000), the table unchanged"] = \
+        mrg_rows() == {7001: "a2", 7002: "b", 7003: "c", 7005: "e"} and mrg_key_set[1] == "0A000" and mrg_rows()[7001] == "a2"
+
+    # An INSERT of 7003.5 with ON CONFLICT DO UPDATE takes the cast key too: it updates 7003 (counted as updated), no row is inserted
+    ins_update = q("INSERT INTO mrg VALUES (7003.5, 'u') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
+    info["merge_decimal_update"] = [ins_update, mrg_rows()]
+    checks["an INSERT of 7003.5 with ON CONFLICT DO UPDATE updates 7003 (counted as updated, none inserted), the other rows as they were"] = \
+        ins_update.get("updated") == 1 and ins_update.get("inserted") == 0 and mrg_rows() == {7001: "a2", 7002: "b", 7003: "u", 7005: "e"}
 
     # Loading doors: still upserts
     post = err('{"id": 1, "name": "append"}\n', P, "/append/people")
