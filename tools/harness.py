@@ -5348,10 +5348,11 @@ def names():
         named == [["x"], ["x::INT", "id", "name", "x"], ["id_1", "id", "name", "x"], ["id", "id_1"], ["CAST(x AS INT)", "x"]]
     apart = [cols("SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM t WHERE id > 1)"), cols("SELECT max(id), (SELECT max(id) FROM t) FROM t"),
              cols("SELECT id + 1, id + 1, id + 1 FROM t"), cols("SELECT (SELECT max(id) FROM t), (SELECT min(id) FROM t)"),
-             cols("SELECT id * 2, id::DOUBLE * 2, CAST(id AS DOUBLE) * 2 FROM t")]
-    checks["two subqueries of one column's name, max(id) beside (SELECT max(id) FROM t), id + 1 thrice and id * 2 beside id::DOUBLE * 2 run, named as written (DuckDB); subqueries apart keep theirs"] = \
+             cols("SELECT id * 2, id::DOUBLE * 2, CAST(id AS DOUBLE) * 2 FROM t"), cols("SELECT NULL, NULL, count(*), count(*) FROM t")]
+    checks["two subqueries of one column's name, max(id) beside (SELECT max(id) FROM t), id + 1 thrice and id * 2 beside id::DOUBLE * 2 run, named as written (DuckDB); subqueries apart keep theirs; NULL and count(*) twice, which DataFusion names as written, run too"] = \
         apart == [["(SELECT count(*) FROM t)", "(SELECT count(*) FROM t WHERE id > 1)"], ["max(t.id)", "(SELECT max(id) FROM t)"],
-                  ["t.id + Int64(1)", "id + 1", "id + 1_1"], ["max(t.id)", "min(t.id)"], ["t.id * Int64(2)", "id::DOUBLE * 2", "CAST(id AS DOUBLE) * 2"]]
+                  ["t.id + Int64(1)", "id + 1", "id + 1_1"], ["max(t.id)", "min(t.id)"], ["t.id * Int64(2)", "id::DOUBLE * 2", "CAST(id AS DOUBLE) * 2"],
+                  ["NULL", "NULL_1", "count(*)", "count(*)_1"]]
     # aggregates that differ only by a cast: DataFusion names both sum(t.id), and refused the query
     alone = lambda q: [list(r.values()) for r in db.sql(q).rows()]
     sets = [["sum(id)", "sum(id::DOUBLE)"], ["min(x)", "min(x::INT)", "max(x::INT)"], ["count(DISTINCT id)", "count(DISTINCT id::TEXT)", "count(DISTINCT x::INT)"],

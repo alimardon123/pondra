@@ -1190,8 +1190,16 @@ fn select_names(body: &mut ast::SetExpr, sorted: &[String]) -> bool {
                 if !again {
                     continue;
                 }
+                // (as written only where DataFusion can't have named another item so: it names a subquery
+                // by its column, a literal by its type, `Int64(1)`, and a cast by what it casts; but `NULL`,
+                // `count(*)` and `t.a + t.b` as they are written)
+                let unlike = key.0 || ast::visit_expressions(e, |x| match x {
+                    Expr::Value(v) if v.value != ast::Value::Null => ControlFlow::Break(()),
+                    Expr::Cast { .. } => ControlFlow::Break(()),
+                    _ => ControlFlow::Continue(()),
+                }).is_break();
                 let written = e.to_string();
-                let name = (0..).map(|i| if i == 0 { written.clone() } else { format!("{written}_{i}") })
+                let name = (usize::from(!unlike)..).map(|i| if i == 0 { written.clone() } else { format!("{written}_{i}") })
                     .find(|m| !names.iter().any(|x| x.as_deref() == Some(m.as_str()))).expect("a free name");
                 keys[k] = Some((false, said(e)));
                 names[k] = Some(name.clone());
@@ -2342,5 +2350,14 @@ mod tests {
         // (a subquery's calls are its own; a cast of a value alone, and calls that differ otherwise, are left as written)
         assert_eq!(named_apart("SELECT sum(c), (SELECT sum(c::DOUBLE) FROM u) AS s FROM t"), None);
         assert_eq!(named_apart("SELECT max(c), max(d::INT) FROM t HAVING f(max(c), 0.5::DOUBLE) > f(max(c), 0.5)"), None);
+    }
+
+    #[test]
+    fn an_expression_written_again_is_named_apart_from_the_first() {
+        // (DataFusion names `id + 1` as `t.id + Int64(1)`, so the second can be named as written; it names
+        // `NULL` and `count(*)` as written, so the second can't)
+        assert_eq!(named_apart("SELECT id + 1, id + 1, id + 1 FROM t").unwrap(), "SELECT id + 1, id + 1 AS \"id + 1\", id + 1 AS \"id + 1_1\" FROM t");
+        assert_eq!(named_apart("INSERT INTO t SELECT value, NULL, NULL FROM r").unwrap(), "INSERT INTO t SELECT value, NULL, NULL AS \"NULL_1\" FROM r");
+        assert_eq!(named_apart("SELECT count(*), count(*) FROM t").unwrap(), "SELECT count(*), count(*) AS \"count(*)_1\" FROM t");
     }
 }

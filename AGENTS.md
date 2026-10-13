@@ -1261,7 +1261,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    refuse for two columns of one name (`SELECT ts::date, *`, `SELECT id, *`) runs, a cast named as
    its column or, beside another of that name, as written, a column named twice `id_1`, and a
    scalar subquery named as another item (DataFusion names it by its column: two of `count(*)`) or
-   an expression written twice (or but for a cast, which DataFusion's names leave out), as written;
+   an expression written twice (or but for a cast, which DataFusion's names leave out), as written,
+   or with `_1` when DataFusion names the first as written too (`NULL`, `count(*)`: no literal or
+   cast in it; `harness.py minmax`'s INSERT of two NULLs failed without it);
    a query that needs no name given is sent as written. Calls that differ only by a cast
    (`sum(id), sum(id::DOUBLE)`, which an aggregate refused as two of `sum(t.id)`) are told apart
    (`routines::casts_apart`): each later form's arguments that cast a column go in `coalesce(…)`,
