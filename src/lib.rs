@@ -97,6 +97,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod ci;
 #[cfg(feature = "server")] mod project;
 #[cfg(feature = "server")] mod protect;
+#[cfg(feature = "server")] mod public;
 #[cfg(feature = "server")] mod query;
 #[cfg(feature = "server")] mod read_delta;
 #[cfg(feature = "server")] mod read_iceberg;

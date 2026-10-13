@@ -3,7 +3,7 @@
 //! wire protocol Pondra's own Kafka port speaks (`kafka.rs`), the other way round, in the
 //! versions every broker since Kafka 2.1 answers and Kafka 4 still does; plain TCP or TLS, SASL
 //! PLAIN or SCRAM, from the secret covering the cluster's URL.
-use crate::kafka::{crc32c, decompress, put_nstr, put_str, put_varint, Rd};
+use crate::kafka::{crc32c, decompress, put_nstr, put_str, put_varint, Rd, MOST};
 use anyhow::{bail, ensure, Context, Result};
 use bytes::{BufMut, Bytes};
 use std::collections::{BTreeMap, HashMap};
@@ -416,7 +416,7 @@ fn decode(mut b: &[u8], from: i64, aborted: &[(i64, i64)]) -> Result<(Vec<Record
         if attributes & 0x10 != 0 && aborting.contains(&producer) {
             continue; // (a transaction that was aborted)
         }
-        let body = decompress(attributes & 7, &r.b[r.at..])?;
+        let body = decompress(attributes & 7, &r.b[r.at..], MOST)?; // (a batch at a time: the fetch's size bounds the answer, and a topic is an admin's to name)
         let log_append = attributes & 8 != 0;
         let mut r = Rd { b: body.into(), at: 0 };
         for _ in 0..count {

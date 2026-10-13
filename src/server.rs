@@ -775,9 +775,10 @@ impl App {
     /// the session's temporary tables, its transaction, settings and variables, a past it reads, and
     /// a Python table function's call; and a user granted some tables has its grants checked where
     /// the query is planned, here. So does a view that says `current_schema()` read under a path of
-    /// the session's own: the other nodes read it with no session, as its reader's path says.
+    /// the session's own: the other nodes read it with no session, as its reader's path says. And
+    /// so do a session's queries while it holds temporary secrets, which only this node has.
     pub async fn here_only(&self, query: &str) -> bool {
-        crate::query::sent() || crate::temp::mentioned(query) || crate::past::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
+        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::holds_secrets() || crate::past::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)
     }
 
@@ -1081,6 +1082,7 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
             crate::defaults::fill(&app.lake, &meta, batch, |c| absent.get(c).cloned()).await?
         }
     };
+    crate::auth::check_load(&meta, name, &batch)?; // (a keyed table's rows replace their keys': UPDATE too; marked _deleted, DELETE: S11)
     Ok(Json(log.append(name.to_string(), Src { producer: p.producer, seq: p.seq, prev: p.prev }, batch).await?))
 }
 

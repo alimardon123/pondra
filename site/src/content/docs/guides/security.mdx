@@ -341,7 +341,12 @@ refused.
 A user's queries use a secret only with `GRANT USAGE ON SECRET s TO …`. And anyone signed in may
 bring their own for a session: `CREATE TEMPORARY SECRET s (TYPE s3, …)` lives in the node's memory for
 that session (a Postgres connection, a client's connection), is used before the lake's, and is written
-nowhere.
+nowhere. One a user who isn't an admin makes reads with its own keys, on the public internet: never
+with the node's own credentials (`PROVIDER credential_chain`), never a topic, and never an address of the
+node's machine or network, whether it is written in the URL, given as an `ENDPOINT` or is a name that
+resolves there. What lives on your own network is reached through an admin's `CREATE SECRET … SCOPE '…'`,
+granted with `USAGE`. A secret's `SCOPE` covers a URL only whole or followed by a path: `s3://data` doesn't
+cover `s3://data-other`.
 
 The master key is `PONDRA_SECRET_KEY`, and **every node of a cluster needs the same one**: a node
 with another key stops with `was sealed with another master key`. Without it a node makes a key for its

@@ -663,7 +663,7 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     // Every request to the bucket takes a turn of its budget, retries too (`budget.rs`, C5).
     let turns = || crate::budget::Budget::of(&root);
     let mut whole: Store = match (params, scheme) {
-        (Some(_), _) => crate::ext::build(&url::Url::parse(&root)?, params, true)?,
+        (Some(_), _) => crate::ext::build(&url::Url::parse(&root)?, params, crate::ext::For::Lake)?,
         (None, "s3") => Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
         (None, "gs") => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).with_config(GoogleConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
         (None, _) => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&root).with_config(AzureConfigKey::Client(idle), after).with_http_connector(turns()).build()?),

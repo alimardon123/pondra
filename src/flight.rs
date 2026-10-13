@@ -314,6 +314,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
         return Err(Status::invalid_argument(crate::log::SEQ_FROM_1)); // (0 is "nothing yet": its batch would be taken for a retry)
     }
     let (lake, again, table2) = (app.lake.clone(), log.clone(), table.clone());
+    let who = crate::auth::current(); // (the caller, for its grants in the task below: a task keeps no task-local)
     type Queued = Pin<Box<dyn std::future::Future<Output = anyhow::Result<crate::log::Ack>> + Send>>;
     let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<(Queued, RecordBatch, crate::log::Src), Status>>(256);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel(); // (acks are small; a client may read them only at the end)
@@ -331,10 +332,16 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
             let rows = crate::query::conform(&b, sch)?;
             crate::defaults::fill(lk, m, rows, |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(b.num_rows()))).await
         };
+        // (a keyed table's rows replace their keys', and rows marked _deleted delete them: S11)
+        let named = crate::auth::catalog_name(&table);
+        let load = |b: &RecordBatch| match &who {
+            Some(w) => crate::auth::WHO.sync_scope(w.clone(), || crate::auth::check_load(m, &named, b)).map_err(|e| Status::permission_denied(e.to_string())),
+            None => Ok(()),
+        };
         let mut i = 0;
         while let Some(b) = batches.next().await {
             let b = match b {
-                Ok(b) => conformed(b).await.map_err(status),
+                Ok(b) => conformed(b).await.map_err(status).and_then(|b| load(&b).map(|_| b)),
                 Err(e) => Err(e),
             };
             let queued = match b {
