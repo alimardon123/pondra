@@ -46,7 +46,7 @@ def library_name(platform):
 
 def entry_points():
     """The wheel's entry_points.txt, from python/pyproject.toml's entry points (SQLAlchemy's dialects), its one definition."""
-    import tomllib
+    import tomllib  # (Python 3.11 or later, as CI runs this)
     with open(os.path.join(ROOT, "python", "pyproject.toml"), "rb") as f:
         groups = tomllib.load(f)["project"].get("entry-points", {})
     return "".join(f"[{group}]\n" + "".join(f"{name} = {target}\n" for name, target in names.items()) + "\n" for group, names in groups.items())
