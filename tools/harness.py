@@ -7418,7 +7418,9 @@ def server():
     env = {**os.environ, "PONDRA_DATABASE_IDLE_SECS": "3"}
     def start(how=()):
         log = open(f"/tmp/pondra-{port}-server-{uuid.uuid4().hex[:6]}.stderr", "w")  # (its databases' nodes write here too: CI keeps it when a check fails)
-        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5"], env=env, stdout=subprocess.DEVNULL, stderr=log)
+        # (a database stops once its log is tiered, and a node's own records — the history, the audit log — commit
+        # quietly, tiered at the latest every 4 × --tier-secs: 4 s here, not the default's 40)
+        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5", "--tier-secs", "1"], env=env, stdout=subprocess.DEVNULL, stderr=log)
         until(lambda: _try(lambda: call(port, "GET", "/databases") is not None), True, 30)
         return p
     srv = start()
