@@ -188,6 +188,13 @@ pub fn secrets() -> Vec<(String, crate::ext::Secret)> {
     SESSIONS.lock().unwrap().get(&s).map(|x| x.secrets.iter().map(|(n, v)| (n.clone(), v.clone())).collect()).unwrap_or_default()
 }
 
+/// Does the session hold temporary secrets? Its queries then run on its node alone: the other nodes
+/// don't have them, and would read its files with secrets of their own, or none (S6, S37).
+pub fn holds_secrets() -> bool {
+    let Some(s) = current() else { return false };
+    SESSIONS.lock().unwrap().get(&s).is_some_and(|x| !x.secrets.is_empty())
+}
+
 /// End a session: its temporary tables and views are gone, and its Python (`python::ask_session`).
 pub fn end(session: &str) -> bool {
     crate::txn::end(session); // (its transaction, if open: rolled back)

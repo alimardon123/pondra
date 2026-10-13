@@ -155,6 +155,9 @@ fn extensions() -> &'static [String] {
 /// `PONDRA_CONSOLE_DIR`, for working on the console: its files read from there on every request
 /// (as served: lean), so a change shows on a reload, without building the binary again.
 fn from_dir(name: &str) -> Option<Asset> {
+    if name.starts_with(['/', '\\']) || name.contains(':') || name.split(['/', '\\']).any(|p| p.is_empty() || p == "." || p == "..") {
+        return None; // (a plain relative path only: an absolute one or `..` would read any file of the machine, S34)
+    }
     let dir = crate::env::os("PONDRA_CONSOLE_DIR")?;
     let text = std::fs::read_to_string(std::path::Path::new(&dir).join(name)).ok()?;
     Some(match name.rsplit('.').next() {

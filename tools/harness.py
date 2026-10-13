@@ -7933,8 +7933,9 @@ def secrets():
     # A session's own temporary secret: its queries only; not in the lake
     mine = as_(bob, f"CREATE TEMPORARY SECRET bobs (TYPE http, BEARER_TOKEN 'bob-own-9999', SCOPE '{url}')", session="bob-session-1")
     temp = [as_(bob, read, session="bob-session-1"), as_(bob, read, session="bob-session-2"), as_(bob, "SELECT name FROM secrets() ORDER BY name", session="bob-session-1"), as_(ann, read, session="bob-session-1")]
+    # (bob's secret covers the web server's URL in his session alone: there it is held to the public internet, `reached`; elsewhere no secret covers it)
     checks["CREATE TEMPORARY SECRET: the session's own (another session, another user naming it: not), in memory, nowhere in the lake"] = mine == {"secret": "bobs", "temporary": True} \
-        and temp[0] == [{"cur": "EUR"}, {"cur": "GBP"}] and "no secret" in temp[1].lower() and {"name": "bobs"} in temp[2] and "bob-own-9999" not in catalog() and "bobs" not in catalog() \
+        and "a temporary secret reaches only the public internet" in str(temp[0]) and "no secret" in temp[1].lower() and {"name": "bobs"} in temp[2] and "bob-own-9999" not in catalog() and "bobs" not in catalog() \
         and temp[3] == [{"cur": "EUR"}, {"cur": "GBP"}]  # (ann's own grant, not bob's secret: her session is her own)
     # A new master key: the previous one set, the leader rewraps every data key when it starts
     node.kill()
@@ -8662,6 +8663,77 @@ def guarded():
     print(json.dumps({"guarded": checks, "ok": ok, "info": info}, indent=1, default=str))
     return ok
 
+
+def reached():
+    """What a temporary secret reaches (S6, S7, S37): one a user made reads with its own keys, on the public
+    internet only. Never with the node's own credentials (PROVIDER credential_chain), never a topic, never an
+    address of the node's machine or network, written in the URL, as its endpoint, or a name that resolves
+    there. An admin's reaches what the admin may, this machine too, as the shell's do. And a secret's SCOPE
+    covers a URL only on a boundary: a port's first digits are another port."""
+    import base64, http.server, socket
+    here = tempfile.mkdtemp(prefix="pondra-reached-")
+    open(os.path.join(here, "x.csv"), "w").write("k\nhere\n")
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=here, **k)
+        def log_message(self, *a):
+            pass
+    web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
+    threading.Thread(target=web.serve_forever, daemon=True).start()
+    wp = web.server_address[1]
+    # (no proxy: a name is then resolved by the node itself, as on a server; the node's own keys in its environment)
+    direct = {k: "" for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")} | {"NO_PROXY": "*", "no_proxy": "*"}
+    node = Node(new_lake(), A.port, admin_token="adm", env={**direct, "AWS_ACCESS_KEY_ID": "node-own-key", "AWS_SECRET_ACCESS_KEY": "node-own-secret", "AWS_REGION": "us-east-1"}).start()
+    def ask(auth, q, session=None):
+        try:
+            return call(A.port, "POST", "/sql", q.encode(), headers={"Authorization": auth, **({"x-pondra-session": session} if session else {})})
+        except Exception as e:
+            return f"ERROR {e}"
+    adm = "Bearer adm"
+    ask(adm, "CREATE USER ann PASSWORD 'ann-password-1'")
+    ann = "Basic " + base64.b64encode(b"ann:ann-password-1").decode()
+    public = "a temporary secret reaches only the public internet"
+    try:
+        named = socket.gethostbyname(socket.gethostname())  # (this machine by its own name: a private or loopback address)
+    except OSError:
+        named = None
+    said = {
+        "chain": ask(ann, "CREATE TEMPORARY SECRET mine (TYPE s3, PROVIDER 'credential_chain')", session="ann-session-1"),
+        "kafka": ask(ann, "CREATE TEMPORARY SECRET topics (TYPE kafka)", session="ann-session-1"),
+        "web": ask(ann, "CREATE TEMPORARY SECRET web (TYPE http)", session="ann-session-1"),
+        "s3": ask(ann, f"CREATE TEMPORARY SECRET lan (TYPE s3, KEY_ID 'k', SECRET 's', ENDPOINT 'http://127.0.0.1:{wp}', URL_STYLE 'path')", session="ann-session-1"),
+        "a bucket with the node's keys": ask(ann, "SELECT * FROM read_csv('s3://nodes-own/x.csv')", session="ann-session-2"),
+        "127.0.0.1": ask(ann, f"SELECT * FROM read_csv('http://127.0.0.1:{wp}/x.csv')", session="ann-session-1"),
+        "[::1]": ask(ann, f"SELECT * FROM read_csv('http://[::1]:{wp}/x.csv')", session="ann-session-1"),
+        "localhost": ask(ann, f"SELECT * FROM read_csv('http://localhost:{wp}/x.csv')", session="ann-session-1"),
+        "as a number": ask(ann, f"SELECT * FROM read_csv('http://2130706433:{wp}/x.csv')", session="ann-session-1"),
+        "its own name": ask(ann, f"SELECT * FROM read_csv('http://{socket.gethostname()}:{wp}/x.csv')", session="ann-session-1") if named else "(unresolved)",
+        "an endpoint here": ask(ann, "SELECT * FROM read_csv('s3://somebucket/x.csv')", session="ann-session-1"),
+        "the admin's own": [ask(adm, "CREATE TEMPORARY SECRET web (TYPE http)", session="adm-session-1"),
+                            ask(adm, f"SELECT * FROM read_csv('http://127.0.0.1:{wp}/x.csv')", session="adm-session-1")],
+    }
+    checks, info = {}, {"said": {k: str(v)[:300] for k, v in said.items()}, "this machine's name resolves to": named}
+    checks["a user's temporary secret never lends the node's own credentials (PROVIDER credential_chain) nor reaches a topic: refused by name"] = \
+        "PROVIDER credential_chain reads with the node's own credentials" in said["chain"] and "TYPE kafka is an admin's" in said["kafka"] \
+        and "no secret covers" in said["a bucket with the node's keys"]
+    checks["…it reaches no address of this machine: written (127.0.0.1, [::1], 2130706433), localhost, or a name that resolves here"] = \
+        said["web"] == {"secret": "web", "temporary": True} and all(public in said[k] for k in ("127.0.0.1", "[::1]", "localhost", "as a number")) \
+        and (named is None or public in said["its own name"])
+    checks["…nor an endpoint of this machine (an S3 secret's ENDPOINT)"] = said["s3"] == {"secret": "lan", "temporary": True} and public in said["an endpoint here"]
+    checks["an admin's temporary secret reaches this machine, as the shell's do"] = said["the admin's own"] == [{"secret": "web", "temporary": True}, [{"k": "here"}]]
+    # S7: a SCOPE covers a URL only on a boundary (the port's first digits aren't the port)
+    first = str(wp)[:-1]
+    narrow = [ask(adm, f"CREATE SECRET narrow (TYPE http, SCOPE 'http://127.0.0.1:{first}')"), ask(adm, f"SELECT * FROM read_csv('http://127.0.0.1:{wp}/x.csv')"),
+              ask(adm, f"CREATE OR REPLACE SECRET narrow (TYPE http, SCOPE 'http://127.0.0.1:{wp}')"), ask(adm, f"SELECT * FROM read_csv('http://127.0.0.1:{wp}/x.csv')")]
+    info["narrow"] = [str(x)[:200] for x in narrow]
+    checks["a secret's SCOPE covers a URL only on a boundary: http://127.0.0.1:" + first + " isn't port " + str(wp)] = \
+        "no secret covers" in str(narrow[1]) and narrow[3] == [{"k": "here"}]
+    node.kill()
+    web.shutdown()
+    shutil.rmtree(here, ignore_errors=True)
+    ok = all(checks.values())
+    print(json.dumps({"reached": checks, "ok": ok, **({} if ok else {"info": info})}, indent=1, default=str))
+    return ok
 
 def owned():
     """A node a program started for itself (the shell, local(): PONDRA_OWNER_KEY) answers only that
@@ -16623,7 +16695,7 @@ SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20,
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, bi, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, bi, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -16655,7 +16727,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "bi", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "bi", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -16668,7 +16740,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "bi": bi, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "bi": bi, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
