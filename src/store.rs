@@ -1088,6 +1088,7 @@ impl Lake {
         let mut state = state.with_analyzer_rules(crate::optimize::analyzer_rules()).with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
         state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::files::planner());
         state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::intervals::planner()); // (n * INTERVAL '37 seconds') // (SUBSTRING of bytes too)
+        state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::pg_json::planner()); // (#>, #>>, @>, ?|: Postgres's JSON operators, ahead of functions-json's)
         let mut ctx = SessionContext::new_with_state(state.build());
         spark(&ctx); // format_string, pmod, parse_url, …
         datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
@@ -1101,6 +1102,7 @@ impl Lake {
         crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
         crate::types::register(&ctx); // gen_random_uuid(), uuidv7(), pg_typeof(x)
         crate::pg_functions::register(&ctx); // format(), array_upper(), to_char(ts, 'YYYY-MM'): what Postgres's clients send
+        crate::pg_json::register(&ctx); // pg_json_path(…), pg_jsonb_contains(…): what those operators call
         crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
         ctx
     }
