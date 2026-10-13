@@ -1307,7 +1307,8 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
         Some(reserved) => crate::sys::stamp_stream(rows, next.clone(), reserved),
         None => Ok(rows),
     });
-    let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 1_000_000, &[], true, partition.as_deref()));
+    // (files of up to 4M rows, as a merge writes them: `maintain` leaves them alone)
+    let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 4_000_000, &[], true, partition.as_deref()));
     Ok((columns, futures::future::try_join_all(writes).await?.concat()))
 }
 
