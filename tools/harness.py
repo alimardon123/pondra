@@ -12354,7 +12354,8 @@ def sqla():
     isc = ("SELECT column_name, data_type, character_maximum_length, character_octet_length, udt_name FROM information_schema.columns "
            "WHERE table_name = 'vc' ORDER BY ordinal_position")
     seen = {"port": [[list(r) for r in conn.execute(s).fetchall()] for s in (ft, isc)],
-            "http": [[list(r.values()) for r in at(s, "postgres")[2]] for s in (ft, isc)]}
+            "http": [[[r.get(c) for c in cs] for r in at(s, "postgres")[2]] for s, cs in ((ft, ("attname", "ty", "atttypmod")),
+                     (isc, ("column_name", "data_type", "character_maximum_length", "character_octet_length", "udt_name")))]}  # (the node's JSON leaves nulls out)
     info["varchar_catalog"] = seen
     want = [[["s", "character varying(5)", 9], ["t", "text", -1]],
             [["s", "character varying", 5, 20, "varchar"], ["t", "text", None, 1073741824, "text"]]]
