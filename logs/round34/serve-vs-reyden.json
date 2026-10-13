@@ -1,0 +1,1095 @@
+{
+ "what": "Lakehouse//RT's claim (12,000 QPS under 100 ms, dataset and hardware not stated) and ClickHouse's answer to it (about 420 QPS of TPC-H SF1 Q6 under a second, one 30-vCPU node) measured the same way on Pondra: TPC-H SF1 (tpchgen-cli 3.0.0) loaded into a lake, every query's answers equal to DuckDB's on every node first, then 50 to 400 clients over HTTP for 10 s a step (tools/loadgen.go), each request a statement with fresh parameters (TPC-H spec 2.4) and text of its own, so the result cache answers none, except in the run that says so.",
+ "command": "PONDRA_BIN=\u2026 python3 tools/serve_bench.py --tpch ~/tpch/sf1 [--queries q6] [--nodes 3 --writes] [--cache] [--alone 35] --out FILE",
+ "binary": "main 55d47d3 (0.33.0), release build",
+ "machine": {
+  "cores": 4,
+  "memory_gb": 15.7,
+  "note": "one 4-core VM: the three-node run shares its cores, so it shows answers and freshness on followers, not scale-out"
+ },
+ "runs": {
+  "q6, one node": {
+   "steps": [
+    {
+     "nodes": 1,
+     "queries": [
+      "q6"
+     ],
+     "result_cache": "off: every request's statement is new",
+     "clients": 50,
+     "secs": 11.2,
+     "qps": 39,
+     "errors": 0,
+     "p50_ms": 1210.15,
+     "p99_ms": 1811.68,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 1210.15,
+       "p99_ms": 1811.68,
+       "requests": 442
+      }
+     ],
+     "per_url": null
+    },
+    {
+     "nodes": 1,
+     "queries": [
+      "q6"
+     ],
+     "result_cache": "off: every request's statement is new",
+     "clients": 100,
+     "secs": 12.3,
+     "qps": 39,
+     "errors": 0,
+     "p50_ms": 2451.51,
+     "p99_ms": 3014.59,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 2451.51,
+       "p99_ms": 3014.59,
+       "requests": 484
+      }
+     ],
+     "per_url": null
+    },
+    {
+     "nodes": 1,
+     "queries": [
+      "q6"
+     ],
+     "result_cache": "off: every request's statement is new",
+     "clients": 200,
+     "secs": 15.1,
+     "qps": 37,
+     "errors": 0,
+     "p50_ms": 5242.3,
+     "p99_ms": 5914.46,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 5242.3,
+       "p99_ms": 5914.46,
+       "requests": 566
+      }
+     ],
+     "per_url": null
+    },
+    {
+     "nodes": 1,
+     "queries": [
+      "q6"
+     ],
+     "result_cache": "off: every request's statement is new",
+     "clients": 400,
+     "secs": 19.9,
+     "qps": 38,
+     "errors": 0,
+     "p50_ms": 9902.62,
+     "p99_ms": 11447.03,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 9902.62,
+       "p99_ms": 11447.03,
+       "requests": 757
+      }
+     ],
+     "per_url": null
+    }
+   ],
+   "data": {
+    "folder": "/root/tpch/sf1",
+    "rows": {
+     "region": 5,
+     "nation": 25,
+     "supplier": 10000,
+     "customer": 150000,
+     "part": 200000,
+     "partsupp": 800000,
+     "orders": 1500000,
+     "lineitem": 6001215
+    },
+    "load_s": 14.7
+   },
+   "answers": {
+    "q1": "20 of 20",
+    "q3": "20 of 20",
+    "q5": "20 of 20",
+    "q6": "20 of 20",
+    "q10": "20 of 20",
+    "q12": "20 of 20",
+    "q14": "20 of 20",
+    "q19": "20 of 20"
+   },
+   "statements_each": 20,
+   "nodes": [
+    18300
+   ],
+   "differ": 0
+  },
+  "the mix of eight, one node (and each query alone)": {
+   "steps": [
+    {
+     "nodes": 1,
+     "queries": [
+      "q1",
+      "q3",
+      "q5",
+      "q6",
+      "q10",
+      "q12",
+      "q14",
+      "q19"
+     ],
+     "result_cache": "off: every request's statement is new",
+     "clients": 50,
+     "secs": 11.4,
+     "qps": 23,
+     "errors": 0,
+     "p50_ms": 2004.97,
+     "p99_ms": 3136.79,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q1",
+       "p50_ms": 2253.97,
+       "p99_ms": 3021.01,
+       "requests": 43
+      },
+      {
+       "errors": 0,
+       "label": "q3",
+       "p50_ms": 2013.51,
+       "p99_ms": 2517.68,
+       "requests": 31
+      },
+      {
+       "errors": 0,
+       "label": "q5",
+       "p50_ms": 2000.79,
+       "p99_ms": 2716.57,
+       "requests": 27
+      },
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 1780.21,
+       "p99_ms": 2940.02,
+       "requests": 29
+      },
+      {
+       "errors": 0,
+       "label": "q10",
+       "p50_ms": 2196.42,
+       "p99_ms": 3057.56,
+       "requests": 30
+      },
+      {
+       "errors": 0,
+       "label": "q12",
+       "p50_ms": 1905.22,
+       "p99_ms": 3148.05,
+       "requests": 34
+      },
+      {
+       "errors": 0,
+       "label": "q14",
+       "p50_ms": 1868.32,
+       "p99_ms": 2398.66,
+       "requests": 34
+      },
+      {
+       "errors": 0,
+       "label": "q19",
+       "p50_ms": 1946.78,
+       "p99_ms": 2609.75,
+       "requests": 38
+      }
+     ],
+     "per_url": null
+    },
+    {
+     "nodes": 1,
+     "queries": [
+      "q1",
+      "q3",
+      "q5",
+      "q6",
+      "q10",
+      "q12",
+      "q14",
+      "q19"
+     ],
+     "result_cache": "off: every request's statement is new",
+     "clients": 100,
+     "secs": 13.6,
+     "qps": 25,
+     "errors": 0,
+     "p50_ms": 3799.7,
+     "p99_ms": 4721.51,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q1",
+       "p50_ms": 3899.19,
+       "p99_ms": 4714.91,
+       "requests": 46
+      },
+      {
+       "errors": 0,
+       "label": "q3",
+       "p50_ms": 3719.78,
+       "p99_ms": 4782.55,
+       "requests": 43
+      },
+      {
+       "errors": 0,
+       "label": "q5",
+       "p50_ms": 3875.83,
+       "p99_ms": 4638.82,
+       "requests": 48
+      },
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 3713.31,
+       "p99_ms": 4242.17,
+       "requests": 49
+      },
+      {
+       "errors": 0,
+       "label": "q10",
+       "p50_ms": 4013.19,
+       "p99_ms": 4536.34,
+       "requests": 39
+      },
+      {
+       "errors": 0,
+       "label": "q12",
+       "p50_ms": 3763.78,
+       "p99_ms": 4496.55,
+       "requests": 30
+      },
+      {
+       "errors": 0,
+       "label": "q14",
+       "p50_ms": 3525.93,
+       "p99_ms": 4147.5,
+       "requests": 38
+      },
+      {
+       "errors": 0,
+       "label": "q19",
+       "p50_ms": 3794.32,
+       "p99_ms": 4544.55,
+       "requests": 48
+      }
+     ],
+     "per_url": null
+    },
+    {
+     "nodes": 1,
+     "queries": [
+      "q1",
+      "q3",
+      "q5",
+      "q6",
+      "q10",
+      "q12",
+      "q14",
+      "q19"
+     ],
+     "result_cache": "off: every request's statement is new",
+     "clients": 200,
+     "secs": 17.5,
+     "qps": 26,
+     "errors": 0,
+     "p50_ms": 7026.28,
+     "p99_ms": 8192.04,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q1",
+       "p50_ms": 7196.53,
+       "p99_ms": 7882.87,
+       "requests": 51
+      },
+      {
+       "errors": 0,
+       "label": "q3",
+       "p50_ms": 7163.0,
+       "p99_ms": 8248.22,
+       "requests": 48
+      },
+      {
+       "errors": 0,
+       "label": "q5",
+       "p50_ms": 7176.92,
+       "p99_ms": 8043.27,
+       "requests": 63
+      },
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 6863.98,
+       "p99_ms": 7624.33,
+       "requests": 62
+      },
+      {
+       "errors": 0,
+       "label": "q10",
+       "p50_ms": 7258.62,
+       "p99_ms": 8229.49,
+       "requests": 66
+      },
+      {
+       "errors": 0,
+       "label": "q12",
+       "p50_ms": 7009.39,
+       "p99_ms": 7733.33,
+       "requests": 53
+      },
+      {
+       "errors": 0,
+       "label": "q14",
+       "p50_ms": 6861.6,
+       "p99_ms": 7593.33,
+       "requests": 54
+      },
+      {
+       "errors": 0,
+       "label": "q19",
+       "p50_ms": 6858.67,
+       "p99_ms": 7748.19,
+       "requests": 69
+      }
+     ],
+     "per_url": null
+    },
+    {
+     "nodes": 1,
+     "queries": [
+      "q1",
+      "q3",
+      "q5",
+      "q6",
+      "q10",
+      "q12",
+      "q14",
+      "q19"
+     ],
+     "result_cache": "off: every request's statement is new",
+     "clients": 400,
+     "secs": 25.1,
+     "qps": 26,
+     "errors": 0,
+     "p50_ms": 12953.12,
+     "p99_ms": 15925.0,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q1",
+       "p50_ms": 12530.96,
+       "p99_ms": 16080.26,
+       "requests": 84
+      },
+      {
+       "errors": 0,
+       "label": "q3",
+       "p50_ms": 11771.88,
+       "p99_ms": 15833.62,
+       "requests": 77
+      },
+      {
+       "errors": 0,
+       "label": "q5",
+       "p50_ms": 12109.45,
+       "p99_ms": 15513.39,
+       "requests": 78
+      },
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 11493.08,
+       "p99_ms": 15813.68,
+       "requests": 75
+      },
+      {
+       "errors": 0,
+       "label": "q10",
+       "p50_ms": 11356.18,
+       "p99_ms": 16131.57,
+       "requests": 92
+      },
+      {
+       "errors": 0,
+       "label": "q12",
+       "p50_ms": 13816.77,
+       "p99_ms": 15460.54,
+       "requests": 79
+      },
+      {
+       "errors": 0,
+       "label": "q14",
+       "p50_ms": 13595.49,
+       "p99_ms": 15528.84,
+       "requests": 100
+      },
+      {
+       "errors": 0,
+       "label": "q19",
+       "p50_ms": 13170.7,
+       "p99_ms": 15629.17,
+       "requests": 71
+      }
+     ],
+     "per_url": null
+    }
+   ],
+   "data": {
+    "folder": "/root/tpch/sf1",
+    "rows": {
+     "region": 5,
+     "nation": 25,
+     "supplier": 10000,
+     "customer": 150000,
+     "part": 200000,
+     "partsupp": 800000,
+     "orders": 1500000,
+     "lineitem": 6001215
+    },
+    "load_s": 13.8
+   },
+   "answers": {
+    "q1": "20 of 20",
+    "q3": "20 of 20",
+    "q5": "20 of 20",
+    "q6": "20 of 20",
+    "q10": "20 of 20",
+    "q12": "20 of 20",
+    "q14": "20 of 20",
+    "q19": "20 of 20"
+   },
+   "statements_each": 35,
+   "nodes": [
+    18300
+   ],
+   "differ": 0,
+   "alone": {
+    "q1": {
+     "pondra_ms": 112.7,
+     "duckdb_ms": 73.4
+    },
+    "q3": {
+     "pondra_ms": 43.6,
+     "duckdb_ms": 33.0
+    },
+    "q5": {
+     "pondra_ms": 34.8,
+     "duckdb_ms": 35.8
+    },
+    "q6": {
+     "pondra_ms": 37.1,
+     "duckdb_ms": 14.8
+    },
+    "q10": {
+     "pondra_ms": 77.4,
+     "duckdb_ms": 79.2
+    },
+    "q12": {
+     "pondra_ms": 47.0,
+     "duckdb_ms": 50.4
+    },
+    "q14": {
+     "pondra_ms": 19.6,
+     "duckdb_ms": 33.6
+    },
+    "q19": {
+     "pondra_ms": 82.2,
+     "duckdb_ms": 75.8
+    }
+   },
+   "duckdb": "1.5.5"
+  },
+  "the mix of eight, three nodes on the same 4 cores, rows written meanwhile": {
+   "steps": [
+    {
+     "nodes": 3,
+     "queries": [
+      "q1",
+      "q3",
+      "q5",
+      "q6",
+      "q10",
+      "q12",
+      "q14",
+      "q19"
+     ],
+     "result_cache": "off: every request's statement is new",
+     "clients": 50,
+     "secs": 12.1,
+     "qps": 18,
+     "errors": 0,
+     "p50_ms": 2041.73,
+     "p99_ms": 9894.87,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q1",
+       "p50_ms": 2212.09,
+       "p99_ms": 4076.48,
+       "requests": 27
+      },
+      {
+       "errors": 0,
+       "label": "q3",
+       "p50_ms": 1898.89,
+       "p99_ms": 3665.24,
+       "requests": 30
+      },
+      {
+       "errors": 0,
+       "label": "q5",
+       "p50_ms": 2368.92,
+       "p99_ms": 3447.12,
+       "requests": 19
+      },
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 1210.08,
+       "p99_ms": 2692.17,
+       "requests": 30
+      },
+      {
+       "errors": 0,
+       "label": "q10",
+       "p50_ms": 2648.57,
+       "p99_ms": 3782.26,
+       "requests": 29
+      },
+      {
+       "errors": 0,
+       "label": "q12",
+       "p50_ms": 6342.84,
+       "p99_ms": 10180.01,
+       "requests": 29
+      },
+      {
+       "errors": 0,
+       "label": "q14",
+       "p50_ms": 1586.07,
+       "p99_ms": 3869.7,
+       "requests": 37
+      },
+      {
+       "errors": 0,
+       "label": "q19",
+       "p50_ms": 1861.66,
+       "p99_ms": 4259.71,
+       "requests": 28
+      }
+     ],
+     "per_url": [
+      77,
+      76,
+      76
+     ],
+     "writes": {
+      "batches": 216,
+      "rows_s": 17848,
+      "errors": 0,
+      "ack_p50_ms": 9.58,
+      "ack_p99_ms": 101.8
+     },
+     "freshness": {
+      "seen": 216,
+      "missing": 0,
+      "pending": 0,
+      "p50_ms": 637.32,
+      "p99_ms": 2315.87,
+      "max_ms": 2570.97,
+      "poll_p50_ms": 629.4
+     }
+    },
+    {
+     "nodes": 3,
+     "queries": [
+      "q1",
+      "q3",
+      "q5",
+      "q6",
+      "q10",
+      "q12",
+      "q14",
+      "q19"
+     ],
+     "result_cache": "off: every request's statement is new",
+     "clients": 100,
+     "secs": 13.5,
+     "qps": 20,
+     "errors": 0,
+     "p50_ms": 4037.59,
+     "p99_ms": 10863.96,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q1",
+       "p50_ms": 4588.71,
+       "p99_ms": 6267.32,
+       "requests": 35
+      },
+      {
+       "errors": 0,
+       "label": "q3",
+       "p50_ms": 3678.36,
+       "p99_ms": 6190.15,
+       "requests": 48
+      },
+      {
+       "errors": 0,
+       "label": "q5",
+       "p50_ms": 3704.85,
+       "p99_ms": 4882.46,
+       "requests": 28
+      },
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 3463.92,
+       "p99_ms": 5546.2,
+       "requests": 32
+      },
+      {
+       "errors": 0,
+       "label": "q10",
+       "p50_ms": 4227.87,
+       "p99_ms": 5359.53,
+       "requests": 29
+      },
+      {
+       "errors": 0,
+       "label": "q12",
+       "p50_ms": 7187.3,
+       "p99_ms": 11662.91,
+       "requests": 38
+      },
+      {
+       "errors": 0,
+       "label": "q14",
+       "p50_ms": 3356.72,
+       "p99_ms": 7093.8,
+       "requests": 36
+      },
+      {
+       "errors": 0,
+       "label": "q19",
+       "p50_ms": 3750.0,
+       "p99_ms": 6868.59,
+       "requests": 30
+      }
+     ],
+     "per_url": [
+      92,
+      92,
+      92
+     ],
+     "writes": {
+      "batches": 253,
+      "rows_s": 18762,
+      "errors": 0,
+      "ack_p50_ms": 10.0,
+      "ack_p99_ms": 44.71
+     },
+     "freshness": {
+      "seen": 253,
+      "missing": 0,
+      "pending": 0,
+      "p50_ms": 3071.53,
+      "p99_ms": 4104.22,
+      "max_ms": 4325.48,
+      "poll_p50_ms": 3068.0
+     }
+    },
+    {
+     "nodes": 3,
+     "queries": [
+      "q1",
+      "q3",
+      "q5",
+      "q6",
+      "q10",
+      "q12",
+      "q14",
+      "q19"
+     ],
+     "result_cache": "off: every request's statement is new",
+     "clients": 200,
+     "secs": 20.4,
+     "qps": 18,
+     "errors": 0,
+     "p50_ms": 9025.5,
+     "p99_ms": 16040.38,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q1",
+       "p50_ms": 9832.22,
+       "p99_ms": 12651.97,
+       "requests": 51
+      },
+      {
+       "errors": 0,
+       "label": "q3",
+       "p50_ms": 8401.41,
+       "p99_ms": 10249.14,
+       "requests": 40
+      },
+      {
+       "errors": 0,
+       "label": "q5",
+       "p50_ms": 8628.81,
+       "p99_ms": 11243.67,
+       "requests": 38
+      },
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 8538.22,
+       "p99_ms": 11617.27,
+       "requests": 55
+      },
+      {
+       "errors": 0,
+       "label": "q10",
+       "p50_ms": 9031.13,
+       "p99_ms": 11201.56,
+       "requests": 47
+      },
+      {
+       "errors": 0,
+       "label": "q12",
+       "p50_ms": 11102.14,
+       "p99_ms": 17412.81,
+       "requests": 49
+      },
+      {
+       "errors": 0,
+       "label": "q14",
+       "p50_ms": 7064.53,
+       "p99_ms": 12145.82,
+       "requests": 51
+      },
+      {
+       "errors": 0,
+       "label": "q19",
+       "p50_ms": 8917.34,
+       "p99_ms": 12285.78,
+       "requests": 54
+      }
+     ],
+     "per_url": [
+      129,
+      128,
+      128
+     ],
+     "writes": {
+      "batches": 385,
+      "rows_s": 18910,
+      "errors": 0,
+      "ack_p50_ms": 9.62,
+      "ack_p99_ms": 33.99
+     },
+     "freshness": {
+      "seen": 385,
+      "missing": 0,
+      "pending": 0,
+      "p50_ms": 8017.2,
+      "p99_ms": 9764.68,
+      "max_ms": 9845.38,
+      "poll_p50_ms": 8017.05
+     }
+    },
+    {
+     "nodes": 3,
+     "queries": [
+      "q1",
+      "q3",
+      "q5",
+      "q6",
+      "q10",
+      "q12",
+      "q14",
+      "q19"
+     ],
+     "result_cache": "off: every request's statement is new",
+     "clients": 400,
+     "secs": 29.2,
+     "qps": 19,
+     "errors": 0,
+     "p50_ms": 15516.5,
+     "p99_ms": 22322.45,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q1",
+       "p50_ms": 16731.08,
+       "p99_ms": 23058.81,
+       "requests": 68
+      },
+      {
+       "errors": 0,
+       "label": "q3",
+       "p50_ms": 13575.2,
+       "p99_ms": 20399.02,
+       "requests": 67
+      },
+      {
+       "errors": 0,
+       "label": "q5",
+       "p50_ms": 13317.46,
+       "p99_ms": 20158.63,
+       "requests": 77
+      },
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 16179.34,
+       "p99_ms": 22130.2,
+       "requests": 78
+      },
+      {
+       "errors": 0,
+       "label": "q10",
+       "p50_ms": 11830.91,
+       "p99_ms": 20693.25,
+       "requests": 85
+      },
+      {
+       "errors": 0,
+       "label": "q12",
+       "p50_ms": 16689.7,
+       "p99_ms": 21623.33,
+       "requests": 59
+      },
+      {
+       "errors": 0,
+       "label": "q14",
+       "p50_ms": 17632.4,
+       "p99_ms": 20864.51,
+       "requests": 65
+      },
+      {
+       "errors": 0,
+       "label": "q19",
+       "p50_ms": 16710.51,
+       "p99_ms": 22322.45,
+       "requests": 72
+      }
+     ],
+     "per_url": [
+      191,
+      190,
+      190
+     ],
+     "writes": {
+      "batches": 514,
+      "rows_s": 17624,
+      "errors": 0,
+      "ack_p50_ms": 9.7,
+      "ack_p99_ms": 40.13
+     },
+     "freshness": {
+      "seen": 514,
+      "missing": 0,
+      "pending": 0,
+      "p50_ms": 14422.64,
+      "p99_ms": 20507.28,
+      "max_ms": 21410.37,
+      "poll_p50_ms": 14418.95
+     }
+    }
+   ],
+   "data": {
+    "folder": "/root/tpch/sf1",
+    "rows": {
+     "region": 5,
+     "nation": 25,
+     "supplier": 10000,
+     "customer": 150000,
+     "part": 200000,
+     "partsupp": 800000,
+     "orders": 1500000,
+     "lineitem": 6001215
+    },
+    "load_s": 12.9
+   },
+   "answers": {
+    "q1": "20 of 20",
+    "q3": "20 of 20",
+    "q5": "20 of 20",
+    "q6": "20 of 20",
+    "q10": "20 of 20",
+    "q12": "20 of 20",
+    "q14": "20 of 20",
+    "q19": "20 of 20"
+   },
+   "statements_each": 20,
+   "nodes": [
+    18300,
+    18301,
+    18302
+   ],
+   "differ": 0,
+   "quiet": {
+    "writes": {
+     "batches": 60,
+     "rows_s": 20000,
+     "errors": 0,
+     "ack_p50_ms": 3.26,
+     "ack_p99_ms": 6.95
+    },
+    "freshness": {
+     "seen": 60,
+     "missing": 0,
+     "pending": 0,
+     "p50_ms": 28.93,
+     "p99_ms": 37.1,
+     "max_ms": 37.1,
+     "poll_p50_ms": 4.79
+    }
+   }
+  },
+  "q6, one node, the result cache as it is (parameters repeat)": {
+   "steps": [
+    {
+     "nodes": 1,
+     "queries": [
+      "q6"
+     ],
+     "result_cache": "on: as it is, parameters repeat",
+     "clients": 50,
+     "secs": 10.0,
+     "qps": 8164,
+     "errors": 0,
+     "p50_ms": 4.26,
+     "p99_ms": 11.91,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 4.26,
+       "p99_ms": 11.91,
+       "requests": 81721
+      }
+     ],
+     "per_url": null
+    },
+    {
+     "nodes": 1,
+     "queries": [
+      "q6"
+     ],
+     "result_cache": "on: as it is, parameters repeat",
+     "clients": 100,
+     "secs": 10.0,
+     "qps": 11775,
+     "errors": 0,
+     "p50_ms": 8.0,
+     "p99_ms": 20.31,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 8.0,
+       "p99_ms": 20.31,
+       "requests": 117961
+      }
+     ],
+     "per_url": null
+    },
+    {
+     "nodes": 1,
+     "queries": [
+      "q6"
+     ],
+     "result_cache": "on: as it is, parameters repeat",
+     "clients": 200,
+     "secs": 10.0,
+     "qps": 11747,
+     "errors": 0,
+     "p50_ms": 16.18,
+     "p99_ms": 36.78,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 16.18,
+       "p99_ms": 36.78,
+       "requests": 117750
+      }
+     ],
+     "per_url": null
+    },
+    {
+     "nodes": 1,
+     "queries": [
+      "q6"
+     ],
+     "result_cache": "on: as it is, parameters repeat",
+     "clients": 400,
+     "secs": 10.0,
+     "qps": 11149,
+     "errors": 0,
+     "p50_ms": 34.66,
+     "p99_ms": 84.03,
+     "by": [
+      {
+       "errors": 0,
+       "label": "q6",
+       "p50_ms": 34.66,
+       "p99_ms": 84.03,
+       "requests": 111917
+      }
+     ],
+     "per_url": null
+    }
+   ],
+   "data": {
+    "folder": "/root/tpch/sf1",
+    "rows": {
+     "region": 5,
+     "nation": 25,
+     "supplier": 10000,
+     "customer": 150000,
+     "part": 200000,
+     "partsupp": 800000,
+     "orders": 1500000,
+     "lineitem": 6001215
+    },
+    "load_s": 12.7
+   },
+   "answers": {
+    "q1": "20 of 20",
+    "q3": "20 of 20",
+    "q5": "20 of 20",
+    "q6": "20 of 20",
+    "q10": "20 of 20",
+    "q12": "20 of 20",
+    "q14": "20 of 20",
+    "q19": "20 of 20"
+   },
+   "statements_each": 20,
+   "nodes": [
+    18300
+   ],
+   "differ": 0
+  }
+ }
+}
