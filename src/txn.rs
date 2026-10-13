@@ -1469,13 +1469,17 @@ pub struct Commit {
     #[serde(default)]
     pub reads: BTreeMap<String, Reads>,
     pub tables: Vec<(String, String, String)>,
+    /// The rows themselves, table by table as `tables` lists them (new, old), when this node leads: handed over as they
+    /// are, with nothing encoded to send or read back (`commit`). Empty when the commit came over HTTP.
+    #[serde(skip)]
+    pub rows: Vec<(Vec<RecordBatch>, Vec<RecordBatch>)>,
 }
 
-fn ipc(b: &[RecordBatch]) -> Result<String> {
-    use base64::Engine;
+/// The batches that have rows, in one schema: what a commit's rows are, sent as IPC or handed over (`commit`).
+fn unified(b: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
     let b: Vec<RecordBatch> = b.iter().filter(|b| b.num_rows() > 0).cloned().collect();
     if b.is_empty() {
-        return Ok(String::new());
+        return Ok(vec![]);
     }
     // One stream has one schema: an UPDATE's rows carry `_created_at`, an INSERT's after it don't, so every batch takes every
     // column any has (NULL where it has none).
@@ -1487,8 +1491,20 @@ fn ipc(b: &[RecordBatch]) -> Result<String> {
         }
     }
     let schema = Arc::new(Schema::new(fields));
-    let b = b.iter().map(|b| crate::query::conform(b, &schema)).collect::<Result<Vec<_>>>()?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(crate::log::encode_ipc(&b)?))
+    b.iter().map(|b| crate::query::conform(b, &schema)).collect()
+}
+
+/// The rows as base64 Arrow IPC, for the wire. A small commit goes uncompressed: a ZSTD context costs a call more than a
+/// small commit's bytes save. `read_ipc` reads both.
+fn ipc(b: &[RecordBatch]) -> Result<String> {
+    use base64::Engine;
+    let b = unified(b)?;
+    if b.is_empty() {
+        return Ok(String::new());
+    }
+    let bytes: usize = b.iter().map(|b| b.get_array_memory_size()).sum();
+    let encoded = if bytes < 1 << 20 { crate::query::ipc(&b)? } else { crate::log::encode_ipc(&b)? };
+    Ok(base64::engine::general_purpose::STANDARD.encode(encoded))
 }
 
 fn unipc(s: &str) -> Result<Vec<RecordBatch>> {
@@ -1509,12 +1525,17 @@ async fn commit(app: &crate::server::App, s: &str) -> Result<(&'static str, Opti
         release_txn(&t); // (it only read)
         return Ok(("COMMIT", None, j!({})));
     }
-    let c = Commit {
-        id: t.id.clone(),
-        job: t.job.clone(),
-        reads: t.reads.clone(),
-        tables: t.tables.iter().map(|(n, c)| Ok((n.clone(), ipc(&fresh(c.new.clone())?)?, ipc(&c.old)?))).collect::<Result<_>>()?,
-    };
+    let local = app.seq.is_some(); // (this node leads: its rows go to `commit_here` as they are)
+    let (mut tables, mut rows) = (vec![], vec![]);
+    for (n, c) in &t.tables {
+        if local {
+            tables.push((n.clone(), String::new(), String::new()));
+            rows.push((unified(&fresh(c.new.clone())?)?, unified(&c.old)?));
+        } else {
+            tables.push((n.clone(), ipc(&fresh(c.new.clone())?)?, ipc(&c.old)?));
+        }
+    }
+    let c = Commit { id: t.id.clone(), job: t.job.clone(), reads: t.reads.clone(), tables, rows };
     let sent = match &app.seq {
         Some(seq) => commit_here(&app.lake, seq, &app.lock, c).await,
         None => crate::write::post(&app.cluster.leader.addr, &crate::write::Request::Txn(c)).await,
@@ -1588,8 +1609,12 @@ pub async fn commit_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio:
 
 async fn write_changes(lake: &Lake, seq: &crate::log::Sequencer, c: Commit) -> Result<Value> {
     let mut pending = vec![];
-    for (name, new, old) in &c.tables {
-        let (new, old) = (unipc(new)?, unipc(old)?);
+    for (i, (name, new, old)) in c.tables.iter().enumerate() {
+        // (a commit from this node's own transaction carries its rows; one sent over HTTP carries them as IPC)
+        let (new, old) = match c.rows.get(i) {
+            Some((n, o)) => (n.clone(), o.clone()),
+            None => (unipc(new)?, unipc(old)?),
+        };
         let stored: TableMeta = lake.cat.get(&table_key(name)).await?.with_context(|| format!("no table {name} (dropped while the transaction ran)"))?;
         let meta = stored.logical();
         let append = meta.key.is_empty();
