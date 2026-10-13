@@ -11715,6 +11715,26 @@ def sqla():
         and asked[3][2] == asked[5][2] == [{"data_type": "Int32"}] and [list(r.values()) for r in asked[4][2]] == port_typ == [["integer"]] \
         and asked[6][:2] == (400, "22023")
     node.kill()
+
+    # A user granted one table, and another's column, sees those in Postgres's catalog and nothing else, over the
+    # port and over ?catalog=postgres alike (invariant 382: pg_class named every table to anyone signed in).
+    import base64
+    admin = "harness-admin-token-1"
+    lake2 = new_lake()
+    node = Node(lake2, port, pg=f"127.0.0.1:{pg}", env={"PONDRA_ADMIN_TOKEN": admin}).start()
+    for s in ["CREATE TABLE seen (a INT)", "CREATE TABLE part (a INT, b INT)", "CREATE TABLE hidden (c INT)",
+              "CREATE USER u1 PASSWORD 'u1-password'", "GRANT SELECT ON seen TO u1", "GRANT SELECT (a) ON part TO u1"]:
+        call(port, "POST", "/sql", s.encode(), timeout=60, headers={"Authorization": f"Bearer {admin}"})
+    rel = "SELECT relname FROM pg_class WHERE relkind = 'r' AND relnamespace = 'public'::regnamespace ORDER BY relname"
+    col = "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position"
+    basic = {"Authorization": "Basic " + base64.b64encode(b"u1:u1-password").decode()}
+    over_http = [[list(r.values()) for r in call(port, "POST", "/sql?catalog=postgres", s.encode(), timeout=60, headers=basic)] for s in (rel, col)]
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=u1 password=u1-password dbname=lake", autocommit=True) as c:
+        over_port = [[list(r) for r in c.execute(s).fetchall()] for s in (rel, col)]
+    info["granted_catalog"] = {"http": over_http, "port": over_port}
+    checks["a user granted one table and one column of another sees only those in pg_class and information_schema, over the port and ?catalog=postgres"] = \
+        over_http == over_port == [[["part"], ["seen"]], [["part", "a"], ["seen", "a"]]]
+    node.kill()
     ok = all(checks.values())
     print(json.dumps({"sqla": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:

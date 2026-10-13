@@ -418,6 +418,19 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         let comments = cols.iter().filter_map(|(c, ..)| Some((c.clone(), notes.get(&format!("column/{name}/{c}"))?.clone()))).collect();
         rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(crate::measures::written(&v.sql).into_owned()), identity: Default::default(), constraints: v.facts.clone(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
     }
+    // A user granted some tables sees those, and of one granted by columns those columns, as at every other
+    // listing (`ddl::listed`, invariant 382). Postgres's pg_class names every table; Pondra names none its
+    // reader may not read, so a BI tool's table list is the user's.
+    if let Some(a) = crate::auth::limited() {
+        rels.retain_mut(|r| match a.columns("select", &crate::ddl::join(&r.schema, &r.name)) {
+            None => false,
+            Some(None) => true,
+            Some(Some(these)) => {
+                r.columns.retain(|(c, ..)| these.contains(c));
+                true
+            }
+        });
+    }
     // The session's own temporary tables and views, in its temporary schema (as Postgres has them).
     let (temp_tables, temp_views) = crate::temp::listed();
     for (name, cols) in temp_tables {
