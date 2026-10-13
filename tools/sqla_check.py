@@ -647,18 +647,18 @@ def with_blocks(url):
     """`with connect() as con` commits and closes (rolls back after an error), as psycopg's does; `with
     con.cursor()` closes the cursor; `execute` gives the cursor back."""
     with dbapi.connect(url) as con, con.cursor() as cur:
-        cur.execute(f"DELETE FROM {DBAPI_TABLE} WHERE id IN (60, 61)")
-        cur.execute(f"INSERT INTO {DBAPI_TABLE} (id, v) VALUES ($1, $2)", (60, "kept"))
+        cur.execute(f"DELETE FROM {DBAPI_TABLE} WHERE id IN (70, 71)")
+        cur.execute(f"INSERT INTO {DBAPI_TABLE} (id, v) VALUES ($1, $2)", (70, "kept"))
     try:
         with dbapi.connect(url) as con2:
-            con2.cursor().execute(f"INSERT INTO {DBAPI_TABLE} (id, v) VALUES ($1, $2)", (61, "undone"))
+            con2.cursor().execute(f"INSERT INTO {DBAPI_TABLE} (id, v) VALUES ($1, $2)", (71, "undone"))
             raise KeyError("an error inside the block")
     except KeyError:
         pass
     closed = (con._open, con2._open, cur._open)
     with dbapi.connect(url) as con3:
-        got = con3.cursor().execute(f"SELECT id, v FROM {DBAPI_TABLE} WHERE id IN (60, 61) ORDER BY id").fetchall()
-    return got == [(60, "kept")] and closed == (False, False, False), f"rows {got}, (connection, connection, cursor) open {closed}"
+        got = con3.cursor().execute(f"SELECT id, v FROM {DBAPI_TABLE} WHERE id IN (70, 71) ORDER BY id").fetchall()
+    return got == [(70, "kept")] and closed == (False, False, False), f"rows {got}, (connection, connection, cursor) open {closed}"
 
 
 def numpy_params(url):

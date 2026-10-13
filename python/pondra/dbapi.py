@@ -486,5 +486,8 @@ def connect(target=None, token=None, **options):
     a bucket's URL, a node's `http://` or `https://` URL (with `token=`, or `user=` and `password=`), or
     none for a lake in this process's memory. `options` are `pondra.connect`'s."""
     # A DB-API user gets no printed notices: a procedure's notices come back on the cursor's side, not on stdout.
-    options.setdefault("echo", False)
-    return Connection(_connect(target, token, **options))
+    # (Set on the client, not passed: for a lake in this process `options` are the node's settings.)
+    echo = options.pop("echo", False)
+    client = _connect(target, token, **options)
+    client.echo = echo
+    return Connection(client)
