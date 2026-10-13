@@ -320,6 +320,17 @@ class Connection:
         self._open = False
         self._client.close()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, *_):
+        """As psycopg's: the transaction committed (rolled back after an error), then the connection closed."""
+        try:
+            if kind is None:
+                self.commit()
+        finally:
+            self.close()
+
     def _alive(self):
         if not self._open:
             raise InterfaceError("connection is closed")
@@ -362,8 +373,10 @@ class Cursor:
         self._open = True
 
     def execute(self, sql, params=None):
+        """Run one statement; the cursor itself comes back, so `cur.execute(…).fetchall()` reads its rows."""
         self._alive()
         self._take(self.connection._execute(sql, _values(params)))
+        return self
 
     def executemany(self, sql, seq):
         """A single `INSERT … VALUES (…)` with parameters goes as one statement carrying every row, so it is
@@ -408,6 +421,12 @@ class Cursor:
 
     def __iter__(self):
         return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
     def __next__(self):
         row = self.fetchone()

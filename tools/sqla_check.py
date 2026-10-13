@@ -643,6 +643,24 @@ def positional_params(url):
     return got == [(2, 1)], f"SELECT $2 AS b, $1 AS a with (1, 2): {got}"
 
 
+def with_blocks(url):
+    """`with connect() as con` commits and closes (rolls back after an error), as psycopg's does; `with
+    con.cursor()` closes the cursor; `execute` gives the cursor back."""
+    with dbapi.connect(url) as con, con.cursor() as cur:
+        cur.execute(f"DELETE FROM {DBAPI_TABLE} WHERE id IN (60, 61)")
+        cur.execute(f"INSERT INTO {DBAPI_TABLE} (id, v) VALUES ($1, $2)", (60, "kept"))
+    try:
+        with dbapi.connect(url) as con2:
+            con2.cursor().execute(f"INSERT INTO {DBAPI_TABLE} (id, v) VALUES ($1, $2)", (61, "undone"))
+            raise KeyError("an error inside the block")
+    except KeyError:
+        pass
+    closed = (con._open, con2._open, cur._open)
+    with dbapi.connect(url) as con3:
+        got = con3.cursor().execute(f"SELECT id, v FROM {DBAPI_TABLE} WHERE id IN (60, 61) ORDER BY id").fetchall()
+    return got == [(60, "kept")] and closed == (False, False, False), f"rows {got}, (connection, connection, cursor) open {closed}"
+
+
 def numpy_params(url):
     con = dbapi.connect(url)
     con.autocommit = True
@@ -730,6 +748,7 @@ DBAPI_CHECKS = [
     ("dbapi.close_rolls_back", close_rolls_back),
     ("dbapi.description_and_rowcount", description_rowcount),
     ("dbapi.fetch_apis", fetch_apis),
+    ("dbapi.with_blocks_commit_or_roll_back", with_blocks),
     ("dbapi.errors_by_sqlstate_live", live_errors),
     ("dbapi.failed_statement_aborts_until_rollback", aborted_until_rollback),
     ("dbapi.errors_by_sqlstate_class", lambda _url: sqlstate_classes()),
