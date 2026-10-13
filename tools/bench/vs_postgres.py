@@ -100,6 +100,7 @@ for n, q in Q.items():
     with psycopg.connect(PG, autocommit=True) as c:
         pg_s = best(lambda: c.execute(q).fetchall())
     with psycopg.connect(PD, autocommit=True) as c:
+        c.execute("SET datafusion.execution.batch_size = 8192")  # (DataFusion's own; a session with a setting has its answers worked out each time, never remembered: Postgres keeps none either)
         pd_s = best(lambda: c.execute(q).fetchall())
     out[f"TPC-H {n.upper()} on SF1 lineitem, best of 3 (s)"] = {"Postgres": pg_s, "Pondra": pd_s}
 node.terminate(); node.wait()
