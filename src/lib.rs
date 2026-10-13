@@ -95,6 +95,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod pg_text;
 #[cfg(feature = "server")] mod pg_types;
 #[cfg(feature = "server")] mod pg_values;
+#[cfg(feature = "server")] mod literals;
 #[cfg(feature = "server")] mod ci;
 #[cfg(feature = "server")] mod project;
 #[cfg(feature = "server")] mod protect;

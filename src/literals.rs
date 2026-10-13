@@ -1,0 +1,363 @@
+//! An INSERT's `VALUES` of literals, as rows, with no session and no plan.
+//!
+//! An INSERT's rows are a `VALUES` (`write::rows_sql`). Planned in a session they cost a session (which
+//! scans every table's catalog entry), a plan and a run through DataFusion's optimizer, for what are
+//! constants. So this module reads each value the way DataFusion's planner reads it (`sql_to_expr`,
+//! knowing no table, function or variable), folds it to the constant it is, and builds the columns the
+//! way DataFusion's `VALUES` does: a column's type is the one type its values share, and a value for a
+//! DOUBLE, REAL or DECIMAL column is cast to that column's type first, as `write::values_typed` casts it.
+//! The values and types are DataFusion's own, so the rows are the ones the planned path writes (the
+//! unit tests at the end compare the two, case by case).
+//!
+//! What is not a literal (a function, arithmetic, a column, a placeholder, a cast that fails, two types
+//! in one column, a session with DataFusion settings of its own, a query that is more than a `VALUES`)
+//! is planned as before: `literal_rows` says None.
+
+use datafusion::arrow::array::{ArrayRef, RecordBatch};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::common::config::{ConfigOptions, Dialect};
+use datafusion::common::{plan_err, DFSchema, ScalarValue, TableReference};
+use datafusion::logical_expr::planner::ContextProvider;
+use datafusion::logical_expr::{AggregateUDF, Expr, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF};
+use datafusion::prelude::SessionConfig;
+use datafusion::sql::planner::{ParserOptions, PlannerContext, SqlToRel};
+use datafusion::sql::sqlparser::ast::{self, Statement};
+use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+use std::sync::Arc;
+
+/// The rows of an INSERT's query, when it is a `VALUES` of literals only, as DataFusion would plan them
+/// into `target`'s columns (`write::fit` fits them to the table). None: not that, so the query is planned.
+pub fn literal_rows(sql: &str, target: &Schema) -> Option<RecordBatch> {
+    let rows = value_rows(sql)?;
+    // (a session's own DataFusion settings may read the literals differently: it plans them)
+    if crate::settings::any() {
+        return None;
+    }
+    let config = crate::optimize::config(SessionConfig::new());
+    let options = config.options();
+    if options.sql_parser.dialect != Dialect::Generic {
+        return None;
+    }
+    let provider = Literals { options };
+    let planner = SqlToRel::new_with_options(&provider, ParserOptions::from(&options.sql_parser));
+    let values = rows.into_iter().map(|row| row.into_iter().map(|v| plan(&planner, v)).collect::<Option<Vec<_>>>()).collect::<Option<Vec<_>>>()?;
+    columns(typed(values, target)?)
+}
+
+/// The expressions of a query that is only `VALUES`: no WITH, ORDER BY, LIMIT, FETCH or the like, one
+/// statement, the same number of values in every row. None for anything else.
+fn value_rows(sql: &str) -> Option<Vec<Vec<ast::Expr>>> {
+    let mut parsed = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    if parsed.len() != 1 {
+        return None;
+    }
+    let Statement::Query(q) = parsed.remove(0) else { return None };
+    let plain = q.with.is_none()
+        && q.order_by.is_none()
+        && q.limit_clause.is_none()
+        && q.fetch.is_none()
+        && q.locks.is_empty()
+        && q.for_clause.is_none()
+        && q.settings.is_none()
+        && q.format_clause.is_none()
+        && q.pipe_operators.is_empty();
+    let ast::SetExpr::Values(values) = *q.body else { return None };
+    if !plain || values.value_keyword {
+        return None; // (`VALUE` is DataFusion's error to give, planned)
+    }
+    let rows: Vec<Vec<ast::Expr>> = values.rows.into_iter().map(|r| r.content).collect();
+    let width = rows.first()?.len();
+    (width > 0 && rows.iter().all(|r| r.len() == width)).then_some(rows)
+}
+
+/// One value as DataFusion's planner reads it, folded to a constant. None: not a constant (or it fails to plan).
+fn plan(planner: &SqlToRel<'_, Literals<'_>>, value: ast::Expr) -> Option<ScalarValue> {
+    let expr = planner.sql_to_expr(value, &DFSchema::empty(), &mut PlannerContext::new()).ok()?;
+    fold(&expr)
+}
+
+/// A planned value as the constant it is: a literal, or a cast of one, cast as DataFusion casts constants.
+/// Anything else (a function, a column, a CASE, TRY_CAST, arithmetic) is None.
+fn fold(e: &Expr) -> Option<ScalarValue> {
+    match e {
+        Expr::Literal(v, _) => Some(v.clone()),
+        Expr::Cast(c) => {
+            let v = fold(&c.expr)?;
+            // (what the optimizer's `Seconds` rule does before a text is cast to a time: `'… 10:30'` has seconds first)
+            let v = match (c.field.data_type(), text(&v).and_then(crate::query::seconds)) {
+                (DataType::Timestamp(..), Some(s)) => ScalarValue::Utf8(Some(s)),
+                _ => v,
+            };
+            v.cast_to(c.field.data_type()).ok() // (a cast that fails is the planned path's error to report)
+        }
+        _ => None,
+    }
+}
+
+/// The text of a string constant, of any of DataFusion's string types.
+fn text(v: &ScalarValue) -> Option<&str> {
+    match v {
+        ScalarValue::Utf8(s) | ScalarValue::Utf8View(s) | ScalarValue::LargeUtf8(s) => s.as_deref(),
+        _ => None,
+    }
+}
+
+/// Each value cast to its column's type where the column is a DOUBLE, REAL or DECIMAL: DataFusion would
+/// otherwise give one column's values the one type it finds for them all, and `1e20` with `1e-20` made a
+/// DECIMAL(38, 20) that couldn't hold the first (`write::values_typed`). A row shorter than the table
+/// skips `_deleted`, as `write::fit` skips it.
+fn typed(mut rows: Vec<Vec<ScalarValue>>, target: &Schema) -> Option<Vec<Vec<ScalarValue>>> {
+    for row in &mut rows {
+        let skip_deleted = row.len() < target.fields().len();
+        let fields = target.fields().iter().filter(|f| !(skip_deleted && f.name() == "_deleted"));
+        for (v, f) in row.iter_mut().zip(fields) {
+            let t = f.data_type();
+            if t.is_floating() || t.is_decimal() {
+                *v = v.cast_to(t).ok()?;
+            }
+        }
+    }
+    Some(rows)
+}
+
+/// The rows as columns named `column1`, `column2`, … (as DataFusion names a `VALUES`' columns). A column's
+/// type is the one type its values share, and a NULL is that type's NULL; a column of NULLs alone is NULL-typed.
+/// Two types in one column: None, since DataFusion finds the type they widen to.
+fn columns(rows: Vec<Vec<ScalarValue>>) -> Option<RecordBatch> {
+    let width = rows.first()?.len();
+    let mut fields = vec![];
+    let mut arrays: Vec<ArrayRef> = vec![];
+    for j in 0..width {
+        let mut types = rows.iter().map(|r| r[j].data_type()).filter(|t| *t != DataType::Null);
+        let t = types.next().unwrap_or(DataType::Null);
+        if types.any(|u| u != t) {
+            return None;
+        }
+        let values = rows.iter().map(|r| match &r[j] {
+            ScalarValue::Null => ScalarValue::try_from(&t),
+            v => Ok(v.clone()),
+        }).collect::<datafusion::common::Result<Vec<_>>>().ok()?;
+        fields.push(Field::new(format!("column{}", j + 1), t, true));
+        arrays.push(ScalarValue::iter_to_array(values).ok()?);
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).ok()
+}
+
+/// What the planner may ask of the session: nothing. A literal names no table, function, aggregate,
+/// window, variable or type, so each lookup misses, and a value that needs one fails to plan (None).
+struct Literals<'a> {
+    options: &'a ConfigOptions,
+}
+
+impl ContextProvider for Literals<'_> {
+    fn get_table_source(&self, _: TableReference) -> datafusion::common::Result<Arc<dyn TableSource>> {
+        plan_err!("a literal names no table")
+    }
+    fn get_function_meta(&self, _: &str) -> Option<Arc<ScalarUDF>> { None }
+    fn get_higher_order_meta(&self, _: &str) -> Option<Arc<HigherOrderUDF>> { None }
+    fn get_aggregate_meta(&self, _: &str) -> Option<Arc<AggregateUDF>> { None }
+    fn get_window_meta(&self, _: &str) -> Option<Arc<WindowUDF>> { None }
+    fn get_variable_type(&self, _: &[String]) -> Option<DataType> { None }
+    fn options(&self) -> &ConfigOptions { self.options }
+    fn udf_names(&self) -> Vec<String> { vec![] }
+    fn higher_order_function_names(&self) -> Vec<String> { vec![] }
+    fn udaf_names(&self) -> Vec<String> { vec![] }
+    fn udwf_names(&self) -> Vec<String> { vec![] }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::TableMeta;
+    use crate::write::{fit, rows};
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::prelude::SessionContext;
+
+    /// A session the way Pondra makes one for a query (`Lake::made`), without the lake's own tables and functions.
+    fn session() -> SessionContext {
+        let state = SessionStateBuilder::new()
+            .with_config(crate::optimize::config(SessionConfig::new()))
+            .with_default_features()
+            .with_analyzer_rules(crate::optimize::analyzer_rules())
+            .with_optimizer_rules(crate::optimize::rules())
+            .build();
+        SessionContext::new_with_state(state)
+    }
+
+    fn meta(columns: &[(&str, &str)]) -> TableMeta {
+        TableMeta { columns: columns.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect(), ..Default::default() }
+    }
+
+    /// The INSERT's rows both ways, for a table of `columns`: planned, and literal (`literal_rows`, then `fit`).
+    /// None when the literal path is not taken.
+    async fn both(columns: &[(&str, &str)], sql: &str) -> Option<(anyhow::Result<RecordBatch>, anyhow::Result<RecordBatch>)> {
+        let meta = meta(columns);
+        let target = crate::query::schema(&meta.columns).unwrap();
+        let literal = literal_rows(sql, &target)?;
+        Some((rows(&session(), &meta, sql).await, fit(&target, &literal)))
+    }
+
+    /// A literal case: the literal path takes it, and it gives what the planned path gives (both fail, or
+    /// both give the same rows).
+    async fn agree(columns: &[(&str, &str)], sql: &str) {
+        let (planned, literal) = both(columns, sql).await.unwrap_or_else(|| panic!("not taken as a literal: {sql}"));
+        match (planned, literal) {
+            (Ok(p), Ok(l)) => same(&p, &l, sql),
+            (Err(_), Err(_)) => {}
+            (p, l) => panic!("{sql}: planned {:?}, literal {:?}", p.err(), l.err()),
+        }
+    }
+
+    /// The same rows, column by column and value by value. Floats compare by their bits (NaN is NaN, -0.0 is
+    /// -0.0), which an array's own `==` would not.
+    fn same(a: &RecordBatch, b: &RecordBatch, sql: &str) {
+        assert_eq!(a.schema().fields(), b.schema().fields(), "{sql}");
+        assert_eq!(a.num_rows(), b.num_rows(), "{sql}");
+        for (x, y) in a.columns().iter().zip(b.columns()) {
+            assert_eq!(x.data_type(), y.data_type(), "{sql}");
+            for i in 0..x.len() {
+                let (p, l) = (ScalarValue::try_from_array(x.as_ref(), i).unwrap(), ScalarValue::try_from_array(y.as_ref(), i).unwrap());
+                assert_eq!(p, l, "{sql}, row {i}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn integers_are_as_planned() {
+        let int = [("v", "Int64")];
+        for sql in ["VALUES (1)", "VALUES (-1)", "VALUES ((-5))", "VALUES (9223372036854775807)", "VALUES (1.5)", "VALUES ('12')", "VALUES ('x')"] {
+            agree(&int, sql).await;
+        }
+        agree(&[("v", "Int16")], "VALUES (70000)").await;
+    }
+
+    #[tokio::test]
+    async fn floats_are_as_planned() {
+        let float = [("v", "Float64")];
+        for sql in ["VALUES (1.5)", "VALUES (1e20)", "VALUES (1e-20)", "VALUES (-0.0)", "VALUES ('NaN')", "VALUES (CAST('1.5' AS DOUBLE))", "VALUES (1e20), (1e-20)"] {
+            agree(&float, sql).await;
+        }
+        agree(&[("v", "Float32")], "VALUES (3.4e39)").await;
+    }
+
+    #[tokio::test]
+    async fn decimals_are_as_planned() {
+        let decimal = [("v", "Decimal128(10, 2)")];
+        for sql in ["VALUES (1.5)", "VALUES (123.456)", "VALUES (1)", "VALUES ('1.25')", "VALUES (-1.25)", "VALUES (NULL), (2.5)"] {
+            agree(&decimal, sql).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bytes_and_escapes_are_as_planned() {
+        agree(&[("v", "Binary")], "VALUES (X'00ff')").await;
+        agree(&[("v", "Utf8")], "VALUES (E'a\\nb')").await;
+    }
+
+    #[tokio::test]
+    async fn strings_are_as_planned() {
+        let text = [("v", "Utf8")];
+        for sql in ["VALUES ('a')", "VALUES ('it''s')", "VALUES ('')", "VALUES ('é ü 日本')", "VALUES (NULL)", "VALUES ($$x$$)"] {
+            agree(&text, sql).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn booleans_are_as_planned() {
+        let boolean = [("v", "Boolean")];
+        for sql in ["VALUES (true)", "VALUES (false)", "VALUES ('t')", "VALUES (1)"] {
+            agree(&boolean, sql).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dates_are_as_planned() {
+        let date = [("v", "Date32")];
+        for sql in ["VALUES ('2026-10-13')", "VALUES (DATE '2026-10-13')", "VALUES ('2026-02-30')"] {
+            agree(&date, sql).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn timestamps_are_as_planned() {
+        let zoned = "Timestamp(Microsecond, Some(\"+00:00\"))";
+        for column in ["Timestamp(Microsecond, None)", zoned] {
+            let ts = [("v", column)];
+            for sql in [
+                "VALUES ('2026-10-13 10:30')",
+                "VALUES ('2026-10-13 10:30:15.123456')",
+                "VALUES ('2026-10-13T10:30:00Z')",
+                "VALUES (TIMESTAMP '2026-10-13 10:30')",
+                "VALUES (TIMESTAMPTZ '2026-10-13 10:30:00Z')",
+            ] {
+                agree(&ts, sql).await;
+            }
+        }
+        agree(&[("v", zoned)], "VALUES ('2026-10-13 10:30:00+02')").await;
+    }
+
+    #[tokio::test]
+    async fn intervals_are_as_planned() {
+        // (DataFusion plans an interval text as a literal of its own: `INTERVAL '1 day'` is one value)
+        agree(&[("v", "Interval(MonthDayNano)")], "VALUES (INTERVAL '1 day')").await;
+        agree(&[("v", "Utf8")], "VALUES (INTERVAL '1 day')").await;
+    }
+
+    #[tokio::test]
+    async fn times_are_as_planned() {
+        let time = [("v", "Time64(Microsecond)")];
+        for sql in ["VALUES ('10:30')", "VALUES ('10:30:15.123456')"] {
+            agree(&time, sql).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn several_columns_and_rows_are_as_planned() {
+        let table = [("n", "Int64"), ("s", "Utf8"), ("x", "Float64"), ("ts", "Timestamp(Microsecond, None)")];
+        agree(&table, "VALUES (1, 'x', 1.5, '2026-10-13 10:00:00'), (2, NULL, NULL, NULL), (NULL, 'z', -2.5e3, '2026-10-13 10:00')").await;
+        agree(&[("v", "Int64")], "VALUES (CAST(NULL AS BIGINT)), (7)").await;
+    }
+
+    #[tokio::test]
+    async fn fewer_or_more_values_than_columns_are_as_planned() {
+        agree(&[("a", "Int64"), ("b", "Utf8"), ("c", "Float64")], "VALUES (1)").await;
+        agree(&[("a", "Int64")], "VALUES (1, 2)").await; // (too many: an error both ways)
+    }
+
+    #[tokio::test]
+    async fn deleted_is_skipped_for_a_shorter_row_as_planned() {
+        let table = [("k", "Int64"), ("v", "Utf8"), ("_deleted", "Boolean")];
+        agree(&table, "VALUES (1, 'x')").await;
+        agree(&table, "VALUES (1, 'x', true)").await;
+    }
+
+    #[tokio::test]
+    async fn what_is_not_a_literal_is_planned() {
+        let int = [("v", "Int64")];
+        let not_literal = [
+            "VALUES (now())",
+            "VALUES (1 + 1)",
+            "VALUES (nextval('s'))",
+            "SELECT 1",
+            "VALUES (1) ORDER BY 1",
+            "VALUES ([1, 2])",
+            "VALUES (TRY_CAST('x' AS INT))",
+            "VALUES ($1)",
+            "VALUES (1), (2.5)",
+            "VALUES (TIMESTAMP '2026-10-13 10:30'), ('2026-10-13 10:30')",
+            "VALUES (1); VALUES (2)",
+            "VALUES (INTERVAL '1 day' + INTERVAL '1 hour')",
+        ];
+        for sql in not_literal {
+            assert!(literal_rows(sql, &crate::query::schema(&meta(&int).columns).unwrap()).is_none(), "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cast_that_fails_is_planned_and_fails_there() {
+        // (99,999,999,999 has more digits than DECIMAL(10, 2) holds: the planned path reports it)
+        let decimal = [("v", "Decimal128(10, 2)")];
+        assert!(literal_rows("VALUES (99999999999)", &crate::query::schema(&meta(&decimal).columns).unwrap()).is_none());
+        assert!(rows(&session(), &meta(&decimal), "VALUES (99999999999)").await.is_err());
+    }
+}
