@@ -23,6 +23,7 @@ use datafusion::parquet::file::metadata::ParquetMetaData;
 use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, DFSchema, ScalarValue};
+use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion::logical_expr::{Accumulator, Expr};
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use serde::{Deserialize, Serialize};
@@ -60,32 +61,64 @@ pub struct Sealed {
 
 // ---------------------------------------------------------------- statistics
 
-/// The min and max of each of the first 32 columns that has an order (as Delta does, so a wide
-/// table's entries stay small; strings only up to 64 characters, where a cut-off value would no
-/// longer bound them), and of the system columns (`sys.rs`: a purge finds changed rows by them).
-/// `written`: the file's footer, whose statistics the writer kept as it went — read from there,
-/// they cost no second pass over the rows (floats aside: Parquet leaves NaN out of them).
-pub fn stats(batches: &[RecordBatch], written: Option<&ParquetMetaData>) -> Stats {
-    let Some(first) = batches.first() else { return Stats::new() };
-    let mut out = Stats::new();
-    for (i, f) in first.schema().fields().iter().enumerate() {
-        if (i >= 32 && !crate::sys::NAMES.contains(&f.name().as_str())) || !orderable(f.data_type()) {
-            continue;
+/// What a file's rows show as they are written, a batch at a time (`tier::Encoding`): which of its
+/// first 32 columns hold a NULL, and its floats' ranges. Every other column's range is read from the
+/// file's footer (`stats`), whose statistics the writer kept as it went: no second pass over the rows.
+pub struct Seen {
+    schema: SchemaRef,
+    nulls: Vec<bool>,
+    floats: Vec<(usize, MinAccumulator, MaxAccumulator)>,
+}
+
+impl Seen {
+    pub fn new(schema: SchemaRef) -> Self {
+        let floats = schema.fields().iter().enumerate().filter(|(i, f)| ranged(*i, f) && f.data_type().is_floating())
+            .filter_map(|(i, f)| Some((i, MinAccumulator::try_new(f.data_type()).ok()?, MaxAccumulator::try_new(f.data_type()).ok()?))).collect();
+        Seen { nulls: vec![false; schema.fields().len().min(32)], floats, schema }
+    }
+
+    pub fn add(&mut self, b: &RecordBatch) -> Result<()> {
+        for (i, held) in self.nulls.iter_mut().enumerate() {
+            *held |= b.column(i).null_count() > 0;
         }
-        let footer = written.filter(|_| !f.data_type().is_floating()).and_then(|md| from_footer(md, &first.schema(), f.name()));
-        let cols: Vec<ArrayRef> = batches.iter().map(|b| b.column(i).clone()).collect();
-        if let Some((lo, hi)) = footer.or_else(|| min_max(&cols)) {
-            if let (Some(lo), Some(hi)) = (text(&lo), text(&hi)) {
+        for (i, lo, hi) in &mut self.floats {
+            lo.update_batch(&[b.column(*i).clone()])?;
+            hi.update_batch(&[b.column(*i).clone()])?;
+        }
+        Ok(())
+    }
+
+    /// The columns (of the first 32, as `stats`) that hold a NULL.
+    pub fn nulls(&self) -> Vec<String> { self.nulls.iter().enumerate().filter(|(_, held)| **held).map(|(i, _)| self.schema.field(i).name().clone()).collect() }
+
+    /// The min and max of each of the first 32 columns that has an order (as Delta does, so a wide
+    /// table's entries stay small; strings only up to 64 characters, where a cut-off value would no
+    /// longer bound them), and of the system columns (`sys.rs`: a purge finds changed rows by them).
+    /// Floats' come from their rows (Parquet leaves NaN out of its own, and a NaN must not be pruned
+    /// away), the rest from the footer, when exact: Parquet cuts a value at 64 bytes, which `text`
+    /// would leave out anyway.
+    pub fn stats(&mut self, written: &ParquetMetaData) -> Stats {
+        let mut out = Stats::new();
+        let floats: BTreeMap<usize, (ScalarValue, ScalarValue)> = self.floats.iter_mut().filter_map(|(i, lo, hi)| Some((*i, (lo.evaluate().ok()?, hi.evaluate().ok()?)))).collect();
+        for (i, f) in self.schema.fields().iter().enumerate().filter(|(i, f)| ranged(*i, f)) {
+            let range = match f.data_type().is_floating() {
+                true => floats.get(&i).cloned(),
+                false => from_footer(written, &self.schema, f.name()),
+            };
+            if let Some((Some(lo), Some(hi))) = range.map(|(lo, hi)| (text(&lo), text(&hi))) {
                 out.insert(f.name().clone(), (lo, hi));
             }
         }
+        out
     }
-    out
 }
+
+/// Whether a file keeps column `i`'s range: the first 32 columns that have an order, and the
+/// system columns.
+fn ranged(i: usize, f: &datafusion::arrow::datatypes::Field) -> bool { (i < 32 || crate::sys::NAMES.contains(&f.name().as_str())) && orderable(f.data_type()) }
 
 /// The least and greatest value in `cols` (None if they can't be ordered).
 pub fn min_max(cols: &[ArrayRef]) -> Option<(ScalarValue, ScalarValue)> {
-    use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
     let (mut lo, mut hi) = (MinAccumulator::try_new(cols.first()?.data_type()).ok()?, MaxAccumulator::try_new(cols[0].data_type()).ok()?);
     cols.iter().try_for_each(|c| lo.update_batch(&[c.clone()]).and_then(|_| hi.update_batch(&[c.clone()]))).ok()?;
     Some((lo.evaluate().ok()?, hi.evaluate().ok()?))
@@ -103,13 +136,6 @@ pub fn from_footer(md: &ParquetMetaData, schema: &datafusion::arrow::datatypes::
         nulls.value(j) as i64 == g.num_rows() || (lo.is_valid(j) && hi.is_valid(j) && lo_exact.value(j) && hi_exact.value(j))
     });
     complete.then(|| min_max(&[lo]).zip(min_max(&[hi]))).flatten().map(|((lo, _), (_, hi))| (lo, hi))
-}
-
-/// The columns (of the first 32, as `stats`) that hold a NULL.
-pub fn nulls(batches: &[RecordBatch]) -> Vec<String> {
-    let Some(first) = batches.first() else { return vec![] };
-    let schema = first.schema();
-    (0..schema.fields().len().min(32)).filter(|&i| batches.iter().any(|b| b.column(i).null_count() > 0)).map(|i| schema.field(i).name().clone()).collect()
 }
 
 /// A value as text that casts back to it exactly (timestamps as ISO 8601), or None for a null

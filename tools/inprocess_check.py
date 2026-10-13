@@ -31,6 +31,7 @@ l. "a Node process that calls process.exit() without close() closes its node: it
 m. "a Node program that ends without close() closes its node (the cleanup hook): its lake's term given back" (Node)
 n. "Bun: connect() answers SQL" (Bun, when it is installed)
 o. "the library defines its ABI, and needs only glibc and libgcc by version: nothing of a host binds to it" (Linux, nm)
+p. "a node in a library prints nothing while all goes well, every statement slow (slow_ms=1)" (Linux and macOS)
 
 --bench also prints, not asserted: the time to the first answer and the idle memory, against
 a node beside the process (what pondra.local() was) and DuckDB, and 10 M rows into pandas. Only the standard library is needed; the checks
@@ -299,6 +300,26 @@ def child_cycles():
     return {"threads": [first[0], last[0]], "files": [first[1], last[1]], "wakeups": [first[2], last[2]], "rows": rows}
 
 
+def child_quiet():
+    """What the node prints while all goes well, read from this process's standard error: every statement slow."""
+    import pondra
+    with tempfile.TemporaryFile() as err:
+        sys.stderr.flush()
+        saved = os.dup(2)
+        os.dup2(err.fileno(), 2)  # (the node writes to the process's own, as eprintln! does)
+        try:
+            db = pondra.connect(slow_ms=1)
+            db.sql("CREATE TABLE q AS SELECT * FROM range(200000)")
+            n = db.sql("SELECT count(*) AS n FROM q").rows()[0]["n"]
+            db.close()
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
+        err.seek(0)
+        printed = err.read().decode(errors="replace")
+    return {"n": n, "printed": printed[-300:]}
+
+
 def child_fork():
     import pondra
     db = pondra.connect()
@@ -425,7 +446,7 @@ def child_bench_pandas_duckdb():
 CHILDREN = {
     "sql": child_sql, "reopen": child_reopen, "second": child_second, "misspelt": child_misspelt,
     "changed": child_changed, "cycles": child_cycles, "fork": child_fork, "calls": child_calls,
-    "tls": child_tls,
+    "tls": child_tls, "quiet": child_quiet,
     "bench_open": child_bench_open, "bench_local": child_bench_local, "bench_duckdb": child_bench_duckdb,
     "bench_pandas_open": child_bench_pandas_open, "bench_pandas_local": child_bench_pandas_local,
     "bench_pandas_duckdb": child_bench_pandas_duckdb,
@@ -455,6 +476,10 @@ def judge_sql(f):
 
 def judge_reopen(f):
     yield f["count"] == 4, f"written, closed, opened again: {f['count']} rows (4)"
+
+
+def judge_quiet(f):
+    yield f["n"] == 200000 and f["printed"] == "", f"a node in a library prints nothing when all goes well, its statements slow too: {f['printed']!r}"
 
 
 def judge_second(f):
@@ -496,7 +521,8 @@ def judge_tls(f):
         return
     yield not f["static_tls"], (f"its {f['tls_bytes']} bytes of thread-locals are given to each thread as it first uses them, "
                                 "never taken from the static TLS block" if not f["static_tls"] else
-                                f"it is marked STATIC_TLS ({f['tls_bytes']} bytes): build its mimalloc with local_dynamic_tls")
+                                f"it is marked STATIC_TLS ({f['tls_bytes']} bytes): build its allocator with dlopen's thread-locals "
+                                "(jemalloc's disable_initial_exec_tls, mimalloc's local_dynamic_tls)")
 
 
 def judge_calls(f):
@@ -608,6 +634,7 @@ CHECKS = [  # (child, label, judge)
     ("misspelt", "a misspelt setting is refused naming the nearest", judge_misspelt),
     ("changed", "a setting changed on a later open is refused naming it", judge_changed),
     ("cycles", "50 opens and closes leave no threads or open files", judge_cycles),
+    ("quiet", "a node in a library prints nothing while all goes well, every statement slow (slow_ms=1)", judge_quiet),
     ("fork", "a fork's child: its parent's connection refused by name, connect() there a node beside it; the parent still answers", judge_fork),
     ("tls", "the library asks for no static TLS, so any process loads it", judge_tls),
     ("js_sql", "connect() in JavaScript with no path, not awaited: SQL, a frame, writeTable, a file here, a live query; its lake in memory, nothing on disk", judge_js_sql),
@@ -620,7 +647,7 @@ CHECKS = [  # (child, label, judge)
     ("symbols", "the library defines its ABI, and needs only glibc and libgcc by version: nothing of a host binds to it", judge_symbols),
 ]
 NO_NODE, NO_BUN = RUNTIMES["node"] is None, RUNTIMES["bun"] is None
-SKIP_IF = {"cycles": (not LINUX, "needs Linux's /proc"), "fork": (not FORK, "needs fork (Linux or macOS)"), "tls": (not LINUX, "glibc's loader"),
+SKIP_IF = {"cycles": (not LINUX, "needs Linux's /proc"), "quiet": (os.name == "nt", "reads the process's standard error by its descriptor"), "fork": (not FORK, "needs fork (Linux or macOS)"), "tls": (not LINUX, "glibc's loader"),
            "js_sql": (NO_NODE, "needs node"), "js_calls": (NO_NODE, "needs node"), "js_reopen": (NO_NODE, "needs node"), "js_exit": (NO_NODE, "needs node"), "js_end": (NO_NODE, "needs node"),
            "js_cycles": (NO_NODE or not LINUX, "needs node and Linux's /proc"), "js_bun": (NO_BUN, "needs Bun (bun.sh, or ~/.bun/bin/bun)"),
            "symbols": (not LINUX or shutil.which("nm") is None, "needs Linux and nm")}

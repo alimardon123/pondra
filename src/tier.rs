@@ -913,7 +913,7 @@ impl Seen {
 /// table held hundreds of MB a partition (ClickBench's 105 columns on four cores: a top-10 of every
 /// column peaked at 1.9 GB, and a node in a 1.6 GB container was killed; 1.0 GB in groups of this
 /// size, and faster). A narrower table's million rows stay one group (TPC-H's lineitem: 34 MB).
-fn writer<'a>(buf: &'a mut Vec<u8>, batch: &RecordBatch, keys: &[String]) -> Result<ArrowWriter<&'a mut Vec<u8>>> {
+fn writer(schema: datafusion::arrow::datatypes::SchemaRef, keys: &[String]) -> Result<ArrowWriter<Vec<u8>>> {
     let mut props = WriterProperties::builder().set_compression(codec()).set_max_row_group_bytes(Some(ROW_GROUP_BYTES));
     if !keys.is_empty() {
         props = props.set_max_row_group_row_count(Some(256 << 10));
@@ -924,12 +924,12 @@ fn writer<'a>(buf: &'a mut Vec<u8>, batch: &RecordBatch, keys: &[String]) -> Res
     // System columns: row ids count up, deltas of a few bits each; versions and times repeat per
     // commit, and plain values the codec squeezes are what costs least to write (the files come
     // out the size they were without them).
-    for c in crate::sys::NAMES.iter().filter(|c| batch.schema().index_of(c).is_ok()) {
+    for c in crate::sys::NAMES.iter().filter(|c| schema.index_of(c).is_ok()) {
         let path: datafusion::parquet::schema::types::ColumnPath = (*c).into();
         let encoding = if *c == crate::sys::ROW_ID { datafusion::parquet::basic::Encoding::DELTA_BINARY_PACKED } else { datafusion::parquet::basic::Encoding::PLAIN };
         props = props.set_column_dictionary_enabled(path.clone(), false).set_column_encoding(path, encoding);
     }
-    Ok(ArrowWriter::try_new_with_options(buf, batch.schema(), plain(props.build()))?)
+    Ok(ArrowWriter::try_new_with_options(vec![], schema, plain(props.build()))?)
 }
 
 /// Writer options with the Parquet file's own types only: no Arrow schema in its footer, which would
@@ -980,29 +980,81 @@ pub fn storable(batch: &RecordBatch) -> Result<RecordBatch> {
 
 /// One Parquet file of these rows; with `stats`, it carries its columns' min/max (append tables).
 pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys: &[String], stats: bool) -> Result<Option<DataFile>> {
-    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    if rows == 0 {
-        return Ok(None);
-    }
+    let Some(first) = batches.iter().find(|b| b.num_rows() > 0) else { return Ok(None) };
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
-    let stored: Vec<RecordBatch> = batches.iter().map(storable).collect::<Result<_>>()?;
-    let ids = field_ids(meta.as_ref(), &stored[0].schema());
-    let folder = meta.as_ref().map_or(table, |m| m.folder(table));
-    let mut buf = vec![];
-    let mut w = writer(&mut buf, &stored[0].clone().with_schema(ids.clone())?, keys)?;
-    for b in &stored {
-        w.write(&b.clone().with_schema(ids.clone())?)?;
+    let mut file = Encoding::new(meta.as_ref(), first, keys, stats)?;
+    let batches = batches.to_vec();
+    let file = blocking(move || {
+        batches.iter().try_for_each(|b| file.write(b))?;
+        Ok(file)
+    }).await?;
+    Ok(Some(file.put(lake, table, meta.as_ref()).await?))
+}
+
+/// Run CPU work (encoding Parquet) on a blocking thread. A statement's partitions each write their
+/// own files, and polled in one task they took turns on one core to encode them: a bulk INSERT used
+/// 1.3 of 4 cores.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> { tokio::task::spawn_blocking(work).await? }
+
+/// What a file of a stream's rows is cut at, encoded, besides its rows: two row groups, well past
+/// the 64 MB `maintain` takes for a small file, so a bulk INSERT's files aren't merged again right
+/// after it (a load of TPC-H's lineitem was written twice, and the next statement's commit waited
+/// for the merge). The writer's count runs a little over what it writes: cut at 64 MB, files came
+/// out at 63.8, and were merged.
+const FILE_BYTES: usize = 128 << 20;
+
+/// A Parquet file being written a batch at a time (`write` on a blocking thread), with what its
+/// entry will say of it. It holds the file's encoded bytes, never its rows.
+struct Encoding {
+    w: ArrowWriter<Vec<u8>>,
+    ids: datafusion::arrow::datatypes::SchemaRef,
+    rows: usize,
+    sys: bool,
+    seen: Option<(crate::manifest::Seen, crate::sketch::Sketches)>, // (`stats`: append tables)
+}
+
+impl Encoding {
+    /// A file of rows like `first`'s (it isn't written yet).
+    fn new(meta: Option<&TableMeta>, first: &RecordBatch, keys: &[String], stats: bool) -> Result<Self> {
+        let ids = field_ids(meta, &storable(&first.slice(0, 0))?.schema());
+        let seen = stats.then(|| (crate::manifest::Seen::new(first.schema()), crate::sketch::Sketches::new(&first.schema())));
+        Ok(Encoding { w: writer(ids.clone(), keys)?, ids, rows: 0, sys: first.schema().index_of(crate::sys::ROW_ID).is_ok(), seen })
     }
-    let footer = w.close()?; // (its statistics: the file's min and max, without a second pass)
-    let (path, bytes) = (format!("data/{folder}/{}.parquet", uuid::Uuid::new_v4()), buf.len() as u64);
-    lake.put(&path, buf).await?;
-    maybe_crash("after_parquet_put");
-    let (stats, nulls, sketch) = match stats {
-        true => (crate::manifest::stats(batches, Some(&footer)), Some(crate::manifest::nulls(batches)), crate::sketch::of(batches)),
-        false => Default::default(),
-    };
-    let sys = batches[0].schema().index_of(crate::sys::ROW_ID).is_ok();
-    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new(), nulls, sketch, sys, ..Default::default() }))
+
+    fn write(&mut self, b: &RecordBatch) -> Result<()> {
+        if let Some((seen, sketches)) = &mut self.seen {
+            seen.add(b)?;
+            sketches.add(b);
+        }
+        self.w.write(&storable(b)?.with_schema(self.ids.clone())?)?;
+        self.rows += b.num_rows();
+        Ok(())
+    }
+
+    /// Its size so far, encoded.
+    fn bytes(&self) -> usize { self.w.bytes_written() + self.w.in_progress_size() }
+
+    /// The file's bytes, finished, and its entry but for where it goes.
+    fn finish(self) -> Result<(Vec<u8>, DataFile)> {
+        let Encoding { mut w, rows, sys, seen, .. } = self;
+        let footer = w.finish()?; // (its statistics: the file's min and max, without a second pass)
+        let buf = std::mem::take(w.inner_mut());
+        let (stats, nulls, sketch) = match seen {
+            Some((mut seen, sketches)) => (seen.stats(&footer), Some(seen.nulls()), sketches.done()),
+            None => Default::default(),
+        };
+        let bytes = buf.len() as u64;
+        Ok((buf, DataFile { rows: rows as u64, bytes, stats, nulls, sketch, sys, ..Default::default() }))
+    }
+
+    /// The file finished and put in the table's folder.
+    async fn put(self, lake: &Lake, table: &str, meta: Option<&TableMeta>) -> Result<DataFile> {
+        let (buf, file) = blocking(move || self.finish()).await?;
+        let path = format!("data/{}/{}.parquet", meta.map_or(table, |m| m.folder(table)), uuid::Uuid::new_v4());
+        lake.put(&path, buf).await?;
+        maybe_crash("after_parquet_put");
+        Ok(DataFile { path, ..file })
+    }
 }
 
 /// The columns as Iceberg knows them (`iceberg.rs`), each with its field id: a column's place
@@ -1030,8 +1082,38 @@ fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::Sc
     std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
-/// Stream a query result into Parquet files of up to `max_rows` each (bulk INSERT … SELECT).
+/// Stream a query result into Parquet files of up to `max_rows` or `FILE_BYTES` each (bulk INSERT …
+/// SELECT, a merge), a batch at a time as the rows come. A partitioned table's rows are split a
+/// million at a time instead (each part held whole until it is written), so each file holds one
+/// partition's (invariant 26).
 pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, max_rows: usize, keys: &[String], stats: bool, partition: Option<&str>) -> Result<Vec<DataFile>> {
+    if let Some(spec) = partition {
+        return write_parts_of(lake, table, stream, max_rows.min(1_000_000), keys, stats, spec).await;
+    }
+    let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
+    let (mut files, mut open) = (vec![], None::<Encoding>);
+    while let Some(b) = stream.next().await.transpose()? {
+        if b.num_rows() == 0 {
+            continue;
+        }
+        let mut file = match open.take() {
+            Some(file) => file,
+            None => Encoding::new(meta.as_ref(), &b, keys, stats)?,
+        };
+        let file = blocking(move || file.write(&b).map(|_| file)).await?;
+        match file.rows >= max_rows || file.bytes() >= FILE_BYTES {
+            true => files.push(file.put(lake, table, meta.as_ref()).await?),
+            false => open = Some(file),
+        }
+    }
+    if let Some(file) = open {
+        files.push(file.put(lake, table, meta.as_ref()).await?);
+    }
+    Ok(files)
+}
+
+/// `write_stream` for a partitioned table: `chunk` rows at a time, split by partition value.
+async fn write_parts_of(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, chunk: usize, keys: &[String], stats: bool, spec: &str) -> Result<Vec<DataFile>> {
     let (mut files, mut pending, mut n) = (vec![], vec![], 0);
     loop {
         let batch = stream.next().await.transpose()?;
@@ -1040,12 +1122,8 @@ pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBa
             n += b.num_rows();
             pending.push(b);
         }
-        if n >= max_rows || (end && n > 0) {
-            let groups = match partition {
-                Some(spec) => split(spec, std::mem::take(&mut pending)).await?,
-                None => vec![(String::new(), std::mem::take(&mut pending))],
-            };
-            for (part, batches) in groups {
+        if n >= chunk || (end && n > 0) {
+            for (part, batches) in split(spec, std::mem::take(&mut pending)).await? {
                 files.extend(write_file(lake, table, &batches, keys, stats).await?.map(|f| DataFile { part, ..f }));
             }
             n = 0;
@@ -1053,5 +1131,61 @@ pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBa
         if end {
             return Ok(files);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+    use std::sync::Arc;
+
+    /// A file's ranges and NULL columns, taken from its footer as it is written, are those worked out
+    /// from its rows (as files were described before): over three row groups, with a NULL, a NaN and a
+    /// string past 64 bytes (no range: Parquet cuts it, and `text` keeps none).
+    #[test]
+    fn ranges_from_the_footer_are_the_rows() {
+        let utc: Arc<str> = "UTC".into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, false),
+            Field::new("long", DataType::Utf8, false),
+            Field::new("f", DataType::Float64, false),
+            Field::new("d", DataType::Date32, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, Some(utc.clone())), false),
+            Field::new("dec", DataType::Decimal128(10, 2), false),
+            Field::new("b", DataType::Boolean, false),
+        ]));
+        let batch = |from: i64| {
+            let n: Vec<i64> = (from..from + 300_000).collect();
+            let last = from == 600_000;
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from_iter(n.iter().map(|&v| (v != 5).then_some(v)))),
+                Arc::new(StringArray::from_iter_values(n.iter().map(|v| format!("s{}", v % 977)))),
+                Arc::new(StringArray::from_iter_values(n.iter().map(|&v| if last && v == from + 299_999 { "z".repeat(70) } else { format!("a{v}") }))),
+                Arc::new(Float64Array::from_iter_values(n.iter().map(|&v| if last && v == from + 7 { f64::NAN } else { v as f64 * 0.5 }))),
+                Arc::new(Date32Array::from_iter_values(n.iter().map(|&v| (v % 20_000) as i32))),
+                Arc::new(TimestampMicrosecondArray::from_iter_values(n.iter().map(|&v| v * 1_000_000)).with_timezone(utc.clone())),
+                Arc::new(Decimal128Array::from_iter_values(n.iter().map(|&v| v as i128 * 3 - 900_000)).with_precision_and_scale(10, 2).unwrap()),
+                Arc::new(BooleanArray::from_iter(n.iter().map(|&v| Some(v % 2 == 0)))),
+            ];
+            RecordBatch::try_new(schema.clone(), columns).unwrap()
+        };
+        let batches: Vec<RecordBatch> = [0, 300_000, 600_000].into_iter().map(batch).collect();
+        let mut file = Encoding::new(None, &batches[0], &["i".to_string()], true).unwrap();
+        batches.iter().try_for_each(|b| file.write(b)).unwrap();
+        let (buf, entry) = file.finish().unwrap();
+        let groups = SerializedFileReader::new(bytes::Bytes::from(buf)).unwrap().metadata().num_row_groups();
+        assert!(groups >= 3, "{groups} row groups");
+        assert_eq!(entry.rows, 900_000);
+        for (i, f) in schema.fields().iter().enumerate() {
+            let cols: Vec<ArrayRef> = batches.iter().map(|b| b.column(i).clone()).collect();
+            let rows = crate::manifest::min_max(&cols).and_then(|(lo, hi)| Some((crate::manifest::text(&lo)?, crate::manifest::text(&hi)?)));
+            assert_eq!(entry.stats.get(f.name()), rows.as_ref(), "{}", f.name());
+        }
+        assert!(!entry.stats.contains_key("long"));
+        assert_eq!(entry.nulls, Some(vec!["i".to_string()]));
     }
 }

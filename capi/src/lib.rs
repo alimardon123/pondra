@@ -14,8 +14,14 @@ use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, PoisonError};
 
-// The library's allocator, as the program's (`main.rs`): the crate sets none. Its thread-locals are
-// dlopen's kind (`local_dynamic_tls` in Cargo.toml), so any process can load the library.
+// The library's allocator, the program's (`main.rs`; the crate sets none): jemalloc on Linux, which gives
+// back what a node has freed, mimalloc elsewhere. The packages' `pondra` runs its node through this library,
+// and a host's (Python's, Node's) through `connect()`. Their thread-locals are dlopen's kind (Cargo.toml),
+// so any process can load the library, and jemalloc's symbols are prefixed: a host's own malloc stays its.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
