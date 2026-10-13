@@ -15118,7 +15118,8 @@ def friendly():
     sample (TABLESAMPLE was ignored); refusals by name; the
     same answers spread over three nodes; and what `random_sql.py` found (`- -3` written again as
     a comment, a DISTINCT over a CASE refused, two IN lists of a column taken as sets of values,
-    columns of one name on both sides of a join mixed up)."""
+    columns of one name on both sides of a join mixed up); `IN` and `EXISTS` subqueries in a SELECT
+    list, a CASE and an aggregate, NULLs and all."""
     import datetime, decimal, duckdb, pyarrow as pa
     lake = new_lake()
     import psycopg
@@ -15205,6 +15206,15 @@ def friendly():
         "…in arithmetic, a REAL's and a DECIMAL column's too": ("SELECT x * 1.5 AS a, x + 0.25 AS b, r * 2.5 AS c, d * x AS e, d + 0.01 AS f FROM big", True, False),
         "…as CASE's branches, COALESCE, GREATEST and LEAST": ("SELECT CASE WHEN x > 1 THEN x ELSE 0.5 END AS c, coalesce(x, 0.5) AS o, greatest(x, 0.5) AS g, least(x, 2.5) AS l FROM big", True, False),
         "…in a UNION and as a join's key": ("SELECT x FROM big UNION ALL SELECT 0.25 UNION ALL SELECT big.x FROM big JOIN (VALUES (0.7)) v(e) ON big.x = v.e", True, False),
+        # (IN and EXISTS outside a WHERE couldn't be planned: `optimize::SubqueriesMarked`)
+        "x IN (SELECT …) in a SELECT list, NULLs among its values": ("SELECT id, x IN (SELECT n FROM t WHERE id < 30) AS i FROM t WHERE id < 40", True, False),
+        "x NOT IN (SELECT …) in a SELECT list, NULLs among its values": ("SELECT id, x NOT IN (SELECT n FROM t WHERE id < 30) AS i FROM t WHERE id < 40", True, False),
+        "a NULL x IN (SELECT …), and a NULL x IN no rows": ("SELECT id, n IN (SELECT k FROM t WHERE id < 50) AS i, n IN (SELECT k FROM t WHERE id < 0) AS e FROM t WHERE id < 25", True, False),
+        "x IN (SELECT …) with no NULL among its values": ("SELECT id, k IN (SELECT k FROM t WHERE g = 'a' AND k < 3) AS i FROM t WHERE id < 50", True, False),
+        "x IN (SELECT …) correlated, NULLs on both sides": ("SELECT id, n IN (SELECT t2.n FROM t t2 WHERE t2.k = t.k AND t2.id < 40) AS i FROM t WHERE id < 60", True, False),
+        "EXISTS and NOT EXISTS correlated, in a SELECT list": ("SELECT id, EXISTS (SELECT 1 FROM q WHERE q.k = t.k AND q.p > t.x) AS e, NOT EXISTS (SELECT 1 FROM q WHERE q.k = t.k + 3) AS n FROM t WHERE id < 100", True, False),
+        "IN (SELECT …) in a CASE": ("SELECT id, CASE WHEN g IN (SELECT g FROM t WHERE k = 3 AND id < 10) THEN 'in' ELSE 'out' END AS c FROM t WHERE id < 30", True, False),
+        "IN and EXISTS in an aggregate's FILTER and argument": ("SELECT k, count(*) FILTER (WHERE x IN (SELECT n FROM t WHERE id < 100)) AS c, sum(CASE WHEN EXISTS (SELECT 1 FROM q WHERE q.k = t.k AND q.p > 50) THEN 1 ELSE 0 END) AS s FROM t GROUP BY k", True, False),
     }
     checks, failed = {}, {}
     for name, (q, names, ordered) in same.items():
@@ -15232,7 +15242,8 @@ def friendly():
     checks["refused by name: FETCH … PERCENT, max_by(…) OVER, a JSON path that isn't a literal"] = "PERCENT" in refused[0] and "first_value" in refused[1] and "literal" in refused[2]
     spread = ["PIVOT (SELECT k, g, x FROM t) ON g USING sum(x) GROUP BY k", "SELECT min(COLUMNS(*)) FROM (SELECT id, x, n FROM t)",
               "SELECT id, [y * 2 FOR y IN l IF y > 0] AS d FROM t", "SELECT g, max_by(id, x), arg_min(id, x) FROM t GROUP BY g",
-              "SELECT t.id, q.p FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts", "UNPIVOT (SELECT id, x, n FROM t) ON x, n INTO NAME col VALUE val"]
+              "SELECT t.id, q.p FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts", "UNPIVOT (SELECT id, x, n FROM t) ON x, n INTO NAME col VALUE val",
+              "SELECT id, x IN (SELECT n FROM t WHERE id < 300) AS i, EXISTS (SELECT 1 FROM q WHERE q.k = t.k AND q.p > t.x) AS e FROM t"]
     apart = {q: (sorted(ours(q, spread=1)[1], key=repr), sorted(ours(q, spread=0)[1], key=repr)) for q in spread}
     checks["spread over three nodes == one node"] = all(a == b for a, b in apart.values())
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:  # (described, then run)
