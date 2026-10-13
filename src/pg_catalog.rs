@@ -20,6 +20,47 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+tokio::task_local! {
+    /// A request that speaks Postgres over HTTP (`POST /sql?catalog=postgres`: the DB-API and SQLAlchemy's
+    /// dialect, in process too): its queries that read Postgres's catalog are answered as the port answers them.
+    static POSTGRES: ();
+}
+
+/// `f`, speaking Postgres's catalog when `yes`.
+pub async fn speaking<F: std::future::Future>(yes: bool, f: F) -> F::Output {
+    match yes {
+        true => POSTGRES.scope((), f).await,
+        false => f.await,
+    }
+}
+
+/// Does this request speak Postgres, and this query read its catalog? (Any other query, and every query of
+/// a request that doesn't, reads as before: DataFusion's own `information_schema` over HTTP.)
+pub fn asked(sql: &str) -> bool { POSTGRES.try_with(|_| ()).is_ok() && wanted(sql) }
+
+/// A query over Postgres's catalog, as the Postgres port answers it: the catalog's tables and functions in
+/// its session, `user` as `current_user`, and over tables that are always empty, no rows with the columns
+/// asked for (whatever DataFusion made of it). `sql` is as `rewrite` left it.
+pub async fn answer(lake: &Lake, sql: &str, user: &str) -> Result<Vec<RecordBatch>> {
+    let ctx = crate::query::session(lake, sql, "").await?;
+    register(&ctx, lake, user, sql).await?;
+    match async { anyhow::Ok(crate::query::sql(&ctx, sql).await?.collect().await?) }.await {
+        Ok(batches) => Ok(batches),
+        Err(e) => match empty_answer(sql) {
+            Some(names) => Ok(vec![RecordBatch::new_empty(Arc::new(Schema::new(names.into_iter().map(|n| Field::new(n, DataType::Utf8, true)).collect::<Vec<_>>())))]),
+            None => Err(e),
+        },
+    }
+}
+
+/// `answer` for a request over HTTP that speaks Postgres (`asked`): its SQL rewritten as the port rewrites
+/// it, its principal as `current_user`, the session's schema as `current_schema()`.
+pub async fn over_http(lake: &Lake, sql: &str) -> Result<Vec<RecordBatch>> {
+    let user = crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "pondra".into());
+    let schema = crate::path::current(lake).map_or_else(|| "public".to_string(), |p| p.schema().to_string());
+    answer(lake, &rewrite(sql, &user, &schema), &user).await
+}
+
 /// Does this query read Postgres's catalog, or say something only Postgres says?
 pub fn wanted(sql: &str) -> bool {
     let s = sql.to_lowercase();
@@ -376,6 +417,19 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = cols.iter().filter_map(|(c, ..)| Some((c.clone(), notes.get(&format!("column/{name}/{c}"))?.clone()))).collect();
         rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(crate::measures::written(&v.sql).into_owned()), identity: Default::default(), constraints: v.facts.clone(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
+    }
+    // A user granted some tables sees those, and of one granted by columns those columns, as at every other
+    // listing (`ddl::listed`, invariant 382). Postgres's pg_class names every table; Pondra names none its
+    // reader may not read, so a BI tool's table list is the user's.
+    if let Some(a) = crate::auth::limited() {
+        rels.retain_mut(|r| match a.columns("select", &crate::ddl::join(&r.schema, &r.name)) {
+            None => false,
+            Some(None) => true,
+            Some(Some(these)) => {
+                r.columns.retain(|(c, ..)| these.contains(c));
+                true
+            }
+        });
     }
     // The session's own temporary tables and views, in its temporary schema (as Postgres has them).
     let (temp_tables, temp_views) = crate::temp::listed();

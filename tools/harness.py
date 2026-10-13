@@ -11717,7 +11717,8 @@ def sqla():
     without a default refused 23502); LIKE … ESCAPE '/' (ILIKE and NOT LIKE too, a pattern that isn't
     written out refused, literals joined by || taken); a table named with a quote refused, the message saying why; a temporary table's
     PRIMARY KEY (23505 for a repeat, 23502 for NULL, ON CONFLICT skips and replaces); a dropped table's
-    sequence refused until UNDROP, and gone with a PURGE."""
+    sequence refused until UNDROP, and gone with a PURGE; `?catalog=postgres` on POST /sql (the DB-API's and the
+    dialect's) answering Postgres's catalog as the port does."""
     import psycopg
     from decimal import Decimal
     lake = new_lake()
@@ -11839,6 +11840,45 @@ def sqla():
     purged = err("SELECT nextval('sq_p_id_seq')")
     info["purged_sequence"] = purged[1:]
     checks["DROP TABLE … PURGE takes its SERIAL sequence with it: nextval refused"] = purged[0] != 200
+
+    # ?catalog=postgres (pondra.dbapi, SQLAlchemy's dialect over HTTP): Postgres's catalog as the port answers it;
+    # without it HTTP is as before (no pg_catalog; DataFusion's information_schema), and neither answer is the other's
+    def at(s, catalog=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql" + (f"?catalog={catalog}" if catalog else ""), s.encode())
+        r = c.getresponse()
+        data = r.read().decode()
+        return r.status, r.getheader("x-pondra-sqlstate"), json.loads(data) if r.status == 200 else data[:300]
+    rel = "SELECT relname, relkind FROM pg_catalog.pg_class WHERE relname = 'dv'"
+    typ = "SELECT data_type FROM information_schema.columns WHERE table_name = 'dv' AND column_name = 'id'"
+    asked = [at(rel), at(rel, "postgres"), at(rel), at(typ), at(typ, "postgres"), at(typ), at(typ, "x")]
+    port_rel = [list(r) for r in conn.execute(rel).fetchall()]
+    port_typ = [list(r) for r in conn.execute(typ).fetchall()]
+    info["catalog_postgres"] = [a[:2] + (a[2] if a[0] == 200 else a[2][:120],) for a in asked] + [port_rel, port_typ]
+    checks["POST /sql?catalog=postgres answers pg_class and information_schema as the Postgres port does; without it as before (42P01, DataFusion's types), each asked twice; catalog=x 22023"] = \
+        asked[0][1] == "42P01" and asked[2][1] == "42P01" and [list(r.values()) for r in asked[1][2]] == port_rel == [["dv", "r"]] \
+        and asked[3][2] == asked[5][2] == [{"data_type": "Int32"}] and [list(r.values()) for r in asked[4][2]] == port_typ == [["integer"]] \
+        and asked[6][:2] == (400, "22023")
+    node.kill()
+
+    # A user granted one table, and another's column, sees those in Postgres's catalog and nothing else, over the
+    # port and over ?catalog=postgres alike (invariant 382: pg_class named every table to anyone signed in).
+    import base64
+    admin = "harness-admin-token-1"
+    lake2 = new_lake()
+    node = Node(lake2, port, pg=f"127.0.0.1:{pg}", env={"PONDRA_ADMIN_TOKEN": admin}).start()
+    for s in ["CREATE TABLE seen (a INT)", "CREATE TABLE part (a INT, b INT)", "CREATE TABLE hidden (c INT)",
+              "CREATE USER u1 PASSWORD 'u1-password'", "GRANT SELECT ON seen TO u1", "GRANT SELECT (a) ON part TO u1"]:
+        call(port, "POST", "/sql", s.encode(), timeout=60, headers={"Authorization": f"Bearer {admin}"})
+    rel = "SELECT relname FROM pg_class WHERE relkind = 'r' AND relnamespace = 'public'::regnamespace ORDER BY relname"
+    col = "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position"
+    basic = {"Authorization": "Basic " + base64.b64encode(b"u1:u1-password").decode()}
+    over_http = [[list(r.values()) for r in call(port, "POST", "/sql?catalog=postgres", s.encode(), timeout=60, headers=basic)] for s in (rel, col)]
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=u1 password=u1-password dbname=lake", autocommit=True) as c:
+        over_port = [[list(r) for r in c.execute(s).fetchall()] for s in (rel, col)]
+    info["granted_catalog"] = {"http": over_http, "port": over_port}
+    checks["a user granted one table and one column of another sees only those in pg_class and information_schema, over the port and ?catalog=postgres"] = \
+        over_http == over_port == [[["part"], ["seen"]], [["part", "a"], ["seen", "a"]]]
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"sqla": checks, "ok": ok, "info": info}, indent=1, default=str))
