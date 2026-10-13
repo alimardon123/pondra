@@ -7186,6 +7186,25 @@ def found():
     seen["json_get_flight"] = (flown_jg, jt_err[:300], jt_rows)
     checks["a JSON value json_get returns is a string over Flight (1, x, [1,2], NULL), and a table made of it keeps the text"] = \
         flown_jg.get("type") == "string" and flown_jg.get("rows") == [{"i": "1", "s": "x", "l": "[1,2]", "n": None}] and not jt_err and jt_rows == jrow
+    # A JSON or a struct's field read from a keyed table, and from a table with a renamed column (L3): DataFusion's
+    # push_down_leaf_projections takes the field down to the scan, and refused the plan as ambiguous when the table's
+    # read aliased a column to its own name (`query::named`).
+    q("CREATE TABLE jkeyed (id INT PRIMARY KEY, doc JSON, s STRUCT<a INT>)")
+    q("""INSERT INTO jkeyed VALUES (1, '{"a": 1, "b": "x"}', named_struct('a', 5))""")
+    q("CREATE TABLE jrenamed (id INT, d JSON, e INT)")
+    q("""INSERT INTO jrenamed VALUES (1, '{"a": 2}', 7)""")
+    q("ALTER TABLE jrenamed RENAME COLUMN d TO doc")
+    def tried(s):
+        try:
+            return q(s)
+        except Exception as e:
+            return str(e)[:200]
+    fields = [tried(s) for s in ("SELECT doc->'a' AS a, doc->>'b' AS b, json_get_int(doc, 'a') AS i, s['a'] AS f FROM jkeyed",
+                                 "SELECT id, doc->>'b' AS b, get_field(s, 'a') AS f FROM jkeyed WHERE id = 1",
+                                 "SELECT id, doc, doc->'a' AS a, e FROM jrenamed")]
+    seen["fields"] = fields
+    checks["a JSON or a struct's field read from a keyed table, and from a table with a renamed column"] = fields == [
+        [{"a": "1", "b": "x", "i": 1, "f": 5}], [{"id": 1, "b": "x", "f": 5}], [{"id": 1, "doc": '{"a": 2}', "a": "2", "e": 7}]]
     # A merge table takes INSERTs only: UPDATE and DELETE are refused as the merge table's own, not a view's. (4 + 2 is 6,
     # so an UPDATE to 5 that went through would show.)
     q("CREATE TABLE totals (k BIGINT PRIMARY KEY, n BIGINT MERGE sum)")
