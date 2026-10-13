@@ -9,15 +9,21 @@
 //! The values and types are DataFusion's own, so the rows are the ones the planned path writes (the
 //! unit tests at the end compare the two, case by case).
 //!
-//! What is not a literal (a function, arithmetic, a column, a placeholder, a cast that fails, two types
-//! in one column, a session with DataFusion settings of its own, a query that is more than a `VALUES`)
-//! is planned as before: `literal_rows` says None.
+//! The functions of the statement's time (`now()`, `CURRENT_TIMESTAMP`, `current_date`, `current_time`) are
+//! folded as the planner folds them: to the time the statement started, which is taken once, so every
+//! row of it shares one time, as a planned query's rows do.
+//!
+//! What is not a literal (any other function, arithmetic, a column, a placeholder, a cast that fails, two
+//! types in one column, a session with DataFusion settings of its own, a query that is more than a
+//! `VALUES`) is planned as before: `literal_rows` says None.
 
 use datafusion::arrow::array::{ArrayRef, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::config::{ConfigOptions, Dialect};
 use datafusion::common::{plan_err, DFSchema, ScalarValue, TableReference};
+use datafusion::functions::datetime::{current_date, current_time, now};
 use datafusion::logical_expr::planner::ContextProvider;
+use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::{AggregateUDF, Expr, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF};
 use datafusion::prelude::SessionConfig;
 use datafusion::sql::planner::{ParserOptions, PlannerContext, SqlToRel};
@@ -26,7 +32,8 @@ use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::sync::Arc;
 
 /// The rows of an INSERT's query, when it is a `VALUES` of literals only, as DataFusion would plan them
-/// into `target`'s columns (`write::fit` fits them to the table). None: not that, so the query is planned.
+/// into `target`'s columns (`write::fit` fits them to the table). Functions of the statement's time are
+/// folded as the planner folds them; any other function is planned. None: not that, so the query is planned.
 pub fn literal_rows(sql: &str, target: &Schema) -> Option<RecordBatch> {
     let rows = value_rows(sql)?;
     // (a session's own DataFusion settings may read the literals differently: it plans them)
@@ -38,10 +45,28 @@ pub fn literal_rows(sql: &str, target: &Schema) -> Option<RecordBatch> {
     if options.sql_parser.dialect != Dialect::Generic {
         return None;
     }
-    let provider = Literals { options };
+    let provider = Literals { options, functions: statement_functions(options) };
     let planner = SqlToRel::new_with_options(&provider, ParserOptions::from(&options.sql_parser));
-    let values = rows.into_iter().map(|row| row.into_iter().map(|v| plan(&planner, v)).collect::<Option<Vec<_>>>()).collect::<Option<Vec<_>>>()?;
+    // (the statement's time is taken once, here: every row's now() is this one, as in a planned query)
+    let ctx = SimplifyContext::builder()
+        .with_config_options(Arc::clone(options))
+        .with_query_execution_start_time(Some(chrono::Utc::now()))
+        .build();
+    let values = rows.into_iter().map(|row| row.into_iter().map(|v| plan(&planner, v, &ctx)).collect::<Option<Vec<_>>>()).collect::<Option<Vec<_>>>()?;
     columns(typed(values, target)?)
+}
+
+/// The functions of the statement's time, made from the session's config as the session makes them. The
+/// session then passes its config to each function again (`SessionState`), so each one gets that step too:
+/// a function that takes no config keeps itself.
+fn statement_functions(options: &ConfigOptions) -> Vec<Arc<ScalarUDF>> {
+    [now(options), current_date(), current_time()]
+        .into_iter()
+        .map(|udf| {
+            let updated = udf.inner().with_updated_config(options).map(Arc::new);
+            updated.unwrap_or(udf)
+        })
+        .collect()
 }
 
 /// The expressions of a query that is only `VALUES`: no WITH, ORDER BY, LIMIT, FETCH or the like, one
@@ -71,18 +96,27 @@ fn value_rows(sql: &str) -> Option<Vec<Vec<ast::Expr>>> {
 }
 
 /// One value as DataFusion's planner reads it, folded to a constant. None: not a constant (or it fails to plan).
-fn plan(planner: &SqlToRel<'_, Literals<'_>>, value: ast::Expr) -> Option<ScalarValue> {
+fn plan(planner: &SqlToRel<'_, Literals<'_>>, value: ast::Expr, ctx: &SimplifyContext) -> Option<ScalarValue> {
     let expr = planner.sql_to_expr(value, &DFSchema::empty(), &mut PlannerContext::new()).ok()?;
-    fold(&expr)
+    fold(&expr, ctx)
 }
 
-/// A planned value as the constant it is: a literal, or a cast of one, cast as DataFusion casts constants.
-/// Anything else (a function, a column, a CASE, TRY_CAST, arithmetic) is None.
-fn fold(e: &Expr) -> Option<ScalarValue> {
+/// A planned value as the constant it is: a literal, a cast of one (cast as DataFusion casts constants), or
+/// a function of the statement's time with no arguments, simplified as the planner simplifies it. Anything
+/// else (another function, a column, a CASE, TRY_CAST, arithmetic) is None.
+fn fold(e: &Expr, ctx: &SimplifyContext) -> Option<ScalarValue> {
     match e {
         Expr::Literal(v, _) => Some(v.clone()),
+        // (a function called by an alias, `CURRENT_TIMESTAMP` for `now`, is planned under the alias's name; a
+        // VALUES row can't name its own, so the wrapper is only that)
+        Expr::Alias(a) => fold(&a.expr, ctx),
+        // (`Literals` offers the statement's three functions only, and each takes no arguments; `now(1)` is planned)
+        Expr::ScalarFunction(f) if f.args.is_empty() => match f.func.simplify(vec![], ctx) {
+            Ok(ExprSimplifyResult::Simplified(Expr::Literal(v, _))) => Some(v),
+            _ => None,
+        },
         Expr::Cast(c) => {
-            let v = fold(&c.expr)?;
+            let v = fold(&c.expr, ctx)?;
             // (what the optimizer's `Seconds` rule does before a text is cast to a time: `'… 10:30'` has seconds first)
             let v = match (c.field.data_type(), text(&v).and_then(crate::query::seconds)) {
                 (DataType::Timestamp(..), Some(s)) => ScalarValue::Utf8(Some(s)),
@@ -143,23 +177,30 @@ fn columns(rows: Vec<Vec<ScalarValue>>) -> Option<RecordBatch> {
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).ok()
 }
 
-/// What the planner may ask of the session: nothing. A literal names no table, function, aggregate,
-/// window, variable or type, so each lookup misses, and a value that needs one fails to plan (None).
+/// What the planner may ask of the session: the statement's three functions of time, and nothing else. A
+/// literal names no table, aggregate, window, variable or type, so each lookup misses, and a value that
+/// needs one fails to plan (None).
 struct Literals<'a> {
     options: &'a ConfigOptions,
+    functions: Vec<Arc<ScalarUDF>>,
 }
 
 impl ContextProvider for Literals<'_> {
     fn get_table_source(&self, _: TableReference) -> datafusion::common::Result<Arc<dyn TableSource>> {
         plan_err!("a literal names no table")
     }
-    fn get_function_meta(&self, _: &str) -> Option<Arc<ScalarUDF>> { None }
+    /// A function by its name or one of its aliases (`CURRENT_TIMESTAMP` is `now`'s alias).
+    fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
+        self.functions.iter().find(|f| f.name() == name || f.aliases().iter().any(|a| a == name)).cloned()
+    }
     fn get_higher_order_meta(&self, _: &str) -> Option<Arc<HigherOrderUDF>> { None }
     fn get_aggregate_meta(&self, _: &str) -> Option<Arc<AggregateUDF>> { None }
     fn get_window_meta(&self, _: &str) -> Option<Arc<WindowUDF>> { None }
     fn get_variable_type(&self, _: &[String]) -> Option<DataType> { None }
     fn options(&self) -> &ConfigOptions { self.options }
-    fn udf_names(&self) -> Vec<String> { vec![] }
+    fn udf_names(&self) -> Vec<String> {
+        self.functions.iter().flat_map(|f| std::iter::once(f.name().to_string()).chain(f.aliases().iter().cloned())).collect()
+    }
     fn higher_order_function_names(&self) -> Vec<String> { vec![] }
     fn udaf_names(&self) -> Vec<String> { vec![] }
     fn udwf_names(&self) -> Vec<String> { vec![] }
@@ -169,6 +210,7 @@ impl ContextProvider for Literals<'_> {
 mod tests {
     use super::*;
     use crate::store::TableMeta;
+    use chrono::{DateTime, Timelike, Utc};
     use crate::write::{fit, rows};
     use datafusion::execution::SessionStateBuilder;
     use datafusion::prelude::SessionContext;
@@ -311,6 +353,73 @@ mod tests {
         }
     }
 
+    /// The UTC day a time falls on, as Date32 counts days (from 1970-01-01).
+    fn day(t: DateTime<Utc>) -> i64 {
+        t.timestamp().div_euclid(86_400)
+    }
+
+    /// A time's nanoseconds since its day's midnight (UTC), as Time64(Nanosecond) counts them.
+    fn nanos_of_day(t: DateTime<Utc>) -> i64 {
+        t.num_seconds_from_midnight() as i64 * 1_000_000_000 + t.nanosecond() as i64
+    }
+
+    /// A statement that reads the time, both ways. The literal path takes it, and both batches have the same
+    /// types. Each path takes its own time, so `agree` can't compare them: a literal time lies between one
+    /// taken just before `literal_rows` and one taken just after, the rows of one statement share one time,
+    /// a date is the planned one unless the statement straddled midnight, and a time is checked unless it
+    /// wraps past midnight between the two.
+    async fn statement_time_case(columns: &[(&str, &str)], sql: &str) {
+        let meta = meta(columns);
+        let target = crate::query::schema(&meta.columns).unwrap();
+        let before = Utc::now();
+        let literal = literal_rows(sql, &target).unwrap_or_else(|| panic!("not taken as a literal: {sql}"));
+        let after = Utc::now();
+        let planned = rows(&session(), &meta, sql).await.unwrap_or_else(|e| panic!("{sql}: planned: {e}"));
+        let end = Utc::now();
+        let literal = fit(&target, &literal).unwrap_or_else(|e| panic!("{sql}: literal: {e}"));
+        assert_eq!(planned.schema().fields(), literal.schema().fields(), "{sql}");
+
+        let value = |b: &RecordBatch, i: usize| ScalarValue::try_from_array(b.column(0).as_ref(), i).unwrap();
+        let values: Vec<ScalarValue> = (0..literal.num_rows()).map(|i| value(&literal, i)).collect();
+        assert!(values.windows(2).all(|w| w[0] == w[1]), "{sql}: rows differ: {values:?}");
+        match &values[0] {
+            ScalarValue::TimestampMicrosecond(Some(us), None) => {
+                assert!(before.timestamp_micros() <= *us && *us <= after.timestamp_micros(), "{sql}: {us}");
+            }
+            ScalarValue::Date32(Some(d)) => {
+                let d = *d as i64;
+                assert!(day(before) <= d && d <= day(end), "{sql}: {d}");
+                if day(before) == day(end) {
+                    assert_eq!(value(&planned, 0), values[0], "{sql}");
+                }
+            }
+            ScalarValue::Time64Nanosecond(Some(ns)) => {
+                if nanos_of_day(before) <= nanos_of_day(after) {
+                    assert!(nanos_of_day(before) <= *ns && *ns <= nanos_of_day(after), "{sql}: {ns}");
+                }
+            }
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn statement_times_are_as_planned() {
+        let timestamp: &[(&str, &str)] = &[("v", "Timestamp(Microsecond, None)")];
+        let date: &[(&str, &str)] = &[("v", "Date32")];
+        let time: &[(&str, &str)] = &[("v", "Time64(Nanosecond)")];
+        for (sql, columns) in [
+            ("VALUES (now())", timestamp),
+            ("VALUES (CURRENT_TIMESTAMP)", timestamp),
+            ("VALUES (current_timestamp())", timestamp),
+            ("VALUES (current_date)", date),
+            ("VALUES (current_time)", time),
+            ("VALUES (now()), (now())", timestamp),
+            ("VALUES (CAST(now() AS DATE))", date),
+        ] {
+            statement_time_case(columns, sql).await;
+        }
+    }
+
     #[tokio::test]
     async fn several_columns_and_rows_are_as_planned() {
         let table = [("n", "Int64"), ("s", "Utf8"), ("x", "Float64"), ("ts", "Timestamp(Microsecond, None)")];
@@ -335,7 +444,9 @@ mod tests {
     async fn what_is_not_a_literal_is_planned() {
         let int = [("v", "Int64")];
         let not_literal = [
-            "VALUES (now())",
+            "VALUES (now() + INTERVAL '1 day')",
+            "VALUES (now(1))",
+            "VALUES (random())",
             "VALUES (1 + 1)",
             "VALUES (nextval('s'))",
             "SELECT 1",
