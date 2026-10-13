@@ -80,7 +80,7 @@ sysinfo = { version = "0.35", default-features = false, features = ["system"], o
 libc = { version = "0.2", optional = true } # (free disk space: statvfs)
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-tikv-jemallocator = { version = "0.7", optional = true, features = ["background_threads"] } # (the program's allocator on Linux: `main.rs`)
+tikv-jemallocator = { version = "0.7", optional = true, features = ["background_threads", "disable_initial_exec_tls"] } # (the program's allocator on Linux: `main.rs`; its features as the library's, `capi/`, so one build makes both)
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu")))'.dependencies]
 mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"], optional = true } # (the program's allocator but on Linux: `main.rs`; its features as the library's, `capi/`, so one build makes both)

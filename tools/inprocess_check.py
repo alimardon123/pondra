@@ -496,7 +496,8 @@ def judge_tls(f):
         return
     yield not f["static_tls"], (f"its {f['tls_bytes']} bytes of thread-locals are given to each thread as it first uses them, "
                                 "never taken from the static TLS block" if not f["static_tls"] else
-                                f"it is marked STATIC_TLS ({f['tls_bytes']} bytes): build its mimalloc with local_dynamic_tls")
+                                f"it is marked STATIC_TLS ({f['tls_bytes']} bytes): build its allocator with dlopen's thread-locals "
+                                "(jemalloc's disable_initial_exec_tls, mimalloc's local_dynamic_tls)")
 
 
 def judge_calls(f):
