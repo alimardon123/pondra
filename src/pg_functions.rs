@@ -173,8 +173,11 @@ impl ScalarUDFImpl for Templated {
         Some(ScalarUDF::new_from_impl(Templated { inner: Arc::new(inner), kind: self.kind }))
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        // (Postgres's signatures: `to_char(timestamp, text)`, `to_date(text, text)`, `to_timestamp(text, text)`;
+        // a number, or a format that isn't text, is DataFusion's call: `to_timestamp(123.5, name)` ignores
+        // its format there, and `to_date(x, 12345)` is refused)
         let templates = match args.args.as_slice() {
-            [value, f] if self.kind != Kind::Char || is_moment(&value.data_type()) => templates(f, args.number_rows)?,
+            [value, f] if is_text(&f.data_type()) && if self.kind == Kind::Char { is_moment(&value.data_type()) } else { is_text(&value.data_type()) } => templates(f, args.number_rows)?,
             _ => None,
         };
         let Some(templates) = templates else { return self.inner.invoke_with_args(args) };
@@ -195,6 +198,9 @@ fn templates(f: &ColumnarValue, n: usize) -> Result<Option<Vec<Option<String>>>>
     let texts = text_arg(&f.to_array(n)?)?;
     Ok(texts.iter().flatten().all(|t| pg_formats::is_template(t)).then_some(texts))
 }
+
+/// Text, which Postgres's templates read and are written in.
+fn is_text(t: &DataType) -> bool { matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) }
 
 /// A date or a timestamp, which Postgres's `to_char` templates write.
 fn is_moment(t: &DataType) -> bool { matches!(t, DataType::Date32 | DataType::Date64 | DataType::Timestamp(..)) }
@@ -263,5 +269,16 @@ mod tests {
         assert!(f.contains(r#"| crm."Sales" | "Sales" | NULL | 'it''s' |"#), "{f}");
         let c = one("SELECT to_char(TIMESTAMP '2024-03-05 14:07:09', 'YYYY-MM-DD HH24:MI:SS') AS a, to_char(TIMESTAMP '2024-03-05 14:07:09', '%Y') AS b, to_date('05 Mar 2024', 'DD Mon YYYY') AS d").await;
         assert!(c.contains("| 2024-03-05 14:07:09 | 2024 | 2024-03-05 |"), "{c}");
+    }
+
+    #[tokio::test]
+    async fn a_number_or_a_format_that_isnt_text_is_datafusions_call() {
+        // (sqllogictest's timestamps.slt and dates.slt: a float's format is ignored, an integer format refused)
+        let t = one("SELECT to_timestamp(123.5, 'foo') AS t").await;
+        assert!(t.contains("1970-01-01T00:02:03.500"), "{t}");
+        let ctx = SessionContext::new();
+        register(&ctx);
+        let refused = async { ctx.sql("SELECT to_date(CAST(NULL AS VARCHAR), 12345)").await?.collect().await };
+        assert!(refused.await.is_err());
     }
 }
