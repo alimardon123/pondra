@@ -1583,11 +1583,15 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    admin reads every row, anyone else their own (`history::visible`); a query naming it is never a
    remembered answer. Nothing a statement does may wait on it. `harness.py history`.
 224. **A quiet commit doesn't move the version remembered answers are keyed by** (`store::quiet`,
-   `Catalog::loud`): one that only adds history rows, moves its producers or its table's entry, or
-   lets segments go and moves marks (`tier::expire`'s `QUIET`). Anything else a read could see is
-   loud: a new kind of periodic commit must be quiet, or every remembered answer is forgotten at its
-   pace (history's commits every second made a repeated query 12× slower on a lake only read). The
-   leader's version is the smaller of `loud` and `committed` (`apply` comes first).
+   `Catalog::loud`): one that only adds the node's records' rows (the history's and the audit log's:
+   `store::RECORDS`), moves their producers or their tables' entries, writes the lake's own keys
+   (`users::KEYS`), takes numbers (sequences' and row ids' blocks, a bulk write's commit:
+   `log::commit`'s `takes`), or lets segments go and moves marks (`tier::expire`'s `QUIET`). Anything
+   else a read could see is loud: a new kind of periodic commit must be quiet, or every remembered
+   answer is forgotten at its pace (history's commits every second made a repeated query 12× slower on
+   a lake only read; the audit log's line 50 ms after a `CREATE TABLE` made `harness.py remembered`'s
+   five asks run twice now and then). The leader's version is the smaller of `loud` and `committed`
+   (`apply` comes first).
 225. **DuckDB's spellings are rewritten in one place, and a text with none goes on as it was**
    (`friendly.rs`, from `routines::expand`, ahead of every door, a view as it is read and a
    materialized view when made): what the parser can't read is turned in the text first (`text`:
