@@ -14,7 +14,7 @@ default = ["server"]
 server = ["dep:http", "dep:slatedb", "dep:reqwest", "dep:tokio", "dep:axum", "dep:toml", "dep:uuid", "dep:clap", "dep:mimalloc",
           "dep:chrono-tz", "dep:postgres-types", "dep:pgwire", "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:zstd",
           "dep:object_store", "dep:object_store_df", "dep:glob", "dep:aws-lc-rs", "dep:tokio-rustls",
-          "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tikv-jemallocator", "dep:tower", "dep:moka"]
+          "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tikv-jemallocator", "dep:tower", "dep:http-body-util", "dep:moka"]
 
 [workspace]
 members = ["capi", "launcher"] # (pondra_lib, the C ABI, and the launcher that loads it: `cargo build --workspace` builds them with the program, into one folder; a plain build at the root builds the program alone)
@@ -36,6 +36,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 tokio = { version = "1", features = ["full"], optional = true }
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", default-features = false, features = ["util"], optional = true } # (a library's request handed to the router: `library.rs`; already built for axum)
+http-body-util = { version = "0.1", optional = true } # (a body capped at a size: Flight's calls before their caller signs in; already built for axum)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -80,7 +81,7 @@ sysinfo = { version = "0.35", default-features = false, features = ["system"], o
 libc = { version = "0.2", optional = true } # (free disk space: statvfs)
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-tikv-jemallocator = { version = "0.7", optional = true, features = ["background_threads"] } # (the program's allocator on Linux: `main.rs`)
+tikv-jemallocator = { version = "0.7", optional = true, features = ["background_threads", "disable_initial_exec_tls"] } # (the program's allocator on Linux: `main.rs`; its features as the library's, `capi/`, so one build makes both)
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu")))'.dependencies]
 mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"], optional = true } # (the program's allocator but on Linux: `main.rs`; its features as the library's, `capi/`, so one build makes both)

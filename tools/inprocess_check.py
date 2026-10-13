@@ -1,36 +1,40 @@
 #!/usr/bin/env python3
-"""`pondra.open()` and JavaScript's `open()`: a node in this process, checked (ADR-061 steps 4 and 6;
-python/pondra/inprocess.py, js/index.js).
+"""`pondra.connect()` of a lake and JavaScript's `connect()`: a node in this process, checked (ADR-061 steps 4
+and 6, ADR-072; python/pondra/inprocess.py, js/index.js).
 
   inprocess_check.py [--lib PATH] [--bin PATH] [--bench]
 
 --lib is the library (libpondra_lib.so, .dylib or pondra_lib.dll), as PONDRA_LIBRARY; --bin the pondra program,
-as PONDRA_BIN (`pondra.local()` and an `open()`'s launcher use it). Each check is a child process of this
+as PONDRA_BIN (a node beside the process and a node's launcher use it). Each check is a child process of this
 script, because a process holds one node and its settings are fixed by its first open; each Python child has
 this checkout's python/ first on its path. The JavaScript children (i to n) are in inprocess_check.mjs, run by
 Node, or by Bun for n (RUNNERS); o reads the library's symbols here, with nm.
 
-a. "pondra.open() with no path: SQL, a frame, pandas in and out, a file here, a live query; its lake held
+a. "pondra.connect() with no path: SQL, a frame, pandas in and out, a file here, a live query; its lake held
    in memory, with nothing written in the temporary folder or here, and a new open a new lake"
 b. "a lake opened, written, closed and opened again in this process: its rows"
-c. "a second open while one is open is refused by name"
+c. "connect() while a node is open here: the same lake another connection to it (sessions apart, one closed and
+   the other still answering), another lake and another memory lake a node each beside this process, a URL a
+   connection; local() and open() warn that they go at 1.0"
 d. "a misspelt setting is refused naming the nearest"
 e. "a setting changed on a later open is refused naming it"
 f. "50 opens and closes leave no threads or open files" (Linux)
-g. "a fork's child is refused by name (a query, an open), and the parent still answers" (Linux and macOS)
+g. "a fork's child: its parent's connection refused by name, connect() there a node beside it; the parent still
+   answers" (Linux and macOS)
 h. "the library asks for no static TLS, so any process loads it" (Linux)
-i. "open() in JavaScript with no path: SQL, a frame, writeTable, a file here, a live query; its lake held in
+i. "connect() in JavaScript with no path, not awaited: SQL, a frame, writeTable, a file here, a live query; its lake held in
    memory, with nothing written in the temporary folder or here" (Node)
-j. "JavaScript: a lake opened, written, closed and opened again: its rows; a second open, a misspelt setting
-   and a changed one refused by name" (Node)
+j. "JavaScript: a lake opened, written, closed and opened again: its rows; the same lake another connection,
+   another lake a node beside; a misspelt setting and a changed one refused by name; open() warns" (Node)
 k. "JavaScript: 20 opens and closes leave no threads or open files" (Node, Linux)
 l. "a Node process that calls process.exit() without close() closes its node: its lake's term given back" (Node)
 m. "a Node program that ends without close() closes its node (the cleanup hook): its lake's term given back" (Node)
-n. "Bun: open() answers SQL" (Bun, when it is installed)
+n. "Bun: connect() answers SQL" (Bun, when it is installed)
 o. "the library defines its ABI, and needs only glibc and libgcc by version: nothing of a host binds to it" (Linux, nm)
+p. "a node in a library prints nothing while all goes well, every statement slow (slow_ms=1)" (Linux and macOS)
 
 --bench also prints, not asserted: the time to the first answer and the idle memory, against
-pondra.local() and DuckDB, and 10 M rows into pandas. Only the standard library is needed; the checks
+a node beside the process (what pondra.local() was) and DuckDB, and 10 M rows into pandas. Only the standard library is needed; the checks
 that use pandas, pyarrow, Polars or DuckDB are skipped when one of them isn't installed.
 """
 import argparse, importlib.util, json, os, re, shutil, statistics, subprocess, sys, tempfile, time
@@ -40,7 +44,7 @@ LINUX, FORK = sys.platform.startswith("linux"), hasattr(os, "fork")
 MJS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inprocess_check.mjs")  # the JavaScript children
 BUN_HOME = os.path.expanduser("~/.bun/bin/bun")  # where bun's installer puts it, when it isn't on the PATH
 RUNTIMES = {"node": shutil.which("node"), "bun": shutil.which("bun") or (BUN_HOME if os.path.isfile(BUN_HOME) else None)}
-RUNNERS = {"js_sql": "node", "js_reopen": "node", "js_cycles": "node", "js_exit": "node", "js_end": "node", "js_bun": "bun"}  # (check -> runtime)
+RUNNERS = {"js_sql": "node", "js_calls": "node", "js_reopen": "node", "js_cycles": "node", "js_exit": "node", "js_end": "node", "js_bun": "bun"}  # (check -> runtime)
 
 
 def has(module):
@@ -65,10 +69,10 @@ def rss_mb(pid="self", field="VmRSS"):
 
 
 def refusal(*args, **settings):
-    """What `pondra.open(*args, **settings)` says when it is refused (None: it opened, and is closed)."""
+    """What `pondra.connect(*args, **settings)` says when it is refused (None: it opened, and is closed)."""
     import pondra
     try:
-        db = pondra.open(*args, **settings)
+        db = pondra.connect(*args, **settings)
     except RuntimeError as e:
         return str(e)
     db.close()
@@ -79,7 +83,7 @@ def refusal(*args, **settings):
 
 def child_sql():
     import pondra
-    db = pondra.open()
+    db = pondra.connect()
     db.sql("CREATE TABLE t (id INT, name TEXT)")
     db.sql("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
     facts = {"count": db.sql("SELECT count(*) AS n FROM t").rows()[0]["n"], "pandas": None, "polars": None}
@@ -111,10 +115,73 @@ def child_sql():
     facts["lake"], facts["while_open"] = db.lake, written_here()
     db.close()
     facts["after_close"] = written_here()
-    db = pondra.open(":memory:")
+    db = pondra.connect(":memory:")
     facts["fresh"] = db.sql("SELECT count(*) AS n FROM information_schema.tables WHERE table_name = 't'").rows()[0]["n"]
     db.close()
     return facts
+
+
+def wait_until(fact, secs=10):
+    """The seconds until `fact()` holds, asked every 0.1 s, or None if it doesn't within `secs`."""
+    started = time.monotonic()
+    while time.monotonic() - started < secs:
+        if fact():
+            return time.monotonic() - started
+        time.sleep(0.1)
+    return None
+
+
+def child_calls():
+    """Every call through the library and none over the loopback port: a live query, a watch, a big answer in
+    pieces; and Ctrl-C (a notebook's Interrupt) stopping a long query, and its work on the node."""
+    import _thread
+    import threading
+    import pondra
+    db = pondra.connect()
+
+    def socket(*args, **kwargs):
+        raise AssertionError("a call went over the loopback port")
+
+    db._open = socket
+    db.sql("CREATE TABLE t (id BIGINT)")
+    db.sql("INSERT INTO t VALUES (1), (2)")
+    live = db.live("SELECT count(*) AS n FROM t")
+    answers = [next(live)[0]["n"]]
+    db.sql("INSERT INTO t VALUES (3)")
+    answers.append(next(live)[0]["n"])
+    live.close()
+    seen = []
+
+    def watching():
+        for row in db.watch("t"):
+            seen.append(row["id"])
+            break
+
+    watcher = threading.Thread(target=watching)
+    watcher.start()
+    time.sleep(1)  # (the watch is on the node before the row commits)
+    db.sql("INSERT INTO t VALUES (4)")
+    watcher.join(30)
+    stats = lambda: json.loads(db._call("GET", "/stats"))
+    ended = wait_until(lambda: stats()["live_queries"] == 0)
+    csv = db._call("POST", "/sql?format=csv", b"SELECT * FROM range(3000000)")  # (past 8 MB: written in pieces)
+
+    def running():
+        text = db._call("GET", "/metrics").decode()
+        return next((float(line.split()[-1]) for line in text.splitlines() if line.startswith("pondra_queries_running")), None)
+
+    threading.Timer(0.5, _thread.interrupt_main).start()
+    started = time.perf_counter()
+    try:
+        db.sql("SELECT sum(value) AS s FROM range(100000000000)").rows()  # (minutes of work, stopped at 0.5 s)
+        interrupted = None
+    except KeyboardInterrupt:
+        interrupted = time.perf_counter() - started
+    stopped = wait_until(lambda: running() == 0)
+    after = db.sql("SELECT 1 AS one").rows()[0]["one"]
+    db.close()
+    return {"live": answers, "watched": seen, "live_ended": ended, "csv_lines": csv.count(b"\n"),
+            "interrupted": interrupted, "stopped": stopped, "after": after}
 
 
 def written_here():
@@ -129,11 +196,11 @@ def child_reopen():
     scratch = tempfile.mkdtemp(prefix="inprocess-check-")
     try:
         lake = os.path.join(scratch, "lake")
-        db = pondra.open(lake)
+        db = pondra.connect(lake)
         db.sql("CREATE TABLE r (id INT)")
         db.sql("INSERT INTO r VALUES (1), (2), (3), (4)")
         db.close()
-        db = pondra.open(lake)
+        db = pondra.connect(lake)
         count = db.sql("SELECT count(*) AS n FROM r").rows()[0]["n"]
         db.close()
         return {"count": count}
@@ -142,11 +209,45 @@ def child_reopen():
 
 
 def child_second():
+    import warnings
     import pondra
-    first = pondra.open()
-    message = refusal()
-    first.close()
-    return {"message": message}
+    scratch = tempfile.mkdtemp(prefix="inprocess-check-")
+    try:
+        lake = os.path.join(scratch, "lake")
+        a, b = pondra.connect(lake), pondra.connect(lake)  # (the same lake twice: one node, two connections)
+        a.sql("CREATE TABLE s (id INT)")
+        a.sql("INSERT INTO s VALUES (1), (2)")
+        a.sql("CREATE TEMP TABLE mine AS SELECT 1 AS x")
+        try:
+            b.sql("SELECT * FROM mine").rows()
+            apart = False
+        except Exception:
+            apart = True  # (a's temporary table is a's session's alone)
+        shared = a._handle == b._handle and getattr(b, "process", None) is None
+        a.close()
+        left = b.sql("SELECT count(*) AS n FROM s").rows()[0]["n"]  # (b still answers after a closed)
+        other = pondra.connect(os.path.join(scratch, "other"))  # (another lake: a node beside this process)
+        other.sql("CREATE TABLE o (id INT)")
+        other.sql("INSERT INTO o VALUES (1)")
+        other_rows = other.sql("SELECT count(*) AS n FROM o").rows()[0]["n"]
+        memory = pondra.connect()  # (a second lake in memory: beside it too)
+        memory_one = memory.sql("SELECT 1 AS one").rows()[0]["one"]
+        beside = [getattr(other, "process", None) is not None, getattr(memory, "process", None) is not None]
+        for db in (memory, other, b):
+            db.close()
+        again = pondra.connect(lake)  # (the node let go with its last connection: this one opens it again, here)
+        again_here = getattr(again, "process", None) is None and again.sql("SELECT count(*) AS n FROM s").rows()[0]["n"]
+        again.close()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            pondra.open(lake).close()
+            pondra.local(os.path.join(scratch, "third")).close()
+        warned = sorted(str(w.message).split(" goes")[0].split()[-1] for w in caught if issubclass(w.category, DeprecationWarning))
+        url = pondra.connect("http://127.0.0.1:9")  # (a URL: a connection, nothing started)
+        return {"shared": shared, "apart": apart, "left": left, "other_rows": other_rows, "memory_one": memory_one,
+                "beside": beside, "again_here": again_here, "warned": warned, "url": [url.url, getattr(url, "_handle", None)]}
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def child_misspelt():
@@ -160,7 +261,7 @@ def child_changed():
     import pondra
     scratch = tempfile.mkdtemp(prefix="inprocess-check-")
     try:
-        pondra.open(os.path.join(scratch, "one"), memory_gb=2).close()
+        pondra.connect(os.path.join(scratch, "one"), memory_gb=2).close()
         return {"message": refusal(os.path.join(scratch, "two"), memory_gb=3)}
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
@@ -170,7 +271,7 @@ def child_cycles():
     import pondra
 
     def cycle():
-        db = pondra.open()  # (a new lake in a new folder each time: each count is 1)
+        db = pondra.connect()  # (a new lake in a new folder each time: each count is 1)
         db.sql("CREATE TABLE IF NOT EXISTS t (id INT)")
         db.sql("INSERT INTO t VALUES (1)")
         n = db.sql("SELECT count(*) AS n FROM t").rows()[0]["n"]
@@ -199,21 +300,47 @@ def child_cycles():
     return {"threads": [first[0], last[0]], "files": [first[1], last[1]], "wakeups": [first[2], last[2]], "rows": rows}
 
 
+def child_quiet():
+    """What the node prints while all goes well, read from this process's standard error: every statement slow."""
+    import pondra
+    with tempfile.TemporaryFile() as err:
+        sys.stderr.flush()
+        saved = os.dup(2)
+        os.dup2(err.fileno(), 2)  # (the node writes to the process's own, as eprintln! does)
+        try:
+            db = pondra.connect(slow_ms=1)
+            db.sql("CREATE TABLE q AS SELECT * FROM range(200000)")
+            n = db.sql("SELECT count(*) AS n FROM q").rows()[0]["n"]
+            db.close()
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
+        err.seek(0)
+        printed = err.read().decode(errors="replace")
+    return {"n": n, "printed": printed[-300:]}
+
+
 def child_fork():
     import pondra
-    db = pondra.open()
+    db = pondra.connect()
     db.sql("CREATE TABLE f (id INT)")
     db.sql("INSERT INTO f VALUES (1), (2)")
     pid = os.fork()
-    if pid == 0:  # (the child: its node is its parent's, so its request, and an open of its own, are refused by name)
+    if pid == 0:  # (the child: its node is its parent's, so its request is refused by name; its own connect() is a node beside it)
         code = 0
-        for attempt in (lambda: db.sql("SELECT 1").rows(), lambda: pondra.open()):
-            try:
-                attempt()
-                code = 1
-            except RuntimeError as e:
-                print(f"child: {e}", file=sys.stderr, flush=True)
-                code = code or (0 if "fork" in str(e) and "spawn" in str(e) else 1)
+        try:
+            db.sql("SELECT 1").rows()
+            code = 1
+        except RuntimeError as e:
+            print(f"child: {e}", file=sys.stderr, flush=True)
+            code = 0 if "fork" in str(e) and "spawn" in str(e) else 1
+        try:
+            mine = pondra.connect()
+            code = code or (0 if mine.sql("SELECT 7 AS n").rows()[0]["n"] == 7 and mine.process is not None else 2)
+            mine.close()
+        except Exception as e:
+            print(f"child's connect(): {e}", file=sys.stderr, flush=True)
+            code = code or 3
         os._exit(code)
     _, status = os.waitpid(pid, 0)
     parent = db.sql("SELECT count(*) AS n FROM f").rows()[0]["n"]
@@ -248,7 +375,7 @@ def child_tls():
 def child_bench_open():
     import pondra
     started = time.perf_counter()
-    db = pondra.open()
+    db = pondra.connect()
     db.sql("SELECT 1").rows()
     first = time.perf_counter() - started
     time.sleep(2)
@@ -261,7 +388,7 @@ def child_bench_local():
     import pondra
     scratch = tempfile.mkdtemp(prefix="inprocess-check-")
     started = time.perf_counter()
-    db = pondra.local(os.path.join(scratch, "lake"))
+    db = pondra.client._child(os.path.join(scratch, "lake"))
     db.sql("SELECT 1").rows()
     first = time.perf_counter() - started
     time.sleep(2)
@@ -282,7 +409,7 @@ def child_bench_duckdb():
 
 def child_bench_pandas_open():
     import pondra
-    db = pondra.open()
+    db = pondra.connect()
     db.sql("SELECT 1").rows()
     started = time.perf_counter()
     db.sql("SELECT * FROM range(10000000)").to_pandas()
@@ -295,7 +422,7 @@ def child_bench_pandas_open():
 def child_bench_pandas_local():
     import pondra
     scratch = tempfile.mkdtemp(prefix="inprocess-check-")
-    db = pondra.local(os.path.join(scratch, "lake"))
+    db = pondra.client._child(os.path.join(scratch, "lake"))
     db.sql("SELECT 1").rows()
     started = time.perf_counter()
     db.sql("SELECT * FROM range(10000000)").to_pandas()
@@ -318,8 +445,8 @@ def child_bench_pandas_duckdb():
 
 CHILDREN = {
     "sql": child_sql, "reopen": child_reopen, "second": child_second, "misspelt": child_misspelt,
-    "changed": child_changed, "cycles": child_cycles, "fork": child_fork,
-    "tls": child_tls,
+    "changed": child_changed, "cycles": child_cycles, "fork": child_fork, "calls": child_calls,
+    "tls": child_tls, "quiet": child_quiet,
     "bench_open": child_bench_open, "bench_local": child_bench_local, "bench_duckdb": child_bench_duckdb,
     "bench_pandas_open": child_bench_pandas_open, "bench_pandas_local": child_bench_pandas_local,
     "bench_pandas_duckdb": child_bench_pandas_duckdb,
@@ -351,9 +478,18 @@ def judge_reopen(f):
     yield f["count"] == 4, f"written, closed, opened again: {f['count']} rows (4)"
 
 
+def judge_quiet(f):
+    yield f["n"] == 200000 and f["printed"] == "", f"a node in a library prints nothing when all goes well, its statements slow too: {f['printed']!r}"
+
+
 def judge_second(f):
-    message = f["message"]
-    yield message is not None and "close it first" in message, f"a second open while one is open: {message or 'it opened'}"
+    yield f["shared"] and f["apart"], f"the same lake connected twice: one node ({f['shared']}), each connection's session its own ({f['apart']})"
+    yield f["left"] == 2, f"one of them closed, the other still answers: {f['left']} rows (2)"
+    yield f["beside"] == [True, True] and f["other_rows"] == 1 and f["memory_one"] == 1, \
+        f"another lake and another memory lake while it is open: a node beside this process each {f['beside']}, answering"
+    yield f["again_here"] == 2, f"its last connection closed, the lake connected again opens here: {f['again_here']} rows (2)"
+    yield f["warned"] == ["pondra.local()", "pondra.open()"], f"local() and open() warn that they go at 1.0: {f['warned']}"
+    yield f["url"] == ["http://127.0.0.1:9", None], f"a URL is a connection to a node, nothing started: {f['url']}"
 
 
 def judge_misspelt(f):
@@ -375,7 +511,7 @@ def judge_cycles(f):
 
 
 def judge_fork(f):
-    yield f["child"] == 0, f"a fork's child asked for a query and an open: both refused by name (exit {f['child']}, 0)"
+    yield f["child"] == 0, f"a fork's child: its parent's connection refused by name, its own connect() a node beside it (exit {f['child']}, 0)"
     yield f["parent"] == 2, f"the parent still answers after the fork: {f['parent']} rows (2)"
 
 
@@ -385,7 +521,28 @@ def judge_tls(f):
         return
     yield not f["static_tls"], (f"its {f['tls_bytes']} bytes of thread-locals are given to each thread as it first uses them, "
                                 "never taken from the static TLS block" if not f["static_tls"] else
-                                f"it is marked STATIC_TLS ({f['tls_bytes']} bytes): build its mimalloc with local_dynamic_tls")
+                                f"it is marked STATIC_TLS ({f['tls_bytes']} bytes): build its allocator with dlopen's thread-locals "
+                                "(jemalloc's disable_initial_exec_tls, mimalloc's local_dynamic_tls)")
+
+
+def judge_calls(f):
+    yield f["live"] == [2, 3], f"a live query: its answer, and again after an INSERT: {f['live']} ([2, 3])"
+    yield f["watched"] == [4], f"a watch: the row committed after it started: {f['watched']} ([4])"
+    yield f["live_ended"] is not None, f"both ended on the node when their loops stopped (live_queries 0): {'yes' if f['live_ended'] is not None else 'no'}"
+    yield f["csv_lines"] == 3000001, f"an answer past 8 MB, read in pieces as written: {f['csv_lines']} lines (3000001)"
+    took = f["interrupted"]
+    yield took is not None and took < 2, f"Ctrl-C 0.5 s into a long query stops the call: {'not stopped' if took is None else f'after {took:.2f} s'} (under 2 s)"
+    yield f["stopped"] is not None and f["after"] == 1, \
+        f"…and its work on the node (no query running {'after ' + format(f['stopped'], '.1f') + ' s' if f['stopped'] is not None else 'never'}); the node answers after: {f['after']}"
+
+
+def judge_js_calls(f):
+    yield f["live"] == [2, 3], f"JavaScript, with fetch refused: a live query and again after an INSERT: {f['live']} ([2, 3])"
+    yield f["watched"] == 4, f"a watch: the row committed after it started: {f['watched']} (4)"
+    yield f["live_left"] == 0, f"both ended on the node when their loops stopped: live_queries {f['live_left']} (0)"
+    yield f["csv_lines"] == 3000001, f"an answer past 8 MB, read in pieces as written: {f['csv_lines']} lines (3000001)"
+    yield f["after_cancel"] == 1, f"a big answer cancelled half-read, then the node answers: {f['after_cancel']} (1)"
+    yield f["per_call_ms"] < 5, f"SELECT 1, 200 times: {f['per_call_ms']:.2f} ms a call (under 5)"
 
 
 def judge_js_sql(f):
@@ -403,9 +560,11 @@ def judge_js_sql(f):
 
 def judge_js_reopen(f):
     yield f["count"] == 2, f"written, closed, opened again: {f['count']} rows (2)"
-    second, misspelt, changed = f["second"], f["misspelt"], f["changed"]
-    yield second is not None and re.search("one at a time|already|close it first", second, re.I) is not None, \
-        f"a second open while one is open: {second or 'it opened'}"
+    yield f["shared"] and f["same_count"] == 2 and f["left"] == 2, \
+        f"the same lake again: one node ({f['shared']}), {f['same_count']} rows; closed, the other still answers: {f['left']} (2)"
+    yield f["beside"] and f["other_one"] == 1, f"another lake while one is open: a node beside this process ({f['beside']}), answering"
+    yield f["warned"] == ["pondra's open()"], f"open() warns that it goes at 1.0: {f['warned']}"
+    misspelt, changed = f["misspelt"], f["changed"]
     # (the misspelt name holds "memory_gb" itself, so the nearest name is what is looked for, after "did you mean")
     yield misspelt is not None and re.search(r"did you mean\W+(PONDRA_)?memory_gb\b", misspelt, re.I) is not None, \
         f"a misspelt setting, the nearest named: {misspelt or 'accepted'}"
@@ -431,6 +590,7 @@ def judge_js_exit(f):
 def judge_js_bun(f):
     yield f["count"] == 3, f"Bun: CREATE, an append and a count: {f['count']} rows (3)"
     yield f["lake"] == ":memory:", f"Bun: with no folder, a lake in memory ({f['lake']})"
+    yield f["live"] == 3 and f["csv_lines"] == 3000001, f"Bun: a live query ({f['live']}, 3) and an answer read in pieces ({f['csv_lines']} lines, 3000001)"
 
 
 def library_symbols(args):
@@ -467,35 +627,38 @@ HERE = {"sql", "js_sql"}  # (children given a temporary folder of their own, whi
 DIRECT = {"symbols": library_symbols}  # (checks read in this process, with no child: see run_child)
 
 CHECKS = [  # (child, label, judge)
-    ("sql", "pondra.open() with no path: SQL, a frame, pandas in and out, a file here, a live query; its lake in memory, nothing on disk", judge_sql),
+    ("sql", "pondra.connect() with no path: SQL, a frame, pandas in and out, a file here, a live query; its lake in memory, nothing on disk", judge_sql),
+    ("calls", "every call through the library, none over the port: a live query, a watch, a big answer; Ctrl-C stops a long query and its work", judge_calls),
     ("reopen", "a lake opened, written, closed and opened again in this process: its rows", judge_reopen),
-    ("second", "a second open while one is open is refused by name", judge_second),
+    ("second", "connect() while a node is open here: the same lake another connection, another lake (or memory) a node beside; local() and open() warn", judge_second),
     ("misspelt", "a misspelt setting is refused naming the nearest", judge_misspelt),
     ("changed", "a setting changed on a later open is refused naming it", judge_changed),
     ("cycles", "50 opens and closes leave no threads or open files", judge_cycles),
-    ("fork", "a fork's child is refused by name (a query, an open), and the parent still answers", judge_fork),
+    ("quiet", "a node in a library prints nothing while all goes well, every statement slow (slow_ms=1)", judge_quiet),
+    ("fork", "a fork's child: its parent's connection refused by name, connect() there a node beside it; the parent still answers", judge_fork),
     ("tls", "the library asks for no static TLS, so any process loads it", judge_tls),
-    ("js_sql", "open() in JavaScript with no path: SQL, a frame, writeTable, a file here, a live query; its lake in memory, nothing on disk", judge_js_sql),
-    ("js_reopen", "JavaScript: a lake opened, written, closed and opened again: its rows; a second open, a misspelt setting and a changed one refused by name", judge_js_reopen),
+    ("js_sql", "connect() in JavaScript with no path, not awaited: SQL, a frame, writeTable, a file here, a live query; its lake in memory, nothing on disk", judge_js_sql),
+    ("js_calls", "JavaScript: every call through Node-API, none over the port: a live query, a watch, a big answer in pieces, one cancelled", judge_js_calls),
+    ("js_reopen", "JavaScript: a lake opened, closed and opened again: its rows; the same lake another connection, another a node beside; a misspelt and a changed setting refused; open() warns", judge_js_reopen),
     ("js_cycles", "JavaScript: 20 opens and closes leave no threads or open files", judge_js_cycles),
     ("js_exit", "a Node process that calls process.exit() without close() closes its node: its lake's term given back", judge_js_exit),
     ("js_end", "a Node program that ends without close() closes its node (the cleanup hook): its lake's term given back", judge_js_exit),
-    ("js_bun", "Bun: open() answers SQL", judge_js_bun),
+    ("js_bun", "Bun: connect() answers SQL", judge_js_bun),
     ("symbols", "the library defines its ABI, and needs only glibc and libgcc by version: nothing of a host binds to it", judge_symbols),
 ]
 NO_NODE, NO_BUN = RUNTIMES["node"] is None, RUNTIMES["bun"] is None
-SKIP_IF = {"cycles": (not LINUX, "needs Linux's /proc"), "fork": (not FORK, "needs fork (Linux or macOS)"), "tls": (not LINUX, "glibc's loader"),
-           "js_sql": (NO_NODE, "needs node"), "js_reopen": (NO_NODE, "needs node"), "js_exit": (NO_NODE, "needs node"), "js_end": (NO_NODE, "needs node"),
+SKIP_IF = {"cycles": (not LINUX, "needs Linux's /proc"), "quiet": (os.name == "nt", "reads the process's standard error by its descriptor"), "fork": (not FORK, "needs fork (Linux or macOS)"), "tls": (not LINUX, "glibc's loader"),
+           "js_sql": (NO_NODE, "needs node"), "js_calls": (NO_NODE, "needs node"), "js_reopen": (NO_NODE, "needs node"), "js_exit": (NO_NODE, "needs node"), "js_end": (NO_NODE, "needs node"),
            "js_cycles": (NO_NODE or not LINUX, "needs node and Linux's /proc"), "js_bun": (NO_BUN, "needs Bun (bun.sh, or ~/.bun/bin/bun)"),
            "symbols": (not LINUX or shutil.which("nm") is None, "needs Linux and nm")}
 BENCH = [  # (child, what it is, the modules it needs)
-    ("bench_open", "pondra.open()", []),
-    ("bench_local", "pondra.local()", []),
+    ("bench_open", "pondra.connect()", []),
+    ("bench_local", "a node beside (local())", []),
     ("bench_duckdb", "DuckDB", ["duckdb"]),
 ]
 BENCH_PANDAS = [
-    ("bench_pandas_open", "pondra.open()", ["pandas", "pyarrow"]),
-    ("bench_pandas_local", "pondra.local()", ["pandas", "pyarrow"]),
+    ("bench_pandas_open", "pondra.connect()", ["pandas", "pyarrow"]),
+    ("bench_pandas_local", "a node beside (local())", ["pandas", "pyarrow"]),
     ("bench_pandas_duckdb", "DuckDB", ["duckdb", "pandas"]),
 ]
 
@@ -550,12 +713,12 @@ def bench(args):
         if error:
             print(f"    FAIL {label}: {error.splitlines()[-1]}")
             continue
-        # (pondra.local(): this process's memory plus its node's)
+        # (a node beside: this process's memory plus its node's)
         idle = None if facts["rss"] is None else facts["rss"] + (facts.get("node_rss") or 0)
         note = f" (the node {fmt_mb(facts['node_rss'])})" if facts.get("node_rss") else ""
         print(f"    {label:<14} {facts['first']:.3f} s   idle memory {fmt_mb(idle)}{note}")
     print(f"  10 M rows (SELECT * FROM range(10000000)) into pandas, the median of {PANDAS_RUNS} runs taken in turn: the time,")
-    print("  and the peak memory (pondra.local()'s two processes added up):")
+    print("  and the peak memory (a node beside: the two processes added up):")
     ready = [(name, label) for name, label, needs in BENCH_PANDAS if all(has(m) for m in needs)]
     for name, label, needs in BENCH_PANDAS:
         if (name, label) not in ready:

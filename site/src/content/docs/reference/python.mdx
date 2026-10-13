@@ -3,9 +3,9 @@ title: Python client
 description: The pondra Python package, with every method of a connection, its signature, what it returns and an example.
 ---
 
-The `pondra` package talks to a node over HTTP. `pondra.connect` reaches a node that is running,
-and `pondra.local` starts one on a folder and connects to it. Both return a connection, a
-`pondra.Pondra`, called `db` on this page. It runs SQL, writes rows, makes views, and calls
+The `pondra` package talks to a node over HTTP. `pondra.connect` is the one way in: it reaches a node
+that is running, or opens a lake and runs its node inside this process. Either way it returns a
+connection, a `pondra.Pondra`, called `db` on this page. It runs SQL, writes rows, makes views, and calls
 functions and procedures. A query comes back as a **frame**, which the
 [frames reference](/pondra/reference/frames/) covers.
 
@@ -18,13 +18,31 @@ db = pondra.connect("http://localhost:8080")
 
 | Call | Meaning |
 |---|---|
-| `pondra.connect(url="http://127.0.0.1:8080", token=None, **options)` | a connection to a node, or to any of several (a list of URLs): with a token, or as a user (`user=`, `password=`: its password, or one of its tokens); over HTTPS, `ca=` names a PEM file to trust besides the system's (a node's own certificate) |
-| `pondra.local(dir="lake", port=None, token=None, flags=(), timeout=120, python=True)` | start a node on a lake here (a folder or `s3://bucket/prefix`) and connect to it |
-| `pondra.open(path=None, token=None, python=True, **settings)` | a node on a lake inside this Python process, through the library the package ships: no second process to start. With no `path`, or `":memory:"` as DuckDB spells it, a lake held in this process's memory: nothing on disk, and gone at `close()`. `settings` are the node's [settings](/pondra/reference/environment/) by name (`memory_gb=2` is `PONDRA_MEMORY_GB`), fixed by the first open in a process; a misspelt one is refused, naming the nearest. One node at a time in a process: open another lake with `ATTACH`, or close this one first |
+| `pondra.connect(target=None, token=None, **options)` | the one way in: a connection to the lake or node `target` names, with its node in this process when it is a lake (below) |
 | `pondra.current()` | the connection `pondra.sql` and its kin use |
 | `pondra.binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, the one pip installed, or the one on `PATH` |
 
-`connect` takes these options:
+`target` says what to connect to:
+
+- **Nothing, or `":memory:"`** (as DuckDB spells it): a new lake held in this process's memory. Nothing is
+  written to disk, and the lake is gone at `close()`.
+- **A folder, or a bucket's URL** (`s3://`, `gs://`, `az://`): that lake. Its node runs inside this process,
+  through the library the package ships, so there is no second process to start. Its SQL may read and write
+  files on this machine (`read_csv('jan.csv')`), and its Python procedures run with this Python (`python=False`
+  gives it none). It listens on 127.0.0.1 at `port=` (a free port if none), for the console and other
+  programs. The other options are the node's [settings](/pondra/reference/environment/) by name:
+  `memory_gb=2` is `PONDRA_MEMORY_GB`. They are fixed by the first node a process opens; a misspelt one is
+  refused, naming the nearest.
+- **`http://` or `https://`** (or a list of them, any of a cluster's nodes): a node running somewhere, with the
+  options below.
+
+A process holds one such node at a time. The same lake connected again is another connection to that node.
+Another lake connected while one is open gets a node of its own beside the process. A node stops with the
+last connection to it, or when Python exits; a folder's or a bucket's lake stays.
+
+`pondra.local()` and `pondra.open()` still work, with a warning, until 1.0.
+
+A connection to a node takes these options:
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -50,19 +68,14 @@ While a node holds the connection's session (a transaction, temporary tables, `S
 session's Python), every call goes to that node. If it goes away, the next call fails with SQLSTATE
 `08006`, the session's state is gone, and the call after that starts again on another node.
 
-`local` starts `pondra serve` on a free port. It stops with `db.close()`, or when Python exits, and
-the lake stays. Because this program started the node, the node's SQL may read and write files on
-this machine (`read_csv('jan.csv')`). `flags` are more `pondra serve` options, such as
-`["--memory-gb", "2"]`. `python=False` starts the node without Python functions.
-
 ```python norun
 db = pondra.connect("https://lake.example.com", token="your-token")
 ```
 
 ```python
-local = pondra.local("scratch", flags=["--memory-gb", "2"])
-print(local.sql("SELECT 1 AS one").rows())
-local.close()
+lake = pondra.connect("scratch", memory_gb=2)
+print(lake.sql("SELECT 1 AS one").rows())
+lake.close()
 ```
 
 ```text
@@ -78,7 +91,7 @@ local.close()
 | `db.producer`, `db.seq` | the name `append` writes under, and the sequence number of its last append |
 | `db.notices` | what the last statement's procedures printed, as a list of strings |
 | `db.position` | the commit a `watch` or `live` answer is as of: where to resume |
-| `db.console_url` | the console in a browser, as this connection. A node `local()` or `open()` started answers only this program, so the link carries its key (`#key=…`) and works while the node runs: keep it to yourself, as a token |
+| `db.console_url` | the console in a browser, as this connection. A lake's node that `connect()` opened answers only this program, so the link carries its key (`#key=…`) and works while the node runs: keep it to yourself, as a token |
 
 ```python
 print(db.urls == [db.url], db.producer.startswith("py-"), db.session != "", db.notices)
@@ -161,7 +174,7 @@ They are SQL's `read_*` functions: see [names](/pondra/reference/names/) for the
 `scan_parquet`, `scan_csv`, `scan_delta`, `scan_iceberg`, `scan_ndjson` and `read_ndjson` are the
 same methods under Polars' names.
 
-A path on this machine is read only by a node that `pondra.local` started. A URL (`s3://`, `gs://`,
+A path on this machine is read only by a node that `pondra.connect` opened for a lake here. A URL (`s3://`, `gs://`,
 `az://`, `https://`) needs a [secret](/pondra/sql/statements/#files-and-secrets) whose scope covers
 it.
 
@@ -170,7 +183,7 @@ printf 'id;name\n1;tea\n2;cake\n' > sales.csv
 ```
 
 ```python
-db_files = pondra.local("scratch")
+db_files = pondra.connect("scratch")
 print(db_files.read_csv("sales.csv", separator=";").rows())
 db_files.close()
 ```
@@ -183,7 +196,7 @@ The readers take the sources SQL's `read_*` functions take. `scan_*` and `read_n
 methods under Polars' names, and `pondra.read_*` reads through the current connection:
 
 ```python
-here = pondra.local("py-files")
+here = pondra.connect("py-files")
 here.sql("COPY (SELECT 1 AS id, 'tea' AS item) TO 'menu.parquet' (FORMAT parquet)")
 here.sql("COPY (SELECT 2 AS id, 'cake' AS item) TO 'menu.json' (FORMAT json)")
 here.sql("SELECT 3 AS id, 'milk' AS item").write_delta("menu_delta")
@@ -522,7 +535,7 @@ except pondra.PondraError as e:
 ## Close
 
 `db.close()` ends the connection's session, so its temporary tables and views go, and so do the
-variables of its `DO LANGUAGE python` blocks. It also stops the node `pondra.local` started. A
+variables of its `DO LANGUAGE python` blocks. It also stops a lake's node once no other connection holds it. A
 connection is a context manager:
 
 ```python
@@ -549,7 +562,7 @@ it is, as `duckdb.sql` runs on DuckDB's default connection.
 | `pondra.vars` | the current connection's SQL variables: `pondra.vars.day` is `$day` |
 | `pondra.read_parquet`, `pondra.read_csv`, `pondra.read_json`, `pondra.read_delta`, `pondra.read_iceberg` | the connection's readers |
 | `pondra.scan_parquet`, `pondra.scan_csv`, `pondra.scan_delta`, `pondra.scan_iceberg`, `pondra.scan_ndjson`, `pondra.read_ndjson` | the same readers under Polars' names |
-| `pondra.connect`, `pondra.local`, `pondra.current`, `pondra.binary` | see [Connect](#connect) |
+| `pondra.connect`, `pondra.current`, `pondra.binary` | see [Connect](#connect) |
 | `pondra.col`, `pondra.lit`, `pondra.when`, `pondra.coalesce`, `pondra.concat`, `pondra.concat_str`, `pondra.sql_expr`, `pondra.all`, `pondra.len`, `pondra.sum`, `pondra.mean`, `pondra.min`, `pondra.max`, `pondra.count`, `pondra.n_unique`, `pondra.median`, `pondra.first`, `pondra.last`, `pondra.fn` | the frame functions: see [frames](/pondra/reference/frames/#expressions) |
 | `pondra.Pondra`, `pondra.Frame`, `pondra.Expr`, `pondra.GroupBy`, `pondra.Result`, `pondra.Run`, `pondra.PondraError` | the classes: a connection, a frame, an expression, what `group_by` returns, a statement's rows, a started procedure, and an error from a node |
 | `pondra.__version__` | the package's version |

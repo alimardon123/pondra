@@ -223,7 +223,7 @@ a procedure and let readers call it. It can only do what its caller may. Functio
 back to the lake at all. See [functions and procedures](/pondra/guides/functions-and-procedures/).
 
 Since a procedure's code is the node's own, `--python` is guarded. A node without an admin token
-refuses it unless it listens on `127.0.0.1` (`pondra.local()` passes its own):
+refuses it unless it listens on `127.0.0.1` (`pondra.connect("lake")` passes its own):
 
 ```bash
 timeout 20 pondra serve open-lake --addr 0.0.0.0:8087 --python auto 2>&1 | head -1
@@ -463,14 +463,14 @@ malformed input (`tools/fuzz_doors.py`).
 
 Whatever the token, SQL sent to a node never reads or writes the node's own disk: no `COPY … TO` to a
 path, no `SELECT * FROM 'notes.parquet'`. Only the program that started a node (the shell,
-`pondra.local()`) does that, by a key only it knows.
+`pondra.connect("lake")`) does that, by a key only it knows.
 
 ```python
 print(attempt("admin", "SELECT * FROM 'notes.parquet'"))
 ```
 
 ```text
-notes.parquet is a file on the node's machine: only the program that started the node (the shell, local()) reads those
+notes.parquet is a file on the node's machine: only the program that started the node (the shell, or a lake's `connect()`) reads those
 ```
 
 A file in a bucket or at a URL needs a secret that covers it, and that is how a node reads other

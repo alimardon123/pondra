@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 tokio::task_local! {
-    /// The caller is the program that started this node (the shell, `local()`: `server::owner`),
+    /// The caller is the program that started this node (the shell, `connect()` of a lake: `server::owner`),
     /// or another node running its share of a query its coordinator checked: this machine's files,
     /// and URLs no secret covers, read with the node's own credentials.
     static OWNER: bool;
@@ -463,7 +463,7 @@ pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
 
 fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
     match scheme(u).filter(|s| *s != "file") {
-        None => bail!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `local()`): read it there, or from a bucket (s3://, gs://, az://, https://)"),
+        None => bail!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): read it there, or from a bucket (s3://, gs://, az://, https://)"),
         Some(_) => ensure!(covering(secrets, u).is_some(), "{}", uncovered(u)),
     }
     Ok(())

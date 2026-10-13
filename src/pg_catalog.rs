@@ -7,22 +7,23 @@
 //! Every object keeps its oid from one query to the next (a hash of its name), so a client that
 //! looks a table up and then asks about its columns by oid gets the same table.
 use crate::store::{Lake, TableMeta};
+use crate::users::On;
 use anyhow::Result;
 use datafusion::arrow::array::{new_null_array, Array, ArrayRef, AsArray, RecordBatch, StringArray, UInt32Array};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::catalog::{MemTable, MemorySchemaProvider, SchemaProvider};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{self, VisitMut, VisitorMut};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// Does this query read Postgres's catalog, or say something only Postgres says?
 pub fn wanted(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pg_", "information_schema", "::reg", "operator(", "format_type(", "current_user", "session_user", "current_schemas", "to_regtype", "to_regclass", "collate", "obj_description", "col_description", "current_setting", "has_table_privilege", "has_schema_privilege", "quote_ident"]
+    ["pg_", "information_schema", "::reg", "operator(", "format_type(", "current_user", "session_user", "current_schemas", "to_regtype", "to_regclass", "collate", "obj_description", "col_description", "current_setting", "has_table_privilege", "has_schema_privilege"]
         .iter().any(|w| s.contains(w))
 }
 
@@ -187,6 +188,40 @@ struct Lakes {
     types: Vec<EnumType>,
     routines: Vec<(u32, String, String, crate::routines::Routine)>, // oid, schema, name
     visible: Vec<String>, // (this lake's schemas on the session's search path: `path.rs`; public when none is set)
+    members: Vec<Member>, // the users and roles the caller may see (`pg_roles`, `pg_auth_members`, the grants)
+}
+
+/// A user or role of the lake, as far as the catalog reads it.
+struct Member {
+    name: String,
+    login: bool,
+    superuser: bool,
+    roles: Vec<String>, // what it is a member of
+    grants: Vec<crate::users::Grant>,
+}
+
+/// The name of the bootstrap role (oid 10, the first row of `pg_roles`); a lake user of this name is that row.
+const BOOTSTRAP: &str = "pondra";
+
+/// A role's oid: a hash of its name, or the bootstrap role's 10.
+fn role_oid(name: &str) -> u32 { if name == BOOTSTRAP { 10 } else { oid("u", name) } }
+
+/// The users and roles of the lake the caller may see. A limited caller sees what `users::principal`
+/// lets it name: itself, the roles it is a member of (and theirs), and public.
+fn members_of(all: &[(String, crate::users::User)], user: &str) -> Vec<Member> {
+    let visible = crate::auth::limited().map(|_| {
+        let mut seen = BTreeSet::new();
+        let mut todo = vec![user.to_string(), "public".to_string()];
+        while let Some(n) = todo.pop() {
+            if seen.insert(n.clone()) {
+                todo.extend(all.iter().find(|(k, _)| &k[2..] == n).into_iter().flat_map(|(_, u)| u.roles.clone()));
+            }
+        }
+        seen
+    });
+    all.iter().filter(|(k, _)| visible.as_ref().is_none_or(|v| v.contains(&k[2..]))).map(|(k, u)| Member {
+        name: k[2..].to_string(), login: u.login, superuser: u.superuser, roles: u.roles.clone(), grants: u.grants.clone(),
+    }).collect()
 }
 
 impl Lakes {
@@ -253,16 +288,44 @@ const CATALOG: &[(&str, u32)] = &[("pg_class", 1259), ("pg_namespace", 2615), ("
     ("pg_inherits", 2611), ("pg_enum", 3501), ("pg_collation", 3456), ("pg_extension", 3079), ("pg_roles", 1260), ("pg_settings", 12000), ("pg_tables", 12001),
     ("pg_views", 12002), ("pg_matviews", 12003), ("pg_user", 12004), ("pg_range", 3541), ("pg_trigger", 2620), ("pg_tablespace", 1213), ("pg_sequence", 2224),
     ("pg_foreign_table", 3118), ("pg_partitioned_table", 3350), ("pg_stat_activity", 12005), ("pg_policy", 3256), ("pg_statistic_ext", 3381), ("pg_publication", 6104),
-    ("pg_authid", 1260), ("pg_shdescription", 2396), ("pg_publication_namespace", 6237), ("pg_publication_rel", 6106), ("pg_language", 2612), ("pg_opclass", 2616), ("pg_event_trigger", 3466), ("pg_cast", 2605), ("pg_indexes", 12006)];
+    ("pg_authid", 1260), ("pg_shdescription", 2396), ("pg_publication_namespace", 6237), ("pg_publication_rel", 6106), ("pg_language", 2612), ("pg_opclass", 2616), ("pg_event_trigger", 3466), ("pg_cast", 2605), ("pg_indexes", 12006),
+    ("pg_stat_user_tables", 12007), ("pg_stat_all_tables", 12008), ("pg_sequences", 12009), ("pg_policies", 12010), ("pg_available_extensions", 12011), ("pg_default_acl", 826),
+    ("pg_db_role_setting", 2964), ("pg_aggregate", 2600), ("pg_conversion", 2607), ("pg_foreign_data_wrapper", 2328), ("pg_foreign_server", 1417), ("pg_auth_members", 1261)];
 
-async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
+/// The rows each table holds in the log and not yet in its files. Tiering takes them within seconds,
+/// but until then a table filled a moment ago would read as empty to a tool that sizes tables by
+/// `n_live_tup` or `reltuples` (Metabase's sync leaves such a table's estimate out). An estimate:
+/// past `FAR` segments of log (tiering stalled) it counts the files alone.
+async fn log_rows(lake: &Lake, metas: &[(String, TableMeta)]) -> Result<BTreeMap<String, u64>> {
+    const FAR: u64 = 100_000;
+    let mut out = BTreeMap::new();
+    let shown = metas.iter().filter(|(k, _)| !crate::sys::hidden(&k[2..]));
+    let (Some(from), to) = (shown.clone().map(|(_, m)| m.tiered).min(), lake.visible()) else { return Ok(out) };
+    if from >= to || to - from > FAR {
+        return Ok(out);
+    }
+    let segs = lake.cat.scan::<crate::store::Segment>(&crate::store::seg_key(from + 1), &crate::store::seg_key(to + 1)).await?;
+    let numbered: Vec<(u64, &crate::store::Segment)> = segs.iter().filter_map(|(k, s)| Some((k[2..].parse().ok()?, s))).collect();
+    for (k, m) in shown {
+        let n: u64 = numbered.iter().filter(|(at, _)| *at > m.tiered).map(|(_, s)| s.rows_of(&k[2..])).sum();
+        if n > 0 {
+            out.insert(k[2..].to_string(), n);
+        }
+    }
+    Ok(out)
+}
+
+async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<Lakes> {
     let schemas = crate::ddl::schemas(lake).await?;
     let mvs: std::collections::HashSet<String> = lake.cat.scan::<serde_json::Value>("v/", "v0").await?.into_iter().map(|(k, _)| k[2..].to_string()).collect();
     let types = enum_types(lake).await?;
+    let members = members_of(&lake.cat.scan::<crate::users::User>("u/", "u0").await?, user);
     // COMMENT ON, as `objects.rs` keeps it (`cm/relation/{name}`, `cm/column/{name}/{stored column}`).
     let notes: BTreeMap<String, String> = lake.cat.scan::<String>("cm/", "cm0").await?.into_iter().map(|(k, v)| (k[3..].to_string(), v)).collect();
     let mut rels = vec![];
-    for (k, m) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
+    let metas = lake.cat.scan::<TableMeta>("t/", "t0").await?;
+    let logged = if counts { log_rows(lake, &metas).await? } else { BTreeMap::new() };
+    for (k, m) in metas {
         let name = &k[2..];
         if crate::sys::hidden(name) {
             continue;
@@ -287,7 +350,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
         let typed = enums.chain(l.sql_types.iter().filter(|(_, t)| *t == "uuid").map(|(c, _)| (c.clone(), UUID))).collect();
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = l.columns.iter().filter_map(|(c, _)| Some((c.clone(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: None, identity: l.identity.clone(), constraints: l.constraints.clone(), checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows, bytes: bytes + sealed.bytes });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: None, identity: l.identity.clone(), constraints: l.constraints.clone(), checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
     }
     let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
     // (a view's columns are its query's: planned only when a client asks for columns, in a
@@ -361,7 +424,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
     let mut all_schemas: Vec<(u32, String)> = vec![(11, "pg_catalog".into()), (13_000, "information_schema".into())];
     all_schemas.extend(schemas.iter().map(|s| (schema_oid(s), s.clone())));
     all_schemas.push((schema_oid(TEMP), TEMP.into()));
-    Ok(Lakes { indexes, database, databases, user: user.into(), schemas: all_schemas, rels, sequences, types, routines, visible: crate::path::schemas_here(lake) })
+    Ok(Lakes { indexes, database, databases, user: user.into(), schemas: all_schemas, rels, sequences, types, routines, visible: crate::path::schemas_here(lake), members })
 }
 
 /// A column's default as Postgres shows it: a text column's string literal gets the `::text` that
@@ -392,6 +455,12 @@ async fn enum_types(lake: &Lake) -> Result<Vec<EnumType>> {
 
 /// A table of `columns` (name, type) and `rows` (a NULL where a value is `ScalarValue::Null`).
 fn table(columns: &[(&str, DataType)], rows: Vec<Vec<ScalarValue>>) -> Result<Arc<MemTable>> {
+    // (a row of the wrong width would drop or shift values without a word: refused instead, naming the
+    // table by its columns)
+    if let Some(bad) = rows.iter().find(|r| r.len() != columns.len()) {
+        let names: Vec<&str> = columns.iter().map(|(n, _)| *n).collect();
+        anyhow::bail!("a catalog table's rows don't match its columns: {} columns ({}), a row of {}", columns.len(), names.join(", "), bad.len());
+    }
     let schema = Arc::new(Schema::new(columns.iter().map(|(n, t)| Field::new(*n, t.clone(), true)).collect::<Vec<_>>()));
     let arrays = columns.iter().enumerate().map(|(i, (_, t))| {
         let values = rows.iter().map(|r| match &r[i] {
@@ -409,7 +478,10 @@ fn b(v: bool) -> ScalarValue { ScalarValue::Boolean(Some(v)) }
 fn i2(v: i16) -> ScalarValue { ScalarValue::Int16(Some(v)) }
 fn i4(v: i32) -> ScalarValue { ScalarValue::Int32(Some(v)) }
 fn f4(v: f32) -> ScalarValue { ScalarValue::Float32(Some(v)) }
+fn i8(v: i64) -> ScalarValue { ScalarValue::Int64(Some(v)) }
 fn n() -> ScalarValue { ScalarValue::Null }
+/// A timestamp with time zone, as `timestamptz` columns are typed.
+fn timestamptz() -> DataType { DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())) }
 /// Columns' places in a relation, numbered from 1 (0: not one of its columns).
 fn at_of(r: &Rel, columns: &[String]) -> Vec<i16> { columns.iter().map(|c| r.columns.iter().position(|(n, ..)| n == c).map_or(0, |p| p as i16 + 1)).collect() }
 
@@ -433,41 +505,70 @@ const INT4: DataType = DataType::Int32;
 const INT8: DataType = DataType::Int64;
 fn list(t: DataType) -> DataType { DataType::List(Arc::new(Field::new("item", t, true))) }
 
-fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
+/// The columns of `pg_stat_all_tables` (and `pg_stat_user_tables`), in Postgres's order.
+fn stat_columns() -> Vec<(&'static str, DataType)> {
+    vec![("relid", OID), ("schemaname", TEXT), ("relname", TEXT), ("seq_scan", INT8), ("last_seq_scan", timestamptz()), ("seq_tup_read", INT8), ("idx_scan", INT8),
+        ("last_idx_scan", timestamptz()), ("idx_tup_fetch", INT8), ("n_tup_ins", INT8), ("n_tup_upd", INT8), ("n_tup_del", INT8), ("n_tup_hot_upd", INT8),
+        ("n_tup_newpage_upd", INT8), ("n_live_tup", INT8), ("n_dead_tup", INT8), ("n_mod_since_analyze", INT8), ("n_ins_since_vacuum", INT8), ("last_vacuum", timestamptz()),
+        ("last_autovacuum", timestamptz()), ("last_analyze", timestamptz()), ("last_autoanalyze", timestamptz()), ("vacuum_count", INT8), ("autovacuum_count", INT8),
+        ("analyze_count", INT8), ("autoanalyze_count", INT8)]
+}
+
+/// The roles `pg_roles` lists, as (oid, name, superuser, login): the bootstrap role first, then the
+/// lake's users and roles the caller may see, then the session user when it is none of them (a token's
+/// user, such as `admin`).
+fn role_rows(l: &Lakes) -> Vec<(u32, String, bool, bool)> {
+    let mut rows = vec![(10, BOOTSTRAP.to_string(), true, true)];
+    rows.extend(l.members.iter().filter(|m| m.name != BOOTSTRAP).map(|m| (role_oid(&m.name), m.name.clone(), m.superuser, m.login)));
+    if l.user != BOOTSTRAP && !l.members.iter().any(|m| m.name == l.user) {
+        rows.push((oid("u", &l.user), l.user.clone(), l.user == "admin", true));
+    }
+    rows
+}
+
+fn tables(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
     let owner = 10u32;
     let ns = |s: &str| schema_oid(s);
     let mut out = vec![];
-    out.push(("pg_namespace", table(&[("oid", OID), ("nspname", TEXT), ("nspowner", OID), ("nspacl", list(TEXT))],
-        l.schemas.iter().map(|(oid, name)| vec![o(*oid), s(name.clone()), o(owner), n()]).collect())?));
+    // (only the tables the statement names are built: a catalog query pays for what it reads)
+    macro_rules! add {
+        ($name:expr, $columns:expr, $rows:expr) => {
+            if want($name) {
+                out.push(($name, table($columns, $rows)?));
+            }
+        };
+    }
+    add!("pg_namespace", &[("oid", OID), ("nspname", TEXT), ("nspowner", OID), ("nspacl", list(TEXT))],
+        l.schemas.iter().map(|(oid, name)| vec![o(*oid), s(name.clone()), o(owner), n()]).collect());
     // Relations: tables, views, materialized views, and each key's index.
     let mut classes = vec![];
     for r in &l.rels {
         classes.push(vec![o(r.oid), s(r.name.clone()), o(ns(&r.schema)), o(0), o(0), o(owner), o(if r.kind == 'v' { 0 } else { 2 }), o(r.oid), o(0), i4((r.bytes / 8192) as i32),
             f4(if r.kind == 'v' { -1.0 } else { r.rows as f32 }), i4(0), o(0), b(!r.key.is_empty() || l.indexes.iter().any(|i| i.table == r.oid)), b(false), s(if r.schema == TEMP { "t" } else { "p" }), s(r.kind.to_string()), i2(r.columns.len() as i16), i2(r.checks.len() as i16),
-            b(r.kind == 'v'), b(false), b(false), b(false), b(false), b(true), s("d"), b(false), o(0), n(), n(), n()]);
+            b(r.kind == 'v'), b(false), b(false), b(false), b(false), b(true), s("d"), b(false), o(0), o(0), o(0), n(), n(), n()]);
         if !r.key.is_empty() {
             classes.push(vec![o(oid("i", &format!("{}.{}", r.schema, r.name))), s(format!("{}_pkey", r.name)), o(ns(&r.schema)), o(0), o(0), o(owner), o(403), o(0), o(0), i4(1), f4(r.rows as f32),
-                i4(0), o(0), b(false), b(false), s("p"), s("i"), i2(r.key.len() as i16), i2(0), b(false), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), n(), n(), n()]);
+                i4(0), o(0), b(false), b(false), s("p"), s("i"), i2(r.key.len() as i16), i2(0), b(false), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), o(0), o(0), n(), n(), n()]);
         }
     }
     for i in &l.indexes {
         classes.push(vec![o(i.oid), s(i.name.clone()), o(ns(&i.schema)), o(0), o(0), o(owner), o(403), o(0), o(0), i4(1), f4(0.0),
-            i4(0), o(0), b(false), b(false), s("p"), s("i"), i2(i.at.len() as i16), i2(0), b(false), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), n(), n(), n()]);
+            i4(0), o(0), b(false), b(false), s("p"), s("i"), i2(i.at.len() as i16), i2(0), b(false), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), o(0), o(0), n(), n(), n()]);
     }
     // A sequence is a relation of kind 'S', with its three columns (last_value, log_cnt, is_called).
     for q in &l.sequences {
         classes.push(vec![o(q.oid), s(q.name.clone()), o(ns(&q.schema)), o(0), o(0), o(owner), o(0), o(q.oid), o(0), i4(0), f4(-1.0), i4(0), o(0), b(false), b(false), s("p"), s("S"), i2(3), i2(0),
-            b(false), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), n(), n(), n()]);
+            b(false), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), o(0), o(0), n(), n(), n()]);
     }
     for (name, oid) in CATALOG {
         classes.push(vec![o(*oid), s(*name), o(11), o(0), o(0), o(owner), o(0), o(*oid), o(0), i4(0), f4(-1.0), i4(0), o(0), b(false), b(false), s("p"), s("v"), i2(0), i2(0),
-            b(true), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), n(), n(), n()]);
+            b(true), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), o(0), o(0), n(), n(), n()]);
     }
-    out.push(("pg_class", table(&[("oid", OID), ("relname", TEXT), ("relnamespace", OID), ("reltype", OID), ("reloftype", OID), ("relowner", OID), ("relam", OID), ("relfilenode", OID),
+    add!("pg_class", &[("oid", OID), ("relname", TEXT), ("relnamespace", OID), ("reltype", OID), ("reloftype", OID), ("relowner", OID), ("relam", OID), ("relfilenode", OID),
         ("reltablespace", OID), ("relpages", INT4), ("reltuples", DataType::Float32), ("relallvisible", INT4), ("reltoastrelid", OID), ("relhasindex", BOOL), ("relisshared", BOOL),
         ("relpersistence", TEXT), ("relkind", TEXT), ("relnatts", INT2), ("relchecks", INT2), ("relhasrules", BOOL), ("relhastriggers", BOOL), ("relhassubclass", BOOL),
         ("relrowsecurity", BOOL), ("relforcerowsecurity", BOOL), ("relispopulated", BOOL), ("relreplident", TEXT), ("relispartition", BOOL), ("relrewrite", OID),
-        ("relacl", list(TEXT)), ("reloptions", list(TEXT)), ("relpartbound", TEXT)], classes)?));
+        ("relfrozenxid", OID), ("relminmxid", OID), ("relacl", list(TEXT)), ("reloptions", list(TEXT)), ("relpartbound", TEXT)], classes);
     // Columns (and their defaults), numbered from 1.
     let (mut attrs, mut defs) = (vec![], vec![]);
     for r in &l.rels {
@@ -477,7 +578,7 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
             let identity = r.identity.get(name).map_or("", |i| if i.always { "a" } else { "d" }); // (an identity has no default of its own, as in Postgres)
             let default = default.as_ref().filter(|_| identity.is_empty());
             attrs.push(vec![o(r.oid), s(name.clone()), o(typ), i4(-1), i2(len), i2(i as i16 + 1), i4(0), i4(-1), i4(typmod), b(len > 0 && len <= 8), s("i"), s("x"), s(""), b(not_null),
-                b(default.is_some()), b(false), s(identity), s(""), b(false), b(true), i4(0), o(if matches!(typ, 25 | 1043) { 100 } else { 0 }), n(), n()]);
+                b(default.is_some()), b(false), s(identity), s(""), b(false), b(true), i4(0), o(if matches!(typ, 25 | 1043) { 100 } else { 0 }), n(), n(), n(), n()]);
             if let Some(d) = default {
                 defs.push(vec![o(oid("d", &format!("{}.{}.{name}", r.schema, r.name))), o(r.oid), i2(i as i16 + 1), s(d.clone())]);
             }
@@ -489,44 +590,45 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
         for (i, k) in r.key.iter().enumerate() {
             let Some((_, t, ..)) = r.columns.iter().find(|(c, ..)| c == k) else { continue };
             let (typ, typmod, _) = r.column_type(k, t);
-            attrs.push(vec![o(index), s(k.clone()), o(typ), i4(-1), i2(8), i2(i as i16 + 1), i4(0), i4(-1), i4(typmod), b(true), s("i"), s("p"), s(""), b(true), b(false), b(false), s(""), s(""), b(false), b(true), i4(0), o(0), n(), n()]);
+            attrs.push(vec![o(index), s(k.clone()), o(typ), i4(-1), i2(8), i2(i as i16 + 1), i4(0), i4(-1), i4(typmod), b(true), s("i"), s("p"), s(""), b(true), b(false), b(false), s(""), s(""), b(false), b(true), i4(0), o(0), n(), n(), n(), n()]);
         }
     }
-    out.push(("pg_attribute", table(&[("attrelid", OID), ("attname", TEXT), ("atttypid", OID), ("attstattarget", INT4), ("attlen", INT2), ("attnum", INT2), ("attndims", INT4),
+    add!("pg_attribute", &[("attrelid", OID), ("attname", TEXT), ("atttypid", OID), ("attstattarget", INT4), ("attlen", INT2), ("attnum", INT2), ("attndims", INT4),
         ("attcacheoff", INT4), ("atttypmod", INT4), ("attbyval", BOOL), ("attalign", TEXT), ("attstorage", TEXT), ("attcompression", TEXT), ("attnotnull", BOOL), ("atthasdef", BOOL),
         ("atthasmissing", BOOL), ("attidentity", TEXT), ("attgenerated", TEXT), ("attisdropped", BOOL), ("attislocal", BOOL), ("attinhcount", INT4), ("attcollation", OID),
-        ("attacl", list(TEXT)), ("attoptions", list(TEXT))], attrs)?));
-    out.push(("pg_attrdef", table(&[("oid", OID), ("adrelid", OID), ("adnum", INT2), ("adbin", TEXT)], defs)?));
+        ("attacl", list(TEXT)), ("attoptions", list(TEXT)), ("attfdwoptions", list(TEXT)), ("attmissingval", TEXT)], attrs);
+    add!("pg_attrdef", &[("oid", OID), ("adrelid", OID), ("adnum", INT2), ("adbin", TEXT)], defs);
     // COMMENT ON: a relation's (objsubid 0) and a column's (its number), all of pg_class (oid 1259).
     let mut described = vec![];
     for r in &l.rels {
         described.extend(r.comment.iter().map(|c| vec![o(r.oid), o(1259), i4(0), s(c.clone())]));
         described.extend(r.columns.iter().enumerate().filter_map(|(i, (c, ..))| Some(vec![o(r.oid), o(1259), i4(i as i32 + 1), s(r.comments.get(c)?.clone())])));
     }
-    out.push(("pg_description", table(&[("objoid", OID), ("classoid", OID), ("objsubid", INT4), ("description", TEXT)], described)?));
+    add!("pg_description", &[("objoid", OID), ("classoid", OID), ("objsubid", INT4), ("description", TEXT)], described);
     // Types, and an array type for each.
     // (The functions by Postgres's own names: drivers such as ADBC's pick a type's binary format by
     // its `typreceive`. Newer types' names have an underscore.)
     let fun = |t: &PgType, f: &str| s(type_function(t, f));
+    // (the subscript, modifier and analyze functions are `-`: none, as Postgres says of a type without one)
     let mut types: Vec<Vec<ScalarValue>> = TYPES.iter().map(|t| vec![o(t.0), s(t.1), o(11), o(owner), i2(t.3), b(t.3 > 0 && t.3 <= 8), s(if t.4 == 'P' { "p" } else { "b" }), s(t.4.to_string()),
-        b(false), b(true), s(","), o(0), o(0), o(t.5), fun(t, "in"), fun(t, "out"), fun(t, "recv"), fun(t, "send"), o(0), i4(-1), b(false), i4(0),
-        o(if matches!(t.0, 25 | 1043 | 1042 | 19) { 100 } else { 0 }), n(), s("i"), s("p"), n()]).collect();
-    types.extend(arrays().map(|(oid, name, _, elem)| vec![o(oid), s(name), o(11), o(owner), i2(-1), b(false), s("b"), s("A"), b(false), b(true), s(","), o(0), o(elem), o(0), s("array_in"),
-        s("array_out"), s("array_recv"), s("array_send"), o(0), i4(-1), b(false), i4(0), o(0), n(), s("i"), s("x"), n()]));
+        b(false), b(true), s(","), o(0), s("-"), o(0), o(t.5), fun(t, "in"), fun(t, "out"), fun(t, "recv"), fun(t, "send"), s("-"), s("-"), s("-"), o(0), i4(-1), b(false), i4(0),
+        o(if matches!(t.0, 25 | 1043 | 1042 | 19) { 100 } else { 0 }), n(), n(), s("i"), s("p"), n()]).collect();
+    types.extend(arrays().map(|(oid, name, _, elem)| vec![o(oid), s(name), o(11), o(owner), i2(-1), b(false), s("b"), s("A"), b(false), b(true), s(","), o(0), s("-"), o(elem), o(0), s("array_in"),
+        s("array_out"), s("array_recv"), s("array_send"), s("-"), s("-"), s("-"), o(0), i4(-1), b(false), i4(0), o(0), n(), n(), s("i"), s("x"), n()]));
     // Enum types: a row of type 'e' and its array's, and a row in pg_enum for each label, in order.
     let mut labels = vec![];
     for t in &l.types {
-        types.push(vec![o(t.oid), s(t.name.clone()), o(schema_oid(&t.schema)), o(owner), i2(ENUM_LENGTH), b(true), s("e"), s("E"), b(false), b(true), s(","), o(0), o(0), o(t.array),
-            s("enum_in"), s("enum_out"), s("enum_recv"), s("enum_send"), o(0), i4(-1), b(false), i4(0), o(0), n(), s("i"), s("p"), n()]);
-        types.push(vec![o(t.array), s(format!("_{}", t.name)), o(schema_oid(&t.schema)), o(owner), i2(-1), b(false), s("b"), s("A"), b(false), b(true), s(","), o(0), o(t.oid), o(0),
-            s("array_in"), s("array_out"), s("array_recv"), s("array_send"), o(0), i4(-1), b(false), i4(0), o(0), n(), s("i"), s("x"), n()]);
+        types.push(vec![o(t.oid), s(t.name.clone()), o(schema_oid(&t.schema)), o(owner), i2(ENUM_LENGTH), b(true), s("e"), s("E"), b(false), b(true), s(","), o(0), s("-"), o(0), o(t.array),
+            s("enum_in"), s("enum_out"), s("enum_recv"), s("enum_send"), s("-"), s("-"), s("-"), o(0), i4(-1), b(false), i4(0), o(0), n(), n(), s("i"), s("p"), n()]);
+        types.push(vec![o(t.array), s(format!("_{}", t.name)), o(schema_oid(&t.schema)), o(owner), i2(-1), b(false), s("b"), s("A"), b(false), b(true), s(","), o(0), s("-"), o(t.oid), o(0),
+            s("array_in"), s("array_out"), s("array_recv"), s("array_send"), s("-"), s("-"), s("-"), o(0), i4(-1), b(false), i4(0), o(0), n(), n(), s("i"), s("x"), n()]);
         labels.extend(t.labels.iter().enumerate().map(|(i, label)| vec![o(oid("ev", &format!("{}/{label}", t.oid))), o(t.oid), f4(i as f32 + 1.0), s(label.clone())]));
     }
-    out.push(("pg_enum", table(&[("oid", OID), ("enumtypid", OID), ("enumsortorder", DataType::Float32), ("enumlabel", TEXT)], labels)?));
-    out.push(("pg_type", table(&[("oid", OID), ("typname", TEXT), ("typnamespace", OID), ("typowner", OID), ("typlen", INT2), ("typbyval", BOOL), ("typtype", TEXT), ("typcategory", TEXT),
-        ("typispreferred", BOOL), ("typisdefined", BOOL), ("typdelim", TEXT), ("typrelid", OID), ("typelem", OID), ("typarray", OID), ("typinput", TEXT), ("typoutput", TEXT),
-        ("typreceive", TEXT), ("typsend", TEXT), ("typbasetype", OID), ("typtypmod", INT4), ("typnotnull", BOOL), ("typndims", INT4), ("typcollation", OID), ("typdefault", TEXT),
-        ("typalign", TEXT), ("typstorage", TEXT), ("typacl", list(TEXT))], types)?));
+    add!("pg_enum", &[("oid", OID), ("enumtypid", OID), ("enumsortorder", DataType::Float32), ("enumlabel", TEXT)], labels);
+    add!("pg_type", &[("oid", OID), ("typname", TEXT), ("typnamespace", OID), ("typowner", OID), ("typlen", INT2), ("typbyval", BOOL), ("typtype", TEXT), ("typcategory", TEXT),
+        ("typispreferred", BOOL), ("typisdefined", BOOL), ("typdelim", TEXT), ("typrelid", OID), ("typsubscript", TEXT), ("typelem", OID), ("typarray", OID), ("typinput", TEXT), ("typoutput", TEXT),
+        ("typreceive", TEXT), ("typsend", TEXT), ("typmodin", TEXT), ("typmodout", TEXT), ("typanalyze", TEXT), ("typbasetype", OID), ("typtypmod", INT4), ("typnotnull", BOOL), ("typndims", INT4),
+        ("typcollation", OID), ("typdefaultbin", TEXT), ("typdefault", TEXT), ("typalign", TEXT), ("typstorage", TEXT), ("typacl", list(TEXT))], types);
     // Keys: an index and a constraint for each keyed table.
     let (mut indexes, mut constraints) = (vec![], vec![]);
     for r in l.rels.iter().filter(|r| !r.key.is_empty()) {
@@ -535,7 +637,7 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
         indexes.push(vec![o(oid("i", &full)), o(r.oid), i2(at.len() as i16), i2(at.len() as i16), b(true), b(false), b(true), b(false), b(true), b(false), b(true), b(false), b(true), b(true), b(false), i2s(&at), ScalarValue::List(ScalarValue::new_list_nullable(&at.iter().map(|_| o(0)).collect::<Vec<_>>(), &OID)),
             ScalarValue::List(ScalarValue::new_list_nullable(&at.iter().map(|_| o(3124)).collect::<Vec<_>>(), &OID)), i2s(&at.iter().map(|_| 0).collect::<Vec<_>>()), n(), n()]);
         constraints.push(vec![o(oid("c", &full)), s(format!("{}_pkey", r.name)), o(ns(&r.schema)), s("p"), b(false), b(false), b(true), o(r.oid), o(0), o(oid("i", &full)), o(0), o(0), s(" "), s(" "), s(" "),
-            b(true), i4(0), b(true), i2s(&at), n(), n(), b(true)]);
+            b(true), i4(0), b(true), i2s(&at), n(), n(), n(), n(), n(), n(), n(), b(true)]);
     }
     for i in &l.indexes {
         let each = |v: ScalarValue| ScalarValue::List(ScalarValue::new_list_nullable(&i.at.iter().map(|_| v.clone()).collect::<Vec<_>>(), &OID));
@@ -547,7 +649,7 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
             // (the columns its condition names, by their words: Postgres keeps them as `conkey`)
             let reads: Vec<String> = r.columns.iter().map(|(c, ..)| c.clone()).filter(|c| cond.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).any(|w| w == c)).collect();
             constraints.push(vec![o(check_oid(r, name)), s(name.clone()), o(ns(&r.schema)), s("c"), b(false), b(false), b(true), o(r.oid), o(0), o(0), o(0), o(0), s(" "), s(" "), s(" "),
-                b(true), i4(0), b(true), i2s(&at_of(r, &reads)), n(), s(cond.clone()), b(true)]);
+                b(true), i4(0), b(true), i2s(&at_of(r, &reads)), n(), n(), n(), n(), n(), n(), s(cond.clone()), b(true)]);
         }
     }
     for r in &l.rels {
@@ -565,40 +667,51 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
             };
             let foreign = c.kind == crate::constraints::Kind::ForeignKey;
             constraints.push(vec![o(constraint_oid(r, c)), s(c.name.clone()), o(ns(&r.schema)), s(kind), b(false), b(false), b(c.enforced), o(r.oid), o(0), o(index), o(0), o(to.map_or(0, |t| t.oid)),
-                s(if foreign { "a" } else { " " }), s(if foreign { "a" } else { " " }), s(if foreign { "s" } else { " " }), b(true), i4(0), b(true), i2s(&at_of(r, &c.columns)), if foreign { to_cols } else { n() }, n(), b(c.enforced)]);
+                s(if foreign { "a" } else { " " }), s(if foreign { "a" } else { " " }), s(if foreign { "s" } else { " " }), b(true), i4(0), b(true), i2s(&at_of(r, &c.columns)), if foreign { to_cols } else { n() }, n(), n(), n(), n(), n(), n(), b(c.enforced)]);
         }
     }
-    out.push(("pg_index", table(&[("indexrelid", OID), ("indrelid", OID), ("indnatts", INT2), ("indnkeyatts", INT2), ("indisunique", BOOL), ("indnullsnotdistinct", BOOL), ("indisprimary", BOOL), ("indisexclusion", BOOL),
+    add!("pg_index", &[("indexrelid", OID), ("indrelid", OID), ("indnatts", INT2), ("indnkeyatts", INT2), ("indisunique", BOOL), ("indnullsnotdistinct", BOOL), ("indisprimary", BOOL), ("indisexclusion", BOOL),
         ("indimmediate", BOOL), ("indisclustered", BOOL), ("indisvalid", BOOL), ("indcheckxmin", BOOL), ("indisready", BOOL), ("indislive", BOOL), ("indisreplident", BOOL),
-        ("indkey", list(INT2)), ("indcollation", list(OID)), ("indclass", list(OID)), ("indoption", list(INT2)), ("indexprs", TEXT), ("indpred", TEXT)], indexes)?));
-    out.push(("pg_constraint", table(&[("oid", OID), ("conname", TEXT), ("connamespace", OID), ("contype", TEXT), ("condeferrable", BOOL), ("condeferred", BOOL), ("convalidated", BOOL),
+        ("indkey", list(INT2)), ("indcollation", list(OID)), ("indclass", list(OID)), ("indoption", list(INT2)), ("indexprs", TEXT), ("indpred", TEXT)], indexes);
+    add!("pg_constraint", &[("oid", OID), ("conname", TEXT), ("connamespace", OID), ("contype", TEXT), ("condeferrable", BOOL), ("condeferred", BOOL), ("convalidated", BOOL),
         ("conrelid", OID), ("contypid", OID), ("conindid", OID), ("conparentid", OID), ("confrelid", OID), ("confupdtype", TEXT), ("confdeltype", TEXT), ("confmatchtype", TEXT),
-        ("conislocal", BOOL), ("coninhcount", INT4), ("connoinherit", BOOL), ("conkey", list(INT2)), ("confkey", list(INT2)), ("conbin", TEXT), ("conenforced", BOOL)], constraints)?));
+        ("conislocal", BOOL), ("coninhcount", INT4), ("connoinherit", BOOL), ("conkey", list(INT2)), ("confkey", list(INT2)), ("conpfeqop", list(OID)), ("conppeqop", list(OID)),
+        ("conffeqop", list(OID)), ("confdelsetcols", list(INT2)), ("conexclop", list(OID)), ("conbin", TEXT), ("conenforced", BOOL)], constraints);
     // Sequences: their type and options, as `seq::shape` works them out (Postgres's oids for the types).
     let sequence_rows = l.sequences.iter().map(|q| {
         let typ = match q.shape.as_type { "SMALLINT" => 21, "INTEGER" => 23, _ => 20 };
         vec![o(q.oid), o(typ), ScalarValue::Int64(Some(q.shape.start)), ScalarValue::Int64(Some(q.shape.increment)), ScalarValue::Int64(Some(q.shape.max)),
             ScalarValue::Int64(Some(q.shape.min)), ScalarValue::Int64(Some(q.shape.cache)), b(q.shape.cycle)]
     }).collect();
-    out.push(("pg_sequence", table(&[("seqrelid", OID), ("seqtypid", OID), ("seqstart", INT8), ("seqincrement", INT8), ("seqmax", INT8), ("seqmin", INT8), ("seqcache", INT8), ("seqcycle", BOOL)], sequence_rows)?));
+    add!("pg_sequence", &[("seqrelid", OID), ("seqtypid", OID), ("seqstart", INT8), ("seqincrement", INT8), ("seqmax", INT8), ("seqmin", INT8), ("seqcache", INT8), ("seqcycle", BOOL)], sequence_rows);
+    // Statistics of each table and materialized view. Pondra keeps no counts but its rows, and BI tools
+    // size a table by `n_live_tup`; both views list the same rows. (A temporary table is no one's.)
+    let stats: Vec<Vec<ScalarValue>> = l.rels.iter().filter(|r| matches!(r.kind, 'r' | 'm') && r.schema != TEMP).map(|r| vec![o(r.oid), s(r.schema.clone()), s(r.name.clone()),
+        i8(0), n(), i8(0), i8(0), n(), i8(0), i8(0), i8(0), i8(0), i8(0), i8(0), i8(r.rows as i64), i8(0), i8(0), i8(0), n(), n(), n(), n(), i8(0), i8(0), i8(0), i8(0)]).collect();
+    add!("pg_stat_user_tables", &stat_columns(), stats.clone());
+    add!("pg_stat_all_tables", &stat_columns(), stats);
+    add!("pg_sequences", &[("schemaname", TEXT), ("sequencename", TEXT), ("sequenceowner", TEXT), ("data_type", TEXT), ("start_value", INT8), ("min_value", INT8),
+        ("max_value", INT8), ("increment_by", INT8), ("cycle", BOOL), ("cache_size", INT8), ("last_value", INT8)],
+        l.sequences.iter().map(|q| vec![s(q.schema.clone()), s(q.name.clone()), s(l.user.clone()), s(match q.shape.as_type { "SMALLINT" => "smallint", "INTEGER" => "integer", _ => "bigint" }),
+            i8(q.shape.start), i8(q.shape.min), i8(q.shape.max), i8(q.shape.increment), b(q.shape.cycle), i8(q.shape.cache), n()]).collect());
     // The views Postgres builds over those.
     let rel_rows = |kind: char| l.rels.iter().filter(move |r| r.kind == kind);
-    out.push(("pg_tables", table(&[("schemaname", TEXT), ("tablename", TEXT), ("tableowner", TEXT), ("tablespace", TEXT), ("hasindexes", BOOL), ("hasrules", BOOL), ("hastriggers", BOOL), ("rowsecurity", BOOL)],
-        rel_rows('r').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), n(), b(!r.key.is_empty()), b(false), b(false), b(false)]).collect())?));
+    add!("pg_tables", &[("schemaname", TEXT), ("tablename", TEXT), ("tableowner", TEXT), ("tablespace", TEXT), ("hasindexes", BOOL), ("hasrules", BOOL), ("hastriggers", BOOL), ("rowsecurity", BOOL)],
+        rel_rows('r').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), n(), b(!r.key.is_empty()), b(false), b(false), b(false)]).collect());
     let mut listed: Vec<Vec<ScalarValue>> = l.rels.iter().filter(|r| !r.key.is_empty()).map(|r| {
         let def = format!("CREATE UNIQUE INDEX {}_pkey ON {}.{} USING btree ({})", r.name, r.schema, r.name, r.key.join(", "));
         vec![s(r.schema.clone()), s(r.name.clone()), s(format!("{}_pkey", r.name)), n(), s(def)]
     }).collect();
     listed.extend(l.indexes.iter().map(|i| vec![s(i.schema.clone()), s(i.table_name.clone()), s(i.name.clone()), n(), s(i.def.clone())]));
-    out.push(("pg_indexes", table(&[("schemaname", TEXT), ("tablename", TEXT), ("indexname", TEXT), ("tablespace", TEXT), ("indexdef", TEXT)], listed)?));
-    out.push(("pg_views", table(&[("schemaname", TEXT), ("viewname", TEXT), ("viewowner", TEXT), ("definition", TEXT)],
-        rel_rows('v').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), s(r.sql.clone().unwrap_or_default())]).collect())?));
-    out.push(("pg_matviews", table(&[("schemaname", TEXT), ("matviewname", TEXT), ("matviewowner", TEXT), ("tablespace", TEXT), ("hasindexes", BOOL), ("ispopulated", BOOL), ("definition", TEXT)],
-        rel_rows('m').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), n(), b(!r.key.is_empty()), b(true), s("")]).collect())?));
-    out.push(("pg_proc", table(&[("oid", OID), ("proname", TEXT), ("pronamespace", OID), ("proowner", OID), ("prolang", OID), ("procost", DataType::Float32), ("prorows", DataType::Float32),
+    add!("pg_indexes", &[("schemaname", TEXT), ("tablename", TEXT), ("indexname", TEXT), ("tablespace", TEXT), ("indexdef", TEXT)], listed);
+    add!("pg_views", &[("schemaname", TEXT), ("viewname", TEXT), ("viewowner", TEXT), ("definition", TEXT)],
+        rel_rows('v').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), s(r.sql.clone().unwrap_or_default())]).collect());
+    add!("pg_matviews", &[("schemaname", TEXT), ("matviewname", TEXT), ("matviewowner", TEXT), ("tablespace", TEXT), ("hasindexes", BOOL), ("ispopulated", BOOL), ("definition", TEXT)],
+        rel_rows('m').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), n(), b(!r.key.is_empty()), b(true), s("")]).collect());
+    add!("pg_proc", &[("oid", OID), ("proname", TEXT), ("pronamespace", OID), ("proowner", OID), ("prolang", OID), ("procost", DataType::Float32), ("prorows", DataType::Float32),
         ("provariadic", OID), ("prosupport", TEXT), ("prokind", TEXT), ("prosecdef", BOOL), ("proleakproof", BOOL), ("proisstrict", BOOL), ("proretset", BOOL), ("provolatile", TEXT),
         ("proparallel", TEXT), ("pronargs", INT2), ("pronargdefaults", INT2), ("prorettype", OID), ("proargtypes", list(OID)), ("proallargtypes", list(OID)), ("proargmodes", list(TEXT)),
-        ("proargnames", list(TEXT)), ("prosrc", TEXT), ("probin", TEXT), ("proconfig", list(TEXT)), ("proacl", list(TEXT))],
+        ("proargnames", list(TEXT)), ("proargdefaults", TEXT), ("protrftypes", list(OID)), ("prosrc", TEXT), ("probin", TEXT), ("prosqlbody", TEXT), ("proconfig", list(TEXT)), ("proacl", list(TEXT))],
         l.routines.iter().map(|(oid, schema, name, r)| {
             use crate::routines::Kind;
             let kind = match r.kind { Kind::Procedure => "p", _ => "f" };
@@ -608,48 +721,73 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
             let names: Vec<String> = r.params.iter().map(|p| p.name.clone()).collect();
             vec![o(*oid), s(name.clone()), o(schema_oid(schema)), o(owner), o(lang), f4(100.0), f4(if r.kind == Kind::Table { 1000.0 } else { 0.0 }), o(0), s("-"), s(kind), b(false), b(false), b(false),
                 b(r.kind == Kind::Table), s("v"), s("u"), i2(r.params.len() as i16), i2(r.params.iter().filter(|p| p.default.is_some()).count() as i16), o(rettype),
-                ScalarValue::List(ScalarValue::new_list_nullable(&args, &OID)), n(), n(), texts(&names), if crate::auth::shows_code() { s(r.body.clone()) } else { n() }, n(), n(), n()]
+                ScalarValue::List(ScalarValue::new_list_nullable(&args, &OID)), n(), n(), texts(&names), n(), n(), if crate::auth::shows_code() { s(r.body.clone()) } else { n() }, n(), n(), n(), n()]
         }).chain(type_functions().into_iter().map(|f| vec![o(oid("tf", &f)), s(f.clone()), o(11), o(10), o(12), f4(1.0), f4(0.0), o(0), s("-"), s("f"), b(false), b(false), b(true),
-            b(false), s("i"), s("s"), i2(1), i2(0), o(0), ScalarValue::List(ScalarValue::new_list_nullable(&[o(0)], &OID)), n(), n(), n(), s(f), n(), n(), n()])).collect())?));
-    out.push(("pg_database", table(&[("oid", OID), ("datname", TEXT), ("datdba", OID), ("encoding", INT4), ("datlocprovider", TEXT), ("datistemplate", BOOL), ("datallowconn", BOOL),
+            b(false), s("i"), s("s"), i2(1), i2(0), o(0), ScalarValue::List(ScalarValue::new_list_nullable(&[o(0)], &OID)), n(), n(), n(), n(), n(), s(f), n(), n(), n(), n()])).collect());
+    add!("pg_database", &[("oid", OID), ("datname", TEXT), ("datdba", OID), ("encoding", INT4), ("datlocprovider", TEXT), ("datistemplate", BOOL), ("datallowconn", BOOL),
         ("datconnlimit", INT4), ("datfrozenxid", OID), ("datminmxid", OID), ("dattablespace", OID), ("datcollate", TEXT), ("datctype", TEXT), ("daticulocale", TEXT), ("daticurules", TEXT),
         ("datcollversion", TEXT), ("datacl", list(TEXT))],
-        l.databases.iter().map(|d| vec![o(if *d == l.database { 16384 } else { oid("db", d) }), s(d.clone()), o(owner), i4(6), s("c"), b(false), b(true), i4(-1), o(0), o(0), o(1663), s("C.UTF-8"), s("C.UTF-8"), n(), n(), n(), n()]).collect())?));
-    let roles = [(10u32, "pondra", true), (oid("u", &l.user), l.user.as_str(), l.user == "admin")];
-    let roles: Vec<_> = roles.iter().filter(|(o, n, _)| *o == 10 || *n != "pondra").collect();
-    out.push(("pg_roles", table(&[("oid", OID), ("rolname", TEXT), ("rolsuper", BOOL), ("rolinherit", BOOL), ("rolcreaterole", BOOL), ("rolcreatedb", BOOL), ("rolcanlogin", BOOL),
+        l.databases.iter().map(|d| vec![o(if *d == l.database { 16384 } else { oid("db", d) }), s(d.clone()), o(owner), i4(6), s("c"), b(false), b(true), i4(-1), o(0), o(0), o(1663), s("C.UTF-8"), s("C.UTF-8"), n(), n(), n(), n()]).collect());
+    let roles = role_rows(l);
+    add!("pg_roles", &[("oid", OID), ("rolname", TEXT), ("rolsuper", BOOL), ("rolinherit", BOOL), ("rolcreaterole", BOOL), ("rolcreatedb", BOOL), ("rolcanlogin", BOOL),
         ("rolreplication", BOOL), ("rolconnlimit", INT4), ("rolpassword", TEXT), ("rolvaliduntil", TEXT), ("rolbypassrls", BOOL), ("rolconfig", list(TEXT))],
-        roles.iter().map(|(oid, name, sup)| vec![o(*oid), s(*name), b(*sup), b(true), b(*sup), b(*sup), b(true), b(false), i4(-1), s("********"), n(), b(false), n()]).collect())?));
-    out.push(("pg_user", table(&[("usename", TEXT), ("usesysid", OID), ("usecreatedb", BOOL), ("usesuper", BOOL), ("userepl", BOOL), ("usebypassrls", BOOL), ("passwd", TEXT), ("valuntil", TEXT), ("useconfig", list(TEXT))],
-        roles.iter().map(|(oid, name, sup)| vec![s(*name), o(*oid), b(*sup), b(*sup), b(false), b(false), s("********"), n(), n()]).collect())?));
-    out.push(("pg_settings", table(&[("name", TEXT), ("setting", TEXT), ("unit", TEXT), ("category", TEXT), ("short_desc", TEXT), ("context", TEXT), ("vartype", TEXT), ("source", TEXT)],
-        SETTINGS.iter().map(|(k, v)| vec![s(*k), s(*v), n(), s("Pondra"), s(""), s("user"), s("string"), s("default")]).collect())?));
-    out.push(("pg_am", table(&[("oid", OID), ("amname", TEXT), ("amhandler", TEXT), ("amtype", TEXT)], vec![vec![o(2), s("heap"), s("heap_tableam_handler"), s("t")], vec![o(403), s("btree"), s("bthandler"), s("i")]])?));
-    out.push(("pg_tablespace", table(&[("oid", OID), ("spcname", TEXT), ("spcowner", OID), ("spcacl", list(TEXT)), ("spcoptions", list(TEXT))], vec![vec![o(1663), s("pg_default"), o(owner), n(), n()]])?));
-    out.push(("pg_language", table(&[("oid", OID), ("lanname", TEXT), ("lanowner", OID), ("lanispl", BOOL), ("lanpltrusted", BOOL)],
-        vec![vec![o(12), s("internal"), o(owner), b(false), b(false)], vec![o(14), s("sql"), o(owner), b(false), b(true)], vec![o(13_000), s("python"), o(owner), b(true), b(false)]])?));
+        roles.iter().map(|(oid, name, sup, login)| vec![o(*oid), s(name.clone()), b(*sup), b(true), b(*sup), b(*sup), b(*login), b(false), i4(-1), s("********"), n(), b(false), n()]).collect());
+    add!("pg_user", &[("usename", TEXT), ("usesysid", OID), ("usecreatedb", BOOL), ("usesuper", BOOL), ("userepl", BOOL), ("usebypassrls", BOOL), ("passwd", TEXT), ("valuntil", TEXT), ("useconfig", list(TEXT))],
+        roles.iter().filter(|r| r.3).map(|(oid, name, sup, _)| vec![s(name.clone()), o(*oid), b(*sup), b(*sup), b(false), b(false), s("********"), n(), n()]).collect());
+    // Memberships: one row per role of each member, the role's oid even when the role isn't listed.
+    let memberships: Vec<Vec<ScalarValue>> = l.members.iter().flat_map(|m| m.roles.iter().map(move |r| {
+        vec![o(oid("am", &format!("{}/{r}", m.name))), o(role_oid(r)), o(role_oid(&m.name)), o(owner), b(false), b(true), b(true)]
+    })).collect();
+    add!("pg_auth_members", &[("oid", OID), ("roleid", OID), ("member", OID), ("grantor", OID), ("admin_option", BOOL), ("inherit_option", BOOL), ("set_option", BOOL)], memberships);
+    // (boot_val and reset_val are the setting: nothing here changes it from its default)
+    add!("pg_settings", &[("name", TEXT), ("setting", TEXT), ("unit", TEXT), ("category", TEXT), ("short_desc", TEXT), ("extra_desc", TEXT), ("context", TEXT), ("vartype", TEXT),
+        ("source", TEXT), ("min_val", TEXT), ("max_val", TEXT), ("enumvals", list(TEXT)), ("boot_val", TEXT), ("reset_val", TEXT), ("sourcefile", TEXT), ("sourceline", INT4), ("pending_restart", BOOL)],
+        SETTINGS.iter().map(|(k, v)| vec![s(*k), s(*v), n(), s("Pondra"), s(""), n(), s("user"), s("string"), s("default"), n(), n(), n(), s(*v), s(*v), n(), n(), b(false)]).collect());
+    add!("pg_am", &[("oid", OID), ("amname", TEXT), ("amhandler", TEXT), ("amtype", TEXT)], vec![vec![o(2), s("heap"), s("heap_tableam_handler"), s("t")], vec![o(403), s("btree"), s("bthandler"), s("i")]]);
+    add!("pg_tablespace", &[("oid", OID), ("spcname", TEXT), ("spcowner", OID), ("spcacl", list(TEXT)), ("spcoptions", list(TEXT))], vec![vec![o(1663), s("pg_default"), o(owner), n(), n()]]);
+    // (no validator or inline handler here, and no privileges set: their OIDs are 0 and the list NULL)
+    add!("pg_language", &[("oid", OID), ("lanname", TEXT), ("lanowner", OID), ("lanispl", BOOL), ("lanpltrusted", BOOL), ("lanplcallfoid", OID), ("laninline", OID),
+        ("lanvalidator", OID), ("lanacl", list(TEXT))],
+        vec![vec![o(12), s("internal"), o(owner), b(false), b(false), o(0), o(0), o(0), n()], vec![o(14), s("sql"), o(owner), b(false), b(true), o(0), o(0), o(0), n()],
+            vec![o(13_000), s("python"), o(owner), b(true), b(false), o(0), o(0), o(0), n()]]);
     // Present, and empty: nothing in Pondra is one of these.
     for (name, cols) in [
         ("pg_shdescription", vec![("objoid", OID), ("classoid", OID), ("description", TEXT)]),
         ("pg_depend", vec![("classid", OID), ("objid", OID), ("objsubid", INT4), ("refclassid", OID), ("refobjid", OID), ("refobjsubid", INT4), ("deptype", TEXT)]),
         ("pg_rewrite", vec![("oid", OID), ("rulename", TEXT), ("ev_class", OID), ("ev_type", TEXT), ("ev_enabled", TEXT), ("is_instead", BOOL), ("ev_qual", TEXT), ("ev_action", TEXT)]),
         ("pg_inherits", vec![("inhrelid", OID), ("inhparent", OID), ("inhseqno", INT4), ("inhdetachpending", BOOL)]),
-        ("pg_collation", vec![("oid", OID), ("collname", TEXT), ("collnamespace", OID), ("collowner", OID), ("collprovider", TEXT), ("collisdeterministic", BOOL), ("collencoding", INT4), ("collcollate", TEXT), ("collctype", TEXT)]),
+        ("pg_collation", vec![("oid", OID), ("collname", TEXT), ("collnamespace", OID), ("collowner", OID), ("collprovider", TEXT), ("collisdeterministic", BOOL), ("collencoding", INT4), ("collcollate", TEXT), ("collctype", TEXT),
+            ("colliculocale", TEXT), ("collicurules", TEXT), ("collversion", TEXT)]),
         ("pg_extension", vec![("oid", OID), ("extname", TEXT), ("extowner", OID), ("extnamespace", OID), ("extrelocatable", BOOL), ("extversion", TEXT), ("extconfig", list(OID)), ("extcondition", list(TEXT))]),
         ("pg_range", vec![("rngtypid", OID), ("rngsubtype", OID), ("rngmultitypid", OID), ("rngcollation", OID), ("rngsubopc", OID), ("rngcanonical", TEXT), ("rngsubdiff", TEXT)]),
-        ("pg_trigger", vec![("oid", OID), ("tgrelid", OID), ("tgparentid", OID), ("tgname", TEXT), ("tgfoid", OID), ("tgtype", INT2), ("tgenabled", TEXT), ("tgisinternal", BOOL), ("tgconstraint", OID)]),
+        ("pg_trigger", vec![("oid", OID), ("tgrelid", OID), ("tgparentid", OID), ("tgname", TEXT), ("tgfoid", OID), ("tgtype", INT2), ("tgenabled", TEXT), ("tgisinternal", BOOL),
+            ("tgconstrrelid", OID), ("tgconstrindid", OID), ("tgconstraint", OID), ("tgdeferrable", BOOL), ("tginitdeferred", BOOL), ("tgnargs", INT2), ("tgattr", list(INT2)),
+            ("tgargs", TEXT), ("tgqual", TEXT), ("tgoldtable", TEXT), ("tgnewtable", TEXT)]),
         ("pg_foreign_table", vec![("ftrelid", OID), ("ftserver", OID), ("ftoptions", list(TEXT))]),
         ("pg_partitioned_table", vec![("partrelid", OID), ("partstrat", TEXT), ("partnatts", INT2), ("partdefid", OID), ("partattrs", list(INT2))]),
         ("pg_policy", vec![("oid", OID), ("polname", TEXT), ("polrelid", OID), ("polcmd", TEXT), ("polpermissive", BOOL), ("polroles", list(OID)), ("polqual", TEXT), ("polwithcheck", TEXT)]),
         ("pg_statistic_ext", vec![("oid", OID), ("stxrelid", OID), ("stxname", TEXT), ("stxnamespace", OID), ("stxowner", OID), ("stxkeys", list(INT2)), ("stxkind", list(TEXT))]),
         ("pg_publication", vec![("oid", OID), ("pubname", TEXT), ("pubowner", OID), ("puballtables", BOOL)]),
-        ("pg_event_trigger", vec![("oid", OID), ("evtname", TEXT), ("evtevent", TEXT), ("evtowner", OID), ("evtfoid", OID), ("evtenabled", TEXT)]),
+        ("pg_event_trigger", vec![("oid", OID), ("evtname", TEXT), ("evtevent", TEXT), ("evtowner", OID), ("evtfoid", OID), ("evtenabled", TEXT), ("evttags", list(TEXT))]),
         ("pg_cast", vec![("oid", OID), ("castsource", OID), ("casttarget", OID), ("castfunc", OID), ("castcontext", TEXT), ("castmethod", TEXT)]),
         ("pg_opclass", vec![("oid", OID), ("opcmethod", OID), ("opcname", TEXT), ("opcnamespace", OID), ("opcowner", OID), ("opcfamily", OID), ("opcintype", OID), ("opcdefault", BOOL), ("opckeytype", OID)]),
-        ("pg_stat_activity", vec![("datid", OID), ("datname", TEXT), ("pid", INT4), ("usename", TEXT), ("application_name", TEXT), ("client_addr", TEXT), ("state", TEXT), ("query", TEXT)]),
+        ("pg_stat_activity", vec![("datid", OID), ("datname", TEXT), ("pid", INT4), ("leader_pid", INT4), ("usesysid", OID), ("usename", TEXT), ("application_name", TEXT),
+            ("client_addr", TEXT), ("client_hostname", TEXT), ("client_port", INT4), ("backend_start", timestamptz()), ("xact_start", timestamptz()), ("query_start", timestamptz()),
+            ("state_change", timestamptz()), ("wait_event_type", TEXT), ("wait_event", TEXT), ("state", TEXT), ("backend_xid", OID), ("backend_xmin", OID), ("query_id", INT8),
+            ("query", TEXT), ("backend_type", TEXT)]),
+        ("pg_policies", vec![("schemaname", TEXT), ("tablename", TEXT), ("policyname", TEXT), ("permissive", TEXT), ("roles", list(TEXT)), ("cmd", TEXT), ("qual", TEXT), ("with_check", TEXT)]),
+        ("pg_default_acl", vec![("oid", OID), ("defaclrole", OID), ("defaclnamespace", OID), ("defaclobjtype", TEXT), ("defaclacl", list(TEXT))]),
+        ("pg_db_role_setting", vec![("setdatabase", OID), ("setrole", OID), ("setconfig", list(TEXT))]),
+        ("pg_aggregate", vec![("aggfnoid", TEXT), ("aggkind", TEXT), ("aggnumdirectargs", INT2), ("aggtransfn", TEXT), ("aggfinalfn", TEXT), ("aggcombinefn", TEXT), ("aggserialfn", TEXT),
+            ("aggdeserialfn", TEXT), ("aggmtransfn", TEXT), ("aggminvtransfn", TEXT), ("aggmfinalfn", TEXT), ("aggfinalextra", BOOL), ("aggmfinalextra", BOOL), ("aggfinalmodify", TEXT),
+            ("aggmfinalmodify", TEXT), ("aggsortop", OID), ("aggtranstype", OID), ("aggtransspace", INT4), ("aggmtranstype", OID), ("aggmtransspace", INT4), ("agginitval", TEXT), ("aggminitval", TEXT)]),
+        ("pg_conversion", vec![("oid", OID), ("conname", TEXT), ("connamespace", OID), ("conowner", OID), ("conforencoding", INT4), ("contoencoding", INT4), ("conproc", TEXT), ("condefault", BOOL)]),
+        ("pg_foreign_data_wrapper", vec![("oid", OID), ("fdwname", TEXT), ("fdwowner", OID), ("fdwhandler", OID), ("fdwvalidator", OID), ("fdwacl", list(TEXT)), ("fdwoptions", list(TEXT))]),
+        ("pg_foreign_server", vec![("oid", OID), ("srvname", TEXT), ("srvowner", OID), ("srvfdw", OID), ("srvtype", TEXT), ("srvversion", TEXT), ("srvacl", list(TEXT)), ("srvoptions", list(TEXT))]),
+        ("pg_available_extensions", vec![("name", TEXT), ("default_version", TEXT), ("installed_version", TEXT), ("comment", TEXT)]),
     ] {
         let cols: Vec<(&str, DataType)> = cols;
-        out.push((name, table(&cols, vec![])?));
+        add!(name, &cols, vec![]);
     }
     Ok(out)
 }
@@ -661,15 +799,23 @@ pub const SETTINGS: &[(&str, &str)] = &[("server_version", "16.0"), ("server_ver
     ("is_superuser", "off"), ("application_name", ""), ("default_transaction_read_only", "off"), ("lc_collate", "C.UTF-8"), ("lc_ctype", "C.UTF-8")];
 
 /// The SQL standard's `information_schema`, Postgres's way: its types by Postgres's names.
-fn information_schema(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
+fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
     let db = || s(l.database.clone());
     let yes = |v: bool| s(if v { "YES" } else { "NO" });
     let mut out = vec![];
-    out.push(("schemata", table(&[("catalog_name", TEXT), ("schema_name", TEXT), ("schema_owner", TEXT), ("default_character_set_catalog", TEXT), ("default_character_set_schema", TEXT),
-        ("default_character_set_name", TEXT), ("sql_path", TEXT)], l.schemas.iter().map(|(_, sc)| vec![db(), s(sc.clone()), s(l.user.clone()), n(), n(), n(), n()]).collect())?));
-    out.push(("tables", table(&[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("table_type", TEXT), ("self_referencing_column_name", TEXT), ("reference_generation", TEXT),
+    // (only the tables the statement names are built: a catalog query pays for what it reads)
+    macro_rules! add {
+        ($name:expr, $columns:expr, $rows:expr) => {
+            if want($name) {
+                out.push(($name, table($columns, $rows)?));
+            }
+        };
+    }
+    add!("schemata", &[("catalog_name", TEXT), ("schema_name", TEXT), ("schema_owner", TEXT), ("default_character_set_catalog", TEXT), ("default_character_set_schema", TEXT),
+        ("default_character_set_name", TEXT), ("sql_path", TEXT)], l.schemas.iter().map(|(_, sc)| vec![db(), s(sc.clone()), s(l.user.clone()), n(), n(), n(), n()]).collect());
+    add!("tables", &[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("table_type", TEXT), ("self_referencing_column_name", TEXT), ("reference_generation", TEXT),
         ("user_defined_type_catalog", TEXT), ("user_defined_type_schema", TEXT), ("user_defined_type_name", TEXT), ("is_insertable_into", TEXT), ("is_typed", TEXT), ("commit_action", TEXT)],
-        l.rels.iter().map(|r| vec![db(), s(r.schema.clone()), s(r.name.clone()), s(if r.kind == 'v' { "VIEW" } else { "BASE TABLE" }), n(), n(), n(), n(), n(), yes(r.kind == 'r'), s("NO"), n()]).collect())?));
+        l.rels.iter().map(|r| vec![db(), s(r.schema.clone()), s(r.name.clone()), s(if r.kind == 'v' { "VIEW" } else { "BASE TABLE" }), n(), n(), n(), n(), n(), yes(r.kind == 'r'), s("NO"), n()]).collect());
     let mut cols = vec![];
     for r in &l.rels {
         for (i, (name, t, not_null, default)) in r.columns.iter().enumerate() {
@@ -706,16 +852,16 @@ fn information_schema(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
                 n(), n(), n(), n(), s((i + 1).to_string()), s("NO"), yes(identity.is_some()), generation, start, increment, maximum, minimum, cycle, s("NEVER"), n(), yes(r.kind == 'r')]);
         }
     }
-    out.push(("columns", table(&[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("column_name", TEXT), ("ordinal_position", INT4), ("column_default", TEXT),
+    add!("columns", &[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("column_name", TEXT), ("ordinal_position", INT4), ("column_default", TEXT),
         ("is_nullable", TEXT), ("data_type", TEXT), ("character_maximum_length", INT4), ("character_octet_length", INT4), ("numeric_precision", INT4), ("numeric_precision_radix", INT4),
         ("numeric_scale", INT4), ("datetime_precision", INT4), ("interval_type", TEXT), ("interval_precision", INT4), ("character_set_catalog", TEXT), ("character_set_schema", TEXT),
         ("character_set_name", TEXT), ("collation_catalog", TEXT), ("collation_schema", TEXT), ("collation_name", TEXT), ("domain_catalog", TEXT), ("domain_schema", TEXT), ("domain_name", TEXT),
         ("udt_catalog", TEXT), ("udt_schema", TEXT), ("udt_name", TEXT), ("scope_catalog", TEXT), ("scope_schema", TEXT), ("scope_name", TEXT), ("maximum_cardinality", INT4),
         ("dtd_identifier", TEXT), ("is_self_referencing", TEXT), ("is_identity", TEXT), ("identity_generation", TEXT), ("identity_start", TEXT), ("identity_increment", TEXT),
-        ("identity_maximum", TEXT), ("identity_minimum", TEXT), ("identity_cycle", TEXT), ("is_generated", TEXT), ("generation_expression", TEXT), ("is_updatable", TEXT)], cols)?));
-    out.push(("views", table(&[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("view_definition", TEXT), ("check_option", TEXT), ("is_updatable", TEXT),
+        ("identity_maximum", TEXT), ("identity_minimum", TEXT), ("identity_cycle", TEXT), ("is_generated", TEXT), ("generation_expression", TEXT), ("is_updatable", TEXT)], cols);
+    add!("views", &[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("view_definition", TEXT), ("check_option", TEXT), ("is_updatable", TEXT),
         ("is_insertable_into", TEXT), ("is_trigger_updatable", TEXT), ("is_trigger_deletable", TEXT), ("is_trigger_insertable_into", TEXT)],
-        l.rels.iter().filter(|r| r.kind == 'v').map(|r| vec![db(), s(r.schema.clone()), s(r.name.clone()), s(r.sql.clone().unwrap_or_default()), s("NONE"), s("NO"), s("NO"), s("NO"), s("NO"), s("NO")]).collect())?));
+        l.rels.iter().filter(|r| r.kind == 'v').map(|r| vec![db(), s(r.schema.clone()), s(r.name.clone()), s(r.sql.clone().unwrap_or_default()), s("NONE"), s("NO"), s("NO"), s("NO"), s("NO"), s("NO")]).collect());
     // Each table's key, then its declared constraints, as the standard lists them.
     let yes = |b: bool| s(if b { "YES" } else { "NO" });
     let keyed: Vec<&Rel> = l.rels.iter().filter(|r| !r.key.is_empty()).collect();
@@ -764,28 +910,60 @@ fn information_schema(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
             table_constraints.push(vec![db(), s(r.schema.clone()), s(name.clone()), db(), s(r.schema.clone()), s(r.name.clone()), s("CHECK"), s("NO"), s("NO"), s("YES"), n()]);
         }
     }
-    out.push(("table_constraints", table(&[("constraint_catalog", TEXT), ("constraint_schema", TEXT), ("constraint_name", TEXT), ("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT),
-        ("constraint_type", TEXT), ("is_deferrable", TEXT), ("initially_deferred", TEXT), ("enforced", TEXT), ("nulls_distinct", TEXT)], table_constraints)?));
-    out.push(("key_column_usage", table(&[("constraint_catalog", TEXT), ("constraint_schema", TEXT), ("constraint_name", TEXT), ("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT),
-        ("column_name", TEXT), ("ordinal_position", INT4), ("position_in_unique_constraint", INT4)], key_columns)?));
-    out.push(("routines", table(&[("specific_catalog", TEXT), ("specific_schema", TEXT), ("specific_name", TEXT), ("routine_catalog", TEXT), ("routine_schema", TEXT), ("routine_name", TEXT),
+    add!("table_constraints", &[("constraint_catalog", TEXT), ("constraint_schema", TEXT), ("constraint_name", TEXT), ("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT),
+        ("constraint_type", TEXT), ("is_deferrable", TEXT), ("initially_deferred", TEXT), ("enforced", TEXT), ("nulls_distinct", TEXT)], table_constraints);
+    add!("key_column_usage", &[("constraint_catalog", TEXT), ("constraint_schema", TEXT), ("constraint_name", TEXT), ("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT),
+        ("column_name", TEXT), ("ordinal_position", INT4), ("position_in_unique_constraint", INT4)], key_columns);
+    add!("routines", &[("specific_catalog", TEXT), ("specific_schema", TEXT), ("specific_name", TEXT), ("routine_catalog", TEXT), ("routine_schema", TEXT), ("routine_name", TEXT),
         ("routine_type", TEXT), ("data_type", TEXT), ("routine_body", TEXT), ("routine_definition", TEXT), ("external_language", TEXT), ("is_deterministic", TEXT)],
         l.routines.iter().map(|(oid, schema, name, r)| {
             let procedure = r.kind == crate::routines::Kind::Procedure;
             vec![db(), s(schema.clone()), s(format!("{name}_{oid}")), db(), s(schema.clone()), s(name.clone()), s(if procedure { "PROCEDURE" } else { "FUNCTION" }), r.returns.clone().map_or(n(), s),
                 s(if r.language == "python" { "EXTERNAL" } else { "SQL" }), if crate::auth::shows_code() { s(r.body.clone()) } else { n() }, s(if r.language.is_empty() { "SQL".to_string() } else { r.language.to_uppercase() }), s("NO")]
-        }).collect())?));
-    out.push(("sequences", table(&[("sequence_catalog", TEXT), ("sequence_schema", TEXT), ("sequence_name", TEXT), ("data_type", TEXT), ("numeric_precision", INT4),
+        }).collect());
+    add!("sequences", &[("sequence_catalog", TEXT), ("sequence_schema", TEXT), ("sequence_name", TEXT), ("data_type", TEXT), ("numeric_precision", INT4),
         ("numeric_precision_radix", INT4), ("numeric_scale", INT4), ("start_value", TEXT), ("minimum_value", TEXT), ("maximum_value", TEXT), ("increment", TEXT), ("cycle_option", TEXT)],
         l.sequences.iter().map(|q| {
             let (data_type, bits) = match q.shape.as_type { "SMALLINT" => ("smallint", 16), "INTEGER" => ("integer", 32), _ => ("bigint", 64) };
             vec![db(), s(q.schema.clone()), s(q.name.clone()), s(data_type), i4(bits), i4(2), i4(0), s(q.shape.start.to_string()), s(q.shape.min.to_string()),
                 s(q.shape.max.to_string()), s(q.shape.increment.to_string()), yes(q.shape.cycle)]
-        }).collect())?));
-    out.push(("referential_constraints", table(&[("constraint_catalog", TEXT), ("constraint_schema", TEXT), ("constraint_name", TEXT), ("unique_constraint_catalog", TEXT),
-        ("unique_constraint_schema", TEXT), ("unique_constraint_name", TEXT), ("match_option", TEXT), ("update_rule", TEXT), ("delete_rule", TEXT)], referential)?));
-    out.push(("constraint_column_usage", table(&[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("column_name", TEXT), ("constraint_catalog", TEXT),
-        ("constraint_schema", TEXT), ("constraint_name", TEXT)], used)?));
+        }).collect());
+    add!("referential_constraints", &[("constraint_catalog", TEXT), ("constraint_schema", TEXT), ("constraint_name", TEXT), ("unique_constraint_catalog", TEXT),
+        ("unique_constraint_schema", TEXT), ("unique_constraint_name", TEXT), ("match_option", TEXT), ("update_rule", TEXT), ("delete_rule", TEXT)], referential);
+    add!("constraint_column_usage", &[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("column_name", TEXT), ("constraint_catalog", TEXT),
+        ("constraint_schema", TEXT), ("constraint_name", TEXT)], used);
+    // Privileges, as each grantee holds them (`users.rs`): SELECT, INSERT, UPDATE and DELETE on a table
+    // name it, on a schema (every table of it) or on the lake; columns only with SELECT on a table. A
+    // table granted twice is one row. Routines have no privileges here.
+    let (mut tables_granted, mut columns_granted) = (BTreeSet::new(), BTreeSet::new()); // (grantee, schema, table, privilege or column)
+    for m in &l.members {
+        for g in m.grants.iter().filter(|g| ["select", "insert", "update", "delete"].contains(&g.privilege.as_str())) {
+            let relations: Vec<&Rel> = match &g.on {
+                On::Table(t) => {
+                    let (schema, table) = crate::ddl::split(t);
+                    l.rels.iter().filter(|r| r.schema == schema && r.name == table).collect()
+                }
+                On::Schema(schema) => l.rels.iter().filter(|r| r.schema == *schema).collect(),
+                On::Lake => l.rels.iter().collect(),
+                _ => vec![],
+            };
+            for r in relations.into_iter().filter(|r| r.schema != TEMP) {
+                if g.columns.is_empty() {
+                    tables_granted.insert((m.name.clone(), r.schema.clone(), r.name.clone(), g.privilege.to_uppercase()));
+                } else {
+                    columns_granted.extend(g.columns.iter().map(|c| (m.name.clone(), r.schema.clone(), r.name.clone(), c.clone())));
+                }
+            }
+        }
+    }
+    add!("table_privileges", &[("grantor", TEXT), ("grantee", TEXT), ("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("privilege_type", TEXT),
+        ("is_grantable", TEXT), ("with_hierarchy", TEXT)],
+        tables_granted.iter().map(|(grantee, schema, name, privilege)| vec![s(l.user.clone()), s(grantee.clone()), db(), s(schema.clone()), s(name.clone()), s(privilege.clone()), s("NO"), s("NO")]).collect());
+    add!("column_privileges", &[("grantor", TEXT), ("grantee", TEXT), ("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("column_name", TEXT),
+        ("privilege_type", TEXT), ("is_grantable", TEXT)],
+        columns_granted.iter().map(|(grantee, schema, name, column)| vec![s(l.user.clone()), s(grantee.clone()), db(), s(schema.clone()), s(name.clone()), s(column.clone()), s("SELECT"), s("NO")]).collect());
+    add!("routine_privileges", &[("grantor", TEXT), ("grantee", TEXT), ("specific_catalog", TEXT), ("specific_schema", TEXT), ("specific_name", TEXT), ("routine_catalog", TEXT),
+        ("routine_schema", TEXT), ("routine_name", TEXT), ("privilege_type", TEXT), ("is_grantable", TEXT)], vec![]);
     Ok(out)
 }
 
@@ -846,22 +1024,26 @@ impl ScalarUDFImpl for PgFn {
 }
 
 fn udf(name: &'static str, returns: fn(&[DataType]) -> DataType, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
-    let signature = Signature::one_of(vec![TypeSignature::Nullary, TypeSignature::VariadicAny], Volatility::Stable);
+    function(name, Signature::one_of(vec![TypeSignature::Nullary, TypeSignature::VariadicAny], Volatility::Stable), returns, body)
+}
+
+/// A function of Postgres's over whole columns: `body` gets every argument as an array of the rows' values.
+pub(crate) fn function(name: &'static str, signature: Signature, returns: fn(&[DataType]) -> DataType, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
     ScalarUDF::new_from_impl(PgFn { name, signature, returns, body: Arc::new(body) })
 }
 
 /// An argument as text (NULL where it is), whatever string or number type it came as.
-fn text_arg(a: &ArrayRef) -> datafusion::error::Result<Vec<Option<String>>> {
+pub(crate) fn text_arg(a: &ArrayRef) -> datafusion::error::Result<Vec<Option<String>>> {
     let c = datafusion::arrow::compute::cast(a, &DataType::Utf8)?;
     Ok(c.as_string::<i32>().iter().map(|v| v.map(str::to_string)).collect())
 }
 
-fn int_arg(a: &ArrayRef) -> datafusion::error::Result<Vec<Option<i64>>> {
+pub(crate) fn int_arg(a: &ArrayRef) -> datafusion::error::Result<Vec<Option<i64>>> {
     let c = datafusion::arrow::compute::cast(a, &DataType::Int64)?;
     Ok(c.as_primitive::<datafusion::arrow::datatypes::Int64Type>().iter().collect())
 }
 
-fn texts_out(v: impl IntoIterator<Item = Option<String>>) -> ArrayRef { Arc::new(StringArray::from_iter(v)) }
+pub(crate) fn texts_out(v: impl IntoIterator<Item = Option<String>>) -> ArrayRef { Arc::new(StringArray::from_iter(v)) }
 
 /// One argument's value of a row as JSON text: numbers and booleans bare, text quoted, NULL as `null`.
 fn json_of(a: &ArrayRef, i: usize) -> datafusion::error::Result<String> {
@@ -978,8 +1160,17 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
     for name in ["shobj_description", "pg_get_triggerdef", "pg_get_ruledef", "pg_get_partkeydef", "pg_get_statisticsobjdef"] {
         ctx.register_udf(udf(name, to_text, move |_, n| Ok(nulls(n))));
     }
+    // A role's oid names it. 10 is the session's user (every object's owner here, as before), and any
+    // other oid Postgres's "unknown".
     let who = l.user.clone();
-    ctx.register_udf(udf("pg_get_userbyid", to_text, move |a, n| Ok(texts_out((0..n).map(|i| if a.first().is_some_and(|c| c.is_null(i)) { None } else { Some(who.clone()) })))));
+    let names: BTreeMap<u32, String> = role_rows(&l).into_iter().map(|(id, name, ..)| (id, name)).collect();
+    ctx.register_udf(udf("pg_get_userbyid", to_text, move |a, n| {
+        let ids = int_arg(&a[0])?;
+        Ok(texts_out((0..n).map(|i| ids[i].map(|id| match id {
+            10 => who.clone(),
+            id => names.get(&(id as u32)).cloned().unwrap_or_else(|| format!("unknown (OID={id})")),
+        }))))
+    }));
     ctx.register_udf(udf("pg_encoding_to_char", to_text, |_, n| Ok(texts_out((0..n).map(|_| Some("UTF8".to_string()))))));
     ctx.register_udf(udf("pg_backend_pid", |_| DataType::Int32, |_, n| Ok(Arc::new(datafusion::arrow::array::Int32Array::from(vec![std::process::id() as i32; n.max(1)])))));
     ctx.register_udf(udf("current_setting", to_text, |a, n| {
@@ -990,10 +1181,6 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
     ctx.register_udf(udf("current_schemas", |_| list(DataType::Utf8), move |_, n| {
         let one = ScalarValue::List(ScalarValue::new_list_nullable(&on_path, &DataType::Utf8));
         Ok(ScalarValue::iter_to_array(std::iter::repeat_n(one, n.max(1)))?)
-    }));
-    ctx.register_udf(udf("quote_ident", to_text, |a, n| {
-        let v = text_arg(&a[0])?;
-        Ok(texts_out((0..n).map(|i| v[i].as_ref().map(|x| if x.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') { x.clone() } else { format!("\"{}\"", x.replace('"', "\"\"")) }))))
     }));
     ctx.register_udf(udf("pg_size_pretty", to_text, |a, n| {
         let v = int_arg(&a[0])?;
@@ -1133,6 +1320,29 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
     }
     ctx.register_udf(udf("pg_indexes_size", |_| DataType::Int64, |_, n| Ok(Arc::new(datafusion::arrow::array::Int64Array::from(vec![0; n])))));
     ctx.register_udf(udf("txid_current", |_| DataType::Int64, |_, n| Ok(Arc::new(datafusion::arrow::array::Int64Array::from(vec![1; n.max(1)])))));
+    // A database's size is its relations' bytes, for this database by oid or name and NULL for another.
+    // Pondra counts no scans, and every table is in the default tablespace.
+    let (here, bytes) = (l.database.clone(), l.rels.iter().map(|r| r.bytes as i64).sum::<i64>());
+    ctx.register_udf(udf("pg_database_size", |_| DataType::Int64, move |a, n| {
+        let this: Vec<bool> = match a[0].data_type().is_integer() {
+            true => int_arg(&a[0])?.iter().map(|id| *id == Some(16384)).collect(),
+            false => text_arg(&a[0])?.iter().map(|name| name.as_deref() == Some(here.as_str())).collect(),
+        };
+        Ok(Arc::new((0..n).map(|i| this[i].then_some(bytes)).collect::<datafusion::arrow::array::Int64Array>()))
+    }));
+    ctx.register_udf(udf("pg_stat_get_numscans", |_| DataType::Int64, |_, n| Ok(Arc::new(datafusion::arrow::array::Int64Array::from(vec![0; n])))));
+    ctx.register_udf(udf("pg_tablespace_location", to_text, |_, n| Ok(texts_out((0..n).map(|_| Some(String::new()))))));
+    // A routine's CREATE statement, as `SHOW CREATE` writes it. A caller who may not see code gets NULL.
+    let code = crate::auth::shows_code();
+    let lk = l.clone();
+    ctx.register_udf(udf("pg_get_functiondef", to_text, move |a, n| {
+        let ids = int_arg(&a[0])?;
+        Ok(texts_out((0..n).map(|i| {
+            let (_, schema, name, r) = lk.routines.iter().find(|(id, ..)| Some(*id as i64) == ids[i])?;
+            let lake_name = if schema == crate::ddl::PUBLIC { name.clone() } else { format!("{schema}.{name}") };
+            code.then(|| crate::objects::routine_sql(&crate::objects::name_sql(&lake_name), r))
+        })))
+    }));
     // SQLAlchemy's identity query: its options as JSON, and the sequence a column counts by.
     ctx.register_udf(udf("json_build_object", to_text, |a, n| {
         let rows = (0..n).map(|i| json_build(a, i)).collect::<datafusion::error::Result<Vec<_>>>()?;
@@ -1155,15 +1365,18 @@ pub async fn register(ctx: &SessionContext, lake: &Lake, user: &str, sql: &str) 
     let lower = sql.to_lowercase();
     // (a view's columns: its `attnum`s and a key's `conkey`, which name them, need them too)
     let columns = ["pg_attribute", "pg_constraint", "information_schema", "columns"].iter().any(|w| lower.contains(w));
-    let l = Arc::new(lakes(lake, user, columns).await?);
+    // (and the log's rows only for SQL that sizes tables: they cost a read of the log tail's entries)
+    let counts = ["n_live_tup", "reltuples", "pg_stat"].iter().any(|w| lower.contains(w));
+    let l = Arc::new(lakes(lake, user, columns, counts).await?);
     let catalog = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog");
     let pg = Arc::new(MemorySchemaProvider::new());
-    for (name, t) in tables(&l)? {
+    let want = |t: &str| lower.contains(t); // (a table's name, as the rewritten statement has it)
+    for (name, t) in tables(&l, &want)? {
         pg.register_table(name.to_string(), t)?;
     }
     catalog.register_schema("pg_catalog", pg)?;
     let info = Arc::new(MemorySchemaProvider::new());
-    for (name, t) in information_schema(&l)? {
+    for (name, t) in information_schema(&l, &want)? {
         info.register_table(name.to_string(), t)?;
     }
     catalog.register_schema(PG_INFO, info)?;
@@ -1172,7 +1385,8 @@ pub async fn register(ctx: &SessionContext, lake: &Lake, user: &str, sql: &str) 
 }
 
 const PG_INFO: &str = "pg_information_schema"; // (DataFusion keeps `information_schema` to itself)
-const INFO_TABLES: &[&str] = &["schemata", "tables", "columns", "views", "table_constraints", "key_column_usage", "routines", "referential_constraints", "constraint_column_usage", "sequences"];
+const INFO_TABLES: &[&str] = &["schemata", "tables", "columns", "views", "table_constraints", "key_column_usage", "routines", "referential_constraints", "constraint_column_usage", "sequences",
+    "table_privileges", "column_privileges", "routine_privileges"];
 
 // ---------------------------------------------------------------- Postgres's SQL, said DataFusion's way
 
@@ -1184,9 +1398,28 @@ pub fn rewrite(sql: &str, user: &str, schema: &str) -> String {
     let Ok(mut stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else { return sql.to_string() };
     let mut r = Rewriter { user: if user.is_empty() { "pondra" } else { user }, schema, expanded: vec![] };
     for s in stmts.iter_mut() {
+        // (a table a statement makes or writes keeps its name: Postgres makes `CREATE TABLE
+        // pg_stat_user_tables (…)` in the current schema; only reads look in pg_catalog first)
+        let written = target(s).cloned();
         let _ = s.visit(&mut r);
+        if let (Some(name), Some(t)) = (written, target(s)) {
+            *t = name;
+        }
     }
     stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join("; ")
+}
+
+/// The table a statement makes, alters or inserts into.
+fn target(s: &mut ast::Statement) -> Option<&mut ast::ObjectName> {
+    match s {
+        ast::Statement::CreateTable(c) => Some(&mut c.name),
+        ast::Statement::AlterTable(a) => Some(&mut a.name),
+        ast::Statement::Insert(i) => match &mut i.table {
+            ast::TableObject::TableName(n) => Some(n),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 struct Rewriter<'a> {
@@ -1206,13 +1439,13 @@ fn regproc(e: &ast::Expr) -> bool {
         ast::Expr::CompoundIdentifier(p) => p.last().map(|i| i.value.to_lowercase()).unwrap_or_default(),
         _ => return false,
     };
-    matches!(name.as_str(), "typinput" | "typoutput" | "typreceive" | "typsend" | "typmodin" | "typmodout" | "typanalyze" | "aggfnoid" | "oprcode")
+    matches!(name.as_str(), "typinput" | "typoutput" | "typreceive" | "typsend" | "typmodin" | "typmodout" | "typanalyze" | "typsubscript" | "aggfnoid" | "oprcode")
 }
 
 fn boolean(e: &ast::Expr) -> bool {
     static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> = std::sync::LazyLock::new(|| {
-        let empty = Lakes { database: String::new(), databases: vec![], user: String::new(), schemas: vec![], rels: vec![], sequences: vec![], types: vec![], routines: vec![], indexes: vec![], visible: vec![] };
-        tables(&empty).unwrap_or_default().iter().flat_map(|(_, t)| datafusion::datasource::TableProvider::schema(t.as_ref()).fields().iter().filter(|f| *f.data_type() == DataType::Boolean).map(|f| f.name().clone()).collect::<Vec<_>>()).collect()
+        let empty = Lakes { database: String::new(), databases: vec![], user: String::new(), schemas: vec![], rels: vec![], sequences: vec![], types: vec![], routines: vec![], indexes: vec![], visible: vec![], members: vec![] };
+        tables(&empty, &|_| true).unwrap_or_default().iter().flat_map(|(_, t)| datafusion::datasource::TableProvider::schema(t.as_ref()).fields().iter().filter(|f| *f.data_type() == DataType::Boolean).map(|f| f.name().clone()).collect::<Vec<_>>()).collect()
     });
     let name = match e {
         ast::Expr::Identifier(i) => i.value.to_lowercase(),
@@ -1262,7 +1495,8 @@ fn vector_as_text(item: &mut ast::SelectItem) {
 
 /// Catalog tables that are always empty here: a subquery that joins one gives no row.
 const EMPTY: &[&str] = &["pg_publication_namespace", "pg_publication_rel", "pg_shdescription", "pg_depend", "pg_rewrite", "pg_inherits", "pg_collation", "pg_extension", "pg_range", "pg_trigger",
-    "pg_foreign_table", "pg_partitioned_table", "pg_policy", "pg_statistic_ext", "pg_publication", "pg_event_trigger", "pg_cast", "pg_opclass"];
+    "pg_foreign_table", "pg_partitioned_table", "pg_policy", "pg_statistic_ext", "pg_publication", "pg_event_trigger", "pg_cast", "pg_opclass", "pg_stat_activity", "pg_policies",
+    "pg_default_acl", "pg_db_role_setting", "pg_aggregate", "pg_conversion", "pg_foreign_data_wrapper", "pg_foreign_server", "pg_available_extensions"];
 
 /// A scalar subquery DataFusion can't decorrelate as Postgres writes it, said another way: NULL if
 /// it joins an always-empty catalog table; its conditions on the outer row alone taken out of it
@@ -1403,6 +1637,31 @@ fn expr(sql: &str) -> Option<ast::Expr> {
     Parser::new(&PostgreSqlDialect {}).try_with_sql(sql).ok()?.parse_expr().ok()
 }
 
+/// One relation of a FROM, from its text (`(SELECT …) AS a`).
+fn factor(sql: &str) -> Option<ast::TableFactor> {
+    use datafusion::sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+    let q = Parser::new(&PostgreSqlDialect {}).try_with_sql(&format!("SELECT * FROM {sql}")).ok()?.parse_query().ok()?;
+    match *q.body {
+        ast::SetExpr::Select(s) => s.from.into_iter().next().map(|t| t.relation),
+        _ => None,
+    }
+}
+
+/// Scalar functions clients call in a FROM, as Postgres lets them: one row, its value a column named
+/// for the alias (Grafana lists tables with `FROM …, string_to_array(current_setting('search_path'), ',') s`).
+const SCALAR_IN_FROM: &[&str] = &["string_to_array", "regexp_split_to_array", "current_schemas", "current_setting"];
+
+/// Table functions of one column, which Postgres names for its alias: `generate_series(1, 3) AS i`
+/// gives a column `i` (DataFusion's is `value`).
+const ONE_COLUMN: &[&str] = &["generate_series"];
+
+/// A function's last name, lower-cased (`pg_catalog.aclexplode` is `aclexplode`).
+fn last_name(name: &ast::ObjectName) -> String { name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.to_lowercase()).unwrap_or_default() }
+
+/// `aclexplode(acl)`'s rows, of which there are none: every ACL in Pondra's catalog is NULL (its
+/// grants are in `pondra.grants` and `information_schema.table_privileges`).
+const NO_ACL: &str = "SELECT CAST(NULL AS INT UNSIGNED) AS grantor, CAST(NULL AS INT UNSIGNED) AS grantee, CAST(NULL AS TEXT) AS privilege_type, CAST(NULL AS BOOLEAN) AS is_grantable WHERE false";
+
 /// `ARRAY(SELECT x FROM … WHERE … ORDER BY k)` as `(SELECT array_agg(x ORDER BY k) FROM … WHERE …)`.
 /// DataFusion can't plan a derived table of such a query when its filter uses the outer row (psql's
 /// `\dT+` filters `pg_enum` on the outer `t.oid`: "No field named __a.enumtypid"), and it plans the
@@ -1442,6 +1701,36 @@ impl VisitorMut for Rewriter<'_> {
         };
         if let Some(parts) = fixed {
             *name = ast::ObjectName::from(parts.into_iter().map(ast::Ident::new).collect::<Vec<_>>());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, f: &mut ast::TableFactor) -> ControlFlow<()> {
+        let replaced = match f {
+            ast::TableFactor::Table { name, args: Some(args), alias, .. } => match last_name(name).as_str() {
+                n if ONE_COLUMN.contains(&n) => {
+                    if let Some(a) = alias.as_mut().filter(|a| a.columns.is_empty()) {
+                        a.columns = vec![ast::TableAliasColumnDef::from_name(a.name.value.clone())];
+                    }
+                    None
+                }
+                n if SCALAR_IN_FROM.contains(&n) => {
+                    let named = alias.as_ref().map_or_else(|| ast::Ident::new(n), |a| a.name.clone());
+                    let column = alias.as_ref().and_then(|a| a.columns.first()).map_or_else(|| named.clone(), |c| c.name.clone());
+                    let given = args.args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+                    factor(&format!("(SELECT {name}({given}) AS {column}) AS {named}"))
+                }
+                "aclexplode" => factor(&format!("({NO_ACL}) AS {}", alias.as_ref().map_or("aclexplode".into(), |a| a.name.to_string()))),
+                _ => None,
+            },
+            // (pgjdbc's and DBeaver's `CROSS JOIN LATERAL aclexplode(c.relacl) AS acl`)
+            ast::TableFactor::Function { name, alias, .. } if last_name(name) == "aclexplode" => {
+                factor(&format!("({NO_ACL}) AS {}", alias.as_ref().map_or("aclexplode".into(), |a| a.name.to_string())))
+            }
+            _ => None,
+        };
+        if let Some(r) = replaced {
+            *f = r;
         }
         ControlFlow::Continue(())
     }
@@ -1498,6 +1787,12 @@ impl VisitorMut for Rewriter<'_> {
                     _ => None,
                 }
             }
+            // (DBeaver's `(aclexplode(relacl)).grantee`: no ACL, so no grantee, as `NO_ACL` says)
+            ast::Expr::Function(f) if last_name(&f.name) == "aclexplode" => match field.as_str() {
+                "grantor" | "grantee" => expr("CAST(NULL AS INT UNSIGNED)"),
+                "is_grantable" => expr("CAST(NULL AS BOOLEAN)"),
+                _ => expr("CAST(NULL AS TEXT)"),
+            },
             // (pgjdbc's `(result.keys).x`: the element itself, for a column `_pg_expandarray` made; any
             // other `(x).f` is a struct's field, as friendly.rs has it)
             x @ (ast::Expr::CompoundIdentifier(_) | ast::Expr::Identifier(_)) if field == "x" && column_name(x).is_some_and(|n| self.expanded.contains(&n)) => Some(x.clone()),
@@ -1512,6 +1807,19 @@ impl VisitorMut for Rewriter<'_> {
     fn post_visit_expr(&mut self, e: &mut ast::Expr) -> ControlFlow<()> {
         let replaced = match e {
             ast::Expr::Collate { expr, .. } => Some((**expr).clone()),
+            // `CASE WHEN x IN (SELECT …)` (Grafana's tables on the search path): DataFusion takes an IN over
+            // a subquery only in a filter, so here it asks whether the subquery's values, gathered, hold x.
+            // Only in a WHEN, where NULL and false alike go on to the next branch.
+            ast::Expr::Case { conditions, .. } => {
+                for w in conditions.iter_mut() {
+                    if let ast::Expr::InSubquery { expr: x, subquery, negated: false } = &w.condition {
+                        if let Some(held) = expr(&format!("array_has((SELECT array_agg(pondra_in) FROM ({subquery}) AS pondra_in_q (pondra_in)), {x})")) {
+                            w.condition = held;
+                        }
+                    }
+                }
+                None
+            }
             // `typreceive != 0` (ADBC's): a function (`regproc`) column against 0, Postgres's "none",
             // which as text is `-`.
             // `pg_proc.oid = typ.typreceive` (Npgsql's): joined by the function's name, which is
@@ -1624,7 +1932,7 @@ impl VisitorMut for Rewriter<'_> {
                     _ => vec![],
                 };
                 match parts.last().map(String::as_str) {
-                    Some("current_user" | "session_user" | "current_role") if bare => Some(ast::Expr::Value(ast::Value::SingleQuotedString(self.user.to_string()).into())),
+                    Some("current_user" | "session_user" | "current_role" | "user") if bare => Some(ast::Expr::Value(ast::Value::SingleQuotedString(self.user.to_string()).into())),
                     // (beside `unnest(a)` in a select list, each element's place: zipped, as Postgres does)
                     Some("generate_subscripts") if !args.is_empty() => expr(&format!("unnest(generate_series(1, cardinality({})))", args[0])),
                     Some("current_schema") => Some(ast::Expr::Value(ast::Value::SingleQuotedString(self.schema.to_string()).into())),
@@ -1663,5 +1971,140 @@ impl VisitorMut for Rewriter<'_> {
             *e = r;
         }
         ControlFlow::Continue(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::users::{Grant, User};
+    use datafusion::arrow::util::display::array_value_to_string;
+
+    #[test]
+    fn postgres_from_said_datafusion_way() {
+        let r = |s: &str| rewrite(s, "ann", "public");
+        assert_eq!(r("SELECT user, current_user"), "SELECT 'ann', 'ann'");
+        // a table made or written under a catalog table's name is the current schema's, as in Postgres
+        assert_eq!(r("CREATE TABLE pg_stat_user_tables (relid BIGINT)"), "CREATE TABLE pg_stat_user_tables (relid BIGINT)");
+        let i = r("INSERT INTO pg_stat_user_tables SELECT oid FROM pg_class");
+        assert!(i.starts_with("INSERT INTO pg_stat_user_tables SELECT") && i.contains("FROM pg_catalog.pg_class"), "{i}");
+        // Grafana's search path: a one-column function named for its alias, a scalar function in FROM
+        let g = r("SELECT trim(s[i]) FROM generate_series(1, 2) AS i, string_to_array(current_setting('search_path'), ',') s");
+        assert!(g.contains("generate_series(1, 2) AS i (i)"), "{g}");
+        assert!(g.contains("(SELECT string_to_array(current_setting('search_path'), ',') AS s) AS s"), "{g}");
+        assert!(r("SELECT * FROM generate_series(1, 2) AS s(r)").contains("AS s (r)"));
+        assert!(r("SELECT x FROM current_schemas(false) AS t(x)").contains("(SELECT current_schemas(false) AS x) AS t"));
+        // DBeaver's ACLs: none, so no rows and no grantee
+        let a = r("SELECT acl.grantee FROM pg_class c CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS acl");
+        assert!(a.contains("WHERE false) AS acl") && !a.contains("aclexplode"), "{a}");
+        let c = r("SELECT CASE WHEN table_schema IN (SELECT 'public') THEN 0 ELSE 1 END FROM information_schema.tables");
+        assert!(c.contains("WHEN array_has((SELECT array_agg(pondra_in) FROM (SELECT 'public') AS pondra_in_q (pondra_in)), table_schema)"), "{c}");
+        let e = r("SELECT (aclexplode(relacl)).grantee AS g FROM pg_class");
+        assert!(e.contains("CAST(NULL AS INT UNSIGNED) AS g") && !e.contains("aclexplode"), "{e}");
+    }
+
+    /// A relation of the sample lake, as `lakes()` makes one from the catalog.
+    fn rel(name: &str, kind: char, rows: u64) -> Rel {
+        let (schema, table) = crate::ddl::split(name);
+        Rel {
+            oid: oid("r", name), schema: schema.into(), name: table.into(), kind,
+            columns: vec![("id".into(), DataType::Int64, true, None), ("region".into(), DataType::Utf8, false, None)],
+            key: vec![], sql: None, identity: BTreeMap::new(), constraints: vec![], checks: vec![], typed: BTreeMap::new(),
+            comment: None, comments: BTreeMap::new(), rows, bytes: if kind == 'v' { 0 } else { 4096 },
+        }
+    }
+
+    /// A lake of three relations and a sequence. `analyst` is a role with SELECT on `sales` and on schema
+    /// `crm`; `u` is a user in `analyst` with INSERT on `sales` and SELECT on its `region`; `pondra` is
+    /// the lake's first user, listed once (as the bootstrap role).
+    fn sample() -> Lakes {
+        let grant = |privilege: &str, on: On, columns: &[&str]| Grant { privilege: privilege.into(), on, columns: columns.iter().map(|c| c.to_string()).collect() };
+        let users = vec![
+            ("u/pondra".to_string(), User { login: true, superuser: true, ..Default::default() }),
+            ("u/analyst".to_string(), User { grants: vec![grant("select", On::Table("sales".into()), &[]), grant("select", On::Schema("crm".into()), &[])], ..Default::default() }),
+            ("u/u".to_string(), User { login: true, roles: vec!["analyst".into()], grants: vec![grant("insert", On::Table("sales".into()), &[]), grant("select", On::Table("sales".into()), &["region"])], ..Default::default() }),
+        ];
+        let sequence = SeqRel {
+            oid: oid("sq", "sales_seq"), lake_name: "sales_seq".into(), schema: "public".into(), name: "sales_seq".into(),
+            shape: crate::seq::Shape { start: 1, increment: 1, min: 1, max: i64::MAX, cache: 1, cycle: false, as_type: "BIGINT" },
+        };
+        Lakes {
+            indexes: vec![], database: "lake".into(), databases: vec!["lake".into()], user: "u".into(),
+            schemas: vec![(2200, "public".into()), (oid("n", "crm"), "crm".into())],
+            rels: vec![rel("sales", 'r', 20000), rel("crm.customers", 'r', 2), rel("sales_by_region", 'v', 0), rel("mv", 'm', 4)],
+            sequences: vec![sequence], types: vec![], routines: vec![], visible: vec!["public".into()], members: members_of(&users, "u"),
+        }
+    }
+
+    /// A session with every catalog table and function of the sample lake registered.
+    async fn catalog() -> SessionContext {
+        let l = Arc::new(sample());
+        let ctx = SessionContext::new();
+        for (name, t) in tables(&l, &|_| true).unwrap().into_iter().chain(information_schema(&l, &|_| true).unwrap()) {
+            ctx.register_table(name, t).unwrap();
+        }
+        register_functions(&ctx, l);
+        ctx
+    }
+
+    /// The first column of `sql`'s rows as text (NULL as `NULL`).
+    async fn column(ctx: &SessionContext, sql: &str) -> Vec<String> {
+        let mut out = vec![];
+        for batch in ctx.sql(sql).await.expect(sql).collect().await.expect(sql) {
+            let col = batch.column(0);
+            for i in 0..batch.num_rows() {
+                out.push(if col.is_null(i) { "NULL".to_string() } else { array_value_to_string(col, i).unwrap() });
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn statistics_list_tables_and_materialized_views() {
+        let ctx = catalog().await;
+        assert_eq!(column(&ctx, "SELECT relname FROM pg_stat_user_tables WHERE n_live_tup > 0 ORDER BY relname").await, vec!["customers", "mv", "sales"]);
+        assert_eq!(column(&ctx, "SELECT n_live_tup FROM pg_stat_all_tables WHERE relname = 'sales'").await, vec!["20000"]);
+        assert_eq!(column(&ctx, "SELECT count(*) FROM pg_stat_all_tables").await, vec!["3"]);
+        assert_eq!(column(&ctx, "SELECT data_type FROM pg_sequences").await, vec!["bigint"]);
+    }
+
+    #[tokio::test]
+    async fn roles_and_memberships() {
+        let ctx = catalog().await;
+        // The lake's first user is the bootstrap role's row, and only that.
+        assert_eq!(column(&ctx, "SELECT count(*) FROM pg_roles WHERE rolname = 'pondra'").await, vec!["1"]);
+        assert_eq!(column(&ctx, "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'analyst'").await, vec!["false"]);
+        assert_eq!(column(&ctx, "SELECT usename FROM pg_user ORDER BY usename").await, vec!["pondra", "u"]);
+        let (analyst, u) = (oid("u", "analyst"), oid("u", "u"));
+        assert_eq!(column(&ctx, &format!("SELECT count(*) FROM pg_auth_members WHERE roleid = {analyst} AND member = {u}")).await, vec!["1"]);
+        assert_eq!(column(&ctx, &format!("SELECT pg_get_userbyid({analyst})")).await, vec!["analyst"]);
+        assert_eq!(column(&ctx, "SELECT pg_get_userbyid(999)").await, vec!["unknown (OID=999)"]);
+        assert_eq!(column(&ctx, "SELECT pg_get_userbyid(10)").await, vec!["u"]);
+    }
+
+    #[tokio::test]
+    async fn privileges_of_tables_and_columns() {
+        let ctx = catalog().await;
+        let mut tables = column(&ctx, "SELECT concat_ws(':', grantee, table_schema, table_name, privilege_type) FROM table_privileges").await;
+        tables.sort();
+        assert_eq!(tables, vec!["analyst:crm:customers:SELECT", "analyst:public:sales:SELECT", "u:public:sales:INSERT"]);
+        assert_eq!(column(&ctx, "SELECT concat_ws(':', grantee, table_name, column_name, privilege_type) FROM column_privileges").await, vec!["u:sales:region:SELECT"]);
+        assert_eq!(column(&ctx, "SELECT count(*) FROM routine_privileges").await, vec!["0"]);
+    }
+
+    #[tokio::test]
+    async fn sizes_and_settings() {
+        let ctx = catalog().await;
+        let bytes: u64 = sample().rels.iter().map(|r| r.bytes).sum();
+        assert_eq!(column(&ctx, "SELECT pg_database_size('lake')").await, vec![bytes.to_string()]);
+        assert_eq!(column(&ctx, "SELECT pg_database_size('other')").await, vec!["NULL"]);
+        assert_eq!(column(&ctx, "SELECT reset_val FROM pg_settings WHERE name = 'search_path'").await, vec!["\"$user\", public"]);
+    }
+
+    #[tokio::test]
+    async fn every_catalog_table_builds() {
+        // (`table` refuses a row of the wrong width: this builds every table with rows in it)
+        let l = sample();
+        assert!(tables(&l, &|_| true).is_ok() && information_schema(&l, &|_| true).is_ok());
     }
 }

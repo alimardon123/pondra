@@ -182,6 +182,9 @@ impl TableMeta {
     /// its rows are positions (`tier::shadow`), and Iceberg keeps the name for its own.
     pub fn marker(&self, column: &str) -> bool { column == "_deleted" && !self.key.is_empty() }
 
+    /// Is this column (by the names its entry uses) a uuid, held as text (`types.rs`)?
+    pub fn uuid(&self, column: &str) -> bool { self.sql_types.get(column).is_some_and(|t| t == "uuid") }
+
     /// Has any column been renamed or dropped (ADR-022)? If not, SQL sees `columns` as stored.
     pub fn mapped(&self) -> bool { !self.names.is_empty() || !self.dropped.is_empty() }
 
@@ -1096,6 +1099,7 @@ impl Lake {
         crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
         crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
         crate::types::register(&ctx); // gen_random_uuid(), uuidv7(), pg_typeof(x)
+        crate::pg_functions::register(&ctx); // format(), array_upper(), to_char(ts, 'YYYY-MM'): what Postgres's clients send
         crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
         ctx
     }

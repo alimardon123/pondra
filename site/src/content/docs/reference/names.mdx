@@ -31,7 +31,7 @@ the same answers. Every client turns into the same SQL, so what works in one wor
 | An Iceberg table | `COPY … TO (FORMAT iceberg)` | `frame.write_iceberg` | `df.write.format("iceberg").save` | |
 | A lake's table | `INSERT INTO t …`, `CREATE TABLE t AS …` | `frame.write_table`, `db.write_table` | `df.write.saveAsTable`, `df.write.insertInto` | |
 
-`db` is a connection (`pondra.connect(url)` or `pondra.local(dir)`), and `pondra.read_*` uses the
+`db` is a connection (`pondra.connect(url)` or `pondra.connect(dir)`), and `pondra.read_*` uses the
 connection Python code has inside a Pondra function or procedure. A `frame` is what `db.table`
 and `db.read_*` return. See the [Python](/pondra/reference/python/) and
 [frames](/pondra/reference/frames/) references.
@@ -44,7 +44,7 @@ and `db.read_*` return. See the [Python](/pondra/reference/python/) and
 A source is a path, a glob (`sales/*.parquet`), a folder, a list of them, or a URL (`s3://`,
 `gs://`, `az://`, `https://`). A URL needs a [secret](/pondra/sql/statements/#files-and-secrets)
 whose scope covers it, unless the node is yours. A path on the node's machine is read and written
-only by the program that started the node: the shell, `pondra.local()` or `pondra sql`. To give a
+only by the program that started the node: the shell, `pondra.connect("lake")` or `pondra sql`. To give a
 source a table's name, see [`CREATE EXTERNAL TABLE`](/pondra/sql/statements/#external-tables).
 
 Options come by name. The same option has each tool's spelling:
@@ -98,7 +98,7 @@ pondra sql --dir scratch "CREATE TABLE menu (id BIGINT, name VARCHAR)"
   <TabItem label="Python">
     ```python
     import pondra
-    db = pondra.local("scratch")
+    db = pondra.connect("scratch")
     print(db.read_csv("sales.csv").rows())
     ```
 
@@ -121,8 +121,8 @@ pondra sql --dir scratch "CREATE TABLE menu (id BIGINT, name VARCHAR)"
   </TabItem>
   <TabItem label="JavaScript">
     ```js
-    import { local } from "pondra";
-    const js = await local("js-lake");
+    import { connect } from "pondra";
+    const js = connect("js-lake");
     console.log(await js.sql("SELECT * FROM read_csv('sales.csv')"));
     await js.close();
     ```
@@ -166,8 +166,8 @@ pondra sql --dir scratch "CREATE TABLE menu (id BIGINT, name VARCHAR)"
   </TabItem>
   <TabItem label="JavaScript">
     ```js
-    import { local } from "pondra";
-    const js = await local("js-lake");
+    import { connect } from "pondra";
+    const js = connect("js-lake");
     await js.sql("COPY (SELECT * FROM read_csv('sales.csv')) TO 'sales_js.parquet' (FORMAT parquet)");
     console.log(await js.sql("SELECT count(*) AS n FROM read_parquet('sales_js.parquet')"));
     await js.close();
@@ -184,7 +184,7 @@ pondra sql --dir scratch "CREATE TABLE menu (id BIGINT, name VARCHAR)"
 `scan_csv` is `read_csv` under Polars' name, and `parquet_scan` is `read_parquet` under DuckDB's:
 
 ```python
-db = pondra.local("scratch")
+db = pondra.connect("scratch")
 same = db.scan_csv("sales.csv").rows() == db.read_csv("sales.csv").rows()
 print(same)
 print(db.sql("SELECT count(*) AS n FROM parquet_scan('sales_py.parquet')").rows())

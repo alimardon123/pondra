@@ -1,14 +1,14 @@
-// `open()` in JavaScript, checked (ADR-061 step 6; js/index.js). inprocess_check.py runs each child here as a
+// `connect()` of a lake in JavaScript, checked (ADR-061 step 6, ADR-072; js/index.js). inprocess_check.py runs each child here as a
 // process of its own, under Node (under Bun for js_bun), because a process holds one node and its settings are
 // fixed by its first open. A child prints one line, `FACTS <json>`, which the Python script judges.
 //
 //   node tools/inprocess_check.mjs <child>
 //
-// The library is found as open() finds it: PONDRA_LIBRARY, else the platform's npm package.
+// The library is found as connect() finds it: PONDRA_LIBRARY, else the platform's npm package.
 import { mkdtempSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { col, open } from "../js/index.js";
+import { col, connect, open } from "../js/index.js";
 
 // (writeSync, not console.log: js_exit ends the process right after its line, and a pipe may be asynchronous)
 const emit = (facts) => writeSync(1, `FACTS ${JSON.stringify(facts)}\n`);
@@ -17,10 +17,12 @@ const settle = () => new Promise((r) => setTimeout(r, 1000)); // (a socket the n
 // What is in the temporary folder, which is also the current one: inprocess_check.py gives js_sql a new, empty one.
 const writtenHere = () => readdirSync(tmpdir(), { recursive: true }).map((p) => relative(tmpdir(), join(tmpdir(), p))).sort();
 
-// The message of an open that is refused, or null when it opens (and is closed again).
+// The message of a connect() that is refused, or null when it opens (and is closed again).
 async function refusal(dir, settings) {
   try {
-    await (await open(dir, settings)).close();
+    const db = connect(dir, settings);
+    await db.ready;
+    await db.close();
     return null;
   } catch (e) {
     return e.message;
@@ -34,9 +36,9 @@ async function sample(db) {
 }
 
 async function js_sql() {
-  const db = await open();
-  const lake = db.lake;
+  const db = connect(); // (not awaited: the first call waits for its node)
   await sample(db);
+  const lake = db.lake;
   const rows = (await db.sql("SELECT * FROM t ORDER BY id")).length;
   const frame = (await db.table("t").filter(col("id").gt(1))).length; // (a frame: it runs when awaited)
   await db.writeTable("w", [{ a: 1 }, { a: 2 }]); // (a table made from rows, its columns from their values)
@@ -56,25 +58,77 @@ async function js_sql() {
   return { lake, rows, frame, written, file_rows: fileRows, live, while_open: whileOpen, after_close: writtenHere() };
 }
 
+// Every call through Node-API and none over the loopback port (fetch refused): a live query, a watch, a big answer
+// read in pieces, one cancelled half-read, and what a call costs.
+async function js_calls() {
+  const fetch = globalThis.fetch;
+  globalThis.fetch = () => {
+    throw new Error("a call went over the loopback port");
+  };
+  const db = connect();
+  await sample(db);
+  await db.sql("DELETE FROM t WHERE id = 3");
+  const live = [];
+  for await (const rows of db.live("SELECT count(*) AS n FROM t")) {
+    live.push(Number(rows[0].n));
+    if (live.length === 2) break;
+    await db.sql("INSERT INTO t VALUES (3, 'c')");
+  }
+  const rows = db.watch("t");
+  const next = rows.next();
+  await settle(); // (the watch is on the node before the row commits)
+  await db.sql("INSERT INTO t VALUES (4, 'd')");
+  const watched = Number((await next).value.id);
+  await rows.return();
+  let liveLeft = null;
+  for (let i = 0; i < 100 && liveLeft !== 0; i++) {
+    liveLeft = (await (await db.request("GET", "/stats")).json()).live_queries;
+    if (liveLeft) await new Promise((r) => setTimeout(r, 100));
+  }
+  const csv = await (await db.request("POST", "/sql?format=csv", "SELECT * FROM range(3000000)")).text(); // (past 8 MB: in pieces)
+  const big = await db.request("POST", "/sql?format=csv", "SELECT * FROM range(30000000)");
+  const reader = big.body.getReader();
+  await reader.read();
+  await reader.cancel(); // (let go of half-read: its work stops)
+  const afterCancel = Number((await db.sql("SELECT 1 AS one"))[0].one);
+  const started = performance.now();
+  for (let i = 0; i < 200; i++) await db.sql("SELECT 1");
+  const perCall = (performance.now() - started) / 200;
+  await db.close();
+  globalThis.fetch = fetch;
+  return { live, watched, live_left: liveLeft, csv_lines: csv.split("\n").length - 1, after_cancel: afterCancel, per_call_ms: perCall };
+}
+
 async function js_reopen() {
   const root = scratch();
+  const warned = [];
+  process.on("warning", (w) => w.name === "DeprecationWarning" && warned.push(w.message.split(" goes")[0]));
   try {
     const lake = join(root, "lake");
     // (the settings the process's first open fixes: every open here gives the same ones, so the refusals below
     // are for what each check is about)
     const settings = { memory_gb: 1 };
-    let db = await open(lake, settings);
+    let db = connect(lake, settings);
     await db.sql("CREATE TABLE r (id INT)");
     await db.sql("INSERT INTO r VALUES (1), (2)");
     await db.close();
-    db = await open(lake, settings);
+    db = connect(lake, settings);
     const count = Number((await db.sql("SELECT count(*) AS n FROM r"))[0].n);
-    const second = await refusal(join(root, "other"), settings); // (one node at a time: a second open is refused)
+    const same = connect(lake, settings); // (the same lake again: another connection to its node)
+    const sameCount = Number((await same.sql("SELECT count(*) AS n FROM r"))[0].n);
+    const shared = same.fetch === db.fetch && !same.process;
+    await same.close();
+    const left = Number((await db.sql("SELECT count(*) AS n FROM r"))[0].n); // (still answering, the other closed)
+    const other = connect(join(root, "other"), settings); // (another lake while one is open: a node beside this process)
+    const otherOne = Number((await other.sql("SELECT 1 AS one"))[0].one);
+    const beside = Boolean(other.process);
+    await other.close();
     await db.close();
     const misspelt = await refusal(join(root, "two"), { memory_gbb: 1 });
-    await (await open(join(root, "three"), settings)).close(); // (the same settings: this one opens)
+    await (await open(join(root, "three"), settings)).close(); // (open() still opens, with a warning)
     const changed = await refusal(join(root, "four"), { memory_gb: 2 });
-    return { count, second, misspelt, changed };
+    await new Promise((r) => setImmediate(r)); // (a warning is emitted on the next tick)
+    return { count, shared, same_count: sameCount, left, beside, other_one: otherOne, misspelt, changed, warned };
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -83,7 +137,7 @@ async function js_reopen() {
 async function js_cycles() {
   if (process.platform !== "linux") return { skip: true };
   const cycle = async () => {
-    const db = await open();
+    const db = connect();
     await db.sql("SELECT 1");
     await db.close();
   };
@@ -98,7 +152,7 @@ async function js_cycles() {
 }
 
 async function js_exit() {
-  const db = await open(join(scratch(), "lake")); // (a folder: what its node leaves there says it was closed)
+  const db = connect(join(scratch(), "lake")); // (a folder: what its node leaves there says it was closed)
   await db.sql("CREATE TABLE e (id INT)");
   await db.sql("INSERT INTO e VALUES (1)");
   emit({ lake: db.lake });
@@ -106,22 +160,28 @@ async function js_exit() {
 }
 
 async function js_end() {
-  const db = await open(join(scratch(), "lake"));
+  const db = connect(join(scratch(), "lake"));
   await db.sql("CREATE TABLE e (id INT)");
   await db.sql("INSERT INTO e VALUES (1)");
   emit({ lake: db.lake }); // (no close(), and nothing left to do: Node ends, and the library's cleanup hook closes the node)
 }
 
 async function js_bun() {
-  const db = await open();
+  const db = connect();
   await sample(db);
   const count = Number((await db.sql("SELECT count(*) AS n FROM t"))[0].n);
+  let live = null;
+  for await (const rows of db.live("SELECT count(*) AS n FROM t")) {
+    live = Number(rows[0].n);
+    break;
+  }
+  const csv = await (await db.request("POST", "/sql?format=csv", "SELECT * FROM range(3000000)")).text(); // (past 8 MB: in pieces)
   const lake = db.lake;
   await db.close();
-  return { count, lake };
+  return { count, lake, live, csv_lines: csv.split("\n").length - 1 };
 }
 
-const CHILDREN = { js_sql, js_reopen, js_cycles, js_exit, js_end, js_bun };
+const CHILDREN = { js_sql, js_calls, js_reopen, js_cycles, js_exit, js_end, js_bun };
 const child = CHILDREN[process.argv[2]];
 if (!child) {
   console.error(`no child ${process.argv[2]}: ${Object.keys(CHILDREN).join(", ")}`);

@@ -238,8 +238,9 @@ jobs:
       BIN: target/${{ matrix.target }}/dist/pondra${{ matrix.exe }}
     steps: *build
 
-  # The crate's own unit tests, beside linux-x64's build (they need a build of their own: the
-  # release profile on this machine, not the dist one zig links for glibc 2.17).
+  # The crate's own unit tests, and a node opened in a host's process (ADR-061), beside linux-x64's
+  # build (they need a build of their own: the release profile on this machine, not the dist one zig
+  # links for glibc 2.17).
   unit:
     needs: plan
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' }}
@@ -257,7 +258,9 @@ jobs:
           shared-key: unit
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }} # (main's caches only, as the build's)
+      - run: python3 tools/per_node_check.py # (a node leaves nothing of itself in its process: the source alone, ADR-061)
       - run: cargo test --release --lib
+      - run: cargo test --release --test node_twice --test node_library # (a node in a host's process: two lakes one after the other, and the library's four checks)
 
   # The suite, on linux-x64's very binary, in three parts side by side: the quick correctness suite
   # (upserts, split brain, crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on
@@ -315,6 +318,9 @@ jobs:
         run: |
           git fetch --depth 1 origin main && git show FETCH_HEAD:docs/surface.json > "$RUNNER_TEMP/main-surface.json" || true
           python3 tools/surface.py --bin "$PONDRA_BIN" --check docs/surface.json --base "$RUNNER_TEMP/main-surface.json"
+      - name: A node stopped gives its term back, also while it starts (ADR-061)
+        if: ${{ !matrix.shard }}
+        run: python3 tools/node_check.py --bin "$PONDRA_BIN"
       - name: Frames, the console, the website's examples, a failover
         if: ${{ !matrix.shard }}
         run: |

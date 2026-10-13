@@ -12,7 +12,7 @@ SQL, Python, PySpark and JavaScript.
 
 The examples read and write files in the current folder. Only programs that run on your machine may do
 that, so they use the [shell](/pondra/start/shell/) (`pondra files` opens a lake named `files`) and
-`local()`, which starts a node for your program. A node from `pondra serve` refuses to read its own
+`connect()`, which opens a lake for your program with its node in it. A node from `pondra serve` refuses to read its own
 disk for a client's SQL, whoever asks. Files in buckets and on HTTPS work through any node (below).
 
 ## Files to read
@@ -52,7 +52,7 @@ Name a file, a folder, a glob or a list where SQL takes a table. Reading is `rea
     import pondra
     from pondra import col
 
-    db = pondra.local("pylake")     # a node on ./pylake, started by this program
+    db = pondra.connect("pylake")     # a node on ./pylake, started by this program
     orders = db.read_parquet("export/orders/", hive_partitioning=True)
     print(orders.group_by("region").agg(col("amount").sum().alias("total")).sort("region").rows())
     ```
@@ -68,9 +68,9 @@ Name a file, a folder, a glob or a list where SQL takes a table. Reading is `rea
   </TabItem>
   <TabItem label="JavaScript">
     ```js
-    import { local } from "pondra";
+    import { connect } from "pondra";
 
-    const db = await local("jslake");
+    const db = connect("jslake");
     console.log(await db.sql("SELECT region, sum(amount) AS total FROM read_parquet('export/orders/', hive_partitioning => true) GROUP BY region ORDER BY region"));
     await db.close();
     ```
@@ -200,7 +200,7 @@ SELECT * FROM secrets();
 `CREATE SECRET` takes `TYPE s3` (or `r2`), `gcs`, `azure`, `http` (a bearer token), `iceberg` (a REST
 catalog), `kafka` or `generic`. A secret's `SCOPE` is the URL prefix it covers, and a URL uses the secret
 with the longest matching scope. A URL no secret covers is refused, except to the program that started
-the node (the shell, `local()`), which reads it with the node's own environment (`AWS_*`, Google's and
+the node (the shell, or a lake's `connect()`), which reads it with the node's own environment (`AWS_*`, Google's and
 Azure's). Secrets are kept in the lake encrypted, with a key only the nodes hold (`PONDRA_SECRET_KEY`, or
 a file beside the node). SQL can list a secret's name, type and scope, and never its values.
 

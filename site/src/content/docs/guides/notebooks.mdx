@@ -15,21 +15,21 @@ lake. Download one and Jupyter, VS Code and GitHub open it.
 
 ## Start a node from a cell
 
-`pondra.local(folder)` starts a node on a lake in that folder, here, and connects to it. It stops when
+`pondra.connect(folder)` starts a node on a lake in that folder, here, and connects to it. It stops when
 the kernel does or when you call `close()`, and the lake stays. The first cell of most notebooks:
 
 ```python
 import pondra
 
-db = pondra.local("notebook-lake")
+db = pondra.connect("notebook-lake")
 ```
 
-`pondra.local()` on its own uses `./lake`. To use a node that is already running, on a server or in a
+`pondra.connect("lake")` on its own uses `./lake`. To use a node that is already running, on a server or in a
 cluster, connect to it instead: `pondra.connect("http://host:8080", token=…)`. Either way the rest of the
 notebook is the same.
 
 [Python functions and procedures](/pondra/guides/functions-and-procedures/) written in a notebook run
-with the notebook's own Python only through `pondra.local()`, which starts the node with that Python.
+with the notebook's own Python only through `pondra.connect("lake")`, which starts the node with that Python.
 A node you `connect()` to runs them with the Python it was started with (`--python`). Without one, it
 refuses them.
 

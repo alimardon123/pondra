@@ -53,21 +53,21 @@ SQL
 pondra run report.sql daily --min 4
 ```
 
-### Python: pondra.local()
-`pondra.local()` starts a node on a lake from inside your program and connects to it; the node stops when you call `close()` or the program ends. [Python client](/pondra/reference/python/)
+### Python: pondra.connect("lake")
+`pondra.connect("lake")` opens a lake from inside your program, with its node in this process; the node stops when you call `close()` or the program ends. [Python client](/pondra/reference/python/)
 
 ```python
-local = pondra.local("local-py")
-print(local.sql("SELECT 1 AS one").rows())
-local.close()
+lake = pondra.connect("local-py")
+print(lake.sql("SELECT 1 AS one").rows())
+lake.close()
 ```
 
-### JavaScript: local()
-`local()` does the same from Node: it starts a node, connects to it, and `close()` stops the node and keeps the lake. [JavaScript client](/pondra/reference/javascript/)
+### JavaScript: connect()
+`connect()` does the same from Node: it opens a lake with its node in this process, and `close()` stops the node and keeps the lake. [JavaScript client](/pondra/reference/javascript/)
 
 ```js
-import { local } from "pondra";
-const db = await local("local-js");
+import { connect } from "pondra";
+const db = connect("local-js");
 console.log(await db.sql("SELECT 1 AS one"));
 await db.close();
 ```

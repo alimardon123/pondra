@@ -132,7 +132,7 @@ SQL like any other function. See [Python functions](/pondra/guides/functions-and
 ## SQL cells in a notebook
 
 In a notebook, `%load_ext pondra` adds `%%sql`. The cell runs as SQL on your newest connection, from
-`pondra.local()` or `pondra.connect()`, and shows its answer as a frame. Set the notebook up in
+`pondra.connect("lake")` or `pondra.connect()`, and shows its answer as a frame. Set the notebook up in
 [Notebooks](/pondra/guides/notebooks/).
 
 ```python norun
@@ -174,6 +174,6 @@ top.filter("spent > 5").to_pandas()
 ```
 
 <Aside type="caution">
-A `%%sql` cell needs a connection made first, by `pondra.local(…)` or `pondra.connect(…)`. Without one
-it stops with `no connection yet: pondra.local(…) or pondra.connect(…) first`.
+A `%%sql` cell needs a connection made first, by `pondra.connect(…)`. Without one
+it stops with `no connection yet: pondra.connect(…) first`.
 </Aside>

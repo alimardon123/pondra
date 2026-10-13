@@ -3258,6 +3258,7 @@ dependencies = [
  "futures",
  "glob",
  "http",
+ "http-body-util",
  "libc",
  "lru",
  "lz4_flex",
@@ -3295,10 +3296,13 @@ version = "0.33.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "futures",
  "libc",
  "mimalloc",
  "pondra",
  "serde_json",
+ "tikv-jemallocator",
+ "tokio",
 ]
 
 [[package]]

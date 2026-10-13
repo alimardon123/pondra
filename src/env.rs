@@ -17,7 +17,7 @@ pub enum Who {
     Node,
     /// The command line's own (`pondra sql`, the project commands): the environment only.
     Command,
-    /// Set by the program that starts a node (the shell, `local()`, a folder of lakes, a service
+    /// Set by the program that starts a node (the shell, `connect()`, a folder of lakes, a service
     /// manager): the environment only.
     Starter,
     /// A test's hook into the node: the environment only, and left out of the docs.

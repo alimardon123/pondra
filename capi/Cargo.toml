@@ -16,10 +16,18 @@ doctest = false
 pondra = { path = ".." }
 anyhow = "1"
 bytes = "1"
+futures = "0.3"
 serde_json = "1"
-# local_dynamic_tls: a library's thread-locals are found through the loader (`__tls_get_addr`), never in
-# the static TLS block glibc keeps for the program's own (a kilobyte or two): mimalloc's initial-exec ones
-# marked the whole library STATIC_TLS, and Python refused it ("cannot allocate memory in static TLS block").
+tokio = { version = "1", features = ["sync"] } # (a body's read ended when JavaScript lets it go: napi.rs)
+
+# The allocators' thread-locals are dlopen's kind (`disable_initial_exec_tls`, `local_dynamic_tls`): found
+# through the loader (`__tls_get_addr`), never in the static TLS block glibc keeps for the program's own (a
+# kilobyte or two). mimalloc's initial-exec ones marked the whole library STATIC_TLS, and Python refused it
+# ("cannot allocate memory in static TLS block").
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["background_threads", "disable_initial_exec_tls"] }
+
+[target.'cfg(not(all(target_os = "linux", target_env = "gnu")))'.dependencies]
 mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
 
 [target.'cfg(unix)'.dependencies]
