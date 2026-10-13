@@ -4,7 +4,7 @@
 
 Starts its own node (--bin) on a new lake in a temporary folder, and runs the checks in each form:
 `pondra+http` (the node's HTTP door), `pondra+psycopg` (the Postgres port), and `pondra:///folder` in this
-process when --lib names a pondra_lib (none is built here, so that form is listed under not_run). Prints one
+process when --lib names a pondra_lib (without it, that form is listed under not_run). Prints one
 JSON document: each check's ok and what it found, the costs (reported, not judged) and what was not run.
 Exits 1 if any check is false. A check that a door can't answer is false and says what the door answered:
 that is the finding, not a crash of the tool.
@@ -772,7 +772,7 @@ def costs(run, http_url, engine):
 
 def parse():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--bin", default="/tmp/claude-0/bin/l3remember", help="the node binary (never built here)")
+    p.add_argument("--bin", default=os.environ.get("PONDRA_BIN") or os.path.join(HERE, "..", "target", "release", "pondra"), help="the node binary (never built here; PONDRA_BIN, else the release build)")
     p.add_argument("--lib", help="a pondra_lib: the in-process form runs too")
     p.add_argument("--postgres", help="a PostgreSQL 16 SQLAlchemy URL to compare the inspector with")
     return p.parse_args()
