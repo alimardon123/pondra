@@ -6349,7 +6349,8 @@ def hot():
     a table whose rows came in time order, held in memory, asked for a range of its time, a top-N of
     it, a key, and NULL-sensitive filters over a column with a batch of NULLs; every answer the
     model's, and the range, the top-N and the key skip batches (`pondra_hot_batches_skipped_total`).
-    Then eight small files held, merged: they leave memory with the merge's commit (`Hot::forget`)."""
+    Then rows tiered from the log, and eight small files held and merged: a hot table's new files are
+    held as they are written, and a merge's file takes the replaced files' place (`Hot::put`, `Hot::forget`)."""
     import re
     lake = new_lake()
     node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1"}).start()
@@ -6407,9 +6408,25 @@ def hot():
             got = q(ask)
             seen[name] = {"got": got if got != want else "== model", "skipped": skipped() - before}
             checks[f"{name}: the model's answer" + (", batches skipped" if skips else "")] = got == want and (not skips or skipped() > before)
-        # A merge's replaced files leave memory when the node sees its commit: kept, a busy table's
-        # merges filled the budget with files no query could read again.
         hot_bytes = lambda: float(re.search(rb"\npondra_hot_bytes (\S+)", call(A.port, "GET", "/metrics")).group(1))
+        # Rows tiered from the log into a hot table's file are held at once: `lg`'s first file is read
+        # twice (hot), then rows go through the log and /tier writes them to a file, which is in memory
+        # by the time /tier answers, with no query in between.
+        q("CREATE TABLE lg (a BIGINT)")
+        q("INSERT INTO lg SELECT value FROM range(0, 100000)")  # (a bulk INSERT: a file of its own)
+        for run in range(2):
+            q(f"SELECT sum(a) AS a FROM lg -- warm {run}")
+        lg_before = hot_settled(A.port)
+        for _ in range(10):
+            q("INSERT INTO lg VALUES (1), (2), (3)")
+        call(A.port, "POST", "/tier", timeout=120)
+        lg_after = hot_bytes()
+        seen["rows tiered into a hot table's file"] = {"before": lg_before, "after /tier": lg_after}
+        checks["rows tiered into a hot table's file are held at once"] = lg_after > lg_before
+        held = hot_settled(A.port)  # (the baseline for the merge below: `lg`'s columns are in it now)
+        # A merge's replaced files leave memory when the node sees its commit: kept, a busy table's
+        # merges filled the budget with files no query could read again. The table is hot, so its
+        # eighth file is held as it is written, and the merge's file takes the eight's place.
         q("CREATE TABLE m (a BIGINT, s VARCHAR)")
         for f in range(8):  # (a bulk INSERT is a file of its own; eight small ones are merged)
             if f == 7:
@@ -6418,10 +6435,11 @@ def hot():
                 with_m = hot_settled(A.port)
             q(f"INSERT INTO m SELECT value + {f * 50000} AS a, 'm' || value AS s FROM range(0, 50000)")
         deadline = time.time() + 60
-        while hot_bytes() > held + (with_m - held) / 10 and time.time() < deadline:
-            time.sleep(0.5)
-        seen["merged files' columns"] = {"before": held, "with them": with_m, "after the merge": hot_bytes()}
-        checks["a merge's replaced files leave memory"] = with_m > held and hot_bytes() <= held + (with_m - held) / 10
+        while metrics_of(A.port)['pondra_table_files{table="m",where="inline"}'] != 1 and time.time() < deadline:
+            time.sleep(0.5)  # (the merge has committed: one file, and nothing is read in between)
+        after = hot_settled(A.port)
+        seen["merged files' columns"] = {"before": held, "with them": with_m, "after the merge": after}
+        checks["a merge's replaced files leave memory, and its own file is held at once (the table is hot)"] = held + 0.5 * (with_m - held) < after < held + 1.6 * (with_m - held)
         checks["…and the merged rows answer"] = q("SELECT count(*) AS n, sum(a) AS a FROM m") == [{"n": 400000, "a": sum(range(400000))}]
     finally:
         node.kill()
