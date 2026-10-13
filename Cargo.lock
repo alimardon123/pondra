@@ -3258,6 +3258,7 @@ dependencies = [
  "futures",
  "glob",
  "http",
+ "http-body-util",
  "libc",
  "lru",
  "lz4_flex",

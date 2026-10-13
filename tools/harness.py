@@ -8822,7 +8822,8 @@ def guesses():
     and refused). Another user from the same address still signs in, and the same user from another address does;
     a bearer token, or a token sent as a password, isn't counted. Behind a proxy of
     PONDRA_TRUSTED_PROXIES and behind `pondra serve --lakes`, each client is counted by its own address, and
-    only a page on this machine saves the console's settings or chooses the Python (S28)."""
+    only a page on this machine saves the console's settings or chooses the Python (S28). Flight signs every call in
+    from its headers before reading its body, and counts a password sent with any call (S32)."""
     import base64, socket
     P = A.port
     token = "gss-admin-token-1"
@@ -8902,7 +8903,7 @@ def guesses():
     import psycopg, adbc_driver_flightsql.dbapi as adbc
     c = Node(new_lake(), P + 3, admin_token=token, pg=f"127.0.0.1:{P + 13}", flight=f"127.0.0.1:{P + 33}").start()
     try:
-        for q in ["CREATE USER dana PASSWORD 'dana-password-1'", "CREATE USER eli PASSWORD 'eli-password-1'", "CREATE USER fran PASSWORD 'fran-password-1'", "CREATE USER svc"]:
+        for q in ["CREATE USER dana PASSWORD 'dana-password-1'", "CREATE USER eli PASSWORD 'eli-password-1'", "CREATE USER fran PASSWORD 'fran-password-1'", "CREATE USER gil PASSWORD 'gil-password-1'", "CREATE USER svc"]:
             reply(P + 3, "POST", "/sql", q.encode(), headers=bearer)
         svc_token = call(P + 3, "POST", "/sql", b"CREATE TOKEN pg FOR USER svc", headers=bearer)["token"]
         def pg_said(user, password):  # ("ok", or the server's message: psycopg gives no SQLSTATE for a failed connection)
@@ -8954,8 +8955,48 @@ def guesses():
             all('uthentication failed for user "svc"' in w for w in svc_pg) and all("wrong user name or password" in w for w in svc_fl) and svc_right == ["ok", "ok"]
         checks["each refusal is audited: postgres dana and flight fran, the eleventh and the right password (pondra.audit)"] = \
             audited == [("flight", "fran"), ("flight", "fran"), ("postgres", "dana"), ("postgres", "dana")]
+        # A name and password sent with any Flight call count the same, not only with the handshake: ten wrong
+        # passwords for gil sent with DoGet itself, then the right one is refused saying why; eli's right one answers.
+        import pyarrow as pa, pyarrow.flight as fl
+        fc = fl.FlightClient(f"grpc://127.0.0.1:{P + 33}")
+        def get_said(user, password):
+            try:
+                fc.do_get(fl.Ticket(b'{"sql": "SELECT 1 AS one"}'), options=fl.FlightCallOptions(headers=[(b"authorization", basic(user, password).encode())])).read_all()
+                return "ok"
+            except pa.ArrowException as e:
+                return str(e).strip()
+        g_wrong = [get_said("gil", f"guess-{i}") for i in range(10)]
+        g_right, g_eli = get_said("gil", "gil-password-1"), get_said("eli", "eli-password-1")
+        info["flight, a password with DoGet"] = {"wrong": g_wrong[0][:140], "right": g_right[:140], "eli": g_eli}
+        checks["Flight: a name and password sent with DoGet count too: ten wrong for gil, then the right one refused saying why; eli's answers"] = \
+            all("wrong user name or password" in w for w in g_wrong) and too_many("gil", g_right) and g_eli == "ok"
     finally:
         c.kill()
+    # Nothing is read from a Flight caller before it signs in (S32): a call's headers are checked first, so an
+    # unsigned DoGet whose ticket is one 200 MB message is refused at once, and the node's peak memory doesn't grow
+    # by it (it took the message in whole first, up to 1 GiB); a signed-in caller's 8 MB batch still lands.
+    d = Node(new_lake(), P + 4, admin_token=token, flight=f"127.0.0.1:{P + 34}").start()
+    try:
+        reply(P + 4, "POST", "/sql", b"CREATE TABLE big (x BIGINT)", headers=bearer)
+        fd = fl.FlightClient(f"grpc://127.0.0.1:{P + 34}")
+        before = vm_hwm(d.p.pid)
+        try:
+            fd.do_get(fl.Ticket(bytes(200 << 20))).read_all()
+            unsigned = "ok"
+        except pa.ArrowException as e:  # (a message read before the call was signed in was refused as one it couldn't decode)
+            unsigned = str(e).strip()
+        grew = vm_hwm(d.p.pid) - before
+        small = pa.record_batch([pa.array(range(1 << 20), pa.int64())], names=["x"])  # (8 MB: past the 64 KB a caller not signed in may send)
+        w, _ = fd.do_put(fl.FlightDescriptor.for_path("big"), small.schema, options=fl.FlightCallOptions(headers=[(b"authorization", f"Bearer {token}".encode())]))
+        w.write_batch(small)
+        w.close()
+        landed = call(P + 4, "POST", "/sql", b"SELECT count(*) AS n FROM big", headers=bearer)
+        info["flight, before signing in"] = {"unsigned": unsigned[:140], "peak grew MB": round(grew / 2**20, 1), "signed-in rows": landed}
+        checks["Flight: an unsigned DoGet of a 200 MB ticket is refused at once, and the node's peak memory grows by under 50 MB"] = \
+            "sign in" in unsigned and grew < 50 << 20
+        checks["…while a signed-in caller's 8 MB batch lands (DoPut)"] = landed == [{"n": 1 << 20}]
+    finally:
+        d.kill()
     if isinstance(other, str):
         ok = all(checks.values())
         print(json.dumps({"guesses": checks, "ok": ok, "info": info}, indent=1, default=str))

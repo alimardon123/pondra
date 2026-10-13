@@ -40,12 +40,59 @@ use tonic::{Request, Response, Status, Streaming};
 type Out<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
-    let door = Door(Sql(app));
-    let service = FlightServiceServer::new(door).max_decoding_message_size(1 << 30).max_encoding_message_size(1 << 30);
+    // (a message up to 1 GiB, as HTTP takes a batch, but only from a caller `Gate` has signed in)
+    let service = FlightServiceServer::new(Door(Sql(app.clone()))).max_decoding_message_size(1 << 30).max_encoding_message_size(1 << 30);
     let doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Flight).await?; // (TLS too: `tls.rs`)
-    tonic::transport::Server::builder().add_service(service).serve_with_incoming(doors.stream()).await?;
+    tonic::transport::Server::builder().add_service(Gate { app, inner: service }).serve_with_incoming(doors.stream()).await?;
     Ok(())
 }
+
+/// The calls a caller not signed in may make: the handshake that signs it in, and the list of actions.
+const UNSIGNED: [&str; 2] = ["/Handshake", "/ListActions"];
+
+/// Signs every call in from its headers before its body is read, as HTTP's guard does. Without it,
+/// anyone who reached the port could make the node take in a message of 1 GiB before saying who they
+/// were. A caller not signed in is refused at once, but for `UNSIGNED`, whose body may be 64 KB at
+/// most (as HTTP's `/login`); the principal rides with the call to `caller`.
+#[derive(Clone)]
+struct Gate {
+    app: App,
+    inner: FlightServiceServer<Door>,
+}
+
+impl tonic::server::NamedService for Gate {
+    const NAME: &'static str = <FlightServiceServer<Door> as tonic::server::NamedService>::NAME;
+}
+
+impl tower::Service<http::Request<tonic::body::Body>> for Gate {
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> { std::task::Poll::Ready(Ok(())) }
+
+    fn call(&mut self, mut req: http::Request<tonic::body::Body>) -> Self::Future {
+        let (app, mut inner) = (self.app.clone(), self.inner.clone());
+        Box::pin(async move {
+            let header = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
+            let peer = req.extensions().get::<crate::tls::Peer>().copied();
+            let who = match sign_in(&app, header.as_deref(), peer).await {
+                Ok(who) => who,
+                Err(refused) => return Ok(refused.into_http()),
+            };
+            if who.role == Role::None {
+                if !UNSIGNED.iter().any(|call| req.uri().path().ends_with(call)) {
+                    return Ok(Status::unauthenticated(SIGN_IN).into_http());
+                }
+                req = req.map(|body| tonic::body::Body::new(http_body_util::Limited::new(body, 64 << 10)));
+            }
+            req.extensions_mut().insert(who);
+            tower::Service::call(&mut inner, req).await
+        })
+    }
+}
+
+const SIGN_IN: &str = "sign in: a token, or a user's name and password (handshake)";
 
 /// An error as a gRPC status: the nearest code to its SQLSTATE, which rides along in `x-pondra-sqlstate`.
 fn status(e: impl Into<anyhow::Error>) -> Status {
@@ -61,27 +108,81 @@ fn allowed<T>(_: &App, _: &Request<T>, need: Role) -> Result<Role, Status> {
     let role = crate::auth::current().map_or(Role::None, |p| p.role);
     match role {
         _ if role >= need => Ok(role),
-        Role::None => Err(Status::unauthenticated("sign in: a token, or a user's name and password (handshake)")),
+        Role::None => Err(Status::unauthenticated(SIGN_IN)),
         _ => Err(Status::permission_denied("this needs more rights than this token's or user's")),
     }
 }
 
-/// Who a call is: its `authorization` (a token, a user's token or session: `users::who`); or, with
-/// nothing that needs a sign-in, an admin.
-async fn caller<T>(app: &App, req: &Request<T>) -> crate::auth::Principal {
-    let header = req.metadata().get("authorization").and_then(|v| v.to_str().ok());
-    let from = req.extensions().get::<crate::tls::Peer>().map(|p| p.addr);
-    let who = match crate::users::who(&app.lake, &app.auth, header).await {
+/// Who a call is, from its `authorization`: a token, or a user's token or session (`Bearer`:
+/// `users::who`); or a name and password (`Basic`: what ADBC's and pyarrow's handshakes send). With
+/// nothing that needs a sign-in, anyone is an admin. A wrong password is an error, said at once.
+async fn sign_in(app: &App, header: Option<&str>, peer: Option<crate::tls::Peer>) -> Result<crate::auth::Principal, Status> {
+    let from = peer.map(|p| p.addr);
+    let who = match header.and_then(basic) {
+        Some((user, password)) => password_sign_in(app, &user, &password, peer).await?,
+        None => crate::users::who(&app.lake, &app.auth, header).await,
+    };
+    let who = match who {
         Some(p) => p,
         None if app.open().await => crate::auth::Principal::of(Role::Admin),
         None => {
             if header.is_some() {
-                crate::audit::refused(app, "", "flight", from, "sign in", "wrong token, or user name and password");
+                crate::audit::refused(app, "", "flight", from, "sign in", "wrong token");
             }
             crate::auth::Principal::of(Role::None)
         }
     };
-    who.at("flight", from)
+    Ok(who.at("flight", from))
+}
+
+/// A `Basic` header's name and password (padding optional: ADBC's driver sends none).
+fn basic(header: &str) -> Option<(String, String)> {
+    use base64::Engine;
+    let lenient = base64::engine::GeneralPurpose::new(&base64::alphabet::STANDARD, base64::engine::GeneralPurposeConfig::new().with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent));
+    let up = String::from_utf8(lenient.decode(header.strip_prefix("Basic ")?).ok()?).ok()?;
+    up.split_once(':').map(|(u, p)| (u.to_string(), p.to_string()))
+}
+
+/// A name and password: a token as the password whatever the name, else a user's password (or
+/// `pt_` token), checked as every door checks one. A password crosses only TLS from another machine
+/// (`tls.rs`; no peer at all refuses one), and failed sign-ins are counted per address and name
+/// (`auth::guessing`), each costing 400 ms. None on a node nothing locks.
+async fn password_sign_in(app: &App, user: &str, password: &str, peer: Option<crate::tls::Peer>) -> Result<Option<crate::auth::Principal>, Status> {
+    let role = app.auth.token_role(password);
+    if role > Role::None {
+        return Ok(Some(crate::auth::Principal::token(role)));
+    }
+    if app.open().await {
+        return Ok(None);
+    }
+    let from = peer.map(|p| p.addr);
+    let ip = from.map(|a| a.ip());
+    let by_token = crate::users::is_token(user, password);
+    if !by_token && !peer.is_some_and(|p| p.may_send_password()) {
+        return Err(Status::unauthenticated(crate::tls::PASSWORD_PLAIN));
+    }
+    if let Some(wait) = crate::auth::guessing(ip, user) {
+        let why = crate::auth::guessing_says(user, wait);
+        crate::audit::refused(app, user, "flight", from, "sign in", &why);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (as a wrong guess does)
+        return Err(Status::unauthenticated(why));
+    }
+    match crate::users::sign_in(&app.lake, &app.auth, user, password).await {
+        Some(p) if p.role > Role::None => Ok(Some(p)),
+        _ => {
+            if !by_token {
+                crate::auth::guessed(ip, user); // (a token isn't guessed: it is random)
+            }
+            crate::audit::refused(app, user, "flight", from, "sign in", "wrong user name or password");
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time, as HTTP's and Postgres's do)
+            Err(Status::unauthenticated("wrong user name or password"))
+        }
+    }
+}
+
+/// Who a call is: signed in by `Gate` before its body was read.
+fn caller<T>(req: &Request<T>) -> crate::auth::Principal {
+    req.extensions().get::<crate::auth::Principal>().cloned().unwrap_or_else(|| crate::auth::Principal::of(Role::None))
 }
 
 /// Batches as a Flight stream (the schema first, so an empty result still has columns).
@@ -375,44 +476,16 @@ impl FlightSqlService for Sql {
     type FlightService = Sql;
 
     async fn do_handshake(&self, req: Request<Streaming<HandshakeRequest>>) -> Result<Response<Out<HandshakeResponse>>, Status> {
-        use base64::Engine;
-        let basic = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Basic "));
-        // (padding optional: ADBC's driver sends none)
-        let lenient = base64::engine::GeneralPurpose::new(&base64::alphabet::STANDARD, base64::engine::GeneralPurposeConfig::new().with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent));
-        let (user, password) = basic.and_then(|b| lenient.decode(b).ok()).and_then(|b| String::from_utf8(b).ok()).and_then(|up| up.split_once(':').map(|(u, p)| (u.to_string(), p.to_string()))).unwrap_or_default();
-        // (a token as the password, whatever the name, as before; or a user's name and password, or
-        // token: a session for it)
+        // (signed in by `Gate` already; here a token is handed back: the password when it is one, or
+        // anything on a node nothing locks; a session when a user signed in)
+        let password = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).and_then(basic).map(|(_, p)| p);
+        let Some(password) = password else { return Err(Status::unauthenticated("wrong user name or password")) };
         let open = self.0.open().await;
         let token = match self.0.auth.token_role(&password) {
-            _ if open => password,
-            Role::None => {
-                // (a user's password crosses only TLS from another machine, as `tls.rs` says; a token may. The
-                // connection's `Peer` says both, as HTTP's does, and no peer at all refuses a password.)
-                let peer = req.extensions().get::<crate::tls::Peer>().copied();
-                let from = peer.map(|p| p.addr);
-                let ip = from.map(|a| a.ip());
-                let by_token = crate::users::is_token(&user, &password);
-                if !by_token && !peer.is_some_and(|p| p.may_send_password()) {
-                    return Err(Status::unauthenticated(crate::tls::PASSWORD_PLAIN));
-                }
-                if let Some(wait) = crate::auth::guessing(ip, &user) {
-                    let why = crate::auth::guessing_says(&user, wait);
-                    crate::audit::refused(&self.0, &user, "flight", from, "sign in", &why);
-                    tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (as a wrong guess does)
-                    return Err(Status::unauthenticated(why));
-                }
-                match crate::users::sign_in(&self.0.lake, &self.0.auth, &user, &password).await {
-                    Some(p) if p.role > Role::None => crate::users::session(&self.0.lake, &p.name).await.map_err(status)?.0,
-                    _ => {
-                        if !by_token {
-                            crate::auth::guessed(ip, &user); // (a token isn't guessed: it is random)
-                        }
-                        crate::audit::refused(&self.0, &user, "flight", from, "sign in", "wrong user name or password");
-                        tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time, as HTTP's and Postgres's do)
-                        return Err(Status::unauthenticated("wrong user name or password"));
-                    }
-                }
-            }
+            Role::None if !open => match caller(&req) {
+                who if who.role > Role::None => crate::users::session(&self.0.lake, &who.name).await.map_err(status)?.0,
+                _ => return Err(Status::unauthenticated("wrong user name or password")),
+            },
             _ => password,
         };
         let mut res: Response<Out<HandshakeResponse>> = Response::new(Box::pin(futures::stream::iter([Ok(HandshakeResponse { protocol_version: 0, payload: token.clone().into_bytes().into() })])));
@@ -651,7 +724,7 @@ impl FlightService for Door {
     async fn handshake(&self, req: Request<Streaming<HandshakeRequest>>) -> Result<Response<Self::HandshakeStream>, Status> { self.0.handshake(req).await }
 
     async fn list_flights(&self, req: Request<Criteria>) -> Result<Response<Self::ListFlightsStream>, Status> {
-        let who = caller(&self.0 .0, &req).await;
+        let who = caller(&req);
         crate::auth::WHO.scope(who, async move {
             let app = &self.0 .0;
             allowed(app, &req, Role::Read)?;
@@ -667,7 +740,7 @@ impl FlightService for Door {
     }
 
     async fn get_flight_info(&self, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
-        let who = caller(&self.0 .0, &req).await;
+        let who = caller(&req);
         crate::auth::WHO.scope(who, async move {
             let Some(json) = Json::parse(&req.get_ref().cmd) else { return self.0.get_flight_info(req).await };
             let app = &self.0 .0;
@@ -699,7 +772,7 @@ impl FlightService for Door {
     }
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
-        let who = caller(&self.0 .0, &req).await;
+        let who = caller(&req);
         crate::auth::WHO.scope(who, async move {
             let Some(json) = Json::parse(&req.get_ref().ticket) else { return self.0.do_get(req).await };
             let app = &self.0 .0;
@@ -719,7 +792,7 @@ impl FlightService for Door {
     }
 
     async fn do_put(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
-        let who = caller(&self.0 .0, &req).await;
+        let who = caller(&req);
         crate::auth::WHO.scope(who, async move { self.0.do_put(req).await }).await
     }
 
@@ -729,7 +802,7 @@ impl FlightService for Door {
         if !ACTIONS.iter().any(|(name, _)| *name == action) {
             return Err(Status::unimplemented(format!("DoAction {action}: Pondra doesn't take it (its actions: BeginTransaction, EndTransaction)")));
         }
-        let who = caller(&self.0 .0, &req).await;
+        let who = caller(&req);
         crate::auth::WHO.scope(who, async move { self.0.do_action(req).await }).await
     }
 
