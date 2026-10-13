@@ -29,6 +29,10 @@
 - **Clients:** `from pondra import *` no longer replaces Python's `sum`, `len`, `max`, `min` and `all`. JavaScript's `local()` takes `timeout` in seconds. ADBC's Flight SQL connections open a transaction unless `autocommit=True`. A string column is `text` in the Postgres catalog.
 - **New settings:** `PONDRA_QUERIES`, `PONDRA_QUEUE_SECS`, `PONDRA_STREAM_MB`, `PONDRA_STATEMENT_TIMEOUT`, `PONDRA_TRUSTED_PROXIES` (set it when your own load balancer fronts the nodes), `PONDRA_TXN_IDLE_SECS`, `PONDRA_BLOCKING_THREADS`.
 
+### Known in 0.34.0
+
+- A `MERGE` whose `ON` doesn't name the table's primary key, run outside a transaction, can replace a row whose key its `WHEN NOT MATCHED THEN INSERT` inserts, where Postgres refuses it with 23505. It has been so since `MERGE` came, and the next release refuses it. Until then, put the key in the `ON`.
+
 The details are in each pull request, and the measures in [`logs/gates/`](https://github.com/alimardon123/pondra/tree/main/logs/gates).
 
 ## What was new in 0.33.0 (since 0.32.0)
