@@ -793,6 +793,9 @@ impl App {
 
     async fn run_query(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
+        if crate::pg_catalog::asked(query) {
+            return crate::pg_catalog::over_http(&self.lake, query).await; // (a request that speaks Postgres, reading its catalog: `?catalog=postgres`)
+        }
         let start = std::time::Instant::now();
         crate::history::read_at(self.lake.visible()); // (its answer again: `t AT (VERSION => n)`)
         let explained = crate::write::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
@@ -1241,6 +1244,7 @@ struct SqlParams {
     stale_ms: Option<u64>,  // accept a cached result up to this old (see `Results`)
     job: Option<String>,    // writes: a retry with the same job id is applied once
     rows: Option<usize>,    // typed: the rows of the first page (the console's rows a page; `SHOWN` if not said)
+    catalog: Option<String>, // "postgres": Postgres's catalog, as the Postgres port answers it (the DB-API, SQLAlchemy: `pg_catalog`)
 }
 
 /// Is this request from whoever started the node here (the shell's or `local()`'s `PONDRA_OWNER_KEY`, a
@@ -1261,10 +1265,15 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
         Ok(session) => session,
         Err(e) => return E::from(e).into_response(), // (a session name that isn't one: refused, saying what one is)
     };
+    let postgres = match p.catalog.as_deref() {
+        None => false,
+        Some("postgres") => true,
+        Some(other) => return E(crate::codes::coded("22023", format!("catalog={other}: the catalog a request may ask for is postgres (Postgres's, as the Postgres port answers it)"))).into_response(),
+    };
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let vars = crate::auth::lent_vars(token); // (Python code a run lent a connection to: the run's variables)
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
-    let go = crate::query::HELD.scope(Default::default(), crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, Box::pin(sql_as(app, p, role, headers, body)))))); // (boxed: a statement's future is big, and every layer around it would copy it)
+    let go = crate::query::HELD.scope(Default::default(), crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(sql_as(app, p, role, headers, body))))))); // (boxed: a statement's future is big, and every layer around it would copy it)
     let (out, heard) = crate::routines::with_notices(crate::python::holder(vars.is_some(), go)).await; // (a lent token's code holds a slot: what it calls takes none)
     let mut r = out.unwrap_or_else(IntoResponse::into_response);
     if session.as_deref().is_some_and(crate::temp::holds) {
@@ -1425,7 +1434,7 @@ impl App {
             let q = text.to_lowercase();
             OFFSET.is_match(text) || !crate::ext::names(text).is_empty() || ["now()", "today(", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
         };
-        let volatile = crate::auth::limited().is_some() || asks(query)
+        let volatile = crate::auth::limited().is_some() || asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
             || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
             || crate::settings::any() // (and its settings may change the answer)
             || crate::routines::with_views(&self.lake, query).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)

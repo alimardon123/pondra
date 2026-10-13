@@ -358,17 +358,7 @@ impl Backend {
         }
         let catalog = crate::pg_catalog::wanted(&sql);
         let batches = match catalog {
-            true => match async { crate::query::sql(&self.session(&sql, user).await?, &sql).await.map_err(user_error)?.collect().await.map_err(|e| user_error(e.into())) }.await {
-                Ok(b) => b,
-                // (over catalog tables that are always empty: no rows, whatever DataFusion made of it)
-                Err(e) => match crate::pg_catalog::empty_answer(&sql) {
-                    Some(names) => {
-                        let schema = Schema::new(names.into_iter().map(|n| datafusion::arrow::datatypes::Field::new(n, DataType::Utf8, true)).collect::<Vec<_>>());
-                        return Ok(Response::Query(rows(&schema, vec![], format)?));
-                    }
-                    None => return Err(e),
-                },
-            },
+            true => crate::pg_catalog::answer(&self.app.lake, &sql, if user.is_empty() { "pondra" } else { user }).await.map_err(user_error)?,
             false => self.answer(&sql).await.map_err(user_error)?,
         };
         let schema = match batches.first() {
