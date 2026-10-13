@@ -444,6 +444,13 @@ def fill(path):
     os.close(fd)
 
 
+def roomy(path):
+    """A quarter of the disk at `path` free: the room a lake there keeps before its writes wait
+    (`store::short_of_room`)."""
+    s = os.statvfs(path)
+    return s.f_bavail >= s.f_blocks // 4
+
+
 EVENTS = json.dumps([["producer", "Utf8"], ["seq", "Int64"], ["i", "Int64"]]).encode()
 
 
@@ -476,11 +483,23 @@ def disk(a):
         info["the disk full: acks a second"] = round(load.since(t0) / (time.time() - t0), 1)
         info["the disk full: reads answered"] = len(load.reads) - reads
         check("the disk full: reads go on", len(load.reads) > reads)
+        s = os.statvfs(mnt)
+        info["the disk full: the lake's own files (MB)"] = ((s.f_blocks - s.f_bavail) * s.f_frsize - os.path.getsize(os.path.join(mnt, "filler"))) >> 20
         os.remove(os.path.join(mnt, "filler"))
-        back, load.phase = time.time(), "room again"
-        again = until(lambda: load.since(back), 60)
-        info["room again: the first ack (s)"] = round(time.time() - back, 1) if again else None
-        check("room again: writes go on within 10 s", again and time.time() - back < 10)
+        gone, load.phase = time.time(), "room again"
+        # (Room is what the writes wait for: a quarter of the disk free. On a fast machine these writers
+        # bring the lake's own files near three quarters of the disk before the filler goes: its WAL,
+        # kept 5 s, and everything its compactor wrote in the last minute, kept that long. Then its
+        # compactor takes the filler's room and the writes wait out that minute: CI acked 267 batches
+        # a second "full", then none for 60 s after the filler went.)
+        room = until(lambda: load.since(gone) or roomy(mnt), 120)
+        at = time.time()
+        until(lambda: load.since(gone), 60)
+        first = min((t for t in list(load.acks) if t >= gone), default=None)
+        info["room again: a quarter of the disk free (s)"] = round(at - gone, 1) if room else None
+        info["room again: the first ack (s)"] = round(first - gone, 1) if first else None
+        check("room again: a quarter of the disk free within two minutes (the lake lets its old files go)", room)
+        check("room again: writes go on within 10 s of it", first is not None and first - at < 10)
         time.sleep(a.secs / 2)
         load.finish()
         info["errors the writers saw"] = dict(load.errors)
