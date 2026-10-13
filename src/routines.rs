@@ -1052,15 +1052,18 @@ fn casts_apart(q: &mut ast::Query) -> bool {
         });
         cast && column
     }
-    let args = |f: &ast::Function| match &f.args {
-        FunctionArguments::List(l) => l.args.clone(),
-        _ => vec![],
-    };
+    let cast = |f: &ast::Function| matches!(&f.args, FunctionArguments::List(l) if l.args.iter().any(casts));
+    // (most queries cast no column in a call: nothing to tell apart, and nothing written out)
+    let mut any = false;
+    calls(q, |f| any |= cast(f));
+    if !any {
+        return false;
+    }
     // Each call as written (its qualifiers left out: `sum(t.c)` is `sum(c)`), and as DataFusion names it.
     let mut met: Vec<(String, String, bool)> = vec![];
     calls(q, |f| {
         let e = Expr::Function(f.clone());
-        met.push((QUALIFIER.replace_all(&e.to_string().to_lowercase(), "").into_owned(), QUALIFIER.replace_all(&said(&e), "").into_owned(), args(f).iter().any(casts)));
+        met.push((QUALIFIER.replace_all(&e.to_string().to_lowercase(), "").into_owned(), QUALIFIER.replace_all(&said(&e), "").into_owned(), cast(f)));
     });
     let mut forms: HashMap<&str, Vec<(&str, bool)>> = HashMap::new();
     for (written, named, cast) in &met {
