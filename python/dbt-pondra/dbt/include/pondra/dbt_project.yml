@@ -1,0 +1,5 @@
+config-version: 2
+name: dbt_pondra
+version: 0.34.0
+
+macro-paths: ["macros"]

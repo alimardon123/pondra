@@ -7488,7 +7488,9 @@ def server():
     env = {**os.environ, "PONDRA_DATABASE_IDLE_SECS": "3"}
     def start(how=()):
         log = open(f"/tmp/pondra-{port}-server-{uuid.uuid4().hex[:6]}.stderr", "w")  # (its databases' nodes write here too: CI keeps it when a check fails)
-        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5"], env=env, stdout=subprocess.DEVNULL, stderr=log)
+        # (a database stops once its log is tiered, and a node's own records — the history, the audit log — commit
+        # quietly, tiered at the latest every 4 × --tier-secs: 4 s here, not the default's 40)
+        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5", "--tier-secs", "1"], env=env, stdout=subprocess.DEVNULL, stderr=log)
         until(lambda: _try(lambda: call(port, "GET", "/databases") is not None), True, 30)
         return p
     srv = start()
@@ -8003,8 +8005,9 @@ def secrets():
     # A session's own temporary secret: its queries only; not in the lake
     mine = as_(bob, f"CREATE TEMPORARY SECRET bobs (TYPE http, BEARER_TOKEN 'bob-own-9999', SCOPE '{url}')", session="bob-session-1")
     temp = [as_(bob, read, session="bob-session-1"), as_(bob, read, session="bob-session-2"), as_(bob, "SELECT name FROM secrets() ORDER BY name", session="bob-session-1"), as_(ann, read, session="bob-session-1")]
+    # (bob's secret covers the web server's URL in his session alone: there it is held to the public internet, `reached`; elsewhere no secret covers it)
     checks["CREATE TEMPORARY SECRET: the session's own (another session, another user naming it: not), in memory, nowhere in the lake"] = mine == {"secret": "bobs", "temporary": True} \
-        and temp[0] == [{"cur": "EUR"}, {"cur": "GBP"}] and "no secret" in temp[1].lower() and {"name": "bobs"} in temp[2] and "bob-own-9999" not in catalog() and "bobs" not in catalog() \
+        and "a temporary secret reaches only the public internet" in str(temp[0]) and "no secret" in temp[1].lower() and {"name": "bobs"} in temp[2] and "bob-own-9999" not in catalog() and "bobs" not in catalog() \
         and temp[3] == [{"cur": "EUR"}, {"cur": "GBP"}]  # (ann's own grant, not bob's secret: her session is her own)
     # A new master key: the previous one set, the leader rewraps every data key when it starts
     node.kill()
@@ -8526,13 +8529,14 @@ def guarded():
     user, reads included; a .py file is an admin's; a page of an answer is its asker's; /stats names
     the cluster's nodes only to a signed-in caller; rows through /append and /insert are in the audit log;
     rows through Flight's DoPut and Kafka's produce are taken as through /append, and a hidden table's rows
-    stream only to a superuser and are written by no statement."""
+    stream only to a superuser and are written by no statement; a keyed table's loads ask UPDATE too, rows
+    marked deleted and another engine's commit taking rows out ask DELETE (S11)."""
     import base64
     import pyarrow as pa, pyarrow.flight as fl, confluent_kafka as ck
     P = A.port
     lake = new_lake()
     audit = {"PONDRA_AUDIT": "role,ddl,function,write"}  # (the writes too: rows through /append and /insert are in the log)
-    a = Node(lake, P, env=audit, flight=f"127.0.0.1:{P + 40}", kafka=f"127.0.0.1:{P + 41}").start()
+    a = Node(lake, P, env=audit, flight=f"127.0.0.1:{P + 40}", kafka=f"127.0.0.1:{P + 41}", pg=f"127.0.0.1:{P + 42}").start()
     checks, info = {}, {}
 
     def ask(port, body, path="/sql", method="POST", auth=None, headers=None):
@@ -8698,6 +8702,78 @@ def guarded():
     checks["a hidden table's rows (pondra$audit) stream to a superuser only: Flight's DoGet and /watch refuse a user granted every table"] = \
         "is Pondra's own" in said["flight get the audit log, carol"] and said["watch the audit log, carol"].startswith("403") and "is Pondra's own" in said["watch the audit log, carol"]
     checks["…and SQL writes none of them, a superuser's INSERT included"] = "written by Pondra alone" in str(said["SQL insert into the audit log, by a superuser"])
+    # S11: a keyed table's loads replace the rows of a key it holds, so every row door asks UPDATE for them too (as
+    # Postgres asks it for ON CONFLICT DO UPDATE), and rows marked deleted (`_deleted`, a Kafka tombstone) ask DELETE;
+    # another engine's commit that takes rows out asks DELETE. An append table's loads still ask INSERT alone.
+    import psycopg
+    from pyiceberg.catalog import load_catalog
+    for q in ["CREATE TABLE stock (id BIGINT PRIMARY KEY, amount DOUBLE)", "INSERT INTO stock VALUES (1, 1.0), (2, 2.0), (3, 3.0)",
+              "CREATE TABLE ice (id BIGINT, amount DOUBLE) WITH (publish = 'iceberg')", "INSERT INTO ice VALUES (1, 1.0), (2, 1.0), (3, 1.0), (4, 1.0)",
+              "CREATE TABLE notes (id BIGINT, amount DOUBLE)",
+              "CREATE USER dave PASSWORD 'dave-password-1'", "GRANT SELECT, INSERT ON stock TO dave", "GRANT SELECT, INSERT ON ice TO dave", "GRANT SELECT, INSERT ON notes TO dave",
+              "CREATE USER erin PASSWORD 'erin-password-1'", "GRANT SELECT, INSERT, UPDATE ON stock TO erin",
+              "CREATE USER fay PASSWORD 'fay-password-1'", "GRANT SELECT, INSERT, UPDATE, DELETE ON stock TO fay", "GRANT SELECT, INSERT, DELETE ON ice TO fay"]:
+        ask(P, q, auth=boss)
+    dave, erin, fay = basic("dave", "dave-password-1"), basic("erin", "erin-password-1"), basic("fay", "fay-password-1")
+    def tombstone(topic, u, p, key):
+        """A record with a key and no value (a tombstone) as a user: each delivery report's error."""
+        reports = []
+        prod = ck.Producer({**sasl(u, p), "message.timeout.ms": 8000})
+        prod.produce(topic, key=json.dumps(key), value=None, on_delivery=lambda err, msg: reports.append(str(err)))
+        prod.flush(10)
+        return reports
+    def copy_in(u, p):
+        """COPY stock FROM STDIN over the Postgres port as a user: "ok", or the error it got."""
+        try:
+            with psycopg.connect(host="127.0.0.1", port=P + 42, user=u, password=p, dbname="lake", autocommit=True) as con, con.cursor() as cur:
+                with cur.copy("COPY stock (id, amount) FROM STDIN") as cp:
+                    cp.write("4\t4.0\n")
+            return "ok"
+        except Exception as e:
+            return f"ERROR {e}"
+    iceberg = lambda u: load_catalog(f"s11_{u}", type="rest", uri=f"http://127.0.0.1:{P}", token=ask(P, f"CREATE TOKEN s11_{u} FOR USER {u}", auth=boss)["token"])
+    def ice_delete(u):
+        """PyIceberg's DELETE of a row of `ice` through the node's REST catalog, as a user's token: "ok", or the error."""
+        try:
+            iceberg(u).load_table("default.ice").delete("id = 1")
+            return "ok"
+        except Exception as e:
+            return f"ERROR {type(e).__name__}: {e}"
+    # (ice's rows tiered and published first, and nothing else writes it: a version published while a delete is under
+    # way is a concurrent change to PyIceberg, which refuses a delete whose filter it matches)
+    watcher = iceberg("boss")
+    def ice_rows():
+        try:
+            return watcher.load_table("default.ice").scan().to_arrow().num_rows
+        except Exception as e:
+            return f"ERROR {e}"
+    published = until(ice_rows, 4, 30)
+    said = {
+        "dave: /append of a key": ask(P, json.dumps({"id": 1, "amount": 9.0}), path="/append/stock", auth=dave),
+        "dave: Flight DoPut": put("stock", dave, ["id", "amount"]),
+        "dave: Kafka produce": produce("stock", "dave", "dave-password-1"),
+        "dave: Postgres COPY": copy_in("dave", "dave-password-1"),
+        "dave: Iceberg DELETE": ice_delete("dave"),
+        "fay: Iceberg DELETE": ice_delete("fay"),
+        "dave: an append table's /append, DoPut and produce": [ask(P, json.dumps({"id": 50, "amount": 1.0}), path="/append/notes", auth=dave), put("notes", dave, ["id", "amount"]), produce("notes", "dave", "dave-password-1")],
+        "erin: /append of a key": ask(P, json.dumps({"id": 1, "amount": 9.0}), path="/append/stock", auth=erin),
+        "erin: /append marked _deleted": ask(P, json.dumps({"id": 2, "_deleted": True}), path="/append/stock", auth=erin),
+        "erin: Kafka tombstone": tombstone("stock", "erin", "erin-password-1", {"id": 3}),
+        "fay: /append marked _deleted": ask(P, json.dumps({"id": 2, "_deleted": True}), path="/append/stock", auth=fay),
+        "fay: Kafka tombstone": tombstone("stock", "fay", "fay-password-1", {"id": 3}),
+    }
+    info["S11"] = {"published": published, **{k: str(v)[:300] for k, v in said.items()}}
+    appended = said["dave: an append table's /append, DoPut and produce"]
+    checks["S11: a keyed table's loads ask UPDATE (/append, Flight, Kafka, COPY); an engine's commit taking rows out asks DELETE; an append table's, INSERT alone"] = \
+        all("permission denied: UPDATE on stock" in str(said[k]) for k in ("dave: /append of a key", "dave: Flight DoPut", "dave: Postgres COPY")) \
+        and "TOPIC_AUTHORIZATION_FAILED" in str(said["dave: Kafka produce"]) and "permission denied: DELETE on ice" in said["dave: Iceberg DELETE"] \
+        and isinstance(appended[0], dict) and isinstance(appended[1], list) and appended[1][0].get("rows") == 1 and appended[2] == ["None"]
+    checks["S11: rows marked deleted (_deleted, a tombstone) ask DELETE; granted it, they delete; granted UPDATE, an upsert lands"] = \
+        isinstance(said["erin: /append of a key"], dict) and "permission denied: DELETE on stock" in str(said["erin: /append marked _deleted"]) \
+        and "TOPIC_AUTHORIZATION_FAILED" in str(said["erin: Kafka tombstone"]) and isinstance(said["fay: /append marked _deleted"], dict) \
+        and said["fay: Kafka tombstone"] == ["None"] and said["fay: Iceberg DELETE"] == "ok" \
+        and until(lambda: ask(P, "SELECT id, amount FROM stock ORDER BY id", auth=boss), [{"id": 1, "amount": 9.0}], 15) == [{"id": 1, "amount": 9.0}] \
+        and until(lambda: ask(P, "SELECT count(*) AS n FROM ice", auth=boss), [{"n": 3}], 15) == [{"n": 3}]
     a.kill(), b.kill()
     # A write token: rows into tables that are there, in the log and their folders; never the lake's records
     lake2 = new_lake()
@@ -8732,6 +8808,77 @@ def guarded():
     print(json.dumps({"guarded": checks, "ok": ok, "info": info}, indent=1, default=str))
     return ok
 
+
+def reached():
+    """What a temporary secret reaches (S6, S7, S37): one a user made reads with its own keys, on the public
+    internet only. Never with the node's own credentials (PROVIDER credential_chain), never a topic, never an
+    address of the node's machine or network, written in the URL, as its endpoint, or a name that resolves
+    there. An admin's reaches what the admin may, this machine too, as the shell's do. And a secret's SCOPE
+    covers a URL only on a boundary: a port's first digits are another port."""
+    import base64, http.server, socket
+    here = tempfile.mkdtemp(prefix="pondra-reached-")
+    open(os.path.join(here, "x.csv"), "w").write("k\nhere\n")
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=here, **k)
+        def log_message(self, *a):
+            pass
+    web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
+    threading.Thread(target=web.serve_forever, daemon=True).start()
+    wp = web.server_address[1]
+    # (no proxy: a name is then resolved by the node itself, as on a server; the node's own keys in its environment)
+    direct = {k: "" for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")} | {"NO_PROXY": "*", "no_proxy": "*"}
+    node = Node(new_lake(), A.port, admin_token="adm", env={**direct, "AWS_ACCESS_KEY_ID": "node-own-key", "AWS_SECRET_ACCESS_KEY": "node-own-secret", "AWS_REGION": "us-east-1"}).start()
+    def ask(auth, q, session=None):
+        try:
+            return call(A.port, "POST", "/sql", q.encode(), headers={"Authorization": auth, **({"x-pondra-session": session} if session else {})})
+        except Exception as e:
+            return f"ERROR {e}"
+    adm = "Bearer adm"
+    ask(adm, "CREATE USER ann PASSWORD 'ann-password-1'")
+    ann = "Basic " + base64.b64encode(b"ann:ann-password-1").decode()
+    public = "a temporary secret reaches only the public internet"
+    try:
+        named = socket.gethostbyname(socket.gethostname())  # (this machine by its own name: a private or loopback address)
+    except OSError:
+        named = None
+    said = {
+        "chain": ask(ann, "CREATE TEMPORARY SECRET mine (TYPE s3, PROVIDER 'credential_chain')", session="ann-session-1"),
+        "kafka": ask(ann, "CREATE TEMPORARY SECRET topics (TYPE kafka)", session="ann-session-1"),
+        "web": ask(ann, "CREATE TEMPORARY SECRET web (TYPE http)", session="ann-session-1"),
+        "s3": ask(ann, f"CREATE TEMPORARY SECRET lan (TYPE s3, KEY_ID 'k', SECRET 's', ENDPOINT 'http://127.0.0.1:{wp}', URL_STYLE 'path')", session="ann-session-1"),
+        "a bucket with the node's keys": ask(ann, "SELECT * FROM read_csv('s3://nodes-own/x.csv')", session="ann-session-2"),
+        "127.0.0.1": ask(ann, f"SELECT * FROM read_csv('http://127.0.0.1:{wp}/x.csv')", session="ann-session-1"),
+        "[::1]": ask(ann, f"SELECT * FROM read_csv('http://[::1]:{wp}/x.csv')", session="ann-session-1"),
+        "localhost": ask(ann, f"SELECT * FROM read_csv('http://localhost:{wp}/x.csv')", session="ann-session-1"),
+        "as a number": ask(ann, f"SELECT * FROM read_csv('http://2130706433:{wp}/x.csv')", session="ann-session-1"),
+        "its own name": ask(ann, f"SELECT * FROM read_csv('http://{socket.gethostname()}:{wp}/x.csv')", session="ann-session-1") if named else "(unresolved)",
+        "an endpoint here": ask(ann, "SELECT * FROM read_csv('s3://somebucket/x.csv')", session="ann-session-1"),
+        "the admin's own": [ask(adm, "CREATE TEMPORARY SECRET web (TYPE http)", session="adm-session-1"),
+                            ask(adm, f"SELECT * FROM read_csv('http://127.0.0.1:{wp}/x.csv')", session="adm-session-1")],
+    }
+    checks, info = {}, {"said": {k: str(v)[:300] for k, v in said.items()}, "this machine's name resolves to": named}
+    checks["a user's temporary secret never lends the node's own credentials (PROVIDER credential_chain) nor reaches a topic: refused by name"] = \
+        "PROVIDER credential_chain reads with the node's own credentials" in said["chain"] and "TYPE kafka is an admin's" in said["kafka"] \
+        and "no secret covers" in said["a bucket with the node's keys"]
+    checks["…it reaches no address of this machine: written (127.0.0.1, [::1], 2130706433), localhost, or a name that resolves here"] = \
+        said["web"] == {"secret": "web", "temporary": True} and all(public in said[k] for k in ("127.0.0.1", "[::1]", "localhost", "as a number")) \
+        and (named is None or public in said["its own name"])
+    checks["…nor an endpoint of this machine (an S3 secret's ENDPOINT)"] = said["s3"] == {"secret": "lan", "temporary": True} and public in said["an endpoint here"]
+    checks["an admin's temporary secret reaches this machine, as the shell's do"] = said["the admin's own"] == [{"secret": "web", "temporary": True}, [{"k": "here"}]]
+    # S7: a SCOPE covers a URL only on a boundary (the port's first digits aren't the port)
+    first = str(wp)[:-1]
+    narrow = [ask(adm, f"CREATE SECRET narrow (TYPE http, SCOPE 'http://127.0.0.1:{first}')"), ask(adm, f"SELECT * FROM read_csv('http://127.0.0.1:{wp}/x.csv')"),
+              ask(adm, f"CREATE OR REPLACE SECRET narrow (TYPE http, SCOPE 'http://127.0.0.1:{wp}')"), ask(adm, f"SELECT * FROM read_csv('http://127.0.0.1:{wp}/x.csv')")]
+    info["narrow"] = [str(x)[:200] for x in narrow]
+    checks["a secret's SCOPE covers a URL only on a boundary: http://127.0.0.1:" + first + " isn't port " + str(wp)] = \
+        "no secret covers" in str(narrow[1]) and narrow[3] == [{"k": "here"}]
+    node.kill()
+    web.shutdown()
+    shutil.rmtree(here, ignore_errors=True)
+    ok = all(checks.values())
+    print(json.dumps({"reached": checks, "ok": ok, **({} if ok else {"info": info})}, indent=1, default=str))
+    return ok
 
 def owned():
     """A node a program started for itself (the shell, local(): PONDRA_OWNER_KEY) answers only that
@@ -11693,7 +11840,8 @@ def sqla():
     without a default refused 23502); LIKE … ESCAPE '/' (ILIKE and NOT LIKE too, a pattern that isn't
     written out refused, literals joined by || taken); a table named with a quote refused, the message saying why; a temporary table's
     PRIMARY KEY (23505 for a repeat, 23502 for NULL, ON CONFLICT skips and replaces); a dropped table's
-    sequence refused until UNDROP, and gone with a PURGE."""
+    sequence refused until UNDROP, and gone with a PURGE; `?catalog=postgres` on POST /sql (the DB-API's and the
+    dialect's) answering Postgres's catalog as the port does."""
     import psycopg
     from decimal import Decimal
     lake = new_lake()
@@ -11815,6 +11963,45 @@ def sqla():
     purged = err("SELECT nextval('sq_p_id_seq')")
     info["purged_sequence"] = purged[1:]
     checks["DROP TABLE … PURGE takes its SERIAL sequence with it: nextval refused"] = purged[0] != 200
+
+    # ?catalog=postgres (pondra.dbapi, SQLAlchemy's dialect over HTTP): Postgres's catalog as the port answers it;
+    # without it HTTP is as before (no pg_catalog; DataFusion's information_schema), and neither answer is the other's
+    def at(s, catalog=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql" + (f"?catalog={catalog}" if catalog else ""), s.encode())
+        r = c.getresponse()
+        data = r.read().decode()
+        return r.status, r.getheader("x-pondra-sqlstate"), json.loads(data) if r.status == 200 else data[:300]
+    rel = "SELECT relname, relkind FROM pg_catalog.pg_class WHERE relname = 'dv'"
+    typ = "SELECT data_type FROM information_schema.columns WHERE table_name = 'dv' AND column_name = 'id'"
+    asked = [at(rel), at(rel, "postgres"), at(rel), at(typ), at(typ, "postgres"), at(typ), at(typ, "x")]
+    port_rel = [list(r) for r in conn.execute(rel).fetchall()]
+    port_typ = [list(r) for r in conn.execute(typ).fetchall()]
+    info["catalog_postgres"] = [a[:2] + (a[2] if a[0] == 200 else a[2][:120],) for a in asked] + [port_rel, port_typ]
+    checks["POST /sql?catalog=postgres answers pg_class and information_schema as the Postgres port does; without it as before (42P01, DataFusion's types), each asked twice; catalog=x 22023"] = \
+        asked[0][1] == "42P01" and asked[2][1] == "42P01" and [list(r.values()) for r in asked[1][2]] == port_rel == [["dv", "r"]] \
+        and asked[3][2] == asked[5][2] == [{"data_type": "Int32"}] and [list(r.values()) for r in asked[4][2]] == port_typ == [["integer"]] \
+        and asked[6][:2] == (400, "22023")
+    node.kill()
+
+    # A user granted one table, and another's column, sees those in Postgres's catalog and nothing else, over the
+    # port and over ?catalog=postgres alike (invariant 382: pg_class named every table to anyone signed in).
+    import base64
+    admin = "harness-admin-token-1"
+    lake2 = new_lake()
+    node = Node(lake2, port, pg=f"127.0.0.1:{pg}", env={"PONDRA_ADMIN_TOKEN": admin}).start()
+    for s in ["CREATE TABLE seen (a INT)", "CREATE TABLE part (a INT, b INT)", "CREATE TABLE hidden (c INT)",
+              "CREATE USER u1 PASSWORD 'u1-password'", "GRANT SELECT ON seen TO u1", "GRANT SELECT (a) ON part TO u1"]:
+        call(port, "POST", "/sql", s.encode(), timeout=60, headers={"Authorization": f"Bearer {admin}"})
+    rel = "SELECT relname FROM pg_class WHERE relkind = 'r' AND relnamespace = 'public'::regnamespace ORDER BY relname"
+    col = "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position"
+    basic = {"Authorization": "Basic " + base64.b64encode(b"u1:u1-password").decode()}
+    over_http = [[list(r.values()) for r in call(port, "POST", "/sql?catalog=postgres", s.encode(), timeout=60, headers=basic)] for s in (rel, col)]
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=u1 password=u1-password dbname=lake", autocommit=True) as c:
+        over_port = [[list(r) for r in c.execute(s).fetchall()] for s in (rel, col)]
+    info["granted_catalog"] = {"http": over_http, "port": over_port}
+    checks["a user granted one table and one column of another sees only those in pg_class and information_schema, over the port and ?catalog=postgres"] = \
+        over_http == over_port == [[["part"], ["seen"]], [["part", "a"], ["seen", "a"]]]
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"sqla": checks, "ok": ok, "info": info}, indent=1, default=str))
@@ -11982,6 +12169,239 @@ def enums():
     if not ok:
         sys.exit(1)
     return f"{sum(checks.values())} of {len(checks)} enum checks"
+
+
+def colnames():
+    """The Postgres port names each answer column as Postgres 16 does (`FigureColname`, src/pg_names.rs), not as
+    DataFusion does (`count(*)`, `Int64(1)`, `oid_1`): `count(*)` is `count`, `'1'::int` is `int4`, `1` is `?column?`,
+    a CASE takes its ELSE's name, `c.oid, c.*` over pg_catalog.pg_collation names two columns `oid`, and an UPDATE's
+    RETURNING names its items as a SELECT does. psycopg sees those names three ways: a plain execute (the extended
+    protocol), the same statement prepared and run twice, and the simple protocol (`pgconn.exec_`, then each column's
+    `fname`). The rows are unchanged: the same values HTTP answers for the same statements. HTTP keeps DataFusion's
+    names (`count(*)`, `a` and `a_1`, `Int64(1)`), so the change is the Postgres port's alone."""
+    import psycopg
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 10
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    # Each statement with the names Postgres 16 printed for it (psycopg's cursor.description), over a table
+    # t (a int, b int, c text, x int, ts timestamp, arr bigint[]) that the test makes and fills with three rows.
+    COLNAMES = [
+        ("SELECT c.oid, c.* FROM pg_catalog.pg_collation c", ["oid", "oid", "collname", "collnamespace", "collowner", "collprovider", "collisdeterministic", "collencoding", "collcollate", "collctype", "colliculocale", "collicurules", "collversion"]),
+        ("SELECT count(*) FROM t", ["count"]),
+        ("SELECT sum(a), max(a) FROM t", ["sum", "max"]),
+        ("SELECT 1", ["?column?"]),
+        ("SELECT a + b FROM t", ["?column?"]),
+        ("SELECT NULL", ["?column?"]),
+        ("SELECT a::text FROM t", ["a"]),
+        ("SELECT '1'::int", ["int4"]),
+        ("SELECT CAST(1 AS bigint)", ["int8"]),
+        ("SELECT CASE WHEN a > 1 THEN b ELSE x END FROM t", ["x"]),
+        ("SELECT CASE WHEN a > 1 THEN 1 ELSE 2 END FROM t", ["case"]),
+        ("SELECT (SELECT max(a) FROM t)", ["max"]),
+        ("SELECT now()", ["now"]),
+        ("SELECT ARRAY[1, 2]", ["array"]),
+        ("SELECT current_timestamp", ["current_timestamp"]),
+        ("SELECT current_user", ["current_user"]),
+        ("SELECT EXTRACT(year FROM ts) FROM t", ["extract"]),
+        ("SELECT trim(' a ')", ["btrim"]),
+        ("SELECT substring('abc' FROM 1 FOR 2)", ["substring"]),
+        ("SELECT ts AT TIME ZONE 'UTC' FROM t", ["timezone"]),
+        ('SELECT a AS "Foo" FROM t', ["Foo"]),
+        ("SELECT a AS foo FROM t", ["foo"]),
+        ("SELECT a, a FROM t", ["a", "a"]),
+        ("SELECT *, a FROM t", ["a", "b", "c", "x", "ts", "arr", "a"]),
+        ("SELECT a FROM t UNION SELECT b FROM t", ["a"]),
+        ("SELECT x IS NULL FROM t", ["?column?"]),
+        ("SELECT coalesce(a, 1) FROM t", ["coalesce"]),
+        ("SELECT row_number() OVER (ORDER BY a) FROM t", ["row_number"]),
+        ("WITH c AS (SELECT a FROM t) SELECT count(*) FROM c", ["count"]),
+        ("UPDATE t SET b = b WHERE a = 1 RETURNING a, b + 1, c::text", ["a", "?column?", "c"]),
+    ]
+    # Statements whose rows HTTP answers the same way (ordered, so the two answers can be compared as they are).
+    SAME_ROWS = ["SELECT count(*) FROM t", "SELECT sum(a), max(a) FROM t", "SELECT a + b FROM t ORDER BY a",
+                 "SELECT CASE WHEN a > 1 THEN b ELSE x END FROM t ORDER BY a", "SELECT (SELECT max(a) FROM t)", "SELECT a::text FROM t ORDER BY a"]
+    checks, info = {}, {}
+    node = None
+
+    def check(name, fn):
+        """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def q(s):
+        return call(port, "POST", "/sql", s.encode(), timeout=120)
+
+    def ways(conn, s):
+        """The names psycopg sees for `s` in each way: 'plain' (a plain execute, the extended protocol), 'prepared'
+        (the statement prepared and run twice) and 'simple' (`pgconn.exec_`, each column's `fname`). A statement
+        that errors is kept as its error, which no name list equals."""
+        try:
+            plain = [c.name for c in conn.execute(s).description]
+            prepared = [[c.name for c in conn.execute(s, prepare=True).description] for _ in range(2)]
+            res = conn.pgconn.exec_(s.encode())
+            return {"plain": plain, "prepared": prepared, "simple": [res.fname(i).decode() for i in range(res.nfields)]}
+        except psycopg.Error as e:
+            return {"error": f"{type(e).__name__}: {str(e).splitlines()[0]}"}
+
+    try:
+        node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+        q("CREATE TABLE t (a INT, b INT, c TEXT, x INT, ts TIMESTAMP, arr BIGINT[])")
+        q("INSERT INTO t VALUES (1, 2, 'x', 3, TIMESTAMP '2026-01-01 00:00:00', NULL), "
+          "(2, 5, 'y', 4, TIMESTAMP '2026-01-02 00:00:00', NULL), (3, 7, 'z', NULL, NULL, NULL)")
+        with psycopg.connect(url, autocommit=True) as conn:
+            seen = {s: ways(conn, s) for s, _ in COLNAMES}
+
+        def sent(way):
+            """Every statement sends Postgres 16's names in `way`; the ones that don't are kept in info."""
+            bad = {}
+            for s, want in COLNAMES:
+                wanted = [want, want] if way == "prepared" else want
+                got = seen[s].get("error") or seen[s][way]
+                if got != wanted:
+                    bad[s] = {"want": wanted, "got": got}
+            if bad:
+                info[f"{way} names that differ"] = bad
+            return not bad
+
+        check(f"extended protocol (cur.execute): all {len(COLNAMES)} statements send Postgres 16's names, c.oid, c.* over "
+              "pg_collation included (two oids), count(*) as count, CASE as its ELSE's name", lambda: sent("plain"))
+        check("prepared (prepare=True, run twice): the same names both times, Postgres 16's", lambda: sent("prepared"))
+        check("simple protocol (pgconn.exec_, then each column's fname): Postgres 16's names", lambda: sent("simple"))
+
+        def rows_same():
+            """The Postgres port's rows for SAME_ROWS are HTTP's, value for value."""
+            with psycopg.connect(url, autocommit=True) as conn:
+                pg_rows = {s: [[str(v) for v in r] for r in conn.execute(s).fetchall()] for s in SAME_ROWS}
+            http_rows = {s: [[str(v) for v in r.values()] for r in q(s)] for s in SAME_ROWS}
+            if pg_rows != http_rows:
+                info["rows that differ"] = {"pg": pg_rows, "http": http_rows}
+            return pg_rows == http_rows
+
+        check(f"rows: the Postgres port's answers to {len(SAME_ROWS)} statements are HTTP's, value for value", rows_same)
+
+        def http_names():
+            """HTTP keeps DataFusion's names for the same statements: count(*), a and a_1, Int64(1)."""
+            got = {s: list(q(s)[0].keys()) for s in ("SELECT count(*) FROM t", "SELECT a, a FROM t", "SELECT 1")}
+            want = {"SELECT count(*) FROM t": ["count(*)"], "SELECT a, a FROM t": ["a", "a_1"], "SELECT 1": ["Int64(1)"]}
+            if got != want:
+                info["HTTP names that differ"] = {"want": want, "got": got}
+            return got == want
+
+        check("HTTP keeps DataFusion's names: count(*), a and a_1, Int64(1) (the change is the Postgres port's alone)", http_names)
+    finally:
+        if node is not None:
+            node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"colnames": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} column-name checks"
+def remembered():
+    """The Postgres port answers a repeated query as HTTP does (`App::remembers`): the same text at the same
+    catalog version, from any connection, runs once (`pondra_queries_total`), and a commit makes the next one
+    run again with the new rows. Never what may answer otherwise: a transaction's reads (its own writes), now(),
+    random(), a temporary table, a session with a DataFusion setting; nor for a user granted some tables, who
+    is refused a table another user's remembered answer read. Each connection sends the answer in its own
+    formats (text, binary) and parameters are part of the text a prepared statement runs."""
+    import psycopg
+    lake = new_lake()
+    pg = A.port + 10
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    node = Node(lake, A.port, pg=f"127.0.0.1:{pg}").start()
+    checks, info = {}, {}
+    q = lambda s: sql(A.port, s)
+    ran = lambda: metrics_of(A.port).get("pondra_queries_total", 0)
+    q("CREATE TABLE r_t (id BIGINT, amount DOUBLE)")
+    q("INSERT INTO r_t SELECT value AS id, value * 1.5 AS amount FROM range(1, 1001)")
+    Q = "SELECT count(*) AS n, sum(amount) AS s FROM r_t WHERE id % 3 = 1"
+    a, b = psycopg.connect(url, autocommit=True), psycopg.connect(url, autocommit=True)
+
+    # 1. Five asks from two connections at one version: run once, the same answer each time. Between
+    # them a statement the audit log keeps: its line lands 50 ms later, a commit no read sees (`store::quiet`;
+    # loud, it made CI's asks straddle the CREATE TABLE's line now and then).
+    before = ran()
+    got = [a.execute(Q).fetchall()]
+    runs = ran() - before
+    try:
+        q("CREATE TABLE r_t (id BIGINT)")  # (42P07: a failed DDL statement, a line of the audit log and nothing else)
+    except Exception:
+        pass
+    time.sleep(0.3)
+    before = ran()
+    got += [c.execute(Q).fetchall() for c in (a, a, b, b)]
+    runs += ran() - before
+    info["asked five times from two connections, the audit log written between: runs"] = runs
+    checks["a query asked again, from another connection too, at one version (the audit log written between): run once, the same answer"] = runs == 1 and all(g == got[0] for g in got) and got[0][0][0] == 334
+
+    # 2. A commit: the next ask runs again and sees the new row; HTTP agrees.
+    a.execute("INSERT INTO r_t VALUES (1000000, 2.0)")  # (1000000 % 3 == 1)
+    before = ran()
+    after = b.execute(Q).fetchall()
+    checks["after a commit the next ask runs again, with the new row, as HTTP answers it"] = ran() - before == 1 and after[0][0] == 335 and q(Q) == [{"n": 335, "s": after[0][1]}]
+
+    # 3. In a transaction: its own write is read, never the remembered answer; outside, the committed one.
+    a.execute("BEGIN")
+    a.execute("INSERT INTO r_t VALUES (1000003, 2.0)")
+    inside = a.execute(Q).fetchall()[0][0]
+    outside = b.execute(Q).fetchall()[0][0]
+    a.execute("ROLLBACK")
+    checks["in a transaction its own write is read (336); another connection reads the committed answer (335)"] = (inside, outside) == (336, 335)
+
+    # 4. What moves on its own: now(), random(), a temporary table.
+    t1 = a.execute("SELECT now()").fetchall()
+    time.sleep(0.01)
+    t2 = a.execute("SELECT now()").fetchall()
+    r1, r2 = a.execute("SELECT random()").fetchall(), a.execute("SELECT random()").fetchall()
+    a.execute("CREATE TEMP TABLE r_tmp (x BIGINT)")
+    a.execute("INSERT INTO r_tmp VALUES (1)")
+    n1 = a.execute("SELECT count(*) FROM r_tmp").fetchall()[0][0]
+    a.execute("INSERT INTO r_tmp VALUES (2)")
+    n2 = a.execute("SELECT count(*) FROM r_tmp").fetchall()[0][0]
+    checks["never what moves on its own: now(), random(), a temporary table's rows"] = t1 != t2 and r1 != r2 and (n1, n2) == (1, 2)
+
+    # 5. A session with a DataFusion setting runs its own.
+    c = psycopg.connect(url, autocommit=True)
+    c.execute(Q).fetchall()
+    c.execute("SET datafusion.execution.batch_size = 1024")
+    before = ran()
+    c.execute(Q).fetchall()
+    checks["a session with a DataFusion setting runs its own query"] = ran() - before == 1
+    c.close()
+
+    # 6. One remembered answer, each connection's formats; parameters are part of the text.
+    P = "SELECT id, amount FROM r_t WHERE id = %s"
+    text = a.execute(P, (7,), prepare=True).fetchall()
+    binary = b.cursor(binary=True).execute(P, (7,), prepare=True).fetchall()
+    other = a.execute(P, (8,), prepare=True).fetchall()
+    checks["parameters keep answers apart, and text and binary connections read one answer alike"] = text == binary == [(7, 10.5)] and other == [(8, 12.0)]
+    a.close(); b.close()
+
+    # 7. A user granted some tables never gets another's remembered answer: refused, as it would be.
+    for s in ["CREATE USER r_boss PASSWORD 'boss-password-1' SUPERUSER", "CREATE TABLE r_secret (x BIGINT)", "INSERT INTO r_secret VALUES (1), (2)",
+              "CREATE USER r_ann PASSWORD 'ann-password-1'", "GRANT SELECT ON r_t TO r_ann"]:
+        q(s) if "r_boss" in s else psycopg.connect(f"host=127.0.0.1 port={pg} user=r_boss password=boss-password-1 dbname=lake", autocommit=True).execute(s)
+    boss = psycopg.connect(f"host=127.0.0.1 port={pg} user=r_boss password=boss-password-1 dbname=lake", autocommit=True)
+    ann = psycopg.connect(f"host=127.0.0.1 port={pg} user=r_ann password=ann-password-1 dbname=lake", autocommit=True)
+    S = "SELECT count(*) FROM r_secret"
+    boss_n = [boss.execute(S).fetchall()[0][0] for _ in range(2)]
+    try:
+        ann.execute(S).fetchall()
+        refused = None
+    except psycopg.Error as e:
+        refused = e.sqlstate
+    ann_n = ann.execute("SELECT count(*) FROM r_t").fetchall()[0][0]
+    info["a user granted r_t, asking what a superuser's answer read"] = refused
+    checks["a user granted some tables is refused a table another user's remembered answer read (42501), and reads its own"] = boss_n == [2, 2] and refused == "42501" and ann_n == 1001
+
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"remembered": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(bool(v) for v in checks.values())} of {len(checks)} remembered checks"
 
 
 def uuids():
@@ -12664,6 +13084,24 @@ def bi():
         check("to_date and to_timestamp read their text as Postgres 16 does", lambda: same(BI_TO_DATE, "to_date and to_timestamp"))
         check("format, quote_ident, quote_literal, quote_nullable and parse_ident give Postgres 16's answers",
               lambda: same(BI_HELPERS, "format and quoting"))
+
+        def matview():
+            """A materialized view as DBeaver's and dbt's catalog queries read it: its query as written in pg_matviews and
+            pg_get_viewdef (the same text); a GROUP BY view's groups are its key (an index, as pg_index lists it), and an
+            index made on a row-by-row one shows in hasindexes."""
+            extra.execute("CREATE MATERIALIZED VIEW region_totals AS SELECT region, sum(amount) AS total FROM sales GROUP BY region")
+            extra.execute("CREATE MATERIALIZED VIEW big_sales AS SELECT region, product, amount FROM sales WHERE amount > 10")
+            has = lambda v: extra.execute(f"SELECT hasindexes FROM pg_matviews WHERE matviewname = '{v}'").fetchone()
+            before = has("big_sales")
+            extra.execute("CREATE INDEX big_sales_region ON big_sales (region)")
+            after = has("big_sales")
+            row = extra.execute("SELECT definition, hasindexes FROM pg_matviews WHERE matviewname = 'region_totals'").fetchone()
+            viewdef = extra.execute("SELECT pg_get_viewdef('region_totals'::regclass)").fetchone()
+            info["materialized view"] = {"row-by-row before and after an index": (before, after), "pg_matviews": row, "pg_get_viewdef": viewdef}
+            return before == (False,) and after == (True,) and row is not None and "sum(amount)" in row[0] and "GROUP BY region" in row[0] \
+                and row[1] is True and viewdef == (row[0],)
+        check("a materialized view's query as written, in pg_matviews.definition and pg_get_viewdef, and an index on it in hasindexes",
+              matview)
     finally:
         if extra is not None:
             extra.close()
@@ -16755,7 +17193,7 @@ SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20,
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, bi, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -16787,7 +17225,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "bi", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -16800,7 +17238,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "bi": bi, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

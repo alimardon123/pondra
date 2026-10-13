@@ -14,6 +14,8 @@ python -m venv "$try/venv"
 py=$try/venv/bin/python && [ -x "$py" ] || py=$try/venv/Scripts/python.exe
 "$py" -m pip install -q "$root"/dist/*.whl
 "$py" "$root/tools/package_check.py"  # (no pyarrow: rows as JSON)
+# The wheel registers SQLAlchemy's dialects (pondra/dialect.py) without SQLAlchemy installed: only their names
+"$py" -c "from importlib.metadata import entry_points; names = {e.name for e in entry_points(group='sqlalchemy.dialects')}; assert {'pondra', 'pondra.http', 'pondra.psycopg'} <= names, names"
 "$py" -m pip install -q pyarrow
 "$py" "$root/tools/package_check.py"
 # uv installs the same wheel, and uvx runs its `pondra` without installing it

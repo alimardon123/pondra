@@ -44,6 +44,14 @@ def library_name(platform):
     return {"windows": "pondra_lib.dll", "macos": "libpondra_lib.dylib"}.get(platform.split("-")[0], "libpondra_lib.so")
 
 
+def entry_points():
+    """The wheel's entry_points.txt, from python/pyproject.toml's entry points (SQLAlchemy's dialects), its one definition."""
+    import tomllib  # (Python 3.11 or later, as CI runs this)
+    with open(os.path.join(ROOT, "python", "pyproject.toml"), "rb") as f:
+        groups = tomllib.load(f)["project"].get("entry-points", {})
+    return "".join(f"[{group}]\n" + "".join(f"{name} = {target}\n" for name, target in names.items()) + "\n" for group, names in groups.items())
+
+
 def wheel(lib, launcher, platform, out):
     v, tags = version(), PLATFORMS[platform][0]
     name = f"pondra-{v}-py3-none-{tags}.whl"
@@ -64,6 +72,7 @@ def wheel(lib, launcher, platform, out):
              f"pondra/_lib/{library_name(platform)}": open(lib, "rb").read(),
              f"pondra-{v}.data/scripts/{exe}": open(launcher, "rb").read(),
              f"pondra-{v}.dist-info/METADATA": meta.encode(), f"pondra-{v}.dist-info/WHEEL": wheel_file.encode(),
+             f"pondra-{v}.dist-info/entry_points.txt": entry_points().encode(),
              **{f"pondra-{v}.dist-info/licenses/{n}": open(os.path.join(ROOT, n), "rb").read() for n in LICENSES}}
     digest = lambda b: "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(b).digest()).rstrip(b"=").decode()
     record = "".join(f"{p},{digest(b)},{len(b)}\n" for p, b in files.items()) + f"pondra-{v}.dist-info/RECORD,,\n"

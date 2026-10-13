@@ -881,8 +881,8 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
             match c.columns.is_empty() {
                 true => {
                     // (a column the query takes from a uuid is one here too: `CREATE TABLE t2 AS SELECT * FROM t`)
-                    let uuids = crate::pg_types::columns(from, &sql).await;
-                    sql_types.extend(fields.iter().zip(&uuids).filter(|(_, u)| **u).map(|(f, _)| (f.name().clone(), "uuid".to_string())));
+                    let shape = crate::pg_types::columns(from, &sql).await;
+                    sql_types.extend(fields.iter().zip(&shape.uuids).filter(|(_, u)| **u).map(|(f, _)| (f.name().clone(), "uuid".to_string())));
                     fields
                 }
                 false => {

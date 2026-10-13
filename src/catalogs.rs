@@ -153,7 +153,7 @@ impl Rest {
         let id = hex(&aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, format!("{url}\n{}\n{}\n{location}", options["namespace"], options["table"]).as_bytes()).as_ref()[..12]);
         let made = hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, serde_json::to_vec(&params)?.as_slice()).as_ref());
         let root = format!("delegated://{id}");
-        let store = stored(&root, &made, || Ok(Arc::new(crate::cache::CachedStore::files(crate::ext::build(&url::Url::parse(&bucket)?, Some(&params), false)?))))?;
+        let store = stored(&root, &made, || Ok(Arc::new(crate::cache::CachedStore::files(crate::ext::build(&url::Url::parse(&bucket)?, Some(&params), crate::ext::For::Files)?))))?;
         lake.rt.register_object_store(&url::Url::parse(&root)?, store.clone());
         Ok(Some(Delegated { prefix: format!("s3://{}{}", u.host_str().unwrap_or_default(), u.path()), bucket, root, store }))
     }

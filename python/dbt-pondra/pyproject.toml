@@ -1,0 +1,22 @@
+[project]
+name = "dbt-pondra"
+version = "0.34.0"
+description = "A dbt adapter for Pondra: tables with keys and layouts, MERGE incremental models, and materialized views Pondra keeps current"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+authors = [{ name = "Alimardon" }]
+urls = { Documentation = "https://alimardon123.github.io/pondra/", Repository = "https://github.com/alimardon123/pondra" }
+keywords = ["dbt", "adapter", "lakehouse", "pondra", "postgres"]
+dependencies = ["dbt-core>=1.9", "dbt-postgres>=1.9,<2"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+# dbt's own packages are namespaces (dbt/, dbt/adapters/, dbt/include/), so only ours are listed
+include = ["dbt.adapters.pondra", "dbt.include.pondra"]
+
+[tool.setuptools.package-data]
+"dbt.include.pondra" = ["dbt_project.yml", "macros/*.sql"]

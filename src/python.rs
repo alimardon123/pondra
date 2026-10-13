@@ -235,7 +235,7 @@ async fn pool(packages: &str) -> Result<Arc<Pool>> {
 async fn install(packages: &str) -> Result<String> {
     static BUSY: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
     let _one = BUSY.lock().await;
-    let dir = std::env::temp_dir().join("pondra-python").join(format!("{:016x}", fnv(packages)));
+    let dir = crate::cluster::own_temp("pondra-python").context("the temporary folder's pondra-python isn't this user's alone: packages aren't installed where another user could change them")?.join(format!("{:016x}", fnv(packages)));
     let done = dir.join(".installed");
     if !done.exists() {
         std::fs::create_dir_all(&dir)?;

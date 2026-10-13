@@ -129,7 +129,8 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
     });
     let mut who = crate::auth::Principal::of(if app.open().await { Role::Admin } else { Role::None }).at("kafka", from);
     while let Ok(size) = rd.read_i32().await {
-        ensure!((0..=128 << 20).contains(&size), "request of {size} bytes");
+        let most = if who.role == Role::None { 1 << 20 } else { 128 << 20 }; // (before signing in: ApiVersions, SASL and Metadata, all small)
+        ensure!((0..=most).contains(&size), "request of {size} bytes");
         let mut buf = vec![0; size as usize];
         rd.read_exact(&mut buf).await?;
         let reply = request(&app, &me, &mut who, &peer, Bytes::from(buf)).await?;
@@ -354,7 +355,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
             let (index, records) = (r.i32()?, r.nbytes()?.unwrap_or_default());
             let outcome = match (&meta, index) {
                 _ if !allowed => ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(format!("this {} may not write {name}", if who.access.is_some() { "user" } else { "token" })))),
-                (Some(meta), 0) => queue(app, &name, meta, &records).await,
+                (Some(meta), 0) => queue(app, who, &name, meta, &records).await,
                 _ => ready((UNKNOWN_TOPIC, -1, None)),
             };
             parts.push((index, outcome));
@@ -393,7 +394,7 @@ fn ready(o: Outcome) -> BoxFuture<'static, Outcome> { async move { o }.boxed() }
 /// Queue one partition's record batches in the log, in order. An idempotent producer's batch is
 /// exactly-once: its (producer id, sequence) become a Pondra producer and seq, and `prev` makes
 /// a batch that overtook its predecessor fail (OUT_OF_ORDER_SEQUENCE; the client resends it).
-async fn queue(app: &App, table: &str, meta: &TableMeta, records: &[u8]) -> BoxFuture<'static, Outcome> {
+async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &TableMeta, records: &[u8]) -> BoxFuture<'static, Outcome> {
     let invalid = |e: anyhow::Error| {
         eprintln!("kafka: a record for {table} refused: {e:#}"); // (librdkafka shows only the code; this says why)
         ready((INVALID_RECORD, -1, Some(format!("{e:#}"))))
@@ -422,6 +423,9 @@ async fn queue(app: &App, table: &str, meta: &TableMeta, records: &[u8]) -> BoxF
         };
         if let Err(e) = crate::defaults::check(meta, table, &rows) {
             return invalid(e); // (NOT NULL: said as a bad record, which a producer doesn't retry; a UNIQUE's duplicate is the leader's to find, and `failed` says it the same way)
+        }
+        if let Err(e) = crate::auth::WHO.sync_scope(who.clone(), || crate::auth::check_load(meta, &crate::auth::catalog_name(table), &rows)) {
+            return ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(e.to_string()))); // (a keyed topic's records replace their keys', a tombstone deletes: S11)
         }
         let src = match b.producer_id >= 0 && b.base_seq >= 0 {
             true => {
@@ -483,7 +487,7 @@ struct Batch {
 
 /// Record batches (format v2, "magic 2"), checked against their CRC, decompressed.
 fn decode_batches(mut b: &[u8]) -> Result<Vec<Batch>> {
-    let mut out = vec![];
+    let (mut out, mut left) = (vec![], MOST); // (what the request's batches may hold decompressed, all together)
     while b.len() >= 61 {
         let len = i32::from_be_bytes(b[8..12].try_into()?) as usize + 12;
         ensure!(len >= 61 && len <= b.len(), "truncated record batch");
@@ -497,10 +501,12 @@ fn decode_batches(mut b: &[u8]) -> Result<Vec<Batch>> {
         let base_ts = r.i64()?;
         r.i64()?; // max timestamp
         let (producer_id, epoch, base_seq, count) = (r.i64()?, r.i16()?, r.i32()?, r.i32()?);
-        let body = decompress(attributes & 7, &r.b[r.at..])?;
+        let body = decompress(attributes & 7, &r.b[r.at..], left)?;
+        left -= body.len() as u64;
         let log_append = attributes & 8 != 0;
+        let most = body.len() / 7; // (a record takes 7 bytes at least: a count from the client can't ask for more room than that)
         let mut r = Rd { b: body.into(), at: 0 };
-        let mut recs = Vec::with_capacity(count.max(0) as usize);
+        let mut recs = Vec::with_capacity((count.max(0) as usize).min(most));
         for _ in 0..count {
             r.varint()?; // length
             r.i8()?; // attributes
@@ -518,30 +524,41 @@ fn decode_batches(mut b: &[u8]) -> Result<Vec<Batch>> {
     Ok(out)
 }
 
-pub(crate) fn decompress(codec: i16, data: &[u8]) -> Result<Vec<u8>> {
+/// The most a produce request's record batches may hold decompressed, and one batch a broker sends:
+/// a small compressed batch could otherwise ask for gigabytes (S17).
+pub(crate) const MOST: u64 = 256 << 20;
+
+/// `data` decompressed, refused if that is over `most` bytes (nothing past it is read).
+pub(crate) fn decompress(codec: i16, data: &[u8], most: u64) -> Result<Vec<u8>> {
     let mut out = vec![];
     match codec {
         0 => out.extend_from_slice(data),
-        1 => drop(flate2::read::GzDecoder::new(data).read_to_end(&mut out)?),
-        2 => out = unsnappy(data)?,
-        3 => drop(lz4_flex::frame::FrameDecoder::new(data).read_to_end(&mut out)?),
-        4 => out = zstd::decode_all(data)?,
+        1 => drop(flate2::read::GzDecoder::new(data).take(most + 1).read_to_end(&mut out)?),
+        2 => out = unsnappy(data, most)?,
+        3 => drop(lz4_flex::frame::FrameDecoder::new(data).take(most + 1).read_to_end(&mut out)?),
+        4 => drop(zstd::stream::read::Decoder::new(data)?.take(most + 1).read_to_end(&mut out)?),
         c => bail!("compression codec {c}"),
     }
+    ensure!(out.len() as u64 <= most, "record batches over {} MB decompressed", MOST >> 20);
     Ok(out)
 }
 
-/// Snappy, raw or in the Java client's framing (a header, then length-prefixed blocks).
-fn unsnappy(data: &[u8]) -> Result<Vec<u8>> {
+/// Snappy: raw, or as Java's client frames it (xerial: a header, then length-prefixed blocks). The
+/// lengths are read from each block's header, so nothing is allocated past `most`.
+fn unsnappy(data: &[u8], most: u64) -> Result<Vec<u8>> {
     let mut snappy = snap::raw::Decoder::new();
+    let too_big = || anyhow!("record batches over {} MB decompressed", MOST >> 20);
     if !data.starts_with(b"\x82SNAPPY\x00") {
+        ensure!(snap::raw::decompress_len(data)? as u64 <= most, too_big());
         return Ok(snappy.decompress_vec(data)?);
     }
     let (mut out, mut at) = (vec![], 16);
     while at + 4 <= data.len() {
         let n = u32::from_be_bytes(data[at..at + 4].try_into()?) as usize;
         ensure!(at + 4 + n <= data.len(), "truncated snappy block");
-        out.extend(snappy.decompress_vec(&data[at + 4..at + 4 + n])?);
+        let block = &data[at + 4..at + 4 + n];
+        ensure!(out.len() as u64 + snap::raw::decompress_len(block)? as u64 <= most, too_big());
+        out.extend(snappy.decompress_vec(block)?);
         at += 4 + n;
     }
     Ok(out)
@@ -1460,4 +1477,30 @@ async fn offset_fetch(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
         w.put_i16(if coordinator { 0 } else { NOT_COORDINATOR });
     }
     Ok(w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_batch_decompresses_within_bounds() {
+        // (2 MB of zeros packs to a few KB in every codec: past a 1 MB bound it is refused, within 4 MB it comes back)
+        let zeros = vec![0u8; 2 << 20];
+        let mut gz = flate2::write::GzEncoder::new(vec![], flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &zeros).unwrap();
+        let mut lz = lz4_flex::frame::FrameEncoder::new(vec![]);
+        std::io::Write::write_all(&mut lz, &zeros).unwrap();
+        let packed = [
+            (1, gz.finish().unwrap()),
+            (2, snap::raw::Encoder::new().compress_vec(&zeros).unwrap()),
+            (3, lz.finish().unwrap()),
+            (4, zstd::encode_all(&zeros[..], 3).unwrap()),
+        ];
+        for (codec, data) in packed {
+            assert!(data.len() < 200 << 10, "codec {codec} packs zeros small");
+            assert!(decompress(codec, &data, 1 << 20).is_err(), "codec {codec} refused past its bound");
+            assert_eq!(decompress(codec, &data, 4 << 20).unwrap(), zeros, "codec {codec} within it");
+        }
+    }
 }

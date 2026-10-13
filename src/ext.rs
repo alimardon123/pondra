@@ -464,7 +464,11 @@ pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
 fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
     match scheme(u).filter(|s| *s != "file") {
         None => bail!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): read it there, or from a bucket (s3://, gs://, az://, https://)"),
-        Some(_) => ensure!(covering(secrets, u).is_some(), "{}", uncovered(u)),
+        Some(_) => match covering(secrets, u) {
+            None => bail!("{}", uncovered(u)),
+            Some((_, s)) if s.temporary && !s.trusted => crate::public::check(&url::Url::parse(u)?)?, // (`register` holds its store to the public internet)
+            Some(_) => {}
+        },
     }
     Ok(())
 }
@@ -833,7 +837,8 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
         return Ok(());
     }
     let params = secret.as_ref().map(|(n, s)| open(n, s)).transpose()?;
-    let store = build(&url::Url::parse(&root)?, params.as_ref(), false)?;
+    let to = if secret.as_ref().is_some_and(|(_, s)| s.temporary && !s.trusted) { For::Public } else { For::Files };
+    let store = build(&url::Url::parse(&root)?, params.as_ref(), to)?;
     lake.rt.register_object_store(&url::Url::parse(&root)?, Arc::new(crate::cache::CachedStore::files(store))); // (a file's ranges kept by its version)
     MADE.lock().unwrap().get_or_insert_default().insert(root, made_with);
     Ok(())
@@ -853,12 +858,27 @@ pub async fn get(lake: &Lake, url: &str) -> Result<bytes::Bytes> {
     Ok(object_store_df::ObjectStoreExt::get(&store, &path).await.with_context(|| format!("reading {url}"))?.bytes().await?)
 }
 
-/// A store for a bucket, container or host, with a secret's settings or the environment's. A
-/// lake's own bucket (`lake`) is read as `store::open_store` reads it: idle connections dropped,
-/// and every request a turn of the bucket's budget (invariant 182).
-pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, lake: bool) -> Result<Arc<dyn object_store::ObjectStore>> {
+/// Whom a store `build` makes is for.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum For {
+    /// A lake's own bucket, read as `store::open_store` reads it: idle connections dropped, and every
+    /// request a turn of the bucket's budget (invariant 182).
+    Lake,
+    /// Files outside the lakes, with an admin's secret, a catalog's, or the node's own credentials.
+    Files,
+    /// Files read with a temporary secret its maker brought: the public internet only (`public.rs`).
+    Public,
+}
+
+/// A store for a bucket, container or host, with a secret's settings or the environment's.
+pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: For) -> Result<Arc<dyn object_store::ObjectStore>> {
     use object_store::{aws::{AmazonS3Builder, AmazonS3ConfigKey}, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder, http::HttpBuilder};
+    let lake = to == For::Lake;
+    let public = to == For::Public;
     let get = |k: &str| p.and_then(|p| p.get(k)).cloned();
+    // (an endpoint or host written as an address is refused here; a name, as it resolves)
+    let reach = |u: &str| if public { crate::public::check(&url::Url::parse(u).with_context(|| format!("endpoint {u}"))?) } else { Ok(()) };
+    reach(url.as_str())?;
     let chain = p.is_none() || get("provider").as_deref() == Some("credential_chain");
     let bucket = url.host_str().context("no bucket in the URL")?.to_string();
     let home = format!("{}://{bucket}", url.scheme());
@@ -870,7 +890,11 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, lake: 
         }
         if let Some(e) = endpoint.or_else(|| get("endpoint")) {
             let e = if e.contains("://") { e } else if get("use_ssl").as_deref() == Some("false") { format!("http://{e}") } else { format!("https://{e}") };
+            reach(&e)?;
             b = b.with_allow_http(e.starts_with("http://")).with_endpoint(e);
+        }
+        if public {
+            b = b.with_http_connector(crate::public::Connector::default());
         }
         if let Some(r) = get("region") {
             b = b.with_region(r);
@@ -898,7 +922,11 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, lake: 
                 None => {}
             }
             if let Some(e) = get("endpoint") {
+                reach(&e)?;
                 b = b.with_config(K::Client(object_store::ClientConfigKey::AllowHttp), e.starts_with("http://").to_string()).with_base_url(&e);
+            }
+            if public {
+                b = b.with_http_connector(crate::public::Connector::default());
             }
             if lake {
                 b = b.with_config(K::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home));
@@ -910,6 +938,7 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, lake: 
             let mut b = if chain { MicrosoftAzureBuilder::from_env() } else { MicrosoftAzureBuilder::new() }.with_url(url.as_str());
             let conn: BTreeMap<String, String> = get("connection_string").unwrap_or_default().split(';').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_lowercase(), v.to_string())).collect();
             let endpoint = get("endpoint").or(conn.get("blobendpoint").cloned());
+            endpoint.as_deref().map(reach).transpose()?;
             let http = endpoint.as_ref().map(|e| e.starts_with("http://").to_string());
             for (key, found) in [(K::AccountName, get("account_name").or(conn.get("accountname").cloned())), (K::AccessKey, get("account_key").or(conn.get("accountkey").cloned())),
                                  (K::SasKey, get("sas_token")), (K::AuthorityId, get("tenant_id")), (K::ClientId, get("client_id")), (K::ClientSecret, get("client_secret")),
@@ -921,16 +950,20 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, lake: 
             if lake {
                 b = b.with_config(K::Client(object_store::ClientConfigKey::PoolIdleTimeout), "15s").with_http_connector(crate::budget::Budget::of(&home));
             }
+            if public {
+                b = b.with_http_connector(crate::public::Connector::default());
+            }
             Arc::new(b.build()?)
         }
         "http" | "https" => {
             let mut options = object_store::ClientOptions::new().with_allow_http(url.scheme() == "http");
+            let mut headers = object_store::HeaderMap::new();
             if let Some(t) = get("bearer_token") {
-                let mut h = object_store::HeaderMap::new();
-                h.insert("authorization", format!("Bearer {t}").parse()?);
-                options = options.with_default_headers(h);
+                headers.insert("authorization", format!("Bearer {t}").parse()?);
+                options = options.with_default_headers(headers.clone());
             }
-            Arc::new(HttpBuilder::new().with_url(url.as_str()).with_client_options(options).build()?)
+            let b = HttpBuilder::new().with_url(url.as_str()).with_client_options(options);
+            Arc::new(if public { b.with_http_connector(crate::public::Connector { headers }) } else { b }.build()?)
         }
         s => bail!("{s}:// isn't read (s3, r2, gs, az, abfss, https)"),
     })
@@ -1085,7 +1118,7 @@ pub async fn share_token(lake: &Lake, endpoint: &str) -> Result<Option<String>> 
 /// The token a Pondra server's leader is asked with (ADR-058), from the TYPE pondra secret covering it.
 fn pondra_token(secrets: &[(String, Secret)], endpoint: &str) -> Result<Option<String>> {
     let found = secrets.iter().filter(|(n, x)| x.kind == "pondra" && usable(n, x))
-        .filter(|(_, x)| x.scope.as_deref().is_none_or(|p| endpoint.starts_with(p)))
+        .filter(|(_, x)| x.scope.as_deref().is_none_or(|p| within(endpoint, p)))
         .max_by_key(|(_, x)| x.scope.as_ref().map_or(0, |p| p.len() + 1));
     let Some((name, secret)) = found else { return Ok(None) };
     Ok(open(name, secret)?.get("token").cloned())
@@ -1188,6 +1221,8 @@ pub struct Secret {
     pub key: Option<String>, // its data key, wrapped by the master key (`wrap`)
     #[serde(skip)]
     pub temporary: bool, // (CREATE TEMPORARY SECRET: the session's, in memory: `temp.rs`)
+    #[serde(skip)]
+    pub trusted: bool, // (a temporary one an admin or the node's owner made: it reaches what they may; anyone else's, the public internet: `public.rs`)
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lent: bool, // (a key a branch was lent to read its base with: `reach_base` alone, never a statement: ADR-058)
 }
@@ -1524,12 +1559,23 @@ fn made(name: &str, mut params: BTreeMap<String, String>) -> Result<Secret> {
         ensure!(scheme(s).is_some_and(|x| schemes.contains(&x)), "a {t} secret's SCOPE is a URL of {}", schemes.iter().map(|s| format!("{s}://")).collect::<Vec<_>>().join(" or "));
     }
     let (sealed, key) = seal_new(&serde_json::to_vec(&params)?)?;
-    Ok(Secret { kind: t, scope, sealed, key: Some(key), temporary: false, lent: false })
+    Ok(Secret { kind: t, scope, sealed, key: Some(key), temporary: false, trusted: false, lent: false })
 }
 
 /// `CREATE TEMPORARY SECRET`: a session's own, in this node's memory only (`temp.rs`), used by its
-/// queries before the lake's of the same scope, never written anywhere.
-pub fn temporary(name: &str, params: BTreeMap<String, String>) -> Result<Secret> { Ok(Secret { temporary: true, ..made(name, params)? }) }
+/// queries before the lake's of the same scope, never written anywhere. One made by anyone but an
+/// admin or the node's owner reads with its own keys, on the public internet: not with the node's
+/// credentials (S37), not a topic (its brokers name others to connect to), and not an address of
+/// the node's own network (`public.rs`, S6).
+pub fn temporary(name: &str, params: BTreeMap<String, String>) -> Result<Secret> {
+    let trusted = owner() || crate::auth::current().is_none_or(|p| p.role >= crate::auth::Role::Admin);
+    if !trusted {
+        let chain = params.get("provider").is_some_and(|p| p.eq_ignore_ascii_case("credential_chain"));
+        ensure!(!chain, "PROVIDER credential_chain reads with the node's own credentials, which only an admin lends: CREATE SECRET {name} (…, PROVIDER credential_chain, SCOPE '…') and GRANT USAGE ON SECRET {name}");
+        ensure!(!params.get("type").is_some_and(|t| t.eq_ignore_ascii_case("kafka")), "a temporary secret of TYPE kafka is an admin's: a topic's brokers name others to connect to, anywhere");
+    }
+    Ok(Secret { temporary: true, trusted, ..made(name, params)? })
+}
 
 pub async fn create(lake: &Lake, name: &str, params: BTreeMap<String, String>, replace: bool, if_not_exists: bool) -> Result<serde_json::Value> {
     let secret = made(name, params)?;
@@ -1585,8 +1631,14 @@ pub(crate) fn covering(secrets: &[(String, Secret)], url: &str) -> Option<(Strin
 fn scoped<'a>(secrets: impl Iterator<Item = &'a (String, Secret)>, url: &str) -> Option<(String, Secret)> {
     let s = scheme(url)?;
     secrets.filter(|(_, x)| !matches!(x.kind.as_str(), "pondra" | "git") && kind(&x.kind).is_ok_and(|(_, schemes)| schemes.contains(&s)))
-        .filter(|(_, x)| x.scope.as_deref().is_none_or(|p| url.starts_with(p)))
+        .filter(|(_, x)| x.scope.as_deref().is_none_or(|p| within(url, p)))
         .max_by_key(|(_, x)| x.scope.as_ref().map_or(0, |p| p.len() + 1)).cloned()
+}
+
+/// Is `url` inside `scope`? The scope whole, or followed by a path, a query or a fragment: so
+/// `http://127.0.0.1:979` doesn't cover port 9790, nor `s3://data` the bucket `data-other` (S7).
+fn within(url: &str, scope: &str) -> bool {
+    url.strip_prefix(scope).is_some_and(|rest| scope.ends_with('/') || rest.is_empty() || rest.starts_with(['/', '?', '#']))
 }
 
 /// A secret's values by its name, for a procedure's code (`server::secret`): its settings, and
@@ -1791,28 +1843,59 @@ fn sha256_of(key: &str) -> [u8; 32] { aws_lc_rs::digest::digest(&aws_lc_rs::dige
 fn machine_key_if_made() -> Option<String> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     let key = std::fs::read_to_string(std::path::PathBuf::from(home).join(".pondra").join("secret.key")).ok()?;
-    Some(key.trim().to_string()).filter(|k| !k.is_empty())
+    Some(key.trim().to_string()).filter(|k| is_key(k))
 }
+
+/// A machine key is 32 random bytes in hex: anything else in its file is refused, never used.
+fn is_key(k: &str) -> bool { k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit()) }
 
 fn machine_key() -> Result<String> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).context("secrets need a key: set PONDRA_SECRET_KEY")?;
     let path = std::path::PathBuf::from(home).join(".pondra").join("secret.key");
     if let Ok(k) = std::fs::read_to_string(&path) {
-        return Ok(k.trim().to_string());
+        return checked_key(&path, &k);
     }
     std::fs::create_dir_all(path.parent().expect("a folder"))?;
     let mut bytes = [0u8; 32];
     aws_lc_rs::rand::fill(&mut bytes).map_err(|_| anyhow!("no randomness"))?;
     let key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    match link_key(&key, &path) {
+        Ok(()) => Ok(key),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => checked_key(&path, &std::fs::read_to_string(&path)?), // (another node, at once: a file is linked only once whole)
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The key in a machine key file, trimmed: a file that holds less than a key is an error (a crash
+/// once left an empty one, and it would have sealed secrets with nothing).
+fn checked_key(path: &std::path::Path, text: &str) -> Result<String> {
+    let k = text.trim();
+    if !is_key(k) {
+        bail!("{} is empty or cut short ({} characters, not 64): if no secret was sealed with it, delete it and a new one is made; otherwise restore it from a backup", path.display(), k.len());
+    }
+    Ok(k.to_string())
+}
+
+/// Writes `key` as `path`, whole or not at all: it goes to a file of its own beside `path`, is synced,
+/// then hard-linked to `path`, which fails if `path` exists (another node made it first). A crash
+/// leaves at most a stray file beside the key, never half a key.
+fn link_key(key: &str, path: &std::path::Path) -> std::io::Result<()> {
+    let mut salt = [0u8; 8];
+    aws_lc_rs::rand::fill(&mut salt).map_err(|_| std::io::Error::other("no randomness"))?;
+    let tmp = path.with_file_name(format!("secret.key.{}.{}", std::process::id(), salt.iter().map(|b| format!("{b:02x}")).collect::<String>()));
     let mut f = std::fs::OpenOptions::new();
+    f.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut f, 0o600);
-    match f.write(true).create_new(true).open(&path) {
-        Ok(mut file) => std::io::Write::write_all(&mut file, key.as_bytes())?,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(std::fs::read_to_string(&path)?.trim().to_string()), // (another node, at once)
-        Err(e) => return Err(e.into()),
-    }
-    Ok(key)
+    let linked = f
+        .open(&tmp)
+        .and_then(|mut file| {
+            std::io::Write::write_all(&mut file, key.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::hard_link(&tmp, path));
+    let _ = std::fs::remove_file(&tmp); // (the key's name holds the key now, or nothing did)
+    linked
 }
 
 /// `secrets()`: each secret's name, type and scope — never its values.
@@ -1854,5 +1937,36 @@ impl datafusion::catalog::TableProvider for Secrets {
         ];
         let batch = datafusion::arrow::record_batch::RecordBatch::try_new(self.schema(), columns)?;
         datafusion::catalog::MemTable::try_new(self.schema(), vec![vec![batch]])?.scan(state, projection, &[], None).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_machine_key_file_is_whole_or_refused() {
+        let key = "ab".repeat(32);
+        let p = std::path::Path::new("secret.key");
+        assert_eq!(checked_key(p, &format!("{key}\n")).unwrap(), key);
+        assert!(checked_key(p, "ab").is_err());
+        assert!(checked_key(p, "").is_err());
+        let dir = std::env::temp_dir().join(format!("pondra-key-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.key");
+        let _ = std::fs::remove_file(&path);
+        link_key(&key, &path).unwrap();
+        assert!(link_key(&"cd".repeat(32), &path).is_err_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), key);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_scope_covers_its_url_whole_or_followed_by_a_path() {
+        assert!(within("http://127.0.0.1:979/x.csv", "http://127.0.0.1:979") && within("http://127.0.0.1:979", "http://127.0.0.1:979"));
+        assert!(within("s3://data/a/b.parquet", "s3://data/a/") && within("https://h/x?y=1", "https://h/x"));
+        assert!(!within("http://127.0.0.1:9790/x.csv", "http://127.0.0.1:979"), "another port");
+        assert!(!within("s3://data-other/x", "s3://data") && !within("https://prod.example.com.evil.net/", "https://prod.example.com"), "another bucket, another host");
+        assert!(!within("s3://data/ab/x", "s3://data/a"), "another folder");
     }
 }

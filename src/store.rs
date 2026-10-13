@@ -663,7 +663,7 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     // Every request to the bucket takes a turn of its budget, retries too (`budget.rs`, C5).
     let turns = || crate::budget::Budget::of(&root);
     let mut whole: Store = match (params, scheme) {
-        (Some(_), _) => crate::ext::build(&url::Url::parse(&root)?, params, true)?,
+        (Some(_), _) => crate::ext::build(&url::Url::parse(&root)?, params, crate::ext::For::Lake)?,
         (None, "s3") => Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
         (None, "gs") => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).with_config(GoogleConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
         (None, _) => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&root).with_config(AzureConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
@@ -1458,19 +1458,29 @@ impl Delta {
 /// A commit's key that says nothing a read sees changed (retention's marks: `tier::expire`).
 pub const QUIET: &str = "quiet";
 
-/// A commit no remembered answer depends on (`Catalog::version`): only the statements' history's
-/// rows, their producer's progress and its table's entry (`history.rs`, every second on every
-/// node), retention letting segments go and marked `QUIET`, or sequences' blocks taken (`seq.rs`,
-/// marked too). Counting them, every remembered
-/// answer was forgotten every second on a lake nobody wrote to.
+/// The node's own records, which its writer appends (`history::writer`) and no remembered answer
+/// reads (`App::remembers`): the statements' history and the audit log.
+const RECORDS: [&str; 2] = [crate::history::TABLE, crate::audit::TABLE];
+
+/// A commit no remembered answer depends on (`Catalog::version`): only the records' rows, their
+/// producers' progress and their tables' entries (`history.rs`, every second on every node; the
+/// audit log 50 ms after a DDL statement or a refusal), the lake's own keys (`users::KEYS`, written
+/// beside serving when the lake is made, and again when sealed), retention letting segments go and
+/// marked `QUIET`, or numbers taken (sequences' and row ids' blocks, a bulk write's commit:
+/// `log::commit`, marked too). Counting them, every remembered answer was forgotten every second on
+/// a lake nobody wrote to, again 50 ms after each `CREATE TABLE`, and once just after a new lake served.
 fn quiet(d: &Delta) -> bool {
-    let history = |k: &str| k == crate::history::KEY || k.strip_prefix("p/history-").is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()));
+    let hex = |id: &str| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit());
+    let unread = |k: &str| {
+        k == crate::users::KEYS
+            || RECORDS.iter().any(|t| k.strip_prefix("t/") == Some(t) || k.strip_prefix("p/").and_then(|p| p.strip_prefix(t.trim_start_matches("pondra$"))).and_then(|p| p.strip_prefix('-')).is_some_and(hex))
+    };
     let marked = d.puts.iter().any(|(k, _)| k == QUIET);
-    let only = |s: &Segment| s.files.is_empty() && s.parts.keys().all(|t| t == crate::history::TABLE);
+    let only = |s: &Segment| s.files.is_empty() && s.parts.keys().all(|t| RECORDS.contains(&t.as_str()));
     d.deletes.iter().all(|k| k.starts_with("s/") || k.starts_with("d/"))
-        && (marked || d.puts.iter().any(|(k, _)| history(k)))
+        && (marked || d.puts.iter().any(|(k, _)| unread(k)))
         && d.puts.iter().all(|(k, v)| {
-            matches!(k.as_str(), "c" | "n" | "b" | QUIET) || k.starts_with("d/") || history(k) || (marked && (k.starts_with("t/") || k.starts_with("sq/")))
+            matches!(k.as_str(), "c" | "n" | "b" | QUIET) || k.starts_with("d/") || unread(k) || (marked && (k.starts_with("t/") || k.starts_with("sq/")))
                 || (k.starts_with("s/") && serde_json::from_slice::<Segment>(v).is_ok_and(|s| only(&s)))
         })
 }
@@ -2300,6 +2310,29 @@ fn spark_of(ctx: &SessionContext) -> Spark {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a read never sees is quiet, and anything else in the same commit makes it loud
+    /// (invariant 224): `harness.py remembered` asks around the audit log's line and a new lake's keys.
+    #[test]
+    fn quiet_is_what_no_read_sees() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let seg = |table: &str| serde_json::json!({"path": "", "parts": {table: [[0, 10, 1]]}, "ts_ms": 1}).to_string();
+        let quiet_of = |puts: &[(&str, &str)]| quiet(&Delta { id: 9, puts: puts.iter().map(|(k, v)| (k.to_string(), Bytes::from(v.to_string()))).collect(), deletes: vec![] });
+        let audit = seg(crate::audit::TABLE);
+        let (history, user) = (seg(crate::history::TABLE), seg("r_t"));
+        let (audit_p, history_p) = (format!("p/audit-{id}"), format!("p/history-{id}"));
+        assert!(quiet_of(&[("t/pondra$audit", "{}"), ("c", "9")]), "the audit log's table made");
+        assert!(quiet_of(&[("d/3", "x"), ("s/3", &audit), (&audit_p, "1"), ("n", "4"), ("c", "9")]), "the audit log's rows");
+        assert!(quiet_of(&[("d/4", "x"), ("s/4", &history), (&history_p, "1"), ("n", "5"), ("c", "9")]), "the history's rows");
+        assert!(quiet_of(&[("n", "4"), ("b", "2"), (QUIET, "true"), ("c", "9")]), "a row-id block taken");
+        assert!(quiet_of(&[(crate::users::KEYS, "{}"), ("c", "9")]), "the lake's own keys");
+        assert!(!quiet_of(&[("n", "4"), ("b", "2"), ("c", "9")]), "unmarked numbers are loud");
+        assert!(!quiet_of(&[("t/r_t", "{}"), ("c", "9")]), "a table's entry");
+        assert!(!quiet_of(&[("d/3", "x"), ("s/3", &user), ("p/sql:1", "1"), ("n", "4"), ("c", "9")]), "a table's rows");
+        assert!(!quiet_of(&[("d/3", "x"), ("s/3", &user), (QUIET, "true"), ("c", "9")]), "a table's rows, marked");
+        assert!(!quiet_of(&[("p/audit-x", "1"), ("c", "9")]), "a producer only named like the audit log's");
+        assert!(!quiet_of(&[("d/3", "x"), ("s/3", &audit), (&audit_p, "1"), ("v/a_view", "{}"), ("c", "9")]), "the audit log's rows with a view's entry");
+    }
 
     /// A catalog its own node's stop closed answers an error, never a restart (invariant 300):
     /// taken for a fence, the write below would exec this test again.

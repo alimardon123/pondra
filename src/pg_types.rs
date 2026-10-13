@@ -5,7 +5,8 @@
 //! it on the answer's schema (`typed`). It then sends it as Postgres's `uuid` (oid 2950: `pg.rs`'s
 //! `field_type`), and drivers hand it over as their uuid type (psycopg's `UUID`, pgjdbc's
 //! `java.util.UUID`). Nothing plans or answers differently for the mark. A trace that can't tell
-//! marks nothing, and the column goes as text, as before.
+//! marks nothing, and the column goes as text, as before. The same parse gives each column's Postgres name
+//! (`pg_names`), which `typed` keeps in the schema's metadata beside the mark: a statement is parsed once.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::sql::sqlparser::ast::{self, Expr, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value, VisitMut, WildcardAdditionalOptions};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 
+use crate::pg_names;
 use crate::store::{table_key, Lake};
 use crate::write::{ident, object};
 
@@ -32,9 +34,36 @@ type Known = HashMap<String, Option<Cols>>;
 /// Is this answer's column a uuid (`typed` marked it)?
 pub fn is_uuid(f: &Field) -> bool { f.metadata().get(MARK).is_some_and(|t| t == "uuid") }
 
+/// What an answer's columns are, from its statement as written: which are uuids (`columns`), and the
+/// names Postgres gives them (`pg_names::of`; None when they can't be read the same way as the columns).
+#[derive(Default, Clone)]
+pub struct Shape {
+    pub uuids: Vec<bool>,
+    names: Option<Vec<pg_names::Item>>,
+}
+
+impl From<Vec<bool>> for Shape {
+    /// A key lookup's uuids (`serve::point`), with no names of their own.
+    fn from(uuids: Vec<bool>) -> Self { Shape { uuids, names: None } }
+}
+
+/// `schema` as an answer sends it: the columns `shape` marks as uuids, and each column's Postgres name in its
+/// metadata (`pg_names::shown` reads it), where `shape` has the names and they fit the schema. The fields keep
+/// their Arrow names, and the batches are the same.
+pub fn typed(schema: &SchemaRef, shape: &Shape) -> SchemaRef {
+    let marked = marked(schema, &shape.uuids);
+    let Some(names) = shape.names.as_ref().and_then(|items| pg_names::named(&marked, items)) else { return marked };
+    let fields: Vec<Arc<Field>> = marked.fields().iter().zip(names).map(|(f, name)| {
+        let mut meta = f.metadata().clone();
+        meta.insert(pg_names::KEY.into(), name);
+        Arc::new(f.as_ref().clone().with_metadata(meta))
+    }).collect();
+    Arc::new(Schema::new_with_metadata(fields, marked.metadata().clone()))
+}
+
 /// `schema` with the columns `marks` names marked as uuids. Only when there is a mark for each column
 /// and each one marked holds text: anything else is a trace gone wrong, and marks nothing.
-pub fn typed(schema: &SchemaRef, marks: &[bool]) -> SchemaRef {
+fn marked(schema: &SchemaRef, marks: &[bool]) -> SchemaRef {
     let text = |f: &Field| matches!(f.data_type(), DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8);
     let fields = schema.fields();
     if !marks.contains(&true) || marks.len() != fields.len() || fields.iter().zip(marks).any(|(f, m)| *m && !text(f)) {
@@ -51,11 +80,19 @@ pub fn typed(schema: &SchemaRef, marks: &[bool]) -> SchemaRef {
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
-/// Which columns of the answer `sql` gives are uuids, in order: a query's, or a write's RETURNING.
-/// Empty when none is, or when it can't tell.
-pub async fn columns(lake: &Lake, sql: &str) -> Vec<bool> {
-    let Some((stmt, known)) = read(lake, sql).await else { return vec![] };
-    Trace::new(&known).statement(&stmt).map(|c| c.into_iter().map(|(_, u)| u).collect()).unwrap_or_default()
+/// The shape of the answer `sql` gives: which of its columns are uuids, in order (a query's, or a write's
+/// RETURNING; none when none is, or when it can't tell), and the Postgres names of its columns. A catalog
+/// query gets names only, as before: its uuids are never traced. The statement is parsed once for both.
+pub async fn columns(lake: &Lake, sql: &str) -> Shape {
+    let Some(stmt) = one(sql) else { return Shape::default() };
+    let names = pg_names::of(&stmt);
+    if crate::pg_catalog::wanted(sql) {
+        return Shape { uuids: vec![], names };
+    }
+    let mut known = Known::new();
+    look_up(lake, &stmt, &mut known, 0).await;
+    let uuids: Vec<bool> = Trace::new(&known).statement(&stmt).map(|c| c.into_iter().map(|(_, u)| u).collect()).unwrap_or_default();
+    Shape { uuids, names }
 }
 
 /// Which of `sql`'s parameters are uuids, by their number less one (`$1` is 0): one cast to uuid, one

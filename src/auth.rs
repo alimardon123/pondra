@@ -170,6 +170,31 @@ pub fn check_rows(table: &str) -> Result<()> {
     check("insert", table)
 }
 
+/// What a write that changes rows already there asks of a user's grants beyond INSERT, as SQL's own
+/// do (S11): rows that replace their key's (`replaces`: ON CONFLICT DO UPDATE asks UPDATE) and rows
+/// taken out (`deletes`: DELETE). A door that takes rows or another engine's commits asks it once it
+/// knows, so a user granted INSERT alone neither overwrites nor deletes through a back door.
+pub fn check_changes(table: &str, replaces: bool, deletes: bool) -> Result<()> {
+    if replaces {
+        check("update", table)?;
+    }
+    if deletes {
+        check("delete", table)?;
+    }
+    Ok(())
+}
+
+/// A row door's rows into a table (`/append`, Flight, Kafka, Postgres's COPY): a keyed table's
+/// replace the rows of their keys, and its rows marked `_deleted` (a tombstone, Debezium's delete)
+/// delete them.
+pub fn check_load(meta: &crate::store::TableMeta, table: &str, rows: &datafusion::arrow::array::RecordBatch) -> Result<()> {
+    if limited().is_none() {
+        return Ok(()); // (a token's role, or the node's own work: no grants to ask)
+    }
+    let marked = rows.column_by_name("_deleted").and_then(|c| c.as_any().downcast_ref::<datafusion::arrow::array::BooleanArray>()).is_some_and(|d| d.true_count() > 0);
+    check_changes(table, !meta.key.is_empty(), marked)
+}
+
 /// Is the request being served at least `role`'s? (Making a table through `/insert`: an admin's, as
 /// `CREATE TABLE` is.)
 pub fn at_least(role: Role, what: &str) -> Result<()> {
