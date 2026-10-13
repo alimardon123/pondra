@@ -487,6 +487,8 @@ impl Backend {
             return refuse("COPY into an attached lake: INSERT INTO it instead");
         }
         let meta = self.app.lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&table)).await.map_err(user_error)?.ok_or_else(|| user_error(anyhow::anyhow!("no table {table}")))?.logical();
+        // (a keyed table's rows replace their keys': UPDATE too; a `_deleted` column named may delete them: S11)
+        crate::auth::check_changes(&table, !meta.key.is_empty(), c.columns.iter().any(|c| c == "_deleted")).map_err(user_error)?;
         let n = if c.columns.is_empty() { meta.columns.iter().filter(|(c, _)| c != "_deleted").count() } else { c.columns.len() };
         COPIES.lock().unwrap().insert(client.socket_addr(), Pending { copy: Copy { table, ..c }, data: vec![], rows: 0, seq: 0, job: uuid::Uuid::new_v4().to_string() });
         Ok(Response::CopyIn(CopyResponse::new(0, n, stream::empty())))

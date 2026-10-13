@@ -355,7 +355,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
             let (index, records) = (r.i32()?, r.nbytes()?.unwrap_or_default());
             let outcome = match (&meta, index) {
                 _ if !allowed => ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(format!("this {} may not write {name}", if who.access.is_some() { "user" } else { "token" })))),
-                (Some(meta), 0) => queue(app, &name, meta, &records).await,
+                (Some(meta), 0) => queue(app, who, &name, meta, &records).await,
                 _ => ready((UNKNOWN_TOPIC, -1, None)),
             };
             parts.push((index, outcome));
@@ -394,7 +394,7 @@ fn ready(o: Outcome) -> BoxFuture<'static, Outcome> { async move { o }.boxed() }
 /// Queue one partition's record batches in the log, in order. An idempotent producer's batch is
 /// exactly-once: its (producer id, sequence) become a Pondra producer and seq, and `prev` makes
 /// a batch that overtook its predecessor fail (OUT_OF_ORDER_SEQUENCE; the client resends it).
-async fn queue(app: &App, table: &str, meta: &TableMeta, records: &[u8]) -> BoxFuture<'static, Outcome> {
+async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &TableMeta, records: &[u8]) -> BoxFuture<'static, Outcome> {
     let invalid = |e: anyhow::Error| {
         eprintln!("kafka: a record for {table} refused: {e:#}"); // (librdkafka shows only the code; this says why)
         ready((INVALID_RECORD, -1, Some(format!("{e:#}"))))
@@ -423,6 +423,9 @@ async fn queue(app: &App, table: &str, meta: &TableMeta, records: &[u8]) -> BoxF
         };
         if let Err(e) = crate::defaults::check(meta, table, &rows) {
             return invalid(e); // (NOT NULL: said as a bad record, which a producer doesn't retry; a UNIQUE's duplicate is the leader's to find, and `failed` says it the same way)
+        }
+        if let Err(e) = crate::auth::WHO.sync_scope(who.clone(), || crate::auth::check_load(meta, &crate::auth::catalog_name(table), &rows)) {
+            return ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(e.to_string()))); // (a keyed topic's records replace their keys', a tombstone deletes: S11)
         }
         let src = match b.producer_id >= 0 && b.base_seq >= 0 {
             true => {

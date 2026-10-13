@@ -1082,6 +1082,7 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
             crate::defaults::fill(&app.lake, &meta, batch, |c| absent.get(c).cloned()).await?
         }
     };
+    crate::auth::check_load(&meta, name, &batch)?; // (a keyed table's rows replace their keys': UPDATE too; marked _deleted, DELETE: S11)
     Ok(Json(log.append(name.to_string(), Src { producer: p.producer, seq: p.seq, prev: p.prev }, batch).await?))
 }
 

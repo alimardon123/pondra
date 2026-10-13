@@ -1039,6 +1039,9 @@ async fn transaction(axum::extract::State(app): axum::extract::State<crate::serv
 async fn prepare(lake: &Lake, name: &str, current: &Value, asked: &Value) -> Result<Option<Commit>, Refusal> {
     let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(name)).await.ok().flatten().ok_or_else(|| bad(format!("no table {name}")))?;
     let mut c = parse(lake, name, &current["metadata"], asked).await?;
+    // (a user's: taking rows out asks DELETE, and a keyed table's rows replace their keys', UPDATE: S11)
+    let (replaces, deletes) = (!meta.key.is_empty() && !c.incoming.is_empty(), !c.removed.is_empty() || !c.deletes.is_empty() || !c.equality.is_empty());
+    crate::auth::check_changes(name, replaces, deletes).map_err(|e| refused(403, "ForbiddenException", e.to_string()))?;
     if done(lake, &c.job()).await.map_err(|e| bad(format!("{e:#}")))? {
         return Ok(None);
     }

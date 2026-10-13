@@ -8457,13 +8457,14 @@ def guarded():
     user, reads included; a .py file is an admin's; a page of an answer is its asker's; /stats names
     the cluster's nodes only to a signed-in caller; rows through /append and /insert are in the audit log;
     rows through Flight's DoPut and Kafka's produce are taken as through /append, and a hidden table's rows
-    stream only to a superuser and are written by no statement."""
+    stream only to a superuser and are written by no statement; a keyed table's loads ask UPDATE too, rows
+    marked deleted and another engine's commit taking rows out ask DELETE (S11)."""
     import base64
     import pyarrow as pa, pyarrow.flight as fl, confluent_kafka as ck
     P = A.port
     lake = new_lake()
     audit = {"PONDRA_AUDIT": "role,ddl,function,write"}  # (the writes too: rows through /append and /insert are in the log)
-    a = Node(lake, P, env=audit, flight=f"127.0.0.1:{P + 40}", kafka=f"127.0.0.1:{P + 41}").start()
+    a = Node(lake, P, env=audit, flight=f"127.0.0.1:{P + 40}", kafka=f"127.0.0.1:{P + 41}", pg=f"127.0.0.1:{P + 42}").start()
     checks, info = {}, {}
 
     def ask(port, body, path="/sql", method="POST", auth=None, headers=None):
@@ -8629,6 +8630,78 @@ def guarded():
     checks["a hidden table's rows (pondra$audit) stream to a superuser only: Flight's DoGet and /watch refuse a user granted every table"] = \
         "is Pondra's own" in said["flight get the audit log, carol"] and said["watch the audit log, carol"].startswith("403") and "is Pondra's own" in said["watch the audit log, carol"]
     checks["…and SQL writes none of them, a superuser's INSERT included"] = "written by Pondra alone" in str(said["SQL insert into the audit log, by a superuser"])
+    # S11: a keyed table's loads replace the rows of a key it holds, so every row door asks UPDATE for them too (as
+    # Postgres asks it for ON CONFLICT DO UPDATE), and rows marked deleted (`_deleted`, a Kafka tombstone) ask DELETE;
+    # another engine's commit that takes rows out asks DELETE. An append table's loads still ask INSERT alone.
+    import psycopg
+    from pyiceberg.catalog import load_catalog
+    for q in ["CREATE TABLE stock (id BIGINT PRIMARY KEY, amount DOUBLE)", "INSERT INTO stock VALUES (1, 1.0), (2, 2.0), (3, 3.0)",
+              "CREATE TABLE ice (id BIGINT, amount DOUBLE) WITH (publish = 'iceberg')", "INSERT INTO ice VALUES (1, 1.0), (2, 1.0), (3, 1.0), (4, 1.0)",
+              "CREATE TABLE notes (id BIGINT, amount DOUBLE)",
+              "CREATE USER dave PASSWORD 'dave-password-1'", "GRANT SELECT, INSERT ON stock TO dave", "GRANT SELECT, INSERT ON ice TO dave", "GRANT SELECT, INSERT ON notes TO dave",
+              "CREATE USER erin PASSWORD 'erin-password-1'", "GRANT SELECT, INSERT, UPDATE ON stock TO erin",
+              "CREATE USER fay PASSWORD 'fay-password-1'", "GRANT SELECT, INSERT, UPDATE, DELETE ON stock TO fay", "GRANT SELECT, INSERT, DELETE ON ice TO fay"]:
+        ask(P, q, auth=boss)
+    dave, erin, fay = basic("dave", "dave-password-1"), basic("erin", "erin-password-1"), basic("fay", "fay-password-1")
+    def tombstone(topic, u, p, key):
+        """A record with a key and no value (a tombstone) as a user: each delivery report's error."""
+        reports = []
+        prod = ck.Producer({**sasl(u, p), "message.timeout.ms": 8000})
+        prod.produce(topic, key=json.dumps(key), value=None, on_delivery=lambda err, msg: reports.append(str(err)))
+        prod.flush(10)
+        return reports
+    def copy_in(u, p):
+        """COPY stock FROM STDIN over the Postgres port as a user: "ok", or the error it got."""
+        try:
+            with psycopg.connect(host="127.0.0.1", port=P + 42, user=u, password=p, dbname="lake", autocommit=True) as con, con.cursor() as cur:
+                with cur.copy("COPY stock (id, amount) FROM STDIN") as cp:
+                    cp.write("4\t4.0\n")
+            return "ok"
+        except Exception as e:
+            return f"ERROR {e}"
+    iceberg = lambda u: load_catalog(f"s11_{u}", type="rest", uri=f"http://127.0.0.1:{P}", token=ask(P, f"CREATE TOKEN s11_{u} FOR USER {u}", auth=boss)["token"])
+    def ice_delete(u):
+        """PyIceberg's DELETE of a row of `ice` through the node's REST catalog, as a user's token: "ok", or the error."""
+        try:
+            iceberg(u).load_table("default.ice").delete("id = 1")
+            return "ok"
+        except Exception as e:
+            return f"ERROR {type(e).__name__}: {e}"
+    # (ice's rows tiered and published first, and nothing else writes it: a version published while a delete is under
+    # way is a concurrent change to PyIceberg, which refuses a delete whose filter it matches)
+    watcher = iceberg("boss")
+    def ice_rows():
+        try:
+            return watcher.load_table("default.ice").scan().to_arrow().num_rows
+        except Exception as e:
+            return f"ERROR {e}"
+    published = until(ice_rows, 4, 30)
+    said = {
+        "dave: /append of a key": ask(P, json.dumps({"id": 1, "amount": 9.0}), path="/append/stock", auth=dave),
+        "dave: Flight DoPut": put("stock", dave, ["id", "amount"]),
+        "dave: Kafka produce": produce("stock", "dave", "dave-password-1"),
+        "dave: Postgres COPY": copy_in("dave", "dave-password-1"),
+        "dave: Iceberg DELETE": ice_delete("dave"),
+        "fay: Iceberg DELETE": ice_delete("fay"),
+        "dave: an append table's /append, DoPut and produce": [ask(P, json.dumps({"id": 50, "amount": 1.0}), path="/append/notes", auth=dave), put("notes", dave, ["id", "amount"]), produce("notes", "dave", "dave-password-1")],
+        "erin: /append of a key": ask(P, json.dumps({"id": 1, "amount": 9.0}), path="/append/stock", auth=erin),
+        "erin: /append marked _deleted": ask(P, json.dumps({"id": 2, "_deleted": True}), path="/append/stock", auth=erin),
+        "erin: Kafka tombstone": tombstone("stock", "erin", "erin-password-1", {"id": 3}),
+        "fay: /append marked _deleted": ask(P, json.dumps({"id": 2, "_deleted": True}), path="/append/stock", auth=fay),
+        "fay: Kafka tombstone": tombstone("stock", "fay", "fay-password-1", {"id": 3}),
+    }
+    info["S11"] = {"published": published, **{k: str(v)[:300] for k, v in said.items()}}
+    appended = said["dave: an append table's /append, DoPut and produce"]
+    checks["S11: a keyed table's loads ask UPDATE (/append, Flight, Kafka, COPY); an engine's commit taking rows out asks DELETE; an append table's, INSERT alone"] = \
+        all("permission denied: UPDATE on stock" in str(said[k]) for k in ("dave: /append of a key", "dave: Flight DoPut", "dave: Postgres COPY")) \
+        and "TOPIC_AUTHORIZATION_FAILED" in str(said["dave: Kafka produce"]) and "permission denied: DELETE on ice" in said["dave: Iceberg DELETE"] \
+        and isinstance(appended[0], dict) and isinstance(appended[1], list) and appended[1][0].get("rows") == 1 and appended[2] == ["None"]
+    checks["S11: rows marked deleted (_deleted, a tombstone) ask DELETE; granted it, they delete; granted UPDATE, an upsert lands"] = \
+        isinstance(said["erin: /append of a key"], dict) and "permission denied: DELETE on stock" in str(said["erin: /append marked _deleted"]) \
+        and "TOPIC_AUTHORIZATION_FAILED" in str(said["erin: Kafka tombstone"]) and isinstance(said["fay: /append marked _deleted"], dict) \
+        and said["fay: Kafka tombstone"] == ["None"] and said["fay: Iceberg DELETE"] == "ok" \
+        and until(lambda: ask(P, "SELECT id, amount FROM stock ORDER BY id", auth=boss), [{"id": 1, "amount": 9.0}], 15) == [{"id": 1, "amount": 9.0}] \
+        and until(lambda: ask(P, "SELECT count(*) AS n FROM ice", auth=boss), [{"n": 3}], 15) == [{"n": 3}]
     a.kill(), b.kill()
     # A write token: rows into tables that are there, in the log and their folders; never the lake's records
     lake2 = new_lake()
