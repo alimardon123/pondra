@@ -1376,7 +1376,12 @@ pub fn on_node_as(app: &crate::server::App, stmt: Stmt, job: Option<String>, fil
 /// with IF NOT EXISTS, dropped first with OR REPLACE. (`POST /tables/{name}`, which may only add
 /// columns, is the call that may be sent again.)
 async fn existing(app: &crate::server::App, c: &ast::CreateTable, job: &str, files: bool) -> Result<Option<Value>> {
-    match there(&app.lake, c).await? {
+    let mut found = there(&app.lake, c).await;
+    if !matches!(found, Ok(None)) {
+        seen_here(app).await; // (a table just dropped through another node: this one holds the drop once it holds what its leader had)
+        found = there(&app.lake, c).await;
+    }
+    match found? {
         Some(true) => Ok(Some(j!({"table": object(&c.name), "exists": true}))),
         Some(false) => {
             let drop = Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: object(&c.name), if_exists: true, purge: false }]);

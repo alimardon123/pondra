@@ -2,6 +2,7 @@
 `inprocess.py`). Queries become frames (`frame.py`); writes, scripts and procedures run at once."""
 import atexit
 import base64, contextlib
+import http.client
 import importlib.util
 import inspect
 import io
@@ -9,6 +10,7 @@ import itertools
 import json
 import os
 import re
+import select
 import shutil
 import socket
 import struct
@@ -17,6 +19,7 @@ import sys
 import sysconfig
 import tempfile
 import textwrap
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -111,6 +114,59 @@ _TRY_AGAIN = {"57P01", "57P03", "58030", "08000", "08001", "08003", "08006"}
 _GONE = "08006"  # (connection_failure: the node holding the session went)
 
 
+class _Kept:
+    """Requests over one connection per node and thread, kept open for the next: urllib opens and
+    closes one for every request, which cost a quarter of a millisecond each and left a socket
+    waiting to close. Used where no proxy is in the way; an answer read as it streams still gets a
+    connection of its own (`_call`)."""
+
+    def __init__(self, context=None):
+        self.context, self.local = context, threading.local()
+
+    def __call__(self, req, timeout=None):
+        u = urllib.parse.urlsplit(req.full_url)
+        if getattr(self.local, "pid", None) != os.getpid():  # (a forked process opens its own)
+            self.local.pid, self.local.kept = os.getpid(), {}
+        kept = self.local.kept
+        c = kept.pop((u.scheme, u.netloc), None)
+        if c is not None and c.sock is not None and select.select([c.sock], [], [], 0)[0]:
+            c.close()  # (the node closed it while it waited: nothing was sent on it)
+            c = None
+        if c is None:
+            c = (http.client.HTTPSConnection(u.hostname, u.port, context=self.context) if u.scheme == "https"
+                 else http.client.HTTPConnection(u.hostname, u.port))
+        c.timeout = timeout
+        if c.sock is not None:
+            c.sock.settimeout(timeout)
+        headers = dict(req.header_items())
+        if req.data is not None and not req.has_header("Content-type"):
+            headers["Content-Type"] = "application/x-www-form-urlencoded"  # (what urllib sends)
+        try:
+            c.request(req.get_method(), u.path + (f"?{u.query}" if u.query else ""), body=req.data, headers=headers)
+            r = c.getresponse()
+            body = r.read()
+        except (OSError, http.client.HTTPException) as e:
+            c.close()
+            raise urllib.error.URLError(e) from e
+        if r.will_close:
+            c.close()
+        else:
+            kept[(u.scheme, u.netloc)] = c
+        if r.status >= 400:
+            raise urllib.error.HTTPError(req.full_url, r.status, r.reason, r.headers, io.BytesIO(body))
+        return _Read(body, r.headers)
+
+
+class _Read:
+    """An answer read whole: what `_call` asks of urllib's."""
+
+    def __init__(self, body, headers):
+        self.body, self.headers = body, headers
+
+    def read(self):
+        return self.body
+
+
 class Pondra:
     def __init__(self, url="http://127.0.0.1:8080", token=None, producer=None, timeout=300, headers=None, job=None, echo=True, user=None, password=None, ca=None, retry_secs=60):
         """`url`: a node, or several (a list, or separated by commas): any of a cluster's nodes
@@ -134,10 +190,15 @@ class Pondra:
         # nodes on this machine are reached directly, whatever proxy the environment names
         local = all(urllib.parse.urlsplit(u).hostname in ("127.0.0.1", "localhost", "::1") for u in urls)
         handlers = [urllib.request.ProxyHandler({})] if local else []
+        context = None
         if ca:  # (a node's own certificate, or its authority's: a PEM file to trust besides the system's)
             import ssl
-            handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=ca)))
+            context = ssl.create_default_context(cafile=ca)
+            handlers.append(urllib.request.HTTPSHandler(context=context))
         self._open = urllib.request.build_opener(*handlers).open if handlers else urllib.request.urlopen
+        proxies = {} if local else urllib.request.getproxies()
+        proxied = any(p.scheme in proxies and not urllib.request.proxy_bypass(p.hostname) for p in map(urllib.parse.urlsplit, urls))
+        self._kept = None if proxied else _Kept(context)  # (one connection a node and thread, kept open)
         _last = self
 
     def _call(self, method, path, body=b"", headers=None, stream=False, again=None):
@@ -159,7 +220,7 @@ class Pondra:
             try:
                 # (a node in this process answers through its router, with no socket; an answer that streams goes to the loopback port)
                 inproc = None if stream else getattr(self, "_inproc", None)
-                r = (inproc or self._open)(req, timeout=None if stream else self.timeout)
+                r = (inproc or (self._open if stream or not self._kept else self._kept))(req, timeout=None if stream else self.timeout)
                 out = r if stream else r.read()
             except urllib.error.HTTPError as e:
                 self._reached = True

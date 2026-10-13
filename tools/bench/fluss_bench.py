@@ -27,7 +27,8 @@ Both are measured on what both do:
   lookup_batch_timeout_ms), and one lookuper does one lookup at a time;
 - lookups_per_s: the same keys with 64 lookups in flight (Fluss: 64 lookupers, whose lookups the
   client batches together; Pondra: 64 connections), each answer checked.
-- memory_mb: the servers' memory at the end.
+- memory_mb: the servers' memory at the end, and memory_settled_mb 15 s later, once each has given
+  back what it had freed (Pondra's allocator keeps freed pages 10 s for the next query).
 
   fluss_bench.py --fluss <fluss-1.0.0 folder> [--rows 10000000] [--people 1000000] [--engines pondra,fluss]
   (pip install pyfluss==1.0.0 duckdb pyarrow; Fluss needs Java 11 or newer)
@@ -355,6 +356,8 @@ def bench(engine, a, bids, first, again):
     s = time.time() - t
     out["lookups_per_s"] = {"in_flight": 64, "n": len(keys), "per_s": round(len(keys) / s), "wrong": sum(got.get(k) != CITIES[(k + 1) % 5] for k in keys)}
     out["memory_mb"] = rss_mb(pids)
+    time.sleep(15)
+    out["memory_settled_mb"] = rss_mb(pids)
     return out
 
 
