@@ -340,7 +340,8 @@ fn sweep(parent: &FsPath) {
     }
 }
 
-/// What one blocking read of a spilled file takes.
+/// What one blocking read of a spilled file takes; and what a move copies at a time, so a spilled file
+/// never comes into memory whole (it was spilled because memory was short).
 const PIECE: u64 = 8 << 20;
 
 /// `range` of a spilled file, as a stream of pieces of at most `PIECE`, each read in one blocking call.
@@ -478,10 +479,6 @@ impl ObjectStore for Held {
 /// The objects a move copied, by path, each with the e-tag it had in the lake when it was read. Pass 2
 /// copies what has changed since: the target's e-tags are its own, so only the lake's can say.
 pub type Copied = BTreeMap<String, Option<String>>;
-
-/// An object up to this size is copied whole; a bigger one in pieces of it, so a spilled file never comes
-/// into memory whole (it was spilled because memory was short).
-const PIECE: u64 = 8 << 20;
 
 /// `ALTER DATABASE b SET LOCATION 'dir'` (ADR-072 §7, `db.save`): a lake held in this process's memory moves
 /// to a folder or a bucket and goes on there, the same node and port, its tasks running. Every check passes
