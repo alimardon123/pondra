@@ -1,8 +1,8 @@
 //! A lake held in this process's memory (`memory://…`, DuckDB's `:memory:`), and its spill to disk.
 //!
 //! Everything stays in memory below the budget. Past it, the bulk of a lake (its files and its log:
-//! `data/` and `log/`) goes to a folder of this process's in the temporary directory, so loading
-//! more than the memory holds no longer ends the process. The catalog and `files/` (replaced by
+//! `data/` and `log/`) goes to a folder of this process's on disk (`spill_base`), so loading more
+//! than the memory holds no longer ends the process. The catalog and `files/` (replaced by
 //! their version: `PutMode::Update`) stay in memory: they are small, and a local folder can't take
 //! an update.
 use crate::store::{Counted, Store};
@@ -12,8 +12,10 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart};
+use object_store::{CopyMode, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart};
+use bytes::Bytes;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -117,8 +119,10 @@ fn already(at: &Path) -> object_store::Error { object_store::Error::AlreadyExist
 fn missing(at: &Path) -> object_store::Error { object_store::Error::NotFound { path: at.to_string(), source: "it is in no tier of the lake".into() } }
 
 fn spill_failed(e: std::io::Error) -> object_store::Error {
-    object_store::Error::Generic { store: "memory", source: format!("past its budget, a lake in memory spills to a folder in the temporary directory, which can't be used: {e}").into() }
+    object_store::Error::Generic { store: "memory", source: format!("past its budget, a lake in memory spills to a folder on disk (PONDRA_CACHE_DIR says where), which can't be used: {e}").into() }
 }
+
+fn read_failed(e: std::io::Error) -> object_store::Error { object_store::Error::Generic { store: "memory", source: format!("reading a lake's file spilled to disk: {e}").into() } }
 
 impl Inner {
     fn in_mem(&self, at: &Path) -> bool { self.sizes.lock().unwrap_or_else(PoisonError::into_inner).contains_key(at) }
@@ -244,15 +248,45 @@ impl Drop for Disk {
     }
 }
 
-/// The folder the spill folders go in: this user's, in the temporary directory, made 0700 and used only
-/// while it is ours alone (as the cluster's lock folder is), so no other user can take a lock away or
-/// read a lake's files.
+/// Where a spill goes: `PONDRA_CACHE_DIR` when set (with the node's other scratch: `spill.rs`), else the
+/// temporary directory, unless that is itself held in memory (tmpfs: /tmp on Fedora and Arch), where a
+/// spill would free nothing: then the user's cache folder.
+fn spill_base() -> PathBuf {
+    if let Some(dir) = crate::env::get("PONDRA_CACHE_DIR") {
+        return PathBuf::from(dir);
+    }
+    let temp = std::env::temp_dir();
+    #[cfg(target_os = "linux")]
+    if held_in_ram(&temp) {
+        let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
+        if let Some(cache) = cache.filter(|c| c.is_absolute()) {
+            let _ = std::fs::create_dir_all(&cache);
+            if !held_in_ram(&cache) {
+                return cache;
+            }
+        }
+    }
+    temp
+}
+
+/// Is `dir` on a filesystem held in memory (tmpfs, ramfs)?
+#[cfg(target_os = "linux")]
+fn held_in_ram(dir: &FsPath) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return false };
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    unsafe { libc::statfs(path.as_ptr(), &mut fs) == 0 && matches!(fs.f_type as u32, 0x0102_1994 | 0x8584_58f6) } // (TMPFS_MAGIC, RAMFS_MAGIC)
+}
+
+/// The folder the spill folders go in: this user's, in `spill_base`, made 0700 and used only while it
+/// is ours alone (as the cluster's lock folder is), so no other user can take a lock away or read a
+/// lake's files.
 fn spill_parent() -> std::io::Result<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
         let uid = unsafe { libc::getuid() };
-        let dir = std::env::temp_dir().join(format!("pondra-memory-{uid}"));
+        let dir = spill_base().join(format!("pondra-memory-{uid}"));
         let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
         let m = std::fs::symlink_metadata(&dir)?;
         if m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0 {
@@ -262,7 +296,7 @@ fn spill_parent() -> std::io::Result<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        let dir = std::env::temp_dir().join("pondra-memory");
+        let dir = spill_base().join("pondra-memory");
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }
@@ -286,6 +320,30 @@ fn sweep(parent: &FsPath) {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+}
+
+/// What one blocking read of a spilled file takes.
+const PIECE: u64 = 8 << 20;
+
+/// `range` of a spilled file, as a stream of pieces of at most `PIECE`, each read in one blocking call.
+/// The file stays open while it is read, as a file's own stream keeps it: deleted meanwhile, it still reads.
+fn pieces(file: std::fs::File, range: Range<u64>) -> BoxStream<'static, object_store::Result<Bytes>> {
+    futures::stream::try_unfold((file, range.start), move |(mut file, at)| async move {
+        if at >= range.end {
+            return Ok(None);
+        }
+        let len = (range.end - at).min(PIECE) as usize;
+        let read = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut buf = vec![0; len];
+            file.seek(SeekFrom::Start(at))?;
+            file.read_exact(&mut buf)?;
+            Ok::<_, std::io::Error>((file, buf))
+        });
+        let (file, buf) = read.await.map_err(|e| read_failed(std::io::Error::other(e)))?.map_err(read_failed)?;
+        Ok(Some((Bytes::from(buf), (file, at + len as u64))))
+    })
+    .boxed()
 }
 
 /// A multipart upload into memory or onto disk. When it completes, the object is where its parts went:
@@ -336,10 +394,14 @@ impl ObjectStore for Held {
 
     async fn get_opts(&self, at: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
         let got = self.0.mem.get_opts(at, opts.clone()).await;
-        if let (Err(object_store::Error::NotFound { .. }), Some(disk)) = (&got, self.0.disk_of(at)) {
-            return disk.store.get_opts(at, opts).await;
+        let (Err(object_store::Error::NotFound { .. }), Some(disk)) = (&got, self.0.disk_of(at)) else { return got };
+        let mut found = disk.store.get_opts(at, opts).await?;
+        // (a file's own stream reads 8 KB a blocking call, which made queries over a spilled lake 1.4x
+        // slower: read it a piece at a time instead, each piece one call)
+        if let GetResultPayload::File(file, _) = found.payload {
+            found.payload = GetResultPayload::Stream(pieces(file, found.range.clone()));
         }
-        got
+        Ok(found)
     }
 
     fn delete_stream(&self, at: BoxStream<'static, object_store::Result<Path>>) -> BoxStream<'static, object_store::Result<Path>> {
@@ -488,5 +550,29 @@ mod tests {
         up.complete().await.unwrap();
         assert_eq!(h.0.held.load(Relaxed), 20);
         assert_eq!(read(&h, "catalog/m").await, [vec![4; 10], vec![5; 10]].concat());
+    }
+
+    #[tokio::test]
+    async fn a_spilled_file_reads_whole_and_in_ranges_across_its_pieces() {
+        let h = Held::with_budget(0);
+        let body: Vec<u8> = (0..PIECE as usize * 2 + 5).map(|i| (i % 251) as u8).collect();
+        let at = Path::from("data/t/f.parquet");
+        h.put(&at, body.clone().into()).await.unwrap();
+        assert!(!h.0.in_mem(&at));
+        assert_eq!(read(&h, "data/t/f.parquet").await, body);
+        let r = PIECE - 3..PIECE * 2 + 2;
+        assert_eq!(h.get_range(&at, r.clone()).await.unwrap(), body[r.start as usize..r.end as usize]);
+        let got = h.get_opts(&at, GetOptions { range: Some((PIECE + 1..PIECE + 9).into()), ..Default::default() }).await.unwrap();
+        assert_eq!(got.range, PIECE + 1..PIECE + 9);
+        assert_eq!(got.bytes().await.unwrap(), body[PIECE as usize + 1..PIECE as usize + 9]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_folder_held_in_memory_is_told_apart() {
+        if FsPath::new("/dev/shm").is_dir() {
+            assert!(held_in_ram(FsPath::new("/dev/shm")), "/dev/shm is tmpfs");
+        }
+        assert!(!held_in_ram(FsPath::new(env!("CARGO_MANIFEST_DIR"))), "the checkout is on disk");
     }
 }
