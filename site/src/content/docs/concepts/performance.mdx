@@ -374,8 +374,8 @@ print(f"append acknowledged: {ack:.2f} ms median")
 print(f"key lookup:          {lookup:.2f} ms median")
 ```
 
-A node counts what it does. `pondra_object_requests_total` counts the writes, lists and deletes the
-lake's store was asked for, which is what a bucket bills:
+A node counts what it does. `pondra_object_requests_total` counts the requests it made of its
+bucket (writes, lists, deletes and reads), in the classes a bucket bills them in:
 
 ```bash
 curl -s localhost:8080/metrics | grep -E '^pondra_(queries_total|rows_in_total|object_requests_total)'

@@ -15,7 +15,8 @@ crate::per_node!(pub static FILES_SCANNED: AtomicU64 = AtomicU64::new(0)); // ap
 crate::per_node!(pub static FILES_SKIPPED: AtomicU64 = AtomicU64::new(0)); // …and skipped by their min/max
 crate::per_node!(pub static OBJECT_WRITES: AtomicU64 = AtomicU64::new(0)); // object-store requests this process made (`store::Counted`): writes…
 crate::per_node!(pub static OBJECT_LISTS: AtomicU64 = AtomicU64::new(0)); // …lists…
-crate::per_node!(pub static OBJECT_DELETES: AtomicU64 = AtomicU64::new(0)); // …and deletes
+crate::per_node!(pub static OBJECT_DELETES: AtomicU64 = AtomicU64::new(0)); // …deletes…
+crate::per_node!(pub static OBJECT_READS: AtomicU64 = AtomicU64::new(0)); // …and reads (GET and HEAD)
 crate::per_node!(pub static SPILLED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes written to this node's disk
 crate::per_node!(pub static SKEW: AtomicU64 = AtomicU64::new(0)); // the worst bucket/average seen in a shuffle, x100
 crate::per_node!(pub static SKEW_SPLITS: AtomicU64 = AtomicU64::new(0)); // hot partitions of shuffled joins shared out
@@ -85,8 +86,8 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("ranged_queries_total", "counter", "…of them with their tables sliced by a key's ranges", &one(get(&RANGED)));
     metric("files_scanned_total", "counter", "Parquet files queries read", &one(get(&FILES_SCANNED)));
     metric("files_skipped_total", "counter", "Parquet files queries skipped by min/max, unopened", &one(get(&FILES_SKIPPED)));
-    let requests = [("write", &OBJECT_WRITES), ("list", &OBJECT_LISTS), ("delete", &OBJECT_DELETES)].map(|(op, c)| (format!("{{op=\"{op}\"}}"), get(c)));
-    metric("object_requests_total", "counter", "object-store writes, lists and deletes this process made (what a bucket bills and rate-limits most)", &requests);
+    let requests = [("write", &OBJECT_WRITES), ("list", &OBJECT_LISTS), ("delete", &OBJECT_DELETES), ("read", &OBJECT_READS)].map(|(op, c)| (format!("{{op=\"{op}\"}}"), get(c)));
+    metric("object_requests_total", "counter", "requests this process made of its bucket, past the SSD tier: writes (a multipart upload's start, parts and end each one), lists, deletes and reads, as a bucket bills and rate-limits them", &requests);
     metric("background_failures_total", "counter", "background jobs (tiering, publishing, emission, tasks, checkpoints) that failed; a rising count is a stall to look at", &failures().iter().map(|(k, n)| (format!("{{job=\"{k}\"}}"), *n as f64)).collect::<Vec<_>>());
     let turns = crate::budget::turns();
     let label = |b: &str, l: &str| format!("{{bucket=\"{b}\",lake=\"{l}\"}}");

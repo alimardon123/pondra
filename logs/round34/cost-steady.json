@@ -1,0 +1,198 @@
+{
+ "what": "What a steady stream through the Kafka port costs the lake's bucket: requests a second by the class S3 and R2 bill them in, and dollars a month at list prices (S3: PUT/COPY/POST/LIST $5 a million, GET $0.40, storage $0.023 a GB-month; R2: class A $4.50, class B $0.36, $0.015 a GB-month; DELETE free). Requests from the simulator's own count (sim_r2.py `ops`), which the nodes' pondra_object_requests_total matched within 0.5%.",
+ "command": "python3 tools/kafka_bench.py --s3 --steady 30 --nodes N --producers P --warm 30 --secs 90 (sim_r2.py with MOTO_S3_DEFAULT_KEY_BUFFER_SIZE=2000000000 --trace; PONDRA_CACHE_GB=3)",
+ "machine": "one 4-core, 16 GB VM: the nodes, the simulator (Python, one core at 90%) and the producers (16 to 24 Python processes) shared its cores, which were all busy: the target 30 MiB/s was reached by none of the runs (14 to 26 MiB/s). limits-r2.yml's cost job measures it on real R2 nightly.",
+ "date": "2026-10-13",
+ "commit": "main 9e78bb1 + this change",
+ "runs": {
+  "1 node, R2's latency": {
+   "engine": "pondra",
+   "nodes": 1,
+   "producers": 16,
+   "flags": {},
+   "bucket": "simulated",
+   "steady_mib_s": 30.0,
+   "measured_s": 90,
+   "in_mib_s": 13.4,
+   "in_rows_s": 13341,
+   "requests_per_s_nodes": {
+    "write": 8.72,
+    "list": 0.09,
+    "read": 6.31,
+    "delete": 2.5
+   },
+   "requests_per_s_bucket": {
+    "write": 8.73,
+    "list": 0.09,
+    "read": 6.33,
+    "delete": 2.5
+   },
+   "bucket_grew_mb_s": 11.02,
+   "kept_bytes_a_row": 678,
+   "kept_gb_a_day": 781.2,
+   "cost": {
+    "s3": {
+     "requests_usd_month": 120.87,
+     "a_day_kept_usd_month": 17.97
+    },
+    "r2": {
+     "requests_usd_month": 108.78,
+     "a_day_kept_usd_month": 11.72
+    }
+   },
+   "unflushed": 489784,
+   "exactly_once": true,
+   "latency": "R2's (sim_r2.py defaults: PUT p50 197 ms, GET p50 100 ms)",
+   "by_object": {
+    "write": {
+     "log/": 4.64,
+     "catalog/wal": 2.62,
+     "catalog/manifest": 0.29,
+     "catalog/compactions": 0.27,
+     "catalog/compacted": 0.24,
+     "data/*.parquet": 0.11,
+     "cluster/": 0.09,
+     "catalog/gc": 0.02
+    },
+    "read": {
+     "catalog/gc": 1.93,
+     "catalog/manifest": 1.09,
+     "inbox/": 0.82,
+     "catalog/compactions": 0.78,
+     "catalog/compacted": 0.53,
+     "cluster/": 0.09
+    }
+   }
+  },
+  "3 nodes, R2's latency": {
+   "engine": "pondra",
+   "nodes": 3,
+   "producers": 24,
+   "flags": {},
+   "bucket": "simulated",
+   "steady_mib_s": 30.0,
+   "measured_s": 90,
+   "in_mib_s": 16.4,
+   "in_rows_s": 16324,
+   "requests_per_s_nodes": {
+    "write": 15.68,
+    "list": 0.1,
+    "read": 40.12,
+    "delete": 2.34
+   },
+   "requests_per_s_bucket": {
+    "write": 15.73,
+    "list": 0.1,
+    "read": 40.19,
+    "delete": 2.35
+   },
+   "bucket_grew_mb_s": 21.05,
+   "kept_bytes_a_row": 679,
+   "kept_gb_a_day": 957.8,
+   "cost": {
+    "s3": {
+     "requests_usd_month": 246.83,
+     "a_day_kept_usd_month": 22.03
+    },
+    "r2": {
+     "requests_usd_month": 222.14,
+     "a_day_kept_usd_month": 14.37
+    }
+   },
+   "exactly_once": true,
+   "unflushed": 0,
+   "by_object": {
+    "write": {
+     "log/": 10.78,
+     "catalog/wal": 2.91,
+     "catalog/compacted": 0.29,
+     "catalog/manifest": 0.27,
+     "catalog/compactions": 0.24,
+     "data/*.parquet": 0.09,
+     "cluster/": 0.09,
+     "catalog/gc": 0.02
+    },
+    "read": {
+     "log/": 21.84,
+     "catalog/gc": 6.8,
+     "catalog/manifest": 6.67,
+     "catalog/compacted": 0.78,
+     "inbox/": 0.73,
+     "catalog/compactions": 0.71,
+     "data/*.parquet": 0.36,
+     "cluster/": 0.09
+    }
+   },
+   "latency": "R2's (sim_r2.py defaults: PUT p50 197 ms, GET p50 100 ms)"
+  },
+  "1 node, S3's latency": {
+   "engine": "pondra",
+   "nodes": 1,
+   "producers": 16,
+   "flags": {},
+   "bucket": "simulated",
+   "steady_mib_s": 30.0,
+   "measured_s": 90,
+   "in_mib_s": 26.3,
+   "in_rows_s": 26244,
+   "requests_per_s_nodes": {
+    "write": 16.01,
+    "list": 0.1,
+    "read": 6.67,
+    "delete": 4.33
+   },
+   "requests_per_s_bucket": {
+    "write": 16.03,
+    "list": 0.1,
+    "read": 6.67,
+    "delete": 4.33
+   },
+   "bucket_grew_mb_s": 15.95,
+   "kept_bytes_a_row": 678,
+   "kept_gb_a_day": 1538.1,
+   "cost": {
+    "s3": {
+     "requests_usd_month": 215.96,
+     "a_day_kept_usd_month": 35.38
+    },
+    "r2": {
+     "requests_usd_month": 194.36,
+     "a_day_kept_usd_month": 23.07
+    }
+   },
+   "exactly_once": true,
+   "unflushed": 0,
+   "by_object": {
+    "write": {
+     "log/": 10.29,
+     "catalog/wal": 5.49,
+     "catalog/manifest": 0.31,
+     "catalog/compacted": 0.27,
+     "catalog/compactions": 0.22,
+     "cluster/": 0.09,
+     "data/*.parquet": 0.04,
+     "catalog/gc": 0.02
+    },
+    "read": {
+     "catalog/gc": 1.82,
+     "catalog/manifest": 1.13,
+     "inbox/": 0.87,
+     "catalog/compactions": 0.69,
+     "catalog/compacted": 0.56,
+     "cluster/": 0.09
+    }
+   },
+   "latency": "S3 Standard's, roughly (sim_r2.py --put-p50 40 --get-p50 20)"
+  }
+ },
+ "notes": [
+  "Requests come per commit round, not per byte: one node at R2's latency made 10.9 writes a second at 6 MiB/s (4 producers) and 8.7 at 13 MiB/s (16 producers). Each round a node writes one log segment and the leader one catalog write-ahead-log object; a round lasts about as long as the bucket takes to answer, so a faster bucket means more rounds (S3's latency: 16 writes a second at 26 MiB/s).",
+  "Three nodes write a segment each a round: 10.8 segment writes a second, against one node's 4.6 at R2's latency and 10.3 at S3's. Followers also read every segment another node wrote (21.8 reads a second), to keep their SSD tiers warm; reads are a twelfth of a write's price.",
+  "The catalog (SlateDB) reads its manifest and garbage-collection marks about 2 to 5 times a second per node; at 100 nodes that would be about $500 a month on S3.",
+  "Tiering fell behind at 26 MiB/s on the saturated VM ('slow tiering: 1,061,958 rows in 49.8 s'), so the S3-latency run's Parquet writes (0.04 a second) are fewer than a machine with cores to spare would make (the R2 runs: 0.09 to 0.11 a second).",
+  "Kept: 678 bytes a row of about 1,050 bytes of values (LZ4 Parquet over words drawn from 2,048 made-up ones). At 30 MiB/s that is 1.9 TB a day: $43 a month on S3 for each day kept, the same in any system that keeps those bytes in a bucket.",
+  "OpenData's page puts Buffer at about $91 a month at 30 MB/s (16.2 M PUTs, about 6.25 writes a second), WarpStream at about $1,300 and self-hosted Kafka at about $8,500 (unverified).",
+  "unflushed: values the producers still held when they stopped (they offered more than the saturated VM took in). exactly_once counts what was acknowledged: every acknowledged value is in the table once, and nothing beyond what was sent."
+ ],
+ "by_object": "Writes and reads a second by the object they went to, from sim_r2.py's --trace over 45 s inside the measured window (45 to 90 s after the run started); they add to within a few percent of the measured totals."
+}

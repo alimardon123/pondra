@@ -734,7 +734,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    spread it now and then. Only the bytes it read, for this node's rate, wait for a run of 20 ms.
 73. **`pondra_object_requests_total` counts what the store was asked to do** (`store::Counted`), not
    what SlateDB tried: a local disk refuses SlateDB's tagged PUT before writing, and it tries again
-   untagged; the refusal isn't counted.
+   untagged; the refusal isn't counted. Both of a lake's clients are counted (its store, and the
+   bucket's client that scans and the SSD tier's misses use; a request goes through one of them),
+   in the classes a bucket bills: writes (each part of a multipart upload too), lists, deletes and
+   reads. `kafka_bench.py --steady` prices them against `sim_r2.py`'s own count (within 0.5%).
 74. **A column keeps the name it was first written under** (`TableMeta::columns`); SQL's names are
    `names` and `dropped` over it (`TableMeta::logical`). Everything users write goes in by SQL's
    names and into the log by stored names (`log::pack` → `to_stored`), and a name SQL no longer
@@ -2632,6 +2635,7 @@ python3 tools/harness.py flight                # Arrow Flight (pyarrow) and Flig
 python3 tools/metadata_bench.py [--files 1000000]   # a million files: commits, pruning, a restart, 3 nodes
 python3 tools/flight_bench.py                  # Flight in, out, and the log as a stream
 python3 tools/kafka_bench.py [--flag ack=replicated] [--kafka ~/kafka_2.13-4.3.1]   # Kafka ingest throughput and latency, 3 nodes; --kafka: the same producers into an Apache Kafka broker
+python3 tools/kafka_bench.py --s3 --steady 30 [--nodes 3]   # a steady 30 MiB/s through the Kafka port: the bucket's requests a second by class and dollars a month on S3 and R2
 python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP SDK (pip install mcp) against a node
 python3 tools/keyed_bench.py                   # keyed-table compaction: bytes written, correctness
 python3 tools/cluster.py race | isolate | split | spread
