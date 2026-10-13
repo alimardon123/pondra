@@ -552,8 +552,10 @@ pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
 
 /// Decoded log rows, each table's by segment, `TAIL_BYTES` at most. A table's log is read only
 /// after its `tiered` mark (a read that began before reads its own from the store), so its rows up
-/// to the mark go as soon as a read finds it moved, and past the limit the oldest segment goes.
-/// Kept by recent use instead, every node held 256 MB of rows long since in files.
+/// to the mark go when the node sees the commit that moved it (`arrived`), or a read finds it
+/// moved, and past the limit the oldest segment goes. Kept by recent use instead, every node held
+/// 256 MB of rows long since in files; kept until a read, a table read once and then only
+/// written held them too (fluss_bench: 267 MB of a node's 740 once it was idle).
 #[derive(Default)]
 struct Tail {
     rows: std::collections::HashMap<String, BTreeMap<u64, Rows>>,
@@ -917,8 +919,13 @@ impl Lake {
                         }
                     }
                 }
-                (Some("t/"), disk) if disk.is_some() || self.hot.on() => {
+                (Some("t/"), disk) => {
+                    let decoded = self.tail.lock().unwrap().rows.contains_key(&key[2..]);
+                    if !(decoded || disk.is_some() || self.hot.on()) {
+                        continue;
+                    }
                     let Ok(m) = serde_json::from_slice::<TableMeta>(value) else { continue };
+                    self.tail.lock().unwrap().forget(&key[2..], m.tiered); // (rows now in files: no read asks for them again)
                     self.hot.forget(&m.garbage);
                     // (files a tiering round writes; not a bulk load's big files, which only the queries that need them read)
                     if let Some(disk) = disk {
@@ -2159,7 +2166,7 @@ impl Catalog {
             // millisecond for it. On a disk a write is a file whichever way; a bucket keeps the tick,
             // which lets writes made together share one PUT.)
             let db = db.clone();
-            tokio::spawn(async move { let _ = db.flush_with_options(FlushOptions { flush_type: FlushType::Wal }).await; });
+            crate::panics::task(async move { let _ = db.flush_with_options(FlushOptions { flush_type: FlushType::Wal }).await; }); // (a node stopped in a process ends it: ADR-061)
         }
         if let Some((_, v)) = puts.iter().find(|(k, _)| k == "n") {
             self.last_n.store(serde_json::from_slice(v)?, Relaxed);

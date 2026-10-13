@@ -1,75 +1,335 @@
 {
- "what": "Apache Fluss 1.0.0 and Pondra on one 4-core VM (Xeon 2.1 GHz, 15 GB, local disk), each through its own Python client: tools/bench/fluss_bench.py --rows 10000000 --people 1000000, three runs each. Fluss as its quick start runs it (local-cluster.sh: ZooKeeper, a coordinator and a tablet server, three JVMs on Java 21; pyfluss 1.0.0), one `pondra serve`. What each number is: the script's docstring. The group answer is checked equal between them, every lookup and every scan checked against what was written.",
+ "what": "Apache Fluss 1.0.0 and Pondra on one 4-core VM (Xeon 2.1 GHz, 15 GB, local disk), each through its own Python client: tools/bench/fluss_bench.py --rows 10000000 --people 1000000, Pondra four runs, Fluss three, alternating, with main's Pondra (a61c05b) beside them. Fluss as its quick start runs it (local-cluster.sh: ZooKeeper, a coordinator and a tablet server, three JVMs on Java 21; pyfluss 1.0.0), one `pondra serve`. What each number is: the script's docstring. The group answer is checked equal between them, every lookup and every scan checked against what was written. Measured 2026-10-12/13 on main a61c05b plus this pull request's changes.",
  "median": {
   "pondra": {
-   "start_s": 0.19,
+   "start_s": 0.08,
    "processes": 1,
-   "idle_mb": 147,
-   "append_rows_per_s": 2805013,
-   "ack_ms_p50": 3.47,
-   "ack_ms_p99": 6.5,
-   "fresh_ms_p50": 4.01,
-   "fresh_ms_p99": 8.13,
-   "scan_s": 2.26,
+   "idle_mb": 120.0,
+   "append_rows_per_s": 4555556,
+   "ack_ms_p50": 1.6,
+   "ack_ms_p99": 2.58,
+   "fresh_ms_p50": 2.42,
+   "fresh_ms_p99": 4.73,
+   "scan_s": 0.34,
    "group_s": 0.1,
-   "upsert_rows_per_s": 8885390,
-   "lookup_ms_p50": 0.6,
-   "lookup_ms_p99": 30.87,
-   "lookups_per_s": 1704,
-   "memory_mb": 968
+   "upsert_rows_per_s": 11173763,
+   "lookup_ms_p50": 0.28,
+   "lookup_ms_p99": 37.19,
+   "lookups_per_s": 2386,
+   "memory_mb": 1978,
+   "memory_settled_mb": 463
   },
   "fluss": {
-   "start_s": 3.19,
+   "start_s": 3.29,
    "processes": 3,
-   "idle_mb": 518,
-   "append_rows_per_s": 4753333,
-   "ack_ms_p50": 1.05,
-   "ack_ms_p99": 3.24,
-   "fresh_ms_p50": 5.03,
-   "fresh_ms_p99": 8.66,
-   "scan_s": 0.47,
-   "group_s": 0.5,
-   "upsert_rows_per_s": 248594,
-   "lookup_ms_p50": 102.3,
-   "lookup_ms_p99": 105.21,
-   "lookups_per_s": 606,
-   "memory_mb": 949
+   "idle_mb": 514,
+   "append_rows_per_s": 4719843,
+   "ack_ms_p50": 1.03,
+   "ack_ms_p99": 2.88,
+   "fresh_ms_p50": 5.35,
+   "fresh_ms_p99": 8.61,
+   "scan_s": 0.48,
+   "group_s": 0.51,
+   "upsert_rows_per_s": 304012,
+   "lookup_ms_p50": 102.33,
+   "lookup_ms_p99": 104.72,
+   "lookups_per_s": 605,
+   "memory_mb": 977,
+   "memory_settled_mb": 1054
+  },
+  "pondra_main_a61c05b": {
+   "start_s": 0.06,
+   "processes": 1,
+   "idle_mb": 133,
+   "append_rows_per_s": 4095428,
+   "ack_ms_p50": 1.61,
+   "ack_ms_p99": 4.12,
+   "fresh_ms_p50": 2.23,
+   "fresh_ms_p99": 5.46,
+   "scan_s": 0.37,
+   "group_s": 0.08,
+   "upsert_rows_per_s": 9816622,
+   "lookup_ms_p50": 0.66,
+   "lookup_ms_p99": 24.22,
+   "lookups_per_s": 1705,
+   "memory_mb": 1965
   }
  },
  "wrong": {
   "pondra": 0,
-  "fluss": 0
+  "fluss": 0,
+  "main": 0
  },
  "runs": {
   "pondra": [
    {
     "engine": "pondra",
-    "start_s": 0.22,
+    "start_s": 0.08,
     "processes": 1,
-    "idle_mb": 147,
+    "idle_mb": 117,
     "append": {
      "rows": 10000000,
-     "secs": 4.05,
-     "rows_per_s": 2470553
+     "secs": 2.27,
+     "rows_per_s": 4398163
     },
     "ack_ms": {
-     "p50": 3.47,
-     "p99": 7.54,
+     "p50": 1.6,
+     "p99": 2.52,
      "n": 1000
     },
     "fresh_ms": {
-     "p50": 4.01,
-     "p99": 8.13,
+     "p50": 2.46,
+     "p99": 8.77,
      "n": 500
     },
     "scan": {
      "rows": 10000000,
-     "secs": 2.83,
-     "rows_per_s": 3536453,
+     "secs": 0.35,
+     "rows_per_s": 28775925,
      "right": true
     },
     "group": {
+     "secs": 0.09,
+     "answer": [
+      [
+       "Google",
+       1666666,
+       99999953
+      ],
+      [
+       "apple",
+       1666667,
+       9998
+      ],
+      [
+       "baidu",
+       1666667,
+       9999
+      ],
+      [
+       "facebook",
+       1666667,
+       99999988
+      ],
+      [
+       "google",
+       1666667,
+       999999
+      ],
+      [
+       "partner",
+       1666666,
+       999998
+      ]
+     ]
+    },
+    "upsert": {
+     "rows": 2000000,
+     "secs": 0.16,
+     "rows_per_s": 12321185
+    },
+    "lookup_ms": {
+     "p50": 0.28,
+     "p99": 38.12,
+     "n": 2000,
+     "wrong": 0
+    },
+    "lookups_per_s": {
+     "in_flight": 64,
+     "n": 2000,
+     "per_s": 2493,
+     "wrong": 0
+    },
+    "memory_mb": 1904
+   },
+   {
+    "engine": "pondra",
+    "start_s": 0.08,
+    "processes": 1,
+    "idle_mb": 121,
+    "append": {
+     "rows": 10000000,
+     "secs": 2.12,
+     "rows_per_s": 4726629
+    },
+    "ack_ms": {
+     "p50": 1.69,
+     "p99": 3.86,
+     "n": 1000
+    },
+    "fresh_ms": {
+     "p50": 1.97,
+     "p99": 4.59,
+     "n": 500
+    },
+    "scan": {
+     "rows": 10000000,
+     "secs": 0.32,
+     "rows_per_s": 30964305,
+     "right": true
+    },
+    "group": {
+     "secs": 0.08,
+     "answer": [
+      [
+       "Google",
+       1666666,
+       99999953
+      ],
+      [
+       "apple",
+       1666667,
+       9998
+      ],
+      [
+       "baidu",
+       1666667,
+       9999
+      ],
+      [
+       "facebook",
+       1666667,
+       99999988
+      ],
+      [
+       "google",
+       1666667,
+       999999
+      ],
+      [
+       "partner",
+       1666666,
+       999998
+      ]
+     ]
+    },
+    "upsert": {
+     "rows": 2000000,
      "secs": 0.15,
+     "rows_per_s": 13357316
+    },
+    "lookup_ms": {
+     "p50": 0.21,
+     "p99": 34.66,
+     "n": 2000,
+     "wrong": 0
+    },
+    "lookups_per_s": {
+     "in_flight": 64,
+     "n": 2000,
+     "per_s": 2517,
+     "wrong": 0
+    },
+    "memory_mb": 2065
+   },
+   {
+    "engine": "pondra",
+    "start_s": 0.07,
+    "processes": 1,
+    "idle_mb": 119,
+    "append": {
+     "rows": 10000000,
+     "secs": 2.31,
+     "rows_per_s": 4337838
+    },
+    "ack_ms": {
+     "p50": 1.61,
+     "p99": 2.41,
+     "n": 1000
+    },
+    "fresh_ms": {
+     "p50": 2.66,
+     "p99": 4.87,
+     "n": 500
+    },
+    "scan": {
+     "rows": 10000000,
+     "secs": 0.37,
+     "rows_per_s": 27396794,
+     "right": true
+    },
+    "group": {
+     "secs": 0.1,
+     "answer": [
+      [
+       "Google",
+       1666666,
+       99999953
+      ],
+      [
+       "apple",
+       1666667,
+       9998
+      ],
+      [
+       "baidu",
+       1666667,
+       9999
+      ],
+      [
+       "facebook",
+       1666667,
+       99999988
+      ],
+      [
+       "google",
+       1666667,
+       999999
+      ],
+      [
+       "partner",
+       1666666,
+       999998
+      ]
+     ]
+    },
+    "upsert": {
+     "rows": 2000000,
+     "secs": 0.2,
+     "rows_per_s": 10026341
+    },
+    "lookup_ms": {
+     "p50": 0.27,
+     "p99": 36.72,
+     "n": 2000,
+     "wrong": 0
+    },
+    "lookups_per_s": {
+     "in_flight": 64,
+     "n": 2000,
+     "per_s": 2278,
+     "wrong": 0
+    },
+    "memory_mb": 2053
+   },
+   {
+    "engine": "pondra",
+    "start_s": 0.07,
+    "processes": 1,
+    "idle_mb": 122,
+    "append": {
+     "rows": 10000000,
+     "secs": 2.12,
+     "rows_per_s": 4712948
+    },
+    "ack_ms": {
+     "p50": 1.52,
+     "p99": 2.63,
+     "n": 1000
+    },
+    "fresh_ms": {
+     "p50": 2.37,
+     "p99": 4.03,
+     "n": 500
+    },
+    "scan": {
+     "rows": 10000000,
+     "secs": 0.33,
+     "rows_per_s": 30703299,
+     "right": true
+    },
+    "group": {
+     "secs": 0.1,
      "answer": [
       [
        "Google",
@@ -106,208 +366,49 @@
     "upsert": {
      "rows": 2000000,
      "secs": 0.22,
-     "rows_per_s": 8983774
-    },
-    "lookup_ms": {
-     "p50": 0.74,
-     "p99": 30.87,
-     "n": 2000,
-     "wrong": 0
-    },
-    "lookups_per_s": {
-     "in_flight": 64,
-     "n": 2000,
-     "per_s": 1704,
-     "wrong": 0
-    },
-    "memory_mb": 986
-   },
-   {
-    "engine": "pondra",
-    "start_s": 0.18,
-    "processes": 1,
-    "idle_mb": 144,
-    "append": {
-     "rows": 10000000,
-     "secs": 3.57,
-     "rows_per_s": 2805013
-    },
-    "ack_ms": {
-     "p50": 3.7,
-     "p99": 6.47,
-     "n": 1000
-    },
-    "fresh_ms": {
-     "p50": 4.04,
-     "p99": 7.73,
-     "n": 500
-    },
-    "scan": {
-     "rows": 10000000,
-     "secs": 1.8,
-     "rows_per_s": 5547541,
-     "right": true
-    },
-    "group": {
-     "secs": 0.1,
-     "answer": [
-      [
-       "Google",
-       1666666,
-       99999953
-      ],
-      [
-       "apple",
-       1666667,
-       9998
-      ],
-      [
-       "baidu",
-       1666667,
-       9999
-      ],
-      [
-       "facebook",
-       1666667,
-       99999988
-      ],
-      [
-       "google",
-       1666667,
-       999999
-      ],
-      [
-       "partner",
-       1666666,
-       999998
-      ]
-     ]
-    },
-    "upsert": {
-     "rows": 2000000,
-     "secs": 0.4,
-     "rows_per_s": 5003521
-    },
-    "lookup_ms": {
-     "p50": 0.54,
-     "p99": 35.89,
-     "n": 2000,
-     "wrong": 0
-    },
-    "lookups_per_s": {
-     "in_flight": 64,
-     "n": 2000,
-     "per_s": 1664,
-     "wrong": 0
-    },
-    "memory_mb": 811
-   },
-   {
-    "engine": "pondra",
-    "start_s": 0.19,
-    "processes": 1,
-    "idle_mb": 147,
-    "append": {
-     "rows": 10000000,
-     "secs": 3.34,
-     "rows_per_s": 2989575
-    },
-    "ack_ms": {
-     "p50": 3.47,
-     "p99": 6.5,
-     "n": 1000
-    },
-    "fresh_ms": {
-     "p50": 3.93,
-     "p99": 8.29,
-     "n": 500
-    },
-    "scan": {
-     "rows": 10000000,
-     "secs": 2.26,
-     "rows_per_s": 4427319,
-     "right": true
-    },
-    "group": {
-     "secs": 0.1,
-     "answer": [
-      [
-       "Google",
-       1666666,
-       99999953
-      ],
-      [
-       "apple",
-       1666667,
-       9998
-      ],
-      [
-       "baidu",
-       1666667,
-       9999
-      ],
-      [
-       "facebook",
-       1666667,
-       99999988
-      ],
-      [
-       "google",
-       1666667,
-       999999
-      ],
-      [
-       "partner",
-       1666666,
-       999998
-      ]
-     ]
-    },
-    "upsert": {
-     "rows": 2000000,
-     "secs": 0.23,
-     "rows_per_s": 8885390
+     "rows_per_s": 9277371
     },
     "lookup_ms": {
      "p50": 0.6,
-     "p99": 26.7,
+     "p99": 37.65,
      "n": 2000,
      "wrong": 0
     },
     "lookups_per_s": {
      "in_flight": 64,
      "n": 2000,
-     "per_s": 1872,
+     "per_s": 1682,
      "wrong": 0
     },
-    "memory_mb": 968
+    "memory_mb": 1760,
+    "memory_settled_mb": 463
    }
   ],
   "fluss": [
    {
     "engine": "fluss",
-    "start_s": 3.49,
+    "start_s": 3.29,
     "processes": 3,
-    "idle_mb": 504,
+    "idle_mb": 514,
     "append": {
      "rows": 10000000,
-     "secs": 1.96,
-     "rows_per_s": 5105164
+     "secs": 2.2,
+     "rows_per_s": 4536811
     },
     "ack_ms": {
-     "p50": 1.05,
-     "p99": 3.24,
+     "p50": 1.03,
+     "p99": 2.83,
      "n": 1000
     },
     "fresh_ms": {
-     "p50": 5.03,
-     "p99": 8.47,
+     "p50": 5.44,
+     "p99": 8.48,
      "n": 500
     },
     "scan": {
      "rows": 10000000,
-     "secs": 0.47,
-     "rows_per_s": 21312704,
+     "secs": 0.48,
+     "rows_per_s": 21008000,
      "right": true
     },
     "group": {
@@ -347,51 +448,51 @@
     },
     "upsert": {
      "rows": 2000000,
-     "secs": 8.39,
-     "rows_per_s": 238284
+     "secs": 6.8,
+     "rows_per_s": 294202
     },
     "lookup_ms": {
-     "p50": 102.27,
-     "p99": 105.19,
+     "p50": 102.33,
+     "p99": 104.24,
      "n": 2000,
      "wrong": 0
     },
     "lookups_per_s": {
      "in_flight": 64,
      "n": 2000,
-     "per_s": 606,
+     "per_s": 604,
      "wrong": 0
     },
-    "memory_mb": 1059
+    "memory_mb": 925
    },
    {
     "engine": "fluss",
-    "start_s": 3.16,
+    "start_s": 3.33,
     "processes": 3,
-    "idle_mb": 518,
+    "idle_mb": 502,
     "append": {
      "rows": 10000000,
-     "secs": 2.1,
-     "rows_per_s": 4753333
+     "secs": 2.12,
+     "rows_per_s": 4719843
     },
     "ack_ms": {
-     "p50": 1.03,
-     "p99": 2.56,
+     "p50": 1.26,
+     "p99": 2.88,
      "n": 1000
     },
     "fresh_ms": {
-     "p50": 4.8,
-     "p99": 8.66,
+     "p50": 5.35,
+     "p99": 10.31,
      "n": 500
     },
     "scan": {
      "rows": 10000000,
-     "secs": 0.42,
-     "rows_per_s": 23741715,
+     "secs": 0.54,
+     "rows_per_s": 18428393,
      "right": true
     },
     "group": {
-     "secs": 0.48,
+     "secs": 0.55,
      "answer": [
       [
        "Google",
@@ -427,12 +528,12 @@
     },
     "upsert": {
      "rows": 2000000,
-     "secs": 6.28,
-     "rows_per_s": 318578
+     "secs": 6.58,
+     "rows_per_s": 304012
     },
     "lookup_ms": {
-     "p50": 102.3,
-     "p99": 105.66,
+     "p50": 102.34,
+     "p99": 104.72,
      "n": 2000,
      "wrong": 0
     },
@@ -442,36 +543,36 @@
      "per_s": 605,
      "wrong": 0
     },
-    "memory_mb": 949
+    "memory_mb": 977
    },
    {
     "engine": "fluss",
-    "start_s": 3.19,
+    "start_s": 3.26,
     "processes": 3,
-    "idle_mb": 518,
+    "idle_mb": 516,
     "append": {
      "rows": 10000000,
-     "secs": 2.17,
-     "rows_per_s": 4598296
+     "secs": 1.96,
+     "rows_per_s": 5110920
     },
     "ack_ms": {
-     "p50": 1.16,
-     "p99": 3.59,
+     "p50": 1.03,
+     "p99": 2.98,
      "n": 1000
     },
     "fresh_ms": {
-     "p50": 5.19,
-     "p99": 10.56,
+     "p50": 5.18,
+     "p99": 8.61,
      "n": 500
     },
     "scan": {
      "rows": 10000000,
-     "secs": 0.51,
-     "rows_per_s": 19613831,
+     "secs": 0.46,
+     "rows_per_s": 21743434,
      "right": true
     },
     "group": {
-     "secs": 0.59,
+     "secs": 0.51,
      "answer": [
       [
        "Google",
@@ -507,12 +608,12 @@
     },
     "upsert": {
      "rows": 2000000,
-     "secs": 8.05,
-     "rows_per_s": 248594
+     "secs": 6.25,
+     "rows_per_s": 319746
     },
     "lookup_ms": {
-     "p50": 102.33,
-     "p99": 105.21,
+     "p50": 102.28,
+     "p99": 104.98,
      "n": 2000,
      "wrong": 0
     },
@@ -522,7 +623,250 @@
      "per_s": 606,
      "wrong": 0
     },
-    "memory_mb": 886
+    "memory_mb": 1054,
+    "memory_settled_mb": 1054
+   }
+  ],
+  "main": [
+   {
+    "engine": "pondra",
+    "start_s": 0.06,
+    "processes": 1,
+    "idle_mb": 131,
+    "append": {
+     "rows": 10000000,
+     "secs": 2.38,
+     "rows_per_s": 4209347
+    },
+    "ack_ms": {
+     "p50": 1.3,
+     "p99": 4.12,
+     "n": 1000
+    },
+    "fresh_ms": {
+     "p50": 2.18,
+     "p99": 5.46,
+     "n": 500
+    },
+    "scan": {
+     "rows": 10000000,
+     "secs": 0.29,
+     "rows_per_s": 34336873,
+     "right": true
+    },
+    "group": {
+     "secs": 0.08,
+     "answer": [
+      [
+       "Google",
+       1666666,
+       99999953
+      ],
+      [
+       "apple",
+       1666667,
+       9998
+      ],
+      [
+       "baidu",
+       1666667,
+       9999
+      ],
+      [
+       "facebook",
+       1666667,
+       99999988
+      ],
+      [
+       "google",
+       1666667,
+       999999
+      ],
+      [
+       "partner",
+       1666666,
+       999998
+      ]
+     ]
+    },
+    "upsert": {
+     "rows": 2000000,
+     "secs": 0.2,
+     "rows_per_s": 9816622
+    },
+    "lookup_ms": {
+     "p50": 0.66,
+     "p99": 35.94,
+     "n": 2000,
+     "wrong": 0
+    },
+    "lookups_per_s": {
+     "in_flight": 64,
+     "n": 2000,
+     "per_s": 1705,
+     "wrong": 0
+    },
+    "memory_mb": 2072
+   },
+   {
+    "engine": "pondra",
+    "start_s": 0.08,
+    "processes": 1,
+    "idle_mb": 133,
+    "append": {
+     "rows": 10000000,
+     "secs": 2.57,
+     "rows_per_s": 3888909
+    },
+    "ack_ms": {
+     "p50": 1.92,
+     "p99": 4.29,
+     "n": 1000
+    },
+    "fresh_ms": {
+     "p50": 2.8,
+     "p99": 6.54,
+     "n": 500
+    },
+    "scan": {
+     "rows": 10000000,
+     "secs": 0.37,
+     "rows_per_s": 27235033,
+     "right": true
+    },
+    "group": {
+     "secs": 0.1,
+     "answer": [
+      [
+       "Google",
+       1666666,
+       99999953
+      ],
+      [
+       "apple",
+       1666667,
+       9998
+      ],
+      [
+       "baidu",
+       1666667,
+       9999
+      ],
+      [
+       "facebook",
+       1666667,
+       99999988
+      ],
+      [
+       "google",
+       1666667,
+       999999
+      ],
+      [
+       "partner",
+       1666666,
+       999998
+      ]
+     ]
+    },
+    "upsert": {
+     "rows": 2000000,
+     "secs": 0.22,
+     "rows_per_s": 9160409
+    },
+    "lookup_ms": {
+     "p50": 0.76,
+     "p99": 23.04,
+     "n": 2000,
+     "wrong": 0
+    },
+    "lookups_per_s": {
+     "in_flight": 64,
+     "n": 2000,
+     "per_s": 1514,
+     "wrong": 0
+    },
+    "memory_mb": 1944
+   },
+   {
+    "engine": "pondra",
+    "start_s": 0.06,
+    "processes": 1,
+    "idle_mb": 134,
+    "append": {
+     "rows": 10000000,
+     "secs": 2.44,
+     "rows_per_s": 4095428
+    },
+    "ack_ms": {
+     "p50": 1.61,
+     "p99": 4.01,
+     "n": 1000
+    },
+    "fresh_ms": {
+     "p50": 2.23,
+     "p99": 3.98,
+     "n": 500
+    },
+    "scan": {
+     "rows": 10000000,
+     "secs": 0.38,
+     "rows_per_s": 26018352,
+     "right": true
+    },
+    "group": {
+     "secs": 0.07,
+     "answer": [
+      [
+       "Google",
+       1666666,
+       99999953
+      ],
+      [
+       "apple",
+       1666667,
+       9998
+      ],
+      [
+       "baidu",
+       1666667,
+       9999
+      ],
+      [
+       "facebook",
+       1666667,
+       99999988
+      ],
+      [
+       "google",
+       1666667,
+       999999
+      ],
+      [
+       "partner",
+       1666666,
+       999998
+      ]
+     ]
+    },
+    "upsert": {
+     "rows": 2000000,
+     "secs": 0.18,
+     "rows_per_s": 10976836
+    },
+    "lookup_ms": {
+     "p50": 0.52,
+     "p99": 24.22,
+     "n": 2000,
+     "wrong": 0
+    },
+    "lookups_per_s": {
+     "in_flight": 64,
+     "n": 2000,
+     "per_s": 1818,
+     "wrong": 0
+    },
+    "memory_mb": 1965
    }
   ]
  },
@@ -531,6 +875,8 @@
   "Fluss's lookups wait for its client's 100 ms batch timeout, which Java's client can lower and Python's can't; its lookups per second are 64 lookupers' batches. Pondra's lookups are 64 HTTP connections from Python threads: what they show is the client's pace as much as the node's (0.14 ms a lookup measured on the node in serve_bench.py).",
   "Fluss's log scanner waits 5 ms at most per fetch here; at its default of 500 ms a row was seen about 340 ms after its write. Its tablet server needs server.data-disk.write-limit-ratio: 1.0 on this VM's disk.",
   "Fluss has no SQL of its own (that is Flink's): its group is the client reading the two columns and pyarrow grouping them; Pondra's is SQL on the node.",
-  "Where Pondra trails: append (2.8 M rows/s against 4.8 M), an acknowledged single row (3.5 ms p50 against 1.05) and reading every row back to the client (2.3 s against 0.47). Where Fluss trails: start (0.19 s against 3.2 s), idle memory (147 MB against 518, one process against three), upserts (8.9 M rows/s against 0.25 M), lookups (0.6 ms p50 against 102 ms), grouping (0.10 s against 0.50), and its lost upserts at the default batch size."
+  "Pondra's appends, acks and lookups go through its Python client, which keeps one connection a node and thread open since this run (urllib opened one a request). main (a61c05b, its own client) beside it, alternating: appends 4.10 M rows/s (this run 4.56 M), lookups 0.66 ms p50 (0.28), an ack's p99 4.1 ms (2.6), upserts 9.8 M rows/s (11.2 M).",
+  "memory_mb is the servers' RSS right after the lookups; memory_settled_mb 15 s later. Pondra's allocator (jemalloc, invariant 383) keeps pages freed in the last 10 s for the next query: giving them back after 1 s made TPC-H 4-9% more CPU (L7's ab_compare.py, 16 rounds), so it stays. Pondra 1,978 MB then 463 MB; main 2,137 then 665 MB, the difference being decoded log rows kept after tiering until a read (now dropped when the commit that tiered them arrives). Fluss's three JVMs keep what they hold: 977 then 1,054 MB.",
+  "Where Pondra trails: an acknowledged single row (1.6 ms p50 against 1.03), and memory in the moment after the run (2.0 GB against 1.0). Appends are 4.6 M rows/s against 4.7 M, inside either one's run-to-run spread (Pondra 4.34-4.87 M, Fluss 4.54-5.11 M). Where Fluss trails: start (0.08 s against 3.3 s), idle memory (120 MB against 514, one process against three), reading every row back (0.34 s against 0.48), upserts (11 M rows/s against 0.30 M), lookups (0.28 ms p50 against 102 ms), a row seen after its write (2.4 ms against 5.4), grouping (0.10 s against 0.51), memory 15 s after the run (463 MB against 1,054), and its lost upserts at the default batch size."
  ]
 }
