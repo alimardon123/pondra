@@ -1259,8 +1259,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    objects (users, grants, flows, an extension's) add a kind, not a tree. `console_check.py` (`work`).
 175. **An answer's columns are named apart** (`routines::output_names`): a query DataFusion would
    refuse for two columns of one name (`SELECT ts::date, *`, `SELECT id, *`) runs, a cast named as
-   its column or, beside another of that name, as written, a column named twice `id_1`; a query
-   that needs no name given is sent as written. `harness.py names`.
+   its column or, beside another of that name, as written, a column named twice `id_1`, and a
+   scalar subquery named as another item (DataFusion names it by its column: two of `count(*)`) or
+   an expression written twice (or but for a cast, which DataFusion's names leave out), as written;
+   a query that needs no name given is sent as written.
+   `harness.py names`.
 176. **One check at every door** (`auth::WHO`, ADR-035): HTTP, Postgres, Kafka and Flight each work
    out a `Principal` (a token's role, or a user's grants) and run the request inside `WHO.scope`;
    anything that reads tables for it (`query::guarded`), writes (`auth::allows`), streams rows

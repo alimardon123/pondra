@@ -5346,6 +5346,12 @@ def names():
     named = [cols("SELECT x::int FROM t"), cols("SELECT x::int, * FROM t"), cols("SELECT id, * FROM t"), cols("SELECT id, id FROM t"), cols("SELECT CAST(x AS INT), x FROM t")]
     checks["a cast is named as its column (Postgres), or as written beside a column of that name (Snowflake, DuckDB); a column twice runs, the one named twice as id_1"] = \
         named == [["x"], ["x::INT", "id", "name", "x"], ["id_1", "id", "name", "x"], ["id", "id_1"], ["CAST(x AS INT)", "x"]]
+    apart = [cols("SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM t WHERE id > 1)"), cols("SELECT max(id), (SELECT max(id) FROM t) FROM t"),
+             cols("SELECT id + 1, id + 1, id + 1 FROM t"), cols("SELECT (SELECT max(id) FROM t), (SELECT min(id) FROM t)"),
+             cols("SELECT id * 2, id::DOUBLE * 2, CAST(id AS DOUBLE) * 2 FROM t")]
+    checks["two subqueries of one column's name, max(id) beside (SELECT max(id) FROM t), id + 1 thrice and id * 2 beside id::DOUBLE * 2 run, named as written (DuckDB); subqueries apart keep theirs"] = \
+        apart == [["(SELECT count(*) FROM t)", "(SELECT count(*) FROM t WHERE id > 1)"], ["max(t.id)", "(SELECT max(id) FROM t)"],
+                  ["t.id + Int64(1)", "id + 1", "id + 1_1"], ["max(t.id)", "min(t.id)"], ["t.id * Int64(2)", "id::DOUBLE * 2", "CAST(id AS DOUBLE) * 2"]]
     # each fallback equals its standard name
     sql_pairs = {"read_parquet": ["parquet_scan"], "read_csv": ["read_csv_auto"], "read_json": ["read_json_auto", "read_ndjson"], "read_delta": ["delta_scan"], "read_iceberg": ["iceberg_scan"]}
     checks["SQL: parquet_scan, read_csv_auto, read_json_auto, read_ndjson, delta_scan, iceberg_scan == Pondra's names"] = \
@@ -6197,7 +6203,8 @@ def temps():
     a query), INSERT, UPDATE (a row keeps its _row_id), DELETE, MERGE, TEMP VIEW, DROP; they shadow
     a lake table; another session doesn't see them; a spread query reading one runs on its node
     with the same answer; not answered from the result cache; a procedure sees its caller's;
-    a Postgres connection's end with it; close() and idleness end a session; without one, refused."""
+    a Postgres connection's end with it; SHOW CREATE makes them again; close() and idleness end a
+    session; without one, refused."""
     import psycopg
     lake = new_lake()
     env = {"PYTHONPATH": os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"), "PONDRA_SESSION_IDLE_SECS": "3"}
@@ -6243,10 +6250,17 @@ def temps():
         pg.execute("CREATE TEMP TABLE t1 (a INT)")
         pg.execute("INSERT INTO t1 VALUES (1), (2)")
         mine = pg.execute("SELECT sum(a) FROM t1 WHERE a > %s", (0,)).fetchall()  # (described, then run: both in the connection's session)
+        pg.execute("CREATE TEMPORARY VIEW tv1 AS SELECT a FROM t1")
+        shown_pg = pg.execute("SHOW CREATE VIEW tv1").fetchall()
     time.sleep(0.5)
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:
-        gone = _raises_text(lambda: pg.execute("SELECT * FROM t1").fetchall())
-    checks["Postgres: a connection's own, gone when it ends"] = mine == [(3,)] and "t1" in gone
+        gone = [_raises_text(lambda: pg.execute(f"SELECT * FROM {t}").fetchall()) for t in ("t1", "tv1")]
+    checks["Postgres: a connection's own (a table, a view), gone when it ends"] = mine == [(3,)] and "t1" in gone[0] and "tv1" in gone[1]
+    shown = [rows("SHOW CREATE VIEW mine"), rows("SHOW CREATE TABLE picked"), _raises_text(lambda: rows("SHOW CREATE VIEW mine", other))]
+    checks["SHOW CREATE of a session's temporary view or table makes it again, over HTTP and Postgres; another session's isn't shown"] = \
+        shown[0][0]["definition"].startswith("CREATE TEMPORARY VIEW mine AS SELECT") and "picked" in shown[0][0]["definition"] and \
+        shown[1][0]["definition"].startswith("CREATE TEMPORARY TABLE picked (id BIGINT, note ") and "no view mine" in shown[2] and \
+        shown_pg[0][0] == "CREATE TEMPORARY VIEW tv1 AS SELECT a FROM t1;"
     session = db.session
     db.close()
     closed = _raises_text(lambda: call(A.port, "POST", "/sql", b"SELECT * FROM picked", headers={"x-pondra-session": session}))
@@ -6259,7 +6273,7 @@ def temps():
     ok = all(checks.values())
     print(json.dumps({"temps": checks, "ok": ok}, indent=1))
     if not ok:
-        print(got, before, joined, spread, cached, shadow, unseen, no_session, lake_view, mine, gone, closed, idled)
+        print(got, before, joined, spread, cached, shadow, unseen, no_session, lake_view, mine, gone, shown, shown_pg, closed, idled)
         sys.exit(1)
     return f"temps: a session's own tables and views, every statement, on its node: all {len(checks)} checks pass"
 
@@ -11143,12 +11157,14 @@ def constraints():
     facts = rows("orders")
     no = [err(x) for x in ("CREATE TABLE bad1 (a INT REFERENCES users (id))", "CREATE TABLE bad2 (a INT, UNIQUE NULLS NOT DISTINCT (a))",
                            "CREATE TABLE bad3 (a INT UNIQUE DEFERRABLE)", "CREATE TABLE bad4 (a INT PRIMARY KEY, b INT, PRIMARY KEY (b) NOT ENFORCED)",
-                           "CREATE TABLE bad6 (a INT, UNIQUE (b))")]
+                           "CREATE TABLE bad6 (a INT, UNIQUE (b))", "CREATE TABLE bad7 (a INT PRIMARY KEY, b INT PRIMARY KEY)",
+                           "CREATE TABLE bad8 (a INT, PRIMARY KEY (a), PRIMARY KEY (a))")]
     no.append(err("CREATE TEMP TABLE bad5 (a INT UNIQUE)", hh=temp))
     q("CREATE TEMP TABLE fine (a INT UNIQUE NOT ENFORCED)", hh=temp)
     info["facts"] = [facts, no]
-    checks["NOT ENFORCED keeps a fact and checks nothing (a PRIMARY KEY makes no key); a reference, NULLS NOT DISTINCT, DEFERRABLE, two keys, a temporary table's UNIQUE and a missing column refused"] = \
-        facts == [[1, 1, "x"], [1, 99, "x"]] and no[0][:2] == (501, "0A000") and all(r[0] == 500 for r in no[1:])  # (a reference: not taken yet, 0A000)
+    checks["NOT ENFORCED keeps a fact and checks nothing (a PRIMARY KEY makes no key); a reference, NULLS NOT DISTINCT, DEFERRABLE, two keys (42P16, as Postgres: two columns' keys too), a temporary table's UNIQUE and a missing column refused"] = \
+        facts == [[1, 1, "x"], [1, 99, "x"]] and no[0][:2] == (501, "0A000") and all(no[i][:2] == (400, "42P16") for i in (3, 5, 6)) and \
+        all(no[i][0] == 500 for i in (1, 2, 4, 7))  # (a reference: not taken yet, 0A000)
     # ALTER TABLE … ADD | DROP CONSTRAINT
     q("CREATE TABLE tags (id INT, tag TEXT)")
     q("INSERT INTO tags VALUES (1, 'a'), (2, 'a'), (3, 'b')")

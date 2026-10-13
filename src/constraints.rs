@@ -113,7 +113,7 @@ pub fn declared(c: &ast::CreateTable, table: &str) -> Result<Vec<Constraint>> {
         }
     }
     let keys = c.columns.iter().flat_map(|c| &c.options).filter(|o| matches!(o.option, ast::ColumnOption::PrimaryKey(_))).count() + c.constraints.iter().filter(|k| matches!(k, ast::TableConstraint::PrimaryKey(_))).count();
-    ensure!(keys <= 1 || !out.iter().any(|k| k.kind == Kind::PrimaryKey), "multiple primary keys for table \"{table}\" are not allowed");
+    ensure!(keys <= 1, "multiple primary keys for table \"{table}\" are not allowed"); // (two columns' PRIMARY KEYs made one key of both)
     let mut names = std::collections::HashSet::new();
     for k in out.iter_mut() {
         let base = k.name.clone();

@@ -958,7 +958,12 @@ pub fn rows_apart(sql: &str) -> std::borrow::Cow<'_, str> {
 ///   has another column that may have that name (a `*`, or another of its items), as written
 ///   (`ts::DATE`), as Snowflake and DuckDB name every cast;
 /// - a column the SELECT has again (`SELECT id, *`, `SELECT id, id`) is named `id_1`, as DuckDB
-///   names the second in a frame (only the item named can be: a `*`'s columns are the table's).
+///   names the second in a frame (only the item named can be: a `*`'s columns are the table's);
+/// - a scalar subquery DataFusion would name as another item (it names one by its column: two of
+///   `count(*)`, `max(q)` beside `(SELECT max(q) FROM t)`), and an expression written again
+///   (`q + 1, q + 1`, or but for a cast: `q * 2, q::DOUBLE * 2`), are named as written, as DuckDB
+///   names them. (An aggregate's are named before this name is given: `sum(c), sum(c::DOUBLE)` is
+///   still refused, by DataFusion's planner.)
 ///
 /// (A column the ORDER BY names qualified, `ORDER BY o.ts`, is one more of the SELECT's: DataFusion
 /// adds it, so a cast of `ts` is then named as written too.)
@@ -989,6 +994,29 @@ fn select_names(body: &mut ast::SetExpr, sorted: &[String]) -> bool {
             _ => None,
         }
     }
+    // (an expression's text, compared as DataFusion's names of it would be: they leave out casts,
+    // so `CAST(c AS DOUBLE) * 2` is named as `c * 2` is)
+    fn said(e: &Expr) -> String {
+        let mut e = e.clone();
+        let _ = visit_expressions_mut(&mut e, |x| {
+            if let Expr::Cast { expr, .. } = x {
+                *x = (**expr).clone();
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        e.to_string().to_lowercase().replace('"', "")
+    }
+    // (a scalar subquery's column: its alias, name or text; "" when it can't be told)
+    fn inner(q: &ast::Query) -> String {
+        match &*q.body {
+            ast::SetExpr::Select(s) if s.projection.len() == 1 => match &s.projection[0] {
+                ast::SelectItem::ExprWithAlias { alias, .. } => plain(alias),
+                ast::SelectItem::UnnamedExpr(e) => column(e).map(|c| c.1).unwrap_or_else(|| said(e)),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
+    }
     match body {
         ast::SetExpr::Select(s) => {
             use ast::SelectItem::{ExprWithAlias, QualifiedWildcard, UnnamedExpr, Wildcard};
@@ -1017,6 +1045,37 @@ fn select_names(body: &mut ast::SetExpr, sorted: &[String]) -> bool {
                     }
                     _ => continue,
                 };
+                names[k] = Some(name.clone());
+                s.projection[k] = ExprWithAlias { expr: e.clone(), alias: ast::Ident::with_quote('"', name) };
+                changed = true;
+            }
+            // What each item may be named, and whether it is a subquery's (compared without the
+            // qualifiers: `max(q)` is named `max(t.q)`, and so is `(SELECT max(q) FROM t)`).
+            static QUALIFIER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\b[a-z_][a-z0-9_]*\.").expect("a regex"));
+            let mut keys: Vec<Option<(bool, String)>> = s.projection.iter().zip(&names).map(|(i, n)| match (i, n) {
+                (UnnamedExpr(Expr::Subquery(q)), _) => Some((true, inner(q))),
+                (UnnamedExpr(e), None) => Some((false, said(e))),
+                _ => n.clone().map(|n| (false, n)),
+            }).collect();
+            let same = |a: &(bool, String), b: &(bool, String)| match a.0 || b.0 {
+                true => QUALIFIER.replace_all(&a.1, "") == QUALIFIER.replace_all(&b.1, ""),
+                false => a.1 == b.1,
+            };
+            let first = keys.clone();
+            for k in 0..s.projection.len() {
+                let (UnnamedExpr(e), None, Some(key)) = (&s.projection[k], &names[k], keys[k].clone()) else { continue };
+                // (every subquery of a name as written; of an expression written again, the later ones)
+                let again = match key.0 {
+                    true => (0..first.len()).any(|j| j != k && first[j].as_ref().is_some_and(|o| same(o, &key))),
+                    false => (0..k).any(|j| keys[j].as_ref().is_some_and(|o| same(o, &key))),
+                };
+                if !again {
+                    continue;
+                }
+                let written = e.to_string();
+                let name = (0..).map(|i| if i == 0 { written.clone() } else { format!("{written}_{i}") })
+                    .find(|m| !names.iter().any(|x| x.as_deref() == Some(m.as_str()))).expect("a free name");
+                keys[k] = Some((false, said(e)));
                 names[k] = Some(name.clone());
                 s.projection[k] = ExprWithAlias { expr: e.clone(), alias: ast::Ident::with_quote('"', name) };
                 changed = true;

@@ -75,6 +75,21 @@ pub fn listed() -> (Vec<(String, Vec<(String, String)>)>, Vec<(String, String)>)
     (x.tables.iter().map(|(n, t)| (n.clone(), t.columns.clone())).collect(), x.views.iter().map(|(n, v)| (n.clone(), v.clone())).collect())
 }
 
+/// The statement that makes one of the current session's temporary views or tables again, and its
+/// kind (`SHOW CREATE`: the session's come first, as `pg_temp` is first on Postgres's path).
+pub fn made(name: &str) -> Option<(&'static str, String)> {
+    use crate::objects::{ident, list_sql, sql_type};
+    peek(&current()?, |x| match (x.views.get(name), x.tables.get(name)) {
+        (Some(sql), _) => Some(("view", format!("CREATE TEMPORARY VIEW {} AS {sql}", ident(name)))),
+        (None, Some(t)) => {
+            let mut parts: Vec<String> = t.columns.iter().map(|(c, ty)| format!("{} {}", ident(c), sql_type(ty))).collect();
+            parts.extend((!t.key.is_empty()).then(|| format!("PRIMARY KEY ({})", list_sql(&t.key))));
+            Some(("table", format!("CREATE TEMPORARY TABLE {} ({})", ident(name), parts.join(", "))))
+        }
+        _ => None,
+    })
+}
+
 const NO_SESSION: &str = "a temporary table or view is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>, 8 to 128 letters, digits, - or _)";
 
 struct Table {

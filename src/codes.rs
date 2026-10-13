@@ -53,6 +53,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("type \"") && has("does not exist") => "42704",                                // undefined_object (`types.rs`)
         _ if has("because column") && (has("uses it") || has("use it")) => "2BP01",              // dependent_objects_still_exist (DROP TYPE)
         _ if has("already exists") || has("exists already") => "42P07",                        // duplicate_table
+        _ if has("multiple primary keys") => "42P16",                                          // invalid_table_definition
         _ if has("divide by zero") || has("division by zero") => "22012",                       // division_by_zero
         _ if has("overflow") || has("out of range") => "22003",                                 // numeric_value_out_of_range
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
@@ -135,6 +136,7 @@ mod tests {
         assert_eq!(of("permission denied: INSERT on t (GRANT INSERT ON t TO ann)"), "42501");
         assert_eq!(of("Invalid function 'nope'.\nDid you mean 'now'?"), "42883");
         assert_eq!(of("table t already exists"), "42P07");
+        assert_eq!(of("multiple primary keys for table \"t\" are not allowed"), "42P16");
         assert_eq!(of("Error during planning: 'nope' is not a variable which can be viewed with 'SHOW'"), "42704");
         assert_eq!(of("a transaction is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>)"), "55000");
         assert_eq!(of("External error: invalid input value for enum mood: \"angry\" (its labels: 'sad', 'ok')"), "22P02"); // (a bulk INSERT's stream)

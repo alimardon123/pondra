@@ -999,6 +999,11 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
     let wanted = kind(&word).context("SHOW CREATE TABLE | VIEW | MATERIALIZED VIEW | FUNCTION | PROCEDURE | TASK | SCHEMA | ROLE | DATABASE | SHARE name")?;
     let here = crate::ddl::lake_name(lake);
     let parts: Vec<&str> = name.split('.').collect();
+    if let ([n], "relation") = (&parts[..], wanted.family) {
+        if let Some((_, made)) = crate::temp::made(n).filter(|(k, _)| *k == wanted.name || wanted.name == "table") {
+            return Ok(Some(format!("SELECT {} AS definition", literal(&format!("{made};"))))); // (the session's own)
+        }
+    }
     let all = list(lake).await?;
     let schema = |o: &Object, s: &str| o.schema.as_deref().unwrap_or(PUBLIC) == s;
     let found = all.iter().filter(|o| {
