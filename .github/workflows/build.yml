@@ -261,8 +261,11 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }} # (main's caches only, as the build's)
       - run: python3 tools/per_node_check.py # (a node leaves nothing of itself in its process: the source alone, ADR-061)
-      - run: cargo test --release --lib
-      - run: cargo test --release --test node_twice --test node_library # (a node in a host's process: two lakes one after the other, and the library's four checks)
+      # The crate's unit tests, and a node in a host's process (two lakes one after the other, and
+      # the library's four checks). One command, so the crate's two builds (for its own tests, and
+      # for the other two) compile side by side: two commands built them one after the other, 9.6
+      # and then 14.3 minutes on main's run 650.
+      - run: cargo test --release --lib --test node_twice --test node_library
 
   # The suite, on linux-x64's very binary, in four parts side by side: the quick correctness suite
   # (upserts, split brain, crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on
