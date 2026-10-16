@@ -46,6 +46,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod files;
 #[cfg(feature = "server")] mod format;
 #[cfg(feature = "server")] mod friendly;
+#[cfg(feature = "server")] mod lateral;
 #[cfg(feature = "server")] mod flight;
 #[cfg(feature = "server")] mod fresh;
 #[cfg(feature = "server")] mod find;

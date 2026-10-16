@@ -446,6 +446,10 @@ pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn
 /// Could `sql` name a type of one's own, in a cast or one of the enum functions? (Only then is
 /// it parsed for one: the built-in types' names are left alone.)
 pub fn wanted(sql: &str) -> bool {
+    static SET_FUNCTION: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\b(generate_series|range|unnest)\s*\(").expect("a regex"));
+    if SET_FUNCTION.is_match(sql) {
+        return true; // (a set function in a FROM that reads a column is written by `lateral::functions`)
+    }
     static NAMED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?i)(?:::|\bas)\s*"?([a-z_][a-z0-9_]*)"?\s*(?:[.]\s*"?([a-z_][a-z0-9_]*))?|\b(?:enum_(?:range|first|last)|pg_typeof)\s*\(|'(\{?[0-9a-fA-F]{8}-?(?:[0-9a-fA-F]{4}-?){3}[0-9a-fA-F]{12}\}?)'"#).expect("a regex"));
     const BUILT_IN: &[&str] = &["int", "integer", "bigint", "smallint", "tinyint", "int2", "int4", "int8", "hugeint", "ubigint", "uinteger", "usmallint", "utinyint", "float", "float4",
         "float8", "real", "double", "decimal", "numeric", "dec", "text", "varchar", "char", "character", "string", "bpchar", "bool", "boolean", "date", "time", "timestamp", "timestamptz",
@@ -469,6 +473,9 @@ pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
     let mut read = false;
     for s in stmts.iter_mut() {
         read |= crate::pg_types::rewrite(lake, s).await; // (strings read as uuids, pg_typeof)
+    }
+    for s in stmts.iter_mut() {
+        read |= crate::lateral::functions(s)?; // (`generate_series(1, t.n)` in a FROM: a LATERAL subquery it can plan)
     }
     let mut f = Casts { types: HashMap::new(), named: vec![], labelled: vec![], typed: false, collecting: true, failed: None };
     for s in stmts.iter_mut() {
