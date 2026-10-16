@@ -15200,10 +15200,13 @@ def lateral():
     the same answer on three nodes with `?spread=1`; the Postgres port answers the same rows; and what is
     refused is refused by name with SQLSTATE 0A000.
 
-    Numbers (one node, 1,000,000 rows of t(id, xs (three elements), n 1..5), median of three runs past the
-    result cache, varied by a literal; see the report that goes with this section):
-      one-pass implicit unnest  vs  unnested in a subquery   (within 10%)
-      one-pass generate_series  vs  the same, as a subquery  (within 10%)
+    Numbers (one node; 1,000,000 rows of t(id, xs INT[3], n 1..5); each form's median of three timed runs past
+    the result cache, each run with its own literal in the aggregate; three such measurements, the forms run
+    one after another, and the two unnest forms alternated in seven rounds to check the order):
+      unnest:          one pass 0.059, 0.021, 0.023 s; a subquery 0.025, 0.014, 0.015 s
+                       (run 1's first form is cold; alternated, 0.020 s and 0.018 s: within 10%)
+      generate_series: one pass 0.027, 0.022, 0.025 s; a subquery 0.026, 0.024, 0.026 s (within 12%)
+    Postgres 16 and DuckDB take the same forms (their subquery form written as their own set function).
     """
     import csv, duckdb, psycopg
     pg_dsn = os.environ.get("PONDRA_PG16", "host=/tmp/pg16-l3 port=55432 user=postgres dbname=postgres")
