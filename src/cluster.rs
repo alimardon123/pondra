@@ -159,7 +159,11 @@ impl Cluster {
         let marked = Arc::new(std::sync::atomic::AtomicU64::new(crate::log::now_ms()));
         let (me, m) = (self.clone(), marked.clone());
         crate::panics::spawn(async move {
+            // (the claim marked it a moment ago, and a node that took its own term back marked it
+            // before it went: C5, a key at most once a second)
+            let mut wait = 10;
             loop {
+                tokio::time::sleep(Duration::from_secs(wait)).await;
                 let ok = mark_alive(&store, me.leader.n).await.is_ok();
                 if ok {
                     m.store(crate::log::now_ms(), std::sync::atomic::Ordering::Relaxed);
@@ -169,7 +173,7 @@ impl Cluster {
                         restart(&format!("term {} has a newer leader", me.leader.n + 1));
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(if ok { 10 } else { 1 })).await; // (C5: a key at most once a second)
+                wait = if ok { 10 } else { 1 }; // (C5: a key at most once a second)
             }
         });
         let bucket = crate::store::bucket_url(lake);
