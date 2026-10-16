@@ -864,11 +864,7 @@ impl App {
                     ctx.state_ref().write().config_mut().options_mut().explain.show_statistics = true;
                 }
                 if frugal {
-                    // Hash joins can't spill, sort-merge joins can; sorts keep less aside to merge.
-                    let state = ctx.state_ref();
-                    let mut state = state.write();
-                    let o = state.config_mut().options_mut();
-                    (o.optimizer.prefer_hash_join, o.execution.sort_spill_reservation_bytes) = (false, 1 << 20);
+                    crate::query::frugal(&ctx);
                 }
                 let df = crate::query::sql(&ctx, query).await?;
                 let (schema, task) = (Arc::new(df.schema().as_arrow().clone()), Arc::new(df.task_ctx()));
@@ -881,10 +877,7 @@ impl App {
                 anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(schema)] } else { out }) // (no rows: still its columns)
             };
             let here = std::time::Instant::now();
-            let out = match run(false).await {
-                Err(e) if format!("{e:#}").contains("Resources exhausted") => run(true).await?, // out of memory: try again frugally
-                r => r?,
-            };
+            let out = crate::query::frugally(run).await?;
             // How fast queries go here (`guard.rs`): every query's time, so a quick one is known to be
             // quick and stays here, and the bytes it read only for one long enough to say what rate
             // this node reads at. The time is taken before they are looked up, which isn't the query.

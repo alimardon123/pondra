@@ -1292,9 +1292,15 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
     if recorded(lake, job).await? {
         return Ok(None);
     }
-    in_order(ctx);
-    let df = crate::query::sql(ctx, &crate::asof::rewrite(query)?).await?;
-    let (columns, files) = write_rows(lake, ctx, table, df, stamp).await?;
+    // (out of memory, once more frugally: the first try's files are never recorded, and the orphan sweep takes them)
+    let (columns, files) = crate::query::frugally(|frugal| async move {
+        if frugal {
+            crate::query::frugal(ctx);
+        }
+        in_order(ctx);
+        let df = crate::query::sql(ctx, &crate::asof::rewrite(query)?).await?;
+        write_rows(lake, ctx, table, df, stamp).await
+    }).await?;
     Ok(Some(Files { table: table.into(), job: job.into(), columns, files }))
 }
 

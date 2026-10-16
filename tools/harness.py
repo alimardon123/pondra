@@ -3456,18 +3456,40 @@ def scale():
     # to sort-merge (hash joins can't spill), and the node stays up. As on a 4-core machine
     # (GitHub's runners), where each partition's sort kept 10 MB aside and the merge above the
     # sorts found the budget gone: a partition per 24 MB at most.
-    node = Node(lake, port, memory_gb=0.05, env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4")}).start()
+    owner = {"x-pondra-owner": "frugal-owner-key-0123"}  # (this node's program: it may write a file on this machine)
+    node = Node(lake, port, memory_gb=0.05, env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4"), "PONDRA_OWNER_KEY": "frugal-owner-key-0123"}).start()
+    q = lambda s, p=port: call(p, "POST", "/sql", s.encode(), headers=owner)  # (with an owner key a node answers its program's requests only)
     q("CREATE TABLE big (id BIGINT, k BIGINT, s VARCHAR)")
     q("INSERT INTO big SELECT value, value % 2000000, 'name-' || (value % 2000000) FROM generate_series(1, 3000000)")
     checks["over the memory limit: aggregation, sort, join"] = (
         q("SELECT count(*) AS g, sum(n) AS n FROM (SELECT s, count(*) AS n FROM big GROUP BY s)") == [{"g": 2000000, "n": 3000000}]
         and q("SELECT max(r) AS r FROM (SELECT row_number() OVER (ORDER BY s, id) AS r FROM big)") == [{"r": 3000000}]
         and q("SELECT count(*) AS n FROM big a JOIN big b ON a.id = b.id") == [{"n": 3000000}]
-        and metrics_of(port)["pondra_memory_limit_bytes"] == int(0.05 * (1 << 30)))
+        and metrics_of(port, headers=owner)["pondra_memory_limit_bytes"] == int(0.05 * (1 << 30)))
+    # A write that runs out of memory retries frugally as a query does: its join's sort-merge spills, and a
+    # COPY to a folder leaves no file of the first try behind. Each write's error is kept for the report.
+    folder = os.path.join(tempfile.mkdtemp(prefix="pondra-frugal-"), "out")
+    write_errors = []
+    def written(s):
+        try:
+            call(port, "POST", "/sql", s.encode(), headers=owner)
+            return True
+        except RuntimeError as e:
+            write_errors.append(str(e)[:400])
+            return False
+    join = "SELECT a.id, b.k FROM big a JOIN big b ON a.id = b.id"
+    checks["over the memory limit, writes retry frugally too: CREATE TABLE … AS, INSERT … SELECT, COPY … TO"] = (
+        written(f"CREATE TABLE j AS {join}")
+        and q("SELECT count(*) AS n FROM j") == [{"n": 3000000}]
+        and written(f"INSERT INTO j {join}")
+        and q("SELECT count(*) AS n FROM j") == [{"n": 6000000}]
+        and written(f"COPY ({join}) TO '{folder}/' (FORMAT parquet)")
+        and call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_parquet('{folder}/*.parquet')".encode(), headers=owner) == [{"n": 3000000}])
+    shutil.rmtree(os.path.dirname(folder), ignore_errors=True)
     node.kill()
     ok = all(checks.values())
     shown = {q: ("same" if same else "DIFFERENT") + (", by ranges" if r else "") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp, r) in shuffles.items()}
-    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "ok": ok}, indent=1))
+    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "ok": ok}, indent=1))
     if not ok:
         print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
         sys.exit(1)
