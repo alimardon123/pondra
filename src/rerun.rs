@@ -969,7 +969,7 @@ async fn old_rows(lake: &Lake, view: &str, keys: &[String], touched: Option<&Tou
 /// key it replaces (an update in the change feed), or none (a new group). Rows compared whole, by
 /// Arrow's row format: NULLs equal, as a key's are. No `keys`: a row's key is all of it.
 fn diff(meta: &TableMeta, keys: &[String], old: &[RecordBatch], new: &[RecordBatch]) -> Result<(RecordBatch, RecordBatch)> {
-    use datafusion::arrow::compute::{concat_batches, filter_record_batch, take};
+    use datafusion::arrow::compute::{concat_batches, filter_record_batch, take, take_record_batch};
     use datafusion::arrow::row::{RowConverter, SortField};
     let s = crate::query::schema(&meta.columns)?;
     let mut fields = s.fields().to_vec();
@@ -984,25 +984,33 @@ fn diff(meta: &TableMeta, keys: &[String], old: &[RecordBatch], new: &[RecordBat
         false => keys.iter().map(|k| s.index_of(k)).collect::<Result<_, _>>()?,
     };
     // (one converter per pair, so the rows of old and new compare)
-    let pair = |cols: &[usize]| -> Result<(datafusion::arrow::row::Rows, datafusion::arrow::row::Rows)> {
+    let pair = |cols: &[usize], new: &RecordBatch| -> Result<(datafusion::arrow::row::Rows, datafusion::arrow::row::Rows)> {
         let c = RowConverter::new(cols.iter().map(|&i| SortField::new(s.field(i).data_type().clone())).collect())?;
         let get = |b: &RecordBatch| cols.iter().map(|&i| b.column(i).clone()).collect::<Vec<ArrayRef>>();
-        Ok((c.convert_columns(&get(&old))?, c.convert_columns(&get(&new))?))
+        Ok((c.convert_columns(&get(&old))?, c.convert_columns(&get(new))?))
     };
-    let ((old_whole, new_whole), (old_key, new_key)) = (pair(&all)?, pair(&at)?);
+    let (old_key, new_key) = pair(&at, &new)?;
     let mut by_key: HashMap<&[u8], Vec<usize>> = HashMap::new();
     for i in 0..old.num_rows() {
         by_key.entry(old_key.row(i).data()).or_default().push(i);
     }
+    // (a new row whose key has no old row is new, so its whole row is never converted)
+    let matched: Vec<usize> = (0..new.num_rows()).filter(|&j| by_key.contains_key(new_key.row(j).data())).collect();
+    // (no keys: the key is the whole row, so a row found by it is the same)
+    let whole = match keys.is_empty() {
+        true => None,
+        false => Some(pair(&all, &take_record_batch(&new, &UInt32Array::from(matched.iter().map(|&j| j as u32).collect::<Vec<_>>()))?)?),
+    };
     let mut gone = vec![true; old.num_rows()];
-    let mut put = vec![];
-    for j in 0..new.num_rows() {
-        let same = by_key.get(new_key.row(j).data()).and_then(|is| is.iter().copied().find(|&i| gone[i] && old_whole.row(i) == new_whole.row(j)));
-        match same {
-            Some(i) => gone[i] = false, // (came out the same: stays as it is)
-            None => put.push(j),
+    let mut kept = vec![false; new.num_rows()];
+    for (m, &j) in matched.iter().enumerate() {
+        let same = by_key[new_key.row(j).data()].iter().copied().find(|&i| gone[i] && whole.as_ref().is_none_or(|(o, n)| o.row(i) == n.row(m)));
+        if let Some(i) = same {
+            gone[i] = false; // (came out the same: stays as it is)
+            kept[j] = true;
         }
     }
+    let put: Vec<usize> = (0..new.num_rows()).filter(|&j| !kept[j]).collect();
     let mut replaced = vec![false; old.num_rows()];
     let mut prior: Vec<Option<u32>> = vec![];
     for &j in &put {
@@ -1012,9 +1020,14 @@ fn diff(meta: &TableMeta, keys: &[String], old: &[RecordBatch], new: &[RecordBat
         }
         prior.push(i.map(|i| i as u32));
     }
-    let picked = UInt32Array::from(put.iter().map(|&j| j as u32).collect::<Vec<_>>());
     let from_old = UInt32Array::from(prior);
-    let mut columns: Vec<ArrayRef> = new.columns().iter().map(|c| take(c, &picked, None)).collect::<Result<_, _>>()?;
+    let mut columns: Vec<ArrayRef> = match put.len() == new.num_rows() {
+        true => new.columns().to_vec(), // (every new row, in order: nothing to take)
+        false => {
+            let picked = UInt32Array::from(put.iter().map(|&j| j as u32).collect::<Vec<_>>());
+            new.columns().iter().map(|c| take(c, &picked, None)).collect::<Result<_, _>>()?
+        }
+    };
     let mut out_fields = s.fields().to_vec();
     for c in [ROW_ID, CREATED] {
         let i = olds.index_of(c)?;
@@ -1029,4 +1042,76 @@ fn diff(meta: &TableMeta, keys: &[String], old: &[RecordBatch], new: &[RecordBat
 /// `l IS NOT DISTINCT FROM r`: a NULL key is a group of its own.
 fn same(l: Expr, r: Expr) -> Expr {
     Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(Box::new(l), datafusion::logical_expr::Operator::IsNotDistinctFrom, Box::new(r)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Array, AsArray, Int64Array, StringArray, TimestampMicrosecondArray};
+    use datafusion::arrow::datatypes::{Int64Type, TimestampMicrosecondType};
+
+    /// The batch's column names.
+    fn names(b: &RecordBatch) -> Vec<String> {
+        b.schema().fields().iter().map(|f| f.name().clone()).collect()
+    }
+
+    /// The batch's rows as text, one per row: values as they are, NULL as `NULL`, timestamps as micros.
+    fn text(b: &RecordBatch) -> Vec<String> {
+        (0..b.num_rows())
+            .map(|r| {
+                b.columns()
+                    .iter()
+                    .map(|c| match c.is_null(r) {
+                        true => "NULL".to_string(),
+                        false => match c.data_type() {
+                            DataType::Utf8 => c.as_string::<i32>().value(r).to_string(),
+                            DataType::Int64 => c.as_primitive::<Int64Type>().value(r).to_string(),
+                            DataType::Timestamp(_, _) => c.as_primitive::<TimestampMicrosecondType>().value(r).to_string(),
+                            t => panic!("no text for {t}"),
+                        },
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect()
+    }
+
+    /// A view's rows as the table holds them: (k, v) and the system columns.
+    fn old_batch() -> RecordBatch {
+        RecordBatch::try_from_iter([
+            ("k", Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(5), Some(5), None])) as ArrayRef),
+            ("v", Arc::new(StringArray::from(vec!["a", "b", "c", "p", "q", "n"])) as ArrayRef),
+            (ROW_ID, Arc::new(Int64Array::from(vec![10, 20, 30, 50, 51, 60])) as ArrayRef),
+            (CREATED, Arc::new(TimestampMicrosecondArray::from(vec![100, 200, 300, 500, 510, 600]).with_timezone("UTC")) as ArrayRef),
+            (VERSION, Arc::new(Int64Array::from(vec![1_i64; 6])) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
+    /// A run's rows: (k, v) only. (5, q) is the old (5, q) again; the two (5, r) rows are equal to each other, not to any old row.
+    fn new_batch() -> RecordBatch {
+        RecordBatch::try_from_iter([
+            ("k", Arc::new(Int64Array::from(vec![Some(4), Some(1), Some(2), Some(5), Some(5), Some(5), None])) as ArrayRef),
+            ("v", Arc::new(StringArray::from(vec!["d", "a", "x", "q", "r", "r", "m"])) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn diff_compares_whole_rows_only_for_old_keys() {
+        let meta = TableMeta { columns: vec![("k".into(), "Int64".into()), ("v".into(), "Utf8".into())], ..Default::default() };
+        let (old, new) = (vec![old_batch()], vec![new_batch()]);
+
+        let (gone, put) = diff(&meta, &["k".to_string()], &old, &new).unwrap();
+        assert_eq!(names(&gone), ["k", "v", ROW_ID, CREATED, VERSION]);
+        assert_eq!(text(&gone), ["2,b,20,200,1", "3,c,30,300,1", "5,p,50,500,1", "NULL,n,60,600,1"]);
+        assert_eq!(names(&put), ["k", "v", ROW_ID, CREATED]);
+        assert_eq!(text(&put), ["4,d,NULL,NULL", "2,x,20,200", "5,r,50,500", "5,r,NULL,NULL", "NULL,m,60,600"]);
+
+        let (gone, put) = diff(&meta, &[], &old, &new).unwrap();
+        assert_eq!(names(&gone), ["k", "v", ROW_ID, CREATED, VERSION]);
+        assert_eq!(text(&gone), ["2,b,20,200,1", "3,c,30,300,1", "5,p,50,500,1", "NULL,n,60,600,1"]);
+        assert_eq!(names(&put), ["k", "v", ROW_ID, CREATED]);
+        assert_eq!(text(&put), ["4,d,NULL,NULL", "2,x,NULL,NULL", "5,r,NULL,NULL", "5,r,NULL,NULL", "NULL,m,NULL,NULL"]);
+    }
 }
