@@ -2178,6 +2178,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the key written. Spark's `DIV` drops the fraction before its cast (`sparksql`). `harness.py found`:
    "a cast of a decimal to an integer rounds…"; `pkey`: "a MERGE that compares a key in another
    type…" (a MERGE wrote 7002.5 as 7002, an INSERT as 7003).
+294. **A loop a lake starts holds it weakly** (`Lake::commits`, `Hot::watch`): the catalog's writes and
+   their durability upgrade a `Weak<Lake>` for each write, the hot columns' watch a `Weak<Hot>` each
+   round, and each ends when what it holds is gone. The writes' sender is the lake's own
+   (`Catalog::writes`), so a loop holding the lake strongly kept a lake a process opened to write (a
+   backup taken in it: `backup::take_here`) for the process's life, its catalog never closed.
+   `cargo test --lib store::tests::a_lake_opened_to_write_goes`.
 295. **SQL answers with the optimizer off** (`optimize::Runnable`, the last analyzer rule): under
    `datafusion.optimizer.max_passes = 0` every scalar function is replaced by what its simplifier
    makes of it, as the optimizer would. `arrow_cast`, `coalesce` and `nvl2` run only as that CAST or
