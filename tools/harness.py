@@ -3468,6 +3468,26 @@ def scale():
         and q("SELECT max(r) AS r FROM (SELECT row_number() OVER (ORDER BY s, id) AS r FROM big)") == [{"r": 3000000}]
         and q("SELECT count(*) AS n FROM big a JOIN big b ON a.id = b.id") == [{"n": 3000000}]
         and metrics_of(port, headers=owner)["pondra_memory_limit_bytes"] == int(0.05 * (1 << 30)))
+    # A window counts the rows it holds against the query memory (invariant 414): one over every row refuses (53200)
+    # and the node answers after; one that lets rows go answers. Each refusal is kept for the report; the SQLSTATE is
+    # read from its header, since `call` keeps only the status and the words.
+    window_refusals = []
+    def refusal(s):
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=30)
+        c.request("POST", "/sql", s.encode(), owner)
+        r = c.getresponse()
+        body = r.read()
+        if r.status == 200:
+            return None
+        window_refusals.append({"sqlstate": r.getheader("x-pondra-sqlstate"), "error": body[:400].decode(errors="replace")})
+        return window_refusals[-1]
+    win_all = refusal("SELECT max(length(s) + id + k + n) AS m FROM (SELECT s, id, k, count(*) OVER () AS n FROM big)")
+    win_part = refusal("SELECT max(length(s) + k + d) AS m FROM (SELECT s, k, id - avg(id) OVER (PARTITION BY id % 3) AS d FROM big)")
+    checks["a window over all rows past the memory limit refuses (53200) and the node answers after; one that streams answers"] = (
+        win_all is not None and "a window holds more rows" in win_all["error"]
+        and win_part is not None and win_part["sqlstate"] == "53200"
+        and q("SELECT count(*) AS n FROM big") == [{"n": 3000000}]
+        and q("SELECT count(*) AS n FROM (SELECT rank() OVER (PARTITION BY k ORDER BY id) AS r FROM big) WHERE r = 1") == [{"n": 2000000}])
     # A write that runs out of memory retries frugally as a query does: its join's sort-merge spills, and a
     # COPY to a folder leaves no file of the first try behind. Each write's error is kept for the report.
     folder = os.path.join(tempfile.mkdtemp(prefix="pondra-frugal-"), "out")
@@ -3491,7 +3511,7 @@ def scale():
     node.kill()
     ok = all(checks.values())
     shown = {q: ("same" if same else "DIFFERENT") + (", by ranges" if r else "") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp, r) in shuffles.items()}
-    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "ok": ok}, indent=1))
+    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "window_refusals": window_refusals, "ok": ok}, indent=1))
     if not ok:
         print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
         sys.exit(1)

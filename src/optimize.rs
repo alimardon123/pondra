@@ -890,6 +890,8 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let filters = rules.iter().position(|r| r.name() == "FilterPushdown").unwrap_or(0);
     rules.insert(filters + 1, Arc::new(FilterShares { apart: false })); // (again: a filter pushed into a union's parts is a new one, at DataFusion's fifth)
     rules.insert(filters, Arc::new(WideTopN)); // (before the filters are pushed down: then they go into the scan)
+    #[cfg(feature = "server")]
+    rules.push(Arc::new(crate::held::Windows)); // (last: nothing after it moves a window)
     rules
 }
 

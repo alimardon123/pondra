@@ -37,6 +37,7 @@ mod optimize;
 #[cfg(feature = "server")] mod copy;
 #[cfg(feature = "server")] mod cursors;
 #[cfg(feature = "server")] mod guard;
+#[cfg(feature = "server")] mod held;
 #[cfg(feature = "server")] mod hilbert;
 #[cfg(feature = "server")] mod history;
 #[cfg(feature = "server")] mod ddl;

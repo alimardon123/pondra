@@ -116,7 +116,8 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           (`pondra status` and `pondra capture`: ADR-060 §7, invariant 280); views kept current (ADR-055,
           ADR-056, ADR-059):
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
-          view that runs its query again, by key or whole: invariant 253)
+          view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
+          counts in the query memory: invariant 414)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -2677,6 +2678,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    order, and doesn't fall back: SCRAM first would be SCRAM for psql 18 too, and a password offered
    beside SASL can't be. `harness.py sso_pg` (a hand-written client, psycopg2's libpq 17, and psql 18
    when there is one); `harness.py keycloak` (psql 18's device flow, approved at Keycloak).
+
+414. **A window counts what it holds** (`held.rs`): every `WindowAggExec` and `BoundedWindowAggExec` is planned
+   between a `HeldInExec`, which counts each batch going in against the query memory (its rows' own slices, the
+   strings their views point to, and the window's own columns), and a `HeldOutExec`, which lets go of each batch as
+   its rows come out (a window gives one row per row, in order), so a window holding more than memory refuses
+   (53200) instead of growing the node until the OS kills it, and one that streams holds only what it holds.
+   What DataFusion keeps inside a window beyond its rows not yet out (the string buffers a long partition's views
+   point into, a frame's rows behind those given out, `WindowAggExec`'s final concatenation) is still uncounted.
+   `harness.py scale`: "a window over all rows past the memory limit refuses…" (answered by growing past its pool
+   without it; killed under a 2 GB cap at SF10).
 
 ## Tests: run these before and after any change
 
