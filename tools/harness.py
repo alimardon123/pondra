@@ -3547,6 +3547,43 @@ def flight_protocol(fport):
     }
 
 
+def flight_schemas(fport):
+    """Every query's announced schema is its stream's, folded constants too: GetFlightInfo's schema
+    and DoGet's agree (nullability and metadata) over plain Flight, and ADBC, which compares the two,
+    answers each query its rows. The optimizer folds `upper('x')` to a literal, which the plan calls
+    nullable and the run didn't; that mismatch failed ADBC. Reads the `ev` table flight() made.
+    Returns the check."""
+    import pyarrow.flight as fl
+    import adbc_driver_flightsql.dbapi as adbc
+    queries = ["SELECT upper('x')", "SELECT 1 + 1", "SELECT 'a' || 'b' AS ab", "SELECT now()", "SELECT CASE WHEN 1 = 1 THEN 'y' END",
+               "SELECT user, amount FROM ev", "SELECT count(*) AS n FROM ev", "SELECT user FROM ev WHERE amount < 0",
+               "SELECT coalesce(user, 'z') AS u FROM ev", "SELECT 'a' AS x UNION ALL SELECT NULL", """SELECT json_get_str('{"a": "x"}', 'a')"""]
+    opts = fl.FlightCallOptions(headers=[(b"authorization", b"Bearer r")])
+    client = fl.FlightClient(f"grpc://127.0.0.1:{fport}")
+    conn = adbc.connect(f"grpc://127.0.0.1:{fport}", db_kwargs={"adbc.flight.sql.authorization_header": "Bearer r"}, autocommit=True)
+    def plain_agrees(q):
+        try:
+            info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": q})), opts)
+            return info.schema.equals(client.do_get(info.endpoints[0].ticket, options=opts).read_all().schema, check_metadata=True)
+        except Exception:
+            return False
+    def adbc_answers(q):
+        cur = conn.cursor()
+        try:
+            cur.execute(q)
+            cur.fetchall()
+            return True
+        except Exception:
+            return False
+        finally:
+            cur.close()
+    bad = [q for q in queries if not (plain_agrees(q) and adbc_answers(q))]
+    conn.close()
+    if bad:
+        print("schemas that disagree, or queries ADBC fails:", bad, file=sys.stderr)
+    return {"every query's announced schema is its stream's (folded constants too), over Flight and ADBC": not bad}
+
+
 def flight():
     """Arrow Flight and Flight SQL. pyarrow: DoPut exactly-once (a retried stream is applied
     once), DoGet SQL, GetFlightInfo, ListFlights, a table's log as a columnar stream (chosen
@@ -3644,6 +3681,7 @@ def flight():
         "every row once": total == {"n": 14001, "s": 1000 * (sum(range(13)) + 100) + 5},
     }
     checks.update(flight_protocol(fport))  # (the protocol's own actions and RPCs, over gRPC)
+    checks.update(flight_schemas(fport))  # (the schema each query announces is the one its stream sends)
     node.kill(); follower.kill()
     ok = all(checks.values())
     follow_ms = round((lag[-1] - sent_at) * 1000) if lag else None
