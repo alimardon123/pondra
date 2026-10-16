@@ -117,7 +117,8 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           ADR-056, ADR-059):
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
-          counts in the query memory: invariant 414)
+          counts in the query memory: invariant 414); round 35 served.rs (a lake's store over HTTP:
+          pondra://host:port, ADR-072 §8, invariant 299)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -2219,6 +2220,21 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    changes anything (`types::grows`). `CHAR(n)` is still plain text. `harness.py ddlgaps`:
    "VARCHAR(n): a longer value refused (22001) by INSERT, Postgres, UPDATE, MERGE, COPY, an append and
    an added column…".
+299. **The node that serves a lake's store leads it, and the nodes that reach it through that node never
+   claim a term** (`served.rs`, `Cluster::may_lead`, ADR-072 §8): their store is in the holder's process, so a
+   holder that followed would restart itself on the next leader change (an exec) and take every node's store
+   with it, and a lake in memory would be gone. One check (`served::checked`, from the command line and
+   `Node::start`) refuses a holder that is a `--reader`, has its lake on a bucket or has no admin token, and a
+   `pondra://` node with no admin token; a holder that didn't win the term stops. A `pondra://` node waits for
+   the holder to answer and to lead (`served::wait_up`, `join`), its `follow` only heartbeats, and it starts
+   again when its holder answers after the lease (a lake in memory started again is another lake of the same
+   term). A holder is never cut off (invariant 214: nobody else could lead). The door answers only
+   `auth::operator()` (the nodes' admin token, or the program that started the node; never a user's, a
+   superuser's included). Two departures from ADR-072 §8: the flag is `--serve-store` (Delta Sharing has
+   "share"), and the nodes open the store with the admin token, not the nodes' key, which a follower can't read
+   until it opens the store. `harness.py served`: "a follower that loses its holder for 10 s claims no term",
+   "a follower whose holder stops waits, and answers again once it is back", "a lake in memory started again:
+   its follower shows none of the old lake's rows", "a superuser's token is refused".
 300. **A node is started and stopped as an object, and a stop at any point gives back what it took**
    (`node.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
    serves, it drains, makes what it committed durable, checkpoints, ends what it started
@@ -2720,6 +2736,7 @@ cargo test --release --lib [filter]     # unit tests (the tests are the library'
 python3 tools/harness.py all            # upsert, fence/split-brain, bulk insert, reader, crash, load
 python3 tools/gates.py [--prepare]      # the gates (sqllogictest, TPC-H SF1 vs DuckDB, vs Postgres, Nexmark): a row in logs/gates/README.md; exit 1 on a drop
 python3 tools/harness.py guarded        # open nodes and pages from other sites, the row doors and the nodes' routes by grant, a forwarded change as its user, .py files an admin's
+python3 tools/harness.py served         # a lake's store over HTTP (pondra://host:port, --serve-store): followers never lead, wait for their holder, and refuse by name
 python3 tools/surface.py --bin target/release/pondra --check docs/surface.json   # what 1.0 keeps (ADR-068): reports until the freeze, then fails on a name added or gone
 python3 tools/harness.py safety         # panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
 python3 tools/harness.py owned signed guesses   # a program's node answers only it; a lake served with tokens stays signed; failed sign-ins limited per address and name

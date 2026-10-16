@@ -181,6 +181,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/job", post(job))
         .route("/cluster/probe", get(|Query(p): Query<HashMap<String, usize>>| async move { crate::guard::probe(p.get("bytes").copied().unwrap_or(0)) }))
         .route("/cluster/beat", post(beat))
+        .nest_service("/cluster/store", crate::served::door_for(app.lake.store.clone())) // (a lake's store, for nodes on other machines: ADR-072 §8)
         .route("/cluster/ack", post(ack))
         .route("/cluster/replica", get(replica))
         .route("/cluster/leader", get(|State(app): State<App>| async move { Json(app.cluster.leader_status()) }))

@@ -193,6 +193,10 @@ A lake on object storage reads its credentials and endpoint from the environment
 own tools do: `AWS_*` for `s3://` (`AWS_ENDPOINT` for R2 and MinIO), `GOOGLE_*` for `gs://`, and
 `AZURE_*` for `az://`, `abfs://` and `abfss://`. Pondra does not read them any other way.
 
+A lake's store can also be one node's, served to the others: `pondra serve --serve-store` sets
+`PONDRA_SERVE_STORE` for its node, and the other nodes open the lake as `pondra://host:port`. Every node
+of it needs the same admin token, and the node that serves the store is the one that leads the lake.
+
 ## Set by Pondra
 
 Do not set these. Pondra sets them for its own processes, and some are copies of flags.

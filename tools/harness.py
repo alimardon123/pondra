@@ -31,6 +31,7 @@
   harness.py sso_pg              psql 18's sign-in through a provider (POSTGRES 'oauth', OAUTHBEARER): told where it is, a token in, refusals, one way a connection
   harness.py keycloak            single sign-on against a real Keycloak (PONDRA_KEYCLOAK): tokens at every door, the console's flow, pondra login, psql 18
   harness.py safety              panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
+  harness.py served              a lake's store served by its node (pondra://host:port, --serve-store): followers never lead, wait for their holder, refusals
   harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
   harness.py stopped             a run whose node was killed under it: stopped, not running for good
   harness.py variables           DECLARE $day / $day = … from every door, a file's parameters (DECLARE PARAMETER, a .py file's cell), runs and procedures of their own
@@ -8929,6 +8930,170 @@ def guarded():
     c.kill()
     ok = all(checks.values())
     print(json.dumps({"guarded": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+def served():
+    """A lake's store served by the node that holds it (ADR-072 §8, invariant 299): `pondra://host:port`
+    opens the store through that node's door, and `--serve-store` makes the holder, which leads the lake.
+    Followers never claim a term; one whose holder stops waits for it and answers again once it is back;
+    a follower killed and started again reads every row; a lake in memory started again shows none of its
+    old rows. Refused by name: a superuser's token at the door, a node without --serve-store, a reader
+    holder, a folder of lakes, a second holder, a pondra:// node with no admin token."""
+    T, R = "adm-" + uuid.uuid4().hex[:12], "rd-" + uuid.uuid4().hex[:12]  # (the nodes' admin token, and a read token)
+    H = {"Authorization": f"Bearer {T}"}
+    P = A.port
+    pa, pb, pc, pd, pe, pm, px = P, P + 1, P + 2, P + 3, P + 4, P + 5, P + 6
+    checks, info = {}, {}
+
+    def mk():  # (a folder of its own, removed when the run exits)
+        d = tempfile.mkdtemp(prefix="pondra-")
+        LAKES.append(d)
+        return d
+
+    def sqlt(port, q, path="/sql"):  # (every call carries the admin token: the nodes are tokened)
+        return call(port, "POST", path, q.encode(), headers=H)
+
+    def answer(port, q):  # (the rows, or the error's text: a node restarting refuses or doesn't answer)
+        try:
+            return sqlt(port, q)
+        except Exception as e:
+            return f"ERROR {e}"
+
+    def count(port, table="t"):
+        r = answer(port, f"SELECT count(*) AS n FROM {table}")
+        return r[0]["n"] if isinstance(r, list) else r
+
+    def door_of(port, token=None):  # (the store's door, read with http.client: its listing is NDJSON)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("GET", "/cluster/store?prefix=", b"", {"Authorization": f"Bearer {token}"} if token else {})
+        r = c.getresponse()
+        return r.status, r.read().decode(errors="replace")
+
+    def term_files(folder):  # (the term records of a lake: a follower writes none)
+        d = os.path.join(folder, "cluster", "term")
+        return {f: open(os.path.join(d, f), "rb").read() for f in sorted(os.listdir(d))} if os.path.isdir(d) else {}
+
+    def start_later(node):  # (a node that waits for its holder doesn't return from start: started in a thread)
+        box = []
+        def run():
+            try:
+                box.append(node.start(tries=1))
+            except Exception as e:
+                box.append(e)
+        threading.Thread(target=run, daemon=True).start()
+        return box
+
+    def refused(args, msg, env=None):  # (a node refused at its start exits non-zero, and says why: `msg` is in what it said)
+        r = subprocess.run([BIN, "serve", *args], timeout=30, capture_output=True, env=env)
+        said = (r.stderr + r.stdout).decode(errors="replace")
+        return {"exit": r.returncode, "match": msg in said, "said": said[-300:]}
+
+    noadmin = {k: v for k, v in os.environ.items() if k != "PONDRA_ADMIN_TOKEN"}
+    drop = os.path.join(mk(), "drop-beats.txt")  # (the followers the holder refuses to answer: PONDRA_DROP_BEATS)
+    open(drop, "w").close()
+    folder = mk()
+    holder_env = {"PONDRA_DROP_BEATS": drop}
+    A_node = Node(folder, pa, admin_token=T, serve_store=True, env=holder_env, tier_secs=1).start()  # (tiered each second: the spread check needs files)
+    cenv, benv = {"PONDRA_CACHE_DIR": mk()}, {"PONDRA_CACHE_DIR": mk()}  # (each follower's SSD tier is its own)
+    B_node = Node(f"pondra://127.0.0.1:{pa}", pb, admin_token=T, env=benv).start()
+    C_node = Node(f"pondra://127.0.0.1:{pa}", pc, admin_token=T, env=cenv).start()
+    checks["the holder's door answers the admin token with 200 (a node's store, listed)"] = door_of(pa, T)[0] == 200
+    checks["the holder leads, and its followers follow it (role on /stats)"] = \
+        call(pa, "GET", "/stats", headers=H)["role"] == "leader" and call(pb, "GET", "/stats", headers=H)["role"] == "follower" and call(pc, "GET", "/stats", headers=H)["role"] == "follower"
+    sqlt(pa, "CREATE TABLE t (k BIGINT, who VARCHAR)")
+    for lo, hi in ((0, 334), (334, 668), (668, 1000)):
+        sqlt(pa, "INSERT INTO t VALUES " + ",".join(f"({i}, 'a')" for i in range(lo, hi)))
+    checks["1,000 rows written on the holder are read on the holder and both followers"] = all(until(lambda p=p: count(p), 1000, 10) == 1000 for p in (pa, pb, pc))
+    sqlt(pc, "INSERT INTO t VALUES " + ",".join(f"({i}, 'c')" for i in range(1000, 1500)))
+    sqlt(pb, "INSERT INTO t VALUES " + ",".join(f"({i}, 'b')" for i in range(1500, 2000)))
+    checks["500 written on each follower (forwarded to the holder): 2,000 on every node"] = all(until(lambda p=p: count(p), 2000, 10) == 2000 for p in (pa, pb, pc))
+    by_who = "SELECT who, count(*) AS n, sum(k) AS s FROM t GROUP BY who ORDER BY who"
+    # (a follower's view of the cluster comes from its first heartbeat: a second or two after it starts)
+    until(lambda: all(len(call(p, "GET", "/stats", headers=H)["nodes"]) == 3 for p in (pa, pb, pc)), True, 20)
+    plain = answer(pb, by_who)
+    spread_before = metrics_of(pb, headers=H)["pondra_spread_queries_total"]
+    spread = call(pb, "POST", "/sql?spread=1", by_who.encode(), headers=H)
+    checks["?spread=1 on a follower answers what it answers alone, and spreads over the three nodes"] = \
+        spread == plain and metrics_of(pb, headers=H)["pondra_spread_queries_total"] > spread_before
+    info["answer"] = plain
+    # A follower that loses its holder for 10 s (its heartbeats refused) claims no term, and the holder
+    # still leads that term when it answers again.
+    terms, term_before = term_files(folder), call(pa, "GET", "/stats", headers=H)["term"]
+    open(drop, "w").write(f"127.0.0.1:{pb}\n127.0.0.1:{pc}\n")
+    time.sleep(10)
+    open(drop, "w").close()
+    checks["a follower that loses its holder for 10 s claims no term: the term records are as they were, the holder leads the same term"] = \
+        term_files(folder) == terms and call(pa, "GET", "/stats", headers=H)["term"] == term_before \
+        and until(lambda: count(pb), 2000, 15) == 2000 and until(lambda: count(pc), 2000, 15) == 2000
+    C_node.kill()
+    C_node = Node(f"pondra://127.0.0.1:{pa}", pc, admin_token=T, env=cenv).start()
+    checks["a follower killed and started again follows its holder and reads every row (2,000)"] = until(lambda: count(pc), 2000, 30) == 2000
+    # The holder stops (SIGTERM: it steps down, and nobody takes a term). Its followers wait for it.
+    A_node.p.send_signal(signal.SIGTERM)
+    A_node.p.wait(timeout=120)
+    time.sleep(5)
+    checks["the holder stopped: its followers stay up, and no follower claims a term"] = B_node.alive() and C_node.alive() and term_files(folder) == terms
+    C_node.kill()
+    C_node = Node(f"pondra://127.0.0.1:{pa}", pc, admin_token=T, env=cenv)
+    box = start_later(C_node)
+    time.sleep(5)
+    checks["a follower killed while its holder is away waits for it (alive, saying so), and does not start on its own"] = \
+        C_node.p is not None and C_node.alive() and f"waiting for pondra://127.0.0.1:{pa} to answer" in open(C_node.log).read() and not box
+    A_node = Node(folder, pa, admin_token=T, serve_store=True, env=holder_env).start()
+    checks["the holder started again leads, and its followers answer every row again within a minute"] = \
+        call(pa, "GET", "/stats", headers=H)["role"] == "leader" and until(lambda: count(pb), 2000, 60) == 2000 and until(lambda: count(pc), 2000, 60) == 2000
+    checks["the follower that waited started once its holder answered"] = until(lambda: bool(box), True, 30) and isinstance(box[0], Node)
+    C_node = box[0] if box and isinstance(box[0], Node) else C_node
+    sqlt(pb, "INSERT INTO t VALUES (2000, 'b')")
+    checks["a write on a follower after that goes through the holder: 2,001 on every node"] = all(until(lambda p=p: count(p), 2001, 20) == 2001 for p in (pa, pb, pc))
+    # A lake in memory: its holder stops, and a new one (a new, empty lake) starts on the same address.
+    M = Node(":memory:", pm, admin_token=T, serve_store=True).start()
+    E = Node(f"pondra://127.0.0.1:{pm}", pe, admin_token=T, env={"PONDRA_CACHE_DIR": mk()}).start()
+    sqlt(pe, "CREATE TABLE m (x BIGINT)")
+    sqlt(pe, "INSERT INTO m VALUES " + ",".join(f"({i})" for i in range(10)))
+    checks["a lake in memory, written and read through its follower"] = until(lambda: count(pe, "m"), 10, 15) == 10
+    M.p.send_signal(signal.SIGTERM)
+    M.p.wait(timeout=120)
+    time.sleep(8)  # (away past the lease: the follower looks again only once it lapses, `follow`)
+    M = Node(":memory:", pm, admin_token=T, serve_store=True).start()
+
+    def gone(port):  # (the old lake's table isn't there, or holds no rows)
+        r = answer(port, "SELECT count(*) AS n FROM m")
+        if isinstance(r, str):
+            return any(w in r for w in ("not found", "no table", "does not exist"))
+        return r == [{"n": 0}]
+    checks["a lake in memory started again: its follower shows none of the old lake's rows"] = until(lambda: gone(pe), True, 60)
+    info["memory follower"] = answer(pe, "SELECT count(*) AS n FROM m")
+    # Refusals: a superuser's token at the door, a node without --serve-store, a reader holder.
+    D = Node(mk(), pd, admin_token=T, read_token=R, serve_store=True).start()
+    sqlt(pd, "CREATE USER su PASSWORD 'su-password-1' SUPERUSER")
+    su = sqlt(pd, "CREATE TOKEN su_t FOR USER su")["token"]
+    d_said = {"no token": door_of(pd), "a read token": door_of(pd, R), "a superuser's token": door_of(pd, su), "the admin token": door_of(pd, T)}
+    info["holder's door refusals"] = {k: [v[0], v[1][:160]] for k, v in d_said.items()}
+    checks["the holder's door: no token 401; a read token refused; a superuser's token 403 saying a user's token can't open it; the admin token 200"] = \
+        d_said["no token"][0] == 401 and d_said["a read token"][0] in (401, 403) and d_said["a superuser's token"][0] == 403 \
+        and "a user's token" in d_said["a superuser's token"][1] and d_said["the admin token"][0] == 200
+    X = Node(mk(), px, admin_token=T).start()  # (a node on its own folder, without --serve-store)
+    checks["a node without --serve-store refuses its store's door, and says how to open it"] = \
+        door_of(px, T)[0] == 403 and "--serve-store" in door_of(px, T)[1]
+    at = f"--addr=127.0.0.1:{px + 10}"  # (a port of its own: nothing here starts, and the refusals come first)
+    refusals = {  # (each named: its command line, and the words its refusal says)
+        "a folder of lakes": refused(["--serve-store", "--lakes", mk(), at, "--admin-token", T], "--serve-store serves one lake's store"),
+        "a reader holder": refused(["--serve-store", "--reader", "--dir", mk(), at, "--admin-token", T], "a --reader never leads"),
+        "an s3 URL": refused(["--serve-store", "--dir", "s3://b/x", at, "--admin-token", T], "reached by its own URL"),
+        "no admin token": refused(["--serve-store", "--dir", mk(), at], "needs --admin-token", env=noadmin),
+        "a pondra:// lake with a path": refused(["--dir", f"pondra://127.0.0.1:{pa}/x", at, "--admin-token", T], "named by pondra://host:port alone"),
+        "a pondra:// lake with no token": refused(["--dir", f"pondra://127.0.0.1:{pa}", at], "admin token its holder has", env=noadmin),
+        "a second holder": refused(Node(folder, px + 11, admin_token=T, serve_store=True).args[2:], "is led by"),
+    }
+    info["refusals"] = refusals
+    checks["refused at the start, exit non-zero and saying why: a folder of lakes, a reader holder, an s3 URL, no admin token, a pondra:// lake with a path or no token, a second holder"] = \
+        all(r["exit"] != 0 and r["match"] for r in refusals.values())
+    for n in (A_node, B_node, C_node, M, E, D, X):
+        n.kill()
+    ok = all(checks.values())
+    print(json.dumps({"served": checks, "ok": ok, "info": info}, indent=1, default=str))
     return ok
 
 
@@ -18892,12 +19057,12 @@ SECS = {"memory": 240, "waits": 99, "sso": 89, "stopped": 87, "guesses": 45, "ba
         "files": 10, "followers": 10, "guarded": 10, "begin": 9, "bykey": 9, "clients": 9, "flows": 9,
         "guard": 9, "hot": 9, "schemas": 9, "temps": 9, "catalogs": 8, "clusters": 8, "columns": 8,
         "fills": 8, "serverless": 8, "alter": 7, "fence": 7, "loads": 7, "safety": 7, "sequences": 7,
-        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60}
+        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60, "served": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -18929,7 +19094,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -18942,7 +19107,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
