@@ -3,7 +3,7 @@ title: SQL statements
 description: Every SQL statement Pondra takes, with its syntax and an example, and the ones it refuses.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 This page lists every statement a Pondra node runs, grouped by what it changes. Queries use
 [Apache DataFusion's SQL](https://datafusion.apache.org/user-guide/sql/index.html), which is close to
@@ -193,6 +193,38 @@ A parameter goes with the request, in JSON. The Python and JavaScript clients do
   </TabItem>
 </Tabs>
 
+
+### LATERAL over a function's rows
+
+A function that makes rows from a column of the same `FROM` reads each row's own value, as Postgres
+writes it: `unnest`, `generate_series` and `range`, with or without `LATERAL`. Each row of the table
+is passed through the function's rows made from it, in one plan, so the three forms below cost what
+the table's scan costs. `LEFT JOIN LATERAL … ON true` keeps a row whose list is NULL or empty, with
+NULL in the function's column.
+
+```sql
+CREATE TABLE baskets (id BIGINT, items BIGINT[], n BIGINT);
+INSERT INTO baskets VALUES (1, [10, 20, 30], 2), (2, NULL, 1), (3, [], 3);
+SELECT b.id, u.item FROM baskets b, unnest(b.items) AS u(item) ORDER BY b.id, u.item;
+SELECT b.id, g FROM baskets b CROSS JOIN LATERAL generate_series(1, b.n) AS g ORDER BY b.id, g;
+SELECT b.id, u.item FROM baskets b LEFT JOIN LATERAL unnest(b.items) AS u(item) ON true ORDER BY b.id, u.item;
+```
+
+```text
+id  item
+1   10
+1   20
+1   30
+```
+
+A `LEFT JOIN LATERAL` takes `ON true` and one `unnest` or set function. Pondra refuses the rest by
+name, with SQLSTATE `0A000`: a condition on it, a `RIGHT` or `FULL` join, and `WITH ORDINALITY` over a
+column. A function of constants (`generate_series(1, 3)`) is planned as it always was.
+
+<Aside type="caution">
+A `LATERAL (SELECT …)` subquery is planned by DataFusion, not by this rule. A correlated aggregate needs
+an equality between the two sides (`WHERE w.v = t.n`): with `<` DataFusion can't plan it.
+</Aside>
 
 ### A table's past
 
@@ -1028,3 +1060,6 @@ text is the node's own, it is shown in code:
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |
 | Python functions and procedures on a node started without `--python` | refused, with the flag to use |
+| `LEFT JOIN LATERAL … ON <condition>` (only `ON true` is taken), or a `LEFT` over more than one function | refused, SQLSTATE `0A000`: `LEFT JOIN LATERAL over u is not supported yet` |
+| `RIGHT JOIN LATERAL` or `FULL JOIN LATERAL` | refused, SQLSTATE `0A000`: `LATERAL syntax is not supported for FULL OUTER and RIGHT … joins` |
+| `generate_series(1, t.n) WITH ORDINALITY` over a column of the same `FROM` | refused, SQLSTATE `0A000`: `WITH ORDINALITY is not supported yet` |
