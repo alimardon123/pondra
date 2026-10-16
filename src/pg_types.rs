@@ -172,57 +172,85 @@ fn rewritten(known: &Known, stmt: &mut Statement) -> bool {
     if asked.is_empty() && compared.is_empty() {
         return false;
     }
-    let mut named = Named(&asked, false);
-    let _ = stmt.visit(&mut named); // (first: it finds the items by their places too)
-    let mut changed = named.1;
-    let _ = ast::visit_expressions_mut(stmt, |e| {
-        let place = at(e);
-        let to = match asked.iter().find(|(p, _)| *p == place) {
-            Some((_, ty)) => Some(ty.name().to_string()),
-            None if compared.contains(&place) => string(e).and_then(|s| crate::types::uuid_of(s).ok()),
-            None => None,
-        };
-        if let Some(to) = to.filter(|to| string(e) != Some(to.as_str())) {
-            *e = Expr::value(Value::SingleQuotedString(to));
-            changed = true;
-        }
-        ControlFlow::<()>::Continue(())
-    });
-    changed
+    // (`pg_typeof(id)` becomes 'uuid', whose own name would be `Utf8("uuid")`: `names_kept` names it as written)
+    names_kept(stmt, |stmt| {
+        let mut changed = false;
+        let _ = ast::visit_expressions_mut(stmt, |e| {
+            let place = at(e);
+            let to = match asked.iter().find(|(p, _)| *p == place) {
+                Some((_, ty)) => Some(ty.name().to_string()),
+                None if compared.contains(&place) => string(e).and_then(|s| crate::types::uuid_of(s).ok()),
+                None => None,
+            };
+            if let Some(to) = to.filter(|to| string(e) != Some(to.as_str())) {
+                *e = Expr::value(Value::SingleQuotedString(to));
+                changed = true;
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        changed
+    })
 }
 
 /// An expression's place in its statement, which tells it from another of the same text.
 fn at(e: &Expr) -> usize { std::ptr::from_ref(e) as usize }
 
-/// Gives a query's item `pg_typeof(x)` of a uuid, json or jsonb, without an alias, its name as written, as any
-/// other item has, before `rewritten` puts the type's name in its place (whose own name would be `Utf8("uuid")`).
-struct Named<'a>(&'a [(usize, Ty)], bool);
+/// Runs `change` over `stmt`, then gives each item it changed that has no alias (in a SELECT, or a RETURNING)
+/// its text as written for a name, so a change made where SQL comes in never renames a column:
+/// `SELECT json_agg(t) FROM t` still answers `json_agg(t)`. Items are found by their places, so `change` must
+/// change expressions where they are (moving a query is fine; a query it clones is new to it). Whether
+/// `change` changed anything.
+pub(crate) fn names_kept(stmt: &mut Statement, change: impl FnOnce(&mut Statement) -> bool) -> bool {
+    let mut written = HashMap::new();
+    let _ = stmt.visit(&mut Items(|item: &mut SelectItem| {
+        if let SelectItem::UnnamedExpr(e) = item {
+            written.insert(at(e), e.to_string());
+        }
+    }));
+    if !change(stmt) {
+        return false;
+    }
+    let _ = stmt.visit(&mut Items(|item: &mut SelectItem| {
+        if let SelectItem::UnnamedExpr(e) = item {
+            if let Some(text) = written.get(&at(e)).filter(|text| **text != e.to_string()) {
+                let expr = std::mem::replace(e, Expr::value(Value::Null));
+                *item = SelectItem::ExprWithAlias { expr, alias: ast::Ident::with_quote('"', text.clone()) };
+            }
+        }
+    }));
+    true
+}
 
-impl ast::VisitorMut for Named<'_> {
+/// Calls its function with each item of every query in a statement (both sides of a UNION) and of every
+/// RETURNING.
+struct Items<F>(F);
+
+impl<F: FnMut(&mut SelectItem)> ast::VisitorMut for Items<F> {
     type Break = ();
 
     fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
-        fn items(body: &mut SetExpr, asked: &[(usize, Ty)], changed: &mut bool) {
+        fn items(body: &mut SetExpr, f: &mut impl FnMut(&mut SelectItem)) {
             match body {
-                SetExpr::Select(s) => {
-                    for item in s.projection.iter_mut() {
-                        if let SelectItem::UnnamedExpr(e) = item {
-                            if let Some((_, ty)) = asked.iter().find(|(p, _)| *p == at(e)) {
-                                let alias = ast::Ident::with_quote('"', e.to_string());
-                                *item = SelectItem::ExprWithAlias { expr: Expr::value(Value::SingleQuotedString(ty.name().into())), alias };
-                                *changed = true;
-                            }
-                        }
-                    }
-                }
+                SetExpr::Select(s) => s.projection.iter_mut().for_each(f),
                 SetExpr::SetOperation { left, right, .. } => {
-                    items(left, asked, changed);
-                    items(right, asked, changed);
+                    items(left, f);
+                    items(right, f);
                 }
-                _ => {}
+                _ => {} // (a query in parentheses is a query of its own: this visits it too)
             }
         }
-        items(&mut q.body, self.0, &mut self.1);
+        items(&mut q.body, &mut self.0);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_statement(&mut self, s: &mut Statement) -> ControlFlow<()> {
+        let returning = match s {
+            Statement::Insert(i) => i.returning.as_mut(),
+            Statement::Update(u) => u.returning.as_mut(),
+            Statement::Delete(d) => d.returning.as_mut(),
+            _ => None,
+        };
+        returning.into_iter().flatten().for_each(&mut self.0);
         ControlFlow::Continue(())
     }
 }
@@ -442,10 +470,11 @@ impl<'a> Trace<'a> {
             Expr::Cast { data_type, .. } => of_type(data_type),
             Expr::Nested(e) => self.expr(e, rels),
             // (`doc -> 'a'` and `doc #> '{a}'` answer a document's own type; `->>` and `#>>` answer text)
-            Expr::BinaryOp { left, op: ast::BinaryOperator::Arrow | ast::BinaryOperator::HashArrow, .. } => self.document(left, rels),
+            // (and `doc #- '{a}'` the document without a part; `b - 'a'` deletes from a jsonb, and json has no `-`)
+            Expr::BinaryOp { left, op: ast::BinaryOperator::Arrow | ast::BinaryOperator::HashArrow | ast::BinaryOperator::HashMinus, .. } => self.document(left, rels),
+            Expr::BinaryOp { left, op: ast::BinaryOperator::Minus, .. } => self.expr(left, rels).filter(|t| *t == Ty::Jsonb),
             Expr::Function(f) => match object(&f.name).as_str() {
                 "gen_random_uuid" | "uuidv4" | "uuidv7" | "uuid" | "pondra_uuid" => Some(Ty::Uuid),
-                "pondra_json" | "json_get_json" => Some(Ty::Json),
                 "json_object_field" | "jsonb_object_field" | "json_array_element" | "jsonb_array_element" | "pondra_json_path" => first_arg(f).and_then(|a| self.document(a, rels)),
                 "nullif" => first_arg(f).and_then(|a| self.expr(a, rels)),
                 "coalesce" => args(f).and_then(|a| same(a.iter().filter(|a| !null(a)).map(|a| self.expr(a, rels)))),
@@ -455,7 +484,7 @@ impl<'a> Trace<'a> {
                     }
                     None
                 }
-                _ => None,
+                name => json_type(name),
             },
             Expr::Case { conditions, else_result, .. } => same(conditions.iter().map(|w| &w.result).chain(else_result.as_deref()).filter(|e| !null(e)).map(|e| self.expr(e, rels))),
             _ => None,
@@ -528,6 +557,20 @@ impl<'a> Trace<'a> {
 }
 
 /// The type a cast to `t` makes its value, when the port names it.
+/// What a function that makes or changes a whole JSON document answers, json or jsonb, by its name: one list,
+/// which the trace reads (a column's type at the Postgres port, `pg_typeof`, what a JSON maker nests). A new
+/// such function adds its name here. (`->` and its functions answer their document's type: `Trace::expr`.)
+pub(crate) fn json_type(name: &str) -> Option<Ty> {
+    match name {
+        "pondra_json" | "json_get_json" | "pondra_as_json" | "to_json" | "row_to_json" | "pondra_row" | "json_build_object" | "json_build_array"
+        | "json_agg" | "json_object_agg" | "pondra_json_agg" | "pondra_json_object_agg" | "json_extract_path" | "json_array_elements" | "json_strip_nulls" => Some(Ty::Json),
+        "pondra_jsonb" | "pondra_as_jsonb" | "to_jsonb" | "jsonb_build_object" | "jsonb_build_array" | "jsonb_agg" | "jsonb_object_agg" | "pondra_jsonb_agg"
+        | "pondra_jsonb_object_agg" | "jsonb_extract_path" | "jsonb_array_elements" | "jsonb_strip_nulls" | "jsonb_set" | "jsonb_set_lax" | "jsonb_insert" | "jsonb_delete"
+        | "jsonb_delete_path" | "jsonb_concat" => Some(Ty::Jsonb),
+        _ => None,
+    }
+}
+
 fn of_type(t: &ast::DataType) -> Option<Ty> {
     match t {
         ast::DataType::Uuid => Some(Ty::Uuid),
@@ -649,6 +692,52 @@ mod tests {
         assert_eq!(cols("INSERT INTO t (id, name) VALUES ('a', 'b') RETURNING id, name"), [Some(Ty::Uuid), None]);
         assert_eq!(cols("UPDATE t AS x SET name = 'a' FROM s.o WHERE x.id = o.ref RETURNING x.*, o.ref"), [Some(Ty::Uuid), None, Some(Ty::Uuid), Some(Ty::Json), Some(Ty::Uuid)]);
         assert_eq!(cols("DELETE FROM t WHERE true RETURNING *"), [Some(Ty::Uuid), None, Some(Ty::Uuid), Some(Ty::Json)]);
+    }
+
+    #[test]
+    fn traced_json_functions() {
+        assert_eq!(cols("SELECT to_json(name), row_to_json(t), json_build_object('a', 1), json_agg(name), pondra_as_json(name), pondra_jsonb(name), to_jsonb(1), jsonb_agg(1), jsonb_set(b, '{a}', '1') FROM t, s.o"), [Some(Ty::Json), Some(Ty::Json), Some(Ty::Json), Some(Ty::Json), Some(Ty::Json), Some(Ty::Jsonb), Some(Ty::Jsonb), Some(Ty::Jsonb), Some(Ty::Jsonb)]);
+        // (`#-` answers its document's type; `-` only a jsonb's: a number minus a number is no document)
+        assert_eq!(cols("SELECT doc #- '{a}', b #- '{a}', b - 'a', name #- '{a}', doc - 'a', id - 1 FROM t, s.o"), [Some(Ty::Json), Some(Ty::Jsonb), Some(Ty::Jsonb), None, None, None]);
+        assert_eq!(cols("SELECT jsonb_pretty(b), json_typeof(doc), upper(name) FROM t, s.o"), [None, None, None]);
+    }
+
+    #[test]
+    fn names_kept_by_place() {
+        // (every `upper(…)` becomes 'x': the items it changed keep their names, the others are as they were)
+        let upper = |s: &mut Statement| {
+            let mut changed = false;
+            let _ = ast::visit_expressions_mut(s, |e| {
+                if matches!(e, Expr::Function(f) if object(&f.name) == "upper") {
+                    *e = Expr::value(Value::SingleQuotedString("x".into()));
+                    changed = true;
+                }
+                ControlFlow::<()>::Continue(())
+            });
+            changed
+        };
+        let kept = |sql: &str| {
+            let mut s = one(sql).unwrap();
+            let changed = names_kept(&mut s, upper);
+            (changed, s.to_string())
+        };
+        assert_eq!(
+            kept("SELECT upper(a), upper(a) AS b, lower(a), (SELECT upper(a) FROM t) FROM t UNION ALL SELECT upper(a), 'y', 'z', 'w' FROM t"),
+            (true, r#"SELECT 'x' AS "upper(a)", 'x' AS b, lower(a), (SELECT 'x' AS "upper(a)" FROM t) AS "(SELECT upper(a) FROM t)" FROM t UNION ALL SELECT 'x' AS "upper(a)", 'y', 'z', 'w' FROM t"#.to_string())
+        );
+        assert_eq!(kept("WITH c AS (SELECT upper(a) FROM t) SELECT * FROM c"), (true, r#"WITH c AS (SELECT 'x' AS "upper(a)" FROM t) SELECT * FROM c"#.to_string()));
+        assert_eq!(kept("UPDATE t SET a = upper(b) RETURNING upper(a), a"), (true, r#"UPDATE t SET a = 'x' RETURNING 'x' AS "upper(a)", a"#.to_string()));
+        assert_eq!(kept("INSERT INTO t SELECT upper(a) FROM s RETURNING upper(a)"), (true, r#"INSERT INTO t SELECT 'x' AS "upper(a)" FROM s RETURNING 'x' AS "upper(a)""#.to_string()));
+        assert_eq!(kept("SELECT lower(a) FROM t"), (false, "SELECT lower(a) FROM t".to_string()));
+        // (a name holding a double quote is written so it reads back as itself)
+        let (_, text) = kept(r#"SELECT upper("A") FROM t"#);
+        match &one(&text).unwrap() {
+            Statement::Query(q) => match &*q.body {
+                SetExpr::Select(s) => assert!(matches!(&s.projection[0], SelectItem::ExprWithAlias { alias, .. } if alias.value == r#"upper("A")"#), "{text}"),
+                _ => panic!("{text}"),
+            },
+            _ => panic!("{text}"),
+        }
     }
 
     #[test]
