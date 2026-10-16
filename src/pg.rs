@@ -170,6 +170,8 @@ impl Startup {
                 None => {
                     let why = crate::sso::why(&app.lake, &token).await.unwrap_or_else(|| format!("the token doesn't sign in {user}"));
                     crate::audit::refused(app, &user, "postgres", from, "sign in", &why);
+                    // (the cost of a wrong guess, but not counted by `auth::Guesses`: a provider's token isn't
+                    // guessed, and counting it would lock the user out of the right one, invariant 381)
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     format!("OAuth bearer authentication failed for user \"{user}\": {why}")
                 }
