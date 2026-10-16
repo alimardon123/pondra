@@ -682,6 +682,9 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
     let (due, waited) = (turn.due, &turn.waited);
     let r = v.rerun.as_ref().context("not run again")?;
     let producer = producer(view);
+    // (each step's time since the run began, to stderr: where a slow view's runs go)
+    let t0 = Instant::now();
+    let tr = |w: &str| if crate::env::is_set("PONDRA_TRACE_RERUN") { eprintln!("rerun {view}: {w} {:.3} s", t0.elapsed().as_secs_f64()) };
     let done: Option<u64> = lake.cat.get(&producer_key(&producer)).await?;
     let mut now = lake.visible();
     if now == 0 {
@@ -715,6 +718,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
         }
         _ => None, // (every group)
     };
+    tr(&format!("touched {} keys", touched.as_ref().map_or(0, |t| t.iter().map(|b| b.num_rows()).sum::<usize>())));
     let scanned = match &touched {
         Some(t) if t.iter().all(|b| b.num_rows() == 0) => None,
         Some(t) => Some(scan(t.clone())?),
@@ -726,6 +730,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
             true => vec![],
             false => worked_out(lake, v, now, scanned.as_ref()).await?,
         };
+        tr(&format!("worked out {} rows", new.iter().map(|b| b.num_rows()).sum::<usize>()));
         // The view's rows as they are, and what came out different, worked out before the lake's
         // lock: a by-key run's take a second or two, and every other view's run waited for them.
         // Under the lock they stand when no commit has changed the view's table since (only its own
@@ -736,10 +741,13 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
             true => vec![],
             false => old_rows(lake, view, &r.keys, scanned.as_ref(), seen).await?,
         };
+        tr(&format!("old rows {}", read.iter().map(|b| b.num_rows()).sum::<usize>()));
         let changed = diff(&before, &r.keys, &read, &new)?;
+        tr("diff");
         // Under the lake's lock, as a change is (invariant 56): this view still the one this run is
         // for (dropped and made again meanwhile, it's another), and its rows as they are.
         let guard = waiting(waited, lock.lock()).await;
+        tr("locked");
         if lake.cat.get::<View>(&crate::views::view_key(view)).await?.and_then(|v| v.rerun).is_none_or(|x| x.id != r.id) {
             return Ok(());
         }
@@ -775,11 +783,13 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
             let name = if a.table == view { producer.clone() } else { format!("{producer}:deleted") };
             a.src = crate::log::Src { producer: name, seq: now, prev: Some(done.unwrap_or(0)) };
         }
+        tr("appends");
         if let crate::log::Outcome::Acks(acks) = waiting(waited, crate::change::submit(lake, seq, &pending)).await? {
             if acks.iter().any(|a| a.conflict) {
                 eprintln!("materialized view {view}: another run committed first; the next one reads on from it");
             }
         }
+        tr("committed");
         return Ok(());
     }
 }
