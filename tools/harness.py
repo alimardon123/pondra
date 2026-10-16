@@ -33,6 +33,7 @@
   harness.py variables           DECLARE $day / $day = … from every door, a file's parameters (DECLARE PARAMETER, a .py file's cell), runs and procedures of their own
   harness.py use                 USE and SET search_path: schemas and databases, views and tasks, Postgres, Python, the shell, three nodes
   harness.py answers_big         answers in pieces: the same bytes as whole; 3M rows over 0.25 GB (53200 past it); turns (53300)
+  harness.py lateral             LATERAL over a function's rows in one pass (Postgres 16 and DuckDB's answers; three nodes; refusals)
   harness.py friendly            SQL as DuckDB's users write it (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, …) == DuckDB's answers, spread too
   harness.py unique_doors        UNIQUE through every loading door (appends, Flight, COPY): 23505 whole, retries duplicates, order, three nodes
   harness.py pkey                PRIMARY KEY: a plain INSERT of a key the table holds is refused (23505) at every SQL door; upserts and loaders still upsert
@@ -15188,6 +15189,164 @@ def sparksql():
 
 
 
+def lateral():
+    """LATERAL over a function's rows, in one pass (L3, `lateral.rs`, `Lateral` and `functions`): Postgres's
+    `FROM t, unnest(t.xs) AS u(x)`, `FROM t, generate_series(1, t.n) AS g`, `CROSS JOIN LATERAL`, `LEFT JOIN
+    LATERAL … ON true` (padded with NULL when the list is NULL or empty), two laterals chained, a lateral in a
+    subquery, a WHERE, GROUP BY and ORDER BY over the lateral's columns, `SELECT *`, a column of the left side
+    named like the function's, `JOIN LATERAL … ON`, `random()` read once, and a lateral the rule leaves to
+    DataFusion (an aggregate) answering as before. Each answer equals Postgres 16's (PONDRA_PG16 names it,
+    default the local one under /tmp/pg16-l3; ORDER BY exactly), DuckDB's where DuckDB takes the query, and
+    the same answer on three nodes with `?spread=1`; the Postgres port answers the same rows; and what is
+    refused is refused by name with SQLSTATE 0A000.
+
+    Numbers (one node, 1,000,000 rows of t(id, xs (three elements), n 1..5), median of three runs past the
+    result cache, varied by a literal; see the report that goes with this section):
+      one-pass implicit unnest  vs  unnested in a subquery   (within 10%)
+      one-pass generate_series  vs  the same, as a subquery  (within 10%)
+    """
+    import csv, duckdb, psycopg
+    pg_dsn = os.environ.get("PONDRA_PG16", "host=/tmp/pg16-l3 port=55432 user=postgres dbname=postgres")
+    pondra_setup = ["CREATE TABLE t (id BIGINT, xs BIGINT[], n BIGINT)", "INSERT INTO t VALUES (1, [1, 2, 3], 2), (2, NULL, 1), (3, [], 3)",
+                    "INSERT INTO t SELECT value + 3, make_array(value % 5, value % 3, 1), value % 5 + 1 FROM generate_series(1, 20000)",
+                    "CREATE TABLE r (id BIGINT, a BIGINT, b BIGINT)", "INSERT INTO r VALUES (1, 1, 5), (2, 3, 4), (3, NULL, 2), (4, 2, 2)",
+                    "CREATE TABLE tx (id BIGINT, x BIGINT, xs BIGINT[])", "INSERT INTO tx VALUES (1, 100, [7, 8]), (2, 200, NULL), (3, 300, [])"]
+    pg_setup = ["CREATE TABLE t (id BIGINT, xs BIGINT[], n BIGINT)", "INSERT INTO t VALUES (1, ARRAY[1, 2, 3], 2), (2, NULL, 1), (3, '{}', 3)",
+                "INSERT INTO t SELECT value + 3, ARRAY[value % 5, value % 3, 1]::BIGINT[], value % 5 + 1 FROM generate_series(1, 20000) AS value",
+                "CREATE TABLE r (id BIGINT, a BIGINT, b BIGINT)", "INSERT INTO r VALUES (1, 1, 5), (2, 3, 4), (3, NULL, 2), (4, 2, 2)",
+                "CREATE TABLE tx (id BIGINT, x BIGINT, xs BIGINT[])", "INSERT INTO tx VALUES (1, 100, ARRAY[7, 8]), (2, 200, NULL), (3, 300, '{}')"]
+    duck_setup = ["CREATE TABLE t (id BIGINT, xs BIGINT[], n BIGINT)", "INSERT INTO t VALUES (1, [1, 2, 3], 2), (2, NULL, 1), (3, [], 3)",
+                  "INSERT INTO t SELECT i + 3, [i % 5, i % 3, 1], i % 5 + 1 FROM range(1, 20001) AS g(i)",
+                  "CREATE TABLE r (id BIGINT, a BIGINT, b BIGINT)", "INSERT INTO r VALUES (1, 1, 5), (2, 3, 4), (3, NULL, 2), (4, 2, 2)",
+                  "CREATE TABLE tx (id BIGINT, x BIGINT, xs BIGINT[])", "INSERT INTO tx VALUES (1, 100, [7, 8]), (2, 200, NULL), (3, 300, [])"]
+    # (name, Pondra's text, Postgres's text or None when the same, ordered: the ORDER BY is compared as written)
+    cases = [
+        ("implicit unnest", "SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x)", None, False),
+        ("generate_series of a column", "SELECT t.id, g FROM t, generate_series(1, t.n) AS g", None, False),
+        ("CROSS JOIN LATERAL unnest", "SELECT t.id, u.x FROM t CROSS JOIN LATERAL unnest(t.xs) AS u(x)", None, False),
+        ("LEFT JOIN LATERAL … ON true", "SELECT t.id, u.x FROM t LEFT JOIN LATERAL unnest(t.xs) AS u(x) ON true", None, False),
+        ("two laterals chained", "SELECT t.id, u.x, v.y FROM t, LATERAL (SELECT unnest(t.xs) AS x) u, LATERAL (SELECT unnest(generate_series(1, u.x)) AS y) v",
+         "SELECT t.id, u.x, v.y FROM t, LATERAL (SELECT unnest(t.xs) AS x) u CROSS JOIN LATERAL generate_series(1, u.x) AS v(y)", False),
+        ("a lateral inside a subquery", "SELECT s.id, s.x FROM (SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x)) s WHERE s.x > 1", None, False),
+        ("WHERE on the lateral's column", "SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x) WHERE u.x > 1", None, False),
+        ("GROUP BY the lateral's column", "SELECT u.x, count(*) AS n FROM t, unnest(t.xs) AS u(x) GROUP BY u.x", None, False),
+        ("ORDER BY both sides", "SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x) ORDER BY t.id DESC, u.x LIMIT 50", None, True),
+        ("SELECT * (r's columns, then g)", "SELECT * FROM r, generate_series(r.a, r.b) AS g", None, False),
+        ("a column of t named like the function's", "SELECT t.x, u.x AS y FROM tx t, unnest(t.xs) AS u(x)", None, False),
+        ("generate_series with a step", "SELECT r.id, g FROM r, generate_series(r.a, r.b, 2) AS g", None, False),
+        ("JOIN LATERAL … ON a condition", "SELECT t.id, u.x FROM t JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1", None, False),
+        ("a lateral aggregate (DataFusion's)", "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s",
+         "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s", False),
+    ]
+    # (DuckDB returns a set function's alias as a struct column: its values are the column named after the function)
+    duck_text = {
+        "generate_series of a column": "SELECT t.id, g.generate_series FROM t, generate_series(1, t.n) AS g",
+        "generate_series with a step": "SELECT r.id, g.generate_series FROM r, generate_series(r.a, r.b, 2) AS g",
+        "SELECT * (r's columns, then g)": "SELECT r.*, g.generate_series FROM r, generate_series(r.a, r.b) AS g",
+    }
+    refused = {  # (Pondra's text, SQLSTATE, words the error must have)
+        "LEFT JOIN LATERAL with a condition": ("SELECT t.id, u.x FROM t LEFT JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1", "0A000", ["LEFT JOIN LATERAL", "not supported"]),
+        "RIGHT JOIN LATERAL": ("SELECT t.id, u.x FROM t RIGHT JOIN LATERAL unnest(t.xs) AS u(x) ON true", "0A000", ["not supported"]),
+        "WITH ORDINALITY over a column": ("SELECT t.id, g FROM t, generate_series(1, t.n) WITH ORDINALITY AS g(v, o)", "0A000", ["WITH ORDINALITY is not supported yet"]),
+    }
+    random_text = "SELECT count(DISTINCT s.r) AS d, count(*) AS n FROM (SELECT random() AS r, [1, 2, 3] AS xs) s, unnest(s.xs) AS u(x)"
+    random_pg = "SELECT count(DISTINCT s.r) AS d, count(*) AS n FROM (SELECT random() AS r, ARRAY[1, 2, 3] AS xs) s, unnest(s.xs) AS u(x)"
+    checks, info = {}, {}
+    schema = f"lateral_{uuid.uuid4().hex[:8]}"
+    pg = psycopg.connect(pg_dsn, autocommit=True)
+    pg.execute(f"CREATE SCHEMA {schema}")
+    pg.execute(f"SET search_path TO {schema}")
+    for s_ in pg_setup:
+        pg.execute(s_)
+    duck = duckdb.connect()
+    for s_ in duck_setup:
+        duck.execute(s_)
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1, pg=f"127.0.0.1:{A.port + 10}").start()
+    for s_ in pondra_setup:
+        sql(A.port, s_)
+    call(A.port, "POST", "/tier", timeout=600)  # (tiered: a spread query slices the files)
+    time.sleep(1)
+    def norm(rows):  # (every value as text, a NULL as "", so the three sides compare alike)
+        return [tuple("" if v is None else str(v) for v in r) for r in rows]
+    def rows_of_pondra(text, port=A.port, spread=False):
+        # (CSV, not JSON: the node's JSON leaves a NULL's field out, so a padded row would lose its column)
+        path = "/sql?format=csv" + ("&spread=1" if spread else "")
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=300)
+        c.request("POST", path, text.encode())
+        r = c.getresponse()
+        body = r.read().decode()
+        assert r.status == 200, body[:300]
+        return [tuple(row) for row in list(csv.reader(io.StringIO(body)))[1:]]
+    def rows_of_pg(text):
+        with pg.cursor() as cur:
+            cur.execute(f"SET search_path TO {schema}")
+            cur.execute(text)
+            return norm([tuple(r) for r in cur.fetchall()])
+    def rows_of_duck(text):
+        return norm([tuple(r) for r in duck.execute(text).fetchall()])
+    def key(rows):
+        return sorted(rows, key=repr)
+    got, want_pg, want_duck, duck_refused = {}, {}, {}, {}
+    for name, text, pg_text, ordered in cases:
+        pg_text = pg_text or text
+        got[name] = rows_of_pondra(text)
+        want_pg[name] = rows_of_pg(pg_text)
+        try:
+            want_duck[name] = rows_of_duck(duck_text.get(name, text))
+        except Exception as e:
+            duck_refused[name] = str(e).splitlines()[0][:120]
+        same = (got[name] == want_pg[name]) if ordered else (key(got[name]) == key(want_pg[name]))
+        checks[f"{name}: one node == Postgres 16's answer ({len(got[name])} rows)"] = same
+        if name in want_duck:
+            checks[f"{name}: == DuckDB's answer"] = key(got[name]) == key(want_duck[name])
+    info["duckdb refused"] = duck_refused
+    got["random"] = rows_of_pondra(random_text)
+    checks["random() in the left side is read once: one r on each of the three rows (Pondra and Postgres)"] = got["random"] == [("1", "3")] and rows_of_pg(random_pg) == [("1", "3")]
+    for name, (text, code, words) in refused.items():
+        status, state, body = _sqlstate_of(A.port, text)
+        info[f"refused: {name}"] = [status, state, body[:200]]
+        checks[f"refused by name, SQLSTATE 0A000: {name}"] = status >= 400 and state == code and all(w in body for w in words)
+    # Postgres's port answers the same rows (one is enough).
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pgp:
+        via_port = norm([tuple(r) for r in pgp.execute(cases[4][1]).fetchall()])
+    checks["the Postgres port answers the same rows as HTTP ('two laterals chained')"] = key(via_port) == key(got["two laterals chained"])
+    node.kill()
+    # Three nodes: the same rows, spread (?spread=1), each node asked.
+    spread_before = None
+    nodes = [Node(lake, A.port + i, tier_secs=1).start() for i in range(3)]
+    time.sleep(2)
+    spread_checks = {}
+    for name, text, _, ordered in cases:
+        if name.startswith("a lateral aggregate"):
+            continue  # (DataFusion's own plan: not a one-pass rewrite)
+        for i in range(3):
+            spread_before = metrics_of(A.port + i).get("pondra_spread_queries_total", 0)
+            spread_rows = rows_of_pondra(text, port=A.port + i, spread=True)
+            spread_now = metrics_of(A.port + i).get("pondra_spread_queries_total", 0)
+            ok = (spread_rows == got[name]) if ordered else (key(spread_rows) == key(got[name]))
+            spread_checks[f"{name} on node {i}"] = (ok, spread_now > spread_before)
+    info["spread"] = {k: v for k, v in spread_checks.items()}
+    checks["three nodes, ?spread=1: each lateral query == one node's answer"] = all(ok for ok, _ in spread_checks.values())
+    checks["three nodes: the lateral queries spread (the query's spread counter rises)"] = all(s for _, s in spread_checks.values())
+    for n in nodes:
+        n.kill()
+    pg.execute(f"DROP SCHEMA {schema} CASCADE")
+    pg.close()
+    ok = all(checks.values())
+    print(json.dumps({"lateral": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
+def _sqlstate_of(port, text):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+    c.request("POST", "/sql", text.encode())
+    r = c.getresponse()
+    body = r.read().decode(errors="replace")
+    return r.status, r.getheader("x-pondra-sqlstate"), body
+
+
 def scripts():
     """Scripts that decide (ADR-045, phases 1 and 2): blocks with handlers, IF / ELSEIF / CASE, WHILE,
     REPEAT, LOOP and FOR over a query's rows (`$r.col`), LEAVE and ITERATE by label, RETURN, RAISE
@@ -16959,6 +17118,8 @@ def doors():
     q("CREATE MACRO d_twice(x) AS x * 2")
     q("CREATE TABLE d_json (id BIGINT, doc JSON)")  # (the JSON operators read a column: Flight refuses a constant SELECT with a non-null answer, a pre-existing bug)
     q("INSERT INTO d_json VALUES (1, '{\"a\": {\"b\": [\"x\", \"y\"]}, \"k\": 1}')")
+    q("CREATE TABLE d_lat (id BIGINT, xs BIGINT[])")  # (LATERAL: a function of a column, at every door)
+    q("INSERT INTO d_lat VALUES (1, [1, 2]), (2, NULL)")
     record = {"repository": "https://github.com/acme/sales", "branch": "main", "commit": "0" * 40, "files": {}}  # (a Git folder: its record, and a file not committed)
     for path, body in (("d_git/.pondra-git.json", json.dumps(record)), ("d_git/a.sql", "SELECT 1;\n")):
         c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
@@ -16989,6 +17150,9 @@ def doors():
                             lambda r: r[3] == [[93]] and q(f"SELECT count(DISTINCT _version) AS v, sum(qty) AS s FROM d_items WHERE id IN ({k + 5}, {k + 6})") == [{"v": 1, "s": 200}]),
             "USE a schema": (["USE d_crm", "SELECT count(*) AS n FROM d_only"], lambda r: r[-1] == [[3]]),
             "a macro": (["SELECT d_twice(21) AS n"], lambda r: r[-1] == [[42]]),
+            "LATERAL over a function's rows": (["SELECT t.id, u.x FROM d_lat t, unnest(t.xs) AS u(x) ORDER BY 1, 2",
+                                                "SELECT t.id, g FROM d_lat t, generate_series(1, t.id + 1) AS g ORDER BY 1, 2"],
+                                               lambda r: r[0] == [[1, 1], [1, 2]] and r[-1] == [[1, 1], [1, 2], [2, 1], [2, 2], [2, 3]]),
             # (Postgres's JSON operators on a column: text and CASE answers, so every door shows them alike)
             "JSON path and containment": (["SELECT doc -> 'k' AS k FROM d_json WHERE doc ->> 'k' = '1' AND id = 1",
                                            "SELECT doc #>> '{a,b,1}' AS v, CASE WHEN doc @> '{\"k\": 1}' THEN 'yes' ELSE 'no' END AS c FROM d_json WHERE id = 1"],
@@ -18390,7 +18554,7 @@ SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20,
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, jsons, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, jsons, colnames, bi, remembered, sparksql, lateral, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -18422,7 +18586,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "jsons", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "jsons", "colnames", "bi", "remembered", "sparksql", "lateral", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -18435,7 +18599,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "jsons": jsons, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "jsons": jsons, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "lateral": lateral, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
