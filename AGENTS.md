@@ -2816,8 +2816,12 @@ failover on its own binary, and dry-runs the release's npm publish (`tools/npm_p
 run, refuses one that failed or a tag that isn't Cargo.toml's version, and publishes the run's
 packages (a minute or two). `cluster-bench.yml`'s default binary (`ci`) is that run's too.
 A pull request's push runs CI only when the pull request is labelled: `ci` builds linux-x64 with
-the suite, `full-ci` all five platforms with deploy.yml; add `full-ci` once before merging, and
-never turn on auto-merge before that run starts. Main builds all five on every push.
+the suite and the tests after it, and a pull request merges once that passes (the owner,
+2026-10-16); `full-ci` adds the other platforms but macOS Intel, for a change that wants them
+first. Main builds every platform but macOS Intel on every push (macOS Intel on a version commit,
+which a release tags, or by hand), with deploy.yml when what it tries changes; a platform that
+fails there is commented on the pull request it came from, and that lane fixes it at once. Never
+turn on auto-merge before its run starts.
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
 
