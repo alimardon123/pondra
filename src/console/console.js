@@ -13,7 +13,7 @@
 //
 // No framework and nothing from anywhere else: the page, its modules and its fonts come from the node.
 import { h, $, fill, said, esc, store, count, bytes,  ICONS, icon, svg, typeMark, sqlType, on, emit, R, byOrder, shell, register, T, configure,
-  MODE, SESSION, sessionOf, S, base, call, run, rows, doBlock, ident, qualified, home, toast, menu, VERSION, ask } from './core.js';
+  MODE, SESSION, sessionOf, S, base, call, run, rows, doBlock, ident, qualified, home, toast, menu, VERSION, ask, SSO_WHY } from './core.js';
 import { grid, copyText } from './grid.js';
 import { Notebook, openNotebook, openPlain, cleanName, doneText } from './notebook.js';
 import { workspace, drawWorkspace, treeItem, upload, newFolder, newAny, registerFiles, lastStatement } from './files.js';
@@ -785,6 +785,7 @@ async function start() {
   edges(); viewDrops();
   sides();
   drawSignin(); drawActions(); drawRail(); drawPanes(); status();
+  if (SSO_WHY) askToken(SSO_WHY); // (a sign-in through a provider that failed: the dialog says why)
   // (extensions, loaded after these modules, register meanwhile: drawn with the core's from here on)
   const data = R.views.find(v => v.id === 'data');
   if (MODE === 'lakes') { data.drawn = true; await renderView(data); await stats(); drawLeft(); } // (the tree picks the database that stats asks of)

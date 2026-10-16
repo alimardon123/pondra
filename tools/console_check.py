@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The console (ADR-030, ADR-032, ADR-034), in headless Chromium through Playwright.
 
-  console_check.py [--port 8890] [--show DIR] [--only node,files,grid,layout,budget,tokens,server,extensions]
+  console_check.py [--port 8890] [--show DIR] [--only node,files,grid,layout,budget,tokens,server,extensions,sso]
 
 - node: a new notebook has no dot until something is typed (its tab, the Workspace); the Data tree lists the lake's schemas, tables and views (each kind its icon) and columns
   (each type its coloured mark, a key's marked), with no bare numbers; a table picked shows its
@@ -40,6 +40,9 @@
 - server: `pondra serve <folder of lakes>`'s console lists its databases, and a cell runs in the one picked.
 - extensions: a node given PONDRA_CONSOLE_EXTENSIONS (examples/console-extension.js) serves it, and
   its section, panel tab, view of an answer and menu action show beside the console's own.
+- sso: a node with an identity provider offers it in the sign-in dialog; the page goes through the provider
+  (tools/fake_idp.py) and comes back signed in as its user, its session out of the address, and a sign-in
+  the provider refuses comes back to the dialog saying why.
 - every request the page made went to the node (or server) that served it; no page errors.
 
 --show DIR keeps screenshots, light and dark.
@@ -1854,11 +1857,65 @@ def ext_checks(browser, port):
         shutil.rmtree(lake, ignore_errors=True)
 
 
+def sso_checks(browser, port):
+    """Single sign-on (ADR-074 §5): a node with an identity provider offers it in the sign-in dialog; the page goes
+    through the provider (tools/fake_idp.py, which signs its test user in at once) and comes back signed in, its
+    session out of the address; a sign-in the provider refuses comes back to the dialog saying why."""
+    import fake_idp
+    srv = fake_idp.start(0)
+    token = "console-check-admin-token"
+    lake = tempfile.mkdtemp(prefix="pondra-")
+    node = Node(lake, port, admin_token=token).start()
+    try:
+        adm = lambda q: harness.call(port, "POST", "/sql", q.encode(), headers={"authorization": f"Bearer {token}"})
+        for q in ["CREATE TABLE sso_things AS SELECT 1 AS id", "CREATE TABLE other_things AS SELECT 2 AS id", 'CREATE USER "ana@acme.com"',
+                  'GRANT SELECT ON sso_things TO "ana@acme.com"', f"CREATE IDENTITY PROVIDER acme (ISSUER '{srv.issuer}', CLIENT_ID 'pondra', LABEL 'Acme')"]:
+            adm(q)
+        row = lambda pg, name: pg.p.locator("#data .row:not([data-kind=database])", has_text=name).count()
+        pg = Page(browser, f"http://127.0.0.1:{port}/")
+        asked = until(lambda: pg.p.locator("#tokenDlg").get_attribute("open") is not None, True)
+        button = pg.p.locator("#ssoIn button", has_text="Sign in with Acme")
+        offered = until(lambda: button.count(), 1)
+        axe = axe_js()
+        found = audit(pg.p, axe) if axe else []
+        button.click()
+        back = until(lambda: (row(pg, "sso_things"), row(pg, "other_things"), pg.p.locator("#signin").inner_text(), pg.p.evaluate("location.hash"),
+                              pg.p.locator("#tokenDlg").get_attribute("open")), (1, 0, "ana@acme.com", "", None), 30)
+        session = pg.p.evaluate("localStorage.getItem('pondra.token')") or ""
+        pg.p.reload()
+        again = until(lambda: (row(pg, "sso_things"), pg.p.locator("#signin").inner_text()), (1, "ana@acme.com"))
+        went = sorted({u.split("/", 3)[2] for u in pg.left()})
+        errors = list(pg.errors)
+        pg.ctx.close()
+        # The provider refuses the next sign-in: the dialog opens again, saying why
+        harness.call(srv.server_address[1], "POST", "/_test/next", json.dumps({"error": "access_denied"}).encode())
+        no = Page(browser, f"http://127.0.0.1:{port}/")
+        until(lambda: no.p.locator("#ssoIn button", has_text="Sign in with Acme").count(), 1)
+        no.p.locator("#ssoIn button", has_text="Sign in with Acme").click()
+        why = until(lambda: "access_denied" in no.p.locator("#tokenWhy").inner_text() and no.p.locator("#tokenDlg").get_attribute("open") is not None
+                    and no.p.evaluate("location.hash") == "" and row(no, "sso_things") == 0, True, 30)
+        said = no.p.locator("#tokenWhy").inner_text()
+        errors += no.errors
+        no.ctx.close()
+        issuer = srv.issuer.split("/", 3)[2]
+        checks = {"with an identity provider, the sign-in dialog offers it (Sign in with Acme); axe finds nothing there": asked is True and offered == 1 and found == [],
+                  "the page goes through the provider and comes back signed in as its user, seeing only what it may read, the session out of the address (and after a reload)":
+                  back == (1, 0, "ana@acme.com", "", None) and session.startswith("ps_") and again == (1, "ana@acme.com"),
+                  "a sign-in the provider refuses comes back to the dialog, saying why": why is True,
+                  "signing in through a provider: requests went only to the node and the provider; no page errors": went in ([], [issuer]) and errors == []}
+        info = {"asked": asked, "offered": offered, "axe": found, "back": back, "session": session[:3], "again": again, "went": went, "said": said, "errors": errors}
+        return checks, info
+    finally:
+        node.kill()
+        fake_idp.stop(srv)
+        shutil.rmtree(lake, ignore_errors=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8890)
     ap.add_argument("--show", help="keep screenshots here")
-    ap.add_argument("--only", help="run only these parts (node, files, grid, work, layout, budget, tokens, server, extensions), separated by commas")
+    ap.add_argument("--only", help="run only these parts (node, files, grid, work, layout, budget, tokens, server, extensions, sso), separated by commas")
     A = harness.A = ap.parse_args()
     A.s3, A.keep = False, False
     if A.show:
@@ -1873,7 +1930,8 @@ def main():
             browser = pw.chromium.launch()
             parts = [("node", lambda: node_checks(browser, A.port, A.show)), ("files", lambda: files_checks(browser, A.port, A.show)), ("grid", lambda: grid_checks(browser, A.port, A.show)), ("work", lambda: work_checks(browser, A.port, A.show)),
                      ("layout", lambda: layout_checks(browser, A.port, A.show)), ("budget", lambda: budget_checks(browser, A.port, A.show)),
-                     ("tokens", lambda: token_checks(browser, A.port + 1)), ("server", lambda: server_checks(browser, A.port + 2)), ("extensions", lambda: ext_checks(browser, A.port + 3))]
+                     ("tokens", lambda: token_checks(browser, A.port + 1)), ("server", lambda: server_checks(browser, A.port + 2)), ("extensions", lambda: ext_checks(browser, A.port + 3)),
+                     ("sso", lambda: sso_checks(browser, A.port + 4))]
             for part, f in parts:
                 if A.only and part not in A.only.split(","):
                     continue

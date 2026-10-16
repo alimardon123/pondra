@@ -27,6 +27,7 @@
   harness.py first               a node on the network with no token makes the lake's first user and prints its token once; pondra token
   harness.py sealed              the lake's keys and secrets sealed by an admin token alone: nodes, rotation, short tokens
   harness.py sso                 identity providers: CREATE IDENTITY PROVIDER, JWTs at every door, refusals, USERS 'any', keys fetched and dropped
+  harness.py sso_flow            single sign-on's browser way in: the flow to a provider and back, refusals, pondra login, the clients with no token
   harness.py safety              panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
   harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
   harness.py stopped             a run whose node was killed under it: stopped, not running for good
@@ -9662,6 +9663,372 @@ def sso():
     return ok
 
 
+def sso_flow():
+    """Single sign-on's browser way in (ADR-074 §5–6, invariant 411, src/sso_flow.rs): the node finishes the flow
+    itself, so a browser, `pondra login` and the clients sign in through a provider with no provider token in a
+    page. The flow starts at /sso/{provider}/start (a 302 to the provider, the flow in a cookie the lake's key
+    signs); the provider sends the browser back to /sso/callback with a code; the node exchanges the code, checks
+    the ID token (its state, its nonce, its signature) and answers a session in the address's fragment, or the
+    reason it failed. The provider is tools/fake_idp.py (its /_test/next says what the next flow does). The browser
+    is urllib with redirects not followed, carrying the flow's cookie by hand."""
+    import base64, hashlib, pathlib, stat, urllib.error, urllib.parse, urllib.request
+    import adbc_driver_flightsql.dbapi as adbc
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import fake_idp
+    repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    P, PG, FLIGHT, SRV, SRV_PG = A.port, A.port + 13, A.port + 33, A.port + 12, A.port + 14  # (ports no other section takes)
+    token = "sso-flow-admin-1"
+    bearer = lambda t: {"Authorization": f"Bearer {t}"}
+    ana, cy, bo = "ana@acme.com", "cy@acme.com", "bo@acme.com"
+    checks, info, started, procs = {}, {}, [], []
+    srv = fake_idp.start(0)
+    issuer = srv.issuer
+    secured = None  # (a second stand-in, with a client secret: check 8)
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None  # a redirect comes back as an answer, its Location read and never followed
+
+    browser = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)  # this machine only
+
+    def get(url, cookie=None, method="GET", body=None):
+        """(status, headers, text) of a request the browser makes; a redirect comes back as it is."""
+        headers = {"Cookie": cookie} if cookie else {}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        try:
+            with browser.open(urllib.request.Request(url, data=body, method=method, headers=headers), timeout=30) as r:
+                return r.status, r.headers, r.read().decode(errors="replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read().decode(errors="replace")
+
+    def idp(path, body):
+        """One of the stand-in's test routes (POST /_test/…): its status."""
+        return get(issuer + path, method="POST", body=json.dumps(body).encode())[0]
+
+    def as_user(email, groups=None):
+        """Who the stand-in signs in next (its /_test/user)."""
+        return idp("/_test/user", {"sub": email, "email": email, "email_verified": True, **({"groups": groups} if groups else {})})
+
+    def cookie_of(headers):
+        """The flow's cookie as the browser sends it back: name=value ('' when none is set)."""
+        set_cookie = headers.get("Set-Cookie") or ""
+        return set_cookie.split(";")[0] if set_cookie.startswith("pondra_sso=") else ""
+
+    def where(headers):
+        """A redirect's Location ('' when there is none)."""
+        return headers.get("Location") or ""
+
+    def fragment(location):
+        """What the page gets in the address's fragment: pondra_session, pondra_user, pondra_error."""
+        return {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlsplit(location).fragment).items()}
+
+    def start(port, provider, to="/", challenge=None, prefix=""):
+        """GET {prefix}/sso/{provider}/start: (status, headers, text)."""
+        q = {"to": to, **({"challenge": challenge} if challenge else {})}
+        return get(f"http://127.0.0.1:{port}{prefix}/sso/{provider}/start?{urllib.parse.urlencode(q)}")
+
+    def sign_in(provider, to="/", challenge=None, port=P, prefix=""):
+        """The browser's whole way through a provider: start (the flow's cookie kept), the provider (which signs its
+        test user in at once and redirects back), then the node's callback with the cookie. (the start's answer,
+        the callback's answer)."""
+        st, h, _ = start(port, provider, to=to, challenge=challenge, prefix=prefix)
+        cookie = cookie_of(h)
+        _, back, _ = get(where(h))
+        return (st, h, cookie), get(where(back), cookie=cookie)
+
+    def read_as(bearer_token, port=P, prefix="", sql="SELECT x FROM t"):
+        """(status, the rows, or the refusal's text) of a query with a Bearer token, over HTTP."""
+        st, _, text = reply(port, "POST", f"{prefix}/sql", sql.encode(), headers=bearer(bearer_token))
+        return st, (json.loads(text) if st == 200 else text)
+
+    def who_as(bearer_token, port=P, prefix=""):
+        """(status, the user /whoami names, or the refusal's text)."""
+        st, _, text = reply(port, "GET", f"{prefix}/whoami", headers=bearer(bearer_token))
+        return st, (json.loads(text)["user"] if st == 200 else text)
+
+    def token_for(email, claims=None):
+        """A token of the stand-in's naming `email`, for pondra's audience."""
+        return srv.idp.mint({"ttl": 3600, "claims": {"aud": "pondra", "email": email, "email_verified": True, **(claims or {})}})
+
+    def flight_as(user, password, sql="SELECT x FROM t"):
+        """The rows over Flight SQL (ADBC's Basic handshake), or the error's text."""
+        try:
+            conn = adbc.connect(f"grpc://127.0.0.1:{FLIGHT}", db_kwargs={"username": user, "password": password})
+            try:
+                cur = conn.cursor()
+                cur.execute(sql)
+                rows = cur.fetchall()
+                cur.close()
+                return rows
+            finally:
+                conn.close()
+        except Exception as e:
+            return str(e).strip()
+
+    def pkce():
+        """(a PKCE verifier, its S256 challenge), as RFC 7636 makes them."""
+        verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+        return verifier, base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+    def login_env(home):
+        """The environment of a `pondra login`: its own PONDRA_HOME, and a browser that follows the redirects."""
+        env = {**os.environ, "PONDRA_HOME": home, "PONDRA_BROWSER": browser_at(home)}
+        env.pop("PONDRA_TOKEN", None)
+        return env
+
+    def browser_at(folder):
+        """A PONDRA_BROWSER program: it is given the URL, follows its redirects as a browser does (cookies kept) to the
+        command line's loopback address, and asks for that, so the command line gets its code."""
+        at = os.path.join(folder, "browser.py")
+        with open(at, "w") as f:
+            f.write(BROWSER.replace("PYTHON", sys.executable))
+        os.chmod(at, 0o755)
+        return at
+
+    lake = new_lake()
+    try:
+        node = Node(lake, P, admin_token=token, pg=f"127.0.0.1:{PG}", flight=f"127.0.0.1:{FLIGHT}").start()
+        started.append(node)
+        setup = [reply(P, "POST", "/sql", q.encode(), headers=bearer(token))[0] for q in (
+            "CREATE TABLE t (x INT)", "INSERT INTO t VALUES (1)", "CREATE ROLE analysts", "GRANT SELECT ON t TO analysts",
+            f'CREATE USER "{ana}"', f'GRANT SELECT ON t TO "{ana}"',
+            f"CREATE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), ROLES_CLAIM 'groups')")]
+        info["setup (statuses)"] = setup
+        checks["setup: t holds a row, ana@acme.com is made and granted SELECT on t, and identity provider acme is made (every statement 200)"] = setup == [200] * 7
+
+        # 1. The start: the provider's authorize with the flow's parameters, and the cookie that carries the flow.
+        st, h, _ = start(P, "acme", to="/")
+        at = urllib.parse.urlsplit(where(h))
+        q = {k: v[0] for k, v in urllib.parse.parse_qs(at.query).items()}
+        cookie_attrs = h.get("Set-Cookie") or ""
+        info["start"] = {"status": st, "location": where(h)[:300], "Set-Cookie": cookie_attrs}
+        checks["start: a 302 to the provider's authorize with response_type=code, client_id pondra, redirect_uri the node's /sso/callback, scope with openid, a state, a nonce and S256 PKCE; a cookie pondra_sso, HttpOnly, SameSite=Lax, Path=/sso/, Max-Age=600, not Secure over http"] = (
+            st == 302 and f"{at.scheme}://{at.netloc}{at.path}" == issuer + "/authorize" and q.get("response_type") == "code" and q.get("client_id") == "pondra"
+            and q.get("redirect_uri") == f"http://127.0.0.1:{P}/sso/callback" and "openid" in q.get("scope", "").split() and bool(q.get("state")) and bool(q.get("nonce"))
+            and q.get("code_challenge_method") == "S256" and len(q.get("code_challenge", "")) == 43
+            and cookie_attrs.startswith("pondra_sso=") and "Path=/sso/" in cookie_attrs and "Max-Age=600" in cookie_attrs and "HttpOnly" in cookie_attrs
+            and "SameSite=Lax" in cookie_attrs and "Secure" not in cookie_attrs)
+
+        # 1b. A redirect URI no request can steer: x-pondra-origin without the server's key, or X-Forwarded-Host from an
+        # address that isn't a trusted proxy, leaves it the node's own.
+        forged = {}
+        for name, hdr in (("x-pondra-origin", {"x-pondra-origin": "not-the-key https://evil.example"}),
+                          ("X-Forwarded-Host", {"X-Forwarded-Host": "evil.example", "X-Forwarded-Proto": "https"})):
+            try:
+                with browser.open(urllib.request.Request(f"http://127.0.0.1:{P}/sso/acme/start?to=%2F", headers=hdr), timeout=30) as r:
+                    loc = r.headers.get("Location") or ""
+            except urllib.error.HTTPError as e:
+                loc = e.headers.get("Location") or ""
+            forged[name] = urllib.parse.parse_qs(urllib.parse.urlsplit(loc).query).get("redirect_uri", [""])[0]
+        info["forged origins: redirect_uri"] = forged
+        checks["a redirect URI no request can steer: x-pondra-origin without the server's key, or X-Forwarded-Host from no trusted proxy, leaves it the node's own"] = \
+            all(v == f"http://127.0.0.1:{P}/sso/callback" for v in forged.values())
+
+        # 5. Refused at the start: nothing set, and a 400 saying why.
+        refused = {
+            "to=//evil.com/": start(P, "acme", to="//evil.com/"),
+            "to=https://evil.com/": start(P, "acme", to="https://evil.com/"),
+            "to=http://127.0.0.1/ (no port)": start(P, "acme", to="http://127.0.0.1/", challenge=pkce()[1]),
+            "a loopback to without a challenge": start(P, "acme", to="http://127.0.0.1:45678/"),
+        }
+        info["refused at start"] = {w: [st, h.get("Set-Cookie"), t[:140]] for w, (st, h, t) in refused.items()}
+        # (a sign-in that can't start, ending where it may: the page, or the command line, hears why there)
+        told = {"the page": start(P, "nope", to="/"), "the command line": start(P, "nope", to="http://127.0.0.1:45678/back", challenge=pkce()[1])}
+        info["told at start"] = {w: [st, where(h)[:120], h.get("Set-Cookie")] for w, (st, h, _) in told.items()}
+        checks["refused at the start with 400 and no cookie set: to=//evil.com/, to=https://evil.com/, a loopback to with no port, a loopback to with no challenge; an unknown provider sends the page to /#pondra_error=… and the command line to its address's ?error=…, no cookie set"] = (
+            all(st == 400 and h.get("Set-Cookie") is None for st, h, _ in refused.values())
+            and told["the page"][0] == 302 and "no identity provider nope" in fragment(where(told["the page"][1])).get("pondra_error", "")
+            and told["the command line"][0] == 302 and where(told["the command line"][1]).startswith("http://127.0.0.1:45678/back?error=")
+            and all(h.get("Set-Cookie") is None for _, h, _ in told.values()))
+
+        # 2. The whole flow for ana (made here) ends in the page's address, signed in.
+        (_, _, _), (st_cb, h_cb, _) = sign_in("acme")
+        frag = fragment(where(h_cb))
+        session = frag.get("pondra_session", "")
+        info["ana's flow"] = {"callback": st_cb, "location": where(h_cb)[:80], "pondra_user": frag.get("pondra_user"), "Set-Cookie": h_cb.get("Set-Cookie")}
+        checks["the whole flow for ana@acme.com (made here) ends at /#pondra_session=…: the session reads t over HTTP and /whoami names ana, and the cookie is cleared"] = (
+            st_cb == 302 and where(h_cb).startswith("/#pondra_session=ps_") and frag.get("pondra_user") == ana
+            and read_as(session) == (200, [{"x": 1}]) and who_as(session) == (200, ana) and "Max-Age=0" in (h_cb.get("Set-Cookie") or ""))
+
+        # 6. Refused at the callback, from the browser's side: no cookie, a tampered one, another flow's state.
+        no_cookie = get(f"http://127.0.0.1:{P}/sso/callback?code=x&state=y")
+        _, h6, _ = start(P, "acme", to="/")
+        payload, sig = cookie_of(h6).split("=", 1)[1].split(".")
+        spoiled = f"pondra_sso={payload[:10]}{'A' if payload[10] != 'A' else 'B'}{payload[11:]}.{sig}"
+        tampered = get(f"http://127.0.0.1:{P}/sso/callback?code=x&state=y", cookie=spoiled)
+        _, h6b, _ = start(P, "acme", to="/")
+        other_state = get(f"http://127.0.0.1:{P}/sso/callback?code=x&state=not-this-flows", cookie=cookie_of(h6b))
+        info["callback refusals"] = {"no cookie": no_cookie[0], "tampered": tampered[0], "another state": [other_state[0], fragment(where(other_state[1])).get("pondra_error")]}
+        checks["refused at the callback: no cookie (400), a tampered cookie (400), and a state that isn't the cookie's (302 to #pondra_error, naming the state)"] = (
+            no_cookie[0] == 400 and tampered[0] == 400 and other_state[0] == 302 and "state" in fragment(where(other_state[1])).get("pondra_error", ""))
+
+        # 7. Refused from the provider's side: a nonce that isn't the flow's, the provider's own refusal, and a user made nowhere.
+        idp("/_test/next", {"nonce": "x"})
+        (_, _, _), (_, h_nonce, _) = sign_in("acme")
+        idp("/_test/next", {"error": "access_denied"})
+        (_, _, _), (_, h_denied, _) = sign_in("acme")
+        as_user(bo)
+        (_, _, _), (_, h_bo, _) = sign_in("acme")
+        as_user(ana)
+        said = {w: fragment(where(h)).get("pondra_error", "") for w, h in (("nonce", h_nonce), ("refused", h_denied), ("nowhere", h_bo))}
+        info["refused by the provider, or for a user made nowhere"] = said
+        checks["refused at the callback, from the provider's side: a nonce that isn't the flow's (#pondra_error naming nonce), the provider's access_denied (naming it), and a user made nowhere under USERS 'listed' (naming bo@acme.com)"] = (
+            "nonce" in said["nonce"] and "access_denied" in said["refused"] and "no user bo@acme.com here" in said["nowhere"])
+
+        # 3. USERS 'any': a second provider, the same issuer, that anyone it vouches for signs in with the roles its claim names.
+        made_staff = reply(P, "POST", "/sql", f"CREATE IDENTITY PROVIDER staff (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), USERS 'any', ROLES_CLAIM 'groups')".encode(), headers=bearer(token))[0]
+        as_user(cy, ["analysts"])
+        (_, _, _), (_, h_cy, _) = sign_in("staff")
+        cy_session = fragment(where(h_cy)).get("pondra_session", "")
+        checks["USERS 'any': cy@acme.com, with no user made here, signs in through staff with groups [analysts], and its session reads t (analysts are granted SELECT on t) and /whoami names cy"] = (
+            made_staff == 200 and cy_session.startswith("ps_") and read_as(cy_session) == (200, [{"x": 1}]) and who_as(cy_session) == (200, cy))
+
+        # 4. Flight: the same user's provider token in the handshake.
+        flown = flight_as(cy, token_for(cy, {"groups": ["analysts"]}))
+        info["Flight as cy (the rows, or the refusal)"] = flown if isinstance(flown, str) else [list(r) for r in flown]
+        checks["Flight: cy's provider token in the handshake (Basic cy@acme.com:<token>) gives a session that reads t"] = flown == [(1,)]
+
+        # 12. Two providers: `pondra login` without --provider is refused, naming both; with --provider it signs in.
+        home, project = tempfile.mkdtemp(prefix="pondra-home-"), tempfile.mkdtemp(prefix="pondra-project-")
+        url = f"http://127.0.0.1:{P}"
+        two = subprocess.run([BIN, "login", url, "--project", project], env=login_env(home), capture_output=True, text=True, timeout=120)
+        as_user(ana)
+        with_provider = subprocess.run([BIN, "login", url, "--project", project, "--provider", "acme"], env=login_env(home), capture_output=True, text=True, timeout=120)
+        info["pondra login with two providers"] = {"no --provider": [two.returncode, two.stderr.strip()[-240:]], "--provider acme": [with_provider.returncode, (with_provider.stdout + with_provider.stderr).strip()[-240:]]}
+        checks["pondra login with two providers and no --provider is refused, naming both (acme, staff); with --provider acme it signs in as ana"] = (
+            two.returncode != 0 and "acme" in two.stderr and "staff" in two.stderr and with_provider.returncode == 0 and "ana@acme.com" in with_provider.stdout + with_provider.stderr)
+
+        # 3 (continued): dropped, cy's session is refused, as is any token of the provider's.
+        reply(P, "POST", "/sql", b"DROP IDENTITY PROVIDER staff", headers=bearer(token))
+        after_read, after_who = read_as(cy_session), who_as(cy_session)
+        info["cy's session after DROP staff"] = [after_read[0], after_who[0]]
+        checks["after DROP IDENTITY PROVIDER staff, cy's session is 401 (reading t and /whoami alike)"] = after_read[0] == 401 and after_who[0] == 401
+
+        # 8. A client secret: the provider names a secret that holds it; the stand-in asks for it.
+        reply(P, "POST", "/sql", b"CREATE SECRET s (TYPE generic, CLIENT_SECRET 's3cret-flow')", headers=bearer(token))
+        secured = fake_idp.start(0, client_secret="s3cret-flow")
+        made_secured = reply(P, "POST", "/sql", f"CREATE IDENTITY PROVIDER secured (ISSUER '{secured.issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), SECRET 's')".encode(), headers=bearer(token))[0]
+        (_, _, _), (_, h_sec, _) = sign_in("secured")
+        sec_session = fragment(where(h_sec)).get("pondra_session", "")
+        reply(P, "POST", "/sql", b"CREATE OR REPLACE SECRET s (TYPE generic, CLIENT_SECRET 'a-wrong-secret')", headers=bearer(token))
+        (_, _, _), (_, h_wrong, _) = sign_in("secured")
+        wrong_said = fragment(where(h_wrong)).get("pondra_error", "")
+        info["client secret: the wrong one's error"] = wrong_said[:200]
+        checks["a client secret: a provider with SECRET 's' (the stand-in started with that client_secret) signs ana in and its session reads t; with the secret replaced by a wrong one, the flow ends at #pondra_error naming invalid_client"] = (
+            made_secured == 200 and sec_session.startswith("ps_") and read_as(sec_session) == (200, [{"x": 1}]) and "invalid_client" in wrong_said)
+        reply(P, "POST", "/sql", b"DROP IDENTITY PROVIDER secured", headers=bearer(token))
+        fake_idp.stop(secured)
+        secured = None
+
+        # 9. The command line's code: a loopback address and a challenge; only the verifier redeems it.
+        as_user(ana)
+        verifier, challenge = pkce()
+        back = "http://127.0.0.1:45678/"
+        (_, _, _), (_, h_code, _) = sign_in("acme", to=back, challenge=challenge)
+        loc = where(h_code)
+        code = (urllib.parse.parse_qs(urllib.parse.urlsplit(loc).query).get("code") or [""])[0]
+        json_type = {"content-type": "application/json"}
+        bad = reply(P, "POST", "/sso/token", json.dumps({"code": code, "verifier": pkce()[0]}).encode(), headers=json_type)
+        good = reply(P, "POST", "/sso/token", json.dumps({"code": code, "verifier": verifier}).encode(), headers=json_type)
+        cli_session = json.loads(good[2]).get("token", "") if good[0] == 200 else ""
+        info["command line"] = {"location": loc[:80], "another verifier": bad[0], "the right one": good[0]}
+        checks["the command line's code: a loopback to with a challenge ends at http://127.0.0.1:PORT/?code=pc_…; POST /sso/token with another verifier is 401; with the right one it gives a session that reads t"] = (
+            loc.startswith(back + "?code=pc_") and bad[0] == 401 and good[0] == 200 and read_as(cli_session) == (200, [{"x": 1}]))
+
+        # 10. Behind `pondra serve --lakes`: the database's own node, its own provider, the path prefix in the flow.
+        folder = new_lake()
+        subprocess.run([BIN, "sql", "--dir", os.path.join(folder, "idp"), "CREATE TABLE t AS SELECT 1 AS x"], check=True, capture_output=True)
+        lakes_log = open(os.path.join(tempfile.gettempdir(), f"pondra-{SRV}-sso-flow.stderr"), "w")  # (CI keeps it when a check fails)
+        lakes = subprocess.Popen([BIN, "serve", "--lakes", folder, "--addr", f"127.0.0.1:{SRV}", "--pg", f"127.0.0.1:{SRV_PG}"], stdout=subprocess.DEVNULL, stderr=lakes_log)
+        procs.append(lakes)
+        until(lambda: _try(lambda: call(SRV, "GET", "/databases") is not None), True, 60)
+        made_boss = reply(SRV, "POST", "/db/idp/sql", b"CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")[0]
+        boss = {"Authorization": "Basic " + base64.b64encode(b"boss:boss-password-1").decode()}
+        db_made = [reply(SRV, "POST", "/db/idp/sql", q.encode(), headers=boss)[0] for q in (
+            f'CREATE USER "{ana}"', f'GRANT SELECT ON t TO "{ana}"', f"CREATE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'))")]
+        as_user(ana)
+        (st_d, h_d, _), (_, h_db, _) = sign_in("acme", to="/db/idp/", port=SRV, prefix="/db/idp")
+        redirect = (urllib.parse.parse_qs(urllib.parse.urlsplit(where(h_d)).query).get("redirect_uri") or [""])[0]
+        db_session = fragment(where(h_db)).get("pondra_session", "")
+        info["pondra serve --lakes: the flow"] = {"redirect_uri": redirect, "Set-Cookie": h_d.get("Set-Cookie"), "location": where(h_db)[:60]}
+        checks["behind pondra serve --lakes, the flow at /db/idp/sso/acme/start has redirect_uri http://127.0.0.1:S/db/idp/sso/callback and cookie Path=/db/idp/sso/, and its session reads t at /db/idp/ (the provider made in that database)"] = (
+            made_boss == 200 and db_made == [200, 200, 200] and st_d == 302 and redirect == f"http://127.0.0.1:{SRV}/db/idp/sso/callback"
+            and "Path=/db/idp/sso/" in (h_d.get("Set-Cookie") or "") and read_as(db_session, port=SRV, prefix="/db/idp") == (200, [{"x": 1}]))
+        lakes.send_signal(signal.SIGTERM)
+        lakes.wait(timeout=120)
+        procs.remove(lakes)
+
+        # 11. `pondra login` with its one provider (acme): the browser's session kept in $PONDRA_HOME, then read by
+        # `pondra run`, the Python client and the JavaScript client, with no token given.
+        as_user(ana)
+        home = tempfile.mkdtemp(prefix="pondra-home-")
+        login = subprocess.run([BIN, "login", url, "--project", project], env=login_env(home), capture_output=True, text=True, timeout=120)
+        kept_at = os.path.join(home, "login.json")
+        kept = json.load(open(kept_at)) if os.path.exists(kept_at) else {}
+        kept_mode = stat.S_IMODE(os.stat(kept_at).st_mode) if os.path.exists(kept_at) else None
+        q_sql = os.path.join(project, "q.sql")
+        with open(q_sql, "w") as f:
+            f.write("SELECT x FROM t;\n")
+        env = login_env(home)
+        run = subprocess.run([BIN, "run", q_sql, "--url", url], env=env, cwd=project, capture_output=True, text=True, timeout=120)
+        py_code = "import json, sys; sys.path.insert(0, " + repr(os.path.join(repo, "python")) + "); import pondra; " \
+            "db = pondra.connect(" + repr(url) + ", echo=False); print(json.dumps(db.sql('SELECT x FROM t').rows()))"
+        py = subprocess.run([sys.executable, "-c", py_code], env=env, capture_output=True, text=True, timeout=120)
+        node = shutil.which("node")
+        js = None
+        if node:
+            js_code = "import { Pondra } from " + json.dumps(pathlib.Path(repo, "js", "index.js").resolve().as_uri()) + "; const db = new Pondra(" + json.dumps(url) + "); " \
+                "console.log(JSON.stringify(await db.sql('SELECT x FROM t')));"
+            js = subprocess.run([node, "--input-type=module", "-e", js_code], env=env, capture_output=True, text=True, timeout=120)
+        info["pondra login"] = {"returncode": login.returncode, "said": (login.stdout + login.stderr).strip()[-240:], "mode": kept_mode, "keys": list(kept)}
+        info["readers with no token"] = {"pondra run": [run.returncode, run.stdout.strip()[-120:]], "python": [py.returncode, py.stdout.strip()[-120:], py.stderr.strip()[-200:]],
+                                         "javascript": None if js is None else [js.returncode, js.stdout.strip()[-120:], js.stderr.strip()[-200:]]}
+        checks["pondra login http://127.0.0.1:P (one provider, the browser sent back in by its PONDRA_BROWSER) signs in and says so: 'signed in to … (ana@acme.com, …)'"] = \
+            login.returncode == 0 and f"signed in to {url} (ana@acme.com" in login.stdout + login.stderr
+        checks["pondra login keeps a ps_ session for the server in login.json, mode 0600"] = \
+            kept_mode == 0o600 and str(kept.get(url, "")).startswith("ps_")
+        checks["pondra run q.sql --url reads t with no token (the saved session)"] = run.returncode == 0 and "1" in run.stdout
+        checks["pondra.Pondra(the server) with that PONDRA_HOME reads t with no token (Python)"] = py.returncode == 0 and json.loads(py.stdout.strip() or "null") == [{"x": 1}]
+        if js is not None:
+            checks["the JavaScript client (new Pondra(the server)) with that PONDRA_HOME reads t with no token"] = js.returncode == 0 and json.loads(js.stdout.strip() or "null") == [{"x": 1}]
+        else:
+            info["javascript"] = "node isn't on this machine: not run"
+
+        # 12 is above (it needs two providers); `pondra login` with one is the check above.
+    finally:
+        for n in started:
+            n.kill()
+        for p in procs:
+            if p.poll() is None:
+                p.send_signal(signal.SIGTERM)
+                p.wait(timeout=120)
+        if secured is not None:
+            fake_idp.stop(secured)
+        fake_idp.stop(srv)
+    ok = all(checks.values())
+    print(json.dumps({"sso_flow": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+BROWSER = '''#!PYTHON
+import http.cookiejar, urllib.error, urllib.parse, urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect, urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+url = __import__("sys").argv[1]
+for _ in range(10):
+    try:
+        opener.open(url, timeout=30).read()
+        break
+    except urllib.error.HTTPError as e:
+        if e.code not in (301, 302, 303, 307, 308):
+            raise
+        url = urllib.parse.urljoin(url, e.headers["Location"])
+'''
+
+
 def versions():
     """Every file keeps its versions (ADR-035 §8): each save through PUT /files kept with who made
     it and when, listed newest first, read back, restored (itself kept as the newest); a deleted
@@ -17609,7 +17976,7 @@ def pkey():
 # About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
 # prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
 # suite in parts side by side that end together. A section not listed counts as 5 s.
-SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20, "sso": 83, "guesses": 30, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
+SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20, "sso": 83, "sso_flow": 15, "guesses": 30, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
         "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
         "users": 15, "find": 15, "measures": 120, "facts": 90, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
         "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "ddlgaps": 40, "sqla": 30, "unique_doors": 60, "pkey": 60}
@@ -17617,7 +17984,7 @@ SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20,
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, sso_flow, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -17649,7 +18016,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -17662,7 +18029,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

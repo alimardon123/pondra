@@ -176,7 +176,7 @@ fn made(mut given: HashMap<String, Vec<String>>) -> Result<Provider> {
 }
 
 /// May a provider be reached at `url`: https, or http on this machine (tests, a provider beside the node)?
-fn reachable(url: &str) -> bool {
+pub(crate) fn reachable(url: &str) -> bool {
     match reqwest::Url::parse(url) {
         Ok(u) if u.scheme() == "https" => u.host().is_some(),
         Ok(u) if u.scheme() == "http" => matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")),
@@ -330,7 +330,7 @@ pub async fn why(lake: &Lake, token: &str) -> Option<String> {
 }
 
 /// Whom each provider of the token's issuer whose checks pass says it names, in name order (never none).
-async fn checked(providers: &[(String, Provider)], token: &str, now: f64) -> Result<Vec<Claimed>> {
+pub(crate) async fn checked(providers: &[(String, Provider)], token: &str, now: f64) -> Result<Vec<Claimed>> {
     let mut parts = token.splitn(3, '.');
     let (h, c, s) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
     let part = |p: &str, what: &str| -> Result<Value> {
@@ -488,18 +488,24 @@ fn remember(issuer: &str, found: Result<Vec<Jwk>>) {
     }
 }
 
+/// An issuer's discovery document, checked to name the issuer exactly as its tokens do.
+pub(crate) async fn discovery(issuer: &str) -> Result<Value> {
+    let doc = get_json(&format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'))).await?;
+    ensure!(doc["issuer"].as_str() == Some(issuer), "its discovery document names issuer {}, not {issuer} (its tokens must name the issuer the document does)", doc["issuer"]);
+    Ok(doc)
+}
+
 /// An issuer's keys, from its discovery document's `jwks_uri` (OpenID Connect Discovery: the document
 /// must name the issuer exactly as its tokens do).
 async fn fetch(issuer: &str) -> Result<Vec<Jwk>> {
-    let doc = get_json(&format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'))).await?;
-    ensure!(doc["issuer"].as_str() == Some(issuer), "its discovery document names issuer {}, not {issuer} (its tokens must name the issuer the document does)", doc["issuer"]);
+    let doc = discovery(issuer).await?;
     let uri = doc["jwks_uri"].as_str().context("its discovery document has no jwks_uri")?;
     let keys = jwks(&get_json(uri).await?);
     ensure!(!keys.is_empty(), "{uri} has no RSA or EC key for signatures");
     Ok(keys)
 }
 
-async fn get_json(url: &str) -> Result<Value> {
+pub(crate) async fn get_json(url: &str) -> Result<Value> {
     ensure!(reachable(url), "{url}: a provider is asked over https (http only on this machine)");
     let mut r = crate::ext::web().get(url).timeout(Duration::from_secs(10)).send().await.with_context(|| url.to_string())?;
     ensure!(r.status().is_success(), "{url} answered {}", r.status());

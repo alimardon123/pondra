@@ -957,19 +957,41 @@ fn session_ms() -> u64 { crate::env::parse::<f64>("PONDRA_SESSION_HOURS").map_or
 pub async fn sign(lake: &Lake, data: &[u8]) -> Result<String> { Ok(B64U.encode(hmac256(&B64.decode(keys(lake).await?.session)?, data))) }
 
 /// A session for `user`: `ps_<payload>.<signature>`, checked by any node with the lake's key.
-pub async fn session(lake: &Lake, user: &str) -> Result<(String, u64)> {
+pub async fn session(lake: &Lake, user: &str) -> Result<(String, u64)> { signed_session(lake, j!({"u": user})).await }
+
+/// A session an identity provider's sign-in made (ADR-074 §5): it names the provider and the roles its token
+/// claimed, so it signs no one in once the provider is dropped, and a user it vouches for with no user here
+/// (`USERS 'any'`) keeps those roles. It lasts its hours, as `/login`'s does, not the token's.
+pub async fn session_of(lake: &Lake, c: &crate::sso::Claimed) -> Result<(String, u64)> { signed_session(lake, j!({"u": c.user, "p": c.provider, "r": c.roles})).await }
+
+async fn signed_session(lake: &Lake, mut payload: Value) -> Result<(String, u64)> {
     let until = crate::log::now_ms() + session_ms();
-    let payload = B64U.encode(serde_json::to_vec(&j!({"u": user, "x": until}))?);
+    payload["x"] = j!(until);
+    let payload = B64U.encode(serde_json::to_vec(&payload)?);
     let sig = B64U.encode(hmac256(&B64.decode(keys(lake).await?.session)?, payload.as_bytes()));
     Ok((format!("ps_{payload}.{sig}"), until))
 }
 
-async fn session_user(lake: &Lake, token: &str) -> Option<String> {
-    let (payload, sig) = token.strip_prefix("ps_")?.split_once('.')?;
+/// `payload` if `sig` is the lake's key's signature of it (a session's, or a sign-in flow's: `sso_flow.rs`).
+pub async fn signed_by_lake(lake: &Lake, payload: &str, sig: &str) -> Option<Value> {
     let key = B64.decode(keys(lake).await.ok()?.session).ok()?;
     hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, &key), payload.as_bytes(), &B64U.decode(sig).ok()?).ok()?;
-    let v: Value = serde_json::from_slice(&B64U.decode(payload).ok()?).ok()?;
-    (v["x"].as_u64()? > crate::log::now_ms()).then(|| v["u"].as_str().map(String::from))?
+    serde_json::from_slice(&B64U.decode(payload).ok()?).ok()
+}
+
+/// Whom a session signs in: its user, or what its provider's sign-in claimed while that provider is there.
+async fn session_principal(lake: &Lake, token: &str) -> Option<Principal> {
+    let (payload, sig) = token.strip_prefix("ps_")?.split_once('.')?;
+    let v = signed_by_lake(lake, payload, sig).await?;
+    let (until, user) = (v["x"].as_u64()?, v["u"].as_str()?);
+    if until <= crate::log::now_ms() {
+        return None;
+    }
+    let Some(name) = v["p"].as_str() else { return principal(lake, user).await.ok() };
+    let all = crate::sso::all(lake).await.ok()?;
+    let (_, p) = all.iter().find(|(n, _)| n == name)?;
+    let roles = v["r"].as_array().map(|r| r.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    claimed(lake, &crate::sso::Claimed { user: user.into(), roles, provider: name.into(), any: p.any, expires_ms: until }).await.ok()
 }
 
 crate::per_node!(
@@ -1307,8 +1329,10 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) ->
         if token.starts_with("pn_") && !auth.admin_set() && keys(lake).await.is_ok_and(|k| aws_lc_rs::constant_time::verify_slices_are_equal(k.node.as_bytes(), token.as_bytes()).is_ok()) {
             return Some(Principal::token(Role::Admin));
         }
-        let user = if token.starts_with("ps_") { session_user(lake, token).await? } else { token_user(lake, token).await? };
-        return principal(lake, &user).await.ok();
+        if token.starts_with("ps_") {
+            return session_principal(lake, token).await;
+        }
+        return principal(lake, &token_user(lake, token).await?).await.ok();
     }
     let basic = String::from_utf8(B64.decode(header.strip_prefix("Basic ")?).ok()?).ok()?;
     let (user, password) = basic.split_once(':')?;

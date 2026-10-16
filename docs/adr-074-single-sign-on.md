@@ -153,11 +153,21 @@ needs a client secret) and no provider token is ever kept in the browser:
    to the page in the URL's fragment (which no server sees) on a redirect to the path it started from.
    The page keeps it as it keeps `/login`'s.
 
-The redirect URI the provider is told is the node's own: `--advertise`'s address, else the request's
-`Host` (checked as invariant 372 checks it), plus `/sso/callback`; behind `pondra serve --lakes`,
-`/db/{name}/sso/callback`. Any node of the lake can finish a flow another started: the cookie is
-signed with the lake's key, and nothing is kept on a node. `to` is only a path on this node (it starts
-with one `/`), or for the command line a loopback address (§6).
+The redirect URI the provider is told is the address the browser used, plus `/sso/callback`: the
+request's scheme and `Host` (checked as invariant 372 checks it); from a proxy in
+`PONDRA_TRUSTED_PROXIES`, its `X-Forwarded-Proto` and `X-Forwarded-Host`; behind `pondra serve
+--lakes`, the address the server names in `x-pondra-origin` with its key (as invariant 381's
+`x-pondra-client`), `/db/{name}` included. The cookie's `Path` is that `/sso/`, so it goes to one
+database only. Any node of the lake can finish a flow another started: the cookie is signed with the
+lake's key, and nothing is kept on a node. `to` is only a path on this node (it starts with one `/`),
+or for the command line a loopback address with a port (§6); anything else is refused at the start.
+A sign-in that fails, at the start (no such provider, its discovery unreachable) or at the callback (the
+provider refused, a check failed), ends where it would have: the page gets `#pondra_error=…` and its
+sign-in dialog says why; the command line gets `?error=…` and prints it.
+
+A session a provider's token made names its provider and claimed roles, and ends with the provider:
+`DROP IDENTITY PROVIDER` refuses its sessions at once, and a USERS 'any' user's session keeps its
+claimed roles.
 
 ### 6. In three parts, by the freeze
 
@@ -166,10 +176,15 @@ with one `/`), or for the command line a loopback address (§6).
    lake's format (§7). `harness.py sso` is the doors check for signing in (HTTP's Bearer and Basic,
    Postgres, Kafka's PLAIN and OAUTHBEARER, Flight, MCP): the doors matrix runs on an open node, which
    a provider would close.
-2. **The console and the command line** (by 10-24): §5; `pondra login <url>` opens the browser to
-   `/sso/{provider}/start?to=http://127.0.0.1:<port>/` (a loopback redirect, RFC 8252), keeps the
-   session in the user's own file (`0600`), and the shell, `pondra sql`, the project commands and
-   Python's and JavaScript's `connect(url)` use it when given no token.
+2. **The console and the command line** (by 10-24): §5; `pondra login [url] [--provider name]`,
+   given no token or user, opens the browser (`PONDRA_BROWSER`, else the system's) to
+   `/sso/{provider}/start?to=http://127.0.0.1:<port>/&challenge=…` (a loopback redirect, RFC 8252,
+   with a PKCE challenge of its own). The callback sends the browser there with a code (`pc_…`, a
+   minute) that only the command line's verifier redeems, at `POST /sso/token`, so no session sits in
+   a browser's history. It keeps the session in `$PONDRA_HOME/login.json` (`~/.pondra`, `0600`), and
+   `pondra run`, the project commands and Python's and JavaScript's clients (`connect(url)`) use it
+   for that server when given no token; a node a program starts never does. Several providers and no
+   `--provider` is refused, naming them.
 3. **What finishes it** (by 10-29): Postgres's `OAUTHBEARER` for `psql` 18's device flow; a reference
    page and a guide (Okta, Entra ID, Google, Keycloak); a run against a real provider (Keycloak in a
    container in `deploy.yml`).

@@ -130,6 +130,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod udf;
 #[cfg(feature = "server")] mod users;
 #[cfg(feature = "server")] mod sso;
+#[cfg(feature = "server")] mod sso_flow;
 #[cfg(feature = "server")] mod vend;
 #[cfg(feature = "server")] mod vars;
 #[cfg(feature = "server")] mod views;
