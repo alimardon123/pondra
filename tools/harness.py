@@ -28,6 +28,8 @@
   harness.py sealed              the lake's keys and secrets sealed by an admin token alone: nodes, rotation, short tokens
   harness.py sso                 identity providers: CREATE IDENTITY PROVIDER, JWTs at every door, refusals, USERS 'any', keys fetched and dropped
   harness.py sso_flow            single sign-on's browser way in: the flow to a provider and back, refusals, pondra login, the clients with no token
+  harness.py sso_pg              psql 18's sign-in through a provider (POSTGRES 'oauth', OAUTHBEARER): told where it is, a token in, refusals, one way a connection
+  harness.py keycloak            single sign-on against a real Keycloak (PONDRA_KEYCLOAK): tokens at every door, the console's flow, pondra login, psql 18
   harness.py safety              panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
   harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
   harness.py stopped             a run whose node was killed under it: stopped, not running for good
@@ -10029,6 +10031,586 @@ for _ in range(10):
 '''
 
 
+def sso_pg():
+    """psql 18's sign-in through a provider (ADR-074 §6's third part, invariant 413, src/pg.rs): with POSTGRES 'oauth', the
+    Postgres port asks a user with no password (or, for a USERS 'any' provider, a name no user has) for OAUTHBEARER
+    (RFC 7628) instead of a password, with SCRAM-SHA-256 after it only so that a client before libpq 18 is told the way
+    out. A client with no token is told where the provider is (the error's
+    openid-configuration and scope) and refused, a token goes straight to AuthenticationOk (no SASLFinal: libpq refuses
+    one), a refused token says why. One way a connection, as pg_hba has it: a user with a password still signs in with
+    SCRAM, and the default (POSTGRES 'password') still asks for the token as a password. A hand-written client speaks the
+    exchange; psql 18 itself, when there is one (PONDRA_PSQL, else psql on the PATH), runs the device flow against
+    tools/fake_idp.py."""
+    import socket, struct, shutil
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import fake_idp
+    import psycopg
+    P, PG = A.port, A.port + 13
+    token = "sso-pg-admin-token-1"
+    bearer = {"Authorization": f"Bearer {token}"}
+    ana, eve, cy, bo = "ana@acme.com", "eve@acme.com", "cy@acme.com", "bo"
+    srv = fake_idp.start(0)
+    issuer = srv.issuer
+    discovery = issuer + "/.well-known/openid-configuration"
+    checks, info, started = {}, {}, []
+    OFFERED = ["OAUTHBEARER", "SCRAM-SHA-256"]  # (libpq 18 takes the first it knows; an older client, SCRAM)
+
+    def token_for(email, **body):
+        return srv.idp.mint({"ttl": 3600, "claims": {"aud": "api://pondra", "email": email, "email_verified": True}, **body})
+
+    def sql(q):
+        st, _, text = reply(P, "POST", "/sql", q.encode(), headers=bearer)
+        return st if st == 200 else (st, text[:200])
+
+    def by_hand(user, tok, query=None, choose="OAUTHBEARER", port=None):
+        """OAUTHBEARER as psql 18 speaks it, written out: what the port asked for, and what came of it. With
+        choose="SCRAM-SHA-256", the mechanism a client before libpq 18 takes from the same list."""
+        s = socket.create_connection(("127.0.0.1", port or PG), timeout=10)
+        def take(n):
+            got = b""
+            while len(got) < n:
+                more = s.recv(n - len(got))
+                if not more:
+                    raise EOFError("the port hung up")
+                got += more
+            return got
+        def read():
+            kind = take(1)
+            return kind, take(struct.unpack("!I", take(4))[0] - 4)
+        def send(kind, body):
+            s.sendall(kind + struct.pack("!I", len(body) + 4) + body)
+        def fields(body):  # an ErrorResponse's fields: severity, code, message
+            return {f[:1].decode(): f[1:].decode() for f in body.split(b"\0") if f}
+        try:
+            hello = struct.pack("!I", 196608) + f"user\0{user}\0database\0lake\0\0".encode()
+            s.sendall(struct.pack("!I", len(hello) + 4) + hello)
+            kind, body = read()
+            code = struct.unpack("!I", body[:4])[0]
+            asked = {3: "password", 10: [m.decode() for m in body[4:].split(b"\0") if m]}.get(code, code)
+            out = {"asked": asked}
+            if asked != OFFERED:
+                return out
+            if choose == "SCRAM-SHA-256":  # (a client first message, n,,n=,r=: the port answers it with an error)
+                first = b"n,,n=,r=abcdefghijklmnop"
+                send(b"p", b"SCRAM-SHA-256\0" + struct.pack("!i", len(first)) + first)
+                kind, body = read()
+                out["error" if kind == b"E" else "then"] = fields(body) if kind == b"E" else kind.decode()
+                return out
+            data = b"n,,\x01auth=" + (f"Bearer {tok}".encode() if tok else b"") + b"\x01\x01"
+            send(b"p", b"OAUTHBEARER\0" + struct.pack("!i", len(data)) + data)
+            kind, body = read()
+            if kind == b"R" and struct.unpack("!I", body[:4])[0] == 11:  # told where the provider is: answer \x01, as psql does
+                out["told"] = json.loads(body[4:])
+                send(b"p", b"\x01")
+                kind, body = read()
+            if kind == b"E":
+                out["error"] = fields(body)
+                return out
+            out["then"] = struct.unpack("!I", body[:4])[0] if kind == b"R" else kind.decode()  # (0: AuthenticationOk)
+            while kind != b"Z":
+                kind, body = read()
+            if query:  # the simple protocol: its rows as text, until ReadyForQuery
+                send(b"Q", query.encode() + b"\0")
+                out["rows"] = []
+                while (got := read())[0] != b"Z":
+                    kind, body = got
+                    if kind == b"E":
+                        out["error"] = fields(body)
+                    if kind == b"D":
+                        at, row = 2, []
+                        for _ in range(struct.unpack("!H", body[:2])[0]):
+                            ln = struct.unpack("!i", body[at:at + 4])[0]
+                            row.append(body[at + 4:at + 4 + ln].decode() if ln >= 0 else None)
+                            at += 4 + max(ln, 0)
+                        out["rows"].append(row)
+            return out
+        except (OSError, EOFError) as e:
+            return {"failed": str(e)}
+        finally:
+            s.close()
+
+    def pg_as(user, password, query="SELECT x FROM t"):
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={PG} user={user} password={password} dbname=lake connect_timeout=10") as conn:
+                return conn.execute(query).fetchall()
+        except psycopg.Error as e:
+            return str(e).strip()
+
+    def find_psql():
+        """psql 18 or later (the first with OAUTHBEARER): PONDRA_PSQL, else psql on the PATH; None without one."""
+        for exe in [os.environ.get("PONDRA_PSQL"), shutil.which("psql")]:
+            if exe:
+                try:
+                    said = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10).stdout
+                    if int(said.split()[-1].split(".")[0]) >= 18:
+                        return exe
+                except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+                    pass
+        return None
+
+    lake = new_lake()
+    try:
+        node = Node(lake, P, admin_token=token, pg=f"127.0.0.1:{PG}").start()
+        started.append(node)
+        setup = [sql(q) for q in (
+            f"CREATE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'))",
+            f'CREATE USER "{ana}"', f'CREATE USER "{eve}"', f"CREATE USER {bo} PASSWORD 'bo-password-1'",
+            "CREATE TABLE t (x INT)", "INSERT INTO t VALUES (7)", f'GRANT SELECT ON t TO "{ana}"', f"GRANT SELECT ON t TO {bo}")]
+        info["setup"] = setup
+        ana_t = token_for(ana)
+
+        # 1. By default (POSTGRES 'password'), as part 1 left it: ana, with no password, is asked for one, and her token is it.
+        checks["by default, a user with no password is asked for a password, and her provider's token signs her in"] = \
+            setup == [200] * len(setup) and by_hand(ana, None) == {"asked": "password"} and pg_as(ana, ana_t) == [(7,)]
+
+        # 2. With POSTGRES 'oauth': OAUTHBEARER first, told where the provider is, then refused; a token signs straight in.
+        info["oauth"] = sql(f"CREATE OR REPLACE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), POSTGRES 'oauth')")
+        shown = call(P, "POST", "/sql", b"SHOW CREATE IDENTITY PROVIDER acme", headers=bearer)[0]["definition"]
+        empty = by_hand(ana, None)
+        info["no token yet"] = empty
+        checks["with POSTGRES 'oauth' (shown by SHOW CREATE), ana is asked for OAUTHBEARER (SCRAM-SHA-256 after it, for older clients); with no token she is told the provider's discovery document and scopes, then refused 28000"] = \
+            "POSTGRES 'oauth'" in shown and empty.get("asked") == OFFERED \
+            and empty.get("told") == {"status": "invalid_token", "openid-configuration": discovery, "scope": "openid email profile"} \
+            and empty.get("error", {}).get("C") == "28000"
+        signed_in = by_hand(ana, ana_t, "SELECT x FROM t")
+        info["her token"] = signed_in
+        checks["her token signs her in: AuthenticationOk with no SASLFinal (libpq refuses one), and she reads t"] = \
+            signed_in.get("then") == 0 and "told" not in signed_in and signed_in.get("rows") == [["7"]]
+
+        # 3. Refused, saying why, after being told where the provider is.
+        refused = {"eve's token as ana": by_hand(ana, token_for(eve)), "a stranger's key": by_hand(ana, token_for(ana, sign_with="stranger")),
+                   "expired": by_hand(ana, token_for(ana, ttl=-600)), "not a token": by_hand(ana, "pt_nope")}
+        info["refused"] = refused
+        checks["refused with 28000, each saying why (another user's token, a stranger's key, an expired one, not a token at all), told where the provider is first"] = \
+            all(r.get("told", {}).get("openid-configuration") == discovery and r.get("error", {}).get("C") == "28000" for r in refused.values()) \
+            and "doesn't sign in ana@acme.com" in refused["eve's token as ana"]["error"]["M"] \
+            and "isn't its issuer's" in refused["a stranger's key"]["error"]["M"] and "expired" in refused["expired"]["error"]["M"]
+
+        # 4. One way a connection: a user with a password still signs in with SCRAM; a name no user has, with no
+        # USERS 'any' provider, too; and a driver that sends the token as its password can't, once OAUTHBEARER is asked.
+        driver = pg_as(ana, ana_t)
+        info["psycopg with the token as the password"] = driver
+        checks["one way a connection: bo (a password) is asked for SCRAM and signs in, a name no user has too; ana's token as psycopg's password is refused once she is asked for OAUTHBEARER"] = \
+            by_hand(bo, None) == {"asked": ["SCRAM-SHA-256"]} and pg_as(bo, "bo-password-1") == [(7,)] \
+            and by_hand(cy, None) == {"asked": ["SCRAM-SHA-256"]} and isinstance(driver, str)
+
+        # 4b. A client before libpq 18 takes SCRAM-SHA-256 from the same list, and is told the way out: psql 18 (or
+        # libpq 18) with the issuer, or the provider's POSTGRES 'password'. psycopg2's libpq is 17.
+        older = by_hand(ana, None, choose="SCRAM-SHA-256")
+        info["a client choosing SCRAM"] = older
+        try:
+            import psycopg2
+            info["psycopg2's libpq"] = psycopg2.__libpq_version__
+            try:
+                psycopg2.connect(f"host=127.0.0.1 port={PG} user={ana} password={ana_t} dbname=lake connect_timeout=10").close()
+                old_said = "signed in"
+            except psycopg2.Error as e:
+                old_said = str(e).strip()
+        except ImportError:
+            old_said = None
+        info["psycopg2 (libpq 17)"] = old_said
+        way_out = lambda said: isinstance(said, str) and "psql 18" in said and f"oauth_issuer={issuer}" in said and "POSTGRES 'password'" in said
+        checks["a client before libpq 18 (psycopg2's libpq 17) takes SCRAM-SHA-256 and is refused 28000, told the way out: psql 18 with the issuer, or POSTGRES 'password'"] = \
+            older.get("error", {}).get("C") == "28000" and way_out(older["error"].get("M")) and (old_said is None or way_out(old_said))
+
+        # 5. A USERS 'any' provider that says POSTGRES 'oauth' asks a name no user has for OAUTHBEARER; the listed one
+        # (acme, first by name) still answers for ana.
+        info["staff"] = sql(f"CREATE IDENTITY PROVIDER staff (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), USERS 'any', POSTGRES 'oauth')")
+        cy_in = by_hand(cy, token_for(cy), "SELECT 1")
+        info["cy"] = cy_in
+        checks["with a USERS 'any' provider saying POSTGRES 'oauth', a name no user has (cy) is asked for OAUTHBEARER and signs in with its token; ana still does"] = \
+            cy_in.get("asked") == OFFERED and cy_in.get("rows") == [["1"]] and by_hand(ana, ana_t, "SELECT x FROM t").get("rows") == [["7"]]
+
+        # 5b. Through a folder of lakes (pondra serve --lakes): the server passes the exchange on to the database's node
+        # as it is, after the startup message.
+        folder, lp = new_lake(), P + 40
+        config = tempfile.mkdtemp(prefix="pondra-sso-pg-config-")
+        with open(f"/tmp/pondra-{lp}-sso-pg.stderr", "w") as log:
+            lakes = subprocess.Popen([BIN, "serve", "--lakes", folder, "--addr", f"127.0.0.1:{lp}", "--pg", f"127.0.0.1:{lp + 1}", "--admin-token", token],
+                                     stdout=subprocess.DEVNULL, stderr=log, env={**os.environ, "PONDRA_CONFIG_DIR": config})
+        try:
+            def made():
+                try:
+                    return reply(lp, "POST", "/sql", f"CREATE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), POSTGRES 'oauth')".encode(), headers=bearer)[0]
+                except OSError:
+                    return None  # (the server not up yet)
+            there = [until(made, 200, 60)] + [reply(lp, "POST", "/sql", q.encode(), headers=bearer)[0] for q in (
+                f'CREATE USER "{ana}"', "CREATE TABLE t (x INT)", "INSERT INTO t VALUES (8)", f'GRANT SELECT ON t TO "{ana}"')]
+            told, signed = by_hand(ana, None, port=lp + 1), by_hand(ana, ana_t, "SELECT x FROM t", port=lp + 1)
+            info["through a folder of lakes"] = {"setup": there, "no token": told, "her token": signed}
+            checks["through pondra serve --lakes, the exchange passes on to the database's node: told where the provider is, then her token signs her in"] = \
+                there == [200] * 5 and told.get("asked") == OFFERED and told.get("told", {}).get("openid-configuration") == discovery \
+                and told.get("error", {}).get("C") == "28000" and signed.get("then") == 0 and signed.get("rows") == [["8"]]
+        finally:
+            lakes.send_signal(signal.SIGTERM)
+            lakes.wait(timeout=60)
+            shutil.rmtree(config, ignore_errors=True)
+
+        # 6. psql 18 itself: the device flow against the provider, then the query.
+        psql = find_psql()
+        info["psql"] = psql or "no psql 18 here (PONDRA_PSQL names one): its check is left out"
+        if psql:
+            asked_before = srv.idp.stats["device_requests"]
+            env = {**os.environ, "PGOAUTHDEBUG": "UNSAFE"}  # (an http issuer: the stand-in provider, on this machine)
+            env.pop("PGPASSWORD", None)
+            ran = subprocess.run([psql, f"host=127.0.0.1 port={PG} dbname=lake user={ana} oauth_issuer={issuer} oauth_client_id=pondra-cli",
+                                  "-At", "-c", "SELECT x FROM t"], capture_output=True, text=True, timeout=60, env=env)
+            info["psql 18"] = {"exit": ran.returncode, "out": ran.stdout.strip(), "err": ran.stderr.strip()[-400:]}
+            checks["psql 18 signs ana in through the provider's device flow (oauth_issuer, oauth_client_id) and reads t"] = \
+                ran.returncode == 0 and ran.stdout.strip() == "7" and srv.idp.stats["device_requests"] == asked_before + 1
+    finally:
+        for n in started:
+            n.kill()
+        fake_idp.stop(srv)
+    ok = all(checks.values())
+    print(json.dumps({"sso_pg": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+KC_BROWSER = '''#!PYTHON
+"""The browser `pondra login` runs (PONDRA_BROWSER, given the sign-in's address): it opens the address, posts Keycloak's
+login form with KC_USER and KC_PASSWORD, and follows the redirects on to the command line's loopback address. Keycloak's
+cookies are Secure, so the cookie policy sends them back over http://127.0.0.1 too (a secure context, in a browser)."""
+import html, http.cookiejar, os, re, sys, traceback, urllib.parse, urllib.request
+here = os.path.dirname(os.path.abspath(__file__))
+
+
+class Loopback(http.cookiejar.DefaultCookiePolicy):
+    def return_ok_secure(self, cookie, request):
+        return True
+
+
+try:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar(Loopback())))
+    r = opener.open(sys.argv[1], timeout=30)
+    page, at = r.read().decode(errors="replace"), r.geturl()
+    action = re.search(r'<form[^>]*action="([^"]+)"', page)
+    if 'name="username"' in page and action:
+        fields = dict(re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', page))
+        fields.update(username=os.environ["KC_USER"], password=os.environ["KC_PASSWORD"])
+        opener.open(urllib.request.Request(urllib.parse.urljoin(at, html.unescape(action.group(1))), data=urllib.parse.urlencode(fields).encode()), timeout=30).read()
+except Exception:
+    with open(os.path.join(here, "browser.log"), "a") as f:
+        f.write(traceback.format_exc())
+    raise
+'''
+
+
+def keycloak():
+    """Single sign-on against a real Keycloak (an OpenID Connect provider, ADR-074), not tools/fake_idp.py: the realm
+    `pondra-check` is made through Keycloak's admin REST API (PONDRA_KEYCLOAK, its admin PONDRA_KEYCLOAK_ADMIN), and
+    Pondra's identity providers point at it. Checked: Bearer tokens at /whoami and /sql (a listed user, USERS 'any' with
+    Keycloak's realm roles, a user with no role; another issuer's and another audience's tokens refused), Postgres with
+    the token as the password, Flight SQL, the console's flow (a scripted browser through Keycloak's login form, the
+    session in the address's fragment), `pondra login --provider` with a PONDRA_BROWSER that signs in at Keycloak, and
+    psql 18's device flow. Not part of `all`: it needs Keycloak running, and psql 18 for its last check."""
+    import html, http.cookiejar, urllib.error, urllib.parse, urllib.request
+    import adbc_driver_flightsql.dbapi as adbc
+    import psycopg
+    KC = os.environ.get("PONDRA_KEYCLOAK", "http://127.0.0.1:8180").rstrip("/")
+    admin_name, _, admin_pass = os.environ.get("PONDRA_KEYCLOAK_ADMIN", "admin:admin").partition(":")
+    REALM = "pondra-check"
+    ISSUER = f"{KC}/realms/{REALM}"
+    P, PG, FLIGHT = A.port, A.port + 13, A.port + 33  # (ports no other section takes)
+    token = "kc-admin-token-1"
+    bearer = lambda t: {"Authorization": f"Bearer {t}"}
+    ana, cy, eve = "ana@acme.com", "cy@acme.com", "eve@acme.com"
+    checks, info, started = {}, {}, []
+    plain = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # (no proxy: Keycloak is on this machine)
+
+    try:
+        plain.open(f"{KC}/realms/master/.well-known/openid-configuration", timeout=10).read()
+    except (urllib.error.URLError, OSError):
+        print(f"no Keycloak answers at {KC} (its master realm's discovery document): start one, or set PONDRA_KEYCLOAK")
+        return False
+
+    def kc_call(method, path, body=None, form=None, auth=None):
+        """(status, the JSON or the text) of a request to Keycloak: a form is sent form-encoded, a body as JSON."""
+        headers = {"Authorization": f"Bearer {auth}"} if auth else {}
+        data = None
+        if form is not None:
+            data, headers["Content-Type"] = urllib.parse.urlencode(form).encode(), "application/x-www-form-urlencoded"
+        elif body is not None:
+            data, headers["Content-Type"] = json.dumps(body).encode(), "application/json"
+        try:
+            with plain.open(urllib.request.Request(KC + path, data=data, method=method, headers=headers), timeout=30) as r:
+                text = r.read().decode(errors="replace")
+                return r.status, (json.loads(text) if text.strip().startswith(("{", "[")) else text)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode(errors="replace")
+
+    st, tok = kc_call("POST", "/realms/master/protocol/openid-connect/token",
+                      form={"grant_type": "password", "client_id": "admin-cli", "username": admin_name, "password": admin_pass})
+    if st != 200:
+        print(f"Keycloak's admin ({admin_name}, from PONDRA_KEYCLOAK_ADMIN) can't sign in to its master realm: {st} {str(tok)[:200]}")
+        return False
+    admin = tok["access_token"]
+
+    # The realm, as kc_setup.py makes it: users ana, cy (realm role analysts) and eve, each with the password name-pass-1;
+    # the pondra client (confidential, the secret kc-secret-1) and pondra-cli (public, the device grant), both with the
+    # audience api://pondra in their access tokens.
+    audience = {"name": "pondra audience", "protocol": "openid-connect", "protocolMapper": "oidc-audience-mapper",
+                "config": {"included.custom.audience": "api://pondra", "access.token.claim": "true", "id.token.claim": "false", "introspection.token.claim": "true"}}
+    person = lambda name, roles=(): {"username": name, "email": f"{name}@acme.com", "emailVerified": True, "enabled": True, "firstName": name.title(), "lastName": "Acme",
+                                     "credentials": [{"type": "password", "value": f"{name}-pass-1", "temporary": False}], "realmRoles": list(roles)}
+    realm = {
+        "realm": REALM, "enabled": True, "sslRequired": "none",
+        "roles": {"realm": [{"name": "analysts"}]},
+        "users": [person("ana"), person("cy", ["analysts"]), person("eve")],
+        "clients": [
+            {"clientId": "pondra", "enabled": True, "publicClient": False, "secret": "kc-secret-1", "standardFlowEnabled": True, "directAccessGrantsEnabled": True,
+             "redirectUris": [f"http://127.0.0.1:{P}/sso/callback"], "webOrigins": [], "consentRequired": False, "protocolMappers": [audience]},
+            {"clientId": "pondra-cli", "enabled": True, "publicClient": True, "standardFlowEnabled": False, "directAccessGrantsEnabled": True,
+             "attributes": {"oauth2.device.authorization.grant.enabled": "true"}, "consentRequired": False, "protocolMappers": [audience]},
+        ],
+    }
+
+    def token_of(label, client, email, secret=None):
+        """Keycloak's password grant for email's user (the realm's password is name-pass-1): its access token, or '' with
+        the refusal kept in info."""
+        name = email.split("@")[0]
+        form = {"grant_type": "password", "client_id": client, "username": name, "password": f"{name}-pass-1", "scope": "openid email"}
+        if secret:
+            form["client_secret"] = secret
+        st, answer = kc_call("POST", f"/realms/{REALM}/protocol/openid-connect/token", form=form)
+        if st != 200:
+            info.setdefault("tokens Keycloak refused", {})[label] = [st, str(answer)[:200]]
+            return ""
+        return answer["access_token"]
+
+    def who_as(bearer_token):
+        """(status, the user /whoami names, or the refusal's text)."""
+        st, _, text = reply(P, "GET", "/whoami", headers=bearer(bearer_token))
+        return st, (json.loads(text)["user"] if st == 200 else text)
+
+    def sql_as(bearer_token, sql="SELECT x FROM t"):
+        """(status, the rows, or the refusal's text) of a query with a Bearer token, over HTTP."""
+        st, _, text = reply(P, "POST", "/sql", sql.encode(), headers=bearer(bearer_token))
+        return st, (json.loads(text) if st == 200 else text)
+
+    def pg_as(user, password, query="SELECT x FROM t"):
+        """The rows psycopg gets as user with password, or the error's text."""
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={PG} user={user} password={password} dbname=lake connect_timeout=10") as conn:
+                return conn.execute(query).fetchall()
+        except psycopg.Error as e:
+            return str(e).strip()
+
+    def flight_as(user, password, sql="SELECT x FROM t"):
+        """The rows over Flight SQL (ADBC's Basic handshake), or the error's text."""
+        try:
+            conn = adbc.connect(f"grpc://127.0.0.1:{FLIGHT}", db_kwargs={"username": user, "password": password})
+            try:
+                cur = conn.cursor()
+                cur.execute(sql)
+                rows = cur.fetchall()
+                cur.close()
+                return rows
+            finally:
+                conn.close()
+        except Exception as e:
+            return str(e).strip()
+
+    class Loopback(http.cookiejar.DefaultCookiePolicy):
+        def return_ok_secure(self, cookie, request):
+            return True  # (Keycloak's cookies are Secure: a browser sends them back to http://127.0.0.1 too, a secure context)
+
+    class Recording(urllib.request.HTTPRedirectHandler):
+        """A redirect followed as a browser follows it, each address it is sent to kept in `sent`."""
+        def __init__(self, sent):
+            self.sent = sent
+
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            self.sent.append(newurl)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    def opener_for(sent):
+        """A browser on this machine: cookies kept, redirects followed (each address into `sent`)."""
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}), Recording(sent), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar(Loopback())))
+
+    def form_of(page):
+        """The page's first form's action (unescaped), and the inputs that have a value."""
+        m = re.search(r'<form[^>]*action="([^"]+)"', page)
+        return (html.unescape(m.group(1)) if m else None), dict(re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', page))
+
+    def keycloak_login(opener, url, email):
+        """Opens url, which the redirects lead to Keycloak's login form, and posts the form with email's user and password
+        as a person would (a consent form gets its Yes): the (address, text) the browser ends on."""
+        name = email.split("@")[0]
+        r = opener.open(url, timeout=30)
+        page, at = r.read().decode(errors="replace"), r.geturl()
+        action, fields = form_of(page)
+        if 'name="username"' not in page or not action:
+            return at, page  # (no login form: where the redirects ended)
+        fields.update(username=name, password=f"{name}-pass-1")
+        r = opener.open(urllib.request.Request(urllib.parse.urljoin(at, action), data=urllib.parse.urlencode(fields).encode()), timeout=30)
+        page, at = r.read().decode(errors="replace"), r.geturl()
+        action, fields = form_of(page)
+        if 'name="accept"' in page and action:
+            fields["accept"] = "Yes"
+            r = opener.open(urllib.request.Request(urllib.parse.urljoin(at, action), data=urllib.parse.urlencode(fields).encode()), timeout=30)
+            page, at = r.read().decode(errors="replace"), r.geturl()
+        return at, page
+
+    def find_psql():
+        """psql 18 or later (the first with OAUTHBEARER): PONDRA_PSQL, else psql on the PATH; None without one."""
+        for exe in [os.environ.get("PONDRA_PSQL"), shutil.which("psql")]:
+            if exe:
+                try:
+                    said = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10).stdout
+                    if int(said.split()[-1].split(".")[0]) >= 18:
+                        return exe
+                except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+                    pass
+        return None
+
+    lake = new_lake()
+    try:
+        kc_call("DELETE", f"/admin/realms/{REALM}", auth=admin)  # (left by an earlier run: none is not an error)
+        info["realm (status)"] = kc_call("POST", "/admin/realms", body=realm, auth=admin)[0]
+        node = Node(lake, P, admin_token=token, pg=f"127.0.0.1:{PG}", flight=f"127.0.0.1:{FLIGHT}").start()
+        started.append(node)
+        # The client secret is a secret the provider names (SECRET), not an option of the provider.
+        setup = [reply(P, "POST", "/sql", q.encode(), headers=bearer(token))[0] for q in (
+            "CREATE TABLE t (x INT)", "INSERT INTO t VALUES (7)", "CREATE ROLE analysts", "GRANT SELECT ON t TO analysts",
+            f'CREATE USER "{ana}"', f'GRANT SELECT ON t TO "{ana}"',
+            "CREATE SECRET kc_client (TYPE generic, CLIENT_SECRET 'kc-secret-1')",
+            f"CREATE IDENTITY PROVIDER kc (ISSUER '{ISSUER}', CLIENT_ID 'pondra', SECRET 'kc_client', AUDIENCE ('api://pondra'), LABEL 'Keycloak')",
+            f"CREATE IDENTITY PROVIDER kcstaff (ISSUER '{ISSUER}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), USERS 'any', ROLES_CLAIM 'realm_access.roles')")]
+        info["setup (statuses)"] = setup
+        checks["setup: Keycloak's realm pondra-check is made, t holds a row, ana@acme.com is made and granted SELECT on t, and identity providers kc and kcstaff are made (every statement 200)"] = (
+            info["realm (status)"] == 201 and setup == [200] * 9)
+
+        # 1. Keycloak's access tokens as Bearer tokens: ana's, from the pondra client (with its secret) and from pondra-cli.
+        ana_t = token_of("ana (pondra)", "pondra", ana, "kc-secret-1")
+        ana_cli = token_of("ana (pondra-cli)", "pondra-cli", ana)
+        seen_ana = {"pondra": (who_as(ana_t), sql_as(ana_t)), "pondra-cli": (who_as(ana_cli), sql_as(ana_cli))}
+        info["ana's tokens: /whoami and SELECT x FROM t"] = seen_ana
+        checks["a Bearer token from Keycloak's password grant: ana's, from the pondra client and from pondra-cli, is named by /whoami as ana@acme.com and reads t (SELECT x FROM t answers [{\"x\": 7}])"] = all(
+            w == (200, ana) and s == (200, [{"x": 7}]) for w, s in seen_ana.values())
+
+        # 2. USERS 'any' with Keycloak's realm roles: cy, made nowhere here, is named by the role analysts; eve has none.
+        cy_t = token_of("cy (pondra)", "pondra", cy, "kc-secret-1")
+        eve_t = token_of("eve (pondra)", "pondra", eve, "kc-secret-1")
+        cy_seen, eve_seen = (who_as(cy_t), sql_as(cy_t)), (who_as(eve_t), sql_as(eve_t))
+        info["USERS 'any' (kcstaff, ROLES_CLAIM realm_access.roles): cy has realm role analysts, eve none"] = {"cy": cy_seen, "eve": eve_seen}
+        checks["USERS 'any' with ROLES_CLAIM 'realm_access.roles': cy@acme.com, made nowhere here, with Keycloak's realm role analysts, is named by /whoami and reads t as ana does; eve@acme.com, with no role, is signed in (/whoami 200) and her SELECT of t is refused"] = (
+            cy_seen == ((200, cy), (200, [{"x": 7}])) and eve_seen[0] == (200, eve) and eve_seen[1][0] != 200)
+
+        # 3. Refused with 401: the master realm's admin token (another issuer), and ana's token from pondra-check's admin-cli
+        # (no api://pondra audience).
+        admin_cli_ana = token_of("ana (admin-cli, pondra-check)", "admin-cli", ana)
+        refusals = {name: (who_as(t), sql_as(t)) for name, t in {"the master realm's admin token": admin, "ana's token from pondra-check's admin-cli": admin_cli_ana}.items()}
+        info["refused tokens: /whoami and SELECT"] = refusals
+        checks["refused with 401 at /whoami and /sql: the master realm's admin token (another issuer) and ana's token from pondra-check's admin-cli (no api://pondra audience)"] = bool(admin_cli_ana) and all(
+            w[0] == 401 and s[0] == 401 for w, s in refusals.values())
+
+        # 4. Postgres: the token is the password (the default, POSTGRES 'password').
+        pg_default = pg_as(ana, ana_t)
+        info["Postgres, the default: psycopg as ana with her token as the password"] = pg_default
+        checks["Postgres (the default, POSTGRES 'password'): psycopg as ana@acme.com with her Keycloak access token as the password reads [(7,)]"] = pg_default == [(7,)]
+
+        # 5. Flight SQL: the same token in ADBC's Basic handshake.
+        fl = flight_as(ana, ana_t)
+        info["Flight SQL (ADBC): ana with her token as the password"] = fl if isinstance(fl, str) else [list(r) for r in fl]
+        checks["Flight SQL: ana@acme.com with her Keycloak access token as the password (ADBC's Basic handshake) reads [(7,)]"] = fl == [(7,)]
+
+        # 6. The console's flow: a browser through Keycloak's login form, the node's callback, the session in the fragment.
+        sent = []
+        try:
+            at = keycloak_login(opener_for(sent), f"http://127.0.0.1:{P}/sso/kc/start?to=%2F", ana)[0]
+        except (urllib.error.URLError, OSError) as e:
+            at = str(e)
+        hits = [u for u in sent if "pondra_session=" in urllib.parse.urlsplit(u).fragment]
+        session = (urllib.parse.parse_qs(urllib.parse.urlsplit(hits[0]).fragment).get("pondra_session") or [""])[0] if hits else ""
+        info["the console's flow: the addresses the browser was sent to, and where it ended"] = {"sent": [u[:140] for u in sent], "ended": at[:120], "pondra_session": session[:12]}
+        checks["the console's flow: a browser opened at /sso/kc/start?to=%2F, Keycloak's login form posted for ana, the node's callback sends it to /#pondra_session=ps_…, and that session's /whoami names ana@acme.com"] = (
+            session.startswith("ps_") and who_as(session) == (200, ana))
+
+        # 7. `pondra login --provider kc`: the PONDRA_BROWSER signs in at Keycloak and follows the redirect to the loopback address.
+        home, project = tempfile.mkdtemp(prefix="pondra-home-"), tempfile.mkdtemp(prefix="pondra-project-")
+        browser = os.path.join(home, "browser.py")
+        with open(browser, "w") as f:
+            f.write(KC_BROWSER.replace("PYTHON", sys.executable))
+        os.chmod(browser, 0o755)
+        base = f"http://127.0.0.1:{P}"
+        env = {**os.environ, "PONDRA_HOME": home, "PONDRA_BROWSER": browser, "KC_USER": "ana", "KC_PASSWORD": "ana-pass-1"}
+        env.pop("PONDRA_TOKEN", None)
+        try:
+            login = subprocess.run([BIN, "login", base, "--project", project, "--provider", "kc"], env=env, capture_output=True, text=True, timeout=120)
+            code, said = login.returncode, (login.stdout + login.stderr).strip()
+        except subprocess.TimeoutExpired:
+            code, said = None, "no sign-in within two minutes"
+        kept = {}
+        if os.path.exists(os.path.join(home, "login.json")):
+            with open(os.path.join(home, "login.json")) as f:
+                kept = json.load(f)
+        kept_session = kept.get(base, "")
+        log_text = None
+        if os.path.exists(os.path.join(home, "browser.log")):
+            with open(os.path.join(home, "browser.log")) as f:
+                log_text = f.read()[-400:]
+        info["pondra login http://127.0.0.1:P --provider kc (PONDRA_BROWSER signs in at Keycloak)"] = {"exit": code, "said": said[-240:], "login.json keys": list(kept), "browser.log": log_text}
+        checks["pondra login http://127.0.0.1:P --provider kc, with a PONDRA_BROWSER that signs in at Keycloak: exit 0, its output names ana@acme.com, and login.json holds a session that /whoami names ana@acme.com"] = (
+            code == 0 and ana in said and kept_session.startswith("ps_") and who_as(kept_session) == (200, ana))
+
+        # 8. psql 18 through Keycloak's device flow: libpq prints the prompt, the scripted browser approves it as ana.
+        psql = find_psql()
+        info["psql 18"] = psql or "no psql 18 here (PONDRA_PSQL names one): its check is left out"
+        if psql:
+            st_oauth = reply(P, "POST", "/sql", f"CREATE OR REPLACE IDENTITY PROVIDER kc (ISSUER '{ISSUER}', CLIENT_ID 'pondra', SECRET 'kc_client', AUDIENCE ('api://pondra'), LABEL 'Keycloak', POSTGRES 'oauth')".encode(), headers=bearer(token))[0]
+            env_psql = {**os.environ, "PGOAUTHDEBUG": "UNSAFE"}  # (an http issuer: Keycloak on this machine)
+            env_psql.pop("PGPASSWORD", None)
+            proc = subprocess.Popen([psql, f"host=127.0.0.1 port={PG} dbname=lake user={ana} oauth_issuer={ISSUER} oauth_client_id=pondra-cli", "-At", "-c", "SELECT x FROM t"],
+                                    env=env_psql, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            lines, prompt = [], {}
+
+            def read_stderr():
+                """psql's stderr line by line; the device flow's prompt (Visit URL and enter the code: CODE) is kept."""
+                for line in proc.stderr:
+                    lines.append(line.rstrip())
+                    m = re.search(r"Visit (\S+) and enter the code: (\S+)", line)
+                    if m and not prompt:
+                        prompt.update(url=m.group(1), code=m.group(2))
+
+            reader = threading.Thread(target=read_stderr, daemon=True)
+            reader.start()
+            approved = None
+            deadline = time.time() + 60  # (the prompt, or psql's end, within a minute)
+            while not prompt and proc.poll() is None and time.time() < deadline:
+                time.sleep(0.2)
+            if prompt:
+                parts = urllib.parse.urlsplit(prompt["url"])
+                verify = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode({"user_code": prompt["code"]}), ""))
+                try:
+                    approved = keycloak_login(opener_for([]), verify, ana)[0]
+                except (urllib.error.URLError, OSError) as e:
+                    approved = str(e)
+            else:
+                proc.kill()
+            try:
+                ran = proc.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                ran = None
+            reader.join(5)
+            out = proc.stdout.read()
+            info["psql 18: the device flow"] = {"CREATE OR REPLACE … POSTGRES 'oauth' (status)": st_oauth, "prompt": prompt, "approved at": approved,
+                                                "exit": ran, "out": out.strip(), "stderr tail": "\n".join(lines[-6:])[-600:]}
+            checks["psql 18 signs ana in through Keycloak's device flow (oauth_issuer, oauth_client_id=pondra-cli, POSTGRES 'oauth') and reads t: exit 0 and 7"] = (
+                st_oauth == 200 and ran == 0 and out.strip() == "7")
+    finally:
+        for n in started:
+            n.kill()
+        try:
+            kc_call("DELETE", f"/admin/realms/{REALM}", auth=admin)
+        except Exception:
+            pass  # (ignore errors: the realm is removed when it can be)
+    ok = all(checks.values())
+    print(json.dumps({"keycloak": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
 def versions():
     """Every file keeps its versions (ADR-035 §8): each save through PUT /files kept with who made
     it and when, listed newest first, read back, restored (itself kept as the newest); a deleted
@@ -18256,18 +18838,24 @@ def memorylake():
             print(f"memorylake: {name_}: {'OK' if good else 'FAIL'}")
 
 
-# About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
-# prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
-# suite in parts side by side that end together. A section not listed counts as 5 s.
-SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20, "sso": 83, "sso_flow": 15, "guesses": 30, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
-        "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
-        "users": 15, "find": 15, "measures": 120, "facts": 90, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
-        "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "ddlgaps": 40, "sqla": 30, "unique_doors": 60, "pkey": 60, "memorylake": 60}
+# About how long each section of `all` takes, in seconds, on CI's runner (main's build run 650,
+# 2026-10-13: `all` prints each one's time as it goes): `--shard K/N` deals the sections out by
+# it, so CI runs the suite in parts side by side that end together. A section not listed
+# counts as 5 s (sso_flow and sso_pg came after that run: their 15 and 20 are guesses).
+SECS = {"memory": 240, "waits": 99, "sso": 89, "stopped": 87, "guesses": 45, "backpressure": 39,
+        "functions": 38, "server": 34, "doors": 33, "crash": 32, "kafkas": 31, "finals": 28, "pace": 27,
+        "found": 23, "clouds": 21, "kafka": 21, "load": 20, "live": 17, "refreshed": 15, "sso_flow": 15, "sso_pg": 20,
+        "users": 14, "workspace": 14, "reader": 13, "scale": 12, "sealed": 12, "answers_big": 11,
+        "cursors": 11, "find": 11, "history": 11, "objects": 11, "procedures": 11, "sessions": 11,
+        "files": 10, "followers": 10, "guarded": 10, "begin": 9, "bykey": 9, "clients": 9, "flows": 9,
+        "guard": 9, "hot": 9, "schemas": 9, "temps": 9, "catalogs": 8, "clusters": 8, "columns": 8,
+        "fills": 8, "serverless": 8, "alter": 7, "fence": 7, "loads": 7, "safety": 7, "sequences": 7,
+        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, sso_flow, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -18299,7 +18887,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "memorylake"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -18312,7 +18900,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "memorylake": memorylake}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

@@ -1,19 +1,21 @@
 name: build
 
 # Every push to main: Pondra built as it is released (the dist profile; Linux against glibc 2.17,
-# with zig, so it runs on any Linux from 2014 on) for all five platforms, tried there (smoke.py),
-# packaged for pip and npm and alone for the one-line installers (tools/package.py), and the
-# packages installed and tried as users get them (tools/try_packages.sh). The website is built as
-# `pages.yml` publishes it (a pull request's when it changes `site/` or `brand/`). linux-x64 is built
-# first, on its own, and the suite then runs on its binary in parts side by side, with the tests
-# that need only it (upgrade, resilience, sharing), while the other platforms finish (the slowest,
-# macOS Intel, holds up none of them).
+# with zig, so it runs on any Linux from 2014 on), tried there (smoke.py), packaged for pip and npm
+# and alone for the one-line installers (tools/package.py), and the packages installed and tried as
+# users get them (tools/try_packages.sh): linux-x64, linux-arm64, macOS arm64 and Windows, and macOS
+# Intel too on a version commit (the one a release tags) or a run started by hand. The website is
+# built as `pages.yml` publishes it (a pull request's when it changes `site/` or `brand/`). linux-x64
+# is built first, on its own, and the suite then runs on its binary in parts side by side, with the
+# tests that need only it (upgrade, resilience, sharing, sso), while the other platforms finish.
 # A tag's release (release.yml) publishes this run's packages: nothing is built twice, and what
 # the suite tested is what ships. A pull request's push runs nothing (its thread builds and tests
-# where it works), unless the pull request asks: the label `ci` builds linux-x64 with the suite,
-# and `full-ci` every platform but macOS Intel, once before it merges (macOS Intel's build is the
-# slowest by far, 31 to 50 minutes, and is main's alone). Decided from the labels alone, so a
-# push that asks for nothing never waits for a runner to say so; a newer push stops the older run.
+# where it works), unless the pull request asks: the label `ci` builds linux-x64 with the suite, and
+# the pull request merges once that passes (the owner, 2026-10-16). Its other platforms first build
+# on main, and a failure there is said on the pull request (`red`, below) for its lane to fix at
+# once; `full-ci` builds them (but macOS Intel) before the merge, for a change that wants them.
+# Decided from the labels alone, so a push that asks for nothing never waits for a runner to say so;
+# a newer push stops the older run.
 # Four pull requests' runs go at once: a fifth waits, holding no runner, until ci-slots.yml starts it.
 on:
   push:
@@ -33,9 +35,10 @@ jobs:
   # What this run builds. A push to main whose code a pull request's run already built and tested
   # on every platform (the merge changed nothing in it: the branch was up to date with main)
   # builds nothing: release.yml and cluster-bench.yml take that run's packages (tools/ci_build.sh
-  # finds them by the commit's tree). Otherwise main builds all five. A pull request labelled `ci`
-  # builds linux-x64; labelled `full-ci`, all but macOS Intel (so main builds a merge of it again);
-  # with neither, this job and the build are skipped.
+  # finds them by the commit's tree). Otherwise main builds every platform but macOS Intel, and it
+  # too when the push changes Cargo.toml's version or the run was started by hand. A pull request
+  # labelled `ci` builds linux-x64; labelled `full-ci`, all but macOS Intel; with neither, this job
+  # and the build are skipped.
   plan:
     if: >-
       github.event_name != 'pull_request' ||
@@ -53,13 +56,14 @@ jobs:
       resilience: ${{ steps.plan.outputs.resilience }}
       upgrade: ${{ steps.plan.outputs.upgrade }}
       sharing: ${{ steps.plan.outputs.sharing }}
+      sso: ${{ steps.plan.outputs.sso }}
       deploy: ${{ steps.plan.outputs.deploy }}
       wait: ${{ steps.plan.outputs.wait }}
       site: ${{ steps.plan.outputs.site }}
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 2 # (a pull request's merge commit and its base: the files it changes, with no API call)
+          fetch-depth: 2 # (a commit and its parent: the files it changes, with no API call)
       - id: plan
         env:
           GH_TOKEN: ${{ github.token }}
@@ -74,31 +78,41 @@ jobs:
             {"platform": "macos-x64", "os": "macos-15-intel", "target": "x86_64-apple-darwin"},
             {"platform": "macos-arm64", "os": "macos-latest", "target": "aarch64-apple-darwin"},
             {"platform": "windows-x64", "os": "windows-latest", "target": "x86_64-pc-windows-msvc", "exe": ".exe"}]'
-          if [ "$GITHUB_EVENT_NAME" = push ]; then
-            run=$(bash tools/ci_build.sh "$GITHUB_SHA")
-            echo "run=$run" >> "$GITHUB_OUTPUT"
-            if [ -n "$run" ]; then echo "Built and tested already: https://github.com/$GITHUB_REPOSITORY/actions/runs/$run" >> "$GITHUB_STEP_SUMMARY"; fi
-          fi
-          if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`). Before merging, the label \`full-ci\` builds the other platforms but macOS Intel (main's alone)." >> "$GITHUB_STEP_SUMMARY"; fi
+          # macOS Intel, the slowest build by far (101 minutes on main's run 650), only where a
+          # release needs it: a push that changes Cargo.toml's version (the commit a release tags), or a
+          # run started by hand (release.yml starts one on a tag of any other commit).
+          intel=false
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || { [ "$GITHUB_EVENT_NAME" = push ] && git diff HEAD^1 HEAD -- Cargo.toml | grep -q '^+version = '; }; then intel=true; fi
           # (linux-x64 apart: the suite and the tests after the build start once it is built, and
           # never wait for the slowest platform)
           echo "linux=$(jq -c '{include: [.[] | select(.platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
-          # (macOS Intel on main alone: a pull request's full-ci waited for it, the slowest by far)
-          echo "others=$(jq -c --arg event "$GITHUB_EVENT_NAME" '{include: [.[] | select(.platform != "linux-x64" and ($event != "pull_request" or .platform != "macos-x64"))]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
+          others=$(jq -c --argjson intel "$intel" '{include: [.[] | select(.platform != "linux-x64" and ($intel or .platform != "macos-x64"))]}' <<< "$platforms")
+          echo "others=$others" >> "$GITHUB_OUTPUT"
           echo "full=$FULL" >> "$GITHUB_OUTPUT"
-          # The tests of what a pull request's run builds, called below once it is built: upgrade
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            # (a run with every package this one would make, `pondra` itself among them)
+            run=$(bash tools/ci_build.sh "$GITHUB_SHA" "$(jq -r '[.include[].platform | "pondra-\(.)"] + ["pondra-linux-x64", "pondra-npm"] | join(" ")' <<< "$others")")
+            echo "run=$run" >> "$GITHUB_OUTPUT"
+            if [ -n "$run" ]; then echo "Built and tested already: https://github.com/$GITHUB_REPOSITORY/actions/runs/$run" >> "$GITHUB_STEP_SUMMARY"; fi
+          fi
+          if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`): the pull request merges once it passes, and main builds the other platforms (the label \`full-ci\` builds them here first, but macOS Intel)." >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ "$FULL" = true ] && [ "$intel" = false ]; then echo "macOS Intel is built on a version commit (the one a release tags) or a run started by hand." >> "$GITHUB_STEP_SUMMARY"; fi
+          # The tests of what this run builds, called below once it is built: deploy's (main, or
+          # `full-ci`: the platforms it tries) when what it tries changes; for a pull request, upgrade
           # always, resilience when what it puts under failure changes, sharing when what it shares,
-          # deploy's (`full-ci`: the platforms it tries) when what it tries changes. (The files from git:
-          # the API's hourly allowance for the repository runs out on a busy day.)
+          # sso when what signs people in. (The files from git: the API's hourly allowance for the
+          # repository runs out on a busy day.)
+          files=$(git diff --name-only HEAD^1 HEAD)
+          if [ "$FULL" = true ] && grep -qE '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)' <<< "$files"; then deploy=true; else deploy=false; fi
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            files=$(git diff --name-only HEAD^1 HEAD)
             if grep -qE '^(src/|Cargo\.(toml|lock)$|python/pondra/client\.py$|js/index\.js$|tools/(resilience_check|faulty_s3|sim_r2|harness)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(resilience|build)\.yml$)' <<< "$files"; then resilience=true; else resilience=false; fi
             if grep -qE '^(src/(shares|sharing|vend|read_delta|delta|ext|scan|audit|server)\.rs$|tools/(sharing_check|sim_r2)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sharing|build)\.yml$)' <<< "$files"; then sharing=true; else sharing=false; fi
-            if [ "$FULL" = true ] && grep -qE '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)' <<< "$files"; then deploy=true; else deploy=false; fi
+            if grep -qE '^(src/(sso|sso_flow|users|auth|pg|flight|kafka)\.rs$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)' <<< "$files"; then sso=true; else sso=false; fi
             if grep -qE '^(site/|brand/|\.github/workflows/(build|pages)\.yml$)' <<< "$files"; then site=true; else site=false; fi
             echo "site=$site" >> "$GITHUB_OUTPUT"
-            printf 'upgrade=true\nresilience=%s\nsharing=%s\ndeploy=%s\n' "$resilience" "$sharing" "$deploy" >> "$GITHUB_OUTPUT"
-            echo "After the build: upgrade$([ "$resilience" = false ] || echo ', resilience')$([ "$sharing" = false ] || echo ', sharing')$([ "$deploy" = false ] || echo ', deploy')." >> "$GITHUB_STEP_SUMMARY"
+            printf 'upgrade=true\nresilience=%s\nsharing=%s\nsso=%s\n' "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
+            echo "After the build: upgrade$([ "$resilience" = false ] || echo ', resilience')$([ "$sharing" = false ] || echo ', sharing')$([ "$sso" = false ] || echo ', sso')$([ "$deploy" = false ] || echo ', deploy')." >> "$GITHUB_STEP_SUMMARY"
             # At most four pull requests' CI at once (two from 2026-10-03; four from 2026-10-11, for the
             # month's eight lanes; ci-slots.yml's SLOTS says the same): with four older runs of other
             # pull requests going, this one waits. It builds nothing, its check `waiting for a
@@ -222,7 +236,8 @@ jobs:
           name: pondra-npm
           path: dist/pondra-[0-9]*.tgz
 
-  # The other platforms (main; `full-ci` all but macOS Intel), with the same steps.
+  # The other platforms (main, macOS Intel only on a version commit or by hand; `full-ci` all but
+  # macOS Intel), with the same steps.
   build:
     needs: plan
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' && needs.plan.outputs.full == 'true' }}
@@ -259,14 +274,17 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }} # (main's caches only, as the build's)
       - run: python3 tools/per_node_check.py # (a node leaves nothing of itself in its process: the source alone, ADR-061)
-      - run: cargo test --release --lib
-      - run: cargo test --release --test node_twice --test node_library # (a node in a host's process: two lakes one after the other, and the library's four checks)
+      # The crate's unit tests, and a node in a host's process (two lakes one after the other, and
+      # the library's four checks). One command, so the crate's two builds (for its own tests, and
+      # for the other two) compile side by side: two commands built them one after the other, 9.6
+      # and then 14.3 minutes on main's run 650.
+      - run: cargo test --release --lib --test node_twice --test node_library
 
-  # The suite, on linux-x64's very binary, in three parts side by side: the quick correctness suite
+  # The suite, on linux-x64's very binary, in four parts side by side: the quick correctness suite
   # (upserts, split brain, crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on
-  # GCS and Azure, scale, Flight…) in two halves (`harness.py all --shard`), and frames against
-  # Polars, the console in Chromium, every example on the website, then a cluster losing its leader
-  # twice.
+  # GCS and Azure, scale, Flight…) in three, each section dealt by its measured time
+  # (`harness.py all --shard`), and frames against Polars, the console in Chromium, every example
+  # on the website, then a cluster losing its leader twice.
   suite:
     needs: [plan, linux]
     if: ${{ !cancelled() && needs.linux.result == 'success' }}
@@ -275,8 +293,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { part: "harness, first half", shard: "1/2" }
-          - { part: "harness, second half", shard: "2/2" }
+          - { part: "harness, 1 of 3", shard: "1/3" }
+          - { part: "harness, 2 of 3", shard: "2/3" }
+          - { part: "harness, 3 of 3", shard: "3/3" }
           - { part: "frames, console, docs, failover" }
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -305,7 +324,7 @@ jobs:
         with:
           path: ~/kafka_2.13-4.3.1
           key: kafka_2.13-4.3.1
-      - name: harness.py all, this half
+      - name: harness.py all, this part
         if: matrix.shard
         run: |
           npm install -g azurite   # (Azure's emulator: harness.py clouds)
@@ -358,6 +377,11 @@ jobs:
     if: ${{ !cancelled() && needs.linux.result == 'success' && needs.plan.outputs.sharing == 'true' }}
     permissions: { actions: read, contents: read }
     uses: ./.github/workflows/sharing.yml
+  sso:
+    needs: [plan, linux]
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.plan.outputs.sso == 'true' }}
+    permissions: { actions: read, contents: read }
+    uses: ./.github/workflows/sso.yml
   deploy:
     needs: [plan, linux, build]
     if: ${{ !cancelled() && needs.linux.result == 'success' && needs.build.result == 'success' && needs.plan.outputs.deploy == 'true' }}
@@ -365,3 +389,27 @@ jobs:
     uses: ./.github/workflows/deploy-check.yml
     with:
       from_run: true
+
+  # A push to main whose run failed: the failed jobs named on the pull request it came from, where
+  # its lane looks, so a platform that only main builds (the pull request merged on Linux alone) is
+  # fixed at once, by whoever merged it. Also in the run's summary, and as an error.
+  red:
+    needs: [plan, site, linux, build, unit, suite, resilience, upgrade, sharing, sso, deploy]
+    if: ${{ always() && github.event_name == 'push' && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          r=$GITHUB_REPOSITORY
+          failed=$(gh api "repos/$r/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" --jq '.jobs[] | select(.conclusion == "failure") | "- [\(.name)](\(.html_url))"')
+          body=$(printf "Main's build of this merge (%s) failed:\n\n%s\n\nThe lane that merged it fixes this next, before other work: a pull request merges on Linux's CI alone, and main builds the other platforms.\n" "${GITHUB_SHA:0:7}" "$failed")
+          echo "$body" >> "$GITHUB_STEP_SUMMARY"
+          pr=$(gh api "repos/$r/commits/$GITHUB_SHA/pulls" --jq '.[0].number // empty' || true)
+          if [ -n "$pr" ]; then gh api "repos/$r/issues/$pr/comments" -f body="$body" > /dev/null && echo "Said on #$pr."; fi
+          echo "::error title=main is red::$(tr '\n' ' ' <<< "$failed")"

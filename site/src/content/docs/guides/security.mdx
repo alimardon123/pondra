@@ -309,6 +309,10 @@ pondra.connect("http://localhost:8086", token=token).sql("SELECT name FROM salar
 [{'name': 'ann'}, {'name': 'bob'}]
 ```
 
+People may also sign in with the company's account instead of a password: add its identity provider
+(Okta, Entra ID, Google, Keycloak), and its tokens sign them in at every door. See
+[single sign-on](/pondra/guides/single-sign-on/).
+
 Once a user who signs in exists, a node with no tokens set refuses whoever doesn't sign in, too.
 Listings show a user what it may read: `information_schema.tables`, `pondra.tables`, the console's
 Data tree. A stream of a table's rows (Kafka, Flight's log, `/watch`, a key lookup, another engine

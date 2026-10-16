@@ -1,7 +1,7 @@
 # A soak (C4, ADR-039): a cluster on one runner under steady ingest for hours, a node stopped or
 # killed now and then, its memory, log, commits and objects on a timeline (tools/soak.py). Started
 # by hand (Actions → soak → Run workflow), or by the label `soak` on a pull request: a day on R2
-# with the build of its head (five legs of 4.8 hours; the pull request's full-ci run must have
+# with the build of its head (five legs of 4.8 hours; the pull request's `ci` run must have
 # passed). A runner's job lasts 6 hours at most, so a longer soak is legs (soak-leg.yml), one after
 # another on one lake in the bucket: the lake lives the whole day, each node process a leg at most.
 # A day's legs stop and kill nodes, but its last, which stops none: a node process then lives 4.8

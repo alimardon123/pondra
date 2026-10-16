@@ -828,6 +828,31 @@ SELECT * FROM secrets();
 DROP SECRET sales;
 ```
 
+## Identity providers
+
+A company's sign-in (OpenID Connect), whose tokens sign people in at every door. Only a superuser (or the admin
+token) runs these. See [single sign-on](/pondra/guides/single-sign-on/).
+
+| Statement | Syntax |
+|---|---|
+| Add one | `CREATE [OR REPLACE] IDENTITY PROVIDER [IF NOT EXISTS] name (ISSUER '…', CLIENT_ID '…' [, option …])`; the issuer is asked for its keys first |
+| Change one | `CREATE OR REPLACE IDENTITY PROVIDER` with every option again (`ALTER` is refused) |
+| Drop one | `DROP IDENTITY PROVIDER [IF EXISTS] name`: the sessions it made end at once |
+| Describe | `COMMENT ON IDENTITY PROVIDER name IS '…'`; `SELECT * FROM pondra.objects WHERE kind = 'identity provider'` (a superuser's); `GET /sso` lists each one's name, label and issuer |
+
+| Option | Default | Meaning |
+|---|---|---|
+| `ISSUER '…'` | (required) | the provider's issuer, exactly as its tokens' `iss` say it; `https`, or `http` on this machine |
+| `CLIENT_ID '…'` | (required) | Pondra's application at the provider: the console's sign-in, and an audience tokens may carry |
+| `SECRET 'name'` | none | a [secret](#files-and-secrets) holding the client's secret (`CREATE SECRET name (TYPE generic, CLIENT_SECRET '…')`) |
+| `AUDIENCE ('…', …)` | none | other audiences its tokens may carry: drivers', services' |
+| `USER_CLAIM '…'` | `email` | the claim naming the user (lower-cased); with `email`, an `email_verified` of false is refused |
+| `ROLES_CLAIM '…'` | none | a claim whose values are roles here, for that sign-in: a list, words in a string, or a path (`realm_access.roles`) |
+| `USERS 'listed' \| 'any'` | `listed` | only users made here (`CREATE USER "ana@acme.com"`), or anyone the provider vouches for, with `public`'s grants and the claimed roles |
+| `SCOPES '…'` | `openid email profile` | what a sign-in asks the provider for |
+| `LABEL '…'` | the name | the console's "Sign in with …" button |
+| `POSTGRES 'password' \| 'oauth'` | `password` | how the Postgres port asks a user with no password: for the token as a password, or for OAuth (`OAUTHBEARER`, psql 18's `oauth_issuer` and `oauth_client_id`) |
+
 ## Shares and recipients
 
 A share hands tables to another company through the Delta Sharing protocol: they read the files with their

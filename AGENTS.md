@@ -2178,6 +2178,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the key written. Spark's `DIV` drops the fraction before its cast (`sparksql`). `harness.py found`:
    "a cast of a decimal to an integer rounds…"; `pkey`: "a MERGE that compares a key in another
    type…" (a MERGE wrote 7002.5 as 7002, an INSERT as 7003).
+294. **A loop a lake starts holds it weakly** (`Lake::commits`, `Hot::watch`): the catalog's writes and
+   their durability upgrade a `Weak<Lake>` for each write, the hot columns' watch a `Weak<Hot>` each
+   round, and each ends when what it holds is gone. The writes' sender is the lake's own
+   (`Catalog::writes`), so a loop holding the lake strongly kept a lake a process opened to write (a
+   backup taken in it: `backup::take_here`) for the process's life, its catalog never closed.
+   `cargo test --lib store::tests::a_lake_opened_to_write_goes`.
 295. **SQL answers with the optimizer off** (`optimize::Runnable`, the last analyzer rule): under
    `datafusion.optimizer.max_passes = 0` every scalar function is replaced by what its simplifier
    makes of it, as the optimizer would. `arrow_cast`, `coalesce` and `nvl2` run only as that CAST or
@@ -2816,8 +2822,12 @@ failover on its own binary, and dry-runs the release's npm publish (`tools/npm_p
 run, refuses one that failed or a tag that isn't Cargo.toml's version, and publishes the run's
 packages (a minute or two). `cluster-bench.yml`'s default binary (`ci`) is that run's too.
 A pull request's push runs CI only when the pull request is labelled: `ci` builds linux-x64 with
-the suite, `full-ci` all five platforms with deploy.yml; add `full-ci` once before merging, and
-never turn on auto-merge before that run starts. Main builds all five on every push.
+the suite and the tests after it, and a pull request merges once that passes (the owner,
+2026-10-16); `full-ci` adds the other platforms but macOS Intel, for a change that wants them
+first. Main builds every platform but macOS Intel on every push (macOS Intel on a version commit,
+which a release tags, or by hand), with deploy.yml when what it tries changes; a platform that
+fails there is commented on the pull request it came from, and that lane fixes it at once. Never
+turn on auto-merge before its run starts.
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
 

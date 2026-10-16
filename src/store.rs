@@ -832,7 +832,7 @@ impl Lake {
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
-            crate::panics::spawn(lake.clone().commits(writes));
+            crate::panics::spawn(Lake::commits(Arc::downgrade(&lake), writes)); // (weak: a lake opened in a process goes when its last handle does)
         }
         Ok(lake)
     }
@@ -842,22 +842,26 @@ impl Lake {
     /// `replicas - 1` member followers hold it, whichever comes first. It reaches the bucket a
     /// moment later either way. A write that fails to reach the bucket (a newer leader fenced
     /// us out) has an unknown outcome: restart and rejoin; the restart reloads the state.
-    async fn commits(self: Arc<Self>, mut writes: mpsc::UnboundedReceiver<Write>) {
+    /// Both loops hold the lake weakly: the writes' sender is the lake's own (`Catalog::writes`), so
+    /// a strong hold would keep a lake opened in a process (a backup taken in it) for ever.
+    async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>) {
         let (to_bucket, mut in_bucket) = mpsc::unbounded_channel::<(Arc<WriteHandle>, u64)>();
-        let lake = self.clone();
+        let lake = me.clone();
         crate::panics::spawn(async move {
             while let Some((handle, id)) = in_bucket.recv().await {
                 if let Err(e) = handle.await_durable().await {
                     eprintln!("catalog commit failed: {e}");
                     crate::cluster::restart("a catalog commit failed");
                 }
+                let Some(lake) = lake.upgrade() else { return };
                 lake.cat.durable.send_replace(id);
                 lake.cat.send(Frame::Durable(id));
             }
         });
-        let cat = &self.cat;
-        let need = cat.replicas.saturating_sub(1);
         while let Some((handle, d, done)) = writes.recv().await {
+            let Some(lake) = me.upgrade() else { return };
+            let cat = &lake.cat;
+            let need = cat.replicas.saturating_sub(1);
             if need > 0 {
                 cat.send(Frame::Change(d.clone())); // followers keep it and say so
             }
@@ -2332,6 +2336,27 @@ mod tests {
         assert!(cat.write(vec![("t/b".into(), b"2".to_vec())], &[]).await.is_err());
         assert!(cat.get_raw("d/1").await.is_err());
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A lake a process opens to write (a backup taken in it: `backup::take_here`) is let go with its
+    /// last handle: the loops `Lake::open` starts hold it weakly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lake_opened_to_write_goes_with_its_last_handle() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-dropped-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        lake.cat.commit(vec![("t/a".into(), b"1".to_vec())], &[]).await?;
+        lake.cat.close().await?;
+        let gone = Arc::downgrade(&lake);
+        drop(lake);
+        for _ in 0..100 {
+            if gone.upgrade().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gone.upgrade().is_none(), "the lake is still held");
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }

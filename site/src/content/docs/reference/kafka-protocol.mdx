@@ -297,7 +297,9 @@ keeps asking for the topic's metadata until its timeout.
 With no tokens set and no user who signs in, anyone may connect and do anything. Otherwise a client
 logs in with SASL/PLAIN: a [user](/pondra/guides/security/#users-roles-and-grants) with its password
 (or one of its tokens), or `reader`, `writer` or `admin` with that role's token, as for
-[Postgres](/pondra/reference/postgres/#connect). A `reader` may consume and not produce; a user
+[Postgres](/pondra/reference/postgres/#connect). With an [identity provider](/pondra/guides/single-sign-on/), a
+client logs in with SASL/OAUTHBEARER and the provider's token (librdkafka's `sasl.oauthbearer.method=oidc`), or
+with PLAIN and the token as the password. A `reader` may consume and not produce; a user
 produces to a table it has INSERT on, and consumes one it may read every column of. A client that does not log in, or logs in with a wrong password, cannot connect: its
 first request is refused and the connection closes. Use `SASL_PLAINTEXT`, or `SASL_SSL` when the node has a certificate ([TLS](/pondra/guides/security/#tls)).
 With a certificate, a client on another machine must use TLS (`SASL_SSL`, or `SSL` on a node nobody signs

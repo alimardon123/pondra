@@ -804,10 +804,13 @@ fn stamp_file(d: &mut DataFile, seg: u64, ms: u64) {
 
 // ---------------------------------------------------------------- encoding
 
-/// Batches as one ZSTD-compressed Arrow IPC stream.
+/// Batches as one Arrow IPC stream, ZSTD-compressed unless they hold under 1 KB of values: a row or
+/// two doesn't compress (Arrow then writes its buffers as they are anyway), and each stream makes a
+/// ZSTD context of its own, which cost a one-row batch 28–45 µs against 3–5 µs written plain.
 pub fn encode_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let mut buf = vec![];
-    let opts = IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD))?;
+    let values: usize = batches.iter().flat_map(|b| b.columns()).map(|c| c.to_data().get_slice_memory_size().unwrap_or(usize::MAX)).fold(0, usize::saturating_add);
+    let opts = IpcWriteOptions::default().try_with_compression((values >= 1024).then_some(CompressionType::ZSTD))?;
     let mut w = StreamWriter::try_new_with_options(&mut buf, &batches[0].schema(), opts)?;
     for b in batches {
         w.write(&crate::query::compact(b.clone()))?;
@@ -824,4 +827,33 @@ pub fn decode(ipc: &[u8]) -> Result<Vec<RecordBatch>> {
 
 pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+
+    #[test]
+    fn a_row_or_two_is_written_plain_and_more_compressed() {
+        let rows = |n: i64| RecordBatch::try_from_iter([("k", Arc::new(Int64Array::from_iter_values(0..n)) as ArrayRef), ("s", Arc::new(StringArray::from_iter_values((0..n).map(|_| "x".repeat(22)))) as ArrayRef)]).unwrap();
+        for (n, plain) in [(1, true), (1000, false)] {
+            let b = rows(n);
+            let ipc = encode_ipc(std::slice::from_ref(&b)).unwrap();
+            assert_eq!(decode(&ipc).unwrap(), vec![b.clone()]);
+            assert_eq!(ipc.len() == crate::query::ipc(std::slice::from_ref(&b)).unwrap().len(), plain, "{n} rows");
+        }
+        let one = rows(1);
+        let zstd = || {
+            let mut w = StreamWriter::try_new_with_options(vec![], &one.schema(), IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD)).unwrap()).unwrap();
+            w.write(&one).unwrap();
+            w.finish().unwrap();
+            w.into_inner().unwrap()
+        };
+        let t0 = std::time::Instant::now();
+        (0..1000).for_each(|_| drop(zstd()));
+        let t1 = std::time::Instant::now();
+        (0..1000).for_each(|_| drop(encode_ipc(std::slice::from_ref(&one))));
+        eprintln!("a one-row batch: {:.1} µs with ZSTD ({} bytes), {:.1} µs as written ({} bytes)", (t1 - t0).as_secs_f64() * 1e3, zstd().len(), t1.elapsed().as_secs_f64() * 1e3, encode_ipc(std::slice::from_ref(&one)).unwrap().len());
+    }
 }
