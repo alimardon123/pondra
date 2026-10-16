@@ -92,15 +92,7 @@ pub fn strict(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
     Ok(datafusion::arrow::compute::cast_with_options(&c, t, &options)?)
 }
 
-/// A time of day without seconds (`'2024-05-01 10:30'`, `'…T10:30+02'`), with them (`10:30:00`):
-/// Postgres, DuckDB, Snowflake and Spark read the first as the second; Arrow's parser wants the
-/// seconds. None: `s` is something else, left as it is.
-pub fn seconds(s: &str) -> Option<String> {
-    static HHMM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"^(\s*\d{4}-\d{1,2}-\d{1,2}[T ]\d{1,2}:\d{2})(\s*(?:[Zz]|[+-]\d{1,2}(?::?\d{2})?|[A-Za-z][\w/+-]*)?\s*)$").expect("a regex")
-    });
-    HHMM.captures(s).map(|c| format!("{}:00{}", &c[1], &c[2]))
-}
+pub use crate::optimize::seconds;
 
 /// Text meant as timestamps, the ones without seconds given them (`seconds`).
 fn with_seconds(c: &ArrayRef) -> Result<ArrayRef> {

@@ -13,6 +13,8 @@ pub mod casts;
 pub mod intervals;
 pub mod xlsx;
 pub mod answer;
+mod asof;
+mod optimize;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
 // Feature `server`, on by default; every module the node is made of is one of these.
@@ -25,7 +27,6 @@ pub mod answer;
 #[cfg(feature = "server")] mod branch;
 #[cfg(feature = "server")] mod bridge;
 #[cfg(feature = "server")] mod rerun;
-#[cfg(feature = "server")] mod asof;
 #[cfg(feature = "server")] mod auth;
 #[cfg(feature = "server")] mod budget;
 #[cfg(feature = "server")] mod cache;
@@ -82,7 +83,6 @@ pub mod answer;
 #[cfg(feature = "server")] mod metrics;
 #[cfg(feature = "server")] pub mod node;
 #[cfg(feature = "server")] pub mod library;
-#[cfg(feature = "server")] mod optimize;
 #[cfg(feature = "server")] mod pages;
 #[cfg(feature = "server")] mod panics;
 #[cfg(feature = "server")] mod past;

@@ -31,6 +31,7 @@ use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, Partiti
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties, InputDistributionRequirements, PlanProperties};
 use futures::{StreamExt, TryStreamExt};
+#[cfg(feature = "server")]
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -43,6 +44,7 @@ type Expr = Arc<dyn PhysicalExpr>;
 
 /// The SQL with each `ASOF JOIN … MATCH_CONDITION (…) [ON …]` turned into a LEFT JOIN on its
 /// keys whose condition carries the marker; as it was if it has none.
+#[cfg(feature = "server")]
 pub fn rewrite(sql: &str) -> anyhow::Result<Cow<'_, str>> {
     Ok(match as_of(sql)? {
         Cow::Borrowed(s) => crate::sys::hide(s), // (and `*` without the system columns)
@@ -51,6 +53,7 @@ pub fn rewrite(sql: &str) -> anyhow::Result<Cow<'_, str>> {
 }
 
 /// `rewrite`, leaving `*` as it is (for a query `sys::hide` couldn't place its EXCLUDE in).
+#[cfg(feature = "server")]
 pub fn as_of(sql: &str) -> anyhow::Result<Cow<'_, str>> {
     use datafusion::sql::sqlparser::{ast::*, dialect::GenericDialect, parser::Parser};
     use std::ops::ControlFlow;
