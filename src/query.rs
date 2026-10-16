@@ -5,9 +5,9 @@
 //! of each key (sum, min, max).
 use crate::store::*;
 use anyhow::{bail, Result};
-use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, UInt64Array, UnionArray};
+use datafusion::arrow::array::{ArrayRef, Int64Array, UInt64Array};
 use datafusion::common::Column;
-use datafusion::logical_expr::{ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
+use datafusion::logical_expr::Expr;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{MemTable, TableProvider};
@@ -842,32 +842,6 @@ pub fn take_held() -> Option<MemoryReservation> { HELD.try_with(|h| h.borrow_mut
 
 pub use crate::answer::{compact, ipc, type_name};
 
-/// `pondra_json_text(x)`: a union (what `json_get` answers: a number, a string, a list…) as the text
-/// of its value, which `->>` gives too. JSON, CSV, Parquet and the Postgres port can't write a union.
-static JSON_TEXT: std::sync::LazyLock<Arc<ScalarUDF>> = std::sync::LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(JsonText(Signature::any(1, Volatility::Immutable)))));
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct JsonText(Signature);
-
-impl ScalarUDFImpl for JsonText {
-    fn name(&self) -> &str { "pondra_json_text" }
-    fn signature(&self) -> &Signature { &self.0 }
-    fn return_type(&self, _: &[DataType]) -> datafusion::error::Result<DataType> { Ok(DataType::Utf8) }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        use datafusion::arrow::array::Array;
-        let array = args.args[0].to_array(args.number_rows)?;
-        let Some(union) = array.as_any().downcast_ref::<UnionArray>() else {
-            return Err(datafusion::error::DataFusionError::Execution("pondra_json_text takes a union".into()));
-        };
-        Ok(ColumnarValue::Array(Arc::new(union_text(union)?)))
-    }
-}
-
-/// Registers `pondra_json_text` in a session (`store.rs`, `made`).
-pub fn register_json_text(ctx: &SessionContext) {
-    ctx.register_udf(JSON_TEXT.as_ref().clone());
-}
-
 /// A query's union columns planned as their text: every door plans through `sql`, so its schema,
 /// its rows and a table made of it all say Utf8. A query with no union column is returned as it is.
 fn text_unions(df: datafusion::dataframe::DataFrame) -> datafusion::error::Result<datafusion::dataframe::DataFrame> {
@@ -880,38 +854,12 @@ fn text_unions(df: datafusion::dataframe::DataFrame) -> datafusion::error::Resul
         .map(|(qualifier, f)| {
             let column = Expr::Column(Column::from((qualifier, f)));
             match f.data_type() {
-                DataType::Union(..) => JSON_TEXT.call(vec![column]).alias_qualified(qualifier.cloned(), f.name()), // (a join's two of one name stay two)
+                DataType::Union(..) => crate::engine::JSON_TEXT.call(vec![column]).alias_qualified(qualifier.cloned(), f.name()), // (a join's two of one name stay two)
                 _ => column,
             }
         })
         .collect();
     df.select(exprs)
-}
-
-/// One union column's text: each row's value in the child its type id selects, NULL where that
-/// value is NULL or the child is of type Null. Sparse and dense unions alike (`value_offset`).
-fn union_text(u: &UnionArray) -> datafusion::arrow::error::Result<StringArray> {
-    use datafusion::arrow::array::Array;
-    use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
-    use std::collections::{hash_map::Entry, HashMap};
-    let options = FormatOptions::default();
-    let mut formats: HashMap<i8, ArrayFormatter<'_>> = HashMap::new(); // (one per child, made when first asked)
-    let mut out: Vec<Option<String>> = Vec::with_capacity(u.len());
-    for i in 0..u.len() {
-        let id = u.type_id(i);
-        let child = u.child(id);
-        let at = u.value_offset(i);
-        if child.data_type() == &DataType::Null || child.is_null(at) {
-            out.push(None);
-            continue;
-        }
-        let format = match formats.entry(id) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(v) => v.insert(ArrayFormatter::try_new(child.as_ref(), &options)?),
-        };
-        out.push(Some(format.value(at).to_string()));
-    }
-    Ok(StringArray::from(out))
 }
 
 /// An Arrow IPC stream's batches (none for no bytes).

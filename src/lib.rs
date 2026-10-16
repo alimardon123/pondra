@@ -13,6 +13,7 @@ pub mod casts;
 pub mod intervals;
 pub mod xlsx;
 pub mod answer;
+pub mod engine;
 mod asof;
 mod optimize;
 
