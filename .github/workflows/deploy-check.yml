@@ -7,9 +7,10 @@ name: deploy check
 # Scoop's and winget's manifests (tools/distribute.py), and signing with a certificate made for the
 # run (tools/sign.py).
 #
-# build.yml calls it once a `full-ci` pull request's build is done and what it tries changes: the
-# packages are that run's own, so nothing waits for them. deploy.yml calls it on a tag (and by
-# hand), before it publishes: the packages are that commit's build run's (tools/ci_artifact.sh).
+# build.yml calls it once main's build, or a `full-ci` pull request's, is done and what it tries
+# changes: the packages are that run's own, so nothing waits for them. deploy.yml calls it on a tag
+# (and by hand), before it publishes: the packages are that commit's build run's
+# (tools/ci_artifact.sh).
 # Read-only either way: publishing is deploy.yml's, on a tag alone.
 on:
   workflow_call:

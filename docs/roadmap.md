@@ -82,7 +82,8 @@ keeps that list, each finding goes to the lane owning its files, and a limit kep
 user meets it. On 10-31 every row not proven and every finding still open is listed for the owner.
 
 **Every pull request:** its lane's files only (shared files take additions, not edits); `ci` while
-iterating and `full-ci` once before merging; the gates (`tools/gates.py`) hold or improve; an engine
+iterating, and it merges once that passes (main builds the other platforms, and a red one there is
+its lane's to fix at once); the gates (`tools/gates.py`) hold or improve; an engine
 or read-path change keeps TPC-H's 22 and TPC-DS's 99 answers and is no slower; a new feature works
 from every door or is refused by name; a one-page review; its ADR when it is a design.
 
