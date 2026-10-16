@@ -444,7 +444,8 @@ pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn
 }
 
 /// Could `sql` name a type of one's own, in a cast or one of the enum functions? (Only then is
-/// it parsed for one: the built-in types' names are left alone.)
+/// it parsed for one: the built-in types' names are left alone.) A call of a JSON maker is parsed too:
+/// `pg_types::rewrite` reads its arguments (`makes_json`).
 pub fn wanted(sql: &str) -> bool {
     static SET_FUNCTION: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\b(generate_series|range|unnest)\s*\(").expect("a regex"));
     if SET_FUNCTION.is_match(sql) {
@@ -454,7 +455,7 @@ pub fn wanted(sql: &str) -> bool {
     const BUILT_IN: &[&str] = &["int", "integer", "bigint", "smallint", "tinyint", "int2", "int4", "int8", "hugeint", "ubigint", "uinteger", "usmallint", "utinyint", "float", "float4",
         "float8", "real", "double", "decimal", "numeric", "dec", "text", "varchar", "char", "character", "string", "bpchar", "bool", "boolean", "date", "time", "timestamp", "timestamptz",
         "datetime", "interval", "json", "jsonb", "uuid", "bytea", "blob", "binary", "varbinary", "bytes", "regclass", "regtype", "regproc", "regnamespace", "oid", "name", "variant", "bit"];
-    NAMED.captures_iter(sql).any(|c| match (c.get(1), c.get(2)) {
+    crate::pg_types::makes_json(sql) || NAMED.captures_iter(sql).any(|c| match (c.get(1), c.get(2)) {
         _ if c.get(3).is_some() => c.get(3).is_some_and(|s| !is_uuid(s.as_str())), // (`'A0EE…'`: read as a uuid where one is compared with it or written into one)
         (None, _) => true, // (enum_range(…), pg_typeof(…))
         (Some(_), Some(_)) => true,
@@ -472,7 +473,7 @@ pub fn wanted(sql: &str) -> bool {
 pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
     let mut read = false;
     for s in stmts.iter_mut() {
-        read |= crate::pg_types::rewrite(lake, s).await; // (strings read as uuids, pg_typeof)
+        read |= crate::pg_types::rewrite(lake, s).await?; // (strings read as uuids, pg_typeof, JSON makers' arguments)
     }
     for s in stmts.iter_mut() {
         read |= crate::lateral::functions(s)?; // (`generate_series(1, t.n)` in a FROM: a LATERAL subquery it can plan)

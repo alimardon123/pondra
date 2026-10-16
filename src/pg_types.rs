@@ -14,12 +14,56 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::sql::sqlparser::ast::{self, Expr, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value, VisitMut, WildcardAdditionalOptions};
+use datafusion::sql::sqlparser::ast::{self, Expr, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value, Visit, VisitMut, WildcardAdditionalOptions};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 
+use crate::codes::coded;
 use crate::pg_names;
 use crate::store::{table_key, Lake};
 use crate::write::{ident, object};
+
+/// The JSON makers: the functions that make JSON from values (`pg_json_make.rs`). A statement that calls one has its
+/// arguments changed where SQL comes in (`rewritten`): a JSON argument is marked as its type prints it, a whole row is
+/// made of its columns, and an aggregate is `pondra_json_agg` over `array_agg`. `makes_json` is the check that lets a
+/// statement without one pass.
+const MAKERS: &[&str] = &["to_json", "to_jsonb", "row_to_json", "json_build_object", "jsonb_build_object", "json_build_array",
+    "jsonb_build_array", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg"];
+
+/// Whether `sql` calls a JSON maker (`MAKERS`), as a name followed by `(`. Only a statement with one has its arguments traced.
+pub fn makes_json(sql: &str) -> bool {
+    static CALL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(&format!(r"(?i)\b(?:{})\s*\(", MAKERS.join("|"))).expect("a regex"));
+    CALL.is_match(sql)
+}
+
+/// What a maker's argument is, for the JSON it writes. A whole row is `Row`, a JSON value `Json` (wrapped as its type prints
+/// it), anything else `Value`. An aggregate's elements are written by it: `json` and `row` elements are JSON text already.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Kind {
+    Json,
+    Row,
+    Value,
+}
+
+impl Kind {
+    /// The kind's name as `pondra_json_agg` reads it.
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Json => "json",
+            Kind::Row => "row",
+            Kind::Value => "value",
+        }
+    }
+}
+
+/// A relation an argument names as a whole row: the name its columns are qualified by, and its columns.
+struct Whole {
+    name: String,
+    cols: Cols,
+}
+
+/// The first character of an item's name when the item has no name of its own (an expression, which Postgres names by
+/// its function or gives `?column?`). No identifier holds a NUL, so a lookup never finds such a name; the text follows it.
+const UNNAMED: char = '\0';
 
 /// The field metadata that marks an answer's uuid column: the port reads it, other doors pass it by.
 pub const MARK: &str = "pg_type";
@@ -152,11 +196,12 @@ pub async fn params(lake: &Lake, sql: &str) -> Vec<usize> {
 /// finds `a0ee…`, as the column holds it, and `SET id = 'A0EE…'` writes it so), and
 /// `pg_typeof(x)` of one is 'uuid' (the planner sees text). Only for a statement with such a string or
 /// a `pg_typeof`; whether it changed anything.
-pub async fn rewrite(lake: &Lake, stmt: &mut Statement) -> bool {
+pub async fn rewrite(lake: &Lake, stmt: &mut Statement) -> anyhow::Result<bool> {
     let asks = |e: &Expr| matches!(e, Expr::Function(f) if object(&f.name) == "pg_typeof");
     let spelled = |e: &Expr| string(e).is_some_and(|s| !crate::types::is_uuid(s) && crate::types::uuid_of(s).is_ok());
-    if !ast::visit_expressions(stmt, |e| if asks(e) || spelled(e) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }).is_break() {
-        return false; // (nearly every statement)
+    let maker = |e: &Expr| matches!(e, Expr::Function(f) if MAKERS.contains(&object(&f.name).as_str()));
+    if !ast::visit_expressions(stmt, |e| if asks(e) || spelled(e) || maker(e) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }).is_break() {
+        return Ok(false); // (nearly every statement)
     }
     let mut known = Known::new();
     look_up(lake, stmt, &mut known, 0).await;
@@ -164,16 +209,21 @@ pub async fn rewrite(lake: &Lake, stmt: &mut Statement) -> bool {
 }
 
 /// `rewrite`'s work, over the relations `known` describes. What it changes is found by its place in the
-/// statement (`at`), never by its text: `name = 'A0EE…'` beside `id = 'A0EE…'` stays as written.
-fn rewritten(known: &Known, stmt: &mut Statement) -> bool {
+/// statement (`at`), never by its text: `name = 'A0EE…'` beside `id = 'A0EE…'` stays as written. A refusal (a whole
+/// row that can't be made, DISTINCT over json) is found before anything changes.
+fn rewritten(known: &Known, stmt: &mut Statement) -> anyhow::Result<bool> {
     let t = Trace::new(known);
     t.statement(stmt);
+    if let Some(refusal) = t.refused.into_inner() {
+        return Err(refusal);
+    }
     let (asked, compared) = (t.typeof_.into_inner(), t.strings.into_inner());
-    if asked.is_empty() && compared.is_empty() {
-        return false;
+    let (wraps, rows, aggregates) = (t.wraps.into_inner(), t.rows.into_inner(), t.aggregates.into_inner());
+    if asked.is_empty() && compared.is_empty() && wraps.is_empty() && rows.is_empty() && aggregates.is_empty() {
+        return Ok(false);
     }
     // (`pg_typeof(id)` becomes 'uuid', whose own name would be `Utf8("uuid")`: `names_kept` names it as written)
-    names_kept(stmt, |stmt| {
+    Ok(names_kept(stmt, |stmt| {
         let mut changed = false;
         let _ = ast::visit_expressions_mut(stmt, |e| {
             let place = at(e);
@@ -186,11 +236,97 @@ fn rewritten(known: &Known, stmt: &mut Statement) -> bool {
                 *e = Expr::value(Value::SingleQuotedString(to));
                 changed = true;
             }
+            changed |= change_makers(e, place, &wraps, &rows, &aggregates);
             ControlFlow::<()>::Continue(())
         });
         changed
+    }))
+}
+
+/// Changes the expression at `place` as the JSON makers' notes say (`Trace::maker`). A node's children are changed before
+/// the node (`visit_expressions_mut`), so an aggregate's arguments are already: the aggregate is rebuilt, then, at the
+/// same place, wrapped if it is a JSON argument of a maker. A whole row is replaced by `pondra_row`. Whether it changed.
+fn change_makers(e: &mut Expr, place: usize, wraps: &[(usize, Ty)], rows: &[(usize, Whole)], aggregates: &[(usize, Kind)]) -> bool {
+    let mut changed = false;
+    if let Some((_, kind)) = aggregates.iter().find(|(p, _)| *p == place) {
+        *e = aggregate_expr(std::mem::replace(e, Expr::value(Value::Null)), *kind);
+        changed = true;
+    }
+    if let Some((_, whole)) = rows.iter().find(|(p, _)| *p == place) {
+        *e = row_expr(whole);
+        changed = true;
+    }
+    if let Some((_, ty)) = wraps.iter().find(|(p, _)| *p == place) {
+        *e = wrap_json(std::mem::replace(e, Expr::value(Value::Null)), Some(*ty));
+        changed = true;
+    }
+    changed
+}
+
+/// `pondra_row('a', "t"."a", 'b', "t"."b", …)`: a whole row's columns in order, each JSON one as its type prints it.
+fn row_expr(w: &Whole) -> Expr {
+    let args = w.cols.iter().flat_map(|(col, ty)| {
+        let column = Expr::CompoundIdentifier(vec![quoted(&w.name), quoted(col)]);
+        [lit(col), wrap_json(column, *ty)]
+    });
+    call("pondra_row", args.collect())
+}
+
+/// `json_agg(x …)` as `pondra_json_agg(array_agg(x …), 'kind')`, and `json_object_agg(k, v …)` as
+/// `pondra_json_object_agg(array_agg(named_struct('k', k, 'v', v) …), 'kind')`; `jsonb` forms alike. The call's own clauses
+/// (DISTINCT, ORDER BY, FILTER, OVER, IGNORE NULLS) move onto `array_agg`, which holds the elements.
+fn aggregate_expr(e: Expr, kind: Kind) -> Expr {
+    let Expr::Function(mut inner) = e else { return e };
+    let name = object(&inner.name);
+    let object = name.ends_with("object_agg");
+    let outer = format!("pondra_{}{}", if name.starts_with("jsonb") { "jsonb" } else { "json" }, if object { "_object_agg" } else { "_agg" });
+    if let (ast::FunctionArguments::List(list), true) = (&mut inner.args, object) {
+        if let [k, v] = list.args.as_slice() {  // (`Trace::aggregate` asks for a key and a value only)
+            let pair = call("named_struct", vec![lit("k"), arg_expr(k), lit("v"), arg_expr(v)]);
+            list.args = vec![unnamed(pair)];
+        }
+    }
+    inner.name = ObjectName::from(vec![ast::Ident::new("array_agg")]);
+    call(&outer, vec![Expr::Function(inner), lit(kind.name())])
+}
+
+/// A function argument that is an unnamed expression, as the expression (`aggregate_expr` reads only those).
+fn arg_expr(a: &ast::FunctionArg) -> Expr {
+    match a {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => e.clone(),
+        _ => Expr::value(Value::Null),
+    }
+}
+
+/// `e` as a JSON argument of a maker, wrapped in `pondra_as_json` or `pondra_as_jsonb` as its type prints it
+/// (`pg_json_make.rs`): a json column's text is quoted otherwise, and a jsonb one's keys are sorted. Any other `e` as it is.
+fn wrap_json(e: Expr, ty: Option<Ty>) -> Expr {
+    match ty {
+        Some(Ty::Json) => call("pondra_as_json", vec![e]),
+        Some(Ty::Jsonb) => call("pondra_as_jsonb", vec![e]),
+        _ => e,
+    }
+}
+
+/// A call of `name` on `args`, as SQL writes it.
+fn call(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::Function(ast::Function {
+        name: ObjectName::from(vec![ast::Ident::new(name)]),
+        uses_odbc_syntax: false,
+        parameters: ast::FunctionArguments::None,
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList { duplicate_treatment: None, args: args.into_iter().map(unnamed).collect(), clauses: vec![] }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
     })
 }
+
+fn unnamed(e: Expr) -> ast::FunctionArg { ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) }
+
+fn lit(s: &str) -> Expr { Expr::value(Value::SingleQuotedString(s.to_string())) }
+
+fn quoted(s: &str) -> ast::Ident { ast::Ident::with_quote('"', s) }
 
 /// An expression's place in its statement, which tells it from another of the same text.
 fn at(e: &Expr) -> usize { std::ptr::from_ref(e) as usize }
@@ -325,10 +461,20 @@ struct Trace<'a> {
     typeof_: RefCell<Vec<(usize, Ty)>>,
     /// The string literals read as uuids (compared with one, or written into one), by place.
     strings: RefCell<Vec<usize>>,
+    /// The JSON makers' JSON arguments, by place, with their type: each is wrapped as its type prints it.
+    wraps: RefCell<Vec<(usize, Ty)>>,
+    /// The JSON makers' whole-row arguments, by place: each becomes `pondra_row` of its relation's columns.
+    rows: RefCell<Vec<(usize, Whole)>>,
+    /// The JSON makers' aggregates, by place, with their elements' kind: each is rebuilt over `array_agg`.
+    aggregates: RefCell<Vec<(usize, Kind)>>,
+    /// The first refusal the statement earns (`rewritten` returns it before anything changes).
+    refused: RefCell<Option<anyhow::Error>>,
 }
 
 impl<'a> Trace<'a> {
-    fn new(known: &'a Known) -> Self { Trace { known, ctes: Default::default(), params: Default::default(), typeof_: Default::default(), strings: Default::default() } }
+    fn new(known: &'a Known) -> Self {
+        Trace { known, ctes: Default::default(), params: Default::default(), typeof_: Default::default(), strings: Default::default(), wraps: Default::default(), rows: Default::default(), aggregates: Default::default(), refused: Default::default() }
+    }
 
     /// The columns `stmt` answers: a query's, or a write's RETURNING.
     fn statement(&self, stmt: &Statement) -> Option<Cols> {
@@ -341,7 +487,9 @@ impl<'a> Trace<'a> {
                 if let Some(source) = &i.source {
                     self.inserted(source, &i.columns, &into);
                 }
-                self.items(i.returning.as_deref()?, &[into])
+                let rels = [into];
+                self.item_makers(i.returning.as_deref().unwrap_or_default(), &rels);
+                self.items(i.returning.as_deref()?, &rels)
             }
             Statement::Update(u) => {
                 let mut rels = self.from(std::slice::from_ref(&u.table));
@@ -354,18 +502,36 @@ impl<'a> Trace<'a> {
                             self.uuid(&a.value);
                         }
                     }
+                    self.makers_in(&a.value, &rels);
                 }
-                u.selection.iter().for_each(|e| self.compared(e, &rels));
+                u.selection.iter().for_each(|e| {
+                    self.compared(e, &rels);
+                    self.makers_in(e, &rels);
+                });
+                self.item_makers(u.returning.as_deref().unwrap_or_default(), &rels);
                 self.items(u.returning.as_deref()?, &rels)
             }
             Statement::Delete(d) => {
                 let (ast::FromTable::WithFromKeyword(t) | ast::FromTable::WithoutKeyword(t)) = &d.from;
                 let mut rels = self.from(t);
                 rels.extend(self.from(d.using.as_deref().unwrap_or_default()));
-                d.selection.iter().for_each(|e| self.compared(e, &rels));
+                d.selection.iter().for_each(|e| {
+                    self.compared(e, &rels);
+                    self.makers_in(e, &rels);
+                });
+                self.item_makers(d.returning.as_deref().unwrap_or_default(), &rels);
                 self.items(d.returning.as_deref()?, &rels)
             }
             _ => None,
+        }
+    }
+
+    /// The JSON makers in SELECT items or a write's RETURNING items, over their relations.
+    fn item_makers(&self, items: &[SelectItem], rels: &[Rel]) {
+        for item in items {
+            if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+                self.makers_in(e, rels);
+            }
         }
     }
 
@@ -384,6 +550,10 @@ impl<'a> Trace<'a> {
         match s {
             SetExpr::Select(s) => self.select(s),
             SetExpr::Query(q) => self.query(q),
+            SetExpr::Values(v) => {
+                self.values(v);
+                None
+            }
             // (a column keeps its type only where both sides have the same one, as Postgres takes a UNION)
             SetExpr::SetOperation { left, right, .. } => {
                 let (l, r) = (self.body(left), self.body(right));
@@ -400,7 +570,26 @@ impl<'a> Trace<'a> {
     fn select(&self, s: &Select) -> Option<Cols> {
         let rels = self.from(&s.from);
         s.selection.iter().chain(&s.having).for_each(|e| self.compared(e, &rels));
+        self.select_makers(s, &rels);
         self.items(&s.projection, &rels)
+    }
+
+    /// The JSON makers in a SELECT's own expressions, over its relations: its items, WHERE, GROUP BY, HAVING, QUALIFY and
+    /// its joins' conditions.
+    fn select_makers(&self, s: &Select, rels: &[Rel]) {
+        self.item_makers(&s.projection, rels);
+        s.selection.iter().chain(&s.having).chain(&s.qualify).for_each(|e| self.makers_in(e, rels));
+        if let ast::GroupByExpr::Expressions(exprs, _) = &s.group_by {
+            exprs.iter().for_each(|e| self.makers_in(e, rels));
+        }
+        on_conditions(&s.from).into_iter().for_each(|e| self.makers_in(e, rels));
+    }
+
+    /// The JSON makers in a VALUES list (no relations: a row's values are its own).
+    fn values(&self, v: &ast::Values) {
+        for e in v.rows.iter().flat_map(|row| row.iter()) {
+            self.makers_in(e, &[]);
+        }
     }
 
     fn from(&self, from: &[TableWithJoins]) -> Vec<Rel> {
@@ -420,6 +609,8 @@ impl<'a> Trace<'a> {
             }
             TableFactor::Derived { subquery, alias, .. } => (vec![], self.query(subquery), alias),
             TableFactor::NestedJoin { table_with_joins, .. } => return rels.extend(self.from(std::slice::from_ref(table_with_joins))),
+            // (a table function or a file read by name: its columns are unknown, but its alias still names it)
+            TableFactor::Table { alias, .. } | TableFactor::Function { alias, .. } | TableFactor::TableFunction { alias, .. } => (vec![], None, alias),
             _ => (vec![], None, &None),
         };
         rels.push(match alias {
@@ -477,7 +668,7 @@ impl<'a> Trace<'a> {
                 "gen_random_uuid" | "uuidv4" | "uuidv7" | "uuid" | "pondra_uuid" => Some(Ty::Uuid),
                 "json_object_field" | "jsonb_object_field" | "json_array_element" | "jsonb_array_element" | "pondra_json_path" => first_arg(f).and_then(|a| self.document(a, rels)),
                 "nullif" => first_arg(f).and_then(|a| self.expr(a, rels)),
-                "coalesce" => args(f).and_then(|a| same(a.iter().filter(|a| !null(a)).map(|a| self.expr(a, rels)))),
+                "coalesce" => args(f).and_then(|a| same_taking_literals(a.iter().filter(|a| !null(a)).map(|a| (string(a).is_some(), self.expr(a, rels))))),
                 "pg_typeof" => {
                     if let Some(t) = first_arg(f).and_then(|a| self.expr(a, rels)) {
                         self.typeof_.borrow_mut().push((at(e), t));
@@ -486,7 +677,7 @@ impl<'a> Trace<'a> {
                 }
                 name => json_type(name),
             },
-            Expr::Case { conditions, else_result, .. } => same(conditions.iter().map(|w| &w.result).chain(else_result.as_deref()).filter(|e| !null(e)).map(|e| self.expr(e, rels))),
+            Expr::Case { conditions, else_result, .. } => same_taking_literals(conditions.iter().map(|w| &w.result).chain(else_result.as_deref()).filter(|e| !null(e)).map(|e| (string(e).is_some(), self.expr(e, rels)))),
             _ => None,
         }
     }
@@ -532,7 +723,10 @@ impl<'a> Trace<'a> {
         };
         let into_uuid = |row: &mut dyn Iterator<Item = &Expr>| row.zip(&uuids).filter(|(_, u)| **u).for_each(|(e, _)| self.uuid(e));
         match source.body.as_ref() {
-            SetExpr::Values(v) => v.rows.iter().for_each(|row| into_uuid(&mut row.iter())),
+            SetExpr::Values(v) => {
+                v.rows.iter().for_each(|row| into_uuid(&mut row.iter()));
+                self.values(v);
+            }
             SetExpr::Select(s) => {
                 into_uuid(&mut s.projection.iter().map_while(|i| match i {
                     SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
@@ -553,6 +747,190 @@ impl<'a> Trace<'a> {
         if string(e).is_some() {
             self.strings.borrow_mut().push(at(e));
         }
+    }
+
+    /// The JSON makers in `e`, noted where they are (`change_makers` changes them). A query nested in `e` is traced with its
+    /// own relations, which note its own makers: this walk leaves its expressions alone (`Makers`).
+    fn makers_in(&self, e: &Expr, rels: &[Rel]) {
+        let _ = e.visit(&mut Makers { trace: self, rels, depth: 0 });
+    }
+
+    /// Notes what a JSON maker's arguments need, when `e` is a call of one: an aggregate (`aggregate`), or each argument of a
+    /// builder, whose object keys must be scalars (`key`).
+    fn maker(&self, e: &Expr, rels: &[Rel]) {
+        let Expr::Function(f) = e else { return };
+        let name = object(&f.name);
+        if !MAKERS.contains(&name.as_str()) {
+            return;
+        }
+        let Some(args) = args(f) else { return };
+        if name.ends_with("_agg") {
+            self.aggregate(e, f, &args, rels);
+        } else {
+            let object_keys = name.ends_with("build_object");
+            for (i, a) in args.iter().enumerate() {
+                if object_keys && i % 2 == 0 {
+                    self.key(a, rels);
+                } else {
+                    self.argument(f, a, rels);
+                }
+            }
+        }
+    }
+
+    /// What an argument `a` of the maker call `f` is, for the JSON it writes. A whole row is noted for `pondra_row`, or
+    /// refused by name; a JSON value is noted for its wrapper, unless it is one already; any other value needs nothing.
+    fn argument(&self, f: &ast::Function, a: &Expr, rels: &[Rel]) -> Kind {
+        if let Expr::Identifier(i) = a {
+            if let Some(whole) = self.whole(i, rels) {
+                return match whole {
+                    Ok(w) => {
+                        self.rows.borrow_mut().push((at(a), w));
+                        Kind::Row
+                    }
+                    Err(why) => {
+                        self.refuse(coded("0A000", format!("{}({}) of a whole row {why}", f.name, i.value)));
+                        Kind::Value
+                    }
+                };
+            }
+        }
+        match self.expr(a, rels) {
+            Some(ty @ (Ty::Json | Ty::Jsonb)) => {
+                if !is_marked(a) {
+                    self.wraps.borrow_mut().push((at(a), ty));
+                }
+                Kind::Json
+            }
+            _ => Kind::Value,
+        }
+    }
+
+    /// An object's key must be a scalar: a whole row or a JSON value is refused, as Postgres refuses it.
+    fn key(&self, a: &Expr, rels: &[Rel]) {
+        let row = matches!(a, Expr::Identifier(i) if self.whole(i, rels).is_some());
+        if row || matches!(self.expr(a, rels), Some(Ty::Json | Ty::Jsonb)) {
+            self.refuse(coded("22023", "key value must be scalar, not array, composite, or json"));
+        }
+    }
+
+    /// An aggregate maker, `json_agg(x)` or `json_object_agg(k, v)`, noted with its elements' kind. The kind is worked out
+    /// here, from the trace, before anything changes. DISTINCT over json is refused as Postgres refuses it.
+    fn aggregate(&self, e: &Expr, f: &ast::Function, args: &[&Expr], rels: &[Rel]) {
+        let name = object(&f.name);
+        let object = name.ends_with("object_agg");
+        if object && args.len() != 2 {
+            return; // (DataFusion refuses the call: it has no such form)
+        }
+        let Some(&value) = args.last() else { return };
+        if object {
+            self.key(args[0], rels);
+        }
+        let kind = self.argument(f, value, rels);
+        let distinct = matches!(&f.args, ast::FunctionArguments::List(l) if l.duplicate_treatment == Some(ast::DuplicateTreatment::Distinct));
+        if distinct && kind == Kind::Json && !name.starts_with("jsonb") {
+            self.refuse(coded("42883", "could not identify an equality operator for type json"));
+        }
+        self.aggregates.borrow_mut().push((at(e), kind));
+    }
+
+    /// The relation `i` names as a whole row: a bare name of a relation of this FROM, when no relation of it has a column of
+    /// that name (a column wins, as in Postgres). Refused with why (the words after the call's text) when the row can't be
+    /// made: its columns aren't known, or one has no name of its own. None when `i` isn't a whole row.
+    fn whole(&self, i: &ast::Ident, rels: &[Rel]) -> Option<Result<Whole, String>> {
+        let name = ident(i);
+        let rel = rels.iter().find(|r| r.names.contains(&name))?;
+        let has_column = |r: &Rel| r.cols.as_ref().is_some_and(|cols| cols.iter().any(|(c, _)| *c == name));
+        if rels.iter().any(|r| has_column(r)) {
+            return None;
+        }
+        // (every relation's columns must be known: one that isn't could have a column of this name too)
+        let known = rels.iter().all(|r| r.cols.is_some());
+        let cols = match (&rel.cols, known) {
+            (Some(cols), true) => cols.clone(),
+            _ => return Some(Err(format!("needs {name}'s columns: name them, as json_build_object('a', {name}.a, …)"))),
+        };
+        if let Some((col, _)) = cols.iter().find(|(c, _)| c.starts_with(UNNAMED)) {
+            return Some(Err(format!("needs a name for each of {name}'s columns: give {} an alias", &col[UNNAMED.len_utf8()..])));
+        }
+        Some(Ok(Whole { name, cols }))
+    }
+
+    /// Keeps the first refusal: the statement fails with it, and nothing is changed.
+    fn refuse(&self, e: anyhow::Error) { self.refused.borrow_mut().get_or_insert(e); }
+}
+
+/// Visits one query's expressions (`Trace::makers_in`). At depth 0 it notes each maker and traces each query nested in an
+/// expression with its own relations; deeper, it skips a nested query, which is traced that way.
+struct Makers<'t, 'k> {
+    trace: &'t Trace<'k>,
+    rels: &'t [Rel],
+    depth: usize,
+}
+
+impl ast::Visitor for Makers<'_, '_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+        if self.depth == 0 {
+            let _ = self.trace.query(q);
+        }
+        self.depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        if self.depth == 0 {
+            self.trace.maker(e, self.rels);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether an argument already marks its JSON as the maker reads it: a call of `pondra_as_json`, `pondra_as_jsonb` or
+/// `pondra_row`, which a rewrite made. So a second rewrite wraps nothing again.
+fn is_marked(a: &Expr) -> bool {
+    matches!(a, Expr::Function(f) if ["pondra_as_json", "pondra_as_jsonb", "pondra_row"].contains(&object(&f.name).as_str()))
+}
+
+/// The conditions of a FROM's joins (`ON`, an as-of join's match condition), nested joins' too.
+fn on_conditions(from: &[TableWithJoins]) -> Vec<&Expr> {
+    let mut out = vec![];
+    for t in from {
+        if let TableFactor::NestedJoin { table_with_joins, .. } = &t.relation {
+            out.extend(on_conditions(std::slice::from_ref(table_with_joins)));
+        }
+        for j in &t.joins {
+            if let TableFactor::NestedJoin { table_with_joins, .. } = &j.relation {
+                out.extend(on_conditions(std::slice::from_ref(table_with_joins)));
+            }
+            out.extend(join_conditions(&j.join_operator));
+        }
+    }
+    out
+}
+
+/// The conditions a join operator carries.
+fn join_conditions(op: &ast::JoinOperator) -> Vec<&Expr> {
+    use ast::JoinOperator as J;
+    let constraint = match op {
+        J::AsOf { match_condition, constraint } => return std::iter::once(match_condition).chain(on_constraint(constraint)).collect(),
+        J::Join(c) | J::Inner(c) | J::Left(c) | J::LeftOuter(c) | J::Right(c) | J::RightOuter(c) | J::FullOuter(c) | J::CrossJoin(c) | J::Semi(c)
+        | J::LeftSemi(c) | J::RightSemi(c) | J::Anti(c) | J::LeftAnti(c) | J::RightAnti(c) | J::StraightJoin(c) => c,
+        _ => return vec![],
+    };
+    on_constraint(constraint).into_iter().collect()
+}
+
+fn on_constraint(c: &ast::JoinConstraint) -> Option<&Expr> {
+    match c {
+        ast::JoinConstraint::On(e) => Some(e),
+        _ => None,
     }
 }
 
@@ -579,6 +957,10 @@ fn of_type(t: &ast::DataType) -> Option<Ty> {
         _ => None,
     }
 }
+
+/// The one type the items that aren't string literals have. A plain string literal takes its neighbours' type, as Postgres
+/// reads an unknown literal beside a value: `coalesce(json_agg(t), '[]')` is json.
+fn same_taking_literals(items: impl Iterator<Item = (bool, Option<Ty>)>) -> Option<Ty> { same(items.filter(|(literal, _)| !literal).map(|(_, t)| t)) }
 
 /// The one type all of `types` have: none when they differ, or when there are none.
 fn same(types: impl Iterator<Item = Option<Ty>>) -> Option<Ty> {
@@ -627,12 +1009,13 @@ fn first_arg(f: &ast::Function) -> Option<&Expr> { args(f)?.first().copied() }
 /// A name's last part, as SQL reads it.
 fn last(n: &ObjectName) -> String { n.0.last().and_then(|p| p.as_ident()).map(ident).unwrap_or_default() }
 
-/// The name an item without an alias goes by in a query around it: a column's own name.
+/// The name an item without an alias goes by in a query around it: a column's own name. An expression has none of its
+/// own, so it is named by its text after `UNNAMED` (`whole` refuses a row with such a column).
 fn name_of(e: &Expr) -> String {
     match e {
         Expr::Identifier(i) => ident(i),
         Expr::CompoundIdentifier(p) => p.last().map(ident).unwrap_or_default(),
-        e => e.to_string(),
+        e => format!("{UNNAMED}{e}"),
     }
 }
 
@@ -766,24 +1149,129 @@ mod tests {
         let k = known();
         let u = "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11";
         let mut s = one(&format!("SELECT pg_typeof(id), pg_typeof(name), pg_typeof(uuidv7()) AS v, pg_typeof('x') FROM t WHERE id = '{u}' OR name = '{u}' OR parent IN ('{{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12}}', $1) UNION ALL SELECT pg_typeof(ref), 'x', 'y', 'z' FROM s.o")).unwrap();
-        assert!(rewritten(&k, &mut s));
+        assert!(rewritten(&k, &mut s).unwrap());
         assert_eq!(s.to_string(), format!("SELECT 'uuid' AS \"pg_typeof(id)\", pg_typeof(name), 'uuid' AS v, pg_typeof('x') FROM t WHERE id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' OR name = '{u}' OR parent IN ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12', $1) UNION ALL SELECT 'uuid' AS \"pg_typeof(ref)\", 'x', 'y', 'z' FROM s.o"));
         let mut s = one("SELECT pg_typeof(doc), pg_typeof(name) FROM t").unwrap();
-        assert!(rewritten(&k, &mut s));
+        assert!(rewritten(&k, &mut s).unwrap());
         assert_eq!(s.to_string(), "SELECT 'json' AS \"pg_typeof(doc)\", pg_typeof(name) FROM t");
         let mut s = one("SELECT pg_typeof(b) FROM s.o").unwrap();
-        assert!(rewritten(&k, &mut s));
+        assert!(rewritten(&k, &mut s).unwrap());
         assert_eq!(s.to_string(), "SELECT 'jsonb' AS \"pg_typeof(b)\" FROM s.o");
         let mut s = one(&format!("INSERT INTO t (name, id) VALUES ('{u}', '{u}'), ('x', 'nope')")).unwrap();
-        assert!(rewritten(&k, &mut s));
+        assert!(rewritten(&k, &mut s).unwrap());
         assert_eq!(s.to_string(), format!("INSERT INTO t (name, id) VALUES ('{u}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), ('x', 'nope')"));
         let mut s = one(&format!("INSERT INTO t (parent, name) SELECT '{u}' AS p, '{u}' FROM s.o")).unwrap();
-        assert!(rewritten(&k, &mut s));
+        assert!(rewritten(&k, &mut s).unwrap());
         assert_eq!(s.to_string(), format!("INSERT INTO t (parent, name) SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' AS p, '{u}' FROM s.o"));
         let mut s = one(&format!("UPDATE t SET parent = '{u}', name = '{u}'")).unwrap();
-        assert!(rewritten(&k, &mut s));
+        assert!(rewritten(&k, &mut s).unwrap());
         assert_eq!(s.to_string(), format!("UPDATE t SET parent = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', name = '{u}'"));
         let mut s = one(&format!("SELECT name FROM t WHERE name = '{u}' AND id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'")).unwrap();
-        assert!(!rewritten(&k, &mut s)); // (a string compared with text, and a uuid already written its way)
+        assert!(!rewritten(&k, &mut s).unwrap()); // (a string compared with text, and a uuid already written its way)
+    }
+
+    /// `sql` rewritten, as its text (the statement as it is, when nothing changes).
+    fn rewrite_text(sql: &str) -> String {
+        let k = known();
+        let mut s = one(sql).unwrap();
+        rewritten(&k, &mut s).unwrap();
+        s.to_string()
+    }
+
+    /// The SQLSTATE and the words of the refusal `sql` earns.
+    fn refusal(sql: &str) -> (&'static str, String) {
+        let k = known();
+        let mut s = one(sql).unwrap();
+        let e = rewritten(&k, &mut s).unwrap_err();
+        (crate::codes::of(&e), e.to_string())
+    }
+
+    /// `t`'s whole row, as `pondra_row` makes it for the relation named `n`.
+    fn t_row(n: &str) -> String {
+        format!(r#"pondra_row('id', "{n}"."id", 'name', "{n}"."name", 'parent', "{n}"."parent", 'doc', pondra_as_json("{n}"."doc"))"#)
+    }
+
+    #[test]
+    fn makes_json_gate() {
+        assert!(makes_json("SELECT json_agg(x) FROM t"));
+        assert!(makes_json("select TO_JSONB ( doc ) FROM t"));
+        assert!(makes_json("SELECT json_build_object('a', 1)"));
+        assert!(!makes_json("SELECT pondra_json_agg(array_agg(x), 'value') FROM t")); // (a rewrite's own name is no maker)
+        assert!(!makes_json("SELECT doc::json, doc -> 'a' FROM t"));
+    }
+
+    #[test]
+    fn json_column_in_a_builder() {
+        assert_eq!(rewrite_text("SELECT json_build_object('id', name, 'doc', doc) FROM t"), r#"SELECT json_build_object('id', name, 'doc', pondra_as_json(doc)) AS "json_build_object('id', name, 'doc', doc)" FROM t"#);
+        assert_eq!(rewrite_text("SELECT jsonb_build_array(b, doc -> 'a') FROM s.o, t"), r#"SELECT jsonb_build_array(pondra_as_jsonb(b), pondra_as_json(doc -> 'a')) AS "jsonb_build_array(b, doc -> 'a')" FROM s.o, t"#);
+        assert_eq!(rewrite_text("SELECT to_json(doc) FROM t"), r#"SELECT to_json(pondra_as_json(doc)) AS "to_json(doc)" FROM t"#);
+    }
+
+    #[test]
+    fn whole_rows_from_a_table_an_alias_a_cte_and_a_subquery() {
+        assert_eq!(rewrite_text("SELECT json_agg(t) FROM t"), format!(r#"SELECT pondra_json_agg(array_agg({r}), 'row') AS "json_agg(t)" FROM t"#, r = t_row("t")));
+        assert_eq!(rewrite_text("SELECT to_json(u), row_to_json(u) FROM t AS u"), format!(r#"SELECT to_json({r}) AS "to_json(u)", row_to_json({r}) AS "row_to_json(u)" FROM t AS u"#, r = t_row("u")));
+        assert_eq!(rewrite_text("SELECT json_agg(x) FROM (SELECT id, name FROM t) x"), r#"SELECT pondra_json_agg(array_agg(pondra_row('id', "x"."id", 'name', "x"."name")), 'row') AS "json_agg(x)" FROM (SELECT id, name FROM t) x"#);
+        assert_eq!(rewrite_text("WITH c AS (SELECT id, doc FROM t) SELECT to_json(c) FROM c"), r#"WITH c AS (SELECT id, doc FROM t) SELECT to_json(pondra_row('id', "c"."id", 'doc', pondra_as_json("c"."doc"))) AS "to_json(c)" FROM c"#);
+    }
+
+    #[test]
+    fn a_column_named_like_its_table_stays_a_column() {
+        assert_eq!(rewrite_text("SELECT json_agg(doc) FROM t AS doc"), r#"SELECT pondra_json_agg(array_agg(pondra_as_json(doc)), 'json') AS "json_agg(doc)" FROM t AS doc"#);
+        assert_eq!(rewrite_text("SELECT to_json(name) FROM t AS name"), "SELECT to_json(name) FROM t AS name");
+    }
+
+    #[test]
+    fn json_agg_keeps_its_order_filter_distinct_and_window() {
+        assert_eq!(rewrite_text("SELECT json_agg(name ORDER BY name DESC) FROM t"), r#"SELECT pondra_json_agg(array_agg(name ORDER BY name DESC), 'value') AS "json_agg(name ORDER BY name DESC)" FROM t"#);
+        assert_eq!(rewrite_text("SELECT json_agg(name) FILTER (WHERE id IS NOT NULL) FROM t"), r#"SELECT pondra_json_agg(array_agg(name) FILTER (WHERE id IS NOT NULL), 'value') AS "json_agg(name) FILTER (WHERE id IS NOT NULL)" FROM t"#);
+        assert_eq!(rewrite_text("SELECT jsonb_agg(DISTINCT name), json_agg(name) OVER (PARTITION BY parent) FROM t"), r#"SELECT pondra_jsonb_agg(array_agg(DISTINCT name), 'value') AS "jsonb_agg(DISTINCT name)", pondra_json_agg(array_agg(name) OVER (PARTITION BY parent), 'value') AS "json_agg(name) OVER (PARTITION BY parent)" FROM t"#);
+        // (jsonb's elements are its own text, so DISTINCT is fine and the element is printed as jsonb)
+        assert_eq!(rewrite_text("SELECT jsonb_agg(DISTINCT b) FROM s.o"), r#"SELECT pondra_jsonb_agg(array_agg(DISTINCT pondra_as_jsonb(b)), 'json') AS "jsonb_agg(DISTINCT b)" FROM s.o"#);
+    }
+
+    #[test]
+    fn json_object_agg_takes_its_key_and_value() {
+        assert_eq!(rewrite_text("SELECT json_object_agg(name, doc), jsonb_object_agg(name, id ORDER BY name) FROM t"), r#"SELECT pondra_json_object_agg(array_agg(named_struct('k', name, 'v', pondra_as_json(doc))), 'json') AS "json_object_agg(name, doc)", pondra_jsonb_object_agg(array_agg(named_struct('k', name, 'v', id) ORDER BY name), 'value') AS "jsonb_object_agg(name, id ORDER BY name)" FROM t"#);
+    }
+
+    #[test]
+    fn whole_rows_and_columns_inside_an_aggregate_both_change() {
+        let expected = format!(r#"SELECT pondra_json_agg(array_agg({r}), 'row') AS "json_agg(t)", pondra_json_agg(array_agg(pondra_as_json(json_build_object('a', pondra_as_json(doc)))), 'json') AS "json_agg(json_build_object('a', doc))" FROM t"#, r = t_row("t"));
+        assert_eq!(rewrite_text("SELECT json_agg(t), json_agg(json_build_object('a', doc)) FROM t"), expected);
+        assert_eq!(rewrite_text("SELECT json_build_object('n', name, 'row', t) FROM t AS t"), format!(r#"SELECT json_build_object('n', name, 'row', {r}) AS "json_build_object('n', name, 'row', t)" FROM t AS t"#, r = t_row("t")));
+    }
+
+    #[test]
+    fn a_maker_in_a_where_is_changed() {
+        assert_eq!(rewrite_text("SELECT id FROM t WHERE json_build_object('d', doc)::text <> '{}'"), "SELECT id FROM t WHERE json_build_object('d', pondra_as_json(doc))::TEXT <> '{}'");
+    }
+
+    #[test]
+    fn whole_row_refused_by_name() {
+        assert_eq!(refusal("SELECT json_agg(t) FROM (SELECT upper(name) FROM t) t"), ("0A000", "json_agg(t) of a whole row needs a name for each of t's columns: give upper(name) an alias".to_string()));
+        assert_eq!(refusal("SELECT json_agg(f) FROM f"), ("0A000", "json_agg(f) of a whole row needs f's columns: name them, as json_build_object('a', f.a, …)".to_string()));
+        assert_eq!(refusal("SELECT json_agg(DISTINCT doc) FROM t"), ("42883", "could not identify an equality operator for type json".to_string()));
+        assert_eq!(refusal("SELECT json_object_agg(doc, name) FROM t"), ("22023", "key value must be scalar, not array, composite, or json".to_string()));
+    }
+
+    #[test]
+    fn coalesce_and_case_let_a_literal_take_json() {
+        assert_eq!(cols("SELECT coalesce(doc, '{}'), CASE WHEN name = 'a' THEN '[]' ELSE doc END, coalesce(json_agg(name), '[]') FROM t"), [Some(Ty::Json), Some(Ty::Json), Some(Ty::Json)]);
+        assert_eq!(cols("SELECT coalesce(name, 'x') FROM t"), [None]);
+        assert_eq!(rewrite_text("SELECT coalesce(json_agg(name), '[]') FROM t"), r#"SELECT coalesce(pondra_json_agg(array_agg(name), 'value'), '[]') AS "coalesce(json_agg(name), '[]')" FROM t"#);
+    }
+
+    #[test]
+    fn a_second_rewrite_changes_nothing() {
+        for sql in ["SELECT json_agg(t) FROM t", "SELECT json_build_object('d', doc), json_agg(json_build_object('a', doc)) FROM t", "SELECT coalesce(json_agg(name), '[]') FROM t", "SELECT jsonb_agg(DISTINCT b) FROM s.o", "SELECT json_object_agg(name, doc) FROM t"] {
+            let once = rewrite_text(sql);
+            assert_eq!(rewrite_text(&once), once, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_statement_without_makers_stays_as_it_is() {
+        assert_eq!(rewrite_text("SELECT name, id, doc FROM t WHERE name = 'x' AND doc IS NOT NULL"), "SELECT name, id, doc FROM t WHERE name = 'x' AND doc IS NOT NULL");
     }
 }
