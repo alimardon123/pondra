@@ -264,11 +264,11 @@ jobs:
       - run: cargo test --release --lib
       - run: cargo test --release --test node_twice --test node_library # (a node in a host's process: two lakes one after the other, and the library's four checks)
 
-  # The suite, on linux-x64's very binary, in three parts side by side: the quick correctness suite
+  # The suite, on linux-x64's very binary, in four parts side by side: the quick correctness suite
   # (upserts, split brain, crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on
-  # GCS and Azure, scale, Flight…) in two halves (`harness.py all --shard`), and frames against
-  # Polars, the console in Chromium, every example on the website, then a cluster losing its leader
-  # twice.
+  # GCS and Azure, scale, Flight…) in three, each section dealt by its measured time
+  # (`harness.py all --shard`), and frames against Polars, the console in Chromium, every example
+  # on the website, then a cluster losing its leader twice.
   suite:
     needs: [plan, linux]
     if: ${{ !cancelled() && needs.linux.result == 'success' }}
@@ -277,8 +277,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { part: "harness, first half", shard: "1/2" }
-          - { part: "harness, second half", shard: "2/2" }
+          - { part: "harness, 1 of 3", shard: "1/3" }
+          - { part: "harness, 2 of 3", shard: "2/3" }
+          - { part: "harness, 3 of 3", shard: "3/3" }
           - { part: "frames, console, docs, failover" }
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -307,7 +308,7 @@ jobs:
         with:
           path: ~/kafka_2.13-4.3.1
           key: kafka_2.13-4.3.1
-      - name: harness.py all, this half
+      - name: harness.py all, this part
         if: matrix.shard
         run: |
           npm install -g azurite   # (Azure's emulator: harness.py clouds)
