@@ -5,7 +5,8 @@ It signs real tokens with real keys, so a client's checks run against what a pro
 the JWKS, the code flow with PKCE, an id token and an access token. /authorize signs the test user in at
 once; there is no login page. Test-only routes (not the standard's): /_test/stats counts fetches and token
 requests, /_test/mint makes a token of any claims, algorithm and key (forgeries too), /_test/rotate adds a
-signing key, /_test/user says who signs in next. It needs `cryptography`, which comes with `moto` in
+signing key, /_test/user says who signs in next, /_test/next what the next flow does (an error from /authorize,
+or a nonce for the next ID token: each applies once). It needs `cryptography`, which comes with `moto` in
 tools/requirements.txt, and otherwise the standard library.
 
   python3 tools/fake_idp.py --port 9100                           # serves until killed
@@ -83,6 +84,7 @@ class Idp:
         self.add_rsa()
         self.keys["ec1"] = new_key("ec")
         self.codes, self.user = {}, dict(TEST_USER)
+        self.next_flow = {}  # what the next flow does: {"error": "access_denied"} or {"nonce": "x"}; each applies once
         self.stats = {"jwks_fetches": 0, "discovery_fetches": 0, "token_requests": 0}
         self.lock = threading.Lock()  # one request at a time, so the counts and codes stay right
 
@@ -125,6 +127,9 @@ class Idp:
             return 400, {"error": "unsupported_response_type"}
         if not (q.get("code_challenge") and q.get("code_challenge_method") == "S256" and q.get("redirect_uri")):
             return 400, {"error": "invalid_request", "error_description": "PKCE (S256) and a redirect_uri are required"}
+        if "error" in self.next_flow:  # the provider refuses this sign-in, and says so to the redirect URI
+            params = {"error": self.next_flow.pop("error"), "error_description": "refused by the test", **({"state": q["state"]} if "state" in q else {})}
+            return 302, {"location": q["redirect_uri"] + ("&" if "?" in q["redirect_uri"] else "?") + urlencode(params)}
         code = secrets.token_urlsafe(24)
         self.codes[code] = {"client_id": q.get("client_id"), "redirect_uri": q["redirect_uri"], "nonce": q.get("nonce"),
                             "challenge": q["code_challenge"], "user": dict(self.user), "expires": time.time() + 60,
@@ -151,6 +156,8 @@ class Idp:
         id_claims = {**entry["user"], "iss": self.issuer, "aud": client_id, "iat": now, "exp": now + 300}
         if entry["nonce"]:
             id_claims["nonce"] = entry["nonce"]
+        if "nonce" in self.next_flow:  # (the next ID token carries the nonce the test names)
+            id_claims["nonce"] = self.next_flow.pop("nonce")
         access = {**entry["user"], "iss": self.issuer, "aud": self.access_audience, "iat": now, "exp": now + 300}
         return 200, {"id_token": self.mint({"claims": id_claims}), "access_token": self.mint({"claims": access}),
                      "token_type": "Bearer", "expires_in": 300}
@@ -186,6 +193,9 @@ class Idp:
         if route == ("POST", "/_test/user"):
             self.user = {k: v for k, v in json.loads(raw or b"{}").items() if v is not None}
             return 200, {"user": self.user}
+        if route == ("POST", "/_test/next"):
+            self.next_flow.update(json.loads(raw or b"{}"))
+            return 200, {"next": self.next_flow}
         return 404, {"error": "not_found", "path": path}
 
 
@@ -373,6 +383,18 @@ def selftest():
     stats = call("GET", "/_test/stats")[2]
     check("stats: 3 token requests, 1 discovery fetch, the JWKS fetches counted",
           stats["token_requests"] == 3 and stats["discovery_fetches"] == 1 and stats["jwks_fetches"] >= 3)
+
+    call("POST", "/_test/next", {"error": "access_denied", "nonce": "n9"})
+    refused_by = parse_qs(urlsplit(call("GET", "/authorize?" + urlencode(params(challenge)))[1]["Location"]).query)
+    check("/_test/next: the next /authorize redirects with error and the state, and no code",
+          refused_by.get("error") == ["access_denied"] and refused_by.get("state") == ["st1"] and "code" not in refused_by)
+    verifier, challenge = pkce()
+    tok = redeem(sign_in(params(challenge))[1]["code"], verifier)[2]
+    check("/_test/next: the next ID token carries its nonce (n9)",
+          verify(tok["id_token"], jwks()[header(tok["id_token"])["kid"]])["nonce"] == "n9")
+    verifier, challenge = pkce()
+    tok = redeem(sign_in(params(challenge))[1]["code"], verifier)[2]
+    check("…and the token after that carries the request's own nonce (n1): each applies once", verify(tok["id_token"], jwks()[header(tok["id_token"])["kid"]])["nonce"] == "n1")
 
     secured = start(0, client_secret="s3cret")
     at = f"http://127.0.0.1:{secured.server_address[1]}"

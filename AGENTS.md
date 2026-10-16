@@ -66,7 +66,7 @@ The owner's design principles, which every change must respect:
 
 ```
 src/      82,000 lines of Rust in 131 files, one per concern (see the table in README.md); `lib.rs` lists
-          the modules: the ones every build has (`finish`, `fsum`, `avg`, `intervals`, `xlsx`, …: no lake, so a
+          the modules: the ones every build has (`finish`, `fsum`, `avg`, `casts`, `intervals`, `xlsx`, …: no lake, so a
           browser build shares them) and the rest under feature `server` (on by default: the node);
           `cli.rs` is the command line (its subcommands and what each starts) and `main.rs` sets the
           allocator and calls it (ADR-061); `node.rs` is a node started and stopped as an object,
@@ -99,7 +99,10 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           `RESTORE DATABASE`: a backup is a lake;
           ADR-070, invariants 290, 291), seq.rs (sequences and
           identity columns: invariant 234), index.rs (indexes kept as objects: invariant 235),
-          constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236),
+          constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236), literals.rs
+          (an INSERT's literal rows without a session or a plan: invariant 401), casts.rs (a cast to an integer
+          rounds: invariant 293), sso.rs (a company's identity provider signs people in at every door, ADR-074:
+          invariants 409, 410, 412),
           types.rs (enum types: invariant 242), and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
           237–239); learned.rs (what a run learned about its filters, ADR-050: invariant 244);
           environments (ADR-047): branch.rs (`CREATE DATABASE dev CLONE prod`, REFRESH: invariant
@@ -1696,7 +1699,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    no query plans it again, and one that already has holds its own batches. Kept until the budget
    needed room, a busy table's merges filled it with files nobody could read (Durability's soak:
    537 MB after 25 minutes, of a table of a few tens). `harness.py hot`: "a merge's replaced files
-   leave memory".
+   leave memory". A table whose columns are held keeps each file it writes as written (`tier::Encoding` → `Hot::put`, in the
+   reader's 8,192-row batches, at most 64 MB a file outside the budget until it is put), so a merge's file
+   takes the replaced files' place at once; a lake held in memory loads a file on its first read.
+   `harness.py hot`: "rows tiered into a hot table's file are held at once".
 234. **A sequence's values are durable before any is handed out, and only the sequencer moves it**
    (`seq.rs`, `sq/{name}`): `nextval` takes a block in a commit of the sequencer's own (`Flush::sequence`,
    `seq::Held`), answered once durable, so a value given out is never given again, through a
@@ -2162,6 +2168,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    joins (its exchanges are the spread analysis's). `harness.py hot`: "NOT IN a subquery with a
    NULL keeps no row…" fails with a NOT IN hashed (the threads that never met the NULL keep their
    rows).
+293. **A cast to an integer rounds a fraction as Postgres and DuckDB do** (`casts.rs`): a decimal half
+   away from zero (`CAST(2.5 AS INT)` is 3, -2.5 is -3), a float half to even (`2.5::DOUBLE::INT`
+   is 2, 3.5 is 4); Arrow's cast drops it. `casts::Rounds`, an analyzer rule after type coercion,
+   puts `pondra_whole` in every `CAST`, `::`, `TRY_CAST` and `arrow_cast` of a decimal with places
+   or a float to an integer type, the casts coercion adds included, so every node, view and door
+   plans it alike; a value written into an integer column is rounded the same way (`query::strict`,
+   an UPDATE's and a MERGE's rows too: `change::part`), so a key an `ON CONFLICT` or a MERGE checks is
+   the key written. Spark's `DIV` drops the fraction before its cast (`sparksql`). `harness.py found`:
+   "a cast of a decimal to an integer rounds…"; `pkey`: "a MERGE that compares a key in another
+   type…" (a MERGE wrote 7002.5 as 7002, an INSERT as 7003).
 295. **SQL answers with the optimizer off** (`optimize::Runnable`, the last analyzer rule): under
    `datafusion.optimizer.max_passes = 0` every scalar function is replaced by what its simplifier
    makes of it, as the optimizer would. `arrow_cast`, `coalesce` and `nvl2` run only as that CAST or
@@ -2287,14 +2303,20 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 318. **SQL's plain INSERT never replaces a row of its key** (`constraints::key_check`, `key_check_over`,
    `txn::autocommit`, `txn::ByKey`): an INSERT without ON CONFLICT or OR REPLACE | IGNORE into a table
    with a PRIMARY KEY (not a merge table) is refused 23505, in Postgres's words, when two of its rows
-   share a key or a live row holds one. Outside a transaction it runs as one of its own under its keys'
+   share a key or a live row holds one. A MERGE's and an `ON CONFLICT` on another column's inserted keys
+   must be new too (`change::run`), checked by lookups unless the MERGE matches on the key alone with
+   source columns of the key's type (`Merge::key_sources`, `compared_as_keys`), which checks only its own
+   new rows (`constraints::distinct_keys`); a SET of a key column is 0A000. An upsert's conflict columns
+   are cast to the table's types before a conflict is looked for (`Upsert::merge`), so a conflict is
+   looked for under the key the row is written as. Outside a transaction it runs as one of its own under its keys'
    row locks, so of two nodes inserting one new key, one wins. In a transaction it is checked at its
    statement over the transaction's kept keys (`ByKey`: its own rows' keys held, the keys it took away
    free, never a pass over its kept rows) and again at COMMIT. A retried job's INSERT is a duplicate
-   (`write::sent`). A CREATE TABLE AS refused for a key leaves no table. ON CONFLICT, MERGE, INSERT OR
+   (`write::sent`). A CREATE TABLE AS refused for a key leaves no table. ON CONFLICT, a MERGE's matched rows, INSERT OR
    REPLACE | IGNORE, the loading doors and views keep upserting, and a change replaces old rows by key,
    not `_row_id` (`change::upserts`). `pondra sql` and an attached lake's INSERT check without locks.
-   `harness.py pkey`.
+   `harness.py pkey`: "a MERGE that inserts a key the table holds is refused…", "…compares a key in another
+   type (7002.5 against BIGINT)…".
 322. **Row locks are a schedule, never the authority** (`locks.rs`, `txn::commit_here`, ADR-067
    §4–6): they live in the leader's memory only, by table and key (an append table's by `_row_id`),
    with a lease of `PONDRA_LOCK_LEASE_SECS` (60) that each lock request renews; a new leader starts
@@ -2562,6 +2584,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    over 1 MB is its caller's alone. `harness.py remembered`: one run for five asks from two connections,
    a commit, a transaction's own write, now() and temporary tables, a setting, parameters in text and
    binary, a user's grants.
+401. **An INSERT's literal rows are DataFusion's, without its planner** (`literals.rs`, from `write::rows_of`):
+   a `VALUES` of literals, casts of them and the statement's time functions is built as the planner would
+   build it (its own `sql_to_expr` and `simplify`, one start time a statement, the session's
+   `optimize::config`, `query::seconds`, `values_typed`'s casts, a cast to an integer rounded as
+   `casts::Rounds` rounds it), and anything else (another call, arithmetic, a placeholder, a cast that
+   fails, two types in a column, a session's own settings) is planned. Only how the batch is made changes,
+   never where it goes. `cargo test --lib literals` compares both paths value by value.
 
 405. **A temporary secret only an admin or the node's owner made reaches past the public internet**
    (`public.rs`, `ext::temporary`, `For::Public`): anyone else's is refused `PROVIDER credential_chain`
@@ -2587,6 +2616,40 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the Iceberg catalog asks DELETE when it takes files out or adds deletes, and UPDATE when it upserts
    into a keyed table (`iceberg::prepare`). A token's role and the node's own work ask nothing more.
    `harness.py guarded`: "S11: …" (both fail without it).
+
+409. **A provider's token is checked where it arrives, against the provider alone** (`sso.rs`: `checked`,
+   `key_for`, `fetch`). It is a JWT of 16 KB at most, signed RS256, RS384, RS512, PS256, ES256 or ES384:
+   `none`, HMAC and a `crit` header are refused, since a public key taken for an HMAC secret is the
+   classic forgery. `iss` is exactly a provider's ISSUER; `aud` is its CLIENT_ID or one of its AUDIENCE;
+   `exp` and `nbf` hold within 60 s. The key is the `kid` from the JWKS that the issuer's own discovery
+   names (its `issuer` the provider's), fetched over https (http only to this machine), 1 MB and 10 s at
+   most. It is fetched again for an unknown `kid` at most once a minute an issuer, so random `kid`s can't
+   make a node hammer the provider, and once an hour old, in the background; a provider that is down
+   keeps the keys it had. Nothing is written and the leader isn't asked. Several providers of one issuer
+   are tried in name order, and the first whose checks pass and that signs the token's user in is taken
+   (`sso::check`), so a listed provider never hides a `USERS 'any'` one. `harness.py sso`: "refused over
+   HTTP with 401, the body saying why…", "20 tokens whose kids the keys lack…", "…the node having asked
+   for its keys once in all", "two providers of one issuer…".
+
+410. **A token signs in only whom its provider vouches for, through the two doors every door uses**
+   (`users::who`, `users::sign_in`, `users::claimed`, `principal_with`). The user is the user claim's
+   value, in lower case; with `email`, `email_verified: false` is refused. `USERS 'listed'` signs in only
+   a user made here; `'any'` signs in anyone, with `public`'s grants and each claimed name that is a role
+   here (never a user who signs in, 64 at most). A token naming `admin`, `writer` or `reader` is refused,
+   and one sent as a password must name the user signing in. A user's name may be an address, written in
+   lower case. Postgres asks for cleartext only a user with no password, and a name no user has only where
+   a password may cross and a provider takes `USERS 'any'`; a password shaped like a JWT is refused when
+   it is set, since it would be taken for a token. Kafka takes OAUTHBEARER; MCP's 401 names
+   `/.well-known/oauth-protected-resource` (RFC 9728). A provider made or dropped applies at once on the
+   node that ran it, and within a second elsewhere, as a grant does. `harness.py sso`: "Basic as ana with
+   eve's token is refused…", "USERS 'any': cy@acme.com…", "…naming nosuchrole or boss (a login user)…".
+
+412. **A lake with an identity provider is never open, and has one only at format 5** (`sso::create`,
+   `users::any`). Making one writes `z/signed` in its commit (invariant 379), `users::any` counts
+   providers (a list that can't be read counts as signed), and it needs every live node to know format
+   5, so a 0.33 node never takes such a lake for open. `upgrade_check.py format`: "…an identity
+   provider, to 5; and Pondra 0.33.0 then refuses it by name". (411 is ADR-074 part 2's: the console's
+   redirect.)
 
 ## Tests: run these before and after any change
 

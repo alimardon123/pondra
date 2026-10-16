@@ -541,7 +541,7 @@ async fn run() -> anyhow::Result<()> {
             anyhow::ensure!(lake.is_none() || url.is_none(), "run a script on a lake folder or on a node (--url), not both");
             let sql = std::fs::read_to_string(&file).map_err(|e| anyhow::anyhow!("{file}: {e}"))?;
             let body = serde_json::json!({"sql": sql, "params": shell::params(&params)?});
-            let token = token.or_else(|| crate::env::get("PONDRA_TOKEN"));
+            let token = token.or_else(|| crate::env::get("PONDRA_TOKEN")).or_else(|| url.as_deref().and_then(project::saved)); // (or `pondra login`'s)
             print!("{}", shell::script(lake.as_deref().unwrap_or("lake"), url.as_deref(), token.as_deref(), body).await?);
         }
         Cmd::Service { cmd } => service::command(cmd).await?,

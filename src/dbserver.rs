@@ -401,6 +401,12 @@ async fn plain(State(s): State<Shared>, axum::extract::ConnectInfo(peer): axum::
     // nodes: `Peer::client`, behind a trusted proxy the client it names; whatever the client said goes)
     let client = format!("{} {}", client_key(), peer.client(req.headers()));
     req.headers_mut().insert(crate::tls::CLIENT, client.parse().expect("a key and an address are a header value"));
+    // (and where it reached this server, with its database's path: a sign-in's redirect address, `Peer::origin`)
+    let db = req.uri().path().strip_prefix("/db/").and_then(|r| r.split('/').next()).map(|d| format!("/db/{d}")).unwrap_or_default();
+    match peer.origin(req.headers()).and_then(|o| format!("{} {o}{db}", client_key()).parse().ok()) {
+        Some(origin) => req.headers_mut().insert(crate::tls::ORIGIN, origin),
+        None => req.headers_mut().remove(crate::tls::ORIGIN),
+    };
     next.run(req).await
 }
 

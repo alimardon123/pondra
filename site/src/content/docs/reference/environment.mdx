@@ -53,6 +53,7 @@ PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `PONDRA_BROWSER` | the system's (`open`, `xdg-open`, Windows's handler) | the program `pondra login` opens its sign-in page with, given the address: a browser of your choice. The address is printed too, to open by hand in a browser on this machine (the sign-in comes back to `127.0.0.1`) |
 | `PONDRA_ENV` | the git branch's database | the environment the project commands use when none is named: `pondra apply`, `pondra plan`, `pondra status` and the rest. `--env` or the name after the command wins |
 | `PONDRA_HOME` | `~/.pondra` (from `HOME`, or `USERPROFILE` on Windows) | the folder where `pondra login` keeps the tokens it saved, in `login.json` |
 

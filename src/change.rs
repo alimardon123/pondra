@@ -14,7 +14,7 @@ use crate::store::*;
 use crate::sys::{self, ROW_ID};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{ArrayRef, BooleanArray};
-use datafusion::arrow::compute::{cast, concat_batches};
+use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::sql::sqlparser::ast;
@@ -460,13 +460,14 @@ async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)
     Ok((old, new))
 }
 
-/// The table's columns from the query's `prefix` ones, cast to their types, and (`ids`) the rows'
+/// The table's columns from the query's `prefix` ones, cast to their types as every write casts them
+/// (`query::strict`: a fraction into an integer rounds, a value that won't go is an error), and (`ids`) the rows'
 /// `_row_id`, `_created_at` (and, for old versions, `_version`) after them.
 fn part(all: &RecordBatch, meta: &TableMeta, prefix: &str, ids: bool) -> Result<RecordBatch> {
     let target = crate::query::schema(&meta.columns)?;
     let get = |name: &str| all.column_by_name(name).cloned().with_context(|| format!("{name}?"));
     let mut fields: Vec<Arc<Field>> = target.fields().to_vec();
-    let mut columns = target.fields().iter().map(|f| Ok(cast(&get(&format!("{prefix}{}", f.name()))?, f.data_type())?)).collect::<Result<Vec<ArrayRef>>>()?;
+    let mut columns = target.fields().iter().map(|f| crate::query::strict(&get(&format!("{prefix}{}", f.name()))?, f.data_type())).collect::<Result<Vec<ArrayRef>>>()?;
     if ids {
         let old = if prefix == "__o_" { vec![sys::VERSION] } else { vec![] };
         for c in [ROW_ID, sys::CREATED].into_iter().chain(old) {

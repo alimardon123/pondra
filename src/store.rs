@@ -1074,6 +1074,7 @@ impl Lake {
         crate::asof::register(&ctx); // (ASOF JOIN's marker)
         crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
         crate::avg::register(&ctx); // avg(DECIMAL): rounded at its last place
+        crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
         crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
         crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
         crate::types::register(&ctx); // gen_random_uuid(), uuidv7(), pg_typeof(x)

@@ -191,6 +191,13 @@ export const register = {
 export const T = { fetch: (url, init) => fetch(url, init), token: () => store.get('pondra.token'), headers: () => (OWNER ? { 'x-pondra-owner': OWNER } : {}) };
 const OWNER = (() => { try { const k = new URLSearchParams(location.hash.slice(1)).get('key'); if (k) { sessionStorage.setItem('pondra.owner', k); history.replaceState(null, '', location.pathname + location.search); } return sessionStorage.getItem('pondra.owner'); } catch { return null; } })();
 export function configure(o) { Object.assign(T, o); }
+// A node's sign-in (ADR-074 §5) ends at this address with its session, or the reason it failed, in the fragment,
+// which no server sees. The session becomes the token; the fragment goes either way. A failure is returned for
+// console.js's start to say, once the sign-in dialog exists.
+const SSO = new URLSearchParams(location.hash.slice(1)), SIGNED = SSO.get('pondra_session');
+if (SIGNED) { store.set('pondra.token', SIGNED); store.set('pondra.user', SSO.get('pondra_user')); }
+export const SSO_WHY = SSO.get('pondra_error');
+if (SIGNED || SSO_WHY) history.replaceState(null, '', location.pathname + location.search);
 
 // ------------------------------------------------------------------ the page's state
 export const MODE = document.documentElement.dataset.mode; // lake: one lake (serve --lake); lakes: a folder of lakes, its databases

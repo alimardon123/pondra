@@ -22,6 +22,25 @@ export { Expr, Frame, Merge, all, coalesce, col, concat, concatStr, count, first
 // behind a flag, so there it is node:crypto's, loaded once.
 const randomUUID = globalThis.crypto?.randomUUID ? () => globalThis.crypto.randomUUID() : (await import("node:crypto")).randomUUID;
 
+// `pondra login` keeps a token per server in `$PONDRA_HOME/login.json` (else `~/.pondra/login.json`). Node, Bun and
+// Deno can read it; a browser has no such file, so there these modules are not loaded.
+const files = globalThis.process?.versions?.node ? await Promise.all([import("node:fs"), import("node:os"), import("node:path")]) : null;
+
+/** The token `pondra login` kept for the server `url` is on: the longest saved server that `url` equals or starts
+ * with and then `/` (as the command line picks it). Undefined when there is no such file, or none for `url`. */
+function savedLogin(url) {
+  if (!files) return undefined;
+  const [fs, os, path] = files;
+  try {
+    const home = globalThis.process.env.PONDRA_HOME || path.join(os.homedir(), ".pondra");
+    const saved = JSON.parse(fs.readFileSync(path.join(home, "login.json"), "utf8"));
+    const hits = Object.entries(saved).filter(([server]) => url === server || url.startsWith(`${server}/`));
+    return hits.sort(([a], [b]) => b.length - a.length)[0]?.[1];
+  } catch {
+    return undefined; // (no file, or one that isn't JSON: no token)
+  }
+}
+
 // A node answered that it ran nothing, or that it couldn't reach the bucket or another node: a
 // request that may be sent again goes to the next node. (57P01 admin_shutdown, 57P03
 // cannot_connect_now, 58030 io_error, 08xxx connection_exception)
@@ -130,6 +149,7 @@ export class Pondra {
     this.reached = false;
     this.jobs = 0;
     this.token = token;
+    if (!token && !user && !password) this.token = this.urls.map((u) => savedLogin(u)).find(Boolean); // (signed in with `pondra login`: its token for this server, if it kept one)
     this.basic = user ? `Basic ${base64(`${user}:${password}`)}` : null; // (a user: its name and password, or its token as the password)
     this.notices = []; // what the last statement's procedures printed
     this.onNotice = onNotice; // (each one, as it comes back; null: keep them quiet)
@@ -516,6 +536,7 @@ export function connect(target, options = {}) {
   if (Array.isArray(target) || /^https?:\/\//.test(target ?? "")) return new Pondra(target, options);
   const { token, python = true, port, onNotice, ...settings } = options;
   const db = new Pondra("http://127.0.0.1", { token, ...(onNotice !== undefined && { onNotice }) });
+  db.token = token; // (a node of this process's answers its key, never a token `pondra login` kept)
   const go = () => opening(db, target ?? ":memory:", { python, port }, settings);
   db.ready = turn = turn.then(go, go);
   db.ready.catch(() => {}); // (not unhandled: the first call, or `ready`, says why)
@@ -610,6 +631,7 @@ async function beside(db, dir, { port, flags = [], timeout = 120, python = true,
   const url = `http://127.0.0.1:${port}`;
   const probe = new Pondra(url, { retrySecs: 0 }); // (asks with the node's key whether it is up, and ours)
   probe.owner = owner;
+  probe.token = undefined; // (asks with the key alone, never a token `pondra login` kept for this address)
   for (const until = Date.now() + timeout * 1000; ; await sleep(50)) {
     let ours;
     try {

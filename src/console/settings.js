@@ -2,7 +2,7 @@
 // them. The console's own (Appearance, Editor and results, Layout, Keys: kept on this machine, in
 // console.json) and the node's (Python, About); and signing in. More come in with `register.setting`, under their
 // own heading: an enterprise build's users and roles, tokens, audit and quotas. Loaded when opened.
-import { h, $, icon, svg, count, ICONS, S, R, call, register, moreStyle, toast, store } from './core.js';
+import { h, $, icon, svg, count, ICONS, S, R, call, register, moreStyle, toast, store, base, T } from './core.js';
 import { PER_PAGE } from './grid.js';
 
 await moreStyle();
@@ -127,6 +127,16 @@ export function askToken(why) {
   $('#userIn').value = store.get('pondra.user') || '';
   d.returnValue = '';
   d.showModal();
+  providerButtons();
+}
+// A button per identity provider the node has (ADR-074 §5): it sends the page through the provider and back here,
+// signed in. The list is fetched each time the dialog opens; with no provider, nothing is drawn.
+async function providerButtons() {
+  const box = $('#ssoIn'), at = location.pathname + location.search;
+  box.replaceChildren();
+  const r = await T.fetch(base() + '/sso').catch(() => null); // (a folder of lakes: the database's own providers)
+  const providers = r?.ok ? (await r.json().catch(() => ({}))).providers || [] : [];
+  box.append(...providers.map(p => h('button', { type: 'button', class: 'btn', onclick: () => { location.href = `${base()}/sso/${encodeURIComponent(p.name)}/start?to=${encodeURIComponent(at)}`; } }, `Sign in with ${p.label}`)));
 }
 async function signedIn() {
   const v = $('#tokenDlg').returnValue, user = $('#userIn').value.trim(), secret = $('#tokenIn').value.trim();
