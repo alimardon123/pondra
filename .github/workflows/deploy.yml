@@ -10,8 +10,8 @@ name: deploy
 # PACKAGES_TOKEN: contents read and write on both), and a pull request to microsoft/winget-pkgs
 # (the secret WINGET_TOKEN: a classic token with public_repo).
 #
-# A pull request's run of the same checks is build.yml's, once its build is done (`full-ci`, and
-# what they try changes): waiting here for its packages held runners, and pull requests' CI runs
+# A merge's or a pull request's run of the same checks is build.yml's, once its build is done (main,
+# or `full-ci`, and what they try changes): waiting here for its packages held runners, and pull requests' CI runs
 # four at a time.
 on:
   push:
