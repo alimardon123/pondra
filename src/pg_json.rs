@@ -6,12 +6,12 @@
 //! answers NULL where a walk meets it; `@>`, `<@`, `?`, `?|` and `?&` read the whole document and refuse it (22P02).
 //! `text` groups the operators the way Postgres does, where SQL comes in (`path::door`).
 use crate::pg_catalog::{follows_json, function, text_arg, texts_out};
+use crate::pg_json_make::fail;
 use crate::types::{is_json, json_of};
 use datafusion::arrow::array::{Array, ArrayAccessor, ArrayRef, AsArray, BooleanArray, StringArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Int64Type};
 use datafusion::common::{DFSchema, Result, ScalarValue};
-use datafusion::error::DataFusionError;
 use datafusion::logical_expr::expr::{Alias, ScalarFunction};
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
 use datafusion::logical_expr::{Expr, ExprSchemable, ScalarUDF, Signature, Volatility};
@@ -100,9 +100,6 @@ pub fn register(ctx: &SessionContext) {
     }
     crate::pg_json_make::register(ctx);
 }
-
-/// An error a function raises, carrying its SQLSTATE to the door (`codes::of`).
-fn fail(e: anyhow::Error) -> DataFusionError { DataFusionError::External(e.into()) }
 
 /// `s` parsed, for containment and existence: a document that isn't JSON is refused (22P02, in `json_of`'s words).
 fn document(s: &str) -> anyhow::Result<Value> {

@@ -218,7 +218,7 @@ fn is_json_field(f: &Field) -> bool { matches!(f.metadata().get(MARK).map(String
 
 /// An error a function raises, carrying its SQLSTATE to the door (`codes::of`). anyhow's own box hides the `Coded` type
 /// `codes::of` looks for, so a `Coded` is boxed as itself; any other error goes as anyhow boxes it.
-fn fail(e: anyhow::Error) -> DataFusionError {
+pub(crate) fn fail(e: anyhow::Error) -> DataFusionError {
     match e.downcast::<Coded>() {
         Ok(c) => DataFusionError::External(Box::new(c)),
         Err(e) => DataFusionError::External(e.into()),
