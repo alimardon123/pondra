@@ -12,7 +12,7 @@ name: deploy
 #
 # A merge's or a pull request's run of the same checks is build.yml's, once its build is done (main,
 # or `full-ci`, and what they try changes): waiting here for its packages held runners, and pull requests' CI runs
-# four at a time.
+# two at a time.
 on:
   push:
     tags: ["v*"]

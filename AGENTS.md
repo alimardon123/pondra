@@ -2824,10 +2824,14 @@ packages (a minute or two). `cluster-bench.yml`'s default binary (`ci`) is that 
 A pull request's push runs CI only when the pull request is labelled: `ci` builds linux-x64 with
 the suite and the tests after it, and a pull request merges once that passes (the owner,
 2026-10-16); `full-ci` adds the other platforms but macOS Intel, for a change that wants them
-first. Main builds every platform but macOS Intel on every push (macOS Intel on a version commit,
-which a release tags, or by hand), with deploy.yml when what it tries changes; a platform that
+first. Main builds every platform but macOS Intel on its newest commit (a push waits while a run goes,
+and drops one that waited before it; macOS Intel on a version commit, which a release tags, or by
+hand), with deploy.yml when what it tries changes; a platform that
 fails there is commented on the pull request it came from, and that lane fixes it at once. Never
-turn on auto-merge before its run starts.
+turn on auto-merge before its run starts. Two pull requests' runs go at once (ci-slots.yml; the
+account's runners are shared with the owner's other work, 2026-10-16), and a run does only what its
+change touches (build.yml's `plan`: a change no check reads runs nothing; one that leaves the crate
+alone skips its unit tests).
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
 
