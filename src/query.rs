@@ -85,13 +85,15 @@ pub fn cast_as(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new_with_options(s.clone(), columns, &options)?)
 }
 
-/// A column as type `t`, or an error saying which value wouldn't go (never a quiet NULL).
+/// A column as type `t`, or an error saying which value wouldn't go (never a quiet NULL). A value with
+/// a fraction is rounded into an integer column as a cast rounds it (`casts.rs`).
 pub fn strict(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
     if c.data_type() == t {
         return Ok(c.clone());
     }
     let c = match (c.data_type(), t) {
         (DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8, DataType::Timestamp(..)) => with_seconds(c)?, // ('… 10:00')
+        (from, to) if to.is_integer() && crate::casts::fractional(from) => crate::casts::whole(c)?, // (2.5 into an INT is 3, as Postgres writes it)
         _ => c.clone(),
     };
     let options = datafusion::arrow::compute::CastOptions { safe: false, ..Default::default() };

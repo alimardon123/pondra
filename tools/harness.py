@@ -6840,7 +6840,8 @@ def found():
     callable as soon as it is made, and gone as soon as it is dropped; ADBC's handshake without
     padding, its ingest modes and table types; `pondra run`'s flags anywhere. And what the console
     found: a time without seconds, BASE TABLE, exact numbers, files() after PUT. And the Postgres catalog's
-    text columns (`text`, varchar kept in pg_type) and COMMENT ON (obj_description, col_description, pg_description)."""
+    text columns (`text`, varchar kept in pg_type) and COMMENT ON (obj_description, col_description, pg_description).
+    And a cast of a decimal or a float to an integer rounding as Postgres's does."""
     import datetime as dt, psycopg, pyarrow as pa, pyarrow.flight as fl
     import adbc_driver_flightsql.dbapi as adbc
     lake, guarded = new_lake(), new_lake()
@@ -7260,6 +7261,26 @@ def found():
     seen["kv"] = q("SELECT k, v, _deleted FROM kv")
     checks["a keyed table's UPDATE keeps _deleted as it was (NULL), not false"] = \
         [{"k": r.get("k"), "v": r.get("v"), "_deleted": r.get("_deleted")} for r in seen["kv"]] == [{"k": 1, "v": "b", "_deleted": None}]
+    # A cast of a decimal or a float to an integer rounds, as Postgres and DuckDB round it (`casts.rs`): a decimal half away
+    # from zero, a float half to even. Constants, columns, TRY_CAST and arrow_cast alike, and a value written into an
+    # integer column; Spark's DIV still cuts toward zero. (Arrow's cast cut every one of them toward zero.)
+    q("CREATE TABLE fracs (d DECIMAL(6, 2), f DOUBLE)")
+    q("INSERT INTO fracs VALUES (2.50, 2.5), (-2.50, 3.5), (2.49, -2.5), (99.50, -3.5)")
+    q("CREATE TABLE wholes (i INT, b BIGINT)")
+    q("INSERT INTO wholes VALUES (2.5, 3.5)")
+    q("INSERT INTO wholes SELECT d, f FROM fracs WHERE d = 2.5")
+    q("UPDATE wholes SET b = 4.5 WHERE b = 4")
+    q("MERGE INTO wholes USING (SELECT 6.5 AS i, 7.5::DOUBLE AS b) s ON wholes.i = s.i WHEN NOT MATCHED THEN INSERT VALUES (s.i, s.b)")
+    seen["casts"] = [q("SELECT CAST(2.5 AS BIGINT) AS a, CAST(-2.5 AS INT) AS b, CAST(2.5::DOUBLE AS BIGINT) AS c, 3.5::DOUBLE::INT AS d, "
+                       "TRY_CAST(2.5 AS INT) AS e, arrow_cast(2.5, 'Int64') AS g, CAST(7 AS INT) AS h"),
+                     q("SELECT CAST(d AS INT) AS di, CAST(f AS BIGINT) AS fi FROM fracs ORDER BY d"),
+                     q("SELECT i, b FROM wholes ORDER BY i, b"),
+                     q("SELECT * FROM spark_sql('SELECT 7.5 DIV 2 AS a, -7 DIV 2 AS b')")]
+    checks["a cast of a decimal to an integer rounds half away from zero and a float's half to even (CAST, ::, TRY_CAST, arrow_cast, a column, an INSERT, UPDATE and MERGE), and Spark's DIV still cuts"] = seen["casts"] == [
+        [{"a": 3, "b": -3, "c": 2, "d": 4, "e": 3, "g": 3, "h": 7}],
+        [{"di": -3, "fi": 4}, {"di": 2, "fi": -2}, {"di": 3, "fi": 2}, {"di": 100, "fi": -4}],
+        [{"i": 3, "b": 2}, {"i": 3, "b": 5}, {"i": 7, "b": 8}],
+        [{"a": 3, "b": -3}]]
     node.kill(); locked.kill()
     ok = all(checks.values())
     print(json.dumps({"found": checks, "ok": ok}, indent=1))
@@ -17280,15 +17301,16 @@ def pkey():
     checks["a MERGE in a transaction that inserts a key the table holds: refused (23505), and the row is as it was"] = mrg_txn == "23505" and mrg_rows()[7002] == "b"
 
     # A key the ON compares in another type: 7002.5 against BIGINT's keys compares as decimals and matches no row, yet the
-    # inserted value is cast to the key's type (7002), a row that's there. Such a MERGE is checked by lookups.
+    # inserted value is cast to the key's type (7003, rounded as Postgres casts it), a row that's there. Such a MERGE is
+    # checked by lookups.
     mrg_dec = err("MERGE INTO mrg t USING (SELECT 7002.5 AS id, 'y' AS v) s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
     info["merge_decimal"] = [mrg_dec, mrg_rows()]
-    # An INSERT's value is cast to the key's type before its conflict is checked (as Postgres does): 7003.5 is the key 7003,
-    # which is held, so DO NOTHING keeps its row (Pondra's cast truncates, Postgres rounds: 7004 there).
-    ins_nothing = err("INSERT INTO mrg SELECT 7003.5 AS id, 'y' AS v ON CONFLICT (id) DO NOTHING")
+    # An INSERT's value is cast to the key's type before its conflict is checked (as Postgres does): 7002.5 is the key 7003,
+    # which is held, so DO NOTHING keeps its row.
+    ins_nothing = err("INSERT INTO mrg SELECT 7002.5 AS id, 'y' AS v ON CONFLICT (id) DO NOTHING")
     info["merge_decimal_nothing"] = [ins_nothing, mrg_rows()]
-    checks["a MERGE that compares a key in another type (7002.5 against BIGINT) and inserts it: refused (23505), the table as it was; an INSERT of 7003.5 ON CONFLICT DO NOTHING keeps 7003"] = \
-        refused(mrg_dec) and mrg_rows() == {7001: "a", 7002: "b", 7003: "c"} and ins_nothing[0] == 200
+    checks["a MERGE that compares a key in another type (7002.5 against BIGINT) and inserts it: refused (23505), the table as it was; an INSERT of 7002.5 ON CONFLICT DO NOTHING keeps 7003"] = \
+        refused(mrg_dec) and "(id)=(7003)" in str(mrg_dec) and mrg_rows() == {7001: "a", 7002: "b", 7003: "c"} and ins_nothing[0] == 200
 
     mrg_dbt = q("MERGE INTO mrg t USING (SELECT 7001 AS id, 'a2' AS v UNION ALL SELECT 7005, 'e') s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)")
     mrg_key_set = err("MERGE INTO mrg t USING (SELECT 7001 AS id) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET id = 7009")
@@ -17296,10 +17318,10 @@ def pkey():
     checks["a MERGE matched on the key updates and inserts (dbt's shape); a SET of the key is refused by name (0A000), the table unchanged"] = \
         mrg_rows() == {7001: "a2", 7002: "b", 7003: "c", 7005: "e"} and mrg_key_set[1] == "0A000" and mrg_rows()[7001] == "a2"
 
-    # An INSERT of 7003.5 with ON CONFLICT DO UPDATE takes the cast key too: it updates 7003 (counted as updated), no row is inserted
-    ins_update = q("INSERT INTO mrg VALUES (7003.5, 'u') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
+    # An INSERT of 7002.5 with ON CONFLICT DO UPDATE takes the cast key too: it updates 7003 (counted as updated), no row is inserted
+    ins_update = q("INSERT INTO mrg VALUES (7002.5, 'u') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
     info["merge_decimal_update"] = [ins_update, mrg_rows()]
-    checks["an INSERT of 7003.5 with ON CONFLICT DO UPDATE updates 7003 (counted as updated, none inserted), the other rows as they were"] = \
+    checks["an INSERT of 7002.5 with ON CONFLICT DO UPDATE updates 7003 (counted as updated, none inserted), the other rows as they were"] = \
         ins_update.get("updated") == 1 and ins_update.get("inserted") == 0 and mrg_rows() == {7001: "a2", 7002: "b", 7003: "u", 7005: "e"}
 
     # Loading doors: still upserts
