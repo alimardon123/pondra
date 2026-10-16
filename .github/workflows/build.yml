@@ -16,7 +16,9 @@ name: build
 # once; `full-ci` builds them (but macOS Intel) before the merge, for a change that wants them.
 # Decided from the labels alone, so a push that asks for nothing never waits for a runner to say so;
 # a newer push stops the older run.
-# Four pull requests' runs go at once: a fifth waits, holding no runner, until ci-slots.yml starts it.
+# Two pull requests' runs go at once (the account's runners are shared with the owner's other work,
+# 2026-10-16): a third waits, holding no runner, until ci-slots.yml starts it. Each run runs only
+# what its change touches (`plan`), and main builds only its newest commit (`concurrency`).
 on:
   push:
     branches: [main]
@@ -25,10 +27,13 @@ on:
     types: [opened, synchronize, reopened, labeled] # (labeled: `ci` or `full-ci` added)
   workflow_dispatch:
 
-# A pull request's runs share a group, so a newer push (or `full-ci` added) stops the older run;
-# main's never do (each push's packages may be a release's), nor does another label added.
+# A pull request's runs share a group, so a newer push (or `full-ci` added) stops the older run.
+# Main's pushes share one too, without stopping the run that goes: a push waits while it runs, and
+# drops a push that waited before it, so main builds its newest commit, never each merge of a busy
+# hour (the account's runners are shared with the owner's other work, 2026-10-16). A run started by
+# hand (a release's) has a group of its own, as has another label added.
 concurrency:
-  group: build-${{ github.event.pull_request.number || github.run_id }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
+  group: build-${{ github.event.pull_request.number || (github.event_name == 'push' && 'main') || github.run_id }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -52,6 +57,10 @@ jobs:
       run: ${{ steps.plan.outputs.run }}
       linux: ${{ steps.plan.outputs.linux }}
       others: ${{ steps.plan.outputs.others }}
+      binary: ${{ steps.plan.outputs.binary }}
+      unit: ${{ steps.plan.outputs.unit }}
+      docs: ${{ steps.plan.outputs.docs }}
+      suite: ${{ steps.plan.outputs.suite }}
       full: ${{ steps.plan.outputs.full }}
       resilience: ${{ steps.plan.outputs.resilience }}
       upgrade: ${{ steps.plan.outputs.upgrade }}
@@ -88,7 +97,6 @@ jobs:
           echo "linux=$(jq -c '{include: [.[] | select(.platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
           others=$(jq -c --argjson intel "$intel" '{include: [.[] | select(.platform != "linux-x64" and ($intel or .platform != "macos-x64"))]}' <<< "$platforms")
           echo "others=$others" >> "$GITHUB_OUTPUT"
-          echo "full=$FULL" >> "$GITHUB_OUTPUT"
           if [ "$GITHUB_EVENT_NAME" = push ]; then
             # (a run with every package this one would make, `pondra` itself among them)
             run=$(bash tools/ci_build.sh "$GITHUB_SHA" "$(jq -r '[.include[].platform | "pondra-\(.)"] + ["pondra-linux-x64", "pondra-npm"] | join(" ")' <<< "$others")")
@@ -97,37 +105,73 @@ jobs:
           fi
           if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`): the pull request merges once it passes, and main builds the other platforms (the label \`full-ci\` builds them here first, but macOS Intel)." >> "$GITHUB_STEP_SUMMARY"; fi
           if [ "$FULL" = true ] && [ "$intel" = false ]; then echo "macOS Intel is built on a version commit (the one a release tags) or a run started by hand." >> "$GITHUB_STEP_SUMMARY"; fi
-          # The tests of what this run builds, called below once it is built: deploy's (main, or
-          # `full-ci`: the platforms it tries) when what it tries changes; for a pull request, upgrade
-          # always, resilience when what it puts under failure changes, sharing when what it shares,
-          # sso when what signs people in. (The files from git: the API's hourly allowance for the
-          # repository runs out on a busy day.)
-          files=$(git diff --name-only HEAD^1 HEAD)
-          if [ "$FULL" = true ] && grep -qE '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)' <<< "$files"; then deploy=true; else deploy=false; fi
-          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+          # What a change touches decides what runs: nothing for one no check reads (docs/ but its
+          # surface and glossary, AGENTS.md, the benches', the soak's and other workflows' own files);
+          # the unit tests when the crate or its tests change; the harness when the program, its
+          # packages or a check does; the frames, console and docs part for the website too; the other
+          # platforms (main, `full-ci`) when what they build or try changes; deploy's, and a pull
+          # request's tests after the build, when what each tries changes. A pull request's files are
+          # its merge's against main. A push's are those since the newest main commit whose run passed:
+          # main runs only its newest commit (`concurrency`), so a run may hold several merges, and a
+          # red run's are run again until main passes. Every push builds linux-x64, whose packages the
+          # benches, the soak and a release take. A run started by hand, or a push whose last passed
+          # run isn't found, runs everything. (The files from git: the API's hourly allowance for the
+          # repository runs out on a busy day; one call finds that commit.)
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            if grep -qE '^(src/|Cargo\.(toml|lock)$|python/pondra/client\.py$|js/index\.js$|tools/(resilience_check|faulty_s3|sim_r2|harness)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(resilience|build)\.yml$)' <<< "$files"; then resilience=true; else resilience=false; fi
-            if grep -qE '^(src/(shares|sharing|vend|read_delta|delta|ext|scan|audit|server)\.rs$|tools/(sharing_check|sim_r2)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sharing|build)\.yml$)' <<< "$files"; then sharing=true; else sharing=false; fi
-            if grep -qE '^(src/(sso|sso_flow|users|auth|pg|flight|kafka)\.rs$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)' <<< "$files"; then sso=true; else sso=false; fi
-            if grep -qE '^(site/|brand/|\.github/workflows/(build|pages)\.yml$)' <<< "$files"; then site=true; else site=false; fi
-            echo "site=$site" >> "$GITHUB_OUTPUT"
-            printf 'upgrade=true\nresilience=%s\nsharing=%s\nsso=%s\n' "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
-            echo "After the build: upgrade$([ "$resilience" = false ] || echo ', resilience')$([ "$sharing" = false ] || echo ', sharing')$([ "$sso" = false ] || echo ', sso')$([ "$deploy" = false ] || echo ', deploy')." >> "$GITHUB_STEP_SUMMARY"
-            # At most four pull requests' CI at once (two from 2026-10-03; four from 2026-10-11, for the
-            # month's eight lanes; ci-slots.yml's SLOTS says the same): with four older runs of other
-            # pull requests going, this one waits. It builds nothing, its check `waiting for a
-            # CI slot` fails, it holds no runner, and ci-slots.yml starts it again when a run ends.
+            files=$(git diff --name-only HEAD^1 HEAD)
+          elif [ "$GITHUB_EVENT_NAME" = push ]; then
+            base=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?branch=main&event=push&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // empty') || base=
+            if [ "$base" = "$GITHUB_SHA" ]; then base=$(git rev-parse HEAD^1); fi # (a passed run started again)
+            if [ -n "$base" ] && git fetch -q --depth 1 origin "$base"; then files=$(git diff --name-only "$base" HEAD); else files=ALL; fi
+          else
+            files=ALL
+          fi
+          has() { [ "$files" = ALL ] || grep -qE "$1" <<< "$files"; }
+          bin='^(src/|capi/|launcher/|brand/|Cargo\.(toml|lock)$)' # (the program and the library)
+          pkg='^(python/|js/|install\.(sh|ps1)$|tools/(package|smoke|package_check)\.py$|tools/(package_check\.mjs|try_packages\.sh|npm_publish\.sh|try_install\.ps1)$)' # (the packages, and what tries them)
+          self='^\.github/workflows/build\.yml$'
+          code=false; unit=false; harness=false; docs=false; site=false; deploy=false; full=false
+          if has "$bin|$pkg|$self"; then code=true; fi
+          if has "$bin|^tests/|^tools/per_node_check\.py\$|$self"; then unit=true; fi
+          # (a check, or what one starts: tools/bench/, tools/cloud/ and tools/soak.py are the benches' and the soak's own)
+          if [ "$code" = true ] || [ "$files" = ALL ] || grep -qE '^tools/[^/]+$' <<< "$(grep -vxF tools/soak.py <<< "$files")"; then harness=true; fi
+          if [ "$harness" = true ] || has '^(site/|examples/|docs/(surface\.json|glossary\.md)$)'; then docs=true; fi
+          if has '^(site/|brand/)|^\.github/workflows/(build|pages)\.yml$'; then site=true; fi
+          if [ "$FULL" = true ] && has '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)'; then deploy=true; fi
+          if [ "$FULL" = true ] && { [ "$code" = true ] || [ "$deploy" = true ]; }; then full=true; fi
+          upgrade=false; resilience=false; sharing=false; sso=false
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if has "$bin|^python/|^tools/(upgrade_check|history_check|environments_check|backup_check|git_check|project_check|fake_github|sim_r2)\.py\$|^tools/(ci_artifact\.sh|requirements\.txt)\$|^\.github/workflows/(upgrade|build)\.yml\$"; then upgrade=true; fi
+            if has '^(src/|Cargo\.(toml|lock)$|python/pondra/client\.py$|js/index\.js$|tools/(resilience_check|faulty_s3|sim_r2|harness)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(resilience|build)\.yml$)'; then resilience=true; fi
+            if has '^(src/(shares|sharing|vend|read_delta|delta|ext|scan|audit|server)\.rs$|tools/(sharing_check|sim_r2)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sharing|build)\.yml$)'; then sharing=true; fi
+            if has '^(src/(sso|sso_flow|users|auth|pg|flight|kafka)\.rs$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)'; then sso=true; fi
+          fi
+          binary=false
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ]; then binary=true; fi
+          suite=$(jq -nc --argjson h "$harness" --argjson d "$docs" '{include: ((if $h then [range(1; 4) | {part: "harness, \(.) of 3", shard: "\(.)/3"}] else [] end) + (if $d then [{part: "frames, console, docs, failover"}] else [] end))}')
+          printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
+            "$binary" "$unit" "$docs" "$suite" "$site" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
+          runs=
+          for k in binary full unit harness docs site upgrade resilience sharing sso deploy; do
+            if [ "${!k}" = true ]; then runs="$runs $k"; fi
+          done
+          echo "Runs:${runs:- nothing (no check reads what this changes)}$([ "$files" != ALL ] || echo ' (everything: started by hand, or no passed run of main found)')." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # At most two pull requests' CI at once (two from 2026-10-03; four from 2026-10-11, for the
+            # month's eight lanes; two again from 2026-10-16, since the account's runners are shared with
+            # the owner's other work; ci-slots.yml's SLOTS says the same): with two older runs of other
+            # pull requests going, this one waits. It builds nothing, its check `waiting for a CI slot`
+            # fails, it holds no runner, and ci-slots.yml starts it again when a run ends.
             # (If the API can't be asked, it runs: a slot is never worth a stuck pull request.)
             going=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?event=pull_request&per_page=100" \
               --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and .status != \"completed\" and (.pull_requests[0].number // 0) != $PR)] | length") || going=0
-            if [ "$going" -ge 4 ]; then
+            if [ "$going" -ge 2 ]; then
               echo wait=true >> "$GITHUB_OUTPUT"
-              echo "Waiting for a CI slot: $going other pull requests' runs are going (four at a time). ci-slots.yml starts this run again when one ends." >> "$GITHUB_STEP_SUMMARY"
+              echo "Waiting for a CI slot: $going other pull requests' runs are going (two at a time). ci-slots.yml starts this run again when one ends." >> "$GITHUB_STEP_SUMMARY"
             fi
           fi
-          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then echo site=true >> "$GITHUB_OUTPUT"; fi
 
-  # A pull request over the four at a time: red until it runs, so nobody takes it for passed.
+  # A pull request over the two at a time: red until it runs, so nobody takes it for passed.
   slot:
     name: waiting for a CI slot
     needs: plan
@@ -135,7 +179,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - run: |
-          echo "::error title=Waiting for a CI slot::Four other pull requests' CI runs are going, and only four run at once. This run starts again by itself when one ends (ci-slots.yml): nothing to do."
+          echo "::error title=Waiting for a CI slot::Two other pull requests' CI runs are going, and only two run at once. This run starts again by itself when one ends (ci-slots.yml): nothing to do."
           exit 1
 
   # The documentation website, built as pages.yml publishes it with each release, so a page that
@@ -163,7 +207,7 @@ jobs:
   # so they start once it is built, never waiting for the slowest platform.
   linux:
     needs: plan
-    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' && needs.plan.outputs.binary == 'true' }}
     name: ${{ matrix.platform }}
     strategy:
       matrix: ${{ fromJSON(needs.plan.outputs.linux) }}
@@ -258,7 +302,7 @@ jobs:
   # links for glibc 2.17).
   unit:
     needs: plan
-    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' && needs.plan.outputs.unit == 'true' }}
     name: unit tests
     runs-on: ubuntu-24.04
     env:
@@ -287,16 +331,11 @@ jobs:
   # on the website, then a cluster losing its leader twice.
   suite:
     needs: [plan, linux]
-    if: ${{ !cancelled() && needs.linux.result == 'success' }}
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.plan.outputs.docs == 'true' }}
     name: suite (${{ matrix.part }})
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { part: "harness, 1 of 3", shard: "1/3" }
-          - { part: "harness, 2 of 3", shard: "2/3" }
-          - { part: "harness, 3 of 3", shard: "3/3" }
-          - { part: "frames, console, docs, failover" }
+      matrix: ${{ fromJSON(needs.plan.outputs.suite) }} # (the parts what the change touches needs: plan)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -408,8 +447,13 @@ jobs:
         run: |
           r=$GITHUB_REPOSITORY
           failed=$(gh api "repos/$r/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" --jq '.jobs[] | select(.conclusion == "failure") | "- [\(.name)](\(.html_url))"')
-          body=$(printf "Main's build of this merge (%s) failed:\n\n%s\n\nThe lane that merged it fixes this next, before other work: a pull request merges on Linux's CI alone, and main builds the other platforms.\n" "${GITHUB_SHA:0:7}" "$failed")
+          # (main runs only its newest commit, so a run may hold several merges: those since the
+          # last run that ran, each said on its pull request once)
+          prev=$(gh api "repos/$r/actions/workflows/build.yml/runs?branch=main&event=push&per_page=30" --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and .conclusion != \"cancelled\" and .conclusion != \"skipped\")][0].head_sha // empty" || true)
+          shas=$([ -n "$prev" ] && gh api "repos/$r/compare/$prev...$GITHUB_SHA" --jq '.commits[].sha' || echo "$GITHUB_SHA")
+          prs=$(for s in $shas; do gh api "repos/$r/commits/$s/pulls" --jq '.[0].number // empty' || true; done | sort -un)
+          held=$([ "$(wc -w <<< "$prs")" -lt 2 ] || printf ' This run holds the merges of%s (main builds only its newest commit): the one that broke it fixes it.' "$(printf ' #%s' $prs)")
+          body=$(printf "Main's build of %s failed:\n\n%s\n\nThe lane that merged it fixes this next, before other work: a pull request merges on Linux's CI alone, and main builds the other platforms.%s\n" "${GITHUB_SHA:0:7}" "$failed" "$held")
           echo "$body" >> "$GITHUB_STEP_SUMMARY"
-          pr=$(gh api "repos/$r/commits/$GITHUB_SHA/pulls" --jq '.[0].number // empty' || true)
-          if [ -n "$pr" ]; then gh api "repos/$r/issues/$pr/comments" -f body="$body" > /dev/null && echo "Said on #$pr."; fi
+          for p in $prs; do gh api "repos/$r/issues/$p/comments" -f body="$body" > /dev/null && echo "Said on #$p."; done
           echo "::error title=main is red::$(tr '\n' ' ' <<< "$failed")"

@@ -42,10 +42,14 @@ jobs:
         run: |
           run=$(gh run list --workflow build.yml --commit "$GITHUB_SHA" --limit 1 --json databaseId --jq '.[0].databaseId')
           [ -n "$run" ] || { echo "::error::no build run for $GITHUB_SHA: push it to main first (or start the build workflow on this tag)"; exit 1; }
-          gh run watch "$run" --exit-status --interval 30 > /dev/null || { echo "::error::build run $run didn't pass: re-run its failed jobs, then this"; exit 1; }
-          built=$(bash tools/ci_build.sh "$GITHUB_SHA") # (its own packages, or the pull request's it reused: build.yml's `reuse`)
+          gh run watch "$run" --interval 30 > /dev/null || true
+          ended=$(gh run view "$run" --json conclusion --jq .conclusion)
+          # (main builds only its newest commit: a run dropped for a newer push built nothing, and the
+          # build workflow is started on the tag below)
+          [ "$ended" = success ] || [ "$ended" = cancelled ] || { echo "::error::build run $run didn't pass: re-run its failed jobs, then this"; exit 1; }
+          built=$([ "$ended" = cancelled ] || bash tools/ci_build.sh "$GITHUB_SHA") # (its own packages, or the pull request's it reused: build.yml's `reuse`)
           if [ -z "$built" ]; then
-            # (a commit that isn't a version commit: main built it without macOS Intel)
+            # (a commit that isn't a version commit: main built it without macOS Intel, or not at all)
             echo "Build run $run has no macOS Intel package: starting the build workflow on $GITHUB_REF_NAME, which builds every platform."
             gh workflow run build.yml --ref "$GITHUB_REF_NAME"
             for _ in $(seq 30); do
