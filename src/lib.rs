@@ -12,6 +12,7 @@ pub mod avg;
 pub mod casts;
 pub mod intervals;
 pub mod xlsx;
+pub mod answer;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
 // Feature `server`, on by default; every module the node is made of is one of these.

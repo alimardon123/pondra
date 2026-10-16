@@ -38,14 +38,6 @@ pub fn dtype(t: &str) -> Result<DataType> {
     })
 }
 
-/// The name a table's columns record a type under (what `dtype` reads back).
-pub fn type_name(t: &DataType) -> String {
-    match crate::write::stored(t) {
-        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => format!("{}[]", type_name(f.data_type())),
-        t => t.to_string(),
-    }
-}
-
 /// A table's columns as queries read them: strings as views (Utf8View), so scans don't copy them
 /// and string filters and joins take their fast paths (TPC-H runs about 8% faster). Tables store
 /// plain Utf8 (see `schema`).
@@ -856,36 +848,7 @@ fn keep_held(held: MemoryReservation) {
 /// The memory of the answer a request kept, for the body that sends it (`server::answer`).
 pub fn take_held() -> Option<MemoryReservation> { HELD.try_with(|h| h.borrow_mut().take()).ok().flatten() }
 
-/// Batches as an Arrow IPC stream.
-pub fn ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
-    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
-    let mut w = datafusion::arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &schema)?;
-    batches.iter().try_for_each(|b| w.write(&compact(b.clone())))?;
-    w.finish()?;
-    Ok(w.into_inner()?)
-}
-
-/// A batch whose string and binary views are copied out of buffers that mostly hold other rows'
-/// strings: those a filter, a limit or a slice kept a few rows of (decoded pages, a whole
-/// group's keys, the batch a shuffle cut it from). Arrow IPC sends every buffer a view points
-/// into, and a batch kept in memory holds them: a 10-row answer of ClickBench's was 220 MB.
-pub fn compact(b: RecordBatch) -> RecordBatch {
-    use datafusion::arrow::array::{Array, AsArray};
-    fn wasteful(held: &[datafusion::arrow::buffer::Buffer], used: usize) -> bool { held.iter().map(|b| b.len()).sum::<usize>() > 2 * used + (8 << 10) }
-    let lean = |c: &ArrayRef| -> Option<ArrayRef> {
-        match c.data_type() {
-            DataType::Utf8View => Some(c.as_string_view()).filter(|v| wasteful(v.data_buffers(), v.total_buffer_bytes_used())).map(|v| Arc::new(v.gc()) as ArrayRef),
-            DataType::BinaryView => Some(c.as_binary_view()).filter(|v| wasteful(v.data_buffers(), v.total_buffer_bytes_used())).map(|v| Arc::new(v.gc()) as ArrayRef),
-            _ => None,
-        }
-    };
-    let leaner: Vec<Option<ArrayRef>> = b.columns().iter().map(lean).collect();
-    if leaner.iter().all(Option::is_none) {
-        return b;
-    }
-    let columns = leaner.into_iter().zip(b.columns()).map(|(l, c)| l.unwrap_or_else(|| c.clone())).collect();
-    RecordBatch::try_new_with_options(b.schema(), columns, &datafusion::arrow::array::RecordBatchOptions::new().with_row_count(Some(b.num_rows()))).unwrap_or(b)
-}
+pub use crate::answer::{compact, ipc, type_name};
 
 /// `pondra_json_text(x)`: a union (what `json_get` answers: a number, a string, a list…) as the text
 /// of its value, which `->>` gives too. JSON, CSV, Parquet and the Postgres port can't write a union.

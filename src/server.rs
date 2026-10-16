@@ -14,9 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use datafusion::arrow::ipc::reader::StreamReader;
-use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::execution::memory_pool::MemoryReservation;
-use datafusion::arrow::{compute::concat_batches, json as arrow_json, record_batch::RecordBatch, util::pretty::pretty_format_batches};
+use datafusion::arrow::{compute::concat_batches, json as arrow_json, record_batch::RecordBatch};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json as j, Value};
@@ -1408,24 +1407,11 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     }
 }
 
-fn content_type(format: Option<&str>) -> &'static str {
-    match format {
-        Some("table") => "text/plain",
-        Some("arrow") => "application/vnd.apache.arrow.stream",
-        Some("csv") => "text/csv; charset=utf-8",
-        Some("tsv") => "text/tab-separated-values; charset=utf-8",
-        Some("ndjson") => "application/x-ndjson",
-        Some("parquet") => "application/vnd.apache.parquet",
-        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        _ => "application/json",
-    }
-}
-
 /// One query: a key lookup without planning, a remembered answer, or run (once for everyone who
 /// asks at the same moment).
 async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Response> {
     let format = p.format.as_deref().unwrap_or("json");
-    let respond = |body: bytes::Bytes| ([("content-type", content_type(p.format.as_deref()))], body).into_response();
+    let respond = |body: bytes::Bytes| ([("content-type", crate::answer::content_type(p.format.as_deref()))], body).into_response();
     let limited = crate::auth::limited().is_some(); // (a user granted some tables: planned as it may read them, never answered from what another read, nor kept: its grants may change)
     if format == "json" && !crate::temp::mentioned(query) && !limited {
         if let Some(body) = crate::serve::point_sql(&app.lake, query).await? {
@@ -1546,7 +1532,7 @@ impl Rendered {
             Rendered::Whole(bytes) => Body::from(bytes),
             Rendered::Pieces(body) => body,
         };
-        ([("content-type", content_type(format))], body).into_response()
+        ([("content-type", crate::answer::content_type(format))], body).into_response()
     }
 }
 
@@ -1554,15 +1540,11 @@ impl Rendered {
 /// `PONDRA_STREAM_MB` of Arrow up, in pieces (`stream`).
 fn answer(batches: &[RecordBatch], p: &SqlParams) -> anyhow::Result<Rendered> {
     match (p.format.as_deref(), p.rows) {
-        (Some("typed"), Some(n)) => Ok(Rendered::Whole(typed(batches, n.clamp(1, MOST))?.into())),
-        (format, _) if streams(format) && big(batches) => Ok(Rendered::Pieces(stream(batches.to_vec(), format, crate::query::take_held())?)),
-        (format, _) => Ok(Rendered::Whole(render(batches, format)?)),
+        (Some("typed"), Some(n)) => Ok(Rendered::Whole(crate::answer::typed(batches, n.clamp(1, crate::answer::MOST), crate::pages::keep)?.into())),
+        (format, _) if crate::answer::streams(format) && big(batches) => Ok(Rendered::Pieces(stream(batches.to_vec(), format, crate::query::take_held())?)),
+        (format, _) => Ok(Rendered::Whole(crate::answer::render(batches, format, crate::pages::keep)?)),
     }
 }
-
-/// The formats an answer can be sent in pieces of (the others are rendered whole: a table, a typed
-/// answer, a Parquet or an Excel file is one thing to the reader).
-fn streams(format: Option<&str>) -> bool { !matches!(format, Some("table" | "typed" | "parquet" | "xlsx")) }
 
 /// Is an answer big enough to send in pieces: `PONDRA_STREAM_MB` (8) of Arrow, read once. 0 sends
 /// every answer in pieces (the tests compare the two ways).
@@ -1578,8 +1560,8 @@ fn big(batches: &[RecordBatch]) -> bool {
 /// it, with its message; a failure later cuts the body short (no end of it is sent). The batches,
 /// and the memory counted for them, go when the last piece is written, or when the client goes.
 fn stream(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryReservation>) -> anyhow::Result<Body> {
-    let pieces: Vec<RecordBatch> = batches.iter().flat_map(piece_rows).collect();
-    let mut enc = Encoding::new(format);
+    let pieces: Vec<RecordBatch> = batches.iter().flat_map(crate::answer::piece_rows).collect();
+    let mut enc = crate::answer::Encoding::new(format);
     let mut steps = pieces.into_iter().map(Some).chain(std::iter::once(None)); // (then the end)
     let first = enc.step(steps.next().flatten().as_ref())?;
     // The rest is written on the queries' runtime, at most two pieces ahead of the client: the
@@ -1600,227 +1582,21 @@ fn stream(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryRe
     Ok(Body::from_stream(head.chain(rest)))
 }
 
-/// A batch cut into pieces of about 1 MB of Arrow (by its rows' average size). An empty batch is one
-/// empty piece, so that CSV's header comes with the first piece, as `render` writes it.
-fn piece_rows(b: &RecordBatch) -> Vec<RecordBatch> {
-    const PIECE: usize = 1 << 20;
-    let rows = b.num_rows();
-    if rows == 0 {
-        return vec![b.clone()];
-    }
-    let per_row = (b.get_array_memory_size() / rows).max(1);
-    let step = (PIECE / per_row).max(1);
-    (0..rows).step_by(step).map(|at| b.slice(at, step.min(rows - at))).collect()
-}
-
-/// The pieces of one answer in one format. Written together they are what `render` writes for the
-/// whole answer: JSON's brackets and commas across pieces, CSV's header once, one Arrow stream.
-struct Encoding {
-    shape: Shape,
-    begun: bool, // the first piece is written (JSON's "[" and CSV's header go with it)
-    rows: usize, // JSON rows written so far (a comma goes before each but the first)
-    arrow: Option<StreamWriter<Vec<u8>>>,
-}
-
-#[derive(Clone, Copy)]
-enum Shape {
-    Json,
-    Lines,
-    Csv(u8),
-    Arrow,
-}
-
-impl Encoding {
-    fn new(format: Option<&str>) -> Self {
-        let shape = match format {
-            Some("csv") => Shape::Csv(b','),
-            Some("tsv") => Shape::Csv(b'\t'),
-            Some("ndjson") => Shape::Lines,
-            Some("arrow") => Shape::Arrow,
-            _ => Shape::Json, // (as `render`: any other format is JSON)
-        };
-        Encoding { shape, begun: false, rows: 0, arrow: None }
-    }
-
-    /// The bytes of one piece.
-    fn piece(&mut self, b: &RecordBatch) -> anyhow::Result<Vec<u8>> {
-        match self.shape {
-            Shape::Json => {
-                let mut out = self.open();
-                for row in lines(b)?.split(|c| *c == b'\n').filter(|r| !r.is_empty()) {
-                    if self.rows > 0 {
-                        out.push(b',');
-                    }
-                    out.extend_from_slice(row);
-                    self.rows += 1;
-                }
-                Ok(out)
-            }
-            Shape::Lines => lines(b),
-            Shape::Csv(delimiter) => {
-                let header = !std::mem::replace(&mut self.begun, true);
-                let mut w = datafusion::arrow::csv::WriterBuilder::new().with_header(header).with_delimiter(delimiter).build(Vec::new());
-                w.write(b)?;
-                Ok(w.into_inner())
-            }
-            Shape::Arrow => {
-                let mut w = match self.arrow.take() {
-                    Some(w) => w,
-                    None => StreamWriter::try_new(Vec::new(), &b.schema())?, // (its schema goes with the first piece)
-                };
-                w.write(&crate::query::compact(b.clone()))?;
-                let out = std::mem::take(w.get_mut());
-                self.arrow = Some(w);
-                Ok(out)
-            }
-        }
-    }
-
-    /// One step of the answer: a piece, or (None) what closes it.
-    fn step(&mut self, piece: Option<&RecordBatch>) -> anyhow::Result<Vec<u8>> {
-        match piece {
-            Some(b) => self.piece(b),
-            None => self.end(),
-        }
-    }
-
-    /// What closes the answer: JSON's "]" (after its "[", if no piece had rows), Arrow's end of stream.
-    fn end(&mut self) -> anyhow::Result<Vec<u8>> {
-        match self.shape {
-            Shape::Json => {
-                let mut out = self.open();
-                out.push(b']');
-                Ok(out)
-            }
-            Shape::Arrow => {
-                let mut w = match self.arrow.take() {
-                    Some(w) => w,
-                    None => StreamWriter::try_new(Vec::new(), &datafusion::arrow::datatypes::Schema::empty())?, // (no rows at all: as `query::ipc` writes them)
-                };
-                w.finish()?;
-                Ok(std::mem::take(w.get_mut()))
-            }
-            Shape::Lines | Shape::Csv(_) => Ok(vec![]),
-        }
-    }
-
-    /// JSON's "[", once: before the first piece's rows, or before the "]" when there are none.
-    fn open(&mut self) -> Vec<u8> {
-        if std::mem::replace(&mut self.begun, true) {
-            vec![]
-        } else {
-            b"[".to_vec()
-        }
-    }
-}
-
-/// A piece's rows as newline-delimited JSON (`render`'s own writer, one line a row).
-fn lines(b: &RecordBatch) -> anyhow::Result<Vec<u8>> {
-    let mut w = arrow_json::LineDelimitedWriter::new(Vec::new());
-    w.write_batches(&[b])?;
-    w.finish()?;
-    Ok(w.into_inner())
-}
-
-/// Rows as `?format=` asks: JSON, a text table, or Arrow IPC (straight into pandas, Polars and
-/// DuckDB, no JSON parsing); or a file of them to download: CSV, TSV, NDJSON, Parquet, Excel.
-pub fn render(batches: &[RecordBatch], format: Option<&str>) -> anyhow::Result<bytes::Bytes> {
-    Ok(bytes::Bytes::from(match format {
-        Some("table") => pretty_format_batches(batches)?.to_string().into_bytes(),
-        Some("typed") => typed(batches, SHOWN)?,
-        Some("arrow") => crate::query::ipc(batches)?,
-        Some(f @ ("csv" | "tsv")) => {
-            let mut w = datafusion::arrow::csv::WriterBuilder::new().with_header(true).with_delimiter(if f == "tsv" { b'\t' } else { b',' }).build(Vec::new());
-            for b in batches {
-                w.write(b)?;
-            }
-            w.into_inner()
-        }
-        Some("ndjson") => {
-            let mut w = arrow_json::LineDelimitedWriter::new(Vec::new());
-            w.write_batches(&batches.iter().collect::<Vec<_>>())?;
-            w.finish()?;
-            w.into_inner()
-        }
-        Some("parquet") => {
-            let batches = batches.iter().map(crate::tier::storable).collect::<anyhow::Result<Vec<_>>>()?; // (intervals as text)
-            let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
-            let mut w = datafusion::parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, None)?;
-            for b in &batches {
-                w.write(b)?;
-            }
-            w.into_inner()?
-        }
-        Some("xlsx") => crate::xlsx::workbook(batches)?,
-        _ => {
-            let mut w = arrow_json::ArrayWriter::new(Vec::new());
-            w.write_batches(&batches.iter().collect::<Vec<_>>())?;
-            w.finish()?;
-            w.into_inner()
-        }
-    }))
-}
-
-/// The rows of an answer the console is sent at once, a page, unless it asks for another number
-/// (`?rows=`, its rows a page), at most `MOST`.
-const SHOWN: usize = 10_000;
-const MOST: usize = 100_000;
-
-/// The console's answer (`?format=typed`, `console/console.js`): the columns with their types, the
-/// first `shown` rows as lists in the columns' order (two columns may share a name: a join's), how
-/// many rows there were, and the id it is kept under (`pages.rs`): its other pages, and every row
-/// downloaded, are read from there (`page`), not run again.
-fn typed(batches: &[RecordBatch], shown: usize) -> anyhow::Result<Vec<u8>> {
-    let columns: Vec<Value> = batches.first().map(|b| b.schema().fields().iter().map(|f| j!({"name": f.name(), "type": crate::query::type_name(f.data_type())})).collect()).unwrap_or_default();
-    let mut w = arrow_json::ArrayWriter::new(Vec::new());
-    let mut left = shown;
-    for b in batches.iter().filter(|b| b.num_rows() > 0) {
-        let b = b.slice(0, left.min(b.num_rows()));
-        left -= b.num_rows();
-        let exact: Vec<datafusion::arrow::array::ArrayRef> = b.columns().iter().map(exact).collect::<Result<_, _>>()?;
-        let numbered: Vec<_> = b.schema().fields().iter().zip(&exact).enumerate().map(|(i, (f, c))| f.as_ref().clone().with_name(i.to_string()).with_data_type(c.data_type().clone())).collect(); // (unique keys)
-        w.write(&RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(numbered)), exact)?)?;
-        if left == 0 {
-            break;
-        }
-    }
-    w.finish()?;
-    let objects: Vec<serde_json::Map<String, Value>> = serde_json::from_slice(&w.into_inner()).unwrap_or_default();
-    let rows: Vec<Value> = objects.into_iter().map(|mut o| Value::Array((0..columns.len()).map(|i| o.remove(&i.to_string()).unwrap_or(Value::Null)).collect())).collect();
-    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    let pages = crate::pages::keep(batches);
-    Ok(serde_json::to_vec(&j!({"columns": columns, "rows": rows, "total": total, "pages": pages}))?)
-}
-
 /// `GET /sql/pages/{id}?from=10000&rows=10000`: more rows of an answer the console was sent
 /// (`pages.rs`), as `typed` has them; with `&format=csv|tsv|ndjson|parquet|xlsx`, every row of it as
 /// a file to download (`render`), not run again. 410 once it is no longer kept (run it again).
 async fn page(Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
     let num = |k: &str, or: usize| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(or);
-    let (from, rows, format) = (num("from", 0), num("rows", SHOWN).clamp(1, MOST), q.get("format").map(String::as_str).filter(|f| *f != "typed"));
+    let (from, rows, format) = (num("from", 0), num("rows", crate::answer::SHOWN).clamp(1, crate::answer::MOST), q.get("format").map(String::as_str).filter(|f| *f != "typed"));
     let got = match format {
-        Some(f) => crate::pages::page(&id, 0, usize::MAX).map(|b| render(&b, Some(f))),
-        None => crate::pages::page(&id, from, rows).map(|b| typed(&b, rows).map(bytes::Bytes::from)),
+        Some(f) => crate::pages::page(&id, 0, usize::MAX).map(|b| crate::answer::render(&b, Some(f), crate::pages::keep)),
+        None => crate::pages::page(&id, from, rows).map(|b| crate::answer::typed(&b, rows, crate::pages::keep).map(bytes::Bytes::from)),
     };
     match got {
-        Some(Ok(body)) => ([("content-type", content_type(format))], body).into_response(),
+        Some(Ok(body)) => ([("content-type", crate::answer::content_type(format))], body).into_response(),
         Some(Err(e)) => E(e).into_response(),
         None => (StatusCode::GONE, "this answer's rows are no longer kept here: run it again").into_response(),
     }
-}
-
-/// A column as JavaScript can hold it exactly: decimals as their digits (`1.50`), and 64-bit
-/// integers past 2^53 as text.
-fn exact(c: &datafusion::arrow::array::ArrayRef) -> anyhow::Result<datafusion::arrow::array::ArrayRef> {
-    use datafusion::arrow::{array::AsArray, compute, datatypes::{DataType, Int64Type, UInt64Type}};
-    const SAFE: i64 = (1 << 53) - 1;
-    let text = match c.data_type() {
-        DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..) => true,
-        DataType::Int64 => compute::min(c.as_primitive::<Int64Type>()).is_some_and(|m| m < -SAFE) || compute::max(c.as_primitive::<Int64Type>()).is_some_and(|m| m > SAFE),
-        DataType::UInt64 => compute::max(c.as_primitive::<UInt64Type>()).is_some_and(|m| m > SAFE as u64),
-        _ => false,
-    };
-    Ok(if text { compute::cast(c, &DataType::Utf8)? } else { c.clone() })
 }
 
 #[derive(Deserialize)]

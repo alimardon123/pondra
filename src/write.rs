@@ -11,7 +11,7 @@ use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 use datafusion::arrow::compute::concat_batches;
-use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{self, Statement};
@@ -977,15 +977,7 @@ pub async fn define(app: &crate::server::App, name: &str, spec: &str) -> Result<
     Ok(out)
 }
 
-/// How a SQL type is kept: strings as Utf8; timestamps in microseconds, as Iceberg, Delta, Spark
-/// and Postgres keep them.
-pub fn stored(t: &DataType) -> DataType {
-    match t {
-        DataType::Utf8View | DataType::LargeUtf8 => DataType::Utf8,
-        DataType::Timestamp(_, tz) => DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
-        t => t.clone(),
-    }
-}
+pub use crate::answer::stored;
 
 /// `ALTER TABLE t ADD COLUMN c TYPE`: the table's definition with the new column at the end, sent
 /// like a CREATE TABLE (the leader adds it; old rows read it as null). None: IF NOT EXISTS, and it does.
