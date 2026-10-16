@@ -6,7 +6,7 @@ name: build
 # packages installed and tried as users get them (tools/try_packages.sh). The website is built as
 # `pages.yml` publishes it (a pull request's when it changes `site/` or `brand/`). linux-x64 is built
 # first, on its own, and the suite then runs on its binary in parts side by side, with the tests
-# that need only it (upgrade, resilience, sharing), while the other platforms finish (the slowest,
+# that need only it (upgrade, resilience, sharing, sso), while the other platforms finish (the slowest,
 # macOS Intel, holds up none of them).
 # A tag's release (release.yml) publishes this run's packages: nothing is built twice, and what
 # the suite tested is what ships. A pull request's push runs nothing (its thread builds and tests
@@ -53,6 +53,7 @@ jobs:
       resilience: ${{ steps.plan.outputs.resilience }}
       upgrade: ${{ steps.plan.outputs.upgrade }}
       sharing: ${{ steps.plan.outputs.sharing }}
+      sso: ${{ steps.plan.outputs.sso }}
       deploy: ${{ steps.plan.outputs.deploy }}
       wait: ${{ steps.plan.outputs.wait }}
       site: ${{ steps.plan.outputs.site }}
@@ -94,11 +95,12 @@ jobs:
             files=$(git diff --name-only HEAD^1 HEAD)
             if grep -qE '^(src/|Cargo\.(toml|lock)$|python/pondra/client\.py$|js/index\.js$|tools/(resilience_check|faulty_s3|sim_r2|harness)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(resilience|build)\.yml$)' <<< "$files"; then resilience=true; else resilience=false; fi
             if grep -qE '^(src/(shares|sharing|vend|read_delta|delta|ext|scan|audit|server)\.rs$|tools/(sharing_check|sim_r2)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sharing|build)\.yml$)' <<< "$files"; then sharing=true; else sharing=false; fi
+            if grep -qE '^(src/(sso|sso_flow|users|auth|pg|flight|kafka)\.rs$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)' <<< "$files"; then sso=true; else sso=false; fi
             if [ "$FULL" = true ] && grep -qE '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)' <<< "$files"; then deploy=true; else deploy=false; fi
             if grep -qE '^(site/|brand/|\.github/workflows/(build|pages)\.yml$)' <<< "$files"; then site=true; else site=false; fi
             echo "site=$site" >> "$GITHUB_OUTPUT"
-            printf 'upgrade=true\nresilience=%s\nsharing=%s\ndeploy=%s\n' "$resilience" "$sharing" "$deploy" >> "$GITHUB_OUTPUT"
-            echo "After the build: upgrade$([ "$resilience" = false ] || echo ', resilience')$([ "$sharing" = false ] || echo ', sharing')$([ "$deploy" = false ] || echo ', deploy')." >> "$GITHUB_STEP_SUMMARY"
+            printf 'upgrade=true\nresilience=%s\nsharing=%s\nsso=%s\ndeploy=%s\n' "$resilience" "$sharing" "$sso" "$deploy" >> "$GITHUB_OUTPUT"
+            echo "After the build: upgrade$([ "$resilience" = false ] || echo ', resilience')$([ "$sharing" = false ] || echo ', sharing')$([ "$sso" = false ] || echo ', sso')$([ "$deploy" = false ] || echo ', deploy')." >> "$GITHUB_STEP_SUMMARY"
             # At most four pull requests' CI at once (two from 2026-10-03; four from 2026-10-11, for the
             # month's eight lanes; ci-slots.yml's SLOTS says the same): with four older runs of other
             # pull requests going, this one waits. It builds nothing, its check `waiting for a
@@ -358,6 +360,11 @@ jobs:
     if: ${{ !cancelled() && needs.linux.result == 'success' && needs.plan.outputs.sharing == 'true' }}
     permissions: { actions: read, contents: read }
     uses: ./.github/workflows/sharing.yml
+  sso:
+    needs: [plan, linux]
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.plan.outputs.sso == 'true' }}
+    permissions: { actions: read, contents: read }
+    uses: ./.github/workflows/sso.yml
   deploy:
     needs: [plan, linux, build]
     if: ${{ !cancelled() && needs.linux.result == 'success' && needs.build.result == 'success' && needs.plan.outputs.deploy == 'true' }}

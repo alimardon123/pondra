@@ -6,8 +6,9 @@ the JWKS, the code flow with PKCE, an id token and an access token. /authorize s
 once; there is no login page. Test-only routes (not the standard's): /_test/stats counts fetches and token
 requests, /_test/mint makes a token of any claims, algorithm and key (forgeries too), /_test/rotate adds a
 signing key, /_test/user says who signs in next, /_test/next what the next flow does (an error from /authorize,
-or a nonce for the next ID token: each applies once). It needs `cryptography`, which comes with `moto` in
-tools/requirements.txt, and otherwise the standard library.
+or a nonce for the next ID token: each applies once). The device flow (RFC 8628) is there too: /device, the
+token endpoint's device grant (approved at its second poll), and /_test/next {"error": …} refuses the next device
+code. It needs `cryptography`, which comes with `moto` in tools/requirements.txt, and otherwise the standard library.
 
   python3 tools/fake_idp.py --port 9100                           # serves until killed
   python3 tools/fake_idp.py --port 9100 --issuer http://idp.test  # discovery names another issuer
@@ -76,7 +77,7 @@ def sign(alg, key, data):
 
 
 class Idp:
-    """The provider's state: its keys (the JWKS), the codes it gave, who signs in, and the counts."""
+    """The provider's state: its keys (the JWKS), the codes and device codes it gave, who signs in, and the counts."""
 
     def __init__(self, issuer, client_secret, access_audience):
         self.issuer, self.client_secret, self.access_audience = issuer, client_secret, access_audience
@@ -84,8 +85,9 @@ class Idp:
         self.add_rsa()
         self.keys["ec1"] = new_key("ec")
         self.codes, self.user = {}, dict(TEST_USER)
+        self.devices = {}  # device codes (RFC 8628): each with its client, its user, its polls and any refusal
         self.next_flow = {}  # what the next flow does: {"error": "access_denied"} or {"nonce": "x"}; each applies once
-        self.stats = {"jwks_fetches": 0, "discovery_fetches": 0, "token_requests": 0}
+        self.stats = {"jwks_fetches": 0, "discovery_fetches": 0, "token_requests": 0, "device_requests": 0}
         self.lock = threading.Lock()  # one request at a time, so the counts and codes stay right
 
     def add_rsa(self):
@@ -144,6 +146,8 @@ class Idp:
             user, _, secret = base64.b64decode(auth[6:]).decode().partition(":")
         if self.client_secret is not None and secret != self.client_secret:
             return 400, {"error": "invalid_client"}
+        if form.get("grant_type") == "urn:ietf:params:oauth:grant-type:device_code":
+            return self.device_token(form, form.get("client_id") or user)  # the client the code flow reads, too
         entry = self.codes.get(form.get("code"))
         if form.get("grant_type") != "authorization_code" or entry is None or entry["spent"] or time.time() > entry["expires"]:
             return 400, {"error": "invalid_grant"}
@@ -162,6 +166,44 @@ class Idp:
         return 200, {"id_token": self.mint({"claims": id_claims}), "access_token": self.mint({"claims": access}),
                      "token_type": "Bearer", "expires_in": 300}
 
+    def device_request(self, form):
+        """RFC 8628's device authorization: a device code to poll with, and the user code a person types at /activate."""
+        self.stats["device_requests"] += 1  # counted as the token requests are, whatever the answer
+        if not form.get("client_id"):
+            return 400, {"error": "invalid_request"}
+        letters = "".join(secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(8))
+        user_code = f"{letters[:4]}-{letters[4:]}"  # written in two halves, as people type it
+        device_code = secrets.token_urlsafe(24)
+        # the refusal the test set up applies to this device code, as the next sign-in's would
+        self.devices[device_code] = {"client_id": form["client_id"], "scope": form.get("scope"), "user": dict(self.user),
+                                     "polls": 0, "expires": time.time() + 300, "spent": False,
+                                     "error": self.next_flow.pop("error") if "error" in self.next_flow else None}
+        return 200, {"device_code": device_code, "user_code": user_code, "verification_uri": self.issuer + "/activate",
+                     "verification_uri_complete": self.issuer + "/activate?user_code=" + user_code,
+                     "expires_in": 300, "interval": 1}
+
+    def device_token(self, form, client_id):
+        """The device grant: the first poll is pending, the second approves (or gives the refusal the test set up)."""
+        entry = self.devices.get(form.get("device_code"))
+        if entry is None or entry["spent"]:  # a code is used once: its first answer spends it
+            return 400, {"error": "invalid_grant"}
+        if time.time() > entry["expires"]:
+            return 400, {"error": "expired_token"}
+        if client_id != entry["client_id"]:  # a code is for the client it was made for; this isn't a poll
+            return 400, {"error": "invalid_grant"}
+        entry["polls"] += 1
+        if entry["polls"] == 1:  # the client must keep polling: its first poll is always pending
+            return 400, {"error": "authorization_pending"}
+        entry["spent"] = True
+        if entry["error"]:
+            return 400, {"error": entry["error"]}
+        now = int(time.time())
+        id_claims = {**entry["user"], "iss": self.issuer, "aud": entry["client_id"], "iat": now, "exp": now + 300}
+        access = {**entry["user"], "iss": self.issuer, "aud": self.access_audience, "iat": now, "exp": now + 300,
+                  **({"scope": entry["scope"]} if entry["scope"] else {})}
+        return 200, {"id_token": self.mint({"claims": id_claims}), "access_token": self.mint({"claims": access}),
+                     "token_type": "Bearer", "expires_in": 300}
+
     def rotate(self, body):
         self.add_rsa()
         if body.get("drop_old"):  # every RSA key but the newest goes; ec1 stays
@@ -174,7 +216,9 @@ class Idp:
         if route == ("GET", "/.well-known/openid-configuration"):
             self.stats["discovery_fetches"] += 1
             return 200, {"issuer": i, "jwks_uri": i + "/jwks", "authorization_endpoint": i + "/authorize",
-                         "token_endpoint": i + "/token", "response_types_supported": ["code"],
+                         "token_endpoint": i + "/token", "device_authorization_endpoint": i + "/device",
+                         "response_types_supported": ["code"],
+                         "grant_types_supported": ["authorization_code", "urn:ietf:params:oauth:grant-type:device_code"],
                          "id_token_signing_alg_values_supported": ["RS256", "ES256"],
                          "code_challenge_methods_supported": ["S256"]}
         if route == ("GET", "/jwks"):
@@ -186,6 +230,11 @@ class Idp:
             return self.authorize({k: v[0] for k, v in query.items()})
         if route == ("POST", "/token"):
             return self.token({k: v[0] for k, v in parse_qs(raw.decode()).items()}, auth)
+        if route == ("POST", "/device"):
+            return self.device_request({k: v[0] for k, v in parse_qs(raw.decode()).items()})
+        if route == ("GET", "/activate"):  # the test provider approves on its own; the page just answers
+            return 200, {"user_code": query.get("user_code", [None])[0],
+                         "note": "the test provider approves every device code itself"}
         if route == ("POST", "/_test/mint"):
             return 200, {"token": self.mint(json.loads(raw or b"{}"))}
         if route == ("POST", "/_test/rotate"):
@@ -313,11 +362,19 @@ def selftest():
                 "code_verifier": verifier, **extra}
         return call("POST", "/token", form=form, headers=headers, at=at)
 
+    def poll(device_code, who=client):  # the device grant, as a device polls the token endpoint
+        form = {"grant_type": "urn:ietf:params:oauth:grant-type:device_code", "device_code": device_code, "client_id": who}
+        return call("POST", "/token", form=form)
+
     disc = call("GET", "/.well-known/openid-configuration")[2]
     check("discovery names its issuer and endpoints", disc == {
         "issuer": issuer, "jwks_uri": issuer + "/jwks", "authorization_endpoint": issuer + "/authorize",
-        "token_endpoint": issuer + "/token", "response_types_supported": ["code"],
+        "token_endpoint": issuer + "/token", "device_authorization_endpoint": issuer + "/device",
+        "response_types_supported": ["code"], "grant_types_supported": ["authorization_code", "urn:ietf:params:oauth:grant-type:device_code"],
         "id_token_signing_alg_values_supported": ["RS256", "ES256"], "code_challenge_methods_supported": ["S256"]})
+    check("discovery names /device, and the device grant on the token endpoint",
+          disc["device_authorization_endpoint"] == issuer + "/device"
+          and "urn:ietf:params:oauth:grant-type:device_code" in disc["grant_types_supported"])
     check("an unknown route answers 404", call("GET", "/nope")[0] == 404)
     keys = jwks()
     check("jwks: rsa1 is RSA 2048 (RS256); ec1 is P-256 (ES256) with 32-byte x and y",
@@ -395,6 +452,57 @@ def selftest():
     verifier, challenge = pkce()
     tok = redeem(sign_in(params(challenge))[1]["code"], verifier)[2]
     check("…and the token after that carries the request's own nonce (n1): each applies once", verify(tok["id_token"], jwks()[header(tok["id_token"])["kid"]])["nonce"] == "n1")
+
+    # the device flow (RFC 8628): a device polls /token until the user approves, and its first poll is pending
+    no_client = call("POST", "/device", form={"scope": "openid email"})
+    check("POST /device without a client_id: 400 invalid_request",
+          no_client[0] == 400 and no_client[2] == {"error": "invalid_request"})
+    made = call("POST", "/device", form={"client_id": client, "scope": "openid email"})[2]
+    check("POST /device: a device code, a user code written ABCD-EFGH, and the verification URIs",
+          made["device_code"] and len(made["user_code"]) == 9 and made["user_code"][4] == "-"
+          and made["user_code"].replace("-", "").isalpha() and made["user_code"].isupper()
+          and made["verification_uri"] == issuer + "/activate"
+          and made["verification_uri_complete"] == issuer + "/activate?user_code=" + made["user_code"])
+    activate = call("GET", "/activate?user_code=" + made["user_code"])[2]
+    check("GET /activate answers with the user code it was given", activate["user_code"] == made["user_code"])
+    first = poll(made["device_code"])
+    check("device poll 1: 400 authorization_pending, so the client keeps polling",
+          first[0] == 400 and first[2] == {"error": "authorization_pending"})
+    second = poll(made["device_code"])
+    check("device poll 2: 200 with a Bearer token", second[0] == 200 and second[2]["token_type"] == "Bearer")
+    tokens = second[2]
+    device_access = verify(tokens["access_token"], jwks()[header(tokens["access_token"])["kid"]])
+    device_id = verify(tokens["id_token"], jwks()[header(tokens["id_token"])["kid"]])
+    check("the device's tokens verify: access aud = the API, the test user's email and the scope; id aud = the client",
+          device_access["aud"] == "api://pondra" and device_access["email"] == "ana@acme.com"
+          and device_access["scope"] == "openid email" and device_id["aud"] == client)
+    third = poll(made["device_code"])
+    check("the same device code polled a third time: 400 invalid_grant (it was spent)",
+          third[0] == 400 and third[2] == {"error": "invalid_grant"})
+    made = call("POST", "/device", form={"client_id": client, "scope": "openid email"})[2]
+    other = poll(made["device_code"], who="pondra-other")
+    check("a device code polled as another client: 400 invalid_grant",
+          other[0] == 400 and other[2] == {"error": "invalid_grant"})
+    still = poll(made["device_code"])
+    check("...and that wasn't a poll: the client's own first poll is still pending",
+          still[2] == {"error": "authorization_pending"})
+    basic = {"Authorization": "Basic " + base64.b64encode(f"{client}:".encode()).decode()}
+    by_basic = call("POST", "/token", form={"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                                            "device_code": made["device_code"]}, headers=basic)
+    check("the client named in HTTP Basic, not in the form: its second poll gives tokens", by_basic[0] == 200)
+    made = call("POST", "/device", form={"client_id": client})[2]
+    with server.idp.lock:  # the test moves this code past its five minutes
+        server.idp.devices[made["device_code"]]["expires"] = 0
+    expired = poll(made["device_code"])
+    check("an expired device code: 400 expired_token", expired[0] == 400 and expired[2] == {"error": "expired_token"})
+    call("POST", "/_test/next", {"error": "access_denied"})
+    refused = call("POST", "/device", form={"client_id": client})[2]
+    poll(refused["device_code"])  # the first poll is pending, as every first poll is
+    denied = poll(refused["device_code"])
+    check("after /_test/next {error: access_denied}, the next device code's second poll answers access_denied",
+          denied[0] == 400 and denied[2] == {"error": "access_denied"})
+    device_stats = call("GET", "/_test/stats")[2]
+    check("stats: device_requests counts every POST /device (five here)", device_stats["device_requests"] == 5)
 
     secured = start(0, client_secret="s3cret")
     at = f"http://127.0.0.1:{secured.server_address[1]}"

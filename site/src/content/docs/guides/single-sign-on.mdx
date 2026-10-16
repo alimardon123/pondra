@@ -1,0 +1,243 @@
+---
+title: Single sign-on
+description: Let people sign in with the company's account (Okta, Entra ID, Google, Keycloak, Auth0) in the console, on the command line, and from every driver and client, with IT's groups as roles.
+---
+
+import { Tabs, TabItem, Aside, Steps } from '@astrojs/starlight/components';
+
+Single sign-on lets people use their company account instead of a password you hand out. You add the
+company's identity provider once, and every door accepts its tokens. That covers the console, `pondra login`,
+the Python and JavaScript clients, Postgres drivers and psql 18, Kafka, Arrow Flight and MCP. When someone
+leaves the company, IT turns their account off and they can't get in.
+
+Any provider that speaks OpenID Connect works. This page shows Okta, Entra ID, Google and Keycloak.
+
+## Add your provider
+
+First register Pondra as an application at your provider (see [your provider's setup](#your-providers-setup)).
+That gives you an issuer, a client ID and usually a client secret. Then a superuser adds the provider:
+
+```sql norun
+CREATE SECRET okta_client (TYPE generic, CLIENT_SECRET 'the-client-secret');
+
+CREATE IDENTITY PROVIDER okta (
+  ISSUER 'https://acme.okta.com/oauth2/default',
+  CLIENT_ID '0oa1b2c3d4',
+  SECRET 'okta_client',
+  AUDIENCE ('api://default'),
+  ROLES_CLAIM 'groups',
+  LABEL 'Okta'
+);
+```
+
+The node asks the issuer for its signing keys right away, so a mistyped issuer is refused now rather than at
+everyone's sign-in. The client secret stays sealed in its [secret](/pondra/guides/security/#secrets), never in
+the provider. Every option is listed in [SQL statements](/pondra/sql/statements/#identity-providers).
+
+<Aside type="caution" title="After this, everyone signs in">
+A lake with an identity provider is a lake people sign in to. If the node had no tokens, it answers no one
+unsigned from then on. Keep an admin token, or make one with `pondra token --dir LAKE`, so you can still get in
+as an administrator.
+</Aside>
+
+Change a provider with `CREATE OR REPLACE IDENTITY PROVIDER`; `ALTER` is refused. `DROP IDENTITY PROVIDER okta`
+ends every session it made at once.
+
+## Who may sign in
+
+By default (`USERS 'listed'`) only the people you make a user for may sign in, each with that user's own grants.
+The user's name is what the token's `email` claim says, in lower case. Such a user has no password:
+
+```sql norun
+CREATE USER "ana@acme.com";
+GRANT SELECT ON sales TO "ana@acme.com";
+```
+
+To let anyone the provider vouches for in, say `USERS 'any'`. Such a person gets `public`'s grants and the
+roles their token claims, and no user is made for them. `ROLES_CLAIM` names the claim holding IT's groups. Each
+value that names a role here makes the person a member of that role for that sign-in, and other values are
+ignored. So IT decides who is in which group, and you grant to the roles:
+
+```sql norun
+CREATE ROLE analysts;
+GRANT SELECT ON ALL TABLES IN SCHEMA sales TO analysts;
+
+CREATE OR REPLACE IDENTITY PROVIDER okta (
+  ISSUER 'https://acme.okta.com/oauth2/default', CLIENT_ID '0oa1b2c3d4', SECRET 'okta_client',
+  AUDIENCE ('api://default'), ROLES_CLAIM 'groups', USERS 'any', LABEL 'Okta'
+);
+```
+
+<Aside type="caution" title="'any' is for your company's own provider">
+Use `USERS 'any'` only with a provider that holds just your company's accounts. At a provider anyone may sign up
+to (Google's `accounts.google.com`, a public Auth0 tenant), every account there would get in. Use `'listed'`
+there.
+</Aside>
+
+A token signs someone in only when it is signed by one of the provider's keys, its `iss` is exactly the issuer,
+its `aud` is the `CLIENT_ID` or one of the `AUDIENCE`s, it hasn't expired, and its `email` is verified.
+`USER_CLAIM` picks another claim to name the user, such as `preferred_username`. You may add several providers,
+for example one for people and one for services, or two companies'. The first one, by name, that signs a token's
+user in is the one used.
+
+## Signing in, door by door
+
+### The console
+
+The console's sign-in dialog shows a button for each provider, "Sign in with Okta" (its `LABEL`). The browser goes
+to the provider and comes back to the console, signed in for `PONDRA_SESSION_HOURS` (12). Register this redirect
+URI at the provider: the address people open the console at, plus `/sso/callback`. For example,
+`https://pondra.acme.com/sso/callback`, or `https://pondra.acme.com/db/sales/sso/callback` for one database of a
+[folder of lakes](/pondra/guides/server/).
+
+Behind a load balancer, list it in `PONDRA_TRUSTED_PROXIES`, so the node builds the redirect URI from the
+address the browser used.
+
+### The command line and the clients
+
+`pondra login` opens the browser to the provider, and keeps the session in `~/.pondra/login.json`:
+
+```bash norun
+pondra login https://pondra.acme.com
+pondra login https://pondra.acme.com --provider okta   # when the lake has several providers
+```
+
+```text
+signed in to https://pondra.acme.com (ana@acme.com, read)
+```
+
+Then `pondra run`, the [project commands](/pondra/guides/projects/), and the Python and JavaScript clients use that
+session for that server when you give them no token:
+
+```python norun
+import pondra
+db = pondra.connect("https://pondra.acme.com")   # the session pondra login kept
+```
+
+A program that has a provider's token of its own sends it as a bearer token, through any client or plain HTTP:
+
+```python norun
+db = pondra.connect("https://pondra.acme.com", token=access_token)
+```
+
+### Postgres drivers
+
+By default a Postgres driver sends the provider's token as the password, with the user's name. This works with
+every driver and BI tool, as on Azure's and AWS's Postgres:
+
+```bash norun
+PGPASSWORD="$ACCESS_TOKEN" psql "host=pondra.acme.com user=ana@acme.com dbname=lake sslmode=require"
+```
+
+A token is longer than some tools allow in their password box. psql 18 can fetch a token itself instead. Say
+`POSTGRES 'oauth'` on the provider, and register a public client at the provider that may use the device
+authorization grant (psql's client ID, below `pondra-cli`):
+
+```sql norun
+CREATE OR REPLACE IDENTITY PROVIDER okta (
+  ISSUER 'https://acme.okta.com/oauth2/default', CLIENT_ID '0oa1b2c3d4', SECRET 'okta_client',
+  AUDIENCE ('api://default'), ROLES_CLAIM 'groups', LABEL 'Okta', POSTGRES 'oauth'
+);
+```
+
+```bash norun
+psql "host=pondra.acme.com user=ana@acme.com dbname=lake sslmode=require oauth_issuer=https://acme.okta.com/oauth2/default oauth_client_id=pondra-cli"
+```
+
+```text
+Visit https://acme.okta.com/activate and enter the code: BCDF-GHJK
+```
+
+You open that address, enter the code and sign in, and psql connects. With `POSTGRES 'oauth'`, a user with no
+password signs in only through OAuth (Postgres 18's `OAUTHBEARER`), so their other drivers need libpq 18 with
+OAuth too. An older driver is refused with a message saying so. Leave the default when people's tools are
+older. A user with a password still signs in with it.
+
+### Kafka, Flight and MCP
+
+- **Kafka** clients use SASL `OAUTHBEARER`, and fetch tokens from the provider themselves (librdkafka's
+  `sasl.oauthbearer.method=oidc`). `PLAIN` takes a user's name and a token as its password. See
+  [Kafka's protocol](/pondra/reference/kafka-protocol/).
+- **Arrow Flight** and ADBC send a bearer token, or the user's name and a token as the password in their
+  handshake.
+- **MCP** clients find the provider at `GET /.well-known/oauth-protected-resource` and send a bearer token. See
+  [agents](/pondra/guides/agents/).
+
+## Your provider's setup
+
+<Tabs>
+  <TabItem label="Okta">
+    <Steps>
+    1. Make an **OIDC web application**. Its sign-in redirect URI is your console's address plus `/sso/callback`.
+       Keep its client ID and client secret.
+    2. Use a custom authorization server, such as `default`: its issuer is `https://acme.okta.com/oauth2/default`.
+       The org server's access tokens are only for Okta's own APIs.
+    3. Its audience (`api://default` for `default`) goes in `AUDIENCE`, so drivers' access tokens are taken.
+    4. For groups as roles, add a `groups` claim to the authorization server's ID and access tokens, and say
+       `ROLES_CLAIM 'groups'`.
+    5. For psql 18, add an **OIDC native application** with the Device Authorization grant. Its client ID is
+       psql's `oauth_client_id`.
+    </Steps>
+  </TabItem>
+  <TabItem label="Entra ID">
+    <Steps>
+    1. Register an application. Add a **Web** redirect URI (your console's address plus `/sso/callback`), and a
+       client secret under *Certificates & secrets*.
+    2. The issuer is `https://login.microsoftonline.com/<tenant-id>/v2.0`, and the client ID is the application
+       (client) ID.
+    3. Set `requestedAccessTokenVersion` to `2` in the manifest, so access tokens carry that issuer. Under
+       *Expose an API*, add a scope, and put it in the provider's `SCOPES`
+       (`SCOPES 'openid profile email api://<client-id>/pondra'`). Then the tokens psql and drivers get are for
+       Pondra and carry the client ID as their audience.
+    4. Entra's tokens name the user in `preferred_username`, and in `email` only when you add it as an optional
+       claim: say `USER_CLAIM 'preferred_username'`.
+    5. For roles, define **app roles** and assign them to groups. They arrive in the `roles` claim:
+       `ROLES_CLAIM 'roles'`. The `groups` claim holds groups' IDs, not their names.
+    6. For psql 18, turn on *Allow public client flows* (the device code flow), and use the same client ID.
+    </Steps>
+  </TabItem>
+  <TabItem label="Google">
+    <Steps>
+    1. Make an OAuth client of type **Web application**, with your console's address plus `/sso/callback` as an
+       authorized redirect URI. Google needs its client secret: put it in a secret and name it in `SECRET`.
+    2. The issuer is `https://accounts.google.com`.
+    3. Keep `USERS 'listed'`: anyone with a Google account could otherwise sign in.
+    </Steps>
+    The console and `pondra login` work. Google's access tokens aren't JWTs, so they are refused by name. A
+    driver sends a Google ID token for the client instead, and psql 18's device flow can't sign in through Google.
+  </TabItem>
+  <TabItem label="Keycloak">
+    <Steps>
+    1. In your realm, make a confidential OpenID Connect client, `pondra`, with *Standard flow* on and your
+       console's address plus `/sso/callback` as a valid redirect URI. Keep its client secret.
+    2. The issuer is `https://sso.acme.com/realms/acme`.
+    3. Add an **Audience** mapper to the client, so its access tokens carry an audience Pondra takes, such as
+       `api://pondra`, and list it in `AUDIENCE`.
+    4. Keycloak keeps a realm's roles at `realm_access.roles`: say `ROLES_CLAIM 'realm_access.roles'`.
+    5. For psql 18, make a public client, `pondra-cli`, with *OAuth 2.0 Device Authorization Grant* on and the same
+       Audience mapper.
+    </Steps>
+    Pondra's own checks run against Keycloak 26.8 (`tools/harness.py keycloak`).
+  </TabItem>
+</Tabs>
+
+For **Auth0**, the audience is the API's identifier, and custom claims are named by URL:
+`ROLES_CLAIM 'https://acme.com/roles'`.
+
+## When a sign-in is refused
+
+Every door says why a token was refused: it expired, it is for another audience or issuer, its email isn't
+verified, or it names someone who isn't a user here. Each refusal is in the [audit log](/pondra/guides/security/#the-audit-log):
+
+```sql norun
+SELECT at, "user", door, message FROM pondra.audit WHERE outcome = 'refused' ORDER BY at DESC LIMIT 5;
+```
+
+<Aside type="caution" title="What single sign-on doesn't do yet">
+- A provider whose tokens aren't JWTs (Google's access tokens, some providers' defaults) is refused by name. Send
+  its ID token, or set it to issue JWT access tokens.
+- The provider doesn't push users and groups to Pondra (SCIM). `USERS 'any'` with `ROLES_CLAIM` takes groups as
+  they are at each sign-in instead.
+- A key the provider takes away stops signing people in within the hour, when the node fetches its keys again. A
+  session made earlier lasts until it ends.
+</Aside>
