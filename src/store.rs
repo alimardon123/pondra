@@ -743,6 +743,11 @@ impl ObjectStore for Counted {
         crate::metrics::add(&crate::metrics::OBJECT_LISTS, 1);
         self.0.list(prefix)
     }
+    // (forwarded: the store's own offset, not the trait's default that lists everything)
+    fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        crate::metrics::add(&crate::metrics::OBJECT_LISTS, 1);
+        self.0.list_with_offset(prefix, offset)
+    }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
         crate::metrics::add(&crate::metrics::OBJECT_LISTS, 1);
         self.0.list_with_delimiter(prefix).await

@@ -141,12 +141,21 @@ pub fn turns() -> Vec<(String, String, usize, usize)> {
     out
 }
 
+/// The gate of the store at `root`: one per node, whatever opens it.
+fn gate(root: &str) -> Arc<Gate> { GATES.lock().unwrap().entry(root.to_string()).or_insert_with(|| Arc::new(Gate::new(start()))).clone() }
+
 impl Budget {
     /// The budget of the bucket at `root` (`s3://bucket`): one per node, whatever opens it.
     pub fn of(root: &str) -> Budget {
-        let gate = GATES.lock().unwrap().entry(root.to_string()).or_insert_with(|| Arc::new(Gate::new(start()))).clone();
-        Budget { root: root.to_string(), gate, inner: ReqwestConnector::default() }
+        Budget { root: root.to_string(), gate: gate(root), inner: ReqwestConnector::default() }
     }
+}
+
+/// An HTTP client of the store at `root` that takes its turns (a lake a node serves: `served.rs`).
+// (wired by piece 2: served.rs's client, and the node's routes)
+#[allow(dead_code)]
+pub fn client(root: &str, inner: reqwest::Client) -> HttpClient {
+    HttpClient::new(Turns { root: root.to_string(), gate: gate(root), inner: HttpClient::new(inner) })
 }
 
 /// When the bucket at `root` last answered this node with anything but a server error (ms; 0:
