@@ -2858,6 +2858,14 @@ Practical notes for an agent working here:
   two or three threads at once. Planned work, a robust core and the APIs come first and the UI at
   the end, so build APIs flexible and reliable enough that a UI is easy to build and fix. Fast and
   token-lean, still well tested, reviewed and bug free.
+- **Small pieces, each brief reviewed first (the owner, 2026-10-16).** A thread works in small pieces.
+  Before a brief goes to a Haiku worker, a separate Opus reviewer, given only the brief and the code it
+  touches, checks that it is flawless and keeps the principles (modular, flexible, fast and light, one
+  part reused wherever it is needed, easy to change); the thread fixes the brief first. Workers run side
+  by side, each on a small branch off the thread's task branch; the thread reviews each result as hard,
+  and merges it into the task branch only when it is right. CI runs on the task branch as a whole, not
+  on each piece, and the thread works on the next piece while it runs. Token-lean, the highest quality,
+  and fast: all three.
 - Never rebuild the binary while a test suite is running (tests exec `argv[0]` when a node restarts).
 - Test runs delete their lakes when they exit (`harness.new_lake`; `--keep` or `PONDRA_KEEP=1`
   keeps them). The owner's R2 free tier is 10 GB: after R2 runs, `tools/clean_bucket.py --bucket
