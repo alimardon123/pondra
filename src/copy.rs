@@ -101,8 +101,21 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
             }
         }
     }
-    let df = crate::query::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
-    let rows = write(df, &target).await?;
+    let rows = crate::query::frugally(|frugal| {
+        let (query, target, kept) = (&query, &target, &kept);
+        async move {
+            if frugal && target.folder() {
+                // (what the first try wrote goes, as after a spread COPY that failed)
+                let written = listed(lake, &target.to).await?.into_iter().filter(|p| !kept.contains(p)).collect();
+                delete(lake, &target.to, written).await?;
+            }
+            let ctx = crate::query::session(lake, query, "").await?;
+            if frugal {
+                crate::query::frugal(&ctx);
+            }
+            write(crate::query::sql(&ctx, query).await?, target).await
+        }
+    }).await?;
     Ok(serde_json::json!({"copied": rows, "to": to}))
 }
 

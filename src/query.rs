@@ -1159,6 +1159,29 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     Ok(ctx)
 }
 
+/// Whether a query ran out of memory (DataFusion's "Resources exhausted": 53200).
+pub fn exhausted(e: &anyhow::Error) -> bool { format!("{e:#}").contains("Resources exhausted") }
+
+/// A session made to run frugally: hash joins as sort-merge joins (hash joins can't spill), and sorts
+/// keeping 1 MB aside to merge.
+pub fn frugal(ctx: &SessionContext) {
+    let state = ctx.state_ref();
+    let mut state = state.write();
+    let o = state.config_mut().options_mut();
+    (o.optimizer.prefer_hash_join, o.execution.sort_spill_reservation_bytes) = (false, 1 << 20);
+}
+
+/// Run `work`, and once more frugally (`work(true)`, which makes its session with `frugal`) when it ran
+/// out of memory. Every path that runs a query for someone goes through it: a door's query
+/// (`server::query_listed`), `CREATE TABLE … AS` and `INSERT … SELECT` (`write::write_files`), and
+/// `COPY … TO` files (`copy::copy_to`).
+pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(work: impl Fn(bool) -> F) -> Result<T> {
+    match work(false).await {
+        Err(e) if exhausted(&e) => work(true).await,
+        r => r,
+    }
+}
+
 /// The stored views (`CREATE VIEW`) `sql` names, and the ones they name; every one for a listing.
 pub async fn stored_views(lake: &Lake, sql: &str, listing: bool) -> Result<Vec<(String, String)>> {
     let (mut text, mut views) = (sql.to_string(), vec![]);
