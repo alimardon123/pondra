@@ -413,15 +413,15 @@ fn ready(o: Outcome) -> BoxFuture<'static, Outcome> { async move { o }.boxed() }
 
 /// Queue one partition's record batches in the log, in order. An idempotent producer's batch is
 /// exactly-once: its (producer id, sequence) become a Pondra producer and seq, and `prev` makes
-/// a batch that overtook its predecessor fail (OUT_OF_ORDER_SEQUENCE; the client resends it).
+/// a batch that overtook its predecessor go again once that one is in (OUT_OF_ORDER_SEQUENCE
+/// only if it never comes).
 async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &TableMeta, records: &[u8]) -> BoxFuture<'static, Outcome> {
     let invalid = |e: anyhow::Error| {
         eprintln!("kafka: a record for {table} refused: {e:#}"); // (librdkafka shows only the code; this says why)
         ready((INVALID_RECORD, -1, Some(format!("{e:#}"))))
     };
-    let log = match app.log() {
-        Ok(log) => log,
-        Err(e) => return ready((POLICY_VIOLATION, -1, Some(e.to_string()))),
+    let Some(log) = app.log.clone() else {
+        return ready((POLICY_VIOLATION, -1, Some("read-only node".into())));
     };
     let batches = match decode_batches(records) {
         Ok(b) => b,
@@ -458,15 +458,27 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
             }
             false => Src { producer: String::new(), seq: 0, prev: None }, // at-least-once, as in Kafka
         };
-        match log.queue(table.to_string(), src, rows).await {
-            Ok(ack) => acks.push(ack),
+        match log.queue(table.to_string(), src.clone(), rows.clone()).await {
+            Ok(ack) => acks.push((ack, src, rows)),
             Err(e) => return ready(failed(&e)),
         }
     }
+    let table = table.to_string();
     async move {
         let mut first = None;
-        for ack in acks {
-            match ack.await {
+        for (ack, src, rows) in acks {
+            let mut ack = ack.await;
+            // Overtaken on its way to the leader by the batch after it (a follower's flushes race:
+            // invariant 29). This response is written only after the ones before it, so the batch
+            // before this one is committed by now, and this one goes again. Answered out of order, an
+            // idempotent producer stops for good (librdkafka: "sequence desynchronization").
+            for _ in 0..100 {
+                match &ack {
+                    Ok(Ack { conflict: true, .. }) => ack = async { log.queue(table.clone(), src.clone(), rows.clone()).await?.await }.await,
+                    _ => break,
+                }
+            }
+            match ack {
                 Ok(Ack { conflict: true, .. }) => return (OUT_OF_ORDER_SEQUENCE, -1, None),
                 Ok(Ack { duplicate: true, .. }) => {} // a retry of a committed batch: success
                 Ok(a) => first = first.or(Some(crate::log::ord(a.seg, a.row) as i64)),
