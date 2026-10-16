@@ -13205,6 +13205,84 @@ def uuids():
     return f"{sum(checks.values())} of {len(checks)} UUID checks"
 
 
+# Postgres 16's answers to the json-making functions, as text (`SELECT (expr)::text`, computed on a Postgres 16.15
+# server; NULL is None). The literals are as written for both; the table ones read the rows the checks insert.
+MAKE_LITERALS = [
+    ('to_json(1)', '1'),
+    ('to_json(\'a"b\\c\'::text)', '"a\\"b\\\\c"'),
+    ('to_json(true)', 'true'),
+    ('to_json(CAST(NULL AS INT))', None),
+    ('to_json(CAST(1.5e-7 AS DOUBLE PRECISION))', '1.5e-07'),
+    # (a numeric literal 1e15 cast to DOUBLE is 9.999999999999999e14 on the node, outside the JSON functions: the text
+    # form is the same double, so this checks the writer's 1e+15)
+    ("to_json(CAST('1e15' AS DOUBLE PRECISION))", '1e+15'),
+    ("to_json(CAST('NaN' AS DOUBLE PRECISION))", '"NaN"'),
+    ("to_json(DATE '2024-01-02')", '"2024-01-02"'),
+    ("to_json(TIMESTAMP '2024-01-02 03:04:05.5')", '"2024-01-02T03:04:05.5"'),
+    ("to_json(INTERVAL '1 day 2 hours')", '"1 day 02:00:00"'),
+    ('to_json(chr(9))', '"\\t"'),
+    ('to_json(1.50)', '1.50'),
+    ('to_jsonb(1.50)', '1.50'),
+    ('to_jsonb(1e2)', '100'),
+    ('to_jsonb(\'b"x\'::text)', '"b\\"x"'),
+    ("json_build_object('a', 1, 'b', 'x', 'c', NULL)", '{"a" : 1, "b" : "x", "c" : null}'),
+    ("json_build_object('a', json_build_object('b', 1))", '{"a" : {"b" : 1}}'),
+    ('json_build_object()', '{}'),
+    ("jsonb_build_object('bb', 1, 'a', 2, 'ccc', 3)", '{"a": 2, "bb": 1, "ccc": 3}'),
+    ("jsonb_build_object('a', 1, 'a', 2)", '{"a": 2}'),
+    ("json_build_array(1, 'a', NULL)", '[1, "a", null]'),
+    ('json_build_array()', '[]'),
+    ("jsonb_build_array(1.50, 'a', true)", '[1.50, "a", true]'),
+    ('to_json(ARRAY[1, 2])', '[1,2]'),
+    ("to_json(ARRAY['a', NULL])", '["a",null]'),
+    ("json_build_object('a', ARRAY[1, 2])", '{"a" : [1,2]}'),
+    ("json_build_object('a', CAST(NULL AS TEXT))", '{"a" : null}'),
+    ('to_json(CAST(NULL AS TEXT))', None),
+    ("pondra_as_jsonb('{\"b\":1,\"a\":2}')", '{"a": 2, "b": 1}'),
+    ("pondra_as_jsonb('[1.50, \"x\"]')", '[1.50, "x"]'),
+    ('pondra_as_jsonb(CAST(NULL AS TEXT))', None),
+    ("to_json(pondra_as_jsonb('{\"b\":1,\"a\":2}'))", '{"a": 2, "b": 1}'),
+]
+MAKE_TABLE = [
+    ('to_json(i)', ['7', None]),
+    ('to_json(b)', ['9000000000', None]),
+    ('to_json(t)', ['"a\\"b\\\\c"', None]),
+    ('to_json(f)', ['1.5e-07', None]),
+    ('to_json(n)', ['12.50', None]),
+    ('to_json(d)', ['"2024-01-02"', None]),
+    ('to_json(ts)', ['"2024-01-02T03:04:05.5"', None]),
+    ('to_json(ok)', ['true', None]),
+    ('to_jsonb(f)', ['0.00000015', None]),
+    ('to_jsonb(n)', ['12.50', None]),
+    ('to_jsonb(t)', ['"a\\"b\\\\c"', None]),
+    ("json_build_object('i', i, 't', t, 'd', d, 'ts', ts, 'ok', ok)", ['{"i" : 7, "t" : "a\\"b\\\\c", "d" : "2024-01-02", "ts" : "2024-01-02T03:04:05.5", "ok" : true}', '{"i" : null, "t" : null, "d" : null, "ts" : null, "ok" : null}']),
+    ('json_build_array(i, b, f, n, d, ts, ok)', ['[7, 9000000000, 1.5e-07, 12.50, "2024-01-02", "2024-01-02T03:04:05.5", true]', '[null, null, null, null, null, null, null]']),
+]
+MAKE_JSON = [  # (Postgres's spelling of the JSON columns, Pondra's with pondra_as_json, the rows' text)
+    ("json_build_object('d', pondra_as_json(doc), 'b', pondra_as_json(docb))", ['{"d" : {"a": 1, "b": [1, 2]}, "b" : {"k": "v"}}', '{"d" : null, "b" : null}']),
+    ('to_json(pondra_as_json(doc))', ['{"a": 1, "b": [1, 2]}', None]),
+    ('to_jsonb(pondra_as_json(docb))', ['{"k": "v"}', None]),
+    ("jsonb_build_object('x', pondra_as_json(doc))", ['{"x": {"a": 1, "b": [1, 2]}}', '{"x": null}']),
+    ("jsonb_build_object('x', pondra_as_jsonb(doc))", ['{"x": {"a": 1, "b": [1, 2]}}', '{"x": null}']),
+    ('to_json(pondra_as_jsonb(docb))', ['{"k": "v"}', None]),
+]
+MAKE_AGGREGATES = [  # (Pondra's aggregate over a list, Postgres 16's text for the aggregate it stands for)
+    ("pondra_json_agg(make_array(1, 2, 3), 'value')", '[1, 2, 3]'),
+    ("pondra_json_agg(make_array(1, NULL, 3), 'value')", '[1, null, 3]'),
+    ("pondra_json_agg(make_array(make_array(1, 1), make_array(2, 2)), 'value')", '[[1,1], \n [2,2]]'),
+    ("pondra_json_agg(make_array(row_to_json(named_struct('a', 1, 'b', 'x')), row_to_json(named_struct('a', 2, 'b', CAST(NULL AS TEXT)))), 'row')", '[{"a":1,"b":"x"}, \n {"a":2,"b":null}]'),
+    ("pondra_json_object_agg(make_array(named_struct('k', 'a', 'v', 1), named_struct('k', 'b', 'v', CAST(NULL AS BIGINT))), 'value')", '{ "a" : 1, "b" : null }'),
+    ("pondra_jsonb_agg(make_array(3, 1, 2), 'value')", '[3, 1, 2]'),
+    ("pondra_jsonb_object_agg(make_array(named_struct('k', 'bb', 'v', 1), named_struct('k', 'a', 'v', 2)), 'value')", '{"a": 2, "bb": 1}'),
+]
+
+MAKE_REFUSED = [  # (the expression, Postgres 16's SQLSTATE; the last is Postgres's '{bad'::json, refused at the cast)
+    ("json_build_object('a')", "22023"), ("json_build_object(NULL, 1)", "22004"), ("json_build_object(ARRAY[1], 1)", "22023"),
+    ("jsonb_build_object('a', pondra_as_json('{bad'))", "22P02"),
+]
+
+
+
 def jsons():
     """JSON and JSONB columns keep their type (`TableMeta::sql_types`, as uuid's do; `types.rs`, `pg_types.rs`). The lake
     holds the text as it was written, and every write door refuses a value that isn't JSON with 22P02, writing nothing:
@@ -13220,7 +13298,8 @@ def jsons():
     over HTTP and the port: #> and #>> with a text path or ARRAY, @> and <@, ?, ?| and ?&. `->` answers the value as JSON text
     (a string keeps its quotes; the port gives json's own value), `->>` text; the operators in a WHERE clause group as
     Postgres groups them, with no parentheses; the functions answer by their Postgres names; and a spread query over three
-    nodes equals one node's answer."""
+    nodes equals one node's answer. The json-making functions (`pg_json_make.rs`: to_json, to_jsonb, row_to_json, json_build_object, jsonb_build_object, json_build_array, jsonb_build_array, and the aggregates' scalar forms) answer Postgres 16's text over HTTP and the port, come to psycopg as dicts and lists typed json or jsonb, and refuse what Postgres refuses by SQLSTATE. pondra_as_jsonb and '…'::jsonb
+    answer jsonb as Postgres prints it, and nesting past 10,000 levels is refused 54001 (`pg_json_make.rs`'s MAX_DEPTH)."""
     import psycopg
     from psycopg.types.json import Json, Jsonb
     import sqlalchemy as sa
@@ -13431,6 +13510,115 @@ def jsons():
         projected = first_typed("SELECT x FROM (SELECT json_build_object('a', 1) AS x) AS s")
         info["json_build_object: (value, type code) directly, then through a projection"] = [direct, projected]
         return direct == ({"a": 1}, 114) and projected == ({"a": 1}, 114)
+
+    def make_setup():
+        """The tables the json-making checks read: mkrow, one row of each type the functions write and a row of NULLs; mkdoc, a JSON
+        and a JSONB column holding the documents of the other checks, and a row of NULLs."""
+        q("CREATE TABLE mkrow (id INT PRIMARY KEY, i INT, b BIGINT, t TEXT, f DOUBLE PRECISION, n NUMERIC(10,2), d DATE, ts TIMESTAMP, ok BOOLEAN)")
+        q("INSERT INTO mkrow (id, i, b, t, f, n, d, ts, ok) VALUES (1, 7, 9000000000, 'a\"b\\c', CAST(1.5e-7 AS DOUBLE PRECISION), "
+          "CAST(12.50 AS DECIMAL(10,2)), DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05.5', true), (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)")
+        q("CREATE TABLE mkdoc (id INT PRIMARY KEY, doc JSON, docb JSONB)")
+        q(f"INSERT INTO mkdoc (id, doc, docb) VALUES (1, {lit(GOOD['doc'])}, {lit(GOOD['docb'])}), (2, NULL, NULL)")
+        return q("SELECT count(*) AS n FROM mkrow")[0]["n"] == 2 and q("SELECT count(*) AS n FROM mkdoc")[0]["n"] == 2
+
+    def make_literals():
+        """Each expression over literals, as HTTP and the port answer it, against Postgres 16's text (`::text`)."""
+        bad = [[e, want, over_http(f"SELECT {e} AS v"), over_port(f"SELECT ({e})::text AS v")] for e, want in MAKE_LITERALS]
+        bad = [b for b in bad if b[2] != b[1] or b[3] != b[1]]
+        info["json-making functions over literals: [expression, Postgres 16's text, HTTP's, the port's], where one differs"] = bad
+        return not bad
+
+    def make_columns():
+        """Each expression over mkrow's columns, row 1 and the row of NULLs, against Postgres 16's text."""
+        bad = []
+        for e, rows in MAKE_TABLE:
+            for row, want in zip((1, 2), rows):
+                http = over_http(f"SELECT {e} AS v FROM mkrow WHERE id = {row}")
+                port = over_port(f"SELECT ({e})::text AS v FROM mkrow WHERE id = {row}")
+                if http != want or port != want:
+                    bad.append([e, row, want, http, port])
+        info["json-making functions over mkrow's columns: [expression, row, Postgres 16's text, HTTP's, the port's], where one differs"] = bad
+        return not bad
+
+    def make_json_columns():
+        """JSON and JSONB columns wrapped in pondra_as_json, against Postgres 16's answers on the same columns."""
+        bad = []
+        for pondra, rows in MAKE_JSON:
+            for row, want in zip((1, 2), rows):
+                http = over_http(f"SELECT {pondra} AS v FROM mkdoc WHERE id = {row}")
+                port = over_port(f"SELECT ({pondra})::text AS v FROM mkdoc WHERE id = {row}")
+                if http != want or port != want:
+                    bad.append([pondra, row, want, http, port])
+        info["json-making functions over mkdoc's JSON columns: [expression, row, Postgres 16's text, HTTP's, the port's], where one differs"] = bad
+        return not bad
+
+    def make_aggregates():
+        """The scalar aggregate forms over a list, against the aggregate Postgres 16 runs on the same values."""
+        bad = []
+        for pondra, want in MAKE_AGGREGATES:
+            http = over_http(f"SELECT {pondra} AS v")
+            port = over_port(f"SELECT ({pondra})::text AS v")
+            if http != want or port != want:
+                bad.append([pondra, want, http, port])
+        info["aggregate forms over a list: [expression, Postgres 16's text, HTTP's, the port's], where one differs"] = bad
+        return not bad
+
+    def make_typed():
+        """psycopg: the json-making functions' answers as dicts and lists, typed json (114) or jsonb (3802)."""
+        got = {
+            "json_build_object": first_typed("SELECT json_build_object('a', 1, 'b', ARRAY[1, 2]) AS x"),
+            "jsonb_build_object": first_typed("SELECT jsonb_build_object('a', 1, 'b', ARRAY[1, 2]) AS x"),
+            "json_build_array": first_typed("SELECT json_build_array(1, 'a') AS x"),
+            "jsonb_build_array": first_typed("SELECT jsonb_build_array(1, 'a') AS x"),
+            "to_jsonb through a projection": first_typed("SELECT x FROM (SELECT to_jsonb(ARRAY['x']) AS x) AS s"),
+            "row_to_json": first_typed("SELECT row_to_json(named_struct('a', 1, 'b', 'x')) AS x"),
+        }
+        info["json-making functions through psycopg: (value, type code) of each"] = got
+        return got == {"json_build_object": ({"a": 1, "b": [1, 2]}, 114), "jsonb_build_object": ({"a": 1, "b": [1, 2]}, 3802),
+                       "json_build_array": ([1, "a"], 114), "jsonb_build_array": ([1, "a"], 3802),
+                       "to_jsonb through a projection": (["x"], 3802), "row_to_json": ({"a": 1, "b": "x"}, 114)}
+
+    def port_error(s):
+        """The SQLSTATE the Postgres port refuses a statement with; None when it runs."""
+        try:
+            pg_rows(s)
+            return None
+        except psycopg.Error as e:
+            return e.sqlstate
+
+    def make_refusals():
+        """Refused by name: HTTP's and the port's SQLSTATE against Postgres 16's (the jsonb case is Postgres's '{bad'::json)."""
+        got = [[s, want, err(f"SELECT {s} AS v")[1], port_error(f"SELECT {s} AS v")] for s, want in MAKE_REFUSED]
+        info["json-making functions refused: [expression, Postgres 16's SQLSTATE, HTTP's, the port's]"] = got
+        return all(g[1] == g[2] == g[3] for g in got)
+
+    def as_jsonb_refusal():
+        """pondra_as_jsonb of text that isn't JSON is refused 22P02, over HTTP and the port."""
+        http = err("SELECT pondra_as_jsonb('{bad') AS v")[1]
+        port = port_error("SELECT pondra_as_jsonb('{bad') AS v")
+        info["pondra_as_jsonb('{bad'): SQLSTATE over HTTP, then the port"] = [http, port]
+        return http == port == "22P02"
+
+    def jsonb_as_postgres_prints_it():
+        """'…'::jsonb (pondra_jsonb) answers jsonb as Postgres prints it: keys sorted by length, the last duplicate kept, ': ' and
+        ', ' between members. Through psycopg it is a dict typed jsonb (3802). '…'::json keeps its text as written."""
+        jb = first_typed("SELECT '{\"b\":1,\"a\":2,\"a\":3}'::jsonb AS x")
+        http = q("SELECT '{\"b\":1,\"a\":2,\"a\":3}'::jsonb AS v")[0]["v"]
+        kept = q("SELECT '{\"b\":1,\"a\":2}'::json AS v")[0]["v"]
+        info["'…'::jsonb: (psycopg's value, type code), then HTTP's text; '…'::json over HTTP, as written"] = [jb, http, kept]
+        return jb == ({"a": 3, "b": 1}, 3802) and http == '{"a": 3, "b": 1}' and kept == '{"b":1,"a":2}'
+
+    def jsonb_depth_limit():
+        """Nesting 10,000 levels is jsonb's limit: a document that deep is taken and written back, and 10,001 levels is refused
+        54001 (stack depth limit exceeded) over HTTP and the port. Past that the reader would overflow a node's stack."""
+        def deep(n):
+            return "[" * n + "]" * n
+        http_ok = q(f"SELECT {lit(deep(10000))}::jsonb AS v")[0]["v"] == deep(10000)
+        port_ok = pg_rows(f"SELECT ({lit(deep(10000))}::jsonb)::text")[0][0] == deep(10000)  # (text: psycopg's own decoder stops at 1,000 levels)
+        http_code = err(f"SELECT {lit(deep(10001))}::jsonb AS v")[1]
+        port_code = port_error(f"SELECT {lit(deep(10001))}::jsonb AS v")
+        info["nesting: 10,000 levels taken (HTTP, the port's text), 10,001 refused (HTTP's SQLSTATE, the port's)"] = [http_ok, port_ok, http_code, port_code]
+        return http_ok and port_ok and http_code == port_code == "54001"
 
     def catalog():
         isc = pg_rows("SELECT column_name, data_type, udt_name FROM information_schema.columns WHERE table_name = 'j' ORDER BY column_name")
@@ -13741,6 +13929,24 @@ def jsons():
               json_spread)
         check("ARRAY[1,2,3] @> ARRAY[2] still answers true, over HTTP and the port (DataFusion's array containment is untouched)",
               arrays_untouched)
+        check("setup: mkrow, one row of each type the json-making functions write and a row of NULLs; mkdoc, a JSON and a JSONB column", make_setup)
+        check("to_json, to_jsonb, row_to_json, json_build_object, json_build_array and their jsonb forms over literals (floats, dates, "
+              "intervals, NULLs, nested objects, arrays, empty ones, numerics) answer Postgres 16's text, over HTTP and the port", make_literals)
+        check("the same functions over mkrow's integer, bigint, text, double, numeric, date, timestamp and boolean columns, a row and a row "
+              "of NULLs, answer Postgres 16's text, over HTTP and the port", make_columns)
+        check("json_build_object, to_json, to_jsonb and jsonb_build_object over a JSON or JSONB column wrapped in pondra_as_json answer "
+              "Postgres 16's text, over HTTP and the port (a table's own JSON columns are unmarked until the next brief)", make_json_columns)
+        check("the aggregate forms (pondra_json_agg, pondra_jsonb_agg, pondra_json_object_agg, pondra_jsonb_object_agg) answer Postgres 16's "
+              "text: line feeds before rows and arrays, a NULL element, the object form, over HTTP and the port", make_aggregates)
+        check("psycopg: json_build_object, json_build_array and row_to_json come as dicts and lists typed 114, the jsonb forms typed 3802, "
+              "through a projection too", make_typed)
+        check("json_build_object and jsonb_build_object refuse what Postgres refuses, by SQLSTATE over HTTP and the port: an odd count and "
+              "an array key (22023), a NULL key (22004), a jsonb of text that isn't JSON (22P02)", make_refusals)
+        check("pondra_as_jsonb of text that isn't JSON is refused 22P02 by HTTP and the port", as_jsonb_refusal)
+        check("'…'::jsonb answers jsonb as Postgres prints it (keys sorted, the last duplicate kept), over HTTP and as a dict over the port; "
+              "'…'::json keeps its text as written", jsonb_as_postgres_prints_it)
+        check("jsonb nested 10,000 levels is taken and written back; 10,001 levels is refused 54001 by HTTP and the port, and the node "
+              "stays up (a deeper reader would overflow its stack)", jsonb_depth_limit)
     finally:
         if node is not None:
             node.kill()

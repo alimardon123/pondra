@@ -64,7 +64,7 @@ pub async fn over_http(lake: &Lake, sql: &str) -> Result<Vec<RecordBatch>> {
 /// Does this query read Postgres's catalog, or say something only Postgres says?
 pub fn wanted(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pg_", "information_schema", "::reg", "operator(", "format_type(", "current_user", "session_user", "current_schemas", "to_regtype", "to_regclass", "collate", "obj_description", "col_description", "current_setting", "has_table_privilege", "has_schema_privilege", "json_build_object("]
+    ["pg_", "information_schema", "::reg", "operator(", "format_type(", "current_user", "session_user", "current_schemas", "to_regtype", "to_regclass", "collate", "obj_description", "col_description", "current_setting", "has_table_privilege", "has_schema_privilege"]
         .iter().any(|w| s.contains(w))
 }
 
@@ -1077,6 +1077,7 @@ struct PgFn {
     returns: fn(&[DataType]) -> DataType,
     body: Arc<Body>,
     marks: Option<&'static str>, // the Postgres type its answers' column is marked with (`pg_types::MARK`): "json"
+    follows: bool, // (no fixed mark: the answers are JSON when the first argument is, as `->` is)
 }
 
 impl std::fmt::Debug for PgFn {
@@ -1098,8 +1099,13 @@ impl ScalarUDFImpl for PgFn {
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> datafusion::error::Result<FieldRef> {
         let types: Vec<DataType> = args.arg_fields.iter().map(|f| f.data_type().clone()).collect();
         let field = Field::new(self.name, (self.returns)(&types), true);
-        Ok(Arc::new(match self.marks {
-            Some(mark) => field.with_metadata([(crate::pg_types::MARK.to_string(), mark.to_string())].into()),
+        let mark = match self.marks {
+            Some(mark) => Some(mark.to_string()),
+            None if self.follows => first_json_mark(args.arg_fields),
+            None => None,
+        };
+        Ok(Arc::new(match mark {
+            Some(mark) => field.with_metadata([(crate::pg_types::MARK.to_string(), mark)].into()),
             None => field,
         }))
     }
@@ -1116,13 +1122,30 @@ fn udf(name: &'static str, returns: fn(&[DataType]) -> DataType, body: impl Fn(&
 
 /// A function of Postgres's over whole columns: `body` gets every argument as an array of the rows' values.
 pub(crate) fn function(name: &'static str, signature: Signature, returns: fn(&[DataType]) -> DataType, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
-    ScalarUDF::new_from_impl(PgFn { name, signature, returns, body: Arc::new(body), marks: None })
+    marked(name, signature, returns, None, body)
+}
+
+/// `function`, whose answers are JSON text marked `mark` ("json" or "jsonb"): the column they make is sent as that type.
+pub(crate) fn marked(name: &'static str, signature: Signature, returns: fn(&[DataType]) -> DataType, mark: Option<&'static str>, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
+    ScalarUDF::new_from_impl(PgFn { name, signature, returns, body: Arc::new(body), marks: mark, follows: false })
+}
+
+/// `function`, whose answers are JSON exactly when its first argument is (`doc -> 'a'` of a JSON column is JSON, of a
+/// text one text, as Postgres has the operator for JSON only): the mark is the first argument's, if it is JSON's.
+pub(crate) fn follows_json(name: &'static str, signature: Signature, returns: fn(&[DataType]) -> DataType, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
+    ScalarUDF::new_from_impl(PgFn { name, signature, returns, body: Arc::new(body), marks: None, follows: true })
+}
+
+/// The JSON mark of a function's first argument, if it has one (`json` or `jsonb`).
+fn first_json_mark(arg_fields: &[FieldRef]) -> Option<String> {
+    let mark = arg_fields.first()?.metadata().get(crate::pg_types::MARK)?;
+    matches!(mark.as_str(), "json" | "jsonb").then(|| mark.clone())
 }
 
 /// `udf`, whose answers are JSON text: the column they make is marked json, so the port sends it as json.
 fn json_udf(name: &'static str, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
     let signature = Signature::one_of(vec![TypeSignature::Nullary, TypeSignature::VariadicAny], Volatility::Stable);
-    ScalarUDF::new_from_impl(PgFn { name, signature, returns: |_| DataType::Utf8, body: Arc::new(body), marks: Some("json") })
+    ScalarUDF::new_from_impl(PgFn { name, signature, returns: |_| DataType::Utf8, body: Arc::new(body), marks: Some("json"), follows: false })
 }
 
 /// An argument as text (NULL where it is), whatever string or number type it came as.
@@ -1137,30 +1160,6 @@ pub(crate) fn int_arg(a: &ArrayRef) -> datafusion::error::Result<Vec<Option<i64>
 }
 
 pub(crate) fn texts_out(v: impl IntoIterator<Item = Option<String>>) -> ArrayRef { Arc::new(StringArray::from_iter(v)) }
-
-/// One argument's value of a row as JSON text: numbers and booleans bare, text quoted, NULL as `null`.
-fn json_of(a: &ArrayRef, i: usize) -> datafusion::error::Result<String> {
-    if a.is_null(i) {
-        return Ok("null".into());
-    }
-    let text = datafusion::arrow::compute::cast(a, &DataType::Utf8)?;
-    let v = text.as_string::<i32>().value(i);
-    let bare = matches!(a.data_type(), DataType::Boolean) || a.data_type().is_numeric();
-    Ok(if bare { v.to_string() } else { serde_json::to_string(v).unwrap_or_default() })
-}
-
-/// `json_build_object(key, value, …)` for one row, as Postgres prints it: `{"key" : value, …}`.
-fn json_build(a: &[ArrayRef], i: usize) -> datafusion::error::Result<String> {
-    let mut pairs = vec![];
-    for kv in a.chunks(2) {
-        let value = match kv.get(1) {
-            Some(v) => json_of(v, i)?,
-            None => "null".into(),
-        };
-        pairs.push(format!("{} : {value}", json_of(&kv[0], i)?));
-    }
-    Ok(format!("{{{}}}", pairs.join(", ")))
-}
 
 /// The sequence a table's identity column counts by, named as Postgres names it (`schema.name`);
 /// None for a column that has none, or a name that isn't a table.
@@ -1436,11 +1435,7 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
             code.then(|| crate::objects::routine_sql(&crate::objects::name_sql(&lake_name), r))
         })))
     }));
-    // SQLAlchemy's identity query: its options as JSON, and the sequence a column counts by.
-    ctx.register_udf(json_udf("json_build_object", |a, n| {
-        let rows = (0..n).map(|i| json_build(a, i)).collect::<datafusion::error::Result<Vec<_>>>()?;
-        Ok(texts_out(rows.into_iter().map(Some)))
-    }));
+    // SQLAlchemy's identity query: the sequence a column counts by (its options are `identity_options`, below).
     let lk = l.clone();
     ctx.register_udf(udf("pg_get_serial_sequence", to_text, move |a, n| {
         let (tables, columns) = (text_arg(&a[0])?, text_arg(&a[1])?);

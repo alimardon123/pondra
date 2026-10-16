@@ -80,6 +80,7 @@ pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     let at = rules.iter().position(|r| r.name() == "type_coercion").unwrap_or(0);
     rules.insert(at, Arc::new(FloatsWin));
     rules.push(Arc::new(crate::casts::Rounds)); // (after type coercion: the casts it adds round too)
+    rules.push(Arc::new(crate::pg_json_make::AsText)); // (a text cast's answer is text, not the JSON it casts: its mark goes)
     rules.push(Arc::new(Runnable)); // (after type coercion: a function's simplifier reads its arguments' types)
     rules
 }

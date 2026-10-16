@@ -383,7 +383,7 @@ pub fn is_json(s: &str) -> bool { serde_json::from_str::<serde::de::IgnoredAny>(
 
 /// Postgres's words for a value that isn't JSON, which it quotes as far as 60 characters (jsonb's
 /// refusals say `type json` too).
-fn json_refusal(s: &str) -> String {
+pub(crate) fn json_refusal(s: &str) -> String {
     let head: String = s.chars().take(60).collect();
     format!("invalid input syntax for type json: \"{head}\"")
 }
@@ -666,19 +666,10 @@ pub fn register(ctx: &datafusion::prelude::SessionContext) {
         }).collect::<datafusion::error::Result<datafusion::arrow::array::StringArray>>()?;
         Ok(std::sync::Arc::new(out))
     }));
-    // (`pondra_jsonb` is the same function under its own name, so a projection names a cast to each apart)
-    for name in ["pondra_json", "pondra_jsonb"] {
-        ctx.register_udf(made(name, Signature::one_of(vec![text(), trying()], Volatility::Immutable), |a, _| {
-            let text = datafusion::arrow::compute::cast(&a[0], &DataType::Utf8)?;
-            let out = text.as_string::<i32>().iter().map(|v| match v.map(json_of) {
-                Some(Ok(j)) => Ok(Some(j)),
-                Some(Err(_)) if is_trying(a) => Ok(None),
-                Some(Err(e)) => Err(datafusion::error::DataFusionError::Execution(e.to_string())),
-                None => Ok(None),
-            }).collect::<datafusion::error::Result<datafusion::arrow::array::StringArray>>()?;
-            Ok(std::sync::Arc::new(out))
-        }));
-    }
+    // (`pondra_jsonb` is its own function, so a projection names a cast to each apart; its text is jsonb as Postgres prints it)
+    let cast_sig = || Signature::one_of(vec![text(), trying()], Volatility::Immutable);
+    ctx.register_udf(made_marked("pondra_json", cast_sig(), "json", |a, _| cast_each(a, json_text)));
+    ctx.register_udf(made_marked("pondra_jsonb", cast_sig(), "jsonb", |a, _| cast_each(a, crate::pg_json_make::jsonb_text)));
     ctx.register_udf(made("pg_typeof", Signature::any(1, Volatility::Immutable), |a, n| {
         let name = crate::pg_catalog::type_of(a[0].data_type());
         Ok(std::sync::Arc::new(datafusion::arrow::array::StringArray::from_iter_values((0..n).map(|_| name.clone()))))
@@ -687,11 +678,13 @@ pub fn register(ctx: &datafusion::prelude::SessionContext) {
 
 type Body = fn(&[datafusion::arrow::array::ArrayRef], usize) -> datafusion::error::Result<datafusion::arrow::array::ArrayRef>;
 
-/// A function of `register`'s: text out, its rows' count known (a function of no arguments needs it).
+/// A function of `register`'s: text out, its rows' count known (a function of no arguments needs it). `mark` is the
+/// JSON type its answers are ("json" or "jsonb"), if they are JSON: the column they make says so.
 #[derive(Debug)]
 struct Made {
     name: &'static str,
     signature: datafusion::logical_expr::Signature,
+    mark: Option<&'static str>,
     body: Body,
 }
 
@@ -710,6 +703,14 @@ impl datafusion::logical_expr::ScalarUDFImpl for Made {
     fn name(&self) -> &str { self.name }
     fn signature(&self) -> &datafusion::logical_expr::Signature { &self.signature }
     fn return_type(&self, _: &[DataType]) -> datafusion::error::Result<DataType> { Ok(DataType::Utf8) }
+    // (the mark rides on the field, so a projection of the answer keeps it and the port sends it as that type)
+    fn return_field_from_args(&self, _: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<datafusion::arrow::datatypes::FieldRef> {
+        let field = datafusion::arrow::datatypes::Field::new(self.name, DataType::Utf8, true);
+        Ok(std::sync::Arc::new(match self.mark {
+            Some(mark) => field.with_metadata([(crate::pg_types::MARK.to_string(), mark.to_string())].into()),
+            None => field,
+        }))
+    }
     fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> datafusion::error::Result<datafusion::logical_expr::ColumnarValue> {
         let n = args.number_rows;
         let arrays = args.args.iter().map(|a| a.to_array(n)).collect::<datafusion::error::Result<Vec<_>>>()?;
@@ -718,12 +719,54 @@ impl datafusion::logical_expr::ScalarUDFImpl for Made {
 }
 
 fn made(name: &'static str, signature: datafusion::logical_expr::Signature, body: Body) -> datafusion::logical_expr::ScalarUDF {
-    datafusion::logical_expr::ScalarUDF::new_from_impl(Made { name, signature, body })
+    datafusion::logical_expr::ScalarUDF::new_from_impl(Made { name, signature, mark: None, body })
+}
+
+/// `made`, whose answers are JSON text of the type `mark` names ("json" or "jsonb").
+fn made_marked(name: &'static str, signature: datafusion::logical_expr::Signature, mark: &'static str, body: Body) -> datafusion::logical_expr::ScalarUDF {
+    datafusion::logical_expr::ScalarUDF::new_from_impl(Made { name, signature, mark: Some(mark), body })
 }
 
 /// The second argument of `pondra_uuid(x, true)` and `pondra_json(x, true)`: a TRY_CAST, which answers
 /// NULL for a value it refuses instead of failing.
 fn is_trying(a: &[datafusion::arrow::array::ArrayRef]) -> bool { a.get(1).is_some_and(|t| t.as_boolean_opt().is_some_and(|t| t.is_valid(0) && t.value(0))) }
 
+/// `s` as the json text the lake keeps (`json_of`), its refusal a query error with its SQLSTATE (22P02).
+fn json_text(s: &str) -> datafusion::error::Result<String> {
+    json_of(s).map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+}
+
+/// A cast of each text to json or jsonb: `of` answers each value, or refuses it with its own error. A `TRY_CAST`
+/// answers NULL for a refusal instead.
+fn cast_each(a: &[datafusion::arrow::array::ArrayRef], of: fn(&str) -> datafusion::error::Result<String>) -> datafusion::error::Result<datafusion::arrow::array::ArrayRef> {
+    let text = datafusion::arrow::compute::cast(&a[0], &DataType::Utf8)?;
+    let out = text.as_string::<i32>().iter().map(|v| match v.map(of) {
+        Some(Ok(j)) => Ok(Some(j)),
+        Some(Err(_)) if is_trying(a) => Ok(None),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }).collect::<datafusion::error::Result<datafusion::arrow::array::StringArray>>()?;
+    Ok(std::sync::Arc::new(out))
+}
+
 /// `CREATE TYPE name AS ENUM (…)`, as `SHOW CREATE TYPE` writes it.
 pub fn create_sql(name: &str, t: &Type) -> String { format!("CREATE TYPE {name} AS ENUM ({})", quoted(&t.labels)) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one text `sql` answers, through the functions `register` makes.
+    async fn one(sql: &str) -> String {
+        let ctx = datafusion::prelude::SessionContext::new();
+        register(&ctx);
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        batches[0].column(0).as_string::<i32>().value(0).to_string()
+    }
+
+    #[tokio::test]
+    async fn jsonb_is_written_as_postgres_prints_it_and_json_as_it_was_written() {
+        assert_eq!(one(r#"SELECT pondra_jsonb('{"b":1,"a":2}')"#).await, r#"{"a": 2, "b": 1}"#);
+        assert_eq!(one(r#"SELECT pondra_json('{"b":1,"a":2}')"#).await, r#"{"b":1,"a":2}"#);
+    }
+}

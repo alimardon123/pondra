@@ -5,7 +5,7 @@
 //! kept as written (`types.rs`), so `->` and `#>` answer the value's text as the document has it. Text that isn't JSON
 //! answers NULL where a walk meets it; `@>`, `<@`, `?`, `?|` and `?&` read the whole document and refuse it (22P02).
 //! `text` groups the operators the way Postgres does, where SQL comes in (`path::door`).
-use crate::pg_catalog::{function, text_arg, texts_out};
+use crate::pg_catalog::{follows_json, function, text_arg, texts_out};
 use crate::types::{is_json, json_of};
 use datafusion::arrow::array::{Array, ArrayAccessor, ArrayRef, AsArray, BooleanArray, StringArray};
 use datafusion::arrow::compute::cast;
@@ -77,8 +77,8 @@ fn as_title(e: &Expr) -> String {
 static FUNCTIONS: LazyLock<Vec<Arc<ScalarUDF>>> = LazyLock::new(|| {
     let two = || Signature::any(2, Volatility::Immutable);
     vec![
-        Arc::new(function("json_object_field", two(), |_| DataType::Utf8, |a, n| field(a, n).map_err(fail)).with_aliases(["jsonb_object_field", "json_array_element", "jsonb_array_element"])),
-        Arc::new(function("pondra_json_path", two(), |_| DataType::Utf8, |a, n| path(a, n, false).map_err(fail))),
+        Arc::new(follows_json("json_object_field", two(), |_| DataType::Utf8, |a, n| field(a, n).map_err(fail)).with_aliases(["jsonb_object_field", "json_array_element", "jsonb_array_element"])),
+        Arc::new(follows_json("pondra_json_path", two(), |_| DataType::Utf8, |a, n| path(a, n, false).map_err(fail))),
         Arc::new(function("pondra_json_path_text", two(), |_| DataType::Utf8, |a, n| path(a, n, true).map_err(fail))),
         Arc::new(function("jsonb_contains", two(), |_| DataType::Boolean, |a, n| contains_all(a, n).map_err(fail))),
         Arc::new(function("jsonb_contained", two(), |_| DataType::Boolean, |a, n| contained(a, n).map_err(fail))),
@@ -98,6 +98,7 @@ pub fn register(ctx: &SessionContext) {
     for f in FUNCTIONS.iter() {
         ctx.register_udf(f.as_ref().clone());
     }
+    crate::pg_json_make::register(ctx);
 }
 
 /// An error a function raises, carrying its SQLSTATE to the door (`codes::of`).
