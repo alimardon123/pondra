@@ -64,6 +64,7 @@ Pages marked *(planned)* aren't written yet.
 | `git.mdx` | Git folders: git tokens and their `SCOPE`, `git_checkout`, `git_status`, `git_commit`, `git_pull`, `git_pull_request` | ADR-060 §8, `src/git.rs` |
 | `sharing.mdx` | sharing with another company: shares, recipients, profiles, the delta-sharing client, `ATTACH … (TYPE share)`, the audit | ADR-046 |
 | `security.mdx` | tokens, users, roles, grants, TLS on every door, the audit log, quotas, secrets' sealing, `--python` | ADR-035, `src/users.rs`, `src/tls.rs` |
+| `single-sign-on.mdx` | identity providers: `CREATE IDENTITY PROVIDER`, `USERS`, `ROLES_CLAIM`, the console's buttons, `pondra login`, Postgres (token as password, psql 18's `POSTGRES 'oauth'`), Kafka, Flight, MCP; Okta, Entra ID, Google, Keycloak | ADR-074, `src/sso.rs`, `src/sso_flow.rs` |
 
 ### Connect (`guides/`)
 
@@ -136,6 +137,7 @@ Pages marked *(planned)* aren't written yet.
 | keyed tables | how: `guides/tables.mdx`; why: `concepts/keyed-tables.mdx` | views, change-rows, kafka |
 | `local()` and `connect()` | `reference/python.mdx`, `reference/javascript.mdx` | first-lake shows them once |
 | tokens, users, grants, TLS | `guides/security.mdx` | every protocol page |
+| identity providers, single sign-on | `guides/single-sign-on.mdx` | security, postgres, kafka-protocol, cli |
 | `CREATE SECRET` | `guides/files-and-other-lakes.mdx` (its use); `guides/security.mdx` (its sealing) | kafka, other-engines, procedures, deploy |
 | `CALL run` and parameters | `guides/workspace.mdx` | functions-and-procedures, notebooks |
 | files on S3 and other clouds | `guides/files-and-other-lakes.mdx` | object-storage (lakes there, not files) |

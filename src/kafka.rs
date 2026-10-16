@@ -279,17 +279,6 @@ fn sasl_handshake(r: &mut Rd) -> Result<Vec<u8>> {
     Ok(w)
 }
 
-/// OAUTHBEARER's first message (RFC 7628): `n,,` then `\x01auth=Bearer <token>\x01\x01`. None: PLAIN's.
-fn bearer(auth: &[u8]) -> Option<String> {
-    if !(auth.starts_with(b"n,") || auth.starts_with(b"y,")) {
-        return None;
-    }
-    let text = std::str::from_utf8(auth).ok()?;
-    let value = text.split('\x01').find_map(|kv| kv.strip_prefix("auth="))?;
-    let (scheme, token) = value.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim().to_string())
-}
-
 /// SASL/PLAIN: "\0user\0password": a user and its password (or one of its tokens), or a role's
 /// name (`reader`, `writer`, `admin`) and its token (`users::sign_in`). As on HTTP, a password crosses
 /// only TLS from another machine, a token may under `PONDRA_TLS=optional` (`tls::may_send_password`), and
@@ -302,7 +291,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, peer: &c
         _ => (String::new(), String::new()),
     };
     let ip = Some(peer.addr.ip());
-    let token = bearer(&auth);
+    let token = crate::sso::bearer(&auth); // (OAUTHBEARER's; None: PLAIN's)
     let refused = if app.open().await {
         *who = crate::auth::Principal::of(Role::Admin).at("kafka", who.from);
         None

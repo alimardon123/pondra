@@ -1737,6 +1737,20 @@ CREATE ROLE analysts;
 GRANT SELECT (id, name) ON payroll TO analysts;
 ```
 
+### Single sign-on
+
+People sign in with the company's account (Okta, Entra ID, Google, Keycloak): the console's "Sign in with"
+button, `pondra login`, and every driver and client take its tokens, with IT's groups as roles. `GET /sso`
+lists the lake's providers. [Single sign-on](/pondra/guides/single-sign-on/)
+
+```bash
+curl -s localhost:8080/sso; echo
+```
+
+```text
+{"providers":[]}
+```
+
 ### Audit log
 
 `pondra.audit` says who did what, through which door, and what came of it, refusals included. [Security](/pondra/guides/security/#the-audit-log)

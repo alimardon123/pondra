@@ -7,7 +7,9 @@
 //! `\copy`, psycopg's `cursor.copy`).
 //! With tokens set or users made (`users.rs`), a client signs in with SCRAM-SHA-256, as Postgres's
 //! own: a user with its password (or one of its tokens), or `reader`, `writer`, `admin` with that
-//! role's token. Each statement runs as whoever signed in (`auth::WHO`).
+//! role's token. A user with no password sends an identity provider's token as its password, or, when
+//! the provider says `POSTGRES 'oauth'`, through OAUTHBEARER, which psql 18 fetches itself (ADR-074).
+//! Each statement runs as whoever signed in (`auth::WHO`).
 use crate::server::App;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
@@ -49,7 +51,7 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         // A connection is a session: its temporary tables end with it (`temp.rs`).
         let session = format!("pg-{}", uuid::Uuid::new_v4().simple());
         let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), me: me.clone() });
-        let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), cancels: cancels.clone() };
+        let startup = Startup { backend: backend.clone(), scram: Default::default(), plain: Default::default(), oauth: Default::default(), cancels: cancels.clone() };
         let pg = Arc::new(Pg(backend, Arc::new(startup), cancel.clone()));
         crate::panics::task(async move {
             let _ = socket.set_nodelay(true);
@@ -85,7 +87,17 @@ struct Startup {
     backend: Arc<Backend>,
     scram: tokio::sync::Mutex<Option<(crate::users::Scram, String)>>, // (the exchange so far, and whose)
     plain: tokio::sync::Mutex<bool>, // (a token asked for as a plain password)
+    oauth: tokio::sync::Mutex<Option<Bearer>>, // (a token asked for by OAUTHBEARER, psql 18's)
     cancels: Arc<ConnectionManager>, // (the server's connections, by the key a cancel request names)
+}
+
+/// OAUTHBEARER's exchange (RFC 7628, as psql 18 speaks it; ADR-074): a client with no token yet, or a
+/// token refused, is told where the provider is, answers `\x01`, and is refused; psql then gets a token
+/// through the device flow and connects again with it.
+struct Bearer {
+    issuer: String, // (the provider's issuer and scopes: what psql is told)
+    scope: String,
+    told: Option<String>, // (told, and why it is refused once it answers)
 }
 
 fn params() -> DefaultServerParameterProvider {
@@ -104,6 +116,70 @@ async fn guessing_refused(app: &App, user: &str, from: Option<std::net::SocketAd
     crate::audit::refused(app, user, "postgres", from, "sign in", &why);
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     fatal(why)
+}
+
+impl Startup {
+    /// OAUTHBEARER asked for (true), when a provider that says `POSTGRES 'oauth'` would sign this user in: one
+    /// way a connection, as pg_hba has it, since libpq 18 takes the first mechanism it knows and never falls
+    /// back to a password (ADR-074 §4a). SCRAM-SHA-256 is offered after it only so that a client before libpq
+    /// 18 says why it can't sign in (`oauth_step`): such a user has no password, so it never signs anyone in.
+    async fn ask_oauth<C>(&self, client: &mut C, listed: bool) -> PgWireResult<bool>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let Some((issuer, scope)) = crate::sso::oauth_for(&self.backend.app.lake, listed).await else { return Ok(false) };
+        *self.oauth.lock().await = Some(Bearer { issuer, scope, told: None });
+        let mechanisms = vec!["OAUTHBEARER".into(), "SCRAM-SHA-256".into()];
+        client.send(PgWireBackendMessage::Authentication(pgwire::messages::startup::Authentication::SASL(mechanisms))).await?;
+        Ok(true)
+    }
+
+    /// A step of OAUTHBEARER's exchange: a token signs in (no SASLFinal: OAUTHBEARER has none, and libpq
+    /// refuses one); none, or one refused, is told where the provider is and refused once it answers; a
+    /// client that chose SCRAM is told the way out.
+    async fn oauth_step<C>(&self, client: &mut C, m: pgwire::messages::startup::PasswordMessageFamily) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let app = &self.backend.app;
+        let from = Some(client.socket_addr());
+        let user = client.metadata().get("user").cloned().unwrap_or_default();
+        let mut oauth = self.oauth.lock().await;
+        let Some(bearer) = oauth.as_mut() else { return Ok(()) };
+        if let Some(why) = bearer.told.take() {
+            return Err(fatal(why)); // (its `\x01` after it was told where the provider is)
+        }
+        let first = m.into_sasl_initial_response()?;
+        if first.auth_method != "OAUTHBEARER" {
+            let why = format!("user \"{user}\" signs in through an identity provider (OAuth), which this client doesn't speak: use psql 18 or another libpq 18 client, with oauth_issuer={} and oauth_client_id, or ask for the provider's POSTGRES 'password' to send a token as the password", bearer.issuer);
+            crate::audit::refused(app, &user, "postgres", from, "sign in", "the client doesn't speak OAuth");
+            return Err(fatal(why));
+        }
+        let discovery = format!("{}/.well-known/openid-configuration", bearer.issuer);
+        let why = match crate::sso::bearer(first.data.as_deref().unwrap_or_default()).filter(|t| !t.is_empty()) {
+            None => format!("{user} signs in with a token from the identity provider ({discovery})"),
+            Some(token) => match crate::users::sign_in(&app.lake, &app.auth, &user, &token).await {
+                Some(who) => {
+                    *self.backend.who.lock().unwrap() = Some(who.at("postgres", from));
+                    return finish(client, &self.cancels).await;
+                }
+                None => {
+                    let why = crate::sso::why(&app.lake, &token).await.unwrap_or_else(|| format!("the token doesn't sign in {user}"));
+                    crate::audit::refused(app, &user, "postgres", from, "sign in", &why);
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    format!("OAuth bearer authentication failed for user \"{user}\": {why}")
+                }
+            },
+        };
+        let error = serde_json::json!({"status": "invalid_token", "openid-configuration": discovery, "scope": bearer.scope});
+        bearer.told = Some(why);
+        client.send(PgWireBackendMessage::Authentication(pgwire::messages::startup::Authentication::SASLContinue(error.to_string().into_bytes().into()))).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -136,14 +212,19 @@ impl StartupHandler for Startup {
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
                 // (a user with only tokens, a service's, or one an identity provider signs in: its token
                 // as a password, asked for plainly; ADR-074. A name no user has is asked so only where a
-                // password may cross: it may be a mistyped name, and its password would come in the clear)
+                // password may cross: it may be a mistyped name, and its password would come in the clear.
+                // A provider that says POSTGRES 'oauth' asks by OAUTHBEARER instead: `ask_oauth`)
                 let user = client.metadata().get("user").cloned().unwrap_or_default();
-                let tokens_only = !crate::users::BUILT_IN.contains(&user.as_str()) && crate::users::verifier(&app.lake, &user).await.is_none()
-                    && (crate::users::principal(&app.lake, &user).await.is_ok()
-                        || (crate::tls::may_send_password(client.is_secure(), client.socket_addr()) && crate::sso::anyone(&app.lake).await));
+                let no_password = !crate::users::BUILT_IN.contains(&user.as_str()) && crate::users::verifier(&app.lake, &user).await.is_none();
+                let listed = no_password && crate::users::principal(&app.lake, &user).await.is_ok();
+                if no_password && self.ask_oauth(client, listed).await? {
+                    return Ok(());
+                }
+                let tokens_only = listed || (no_password && crate::tls::may_send_password(client.is_secure(), client.socket_addr()) && crate::sso::anyone(&app.lake).await);
                 *self.plain.lock().await = tokens_only;
                 client.send(PgWireBackendMessage::Authentication(if tokens_only { Authentication::CleartextPassword } else { Authentication::SASL(vec!["SCRAM-SHA-256".into()]) })).await?;
             }
+            PgWireFrontendMessage::PasswordMessageFamily(m) if self.oauth.lock().await.is_some() => return self.oauth_step(client, m).await,
             PgWireFrontendMessage::PasswordMessageFamily(m) if *self.plain.lock().await => {
                 let user = client.metadata().get("user").cloned().unwrap_or_default();
                 let password = m.into_password()?.password;
