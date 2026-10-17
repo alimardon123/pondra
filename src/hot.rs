@@ -609,7 +609,7 @@ pub fn known(stats: &datafusion::common::Statistics, schema: &Schema) -> HashMap
 }
 
 /// A table's Parquet files told what the planner knows of its columns' distinct values, as the hot
-/// batches are told. The footers hold no distinct counts, so a GROUP BY over a read cold was sized
+/// batches are told. The footers hold no distinct counts, so a GROUP BY over a table read cold was sized
 /// at every input row, and a join built the big side instead of the groups.
 fn told(plan: Arc<dyn ExecutionPlan>, known: &HashMap<String, Known>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
     let Some(scan) = plan.downcast_ref::<DataSourceExec>() else { return Ok(plan) };

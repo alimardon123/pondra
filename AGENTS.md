@@ -2745,6 +2745,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    above counts those buffers whole: a 10M-row sort of md5 strings on 4 partitions counted 66 MB for about 2 MB of
    rows and a 256 MB query memory refused it, one run in three. A top-N keeps a few rows and is left alone.
    `harness.py scale`: "a sort of 10M strings under a 256 MB query memory answers every time…".
+418. **A table read cold tells the planner its columns' distinct values, as one read hot does** (`hot::told`): the
+   cold branch of `HotFiles::scan` gives its Parquet scan's statistics, and each file group's, the catalog's distinct
+   counts (`Known`, from the table's sketch and ranges), where the footers have none. DataFusion bounds a GROUP BY's
+   rows by its keys' distinct counts, so without them a GROUP BY of a 3-value column over a table past the hot
+   budget was sized at every row, and a join built the big side (SF10's `GROUP BY l_returnflag` at 60M rows, its join
+   refused for memory). Rows, bytes, ranges and null counts stay the footers'. `harness.py hot`: "a table read cold
+   sizes a GROUP BY by its column's distinct values (3 groups), and a join builds those".
 
 ## Tests: run these before and after any change
 
