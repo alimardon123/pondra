@@ -191,20 +191,9 @@ export const register = {
 export const T = { fetch: (url, init) => fetch(url, init), token: () => store.get('pondra.token'), headers: () => (OWNER ? { 'x-pondra-owner': OWNER } : {}) };
 const OWNER = (() => { try { const k = new URLSearchParams(location.hash.slice(1)).get('key'); if (k) { sessionStorage.setItem('pondra.owner', k); history.replaceState(null, '', location.pathname + location.search); } return sessionStorage.getItem('pondra.owner'); } catch { return null; } })();
 export function configure(o) { Object.assign(T, o); }
-// A node's sign-in (ADR-074 §5) ends at this address with its session, or the reason it failed, in the fragment,
-// which no server sees. It is taken only when the address carries the nonce this tab kept as it started the sign-in
-// (settings.js), so a link can't sign the page in as someone else, nor put words in the dialog. The session becomes
-// the token; the fragment and the nonce go either way. A failure is returned for console.js's start to say, once
-// the sign-in dialog exists.
-const SSO = new URLSearchParams(location.hash.slice(1)), ASKED = new URLSearchParams(location.search);
-const OURS = (() => { try { const n = ASKED.get('pondra_sso'), kept = sessionStorage.getItem('pondra.sso'); sessionStorage.removeItem('pondra.sso'); return !!n && n === kept; } catch { return false; } })();
-const SIGNED = OURS ? SSO.get('pondra_session') : null;
-if (SIGNED) { store.set('pondra.token', SIGNED); store.set('pondra.user', SSO.get('pondra_user')); }
-export const SSO_WHY = OURS ? SSO.get('pondra_error') : null;
-if (SSO.has('pondra_session') || SSO.has('pondra_error') || ASKED.has('pondra_sso')) {
-  ASKED.delete('pondra_sso');
-  history.replaceState(null, '', location.pathname + (ASKED.size ? '?' + ASKED : ''));
-}
+// A sign-in through a provider ends at this address with its session, or why it failed, in the fragment: sso.js,
+// loaded only then, takes it. What failed is returned for console.js's start to say, once the sign-in dialog exists.
+export const SSO_WHY = /[#&]pondra_(session|error)=|[?&]pondra_sso=/.test(location.hash + location.search) ? (await import('./sso.js')).back(store) : null;
 
 // ------------------------------------------------------------------ the page's state
 export const MODE = document.documentElement.dataset.mode; // lake: one lake (serve --lake); lakes: a folder of lakes, its databases

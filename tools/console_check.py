@@ -1675,7 +1675,7 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "history.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js", "access.js", "table.js", "share.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "history.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js", "access.js", "table.js", "share.js", "sso.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \

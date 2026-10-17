@@ -43,7 +43,7 @@ pub async fn start(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Peer>,
             crate::audit::refused(&app, "", "http", Some(peer.addr), "sign in", &format!("identity provider {name}: {e:#}"));
             // (the page, or the command line that asked, hears why where the sign-in would have ended; a request
             // naming nowhere it may end, or a command line's without its challenge, gets the reason as the answer)
-            let why = format!("not signed in through {name}: {e:#}");
+            let why = format!("not signed in through {name}: {}", crate::ext::said(&e));
             let place = match destination(q.get("to").map_or("/", String::as_str)) {
                 Ok(to) if to.starts_with('/') => Some(format!("{to}#pondra_error={}", encode(&why))),
                 Ok(to) if q.contains_key("challenge") => Some(with_query(&to, "error", &why)),
@@ -51,7 +51,7 @@ pub async fn start(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Peer>,
             };
             match place {
                 Some(place) => (StatusCode::FOUND, [("location", place), ("cache-control", "no-store".into())]).into_response(),
-                None => (StatusCode::BAD_REQUEST, format!("signing in through {name}: {e:#}")).into_response(),
+                None => (StatusCode::BAD_REQUEST, format!("signing in through {name}: {}", crate::ext::said(&e))).into_response(),
             }
         }
     }
@@ -128,7 +128,7 @@ pub async fn callback(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Pee
     };
     let (place, asks) = ended.unwrap_or_else(|e| {
         crate::audit::refused(&app, "", "http", Some(peer.addr), "sign in", &format!("identity provider {name}: {e:#}"));
-        let why = format!("not signed in through {name}: {e:#}"); // (as the sign-in dialog and the command line say it)
+        let why = format!("not signed in through {name}: {}", crate::ext::said(&e)); // (as the sign-in dialog and the command line say it, a door's words)
         match flow["ch"].is_string() {
             true => (with_query(to, "error", &why), None),
             false => (format!("{to}#pondra_error={}", encode(&why)), None),
@@ -230,7 +230,7 @@ pub async fn redeem(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Peer>
         Ok(v) => Json(v).into_response(),
         Err(e) => {
             crate::audit::refused(&app, "", "http", Some(peer.addr), "sign in", &format!("a sign-in's code: {e:#}"));
-            (StatusCode::UNAUTHORIZED, format!("{e:#}")).into_response()
+            (StatusCode::UNAUTHORIZED, crate::ext::said(&e)).into_response()
         }
     }
 }

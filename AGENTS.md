@@ -1248,7 +1248,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    tabs' and the panes' menus (`tabs.js`), live queries (`live.js`), the database pill's menu and
    New database (`objects.js`), the grid's editing, menus and filter dialog (`gridmore.js`), the
    Data tree's other objects (`groups.js`), uploads (`upload.js`), users, roles and who has access
-   (`access.js`), and a table's own tab (`table.js`) too; the lake's summary loads with Details
+   (`access.js`), a table's own tab (`table.js`), and a sign-in's return through a provider (`sso.js`, which core.js waits for only when the address carries one) too; the lake's summary loads with Details
    (`details.js`). `console_check.py` (`budget`).
 171. **A page of an answer is that answer's rows** (`pages.rs`, `server::page`): every answer the
    console gets is kept whole, under a random id, and a page is a slice of it: the same rows in the
@@ -2700,7 +2700,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    proxy's or `serve --lakes`'s word), and its ID token is checked as every token is (invariant 409), with the
    flow's state and nonce and PKCE's verifier. A sign-in ends at a path of the node's or at the command line's
    loopback address with a challenge, nowhere else. The page takes the session in its fragment only with the nonce
-   its tab kept when it started (`core.js`), so a link can't sign it in as someone else. The command line's code
+   its tab kept when it started (`sso.js`, loaded only for that), so a link can't sign it in as someone else. The command line's code
    goes there only once the person continues on the node's page, and redeems within a minute only with its
    verifier. A flow, a code, a share link and a branch's key are signed under labels of their own, sessions bare
    (`sign_for`, `signed_for`), so none passes for another. The provider's discovery document is kept with its keys
