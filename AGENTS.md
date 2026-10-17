@@ -2188,7 +2188,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    or a float to an integer type, the casts coercion adds included, so every node, view and door
    plans it alike; a value written into an integer column is rounded the same way (`query::strict`,
    an UPDATE's and a MERGE's rows too: `change::part`), so a key an `ON CONFLICT` or a MERGE checks is
-   the key written. Spark's `DIV` drops the fraction before its cast (`sparksql`). `harness.py found`:
+   the key written. Spark's and Polars' names cut it toward zero, as those tools do: a session in Spark's
+   dialect (`Rounds` puts `pondra_truncate` there instead), `spark_sql('…')`'s casts and `DIV` (`sparksql`),
+   and the frames' casts to an integer (`cast_sql`, `castSql`: Python's and JavaScript's write the same text). `harness.py found`:
    "a cast of a decimal to an integer rounds…"; `pkey`: "a MERGE that compares a key in another
    type…" (a MERGE wrote 7002.5 as 7002, an INSERT as 7003).
 294. **A loop a lake starts holds it weakly** (`Lake::commits`, `Hot::watch`): the catalog's writes and

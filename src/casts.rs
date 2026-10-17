@@ -261,8 +261,6 @@ mod tests {
         assert_eq!(whole_type(&DataType::Decimal128(38, 2)), DataType::Decimal128(38, 2));
     }
 
-    /// `truncated` cuts the fraction toward zero in each type, keeping the decimal's type, NaN and NULL as
-    /// they are, and an integer exactly (`i64::MAX` too).
     /// A cast of a value that is already `pondra_truncate`d (what `spark_sql('…')` writes) gets no call of its own:
     /// its plan holds one such call, and the answer is the cut one.
     #[tokio::test]
@@ -276,6 +274,8 @@ mod tests {
         assert_eq!(array_value_to_string(ctx.sql(sql).await.unwrap().collect().await.unwrap()[0].column(0), 0).unwrap(), "2");
     }
 
+    /// `truncated` cuts the fraction toward zero in each type, keeping the decimal's type, NaN and NULL as
+    /// they are, and an integer exactly (`i64::MAX` too).
     #[test]
     fn truncation_cuts_toward_zero_in_each_type() {
         let f: ArrayRef = Arc::new(Float64Array::from(vec![Some(2.7), Some(-2.7), Some(2.5), Some(-0.5), Some(f64::NAN), None]));
