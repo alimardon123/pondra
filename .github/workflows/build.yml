@@ -127,7 +127,7 @@ jobs:
             files=ALL
           fi
           has() { [ "$files" = ALL ] || grep -qE "$1" <<< "$files"; }
-          bin='^(src/|capi/|launcher/|brand/|Cargo\.(toml|lock)$)' # (the program and the library)
+          bin='^(src/|capi/|launcher/|brand/|build\.rs$|tools/startup_layout\.rs$|Cargo\.(toml|lock)$)' # (the program and the library, and their build scripts)
           pkg='^(python/|js/|install\.(sh|ps1)$|tools/(package|smoke|package_check)\.py$|tools/(package_check\.mjs|try_packages\.sh|npm_publish\.sh|try_install\.ps1)$)' # (the packages, and what tries them)
           self='^\.github/workflows/build\.yml$'
           code=false; unit=false; harness=false; docs=false; site=false; deploy=false; full=false
@@ -245,6 +245,9 @@ jobs:
           # kernel with bigger pages: arm64 kernels use 4, 16 or 64 KB (a Raspberry Pi 5, some RHEL),
           # so arm64's is built for 64 KB pages, which runs on all three)
           AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE: "16"
+          # (only builds that ship pay for the startup layout, about 45 s more a link: tools/startup_layout.rs.
+          # linux-x64's alone so far: zig's lld has linked it with the script, and arm64's hasn't been tried)
+          PONDRA_STARTUP_LAYOUT: ${{ github.event_name == 'push' && matrix.platform == 'linux-x64' && '1' || '' }}
         run: |
           if [ -n "${{ matrix.zig }}" ]; then
             pip install ziglang cargo-zigbuild
@@ -254,6 +257,9 @@ jobs:
             cargo build --profile dist --target ${{ matrix.target }} --workspace
           fi
       - run: python tools/smoke.py "$BIN" # (on this OS: the shell, SQL, and memory read without /proc)
+      - name: The startup layout held # (a stale tools/startup.txt, or a build without the script: startup_order.py trace and mark it again)
+        if: matrix.platform == 'linux-x64' && github.event_name == 'push'
+        run: python tools/startup_order.py check --bin "$BIN" --most-mb 32
       # The pip and npm packages and the installers' archive, installed and tried as on a user's
       # machine: packaging that breaks on an OS (npm is npm.cmd on Windows) shows on a push.
       - run: python tools/package.py --bin "$BIN" --platform ${{ matrix.platform }} --npm-main --out dist && bash tools/try_packages.sh ${{ matrix.platform }}
