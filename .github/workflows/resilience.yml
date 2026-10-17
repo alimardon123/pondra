@@ -12,6 +12,10 @@ name: resilience
 # puts under failure changes: the node, the clients, the check itself. By hand too.
 on:
   workflow_call:
+    inputs:
+      artifact: # (build.yml's packages of linux-x64: pondra-linux-x64, or pr-linux-x64 for a pull request's release-profile build)
+        type: string
+        default: pondra-linux-x64
   workflow_dispatch:
 
 permissions:
@@ -34,11 +38,11 @@ jobs:
           python-version: "3.11"
       - name: The checks' Python packages (tools/requirements.txt's versions)
         run: pip install -r <(grep -iE '^(moto|boto3|psycopg\[|confluent-kafka|pyarrow)' tools/requirements.txt)
-      # (Called from build.yml: its run's own packages, with no API call. By hand: a build run's.)
+      # (Called from build.yml: its run's own packages, with no API call, whatever started that run. By hand: a build run's.)
       - uses: actions/download-artifact@v7
-        if: github.event_name != 'workflow_dispatch'
+        if: inputs.artifact
         with:
-          name: pondra-linux-x64
+          name: ${{ inputs.artifact }}
           path: dist
       - name: This commit's Linux binary (the build workflow's)
         run: |

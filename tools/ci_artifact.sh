@@ -5,8 +5,9 @@
 # a test started by hand), without building it again. The build uploads each platform's packages
 # as soon as they are made, before its suite runs, so this waits for them while that run goes on
 # (`WAIT_MINUTES`, 75), or takes a passed run of the same tree
-# (`ci_build.sh`: a merge or a tag whose code a pull request's run built). Needs `gh` with
-# GH_TOKEN (actions: read) and GITHUB_REPOSITORY.
+# (`ci_build.sh`: a merge or a tag whose code a pull request's run built). A pull request's `ci`
+# run names its packages `pr-linux-x64` (the release profile, for the runner's glibc), so they are
+# never taken for what ships. Needs `gh` with GH_TOKEN (actions: read) and GITHUB_REPOSITORY.
 set -euo pipefail
 platform=$1 sha=${2:-$GITHUB_SHA} repo=$GITHUB_REPOSITORY
 artifact() { gh api "repos/$repo/actions/runs/$1/artifacts" --jq ".artifacts[] | select(.name == \"pondra-$platform\" and (.expired | not)) | .id" 2>/dev/null | head -1; }
