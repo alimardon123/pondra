@@ -1085,7 +1085,7 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
             match self::sql(ctx, &crate::asof::rewrite(&sql)?).await {
                 Ok(df) => {
                     ctx.deregister_table(table_ref(&name))?;
-                    let view = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext::readable(&sql)))); // (its files as SQL named them)
+                    let view = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext_names::readable(&sql)))); // (its files as SQL named them)
                     if let Some(v) = guarded(&name, view, listing) {
                         ctx.register_table(table_ref(&name), v)?;
                     }

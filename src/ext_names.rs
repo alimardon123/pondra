@@ -25,6 +25,21 @@ fn name(spec: &Spec) -> String { format!("{PREFIX}{}", B64.encode(serde_json::to
 
 pub fn spec(name: &str) -> Option<Spec> { serde_json::from_slice(&B64.decode(name.strip_prefix(PREFIX)?).ok()?).ok() }
 
+/// Text (an error, a plan) with each table of files named as SQL named it: `'s3://…'`, or
+/// `read_csv('…', delim => ';')`, not its internal name.
+pub fn readable(text: &str) -> String {
+    static NAMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#""?(ext:[A-Za-z0-9_-]+)"?"#).expect("a regex"));
+    NAMES.replace_all(text, |c: &regex::Captures| {
+        let Some(s) = spec(&c[1]) else { return c[0].to_string() };
+        let urls = s.urls.iter().map(|u| format!("'{u}'")).collect::<Vec<_>>();
+        let urls = if urls.len() == 1 { urls[0].clone() } else { format!("[{}]", urls.join(", ")) };
+        match s.options.is_empty() {
+            true if s.urls.len() == 1 => urls,
+            _ => format!("read_{}({urls}{})", s.format, s.options.iter().map(|(k, v)| format!(", {k} => '{v}'")).collect::<String>()),
+        }
+    }).into_owned()
+}
+
 /// Might `sql` name files? (A cheap test, before anything is parsed.)
 pub fn mentions(sql: &str) -> bool {
     static FILES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {

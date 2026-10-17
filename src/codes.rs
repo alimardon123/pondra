@@ -21,8 +21,8 @@ pub fn of(e: &anyhow::Error) -> &'static str {
     by_words(&text)
 }
 
-/// An error in words: its causes after it, each said once, DataFusion's and Arrow's labels taken off (a node adds
-/// its own: `ext::said`).
+/// An error in words: its causes after it, each said once, DataFusion's and Arrow's labels taken off, and the files it
+/// names as SQL named them (`ext_names::readable`, the same at every door). A node leaves out more: `ext::said`.
 pub fn words(e: &anyhow::Error) -> String {
     let mut out = String::new();
     for c in e.chain().map(|c| c.to_string()) {
@@ -40,7 +40,7 @@ pub fn words(e: &anyhow::Error) -> String {
             out += &c;
         }
     }
-    SPILL_SAYS.iter().fold(out, |out, (from, to)| out.replace(from, to)) // (DataFusion's words for spilling, in the setting Pondra asks for)
+    crate::ext_names::readable(&SPILL_SAYS.iter().fold(out, |out, (from, to)| out.replace(from, to))) // (DataFusion's words for spilling, in the setting Pondra asks for; files as SQL named them)
 }
 
 /// DataFusion's words for a spill that ran past its cap, and for spilling turned off, said with the
@@ -158,6 +158,17 @@ pub fn http(code: &str) -> u16 {
     }
 }
 
+/// An error as every door answers it: the HTTP status its SQLSTATE takes, the SQLSTATE, and its words (a node's
+/// leave out what its caller may not see: `ext::said`).
+pub fn answer(e: &anyhow::Error) -> (u16, &'static str, String) {
+    let code = of(e);
+    #[cfg(feature = "server")]
+    let told = crate::ext::said(e);
+    #[cfg(not(feature = "server"))]
+    let told = words(e);
+    (http(code), code, told)
+}
+
 /// The gRPC status nearest a SQLSTATE (Flight SQL's errors).
 #[cfg(feature = "server")]
 pub fn grpc(code: &str) -> tonic::Code {
@@ -262,5 +273,12 @@ mod tests {
         // Only a real fault stays a 500.
         assert_eq!(h("XX000"), 500); // internal_error
         assert_eq!(h("58000"), 500); // system_error
+    }
+
+    #[test]
+    fn an_answer_is_its_status_code_and_words() {
+        // (what every door sends for one error: `http` of its code, the code, its words)
+        assert_eq!(super::answer(&super::coded("23505", "x")), (409, "23505", "x".to_string()));
+        assert_eq!(super::answer(&super::coded("42P01", "no file here")), (404, "42P01", "no file here".to_string()));
     }
 }

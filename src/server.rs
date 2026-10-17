@@ -899,7 +899,7 @@ impl App {
                 crate::history::planned(&logical, &plan); // (its shape; a slow statement's plan, with what each operator did; what it learned)
                 let out = if explained { crate::history::explained(out)? } else { out };
                 // (no rows: still its columns, with the types its batches have, which the physical plan gives: not the planner's)
-                anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(plan.schema())] } else { out })
+                anyhow::Ok(crate::engine::kept(out, &plan))
             };
             let here = std::time::Instant::now();
             let out = crate::query::frugally(run).await?;
@@ -1751,8 +1751,8 @@ impl std::fmt::Display for E {
 }
 impl IntoResponse for E {
     fn into_response(self) -> Response {
-        let code = crate::codes::of(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4)
-        let status = StatusCode::from_u16(crate::codes::http(code)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (status, [("x-pondra-sqlstate", code)], crate::ext::said(&self.0)).into_response()
+        let (status, code, told) = crate::codes::answer(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4; `codes::answer`, every door's)
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, [("x-pondra-sqlstate", code)], told).into_response()
     }
 }

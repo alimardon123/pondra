@@ -9,7 +9,7 @@ use crate::front::{Host, Own};
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, SchemaProvider, TableProvider};
 use datafusion::arrow::ipc::reader::{FileReader, StreamReader};
-use datafusion::arrow::record_batch::{RecordBatch, RecordBatchReader};
+use datafusion::arrow::record_batch::RecordBatchReader;
 use datafusion::arrow::{csv, json};
 use datafusion::common::TableReference;
 use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
@@ -62,10 +62,10 @@ impl Answer {
     }
 }
 
-/// An error as an answer: its SQLSTATE, the status HTTP's door would give it (`codes::http`), its words as the body.
+/// An error as an answer: its status, its SQLSTATE and its words, as every door gives them (`codes::answer`).
 fn failed(e: anyhow::Error) -> Answer {
-    let code = crate::codes::of(&e);
-    Answer { status: crate::codes::http(code), content_type: TEXT, sqlstate: Some(code), body: crate::codes::words(&e).into() }
+    let (status, code, words) = crate::codes::answer(&e);
+    Answer { status, content_type: TEXT, sqlstate: Some(code), body: words.into() }
 }
 
 impl Page {
@@ -107,14 +107,9 @@ impl Page {
     }
 
     /// SQL as a node reads it: the front, then the rows of the files it names by name, planned (`plan`), then the
-    /// rows in `format` (an answer with no rows keeps its columns: invariant 88).
+    /// rows in `format` (an answer with no rows keeps its columns, as `engine::collect` gives them: invariant 88).
     async fn sql(&self, text: &str, format: Option<&str>) -> anyhow::Result<Answer> {
-        let df = self.plan(text).await?;
-        let schema = df.schema().inner().clone();
-        let mut batches = df.collect().await?;
-        if batches.is_empty() {
-            batches.push(RecordBatch::new_empty(schema)); // (an answer with no rows keeps its columns: invariant 88)
-        }
+        let batches = crate::engine::collect(self.plan(text).await?).await?;
         Ok(Answer::ok(crate::answer::content_type(format), crate::answer::render(&batches, format, |_| None)?))
     }
 
@@ -346,6 +341,7 @@ impl Host for PageHost<'_> {
 mod tests {
     use super::*;
     use datafusion::arrow::ipc::reader::StreamReader;
+    use datafusion::arrow::record_batch::RecordBatch;
 
     const ORDERS: &str = "id,name,qty\n1,a,5\n2,b,7\n3,c,9\n";
     const NAMES: &str = "id,label\n1,x\n3,z\n";
@@ -411,6 +407,31 @@ mod tests {
         let reader = StreamReader::try_new(&got.body[..], None).unwrap();
         assert_eq!(reader.schema().fields().len(), 3);
         assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_is_typed_as_its_plan_runs_it() {
+        // (the planner types 1e15 as a decimal of negative scale, which Parquet can't hold: the plan's type is not that)
+        use datafusion::arrow::datatypes::DataType;
+        let page = page_with_tables().await;
+        let got = page.request("POST", "/sql?format=arrow", "SELECT 1e15 AS x WHERE false".into()).await;
+        assert_eq!(got.status, 200);
+        let batches: Vec<RecordBatch> = StreamReader::try_new(&got.body[..], None).unwrap().map(|b| b.unwrap()).collect();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 0);
+        let x = batches[0].schema().field(0).data_type().clone();
+        assert!(!matches!(x, DataType::Decimal128(_, s) | DataType::Decimal256(_, s) if s < 0), "{x:?}");
+        let parquet = page.request("POST", "/sql?format=parquet", "SELECT 1e15 AS x WHERE false".into()).await;
+        assert_eq!(parquet.status, 200);
+    }
+
+    #[tokio::test]
+    async fn an_error_names_a_file_as_sql_did() {
+        let page = page_with_tables().await;
+        let got = page.request("POST", "/sql", "SELECT nope FROM 'orders.csv'".into()).await;
+        assert_eq!(got.sqlstate, Some("42703"));
+        let body = std::str::from_utf8(&got.body).unwrap();
+        assert!(body.contains("'orders.csv'") && !body.contains("ext:"), "{body}");
     }
 
     #[tokio::test]

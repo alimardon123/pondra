@@ -3,6 +3,7 @@
 //! uses it as it is, so both plan a query alike (designs/l2-b4-front-and-web.md).
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, Int64Array, StringArray, UnionArray};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::{exec_err, Result};
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -11,6 +12,7 @@ use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult};
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion::logical_expr::{ColumnarValue, Documentation, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{create_udf, SessionConfig, SessionContext};
 use std::sync::Arc;
 
@@ -308,6 +310,22 @@ pub async fn sql(ctx: &SessionContext, sql: &str) -> anyhow::Result<datafusion::
         return Ok(text_unions(ctx.execute_logical_plan(plan).await?)?);
     }
     Ok(text_unions(ctx.sql_with_options(sql, read_only()).await?)?)
+}
+
+/// A plan's rows; an answer with none still has its columns, typed as the plan runs them (the physical plan's
+/// schema, not the planner's, which types `1e15` as a negative-scale decimal: invariant 88).
+pub fn kept(rows: Vec<RecordBatch>, plan: &Arc<dyn ExecutionPlan>) -> Vec<RecordBatch> {
+    if rows.is_empty() {
+        return vec![RecordBatch::new_empty(plan.schema())];
+    }
+    rows
+}
+
+/// A frame's rows, as `kept` gives them.
+pub async fn collect(df: datafusion::dataframe::DataFrame) -> anyhow::Result<Vec<RecordBatch>> {
+    let task = Arc::new(df.task_ctx());
+    let plan = df.create_physical_plan().await?;
+    Ok(kept(datafusion::physical_plan::collect(plan.clone(), task).await?, &plan))
 }
 
 #[cfg(test)]

@@ -208,37 +208,23 @@ fn located(l: &str) -> Result<String> {
 
 // ---------------------------------------------------------------- the table they make
 
-/// Text (an error, a plan) with each table of files named as SQL named it: `'s3://…'`, or
-/// `read_csv('…', delim => ';')`, not its internal name.
-/// An error in words for whoever sent the statement: its causes after it, each said once
-/// (DataFusion repeats a cause's words in its own), files named as SQL named them.
+/// An error in words for whoever sent the statement: its causes after it, each said once, files named as SQL
+/// named them (`codes::words` does both, for every door). A node leaves out what its caller may not see: a Python
+/// routine's lines are cut where the caller may not see its code (S27).
 pub fn said(e: &anyhow::Error) -> String {
     let out = crate::codes::words(e);
     match crate::auth::shows_code() {
-        true => readable(&out),
-        false => crate::python::unquoted(&readable(&out)), // (a Python routine's lines, quoted wherever its batch ran: S27)
+        true => out,
+        false => crate::python::unquoted(&out), // (a Python routine's lines, quoted wherever its batch ran: S27)
     }
 }
 
-pub fn readable(text: &str) -> String {
-    static NAMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#""?(ext:[A-Za-z0-9_-]+)"?"#).expect("a regex"));
-    NAMES.replace_all(text, |c: &regex::Captures| {
-        let Some(s) = spec(&c[1]) else { return c[0].to_string() };
-        let urls = s.urls.iter().map(|u| format!("'{u}'")).collect::<Vec<_>>();
-        let urls = if urls.len() == 1 { urls[0].clone() } else { format!("[{}]", urls.join(", ")) };
-        match s.options.is_empty() {
-            true if s.urls.len() == 1 => urls,
-            _ => format!("read_{}({urls}{})", s.format, s.options.iter().map(|(k, v)| format!(", {k} => '{v}'")).collect::<String>()),
-        }
-    }).into_owned()
-}
-
-/// An EXPLAIN's rows, its tables of files named as SQL named them (`readable`).
+/// An EXPLAIN's rows, its tables of files named as SQL named them (`ext_names::readable`).
 pub fn readable_rows(batches: Vec<datafusion::arrow::record_batch::RecordBatch>) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
     use datafusion::arrow::array::{ArrayRef, AsArray, StringArray};
     batches.into_iter().map(|b| {
         let columns = b.columns().iter().map(|c| match c.data_type() {
-            datafusion::arrow::datatypes::DataType::Utf8 => Arc::new(c.as_string::<i32>().iter().map(|v| v.map(readable)).collect::<StringArray>()) as ArrayRef,
+            datafusion::arrow::datatypes::DataType::Utf8 => Arc::new(c.as_string::<i32>().iter().map(|v| v.map(crate::ext_names::readable)).collect::<StringArray>()) as ArrayRef,
             _ => c.clone(),
         });
         Ok(datafusion::arrow::record_batch::RecordBatch::try_new(b.schema(), columns.collect())?)
