@@ -1081,6 +1081,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     }
     let entries = lake.cat.scan_raw("t/", "t0").await?;
     lake.cat.settle().await?; // (the log read as far as these entries: `Catalog::settle`)
+    let upto = upto.or_else(|| Some(lake.visible())); // (one end for every table it reads, fixed once their entries are read: a table read twice, or two a transaction wrote, read one commit)
     for (key, raw) in entries {
         let name = &key[2..];
         if name != except && !crate::sys::hidden(name) && (listing || mentions(&text, name)) {
@@ -1132,13 +1133,14 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         }
         let entries = other.cat.scan_raw("t/", "t0").await?;
         other.cat.settle().await?; // (as this lake's own, above)
+        let upto = Some(other.visible()); // (one end for its tables too, as this lake's above)
         for (key, raw) in entries {
             let name = &key[2..];
             if crate::sys::hidden(name) || !(listing || mentions(&text, name)) {
                 continue;
             }
             let meta: TableMeta = serde_json::from_slice(&raw)?;
-            let view = named(&ctx, table_view(&other, &ctx, name, &sys(meta.clone()), None).await?, &meta, names_deleted(&text))?;
+            let view = named(&ctx, table_view(&other, &ctx, name, &sys(meta.clone()), upto).await?, &meta, names_deleted(&text))?;
             let Some(view) = across(&format!("{ns}.{name}"), view, listing, &locked) else { continue };
             let (s, t) = split(name);
             if old && s == PUBLIC {

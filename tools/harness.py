@@ -1369,8 +1369,9 @@ def tiering():
 def tails():
     """A table's log tail is kept from one query to the next and extended (`query::Tail`): every
     read equals a model while rows stream into two tables, a keyed one among them; a transaction's
-    reads stay at its snapshot while other reads move the kept tail past it; an added column; and
-    a tiering round moving the table's mark."""
+    reads stay at its snapshot while other reads move the kept tail past it; an added column; a
+    tiering round moving the table's mark; and a query reading one table twice, and two tables one
+    transaction wrote, as of one commit while rows land."""
     lake = new_lake()
     node = Node(lake, A.port, tier_secs=3600).start()
     q = lambda s: sql(A.port, s)
@@ -1419,12 +1420,57 @@ def tails():
     for i in range(60, 70):
         insert(i, x=True)
         check(f"after insert {i}, tiered")
+    # Two tables that one transaction writes in one commit, and a query reading one of them twice:
+    # every read must be as of one commit. Three writers commit a transaction each (BEGIN … COMMIT in
+    # one request); one reader asks as fast as it can. Before the log's end was fixed once per query,
+    # each scan took the newest commit when it was planned, so the two reads could differ.
+    q("CREATE TABLE pa (id BIGINT)")
+    q("CREATE TABLE pb (id BIGINT)")
+    pair_secs, pair_lock, pair_last, pair_stop = 20, threading.Lock(), [0], threading.Event()
+    pair_commits, pair_reads, pair_wrong, pair_errors = [0], [0], [], []
+
+    def pair_writer():
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        while not pair_stop.is_set():
+            with pair_lock:
+                pair_last[0] += 1
+                i = pair_last[0]  # (unique, so each transaction's rows are its own)
+            c.request("POST", "/sql", f"BEGIN; INSERT INTO pa VALUES ({i}); INSERT INTO pb VALUES ({i}); COMMIT".encode())
+            r = c.getresponse()
+            data = r.read()
+            with pair_lock:
+                if r.status == 200:
+                    pair_commits[0] += 1
+                else:
+                    pair_errors.append((r.status, data[:200]))
+
+    def pair_reader():
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        while not pair_stop.is_set():
+            c.request("POST", "/sql", f"SELECT (SELECT sum(id) FROM pa) AS a, (SELECT sum(id) FROM pb) AS b, (SELECT sum(id + 0) FROM pa) AS a2 -- {uuid.uuid4()}".encode())  # (never a remembered answer)
+            r = c.getresponse()
+            body = json.loads(r.read())
+            with pair_lock:
+                pair_reads[0] += 1
+            if r.status != 200 or not body or not (body[0]["a"] == body[0]["b"] == body[0]["a2"]):  # (NULL equals NULL)
+                with pair_lock:
+                    pair_wrong.append(body)
+
+    pair_threads = [threading.Thread(target=pair_writer, daemon=True) for _ in range(3)] + [threading.Thread(target=pair_reader, daemon=True)]
+    [t.start() for t in pair_threads]
+    time.sleep(pair_secs)
+    pair_stop.set()
+    [t.join(60) for t in pair_threads]
+    print(f"tails: pairs: {pair_reads[0]} reads, {pair_commits[0]} commits, {len(pair_wrong)} wrong {pair_wrong[:3]}, {len(pair_errors)} refused {pair_errors[:3]}")
+    pairs_name = f"a table read twice and two tables one transaction wrote read one commit while rows land ({pair_reads[0]} reads, {pair_commits[0]} commits)"
+    pairs_good = not pair_wrong and pair_reads[0] >= 200 and pair_commits[0] >= 500
     node.kill()
     checks = {
         "every read == the model while rows stream in (two tables, one keyed)": not wrong,
         "a transaction reads its snapshot while other reads move past it": held == snapshot == 80,
         "rows from before an added column read it as NULL": added == want_added,
         "decoded log rows go when their table is tiered, with no read since": before_tiering > 0 and after_tiering == 0,
+        pairs_name: pairs_good,
     }
     for name, good in checks.items():
         print(f"tails: {name}: {'OK' if good else 'FAIL'}")
@@ -18111,7 +18157,18 @@ def attached():
                 reads[t] = reads.get(t, 0) + 1
                 if not isinstance(r, list) or [x["id"] for x in r] != [1, 2, 3]:
                     wrong.append((t, r))
-    readers = [threading.Thread(target=read, args=(ts,)) for ts in (["t"], firsts)]
+
+    def read_twice():
+        # One table of the attached lake read twice in one query: both reads are as of one commit of
+        # its leader's (`session_at` fixes the attached lake's log end once, as for this lake's own).
+        # Each UPDATE adds 1 to the sum, so two commits never give the same sum.
+        while not stop.is_set():
+            r = _try(lambda: sql(b.port, f"SELECT (SELECT sum(amount) FROM other.t) AS a, (SELECT sum(amount + 0) FROM other.t) AS a2 -- {uuid.uuid4()}"))  # (never a remembered answer)
+            reads["twice"] = reads.get("twice", 0) + 1
+            if not isinstance(r, list) or not r or r[0]["a"] != r[0]["a2"]:  # (NULL equals NULL)
+                wrong.append(("twice", r))
+
+    readers = [threading.Thread(target=read, args=(ts,)) for ts in (["t"], firsts)] + [threading.Thread(target=read_twice)]
     [r.start() for r in readers]
     try:
         for i in range(80):
@@ -18126,11 +18183,12 @@ def attached():
     checks = {
         f"every read of a table of an attached lake while its leader updates, tiers and purges it holds each row once ({reads.get('t', 0)} reads)": reads.get("t", 0) > 50 and not any(t == "t" for t, _ in wrong),
         "…and of tables read while their first UPDATE lands": all(reads.get(t, 0) > 3 for t in firsts) and not any(t in firsts for t, _ in wrong),
+        f"a table of an attached lake read twice in one query while its leader changes it holds one commit ({reads.get('twice', 0)} reads)": reads.get("twice", 0) > 50 and not any(t == "twice" for t, _ in wrong),
     }
     for name, good in checks.items():
         print(f"attached: {name}: {'OK' if good else 'FAIL'}")
     if not all(checks.values()):
-        print(f"attached: {len(wrong)} wrong, {wrong[:5]}")
+        print(f"attached: {len(wrong)} wrong, {wrong[:5]}; read twice: {sum(1 for t, _ in wrong if t == 'twice')} wrong of {reads.get('twice', 0)}, first {[r for t, r in wrong if t == 'twice'][:3]}")
         sys.exit(1)
     return "an attached lake read while its leader changes, tiers and purges rows: every read as of one commit"
 
