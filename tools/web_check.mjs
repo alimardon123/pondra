@@ -29,6 +29,10 @@ const CASES = [
     '[{"id":1,"qty":5},{"id":2,"qty":7},{"id":3,"qty":9}]'],
   ['join', 'POST', '/sql?format=csv', 'SELECT o.id, n.label FROM orders o JOIN names n ON o.id = n.id ORDER BY o.id', 200, null,
     'id,label\n1,x\n3,z\n'],
+  // A join whose other side groups (EarlyProbes reads that side ahead: a page has no runtime to read on).
+  ['join of a grouped subquery', 'POST', '/sql?format=csv',
+    'SELECT n.id, g.total FROM names n JOIN (SELECT id, sum(qty) AS total FROM orders GROUP BY id) g ON n.id = g.id ORDER BY n.id',
+    200, null, 'id,total\n1,5\n3,9\n'],
   ['window', 'POST', '/sql?format=csv', 'SELECT id, sum(qty) OVER (ORDER BY id) AS run FROM orders', 200, null,
     'id,run\n1,5\n2,12\n3,21\n'],
   ['syntax error', 'POST', '/sql', 'SELEC 1', 400, '42601', undefined],
