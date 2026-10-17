@@ -60,7 +60,8 @@ impl IntoResponse for Fail {
     fn into_response(self) -> Response { (self.0, Json(j!({"errorCode": self.1, "message": self.2}))).into_response() }
 }
 
-fn internal(e: anyhow::Error) -> Fail { Fail(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", format!("{e:#}")) }
+// (a client is told an error as every door words it: files by their SQL names, no routine's code, `ext::said`)
+fn internal(e: anyhow::Error) -> Fail { Fail(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", crate::ext::said(&e)) }
 fn missing(what: String) -> Fail { Fail(StatusCode::NOT_FOUND, "RESOURCE_DOES_NOT_EXIST", what) }
 fn invalid(what: String) -> Fail { Fail(StatusCode::BAD_REQUEST, "INVALID_PARAMETER_VALUE", what) }
 
@@ -178,8 +179,8 @@ async fn log_of(app: &App, t: &Shared, version: Option<i64>) -> Result<(String, 
     let folder = format!("data/{}", meta.folder(&t.table));
     let root = format!("{}/{folder}", lake.url.trim_end_matches('/'));
     let log = crate::read_delta::replay(lake, &root, version).await.map_err(|e| match version {
-        Some(v) => invalid(format!("{}.{} has no version {v} to read: {e:#}", t.schema, t.name)),
-        None => Fail(StatusCode::SERVICE_UNAVAILABLE, "TEMPORARILY_UNAVAILABLE", format!("{}.{} isn't available to share yet; its newest rows are still being written to the open format, so try again shortly: {e:#}", t.schema, t.name)),
+        Some(v) => invalid(format!("{}.{} has no version {v} to read: {}", t.schema, t.name, crate::ext::said(&e))),
+        None => Fail(StatusCode::SERVICE_UNAVAILABLE, "TEMPORARILY_UNAVAILABLE", format!("{}.{} isn't available to share yet; its newest rows are still being written to the open format, so try again shortly: {}", t.schema, t.name, crate::ext::said(&e))),
     })?;
     Ok((folder, log))
 }
@@ -382,7 +383,7 @@ fn quota(who: &str, n: usize) -> Result<(), Fail> {
 async fn file(State(app): State<App>, method: axum::http::Method, Path(link): Path<String>, Query(q): Query<HashMap<String, String>>, h: HeaderMap) -> Response {
     let (key, _) = match crate::vend::opened(&app.lake, &link, q.get("sig").map_or("", String::as_str)).await {
         Ok(k) => k,
-        Err(e) => return Fail(StatusCode::FORBIDDEN, "PERMISSION_DENIED", format!("{e:#}")).into_response(),
+        Err(e) => return Fail(StatusCode::FORBIDDEN, "PERMISSION_DENIED", crate::ext::said(&e)).into_response(),
     };
     let path = object_store::path::Path::from(key.as_str());
     let size = match object_store::ObjectStoreExt::head(&app.lake.store, &path).await {

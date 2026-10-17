@@ -209,14 +209,15 @@ pub async fn create(lake: &Lake, name: String, p: Provider, replace: bool, if_no
     if let Some(s) = &p.secret {
         ensure!(lake.cat.get::<Value>(&format!("e/{s}")).await?.is_some(), "no secret {s} (CREATE SECRET {s} (TYPE generic, CLIENT_SECRET '…'))");
     }
-    let keys = fetch(&p.issuer).await.with_context(|| format!("identity provider {name}: its issuer {} was asked for its keys", p.issuer))?;
+    let found = fetch(&p.issuer).await.with_context(|| format!("identity provider {name}: its issuer {} was asked for its keys", p.issuer))?;
+    let keys = found.1.len();
     let open = !crate::users::signed(lake).await && !crate::users::any(lake).await; // (a lake served with tokens is marked: invariant 379)
     let mut puts = vec![(key(&name), json(&p))];
     puts.extend(crate::users::signed_mark(lake).await?);
     lake.cat.commit(puts, &[]).await?;
     forget();
-    remember(&p.issuer, Ok(keys.clone()));
-    let mut out = j!({"identity_provider": name, "issuer": p.issuer, "keys": keys.len()});
+    remember(&p.issuer, Ok(found));
+    let mut out = j!({"identity_provider": name, "issuer": p.issuer, "keys": keys});
     if open {
         // (told through the door: `write.rs` passes a DDL answer's notice on)
         out["notice"] = format!("the lake took requests from anyone before: now everyone signs in, through {name} or as a user here (`pondra token --dir …` makes an admin's token)").into();
@@ -456,9 +457,11 @@ impl Jwk {
     }
 }
 
-/// An issuer's keys: when last fetched, and when last asked (a provider is asked at most once a minute).
+/// An issuer's keys and the discovery document they came with: when last fetched, and when last asked (a provider is
+/// asked at most once a minute).
 struct Keys {
     keys: Vec<Jwk>,
+    doc: Value, // (Null: none fetched yet)
     fetched: Option<Instant>,
     asked: Instant,
 }
@@ -514,36 +517,56 @@ async fn key_for(p: &Provider, kid: Option<&str>, alg: &str) -> Result<Jwk> {
     }
 }
 
-/// Keep what a fetch found (or, when it failed, the keys there were, asked again in a minute).
-fn remember(issuer: &str, found: Result<Vec<Jwk>>) {
+/// Keep what a fetch found, the document and its keys (or, when it failed, what there was, asked again in a minute).
+fn remember(issuer: &str, found: Result<(Value, Vec<Jwk>)>) {
     let mut all = KEYS.lock().unwrap();
     let now = Instant::now();
     match found {
-        Ok(keys) => {
-            all.insert(issuer.to_string(), Keys { keys, fetched: Some(now), asked: now });
+        Ok((doc, keys)) => {
+            all.insert(issuer.to_string(), Keys { keys, doc, fetched: Some(now), asked: now });
         }
         Err(e) => {
-            all.entry(issuer.to_string()).or_insert(Keys { keys: vec![], fetched: None, asked: now }).asked = now;
+            all.entry(issuer.to_string()).or_insert(Keys { keys: vec![], doc: Value::Null, fetched: None, asked: now }).asked = now;
             eprintln!("identity provider {issuer}: its keys weren't fetched: {e:#}");
         }
     }
 }
 
-/// An issuer's discovery document, checked to name the issuer exactly as its tokens do.
+/// An issuer's discovery document, as it came with the keys (`fetch`): fetched again only when there is none or it
+/// is an hour old, and at most once a minute an issuer, so the sign-ins anyone may start (`sso_flow`'s start) can't
+/// make the node hammer the provider, as its keys can't (invariant 409). A provider that can't be reached starts
+/// sign-ins with the document it had.
 pub(crate) async fn discovery(issuer: &str) -> Result<Value> {
-    let doc = get_json(&format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'))).await?;
-    ensure!(doc["issuer"].as_str() == Some(issuer), "its discovery document names issuer {}, not {issuer} (its tokens must name the issuer the document does)", doc["issuer"]);
-    Ok(doc)
+    // (the document, whether it is an hour old or less, and whether the provider may be asked again)
+    let look = || KEYS.lock().unwrap().get(issuer).map(|k| (k.doc.clone(), k.fetched.is_some_and(|f| f.elapsed() < HOUR), k.asked.elapsed() >= MINUTE));
+    if let Some((doc, true, _)) = look().filter(|(doc, ..)| !doc.is_null()) {
+        return Ok(doc);
+    }
+    let gate = FETCHING.lock().unwrap().entry(issuer.to_string()).or_default().clone();
+    let _one = gate.lock().await;
+    match look() {
+        Some((doc, fresh, may)) if !doc.is_null() && (fresh || !may) => return Ok(doc), // (fetched while this one waited, or asked less than a minute ago)
+        Some((_, _, false)) => bail!("{issuer} was asked for its discovery document less than a minute ago and didn't give it (the node's log says why)"),
+        _ => {}
+    }
+    let found = fetch(issuer).await;
+    let failed = found.as_ref().err().map(|e| format!("{e:#}"));
+    remember(issuer, found);
+    match look() {
+        Some((doc, ..)) if !doc.is_null() => Ok(doc), // (fetched now; or, the provider down, the one it had)
+        _ => bail!("{}", failed.unwrap_or_default()),
+    }
 }
 
-/// An issuer's keys, from its discovery document's `jwks_uri` (OpenID Connect Discovery: the document
-/// must name the issuer exactly as its tokens do).
-async fn fetch(issuer: &str) -> Result<Vec<Jwk>> {
-    let doc = discovery(issuer).await?;
+/// An issuer's discovery document and its keys, from the document's `jwks_uri` (OpenID Connect Discovery: the
+/// document must name the issuer exactly as its tokens do).
+async fn fetch(issuer: &str) -> Result<(Value, Vec<Jwk>)> {
+    let doc = get_json(&format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'))).await?;
+    ensure!(doc["issuer"].as_str() == Some(issuer), "its discovery document names issuer {}, not {issuer} (its tokens must name the issuer the document does)", doc["issuer"]);
     let uri = doc["jwks_uri"].as_str().context("its discovery document has no jwks_uri")?;
     let keys = jwks(&get_json(uri).await?);
     ensure!(!keys.is_empty(), "{uri} has no RSA or EC key for signatures");
-    Ok(keys)
+    Ok((doc, keys))
 }
 
 pub(crate) async fn get_json(url: &str) -> Result<Value> {
@@ -623,7 +646,7 @@ mod tests {
         format!("{signed}.{}", B64U.encode(sig))
     }
 
-    fn keys_of(issuer: &str, keys: Vec<Jwk>) { remember(issuer, Ok(keys)); }
+    fn keys_of(issuer: &str, keys: Vec<Jwk>) { remember(issuer, Ok((serde_json::Value::Null, keys))); }
 
     #[tokio::test]
     async fn checked_by_rsa_and_ec_keys() {

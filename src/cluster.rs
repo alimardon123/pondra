@@ -56,6 +56,9 @@ pub struct Cluster {
     cut_off: std::sync::atomic::AtomicBool,       // leader: it can't reach the bucket (`keep_alive`)
     others: std::sync::atomic::AtomicBool,        // leader cut off: another node was there meanwhile
     may_lead: bool, // false: our store is another node's (pondra://), which leads: we never claim a term (`served.rs`)
+    /// The term was ours before this process started, and taken back (`coming_back`): its mark is as old as the
+    /// restart, so `keep_alive` marks it at once.
+    taken_back: bool,
 }
 
 impl Cluster {
@@ -63,7 +66,7 @@ impl Cluster {
     /// from our own restart: `coming_back`). `may_lead` false: our store is another node's (`pondra://`),
     /// which leads its lake; we follow it, and wait for it, and never claim a term (invariant 299).
     pub async fn join(store: &Store, addr: &str, reader: bool, may_lead: bool) -> Result<Arc<Cluster>> {
-        let mut said = false;
+        let (mut said, mut taken_back) = (false, false);
         let leader = loop {
             let latest_term = match latest(store).await {
                 Ok(t) => t,
@@ -91,6 +94,7 @@ impl Cluster {
                 Some(t) if t.addr == addr && !stepped_down(store, t.n).await => {
                     if coming_back(&t) {
                         relock(&t);
+                        taken_back = true;
                         break t;
                     }
                     if let Some(t) = claim(store, t.n + 1, addr).await? {
@@ -111,7 +115,7 @@ impl Cluster {
         // its first answer, not 30 s later, so the restart check in `follow` can fire)
         let last_ok = Mutex::new(if may_lead { Instant::now() + STARTUP } else { Instant::now() }); // until we first hear from the leader
         let (beats, shard_runs, heard) = (Default::default(), Default::default(), Default::default());
-        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default(), others: Default::default(), may_lead }))
+        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default(), others: Default::default(), may_lead, taken_back }))
     }
 
     pub fn is_leader(&self) -> bool { self.leader.addr == self.addr }
@@ -185,9 +189,10 @@ impl Cluster {
         let marked = Arc::new(std::sync::atomic::AtomicU64::new(crate::log::now_ms()));
         let (me, m) = (self.clone(), marked.clone());
         crate::panics::spawn(async move {
-            // (the claim marked it a moment ago, and a node that took its own term back marked it
-            // before it went: C5, a key at most once a second)
-            let mut wait = 10;
+            // (the claim marked it a moment ago: C5, a key at most once a second. A term taken back after a
+            // restart was last marked before the restart, so it is marked a second in, not ten: invariant 17's
+            // 30 s count from that mark)
+            let mut wait = if me.taken_back { 1 } else { 10 };
             loop {
                 tokio::time::sleep(Duration::from_secs(wait)).await;
                 let ok = mark_alive(&store, me.leader.n).await.is_ok();

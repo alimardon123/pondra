@@ -215,11 +215,14 @@ impl StartupHandler for Startup {
                 // (a user with only tokens, a service's, or one an identity provider signs in: its token
                 // as a password, asked for plainly; ADR-074. A name no user has is asked so only where a
                 // password may cross: it may be a mistyped name, and its password would come in the clear.
-                // A provider that says POSTGRES 'oauth' asks by OAUTHBEARER instead: `ask_oauth`)
+                // A provider that says POSTGRES 'oauth' asks by OAUTHBEARER instead (`ask_oauth`), but never a
+                // user with tokens of its own: libpq 18's OAuth can't carry a `pt_` token, so its drivers would
+                // be refused)
                 let user = client.metadata().get("user").cloned().unwrap_or_default();
                 let no_password = !crate::users::BUILT_IN.contains(&user.as_str()) && crate::users::verifier(&app.lake, &user).await.is_none();
                 let listed = no_password && crate::users::principal(&app.lake, &user).await.is_ok();
-                if no_password && self.ask_oauth(client, listed).await? {
+                let tokens = listed && crate::users::has_tokens(&app.lake, &user).await;
+                if no_password && !tokens && self.ask_oauth(client, listed).await? {
                     return Ok(());
                 }
                 let tokens_only = listed || (no_password && crate::tls::may_send_password(client.is_secure(), client.socket_addr()) && crate::sso::anyone(&app.lake).await);

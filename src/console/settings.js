@@ -4,6 +4,7 @@
 // own heading: an enterprise build's users and roles, tokens, audit and quotas. Loaded when opened.
 import { h, $, icon, svg, count, ICONS, S, R, call, register, moreStyle, toast, store, base, T } from './core.js';
 import { PER_PAGE } from './grid.js';
+import { start } from './sso.js';
 
 await moreStyle();
 
@@ -136,7 +137,8 @@ async function providerButtons() {
   box.replaceChildren();
   const r = await T.fetch(base() + '/sso').catch(() => null); // (a folder of lakes: the database's own providers)
   const providers = r?.ok ? (await r.json().catch(() => ({}))).providers || [] : [];
-  box.append(...providers.map(p => h('button', { type: 'button', class: 'btn', onclick: () => { location.href = `${base()}/sso/${encodeURIComponent(p.name)}/start?to=${encodeURIComponent(at)}`; } }, `Sign in with ${p.label}`)));
+  // (through sso.js, which keeps a nonce in this tab that the sign-in brings back: a link can't sign the page in)
+  box.append(...providers.map(p => h('button', { type: 'button', class: 'btn', onclick: () => start(`${base()}/sso/${encodeURIComponent(p.name)}/start`, at) }, `Sign in with ${p.label}`)));
 }
 async function signedIn() {
   const v = $('#tokenDlg').returnValue, user = $('#userIn').value.trim(), secret = $('#tokenIn').value.trim();

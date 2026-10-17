@@ -980,7 +980,7 @@ async fn signed_session(lake: &Lake, mut payload: Value) -> Result<(String, u64)
     let until = crate::log::now_ms() + session_ms();
     payload["x"] = j!(until);
     let payload = B64U.encode(serde_json::to_vec(&payload)?);
-    let sig = B64U.encode(hmac256(&B64.decode(keys(lake).await?.session)?, payload.as_bytes()));
+    let sig = sign(lake, payload.as_bytes()).await?; // (a session alone is signed bare: `sign_for`)
     Ok((format!("ps_{payload}.{sig}"), until))
 }
 
@@ -1035,6 +1035,12 @@ pub async fn password_ok(lake: &Lake, user: &str, password: &str) -> bool {
 
 /// A user's verifier, for a Postgres client's SCRAM exchange.
 pub async fn verifier(lake: &Lake, user: &str) -> Option<Verifier> { lake.cat.get::<User>(&user_key(user)).await.ok()?.filter(|u| u.login)?.verifier }
+
+/// Does `user` sign in with tokens of its own (`CREATE TOKEN … FOR USER`)? The Postgres port asks such a user for
+/// one as a password, even where a provider takes OAUTHBEARER (`pg.rs`).
+pub async fn has_tokens(lake: &Lake, user: &str) -> bool {
+    lake.cat.get::<User>(&user_key(user)).await.ok().flatten().is_some_and(|u| u.login && !u.tokens.is_empty())
+}
 
 /// A user's token (`pt_…`): whose, if it is theirs and hasn't expired.
 async fn token_user(lake: &Lake, token: &str) -> Option<String> {

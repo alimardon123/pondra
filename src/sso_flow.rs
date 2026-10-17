@@ -36,14 +36,14 @@ const CODE: &str = "sso-code";
 /// `GET /sso/{provider}/start?to=…`: to the provider, with the flow in a cookie. `to` is a path of this
 /// node's (the console's page), or for `pondra login` its loopback address, with `challenge` (S256 of
 /// the verifier it will redeem its code with).
-pub async fn start(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Peer>, Path(name): Path<String>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
-    match begin(&app, &peer, &name, &headers, &q).await {
+pub async fn start(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Peer>, Path(name): Path<String>, headers: HeaderMap, uri: axum::http::Uri, Query(q): Query<HashMap<String, String>>) -> Response {
+    match begin(&app, &peer, &name, &headers, &uri, &q).await {
         Ok((to, cookie)) => (StatusCode::FOUND, [("location", to), ("set-cookie", cookie), ("cache-control", "no-store".into())]).into_response(),
         Err(e) => {
             crate::audit::refused(&app, "", "http", Some(peer.addr), "sign in", &format!("identity provider {name}: {e:#}"));
             // (the page, or the command line that asked, hears why where the sign-in would have ended; a request
             // naming nowhere it may end, or a command line's without its challenge, gets the reason as the answer)
-            let why = format!("not signed in through {name}: {e:#}");
+            let why = format!("not signed in through {name}: {}", crate::ext::said(&e));
             let place = match destination(q.get("to").map_or("/", String::as_str)) {
                 Ok(to) if to.starts_with('/') => Some(format!("{to}#pondra_error={}", encode(&why))),
                 Ok(to) if q.contains_key("challenge") => Some(with_query(&to, "error", &why)),
@@ -51,13 +51,13 @@ pub async fn start(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Peer>,
             };
             match place {
                 Some(place) => (StatusCode::FOUND, [("location", place), ("cache-control", "no-store".into())]).into_response(),
-                None => (StatusCode::BAD_REQUEST, format!("signing in through {name}: {e:#}")).into_response(),
+                None => (StatusCode::BAD_REQUEST, format!("signing in through {name}: {}", crate::ext::said(&e))).into_response(),
             }
         }
     }
 }
 
-async fn begin(app: &App, peer: &Peer, name: &str, headers: &HeaderMap, q: &HashMap<String, String>) -> Result<(String, String)> {
+async fn begin(app: &App, peer: &Peer, name: &str, headers: &HeaderMap, uri: &axum::http::Uri, q: &HashMap<String, String>) -> Result<(String, String)> {
     let all = crate::sso::all(&app.lake).await?;
     let (_, p) = all.iter().find(|(n, _)| n == name).with_context(|| format!("no identity provider {name}"))?;
     let to = destination(q.get("to").map_or("/", String::as_str))?;
@@ -69,7 +69,7 @@ async fn begin(app: &App, peer: &Peer, name: &str, headers: &HeaderMap, q: &Hash
     let authorize = doc["authorization_endpoint"].as_str().context("its discovery document has no authorization_endpoint")?;
     let token = doc["token_endpoint"].as_str().context("its discovery document has no token_endpoint")?;
     ensure!(crate::sso::reachable(authorize) && crate::sso::reachable(token), "its endpoints are https (http only on this machine): {authorize}, {token}");
-    let redirect = format!("{}/sso/callback", peer.origin(headers).context("the request names no host")?);
+    let redirect = format!("{}/sso/callback", peer.origin(headers, uri).context("the request names no host")?);
     let path = reqwest::Url::parse(&redirect)?.path().trim_end_matches("callback").to_string(); // (the cookie goes only to this database's /sso/)
     let (state, nonce, verifier) = (random(), random(), random());
     let flow = j!({"p": name, "s": state, "n": nonce, "v": verifier, "to": to, "ch": challenge, "r": redirect, "t": token, "c": path, "x": crate::log::now_ms() + FLOW_MS});
@@ -115,25 +115,58 @@ pub async fn callback(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Pee
     };
     let to = flow["to"].as_str().unwrap_or("/");
     let clear = format!("{COOKIE}=; Path={}; Max-Age=0; HttpOnly; SameSite=Lax", flow["c"].as_str().unwrap_or("/sso/"));
-    let place = match finish(&app, &flow, &q).await {
+    let name = flow["p"].as_str().unwrap_or_default();
+    // (where the browser goes, and, for the command line, whom its code signs in)
+    let ended = match finish(&app, &flow, &q).await {
         Ok(c) => match flow["ch"].as_str() {
-            Some(challenge) => code_for(&app, &c, challenge).await.map(|code| with_query(to, "code", &code)),
+            Some(challenge) => code_for(&app, &c, challenge).await.map(|code| (with_query(to, "code", &code), Some(c.user.clone()))),
             None => crate::users::session_of(&app.lake, &c).await.map(|(token, until)| {
-                format!("{to}#pondra_session={token}&pondra_user={}&pondra_until={until}", encode(&c.user))
+                (format!("{to}#pondra_session={token}&pondra_user={}&pondra_until={until}", encode(&c.user)), None)
             }),
         },
         Err(e) => Err(e),
     };
-    let place = place.unwrap_or_else(|e| {
-        let name = flow["p"].as_str().unwrap_or_default();
+    let (place, asks) = ended.unwrap_or_else(|e| {
         crate::audit::refused(&app, "", "http", Some(peer.addr), "sign in", &format!("identity provider {name}: {e:#}"));
-        let why = format!("not signed in through {name}: {e:#}"); // (as the sign-in dialog and the command line say it)
+        let why = format!("not signed in through {name}: {}", crate::ext::said(&e)); // (as the sign-in dialog and the command line say it, a door's words)
         match flow["ch"].is_string() {
-            true => with_query(to, "error", &why),
-            false => format!("{to}#pondra_error={}", encode(&why)),
+            true => (with_query(to, "error", &why), None),
+            false => (format!("{to}#pondra_error={}", encode(&why)), None),
         }
     });
-    (StatusCode::FOUND, [("location", place), ("set-cookie", clear), ("cache-control", "no-store".into())]).into_response()
+    match asks {
+        // (a code goes to the command line only once the person says so on this page: the link that started the
+        // sign-in may be anyone's, naming a port of this machine and a challenge of theirs, and a person already
+        // signed in at the provider would otherwise hand them a code with no question asked)
+        Some(user) => (StatusCode::OK, [("content-type", "text/html; charset=utf-8".to_string()), ("set-cookie", clear), ("cache-control", "no-store".into()),
+            ("referrer-policy", "no-referrer".into()), ("x-frame-options", "DENY".into()), ("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'".into())],
+            confirm(&place, &user, name)).into_response(),
+        None => (StatusCode::FOUND, [("location", place), ("set-cookie", clear), ("cache-control", "no-store".into())]).into_response(),
+    }
+}
+
+/// The page that asks before a code goes to the command line: whom it signs in, and the port it goes to.
+fn confirm(place: &str, user: &str, provider: &str) -> String {
+    let port = reqwest::Url::parse(place).ok().and_then(|u| u.port()).map_or_else(String::new, |p| p.to_string());
+    format!(
+        concat!(
+            "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>Pondra: sign in the command line?</title>",
+            "<body style=\"font: 16px/1.5 system-ui, sans-serif; max-width: 34em; margin: 4em auto; padding: 0 1em\">",
+            "<h1 style=\"font-size: 1.25em\">Sign in the command line?</h1>",
+            "<p>A program on this computer, listening on port {port}, asks to be signed in as <b>{user}</b> through {provider}.</p>",
+            "<p>Continue only if you just ran <code>pondra login</code> here. If you didn't, close this page: whoever sent you the link would be signed in as you.</p>",
+            "<p><a id=\"continue\" href=\"{place}\">Continue</a></p>"
+        ),
+        port = port,
+        user = html(user),
+        provider = html(provider),
+        place = html(place)
+    )
+}
+
+/// Text put in a page's HTML, its `&`, `<`, `>` and quotes escaped (this page, and `pondra login`'s own: `project.rs`).
+pub(crate) fn html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
 
 /// The provider's code exchanged and its ID token checked: whom it signs in.
@@ -197,7 +230,7 @@ pub async fn redeem(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Peer>
         Ok(v) => Json(v).into_response(),
         Err(e) => {
             crate::audit::refused(&app, "", "http", Some(peer.addr), "sign in", &format!("a sign-in's code: {e:#}"));
-            (StatusCode::UNAUTHORIZED, format!("{e:#}")).into_response()
+            (StatusCode::UNAUTHORIZED, crate::ext::said(&e)).into_response()
         }
     }
 }
@@ -268,5 +301,13 @@ mod tests {
     fn pkce() {
         // (RFC 7636's own example)
         assert_eq!(s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn confirmed() {
+        let page = confirm("http://127.0.0.1:5123/?code=pc_a&x=1", "a<b>@acme.com", "acme");
+        assert!(page.contains("listening on port 5123"), "{page}");
+        assert!(page.contains("<b>a&lt;b&gt;@acme.com</b> through acme"), "{page}");
+        assert!(page.contains(r#"<a id="continue" href="http://127.0.0.1:5123/?code=pc_a&amp;x=1">"#), "{page}");
     }
 }
