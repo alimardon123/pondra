@@ -153,7 +153,7 @@ pub fn http(code: &str) -> u16 {
         "57014" | "57P03" | "58030" | "53200" => 503,                     // timeout, catching up / cut off, bucket or node silent, out of memory: try again
         c if c.starts_with("40") || c.starts_with("55") || c.starts_with("2B") => 409, // serialize / deadlock, wrong state, still depended on
         c if c.starts_with("08") || c.starts_with("53") || c.starts_with("57") => 503, // connection, resources, operator intervention
-        c if c.starts_with("22") || c.starts_with("23") || c.starts_with("25") || c.starts_with("42") || c.starts_with("P0") => 400, // a bad request (data, constraint, transaction state, syntax, a procedure's RAISE)
+        c if c.starts_with("21") || c.starts_with("22") || c.starts_with("23") || c.starts_with("25") || c.starts_with("42") || c.starts_with("P0") => 400, // a bad request (cardinality, data, constraint, transaction state, syntax, a procedure's RAISE)
         _ => 500,                                                         // XX, 58, unknown: a real fault
     }
 }
@@ -182,7 +182,7 @@ pub fn grpc(code: &str) -> tonic::Code {
         "53100" | "53200" | "53300" => tonic::Code::ResourceExhausted,
         "0A000" => tonic::Code::Unimplemented,
         "23514" | "23502" | "25006" | "25P01" | "25P02" | "25P03" => tonic::Code::FailedPrecondition, // (a transaction that isn't open, failed, or idle-ended)
-        c if c.starts_with("42") || c.starts_with("22") => tonic::Code::InvalidArgument,
+        c if c.starts_with("42") || c.starts_with("22") || c.starts_with("21") => tonic::Code::InvalidArgument,
         _ => tonic::Code::Internal,
     }
 }
@@ -256,6 +256,7 @@ mod tests {
         assert_eq!(h("40001"), 409); // serialization_failure (retry)
         assert_eq!(h("55000"), 409); // object_not_in_prerequisite_state
         assert_eq!(h("2BP01"), 409); // dependent_objects_still_exist
+        assert_eq!(h("21000"), 400); // cardinality_violation (a row changed twice in one statement)
         assert_eq!(h("23514"), 400); // check_violation
         assert_eq!(h("23502"), 400); // not_null_violation
         assert_eq!(h("22P02"), 400); // invalid_text_representation

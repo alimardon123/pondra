@@ -448,7 +448,13 @@ pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn
 pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
     let mut read = false;
     for s in stmts.iter_mut() {
-        read |= crate::pg_json_sets::sets(s)?; // (set-returning JSON functions: rows of a document, before the casts they may read)
+        // (a bare name of a JSON call's rows is its value unless a relation has a column of that name: the catalog is asked
+        // only for a statement with such a name)
+        let columns = match crate::pg_json_sets::bare_aliases(s) {
+            true => crate::pg_types::columns_named(lake, s).await,
+            false => None,
+        };
+        read |= crate::pg_json_sets::sets(s, columns.as_ref())?; // (set-returning JSON functions: rows of a document, before the casts they may read)
         read |= crate::pg_types::rewrite(lake, s).await?; // (strings read as uuids, pg_typeof, JSON makers' arguments)
     }
     for s in stmts.iter_mut() {

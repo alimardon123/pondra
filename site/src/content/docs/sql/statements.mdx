@@ -218,8 +218,9 @@ id  item
 ```
 
 A `LEFT JOIN LATERAL` takes `ON true` and one `unnest` or set function. Pondra refuses the rest by
-name, with SQLSTATE `0A000`: a condition on it, a `RIGHT` or `FULL` join, and `WITH ORDINALITY` over a
-column. A function of constants (`generate_series(1, 3)`) is planned as it always was.
+name, with SQLSTATE `0A000`: a condition on it, and a `RIGHT` or `FULL` join. A function of constants
+(`generate_series(1, 3)`) is planned as it always was, and `WITH ORDINALITY` numbers each row's elements from 1, as
+Postgres does.
 
 <Aside type="caution">
 A `LATERAL (SELECT …)` subquery is planned by DataFusion, not by this rule. A correlated aggregate needs
@@ -1088,4 +1089,5 @@ text is the node's own, it is shown in code:
 | Python functions and procedures on a node started without `--python` | refused, with the flag to use |
 | `LEFT JOIN LATERAL … ON <condition>` (only `ON true` is taken), or a `LEFT` over more than one function | refused, SQLSTATE `0A000`: `LEFT JOIN LATERAL over u is not supported yet` |
 | `RIGHT JOIN LATERAL` or `FULL JOIN LATERAL` | refused, SQLSTATE `0A000`: `LATERAL syntax is not supported for FULL OUTER and RIGHT … joins` |
-| `generate_series(1, t.n) WITH ORDINALITY` over a column of the same `FROM` | refused, SQLSTATE `0A000`: `WITH ORDINALITY is not supported yet` |
+| `generate_series(1, t.n) WITH ORDINALITY` over a column of the same `FROM` | taken: each row's elements are numbered from 1, as Postgres numbers them |
+| `jsonb_to_recordset(…) WITH ORDINALITY AS x(a int)`, a record's column list with `WITH ORDINALITY` | refused, SQLSTATE `42601`: `WITH ORDINALITY cannot be used with a column definition list`, as Postgres refuses it (`ROWS FROM()` isn't taken) |

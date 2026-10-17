@@ -3673,10 +3673,11 @@ def scale():
     # it: it answers 53200, the node's peak stays under 1.5 GB (without a line it peaked at 1,941 MB), and the node
     # answers after. Queries that spill under the 0.5 GB pool stay under the line and aren't stopped: a sort, a GROUP BY
     # and a full ORDER BY over `big`. Then the same statement over Postgres, and in a transaction over HTTP: the statement
-    # fails the transaction, as an error does (COMMIT answers ROLLBACK; the INSERT before it is gone).
+    # fails the transaction, as an error does (COMMIT answers ROLLBACK; the INSERT before it is gone). Over Flight the same
+    # statement is stopped too (`_flight_memory_stop`, after the transaction).
     import heapq, psycopg
     line = 1 << 30
-    node = Node(lake, port, memory_gb=0.5, pg=f"127.0.0.1:{port + 10}", env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4"), "PONDRA_MEMORY_MAX_GB": "1"}).start()
+    node = Node(lake, port, memory_gb=0.5, pg=f"127.0.0.1:{port + 10}", flight=f"127.0.0.1:{port + 30}", env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4"), "PONDRA_MEMORY_MAX_GB": "1"}).start()
     def answer(s, session=None):  # (status, SQLSTATE, body): the answer, or the refusal as the node sends it
         c = http_client.HTTPConnection("127.0.0.1", port, timeout=600)
         c.request("POST", "/sql", s.encode(), {"x-pondra-session": session} if session else {})
@@ -3746,6 +3747,7 @@ def scale():
         stopped_http and agg_peak < 1.5 * (1 << 30) and after == [{"one": 1}] and spilled_ok and stopped_count == 1
         and stopped_pg == ("53200", True) and count_pg == 2 and tx_sqlstate == "53200" and "nearly out of memory" in tx_body and count_tx == 3
         and tx_after == "25P02" and '"transaction":"rollback"' in tx_commit.replace(" ", "") and tx_count == [{"n": 0}])
+    checks.update(_flight_memory_stop(port + 30, aggregate, lambda: metrics_of(port).get("pondra_queries_stopped_for_memory_total"), settle))  # (the same stop over Flight)
     # A sort that needs more than its memory spills to PONDRA_SPILL_DIR, and the spill folder is empty once it answers.
     # Past PONDRA_SPILL_GB the same sort is refused by name (53100), saying to raise that setting and not DataFusion's
     # `datafusion.runtime.*`, and the node answers after. The 10 M strings are made again: the sort check above dropped them.
@@ -3894,7 +3896,8 @@ def flight_schemas(fport):
     import adbc_driver_flightsql.dbapi as adbc
     queries = ["SELECT upper('x')", "SELECT 1 + 1", "SELECT 'a' || 'b' AS ab", "SELECT now()", "SELECT CASE WHEN 1 = 1 THEN 'y' END",
                "SELECT user, amount FROM ev", "SELECT count(*) AS n FROM ev", "SELECT user FROM ev WHERE amount < 0",
-               "SELECT coalesce(user, 'z') AS u FROM ev", "SELECT 'a' AS x UNION ALL SELECT NULL", """SELECT json_get_str('{"a": "x"}', 'a')"""]
+               "SELECT coalesce(user, 'z') AS u FROM ev", "SELECT 'a' AS x UNION ALL SELECT NULL", """SELECT json_get_str('{"a": "x"}', 'a')""",
+               "SELECT arrow_cast('a', 'Dictionary(Int32, Utf8)') AS d"]
     opts = fl.FlightCallOptions(headers=[(b"authorization", b"Bearer r")])
     client = fl.FlightClient(f"grpc://127.0.0.1:{fport}")
     conn = adbc.connect(f"grpc://127.0.0.1:{fport}", db_kwargs={"adbc.flight.sql.authorization_header": "Bearer r"}, autocommit=True)
@@ -3919,6 +3922,41 @@ def flight_schemas(fport):
     if bad:
         print("schemas that disagree, or queries ADBC fails:", bad, file=sys.stderr)
     return {"every query's announced schema is its stream's (folded constants too), over Flight and ADBC": not bad}
+
+
+def _flight_announced(client, opts):
+    """list_flights announces what its ticket streams: the `ev` table's flight (`SELECT * FROM ev`, whose strings are
+    Utf8View) has the schema DoGet sends for its ticket, metadata included. Pondra's tables have no dictionary columns,
+    so the dictionary part of the check is `flight_schemas`' query. Returns the check."""
+    flights = [f for f in client.list_flights(options=opts("r")) if f.descriptor.path and f.descriptor.path[0].decode() == "ev"]
+    streamed = client.do_get(flights[0].endpoints[0].ticket, options=opts("r")).read_all().schema if len(flights) == 1 else None
+    return {"list_flights announces what its ticket streams (Utf8View strings, dictionaries as their values)": len(flights) == 1 and flights[0].schema.equals(streamed, check_metadata=True)}
+
+
+def _flight_memory_stop(fport, aggregate, stopped, settle):
+    """Over Flight, the statement the memory line stops over HTTP and Postgres is stopped too: resource exhausted, with the
+    node's "out of memory" (53200, as Postgres 16 names out_of_memory), its stopped-for-memory counter one more, and the node
+    answers `SELECT 1` after. `stopped` reads that counter; the watch's ten-second hold is waited out first, as scale does.
+    Returns the check."""
+    import pyarrow.flight as fl
+    client = fl.FlightClient(f"grpc://127.0.0.1:{fport}")
+    before = stopped() or 0
+    time.sleep(11)
+    settle()
+    try:
+        info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": aggregate})))
+        client.do_get(info.endpoints[0].ticket).read_all()
+        text = "answered"
+    except Exception as e:  # (pyarrow raises the gRPC status as its own error: the text carries the status and the message)
+        text = str(e)
+    stopped_here = bool(re.search(r"resource[ _]exhausted", text, re.I)) and "out of memory" in text
+    counted = (stopped() or 0) == before + 1
+    settle()
+    try:  # (a refusal fails the check, it doesn't end the run: as `rows_of` does over HTTP)
+        after = client.do_get(fl.Ticket(json.dumps({"sql": "SELECT 1 AS one"}))).read_all().to_pylist()
+    except Exception:
+        after = None
+    return {"…and over Flight: stopped for memory (resource exhausted, out of memory), counted, the node answering after": stopped_here and counted and after == [{"one": 1}]}
 
 
 def flight():
@@ -4019,6 +4057,7 @@ def flight():
     }
     checks.update(flight_protocol(fport))  # (the protocol's own actions and RPCs, over gRPC)
     checks.update(flight_schemas(fport))  # (the schema each query announces is the one its stream sends)
+    checks.update(_flight_announced(client, opts))  # (list_flights' schema is the one its ticket streams)
     # A number with an exponent: the schema GetFlightInfo announces is the type its rows come back with (decimal(16, 0), not the planner's decimal(1, -15)).
     exp_info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": "SELECT 1e15 AS x"})), opts("r"))
     exp_rows = client.do_get(exp_info.endpoints[0].ticket, options=opts("r")).read_all()
@@ -8287,6 +8326,51 @@ def first():
 
 # ---------------------------------------------------------------- round 29, part 2 (ADR-035)
 
+def _users_mcp_errors(checks, port, admin, names):
+    """MCP words a failed call's error as every door does (`ext::said`): ann, granted some tables, reads a
+    failed CALL's or a Python function's error without a routine's code (S27), and a file's name as SQL names
+    it, never by its internal `ext:` name; an admin reads all of it. Run after users()'s S27 checks: it uses
+    the procedures trips() and trips_py() and the function trips_fn() made there. `admin` is the admin's
+    Basic header, `names` are (ann, boss)."""
+    import http.server, socketserver
+    ann, boss = names
+    token = {u: call(port, "POST", "/sql", f"CREATE TOKEN mcp_{u} FOR USER {u}".encode(), headers={"Authorization": admin})["token"] for u in (ann, boss)}
+
+    def mcp_text(who, name, args):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}).encode()
+        out = call(port, "POST", "/mcp", body, headers={"Authorization": f"Bearer {token[who]}", "content-type": "application/json"})
+        return out["result"]["content"][0]["text"]  # (a failed tool is its result, its text the error: `isError`)
+
+    sql = {who: mcp_text(who, "write", {"sql": "CALL trips()"}) for who in (ann, boss)}
+    py = {who: mcp_text(who, "write", {"sql": "CALL trips_py()"}) for who in (ann, boss)}
+    checks["MCP words errors as every door does: ann's failed CALLs name statement 2 and line 3 without their text, boss's quote them (S27 at MCP)"] = \
+        "statement 2" in sql[ann] and "hidden_marker_q" not in sql[ann] and "hidden_marker_q" in sql[boss] \
+        and "line 3" in py[ann] and "hidden_marker_p" not in py[ann] and "hidden_marker_p" in py[boss]
+    fn = {who: mcp_text(who, "query", {"sql": "SELECT item, sum(trips_fn(id)) AS s FROM sales.orders GROUP BY item"}) for who in (ann, boss)}
+    checks["…a Python function's error through MCP's query: ann's names line 3 without its code, boss's quotes it (S27 at MCP)"] = \
+        "line 3" in fn[ann] and "hidden_marker_f" not in fn[ann] and "hidden_marker_f" in fn[boss]
+    # A file that fails names it as SQL does: ann reads a CSV over HTTP, through a secret that covers it (granted to ann)
+    folder = tempfile.mkdtemp(prefix="pondra-mcp-")
+    with open(os.path.join(folder, "data.csv"), "w") as f:
+        f.write("id,item\n1,tea\n2,cake\n")
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=folder, **k)
+        def log_message(self, *a):
+            pass
+    web = socketserver.TCPServer(("127.0.0.1", 0), Quiet)
+    threading.Thread(target=web.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{web.server_address[1]}/data.csv"
+        call(port, "POST", "/sql", f"CREATE SECRET mcp_web (TYPE http, BEARER_TOKEN 'x', SCOPE 'http://127.0.0.1:{web.server_address[1]}')".encode(), headers={"Authorization": admin})
+        call(port, "POST", "/sql", f"GRANT USAGE ON SECRET mcp_web TO {ann}".encode(), headers={"Authorization": admin})
+        file_error = mcp_text(ann, "query", {"sql": f"SELECT nope FROM read_csv('{url}')"})  # (no such column: the planner names the file's fields)
+    finally:
+        web.shutdown()
+        web.server_close()
+    checks["…an error naming a file shows it by its SQL name, never ext:…"] = "ext:" not in file_error and url in file_error
+
+
 def users():
     """Users, roles and grants (ADR-035 §2): made in SQL; signed in at every door — HTTP (a password,
     a token, a session), Postgres (SCRAM; a token-only user's token), Kafka (SASL/PLAIN), Flight (a
@@ -8412,6 +8496,7 @@ def users():
         "statement 2" in str(failed["sql"]) and "hidden_marker_q" not in str(failed["sql"]) and "hidden_marker_q" in str(failed["sql_boss"]) \
         and "line 3" in str(failed["py"]) and "hidden_marker_p" not in str(failed["py"]) and "hidden_marker_p" in str(failed["py_boss"]) \
         and "line 3" in str(failed["fn"]) and "hidden_marker_f" not in str(failed["fn"]) and "hidden_marker_f" in str(failed["fn_boss"])
+    _users_mcp_errors(checks, A.port, boss, ("ann", "boss"))
     # Tokens and sessions
     tok = as_(A.port, boss, "CREATE TOKEN ci FOR USER svc")
     short = as_(A.port, boss, "CREATE TOKEN brief FOR USER svc EXPIRES IN '1 second'")
@@ -14574,6 +14659,62 @@ def _jsonfns_spaces(check, http_answer, http_error, port_answer, conn, info):
         check(f"over the port, {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_port(conn, s, sqlstate, message, info))
 
 
+def _outer_refused_http(http_error, s, column):
+    """A set function over an outer query's column is refused by name over HTTP: 0A000, with the column named."""
+    code, body = http_error(s)
+    return code == "0A000" and column in body and "aren't taken yet" in body
+
+
+def _outer_refused_port(conn, s, column):
+    """The same refusal over the Postgres port."""
+    import psycopg
+    try:
+        conn.execute(s)
+    except psycopg.Error as e:
+        return e.sqlstate == "0A000" and column in str(e) and "aren't taken yet" in str(e)
+    return False
+
+
+def _jsonfns_bare_names(check, http_answer, http_error, port_answer, conn, info):
+    """A JSON call's rows named bare, as Postgres 16 reads a name no column has (D4): the name is the row's value, so
+    `e ->> 'k'` and `SELECT e` work as `e.value` does, over HTTP and the port. Each expected answer was asked of Postgres 16
+    on the same rows (a temporary table of the section's own). An object's elements are an error, so each statement reads
+    only the rows that are arrays, or has the WHERE that keeps the others out. A bare e in an EXISTS over an outer column is
+    refused by name, as the e.value form is: Postgres answers both."""
+    CASES = [
+        ("bare name: e ->> 'sku' in a SELECT list, over a FROM call that reads a column (the element is the value)", "SELECT d.id, e ->> 'sku' AS sku FROM docs d, jsonb_array_elements(d.doc -> 'items') AS e ORDER BY 1, 2",
+         ['id', 'sku'], [23, 25],
+         [[1, 'A1'], [1, 'B7']]),
+        ("bare name: e ->> 'sku' in a WHERE, its value compared", "SELECT d.id FROM docs d, jsonb_array_elements(d.doc -> 'items') AS e WHERE e ->> 'sku' = 'B7'",
+         ['id'], [23],
+         [[1]]),
+        ("bare name: e ->> 'sku' in a WHERE, over a CROSS JOIN LATERAL call (its rows are the value too)", "SELECT d.id FROM docs d CROSS JOIN LATERAL jsonb_array_elements(d.doc -> 'items') AS e WHERE e ->> 'sku' = 'B7'",
+         ['id'], [23],
+         [[1]]),
+        ("bare name: SELECT e of a constant array, its column named e and holding the jsonb value", "SELECT e FROM jsonb_array_elements('[1,\"a\",null]') e",
+         ['e'], [3802],
+         [['1'], ['"a"'], ['null']]),
+        ("bare name: a function's name is its value's name: SELECT jsonb_array_elements FROM jsonb_array_elements(...)", "SELECT jsonb_array_elements FROM jsonb_array_elements('[1]')",
+         ['jsonb_array_elements'], [3802],
+         [['1']]),
+        ("bare name: jsonb_array_elements_text's bare name compared in a WHERE of a column's array", "SELECT count(*) FROM docs d, jsonb_array_elements_text(d.doc) x WHERE d.id = 4 AND x = 'x'",
+         ['count'], [20],
+         [[1]]),
+        ("bare name: a column named e beats a JSON call's bare name e, as Postgres resolves it", "SELECT e FROM (SELECT 7::int AS e) s, jsonb_array_elements('[1]') e",
+         ['e'], [23],
+         [[7]]),
+    ]
+    for name, s, names, types, rows in CASES:
+        check(f"over HTTP, {name}", lambda s=s, rows=rows: _same(http_answer(s), [[v for v in row if v is not None] for row in rows], info, s))
+    for name, s, names, types, rows in CASES:
+        check(f"over the port, {name}", lambda s=s, names=names, types=types, rows=rows: _same(port_answer(conn, s), (names, types, rows), info, s))
+    outer = "SELECT id FROM docs AS t WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(t.doc) e WHERE e ->> 'k' = 'x')"
+    check("over HTTP, refused by name, naming t.doc: EXISTS over an outer column, written with the bare name e",
+          lambda: _outer_refused_http(http_error, outer, "t.doc"))
+    check("over the port, refused by name, naming t.doc: EXISTS over an outer column, written with the bare name e",
+          lambda: _outer_refused_port(conn, outer, "t.doc"))
+
+
 def jsonfns():
     """Postgres 16's functions that read a JSON document and expand it into rows (ADR-072 phase 2, brief D1). Reading:
     json(b)_typeof, json(b)_array_length, json(b)_extract_path(_text) (`#>` and `#>>` with the keys as the path; NULL where
@@ -14583,10 +14724,11 @@ def jsonfns():
     expands (Postgres's meaning); DataFusion's list is json_keys. Every answer is Postgres 16's: the names, the types and the
     rows, over HTTP and over the Postgres port (psycopg, as text and through its own decoders), and each refusal's SQLSTATE and
     words. A function in FROM that reads a column of the same query is LATERAL, as Postgres takes it (implicitly, CROSS
-    JOIN LATERAL, LEFT JOIN LATERAL … ON true when its outputs are its own unnest's). Not taken yet, refused by name where
-    Postgres takes them: a LEFT JOIN LATERAL over an expanding function whose outputs are expressions of its rows (a padded
-    row needs each output NULL, which lateral.rs can't show for an expression), WITH ORDINALITY, and an expanding function
-    in GROUP BY, ORDER BY, a window or INSERT's VALUES."""
+    JOIN LATERAL, LEFT JOIN LATERAL … ON true when its outputs are its own unnest's). WITH ORDINALITY numbers each
+    row's elements from 1, as Postgres does; over a record's columns Postgres refuses it (ROWS FROM() is not taken), and so
+    does this. Not taken yet, refused by name where Postgres takes them: a LEFT JOIN LATERAL over an expanding function
+    whose outputs are expressions of its rows (a padded row needs each output NULL, which lateral.rs can't show for an
+    expression), and an expanding function in GROUP BY, ORDER BY, a window or INSERT's VALUES."""
     import psycopg
     from psycopg.types.json import JsonbLoader, JsonLoader
     from psycopg.types.string import TextLoader
@@ -14698,6 +14840,36 @@ def jsonfns():
         ('expands: jsonb_to_record of NULL has no rows', 'SELECT count(*) FROM jsonb_to_record(NULL) AS x(a INT)',
          ['count'], [20],
          [[1]]),
+        ("WITH ORDINALITY: jsonb_array_elements of a column, each element's position from 1 in its own document", "SELECT d.id, e.value, e.ordinality FROM docs d, jsonb_array_elements(d.doc -> 'items') WITH ORDINALITY AS e ORDER BY d.id, e.ordinality",
+         ['id', 'value', 'ordinality'], [23, 3802, 20],
+         [[1, '{"qty": 2, "sku": "A1"}', 1], [1, '{"qty": 1, "sku": "B7"}', 2]]),
+        ("WITH ORDINALITY: jsonb_each of a column's object, the keys in jsonb's order and each one's position", "SELECT d.id, kv.key, kv.value, kv.ordinality FROM docs d CROSS JOIN LATERAL jsonb_each(d.doc -> 'tags') WITH ORDINALITY AS kv ORDER BY d.id, kv.ordinality",
+         ['id', 'key', 'value', 'ordinality'], [23, 25, 3802, 20],
+         [[1, 'a', '3', 1], [1, 'b', '1', 2]]),
+        ('WITH ORDINALITY: json_each_text with a column list, the keys as written', "SELECT * FROM json_each_text('{\"b\": 1, \"a\": {\"x\": 2}, \"c\": null}') WITH ORDINALITY AS e(k, v, n)",
+         ['k', 'v', 'n'], [25, 25, 20],
+         [['b', '1', 1], ['a', '{"x": 2}', 2], ['c', None, 3]]),
+        ('WITH ORDINALITY: jsonb_array_elements_text in FROM, a JSON null is a NULL with its position', "SELECT * FROM jsonb_array_elements_text('[\"a\", null]') WITH ORDINALITY",
+         ['value', 'ordinality'], [25, 20],
+         [['a', 1], [None, 2]]),
+        ('WITH ORDINALITY: jsonb_object_keys with a column list names the key and its position', "SELECT * FROM jsonb_object_keys('{\"a\":1,\"b\":2}') WITH ORDINALITY AS k(x, n)",
+         ['x', 'n'], [25, 20],
+         [['a', 1], ['b', 2]]),
+        ('WITH ORDINALITY: jsonb_each in FROM, its value as jsonb', "SELECT * FROM jsonb_each('{\"b\": 1, \"a\": {\"x\": 2}}') WITH ORDINALITY AS kv(k, v, n)",
+         ['k', 'v', 'n'], [25, 3802, 20],
+         [['a', '{"x": 2}', 1], ['b', '1', 2]]),
+        ('WITH ORDINALITY: jsonb_array_elements of a literal, one row with its position', "SELECT * FROM jsonb_array_elements('[5]') WITH ORDINALITY AS e",
+         ['value', 'ordinality'], [3802, 20],
+         [['5', 1]]),
+        ('WITH ORDINALITY without an alias: the function\'s name and ordinality', "SELECT * FROM jsonb_object_keys('{\"a\":1,\"b\":2}') WITH ORDINALITY",
+         ['jsonb_object_keys', 'ordinality'], [25, 20],
+         [['a', 1], ['b', 2]]),
+        ('WITH ORDINALITY: a WHERE on the position picks the second element of each document', "SELECT d.id, e.value FROM docs d, jsonb_array_elements(d.doc -> 'items') WITH ORDINALITY AS e WHERE e.ordinality = 2",
+         ['id', 'value'], [23, 3802],
+         [[1, '{"qty": 1, "sku": "B7"}']]),
+        ("a JSON operator over the rows of a FROM call that reads a column (e.value ->> 'sku')", "SELECT d.id, e.value ->> 'sku' AS sku FROM docs d, jsonb_array_elements(d.doc -> 'items') AS e ORDER BY 1, 2",
+         ['id', 'sku'], [23, 25],
+         [[1, 'A1'], [1, 'B7']]),
     ]
     # (name, sql, SQLSTATE, message): refused by Postgres 16 with these words.
     ERRORS = [
@@ -14712,6 +14884,8 @@ def jsonfns():
         ('refused: jsonb_to_recordset with no column list (42601)', 'SELECT * FROM jsonb_to_recordset(\'[{"a":1}]\') AS x(a, b)', '42601', 'a column definition list is required for functions returning "record"'),
         ('refused: jsonb_to_record in a SELECT list, no row type (0A000)', 'SELECT jsonb_to_record(\'{"a":1}\')', '0A000', 'could not determine row type for result of jsonb_to_record'),
         ('refused: jsonb_to_record of an array (22023)', "SELECT * FROM jsonb_to_record('[1]') AS x(a int)", '22023', 'cannot call populate_composite on an array'),
+        ('refused: WITH ORDINALITY over a record with no column list (42601)', 'SELECT * FROM jsonb_to_recordset(\'[{"a":1}]\') WITH ORDINALITY AS x', '42601', 'a column definition list is required for functions returning "record"'),
+        ('refused: WITH ORDINALITY over a record with a column list (42601, ROWS FROM() is Postgres\'s way)', 'SELECT * FROM jsonb_to_recordset(\'[{"a":1}]\') WITH ORDINALITY AS x(a int)', '42601', 'WITH ORDINALITY cannot be used with a column definition list'),
         ('refused: an expanding function in WHERE (0A000)', 'SELECT 1 FROM docs WHERE jsonb_array_elements(doc) IS NULL', '0A000', 'set-returning functions are not allowed in WHERE'),
         ('refused: an expanding function in CASE (0A000)', "SELECT CASE WHEN true THEN jsonb_array_elements('[1]') END", '0A000', 'set-returning functions are not allowed in CASE'),
         ('refused: an expanding function in an aggregate (0A000)', "SELECT count(jsonb_array_elements('[1]'))", '0A000', 'aggregate function calls cannot contain set-returning function calls'),
@@ -14724,7 +14898,7 @@ def jsonfns():
     NOT_YET = [
         ("a LEFT JOIN LATERAL over an expanding function whose outputs are expressions, not taken yet (Postgres takes it)", "SELECT d.id, e.value FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') AS e ON true", "0A000", "LEFT JOIN LATERAL over e is not supported yet"),
         ("a LEFT JOIN LATERAL over jsonb_each, not taken yet (Postgres takes it)", "SELECT d.id, kv.key FROM docs d LEFT JOIN LATERAL jsonb_each(d.doc -> 'tags') AS kv ON true", "0A000", "LEFT JOIN LATERAL over kv is not supported yet"),
-        ("WITH ORDINALITY, not taken yet (Postgres takes it)", "SELECT * FROM jsonb_array_elements('[1,2]') WITH ORDINALITY AS e", "0A000", "WITH ORDINALITY isn't taken yet"),
+        ("a LEFT JOIN LATERAL over an expanding function with WITH ORDINALITY, not taken yet (Postgres takes it)", "SELECT d.id, e.value FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') WITH ORDINALITY AS e ON true", "0A000", "LEFT JOIN LATERAL over e is not supported yet"),
         ("an expanding function in GROUP BY, not taken yet (Postgres takes it)", "SELECT 1 FROM docs GROUP BY jsonb_array_elements(doc)", "0A000", "in GROUP BY isn't taken yet"),
         ("an expanding function in ORDER BY, not taken yet (Postgres takes it)", "SELECT 1 FROM docs ORDER BY jsonb_array_elements('[1]')", "0A000", "in ORDER BY isn't taken yet"),
         ("an expanding function in a window's PARTITION BY, not taken yet (Postgres takes it)", "SELECT sum(id) OVER (PARTITION BY jsonb_array_elements('[1]')) FROM docs", "0A000", "in window definitions isn't taken yet"),
@@ -14807,25 +14981,16 @@ def jsonfns():
             check(f"over HTTP, refused by name: {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_http(http_error(s), sqlstate, message, info, s))
         # A set function over an outer query's column, in a subquery or EXISTS: Postgres answers these, Pondra refuses them
         # by name (0A000, the column named), over HTTP and over the port.
-        # (EXISTS writes the element as e.value: a bare e, a scalar set function's alias, is a schema error here, as before
-        # this check, so the refusal would never be reached; Postgres takes both.)
+        # (The rows write the element as e.value. A bare e is the same refusal: _jsonfns_bare_names checks it.)
         OUTER = [("a count over an outer column", "SELECT id, (SELECT count(*) FROM jsonb_array_elements(t.doc)) FROM docs AS t", "t.doc"),
                  ("EXISTS over an outer column", "SELECT id FROM docs AS t WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(t.doc) e WHERE e.value ->> 'k' = 'x')", "t.doc")]
-        def outer_http(s, column):
-            code, body = http_error(s)
-            return code == "0A000" and column in body and "aren't taken yet" in body
-        def outer_port(conn, s, column):
-            try:
-                conn.execute(s)
-            except psycopg.Error as e:
-                return e.sqlstate == "0A000" and column in str(e) and "aren't taken yet" in str(e)
-            return False
         for name, s, column in OUTER:
-            check(f"over HTTP, refused by name, naming {column}: {name}", lambda s=s, column=column: outer_http(s, column))
+            check(f"over HTTP, refused by name, naming {column}: {name}", lambda s=s, column=column: _outer_refused_http(http_error, s, column))
         with psycopg.connect(url, autocommit=True) as conn:
             for name, s, column in OUTER:
-                check(f"over the port, refused by name, naming {column}: {name}", lambda s=s, column=column: outer_port(conn, s, column))
+                check(f"over the port, refused by name, naming {column}: {name}", lambda s=s, column=column: _outer_refused_port(conn, s, column))
             _jsonfns_spaces(check, http_answer, http_error, port_answer, conn, info)
+            _jsonfns_bare_names(check, http_answer, http_error, port_answer, conn, info)
         check("json_keys is DataFusion's list of the keys, as written (DuckDB's name; json_object_keys expands)",
               lambda: http_answer("SELECT json_keys('{\"b\":1,\"a\":2}') AS k") == [[["b", "a"]]])
         checks.update(_jsonfns_params(port, pg, info))  # (the parameters and results of SQL functions and procedures, W5)
@@ -18499,9 +18664,11 @@ def lateral():
     `FROM t, unnest(t.xs) AS u(x)`, `FROM t, generate_series(1, t.n) AS g`, `CROSS JOIN LATERAL`, `LEFT JOIN
     LATERAL … ON true` (padded with NULL when the list is NULL or empty), two laterals chained, a lateral in a
     subquery, a WHERE, GROUP BY and ORDER BY over the lateral's columns, `SELECT *`, a column of the left side
-    named like the function's, `JOIN LATERAL … ON`, `random()` read once, and a lateral the rule leaves to
-    DataFusion (an aggregate) answering as before. Each answer equals Postgres 16's (PONDRA_PG16 names it,
-    default the local one under /tmp/pg16-l3, or, with none, its answers recorded in tools/pg16/lateral.json (`Pg16`; ORDER BY exactly), DuckDB's where DuckDB takes the query, and
+    named like the function's, `JOIN LATERAL … ON`, `random()` read once, `WITH ORDINALITY` over a column, a constant
+    and an unnest with no alias (each row's elements numbered from 1, as Postgres numbers them), and a lateral the rule
+    leaves to DataFusion (an aggregate) answering as before. Each answer equals Postgres 16's (PONDRA_PG16 names it,
+    default the local one under /tmp/pg16-l3, or, with none, its answers recorded in tools/pg16/lateral.json (`Pg16`;
+    ORDER BY exactly), DuckDB's where DuckDB takes the query, and
     the same answer on three nodes with `?spread=1`; the Postgres port answers the same rows; and what is
     refused is refused by name with SQLSTATE 0A000.
 
@@ -18544,6 +18711,13 @@ def lateral():
         ("JOIN LATERAL … ON a condition", "SELECT t.id, u.x FROM t JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1", None, False),
         ("a lateral aggregate (DataFusion's)", "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s",
          "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s", False),
+        ("WITH ORDINALITY over a column: the positions restart for each row", "SELECT t.id, g.v, g.o FROM t, generate_series(t.n, t.n + 1) WITH ORDINALITY AS g(v, o)", None, False),
+        ("WITH ORDINALITY over a column's list: NULL and empty lists give no rows", "SELECT t.id, u.x, u.o FROM t, unnest(t.xs) WITH ORDINALITY AS u(x, o)", None, False),
+        ("WITH ORDINALITY with no alias: unnest, ordinality", "SELECT t.id, ordinality FROM t, unnest(t.xs) WITH ORDINALITY", None, False),
+        ("WITH ORDINALITY of a constant generate_series", "SELECT t.id, g.v, g.o FROM t, generate_series(5, 7) WITH ORDINALITY AS g(v, o) WHERE t.id <= 2", None, False),
+        ("WITH ORDINALITY of a constant unnest", "SELECT t.id, u.x, u.o FROM t, unnest([5, 6]) WITH ORDINALITY AS u(x, o) WHERE t.id <= 2",
+         "SELECT t.id, u.x, u.o FROM t, unnest(ARRAY[5, 6]) WITH ORDINALITY AS u(x, o) WHERE t.id <= 2", False),
+        ("LEFT JOIN LATERAL … WITH ORDINALITY ON true: a NULL or empty list padded with NULL", "SELECT t.id, g.v, g.o FROM t LEFT JOIN LATERAL generate_series(1, t.n) WITH ORDINALITY AS g(v, o) ON true", None, False),
     ]
     # (DuckDB returns a set function's alias as a struct column: its values are the column named after the function)
     duck_text = {
@@ -18554,7 +18728,7 @@ def lateral():
     refused = {  # (Pondra's text, SQLSTATE, words the error must have)
         "LEFT JOIN LATERAL with a condition": ("SELECT t.id, u.x FROM t LEFT JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1", "0A000", ["LEFT JOIN LATERAL", "not supported"]),
         "RIGHT JOIN LATERAL": ("SELECT t.id, u.x FROM t RIGHT JOIN LATERAL unnest(t.xs) AS u(x) ON true", "0A000", ["not supported"]),
-        "WITH ORDINALITY over a column": ("SELECT t.id, g FROM t, generate_series(1, t.n) WITH ORDINALITY AS g(v, o)", "0A000", ["WITH ORDINALITY is not supported yet"]),
+        "WITH ORDINALITY over a two-argument unnest": ("SELECT t.id, u.x FROM t, unnest(t.xs, t.xs) WITH ORDINALITY AS u(x, y, o)", "0A000", ["WITH ORDINALITY over unnest("]),
     }
     random_text = "SELECT count(DISTINCT s.r) AS d, count(*) AS n FROM (SELECT random() AS r, [1, 2, 3] AS xs) s, unnest(s.xs) AS u(x)"
     random_pg = "SELECT count(DISTINCT s.r) AS d, count(*) AS n FROM (SELECT random() AS r, ARRAY[1, 2, 3] AS xs) s, unnest(s.xs) AS u(x)"
@@ -22039,6 +22213,115 @@ def pkey():
     checks["CREATE TABLE … PRIMARY KEY AS SELECT: a key's rows once go in; two rows of one key are refused (23505) and the table isn't left behind, nor kept for UNDROP (an ordinary DROP is: the control)"] = \
         q("SELECT count(*) AS n FROM people_copy") == q("SELECT count(*) AS n FROM people") and refused(ctas_dup) and no_table[0] == 404 \
         and undrop_control[0] == 200 and undrop_dup[0] != 200
+
+    # Upserts whose rows share a key (`change.rs`, `Upsert::merge`): Postgres 16's answers, checked against it one statement at
+    # a time in fresh tables. A statement meets k (holding (1, 'a')) or u (empty) as it would alone. DO NOTHING keeps each key's
+    # first row (INSERT OR IGNORE too), and its count is Postgres's over HTTP and the Postgres port. DO UPDATE and MERGE refuse a
+    # key a second time (21000, Postgres's words) and write nothing. NULLs never conflict.
+    def fresh_k(name):
+        q(f"CREATE TABLE {name} (id BIGINT PRIMARY KEY, v TEXT)")
+        q(f"INSERT INTO {name} VALUES (1, 'a')")
+        return name
+
+    def fresh_u(name):
+        q(f"CREATE TABLE {name} (id BIGINT, e TEXT UNIQUE)")
+        return name
+
+    kv = lambda t: {r["id"]: r["v"] for r in q(f"SELECT id, v FROM {t}")}
+    ue = lambda t: sorted(((r["id"], r.get("e")) for r in q(f"SELECT id, e FROM {t}")), key=lambda p: (p[0], p[1] or ""))  # (the JSON leaves a NULL out)
+    inserted_of = lambda res: res.get("inserted", 0)  # (an upsert that inserts nothing answers {"rows": 0}: nothing inserted)
+
+    def pg_rowcount(sql):
+        """The count the Postgres port gives a statement: psycopg's rowcount, as Postgres's INSERT 0 n."""
+        with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+            cur = conn.cursor()
+            cur.execute(sql)
+            return cur.rowcount
+
+    # DO NOTHING: the first row of each key goes in; a key the table holds is skipped (the port's count too)
+    fresh_k("dn1")
+    fresh_k("dn1p")
+    dn1 = (inserted_of(q("INSERT INTO dn1 VALUES (5, 'a'), (5, 'b') ON CONFLICT DO NOTHING")), kv("dn1"))
+    dn1_port = (pg_rowcount("INSERT INTO dn1p VALUES (5, 'a'), (5, 'b') ON CONFLICT DO NOTHING"), kv("dn1p"))
+    info["upsert_dn1"] = [dn1, dn1_port]
+    checks["upserts: DO NOTHING of (5,'a'),(5,'b') keeps the first, count 1 over HTTP and the port (Postgres: INSERT 0 1, (5,'a'))"] = \
+        dn1 == (1, {1: "a", 5: "a"}) and dn1_port == (1, {1: "a", 5: "a"})
+
+    fresh_k("dn2")
+    fresh_k("dn2p")
+    dn2 = (inserted_of(q("INSERT INTO dn2 VALUES (1, 'e'), (1, 'f') ON CONFLICT DO NOTHING")), kv("dn2"))
+    dn2_port = (pg_rowcount("INSERT INTO dn2p VALUES (1, 'e'), (1, 'f') ON CONFLICT DO NOTHING"), kv("dn2p"))
+    info["upsert_dn2"] = [dn2, dn2_port]
+    checks["upserts: DO NOTHING of (1,'e'),(1,'f') with 1 held: nothing changes, count 0 over HTTP and the port (Postgres: INSERT 0 0)"] = \
+        dn2 == (0, {1: "a"}) and dn2_port == (0, {1: "a"})
+
+    # INSERT OR IGNORE is DO NOTHING (Postgres has no such word: its ON CONFLICT form is what the port is sent)
+    fresh_k("dn3")
+    fresh_k("dn3p")
+    dn3 = (inserted_of(q("INSERT OR IGNORE INTO dn3 VALUES (4, 'x'), (4, 'y')")), kv("dn3"))
+    dn3_port = (pg_rowcount("INSERT INTO dn3p VALUES (4, 'x'), (4, 'y') ON CONFLICT DO NOTHING"), kv("dn3p"))
+    info["upsert_dn3"] = [dn3, dn3_port]
+    checks["upserts: INSERT OR IGNORE of (4,'x'),(4,'y') keeps the first, as DO NOTHING does (Postgres: INSERT 0 1, (4,'x'))"] = \
+        dn3 == (1, {1: "a", 4: "x"}) and dn3_port == (1, {1: "a", 4: "x"})
+
+    # Two keys repeated in one statement: the held one is skipped, the first row of the other goes in (Postgres: INSERT 0 1)
+    fresh_k("dn4")
+    fresh_k("dn4p")
+    dn4 = (inserted_of(q("INSERT INTO dn4 VALUES (1, 'e'), (2, 'f'), (2, 'g') ON CONFLICT DO NOTHING")), kv("dn4"))
+    dn4_port = (pg_rowcount("INSERT INTO dn4p VALUES (1, 'e'), (2, 'f'), (2, 'g') ON CONFLICT DO NOTHING"), kv("dn4p"))
+    info["upsert_dn4"] = [dn4, dn4_port]
+    checks["upserts: DO NOTHING of (1,'e'),(2,'f'),(2,'g') with 1 held: (2,'f') goes in, count 1 over HTTP and the port"] = \
+        dn4 == (1, {1: "a", 2: "f"}) and dn4_port == (1, {1: "a", 2: "f"})
+
+    # A UNIQUE column, with DO NOTHING: the first of a repeated value goes in
+    fresh_u("dn5")
+    fresh_u("dn5p")
+    dn5 = (inserted_of(q("INSERT INTO dn5 VALUES (1, 'm'), (2, 'm') ON CONFLICT (e) DO NOTHING")), ue("dn5"))
+    dn5_port = (pg_rowcount("INSERT INTO dn5p VALUES (1, 'm'), (2, 'm') ON CONFLICT (e) DO NOTHING"), ue("dn5p"))
+    info["upsert_dn5"] = [dn5, dn5_port]
+    checks["upserts: DO NOTHING of (1,'m'),(2,'m') on a UNIQUE column: (1,'m') only, count 1 over HTTP and the port"] = \
+        dn5 == (1, [(1, "m")]) and dn5_port == (1, [(1, "m")])
+
+    # NULLs never conflict: both rows go in, over HTTP and the port
+    fresh_u("dn6")
+    fresh_u("dn6p")
+    dn6 = (inserted_of(q("INSERT INTO dn6 VALUES (1, NULL), (2, NULL) ON CONFLICT (e) DO NOTHING")), ue("dn6"))
+    dn6_port = (pg_rowcount("INSERT INTO dn6p VALUES (1, NULL), (2, NULL) ON CONFLICT (e) DO NOTHING"), ue("dn6p"))
+    info["upsert_dn6"] = [dn6, dn6_port]
+    checks["upserts: DO NOTHING of two NULLs on a UNIQUE column: both rows go in (NULLs never conflict), count 2 over HTTP and the port"] = \
+        dn6 == (2, [(1, None), (2, None)]) and dn6_port == (2, [(1, None), (2, None)])
+
+    # DO UPDATE and MERGE: a key a second time is refused (21000, Postgres's words), and nothing is written
+    fresh_k("up1")
+    e_up1 = err("INSERT INTO up1 VALUES (6, 'a'), (6, 'b') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
+    info["upsert_up1"] = [e_up1[1], e_up1[2][:160], kv("up1")]
+    checks["upserts: DO UPDATE of (6,'a'),(6,'b') is refused 21000 (\"ON CONFLICT DO UPDATE command cannot affect row a second time\", HTTP 400), nothing written"] = \
+        e_up1[0] == 400 and e_up1[1] == "21000" and "ON CONFLICT DO UPDATE command cannot affect row a second time" in e_up1[2] and kv("up1") == {1: "a"}
+
+    fresh_k("up2")
+    e_up2 = err("INSERT INTO up2 VALUES (1, 'c'), (1, 'd') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
+    info["upsert_up2"] = [e_up2[1], kv("up2")]
+    checks["upserts: DO UPDATE of (1,'c'),(1,'d') with 1 held: refused 21000, the held row as it was"] = \
+        e_up2[1] == "21000" and kv("up2") == {1: "a"}
+
+    fresh_k("up3")
+    e_up3 = err("INSERT OR REPLACE INTO up3 VALUES (3, 'x'), (3, 'y')")
+    info["upsert_up3"] = [e_up3[1], kv("up3")]
+    checks["upserts: INSERT OR REPLACE of (3,'x'),(3,'y') is refused 21000, as DO UPDATE is (DuckDB refuses it too), nothing written"] = \
+        e_up3[1] == "21000" and kv("up3") == {1: "a"}
+
+    fresh_k("up4")
+    e_up4 = err("MERGE INTO up4 USING (VALUES (1, 'p'), (1, 'q')) s(id, v) ON up4.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v")
+    info["upsert_up4"] = [e_up4[1], e_up4[2][:160], kv("up4")]
+    checks["upserts: a MERGE whose two source rows match one row is refused 21000 (\"MERGE command cannot affect row a second time\"), nothing written"] = \
+        e_up4[1] == "21000" and "MERGE command cannot affect row a second time" in e_up4[2] and kv("up4") == {1: "a"}
+
+    # NULLs never conflict under DO UPDATE either: two NULL keys are no repeat
+    fresh_u("up5")
+    up5 = (inserted_of(q("INSERT INTO up5 VALUES (1, NULL), (2, NULL) ON CONFLICT (e) DO UPDATE SET id = excluded.id")), ue("up5"))
+    info["upsert_up5"] = up5
+    checks["upserts: DO UPDATE of two NULLs on a UNIQUE column is no repeat: both rows go in, count 2"] = \
+        up5 == (2, [(1, None), (2, None)])
 
     # pondra sql with no leader: it leads for a moment, and refuses the same way
     for n in nodes:

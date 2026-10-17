@@ -100,7 +100,7 @@ SELECT * FROM visits ORDER BY page;
 ```
 
 Without `ON CONFLICT`, a plain `INSERT` of a key the table holds is refused. `INSERT OR REPLACE` replaces
-the row, as a load does, and `MERGE` does the same jobs and more. MySQL's `ON DUPLICATE KEY UPDATE` is refused, with the Postgres form to use instead.
+the row, as a load does, and `MERGE` does the same jobs and more. Two rows of one `INSERT … ON CONFLICT` with the same key: `DO NOTHING` keeps the first, as Postgres does; `DO UPDATE` refuses the statement with `21000`, as Postgres does, since a row can't change twice in one statement. A `MERGE` whose source rows match one row twice is refused the same way. NULLs never conflict. MySQL's `ON DUPLICATE KEY UPDATE` is refused, with the Postgres form to use instead.
 
 ## Empty a table
 

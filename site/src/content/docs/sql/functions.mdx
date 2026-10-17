@@ -151,6 +151,8 @@ FROM carts
 CROSS JOIN LATERAL jsonb_array_elements(carts.doc -> 'items') AS item;
 ```
 
+The alias of `jsonb_array_elements` is each element itself, so `WHERE item ->> 'sku' = 'B7'` reads the element, as Postgres does.
+
 `LEFT JOIN LATERAL … ON true` keeps a row when the call gives none, for `json_array_elements_text`,
 `jsonb_array_elements_text` and `unnest`. Over `jsonb_array_elements` or `jsonb_each` it is refused by
 name for now: their columns are computed from the rows, and this engine doesn't yet keep such a row
