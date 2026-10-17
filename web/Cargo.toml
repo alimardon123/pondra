@@ -22,7 +22,7 @@ getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 [profile.release]
-opt-level = "z" # (a page downloads the module: size over speed, measured in the PR)
+opt-level = "s" # (TPC-H SF1 in Node 5.2–5.4 s against "z"'s 7.7–8.0, for 5.75 MB brotli against 4.90; 3 is no faster and 2.2× the size)
 lto = true
 codegen-units = 1
 

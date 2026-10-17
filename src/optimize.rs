@@ -901,12 +901,16 @@ fn cost(e: &Expr, schema: &DFSchema) -> usize {
 /// from the build and runs before the join's filter is ready (TPC-DS q22 1.4×, q90 1.7× slower with
 /// every join's other side read early). In DataFusion's place for that (`HashJoinBuffering`), whose
 /// setting, when given, still reads every join's other side early. Never in a spread query's
-/// slices, whose exchanges are the spread analysis's: `BufferExec` is no operator it knows.
+/// slices, whose exchanges are the spread analysis's: `BufferExec` is no operator it knows. Nor where no tokio
+/// runtime runs the plan (a page): nothing could read ahead, and BufferExec's spawn would panic.
 #[derive(Debug)]
 struct EarlyProbes;
 
 impl PhysicalOptimizerRule for EarlyProbes {
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Ok(plan); // (no runtime to read ahead on: a page in a browser has one thread, and BufferExec spawns)
+        }
         use datafusion::physical_plan::buffer::BufferExec;
         if plan.exists(|p| Ok(matches!(p.name(), "ShareExec" | "WholeExec")))? {
             return Ok(plan);

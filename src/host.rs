@@ -41,6 +41,8 @@ impl Host for Lake {
     fn types(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send { types_of(self, stmts) }
 
     fn friendly(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send { friendly_of(self, stmts) }
+
+    fn ask(&self, sql: &str) -> impl Future<Output = Result<datafusion::prelude::DataFrame>> + Send { ask_of(self, sql) }
 }
 
 async fn measured_of(lake: &Lake, sql: &str) -> Result<bool> { crate::measures::wanted(lake, sql).await }
@@ -49,7 +51,18 @@ async fn measures_of(lake: &Lake, sql: &str, stmts: &mut [Statement]) -> Result<
 
 async fn types_of(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> { crate::types::rewrite(lake, stmts).await }
 
-async fn friendly_of(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> { crate::friendly::rewrite(lake, stmts).await }
+async fn friendly_of(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
+    let defaulted = crate::friendly::defaults(lake, stmts).await?;
+    Ok(crate::friendly::rewrite(lake, stmts).await? || defaulted)
+}
+
+/// What the front's passes ask, planned as the node plans a query: expanded, ASOF JOIN's marker, the caller's session.
+async fn ask_of(lake: &Lake, sql: &str) -> Result<datafusion::prelude::DataFrame> {
+    let sql = crate::routines::expand(lake, sql).await?;
+    let sql = crate::asof::rewrite(&sql)?.into_owned();
+    let ctx = crate::query::session(lake, &sql, "").await?;
+    crate::query::sql(&ctx, &sql).await
+}
 
 /// The node's own statements, asked before anything else (`Host::own`): the seven passes of the
 /// front, in their order.

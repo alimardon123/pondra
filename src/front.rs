@@ -6,6 +6,7 @@ use crate::ext_names::Attached;
 use crate::expander::Routine;
 use crate::expander::{Expander, Kind};
 use anyhow::Result;
+use datafusion::prelude::DataFrame;
 use datafusion::sql::sqlparser::ast::Statement;
 use datafusion::sql::sqlparser::{ast::{self, VisitMut}, dialect::GenericDialect, parser::Parser};
 use std::collections::{BTreeSet, HashMap};
@@ -34,6 +35,10 @@ pub trait Host: Sync {
     fn types(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send;
     /// DuckDB's and Snowflake's forms that ask the data (`friendly::rewrite`): whether it changed anything.
     fn friendly(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send;
+    /// A query the front's passes ask before they can write theirs (`friendly`: a `PIVOT`'s values, the columns
+    /// `COLUMNS(…)` and `SUMMARIZE` read), planned as the host plans a user's query, after its front. Its rows are
+    /// read only if the pass needs them.
+    fn ask(&self, sql: &str) -> impl Future<Output = Result<DataFrame>> + Send;
 }
 
 /// What the host's own statements made of one: a query to run in its place, or the text to go on with.
