@@ -168,6 +168,10 @@ pub struct TableMeta {
     /// refused (`past::table`); None for a table made before this was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub made: Option<(u64, u64)>,
+    /// The job of the `CREATE TABLE … AS SELECT` that made it: a definition sent again by that statement is
+    /// its own, and another statement's is refused while the table is there (`write::create_table`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub made_by: Option<String>,
     /// A clone's (`CREATE TABLE c CLONE t`, ADR-043): the folders of other tables whose files it
     /// lists too. Files there go only by the orphan sweep, which counts every table listing them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
