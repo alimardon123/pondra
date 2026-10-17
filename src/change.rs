@@ -294,7 +294,8 @@ impl Upsert {
     fn merge(&self, meta: &TableMeta, m: &Merge, first_only: bool) -> Result<Merge> {
         // The columns the rows give: the query's aliases below, and the conflict's.
         let given: Vec<String> = match self.columns.is_empty() {
-            true => meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect(),
+            // (no list: the table's first columns, as many as the rows give, as an INSERT's: `write::implicit`)
+            true => crate::write::implicit(&meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>(), crate::write::values_width(&self.query)).to_vec(),
             false => self.columns.clone(),
         };
         let on = self.on_columns(meta, &m.target)?;
@@ -324,7 +325,10 @@ impl Upsert {
         // would be an Int64 in `excluded` otherwise)
         let cast: Vec<String> = columns.iter().map(|c| match given.contains(c) {
             true => format!("{} AS {}", value(c), q(c)),
-            false => format!("{} AS {}", typed(c, crate::defaults::value(meta, c, "DEFAULT")), q(c)),
+            false => match crate::defaults::sql_of(meta, c) {
+                Some(d) => format!("{} AS {}", typed(c, d), q(c)),
+                None => format!("NULL AS {}", q(c)), // (cast as it is written, as before: not every type has a spelling `arrow_cast` reads)
+            },
         }).collect();
         let names: Vec<String> = columns.iter().map(|c| q(c)).collect();
         let given_names: Vec<String> = given.iter().map(|c| q(c)).collect();
@@ -584,8 +588,12 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
             }
             (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a).await?,
             (Action::Insert(columns, values), _) => {
-                let given = if columns.is_empty() { meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect() } else { columns.clone() };
-                ensure!(given.len() == values.len(), "MERGE: INSERT gives {} values for {} columns", values.len(), given.len());
+                // (no list: the table's first columns, as many as the values, as an INSERT's: `write::implicit`)
+                let given = if columns.is_empty() { crate::write::implicit(&meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>(), Some(values.len())).to_vec() } else { columns.clone() };
+                if given.len() != values.len() {
+                    let what = if values.len() > given.len() { "INSERT has more expressions than target columns" } else { "INSERT has more target columns than expressions" };
+                    return Err(crate::codes::coded("42601", format!("{what} (MERGE: INSERT gives {} values for {} columns)", values.len(), given.len())));
+                }
                 ensure!(given.iter().all(|c| meta.columns.iter().any(|(n, _)| n == c)), "MERGE: INSERT names the table's own columns");
                 // (a column the clause leaves out takes its default, as `select_as` gives it: NULL with none)
                 let values: Vec<String> = meta.columns.iter().map(|(c, _)| given.iter().position(|g| g == c).map_or("DEFAULT".into(), |i| values[i].clone())).collect();

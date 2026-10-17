@@ -6797,6 +6797,7 @@ def _temps_typed(checks, port):
         ("INSERT INTO tcons (a) VALUES (2)", None),
         ("INSERT INTO tcons VALUES (3, DEFAULT, 5, DEFAULT)", None),
         ("INSERT INTO tcons (a, c) SELECT 4, 6", None),
+        ("INSERT INTO tcons VALUES (5)", None),  # (a short row, no column list: the others their DEFAULTs)
         ("INSERT INTO tcons (b) SELECT 1", "23502"),
         ("UPDATE tcons SET a = NULL WHERE a = 2", "23502"),
         ("UPDATE tcons SET c = -1 WHERE a = 2", "23514"),
@@ -6807,7 +6808,7 @@ def _temps_typed(checks, port):
     shown_cons = db.sql("SHOW CREATE TABLE tcons").rows()[0]["definition"]
     cons_info = {"got": cons_got, "rows": cons_back, "shown": shown_cons, "port": [port_not_null, port_nullable]}
     checks["a temporary table's NOT NULL and CHECK refuse what a lake table's do (SQLSTATE 23502, 23514; nothing written), and a DEFAULT fills what a write leaves out"] = \
-        cons_ok and cons_back == [(2, 7, None, "xy"), (3, 7, 5, "xy"), (4, 7, 6, "xy")]
+        cons_ok and cons_back == [(2, 7, None, "xy"), (3, 7, 5, "xy"), (4, 7, 6, "xy"), (5, 7, None, "xy")]
     checks["SHOW CREATE of a temporary table keeps NOT NULL, DEFAULT and CHECK"] = \
         shown_cons.startswith("CREATE TEMPORARY TABLE tcons") and "NOT NULL" in shown_cons and "DEFAULT 7" in shown_cons and "CHECK (" in shown_cons
     checks["a Postgres connection's temporary table: NOT NULL refused 23502, and the catalog says the column is NOT NULL, with no _deleted"] = \
@@ -7466,6 +7467,8 @@ def _default_words(q, pgport, checks, seen):
     q("INSERT INTO ad VALUES (2, 9)")
     q("UPDATE ad SET n = DEFAULT WHERE id = 2")  # (an append table: change::update)
     w["ad_update"] = [tuple(r.values()) for r in q("SELECT id, n FROM ad ORDER BY id")]
+    q("MERGE INTO ad USING (SELECT 3 AS id) s ON ad.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id)")  # (no column list: 3 | 3)
+    w["ad_implicit"] = [tuple(r.values()) for r in q("SELECT id, n FROM ad WHERE id = 3")]
     q("CREATE TABLE ia (id INT PRIMARY KEY, s BIGINT GENERATED ALWAYS AS IDENTITY)")
     q("INSERT INTO ia (id) VALUES (1)")
     first = q("SELECT s FROM ia")[0]["s"]
@@ -7480,7 +7483,7 @@ def _default_words(q, pgport, checks, seen):
         w["bound"] == [(1, 3, "k")] and w["implicit"] == [(2, 3, "k")] and w["excluded"] == [(2, 4, "k")] \
         and w["upserts"] == [(1, 3, "k"), (2, 4, "k"), (3, 3, "k"), (4, 9, "k"), (7, 1, "k")] \
         and w["merge"] == [(1, 3, "k"), (2, 3, "k"), (3, 3, "k"), (4, 9, "k"), (5, 3, "k"), (7, 3, "k")] \
-        and w["default_row"] == [(8, 3, "k")] and w["ad_merge"] == [(1, 3)] \
+        and w["default_row"] == [(8, 3, "k")] and w["ad_merge"] == [(1, 3)] and w["ad_implicit"] == [(3, 3)] \
         and len(w["identity"]) == 3 and all(a[1] < b[1] for a, b in zip(w["identity"], w["identity"][1:]))
     checks["SET x = DEFAULT and VALUES (…, DEFAULT) in UPDATE, MERGE and ON CONFLICT: the column's default (a one-key UPDATE, a transaction, an append table)"] = \
         w["one_key"] == [(3, 3, "k")] and w["upserts"][3] == (4, 9, "k") and w["ad_update"] == [(1, 3), (2, 3)] \
