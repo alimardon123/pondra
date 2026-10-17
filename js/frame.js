@@ -79,6 +79,16 @@ export function sqlType(t) {
   return SQL_TYPES.get(name.split("(")[0].toLowerCase()) ?? name;
 }
 
+// A cast to one of these drops a fraction toward zero, as Polars and PySpark cast (`pondra_truncate`); SQL's
+// own CAST rounds it (invariant 293). The same text as Python's `cast_sql`.
+const INTEGER_SQL = new Set(["TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT"]);
+
+/** `x` cast to the SQL type `t` (from `sqlType`): an integer type truncates, any other is a plain CAST. */
+function castSql(x, t) {
+  const word = t.replace(/\(/g, " ").trim().split(/\s+/)[0].toUpperCase(); // (TINYINT UNSIGNED is an integer; DECIMAL(10, 2) is not)
+  return INTEGER_SQL.has(word) ? `CAST(pondra_truncate(${x}) AS ${t})` : `CAST(${x} AS ${t})`;
+}
+
 const sqlOf = (x) => (x instanceof Expr ? x.sql : literal(x));
 
 /** Python's `re.escape`, for `replace(…, {literal: true})`. */
@@ -136,7 +146,7 @@ export class Expr {
     return out;
   }
 
-  cast(dtype) { return new Expr(`CAST(${this.sql} AS ${sqlType(dtype)})`, this.name); }
+  cast(dtype) { return new Expr(castSql(this.sql, sqlType(dtype)), this.name); }
   isNull() { return new Expr(`(${this.sql} IS NULL)`, this.name); }
   isNotNull() { return new Expr(`(${this.sql} IS NOT NULL)`, this.name); }
   isNan() { return this._fn("isnan"); }
@@ -261,7 +271,7 @@ const SCALES = new Map([["s", 1], ["ms", 1_000], ["us", 1_000_000], ["ns", 1_000
 /** `.dt`: date and time functions, with Polars' names. */
 class DtNs {
   constructor(e) { this.e = e; }
-  _part(part) { return new Expr(`CAST(date_part('${part}', ${this.e.sql}) AS BIGINT)`, this.e.name); }
+  _part(part) { return new Expr(castSql(`date_part('${part}', ${this.e.sql})`, "BIGINT"), this.e.name); }
   year() { return this._part("year"); }
   month() { return this._part("month"); }
   day() { return this._part("day"); }
@@ -270,7 +280,7 @@ class DtNs {
   second() { return this._part("second"); }
   quarter() { return this._part("quarter"); }
   ordinalDay() { return this._part("doy"); }
-  weekday() { return new Expr(`CAST((date_part('dow', ${this.e.sql}) + 6) % 7 + 1 AS BIGINT)`, this.e.name); } // (Monday 1 … Sunday 7)
+  weekday() { return new Expr(castSql(`(date_part('dow', ${this.e.sql}) + 6) % 7 + 1`, "BIGINT"), this.e.name); } // (Monday 1 … Sunday 7)
   date() { return new Expr(`CAST(${this.e.sql} AS DATE)`, this.e.name); }
 
   /** Down to the start of its `every`: "1h", "15m", "1d", "1mo"… */
@@ -611,7 +621,7 @@ export class Frame {
 
   /** Columns cast: `cast({ n: "Float64" })`, or SQL types (`{ n: "DOUBLE" }`). */
   cast(dtypes) {
-    const casts = Object.entries(dtypes).map(([c, t]) => `CAST(${quote(c)} AS ${sqlType(t)}) AS ${quote(c)}`).join(", ");
+    const casts = Object.entries(dtypes).map(([c, t]) => `${castSql(quote(c), sqlType(t))} AS ${quote(c)}`).join(", ");
     return this._step((r) => `SELECT * REPLACE (${casts}) FROM ${r}`, this._kept());
   }
 

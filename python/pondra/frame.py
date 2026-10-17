@@ -128,7 +128,7 @@ class Expr:
         return out
 
     def cast(self, dtype):
-        return Expr(f"CAST({self.sql} AS {sql_type(dtype)})", self.name)
+        return Expr(cast_sql(self.sql, sql_type(dtype)), self.name)
 
     def not_(self):
         return ~self
@@ -327,7 +327,7 @@ class _Dt:
         self.e = e
 
     def _part(self, part):
-        return Expr(f"CAST(date_part('{part}', {self.e.sql}) AS BIGINT)", self.e.name)
+        return Expr(cast_sql(f"date_part('{part}', {self.e.sql})", "BIGINT"), self.e.name)
 
     year = lambda s: s._part("year")
     month = lambda s: s._part("month")
@@ -339,7 +339,7 @@ class _Dt:
     ordinal_day = lambda s: s._part("doy")
 
     def weekday(self):  # (Monday 1 … Sunday 7)
-        return Expr(f"CAST((date_part('dow', {self.e.sql}) + 6) % 7 + 1 AS BIGINT)", self.e.name)
+        return Expr(cast_sql(f"(date_part('dow', {self.e.sql}) + 6) % 7 + 1", "BIGINT"), self.e.name)
 
     def date(self):
         return Expr(f"CAST({self.e.sql} AS DATE)", self.e.name)
@@ -511,6 +511,19 @@ def sql_type(t):
     return SQL_TYPES.get(name.split("(")[0].lower(), name)
 
 
+# A cast to one of these drops a fraction toward zero, as Polars and PySpark cast (`pondra_truncate`); SQL's
+# own CAST rounds it (invariant 293). JavaScript's frames write the same text (`castSql`).
+INTEGER_SQL = ("TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT")
+
+
+def cast_sql(x, sql_t):
+    """`x` cast to the SQL type `sql_t` (from `sql_type`): an integer type truncates, any other is a plain CAST."""
+    words = sql_t.replace("(", " ").split()  # (TINYINT UNSIGNED is an integer too; DECIMAL(10, 2) is not)
+    if words and words[0].upper() in INTEGER_SQL:
+        return f"CAST(pondra_truncate({x}) AS {sql_t})"
+    return f"CAST({x} AS {sql_t})"
+
+
 # ---------------------------------------------------------------- frames
 
 class Frame:
@@ -635,7 +648,7 @@ class Frame:
         return self._step(lambda r: f"SELECT {', '.join(cols)} FROM {r}", self._kept(set(have) - set(mapping)))
 
     def cast(self, dtypes):
-        casts = ", ".join(f"CAST({_quote(c)} AS {sql_type(t)}) AS {_quote(c)}" for c, t in dtypes.items())
+        casts = ", ".join(f"{cast_sql(_quote(c), sql_type(t))} AS {_quote(c)}" for c, t in dtypes.items())
         return self._step(lambda r: f"SELECT * REPLACE ({casts}) FROM {r}", self._kept())
 
     def sort(self, by, *more, descending=False, nulls_last=False):

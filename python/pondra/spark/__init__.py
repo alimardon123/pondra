@@ -16,7 +16,7 @@ import re
 import sys
 
 from .. import client as _client
-from ..frame import Frame, _literal, _quote, sql_expr, trailing_order
+from ..frame import Frame, _literal, _quote, cast_sql, sql_expr, trailing_order
 
 _ids = itertools.count(1)
 _SIMPLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
@@ -117,7 +117,7 @@ class Column:
     name_ = alias
 
     def cast(self, t):
-        return Column(f"CAST({self.sql} AS {_type(t)})", self._name)
+        return Column(cast_sql(self.sql, _type(t)), self._name)
 
     astype = cast
 
@@ -386,7 +386,7 @@ class SparkSession:
             data = pa.Table.from_pylist(rows) if rows else pa.table({n: [] for n in names})
         df = DataFrame(self, self.con.from_arrow(data))
         if types:
-            df = df.select(*[Column(f"CAST({_quote(n)} AS {_type(t)})", n) for n, t in zip(names, types)])
+            df = df.select(*[Column(cast_sql(_quote(n), _type(t)), n) for n, t in zip(names, types)])
         elif names and not isinstance(schema, str):
             df = df.toDF(*names)
         return df
@@ -572,9 +572,9 @@ class _Reader:
             types_ = types_ or ["string"] * len(cols)
             if len(names) != len(cols):
                 raise ValueError(f"the schema has {len(names)} columns, the files {len(cols)}")
-            frame = frame.select(*[sql_expr(f"CAST({_quote(c)} AS {_type(t)}) AS {_quote(n)}") for c, n, t in zip(cols, names, types_)])
+            frame = frame.select(*[sql_expr(f"{cast_sql(_quote(c), _type(t))} AS {_quote(n)}") for c, n, t in zip(cols, names, types_)])
         elif names:  # (Parquet's and JSON's columns by name)
-            frame = frame.select(*[sql_expr(f"CAST({_quote(n)} AS {_type(t)}) AS {_quote(n)}") for n, t in zip(names, types_ or ["string"] * len(names))])
+            frame = frame.select(*[sql_expr(f"{cast_sql(_quote(n), _type(t))} AS {_quote(n)}") for n, t in zip(names, types_ or ["string"] * len(names))])
         return DataFrame(self.spark, frame)
 
     # Delta's and Iceberg's options for reading an older version, as SQL's arguments.

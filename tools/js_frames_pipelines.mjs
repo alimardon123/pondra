@@ -69,6 +69,8 @@ const PIPELINES = [
     col("price").sqrt().alias("s"), col("price").clip(5, 30).alias("c"))],
   ["SQL snippets inside frame methods", (o) => o.filter("qty > 2 AND item LIKE 't%'").withColumns("qty * price AS total")
     .groupBy("item").agg("sum(total) AS revenue", "count(*) AS n")],
+  ["casts to integers cut a fraction toward zero, as Polars does (2.5 is 2, -2.5 is -2)", (o) => o.filter(col("qty").isNotNull()).select("id", col("qty").sub(5).div(2).alias("h"), col("price").sub(20).alias("p"))
+    .select("id", col("h").cast("Int64").alias("h64"), col("h").cast("Int32").alias("h32"), col("p").cast("Int64").alias("p64"), col("p").cast("Int32").alias("p32"))],
 ];
 
 const oneLine = (e) => `${e.name}: ${String(e.message).slice(0, 400)}`;

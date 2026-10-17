@@ -129,6 +129,8 @@ PIPELINES = [
         col("price").sqrt().alias("s"), col("price").clip(5, 30).alias("c")), False),
     ("SQL snippets inside frame methods", lambda c, o, u, q: o.filter("qty > 2 AND item LIKE 't%'").with_columns("qty * price AS total")
         .group_by("item").agg("sum(total) AS revenue", "count(*) AS n"), False),
+    ("casts to integers cut a fraction toward zero, as Polars does (2.5 is 2, -2.5 is -2)", lambda c, o, u, q: o.filter(col("qty").is_not_null()).select("id", ((col("qty") - 5) / 2).alias("h"), (col("price") - 20).alias("p")).select(
+        "id", col("h").cast("Int64").alias("h64"), col("h").cast("Int32").alias("h32"), col("p").cast("Int64").alias("p64"), col("p").cast("Int32").alias("p32")), False),
 ]
 
 

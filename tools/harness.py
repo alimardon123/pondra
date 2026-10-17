@@ -18149,6 +18149,12 @@ def sparksql():
     q("CREATE TABLE people AS SELECT id, name, xs, CAST(d AS DOUBLE) AS d FROM (VALUES (1, 'ann', make_array(1, 2, 3), 2.5), (2, 'bob', make_array(4), -2.5), "
       "(3, 'cy', CAST(make_array() AS BIGINT[]), 0.5), (4, 'dee', CAST(NULL AS BIGINT[]), 7.5)) AS v(id, name, xs, d)")  # (Spark's floor of a DOUBLE is a BIGINT; 2.5 is a DECIMAL, whose floor has scale 0)
     rows = lambda df: [r.asDict() for r in df.collect()]
+    def tried(f):
+        # A binary without the feature answers with an error: the check fails by name, the run goes on.
+        try:
+            return f()
+        except Exception as e:
+            return f"error: {e}"
     got = {
         "text": rows(spark.sql('SELECT "hi" AS s, `name` FROM people WHERE name = "ann"')),
         "floor": rows(spark.sql("SELECT id, floor(d) AS f, ceil(d) AS c FROM people ORDER BY id")),
@@ -18165,7 +18171,16 @@ def sparksql():
         "args": [r["id"] for r in rows(spark.sql("SELECT id FROM people WHERE id > :m ORDER BY id", args={"m": 2}))],
         "frame": rows(spark.sql("SELECT count(*) AS n FROM {d} WHERE `name` <> \"bob\"", d=spark.table("people"))),
         "door": q("SELECT f, arrow_typeof(f) AS t FROM spark_sql('SELECT floor(CAST(2.5 AS DOUBLE)) AS f')"),
+        # Casts to an integer: Spark's cut the fraction toward zero, Pondra's SQL rounds it (invariant 293).
+        "spark cast": q("SELECT * FROM spark_sql('SELECT CAST(2.7 AS INT) AS a, CAST(-2.7 AS BIGINT) AS b, CAST(9007199254740993 AS BIGINT) AS c, 7 DIV 2 AS d')"),
+        "plain cast": q("SELECT CAST(2.7 AS INT) AS a, CAST(-2.7 AS BIGINT) AS b"),
+        "frame cast": tried(lambda: [(r["i"], r["b"]) for r in sorted(rows(spark.createDataFrame([{"x": 2.7}, {"x": -2.7}]).select("x", F.col("x").cast("int").alias("i"),
+            F.col("x").cast("bigint").alias("b"))), key=lambda r: r["x"])]),
     }
+    # A session in Spark's dialect (SET names it, as a client's does) cuts a cast; the session beside it rounds.
+    dialect = {"x-pondra-session": "harness-sparksql-dialect"}
+    call(A.port, "POST", "/sql", b"SET datafusion.sql_parser.dialect = 'spark'", headers=dialect)
+    got["dialect cast"] = call(A.port, "POST", "/sql", b"SELECT CAST(2.7 AS INT) AS a, CAST(-2.7 AS BIGINT) AS b", headers=dialect)
     q("CREATE VIEW floors AS SELECT * FROM spark_sql('SELECT id, floor(d) AS f FROM people')")
     got["view"] = q("SELECT sum(f) AS s FROM floors")
     refused = {
@@ -18193,6 +18208,9 @@ def sparksql():
     checks["spark_sql('…') from any door, and a view over it"] = got["door"] == [{"f": 2, "t": "Int64"}] and got["view"] == [{"s": 6}]
     checks["refused by name: " + ", ".join(refused)] = "takes a query" in refused["a statement that isn't a query"] and "posexplode" in refused["posexplode"] \
         and "over a join" in refused["a lateral view over a join"]
+    checks["a cast to an integer cuts the fraction toward zero in Spark's dialect (spark_sql, a session's SET, the frames' cast; 2.7 is 2, -2.7 is -2), and rounds in Pondra's SQL (3, -3)"] = \
+        [(str(r["c"]), r["d"]) for r in got["spark cast"]] == [("9007199254740993", 3)] and [(r["a"], r["b"]) for r in got["spark cast"]] == [(2, -2)] \
+        and got["plain cast"] == [{"a": 3, "b": -3}] and got["dialect cast"] == [{"a": 2, "b": -2}] and got["frame cast"] == [(-2, -2), (2, 2)]
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"sparksql": checks, "ok": ok, "info": info}, indent=1, default=str))

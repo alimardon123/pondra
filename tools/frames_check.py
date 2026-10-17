@@ -17,6 +17,7 @@
    `explain()` and `show()`, `read_csv`'s SQL option names.
 8. Polars' `unique(keep=…)` and `maintain_order`: taken where the frame is sorted, refused by name where
    it isn't; `group_by(maintain_order=True)` refused by name.
+9. A cast of a fraction to an integer is cut toward zero, as Polars casts it (SQL's CAST rounds it: invariant 293).
 
   frames_check.py [--only name,…] [--port 8830]      (pondra.spark vs PySpark: spark_check.py)
 """
@@ -104,6 +105,12 @@ def pipelines():
         lambda o, u, q: o.sort(["user", "item"]).select("user", "item").unique(keep="last", maintain_order=True), True)
     add("drop, rename, cast", lambda c, o, u, q: o.drop("ts", "region").rename({"qty": "n"}).cast({"n": pl.Float64}),
         lambda o, u, q: o.drop("ts", "region").rename({"qty": "n"}).cast({"n": pl.Float64}))
+    # A fraction cast to an integer is cut toward zero, as Polars casts it (SQL's CAST rounds: invariant 293).
+    add("casts to integers cut a fraction toward zero, as Polars does (2.5 is 2, -2.5 is -2)",
+        lambda c, o, u, q: o.filter(col("qty").is_not_null()).select("id", ((col("qty") - 5) / 2).alias("h"), (col("price") - 20).alias("p")).select(
+            "id", col("h").cast(pl.Int64).alias("h64"), col("h").cast(pl.Int32).alias("h32"), col("p").cast(pl.Int64).alias("p64"), col("p").cast(pl.Int32).alias("p32")),
+        lambda o, u, q: o.filter(pl.col("qty").is_not_null()).select("id", ((pl.col("qty") - 5) / 2).alias("h"), (pl.col("price") - 20).alias("p")).select(
+            "id", pl.col("h").cast(pl.Int64).alias("h64"), pl.col("h").cast(pl.Int32).alias("h32"), pl.col("p").cast(pl.Int64).alias("p64"), pl.col("p").cast(pl.Int32).alias("p32")))
     add("when / then / otherwise", lambda c, o, u, q: o.select("id", when(col("qty") > 6).then(lit("big")).when(col("qty") > 2).then(lit("mid")).otherwise(lit("small")).alias("size")),
         lambda o, u, q: o.select("id", pl.when(pl.col("qty") > 6).then(pl.lit("big")).when(pl.col("qty") > 2).then(pl.lit("mid")).otherwise(pl.lit("small")).alias("size")))
     add("is_in, is_between, is_null, fill_null", lambda c, o, u, q: o.select("id", col("item").is_in(["tea", "bun"]).alias("a"), col("price").is_between(5, 10).alias("b"), col("qty").is_null().alias("c"), col("qty").fill_null(-1).alias("d")),
