@@ -1901,6 +1901,7 @@ async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<V
     // otherwise shows only on this node's stderr.
     s["background_failures"] = j!(crate::metrics::failures().into_iter().filter(|(_, n)| *n > 0).collect::<std::collections::BTreeMap<_, _>>());
     s["signed"] = j!(crate::users::signed(&app.lake).await); // (served with tokens once: a node without them answers no one unsigned)
+    s["move_failed"] = j!(crate::memory::MOVE_FAILED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()); // (a move that failed: the lake stays in memory, and why)
     if c.is_leader() {
         s["releases"] = j!(c.releases()); // (each live node's: a rolling upgrade's progress)
     }

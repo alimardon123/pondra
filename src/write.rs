@@ -568,6 +568,11 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         let tables = c[2].split(',').map(|t| name(t.trim())).filter(|t| !t.is_empty()).collect();
         return Some(Stmt::Ddl(vec![Ddl::Refresh { database: Some(name(&c[1])), tables }]));
     }
+    // `ALTER DATABASE b SET LOCATION 'dir'`: a lake held in memory moves there, and goes on there (`memory.rs`).
+    static DB_LOCATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+SET\s+LOCATION\s+'((?:[^']|'')*)'\s*;?\s*$"#).expect("a regex"));
+    if let Some(c) = (head == "alter").then(|| DB_LOCATION.captures(first_word(sql))).flatten() {
+        return Some(Stmt::Ddl(vec![Ddl::SetLocation { database: name(&c[1]), to: c[2].replace("''", "'") }]));
+    }
     // `ALTER DATABASE b SET (protected = true | false)`: a database's protection (ADR-058: `protect.rs`).
     static DB_PROTECT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+SET\s*\(\s*protected\s*=\s*(true|false)\s*\)\s*;?\s*$"#).expect("a regex"));
     if let Some(c) = (head == "alter").then(|| DB_PROTECT.captures(first_word(sql))).flatten() {
@@ -2108,6 +2113,7 @@ pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
 pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>, d: crate::ddl::Ddl) -> Result<Value> {
     match d {
         crate::ddl::Ddl::Refresh { database, tables } => crate::branch::refresh(lake, seq, lock, database, tables).await,
+        crate::ddl::Ddl::SetLocation { database, to } => crate::memory::set_location(lake, &database, &to).await, // (copies outside the lake's lock: `memory.rs`)
         d @ (crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. }) => crate::backup::statement(lake, lock, d).await,
         d => {
             let _guard = lock.lock().await;

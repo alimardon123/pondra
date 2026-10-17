@@ -685,6 +685,18 @@ class Pondra:
             raise
         self._run("COMMIT")
 
+    def save(self, target):
+        """Moves a lake held in memory to `target` (a folder, or a bucket's URL) and goes on over it there:
+        its tables, views, tasks and history as they are, the same connection. Statements wait while it
+        moves, and a lake that isn't in memory is refused (`ALTER DATABASE … SET LOCATION`)."""
+        name = self._run("SELECT current_database() AS d").rows()[0]["d"].replace('"', '""')  # (SQL's quoting)
+        target = os.fspath(target).replace("'", "''")
+        self._run(f"ALTER DATABASE \"{name}\" SET LOCATION '{target}'")
+        self._run("SELECT 1")  # (its retries wait out the move: the node starts again on the target)
+        failed = json.loads(self._call("GET", "/stats")).get("move_failed")  # (a move that failed: the lake stays in memory)
+        if failed:
+            raise RuntimeError(f"the lake stays in memory: {failed}")
+
     def close(self):
         """End this connection's session (its temporary tables and views), and close the node
         `connect()` started for it: in this process when no other connection is open to it (and a lake

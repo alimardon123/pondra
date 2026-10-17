@@ -17150,6 +17150,7 @@ def doors():
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
     import pondra
     lake = new_lake()
+    lake_db = os.path.basename(lake.rstrip("/")).lower()  # (the database's name: its folder's last part, as `lake_name` makes it)
     pgp, fp = A.port + 2000, A.port + 30
     node = Node(lake, A.port, pg=f"127.0.0.1:{pgp}", flight=f"127.0.0.1:{fp}", tier_secs=0.5).start()
     q = lambda s: sql(A.port, s)
@@ -17194,6 +17195,7 @@ def doors():
             "a Git folder's status": (["SELECT path, change FROM pondra.git_status('d_git')"], lambda r: r[-1] == [["a.sql", "added"]]),
             "a backup": ([f"BACKUP DATABASE TO '{backups}/door{i}'"], lambda r: backed(f"{backups}/door{i}")),
             "a write to a backup refused, 25006": ([f"INSERT INTO d_bk.d_log VALUES ('door{i}', {i})"], lambda r: r == "25006"),
+            "SET LOCATION of a lake on disk, 0A000": ([f"ALTER DATABASE \"{lake_db}\" SET LOCATION '{backups}/moved{i}'"], lambda r: r == "0A000"),
         }
     def rows_of(x):
         return [list(r.values()) if isinstance(r, dict) else list(r) for r in x] if isinstance(x, list) else x
@@ -17262,8 +17264,8 @@ def doors():
                 r = json.loads(urllib.request.urlopen(urllib.request.Request(mcp, data=body, headers={"content-type": "application/json", "mcp-session-id": sid}), timeout=60).read())["result"]
                 text = r["content"][0]["text"]
                 if r["isError"]:
-                    m = re.search(r"\b(\d{2}[0-9A-Z]\d{2})\b", text)
-                    return m.group(1) if m and m.group(1) in ("23514", "42P01", "40001", "25P02", "25006") else "refused: " + text[:160]
+                    code = next((c for c in re.findall(r"\b([0-9][0-9A-Z]{4})\b", text) if c in ("23514", "42P01", "40001", "25P02", "25006", "0A000")), None)
+                    return code or "refused: " + text[:160]
                 got = json.loads(text)
                 out.append(rows_of(got["rows"]) if isinstance(got, dict) and "rows" in got else None)
         finally:
@@ -17301,7 +17303,7 @@ finally {{ await db.close?.(); }}"""
         return out
     # The shell prints its errors without a SQLSTATE (the header `x-pondra-sqlstate` carries it), so the
     # codes this matrix checks are named by the words of their messages.
-    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01"), ("is a backup, so it is read-only", "25006")]
+    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01"), ("is a backup, so it is read-only", "25006"), ("SET LOCATION moves a lake held in memory", "0A000")]
     def via_cli(stmts):
         # The shell on the lake, one process for the feature's statements: one session (`shell.rs`). It has no
         # `--url`, so it starts a node on the lake, which joins this one as a follower; its own address is an
@@ -18577,6 +18579,287 @@ def pkey():
     return f"{sum(checks.values())} of {len(checks)} PRIMARY KEY checks"
 
 
+def memorylake():
+    """A lake held in this process's memory moves to a folder and goes on there (`memory.rs`, the design's
+    l2-memory-spill-and-save §2): `ALTER DATABASE <name> SET LOCATION '<place>'`, and `db.save(target)` in
+    Python and JavaScript, which is that statement and the wait. The node keeps its port and all of the
+    lake: tables, views, a materialized view, a sequence, a task that keeps ticking, the lake's files. A
+    write sent while it moves waits (503 with Retry-After, or 57P03, which the clients ask again on), so
+    none is lost or doubled. The lake's objects are at the target, where another node opens them. The lake
+    spills to disk past a 10 KB budget here, so its spilled files move too. Refused by name: a database
+    that isn't this one, a folder holding other things (nothing of the lake is written there), a lake on
+    disk (0A000). The library's `pondra.connect()` in this process is moved the same way when it is built. A
+    published Iceberg table is published again at the new place; a move whose second pass fails leaves the lake
+    in memory with every row (and says so in /stats and to db.save); BACKUP of a lake in memory runs here."""
+    import pathlib
+    P, nodes, checks = A.port, [], {}
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    env = {"PONDRA_MEMORY_LAKE_GB": "0.00001"}  # (about 10 KB: past it a lake's files spill to a folder, and move too)
+    acked, errors, quit_writing = [], [], threading.Event()
+
+    def lake_now(port):
+        """The lake a node serves (`/stats`), or None while no node answers."""
+        try:
+            return call(port, "GET", "/stats", timeout=2)["lake"]
+        except Exception:
+            return None
+
+    def answers(port):
+        """What the lake holds, without the writes made under the move ('w') and the 'post' group added after it."""
+        return {
+            "orders": sql(port, "SELECT _row_id, _version, k, n FROM orders WHERE k <> 'w' ORDER BY _row_id, n"),
+            "big": sql(port, "SELECT k, n FROM big WHERE k <> 'w' ORDER BY n, k"),
+            "totals": sql(port, "SELECT k, c, s FROM totals WHERE k <> 'w' ORDER BY k"),
+            "file": call(port, "GET", "/files/notes/a.txt"),
+        }
+
+    def pub_metadata(folder):
+        """The newest Iceberg metadata file of the table `pub` in a folder (highest N), or None."""
+        d = os.path.join(folder, "data", "pub", "metadata")
+        names = [n for n in os.listdir(d) if n.startswith("v") and n.endswith(".metadata.json")] if os.path.isdir(d) else []
+        return os.path.join(d, max(names, key=lambda n: int(n[1:].split(".")[0]))) if names else None
+
+    def pub_at_target(folder):
+        """Whether the newest metadata of `pub` names `folder` (and no memory:// path is left in it)."""
+        path = pub_metadata(folder)
+        try:
+            text = open(path).read() if path else ""
+            return bool(text) and json.loads(text)["location"].startswith(os.path.realpath(folder)) and "memory://" not in text
+        except (OSError, ValueError, KeyError):
+            return False
+
+    def pub_rows_at(folder):
+        """The rows PyIceberg reads from `pub`'s newest metadata at `folder`; None when PyIceberg isn't there."""
+        try:
+            from pyiceberg.table import StaticTable
+        except ImportError:
+            return None
+        try:
+            return StaticTable.from_metadata(pub_metadata(folder)).scan().to_arrow().num_rows
+        except Exception as e:  # (a check that fails, not the section: what PyIceberg said is shown)
+            print(f"memorylake: PyIceberg couldn't read pub at {folder}: {e!r}"[:400], file=sys.stderr)
+            return -1
+
+    def more(f, before, secs=20):
+        """Whether f() comes above `before` within `secs` (a task's ticks, polled)."""
+        deadline = time.time() + secs
+        while time.time() < deadline:
+            if f() > before:
+                return True
+            time.sleep(0.5)
+        return False
+
+    def writer():
+        """One client writing a row every 5 ms, through the move: each acknowledged row is kept."""
+        db = _client(P)
+        i = 0
+        while not quit_writing.is_set():
+            try:
+                db.sql(f"INSERT INTO orders VALUES ('w', {10000 + i})")
+                acked.append(10000 + i)
+            except Exception as e:
+                errors.append(repr(e)[:200])
+            i += 1
+            time.sleep(0.005)
+
+    try:
+        node = Node(":memory:", P, env=env).start()
+        nodes.append(node)
+        name = call(P, "GET", "/stats")["lake"]  # (a lake in memory is named by its id)
+        sql(P, "CREATE TABLE orders (k VARCHAR, n BIGINT)")
+        for i in range(30):
+            sql(P, f"INSERT INTO orders VALUES ('{'ab'[i % 2]}', {i})")
+        sql(P, "UPDATE orders SET n = 100 WHERE n = 4")
+        call(P, "POST", "/tier", timeout=600)  # (tiered: the lake holds files, which spill past the budget)
+        sql(P, "INSERT INTO orders VALUES ('c', 31)")
+        sql(P, "CREATE VIEW big AS SELECT k, n FROM orders WHERE n > 5")
+        sql(P, "CREATE MATERIALIZED VIEW totals AS SELECT k, count(*) AS c, sum(n) AS s FROM orders GROUP BY k")
+        sql(P, "CREATE SEQUENCE ids")
+        sql(P, "CREATE TABLE ticks (at TIMESTAMP)")
+        sql(P, "CREATE TABLE pub (id BIGINT, v VARCHAR) WITH (publish = 'iceberg')")
+        sql(P, "INSERT INTO pub VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')")
+        call(P, "POST", "/tier", timeout=600)  # (tiered and published: its Iceberg metadata names the lake's place now)
+        sql(P, "CREATE PROCEDURE mark() LANGUAGE sql AS $$ INSERT INTO ticks SELECT now() $$")
+        sql(P, "CREATE TASK tick SCHEDULE '1 second' AS CALL mark()")
+        call(P, "PUT", "/files/notes/a.txt", b"hello lake\n")
+        time.sleep(2)
+        before = answers(P)
+        seq_before = sql(P, "SELECT nextval('ids') AS v")[0]["v"]
+        ticks_before = sql(P, "SELECT count(*) AS n FROM ticks")[0]["n"]
+
+        # Refusals, before anything moves.
+        status, _, text = reply(P, "POST", "/sql", f"ALTER DATABASE nosuchdb SET LOCATION '{new_lake()}'".encode())
+        checks["a database that isn't this one is refused, and the answer names this one"] = status != 200 and name in text
+        busy = new_lake()
+        put_object(busy, "notes.txt", b"not a lake")
+        status, _, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{busy}'".encode())
+        checks["a folder holding other things is refused, and no part of the lake is written there"] = (
+            status != 200 and "holds other things" in text and not lake_objects(busy, "catalog/") and not lake_objects(busy, "data/"))
+
+        # The move, under writes.
+        wt = threading.Thread(target=writer, daemon=True)
+        wt.start()
+        t_end = time.time() + 30
+        while len(acked) < 20 and time.time() < t_end:
+            time.sleep(0.1)
+        target = new_lake()
+        target_name = os.path.basename(target.rstrip("/")).lower()  # (the lake's name in a folder: its last part)
+        t0 = time.time()
+        status, _, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{target}'".encode())
+        moved = status == 200 and '"moving"' in text
+        served = until(lambda: lake_now(P), target_name, 60)  # the same port serves the target once the node starts again
+        downtime = time.time() - t0
+        quit_writing.set()
+        wt.join(60)  # (its last request is answered first: every row it was told went in is in `acked`)
+        checks["the move answers at once, and the same port serves the target"] = moved and served == target_name
+        if not checks["the move answers at once, and the same port serves the target"]:
+            print(f"memorylake: the move answered {status}: {text[:300]}", file=sys.stderr)
+            return False  # (the checks are printed on the way out)
+        checks[f"no write failed while the lake moved ({downtime:.1f} s from the move to its first answer on the target)"] = not errors and downtime < 30 and len(acked) > 20
+        stored = [r["n"] for r in sql(P, "SELECT n FROM orders WHERE k = 'w' ORDER BY n")]
+        checks[f"every write acknowledged is there once ({len(acked)} writes, none doubled)"] = stored == sorted(acked)
+        checks["the tables, the views, the materialized view and the file are as they were"] = answers(P) == before
+        seq_after = sql(P, "SELECT nextval('ids') AS v")[0]["v"]
+        checks["a sequence goes on past its last value"] = seq_after > seq_before
+        sql(P, "INSERT INTO orders VALUES ('post', 999)")
+        got = until(lambda: [(r["c"], r["s"]) for r in sql(P, "SELECT c, s FROM totals WHERE k = 'post'")], [(1, 999)], 20)
+        checks["a materialized view on the target takes a write made after the move"] = got == [(1, 999)]
+        checks["a task keeps ticking after the move"] = more(lambda: sql(P, "SELECT count(*) AS n FROM ticks")[0]["n"], ticks_before)
+        checks["the lake's objects are at the target: catalog, tiered files and the file"] = (
+            bool(lake_objects(target, "catalog/")) and any(k.endswith(".parquet") for k in lake_objects(target, "data/orders/"))
+            and bool(lake_objects(target, "files/notes/")))
+        status, hdrs, _ = reply(P, "POST", "/sql", f"ALTER DATABASE {target_name} SET LOCATION '{new_lake()}'".encode())
+        checks["a lake on disk is not moved this way (0A000)"] = status != 200 and hdrs.get("x-pondra-sqlstate") == "0A000"
+        # The Iceberg table is published again where the lake is now: its newest metadata names the target, no
+        # memory:// path is left in it, and PyIceberg reads its rows there.
+        pub_moved = until(lambda: pub_at_target(target), True, 20)
+        pub_rows = pub_rows_at(target)
+        checks["a published Iceberg table is published again at the target (its metadata names the target, PyIceberg reads its rows)"] = pub_moved and pub_rows in (5, None)
+
+        # Stopped, and opened again from the target by another node: the same lake.
+        final = answers(P)
+        node.p.send_signal(signal.SIGTERM)
+        stopped_ok = node.p.wait(60) == 0
+        reopened = Node(target, P + 1).start()
+        nodes.append(reopened)
+        stored_again = [r["n"] for r in sql(P + 1, "SELECT n FROM orders WHERE k = 'w' ORDER BY n")]
+        checks["stopped, and opened again from the target: the same rows, files and writes"] = (
+            stopped_ok and answers(P + 1) == final and stored_again == sorted(acked))
+
+        # Python: db.save(target) on a memory node of its own.
+        py = Node(":memory:", P + 2, env=env).start()
+        nodes.append(py)
+        db = _client(P + 2)
+        db.sql("CREATE TABLE pts (v BIGINT)")
+        db.sql("INSERT INTO pts VALUES (1), (2), (3)")
+        # BACKUP of a lake in memory runs in this process: the backup reads back its rows (ADR-070, invariant 62).
+        backed = new_lake()
+        sql(P + 2, "BACKUP DATABASE TO '" + backed + "'")
+        listed = os.listdir(os.path.join(backed, "_backups")) if os.path.isdir(os.path.join(backed, "_backups")) else []
+        sql(P + 2, f"ATTACH '{backed}' AS bk")
+        bk_rows = sql(P + 2, "SELECT count(*) AS n FROM bk.pts")[0]["n"]
+        sql(P + 2, "DETACH bk")
+        checks["BACKUP of a lake in memory runs in this process, and the backup reads back its rows"] = any(f.endswith(".json.zst") for f in listed) and bk_rows == 3
+        t3 = new_lake()
+        db.save(t3)
+        db.sql("INSERT INTO pts VALUES (4)")
+        py_rows = [str(r["v"]) for r in db.sql("SELECT v FROM pts ORDER BY v").rows()]
+        checks["db.save(target) in Python: the lake there, and the same connection goes on"] = py_rows == ["1", "2", "3", "4"] and bool(lake_objects(t3, "catalog/"))
+
+        # A move whose second pass fails (PONDRA_CRASH=move_settle:1, a full disk's stand-in): the lake stays in memory,
+        # whole, says why in /stats, and the target is left empty; db.save says so too.
+        bad = Node(":memory:", P + 4, env={**env, "PONDRA_CRASH": "move_settle:1"}).start()
+        nodes.append(bad)
+        sql(P + 4, "CREATE TABLE kept (v BIGINT)")
+        sql(P + 4, "INSERT INTO kept VALUES (1), (2), (3)")
+        bad_name = call(P + 4, "GET", "/stats")["lake"]
+        bad_target = new_lake()
+        reply(P + 4, "POST", "/sql", f"ALTER DATABASE \"{bad_name}\" SET LOCATION '{bad_target}'".encode())
+        def failed_why():
+            """Why the move failed, once the node serves again and says so (/stats), else None."""
+            try:
+                return call(P + 4, "GET", "/stats", timeout=2).get("move_failed")
+            except Exception:
+                return None
+        why = until(lambda: bool(failed_why()), True, 60) and failed_why()
+        back = lake_now(P + 4) == bad_name
+        bad_stats = {"move_failed": why}
+        checks["a move whose second pass fails leaves the lake in memory with every row, says why in /stats, and nothing at the target"] = (
+            back and bool(bad_stats.get("move_failed")) and sql(P + 4, "SELECT v FROM kept ORDER BY v") == [{"v": 1}, {"v": 2}, {"v": 3}]
+            and not lake_objects(bad_target, "catalog/") and not lake_objects(bad_target, "data/"))
+        said = ""
+        try:
+            _client(P + 4).save(new_lake())
+        except Exception as e:
+            said = str(e)
+        checks["…and db.save raises, saying so"] = "stays in memory" in said
+
+        # JavaScript: db.save(target) from a script of its own, on a memory node of its own.
+        if not shutil.which("node"):
+            checks["(skipped: node isn't on PATH, so the JavaScript check didn't run)"] = True
+        if shutil.which("node"):
+            js_node = Node(":memory:", P + 3, env=env).start()
+            nodes.append(js_node)
+            sql(P + 3, "CREATE TABLE js (v BIGINT)")
+            sql(P + 3, "INSERT INTO js VALUES (7)")
+            t4 = new_lake()
+            module = pathlib.Path(root, "js", "index.js").resolve().as_uri()
+            code = "\n".join([
+                f"import {{ connect }} from {json.dumps(module)};",
+                f"const db = connect({json.dumps(f'http://127.0.0.1:{P + 3}')});",
+                f"await db.save({json.dumps(t4)});",
+                'console.log(JSON.stringify(await db.sql("SELECT v FROM js")));',
+                "process.exit(0);",
+            ])
+            ran = subprocess.run(["node", "--input-type=module", "-e", code], capture_output=True, text=True, timeout=120)
+            try:
+                js_rows = json.loads(ran.stdout.strip().splitlines()[-1]) if ran.returncode == 0 else None
+            except (ValueError, IndexError):
+                js_rows = None
+            got_js = [str(r.get("v")) for r in js_rows] if isinstance(js_rows, list) and all(isinstance(r, dict) for r in js_rows) else None
+            checks["db.save(target) in JavaScript: the lake there, and the same connection goes on"] = got_js == ["7"] and bool(lake_objects(t4, "catalog/"))
+            if not got_js:
+                print((ran.stdout + ran.stderr)[-500:], file=sys.stderr)
+
+        # The library in this process: pondra.connect() and its save, when the library is built.
+        lib = os.environ.get("PONDRA_LIBRARY") or os.path.join(root, "target", "release", {"darwin": "libpondra_lib.dylib", "win32": "pondra_lib.dll"}.get(sys.platform, "libpondra_lib.so"))
+        if not os.path.exists(lib):
+            checks["(skipped: the library isn't built, so pondra.connect() in this process didn't run)"] = True
+        if os.path.exists(lib):
+            t5 = new_lake()
+            code = "\n".join([
+                "import json, sys",
+                f"sys.path.insert(0, {json.dumps(os.path.join(root, 'python'))})",
+                "import pondra",
+                "db = pondra.connect()",
+                'db.sql("CREATE TABLE t (v BIGINT)")',
+                'db.sql("INSERT INTO t VALUES (1), (2)")',
+                f"db.save({json.dumps(t5)})",
+                'db.sql("INSERT INTO t VALUES (3)")',
+                'print(json.dumps([r["v"] for r in db.sql("SELECT v FROM t ORDER BY v").rows()]))',
+                "db.close()",
+            ])
+            ran = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=180,
+                                 env={**os.environ, **env, "PONDRA_LIBRARY": os.path.abspath(lib)})
+            try:
+                inproc = json.loads(ran.stdout.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                inproc = None
+            checks["pondra.connect() in this process: save(target) moves the lake, and the handle goes on"] = (
+                isinstance(inproc, list) and [str(v) for v in inproc] == ["1", "2", "3"] and bool(lake_objects(t5, "catalog/")))
+            if ran.returncode != 0:
+                print((ran.stdout + ran.stderr)[-500:], file=sys.stderr)
+        if not all(checks.values()):
+            return False  # (its checks are printed on the way out)
+        return f"a lake in memory moved to a folder under {len(acked)} writes ({downtime:.1f} s from the move to its first answer there), then Python's and JavaScript's clients (and the library's, when it is built); {len(checks)} checks"
+    finally:
+        quit_writing.set()
+        for n in nodes:
+            n.kill()
+        for name_, good in checks.items():
+            print(f"memorylake: {name_}: {'OK' if good else 'FAIL'}")
+
+
 # About how long each section of `all` takes, in seconds, on CI's runner (main's build run 650,
 # 2026-10-13: `all` prints each one's time as it goes): `--shard K/N` deals the sections out by
 # it, so CI runs the suite in parts side by side that end together. A section not listed
@@ -18589,12 +18872,12 @@ SECS = {"memory": 240, "waits": 99, "sso": 89, "stopped": 87, "guesses": 45, "ba
         "files": 10, "followers": 10, "guarded": 10, "begin": 9, "bykey": 9, "clients": 9, "flows": 9,
         "guard": 9, "hot": 9, "schemas": 9, "temps": 9, "catalogs": 8, "clusters": 8, "columns": 8,
         "fills": 8, "serverless": 8, "alter": 7, "fence": 7, "loads": 7, "safety": 7, "sequences": 7,
-        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6}
+        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -18626,7 +18909,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -18639,7 +18922,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

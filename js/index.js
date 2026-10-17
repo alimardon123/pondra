@@ -478,6 +478,17 @@ export class Pondra {
     return this.owner ? `${this.url}/#key=${this.owner}` : `${this.url}/`;
   }
 
+  /** Moves a lake held in memory to `target` (a folder, or a bucket's URL) and goes on over it there: its tables,
+   * views, tasks and history as they are, this connection too. Statements wait while it moves; a lake that isn't
+   * in memory is refused (`ALTER DATABASE … SET LOCATION`, the statement any client can send). */
+  async save(target) {
+    const name = (await this.sql("SELECT current_database() AS d"))[0].d.replace(/"/g, '""');
+    await this.sql(`ALTER DATABASE "${name}" SET LOCATION '${String(target).replace(/'/g, "''")}'`);
+    await this.sql("SELECT 1"); // (its retries wait out the move: the node starts again on the target)
+    const failed = (await (await this.request("GET", "/stats")).json()).move_failed; // (a move that failed: the lake stays in memory)
+    if (failed) throw new Error(`the lake stays in memory: ${failed}`);
+  }
+
   /** End this connection's session (its temporary tables and views), then close the node `connect()` started
    * for it. In this process, once no other connection to it is open: drained, its term given back, and a lake
    * in memory let go. Beside this process, by closing its input (it hands the lake on at once), on every OS; it

@@ -130,6 +130,7 @@ fn ddl_touches(d: &Ddl) -> Vec<Touch> {
         Ddl::Object(crate::objects::Op::Comment { .. }) => vec![], // (a comment changes no object's definition)
         Ddl::DropSchema { name, .. } => vec![Touch::Schema(name.clone())],
         Ddl::Refresh { database, .. } => vec![Touch::Database(database.clone(), "refreshed")],
+        Ddl::SetLocation { database, .. } => vec![Touch::Database(Some(database.clone()), "moved")],
         Ddl::DropDatabase { name, .. } => vec![Touch::Database(Some(name.clone()), "dropped")],
         Ddl::Users(c) => users(c),
         // (none of these is a project's: `apply::head` refuses the kinds a project can't declare)

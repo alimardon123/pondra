@@ -645,7 +645,7 @@ pub fn reach_of(url: &str) -> Option<Reach> {
 pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
     if in_memory(url) {
         let url = url.trim_end_matches('/').to_string();
-        let held = MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(url.clone()).or_insert_with(|| Arc::new(Counted(Arc::new(object_store::memory::InMemory::new())))).clone();
+        let held = crate::memory::store(&url);
         return Ok((url.clone(), held.clone(), Some((url, held)))); // (DataFusion reads its files at their URLs, as a bucket's)
     }
     let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
@@ -677,31 +677,9 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     Ok((url.trim_end_matches('/').to_string(), Arc::new(Counted(store)), Some((root, Arc::new(Counted(whole)) as Store))))
 }
 
-/// Lakes held in this process's memory (`memory://name`, DuckDB's `:memory:`), by place: every open
-/// of one here is the same store until `forget_memory`, so a node that restarts in place finds its
-/// lake as it left it. Nothing of one is on disk, and no other process reaches it. (Not `per_node!`:
-/// a restart in place resets those.)
-static MEMORY: std::sync::LazyLock<Mutex<HashMap<String, Store>>> = std::sync::LazyLock::new(Default::default);
-
-/// Is `url` a lake held in this process's memory?
-pub fn in_memory(url: &str) -> bool { url.starts_with("memory://") }
-
-/// Is a lake held in this process's memory at `url`? (Opening one there makes it.)
-pub fn memory_held(url: &str) -> bool { MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(url.trim_end_matches('/')) }
-
-/// Is `store` a lake held in this process's memory? Every open of one gives the same store.
-pub fn held_in_memory(store: &Store) -> bool { MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().any(|s| Arc::ptr_eq(s, store)) }
-
-/// A lake's place as given: `:memory:` (DuckDB's word) is a new lake in this process's memory.
-pub fn place(lake: &str) -> String {
-    match lake {
-        ":memory:" => format!("memory://{}", uuid::Uuid::new_v4().simple()),
-        _ => lake.to_string(),
-    }
-}
-
-/// Let a lake in memory go (the library's close, once its node has stopped): its memory with it.
-pub fn forget_memory(url: &str) { MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(url.trim_end_matches('/')); }
+// Lakes held in this process's memory (`memory://`, DuckDB's `:memory:`) live in `memory.rs`, which
+// spills their files to disk past a budget.
+pub use crate::memory::{forget_memory, held_in_memory, in_memory, memory_held, place};
 
 /// A lake's bucket, as DataFusion names its store (`s3://bucket`), or None for a folder.
 pub fn bucket_url(url: &str) -> Option<String> {
@@ -712,7 +690,7 @@ pub fn bucket_url(url: &str) -> Option<String> {
 /// A lake's store, counting the requests that cost the most and meet a bucket's rate limits
 /// (S3: 3,500 writes a second per prefix): writes, lists and deletes (`GET /metrics`).
 #[derive(Debug)]
-struct Counted(Store);
+pub(crate) struct Counted(pub(crate) Store);
 
 impl std::fmt::Display for Counted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
@@ -2252,17 +2230,23 @@ fn fatal(e: slatedb::Error) -> anyhow::Error {
 /// Test hook: `PONDRA_CRASH=after_seg_put:0.05,after_parquet_put:0.2` aborts the process at
 /// that point with that probability, to prove crashes never lose or duplicate rows.
 pub fn maybe_crash(point: &str) {
-    let Some(spec) = crate::env::get("PONDRA_CRASH") else { return };
-    for (name, prob) in spec.split(',').filter_map(|p| p.split_once(':')) {
-        let roll = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1e6;
-        if name == point && roll < prob.parse().unwrap_or(0.0) {
-            if crate::library::on() {
-                panic!("PONDRA_CRASH at {point}"); // (a library's node fails, its host stays: a vital loop's panic)
-            }
-            eprintln!("PONDRA_CRASH: aborting at {point}");
-            std::process::abort();
+    if crash_rolled(point) {
+        if crate::library::on() {
+            panic!("PONDRA_CRASH at {point}"); // (a library's node fails, its host stays: a vital loop's panic)
         }
+        eprintln!("PONDRA_CRASH: aborting at {point}");
+        std::process::abort();
     }
+}
+
+/// Whether `PONDRA_CRASH` names `point` and its roll comes up: `maybe_crash`'s test, for a point that
+/// fails an operation (`memory::settle`'s second pass) rather than the process.
+pub fn crash_rolled(point: &str) -> bool {
+    let Some(spec) = crate::env::get("PONDRA_CRASH") else { return false };
+    spec.split(',').filter_map(|p| p.split_once(':')).any(|(name, prob)| {
+        let roll = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1e6;
+        name == point && roll < prob.parse().unwrap_or(0.0)
+    })
 }
 
 /// How many partitions a query runs in here: one per core (`PONDRA_CORES` stands for another

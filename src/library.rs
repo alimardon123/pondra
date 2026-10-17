@@ -366,7 +366,7 @@ fn halt(node: Option<Node>) {
     crate::reset::reset();
 }
 
-async fn supervise(options: Options, state: Arc<Mutex<State>>, router: Arc<Mutex<Option<axum::Router>>>, mut events: mpsc::UnboundedReceiver<Event>, first: std::sync::mpsc::Sender<Result<(), String>>) {
+async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<Mutex<Option<axum::Router>>>, mut events: mpsc::UnboundedReceiver<Event>, first: std::sync::mpsc::Sender<Result<(), String>>) {
     // (the router is there exactly while the node runs: a request at any other time is told why)
     let set = |s: State| {
         let mut r = router.lock().unwrap_or_else(PoisonError::into_inner);
@@ -377,6 +377,7 @@ async fn supervise(options: Options, state: Arc<Mutex<State>>, router: Arc<Mutex
     };
     let mut first = Some(first);
     let mut restarts: Vec<Instant> = vec![];
+    let mut moves = crate::node::mover(); // (a lake moving to another place: `memory::set_location`)
     loop {
         set(State::Starting);
         // (a start can be told to restart by a task it started, or unwind with `Restarting` itself)
@@ -390,7 +391,24 @@ async fn supervise(options: Options, state: Arc<Mutex<State>>, router: Arc<Mutex
                         let _ = f.send(Ok(()));
                     }
                     let since = Instant::now();
-                    match events.recv().await {
+                    let next = tokio::select! {
+                        e = events.recv() => e,
+                        Some(m) = moves.recv() => {
+                            // The lake moves: its requests answered, the node stopped, its objects settled on the
+                            // target, and the node started there. A move is not a restart, so it is not counted.
+                            crate::drain::drain().await;
+                            set(State::Restarting(format!("moving the lake to {}", m.to)));
+                            node.stop().await;
+                            if let Err(e) = crate::memory::settle(&m).await {
+                                // (the lake stays in memory: the node starts again on it, and says why in `/stats`)
+                                crate::memory::move_failed(&m.to, &e);
+                                continue;
+                            }
+                            options.dir = m.to;
+                            continue;
+                        }
+                    };
+                    match next {
                         Some(Event::Restart(why)) => {
                             router.lock().unwrap_or_else(PoisonError::into_inner).take(); // (no request reaches a node being halted)
                             halt(Some(node));

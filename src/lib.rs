@@ -75,6 +75,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod log;
 #[cfg(feature = "server")] mod manifest;
 #[cfg(feature = "server")] mod measures;
+#[cfg(feature = "server")] pub mod memory;
 #[cfg(feature = "server")] mod objects;
 #[cfg(feature = "server")] mod once;
 #[cfg(feature = "server")] mod metrics;

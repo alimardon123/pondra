@@ -53,6 +53,11 @@ struct Published {
     /// whose files changed but not these only rewrote them.
     #[serde(default)]
     rows: (u64, u64),
+    /// Where the table's folder was when its versions were published (`lake.full`): another place means the
+    /// lake moved (`ALTER DATABASE … SET LOCATION`) or was copied, and every path they name is somewhere else.
+    /// (Empty: published before this was kept, taken as here.)
+    #[serde(default)]
+    location: String,
 }
 
 /// An Iceberg manifest this lake wrote.
@@ -183,6 +188,9 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     let Some(parts) = crate::delta::publishable(lake, meta).await? else { return Ok(None) };
     let key = format!("i/{table}");
     let mut st: Published = lake.cat.get(&key).await?.unwrap_or_default();
+    let here = lake.full(&format!("data/{}", meta.folder(table)));
+    let moved = !st.location.is_empty() && st.location.trim_end_matches('/') != here.trim_end_matches('/');
+    let stale = if moved { forget(&mut st) } else { vec![] };
     let inlined: BTreeMap<String, u64> = parts.inline.iter().map(|f| (f.path.clone(), f.rows)).collect();
     let deleted: BTreeMap<String, u64> = parts.inline.iter().filter(|f| f.deleted > 0).map(|f| (f.path.clone(), f.deleted)).collect();
     let fresh: Vec<&crate::manifest::Manifest> = parts.manifests.iter().filter(|m| !st.manifests.contains_key(&m.path)).collect();
@@ -191,7 +199,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     let layout = Layout::of(meta);
     let shape = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(),
         json!([fields, layout.spec(), layout.sort, layout.keys, meta.columns.iter().map(|(c, _)| meta.name_of(c)).collect::<Vec<_>>(), meta.properties]).to_string()); // (a rename, say)
-    if st.version > 0 && fresh.is_empty() && went.is_empty() && !inline_changed && named.is_none() && st.shape == shape {
+    if st.version > 0 && fresh.is_empty() && went.is_empty() && !inline_changed && named.is_none() && st.shape == shape && !moved {
         return Ok(None);
     }
     if st.uuid.is_empty() {
@@ -269,7 +277,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
         snapshot["parent-snapshot-id"] = p;
     }
     st.snapshots.push((snapshot, list));
-    let gone: Vec<(Value, String)> = st.snapshots.drain(..st.snapshots.len().saturating_sub(HISTORY)).collect();
+    let gone: Vec<(Value, String)> = stale.into_iter().chain(st.snapshots.drain(..st.snapshots.len().saturating_sub(HISTORY))).collect();
     let body = metadata(lake, meta.folder(table), &st.uuid, v, now, &schema, &layout, meta, &st.snapshots);
     // Written once, never overwritten; if it's there, an attempt that crashed wrote it, and this
     // one's objects are garbage the next round's version replaces.
@@ -304,7 +312,32 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     }
     st.rows = rows_now;
     (st.version, st.inlined, st.deleted, st.shape) = (v, inlined, deleted, shape);
+    st.location = here;
     Ok(Some((key, json(&st))))
+}
+
+/// A table whose folder moved (the lake moved, or was copied): its manifests name paths that aren't there any
+/// more, and its snapshots name the old place too. Its files are where they were relative to the lake, so
+/// the new version is written again from the table's files, and only it is kept: the manifests go to `dropped`
+/// as version 0 (deleted by the cleanup at the end of `publish`), and the snapshots are returned to be deleted
+/// with their metadata and lists. `uuid`, `version`, `rows` and `shape` stay.
+fn forget(st: &mut Published) -> Vec<(Value, String)> {
+    let avro = std::mem::take(&mut st.manifests).into_values().chain(std::mem::take(&mut st.deleting).into_values());
+    st.dropped.extend(avro.chain(st.inline.take()).chain(st.inline_deleting.take()).map(|a| (0, a.path)));
+    st.inlined.clear();
+    st.deleted.clear();
+    st.since.clear();
+    std::mem::take(&mut st.snapshots)
+}
+
+/// Whether a published table names a place other than this lake's (the lake was moved or copied: invariant
+/// 310), from the catalog alone, so a leader starting on a lake that stayed where it was loads no manifests.
+pub async fn elsewhere(lake: &Lake) -> bool {
+    let here = lake.full("data/");
+    match lake.cat.scan::<Published>("i/", "i0").await {
+        Ok(published) => published.iter().any(|(_, st)| !st.location.is_empty() && !st.location.starts_with(&here)),
+        Err(_) => true, // (unread: the pass finds out)
+    }
 }
 
 /// One Iceberg manifest added by version `v` (snapshot `id`): `files` (`content` 0), or the
