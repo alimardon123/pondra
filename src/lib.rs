@@ -14,7 +14,11 @@ pub mod intervals;
 pub mod xlsx;
 pub mod answer;
 pub mod engine;
+pub mod text;
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod asof;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod sparksql;
 mod optimize;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
@@ -124,7 +128,6 @@ mod optimize;
 #[cfg(feature = "server")] mod server;
 #[cfg(feature = "server")] mod service;
 #[cfg(feature = "server")] mod spill;
-#[cfg(feature = "server")] mod sparksql;
 #[cfg(feature = "server")] mod spmd;
 #[cfg(feature = "server")] mod status;
 #[cfg(feature = "server")] mod store;
