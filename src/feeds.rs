@@ -39,7 +39,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, topic: &str, options: &s
     // Its columns: the query planned over the topic's (no records needed).
     let schema = crate::query::schema(&crate::kafka_client::columns())?;
     let plan = over(lake, &feed, datafusion::arrow::record_batch::RecordBatch::new_empty(schema)).await?;
-    let columns: Vec<(String, String)> = plan.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+    let columns: Vec<(String, String)> = plan.into_optimized_plan()?.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect(); // (the types as the query runs)
     let meta = TableMeta { columns, publish: crate::store::default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (feed_key(name), json(&feed))], &[]).await
 }

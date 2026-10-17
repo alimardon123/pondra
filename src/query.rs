@@ -891,6 +891,13 @@ pub async fn sql(ctx: &SessionContext, sql: &str) -> Result<datafusion::datafram
     Ok(text_unions(ctx.sql_with_options(sql, read_only()).await?)?)
 }
 
+/// The schema a plan's rows have as they run: the analyzer's and the optimizer's types, not the SQL
+/// planner's. The planner types a literal such as `1e15` as a decimal with a negative scale, which no
+/// table can hold (`optimize::WholeLiterals`), so a table made from a query takes its columns from this.
+pub fn run_schema(ctx: &SessionContext, plan: &datafusion::logical_expr::LogicalPlan) -> Result<datafusion::common::DFSchemaRef> {
+    Ok(ctx.state().optimize(plan)?.schema().clone())
+}
+
 /// A table of this lake in a session: `t` in the default schema (`public`), `s.t` in schema `s`,
 /// exactly as named (SQL folds unquoted names to lower case; a name that isn't must be quoted).
 pub fn table_ref(name: &str) -> datafusion::common::TableReference {

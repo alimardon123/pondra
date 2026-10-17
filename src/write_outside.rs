@@ -57,7 +57,7 @@ pub async fn copy_table(lake: &Lake, df: datafusion::prelude::DataFrame, to: &st
         true => ensure!(append || overwrite, "COPY … TO {to}: a {format} table is there already: APPEND adds to it, OVERWRITE replaces its rows"),
         false => {
             ensure!(there.is_empty(), "COPY … TO {to}: the folder holds files that aren't a {format} table");
-            let columns: Vec<(String, String)> = df.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(&crate::write::stored(f.data_type())))).collect();
+            let columns: Vec<(String, String)> = df.clone().into_optimized_plan()?.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(&crate::write::stored(f.data_type())))).collect(); // (the types as the query runs, not as the planner first typed them)
             let name = root.rsplit('/').next().unwrap_or("table");
             let now = crate::log::now_ms();
             let (file, body) = match format {

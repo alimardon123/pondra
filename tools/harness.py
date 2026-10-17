@@ -7374,6 +7374,11 @@ def found():
     seen["exps"] = [len(exps_files), q("SELECT CAST(1e15 AS DOUBLE) AS a, 1e15::double AS b, x, n, CAST(n AS DOUBLE) AS c FROM exps")]
     checks["a number with an exponent is a whole decimal: CAST(1e15 AS DOUBLE) is 1e15, and a table made from 1e15 is written to files"] = (
         seen["exps"][0] > 0 and seen["exps"][1] == [{"a": 1e15, "b": 1e15, "x": 1000000000000000, "n": 602000000000000000000000, "c": 6.02e23}])
+    # A materialized view's table takes its columns' types as the query runs, too: 1e15 is a whole decimal there as well.
+    q("CREATE MATERIALIZED VIEW exps_v AS SELECT x, 1e15 AS y FROM exps")
+    q("CHECKPOINT")
+    seen["exps_v"] = q("SELECT y FROM exps_v")
+    checks["a materialized view's column of 1e15 is a whole decimal too: its table is written and reads 1000000000000000"] = seen["exps_v"] == [{"y": 1000000000000000}]
     node.kill(); locked.kill()
     ok = all(checks.values())
     print(json.dumps({"found": checks, "ok": ok}, indent=1))
