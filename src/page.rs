@@ -203,16 +203,19 @@ impl Page {
     async fn put(&self, name: &str, body: bytes::Bytes) -> anyhow::Result<Answer> {
         let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
         let (stem, ext) = (stem.to_lowercase(), ext.to_lowercase());
+        // (the rows come in the session's batch size, DataFusion's own, not the readers' 1,024: a query's batches are
+        // then as big as a node's; an Arrow file's batches are the file's own)
+        let size = self.ctx.state().config().batch_size();
         let reader: Box<dyn RecordBatchReader + '_> = match ext.as_str() {
             "csv" => {
                 let (schema, _) = csv::reader::Format::default().with_header(true).infer_schema(&body[..], Some(1000))?;
-                Box::new(csv::ReaderBuilder::new(Arc::new(schema)).with_header(true).build(&body[..])?)
+                Box::new(csv::ReaderBuilder::new(Arc::new(schema)).with_header(true).with_batch_size(size).build(&body[..])?)
             }
             "json" | "ndjson" => {
                 let (schema, _) = json::reader::infer_json_schema(&body[..], Some(1000))?;
-                Box::new(json::ReaderBuilder::new(Arc::new(schema)).build(&body[..])?)
+                Box::new(json::ReaderBuilder::new(Arc::new(schema)).with_batch_size(size).build(&body[..])?)
             }
-            "parquet" => Box::new(ParquetRecordBatchReaderBuilder::try_new(body.clone())?.build()?),
+            "parquet" => Box::new(ParquetRecordBatchReaderBuilder::try_new(body.clone())?.with_batch_size(size).build()?),
             "arrow" => match FileReader::try_new(Cursor::new(body.clone()), None) {
                 Ok(r) => Box::new(r),
                 Err(_) => Box::new(StreamReader::try_new(&body[..], None)?), // (an IPC stream, not a file)
@@ -413,6 +416,25 @@ mod tests {
         assert_eq!(page.request("PUT", "/files/o.parquet", parquet.body).await.status, 200);
         let got = page.request("POST", "/sql?format=csv", "SELECT sum(qty) AS s FROM read_parquet('o.parquet')".into()).await;
         assert_eq!(got.body, "s\n21\n");
+    }
+
+    /// A Parquet file of 20,000 rows (one Int64 column) put as a table is read in the session's batch size, and its
+    /// answer is the file's: the batch size is not visible in an answer, so this guards the path.
+    #[tokio::test]
+    async fn a_parquet_file_of_many_rows_is_read_in_full() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let column = Int64Array::from_iter_values(1..=20_000);
+        let mut body = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut body, schema.clone(), None).unwrap();
+        writer.write(&RecordBatch::try_new(schema, vec![Arc::new(column)]).unwrap()).unwrap();
+        writer.close().unwrap();
+        let page = Page::open(&Options::default());
+        assert_eq!(page.request("PUT", "/files/big.parquet", body.into()).await.status, 200);
+        let got = page.request("POST", "/sql?format=csv", "SELECT count(*) AS n, sum(x) AS s FROM big".into()).await;
+        assert_eq!(got.body, "n,s\n20000,200010000\n");
     }
 
     #[tokio::test]
