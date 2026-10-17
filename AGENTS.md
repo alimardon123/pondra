@@ -542,7 +542,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    operators are refused until the analysis knows them.
 29. **Flushes reach the sequencer in the order they were cut** (`log::send`'s turn), so a
    producer's pipelined batches commit in order. Over HTTP from a follower they may still
-   overtake each other; a door that pipelines (Flight) re-queues a batch refused as out of order.
+   overtake each other; a door that pipelines (Flight, Kafka) re-queues a batch refused as out of
+   order. Answered OUT_OF_ORDER_SEQUENCE, an idempotent librdkafka producer on a follower stopped for
+   good ("sequence desynchronization"): `kafka_bench.py --s3 --nodes 3 --steady 30` on `sim_r2.py`
+   lost two of its 24 producers in their first seconds without the Kafka door's re-queue.
 30. **A shuffle's scratch folder has the node's own id in it** (`spill::dir`). Two nodes on one
    machine share a cache directory and name their buckets the same way; without the id they write
    over each other's rows and the answer is quietly wrong. This is what `tools/shuffle_spill.py`

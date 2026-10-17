@@ -11,7 +11,7 @@ the simulator's own count with sim_r2.py), what they cost a month at S3's and R2
 and what a day of the stream keeps in the table's files.
   kafka_bench.py [--nodes 3] [--producers 4] [--events 500000] [--flag ack=replicated] [--s3] [--kafka ~/kafka_2.13-4.3.1]
   kafka_bench.py --s3 --steady 30 [--nodes 1] [--warm 30] [--secs 120]"""
-import argparse, json, multiprocessing as mp, os, random, sys, time, urllib.request
+import argparse, json, multiprocessing as mp, os, queue, random, sys, time, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness
 from harness import Node, call, pct
@@ -60,6 +60,21 @@ def steady(port, name, rate, until, q):
         p.poll(0)
         time.sleep(0.005)
     q.put((name, i, sent, p.flush(120)))
+
+
+def gather(q, procs):
+    """Each producer's result. A producer that died (librdkafka's fatal errors end one) stops the bench
+    at once, where waiting for its result would hang until the job's time limit."""
+    got = []
+    while len(got) < len(procs):
+        try:
+            got.append(q.get(timeout=5))
+        except queue.Empty:
+            dead = [p.exitcode for p in procs if p.exitcode not in (None, 0)]
+            if dead:
+                [p.kill() for p in procs if p.is_alive()]
+                sys.exit(f"kafka_bench: {len(dead)} producer(s) died (exit {dead[0]}): the error is above")
+    return got
 
 
 def requests(ports):
@@ -111,7 +126,7 @@ def measure_steady(lake, ports):
     time.sleep(A.secs)
     n1, sim1, t1 = requests(ports), simulated(), time.time()
     bytes1, took, files = stored(lake), t1 - t0, kept()
-    results = [q.get() for _ in procs]
+    results = gather(q, procs)
     [p.join() for p in procs]
     sent, values, unflushed = sum(r[1] for r in results), sum(r[2] for r in results), sum(r[3] for r in results)
     time.sleep(2)
@@ -185,7 +200,7 @@ def main():
     q, t = mp.Queue(), time.time()
     procs = [mp.Process(target=produce, args=(kport(k), f"p{k}", A.events, q)) for k in range(A.producers)]
     [p.start() for p in procs]
-    results = [q.get() for _ in procs]
+    results = gather(q, procs)
     [p.join() for p in procs]
     wall = time.time() - t
     want = A.producers * A.events
