@@ -2738,6 +2738,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `df.schema()`: the analyzer's rules change types the rows then have. `harness.py found`: "a number with
    an exponent is a whole decimal…" and the bulk door, task, Delta and topic-view checks; `flight`: "the
    FlightInfo schema of SELECT 1e15 AS x is decimal(16, 0)".
+416. **A sort of strings hands up only its own rows' strings** (`held::LeanExec`, `LeanSorts`): a sort that keeps
+   all its rows and has a `Utf8View` or `BinaryView` column passes its output through `query::compact`
+   (invariant 202). Its `take` and its merge's `interleave` copy views but keep the buffers they point into, so a
+   batch it hands up points into the current batch of every run it merges, and the `SortPreservingMergeExec`
+   above counts those buffers whole: a 10M-row sort of md5 strings on 4 partitions counted 66 MB for about 2 MB of
+   rows and a 256 MB query memory refused it, one run in three. A top-N keeps a few rows and is left alone.
+   `harness.py scale`: "a sort of 10M strings under a 256 MB query memory answers every time…".
 
 ## Tests: run these before and after any change
 
