@@ -28,6 +28,10 @@ const COOKIE: &str = "pondra_sso";
 const FLOW_MS: u64 = 10 * 60_000;
 /// How long the command line has to redeem its code.
 const CODE_MS: u64 = 60_000;
+/// What the lake's key signs a flow's cookie and a command line's code for (`users::sign_for`): neither
+/// passes for the other, nor for a session.
+const FLOW: &str = "sso-flow";
+const CODE: &str = "sso-code";
 
 /// `GET /sso/{provider}/start?to=…`: to the provider, with the flow in a cookie. `to` is a path of this
 /// node's (the console's page), or for `pondra login` its loopback address, with `challenge` (S256 of
@@ -70,7 +74,7 @@ async fn begin(app: &App, peer: &Peer, name: &str, headers: &HeaderMap, q: &Hash
     let (state, nonce, verifier) = (random(), random(), random());
     let flow = j!({"p": name, "s": state, "n": nonce, "v": verifier, "to": to, "ch": challenge, "r": redirect, "t": token, "c": path, "x": crate::log::now_ms() + FLOW_MS});
     let secure = if redirect.starts_with("https:") { "; Secure" } else { "" };
-    let cookie = format!("{COOKIE}={}; Path={path}; Max-Age={}; HttpOnly; SameSite=Lax{secure}", signed(app, &flow).await?, FLOW_MS / 1000);
+    let cookie = format!("{COOKIE}={}; Path={path}; Max-Age={}; HttpOnly; SameSite=Lax{secure}", signed(app, FLOW, &flow).await?, FLOW_MS / 1000);
     let scopes = match p.scopes.split_whitespace().any(|s| s == "openid") {
         true => p.scopes.clone(),
         false => format!("openid {}", p.scopes), // (an ID token comes only with `openid`)
@@ -175,9 +179,11 @@ pub async fn redeem(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Peer>
     let b: Value = serde_json::from_slice(&body).unwrap_or_default();
     let session = async {
         let (payload, sig) = b["code"].as_str().and_then(|c| c.strip_prefix("pc_")?.split_once('.')).context("no code")?;
-        let v = crate::users::signed_by_lake(&app.lake, payload, sig).await.context("not a code of this lake's")?;
+        let v = crate::users::signed_for(&app.lake, CODE, payload, sig).await.context("not a code of this lake's")?;
         ensure!(v["x"].as_u64().is_some_and(|x| x > crate::log::now_ms()), "the code is over a minute old: sign in again");
-        ensure!(b["verifier"].as_str().map(s256).as_deref() == v["ch"].as_str(), "the verifier isn't the one this sign-in started with");
+        let challenge = v["ch"].as_str().context("not a code of this lake's")?;
+        let verifier = b["verifier"].as_str().context("no verifier: a code is redeemed with the verifier its sign-in started with")?;
+        ensure!(s256(verifier) == challenge, "the verifier isn't the one this sign-in started with");
         let name = v["p"].as_str().unwrap_or_default();
         let all = crate::sso::all(&app.lake).await?;
         let (_, p) = all.iter().find(|(n, _)| n == name).with_context(|| format!("no identity provider {name} now"))?;
@@ -199,7 +205,7 @@ pub async fn redeem(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Peer>
 /// The command line's code: whom the flow signed in and its challenge, signed with the lake's key, for a minute.
 async fn code_for(app: &App, c: &Claimed, challenge: &str) -> Result<String> {
     let code = j!({"u": c.user, "p": c.provider, "r": c.roles, "ch": challenge, "x": crate::log::now_ms() + CODE_MS});
-    Ok(format!("pc_{}", signed(app, &code).await?))
+    Ok(format!("pc_{}", signed(app, CODE, &code).await?))
 }
 
 /// The flow this request's cookie carries, if the lake's key signed it and it hasn't run out.
@@ -207,14 +213,14 @@ async fn flow_of(app: &App, headers: &HeaderMap) -> Option<Value> {
     let cookies = headers.get_all("cookie").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).map(str::trim);
     let value = cookies.filter_map(|c| c.strip_prefix(COOKIE)?.strip_prefix('=')).next()?;
     let (payload, sig) = value.split_once('.')?;
-    let flow = crate::users::signed_by_lake(&app.lake, payload, sig).await?;
+    let flow = crate::users::signed_for(&app.lake, FLOW, payload, sig).await?;
     flow["x"].as_u64().is_some_and(|x| x > crate::log::now_ms()).then_some(flow)
 }
 
-/// `value` as `<base64url JSON>.<the lake's signature of it>`.
-async fn signed(app: &App, value: &Value) -> Result<String> {
+/// `value` as `<base64url JSON>.<the lake's signature of it for purpose>`.
+async fn signed(app: &App, purpose: &str, value: &Value) -> Result<String> {
     let payload = B64U.encode(serde_json::to_vec(value)?);
-    let sig = crate::users::sign(&app.lake, payload.as_bytes()).await?;
+    let sig = crate::users::sign_for(&app.lake, purpose, payload.as_bytes()).await?;
     Ok(format!("{payload}.{sig}"))
 }
 

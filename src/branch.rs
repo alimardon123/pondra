@@ -351,8 +351,9 @@ pub async fn unpin(lake: &Lake, branch: &str) -> Result<Value> {
 
 /// A branch's key in this lake: its pin renewed and let go with it, nothing else (`keyed`).
 /// Derived from the lake's own key, so asked again (a retried CLONE) it is the same.
+/// (`sign_for` signs the same bytes as before, so keys already given stay good.)
 pub async fn key_for(lake: &Lake, branch: &str) -> Result<String> {
-    Ok(format!("pb_{}", crate::users::sign(lake, format!("branch-key\n{branch}").as_bytes()).await?))
+    Ok(format!("pb_{}", crate::users::sign_for(lake, "branch-key", branch.as_bytes()).await?))
 }
 
 /// `/cluster/ddl` with a branch's key: a renewal or an unpin of that branch's pin, while there is
