@@ -64,7 +64,9 @@ pub fn grouped(mut r: Routine) -> Routine {
     if is_query(&r.body) {
         r.body = crate::pg_json::text(&r.body).into_owned();
     } else if let std::borrow::Cow::Owned(select) = crate::pg_json::text(&format!("SELECT {}", r.body)) {
-        r.body = select.strip_prefix("SELECT ").unwrap_or(r.body.as_str()).to_string();
+        // (less the `?column?` a bare `?` is named as the one item of a select list)
+        let value = select.strip_prefix("SELECT ").map(|v| v.strip_suffix(r#" AS "?column?""#).unwrap_or(v));
+        r.body = value.unwrap_or(r.body.as_str()).to_string();
     }
     r
 }
@@ -1271,6 +1273,15 @@ mod tests {
         let Expr::Function(f) = parse_expr(sql).unwrap() else { panic!("{sql}: not a call") };
         let FunctionArguments::List(l) = f.args else { panic!("{sql}: no arguments") };
         l.args
+    }
+
+    #[test]
+    fn a_sql_functions_json_operators_are_grouped_as_postgres_groups_them() {
+        let body = |body: &str| grouped(Routine { kind: Kind::Macro, params: vec![], language: "sql".into(), body: body.into(), returns: None, with: Options::default() }).body;
+        assert_eq!(body("d ->> 'a' = '1'"), "(d ->> 'a') = '1'");
+        assert_eq!(body("d ? 'a'"), "jsonb_exists(d, 'a')", "an expression stays one, unnamed");
+        assert_eq!(body("SELECT d ? 'a'"), r#"SELECT jsonb_exists(d, 'a') AS "?column?""#);
+        assert_eq!(body("x + 1"), "x + 1", "nothing of JSON's: as written");
     }
 
     #[test]
