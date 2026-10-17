@@ -2288,7 +2288,7 @@ mod tests {
         assert!(!equal.said(&keys[2].0, &keys[2].1, &schema) && !equal.said(&keys[2].0, &keys[2].1, &schema));
     }
 
-    /// A session the way Pondra makes one for a query (`literals.rs`'s), with this file's rules.
+    /// A session with Pondra's config and this file's analyzer and logical rules (no lake: a literal's types need none).
     fn session() -> datafusion::prelude::SessionContext {
         use datafusion::execution::SessionStateBuilder;
         let state = SessionStateBuilder::new()
