@@ -6,15 +6,41 @@
 //! the rest are known by their words; anything else is XX000 (internal_error), as in Postgres.
 
 /// The SQLSTATE of an error.
-#[cfg(feature = "server")]
 pub fn of(e: &anyhow::Error) -> &'static str {
+    #[cfg(feature = "server")]
     if let Some(v) = e.chain().find_map(|c| c.downcast_ref::<crate::views::Violation>()) {
         return v.1; // check_violation (a table's CHECK, a view's expectation), or an enum's invalid_text_representation
     }
     if let Some(c) = e.chain().find_map(|c| c.downcast_ref::<Coded>()) {
         return c.0;
     }
-    by_words(&crate::ext::said(e))
+    #[cfg(feature = "server")]
+    let text = crate::ext::said(e); // (the node's words: files by their SQL names, a Python routine's lines cut)
+    #[cfg(not(feature = "server"))]
+    let text = words(e);
+    by_words(&text)
+}
+
+/// An error in words: its causes after it, each said once, DataFusion's and Arrow's labels taken off (a node adds
+/// its own: `ext::said`).
+pub fn words(e: &anyhow::Error) -> String {
+    let mut out = String::new();
+    for c in e.chain().map(|c| c.to_string()) {
+        // Unwrap DataFusion's and Arrow's wrappers, repeatedly, so the inner message — the part a
+        // user can act on — leads, not an engine-internal label.
+        let mut c = c;
+        while let Some(inner) = ["External error: ", "Error during planning: ", "Arrow error: ", "Execution error: "]
+            .iter()
+            .find_map(|p| c.strip_prefix(p))
+        {
+            c = inner.to_string();
+        }
+        if !out.contains(c.trim()) {
+            out += if out.is_empty() { "" } else { ": " };
+            out += &c;
+        }
+    }
+    out
 }
 
 /// An error that says its own SQLSTATE.
@@ -166,7 +192,9 @@ mod tests {
         assert_eq!(of("type \"mood\" does not exist"), "42704");
         assert_eq!(of("cannot drop type mood because column t.m uses it"), "2BP01");
         assert_eq!(of("cannot drop type mood because columns use it: a.m, b.n; drop or change them first"), "2BP01");
+        #[cfg(feature = "server")]
         assert_eq!(of(crate::cluster::CUT_OFF_SAYS), "57P03");
+        #[cfg(feature = "server")]
         assert_eq!(of(crate::store::CATCHING_UP), "57P03");
         assert_eq!(of("error sending request for url (http://10.0.0.2:8080/cluster/commit)"), "58030");
         assert_eq!(of("cannot insert a non-DEFAULT value into column \"id\" of t: it is an identity column defined as GENERATED ALWAYS"), "428C9");
@@ -177,7 +205,9 @@ mod tests {
         assert_eq!(super::of(&super::coded("40001", "could not serialize access due to concurrent update")), "40001");
         assert_eq!(super::of(&super::coded("3D000", "no database x (CREATE DATABASE x)")), "3D000"); // (USE of a database that isn't there)
         assert_eq!(super::named("invalid_catalog_name"), Some("3D000"));
+        #[cfg(feature = "server")]
         assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("new row for relation \"t\" violates check constraint \"c\"".into(), "23514"))), "23514");
+        #[cfg(feature = "server")]
         assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("invalid input value for enum mood: \"x\"".into(), "22P02"))), "22P02");
         // (a lock refusal a follower reads back as words keeps its code: "canceling statement" is a cancel, 57014, otherwise)
         assert_eq!(of("the leader at http://10.0.0.1:8080: canceling statement due to lock timeout"), "55P03");

@@ -212,22 +212,7 @@ fn located(l: &str) -> Result<String> {
 /// An error in words for whoever sent the statement: its causes after it, each said once
 /// (DataFusion repeats a cause's words in its own), files named as SQL named them.
 pub fn said(e: &anyhow::Error) -> String {
-    let mut out = String::new();
-    for c in e.chain().map(|c| c.to_string()) {
-        // Unwrap DataFusion's and Arrow's wrappers, repeatedly, so the inner message — the part a
-        // user can act on — leads, not an engine-internal label.
-        let mut c = c;
-        while let Some(inner) = ["External error: ", "Error during planning: ", "Arrow error: ", "Execution error: "]
-            .iter()
-            .find_map(|p| c.strip_prefix(p))
-        {
-            c = inner.to_string();
-        }
-        if !out.contains(c.trim()) {
-            out += if out.is_empty() { "" } else { ": " };
-            out += &c;
-        }
-    }
+    let out = crate::codes::words(e);
     match crate::auth::shows_code() {
         true => readable(&out),
         false => crate::python::unquoted(&readable(&out)), // (a Python routine's lines, quoted wherever its batch ran: S27)
