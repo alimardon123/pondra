@@ -2216,6 +2216,7 @@ dependencies = [
  "datafusion-spark",
  "flate2",
  "futures",
+ "glob",
  "lru",
  "lz4_flex",
  "parquet",

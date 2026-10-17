@@ -37,6 +37,7 @@ pub fn mentions(sql: &str) -> bool {
 pub(crate) const CSV_OPTIONS: &[&str] = &["header", "delim", "sep", "delimiter", "quote", "escape", "comment", "new_line"];
 /// The options every listing of files takes, on a node.
 const LISTING_OPTIONS: &[&str] = &["hive_partitioning", "hive_types", "union_by_name", "columns"];
+
 /// The table a reference to files is: `'s3://…/x.parquet'` or `'sales/*.csv'` (a URL or a path,
 /// its format by extension), or `read_parquet(…)`, `read_csv(…)`, `read_json(…)`, `read_delta(…)`,
 /// `read_iceberg(…)` with URLs or paths and DuckDB's options by name. Pondra's names come first;

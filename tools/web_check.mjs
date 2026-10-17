@@ -33,7 +33,10 @@ const CASES = [
     'id,run\n1,5\n2,12\n3,21\n'],
   ['syntax error', 'POST', '/sql', 'SELEC 1', 400, '42601', undefined],
   ['DDL refused', 'POST', '/sql', 'CREATE TABLE t (a INT)', undefined, '0A000', undefined],
+  ['a file by name', 'POST', '/sql?format=csv', "SELECT sum(qty) AS s FROM 'orders.csv'", 200, null, 's\n21\n'],
+  ['a glob', 'POST', '/sql?format=csv', "SELECT count(*) AS n FROM 'order*.csv'", 200, null, 'n\n3\n'],
   ['tables', 'GET', '/tables', undefined, 200, null, '["names","orders"]'],
+  ['files', 'GET', '/files', undefined, 200, null, '["names.csv","orders.csv"]'],
   ['unknown route', 'GET', '/nowhere', undefined, 404, '0A000', undefined],
 ];
 
