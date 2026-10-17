@@ -11,9 +11,9 @@ use crate::pg_types::names_kept;
 use crate::types::json_refusal;
 use datafusion::arrow::array::{ArrayRef, ListArray, StringArray, StructArray};
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use datafusion::arrow::datatypes::{DataType, Field, Fields};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields};
 use datafusion::execution::FunctionRegistry;
-use datafusion::logical_expr::{ScalarUDF, Signature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{self, Expr, FunctionArg, LimitClause, Query, Select, SetExpr, Statement, TableAlias, TableAliasColumnDef, TableFactor};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -68,10 +68,24 @@ pub fn register(ctx: &SessionContext) {
     for set in SETS.iter() {
         ctx.register_udf(set.udf());
     }
+    // The library's scalar json_object_keys is DuckDB's json_keys, and Postgres's json_object_keys is the set-returning
+    // one above. DataFusion's deregister also drops a function's aliases, so the scalar is renamed rather than aliased.
     if let Ok(keys) = ctx.state().udf("json_object_keys") {
-        ctx.register_udf(keys.as_ref().clone().with_aliases(["json_keys"]));
+        ctx.deregister_udf("json_object_keys");
+        ctx.register_udf(ScalarUDF::new_from_impl(JsonKeys(keys.as_ref().clone())));
     }
-    ctx.deregister_udf("json_object_keys");
+}
+
+/// The library's `json_object_keys`, under the name `json_keys` (DuckDB's name for it, with the same arguments).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonKeys(ScalarUDF);
+
+impl ScalarUDFImpl for JsonKeys {
+    fn name(&self) -> &str { "json_keys" }
+    fn signature(&self) -> &Signature { self.0.signature() }
+    fn return_type(&self, arg_types: &[DataType]) -> datafusion::error::Result<DataType> { self.0.return_type(arg_types) }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> datafusion::error::Result<FieldRef> { self.0.return_field_from_args(args) }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> { self.0.invoke_with_args(args) }
 }
 
 impl Set {
@@ -181,9 +195,10 @@ fn texts_array(rows: &[Option<Vec<Option<String>>>]) -> anyhow::Result<ArrayRef>
 /// The `(key, value)` rows of each document as a list of structs per document.
 fn pairs_array(rows: &[Option<Vec<(String, Option<String>)>>]) -> anyhow::Result<ArrayRef> {
     let lengths: Vec<Option<usize>> = rows.iter().map(|r| r.as_ref().map(Vec::len)).collect();
-    let pairs = rows.iter().flatten().flatten();
-    let keys = StringArray::from_iter_values(pairs.clone().map(|(key, _)| key.as_str()));
-    let values = StringArray::from_iter(pairs.map(|(_, value)| value.clone()));
+    // Collected first: arrow's from_iter_values needs an iterator with a known length.
+    let pairs: Vec<&(String, Option<String>)> = rows.iter().flatten().flatten().collect();
+    let keys = StringArray::from_iter_values(pairs.iter().map(|(key, _)| key.as_str()));
+    let values = StringArray::from_iter(pairs.iter().map(|(_, value)| value.clone()));
     let fields = pair_fields();
     let items = StructArray::try_new(fields.clone(), vec![Arc::new(keys), Arc::new(values)], None)?;
     list_of(Field::new_list_field(DataType::Struct(fields), true), Arc::new(items), &lengths)
@@ -688,6 +703,16 @@ mod tests {
     }
 
     fn refusal(sql: &str) -> String { rewritten(sql).expect_err("refused").to_string() }
+
+    /// The library's scalar is `json_keys` now, and `json_object_keys` names only the set-returning function here.
+    #[test]
+    fn json_keys_is_the_scalar_under_its_own_name() {
+        let mut ctx = SessionContext::new();
+        datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register");
+        register(&ctx);
+        assert!(ctx.state().udf("json_keys").is_ok());
+        assert!(ctx.state().udf("json_object_keys").is_err());
+    }
 
     #[test]
     fn select_items_unnest_their_rows() {
