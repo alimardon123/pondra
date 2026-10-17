@@ -163,7 +163,7 @@ fn as_of(sql: &str) -> Cow<'_, str> {
 
 /// `pondra_at(t, version => …)` in a FROM: the table of `t` as it was, by its own name. Ok(false):
 /// not one.
-pub fn table_factor(lake: &Lake, t: &mut ast::TableFactor) -> Result<bool> {
+pub fn table_factor(lake: &str, t: &mut ast::TableFactor) -> Result<bool> {
     let ast::TableFactor::Table { name, args: Some(args), .. } = t else { return Ok(false) };
     if crate::write::object(name) != "pondra_at" {
         return Ok(false);
@@ -175,7 +175,7 @@ pub fn table_factor(lake: &Lake, t: &mut ast::TableFactor) -> Result<bool> {
         Some(ast::Expr::CompoundIdentifier(parts)) => parts.iter().map(crate::write::ident).collect::<Vec<_>>().join("."),
         _ => bail!("{shape}: after a table's name"),
     };
-    let table = crate::ddl::local(lake, &table).ok_or_else(|| anyhow!("{table} AT (…): only this lake's tables are read as they were (ask a node of that lake)"))?;
+    let table = crate::ddl::local_in(lake, &table).ok_or_else(|| anyhow!("{table} AT (…): only this lake's tables are read as they were (ask a node of that lake)"))?;
     ensure!(a.given.len() == 1 && a.named.len() == 1 && ["version", "timestamp", "offset"].contains(&a.named[0].0.as_str()), "{shape}");
     let (at, expr) = (a.named[0].0.clone(), a.named[0].1.to_string());
     let spec = B64.encode(serde_json::to_vec(&Spec { table, at, expr })?);

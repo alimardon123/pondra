@@ -304,7 +304,7 @@ async fn schema_in(lake: &Lake, db: &str, s: &str) -> Result<()> {
     Err(coded("3F000", format!("no schema {s} in {db} (CREATE SCHEMA {s})")))
 }
 
-/// `sql` read as statements, with the past's and DuckDB's forms first (as `expand_with` reads them).
+/// `sql` read as statements, with the past's and DuckDB's forms first (as `front::expand` reads them).
 fn parse_text(sql: &str) -> Option<Vec<Statement>> {
     let sql = crate::past::syntax(sql);
     let sql = crate::friendly::text(&sql).ok()?;
@@ -352,7 +352,7 @@ fn pick<'a>(path: &'a Path, w: &World, fam: Fam, n: &str, creating: bool) -> Opt
     }
 }
 
-/// Statements sqlparser doesn't read, or that `expand_with` answers before it parses: the head,
+/// Statements sqlparser doesn't read, or that `front::expand` answers before it parses: the head,
 /// the family of the name after it, and whether that name is made here.
 type Head = (Regex, Fam, bool);
 

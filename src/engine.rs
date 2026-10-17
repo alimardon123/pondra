@@ -1,0 +1,295 @@
+//! The session every query starts from, in every build: DataFusion's, with Pondra's rules, planners and the
+//! functions that need no lake (Spark's, JSON's, `sum` over DOUBLE, …). A node adds its own (`Lake::made`); a page
+//! uses it as it is, so both plan a query alike (designs/l2-b4-front-and-web.md).
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, Int64Array, StringArray, UnionArray};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion::common::config::ConfigOptions;
+use datafusion::common::{exec_err, Result};
+use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::SessionStateBuilder;
+use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult};
+use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
+use datafusion::logical_expr::sort_properties::{ExprProperties, SortProperties};
+use datafusion::logical_expr::{ColumnarValue, Documentation, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
+use datafusion::prelude::{create_udf, SessionConfig, SessionContext};
+use std::sync::Arc;
+
+/// The session every query starts from: DataFusion's, with Pondra's rules and planners, and the functions
+/// that need no lake. `Lake::made` adds the node's own.
+pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
+    let config = crate::optimize::config(config.with_information_schema(true));
+    let state = SessionStateBuilder::new().with_config(config).with_runtime_env(rt).with_default_features();
+    let mut state = state.with_analyzer_rules(crate::optimize::analyzer_rules()).with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
+    state.expr_planners().get_or_insert_with(Vec::new).insert(0, substrings()); // (SUBSTRING of bytes too)
+    state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::intervals::planner()); // (n * INTERVAL '37 seconds')
+    let mut ctx = SessionContext::new_with_state(state.build());
+    // format_string, pmod, parse_url, …
+    spark(&ctx); // (first: Spark's set is worked out against DataFusion's names alone)
+    datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
+    ctx.register_udf(JSON_TEXT.as_ref().clone()); // pondra_json_text(x): a union (json_get's answer) as its text
+    crate::asof::register(&ctx); // (ASOF JOIN's marker)
+    crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
+    crate::avg::register(&ctx); // avg(DECIMAL): rounded at its last place
+    crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
+    crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
+    crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
+    // `octet_length` is for text; bytes have their own (DataFusion's other byte functions —
+    // sha256, md5, encode, decode — take BINARY as they are; substr is below).
+    let bytes = |args: &[ColumnarValue]| {
+        let arrays: Vec<ArrayRef> = args.iter().map(|a| match a {
+            ColumnarValue::Array(a) => Ok(a.clone()),
+            ColumnarValue::Scalar(s) => s.to_array(),
+        }).collect::<Result<_>>()?;
+        let binary = datafusion::arrow::compute::cast(&arrays[0], &DataType::Binary)?;
+        let binary = binary.as_binary::<i32>();
+        let lengths = (0..binary.len()).map(|i| binary.is_valid(i).then(|| binary.value(i).len() as i64));
+        Ok(ColumnarValue::Array(Arc::new(lengths.collect::<Int64Array>())))
+    };
+    ctx.register_udf(create_udf("byte_length", vec![DataType::Binary], DataType::Int64, Volatility::Immutable, Arc::new(bytes)));
+    ctx.register_udf(substr().as_ref().clone());
+    ctx
+}
+
+/// Spark's functions whose names DataFusion doesn't have (`format_string`, `pmod`, `parse_url`,
+/// `sha2`, `collect_list`, …: PySpark's vocabulary in SQL). Where both have a name, DataFusion's
+/// stays, so no answer changes, and Spark's is there under a name of its own (`spark_floor`):
+/// `spark_sql('…')` calls it where Spark SQL names `floor` (`sparksql.rs`).
+fn spark(ctx: &SessionContext) {
+    let more = SPARK.get_or_init(|| spark_of(ctx));
+    more.scalar.iter().chain(&more.shared).for_each(|f| { ctx.register_udf(f.clone()); });
+    more.aggregate.iter().for_each(|f| { ctx.register_udaf(f.clone()); });
+}
+
+pub struct Spark {
+    scalar: Vec<datafusion::logical_expr::ScalarUDF>,
+    aggregate: Vec<datafusion::logical_expr::AggregateUDF>,
+    shared: Vec<datafusion::logical_expr::ScalarUDF>, // (Spark's of the names both have, renamed)
+    pub names: std::collections::HashMap<String, String>, // a name both have (or its alias) → Spark's here
+}
+
+static SPARK: std::sync::OnceLock<Spark> = std::sync::OnceLock::new();
+
+/// Spark's functions as every session has them (worked out once, against the first session's
+/// names: DataFusion's own, nothing else yet).
+pub fn spark_functions() -> &'static Spark {
+    SPARK.get_or_init(|| spark_of(&SessionContext::new()))
+}
+
+fn spark_of(ctx: &SessionContext) -> Spark {
+    use datafusion::execution::FunctionRegistry;
+    let new = |name: &str, aliases: &[String]| std::iter::once(name).chain(aliases.iter().map(String::as_str)).all(|n| ctx.udf(n).is_err() && ctx.udaf(n).is_err() && ctx.udwf(n).is_err());
+    let (scalar, shared): (Vec<_>, Vec<_>) = datafusion_spark::all_default_scalar_functions().into_iter().partition(|f| new(f.name(), f.aliases()));
+    let aggregate = datafusion_spark::all_default_aggregate_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
+    let names = shared.iter().flat_map(|f| std::iter::once(f.name().to_string()).chain(f.aliases().iter().cloned()).map(|n| (n, format!("spark_{}", f.name())))).collect();
+    Spark {
+        scalar: scalar.iter().map(|f| f.as_ref().clone()).collect(),
+        aggregate: aggregate.map(|f| f.as_ref().clone()).collect(),
+        shared: shared.iter().map(renamed).collect(),
+        names,
+    }
+}
+
+/// Spark's version of a function DataFusion has too, under a name of its own (`spark_floor`):
+/// everything as Spark's, but the name.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Renamed {
+    name: String,
+    inner: Arc<ScalarUDF>,
+}
+
+fn renamed(f: &Arc<ScalarUDF>) -> ScalarUDF {
+    ScalarUDF::new_from_impl(Renamed { name: format!("spark_{}", f.name()), inner: f.clone() })
+}
+
+impl ScalarUDFImpl for Renamed {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        self.inner.signature()
+    }
+    fn return_type(&self, types: &[DataType]) -> datafusion::common::Result<DataType> {
+        self.inner.return_type(types)
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> datafusion::common::Result<FieldRef> {
+        self.inner.return_field_from_args(args)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::common::Result<ColumnarValue> {
+        self.inner.invoke_with_args(args)
+    }
+    fn coerce_types(&self, types: &[DataType]) -> datafusion::common::Result<Vec<DataType>> {
+        self.inner.coerce_types(types)
+    }
+    fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> datafusion::common::Result<ExprSimplifyResult> {
+        self.inner.simplify(args, info)
+    }
+    fn short_circuits(&self) -> bool {
+        self.inner.short_circuits()
+    }
+    fn output_ordering(&self, inputs: &[ExprProperties]) -> datafusion::common::Result<SortProperties> {
+        self.inner.output_ordering(inputs)
+    }
+    fn with_updated_config(&self, config: &ConfigOptions) -> Option<ScalarUDF> {
+        let f = Arc::new(self.inner.inner().with_updated_config(config)?);
+        Some(ScalarUDF::new_from_impl(Renamed { name: self.name.clone(), inner: f }))
+    }
+    fn documentation(&self) -> Option<&Documentation> {
+        self.inner.documentation()
+    }
+}
+
+/// `pondra_json_text(x)`: a union (what `json_get` answers: a number, a string, a list…) as the text
+/// of its value, which `->>` gives too. JSON, CSV, Parquet and the Postgres port can't write a union.
+pub static JSON_TEXT: std::sync::LazyLock<Arc<ScalarUDF>> = std::sync::LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(JsonText(Signature::any(1, Volatility::Immutable)))));
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonText(Signature);
+
+impl ScalarUDFImpl for JsonText {
+    fn name(&self) -> &str { "pondra_json_text" }
+    fn signature(&self) -> &Signature { &self.0 }
+    fn return_type(&self, _: &[DataType]) -> datafusion::error::Result<DataType> { Ok(DataType::Utf8) }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        use datafusion::arrow::array::Array;
+        let array = args.args[0].to_array(args.number_rows)?;
+        let Some(union) = array.as_any().downcast_ref::<UnionArray>() else {
+            return Err(datafusion::error::DataFusionError::Execution("pondra_json_text takes a union".into()));
+        };
+        Ok(ColumnarValue::Array(Arc::new(union_text(union)?)))
+    }
+}
+
+/// One union column's text: each row's value in the child its type id selects, NULL where that
+/// value is NULL or the child is of type Null. Sparse and dense unions alike (`value_offset`).
+fn union_text(u: &UnionArray) -> datafusion::arrow::error::Result<StringArray> {
+    use datafusion::arrow::array::Array;
+    use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
+    use std::collections::{hash_map::Entry, HashMap};
+    let options = FormatOptions::default();
+    let mut formats: HashMap<i8, ArrayFormatter<'_>> = HashMap::new(); // (one per child, made when first asked)
+    let mut out: Vec<Option<String>> = Vec::with_capacity(u.len());
+    for i in 0..u.len() {
+        let id = u.type_id(i);
+        let child = u.child(id);
+        let at = u.value_offset(i);
+        if child.data_type() == &DataType::Null || child.is_null(at) {
+            out.push(None);
+            continue;
+        }
+        let format = match formats.entry(id) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => v.insert(ArrayFormatter::try_new(child.as_ref(), &options)?),
+        };
+        out.push(Some(format.value(at).to_string()));
+    }
+    Ok(StringArray::from(out))
+}
+
+/// `substr` and `SUBSTRING(… FROM … FOR …)` for bytes and text: planned here, ahead of
+/// DataFusion's own planner, which knows only the text one.
+fn substrings() -> Arc<dyn ExprPlanner> {
+    Arc::new(Substrings)
+}
+
+#[derive(Debug)]
+struct Substrings;
+
+impl ExprPlanner for Substrings {
+    fn plan_substring(&self, args: Vec<Expr>) -> Result<PlannerResult<Vec<Expr>>> {
+        Ok(PlannerResult::Planned(substr().call(args)))
+    }
+}
+
+fn substr() -> Arc<ScalarUDF> {
+    static SUBSTR: std::sync::LazyLock<Arc<ScalarUDF>> = std::sync::LazyLock::new(|| {
+        let signature = Signature::user_defined(Volatility::Immutable).with_parameter_names(vec!["str", "start_pos", "length"]).expect("names"); // (DataFusion's: `substr(str => …, start_pos => …)`)
+        Arc::new(ScalarUDF::new_from_impl(Substr { text: datafusion::functions::unicode::substr(), signature }))
+    });
+    SUBSTR.clone()
+}
+
+/// `substr(bytes, from [, count])` on BINARY, 1-based like the text one; text goes to DataFusion's.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Substr {
+    text: Arc<ScalarUDF>,
+    signature: Signature,
+}
+
+fn bytes(t: &DataType) -> bool {
+    matches!(t, DataType::Binary | DataType::LargeBinary | DataType::BinaryView | DataType::FixedSizeBinary(_))
+}
+
+impl ScalarUDFImpl for Substr {
+    fn name(&self) -> &str {
+        "substr"
+    }
+    fn aliases(&self) -> &[String] {
+        self.text.aliases()
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn coerce_types(&self, types: &[DataType]) -> Result<Vec<DataType>> {
+        match types {
+            [b, rest @ ..] if bytes(b) && (1..=2).contains(&rest.len()) => Ok([DataType::Binary].into_iter().chain(rest.iter().map(|_| DataType::Int64)).collect()),
+            _ => {
+                let fields: Vec<_> = types.iter().map(|t| Arc::new(Field::new("a", t.clone(), true))).collect();
+                Ok(datafusion::logical_expr::type_coercion::functions::fields_with_udf(&fields, self.text.as_ref())?.iter().map(|f| f.data_type().clone()).collect())
+            }
+        }
+    }
+    fn return_type(&self, types: &[DataType]) -> Result<DataType> {
+        if types.first().is_some_and(bytes) { Ok(DataType::Binary) } else { self.text.return_type(types) }
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if !args.args.first().is_some_and(|a| bytes(&a.data_type())) {
+            return self.text.invoke_with_args(args);
+        }
+        let n = args.number_rows;
+        let arrays: Vec<ArrayRef> = args.args.iter().map(|a| a.to_array(n)).collect::<Result<_>>()?;
+        let (b, from) = (arrays[0].as_binary::<i32>(), arrays[1].as_primitive::<datafusion::arrow::datatypes::Int64Type>());
+        let count = arrays.get(2).map(|c| c.as_primitive::<datafusion::arrow::datatypes::Int64Type>());
+        let mut out = BinaryBuilder::new();
+        for i in 0..n {
+            if b.is_null(i) || from.is_null(i) || count.is_some_and(|c| c.is_null(i)) {
+                out.append_null();
+                continue;
+            }
+            let (v, start) = (b.value(i), from.value(i));
+            // As SQL's: characters before position 1 count against the length.
+            let end = match count {
+                Some(c) if c.value(i) < 0 => return exec_err!("negative substring length not allowed"),
+                Some(c) => start.saturating_add(c.value(i)),
+                None => i64::MAX,
+            };
+            let (lo, hi) = (start.max(1) - 1, (end - 1).clamp(0, v.len() as i64));
+            out.append_value(if lo < hi { &v[lo as usize..hi as usize] } else { &[][..] });
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::util::display::array_value_to_string;
+
+    /// A session answers as a node's does: one value per query, from the functions the session has.
+    #[tokio::test]
+    async fn a_session_answers_as_a_node() {
+        let ctx = session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let cases = [
+            ("SELECT pmod(-7, 3)", "2"),
+            ("SELECT sum(x) FROM (VALUES (CAST('1e16' AS DOUBLE)), (CAST('1' AS DOUBLE)), (CAST('-1e16' AS DOUBLE))) t(x)", "1.0"), // (a plain sum gives 0)
+            ("SELECT byte_length(X'010203')", "3"),
+            ("SELECT avg(x) FROM (VALUES (CAST(1 AS DECIMAL(10,2))), (2), (2)) t(x)", "1.666667"),
+            ("SELECT '{\"a\": 7}' ->> 'a'", "7"),
+            ("SELECT encode(substring(X'0102030405' FROM 2 FOR 2), 'hex')", "0203"),
+        ];
+        for (sql, want) in cases {
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            let got = array_value_to_string(batches[0].column(0), 0).unwrap();
+            assert_eq!(got, want, "{sql}");
+        }
+    }
+}

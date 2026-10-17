@@ -11,7 +11,7 @@ publish = false # (not on crates.io yet: pip and npm carry the binary)
 default = ["server"]
 # A node: the catalog in the bucket, the doors (HTTP, Postgres, Kafka, Flight), the cluster and the
 # command line. Without it the library is the parts a browser build shares (`src/lib.rs`).
-server = ["dep:http", "dep:slatedb", "dep:reqwest", "dep:tokio", "dep:axum", "dep:toml", "dep:uuid", "dep:clap", "dep:mimalloc",
+server = ["dep:http", "dep:slatedb", "dep:reqwest", "tokio/full", "dep:axum", "dep:toml", "dep:uuid", "dep:clap", "dep:mimalloc",
           "dep:chrono-tz", "dep:postgres-types", "dep:pgwire", "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:zstd",
           "dep:object_store", "dep:object_store_df", "dep:glob", "dep:aws-lc-rs", "dep:tokio-rustls",
           "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tikv-jemallocator", "dep:tower", "dep:http-body-util", "dep:moka"]
@@ -33,7 +33,7 @@ slatedb = { version = "0.16", default-features = false, features = ["aws", "moka
 moka = { version = "0.12.8", features = ["future"], optional = true } # (the catalog's block caches, as slatedb's own over the same moka, saying what they hold: `store::blocks`)
 arrow-ipc = { version = "59", features = ["zstd"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"], optional = true }
-tokio = { version = "1", features = ["full"], optional = true }
+tokio = { version = "1", features = ["sync"] } # (asof.rs's OnceCell in every build; `server` adds the rest: "tokio/full")
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", default-features = false, features = ["util"], optional = true } # (a library's request handed to the router: `library.rs`; already built for axum)
 http-body-util = { version = "0.1", optional = true } # (a body capped at a size: Flight's calls before their caller signs in; already built for axum)

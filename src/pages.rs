@@ -1,5 +1,5 @@
 //! An answer's other pages (ADR-034, round 29). The console is sent an answer's first 10,000 rows
-//! (`server::typed`), and the answer is kept here a while, under the id it is sent with, so its
+//! (`answer::typed`), and the answer is kept here a while, under the id it is sent with, so its
 //! other pages, and a download of every row, come from it: the same rows, in the same order,
 //! without running it again.
 //! Answers are kept within `PONDRA_PAGES_MB` (256) in all, for 20 minutes after they were last

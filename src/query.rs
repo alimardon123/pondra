@@ -5,9 +5,9 @@
 //! of each key (sum, min, max).
 use crate::store::*;
 use anyhow::{bail, Result};
-use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, UInt64Array, UnionArray};
+use datafusion::arrow::array::{ArrayRef, Int64Array, UInt64Array};
 use datafusion::common::Column;
-use datafusion::logical_expr::{ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
+use datafusion::logical_expr::Expr;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{MemTable, TableProvider};
@@ -36,14 +36,6 @@ pub fn dtype(t: &str) -> Result<DataType> {
             _ => t.parse::<DataType>().map_err(|e| anyhow::anyhow!("unknown column type {t}: {e}"))?,
         },
     })
-}
-
-/// The name a table's columns record a type under (what `dtype` reads back).
-pub fn type_name(t: &DataType) -> String {
-    match crate::write::stored(t) {
-        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => format!("{}[]", type_name(f.data_type())),
-        t => t.to_string(),
-    }
 }
 
 /// A table's columns as queries read them: strings as views (Utf8View), so scans don't copy them
@@ -100,15 +92,7 @@ pub fn strict(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
     Ok(datafusion::arrow::compute::cast_with_options(&c, t, &options)?)
 }
 
-/// A time of day without seconds (`'2024-05-01 10:30'`, `'…T10:30+02'`), with them (`10:30:00`):
-/// Postgres, DuckDB, Snowflake and Spark read the first as the second; Arrow's parser wants the
-/// seconds. None: `s` is something else, left as it is.
-pub fn seconds(s: &str) -> Option<String> {
-    static HHMM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"^(\s*\d{4}-\d{1,2}-\d{1,2}[T ]\d{1,2}:\d{2})(\s*(?:[Zz]|[+-]\d{1,2}(?::?\d{2})?|[A-Za-z][\w/+-]*)?\s*)$").expect("a regex")
-    });
-    HHMM.captures(s).map(|c| format!("{}:00{}", &c[1], &c[2]))
-}
+pub use crate::optimize::seconds;
 
 /// Text meant as timestamps, the ones without seconds given them (`seconds`).
 fn with_seconds(c: &ArrayRef) -> Result<ArrayRef> {
@@ -856,62 +840,7 @@ fn keep_held(held: MemoryReservation) {
 /// The memory of the answer a request kept, for the body that sends it (`server::answer`).
 pub fn take_held() -> Option<MemoryReservation> { HELD.try_with(|h| h.borrow_mut().take()).ok().flatten() }
 
-/// Batches as an Arrow IPC stream.
-pub fn ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
-    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
-    let mut w = datafusion::arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &schema)?;
-    batches.iter().try_for_each(|b| w.write(&compact(b.clone())))?;
-    w.finish()?;
-    Ok(w.into_inner()?)
-}
-
-/// A batch whose string and binary views are copied out of buffers that mostly hold other rows'
-/// strings: those a filter, a limit or a slice kept a few rows of (decoded pages, a whole
-/// group's keys, the batch a shuffle cut it from). Arrow IPC sends every buffer a view points
-/// into, and a batch kept in memory holds them: a 10-row answer of ClickBench's was 220 MB.
-pub fn compact(b: RecordBatch) -> RecordBatch {
-    use datafusion::arrow::array::{Array, AsArray};
-    fn wasteful(held: &[datafusion::arrow::buffer::Buffer], used: usize) -> bool { held.iter().map(|b| b.len()).sum::<usize>() > 2 * used + (8 << 10) }
-    let lean = |c: &ArrayRef| -> Option<ArrayRef> {
-        match c.data_type() {
-            DataType::Utf8View => Some(c.as_string_view()).filter(|v| wasteful(v.data_buffers(), v.total_buffer_bytes_used())).map(|v| Arc::new(v.gc()) as ArrayRef),
-            DataType::BinaryView => Some(c.as_binary_view()).filter(|v| wasteful(v.data_buffers(), v.total_buffer_bytes_used())).map(|v| Arc::new(v.gc()) as ArrayRef),
-            _ => None,
-        }
-    };
-    let leaner: Vec<Option<ArrayRef>> = b.columns().iter().map(lean).collect();
-    if leaner.iter().all(Option::is_none) {
-        return b;
-    }
-    let columns = leaner.into_iter().zip(b.columns()).map(|(l, c)| l.unwrap_or_else(|| c.clone())).collect();
-    RecordBatch::try_new_with_options(b.schema(), columns, &datafusion::arrow::array::RecordBatchOptions::new().with_row_count(Some(b.num_rows()))).unwrap_or(b)
-}
-
-/// `pondra_json_text(x)`: a union (what `json_get` answers: a number, a string, a list…) as the text
-/// of its value, which `->>` gives too. JSON, CSV, Parquet and the Postgres port can't write a union.
-static JSON_TEXT: std::sync::LazyLock<Arc<ScalarUDF>> = std::sync::LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(JsonText(Signature::any(1, Volatility::Immutable)))));
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct JsonText(Signature);
-
-impl ScalarUDFImpl for JsonText {
-    fn name(&self) -> &str { "pondra_json_text" }
-    fn signature(&self) -> &Signature { &self.0 }
-    fn return_type(&self, _: &[DataType]) -> datafusion::error::Result<DataType> { Ok(DataType::Utf8) }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        use datafusion::arrow::array::Array;
-        let array = args.args[0].to_array(args.number_rows)?;
-        let Some(union) = array.as_any().downcast_ref::<UnionArray>() else {
-            return Err(datafusion::error::DataFusionError::Execution("pondra_json_text takes a union".into()));
-        };
-        Ok(ColumnarValue::Array(Arc::new(union_text(union)?)))
-    }
-}
-
-/// Registers `pondra_json_text` in a session (`store.rs`, `made`).
-pub fn register_json_text(ctx: &SessionContext) {
-    ctx.register_udf(JSON_TEXT.as_ref().clone());
-}
+pub use crate::answer::{compact, ipc, type_name};
 
 /// A query's union columns planned as their text: every door plans through `sql`, so its schema,
 /// its rows and a table made of it all say Utf8. A query with no union column is returned as it is.
@@ -925,38 +854,12 @@ fn text_unions(df: datafusion::dataframe::DataFrame) -> datafusion::error::Resul
         .map(|(qualifier, f)| {
             let column = Expr::Column(Column::from((qualifier, f)));
             match f.data_type() {
-                DataType::Union(..) => JSON_TEXT.call(vec![column]).alias_qualified(qualifier.cloned(), f.name()), // (a join's two of one name stay two)
+                DataType::Union(..) => crate::engine::JSON_TEXT.call(vec![column]).alias_qualified(qualifier.cloned(), f.name()), // (a join's two of one name stay two)
                 _ => column,
             }
         })
         .collect();
     df.select(exprs)
-}
-
-/// One union column's text: each row's value in the child its type id selects, NULL where that
-/// value is NULL or the child is of type Null. Sparse and dense unions alike (`value_offset`).
-fn union_text(u: &UnionArray) -> datafusion::arrow::error::Result<StringArray> {
-    use datafusion::arrow::array::Array;
-    use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
-    use std::collections::{hash_map::Entry, HashMap};
-    let options = FormatOptions::default();
-    let mut formats: HashMap<i8, ArrayFormatter<'_>> = HashMap::new(); // (one per child, made when first asked)
-    let mut out: Vec<Option<String>> = Vec::with_capacity(u.len());
-    for i in 0..u.len() {
-        let id = u.type_id(i);
-        let child = u.child(id);
-        let at = u.value_offset(i);
-        if child.data_type() == &DataType::Null || child.is_null(at) {
-            out.push(None);
-            continue;
-        }
-        let format = match formats.entry(id) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(v) => v.insert(ArrayFormatter::try_new(child.as_ref(), &options)?),
-        };
-        out.push(Some(format.value(at).to_string()));
-    }
-    Ok(StringArray::from(out))
 }
 
 /// An Arrow IPC stream's batches (none for no bytes).

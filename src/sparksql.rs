@@ -4,20 +4,14 @@
 //! view) is Pondra's SQL as everywhere else. What it turns: `"text"` (a string in Spark),
 //! `a DIV b`, `<=>`, `!`, `RLIKE`, `LATERAL VIEW [OUTER] explode(…)` and `explode` itself, and the
 //! functions both have with Spark's answers (`floor` a BIGINT, `substring`, `round`, …): Spark's
-//! own, registered in every session as `spark_floor`, … (`store::spark`), so DataFusion's answers
+//! own, registered in every session as `spark_floor`, … (`engine::spark`), so DataFusion's answers
 //! never change outside it (invariant 190). Backticks are names in Pondra's SQL too.
 use anyhow::{bail, ensure, Context, Result};
-use datafusion::arrow::datatypes::{DataType, FieldRef};
-use datafusion::common::config::ConfigOptions;
-use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
-use datafusion::logical_expr::sort_properties::{ExprProperties, SortProperties};
-use datafusion::logical_expr::{ColumnarValue, Documentation, Expr as DfExpr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature};
 use datafusion::sql::sqlparser::ast::{self, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, TableFactor, UnaryOperator, VisitMut, VisitorMut};
 use datafusion::sql::sqlparser::dialect::{GenericDialect, SparkSqlDialect};
 use datafusion::sql::sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::Arc;
 
 /// Does this SQL name `spark_sql`? (A word match: `inline` parses only what does.)
 pub fn mentions(sql: &str) -> bool {
@@ -99,7 +93,7 @@ pub fn query(text: &str) -> Result<ast::Query> {
     let mut stmts = Parser::parse_sql(&SparkSqlDialect {}, text).context("Spark SQL")?;
     ensure!(stmts.len() == 1, "spark_sql takes one query, not {}", stmts.len());
     let ast::Statement::Query(mut q) = stmts.remove(0) else { bail!("spark_sql takes a query (SELECT, WITH, VALUES): other statements are Pondra's SQL") };
-    let mut t = Turn { names: &crate::store::spark_functions().names };
+    let mut t = Turn { names: &crate::engine::spark_functions().names };
     if let ControlFlow::Break(e) = q.visit(&mut t) {
         return Err(e);
     }
@@ -276,55 +270,6 @@ fn lateral(s: &mut ast::Select, views: &mut HashMap<String, String>) -> Result<(
         *rel = TableFactor::Derived { lateral: false, subquery: Box::new(inner), alias: Some(ast::TableAlias { explicit: true, name: alias.clone(), columns: vec![], at: None }), sample: None };
     }
     Ok(())
-}
-
-/// Spark's version of a function DataFusion has too, under a name of its own (`spark_floor`):
-/// everything as Spark's, but the name.
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct Renamed {
-    name: String,
-    inner: Arc<ScalarUDF>,
-}
-
-pub fn renamed(f: &Arc<ScalarUDF>) -> ScalarUDF {
-    ScalarUDF::new_from_impl(Renamed { name: format!("spark_{}", f.name()), inner: f.clone() })
-}
-
-impl ScalarUDFImpl for Renamed {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn signature(&self) -> &Signature {
-        self.inner.signature()
-    }
-    fn return_type(&self, types: &[DataType]) -> datafusion::common::Result<DataType> {
-        self.inner.return_type(types)
-    }
-    fn return_field_from_args(&self, args: ReturnFieldArgs) -> datafusion::common::Result<FieldRef> {
-        self.inner.return_field_from_args(args)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::common::Result<ColumnarValue> {
-        self.inner.invoke_with_args(args)
-    }
-    fn coerce_types(&self, types: &[DataType]) -> datafusion::common::Result<Vec<DataType>> {
-        self.inner.coerce_types(types)
-    }
-    fn simplify(&self, args: Vec<DfExpr>, info: &SimplifyContext) -> datafusion::common::Result<ExprSimplifyResult> {
-        self.inner.simplify(args, info)
-    }
-    fn short_circuits(&self) -> bool {
-        self.inner.short_circuits()
-    }
-    fn output_ordering(&self, inputs: &[ExprProperties]) -> datafusion::common::Result<SortProperties> {
-        self.inner.output_ordering(inputs)
-    }
-    fn with_updated_config(&self, config: &ConfigOptions) -> Option<ScalarUDF> {
-        let f = Arc::new(self.inner.inner().with_updated_config(config)?);
-        Some(ScalarUDF::new_from_impl(Renamed { name: self.name.clone(), inner: f }))
-    }
-    fn documentation(&self) -> Option<&Documentation> {
-        self.inner.documentation()
-    }
 }
 
 #[cfg(test)]
