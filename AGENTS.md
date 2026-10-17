@@ -2193,7 +2193,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    an UPDATE's and a MERGE's rows too: `change::part`), so a key an `ON CONFLICT` or a MERGE checks is
    the key written. Spark's and Polars' names cut it toward zero, as those tools do: a session in Spark's
    dialect (`Rounds` puts `pondra_truncate` there instead), `spark_sql('…')`'s casts and `DIV` (`sparksql`),
-   and the frames' casts to an integer (`cast_sql`, `castSql`: Python's and JavaScript's write the same
+   and the frames' casts to an integer (`_cast_sql`, `castSql`: Python's and JavaScript's write the same
    text). `harness.py found`: "a cast of a decimal to an integer rounds…"; `pkey`: "a MERGE that
    compares a key in another type…" (a MERGE wrote 7002.5 as 7002, an INSERT as 7003); `sparksql`: the
    casts that cut; `frames_check.py`: a frame's casts == Polars.

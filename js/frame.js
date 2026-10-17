@@ -80,7 +80,7 @@ export function sqlType(t) {
 }
 
 // A cast to one of these drops a fraction toward zero, as Polars and PySpark cast (`pondra_truncate`); SQL's
-// own CAST rounds it (invariant 293). The same text as Python's `cast_sql`.
+// own CAST rounds it (invariant 293). The same text as Python's `_cast_sql`.
 const INTEGER_SQL = new Set(["TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT"]);
 
 /** `x` cast to the SQL type `t` (from `sqlType`): an integer type truncates, any other is a plain CAST. */
