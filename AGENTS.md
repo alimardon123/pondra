@@ -2197,9 +2197,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    text). `harness.py found`: "a cast of a decimal to an integer rounds…"; `pkey`: "a MERGE that
    compares a key in another type…" (a MERGE wrote 7002.5 as 7002, an INSERT as 7003); `sparksql`: the
    casts that cut; `frames_check.py`: a frame's casts == Polars.
-294. **A loop a lake starts holds it weakly** (`Lake::commits`, `Hot::watch`): the catalog's writes and
-   their durability upgrade a `Weak<Lake>` for each write, the hot columns' watch a `Weak<Hot>` each
-   round, and each ends when what it holds is gone. The writes' sender is the lake's own
+294. **A loop a lake starts holds it weakly** (`Lake::commits`, `oom::gives_back`): the catalog's writes and
+   their durability upgrade a `Weak<Lake>` for each write, the memory watch each lake's `Weak<Hot>` at each
+   look, and each ends when what it holds is gone. The writes' sender is the lake's own
    (`Catalog::writes`), so a loop holding the lake strongly kept a lake a process opened to write (a
    backup taken in it: `backup::take_here`) for the process's life, its catalog never closed.
    `cargo test --lib store::tests::a_lake_opened_to_write_goes`.
@@ -2798,7 +2798,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    calls, bulk writes and live queries are never stopped. A pool wrapper that looked only when asked found 1.8–1.9 GB
    already resident (parked). `harness.py scale`: "a query the pool doesn't see grow (array_agg over 30M rows) is
    stopped at the node's memory line (53200)…" (a 1 GB line: peak 1,072 MB; 2.1 GB without; looking every second
-   below half the line and stopping only after a second, CI's runner reached 1.75 GB).
+   below half the line and stopping only after a second, CI's runner reached 1.75 GB). The same one watch gives the
+   hot columns back first, past seven tenths of the line (`oom::trim_line`; three fifths of the machine's memory where
+   there is no line), and the cache loads only while the node is under that (`Hot::room_for`), since a column can be
+   decoded again and a query can't. A request takes the watch's last reading as it starts (`oom::seen`), never reads
+   the process itself. `harness.py hot`: "under a memory line below three fifths of RAM, the hot columns are let go
+   before a query is stopped".
 418. **A table read cold tells the planner its columns' distinct values, as one read hot does** (`hot::told`): the
    cold branch of `HotFiles::scan` gives its Parquet scan's statistics, and each file group's, the catalog's distinct
    counts (`Known`, from the table's sketch and ranges), where the footers have none. DataFusion bounds a GROUP BY's
