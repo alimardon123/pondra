@@ -31,7 +31,8 @@ use datafusion::logical_expr::{ColumnarValue, Expr, LogicalPlan, ReturnFieldArgs
 use datafusion::optimizer::analyzer::AnalyzerRule;
 use datafusion::prelude::SessionContext;
 use jiter::{Jiter, Peek};
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 /// Adds the functions to a session. `pg_json::register` calls it, so they are in every session.
@@ -697,16 +698,16 @@ pub(crate) const MAX_DEPTH: usize = 10_000;
 
 /// `json` read into a tree (`jsonb_text` writes it). Refused as Postgres refuses it: 22P02 for text that isn't JSON,
 /// 54001 past `MAX_DEPTH` levels.
-pub(crate) fn parse(json: &str) -> Result<Node> {
+pub(crate) fn parse(json: &str) -> Result<Node<'_>> {
     depth_check(json)?;
     read_whole(json).ok_or_else(|| fail(coded("22P02", json_refusal(json))))
 }
 
 /// The one value `json` holds, and nothing after it. None where it isn't JSON.
-fn read_whole(json: &str) -> Option<Node> {
+fn read_whole(json: &str) -> Option<Node<'_>> {
     let mut jiter = Jiter::new(json.as_bytes());
     let peek = jiter.peek().ok()?;
-    let node = read(&mut jiter, peek)?;
+    let node = read(json, &mut jiter, peek)?;
     jiter.finish().ok()?;
     Some(node)
 }
@@ -739,62 +740,96 @@ pub(crate) fn depth_check(json: &str) -> Result<()> {
     Ok(())
 }
 
-/// A JSON value as jsonb keeps it. An object's members are ordered by their key's length, then its bytes.
+/// A JSON value as jsonb keeps it, borrowing from the document it was read from: a number as written, a text as written
+/// when it has no escape (`Cow::Borrowed`), an object's members in jsonb's order (`in_jsonb_order`).
 #[derive(Clone)]
-pub(crate) enum Node {
+pub(crate) enum Node<'a> {
     Null,
     Bool(bool),
-    Number(String),
-    Text(String),
-    List(Vec<Node>),
-    Object(BTreeMap<(usize, String), Node>),
+    Number(&'a str),
+    Text(Cow<'a, str>),
+    List(Vec<Node<'a>>),
+    Object(Vec<(Cow<'a, str>, Node<'a>)>),
 }
 
-/// The value at the reader's place, whose first byte is `peek`.
-fn read(jiter: &mut Jiter, peek: Peek) -> Option<Node> {
+/// The value at the reader's place, whose first byte is `peek`. `doc` is the text `jiter` reads, so a value's text is
+/// borrowed from it: the reader's index before a string or a number is the token's first byte (`peek` moved it there).
+fn read<'a>(doc: &'a str, jiter: &mut Jiter, peek: Peek) -> Option<Node<'a>> {
     Some(if peek == Peek::Null {
         jiter.known_null().ok()?;
         Node::Null
     } else if peek == Peek::True || peek == Peek::False {
         Node::Bool(jiter.known_bool(peek).ok()?)
     } else if peek == Peek::String {
-        Node::Text(jiter.known_str().ok()?.to_string())
+        let at = jiter.current_index();
+        Node::Text(as_written(doc, at, jiter.known_str().ok()?))
     } else if peek == Peek::Array {
-        Node::List(list_of(jiter)?)
+        Node::List(list_of(doc, jiter)?)
     } else if peek == Peek::Object {
-        Node::Object(object_of_json(jiter)?)
+        Node::Object(object_of_json(doc, jiter)?)
     } else {
-        Node::Number(number_text(jiter, peek)?)
+        Node::Number(number_text(doc, jiter, peek)?)
     })
 }
 
-fn list_of(jiter: &mut Jiter) -> Option<Vec<Node>> {
+/// A string token as the document has it: borrowed when no escape is in it (the text between its quotes), else
+/// `decoded`. `at` is the reader's index before the token; the token's opening quote is the next `"` from there.
+fn as_written<'a>(doc: &'a str, at: usize, decoded: &str) -> Cow<'a, str> {
+    let rest = doc.get(at..).unwrap_or("");
+    let Some(open) = rest.find('"') else { return Cow::Owned(decoded.to_string()) };
+    let text = &rest[open + 1..];
+    match text.find(['"', '\\']) {
+        Some(end) if text.as_bytes()[end] == b'"' => Cow::Borrowed(&text[..end]),
+        _ => Cow::Owned(decoded.to_string()),
+    }
+}
+
+fn list_of<'a>(doc: &'a str, jiter: &mut Jiter) -> Option<Vec<Node<'a>>> {
     let mut items = Vec::new();
     let mut next = jiter.known_array().ok()?;
     while let Some(peek) = next {
-        items.push(read(jiter, peek)?);
+        items.push(read(doc, jiter, peek)?);
         next = jiter.array_step().ok()?;
     }
     Some(items)
 }
 
-/// An object's members, the last of each duplicate key kept.
-fn object_of_json(jiter: &mut Jiter) -> Option<BTreeMap<(usize, String), Node>> {
-    let mut members = BTreeMap::new();
-    let mut key = jiter.known_object().ok()?.map(str::to_string);
+/// An object's members in jsonb's order: each key's text as written, with its value read after it.
+fn object_of_json<'a>(doc: &'a str, jiter: &mut Jiter) -> Option<Vec<(Cow<'a, str>, Node<'a>)>> {
+    let mut members = Vec::new();
+    let at = jiter.current_index();
+    let mut key = jiter.known_object().ok()?.map(|name| as_written(doc, at, name));
     while let Some(name) = key {
         let peek = jiter.peek().ok()?;
-        let value = read(jiter, peek)?;
-        members.insert((name.len(), name), value);
-        key = jiter.next_key().ok()?.map(str::to_string);
+        members.push((name, read(doc, jiter, peek)?));
+        let at = jiter.current_index();
+        key = jiter.next_key().ok()?.map(|name| as_written(doc, at, name));
     }
+    in_jsonb_order(&mut members);
     Some(members)
 }
 
-/// A number's text as the document has it (never through f64).
-fn number_text(jiter: &mut Jiter, peek: Peek) -> Option<String> {
-    let bytes = jiter.known_number_bytes(peek).ok()?;
-    std::str::from_utf8(bytes).ok().map(str::to_string)
+/// Puts an object's members in jsonb's order, each key once: by `order`, the last of a duplicate kept. Reversed, a
+/// stable sort puts a duplicate's last member first, so the dedup (which keeps the first of a run) keeps that one.
+pub(crate) fn in_jsonb_order<'a>(members: &mut Vec<(Cow<'a, str>, Node<'a>)>) {
+    members.reverse();
+    members.sort_by(|a, b| order(&a.0, &b.0));
+    members.dedup_by(|a, b| a.0 == b.0);
+}
+
+/// jsonb's order of two keys: the shorter first, then by bytes.
+fn order(a: &str, b: &str) -> Ordering { (a.len(), a.as_bytes()).cmp(&(b.len(), b.as_bytes())) }
+
+/// Where `key` is among an object's members in jsonb's order: `Ok` at its own place, `Err` at the place it goes.
+pub(crate) fn find(members: &[(Cow<'_, str>, Node<'_>)], key: &str) -> std::result::Result<usize, usize> {
+    members.binary_search_by(|(name, _)| order(name, key))
+}
+
+/// A number's text as the document has it (never through f64): from the reader's index before it to the index after.
+fn number_text<'a>(doc: &'a str, jiter: &mut Jiter, peek: Peek) -> Option<&'a str> {
+    let at = jiter.current_index();
+    jiter.known_number_bytes(peek).ok()?;
+    doc.get(at..jiter.current_index())
 }
 
 /// jsonb's text for a tree: `[1, 2]`, `{"a": 1, "bb": 2}`, strings escaped as `value` escapes them. None where a number
@@ -817,7 +852,7 @@ pub(crate) fn write(out: &mut String, node: &Node) -> Option<()> {
         }
         Node::Object(members) => {
             out.push('{');
-            for (k, ((_, name), item)) in members.iter().enumerate() {
+            for (k, (name, item)) in members.iter().enumerate() {
                 if k > 0 {
                     out.push_str(", ");
                 }
@@ -954,6 +989,26 @@ mod tests {
         assert_eq!(jsonb_text(r#"{"b":{}, "a":[]}"#).unwrap(), r#"{"a": [], "b": {}}"#);
         assert_eq!(jsonb_text("{}").unwrap(), "{}");
         assert_eq!(jsonb_text("[]").unwrap(), "[]");
+    }
+
+    #[test]
+    fn a_duplicate_key_keeps_its_last_value_in_jsonb_order() {
+        assert_eq!(jsonb_text(r#"{"ab":1,"ab":2}"#).unwrap(), r#"{"ab": 2}"#);
+        assert_eq!(jsonb_text(r#"{"é":1,"ab":2}"#).unwrap(), r#"{"ab": 2, "é": 1}"#);
+        assert_eq!(jsonb_text(r#"{"k\"x":1,"aé":2}"#).unwrap(), r#"{"aé": 2, "k\"x": 1}"#);
+    }
+
+    #[test]
+    fn values_keep_their_escapes_as_jsonb_writes_them() {
+        assert_eq!(jsonb_text(r#"{"a":"x\"y\/zé"}"#).unwrap(), r#"{"a": "x\"y/zé"}"#);
+        assert_eq!(jsonb_text(r#"{"a":"\\"}"#).unwrap(), r#"{"a": "\\"}"#);
+        assert_eq!(jsonb_text(r#"{"a":"é/"}"#).unwrap(), r#"{"a": "é/"}"#);
+        assert_eq!(jsonb_text(r#"{"a":"Aé\n"}"#).unwrap(), r#"{"a": "Aé\n"}"#);
+    }
+
+    #[test]
+    fn exponent_numbers_are_written_as_numeric_prints_them() {
+        assert_eq!(jsonb_text("[1e2, 1.5E-3, -2.50e+1, 1.0e0, 0.5e-1, 12e0]").unwrap(), "[100, 0.0015, -25.0, 1.0, 0.05, 12]");
     }
 
     #[test]

@@ -8,7 +8,7 @@
 use crate::codes::coded;
 use crate::pg_catalog::{function, marked, texts_out};
 use crate::pg_json::{index_of, is_integer, lists};
-use crate::pg_json_make::{depth_check, fail, json_string, parse, refuse, write, Node};
+use crate::pg_json_make::{depth_check, fail, find, in_jsonb_order, json_string, parse, refuse, write, Node};
 use crate::types::json_refusal;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringArray};
 use datafusion::arrow::compute::cast;
@@ -18,7 +18,7 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{ScalarUDF, Signature, TypeSignature, Volatility};
 use datafusion::prelude::SessionContext;
 use jiter::{Jiter, Peek};
-use std::collections::BTreeMap;
+use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 
 /// The functions this file makes; `pg_json` finds the ones its operators call here too.
@@ -57,7 +57,7 @@ fn set_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
         let (Some(doc), Some(path), Some(value), Some(create)) = (text_at(docs, i), &paths[i], text_at(values, i), create[i]) else {
             return Ok(None);
         };
-        edit_doc(doc, path, &Edit::Set { value: parse(value)?, create }).map(Some)
+        edit_doc(doc, path, Edit::Set { value: parse(value)?, create }).map(Some)
     })
 }
 
@@ -72,7 +72,7 @@ fn insert_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
         let (Some(doc), Some(path), Some(value), Some(after)) = (text_at(docs, i), &paths[i], text_at(values, i), after[i]) else {
             return Ok(None);
         };
-        edit_doc(doc, path, &Edit::Insert { value: parse(value)?, after }).map(Some)
+        edit_doc(doc, path, Edit::Insert { value: parse(value)?, after }).map(Some)
     })
 }
 
@@ -122,7 +122,7 @@ fn delete_path_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
     let docs = docs.as_string::<i32>();
     let paths = lists(&a[1]).map_err(fail)?;
     rows(n, |i| match (text_at(docs, i), &paths[i]) {
-        (Some(doc), Some(path)) => edit_doc(doc, path, &Edit::Delete).map(Some),
+        (Some(doc), Some(path)) => edit_doc(doc, path, Edit::Delete).map(Some),
         _ => Ok(None),
     })
 }
@@ -166,48 +166,41 @@ fn rows(n: usize, row: impl Fn(usize) -> Result<Option<String>>) -> Result<Array
 // ---- the changes, on one document's text: each returns the answer's text ----
 
 /// What a path does to the value it reaches.
-enum Edit {
+enum Edit<'a> {
     /// `jsonb_set`: replaces the value, or makes it at a new member (or at a position past an array's end) when `create`.
-    Set { value: Node, create: bool },
+    Set { value: Node<'a>, create: bool },
     /// `jsonb_insert`: a new member, or an element before (or after) the position named.
-    Insert { value: Node, after: bool },
+    Insert { value: Node<'a>, after: bool },
     /// `jsonb_delete_path`: what the path reaches goes.
     Delete,
 }
 
-impl Edit {
-    /// The edit at a member named `key` of an object.
-    fn in_object(&self, members: &mut BTreeMap<(usize, String), Node>, key: (usize, String)) -> Result<()> {
-        match self {
-            Edit::Set { value, create } => {
-                if let Some(slot) = members.get_mut(&key) {
-                    *slot = value.clone();
-                } else if *create {
-                    members.insert(key, value.clone());
-                }
+impl<'a> Edit<'a> {
+    /// The edit at a member named `key` of an object. The member's place is found in jsonb's order; a new one goes there.
+    fn in_object(self, members: &mut Vec<(Cow<'a, str>, Node<'a>)>, key: &str) -> Result<()> {
+        match (self, find(members, key)) {
+            (Edit::Set { value, .. }, Ok(at)) => members[at].1 = value,
+            (Edit::Set { value, create: true }, Err(at)) => members.insert(at, (Cow::Owned(key.to_string()), value)),
+            (Edit::Set { .. }, Err(_)) => {}
+            (Edit::Insert { .. }, Ok(_)) => return Err(refuse("22023", "cannot replace existing key")),
+            (Edit::Insert { value, .. }, Err(at)) => members.insert(at, (Cow::Owned(key.to_string()), value)),
+            (Edit::Delete, Ok(at)) => {
+                members.remove(at);
             }
-            Edit::Insert { value, .. } => {
-                if members.contains_key(&key) {
-                    return Err(refuse("22023", "cannot replace existing key"));
-                }
-                members.insert(key, value.clone());
-            }
-            Edit::Delete => {
-                members.remove(&key);
-            }
+            (Edit::Delete, Err(_)) => {}
         }
         Ok(())
     }
 
     /// The edit at element `raw` of an array (a negative one counts from the end).
-    fn in_list(&self, items: &mut Vec<Node>, raw: i64) -> Result<()> {
+    fn in_list(self, items: &mut Vec<Node<'a>>, raw: i64) -> Result<()> {
         match self {
             Edit::Set { value, create } => match position(items.len(), raw) {
-                Some(at) => items[at] = value.clone(),
-                None if *create => items.insert(insert_point(items.len(), raw, false), value.clone()),
+                Some(at) => items[at] = value,
+                None if create => items.insert(insert_point(items.len(), raw, false), value),
                 None => {}
             },
-            Edit::Insert { value, after } => items.insert(insert_point(items.len(), raw, *after), value.clone()),
+            Edit::Insert { value, after } => items.insert(insert_point(items.len(), raw, after), value),
             Edit::Delete => {
                 if let Some(at) = position(items.len(), raw) {
                     items.remove(at);
@@ -220,7 +213,7 @@ impl Edit {
 
 /// The document with `edit` made at `path`. An empty path is the document itself (as jsonb writes it); a path that
 /// reaches nothing leaves it as it is. A path into a scalar, and a NULL step, are refused.
-fn edit_doc(doc: &str, path: &[Option<String>], edit: &Edit) -> Result<String> {
+fn edit_doc<'a>(doc: &'a str, path: &[Option<String>], edit: Edit<'a>) -> Result<String> {
     let mut root = parse(doc)?;
     let steps = path_steps(path)?;
     if steps.is_empty() {
@@ -234,26 +227,26 @@ fn edit_doc(doc: &str, path: &[Option<String>], edit: &Edit) -> Result<String> {
     text_of(&root)
 }
 
-/// The path's steps as text. A NULL step is refused, as Postgres refuses it (22004).
-fn path_steps(path: &[Option<String>]) -> Result<Vec<String>> {
+/// The path's steps as text, borrowed from the path. A NULL step is refused, as Postgres refuses it (22004).
+fn path_steps(path: &[Option<String>]) -> Result<Vec<&str>> {
     path.iter()
         .enumerate()
-        .map(|(k, step)| step.clone().ok_or_else(|| refuse("22004", format!("path element at position {} is null", k + 1))))
+        .map(|(k, step)| step.as_deref().ok_or_else(|| refuse("22004", format!("path element at position {} is null", k + 1))))
         .collect()
 }
 
 /// The edit at the end of `path` below `node`. A step that reaches nothing (a missing member, an index past an array's
 /// end, a scalar on the way) changes nothing; an array's step that isn't an integer is refused.
-fn walk(node: &mut Node, path: &[String], edit: &Edit) -> Result<()> {
+fn walk<'a>(node: &mut Node<'a>, path: &[&str], edit: Edit<'a>) -> Result<()> {
     let Some((step, rest)) = path.split_first() else { return Ok(()) };
     match node {
         Node::Object(members) => {
             if rest.is_empty() {
-                return edit.in_object(members, (step.len(), step.clone()));
+                return edit.in_object(members, step);
             }
-            match members.get_mut(&(step.len(), step.clone())) {
-                Some(child) => walk(child, rest, edit),
-                None => Ok(()),
+            match find(members, step) {
+                Ok(at) => walk(&mut members[at].1, rest, edit),
+                Err(_) => Ok(()),
             }
         }
         Node::List(items) => {
@@ -298,10 +291,12 @@ fn insert_point(len: usize, raw: i64, after: bool) -> usize {
 /// anything else takes it as one element; anything else makes a two-element array.
 fn concat(left: &str, right: &str) -> Result<String> { text_of(&concat_nodes(parse(left)?, parse(right)?)) }
 
-fn concat_nodes(left: Node, right: Node) -> Node {
+fn concat_nodes<'a>(left: Node<'a>, right: Node<'a>) -> Node<'a> {
     match (left, right) {
         (Node::Object(mut a), Node::Object(b)) => {
+            // (the right side's members come last, so they win the dedup: jsonb's order is put back after the join)
             a.extend(b);
+            in_jsonb_order(&mut a);
             Node::Object(a)
         }
         (Node::List(mut a), Node::List(b)) => {
@@ -326,8 +321,8 @@ fn concat_nodes(left: Node, right: Node) -> Node {
 fn delete_keys(doc: &str, keys: &[&str]) -> Result<String> {
     let mut node = parse(doc)?;
     match &mut node {
-        Node::Object(members) => members.retain(|key, _| !keys.contains(&key.1.as_str())),
-        Node::List(items) => items.retain(|item| !matches!(item, Node::Text(s) if keys.contains(&s.as_str()))),
+        Node::Object(members) => members.retain(|(key, _)| !keys.contains(&&**key)),
+        Node::List(items) => items.retain(|item| !matches!(item, Node::Text(s) if keys.contains(&&**s))),
         _ => return Err(refuse("22023", "cannot delete from scalar")),
     }
     text_of(&node)
@@ -350,19 +345,27 @@ fn delete_index(doc: &str, at: i64) -> Result<String> {
 }
 
 /// `jsonb_strip_nulls`: the document with every object member whose value is null left out (array elements stay).
-fn strip_nulls(doc: &str) -> Result<String> { text_of(&without_nulls(parse(doc)?)) }
+fn strip_nulls(doc: &str) -> Result<String> {
+    let mut node = parse(doc)?;
+    without_nulls(&mut node);
+    text_of(&node)
+}
 
-fn without_nulls(node: Node) -> Node {
+/// Takes the null members out of every object, in place; a list's nulls stay.
+fn without_nulls(node: &mut Node) {
     match node {
-        Node::Object(members) => Node::Object(
-            members
-                .into_iter()
-                .filter(|(_, value)| !matches!(value, Node::Null))
-                .map(|(key, value)| (key, without_nulls(value)))
-                .collect(),
-        ),
-        Node::List(items) => Node::List(items.into_iter().map(without_nulls).collect()),
-        other => other,
+        Node::Object(members) => {
+            members.retain(|(_, value)| !matches!(value, Node::Null));
+            for (_, value) in members.iter_mut() {
+                without_nulls(value);
+            }
+        }
+        Node::List(items) => {
+            for item in items.iter_mut() {
+                without_nulls(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -453,7 +456,7 @@ fn pretty_into(out: &mut String, node: &Node, depth: usize) -> Option<()> {
         }
         Node::Object(members) => {
             out.push('{');
-            for (k, ((_, name), item)) in members.iter().enumerate() {
+            for (k, (name, item)) in members.iter().enumerate() {
                 out.push_str(if k == 0 { "\n" } else { ",\n" });
                 indent(out, depth + 1);
                 json_string(out, name);
@@ -502,11 +505,11 @@ mod tests {
         }
     }
 
-    fn set(doc: &str, at: &str, value: &str, create: bool) -> Result<String> { edit_doc(doc, &path(at), &Edit::Set { value: parse(value)?, create }) }
+    fn set(doc: &str, at: &str, value: &str, create: bool) -> Result<String> { edit_doc(doc, &path(at), Edit::Set { value: parse(value)?, create }) }
 
-    fn insert(doc: &str, at: &str, value: &str, after: bool) -> Result<String> { edit_doc(doc, &path(at), &Edit::Insert { value: parse(value)?, after }) }
+    fn insert(doc: &str, at: &str, value: &str, after: bool) -> Result<String> { edit_doc(doc, &path(at), Edit::Insert { value: parse(value)?, after }) }
 
-    fn delete_at(doc: &str, at: &str) -> Result<String> { edit_doc(doc, &path(at), &Edit::Delete) }
+    fn delete_at(doc: &str, at: &str) -> Result<String> { edit_doc(doc, &path(at), Edit::Delete) }
 
     fn strip_json_text(doc: &str) -> String { strip_json(doc).unwrap() }
 
@@ -605,6 +608,13 @@ mod tests {
         assert_eq!(refused(delete_at("[1]", "{a}")), "22P02", "a key on an array");
         assert_eq!(refused(delete_at("1", "{0}")), "22023", "a scalar");
         assert_eq!(refused(delete_at(r#"{"a":[1]}"#, "{NULL}")), "22004", "a NULL path element");
+    }
+
+    #[test]
+    fn edits_and_concat_keep_jsonb_order_for_keys_of_every_length() {
+        assert_eq!(set(r#"{"ccc":1,"a":2,"bb":3}"#, "{bb}", "9", true).unwrap(), r#"{"a": 2, "bb": 9, "ccc": 1}"#);
+        assert_eq!(set(r#"{"ccc":1,"a":2,"bb":3}"#, "{dd}", "9", true).unwrap(), r#"{"a": 2, "bb": 3, "dd": 9, "ccc": 1}"#);
+        assert_eq!(concat(r#"{"a":1,"b":2}"#, r#"{"b":3,"a":4}"#).unwrap(), r#"{"a": 4, "b": 3}"#, "the right side's members win");
     }
 
     #[test]
