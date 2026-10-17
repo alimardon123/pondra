@@ -701,6 +701,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    lead` of their own (hidden), which leads for a moment, once, and ends. That lake's catalog writer would
    otherwise stay open in the node, and its next leader would fence it. (No test catches the
    stray writer yet; `smoke.py`'s `CREATE DATABASE` and `harness.py changes` run the path.)
+   BACKUP of a lake held in memory runs in the process holding it (`backup::take_here`): a `pondra lead` can't
+   reach `memory://`. It claims a term with no address, as a one-off writer does, and closes the backup's
+   catalog on every path. `harness.py memorylake`: "BACKUP of a lake in memory runs in this process…".
 63. **DataFusion settings that have their own switches are changed through `set`**
    (`enable_dynamic_filter_pushdown`): assigning the umbrella field left the joins' own switch on,
    and a changed table's anti-join, planned with its dynamic filter built, failed when the query
@@ -2310,6 +2313,26 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    library's dynamic symbols (only its ABI defined but a dependency's C API, nothing needed unversioned).
    A node in a library prints nothing when all goes well: a slow statement too goes only to `pondra.history`
    (`history::ended`; `inprocess_check.py` p).
+308. **A lake held in memory keeps its catalog there and its bulk on disk past its budget, and none of it
+   outlives the lake** (`memory::Held`): past `PONDRA_MEMORY_LAKE_GB` its new `data/` and `log/` objects go
+   to `pondra-memory-{uid}/{pid}-{hex}` (0700, a lock file held), under `PONDRA_CACHE_DIR`, else the
+   temporary directory unless that is tmpfs, else the user's cache folder. An object is in one tier only:
+   writing it to one takes the other's copy away. The folder goes when the lake is let go, and one whose
+   lock is free is swept by the next spill. A spilled file is read in pieces of 8 MB, each one blocking
+   call (a file's own stream reads 8 KB a call: 1.4x slower). `cargo test --lib memory::`; TPC-H SF5 in a
+   2.5 GB container loads and answers (the build before was killed).
+309. **A lake moves whole or not at all** (`memory::set_location`, `settle`, `node::Move`): `ALTER DATABASE
+   … SET LOCATION` copies every object while the node serves; then its host drains and stops the node,
+   copies again what changed by e-tag and takes away what went, and only then lets the lake in memory go
+   and starts the node on the target, as a new term. A second pass that fails clears the target and starts
+   the node in memory again, saying why in `/stats` (`move_failed`) and to `db.save`. A lake a branch is
+   pinned to doesn't move. `harness.py memorylake`: "every write acknowledged is there once…", "a move
+   whose second pass fails leaves the lake in memory…".
+310. **A published Iceberg table names the place it was published from** (`iceberg::Published::location`):
+   its metadata's paths are absolute, so a lake opened anywhere else (moved, copied) forgets the state and
+   publishes it again whole. A leader publishes once at start when a published table names another place
+   (`iceberg::elsewhere`, from the catalog alone), and loads no manifests otherwise. `harness.py memorylake`:
+   "a published Iceberg table is published again at the target…".
 318. **SQL's plain INSERT never replaces a row of its key** (`constraints::key_check`, `key_check_over`,
    `txn::autocommit`, `txn::ByKey`): an INSERT without ON CONFLICT or OR REPLACE | IGNORE into a table
    with a PRIMARY KEY (not a merge table) is refused 23505, in Postgres's words, when two of its rows
