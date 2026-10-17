@@ -356,8 +356,15 @@ class _Dt:
         return Expr(f"to_char({self.e.sql}, {_literal(format)})", self.e.name)
 
     def epoch(self, time_unit="us"):
-        scale = {"s": 1, "ms": 1_000, "us": 1_000_000, "ns": 1_000_000_000}[time_unit]
-        return Expr(f"CAST(date_part('epoch', {self.e.sql}) * {scale} AS BIGINT)", self.e.name)
+        # The microseconds since 1970 in integers, then whole units floored as Polars floors them (a float would round
+        # a fraction now, `casts::Rounds`; a time before 1970 floors, not cut toward 0). A zoned time keeps its instant.
+        u = f"arrow_cast(arrow_cast({self.e.sql}, 'Timestamp(Microsecond, None)'), 'Int64')"
+        if time_unit == "us":
+            return Expr(u, self.e.name)
+        if time_unit == "ns":
+            return Expr(f"{u} * 1000", self.e.name)
+        d = {"s": 1_000_000, "ms": 1_000}[time_unit]
+        return Expr(f"({u} - (({u} % {d}) + {d}) % {d}) / {d}", self.e.name)
 
 
 def col(name):

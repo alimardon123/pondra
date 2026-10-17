@@ -35,6 +35,14 @@ import pondra
 from pondra import col, lit, when
 
 
+# Times with fractions, before and after 1970: `epoch` floors them as Polars does (a fraction is never rounded up, and
+# 1969-12-31 23:59:59.3 is -1 second, not 0). Before the frames were integers this was a float, and 0.7 s rounded to 1 s.
+TIMES = pa.table({"id": list(range(6)), "ts": pa.array([
+    dt.datetime(2024, 1, 1, 0, 0, 0, 700000), dt.datetime(2024, 1, 1, 0, 0, 0, 500),
+    dt.datetime(1969, 12, 31, 23, 59, 59, 300000), dt.datetime(1969, 12, 31, 23, 59, 59, 999500),
+    dt.datetime(1969, 12, 31, 12, 0, 0, 1), dt.datetime(1970, 1, 1)], pa.timestamp("us"))})
+
+
 def data(n=3000, seed=11):
     """Orders and users, with nulls in places, as Arrow."""
     r = random.Random(seed)
@@ -53,7 +61,7 @@ def data(n=3000, seed=11):
     quotes = pa.table({"item": [r.choice(["tea", "cake", "coffee"]) for _ in range(400)],
                        "at": sorted(t0 + dt.timedelta(seconds=r.randrange(30 * 86400)) for _ in range(400)),
                        "px": [round(r.uniform(1, 9), 2) for _ in range(400)]})
-    return {"orders": orders, "users": users, "quotes": quotes}
+    return {"orders": orders, "users": users, "quotes": quotes, "times": TIMES}
 
 
 # ---------------------------------------------------------------- 1. frames == Polars
@@ -141,6 +149,9 @@ def pipelines():
         lambda o, u, q: o.select("id", pl.col("price").round(1).alias("r"), (-pl.col("price")).abs().alias("a"), pl.col("price").sqrt().alias("s"), pl.col("price").clip(5, 30).alias("c")))
     add("SQL snippets inside frame methods", lambda c, o, u, q: o.filter("qty > 2 AND item LIKE 't%'").with_columns("qty * price AS total").group_by("item").agg("sum(total) AS revenue", "count(*) AS n"),
         lambda o, u, q: o.filter((pl.col("qty") > 2) & pl.col("item").str.starts_with("t")).with_columns((pl.col("qty") * pl.col("price")).alias("total")).group_by("item").agg(pl.col("total").sum().alias("revenue"), pl.len().cast(pl.Int64).alias("n")))
+    add("dt.epoch in s, ms and us: fractions, and before 1970 (floored)",
+        lambda c, o, u, q: c.table("times").select("id", col("ts").dt.epoch("s").alias("s"), col("ts").dt.epoch("ms").alias("ms"), col("ts").dt.epoch("us").alias("us")),
+        lambda o, u, q: pl.from_arrow(TIMES).lazy().select("id", pl.col("ts").dt.epoch("s").alias("s"), pl.col("ts").dt.epoch("ms").alias("ms"), pl.col("ts").dt.epoch("us").alias("us")))
     return P
 
 

@@ -266,7 +266,8 @@ class StrNs {
 }
 
 const UNITS = new Map(Object.entries({ us: "microsecond", ms: "millisecond", s: "second", m: "minute", h: "hour", d: "day", w: "week", mo: "month", q: "quarter", y: "year" }));
-const SCALES = new Map([["s", 1], ["ms", 1_000], ["us", 1_000_000], ["ns", 1_000_000_000]]);
+// The microseconds in one whole unit of `epoch` (`s` and `ms` are floored; `us` is itself, `ns` is 1,000 of them).
+const EPOCH_DIVISORS = new Map([["s", 1_000_000], ["ms", 1_000]]);
 
 /** `.dt`: date and time functions, with Polars' names. */
 class DtNs {
@@ -297,8 +298,14 @@ class DtNs {
   strftime(format) { return new Expr(`to_char(${this.e.sql}, ${literal(format)})`, this.e.name); }
 
   epoch(timeUnit = "us") {
-    if (!SCALES.has(timeUnit)) throw new Error(`epoch("${timeUnit}"): s, ms, us or ns`);
-    return new Expr(`CAST(date_part('epoch', ${this.e.sql}) * ${SCALES.get(timeUnit)} AS BIGINT)`, this.e.name);
+    if (!["s", "ms", "us", "ns"].includes(timeUnit)) throw new Error(`epoch("${timeUnit}"): s, ms, us or ns`);
+    // The same SQL as frame.py's: the microseconds since 1970 in integers, then whole units floored as Polars floors them
+    // (a float would round a fraction now, `casts::Rounds`; a time before 1970 floors, not cut toward 0). A zoned time keeps its instant.
+    const u = `arrow_cast(arrow_cast(${this.e.sql}, 'Timestamp(Microsecond, None)'), 'Int64')`;
+    if (timeUnit === "us") return new Expr(u, this.e.name);
+    if (timeUnit === "ns") return new Expr(`${u} * 1000`, this.e.name);
+    const d = EPOCH_DIVISORS.get(timeUnit);
+    return new Expr(`(${u} - ((${u} % ${d}) + ${d}) % ${d}) / ${d}`, this.e.name);
   }
 }
 
