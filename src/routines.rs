@@ -1068,7 +1068,10 @@ async fn prepared(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Resu
     let row = match r.params.is_empty() {
         true => RecordBatch::new_empty(Arc::new(datafusion::arrow::datatypes::Schema::empty())),
         false => {
-            let rows = app.query(&format!("SELECT {}", select.collect::<Vec<_>>().join(", ")), Some("0")).await.with_context(|| format!("{name}'s arguments"))?;
+            let about = || format!("{name}'s arguments");
+            // (made ready as SQL that comes in, as a variable's value is: a cast to jsonb or uuid is the one the lake holds)
+            let sql = prepare(&app.lake, &format!("SELECT {}", select.collect::<Vec<_>>().join(", ")), &HashMap::new(), &HashMap::new()).await.with_context(about)?;
+            let rows = app.query(&sql, Some("0")).await.with_context(about)?;
             datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?
         }
     };

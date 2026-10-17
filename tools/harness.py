@@ -16570,7 +16570,8 @@ def _jsons_w2(check, url, q, info):
         info["RETURNING with ?, ?| and -> (psycopg: rows, (name, type code) of each column)"] = got
         return all(got[sql] == want for sql, want in RETURNING.items())
 
-    # (Postgres 16's COPY of the same rows: the binary stream as bytes, the text and CSV ones as text)
+    # (Postgres 16's COPY of the same rows, the table's and the ordered query's alike: the binary stream as bytes, the text
+    # and CSV ones as text)
     BINARY = bytes.fromhex(
         "5047434f50590aff0d0a0000000000000000000005000000040000000100000009017b22"
         "61223a20317d000000157b2261223a20312c202262223a205b312c20325d7d000000106f"
@@ -16596,17 +16597,17 @@ def _jsons_w2(check, url, q, info):
     ]).encode()
 
     def binary_copy():
-        got = copied("COPY w2j TO STDOUT (FORMAT binary)")
+        got = copied("COPY (SELECT * FROM w2j ORDER BY id) TO STDOUT (FORMAT binary)")
         info["COPY … TO STDOUT (FORMAT binary): the stream, as hex, when it differs from Postgres 16's"] = None if got == BINARY else got.hex()
         return got == BINARY
 
     def text_copy():
-        got = copied("COPY w2j TO STDOUT")
+        got = copied("COPY (SELECT * FROM w2j ORDER BY id) TO STDOUT")
         info["COPY … TO STDOUT (text): the stream, when it differs from Postgres 16's"] = None if got == TEXT else got.decode(errors="replace")
         return got == TEXT
 
     def csv_copy():
-        got = copied("COPY w2j TO STDOUT (FORMAT csv, HEADER)")
+        got = copied("COPY (SELECT * FROM w2j ORDER BY id) TO STDOUT (FORMAT csv, HEADER)")
         info["COPY … TO STDOUT (csv, header): the stream, when it differs from Postgres 16's"] = None if got == CSV else got.decode(errors="replace")
         return got == CSV
 
@@ -16617,10 +16618,10 @@ def _jsons_w2(check, url, q, info):
     check("psycopg: a uuid column (u, 2950) of a WHERE on doc ?| array[...] comes as uuid, as Postgres 16 has it", uuid_others)
     check("psycopg: doc ? 'a' in the select list is named ?column? and is boolean (NULL for a NULL document), as Postgres 16 names it",
           question_name)
-    check("COPY w2j TO STDOUT (FORMAT binary): the whole stream, header and trailer included, is Postgres 16's bytes (jsonb's version "
+    check("COPY (SELECT * FROM w2j ORDER BY id) TO STDOUT (FORMAT binary), as a table's rows come in no promised order: the whole stream, header and trailer included, is Postgres 16's bytes (jsonb's version "
           "byte, uuid's 16 bytes, NULLs as -1)", binary_copy)
-    check("COPY w2j TO STDOUT (text) is Postgres 16's stream: the same values, \\N for NULLs, the same escapes", text_copy)
-    check("COPY w2j TO STDOUT (FORMAT csv, HEADER) is Postgres 16's stream: the column names, quoted fields with doubled quotes, "
+    check("COPY (… ORDER BY id) TO STDOUT (text) is Postgres 16's stream: the same values, \\N for NULLs, the same escapes", text_copy)
+    check("COPY (… ORDER BY id) TO STDOUT (FORMAT csv, HEADER) is Postgres 16's stream: the column names, quoted fields with doubled quotes, "
           "empty NULLs", csv_copy)
     check("psycopg: UPDATE, DELETE and INSERT … RETURNING with ?, ?| and -> answer Postgres 16's rows, each column named and typed "
           "as Postgres 16 has it (doc as jsonb, the operators as ?column?)", returning_forms)
