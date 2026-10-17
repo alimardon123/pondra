@@ -22684,7 +22684,7 @@ def memorylake():
 
         # A move whose second pass fails (PONDRA_CRASH=move_settle:1, a full disk's stand-in): the lake stays in memory,
         # whole, says why in /stats, and the target is left empty; db.save says so too.
-        bad = Node(":memory:", P + 4, env={**env, "PONDRA_CRASH": "move_settle:1"}).start()
+        bad = Node(":memory:", P + 4, pg=f"127.0.0.1:{P + 14}", env={**env, "PONDRA_CRASH": "move_settle:1"}).start()
         nodes.append(bad)
         sql(P + 4, "CREATE TABLE kept (v BIGINT)")
         sql(P + 4, "INSERT INTO kept VALUES (1), (2), (3)")
@@ -22703,6 +22703,12 @@ def memorylake():
         checks["a move whose second pass fails leaves the lake in memory with every row, says why in /stats, and nothing at the target"] = (
             back and bool(bad_stats.get("move_failed")) and sql(P + 4, "SELECT v FROM kept ORDER BY v") == [{"v": 1}, {"v": 2}, {"v": 3}]
             and not lake_objects(bad_target, "catalog/") and not lake_objects(bad_target, "data/") and not os.path.exists(os.path.join(bad_target, "_moving")))
+        # pondra.databases.move_failed says why at every door (M12): the same text over HTTP and over Postgres.
+        import psycopg
+        over_http = [r["move_failed"] for r in sql(P + 4, f"SELECT move_failed FROM pondra.databases WHERE name = '{bad_name}'")]
+        with psycopg.connect(f"host=127.0.0.1 port={P + 14} user=admin dbname=lake", autocommit=True) as c:  # (an open node: no password)
+            over_pg = [r[0] for r in c.execute(f"SELECT move_failed FROM pondra.databases WHERE name = '{bad_name}'").fetchall()]
+        checks["a failed move: pondra.databases.move_failed says the same over HTTP and Postgres"] = over_http == [why] and over_pg == [why]
         said = ""
         try:
             _client(P + 4).save(new_lake())

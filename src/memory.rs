@@ -792,7 +792,7 @@ pub async fn set_location(lake: &Lake, database: &str, to: &str) -> anyhow::Resu
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    Ok(serde_json::json!({"moving": to, "objects": objects, "bytes": bytes, "notice": "the node starts again on it: statements wait a moment, a Postgres connection reconnects"}))
+    Ok(serde_json::json!({"moving": to, "objects": objects, "bytes": bytes, "notice": "the node starts again on it: statements wait a moment, a Postgres connection reconnects; if the move fails, the lake stays in memory and pondra.databases.move_failed says why"}))
 }
 
 /// Copies the object at `at` from `from` to `to`, as it is. `create`: it must not be in `to` yet (pass 1,
