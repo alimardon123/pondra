@@ -63,7 +63,7 @@ enum TableSpec {
         #[serde(default)]
         enums: BTreeMap<String, crate::types::Enum>, // enum columns: the labels each takes (`types.rs`)
         #[serde(default)]
-        sql_types: BTreeMap<String, String>, // columns held as text of another SQL type: "uuid", "varchar(n)" (`types.rs`)
+        sql_types: BTreeMap<String, String>, // columns held as text of another SQL type: "uuid", "json", "jsonb", "varchar(n)" (`types.rs`)
     },
 }
 
@@ -120,9 +120,8 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         if let Some(c) = enums.keys().find(|c| !columns.iter().any(|(n, t)| n == *c && t == "Utf8")) {
             bail!("{c}: an enum column holds text (a column of the table, of type VARCHAR)");
         }
-        let held = |t: &str| t == "uuid" || crate::types::length(t).is_some();
-        if let Some((c, t)) = sql_types.iter().find(|(c, t)| !held(t) || !columns.iter().any(|(n, ty)| n == *c && ty == "Utf8")) {
-            bail!("{c} {t}: a uuid or VARCHAR(n) column holds text (a column of the table, of type VARCHAR)");
+        if let Some((c, t)) = sql_types.iter().find(|(c, t)| !crate::types::held(t) || !columns.iter().any(|(n, ty)| n == *c && ty == "Utf8")) {
+            bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text (a column of the table, of type VARCHAR)");
         }
         for (c, expr) in &defaults {
             let t = &columns.iter().find(|(n, _)| n == c).expect("a column").1;
@@ -707,7 +706,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if crate::defaults::fills_existing(c) || !matches!(crate::seq::identity_of(c), Ok(None)) => {
                 Stmt::Invalid(format!("ALTER TABLE {} ADD COLUMN {} … NOT NULL, DEFAULT or an identity: the rows already there would have no value for it (add it, then UPDATE {} SET {} = …)", a.name, c.name, a.name, c.name))
             }
-            [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => Stmt::AddColumn(object(&a.name), ident(&c.name), sql_type(&c.data_type), *if_not_exists),
+            [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => Stmt::AddColumn(object(&a.name), ident(&c.name), added_type(&c.data_type), *if_not_exists),
             // (renames, drops and types: the catalog's names change, the files never do: ADR-022)
             [ast::AlterTableOperation::RenameColumn { old_column_name: from, new_column_name: to }] => alter(&a, from, Change::Rename(ident(to))),
             [ast::AlterTableOperation::DropColumn { column_names, if_exists, .. }] => Stmt::Ddl(column_names.iter().map(|c| Ddl::AlterColumn { table: object(&a.name), column: ident(c), change: Change::Drop { if_exists: *if_exists } }).collect()),
@@ -806,6 +805,16 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     })
 }
 
+/// The type an ADD COLUMN passes on: a type the lake checks (uuid, JSON, VARCHAR(n)) keeps its own
+/// spelling, so the AddColumn branch holds it as text and records it (`types::sql_type`); any
+/// other is as DataFusion plans it (`sql_type`).
+fn added_type(t: &ast::DataType) -> String {
+    match crate::types::sql_type(t) {
+        Ok(Some(_)) => t.to_string(),
+        _ => sql_type(t),
+    }
+}
+
 /// A column type as DataFusion plans it: bytes by any of their names (`BYTEA`), and JSON kept as
 /// text (`VARIANT`, `JSON`, `JSONB`: the JSON functions read it).
 pub fn sql_type(t: &ast::DataType) -> String {
@@ -835,6 +844,19 @@ pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::Fi
     Ok(ctx.table("t").await?.schema().fields().iter().cloned().collect::<Vec<_>>())
 }
 
+/// The `sql_types` of a table made from `sql`, whose columns are `names`: the query's output columns in its order, as
+/// the table names them. Those the query takes from a uuid, json or jsonb (or a maker) keep their type, as `CREATE TABLE
+/// … AS` keeps them and a view's table does too (`pg_types::columns`). A query that gives another number of columns
+/// than `names` gives none: a type matched to the wrong name would be a guess. (A view kept as partial rows is no
+/// query's columns: its caller passes none, `finish.rs`.)
+pub async fn query_types(lake: &Lake, sql: &str, names: &[String]) -> BTreeMap<String, String> {
+    let shape = crate::pg_types::columns(lake, sql).await;
+    if shape.types.len() != names.len() {
+        return BTreeMap::new();
+    }
+    names.iter().zip(&shape.types).filter_map(|(n, t)| (*t).map(|t| (n.clone(), t.name().to_string()))).collect()
+}
+
 /// `CREATE TABLE t (a BIGINT, b VARCHAR, PRIMARY KEY (a)) [WITH (publish = 'delta,iceberg',
 /// cluster_by = 'b', merge = 'total:sum', partition_by = 'day(ts)')]` → the table name and its spec. SQL types become Arrow
 /// types the way DataFusion maps them.
@@ -862,9 +884,8 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
             let fields = crate::query::run_schema(&ctx, df.logical_plan())?.fields().iter().cloned().collect::<Vec<_>>();
             match c.columns.is_empty() {
                 true => {
-                    // (a column the query takes from a uuid is one here too: `CREATE TABLE t2 AS SELECT * FROM t`)
-                    let shape = crate::pg_types::columns(from, &sql).await;
-                    sql_types.extend(fields.iter().zip(&shape.uuids).filter(|(_, u)| **u).map(|(f, _)| (f.name().clone(), "uuid".to_string())));
+                    let names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
+                    sql_types.extend(query_types(from, &sql, &names).await);
                     fields
                 }
                 false => {

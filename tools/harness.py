@@ -37,6 +37,7 @@
   harness.py variables           DECLARE $day / $day = … from every door, a file's parameters (DECLARE PARAMETER, a .py file's cell), runs and procedures of their own
   harness.py use                 USE and SET search_path: schemas and databases, views and tasks, Postgres, Python, the shell, three nodes
   harness.py answers_big         answers in pieces: the same bytes as whole; 3M rows over 0.25 GB (53200 past it); turns (53300)
+  harness.py lateral             LATERAL over a function's rows in one pass (Postgres 16 and DuckDB's answers; three nodes; refusals)
   harness.py friendly            SQL as DuckDB's users write it (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, …) == DuckDB's answers, spread too
   harness.py unique_doors        UNIQUE through every loading door (appends, Flight, COPY): 23505 whole, retries duplicates, order, three nodes
   harness.py pkey                PRIMARY KEY: a plain INSERT of a key the table holds is refused (23505) at every SQL door; upserts and loaders still upsert
@@ -6544,6 +6545,7 @@ def temps():
     time.sleep(6.5)
     idled = _raises_text(lambda: idle.sql("SELECT * FROM soon").rows())
     checks["close() ends a session; so does idleness (PONDRA_SESSION_IDLE_SECS)"] = "picked" in closed and "soon" in idled
+    _temps_typed(checks, A.port)  # (typed columns and checks, temporary views' rewrites, a Postgres connection's uuids: Postgres 16's answers)
     [n.kill() for n in nodes]
     ok = all(checks.values())
     print(json.dumps({"temps": checks, "ok": ok}, indent=1))
@@ -6551,6 +6553,72 @@ def temps():
         print(got, before, joined, spread, cached, shadow, unseen, no_session, lake_view, mine, gone, shown, shown_pg, closed, idled)
         sys.exit(1)
     return f"temps: a session's own tables and views, every statement, on its node: all {len(checks)} checks pass"
+
+
+def _temps_typed(checks, port):
+    """A temporary table keeps its typed columns and checks every write as a lake table does (`temp::apply`, through
+    `defaults::check`, invariant 130): a JSON, JSONB, UUID or VARCHAR(n) value its column can't hold is refused by INSERT,
+    INSERT … SELECT and UPDATE with Postgres 16's SQLSTATE and words, and nothing is written; a good one reads back as
+    Postgres prints it (an upper-case uuid in lower case, JSON as written). A temporary view is read with the door's
+    rewrites, as a stored view is: its `||` over jsonb merges the objects, as Postgres does, not the two texts joined.
+    A Postgres connection's temporary table sends its uuid column as a uuid (`pg_types::of`). SHOW CREATE gives each
+    column's type. Every expected answer is Postgres 16's, from a probe of these statements on /tmp/pg16-l3."""
+    import psycopg
+    db = _client(port)
+
+    def refused(s):  # (SQLSTATE and words of the error a statement gets over HTTP; None when it is taken)
+        try:
+            db.sql(s)
+            return None
+        except Exception as e:
+            return getattr(e, "sqlstate", None), str(e)
+
+    db.sql("CREATE TEMP TABLE tdocs (doc JSONB, j JSON, u UUID, v VARCHAR(3))")
+    db.sql("INSERT INTO tdocs VALUES ('{\"a\": 1, \"b\": 2}', '[1, 2]', 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', 'abc')")
+    # (statement, Postgres's SQLSTATE, the words Postgres gives. The UPDATEs match the row: a change is checked for the rows it writes,
+    # and Postgres refuses a bad literal even when no row matches, which this check doesn't ask of Pondra)
+    cases = [
+        ("INSERT INTO tdocs (doc) VALUES ('{bad')", "22P02", "invalid input syntax for type json"),
+        ("INSERT INTO tdocs (j) VALUES ('[1,')", "22P02", "invalid input syntax for type json"),
+        ("INSERT INTO tdocs (u) VALUES ('not-a-uuid')", "22P02", 'invalid input syntax for type uuid: "not-a-uuid"'),
+        ("INSERT INTO tdocs (v) VALUES ('abcd')", "22001", "value too long for type character varying(3)"),
+        ("INSERT INTO tdocs (doc) SELECT '{bad'", "22P02", "invalid input syntax for type json"),
+        ("INSERT INTO tdocs (u) SELECT 'not-a-uuid'", "22P02", 'invalid input syntax for type uuid: "not-a-uuid"'),
+        ("INSERT INTO tdocs (v) SELECT 'abcd'", "22001", "value too long for type character varying(3)"),
+        ("UPDATE tdocs SET doc = '{bad' WHERE v = 'abc'", "22P02", "invalid input syntax for type json"),
+        ("UPDATE tdocs SET u = 'not-a-uuid' WHERE v = 'abc'", "22P02", 'invalid input syntax for type uuid: "not-a-uuid"'),
+        ("UPDATE tdocs SET v = 'abcd' WHERE v = 'abc'", "22001", "value too long for type character varying(3)"),
+    ]
+    got = [refused(s) for s, _, _ in cases]
+    refusals_ok = all(g is not None and g[0] == code and words in g[1] for g, (_, code, words) in zip(got, cases))
+    back = db.sql("SELECT doc, j, u, v FROM tdocs").rows()
+    count = db.sql("SELECT count(*) AS n FROM tdocs").rows()
+    db.sql("CREATE TEMP TABLE tjson (doc JSONB)")
+    db.sql("INSERT INTO tjson VALUES ('{\"a\": 1}'), ('{\"b\": 2, \"a\": 1}')")
+    db.sql("CREATE TEMP VIEW tcat AS SELECT doc || '{\"a\": 9}'::jsonb AS m FROM tjson")
+    merged = sorted(r["m"] for r in db.sql("SELECT m FROM tcat").rows())
+    shown = db.sql("SHOW CREATE TABLE tdocs").rows()[0]["definition"]
+    with psycopg.connect(f"host=127.0.0.1 port={port + 10} user=u dbname=lake", autocommit=True) as pg:
+        pg.execute("CREATE TEMP TABLE tport (u UUID, doc JSONB)")
+        pg.execute("INSERT INTO tport VALUES ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', '{\"a\": 1}')")
+        row = pg.execute("SELECT u, doc FROM tport").fetchone()
+        try:
+            pg.execute("INSERT INTO tport (doc) VALUES ('{bad')")
+            port_refused = None
+        except psycopg.Error as e:
+            port_refused = e.sqlstate
+    db.close()
+    info = {"refusals": got, "back": back, "count": count, "merged": merged, "shown": shown, "port": [repr(row), port_refused]}
+    checks["a temporary table's uuid, JSON, JSONB and VARCHAR(n) columns refuse what they can't hold by INSERT, INSERT … SELECT and UPDATE (Postgres's SQLSTATE and words, nothing written), and keep a good value as Postgres prints it"] = \
+        refusals_ok and back == [{"doc": '{"a": 1, "b": 2}', "j": "[1, 2]", "u": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "v": "abc"}] and count == [{"n": 1}]
+    checks["a temporary view's || over a temporary table's jsonb merges the objects, as Postgres does (not the two texts joined)"] = \
+        merged == ['{"a": 9, "b": 2}', '{"a": 9}']
+    checks["SHOW CREATE of a temporary table gives each column's own type (UUID, JSON, JSONB, VARCHAR(n))"] = \
+        all(w in shown for w in ("doc JSONB", "j JSON", "u UUID", "v VARCHAR(3)"))
+    checks["a Postgres connection's temporary table: an upper-case uuid reads back as a uuid, a bad JSON is refused 22P02"] = \
+        type(row[0]).__name__ == "UUID" and str(row[0]) == "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" and row[1] == {"a": 1} and port_refused == "22P02"
+    if not all(checks[k] for k in list(checks)[-4:]):
+        print(json.dumps(info, indent=1, default=str))
 
 
 def across():
@@ -13869,6 +13937,21 @@ def sqla():
         asked[0][1] == "42P01" and asked[2][1] == "42P01" and [list(r.values()) for r in asked[1][2]] == port_rel == [["dv", "r"]] \
         and asked[3][2] == asked[5][2] == [{"data_type": "Int32"}] and [list(r.values()) for r in asked[4][2]] == port_typ == [["integer"]] \
         and asked[6][:2] == (400, "22023")
+
+    # VARCHAR(n) in Postgres's catalog, as Postgres 16 shows it: format_type with the length (atttypmod n + 4),
+    # information_schema's lengths (bytes at UTF-8's four a character); text has none. Over the port and over HTTP.
+    q("CREATE TABLE vc (s VARCHAR(5), t TEXT)")
+    ft = "SELECT attname, format_type(atttypid, atttypmod) AS ty, atttypmod FROM pg_attribute WHERE attrelid = 'vc'::regclass AND attnum > 0 ORDER BY attnum"
+    isc = ("SELECT column_name, data_type, character_maximum_length, character_octet_length, udt_name FROM information_schema.columns "
+           "WHERE table_name = 'vc' ORDER BY ordinal_position")
+    seen = {"port": [[list(r) for r in conn.execute(s).fetchall()] for s in (ft, isc)],
+            "http": [[[r.get(c) for c in cs] for r in at(s, "postgres")[2]] for s, cs in ((ft, ("attname", "ty", "atttypmod")),
+                     (isc, ("column_name", "data_type", "character_maximum_length", "character_octet_length", "udt_name")))]}  # (the node's JSON leaves nulls out)
+    info["varchar_catalog"] = seen
+    want = [[["s", "character varying(5)", 9], ["t", "text", -1]],
+            [["s", "character varying", 5, 20, "varchar"], ["t", "text", None, 1073741824, "text"]]]
+    checks["VARCHAR(5) in Postgres's catalog as Postgres 16 shows it (format_type, atttypmod 9, information_schema's lengths), over the port and ?catalog=postgres"] = \
+        seen["port"] == seen["http"] == want
     node.kill()
 
     # A user granted one table, and another's column, sees those in Postgres's catalog and nothing else, over the
@@ -14289,6 +14372,479 @@ def remembered():
     if not ok:
         sys.exit(1)
     return f"{sum(bool(v) for v in checks.values())} of {len(checks)} remembered checks"
+
+
+def _jsonfns_spaces(check, http_answer, http_error, port_answer, conn, info):
+    """JSON's spaces in front of a document, and after it (PR #131): the expanding functions read an array or an object that
+    starts after a space, a tab or a newline as Postgres 16 reads it, json and jsonb alike, over HTTP and the port (names,
+    type codes and rows), and refuse what Postgres refuses, by its SQLSTATE and words. Each expected answer was asked of
+    Postgres 16 on the same text."""
+    CASES = [
+        ("jsonb_array_elements of a literal with a space in front: its items as jsonb", "SELECT * FROM jsonb_array_elements(' [1,2]')",
+         ['value'], [3802], [['1'], ['2']]),
+        ("jsonb_array_elements with a tab and a newline in front and a space after: the same items", "SELECT * FROM jsonb_array_elements('\t[1, 2 ]\n')",
+         ['value'], [3802], [['1'], ['2']]),
+        ("jsonb_array_elements of every kind of item, after a space, as jsonb prints each", "SELECT * FROM jsonb_array_elements(' [1, \"x\", {\"b\":1,\"a\":2,\"a\":3}, null, 1.50]') AS e",
+         ['value'], [3802], [['1'], ['"x"'], ['{"a": 3, "b": 1}'], ['null'], ['1.50']]),
+        ("jsonb_array_elements_text after a space: a JSON null as NULL, an object as jsonb prints it", "SELECT * FROM jsonb_array_elements_text(' [1.50, {\"b\":1,\"a\":2,\"a\":3}, null, \"x\"]')",
+         ['value'], [25], [['1.50'], ['{"a": 3, "b": 1}'], [None], ['x']]),
+        ("json_array_elements_text after a space keeps each element as written", "SELECT * FROM json_array_elements_text(' [1.50, {\"b\":1,\"a\":2,\"a\":3}]')",
+         ['value'], [25], [['1.50'], ['{"b":1,"a":2,"a":3}']]),
+        ("json_array_elements after a space keeps each element as written", "SELECT * FROM json_array_elements(' [1.50, {\"b\":1,\"a\":2,\"a\":3}]')",
+         ['value'], [114], [['1.50'], ['{"b":1,"a":2,"a":3}']]),
+        ("json_array_elements in a SELECT list after a space: named for the function", "SELECT json_array_elements(' [1.50, {\"b\":1,\"a\":2,\"a\":3}]')",
+         ['json_array_elements'], [114], [['1.50'], ['{"b":1,"a":2,"a":3}']]),
+        ("jsonb_array_elements and jsonb_array_elements_text in one SELECT list, after a space and a tab", "SELECT jsonb_array_elements(' [1,\"x\"]'), jsonb_array_elements_text('\t[1,\"x\"]')",
+         ['jsonb_array_elements', 'jsonb_array_elements_text'], [3802, 25], [['1', '1'], ['"x"', 'x']]),
+        ("jsonb_each in FROM after a space: the keys in jsonb's order, the values as jsonb", "SELECT * FROM jsonb_each(' {\"b\": 1, \"a\": {\"x\": 2}}')",
+         ['key', 'value'], [25, 3802], [['a', '{"x": 2}'], ['b', '1']]),
+        ("jsonb_each in FROM after a tab and a newline, with a space after", "SELECT * FROM jsonb_each('\t{\"b\":1,\"a\":{\"x\":2}}\n')",
+         ['key', 'value'], [25, 3802], [['a', '{"x": 2}'], ['b', '1']]),
+        ("jsonb_each_text after a space: a JSON null as NULL", "SELECT * FROM jsonb_each_text(' {\"b\": 1, \"a\": {\"x\": 2}, \"c\": null}')",
+         ['key', 'value'], [25, 25], [['a', '{"x": 2}'], ['b', '1'], ['c', None]]),
+        ("json_each_text after a space keeps the keys' order as written", "SELECT * FROM json_each_text(' {\"b\": 1, \"a\": {\"x\": 2}, \"c\": null}')",
+         ['key', 'value'], [25, 25], [['b', '1'], ['a', '{"x": 2}'], ['c', None]]),
+        ("json_each after a space keeps each value as written", "SELECT * FROM json_each(' {\"b\": 1, \"a\": {\"x\": 2}}')",
+         ['key', 'value'], [25, 114], [['b', '1'], ['a', '{"x": 2}']]),
+        ("jsonb_object_keys after a space, in FROM and in a SELECT list: the keys in jsonb's order", "SELECT * FROM jsonb_object_keys(' {\"b\":1,\"a\":2}')",
+         ['jsonb_object_keys'], [25], [['a'], ['b']]),
+        ("jsonb_object_keys after a newline, with a CRLF and a space after", "SELECT * FROM jsonb_object_keys('\n{\"b\":1,\"a\":2}\r\n ')",
+         ['jsonb_object_keys'], [25], [['a'], ['b']]),
+        ("jsonb_object_keys in a SELECT list after a space", "SELECT jsonb_object_keys(' {\"b\":1,\"a\":2}')",
+         ['jsonb_object_keys'], [25], [['a'], ['b']]),
+        ("json_object_keys after a space keeps the keys as written, duplicates included", "SELECT * FROM json_object_keys(' {\"b\":1,\"a\":2,\"b\":3}')",
+         ['json_object_keys'], [25], [['b'], ['a'], ['b']]),
+        ("jsonb_to_recordset after a space, with a column list, a missing key NULL", "SELECT * FROM jsonb_to_recordset(' [{\"a\":1,\"b\":\"x\"},{\"a\":2}]') AS x(a int, b text)",
+         ['a', 'b'], [23, 25], [[1, 'x'], [2, None]]),
+        ("json_to_recordset after a space, with a column list", "SELECT * FROM json_to_recordset(' [{\"a\":1,\"b\":\"x\"},{\"a\":2}]') AS x(a int, b text)",
+         ['a', 'b'], [23, 25], [[1, 'x'], [2, None]]),
+        ("jsonb_to_recordset after a tab and a newline, with a space after", "SELECT * FROM jsonb_to_recordset('\t[{\"a\":1,\"b\":\"x\"}]\n') AS x(a int, b text)",
+         ['a', 'b'], [23, 25], [[1, 'x']]),
+        ("jsonb_array_length and json_array_length after a space and a newline: the counts", "SELECT jsonb_array_length(' [1,2]'), json_array_length('\n[1,[2,3]] ')",
+         ['jsonb_array_length', 'json_array_length'], [23, 23], [[2, 2]]),
+    ]
+    # (name, sql, SQLSTATE, message): refused with Postgres 16's words, over HTTP and the port.
+    ERRORS = [
+        ("refused: jsonb_array_elements of an object after a space (22023)", 'SELECT jsonb_array_elements(\' {"a":1}\')', "22023", "cannot extract elements from an object"),
+        ("refused: jsonb_each of an array after a space (22023)", "SELECT * FROM jsonb_each(' [1]') AS e", "22023", "cannot call jsonb_each on a non-object"),
+        ("refused: jsonb_object_keys of an array after a space (22023)", "SELECT * FROM jsonb_object_keys(' [1]') AS k", "22023", "cannot call jsonb_object_keys on an array"),
+        ("refused: jsonb_to_recordset of an object after a space (22023)", "SELECT * FROM jsonb_to_recordset(' {}') AS x(a int)", "22023", "cannot call jsonb_to_recordset on a non-array"),
+        ("refused: json_array_elements of a scalar after a space (22023)", "SELECT * FROM json_array_elements(' 1')", "22023", "cannot call json_array_elements on a scalar"),
+    ]
+    for name, s, names, types, rows in CASES:
+        check(f"over HTTP, {name}", lambda s=s, rows=rows: _same(http_answer(s), [[v for v in row if v is not None] for row in rows], info, s))
+    for name, s, names, types, rows in CASES:
+        check(f"over the port, {name}", lambda s=s, names=names, types=types, rows=rows: _same(port_answer(conn, s), (names, types, rows), info, s))
+    for name, s, sqlstate, message in ERRORS:
+        check(f"over HTTP, {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_http(http_error(s), sqlstate, message, info, s))
+        check(f"over the port, {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_port(conn, s, sqlstate, message, info))
+
+
+def jsonfns():
+    """Postgres 16's functions that read a JSON document and expand it into rows (ADR-072 phase 2, brief D1). Reading:
+    json(b)_typeof, json(b)_array_length, json(b)_extract_path(_text) (`#>` and `#>>` with the keys as the path; NULL where
+    the path reaches nothing; zero keys 42883). Expanding, one row per element, in a SELECT list (paired by position, as
+    Postgres pairs them), in FROM over a literal or a column's document in a subquery's list, and as a record: json(b)_array_elements(_text),
+    json(b)_each(_text), json(b)_object_keys, json(b)_to_recordset and json(b)_to_record with a column list. json_object_keys
+    expands (Postgres's meaning); DataFusion's list is json_keys. Every answer is Postgres 16's: the names, the types and the
+    rows, over HTTP and over the Postgres port (psycopg, as text and through its own decoders), and each refusal's SQLSTATE and
+    words. A function in FROM that reads a column of the same query is LATERAL, as Postgres takes it (implicitly, CROSS
+    JOIN LATERAL, LEFT JOIN LATERAL … ON true when its outputs are its own unnest's). Not taken yet, refused by name where
+    Postgres takes them: a LEFT JOIN LATERAL over an expanding function whose outputs are expressions of its rows (a padded
+    row needs each output NULL, which lateral.rs can't show for an expression), WITH ORDINALITY, and an expanding function
+    in GROUP BY, ORDER BY, a window or INSERT's VALUES."""
+    import psycopg
+    from psycopg.types.json import JsonbLoader, JsonLoader
+    from psycopg.types.string import TextLoader
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 10
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    SETUP = [
+        "CREATE TABLE docs (id INT, doc JSONB, jdoc JSON)",
+        "INSERT INTO docs VALUES (1, '{\"items\": [{\"sku\": \"A1\", \"qty\": 2}, {\"sku\": \"B7\", \"qty\": 1}], \"tags\": {\"b\": 1, \"a\": 2, \"a\": 3}}', '{\"items\":[{\"sku\":\"A1\"}], \"n\": 1.50}'), (2, '{\"items\": []}', '{}'), (3, NULL, NULL), (4, '[1, \"x\", {\"a\": 1}, null]', '[1,\"x\",{\"a\":1},null]')",
+    ]
+    # (name, sql, names, type codes, rows): Postgres 16's answers, json and jsonb read as their text.
+    CASES = [
+        ("reads: jsonb_typeof, json_typeof and the array lengths of a table's documents, NULL for a NULL document", "SELECT id, jsonb_typeof(doc), json_typeof(jdoc), jsonb_array_length(doc -> 'items'), json_array_length(jdoc -> 'items') FROM docs ORDER BY id",
+         ['id', 'jsonb_typeof', 'json_typeof', 'jsonb_array_length', 'json_array_length'], [23, 25, 25, 23, 23],
+         [[1, 'object', 'object', 2, 1], [2, 'object', 'object', 0, None], [3, None, None, None, None], [4, 'array', 'array', None, None]]),
+        ("reads: jsonb_extract_path and _text, json_extract_path and _text of a table's column, by keys and an index", "SELECT id, jsonb_extract_path(doc, 'items', '0', 'sku'), jsonb_extract_path_text(doc, 'items', '1', 'qty'), json_extract_path(jdoc, 'n'), json_extract_path_text(jdoc, 'items', '0', 'sku'), jsonb_extract_path(doc, 'tags') FROM docs ORDER BY id",
+         ['id', 'jsonb_extract_path', 'jsonb_extract_path_text', 'json_extract_path', 'json_extract_path_text', 'jsonb_extract_path'], [23, 3802, 25, 114, 25, 3802],
+         [[1, '"A1"', '1', '1.50', 'A1', '{"a": 3, "b": 1}'], [2, None, None, None, None, None], [3, None, None, None, None, None], [4, None, None, None, None, None]]),
+        ('reads: a negative index counts from the end, a missing path is NULL', 'SELECT jsonb_extract_path(\'{"a":[1,2]}\', \'a\', \'-1\'), jsonb_extract_path_text(\'[1,2,3]\', \'-3\'), json_extract_path(\'{"a":1}\', \'z\'), jsonb_extract_path_text(\'{"a":null}\', \'a\')',
+         ['jsonb_extract_path', 'jsonb_extract_path_text', 'json_extract_path', 'jsonb_extract_path_text'], [3802, 25, 114, 25],
+         [['2', '1', None, None]]),
+        ('reads: json_extract_path of nested keys as written, jsonb_extract_path normalized', 'SELECT json_extract_path(\'{"a":{"b":[1,2]}}\', \'a\', \'b\'), jsonb_extract_path(\'{"a":{"b":[1,2]}}\', \'a\', \'b\', \'1\'), json_extract_path_text(\'{"a":{"b":"x"}}\', \'a\', \'b\'), jsonb_extract_path(\'{"b":1,"a":{"y":2,"x":1}}\', \'a\')',
+         ['json_extract_path', 'jsonb_extract_path', 'json_extract_path_text', 'jsonb_extract_path'], [114, 3802, 25, 3802],
+         [['[1,2]', '2', 'x', '{"x": 1, "y": 2}']]),
+        ('reads: the type and the array length of literals, NULL inputs', 'SELECT json_array_length(\'[1,2,[3]]\'), jsonb_array_length(\'[]\'), json_typeof(\'[1]\'), jsonb_typeof(\'1.5\'), jsonb_typeof(\'"s"\'), jsonb_typeof(\'true\'), jsonb_typeof(\'null\'), jsonb_typeof(NULL::jsonb), json_array_length(NULL::json)',
+         ['json_array_length', 'jsonb_array_length', 'json_typeof', 'jsonb_typeof', 'jsonb_typeof', 'jsonb_typeof', 'jsonb_typeof', 'jsonb_typeof', 'json_array_length'], [23, 23, 25, 25, 25, 25, 25, 25, 23],
+         [[3, 0, 'array', 'number', 'string', 'boolean', 'null', None, None]]),
+        ('expands: jsonb_array_elements in a SELECT list, one row per element, none for an empty or a NULL array', "SELECT id, jsonb_array_elements(doc -> 'items') FROM docs ORDER BY id",
+         ['id', 'jsonb_array_elements'], [23, 3802],
+         [[1, '{"qty": 2, "sku": "A1"}'], [1, '{"qty": 1, "sku": "B7"}']]),
+        ('expands: json_array_elements keeps each element as written', "SELECT json_array_elements(jdoc -> 'items') FROM docs WHERE id = 1",
+         ['json_array_elements'], [114],
+         [['{"sku":"A1"}']]),
+        ("expands: jsonb_array_elements over a column's array of mixed elements, jsonb normalized", 'SELECT id, jsonb_array_elements(doc) FROM docs WHERE id = 4',
+         ['id', 'jsonb_array_elements'], [23, 3802],
+         [[4, '1'], [4, '"x"'], [4, '{"a": 1}'], [4, 'null']]),
+        ("expands: jsonb_array_elements_text gives each element's text, a JSON null as NULL", 'SELECT id, jsonb_array_elements_text(doc) FROM docs WHERE id = 4',
+         ['id', 'jsonb_array_elements_text'], [23, 25],
+         [[4, '1'], [4, 'x'], [4, '{"a": 1}'], [4, None]]),
+        ('expands: jsonb_array_elements_text prints the element as jsonb does (keys sorted, the last duplicate)', 'SELECT jsonb_array_elements_text(\'[1.50, {"b":1,"a":2,"a":3}]\')',
+         ['jsonb_array_elements_text'], [25],
+         [['1.50'], ['{"a": 3, "b": 1}']]),
+        ('expands: json_array_elements_text keeps each element as written', 'SELECT json_array_elements_text(\'[1.50, {"b":1,"a":2,"a":3}]\')',
+         ['json_array_elements_text'], [25],
+         [['1.50'], ['{"b":1,"a":2,"a":3}']]),
+        ('expands: two expanding functions in one SELECT list pair by position, the shorter padded with NULL', 'SELECT jsonb_array_elements(\'[1,2]\'), jsonb_array_elements_text(\'["a","b","c"]\')',
+         ['jsonb_array_elements', 'jsonb_array_elements_text'], [3802, 25],
+         [['1', 'a'], ['2', 'b'], [None, 'c']]),
+        ("expands: an expanding function inside another function's argument", "SELECT id, upper(jsonb_array_elements_text(doc -> 'items')) FROM docs WHERE id = 1",
+         ['id', 'upper'], [23, 25],
+         [[1, '{"QTY": 2, "SKU": "A1"}'], [1, '{"QTY": 1, "SKU": "B7"}']]),
+        ('expands: jsonb_object_keys of a column, grouped by key over a subquery', 'SELECT k, count(*) FROM (SELECT jsonb_object_keys(doc) AS k FROM docs WHERE id < 3) s GROUP BY k ORDER BY k',
+         ['k', 'count'], [25, 20],
+         [['items', 2], ['tags', 1]]),
+        ('expands: json_object_keys keeps the keys as written, duplicates included', 'SELECT json_object_keys(\'{"b":1,"a":2,"b":3}\'), jsonb_object_keys(\'{"b":1,"a":2}\')',
+         ['json_object_keys', 'jsonb_object_keys'], [25, 25],
+         [['b', 'a'], ['a', 'b'], ['b', None]]),
+        ("expands: json_object_keys of a table's column, one row per key", 'SELECT id, json_object_keys(jdoc) FROM docs WHERE id = 1',
+         ['id', 'json_object_keys'], [23, 25],
+         [[1, 'items'], [1, 'n']]),
+        ("expands: jsonb_each in FROM, the rows in jsonb's key order, values as jsonb", 'SELECT * FROM jsonb_each(\'{"b": 1, "a": {"x": 2}}\')',
+         ['key', 'value'], [25, 3802],
+         [['a', '{"x": 2}'], ['b', '1']]),
+        ('expands: json_each_text in FROM with a column list, values as text, a JSON null as NULL', 'SELECT * FROM json_each_text(\'{"b": 1, "a": {"x": 2}, "c": null}\') AS e(k, v)',
+         ['k', 'v'], [25, 25],
+         [['b', '1'], ['a', '{"x": 2}'], ['c', None]]),
+        ('expands: jsonb_array_elements in FROM, its column named value', "SELECT * FROM jsonb_array_elements('[1,2]') AS e",
+         ['value'], [3802],
+         [['1'], ['2']]),
+        ('expands: jsonb_array_elements_text in FROM without an alias', 'SELECT * FROM jsonb_array_elements_text(\'["a", null]\')',
+         ['value'], [25],
+         [['a'], [None]]),
+        ('expands: jsonb_object_keys in FROM, its column named after the alias', 'SELECT * FROM jsonb_object_keys(\'{"a":1}\') AS k',
+         ['k'], [25],
+         [['a']]),
+        ('expands: jsonb_object_keys in FROM without an alias, its column named after the function', 'SELECT * FROM jsonb_object_keys(\'{"a":1}\')',
+         ['jsonb_object_keys'], [25],
+         [['a']]),
+        ('expands: jsonb_to_recordset in FROM with a column list', 'SELECT * FROM jsonb_to_recordset(\'[{"a":1,"b":"x"},{"a":2}]\') AS x(a int, b text)',
+         ['a', 'b'], [23, 25],
+         [[1, 'x'], [2, None]]),
+        ("expands: jsonb_to_recordset over a literal, joined to a table's rows", 'SELECT id, line.sku, line.qty FROM docs, jsonb_to_recordset(\'[{"sku": "A1", "qty": 2}]\') AS line(sku TEXT, qty INT) WHERE id = 2',
+         ['id', 'sku', 'qty'], [23, 25, 23],
+         [[2, 'A1', 2]]),
+        ("lateral: a function in FROM reading a column of the query (implicit LATERAL), with a column's own names", "SELECT d.id, e.value FROM docs d, jsonb_array_elements(d.doc -> 'items') AS e ORDER BY d.id, e.value::text",
+         ['id', 'value'], [23, 3802],
+         [[1, '{"qty": 1, "sku": "B7"}'], [1, '{"qty": 2, "sku": "A1"}']]),
+        ("lateral: CROSS JOIN LATERAL jsonb_each of a column, the last duplicate key kept", "SELECT d.id, kv.key, kv.value FROM docs d CROSS JOIN LATERAL jsonb_each(d.doc -> 'tags') AS kv ORDER BY d.id, kv.key",
+         ['id', 'key', 'value'], [23, 25, 3802],
+         [[1, 'a', '3'], [1, 'b', '1']]),
+        ("lateral: LEFT JOIN LATERAL json_array_elements_text ON true keeps each row of the query, NULL where the array is missing", "SELECT d.id, x.value FROM docs d LEFT JOIN LATERAL json_array_elements_text(d.jdoc -> 'items') AS x ON true ORDER BY d.id, x.value",
+         ['id', 'value'], [23, 25],
+         [[1, '{"sku":"A1"}'], [2, None], [3, None], [4, None]]),
+        ("lateral: jsonb_to_recordset of a column, with a column list, joined to the query's row", "SELECT d.id, r.sku, r.qty FROM docs d, jsonb_to_recordset(d.doc -> 'items') AS r(sku TEXT, qty INT) ORDER BY d.id, r.sku",
+         ['id', 'sku', 'qty'], [23, 25, 23],
+         [[1, 'A1', 2], [1, 'B7', 1]]),
+        ("lateral: a WHERE on the query's own column, before the call reads the other rows (no error on an array)", "SELECT d.id, kv.key, kv.value FROM docs d CROSS JOIN LATERAL jsonb_each(d.doc) AS kv WHERE d.id <> 4 ORDER BY d.id, kv.key",
+         ['id', 'key', 'value'], [23, 25, 3802],
+         [[1, 'items', '[{"qty": 2, "sku": "A1"}, {"qty": 1, "sku": "B7"}]'], [1, 'tags', '{"a": 3, "b": 1}'], [2, 'items', '[]']]),
+        ("lateral: LEFT JOIN LATERAL jsonb_array_elements_text of a column, a NULL row for each row the array is missing from", "SELECT d.id, x.value FROM docs d LEFT JOIN LATERAL jsonb_array_elements_text(d.doc -> 'items') AS x ON true ORDER BY d.id, x.value",
+         ['id', 'value'], [23, 25],
+         [[1, '{"qty": 1, "sku": "B7"}'], [1, '{"qty": 2, "sku": "A1"}'], [2, None], [3, None], [4, None]]),
+        ('expands: jsonb_to_recordset with missing keys: NULL for each one not there', 'SELECT * FROM jsonb_to_recordset(\'[{"sku": "A1", "qty": 2}, {"sku": "B7"}]\') AS line(sku TEXT, qty INT)',
+         ['sku', 'qty'], [25, 23],
+         [['A1', 2], ['B7', None]]),
+        ('expands: json_to_record, a json and a jsonb column of a document', 'SELECT * FROM json_to_record(\'{"a": 1, "b": [1, 2], "c": {"x": true}}\') AS r(a INT, b JSON, c JSONB)',
+         ['a', 'b', 'c'], [23, 114, 3802],
+         [[1, '[1, 2]', '{"x": true}']]),
+        ('expands: jsonb_to_record of NULL has no rows', 'SELECT count(*) FROM jsonb_to_record(NULL) AS x(a INT)',
+         ['count'], [20],
+         [[1]]),
+    ]
+    # (name, sql, SQLSTATE, message): refused by Postgres 16 with these words.
+    ERRORS = [
+        ("refused: jsonb_array_elements of an object, by Postgres's words (22023)", 'SELECT jsonb_array_elements(\'{"a":1}\')', '22023', 'cannot extract elements from an object'),
+        ('refused: json_array_elements of a scalar (22023)', "SELECT json_array_elements('1')", '22023', 'cannot call json_array_elements on a scalar'),
+        ('refused: jsonb_each of an array (22023)', "SELECT * FROM jsonb_each('[1]') AS e", '22023', 'cannot call jsonb_each on a non-object'),
+        ('refused: json_each of an array (22023)', "SELECT * FROM json_each('[1]') AS e", '22023', 'cannot deconstruct an array as an object'),
+        ('refused: json_object_keys of a scalar (22023)', "SELECT * FROM json_object_keys('1') AS k", '22023', 'cannot call json_object_keys on a scalar'),
+        ('refused: jsonb_object_keys of an array (22023)', "SELECT * FROM jsonb_object_keys('[1]') AS k", '22023', 'cannot call jsonb_object_keys on an array'),
+        ('refused: jsonb_to_recordset of an array of scalars (22023)', "SELECT * FROM jsonb_to_recordset('[1]') AS x(a int)", '22023', 'argument of jsonb_to_recordset must be an array of objects'),
+        ('refused: jsonb_to_recordset of an object (22023)', "SELECT * FROM jsonb_to_recordset('{}') AS x(a int)", '22023', 'cannot call jsonb_to_recordset on a non-array'),
+        ('refused: jsonb_to_recordset with no column list (42601)', 'SELECT * FROM jsonb_to_recordset(\'[{"a":1}]\') AS x(a, b)', '42601', 'a column definition list is required for functions returning "record"'),
+        ('refused: jsonb_to_record in a SELECT list, no row type (0A000)', 'SELECT jsonb_to_record(\'{"a":1}\')', '0A000', 'could not determine row type for result of jsonb_to_record'),
+        ('refused: jsonb_to_record of an array (22023)', "SELECT * FROM jsonb_to_record('[1]') AS x(a int)", '22023', 'cannot call populate_composite on an array'),
+        ('refused: an expanding function in WHERE (0A000)', 'SELECT 1 FROM docs WHERE jsonb_array_elements(doc) IS NULL', '0A000', 'set-returning functions are not allowed in WHERE'),
+        ('refused: an expanding function in CASE (0A000)', "SELECT CASE WHEN true THEN jsonb_array_elements('[1]') END", '0A000', 'set-returning functions are not allowed in CASE'),
+        ('refused: an expanding function in an aggregate (0A000)', "SELECT count(jsonb_array_elements('[1]'))", '0A000', 'aggregate function calls cannot contain set-returning function calls'),
+        ('refused: an expanding function in LIMIT (0A000)', "SELECT 1 LIMIT jsonb_array_elements('[1]')", '0A000', 'set-returning functions are not allowed in LIMIT'),
+        ('refused: an expanding function in COALESCE (0A000)', "SELECT COALESCE(jsonb_array_elements('[1]'), '2'::jsonb)", '0A000', 'set-returning functions are not allowed in COALESCE'),
+        ('refused: an expanding function in HAVING (0A000)', "SELECT 1 HAVING jsonb_array_elements('[1]') IS NOT NULL", '0A000', 'set-returning functions are not allowed in HAVING'),
+        ("refused: an expanding function in a JOIN's ON (0A000)", "SELECT 1 FROM (SELECT 1) s JOIN generate_series(1, 2) g ON g = jsonb_array_elements('[1]')", '0A000', 'set-returning functions are not allowed in JOIN conditions'),
+    ]
+    # Refused by name where Postgres 16 takes the call (the words are the ones this engine says, then the SQLSTATE).
+    NOT_YET = [
+        ("a LEFT JOIN LATERAL over an expanding function whose outputs are expressions, not taken yet (Postgres takes it)", "SELECT d.id, e.value FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') AS e ON true", "0A000", "LEFT JOIN LATERAL over e is not supported yet"),
+        ("a LEFT JOIN LATERAL over jsonb_each, not taken yet (Postgres takes it)", "SELECT d.id, kv.key FROM docs d LEFT JOIN LATERAL jsonb_each(d.doc -> 'tags') AS kv ON true", "0A000", "LEFT JOIN LATERAL over kv is not supported yet"),
+        ("WITH ORDINALITY, not taken yet (Postgres takes it)", "SELECT * FROM jsonb_array_elements('[1,2]') WITH ORDINALITY AS e", "0A000", "WITH ORDINALITY isn't taken yet"),
+        ("an expanding function in GROUP BY, not taken yet (Postgres takes it)", "SELECT 1 FROM docs GROUP BY jsonb_array_elements(doc)", "0A000", "in GROUP BY isn't taken yet"),
+        ("an expanding function in ORDER BY, not taken yet (Postgres takes it)", "SELECT 1 FROM docs ORDER BY jsonb_array_elements('[1]')", "0A000", "in ORDER BY isn't taken yet"),
+        ("an expanding function in a window's PARTITION BY, not taken yet (Postgres takes it)", "SELECT sum(id) OVER (PARTITION BY jsonb_array_elements('[1]')) FROM docs", "0A000", "in window definitions isn't taken yet"),
+        ("an expanding function in INSERT's VALUES, not taken yet (Postgres takes it)", "INSERT INTO docs (id) VALUES (jsonb_array_elements('[1]')::text::int)", "0A000", "in VALUES isn't taken yet"),
+    ]
+    # psycopg's own decoding over the port (dicts, lists, numbers) and the cursor's names and type codes, Postgres 16's.
+    TYPED = [
+        ("jsonb_array_elements of a column, as dicts", "SELECT jsonb_array_elements(doc -> 'items') FROM docs WHERE id = 1", ["jsonb_array_elements"], [3802], [[{"qty": 2, "sku": "A1"}], [{"qty": 1, "sku": "B7"}]]),
+        ("jsonb_array_elements of a literal: numbers, strings, lists and NULL", "SELECT jsonb_array_elements('[1, \"x\", [2], null]')", ["jsonb_array_elements"], [3802], [[1], ["x"], [[2]], [None]]),
+        ("jsonb_array_elements_text: strings, a JSON null as NULL", "SELECT jsonb_array_elements_text('[1, \"x\", [2], null]')", ["jsonb_array_elements_text"], [25], [["1"], ["x"], ["[2]"], [None]]),
+        ("jsonb_typeof as a string, jsonb_array_length as a number", "SELECT jsonb_typeof(doc), jsonb_array_length(doc -> 'items') FROM docs WHERE id = 1", ["jsonb_typeof", "jsonb_array_length"], [25, 23], [["object", 2]]),
+        ("jsonb_each in FROM: the key as text, the value as a dict or a number", "SELECT * FROM jsonb_each('{\"b\": 1, \"a\": {\"x\": 2}}')", ["key", "value"], [25, 3802], [["a", {"x": 2}], ["b", 1]]),
+        ("jsonb_to_recordset with missing keys: a number and NULL", "SELECT * FROM jsonb_to_recordset('[{\"sku\": \"A1\", \"qty\": 2}, {\"sku\": \"B7\"}]') AS line(sku TEXT, qty INT)", ["sku", "qty"], [25, 23], [["A1", 2], ["B7", None]]),
+        ("json_extract_path as a float, jsonb_extract_path as a dict", "SELECT json_extract_path(jdoc, 'n'), jsonb_extract_path(doc, 'tags') FROM docs WHERE id = 1", ["json_extract_path", "jsonb_extract_path"], [114, 3802], [[1.5, {"a": 3, "b": 1}]]),
+    ]
+    checks, info = {}, {}
+    node = None
+
+    def q(s):
+        return call(port, "POST", "/sql", s.encode(), timeout=120)
+
+    def check(name, fn):
+        """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def http_answer(s):
+        """The rows of a statement over HTTP, their values in column order. HTTP names columns as the engine does (not as
+        Postgres does: the port checks names), and leaves a NULL out of its row object, so a row is its non-NULL values."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        if r.status != 200:
+            raise RuntimeError(f"{r.status}: {data[:300]!r}")
+        rows = json.loads(data, object_pairs_hook=lambda pairs: pairs)  # pairs, not a dict: duplicate names stay
+        return [[v for _, v in row] for row in rows]
+
+    def http_error(s):
+        """(SQLSTATE header, body) of a statement HTTP refuses."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        return r.getheader("x-pondra-sqlstate"), data
+
+    def port_answer(conn, s, text=True):
+        """(names, type codes, rows) over the port: json and jsonb as their text (`text`), or through psycopg's decoders."""
+        if text:
+            conn.adapters.register_loader(114, TextLoader)
+            conn.adapters.register_loader(3802, TextLoader)
+        else:
+            conn.adapters.register_loader(114, JsonLoader)
+            conn.adapters.register_loader(3802, JsonbLoader)
+        cur = conn.execute(s)
+        return [c.name for c in cur.description], [c.type_code for c in cur.description], [list(r) for r in cur.fetchall()]
+
+    try:
+        node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+        for s in SETUP:
+            q(s)
+        for name, s, names, types, rows in CASES:
+            check(f"over HTTP, {name}", lambda s=s, rows=rows: _same(http_answer(s), [[v for v in row if v is not None] for row in rows], info, s))
+        with psycopg.connect(url, autocommit=True) as conn:
+            for name, s, names, types, rows in CASES:
+                check(f"over the port, {name}", lambda s=s, names=names, types=types, rows=rows: _same(port_answer(conn, s), (names, types, rows), info, s))
+            for name, s, names, types, rows in TYPED:
+                check(f"over the port, psycopg's types: {name}", lambda s=s, names=names, types=types, rows=rows: _same(port_answer(conn, s, text=False), (names, types, rows), info, s))
+        for name, s, sqlstate, message in ERRORS:
+            check(f"over HTTP, refused: {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_http(http_error(s), sqlstate, message, info, s))
+        with psycopg.connect(url, autocommit=True) as conn:
+            for name, s, sqlstate, message in ERRORS:
+                check(f"over the port, refused: {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_port(conn, s, sqlstate, message, info))
+        for name, s, sqlstate, message in NOT_YET:
+            check(f"over HTTP, refused by name: {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_http(http_error(s), sqlstate, message, info, s))
+        # A set function over an outer query's column, in a subquery or EXISTS: Postgres answers these, Pondra refuses them
+        # by name (0A000, the column named), over HTTP and over the port.
+        # (EXISTS writes the element as e.value: a bare e, a scalar set function's alias, is a schema error here, as before
+        # this check, so the refusal would never be reached; Postgres takes both.)
+        OUTER = [("a count over an outer column", "SELECT id, (SELECT count(*) FROM jsonb_array_elements(t.doc)) FROM docs AS t", "t.doc"),
+                 ("EXISTS over an outer column", "SELECT id FROM docs AS t WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(t.doc) e WHERE e.value ->> 'k' = 'x')", "t.doc")]
+        def outer_http(s, column):
+            code, body = http_error(s)
+            return code == "0A000" and column in body and "aren't taken yet" in body
+        def outer_port(conn, s, column):
+            try:
+                conn.execute(s)
+            except psycopg.Error as e:
+                return e.sqlstate == "0A000" and column in str(e) and "aren't taken yet" in str(e)
+            return False
+        for name, s, column in OUTER:
+            check(f"over HTTP, refused by name, naming {column}: {name}", lambda s=s, column=column: outer_http(s, column))
+        with psycopg.connect(url, autocommit=True) as conn:
+            for name, s, column in OUTER:
+                check(f"over the port, refused by name, naming {column}: {name}", lambda s=s, column=column: outer_port(conn, s, column))
+            _jsonfns_spaces(check, http_answer, http_error, port_answer, conn, info)
+        check("json_keys is DataFusion's list of the keys, as written (DuckDB's name; json_object_keys expands)",
+              lambda: http_answer("SELECT json_keys('{\"b\":1,\"a\":2}') AS k") == [[["b", "a"]]])
+        checks.update(_jsonfns_params(port, pg, info))  # (the parameters and results of SQL functions and procedures, W5)
+    finally:
+        if node is not None:
+            node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"jsonfns": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} JSON function checks"
+
+
+def _jsonfns_params(port, pg, info):
+    """The parameters and results of SQL functions and procedures that take json, jsonb, uuid and varchar(n) (W5, PR #131).
+    Every expected answer is Postgres 16's (names, types, rows, SQLSTATEs), taken in a scratch schema. A jsonb parameter's
+    body reads `->>`, `=` and `?` as Postgres groups them, as a query body and as a RETURN expression; a jsonb and a uuid
+    result come out typed 3802 and 2950 over the port; a varchar(10) parameter and a varchar(3) result neither refuse nor
+    cut a value (Postgres ignores the lengths there); a uuid or jsonb argument that isn't one is refused (22P02) in
+    Postgres's words; and a procedure takes the same types. Python functions aren't checked here: the Postgres 16 this
+    suite runs against has no plpython, so there is no answer of Postgres's to take for them."""
+    import psycopg
+    from psycopg.types.json import JsonbLoader
+    from psycopg.types.string import TextLoader
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    checks = {}
+
+    def check(name, fn):
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def http_rows(s):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        if r.status != 200:
+            raise RuntimeError(f"{r.status}: {data[:300]!r}")
+        rows = json.loads(data, object_pairs_hook=lambda pairs: pairs)  # (pairs, so a NULL's column is left out, as HTTP does)
+        return [[v for _, v in row] for row in rows]
+
+    def http_error(s):
+        """(SQLSTATE header, body) of a statement HTTP refuses."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        return r.getheader("x-pondra-sqlstate"), data
+
+    def port_answer(conn, s, typed=False):
+        """(names, type codes, rows) over the port: jsonb as its text, or decoded by psycopg's loader (`typed`)."""
+        conn.adapters.register_loader(3802, JsonbLoader if typed else TextLoader)
+        cur = conn.execute(s)
+        return [c.name for c in cur.description], [c.type_code for c in cur.description], [list(r) for r in cur.fetchall()]
+
+    def port_refused(conn, s, sqlstate, words):
+        """The port refuses `s` with the SQLSTATE and words in its message (a message that carries the value too)."""
+        try:
+            conn.execute(s)
+        except psycopg.Error as e:
+            return e.sqlstate == sqlstate and words in (e.diag.message_primary or "")
+        return False
+
+    SETUP = [
+        "CREATE FUNCTION w5has(d JSONB) RETURNS BOOLEAN AS $$ SELECT d ->> 'a' = '1' $$ LANGUAGE sql",
+        "CREATE FUNCTION w5ask(d JSONB) RETURNS BOOLEAN AS $$ SELECT d ? 'a' $$ LANGUAGE sql",
+        "CREATE FUNCTION w5ret(d JSONB) RETURNS BOOLEAN LANGUAGE sql RETURN d ->> 'a' = '1'",
+        "CREATE FUNCTION w5jb(d JSONB) RETURNS JSONB AS $$ SELECT d -> 'x' $$ LANGUAGE sql",
+        "CREATE FUNCTION w5id(u UUID) RETURNS UUID AS $$ SELECT u $$ LANGUAGE sql",
+        "CREATE FUNCTION w5vc(s VARCHAR(10)) RETURNS VARCHAR(3) AS $$ SELECT s $$ LANGUAGE sql",
+        "CREATE TABLE w5calls (u UUID, v VARCHAR(10))",
+        "CREATE PROCEDURE w5p(d JSONB, u UUID, v VARCHAR(10)) LANGUAGE sql AS $$ INSERT INTO w5calls VALUES ($u, $v) $$",
+    ]
+    for s in SETUP:
+        check(f"made: {s[:70]}", lambda s=s: call(port, "POST", "/sql", s.encode(), timeout=120) is not None)
+    # (statement, rows): Postgres 16's values, JSON booleans as True and False.
+    HTTP = [
+        ("a jsonb parameter's ->> and = in a query body", "SELECT w5has('{\"a\":1}') AS one, w5has('{\"a\":\"2\"}') AS two", [[True, False]]),
+        ("? on a jsonb parameter in a query body", "SELECT w5ask('{\"a\":1}') AS yes, w5ask('{\"b\":1}') AS no", [[True, False]]),
+        ("the same operators in a RETURN expression", "SELECT w5ret('{\"a\":1}') AS one, w5ret('{\"a\":\"2\"}') AS two", [[True, False]]),
+        ("a jsonb result, as its text", "SELECT w5jb('{\"x\":{\"y\":2}}') AS v", [['{"y": 2}']]),
+        ("a uuid parameter and result, given upper case with hyphens", "SELECT w5id('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11') AS v", [['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11']]),
+        ("a uuid given without hyphens", "SELECT w5id('a0eebc999c0b4ef8bb6d6bb9bd380a11') AS v", [['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11']]),
+        ("a varchar(10) parameter and a varchar(3) result: neither refused nor cut", "SELECT w5vc('abcdefghijklmnop') AS long_arg, w5vc('ab') AS short", [['abcdefghijklmnop', 'ab']]),
+    ]
+    for name, s, want in HTTP:
+        check(f"over HTTP, {name}", lambda s=s, want=want: _same(http_rows(s), want, info, s))
+    # (statement, names, type codes, rows): Postgres 16's, as the port sends them.
+    PORT = [
+        ("a jsonb parameter's ->> and = in a query body: names, types and rows", "SELECT w5has('{\"a\":1}') AS one, w5has('{\"a\":\"2\"}') AS two", ["one", "two"], [16, 16], [[True, False]], False),
+        ("? and a RETURN expression: names, types and rows", "SELECT w5ask('{\"a\":1}') AS yes, w5ret('{\"a\":\"2\"}') AS no", ["yes", "no"], [16, 16], [[True, False]], False),
+        ("a jsonb result as its text, typed 3802", "SELECT w5jb('{\"x\":{\"y\":2}}')", ["w5jb"], [3802], [['{"y": 2}']], False),
+        ("a jsonb result decoded by psycopg, typed 3802", "SELECT w5jb('{\"x\":{\"y\":2}}')", ["w5jb"], [3802], [[{"y": 2}]], True),
+        ("a uuid result typed 2950 (psycopg's uuid.UUID)", "SELECT w5id('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11')", ["w5id"], [2950], [[uuid.UUID("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")]], True),
+    ]
+    with psycopg.connect(url, autocommit=True) as conn:
+        for name, s, names, types, rows, typed in PORT:
+            check(f"over the port, {name}", lambda s=s, names=names, types=types, rows=rows, typed=typed: _same(port_answer(conn, s, typed), (names, types, rows), info, s))
+        check("over the port, a varchar(10) parameter and a varchar(3) result: neither refused nor cut",
+              lambda: _same(port_answer(conn, "SELECT w5vc('abcdefghijklmnop') AS long_arg, w5vc('ab') AS short")[2], [["abcdefghijklmnop", "ab"]], info, "SELECT w5vc"))
+        check("over the port, a uuid that isn't one: refused 22P02 in Postgres's words",
+              lambda: port_refused(conn, "SELECT w5id('nope')", "22P02", 'invalid input syntax for type uuid: "nope"'))
+        check("over the port, a jsonb argument that isn't JSON: refused 22P02 (invalid input syntax for type json)",
+              lambda: port_refused(conn, "SELECT w5has('{bad')", "22P02", "invalid input syntax for type json"))
+    check("over HTTP, a uuid that isn't one: refused 22P02 in Postgres's words",
+          lambda: _refused_http(http_error("SELECT w5id('nope')"), "22P02", 'invalid input syntax for type uuid: "nope"', info, "SELECT w5id('nope')"))
+    check("over HTTP, a jsonb argument that isn't JSON: refused 22P02 (invalid input syntax for type json)",
+          lambda: _refused_http(http_error("SELECT w5has('{bad')"), "22P02", "invalid input syntax for type json", info, "SELECT w5has('{bad')"))
+    # A procedure takes the same types: CALL writes its uuid and varchar(10) arguments as they are.
+    check("over HTTP, a procedure takes a jsonb, a uuid and a varchar(10) argument: CALL writes the uuid and the text",
+          lambda: (call(port, "POST", "/sql", b"CALL w5p('{\"a\":1}', 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', 'abc')", timeout=120) is not None
+                   and _same(http_rows("SELECT u, v FROM w5calls ORDER BY v"), [["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "abc"]], info, "SELECT u, v FROM w5calls")))
+    return checks
+
+
+def _same(got, want, info, sql):
+    """Equal answers; when not, what each side said is kept in info (keyed by the statement)."""
+    if got == want:
+        return True
+    info[f"differs: {sql[:120]}"] = {"got": got, "want": want}
+    return False
+
+
+def _says(body, message):
+    """The message as the body carries it (JSON-escaped quotes included)."""
+    return message in body or json.dumps(message)[1:-1] in body
+
+
+def _refused_http(answer, sqlstate, message, info, sql):
+    code, body = answer
+    if code == sqlstate and _says(body, message):
+        return True
+    info[f"refused differently: {sql[:120]}"] = {"got": [code, body[:300]], "want": [sqlstate, message]}
+    return False
+
+
+def _refused_port(conn, sql, sqlstate, message, info):
+    """The port refuses `sql` with the SQLSTATE and the words; a statement it takes is a failure, kept in info."""
+    import psycopg
+    try:
+        conn.execute(sql)
+    except psycopg.Error as e:
+        if e.sqlstate == sqlstate and e.diag.message_primary == message:
+            return True
+        info[f"refused differently: {sql[:120]}"] = {"got": [e.sqlstate, e.diag.message_primary], "want": [sqlstate, message]}
+        return False
+    info[f"not refused: {sql[:120]}"] = True
+    return False
 
 
 def uuids():
@@ -14713,6 +15269,1575 @@ def uuids():
     return f"{sum(checks.values())} of {len(checks)} UUID checks"
 
 
+# Postgres 16's answers to the json-making functions, as text (`SELECT (expr)::text`, computed on a Postgres 16.15
+# server; NULL is None). The literals are as written for both; the table ones read the rows the checks insert.
+MAKE_LITERALS = [
+    ('to_json(1)', '1'),
+    ('to_json(\'a"b\\c\'::text)', '"a\\"b\\\\c"'),
+    ('to_json(true)', 'true'),
+    ('to_json(CAST(NULL AS INT))', None),
+    ('to_json(CAST(1.5e-7 AS DOUBLE PRECISION))', '1.5e-07'),
+    # (a numeric literal 1e15 cast to DOUBLE is 9.999999999999999e14 on the node, outside the JSON functions: the text
+    # form is the same double, so this checks the writer's 1e+15)
+    ("to_json(CAST('1e15' AS DOUBLE PRECISION))", '1e+15'),
+    ("to_json(CAST('NaN' AS DOUBLE PRECISION))", '"NaN"'),
+    ("to_json(DATE '2024-01-02')", '"2024-01-02"'),
+    ("to_json(TIMESTAMP '2024-01-02 03:04:05.5')", '"2024-01-02T03:04:05.5"'),
+    ("to_json(INTERVAL '1 day 2 hours')", '"1 day 02:00:00"'),
+    ('to_json(chr(9))', '"\\t"'),
+    ('to_json(1.50)', '1.50'),
+    ('to_jsonb(1.50)', '1.50'),
+    ('to_jsonb(1e2)', '100'),
+    ('to_jsonb(\'b"x\'::text)', '"b\\"x"'),
+    ("json_build_object('a', 1, 'b', 'x', 'c', NULL)", '{"a" : 1, "b" : "x", "c" : null}'),
+    ("json_build_object('a', json_build_object('b', 1))", '{"a" : {"b" : 1}}'),
+    ('json_build_object()', '{}'),
+    ("jsonb_build_object('bb', 1, 'a', 2, 'ccc', 3)", '{"a": 2, "bb": 1, "ccc": 3}'),
+    ("jsonb_build_object('a', 1, 'a', 2)", '{"a": 2}'),
+    ("json_build_array(1, 'a', NULL)", '[1, "a", null]'),
+    ('json_build_array()', '[]'),
+    ("jsonb_build_array(1.50, 'a', true)", '[1.50, "a", true]'),
+    ('to_json(ARRAY[1, 2])', '[1,2]'),
+    ("to_json(ARRAY['a', NULL])", '["a",null]'),
+    ("json_build_object('a', ARRAY[1, 2])", '{"a" : [1,2]}'),
+    ("json_build_object('a', CAST(NULL AS TEXT))", '{"a" : null}'),
+    ('to_json(CAST(NULL AS TEXT))', None),
+    ("pondra_as_jsonb('{\"b\":1,\"a\":2}')", '{"a": 2, "b": 1}'),
+    ("pondra_as_jsonb('[1.50, \"x\"]')", '[1.50, "x"]'),
+    ('pondra_as_jsonb(CAST(NULL AS TEXT))', None),
+    ("to_json(pondra_as_jsonb('{\"b\":1,\"a\":2}'))", '{"a": 2, "b": 1}'),
+]
+MAKE_TABLE = [
+    ('to_json(i)', ['7', None]),
+    ('to_json(b)', ['9000000000', None]),
+    ('to_json(t)', ['"a\\"b\\\\c"', None]),
+    ('to_json(f)', ['1.5e-07', None]),
+    ('to_json(n)', ['12.50', None]),
+    ('to_json(d)', ['"2024-01-02"', None]),
+    ('to_json(ts)', ['"2024-01-02T03:04:05.5"', None]),
+    ('to_json(ok)', ['true', None]),
+    ('to_jsonb(f)', ['0.00000015', None]),
+    ('to_jsonb(n)', ['12.50', None]),
+    ('to_jsonb(t)', ['"a\\"b\\\\c"', None]),
+    ("json_build_object('i', i, 't', t, 'd', d, 'ts', ts, 'ok', ok)", ['{"i" : 7, "t" : "a\\"b\\\\c", "d" : "2024-01-02", "ts" : "2024-01-02T03:04:05.5", "ok" : true}', '{"i" : null, "t" : null, "d" : null, "ts" : null, "ok" : null}']),
+    ('json_build_array(i, b, f, n, d, ts, ok)', ['[7, 9000000000, 1.5e-07, 12.50, "2024-01-02", "2024-01-02T03:04:05.5", true]', '[null, null, null, null, null, null, null]']),
+]
+MAKE_JSON = [  # (Postgres's spelling of the JSON columns, Pondra's with pondra_as_json, the rows' text)
+    ("json_build_object('d', pondra_as_json(doc), 'b', pondra_as_json(docb))", ['{"d" : {"a": 1, "b": [1, 2]}, "b" : {"k": "v"}}', '{"d" : null, "b" : null}']),
+    ('to_json(pondra_as_json(doc))', ['{"a": 1, "b": [1, 2]}', None]),
+    ('to_jsonb(pondra_as_json(docb))', ['{"k": "v"}', None]),
+    ("jsonb_build_object('x', pondra_as_json(doc))", ['{"x": {"a": 1, "b": [1, 2]}}', '{"x": null}']),
+    ("jsonb_build_object('x', pondra_as_jsonb(doc))", ['{"x": {"a": 1, "b": [1, 2]}}', '{"x": null}']),
+    ('to_json(pondra_as_jsonb(docb))', ['{"k": "v"}', None]),
+]
+MAKE_AGGREGATES = [  # (Pondra's aggregate over a list, Postgres 16's text for the aggregate it stands for)
+    ("pondra_json_agg(make_array(1, 2, 3), 'value')", '[1, 2, 3]'),
+    ("pondra_json_agg(make_array(1, NULL, 3), 'value')", '[1, null, 3]'),
+    ("pondra_json_agg(make_array(make_array(1, 1), make_array(2, 2)), 'value')", '[[1,1], \n [2,2]]'),
+    ("pondra_json_agg(make_array(row_to_json(named_struct('a', 1, 'b', 'x')), row_to_json(named_struct('a', 2, 'b', CAST(NULL AS TEXT)))), 'row')", '[{"a":1,"b":"x"}, \n {"a":2,"b":null}]'),
+    ("pondra_json_object_agg(make_array(named_struct('k', 'a', 'v', 1), named_struct('k', 'b', 'v', CAST(NULL AS BIGINT))), 'value')", '{ "a" : 1, "b" : null }'),
+    ("pondra_jsonb_agg(make_array(3, 1, 2), 'value')", '[3, 1, 2]'),
+    ("pondra_jsonb_object_agg(make_array(named_struct('k', 'bb', 'v', 1), named_struct('k', 'a', 'v', 2)), 'value')", '{"a": 2, "bb": 1}'),
+]
+
+MAKE_REFUSED = [  # (the expression, Postgres 16's SQLSTATE; the last is Postgres's '{bad'::json, refused at the cast)
+    ("json_build_object('a')", "22023"), ("json_build_object(NULL, 1)", "22004"), ("json_build_object(ARRAY[1], 1)", "22023"),
+    ("jsonb_build_object('a', pondra_as_json('{bad'))", "22P02"),
+]
+
+
+
+# Postgres 16's answers to the whole-row checks of `jsons` (the tables wholes_setup makes, on the same rows): each query's
+# rows as psql prints them, one list of fields per row; a NULL is ''. Captured from Postgres 16 with those tables.
+WHOLE_PG = {'BUILD': [['{"id" : 1, "doc" : {"a": 1, "b": [1, 2]}}'],
+           ['{"id" : 2, "doc" : {"c": null}}'],
+           ['{"id" : 3, "doc" : null}'],
+           ['{"id" : 4, "doc" : [1, "x"]}'],
+           ['{"id" : 5, "doc" : "str"}']],
+ 'TOJSON': [['{"a": 1, "b": [1, 2]}', '{"a": 3, "z": 1}'], ['{"c": null}', '{"k": "v"}'], ['', ''], ['[1, "x"]', '{"b": {"x": 2, "y": 1}}'], ['"str"', '[]']],
+ 'AGG_TABLE': [['[{"id":1,"name":"ann","k":1,"doc":{"a": 1, "b": [1, 2]},"docb":{"a": 3, "z": 1}}, \n'
+                ' {"id":2,"name":"bob","k":1,"doc":{"c": null},"docb":{"k": "v"}}, \n'
+                ' {"id":3,"name":"cy","k":2,"doc":null,"docb":null}, \n'
+                ' {"id":4,"name":"dee","k":2,"doc":[1, "x"],"docb":{"b": {"x": 2, "y": 1}}}, \n'
+                ' {"id":5,"name":"eve","k":3,"doc":"str","docb":[]}]']],
+ 'PAD_LEFT_AGG': [['1', '[{"id":10,"pid":1,"label":"a","doc":{"x": 1}}, \n {"id":11,"pid":1,"label":"b","doc":null}]'],
+                  ['2', '[{"id":12,"pid":2,"label":"c","doc":[1]}]'],
+                  ['3', '[null]']],
+ 'PAD_LEFT_ROWS': [['1', '{"id":10,"pid":1,"label":"a","doc":{"x": 1}}'], ['1', '{"id":11,"pid":1,"label":"b","doc":null}'],
+                   ['2', '{"id":12,"pid":2,"label":"c","doc":[1]}'], ['3', '']],
+ 'PAD_LEFT_COALESCE': [['1', '[{"id":10,"pid":1,"label":"a","doc":{"x": 1}}, \n {"id":11,"pid":1,"label":"b","doc":null}]'],
+                       ['2', '[{"id":12,"pid":2,"label":"c","doc":[1]}]'], ['3', '[]']],
+ 'PAD_LEFT_BUILD': [['1', '{"c" : {"id":10,"pid":1,"label":"a","doc":{"x": 1}}}'], ['1', '{"c" : {"id":11,"pid":1,"label":"b","doc":null}}'],
+                    ['2', '{"c" : {"id":12,"pid":2,"label":"c","doc":[1]}}'], ['3', '{"c" : null}']],
+ 'PAD_RIGHT_AGG': [['[{"id":1,"name":"ann"}, \n {"id":1,"name":"ann"}, \n {"id":2,"name":"bob"}, null]']],
+ 'PAD_RIGHT_GROUP': [['10', '[{"id":1,"name":"ann"}]'], ['11', '[{"id":1,"name":"ann"}]'], ['12', '[{"id":2,"name":"bob"}]'], ['13', '[null]']],
+ 'AGG_SUBQUERY': [['[{"id":1,"name":"ann"}, \n {"id":2,"name":"bob"}]']],
+ 'AGG_CTE': [['[{"id":1,"name":"ann","doc":{"a": 1, "b": [1, 2]}}, \n'
+              ' {"id":2,"name":"bob","doc":{"c": null}}, \n'
+              ' {"id":3,"name":"cy","doc":null}, \n'
+              ' {"id":4,"name":"dee","doc":[1, "x"]}, \n'
+              ' {"id":5,"name":"eve","doc":"str"}]']],
+ 'AGG_VIEW': [['[{"id":1,"name":"ann","doc":{"a": 1, "b": [1, 2]}}, \n'
+               ' {"id":2,"name":"bob","doc":{"c": null}}, \n'
+               ' {"id":3,"name":"cy","doc":null}, \n'
+               ' {"id":4,"name":"dee","doc":[1, "x"]}, \n'
+               ' {"id":5,"name":"eve","doc":"str"}]']],
+ 'ROWS': [['1', '{"id":1,"name":"ann","doc":{"a": 1, "b": [1, 2]}}', '{"id":1,"name":"ann","doc":{"a": 1, "b": [1, 2]}}'],
+          ['2', '{"id":2,"name":"bob","doc":{"c": null}}', '{"id":2,"name":"bob","doc":{"c": null}}'],
+          ['3', '{"id":3,"name":"cy","doc":null}', '{"id":3,"name":"cy","doc":null}'],
+          ['4', '{"id":4,"name":"dee","doc":[1, "x"]}', '{"id":4,"name":"dee","doc":[1, "x"]}'],
+          ['5', '{"id":5,"name":"eve","doc":"str"}', '{"id":5,"name":"eve","doc":"str"}']],
+ 'AGG_DESC': [['["eve", "dee", "cy", "bob", "ann"]']],
+ 'AGG_FILTER': [['["cy", "dee", "eve"]']],
+ 'AGG_DISTINCT': [['[1, 2, 3]']],
+ 'AGG_GROUP': [['1', '["ann", "bob"]'], ['2', '["cy", "dee"]'], ['3', '["eve"]']],
+ 'AGG_OVER': [['1', '["ann"]'], ['2', '["ann", "bob"]'], ['3', '["cy"]'], ['4', '["cy", "dee"]'], ['5', '["eve"]']],
+ 'JSONB_AGG': [['[{"a": 3, "z": 1}, {"k": "v"}, null, {"b": {"x": 2, "y": 1}}, []]']],
+ 'OBJECT_AGG': [['{ "ann" : {"a": 1, "b": [1, 2]}, "bob" : {"c": null}, "cy" : null, "dee" : [1, "x"], "eve" : "str" }']],
+ 'JSONB_OBJECT_AGG': [['{"ann": {"a": 3, "z": 1}, "bob": {"k": "v"}, "dee": {"b": {"x": 2, "y": 1}}, "eve": []}']],
+ 'AGG_BUILD': [['[{"a" : "ann", "doc" : {"a": 1, "b": [1, 2]}}, {"a" : "bob", "doc" : {"c": null}}, {"a" : "cy", "doc" : null}, {"a" : "dee", "doc" : [1, '
+                '"x"]}, {"a" : "eve", "doc" : "str"}]']],
+ 'POSTGREST': [['[{"id":1,"doc":{"a": 1, "b": [1, 2]}}, \n'
+                ' {"id":2,"doc":{"c": null}}, \n'
+                ' {"id":3,"doc":null}, \n'
+                ' {"id":4,"doc":[1, "x"]}, \n'
+                ' {"id":5,"doc":"str"}]']],
+ 'POSTGREST_EMPTY': [['[]']],
+ 'ITEMS': [['{"items" : [{"id":1,"doc":{"a": 1, "b": [1, 2]}}, \n'
+            ' {"id":2,"doc":{"c": null}}, \n'
+            ' {"id":3,"doc":null}, \n'
+            ' {"id":4,"doc":[1, "x"]}, \n'
+            ' {"id":5,"doc":"str"}]}']],
+ 'ITEMS_EMPTY': [['{"items" : []}']],
+ 'JSONB_KEYS': [['{"d" : {"a": 3, "z": 1}}']],
+ 'JSONB_KEYS_AGG': [['[{"d" : {"a": 3, "z": 1}}, {"d" : {"b": {"x": 2, "y": 1}}}]']],
+ 'WHERE': [['1'], ['2'], ['3'], ['4'], ['5']],
+ 'SCALAR': [['[{"id":1,"k":1}, \n {"id":2,"k":1}]']],
+ 'NAMES_AGG': [['[{"id":1}, \n {"id":2}, \n {"id":3}, \n {"id":4}, \n {"id":5}]', '5']],
+ 'NAMES_ROW': [['{"id":1}', '{"id":1}']],
+ 'EMPTY_AGG': [[""]],
+ 'NESTED_ROW': [['{"n" : "str", "row" : {"id":5,"doc":"str"}}']],
+ 'JSONB_BUILD': [['{"x": {"b": {"x": 2, "y": 1}}}']],
+ 'ROW_JSONB': [['{"docb":{"a": 3, "z": 1}}']],
+ 'BIG_MD5': [['ebe9b197b957da5ff234eb8d89ff5a17', '7']],
+ 'BIG_ROWS': [['0',
+               '["n7", "n14", "n21", "n28", "n35", "n42", "n49", "n56", "n63", "n70", "n77", "n84", "n91", "n98", "n105", "n112", "n119", "n126", "n133", '
+               '"n140", "n147", "n154", "n161", "n168", "n175", "n182", "n189", "n196", "n203", "n210", "n217", "n224", "n231", "n238", "n245", "n252", '
+               '"n259", "n266", "n273", "n280", "n287", "n294", "n301", "n308", "n315", "n322", "n329", "n336", "n343", "n350", "n357", "n364", "n371", '
+               '"n378", "n385", "n392", "n399", "n406", "n413", "n420", "n427", "n434", "n441", "n448", "n455", "n462", "n469", "n476", "n483", "n490", '
+               '"n497", "n504", "n511", "n518", "n525", "n532", "n539", "n546", "n553", "n560", "n567", "n574", "n581", "n588", "n595", "n602", "n609", '
+               '"n616", "n623", "n630", "n637", "n644", "n651", "n658", "n665", "n672", "n679", "n686", "n693", "n700", "n707", "n714", "n721", "n728", '
+               '"n735", "n742", "n749", "n756", "n763", "n770", "n777", "n784", "n791", "n798", "n805", "n812", "n819", "n826", "n833", "n840", "n847", '
+               '"n854", "n861", "n868", "n875", "n882", "n889", "n896", "n903", "n910", "n917", "n924", "n931", "n938", "n945", "n952", "n959", "n966", '
+               '"n973", "n980", "n987", "n994", "n1001", "n1008", "n1015", "n1022", "n1029", "n1036", "n1043", "n1050", "n1057", "n1064", "n1071", "n1078", '
+               '"n1085", "n1092", "n1099", "n1106", "n1113", "n1120", "n1127", "n1134", "n1141", "n1148", "n1155", "n1162", "n1169", "n1176", "n1183", '
+               '"n1190", "n1197", "n1204", "n1211", "n1218", "n1225", "n1232", "n1239", "n1246", "n1253", "n1260", "n1267", "n1274", "n1281", "n1288", '
+               '"n1295", "n1302", "n1309", "n1316", "n1323", "n1330", "n1337", "n1344", "n1351", "n1358", "n1365", "n1372", "n1379", "n1386", "n1393", '
+               '"n1400", "n1407", "n1414", "n1421", "n1428", "n1435", "n1442", "n1449", "n1456", "n1463", "n1470", "n1477", "n1484", "n1491", "n1498", '
+               '"n1505", "n1512", "n1519", "n1526", "n1533", "n1540", "n1547", "n1554", "n1561", "n1568", "n1575", "n1582", "n1589", "n1596", "n1603", '
+               '"n1610", "n1617", "n1624", "n1631", "n1638", "n1645", "n1652", "n1659", "n1666", "n1673", "n1680", "n1687", "n1694", "n1701", "n1708", '
+               '"n1715", "n1722", "n1729", "n1736", "n1743", "n1750", "n1757", "n1764", "n1771", "n1778", "n1785", "n1792", "n1799", "n1806", "n1813", '
+               '"n1820", "n1827", "n1834", "n1841", "n1848", "n1855", "n1862", "n1869", "n1876", "n1883", "n1890", "n1897", "n1904", "n1911", "n1918", '
+               '"n1925", "n1932", "n1939", "n1946", "n1953", "n1960", "n1967", "n1974", "n1981", "n1988", "n1995", "n2002", "n2009", "n2016", "n2023", '
+               '"n2030", "n2037", "n2044", "n2051", "n2058", "n2065", "n2072", "n2079", "n2086", "n2093", "n2100", "n2107", "n2114", "n2121", "n2128", '
+               '"n2135", "n2142", "n2149", "n2156", "n2163", "n2170", "n2177", "n2184", "n2191", "n2198", "n2205", "n2212", "n2219", "n2226", "n2233", '
+               '"n2240", "n2247", "n2254", "n2261", "n2268", "n2275", "n2282", "n2289", "n2296", "n2303", "n2310", "n2317", "n2324", "n2331", "n2338", '
+               '"n2345", "n2352", "n2359", "n2366", "n2373", "n2380", "n2387", "n2394", "n2401", "n2408", "n2415", "n2422", "n2429", "n2436", "n2443", '
+               '"n2450", "n2457", "n2464", "n2471", "n2478", "n2485", "n2492", "n2499", "n2506", "n2513", "n2520", "n2527", "n2534", "n2541", "n2548", '
+               '"n2555", "n2562", "n2569", "n2576", "n2583", "n2590", "n2597", "n2604", "n2611", "n2618", "n2625", "n2632", "n2639", "n2646", "n2653", '
+               '"n2660", "n2667", "n2674", "n2681", "n2688", "n2695", "n2702", "n2709", "n2716", "n2723", "n2730", "n2737", "n2744", "n2751", "n2758", '
+               '"n2765", "n2772", "n2779", "n2786", "n2793", "n2800", "n2807", "n2814", "n2821", "n2828", "n2835", "n2842", "n2849", "n2856", "n2863", '
+               '"n2870", "n2877", "n2884", "n2891", "n2898", "n2905", "n2912", "n2919", "n2926", "n2933", "n2940", "n2947", "n2954", "n2961", "n2968", '
+               '"n2975", "n2982", "n2989", "n2996"]'],
+              ['1',
+               '["n1", "n8", "n15", "n22", "n29", "n36", "n43", "n50", "n57", "n64", "n71", "n78", "n85", "n92", "n99", "n106", "n113", "n120", "n127", '
+               '"n134", "n141", "n148", "n155", "n162", "n169", "n176", "n183", "n190", "n197", "n204", "n211", "n218", "n225", "n232", "n239", "n246", '
+               '"n253", "n260", "n267", "n274", "n281", "n288", "n295", "n302", "n309", "n316", "n323", "n330", "n337", "n344", "n351", "n358", "n365", '
+               '"n372", "n379", "n386", "n393", "n400", "n407", "n414", "n421", "n428", "n435", "n442", "n449", "n456", "n463", "n470", "n477", "n484", '
+               '"n491", "n498", "n505", "n512", "n519", "n526", "n533", "n540", "n547", "n554", "n561", "n568", "n575", "n582", "n589", "n596", "n603", '
+               '"n610", "n617", "n624", "n631", "n638", "n645", "n652", "n659", "n666", "n673", "n680", "n687", "n694", "n701", "n708", "n715", "n722", '
+               '"n729", "n736", "n743", "n750", "n757", "n764", "n771", "n778", "n785", "n792", "n799", "n806", "n813", "n820", "n827", "n834", "n841", '
+               '"n848", "n855", "n862", "n869", "n876", "n883", "n890", "n897", "n904", "n911", "n918", "n925", "n932", "n939", "n946", "n953", "n960", '
+               '"n967", "n974", "n981", "n988", "n995", "n1002", "n1009", "n1016", "n1023", "n1030", "n1037", "n1044", "n1051", "n1058", "n1065", "n1072", '
+               '"n1079", "n1086", "n1093", "n1100", "n1107", "n1114", "n1121", "n1128", "n1135", "n1142", "n1149", "n1156", "n1163", "n1170", "n1177", '
+               '"n1184", "n1191", "n1198", "n1205", "n1212", "n1219", "n1226", "n1233", "n1240", "n1247", "n1254", "n1261", "n1268", "n1275", "n1282", '
+               '"n1289", "n1296", "n1303", "n1310", "n1317", "n1324", "n1331", "n1338", "n1345", "n1352", "n1359", "n1366", "n1373", "n1380", "n1387", '
+               '"n1394", "n1401", "n1408", "n1415", "n1422", "n1429", "n1436", "n1443", "n1450", "n1457", "n1464", "n1471", "n1478", "n1485", "n1492", '
+               '"n1499", "n1506", "n1513", "n1520", "n1527", "n1534", "n1541", "n1548", "n1555", "n1562", "n1569", "n1576", "n1583", "n1590", "n1597", '
+               '"n1604", "n1611", "n1618", "n1625", "n1632", "n1639", "n1646", "n1653", "n1660", "n1667", "n1674", "n1681", "n1688", "n1695", "n1702", '
+               '"n1709", "n1716", "n1723", "n1730", "n1737", "n1744", "n1751", "n1758", "n1765", "n1772", "n1779", "n1786", "n1793", "n1800", "n1807", '
+               '"n1814", "n1821", "n1828", "n1835", "n1842", "n1849", "n1856", "n1863", "n1870", "n1877", "n1884", "n1891", "n1898", "n1905", "n1912", '
+               '"n1919", "n1926", "n1933", "n1940", "n1947", "n1954", "n1961", "n1968", "n1975", "n1982", "n1989", "n1996", "n2003", "n2010", "n2017", '
+               '"n2024", "n2031", "n2038", "n2045", "n2052", "n2059", "n2066", "n2073", "n2080", "n2087", "n2094", "n2101", "n2108", "n2115", "n2122", '
+               '"n2129", "n2136", "n2143", "n2150", "n2157", "n2164", "n2171", "n2178", "n2185", "n2192", "n2199", "n2206", "n2213", "n2220", "n2227", '
+               '"n2234", "n2241", "n2248", "n2255", "n2262", "n2269", "n2276", "n2283", "n2290", "n2297", "n2304", "n2311", "n2318", "n2325", "n2332", '
+               '"n2339", "n2346", "n2353", "n2360", "n2367", "n2374", "n2381", "n2388", "n2395", "n2402", "n2409", "n2416", "n2423", "n2430", "n2437", '
+               '"n2444", "n2451", "n2458", "n2465", "n2472", "n2479", "n2486", "n2493", "n2500", "n2507", "n2514", "n2521", "n2528", "n2535", "n2542", '
+               '"n2549", "n2556", "n2563", "n2570", "n2577", "n2584", "n2591", "n2598", "n2605", "n2612", "n2619", "n2626", "n2633", "n2640", "n2647", '
+               '"n2654", "n2661", "n2668", "n2675", "n2682", "n2689", "n2696", "n2703", "n2710", "n2717", "n2724", "n2731", "n2738", "n2745", "n2752", '
+               '"n2759", "n2766", "n2773", "n2780", "n2787", "n2794", "n2801", "n2808", "n2815", "n2822", "n2829", "n2836", "n2843", "n2850", "n2857", '
+               '"n2864", "n2871", "n2878", "n2885", "n2892", "n2899", "n2906", "n2913", "n2920", "n2927", "n2934", "n2941", "n2948", "n2955", "n2962", '
+               '"n2969", "n2976", "n2983", "n2990", "n2997"]'],
+              ['2',
+               '["n2", "n9", "n16", "n23", "n30", "n37", "n44", "n51", "n58", "n65", "n72", "n79", "n86", "n93", "n100", "n107", "n114", "n121", "n128", '
+               '"n135", "n142", "n149", "n156", "n163", "n170", "n177", "n184", "n191", "n198", "n205", "n212", "n219", "n226", "n233", "n240", "n247", '
+               '"n254", "n261", "n268", "n275", "n282", "n289", "n296", "n303", "n310", "n317", "n324", "n331", "n338", "n345", "n352", "n359", "n366", '
+               '"n373", "n380", "n387", "n394", "n401", "n408", "n415", "n422", "n429", "n436", "n443", "n450", "n457", "n464", "n471", "n478", "n485", '
+               '"n492", "n499", "n506", "n513", "n520", "n527", "n534", "n541", "n548", "n555", "n562", "n569", "n576", "n583", "n590", "n597", "n604", '
+               '"n611", "n618", "n625", "n632", "n639", "n646", "n653", "n660", "n667", "n674", "n681", "n688", "n695", "n702", "n709", "n716", "n723", '
+               '"n730", "n737", "n744", "n751", "n758", "n765", "n772", "n779", "n786", "n793", "n800", "n807", "n814", "n821", "n828", "n835", "n842", '
+               '"n849", "n856", "n863", "n870", "n877", "n884", "n891", "n898", "n905", "n912", "n919", "n926", "n933", "n940", "n947", "n954", "n961", '
+               '"n968", "n975", "n982", "n989", "n996", "n1003", "n1010", "n1017", "n1024", "n1031", "n1038", "n1045", "n1052", "n1059", "n1066", "n1073", '
+               '"n1080", "n1087", "n1094", "n1101", "n1108", "n1115", "n1122", "n1129", "n1136", "n1143", "n1150", "n1157", "n1164", "n1171", "n1178", '
+               '"n1185", "n1192", "n1199", "n1206", "n1213", "n1220", "n1227", "n1234", "n1241", "n1248", "n1255", "n1262", "n1269", "n1276", "n1283", '
+               '"n1290", "n1297", "n1304", "n1311", "n1318", "n1325", "n1332", "n1339", "n1346", "n1353", "n1360", "n1367", "n1374", "n1381", "n1388", '
+               '"n1395", "n1402", "n1409", "n1416", "n1423", "n1430", "n1437", "n1444", "n1451", "n1458", "n1465", "n1472", "n1479", "n1486", "n1493", '
+               '"n1500", "n1507", "n1514", "n1521", "n1528", "n1535", "n1542", "n1549", "n1556", "n1563", "n1570", "n1577", "n1584", "n1591", "n1598", '
+               '"n1605", "n1612", "n1619", "n1626", "n1633", "n1640", "n1647", "n1654", "n1661", "n1668", "n1675", "n1682", "n1689", "n1696", "n1703", '
+               '"n1710", "n1717", "n1724", "n1731", "n1738", "n1745", "n1752", "n1759", "n1766", "n1773", "n1780", "n1787", "n1794", "n1801", "n1808", '
+               '"n1815", "n1822", "n1829", "n1836", "n1843", "n1850", "n1857", "n1864", "n1871", "n1878", "n1885", "n1892", "n1899", "n1906", "n1913", '
+               '"n1920", "n1927", "n1934", "n1941", "n1948", "n1955", "n1962", "n1969", "n1976", "n1983", "n1990", "n1997", "n2004", "n2011", "n2018", '
+               '"n2025", "n2032", "n2039", "n2046", "n2053", "n2060", "n2067", "n2074", "n2081", "n2088", "n2095", "n2102", "n2109", "n2116", "n2123", '
+               '"n2130", "n2137", "n2144", "n2151", "n2158", "n2165", "n2172", "n2179", "n2186", "n2193", "n2200", "n2207", "n2214", "n2221", "n2228", '
+               '"n2235", "n2242", "n2249", "n2256", "n2263", "n2270", "n2277", "n2284", "n2291", "n2298", "n2305", "n2312", "n2319", "n2326", "n2333", '
+               '"n2340", "n2347", "n2354", "n2361", "n2368", "n2375", "n2382", "n2389", "n2396", "n2403", "n2410", "n2417", "n2424", "n2431", "n2438", '
+               '"n2445", "n2452", "n2459", "n2466", "n2473", "n2480", "n2487", "n2494", "n2501", "n2508", "n2515", "n2522", "n2529", "n2536", "n2543", '
+               '"n2550", "n2557", "n2564", "n2571", "n2578", "n2585", "n2592", "n2599", "n2606", "n2613", "n2620", "n2627", "n2634", "n2641", "n2648", '
+               '"n2655", "n2662", "n2669", "n2676", "n2683", "n2690", "n2697", "n2704", "n2711", "n2718", "n2725", "n2732", "n2739", "n2746", "n2753", '
+               '"n2760", "n2767", "n2774", "n2781", "n2788", "n2795", "n2802", "n2809", "n2816", "n2823", "n2830", "n2837", "n2844", "n2851", "n2858", '
+               '"n2865", "n2872", "n2879", "n2886", "n2893", "n2900", "n2907", "n2914", "n2921", "n2928", "n2935", "n2942", "n2949", "n2956", "n2963", '
+               '"n2970", "n2977", "n2984", "n2991", "n2998"]'],
+              ['3',
+               '["n3", "n10", "n17", "n24", "n31", "n38", "n45", "n52", "n59", "n66", "n73", "n80", "n87", "n94", "n101", "n108", "n115", "n122", "n129", '
+               '"n136", "n143", "n150", "n157", "n164", "n171", "n178", "n185", "n192", "n199", "n206", "n213", "n220", "n227", "n234", "n241", "n248", '
+               '"n255", "n262", "n269", "n276", "n283", "n290", "n297", "n304", "n311", "n318", "n325", "n332", "n339", "n346", "n353", "n360", "n367", '
+               '"n374", "n381", "n388", "n395", "n402", "n409", "n416", "n423", "n430", "n437", "n444", "n451", "n458", "n465", "n472", "n479", "n486", '
+               '"n493", "n500", "n507", "n514", "n521", "n528", "n535", "n542", "n549", "n556", "n563", "n570", "n577", "n584", "n591", "n598", "n605", '
+               '"n612", "n619", "n626", "n633", "n640", "n647", "n654", "n661", "n668", "n675", "n682", "n689", "n696", "n703", "n710", "n717", "n724", '
+               '"n731", "n738", "n745", "n752", "n759", "n766", "n773", "n780", "n787", "n794", "n801", "n808", "n815", "n822", "n829", "n836", "n843", '
+               '"n850", "n857", "n864", "n871", "n878", "n885", "n892", "n899", "n906", "n913", "n920", "n927", "n934", "n941", "n948", "n955", "n962", '
+               '"n969", "n976", "n983", "n990", "n997", "n1004", "n1011", "n1018", "n1025", "n1032", "n1039", "n1046", "n1053", "n1060", "n1067", "n1074", '
+               '"n1081", "n1088", "n1095", "n1102", "n1109", "n1116", "n1123", "n1130", "n1137", "n1144", "n1151", "n1158", "n1165", "n1172", "n1179", '
+               '"n1186", "n1193", "n1200", "n1207", "n1214", "n1221", "n1228", "n1235", "n1242", "n1249", "n1256", "n1263", "n1270", "n1277", "n1284", '
+               '"n1291", "n1298", "n1305", "n1312", "n1319", "n1326", "n1333", "n1340", "n1347", "n1354", "n1361", "n1368", "n1375", "n1382", "n1389", '
+               '"n1396", "n1403", "n1410", "n1417", "n1424", "n1431", "n1438", "n1445", "n1452", "n1459", "n1466", "n1473", "n1480", "n1487", "n1494", '
+               '"n1501", "n1508", "n1515", "n1522", "n1529", "n1536", "n1543", "n1550", "n1557", "n1564", "n1571", "n1578", "n1585", "n1592", "n1599", '
+               '"n1606", "n1613", "n1620", "n1627", "n1634", "n1641", "n1648", "n1655", "n1662", "n1669", "n1676", "n1683", "n1690", "n1697", "n1704", '
+               '"n1711", "n1718", "n1725", "n1732", "n1739", "n1746", "n1753", "n1760", "n1767", "n1774", "n1781", "n1788", "n1795", "n1802", "n1809", '
+               '"n1816", "n1823", "n1830", "n1837", "n1844", "n1851", "n1858", "n1865", "n1872", "n1879", "n1886", "n1893", "n1900", "n1907", "n1914", '
+               '"n1921", "n1928", "n1935", "n1942", "n1949", "n1956", "n1963", "n1970", "n1977", "n1984", "n1991", "n1998", "n2005", "n2012", "n2019", '
+               '"n2026", "n2033", "n2040", "n2047", "n2054", "n2061", "n2068", "n2075", "n2082", "n2089", "n2096", "n2103", "n2110", "n2117", "n2124", '
+               '"n2131", "n2138", "n2145", "n2152", "n2159", "n2166", "n2173", "n2180", "n2187", "n2194", "n2201", "n2208", "n2215", "n2222", "n2229", '
+               '"n2236", "n2243", "n2250", "n2257", "n2264", "n2271", "n2278", "n2285", "n2292", "n2299", "n2306", "n2313", "n2320", "n2327", "n2334", '
+               '"n2341", "n2348", "n2355", "n2362", "n2369", "n2376", "n2383", "n2390", "n2397", "n2404", "n2411", "n2418", "n2425", "n2432", "n2439", '
+               '"n2446", "n2453", "n2460", "n2467", "n2474", "n2481", "n2488", "n2495", "n2502", "n2509", "n2516", "n2523", "n2530", "n2537", "n2544", '
+               '"n2551", "n2558", "n2565", "n2572", "n2579", "n2586", "n2593", "n2600", "n2607", "n2614", "n2621", "n2628", "n2635", "n2642", "n2649", '
+               '"n2656", "n2663", "n2670", "n2677", "n2684", "n2691", "n2698", "n2705", "n2712", "n2719", "n2726", "n2733", "n2740", "n2747", "n2754", '
+               '"n2761", "n2768", "n2775", "n2782", "n2789", "n2796", "n2803", "n2810", "n2817", "n2824", "n2831", "n2838", "n2845", "n2852", "n2859", '
+               '"n2866", "n2873", "n2880", "n2887", "n2894", "n2901", "n2908", "n2915", "n2922", "n2929", "n2936", "n2943", "n2950", "n2957", "n2964", '
+               '"n2971", "n2978", "n2985", "n2992", "n2999"]'],
+              ['4',
+               '["n4", "n11", "n18", "n25", "n32", "n39", "n46", "n53", "n60", "n67", "n74", "n81", "n88", "n95", "n102", "n109", "n116", "n123", "n130", '
+               '"n137", "n144", "n151", "n158", "n165", "n172", "n179", "n186", "n193", "n200", "n207", "n214", "n221", "n228", "n235", "n242", "n249", '
+               '"n256", "n263", "n270", "n277", "n284", "n291", "n298", "n305", "n312", "n319", "n326", "n333", "n340", "n347", "n354", "n361", "n368", '
+               '"n375", "n382", "n389", "n396", "n403", "n410", "n417", "n424", "n431", "n438", "n445", "n452", "n459", "n466", "n473", "n480", "n487", '
+               '"n494", "n501", "n508", "n515", "n522", "n529", "n536", "n543", "n550", "n557", "n564", "n571", "n578", "n585", "n592", "n599", "n606", '
+               '"n613", "n620", "n627", "n634", "n641", "n648", "n655", "n662", "n669", "n676", "n683", "n690", "n697", "n704", "n711", "n718", "n725", '
+               '"n732", "n739", "n746", "n753", "n760", "n767", "n774", "n781", "n788", "n795", "n802", "n809", "n816", "n823", "n830", "n837", "n844", '
+               '"n851", "n858", "n865", "n872", "n879", "n886", "n893", "n900", "n907", "n914", "n921", "n928", "n935", "n942", "n949", "n956", "n963", '
+               '"n970", "n977", "n984", "n991", "n998", "n1005", "n1012", "n1019", "n1026", "n1033", "n1040", "n1047", "n1054", "n1061", "n1068", "n1075", '
+               '"n1082", "n1089", "n1096", "n1103", "n1110", "n1117", "n1124", "n1131", "n1138", "n1145", "n1152", "n1159", "n1166", "n1173", "n1180", '
+               '"n1187", "n1194", "n1201", "n1208", "n1215", "n1222", "n1229", "n1236", "n1243", "n1250", "n1257", "n1264", "n1271", "n1278", "n1285", '
+               '"n1292", "n1299", "n1306", "n1313", "n1320", "n1327", "n1334", "n1341", "n1348", "n1355", "n1362", "n1369", "n1376", "n1383", "n1390", '
+               '"n1397", "n1404", "n1411", "n1418", "n1425", "n1432", "n1439", "n1446", "n1453", "n1460", "n1467", "n1474", "n1481", "n1488", "n1495", '
+               '"n1502", "n1509", "n1516", "n1523", "n1530", "n1537", "n1544", "n1551", "n1558", "n1565", "n1572", "n1579", "n1586", "n1593", "n1600", '
+               '"n1607", "n1614", "n1621", "n1628", "n1635", "n1642", "n1649", "n1656", "n1663", "n1670", "n1677", "n1684", "n1691", "n1698", "n1705", '
+               '"n1712", "n1719", "n1726", "n1733", "n1740", "n1747", "n1754", "n1761", "n1768", "n1775", "n1782", "n1789", "n1796", "n1803", "n1810", '
+               '"n1817", "n1824", "n1831", "n1838", "n1845", "n1852", "n1859", "n1866", "n1873", "n1880", "n1887", "n1894", "n1901", "n1908", "n1915", '
+               '"n1922", "n1929", "n1936", "n1943", "n1950", "n1957", "n1964", "n1971", "n1978", "n1985", "n1992", "n1999", "n2006", "n2013", "n2020", '
+               '"n2027", "n2034", "n2041", "n2048", "n2055", "n2062", "n2069", "n2076", "n2083", "n2090", "n2097", "n2104", "n2111", "n2118", "n2125", '
+               '"n2132", "n2139", "n2146", "n2153", "n2160", "n2167", "n2174", "n2181", "n2188", "n2195", "n2202", "n2209", "n2216", "n2223", "n2230", '
+               '"n2237", "n2244", "n2251", "n2258", "n2265", "n2272", "n2279", "n2286", "n2293", "n2300", "n2307", "n2314", "n2321", "n2328", "n2335", '
+               '"n2342", "n2349", "n2356", "n2363", "n2370", "n2377", "n2384", "n2391", "n2398", "n2405", "n2412", "n2419", "n2426", "n2433", "n2440", '
+               '"n2447", "n2454", "n2461", "n2468", "n2475", "n2482", "n2489", "n2496", "n2503", "n2510", "n2517", "n2524", "n2531", "n2538", "n2545", '
+               '"n2552", "n2559", "n2566", "n2573", "n2580", "n2587", "n2594", "n2601", "n2608", "n2615", "n2622", "n2629", "n2636", "n2643", "n2650", '
+               '"n2657", "n2664", "n2671", "n2678", "n2685", "n2692", "n2699", "n2706", "n2713", "n2720", "n2727", "n2734", "n2741", "n2748", "n2755", '
+               '"n2762", "n2769", "n2776", "n2783", "n2790", "n2797", "n2804", "n2811", "n2818", "n2825", "n2832", "n2839", "n2846", "n2853", "n2860", '
+               '"n2867", "n2874", "n2881", "n2888", "n2895", "n2902", "n2909", "n2916", "n2923", "n2930", "n2937", "n2944", "n2951", "n2958", "n2965", '
+               '"n2972", "n2979", "n2986", "n2993", "n3000"]'],
+              ['5',
+               '["n5", "n12", "n19", "n26", "n33", "n40", "n47", "n54", "n61", "n68", "n75", "n82", "n89", "n96", "n103", "n110", "n117", "n124", "n131", '
+               '"n138", "n145", "n152", "n159", "n166", "n173", "n180", "n187", "n194", "n201", "n208", "n215", "n222", "n229", "n236", "n243", "n250", '
+               '"n257", "n264", "n271", "n278", "n285", "n292", "n299", "n306", "n313", "n320", "n327", "n334", "n341", "n348", "n355", "n362", "n369", '
+               '"n376", "n383", "n390", "n397", "n404", "n411", "n418", "n425", "n432", "n439", "n446", "n453", "n460", "n467", "n474", "n481", "n488", '
+               '"n495", "n502", "n509", "n516", "n523", "n530", "n537", "n544", "n551", "n558", "n565", "n572", "n579", "n586", "n593", "n600", "n607", '
+               '"n614", "n621", "n628", "n635", "n642", "n649", "n656", "n663", "n670", "n677", "n684", "n691", "n698", "n705", "n712", "n719", "n726", '
+               '"n733", "n740", "n747", "n754", "n761", "n768", "n775", "n782", "n789", "n796", "n803", "n810", "n817", "n824", "n831", "n838", "n845", '
+               '"n852", "n859", "n866", "n873", "n880", "n887", "n894", "n901", "n908", "n915", "n922", "n929", "n936", "n943", "n950", "n957", "n964", '
+               '"n971", "n978", "n985", "n992", "n999", "n1006", "n1013", "n1020", "n1027", "n1034", "n1041", "n1048", "n1055", "n1062", "n1069", "n1076", '
+               '"n1083", "n1090", "n1097", "n1104", "n1111", "n1118", "n1125", "n1132", "n1139", "n1146", "n1153", "n1160", "n1167", "n1174", "n1181", '
+               '"n1188", "n1195", "n1202", "n1209", "n1216", "n1223", "n1230", "n1237", "n1244", "n1251", "n1258", "n1265", "n1272", "n1279", "n1286", '
+               '"n1293", "n1300", "n1307", "n1314", "n1321", "n1328", "n1335", "n1342", "n1349", "n1356", "n1363", "n1370", "n1377", "n1384", "n1391", '
+               '"n1398", "n1405", "n1412", "n1419", "n1426", "n1433", "n1440", "n1447", "n1454", "n1461", "n1468", "n1475", "n1482", "n1489", "n1496", '
+               '"n1503", "n1510", "n1517", "n1524", "n1531", "n1538", "n1545", "n1552", "n1559", "n1566", "n1573", "n1580", "n1587", "n1594", "n1601", '
+               '"n1608", "n1615", "n1622", "n1629", "n1636", "n1643", "n1650", "n1657", "n1664", "n1671", "n1678", "n1685", "n1692", "n1699", "n1706", '
+               '"n1713", "n1720", "n1727", "n1734", "n1741", "n1748", "n1755", "n1762", "n1769", "n1776", "n1783", "n1790", "n1797", "n1804", "n1811", '
+               '"n1818", "n1825", "n1832", "n1839", "n1846", "n1853", "n1860", "n1867", "n1874", "n1881", "n1888", "n1895", "n1902", "n1909", "n1916", '
+               '"n1923", "n1930", "n1937", "n1944", "n1951", "n1958", "n1965", "n1972", "n1979", "n1986", "n1993", "n2000", "n2007", "n2014", "n2021", '
+               '"n2028", "n2035", "n2042", "n2049", "n2056", "n2063", "n2070", "n2077", "n2084", "n2091", "n2098", "n2105", "n2112", "n2119", "n2126", '
+               '"n2133", "n2140", "n2147", "n2154", "n2161", "n2168", "n2175", "n2182", "n2189", "n2196", "n2203", "n2210", "n2217", "n2224", "n2231", '
+               '"n2238", "n2245", "n2252", "n2259", "n2266", "n2273", "n2280", "n2287", "n2294", "n2301", "n2308", "n2315", "n2322", "n2329", "n2336", '
+               '"n2343", "n2350", "n2357", "n2364", "n2371", "n2378", "n2385", "n2392", "n2399", "n2406", "n2413", "n2420", "n2427", "n2434", "n2441", '
+               '"n2448", "n2455", "n2462", "n2469", "n2476", "n2483", "n2490", "n2497", "n2504", "n2511", "n2518", "n2525", "n2532", "n2539", "n2546", '
+               '"n2553", "n2560", "n2567", "n2574", "n2581", "n2588", "n2595", "n2602", "n2609", "n2616", "n2623", "n2630", "n2637", "n2644", "n2651", '
+               '"n2658", "n2665", "n2672", "n2679", "n2686", "n2693", "n2700", "n2707", "n2714", "n2721", "n2728", "n2735", "n2742", "n2749", "n2756", '
+               '"n2763", "n2770", "n2777", "n2784", "n2791", "n2798", "n2805", "n2812", "n2819", "n2826", "n2833", "n2840", "n2847", "n2854", "n2861", '
+               '"n2868", "n2875", "n2882", "n2889", "n2896", "n2903", "n2910", "n2917", "n2924", "n2931", "n2938", "n2945", "n2952", "n2959", "n2966", '
+               '"n2973", "n2980", "n2987", "n2994"]'],
+              ['6',
+               '["n6", "n13", "n20", "n27", "n34", "n41", "n48", "n55", "n62", "n69", "n76", "n83", "n90", "n97", "n104", "n111", "n118", "n125", "n132", '
+               '"n139", "n146", "n153", "n160", "n167", "n174", "n181", "n188", "n195", "n202", "n209", "n216", "n223", "n230", "n237", "n244", "n251", '
+               '"n258", "n265", "n272", "n279", "n286", "n293", "n300", "n307", "n314", "n321", "n328", "n335", "n342", "n349", "n356", "n363", "n370", '
+               '"n377", "n384", "n391", "n398", "n405", "n412", "n419", "n426", "n433", "n440", "n447", "n454", "n461", "n468", "n475", "n482", "n489", '
+               '"n496", "n503", "n510", "n517", "n524", "n531", "n538", "n545", "n552", "n559", "n566", "n573", "n580", "n587", "n594", "n601", "n608", '
+               '"n615", "n622", "n629", "n636", "n643", "n650", "n657", "n664", "n671", "n678", "n685", "n692", "n699", "n706", "n713", "n720", "n727", '
+               '"n734", "n741", "n748", "n755", "n762", "n769", "n776", "n783", "n790", "n797", "n804", "n811", "n818", "n825", "n832", "n839", "n846", '
+               '"n853", "n860", "n867", "n874", "n881", "n888", "n895", "n902", "n909", "n916", "n923", "n930", "n937", "n944", "n951", "n958", "n965", '
+               '"n972", "n979", "n986", "n993", "n1000", "n1007", "n1014", "n1021", "n1028", "n1035", "n1042", "n1049", "n1056", "n1063", "n1070", "n1077", '
+               '"n1084", "n1091", "n1098", "n1105", "n1112", "n1119", "n1126", "n1133", "n1140", "n1147", "n1154", "n1161", "n1168", "n1175", "n1182", '
+               '"n1189", "n1196", "n1203", "n1210", "n1217", "n1224", "n1231", "n1238", "n1245", "n1252", "n1259", "n1266", "n1273", "n1280", "n1287", '
+               '"n1294", "n1301", "n1308", "n1315", "n1322", "n1329", "n1336", "n1343", "n1350", "n1357", "n1364", "n1371", "n1378", "n1385", "n1392", '
+               '"n1399", "n1406", "n1413", "n1420", "n1427", "n1434", "n1441", "n1448", "n1455", "n1462", "n1469", "n1476", "n1483", "n1490", "n1497", '
+               '"n1504", "n1511", "n1518", "n1525", "n1532", "n1539", "n1546", "n1553", "n1560", "n1567", "n1574", "n1581", "n1588", "n1595", "n1602", '
+               '"n1609", "n1616", "n1623", "n1630", "n1637", "n1644", "n1651", "n1658", "n1665", "n1672", "n1679", "n1686", "n1693", "n1700", "n1707", '
+               '"n1714", "n1721", "n1728", "n1735", "n1742", "n1749", "n1756", "n1763", "n1770", "n1777", "n1784", "n1791", "n1798", "n1805", "n1812", '
+               '"n1819", "n1826", "n1833", "n1840", "n1847", "n1854", "n1861", "n1868", "n1875", "n1882", "n1889", "n1896", "n1903", "n1910", "n1917", '
+               '"n1924", "n1931", "n1938", "n1945", "n1952", "n1959", "n1966", "n1973", "n1980", "n1987", "n1994", "n2001", "n2008", "n2015", "n2022", '
+               '"n2029", "n2036", "n2043", "n2050", "n2057", "n2064", "n2071", "n2078", "n2085", "n2092", "n2099", "n2106", "n2113", "n2120", "n2127", '
+               '"n2134", "n2141", "n2148", "n2155", "n2162", "n2169", "n2176", "n2183", "n2190", "n2197", "n2204", "n2211", "n2218", "n2225", "n2232", '
+               '"n2239", "n2246", "n2253", "n2260", "n2267", "n2274", "n2281", "n2288", "n2295", "n2302", "n2309", "n2316", "n2323", "n2330", "n2337", '
+               '"n2344", "n2351", "n2358", "n2365", "n2372", "n2379", "n2386", "n2393", "n2400", "n2407", "n2414", "n2421", "n2428", "n2435", "n2442", '
+               '"n2449", "n2456", "n2463", "n2470", "n2477", "n2484", "n2491", "n2498", "n2505", "n2512", "n2519", "n2526", "n2533", "n2540", "n2547", '
+               '"n2554", "n2561", "n2568", "n2575", "n2582", "n2589", "n2596", "n2603", "n2610", "n2617", "n2624", "n2631", "n2638", "n2645", "n2652", '
+               '"n2659", "n2666", "n2673", "n2680", "n2687", "n2694", "n2701", "n2708", "n2715", "n2722", "n2729", "n2736", "n2743", "n2750", "n2757", '
+               '"n2764", "n2771", "n2778", "n2785", "n2792", "n2799", "n2806", "n2813", "n2820", "n2827", "n2834", "n2841", "n2848", "n2855", "n2862", '
+               '"n2869", "n2876", "n2883", "n2890", "n2897", "n2904", "n2911", "n2918", "n2925", "n2932", "n2939", "n2946", "n2953", "n2960", "n2967", '
+               '"n2974", "n2981", "n2988", "n2995"]']]}
+
+
+def _jsons_spaces(check, over_http, over_port, info):
+    """JSON's spaces in front of a literal, and a tab, a newline or CRLF inside or after it (PR #131): -> , ->>, #> and #>>
+    walk a json and a jsonb literal as Postgres 16 walks it, over HTTP (the expression's JSON text) and the port (its text
+    cast). An empty path gives the whole document with the spaces at its ends left out (Postgres's own answer): json keeps
+    the rest of its text as written, jsonb prints as jsonb does. Each expected answer was asked of Postgres 16 on the same text."""
+    J = " \t{\"a\": \"x\", \"b\": [1, 2], \"c\": {\"d\": null}}\n"
+    K = "\r\n {\"k\" :\t\"v\" , \"n\" : 1.50 }  "
+    J_WALKS = [("-> 'a'", '"x"'), ("->> 'a'", "x"), ("#> '{b,0}'", "1"), ("#>> '{b,0}'", "1"), ("-> 'c'", '{"d": null}'),
+               ("->> 'c'", '{"d": null}'), ("#> '{c,d}'", "null"), ("#>> '{c,d}'", None), ("-> 'b' -> -1", "2"),
+               ("#>> '{b,1}'", "2"), ("#> '{b,5}'", None), ("-> 'zz'", None),
+               ("#> '{}'", '{"a": "x", "b": [1, 2], "c": {"d": null}}'), ("#>> '{}'", '{"a": "x", "b": [1, 2], "c": {"d": null}}')]
+    K_JSON = [("-> 'k'", '"v"'), ("->> 'k'", "v"), ("#> '{n}'", "1.50"), ("#>> '{n}'", "1.50"),
+              ("#> '{}'", '{"k" :\t"v" , "n" : 1.50 }'), ("#>> '{}'", '{"k" :\t"v" , "n" : 1.50 }')]
+    K_JSONB = [("-> 'k'", '"v"'), ("->> 'k'", "v"), ("#> '{n}'", "1.50"), ("#>> '{n}'", "1.50"),
+               ("#> '{}'", '{"k": "v", "n": 1.50}'), ("#>> '{}'", '{"k": "v", "n": 1.50}')]
+    CASES = ([(J, typ, e, want) for typ in ("json", "jsonb") for e, want in J_WALKS]
+             + [(K, "json", e, want) for e, want in K_JSON] + [(K, "jsonb", e, want) for e, want in K_JSONB])
+
+    def walks(label, over, cases):
+        """Each case as `over` answers it, against Postgres 16's; the cases that differ are kept in info."""
+        wrong = {}
+        for doc, typ, expr, want in cases:
+            got = over(f"('{doc}'::{typ} {expr})")  # (no document here has a quote to double)
+            if got != want:
+                wrong[f"{typ} {expr} of {doc!r}"] = [got, want]
+        info[f"{label}: walks that differ from Postgres 16 (expression: [got, Postgres's])"] = wrong
+        return not wrong
+
+    check("-> , ->>, #> and #>> over a json and a jsonb literal with JSON's spaces in front and a tab, a newline or CRLF inside or "
+          "after: Postgres 16's answers, over HTTP (the JSON text)",
+          lambda: walks("HTTP", lambda sql: over_http(f"SELECT {sql} AS v"), CASES))
+    check("the same walks over the Postgres port, as its text cast: Postgres 16's answers",
+          lambda: walks("the port", lambda sql: over_port(f"SELECT CAST({sql} AS TEXT) AS v"), CASES))
+
+
+def jsons():
+    """JSON and JSONB columns keep their type (`TableMeta::sql_types`, as uuid's do; `types.rs`, `pg_types.rs`). The lake
+    holds the text as it was written, and every write door refuses a value that isn't JSON with 22P02, writing nothing:
+    SQL over HTTP and the Postgres port (INSERT, UPDATE), POST /append, COPY FROM STDIN and `pondra sql`. A valid value is
+    taken and read back as written. The Postgres port answers them as Postgres does (json 114, jsonb 3802), so psycopg
+    hands over dicts and lists, in text and binary cursors, for a column, RETURNING, a view and a literal cast alike, and
+    takes psycopg's Json and Jsonb parameters. `'x'::json` is 22P02 (TRY_CAST NULL); pg_typeof says json and jsonb; the
+    catalog says so too; SHOW CREATE TABLE says JSON and JSONB and runs again after a DROP; ADD COLUMN keeps the type; ALTER
+    COLUMN … TYPE JSON on a text column is refused 42804. json_build_object's answer is typed json, through a projection
+    as well. SQLAlchemy's JSON and JSONB columns and an Identity column round-trip over psycopg and over HTTP (`pondra+http`,
+    where the dialect reads the identity's options from their JSON text), and the inspector reports JSON, JSONB and the
+    identity as a dict. Postgres 16's JSON operators (`pg_json.rs`) answer as Postgres does on a JSON and a TEXT column,
+    over HTTP and the port: #> and #>> with a text path or ARRAY, @> and <@, ?, ?| and ?&. `->` answers the value as JSON text
+    (a string keeps its quotes; the port gives json's own value), `->>` text; the operators in a WHERE clause group as
+    Postgres groups them, with no parentheses; the functions answer by their Postgres names; and a spread query over three
+    nodes equals one node's answer. The json-making functions (`pg_json_make.rs`: to_json, to_jsonb, row_to_json, json_build_object, jsonb_build_object, json_build_array, jsonb_build_array, and the aggregates' scalar forms) answer Postgres 16's text over HTTP and the port, come to psycopg as dicts and lists typed json or jsonb, and refuse what Postgres refuses by SQLSTATE. pondra_as_jsonb and '…'::jsonb
+    answer jsonb as Postgres prints it, and nesting past 10,000 levels is refused 54001 (`pg_json_make.rs`'s MAX_DEPTH). A whole row (json_agg(t), to_json(t) and
+    row_to_json(t) over a table, an alias, a CTE or a subquery) is made of its columns; json_agg's ORDER BY, FILTER, DISTINCT and OVER,
+    the object forms, PostgREST's coalesce(json_agg(...), '[]') and a JSON column in a maker answer as Postgres 16 does, over HTTP, the
+    port and three nodes; a whole row that can't be made is refused by name (`pg_types.rs`, MAKERS).
+    Measured, per 1,000,000 rows (the benchmark's lake: `t` as in jsonedits, and `m` = (id BIGINT, name VARCHAR) with
+    'n' || id; the method as there; seconds per statement; in parentheses, the same run's build before parts A to D,
+    which is also before main's merge):
+        statement                                             Pondra (before)     Postgres 16       DuckDB 1.5.5
+        length(json_agg(id))                                  0.08 s (0.10 s)     0.31 s            0.06 s (to_json(list(id)))
+        json_agg(name ORDER BY id) in 1,000 groups, counted   1.21 s (1.27 s)     1.39 s            0.19 s (to_json(list(...)))
+        count(json_build_object(id, name))                    0.07 s (0.19 s)     0.26 s            0.05 s (json_object, a text key)
+        length(json_agg(s)) over (SELECT id, name ...)        0.21 s (0.44 s)     0.95 s            0.36 s
+    Pondra's answers equal Postgres 16's, the lengths of the JSON texts too. DuckDB's texts have no spaces after commas
+    or colons, so its lengths are shorter. Pondra is ahead of Postgres 16 on all four, the grouped json_agg by the least
+    (0.19 s), and behind DuckDB on three of them; on json_agg(s) it is ahead of DuckDB too.
+"""
+    import psycopg
+    from psycopg.types.json import Json, Jsonb
+    import sqlalchemy as sa
+    from sqlalchemy.dialects import postgresql
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
+    from pondra import dialect
+    dialect.register()  # (the dialect names, as the wheel's entry points make them known)
+
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 10
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    GOOD = {"doc": '{"a": 1, "b": [1, 2]}', "docb": '{"k": "v"}'}  # (valid JSON, written as it is here)
+    BAD = ["not json", '{"a": ', "{'a': 1}"]  # (not JSON: refused at every write door)
+    CATALOG = [("doc", "json", 114), ("docb", "jsonb", 3802), ("id", "integer", 23), ("note", "text", 25)]
+    checks, info = {}, {}
+    node = None
+    extras = []  # (two more nodes on the lake, for the spread check: stopped at the end)
+
+    def check(name, fn):
+        """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def q(s, h=None):
+        return call(port, "POST", "/sql", s.encode(), timeout=120, headers=h or {})
+
+    def err(s, path="/sql"):
+        """(status, x-pondra-sqlstate, the body) of a POST; (200, None, '') when it went through."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", path, s.encode(), {})
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        return (r.status, r.getheader("x-pondra-sqlstate"), data) if r.status != 200 else (200, None, "")
+
+    def http_refused(s, path="/sql"):
+        status, code, _ = err(s, path)
+        return status != 200 and code == "22P02"
+
+    def pg_write(s):
+        """The SQLSTATE the Postgres port answers a statement with, None when it went in."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            try:
+                conn.execute(s)
+                return None
+            except psycopg.Error as e:
+                return e.sqlstate
+
+    def pg_rows(s):
+        with psycopg.connect(url, autocommit=True) as conn:
+            return conn.execute(s).fetchall()
+
+    def first_typed(s):
+        """The first column of the first row through psycopg, and its type code (114 for json, 3802 for jsonb)."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            cur = conn.execute(s)
+            return cur.fetchone()[0], cur.description[0].type_code
+
+    def copy_into(cols, line):
+        """COPY FROM STDIN of one text line: None when it went in, else the SQLSTATE."""
+        try:
+            with psycopg.connect(url, autocommit=True) as conn:
+                with conn.cursor() as cur, cur.copy(f"COPY j ({cols}) FROM STDIN") as cp:
+                    cp.write(line)
+            return None
+        except psycopg.Error as e:
+            return e.sqlstate
+
+    def cli(s):
+        return subprocess.run([BIN, "sql", "--dir", lake, s], capture_output=True, text=True, timeout=120)
+
+    def cli_refused(s):
+        p = cli(s)
+        if p.returncode != 0 and "invalid input syntax for type json" in p.stderr:
+            return True
+        info.setdefault("pondra sql, not refused for a json value", []).append([s[:90], p.returncode, p.stderr[-300:]])
+        return False
+
+    def cli_ok(s):
+        p = cli(s)
+        if p.returncode != 0:
+            info.setdefault("pondra sql, refused", []).append([s[:90], p.returncode, p.stderr[-300:]])
+        return p.returncode == 0
+
+    def lit(s):
+        return "'" + s.replace("'", "''") + "'"
+
+    def text_of(rs):
+        return " ".join(str(v) for r in rs for v in r.values())  # (a SHOW CREATE's text, whatever its column is called)
+
+    def attrs(table):
+        """(name, format_type, type oid) of each column of a table, from the Postgres port's catalog, sorted by name."""
+        return sorted(pg_rows("SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.atttypid FROM pg_attribute a "
+                              f"JOIN pg_class c ON a.attrelid = c.oid WHERE c.relname = '{table}' AND a.attnum > 0"))
+
+    def snap():
+        """Every row as the node holds it (note, doc, docb), sorted: what a refused write must leave as it was."""
+        return sorted((r.get("note") or "", r.get("doc") or "", r.get("docb") or "") for r in q("SELECT note, doc, docb FROM j"))
+
+    # Each write door with one bad value in one column (doc or docb): refused with 22P02.
+    attempts = {
+        "INSERT": lambda c, b: http_refused(f"INSERT INTO j (id, note, {c}) VALUES (900, 'good', {lit(GOOD[c])}), (901, 'bad', {lit(b)})"),
+        "UPDATE": lambda c, b: http_refused(f"UPDATE j SET {c} = {lit(b)} WHERE note = 'one'"),
+        "Postgres INSERT": lambda c, b: pg_write(f"INSERT INTO j (id, note, {c}) VALUES (901, 'bad', {lit(b)})") == "22P02",
+        "Postgres UPDATE": lambda c, b: pg_write(f"UPDATE j SET {c} = {lit(b)} WHERE note = 'one'") == "22P02",
+        "POST /append": lambda c, b: http_refused(json.dumps({"id": 902, "note": "bad", c: b}) + "\n", "/append/j"),
+        "COPY FROM STDIN": lambda c, b: copy_into(f"id, note, {c}", f"903\tbad\t{b}\n") == "22P02",
+        "pondra sql INSERT": lambda c, b: cli_refused(f"INSERT INTO j (id, note, {c}) VALUES (904, 'bad', {lit(b)})"),
+        "pondra sql UPDATE": lambda c, b: cli_refused(f"UPDATE j SET {c} = {lit(b)} WHERE note = 'one'"),
+    }
+
+    def refused_everywhere():
+        failed = {}
+        for c in ("doc", "docb"):
+            for door, attempt in attempts.items():
+                for b in BAD:
+                    before = snap()
+                    refused = attempt(c, b)
+                    if not refused or snap() != before:
+                        failed[f"{door} {c} {b}"] = refused
+        info["refusals that failed (door, column, value: refused)"] = failed
+        return not failed
+
+    def accepted_everywhere():
+        sent = {}
+        sent["INSERT"] = err(f"INSERT INTO j (id, note, doc, docb) VALUES (1000, 'ok-ins', {lit(GOOD['doc'])}, {lit(GOOD['docb'])})")[0] == 200
+        sent["POST /append"] = err(json.dumps({"id": 1001, "note": "ok-app", **GOOD}) + "\n", "/append/j")[0] == 200
+        sent["COPY FROM STDIN"] = copy_into("id, note, doc, docb", f"1002\tok-copy\t{GOOD['doc']}\t{GOOD['docb']}\n") is None
+        sent["Postgres INSERT"] = pg_write(f"INSERT INTO j (id, note, doc, docb) VALUES (1003, 'ok-pg', {lit(GOOD['doc'])}, {lit(GOOD['docb'])})") is None
+        sent["pondra sql INSERT"] = cli_ok(f"INSERT INTO j (id, note, doc, docb) VALUES (1004, 'ok-cli', {lit(GOOD['doc'])}, {lit(GOOD['docb'])})")
+        sent["UPDATE"] = err("UPDATE j SET docb = '[7]' WHERE note = 'ok-ins'")[0] == 200
+        sent["Postgres UPDATE"] = pg_write("UPDATE j SET doc = '[8]' WHERE note = 'ok-pg'") is None
+        sent["pondra sql UPDATE"] = cli_ok("UPDATE j SET doc = '[9]' WHERE note = 'ok-cli'")
+        back = {r["note"]: (json.loads(r["doc"]), json.loads(r["docb"])) for r in q("SELECT note, doc, docb FROM j WHERE note LIKE 'ok-%'")}
+        d, b = json.loads(GOOD["doc"]), json.loads(GOOD["docb"])
+        want = {"ok-ins": (d, [7]), "ok-app": (d, b), "ok-copy": (d, b), "ok-pg": ([8], b), "ok-cli": ([9], b)}
+        info["accepted (door: ok), then read back over HTTP (note: doc, docb)"] = [sent, back]
+        return all(sent.values()) and back == want
+
+    def psycopg_reads():
+        """Text and binary cursors, a column, *, a key lookup, RETURNING, a view and literal casts: dicts and lists, typed."""
+        q("CREATE VIEW jv AS SELECT id, doc, docb, note FROM j")
+        d, b = json.loads(GOOD["doc"]), json.loads(GOOD["docb"])
+        out = {}
+        with psycopg.connect(url, autocommit=True) as conn:
+            cur = conn.execute("SELECT doc, docb, note FROM j WHERE id = 1")
+            out["select"] = (cur.fetchone(), [x.type_code for x in cur.description])
+            with conn.cursor(binary=True) as bc:
+                bc.execute("SELECT doc, docb, note FROM j WHERE id = 1")
+                out["select, binary"] = (bc.fetchone(), [x.type_code for x in bc.description])
+            cur = conn.execute("SELECT * FROM j WHERE id = %s", (1,))
+            out["select * by key"] = (cur.fetchone(), [x.type_code for x in cur.description])
+            cur = conn.execute("SELECT doc, docb FROM j WHERE id = 2")
+            out["select NULLs"] = (cur.fetchone(), [x.type_code for x in cur.description])
+            cur = conn.execute("INSERT INTO j (id, note, doc, docb) VALUES (2000, 'ret', '[1, 2]', '{\"x\": true}') RETURNING doc, docb")
+            out["RETURNING"] = (cur.fetchone(), [x.type_code for x in cur.description])
+            cur = conn.execute("SELECT doc, docb FROM jv WHERE id = 1")
+            out["view"] = (cur.fetchone(), [x.type_code for x in cur.description])
+            cur = conn.execute("SELECT '{\"x\": [1]}'::json AS a, CAST('{}' AS JSONB) AS b")
+            out["literal casts"] = (cur.fetchone(), [x.type_code for x in cur.description])
+        want = {
+            "select": ((d, b, "one"), [114, 3802, 25]),
+            "select, binary": ((d, b, "one"), [114, 3802, 25]),
+            "select * by key": ((1, d, b, "one"), [23, 114, 3802, 25]),
+            "select NULLs": ((None, None), [114, 3802]),
+            "RETURNING": (([1, 2], {"x": True}), [114, 3802]),
+            "view": ((d, b), [114, 3802]),
+            "literal casts": (({"x": [1]}, {}), [114, 3802]),
+        }
+        http_text = q("SELECT doc, docb FROM j WHERE id = 1")  # (over HTTP, the text as it was written)
+        info["psycopg: (row, type codes) by read; HTTP's text of row 1"] = [out, http_text]
+        return all(out[k] == v for k, v in want.items()) and http_text == [{"doc": GOOD["doc"], "docb": GOOD["docb"]}]
+
+    def json_params():
+        """psycopg's Json and Jsonb parameters, as text (%s) and as binary (%b), written and read back equal."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.execute("INSERT INTO j (id, note, doc, docb) VALUES (%s, %s, %s, %s)",
+                         (3000, "param-text", Json({"p": [1, 2]}), Jsonb({"q": None})))
+            conn.execute("INSERT INTO j (id, note, doc, docb) VALUES (%b, %b, %b, %b)",
+                         (3001, "param-bin", Json({"p": [3]}), Jsonb({"r": "s"})))
+            text = conn.execute("SELECT id, doc, docb FROM j WHERE id IN (3000, 3001) ORDER BY id").fetchall()
+            with conn.cursor(binary=True) as bc:
+                bc.execute("SELECT id, doc, docb FROM j WHERE id IN (3000, 3001) ORDER BY id")
+                binary = bc.fetchall()
+        info["parameters: rows read back as text, then as binary"] = [text, binary]
+        want = [(3000, {"p": [1, 2]}, {"q": None}), (3001, {"p": [3]}, {"r": "s"})]
+        return text == want and binary == want
+
+    def bad_literals():
+        http = [err("SELECT 'x'::json AS v")[1], err("SELECT CAST('x' AS JSONB) AS v")[1]]
+        port_codes = [pg_write("SELECT 'x'::json"), pg_write("SELECT CAST('x' AS JSONB)")]
+        tried = q("SELECT TRY_CAST('x' AS JSON) AS v")[0].get("v")  # (Pondra's own: Postgres 16 has no TRY_CAST; the JSON answer leaves a NULL out)
+        info["'x'::json and CAST('x' AS JSONB): SQLSTATE over HTTP, then the port; TRY_CAST('x' AS JSON) over HTTP"] = [http, port_codes, tried]
+        return http == ["22P02", "22P02"] and port_codes == ["22P02", "22P02"] and tried is None
+
+    def typeof():
+        h = q("SELECT pg_typeof(doc) AS a, pg_typeof(docb) AS b FROM j WHERE id = 1")[0]
+        p = pg_rows("SELECT pg_typeof(doc), pg_typeof(docb) FROM j WHERE id = 1")[0]
+        info["pg_typeof(doc), pg_typeof(docb): over HTTP, then the port"] = [h, p]
+        return h == {"a": "json", "b": "jsonb"} and p == ("json", "jsonb")
+
+    def json_function():
+        """json_build_object's answer is typed json: a dict over psycopg, directly and through a projection."""
+        direct = first_typed("SELECT json_build_object('a', 1) AS x")
+        projected = first_typed("SELECT x FROM (SELECT json_build_object('a', 1) AS x) AS s")
+        info["json_build_object: (value, type code) directly, then through a projection"] = [direct, projected]
+        return direct == ({"a": 1}, 114) and projected == ({"a": 1}, 114)
+
+    def make_setup():
+        """The tables the json-making checks read: mkrow, one row of each type the functions write and a row of NULLs; mkdoc, a JSON
+        and a JSONB column holding the documents of the other checks, and a row of NULLs."""
+        q("CREATE TABLE mkrow (id INT PRIMARY KEY, i INT, b BIGINT, t TEXT, f DOUBLE PRECISION, n NUMERIC(10,2), d DATE, ts TIMESTAMP, ok BOOLEAN)")
+        q("INSERT INTO mkrow (id, i, b, t, f, n, d, ts, ok) VALUES (1, 7, 9000000000, 'a\"b\\c', CAST(1.5e-7 AS DOUBLE PRECISION), "
+          "CAST(12.50 AS DECIMAL(10,2)), DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05.5', true), (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)")
+        q("CREATE TABLE mkdoc (id INT PRIMARY KEY, doc JSON, docb JSONB)")
+        q(f"INSERT INTO mkdoc (id, doc, docb) VALUES (1, {lit(GOOD['doc'])}, {lit(GOOD['docb'])}), (2, NULL, NULL)")
+        return q("SELECT count(*) AS n FROM mkrow")[0]["n"] == 2 and q("SELECT count(*) AS n FROM mkdoc")[0]["n"] == 2
+
+    def make_literals():
+        """Each expression over literals, as HTTP and the port answer it, against Postgres 16's text (`::text`)."""
+        bad = [[e, want, over_http(f"SELECT {e} AS v"), over_port(f"SELECT ({e})::text AS v")] for e, want in MAKE_LITERALS]
+        bad = [b for b in bad if b[2] != b[1] or b[3] != b[1]]
+        info["json-making functions over literals: [expression, Postgres 16's text, HTTP's, the port's], where one differs"] = bad
+        return not bad
+
+    def make_columns():
+        """Each expression over mkrow's columns, row 1 and the row of NULLs, against Postgres 16's text."""
+        bad = []
+        for e, rows in MAKE_TABLE:
+            for row, want in zip((1, 2), rows):
+                http = over_http(f"SELECT {e} AS v FROM mkrow WHERE id = {row}")
+                port = over_port(f"SELECT ({e})::text AS v FROM mkrow WHERE id = {row}")
+                if http != want or port != want:
+                    bad.append([e, row, want, http, port])
+        info["json-making functions over mkrow's columns: [expression, row, Postgres 16's text, HTTP's, the port's], where one differs"] = bad
+        return not bad
+
+    def make_json_columns():
+        """JSON and JSONB columns wrapped in pondra_as_json, against Postgres 16's answers on the same columns."""
+        bad = []
+        for pondra, rows in MAKE_JSON:
+            for row, want in zip((1, 2), rows):
+                http = over_http(f"SELECT {pondra} AS v FROM mkdoc WHERE id = {row}")
+                port = over_port(f"SELECT ({pondra})::text AS v FROM mkdoc WHERE id = {row}")
+                if http != want or port != want:
+                    bad.append([pondra, row, want, http, port])
+        info["json-making functions over mkdoc's JSON columns: [expression, row, Postgres 16's text, HTTP's, the port's], where one differs"] = bad
+        return not bad
+
+    def make_aggregates():
+        """The scalar aggregate forms over a list, against the aggregate Postgres 16 runs on the same values."""
+        bad = []
+        for pondra, want in MAKE_AGGREGATES:
+            http = over_http(f"SELECT {pondra} AS v")
+            port = over_port(f"SELECT ({pondra})::text AS v")
+            if http != want or port != want:
+                bad.append([pondra, want, http, port])
+        info["aggregate forms over a list: [expression, Postgres 16's text, HTTP's, the port's], where one differs"] = bad
+        return not bad
+
+    def make_typed():
+        """psycopg: the json-making functions' answers as dicts and lists, typed json (114) or jsonb (3802)."""
+        got = {
+            "json_build_object": first_typed("SELECT json_build_object('a', 1, 'b', ARRAY[1, 2]) AS x"),
+            "jsonb_build_object": first_typed("SELECT jsonb_build_object('a', 1, 'b', ARRAY[1, 2]) AS x"),
+            "json_build_array": first_typed("SELECT json_build_array(1, 'a') AS x"),
+            "jsonb_build_array": first_typed("SELECT jsonb_build_array(1, 'a') AS x"),
+            "to_jsonb through a projection": first_typed("SELECT x FROM (SELECT to_jsonb(ARRAY['x']) AS x) AS s"),
+            "row_to_json": first_typed("SELECT row_to_json(named_struct('a', 1, 'b', 'x')) AS x"),
+        }
+        info["json-making functions through psycopg: (value, type code) of each"] = got
+        return got == {"json_build_object": ({"a": 1, "b": [1, 2]}, 114), "jsonb_build_object": ({"a": 1, "b": [1, 2]}, 3802),
+                       "json_build_array": ([1, "a"], 114), "jsonb_build_array": ([1, "a"], 3802),
+                       "to_jsonb through a projection": (["x"], 3802), "row_to_json": ({"a": 1, "b": "x"}, 114)}
+
+    def port_error(s):
+        """The SQLSTATE the Postgres port refuses a statement with; None when it runs."""
+        try:
+            pg_rows(s)
+            return None
+        except psycopg.Error as e:
+            return e.sqlstate
+
+    def make_refusals():
+        """Refused by name: HTTP's and the port's SQLSTATE against Postgres 16's (the jsonb case is Postgres's '{bad'::json)."""
+        got = [[s, want, err(f"SELECT {s} AS v")[1], port_error(f"SELECT {s} AS v")] for s, want in MAKE_REFUSED]
+        info["json-making functions refused: [expression, Postgres 16's SQLSTATE, HTTP's, the port's]"] = got
+        return all(g[1] == g[2] == g[3] for g in got)
+
+    def as_jsonb_refusal():
+        """pondra_as_jsonb of text that isn't JSON is refused 22P02, over HTTP and the port."""
+        http = err("SELECT pondra_as_jsonb('{bad') AS v")[1]
+        port = port_error("SELECT pondra_as_jsonb('{bad') AS v")
+        info["pondra_as_jsonb('{bad'): SQLSTATE over HTTP, then the port"] = [http, port]
+        return http == port == "22P02"
+
+    def jsonb_as_postgres_prints_it():
+        """'…'::jsonb (pondra_jsonb) answers jsonb as Postgres prints it: keys sorted by length, the last duplicate kept, ': ' and
+        ', ' between members. Through psycopg it is a dict typed jsonb (3802). '…'::json keeps its text as written."""
+        jb = first_typed("SELECT '{\"b\":1,\"a\":2,\"a\":3}'::jsonb AS x")
+        http = q("SELECT '{\"b\":1,\"a\":2,\"a\":3}'::jsonb AS v")[0]["v"]
+        kept = q("SELECT '{\"b\":1,\"a\":2}'::json AS v")[0]["v"]
+        info["'…'::jsonb: (psycopg's value, type code), then HTTP's text; '…'::json over HTTP, as written"] = [jb, http, kept]
+        return jb == ({"a": 3, "b": 1}, 3802) and http == '{"a": 3, "b": 1}' and kept == '{"b":1,"a":2}'
+
+    def jsonb_depth_limit():
+        """Nesting 10,000 levels is jsonb's limit: a document that deep is taken and written back, and 10,001 levels is refused
+        54001 (stack depth limit exceeded) over HTTP and the port. Past that the reader would overflow a node's stack."""
+        def deep(n):
+            return "[" * n + "]" * n
+        http_ok = q(f"SELECT {lit(deep(10000))}::jsonb AS v")[0]["v"] == deep(10000)
+        port_ok = pg_rows(f"SELECT ({lit(deep(10000))}::jsonb)::text")[0][0] == deep(10000)  # (text: psycopg's own decoder stops at 1,000 levels)
+        http_code = err(f"SELECT {lit(deep(10001))}::jsonb AS v")[1]
+        port_code = port_error(f"SELECT {lit(deep(10001))}::jsonb AS v")
+        info["nesting: 10,000 levels taken (HTTP, the port's text), 10,001 refused (HTTP's SQLSTATE, the port's)"] = [http_ok, port_ok, http_code, port_code]
+        return http_ok and port_ok and http_code == port_code == "54001"
+
+    def wholes_setup():
+        """The tables the whole-row checks read, with the rows Postgres 16 answered for (WHOLE_PG): d_json (five rows: a name, a
+        group, a JSON and a JSONB document, NULLs, a string and an empty array), d_named (a view of it) and d_big (3,000 rows)."""
+        rows = [(1, "ann", 1, '{"a": 1, "b": [1, 2]}', '{"z": 1, "a": 2, "a": 3}'), (2, "bob", 1, '{"c": null}', '{"k": "v"}'),
+                (3, "cy", 2, None, None), (4, "dee", 2, '[1, "x"]', '{"b": {"y": 1, "x": 2}}'), (5, "eve", 3, '"str"', "[]")]
+        cell = lambda s: "NULL" if s is None else lit(s)
+        q("CREATE TABLE d_json (id INT PRIMARY KEY, name TEXT, k INT, doc JSON, docb JSONB)")
+        q("INSERT INTO d_json (id, name, k, doc, docb) VALUES " + ", ".join(f"({i}, {lit(n)}, {k}, {cell(d)}, {cell(b)})" for i, n, k, d, b in rows))
+        q("CREATE VIEW d_named AS SELECT id, name, doc FROM d_json")
+        q("CREATE TABLE d_big (id INT PRIMARY KEY, k INT, name TEXT)")
+        q("INSERT INTO d_big (id, k, name) SELECT CAST(value AS INT), CAST(value % 7 AS INT), 'n' || CAST(value AS VARCHAR) FROM range(1, 3001)")
+        return q("SELECT count(*) AS n FROM d_json")[0]["n"] == 5 and q("SELECT count(*) AS n FROM d_big")[0]["n"] == 3000
+
+    def pg_cells(name):
+        """Postgres 16's answer to WHOLE_PG[name], as cells: '' is NULL (psql prints nothing for one)."""
+        return [[None if f == "" else f for f in row] for row in WHOLE_PG[name]]
+
+    def http_cells(sql, names):
+        """HTTP's answer to `sql` as text, its columns in `names` (HTTP leaves a NULL out of a row, so each is read with get)."""
+        return [[None if r.get(n) is None else str(r.get(n)) for n in names] for r in q(sql)]
+
+    def port_cells(sql):
+        """The Postgres port's answer to `sql` as text (the query casts its json to text)."""
+        return [[None if v is None else str(v) for v in row] for row in pg_rows(sql)]
+
+    def pg_same(label, got, name):
+        """`got` equals Postgres 16's answer WHOLE_PG[name]; what differs is kept in info under `label`."""
+        want = pg_cells(name)
+        if got != want:
+            info[label] = {"got": got, "want": want}
+        return got == want
+
+    def as_text(sql):
+        """`sql`'s one column (v) read through the port as text: the same value, cast in the SQL."""
+        return f"SELECT (x.v)::text FROM ({sql}) x"
+
+    def port_names(sql):
+        with psycopg.connect(url, autocommit=True) as conn:
+            return [d.name for d in conn.execute(sql).description]
+
+    def wholes_build():
+        """json_build_object nests a json column's document; to_json and to_jsonb answer as Postgres 16 does."""
+        return (pg_same("json_build_object, HTTP", http_cells("SELECT json_build_object('id', id, 'doc', doc) AS v FROM d_json ORDER BY id", ["v"]), "BUILD")
+                and pg_same("json_build_object, the port", port_cells("SELECT (json_build_object('id', id, 'doc', doc))::text FROM d_json ORDER BY id"), "BUILD")
+                and pg_same("to_json and to_jsonb, HTTP", http_cells("SELECT to_json(doc) AS a, to_jsonb(docb) AS b FROM d_json ORDER BY id", ["a", "b"]), "TOJSON")
+                and pg_same("to_json and to_jsonb, the port", port_cells("SELECT (to_json(doc))::text, (to_jsonb(docb))::text FROM d_json ORDER BY id"), "TOJSON"))
+
+    def wholes_rows():
+        """json_agg of a whole row: a table, a subquery with a WHERE, a CTE and a view; to_json and row_to_json per row.
+        The aggregates say ORDER BY id: SQL leaves an unordered aggregate's rows in no order, Postgres answers its heap order
+        and Pondra answers its scan's (HTTP and the port differed run to run), so the answer is compared where it is defined."""
+        queries = [("AGG_TABLE", "SELECT json_agg(t ORDER BY t.id) AS v FROM d_json t"),
+                   ("AGG_SUBQUERY", "SELECT json_agg(t ORDER BY t.id) AS v FROM (SELECT id, name FROM d_json WHERE k = 1) t"),
+                   ("AGG_CTE", "WITH c AS (SELECT id, name, doc FROM d_json) SELECT json_agg(c ORDER BY id) AS v FROM c"),
+                   ("AGG_VIEW", "SELECT json_agg(v ORDER BY id) AS v FROM d_named v")]
+        http = [pg_same(f"{name}, HTTP", http_cells(sql, ["v"]), name) for name, sql in queries]
+        http.append(pg_same("to_json and row_to_json per row, HTTP", http_cells(
+            "SELECT id, to_json(t) AS a, row_to_json(t) AS b FROM (SELECT id, name, doc FROM d_json) t ORDER BY id", ["id", "a", "b"]), "ROWS"))
+        ported = [pg_same(f"{name}, the port", port_cells(as_text(sql)), name) for name, sql in queries]
+        ported.append(pg_same("to_json and row_to_json per row, the port", port_cells(
+            "SELECT id, (to_json(t))::text, (row_to_json(t))::text FROM (SELECT id, name, doc FROM d_json) t ORDER BY id"), "ROWS"))
+        return all(http) and all(ported)
+
+    def wholes_typed():
+        """psycopg hands json_agg's answer over as a list typed json (114); the port names the columns as Postgres does."""
+        value, code = first_typed("SELECT json_agg(t ORDER BY t.id) FROM (SELECT id, name FROM d_json WHERE k = 1) t")
+        info["json_agg over the port: (value, type code) and the column names"] = [code, port_names("SELECT json_agg(t), count(*) FROM (SELECT id FROM d_json) t"),
+                                                                                  port_names("SELECT to_json(t), row_to_json(t) FROM (SELECT id FROM d_json WHERE id = 1) t")]
+        return (value == json.loads(WHOLE_PG["AGG_SUBQUERY"][0][0]) and code == 114
+                and port_names("SELECT json_agg(t), count(*) FROM (SELECT id FROM d_json) t") == ["json_agg", "count"]
+                and port_names("SELECT to_json(t), row_to_json(t) FROM (SELECT id FROM d_json WHERE id = 1) t") == ["to_json", "row_to_json"]
+                and [json.loads(list(r.values())[0]) for r in q("SELECT json_agg(t) FROM (SELECT id FROM d_json WHERE id = 1) t")] == [[{"id": 1}]])
+
+    def wholes_aggregates():
+        """json_agg's ORDER BY, FILTER, DISTINCT, GROUP BY and OVER, and jsonb_agg, answer Postgres 16's text over HTTP and the port."""
+        queries = [("AGG_DESC", "SELECT json_agg(name ORDER BY name DESC) AS v FROM d_json"),
+                   ("AGG_FILTER", "SELECT json_agg(name ORDER BY id) FILTER (WHERE k > 1) AS v FROM d_json"),
+                   ("AGG_DISTINCT", "SELECT json_agg(DISTINCT k ORDER BY k) AS v FROM d_json"),
+                   ("JSONB_AGG", "SELECT jsonb_agg(docb ORDER BY id) AS v FROM d_json")]
+        http = [pg_same(f"{name}, HTTP", http_cells(sql, ["v"]), name) for name, sql in queries]
+        http.append(pg_same("json_agg GROUP BY, HTTP", http_cells("SELECT k, json_agg(name ORDER BY id) AS v FROM d_json GROUP BY k ORDER BY k", ["k", "v"]), "AGG_GROUP"))
+        http.append(pg_same("json_agg OVER, HTTP", http_cells("SELECT id, json_agg(name) OVER (PARTITION BY k ORDER BY id) AS v FROM d_json ORDER BY id", ["id", "v"]), "AGG_OVER"))
+        ported = [pg_same(f"{name}, the port", port_cells(as_text(sql)), name) for name, sql in queries]
+        ported.append(pg_same("json_agg GROUP BY, the port", port_cells("SELECT k, (json_agg(name ORDER BY id))::text FROM d_json GROUP BY k ORDER BY k"), "AGG_GROUP"))
+        ported.append(pg_same("json_agg OVER, the port", port_cells("SELECT id, (json_agg(name) OVER (PARTITION BY k ORDER BY id))::text FROM d_json ORDER BY id"), "AGG_OVER"))
+        return all(http) and all(ported)
+
+    def wholes_objects():
+        """json_object_agg, jsonb_object_agg (keys sorted, as jsonb prints them), and json_agg of json_build_object: documents nested."""
+        queries = [("OBJECT_AGG", "SELECT json_object_agg(name, doc ORDER BY id) AS v FROM d_json"),
+                   ("JSONB_OBJECT_AGG", "SELECT jsonb_object_agg(name, docb ORDER BY name) AS v FROM d_json WHERE docb IS NOT NULL"),
+                   ("AGG_BUILD", "SELECT json_agg(json_build_object('a', name, 'doc', doc) ORDER BY id) AS v FROM d_json")]
+        http = [pg_same(f"{name}, HTTP", http_cells(sql, ["v"]), name) for name, sql in queries]
+        ported = [pg_same(f"{name}, the port", port_cells(as_text(sql)), name) for name, sql in queries]
+        return all(http) and all(ported)
+
+    def wholes_postgrest():
+        """PostgREST's shape: coalesce(json_agg(_t), '[]') answers the rows, or '[]' when there are none, and json_build_object('items', …)
+        nests it. Over the port the column is json (114), and psycopg hands it over as a list."""
+        queries = [("POSTGREST", "SELECT coalesce(json_agg(_t ORDER BY id), '[]') AS v FROM (SELECT id, doc FROM d_json) _t"),
+                   ("POSTGREST_EMPTY", "SELECT coalesce(json_agg(_t ORDER BY id), '[]') AS v FROM (SELECT id, doc FROM d_json WHERE id > 10) _t"),
+                   ("ITEMS", "SELECT json_build_object('items', coalesce(json_agg(x ORDER BY id), '[]')) AS v FROM (SELECT id, doc FROM d_json) x"),
+                   ("ITEMS_EMPTY", "SELECT json_build_object('items', coalesce(json_agg(x ORDER BY id), '[]')) AS v FROM (SELECT id, doc FROM d_json WHERE id > 10) x")]
+        http = [pg_same(f"{name}, HTTP", http_cells(sql, ["v"]), name) for name, sql in queries]
+        typed = []
+        for name, sql in queries:
+            value, code = first_typed(sql)
+            typed.append(value == json.loads(WHOLE_PG[name][0][0]) and code == 114)
+            if not typed[-1]:
+                info[f"{name}, the port: (value, type code)"] = [value, code]
+        return all(http) and all(typed)
+
+    def wholes_jsonb():
+        """A jsonb column (keys out of order, a duplicate key) nested by json_build_object, json_agg, jsonb_build_object and row_to_json
+        is printed as jsonb prints it, over HTTP and the port."""
+        queries = [("JSONB_KEYS", "SELECT json_build_object('d', docb) AS v FROM d_json WHERE id = 1"),
+                   ("JSONB_KEYS_AGG", "SELECT json_agg(json_build_object('d', docb) ORDER BY id) AS v FROM d_json WHERE id IN (1, 4)"),
+                   ("JSONB_BUILD", "SELECT jsonb_build_object('x', docb) AS v FROM d_json WHERE id = 4"),
+                   ("ROW_JSONB", "SELECT row_to_json(t) AS v FROM (SELECT docb FROM d_json WHERE id = 1) t")]
+        http = [pg_same(f"{name}, HTTP", http_cells(sql, ["v"]), name) for name, sql in queries]
+        ported = [pg_same(f"{name}, the port", port_cells(as_text(sql)), name) for name, sql in queries]
+        return all(http) and all(ported)
+
+    def wholes_nested():
+        """A maker in a WHERE clause and one in a scalar subquery, over HTTP and the port, against Postgres 16's rows."""
+        where = "SELECT id FROM d_json WHERE json_build_object('d', doc)::text <> '{}' ORDER BY id"
+        scalar = "SELECT (SELECT json_agg(t ORDER BY id) FROM (SELECT id, k FROM d_json WHERE id < 3) t) AS v"
+        return (pg_same("a maker in a WHERE, HTTP", http_cells(where, ["id"]), "WHERE")
+                and pg_same("a maker in a WHERE, the port", port_cells(where), "WHERE")
+                and pg_same("json_agg in a scalar subquery, HTTP", http_cells(scalar, ["v"]), "SCALAR")
+                and pg_same("json_agg in a scalar subquery, the port", port_cells(as_text(scalar)), "SCALAR"))
+
+    def padding_setup():
+        """The tables the outer-join checks read (WHOLE_PG's PAD_*): p, three parents, and c, four children: two of parent 1, one of
+        parent 2 and an orphan (pid 9); c 11 has a NULL document, and parent 3 has no children."""
+        q("CREATE TABLE p (id INT PRIMARY KEY, name TEXT)")
+        q("INSERT INTO p (id, name) VALUES (1, 'ann'), (2, 'bob'), (3, 'cy')")
+        q("CREATE TABLE c (id INT PRIMARY KEY, pid INT, label TEXT, doc JSON)")
+        q("INSERT INTO c (id, pid, label, doc) VALUES (10, 1, 'a', '{\"x\": 1}'), (11, 1, 'b', NULL), (12, 2, 'c', '[1]'), (13, 9, 'orphan', NULL)")
+        return q("SELECT count(*) AS n FROM c")[0]["n"] == 4
+
+    def padding():
+        """A whole row of a table an outer join pads with NULLs is NULL where Postgres 16 pads it: a LEFT JOIN's unmatched child
+        (parent 3 has none: json_agg gives [null], row_to_json NULL, json_build_object {"c" : null}), a RIGHT JOIN's unmatched
+        parent (c 13's, json_agg's null), and coalesce(json_agg ... FILTER) keeps its []. Over HTTP and the port, against WHOLE_PG."""
+        queries = [("PAD_LEFT_AGG", "SELECT p.id AS id, (json_agg(c ORDER BY c.id))::text AS cs FROM p LEFT JOIN c ON c.pid = p.id GROUP BY p.id ORDER BY p.id", ["id", "cs"]),
+                   ("PAD_LEFT_ROWS", "SELECT p.id AS id, (row_to_json(c))::text AS j FROM p LEFT JOIN c ON c.pid = p.id ORDER BY p.id, c.id", ["id", "j"]),
+                   ("PAD_LEFT_COALESCE", "SELECT p.id AS id, (coalesce(json_agg(c ORDER BY c.id) FILTER (WHERE c.id IS NOT NULL), '[]'))::text AS cs FROM p LEFT JOIN c ON c.pid = p.id GROUP BY p.id ORDER BY p.id", ["id", "cs"]),
+                   ("PAD_LEFT_BUILD", "SELECT p.id AS id, (json_build_object('c', c))::text AS j FROM p LEFT JOIN c ON c.pid = p.id ORDER BY p.id, c.id", ["id", "j"]),
+                   ("PAD_RIGHT_AGG", "SELECT (json_agg(p ORDER BY c.id))::text AS ps FROM p RIGHT JOIN c ON c.pid = p.id", ["ps"]),
+                   ("PAD_RIGHT_GROUP", "SELECT c.id AS id, (json_agg(p))::text AS ps FROM p RIGHT JOIN c ON c.pid = p.id GROUP BY c.id ORDER BY c.id", ["id", "ps"])]
+        http = [pg_same(f"{name}, HTTP", http_cells(sql, names), name) for name, sql, names in queries]
+        ported = [pg_same(f"{name}, the port", port_cells(sql), name) for name, sql, _ in queries]
+        return all(http) and all(ported)
+
+    def wholes_refusals():
+        """A whole row Pondra can't make is refused by name with its SQLSTATE, over HTTP and the port: a subquery's item with no name
+        (Postgres answers it, keyed 'upper'), a file's columns, DISTINCT over json (42883) and a json key (22023)."""
+        import tempfile
+        csv_path = os.path.join(tempfile.mkdtemp(prefix="pondra-csv-"), "wholes.csv")
+        with open(csv_path, "w") as f:
+            f.write("id,name\n1,ann\n")
+        cases = [("SELECT json_agg(t) FROM (SELECT upper(name) FROM d_json) t", "0A000", "needs a name for each of t's columns: give upper(name) an alias"),
+                 (f"SELECT json_agg(f) FROM read_csv('{csv_path}') f", "0A000", "needs f's columns: name them"),
+                 ("SELECT json_agg(DISTINCT doc) FROM d_json", "42883", None),
+                 ("SELECT json_object_agg(doc, name) FROM d_json", "22023", None)]
+        http, port = [], []
+        for sql, code, words in cases:
+            status, got, body = err(sql)
+            http.append(got == code and (words is None or words in body))
+            port.append(port_error(sql) == code)
+        info["refusals: HTTP's SQLSTATE and the port's, per case (0A000 file, unnamed item; 42883; 22023)"] = [http, port]
+        return all(http) and all(port)
+
+    def wholes_spread():
+        """json_agg(… ORDER BY …) GROUP BY over 3,000 rows, on three nodes (spread=1) and one (spread=0): equal to each other and to
+        Postgres 16's text (the md5 of its rows, k|vs, one per line)."""
+        import hashlib
+        if not extras:
+            extras.extend(Node(lake, port + k, tier_secs=1).start() for k in (2, 3))
+        for p in (port + 2, port + 3):  # (each follower has the rows before the query asks it)
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                try:
+                    if call(p, "POST", "/sql", b"SELECT count(*) AS n FROM d_big")[0]["n"] == 3000:
+                        break
+                except Exception:
+                    pass  # (not up yet: asked again)
+                time.sleep(0.5)
+        sql = "SELECT k, json_agg(name ORDER BY id) AS vs FROM d_big GROUP BY k ORDER BY k".encode()
+        one = call(port, "POST", "/sql?spread=0", sql, timeout=120)
+        three = call(port, "POST", "/sql?spread=1", sql, timeout=120)
+        digest = hashlib.md5("\n".join(f"{r['k']}|{r['vs']}" for r in three).encode()).hexdigest()
+        info["spread over three nodes: md5 of its rows, one node's equal"] = [digest, three == one]
+        return three == one and len(three) == 7 and digest == "ebe9b197b957da5ff234eb8d89ff5a17"
+
+    def wholes_materialized():
+        """A materialized view of json_agg(v ORDER BY v) GROUP BY k is filled, then answers what the query answers after an INSERT
+        and after an UPDATE: Postgres 16's text at each of the three stages."""
+        q("CREATE TABLE d_mv (id INT PRIMARY KEY, k INT, v INT)")
+        q("INSERT INTO d_mv (id, k, v) VALUES (1, 1, 30), (2, 1, 10), (3, 2, 20)")
+        q("CREATE MATERIALIZED VIEW d_mv_vs AS SELECT k, json_agg(v ORDER BY v) AS vs FROM d_mv GROUP BY k")
+        view = lambda: [[str(r["k"]), r["vs"]] for r in q("SELECT k, vs FROM d_mv_vs ORDER BY k")]
+        query = lambda: [[str(r["k"]), r["vs"]] for r in q("SELECT k, json_agg(v ORDER BY v) AS vs FROM d_mv GROUP BY k ORDER BY k")]
+        want = [[[ "1", "[10, 30]"], ["2", "[20]"]],
+                [["1", "[10, 30]"], ["2", "[5, 20]"], ["3", "[7]"]],
+                [["1", "[10, 50]"], ["2", "[5, 20]"], ["3", "[7]"]]]
+        filled = [view(), query()]
+        # (a view that runs its query again catches up a moment after a write, as invariant 285 says: the check waits for it,
+        # up to 15 s, and then says what it held)
+        q("INSERT INTO d_mv (id, k, v) VALUES (4, 2, 5), (5, 3, 7)")
+        inserted = [until(view, want[1], secs=15), query()]
+        q("UPDATE d_mv SET v = 50 WHERE id = 1")
+        updated = [until(view, want[2], secs=15), query()]
+        info["materialized view: [view, query] after the fill, an INSERT and an UPDATE"] = [filled, inserted, updated]
+        return filled == [want[0], want[0]] and inserted == [want[1], want[1]] and updated == [want[2], want[2]]
+
+    def catalog():
+        isc = pg_rows("SELECT column_name, data_type, udt_name FROM information_schema.columns WHERE table_name = 'j' ORDER BY column_name")
+        info["pg_attribute (name, format_type, oid); information_schema (name, data_type, udt_name)"] = [attrs("j"), isc]
+        return attrs("j") == CATALOG and isc == [("doc", "json", "json"), ("docb", "jsonb", "jsonb"), ("id", "integer", "int4"),
+                                                  ("note", "text", "text")]
+
+    def show_create():
+        shown = text_of(q("SHOW CREATE TABLE j"))
+        info["SHOW CREATE TABLE j"] = shown
+        shows = re.search(r'\bdoc"?\s+JSON\b', shown) and re.search(r'\bdocb"?\s+JSONB\b', shown)
+        q("DROP TABLE j")
+        q(shown)  # the text again: a table of its own, with its json columns
+        same = attrs("j") == CATALOG
+        bad = err("INSERT INTO j (id, note, doc) VALUES (1, 'shown-bad', 'not json')")
+        info["shown again: the catalog's columns, 'not json' (sqlstate)"] = [same, bad[1]]
+        return bool(shows) and same and bad[1] == "22P02"
+
+    def sa_round_trip(engine):
+        """A table SQLAlchemy makes: an Identity id, a JSON and a JSONB column and a text one. Two rows, one with None,
+        read back (None as None), and the inspector's answers: JSON, JSONB, and the identity's options as a dict."""
+        md = sa.MetaData()
+        t = sa.Table("jsons_sa", md, sa.Column("id", sa.Integer, sa.Identity(), primary_key=True),
+                     sa.Column("doc", sa.JSON), sa.Column("docb", postgresql.JSONB), sa.Column("note", sa.String(20)))
+        with engine.begin() as c:
+            c.exec_driver_sql("DROP TABLE IF EXISTS jsons_sa")
+        md.create_all(engine)
+        with engine.begin() as c:
+            c.execute(t.insert(), [{"doc": {"k": [1, 2]}, "docb": {"k": "v"}, "note": "s1"},
+                                   {"doc": None, "docb": None, "note": "s2"}])
+        with engine.connect() as c:
+            back = [tuple(r) for r in c.execute(sa.select(t).order_by(t.c.id))]
+        cols = {c["name"]: c for c in sa.inspect(engine).get_columns("jsons_sa")}
+        ident = cols["id"].get("identity")
+        info[f"SQLAlchemy over {engine.url.drivername}: rows; types of doc and docb; identity"] = [back, str(cols["doc"]["type"]),
+                                                                                                str(cols["docb"]["type"]), ident]
+        engine.dispose()
+        return (back == [(1, {"k": [1, 2]}, {"k": "v"}, "s1"), (2, None, None, "s2")]
+                and str(cols["doc"]["type"]) == "JSON" and str(cols["docb"]["type"]) == "JSONB"
+                and isinstance(ident, dict) and ident.get("start") == 1)
+
+    def add_column():
+        q("ALTER TABLE j ADD COLUMN extra JSON")
+        bad = err("INSERT INTO j (id, note, extra) VALUES (4000, 'add-bad', 'not json')")
+        q(f"INSERT INTO j (id, note, extra) VALUES (4001, 'add-good', {lit(GOOD['doc'])})")
+        got = first_typed("SELECT extra FROM j WHERE note = 'add-good'")
+        kind = [a for a in attrs("j") if a[0] == "extra"]
+        info["ADD COLUMN extra JSON: 'not json' (sqlstate); the good value read back (value, type code); its catalog entry"] = [bad[1], got, kind]
+        return bad[1] == "22P02" and got == (json.loads(GOOD["doc"]), 114) and kind == [("extra", "json", 114)]
+
+    def alter_to_json():
+        """A text column can't become JSON in place (its rows were never checked): 42804, and the column stays text. Its own
+        table, so no view names j's columns (a view's refusal is a separate one)."""
+        q("CREATE TABLE jt (id INT PRIMARY KEY, note TEXT)")
+        refused = err("ALTER TABLE jt ALTER COLUMN note TYPE JSON")
+        still = err("INSERT INTO jt (id, note) VALUES (1, 'not json, but text')")[0] == 200
+        info["ALTER COLUMN note TYPE JSON: (status, sqlstate, body); a text value that isn't JSON still taken"] = [refused, still]
+        return refused[1] == "42804" and still
+
+    # Postgres 16's JSON operators (pg_json.rs, round 35). Each expected answer was asked of Postgres 16 (json for the
+    # paths, jsonb for containment and existence; `::text` makes them the text the port sends a text column). The same
+    # cases run on a JSON column (doc) and on a TEXT column (t) of the same document.
+    JP = '{"a": "x", "b": [1, 2], "c": {"d": null}}'
+    PATHS = [("COL #> '{b,0}'", "1"), ("COL #>> '{b,0}'", "1"), ("COL #> ARRAY['b','0']", "1"), ("COL #>> ARRAY['b','0']", "1"),
+             ("COL #> '{c}'", '{"d": null}'), ("COL #>> '{c}'", '{"d": null}'), ("COL #> '{c,d}'", "null"), ("COL #>> '{c,d}'", None),
+             ("COL #> '{a}'", '"x"'), ("COL #>> '{a}'", "x"), ("COL #> '{}'", JP), ("COL #> '{b,-1}'", "2"),
+             ("COL #> '{b,5}'", None), ("COL #> '{a,b}'", None), ("COL #> '{zz}'", None)]
+    CONTAINS = [("COL @> '{\"a\": \"x\"}'", True), ("COL @> '{\"b\": [2]}'", True), ("COL @> '{\"b\": [3]}'", False),
+                ("'{\"a\": \"x\"}' <@ COL", True), ("COL <@ '{\"a\": \"x\"}'", False), ("COL @> '{\"c\": {\"d\": null}}'", True),
+                ("COL @> '{\"c\": {}}'", True), ("COL @> '{\"b\": [1, 2]}'", True), ("'[1, 2]' <@ COL", False)]
+    EXISTS = [("COL ? 'a'", True), ("COL ? 'zz'", False), ("COL ? 'd'", False), ("COL ?| ARRAY['zz','c']", True),
+              ("COL ?| ARRAY['zz']", False), ("COL ?& ARRAY['a','c']", True), ("COL ?& ARRAY['a','zz']", False),
+              ("COL ?| '{zz,c}'", True), ("COL ?& '{}'", True), ("COL ?| '{}'", False),
+              ("'[\"foo\", \"bar\"]' ? 'foo'", True), ("'[\"foo\", [\"bar\"]]' ? 'bar'", False), ("'\"foo\"' ? 'foo'", True)]
+    # Postgres 16's -> and ->> on row 1 (JP): (expression, the JSON text over HTTP, the value psycopg gives for json, the
+    # text cast of the port's value). `->` answers JSON, so a string keeps its quotes over HTTP and psycopg hands over
+    # json's own value; a JSON null is None to psycopg, so the text cast (which says 'null') is checked too.
+    ARROW_CASES = [("doc -> 'a'", '"x"', "x"), ("doc -> 'c'", '{"d": null}', {"d": None}), ("doc -> 'b'", "[1, 2]", [1, 2]),
+                   ("doc -> 'b' -> 0", "1", 1), ("doc -> 'b' -> -1", "2", 2), ("doc -> 'c' -> 'd'", "null", None),
+                   ("doc -> 'zz'", None, None), ("doc -> 'a' -> 'b'", None, None), ("doc -> 'b' -> '0'", None, None),
+                   ("doc -> 'a' ->> 'b'", None, None), ("doc -> 'c' ->> 'd'", None, None),
+                   ("doc ->> 'a'", "x", "x"), ("doc ->> 'c'", '{"d": null}', '{"d": null}'), ("doc ->> 'zz'", None, None),
+                   ("t -> 'a'", '"x"', '"x"'), ("t -> 'b' -> 0", "1", "1"), ("t ->> 'a'", "x", "x")]
+    # The same answers as one row (`->` and `->>` as Postgres 16 gives them; the port's values, which are json's for `->`).
+    ARROWS = ["a", "at", "c", "ct", "b", "z", "b0", "ta", "tat"]
+    ARROWS_SQL = ("SELECT doc -> 'a' AS a, doc ->> 'a' AS at, doc -> 'c' AS c, doc ->> 'c' AS ct, doc -> 'b' AS b, doc ->> 'zz' AS z, "
+                  "doc -> 'b' -> 0 AS b0, t -> 'a' AS ta, t ->> 'a' AS tat FROM jp WHERE id = 1")
+
+    def over_http(s):
+        return q(s)[0].get("v")  # (HTTP leaves a NULL out of its row)
+
+    def over_port(s):
+        return pg_rows(s)[0][0]
+
+    def operator_setup():
+        q("CREATE TABLE jp (id INT PRIMARY KEY, doc JSON, t TEXT)")
+        q(f"INSERT INTO jp (id, doc, t) VALUES (1, {lit(JP)}, {lit(JP)}), (2, NULL, NULL)")
+        q("CREATE TABLE jbad (id INT PRIMARY KEY, t TEXT)")
+        q("INSERT INTO jbad (id, t) VALUES (1, 'not json')")
+        return q("SELECT count(*) AS n FROM jp")[0]["n"] == 2
+
+    def answers(cases, over, as_text=False):
+        """Each case on the JSON column and on the TEXT column of row 1, read by `over`: the cases that differ from Postgres 16.
+        `as_text` casts each answer to text first: psycopg decodes a JSON answer to Python's value (1, a dict), which the
+        expectations, written as text, don't name."""
+        wrong = {}
+        for col in ("doc", "t"):
+            for expr, want in cases:
+                sql = expr.replace("COL", col)
+                got = over(f"SELECT {f'({sql})::text' if as_text else sql} AS v FROM jp WHERE id = 1")
+                if got != want:
+                    wrong[sql] = [got, want]
+        info[f"{over.__name__}{' as text' if as_text else ''}: cases that differ from Postgres 16 (expression: [got, Postgres's])"] = wrong
+        return not wrong
+
+    def null_documents():
+        """A NULL document or text (row 2) answers NULL to every operator, over HTTP and the port."""
+        exprs = ["COL #> '{b,0}'", "COL #>> '{b,0}'", "COL @> '{\"a\": \"x\"}'", "'{\"a\": \"x\"}' <@ COL", "COL ? 'a'",
+                 "COL ?| ARRAY['a']", "COL ?& ARRAY['a']"]
+        got = [over(f"SELECT {e.replace('COL', col)} AS v FROM jp WHERE id = 2") for col in ("doc", "t") for e in exprs
+               for over in (over_http, over_port)]
+        info["NULL document, every operator, HTTP and the port: the answers"] = got
+        return all(v is None for v in got)
+
+    def not_json_text():
+        """A TEXT value that isn't JSON: -> , ->>, #> and #>> answer NULL where the walk meets the text (it reads only what
+        it needs, so the text is never validated), over HTTP and the port. @>, <@, ?, ?| and ?& read the whole document
+        and are 22P02, over HTTP and the port."""
+        nulls = ["t -> 'a'", "t ->> 'a'", "t #> '{a}'", "t #>> '{a}'"]
+        refused = ["t @> '{}'", "t <@ '{}'", "t ? 'a'", "t ?| ARRAY['a']", "t ?& ARRAY['a']"]
+        got = {e: [q(f"SELECT {e} AS v FROM jbad WHERE id = 1")[0].get("v"), pg_rows(f"SELECT {e} FROM jbad WHERE id = 1")[0][0]] for e in nulls}
+        codes = {e: [err(f"SELECT {e} AS v FROM jbad WHERE id = 1")[1], pg_write(f"SELECT {e} FROM jbad WHERE id = 1")] for e in refused}
+        info["not JSON in a TEXT column: [HTTP, the port] per NULL answer; [HTTP's SQLSTATE, the port's] per refusal"] = [got, codes]
+        return all(v == [None, None] for v in got.values()) and all(v == ["22P02", "22P02"] for v in codes.values())
+
+    def arrows_as_postgres():
+        """The -> and ->> of ARROWS_SQL, over HTTP then the port, as Postgres 16 answers them (-> is JSON, ->> text)."""
+        http = [q(ARROWS_SQL)[0].get(n) for n in ARROWS]
+        port = list(pg_rows(ARROWS_SQL)[0])
+        want_http = ['"x"', "x", '{"d": null}', '{"d": null}', "[1, 2]", None, "1", '"x"', "x"]
+        want_port = ["x", "x", {"d": None}, '{"d": null}', [1, 2], None, 1, '"x"', "x"]
+        info["-> and ->>, over HTTP then the port: the answers"] = [http, port]
+        return http == want_http and port == want_port
+
+    def arrow_cases():
+        """Each case of ARROW_CASES: the JSON text over HTTP, the value psycopg gives, and the port's text cast, all as Postgres 16."""
+        http = {e: q(f"SELECT {e} AS v FROM jp WHERE id = 1")[0].get("v") for e, _, _ in ARROW_CASES}
+        typed = {e: pg_rows(f"SELECT {e} FROM jp WHERE id = 1")[0][0] for e, _, _ in ARROW_CASES}
+        texted = {e: pg_rows(f"SELECT CAST(({e}) AS TEXT) FROM jp WHERE id = 1")[0][0] for e, _, _ in ARROW_CASES}
+        wrong = {e: [http[e], typed[e], texted[e]] for e, text, value in ARROW_CASES if http[e] != text or typed[e] != value or texted[e] != text}
+        info["-> cases that differ from Postgres 16 (expression: [HTTP, the port's value, the port's text])"] = wrong
+        return not wrong
+
+    def variant():
+        """A VARIANT column holds JSON text, so its -> answers as a JSON column's does (Postgres has no VARIANT: Pondra's own answer)."""
+        q("CREATE TABLE jvar (id INT PRIMARY KEY, v VARIANT)")
+        q(f"INSERT INTO jvar (id, v) VALUES (1, {lit(JP)})")
+        got = q("SELECT v -> 'a' AS a, v ->> 'a' AS at, v -> 'b' -> 0 AS b0 FROM jvar WHERE id = 1")[0]
+        info["VARIANT: v -> 'a', v ->> 'a', v -> 'b' -> 0, over HTTP"] = got
+        return got == {"a": '"x"', "at": "x", "b0": "1"}
+
+    # The JSON operators in a WHERE clause, written without parentheses: Postgres 16 groups each as it groups it (above
+    # =, IS, LIKE, IN and ||), and the port answers the same rows (ids of jp).
+    GROUPED = [("doc ->> 'a' = 'x'", [1]), ("'x' = doc ->> 'a'", [1]), ("doc -> 'zz' IS NULL", [1, 2]),
+               ("doc #>> '{b,0}' = '1'", [1]), ("doc ->> 'a' LIKE 'x%'", [1]), ("doc ->> 'a' IN ('x', 'y')", [1]),
+               ("doc ? 'a' AND doc ->> 'a' = 'x'", [1])]
+
+    def grouping():
+        http = {w: [r["id"] for r in q(f"SELECT id FROM jp WHERE {w} ORDER BY id")] for w, _ in GROUPED}
+        port = {w: [r[0] for r in pg_rows(f"SELECT id FROM jp WHERE {w} ORDER BY id")] for w, _ in GROUPED}
+        concat = (q("SELECT doc ->> 'a' || 'y' AS v FROM jp WHERE id = 1")[0].get("v"), pg_rows("SELECT doc ->> 'a' || 'y' FROM jp WHERE id = 1")[0][0])
+        info["WHERE without parentheses: the ids over HTTP, then the port; doc ->> 'a' || 'y' over HTTP, then the port"] = [http, port, concat]
+        return all(http[w] == want and port[w] == want for w, want in GROUPED) and concat == ("xy", "xy")
+
+    def functions_by_name():
+        """Each function answers as its operator does (their Postgres names): HTTP's text, and the port's booleans."""
+        sql = ("SELECT jsonb_contains(doc, '{\"b\": [2]}') AS a, jsonb_contained('{\"a\": \"x\"}', doc) AS b, jsonb_exists(doc, 'a') AS c, "
+               "jsonb_exists_any(doc, ARRAY['zz', 'c']) AS d, jsonb_exists_all(doc, ARRAY['a', 'zz']) AS e, json_object_field(doc, 'a') AS f, "
+               "jsonb_object_field(doc, 'c') AS g, json_array_element('[10, 20]', 1) AS h, jsonb_array_element('[10, 20]', -2) AS i FROM jp WHERE id = 1")
+        http = q(sql)[0]
+        port = pg_rows(sql)[0]
+        want = {"a": True, "b": True, "c": True, "d": True, "e": False, "f": '"x"', "g": '{"d": null}', "h": "20", "i": "10"}
+        info["functions by name: HTTP's row, then the port's row"] = [http, port]
+        return http == want and tuple(port[:5]) == (True, True, True, True, False)
+
+    def materialized():
+        """A materialized view of JSON operators is filled, then follows an INSERT into its table."""
+        y = '{"a": "y", "b": [5]}'
+        q("CREATE TABLE jmsrc (id INT PRIMARY KEY, doc JSON)")
+        q(f"INSERT INTO jmsrc (id, doc) VALUES (1, {lit(JP)}), (2, NULL)")
+        q("CREATE MATERIALIZED VIEW jm AS SELECT id, doc -> 'a' AS a, doc #>> '{b,0}' AS b0 FROM jmsrc")
+        filled = [(r["id"], r.get("a"), r.get("b0")) for r in q("SELECT id, a, b0 FROM jm ORDER BY id")]
+        q(f"INSERT INTO jmsrc (id, doc) VALUES (3, {lit(y)})")
+        followed = [(r["id"], r.get("a"), r.get("b0")) for r in q("SELECT id, a, b0 FROM jm ORDER BY id")]
+        want = [(1, '"x"', "1"), (2, None, None)]
+        info["materialized view, filled, then after an INSERT: (id, a, b0) over HTTP"] = [filled, followed]
+        return filled == want and followed == want + [(3, '"y"', "5")]
+
+    def use_json():
+        """`doc ? 'a'` under USE of a schema, the table in that schema: the search path reaches it, and the names it writes
+        in full (path.rs) make the same statement under the session."""
+        b1 = '{"b": 1}'
+        q("CREATE SCHEMA jsx")
+        q("CREATE TABLE jsx.jq (id INT PRIMARY KEY, doc JSON)")
+        q(f"INSERT INTO jsx.jq (id, doc) VALUES (1, {lit(JP)}), (2, {lit(b1)})")
+        h = {"x-pondra-session": "jsons-use-json"}
+        q("USE jsx", h)
+        got = q("SELECT id FROM jq WHERE doc ? 'a' AND doc ->> 'a' = 'x' ORDER BY id", h)
+        arrow = q("SELECT doc -> 'a' AS v FROM jq WHERE id = 1", h)[0].get("v")
+        info["USE jsx: doc ? 'a' AND doc ->> 'a' = 'x' (rows), then doc -> 'a'"] = [got, arrow]
+        return got == [{"id": 1}] and arrow == '"x"'
+
+    def json_spread():
+        """3,000 documents, queried with -> , #>> , @> and an unparenthesised =: one node's answer, three nodes' answer, and
+        Python's count of the same rows, all equal (the rows are in files and the log tail; `spread=1` forces the plan)."""
+        q("CREATE TABLE jbig (id INT PRIMARY KEY, doc JSON)")
+        docs = [{"id": i, "a": f"x{i % 7}", "b": [i, 2], "k": {"n": i * 3}} for i in range(1, 3001)]
+        call(port, "POST", "/append/jbig", ("\n".join(json.dumps({"id": d["id"], "doc": json.dumps(d)}) for d in docs) + "\n").encode(), timeout=120)
+        extras.extend(Node(lake, port + k, tier_secs=1).start() for k in (2, 3))
+        for p in (port + 2, port + 3):  # (each follower has the rows before the query asks it)
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                try:
+                    if call(p, "POST", "/sql", b"SELECT count(*) AS n FROM jbig")[0]["n"] == 3000:
+                        break
+                except Exception:
+                    pass  # (not up yet: asked again)
+                time.sleep(0.5)
+        spread_sql = ("SELECT a, count(*) AS n, sum(s) AS total FROM (SELECT doc ->> 'a' AS a, CAST(doc #>> '{k,n}' AS BIGINT) AS s "
+                      "FROM jbig WHERE doc @> '{\"a\": \"x3\"}' OR doc #>> '{b,0}' = '7') AS r GROUP BY a ORDER BY a")
+        want_groups = {}
+        for d in docs:
+            if d["a"] == "x3" or d["b"][0] == 7:
+                n, total = want_groups.get(d["a"], (0, 0))
+                want_groups[d["a"]] = (n + 1, total + d["k"]["n"])
+        want = [{"a": a, "n": n, "total": t} for a, (n, t) in sorted(want_groups.items())]
+        one = call(port, "POST", "/sql?spread=0", spread_sql.encode(), timeout=120)
+        three = call(port, "POST", "/sql?spread=1", spread_sql.encode(), timeout=120)
+        info["spread over three nodes, one node, and Python: rows"] = [three, one, want]
+        return three == one == want
+
+    def arrays_untouched():
+        """ARRAY[1,2,3] @> ARRAY[2] is DataFusion's array containment, and still true."""
+        http = over_http("SELECT ARRAY[1, 2, 3] @> ARRAY[2] AS v FROM jp WHERE id = 1")
+        port = over_port("SELECT ARRAY[1, 2, 3] @> ARRAY[2] AS v FROM jp WHERE id = 1")
+        return http is True and port is True
+
+    def in_where():
+        """The operators in a WHERE clause find the rows they name, over HTTP and the port, with no parentheses: `doc #>> '{c,d}'
+        IS NULL` is `(doc #>> '{c,d}') IS NULL`, as Postgres 16 groups it (path::door's text, `pg_json::text`)."""
+        http = [r["id"] for r in q("SELECT id FROM jp WHERE t ?| ARRAY['zz','c'] AND doc #>> '{c,d}' IS NULL ORDER BY id")]
+        port = [r[0] for r in pg_rows("SELECT id FROM jp WHERE doc @> '{\"a\": \"x\"}' AND t #>> '{b,0}' = '1' ORDER BY id")]
+        info["WHERE with the operators: rows over HTTP, then the port"] = [http, port]
+        return http == [1] and port == [1]
+
+    try:
+        node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+        check("CREATE TABLE j (doc JSON, docb JSONB): pg_attribute 114 and 3802, format_type json and jsonb, "
+              "information_schema data_type and udt_name json and jsonb, as Postgres 16 gives them", lambda: q("CREATE TABLE j (id INT PRIMARY KEY, doc JSON, docb JSONB, note TEXT)") is not None and catalog())
+        check("SHOW CREATE TABLE says JSON and JSONB; run again after a DROP it makes the same table, its json columns the same", show_create)
+        check("setup: two rows, one with JSON, one with NULLs", lambda: err(f"INSERT INTO j (id, note, doc, docb) VALUES (1, 'one', {lit(GOOD['doc'])}, {lit(GOOD['docb'])}), (2, 'two', NULL, NULL)")[0] == 200)
+        check("a value that isn't JSON is refused 22P02 by every write door (INSERT, UPDATE over HTTP and the port, POST /append, "
+              "COPY FROM STDIN, pondra sql), in doc and in docb, and nothing is written", refused_everywhere)
+        check("a valid JSON value is taken by every write door and read back over HTTP as it was written", accepted_everywhere)
+        check("psycopg, text and binary cursors: doc and docb come as dicts and lists typed 114 and 3802 (a column, *, a key lookup, "
+              "NULLs, RETURNING, a view, literal casts); note stays str; HTTP's answer is the text as written", psycopg_reads)
+        check("psycopg's Json and Jsonb parameters, as text (%s) and binary (%b), are written and read back equal", json_params)
+        check("'x'::json and CAST('x' AS JSONB) are 22P02 over HTTP and the port; TRY_CAST('x' AS JSON) is NULL", bad_literals)
+        check("pg_typeof(doc) is 'json' and pg_typeof(docb) 'jsonb', over HTTP and the port", typeof)
+        check("json_build_object's answer is typed json (a dict over psycopg), directly and through a projection", json_function)
+        check("SQLAlchemy over psycopg: JSON and JSONB columns and an Identity column round-trip (dicts, None as None); "
+              "the inspector says JSON, JSONB and the identity as a dict", lambda: sa_round_trip(sa.create_engine(f"postgresql+psycopg://u@127.0.0.1:{pg}/lake")))
+        check("SQLAlchemy over HTTP (pondra+http): the same round trip; the identity's options read from their JSON text as a dict",
+              lambda: sa_round_trip(sa.create_engine(f"pondra+http://127.0.0.1:{port}")))
+        check("ALTER TABLE ADD COLUMN extra JSON is json (catalog); 'not json' is 22P02; a valid value is read back as a dict", add_column)
+        check("ALTER COLUMN note TYPE JSON on a text column is refused 42804; the column stays text", alter_to_json)
+        check("setup: a table with a JSON and a TEXT column holding one document (row 1), NULLs (row 2), and a TEXT value that isn't JSON",
+              operator_setup)
+        check("#> and #>> over HTTP, on a JSON column and a TEXT column, with the path as '{b,0}' and as ARRAY['b','0'], and the other "
+              "paths: what Postgres 16 answers (a found JSON null is the text null, a missing path NULL, '{}' the whole document)",
+              lambda: answers(PATHS, over_http))
+        check("#> and #>> over the Postgres port (psycopg), on a JSON and a TEXT column: the same answers, as text",
+              lambda: answers(PATHS, over_port, as_text=True))
+        check("@> and <@ over HTTP and the port, on a JSON and a TEXT column: what Postgres 16 answers (nested objects and arrays, "
+              "a top-level scalar in an array, 1 and 1.0, empty objects and arrays, null)",
+              lambda: answers(CONTAINS, over_http) and answers(CONTAINS, over_port))
+        check("? , ?| and ?& over HTTP and the port, on a JSON and a TEXT column: what Postgres 16 answers (a key of an object, a string "
+              "in an array, a scalar string, a nested array, an empty list, a list of keys)",
+              lambda: answers(EXISTS, over_http) and answers(EXISTS, over_port))
+        check("a NULL document or text answers NULL to each operator, over HTTP and the port", null_documents)
+        check("a TEXT value that isn't JSON: -> , ->>, #> and #>> answer NULL, @>, <@, ?, ?| and ?& are 22P02, over HTTP and the port",
+              not_json_text)
+        check("-> and ->>, over HTTP then the port, as Postgres 16 answers them (-> is JSON: quotes kept over HTTP, json's value to psycopg)",
+              arrows_as_postgres)
+        check("-> on a JSON and a TEXT column, over HTTP, the port's json value and the port's text cast: Postgres 16's answers "
+              "(strings, objects, arrays, numbers, a JSON null, a missing key, a negative index, a path into a scalar, a text key on an array)",
+              arrow_cases)
+        check("a VARIANT column: v -> 'a', v ->> 'a' and v -> 'b' -> 0 answer as a JSON column's do, over HTTP", variant)
+        _jsons_spaces(check, over_http, over_port, info)
+        check("the operators in a WHERE clause, and doc ->> 'a' || 'y', with no parentheses: the rows and the text, over HTTP and the port",
+              grouping)
+        check("the operators in a WHERE clause find the rows they name, over HTTP and the port (a JSON null and an IS NULL unparenthesised)",
+              in_where)
+        check("jsonb_contains, jsonb_contained, jsonb_exists, jsonb_exists_any, jsonb_exists_all, json_object_field, jsonb_object_field, "
+              "json_array_element and jsonb_array_element answer as their operators do, over HTTP and the port", functions_by_name)
+        check("a materialized view of doc -> 'a' and doc #>> '{b,0}' is filled, and follows an INSERT into its table", materialized)
+        check("under USE of a schema, doc ? 'a' and doc ->> 'a' = 'x' find the schema's table (the search path reaches it)", use_json)
+        check("a spread query over three nodes, with ->>, #>> and @> over 3,000 documents: equal to one node's answer and to Python's",
+              json_spread)
+        check("ARRAY[1,2,3] @> ARRAY[2] still answers true, over HTTP and the port (DataFusion's array containment is untouched)",
+              arrays_untouched)
+        check("setup: mkrow, one row of each type the json-making functions write and a row of NULLs; mkdoc, a JSON and a JSONB column", make_setup)
+        check("to_json, to_jsonb, row_to_json, json_build_object, json_build_array and their jsonb forms over literals (floats, dates, "
+              "intervals, NULLs, nested objects, arrays, empty ones, numerics) answer Postgres 16's text, over HTTP and the port", make_literals)
+        check("the same functions over mkrow's integer, bigint, text, double, numeric, date, timestamp and boolean columns, a row and a row "
+              "of NULLs, answer Postgres 16's text, over HTTP and the port", make_columns)
+        check("json_build_object, to_json, to_jsonb and jsonb_build_object over a JSON or JSONB column wrapped in pondra_as_json answer "
+              "Postgres 16's text, over HTTP and the port (a table's own JSON columns are unmarked until the next brief)", make_json_columns)
+        check("the aggregate forms (pondra_json_agg, pondra_jsonb_agg, pondra_json_object_agg, pondra_jsonb_object_agg) answer Postgres 16's "
+              "text: line feeds before rows and arrays, a NULL element, the object form, over HTTP and the port", make_aggregates)
+        check("psycopg: json_build_object, json_build_array and row_to_json come as dicts and lists typed 114, the jsonb forms typed 3802, "
+              "through a projection too", make_typed)
+        check("json_build_object and jsonb_build_object refuse what Postgres refuses, by SQLSTATE over HTTP and the port: an odd count and "
+              "an array key (22023), a NULL key (22004), a jsonb of text that isn't JSON (22P02)", make_refusals)
+        check("pondra_as_jsonb of text that isn't JSON is refused 22P02 by HTTP and the port", as_jsonb_refusal)
+        check("'…'::jsonb answers jsonb as Postgres prints it (keys sorted, the last duplicate kept), over HTTP and as a dict over the port; "
+              "'…'::json keeps its text as written", jsonb_as_postgres_prints_it)
+        check("jsonb nested 10,000 levels is taken and written back; 10,001 levels is refused 54001 by HTTP and the port, and the node "
+              "stays up (a deeper reader would overflow its stack)", jsonb_depth_limit)
+        check("setup: d_json (five rows with JSON and JSONB documents, NULLs), d_named (a view) and d_big (3,000 rows)", wholes_setup)
+        check("json_build_object nests a json column's document, not a quoted string; to_json and to_jsonb answer as Postgres 16 does, over HTTP and the port", wholes_build)
+        check("json_agg of a whole row (a table, a subquery, a CTE, a view) and to_json and row_to_json per row answer Postgres 16's text, over HTTP and the port", wholes_rows)
+        check("psycopg: json_agg's answer is a list typed json (114); the port names json_agg and count as Postgres does (cursor.description), HTTP keeps json_agg(t) as the name", wholes_typed)
+        check("json_agg's ORDER BY, FILTER, DISTINCT, GROUP BY and OVER, and jsonb_agg, answer Postgres 16's text, over HTTP and the port", wholes_aggregates)
+        check("json_object_agg and jsonb_object_agg, and json_agg of json_build_object, nest their documents as Postgres 16 does, over HTTP and the port", wholes_objects)
+        check("PostgREST's coalesce(json_agg(...), '[]') answers its rows or '[]', nests in json_build_object, and is json (114) to psycopg", wholes_postgrest)
+        check("a jsonb column with keys out of order and a duplicate key, nested by json_build_object, json_agg and jsonb_build_object, prints as jsonb does", wholes_jsonb)
+        check("a maker in a WHERE clause and in a scalar subquery answers Postgres 16's rows, over HTTP and the port", wholes_nested)
+        check("a whole row Pondra can't make is refused by name: 0A000 for an unnamed item and a file's columns, 42883 for DISTINCT over json, 22023 for a json key", wholes_refusals)
+        check("json_agg over 3,000 rows in seven groups, on three nodes (spread=1) and one (spread=0): equal to each other and to Postgres 16's text", wholes_spread)
+        check("a materialized view of json_agg(v ORDER BY v) GROUP BY k is filled, then answers what the query answers after an INSERT and after an UPDATE", wholes_materialized)
+        check("setup: p (three parents) and c (four children, an orphan, a NULL document)", padding_setup)
+        check('a whole row an outer join pads is NULL where Postgres 16 pads it: LEFT (json_agg [null], row_to_json NULL, json_build_object {"c" : null}), RIGHT (json_agg null), coalesce(json_agg ... FILTER) []; HTTP and the port', padding)
+        _jsons_w2(check, url, q, info)
+        _jsons_w3(checks, info, port, url)
+    finally:
+        if node is not None:
+            node.kill()
+        for extra in extras:
+            extra.kill()
+    ok = all(checks.values())
+    print(json.dumps({"jsons": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} JSON checks"
+
+
+def _jsons_w2(check, url, q, info):
+    """Brief W2 (PR #131). The Postgres port types a statement's columns from the text its JSON operators read (`pg_types::one`
+    runs `pg_json::text` first), so `doc ? 'a'`, `?|`, `?&` and `@>` send doc as jsonb (3802) under Postgres's name for it; and
+    COPY … TO STDOUT types its columns as RowDescription does, so a binary COPY sends a jsonb's version byte and a uuid's 16
+    bytes. Every expected answer is Postgres 16's on the same rows (a scratch database, dropped after): the rows, the column
+    names and type codes, and the three COPY streams, header and trailer included."""
+    import uuid
+    import psycopg
+
+    def read(sql):
+        """(rows, (name, type code) of each column) through psycopg."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            cur = conn.execute(sql)
+            return cur.fetchall(), [(c.name, c.type_code) for c in cur.description]
+
+    def copied(sql):
+        """The bytes of a COPY … TO STDOUT, as psycopg hands them over."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            with conn.cursor() as cur, cur.copy(sql) as cp:
+                return b"".join(bytes(block) for block in cp)
+
+    def setup():
+        q("CREATE TABLE w2j (id INT PRIMARY KEY, doc JSONB, dj JSON, u UUID, note TEXT)")
+        q("""INSERT INTO w2j (id, doc, dj, u, note) VALUES
+            (1, '{"a": 1}', '{"a": 1, "b": [1, 2]}', '6f1c0a1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b', 'one'),
+            (2, NULL, NULL, NULL, 'two'),
+            (3, '{"a": [true, "s"]}', '[1, {"x": null}]', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'three'),
+            (4, '{"b": 2, "c": {"a": 1}}', '{"c": [3]}', NULL, 'four')""")
+        return read("SELECT count(*) FROM w2j")[0] == [(4,)]
+
+    # (Postgres 16's rows and (name, type code) of each column, for the statement)
+    WHERE = {
+        "SELECT doc FROM w2j WHERE doc ? 'a' ORDER BY id": ([({"a": 1},), ({"a": [True, "s"]},)], [("doc", 3802)]),
+        "SELECT doc FROM w2j WHERE doc ?| array['b', 'zz'] ORDER BY id": ([({"b": 2, "c": {"a": 1}},)], [("doc", 3802)]),
+        "SELECT doc FROM w2j WHERE doc ?& array['b', 'c'] ORDER BY id": ([({"b": 2, "c": {"a": 1}},)], [("doc", 3802)]),
+        "SELECT doc FROM w2j WHERE doc @> '{\"a\": 1}' ORDER BY id": ([({"a": 1},)], [("doc", 3802)]),
+    }
+
+    def where_forms():
+        got = {sql: read(sql) for sql in WHERE}
+        info["WHERE with ?, ?|, ?& and @> (psycopg: rows, (name, type code) of each column)"] = got
+        return all(got[sql] == want for sql, want in WHERE.items())
+
+    def where_others():
+        got = read("SELECT dj, note FROM w2j WHERE doc ? 'a' ORDER BY id")
+        info["a json and a text column of a WHERE on doc (psycopg)"] = got
+        return got == ([({"a": 1, "b": [1, 2]}, "one"), ([1, {"x": None}], "three")], [("dj", 114), ("note", 25)])
+
+    def uuid_others():
+        got = read("SELECT u FROM w2j WHERE doc ?| array['a'] ORDER BY id")
+        info["a uuid column of a WHERE on doc (psycopg)"] = got
+        return got == ([(uuid.UUID("6f1c0a1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b"),), (uuid.UUID("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),)], [("u", 2950)])
+
+    def question_name():
+        got = read("SELECT doc ? 'a' FROM w2j ORDER BY id")
+        info["doc ? 'a' in the select list (psycopg)"] = got
+        return got == ([(True,), (None,), (True,), (False,)], [("?column?", 16)])
+
+    # (Postgres 16's RETURNING of the same rows: sorted, since a write's rows come in no promised order; run last, as they
+    # change the rows)
+    RETURNING = {
+        "UPDATE w2j SET note = 'x' WHERE id = 4 RETURNING note, doc ?| array['b']": ([("x", True)], [("note", 25), ("?column?", 16)]),
+        "DELETE FROM w2j WHERE doc ? 'a' RETURNING id, doc": ([(1, {"a": 1}), (3, {"a": [True, "s"]})], [("id", 23), ("doc", 3802)]),
+        "INSERT INTO w2j (id, doc) VALUES (5, '{\"a\": 5}') RETURNING doc -> 'a', doc ? 'a'": ([(5, True)], [("?column?", 3802), ("?column?", 16)]),
+    }
+
+    def returning_forms():
+        got = {}
+        for sql in RETURNING:
+            rows, columns = read(sql)
+            got[sql] = (sorted(rows, key=repr), columns)
+        info["RETURNING with ?, ?| and -> (psycopg: rows, (name, type code) of each column)"] = got
+        return all(got[sql] == want for sql, want in RETURNING.items())
+
+    # (Postgres 16's COPY of the same rows, the table's and the ordered query's alike: the binary stream as bytes, the text
+    # and CSV ones as text)
+    BINARY = bytes.fromhex(
+        "5047434f50590aff0d0a0000000000000000000005000000040000000100000009017b22"
+        "61223a20317d000000157b2261223a20312c202262223a205b312c20325d7d000000106f"
+        "1c0a1e2b3d4e5f8a9b0c1d2e3f4a5b000000036f6e6500050000000400000002ffffffff"
+        "ffffffffffffffff0000000374776f0005000000040000000300000013017b2261223a20"
+        "5b747275652c202273225d7d000000105b312c207b2278223a206e756c6c7d5d00000010"
+        "a0eebc999c0b4ef8bb6d6bb9bd380a110000000574687265650005000000040000000400"
+        "000018017b2262223a20322c202263223a207b2261223a20317d7d0000000a7b2263223a"
+        "205b335d7dffffffff00000004666f7572ffff"
+    )
+    TEXT = "".join(f"{line}\n" for line in [
+        '1\t{"a": 1}\t{"a": 1, "b": [1, 2]}\t6f1c0a1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b\tone',
+        '2\t\\N\t\\N\t\\N\ttwo',
+        '3\t{"a": [true, "s"]}\t[1, {"x": null}]\ta0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\tthree',
+        '4\t{"b": 2, "c": {"a": 1}}\t{"c": [3]}\t\\N\tfour',
+    ]).encode()
+    CSV = "".join(f"{line}\n" for line in [
+        "id,doc,dj,u,note",
+        '1,"{""a"": 1}","{""a"": 1, ""b"": [1, 2]}",6f1c0a1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b,one',
+        "2,,,,two",
+        '3,"{""a"": [true, ""s""]}","[1, {""x"": null}]",a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11,three',
+        '4,"{""b"": 2, ""c"": {""a"": 1}}","{""c"": [3]}",,four',
+    ]).encode()
+
+    def binary_copy():
+        got = copied("COPY (SELECT * FROM w2j ORDER BY id) TO STDOUT (FORMAT binary)")
+        info["COPY … TO STDOUT (FORMAT binary): the stream, as hex, when it differs from Postgres 16's"] = None if got == BINARY else got.hex()
+        return got == BINARY
+
+    def text_copy():
+        got = copied("COPY (SELECT * FROM w2j ORDER BY id) TO STDOUT")
+        info["COPY … TO STDOUT (text): the stream, when it differs from Postgres 16's"] = None if got == TEXT else got.decode(errors="replace")
+        return got == TEXT
+
+    def csv_copy():
+        got = copied("COPY (SELECT * FROM w2j ORDER BY id) TO STDOUT (FORMAT csv, HEADER)")
+        info["COPY … TO STDOUT (csv, header): the stream, when it differs from Postgres 16's"] = None if got == CSV else got.decode(errors="replace")
+        return got == CSV
+
+    check("setup: w2j with a jsonb, a json, a uuid and a text column (four rows, NULLs among them), written over HTTP", setup)
+    check("psycopg: doc ? 'a', doc ?| array[...], doc ?& array[...] and doc @> '...' in a WHERE clause give doc as jsonb (3802) under its "
+          "name, with Postgres 16's rows", where_forms)
+    check("psycopg: a json column (dj, 114) and a text one come with the rows of a WHERE on doc ? 'a', as Postgres 16 has them", where_others)
+    check("psycopg: a uuid column (u, 2950) of a WHERE on doc ?| array[...] comes as uuid, as Postgres 16 has it", uuid_others)
+    check("psycopg: doc ? 'a' in the select list is named ?column? and is boolean (NULL for a NULL document), as Postgres 16 names it",
+          question_name)
+    check("COPY (SELECT * FROM w2j ORDER BY id) TO STDOUT (FORMAT binary), as a table's rows come in no promised order: the whole stream, header and trailer included, is Postgres 16's bytes (jsonb's version "
+          "byte, uuid's 16 bytes, NULLs as -1)", binary_copy)
+    check("COPY (… ORDER BY id) TO STDOUT (text) is Postgres 16's stream: the same values, \\N for NULLs, the same escapes", text_copy)
+    check("COPY (… ORDER BY id) TO STDOUT (FORMAT csv, HEADER) is Postgres 16's stream: the column names, quoted fields with doubled quotes, "
+          "empty NULLs", csv_copy)
+    check("psycopg: UPDATE, DELETE and INSERT … RETURNING with ?, ?| and -> answer Postgres 16's rows, each column named and typed "
+          "as Postgres 16 has it (doc as jsonb, the operators as ?column?)", returning_forms)
+
+
+def _jsons_w3(checks, info, port, url):
+    """W3 (PR #131): CHECK, DEFAULT and a materialized view's expectations take the JSON functions and operators (`defaults.rs`:
+    one base session, with the JSON functions `->` and `->>` as every session has them; a view's condition regrouped as
+    Postgres groups it when the view is made, `views.rs`'s `grouped`), and a materialized view's JSON column is typed as
+    CREATE TABLE … AS types its own (`write::query_types`). Every refusal is Postgres 16's SQLSTATE and every row Postgres 16's,
+    taken from the same definitions on TEMP tables of a psql session (the rows the expectations keep: `WHERE (cond) IS NOT FALSE`)."""
+    import psycopg
+
+    def ok(s):
+        """Runs over HTTP: True, or the SQLSTATE the node refused it with."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return True if r.status == 200 else r.getheader("x-pondra-sqlstate")
+
+    def http_rows(s):
+        return call(port, "POST", "/sql", s.encode(), timeout=120)
+
+    def port_rows(s):
+        """psycopg's rows and the type codes of their columns (a jsonb column comes as a dict, 3802)."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            cur = conn.execute(s)
+            return cur.fetchall(), [d.type_code for d in cur.description]
+
+    def port_ok(s):
+        """Runs over the Postgres port: True, or the SQLSTATE it refused the statement with."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            try:
+                conn.execute(s)
+                return True
+            except psycopg.Error as e:
+                return e.sqlstate
+
+    def refused(s, code):
+        """Refused with `code` by HTTP and by the port alike."""
+        return ok(s) == code and port_ok(s) == code
+
+    def run(name, fn):
+        """A check's value: its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def table_check(table, make, good, bad, code, kept):
+        """A table made with a CHECK: a good row written, a bad one refused by `code` over HTTP and the port, and the rows left."""
+        created = ok(make) is True
+        wrote = ok(good) is True
+        return created and wrote and refused(bad, code) and http_rows(f"SELECT id FROM {table} ORDER BY id") == kept
+
+    def c1():
+        return table_check("w3_c1", "CREATE TABLE w3_c1 (id INT, doc JSONB CHECK (doc ? 'id'))",
+                           "INSERT INTO w3_c1 VALUES (1, '{\"id\": 1}')", "INSERT INTO w3_c1 VALUES (2, '{\"a\": 1}')", "23514", [{"id": 1}])
+
+    def c2():
+        return table_check("w3_c2", "CREATE TABLE w3_c2 (id INT, doc JSONB CHECK (jsonb_typeof(doc) = 'object'))",
+                           "INSERT INTO w3_c2 VALUES (1, '{\"a\": 1}')", "INSERT INTO w3_c2 VALUES (2, '[1, 2]')", "23514", [{"id": 1}])
+
+    def c3():
+        created = ok("CREATE TABLE w3_c3 (id INT, doc JSONB DEFAULT jsonb_build_object('a', 1))") is True
+        filled = ok("INSERT INTO w3_c3 (id) VALUES (1)") is True
+        got, codes = port_rows("SELECT doc FROM w3_c3 WHERE id = 1")
+        info["DEFAULT jsonb_build_object('a', 1): the port's rows and type codes (Postgres 16: {'a': 1} as jsonb, 3802)"] = [got, codes]
+        return created and filled and got == [({"a": 1},)] and codes == [3802] and refused("INSERT INTO w3_c3 (id, doc) VALUES (2, 'not json')", "22P02")
+
+    def c4():
+        return table_check("w3_c4", "CREATE TABLE w3_c4 (id INT, doc JSONB CHECK (doc ->> 'id' IS NOT NULL))",
+                           "INSERT INTO w3_c4 VALUES (1, '{\"id\": 1}')", "INSERT INTO w3_c4 VALUES (2, '{\"a\": 1}')", "23514", [{"id": 1}])
+
+    def c5():
+        return table_check("w3_c5", "CREATE TABLE w3_c5 (id INT, doc JSONB CHECK (doc ->> 'a' = 'x'))",
+                           "INSERT INTO w3_c5 VALUES (1, '{\"a\": \"x\"}')", "INSERT INTO w3_c5 VALUES (2, '{\"a\": \"y\"}')", "23514", [{"id": 1}])
+
+    # Two materialized views with an expectation each over the same JSON table: `?` and `->>`, made with the rows there
+    # and then written to. Postgres 16's rows after the two writes: (doc ? 'a') and (doc ->> 'a' = 'x') IS NOT FALSE.
+    def views_setup():
+        made = all(ok(s) is True for s in [
+            "CREATE TABLE w3_ej (id INT, doc JSONB, note TEXT)",
+            "INSERT INTO w3_ej VALUES (1, '{\"a\": 1}', 'one'), (2, '{\"b\": 2}', 'two'), (3, '{\"a\": \"x\", \"c\": 4}', 'three'), "
+            "(4, NULL, 'four'), (5, '{\"a\": \"y\"}', 'five')",
+            "CREATE MATERIALIZED VIEW w3_ev (CONSTRAINT has_a CHECK (doc ? 'a') ON VIOLATION DROP ROW) AS SELECT id, doc FROM w3_ej",
+            "CREATE MATERIALIZED VIEW w3_eq (CONSTRAINT ax CHECK (doc ->> 'a' = 'x') ON VIOLATION DROP ROW) AS SELECT id, doc FROM w3_ej",
+        ])
+        written = ok("INSERT INTO w3_ej VALUES (6, '{\"b\": 1}', 'six'), (7, '{\"a\": 7}', 'seven')") is True
+        return made and written
+
+    ready = []  # (the views' setup, made once: both checks read the same two views)
+
+    def views_ready():
+        if not ready:
+            ready.append(views_setup())
+        return ready[0]
+
+    def view_question():
+        return views_ready() and [r["id"] for r in http_rows("SELECT id FROM w3_ev ORDER BY id")] == [1, 3, 4, 5, 7]
+
+    def view_arrow():
+        return views_ready() and [r[0] for r in port_rows("SELECT id FROM w3_eq ORDER BY id")[0]] == [2, 3, 4, 6]
+
+    def view_json_type():
+        made = all(ok(s) is True for s in [
+            "CREATE TABLE w3_mo_src (id INT, note TEXT)",
+            "INSERT INTO w3_mo_src VALUES (1, 'a'), (2, 'b')",
+            "CREATE MATERIALIZED VIEW w3_mo AS SELECT id, jsonb_build_object('a', id) AS o FROM w3_mo_src",
+        ])
+        rows, codes = port_rows("SELECT id, o FROM w3_mo ORDER BY id")
+        info["materialized view jsonb_build_object AS o: the port's rows and type codes (Postgres 16: 23 and 3802, dicts)"] = [rows, codes]
+        return made and rows == [(1, {"a": 1}), (2, {"a": 2})] and codes == [23, 3802]
+
+    run("W3: CHECK (doc ? 'id') on a JSONB column: CREATE takes it, a row with the key is written, one without refused 23514 by HTTP and the port, and only the good row is there", c1)
+    run("W3: CHECK (jsonb_typeof(doc) = 'object'): CREATE takes it; an object is written, an array refused 23514 by HTTP and the port", c2)
+    run("W3: DEFAULT jsonb_build_object('a', 1) fills {\"a\": 1} as jsonb (3802, a dict over the port); a value that isn't JSON refused 22P02 by both", c3)
+    run("W3: CHECK (doc ->> 'id' IS NOT NULL): CREATE takes it, a row with the key written, one without refused 23514 by HTTP and the port", c4)
+    run("W3: CHECK (doc ->> 'a' = 'x') on a table: CREATE takes it, 'x' written, 'y' refused 23514 by HTTP and the port (the door regroups it)", c5)
+    run("W3: a materialized view's expectation CHECK (doc ? 'a') ON VIOLATION DROP ROW over a JSON column keeps the rows Postgres 16 keeps, before and after writes", view_question)
+    run("W3: a materialized view's expectation CHECK (doc ->> 'a' = 'x') ON VIOLATION DROP ROW keeps the rows Postgres 16 keeps, through the port, after writes", view_arrow)
+    run("W3: a materialized view of jsonb_build_object('a', id) AS o: o is typed jsonb (3802) over psycopg, its rows are dicts, id is int4 (23)", view_json_type)
+
+
 # The sample data the BI tools' statements were captured against (copied from /tmp/claude-0/bi/PREAMBLE.md, "Sample
 # data"; split at each ';'), then the role and the sequence the tools' statements name.
 BI_SAMPLE = """
@@ -14753,17 +16878,15 @@ BI_EXCEPTIONS = {
                    "attnum both qualified (a.attnum) and unqualified, so Pondra answers XX000 'ambiguous'",
 }
 
-# What Postgres 16 answers on the same data, written as literals (computed on a Postgres 16.15 server, database bi). One
-# difference is Pondra's on purpose: a VARCHAR(n) column is text, as in DuckDB (Pondra keeps strings as one type and no
-# declared length; the `pg_catalog` section checks it), so `note` reads text where Postgres 16 says character varying.
+# What Postgres 16 answers on the same data, written as literals (computed on a Postgres 16.15 server, database bi).
 BI_GRAFANA_TABLES = ["regions", "sales", "sales_by_region", "crm.customers"]  # showTables, in the order its ORDER BY gives
-BI_GRAFANA_SALES = [("amount", "double precision"), ("id", "bigint"), ("note", "text"), ("product", "text"),
+BI_GRAFANA_SALES = [("amount", "double precision"), ("id", "bigint"), ("note", "character varying"), ("product", "text"),
                     ("qty", "integer"), ("ref", "uuid"), ("region", "text"), ("ts", "timestamp without time zone")]
 BI_METABASE_TABLES = [("crm", "customers", "TABLE", None), ("public", "regions", "TABLE", None),
                       ("public", "sales", "TABLE", "one row a sale"), ("public", "sales_by_region", "VIEW", None)]
 BI_METABASE_SALES = [("id", "int8", 0, True, None), ("ts", "timestamp", 1, False, None), ("region", "text", 2, False, None),
                      ("product", "text", 3, False, None), ("amount", "float8", 4, False, "in euros"),
-                     ("qty", "int4", 5, False, None), ("ref", "uuid", 6, False, None), ("note", "text", 7, False, None)]
+                     ("qty", "int4", 5, False, None), ("ref", "uuid", 6, False, None), ("note", "varchar", 7, False, None)]
 # Superset's time-range charts: [row count, digest] (bi_digest), by statement key.
 BI_SUPERSET = {"superset:45": ("day", 356, "9cbded7090574f0e"), "superset:46": ("week", 56, "4149781711f54944"),
                "superset:47": ("month", 12, "ac21e38aff619dea"), "superset:48": ("hour", 8544, "4686040d6f2da882"),
@@ -14954,7 +17077,7 @@ def bi():
               lambda: [tuple(r[:4]) for r in results["metabase:sync-11"]] == BI_METABASE_TABLES
               and any(r[0] == "public" and r[1] == "sales" and r[4] is not None for r in results["metabase:sync-11"]))
         check("Metabase's field sync (statement 13) gives each column of sales its database type (int8, timestamp, text, float8, "
-              "int4, uuid; a VARCHAR(n) text), pk? true for id only, and amount's comment",
+              "int4, uuid, varchar), pk? true for id only, and amount's comment",
               lambda: [(r[0], r[1], r[2], r[5], r[6]) for r in results["metabase:sync-13"]
                        if r[3] == "public" and r[4] == "sales"] == BI_METABASE_SALES)
         for key, (grain, count, digest) in BI_SUPERSET.items():
@@ -15942,6 +18065,561 @@ def sparksql():
     if not ok:
         sys.exit(1)
 
+
+
+def _jsonedits_spaces(checks, info, pg_rows, http_rows, port_rows):
+    """JSON's spaces in front of a document (PR #131): jsonb_set edits a document that starts after a space, a tab or a
+    newline, and makers read one (jsonb_build_object, json_build_object, to_jsonb, jsonb_build_array, json_build_array):
+    jsonb takes its text as jsonb prints it, json keeps its text as written. Each statement's answer is Postgres 16's on the
+    same text, over HTTP and over the port."""
+    cases = [
+        ("jsonb_set of a member, in a document with a space, a newline and a tab in front",
+         "SELECT jsonb_set(' \n{\"c\": {\"d\": 1}, \"b\": [1, 2]}\t'::jsonb, '{c,d}', '\"new\"')::text"),
+        ("jsonb_set of an element, in an array with a tab and a newline in front", "SELECT jsonb_set('\t[1, 2]\n'::jsonb, '{1}', '9')::text"),
+        ("jsonb_set made at a new member, in a document with a space in front", "SELECT jsonb_set(' {\"b\": 1}'::jsonb, '{zz}', '[true]', true)::text"),
+        ("jsonb_build_object of a jsonb document with spaces round it: nested as jsonb prints it",
+         "SELECT jsonb_build_object('doc', ' {\"b\":1,\"a\":[2,{\"d\":null,\"c\":3}]} '::jsonb)::text"),
+        ("json_build_object of a json document with spaces round it: nested as written",
+         "SELECT json_build_object('doc', ' {\"b\": 1,  \"a\": [2]}\n'::json)::text"),
+        ("to_jsonb of a json document with a space and a tab in front", "SELECT to_jsonb(' [1, \"x\"]\t'::json)::text"),
+        ("jsonb_build_array of jsonb documents with spaces in front", "SELECT jsonb_build_array(' {\"b\":1,\"a\":2}'::jsonb, '\t[]\n'::jsonb)::text"),
+        ("json_build_array of a json document with a space in front: as written", "SELECT json_build_array(' [1]'::json)::text"),
+    ]
+    for name, text in cases:
+        want = pg_rows(text)
+        got = http_rows(text)
+        checks[f"{name}: HTTP == Postgres 16's answer ({len(want)} rows)"] = got == want
+        checks[f"{name}: the Postgres port == Postgres 16's answer"] = port_rows(text) == want
+        if got != want:
+            info[f"differs: {name}"] = {"pondra": got[:4], "postgres": want[:4]}
+
+
+def jsonedits():
+    """JSON documents changed in place (`pg_json_edit.rs`, round 35): jsonb_set, jsonb_insert, jsonb_concat, `-` and `#-`
+    (jsonb_delete, jsonb_delete_path), jsonb_strip_nulls, json_strip_nulls and jsonb_pretty; and a string cast to an array
+    type read as a Postgres array literal ('{a,b}'::text[], CAST('{1,2}' AS INT[]), TEXT[] '{a,b}') by `pg_values.rs`.
+    Each answer equals Postgres 16's (PONDRA_PG16 names it, default the local one under /tmp/pg16-l3), or, with none, its answers recorded in tools/pg16/jsonedits.json (`Pg16`), over HTTP and over
+    the Postgres port; what Postgres refuses is refused with the same SQLSTATE by name (42883 for `-` on a json or a
+    decimal operand, 22023 for a change into a scalar or a key that is there already, 22004 for a NULL path element,
+    22P02 for a path element that isn't an integer where an array is, or text that isn't JSON). Where Pondra reads more
+    than Postgres 16 answers, the check is Pondra's own answer and the note says why: TEXT[] '{a,b}' is a syntax error
+    (42601) in Postgres 16, and a nested array literal is refused by name (0A000).
+    Known gaps, recorded in `info` and not checked: the planner sees a table column's text, not its json type (the marks
+    are answer-side only), so `-` and `#-` on a json or jsonb COLUMN are not refused as Postgres refuses them (`js - 'a'`
+    answers a delete, `doc - 1.5` and `doc - doc` arithmetic's error); jsonb_set of a json column is answered (Postgres:
+    42883). A `-` on a json or jsonb value made by a function (json_build_object, jsonb_build_object) is refused by name.
+    `||` (round 35, Piece E): jsonb's operator merges documents, as `jsonb_concat` does. Postgres 16's answers are the model
+    (each pair of these operands with a json or jsonb one, over j's rows, is one statement; Pondra's answer equals Postgres's,
+    or its SQLSTATE is the one Postgres gives, and a 42883 carries Postgres's words):
+        jsonb || jsonb, jsonb || '…' and '…' || jsonb, jsonb || NULL: jsonb (a literal that isn't JSON is 22P02)
+        json || json, json || jsonb, jsonb || json, jsonb || integer | numeric | boolean | uuid, json || integer | uuid: 42883
+        json || '…', json || text, jsonb || text, '…' || '…', untyped || integer | uuid: text, as before
+    Known gap: a bigint column beside a document is text in Pondra (the trace knows no integer columns; Postgres: 42883).
+    Measured (1,000,000 rows of `(id BIGINT, doc JSONB)`, each `{"id": i, "name": "n<i>", "tags": ["a", "b", "c"],
+    "nested": {"k": i}}`; the median of 7 rounds, the two Pondra builds one after the other in each round (alternating),
+    a warm-up before each timed run, every statement's text new so that no answer is remembered; Postgres 16 and DuckDB
+    1.5.5 run the same statements in the same rounds, on a quiet machine). Seconds per statement. Pondra's figure is this
+    round's build; in parentheses, the same run's build from before parts A to D (and before main's merge):
+        statement                                  Pondra (before)      Postgres 16          DuckDB 1.5.5
+        count(jsonb_set(doc, '{name}', '"x"'))     0.42 s (0.96 s)      0.45 s               n/a
+        count(jsonb_concat(doc, '{"z": 1}'))       0.50 s (0.78 s)      0.51 s (doc || ...)  0.25 s (json_merge_patch)
+        count(doc - 'tags')                        0.38 s (0.70 s)      0.31 s               n/a
+        sum(length(jsonb_set ...)), as text        0.44 s (0.98 s)      0.87 s               n/a
+        sum(length(jsonb_concat ...)), as text     0.51 s (0.98 s)      1.01 s               0.26 s (json_merge_patch)
+        sum(length(doc - 'tags')), as text         0.34 s (0.69 s)      0.60 s               n/a
+    Every statement is faster, and every answer is the one before. Pondra's answers equal Postgres 16's for all six. Still behind Postgres:
+    count(doc - 'tags'), by 0.07 s: a count still prints the document, where Postgres edits binary jsonb and never
+    prints it for a count. The references, measured before this round: Pondra count(json_get_str(doc, 'name')) 0.11 s
+    (one member read); jsonb_strip_nulls, the tree path, 1.77 s; json_strip_nulls, which copies tokens, 0.63 s.
+    Where the time went (a probe before parts A to D, on a loaded machine: compare the shares, not the seconds): a jsonb
+    function parsed each document into a tree of strings and maps and printed it again, whatever the edit. Most of the
+    time went to reading the tree, then to the path lists, the depth scan and the copy of the output. Parts A to D made
+    the tree borrow its text, write each batch into one String, read a literal path once, skip the depth scan of a short
+    document and write plain numbers as they are. What is left, not done: copy the untouched bytes and re-encode only the
+    path changed (the token walk json_strip_nulls uses, which is 2.8x faster here), and, to match counts, a binary jsonb
+    stored in the lake (a new format: an ADR and a format number).
+    """
+    import csv, psycopg
+    # Rows: a document in jsonb's own text (keys in jsonb's order: what jsonb would print), json text with spaces
+    # (json keeps what it is given), a count. Row 3 is all NULL; row 4 is a scalar (a change into it is refused).
+    rows = [
+        (1, '{"a": 1, "b": [1, 2], "c": {"d": null, "e": "x"}, "n": null}', '{ "a" : 1, "n" : null, "b" : [ 1 , 2 ] }', 1),
+        (2, '[1, null, {"k": null}]', '[1, {"z" : null}, null]', 2),
+        (3, None, None, None),
+        (4, '"text"', '"s"', 4),
+    ]
+    lit = lambda v: "NULL" if v is None else "'" + v.replace("'", "''") + "'"
+    values = ", ".join(f"({i}, {lit(d)}, {lit(j)}, {'NULL' if n is None else n})" for i, d, j, n in rows)
+    setup = ["CREATE TABLE j (id BIGINT, doc JSONB, js JSON, n BIGINT)", f"INSERT INTO j VALUES {values}", "CREATE VIEW jv AS SELECT id, doc FROM j"]
+    # Each answer is one statement, the same text for Pondra and Postgres 16 (every result cast to text).
+    ok_cases = [
+        ("jsonb_set of a member", "SELECT id, jsonb_set(doc, '{c,e}', '\"y\"')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set of an element", "SELECT id, jsonb_set(doc, '{b,1}', '9')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set from the end of an array", "SELECT id, jsonb_set(doc, '{b,-1}', '9')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set past an array's end (made)", "SELECT id, jsonb_set(doc, '{b,7}', '9')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set of a new member (made)", "SELECT id, jsonb_set(doc, '{zz}', '\"x\"')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set of a new member, not made", "SELECT id, jsonb_set(doc, '{zz}', '\"x\"', false)::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set of an element of an array document", "SELECT id, jsonb_set(doc, '{1}', '9')::text FROM j WHERE id IN (2, 3) ORDER BY id"),
+        ("jsonb_set with a path array", "SELECT id, jsonb_set(doc, ARRAY['c', 'd'], '\"new\"', true)::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set through a missing member: unchanged", "SELECT id, jsonb_set(doc, '{c,zz,yy}', '1')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_insert before an element", "SELECT id, jsonb_insert(doc, '{b,0}', '0')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_insert after an element", "SELECT id, jsonb_insert(doc, '{b,0}', '0', true)::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_insert after a negative step", "SELECT id, jsonb_insert(doc, '{b,-1}', '0', true)::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_insert of a new member", "SELECT id, jsonb_insert(doc, '{zz}', '\"x\"')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_concat of an object and an object", "SELECT id, jsonb_concat(doc, '{\"z\": 1}')::text FROM j ORDER BY id"),
+        ("jsonb_concat of a document and an array", "SELECT id, jsonb_concat(doc, '[9]')::text FROM j ORDER BY id"),
+        ("- a key", "SELECT id, (doc - 'c')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("- a key of an array (nothing to delete)", "SELECT id, (doc - 'b')::text FROM j WHERE id = 2"),
+        ("- an index", "SELECT id, (doc - 1)::text FROM j WHERE id = 2"),
+        ("- a list of keys", "SELECT id, (doc - ARRAY['a', 'c'])::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("#- a path", "SELECT id, (doc #- '{c,e}')::text FROM j WHERE id = 1"),
+        ("#- a negative index", "SELECT id, (doc #- '{b,-1}')::text FROM j WHERE id = 1"),
+        ("#- a path array", "SELECT id, (doc #- ARRAY['b', '1'])::text FROM j WHERE id = 1"),
+        ("#- an element of an array document", "SELECT id, (doc #- '{1}')::text FROM j WHERE id = 2"),
+        ("jsonb_strip_nulls", "SELECT id, jsonb_strip_nulls(doc)::text FROM j ORDER BY id"),
+        ("json_strip_nulls of json text", "SELECT id, json_strip_nulls(js)::text FROM j ORDER BY id"),
+        ("jsonb_pretty", "SELECT id, jsonb_pretty(doc) FROM j WHERE id IN (1, 2) ORDER BY id"),
+        ("jsonb_pretty of a scalar", "SELECT id, jsonb_pretty(doc) FROM j WHERE id = 4"),
+        ("jsonb_pretty of empty containers", "SELECT jsonb_pretty('{\"tags\": [], \"o\": {}, \"n\": [[], {\"x\": []}]}'::jsonb)"),
+        ("|| of two jsonb columns", "SELECT id, (doc || doc)::text FROM j ORDER BY id"),
+        ("|| of a document, a literal list and an object, nested", "SELECT id, (doc || '{\"z\": 1}' || '[9]' || '{\"a\": 2}')::text FROM j ORDER BY id"),
+        ("|| with NULL on either side", "SELECT id, (doc || NULL)::text, (NULL || doc)::text FROM j ORDER BY id"),
+        ("|| in a WHERE", "SELECT id FROM j WHERE doc || '{\"x\": 1}' IS NOT NULL ORDER BY id"),
+        ("|| of a jsonb made by a function", "SELECT id, (jsonb_build_object('a', n) || '{\"b\": 2}')::text FROM j ORDER BY id"),
+        ("|| of a subquery's jsonb column", "SELECT x.id, (x.v || '{\"w\": 0}')::text FROM (SELECT id, doc AS v FROM j) AS x ORDER BY x.id"),
+        ("|| of a subquery's column that a function makes", "SELECT x.id, (x.v || '{\"w\": 0}')::text FROM (SELECT id, jsonb_build_object('a', id) AS v FROM j) AS x ORDER BY x.id"),
+        ("|| over a view of a jsonb column", "SELECT id, (doc || '{\"w\": 0}')::text FROM jv ORDER BY id"),
+        ("|| of json and an object literal: text, as before", "SELECT id, js || '{\"b\": 2}' FROM j ORDER BY id"),
+        ("|| of jsonb and text: text, as before", "SELECT id, doc || 'x'::text FROM j ORDER BY id"),
+        ("array literals in casts", "SELECT array_to_string('{a,b}'::text[], '|'), array_to_string(CAST('{1,2}' AS INT[]), '|'), array_to_string('{}'::text[], '|')"),
+        ("array literal with quotes and an escape", "SELECT array_to_string('{\"a b\",\"c\\\"d\"}'::text[], '|')"),
+    ]
+    # (name, statement, SQLSTATE Postgres 16 gives it, and Pondra refuses it with)
+    error_cases = [
+        ("- on json made by a function: no operator", "SELECT json_build_object('a', 1) - 'a'", "42883"),
+        ("- a decimal on jsonb made by a function: no operator", "SELECT jsonb_build_object('a', 1) - 1.5", "42883"),
+        ("- jsonb on jsonb made by a function: no operator", "SELECT jsonb_build_object('a', 1) - jsonb_build_array(1)", "42883"),
+        ("#- an integer: no operator", "SELECT doc #- 1 FROM j WHERE id = 1", "42883"),
+        ("- a key of a scalar", "SELECT doc - 'a' FROM j WHERE id = 4", "22023"),
+        ("#- a path of a scalar", "SELECT doc #- '{a}' FROM j WHERE id = 4", "22023"),
+        ("jsonb_set into a scalar", "SELECT jsonb_set(doc, '{a}', '1') FROM j WHERE id = 4", "22023"),
+        ("jsonb_insert of a key that is there", "SELECT jsonb_insert(doc, '{a}', '2') FROM j WHERE id = 1", "22023"),
+        ("an index of an object", "SELECT doc - 0 FROM j WHERE id = 1", "22023"),
+        ("jsonb_set with a NULL path element", "SELECT jsonb_set(doc, '{a,NULL}', '1') FROM j WHERE id = 1", "22004"),
+        ("jsonb_set: a key on an array", "SELECT jsonb_set(doc, '{b,x}', '1') FROM j WHERE id = 1", "22P02"),
+        ("jsonb_set of text that isn't JSON", "SELECT jsonb_set(doc, '{a}', 'x') FROM j WHERE id = 1", "22P02"),
+        ("#- a key on an array", "SELECT doc #- '{x}' FROM j WHERE id = 2", "22P02"),
+        ("a malformed array literal", "SELECT '{a,b'::text[]", "22P02"),
+    ]
+    # Known gaps (the docstring): the planner sees a column's text, not its json type. Postgres's code is pinned;
+    # Pondra's answer is recorded in `info`, not checked.
+    gap_cases = [
+        ("- on a json column", "SELECT js - 'a' FROM j WHERE id = 1", "42883"),
+        ("- a decimal on a jsonb column", "SELECT doc - 1.5 FROM j WHERE id = 1", "42883"),
+        ("- jsonb on a jsonb column", "SELECT doc - doc FROM j WHERE id = 1", "42883"),
+    ]
+    checks, info = {}, {}
+    pg16 = Pg16("jsonedits", setup)
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1, pg=f"127.0.0.1:{A.port + 10}").start()
+    try:
+        for s_ in setup:
+            sql(A.port, s_)
+        call(A.port, "POST", "/tier", timeout=600)  # (tiered: the rows come from files as well as the log)
+        time.sleep(1)
+
+        def norm(rows_):  # (every value as text, a NULL as "": the three sides compare alike)
+            return [tuple("" if v is None else str(v) for v in r) for r in rows_]
+
+        def http_rows(text):
+            c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=300)
+            c.request("POST", "/sql?format=csv", text.encode())
+            r = c.getresponse()
+            body = r.read().decode()
+            assert r.status == 200, body[:300]
+            return [tuple(row) for row in list(csv.reader(io.StringIO(body)))[1:]]
+
+        def pg_rows(text):
+            return pg16.rows(text)
+
+        def port_rows(text):
+            with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as conn:
+                return norm([tuple(r) for r in conn.execute(text).fetchall()])
+
+        def pg_code(text):
+            """The SQLSTATE Postgres 16 refuses a statement with, None when it answers."""
+            try:
+                pg_rows(text)
+                return None
+            except Pg16Error as e:
+                return e.sqlstate
+
+        def port_code(text):
+            try:
+                port_rows(text)
+                return None
+            except psycopg.Error as e:
+                return e.sqlstate
+
+        for name, text in ok_cases:
+            want = pg_rows(text)
+            got = http_rows(text)
+            checks[f"{name}: HTTP == Postgres 16's answer ({len(want)} rows)"] = got == want
+            checks[f"{name}: the Postgres port == Postgres 16's answer"] = port_rows(text) == want
+            if got != want:
+                info[f"differs: {name}"] = {"pondra": got[:4], "postgres": want[:4]}
+        for name, text, code in error_cases:
+            status, state, body = _sqlstate_of(A.port, text)
+            info[f"refused: {name}"] = [status, state, body[:160]]
+            checks[f"{name}: Postgres 16 refuses with SQLSTATE {code}"] = pg_code(text) == code
+            checks[f"{name}: HTTP refuses by name, SQLSTATE {code}"] = status >= 400 and state == code
+            checks[f"{name}: the Postgres port refuses with SQLSTATE {code}"] = port_code(text) == code
+        for name, text, code in gap_cases:
+            status, state, body = _sqlstate_of(A.port, text)
+            checks[f"known gap, {name}: Postgres 16 refuses with SQLSTATE {code}"] = pg_code(text) == code
+            info[f"known gap: {name}"] = {"postgres": pg_code(text), "pondra": [status, state, body[:160]]}
+        # `||` (Piece E): every pair of these operands with a json or jsonb one, over j's rows. Postgres answers or refuses;
+        # its answer, or its SQLSTATE and words, is what Pondra must give. A bigint column (`n`) beside a document is the
+        # known gap: Pondra's trace knows no integer columns, so it stays text where Postgres refuses.
+        concat_ops = ["doc", "js", "(doc -> 'a')", "'{\"z\": 1}'", "'[9]'", "'x'", "NULL", "1", "1.5", "TRUE", "'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid", "'x'::text", "n"]
+        json_ops = {"doc", "js", "(doc -> 'a')", "'{\"z\": 1}'", "'[9]'"}
+
+        def pg_message(text):
+            try:
+                pg_rows(text)
+                return None
+            except Pg16Error as e:
+                return str(e).splitlines()[0]
+
+        def http_or_error(text):  # (a Pondra error is a failed check, not an abort: the rest of the grid still runs)
+            try:
+                return http_rows(text)
+            except AssertionError as e:
+                return f"error: {e}"
+
+        for l_ in concat_ops:
+            for r_ in concat_ops:
+                if l_ not in json_ops and r_ not in json_ops:
+                    continue
+                name, text = f"{l_} || {r_}", f"SELECT id, ({l_} || {r_})::text AS v FROM j ORDER BY id"
+                code = pg_code(text)
+                if code is None:
+                    want = pg_rows(text)
+                    got = http_or_error(text)
+                    checks[f"{name}: HTTP == Postgres 16's answer ({len(want)} rows)"] = got == want
+                    checks[f"{name}: the Postgres port == Postgres 16's answer"] = port_rows(text) == want
+                    if got != want:
+                        info[f"differs: {name}"] = {"pondra": got if isinstance(got, str) else got[:4], "postgres": want[:4]}
+                elif "n" in (l_, r_):
+                    status, state, body = _sqlstate_of(A.port, text)
+                    checks[f"known gap, {name}: Postgres 16 refuses with SQLSTATE {code}"] = code == "42883"
+                    info[f"known gap: {name}"] = {"postgres": code, "pondra": [status, state, body[:120]]}
+                else:
+                    status, state, body = _sqlstate_of(A.port, text)
+                    checks[f"{name}: HTTP refuses with SQLSTATE {code}"] = status >= 400 and state == code
+                    checks[f"{name}: the Postgres port refuses with SQLSTATE {code}"] = port_code(text) == code
+                    if code == "42883":
+                        checks[f"{name}: HTTP says Postgres's words"] = pg_message(text) in body
+        # Known gaps, recorded and not checked: sqlparser ranks `||` with `*` where Postgres ranks it with `->` and below `+`.
+        # Without parentheses, `doc -> 'a' || doc` is `doc -> ('a' || doc)` here (refused: 22P02), where Postgres answers
+        # `(doc -> 'a') || doc`; and `'x' || n + 1` is `('x' || n) + 1` here (refused), where Postgres answers 'x6'.
+        for name, gap_text in [("doc -> 'a' || doc, with no parentheses", "SELECT id, (doc -> 'a' || doc)::text AS v FROM j WHERE id = 1"),
+                               ("'x' || n + 1, with no parentheses", "SELECT id, ('x' || n + 1) AS v FROM j WHERE id = 1")]:
+            info[f"known gap: {name} (Postgres 16's answer)"] = {"postgres": rows_text(pg_rows(gap_text)), "pondra": list(_sqlstate_of(A.port, gap_text))[:2] + [str(http_or_error(gap_text))[:120]]}
+        # UPDATE … SET doc = doc || …, and an INSERT … SELECT of one, change the same rows as Postgres's, read back.
+        for write in ["UPDATE j SET doc = doc || '{\"z\": 1}' WHERE id IN (1, 2)", "INSERT INTO j (id, doc, js, n) SELECT id + 10, doc || '{\"c\": 3}', js, n FROM j WHERE id = 1"]:
+            pg16.rows(write)
+            sql(A.port, write)
+        back = "SELECT id, doc::text, (doc || '{\"d\": 4}')::text FROM j ORDER BY id"
+        checks["UPDATE … SET doc = doc || … and INSERT … SELECT: HTTP reads back Postgres 16's rows"] = http_rows(back) == pg_rows(back)
+        checks["UPDATE … SET doc = doc || … and INSERT … SELECT: the Postgres port reads back Postgres 16's rows"] = port_rows(back) == pg_rows(back)
+        # Where Pondra reads more than Postgres 16 answers: Pondra's own answer is the check, Postgres's is recorded.
+        typed = "SELECT array_to_string(TEXT[] '{a,\"b,c\"}', '|')"
+        info["TEXT[] '{a,\"b,c\"}' in Postgres 16"] = pg_code(typed) or "answered"
+        checks["TEXT[] '{a,\"b,c\"}' is read as an array literal (a|b,c; Postgres 16 refuses its syntax)"] = http_rows(typed) == [("a|b,c",)]
+        nested = "SELECT array_to_string('{{1,2},{3,4}}'::int[], '|')"
+        status, state, body = _sqlstate_of(A.port, nested)
+        info["nested array literal in Postgres 16"] = rows_text(pg_rows(nested))
+        info["refused: nested array literal"] = [status, state, body[:160]]
+        checks["a nested array literal is refused by name, SQLSTATE 0A000 (a gap: Postgres answers it)"] = status >= 400 and state == "0A000"
+        _jsonedits_spaces(checks, info, pg_rows, http_rows, port_rows)
+        # Known, not yet refused: jsonb_set of a json column (Postgres: no such function).
+        known = "SELECT jsonb_set(js, '{a}', '1') FROM j WHERE id = 1"
+        info["known gap: jsonb_set of a json column (Postgres 16: 42883)"] = {"pondra": http_rows(known), "postgres": pg_code(known)}
+    finally:
+        node.kill()
+        pg16.close()
+    ok = all(checks.values())
+    print(json.dumps({"jsonedits": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
+def rows_text(rows_):
+    """A query's rows as text, for a note in a check's `info`."""
+    return [[str(v) for v in r] for r in rows_][:4]
+
+
+def lateral():
+    """LATERAL over a function's rows, in one pass (L3, `lateral.rs`, `Lateral` and `functions`): Postgres's
+    `FROM t, unnest(t.xs) AS u(x)`, `FROM t, generate_series(1, t.n) AS g`, `CROSS JOIN LATERAL`, `LEFT JOIN
+    LATERAL … ON true` (padded with NULL when the list is NULL or empty), two laterals chained, a lateral in a
+    subquery, a WHERE, GROUP BY and ORDER BY over the lateral's columns, `SELECT *`, a column of the left side
+    named like the function's, `JOIN LATERAL … ON`, `random()` read once, and a lateral the rule leaves to
+    DataFusion (an aggregate) answering as before. Each answer equals Postgres 16's (PONDRA_PG16 names it,
+    default the local one under /tmp/pg16-l3, or, with none, its answers recorded in tools/pg16/lateral.json (`Pg16`; ORDER BY exactly), DuckDB's where DuckDB takes the query, and
+    the same answer on three nodes with `?spread=1`; the Postgres port answers the same rows; and what is
+    refused is refused by name with SQLSTATE 0A000.
+
+    Numbers (one node; 1,000,000 rows of t(id, xs INT[3], n 1..5); each form's median of three timed runs past
+    the result cache, each run with its own literal in the aggregate; three such measurements, the forms run
+    one after another, and the two unnest forms alternated in seven rounds to check the order):
+      unnest:          one pass 0.059, 0.021, 0.023 s; a subquery 0.025, 0.014, 0.015 s
+                       (run 1's first form is cold; alternated, 0.020 s and 0.018 s: within 10%)
+      generate_series: one pass 0.027, 0.022, 0.025 s; a subquery 0.026, 0.024, 0.026 s (within 12%)
+    Postgres 16 and DuckDB take the same forms (their subquery form written as their own set function).
+    """
+    import csv, duckdb, psycopg
+    pondra_setup = ["CREATE TABLE t (id BIGINT, xs BIGINT[], n BIGINT)", "INSERT INTO t VALUES (1, [1, 2, 3], 2), (2, NULL, 1), (3, [], 3)",
+                    "INSERT INTO t SELECT value + 3, make_array(value % 5, value % 3, 1), value % 5 + 1 FROM generate_series(1, 20000)",
+                    "CREATE TABLE r (id BIGINT, a BIGINT, b BIGINT)", "INSERT INTO r VALUES (1, 1, 5), (2, 3, 4), (3, NULL, 2), (4, 2, 2)",
+                    "CREATE TABLE tx (id BIGINT, x BIGINT, xs BIGINT[])", "INSERT INTO tx VALUES (1, 100, [7, 8]), (2, 200, NULL), (3, 300, [])"]
+    pg_setup = ["CREATE TABLE t (id BIGINT, xs BIGINT[], n BIGINT)", "INSERT INTO t VALUES (1, ARRAY[1, 2, 3], 2), (2, NULL, 1), (3, '{}', 3)",
+                "INSERT INTO t SELECT value + 3, ARRAY[value % 5, value % 3, 1]::BIGINT[], value % 5 + 1 FROM generate_series(1, 20000) AS value",
+                "CREATE TABLE r (id BIGINT, a BIGINT, b BIGINT)", "INSERT INTO r VALUES (1, 1, 5), (2, 3, 4), (3, NULL, 2), (4, 2, 2)",
+                "CREATE TABLE tx (id BIGINT, x BIGINT, xs BIGINT[])", "INSERT INTO tx VALUES (1, 100, ARRAY[7, 8]), (2, 200, NULL), (3, 300, '{}')"]
+    duck_setup = ["CREATE TABLE t (id BIGINT, xs BIGINT[], n BIGINT)", "INSERT INTO t VALUES (1, [1, 2, 3], 2), (2, NULL, 1), (3, [], 3)",
+                  "INSERT INTO t SELECT i + 3, [i % 5, i % 3, 1], i % 5 + 1 FROM range(1, 20001) AS g(i)",
+                  "CREATE TABLE r (id BIGINT, a BIGINT, b BIGINT)", "INSERT INTO r VALUES (1, 1, 5), (2, 3, 4), (3, NULL, 2), (4, 2, 2)",
+                  "CREATE TABLE tx (id BIGINT, x BIGINT, xs BIGINT[])", "INSERT INTO tx VALUES (1, 100, [7, 8]), (2, 200, NULL), (3, 300, [])"]
+    # (name, Pondra's text, Postgres's text or None when the same, ordered: the ORDER BY is compared as written)
+    cases = [
+        ("implicit unnest", "SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x)", None, False),
+        ("generate_series of a column", "SELECT t.id, g FROM t, generate_series(1, t.n) AS g", None, False),
+        ("CROSS JOIN LATERAL unnest", "SELECT t.id, u.x FROM t CROSS JOIN LATERAL unnest(t.xs) AS u(x)", None, False),
+        ("LEFT JOIN LATERAL … ON true", "SELECT t.id, u.x FROM t LEFT JOIN LATERAL unnest(t.xs) AS u(x) ON true", None, False),
+        ("two laterals chained", "SELECT t.id, u.x, v.y FROM t, LATERAL (SELECT unnest(t.xs) AS x) u, LATERAL (SELECT unnest(generate_series(1, u.x)) AS y) v",
+         "SELECT t.id, u.x, v.y FROM t, LATERAL (SELECT unnest(t.xs) AS x) u CROSS JOIN LATERAL generate_series(1, u.x) AS v(y)", False),
+        ("a lateral inside a subquery", "SELECT s.id, s.x FROM (SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x)) s WHERE s.x > 1", None, False),
+        ("WHERE on the lateral's column", "SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x) WHERE u.x > 1", None, False),
+        ("GROUP BY the lateral's column", "SELECT u.x, count(*) AS n FROM t, unnest(t.xs) AS u(x) GROUP BY u.x", None, False),
+        ("ORDER BY both sides", "SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x) ORDER BY t.id DESC, u.x LIMIT 50", None, True),
+        ("SELECT * (r's columns, then g)", "SELECT * FROM r, generate_series(r.a, r.b) AS g", None, False),
+        ("a column of t named like the function's", "SELECT t.x, u.x AS y FROM tx t, unnest(t.xs) AS u(x)", None, False),
+        ("generate_series with a step", "SELECT r.id, g FROM r, generate_series(r.a, r.b, 2) AS g", None, False),
+        ("JOIN LATERAL … ON a condition", "SELECT t.id, u.x FROM t JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1", None, False),
+        ("a lateral aggregate (DataFusion's)", "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s",
+         "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s", False),
+    ]
+    # (DuckDB returns a set function's alias as a struct column: its values are the column named after the function)
+    duck_text = {
+        "generate_series of a column": "SELECT t.id, g.generate_series FROM t, generate_series(1, t.n) AS g",
+        "generate_series with a step": "SELECT r.id, g.generate_series FROM r, generate_series(r.a, r.b, 2) AS g",
+        "SELECT * (r's columns, then g)": "SELECT r.*, g.generate_series FROM r, generate_series(r.a, r.b) AS g",
+    }
+    refused = {  # (Pondra's text, SQLSTATE, words the error must have)
+        "LEFT JOIN LATERAL with a condition": ("SELECT t.id, u.x FROM t LEFT JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1", "0A000", ["LEFT JOIN LATERAL", "not supported"]),
+        "RIGHT JOIN LATERAL": ("SELECT t.id, u.x FROM t RIGHT JOIN LATERAL unnest(t.xs) AS u(x) ON true", "0A000", ["not supported"]),
+        "WITH ORDINALITY over a column": ("SELECT t.id, g FROM t, generate_series(1, t.n) WITH ORDINALITY AS g(v, o)", "0A000", ["WITH ORDINALITY is not supported yet"]),
+    }
+    random_text = "SELECT count(DISTINCT s.r) AS d, count(*) AS n FROM (SELECT random() AS r, [1, 2, 3] AS xs) s, unnest(s.xs) AS u(x)"
+    random_pg = "SELECT count(DISTINCT s.r) AS d, count(*) AS n FROM (SELECT random() AS r, ARRAY[1, 2, 3] AS xs) s, unnest(s.xs) AS u(x)"
+    checks, info = {}, {}
+    pg16 = Pg16("lateral", pg_setup)
+    duck = duckdb.connect()
+    for s_ in duck_setup:
+        duck.execute(s_)
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1, pg=f"127.0.0.1:{A.port + 10}").start()
+    for s_ in pondra_setup:
+        sql(A.port, s_)
+    call(A.port, "POST", "/tier", timeout=600)  # (tiered: a spread query slices the files)
+    time.sleep(1)
+    def norm(rows):  # (every value as text, a NULL as "", so the three sides compare alike)
+        return [tuple("" if v is None else str(v) for v in r) for r in rows]
+    def rows_of_pondra(text, port=A.port, spread=False):
+        # (CSV, not JSON: the node's JSON leaves a NULL's field out, so a padded row would lose its column)
+        path = "/sql?format=csv" + ("&spread=1" if spread else "")
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=300)
+        c.request("POST", path, text.encode())
+        r = c.getresponse()
+        body = r.read().decode()
+        assert r.status == 200, body[:300]
+        return [tuple(row) for row in list(csv.reader(io.StringIO(body)))[1:]]
+    def rows_of_pg(text):
+        return pg16.rows(text)
+    def rows_of_duck(text):
+        return norm([tuple(r) for r in duck.execute(text).fetchall()])
+    def key(rows):
+        return sorted(rows, key=repr)
+    got, want_duck, duck_refused = {}, {}, {}
+    for name, text, pg_text, ordered in cases:
+        pg_text = pg_text or text
+        got[name] = rows_of_pondra(text)
+        try:
+            want_duck[name] = rows_of_duck(duck_text.get(name, text))
+        except Exception as e:
+            duck_refused[name] = str(e).splitlines()[0][:120]
+        same = pg16.same(pg_text, got[name], ordered)
+        checks[f"{name}: one node == Postgres 16's answer ({len(got[name])} rows)"] = same
+        if name in want_duck:
+            checks[f"{name}: == DuckDB's answer"] = key(got[name]) == key(want_duck[name])
+    info["duckdb refused"] = duck_refused
+    got["random"] = rows_of_pondra(random_text)
+    checks["random() in the left side is read once: one r on each of the three rows (Pondra and Postgres)"] = got["random"] == [("1", "3")] and rows_of_pg(random_pg) == [("1", "3")]
+    for name, (text, code, words) in refused.items():
+        status, state, body = _sqlstate_of(A.port, text)
+        info[f"refused: {name}"] = [status, state, body[:200]]
+        checks[f"refused by name, SQLSTATE 0A000: {name}"] = status >= 400 and state == code and all(w in body for w in words)
+    # Postgres's port answers the same rows (one is enough).
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pgp:
+        via_port = norm([tuple(r) for r in pgp.execute(cases[4][1]).fetchall()])
+    checks["the Postgres port answers the same rows as HTTP ('two laterals chained')"] = key(via_port) == key(got["two laterals chained"])
+    # A set function over an outer query's column, in a subquery: Postgres answers it (3, 0, 0, 1), Pondra refuses it by name.
+    outer_text = "SELECT id, (SELECT count(*) FROM unnest(t.xs)) FROM t"
+    status, state, body = _sqlstate_of(A.port, outer_text)
+    info["refused: unnest over an outer column (HTTP)"] = [status, state, body[:300]]
+    checks["a set function over an outer query's column is refused by name over HTTP: 0A000, naming t.xs"] = status >= 400 and state == "0A000" and "t.xs" in body and "aren't taken yet" in body
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pgo:
+        try:
+            pgo.execute(outer_text)
+            port_refused = False
+        except psycopg.Error as e:
+            port_refused = e.sqlstate == "0A000" and "t.xs" in str(e) and "aren't taken yet" in str(e)
+    checks["a set function over an outer query's column is refused by name over the port: 0A000, naming t.xs"] = port_refused
+    # A plain correlated subquery (no set function over the outer column) is DataFusion's, and answers as Postgres 16 does.
+    plain_text = "SELECT t.id, (SELECT max(v) FROM (SELECT 1 AS v) w WHERE w.v = t.n) AS m FROM t WHERE t.id <= 3"
+    checks["a plain correlated subquery answers as Postgres 16 does (1 NULL, 2 1, 3 NULL), over HTTP"] = key(rows_of_pondra(plain_text)) == key(rows_of_pg(plain_text)) == key([("1", ""), ("2", "1"), ("3", "")])
+    node.kill()
+    # Three nodes: the same rows, spread (?spread=1), each node asked.
+    spread_before = None
+    nodes = [Node(lake, A.port + i, tier_secs=1).start() for i in range(3)]
+    time.sleep(2)
+    spread_checks = {}
+    for name, text, _, ordered in cases:
+        if name.startswith("a lateral aggregate"):
+            continue  # (DataFusion's own plan: not a one-pass rewrite)
+        for i in range(3):
+            spread_before = metrics_of(A.port + i).get("pondra_spread_queries_total", 0)
+            spread_rows = rows_of_pondra(text, port=A.port + i, spread=True)
+            spread_now = metrics_of(A.port + i).get("pondra_spread_queries_total", 0)
+            ok = (spread_rows == got[name]) if ordered else (key(spread_rows) == key(got[name]))
+            spread_checks[f"{name} on node {i}"] = (ok, spread_now > spread_before)
+    info["spread"] = {k: v for k, v in spread_checks.items()}
+    checks["three nodes, ?spread=1: each lateral query == one node's answer"] = all(ok for ok, _ in spread_checks.values())
+    checks["three nodes: the lateral queries spread (the query's spread counter rises)"] = all(s for _, s in spread_checks.values())
+    for n in nodes:
+        n.kill()
+    pg16.close()
+    ok = all(checks.values())
+    print(json.dumps({"lateral": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
+class Pg16Error(Exception):
+    """Postgres 16 refused a statement: its SQLSTATE, and its message's first line as str()."""
+
+    def __init__(self, sqlstate, message):
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+class Pg16:
+    """Postgres 16's answers to one section's statements. With a server (PONDRA_PG16 names it; the default is the local
+    one under /tmp/pg16-l3), each statement is asked there, in a schema of its own made by `setup`, and every answer is
+    written to tools/pg16/<section>.json when the section ends. With none (CI has no Postgres), or PONDRA_PG16=recorded,
+    the answers come from that file, and a statement it doesn't hold stops the section: a check never passes by default.
+    Rows are text (a NULL as ""), as the sections compare Pondra's CSV."""
+
+    DEFAULT = "host=/tmp/pg16-l3 port=55432 user=postgres dbname=postgres"
+    BIG = 200  # (an answer of more rows is kept as its digests: the file holds what a check needs, not 60,000 rows)
+
+    def __init__(self, section, setup):
+        import psycopg
+        self.psycopg, self.section = psycopg, section
+        self.path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pg16", f"{section}.json")
+        dsn = os.environ.get("PONDRA_PG16")
+        self.conn = None
+        if dsn != "recorded":
+            try:
+                self.conn = psycopg.connect(dsn or self.DEFAULT, autocommit=True, connect_timeout=5)
+            except psycopg.OperationalError:
+                if dsn:
+                    raise  # (a server named and not there is an error, never a reason to read the file)
+        if self.conn is None:
+            with open(self.path) as f:
+                self.recorded = json.load(f)
+            return
+        self.recorded, self.schema = {}, f"{section}_{uuid.uuid4().hex[:8]}"
+        self.conn.execute(f"CREATE SCHEMA {self.schema}")
+        self.conn.execute(f"SET search_path TO {self.schema}")
+        for s in setup:
+            self.conn.execute(s)
+
+    def answer(self, text):
+        """{"rows": [[text, …], …]} or {"error": [SQLSTATE, message]}."""
+        if self.conn is None:
+            if text not in self.recorded:
+                raise KeyError(f"tools/pg16/{self.section}.json has no answer to {text!r}: run the section with Postgres 16 to record it")
+            return self.recorded[text]
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(f"SET search_path TO {self.schema}")
+                cur.execute(text)
+                # (a write has no rows, and psycopg refuses to fetch them: its answer is no rows)
+                rows = cur.fetchall() if cur.description else []
+                answer = {"rows": [["" if v is None else str(v) for v in r] for r in rows]}
+        except self.psycopg.Error as e:
+            answer = {"error": [e.sqlstate, str(e).splitlines()[0]]}
+        big = len(answer.get("rows", ())) > self.BIG
+        self.recorded[text] = self.digests(answer["rows"]) if big else answer
+        return answer
+
+    @staticmethod
+    def digests(rows):
+        """An answer's row count and SHA-256 digests: of its rows in order, and sorted (for a query with no ORDER BY)."""
+        import hashlib
+        rows = [list(r) for r in rows]
+        sha = lambda rs: hashlib.sha256(json.dumps(rs).encode()).hexdigest()
+        return {"count": len(rows), "ordered": sha(rows), "sorted": sha(sorted(rows, key=repr))}
+
+    def same(self, text, rows, ordered):
+        """Whether `rows` (tuples of text) are Postgres 16's answer to `text`: in its order, or the same rows in any order."""
+        answer = self.answer(text)
+        if "error" in answer:
+            return False
+        want, got = answer if "count" in answer else self.digests(answer["rows"]), self.digests(rows)
+        way = "ordered" if ordered else "sorted"
+        return got["count"] == want["count"] and got[way] == want[way]
+
+    def rows(self, text):
+        """The rows Postgres 16 answers (tuples of text), or Pg16Error when it refuses."""
+        answer = self.answer(text)
+        if "error" in answer:
+            raise Pg16Error(*answer["error"])
+        if "count" in answer:
+            raise KeyError(f"tools/pg16/{self.section}.json keeps {text!r}'s {answer['count']} rows as digests: compare with same()")
+        return [tuple(r) for r in answer["rows"]]
+
+    def close(self):
+        """Drops the schema and writes the answers asked (a live run only)."""
+        if self.conn is None:
+            return
+        self.conn.execute(f"DROP SCHEMA {self.schema} CASCADE")
+        self.conn.close()
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "w") as f:
+            json.dump(self.recorded, f, indent=1, sort_keys=True)
+            f.write("\n")
+
+
+def _sqlstate_of(port, text):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+    c.request("POST", "/sql", text.encode())
+    r = c.getresponse()
+    body = r.read().decode(errors="replace")
+    return r.status, r.getheader("x-pondra-sqlstate"), body
 
 
 def scripts():
@@ -17714,6 +20392,10 @@ def doors():
     q("CREATE TABLE d_crm.d_only (x BIGINT)")
     q("INSERT INTO d_crm.d_only VALUES (1), (2), (3)")
     q("CREATE MACRO d_twice(x) AS x * 2")
+    q("CREATE TABLE d_json (id BIGINT, doc JSON)")  # (the JSON operators read a column: Flight refuses a constant SELECT with a non-null answer, a pre-existing bug)
+    q("INSERT INTO d_json VALUES (1, '{\"a\": {\"b\": [\"x\", \"y\"]}, \"k\": 1}')")
+    q("CREATE TABLE d_lat (id BIGINT, xs BIGINT[])")  # (LATERAL: a function of a column, at every door)
+    q("INSERT INTO d_lat VALUES (1, [1, 2]), (2, NULL)")
     record = {"repository": "https://github.com/acme/sales", "branch": "main", "commit": "0" * 40, "files": {}}  # (a Git folder: its record, and a file not committed)
     for path, body in (("d_git/.pondra-git.json", json.dumps(record)), ("d_git/a.sql", "SELECT 1;\n")):
         c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
@@ -17727,6 +20409,9 @@ def doors():
         return any(f.endswith(".json.zst") for f in os.listdir(os.path.join(place, "_backups")))
     DOORS = ["http", "python", "postgres", "flight", "javascript", "mcp", "cli", "console"]
     shell_dir = tempfile.mkdtemp(prefix="pondra-doors-cwd-")  # (the shell attaches the lakes beside its folder: an empty one)
+    def json_made(v):
+        return json.loads(v) if isinstance(v, str) else v  # (a door gives JSON as its text, or as its value)
+
     def features(i):
         k = 10 * i + 1  # (each door its own keys)
         return {
@@ -17744,6 +20429,15 @@ def doors():
                             lambda r: r[3] == [[93]] and q(f"SELECT count(DISTINCT _version) AS v, sum(qty) AS s FROM d_items WHERE id IN ({k + 5}, {k + 6})") == [{"v": 1, "s": 200}]),
             "USE a schema": (["USE d_crm", "SELECT count(*) AS n FROM d_only"], lambda r: r[-1] == [[3]]),
             "a macro": (["SELECT d_twice(21) AS n"], lambda r: r[-1] == [[42]]),
+            "LATERAL over a function's rows": (["SELECT t.id, u.x FROM d_lat t, unnest(t.xs) AS u(x) ORDER BY 1, 2",
+                                                "SELECT t.id, g FROM d_lat t, generate_series(1, t.id + 1) AS g ORDER BY 1, 2"],
+                                               lambda r: r[0] == [[1, 1], [1, 2]] and r[-1] == [[1, 1], [1, 2], [2, 1], [2, 2], [2, 3]]),
+            # (Postgres's JSON operators on a column: text and CASE answers, so every door shows them alike)
+            "JSON path and containment": (["SELECT doc -> 'k' AS k FROM d_json WHERE doc ->> 'k' = '1' AND id = 1",
+                                           "SELECT doc #>> '{a,b,1}' AS v, CASE WHEN doc @> '{\"k\": 1}' THEN 'yes' ELSE 'no' END AS c FROM d_json WHERE id = 1"],
+                                          lambda r: r[-1] == [["y", "yes"]] and r[0] in ([["1"]], [[1]])),
+            "JSON made from values": (["SELECT json_agg(t) AS a FROM (SELECT id FROM d_json) t", "SELECT json_build_object('doc', doc) AS d FROM d_json WHERE id = 1"],
+                                     lambda r: [json_made(r[0][0][0]), json_made(r[-1][0][0])] == [[{"id": 1}], {"doc": {"a": {"b": ["x", "y"]}, "k": 1}}]),
             "a Git folder's status": (["SELECT path, change FROM pondra.git_status('d_git')"], lambda r: r[-1] == [["a.sql", "added"]]),
             "a backup": ([f"BACKUP DATABASE TO '{backups}/door{i}'"], lambda r: backed(f"{backups}/door{i}")),
             "a write to a backup refused, 25006": ([f"INSERT INTO d_bk.d_log VALUES ('door{i}', {i})"], lambda r: r == "25006"),
@@ -19424,12 +22118,12 @@ SECS = {"memory": 240, "waits": 99, "sso": 89, "stopped": 87, "guesses": 45, "ba
         "files": 10, "followers": 10, "guarded": 10, "begin": 9, "bykey": 9, "clients": 9, "flows": 9,
         "guard": 9, "hot": 9, "schemas": 9, "temps": 9, "catalogs": 8, "clusters": 8, "columns": 8,
         "fills": 8, "serverless": 8, "alter": 7, "fence": 7, "loads": 7, "safety": 7, "sequences": 7,
-        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60, "served": 60}
+        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60, "served": 60, "jsonfns": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -19461,7 +22155,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -19474,7 +22168,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

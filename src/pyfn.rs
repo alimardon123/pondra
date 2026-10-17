@@ -30,13 +30,15 @@ use std::sync::{Arc, LazyLock, Mutex};
 pub use crate::text::{is_json, loose};
 
 /// A SQL type as DataFusion reads it (`VARCHAR` → Utf8, `DOUBLE` → Float64, `INT[]` → a list),
-/// strings as plain Utf8; `VARIANT` and `JSON` are JSON text. Worked out once per type.
+/// strings as plain Utf8; `VARIANT` and `JSON` are JSON text, and so are the types the lake holds as
+/// checked text (`types::declared`: `UUID`, `JSON`, `JSONB`, `VARCHAR(n)`, whose length a parameter or
+/// a result ignores, as Postgres does). Worked out once per type.
 pub async fn arrow_of(sql_type: &str) -> Result<DataType> {
     static SEEN: LazyLock<Mutex<HashMap<String, DataType>>> = LazyLock::new(Default::default);
     if let Some(t) = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(sql_type) {
         return Ok(t.clone());
     }
-    let t = match is_json(Some(sql_type)) {
+    let t = match is_json(Some(sql_type)) || crate::types::declared(sql_type)?.is_some() {
         true => DataType::Utf8,
         false => {
             let df = SessionContext::new().sql(&format!("SELECT CAST(NULL AS {sql_type}) AS v")).await?;

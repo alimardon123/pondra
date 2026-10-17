@@ -949,6 +949,7 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
     if let Some((c, t)) = was.iter().find_map(|(c, _)| sql_types.get(c).filter(|t| !crate::types::grows(old.sql_types.get(c).map(String::as_str), t)).map(|t| (c, t))) {
         let why = match t.as_str() {
             "uuid" => "a uuid: a column is a uuid only from when it is made, since the rows there were never checked as uuids".to_string(),
+            "json" | "jsonb" => format!("{0}: a column is {0} only from when it is made, since the rows there were never checked as {0}", t.to_uppercase()),
             _ => format!("{}: a column's length holds only from when it is made, and only grows, since the rows there were never checked against it", t.to_uppercase()),
         };
         return Err(crate::codes::coded("42804", format!("{table}.{c} can't become {why}")));

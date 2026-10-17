@@ -10,10 +10,10 @@ use crate::store::{Lake, TableMeta};
 use crate::users::On;
 use anyhow::Result;
 use datafusion::arrow::array::{new_null_array, Array, ArrayRef, AsArray, RecordBatch, StringArray, UInt32Array};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, TimeUnit};
 use datafusion::catalog::{MemTable, MemorySchemaProvider, SchemaProvider};
 use datafusion::common::ScalarValue;
-use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{self, VisitMut, VisitorMut};
 use std::collections::{BTreeMap, BTreeSet};
@@ -142,6 +142,10 @@ pub fn pg_of(t: &DataType) -> (u32, i32) {
 /// uuid's oid: a uuid column's type (`types.rs` holds it as text).
 pub const UUID: u32 = 2950;
 
+/// json's and jsonb's oids: a column of either type (`types.rs` holds it as text).
+pub const JSON: u32 = 114;
+pub const JSONB: u32 = 3802;
+
 /// `pg_typeof(x)`: the name of the Postgres type a value of this Arrow type is sent as.
 pub fn type_of(t: &DataType) -> String {
     match t {
@@ -155,6 +159,8 @@ fn format_type(oid: u32, typmod: i32) -> Option<String> {
     let name = TYPES.iter().find(|t| t.0 == oid).map(|t| t.2.to_string()).or_else(|| arrays().find(|a| a.0 == oid).map(|a| a.2))?;
     Some(match (oid, typmod) {
         (1700, m) if m >= 4 => format!("numeric({},{})", (m - 4) >> 16, (m - 4) & 0xffff),
+        (1043, m) if m >= 4 => format!("character varying({})", m - 4), // (a VARCHAR(n) column: n + 4, as Postgres keeps it)
+        (1042, m) if m >= 4 => format!("character({})", m - 4),
         _ => name,
     })
 }
@@ -175,7 +181,7 @@ struct Rel {
     identity: BTreeMap<String, crate::seq::Identity>, // identity columns, by name (`attidentity`)
     constraints: Vec<crate::constraints::Constraint>, // UNIQUE, and keys said NOT ENFORCED (SQL's names)
     checks: Vec<(String, String)>, // CHECK constraints: (name, condition)
-    typed: BTreeMap<String, u32>, // columns of a type their Arrow type doesn't say (SQL's names): an enum's type's oid (an inline ENUM('a') is text), uuid's
+    typed: BTreeMap<String, (u32, i32)>, // columns of a type their Arrow type doesn't say (SQL's names), with its typmod: an enum's type (an inline ENUM('a') is text), uuid, VARCHAR(n)
     comment: Option<String>, // COMMENT ON the relation (`cm/relation/…`, `objects.rs`)
     comments: BTreeMap<String, String>, // COMMENT ON its columns, by SQL name (`cm/column/…` by the stored name)
     rows: u64,
@@ -184,10 +190,10 @@ struct Rel {
 
 impl Rel {
     /// A column's type as Postgres names it: (oid, typmod, length, -1 when it varies). An enum
-    /// column's own type, a uuid column's; the type `pg_of` gives every other.
+    /// column's own type, a uuid column's, a VARCHAR(n)'s with its length; the type `pg_of` gives every other.
     fn column_type(&self, name: &str, t: &DataType) -> (u32, i32, i16) {
         match self.typed.get(name) {
-            Some(oid) => (*oid, -1, TYPES.iter().find(|x| x.0 == *oid).map_or(ENUM_LENGTH, |x| x.3)),
+            Some(&(oid, typmod)) => (oid, typmod, TYPES.iter().find(|x| x.0 == oid).map_or(ENUM_LENGTH, |x| x.3)),
             None => {
                 let (typ, typmod) = pg_of(t);
                 (typ, typmod, TYPES.iter().find(|x| x.0 == typ).map_or(-1, |x| x.3))
@@ -387,12 +393,19 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         let (rows, bytes) = m.files.iter().fold((0, 0), |(r, b), f| (r + f.rows, b + f.bytes));
         let sealed = m.sealed.clone().unwrap_or_default();
         let kind = if mvs.contains_key(name) { 'm' } else { 'r' };
-        // (an enum column is the type it was declared with, when the lake still has that type; a uuid column is uuid)
+        // (an enum column is the type it was declared with, when the lake still has that type; a uuid column is
+        // uuid; a VARCHAR(n) column character varying(n), its typmod n + 4 as Postgres keeps it)
         let enums = l.enums.iter().filter_map(|(c, e)| {
             let t = oid("ty", e.of.as_deref()?);
-            types.iter().any(|x| x.oid == t).then(|| (c.clone(), t))
+            types.iter().any(|x| x.oid == t).then(|| (c.clone(), (t, -1)))
         });
-        let typed = enums.chain(l.sql_types.iter().filter(|(_, t)| *t == "uuid").map(|(c, _)| (c.clone(), UUID))).collect();
+        let held = l.sql_types.iter().filter_map(|(c, t)| match t.as_str() {
+            "uuid" => Some((c.clone(), (UUID, -1))),
+            "json" => Some((c.clone(), (JSON, -1))),
+            "jsonb" => Some((c.clone(), (JSONB, -1))),
+            t => crate::types::length(t).map(|n| (c.clone(), (1043, n as i32 + 4))),
+        });
+        let typed = enums.chain(held).collect();
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = l.columns.iter().filter_map(|(c, _)| Some((c.clone(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
         rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: mvs.get(name).cloned(), identity: l.identity.clone(), constraints: l.constraints.clone(), checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
@@ -880,9 +893,9 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
     let mut cols = vec![];
     for r in &l.rels {
         for (i, (name, t, not_null, default)) in r.columns.iter().enumerate() {
-            let (typ, _, _) = r.column_type(name, t);
+            let (typ, typmod, _) = r.column_type(name, t);
             let array = arrays().find(|a| a.0 == typ);
-            let data_type = match (r.typed.get(name).is_some_and(|t| l.enum_type(*t).is_some()), array) {
+            let data_type = match (r.typed.get(name).is_some_and(|t| l.enum_type(t.0).is_some()), array) {
                 (true, _) => "USER-DEFINED".to_string(), // (an enum: its type's schema and name, below)
                 (false, Some(_)) => "ARRAY".to_string(),
                 (false, None) => l.format_type(typ, -1).unwrap_or_else(|| "text".into()),
@@ -897,7 +910,7 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
                 _ => (n(), n(), n()),
             };
             let datetime = if matches!(typ, 1082) { i4(0) } else if matches!(typ, 1083 | 1114 | 1184) { i4(6) } else { n() };
-            let (udt_schema, udt) = match r.typed.get(name).and_then(|oid| l.enum_type(*oid)) {
+            let (udt_schema, udt) = match r.typed.get(name).and_then(|t| l.enum_type(t.0)) {
                 Some(e) => (e.schema.clone(), e.name.clone()),
                 None => ("pg_catalog".to_string(), type_name(typ).unwrap_or_else(|| "text".into())),
             };
@@ -908,8 +921,14 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
                 (Some(id), Some(sh)) => (s(if id.always { "ALWAYS" } else { "BY DEFAULT" }), s(sh.start.to_string()), s(sh.increment.to_string()), s(sh.max.to_string()), s(sh.min.to_string()), yes(sh.cycle)),
                 _ => (n(), n(), n(), n(), n(), n()),
             };
+            // (a VARCHAR(n)'s length, and its bytes at UTF-8's four a character, as Postgres says; text's 1 GB)
+            let (chars, octets) = match (typ, typmod) {
+                (1042 | 1043, m) if m >= 4 => (i4(m - 4), i4((m - 4) * 4)),
+                (25 | 1043, _) => (n(), i4(1_073_741_824)),
+                _ => (n(), n()),
+            };
             cols.push(vec![db(), s(r.schema.clone()), s(r.name.clone()), s(name.clone()), i4(i as i32 + 1), default.clone().map_or(n(), s), yes(!(*not_null || r.key.contains(name))), s(data_type),
-                n(), if matches!(typ, 25 | 1043) { i4(1_073_741_824) } else { n() }, precision, radix, scale, datetime, n(), n(), n(), n(), n(), n(), n(), n(), n(), n(), n(), db(), s(udt_schema), s(udt),
+                chars, octets, precision, radix, scale, datetime, n(), n(), n(), n(), n(), n(), n(), n(), n(), n(), n(), db(), s(udt_schema), s(udt),
                 n(), n(), n(), n(), s((i + 1).to_string()), s("NO"), yes(identity.is_some()), generation, start, increment, maximum, minimum, cycle, s("NEVER"), n(), yes(r.kind == 'r')]);
         }
     }
@@ -1060,6 +1079,8 @@ struct PgFn {
     signature: Signature,
     returns: fn(&[DataType]) -> DataType,
     body: Arc<Body>,
+    marks: Option<&'static str>, // the Postgres type its answers' column is marked with (`pg_types::MARK`): "json"
+    follows: bool, // (no fixed mark: the answers are JSON when the first argument is, as `->` is)
 }
 
 impl std::fmt::Debug for PgFn {
@@ -1077,6 +1098,20 @@ impl ScalarUDFImpl for PgFn {
     fn name(&self) -> &str { self.name }
     fn signature(&self) -> &Signature { &self.signature }
     fn return_type(&self, args: &[DataType]) -> datafusion::error::Result<DataType> { Ok((self.returns)(args)) }
+    // (the mark rides on the field the function returns, so a projection of it keeps it: the port sends json as json)
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> datafusion::error::Result<FieldRef> {
+        let types: Vec<DataType> = args.arg_fields.iter().map(|f| f.data_type().clone()).collect();
+        let field = Field::new(self.name, (self.returns)(&types), true);
+        let mark = match self.marks {
+            Some(mark) => Some(mark.to_string()),
+            None if self.follows => first_json_mark(args.arg_fields),
+            None => None,
+        };
+        Ok(Arc::new(match mark {
+            Some(mark) => field.with_metadata([(crate::pg_types::MARK.to_string(), mark)].into()),
+            None => field,
+        }))
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let n = args.number_rows;
         let arrays = args.args.iter().map(|a| a.to_array(n)).collect::<datafusion::error::Result<Vec<_>>>()?;
@@ -1090,7 +1125,30 @@ fn udf(name: &'static str, returns: fn(&[DataType]) -> DataType, body: impl Fn(&
 
 /// A function of Postgres's over whole columns: `body` gets every argument as an array of the rows' values.
 pub(crate) fn function(name: &'static str, signature: Signature, returns: fn(&[DataType]) -> DataType, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
-    ScalarUDF::new_from_impl(PgFn { name, signature, returns, body: Arc::new(body) })
+    marked(name, signature, returns, None, body)
+}
+
+/// `function`, whose answers are JSON text marked `mark` ("json" or "jsonb"): the column they make is sent as that type.
+pub(crate) fn marked(name: &'static str, signature: Signature, returns: fn(&[DataType]) -> DataType, mark: Option<&'static str>, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
+    ScalarUDF::new_from_impl(PgFn { name, signature, returns, body: Arc::new(body), marks: mark, follows: false })
+}
+
+/// `function`, whose answers are JSON exactly when its first argument is (`doc -> 'a'` of a JSON column is JSON, of a
+/// text one text, as Postgres has the operator for JSON only): the mark is the first argument's, if it is JSON's.
+pub(crate) fn follows_json(name: &'static str, signature: Signature, returns: fn(&[DataType]) -> DataType, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
+    ScalarUDF::new_from_impl(PgFn { name, signature, returns, body: Arc::new(body), marks: None, follows: true })
+}
+
+/// The JSON mark of a function's first argument, if it has one (`json` or `jsonb`).
+fn first_json_mark(arg_fields: &[FieldRef]) -> Option<String> {
+    let mark = arg_fields.first()?.metadata().get(crate::pg_types::MARK)?;
+    matches!(mark.as_str(), "json" | "jsonb").then(|| mark.clone())
+}
+
+/// `udf`, whose answers are JSON text: the column they make is marked json, so the port sends it as json.
+fn json_udf(name: &'static str, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
+    let signature = Signature::one_of(vec![TypeSignature::Nullary, TypeSignature::VariadicAny], Volatility::Stable);
+    ScalarUDF::new_from_impl(PgFn { name, signature, returns: |_| DataType::Utf8, body: Arc::new(body), marks: Some("json"), follows: false })
 }
 
 /// An argument as text (NULL where it is), whatever string or number type it came as.
@@ -1105,30 +1163,6 @@ pub(crate) fn int_arg(a: &ArrayRef) -> datafusion::error::Result<Vec<Option<i64>
 }
 
 pub(crate) fn texts_out(v: impl IntoIterator<Item = Option<String>>) -> ArrayRef { Arc::new(StringArray::from_iter(v)) }
-
-/// One argument's value of a row as JSON text: numbers and booleans bare, text quoted, NULL as `null`.
-fn json_of(a: &ArrayRef, i: usize) -> datafusion::error::Result<String> {
-    if a.is_null(i) {
-        return Ok("null".into());
-    }
-    let text = datafusion::arrow::compute::cast(a, &DataType::Utf8)?;
-    let v = text.as_string::<i32>().value(i);
-    let bare = matches!(a.data_type(), DataType::Boolean) || a.data_type().is_numeric();
-    Ok(if bare { v.to_string() } else { serde_json::to_string(v).unwrap_or_default() })
-}
-
-/// `json_build_object(key, value, …)` for one row, as Postgres prints it: `{"key" : value, …}`.
-fn json_build(a: &[ArrayRef], i: usize) -> datafusion::error::Result<String> {
-    let mut pairs = vec![];
-    for kv in a.chunks(2) {
-        let value = match kv.get(1) {
-            Some(v) => json_of(v, i)?,
-            None => "null".into(),
-        };
-        pairs.push(format!("{} : {value}", json_of(&kv[0], i)?));
-    }
-    Ok(format!("{{{}}}", pairs.join(", ")))
-}
 
 /// The sequence a table's identity column counts by, named as Postgres names it (`schema.name`);
 /// None for a column that has none, or a name that isn't a table.
@@ -1404,18 +1438,14 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
             code.then(|| crate::objects::routine_sql(&crate::objects::name_sql(&lake_name), r))
         })))
     }));
-    // SQLAlchemy's identity query: its options as JSON, and the sequence a column counts by.
-    ctx.register_udf(udf("json_build_object", to_text, |a, n| {
-        let rows = (0..n).map(|i| json_build(a, i)).collect::<datafusion::error::Result<Vec<_>>>()?;
-        Ok(texts_out(rows.into_iter().map(Some)))
-    }));
+    // SQLAlchemy's identity query: the sequence a column counts by (its options are `identity_options`, below).
     let lk = l.clone();
     ctx.register_udf(udf("pg_get_serial_sequence", to_text, move |a, n| {
         let (tables, columns) = (text_arg(&a[0])?, text_arg(&a[1])?);
         Ok(texts_out((0..n).map(|i| serial_sequence(&lk, tables[i].as_deref()?, columns[i].as_deref()?))))
     }));
     // The identity options `identity_of` puts in place of SQLAlchemy's subquery: (attrelid, attname, attidentity).
-    ctx.register_udf(udf("identity_options", to_text, move |a, n| {
+    ctx.register_udf(json_udf("identity_options", move |a, n| {
         let (relids, columns, kinds) = (int_arg(&a[0])?, text_arg(&a[1])?, text_arg(&a[2])?);
         Ok(texts_out((0..n).map(|i| identity_options(&l, relids[i]? as u32, columns[i].as_deref()?, kinds[i].as_deref()?))))
     }));

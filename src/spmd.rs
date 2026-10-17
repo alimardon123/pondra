@@ -978,7 +978,7 @@ fn spread(p: &Arc<dyn ExecutionPlan>, exchanges: &mut Vec<Exchange>) -> Option<S
     }
     match p.name() {
         "DataSourceExec" | "EmptyExec" | "PlaceholderRowExec" => Some(Whole),
-        "ProjectionExec" | "FilterExec" | "CoalesceBatchesExec" | "CooperativeExec" | "LocalLimitExec" => one,
+        "ProjectionExec" | "FilterExec" | "UnnestExec" | "CoalesceBatchesExec" | "CooperativeExec" | "LocalLimitExec" => one,
         "HeldInExec" | "HeldOutExec" | "LeanExec" => one, // (a window's memory counted: its rows as they are; a sort's output as it is)
         "async_func" => one, // (AsyncFuncExec: a Python or Flight function, row by row: each node its own rows, through its own workers)
         // (within a node — and a limit within one node, over rows spread across them all, is wrong)

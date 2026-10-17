@@ -1,0 +1,2332 @@
+{
+ "INSERT INTO j (id, doc, js, n) SELECT id + 10, doc || '{\"c\": 3}', js, n FROM j WHERE id = 1": {
+  "rows": []
+ },
+ "SELECT '{a,b'::text[]": {
+  "error": [
+   "22P02",
+   "malformed array literal: \"{a,b\""
+  ]
+ },
+ "SELECT array_to_string('{\"a b\",\"c\\\"d\"}'::text[], '|')": {
+  "rows": [
+   [
+    "a b|c\"d"
+   ]
+  ]
+ },
+ "SELECT array_to_string('{a,b}'::text[], '|'), array_to_string(CAST('{1,2}' AS INT[]), '|'), array_to_string('{}'::text[], '|')": {
+  "rows": [
+   [
+    "a|b",
+    "1|2",
+    ""
+   ]
+  ]
+ },
+ "SELECT array_to_string('{{1,2},{3,4}}'::int[], '|')": {
+  "rows": [
+   [
+    "1|2|3|4"
+   ]
+  ]
+ },
+ "SELECT array_to_string(TEXT[] '{a,\"b,c\"}', '|')": {
+  "error": [
+   "42601",
+   "syntax error at or near \"]\""
+  ]
+ },
+ "SELECT doc #- '{a}' FROM j WHERE id = 4": {
+  "error": [
+   "22023",
+   "cannot delete path in scalar"
+  ]
+ },
+ "SELECT doc #- '{x}' FROM j WHERE id = 2": {
+  "error": [
+   "22P02",
+   "path element at position 1 is not an integer: \"x\""
+  ]
+ },
+ "SELECT doc #- 1 FROM j WHERE id = 1": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb #- integer"
+  ]
+ },
+ "SELECT doc - 'a' FROM j WHERE id = 4": {
+  "error": [
+   "22023",
+   "cannot delete from scalar"
+  ]
+ },
+ "SELECT doc - 0 FROM j WHERE id = 1": {
+  "error": [
+   "22023",
+   "cannot delete from object using integer index"
+  ]
+ },
+ "SELECT doc - 1.5 FROM j WHERE id = 1": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb - numeric"
+  ]
+ },
+ "SELECT doc - doc FROM j WHERE id = 1": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb - jsonb"
+  ]
+ },
+ "SELECT id FROM j WHERE doc || '{\"x\": 1}' IS NOT NULL ORDER BY id": {
+  "rows": [
+   [
+    "1"
+   ],
+   [
+    "2"
+   ],
+   [
+    "4"
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[9][9]"
+   ],
+   [
+    "2",
+    "[9][9]"
+   ],
+   [
+    "3",
+    "[9][9]"
+   ],
+   [
+    "4",
+    "[9][9]"
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[9]a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+   ],
+   [
+    "2",
+    "[9]a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+   ],
+   [
+    "3",
+    "[9]a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+   ],
+   [
+    "4",
+    "[9]a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || 'x')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[9]x"
+   ],
+   [
+    "2",
+    "[9]x"
+   ],
+   [
+    "3",
+    "[9]x"
+   ],
+   [
+    "4",
+    "[9]x"
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || 'x'::text)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[9]x"
+   ],
+   [
+    "2",
+    "[9]x"
+   ],
+   [
+    "3",
+    "[9]x"
+   ],
+   [
+    "4",
+    "[9]x"
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[9]{\"z\": 1}"
+   ],
+   [
+    "2",
+    "[9]{\"z\": 1}"
+   ],
+   [
+    "3",
+    "[9]{\"z\": 1}"
+   ],
+   [
+    "4",
+    "[9]{\"z\": 1}"
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[9, 1]"
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || 1)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[9]1"
+   ],
+   [
+    "2",
+    "[9]1"
+   ],
+   [
+    "3",
+    "[9]1"
+   ],
+   [
+    "4",
+    "[9]1"
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || 1.5)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[9]1.5"
+   ],
+   [
+    "2",
+    "[9]1.5"
+   ],
+   [
+    "3",
+    "[9]1.5"
+   ],
+   [
+    "4",
+    "[9]1.5"
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || NULL)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    ""
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || TRUE)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[9]true"
+   ],
+   [
+    "2",
+    "[9]true"
+   ],
+   [
+    "3",
+    "[9]true"
+   ],
+   [
+    "4",
+    "[9]true"
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || doc)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[9, {\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}]"
+   ],
+   [
+    "2",
+    "[9, 1, null, {\"k\": null}]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[9, \"text\"]"
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || js)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[9]{ \"a\" : 1, \"n\" : null, \"b\" : [ 1 , 2 ] }"
+   ],
+   [
+    "2",
+    "[9][1, {\"z\" : null}, null]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[9]\"s\""
+   ]
+  ]
+ },
+ "SELECT id, ('[9]' || n)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[9]1"
+   ],
+   [
+    "2",
+    "[9]2"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[9]4"
+   ]
+  ]
+ },
+ "SELECT id, ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11[9]"
+   ],
+   [
+    "2",
+    "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11[9]"
+   ],
+   [
+    "3",
+    "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11[9]"
+   ],
+   [
+    "4",
+    "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11[9]"
+   ]
+  ]
+ },
+ "SELECT id, ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11{\"z\": 1}"
+   ],
+   [
+    "2",
+    "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11{\"z\": 1}"
+   ],
+   [
+    "3",
+    "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11{\"z\": 1}"
+   ],
+   [
+    "4",
+    "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11{\"z\": 1}"
+   ]
+  ]
+ },
+ "SELECT id, ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: uuid || jsonb"
+  ]
+ },
+ "SELECT id, ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid || doc)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: uuid || jsonb"
+  ]
+ },
+ "SELECT id, ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid || js)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: uuid || json"
+  ]
+ },
+ "SELECT id, ('x' || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "x[9]"
+   ],
+   [
+    "2",
+    "x[9]"
+   ],
+   [
+    "3",
+    "x[9]"
+   ],
+   [
+    "4",
+    "x[9]"
+   ]
+  ]
+ },
+ "SELECT id, ('x' || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "x{\"z\": 1}"
+   ],
+   [
+    "2",
+    "x{\"z\": 1}"
+   ],
+   [
+    "3",
+    "x{\"z\": 1}"
+   ],
+   [
+    "4",
+    "x{\"z\": 1}"
+   ]
+  ]
+ },
+ "SELECT id, ('x' || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "error": [
+   "22P02",
+   "invalid input syntax for type json"
+  ]
+ },
+ "SELECT id, ('x' || doc)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "22P02",
+   "invalid input syntax for type json"
+  ]
+ },
+ "SELECT id, ('x' || js)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "x{ \"a\" : 1, \"n\" : null, \"b\" : [ 1 , 2 ] }"
+   ],
+   [
+    "2",
+    "x[1, {\"z\" : null}, null]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "x\"s\""
+   ]
+  ]
+ },
+ "SELECT id, ('x' || n + 1) AS v FROM j WHERE id = 1": {
+  "rows": [
+   [
+    "1",
+    "x2"
+   ]
+  ]
+ },
+ "SELECT id, ('x'::text || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "x[9]"
+   ],
+   [
+    "2",
+    "x[9]"
+   ],
+   [
+    "3",
+    "x[9]"
+   ],
+   [
+    "4",
+    "x[9]"
+   ]
+  ]
+ },
+ "SELECT id, ('x'::text || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "x{\"z\": 1}"
+   ],
+   [
+    "2",
+    "x{\"z\": 1}"
+   ],
+   [
+    "3",
+    "x{\"z\": 1}"
+   ],
+   [
+    "4",
+    "x{\"z\": 1}"
+   ]
+  ]
+ },
+ "SELECT id, ('x'::text || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "x1"
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, ('x'::text || doc)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "x{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ],
+   [
+    "2",
+    "x[1, null, {\"k\": null}]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "x\"text\""
+   ]
+  ]
+ },
+ "SELECT id, ('x'::text || js)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "x{ \"a\" : 1, \"n\" : null, \"b\" : [ 1 , 2 ] }"
+   ],
+   [
+    "2",
+    "x[1, {\"z\" : null}, null]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "x\"s\""
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"z\": 1}[9]"
+   ],
+   [
+    "2",
+    "{\"z\": 1}[9]"
+   ],
+   [
+    "3",
+    "{\"z\": 1}[9]"
+   ],
+   [
+    "4",
+    "{\"z\": 1}[9]"
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"z\": 1}a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+   ],
+   [
+    "2",
+    "{\"z\": 1}a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+   ],
+   [
+    "3",
+    "{\"z\": 1}a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+   ],
+   [
+    "4",
+    "{\"z\": 1}a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || 'x')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"z\": 1}x"
+   ],
+   [
+    "2",
+    "{\"z\": 1}x"
+   ],
+   [
+    "3",
+    "{\"z\": 1}x"
+   ],
+   [
+    "4",
+    "{\"z\": 1}x"
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || 'x'::text)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"z\": 1}x"
+   ],
+   [
+    "2",
+    "{\"z\": 1}x"
+   ],
+   [
+    "3",
+    "{\"z\": 1}x"
+   ],
+   [
+    "4",
+    "{\"z\": 1}x"
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"z\": 1}{\"z\": 1}"
+   ],
+   [
+    "2",
+    "{\"z\": 1}{\"z\": 1}"
+   ],
+   [
+    "3",
+    "{\"z\": 1}{\"z\": 1}"
+   ],
+   [
+    "4",
+    "{\"z\": 1}{\"z\": 1}"
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[{\"z\": 1}, 1]"
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || 1)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"z\": 1}1"
+   ],
+   [
+    "2",
+    "{\"z\": 1}1"
+   ],
+   [
+    "3",
+    "{\"z\": 1}1"
+   ],
+   [
+    "4",
+    "{\"z\": 1}1"
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || 1.5)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"z\": 1}1.5"
+   ],
+   [
+    "2",
+    "{\"z\": 1}1.5"
+   ],
+   [
+    "3",
+    "{\"z\": 1}1.5"
+   ],
+   [
+    "4",
+    "{\"z\": 1}1.5"
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || NULL)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    ""
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || TRUE)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"z\": 1}true"
+   ],
+   [
+    "2",
+    "{\"z\": 1}true"
+   ],
+   [
+    "3",
+    "{\"z\": 1}true"
+   ],
+   [
+    "4",
+    "{\"z\": 1}true"
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || doc)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null, \"z\": 1}"
+   ],
+   [
+    "2",
+    "[{\"z\": 1}, 1, null, {\"k\": null}]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[{\"z\": 1}, \"text\"]"
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || js)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"z\": 1}{ \"a\" : 1, \"n\" : null, \"b\" : [ 1 , 2 ] }"
+   ],
+   [
+    "2",
+    "{\"z\": 1}[1, {\"z\" : null}, null]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "{\"z\": 1}\"s\""
+   ]
+  ]
+ },
+ "SELECT id, ('{\"z\": 1}' || n)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"z\": 1}1"
+   ],
+   [
+    "2",
+    "{\"z\": 1}2"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "{\"z\": 1}4"
+   ]
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[1, 9]"
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb || uuid"
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || 'x')::text AS v FROM j ORDER BY id": {
+  "error": [
+   "22P02",
+   "invalid input syntax for type json"
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || 'x'::text)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "1x"
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[1, {\"z\": 1}]"
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[1, 1]"
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || 1)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb || integer"
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || 1.5)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb || numeric"
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || NULL)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    ""
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || TRUE)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb || boolean"
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || doc)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[1, {\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}]"
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || js)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb || json"
+  ]
+ },
+ "SELECT id, ((doc -> 'a') || n)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb || bigint"
+  ]
+ },
+ "SELECT id, (1 || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "1[9]"
+   ],
+   [
+    "2",
+    "1[9]"
+   ],
+   [
+    "3",
+    "1[9]"
+   ],
+   [
+    "4",
+    "1[9]"
+   ]
+  ]
+ },
+ "SELECT id, (1 || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "1{\"z\": 1}"
+   ],
+   [
+    "2",
+    "1{\"z\": 1}"
+   ],
+   [
+    "3",
+    "1{\"z\": 1}"
+   ],
+   [
+    "4",
+    "1{\"z\": 1}"
+   ]
+  ]
+ },
+ "SELECT id, (1 || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: integer || jsonb"
+  ]
+ },
+ "SELECT id, (1 || doc)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: integer || jsonb"
+  ]
+ },
+ "SELECT id, (1 || js)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: integer || json"
+  ]
+ },
+ "SELECT id, (1.5 || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "1.5[9]"
+   ],
+   [
+    "2",
+    "1.5[9]"
+   ],
+   [
+    "3",
+    "1.5[9]"
+   ],
+   [
+    "4",
+    "1.5[9]"
+   ]
+  ]
+ },
+ "SELECT id, (1.5 || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "1.5{\"z\": 1}"
+   ],
+   [
+    "2",
+    "1.5{\"z\": 1}"
+   ],
+   [
+    "3",
+    "1.5{\"z\": 1}"
+   ],
+   [
+    "4",
+    "1.5{\"z\": 1}"
+   ]
+  ]
+ },
+ "SELECT id, (1.5 || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: numeric || jsonb"
+  ]
+ },
+ "SELECT id, (1.5 || doc)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: numeric || jsonb"
+  ]
+ },
+ "SELECT id, (1.5 || js)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: numeric || json"
+  ]
+ },
+ "SELECT id, (NULL || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    ""
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, (NULL || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    ""
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, (NULL || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    ""
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, (NULL || doc)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    ""
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, (NULL || js)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    ""
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, (TRUE || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "true[9]"
+   ],
+   [
+    "2",
+    "true[9]"
+   ],
+   [
+    "3",
+    "true[9]"
+   ],
+   [
+    "4",
+    "true[9]"
+   ]
+  ]
+ },
+ "SELECT id, (TRUE || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "true{\"z\": 1}"
+   ],
+   [
+    "2",
+    "true{\"z\": 1}"
+   ],
+   [
+    "3",
+    "true{\"z\": 1}"
+   ],
+   [
+    "4",
+    "true{\"z\": 1}"
+   ]
+  ]
+ },
+ "SELECT id, (TRUE || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: boolean || jsonb"
+  ]
+ },
+ "SELECT id, (TRUE || doc)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: boolean || jsonb"
+  ]
+ },
+ "SELECT id, (TRUE || js)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: boolean || json"
+  ]
+ },
+ "SELECT id, (doc #- '{1}')::text FROM j WHERE id = 2": {
+  "rows": [
+   [
+    "2",
+    "[1, {\"k\": null}]"
+   ]
+  ]
+ },
+ "SELECT id, (doc #- '{b,-1}')::text FROM j WHERE id = 1": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ]
+  ]
+ },
+ "SELECT id, (doc #- '{c,e}')::text FROM j WHERE id = 1": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null}, \"n\": null}"
+   ]
+  ]
+ },
+ "SELECT id, (doc #- ARRAY['b', '1'])::text FROM j WHERE id = 1": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ]
+  ]
+ },
+ "SELECT id, (doc - 'b')::text FROM j WHERE id = 2": {
+  "rows": [
+   [
+    "2",
+    "[1, null, {\"k\": null}]"
+   ]
+  ]
+ },
+ "SELECT id, (doc - 'c')::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"n\": null}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, (doc - 1)::text FROM j WHERE id = 2": {
+  "rows": [
+   [
+    "2",
+    "[1, {\"k\": null}]"
+   ]
+  ]
+ },
+ "SELECT id, (doc - ARRAY['a', 'c'])::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"b\": [1, 2], \"n\": null}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, (doc -> 'a' || doc)::text AS v FROM j WHERE id = 1": {
+  "rows": [
+   [
+    "1",
+    "[1, {\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}]"
+   ]
+  ]
+ },
+ "SELECT id, (doc || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}, 9]"
+   ],
+   [
+    "2",
+    "[1, null, {\"k\": null}, 9]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[\"text\", 9]"
+   ]
+  ]
+ },
+ "SELECT id, (doc || 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb || uuid"
+  ]
+ },
+ "SELECT id, (doc || 'x')::text AS v FROM j ORDER BY id": {
+  "error": [
+   "22P02",
+   "invalid input syntax for type json"
+  ]
+ },
+ "SELECT id, (doc || 'x'::text)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}x"
+   ],
+   [
+    "2",
+    "[1, null, {\"k\": null}]x"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "\"text\"x"
+   ]
+  ]
+ },
+ "SELECT id, (doc || '{\"w\": 0}')::text FROM jv ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null, \"w\": 0}"
+   ],
+   [
+    "2",
+    "[1, null, {\"k\": null}, {\"w\": 0}]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[\"text\", {\"w\": 0}]"
+   ]
+  ]
+ },
+ "SELECT id, (doc || '{\"z\": 1}' || '[9]' || '{\"a\": 2}')::text FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null, \"z\": 1}, 9, {\"a\": 2}]"
+   ],
+   [
+    "2",
+    "[1, null, {\"k\": null}, {\"z\": 1}, 9, {\"a\": 2}]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[\"text\", {\"z\": 1}, 9, {\"a\": 2}]"
+   ]
+  ]
+ },
+ "SELECT id, (doc || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null, \"z\": 1}"
+   ],
+   [
+    "2",
+    "[1, null, {\"k\": null}, {\"z\": 1}]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[\"text\", {\"z\": 1}]"
+   ]
+  ]
+ },
+ "SELECT id, (doc || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}, 1]"
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, (doc || 1)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb || integer"
+  ]
+ },
+ "SELECT id, (doc || 1.5)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb || numeric"
+  ]
+ },
+ "SELECT id, (doc || NULL)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    ""
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, (doc || NULL)::text, (NULL || doc)::text FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "",
+    ""
+   ],
+   [
+    "2",
+    "",
+    ""
+   ],
+   [
+    "3",
+    "",
+    ""
+   ],
+   [
+    "4",
+    "",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, (doc || TRUE)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb || boolean"
+  ]
+ },
+ "SELECT id, (doc || doc)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ],
+   [
+    "2",
+    "[1, null, {\"k\": null}, 1, null, {\"k\": null}]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[\"text\", \"text\"]"
+   ]
+  ]
+ },
+ "SELECT id, (doc || doc)::text FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ],
+   [
+    "2",
+    "[1, null, {\"k\": null}, 1, null, {\"k\": null}]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[\"text\", \"text\"]"
+   ]
+  ]
+ },
+ "SELECT id, (doc || js)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb || json"
+  ]
+ },
+ "SELECT id, (doc || n)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb || bigint"
+  ]
+ },
+ "SELECT id, (js || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{ \"a\" : 1, \"n\" : null, \"b\" : [ 1 , 2 ] }[9]"
+   ],
+   [
+    "2",
+    "[1, {\"z\" : null}, null][9]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "\"s\"[9]"
+   ]
+  ]
+ },
+ "SELECT id, (js || 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: json || uuid"
+  ]
+ },
+ "SELECT id, (js || 'x')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{ \"a\" : 1, \"n\" : null, \"b\" : [ 1 , 2 ] }x"
+   ],
+   [
+    "2",
+    "[1, {\"z\" : null}, null]x"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "\"s\"x"
+   ]
+  ]
+ },
+ "SELECT id, (js || 'x'::text)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{ \"a\" : 1, \"n\" : null, \"b\" : [ 1 , 2 ] }x"
+   ],
+   [
+    "2",
+    "[1, {\"z\" : null}, null]x"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "\"s\"x"
+   ]
+  ]
+ },
+ "SELECT id, (js || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{ \"a\" : 1, \"n\" : null, \"b\" : [ 1 , 2 ] }{\"z\": 1}"
+   ],
+   [
+    "2",
+    "[1, {\"z\" : null}, null]{\"z\": 1}"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "\"s\"{\"z\": 1}"
+   ]
+  ]
+ },
+ "SELECT id, (js || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: json || jsonb"
+  ]
+ },
+ "SELECT id, (js || 1)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: json || integer"
+  ]
+ },
+ "SELECT id, (js || 1.5)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: json || numeric"
+  ]
+ },
+ "SELECT id, (js || NULL)::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    ""
+   ],
+   [
+    "2",
+    ""
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, (js || TRUE)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: json || boolean"
+  ]
+ },
+ "SELECT id, (js || doc)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: json || jsonb"
+  ]
+ },
+ "SELECT id, (js || js)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: json || json"
+  ]
+ },
+ "SELECT id, (js || n)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: json || bigint"
+  ]
+ },
+ "SELECT id, (jsonb_build_object('a', n) || '{\"b\": 2}')::text FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": 2}"
+   ],
+   [
+    "2",
+    "{\"a\": 2, \"b\": 2}"
+   ],
+   [
+    "3",
+    "{\"a\": null, \"b\": 2}"
+   ],
+   [
+    "4",
+    "{\"a\": 4, \"b\": 2}"
+   ]
+  ]
+ },
+ "SELECT id, (n || '[9]')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "1[9]"
+   ],
+   [
+    "2",
+    "2[9]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "4[9]"
+   ]
+  ]
+ },
+ "SELECT id, (n || '{\"z\": 1}')::text AS v FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "1{\"z\": 1}"
+   ],
+   [
+    "2",
+    "2{\"z\": 1}"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "4{\"z\": 1}"
+   ]
+  ]
+ },
+ "SELECT id, (n || (doc -> 'a'))::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: bigint || jsonb"
+  ]
+ },
+ "SELECT id, (n || doc)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: bigint || jsonb"
+  ]
+ },
+ "SELECT id, (n || js)::text AS v FROM j ORDER BY id": {
+  "error": [
+   "42883",
+   "operator does not exist: bigint || json"
+  ]
+ },
+ "SELECT id, doc || 'x'::text FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}x"
+   ],
+   [
+    "2",
+    "[1, null, {\"k\": null}]x"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "\"text\"x"
+   ]
+  ]
+ },
+ "SELECT id, doc::text, (doc || '{\"d\": 4}')::text FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null, \"z\": 1}",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"d\": 4, \"n\": null, \"z\": 1}"
+   ],
+   [
+    "2",
+    "[1, null, {\"k\": null}, {\"z\": 1}]",
+    "[1, null, {\"k\": null}, {\"z\": 1}, {\"d\": 4}]"
+   ],
+   [
+    "3",
+    "",
+    ""
+   ],
+   [
+    "4",
+    "\"text\"",
+    "[\"text\", {\"d\": 4}]"
+   ],
+   [
+    "11",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": 3, \"n\": null, \"z\": 1}",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": 3, \"d\": 4, \"n\": null, \"z\": 1}"
+   ]
+  ]
+ },
+ "SELECT id, js || '{\"b\": 2}' FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{ \"a\" : 1, \"n\" : null, \"b\" : [ 1 , 2 ] }{\"b\": 2}"
+   ],
+   [
+    "2",
+    "[1, {\"z\" : null}, null]{\"b\": 2}"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "\"s\"{\"b\": 2}"
+   ]
+  ]
+ },
+ "SELECT id, json_strip_nulls(js)::text FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\":1,\"b\":[1,2]}"
+   ],
+   [
+    "2",
+    "[1,{},null]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "\"s\""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_concat(doc, '[9]')::text FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "[{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}, 9]"
+   ],
+   [
+    "2",
+    "[1, null, {\"k\": null}, 9]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[\"text\", 9]"
+   ]
+  ]
+ },
+ "SELECT id, jsonb_concat(doc, '{\"z\": 1}')::text FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null, \"z\": 1}"
+   ],
+   [
+    "2",
+    "[1, null, {\"k\": null}, {\"z\": 1}]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[\"text\", {\"z\": 1}]"
+   ]
+  ]
+ },
+ "SELECT id, jsonb_insert(doc, '{b,-1}', '0', true)::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2, 0], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_insert(doc, '{b,0}', '0')::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [0, 1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_insert(doc, '{b,0}', '0', true)::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 0, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_insert(doc, '{zz}', '\"x\"')::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null, \"zz\": \"x\"}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_pretty(doc) FROM j WHERE id = 4": {
+  "rows": [
+   [
+    "4",
+    "\"text\""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_pretty(doc) FROM j WHERE id IN (1, 2) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\n    \"a\": 1,\n    \"b\": [\n        1,\n        2\n    ],\n    \"c\": {\n        \"d\": null,\n        \"e\": \"x\"\n    },\n    \"n\": null\n}"
+   ],
+   [
+    "2",
+    "[\n    1,\n    null,\n    {\n        \"k\": null\n    }\n]"
+   ]
+  ]
+ },
+ "SELECT id, jsonb_set(doc, '{1}', '9')::text FROM j WHERE id IN (2, 3) ORDER BY id": {
+  "rows": [
+   [
+    "2",
+    "[1, 9, {\"k\": null}]"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_set(doc, '{b,-1}', '9')::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 9], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_set(doc, '{b,1}', '9')::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 9], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_set(doc, '{b,7}', '9')::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2, 9], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_set(doc, '{c,e}', '\"y\"')::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"y\"}, \"n\": null}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_set(doc, '{c,zz,yy}', '1')::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_set(doc, '{zz}', '\"x\"')::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null, \"zz\": \"x\"}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_set(doc, '{zz}', '\"x\"', false)::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_set(doc, ARRAY['c', 'd'], '\"new\"', true)::text FROM j WHERE id IN (1, 3) ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": \"new\", \"e\": \"x\"}, \"n\": null}"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT id, jsonb_strip_nulls(doc)::text FROM j ORDER BY id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"e\": \"x\"}}"
+   ],
+   [
+    "2",
+    "[1, null, {}]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "\"text\""
+   ]
+  ]
+ },
+ "SELECT js - 'a' FROM j WHERE id = 1": {
+  "error": [
+   "42883",
+   "operator does not exist: json - unknown"
+  ]
+ },
+ "SELECT json_build_array(' [1]'::json)::text": {
+  "rows": [
+   [
+    "[ [1]]"
+   ]
+  ]
+ },
+ "SELECT json_build_object('a', 1) - 'a'": {
+  "error": [
+   "42883",
+   "operator does not exist: json - unknown"
+  ]
+ },
+ "SELECT json_build_object('doc', ' {\"b\": 1,  \"a\": [2]}\n'::json)::text": {
+  "rows": [
+   [
+    "{\"doc\" :  {\"b\": 1,  \"a\": [2]}\n}"
+   ]
+  ]
+ },
+ "SELECT jsonb_build_array(' {\"b\":1,\"a\":2}'::jsonb, '\t[]\n'::jsonb)::text": {
+  "rows": [
+   [
+    "[{\"a\": 2, \"b\": 1}, []]"
+   ]
+  ]
+ },
+ "SELECT jsonb_build_object('a', 1) - 1.5": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb - numeric"
+  ]
+ },
+ "SELECT jsonb_build_object('a', 1) - jsonb_build_array(1)": {
+  "error": [
+   "42883",
+   "operator does not exist: jsonb - jsonb"
+  ]
+ },
+ "SELECT jsonb_build_object('doc', ' {\"b\":1,\"a\":[2,{\"d\":null,\"c\":3}]} '::jsonb)::text": {
+  "rows": [
+   [
+    "{\"doc\": {\"a\": [2, {\"c\": 3, \"d\": null}], \"b\": 1}}"
+   ]
+  ]
+ },
+ "SELECT jsonb_insert(doc, '{a}', '2') FROM j WHERE id = 1": {
+  "error": [
+   "22023",
+   "cannot replace existing key"
+  ]
+ },
+ "SELECT jsonb_pretty('{\"tags\": [], \"o\": {}, \"n\": [[], {\"x\": []}]}'::jsonb)": {
+  "rows": [
+   [
+    "{\n    \"n\": [\n        [\n        ],\n        {\n            \"x\": [\n            ]\n        }\n    ],\n    \"o\": {\n    },\n    \"tags\": [\n    ]\n}"
+   ]
+  ]
+ },
+ "SELECT jsonb_set('\t[1, 2]\n'::jsonb, '{1}', '9')::text": {
+  "rows": [
+   [
+    "[1, 9]"
+   ]
+  ]
+ },
+ "SELECT jsonb_set(' \n{\"c\": {\"d\": 1}, \"b\": [1, 2]}\t'::jsonb, '{c,d}', '\"new\"')::text": {
+  "rows": [
+   [
+    "{\"b\": [1, 2], \"c\": {\"d\": \"new\"}}"
+   ]
+  ]
+ },
+ "SELECT jsonb_set(' {\"b\": 1}'::jsonb, '{zz}', '[true]', true)::text": {
+  "rows": [
+   [
+    "{\"b\": 1, \"zz\": [true]}"
+   ]
+  ]
+ },
+ "SELECT jsonb_set(doc, '{a,NULL}', '1') FROM j WHERE id = 1": {
+  "error": [
+   "22004",
+   "path element at position 2 is null"
+  ]
+ },
+ "SELECT jsonb_set(doc, '{a}', '1') FROM j WHERE id = 4": {
+  "error": [
+   "22023",
+   "cannot set path in scalar"
+  ]
+ },
+ "SELECT jsonb_set(doc, '{a}', 'x') FROM j WHERE id = 1": {
+  "error": [
+   "22P02",
+   "invalid input syntax for type json"
+  ]
+ },
+ "SELECT jsonb_set(doc, '{b,x}', '1') FROM j WHERE id = 1": {
+  "error": [
+   "22P02",
+   "path element at position 2 is not an integer: \"x\""
+  ]
+ },
+ "SELECT jsonb_set(js, '{a}', '1') FROM j WHERE id = 1": {
+  "error": [
+   "42883",
+   "function jsonb_set(json, unknown, unknown) does not exist"
+  ]
+ },
+ "SELECT to_jsonb(' [1, \"x\"]\t'::json)::text": {
+  "rows": [
+   [
+    "[1, \"x\"]"
+   ]
+  ]
+ },
+ "SELECT x.id, (x.v || '{\"w\": 0}')::text FROM (SELECT id, doc AS v FROM j) AS x ORDER BY x.id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": null, \"e\": \"x\"}, \"n\": null, \"w\": 0}"
+   ],
+   [
+    "2",
+    "[1, null, {\"k\": null}, {\"w\": 0}]"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "4",
+    "[\"text\", {\"w\": 0}]"
+   ]
+  ]
+ },
+ "SELECT x.id, (x.v || '{\"w\": 0}')::text FROM (SELECT id, jsonb_build_object('a', id) AS v FROM j) AS x ORDER BY x.id": {
+  "rows": [
+   [
+    "1",
+    "{\"a\": 1, \"w\": 0}"
+   ],
+   [
+    "2",
+    "{\"a\": 2, \"w\": 0}"
+   ],
+   [
+    "3",
+    "{\"a\": 3, \"w\": 0}"
+   ],
+   [
+    "4",
+    "{\"a\": 4, \"w\": 0}"
+   ]
+  ]
+ },
+ "UPDATE j SET doc = doc || '{\"z\": 1}' WHERE id IN (1, 2)": {
+  "rows": []
+ }
+}
