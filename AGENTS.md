@@ -548,13 +548,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    order. Answered OUT_OF_ORDER_SEQUENCE, an idempotent librdkafka producer on a follower stopped for
    good ("sequence desynchronization"): `kafka_bench.py --s3 --nodes 3 --steady 30` on `sim_r2.py`
    lost two of its 24 producers in their first seconds without the Kafka door's re-queue.
-30. **A shuffle's scratch folder has the node's own id in it** (`spill::dir`). Two nodes on one
-   machine share a cache directory and name their buckets the same way; without the id they write
+30. **A shuffle's scratch folder has the node's own id in it** (`spill::dir`). Two nodes in one
+   process share its spill folder and name their buckets the same way; without the id they write
    over each other's rows and the answer is quietly wrong. This is what `tools/shuffle_spill.py`
    caught when the id wasn't there.
 31. **A step's buckets are kept, not taken** (`spmd::fetch`, `bucket`): reading one clones it, so
    a step that has to be run again reads the same rows. Everything a job spilled goes when the job
-   ends (`Drop for Job`, `gc`, `?drop=true`), and a dead node's is swept an hour later. A gather's
+   ends (`Drop for Job`, `gc`, `?drop=true`), and a dead process's goes with its spill folder (invariant 419). A gather's
    spill is freed by the guard its response stream holds instead, since nothing retries it.
 32. **Every node splits the same rows the same way.** `spmd::scatter` runs a stage's partitions at
    once, each into buckets of its own, and joins them in partition order at the end; the hash is
@@ -2770,15 +2770,19 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `memory::spill_base`, `memory::Folder`, `spill::dir`). A query's spills (DataFusion's) and a shuffle's go under
    `PONDRA_SPILL_DIR`, else `PONDRA_CACHE_DIR`, else the temporary folder unless it is held in memory (tmpfs: /tmp on
    Fedora and Arch, where a spill frees nothing), then the user's cache folder. A query's go in a folder of the
-   process's own (`pondra-spill-{uid}/{pid}-…`, 0700, its lock file held), and the folders of processes that ended
-   are swept when the next process makes its own: a node killed mid-spill left them for good. A node may spill
+   process's own (`pondra-spill-{uid}/{pid}-…`, the user's folder 0700, its lock file held; a shuffle's in its
+   `shuffle/`), and the folders of processes that ended are swept when the next process makes its own: a node killed
+   mid-spill left them for good. One helper makes every folder that is this user's alone (`memory::own_dir`: the
+   spill folders, and in the temporary folder the term locks of invariant 370 and Python's packages); a shuffle used
+   to share one folder a machine, open to other users and swept by age while its job ran. A node may spill
    `PONDRA_SPILL_GB`, by default the disk's free space when the lake opens less what a lake keeps for itself
    (`store::lake_keeps`, invariant 220), not DataFusion's 100 GB; past it a query is refused with 53100, worded to
    raise `PONDRA_SPILL_GB` (`codes::words`), never DataFusion's `datafusion.runtime.*` (refused: invariant 188), and
    the frugal retry doesn't run it again. `0`: nothing spills. Spills are written uncompressed: on this 4-core VM zstd
    cut a 10M-string sort's spill 2.5× but took 10–24% longer, lz4 5–9%. `harness.py scale`: "a query spills to
    PONDRA_SPILL_DIR, cleans up after, and past PONDRA_SPILL_GB is refused by name (53100)" (a folder not made yet);
-   `memory::tests::sweep_removes_a_folder_whose_process_ended_and_keeps_the_rest`.
+   `memory::tests::sweep_removes_a_folder_whose_process_ended_and_keeps_the_rest`, `own_dir_is_this_users_alone…`,
+   `spill::tests`.
 
 420. **A `CREATE TABLE … AS SELECT` that fails leaves no table** (`write::run_listed`, `Undo`; `from_cli`). Its table
    is made first (`Stmt::Define`), so an INSERT of its rows that fails, for any reason, drops it, purged, before the

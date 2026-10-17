@@ -26,9 +26,9 @@ fn piece() -> usize {
 /// Where a node keeps what it spills: `shuffle` in the process's own spill folder (`store::spill_folder`: this
 /// user's alone, locked while the process lives, swept once it ends), one folder per job and node (`<job>-<node id>`).
 /// The node's own id is in the path because two nodes in one process share that folder, and they name their buckets
-/// the same way: without it they would write over each other's rows (invariant 30). It used to be one shared folder
-/// per machine, with an hour's age deciding what was swept: another user could read the rows, and a live job could
-/// be swept. An empty job names the `shuffle` folder itself (measuring). Err when the process has no spill folder.
+/// the same way: without it they would write over each other's rows (invariant 30). Being the process's, no other
+/// user can read the rows, and nothing sweeps a job while its process lives. An empty job names the `shuffle` folder
+/// itself (measuring). Err when the process has no spill folder.
 pub fn dir(job: &str) -> std::io::Result<PathBuf> {
     crate::per_node!(static ME: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
     let me = ME.get_or(|| uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string());

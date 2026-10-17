@@ -43,7 +43,7 @@ def rss_mb(node):
 
 def main():
     lake = harness.new_lake()
-    # A scratch folder each, as separate machines have (a dead node's is swept an hour later).
+    # A scratch folder each, as separate machines have (a dead node's is swept by the next process that spills there).
     scratch = os.path.join(harness.tempfile.gettempdir(), f"pondra-spill-{os.getpid()}")
     env = lambda i: {"PONDRA_SPILL_MB": str(A.spill_mb), "PONDRA_CACHE_DIR": f"{scratch}/{i}"}
     nodes = [Node(lake, A.port + i, env=env(i), memory_gb=A.memory_gb, tier_secs=0).start() for i in range(A.nodes)]
