@@ -22063,8 +22063,8 @@ def pkey():
     fresh_k("up1")
     e_up1 = err("INSERT INTO up1 VALUES (6, 'a'), (6, 'b') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
     info["upsert_up1"] = [e_up1[1], e_up1[2][:160], kv("up1")]
-    checks["upserts: DO UPDATE of (6,'a'),(6,'b') is refused 21000 (\"ON CONFLICT DO UPDATE command cannot affect row a second time\"), nothing written"] = \
-        e_up1[1] == "21000" and "ON CONFLICT DO UPDATE command cannot affect row a second time" in e_up1[2] and kv("up1") == {1: "a"}
+    checks["upserts: DO UPDATE of (6,'a'),(6,'b') is refused 21000 (\"ON CONFLICT DO UPDATE command cannot affect row a second time\", HTTP 400), nothing written"] = \
+        e_up1[0] == 400 and e_up1[1] == "21000" and "ON CONFLICT DO UPDATE command cannot affect row a second time" in e_up1[2] and kv("up1") == {1: "a"}
 
     fresh_k("up2")
     e_up2 = err("INSERT INTO up2 VALUES (1, 'c'), (1, 'd') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
