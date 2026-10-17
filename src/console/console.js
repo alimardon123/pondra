@@ -107,7 +107,9 @@ function drawLeft() {
     if (i && !f && parts.length && !parts.at(-1).classList.contains('folded')) parts.push(divider(parts.at(-1), g));
     parts.push(g);
   });
+  const a = document.activeElement;
   $('#left').replaceChildren(FILTER, ...parts.length ? parts : [h('div', { class: 'empty pad' }, 'Nothing here: views moved to the right pane come back with their ⋯.')], EDGE);
+  a.focus(); // (a redraw keeps the focus: what is typed in the filter as a module registers lands there)
   filterLeft();
 }
 const EDGE = $('#leftEdge'); // (the edge of the left pane: kept as its groups are drawn again)
