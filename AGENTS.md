@@ -2724,8 +2724,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    strings their views point to, and the window's own columns), and a `HeldOutExec`, which lets go of each batch as
    its rows come out (a window gives one row per row, in order), so a window holding more than memory refuses
    (53200) instead of growing the node until the OS kills it, and one that streams holds only what it holds.
-   What DataFusion keeps inside a window beyond its rows not yet out (the string buffers a long partition's views
-   point into, a frame's rows behind those given out, `WindowAggExec`'s final concatenation) is still uncounted.
+   What DataFusion keeps inside a window beyond its rows not yet out (a frame's rows behind those given out,
+   `WindowAggExec`'s final concatenation) is still uncounted; a streaming window's strings are plain (invariant 423).
    `harness.py scale`: "…one no rewrite takes refuses (53200) and the node answers after…" (answered by growing past
    its pool without it; killed under a 2 GB cap at SF10). A window over whole partitions is answered instead
    (invariant 422).
@@ -2812,6 +2812,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    0.99). `harness.py scale`: `count(*) OVER ()` and `avg(id) OVER (PARTITION BY id % 3)` over 3M rows on a 0.05 GB
    node answer, at a peak of 285 MB (refused before, 53200).
 
+423. **A streaming window holds plain strings, and a merge of spilled runs leaves room beside it** (`held::Windows`,
+   `plain_below`, `views_back`; `store::spill_disk`). A `BoundedWindowAggExec` concatenates a partition's batches, and
+   concatenated views keep every batch's buffers, so below it each view column no partition key or window function
+   reads is cast plain, and cast back above `HeldOutExec` (a key stays a view: the window finds its partitions by its
+   ordering, which a cast hides). Its reservation is spillable, though it never spills, so `FairSpillPool` gives it a
+   share of its own beside the sorts feeding it (an unspillable grow is refused once their shares are full). A merge of
+   spilled runs takes at most `memory_limit / partitions / 32 MB` runs at once (4 to 64; `PONDRA_SPILL_FAN_IN`, 0 for
+   DataFusion's own, no limit): unlimited, each partition's merge reserved the whole pool and the window above it was
+   refused. Fewer runs at once means more passes, so a small node writes more spill (9M long strings: 1.3 GB at 4,
+   1.07 GB unlimited). `harness.py scale`: "a rank() over one partition of 9M long strings streams…" (stopped by the 1 GB
+   watch before) and "a rank() over 3 partitions of 6M long strings…" (a 501 MB peak; refused before, 53200).
 ## Tests: run these before and after any change
 
 ```bash
