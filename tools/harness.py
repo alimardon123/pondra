@@ -743,6 +743,13 @@ def outside():
     lines = got("out/eu.csv").decode().splitlines()
     checks["…CSV with a header and a delimiter, JSON lines"] = (lines[0].split(";")[:3] == ["id", "region", "amount"] and len(lines) == 1 + len(eu) + sum(1 for r in eu if r["id"] < 100)
         and [json.loads(l) for l in got("out/events.json").decode().splitlines()] == [{"k": "a", "v": 1}, {"k": "b", "v": 2}, {"k": "a", "v": 3}])
+    # (Arrow's file format as arrow-rs writes it pads its magic to 64 bytes, which DataFusion's reading of a file a bucket
+    # sends as a stream took for the schema's length: `ext_names::arrow_file_schema` reads the footer)
+    q("COPY eu TO 's3://ext/out/eu.arrow' (FORMAT arrow)")
+    eu_rows = q("SELECT count(*) AS n FROM eu", 1)[0]["n"]
+    checks["…an Arrow file, read back from the bucket by Pondra and by pyarrow"] = (
+        q("SELECT count(*) AS n FROM read_arrow('s3://ext/out/eu.arrow')", 1) == [{"n": eu_rows}]
+        and pa.ipc.open_file(io.BytesIO(got("out/eu.arrow"))).read_all().num_rows == eu_rows)
     q("COPY (SELECT 1 AS a) TO 's3://ext/out/eu.parquet'")
     checks["…a file there already is replaced"] = pq.read_table(io.BytesIO(got("out/eu.parquet"))).to_pylist() == [{"a": 1}]
     mine = tempfile.mkdtemp(prefix="pondra-copy-")

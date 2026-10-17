@@ -547,7 +547,7 @@ impl TableProvider for HotFiles {
         let (plain, special): (Vec<&DataFile>, Vec<&DataFile>) = cold.iter().copied().partition(|f| f.lineage.is_none() && (f.deletes.is_empty() || !deletes));
         if !plain.is_empty() {
             let urls = plain.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
-            let options = ParquetReadOptions::default().to_listing_options(state.config(), state.table_options().clone());
+            let options = ParquetReadOptions::default().to_listing_options(state.config(), state.default_table_options());
             let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).with_schema(self.schema.clone());
             let table = ListingTable::try_new(config)?.with_cache(state.runtime_env().cache_manager.get_file_statistic_cache());
             plans.push(told(table.scan(state, projection, filters, limit).await?, &self.known)?);
