@@ -2727,6 +2727,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    point into, a frame's rows behind those given out, `WindowAggExec`'s final concatenation) is still uncounted.
    `harness.py scale`: "a window over all rows past the memory limit refuses…" (answered by growing past its pool
    without it; killed under a 2 GB cap at SF10).
+415. **A number with an exponent is a whole decimal, and what a query is said to give is what it gives**
+   (`optimize::WholeLiterals`, `query::run_schema`). DataFusion types `1e15` as a decimal of negative scale:
+   Arrow's cast to a float divides by `10^scale` (`CAST(1e15 AS DOUBLE)` was `9.999999999999999e14`) and
+   Parquet has no negative scale (a table made from one couldn't be written). The first analyzer rule makes
+   it the same number at scale 0 (Decimal256 past 38 digits, a float past 76). Anything that defines columns
+   from a query (`CREATE TABLE … AS`, `POST /insert`, a view's or a task's table, `COPY … TO` Delta or
+   Iceberg) or describes them before it runs (Flight's info, a Postgres Describe, the Postgres catalog's
+   views, an empty answer) takes the analyzed schema through `run_schema`, never the planner's
+   `df.schema()`: the analyzer's rules change types the rows then have. `harness.py found`: "a number with
+   an exponent is a whole decimal…" and the bulk door, task, Delta and topic-view checks; `flight`: "the
+   FlightInfo schema of SELECT 1e15 AS x is decimal(16, 0)".
 
 ## Tests: run these before and after any change
 
