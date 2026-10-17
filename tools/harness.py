@@ -17470,17 +17470,15 @@ def jsonedits():
     "nested": {"k": i}}`; the median of 7 rounds, the two Pondra builds one after the other in each round (alternating),
     a warm-up before each timed run, every statement's text new so that no answer is remembered; Postgres 16 and DuckDB
     1.5.5 run the same statements in the same rounds, on a quiet machine). Seconds per statement. Pondra's figure is this
-    round's build; in parentheses, the figure this paragraph had before:
+    round's build; in parentheses, the same run's build from before parts A to D (and before main's merge):
         statement                                  Pondra (before)      Postgres 16          DuckDB 1.5.5
-        count(jsonb_set(doc, '{name}', '"x"'))     0.42 s (1.67 s)      0.45 s               n/a
-        count(jsonb_concat(doc, '{"z": 1}'))       0.50 s (1.75 s)      0.51 s (doc || ...)  0.25 s (json_merge_patch)
-        count(doc - 'tags')                        0.38 s (1.38 s)      0.31 s               n/a
-        sum(length(jsonb_set ...)), as text        0.44 s (1.72 s)      0.87 s               n/a
-        sum(length(jsonb_concat ...)), as text     0.51 s (1.80 s)      1.01 s               0.26 s (json_merge_patch)
-        sum(length(doc - 'tags')), as text         0.34 s (1.33 s)      0.60 s               n/a
-    The same run's build before this round (before parts A to D, and before main's merge into the branch) took 0.96,
-    0.78, 0.70, 0.98, 0.98 and 0.69 s for the first six rows, in the same order: every statement is faster now, and
-    every answer is the one before. Pondra's answers equal Postgres 16's for all six. Still behind Postgres:
+        count(jsonb_set(doc, '{name}', '"x"'))     0.42 s (0.96 s)      0.45 s               n/a
+        count(jsonb_concat(doc, '{"z": 1}'))       0.50 s (0.78 s)      0.51 s (doc || ...)  0.25 s (json_merge_patch)
+        count(doc - 'tags')                        0.38 s (0.70 s)      0.31 s               n/a
+        sum(length(jsonb_set ...)), as text        0.44 s (0.98 s)      0.87 s               n/a
+        sum(length(jsonb_concat ...)), as text     0.51 s (0.98 s)      1.01 s               0.26 s (json_merge_patch)
+        sum(length(doc - 'tags')), as text         0.34 s (0.69 s)      0.60 s               n/a
+    Every statement is faster, and every answer is the one before. Pondra's answers equal Postgres 16's for all six. Still behind Postgres:
     count(doc - 'tags'), by 0.07 s: a count still prints the document, where Postgres edits binary jsonb and never
     prints it for a count. The references, measured before this round: Pondra count(json_get_str(doc, 'name')) 0.11 s
     (one member read); jsonb_strip_nulls, the tree path, 1.77 s; json_strip_nulls, which copies tokens, 0.63 s.
