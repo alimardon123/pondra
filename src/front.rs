@@ -4,13 +4,13 @@
 
 use crate::ext_names::Attached;
 use crate::expander::Routine;
-#[cfg(feature = "server")] use crate::expander::{Expander, Kind};
+use crate::expander::{Expander, Kind};
 use anyhow::Result;
 use datafusion::sql::sqlparser::ast::Statement;
-#[cfg(feature = "server")] use datafusion::sql::sqlparser::{ast::{self, VisitMut}, dialect::GenericDialect, parser::Parser};
+use datafusion::sql::sqlparser::{ast::{self, VisitMut}, dialect::GenericDialect, parser::Parser};
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-#[cfg(feature = "server")] use std::ops::ControlFlow;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// What the front asks of where it runs. Asked once a statement, or once a name, never once a batch.
@@ -43,7 +43,6 @@ pub enum Own {
 }
 
 /// The front (`routines::expand_with` before):
-#[cfg(feature = "server")]
 pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String>) -> Result<String> {
     let sql = &match host.own(sql).await? {
         Own::Answer(q) => return Ok(q),
@@ -57,12 +56,12 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     let sql: &str = &marked;
     let all = host.routines().await?;
     let outside = host.attached().await?;
-    let named = |n: &String| crate::ddl::mentions(sql, n);
-    let expands = all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) || views.keys().any(named) || crate::routines::FROM_FIRST.is_match(sql) || crate::ext::mentions(sql)
+    let named = |n: &String| crate::text::mentions(sql, n);
+    let expands = all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) || views.keys().any(named) || crate::expander::FROM_FIRST.is_match(sql) || crate::ext_names::mentions(sql)
         || outside.iter().any(|(n, _)| named(n)) || sql.contains("pondra_at(");
-    let as_written = || Ok(crate::routines::named_apart(sql).unwrap_or_else(|| sql.to_string()));
+    let as_written = || Ok(crate::expander::named_apart(sql).unwrap_or_else(|| sql.to_string()));
     let measured = host.measured(sql).await?; // (a view with measures read, or a measure named)
-    if !expands && !measured && !crate::friendly::wanted(sql) && !crate::types::wanted(sql) {
+    if !expands && !measured && !crate::friendly::wanted(sql) && !crate::text::names_a_type(sql) {
         return as_written();
     }
     // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
@@ -76,7 +75,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     // Measures first, at the query's own grain (ADR-065 §3): what they put in (a view's FROM, its macros) is expanded below.
     let expands = (measured && host.measures(sql, &mut stmts).await?) || expands;
     let columns = match expands {
-        true => crate::routines::columns(host, &stmts, &all).await?,
+        true => crate::expander::columns(host, &stmts, &all).await?,
         false => HashMap::new(),
     };
     let name = host.name();
@@ -93,5 +92,5 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     if !expands && !friendly && !typed {
         return as_written();
     }
-    Ok(crate::routines::text(&stmts))
+    Ok(crate::text::text(&stmts))
 }

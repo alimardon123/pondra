@@ -35,7 +35,6 @@ use std::sync::{Arc, LazyLock, Mutex};
 pub use crate::text::sql;
 pub(crate) use crate::text::text;
 pub use crate::text::args;
-pub(crate) use crate::expander::{columns, named_apart, FROM_FIRST};
 pub use crate::expander::{columns_of, names, Kind, Routine};
 use crate::expander::{arguments, params, parse_expr, parse_query, query_text, scalar_body, values_apart, Options, Param, VALUES_SUB};
 
@@ -1249,6 +1248,7 @@ pub async fn with_views(lake: &Lake, sql: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expander::named_apart;
 
     fn call(sql: &str) -> Vec<FunctionArg> {
         let Expr::Function(f) = parse_expr(sql).unwrap() else { panic!("{sql}: not a call") };

@@ -28,6 +28,12 @@ mod diff;
 mod expander;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod front;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod codes;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod friendly;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod measures;
 mod optimize;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
@@ -46,7 +52,6 @@ mod optimize;
 #[cfg(feature = "server")] mod cache;
 #[cfg(feature = "server")] mod catalogs;
 #[cfg(feature = "server")] mod change;
-#[cfg(feature = "server")] mod codes;
 #[cfg(feature = "server")] mod copy;
 #[cfg(feature = "server")] mod cursors;
 #[cfg(feature = "server")] mod guard;
@@ -61,7 +66,6 @@ mod optimize;
 #[cfg(feature = "server")] mod feeds;
 #[cfg(feature = "server")] mod files;
 #[cfg(feature = "server")] mod format;
-#[cfg(feature = "server")] mod friendly;
 #[cfg(feature = "server")] mod flight;
 #[cfg(feature = "server")] mod fresh;
 #[cfg(feature = "server")] mod find;
@@ -90,7 +94,6 @@ mod optimize;
 #[cfg(feature = "server")] mod drain;
 #[cfg(feature = "server")] mod log;
 #[cfg(feature = "server")] mod manifest;
-#[cfg(feature = "server")] mod measures;
 #[cfg(feature = "server")] pub mod memory;
 #[cfg(feature = "server")] mod objects;
 #[cfg(feature = "server")] mod once;

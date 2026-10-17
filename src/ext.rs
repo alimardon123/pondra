@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-pub use crate::ext_names::{attached_table, is, mentions, names, spec, Attached, Spec};
+pub use crate::ext_names::{attached_table, is, names, spec, Attached, Spec};
 pub(crate) use crate::ext_names::{format_of, quoted, scheme};
 
 tokio::task_local! {

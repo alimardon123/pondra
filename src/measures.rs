@@ -15,9 +15,11 @@ use datafusion::sql::sqlparser::{
     parser::Parser,
     tokenizer::{Location, Token, TokenWithSpan, Tokenizer},
 };
-use std::{borrow::Cow, collections::{HashMap, HashSet}, ops::ControlFlow, sync::{Arc, LazyLock, Mutex}};
+use std::{borrow::Cow, collections::{HashMap, HashSet}, ops::ControlFlow, sync::{Arc, LazyLock}};
+#[cfg(feature = "server")] use std::sync::Mutex;
 
-use crate::{constraints::Kind, ddl, routines, store::{self, Lake}, write};
+use crate::text;
+#[cfg(feature = "server")] use crate::{constraints::Kind, ddl, routines, store::{self, Lake}};
 
 /// The alias a measure is stored under: `sum(x) AS MEASURE m` is kept as `sum(x) AS "pondra_measure:m"`.
 pub const MARK: &str = "pondra_measure:";
@@ -147,7 +149,7 @@ impl Definition {
             match item {
                 SelectItem::ExprWithAlias { expr, alias } => match alias.value.strip_prefix(MARK) {
                     Some(name) => measures.push((name.to_string(), expr.clone())),
-                    None => dimensions.push((write::ident(alias), expr.clone())),
+                    None => dimensions.push((text::ident(alias), expr.clone())),
                 },
                 SelectItem::UnnamedExpr(expr) => dimensions.push((dimension_name(expr)?, expr.clone())),
                 _ => {} // a wildcard: `shape` refuses it
@@ -168,12 +170,12 @@ pub fn listed(sql: &str) -> Vec<(String, String)> {
 /// A dimension without an alias is named by its column: `c.region` is `region`.
 fn dimension_name(expr: &Expr) -> Result<String> {
     match expr {
-        Expr::Identifier(i) => Ok(write::ident(i)),
-        Expr::CompoundIdentifier(parts) => parts.last().map(write::ident).ok_or_else(|| anyhow!("name the dimension {expr} (... AS name)")),
+        Expr::Identifier(i) => Ok(text::ident(i)),
+        Expr::CompoundIdentifier(parts) => parts.last().map(text::ident).ok_or_else(|| anyhow!("name the dimension {expr} (... AS name)")),
         // (`e.user`: a word that is also a function with no arguments, `user`, makes the parser read the
         // whole name as a call of it, which SQL plans as the column)
         Expr::Function(f) if matches!(f.args, ast::FunctionArguments::None) && f.name.0.len() > 1 && f.over.is_none() => {
-            f.name.0.last().and_then(|p| p.as_ident()).map(write::ident).ok_or_else(|| anyhow!("name the dimension {expr} (... AS name)"))
+            f.name.0.last().and_then(|p| p.as_ident()).map(text::ident).ok_or_else(|| anyhow!("name the dimension {expr} (... AS name)"))
         }
         _ => bail!("name the dimension {expr} (... AS name)"),
     }
@@ -231,7 +233,7 @@ fn is_window(e: &Expr) -> bool {
 }
 
 fn is_aggregate_or_window(e: &Expr) -> bool {
-    is_window(e) || matches!(e, Expr::Function(f) if listed_in(AGGREGATES, &write::object(&f.name)))
+    is_window(e) || matches!(e, Expr::Function(f) if listed_in(AGGREGATES, &text::object(&f.name)))
 }
 
 fn is_subquery_or_window(e: &Expr) -> bool {
@@ -261,7 +263,7 @@ fn expanded(d: &Definition, name: &str, path: &mut Vec<String>) -> Result<Expr> 
     let mut e = expr.clone();
     let worked = visit_expressions_mut(&mut e, |x: &mut Expr| {
         let Expr::Identifier(id) = x else { return ControlFlow::Continue(()) };
-        let inner = write::ident(id);
+        let inner = text::ident(id);
         if !d.measures.iter().any(|(n, _)| *n == inner) {
             return ControlFlow::Continue(());
         }
@@ -398,7 +400,7 @@ fn qualifiers(e: &Expr, out: &mut Vec<Option<String>>) {
     let _ = visit_expressions(e, |x| {
         match x {
             Expr::Identifier(_) => out.push(None),
-            Expr::CompoundIdentifier(p) if p.len() >= 2 => out.push(Some(write::ident(&p[p.len() - 2]))),
+            Expr::CompoundIdentifier(p) if p.len() >= 2 => out.push(Some(text::ident(&p[p.len() - 2]))),
             _ => {}
         }
         ControlFlow::<()>::Continue(())
@@ -408,7 +410,7 @@ fn qualifiers(e: &Expr, out: &mut Vec<Option<String>>) {
 /// The name a relation is known by in a query: its alias, or the last part of its table name.
 fn relation_name(f: &TableFactor) -> Option<String> {
     match f {
-        TableFactor::Table { alias: Some(a), .. } | TableFactor::Derived { alias: Some(a), .. } => Some(write::ident(&a.name)),
+        TableFactor::Table { alias: Some(a), .. } | TableFactor::Derived { alias: Some(a), .. } => Some(text::ident(&a.name)),
         TableFactor::Table { name, alias: None, .. } => Some(last_part(name)),
         _ => None,
     }
@@ -416,7 +418,7 @@ fn relation_name(f: &TableFactor) -> Option<String> {
 
 /// The last part of a name, as SQL resolves it (`customers` of `public.customers`).
 fn last_part(name: &ObjectName) -> String {
-    name.0.last().and_then(|p| p.as_ident()).map(write::ident).unwrap_or_default()
+    name.0.last().and_then(|p| p.as_ident()).map(text::ident).unwrap_or_default()
 }
 
 /// A join's condition, for the joins that have one.
@@ -448,9 +450,9 @@ impl<'a> Uses<'a> {
     /// The measure a bare reference names: `revenue`, or `v.revenue` where `v` is the view's name here.
     fn measure_ref(&self, e: &Expr) -> Option<String> {
         let name = match e {
-            Expr::Identifier(m) => write::ident(m),
+            Expr::Identifier(m) => text::ident(m),
             Expr::CompoundIdentifier(p) => match p.as_slice() {
-                [.., q, m] if write::ident(q) == self.alias => write::ident(m),
+                [.., q, m] if text::ident(q) == self.alias => text::ident(m),
                 _ => return None,
             },
             _ => return None,
@@ -478,7 +480,7 @@ impl<'a> Uses<'a> {
             return Ok(Some(m));
         }
         let Expr::Function(f) = e else { return Ok(None) };
-        let name = write::object(&f.name);
+        let name = text::object(&f.name);
         let arg = single_arg(f);
         if measure_call(f, self.routine) {
             let Some(arg) = arg else { bail!("{name}() takes one measure of {}", self.alias) };
@@ -505,7 +507,7 @@ impl<'a> Uses<'a> {
             return Ok(());
         }
         let name = match &*e {
-            Expr::Function(f) => write::object(&f.name),
+            Expr::Function(f) => text::object(&f.name),
             _ => String::new(),
         };
         if !listed_in(AGGREGATES, &name) {
@@ -546,7 +548,7 @@ impl VisitorMut for Uses<'_> {
 /// A call of `MEASURE`, `AGG` or `AGGREGATE` with one argument at most, unless the lake has a function of that name. With more,
 /// it is another engine's function of that name (Spark's and DuckDB's `aggregate(list, …)`), left for the planner to answer.
 fn measure_call(f: &ast::Function, routine: &dyn Fn(&str) -> bool) -> bool {
-    let name = write::object(&f.name);
+    let name = text::object(&f.name);
     let one = match &f.args {
         ast::FunctionArguments::List(list) => list.args.len() <= 1,
         ast::FunctionArguments::None => true,
@@ -600,11 +602,11 @@ fn names_used(s: &ast::Select, order: Option<&OrderBy>) -> HashSet<String> {
         let _ = visit_expressions(e, |x| {
             match x {
                 Expr::Identifier(i) => {
-                    names.insert(write::ident(i));
+                    names.insert(text::ident(i));
                 }
                 Expr::CompoundIdentifier(p) => {
                     if let Some(l) = p.last() {
-                        names.insert(write::ident(l));
+                        names.insert(text::ident(l));
                     }
                 }
                 _ => {}
@@ -708,7 +710,7 @@ fn flattened(s: &ast::Select, order: Option<&OrderBy>, alias: &str) -> Option<(a
         return None;
     }
     let columns: HashMap<String, Expr> = inner.projection.iter().filter_map(|i| match i {
-        SelectItem::ExprWithAlias { expr, alias } => Some((write::ident(alias), expr.clone())),
+        SelectItem::ExprWithAlias { expr, alias } => Some((text::ident(alias), expr.clone())),
         _ => None,
     }).collect();
     let mut flat = s.clone();
@@ -716,15 +718,15 @@ fn flattened(s: &ast::Select, order: Option<&OrderBy>, alias: &str) -> Option<(a
     for item in flat.projection.iter_mut() {
         if let SelectItem::UnnamedExpr(e) = item {
             let name = match e {
-                Expr::Identifier(i) => write::ident(i),
-                Expr::CompoundIdentifier(p) => write::ident(p.last()?),
+                Expr::Identifier(i) => text::ident(i),
+                Expr::CompoundIdentifier(p) => text::ident(p.last()?),
                 _ => return None,
             };
             *item = SelectItem::ExprWithAlias { expr: e.clone(), alias: ident_for(&name) };
         }
     }
     let outputs: HashSet<String> = flat.projection.iter().filter_map(|i| match i {
-        SelectItem::ExprWithAlias { alias, .. } => Some(write::ident(alias)),
+        SelectItem::ExprWithAlias { alias, .. } => Some(text::ident(alias)),
         _ => None,
     }).collect();
     let mut flat_order = order.cloned();
@@ -757,9 +759,9 @@ fn written_in(e: &mut Expr, columns: &HashMap<String, Expr>, alias: &str, ours: 
         let name = match &*x {
             Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::Lambda(_) => return ControlFlow::Break(()),
             Expr::Function(f) if f.over.is_some() => return ControlFlow::Break(()),
-            Expr::Identifier(i) => write::ident(i),
+            Expr::Identifier(i) => text::ident(i),
             Expr::CompoundIdentifier(p) => match p.as_slice() {
-                [q, n] if write::ident(q) == alias => write::ident(n),
+                [q, n] if text::ident(q) == alias => text::ident(n),
                 _ => return ControlFlow::Break(()),
             },
             _ => return ControlFlow::Continue(()),
@@ -798,7 +800,7 @@ impl VisitorMut for Rewrite<'_> {
         let mut scope = HashMap::new();
         for cte in query.with.iter().flat_map(|w| w.cte_tables.iter()) {
             let found = self.passing(&scope, &cte.query);
-            scope.insert(write::ident(&cte.alias.name), found);
+            scope.insert(text::ident(&cte.alias.name), found);
         }
         self.passes.push(scope);
         ControlFlow::Continue(())
@@ -853,14 +855,14 @@ impl Rewrite<'_> {
     fn measured(&self, select: &ast::Select) -> Option<(Passing, String)> {
         let [item] = select.from.as_slice() else { return None };
         let TableFactor::Table { name, alias, .. } = &item.relation else { return None };
-        let alias = alias.as_ref().map_or_else(|| last_part(name), |a| write::ident(&a.name));
+        let alias = alias.as_ref().map_or_else(|| last_part(name), |a| text::ident(&a.name));
         Some((self.found(&HashMap::new(), name)?, alias))
     }
 
     /// The view with measures a name reads: a CTE in scope (`scope`, the one being made, first), else a view.
     fn found(&self, scope: &HashMap<String, Option<Passing>>, name: &ObjectName) -> Option<Passing> {
         if let [part] = name.0.as_slice() {
-            let cte = part.as_ident().map(write::ident).unwrap_or_default();
+            let cte = part.as_ident().map(text::ident).unwrap_or_default();
             if let Some(p) = std::iter::once(scope).chain(self.passes.iter().rev()).find_map(|s| s.get(&cte)) {
                 return p.clone();
             }
@@ -943,9 +945,9 @@ pub fn joins_checked(d: &Definition, keys: &dyn Fn(&ObjectName) -> Option<Vec<Ve
     };
     for join in joins {
         let TableFactor::Table { name, alias, .. } = &join.relation else { bail!("a view with measures joins tables by their keys: {} is not a table", join.relation) };
-        let full = write::object(name);
+        let full = text::object(name);
         let Some(found) = keys(name).filter(|k| !k.is_empty()) else { bail!("{full} has no key (a PRIMARY KEY or UNIQUE; NOT ENFORCED is enough): a join to it could count rows twice") };
-        let rel = alias.as_ref().map_or_else(|| last_part(name), |a| write::ident(&a.name));
+        let rel = alias.as_ref().map_or_else(|| last_part(name), |a| text::ident(&a.name));
         let covered = covered_by(constraint_of(&join.join_operator), &rel);
         let keys_text = found.iter().map(|k| format!("({})", k.join(", "))).collect::<Vec<_>>().join(", ");
         ensure!(found.iter().any(|k| k.iter().all(|c| covered.contains(c))), "{full} is joined on ({}), not on a key ({keys_text}): a join in a view with measures must be many-to-one", covered.join(", "));
@@ -984,7 +986,7 @@ fn equal_column(e: &Expr, rel: &str) -> Option<String> {
 fn column_of(e: &Expr, rel: &str) -> Option<String> {
     match e {
         Expr::CompoundIdentifier(parts) => match parts.as_slice() {
-            [.., q, c] if write::ident(q) == rel => Some(write::ident(c)),
+            [.., q, c] if text::ident(q) == rel => Some(text::ident(c)),
             _ => None,
         },
         _ => None,
@@ -995,6 +997,7 @@ fn column_of(e: &Expr, rel: &str) -> Option<String> {
 
 /// The views with measures a lake holds, by local name (`sales`, or `crm.sales`). Read again only after a commit, as
 /// `routines::listed` is: every query asks.
+#[cfg(feature = "server")]
 async fn own_views(lake: &Lake) -> Result<Arc<HashMap<String, Arc<Definition>>>> {
     type Seen = Mutex<HashMap<String, (u64, Arc<HashMap<String, Arc<Definition>>>)>>;
     crate::per_node!(static SEEN: Seen = Default::default());
@@ -1020,6 +1023,7 @@ async fn own_views(lake: &Lake) -> Result<Arc<HashMap<String, Arc<Definition>>>>
 }
 
 /// The views with measures a lake can read: its own by local name, and those of the lakes attached to it (`lake.sales`).
+#[cfg(feature = "server")]
 async fn views(lake: &Lake, sql: &str) -> Result<HashMap<String, Arc<Definition>>> {
     let mut out: HashMap<String, Arc<Definition>> = own_views(lake).await?.iter().map(|(k, d)| (k.clone(), d.clone())).collect();
     // (another lake's only when the statement names it: its catalog has no version to keep them by, so each look reads it)
@@ -1037,6 +1041,7 @@ async fn views(lake: &Lake, sql: &str) -> Result<HashMap<String, Arc<Definition>
 
 /// Whether a statement may need the rewrite: it names a measure, or may read a view with measures. The words come first,
 /// then this lake's views as kept, then an attached lake's only when the statement names it (every statement asks: no copy).
+#[cfg(feature = "server")]
 pub async fn wanted(lake: &Lake, sql: &str) -> Result<bool> {
     if sql.contains(MARK) || CALL_TEXT.is_match(sql) {
         return Ok(true);
@@ -1054,11 +1059,12 @@ pub async fn wanted(lake: &Lake, sql: &str) -> Result<bool> {
 }
 
 /// Rewrites statements against the views with measures of `lake`, and the functions it has (see `rewrite_with`).
+#[cfg(feature = "server")]
 pub async fn rewrite(lake: &Lake, sql: &str, stmts: &mut [Statement]) -> Result<bool> {
     let views = views(lake, sql).await?;
     let routines = routines::listed(lake).await?;
     let me = format!("{}.", ddl::lake_name(lake));
-    let view = |name: &ObjectName| -> Option<Arc<Definition>> { candidates(&write::object(name), &me).iter().find_map(|c| views.get(c).cloned()) };
+    let view = |name: &ObjectName| -> Option<Arc<Definition>> { candidates(&text::object(name), &me).iter().find_map(|c| views.get(c).cloned()) };
     rewrite_with(stmts, &view, &|name: &str| routines.contains_key(name))
 }
 
@@ -1074,6 +1080,7 @@ fn candidates(full: &str, me: &str) -> Vec<String> {
 
 /// Checks a view with measures where it is made: `sql` is its SELECT as stored. Its shape is checked, and each join of its FROM
 /// must be onto a key of the table it joins.
+#[cfg(feature = "server")]
 pub async fn check(lake: &Lake, sql: &str) -> Result<()> {
     if !sql.contains(MARK) {
         return Ok(());
@@ -1083,16 +1090,17 @@ pub async fn check(lake: &Lake, sql: &str) -> Result<()> {
     let Some(d) = Definition::of(query)? else { return Ok(()) };
     shape(&d, query)?;
     let keys = join_keys(lake, query).await?;
-    joins_checked(&d, &|name: &ObjectName| keys.get(&write::object(name)).cloned())
+    joins_checked(&d, &|name: &ObjectName| keys.get(&text::object(name)).cloned())
 }
 
 /// The keys of each table a SELECT joins, by the name the query gives it.
+#[cfg(feature = "server")]
 async fn join_keys(lake: &Lake, query: &ast::Query) -> Result<HashMap<String, Vec<Vec<String>>>> {
     let mut keys = HashMap::new();
     let SetExpr::Select(select) = &*query.body else { return Ok(keys) };
     for join in select.from.iter().flat_map(|item| item.joins.iter()) {
         let TableFactor::Table { name, .. } = &join.relation else { continue };
-        let full = write::object(name);
+        let full = text::object(name);
         let (other, local) = ddl::resolve(lake, &full).await?;
         let owner: &Lake = other.as_deref().unwrap_or(lake);
         let mut found = Vec::new();
@@ -1127,7 +1135,7 @@ mod tests {
     /// Rewrites statements where `sales` is the only view with measures and the lake's functions are `routine`.
     fn rewritten_with(sql: &str, routine: &dyn Fn(&str) -> bool) -> Result<(bool, String)> {
         let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
-        let view = |name: &ObjectName| -> Option<Arc<Definition>> { (write::object(name) == "sales").then(sales) };
+        let view = |name: &ObjectName| -> Option<Arc<Definition>> { (text::object(name) == "sales").then(sales) };
         let changed = rewrite_with(&mut stmts, &view, routine)?;
         Ok((changed, stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("; ")))
     }
@@ -1314,7 +1322,7 @@ mod tests {
 
     #[test]
     fn a_view_joins_only_onto_keys() {
-        let by_id = |n: &ObjectName| (write::object(n) == "customers").then(|| vec![vec!["id".to_string()]]);
+        let by_id = |n: &ObjectName| (text::object(n) == "customers").then(|| vec![vec!["id".to_string()]]);
         joins_checked(&sales(), &by_id).expect("the join is onto the key");
 
         let on_name = "SELECT o.region AS region, sum(o.amount) AS MEASURE revenue FROM orders o LEFT JOIN customers c ON o.name = c.name";
