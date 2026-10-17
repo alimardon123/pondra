@@ -71,6 +71,8 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     rules.insert(0, Arc::new(Seconds)); // (before a literal is folded into a timestamp)
     #[cfg(feature = "server")] // (first: the filters and projections after it see the join it makes; a node's only, like frugal.rs)
     rules.insert(0, Arc::new(crate::frugal::WholePartition));
+    #[cfg(feature = "server")] // (before WholePartition: the window it makes is rewritten by it in the same pass)
+    rules.insert(0, Arc::new(crate::frugal::MiddleRows));
     rules.push(Arc::new(CheapFirst));
     rules.push(Arc::new(AsyncBelow)); // (last: after COUNT(DISTINCT) became a GROUP BY)
     rules

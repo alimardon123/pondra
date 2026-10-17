@@ -3533,6 +3533,21 @@ def scale():
         and q("SELECT count(*) AS n FROM big") == [{"n": 3000000}]
         and q("SELECT count(*) AS n FROM (SELECT rank() OVER (PARTITION BY k ORDER BY id) AS r FROM big) WHERE r = 1") == [{"n": 2000000}])
     print(json.dumps({"windows": {"seconds": window_times, "peak_mb": win_peak >> 20, "errors": window_errors, "want": [want_all, want_part], "got": [got_all, got_part], "refused": win_refused}}))
+    # A median holds every value of its group, which DataFusion's can't spill. In the frugal retry (`frugal.rs`,
+    # MiddleRows) a GROUP BY over medians is answered from a sort's middle rows: each group's values numbered in order,
+    # the one or two in the middle kept. Each id is four rows here (a CROSS JOIN of four VALUES): 12 M values in three
+    # groups, and each group's median is worked out from the sorted ids (the group's multiset holds each id four times).
+    median_want = {}
+    for g in range(3):
+        ids_g = range(g or 3, 3000001, 3)  # (ascending, each id once: the ids with id % 3 == g)
+        n = 4 * len(ids_g)
+        median_want[g] = (ids_g[(n // 2 - 1) // 4] + ids_g[(n // 2) // 4]) / 2
+    median_name = "median(id) over 12 M values in 3 groups"
+    got_median = answered(median_name, "SELECT id % 3 AS g, median(id) AS m FROM big CROSS JOIN (VALUES (1), (2), (3), (4)) v(n) GROUP BY id % 3 ORDER BY g")
+    checks[f"a median of 12M values in 3 groups past the memory limit answers on the frugal retry (a sort's middle rows): {window_times[median_name]} s"] = (
+        got_median is not None and [r["g"] for r in got_median] == [0, 1, 2]
+        and all(abs(r["m"] - median_want[r["g"]]) <= 1e-6 for r in got_median))
+    print(json.dumps({"medians": {"seconds": window_times[median_name], "errors": window_errors.get(median_name), "want": median_want, "got": got_median}}))
     # Two windows over long strings, each on a fresh node of its own, over one lake that a separate `pondra sql` process
     # loaded (an in-node load would put its own peak into the node's high-water mark). One partition of 9 M strings: the
     # window's rows wait for the partition's end, and the concatenation kept the strings they point into past it, so a
