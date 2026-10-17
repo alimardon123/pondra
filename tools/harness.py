@@ -66,6 +66,36 @@ def sql(port, q):
     return call(port, "POST", "/sql", q.encode())
 
 
+def files_settled(lake, folder, quiet=20, cap=150):
+    """Wait until a table's files stop changing, and say how many there are. A fresh bulk load's small files
+    are merged by the leader's first tiering rounds, and a merge forgets the decoded columns of the files it
+    replaces (`hot.forget`): warm reads before that would be lost to it."""
+    last, since, deadline = None, time.time(), time.time() + cap
+    while time.time() < deadline:
+        now = len(lake_objects(lake, folder))
+        if now != last:
+            last, since = now, time.time()
+        elif time.time() - since >= quiet:
+            return now
+        time.sleep(2)
+    raise AssertionError(f"{folder} still changing {cap} s after its node started")
+
+
+def resident_settled(pid, quiet=3, cap=60):
+    """Wait until a node's resident memory stops falling (within 2% for `quiet` seconds). The memory a cache
+    let go, and the decoding's own, goes back to the OS over about ten seconds (the allocator's decay): read
+    before then, the cache would look over-full and the next query would take all of it (`hot_under_line`)."""
+    last, still, deadline = None, 0, time.time() + cap
+    while time.time() < deadline:
+        now = int(open(f"/proc/{pid}/statm").read().split()[1])
+        still = still + 1 if last is not None and abs(now - last) * 50 <= last else 0
+        if still >= quiet:
+            return now
+        last = now
+        time.sleep(1)
+    raise AssertionError(f"node {pid}'s resident memory still falling {cap} s after its columns settled")
+
+
 def hot_settled(port):
     """Wait until the node's hot columns (hot.rs) stop loading: none being decoded and the bytes held
     the same twice running (a file's columns load in the background after its second read)."""
@@ -6854,6 +6884,67 @@ def across():
 
 # ---------------------------------------------------------------- round 26 (ADR-030)
 
+HOT_LINE_ROWS = 8_000_000  # the values array_agg holds in hot_under_line's query (calibrated on pondra-whole: see its docstring)
+HOT_LINE_FILES = 20  # the bulk INSERTs of hot_under_line's table: a file of its own each (about 32 MB decoded each)
+
+
+def hot_under_line():
+    """Under a memory line below three fifths of RAM, the decoded columns are let go before a query is stopped
+    (`oom.rs`, the one watch: past seven tenths of the line it gives the cache back, past the line it stops a query).
+    A node with PONDRA_MEMORY_MAX_GB=1 and a 2 GB cache holds a table's four BIGINT columns (twenty bulk INSERTs of a
+    million rows, a file each, about 32 MB decoded each), then a query that grows the node outside the query pool
+    (array_agg over HOT_LINE_ROWS values in three groups, as `scale`'s memory-line check) must answer with the model's
+    counts, stop nothing (`pondra_queries_stopped_for_memory_total` 0 or absent), and find the columns trimmed: fewer
+    bytes than before the query, but some left. Read with status-returning calls throughout. On a build before the
+    watch (PONDRA_BIN), the query is stopped (53200) and the check fails there.
+    Calibrated on pondra-whole (round 33's build) with 20 files: 8,000,000 rows, 640 MB held and the query stopped
+    (1,375 MB resident before it, 1,712 peak); with the same node and no cache (PONDRA_HOT_GB=0) it answers at a 629 MB
+    peak. Two waits make the cache read the same way on every run: the table's files stop changing (the leader's first
+    tiering rounds merge the small files, and a merge forgets their decoded columns, `hot.forget`), and resident memory
+    stops falling (the decoding's memory goes back to the OS over about ten seconds)."""
+    import re
+    lake = new_lake()
+    # The table is made by `pondra sql` in its own processes (as `scale` makes its tables), so the node starts with
+    # nothing decoded in memory: a node that made it through its own INSERTs kept the writes' memory, over the line.
+    for statement in ["CREATE TABLE hl (a BIGINT, b BIGINT, c BIGINT, d BIGINT)"] + [
+            f"INSERT INTO hl SELECT value + {i * 1000000}, value * 2, value % 1000, value + 7 FROM generate_series(1, 1000000)" for i in range(HOT_LINE_FILES)]:
+        subprocess.run([BIN, "sql", "--dir", lake, statement], check=True, capture_output=True, timeout=900)  # (a bulk INSERT is a file of its own)
+    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "2", "PONDRA_MEMORY_MAX_GB": "1"}).start()
+    q = lambda s: sql(A.port, s)
+    def answer(s):  # (status, SQLSTATE, body): the answer, or the refusal as the node sends it (`scale`'s `answer`)
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=600)
+        c.request("POST", "/sql", s.encode())
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode(errors="replace")
+    def resident_of(pid):  # resident memory, in bytes: statm counts pages of the size the OS says
+        return int(open(f"/proc/{pid}/statm").read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    hot_bytes = lambda: float(re.search(rb"\npondra_hot_bytes (\S+)", call(A.port, "GET", "/metrics")).group(1))
+    checks, seen = {}, {}
+    try:
+        seen["files once the leader's first tiering rounds are done"] = files_settled(lake, "data/hl/")
+        for run in range(2):  # (a file's columns load on its second read)
+            q(f"SELECT sum(a) AS a, sum(b) AS b, sum(c) AS c, sum(d) AS d FROM hl -- warm {run}")
+        hot_settled(A.port)
+        resident_settled(node.p.pid)  # (the decoding's memory goes back first: the cache is read in steady state)
+        held_before, rss_before = hot_bytes(), resident_of(node.p.pid)
+        n = HOT_LINE_ROWS
+        status, sqlstate, body = answer(f"SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, {n}) GROUP BY 1")
+        held_after = hot_bytes()
+        peak = vm_hwm(node.p.pid)
+        stopped = metrics_of(A.port).get("pondra_queries_stopped_for_memory_total", 0)
+        want = [{"g": 0, "n": n // 3}, {"g": 1, "n": (n + 2) // 3}, {"g": 2, "n": (n + 1) // 3}]
+        got = sorted(json.loads(body), key=lambda r: r["g"]) if status == 200 else None
+        seen["a memory line of 1 GB: the columns held, the query's answer, resident memory (MB)"] = {
+            "rows": n, "held before": held_before, "resident before": rss_before >> 20, "status": [status, sqlstate],
+            "answer == model": got == want, "held after": held_after, "peak resident": peak >> 20, "stopped": stopped}
+        checks["under a memory line below three fifths of RAM, the hot columns are let go before a query is stopped"] = (
+            held_before > 0 and status == 200 and got == want and stopped == 0 and 0 < held_after < held_before)
+    finally:
+        node.kill()
+        clean_up()
+    return checks, seen
+
+
 def hot():
     """Hot columns skip the batches a filter rules out by their ranges, and only those (round 32):
     a table whose rows came in time order, held in memory, asked for a range of its time, a top-N of
@@ -6977,6 +7068,10 @@ def hot():
     finally:
         cold.kill()
         clean_up()
+    # Under a memory line, the decoded columns are let go before a query is stopped (`oom.rs`): see hot_under_line.
+    line_checks, line_seen = hot_under_line()
+    checks.update(line_checks)
+    seen.update(line_seen)
     ok = all(checks.values())
     print(json.dumps({"hot": checks, "seen": seen, "ok": ok}, indent=1))
     if not ok:

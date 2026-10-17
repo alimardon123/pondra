@@ -26,9 +26,11 @@ pub async fn door<T>(f: impl Future<Output = T>) -> Result<T, String> {
 /// parked thread each way, which cost pgbench's four clients, whose statements take a millisecond
 /// or two, a sixth of their transactions. Dropped, as when its client goes, it stops the work.
 ///
-/// A `stoppable` request is one the node may stop for memory (`oom.rs`): then it answers [`crate::oom::OOM`]
-/// and its future is dropped, its memory let go. Wherever it runs, it can be stopped.
+/// A `stoppable` request is one the node may stop for memory (`oom.rs`), where the node has a line to
+/// stop it at: then it answers [`crate::oom::OOM`] and its future is dropped, its memory let go. Any other
+/// request is not wrapped, and runs where it came in or on the queries' runtime, as the others do.
 pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
+    use futures::future::{Aborted, Either};
     use std::sync::atomic::Ordering::Relaxed;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     struct Stop(u64, Option<tokio::task::AbortHandle>);
@@ -41,14 +43,20 @@ pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T>
         }
     }
     let id = NEXT.fetch_add(1, Relaxed);
-    let (f, stop_it) = futures::future::abortable(f);
+    let stoppable = stoppable && crate::oom::line().is_some(); // (nothing could stop it otherwise)
+    let (f, handle) = if stoppable {
+        let (f, handle) = futures::future::abortable(f);
+        (Either::Left(f), Some(handle))
+    } else {
+        (Either::Right(f.map(Ok::<T, Aborted>)), None)
+    };
     let long = {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         let long = running.first_key_value().is_some_and(|(_, r)| r.since.elapsed() >= LONG);
-        let stop = stoppable.then_some(stop_it);
-        running.insert(id, Running { since: Instant::now(), noted: crate::oom::seen(), stop, stopped: false });
+        running.insert(id, crate::oom::Running { since: Instant::now(), noted: crate::oom::seen(), stop: handle, stopped: false });
         long
     };
+    crate::oom::wake(); // (the watch looks now, once this request is in RUNNING: it may be one to stop)
     let mut stop = Stop(id, None);
     let out = if !long {
         door(f).await
@@ -64,29 +72,32 @@ pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T>
 }
 
 // The requests running through [`work`], by id (ids grow with time, so the first is the oldest).
-crate::per_node!(static RUNNING: std::sync::Mutex<std::collections::BTreeMap<u64, Running>> = Default::default());
+crate::per_node!(static RUNNING: std::sync::Mutex<std::collections::BTreeMap<u64, crate::oom::Running>> = Default::default());
 
-struct Running {
-    since: std::time::Instant,
-    /// The resident memory the watch read when it started (`oom::seen`).
-    noted: usize,
-    /// How to stop it, when it may be stopped.
-    stop: Option<futures::future::AbortHandle>,
-    stopped: bool,
+/// Is a request running through [`work`]: the watch has something to look at (`oom::start` waits on it).
+pub(crate) fn running() -> bool {
+    !RUNNING.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
+/// Gives each request that started while the watch waited (no reading: `oom::seen` was `usize::MAX`) the
+/// reading of the watch's look after it started, which the watch calls before any stop decision. The
+/// others keep theirs. Only the watch's loop calls it: a request's `noted` is one reading, never a file read.
+pub(crate) fn note(resident: usize) {
+    for r in RUNNING.lock().unwrap_or_else(|e| e.into_inner()).values_mut() {
+        if r.noted == usize::MAX {
+            r.noted = resident;
+        }
+    }
 }
 
 /// Stops the request the watch chose (`oom::pick`), if one qualifies: it is aborted, so its future is
 /// dropped and answers [`crate::oom::OOM`]. True if one was stopped.
 pub(crate) fn stop_one(now: std::time::Instant, margin: usize) -> bool {
     let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-    let asked: Vec<crate::oom::Running> = running
-        .iter()
-        .map(|(id, r)| crate::oom::Running { id: *id, since: r.since, noted: r.noted, stoppable: r.stop.is_some(), stopped: r.stopped })
-        .collect();
-    let Some(id) = crate::oom::pick(&asked, now, crate::oom::seen(), margin) else { return false };
+    let Some(id) = crate::oom::pick(&running, now, crate::oom::seen(), margin) else { return false };
     let Some(r) = running.get_mut(&id) else { return false };
     r.stopped = true;
-    if let Some(stop) = r.stop.clone() {
+    if let Some(stop) = &r.stop {
         stop.abort(); // (its next poll finds it aborted: the future is dropped there)
     }
     true
@@ -210,6 +221,23 @@ pub fn test_function(ctx: &datafusion::prelude::SessionContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // (a request that started while the watch waited has no reading: `note` gives it the watch's next one, and
+    // keeps the others'; the entries are this test's own, with no stop, so no other test can stop them)
+    #[test]
+    fn a_request_that_started_unread_takes_the_watchs_next_reading() {
+        let unread = crate::oom::Running { since: Instant::now(), noted: usize::MAX, stop: None, stopped: false };
+        let read = crate::oom::Running { since: Instant::now(), noted: 5, stop: None, stopped: false };
+        RUNNING.lock().unwrap().insert(u64::MAX - 1, unread);
+        RUNNING.lock().unwrap().insert(u64::MAX, read);
+        note(7 << 20);
+        {
+            let running = RUNNING.lock().unwrap();
+            assert_eq!(running.get(&(u64::MAX - 1)).expect("the unread one").noted, 7 << 20, "the unread one takes the reading");
+            assert_eq!(running.get(&u64::MAX).expect("the read one").noted, 5, "a read one keeps its own");
+        }
+        RUNNING.lock().unwrap().retain(|id, _| *id < u64::MAX - 1);
+    }
 
     // (one test, not two: the running requests are the process's, and a parallel test's stop would be
     // this one's to see)

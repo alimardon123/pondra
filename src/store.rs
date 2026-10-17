@@ -608,12 +608,26 @@ fn cgroup_memory() -> Option<usize> {
 /// This process's resident memory, if the OS says.
 pub fn resident() -> Option<usize> {
     let proc = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok());
-    proc.map(|pages| pages * 4096).or_else(|| {
+    proc.map(|pages| pages * page_size()).or_else(|| {
         use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
         let (pid, mut s) = (sysinfo::get_current_pid().ok()?, System::new());
         s.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), false, ProcessRefreshKind::nothing().with_memory());
         Some(s.process(pid)?.memory() as usize).filter(|&b| b > 0)
     })
+}
+
+/// The size of a page in bytes, which `/proc/self/statm` counts in: 4 KB, or 64 KB on some arm64 builds
+/// (where a count of pages read as 4 KB pages was 16 times too little). Asked each time: glibc answers
+/// from memory, and a static would be a node's state for nothing.
+fn page_size() -> usize {
+    #[cfg(unix)]
+    {
+        let bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if bytes > 0 {
+            return bytes as usize;
+        }
+    }
+    4096
 }
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
@@ -930,7 +944,7 @@ impl Lake {
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
         let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new((lru::LruCache::unbounded(), 0)), kept, disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
-        lake.hot.watch(); // the decoded columns give memory back when the node needs it
+        crate::oom::gives_back(&lake.hot); // (the decoded columns give memory back when the node needs it: the one watch takes them, `oom.rs`)
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             crate::panics::spawn(Lake::commits(Arc::downgrade(&lake), writes)); // (weak: a lake opened in a process goes when its last handle does)
@@ -2343,6 +2357,21 @@ pub fn partitions() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `resident` counts bytes: `/proc/self/statm` counts pages, and the page size is the OS's (64 KB on
+    /// some arm64 builds), so it agrees with `VmRSS` in kilobytes. (On 4 KB pages the old constant passed
+    /// too; it is the arm64 case this guards.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resident_is_in_bytes_as_the_page_size_says() {
+        let block = vec![1u8; 100 << 20]; // (written, so resident)
+        std::hint::black_box(&block);
+        let ours = resident().expect("resident memory");
+        let status = std::fs::read_to_string("/proc/self/status").expect("the process's status");
+        let kb: usize = status.lines().find_map(|l| l.strip_prefix("VmRSS:")?.trim().strip_suffix("kB")?.trim().parse().ok()).expect("VmRSS");
+        let theirs = kb << 10;
+        assert!(ours.abs_diff(theirs) * 4 <= theirs, "resident {ours} bytes, VmRSS {theirs} bytes");
+    }
 
     /// What a read never sees is quiet, and anything else in the same commit makes it loud
     /// (invariant 224): `harness.py remembered` asks around the audit log's line and a new lake's keys.
