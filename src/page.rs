@@ -6,6 +6,8 @@
 use crate::expander::Routine;
 use crate::ext_names::Attached;
 use crate::front::{Host, Own};
+use async_trait::async_trait;
+use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, SchemaProvider, TableProvider};
 use datafusion::arrow::ipc::reader::{FileReader, StreamReader};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchReader};
 use datafusion::arrow::{csv, json};
@@ -23,7 +25,7 @@ use futures::TryStreamExt;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 const TEXT: &str = "text/plain; charset=utf-8";
 const JSON: &str = "application/json";
@@ -116,44 +118,48 @@ impl Page {
         Ok(Answer::ok(crate::answer::content_type(format), crate::answer::render(&batches, format, |_| None)?))
     }
 
-    /// A statement read as a node reads it: the front, ASOF JOIN's marker, the files it names as tables (`given`),
-    /// then planned. The files' tables go once it is planned: the plan holds what it reads, so a file put again is
-    /// read afresh by the next statement, and requests at once share no table for longer than a plan takes.
+    /// A statement read as a node reads it: the front, ASOF JOIN's marker, then planned on the statement's own copy of
+    /// the page's session (`statement`), with the files it names given to that copy alone (`given`). Nothing a
+    /// statement registers reaches the page or another statement, so requests at once share no table and none is
+    /// taken away from one another.
     async fn plan(&self, text: &str) -> anyhow::Result<DataFrame> {
         let expanded = crate::front::expand(&PageHost(self), text, &HashMap::new()).await?;
         let expanded = crate::asof::as_of(&expanded)?.into_owned();
-        let given = self.given(&expanded).await?;
-        let planned = crate::engine::sql(&self.ctx, &expanded).await;
-        self.forget(given);
-        planned
+        let (ctx, overlay) = self.statement();
+        self.given(&overlay, &expanded).await?;
+        crate::engine::sql(&ctx, &expanded).await
     }
 
-    /// The files the statement names (the front wrote them as `ext:` names), each a table for this statement alone
-    /// (`plan` takes it back), read as a node reads it. Returns the names registered; if one is refused, the ones
-    /// before it are taken back.
-    async fn given(&self, sql: &str) -> anyhow::Result<Vec<String>> {
-        let mut registered = vec![];
+    /// A statement's session: a copy of the page's, whose default schema is an `Overlay` over the page's own, so the
+    /// files the statement names are its alone. The copy's state is the page's, cloned: its functions, settings and
+    /// object store come with it, so nothing is registered again.
+    fn statement(&self) -> (SessionContext, Arc<Overlay>) {
+        let mut state = self.ctx.state();
+        let (catalog, schema) = (state.config().options().catalog.default_catalog.clone(), state.config().options().catalog.default_schema.clone());
+        let page = self.ctx.catalog(&catalog).and_then(|c| c.schema(&schema)).expect("a page has its default schema");
+        let overlay = Arc::new(Overlay { page, own: Default::default() });
+        let default = MemoryCatalogProvider::new();
+        default.register_schema(&schema, overlay.clone()).expect("a new catalog takes its schema");
+        let catalogs = MemoryCatalogProviderList::new();
+        CatalogProviderList::register_catalog(&catalogs, catalog, Arc::new(default));
+        state.register_catalog_list(Arc::new(catalogs));
+        (SessionContext::new_with_state(state), overlay)
+    }
+
+    /// The files the statement names (the front wrote them as `ext:` names), each a table of the statement's own copy
+    /// (`overlay`), read as a node reads it. A file refused stops the statement, and its copy goes with it.
+    async fn given(&self, overlay: &Overlay, sql: &str) -> anyhow::Result<()> {
         for name in crate::ext_names::names(sql) {
             let Some(spec) = crate::ext_names::spec(&name) else { continue }; // (not a file's name: the planner answers 42P01 for it)
-            if let Err(e) = self.register(&name, &spec).await {
-                self.forget(registered);
-                return Err(e);
-            }
-            registered.push(name);
+            self.register(overlay, &name, &spec).await?;
         }
-        Ok(registered)
+        Ok(())
     }
 
-    /// Takes the files' tables a statement registered away again (`given`'s, once planned or refused).
-    fn forget(&self, names: Vec<String>) {
-        for name in names {
-            _ = self.ctx.deregister_table(TableReference::bare(name));
-        }
-    }
-
-    /// One file a statement names, as a table under its `ext:` name: refused unless a page reads it (its format, its
-    /// options, its URL) and a file of that path was given, and registered only once its columns are known.
-    async fn register(&self, name: &str, spec: &crate::ext_names::Spec) -> anyhow::Result<()> {
+    /// One file a statement names, as a table of its own copy under its `ext:` name: refused unless a page reads it
+    /// (its format, its options, its URL) and a file of that path was given, and given to the statement only once its
+    /// columns are known.
+    async fn register(&self, overlay: &Overlay, name: &str, spec: &crate::ext_names::Spec) -> anyhow::Result<()> {
         use crate::ext_names::CSV_OPTIONS;
         if !["parquet", "csv", "json", "arrow"].contains(&spec.format.as_str()) {
             return Err(crate::codes::coded("0A000", format!("a page reads Parquet, CSV, JSON and Arrow files given to it, not {} tables", spec.format)));
@@ -179,8 +185,7 @@ impl Page {
         let urls: Vec<_> = urls.into_iter().map(|(_, url)| url).collect();
         let options = ListingOptions::new(crate::ext_names::file_format(spec)?).with_file_extension("");
         let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).infer_schema(&state).await?;
-        self.ctx.deregister_table(TableReference::bare(name))?; // (as `put` does: a name is one table)
-        self.ctx.register_table(TableReference::bare(name), Arc::new(ListingTable::try_new(config)?))?;
+        overlay.own(name.to_string(), Arc::new(ListingTable::try_new(config)?)); // (a name is one table: the statement's own map)
         Ok(())
     }
 
@@ -231,6 +236,51 @@ impl Page {
         self.ctx.deregister_table(table.clone())?;
         self.ctx.register_table(table, Arc::new(MemTable::try_new(schema, vec![batches])?))?;
         Ok(Answer::ok(JSON, serde_json::to_vec(&serde_json::json!({"table": stem, "rows": rows}))?))
+    }
+}
+
+/// A statement's view of its page's default schema: the files the statement names (`own`), then the page's own tables.
+/// The page's tables are everyone's, and a statement's files are its own, so requests at once never see or take each
+/// other's. A table a statement makes or drops (`register_table`, `deregister_table`) is the page's, as a `PUT` makes it.
+#[derive(Debug)]
+struct Overlay {
+    page: Arc<dyn SchemaProvider>,
+    own: std::sync::RwLock<HashMap<String, Arc<dyn TableProvider>>>,
+}
+
+impl Overlay {
+    /// Adds a table for this statement alone.
+    fn own(&self, name: String, table: Arc<dyn TableProvider>) {
+        self.own.write().unwrap_or_else(PoisonError::into_inner).insert(name, table);
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for Overlay {
+    fn table_names(&self) -> Vec<String> {
+        let mut names: BTreeSet<String> = self.page.table_names().into_iter().collect();
+        names.extend(self.own.read().unwrap_or_else(PoisonError::into_inner).keys().cloned());
+        names.into_iter().collect()
+    }
+
+    async fn table(&self, name: &str) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
+        let own = self.own.read().unwrap_or_else(PoisonError::into_inner).get(name).cloned();
+        match own {
+            Some(table) => Ok(Some(table)),
+            None => self.page.table(name).await,
+        }
+    }
+
+    fn register_table(&self, name: String, table: Arc<dyn TableProvider>) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
+        self.page.register_table(name, table)
+    }
+
+    fn deregister_table(&self, name: &str) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
+        self.page.deregister_table(name)
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        self.own.read().unwrap_or_else(PoisonError::into_inner).contains_key(name) || self.page.table_exist(name)
     }
 }
 
@@ -463,6 +513,64 @@ mod tests {
         }
         let got = page.request("POST", "/sql?format=csv", "FROM 'orders.csv'".into()).await;
         assert_eq!(got.body, rendered(&page, "SELECT * FROM orders", Some("csv")).await);
+    }
+
+    /// Requests at once that name one file each read it as their own: none takes another's table of its name, so every
+    /// one answers the file's rows. (On one thread they never interleave, so the next test runs them on threads too.)
+    #[tokio::test]
+    async fn requests_at_once_naming_one_file_each_answer_its_rows() {
+        let page = page_with_tables().await;
+        let count = "SELECT count(*) AS n FROM 'orders.csv'";
+        let answers = futures::future::join_all((0..20).map(|_| page.request("POST", "/sql?format=csv", count.into()))).await;
+        for got in answers {
+            assert_eq!(got.status, 200, "{:?}", got.body);
+            assert_eq!(got.body, "n\n3\n");
+        }
+    }
+
+    /// The same, each on a thread of its own: requests run truly at once, so one statement can take a file away between
+    /// another's registering it and planning. (On one thread they never interleave, as above: nothing yields.) Each
+    /// request is blocked on by its own thread, since a page's request future is not `Send` (`put` holds a reader).
+    #[test]
+    fn requests_on_threads_naming_one_file_each_answer_its_rows() {
+        let page = futures::executor::block_on(page_with_tables());
+        for _ in 0..50 {
+            std::thread::scope(|s| {
+                let asks: Vec<_> = (0..20)
+                    .map(|_| s.spawn(|| futures::executor::block_on(page.request("POST", "/sql?format=csv", "SELECT count(*) AS n FROM 'orders.csv'".into()))))
+                    .collect();
+                for ask in asks {
+                    let got = ask.join().unwrap();
+                    assert_eq!(got.status, 200, "{:?}", got.body);
+                    assert_eq!(got.body, "n\n3\n");
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn a_statement_that_names_a_file_leaves_no_table_behind() {
+        let page = page_with_tables().await;
+        assert_eq!(page.request("POST", "/sql?format=csv", "SELECT count(*) AS n FROM 'orders.csv'".into()).await.body, "n\n3\n");
+        assert_eq!(page.request("GET", "/tables", bytes::Bytes::new()).await.body, r#"["names","orders"]"#);
+    }
+
+    /// A table a statement makes is the page's: a later request reads it, and `GET /tables` lists it until a statement
+    /// drops it. (A page's door refuses DDL (`read_only`), which the front's own `CREATE TABLE` will change in a later
+    /// step, so this runs the statement the way `rendered` does: its front, its file given, then its own session.)
+    #[tokio::test]
+    async fn a_table_a_statement_makes_is_the_pages() {
+        let page = page_with_tables().await;
+        let made = "CREATE TABLE t AS SELECT * FROM 'orders.csv'";
+        let expanded = crate::front::expand(&PageHost(&page), made, &HashMap::new()).await.unwrap();
+        let (ctx, overlay) = page.statement();
+        page.given(&overlay, &expanded).await.unwrap();
+        ctx.sql(&expanded).await.unwrap().collect().await.unwrap();
+        assert_eq!(page.request("POST", "/sql?format=csv", "SELECT count(*) AS n FROM t".into()).await.body, "n\n3\n");
+        assert_eq!(page.request("GET", "/tables", bytes::Bytes::new()).await.body, r#"["names","orders","t"]"#);
+        let (ctx, _) = page.statement();
+        ctx.sql("DROP TABLE t").await.unwrap().collect().await.unwrap();
+        assert_eq!(page.request("GET", "/tables", bytes::Bytes::new()).await.body, r#"["names","orders"]"#);
     }
 
     #[tokio::test]
