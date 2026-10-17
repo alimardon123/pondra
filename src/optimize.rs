@@ -1,7 +1,7 @@
 //! Planning rules Pondra adds to DataFusion's, and the engine settings it starts from.
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{i256, DataType};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DFSchema, NullEquality, Result};
+use datafusion::common::{Column, DFSchema, NullEquality, Result, ScalarValue};
 use datafusion::logical_expr::utils::{can_hash, conjunction, disjunction, find_valid_equijoin_key_pair, split_binary, split_conjunction};
 use datafusion::logical_expr::{ExprSchemable, build_join_schema, Aggregate, Expr, Filter, Join, JoinConstraint, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, Projection, SubqueryAlias};
 use datafusion::optimizer::{analyzer::{Analyzer, AnalyzerRule}, optimizer::ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
@@ -79,6 +79,7 @@ pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     let mut rules = Analyzer::new().rules;
     let at = rules.iter().position(|r| r.name() == "type_coercion").unwrap_or(0);
     rules.insert(at, Arc::new(FloatsWin));
+    rules.insert(at, Arc::new(WholeLiterals)); // (first: FloatsWin and type coercion see whole decimals)
     rules.push(Arc::new(crate::casts::Rounds)); // (after type coercion: the casts it adds round too)
     rules.push(Arc::new(Runnable)); // (after type coercion: a function's simplifier reads its arguments' types)
     rules
@@ -124,6 +125,78 @@ impl AnalyzerRule for Runnable {
         })
         .data()
     }
+}
+
+/// A number with an exponent is a whole decimal: `1e15` is typed `Decimal128(1, -15)`, a negative
+/// scale. Arrow casts a decimal to a float by dividing by `10^scale`, and `10^-15` isn't exact, so
+/// `CAST(1e15 AS DOUBLE)` was `9.999999999999999e14`; Parquet has no negative scale, so a table made
+/// from `1e15` couldn't be written. Postgres reads `1e15` as the numeric `1000000000000000`, so here
+/// it is that number at scale 0 (as a decimal of 38 digits or fewer, of 76, and past that a float
+/// read from its text). Done first, so FloatsWin and type coercion see whole decimals.
+#[derive(Debug)]
+struct WholeLiterals;
+
+impl AnalyzerRule for WholeLiterals {
+    fn name(&self) -> &str {
+        "pondra_whole_literals"
+    }
+
+    fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> Result<LogicalPlan> {
+        plan.transform_up_with_subqueries(|plan| {
+            let mut has = false;
+            plan.apply_expressions(|e| {
+                has = e.exists(|e| Ok(matches!(e, Expr::Literal(v, _) if whole(v).is_some())))?;
+                Ok(if has { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
+            })?;
+            if !has {
+                return Ok(Transformed::no(plan)); // (nearly every step: no number with an exponent in it)
+            }
+            let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan); // (a column keeps the name its expression gave it)
+            let t = plan.map_expressions(|e| {
+                let name = names.save(&e);
+                Ok(e.transform_up(|e| match e {
+                    Expr::Literal(v, m) => Ok(match whole(&v) {
+                        Some(w) => Transformed::yes(Expr::Literal(w, m)),
+                        None => Transformed::no(Expr::Literal(v, m)),
+                    }),
+                    e => Ok(Transformed::no(e)),
+                })?
+                .update_data(|e| name.restore(e)))
+            })?;
+            if t.transformed { t.map_data(|p| p.recompute_schema()) } else { Ok(t) } // (a node above reads the types its columns have now)
+        })
+        .data()
+    }
+}
+
+/// The whole number a decimal literal with a negative scale stands for, at scale 0 (a NULL of that
+/// type too). `None` for any other literal, and for a float's text that won't parse: those stay as
+/// they were.
+fn whole(v: &ScalarValue) -> Option<ScalarValue> {
+    let (digits, k) = match v {
+        ScalarValue::Decimal128(_, p, s) | ScalarValue::Decimal256(_, p, s) if *s < 0 => (u32::from(*p), u32::from(s.unsigned_abs())),
+        _ => return None,
+    };
+    let precision = digits + k;
+    let big = match v {
+        ScalarValue::Decimal128(x, _, _) => x.map(i256::from_i128),
+        ScalarValue::Decimal256(x, _, _) => *x,
+        _ => return None,
+    };
+    if precision > 76 {
+        // (no decimal holds it: the float its text is, which the parser rounds correctly)
+        let f = match big {
+            Some(x) => Some(format!("{x}e{k}").parse::<f64>().ok()?),
+            None => None,
+        };
+        return Some(ScalarValue::Float64(f));
+    }
+    let scaled = big.and_then(|x| x.checked_mul(i256::from_i128(10).checked_pow(k)?));
+    Some(if precision <= 38 {
+        ScalarValue::Decimal128(scaled.and_then(|x| x.to_i128()), precision as u8, 0)
+    } else {
+        ScalarValue::Decimal256(scaled, precision as u8, 0)
+    })
 }
 
 /// A DOUBLE (or REAL) that meets a DECIMAL makes both DOUBLEs, as Postgres and DuckDB do: `price >
@@ -2213,5 +2286,47 @@ mod tests {
         assert!(!equal.said(&keys[0].0, &keys[0].1, &schema) && !equal.said(&keys[1].0, &keys[1].1, &schema));
         assert!(equal.said(&c("n", "n_nationkey"), &c("c", "c_nationkey"), &schema));
         assert!(!equal.said(&keys[2].0, &keys[2].1, &schema) && !equal.said(&keys[2].0, &keys[2].1, &schema));
+    }
+
+    /// A session the way Pondra makes one for a query (`literals.rs`'s), with this file's rules.
+    fn session() -> datafusion::prelude::SessionContext {
+        use datafusion::execution::SessionStateBuilder;
+        let state = SessionStateBuilder::new()
+            .with_config(config(SessionConfig::new()))
+            .with_default_features()
+            .with_analyzer_rules(analyzer_rules())
+            .with_optimizer_rules(rules())
+            .build();
+        datafusion::prelude::SessionContext::new_with_state(state)
+    }
+
+    /// The first cell of a query's first row, as text (the type's own display).
+    async fn first(ctx: &datafusion::prelude::SessionContext, sql: &str) -> String {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        datafusion::arrow::util::display::array_value_to_string(batches[0].column(0), 0).unwrap()
+    }
+
+    /// A number with an exponent is a whole decimal (`WholeLiterals`): a cast of `1e15` to a float is
+    /// the float it was written as, its type is a decimal at scale 0 (a `Decimal256` past 38 digits, a
+    /// float past 76), and exact decimals beside it keep their types.
+    #[tokio::test]
+    async fn exponents_are_whole_decimals() {
+        use datafusion::arrow::array::{Array, Float64Array};
+        let ctx = session();
+        for (sql, want) in [("SELECT CAST(1e15 AS DOUBLE)", 1e15), ("SELECT CAST(1e22 AS DOUBLE)", 1e22)] {
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            let got = batches[0].column(0).as_any().downcast_ref::<Float64Array>().unwrap().value(0);
+            assert_eq!(got, want, "{sql}");
+        }
+        for (sql, want) in [
+            ("SELECT arrow_typeof(1e15)", "Decimal128(16, 0)"),
+            ("SELECT arrow_typeof(1e40)", "Decimal256(41, 0)"),
+            ("SELECT arrow_typeof(1e100)", "Float64"),
+            ("SELECT arrow_typeof(1.5)", "Decimal128(2, 1)"),
+            ("SELECT 1e15 + 1", "1000000000000001"),
+            ("SELECT 2.5e3", "2500"),
+        ] {
+            assert_eq!(first(&ctx, sql).await, want, "{sql}");
+        }
     }
 }

@@ -7365,6 +7365,15 @@ def found():
         [{"di": -3, "fi": 4}, {"di": 2, "fi": -2}, {"di": 3, "fi": 2}, {"di": 100, "fi": -4}],
         [{"i": 3, "b": 2}, {"i": 3, "b": 5}, {"i": 7, "b": 8}],
         [{"a": 3, "b": -3}]]
+    # A number with an exponent is a whole decimal (`optimize::WholeLiterals`): CAST(1e15 AS DOUBLE) is 1e15, and a table made from
+    # 1e15 is written to files (Parquet has no negative scale). The table's files are listed by the catalog, after a CHECKPOINT.
+    q("CREATE TABLE exps AS SELECT 1e15 AS x, 6.02e23 AS n")
+    q("CHECKPOINT")
+    listed = subprocess.run([BIN, "catalog", "--dir", lake, "t/"], capture_output=True, text=True).stdout
+    exps_files = next((json.loads(l.split(" ", 1)[1])["files"] for l in listed.splitlines() if l.startswith("t/exps ")), [])
+    seen["exps"] = [len(exps_files), q("SELECT CAST(1e15 AS DOUBLE) AS a, 1e15::double AS b, x, n, CAST(n AS DOUBLE) AS c FROM exps")]
+    checks["a number with an exponent is a whole decimal: CAST(1e15 AS DOUBLE) is 1e15, and a table made from 1e15 is written to files"] = (
+        seen["exps"][0] > 0 and seen["exps"][1] == [{"a": 1e15, "b": 1e15, "x": 1000000000000000, "n": 602000000000000000000000, "c": 6.02e23}])
     node.kill(); locked.kill()
     ok = all(checks.values())
     print(json.dumps({"found": checks, "ok": ok}, indent=1))
