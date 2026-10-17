@@ -44,7 +44,7 @@ pub fn asked(sql: &str) -> bool { POSTGRES.try_with(|_| ()).is_ok() && wanted(sq
 pub async fn answer(lake: &Lake, sql: &str, user: &str) -> Result<Vec<RecordBatch>> {
     let ctx = crate::query::session(lake, sql, "").await?;
     register(&ctx, lake, user, sql).await?;
-    match async { anyhow::Ok(crate::query::sql(&ctx, sql).await?.collect().await?) }.await {
+    match async { crate::engine::collect(crate::query::sql(&ctx, sql).await?).await }.await { // (no rows: its columns as they run)
         Ok(batches) => Ok(batches),
         Err(e) => match empty_answer(sql) {
             Some(names) => Ok(vec![RecordBatch::new_empty(Arc::new(Schema::new(names.into_iter().map(|n| Field::new(n, DataType::Utf8, true)).collect::<Vec<_>>())))]),

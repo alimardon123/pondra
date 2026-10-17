@@ -1407,8 +1407,8 @@ fn with_keys(q: &Query, cols: &[String]) -> Query {
 async fn run_at(lake: &Lake, text: &str, at: u64) -> Result<(Schema, Vec<RecordBatch>)> {
     let ctx = crate::query::session_at(lake, text, "", Some(at)).await?;
     let df = crate::query::sql(&ctx, &crate::asof::as_of(text)?).await?;
-    let schema = df.schema().as_arrow().clone();
-    Ok((schema, df.collect().await?))
+    let rows = crate::engine::collect(df).await?; // (never empty: an answer with no rows keeps its columns as they run)
+    Ok((rows[0].schema().as_ref().clone(), rows))
 }
 
 /// A run's rows without its last `n` columns (the appended keys), and those rows' keys as text (a temporary `_row_id` is
