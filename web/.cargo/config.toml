@@ -1,0 +1,6 @@
+# A plain `cargo build` here builds the module for a page.
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"'] # (getrandom 0.3 and 0.4 read the browser's crypto only with this)

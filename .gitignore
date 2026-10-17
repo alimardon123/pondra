@@ -1,5 +1,7 @@
 /target
 /dist
+/web/target
+/web/pkg
 __pycache__/
 *.pyc
 *.stderr
