@@ -5,7 +5,10 @@
 # passed). A runner's job lasts 6 hours at most, so a longer soak is legs (soak-leg.yml), one after
 # another on one lake in the bucket: the lake lives the whole day, each node process a leg at most.
 # A day's legs stop and kill nodes, but its last, which stops none: a node process then lives 4.8
-# hours, and its memory is measured over them.
+# hours, and its memory is measured over them. binary heap builds the commit with jemalloc's heap
+# profiling and stops no node in any leg: each node writes its heap every few GB it allocates, and
+# tools/heap_report.py diffs a node's early heap against its last, by call stack (soak-heap/ in the
+# leg's artifact, its top in the job's log).
 #
 # storage r2 puts the lake in the bucket of cluster-bench.yml's secrets (R2_*). Mind the free tier:
 # each commit is about one object write (durable acknowledgements), so rate / batch commits a second
@@ -36,7 +39,7 @@ on:
         description: "local (the runner's disk) or r2 (the bucket)"
         default: "local"
       binary:
-        description: "ci (the build workflow's, for this commit: what ships) or build (from source)"
+        description: "ci (the build workflow's, for this commit: what ships), build (from source), or heap (from source with jemalloc's heap profiling: no node stopped, each one's heap diffed over the leg)"
         default: "ci"
   pull_request:
     types: [labeled]
@@ -64,6 +67,8 @@ jobs:
           day = {"legs": "5", "hours": "4.8", "rate": "500", "batch": "200", "nodes": "3", "storage": "r2", "binary": "ci"}
           p = {**(day if os.environ["LABELLED"] == "true" else json.loads(os.environ["INPUTS"])), "sha": os.environ["SHA"]}
           p["legs"] = str(max(1, min(5, int(p.get("legs") or 1))))
+          if p["binary"] not in ("ci", "build", "heap"):
+              raise SystemExit(f"::error::binary is ci, build or heap, not {p['binary']!r}")
           if p["legs"] != "1" and p["storage"] != "r2":
               raise SystemExit("::error::legs need storage r2: a runner's disk goes with its job")
           print(f"plan={json.dumps(p)}\nlegs={p['legs']}")
