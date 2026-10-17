@@ -811,22 +811,204 @@ tokio::task_local! {
     pub static HELD: std::cell::RefCell<Option<MemoryReservation>>;
 }
 
+tokio::task_local! {
+    /// The pieces the one query a door sends may hand its answer to the door in (`server::sql`): once an
+    /// answer reaches `stream_bytes()`, it goes to the door as its plan makes it (`collect_or_send`).
+    pub static PIECES: Arc<Pieces>;
+}
+
+/// A request's way to hand its door an answer in pieces (`server::sql`).
+pub struct Pieces {
+    /// Some(format) while a query may send its answer this way (`arm`).
+    armed: std::sync::Mutex<Option<Option<String>>>,
+    /// The door's end, taken by the one answer handed over.
+    hand: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Handed>>>,
+    /// The rows sent, once an answer was handed over: 0 at once, then the count at its end.
+    sent: tokio::sync::watch::Sender<Option<u64>>,
+}
+
+impl Pieces {
+    pub fn new(hand: tokio::sync::oneshot::Sender<Handed>) -> Arc<Pieces> {
+        Arc::new(Pieces { armed: Default::default(), hand: std::sync::Mutex::new(Some(hand)), sent: tokio::sync::watch::channel(None).0 })
+    }
+}
+
+/// An answer handed to its door: its first piece's bytes, the rest as they are written, and whether its last
+/// was written (a channel that closes before it is an answer cut short: the body must fail then, never end as
+/// if whole).
+pub struct Handed {
+    pub first: Vec<u8>,
+    pub rest: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
+    pub ended: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Lets the query a request runs send its answer in pieces, until it is dropped (`arm`).
+pub struct Armed;
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        let _ = PIECES.try_with(|p| *p.armed.lock().unwrap_or_else(|e| e.into_inner()) = None);
+    }
+}
+
+/// Lets the query a door runs send its answer in `format`'s pieces (`collect_or_send`); nothing outside `PIECES`.
+pub fn arm(format: Option<&str>) -> Armed {
+    let _ = PIECES.try_with(|p| *p.armed.lock().unwrap_or_else(|e| e.into_inner()) = Some(format.map(str::to_string)));
+    Armed
+}
+
+/// The rows of the request's answer once it was handed to its door (`Some(0)` at once, then the count at its
+/// end); None before, and outside `PIECES`.
+pub fn handed() -> Option<u64> { PIECES.try_with(|p| *p.sent.borrow()).ok().flatten() }
+
+/// Waits until the request's answer is handed to its door: for ever outside `PIECES`, or if it never is.
+pub async fn when_handed() {
+    let Ok(mut sent) = PIECES.try_with(|p| p.sent.subscribe()) else { return std::future::pending().await };
+    let reached = sent.wait_for(|s| s.is_some()).await.is_ok();
+    if !reached {
+        std::future::pending::<()>().await
+    }
+}
+
+/// The size from which a query's answer goes to its door in pieces (`PONDRA_STREAM_MB`, 8 MB of Arrow), read
+/// once. 0 sends every answer in pieces (the tests compare the two ways).
+pub fn stream_bytes() -> usize {
+    static MB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| crate::env::or("PONDRA_STREAM_MB", 8));
+    *MB << 20
+}
+
 /// An answer's batches, collected from a plan's partitions. They are counted in the query memory
 /// (DataFusion counts the operators', not what they hand back), so an answer bigger than the memory
 /// stops with 53200 instead of taking the node down.
 pub async fn collect(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>) -> Result<Vec<RecordBatch>> {
+    gather(plan, task, None).await
+}
+
+/// `collect`, for the query a door sends (`App::run_query`): once `arm`ed, its answer goes to the door in pieces
+/// past `stream_bytes()` (`send_rest`), and no batches come back here (`handed` says how many rows went).
+pub async fn collect_or_send(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>) -> Result<Vec<RecordBatch>> {
+    let format = PIECES.try_with(|p| p.armed.lock().unwrap_or_else(|e| e.into_inner()).clone()).ok().flatten();
+    gather(plan, task, format).await
+}
+
+/// `collect`'s loop. `send`: the answer may go to its door in pieces of this format (`collect_or_send`).
+async fn gather(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>, send: Option<Option<String>>) -> Result<Vec<RecordBatch>> {
     let held = MemoryConsumer::new("an answer").register(task.memory_pool());
     let mut counted = RecordBatchMemoryCounter::new(); // (each buffer once: batches cut from one batch or page share theirs)
     let mut stream = datafusion::physical_plan::execute_stream(plan, task)?;
     let mut out = vec![];
     while let Some(batch) = stream.try_next().await? {
+        // (compacted before it is counted when it may be handed over: the hand-off measures what `big` measures, so
+        // a small answer whose strings were other rows' is not sent in pieces, nor left out of `Results`)
+        let batch = if send.is_some() { compact(batch) } else { batch };
         if held.try_grow(counted.count_batch(&batch)).is_err() {
-            return Err(crate::codes::coded("53200", format!("the answer is bigger than this node's memory for queries ({} MB): ask for fewer rows (a LIMIT or a filter), or write them out with COPY (…) TO a file or folder", memory_limit() >> 20)));
+            return Err(too_big());
         }
         out.push(batch);
+        if let Some(format) = &send {
+            if held.size() >= stream_bytes() && may_hand() {
+                return send_rest(out, stream, held, format.as_deref()).await;
+            }
+        }
     }
     keep_held(held);
     Ok(out)
+}
+
+/// The refusal of an answer bigger than the query memory (53200), with the way out.
+fn too_big() -> anyhow::Error {
+    crate::codes::coded("53200", format!("the answer is bigger than this node's memory for queries ({} MB): ask for fewer rows (a LIMIT or a filter), or write them out with COPY (…) TO a file or folder", memory_limit() >> 20))
+}
+
+/// The refusal of a client that went before the answer's end (57014).
+fn gone() -> anyhow::Error { crate::codes::coded("57014", "the client went before the answer's end") }
+
+/// Whether the request's door can still take an answer in pieces: its one `hand` is not given away yet.
+fn may_hand() -> bool { PIECES.try_with(|p| p.hand.lock().unwrap_or_else(|e| e.into_inner()).is_some()).unwrap_or(false) }
+
+fn take_hand() -> Option<tokio::sync::oneshot::Sender<Handed>> {
+    PIECES.try_with(|p| p.hand.lock().unwrap_or_else(|e| e.into_inner()).take()).ok().flatten()
+}
+
+fn set_sent(rows: Option<u64>) {
+    let _ = PIECES.try_with(|p| p.sent.send_replace(rows));
+}
+
+/// Sends an answer in pieces as its plan makes them: the batches so far, then the rest, each written as `format`
+/// writes it (`answer::Encoding`). The first piece is written before the door is handed anything, so a format that
+/// can't write these columns is refused as `render` refuses it. Then the door's body takes each piece as its client
+/// reads it (two at a time), and each batch is counted only while it is written.
+async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan::SendableRecordBatchStream, mut held: MemoryReservation, format: Option<&str>) -> Result<Vec<RecordBatch>> {
+    let mut enc = crate::answer::Encoding::new(format);
+    let mut prefix: std::collections::VecDeque<RecordBatch> = out.into_iter().map(compact).flat_map(|b| crate::answer::piece_rows(&b)).collect();
+    let (mut rows, mut first) = (0u64, vec![]);
+    if let Some(piece) = prefix.pop_front() {
+        first = enc.step(Some(&piece))?;
+        rows = piece.num_rows() as u64;
+    }
+    let Some(hand) = take_hand() else { bail!("an answer in pieces has no door") };
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if hand.send(Handed { first, rest: rx, ended: ended.clone() }).is_err() {
+        return Err(gone());
+    }
+    set_sent(Some(0));
+    match pour(&mut enc, &tx, prefix, &mut stream, &mut held).await {
+        Ok(more) => {
+            ended.store(true, std::sync::atomic::Ordering::Release); // (set before the channel closes: the body ends whole only then)
+            drop(tx);
+            set_sent(Some(rows + more));
+            Ok(vec![])
+        }
+        Err(e) => {
+            let _ = tx.try_send(Err(std::io::Error::other(format!("{e:#}")))); // (if the channel is full, its close says the answer was cut short)
+            Err(e)
+        }
+    }
+}
+
+/// The pieces after the first: the prefix's, then each batch of the stream's, counted while it is written; then the
+/// end. Returns the rows written.
+async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>, prefix: std::collections::VecDeque<RecordBatch>, stream: &mut datafusion::physical_plan::SendableRecordBatchStream, held: &mut MemoryReservation) -> Result<u64> {
+    let mut rows = 0u64;
+    for piece in prefix {
+        rows += piece.num_rows() as u64;
+        step_to(enc, tx, Some(&piece)).await?;
+    }
+    held.free(); // (the prefix's batches are written: their memory goes)
+    loop {
+        let next = tokio::select! {
+            next = stream.try_next() => next?,
+            () = tx.closed() => return Err(gone()), // (the client went: the plan is let go now, not at its next send)
+        };
+        let Some(batch) = next else { break };
+        let batch = compact(batch);
+        let size = batch.get_array_memory_size();
+        held.try_grow(size).map_err(|_| too_big())?;
+        for piece in crate::answer::piece_rows(&batch) {
+            rows += piece.num_rows() as u64;
+            step_to(enc, tx, Some(&piece)).await?;
+        }
+        held.shrink(size);
+    }
+    step_to(enc, tx, None).await?; // (the end)
+    Ok(rows)
+}
+
+/// Writes one step of the answer (a piece, or None: what closes it) to the body.
+async fn step_to(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>, piece: Option<&RecordBatch>) -> Result<()> {
+    let bytes = enc.step(piece)?;
+    give(tx, Ok(bytes::Bytes::from(bytes))).await
+}
+
+/// Gives the body one piece, or says why it can't: its client went, or took no piece for a minute (a client that
+/// stops reading would hold the query's turn and its memory for ever).
+async fn give(tx: &tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>, piece: std::io::Result<bytes::Bytes>) -> Result<()> {
+    match tokio::time::timeout(std::time::Duration::from_secs(60), tx.send(piece)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(gone()),
+        Err(_) => Err(crate::codes::coded("57014", "the client took no piece of the answer for a minute")),
+    }
 }
 
 /// Keeps an answer's memory counted in the request's scope (`HELD`); a door with no scope of its own
@@ -1049,7 +1231,7 @@ pub fn frugal(ctx: &SessionContext) {
 /// `COPY … TO` files (`copy::copy_to`).
 pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(work: impl Fn(bool) -> F) -> Result<T> {
     match work(false).await {
-        Err(e) if exhausted(&e) => work(true).await,
+        Err(e) if exhausted(&e) && handed().is_none() => work(true).await, // (an answer half sent is never run again: its client has the first rows)
         r => r,
     }
 }

@@ -18498,7 +18498,10 @@ def answers_big():
     with 53200 and the node answers after. Queries take one of PONDRA_QUERIES' turns: with two turns
     and a second's queue, four slow queries at once answer two at once and refuse the rest with
     53300 (or answer after), and a query run inside a query (PIVOT asks the data) takes no turn of its
-    own, so one turn does for it."""
+    own, so one turn does for it. Past the node's memory an answer streams from its plan as the plan
+    makes it (`query::collect_or_send`): a 9M-row CSV over the 0.25 GB node is read a piece at a time, a
+    text table (never in pieces) of 60M rows is still refused, an answer that is cut short fails its body
+    rather than ending whole, and an identical query doesn't wait for another client's reading."""
     import pyarrow.compute as pc, pyarrow.csv as pacsv, pyarrow.ipc as paipc
     checks = {}
     # 1. The bytes of a streamed answer are the whole answer's.
@@ -18565,8 +18568,9 @@ def answers_big():
             t.num_rows == rows and pc.sum(t.column("a")).as_py() == rows * (rows + 1) // 2 and pc.sum(t.column("b")).as_py() == rows * (rows + 1)
             and back.num_rows == rows and pc.sum(back.column("a")).as_py() == rows * (rows + 1) // 2 and pc.sum(back.column("b")).as_py() == rows * (rows + 1))
         del csv_body, t, arrow
-        status, _, code, text = raw_sql(A.port + 2, "SELECT b1.a, b2.a FROM big b1 CROSS JOIN (SELECT a FROM big LIMIT 20) b2")
-        checks[f"a 60M-row answer over 0.25 GB: refused with 53200 ({code}) by name: {'the answer is bigger than this node' in text.decode(errors='replace')}"] = status != 200 and code == "53200"
+        # (as a text table: a table is never sent in pieces, so it counts in the query memory whole)
+        status, _, code, text = raw_sql(A.port + 2, "SELECT b1.a, b2.a FROM big b1 CROSS JOIN (SELECT a FROM big LIMIT 20) b2", fmt="table")
+        checks[f"a 60M-row answer as a text table (never in pieces) over 0.25 GB: refused with 53200 ({code}) by name: {'the answer is bigger than this node' in text.decode(errors='replace')}"] = status != 200 and code == "53200"
         checks["…and the node answers after: SELECT 1 is 1"] = json.loads(raw_sql(A.port + 2, "SELECT 1 AS one")[3]) == [{"one": 1}]
     finally:
         node.kill()
@@ -18577,6 +18581,76 @@ def answers_big():
         peak_whole = vm_hwm(node.p.pid)
         del body
         checks[f"…in pieces its peak ({peak_json >> 20} MB) is at least half its JSON ({json_size >> 20} MB) under the same answer's rendered whole ({peak_whole >> 20} MB)"] = status == 200 and peak_json + json_size // 2 < peak_whole
+    finally:
+        node.kill()
+
+    # 2b. Past the node's memory, an answer goes from its plan as the plan makes it: 9M rows of CSV over the same 0.25 GB
+    # node, read a piece at a time (each line counted and its first column summed as it comes, never the body whole).
+    node = Node(lake, A.port + 5, memory_gb=0.25).start()
+    try:
+        streamed_rows = rows * 3
+        conn = http_client.HTTPConnection("127.0.0.1", A.port + 5, timeout=900)
+        conn.request("POST", "/sql?format=csv", "SELECT b1.*, b2.a AS a2 FROM big b1 CROSS JOIN (SELECT a FROM big LIMIT 3) b2".encode())
+        resp = conn.getresponse()
+        lines_read, total, pending, header = 0, 0, b"", True
+        while piece := resp.read(1 << 20):
+            complete, _, pending = (pending + piece).rpartition(b"\n")
+            for line in (complete.split(b"\n") if complete else []):
+                if header:
+                    header = False
+                    continue
+                lines_read += 1
+                total += int(line.split(b",", 1)[0])
+        conn.close()
+        peak_csv = vm_hwm(node.p.pid)
+        checks[f"a {streamed_rows:,}-row answer (about {streamed_rows * 46 >> 20} MB as Arrow, past the node's 256 MB for queries) goes as CSV from its plan: {resp.status}, every row ({lines_read:,}), sum of a right, at a peak of {peak_csv >> 20} MB, under the 3M-row answer rendered whole ({peak_whole >> 20} MB)"] = (
+            resp.status == 200 and not pending and lines_read == streamed_rows and total == 3 * (rows * (rows + 1) // 2) and peak_csv < peak_whole)
+    finally:
+        node.kill()
+
+    # 2c. A cut answer is never a whole one: a CAST that fails at row 2,999,999 of 3M, with every answer in pieces (0).
+    node = Node(lake, A.port + 6, env={"PONDRA_STREAM_MB": "0"}).start()
+    try:
+        conn = http_client.HTTPConnection("127.0.0.1", A.port + 6, timeout=900)
+        conn.request("POST", "/sql", "SELECT CAST(CASE WHEN a = 2999999 THEN 'x' ELSE CAST(a AS VARCHAR) END AS BIGINT) AS v FROM big".encode())
+        resp = conn.getresponse()
+        try:
+            body = resp.read()
+            outcome = f"{resp.status}, read whole ({len(body)} bytes, ends with ']': {body.rstrip().endswith(b']')})"
+            cut = resp.status != 200 or not body.rstrip().endswith(b"]")
+        except Exception as e:  # (a chunked body that ends without its last chunk: IncompleteRead, a reset)
+            outcome = f"{resp.status}, its read raised {type(e).__name__}"
+            cut = True
+        conn.close()
+        checks[f"a cut answer is never a whole one (a CAST that fails at row 2,999,999 of 3M, in pieces): {outcome}"] = cut
+    finally:
+        node.kill()
+
+    # 2d. An identical query doesn't wait for another client's reading: A reads 1 MB of a CSV and stops; B asks the same
+    # and gets every row; then A reads the rest, and it is every row too.
+    node = Node(lake, A.port + 7).start()
+    try:
+        full = "SELECT * FROM big"
+        a = http_client.HTTPConnection("127.0.0.1", A.port + 7, timeout=900)
+        a.request("POST", "/sql?format=csv", full.encode())
+        ra = a.getresponse()
+        head = ra.read(1 << 20)  # (A has read a megabyte, and stops reading)
+        got = {}
+        def ask_b():
+            t0 = time.time()
+            got["status"], _, _, got["body"] = raw_sql(A.port + 7, full, "csv", timeout=45)
+            got["secs"] = time.time() - t0
+        b = threading.Thread(target=ask_b)
+        b.start()
+        b.join(60)
+        b_rows = pacsv.read_csv(io.BytesIO(got["body"])) if got.get("status") == 200 else None
+        b_ok = b_rows is not None and b_rows.num_rows == rows and pc.sum(b_rows.column("a")).as_py() == rows * (rows + 1) // 2
+        got.pop("body", None)
+        rest = ra.read()  # (then A reads the rest)
+        a.close()
+        a_rows = pacsv.read_csv(io.BytesIO(head + rest))
+        a_ok = a_rows.num_rows == rows and pc.sum(a_rows.column("a")).as_py() == rows * (rows + 1) // 2
+        checks[f"an identical query while another's answer is half read runs on its own: {got.get('secs', float('nan')):.1f} s, every row; then the first is read to its end"] = b_ok and a_ok
     finally:
         node.kill()
 

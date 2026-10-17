@@ -821,7 +821,7 @@ impl App {
         match self.query_as(&crate::asof::rewrite(query)?, spread, false).await {
             // (`*` left as it is when `sys::hide`'s EXCLUDE names a column its table lacks: a
             // stored view's, say)
-            Err(e) if [crate::sys::mentioned, crate::query::names_deleted].iter().any(|m| m(query) && m(&format!("{e:#}"))) => self.query_as(&crate::asof::as_of(query)?, spread, false).await,
+            Err(e) if crate::query::handed().is_none() && [crate::sys::mentioned, crate::query::names_deleted].iter().any(|m| m(query) && m(&format!("{e:#}"))) => self.query_as(&crate::asof::as_of(query)?, spread, false).await, // (an answer half sent is never run again)
             r => r,
         }
     }
@@ -850,13 +850,14 @@ impl App {
     /// (a procedure's, a view's) is served by the turn its caller holds, never waiting for one.
     async fn query_listed(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
         if TURN.try_with(|_| ()).is_ok() {
-            return self.run_query(query, spread, files).await;
+            return self.run_query(query, spread, files, false).await; // (a query inside another one: never the door's answer)
         }
         let _turn = turn().await?; // (held until the answer is made)
-        TURN.scope((), self.run_query(query, spread, files)).await
+        TURN.scope((), self.run_query(query, spread, files, true)).await
     }
 
-    async fn run_query(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
+    /// `top`: the query a door sent (it took a turn), whose answer may go to the door in pieces (`query::collect_or_send`).
+    async fn run_query(&self, query: &str, spread: Option<&str>, files: bool, top: bool) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         if crate::pg_catalog::asked(query) {
             return crate::pg_catalog::over_http(&self.lake, query).await; // (a request that speaks Postgres, reading its catalog: `?catalog=postgres`)
@@ -864,6 +865,7 @@ impl App {
         let start = std::time::Instant::now();
         crate::history::read_at(self.lake.visible()); // (its answer again: `t AT (VERSION => n)`)
         let explained = crate::write::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
+        let top = top && !explained; // (an explained query's operators' rows are kept whole)
         let run = async {
             let nodes = if spread == Some("0") || self.here_only(query).await { vec![] } else { self.cluster.nodes() };
             // (boxed, and only with nodes to spread over: its future is 300 KB, which every query on one node carried)
@@ -895,7 +897,7 @@ impl App {
                 let (state, logical) = df.into_parts();
                 let logical = state.optimize(&logical)?; // (as `create_physical_plan`, the plan it optimized kept: what its filters were about, `learned.rs`)
                 let plan = state.query_planner().create_physical_plan(&logical, &state).await?;
-                let out = crate::query::collect(plan.clone(), task).await?;
+                let out = if top { crate::query::collect_or_send(plan.clone(), task).await? } else { crate::query::collect(plan.clone(), task).await? };
                 crate::history::planned(&logical, &plan); // (its shape; a slow statement's plan, with what each operator did; what it learned)
                 let out = if explained { crate::history::explained(out)? } else { out };
                 // (no rows: still its columns, with the types its batches have, which the physical plan gives: not the planner's)
@@ -906,8 +908,8 @@ impl App {
             // How fast queries go here (`guard.rs`): every query's time, so a quick one is known to be
             // quick and stays here, and the bytes it read only for one long enough to say what rate
             // this node reads at. The time is taken before they are looked up, which isn't the query.
-            let took = here.elapsed();
-            if self.cluster.nodes().len() > 1 {
+            let took = here.elapsed(); // (an answer handed in pieces: its time includes the client's reading, so it says nothing)
+            if self.cluster.nodes().len() > 1 && crate::query::handed().is_none() {
                 let bytes = match took >= Duration::from_millis(20) {
                     true => crate::spmd::reads_sql(&self.lake, query).await.unwrap_or(0),
                     false => 0,
@@ -921,9 +923,12 @@ impl App {
         add(&QUERY_US, start.elapsed().as_micros() as u64);
         match out {
             Ok((batches, spread)) => {
-                crate::learned::ran(query, planned, start.elapsed()); // (never worse: facts that made it slower twice are set aside)
+                let handed = crate::query::handed(); // (rows sent in pieces: the batches went to the door, which holds none here)
+                if handed.is_none() {
+                    crate::learned::ran(query, planned, start.elapsed()); // (never worse: facts that made it slower twice are set aside)
+                }
                 add(&SPREAD, spread as u64);
-                crate::history::rows(batches.iter().map(|b| b.num_rows() as u64).sum());
+                crate::history::rows(handed.unwrap_or_else(|| batches.iter().map(|b| b.num_rows() as u64).sum()));
                 Ok(batches.into_iter().map(crate::query::compact).collect()) // (an answer kept or sent holds only its own strings)
             }
             Err(e) => {
@@ -1336,15 +1341,42 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
     };
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let vars = crate::auth::lent_vars(token); // (Python code a run lent a connection to: the run's variables)
+    let format = p.format.clone(); // (an answer handed to the door in pieces is sent in this format)
+    let (hand, mut handed) = tokio::sync::oneshot::channel(); // (the door's end of an answer in pieces: `query::Pieces`)
+    let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), sql_as(app, p, role, headers, body));
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
-    let go = crate::query::HELD.scope(Default::default(), crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(sql_as(app, p, role, headers, body))))))); // (boxed: a statement's future is big, and every layer around it would copy it)
-    let (out, heard) = crate::routines::with_notices(crate::python::holder(vars.is_some(), go)).await; // (a lent token's code holds a slot: what it calls takes none)
-    let mut r = out.unwrap_or_else(IntoResponse::into_response);
-    if session.as_deref().is_some_and(crate::temp::holds) {
-        r.headers_mut().insert("x-pondra-session", axum::http::HeaderValue::from_static("held")); // (a client keeps to this node meanwhile)
-    }
+    let go = crate::query::HELD.scope(Default::default(), crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(statement))))));
+    // (`guard` gave this request its principal and its apply flag, outside this handler: a request whose answer is
+    // handed over runs on after it, and its history and audit still need who asked, so `auth::carried` takes WHO here)
+    let applying = crate::protect::APPLYING.try_with(|_| ()).is_ok();
+    let applied = async move { if applying { crate::protect::APPLYING.scope((), go).await } else { go.await } };
+    let mut go = Box::pin(crate::auth::carried(crate::routines::with_notices(crate::python::holder(vars.is_some(), applied)))); // (a lent token's code holds a slot: what it calls takes none; boxed: a statement's future is big)
+    let (out, heard) = tokio::select! {
+        biased;
+        done = &mut go => done,
+        Ok(h) = &mut handed => {
+            // Its answer goes in pieces as its plan makes them (`query::send_rest`): the rest of the request, the
+            // pieces and the statement's end, is polled on the queries' runtime while its client reads; the plan's
+            // partition tasks stay where the prefix spawned them. The node may still stop it for memory (`oom.rs`).
+            crate::panics::aside(crate::panics::work(true, go));
+            return held_session(Rendered::Pieces(pieces(h)).respond(format.as_deref()), session.as_deref());
+        }
+    };
+    let mut r = match handed.try_recv() {
+        Ok(h) => Rendered::Pieces(pieces(h)).respond(format.as_deref()), // (handed over as the request ended: its rows still come in pieces)
+        Err(_) => out.unwrap_or_else(IntoResponse::into_response),
+    };
+    r = held_session(r, session.as_deref());
     if let Some(h) = notices(&heard) {
         r.headers_mut().insert("x-pondra-notices", h);
+    }
+    r
+}
+
+/// The header that keeps a client to this node while its session holds temporary tables (`temp::holds`).
+fn held_session(mut r: Response, session: Option<&str>) -> Response {
+    if session.is_some_and(crate::temp::holds) {
+        r.headers_mut().insert("x-pondra-session", axum::http::HeaderValue::from_static("held")); // (a client keeps to this node meanwhile)
     }
     r
 }
@@ -1454,7 +1486,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
         let rendered = run_sql(app, p, query, files).await?;
         let keep = match &rendered {
             Rendered::Whole(body) => Some(body.clone()),
-            Rendered::Pieces(_) => None, // (a big answer: sent to its own caller only)
+            Rendered::Pieces(_) | Rendered::Sent => None, // (a big answer: sent to its own caller only)
         };
         Ok((keep, rendered))
     };
@@ -1523,7 +1555,18 @@ impl App {
         }
         (slot.0, slot.1) = (flight.0.load(std::sync::atomic::Ordering::Relaxed), None);
         let version = self.lake.version_for(query).await; // (read after `covers`: this run reads at least this)
-        let (keep, own) = run().await?;
+        let run = run();
+        tokio::pin!(run);
+        let (keep, own) = tokio::select! {
+            biased;
+            out = &mut run => out?,
+            () = crate::query::when_handed() => {
+                // (its answer goes in pieces to its own caller as the query runs: those it covered run on their own
+                // now, not once the client has read it all)
+                drop(slot);
+                return Ok(Kept::Own(run.await?.1));
+            }
+        };
         if let Some(body) = keep {
             if let Some(v) = version {
                 self.results.put(key, v, body.clone());
@@ -1536,20 +1579,28 @@ impl App {
 
 /// Run a query (across the cluster if it's worth it) and format the result.
 async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Rendered> {
+    let explained = crate::write::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
+    // (an answer in a format that streams may be sent to the door from its plan: `query::collect_or_send`)
+    let _armed = (crate::answer::streams(p.format.as_deref()) && !explained).then(|| crate::query::arm(p.format.as_deref()));
     let batches = match files {
         true => app.query_as(&crate::asof::rewrite(query)?, Some("0"), true).await?, // (a file here: this node only)
         false => app.query(query, p.spread.as_deref()).await?,
     };
-    let explained = crate::write::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
+    if crate::query::handed().is_some() {
+        return Ok(Rendered::Sent); // (its answer went to the door in pieces as its plan made them)
+    }
     let batches = if explained { crate::ext::readable_rows(batches)? } else { batches }; // (files as SQL named them)
     answer(&batches, p)
 }
 
 /// An answer as the HTTP door sends it: rendered whole (what `Results` keeps and the others asking at
-/// the same moment share), or as a body in pieces, for an answer too big to render as one (`stream`).
+/// the same moment share), or as a body in pieces, for an answer too big to render as one (`stream`), or
+/// `Sent`: its answer went to the door in pieces as its plan made them (`query::collect_or_send`), and the
+/// door already has its body (`sql`).
 enum Rendered {
     Whole(bytes::Bytes),
     Pieces(Body),
+    Sent,
 }
 
 impl Rendered {
@@ -1557,6 +1608,7 @@ impl Rendered {
         let body = match self {
             Rendered::Whole(bytes) => Body::from(bytes),
             Rendered::Pieces(body) => body,
+            Rendered::Sent => return StatusCode::NO_CONTENT.into_response(),
         };
         ([("content-type", crate::answer::content_type(format))], body).into_response()
     }
@@ -1572,12 +1624,10 @@ fn answer(batches: &[RecordBatch], p: &SqlParams) -> anyhow::Result<Rendered> {
     }
 }
 
-/// Is an answer big enough to send in pieces: `PONDRA_STREAM_MB` (8) of Arrow, read once. 0 sends
-/// every answer in pieces (the tests compare the two ways).
+/// Is an answer big enough to send in pieces (`query::stream_bytes`: `PONDRA_STREAM_MB` of Arrow)?
 fn big(batches: &[RecordBatch]) -> bool {
-    static MB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| crate::env::or("PONDRA_STREAM_MB", 8));
     let mut counted = datafusion::common::utils::memory::RecordBatchMemoryCounter::new(); // (as `query::collect` counts it)
-    batches.iter().map(|b| counted.count_batch(b)).sum::<usize>() >= *MB << 20
+    batches.iter().map(|b| counted.count_batch(b)).sum::<usize>() >= crate::query::stream_bytes()
 }
 
 /// An answer in pieces of about 1 MB of Arrow, each written as `render` writes its rows (`Encoding`),
@@ -1586,26 +1636,43 @@ fn big(batches: &[RecordBatch]) -> bool {
 /// it, with its message; a failure later cuts the body short (no end of it is sent). The batches,
 /// and the memory counted for them, go when the last piece is written, or when the client goes.
 fn stream(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryReservation>) -> anyhow::Result<Body> {
-    let pieces: Vec<RecordBatch> = batches.iter().flat_map(crate::answer::piece_rows).collect();
+    let parts: Vec<RecordBatch> = batches.iter().flat_map(crate::answer::piece_rows).collect();
     let mut enc = crate::answer::Encoding::new(format);
-    let mut steps = pieces.into_iter().map(Some).chain(std::iter::once(None)); // (then the end)
+    let mut steps = parts.into_iter().map(Some).chain(std::iter::once(None)); // (then the end)
     let first = enc.step(steps.next().flatten().as_ref())?;
     // The rest is written on the queries' runtime, at most two pieces ahead of the client: the
     // node's own runtime keeps to appends and commits (invariant 231).
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(2);
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = ended.clone();
     crate::panics::aside(async move {
         let _held = held;
         for step in steps {
             let bytes = enc.step(step.as_ref()).map(Bytes::from).map_err(std::io::Error::other);
             let failed = bytes.is_err();
             if tx.send(bytes).await.is_err() || failed {
-                break; // (its client went, or the rest can't be written)
+                return; // (its client went, or the rest can't be written: the body fails, not ends)
             }
         }
+        done.store(true, std::sync::atomic::Ordering::Release); // (the end is written: the body may end)
     });
+    Ok(pieces(crate::query::Handed { first, rest: rx, ended }))
+}
+
+/// The body of an answer in pieces (`query::Handed`): its first piece, then the rest as they are written. A channel
+/// that closes before the last piece was written fails the body, so a client never takes a cut answer for a whole one.
+fn pieces(h: crate::query::Handed) -> Body {
+    let crate::query::Handed { first, rest, ended } = h;
     let head = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(first)) });
-    let rest = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|piece| (piece, rx)) });
-    Ok(Body::from_stream(head.chain(rest)))
+    let rest = futures::stream::unfold(Some((rest, ended)), |state| async move {
+        let (mut rest, ended) = state?;
+        match rest.recv().await {
+            Some(piece) => Some((piece, Some((rest, ended)))),
+            None if ended.load(std::sync::atomic::Ordering::Acquire) => None,
+            None => Some((Err(std::io::Error::other("the answer stopped before its end")), None)),
+        }
+    });
+    Body::from_stream(head.chain(rest))
 }
 
 /// `GET /sql/pages/{id}?from=10000&rows=10000`: more rows of an answer the console was sent
