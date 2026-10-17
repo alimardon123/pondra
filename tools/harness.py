@@ -21982,6 +21982,115 @@ def pkey():
         q("SELECT count(*) AS n FROM people_copy") == q("SELECT count(*) AS n FROM people") and refused(ctas_dup) and no_table[0] == 404 \
         and undrop_control[0] == 200 and undrop_dup[0] != 200
 
+    # Upserts whose rows share a key (`change.rs`, `Upsert::merge`): Postgres 16's answers, checked against it one statement at
+    # a time in fresh tables. A statement meets k (holding (1, 'a')) or u (empty) as it would alone. DO NOTHING keeps each key's
+    # first row (INSERT OR IGNORE too), and its count is Postgres's over HTTP and the Postgres port. DO UPDATE and MERGE refuse a
+    # key a second time (21000, Postgres's words) and write nothing. NULLs never conflict.
+    def fresh_k(name):
+        q(f"CREATE TABLE {name} (id BIGINT PRIMARY KEY, v TEXT)")
+        q(f"INSERT INTO {name} VALUES (1, 'a')")
+        return name
+
+    def fresh_u(name):
+        q(f"CREATE TABLE {name} (id BIGINT, e TEXT UNIQUE)")
+        return name
+
+    kv = lambda t: {r["id"]: r["v"] for r in q(f"SELECT id, v FROM {t}")}
+    ue = lambda t: sorted(((r["id"], r.get("e")) for r in q(f"SELECT id, e FROM {t}")), key=lambda p: (p[0], p[1] or ""))  # (the JSON leaves a NULL out)
+    inserted_of = lambda res: res.get("inserted", 0)  # (an upsert that inserts nothing answers {"rows": 0}: nothing inserted)
+
+    def pg_rowcount(sql):
+        """The count the Postgres port gives a statement: psycopg's rowcount, as Postgres's INSERT 0 n."""
+        with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+            cur = conn.cursor()
+            cur.execute(sql)
+            return cur.rowcount
+
+    # DO NOTHING: the first row of each key goes in; a key the table holds is skipped (the port's count too)
+    fresh_k("dn1")
+    fresh_k("dn1p")
+    dn1 = (inserted_of(q("INSERT INTO dn1 VALUES (5, 'a'), (5, 'b') ON CONFLICT DO NOTHING")), kv("dn1"))
+    dn1_port = (pg_rowcount("INSERT INTO dn1p VALUES (5, 'a'), (5, 'b') ON CONFLICT DO NOTHING"), kv("dn1p"))
+    info["upsert_dn1"] = [dn1, dn1_port]
+    checks["upserts: DO NOTHING of (5,'a'),(5,'b') keeps the first, count 1 over HTTP and the port (Postgres: INSERT 0 1, (5,'a'))"] = \
+        dn1 == (1, {1: "a", 5: "a"}) and dn1_port == (1, {1: "a", 5: "a"})
+
+    fresh_k("dn2")
+    fresh_k("dn2p")
+    dn2 = (inserted_of(q("INSERT INTO dn2 VALUES (1, 'e'), (1, 'f') ON CONFLICT DO NOTHING")), kv("dn2"))
+    dn2_port = (pg_rowcount("INSERT INTO dn2p VALUES (1, 'e'), (1, 'f') ON CONFLICT DO NOTHING"), kv("dn2p"))
+    info["upsert_dn2"] = [dn2, dn2_port]
+    checks["upserts: DO NOTHING of (1,'e'),(1,'f') with 1 held: nothing changes, count 0 over HTTP and the port (Postgres: INSERT 0 0)"] = \
+        dn2 == (0, {1: "a"}) and dn2_port == (0, {1: "a"})
+
+    # INSERT OR IGNORE is DO NOTHING (Postgres has no such word: its ON CONFLICT form is what the port is sent)
+    fresh_k("dn3")
+    fresh_k("dn3p")
+    dn3 = (inserted_of(q("INSERT OR IGNORE INTO dn3 VALUES (4, 'x'), (4, 'y')")), kv("dn3"))
+    dn3_port = (pg_rowcount("INSERT INTO dn3p VALUES (4, 'x'), (4, 'y') ON CONFLICT DO NOTHING"), kv("dn3p"))
+    info["upsert_dn3"] = [dn3, dn3_port]
+    checks["upserts: INSERT OR IGNORE of (4,'x'),(4,'y') keeps the first, as DO NOTHING does (Postgres: INSERT 0 1, (4,'x'))"] = \
+        dn3 == (1, {1: "a", 4: "x"}) and dn3_port == (1, {1: "a", 4: "x"})
+
+    # Two keys repeated in one statement: the held one is skipped, the first row of the other goes in (Postgres: INSERT 0 1)
+    fresh_k("dn4")
+    fresh_k("dn4p")
+    dn4 = (inserted_of(q("INSERT INTO dn4 VALUES (1, 'e'), (2, 'f'), (2, 'g') ON CONFLICT DO NOTHING")), kv("dn4"))
+    dn4_port = (pg_rowcount("INSERT INTO dn4p VALUES (1, 'e'), (2, 'f'), (2, 'g') ON CONFLICT DO NOTHING"), kv("dn4p"))
+    info["upsert_dn4"] = [dn4, dn4_port]
+    checks["upserts: DO NOTHING of (1,'e'),(2,'f'),(2,'g') with 1 held: (2,'f') goes in, count 1 over HTTP and the port"] = \
+        dn4 == (1, {1: "a", 2: "f"}) and dn4_port == (1, {1: "a", 2: "f"})
+
+    # A UNIQUE column, with DO NOTHING: the first of a repeated value goes in
+    fresh_u("dn5")
+    fresh_u("dn5p")
+    dn5 = (inserted_of(q("INSERT INTO dn5 VALUES (1, 'm'), (2, 'm') ON CONFLICT (e) DO NOTHING")), ue("dn5"))
+    dn5_port = (pg_rowcount("INSERT INTO dn5p VALUES (1, 'm'), (2, 'm') ON CONFLICT (e) DO NOTHING"), ue("dn5p"))
+    info["upsert_dn5"] = [dn5, dn5_port]
+    checks["upserts: DO NOTHING of (1,'m'),(2,'m') on a UNIQUE column: (1,'m') only, count 1 over HTTP and the port"] = \
+        dn5 == (1, [(1, "m")]) and dn5_port == (1, [(1, "m")])
+
+    # NULLs never conflict: both rows go in, over HTTP and the port
+    fresh_u("dn6")
+    fresh_u("dn6p")
+    dn6 = (inserted_of(q("INSERT INTO dn6 VALUES (1, NULL), (2, NULL) ON CONFLICT (e) DO NOTHING")), ue("dn6"))
+    dn6_port = (pg_rowcount("INSERT INTO dn6p VALUES (1, NULL), (2, NULL) ON CONFLICT (e) DO NOTHING"), ue("dn6p"))
+    info["upsert_dn6"] = [dn6, dn6_port]
+    checks["upserts: DO NOTHING of two NULLs on a UNIQUE column: both rows go in (NULLs never conflict), count 2 over HTTP and the port"] = \
+        dn6 == (2, [(1, None), (2, None)]) and dn6_port == (2, [(1, None), (2, None)])
+
+    # DO UPDATE and MERGE: a key a second time is refused (21000, Postgres's words), and nothing is written
+    fresh_k("up1")
+    e_up1 = err("INSERT INTO up1 VALUES (6, 'a'), (6, 'b') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
+    info["upsert_up1"] = [e_up1[1], e_up1[2][:160], kv("up1")]
+    checks["upserts: DO UPDATE of (6,'a'),(6,'b') is refused 21000 (\"ON CONFLICT DO UPDATE command cannot affect row a second time\"), nothing written"] = \
+        e_up1[1] == "21000" and "ON CONFLICT DO UPDATE command cannot affect row a second time" in e_up1[2] and kv("up1") == {1: "a"}
+
+    fresh_k("up2")
+    e_up2 = err("INSERT INTO up2 VALUES (1, 'c'), (1, 'd') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
+    info["upsert_up2"] = [e_up2[1], kv("up2")]
+    checks["upserts: DO UPDATE of (1,'c'),(1,'d') with 1 held: refused 21000, the held row as it was"] = \
+        e_up2[1] == "21000" and kv("up2") == {1: "a"}
+
+    fresh_k("up3")
+    e_up3 = err("INSERT OR REPLACE INTO up3 VALUES (3, 'x'), (3, 'y')")
+    info["upsert_up3"] = [e_up3[1], kv("up3")]
+    checks["upserts: INSERT OR REPLACE of (3,'x'),(3,'y') is refused 21000, as DO UPDATE is (DuckDB refuses it too), nothing written"] = \
+        e_up3[1] == "21000" and kv("up3") == {1: "a"}
+
+    fresh_k("up4")
+    e_up4 = err("MERGE INTO up4 USING (VALUES (1, 'p'), (1, 'q')) s(id, v) ON up4.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v")
+    info["upsert_up4"] = [e_up4[1], e_up4[2][:160], kv("up4")]
+    checks["upserts: a MERGE whose two source rows match one row is refused 21000 (\"MERGE command cannot affect row a second time\"), nothing written"] = \
+        e_up4[1] == "21000" and "MERGE command cannot affect row a second time" in e_up4[2] and kv("up4") == {1: "a"}
+
+    # NULLs never conflict under DO UPDATE either: two NULL keys are no repeat
+    fresh_u("up5")
+    up5 = (inserted_of(q("INSERT INTO up5 VALUES (1, NULL), (2, NULL) ON CONFLICT (e) DO UPDATE SET id = excluded.id")), ue("up5"))
+    info["upsert_up5"] = up5
+    checks["upserts: DO UPDATE of two NULLs on a UNIQUE column is no repeat: both rows go in, count 2"] = \
+        up5 == (2, [(1, None), (2, None)])
+
     # pondra sql with no leader: it leads for a moment, and refuses the same way
     for n in nodes:
         n.kill()

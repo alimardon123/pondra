@@ -281,28 +281,43 @@ fn same_key_type(key: &DataType, source: &DataType) -> bool {
 }
 
 impl Upsert {
+    /// The columns a conflict is on: the statement's own, else the table's key. `merge` and `repeats` both take them from here.
+    fn on_columns(&self, meta: &TableMeta, target: &str) -> Result<Vec<String>> {
+        let on = if self.on.is_empty() { meta.key.clone() } else { self.on.clone() };
+        ensure!(!on.is_empty(), "INSERT … ON CONFLICT: name the columns a conflict is on (ON CONFLICT (id) …), or give {target} a PRIMARY KEY");
+        Ok(on)
+    }
+
     /// The MERGE this is, for a table of these columns: a row whose `on` columns match one of the
-    /// table's updates it (DO UPDATE) or is skipped (DO NOTHING); the others are inserted.
-    fn merge(&self, meta: &TableMeta, m: &Merge) -> Result<Merge> {
+    /// table's updates it (DO UPDATE) or is skipped (DO NOTHING); the others are inserted. `first_only`
+    /// (DO NOTHING, when `repeats` found a key twice): the source keeps each conflict key's first row.
+    fn merge(&self, meta: &TableMeta, m: &Merge, first_only: bool) -> Result<Merge> {
         let columns: Vec<String> = match self.columns.is_empty() {
             true => meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect(),
             false => self.columns.clone(),
         };
-        let on = if self.on.is_empty() { meta.key.clone() } else { self.on.clone() };
-        ensure!(!on.is_empty(), "INSERT … ON CONFLICT: name the columns a conflict is on (ON CONFLICT (id) …), or give {} a PRIMARY KEY", m.target);
+        let on = self.on_columns(meta, &m.target)?;
         ensure!(on.iter().all(|c| columns.contains(c)), "INSERT … ON CONFLICT ({}): the rows must give those columns", on.join(", "));
         let (a, x, u) = (q(&m.alias), "excluded", "__u");
         // The conflict columns are cast to the table's types before a conflict is checked, as Postgres casts an INSERT's
         // values first: `excluded` holds the cast keys, so a DECIMAL 7003.5 for a BIGINT key is the key 7003 and conflicts
         // with it. (The other columns are cast as they are written; a list's type has no spelling `arrow_cast` reads back.)
-        let cast: Vec<String> = columns.iter().map(|c| {
-            let value = match meta.columns.iter().find(|(n, _)| n == c).map(|(_, t)| crate::query::dtype(t)) {
-                Some(Ok(t)) if on.contains(c) && !matches!(t, DataType::List(_)) => format!("arrow_cast({u}.{}, '{t}')", q(c)),
-                _ => format!("{u}.{}", q(c)),
-            };
-            format!("{value} AS {}", q(c))
-        }).collect();
-        let source = format!("(SELECT {} FROM ({}) AS {u} ({})) AS {x}", cast.join(", "), self.query, columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", "));
+        let value = |c: &String| match meta.columns.iter().find(|(n, _)| n == c).map(|(_, t)| crate::query::dtype(t)) {
+            Some(Ok(t)) if on.contains(c) && !matches!(t, DataType::List(_)) => format!("arrow_cast({u}.{}, '{t}')", q(c)),
+            _ => format!("{u}.{}", q(c)),
+        };
+        let cast: Vec<String> = columns.iter().map(|c| format!("{} AS {}", value(c), q(c))).collect();
+        let names: Vec<String> = columns.iter().map(|c| q(c)).collect();
+        let source = if first_only {
+            // A window can't sit in a WHERE: the rows are numbered in their order, each conflict key's first is kept, and so
+            // is every row NULL in a conflict column (NULLs never conflict). Built only when a key repeats (`repeats`).
+            let keys: Vec<String> = on.iter().map(|c| value(c)).collect();
+            let null: Vec<String> = on.iter().map(|c| format!("{} IS NULL", q(c))).collect();
+            format!("(SELECT {} FROM (SELECT {}, row_number() OVER (PARTITION BY {} ORDER BY {u}.__p) AS __r FROM (SELECT *, row_number() OVER () AS __p FROM ({}) AS __v ({})) AS {u}) AS __f WHERE __r = 1 OR {}) AS {x}",
+                names.join(", "), cast.join(", "), keys.join(", "), self.query, names.join(", "), null.join(" OR "))
+        } else {
+            format!("(SELECT {} FROM ({}) AS {u} ({})) AS {x}", cast.join(", "), self.query, names.join(", "))
+        };
         let on_sql = on.iter().map(|c| format!("{a}.{} = {x}.{}", q(c), q(c))).collect::<Vec<_>>().join(" AND ");
         let insert = Clause { kind: Kind::NotMatched, when: None, action: Action::Insert(columns.clone(), columns.iter().map(|c| format!("{x}.{}", q(c))).collect()) };
         let mut clauses = vec![];
@@ -378,7 +393,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
     }
     // A plain INSERT's keys must be new (23505: `constraints.rs`), and so must the keys a MERGE inserts. One that matches on
     // the key alone, comparing it in the key's own type, inserts only rows whose key no row holds, so nothing is looked up;
-    // a MERGE's must still differ from each other (an upsert's keep their own rule: a key's last row wins).
+    // a MERGE's must still differ from each other (an upsert's keep their own rule: `Upsert::merge` keeps a key's first row, or refuses 21000).
     let plain = match &stmt {
         crate::write::Stmt::Insert(..) | crate::write::Stmt::InsertInto(..) => true,
         crate::write::Stmt::Merge(m) if m.upsert.is_some() => !m.on_key(&meta),
@@ -481,23 +496,50 @@ fn part(all: &RecordBatch, meta: &TableMeta, prefix: &str, ids: bool) -> Result<
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?)
 }
 
+/// Does a source hold two rows of one conflict key? A row NULL in a conflict column conflicts with none, so it isn't counted.
+async fn repeats(lake: &Lake, source: &str, on: &[String], upto: u64) -> Result<bool> {
+    let keys: Vec<String> = on.iter().map(|c| q(c)).collect();
+    let not_null: Vec<String> = on.iter().map(|c| format!("{} IS NOT NULL", q(c))).collect();
+    let sql = format!("SELECT 1 FROM {source} WHERE {} GROUP BY {} HAVING count(*) > 1 LIMIT 1", not_null.join(" AND "), keys.join(", "));
+    let ctx = session(lake, &sql, upto).await?;
+    Ok(ctx.sql(&sql).await?.count().await? > 0)
+}
+
 async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
     let what = if m.upsert.is_some() { "INSERT … ON CONFLICT" } else { "MERGE" };
+    // (read from the statement before `m` is rebound to the MERGE it becomes below, whose `upsert` is None)
+    let upsert = m.upsert.is_some();
+    let merge_stmt = m.sql.trim_start().get(..5).is_some_and(|w| w.eq_ignore_ascii_case("MERGE")); // (an UPDATE … FROM keeps its message)
     let built;
     let m = match &m.upsert {
         Some(u) => {
-            built = u.merge(meta, m)?;
+            let plain = u.merge(meta, m, false)?;
+            built = if repeats(lake, &plain.source, &u.on_columns(meta, &m.target)?, upto).await? {
+                // A DO UPDATE refuses a key a second time, as Postgres does; Postgres lets a second row through when the first
+                // one's DO UPDATE WHERE failed on the existing key, and so is this refusal too.
+                if u.update.is_some() {
+                    return Err(crate::codes::coded("21000", "ON CONFLICT DO UPDATE command cannot affect row a second time: ensure that no rows proposed for insertion within the same command have duplicate constrained values"));
+                }
+                u.merge(meta, m, true)?
+            } else {
+                plain
+            };
             &built
         }
         None => m,
     };
     let (t, a, s, on) = (format!("{} AS {}", crate::write::sql_name(table), q(&m.alias)), q(&m.alias), &m.source, &m.on);
-    // Each target row takes at most one source row (else which one's values?). A DELETE … USING
-    // deletes a row once however many match it, as Postgres does.
-    if !m.semi {
+    // Each target row takes at most one source row (else which one's values?). A DELETE … USING deletes a row once
+    // however many match it, as Postgres does. An upsert's keys are unique by now (`repeats`).
+    if !m.semi && !upsert {
         let twice = format!("SELECT {a}.{} FROM {t} JOIN {s} ON {on} GROUP BY 1 HAVING count(*) > 1 LIMIT 1", q(ROW_ID));
         let ctx = session(lake, &twice, upto).await?;
-        ensure!(ctx.sql(&twice).await?.count().await? == 0, "{what}: a row of {table} matches more than one source row");
+        if ctx.sql(&twice).await?.count().await? > 0 {
+            if merge_stmt {
+                return Err(crate::codes::coded("21000", "MERGE command cannot affect row a second time: ensure that not more than one source row matches any one target row"));
+            }
+            bail!("{what}: a row of {table} matches more than one source row");
+        }
     }
     let (mut old, mut new) = (vec![], vec![]);
     for (i, c) in m.clauses.iter().enumerate() {
