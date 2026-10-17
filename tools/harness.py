@@ -15313,7 +15313,19 @@ def jsons():
     answer jsonb as Postgres prints it, and nesting past 10,000 levels is refused 54001 (`pg_json_make.rs`'s MAX_DEPTH). A whole row (json_agg(t), to_json(t) and
     row_to_json(t) over a table, an alias, a CTE or a subquery) is made of its columns; json_agg's ORDER BY, FILTER, DISTINCT and OVER,
     the object forms, PostgREST's coalesce(json_agg(...), '[]') and a JSON column in a maker answer as Postgres 16 does, over HTTP, the
-    port and three nodes; a whole row that can't be made is refused by name (`pg_types.rs`, MAKERS)."""
+    port and three nodes; a whole row that can't be made is refused by name (`pg_types.rs`, MAKERS).
+    Measured, per 1,000,000 rows (the benchmark's lake: `t` as in jsonedits, and `m` = (id BIGINT, name VARCHAR) with
+    'n' || id; the method as there; seconds per statement; in parentheses, the same run's build before parts A to D,
+    which is also before main's merge):
+        statement                                             Pondra (before)     Postgres 16       DuckDB 1.5.5
+        length(json_agg(id))                                  0.08 s (0.10 s)     0.31 s            0.06 s (to_json(list(id)))
+        json_agg(name ORDER BY id) in 1,000 groups, counted   1.21 s (1.27 s)     1.39 s            0.19 s (to_json(list(...)))
+        count(json_build_object(id, name))                    0.07 s (0.19 s)     0.26 s            0.05 s (json_object, a text key)
+        length(json_agg(s)) over (SELECT id, name ...)        0.21 s (0.44 s)     0.95 s            0.36 s
+    Pondra's answers equal Postgres 16's, the lengths of the JSON texts too. DuckDB's texts have no spaces after commas
+    or colons, so its lengths are shorter. Pondra is ahead of Postgres 16 on all four, the grouped json_agg by the least
+    (0.19 s), and behind DuckDB on three of them; on json_agg(s) it is ahead of DuckDB too.
+"""
     import psycopg
     from psycopg.types.json import Json, Jsonb
     import sqlalchemy as sa
@@ -17455,20 +17467,30 @@ def jsonedits():
         json || '…', json || text, jsonb || text, '…' || '…', untyped || integer | uuid: text, as before
     Known gap: a bigint column beside a document is text in Pondra (the trace knows no integer columns; Postgres: 42883).
     Measured (1,000,000 rows of `(id BIGINT, doc JSONB)`, each `{"id": i, "name": "n<i>", "tags": ["a", "b", "c"],
-    "nested": {"k": i}}`; median of 7 timed runs after one warm-up, each run's text unique so that no answer is
-    remembered; 4 vCPUs shared with other builds, load 6 to 8, so compare the ratios, not the seconds):
-        count(jsonb_set(doc, '{name}', '"x"'))    Pondra 1.67 s   Postgres 16 0.46 s
-        count(jsonb_concat(doc, '{"z": 1}'))      Pondra 1.75 s   Postgres 16 `doc || …` 0.55 s   DuckDB json_merge_patch 0.47 s
-        count(doc - 'tags')                       Pondra 1.38 s   Postgres 16 0.31 s
-        the same with the answer as text (what Pondra's functions always return; Postgres prints its jsonb here):
-        sum(length(jsonb_set …)), concat, - ::    Pondra 1.72 / 1.80 / 1.33 s   Postgres 0.90 / 1.06 / 0.64 s   DuckDB 0.50 s
-        references: Pondra count(json_get_str(doc, 'name')) 0.11 s (one member read); jsonb_strip_nulls, the tree
-        path, 1.77 s; json_strip_nulls, which copies tokens, 0.63 s.
-    Why Pondra is slower: a jsonb function here parses each document into a tree of strings and maps and prints it
-    again, whatever the edit (strip_nulls costs what set costs). Postgres edits binary jsonb and never prints it for a
-    count. What it would take, not done: copy the untouched bytes and re-encode only the path changed (the token walk
-    json_strip_nulls uses, which is 2.8× faster here), and, to match counts, a binary jsonb stored in the lake (a new
-    format: an ADR and a format number).
+    "nested": {"k": i}}`; the median of 7 rounds, the two Pondra builds one after the other in each round (alternating),
+    a warm-up before each timed run, every statement's text new so that no answer is remembered; Postgres 16 and DuckDB
+    1.5.5 run the same statements in the same rounds, on a quiet machine). Seconds per statement. Pondra's figure is this
+    round's build; in parentheses, the figure this paragraph had before:
+        statement                                  Pondra (before)      Postgres 16          DuckDB 1.5.5
+        count(jsonb_set(doc, '{name}', '"x"'))     0.42 s (1.67 s)      0.45 s               n/a
+        count(jsonb_concat(doc, '{"z": 1}'))       0.50 s (1.75 s)      0.51 s (doc || ...)  0.25 s (json_merge_patch)
+        count(doc - 'tags')                        0.38 s (1.38 s)      0.31 s               n/a
+        sum(length(jsonb_set ...)), as text        0.44 s (1.72 s)      0.87 s               n/a
+        sum(length(jsonb_concat ...)), as text     0.51 s (1.80 s)      1.01 s               0.26 s (json_merge_patch)
+        sum(length(doc - 'tags')), as text         0.34 s (1.33 s)      0.60 s               n/a
+    The same run's build before this round (before parts A to D, and before main's merge into the branch) took 0.96,
+    0.78, 0.70, 0.98, 0.98 and 0.69 s for the first six rows, in the same order: every statement is faster now, and
+    every answer is the one before. Pondra's answers equal Postgres 16's for all six. Still behind Postgres:
+    count(doc - 'tags'), by 0.07 s: a count still prints the document, where Postgres edits binary jsonb and never
+    prints it for a count. The references, measured before this round: Pondra count(json_get_str(doc, 'name')) 0.11 s
+    (one member read); jsonb_strip_nulls, the tree path, 1.77 s; json_strip_nulls, which copies tokens, 0.63 s.
+    Where the time went (a probe before parts A to D, on a loaded machine: compare the shares, not the seconds): a jsonb
+    function parsed each document into a tree of strings and maps and printed it again, whatever the edit. Most of the
+    time went to reading the tree, then to the path lists, the depth scan and the copy of the output. Parts A to D made
+    the tree borrow its text, write each batch into one String, read a literal path once, skip the depth scan of a short
+    document and write plain numbers as they are. What is left, not done: copy the untouched bytes and re-encode only the
+    path changed (the token walk json_strip_nulls uses, which is 2.8x faster here), and, to match counts, a binary jsonb
+    stored in the lake (a new format: an ADR and a format number).
     """
     import csv, psycopg
     pg_dsn = os.environ.get("PONDRA_PG16", "host=/tmp/pg16-l3 port=55432 user=postgres dbname=postgres")
