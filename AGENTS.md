@@ -2137,9 +2137,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    rendered whole. Only a whole body is remembered (`Results`) or handed to the requests that
    waited for the same query; those a streamed run covered run on their own. The Postgres port,
    Flight and MCP let the count go when the answer is made. `harness.py answers_big`: every
-   format's pieces == the whole answer; an answer bigger than a 0.25 GB node's memory refused
+   format's pieces == the whole answer; a text table bigger than a 0.25 GB node's memory refused
    (53200), the node answering after; 3M rows' peak at least half their JSON under rendering them
-   whole (442 MB against 715 when written).
+   whole (442 MB against 715 when written). A door's own query sends its answer from its plan
+   (invariant 421).
 289. **A node runs at most `PONDRA_QUERIES` queries at once** (`server::TURNS`: four a core, 16 at
    least), the rest in the order they asked, and one that waits `PONDRA_QUEUE_SECS` (60) is
    refused (53300: a client asks again, or another node). A query run inside one this task runs (a
@@ -2784,6 +2785,19 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (the memory watch drops its future: invariant 417) drops it from `Undo`'s `drop`, as its caller. Left there, the
    user's next try of the fixed statement was refused 42P07. `harness.py objects`: "a CREATE TABLE … AS SELECT that
    fails leaves no table…" (the old build kept it after a cast's 22P02 and after the watch's stop).
+421. **A big answer goes from its plan as the plan makes it, and a cut one never looks whole** (`query::collect_or_send`,
+   `send_rest`, `PIECES`; `server::sql`, `pieces`). The query an HTTP request sends (`run_query`'s `top`: the one that
+   took the request's turn), in a format that streams and not `EXPLAIN`ed, is armed (`query::arm`); once its batches
+   pass `PONDRA_STREAM_MB` it writes the first piece, hands the body to the door, and pulls the rest of the plan into
+   it two pieces ahead of the client, each batch counted only while it is written. The handler then runs the rest of
+   the request on the queries' runtime with its principal and apply flag (`auth::carried`). A body ends only after its
+   last piece was written (`Handed::ended`): a plan that fails, or a client gone, cuts it, and the client sees an
+   error, never a short answer. An answer half sent is never run again (`frugally`, `App::query`'s retry), never
+   remembered, and the requests that waited for it run on their own. The turn and the quota are held while the client
+   reads, a client that takes no piece for a minute ends it (57014), and its time in `pondra.history` includes
+   the reading. `harness.py answers_big`: 12M rows as CSV past a 0.25 GB node's memory for queries at a peak of 171 MB
+   (the build before refused it, 53200), a cut answer fails its read, an identical query while another is half read
+   answers at once.
 
 ## Tests: run these before and after any change
 
