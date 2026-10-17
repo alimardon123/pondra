@@ -2645,6 +2645,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    fails, two types in a column, a session's own settings) is planned. Only how the batch is made changes,
    never where it goes. `cargo test --lib literals` compares both paths value by value.
 
+402. **A JSON or JSONB column holds the text as written, and every write door checks it** (22P02). The
+   Postgres port types it 114 or 3802. Postgres's JSON operators and functions answer as Postgres 16 does,
+   refusals by SQLSTATE; they are planned ahead of datafusion-functions-json's, and only for text
+   (`pg_json.rs`, `pg_json_make.rs`, `pg_json_edit.rs`, `pg_json_sets.rs`). `harness.py jsons`,
+   `jsonedits`, `jsonfns`.
+
+403. **A lateral over a function's rows is one unnest pass** (`lateral.rs`): `FROM t, f(t.x)`, `CROSS JOIN
+   LATERAL`, `LEFT JOIN LATERAL … ON true` padded with NULL. Any other lateral stays DataFusion's. A
+   function's rows over an outer query's column are refused by name, never left to the physical planner.
+   `harness.py lateral`.
+
 405. **A temporary secret only an admin or the node's owner made reaches past the public internet**
    (`public.rs`, `ext::temporary`, `For::Public`): anyone else's is refused `PROVIDER credential_chain`
    (the node's own credentials) and `TYPE kafka` when made. Its stores ask only public addresses: one
