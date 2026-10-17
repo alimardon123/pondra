@@ -14107,6 +14107,262 @@ def remembered():
     return f"{sum(bool(v) for v in checks.values())} of {len(checks)} remembered checks"
 
 
+def jsonfns():
+    """Postgres 16's functions that read a JSON document and expand it into rows (ADR-072 phase 2, brief D1). Reading:
+    json(b)_typeof, json(b)_array_length, json(b)_extract_path(_text) (`#>` and `#>>` with the keys as the path; NULL where
+    the path reaches nothing; zero keys 42883). Expanding, one row per element, in a SELECT list (paired by position, as
+    Postgres pairs them), in FROM over a literal or a column's document in a subquery's list, and as a record: json(b)_array_elements(_text),
+    json(b)_each(_text), json(b)_object_keys, json(b)_to_recordset and json(b)_to_record with a column list. json_object_keys
+    expands (Postgres's meaning); DataFusion's list is json_keys. Every answer is Postgres 16's: the names, the types and the
+    rows, over HTTP and over the Postgres port (psycopg, as text and through its own decoders), and each refusal's SQLSTATE and
+    words. Not taken yet, refused by name where Postgres takes them: a function in FROM that reads a column (LATERAL), WITH
+    ORDINALITY, and an expanding function in GROUP BY, ORDER BY, a window or INSERT's VALUES."""
+    import psycopg
+    from psycopg.types.json import JsonbLoader, JsonLoader
+    from psycopg.types.string import TextLoader
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 10
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    SETUP = [
+        "CREATE TABLE docs (id INT, doc JSONB, jdoc JSON)",
+        "INSERT INTO docs VALUES (1, '{\"items\": [{\"sku\": \"A1\", \"qty\": 2}, {\"sku\": \"B7\", \"qty\": 1}], \"tags\": {\"b\": 1, \"a\": 2, \"a\": 3}}', '{\"items\":[{\"sku\":\"A1\"}], \"n\": 1.50}'), (2, '{\"items\": []}', '{}'), (3, NULL, NULL), (4, '[1, \"x\", {\"a\": 1}, null]', '[1,\"x\",{\"a\":1},null]')",
+    ]
+    # (name, sql, names, type codes, rows): Postgres 16's answers, json and jsonb read as their text.
+    CASES = [
+        ("reads: jsonb_typeof, json_typeof and the array lengths of a table's documents, NULL for a NULL document", "SELECT id, jsonb_typeof(doc), json_typeof(jdoc), jsonb_array_length(doc -> 'items'), json_array_length(jdoc -> 'items') FROM docs ORDER BY id",
+         ['id', 'jsonb_typeof', 'json_typeof', 'jsonb_array_length', 'json_array_length'], [23, 25, 25, 23, 23],
+         [[1, 'object', 'object', 2, 1], [2, 'object', 'object', 0, None], [3, None, None, None, None], [4, 'array', 'array', None, None]]),
+        ("reads: jsonb_extract_path and _text, json_extract_path and _text of a table's column, by keys and an index", "SELECT id, jsonb_extract_path(doc, 'items', '0', 'sku'), jsonb_extract_path_text(doc, 'items', '1', 'qty'), json_extract_path(jdoc, 'n'), json_extract_path_text(jdoc, 'items', '0', 'sku'), jsonb_extract_path(doc, 'tags') FROM docs ORDER BY id",
+         ['id', 'jsonb_extract_path', 'jsonb_extract_path_text', 'json_extract_path', 'json_extract_path_text', 'jsonb_extract_path'], [23, 3802, 25, 114, 25, 3802],
+         [[1, '"A1"', '1', '1.50', 'A1', '{"a": 3, "b": 1}'], [2, None, None, None, None, None], [3, None, None, None, None, None], [4, None, None, None, None, None]]),
+        ('reads: a negative index counts from the end, a missing path is NULL', 'SELECT jsonb_extract_path(\'{"a":[1,2]}\', \'a\', \'-1\'), jsonb_extract_path_text(\'[1,2,3]\', \'-3\'), json_extract_path(\'{"a":1}\', \'z\'), jsonb_extract_path_text(\'{"a":null}\', \'a\')',
+         ['jsonb_extract_path', 'jsonb_extract_path_text', 'json_extract_path', 'jsonb_extract_path_text'], [3802, 25, 114, 25],
+         [['2', '1', None, None]]),
+        ('reads: json_extract_path of nested keys as written, jsonb_extract_path normalized', 'SELECT json_extract_path(\'{"a":{"b":[1,2]}}\', \'a\', \'b\'), jsonb_extract_path(\'{"a":{"b":[1,2]}}\', \'a\', \'b\', \'1\'), json_extract_path_text(\'{"a":{"b":"x"}}\', \'a\', \'b\'), jsonb_extract_path(\'{"b":1,"a":{"y":2,"x":1}}\', \'a\')',
+         ['json_extract_path', 'jsonb_extract_path', 'json_extract_path_text', 'jsonb_extract_path'], [114, 3802, 25, 3802],
+         [['[1,2]', '2', 'x', '{"x": 1, "y": 2}']]),
+        ('reads: the type and the array length of literals, NULL inputs', 'SELECT json_array_length(\'[1,2,[3]]\'), jsonb_array_length(\'[]\'), json_typeof(\'[1]\'), jsonb_typeof(\'1.5\'), jsonb_typeof(\'"s"\'), jsonb_typeof(\'true\'), jsonb_typeof(\'null\'), jsonb_typeof(NULL::jsonb), json_array_length(NULL::json)',
+         ['json_array_length', 'jsonb_array_length', 'json_typeof', 'jsonb_typeof', 'jsonb_typeof', 'jsonb_typeof', 'jsonb_typeof', 'jsonb_typeof', 'json_array_length'], [23, 23, 25, 25, 25, 25, 25, 25, 23],
+         [[3, 0, 'array', 'number', 'string', 'boolean', 'null', None, None]]),
+        ('expands: jsonb_array_elements in a SELECT list, one row per element, none for an empty or a NULL array', "SELECT id, jsonb_array_elements(doc -> 'items') FROM docs ORDER BY id",
+         ['id', 'jsonb_array_elements'], [23, 3802],
+         [[1, '{"qty": 2, "sku": "A1"}'], [1, '{"qty": 1, "sku": "B7"}']]),
+        ('expands: json_array_elements keeps each element as written', "SELECT json_array_elements(jdoc -> 'items') FROM docs WHERE id = 1",
+         ['json_array_elements'], [114],
+         [['{"sku":"A1"}']]),
+        ("expands: jsonb_array_elements over a column's array of mixed elements, jsonb normalized", 'SELECT id, jsonb_array_elements(doc) FROM docs WHERE id = 4',
+         ['id', 'jsonb_array_elements'], [23, 3802],
+         [[4, '1'], [4, '"x"'], [4, '{"a": 1}'], [4, 'null']]),
+        ("expands: jsonb_array_elements_text gives each element's text, a JSON null as NULL", 'SELECT id, jsonb_array_elements_text(doc) FROM docs WHERE id = 4',
+         ['id', 'jsonb_array_elements_text'], [23, 25],
+         [[4, '1'], [4, 'x'], [4, '{"a": 1}'], [4, None]]),
+        ('expands: jsonb_array_elements_text prints the element as jsonb does (keys sorted, the last duplicate)', 'SELECT jsonb_array_elements_text(\'[1.50, {"b":1,"a":2,"a":3}]\')',
+         ['jsonb_array_elements_text'], [25],
+         [['1.50'], ['{"a": 3, "b": 1}']]),
+        ('expands: json_array_elements_text keeps each element as written', 'SELECT json_array_elements_text(\'[1.50, {"b":1,"a":2,"a":3}]\')',
+         ['json_array_elements_text'], [25],
+         [['1.50'], ['{"b":1,"a":2,"a":3}']]),
+        ('expands: two expanding functions in one SELECT list pair by position, the shorter padded with NULL', 'SELECT jsonb_array_elements(\'[1,2]\'), jsonb_array_elements_text(\'["a","b","c"]\')',
+         ['jsonb_array_elements', 'jsonb_array_elements_text'], [3802, 25],
+         [['1', 'a'], ['2', 'b'], [None, 'c']]),
+        ("expands: an expanding function inside another function's argument", "SELECT id, upper(jsonb_array_elements_text(doc -> 'items')) FROM docs WHERE id = 1",
+         ['id', 'upper'], [23, 25],
+         [[1, '{"QTY": 2, "SKU": "A1"}'], [1, '{"QTY": 1, "SKU": "B7"}']]),
+        ('expands: jsonb_object_keys of a column, grouped by key over a subquery', 'SELECT k, count(*) FROM (SELECT jsonb_object_keys(doc) AS k FROM docs WHERE id < 3) s GROUP BY k ORDER BY k',
+         ['k', 'count'], [25, 20],
+         [['items', 2], ['tags', 1]]),
+        ('expands: json_object_keys keeps the keys as written, duplicates included', 'SELECT json_object_keys(\'{"b":1,"a":2,"b":3}\'), jsonb_object_keys(\'{"b":1,"a":2}\')',
+         ['json_object_keys', 'jsonb_object_keys'], [25, 25],
+         [['b', 'a'], ['a', 'b'], ['b', None]]),
+        ("expands: json_object_keys of a table's column, one row per key", 'SELECT id, json_object_keys(jdoc) FROM docs WHERE id = 1',
+         ['id', 'json_object_keys'], [23, 25],
+         [[1, 'items'], [1, 'n']]),
+        ("expands: jsonb_each in FROM, the rows in jsonb's key order, values as jsonb", 'SELECT * FROM jsonb_each(\'{"b": 1, "a": {"x": 2}}\')',
+         ['key', 'value'], [25, 3802],
+         [['a', '{"x": 2}'], ['b', '1']]),
+        ('expands: json_each_text in FROM with a column list, values as text, a JSON null as NULL', 'SELECT * FROM json_each_text(\'{"b": 1, "a": {"x": 2}, "c": null}\') AS e(k, v)',
+         ['k', 'v'], [25, 25],
+         [['b', '1'], ['a', '{"x": 2}'], ['c', None]]),
+        ('expands: jsonb_array_elements in FROM, its column named value', "SELECT * FROM jsonb_array_elements('[1,2]') AS e",
+         ['value'], [3802],
+         [['1'], ['2']]),
+        ('expands: jsonb_array_elements_text in FROM without an alias', 'SELECT * FROM jsonb_array_elements_text(\'["a", null]\')',
+         ['value'], [25],
+         [['a'], [None]]),
+        ('expands: jsonb_object_keys in FROM, its column named after the alias', 'SELECT * FROM jsonb_object_keys(\'{"a":1}\') AS k',
+         ['k'], [25],
+         [['a']]),
+        ('expands: jsonb_object_keys in FROM without an alias, its column named after the function', 'SELECT * FROM jsonb_object_keys(\'{"a":1}\')',
+         ['jsonb_object_keys'], [25],
+         [['a']]),
+        ('expands: jsonb_to_recordset in FROM with a column list', 'SELECT * FROM jsonb_to_recordset(\'[{"a":1,"b":"x"},{"a":2}]\') AS x(a int, b text)',
+         ['a', 'b'], [23, 25],
+         [[1, 'x'], [2, None]]),
+        ("expands: jsonb_to_recordset over a literal, joined to a table's rows", 'SELECT id, line.sku, line.qty FROM docs, jsonb_to_recordset(\'[{"sku": "A1", "qty": 2}]\') AS line(sku TEXT, qty INT) WHERE id = 2',
+         ['id', 'sku', 'qty'], [23, 25, 23],
+         [[2, 'A1', 2]]),
+        ('expands: jsonb_to_recordset with missing keys: NULL for each one not there', 'SELECT * FROM jsonb_to_recordset(\'[{"sku": "A1", "qty": 2}, {"sku": "B7"}]\') AS line(sku TEXT, qty INT)',
+         ['sku', 'qty'], [25, 23],
+         [['A1', 2], ['B7', None]]),
+        ('expands: json_to_record, a json and a jsonb column of a document', 'SELECT * FROM json_to_record(\'{"a": 1, "b": [1, 2], "c": {"x": true}}\') AS r(a INT, b JSON, c JSONB)',
+         ['a', 'b', 'c'], [23, 114, 3802],
+         [[1, '[1, 2]', '{"x": true}']]),
+        ('expands: jsonb_to_record of NULL has no rows', 'SELECT count(*) FROM jsonb_to_record(NULL) AS x(a INT)',
+         ['count'], [20],
+         [[1]]),
+    ]
+    # (name, sql, SQLSTATE, message): refused by Postgres 16 with these words.
+    ERRORS = [
+        ("refused: jsonb_array_elements of an object, by Postgres's words (22023)", 'SELECT jsonb_array_elements(\'{"a":1}\')', '22023', 'cannot extract elements from an object'),
+        ('refused: json_array_elements of a scalar (22023)', "SELECT json_array_elements('1')", '22023', 'cannot call json_array_elements on a scalar'),
+        ('refused: jsonb_each of an array (22023)', "SELECT * FROM jsonb_each('[1]') AS e", '22023', 'cannot call jsonb_each on a non-object'),
+        ('refused: json_each of an array (22023)', "SELECT * FROM json_each('[1]') AS e", '22023', 'cannot deconstruct an array as an object'),
+        ('refused: json_object_keys of a scalar (22023)', "SELECT * FROM json_object_keys('1') AS k", '22023', 'cannot call json_object_keys on a scalar'),
+        ('refused: jsonb_object_keys of an array (22023)', "SELECT * FROM jsonb_object_keys('[1]') AS k", '22023', 'cannot call jsonb_object_keys on an array'),
+        ('refused: jsonb_to_recordset of an array of scalars (22023)', "SELECT * FROM jsonb_to_recordset('[1]') AS x(a int)", '22023', 'argument of jsonb_to_recordset must be an array of objects'),
+        ('refused: jsonb_to_recordset of an object (22023)', "SELECT * FROM jsonb_to_recordset('{}') AS x(a int)", '22023', 'cannot call jsonb_to_recordset on a non-array'),
+        ('refused: jsonb_to_recordset with no column list (42601)', 'SELECT * FROM jsonb_to_recordset(\'[{"a":1}]\') AS x(a, b)', '42601', 'a column definition list is required for functions returning "record"'),
+        ('refused: jsonb_to_record in a SELECT list, no row type (0A000)', 'SELECT jsonb_to_record(\'{"a":1}\')', '0A000', 'could not determine row type for result of jsonb_to_record'),
+        ('refused: jsonb_to_record of an array (22023)', "SELECT * FROM jsonb_to_record('[1]') AS x(a int)", '22023', 'cannot call populate_composite on an array'),
+        ('refused: an expanding function in WHERE (0A000)', 'SELECT 1 FROM docs WHERE jsonb_array_elements(doc) IS NULL', '0A000', 'set-returning functions are not allowed in WHERE'),
+        ('refused: an expanding function in CASE (0A000)', "SELECT CASE WHEN true THEN jsonb_array_elements('[1]') END", '0A000', 'set-returning functions are not allowed in CASE'),
+        ('refused: an expanding function in an aggregate (0A000)', "SELECT count(jsonb_array_elements('[1]'))", '0A000', 'aggregate function calls cannot contain set-returning function calls'),
+        ('refused: an expanding function in LIMIT (0A000)', "SELECT 1 LIMIT jsonb_array_elements('[1]')", '0A000', 'set-returning functions are not allowed in LIMIT'),
+        ('refused: an expanding function in COALESCE (0A000)', "SELECT COALESCE(jsonb_array_elements('[1]'), '2'::jsonb)", '0A000', 'set-returning functions are not allowed in COALESCE'),
+        ('refused: an expanding function in HAVING (0A000)', "SELECT 1 HAVING jsonb_array_elements('[1]') IS NOT NULL", '0A000', 'set-returning functions are not allowed in HAVING'),
+        ("refused: an expanding function in a JOIN's ON (0A000)", "SELECT 1 FROM (SELECT 1) s JOIN generate_series(1, 2) g ON g = jsonb_array_elements('[1]')", '0A000', 'set-returning functions are not allowed in JOIN conditions'),
+    ]
+    # Refused by name where Postgres 16 takes the call (the words are the ones this engine says, then the SQLSTATE).
+    NOT_YET = [
+        ("a function in FROM that reads a column needs LATERAL, not taken yet (Postgres takes it)", "SELECT d.id, e.value FROM docs d, jsonb_array_elements(d.doc -> 'items') AS e", "0A000", "needs LATERAL, not yet"),
+        ("WITH ORDINALITY, not taken yet (Postgres takes it)", "SELECT * FROM jsonb_array_elements('[1,2]') WITH ORDINALITY AS e", "0A000", "WITH ORDINALITY isn't taken yet"),
+        ("an expanding function in GROUP BY, not taken yet (Postgres takes it)", "SELECT 1 FROM docs GROUP BY jsonb_array_elements(doc)", "0A000", "in GROUP BY isn't taken yet"),
+        ("an expanding function in ORDER BY, not taken yet (Postgres takes it)", "SELECT 1 FROM docs ORDER BY jsonb_array_elements('[1]')", "0A000", "in ORDER BY isn't taken yet"),
+        ("an expanding function in a window's PARTITION BY, not taken yet (Postgres takes it)", "SELECT sum(id) OVER (PARTITION BY jsonb_array_elements('[1]')) FROM docs", "0A000", "in window definitions isn't taken yet"),
+        ("an expanding function in INSERT's VALUES, not taken yet (Postgres takes it)", "INSERT INTO docs (id) VALUES (jsonb_array_elements('[1]')::text::int)", "0A000", "in VALUES isn't taken yet"),
+    ]
+    # psycopg's own decoding over the port (dicts, lists, numbers) and the cursor's names and type codes, Postgres 16's.
+    TYPED = [
+        ("jsonb_array_elements of a column, as dicts", "SELECT jsonb_array_elements(doc -> 'items') FROM docs WHERE id = 1", ["jsonb_array_elements"], [3802], [[{"qty": 2, "sku": "A1"}], [{"qty": 1, "sku": "B7"}]]),
+        ("jsonb_array_elements of a literal: numbers, strings, lists and NULL", "SELECT jsonb_array_elements('[1, \"x\", [2], null]')", ["jsonb_array_elements"], [3802], [[1], ["x"], [[2]], [None]]),
+        ("jsonb_array_elements_text: strings, a JSON null as NULL", "SELECT jsonb_array_elements_text('[1, \"x\", [2], null]')", ["jsonb_array_elements_text"], [25], [["1"], ["x"], ["[2]"], [None]]),
+        ("jsonb_typeof as a string, jsonb_array_length as a number", "SELECT jsonb_typeof(doc), jsonb_array_length(doc -> 'items') FROM docs WHERE id = 1", ["jsonb_typeof", "jsonb_array_length"], [25, 23], [["object", 2]]),
+        ("jsonb_each in FROM: the key as text, the value as a dict or a number", "SELECT * FROM jsonb_each('{\"b\": 1, \"a\": {\"x\": 2}}')", ["key", "value"], [25, 3802], [["a", {"x": 2}], ["b", 1]]),
+        ("jsonb_to_recordset with missing keys: a number and NULL", "SELECT * FROM jsonb_to_recordset('[{\"sku\": \"A1\", \"qty\": 2}, {\"sku\": \"B7\"}]') AS line(sku TEXT, qty INT)", ["sku", "qty"], [25, 23], [["A1", 2], ["B7", None]]),
+        ("json_extract_path as a float, jsonb_extract_path as a dict", "SELECT json_extract_path(jdoc, 'n'), jsonb_extract_path(doc, 'tags') FROM docs WHERE id = 1", ["json_extract_path", "jsonb_extract_path"], [114, 3802], [[1.5, {"a": 3, "b": 1}]]),
+    ]
+    checks, info = {}, {}
+    node = None
+
+    def q(s):
+        return call(port, "POST", "/sql", s.encode(), timeout=120)
+
+    def check(name, fn):
+        """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def http_answer(s):
+        """The rows of a statement over HTTP, their values in column order. HTTP names columns as the engine does (not as
+        Postgres does: the port checks names), and leaves a NULL out of its row object, so a row is its non-NULL values."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        if r.status != 200:
+            raise RuntimeError(f"{r.status}: {data[:300]!r}")
+        rows = json.loads(data, object_pairs_hook=lambda pairs: pairs)  # pairs, not a dict: duplicate names stay
+        return [[v for _, v in row] for row in rows]
+
+    def http_error(s):
+        """(SQLSTATE header, body) of a statement HTTP refuses."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        return r.getheader("x-pondra-sqlstate"), data
+
+    def port_answer(conn, s, text=True):
+        """(names, type codes, rows) over the port: json and jsonb as their text (`text`), or through psycopg's decoders."""
+        if text:
+            conn.adapters.register_loader(114, TextLoader)
+            conn.adapters.register_loader(3802, TextLoader)
+        else:
+            conn.adapters.register_loader(114, JsonLoader)
+            conn.adapters.register_loader(3802, JsonbLoader)
+        cur = conn.execute(s)
+        return [c.name for c in cur.description], [c.type_code for c in cur.description], [list(r) for r in cur.fetchall()]
+
+    try:
+        node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+        for s in SETUP:
+            q(s)
+        for name, s, names, types, rows in CASES:
+            check(f"over HTTP, {name}", lambda s=s, rows=rows: _same(http_answer(s), [[v for v in row if v is not None] for row in rows], info, s))
+        with psycopg.connect(url, autocommit=True) as conn:
+            for name, s, names, types, rows in CASES:
+                check(f"over the port, {name}", lambda s=s, names=names, types=types, rows=rows: _same(port_answer(conn, s), (names, types, rows), info, s))
+            for name, s, names, types, rows in TYPED:
+                check(f"over the port, psycopg's types: {name}", lambda s=s, names=names, types=types, rows=rows: _same(port_answer(conn, s, text=False), (names, types, rows), info, s))
+        for name, s, sqlstate, message in ERRORS:
+            check(f"over HTTP, refused: {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_http(http_error(s), sqlstate, message, info, s))
+        with psycopg.connect(url, autocommit=True) as conn:
+            for name, s, sqlstate, message in ERRORS:
+                check(f"over the port, refused: {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_port(conn, s, sqlstate, message, info))
+        for name, s, sqlstate, message in NOT_YET:
+            check(f"over HTTP, refused by name: {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_http(http_error(s), sqlstate, message, info, s))
+        check("json_keys is DataFusion's list of the keys, as written (DuckDB's name; json_object_keys expands)",
+              lambda: http_answer("SELECT json_keys('{\"b\":1,\"a\":2}') AS k") == [[["b", "a"]]])
+    finally:
+        if node is not None:
+            node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"jsonfns": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} JSON function checks"
+
+
+def _same(got, want, info, sql):
+    """Equal answers; when not, what each side said is kept in info (keyed by the statement)."""
+    if got == want:
+        return True
+    info[f"differs: {sql[:120]}"] = {"got": got, "want": want}
+    return False
+
+
+def _says(body, message):
+    """The message as the body carries it (JSON-escaped quotes included)."""
+    return message in body or json.dumps(message)[1:-1] in body
+
+
+def _refused_http(answer, sqlstate, message, info, sql):
+    code, body = answer
+    if code == sqlstate and _says(body, message):
+        return True
+    info[f"refused differently: {sql[:120]}"] = {"got": [code, body[:300]], "want": [sqlstate, message]}
+    return False
+
+
+def _refused_port(conn, sql, sqlstate, message, info):
+    """The port refuses `sql` with the SQLSTATE and the words; a statement it takes is a failure, kept in info."""
+    import psycopg
+    try:
+        conn.execute(sql)
+    except psycopg.Error as e:
+        if e.sqlstate == sqlstate and e.diag.message_primary == message:
+            return True
+        info[f"refused differently: {sql[:120]}"] = {"got": [e.sqlstate, e.diag.message_primary], "want": [sqlstate, message]}
+        return False
+    info[f"not refused: {sql[:120]}"] = True
+    return False
+
+
 def uuids():
     """UUID columns, kept as their canonical text (36 characters, lower-case hex, hyphens at 8, 13, 18 and 23).
     `DEFAULT gen_random_uuid()` as a PRIMARY KEY gives each row its own version-4 id. Every write door (INSERT,
@@ -20948,12 +21204,12 @@ SECS = {"memory": 240, "waits": 99, "sso": 89, "stopped": 87, "guesses": 45, "ba
         "files": 10, "followers": 10, "guarded": 10, "begin": 9, "bykey": 9, "clients": 9, "flows": 9,
         "guard": 9, "hot": 9, "schemas": 9, "temps": 9, "catalogs": 8, "clusters": 8, "columns": 8,
         "fills": 8, "serverless": 8, "alter": 7, "fence": 7, "loads": 7, "safety": 7, "sequences": 7,
-        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60, "served": 60}
+        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60, "served": 60, "jsonfns": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -20985,7 +21241,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -20998,7 +21254,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

@@ -109,6 +109,42 @@ The same operators are functions under Postgres's own names, so SQL written for 
 | `doc ?\| keys` | `jsonb_exists_any(doc, keys)` |
 | `doc ?& keys` | `jsonb_exists_all(doc, keys)` |
 
+## Reading a document and its elements
+
+Postgres's JSON functions read a document, and some of them expand it into rows. They take `json`
+and `jsonb` values, and text that holds JSON, and the `jsonb` ones answer as `jsonb` prints them.
+
+`jsonb_typeof` and `jsonb_array_length` say what a document holds:
+
+```sql
+CREATE TABLE carts (id BIGINT, doc JSONB);
+INSERT INTO carts VALUES
+  (1, '{"items": [{"sku": "A1", "qty": 2}, {"sku": "B7", "qty": 1}]}'),
+  (2, '{"items": []}');
+
+SELECT id, jsonb_typeof(doc -> 'items') AS kind, jsonb_array_length(doc -> 'items') AS count
+FROM carts;
+```
+
+`jsonb_array_elements` gives one row per element. Call it in the SELECT list, and a row is made for
+each element, none for an empty array:
+
+```sql
+SELECT id, jsonb_array_elements(doc -> 'items') AS item
+FROM carts;
+```
+
+`jsonb_to_recordset` gives one row per object. Name the columns and their types after the alias:
+
+```sql
+SELECT *
+FROM jsonb_to_recordset('[{"sku": "A1", "qty": 2}, {"sku": "B7"}]') AS line(sku TEXT, qty INT);
+```
+
+A call in a `FROM` clause works over literals, as the last example does. A call that reads a column
+of the same query needs `LATERAL`, which isn't taken yet: call it in the SELECT list instead, as the
+second example does.
+
 The functions below read the same documents. Each takes the document, then a path:
 
 | Function | Returns |
@@ -123,7 +159,7 @@ The functions below read the same documents. Each takes the document, then a pat
 | `json_as_text(doc, path…)` | the value as text, whatever its type |
 | `json_contains(doc, path…)` | true if the path exists |
 | `json_length(doc, path…)` | the length of the array or object |
-| `json_object_keys(doc, path…)` | the keys of the object |
+| `json_keys(doc, path…)` | the keys of the object (`json_object_keys` is Postgres's, and expands into rows: see below) |
 | `json_from_scalar(x)` | a JSON value made from a number, text or boolean (cast a decimal to `DOUBLE` first) |
 | `json_union_to_text(v)` | the JSON text of a value from `json_get` or `json_from_scalar`: a string keeps its quotes |
 
