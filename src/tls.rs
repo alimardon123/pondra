@@ -137,8 +137,9 @@ impl Peer {
     /// The scheme and host a browser reached this node at, for a sign-in's redirect address (ADR-074 §5):
     /// the one `pondra serve --lakes` names (`ORIGIN`, with the key it gave this node); from a proxy of
     /// `PONDRA_TRUSTED_PROXIES`, its `X-Forwarded-Proto` and `X-Forwarded-Host`; else this connection's
-    /// scheme and the request's `Host`. (A provider sends a code only to an address registered with it.)
-    pub fn origin(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+    /// scheme and the request's `Host`, or over HTTP/2 its URI's authority (browsers send `:authority` there, and
+    /// no `Host`). (A provider sends a code only to an address registered with it.)
+    pub fn origin(&self, headers: &axum::http::HeaderMap, uri: &axum::http::Uri) -> Option<String> {
         let said = |name: &str| headers.get(name)?.to_str().ok()?.split(',').next().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let named = said(ORIGIN).and_then(|v| v.split_once(' ').map(|(k, o)| (k.to_string(), o.to_string())));
         if let (Some((given, origin)), Some(key)) = (named, server_key().filter(|_| self.local)) {
@@ -148,7 +149,7 @@ impl Peer {
         }
         let proxied = proxies().iter().any(|p| within(self.addr.ip(), *p));
         let scheme = proxied.then(|| said("x-forwarded-proto")).flatten().unwrap_or_else(|| if self.tls { "https" } else { "http" }.to_string());
-        let host = proxied.then(|| said("x-forwarded-host")).flatten().or_else(|| said("host"))?;
+        let host = proxied.then(|| said("x-forwarded-host")).flatten().or_else(|| said("host")).or_else(|| uri.authority().map(|a| a.to_string()))?;
         let plain = !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'));
         (matches!(scheme.as_str(), "http" | "https") && plain).then(|| format!("{scheme}://{host}"))
     }

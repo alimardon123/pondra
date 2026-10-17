@@ -645,7 +645,7 @@ async fn browser_token(http: &reqwest::Client, api: &str, provider: Option<&str>
     let challenge = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, verifier.as_bytes()));
     let mut start = reqwest::Url::parse(&format!("{api}/sso/{name}/start"))?;
     start.query_pairs_mut().append_pair("to", &back).append_pair("challenge", &challenge);
-    eprintln!("signing in through {name} in your browser: {start}");
+    eprintln!("signing in through {name} in your browser: {start}\n(once you are signed in there, the page asks you to continue to this command line)");
     open_browser(start.as_str());
     let answer = tokio::time::timeout(std::time::Duration::from_secs(300), came_back(&listener)).await.context("no sign-in within five minutes")??;
     if let Some(e) = answer.get("error") {
@@ -675,7 +675,7 @@ async fn came_back(listener: &tokio::net::TcpListener) -> Result<BTreeMap<String
             continue;
         }
         let said = match query.get("error") {
-            Some(e) => e.replace('&', "&amp;").replace('<', "&lt;"), // ("not signed in through …: why")
+            Some(e) => crate::sso_flow::html(e), // ("not signed in through …: why")
             None => "Signed in. You can close this tab and go back to the terminal.".to_string(),
         };
         let page = format!("<!doctype html><meta charset=utf-8><title>Pondra</title><p style=\"font:16px system-ui;margin:3em\">{said}</p>");

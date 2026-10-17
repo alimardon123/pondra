@@ -10119,7 +10119,7 @@ def sso_flow():
     the ID token (its state, its nonce, its signature) and answers a session in the address's fragment, or the
     reason it failed. The provider is tools/fake_idp.py (its /_test/next says what the next flow does). The browser
     is urllib with redirects not followed, carrying the flow's cookie by hand."""
-    import base64, hashlib, pathlib, stat, urllib.error, urllib.parse, urllib.request
+    import base64, hashlib, html, pathlib, re, stat, urllib.error, urllib.parse, urllib.request
     import adbc_driver_flightsql.dbapi as adbc
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import fake_idp
@@ -10170,6 +10170,13 @@ def sso_flow():
     def fragment(location):
         """What the page gets in the address's fragment: pondra_session, pondra_user, pondra_error."""
         return {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlsplit(location).fragment).items()}
+
+    def continued(answer):
+        """Where the callback's answer sends the command line's code: its confirmation page's Continue link (a 200),
+        else its redirect's Location."""
+        st, h, text = answer
+        go = re.search(r'<a id="continue" href="([^"]+)"', text or "")
+        return html.unescape(go.group(1)) if st == 200 and go else where(h)
 
     def start(port, provider, to="/", challenge=None, prefix=""):
         """GET {prefix}/sso/{provider}/start: (status, headers, text)."""
@@ -10350,8 +10357,8 @@ def sso_flow():
         cookie_as_code = reply(P, "POST", "/sso/token", json.dumps({"code": "pc_" + flow_value}).encode(), headers=as_json)
         cy_verifier, cy_challenge = pkce()
         as_user(cy, ["analysts"])
-        (_, _, _), (_, h_cy_code, _) = sign_in("staff", to="http://127.0.0.1:45678/", challenge=cy_challenge)
-        cy_code = (urllib.parse.parse_qs(urllib.parse.urlsplit(where(h_cy_code)).query).get("code") or [""])[0]
+        (_, _, _), cy_answer = sign_in("staff", to="http://127.0.0.1:45678/", challenge=cy_challenge)
+        cy_code = (urllib.parse.parse_qs(urllib.parse.urlsplit(continued(cy_answer)).query).get("code") or [""])[0]
         code_as_session = read_as("ps_" + cy_code[3:])
         session_as_code = reply(P, "POST", "/sso/token", json.dumps({"code": "pc_" + cy_session[3:]}).encode(), headers=as_json)
         code_redeemed = reply(P, "POST", "/sso/token", json.dumps({"code": cy_code, "verifier": cy_verifier}).encode(), headers=as_json)
@@ -10402,8 +10409,8 @@ def sso_flow():
         as_user(ana)
         verifier, challenge = pkce()
         back = "http://127.0.0.1:45678/"
-        (_, _, _), (_, h_code, _) = sign_in("acme", to=back, challenge=challenge)
-        loc = where(h_code)
+        (_, _, _), answered = sign_in("acme", to=back, challenge=challenge)
+        loc = continued(answered)
         code = (urllib.parse.parse_qs(urllib.parse.urlsplit(loc).query).get("code") or [""])[0]
         json_type = {"content-type": "application/json"}
         bad = reply(P, "POST", "/sso/token", json.dumps({"code": code, "verifier": pkce()[0]}).encode(), headers=json_type)
@@ -10412,6 +10419,16 @@ def sso_flow():
         info["command line"] = {"location": loc[:80], "another verifier": bad[0], "the right one": good[0]}
         checks["the command line's code: a loopback to with a challenge ends at http://127.0.0.1:PORT/?code=pc_…; POST /sso/token with another verifier is 401; with the right one it gives a session that reads t"] = (
             loc.startswith(back + "?code=pc_") and bad[0] == 401 and good[0] == 200 and read_as(cli_session) == (200, [{"x": 1}]))
+
+        # 9b. That code goes only through a page that asks first (M22 of the 10-17 audit: a link anyone made, naming a
+        # port of this machine and a challenge of theirs, handed them a code with no question asked).
+        st_page, h_page, page = answered
+        info["the command line's confirmation page"] = {"status": st_page, "Location": h_page.get("Location"), "page": page[:400],
+                                                        "headers": {k: h_page.get(k) for k in ("X-Frame-Options", "Content-Security-Policy", "Referrer-Policy", "Cache-Control")}}
+        checks["the command line's code goes only through a page that asks first: the callback answers 200 (no redirect) naming ana@acme.com, acme and port 45678, with a Continue link to the loopback address, in no one's frame, its referrer and cache kept off"] = (
+            st_page == 200 and h_page.get("Location") is None and ana in page and "through acme" in page and "port 45678" in page
+            and loc.startswith(back + "?code=pc_") and h_page.get("X-Frame-Options") == "DENY" and "frame-ancestors 'none'" in (h_page.get("Content-Security-Policy") or "")
+            and h_page.get("Referrer-Policy") == "no-referrer" and h_page.get("Cache-Control") == "no-store")
 
         # 10. Behind `pondra serve --lakes`: the database's own node, its own provider, the path prefix in the flow.
         folder = new_lake()
@@ -10449,6 +10466,8 @@ def sso_flow():
             f.write("SELECT x FROM t;\n")
         env = login_env(home)
         run = subprocess.run([BIN, "run", q_sql, "--url", url], env=env, cwd=project, capture_output=True, text=True, timeout=120)
+        # (L22 of the 10-17 audit: `pondra workspace pull` finds `pondra login`'s session too, with no token given)
+        pulled = subprocess.run([BIN, "workspace", "pull", tempfile.mkdtemp(prefix="pondra-pull-"), "--url", url], env=login_env(home), capture_output=True, text=True, timeout=120)
         py_code = "import json, sys; sys.path.insert(0, " + repr(os.path.join(repo, "python")) + "); import pondra; " \
             "db = pondra.connect(" + repr(url) + ", echo=False); print(json.dumps(db.sql('SELECT x FROM t').rows()))"
         py = subprocess.run([sys.executable, "-c", py_code], env=env, capture_output=True, text=True, timeout=120)
@@ -10460,17 +10479,40 @@ def sso_flow():
             js = subprocess.run([node, "--input-type=module", "-e", js_code], env=env, capture_output=True, text=True, timeout=120)
         info["pondra login"] = {"returncode": login.returncode, "said": (login.stdout + login.stderr).strip()[-240:], "mode": kept_mode, "keys": list(kept)}
         info["readers with no token"] = {"pondra run": [run.returncode, run.stdout.strip()[-120:]], "python": [py.returncode, py.stdout.strip()[-120:], py.stderr.strip()[-200:]],
-                                         "javascript": None if js is None else [js.returncode, js.stdout.strip()[-120:], js.stderr.strip()[-200:]]}
+                                         "javascript": None if js is None else [js.returncode, js.stdout.strip()[-120:], js.stderr.strip()[-200:]],
+                                         "pondra workspace pull": [pulled.returncode, (pulled.stdout + pulled.stderr).strip()[-160:]]}
         checks["pondra login http://127.0.0.1:P (one provider, the browser sent back in by its PONDRA_BROWSER) signs in and says so: 'signed in to … (ana@acme.com, …)'"] = \
             login.returncode == 0 and f"signed in to {url} (ana@acme.com" in login.stdout + login.stderr
         checks["pondra login keeps a ps_ session for the server in login.json, mode 0600"] = \
             kept_mode == 0o600 and str(kept.get(url, "")).startswith("ps_")
         checks["pondra run q.sql --url reads t with no token (the saved session)"] = run.returncode == 0 and "1" in run.stdout
+        checks["pondra workspace pull --url pulls with no token (the saved session, as every command finds it)"] = pulled.returncode == 0
         checks["pondra.Pondra(the server) with that PONDRA_HOME reads t with no token (Python)"] = py.returncode == 0 and json.loads(py.stdout.strip() or "null") == [{"x": 1}]
         if js is not None:
             checks["the JavaScript client (new Pondra(the server)) with that PONDRA_HOME reads t with no token"] = js.returncode == 0 and json.loads(js.stdout.strip() or "null") == [{"x": 1}]
         else:
             info["javascript"] = "node isn't on this machine: not run"
+
+        # 13. A node serving TLS itself, reached over HTTP/2 as browsers reach it (:authority, and no Host): the start's
+        # redirect_uri is the address the browser used, as over HTTP/1.1 (M23 of the 10-17 audit).
+        tls_dir = tempfile.mkdtemp(prefix="pondra-tls-")
+        tls_key, tls_crt = os.path.join(tls_dir, "node.key"), os.path.join(tls_dir, "node.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", tls_key, "-out", tls_crt, "-days", "2",
+                        "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1"], check=True, capture_output=True)
+        TLS = A.port + 16
+        tls_node = Node(new_lake(), TLS, admin_token=token, tls_cert=tls_crt, tls_key=tls_key).start()
+        started.append(tls_node)
+        tls_made = reply(TLS, "POST", "/sql", f"CREATE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra')".encode(), headers=bearer(token))[0]
+        over = {}
+        for version in ("--http1.1", "--http2"):
+            out = subprocess.run(["curl", "-sk", version, "-o", "/dev/null", "-w", "%{http_version} %{http_code} %{redirect_url}",
+                                  f"https://127.0.0.1:{TLS}/sso/acme/start?to=/"], capture_output=True, text=True, timeout=60).stdout.split(" ", 2)
+            got = out + [""] * (3 - len(out))
+            over[version] = [got[0], got[1], (urllib.parse.parse_qs(urllib.parse.urlsplit(got[2]).query).get("redirect_uri") or [""])[0]]
+        info["a TLS node's start, over HTTP/1.1 and HTTP/2"] = over
+        checks["a node serving TLS itself: the start over HTTP/2 (no Host) redirects with redirect_uri https://127.0.0.1:T/sso/callback, as over HTTP/1.1"] = (
+            tls_made == 200 and over["--http2"][:2] == ["2", "302"] and over["--http1.1"][:2] == ["1.1", "302"]
+            and over["--http2"][2] == over["--http1.1"][2] == f"https://127.0.0.1:{TLS}/sso/callback")
 
         # 12 is above (it needs two providers); `pondra login` with one is the check above.
     finally:
@@ -10489,7 +10531,7 @@ def sso_flow():
 
 
 BROWSER = '''#!PYTHON
-import http.cookiejar, urllib.error, urllib.parse, urllib.request
+import html, http.cookiejar, re, urllib.error, urllib.parse, urllib.request
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -10497,8 +10539,11 @@ opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect
 url = __import__("sys").argv[1]
 for _ in range(10):
     try:
-        opener.open(url, timeout=30).read()
-        break
+        page = opener.open(url, timeout=30).read().decode(errors="replace")
+        go = re.search(r'<a id="continue" href="([^"]+)"', page)
+        if not go:
+            break
+        url = urllib.parse.urljoin(url, html.unescape(go.group(1)))  # (the node's page that asks before a code goes to the command line: Continue)
     except urllib.error.HTTPError as e:
         if e.code not in (301, 302, 303, 307, 308):
             raise
@@ -10773,7 +10818,12 @@ try:
     if 'name="username"' in page and action:
         fields = dict(re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', page))
         fields.update(username=os.environ["KC_USER"], password=os.environ["KC_PASSWORD"])
-        opener.open(urllib.request.Request(urllib.parse.urljoin(at, html.unescape(action.group(1))), data=urllib.parse.urlencode(fields).encode()), timeout=30).read()
+        r = opener.open(urllib.request.Request(urllib.parse.urljoin(at, html.unescape(action.group(1))), data=urllib.parse.urlencode(fields).encode()), timeout=30)
+        page, at = r.read().decode(errors="replace"), r.geturl()
+    # (the node's page that asks before a code goes to the command line: a person's Continue)
+    go = re.search(r'<a id="continue" href="([^"]+)"', page)
+    if go:
+        opener.open(urllib.parse.urljoin(at, html.unescape(go.group(1))), timeout=30).read()
 except Exception:
     with open(os.path.join(here, "browser.log"), "a") as f:
         f.write(traceback.format_exc())

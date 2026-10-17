@@ -980,7 +980,7 @@ async fn signed_session(lake: &Lake, mut payload: Value) -> Result<(String, u64)
     let until = crate::log::now_ms() + session_ms();
     payload["x"] = j!(until);
     let payload = B64U.encode(serde_json::to_vec(&payload)?);
-    let sig = B64U.encode(hmac256(&B64.decode(keys(lake).await?.session)?, payload.as_bytes()));
+    let sig = sign(lake, payload.as_bytes()).await?; // (a session alone is signed bare: `sign_for`)
     Ok((format!("ps_{payload}.{sig}"), until))
 }
 
