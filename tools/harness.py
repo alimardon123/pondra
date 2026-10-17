@@ -22750,6 +22750,30 @@ def memorylake():
                 isinstance(inproc, list) and [str(v) for v in inproc] == ["1", "2", "3"] and bool(lake_objects(t5, "catalog/")))
             if ran.returncode != 0:
                 print((ran.stdout + ran.stderr)[-500:], file=sys.stderr)
+        # A shell on :memory: that spilled leaves no spill folder once it ends (`memory::leave`: a process's statics
+        # run no destructor, so the program's end removes what it made). The node is the shell's child: never by pid.
+        shell_dir, spill_dir = tempfile.mkdtemp(prefix="pondra-shell-"), tempfile.mkdtemp(prefix="pondra-spill-")
+        with open(os.path.join(shell_dir, "shell.out"), "w") as out:
+            shell = subprocess.Popen([BIN, ":memory:"], cwd=shell_dir, stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT,
+                                     env={**os.environ, **env, "PONDRA_SPILL_DIR": spill_dir})
+            shell.stdin.write(b"CREATE TABLE t AS SELECT value AS n, md5(value::VARCHAR) AS s FROM range(20000);\n")
+            shell.stdin.flush()
+            spilled = False
+            for _ in range(300):  # (30 s: the table's files are past the 10 KB budget, so they go to a folder)
+                if glob_.glob(os.path.join(spill_dir, "pondra-memory-*", "*")):
+                    spilled = True
+                    break
+                time.sleep(0.1)
+            try:
+                shell.stdin.close()
+                shell.wait(30)
+            except (OSError, subprocess.TimeoutExpired):
+                shell.kill()
+                shell.wait()
+        left = glob_.glob(os.path.join(spill_dir, "pondra-memory-*", "*")) + glob_.glob(os.path.join(spill_dir, "pondra-spill-*", "*"))
+        checks["a shell on :memory: that spilled leaves no spill folder once it ends"] = spilled and not left
+        shutil.rmtree(shell_dir, ignore_errors=True)
+        shutil.rmtree(spill_dir, ignore_errors=True)
         if not all(checks.values()):
             return False  # (its checks are printed on the way out)
         return f"a lake in memory moved to a folder under {len(acked)} writes ({downtime:.1f} s from the move to its first answer there), then Python's and JavaScript's clients (and the library's, when it is built); {len(checks)} checks"

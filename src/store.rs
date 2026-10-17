@@ -476,9 +476,10 @@ pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
 }
 
 /// The folder of this process's spills, DataFusion's and a shuffle's (`spill::dir`): a `memory::Folder` of
-/// this process's own, made by the first spill that needs one and held until the process ends. A static is
-/// never dropped, so the folder (with its lock file, and nothing else once the spills are gone) is left for
-/// the next process on the machine to sweep. A folder that can't be made is remembered as the reason why.
+/// this process's own, made by the first spill that needs one. A static's end runs no destructor, so the
+/// folder goes when the program ends through `memory::leave` (which `cli.rs` calls before each exit); where
+/// that can't remove it (Windows, while its lock file is open), it stays for the next process's sweep. A
+/// folder that can't be made is remembered as the reason why.
 static SPILLS: std::sync::OnceLock<Result<crate::memory::Folder, String>> = std::sync::OnceLock::new();
 
 /// The folder of this process's spills (`SPILLS`), made on first use. Its error when there is none: DataFusion's

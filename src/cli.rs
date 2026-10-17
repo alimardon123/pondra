@@ -332,11 +332,14 @@ pub fn main() {
             // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
             if let Err(e) = run().await {
                 eprintln!("Error: {}", ext::said(&e));
+                crate::memory::leave(); // (what this process made goes first: `process::exit` runs no destructor)
                 std::process::exit(1);
             }
         })
     });
-    if work.expect("a thread to work on").join().is_err() {
+    let panicked = work.expect("a thread to work on").join().is_err();
+    crate::memory::leave(); // (`main` returns, or exits below, past statics no destructor runs for: what it made goes now)
+    if panicked {
         std::process::exit(101); // (a panic, said already: as Rust's main says one)
     }
 }
@@ -515,6 +518,7 @@ async fn run() -> anyhow::Result<()> {
                     // the next node leads at once; there is no drain here, since nothing serves yet)
                     _ = &mut stop => {
                         held.stop().await;
+                        crate::memory::leave();
                         std::process::exit(0);
                     }
                 };
@@ -526,6 +530,7 @@ async fn run() -> anyhow::Result<()> {
                     _ = &mut stop => {
                         tokio::select! { _ = drain::drain() => {}, _ = stopped(false) => {} }
                         node.stop().await;
+                        crate::memory::leave();
                         std::process::exit(0);
                     }
                     // The lake moves: its requests answered and the node stopped, its objects settled on the

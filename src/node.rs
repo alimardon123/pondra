@@ -122,6 +122,9 @@ impl Node {
     /// `held` takes what this start takes (the term, then the lake), so a stop during the start gives it back.
     pub(crate) async fn start(o: Options, held: Arc<Held>) -> anyhow::Result<Node> {
         let Options { dir, listen, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth } = o;
+        // (the spill folders of processes that ended, swept beside the start and not on it: a crashed one's may be
+        // gigabytes, and a cold start waits for nothing but what serving needs, invariant 182)
+        std::thread::spawn(crate::memory::sweep_all);
         crate::served::checked(&dir, reader, auth.admin_set(), crate::env::flag("PONDRA_SERVE_STORE"))?; // (who may serve or open a store: `served.rs`)
         let (_, store, _) = store::open_store(&dir)?;
         let t_start = std::time::Instant::now();
