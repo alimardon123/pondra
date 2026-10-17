@@ -177,9 +177,10 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           commit's build run), distribute.py (Homebrew's formula, Scoop's and winget's manifests from
           a release), sign.py (macOS and Windows signing once the certificates are set),
           upgrade_check.py (every release's lake opens, formats, the drain, rolling upgrades),
-          soak.py (C4's soak), faulty_s3.py (an S3 proxy that errs, loses replies, slows, holds and
-          goes down), resilience_check.py (every mode under failure), git_check.py (Git folders against
-          fake_github.py, a stand-in for GitHub's REST API)
+          soak.py (C4's soak; heap_report.py: a heap-profiled leg's dumps diffed), faulty_s3.py (an
+          S3 proxy that errs, loses replies, slows, holds and goes down), resilience_check.py (every
+          mode under failure), git_check.py (Git folders against fake_github.py, a stand-in for
+          GitHub's REST API)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
 ```
 

@@ -15,6 +15,10 @@ server = ["dep:http", "dep:slatedb", "dep:reqwest", "tokio/full", "dep:axum", "d
           "dep:chrono-tz", "dep:postgres-types", "dep:pgwire", "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:zstd",
           "dep:object_store", "dep:object_store_df", "dep:aws-lc-rs", "dep:tokio-rustls",
           "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tikv-jemallocator", "dep:tower", "dep:http-body-util", "dep:moka"]
+# jemalloc's heap profiling and statistics built in (Linux), for a soak whose nodes dump their
+# heaps: soak.yml's `binary: heap`, read by tools/heap_report.py. Off unless asked: a node built
+# with it profiles nothing until `_RJEM_MALLOC_CONF` says `prof:true`.
+heap-profile = ["tikv-jemallocator?/profiling", "tikv-jemallocator?/stats"]
 
 [workspace]
 members = ["capi", "launcher"] # (pondra_lib, the C ABI, and the launcher that loads it: `cargo build --workspace` builds them with the program, into one folder; a plain build at the root builds the program alone)
