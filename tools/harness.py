@@ -15665,6 +15665,187 @@ def sparksql():
 
 
 
+def jsonedits():
+    """JSON documents changed in place (`pg_json_edit.rs`, round 35): jsonb_set, jsonb_insert, jsonb_concat, `-` and `#-`
+    (jsonb_delete, jsonb_delete_path), jsonb_strip_nulls, json_strip_nulls and jsonb_pretty; and a string cast to an array
+    type read as a Postgres array literal ('{a,b}'::text[], CAST('{1,2}' AS INT[]), TEXT[] '{a,b}') by `pg_values.rs`.
+    Each answer equals Postgres 16's (PONDRA_PG16 names it, default the local one under /tmp/pg16-l3), over HTTP and over
+    the Postgres port; what Postgres refuses is refused with the same SQLSTATE by name (42883 for `-` on a json or a
+    decimal operand, 22023 for a change into a scalar or a key that is there already, 22004 for a NULL path element,
+    22P02 for a path element that isn't an integer where an array is, or text that isn't JSON). Where Pondra reads more
+    than Postgres 16 answers, the check is Pondra's own answer and the note says why: TEXT[] '{a,b}' is a syntax error
+    (42601) in Postgres 16, and a nested array literal is refused by name (0A000).
+    Known gaps, recorded in `info` and not checked: the planner sees a table column's text, not its json type (the marks
+    are answer-side only), so `-` and `#-` on a json or jsonb COLUMN are not refused as Postgres refuses them (`js - 'a'`
+    answers a delete, `doc - 1.5` and `doc - doc` arithmetic's error); jsonb_set of a json column is answered (Postgres:
+    42883). A `-` on a json or jsonb value made by a function (json_build_object, jsonb_build_object) is refused by name.
+    Measured (`bench`, 1,000,000 rows of `(id BIGINT, doc JSONB)`, median of 7 runs after a warm-up): recorded in the
+    commit message and the report, not here.
+    """
+    import csv, psycopg
+    pg_dsn = os.environ.get("PONDRA_PG16", "host=/tmp/pg16-l3 port=55432 user=postgres dbname=postgres")
+    # Rows: a document in jsonb's own text (keys in jsonb's order: what jsonb would print), json text with spaces
+    # (json keeps what it is given), a count. Row 3 is all NULL; row 4 is a scalar (a change into it is refused).
+    rows = [
+        (1, '{"a": 1, "b": [1, 2], "c": {"d": null, "e": "x"}, "n": null}', '{ "a" : 1, "n" : null, "b" : [ 1 , 2 ] }', 1),
+        (2, '[1, null, {"k": null}]', '[1, {"z" : null}, null]', 2),
+        (3, None, None, None),
+        (4, '"text"', '"s"', 4),
+    ]
+    lit = lambda v: "NULL" if v is None else "'" + v.replace("'", "''") + "'"
+    values = ", ".join(f"({i}, {lit(d)}, {lit(j)}, {'NULL' if n is None else n})" for i, d, j, n in rows)
+    setup = ["CREATE TABLE j (id BIGINT, doc JSONB, js JSON, n BIGINT)", f"INSERT INTO j VALUES {values}"]
+    # Each answer is one statement, the same text for Pondra and Postgres 16 (every result cast to text).
+    ok_cases = [
+        ("jsonb_set of a member", "SELECT id, jsonb_set(doc, '{c,e}', '\"y\"')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set of an element", "SELECT id, jsonb_set(doc, '{b,1}', '9')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set from the end of an array", "SELECT id, jsonb_set(doc, '{b,-1}', '9')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set past an array's end (made)", "SELECT id, jsonb_set(doc, '{b,7}', '9')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set of a new member (made)", "SELECT id, jsonb_set(doc, '{zz}', '\"x\"')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set of a new member, not made", "SELECT id, jsonb_set(doc, '{zz}', '\"x\"', false)::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set of an element of an array document", "SELECT id, jsonb_set(doc, '{1}', '9')::text FROM j WHERE id IN (2, 3) ORDER BY id"),
+        ("jsonb_set with a path array", "SELECT id, jsonb_set(doc, ARRAY['c', 'd'], '\"new\"', true)::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_set through a missing member: unchanged", "SELECT id, jsonb_set(doc, '{c,zz,yy}', '1')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_insert before an element", "SELECT id, jsonb_insert(doc, '{b,0}', '0')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_insert after an element", "SELECT id, jsonb_insert(doc, '{b,0}', '0', true)::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_insert after a negative step", "SELECT id, jsonb_insert(doc, '{b,-1}', '0', true)::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_insert of a new member", "SELECT id, jsonb_insert(doc, '{zz}', '\"x\"')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("jsonb_concat of an object and an object", "SELECT id, jsonb_concat(doc, '{\"z\": 1}')::text FROM j ORDER BY id"),
+        ("jsonb_concat of a document and an array", "SELECT id, jsonb_concat(doc, '[9]')::text FROM j ORDER BY id"),
+        ("- a key", "SELECT id, (doc - 'c')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("- a key of an array (nothing to delete)", "SELECT id, (doc - 'b')::text FROM j WHERE id = 2"),
+        ("- an index", "SELECT id, (doc - 1)::text FROM j WHERE id = 2"),
+        ("- a list of keys", "SELECT id, (doc - ARRAY['a', 'c'])::text FROM j WHERE id IN (1, 3) ORDER BY id"),
+        ("#- a path", "SELECT id, (doc #- '{c,e}')::text FROM j WHERE id = 1"),
+        ("#- a negative index", "SELECT id, (doc #- '{b,-1}')::text FROM j WHERE id = 1"),
+        ("#- a path array", "SELECT id, (doc #- ARRAY['b', '1'])::text FROM j WHERE id = 1"),
+        ("#- an element of an array document", "SELECT id, (doc #- '{1}')::text FROM j WHERE id = 2"),
+        ("jsonb_strip_nulls", "SELECT id, jsonb_strip_nulls(doc)::text FROM j ORDER BY id"),
+        ("json_strip_nulls of json text", "SELECT id, json_strip_nulls(js)::text FROM j ORDER BY id"),
+        ("jsonb_pretty", "SELECT id, jsonb_pretty(doc) FROM j WHERE id IN (1, 2) ORDER BY id"),
+        ("jsonb_pretty of a scalar", "SELECT id, jsonb_pretty(doc) FROM j WHERE id = 4"),
+        ("array literals in casts", "SELECT array_to_string('{a,b}'::text[], '|'), array_to_string(CAST('{1,2}' AS INT[]), '|'), array_to_string('{}'::text[], '|')"),
+        ("array literal with quotes and an escape", "SELECT array_to_string('{\"a b\",\"c\\\"d\"}'::text[], '|')"),
+    ]
+    # (name, statement, SQLSTATE Postgres 16 gives it, and Pondra refuses it with)
+    error_cases = [
+        ("- on json made by a function: no operator", "SELECT json_build_object('a', 1) - 'a'", "42883"),
+        ("- a decimal on jsonb made by a function: no operator", "SELECT jsonb_build_object('a', 1) - 1.5", "42883"),
+        ("- jsonb on jsonb made by a function: no operator", "SELECT jsonb_build_object('a', 1) - jsonb_build_array(1)", "42883"),
+        ("#- an integer: no operator", "SELECT doc #- 1 FROM j WHERE id = 1", "42883"),
+        ("- a key of a scalar", "SELECT doc - 'a' FROM j WHERE id = 4", "22023"),
+        ("#- a path of a scalar", "SELECT doc #- '{a}' FROM j WHERE id = 4", "22023"),
+        ("jsonb_set into a scalar", "SELECT jsonb_set(doc, '{a}', '1') FROM j WHERE id = 4", "22023"),
+        ("jsonb_insert of a key that is there", "SELECT jsonb_insert(doc, '{a}', '2') FROM j WHERE id = 1", "22023"),
+        ("an index of an object", "SELECT doc - 0 FROM j WHERE id = 1", "22023"),
+        ("jsonb_set with a NULL path element", "SELECT jsonb_set(doc, '{a,NULL}', '1') FROM j WHERE id = 1", "22004"),
+        ("jsonb_set: a key on an array", "SELECT jsonb_set(doc, '{b,x}', '1') FROM j WHERE id = 1", "22P02"),
+        ("jsonb_set of text that isn't JSON", "SELECT jsonb_set(doc, '{a}', 'x') FROM j WHERE id = 1", "22P02"),
+        ("#- a key on an array", "SELECT doc #- '{x}' FROM j WHERE id = 2", "22P02"),
+        ("a malformed array literal", "SELECT '{a,b'::text[]", "22P02"),
+    ]
+    # Known gaps (the docstring): the planner sees a column's text, not its json type. Postgres's code is pinned;
+    # Pondra's answer is recorded in `info`, not checked.
+    gap_cases = [
+        ("- on a json column", "SELECT js - 'a' FROM j WHERE id = 1", "42883"),
+        ("- a decimal on a jsonb column", "SELECT doc - 1.5 FROM j WHERE id = 1", "42883"),
+        ("- jsonb on a jsonb column", "SELECT doc - doc FROM j WHERE id = 1", "42883"),
+    ]
+    checks, info = {}, {}
+    schema = f"jsonedits_{uuid.uuid4().hex[:8]}"
+    pg = psycopg.connect(pg_dsn, autocommit=True)
+    pg.execute(f"CREATE SCHEMA {schema}")
+    pg.execute(f"SET search_path TO {schema}")
+    for s_ in setup:
+        pg.execute(s_)
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1, pg=f"127.0.0.1:{A.port + 10}").start()
+    try:
+        for s_ in setup:
+            sql(A.port, s_)
+        call(A.port, "POST", "/tier", timeout=600)  # (tiered: the rows come from files as well as the log)
+        time.sleep(1)
+
+        def norm(rows_):  # (every value as text, a NULL as "": the three sides compare alike)
+            return [tuple("" if v is None else str(v) for v in r) for r in rows_]
+
+        def http_rows(text):
+            c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=300)
+            c.request("POST", "/sql?format=csv", text.encode())
+            r = c.getresponse()
+            body = r.read().decode()
+            assert r.status == 200, body[:300]
+            return [tuple(row) for row in list(csv.reader(io.StringIO(body)))[1:]]
+
+        def pg_rows(text):
+            with pg.cursor() as cur:
+                cur.execute(f"SET search_path TO {schema}")
+                cur.execute(text)
+                return norm([tuple(r) for r in cur.fetchall()])
+
+        def port_rows(text):
+            with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as conn:
+                return norm([tuple(r) for r in conn.execute(text).fetchall()])
+
+        def pg_code(text):
+            """The SQLSTATE Postgres 16 refuses a statement with, None when it answers."""
+            try:
+                pg_rows(text)
+                return None
+            except psycopg.Error as e:
+                return e.sqlstate
+
+        def port_code(text):
+            try:
+                port_rows(text)
+                return None
+            except psycopg.Error as e:
+                return e.sqlstate
+
+        for name, text in ok_cases:
+            want = pg_rows(text)
+            got = http_rows(text)
+            checks[f"{name}: HTTP == Postgres 16's answer ({len(want)} rows)"] = got == want
+            checks[f"{name}: the Postgres port == Postgres 16's answer"] = port_rows(text) == want
+            if got != want:
+                info[f"differs: {name}"] = {"pondra": got[:4], "postgres": want[:4]}
+        for name, text, code in error_cases:
+            status, state, body = _sqlstate_of(A.port, text)
+            info[f"refused: {name}"] = [status, state, body[:160]]
+            checks[f"{name}: Postgres 16 refuses with SQLSTATE {code}"] = pg_code(text) == code
+            checks[f"{name}: HTTP refuses by name, SQLSTATE {code}"] = status >= 400 and state == code
+            checks[f"{name}: the Postgres port refuses with SQLSTATE {code}"] = port_code(text) == code
+        for name, text, code in gap_cases:
+            status, state, body = _sqlstate_of(A.port, text)
+            checks[f"known gap, {name}: Postgres 16 refuses with SQLSTATE {code}"] = pg_code(text) == code
+            info[f"known gap: {name}"] = {"postgres": pg_code(text), "pondra": [status, state, body[:160]]}
+        # Where Pondra reads more than Postgres 16 answers: Pondra's own answer is the check, Postgres's is recorded.
+        typed = "SELECT array_to_string(TEXT[] '{a,\"b,c\"}', '|')"
+        info["TEXT[] '{a,\"b,c\"}' in Postgres 16"] = pg_code(typed) or "answered"
+        checks["TEXT[] '{a,\"b,c\"}' is read as an array literal (a|b,c; Postgres 16 refuses its syntax)"] = http_rows(typed) == [("a|b,c",)]
+        nested = "SELECT array_to_string('{{1,2},{3,4}}'::int[], '|')"
+        status, state, body = _sqlstate_of(A.port, nested)
+        info["nested array literal in Postgres 16"] = rows_text(pg_rows(nested))
+        info["refused: nested array literal"] = [status, state, body[:160]]
+        checks["a nested array literal is refused by name, SQLSTATE 0A000 (a gap: Postgres answers it)"] = status >= 400 and state == "0A000"
+        # Known, not yet refused: jsonb_set of a json column (Postgres: no such function).
+        known = "SELECT jsonb_set(js, '{a}', '1') FROM j WHERE id = 1"
+        info["known gap: jsonb_set of a json column (Postgres 16: 42883)"] = {"pondra": http_rows(known), "postgres": pg_code(known)}
+    finally:
+        node.kill()
+        pg.execute(f"DROP SCHEMA {schema} CASCADE")
+        pg.close()
+    ok = all(checks.values())
+    print(json.dumps({"jsonedits": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
+def rows_text(rows_):
+    """A query's rows as text, for a note in a check's `info`."""
+    return [[str(v) for v in r] for r in rows_][:4]
+
+
 def lateral():
     """LATERAL over a function's rows, in one pass (L3, `lateral.rs`, `Lateral` and `functions`): Postgres's
     `FROM t, unnest(t.xs) AS u(x)`, `FROM t, generate_series(1, t.n) AS g`, `CROSS JOIN LATERAL`, `LEFT JOIN
@@ -19038,7 +19219,7 @@ SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20,
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, jsons, colnames, bi, remembered, sparksql, lateral, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, jsons, jsonedits, colnames, bi, remembered, sparksql, lateral, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -19070,7 +19251,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "jsons", "colnames", "bi", "remembered", "sparksql", "lateral", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "jsons", "jsonedits", "colnames", "bi", "remembered", "sparksql", "lateral", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -19083,7 +19264,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "jsons": jsons, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "lateral": lateral, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "jsons": jsons, "jsonedits": jsonedits, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "lateral": lateral, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
