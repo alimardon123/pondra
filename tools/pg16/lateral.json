@@ -109,6 +109,55 @@
   "ordered": "8fee061893065b9ef7567edb7363b3232d39e613436d5d5cd12f13dd4c3c2b7a",
   "sorted": "1514954c8aa03f934f21091bb1db8aaeb13ea0216cdc2d93795e0b720e880c8d"
  },
+ "SELECT t.id, g.v, g.o FROM t LEFT JOIN LATERAL generate_series(1, t.n) WITH ORDINALITY AS g(v, o) ON true": {
+  "count": 60006,
+  "ordered": "8361eb7e61a4c357200db3e8c23e66137367d8de456139d592a0ee80cf130d09",
+  "sorted": "81cbc8e9d47cbba714597b9afcca7ee0697bb7f5193cd0dd0ab77b0100316c4c"
+ },
+ "SELECT t.id, g.v, g.o FROM t, generate_series(5, 7) WITH ORDINALITY AS g(v, o) WHERE t.id <= 2": {
+  "rows": [
+   [
+    "1",
+    "5",
+    "1"
+   ],
+   [
+    "2",
+    "5",
+    "1"
+   ],
+   [
+    "1",
+    "6",
+    "2"
+   ],
+   [
+    "2",
+    "6",
+    "2"
+   ],
+   [
+    "1",
+    "7",
+    "3"
+   ],
+   [
+    "2",
+    "7",
+    "3"
+   ]
+  ]
+ },
+ "SELECT t.id, g.v, g.o FROM t, generate_series(t.n, t.n + 1) WITH ORDINALITY AS g(v, o)": {
+  "count": 40006,
+  "ordered": "3862f57f4fa1662b5aec678a725e257ae8839c460e2355e2d30d9de74a795c52",
+  "sorted": "e92b11d8c668ded4630c40d5d2da4354ae092587b11443db9fe163938cd8cf6f"
+ },
+ "SELECT t.id, ordinality FROM t, unnest(t.xs) WITH ORDINALITY": {
+  "count": 60003,
+  "ordered": "b7f4a9d0380cde12878f50e8ff12aaed4f981cbe8613a07ad5291e7c10d22e2f",
+  "sorted": "7c89cd14ded71453386b7d603400b8dfd214901edc493f57108980425cd48d3c"
+ },
  "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s": {
   "count": 20003,
   "ordered": "dfff7f73334d7f9157ab46edc107a27e5acc73fda911d76448bff5caaf908a84",
@@ -342,6 +391,35 @@
   "count": 18669,
   "ordered": "96694b0cdd0ac9f3b317de4a3b41b7a2722ef2947d7764b0c2f64336f455ea8e",
   "sorted": "fec9540f4c4fa3b249ae3a5bacdaebc7263a8134c84438a56c0e0a51a758c010"
+ },
+ "SELECT t.id, u.x, u.o FROM t, unnest(ARRAY[5, 6]) WITH ORDINALITY AS u(x, o) WHERE t.id <= 2": {
+  "rows": [
+   [
+    "1",
+    "5",
+    "1"
+   ],
+   [
+    "2",
+    "5",
+    "1"
+   ],
+   [
+    "1",
+    "6",
+    "2"
+   ],
+   [
+    "2",
+    "6",
+    "2"
+   ]
+  ]
+ },
+ "SELECT t.id, u.x, u.o FROM t, unnest(t.xs) WITH ORDINALITY AS u(x, o)": {
+  "count": 60003,
+  "ordered": "324c361de0f356ae8ca5b21452b2b2fe3e78631356f038d0a53a496ef62c8a83",
+  "sorted": "571068810ea0b70b5396a5f63de3cd8dd1cd83d0d7b6d42c92968fb82a6fc084"
  },
  "SELECT t.id, u.x, v.y FROM t, LATERAL (SELECT unnest(t.xs) AS x) u CROSS JOIN LATERAL generate_series(1, u.x) AS v(y)": {
   "count": 80007,
