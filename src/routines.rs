@@ -36,7 +36,7 @@ pub use crate::text::sql;
 pub(crate) use crate::text::text;
 pub use crate::text::args;
 pub use crate::expander::{columns_of, names, Kind, Routine};
-use crate::expander::{arguments, params, parse_expr, parse_query, query_text, scalar_body, values_apart, Options, Param, VALUES_SUB};
+use crate::expander::{arguments, is_query, params, parse_expr, parse_query, query_text, scalar_body, values_apart, Options, Param, VALUES_SUB};
 
 pub fn key(name: &str) -> String { format!("r/{name}") }
 
@@ -49,7 +49,24 @@ pub fn of_macro(args: &Option<Vec<ast::MacroArg>>, def: &ast::MacroDefinition) -
         ast::MacroDefinition::Expr(e) => (Kind::Macro, e.to_string()),
         ast::MacroDefinition::Table(q) => (Kind::Table, q.to_string()),
     };
-    Routine { kind, params, language: String::new(), body, returns: None, with: Options::default() }
+    grouped(Routine { kind, params, language: String::new(), body, returns: None, with: Options::default() })
+}
+
+/// A SQL function's body with its JSON operators grouped as Postgres groups them: the rule a view's query gets from
+/// `path::door` before it is stored (`pg_json::text`). It is done where the routine is read, so the routine a statement
+/// carries (`ddl` waits for it to be kept) is the one kept. A query's body is grouped as text; an expression's
+/// (`RETURN d ->> 'a' = '1'`, which the parser reads as `d ->> ('a' = '1')`) as the one value of a SELECT, and kept as
+/// an expression. A procedure's body isn't: its statements go through the door as they run. Python's code is its own.
+pub fn grouped(mut r: Routine) -> Routine {
+    if r.kind == Kind::Procedure || r.python() {
+        return r;
+    }
+    if is_query(&r.body) {
+        r.body = crate::pg_json::text(&r.body).into_owned();
+    } else if let std::borrow::Cow::Owned(select) = crate::pg_json::text(&format!("SELECT {}", r.body)) {
+        r.body = select.strip_prefix("SELECT ").unwrap_or(r.body.as_str()).to_string();
+    }
+    r
 }
 
 /// The statements sqlparser doesn't read as Pondra means them: `CREATE [OR REPLACE] FUNCTION`
@@ -212,7 +229,7 @@ fn routine(p: &mut Parser, sql: &str, procedure: bool) -> Result<(String, Routin
     ensure!(!r.with.vectorized || (r.python() && r.kind == Kind::Macro), "vectorized: a Python function returning a value (not a table, or a procedure)");
     ensure!(r.python() || (r.with.packages.is_empty() && r.with.entry.is_empty()), "packages and entry: a Python routine's");
     ensure!(r.with.cache.is_none() || (r.python() && !procedure), "cache: a Python function's (a SQL function is part of its query, whose answers the result cache keeps; a procedure is called for what it does)");
-    Ok((name, r))
+    Ok((name, grouped(r)))
 }
 
 /// The longest a routine's `timeout` may be: past it a duration would overflow (`1e20`, `inf`).
