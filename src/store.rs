@@ -471,24 +471,36 @@ pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
     space(dir).map(|(free, total)| (free, lake_keeps(total))).filter(|(free, keep)| free < keep)
 }
 
+/// The folder DataFusion's spills go to: a `memory::Folder` of this process's own, made by the first query
+/// that spills and held until the process ends. A static is never dropped, so the folder (with its lock
+/// file, and nothing else once the spills are gone) is left for the next process on the machine to sweep.
+static SPILLS: std::sync::OnceLock<Option<crate::memory::Folder>> = std::sync::OnceLock::new();
+
 /// Where DataFusion's spills go, and how much of the disk they may take (`PONDRA_SPILL_GB`). Not the
-/// OS temp folder, which is held in memory on many Linux systems, where a spill frees nothing: the
-/// `pondra-spill` folder is on the disk with the room (`memory::spill_base`), and the cap is what that
-/// disk has free less the room a lake keeps, or the setting in GB. `0` turns spilling off: a query
-/// that needs it is refused (53200).
+/// OS temp folder, which is held in memory on many Linux systems, where a spill frees nothing. The
+/// folder is the user's own, under the disk with the room (`memory::spill_base`), and folders of
+/// processes that ended are swept from it. The cap is the free space when the lake opens, less the room
+/// a lake keeps, or the setting in GB. `0` turns spilling off: a query that needs it is refused (53200).
+/// A negative setting is no setting.
 fn spill_disk() -> DiskManagerBuilder {
-    let gb = crate::env::parse::<f64>("PONDRA_SPILL_GB");
+    let gb = crate::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0);
     if gb == Some(0.0) {
         return DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
     }
-    let folder = crate::memory::spill_base().join("pondra-spill");
-    let builder = match std::fs::create_dir_all(&folder) {
-        Ok(()) => DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![folder.clone()])),
-        Err(_) => DiskManagerBuilder::default(), // (no folder there: the OS temp folder, as before)
+    let folder = SPILLS.get_or_init(|| match crate::memory::Folder::make("spill") {
+        Ok(folder) => Some(folder),
+        Err(e) => {
+            eprintln!("spills go to the temporary folder: {e}");
+            None
+        }
+    });
+    let builder = match folder {
+        Some(folder) => DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![folder.path.clone()])),
+        None => DiskManagerBuilder::default(), // (no folder: the OS temp folder, as before)
     };
     let cap = match gb {
         Some(gb) => Some((gb * (1u64 << 30) as f64) as u64),
-        None => space(&folder).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
+        None => folder.as_ref().and_then(|f| space(&f.path)).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
     };
     match cap {
         Some(cap) => builder.with_max_temp_directory_size(cap), // (where the platform can't say, DataFusion's own 100 GB stays)

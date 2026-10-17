@@ -93,6 +93,7 @@ PROCESS = {
     "store.rs:ONE": LOCK,
     "store.rs:PARTS": SETTING + " (PONDRA_CORES, --memory-gb)",
     "store.rs:RAM": "the machine's memory, or its container's",
+    "store.rs:SPILLS": "the process's own spill folder, held until it ends: the next process on the machine sweeps it (memory::sweep)",
     "engine.rs:SPARK": "Spark's functions, made against a session with nothing of a lake",
     "temp.rs:CHANGES": "a counter live queries wait on: it only grows, so a waiter never misses a change",
     "tier.rs:SLOTS": SETTING + " (tiering's slots, sized by --memory-gb)",

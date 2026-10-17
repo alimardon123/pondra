@@ -3361,11 +3361,17 @@ def schemas():
     return f"schemas: lake.schema.table, attached lakes as catalogs, CREATE/DROP SCHEMA, DROP TABLE, CTAS, stored and materialized views in SQL from any node, spread over views, clients list schemas: all {len(checks)} checks pass"
 
 
+LOCK_FILE = ".lock"  # memory.rs's LOCK_FILE: a spill folder's lock, held by its process, not a spilled file
+
+
 def spill_files(folder):
-    """The files under a folder now, as (count, bytes): a file that goes while it is counted is not there."""
+    """The spilled files under a folder now, as (count, bytes): a file that goes while it is counted is not there.
+    Lock files don't count: each process's folder keeps its own while the process lives."""
     sizes = []
     for d, _, names in os.walk(folder):
         for n in names:
+            if n == LOCK_FILE:
+                continue
             try:
                 sizes.append(os.path.getsize(os.path.join(d, n)))
             except OSError:
@@ -3627,6 +3633,7 @@ def scale():
     node.kill()  # (the memory-line node still holds the port and the lake: this check starts its own)
     spill_dir = tempfile.mkdtemp(prefix="pondra-spill-")
     spill_env = {"PONDRA_CORES": "4", "PONDRA_SPILL_DIR": spill_dir}
+    spill_root = os.path.join(spill_dir, f"pondra-spill-{os.getuid()}")  # the user's folder a node makes there (memory::spill_base)
     def reply(s, timeout=600):  # (status, SQLSTATE, body) as the node sends it, a refusal included
         c = http_client.HTTPConnection("127.0.0.1", port, timeout=timeout)
         c.request("POST", "/sql", s.encode(), {})
@@ -3638,7 +3645,7 @@ def scale():
     watching = threading.Event()
     def watch_spill():
         while not watching.is_set():
-            n, b = spill_files(spill_dir)
+            n, b = spill_files(spill_root)
             seen["files"], seen["bytes"] = max(seen["files"], n), max(seen["bytes"], b)
             watching.wait(0.2)
     watcher = threading.Thread(target=watch_spill, daemon=True)
@@ -3648,7 +3655,7 @@ def scale():
     finally:
         watching.set()
         watcher.join()
-    left_after = spill_files(spill_dir)
+    left_after = spill_files(spill_root)
     sp_1 = sql(port, "SELECT count(*) AS n, min(k) AS lo, max(k) AS hi FROM sp_1") if sorted_to[0] == 200 else None
     sql(port, "DROP TABLE IF EXISTS sp_1")
     sorter.kill()
