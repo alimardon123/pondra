@@ -442,8 +442,11 @@ async fn read(lake: &Lake, sql: &str) -> Option<(Statement, Known)> {
     Some((stmt, known))
 }
 
+/// `sql` parsed as one statement, read as SQL comes in: Postgres's JSON operators first (`doc ? 'a'`, `doc ?& …`,
+/// `doc @> …`), which the generic dialect can't parse, so every column traced here (Describe, the answer's names,
+/// stored views) is the one the statement runs with (`pg_json::text`, borrowed when it has no such operator).
 fn one(sql: &str) -> Option<Statement> {
-    let mut parsed = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let mut parsed = Parser::parse_sql(&GenericDialect {}, &crate::pg_json::text(sql)).ok()?;
     (parsed.len() == 1).then(|| parsed.pop()).flatten()
 }
 
@@ -1257,6 +1260,16 @@ mod tests {
         assert_eq!(cols("INSERT INTO t (id, name) VALUES ('a', 'b') RETURNING id, name"), [Some(Ty::Uuid), None]);
         assert_eq!(cols("UPDATE t AS x SET name = 'a' FROM s.o WHERE x.id = o.ref RETURNING x.*, o.ref"), [Some(Ty::Uuid), None, Some(Ty::Uuid), Some(Ty::Json), Some(Ty::Uuid)]);
         assert_eq!(cols("DELETE FROM t WHERE true RETURNING *"), [Some(Ty::Uuid), None, Some(Ty::Uuid), Some(Ty::Json)]);
+    }
+
+    #[test]
+    fn traced_json_operators() {
+        // (Postgres's JSON operators the generic dialect can't parse, `?`, `?|`, `?&`, read as Postgres reads them, so the
+        // statement's columns keep their types: the one the port sends as json or jsonb)
+        assert_eq!(cols("SELECT b FROM s.o WHERE b ? 'a'"), [Some(Ty::Jsonb)]);
+        assert_eq!(cols("SELECT doc FROM t WHERE doc ?| array['a', 'b']"), [Some(Ty::Json)]);
+        assert_eq!(cols("SELECT doc, id FROM t WHERE doc ?& array['a']"), [Some(Ty::Json), Some(Ty::Uuid)]);
+        assert_eq!(cols("SELECT doc FROM t WHERE doc @> '{\"a\": 1}'"), [Some(Ty::Json)]);
     }
 
     #[test]

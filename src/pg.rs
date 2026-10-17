@@ -525,6 +525,8 @@ impl Backend {
             Some(b) => b.schema(),
             None => self.schema(&sql, "").await?,
         };
+        // (typed as RowDescription types an answer, so binary COPY sends a jsonb's version byte and a uuid's 16 bytes)
+        let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, &sql).await);
         let format = if c.format == "binary" { FieldFormat::Binary } else { FieldFormat::Text };
         let (info, types) = fields(&schema, &|_| format);
         let pg_types: Vec<Type> = info.iter().map(|f| f.datatype().clone()).collect();
