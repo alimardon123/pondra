@@ -2726,8 +2726,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (53200) instead of growing the node until the OS kills it, and one that streams holds only what it holds.
    What DataFusion keeps inside a window beyond its rows not yet out (the string buffers a long partition's views
    point into, a frame's rows behind those given out, `WindowAggExec`'s final concatenation) is still uncounted.
-   `harness.py scale`: "a window over all rows past the memory limit refuses…" (answered by growing past its pool
-   without it; killed under a 2 GB cap at SF10).
+   `harness.py scale`: "…one no rewrite takes refuses (53200) and the node answers after…" (answered by growing past
+   its pool without it; killed under a 2 GB cap at SF10). A window over whole partitions is answered instead
+   (invariant 422).
 415. **A number with an exponent is a whole decimal, and what a query is said to give is what it gives**
    (`optimize::WholeLiterals`, `query::run_schema`). DataFusion types `1e15` as a decimal of negative scale:
    Arrow's cast to a float divides by `10^scale` (`CAST(1e15 AS DOUBLE)` was `9.999999999999999e14`) and
@@ -2798,6 +2799,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the reading. `harness.py answers_big`: 12M rows as CSV past a 0.25 GB node's memory for queries at a peak of 171 MB
    (the build before refused it, 53200), a cut answer fails its read, an identical query while another is half read
    answers at once.
+422. **A window over whole partitions that ran out of memory is answered as a GROUP BY joined back to its rows, and
+   only then** (`frugal::WholePartition`, `query::frugal`). A window's held rows refuse with "Resources exhausted"
+   (`held.rs`), which starts the frugal retry; its session carries `pondra_frugal.on` (`frugal::mark`), and only
+   there does the rule turn a window whose every expression is `count`, `sum`, `avg`, `min`, `max`, `bool_and` or
+   `bool_or` over one partition, with no order, FILTER or DISTINCT and the whole partition as its frame, into each
+   partition's aggregates grouped by its keys and joined back on them (NULL equal to NULL), its rows on the side a
+   sort-merge join streams; with no keys, one row cross-joined. The rewrite reads its input twice, so it is refused
+   when anything below it gives other rows when read again (a LIMIT, a fetch, DISTINCT ON, a volatile or correlated
+   expression: `differs_by_reading`), and when its fields would differ; a rewrite that can't be built leaves the
+   query to refuse as before. A query that fits plans exactly as before (TPC-H SF1: the same answers, B/A wall
+   0.99). `harness.py scale`: `count(*) OVER ()` and `avg(id) OVER (PARTITION BY id % 3)` over 3M rows on a 0.05 GB
+   node answer, at a peak of 285 MB (refused before, 53200).
 
 ## Tests: run these before and after any change
 
