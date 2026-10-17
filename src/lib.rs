@@ -81,6 +81,7 @@ mod optimize;
 #[cfg(feature = "server")] mod measures;
 #[cfg(feature = "server")] pub mod memory;
 #[cfg(feature = "server")] mod objects;
+#[cfg(feature = "server")] mod oom;
 #[cfg(feature = "server")] mod once;
 #[cfg(feature = "server")] mod metrics;
 #[cfg(feature = "server")] pub mod node;

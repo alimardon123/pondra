@@ -10,6 +10,7 @@
 use futures::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::time::Instant;
 
 /// Run a request: `Err` (the panic's message) if it panicked.
 pub async fn door<T>(f: impl Future<Output = T>) -> Result<T, String> {
@@ -24,10 +25,11 @@ pub async fn door<T>(f: impl Future<Output = T>) -> Result<T, String> {
 /// 22,000). A request runs where it came in while no other has run for [`LONG`]: the hop wakes a
 /// parked thread each way, which cost pgbench's four clients, whose statements take a millisecond
 /// or two, a sixth of their transactions. Dropped, as when its client goes, it stops the work.
-pub async fn work<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
-    use std::{collections::BTreeMap, sync::Mutex, time::Instant};
-    // The requests running, by when each started: ids grow with time, so the first is the oldest.
-    crate::per_node!(static RUNNING: Mutex<BTreeMap<u64, Instant>> = Mutex::new(BTreeMap::new()));
+///
+/// A `stoppable` request is one the node may stop for memory (`oom.rs`): then it answers [`crate::oom::OOM`]
+/// and its future is dropped, its memory let go. Wherever it runs, it can be stopped.
+pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
+    use std::sync::atomic::Ordering::Relaxed;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     struct Stop(u64, Option<tokio::task::AbortHandle>);
     impl Drop for Stop {
@@ -38,20 +40,56 @@ pub async fn work<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static
             }
         }
     }
-    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = NEXT.fetch_add(1, Relaxed);
+    let (f, stop_it) = futures::future::abortable(f);
     let long = {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-        let long = running.first_key_value().is_some_and(|(_, t)| t.elapsed() >= LONG);
-        running.insert(id, Instant::now());
+        let long = running.first_key_value().is_some_and(|(_, r)| r.since.elapsed() >= LONG);
+        let stop = stoppable.then_some(stop_it);
+        running.insert(id, Running { since: Instant::now(), noted: crate::oom::seen(), stop, stopped: false });
         long
     };
     let mut stop = Stop(id, None);
-    if !long {
-        return door(f).await;
+    let out = if !long {
+        door(f).await
+    } else {
+        let task = queries().spawn(door(f));
+        stop.1 = Some(task.abort_handle());
+        task.await.unwrap_or_else(|e| Err(format!("internal error: {e}")))
+    };
+    match out? {
+        Ok(v) => Ok(v),
+        Err(_stopped) => Err(crate::oom::OOM.to_string()), // (the node stopped it for memory: `stop_one`)
     }
-    let task = queries().spawn(door(f));
-    stop.1 = Some(task.abort_handle());
-    task.await.unwrap_or_else(|e| Err(format!("internal error: {e}")))
+}
+
+// The requests running through [`work`], by id (ids grow with time, so the first is the oldest).
+crate::per_node!(static RUNNING: std::sync::Mutex<std::collections::BTreeMap<u64, Running>> = Default::default());
+
+struct Running {
+    since: std::time::Instant,
+    /// The resident memory the watch read when it started (`oom::seen`).
+    noted: usize,
+    /// How to stop it, when it may be stopped.
+    stop: Option<futures::future::AbortHandle>,
+    stopped: bool,
+}
+
+/// Stops the request the watch chose (`oom::pick`), if one qualifies: it is aborted, so its future is
+/// dropped and answers [`crate::oom::OOM`]. True if one was stopped.
+pub(crate) fn stop_one(now: std::time::Instant, margin: usize) -> bool {
+    let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    let asked: Vec<crate::oom::Running> = running
+        .iter()
+        .map(|(id, r)| crate::oom::Running { id: *id, since: r.since, noted: r.noted, stoppable: r.stop.is_some(), stopped: r.stopped })
+        .collect();
+    let Some(id) = crate::oom::pick(&asked, now, crate::oom::seen(), margin) else { return false };
+    let Some(r) = running.get_mut(&id) else { return false };
+    r.stopped = true;
+    if let Some(stop) = r.stop.clone() {
+        stop.abort(); // (its next poll finds it aborted: the future is dropped there)
+    }
+    true
 }
 
 /// Start work of the leader's own that reads and writes as queries do (a view running its query
@@ -166,5 +204,30 @@ pub fn test_function(ctx: &datafusion::prelude::SessionContext) {
     if crate::env::flag("PONDRA_TEST_PANICS") {
         let f = |_: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> { panic!("pondra_panic() was called") };
         ctx.register_udf(create_udf("pondra_panic", vec![], DataType::Int64, Volatility::Volatile, std::sync::Arc::new(f)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // (one test, not two: the running requests are the process's, and a parallel test's stop would be
+    // this one's to see)
+    #[test]
+    fn a_stop_takes_a_stoppable_request_and_answers_out_of_memory() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime");
+        rt.block_on(async {
+            let later = || Instant::now() + std::time::Duration::from_secs(2); // (a request that has run a second or more)
+            let asked = tokio::spawn(work(false, std::future::pending::<()>()));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(!stop_one(later(), 0), "a request that may not be stopped is passed over");
+            asked.abort();
+            let stoppable = tokio::spawn(work(true, std::future::pending::<()>()));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(stop_one(later(), 0), "a stoppable request is stopped");
+            assert_eq!(stoppable.await.expect("the task ends"), Err(crate::oom::OOM.to_string()));
+            assert!(!stop_one(later(), 0), "a stopped request is not stopped again");
+            assert_eq!(work(true, async { 5 }).await, Ok(5), "a request that ends on its own answers");
+        });
     }
 }

@@ -490,6 +490,9 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     };
     req.extensions_mut().insert(who.role);
     let heavy = queries(req.uri().path());
+    let stoppable = stoppable(req.uri().path()); // (a query the node may stop for memory: `oom.rs`)
+    // (a stopped statement fails its session's transaction: who asked, and the headers `temp::of` reads the session from)
+    let asked = stoppable.then(|| (who.clone(), req.headers().clone()));
     // (a Python procedure of an apply calls back with its lent token: those calls are the apply's, as its statements are)
     let applying = crate::auth::lent_applying(token);
     let run = crate::auth::WHO.scope(who, next.run(req));
@@ -499,9 +502,30 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             false => run.await,
         }
     };
-    match if heavy { crate::panics::work(run).await } else { crate::panics::door(run).await } {
+    match if heavy { crate::panics::work(stoppable, run).await } else { crate::panics::door(run).await } {
         Ok(r) => r,
-        Err(m) => E(anyhow::anyhow!(m)).into_response(), // (and the node stays up)
+        Err(m) => {
+            if let (true, Some((who, headers))) = (m == crate::oom::OOM, asked) {
+                failed_for_memory(who, &headers); // (the node stopped the statement: its transaction fails, as an error's does)
+            }
+            E(anyhow::anyhow!(m)).into_response() // (and the node stays up)
+        }
+    }
+}
+
+/// The queries the node may stop for memory (`oom.rs`): a client's query, which its client asks again
+/// or gives up on. Not the cluster's own calls, the bulk writes or a live query, which lives as long as
+/// its client.
+fn stoppable(path: &str) -> bool {
+    matches!(path, "/sql" | "/mcp") || path.starts_with("/sql/pages/")
+}
+
+/// A statement the node stopped for memory fails its session's transaction, as an error does
+/// (`txn::failed`): the session is found as `sql` finds it, for the caller that asked.
+fn failed_for_memory(who: crate::auth::Principal, headers: &axum::http::HeaderMap) {
+    let session = crate::auth::WHO.sync_scope(who, || crate::temp::of(headers)).ok().flatten();
+    if let Some(s) = session {
+        crate::temp::SESSION.sync_scope(Some(s), || crate::txn::failed(crate::oom::OOM));
     }
 }
 

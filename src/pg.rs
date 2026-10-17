@@ -471,7 +471,7 @@ impl Backend {
             let (session, who) = (Some(me.session.clone()), me.who());
             crate::routines::with_notices(crate::temp::SESSION.scope(session, crate::auth::WHO.scope(who, me.caught(&u, &q, &f)))).await
         };
-        let (out, heard) = crate::panics::work(Box::pin(run)).await.unwrap_or_else(|m| (Err(user_error(anyhow::anyhow!(m))), vec![]));
+        let (out, heard) = crate::panics::work(true, Box::pin(run)).await.unwrap_or_else(|m| (Err(user_error(anyhow::anyhow!(m))), vec![])); // (stoppable for memory: `oom.rs`)
         for n in heard {
             let _ = client.send(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
         }
@@ -500,12 +500,16 @@ impl Backend {
     /// Whoever signed in on this connection (nobody, before).
     fn who(&self) -> crate::auth::Principal { self.who.lock().unwrap().clone().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None)) }
 
-    /// A statement pgwire cancelled (a cancel request, psql's Ctrl-C) is dropped before it reaches
-    /// `caught`, which would fail its transaction: here it does, as the error would have.
+    /// A statement pgwire cancelled (a cancel request, psql's Ctrl-C), or one the node stopped for memory
+    /// (`oom.rs`), is dropped before it reaches `caught`, which would fail its transaction: here it does,
+    /// as the error would have.
     fn cancelled<T>(&self, out: &PgWireResult<T>) {
-        if matches!(out, Err(PgWireError::QueryCanceled)) {
-            crate::temp::SESSION.sync_scope(Some(self.session.clone()), || crate::txn::failed("canceling statement due to user request"));
-        }
+        let why = match out {
+            Err(PgWireError::QueryCanceled) => "canceling statement due to user request",
+            Err(PgWireError::UserError(e)) if e.message == crate::oom::OOM => crate::oom::OOM,
+            _ => return,
+        };
+        crate::temp::SESSION.sync_scope(Some(self.session.clone()), || crate::txn::failed(why));
     }
 
     /// `COPY … TO STDOUT`: the rows, one COPY message each.

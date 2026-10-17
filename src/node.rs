@@ -454,6 +454,7 @@ impl Node {
         tr("listening");
         let listener = tls::Doors::bind(&listen, tls::Door::Http).await?; // (TLS too: `tls.rs`)
         store::serving(); // (the catalog's compactor and garbage collector start now: C5)
+        crate::oom::start(); // (the memory line: a query that grows the node past it is stopped, not the node: `oom.rs`)
         runs::mark_stopped(app.clone()); // (runs whose node stopped under them: `stopped`)
         if leader {
             let l = app.lake.clone(); // (what it inherited, replayed from the WAL, into every node's view)

@@ -78,6 +78,7 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_LOCK_LEASE_SECS", Node),
     ("PONDRA_MEMORY_GB", Node),
     ("PONDRA_MEMORY_LAKE_GB", Node),
+    ("PONDRA_MEMORY_MAX_GB", Node),
     ("PONDRA_PAGES_MB", Node),
     ("PONDRA_PIN_LEASE_SECS", Node),
     ("PONDRA_PIN_RENEW_SECS", Node),

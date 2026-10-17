@@ -3531,9 +3531,88 @@ def scale():
     for t in ("ss_3", "ss_2", "ss_1", "ss"):
         sql(port, f"DROP TABLE IF EXISTS {t}")
     sorter.kill()
+    # A query the pool can't see grow: array_agg over 30M values in three groups holds them outside the query memory
+    # (`oom.rs`). On a node whose line is 1 GB (PONDRA_MEMORY_MAX_GB), the watch stops the oldest query that grew past
+    # it: it answers 53200, the node's peak stays under 1.5 GB (without a line it peaked at 1,941 MB), and the node
+    # answers after. Queries that spill under the 0.5 GB pool stay under the line and aren't stopped: a sort, a GROUP BY
+    # and a full ORDER BY over `big`. Then the same statement over Postgres, and in a transaction over HTTP: the statement
+    # fails the transaction, as an error does (COMMIT answers ROLLBACK; the INSERT before it is gone).
+    import heapq, psycopg
+    line = 1 << 30
+    node = Node(lake, port, memory_gb=0.5, pg=f"127.0.0.1:{port + 10}", env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4"), "PONDRA_MEMORY_MAX_GB": "1"}).start()
+    def answer(s, session=None):  # (status, SQLSTATE, body): the answer, or the refusal as the node sends it
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=600)
+        c.request("POST", "/sql", s.encode(), {"x-pondra-session": session} if session else {})
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode(errors="replace")
+    def rows_of(s):  # the rows, or None: a refusal fails its check, it doesn't end the run
+        status, _, body = answer(s)
+        return json.loads(body) if status == 200 else None
+    def resident_of(pid):
+        return int(open(f"/proc/{pid}/statm").read().split()[1]) * 4096
+    def settle():  # resident memory under the line, 15 s at most (the allocator gives its pages back over ten seconds)
+        t = time.time()
+        while resident_of(node.p.pid) >= line and time.time() - t < 15:
+            time.sleep(0.5)
+        return time.time() - t
+    aggregate = "SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, 30000000) GROUP BY 1"
+    t0 = time.time()
+    status, sqlstate, body = answer(aggregate)
+    agg_seconds = time.time() - t0
+    agg_peak = vm_hwm(node.p.pid)
+    agg_settled = settle()
+    t0 = time.time()
+    after = rows_of("SELECT 1 AS one")
+    after_seconds = time.time() - t0
+    t0 = time.time()
+    sort_rows = rows_of("SELECT max(r) AS r FROM (SELECT row_number() OVER (ORDER BY s, id) AS r FROM big)")
+    sort_seconds = time.time() - t0
+    t0 = time.time()
+    group_rows = rows_of("SELECT count(*) AS g, sum(n) AS n FROM (SELECT s, count(*) AS n FROM big GROUP BY s)")
+    group_seconds = time.time() - t0
+    # The last ten rows of a full sort of the table by (s, id): OFFSET keeps no top-N, so the whole table is sorted.
+    t0 = time.time()
+    order_rows = rows_of("SELECT id, s FROM big ORDER BY s, id OFFSET 2999990")
+    order_seconds = time.time() - t0
+    last_ten = sorted(heapq.nlargest(10, ((f"name-{v % 2000000}", v) for v in range(1, 3000001))))
+    spilled_ok = sort_rows == [{"r": 3000000}] and group_rows == [{"g": 2000000, "n": 3000000}] and order_rows is not None and [(r["s"], r["id"]) for r in order_rows] == last_ten
+    stopped_http = status == 503 and sqlstate == "53200" and "out of memory" in body
+    stopped_count = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    # A stop holds the watch for ten seconds (`oom.rs`): each later attempt waits that out, so its refusal is the watch's
+    # and not the pool's, and the counter says so.
+    time.sleep(11)
+    settle()
+    with psycopg.connect(f"host=127.0.0.1 port={port + 10} user=u dbname=lake", autocommit=True) as c:
+        try:
+            c.execute(aggregate).fetchall()
+            stopped_pg = None
+        except psycopg.Error as e:
+            stopped_pg = (e.sqlstate, "nearly out of memory" in str(e))
+    count_pg = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    time.sleep(11)
+    settle()
+    session = "harness-stopped-txn"
+    answer("CREATE TABLE stopped_tx (id BIGINT)")
+    answer("BEGIN", session)
+    answer("INSERT INTO stopped_tx VALUES (1)", session)
+    tx_status, tx_sqlstate, tx_body = answer(aggregate, session)
+    tx_after = answer("SELECT 1 AS one", session)[1]
+    tx_commit = answer("COMMIT", session)[2]
+    tx_count = rows_of("SELECT count(*) AS n FROM stopped_tx")
+    count_tx = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    memory_line = {"array_agg_http": [status, sqlstate, body[:160]], "array_agg_seconds": round(agg_seconds, 1), "peak_mb": agg_peak >> 20,
+                   "settled_after_s": round(agg_settled, 1), "after_stop_seconds": round(after_seconds, 3), "sort_seconds": round(sort_seconds, 1),
+                   "group_seconds": round(group_seconds, 1), "order_seconds": round(order_seconds, 1), "stopped_count": stopped_count,
+                   "array_agg_postgres": stopped_pg, "stopped_count_after_postgres": count_pg, "transaction": [tx_sqlstate, tx_after, tx_commit.strip()[:60], tx_count],
+                   "stopped_count_after_transaction": count_tx}
+    checks["a query the pool doesn't see grow (array_agg over 30M rows) is stopped at the node's memory line (53200), not the node; the node answers after, and spilling queries under the line aren't stopped"] = (
+        stopped_http and agg_peak < 1.5 * (1 << 30) and after == [{"one": 1}] and spilled_ok and stopped_count == 1
+        and stopped_pg == ("53200", True) and count_pg == 2 and tx_sqlstate == "53200" and "nearly out of memory" in tx_body and count_tx == 3
+        and tx_after == "25P02" and '"transaction":"rollback"' in tx_commit.replace(" ", "") and tx_count == [{"n": 0}])
+    node.kill()
     ok = all(checks.values())
     shown = {q: ("same" if same else "DIFFERENT") + (", by ranges" if r else "") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp, r) in shuffles.items()}
-    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "sort_errors": sort_errors, "window_refusals": window_refusals, "ok": ok}, indent=1))
+    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "sort_errors": sort_errors, "window_refusals": window_refusals, "memory_line": memory_line, "ok": ok}, indent=1))
     if not ok:
         print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
         sys.exit(1)
