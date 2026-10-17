@@ -2217,6 +2217,7 @@ dependencies = [
  "flate2",
  "futures",
  "glob",
+ "jiter",
  "lru",
  "lz4_flex",
  "parquet",

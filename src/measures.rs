@@ -39,7 +39,7 @@ fn listed_in(list: &str, word: &str) -> bool {
 }
 
 /// Whether a function is an aggregate, as measures name them (`pg_json_sets` refuses a set-returning call in one).
-pub(crate) fn aggregate(name: &datafusion::sql::sqlparser::ast::ObjectName) -> bool { listed_in(AGGREGATES, &crate::write::object(name)) }
+pub(crate) fn aggregate(name: &datafusion::sql::sqlparser::ast::ObjectName) -> bool { listed_in(AGGREGATES, &text::object(name)) }
 
 /// A plain lower-case name, which SQL reads back the same bare.
 static BARE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^[a-z_][a-z0-9_]*$").expect("a regex"));
