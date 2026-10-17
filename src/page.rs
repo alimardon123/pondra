@@ -1,6 +1,7 @@
 //! A lake-less engine: the tables its caller gives it, SQL through the node's own front, answers in the node's
 //! own bytes, so a page and a node answer alike. The page form's core (designs/l2-b4-web.md); `web/` wraps it.
-//! The files it is given are also read by name (`FROM 'x.csv'`, `read_parquet('x.parquet')`).
+//! The files it is given are also read by name (`FROM 'x.csv'`, `read_parquet('x.parquet')`). DuckDB's forms that
+//! ask the data (`PIVOT`, `COLUMNS`, `SUMMARIZE`) and ASOF JOIN answer as on a node.
 
 use crate::expander::Routine;
 use crate::ext_names::Attached;
@@ -16,10 +17,11 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt, PutPayload};
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::sqlparser::ast::Statement;
 use futures::TryStreamExt;
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -102,21 +104,10 @@ impl Page {
         answer.unwrap_or_else(failed)
     }
 
-    /// SQL as a node reads it: the front, then the rows of the files it names by name (`given`, gone once it has
-    /// answered), then the node's planning (queries only) and the rows in `format`.
+    /// SQL as a node reads it: the front, then the rows of the files it names by name, planned (`plan`), then the
+    /// rows in `format` (an answer with no rows keeps its columns: invariant 88).
     async fn sql(&self, text: &str, format: Option<&str>) -> anyhow::Result<Answer> {
-        let expanded = crate::front::expand(&PageHost(&self.ctx), text, &HashMap::new()).await?;
-        let given = self.given(&expanded).await?;
-        let answer = self.run(&expanded, format).await;
-        for name in given {
-            _ = self.ctx.deregister_table(TableReference::bare(name));
-        }
-        answer
-    }
-
-    /// The node's planning of `sql` and its rows, in `format` (an answer with no rows keeps its columns).
-    async fn run(&self, sql: &str, format: Option<&str>) -> anyhow::Result<Answer> {
-        let df = crate::engine::sql(&self.ctx, sql).await?;
+        let df = self.plan(text).await?;
         let schema = df.schema().inner().clone();
         let mut batches = df.collect().await?;
         if batches.is_empty() {
@@ -125,21 +116,39 @@ impl Page {
         Ok(Answer::ok(crate::answer::content_type(format), crate::answer::render(&batches, format, |_| None)?))
     }
 
-    /// The files the statement names (the front wrote them as `ext:` names), each a table for this statement alone,
-    /// read as a node reads it. Returns the names registered; if one is refused, the ones before it are taken back.
+    /// A statement read as a node reads it: the front, ASOF JOIN's marker, the files it names as tables (`given`),
+    /// then planned. The files' tables go once it is planned: the plan holds what it reads, so a file put again is
+    /// read afresh by the next statement, and requests at once share no table for longer than a plan takes.
+    async fn plan(&self, text: &str) -> anyhow::Result<DataFrame> {
+        let expanded = crate::front::expand(&PageHost(self), text, &HashMap::new()).await?;
+        let expanded = crate::asof::as_of(&expanded)?.into_owned();
+        let given = self.given(&expanded).await?;
+        let planned = crate::engine::sql(&self.ctx, &expanded).await;
+        self.forget(given);
+        planned
+    }
+
+    /// The files the statement names (the front wrote them as `ext:` names), each a table for this statement alone
+    /// (`plan` takes it back), read as a node reads it. Returns the names registered; if one is refused, the ones
+    /// before it are taken back.
     async fn given(&self, sql: &str) -> anyhow::Result<Vec<String>> {
         let mut registered = vec![];
         for name in crate::ext_names::names(sql) {
             let Some(spec) = crate::ext_names::spec(&name) else { continue }; // (not a file's name: the planner answers 42P01 for it)
             if let Err(e) = self.register(&name, &spec).await {
-                for done in registered {
-                    _ = self.ctx.deregister_table(TableReference::bare(done));
-                }
+                self.forget(registered);
                 return Err(e);
             }
             registered.push(name);
         }
         Ok(registered)
+    }
+
+    /// Takes the files' tables a statement registered away again (`given`'s, once planned or refused).
+    fn forget(&self, names: Vec<String>) {
+        for name in names {
+            _ = self.ctx.deregister_table(TableReference::bare(name));
+        }
     }
 
     /// One file a statement names, as a table under its `ext:` name: refused unless a page reads it (its format, its
@@ -222,9 +231,10 @@ impl Page {
     }
 }
 
-/// What a page's SQL asks of where it runs. A page has no routines, no attached lakes, no views with measures and no
-/// types or spellings of its own, so each of those answers "none"; the columns are its tables' own.
-struct PageHost<'a>(&'a SessionContext);
+/// What a page's SQL asks of where it runs. DuckDB's forms that ask the data (`PIVOT`, `COLUMNS`, `SUMMARIZE`) ask the
+/// page itself, as a node asks its own. A page has no routines, no attached lakes and no views with measures, so each
+/// of those answers "none"; the columns are its tables' own.
+struct PageHost<'a>(&'a Page);
 
 impl Host for PageHost<'_> {
     fn name(&self) -> String {
@@ -232,7 +242,10 @@ impl Host for PageHost<'_> {
     }
 
     async fn own(&self, sql: &str) -> anyhow::Result<Own> {
-        Ok(Own::Go(sql.to_string()))
+        match crate::friendly::summarize(self, sql).await? {
+            Some(q) => Ok(Own::Answer(q)),
+            None => Ok(Own::Go(sql.to_string())),
+        }
     }
 
     async fn routines(&self) -> anyhow::Result<Arc<HashMap<String, Routine>>> {
@@ -246,7 +259,7 @@ impl Host for PageHost<'_> {
     async fn columns(&self, tables: BTreeSet<String>) -> anyhow::Result<HashMap<String, Vec<String>>> {
         let mut out = HashMap::new();
         for name in tables {
-            if let Ok(t) = self.0.table_provider(name.as_str()).await {
+            if let Ok(t) = self.0.ctx.table_provider(name.as_str()).await {
                 out.insert(name, t.schema().fields().iter().map(|f| f.name().clone()).collect());
             }
         }
@@ -265,8 +278,14 @@ impl Host for PageHost<'_> {
         Ok(false) // (nor types of its own)
     }
 
-    async fn friendly(&self, _stmts: &mut [Statement]) -> anyhow::Result<bool> {
-        Ok(false) // (its probes: piece 4d)
+    async fn friendly(&self, stmts: &mut [Statement]) -> anyhow::Result<bool> {
+        crate::friendly::rewrite(self, stmts).await
+    }
+
+    // (not an `async fn`: a loop back into the front goes through here, and this declared `Send` is where the
+    // compiler's check of that loop stops)
+    fn ask(&self, sql: &str) -> impl Future<Output = anyhow::Result<DataFrame>> + Send {
+        self.0.plan(sql)
     }
 }
 
@@ -430,5 +449,33 @@ mod tests {
         assert_eq!(page.request("PUT", "/files/x.tsv", "a\tb\n1\t2\n".into()).await.sqlstate, Some("22023"));
         let got = page.request("GET", "/files", bytes::Bytes::new()).await;
         assert_eq!(got.body, r#"["names.csv","orders.csv"]"#);
+    }
+
+    #[tokio::test]
+    async fn duckdb_forms_that_ask_the_data() {
+        let page = page_with_tables().await;
+        // PIVOT asks the page for its values, then writes the pivot as SQL.
+        let pivot = page.request("POST", "/sql?format=csv", "PIVOT (SELECT name, qty FROM orders) ON name USING sum(qty)".into()).await;
+        assert_eq!(pivot.body, "a,b,c\n5,7,9\n");
+        // The same over a file read by name.
+        let by_name = page.request("POST", "/sql?format=csv", "PIVOT (SELECT name, qty FROM 'orders.csv') ON name USING sum(qty)".into()).await;
+        assert_eq!(by_name.body, "a,b,c\n5,7,9\n");
+        // COLUMNS asks the page for the columns the pattern matches.
+        let columns = page.request("POST", "/sql?format=csv", "SELECT COLUMNS('q.*') FROM orders ORDER BY qty".into()).await;
+        assert_eq!(columns.body, "qty\n5\n7\n9\n");
+        // SUMMARIZE asks for the columns, then answers one row a column.
+        let summary = page.request("POST", "/sql?format=csv", "SUMMARIZE orders".into()).await;
+        assert_eq!(summary.status, 200);
+        let lines: Vec<&str> = std::str::from_utf8(&summary.body).unwrap().lines().collect();
+        assert!(lines[0].starts_with("column_name,column_type,min,max"), "{lines:?}");
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[1].starts_with("id,") && lines[2].starts_with("name,") && lines[3].starts_with("qty,"), "{lines:?}");
+        // ASOF JOIN, over two files put by name.
+        assert_eq!(page.request("PUT", "/files/trades.csv", "k,t\n1,3\n1,7\n".into()).await.status, 200);
+        assert_eq!(page.request("PUT", "/files/quotes.csv", "k,t,p\n1,1,100\n1,5,200\n".into()).await.status, 200);
+        let asof = "SELECT tr.t, q.p FROM trades tr ASOF JOIN quotes q ON tr.k = q.k AND tr.t >= q.t ORDER BY tr.t";
+        assert_eq!(page.request("POST", "/sql?format=csv", asof.into()).await.body, "t,p\n3,100\n7,200\n");
+        // Every ask leaves no table behind.
+        assert_eq!(page.request("GET", "/tables", bytes::Bytes::new()).await.body, r#"["names","orders","quotes","trades"]"#);
     }
 }

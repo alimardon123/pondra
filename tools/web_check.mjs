@@ -39,6 +39,8 @@ const CASES = [
   ['DDL refused', 'POST', '/sql', 'CREATE TABLE t (a INT)', undefined, '0A000', undefined],
   ['a file by name', 'POST', '/sql?format=csv', "SELECT sum(qty) AS s FROM 'orders.csv'", 200, null, 's\n21\n'],
   ['a glob', 'POST', '/sql?format=csv', "SELECT count(*) AS n FROM 'order*.csv'", 200, null, 'n\n3\n'],
+  ['PIVOT', 'POST', '/sql?format=csv', 'PIVOT (SELECT name, qty FROM orders) ON name USING sum(qty)', 200, null, 'a,b,c\n5,7,9\n'],
+  ['SUMMARIZE', 'POST', '/sql?format=csv', 'SUMMARIZE orders', 200, null, undefined],
   ['tables', 'GET', '/tables', undefined, 200, null, '["names","orders"]'],
   ['files', 'GET', '/files', undefined, 200, null, '["names.csv","orders.csv"]'],
   ['unknown route', 'GET', '/nowhere', undefined, 404, '0A000', undefined],

@@ -431,10 +431,9 @@ struct Level {
     entered: usize,
 }
 
-/// `stmts` with every friendly form in them rewritten, asking the lake what they need to know;
+/// `stmts` with every friendly form in them rewritten, asking the host what they need to know;
 /// whether any was.
-#[cfg(feature = "server")]
-pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
+pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
     let before = stmts.to_vec();
     // (dbt's `AS (SELECT …)`: a materialized view's query is read as `first_table` reads it, a SELECT
     // of its own; done here, not in the visitor, which doesn't reach a view's query)
@@ -443,7 +442,6 @@ pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
             unparen(query);
         }
         unalias(s)?; // (`DELETE FROM t AS d`: `d.col` is `t.col` in the rows' query, which names the table)
-        default_values(lake, s).await?;
     }
     let mut f = Friendly { asks: Asks::Collect(Vec::new()), with: Vec::new(), orders: Vec::new(), selects: Vec::new(), names: Vec::new() };
     // (a stored view keeps its text: it is expanded as it is read, as its functions are)
@@ -456,7 +454,7 @@ pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
     let Asks::Collect(asks) = std::mem::replace(&mut f.asks, Asks::Apply(VecDeque::new())) else { unreachable!() };
     let mut answers = VecDeque::new();
     for a in asks {
-        answers.push_back(Box::pin(answer(lake, a)).await?); // (its query is expanded too)
+        answers.push_back(Box::pin(answer(host, a)).await?); // (its query is expanded too)
     }
     f.asks = Asks::Apply(answers);
     for s in stmts.iter_mut().filter(|s| !kept(s)) {
@@ -475,23 +473,18 @@ tokio::task_local! {
 /// The answer to an ask, from a query run as the caller (itself expanded: it may hold friendly
 /// SQL too). Asks inside asks stop 8 deep: a probe that asked itself again overflowed the stack
 /// and took the node down.
-#[cfg(feature = "server")]
-async fn answer(lake: &Lake, ask: Ask) -> Result<Vec<Column>> {
+async fn answer<H: crate::front::Host>(host: &H, ask: Ask) -> Result<Vec<Column>> {
     let depth = ASKING.try_with(|d| *d).unwrap_or(0);
     ensure!(depth < 8, "a query that needs its own columns to know its own columns (asked 8 deep)");
-    ASKING.scope(depth + 1, answered(lake, ask)).await
+    ASKING.scope(depth + 1, answered(host, ask)).await
 }
 
-#[cfg(feature = "server")]
-async fn answered(lake: &Lake, ask: Ask) -> Result<Vec<Column>> {
+async fn answered<H: crate::front::Host>(host: &H, ask: Ask) -> Result<Vec<Column>> {
     let (sql, values) = match ask {
         Ask::Values(q) => (q, true),
         Ask::Columns(q) => (q, false),
     };
-    let sql = crate::routines::expand(lake, &sql).await?;
-    let sql = crate::asof::rewrite(&sql)?.into_owned();
-    let ctx = crate::query::session(lake, &sql, "").await?;
-    let df = crate::query::sql(&ctx, &sql).await?;
+    let df = host.ask(&sql).await?;
     if !values {
         return Ok(df.schema().iter().map(|(q, f)| Column { table: q.map(|q| q.table().to_string()), name: f.name().clone(), numeric: f.data_type().is_numeric(), sql_type: sql_type(f.data_type()) }).collect());
     }
@@ -1020,17 +1013,28 @@ fn backslash_pattern(pattern: &str, esc: Option<char>) -> Result<String> {
 /// defaults and identity columns fill the row as they do for any INSERT. Only a lake table; a
 /// temporary table's INSERT is its own path (`temp.rs`), so it is left as it is.
 #[cfg(feature = "server")]
-async fn default_values(lake: &Lake, s: &mut Statement) -> Result<()> {
-    let Statement::Insert(ins) = s else { return Ok(()) };
+async fn default_values(lake: &Lake, s: &mut Statement) -> Result<bool> {
+    let Statement::Insert(ins) = s else { return Ok(false) };
     if ins.source.is_some() || !ins.assignments.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
-    let TableObject::TableName(name) = &ins.table else { return Ok(()) };
-    let Some(meta) = lake.cat.get::<TableMeta>(&crate::store::table_key(&crate::write::object(name))).await? else { return Ok(()) };
+    let TableObject::TableName(name) = &ins.table else { return Ok(false) };
+    let Some(meta) = lake.cat.get::<TableMeta>(&crate::store::table_key(&crate::write::object(name))).await? else { return Ok(false) };
     let columns = meta.logical_columns().iter().filter(|(c, _)| c != "_deleted").count();
-    let Statement::Query(query) = Parser::parse_sql(&GenericDialect {}, &format!("VALUES ({})", vec!["DEFAULT"; columns].join(", ")))?.remove(0) else { return Ok(()) };
+    let Statement::Query(query) = Parser::parse_sql(&GenericDialect {}, &format!("VALUES ({})", vec!["DEFAULT"; columns].join(", ")))?.remove(0) else { return Ok(false) };
     ins.source = Some(query);
-    Ok(())
+    Ok(true)
+}
+
+/// `INSERT INTO t DEFAULT VALUES` filled from each table's columns (`default_values`): the part of `rewrite` that reads
+/// the lake's catalog, which the node runs before it. Whether it changed any statement.
+#[cfg(feature = "server")]
+pub async fn defaults(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
+    let mut changed = false;
+    for s in stmts.iter_mut() {
+        changed |= default_values(lake, s).await?;
+    }
+    Ok(changed)
 }
 
 /// `FETCH FIRST n ROWS ONLY` as `LIMIT n`.
@@ -1584,8 +1588,7 @@ fn with_aliases(s: &mut Select, cols: &[Column]) -> Result<()> {
 /// DuckDB's `SUMMARIZE t` (or `SUMMARIZE SELECT …`): a row per column (its type, least and
 /// greatest value, distinct values about, mean, standard deviation, quartiles, count and share
 /// of NULLs), from one pass over the rows.
-#[cfg(feature = "server")]
-pub async fn summarize(lake: &Lake, sql: &str) -> Result<Option<String>> {
+pub async fn summarize<H: crate::front::Host>(host: &H, sql: &str) -> Result<Option<String>> {
     static SUMMARIZE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*summarize\s+(.+?)\s*;?\s*$").expect("a regex"));
     let Some(m) = SUMMARIZE.captures(sql) else { return Ok(None) };
     let what = m[1].trim();
@@ -1593,7 +1596,7 @@ pub async fn summarize(lake: &Lake, sql: &str) -> Result<Option<String>> {
         true => format!("({what}) AS __summarized"),
         false => what.to_string(),
     };
-    let cols = Box::pin(answer(lake, Ask::Columns(format!("SELECT * FROM {from} LIMIT 0")))).await?;
+    let cols = Box::pin(answer(host, Ask::Columns(format!("SELECT * FROM {from} LIMIT 0")))).await?;
     ensure!(!cols.is_empty(), "SUMMARIZE: no columns");
     let list = |f: &dyn Fn(&Column) -> String| format!("[{}]", cols.iter().map(f).collect::<Vec<_>>().join(", "));
     let c = |col: &Column| name(&col.name);
