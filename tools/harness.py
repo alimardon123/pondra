@@ -14471,6 +14471,7 @@ def jsonfns():
                 check(f"over the port, refused by name, naming {column}: {name}", lambda s=s, column=column: outer_port(conn, s, column))
         check("json_keys is DataFusion's list of the keys, as written (DuckDB's name; json_object_keys expands)",
               lambda: http_answer("SELECT json_keys('{\"b\":1,\"a\":2}') AS k") == [[["b", "a"]]])
+        checks.update(_jsonfns_params(port, pg, info))  # (the parameters and results of SQL functions and procedures, W5)
     finally:
         if node is not None:
             node.kill()
@@ -14479,6 +14480,113 @@ def jsonfns():
     if not ok:
         sys.exit(1)
     return f"{sum(checks.values())} of {len(checks)} JSON function checks"
+
+
+def _jsonfns_params(port, pg, info):
+    """The parameters and results of SQL functions and procedures that take json, jsonb, uuid and varchar(n) (W5, PR #131).
+    Every expected answer is Postgres 16's (names, types, rows, SQLSTATEs), taken in a scratch schema. A jsonb parameter's
+    body reads `->>`, `=` and `?` as Postgres groups them, as a query body and as a RETURN expression; a jsonb and a uuid
+    result come out typed 3802 and 2950 over the port; a varchar(10) parameter and a varchar(3) result neither refuse nor
+    cut a value (Postgres ignores the lengths there); a uuid or jsonb argument that isn't one is refused (22P02) in
+    Postgres's words; and a procedure takes the same types. Python functions aren't checked here: the Postgres 16 this
+    suite runs against has no plpython, so there is no answer of Postgres's to take for them."""
+    import psycopg
+    from psycopg.types.json import JsonbLoader
+    from psycopg.types.string import TextLoader
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    checks = {}
+
+    def check(name, fn):
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def http_rows(s):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        if r.status != 200:
+            raise RuntimeError(f"{r.status}: {data[:300]!r}")
+        rows = json.loads(data, object_pairs_hook=lambda pairs: pairs)  # (pairs, so a NULL's column is left out, as HTTP does)
+        return [[v for _, v in row] for row in rows]
+
+    def http_error(s):
+        """(SQLSTATE header, body) of a statement HTTP refuses."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        return r.getheader("x-pondra-sqlstate"), data
+
+    def port_answer(conn, s, typed=False):
+        """(names, type codes, rows) over the port: jsonb as its text, or decoded by psycopg's loader (`typed`)."""
+        conn.adapters.register_loader(3802, JsonbLoader if typed else TextLoader)
+        cur = conn.execute(s)
+        return [c.name for c in cur.description], [c.type_code for c in cur.description], [list(r) for r in cur.fetchall()]
+
+    def port_refused(conn, s, sqlstate, words):
+        """The port refuses `s` with the SQLSTATE and words in its message (a message that carries the value too)."""
+        try:
+            conn.execute(s)
+        except psycopg.Error as e:
+            return e.sqlstate == sqlstate and words in (e.diag.message_primary or "")
+        return False
+
+    SETUP = [
+        "CREATE FUNCTION w5has(d JSONB) RETURNS BOOLEAN AS $$ SELECT d ->> 'a' = '1' $$ LANGUAGE sql",
+        "CREATE FUNCTION w5ask(d JSONB) RETURNS BOOLEAN AS $$ SELECT d ? 'a' $$ LANGUAGE sql",
+        "CREATE FUNCTION w5ret(d JSONB) RETURNS BOOLEAN LANGUAGE sql RETURN d ->> 'a' = '1'",
+        "CREATE FUNCTION w5jb(d JSONB) RETURNS JSONB AS $$ SELECT d -> 'x' $$ LANGUAGE sql",
+        "CREATE FUNCTION w5id(u UUID) RETURNS UUID AS $$ SELECT u $$ LANGUAGE sql",
+        "CREATE FUNCTION w5vc(s VARCHAR(10)) RETURNS VARCHAR(3) AS $$ SELECT s $$ LANGUAGE sql",
+        "CREATE TABLE w5calls (u UUID, v VARCHAR(10))",
+        "CREATE PROCEDURE w5p(d JSONB, u UUID, v VARCHAR(10)) LANGUAGE sql AS $$ INSERT INTO w5calls VALUES ($u, $v) $$",
+    ]
+    for s in SETUP:
+        check(f"made: {s[:70]}", lambda s=s: call(port, "POST", "/sql", s.encode(), timeout=120) is not None)
+    # (statement, rows): Postgres 16's values, JSON booleans as True and False.
+    HTTP = [
+        ("a jsonb parameter's ->> and = in a query body", "SELECT w5has('{\"a\":1}') AS one, w5has('{\"a\":\"2\"}') AS two", [[True, False]]),
+        ("? on a jsonb parameter in a query body", "SELECT w5ask('{\"a\":1}') AS yes, w5ask('{\"b\":1}') AS no", [[True, False]]),
+        ("the same operators in a RETURN expression", "SELECT w5ret('{\"a\":1}') AS one, w5ret('{\"a\":\"2\"}') AS two", [[True, False]]),
+        ("a jsonb result, as its text", "SELECT w5jb('{\"x\":{\"y\":2}}') AS v", [['{"y": 2}']]),
+        ("a uuid parameter and result, given upper case with hyphens", "SELECT w5id('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11') AS v", [['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11']]),
+        ("a uuid given without hyphens", "SELECT w5id('a0eebc999c0b4ef8bb6d6bb9bd380a11') AS v", [['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11']]),
+        ("a varchar(10) parameter and a varchar(3) result: neither refused nor cut", "SELECT w5vc('abcdefghijklmnop') AS long_arg, w5vc('ab') AS short", [['abcdefghijklmnop', 'ab']]),
+    ]
+    for name, s, want in HTTP:
+        check(f"over HTTP, {name}", lambda s=s, want=want: _same(http_rows(s), want, info, s))
+    # (statement, names, type codes, rows): Postgres 16's, as the port sends them.
+    PORT = [
+        ("a jsonb parameter's ->> and = in a query body: names, types and rows", "SELECT w5has('{\"a\":1}') AS one, w5has('{\"a\":\"2\"}') AS two", ["one", "two"], [16, 16], [[True, False]], False),
+        ("? and a RETURN expression: names, types and rows", "SELECT w5ask('{\"a\":1}') AS yes, w5ret('{\"a\":\"2\"}') AS no", ["yes", "no"], [16, 16], [[True, False]], False),
+        ("a jsonb result as its text, typed 3802", "SELECT w5jb('{\"x\":{\"y\":2}}')", ["w5jb"], [3802], [['{"y": 2}']], False),
+        ("a jsonb result decoded by psycopg, typed 3802", "SELECT w5jb('{\"x\":{\"y\":2}}')", ["w5jb"], [3802], [[{"y": 2}]], True),
+        ("a uuid result typed 2950 (psycopg's uuid.UUID)", "SELECT w5id('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11')", ["w5id"], [2950], [[uuid.UUID("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")]], True),
+    ]
+    with psycopg.connect(url, autocommit=True) as conn:
+        for name, s, names, types, rows, typed in PORT:
+            check(f"over the port, {name}", lambda s=s, names=names, types=types, rows=rows, typed=typed: _same(port_answer(conn, s, typed), (names, types, rows), info, s))
+        check("over the port, a varchar(10) parameter and a varchar(3) result: neither refused nor cut",
+              lambda: _same(port_answer(conn, "SELECT w5vc('abcdefghijklmnop') AS long_arg, w5vc('ab') AS short")[2], [["abcdefghijklmnop", "ab"]], info, "SELECT w5vc"))
+        check("over the port, a uuid that isn't one: refused 22P02 in Postgres's words",
+              lambda: port_refused(conn, "SELECT w5id('nope')", "22P02", 'invalid input syntax for type uuid: "nope"'))
+        check("over the port, a jsonb argument that isn't JSON: refused 22P02 (invalid input syntax for type json)",
+              lambda: port_refused(conn, "SELECT w5has('{bad')", "22P02", "invalid input syntax for type json"))
+    check("over HTTP, a uuid that isn't one: refused 22P02 in Postgres's words",
+          lambda: _refused_http(http_error("SELECT w5id('nope')"), "22P02", 'invalid input syntax for type uuid: "nope"', info, "SELECT w5id('nope')"))
+    check("over HTTP, a jsonb argument that isn't JSON: refused 22P02 (invalid input syntax for type json)",
+          lambda: _refused_http(http_error("SELECT w5has('{bad')"), "22P02", "invalid input syntax for type json", info, "SELECT w5has('{bad')"))
+    # A procedure takes the same types: CALL writes its uuid and varchar(10) arguments as they are.
+    check("over HTTP, a procedure takes a jsonb, a uuid and a varchar(10) argument: CALL writes the uuid and the text",
+          lambda: (call(port, "POST", "/sql", b"CALL w5p('{\"a\":1}', 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', 'abc')", timeout=120) is not None
+                   and _same(http_rows("SELECT u, v FROM w5calls ORDER BY v"), [["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "abc"]], info, "SELECT u, v FROM w5calls")))
+    return checks
 
 
 def _same(got, want, info, sql):

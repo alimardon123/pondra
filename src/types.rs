@@ -625,7 +625,8 @@ pub fn register(ctx: &datafusion::prelude::SessionContext) {
     }));
     let text = || TypeSignature::String(1);
     let trying = || TypeSignature::Exact(vec![DataType::Utf8, DataType::Boolean]);
-    ctx.register_udf(made("pondra_uuid", Signature::one_of(vec![text(), trying()], Volatility::Immutable), |a, _| {
+    // (its answers are marked uuid, so the Postgres port sends a uuid result as Postgres's uuid, whatever query it is in)
+    ctx.register_udf(made_marked("pondra_uuid", Signature::one_of(vec![text(), trying()], Volatility::Immutable), "uuid", |a, _| {
         let text = datafusion::arrow::compute::cast(&a[0], &DataType::Utf8)?;
         let out = text.as_string::<i32>().iter().map(|v| match v.map(uuid_of) {
             Some(Ok(u)) => Ok(Some(u)),
@@ -648,7 +649,7 @@ pub fn register(ctx: &datafusion::prelude::SessionContext) {
 type Body = fn(&[datafusion::arrow::array::ArrayRef], usize) -> datafusion::error::Result<datafusion::arrow::array::ArrayRef>;
 
 /// A function of `register`'s: text out, its rows' count known (a function of no arguments needs it). `mark` is the
-/// JSON type its answers are ("json" or "jsonb"), if they are JSON: the column they make says so.
+/// type its answers are ("json", "jsonb" or "uuid"), if the column they make should say so.
 #[derive(Debug)]
 struct Made {
     name: &'static str,
@@ -691,7 +692,7 @@ fn made(name: &'static str, signature: datafusion::logical_expr::Signature, body
     datafusion::logical_expr::ScalarUDF::new_from_impl(Made { name, signature, mark: None, body })
 }
 
-/// `made`, whose answers are JSON text of the type `mark` names ("json" or "jsonb").
+/// `made`, whose answers are text of the type `mark` names ("json", "jsonb" or "uuid").
 fn made_marked(name: &'static str, signature: datafusion::logical_expr::Signature, mark: &'static str, body: Body) -> datafusion::logical_expr::ScalarUDF {
     datafusion::logical_expr::ScalarUDF::new_from_impl(Made { name, signature, mark: Some(mark), body })
 }

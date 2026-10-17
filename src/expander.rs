@@ -529,8 +529,7 @@ fn select_names(body: &mut ast::SetExpr, sorted: &[String]) -> bool {
 /// x $$`).
 pub(crate) fn scalar_body(body: &str) -> Result<Expr> {
     let text = query_text(body);
-    let first = text.split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default().to_lowercase();
-    if !["select", "with", "values"].contains(&first.as_str()) {
+    if !is_query(text) {
         return parse_expr(text);
     }
     let q = parse_query(text)?;
@@ -546,6 +545,12 @@ pub(crate) fn scalar_body(body: &str) -> Result<Expr> {
 
 /// A body's statement without the `;` that may end it.
 pub(crate) fn query_text(body: &str) -> &str { body.trim().trim_end_matches(';').trim_end() }
+
+/// Whether a body is a query (`SELECT`, `WITH`, `VALUES`) rather than one expression.
+pub(crate) fn is_query(body: &str) -> bool {
+    let first = query_text(body).split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default().to_lowercase();
+    ["select", "with", "values"].contains(&first.as_str())
+}
 
 pub(crate) struct Expander<'a> {
     pub(crate) name: &'a str, // (this lake's name: three-part names)
