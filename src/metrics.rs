@@ -23,6 +23,7 @@ crate::per_node!(pub static SKEW_SPLITS: AtomicU64 = AtomicU64::new(0)); // hot 
 crate::per_node!(pub static RECEIVED: AtomicU64 = AtomicU64::new(0)); // shuffle bytes this node's steps read (its share of the work)
 crate::per_node!(pub static WIRE: AtomicU64 = AtomicU64::new(0)); // bytes other nodes sent this node, compressed as sent (shuffles, gathered results)
 crate::per_node!(pub static WAIT_US: AtomicU64 = AtomicU64::new(0)); // time this node's steps waited for other nodes' buckets
+crate::per_node!(pub static STOPPED_FOR_MEMORY: AtomicU64 = AtomicU64::new(0)); // queries the node stopped because it was nearly out of memory (`oom.rs`)
 // (these two are the process's, not a node's: a stopped node's last queries still count themselves
 // down, and set back to 0 under them they would wrap)
 pub static RUNNING: AtomicU64 = AtomicU64::new(0); // queries running here now, each on one of PONDRA_QUERIES' turns
@@ -103,6 +104,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("wire_bytes_total", "counter", "bytes other nodes sent this node, compressed as sent", &one(get(&WIRE)));
     metric("shuffle_wait_seconds_total", "counter", "time this node's steps waited for other nodes' buckets", &one(get(&WAIT_US) / 1e6));
     let (reserved, limit) = app.lake.memory();
+    metric("queries_stopped_for_memory_total", "counter", "queries stopped because the node was nearly out of memory (PONDRA_MEMORY_MAX_GB)", &one(get(&STOPPED_FOR_MEMORY)));
     metric("memory_limit_bytes", "gauge", "query memory limit (spills beyond it)", &one(limit as f64));
     metric("memory_reserved_bytes", "gauge", "query memory in use", &one(reserved as f64));
     let (hot, hot_max, loading) = app.lake.hot.usage();

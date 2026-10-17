@@ -90,6 +90,7 @@ lakes in `data` as databases: see [A folder of lakes](#a-folder-of-lakes).
 | holds a lake (it has a `catalog/` folder) | serves that lake |
 | has subfolders that hold lakes | serves each as a database named after its folder |
 | is new or empty | makes a new lake there, and serves it |
+| `pondra://host:port` (a lake whose store its node serves with `--serve-store`) | serves that lake through the node that holds it. Nothing is made here, and that node leads the lake |
 
 Two guards keep a mistyped path from making a lake where you did not mean to:
 
@@ -120,6 +121,7 @@ anything that starts a node unattended.
 | `--addr ADDR` | `127.0.0.1:8080` | the address the HTTP API and [the console](/pondra/start/console/) listen on, and other nodes reach this one at |
 | `--advertise ADDR` | `--addr` | the address other nodes reach this one at, when it isn't `--addr`. A database's node, behind the process that serves its folder, is `host:port/db/name` |
 | `--reader` | off | a read-only node: SQL only, never leads. Any number can run beside the writer |
+| `--serve-store` | off | serve this lake's store to nodes on other machines, which open it as `pondra://host:port`. Needs an admin token, the same on every node; this node leads the lake. A folder or `:memory:` only |
 | `--python PYTHON` | none | run Python functions and procedures (`LANGUAGE python`) with this Python, which has the `pondra` package and pyarrow. `auto` takes the first one found. Routines run on warm workers beside the node, gone after a minute idle |
 | `--stop-with-stdin` | off | stop, as on Ctrl-C, when standard input closes: when the program that started the node ends, however it ends |
 

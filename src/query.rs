@@ -850,6 +850,16 @@ pub fn read_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     Ok(datafusion::arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)?.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// The schema a plan's rows have as they run: the analyzer's types, not the SQL planner's. The planner
+/// types a literal such as `1e15` as a decimal with a negative scale, which no table can hold; the
+/// analyzer's rules (`optimize::WholeLiterals`, type coercion) type it as the query runs. Only the
+/// analyzer runs here: the optimizer keeps a plan's schema (DataFusion checks it), so a query that is
+/// only described (a table's columns, a Flight or Postgres description) needn't be optimized to be.
+pub fn run_schema(ctx: &SessionContext, plan: &datafusion::logical_expr::LogicalPlan) -> Result<datafusion::common::DFSchemaRef> {
+    let state = ctx.state();
+    Ok(state.analyzer().execute_and_check(plan.clone(), state.config_options(), |_, _| {})?.schema().clone())
+}
+
 /// A table of this lake in a session: `t` in the default schema (`public`), `s.t` in schema `s`,
 /// exactly as named (SQL folds unquoted names to lower case; a name that isn't must be quoted).
 pub fn table_ref(name: &str) -> datafusion::common::TableReference {

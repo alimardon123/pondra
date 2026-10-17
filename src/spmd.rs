@@ -235,7 +235,7 @@ async fn writers<'a>(lake: &Lake, nodes: &'a [String], me: &str, sql: &str) -> R
     let mut shares: Vec<(&str, Slice)> = nodes.iter().map(String::as_str).zip(deal(lake, &meta, &main, nodes.len()).await?.into_iter().map(|p| slice(vec![p]))).collect();
     let (_, plan) = plan(lake, &shares[mine].1).await?;
     let mut exchanges = vec![];
-    if plan.name().starts_with("Sort") || spread(&plan, &mut exchanges) != Some(Spread::Split) || !exchanges.is_empty() {
+    if plan.name().starts_with("Sort") || plan.name() == "LeanExec" || spread(&plan, &mut exchanges) != Some(Spread::Split) || !exchanges.is_empty() {
         return Ok(refused("its rows don't split over the nodes as they are"));
     }
     if meta.ext.is_none() && upto > meta.tiered {
@@ -979,6 +979,7 @@ fn spread(p: &Arc<dyn ExecutionPlan>, exchanges: &mut Vec<Exchange>) -> Option<S
     match p.name() {
         "DataSourceExec" | "EmptyExec" | "PlaceholderRowExec" => Some(Whole),
         "ProjectionExec" | "FilterExec" | "CoalesceBatchesExec" | "CooperativeExec" | "LocalLimitExec" => one,
+        "HeldInExec" | "HeldOutExec" | "LeanExec" => one, // (a window's memory counted: its rows as they are; a sort's output as it is)
         "async_func" => one, // (AsyncFuncExec: a Python or Flight function, row by row: each node its own rows, through its own workers)
         // (within a node — and a limit within one node, over rows spread across them all, is wrong)
         "CoalescePartitionsExec" | "SortPreservingMergeExec" => (!has("fetch=")).then_some(one?),
@@ -1079,7 +1080,7 @@ fn ranged(p: &Arc<dyn ExecutionPlan>, i: usize) -> bool {
             (JoinSide::Right, _) => ranged(j.right(), c.index),
         });
     }
-    matches!(p.name(), "CoalesceBatchesExec" | "CooperativeExec" | "RepartitionExec" | "CoalescePartitionsExec" | "SortExec" | "SortPreservingMergeExec") && ranged(p.children()[0], i)
+    matches!(p.name(), "CoalesceBatchesExec" | "CooperativeExec" | "RepartitionExec" | "CoalescePartitionsExec" | "SortExec" | "LeanExec" | "SortPreservingMergeExec") && ranged(p.children()[0], i)
 }
 
 /// A join of two sides cut by the same ranges that runs where the rows are: a pair of its keys is

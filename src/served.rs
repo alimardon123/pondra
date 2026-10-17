@@ -2,9 +2,8 @@
 //! (`door`), and another node reads and writes that store through `Served`, an `ObjectStore` that
 //! talks to the door. So a lake held in one node's memory or folder can have more nodes with no
 //! bucket: they reach the store through the node that holds it, and everything else (the log, the
-//! catalog, terms, tiering, spreading) goes through `ObjectStore` as it does for a bucket.
-//! Piece 2 wires it (the routes, `open_store`) and puts the door behind its own check.
-#![allow(dead_code)] // (wired by piece 2: server.rs, open_store)
+//! catalog, terms, tiering, spreading) goes through `ObjectStore` as it does for a bucket. The node
+//! that serves a store leads its lake, and the others never claim a term (`checked`, invariant 299).
 
 use crate::store::Store;
 use axum::body::Body;
@@ -85,14 +84,50 @@ fn nanos(t: DateTime<Utc>) -> i64 { t.timestamp_nanos_opt().unwrap_or_default() 
 // ---- the door (the server side) ----
 
 /// The store, served: its listings at `/`, its objects at `/{path}`. The node mounts it at
-/// `/cluster/store`. It serves whatever store it is given; who may call it is decided where it is
-/// mounted (piece 2).
+/// `/cluster/store`, through `door_for`, which decides who may call it. It serves whatever store it is given.
 pub fn door(store: Store) -> Router {
     Router::new()
         .route("/", get(list))
         .route("/{*path}", get(object).put(put_object).delete(delete_object).post(copy_object))
         .layer(middleware::map_response(stamped))
         .with_state(store)
+}
+
+/// The store door as a node mounts it: its lake's store, to whoever runs the nodes (their admin token;
+/// a user's, even a superuser's, is not), when it was started with --serve-store; otherwise a door
+/// that says how to open it.
+pub fn door_for(store: Store) -> Router {
+    if crate::env::flag("PONDRA_SERVE_STORE") {
+        return door(store).layer(middleware::from_fn(operator_only));
+    }
+    Router::new().fallback(|| async { refused("this node doesn't serve its lake's store: start it with --serve-store") })
+}
+
+/// Passes a request only from whoever runs the nodes (`auth::operator`: their admin token, or the
+/// program that started the node). The guard has let the request in as a sign-in, and says who it was.
+async fn operator_only(req: extract::Request, next: middleware::Next) -> Response {
+    if crate::auth::operator() {
+        return next.run(req).await;
+    }
+    refused("the store of a lake is opened by the nodes that run it, with the admin token they share; a user's token (a superuser's too) can't open it")
+}
+
+/// A refusal of the door: 403, with the header that makes the client say it as `PermissionDenied`.
+fn refused(text: &'static str) -> Response {
+    let mut res = (StatusCode::FORBIDDEN, text).into_response();
+    res.headers_mut().insert("x-pondra-store", HeaderValue::from_static("1"));
+    res
+}
+
+/// Whether a node may start on `dir` as it is asked: one that serves its store (`serving`) leads it, so it is
+/// never a reader, holds its lake on this machine, and has the admin token its nodes open the store with; a
+/// node of a `pondra://` lake opens it with that token too.
+pub fn checked(dir: &str, reader: bool, admin: bool, serving: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(!(serving && reader), "--serve-store: the node that serves a lake's store leads it, and a --reader never leads");
+    anyhow::ensure!(!(serving && dir.contains("://") && !crate::store::in_memory(dir)), "--serve-store serves a lake on this machine (a folder, or :memory:): {dir} is reached by its own URL");
+    anyhow::ensure!(!(serving && !admin), "--serve-store needs --admin-token (or PONDRA_ADMIN_TOKEN), the same on every node: the nodes open the store with it");
+    anyhow::ensure!(!(crate::store::served(dir) && !admin), "a node of {dir} opens its store with the admin token its holder has: set --admin-token (or PONDRA_ADMIN_TOKEN)");
+    Ok(())
 }
 
 /// Every answer the door makes says it is a door's, errors and axum's own rejections too.
@@ -383,6 +418,22 @@ impl Served {
 
 impl std::fmt::Display for Served {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "pondra://{}", self.at) }
+}
+
+/// Until the holder at `at` answers (any HTTP answer, whatever its status), once a second. A node of its
+/// lake that starts while the holder is away waits here, and says so once.
+pub async fn wait_up(at: &str) {
+    let url = crate::tls::url(&format!("{at}/healthz"));
+    let mut said = false;
+    loop {
+        if crate::cluster::http().get(url.as_str()).timeout(Duration::from_secs(2)).send().await.is_ok() {
+            return;
+        }
+        if !std::mem::replace(&mut said, true) {
+            eprintln!("waiting for pondra://{at} to answer");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// What one request sends: its method, URL and headers, and its body (none, or a payload a try sends
@@ -778,6 +829,20 @@ mod tests {
     use object_store::Attribute;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::sync::Arc;
+
+    /// Each refusal of `checked` says its reason, and the cases it lets through pass.
+    #[test]
+    fn a_node_starts_on_a_store_only_as_its_flags_allow() {
+        let why = |dir: &str, reader: bool, admin: bool, serving: bool| checked(dir, reader, admin, serving).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(why("/lake", false, true, true).is_empty(), "serving a folder with the admin token");
+        assert!(why("/lake", false, false, false).is_empty(), "a folder, served by no one");
+        assert!(why("memory://m", false, true, true).is_empty(), "serving a lake in memory");
+        assert!(why("pondra://127.0.0.1:1", false, true, false).is_empty(), "a node of a served lake, with the admin token");
+        assert!(why("/lake", true, true, true).contains("a --reader never leads"));
+        assert!(why("s3://b/x", false, true, true).contains("reached by its own URL"));
+        assert!(why("/lake", false, false, true).contains("needs --admin-token"));
+        assert!(why("pondra://127.0.0.1:1", false, false, false).contains("admin token its holder has"));
+    }
 
     /// Serve `app` on a port of this machine.
     async fn serve(app: Router) -> String {

@@ -181,6 +181,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/job", post(job))
         .route("/cluster/probe", get(|Query(p): Query<HashMap<String, usize>>| async move { crate::guard::probe(p.get("bytes").copied().unwrap_or(0)) }))
         .route("/cluster/beat", post(beat))
+        .nest_service("/cluster/store", crate::served::door_for(app.lake.store.clone())) // (a lake's store, for nodes on other machines: ADR-072 §8)
         .route("/cluster/ack", post(ack))
         .route("/cluster/replica", get(replica))
         .route("/cluster/leader", get(|State(app): State<App>| async move { Json(app.cluster.leader_status()) }))
@@ -489,6 +490,9 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     };
     req.extensions_mut().insert(who.role);
     let heavy = queries(req.uri().path());
+    let stoppable = stoppable(req.uri().path()); // (a query the node may stop for memory: `oom.rs`)
+    // (a stopped statement fails its session's transaction: who asked, and the headers `temp::of` reads the session from)
+    let asked = stoppable.then(|| (who.clone(), req.headers().clone()));
     // (a Python procedure of an apply calls back with its lent token: those calls are the apply's, as its statements are)
     let applying = crate::auth::lent_applying(token);
     let run = crate::auth::WHO.scope(who, next.run(req));
@@ -498,9 +502,30 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             false => run.await,
         }
     };
-    match if heavy { crate::panics::work(run).await } else { crate::panics::door(run).await } {
+    match if heavy { crate::panics::work(stoppable, run).await } else { crate::panics::door(run).await } {
         Ok(r) => r,
-        Err(m) => E(anyhow::anyhow!(m)).into_response(), // (and the node stays up)
+        Err(m) => {
+            if let (true, Some((who, headers))) = (m == crate::oom::OOM, asked) {
+                failed_for_memory(who, &headers); // (the node stopped the statement: its transaction fails, as an error's does)
+            }
+            E(anyhow::anyhow!(m)).into_response() // (and the node stays up)
+        }
+    }
+}
+
+/// The queries the node may stop for memory (`oom.rs`): a client's query, which its client asks again
+/// or gives up on. Not the cluster's own calls, the bulk writes or a live query, which lives as long as
+/// its client.
+fn stoppable(path: &str) -> bool {
+    matches!(path, "/sql" | "/mcp") || path.starts_with("/sql/pages/")
+}
+
+/// A statement the node stopped for memory fails its session's transaction, as an error does
+/// (`txn::failed`): the session is found as `sql` finds it, for the caller that asked.
+fn failed_for_memory(who: crate::auth::Principal, headers: &axum::http::HeaderMap) {
+    let session = crate::auth::WHO.sync_scope(who, || crate::temp::of(headers)).ok().flatten();
+    if let Some(s) = session {
+        crate::temp::SESSION.sync_scope(Some(s), || crate::txn::failed(crate::oom::OOM));
     }
 }
 
@@ -866,14 +891,15 @@ impl App {
                     crate::query::frugal(&ctx);
                 }
                 let df = crate::query::sql(&ctx, query).await?;
-                let (schema, task) = (Arc::new(df.schema().as_arrow().clone()), Arc::new(df.task_ctx()));
+                let task = Arc::new(df.task_ctx());
                 let (state, logical) = df.into_parts();
                 let logical = state.optimize(&logical)?; // (as `create_physical_plan`, the plan it optimized kept: what its filters were about, `learned.rs`)
                 let plan = state.query_planner().create_physical_plan(&logical, &state).await?;
                 let out = crate::query::collect(plan.clone(), task).await?;
                 crate::history::planned(&logical, &plan); // (its shape; a slow statement's plan, with what each operator did; what it learned)
                 let out = if explained { crate::history::explained(out)? } else { out };
-                anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(schema)] } else { out }) // (no rows: still its columns)
+                // (no rows: still its columns, with the types its batches have, which the physical plan gives: not the planner's)
+                anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(plan.schema())] } else { out })
             };
             let here = std::time::Instant::now();
             let out = crate::query::frugally(run).await?;

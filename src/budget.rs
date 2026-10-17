@@ -152,8 +152,6 @@ impl Budget {
 }
 
 /// An HTTP client of the store at `root` that takes its turns (a lake a node serves: `served.rs`).
-// (wired by piece 2: served.rs's client, and the node's routes)
-#[allow(dead_code)]
 pub fn client(root: &str, inner: reqwest::Client) -> HttpClient {
     HttpClient::new(Turns { root: root.to_string(), gate: gate(root), inner: HttpClient::new(inner) })
 }

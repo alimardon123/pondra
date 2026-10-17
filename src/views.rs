@@ -465,8 +465,9 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     let planned = crate::asof::rewrite(sql)?;
     let ctx = session(lake, &planned, "").await?;
     let plan = crate::query::sql(&ctx, &planned).await?.logical_plan().clone();
-    let typed = |p: &LogicalPlan| -> Vec<(String, String)> { p.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect() };
-    let shown = typed(&plan); // (the view's columns, as it is read)
+    // (a table's columns are the types the query runs with, not the planner's: it types `1e15` as a negative scale)
+    let typed = |p: &LogicalPlan| -> Result<Vec<(String, String)>> { Ok(crate::query::run_schema(&ctx, p)?.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect()) };
+    let shown = typed(&plan)?; // (the view's columns, as it is read)
     let written = sql;
     // Its query run again (ADR-056, ADR-059) when asked, or when the rows alone can't keep it: by
     // key when it can be (`median`, …), else whole (`ORDER BY … LIMIT`, a window, `now()`, …).
@@ -529,7 +530,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     }
     ensure!(lag_secs.is_none(), "lag spaces out the runs of a view that runs its query again: {name} is kept from each write's rows, in its commit (refresh = 'full' runs it again instead)");
     let sql = sql.as_str();
-    let columns = typed(&plan);
+    let columns = typed(&plan)?;
     if let Some((c, _)) = columns.iter().find(|(c, _)| crate::sys::NAMES.contains(&c.as_str())) {
         bail!("{c} is a system column of the view's own table: name it something else ({c} AS source{c})");
     }
@@ -605,18 +606,20 @@ async fn finished(lake: &Lake, ctx: &datafusion::prelude::SessionContext, sql: &
     let Some(split) = crate::finish::split(sql, &names, &aggregates)? else { return Ok(None) };
     let planned = crate::asof::rewrite(&split.partial)?;
     let partial = crate::query::sql(&session(lake, &planned, "").await?, &planned).await?.logical_plan().clone();
-    let schema = std::sync::Arc::new(partial.schema().as_arrow().clone());
+    let schema = std::sync::Arc::new(crate::query::run_schema(ctx, &partial)?.as_arrow().clone());
     let decimal = |c: &str| schema.field_with_name(c).is_ok_and(|f| matches!(f.data_type(), DataType::Decimal128(..) | DataType::Decimal256(..)));
     // (planned over an empty table of the partial rows: a column typed otherwise than the query's is cast)
     let aux = datafusion::prelude::SessionContext::new_with_state(ctx.state());
     aux.register_table(crate::finish::PARTIAL, std::sync::Arc::new(datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])?))?;
     let mut sql = split.finish(decimal, &[]);
-    let got = aux.sql(&sql).await.with_context(|| format!("the view's answers from its partial rows: {sql}"))?.schema().clone();
-    let casts: Vec<Option<String>> = got.fields().iter().zip(plan.schema().fields()).map(|(g, w)| (g.data_type() != w.data_type()).then(|| w.data_type().to_string())).collect();
+    let answers = aux.sql(&sql).await.with_context(|| format!("the view's answers from its partial rows: {sql}"))?;
+    let got = crate::query::run_schema(&aux, answers.logical_plan())?;
+    let want = crate::query::run_schema(ctx, plan)?;
+    let casts: Vec<Option<String>> = got.fields().iter().zip(want.fields()).map(|(g, w)| (g.data_type() != w.data_type()).then(|| w.data_type().to_string())).collect();
     if casts.iter().any(Option::is_some) {
         sql = split.finish(decimal, &casts);
     }
-    let columns = plan.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+    let columns = want.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     Ok(Some((split.partial.clone(), partial, crate::finish::Finish { sql, columns }, split.ordered)))
 }
 
@@ -730,7 +733,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
         }
     }
     ensure!(!s.keys.is_empty(), "a session view groups by a key: GROUP BY user");
-    let out = plan.schema();
+    let out = crate::query::run_schema(&ctx, &plan)?;
     ensure!(s.keys.iter().all(|k| out.field_with_unqualified_name(k).is_ok()), "a session view SELECTs its GROUP BY columns, as they are named");
     let columns = out.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
@@ -1366,7 +1369,8 @@ fn top_aggregate(plan: &LogicalPlan) -> Option<&LogicalPlan> {
 async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: Join) -> Result<()> {
     use datafusion::common::tree_node::TreeNode;
     let planned = crate::asof::rewrite(sql)?;
-    let plan = crate::query::sql(&session(lake, &planned, "").await?, &planned).await?.into_unoptimized_plan();
+    let ctx = session(lake, &planned, "").await?;
+    let plan = crate::query::sql(&ctx, &planned).await?.into_unoptimized_plan();
     let mut scans = vec![];
     plan.apply(|p| {
         if let LogicalPlan::TableScan(t) = p {
@@ -1394,7 +1398,7 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
             ensure!(timestamp(&meta, c), "time: {c} isn't a timestamp column of {t}");
         }
     }
-    let columns: Vec<(String, String)> = plan.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+    let columns: Vec<(String, String)> = crate::query::run_schema(&ctx, &plan)?.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     j.tables = tables;
     let now = lake.visible();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: now, ..Default::default() };
