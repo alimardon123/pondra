@@ -8,7 +8,8 @@
 
 use crate::auth::Role;
 use crate::ext;
-use crate::files::{under_files, APPLIES, VERSIONS};
+use crate::files::{APPLIES, VERSIONS};
+use crate::lake_files::under_files;
 use crate::routines::{Outcome, Who};
 use crate::server::App;
 use crate::store::{Changed, Lake};

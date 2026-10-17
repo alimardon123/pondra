@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use datafusion::arrow::array::ArrayRef;
-use datafusion::arrow::datatypes::{DataType, Schema, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::json as arrow_json;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -276,6 +276,25 @@ pub fn type_name(t: &DataType) -> String {
         DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => format!("{}[]", type_name(f.data_type())),
         t => t.to_string(),
     }
+}
+
+pub fn schema(columns: &[(String, String)]) -> Result<SchemaRef> {
+    let fields = columns.iter().map(|(n, t)| Ok(Field::new(n, dtype(t)?, true)));
+    Ok(Arc::new(Schema::new(fields.collect::<Result<Vec<_>>>()?)))
+}
+
+/// A column's type by name: Arrow's own (`Utf8`, `Int64`, `Timestamp(Microsecond, None)`,
+/// `Binary`), `T[]` for a list of T (`Float32[]`: an embedding), and `VARIANT`/`JSON` for
+/// semi-structured text, which is stored as a string and read with `json_get(…)`, `->` and `->>`.
+pub fn dtype(t: &str) -> Result<DataType> {
+    let t = t.trim();
+    Ok(match t.strip_suffix("[]") {
+        Some(item) => DataType::List(Arc::new(Field::new("item", dtype(item)?, true))),
+        None => match t.to_uppercase().as_str() {
+            "VARIANT" | "JSON" => DataType::Utf8,
+            _ => t.parse::<DataType>().map_err(|e| anyhow::anyhow!("unknown column type {t}: {e}"))?,
+        },
+    })
 }
 
 /// How a SQL type is kept: strings as Utf8; timestamps in microseconds, as Iceberg, Delta, Spark

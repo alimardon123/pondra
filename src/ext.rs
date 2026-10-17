@@ -13,7 +13,6 @@ use crate::store::{json, DataFile, Lake, TableMeta};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
-use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::sql::sqlparser::ast::Value;
 use futures::{StreamExt, TryStreamExt};
@@ -22,8 +21,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 pub use crate::ext_names::{attached_table, is, names, spec, Attached, Spec};
-pub(crate) use crate::ext_names::{format_of, quoted, scheme};
-use crate::ext_names::{file_format, glob_at, listing_url};
+pub(crate) use crate::ext_names::{format_of, quoted, scheme, NULL_FOLDER};
+use crate::ext_names::{file_format, folders, hive_value, listed, read_files, schema_of};
 
 tokio::task_local! {
     /// The caller is the program that started this node (the shell, `connect()` of a lake: `server::owner`),
@@ -208,37 +207,23 @@ fn located(l: &str) -> Result<String> {
 
 // ---------------------------------------------------------------- the table they make
 
-/// Text (an error, a plan) with each table of files named as SQL named it: `'s3://…'`, or
-/// `read_csv('…', delim => ';')`, not its internal name.
-/// An error in words for whoever sent the statement: its causes after it, each said once
-/// (DataFusion repeats a cause's words in its own), files named as SQL named them.
+/// An error in words for whoever sent the statement: its causes after it, each said once, files named as SQL
+/// named them (`codes::words` does both, for every door). A node leaves out what its caller may not see: a Python
+/// routine's lines are cut where the caller may not see its code (S27).
 pub fn said(e: &anyhow::Error) -> String {
     let out = crate::codes::words(e);
     match crate::auth::shows_code() {
-        true => readable(&out),
-        false => crate::python::unquoted(&readable(&out)), // (a Python routine's lines, quoted wherever its batch ran: S27)
+        true => out,
+        false => crate::python::unquoted(&out), // (a Python routine's lines, quoted wherever its batch ran: S27)
     }
 }
 
-pub fn readable(text: &str) -> String {
-    static NAMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#""?(ext:[A-Za-z0-9_-]+)"?"#).expect("a regex"));
-    NAMES.replace_all(text, |c: &regex::Captures| {
-        let Some(s) = spec(&c[1]) else { return c[0].to_string() };
-        let urls = s.urls.iter().map(|u| format!("'{u}'")).collect::<Vec<_>>();
-        let urls = if urls.len() == 1 { urls[0].clone() } else { format!("[{}]", urls.join(", ")) };
-        match s.options.is_empty() {
-            true if s.urls.len() == 1 => urls,
-            _ => format!("read_{}({urls}{})", s.format, s.options.iter().map(|(k, v)| format!(", {k} => '{v}'")).collect::<String>()),
-        }
-    }).into_owned()
-}
-
-/// An EXPLAIN's rows, its tables of files named as SQL named them (`readable`).
+/// An EXPLAIN's rows, its tables of files named as SQL named them (`ext_names::readable`).
 pub fn readable_rows(batches: Vec<datafusion::arrow::record_batch::RecordBatch>) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
     use datafusion::arrow::array::{ArrayRef, AsArray, StringArray};
     batches.into_iter().map(|b| {
         let columns = b.columns().iter().map(|c| match c.data_type() {
-            datafusion::arrow::datatypes::DataType::Utf8 => Arc::new(c.as_string::<i32>().iter().map(|v| v.map(readable)).collect::<StringArray>()) as ArrayRef,
+            datafusion::arrow::datatypes::DataType::Utf8 => Arc::new(c.as_string::<i32>().iter().map(|v| v.map(crate::ext_names::readable)).collect::<StringArray>()) as ArrayRef,
             _ => c.clone(),
         });
         Ok(datafusion::arrow::record_batch::RecordBatch::try_new(b.schema(), columns.collect())?)
@@ -398,32 +383,21 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
         Some(c) => crate::write::declared(c).await?,
         None => vec![],
     };
-    let (mut objects, mut urls) = (vec![], vec![]);
-    let deep = spec.urls.iter().any(|u| u.contains("**") || glob_at(u).is_some_and(|i| u[i..].contains('/')));
-    ctx.state_ref().write().config_mut().options_mut().execution.listing_table_ignore_subdirectory = !deep; // (`**`, `*/x.parquet`: into folders)
-    let state = ctx.state();
     for u in &spec.urls {
-        let url = listing_url(u)?;
         register(lake, u).await?;
-        let store = lake.rt.object_store(&url)?;
-        let wanted = if u.ends_with('/') { format!(".{}", spec.format) } else { String::new() }; // (a folder: its files of that format)
-        let found: Vec<_> = url.list_all_files(&state, store.as_ref(), &wanted).await?.try_collect().await?;
-        ensure!(!found.is_empty() || declared.is_some(), "no files at {u}"); // (declared: none yet is an empty table)
-        objects.extend(found.into_iter().map(|o| (store.clone(), url.clone(), o)));
-        urls.push(url);
     }
-    objects.sort_by(|a, b| a.2.location.cmp(&b.2.location)); // (every node lists them in one order)
+    let state = ctx.state();
+    let found = listed(&state, spec, |u| declared.is_none().then(|| anyhow!("no files at {u}"))).await?; // (declared: none yet is an empty table)
     let named = |fields: &[datafusion::arrow::datatypes::FieldRef]| -> Vec<(String, String)> { fields.iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect() };
-    if objects.is_empty() {
+    if found.is_empty() {
         let columns = [named(declared.as_deref().unwrap_or_default()), named(&hive_types)].concat();
         return Ok(TableMeta { columns, ext: Some(spec.clone()), ..Default::default() });
     }
-    let (store, first) = (objects[0].0.clone(), objects.iter().take(if spec.format == "parquet" { usize::MAX } else { 16 }).map(|o| o.2.clone()).collect::<Vec<_>>());
     // CSV's declared columns are its columns by position, JSON's by name: the readers take them as
     // they are. Parquet's files say their own (for their statistics), read by name as declared.
     let schema = match (&declared, spec.format.as_str()) {
         (Some(d), "csv" | "json") => Arc::new(datafusion::arrow::datatypes::Schema::new(d.clone())),
-        _ => inferred(format.as_ref(), &state, &store, &first).await.with_context(|| format!("reading {}", spec.urls.join(", ")))?,
+        _ => schema_of(&state, spec, &found).await?,
     };
     let mut columns: Vec<(String, String)> = named(declared.as_deref().unwrap_or(&schema.fields()[..]));
     // (a column read as another type than the file's: its ranges are the file's type's, so none is kept)
@@ -432,32 +406,17 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
         None => schema.fields().iter().map(|f| f.name().clone()).collect(),
     };
     let missing = declared.is_some() && spec.format == "parquet" && columns.iter().any(|(c, _)| schema.field_with_name(c).is_err());
-    // Hive-style folders (`day=2026-09-28/`): each a column, the same in every file's path, typed
-    // by what all its values are (as Spark, DuckDB and Polars do).
-    let hive = |url: &ListingTableUrl, o: &object_store_df::ObjectMeta| -> Vec<(String, String)> {
-        let rest = o.location.as_ref().strip_prefix(url.prefix().as_ref()).unwrap_or_default();
-        rest.split('/').filter_map(|s| s.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-    };
-    // Found unless turned off (DuckDB's and Spark's default); when asked for, every file has them.
-    let asked = spec.options.get("hive_partitioning").map(|v| v != "false" && v != "0").or((!hive_types.is_empty()).then_some(true));
-    let found: Vec<Vec<String>> = if asked == Some(false) { vec![] } else { objects.iter().map(|(_, u, o)| hive(u, o).into_iter().map(|(k, _)| k).collect()).collect() };
-    let same = found.windows(2).all(|w| w[0] == w[1]);
-    ensure!(same || asked != Some(true), "{}: files in other folders than {} (hive_partitioning)", spec.urls.join(", "), found[0].join("/"));
-    let keys = if same { found.first().cloned().unwrap_or_default() } else { vec![] };
+    // Hive-style folders (`day=2026-09-28/`): each a column, the keys and types worked out by `keys`.
+    let keys = crate::ext_names::keys(&found, spec, &hive_types, &columns)?;
+    columns.extend(keys.iter().cloned());
     let hived = !keys.is_empty();
-    for (i, k) in keys.iter().enumerate() {
-        ensure!(!columns.iter().any(|(c, _)| c == k), "{k} is a folder's key and a column in the files");
-        let values: Vec<String> = objects.iter().filter_map(|(_, url, o)| hive_value(hive(url, o).get(i)?.1.as_str())).collect();
-        let typed = hive_types.iter().find(|f| f.name() == k).map(|f| crate::query::type_name(f.data_type()));
-        columns.push((k.clone(), typed.unwrap_or_else(|| hive_type(&values).into())));
-    }
     let parquet = spec.format == "parquet";
-    let stats: Vec<_> = objects.into_iter().map(|(store, url, o)| {
+    let stats: Vec<_> = found.into_iter().map(|hit| {
         let (format, schema, state, as_stored) = (format.clone(), schema.clone(), state.clone(), as_stored.clone());
-        let part = if hived { hive(&url, &o) } else { vec![] };
+        let part = if hived { folders(&hit.url, &hit.object) } else { vec![] };
         async move {
-            let root = url.object_store();
-            let full = format!("{}{}", root.as_str().strip_suffix('/').unwrap_or(root.as_str()), url_path(&o)); // (`file:///x`, `s3://b/x`)
+            let full = hit.full(); // (`file:///x`, `s3://b/x`)
+            let (store, o) = (hit.store, hit.object);
             let s = if parquet { Some(format.infer_stats(&state, &store, schema.clone(), &o).await?) } else { None };
             let mut f = file(full, o.size, s.as_ref(), &schema);
             f.stats.retain(|c, _| as_stored.contains(c));
@@ -488,56 +447,12 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
 pub(crate) async fn objects(lake: &Lake, spec: &Spec) -> Result<Vec<(String, object_store_df::ObjectMeta)>> {
     check(lake, spec).await?;
     let u = &spec.urls[0];
-    let url = listing_url(u)?;
     register(lake, u).await?;
-    let store = lake.rt.object_store(&url)?;
-    let ctx = lake.session();
-    let deep = u.contains("**") || glob_at(u).is_some_and(|i| u[i..].contains('/'));
-    ctx.state_ref().write().config_mut().options_mut().execution.listing_table_ignore_subdirectory = !deep;
-    let state = ctx.state();
-    let wanted = if u.ends_with('/') { format!(".{}", spec.format) } else { String::new() };
-    let found: Vec<_> = url.list_all_files(&state, store.as_ref(), &wanted).await?.try_collect().await?;
-    let root = url.object_store();
-    let root = root.as_str().strip_suffix('/').unwrap_or(root.as_str()).to_string();
-    let mut out: Vec<_> = found.into_iter().map(|o| (format!("{root}{}", url_path(&o)), o)).collect();
-    out.sort_by(|a, b| a.1.location.cmp(&b.1.location));
-    Ok(out)
+    let state = lake.session().state();
+    let first = Spec { urls: vec![u.clone()], ..spec.clone() };
+    let found = listed(&state, &first, |_| None).await?;
+    Ok(found.into_iter().map(|f| (f.full(), f.object)).collect())
 }
-
-/// A NULL's folder, as Hive, Spark, pyarrow and Polars name it.
-pub const NULL_FOLDER: &str = "__HIVE_DEFAULT_PARTITION__";
-
-/// A folder's value as written (percent-escaped where a path can't hold a character), or None
-/// for a NULL's folder.
-fn hive_value(v: &str) -> Option<String> {
-    if v == NULL_FOLDER {
-        return None;
-    }
-    let (b, mut out, mut i) = (v.as_bytes(), Vec::with_capacity(v.len()), 0);
-    while i < b.len() {
-        match (b[i], v.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())) {
-            (b'%', Some(c)) => (out.push(c), i += 3),
-            (c, _) => (out.push(c), i += 1),
-        };
-    }
-    Some(String::from_utf8_lossy(&out).into_owned())
-}
-
-/// A folder key's type: whole numbers, numbers, dates, or text.
-fn hive_type(values: &[String]) -> &'static str {
-    let all = |ok: fn(&str) -> bool| !values.is_empty() && values.iter().all(|v| ok(v));
-    if all(|v| v.parse::<i64>().is_ok()) {
-        "Int64"
-    } else if all(|v| v.parse::<f64>().is_ok_and(f64::is_finite)) {
-        "Float64"
-    } else if all(|v| v.len() == 10 && chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").is_ok()) {
-        "Date32"
-    } else {
-        "Utf8"
-    }
-}
-
-fn url_path(o: &object_store_df::ObjectMeta) -> String { format!("/{}", o.location) }
 
 /// A file as a table's `DataFile`: its rows and exact column ranges when its footer says.
 fn file(path: String, bytes: u64, s: Option<&datafusion::common::Statistics>, schema: &datafusion::arrow::datatypes::Schema) -> DataFile {
@@ -560,20 +475,6 @@ fn file(path: String, bytes: u64, s: Option<&datafusion::common::Statistics>, sc
     DataFile { path, bytes, rows, stats, nulls, ..Default::default() }
 }
 
-/// The files' columns; files whose notes differ (pandas' metadata, each file's own) merged without them.
-async fn inferred(format: &dyn FileFormat, state: &dyn datafusion::catalog::Session, store: &Arc<dyn object_store_df::ObjectStore>, files: &[object_store_df::ObjectMeta]) -> Result<datafusion::arrow::datatypes::SchemaRef> {
-    match format.infer_schema(state, store, files).await {
-        Err(e) if e.to_string().contains("conflicting metadata") => {
-            let mut each = vec![];
-            for f in files {
-                each.push(format.infer_schema(state, store, std::slice::from_ref(f)).await?.as_ref().clone().with_metadata(Default::default()));
-            }
-            Ok(Arc::new(datafusion::arrow::datatypes::Schema::try_merge(each)?))
-        }
-        r => Ok(r?),
-    }
-}
-
 /// The rows of `files` of an `ext:` table, as `schema`: DataFusion's own readers, without the hot
 /// columns (outside the lake, a file may change under the same name).
 pub async fn read(lake: &Lake, ctx: &datafusion::prelude::SessionContext, files: &[&DataFile], schema: &datafusion::arrow::datatypes::SchemaRef, spec: &Spec, table: Option<&crate::scan::Table>) -> Result<datafusion::prelude::DataFrame> {
@@ -586,43 +487,8 @@ pub async fn read(lake: &Lake, ctx: &datafusion::prelude::SessionContext, files:
     if spec.format == "parquet" {
         return crate::scan::read(ctx, files, schema, None).await; // (as listed: no second look at each file before it is read)
     }
-    use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
-    use datafusion::prelude::{cast, ident, lit};
-    let folders = |f: &DataFile| f.part.split('/').filter_map(|s| s.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
-    let keys: Vec<String> = files.first().map(|f| folders(f).into_iter().map(|(k, _)| k).collect()).unwrap_or_default();
-    let fields: Vec<_> = schema.fields().iter().filter(|f| !keys.contains(f.name())).cloned().collect();
-    let stored = crate::query::schema(&fields.iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect::<Vec<_>>())?; // (as the files hold it)
-    let in_files = if spec.format == "parquet" { Arc::new(datafusion::arrow::datatypes::Schema::new(fields)) } else { stored };
-    let mut by_folder: BTreeMap<&str, Vec<&DataFile>> = BTreeMap::new();
-    files.iter().for_each(|f| by_folder.entry(f.part.as_str()).or_default().push(f));
-    let mut out: Option<datafusion::prelude::DataFrame> = None;
-    for group in by_folder.into_values() {
-        let urls = group.iter().map(|f| ListingTableUrl::parse(&f.path)).collect::<datafusion::error::Result<Vec<_>>>()?;
-        let options = ListingOptions::new(file_format(spec)?).with_file_extension("");
-        let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options);
-        let config = match spec.format.as_str() {
-            "arrow" => {
-                // (as each file holds its columns: Arrow's reader doesn't cast them, the select below
-                // does; the files' notes left out, as the table's columns have none)
-                let mut c = config.infer_schema(&ctx.state()).await?;
-                c.file_schema = c.file_schema.map(|s| Arc::new(s.as_ref().clone().with_metadata(Default::default())));
-                c
-            }
-            _ => config.with_schema(in_files.clone()),
-        };
-        let table = ListingTable::try_new(config)?;
-        let mut df = ctx.read_table(Arc::new(table))?;
-        for (k, v) in folders(group[0]) {
-            df = df.with_column(&k, lit(datafusion::common::ScalarValue::Utf8(hive_value(&v))))?; // (a folder's value, for each of its rows)
-        }
-        let typed = schema.fields().iter().map(|f| cast(ident(f.name()), f.data_type().clone()).alias(f.name())).collect::<Vec<_>>();
-        let df = df.select(typed)?;
-        out = Some(match out {
-            Some(o) => o.union(df)?,
-            None => df,
-        });
-    }
-    out.context("no files")
+    let files: Vec<(&str, &str)> = files.iter().map(|f| (f.path.as_str(), f.part.as_str())).collect();
+    read_files(ctx, &files, schema, spec).await
 }
 
 // ---------------------------------------------------------------- where they are

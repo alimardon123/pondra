@@ -2,8 +2,14 @@
 // TPC-H's 22 queries on the page form (web/, tools/web_check.mjs) and on DuckDB-WASM, in Node: answers compared as
 // singlenode.py compares them, load, time and memory. Each engine runs in child processes of its own (this file,
 // `--engine`), so a query that kills or hangs one is recorded and the rest go on.
-//   node tools/web_bench.mjs --data DIR --duckdb NODE_MODULES [--pkg web/pkg] [--queries tools/bench/tpch-queries]
-//        [--runs 3] [--timeout 600] [--out FILE]
+//   node tools/web_bench.mjs --data DIR --duckdb NODE_MODULES [--arrow NODE_MODULES] [--pkg web/pkg]
+//        [--queries tools/bench/tpch-queries] [--runs 3] [--timeout 600] [--out FILE]
+// A node answers strings as views (its Parquet is read with views), and apache-arrow older than 21 cannot read views.
+// So --arrow names the apache-arrow that reads both engines' answers (default: --duckdb's, which is 17 and stops the
+// run with that message); it must be 21 or newer.
+// A page's load is PUT /files/<t>.parquet, then CREATE TABLE <t> AS FROM '<t>.parquet', then DELETE of the file; DuckDB's
+// is registerFileBuffer and CREATE TABLE AS, then dropFile. Each side lets its file go, and the rows are counted by
+// SELECT count(*) after the load's clock stops.
 // One table on stdout; exit 1 if an answer differs, a query failed on either engine, or an engine did not load.
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -15,6 +21,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const HERE = fileURLToPath(import.meta.url);
 const NAMES = Array.from({ length: 22 }, (_, i) => `q${i + 1}`);
 const dec = new TextDecoder();
+// The packages of a node_modules folder, loaded as from a file beside it.
+const loaderOf = (folder) => createRequire(join(folder, 'x.js'));
 
 // ---- the command line -------------------------------------------------------------------------------------------
 
@@ -24,11 +32,13 @@ function options(argv) {
     return i < 0 ? dflt : argv[i + 1];
   };
   const root = resolve(dirname(HERE), '..');
+  const duckdb = get('duckdb') && resolve(get('duckdb'));
   return {
     engine: get('engine'), // (a child's own: `pondra` or `duckdb`)
     only: (get('only', '') || '').split(',').filter(Boolean), // (a child's own: the queries it runs)
     data: get('data') && resolve(get('data')),
-    duckdb: get('duckdb') && resolve(get('duckdb')),
+    duckdb,
+    arrow: (get('arrow') && resolve(get('arrow'))) || duckdb, // (apache-arrow 21 or newer: reads a node's views)
     pkg: resolve(get('pkg', join(root, 'web/pkg'))),
     queries: resolve(get('queries', join(root, 'tools/bench/tpch-queries'))),
     runs: Number(get('runs', 3)),
@@ -119,40 +129,47 @@ async function readTables(dir) {
   return tables;
 }
 
-// The page: `PUT /files/<table>.parquet` per table. Its counts are the rows each PUT answered.
+// The page, through ADR-061's contract: per table, a PUT of its file, a CREATE TABLE … AS FROM it, then the file's
+// DELETE (a page holds each table once).
 async function openPage(o, arrow) {
   const { default: init, Page } = await import(pathToFileURL(join(o.pkg, 'pondra_web.js')).href);
   await init({ module_or_path: await readFile(join(o.pkg, 'pondra_web_bg.wasm')) });
   const page = new Page();
-  const putRows = {};
   let version = 'unknown';
   try {
     version = (await readFile(join(o.pkg, '..', 'Cargo.toml'), 'utf8')).match(/^version = "(.*)"/m)[1];
   } catch {
     // (no Cargo.toml beside the module: the version stays unknown)
   }
+  async function query(sql) {
+    const a = await page.request('POST', '/sql?format=arrow', undefined, sql);
+    if (a.status !== 200) throw new Error(`${a.headers['x-pondra-sqlstate']}: ${dec.decode(a.body).split('\n')[0]}`);
+    return arrow.tableFromIPC(a.body);
+  }
   return {
     version,
     async load(tables) {
       for (const t of tables) {
-        const a = await page.request('PUT', `/files/${t.name}.parquet`, t.bytes);
-        if (a.status !== 200) throw new Error(`PUT ${t.name}: ${a.status} ${dec.decode(a.body)}`);
-        const j = JSON.parse(dec.decode(a.body));
-        if (j.table !== t.name) throw new Error(`PUT ${t.name} answered for ${j.table}`);
-        putRows[t.name] = j.rows;
+        const put = await page.request('PUT', `/files/${t.name}.parquet`, undefined, t.bytes);
+        if (put.status !== 200) throw new Error(`PUT ${t.name}: ${put.status} ${dec.decode(put.body)}`);
+        const made = await page.request('POST', '/sql', undefined, `CREATE TABLE ${t.name} AS FROM '${t.name}.parquet'`);
+        if (made.status !== 200) throw new Error(`CREATE TABLE ${t.name}: ${made.headers['x-pondra-sqlstate']} ${dec.decode(made.body)}`);
+        const gone = await page.request('DELETE', `/files/${t.name}.parquet`, undefined, undefined);
+        if (gone.status !== 200) throw new Error(`DELETE ${t.name}: ${gone.status} ${dec.decode(gone.body)}`);
       }
     },
-    counts: async (names) => Object.fromEntries(names.map((n) => [n, putRows[n]])),
-    async run(sql) {
-      const a = await page.request('POST', '/sql?format=arrow', sql);
-      if (a.status !== 200) throw new Error(`${a.sqlstate}: ${dec.decode(a.body).split('\n')[0]}`);
-      return arrow.tableFromIPC(a.body);
+    async counts(names) {
+      const rows = {};
+      for (const n of names) rows[n] = Number((await query(`SELECT count(*) AS n FROM ${n}`)).getChildAt(0).get(0));
+      return rows;
     },
+    run: query,
   };
 }
 
 // DuckDB-WASM's blocking Node build, opened the way its own package opens it. Each table's bytes are registered
-// under its file name and a table made from them; the counts are asked after the load's clock stops.
+// under its file name and a table made from them, then the file is dropped; the counts are asked after the load's
+// clock stops.
 async function openDuck(o, req) {
   const duckdb = req('@duckdb/duckdb-wasm/dist/duckdb-node-blocking.cjs');
   const dist = join(o.duckdb, '@duckdb/duckdb-wasm/dist');
@@ -170,6 +187,7 @@ async function openDuck(o, req) {
       for (const t of tables) {
         db.registerFileBuffer(`${t.name}.parquet`, t.bytes);
         conn.query(`CREATE TABLE ${t.name} AS SELECT * FROM '${t.name}.parquet'`);
+        db.dropFile(`${t.name}.parquet`); // (the file goes once its table is made, as a page's does)
       }
     },
     async counts(names) {
@@ -181,9 +199,9 @@ async function openDuck(o, req) {
 
 async function child(o) {
   if (typeof globalThis.gc !== 'function') throw new Error('run with --expose-gc');
-  // One apache-arrow for both: DuckDB's tables and the page's answers are read by the same code.
-  const req = createRequire(join(o.duckdb, 'x.js'));
-  const arrow = req('apache-arrow');
+  // One apache-arrow for both (--arrow): DuckDB's tables and the page's answers are read by the same code.
+  const req = loaderOf(o.duckdb);
+  const arrow = loaderOf(o.arrow)('apache-arrow');
   let tables = await readTables(o.data); // (read before any clock starts)
   const names = tables.map((t) => t.name);
   const t0 = performance.now();
@@ -221,8 +239,8 @@ async function child(o) {
 // Runs one child on the queries left. Resolves with what it printed and how it ended.
 function runChild(o, engine, only, progress) {
   return new Promise((resolve) => {
-    const args = ['--expose-gc', HERE, '--engine', engine, '--data', o.data, '--duckdb', o.duckdb, '--pkg', o.pkg,
-      '--queries', o.queries, '--runs', String(o.runs), '--only', only.join(',')];
+    const args = ['--expose-gc', HERE, '--engine', engine, '--data', o.data, '--duckdb', o.duckdb, '--arrow', o.arrow,
+      '--pkg', o.pkg, '--queries', o.queries, '--runs', String(o.runs), '--only', only.join(',')];
     const proc = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     const seen = { load: null, queries: [], stderr: [], timedOut: false, code: null, signal: null };
     let last = Date.now();
@@ -330,9 +348,29 @@ function report(o, engines) {
   return { ok: failures.length === 0 && total.same === 22, results, total, rowsEqual, failures };
 }
 
+// A page's answers are views, which apache-arrow older than 21 cannot read: say so before any engine runs, not after
+// 14 failed queries. The package's own main file sits at its root, so its package.json is beside it.
+async function arrowVersion(o) {
+  const main = loaderOf(o.arrow).resolve('apache-arrow');
+  const version = JSON.parse(await readFile(join(dirname(main), 'package.json'), 'utf8')).version;
+  if (Number(version.split('.')[0]) < 21) {
+    throw new Error(`apache-arrow ${version} in ${o.arrow} cannot read a node's answers (strings are views there): `
+      + 'pass --arrow NODE_MODULES with apache-arrow 21 or newer');
+  }
+  return version;
+}
+
 async function parent(o) {
   if (!o.data || !o.duckdb) throw new Error('--data DIR and --duckdb NODE_MODULES are needed');
   await readdir(o.data).catch(() => { throw new Error(`no folder ${o.data}`); });
+  let arrowVer;
+  try {
+    arrowVer = await arrowVersion(o);
+  } catch (e) {
+    console.error(e.message);
+    process.exitCode = 1;
+    return;
+  }
   const progress = (j) => console.error(j.open_ms !== undefined ? `  loaded in ${j.load_ms} ms`
     : j.error ? `  ${j.q} FAILED: ${j.error.slice(0, 160)}` : `  ${j.q} ${j.ms} ms`);
   const engines = {};
@@ -342,7 +380,9 @@ async function parent(o) {
   }
   const r = report(o, engines);
   if (o.out) {
-    const result = { versions: { pondra: engines.pondra.load?.version, duckdb: engines.duckdb.load?.version }, data: o.data,
+    const result = { versions: { pondra: engines.pondra.load?.version, duckdb: engines.duckdb.load?.version, arrow: arrowVer },
+      data: o.data,
+      note: "DuckDB's file is dropped once its table is made (dropFile), as a page's is: this run's DuckDB memory after load is not comparable with run2's.",
       runs: o.runs, timeout: o.timeout, open: { pondra: engines.pondra.load?.open_ms, duckdb: engines.duckdb.load?.open_ms },
       load: { pondra: engines.pondra.load?.load_ms, duckdb: engines.duckdb.load?.load_ms }, rows_loaded: engines.pondra.load?.rows,
       rows_loaded_equal: r.rowsEqual, memory: { pondra: engines.pondra.load && { after_load_mb: engines.pondra.load.rss_after_load_mb, peak_mb: engines.pondra.peak },
