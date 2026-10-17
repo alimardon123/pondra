@@ -289,7 +289,7 @@ fn set_of(name: &ast::ObjectName) -> Option<&'static Set> {
 }
 
 /// Whether `name` is one of the set-returning JSON functions: a FROM item of that name is a call, not a relation.
-pub fn is_set_name(name: &str) -> bool { SETS.iter().any(|set| set.name == name) }
+pub fn is_set_name(name: &str) -> bool { SETS.iter().any(|set| set.name.eq_ignore_ascii_case(name)) }
 
 /// The set call `e` is with its arguments, if it is one.
 fn call_of(e: &Expr) -> Option<(&'static Set, Vec<Expr>)> {
