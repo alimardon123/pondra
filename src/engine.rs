@@ -9,6 +9,7 @@ use datafusion::common::{exec_err, Result};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult};
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion::logical_expr::{ColumnarValue, Documentation, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
@@ -302,14 +303,20 @@ pub fn read_only() -> datafusion::execution::context::SQLOptions {
 /// the tree). A session in another dialect reads its own lambdas, and its own strings: read as the
 /// generic dialect, Databricks' `"a"` became a column.
 pub async fn sql(ctx: &SessionContext, sql: &str) -> anyhow::Result<datafusion::dataframe::DataFrame> {
+    sql_checked(ctx, sql, |plan| Ok(read_only().verify_plan(plan)?)).await
+}
+
+/// A user's statement planned as `sql` plans it, refused unless `may` allows its plan. `may` runs before
+/// anything does: a `CREATE TABLE … AS` runs as it is planned.
+pub async fn sql_checked(ctx: &SessionContext, sql: &str, may: impl Fn(&LogicalPlan) -> anyhow::Result<()>) -> anyhow::Result<datafusion::dataframe::DataFrame> {
     use datafusion::config::Dialect;
     let generic = matches!(ctx.state().config().options().sql_parser.dialect, Dialect::Generic);
-    if let Some(stmt) = crate::friendly::lambdas(sql).filter(|_| generic) {
-        let plan = ctx.state().statement_to_plan(stmt).await?;
-        read_only().verify_plan(&plan)?;
-        return Ok(text_unions(ctx.execute_logical_plan(plan).await?)?);
-    }
-    Ok(text_unions(ctx.sql_with_options(sql, read_only()).await?)?)
+    let plan = match crate::friendly::lambdas(sql).filter(|_| generic) {
+        Some(stmt) => ctx.state().statement_to_plan(stmt).await?,
+        None => ctx.state().create_logical_plan(sql).await?,
+    };
+    may(&plan)?;
+    Ok(text_unions(ctx.execute_logical_plan(plan).await?)?)
 }
 
 /// A plan's rows; an answer with none still has its columns, typed as the plan runs them (the physical plan's

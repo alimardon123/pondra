@@ -17,6 +17,7 @@ pub mod engine;
 pub mod page;
 pub mod text;
 pub mod ext_names;
+pub mod lake_files;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod asof;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)

@@ -36,7 +36,7 @@ pub async fn arguments(app: &App, args: &[FunctionArg]) -> Result<(String, Recor
 pub async fn run(app: &App, args: &[FunctionArg], who: Who, job: Option<String>, id: Option<String>) -> Result<Outcome> {
     ensure!(who.depth < 16, "run: files running files 16 deep (a loop?)");
     let (path, row) = arguments(app, args).await?;
-    let path = match crate::files::under_files(&path) {
+    let path = match crate::lake_files::under_files(&path) {
         p if p.starts_with("files/notebooks/") && p.matches('/').count() == 2 && !p.ends_with(".ipynb") => latest(app, &p).await?, // (a notebook by name: its newest version)
         p => p,
     };

@@ -16,6 +16,7 @@
 //!
 //! Bytes are `BINARY` columns: `byte_length`, `sha256`, `md5`, `encode(…, 'base64')`, `decode`
 //! and `substr` (`engine.rs`: DataFusion's own takes only text) work on them.
+use crate::lake_files::under_files;
 use crate::store::Lake;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -48,13 +49,6 @@ impl TableFunctionImpl for Listing {
         };
         Ok(Arc::new(Files { lake: self.0.clone(), prefix, schema: files_schema() }))
     }
-}
-
-/// A path as `PUT /files/…` named it (`photos/a.jpg`), or as `files()` lists it (`files/photos/a.jpg`):
-/// the object's place in the lake either way.
-pub fn under_files(path: &str) -> String {
-    let path = path.trim_start_matches('/');
-    if path.starts_with("files/") { path.to_string() } else { format!("files/{path}") }
 }
 
 fn files_schema() -> SchemaRef {
