@@ -49,12 +49,20 @@ jobs:
         # (waited for while that run builds: a soak labelled with the pull request's `ci` starts at once)
         run: bash tools/ci_artifact.sh linux-x64 "$SHA" && tar -xzf dist/pondra-linux-x64.tar.gz pondra
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        if: fromJSON(inputs.plan).binary == 'build'
+        if: fromJSON(inputs.plan).binary != 'ci'
         with:
           toolchain: stable
-      - name: Or build from source
-        if: fromJSON(inputs.plan).binary == 'build'
-        run: cargo build --profile dist && cp target/dist/pondra pondra
+      - name: Or build from source (for heap, with jemalloc's heap profiling)
+        if: fromJSON(inputs.plan).binary != 'ci'
+        env:
+          BINARY: ${{ fromJSON(inputs.plan).binary }}
+        # (heap's in the release profile: no LTO, so it leaves the leg its time, and its symbols kept for jeprof)
+        run: |
+          if [ "$BINARY" = heap ]; then
+            cargo build --release --features heap-profile && cp target/release/pondra pondra
+          else
+            cargo build --profile dist && cp target/dist/pondra pondra
+          fi
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
@@ -72,12 +80,26 @@ jobs:
             echo "::error::the leg before saved no state (a check of its rows failed): the day stops there"; exit 1
           fi
           pip install -q $(grep -E '^boto3' tools/requirements.txt | sed 's/ *#.*//')
-          read -r hours rate batch nodes storage legs < <(python3 -c "import json, os; p = json.loads(os.environ['PLAN']); print(min(5.5, float(p['hours'])), p['rate'], p['batch'], p['nodes'], p['storage'], p['legs'])")
+          read -r hours rate batch nodes storage legs binary < <(python3 -c "import json, os; p = json.loads(os.environ['PLAN']); print(min(5.5, float(p['hours'])), p['rate'], p['batch'], p['nodes'], p['storage'], p['legs'], p['binary'])")
+          # (a day's last leg stops no node, so a node process lives the leg; nor does any heap leg: a
+          # heap is diffed within one process, and a node killed writes no last dump)
+          steady=""
+          if { [ "$legs" -gt 1 ] && [ "$LEG" -eq "$legs" ]; } || [ "$binary" = heap ]; then steady=--steady; fi
+          # (jemalloc reads this itself, prefixed as pondra builds it: a dump every GB a node allocates,
+          # every 40-50 s on a local soak at a day's load, 45 KB each; one at exit; and its page counts
+          # at exit in the node's log)
+          if [ "$binary" = heap ]; then
+            mkdir -p heap
+            export _RJEM_MALLOC_CONF="prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:30,prof_final:true,prof_prefix:$PWD/heap/jeprof,stats_print:true,stats_print_opts:dablxeh"
+          fi
           python3 tools/soak.py --hours "$hours" --rate "$rate" --batch "$batch" --nodes "$nodes" --bin ./pondra \
             $([ "$storage" = r2 ] && echo --s3) --out soak.json --timeline soak-timeline.jsonl \
             $([ "$LEG" -gt 1 ] && echo --resume before/soak-state.json) \
-            $([ "$LEG" -lt "$legs" ] && echo --save soak-state.json) \
-            $([ "$legs" -gt 1 ] && [ "$LEG" -eq "$legs" ] && echo --steady)
+            $([ "$LEG" -lt "$legs" ] && echo --save soak-state.json) $steady
+      - name: The nodes' heaps, diffed (heap)
+        if: always() && fromJSON(inputs.plan).binary == 'heap'
+        timeout-minutes: 20 # (about 40 s a node on an 8-minute soak; the dumps upload either way)
+        run: python3 tools/heap_report.py ./pondra heap soak-heap
       - name: The nodes' logs, beside the results
         if: always()
         # (soak-logs/, not logs/: that is the repository's own folder, and its 900 files went into the artifact)
@@ -92,5 +114,6 @@ jobs:
             soak-timeline.jsonl
             soak-state.json
             soak-logs/
+            soak-heap/
           retention-days: 30
           if-no-files-found: ignore
