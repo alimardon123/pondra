@@ -598,7 +598,7 @@ fn regrouped(mut stmts: Vec<ast::Statement>) -> Option<String> {
 }
 
 /// Text with a `?`, `?|` or `?&`, read as Postgres's dialect reads it (so its JSON operators are grouped right).
-/// Each `?` becomes the call Postgres names it for, a top-level `?` in a SELECT list is named `?column?`, and every
+/// Each `?` becomes the call Postgres names it for, a top-level `?` in a SELECT list or a RETURNING is named `?column?`, and every
 /// other JSON operator is nested, so the generic dialect reads the text the same way.
 fn questions(sql: &str) -> Option<String> {
     let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).ok()?;
@@ -614,14 +614,20 @@ impl VisitorMut for Questions {
 
     fn pre_visit_query(&mut self, q: &mut ast::Query) -> ControlFlow<()> {
         if let ast::SetExpr::Select(select) = q.body.as_mut() {
-            let items = std::mem::take(&mut select.projection);
-            select.projection = items
-                .into_iter()
-                .map(|item| match item {
-                    ast::SelectItem::UnnamedExpr(e) if is_question(&e) => ast::SelectItem::ExprWithAlias { expr: unquestion(e), alias: ast::Ident::with_quote('"', "?column?") },
-                    other => other,
-                })
-                .collect();
+            name_questions(&mut select.projection);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_statement(&mut self, s: &mut ast::Statement) -> ControlFlow<()> {
+        let returning = match s {
+            ast::Statement::Insert(i) => i.returning.as_mut(),
+            ast::Statement::Update(u) => u.returning.as_mut(),
+            ast::Statement::Delete(d) => d.returning.as_mut(),
+            _ => None,
+        };
+        if let Some(items) = returning {
+            name_questions(items);
         }
         ControlFlow::Continue(())
     }
@@ -634,6 +640,18 @@ impl VisitorMut for Questions {
         }
         ControlFlow::Continue(())
     }
+}
+
+/// A select list's or a RETURNING's items with each bare `?`, `?|` or `?&` named as Postgres names it, `?column?` (the call it
+/// becomes would otherwise name the column after itself).
+fn name_questions(items: &mut Vec<ast::SelectItem>) {
+    *items = std::mem::take(items)
+        .into_iter()
+        .map(|item| match item {
+            ast::SelectItem::UnnamedExpr(e) if is_question(&e) => ast::SelectItem::ExprWithAlias { expr: unquestion(e), alias: ast::Ident::with_quote('"', "?column?") },
+            other => other,
+        })
+        .collect();
 }
 
 fn written(stmts: &[ast::Statement]) -> String { stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n") }
@@ -1049,6 +1067,9 @@ mod tests {
         assert_eq!(grouped("SELECT * FROM t WHERE doc ? 'a' AND doc ->> 'a' = 'x'"), "SELECT * FROM t WHERE jsonb_exists(doc, 'a') AND (doc ->> 'a') = 'x'");
         assert_eq!(grouped("SELECT * FROM t WHERE doc ?| ARRAY['a', 'b']"), "SELECT * FROM t WHERE jsonb_exists_any(doc, ARRAY['a', 'b'])");
         assert_eq!(grouped("SELECT * FROM t WHERE doc ?& '{a}'"), "SELECT * FROM t WHERE jsonb_exists_all(doc, '{a}')");
+        // (a RETURNING's items are named as a select list's: Postgres 16 names `RETURNING id, doc ? 'a'` id and ?column?)
+        assert_eq!(grouped("DELETE FROM t WHERE doc ? 'a' RETURNING id, doc ? 'a'"), r#"DELETE FROM t WHERE jsonb_exists(doc, 'a') RETURNING id, jsonb_exists(doc, 'a') AS "?column?""#);
+        assert_eq!(grouped("UPDATE t SET n = 1 RETURNING doc ?| ARRAY['a']"), r#"UPDATE t SET n = 1 RETURNING jsonb_exists_any(doc, ARRAY['a']) AS "?column?""#);
     }
 
     #[test]

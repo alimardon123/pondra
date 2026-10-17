@@ -445,7 +445,7 @@ async fn read(lake: &Lake, sql: &str) -> Option<(Statement, Known)> {
 /// `sql` parsed as one statement, read as SQL comes in: Postgres's JSON operators first (`doc ? 'a'`, `doc ?& …`,
 /// `doc @> …`), which the generic dialect can't parse, so every column traced here (Describe, the answer's names,
 /// stored views) is the one the statement runs with (`pg_json::text`, borrowed when it has no such operator).
-fn one(sql: &str) -> Option<Statement> {
+pub(crate) fn one(sql: &str) -> Option<Statement> {
     let mut parsed = Parser::parse_sql(&GenericDialect {}, &crate::pg_json::text(sql)).ok()?;
     (parsed.len() == 1).then(|| parsed.pop()).flatten()
 }

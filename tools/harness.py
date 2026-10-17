@@ -16378,6 +16378,22 @@ def _jsons_w2(check, url, q, info):
         info["doc ? 'a' in the select list (psycopg)"] = got
         return got == ([(True,), (None,), (True,), (False,)], [("?column?", 16)])
 
+    # (Postgres 16's RETURNING of the same rows: sorted, since a write's rows come in no promised order; run last, as they
+    # change the rows)
+    RETURNING = {
+        "UPDATE w2j SET note = 'x' WHERE id = 4 RETURNING note, doc ?| array['b']": ([("x", True)], [("note", 25), ("?column?", 16)]),
+        "DELETE FROM w2j WHERE doc ? 'a' RETURNING id, doc": ([(1, {"a": 1}), (3, {"a": [True, "s"]})], [("id", 23), ("doc", 3802)]),
+        "INSERT INTO w2j (id, doc) VALUES (5, '{\"a\": 5}') RETURNING doc -> 'a', doc ? 'a'": ([(5, True)], [("?column?", 3802), ("?column?", 16)]),
+    }
+
+    def returning_forms():
+        got = {}
+        for sql in RETURNING:
+            rows, columns = read(sql)
+            got[sql] = (sorted(rows, key=repr), columns)
+        info["RETURNING with ?, ?| and -> (psycopg: rows, (name, type code) of each column)"] = got
+        return all(got[sql] == want for sql, want in RETURNING.items())
+
     # (Postgres 16's COPY of the same rows: the binary stream as bytes, the text and CSV ones as text)
     BINARY = bytes.fromhex(
         "5047434f50590aff0d0a0000000000000000000005000000040000000100000009017b22"
@@ -16430,6 +16446,8 @@ def _jsons_w2(check, url, q, info):
     check("COPY w2j TO STDOUT (text) is Postgres 16's stream: the same values, \\N for NULLs, the same escapes", text_copy)
     check("COPY w2j TO STDOUT (FORMAT csv, HEADER) is Postgres 16's stream: the column names, quoted fields with doubled quotes, "
           "empty NULLs", csv_copy)
+    check("psycopg: UPDATE, DELETE and INSERT … RETURNING with ?, ?| and -> answer Postgres 16's rows, each column named and typed "
+          "as Postgres 16 has it (doc as jsonb, the operators as ?column?)", returning_forms)
 
 
 # The sample data the BI tools' statements were captured against (copied from /tmp/claude-0/bi/PREAMBLE.md, "Sample
