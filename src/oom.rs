@@ -20,8 +20,13 @@ pub const OOM: &str = "out of memory: the node was nearly out of memory and stop
 const HOLD: Duration = Duration::from_secs(10);
 
 /// How long a request must have run to be stopped: one that has only just started did not grow the
-/// memory the watch sees, and its own cost is still arriving.
-const FIRST: Duration = Duration::from_secs(1);
+/// memory the watch sees, and its own cost is still arriving. (A second let `array_agg` of 30M values
+/// reach 1.75 GB on a 1 GB line on CI's runner, where it grows faster.)
+const FIRST: Duration = Duration::from_millis(200);
+
+/// How fast the watch takes a query to grow, at most: it looks again before memory growing at this
+/// rate could pass the line, every 20 ms near it and every second at most far below it.
+const RATE: f64 = 8.0 * (1u64 << 30) as f64;
 
 crate::per_node!(static SEEN: AtomicUsize = AtomicUsize::new(0));
 
@@ -67,16 +72,21 @@ pub fn start() {
                     eprintln!("stopped a query: the node held {} MB, its line {} MB (PONDRA_MEMORY_MAX_GB)", mb(resident), mb(line));
                     last_stop = Some(now);
                 } else if !std::mem::replace(&mut said, true) {
-                    // (nothing to stop yet: a request a second old that grew the node is stopped at a later look,
+                    // (nothing to stop yet: a request old enough that grew the node is stopped at a later look,
                     // so no hold starts here; the line is said once per stretch over the line)
                     eprintln!("the node holds {} MB, past its line {} MB, and no query grew it", mb(resident), mb(line));
                 }
             }
-            // (a look every second while the node is well under its line, every 50 ms above half of it)
-            let every = if resident < line / 2 { Duration::from_secs(1) } else { Duration::from_millis(50) };
-            tokio::time::sleep(every).await;
+            tokio::time::sleep(every(resident, line)).await;
         }
     });
+}
+
+/// When to look again: before memory growing at [`RATE`] could pass the line from where it is now. (Looking
+/// every second while under half the line, a query that grew from there in that second passed a 1 GB line
+/// by 0.75 GB before the watch saw it.)
+fn every(resident: usize, line: usize) -> Duration {
+    Duration::from_secs_f64(line.saturating_sub(resident) as f64 / RATE).clamp(Duration::from_millis(20), Duration::from_secs(1))
 }
 
 /// Is a request to be stopped now: over the line, and no stop still holding.
@@ -85,7 +95,7 @@ fn due(last_stop: Option<Instant>, resident: usize, line: usize, now: Instant) -
 }
 
 /// Is a stop still holding: the node is over its line, and the last stop was less than [`HOLD`] ago. (A
-/// look that finds nothing to stop holds nothing: a request that is a second old by the next look is stopped then.)
+/// look that finds nothing to stop holds nothing: a request old enough by the next look is stopped then.)
 fn pending(last_stop: Option<Instant>, resident: usize, line: usize, now: Instant) -> bool {
     resident >= line && last_stop.is_some_and(|at| now.saturating_duration_since(at) < HOLD)
 }
@@ -100,7 +110,7 @@ pub struct Running {
     pub stopped: bool,
 }
 
-/// The request to stop: the oldest that can be stopped, has run for a second, and started at least
+/// The request to stop: the oldest that can be stopped, has run for [`FIRST`], and started at least
 /// `margin` bytes below the memory now, so it is one that grew it. None when no request qualifies.
 pub fn pick(running: &[Running], now: Instant, resident: usize, margin: usize) -> Option<u64> {
     running
@@ -128,6 +138,15 @@ mod tests {
     }
 
     #[test]
+    fn the_watch_looks_sooner_the_nearer_the_line() {
+        assert_eq!(every(0, 64 << 30), Duration::from_secs(1), "far below a big line: a look a second");
+        assert_eq!(every(LINE - (1 << 20), LINE), Duration::from_millis(20), "near it: every 20 ms");
+        assert_eq!(every(2 * LINE, LINE), Duration::from_millis(20), "past it too");
+        let half = every(LINE / 2, LINE);
+        assert!(half > Duration::from_millis(50) && half < Duration::from_millis(70), "half a 1 GB line: before 8 GB/s could pass it ({half:?})");
+    }
+
+    #[test]
     fn under_the_line_nothing_is_stopped() {
         let now = at(60);
         assert!(!due(None, LINE - 1, LINE, now));
@@ -147,8 +166,8 @@ mod tests {
     fn younger_stopped_unstoppable_and_fresh_requests_are_passed_over() {
         let start = Instant::now();
         let now = start + Duration::from_secs(5);
-        let young = req(1, now - Duration::from_millis(900), 0);
-        assert_eq!(pick(&[young], now, LINE, MARGIN), None, "under a second old");
+        let young = req(1, now - Duration::from_millis(150), 0);
+        assert_eq!(pick(&[young], now, LINE, MARGIN), None, "just started");
         let stopped = Running { stopped: true, ..req(2, start, 0) };
         assert_eq!(pick(&[stopped], now, LINE, MARGIN), None, "already stopped");
         let not = Running { stoppable: false, ..req(3, start, 0) };
