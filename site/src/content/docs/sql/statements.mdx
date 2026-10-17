@@ -440,7 +440,7 @@ SELECT name, definition FROM pondra.objects WHERE kind = 'index';
 
 | Statement | Syntax |
 |---|---|
-| Insert | `INSERT INTO t [(column, …)] VALUES (…), …` or `INSERT INTO t [(column, …)] SELECT …`; on a keyed table, a key the table holds (or two rows of one key) is refused with `23505`, the whole statement |
+| Insert | `INSERT INTO t [(column, …)] VALUES (…), …` or `INSERT INTO t [(column, …)] SELECT …`; without a column list, a row gives the table's first columns in order and the rest take their `DEFAULT` (NULL if they have none); on a keyed table, a key the table holds (or two rows of one key) is refused with `23505`, the whole statement |
 | Insert, on a key that exists | `INSERT … ON CONFLICT (key) DO NOTHING`, or `… ON CONFLICT (key) DO UPDATE SET column = t.column + excluded.column` (Postgres's) |
 | The same, shorter | `INSERT OR IGNORE INTO t …` (`ON CONFLICT DO NOTHING`), `INSERT OR REPLACE INTO t …` (every column the rows give replaces the row's), as DuckDB and SQLite write them; MySQL's `INSERT IGNORE` too |
 | Update | `UPDATE t SET column = expression [, …] [FROM other o] [WHERE condition]` |

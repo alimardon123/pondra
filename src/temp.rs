@@ -399,13 +399,14 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
     let query = match names {
         Some(n) => {
             let all: Vec<String> = meta.columns.iter().map(|(c, _)| c.clone()).collect();
-            crate::write::rows_for(name, &all, if n.is_empty() { &all } else { n }, query, &|c: &str| crate::defaults::sql_of(&meta, c))? // (a column left out takes its DEFAULT; no names: `VALUES (1, DEFAULT)`)
+            let names = if n.is_empty() { crate::write::implicit(&all, crate::write::values_width(query)) } else { n }; // (no names: `VALUES (1, DEFAULT)`, the columns its rows give)
+            crate::write::rows_for(name, &all, names, query, &|c: &str| crate::defaults::sql_of(&meta, c))? // (a column left out takes its DEFAULT)
         }
         None => query.to_string(),
     };
     let ctx = crate::query::session(&app.lake, &query, "").await?;
     let ctx = if files { ctx.enable_url_table() } else { ctx };
-    let batch = crate::write::rows(&ctx, &meta, &query).await?;
+    let batch = crate::write::rows(&app.lake, &ctx, &meta, &query).await?;
     let n = batch.num_rows();
     apply(s, name, HashSet::new(), vec![batch])?;
     Ok(j!({"rows": n}))

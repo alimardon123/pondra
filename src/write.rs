@@ -1065,7 +1065,7 @@ pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str)
     let (other, name) = crate::ddl::resolve(lake, table).await?;
     let meta: TableMeta = other.as_deref().unwrap_or(lake).cat.get(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?;
     let columns: Vec<String> = meta.logical_columns().into_iter().map(|(c, _)| c).filter(|c| c != "_deleted" || names.contains(c)).collect();
-    let names = if names.is_empty() { &columns[..] } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: every column)
+    let names = if names.is_empty() { implicit(&columns, values_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
     let given: Vec<String> = names.iter().enumerate().filter(|(i, _)| !defaulted(query, *i)).map(|(_, n)| n.clone()).collect();
     crate::seq::check_given(&meta.logical(), table, &given)?;
     let default = |c: &str| crate::defaults::sql_of(&meta, c);
@@ -1086,6 +1086,22 @@ fn plain_values(query: &str) -> Option<ast::Values> {
     match (*q.body, &q.order_by) {
         (ast::SetExpr::Values(v), None) => Some(v),
         _ => None,
+    }
+}
+
+/// The width of a plain `VALUES` whose rows all have one width (None for any other query, or rows of several widths).
+pub(crate) fn values_width(query: &str) -> Option<usize> {
+    let v = plain_values(query)?;
+    let first = v.rows.first()?.len();
+    v.rows.iter().all(|r| r.len() == first).then_some(first)
+}
+
+/// The columns an INSERT without a column list fills, as Postgres takes them: the first `width` of the table's (all of
+/// them when the width isn't known, or isn't smaller). The rest take their DEFAULTs (`fitted`).
+pub(crate) fn implicit(columns: &[String], width: Option<usize>) -> &[String] {
+    match width {
+        Some(n) if n < columns.len() => &columns[..n],
+        _ => columns,
     }
 }
 
@@ -1129,7 +1145,10 @@ pub fn rows_for(table: &str, columns: &[String], names: &[String], query: &str, 
     if let Some(v) = plain_values(query) {
         let mut rows = vec![];
         for r in &v.rows {
-            ensure!(r.len() == names.len(), "INSERT INTO {table} names {} columns, and a row has {}", names.len(), r.len());
+            if r.len() != names.len() {
+                let what = if r.len() > names.len() { "INSERT has more expressions than target columns" } else { "INSERT has more target columns than expressions" };
+                return Err(crate::codes::coded("42601", format!("{what} (INSERT INTO {table} names {} columns, and a row has {})", names.len(), r.len())));
+            }
             let value = |c: &String| match at(c) {
                 Some(i) if !is_default(&r[i]) => r[i].to_string(),
                 _ => default(c).unwrap_or_else(|| "NULL".into()),
@@ -1170,10 +1189,17 @@ pub async fn follows(lake: &Lake, table: &str) -> Result<bool> {
     Ok(views || lake.cat.scan::<crate::tasks::Task>("k/", "k0").await?.into_iter().any(|(_, t)| t.source == table))
 }
 
-/// Run a row query here: its rows in the table's column order and types.
-pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
+/// Run a row query here: its rows in the table's column order and types. `lake` is the table's own: the one a
+/// DEFAULT's `nextval` takes its values from.
+pub async fn rows(lake: &Lake, ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
     let target = schema(&meta.columns)?;
-    let sql = &values_typed(sql, &target);
+    let Some(all) = planned(ctx, &target, sql).await? else { return Ok(RecordBatch::new_empty(target)) };
+    fitted(lake, meta, &target, &all).await
+}
+
+/// A query's rows as planned in `ctx`, before they fit the table (`rows`); None when it gives none.
+pub(crate) async fn planned(ctx: &SessionContext, target: &SchemaRef, sql: &str) -> Result<Option<RecordBatch>> {
+    let sql = &values_typed(sql, target);
     let one; // (`nextval` numbers `VALUES` in their order, as Postgres does: one partition)
     let ctx = match crate::seq::calls(sql) {
         true => {
@@ -1185,13 +1211,18 @@ pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<R
         false => ctx,
     };
     let batches = crate::query::sql(ctx, &crate::asof::rewrite(&crate::routines::rows_apart(sql))?).await?.collect().await?;
-    let Some(first) = batches.first() else { return Ok(RecordBatch::new_empty(target)) };
-    let all = concat_batches(&first.schema(), &batches)?;
-    fit(&target, &all)
+    let Some(first) = batches.first() else { return Ok(None) };
+    Ok(Some(concat_batches(&first.schema(), &batches)?))
 }
 
-/// A query's rows as the table's columns, in its order and types (`rows`, and the literal rows of `literals.rs`).
-pub fn fit(target: &SchemaRef, all: &RecordBatch) -> Result<RecordBatch> {
+/// A query's rows as the table's columns, in its order and types (`rows` fits them with `fitted`; the tests of `literals.rs`
+/// fit a literal's rows with this, where no table has defaults to fill).
+#[cfg(test)]
+pub fn fit(target: &SchemaRef, all: &RecordBatch) -> Result<RecordBatch> { fit_with(target, all).map(|(batch, _)| batch) }
+
+/// `fit`, and the names of the columns the rows left out at the end: NULL in the batch until `fitted` gives them their
+/// DEFAULTs.
+fn fit_with(target: &SchemaRef, all: &RecordBatch) -> Result<(RecordBatch, Vec<String>)> {
     // An UPDATE's rows end with the ids they keep (`sys.rs`): those go along, by name.
     let kept: Vec<usize> = (0..all.num_columns()).filter(|&i| [crate::sys::ROW_ID, crate::sys::CREATED].contains(&all.schema().field(i).name().as_str())).collect();
     let values: Vec<usize> = (0..all.num_columns()).filter(|i| !kept.contains(i)).collect();
@@ -1200,28 +1231,50 @@ pub fn fit(target: &SchemaRef, all: &RecordBatch) -> Result<RecordBatch> {
     // first few (later ones, such as added columns, are null).
     let skip_deleted = all.num_columns() < target.fields().len();
     let mut given = all.columns().iter();
-    let columns = target.fields().iter().map(|f| match given.len() > 0 && !(skip_deleted && f.name() == "_deleted") {
-        true => crate::query::strict(given.next().expect("counted"), f.data_type()),
-        false => Ok(datafusion::arrow::array::new_null_array(f.data_type(), all.num_rows())),
+    let mut padded = vec![];
+    let columns = target.fields().iter().map(|f| {
+        let skipped = skip_deleted && f.name() == "_deleted"; // (a short row never gives a delete marker: it's a NULL, not a default)
+        match given.len() > 0 && !skipped {
+            true => crate::query::strict(given.next().expect("counted"), f.data_type()),
+            false => {
+                if !skipped {
+                    padded.push(f.name().clone()); // (left out by the row: its DEFAULT, if it has one, in `fitted`)
+                }
+                Ok(datafusion::arrow::array::new_null_array(f.data_type(), all.num_rows()))
+            }
+        }
     }).collect::<Result<Vec<_>, _>>()?;
-    ensure!(given.len() == 0, "{} columns given, the table has {}", all.num_columns(), target.fields().len());
+    if given.len() > 0 {
+        return Err(crate::codes::coded("42601", format!("INSERT has more expressions than target columns ({} given, the table has {})", all.num_columns(), target.fields().len())));
+    }
     let (mut fields, mut columns) = (target.fields().to_vec(), columns);
     fields.extend(ids.schema().fields().iter().cloned());
     columns.extend(ids.columns().iter().cloned());
-    Ok(RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), columns)?)
+    Ok((RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), columns)?, padded))
+}
+
+/// `fit`, with the columns the rows leave out at the end given their DEFAULT, as a bulk INSERT's are (`write_rows`)
+/// and as Postgres fills them: `INSERT INTO t VALUES (1)` is t's first column, the others their defaults.
+async fn fitted(lake: &Lake, meta: &TableMeta, target: &SchemaRef, all: &RecordBatch) -> Result<RecordBatch> {
+    let (batch, padded) = fit_with(target, all)?;
+    if padded.is_empty() || !crate::defaults::any(meta) {
+        return Ok(batch); // (a full-width INSERT, or a table with no defaults: nothing more to do)
+    }
+    let n = batch.num_rows();
+    crate::defaults::fill(lake, meta, batch, |c| padded.iter().any(|p| p == c).then(|| crate::defaults::all(n))).await
 }
 
 /// An INSERT's rows into `meta`'s table, from `sql` (its rows' query). A `VALUES` of literals is built here as
 /// DataFusion would plan it, with no session (`literals.rs`); anything else is planned in a session of `lake` as
-/// of `upto` (`files`: this machine's files too), as `rows` plans it.
-pub async fn rows_of(lake: &Lake, meta: &TableMeta, sql: &str, upto: Option<u64>, files: bool) -> Result<RecordBatch> {
+/// of `upto` (`files`: this machine's files too), as `rows` plans it. `home` is the table's own lake (`rows`).
+pub async fn rows_of(lake: &Lake, home: &Lake, meta: &TableMeta, sql: &str, upto: Option<u64>, files: bool) -> Result<RecordBatch> {
     let target = schema(&meta.columns)?;
     if let Some(all) = crate::literals::literal_rows(sql, &target) {
-        return fit(&target, &all);
+        return fitted(home, meta, &target, &all).await;
     }
     let ctx = crate::query::session_at(lake, sql, "", upto).await?;
     let ctx = if files { ctx.enable_url_table() } else { ctx };
-    rows(&ctx, meta, sql).await
+    rows(home, &ctx, meta, sql).await
 }
 
 /// An INSERT's `VALUES` with each value for a DOUBLE, REAL or DECIMAL column cast to that column's
@@ -1316,7 +1369,9 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
         // (a new table takes the types the query gives as it runs, as `create_spec` does)
         None => crate::query::run_schema(ctx, df.logical_plan())?.fields().iter().map(|f| (f.name().clone(), if *f.data_type() == DataType::Utf8View { DataType::Utf8 } else { f.data_type().clone() })).collect(),
     };
-    ensure!(df.schema().fields().len() <= target.len(), "{} columns given, table {table} has {}", df.schema().fields().len(), target.len());
+    if df.schema().fields().len() > target.len() {
+        return Err(crate::codes::coded("42601", format!("INSERT has more expressions than target columns ({} given, {table} has {})", df.schema().fields().len(), target.len())));
+    }
     let given = df.schema().columns(); // (the table's first columns; any after them are null)
     let null = || datafusion::prelude::lit(datafusion::scalar::ScalarValue::Null);
     // (a column the query leaves out: its DEFAULT, else NULL)
@@ -1544,7 +1599,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     let stmt = match stmt {
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
-            crate::seq::check_every(&app.lake, &t).await?; // (every column given, an ALWAYS identity's too)
+            crate::seq::check_every(&app.lake, &t, values_width(&query)).await?; // (the columns it gives: an ALWAYS identity's refused among them)
             if !is_there(&app.lake, &t).await? {
                 seen_here(app).await; // (a table just made through another node: this one holds it once it holds what its leader had)
                 if !is_there(&app.lake, &t).await? {
@@ -1694,7 +1749,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         _ => bail!("UPDATE and DELETE need a keyed table (append tables only take INSERTs)"),
     };
     let meta = meta.expect("a table");
-    let batch = rows_of(lake, &meta, &sql, None, files).await?;
+    let batch = rows_of(lake, lake, &meta, &sql, None, files).await?;
     crate::returning::wrote(&[], std::slice::from_ref(&batch));
     let n = batch.num_rows();
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
@@ -1880,7 +1935,7 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&*Lake::open(dir, false, false).await?, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
             let lake = Lake::open(dir, false, false).await?;
-            crate::seq::check_every(&lake, &t).await?;
+            crate::seq::check_every(&lake, &t, values_width(&query)).await?;
             if !is_there(&lake, &t).await? {
                 return Err(no_table(&t));
             }
@@ -2081,7 +2136,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
     match (meta, stmt) {
         (Some(m), _) if log => {
             let sql = rows_sql(&m, stmt)?;
-            let batch = rows_of(query, &m, &sql, None, files).await?;
+            let batch = rows_of(query, target, &m, &sql, None, files).await?; // (a DEFAULT's sequence is the attached lake's)
             crate::defaults::check(&m, table, &batch)?; // (NOT NULL: as a node's own log checks its rows)
             if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && crate::constraints::key_checked(s)) {
                 if sent(target, job).await? {
@@ -2258,4 +2313,57 @@ async fn lead(dir: &str, store: &Store, term: u64, req: Option<Option<Request>>,
     marks.abort();
     release(store, term).await; // the next writer or node doesn't have to wait
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{ArrayRef, BooleanArray, Int32Array};
+    use datafusion::arrow::datatypes::{Field, Schema};
+
+    /// A table of `a`, `b`, `c` and a delete marker, as a keyed table has them.
+    fn target() -> SchemaRef {
+        let int = |n: &str| Field::new(n, DataType::Int32, true);
+        Arc::new(Schema::new(vec![int("a"), int("b"), int("c"), Field::new("_deleted", DataType::Boolean, true)]))
+    }
+
+    /// One row of the named columns: `_deleted` a Boolean, the others Int32.
+    fn row(names: &[&str]) -> RecordBatch {
+        let fields: Vec<Field> = names.iter().map(|n| Field::new(*n, if *n == "_deleted" { DataType::Boolean } else { DataType::Int32 }, true)).collect();
+        let columns: Vec<ArrayRef> = names.iter().map(|n| -> ArrayRef { if *n == "_deleted" { Arc::new(BooleanArray::from(vec![false])) } else { Arc::new(Int32Array::from(vec![1])) } }).collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("a row")
+    }
+
+    #[test]
+    fn a_short_row_pads_what_it_leaves_out_but_not_a_delete_marker() {
+        let (out, padded) = fit_with(&target(), &row(&["a"])).expect("fits");
+        assert_eq!(padded, ["b", "c"]);
+        assert_eq!((out.column(0).null_count(), out.column(1).null_count(), out.column(3).null_count()), (0, 1, 1));
+    }
+
+    #[test]
+    fn a_full_row_pads_nothing() {
+        assert!(fit_with(&target(), &row(&["a", "b", "c"])).expect("fits").1.is_empty());
+        assert!(fit_with(&target(), &row(&["a", "b", "c", "_deleted"])).expect("fits").1.is_empty());
+    }
+
+    #[test]
+    fn a_row_wider_than_the_table_is_refused_as_42601() {
+        let err = fit(&target(), &row(&["a", "b", "c", "_deleted", "x"])).expect_err("too wide");
+        assert_eq!(crate::codes::of(&err), "42601");
+    }
+
+    #[test]
+    fn the_implicit_column_list_is_the_first_the_values_give() {
+        assert_eq!(values_width("VALUES (1, 2), (3, 4)"), Some(2));
+        assert_eq!(values_width("VALUES (1), (2, 3)"), None);
+        assert_eq!(values_width("SELECT 1, 2"), None);
+        assert_eq!(values_width("VALUES (1) ORDER BY 1"), None);
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|n| n.to_string()).collect();
+        assert_eq!(implicit(&names, Some(1)), ["a"]);
+        assert_eq!(implicit(&names, Some(2)), ["a", "b"]);
+        assert_eq!(implicit(&names, Some(3)), ["a", "b", "c"]);
+        assert_eq!(implicit(&names, Some(5)), ["a", "b", "c"]);
+        assert_eq!(implicit(&names, None), ["a", "b", "c"]);
+    }
 }

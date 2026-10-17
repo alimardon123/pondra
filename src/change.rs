@@ -422,10 +422,10 @@ pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, stmt: &crate::w
         }
         crate::write::Stmt::Delete(_, cond) => (select(lake, table, meta, &[], &format!("FROM {} {}", from(table), filter(cond)), upto).await?.0, vec![]),
         crate::write::Stmt::Merge(m) => merge(lake, table, meta, m, upto).await?,
-        crate::write::Stmt::Insert(_, query) => (vec![], vec![crate::write::rows(&session(lake, query, upto).await?, meta, query).await?]), // (a checked table's: `constraints.rs`)
+        crate::write::Stmt::Insert(_, query) => (vec![], vec![crate::write::rows(lake, &session(lake, query, upto).await?, meta, query).await?]), // (a checked table's: `constraints.rs`)
         crate::write::Stmt::InsertInto(t, names, query) => {
             let query = crate::write::whole_rows(lake, t, names, query).await?;
-            (vec![], vec![crate::write::rows(&session(lake, &query, upto).await?, meta, &query).await?])
+            (vec![], vec![crate::write::rows(lake, &session(lake, &query, upto).await?, meta, &query).await?])
         }
         _ => bail!("not an UPDATE, DELETE or MERGE"),
     })

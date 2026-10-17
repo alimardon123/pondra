@@ -863,7 +863,7 @@ fn conflict(table: &str) -> anyhow::Error {
 async fn insert_rows(l: &Locks<'_>, stored: &TableMeta, query: &str, snapshot: u64, files: bool) -> Result<(RecordBatch, u64, Option<Keys>)> {
     let lake = &l.app.lake;
     passes(l, snapshot, |at| async move {
-        let rows = crate::write::rows_of(lake, l.meta, query, Some(at), files).await?;
+        let rows = crate::write::rows_of(lake, lake, l.meta, query, Some(at), files).await?;
         crate::defaults::check(stored, l.name, &rows)?;
         // (over `LOCK_MAX` rows nothing is locked, `passes`, so their keys' text would be made for nothing)
         let keys = if rows.num_rows() > LOCK_MAX { vec![] } else { write_keys(l.meta, &[], std::slice::from_ref(&rows))? };

@@ -7384,6 +7384,52 @@ def learn():
     return f"learn: the planner uses what runs learned: all {len(checks)} checks pass"
 
 
+def _short_rows(q, pgport, checks, seen):
+    """A row shorter than the table, with no column list, takes the DEFAULTs of the columns it leaves out, as Postgres
+    fills it (`write::fitted`), and a row of the wrong width is refused 42601 (`write::fit_with`, `write::rows_for`).
+    Postgres 16's answers, asked live on /tmp/pg16-l3: the row's first columns, the others their defaults."""
+    import psycopg
+    conn = lambda autocommit=True: psycopg.connect(f"host=127.0.0.1 port={pgport} dbname=pondra user=u", autocommit=autocommit)
+    q("CREATE TABLE lt (a INT, b INT DEFAULT 7, c INT NOT NULL DEFAULT 1, d TEXT DEFAULT 'z')")
+    q("INSERT INTO lt VALUES (1)")
+    q("INSERT INTO lt VALUES (2, 8)")
+    q("INSERT INTO lt VALUES (3), (4)")
+    q("INSERT INTO lt VALUES (5, DEFAULT)")
+    with conn() as c:
+        c.execute("INSERT INTO lt VALUES (%s)", (6,))  # (bound: the extended protocol)
+    with conn(False) as c:  # (a transaction: `txn.rs`)
+        c.execute("INSERT INTO lt VALUES (9)")
+        c.commit()
+    q("INSERT INTO lt SELECT 10")  # (the bulk path: already filled, and stays so)
+    q("ALTER TABLE lt RENAME COLUMN b TO bb")
+    q("INSERT INTO lt VALUES (11)")
+    lt = [(r["a"], r["bb"], r["c"], r["d"]) for r in q("SELECT a, bb, c, d FROM lt ORDER BY a")]
+    q("CREATE TABLE kt (id INT PRIMARY KEY, n INT DEFAULT 3, t TEXT DEFAULT 'k')")
+    q("INSERT INTO kt VALUES (1)")
+    q("INSERT INTO kt SELECT 2")
+    q("INSERT INTO kt VALUES (3, 4)")
+    kt = [(r["id"], r["n"], r["t"]) for r in q("SELECT * FROM kt ORDER BY id")]
+    q("CREATE TABLE it (name TEXT, id BIGINT GENERATED ALWAYS AS IDENTITY)")
+    q("INSERT INTO it VALUES ('x'), ('y')")
+    it = [(r["name"], r["id"]) for r in q("SELECT name, id FROM it ORDER BY id")]
+    # The wrong widths: refused by name with Postgres's code, and nothing written.
+    count = lambda: [q(f"SELECT count(*) AS n FROM {t}")[0]["n"] for t in ("lt", "kt")]
+    before, wrong = count(), {}
+    with conn() as c:
+        for s in ["INSERT INTO lt VALUES (6, 1), (7)", "INSERT INTO lt VALUES (1, 2, 3, 'w', 5)", "INSERT INTO kt (id) VALUES (5, 6)", "INSERT INTO kt (id, n) VALUES (5)"]:
+            try:
+                c.execute(s)
+                wrong[s] = "accepted"
+            except psycopg.Error as e:
+                wrong[s] = e.sqlstate
+    after = count()
+    seen["short rows"] = {"lt": lt, "kt": kt, "it": it, "wrong width": wrong, "counts": [before, after]}
+    checks["a row shorter than the table (no column list) takes the DEFAULTs of the columns it leaves out, as Postgres fills it: VALUES and SELECT, append and keyed tables, bound, in a transaction, a renamed column, an identity"] = \
+        lt == [(1, 7, 1, "z"), (2, 8, 1, "z"), (3, 7, 1, "z"), (4, 7, 1, "z"), (5, 7, 1, "z"), (6, 7, 1, "z"), (9, 7, 1, "z"), (10, 7, 1, "z"), (11, 7, 1, "z")] \
+        and kt == [(1, 3, "k"), (2, 3, "k"), (3, 4, "k")] and it == [("x", 1), ("y", 2)]
+    checks["a row of the wrong width is refused 42601, writing nothing"] = all(v == "42601" for v in wrong.values()) and after == before
+
+
 def found():
     """What writing the docs found (round 26), each fixed: a filtered materialized view follows
     UPDATE and DELETE; a producer's seq 0 refused (HTTP, Flight); a merge table that leaves a
@@ -7398,7 +7444,9 @@ def found():
     padding, its ingest modes and table types; `pondra run`'s flags anywhere. And what the console
     found: a time without seconds, BASE TABLE, exact numbers, files() after PUT. And the Postgres catalog's
     text columns (`text`, varchar kept in pg_type) and COMMENT ON (obj_description, col_description, pg_description).
-    And a cast of a decimal or a float to an integer rounding as Postgres's does."""
+    And a cast of a decimal or a float to an integer rounding as Postgres's does. And a row shorter than the table, with
+    no column list, takes the DEFAULTs of the columns it leaves out, as Postgres fills it; a row of the wrong width is
+    refused 42601."""
     import datetime as dt, psycopg, pyarrow as pa, pyarrow.flight as fl
     import adbc_driver_flightsql.dbapi as adbc
     lake, guarded = new_lake(), new_lake()
@@ -7613,6 +7661,7 @@ def found():
         all("is NOT NULL" in v for v in null_refused.values()) and "acct.id is NOT NULL" in null_refused["a NULL key"] and q("SELECT count(*) AS n FROM acct") == [{"n": 8}] \
         and "Cannot cast" in fails("CREATE TABLE bad (a BIGINT DEFAULT 'abc')") and "nope" in fails("CREATE TABLE bad (a BIGINT DEFAULT nope())") \
         and "rows already there" in fails("ALTER TABLE acct ADD COLUMN z BIGINT DEFAULT 3")
+    _short_rows(q, pgport, checks, seen)
     # Read your writes on a follower: each statement sees the one before it (a script's INSERT, then
     # its SELECT; an UPDATE; a table made, then filled), as on the leader.
     follower = Node(lake, port + 2).start()

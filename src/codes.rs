@@ -97,6 +97,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("permission denied") || has("may not ") && (has("this user") || has("this token")) => "42501", // insufficient_privilege
         _ if has("wrong token") || has("password authentication failed") => "28P01",            // invalid_password
         _ if has("sql error: parsererror") || has("syntax error") || has("expected: ") && has("found: ") => "42601", // syntax_error
+        _ if has("inconsistent data length across values list") => "42601", // (a VALUES whose rows differ in width: Postgres says syntax_error too)
         _ if has("no field named") || has("column") && has("not found") || has("no column ") => "42703", // undefined_column
         _ if has("invalid function") || has("function") && (has("not found") || has("does not exist")) || has("no function ") => "42883", // undefined_function
         _ if has("table '") && has("not found") || has("no table ") || has("no table or view") || has("relation") && has("does not exist") => "42P01", // undefined_table
@@ -200,6 +201,7 @@ mod tests {
         assert_eq!(of("Error during planning: table 'datafusion.public.nope' not found"), "42P01");
         assert_eq!(of("Schema error: No field named nope. Valid fields are t.a."), "42703");
         assert_eq!(of("SQL error: ParserError(\"Expected: an SQL statement, found: SELEC at Line: 1, Column: 1\")"), "42601");
+        assert_eq!(of("Inconsistent data length across values list: got 1 values in row 2 but expected 2"), "42601");
         assert_eq!(of("Arrow error: Divide by zero error"), "22012");
         assert_eq!(of("orders.id is NOT NULL, and a row gives it no value"), "23502");
         assert_eq!(of("permission denied: INSERT on t (GRANT INSERT ON t TO ann)"), "42501");

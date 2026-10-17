@@ -216,7 +216,7 @@ mod tests {
     use super::*;
     use crate::store::TableMeta;
     use chrono::{DateTime, Timelike, Utc};
-    use crate::write::{fit, rows};
+    use crate::write::{fit, planned};
     use datafusion::execution::SessionStateBuilder;
     use datafusion::prelude::SessionContext;
 
@@ -229,6 +229,16 @@ mod tests {
             .with_optimizer_rules(crate::optimize::rules())
             .build();
         SessionContext::new_with_state(state)
+    }
+
+    /// `write::rows` for these tests' tables, which have no DEFAULTs: their rows are planned and fit, with no lake to
+    /// take a default's values from.
+    async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> anyhow::Result<RecordBatch> {
+        let target = crate::query::schema(&meta.columns)?;
+        match planned(ctx, &target, sql).await? {
+            Some(all) => fit(&target, &all),
+            None => Ok(RecordBatch::new_empty(target)),
+        }
     }
 
     fn meta(columns: &[(&str, &str)]) -> TableMeta {
