@@ -8,6 +8,7 @@
 //! A table that needs nothing of a Delta reader is answered in the protocol's Parquet form (every
 //! client reads it); one with deletion vectors or renamed columns only to a client that reads
 //! Delta's (`responseformat=delta`): never handed out as files that would show deleted rows.
+use crate::byte_range;
 use crate::read_delta::Log;
 use crate::reset::Once;
 use crate::server::App;
@@ -390,7 +391,7 @@ async fn file(State(app): State<App>, method: axum::http::Method, Path(link): Pa
         Ok(m) => m.size,
         Err(_) => return missing("the file is gone: ask for the table's files again".into()).into_response(),
     };
-    let range = h.get("range").and_then(|r| r.to_str().ok()).and_then(|r| asked(r, size));
+    let range = h.get("range").and_then(|r| r.to_str().ok()).and_then(|r| byte_range::resolve(r, size));
     let (from, to) = range.unwrap_or((0, size));
     let mut out = HeaderMap::new();
     out.insert("accept-ranges", "bytes".parse().expect("a header"));
@@ -398,7 +399,7 @@ async fn file(State(app): State<App>, method: axum::http::Method, Path(link): Pa
     out.insert("content-type", "application/octet-stream".parse().expect("a header"));
     let status = match range {
         Some(_) => {
-            out.insert("content-range", format!("bytes {from}-{}/{size}", to.saturating_sub(1)).parse().expect("a header"));
+            out.insert("content-range", byte_range::content_range(&(from..to), size).parse().expect("a header"));
             StatusCode::PARTIAL_CONTENT
         }
         None => StatusCode::OK,
@@ -411,17 +412,6 @@ async fn file(State(app): State<App>, method: axum::http::Method, Path(link): Pa
         Ok(got) => (status, out, axum::body::Body::from_stream(got.into_stream())).into_response(),
         Err(e) => internal(e.into()).into_response(),
     }
-}
-
-/// A `Range: bytes=…` header's one range, within the file (None: none asked, or not one we take).
-fn asked(r: &str, size: u64) -> Option<(u64, u64)> {
-    let (a, b) = r.strip_prefix("bytes=")?.split_once('-')?;
-    let (from, to) = match (a.trim(), b.trim()) {
-        ("", n) => (size.saturating_sub(n.parse().ok()?), size),
-        (a, "") => (a.parse().ok()?, size),
-        (a, b) => (a.parse().ok()?, b.parse::<u64>().ok()?.saturating_add(1).min(size)),
-    };
-    (from <= to && from <= size).then_some((from, to))
 }
 
 // ---------------------------------------------------------------- reading another's shares
@@ -504,6 +494,15 @@ impl std::fmt::Display for Links {
 
 fn links_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> object_store_df::Error { object_store_df::Error::Generic { store: "share", source: e.into() } }
 
+/// DataFusion's object_store is another crate's copy of this one's, so its ranges are written out as ours.
+fn ours(r: &object_store_df::GetRange) -> object_store::GetRange {
+    match r {
+        object_store_df::GetRange::Bounded(b) => object_store::GetRange::Bounded(b.clone()),
+        object_store_df::GetRange::Offset(o) => object_store::GetRange::Offset(*o),
+        object_store_df::GetRange::Suffix(n) => object_store::GetRange::Suffix(*n),
+    }
+}
+
 #[async_trait::async_trait]
 impl object_store_df::ObjectStore for Links {
     async fn put_opts(&self, _: &object_store_df::path::Path, _: object_store_df::PutPayload, _: object_store_df::PutOptions) -> object_store_df::Result<object_store_df::PutResult> {
@@ -513,25 +512,23 @@ impl object_store_df::ObjectStore for Links {
         Err(object_store_df::Error::NotSupported { source: "a share is read only".into() })
     }
     async fn get_opts(&self, location: &object_store_df::path::Path, options: object_store_df::GetOptions) -> object_store_df::Result<object_store_df::GetResult> {
-        use object_store_df::GetRange;
         let encoded = location.as_ref().rsplit('/').next().unwrap_or_default();
         let url = String::from_utf8(base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, encoded).map_err(links_error)?).map_err(links_error)?;
-        // (a link is signed for GET alone: a HEAD is a GET of the first byte)
-        let range = match (&options.range, options.head) {
-            (_, true) => "bytes=0-0".to_string(),
-            (Some(GetRange::Bounded(b)), _) => format!("bytes={}-{}", b.start, b.end.saturating_sub(1)),
-            (Some(GetRange::Offset(o)), _) => format!("bytes={o}-"),
-            (Some(GetRange::Suffix(n)), _) => format!("bytes=-{n}"),
-            (None, _) => "bytes=0-".to_string(),
+        // (a link is signed for GET alone: a HEAD is a GET of the first byte; no range asked is the whole file)
+        let want = match (&options.range, options.head) {
+            (_, true) => object_store::GetRange::Bounded(0..1),
+            (Some(r), _) => ours(r),
+            (None, _) => object_store::GetRange::Offset(0),
         };
-        let r = crate::ext::web().get(&url).header("range", range).send().await.map_err(links_error)?;
+        let r = crate::ext::web().get(&url).header("range", byte_range::header(&want)).send().await.map_err(links_error)?;
         match r.status().as_u16() {
             200 | 206 => {}
             404 => return Err(object_store_df::Error::NotFound { path: location.to_string(), source: "the provider has no such file now".into() }),
             s => return Err(links_error(format!("the provider's link answered {s} (links end after a while: run the query again)"))),
         }
-        let total = r.headers().get("content-range").and_then(|v| v.to_str().ok()).and_then(|c| c.rsplit('/').next()?.parse::<u64>().ok());
-        let start = r.headers().get("content-range").and_then(|v| v.to_str().ok()).and_then(|c| c.strip_prefix("bytes ")?.split('-').next()?.parse::<u64>().ok()).unwrap_or(0);
+        let answer = r.headers().get("content-range").and_then(|v| v.to_str().ok()).and_then(byte_range::answered);
+        let start = answer.as_ref().map_or(0, |(span, _)| span.start);
+        let total = answer.and_then(|(_, size)| size);
         let bytes = if options.head { bytes::Bytes::new() } else { r.bytes().await.map_err(links_error)? };
         let size = total.unwrap_or(start + bytes.len() as u64);
         let meta = object_store_df::ObjectMeta { location: location.clone(), last_modified: chrono::DateTime::UNIX_EPOCH, size, e_tag: None, version: None };
@@ -553,12 +550,7 @@ impl object_store_df::ObjectStore for Links {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn ranges() {
-        assert_eq!(super::asked("bytes=0-99", 1000), Some((0, 100)));
-        assert_eq!(super::asked("bytes=900-", 1000), Some((900, 1000)));
-        assert_eq!(super::asked("bytes=-8", 1000), Some((992, 1000)));
-        assert_eq!(super::asked("bytes=990-2000", 1000), Some((990, 1000)));
-        assert_eq!(super::asked("bytes=5-1", 1000), None);
+    fn pages() {
         let p = super::page((0..5).map(|i| serde_json::json!(i)).collect(), &[("maxResults".to_string(), "2".to_string())].into());
         assert_eq!((p["items"].as_array().unwrap().len(), p["nextPageToken"].as_str()), (2, Some("2")));
     }

@@ -53,6 +53,7 @@ mod optimize;
 #[cfg(feature = "server")] mod rerun;
 #[cfg(feature = "server")] mod auth;
 #[cfg(feature = "server")] mod budget;
+#[cfg(feature = "server")] mod byte_range;
 #[cfg(feature = "server")] mod cache;
 #[cfg(feature = "server")] mod catalogs;
 #[cfg(feature = "server")] mod change;

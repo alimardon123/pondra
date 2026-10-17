@@ -5,6 +5,7 @@
 //! catalog, terms, tiering, spreading) goes through `ObjectStore` as it does for a bucket. The node
 //! that serves a store leads its lake, and the others never claim a term (`checked`, invariant 299).
 
+use crate::byte_range;
 use crate::store::Store;
 use axum::body::Body;
 use axum::extract::{self, Query, State};
@@ -245,7 +246,7 @@ async fn get_at(store: &Store, head: bool, raw: &str, headers: &HeaderMap) -> Re
     } else {
         Body::from_stream(got.into_stream())
     };
-    let partial = asked.then(|| content_range(&span, meta.size));
+    let partial = asked.then(|| byte_range::content_range(&span, meta.size));
     let mut res = Response::new(body);
     *res.status_mut() = if asked { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
     object_headers(&mut res, &meta, partial)?;
@@ -255,29 +256,9 @@ async fn get_at(store: &Store, head: bool, raw: &str, headers: &HeaderMap) -> Re
 /// The Range header as a range the store can serve; any other is a 400.
 fn requested_range(raw: &str, headers: &HeaderMap) -> Result<Option<GetRange>, Response> {
     let Some(value) = headers.get("range") else { return Ok(None) };
-    value.to_str().ok().and_then(parse_range).filter(|r| r.is_valid().is_ok())
+    value.to_str().ok().and_then(byte_range::parse).filter(|r| r.is_valid().is_ok())
         .ok_or_else(|| bad(format!("{raw}: a Range this store can't serve")))
         .map(Some)
-}
-
-/// `bytes=a-b`, `bytes=a-` or `bytes=-n`, as the store's ranges (HTTP's `b` is inclusive).
-fn parse_range(text: &str) -> Option<GetRange> {
-    let (first, last) = text.strip_prefix("bytes=")?.split_once('-')?;
-    match (first.is_empty(), last.is_empty()) {
-        (true, false) => Some(GetRange::Suffix(last.parse().ok()?)),
-        (false, true) => Some(GetRange::Offset(first.parse().ok()?)),
-        (false, false) => {
-            let (start, end): (u64, u64) = (first.parse().ok()?, last.parse().ok()?);
-            Some(GetRange::Bounded(start..end.checked_add(1)?))
-        }
-        (true, true) => None,
-    }
-}
-
-/// The `content-range` of a partial answer: `bytes a-b/size`, or `bytes */size` for an empty range
-/// (every store puts an empty range at the end).
-fn content_range(span: &Range<u64>, size: u64) -> String {
-    if span.is_empty() { format!("bytes */{size}") } else { format!("bytes {}-{}/{size}", span.start, span.end - 1) }
 }
 
 /// The headers every answer about an object carries, as the store gave the object.
@@ -623,17 +604,7 @@ fn number<T: std::str::FromStr>(headers: &HeaderMap, name: &str, served: &str) -
 /// The range of a partial answer, from its `content-range`.
 fn content_span(headers: &HeaderMap, served: &str) -> object_store::Result<Range<u64>> {
     let text = text_of(headers, "content-range").ok_or_else(|| generic(served, "answered a partial read without its content-range"))?;
-    span_of(&text).ok_or_else(|| generic(served, format!("answered the content-range {text:?}, which isn't one")))
-}
-
-fn span_of(text: &str) -> Option<Range<u64>> {
-    let (span, size) = text.strip_prefix("bytes ")?.split_once('/')?;
-    let size: u64 = size.parse().ok()?;
-    if span == "*" {
-        return Some(size..size);
-    }
-    let (start, last) = span.split_once('-')?;
-    Some(start.parse().ok()?..last.parse::<u64>().ok()?.checked_add(1)?)
+    byte_range::answered(&text).map(|(span, _)| span).ok_or_else(|| generic(served, format!("answered the content-range {text:?}, which isn't one")))
 }
 
 /// A body's chunks, each waited for `IDLE` at most. After a failure the stream is over.
@@ -758,7 +729,7 @@ impl ObjectStore for Served {
         let mut headers = HeaderMap::new();
         if let Some(range) = &options.range {
             range.is_valid().map_err(|e| generic(&self.at, e))?;
-            headers.insert("range", header_text(&self.at, &range.to_string())?);
+            headers.insert("range", header_text(&self.at, &byte_range::header(range))?);
         }
         if let Some(e_tag) = &options.if_match {
             headers.insert("if-match", header_text(&self.at, e_tag)?);
