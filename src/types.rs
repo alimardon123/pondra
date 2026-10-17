@@ -447,6 +447,9 @@ pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn
 /// it parsed for one: the built-in types' names are left alone.) A call of a JSON maker is parsed too:
 /// `pg_types::rewrite` reads its arguments (`makes_json`).
 pub fn wanted(sql: &str) -> bool {
+    if sql.contains("[]") {
+        return true; // (an array type: a string cast to one reads as a Postgres array literal, `pg_values::array_literals`)
+    }
     static SET_FUNCTION: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\b(generate_series|range|unnest)\s*\(").expect("a regex"));
     if SET_FUNCTION.is_match(sql) {
         return true; // (a set function in a FROM that reads a column is written by `lateral::functions`)
@@ -477,6 +480,9 @@ pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
     }
     for s in stmts.iter_mut() {
         read |= crate::lateral::functions(s)?; // (`generate_series(1, t.n)` in a FROM: a LATERAL subquery it can plan)
+    }
+    for s in stmts.iter_mut() {
+        read |= crate::pg_values::array_literals(s)?; // (a string cast to an array type reads as Postgres reads an array literal)
     }
     let mut f = Casts { types: HashMap::new(), named: vec![], labelled: vec![], typed: false, collecting: true, failed: None };
     for s in stmts.iter_mut() {

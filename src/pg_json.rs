@@ -6,11 +6,13 @@
 //! answers NULL where a walk meets it; `@>`, `<@`, `?`, `?|` and `?&` read the whole document and refuse it (22P02).
 //! `text` groups the operators the way Postgres does, where SQL comes in (`path::door`).
 use crate::pg_catalog::{follows_json, function, text_arg, texts_out};
-use crate::pg_json_make::fail;
+use crate::pg_json_make::{fail, refuse};
+use crate::pg_types::MARK;
+use crate::pg_values::array_literal;
 use crate::types::{is_json, json_of};
 use datafusion::arrow::array::{Array, ArrayAccessor, ArrayRef, AsArray, BooleanArray, StringArray};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Int64Type};
+use datafusion::arrow::datatypes::{DataType, Field, Int64Type};
 use datafusion::common::{DFSchema, Result, ScalarValue};
 use datafusion::logical_expr::expr::{Alias, ScalarFunction};
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
@@ -33,9 +35,13 @@ struct Operators;
 impl ExprPlanner for Operators {
     fn plan_binary_op(&self, e: RawBinaryExpr, schema: &DFSchema) -> Result<PlannerResult<RawBinaryExpr>> {
         let Some((name, both_text)) = operator(&e.op) else { return Ok(PlannerResult::Original(e)) };
-        let text = |x: &Expr| x.get_type(schema).is_ok_and(|t| matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8));
-        if !text(&e.left) || (both_text && !text(&e.right)) {
-            return Ok(PlannerResult::Original(e)); // (an array's @> stays DataFusion's, a JSON union's -> stays functions-json's)
+        let text = |x: &Expr| x.get_type(schema).is_ok_and(|t| is_text(&t));
+        let planned = match e.op {
+            BinaryOperator::Minus | BinaryOperator::HashMinus => deletes(&e, schema)?,
+            _ => text(&e.left) && (!both_text || text(&e.right)), // (an array's @> stays DataFusion's, a JSON union's -> stays functions-json's)
+        };
+        if !planned {
+            return Ok(PlannerResult::Original(e));
         }
         // The column's title is what functions-json gives it (`doc #>> '{b,0}'`), so a default name doesn't change.
         let alias = format!("{} {} {}", as_title(&e.left), e.op, as_title(&e.right));
@@ -45,7 +51,7 @@ impl ExprPlanner for Operators {
 }
 
 /// The function an operator calls, and whether both sides must be text. `->` takes a text key or an integer index,
-/// so only its left side must be text.
+/// so only its left side must be text. `-` and `#-` are planned by `deletes`, which asks for the same two.
 fn operator(op: &BinaryOperator) -> Option<(&'static str, bool)> {
     Some(match op {
         BinaryOperator::Arrow => ("json_object_field", false),
@@ -56,8 +62,53 @@ fn operator(op: &BinaryOperator) -> Option<(&'static str, bool)> {
         BinaryOperator::Question => ("jsonb_exists", false),
         BinaryOperator::QuestionPipe => ("jsonb_exists_any", false),
         BinaryOperator::QuestionAnd => ("jsonb_exists_all", false),
+        BinaryOperator::Minus => ("jsonb_delete", false),
+        BinaryOperator::HashMinus => ("jsonb_delete_path", false),
         _ => return None,
     })
+}
+
+fn is_text(t: &DataType) -> bool { matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8) }
+
+fn is_list(t: &DataType) -> bool { matches!(t, DataType::List(_) | DataType::LargeList(_)) }
+
+/// The JSON type a field is marked with (`json` or `jsonb`), if it is.
+fn json_mark(f: &Field) -> Option<&str> { f.metadata().get(MARK).map(String::as_str).filter(|m| matches!(*m, "json" | "jsonb")) }
+
+/// Whether `-` or `#-` deletes from a document here (`jsonb_delete`, `jsonb_delete_path`), else DataFusion keeps the
+/// operator it has. A document takes `-` a key, an integer or a list of keys, and `#-` a path (text or a list): what
+/// Postgres's jsonb operators take. A bare literal's `-` stays DataFusion's, since Postgres has no `unknown - unknown`.
+/// json has neither operator, and a right side jsonb has none for is refused by name (42883), as Postgres refuses it.
+fn deletes(e: &RawBinaryExpr, schema: &DFSchema) -> Result<bool> {
+    let (left, right) = (e.left.to_field(schema)?.1, e.right.to_field(schema)?.1);
+    let minus = matches!(e.op, BinaryOperator::Minus);
+    if !is_text(left.data_type()) || (minus && matches!(e.left, Expr::Literal(..))) {
+        return Ok(false);
+    }
+    // (a NULL on the right is a NULL text or path, as Postgres reads an unknown there)
+    let keys = is_text(right.data_type()) || matches!(right.data_type(), DataType::Null) || is_list(right.data_type());
+    let fits = keys || (minus && is_integer(right.data_type()));
+    let refused = json_mark(&left) == Some("json") || json_mark(&right).is_some() || (!fits && (!minus || json_mark(&left).is_some()));
+    if refused {
+        let message = format!("operator does not exist: {} {} {}", type_name(&e.left, &left), e.op, type_name(&e.right, &right));
+        return Err(refuse("42883", message));
+    }
+    Ok(fits)
+}
+
+/// The name Postgres gives an operand's type in its message about an operator (`jsonb - integer`).
+fn type_name(e: &Expr, f: &Field) -> &'static str {
+    if let Some(mark) = json_mark(f) {
+        return if mark == "json" { "json" } else { "jsonb" };
+    }
+    match f.data_type() {
+        DataType::Null => "unknown",
+        t if is_text(t) => if matches!(e, Expr::Literal(..)) { "unknown" } else { "text" },
+        t if is_list(t) => "text[]",
+        t if is_integer(t) => "integer",
+        DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Decimal128(..) | DataType::Decimal256(..) => "numeric",
+        _ => "unknown",
+    }
 }
 
 /// An operand as functions-json writes it in a column's title: a column's name, a string in quotes.
@@ -90,7 +141,7 @@ static FUNCTIONS: LazyLock<Vec<Arc<ScalarUDF>>> = LazyLock::new(|| {
 
 /// The function called `name` (one of the ones above, or an alias of one).
 fn named(name: &str) -> Arc<ScalarUDF> {
-    FUNCTIONS.iter().find(|f| f.name() == name).cloned().expect("pg_json.rs calls only the functions it makes")
+    FUNCTIONS.iter().chain(crate::pg_json_edit::FUNCTIONS.iter()).find(|f| f.name() == name).cloned().expect("pg_json.rs calls only the functions it makes")
 }
 
 /// Adds the functions to a session, so `json_object_field(…)`, `jsonb_contains(…)` and the rest can be called by name.
@@ -99,6 +150,7 @@ pub fn register(ctx: &SessionContext) {
         ctx.register_udf(f.as_ref().clone());
     }
     crate::pg_json_make::register(ctx);
+    crate::pg_json_edit::register(ctx);
 }
 
 /// `s` parsed, for containment and existence: a document that isn't JSON is refused (22P02, in `json_of`'s words).
@@ -109,7 +161,7 @@ fn document(s: &str) -> anyhow::Result<Value> {
 
 /// A path or a list of keys, one per row: a text-array literal (`'{b,0}'`) or a list (`ARRAY['b', '0']`). None where
 /// the argument is NULL, and a NULL element is None inside the list.
-fn lists(a: &ArrayRef) -> anyhow::Result<Vec<Option<Vec<Option<String>>>>> {
+pub(crate) fn lists(a: &ArrayRef) -> anyhow::Result<Vec<Option<Vec<Option<String>>>>> {
     if !matches!(a.data_type(), DataType::List(_) | DataType::LargeList(_)) {
         return text_arg(a)?.into_iter().map(|t| t.map(|s| array_literal(&s)).transpose()).collect();
     }
@@ -119,81 +171,6 @@ fn lists(a: &ArrayRef) -> anyhow::Result<Vec<Option<Vec<Option<String>>>>> {
         (!items.is_null(i)).then(|| items.value(i).as_string::<i32>().iter().map(|s| s.map(str::to_string)).collect::<Vec<_>>())
     });
     Ok(rows.collect())
-}
-
-/// Postgres's text array literal (`{a,"b,c",NULL}`): a bare NULL is a NULL element, a quoted one is text, a bare
-/// element is trimmed of its spaces, and `{}` has no elements.
-fn array_literal(s: &str) -> anyhow::Result<Vec<Option<String>>> {
-    let malformed = || crate::codes::coded("22P02", format!("malformed array literal: \"{s}\""));
-    let body = s.trim().strip_prefix('{').and_then(|b| b.strip_suffix('}')).ok_or_else(malformed)?;
-    let mut rest = body.trim_start();
-    let mut items = Vec::new();
-    if rest.is_empty() {
-        return Ok(items);
-    }
-    loop {
-        let (item, after) = if rest.starts_with('"') { quoted(rest) } else { bare(rest) }.ok_or_else(malformed)?;
-        items.push(item);
-        let after = after.trim_start();
-        if after.is_empty() {
-            return Ok(items);
-        }
-        rest = after.strip_prefix(',').ok_or_else(malformed)?.trim_start();
-    }
-}
-
-/// A quoted element at the start of `s`, its escapes undone, and the text after its closing quote.
-fn quoted(s: &str) -> Option<(Option<String>, &str)> {
-    let mut out = String::new();
-    let mut chars = s[1..].char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '"' => return Some((Some(out), &s[2 + i..])),
-            '\\' => out.push(chars.next()?.1),
-            c => out.push(c),
-        }
-    }
-    None
-}
-
-/// A bare element at the start of `s`: up to the next comma, trimmed, with `\x` read as `x`. A bare NULL is NULL,
-/// and an empty element (`{a,,b}`) is malformed.
-fn bare(s: &str) -> Option<(Option<String>, &str)> {
-    let mut end = s.len();
-    let mut chars = s.char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '\\' => {
-                chars.next();
-            }
-            ',' => {
-                end = i;
-                break;
-            }
-            _ => {}
-        }
-    }
-    let raw = s[..end].trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let item = if raw.eq_ignore_ascii_case("NULL") { None } else { Some(unescape(raw)) };
-    Some((item, &s[end..]))
-}
-
-/// `s` with each `\x` read as `x`.
-fn unescape(s: &str) -> String {
-    let mut out = String::new();
-    let mut escaped = false;
-    for c in s.chars() {
-        if c == '\\' && !escaped {
-            escaped = true;
-        } else {
-            out.push(c);
-            escaped = false;
-        }
-    }
-    out
 }
 
 const JSON_SPACE: &[char] = &[' ', '\t', '\n', '\r'];
@@ -256,7 +233,7 @@ where
     Arc::new(StringArray::from_iter(out))
 }
 
-fn is_integer(d: &DataType) -> bool {
+pub(crate) fn is_integer(d: &DataType) -> bool {
     matches!(d, DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64)
 }
 
@@ -351,7 +328,7 @@ fn array_len(doc: &str) -> Option<usize> {
 
 /// An array index as `#>` reads a path element: an optional sign, then digits (`+1`, `01`, `-0` and `-1` as Postgres
 /// reads them). None when it isn't a whole number.
-fn index_of(text: &str) -> Option<i64> {
+pub(crate) fn index_of(text: &str) -> Option<i64> {
     let (sign, digits) = match text.as_bytes().first()? {
         b'-' => (-1, &text[1..]),
         b'+' => (1, &text[1..]),
@@ -479,7 +456,7 @@ const OP: u8 = 70;
 /// `(doc ->> 'a') = 'x'`, and `doc ? 'a'` as `jsonb_exists(doc, 'a')`. Text that needs neither (and any text neither
 /// dialect reads) comes back borrowed, as it was.
 pub fn text(sql: &str) -> Cow<'_, str> {
-    const OPERATORS: [&str; 5] = ["->", "#>", "@>", "<@", "?"];
+    const OPERATORS: [&str; 6] = ["->", "#>", "@>", "<@", "?", "#-"];
     if !OPERATORS.iter().any(|op| sql.contains(op)) {
         return Cow::Borrowed(sql);
     }
@@ -698,7 +675,8 @@ fn is_json_op(e: &ast::Expr) -> bool {
                 | BinaryOperator::ArrowAt
                 | BinaryOperator::Question
                 | BinaryOperator::QuestionPipe
-                | BinaryOperator::QuestionAnd,
+                | BinaryOperator::QuestionAnd
+                | BinaryOperator::HashMinus,
             ..
         }
     )
@@ -722,6 +700,8 @@ fn take(e: &mut ast::Expr) -> ast::Expr { std::mem::replace(e, ast::Expr::value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codes::Coded;
+    use datafusion::common::DataFusionError;
 
     fn elements(v: &[&str]) -> Vec<Option<String>> { v.iter().map(|s| Some(s.to_string())).collect() }
 
@@ -978,5 +958,53 @@ mod tests {
         assert!(matches!(text("SELECT doc -> 'a' FROM t"), Cow::Borrowed(_)), "a JSON operator already grouped the way Postgres groups it");
         assert!(matches!(text("SELECT 1 FROM t"), Cow::Borrowed(_)), "no JSON operator at all");
         assert!(matches!(text("SELECT doc ->> 'a' = 'x' FROM t WHERE doc"), Cow::Owned(_)));
+    }
+
+    #[test]
+    fn text_groups_path_deletion_as_postgres_does() {
+        assert_eq!(grouped("SELECT doc #- '{a}' = '{}' FROM t"), "SELECT (doc #- '{a}') = '{}' FROM t");
+        assert_eq!(grouped("SELECT doc #- '{a}' FROM t"), "SELECT doc #- '{a}' FROM t", "alone, it reads as it is");
+    }
+
+    /// The SQLSTATE of a refusal a planner raised (`refuse`), if it raised one.
+    fn refused_as(r: Result<bool>) -> Option<&'static str> {
+        match r {
+            Err(DataFusionError::External(e)) => e.downcast_ref::<Coded>().map(|c| c.0),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn deletes_are_planned_where_postgres_has_the_operator() {
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::logical_expr::{col, lit};
+        use std::collections::HashMap;
+        let marked = |m: &str| HashMap::from([(MARK.to_string(), m.to_string())]);
+        let schema = DFSchema::try_from(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true).with_metadata(marked("jsonb")),
+            Field::new("js", DataType::Utf8, true).with_metadata(marked("json")),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new("tags", DataType::new_list(DataType::Utf8, true), true),
+        ]))
+        .unwrap();
+        let plan = |op: BinaryOperator, left: Expr, right: Expr| deletes(&RawBinaryExpr { op, left, right }, &schema);
+        let (minus, hash) = (|| BinaryOperator::Minus, || BinaryOperator::HashMinus);
+        let null = || Expr::Literal(ScalarValue::Null, None);
+        // `-` and `#-` on a document: the operators Postgres has (a key, an index, a list of keys, a path)
+        assert!(plan(minus(), col("doc"), lit("a")).unwrap(), "doc - 'a'");
+        assert!(plan(minus(), col("doc"), lit(1i64)).unwrap(), "doc - 1");
+        assert!(plan(minus(), col("doc"), col("tags")).unwrap(), "doc - a text[] column");
+        assert!(plan(minus(), col("doc"), null()).unwrap(), "doc - NULL");
+        assert!(plan(hash(), col("doc"), lit("{a}")).unwrap(), "doc #- a path literal");
+        // Not these: a bare literal's `-`, a number, and text with no document in it
+        assert!(!plan(minus(), lit("[]"), lit("a")).unwrap(), "a bare literal's minus stays DataFusion's");
+        assert!(!plan(minus(), col("n"), lit(1i64)).unwrap(), "an integer column's `-` is arithmetic");
+        assert!(!plan(minus(), col("name"), lit(1.5f64)).unwrap(), "text - a decimal is not a document's");
+        // Refused by name, as Postgres refuses them: json has no `-`, jsonb has no `-` for a decimal or a jsonb right side
+        assert_eq!(refused_as(plan(minus(), col("js"), lit("a"))), Some("42883"), "json - text");
+        assert_eq!(refused_as(plan(minus(), col("doc"), lit(1.5f64))), Some("42883"), "jsonb - numeric");
+        assert_eq!(refused_as(plan(minus(), col("doc"), col("doc"))), Some("42883"), "jsonb - jsonb");
+        assert_eq!(refused_as(plan(hash(), col("doc"), lit(1i64))), Some("42883"), "jsonb #- integer");
     }
 }

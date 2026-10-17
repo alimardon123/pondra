@@ -225,6 +225,9 @@ pub(crate) fn fail(e: anyhow::Error) -> DataFusionError {
     }
 }
 
+/// A refusal with its SQLSTATE, as a function raises it (`fail` of a `Coded`).
+pub(crate) fn refuse(code: &'static str, message: impl Into<String>) -> DataFusionError { fail(coded(code, message)) }
+
 fn null_key() -> DataFusionError { fail(coded("22004", "null value not allowed for object key")) }
 
 /// One text per row: `row(i)` is row `i`'s answer, None where it is NULL.
@@ -698,7 +701,7 @@ fn read_whole(json: &str) -> Option<Node> {
 
 /// Refuses a document nested past `MAX_DEPTH` levels, before anything is read: a bracket inside a string doesn't count,
 /// and a text's escapes are skipped. The byte scan is a few lines and costs less than the reading it guards.
-fn depth_check(json: &str) -> Result<()> {
+pub(crate) fn depth_check(json: &str) -> Result<()> {
     let mut depth = 0usize;
     let mut in_text = false;
     let mut escaped = false;
@@ -725,6 +728,7 @@ fn depth_check(json: &str) -> Result<()> {
 }
 
 /// A JSON value as jsonb keeps it. An object's members are ordered by their key's length, then its bytes.
+#[derive(Clone)]
 pub(crate) enum Node {
     Null,
     Bool(bool),
