@@ -78,7 +78,7 @@ writes hands each job the one it needs as `PONDRA_TOKEN`; Pondra itself never re
 |---|---|---|
 | `PONDRA_MEMORY_GB` | a third of the machine's memory | memory for queries, when `--memory-gb` is not given. A sort, join or aggregation that needs more spills to disk. An answer counts in it until it is sent, and one bigger than it is refused with SQLSTATE `53200`, saying so: ask for fewer rows, or write them out with `COPY (…) TO` |
 | `PONDRA_MEMORY_MAX_GB` | 85% of the machine's or container's memory | the memory (GB) past which the node stops the query that grew it (SQLSTATE `53200`) rather than be killed. `0` turns it off |
-| `PONDRA_MEMORY_LAKE_GB` | a quarter of the machine's memory | what a lake held in memory (`connect()`, `:memory:`) keeps in memory. Past it, its new files and log go to a folder of the process's own on disk (under `PONDRA_CACHE_DIR` when set, else the temporary directory, or the user's cache folder where that is held in memory), removed when the lake is closed, instead of the process running out of memory |
+| `PONDRA_MEMORY_LAKE_GB` | a quarter of the machine's memory | what a lake held in memory (`connect()`, `:memory:`) keeps in memory. Past it, its new files and log go to a folder of the process's own on disk (under `PONDRA_SPILL_DIR`, or `PONDRA_CACHE_DIR` when set, else the temporary directory, or the user's cache folder where that is held in memory), removed when the lake is closed, instead of the process running out of memory |
 | `PONDRA_QUERIES` | four a core, 16 at least | how many queries a node runs at once. The others wait their turn, in the order they came (`pondra_queries_running` and `pondra_queries_waiting` in [`/metrics`](/pondra/reference/http/)) |
 | `PONDRA_QUEUE_SECS` | `60` | how long a query waits for its turn. Past it, it is refused with SQLSTATE `53300`: try again, or ask another node |
 | `PONDRA_STREAM_MB` | `8` | an answer this big or bigger (as Arrow) is sent over HTTP in pieces as it is written, as JSON, CSV, TSV, NDJSON or Arrow, never as one body in memory. The bytes are the same either way |
@@ -112,6 +112,8 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 | `PONDRA_SPREAD_MB` | `256` | tables smaller than this are not spread over nodes |
 | `PONDRA_BROADCAST_MB` | `64` | in a shuffle, tables smaller than this are read whole by every node, so a join broadcasts them. `0` slices every table |
 | `PONDRA_SKEW_MB` | `64` | a partition bigger than this, and than twice the average, is shared out among nodes |
+| `PONDRA_SPILL_DIR` | `PONDRA_CACHE_DIR` when set, else the temporary folder (your cache folder where the temporary one is held in memory) | the folder a node's queries spill to when they need more than their memory: sorts, aggregations, joins and shuffles |
+| `PONDRA_SPILL_GB` | that disk's free space, less what the lake keeps for itself | how much a node's queries may spill. Past it a query is refused with SQLSTATE `53100`, saying to raise this. `0`: nothing spills, and a query that needs to is refused with `53200` |
 | `PONDRA_SPILL_MB` | `64` | rows a shuffle holds in memory before they go to disk |
 | `PONDRA_LINK` | measured | the network between nodes as `ms,MB/s` (`0.5,1000`), instead of measuring it every 10 minutes |
 | `PONDRA_JOIN_ORDER` | `2` | how much cheaper a new join order must look before it is taken. `0` turns join reordering off |
