@@ -23,6 +23,18 @@ def queries(folder):
     return out
 
 
+def columns(schema):
+    """A Parquet schema as POST /tables/{t} takes it (sf1 has decimals, sf1-bench doubles)."""
+    names = {"decimal128": "Decimal128", "date32[day]": "Date32", "int64": "Int64", "int32": "Int32", "string": "Utf8", "double": "Float64"}
+    out = []
+    for f in schema:
+        t = str(f.type)
+        for k, v in names.items():
+            t = t.replace(k, v)
+        out.append([f.name, t])
+    return out
+
+
 def pondra(data, qs):
     import pyarrow as pa, pyarrow.ipc, pyarrow.parquet as pq
     lake = tempfile.mkdtemp(prefix="pondra-tpch-")
@@ -30,8 +42,7 @@ def pondra(data, qs):
     t0 = time.time()
     for t in TABLES:
         table = pq.read_table(os.path.join(data, f"{t}.parquet"))
-        cols = [[f.name, str(f.type).replace("decimal128", "Decimal128").replace("date32[day]", "Date32").replace("int64", "Int64")
-                 .replace("int32", "Int32").replace("string", "Utf8")] for f in table.schema]
+        cols = columns(table.schema)
         call(A.port, "POST", f"/tables/{t}", json.dumps(cols).encode())
         for seq, batch in enumerate(table.to_batches(max_chunksize=500_000), 1):
             buf = io.BytesIO()
