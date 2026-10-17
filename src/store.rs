@@ -498,6 +498,10 @@ fn spill_disk() -> DiskManagerBuilder {
         Some(folder) => DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![folder.path.clone()])),
         None => DiskManagerBuilder::default(), // (no folder: the OS temp folder, as before)
     };
+    // (a merge of spilled runs takes at most an eighth of its partition's share, about 4 MB a run read at once: unlimited,
+    // as DataFusion has it, each partition's merge took the whole pool and a window over its rows was refused)
+    let fan_in = (memory_limit() / partitions() / (32 << 20)).clamp(4, 64);
+    let builder = builder.with_max_spill_merge_fan_in(fan_in);
     let cap = match gb {
         Some(gb) => Some((gb * (1u64 << 30) as f64) as u64),
         None => folder.as_ref().and_then(|f| space(&f.path)).map(|(free, total)| free.saturating_sub(lake_keeps(total))),

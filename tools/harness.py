@@ -3533,15 +3533,18 @@ def scale():
         and q("SELECT count(*) AS n FROM big") == [{"n": 3000000}]
         and q("SELECT count(*) AS n FROM (SELECT rank() OVER (PARTITION BY k ORDER BY id) AS r FROM big) WHERE r = 1") == [{"n": 2000000}])
     print(json.dumps({"windows": {"seconds": window_times, "peak_mb": win_peak >> 20, "errors": window_errors, "want": [want_all, want_part], "got": [got_all, got_part], "refused": win_refused}}))
-    # A window over long strings, on a fresh node of its own, over a lake that a separate `pondra sql` process loaded (an
-    # in-node load would put its own peak into the node's high-water mark). One partition of 9 M strings: the window's
-    # rows wait for the partition's end, and the concatenation kept the strings they point into past it, so a build
-    # without the change is stopped by the 1 GB watch.
+    # Two windows over long strings, each on a fresh node of its own, over one lake that a separate `pondra sql` process
+    # loaded (an in-node load would put its own peak into the node's high-water mark). One partition of 9 M strings: the
+    # window's rows wait for the partition's end, and the concatenation kept the strings they point into past it, so a
+    # build without the change is stopped by the 1 GB watch. Three partitions of 6 M, with the pool sized so the sorts
+    # feeding the windows fill their shares: a window's reservation is spillable, so the pool gives it a fair share beside
+    # them (`held.rs`); a build without that refuses it, since an unspillable grow is checked against what the sorts hold.
     wlake = new_lake()
-    for statement in ("CREATE TABLE ws1 (k BIGINT, s VARCHAR)",):
+    for statement in ("CREATE TABLE ws1 (k BIGINT, s VARCHAR)", "CREATE TABLE ws3 (k BIGINT, s VARCHAR)"):
         subprocess.run([BIN, "sql", "--dir", wlake, statement], check=True, capture_output=True)
     long_string = "md5(value::VARCHAR) || md5(value::VARCHAR) || md5(value::VARCHAR)"
     subprocess.run([BIN, "sql", "--dir", wlake, f"INSERT INTO ws1 SELECT 0, {long_string} FROM generate_series(1, 9000000)"], check=True, capture_output=True, timeout=900)
+    subprocess.run([BIN, "sql", "--dir", wlake, f"INSERT INTO ws3 SELECT value % 3, {long_string} FROM generate_series(1, 6000000)"], check=True, capture_output=True, timeout=900)
     wport = port + 20
     def windowed(table):
         node = Node(wlake, wport, memory_gb=0.25, env={"PONDRA_CORES": "4", "PONDRA_MEMORY_MAX_GB": "1"}).start()
@@ -3556,8 +3559,11 @@ def scale():
             node.kill()
         return out
     window_strings = windowed("ws1")
+    window_share = windowed("ws3")
     checks[f"a rank() over one partition of 9M long strings streams: 1 answered, its peak {window_strings['peak_mb']} MB under the 1 GB line"] = (
         window_strings["answer"] == [{"n": 1}] and window_strings["peak_mb"] < 1 << 10)
+    checks[f"a rank() over 3 partitions of 6M long strings, the sorts feeding it filling their shares: 3 answered (the window has a fair share of the pool), its peak {window_share['peak_mb']} MB"] = (
+        window_share["answer"] == [{"n": 3}])
     # A write that runs out of memory retries frugally as a query does: its join's sort-merge spills, and a
     # COPY to a folder leaves no file of the first try behind. Each write's error is kept for the report.
     folder = os.path.join(tempfile.mkdtemp(prefix="pondra-frugal-"), "out")
@@ -3735,7 +3741,7 @@ def scale():
     node.kill()
     ok = all(checks.values())
     shown = {q: ("same" if same else "DIFFERENT") + (", by ranges" if r else "") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp, r) in shuffles.items()}
-    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "sort_errors": sort_errors, "window_refusals": window_refusals, "window_strings": window_strings, "memory_line": memory_line, "spill": spill_report, "ok": ok}, indent=1))
+    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "sort_errors": sort_errors, "window_refusals": window_refusals, "window_strings": window_strings, "window_share": window_share, "memory_line": memory_line, "spill": spill_report, "ok": ok}, indent=1))
     if not ok:
         print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
         sys.exit(1)
