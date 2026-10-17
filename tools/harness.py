@@ -18499,8 +18499,8 @@ def answers_big():
     and a second's queue, four slow queries at once answer two at once and refuse the rest with
     53300 (or answer after), and a query run inside a query (PIVOT asks the data) takes no turn of its
     own, so one turn does for it. Past the node's memory an answer streams from its plan as the plan
-    makes it (`query::collect_or_send`): a 9M-row CSV over the 0.25 GB node is read a piece at a time, a
-    text table (never in pieces) of 60M rows is still refused, an answer that is cut short fails its body
+    makes it (`query::collect_or_send`): a 12M-row CSV of computed columns (288 MB, past the 256 MB a query
+    may hold) over the 0.25 GB node is read a piece at a time, a text table (never in pieces) of 60M rows is still refused, an answer that is cut short fails its body
     rather than ending whole, and an identical query doesn't wait for another client's reading."""
     import pyarrow.compute as pc, pyarrow.csv as pacsv, pyarrow.ipc as paipc
     checks = {}
@@ -18584,27 +18584,39 @@ def answers_big():
     finally:
         node.kill()
 
-    # 2b. Past the node's memory, an answer goes from its plan as the plan makes it: 9M rows of CSV over the same 0.25 GB
-    # node, read a piece at a time (each line counted and its first column summed as it comes, never the body whole).
+    # 2b. Past the node's memory, an answer goes from its plan as the plan makes it: 12M rows of CSV over the same 0.25 GB
+    # node, read a piece at a time (each line counted and its first two columns summed as it comes, never the body whole).
+    # The columns are computed, so no buffer is shared with `big` and the answer counts its own bytes: three 8-byte columns
+    # a row, 288 MB, past the 256 MB a query may hold, so a node that collects it refuses it (53200). (Nine million rows
+    # are 216 MB: under the budget, so they would still answer.) `b1.b + b2.a - b2.a` is computed with no zero to fold away.
+    copies = 4
     node = Node(lake, A.port + 5, memory_gb=0.25).start()
     try:
-        streamed_rows = rows * 3
+        streamed_rows = rows * copies
         conn = http_client.HTTPConnection("127.0.0.1", A.port + 5, timeout=900)
-        conn.request("POST", "/sql?format=csv", "SELECT b1.*, b2.a AS a2 FROM big b1 CROSS JOIN (SELECT a FROM big LIMIT 3) b2".encode())
+        conn.request("POST", "/sql?format=csv", f"SELECT b1.a + b2.a - b2.a AS a, b1.b + b2.a - b2.a AS b, b2.a AS a2 FROM big b1 CROSS JOIN (SELECT a FROM big LIMIT {copies}) b2".encode())
         resp = conn.getresponse()
-        lines_read, total, pending, header = 0, 0, b"", True
-        while piece := resp.read(1 << 20):
-            complete, _, pending = (pending + piece).rpartition(b"\n")
-            for line in (complete.split(b"\n") if complete else []):
-                if header:
-                    header = False
-                    continue
-                lines_read += 1
-                total += int(line.split(b",", 1)[0])
+        lines_read, total, total_b, sums_ok, pending, header = 0, 0, 0, False, b"", True
+        if resp.status == 200:
+            while piece := resp.read(1 << 20):
+                complete, _, pending = (pending + piece).rpartition(b"\n")
+                for line in (complete.split(b"\n") if complete else []):
+                    if header:
+                        header = False
+                        continue
+                    first, second, _ = line.split(b",", 2)
+                    lines_read += 1
+                    total += int(first)
+                    total_b += int(second)
+            sums_ok = total == copies * (rows * (rows + 1) // 2) and total_b == copies * rows * (rows + 1)
+            outcome = f"200, {lines_read:,} rows, sums of a and b right: {sums_ok}"
+        else:
+            text = resp.read().decode(errors="replace")
+            outcome = f"{resp.status} ({resp.getheader('x-pondra-sqlstate')}), refused: {'the answer is bigger than this node' in text}"
         conn.close()
         peak_csv = vm_hwm(node.p.pid)
-        checks[f"a {streamed_rows:,}-row answer (about {streamed_rows * 46 >> 20} MB as Arrow, past the node's 256 MB for queries) goes as CSV from its plan: {resp.status}, every row ({lines_read:,}), sum of a right, at a peak of {peak_csv >> 20} MB, under the 3M-row answer rendered whole ({peak_whole >> 20} MB)"] = (
-            resp.status == 200 and not pending and lines_read == streamed_rows and total == 3 * (rows * (rows + 1) // 2) and peak_csv < peak_whole)
+        checks[f"an answer of {streamed_rows:,} rows, past the node's memory for queries, goes as CSV from its plan at a peak of {peak_csv >> 20} MB: {outcome}; under the 3M-row answer rendered whole ({peak_whole >> 20} MB)"] = (
+            resp.status == 200 and not pending and lines_read == streamed_rows and sums_ok and peak_csv < peak_whole)
     finally:
         node.kill()
 
