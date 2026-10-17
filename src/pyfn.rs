@@ -27,6 +27,7 @@ use datafusion::prelude::SessionContext;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
+pub use crate::text::{is_json, loose};
 
 /// A SQL type as DataFusion reads it (`VARCHAR` → Utf8, `DOUBLE` → Float64, `INT[]` → a list),
 /// strings as plain Utf8; `VARIANT` and `JSON` are JSON text. Worked out once per type.
@@ -45,13 +46,6 @@ pub async fn arrow_of(sql_type: &str) -> Result<DataType> {
     SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(sql_type.to_string(), t.clone());
     Ok(t)
 }
-
-/// VARIANT (JSON) values go to Python as what they hold, and come back as JSON.
-pub fn is_json(sql_type: Option<&str>) -> bool { sql_type.is_some_and(|t| ["VARIANT", "JSON"].contains(&t.trim().to_uppercase().as_str())) }
-
-/// A parameter that takes any value as it comes, not cast: none given, `ANY` (Postgres's
-/// `anyelement`), or VARIANT / JSON (a JSON document's text, or any other value).
-pub fn loose(sql_type: Option<&str>) -> bool { sql_type.is_none_or(|t| is_json(Some(t)) || ["ANY", "ANYELEMENT"].contains(&t.trim().to_uppercase().as_str())) }
 
 fn plain(t: &DataType) -> DataType {
     match t {

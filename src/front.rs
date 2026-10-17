@@ -2,10 +2,12 @@
 //! FROM first, files by name, …), generic over what it asks of where it runs (`Host`). A node is a host
 //! (`host.rs`); a page will be one (designs/l2-b4-front-and-web.md). Each pass runs once a statement or once a name.
 
-use crate::ext::Attached;
-use crate::routines::{Expander, Kind, Routine};
+use crate::ext_names::Attached;
+use crate::expander::Routine;
+use crate::expander::{Expander, Kind};
 use anyhow::Result;
-use datafusion::sql::sqlparser::{ast::{self, Statement, VisitMut}, dialect::GenericDialect, parser::Parser};
+use datafusion::sql::sqlparser::ast::Statement;
+use datafusion::sql::sqlparser::{ast::{self, VisitMut}, dialect::GenericDialect, parser::Parser};
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -47,19 +49,19 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
         Own::Go(sql) => sql,
     };
     let sql = &crate::sparksql::inline(sql)?; // (`spark_sql('…')`: Spark SQL as Pondra's, then expanded as any)
-    let sql = &crate::branch::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
+    let sql = &crate::diff::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
     let sql = &crate::past::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
     let sql = &crate::friendly::text(sql)?.into_owned(); // (`PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON: as SQL that parses)
     let marked = crate::measures::text(sql); // (`sum(x) AS MEASURE revenue`: an alias that parses, ADR-065 §3)
     let sql: &str = &marked;
     let all = host.routines().await?;
     let outside = host.attached().await?;
-    let named = |n: &String| crate::ddl::mentions(sql, n);
-    let expands = all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) || views.keys().any(named) || crate::routines::FROM_FIRST.is_match(sql) || crate::ext::mentions(sql)
+    let named = |n: &String| crate::text::mentions(sql, n);
+    let expands = all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) || views.keys().any(named) || crate::expander::FROM_FIRST.is_match(sql) || crate::ext_names::mentions(sql)
         || outside.iter().any(|(n, _)| named(n)) || sql.contains("pondra_at(");
-    let as_written = || Ok(crate::routines::named_apart(sql).unwrap_or_else(|| sql.to_string()));
+    let as_written = || Ok(crate::expander::named_apart(sql).unwrap_or_else(|| sql.to_string()));
     let measured = host.measured(sql).await?; // (a view with measures read, or a measure named)
-    if !expands && !measured && !crate::friendly::wanted(sql) && !crate::types::wanted(sql) {
+    if !expands && !measured && !crate::friendly::wanted(sql) && !crate::text::names_a_type(sql) {
         return as_written();
     }
     // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
@@ -73,7 +75,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     // Measures first, at the query's own grain (ADR-065 §3): what they put in (a view's FROM, its macros) is expanded below.
     let expands = (measured && host.measures(sql, &mut stmts).await?) || expands;
     let columns = match expands {
-        true => crate::routines::columns(host, &stmts, &all).await?,
+        true => crate::expander::columns(host, &stmts, &all).await?,
         false => HashMap::new(),
     };
     let name = host.name();
@@ -90,5 +92,5 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     if !expands && !friendly && !typed {
         return as_written();
     }
-    Ok(crate::routines::text(&stmts))
+    Ok(crate::text::text(&stmts))
 }

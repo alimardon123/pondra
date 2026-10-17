@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+pub use crate::text::{first_word, head, ident, object};
 
 // ---------------------------------------------------------------- tables
 
@@ -403,15 +404,6 @@ pub fn cluster_names(e: &ast::Expr) -> Vec<String> {
         e => vec![e.to_string()],
     }
 }
-
-/// A name as SQL resolves it: its parts, unquoted ones in lower case, joined by dots.
-pub fn object(n: &ast::ObjectName) -> String {
-    let part = |p: &ast::ObjectNamePart| p.as_ident().map(ident).unwrap_or_else(|| p.to_string());
-    n.0.iter().map(part).collect::<Vec<_>>().join(".")
-}
-
-/// One part of a name: as written if quoted, else in lower case.
-pub fn ident(i: &ast::Ident) -> String { if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() } }
 
 /// A name in SQL, each part quoted as it is: `"t"`, `"schema"."t"`, `"lake"."schema"."t"`.
 pub fn sql_name(name: &str) -> String {
@@ -814,32 +806,6 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     })
 }
 
-/// `CREATE TABLE t (a BIGINT, b VARCHAR, PRIMARY KEY (a)) [WITH (publish = 'delta,iceberg',
-/// cluster_by = 'b', merge = 'total:sum', partition_by = 'day(ts)')]` → the table name and its spec. SQL types become Arrow
-/// types the way DataFusion maps them.
-/// With `AS SELECT`, the columns are the query's (run over `from`'s tables; `files`: local files
-/// too, for `pondra sql` on its own machine), or those it names (`CREATE TABLE t (a INT, b
-/// VARCHAR) AS VALUES …`: the query's columns by position).
-/// `sql` from its first word on: past leading whitespace and comments (`-- …`, `/* … */`).
-pub fn first_word(sql: &str) -> &str {
-    let mut s = sql.trim_start();
-    loop {
-        if let Some(rest) = s.strip_prefix("--") {
-            s = rest.find('\n').map_or("", |i| &rest[i + 1..]).trim_start();
-        } else if let Some(rest) = s.strip_prefix("/*") {
-            s = rest.find("*/").map_or("", |i| &rest[i + 2..]).trim_start();
-        } else {
-            return s;
-        }
-    }
-}
-
-/// The statement's first word, lowercased (`create` for `CREATE TABLE …`, past comments): what a
-/// statement's own regexes are looked at for, so a query compiles none of them.
-pub fn head(sql: &str) -> String {
-    first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_ascii_lowercase()
-}
-
 /// A column type as DataFusion plans it: bytes by any of their names (`BYTEA`), and JSON kept as
 /// text (`VARIANT`, `JSON`, `JSONB`: the JSON functions read it).
 pub fn sql_type(t: &ast::DataType) -> String {
@@ -869,6 +835,12 @@ pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::Fi
     Ok(ctx.table("t").await?.schema().fields().iter().cloned().collect::<Vec<_>>())
 }
 
+/// `CREATE TABLE t (a BIGINT, b VARCHAR, PRIMARY KEY (a)) [WITH (publish = 'delta,iceberg',
+/// cluster_by = 'b', merge = 'total:sum', partition_by = 'day(ts)')]` → the table name and its spec. SQL types become Arrow
+/// types the way DataFusion maps them.
+/// With `AS SELECT`, the columns are the query's (run over `from`'s tables; `files`: local files
+/// too, for `pondra sql` on its own machine), or those it names (`CREATE TABLE t (a INT, b
+/// VARCHAR) AS VALUES …`: the query's columns by position).
 pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Result<String> {
     let (as_text, mut enums, mut sql_types) = crate::types::columns(from, &c.columns).await?; // (an enum or a uuid column holds text: `types.rs`)
     let declared = || declared_of(&as_text);
