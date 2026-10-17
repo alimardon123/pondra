@@ -1472,6 +1472,24 @@ async fn seen_there(other: &Lake, mark: Option<String>) {
     let _ = other.refresh().await;
 }
 
+/// The table a `CREATE TABLE … AS SELECT` made, dropped if its request ends before the INSERT answers: the
+/// memory watch stops a request by dropping its future (`oom.rs`), so the code after the INSERT never runs.
+struct Undo(Option<(crate::server::App, String)>);
+
+impl Drop for Undo {
+    fn drop(&mut self) {
+        let Some((app, name)) = self.0.take() else { return };
+        // (carried: the drop runs as the caller that was stopped, with its sign-in and session, which tokio still
+        // holds while a future is dropped)
+        crate::panics::task(crate::auth::carried(async move {
+            let drop = Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: name.clone(), if_exists: true, purge: true }]);
+            if let Err(e) = Box::pin(on_node_as(&app, drop, None, false)).await {
+                eprintln!("dropping {name}, a CREATE TABLE … AS SELECT that stopped before it answered: {e:#}");
+            }
+        }));
+    }
+}
+
 async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
     let stmt = crate::protect::door(&app.lake, stmt).await?; // (a project's objects in a protected database: an apply's only)
     if let Some(out) = crate::temp::statement(app, &stmt, files).await? {
@@ -1552,10 +1570,12 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         if let Some(q) = &c.query {
             let (name, query) = (object(&c.name), q.to_string());
             Box::pin(on_node_as(app, Stmt::Define(name.clone(), create_spec(c, lake, files).await?), Some(job.clone()), files)).await?;
+            let mut undo = Undo(Some((app.clone(), name.clone()))); // (a request stopped before the INSERT answers drops the table too)
             let out = Box::pin(on_node_as(app, Stmt::Insert(name.clone(), query), Some(job), files)).await;
-            if out.as_ref().is_err_and(|e| crate::codes::of(e) == "23505") {
-                // Refused (two rows of one key, or a key the table can't take): nothing lands, so the table goes too, purged:
-                // it never held a row, so it isn't kept for UNDROP.
+            undo.0 = None; // (answered: the drop below is this request's own, and its answer comes once the table is gone)
+            if out.is_err() {
+                // Refused or failed (a cast, a query the memory watch stops, a key the table can't take): nothing lands, so the
+                // table goes too, purged: it never held a row the statement answered for, so it isn't kept for UNDROP.
                 Box::pin(on_node_as(app, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name, if_exists: true, purge: true }]), None, false)).await?;
             }
             return out;
@@ -1866,8 +1886,8 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
             let (name, query) = (object(&c.name), c.query.as_ref().expect("a query").to_string());
             Box::pin(one_from_cli(dir, Stmt::Define(name.clone(), create_spec(&c, &lake, true).await?))).await?;
             let out = Box::pin(one_from_cli(dir, Stmt::Insert(name.clone(), query))).await;
-            if out.as_ref().is_err_and(|e| crate::codes::of(e) == "23505") {
-                Box::pin(one_from_cli(dir, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name, if_exists: true, purge: true }]))).await?; // (refused: nothing lands, nor the table; purged: never kept for UNDROP)
+            if out.is_err() {
+                Box::pin(one_from_cli(dir, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name, if_exists: true, purge: true }]))).await?; // (refused or failed: nothing lands, nor the table; purged: never kept for UNDROP)
             }
             out
         }

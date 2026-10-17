@@ -12669,6 +12669,45 @@ def objects():
     checks["an INSERT into a name no table has is refused (42P01, naming it) over HTTP and pondra sql, nothing made; POST /insert/{t} still makes one"] = \
         nope[:2] == (404, "42P01") and "no table nope" in str(nope[2]) and nope_select[1] == "42P01" and nope_read[1] == "42P01" \
         and cli_nope.returncode != 0 and "no table nope" in cli_nope.stdout + cli_nope.stderr and q("SELECT count(*) AS n FROM bulk_made") == [{"n": 1}]
+    # A CREATE TABLE … AS SELECT that fails leaves no table (`write.rs`, `Undo`): a cast's 22P02 over HTTP and pondra sql,
+    # then a query the memory watch stops (53200: its future is dropped mid-request, so only `Undo` drops the table it made)
+    # on a node of its own with a 1 GB line. The same statement, fixed, then answers (no 42P07).
+    ctas_bad = http("CREATE TABLE ctas_bad AS SELECT CAST('x' AS INT) AS a")
+    ctas_read = http("SELECT * FROM ctas_bad")
+    ctas_fixed = http("CREATE TABLE ctas_bad AS SELECT 1 AS a")
+    ctas_rows = q("SELECT a FROM ctas_bad")
+    own = new_lake()  # (a lake of its own, for pondra sql alone)
+    cli_bad = subprocess.run([BIN, "sql", "--dir", own, "CREATE TABLE ctas_cli AS SELECT CAST('x' AS INT) AS a"], capture_output=True, text=True, timeout=120, env=node.env)
+    cli_fixed = subprocess.run([BIN, "sql", "--dir", own, "CREATE TABLE ctas_cli AS SELECT 1 AS a"], capture_output=True, text=True, timeout=120, env=node.env)
+    cli_read = subprocess.run([BIN, "sql", "--dir", own, "SELECT a FROM ctas_cli"], capture_output=True, text=True, timeout=120, env=node.env)
+    big_lake = new_lake()
+    big = Node(big_lake, A.port + 6, memory_gb=0.5, env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4"), "PONDRA_MEMORY_MAX_GB": "1"}).start()  # (as scale's memory-line check starts one)
+    def big_answer(s):  # (status, SQLSTATE, body): the answer, or the refusal as the node sends it
+        c = http_client.HTTPConnection("127.0.0.1", big.port, timeout=600)
+        c.request("POST", "/sql", s.encode())
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode(errors="replace")
+    t0 = time.time()
+    stopped = big_answer("CREATE TABLE ctas_big AS SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, 30000000) GROUP BY 1")
+    stopped_seconds = time.time() - t0
+    t0, gone, probe = time.time(), None, None
+    while time.time() - t0 < 10:  # (the table goes within 10 s of the answer, or it stays)
+        probe = big_answer("SELECT * FROM ctas_big")
+        if probe[1] == "42P01":
+            gone = round(time.time() - t0, 1)
+            break
+        time.sleep(0.5)
+    big_after = _try(lambda: sql(big.port, "SELECT 1 AS one"))
+    big.kill()
+    if not big_lake.startswith("s3://"):
+        shutil.rmtree(big_lake, ignore_errors=True)  # (its node is stopped: its lake goes now)
+    info["ctas"] = {"http_cast": [ctas_bad[0], ctas_bad[1]], "http_read": ctas_read[1], "fixed": [ctas_fixed[0], ctas_rows],
+                    "cli": [cli_bad.returncode, cli_fixed.returncode, (cli_fixed.stdout + cli_fixed.stderr)[-200:], cli_read.returncode, cli_read.stdout[-200:]],
+                    "memory_line": [stopped[0], stopped[1], round(stopped_seconds, 1)], "gone_seconds": gone, "after": big_after}
+    checks["a CREATE TABLE … AS SELECT that fails leaves no table (a cast's 22P02, a query the memory watch stops), and the same statement fixed then answers"] = \
+        ctas_bad[1] == "22P02" and ctas_read[1] == "42P01" and ctas_fixed[0] == 200 and ctas_rows == [{"a": 1}] \
+        and cli_bad.returncode != 0 and cli_fixed.returncode == 0 and "42P07" not in cli_fixed.stdout + cli_fixed.stderr and cli_read.returncode == 0 and "| 1 |" in cli_read.stdout \
+        and stopped[1] == "53200" and gone is not None and big_after == [{"one": 1}]
     # DuckDB's EXPORT DATABASE and IMPORT DATABASE are not Pondra's yet (ADR-071): refused by name
     # with the ways it has (0A000), not with the parser's words.
     exported, imported = http("EXPORT DATABASE 'out'"), http("IMPORT DATABASE 'out'")
