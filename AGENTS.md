@@ -2814,7 +2814,8 @@ python3 tools/harness.py safety         # panics answered as errors, TLS at ever
 python3 tools/harness.py owned signed guesses   # a program's node answers only it; a lake served with tokens stays signed; failed sign-ins limited per address and name
 python3 tools/harness.py sealed         # the admin token as the master key: sealed from the first write, across nodes, rotation, the nodes' key refused
 python3 tools/harness.py first          # a node on the network with no token makes the lake's first user and prints its token once; pondra token; a follower answers no one
-python3 tools/harness.py sso sso_flow  # tokens from a provider at every door (409, 410); the browser's and pondra login's way in (411): kinds apart, the command line's confirmation, HTTP/2, starts that ask the provider nothing
+python3 tools/harness.py sso          # tokens from a provider at every door (409, 410): refusals, USERS 'any', claimed roles, keys fetched at most once a minute
+python3 tools/harness.py sso_flow     # the browser's and pondra login's way in (411): kinds apart, the command line's confirmation, HTTP/2, starts that ask the provider nothing
 python3 tools/harness.py sso_pg         # psql 18's sign-in through a provider (POSTGRES 'oauth', OAUTHBEARER): told where it is, a token in, refusals, one way a connection
 python3 tools/harness.py keycloak       # single sign-on against a real Keycloak (PONDRA_KEYCLOAK): tokens at every door, realm roles, the console's flow, pondra login, psql 18
 python3 tools/node_check.py             # a node stopped once it serves, or while it starts, gives its term back: the next leads at once
