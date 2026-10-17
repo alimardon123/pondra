@@ -690,7 +690,7 @@ impl ObjectStore for Held {
         if matches!(opts.mode, CopyMode::Create) && (inner.mem.has(to) || inner.on_disk(to).await?) {
             return Err(already(to));
         }
-        // (a copy on disk is a hard link, which takes no room: it only counts what it names)
+        // (a copy on disk is a hard link: it keeps its bytes once the object it copied goes, so it counts them)
         match inner.mem.size(from) {
             Some(bytes) => {
                 inner.objects.copy_opts(from, to, opts).await?;
