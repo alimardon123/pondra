@@ -191,3 +191,19 @@ pub fn names_a_type(sql: &str) -> bool {
         (Some(n), None) => ["uuid", "json", "jsonb"].iter().any(|t| n.as_str().eq_ignore_ascii_case(t)) || !BUILT_IN.contains(&n.as_str().to_lowercase().as_str()), // (a cast to uuid, json or jsonb: written as text)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_concatenation_is_parsed_only_when_it_may_meet_a_document() {
+        for sql in ["SELECT 'n' || 5", "SELECT 'a' || 'b' || 'c'", "SELECT name || 'x'"] {
+            assert!(!names_a_type(sql), "{sql}");
+        }
+        for sql in ["SELECT 'n' || name FROM t", "UPDATE t SET doc = doc || '{}'", "INSERT INTO t SELECT 1", "SELECT '{}' || '{}'::jsonb", "SELECT to_jsonb(1) || '{}'"] {
+            assert!(names_a_type(sql), "{sql}");
+        }
+        assert!(names_a_type("SELECT json_agg(x) FROM t") && names_a_type("SELECT * FROM generate_series(1, t.n)") && names_a_type("SELECT '{a}'::text[]"));
+    }
+}
