@@ -170,7 +170,11 @@ pub fn names_a_type(sql: &str) -> bool {
     if sql.contains("[]") {
         return true; // (an array type: a string cast to one reads as a Postgres array literal, `pg_values::array_literals`)
     }
-    static SET_FUNCTION: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\b(generate_series|range|unnest)\s*\(").expect("a regex"));
+    // (a set function: one in a FROM that reads a column is LATERAL's, `lateral::functions`; JSON's give a document's
+    // rows, `pg_json_sets::sets`)
+    static SET_FUNCTION: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b(?:generate_series|range|unnest|jsonb?_(?:array_elements(?:_text)?|each(?:_text)?|object_keys|to_record(?:set)?))\s*\(").expect("a regex")
+    });
     if SET_FUNCTION.is_match(sql) || makes_json(sql) {
         return true;
     }
@@ -204,6 +208,6 @@ mod tests {
         for sql in ["SELECT 'n' || name FROM t", "UPDATE t SET doc = doc || '{}'", "INSERT INTO t SELECT 'a' || 'b'", "SELECT '{}' || '{}'::jsonb", "SELECT to_jsonb(1) || '{}'"] {
             assert!(names_a_type(sql), "{sql}");
         }
-        assert!(names_a_type("SELECT json_agg(x) FROM t") && names_a_type("SELECT * FROM generate_series(1, t.n)") && names_a_type("SELECT '{a}'::text[]"));
+        assert!(names_a_type("SELECT json_agg(x) FROM t") && names_a_type("SELECT * FROM generate_series(1, t.n)") && names_a_type("SELECT * FROM jsonb_each(t.doc)") && names_a_type("SELECT '{a}'::text[]"));
     }
 }

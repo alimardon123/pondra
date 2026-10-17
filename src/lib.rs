@@ -119,6 +119,7 @@ mod optimize;
 #[cfg(feature = "server")] mod pg_json;
 #[cfg(feature = "server")] mod pg_json_make;
 #[cfg(feature = "server")] mod pg_json_edit;
+#[cfg(feature = "server")] mod pg_json_sets;
 #[cfg(feature = "server")] mod pg_names;
 #[cfg(feature = "server")] mod pg_text;
 #[cfg(feature = "server")] mod pg_types;

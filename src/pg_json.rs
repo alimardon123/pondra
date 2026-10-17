@@ -5,12 +5,12 @@
 //! kept as written (`types.rs`), so `->` and `#>` answer the value's text as the document has it. Text that isn't JSON
 //! answers NULL where a walk meets it; `@>`, `<@`, `?`, `?|` and `?&` read the whole document and refuse it (22P02).
 //! `text` groups the operators the way Postgres does, where SQL comes in (`path::door`).
-use crate::pg_catalog::{follows_json, function, text_arg, texts_out};
-use crate::pg_json_make::{fail, refuse};
+use crate::pg_catalog::{follows_json, function, marked, text_arg, texts_out};
+use crate::pg_json_make::{fail, jsonb_text, refuse};
 use crate::pg_types::MARK;
 use crate::pg_values::array_literal;
-use crate::types::{is_json, json_of};
-use datafusion::arrow::array::{Array, ArrayAccessor, ArrayRef, AsArray, BooleanArray, StringArray};
+use crate::types::{is_json, json_of, json_refusal};
+use datafusion::arrow::array::{Array, ArrayAccessor, ArrayRef, AsArray, BooleanArray, Int32Array, StringArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type};
 use datafusion::common::{DFSchema, Result, ScalarValue};
@@ -140,6 +140,9 @@ fn as_title(e: &Expr) -> String {
 /// and its aliases); the path ones keep `pondra_` names, as `pondra_json` does. `register` adds them to every session.
 static FUNCTIONS: LazyLock<Vec<Arc<ScalarUDF>>> = LazyLock::new(|| {
     let two = || Signature::any(2, Volatility::Immutable);
+    let one = || Signature::any(1, Volatility::Immutable);
+    // (a path's keys are any number of text arguments: `json_extract_path(doc, 'a', 'b')`; zero keys are refused in `extract`)
+    let any = || Signature::variadic_any(Volatility::Immutable);
     vec![
         Arc::new(follows_json("json_object_field", two(), |_| DataType::Utf8, |a, n| field(a, n).map_err(fail)).with_aliases(["jsonb_object_field", "json_array_element", "jsonb_array_element"])),
         Arc::new(follows_json("pondra_json_path", two(), |_| DataType::Utf8, |a, n| path(a, n, false).map_err(fail))),
@@ -149,6 +152,14 @@ static FUNCTIONS: LazyLock<Vec<Arc<ScalarUDF>>> = LazyLock::new(|| {
         Arc::new(function("jsonb_exists", two(), |_| DataType::Boolean, |a, n| exists(a, n).map_err(fail))),
         Arc::new(function("jsonb_exists_any", two(), |_| DataType::Boolean, |a, n| any_all(a, n, false).map_err(fail))),
         Arc::new(function("jsonb_exists_all", two(), |_| DataType::Boolean, |a, n| any_all(a, n, true).map_err(fail))),
+        Arc::new(function("json_typeof", one(), |_| DataType::Utf8, |a, n| type_of(a, n).map_err(fail))),
+        Arc::new(function("jsonb_typeof", one(), |_| DataType::Utf8, |a, n| type_of(a, n).map_err(fail))),
+        Arc::new(function("json_array_length", one(), |_| DataType::Int32, |a, n| array_length(a, n).map_err(fail))),
+        Arc::new(function("jsonb_array_length", one(), |_| DataType::Int32, |a, n| array_length(a, n).map_err(fail))),
+        Arc::new(marked("json_extract_path", any(), |_| DataType::Utf8, Some("json"), |a, n| extract("json_extract_path", a, n, false, false).map_err(fail))),
+        Arc::new(marked("jsonb_extract_path", any(), |_| DataType::Utf8, Some("jsonb"), |a, n| extract("jsonb_extract_path", a, n, false, true).map_err(fail))),
+        Arc::new(function("json_extract_path_text", any(), |_| DataType::Utf8, |a, n| extract("json_extract_path_text", a, n, true, false).map_err(fail))),
+        Arc::new(function("jsonb_extract_path_text", any(), |_| DataType::Utf8, |a, n| extract("jsonb_extract_path_text", a, n, true, true).map_err(fail))),
     ]
 });
 
@@ -164,6 +175,7 @@ pub fn register(ctx: &SessionContext) {
     }
     crate::pg_json_make::register(ctx);
     crate::pg_json_edit::register(ctx);
+    crate::pg_json_sets::register(ctx);
 }
 
 /// `s` parsed, for containment and existence: a document that isn't JSON is refused (22P02, in `json_of`'s words).
@@ -186,7 +198,7 @@ pub(crate) fn lists(a: &ArrayRef) -> anyhow::Result<Vec<Option<Vec<Option<String
     Ok(rows.collect())
 }
 
-const JSON_SPACE: &[char] = &[' ', '\t', '\n', '\r'];
+pub(crate) const JSON_SPACE: &[char] = &[' ', '\t', '\n', '\r'];
 
 /// One step of a path, as an operator takes it. `->` takes a text key (`Key`, an object's member only) or an integer
 /// (`Index`, an array's element, negative from the end); `#>` takes each element as text (`Path`): a key of an object,
@@ -201,13 +213,94 @@ enum Step<'a> {
 /// `#>` (`text` false) and `#>>` (true): what the path reaches in each document, NULL where it reaches nothing.
 fn path(a: &[ArrayRef], n: usize, text: bool) -> anyhow::Result<ArrayRef> {
     let (docs, paths) = (text_arg(&a[0])?, lists(&a[1])?);
-    let out = (0..n).map(|i| {
-        let (Some(doc), Some(elements)) = (&docs[i], &paths[i]) else { return None };
-        let steps: Option<Vec<Step>> = elements.iter().map(|e| e.as_deref().map(Step::Path)).collect();
-        let raw = find(doc, &steps?)?;
-        if text { unquoted(raw) } else { Some(raw.to_string()) }
+    reached(&docs, paths, n, text, false)
+}
+
+/// What each row's path reaches in its document: `paths[i]` is the path's steps (None where it is NULL, and a NULL step
+/// makes the answer NULL). `text` and `jsonb` answer as `answer` says.
+fn reached(docs: &[Option<String>], paths: Vec<Option<Vec<Option<String>>>>, n: usize, text: bool, jsonb: bool) -> anyhow::Result<ArrayRef> {
+    let out = (0..n).map(|i| -> anyhow::Result<Option<String>> {
+        let (Some(doc), Some(elements)) = (&docs[i], &paths[i]) else { return Ok(None) };
+        let Some(steps) = elements.iter().map(|e| e.as_deref().map(Step::Path)).collect::<Option<Vec<_>>>() else { return Ok(None) };
+        match find(doc, &steps) {
+            Some(raw) => answer(raw, text, jsonb),
+            None => Ok(None),
+        }
     });
-    Ok(texts_out(out.collect::<Vec<_>>()))
+    Ok(texts_out(out.collect::<anyhow::Result<Vec<_>>>()?))
+}
+
+/// A value a path reached, as the function answers it. As written, unless `text` (`#>>`'s text: `text_of`); `jsonb`
+/// answers as jsonb prints it.
+pub(crate) fn answer(raw: &str, text: bool, jsonb: bool) -> anyhow::Result<Option<String>> {
+    if text {
+        return text_of(raw, jsonb);
+    }
+    Ok(Some(if jsonb { jsonb_text(raw)? } else { raw.to_string() }))
+}
+
+/// `#>>`'s text for a value: a JSON string's content (unescaped), NULL for a JSON null, and anything else as written,
+/// or as jsonb prints it (`jsonb`). Shared with the functions that expand a document (`pg_json_sets`).
+pub(crate) fn text_of(raw: &str, jsonb: bool) -> anyhow::Result<Option<String>> {
+    if raw == "null" || raw.starts_with('"') {
+        return Ok(unquoted(raw));
+    }
+    Ok(Some(if jsonb { jsonb_text(raw)? } else { raw.to_string() }))
+}
+
+/// The JSON type of a document's one value, as Postgres names it (`object`, `array`, `string`, `number`, `boolean`,
+/// `null`). Text that isn't one JSON value is 22P02, as Postgres refuses it.
+pub(crate) fn kind(doc: &str) -> anyhow::Result<&'static str> {
+    let refused = || crate::codes::coded("22P02", json_refusal(doc));
+    let mut jiter = Jiter::new(doc.as_bytes());
+    let peek = jiter.peek().map_err(|_| refused())?;
+    jiter.known_skip(peek).map_err(|_| refused())?;
+    jiter.finish().map_err(|_| refused())?;
+    Ok(match peek {
+        Peek::Null => "null",
+        Peek::True | Peek::False => "boolean",
+        Peek::String => "string",
+        Peek::Array => "array",
+        Peek::Object => "object",
+        _ => "number",
+    })
+}
+
+/// `json_typeof` and `jsonb_typeof`: the type of each document's value. NULL where the document is.
+fn type_of(a: &[ArrayRef], n: usize) -> anyhow::Result<ArrayRef> {
+    let docs = cast(&a[0], &DataType::Utf8)?;
+    let docs = docs.as_string::<i32>();
+    let kinds = (0..n).map(|i| docs.is_valid(i).then(|| kind(docs.value(i))).transpose()).collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Arc::new(StringArray::from(kinds)))
+}
+
+/// `json_array_length` and `jsonb_array_length`: how many elements each document's array has. A document that isn't an
+/// array is 22023, as Postgres words it; NULL where the document is.
+fn array_length(a: &[ArrayRef], n: usize) -> anyhow::Result<ArrayRef> {
+    let docs = cast(&a[0], &DataType::Utf8)?;
+    let docs = docs.as_string::<i32>();
+    let lengths = (0..n).map(|i| docs.is_valid(i).then(|| length_of(docs.value(i))).transpose()).collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Arc::new(Int32Array::from(lengths)))
+}
+
+fn length_of(doc: &str) -> anyhow::Result<i32> {
+    match kind(doc)? {
+        "array" => array_len(doc).map(|n| n as i32).ok_or_else(|| crate::codes::coded("22P02", json_refusal(doc))),
+        "object" => Err(crate::codes::coded("22023", "cannot get array length of a non-array")),
+        _ => Err(crate::codes::coded("22023", "cannot get array length of a scalar")),
+    }
+}
+
+/// `json_extract_path` and kin: `#>` (`#>>` when `text`) with each argument after the document as one step of the path.
+/// `jsonb` answers as jsonb prints. Zero keys are refused as Postgres refuses them (42883).
+fn extract(name: &str, a: &[ArrayRef], n: usize, text: bool, jsonb: bool) -> anyhow::Result<ArrayRef> {
+    if a.len() < 2 {
+        return Err(crate::codes::coded("42883", format!("function {name}(unknown) does not exist")));
+    }
+    let docs = text_arg(&a[0])?;
+    let keys = a[1..].iter().map(text_arg).collect::<datafusion::common::Result<Vec<_>>>()?;
+    let paths = (0..n).map(|i| Some(keys.iter().map(|key| key[i].clone()).collect())).collect();
+    reached(&docs, paths, n, text, jsonb)
 }
 
 /// `->`, and `json_array_element` and its kin: the value at a text key of an object or an integer index of an array,
@@ -328,7 +421,8 @@ fn element<'a>(doc: &'a str, at: i64) -> Option<&'a str> {
 /// The number of elements of the array `doc`, read through once more (a negative index counts from the end, as
 /// functions-json does). `Jiter` can't be copied, so the count reads its own reader.
 fn array_len(doc: &str) -> Option<usize> {
-    let mut jiter = Jiter::new(doc.as_bytes());
+    // (`known_array` reads the bracket where the text starts, so leading spaces are passed over first)
+    let mut jiter = Jiter::new(doc.trim_start_matches(JSON_SPACE).as_bytes());
     let mut peek = jiter.known_array().ok()?;
     let mut len = 0;
     while let Some(p) = peek {
@@ -1019,5 +1113,111 @@ mod tests {
         assert_eq!(refused_as(plan(minus(), col("doc"), lit(1.5f64))), Some("42883"), "jsonb - numeric");
         assert_eq!(refused_as(plan(minus(), col("doc"), col("doc"))), Some("42883"), "jsonb - jsonb");
         assert_eq!(refused_as(plan(hash(), col("doc"), lit(1i64))), Some("42883"), "jsonb #- integer");
+    }
+
+    /// The SQLSTATE of an error from a reading function (`codes::of`).
+    fn code(e: &anyhow::Error) -> &'static str { crate::codes::of(e) }
+
+    /// `json(b)_extract_path(_text)` over one document and its keys, as the SQL function gets them: one column per
+    /// argument, one row.
+    fn extract_of(name: &str, doc: Option<&str>, keys: &[Option<&str>], text: bool, jsonb: bool) -> anyhow::Result<Option<String>> {
+        let mut args: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![doc]))];
+        args.extend(keys.iter().map(|k| Arc::new(StringArray::from(vec![*k])) as ArrayRef));
+        let out = extract(name, &args, 1, text, jsonb)?;
+        Ok(out.as_string::<i32>().iter().next().flatten().map(str::to_string))
+    }
+
+    #[test]
+    fn json_kinds_are_postgres_type_names() {
+        assert_eq!(kind("{}").unwrap(), "object");
+        assert_eq!(kind("[]").unwrap(), "array");
+        assert_eq!(kind(r#""s""#).unwrap(), "string");
+        assert_eq!(kind("1.5").unwrap(), "number");
+        assert_eq!(kind("-2e3").unwrap(), "number");
+        assert_eq!(kind("true").unwrap(), "boolean");
+        assert_eq!(kind("false").unwrap(), "boolean");
+        assert_eq!(kind("null").unwrap(), "null");
+        assert_eq!(kind(" [1] ").unwrap(), "array", "spaces around the one value are fine (Postgres: array)");
+        for bad in ["", "[1,", "1 2", "not json"] {
+            assert_eq!(code(&kind(bad).unwrap_err()), "22P02", "{bad:?} is not one JSON value");
+        }
+    }
+
+    #[test]
+    fn array_length_counts_elements_and_refuses_the_rest_as_postgres_does() {
+        assert_eq!(length_of("[]").unwrap(), 0);
+        assert_eq!(length_of("[1,[2,3]]").unwrap(), 2, "a nested array is one element");
+        assert_eq!(length_of(" [1, 2] ").unwrap(), 2);
+        let object = length_of(r#"{"a":1}"#).unwrap_err();
+        assert_eq!(code(&object), "22023");
+        assert_eq!(object.to_string(), "cannot get array length of a non-array");
+        let scalar = length_of("null").unwrap_err();
+        assert_eq!(code(&scalar), "22023");
+        assert_eq!(scalar.to_string(), "cannot get array length of a scalar", "a JSON null is a scalar");
+        assert_eq!(code(&length_of("[").unwrap_err()), "22P02", "text that isn't JSON is refused as JSON text");
+    }
+
+    #[test]
+    fn typeof_and_array_length_answer_null_for_a_null_document() {
+        let docs: ArrayRef = Arc::new(StringArray::from(vec![Some("[1]"), None]));
+        let kinds = type_of(&[docs.clone()], 2).unwrap();
+        assert_eq!(kinds.as_string::<i32>().iter().collect::<Vec<_>>(), vec![Some("array"), None]);
+        let lengths = array_length(&[docs], 2).unwrap();
+        let lengths = lengths.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(lengths.iter().collect::<Vec<_>>(), vec![Some(1), None]);
+    }
+
+    #[test]
+    fn extract_path_walks_keys_and_indexes_as_postgres_does() {
+        let doc = r#"{"a":{"b":[1,2]}}"#;
+        assert_eq!(extract_of("json_extract_path", Some(doc), &[Some("a"), Some("b")], false, false).unwrap().as_deref(), Some("[1,2]"));
+        assert_eq!(extract_of("jsonb_extract_path", Some(doc), &[Some("a"), Some("b"), Some("1")], false, true).unwrap().as_deref(), Some("2"));
+        assert_eq!(extract_of("jsonb_extract_path", Some(r#"{"a":[1,2]}"#), &[Some("a"), Some("-1")], false, true).unwrap().as_deref(), Some("2"), "a negative index counts from the end");
+        assert_eq!(extract_of("json_extract_path", Some(r#"{"a":1}"#), &[Some("z")], false, false).unwrap(), None, "a missing path is NULL");
+        assert_eq!(extract_of("json_extract_path", Some(r#"{"a":1}"#), &[Some("a"), Some("b")], false, false).unwrap(), None, "a path into a scalar is NULL");
+        assert_eq!(extract_of("json_extract_path", Some("[\"a\"]"), &[Some("0")], false, false).unwrap().as_deref(), Some(r#""a""#));
+        assert_eq!(extract_of("json_extract_path", Some(doc), &[Some("a"), None], false, false).unwrap(), None, "a NULL key makes the answer NULL");
+        assert_eq!(extract_of("json_extract_path", None, &[Some("a")], false, false).unwrap(), None, "a NULL document is NULL");
+    }
+
+    #[test]
+    fn extract_path_answers_json_as_written_and_jsonb_as_jsonb_prints_it() {
+        let loose = r#"{"a": 1.0 , "b" :  {"x" : 1 }}"#;
+        assert_eq!(extract_of("json_extract_path", Some(loose), &[Some("b")], false, false).unwrap().as_deref(), Some(r#"{"x" : 1 }"#));
+        let docb = r#"{"b":1,"a":{"y":2,"x":1}}"#;
+        assert_eq!(extract_of("jsonb_extract_path", Some(docb), &[Some("a")], false, true).unwrap().as_deref(), Some(r#"{"x": 1, "y": 2}"#));
+        assert_eq!(extract_of("jsonb_extract_path", Some(r#"{"a":"é"}"#), &[Some("a")], false, true).unwrap().as_deref(), Some("\"é\""));
+        assert_eq!(extract_of("json_extract_path", Some(r#"{"a":"é"}"#), &[Some("a")], false, false).unwrap().as_deref(), Some(r#""é""#));
+        assert_eq!(extract_of("jsonb_extract_path", Some(r#"{"a":1,"a":2}"#), &[Some("a")], false, true).unwrap().as_deref(), Some("2"), "a duplicate key: the last wins");
+    }
+
+    #[test]
+    fn extract_path_text_unquotes_strings_and_keeps_numbers_as_written() {
+        assert_eq!(extract_of("json_extract_path_text", Some(r#"{"a":"x\"y"}"#), &[Some("a")], true, false).unwrap().as_deref(), Some("x\"y"));
+        assert_eq!(extract_of("json_extract_path_text", Some(r#"{"a":null}"#), &[Some("a")], true, false).unwrap(), None, "a JSON null is NULL");
+        assert_eq!(extract_of("json_extract_path_text", Some(r#"{"a":1.0}"#), &[Some("a")], true, false).unwrap().as_deref(), Some("1.0"));
+        assert_eq!(extract_of("jsonb_extract_path_text", Some(r#"{"a":1.50}"#), &[Some("a")], true, true).unwrap().as_deref(), Some("1.50"));
+        assert_eq!(extract_of("jsonb_extract_path_text", Some(r#"{"a":""}"#), &[Some("a")], true, true).unwrap().as_deref(), Some(""), "an empty string is not NULL");
+        assert_eq!(extract_of("jsonb_extract_path_text", Some(r#"{"a":{"b":true}}"#), &[Some("a"), Some("b")], true, true).unwrap().as_deref(), Some("true"));
+        assert_eq!(extract_of("jsonb_extract_path_text", Some(r#"{"a":{"b":[1]}}"#), &[Some("a")], true, true).unwrap().as_deref(), Some(r#"{"b": [1]}"#));
+    }
+
+    #[test]
+    fn extract_path_with_no_keys_is_refused_as_postgres_refuses_it() {
+        let e = extract_of("json_extract_path", Some("{}"), &[], false, false).unwrap_err();
+        assert_eq!(code(&e), "42883");
+        assert_eq!(e.to_string(), "function json_extract_path(unknown) does not exist");
+        let t = extract_of("jsonb_extract_path_text", Some("{}"), &[], true, true).unwrap_err();
+        assert_eq!(code(&t), "42883");
+        assert_eq!(t.to_string(), "function jsonb_extract_path_text(unknown) does not exist");
+    }
+
+    #[test]
+    fn text_of_a_value_is_unquoted_or_as_written_or_as_jsonb_prints_it() {
+        assert_eq!(text_of("null", false).unwrap(), None);
+        assert_eq!(text_of(r#""x\"y""#, false).unwrap(), Some("x\"y".to_string()));
+        assert_eq!(text_of("1.0", false).unwrap(), Some("1.0".to_string()));
+        assert_eq!(text_of(r#"{"b":1,"a":2}"#, true).unwrap(), Some(r#"{"a": 2, "b": 1}"#.to_string()));
+        assert_eq!(text_of(r#"{"b":1,"a":2}"#, false).unwrap(), Some(r#"{"b":1,"a":2}"#.to_string()));
     }
 }
