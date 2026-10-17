@@ -14724,11 +14724,11 @@ def jsonfns():
     expands (Postgres's meaning); DataFusion's list is json_keys. Every answer is Postgres 16's: the names, the types and the
     rows, over HTTP and over the Postgres port (psycopg, as text and through its own decoders), and each refusal's SQLSTATE and
     words. A function in FROM that reads a column of the same query is LATERAL, as Postgres takes it (implicitly, CROSS
-    JOIN LATERAL, LEFT JOIN LATERAL … ON true when its outputs are its own unnest's). WITH ORDINALITY numbers each
-    row's elements from 1, as Postgres does; over a record's columns Postgres refuses it (ROWS FROM() is not taken), and so
-    does this. Not taken yet, refused by name where Postgres takes them: a LEFT JOIN LATERAL over an expanding function
-    whose outputs are expressions of its rows (a padded row needs each output NULL, which lateral.rs can't show for an
-    expression), and an expanding function in GROUP BY, ORDER BY, a window or INSERT's VALUES."""
+    JOIN LATERAL, LEFT JOIN LATERAL … ON true when its outputs are its own unnest's, or read from them by a field, a JSON
+    operator or a cast). WITH ORDINALITY numbers each row's elements from 1, as Postgres does; over a record's columns Postgres
+    refuses it (ROWS FROM() is not taken), and so does this. Not taken yet, refused by name where Postgres takes them: a LEFT
+    JOIN LATERAL over a constant (a padded row can't make it NULL), and an expanding function in GROUP BY, ORDER BY, a window
+    or INSERT's VALUES."""
     import psycopg
     from psycopg.types.json import JsonbLoader, JsonLoader
     from psycopg.types.string import TextLoader
@@ -14870,6 +14870,30 @@ def jsonfns():
         ("a JSON operator over the rows of a FROM call that reads a column (e.value ->> 'sku')", "SELECT d.id, e.value ->> 'sku' AS sku FROM docs d, jsonb_array_elements(d.doc -> 'items') AS e ORDER BY 1, 2",
          ['id', 'sku'], [23, 25],
          [[1, 'A1'], [1, 'B7']]),
+        ("lateral: LEFT JOIN LATERAL jsonb_array_elements ON true: each element, and one NULL row for each row whose array is missing", "SELECT d.id, e.value FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') AS e ON true ORDER BY d.id, e.value ->> 'sku'",
+         ['id', 'value'], [23, 3802],
+         [[1, '{"qty": 2, "sku": "A1"}'], [1, '{"qty": 1, "sku": "B7"}'], [2, None], [3, None], [4, None]]),
+        ("lateral: LEFT JOIN LATERAL jsonb_each ON true: each key and its value, a NULL row for each row with no object", "SELECT d.id, kv.key, kv.value FROM docs d LEFT JOIN LATERAL jsonb_each(d.doc -> 'tags') AS kv ON true ORDER BY d.id, kv.key",
+         ['id', 'key', 'value'], [23, 25, 3802],
+         [[1, 'a', '3'], [1, 'b', '1'], [2, None, None], [3, None, None], [4, None, None]]),
+        ("lateral: LEFT JOIN LATERAL jsonb_array_elements WITH ORDINALITY ON true: each element's position, NULL for a row with no array", "SELECT d.id, e.value, e.ordinality FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') WITH ORDINALITY AS e ON true ORDER BY d.id, e.ordinality",
+         ['id', 'value', 'ordinality'], [23, 3802, 20],
+         [[1, '{"qty": 2, "sku": "A1"}', 1], [1, '{"qty": 1, "sku": "B7"}', 2], [2, None, None], [3, None, None], [4, None, None]]),
+        ("lateral: LEFT JOIN LATERAL jsonb_array_elements ON true, a JSON operator over an element read from its row", "SELECT d.id, e.value ->> 'sku' AS sku FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') AS e ON true ORDER BY d.id, sku",
+         ['id', 'sku'], [23, 25],
+         [[1, 'A1'], [1, 'B7'], [2, None], [3, None], [4, None]]),
+        ("lateral: LEFT JOIN LATERAL jsonb_to_recordset ON true, its columns made by casts of the rows", "SELECT d.id, r.sku, r.qty FROM docs d LEFT JOIN LATERAL jsonb_to_recordset(d.doc -> 'items') AS r(sku text, qty int) ON true ORDER BY d.id, r.sku",
+         ['id', 'sku', 'qty'], [23, 25, 23],
+         [[1, 'A1', 2], [1, 'B7', 1], [2, None, None], [3, None, None], [4, None, None]]),
+        ("lateral: LEFT JOIN LATERAL json_array_elements of a json column ON true, each element as written", "SELECT d.id, x.value FROM docs d LEFT JOIN LATERAL json_array_elements(d.jdoc -> 'items') AS x ON true ORDER BY d.id",
+         ['id', 'value'], [23, 114],
+         [[1, '{"sku":"A1"}'], [2, None], [3, None], [4, None]]),
+        ("lateral: LEFT JOIN LATERAL over a subquery that reads the rows, the element named bare (e ->> 'sku')", "SELECT d.id, s.sku FROM docs d LEFT JOIN LATERAL (SELECT e ->> 'sku' AS sku FROM jsonb_array_elements(d.doc -> 'items') e) s ON true ORDER BY d.id, s.sku",
+         ['id', 'sku'], [23, 25],
+         [[1, 'A1'], [1, 'B7'], [2, None], [3, None], [4, None]]),
+        ("lateral: LEFT JOIN LATERAL jsonb_each_text ON true, the values as text", "SELECT d.id, kv.key, kv.value FROM docs d LEFT JOIN LATERAL jsonb_each_text(d.doc -> 'tags') AS kv ON true ORDER BY d.id, kv.key",
+         ['id', 'key', 'value'], [23, 25, 25],
+         [[1, 'a', '3'], [1, 'b', '1'], [2, None, None], [3, None, None], [4, None, None]]),
     ]
     # (name, sql, SQLSTATE, message): refused by Postgres 16 with these words.
     ERRORS = [
@@ -14896,9 +14920,7 @@ def jsonfns():
     ]
     # Refused by name where Postgres 16 takes the call (the words are the ones this engine says, then the SQLSTATE).
     NOT_YET = [
-        ("a LEFT JOIN LATERAL over an expanding function whose outputs are expressions, not taken yet (Postgres takes it)", "SELECT d.id, e.value FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') AS e ON true", "0A000", "LEFT JOIN LATERAL over e is not supported yet"),
-        ("a LEFT JOIN LATERAL over jsonb_each, not taken yet (Postgres takes it)", "SELECT d.id, kv.key FROM docs d LEFT JOIN LATERAL jsonb_each(d.doc -> 'tags') AS kv ON true", "0A000", "LEFT JOIN LATERAL over kv is not supported yet"),
-        ("a LEFT JOIN LATERAL over an expanding function with WITH ORDINALITY, not taken yet (Postgres takes it)", "SELECT d.id, e.value FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') WITH ORDINALITY AS e ON true", "0A000", "LEFT JOIN LATERAL over e is not supported yet"),
+        ("a LEFT JOIN LATERAL over a constant, not taken yet: a padded row can't make it NULL (Postgres takes it)", "SELECT d.id, s.one FROM docs d LEFT JOIN LATERAL (SELECT 1 AS one FROM jsonb_array_elements(d.doc -> 'items') e) s ON true", "0A000", "LEFT JOIN LATERAL over s is not supported yet"),
         ("an expanding function in GROUP BY, not taken yet (Postgres takes it)", "SELECT 1 FROM docs GROUP BY jsonb_array_elements(doc)", "0A000", "in GROUP BY isn't taken yet"),
         ("an expanding function in ORDER BY, not taken yet (Postgres takes it)", "SELECT 1 FROM docs ORDER BY jsonb_array_elements('[1]')", "0A000", "in ORDER BY isn't taken yet"),
         ("an expanding function in a window's PARTITION BY, not taken yet (Postgres takes it)", "SELECT sum(id) OVER (PARTITION BY jsonb_array_elements('[1]')) FROM docs", "0A000", "in window definitions isn't taken yet"),

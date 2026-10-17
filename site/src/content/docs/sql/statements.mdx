@@ -217,14 +217,17 @@ id  item
 1   30
 ```
 
-A `LEFT JOIN LATERAL` takes `ON true` and one `unnest` or set function. Pondra refuses the rest by
-name, with SQLSTATE `0A000`: a condition on it, and a `RIGHT` or `FULL` join. A function of constants
-(`generate_series(1, 3)`) is planned as it always was, and `WITH ORDINALITY` numbers each row's elements from 1, as
-Postgres does.
+A `LEFT JOIN LATERAL` takes `ON true` and one `unnest` or set function. Its columns are its own, or
+read from them by a field, a JSON operator or a cast, even inside a `LATERAL (SELECT …)`. Pondra
+refuses the rest by name, with SQLSTATE `0A000`: a condition on it, a constant or arithmetic among its
+columns (a row with no list would need a value there), and a `RIGHT` or `FULL` join. A function of
+constants (`generate_series(1, 3)`) is planned as it always was, and `WITH ORDINALITY` numbers each
+row's elements from 1, as Postgres does.
 
 <Aside type="caution">
-A `LATERAL (SELECT …)` subquery is planned by DataFusion, not by this rule. A correlated aggregate needs
-an equality between the two sides (`WHERE w.v = t.n`): with `<` DataFusion can't plan it.
+A `LATERAL (SELECT …)` over a function's rows is this rule's, as above. One over an aggregate or a scan
+is planned by DataFusion, not by this rule. A correlated aggregate needs an equality between the two
+sides (`WHERE w.v = t.n`): with `<` DataFusion can't plan it.
 </Aside>
 
 ### A table's past
@@ -1087,7 +1090,7 @@ text is the node's own, it is shown in code:
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |
 | Python functions and procedures on a node started without `--python` | refused, with the flag to use |
-| `LEFT JOIN LATERAL … ON <condition>` (only `ON true` is taken), or a `LEFT` over more than one function | refused, SQLSTATE `0A000`: `LEFT JOIN LATERAL over u is not supported yet` |
+| `LEFT JOIN LATERAL … ON <condition>` (only `ON true` is taken), a `LEFT` over more than one function, or a `LEFT` whose columns include a constant or arithmetic | refused, SQLSTATE `0A000`: `LEFT JOIN LATERAL over u is not supported yet` |
 | `RIGHT JOIN LATERAL` or `FULL JOIN LATERAL` | refused, SQLSTATE `0A000`: `LATERAL syntax is not supported for FULL OUTER and RIGHT … joins` |
 | `generate_series(1, t.n) WITH ORDINALITY` over a column of the same `FROM` | taken: each row's elements are numbered from 1, as Postgres numbers them |
 | `jsonb_to_recordset(…) WITH ORDINALITY AS x(a int)`, a record's column list with `WITH ORDINALITY` | refused, SQLSTATE `42601`: `WITH ORDINALITY cannot be used with a column definition list`, as Postgres refuses it (`ROWS FROM()` isn't taken) |

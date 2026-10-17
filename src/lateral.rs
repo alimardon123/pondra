@@ -131,7 +131,7 @@ fn takes(j: &Join) -> Result<bool> {
         return Ok(false);
     }
     if j.join_type == JoinType::Left && !(padded(j) && one_unnest(&chain)) {
-        return not_impl_err!("LEFT JOIN LATERAL over {} is not supported yet: it takes ON true, and one unnest or set function whose columns are its own, unchanged", name_of(&j.right));
+        return not_impl_err!("LEFT JOIN LATERAL over {} is not supported yet: it takes ON true, and one unnest or set function whose columns are its own, or read from them by a field, a JSON operator or a cast", name_of(&j.right));
     }
     Ok(true)
 }
@@ -159,24 +159,61 @@ fn padded(j: &Join) -> bool {
     }
 }
 
-/// One unnest, no filter, and every output of the right side one of the unnest's own (a column of
-/// the left side, or a constant, would need a row of its own when the list is empty).
+/// One unnest, no filter, and every output of the right side NULL on a padded row: each projection above the
+/// unnest reads only the unnest's own columns, through `nulls_with`. A column of the left side, a constant or any
+/// other expression would need a row of its own when the list is empty.
 fn one_unnest(chain: &[&LogicalPlan]) -> bool {
-    let unnests: Vec<&Unnest> = chain.iter().filter_map(|p| match p { LogicalPlan::Unnest(u) => Some(u), _ => None }).collect();
-    if unnests.len() != 1 || chain.iter().any(|p| matches!(p, LogicalPlan::Filter(_))) {
+    let at: Vec<usize> = chain.iter().enumerate().filter(|(_, p)| matches!(p, LogicalPlan::Unnest(_))).map(|(i, _)| i).collect();
+    if at.len() != 1 || chain.iter().any(|p| matches!(p, LogicalPlan::Filter(_))) {
         return false;
     }
-    let u = unnests[0];
+    let LogicalPlan::Unnest(u) = chain[at[0]] else { return false };
     let exec: Vec<usize> = u.exec_columns.iter().filter_map(|c| u.input.schema().index_of_column(c).ok()).collect();
-    let made: Vec<&str> = u.schema.iter().enumerate().filter(|(i, _)| exec.contains(&u.dependency_indices[*i])).map(|(_, (_, f))| f.name().as_str()).collect();
-    let Some(LogicalPlan::Projection(top)) = chain.iter().find(|p| matches!(p, LogicalPlan::Projection(_))) else { return false };
-    top.expr.iter().all(|e| matches!(unaliased(e), Expr::Column(c) if made.contains(&c.name.as_str())))
+    let mut padded: Vec<String> = u.schema.iter().enumerate().filter(|(i, _)| exec.contains(&u.dependency_indices[*i])).map(|(_, (_, f))| f.name().clone()).collect();
+    let mut above = false;
+    // (the chain is top first: the projections over the unnest are read from it up, each naming what the next reads)
+    for p in chain[..at[0]].iter().rev() {
+        if let LogicalPlan::Projection(p) = p {
+            if !p.expr.iter().all(|e| nulls_with(e, &padded)) {
+                return false;
+            }
+            padded = p.schema.fields().iter().map(|f| f.name().clone()).collect();
+            above = true;
+        }
+    }
+    above
 }
 
-fn unaliased(e: &Expr) -> &Expr {
+/// The functions that answer NULL for a NULL first argument when the others are constants: a struct's field, the
+/// JSON marks of a set function's values (`pg_json_make.rs`), and the JSON operators (`->`, `#>`, `#>>` are
+/// `pg_json.rs`'s; `->>` is datafusion-functions-json's).
+const STRICT: [&str; 7] = ["get_field", "pondra_as_json", "pondra_as_jsonb", "json_object_field", "json_as_text", "pondra_json_path", "pondra_json_path_text"];
+
+/// Whether `e` is NULL whenever the columns named `padded` are: one of them, a cast of such an expression, or a
+/// `STRICT` call whose first argument is such and whose others are constants.
+fn nulls_with(e: &Expr, padded: &[String]) -> bool {
     match e {
-        Expr::Alias(a) => unaliased(&a.expr),
-        e => e,
+        Expr::Alias(a) => nulls_with(&a.expr, padded),
+        Expr::Column(c) => padded.contains(&c.name),
+        Expr::Cast(c) => nulls_with(&c.expr, padded),
+        Expr::TryCast(c) => nulls_with(&c.expr, padded),
+        Expr::ScalarFunction(f) => {
+            STRICT.contains(&f.name()) && f.args.first().is_some_and(|a| nulls_with(a, padded)) && f.args[1..].iter().all(constant)
+        }
+        _ => false,
+    }
+}
+
+/// A literal, or a cast of one (type coercion casts a key's literal).
+fn constant(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(..) => true,
+        Expr::Cast(c) => constant(&c.expr),
+        Expr::TryCast(c) => constant(&c.expr),
+        Expr::Alias(a) => constant(&a.expr),
+        // (a bound value, a `$name` or a procedure's argument, is written `arrow_cast('k', 'Utf8')`: routines::exact)
+        Expr::ScalarFunction(f) if f.name() == "arrow_cast" => f.args.iter().all(constant),
+        _ => false,
     }
 }
 
@@ -493,6 +530,36 @@ mod tests {
         let err = run(&ctx, "SELECT t.id, u.x FROM t LEFT JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1").await.expect_err("refused");
         let text = err.to_string();
         assert!(text.contains("LEFT JOIN LATERAL") && text.contains("not supported"), "{text}");
+    }
+
+    /// A cast of the rows is NULL with them: a row of its own for each element, and NULL for a NULL or empty list.
+    #[tokio::test]
+    async fn left_pads_a_cast_of_its_rows() {
+        let ctx = session().await.expect("a session");
+        let sql = "SELECT t.id, s.y FROM t LEFT JOIN LATERAL (SELECT CAST(u.x AS VARCHAR) AS y FROM unnest(t.xs) AS u(x)) s ON true";
+        assert_eq!(run(&ctx, sql).await.expect("a cast of the rows"), rows(&["1,1", "1,2", "1,3", "2,", "3,"]));
+    }
+
+    /// A field of a struct is NULL when the struct is, so a padded row keeps its left row with NULL there.
+    #[tokio::test]
+    async fn left_pads_a_field_of_its_rows() {
+        let ctx = session().await.expect("a session");
+        let sql = "SELECT t.id, s.a FROM t LEFT JOIN LATERAL (SELECT get_field(u.r, 'a') AS a FROM unnest(CASE WHEN t.id = 1 THEN make_array(named_struct('a', 7)) END) AS u(r)) s ON true";
+        assert_eq!(run(&ctx, sql).await.expect("a field of the rows"), rows(&["1,7", "2,", "3,"]));
+    }
+
+    /// Outputs a padded row can't make NULL (a constant, arithmetic, a column of the left side) are refused by name.
+    #[tokio::test]
+    async fn left_computed_outputs_refused_by_name() {
+        let ctx = session().await.expect("a session");
+        for sql in [
+            "SELECT t.id, s.one FROM t LEFT JOIN LATERAL (SELECT 1 AS one FROM unnest(t.xs) AS u(x)) s ON true",
+            "SELECT t.id, s.y FROM t LEFT JOIN LATERAL (SELECT u.x + 1 AS y FROM unnest(t.xs) AS u(x)) s ON true",
+            "SELECT t.id, s.m, s.x FROM t LEFT JOIN LATERAL (SELECT t.n AS m, u.x FROM unnest(t.xs) AS u(x)) s ON true",
+        ] {
+            let text = run(&ctx, sql).await.expect_err(sql).to_string();
+            assert!(text.contains("LEFT JOIN LATERAL") && text.contains("not supported"), "{sql}: {text}");
+        }
     }
 
     #[tokio::test]
