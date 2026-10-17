@@ -42,7 +42,7 @@ fn version_of(m: &object_store::ObjectMeta) -> String {
 #[derive(Debug)]
 pub struct Changed;
 impl std::fmt::Display for Changed {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "the file changed since it was opened: open it again, or save under another name") }
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str(crate::lake_files::CHANGED) }
 }
 impl std::error::Error for Changed {}
 

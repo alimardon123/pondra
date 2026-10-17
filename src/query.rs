@@ -18,25 +18,6 @@ use datafusion::physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 
-pub fn schema(columns: &[(String, String)]) -> Result<SchemaRef> {
-    let fields = columns.iter().map(|(n, t)| Ok(Field::new(n, dtype(t)?, true)));
-    Ok(Arc::new(Schema::new(fields.collect::<Result<Vec<_>>>()?)))
-}
-
-/// A column's type by name: Arrow's own (`Utf8`, `Int64`, `Timestamp(Microsecond, None)`,
-/// `Binary`), `T[]` for a list of T (`Float32[]`: an embedding), and `VARIANT`/`JSON` for
-/// semi-structured text, which is stored as a string and read with `json_get(…)`, `->` and `->>`.
-pub fn dtype(t: &str) -> Result<DataType> {
-    let t = t.trim();
-    Ok(match t.strip_suffix("[]") {
-        Some(item) => DataType::List(Arc::new(Field::new("item", dtype(item)?, true))),
-        None => match t.to_uppercase().as_str() {
-            "VARIANT" | "JSON" => DataType::Utf8,
-            _ => t.parse::<DataType>().map_err(|e| anyhow::anyhow!("unknown column type {t}: {e}"))?,
-        },
-    })
-}
-
 /// A table's columns as queries read them: strings as views (Utf8View), so scans don't copy them
 /// and string filters and joins take their fast paths (TPC-H runs about 8% faster). Tables store
 /// plain Utf8 (see `schema`).
@@ -839,7 +820,7 @@ fn keep_held(held: MemoryReservation) {
 /// The memory of the answer a request kept, for the body that sends it (`server::answer`).
 pub fn take_held() -> Option<MemoryReservation> { HELD.try_with(|h| h.borrow_mut().take()).ok().flatten() }
 
-pub use crate::answer::{compact, ipc, type_name};
+pub use crate::answer::{compact, dtype, ipc, schema, type_name};
 pub use crate::engine::sql;
 
 /// An Arrow IPC stream's batches (none for no bytes).
@@ -1089,7 +1070,7 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
             match self::sql(ctx, &crate::asof::rewrite(&sql)?).await {
                 Ok(df) => {
                     ctx.deregister_table(table_ref(&name))?;
-                    let view = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext::readable(&sql)))); // (its files as SQL named them)
+                    let view = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext_names::readable(&sql)))); // (its files as SQL named them)
                     if let Some(v) = guarded(&name, view, listing) {
                         ctx.register_table(table_ref(&name), v)?;
                     }

@@ -219,7 +219,7 @@ async fn drop_function(State(app): State<App>, Path(name): Path<String>) -> Resu
 /// if nobody replaced it meanwhile (412 if so; ADR-034). Each save is kept as a version too
 /// (`files::keep`, ADR-035 §8).
 async fn put_file(State(app): State<App>, Path(path): Path<String>, headers: HeaderMap, body: Bytes) -> Result<Response, E> {
-    let (path, bytes) = (crate::files::under_files(&path), body.len());
+    let (path, bytes) = (crate::lake_files::under_files(&path), body.len());
     let expect = headers.get("if-match").and_then(|v| v.to_str().ok()).map(|v| v.trim_matches('"').to_string());
     let done = match &expect {
         Some(v) => app.lake.replace(&path, body.to_vec(), v).await,
@@ -235,9 +235,9 @@ async fn put_file(State(app): State<App>, Path(path): Path<String>, headers: Hea
             }
             Ok(Json(j!({"path": path, "bytes": bytes, "version": version})).into_response())
         }
-        Err(e) if e.is::<crate::store::Changed>() => Ok((StatusCode::PRECONDITION_FAILED, format!("{path}: {e}")).into_response()),
+        Err(e) if e.is::<crate::store::Changed>() => Ok((StatusCode::PRECONDITION_FAILED, crate::lake_files::changed(&path)).into_response()),
         Err(e) if expect.is_none() && format!("{e:#}").contains("already exists") =>
-            Ok((StatusCode::CONFLICT, format!("{path} is there already: send If-Match with the version you read to replace it, or put it under another name")).into_response()),
+            Ok((StatusCode::CONFLICT, crate::lake_files::there_already(&path)).into_response()),
         Err(e) => Err(E(e)),
     }
 }
@@ -245,7 +245,7 @@ async fn put_file(State(app): State<App>, Path(path): Path<String>, headers: Hea
 /// `GET /files/<path>`: that object's bytes, its version (`etag`, for `If-Match`) and a content
 /// type by its name. `?versions`: the versions it keeps, newest first; `?version=<id>`: one's bytes.
 async fn get_file(State(app): State<App>, Path(path): Path<String>, Query(q): Query<HashMap<String, String>>) -> Result<Response, E> {
-    let path = crate::files::under_files(&path);
+    let path = crate::lake_files::under_files(&path);
     if q.contains_key("versions") {
         let all = crate::files::versions(&app.lake, &path).await?;
         return Ok(Json(all.iter().map(|v| j!({"id": v.id, "at": v.ms, "who": v.who, "bytes": v.bytes})).collect::<Vec<_>>()).into_response());
@@ -260,29 +260,16 @@ async fn get_file(State(app): State<App>, Path(path): Path<String>, Query(q): Qu
     let (bytes, version) = match found {
         Ok(found) => found,
         Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {
-            return Ok((StatusCode::NOT_FOUND, format!("no such file: {path}")).into_response());
+            return Ok((StatusCode::NOT_FOUND, crate::lake_files::not_found(&path)).into_response());
         }
         Err(e) => return Err(E(e)),
     };
-    let ext = path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
-    let kind = match ext.as_str() {
-        "csv" => "text/csv; charset=utf-8",
-        "tsv" => "text/tab-separated-values; charset=utf-8",
-        "json" | "ipynb" => "application/json",
-        "jsonl" | "ndjson" => "application/x-ndjson",
-        "sql" | "py" | "md" | "txt" => "text/plain; charset=utf-8",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "svg" => "image/svg+xml",
-        "pdf" => "application/pdf",
-        _ => "application/octet-stream",
-    };
-    Ok(([("content-type", kind), ("etag", &format!("\"{version}\"")), ("cache-control", "no-store")], bytes).into_response())
+    Ok(([("content-type", crate::lake_files::content_type(&path)), ("etag", &format!("\"{version}\"")), ("cache-control", "no-store")], bytes).into_response())
 }
 
 /// `POST /files/<path>?restore=<id>`: that version made the file again (itself kept as the newest).
 async fn restore_file(State(app): State<App>, Path(path): Path<String>, Query(q): Query<HashMap<String, String>>) -> Result<Json<Value>, E> {
-    let path = crate::files::under_files(&path);
+    let path = crate::lake_files::under_files(&path);
     let id = q.get("restore").ok_or_else(|| E(anyhow::anyhow!("POST /files/<path>?restore=<a version's id> (GET ?versions lists them)")))?;
     let bytes = crate::files::version(&app.lake, &path, id).await?;
     let version = match app.lake.version(&path).await {
@@ -296,11 +283,16 @@ async fn restore_file(State(app): State<App>, Path(path): Path<String>, Query(q)
     Ok(Json(j!({"path": path, "version": version, "restored": id})))
 }
 
-/// `DELETE /files/<path>`: that object gone (a writer's, as `PUT`); its versions stay.
-async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result<Json<Value>, E> {
-    let path = crate::files::under_files(&path);
-    app.lake.remove_file(&path).await?;
-    Ok(Json(j!({"removed": path})))
+/// `DELETE /files/<path>`: that object gone (a writer's, as `PUT`); its versions stay. A path no file is at: 404.
+async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result<Response, E> {
+    let path = crate::lake_files::under_files(&path);
+    match app.lake.remove_file(&path).await {
+        Ok(()) => Ok(Json(j!({"removed": path})).into_response()),
+        Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {
+            Ok((StatusCode::NOT_FOUND, crate::lake_files::not_found(&path)).into_response())
+        }
+        Err(e) => Err(E(e)),
+    }
 }
 
 /// `GET /sessions/{id}/python`: the variables a session's Python holds, as the console's panel
@@ -899,7 +891,7 @@ impl App {
                 crate::history::planned(&logical, &plan); // (its shape; a slow statement's plan, with what each operator did; what it learned)
                 let out = if explained { crate::history::explained(out)? } else { out };
                 // (no rows: still its columns, with the types its batches have, which the physical plan gives: not the planner's)
-                anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(plan.schema())] } else { out })
+                anyhow::Ok(crate::engine::kept(out, &plan))
             };
             let here = std::time::Instant::now();
             let out = crate::query::frugally(run).await?;
@@ -1751,8 +1743,8 @@ impl std::fmt::Display for E {
 }
 impl IntoResponse for E {
     fn into_response(self) -> Response {
-        let code = crate::codes::of(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4)
-        let status = StatusCode::from_u16(crate::codes::http(code)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (status, [("x-pondra-sqlstate", code)], crate::ext::said(&self.0)).into_response()
+        let (status, code, told) = crate::codes::answer(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4; `codes::answer`, every door's)
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, [("x-pondra-sqlstate", code)], told).into_response()
     }
 }

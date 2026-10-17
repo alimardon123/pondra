@@ -24,23 +24,47 @@ impl Page {
         Page(pondra::page::Page::open(&pondra::page::Options::default()))
     }
 
-    /// One request, as to a node: `request('POST', '/sql?format=csv', 'FROM t')`, `request('PUT', '/files/t.csv', bytes)`.
-    /// The body is text, bytes (a Uint8Array or an ArrayBuffer) or nothing. The answer is `{status, contentType,
-    /// sqlstate, body}`: `sqlstate` null unless it failed, `body` a Uint8Array.
-    pub async fn request(&self, method: String, path: String, body: JsValue) -> Result<JsValue, JsValue> {
+    /// One request, as to a node (ADR-061's contract): `request('POST', '/sql?format=csv', {}, 'FROM t')`,
+    /// `request('PUT', '/files/t.csv', {'If-Match': '"v"'}, bytes)`. `headers` is a plain object of the request's
+    /// headers (or undefined or null for none); `body` is text, bytes (a Uint8Array or an ArrayBuffer) or nothing. The
+    /// answer is `{status, headers, body}`: `headers` a plain object of the answer's (`content-type` on every one,
+    /// `x-pondra-sqlstate` on an error with a SQLSTATE, `etag` on a file), `body` a Uint8Array.
+    pub async fn request(&self, method: String, path: String, headers: JsValue, body: JsValue) -> Result<JsValue, JsValue> {
+        let headers = header_pairs(&headers)?;
         let body: Vec<u8> = match body.as_string() {
             Some(text) => text.into_bytes(),
             None if body.is_undefined() || body.is_null() => Vec::new(),
             None => js_sys::Uint8Array::new(&body).to_vec(),
         };
-        let answer = self.0.request(&method, &path, body.into()).await;
+        let answer = self.0.request(&method, &path, &headers, body.into()).await;
         let out = js_sys::Object::new();
         js_sys::Reflect::set(&out, &"status".into(), &answer.status.into())?;
-        js_sys::Reflect::set(&out, &"contentType".into(), &answer.content_type.into())?;
-        js_sys::Reflect::set(&out, &"sqlstate".into(), &answer.sqlstate.map(JsValue::from).unwrap_or(JsValue::NULL))?;
+        let answered = js_sys::Object::new();
+        for (name, value) in &answer.headers {
+            js_sys::Reflect::set(&answered, &(*name).into(), &value.as_str().into())?;
+        }
+        js_sys::Reflect::set(&out, &"headers".into(), &answered)?;
         js_sys::Reflect::set(&out, &"body".into(), &js_sys::Uint8Array::from(&answer.body[..]).into())?;
         Ok(out.into())
     }
+}
+
+/// A request's headers from a plain object (`{'If-Match': '"v"'}`), none for undefined or null. A value that isn't a
+/// string is refused by name.
+fn header_pairs(headers: &JsValue) -> Result<Vec<(String, String)>, JsValue> {
+    if headers.is_undefined() || headers.is_null() {
+        return Ok(vec![]);
+    }
+    let object = js_sys::Object::from(headers.clone());
+    let mut pairs = vec![];
+    for key in js_sys::Object::keys(&object).iter() {
+        let name = key.as_string().unwrap_or_default();
+        let value = js_sys::Reflect::get(&object, &key)?
+            .as_string()
+            .ok_or_else(|| JsValue::from_str(&format!("the header {name} must be a string")))?;
+        pairs.push((name, value));
+    }
+    Ok(pairs)
 }
 
 impl Default for Page {

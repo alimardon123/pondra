@@ -513,7 +513,7 @@ pub async fn parameters_in(lake: &crate::store::Lake, sql: &str) -> Result<Strin
     let mut last = 0;
     for c in CALL.captures_iter(sql) {
         let m = c.get(0).expect("a match");
-        let path = crate::files::under_files(&c[1].replace("''", "'"));
+        let path = crate::lake_files::under_files(&c[1].replace("''", "'"));
         let (bytes, _) = lake.file(&path).await.map_err(|e| match e.downcast_ref::<object_store::Error>() {
             Some(object_store::Error::NotFound { .. }) => anyhow::anyhow!("pondra.parameters: no file {path}"),
             _ => e,
