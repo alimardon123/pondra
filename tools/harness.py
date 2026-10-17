@@ -16686,6 +16686,13 @@ def jsonedits():
     are answer-side only), so `-` and `#-` on a json or jsonb COLUMN are not refused as Postgres refuses them (`js - 'a'`
     answers a delete, `doc - 1.5` and `doc - doc` arithmetic's error); jsonb_set of a json column is answered (Postgres:
     42883). A `-` on a json or jsonb value made by a function (json_build_object, jsonb_build_object) is refused by name.
+    `||` (round 35, Piece E): jsonb's operator merges documents, as `jsonb_concat` does. Postgres 16's answers are the model
+    (each pair of these operands with a json or jsonb one, over j's rows, is one statement; Pondra's answer equals Postgres's,
+    or its SQLSTATE is the one Postgres gives, and a 42883 carries Postgres's words):
+        jsonb || jsonb, jsonb || '…' and '…' || jsonb, jsonb || NULL: jsonb (a literal that isn't JSON is 22P02)
+        json || json, json || jsonb, jsonb || json, jsonb || integer | numeric | boolean | uuid, json || integer | uuid: 42883
+        json || '…', json || text, jsonb || text, '…' || '…', untyped || integer | uuid: text, as before
+    Known gap: a bigint column beside a document is text in Pondra (the trace knows no integer columns; Postgres: 42883).
     Measured (1,000,000 rows of `(id BIGINT, doc JSONB)`, each `{"id": i, "name": "n<i>", "tags": ["a", "b", "c"],
     "nested": {"k": i}}`; median of 7 timed runs after one warm-up, each run's text unique so that no answer is
     remembered; 4 vCPUs shared with other builds, load 6 to 8, so compare the ratios, not the seconds):
@@ -16714,7 +16721,7 @@ def jsonedits():
     ]
     lit = lambda v: "NULL" if v is None else "'" + v.replace("'", "''") + "'"
     values = ", ".join(f"({i}, {lit(d)}, {lit(j)}, {'NULL' if n is None else n})" for i, d, j, n in rows)
-    setup = ["CREATE TABLE j (id BIGINT, doc JSONB, js JSON, n BIGINT)", f"INSERT INTO j VALUES {values}"]
+    setup = ["CREATE TABLE j (id BIGINT, doc JSONB, js JSON, n BIGINT)", f"INSERT INTO j VALUES {values}", "CREATE VIEW jv AS SELECT id, doc FROM j"]
     # Each answer is one statement, the same text for Pondra and Postgres 16 (every result cast to text).
     ok_cases = [
         ("jsonb_set of a member", "SELECT id, jsonb_set(doc, '{c,e}', '\"y\"')::text FROM j WHERE id IN (1, 3) ORDER BY id"),
@@ -16745,6 +16752,16 @@ def jsonedits():
         ("jsonb_pretty", "SELECT id, jsonb_pretty(doc) FROM j WHERE id IN (1, 2) ORDER BY id"),
         ("jsonb_pretty of a scalar", "SELECT id, jsonb_pretty(doc) FROM j WHERE id = 4"),
         ("jsonb_pretty of empty containers", "SELECT jsonb_pretty('{\"tags\": [], \"o\": {}, \"n\": [[], {\"x\": []}]}'::jsonb)"),
+        ("|| of two jsonb columns", "SELECT id, (doc || doc)::text FROM j ORDER BY id"),
+        ("|| of a document, a literal list and an object, nested", "SELECT id, (doc || '{\"z\": 1}' || '[9]' || '{\"a\": 2}')::text FROM j ORDER BY id"),
+        ("|| with NULL on either side", "SELECT id, (doc || NULL)::text, (NULL || doc)::text FROM j ORDER BY id"),
+        ("|| in a WHERE", "SELECT id FROM j WHERE doc || '{\"x\": 1}' IS NOT NULL ORDER BY id"),
+        ("|| of a jsonb made by a function", "SELECT id, (jsonb_build_object('a', n) || '{\"b\": 2}')::text FROM j ORDER BY id"),
+        ("|| of a subquery's jsonb column", "SELECT x.id, (x.v || '{\"w\": 0}')::text FROM (SELECT id, doc AS v FROM j) AS x ORDER BY x.id"),
+        ("|| of a subquery's column that a function makes", "SELECT x.id, (x.v || '{\"w\": 0}')::text FROM (SELECT id, jsonb_build_object('a', id) AS v FROM j) AS x ORDER BY x.id"),
+        ("|| over a view of a jsonb column", "SELECT id, (doc || '{\"w\": 0}')::text FROM jv ORDER BY id"),
+        ("|| of json and an object literal: text, as before", "SELECT id, js || '{\"b\": 2}' FROM j ORDER BY id"),
+        ("|| of jsonb and text: text, as before", "SELECT id, doc || 'x'::text FROM j ORDER BY id"),
         ("array literals in casts", "SELECT array_to_string('{a,b}'::text[], '|'), array_to_string(CAST('{1,2}' AS INT[]), '|'), array_to_string('{}'::text[], '|')"),
         ("array literal with quotes and an escape", "SELECT array_to_string('{\"a b\",\"c\\\"d\"}'::text[], '|')"),
     ]
@@ -16840,6 +16857,61 @@ def jsonedits():
             status, state, body = _sqlstate_of(A.port, text)
             checks[f"known gap, {name}: Postgres 16 refuses with SQLSTATE {code}"] = pg_code(text) == code
             info[f"known gap: {name}"] = {"postgres": pg_code(text), "pondra": [status, state, body[:160]]}
+        # `||` (Piece E): every pair of these operands with a json or jsonb one, over j's rows. Postgres answers or refuses;
+        # its answer, or its SQLSTATE and words, is what Pondra must give. A bigint column (`n`) beside a document is the
+        # known gap: Pondra's trace knows no integer columns, so it stays text where Postgres refuses.
+        concat_ops = ["doc", "js", "(doc -> 'a')", "'{\"z\": 1}'", "'[9]'", "'x'", "NULL", "1", "1.5", "TRUE", "'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid", "'x'::text", "n"]
+        json_ops = {"doc", "js", "(doc -> 'a')", "'{\"z\": 1}'", "'[9]'"}
+
+        def pg_message(text):
+            try:
+                pg_rows(text)
+                return None
+            except psycopg.Error as e:
+                return str(e).splitlines()[0]
+
+        def http_or_error(text):  # (a Pondra error is a failed check, not an abort: the rest of the grid still runs)
+            try:
+                return http_rows(text)
+            except AssertionError as e:
+                return f"error: {e}"
+
+        for l_ in concat_ops:
+            for r_ in concat_ops:
+                if l_ not in json_ops and r_ not in json_ops:
+                    continue
+                name, text = f"{l_} || {r_}", f"SELECT id, ({l_} || {r_})::text AS v FROM j ORDER BY id"
+                code = pg_code(text)
+                if code is None:
+                    want = pg_rows(text)
+                    got = http_or_error(text)
+                    checks[f"{name}: HTTP == Postgres 16's answer ({len(want)} rows)"] = got == want
+                    checks[f"{name}: the Postgres port == Postgres 16's answer"] = port_rows(text) == want
+                    if got != want:
+                        info[f"differs: {name}"] = {"pondra": got if isinstance(got, str) else got[:4], "postgres": want[:4]}
+                elif "n" in (l_, r_):
+                    status, state, body = _sqlstate_of(A.port, text)
+                    checks[f"known gap, {name}: Postgres 16 refuses with SQLSTATE {code}"] = code == "42883"
+                    info[f"known gap: {name}"] = {"postgres": code, "pondra": [status, state, body[:120]]}
+                else:
+                    status, state, body = _sqlstate_of(A.port, text)
+                    checks[f"{name}: HTTP refuses with SQLSTATE {code}"] = status >= 400 and state == code
+                    checks[f"{name}: the Postgres port refuses with SQLSTATE {code}"] = port_code(text) == code
+                    if code == "42883":
+                        checks[f"{name}: HTTP says Postgres's words"] = pg_message(text) in body
+        # Known gaps, recorded and not checked: sqlparser ranks `||` with `*` where Postgres ranks it with `->` and below `+`.
+        # Without parentheses, `doc -> 'a' || doc` is `doc -> ('a' || doc)` here (refused: 22P02), where Postgres answers
+        # `(doc -> 'a') || doc`; and `'x' || n + 1` is `('x' || n) + 1` here (refused), where Postgres answers 'x6'.
+        for name, gap_text in [("doc -> 'a' || doc, with no parentheses", "SELECT id, (doc -> 'a' || doc)::text AS v FROM j WHERE id = 1"),
+                               ("'x' || n + 1, with no parentheses", "SELECT id, ('x' || n + 1) AS v FROM j WHERE id = 1")]:
+            info[f"known gap: {name} (Postgres 16's answer)"] = {"postgres": rows_text(pg_rows(gap_text)), "pondra": list(_sqlstate_of(A.port, gap_text))[:2] + [str(http_or_error(gap_text))[:120]]}
+        # UPDATE … SET doc = doc || …, and an INSERT … SELECT of one, change the same rows as Postgres's, read back.
+        for write in ["UPDATE j SET doc = doc || '{\"z\": 1}' WHERE id IN (1, 2)", "INSERT INTO j (id, doc, js, n) SELECT id + 10, doc || '{\"c\": 3}', js, n FROM j WHERE id = 1"]:
+            pg.execute(write)
+            sql(A.port, write)
+        back = "SELECT id, doc::text, (doc || '{\"d\": 4}')::text FROM j ORDER BY id"
+        checks["UPDATE … SET doc = doc || … and INSERT … SELECT: HTTP reads back Postgres 16's rows"] = http_rows(back) == pg_rows(back)
+        checks["UPDATE … SET doc = doc || … and INSERT … SELECT: the Postgres port reads back Postgres 16's rows"] = port_rows(back) == pg_rows(back)
         # Where Pondra reads more than Postgres 16 answers: Pondra's own answer is the check, Postgres's is recorded.
         typed = "SELECT array_to_string(TEXT[] '{a,\"b,c\"}', '|')"
         info["TEXT[] '{a,\"b,c\"}' in Postgres 16"] = pg_code(typed) or "answered"

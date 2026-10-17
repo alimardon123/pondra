@@ -312,7 +312,7 @@ had until an `UPDATE` stores the answer. The functions and their operators are P
 |---|---|---|
 | Set the value at a path, or add it | `jsonb_set(doc, path, value)` | |
 | Insert a value before or after a place in an array | `jsonb_insert(doc, path, value, after)` | |
-| Merge two documents: the second one's keys win | `jsonb_concat(a, b)` | |
+| Merge two documents: the second one's keys win | `jsonb_concat(a, b)` | `a \|\| b` |
 | Remove a key, an array element or a list of keys | `jsonb_delete(doc, key)` | `doc - key` |
 | Remove the value at a path | `jsonb_delete_path(doc, path)` | `doc #- path` |
 | Remove the null members | `jsonb_strip_nulls(doc)`, or `json_strip_nulls` for `JSON` text | |
@@ -328,7 +328,7 @@ INSERT INTO profiles VALUES
   (2, '{"name": "bo", "tags": [], "plan": null}');
 
 UPDATE profiles SET doc = jsonb_set(doc, '{plan,tier}', '"pro"') WHERE id = 1;
-UPDATE profiles SET doc = jsonb_concat(doc, '{"seen": true}');
+UPDATE profiles SET doc = doc || '{"seen": true}';
 
 SELECT id, doc FROM profiles ORDER BY id;
 ```
@@ -386,8 +386,7 @@ indented
 ```
 
 <Aside type="caution">
-`||` joins text in Pondra, as it does for any text: `doc || '{"seen": true}'` makes a string that isn't
-one document. Postgres merges two documents with `||`. Here use `jsonb_concat`.
+`||` on two `JSONB` documents merges them, as Postgres does: `doc || '{"seen": true}'` is `jsonb_concat(doc, '{"seen": true}')`.
 
 The planner doesn't yet know a column is `JSON` when it plans `-` and `#-`, so on a `JSON` column they
 answer a change where Postgres refuses it (`42883`). Keep the documents you change in a `JSONB` column.
