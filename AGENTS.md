@@ -116,7 +116,9 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           (`pondra status` and `pondra capture`: ADR-060 §7, invariant 280); views kept current (ADR-055,
           ADR-056, ADR-059):
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
-          view that runs its query again, by key or whole: invariant 253)
+          view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
+          counts in the query memory: invariant 414); round 35 served.rs (a lake's store over HTTP:
+          pondra://host:port, ADR-072 §8, invariant 299)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -511,7 +513,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 20. **A write to an attached lake is recorded by that lake's leader** (`write::deliver`), never
    by ours: our catalog never lists another lake's files.
 21. **SQL from users never touches a node's disk.** Every query that arrives over HTTP, Postgres
-   or MCP runs with `query::read_only()` (no `COPY … TO`, no `CREATE EXTERNAL TABLE`, no session
+   or MCP runs with `engine::read_only()` (no `COPY … TO`, no `CREATE EXTERNAL TABLE`, no session
    DDL); writes go through `write.rs`. Local files (`enable_url_table`) are for `pondra sql` on
    its user's own machine only (`prepare(…, files: true)`). `harness.py clients` checks both.
 22. **A Kafka batch's seq comes from its producer id and sequence** (`kafka::queue`): seq = base
@@ -700,6 +702,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    lead` of their own (hidden), which leads for a moment, once, and ends. That lake's catalog writer would
    otherwise stay open in the node, and its next leader would fence it. (No test catches the
    stray writer yet; `smoke.py`'s `CREATE DATABASE` and `harness.py changes` run the path.)
+   BACKUP of a lake held in memory runs in the process holding it (`backup::take_here`): a `pondra lead` can't
+   reach `memory://`. It claims a term with no address, as a one-off writer does, and closes the backup's
+   catalog on every path. `harness.py memorylake`: "BACKUP of a lake in memory runs in this process…".
 63. **DataFusion settings that have their own switches are changed through `set`**
    (`enable_dynamic_filter_pushdown`): assigning the umbrella field left the joins' own switch on,
    and a changed table's anti-join, planned with its dynamic filter built, failed when the query
@@ -2215,6 +2220,21 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    changes anything (`types::grows`). `CHAR(n)` is still plain text. `harness.py ddlgaps`:
    "VARCHAR(n): a longer value refused (22001) by INSERT, Postgres, UPDATE, MERGE, COPY, an append and
    an added column…".
+299. **The node that serves a lake's store leads it, and the nodes that reach it through that node never
+   claim a term** (`served.rs`, `Cluster::may_lead`, ADR-072 §8): their store is in the holder's process, so a
+   holder that followed would restart itself on the next leader change (an exec) and take every node's store
+   with it, and a lake in memory would be gone. One check (`served::checked`, from the command line and
+   `Node::start`) refuses a holder that is a `--reader`, has its lake on a bucket or has no admin token, and a
+   `pondra://` node with no admin token; a holder that didn't win the term stops. A `pondra://` node waits for
+   the holder to answer and to lead (`served::wait_up`, `join`), its `follow` only heartbeats, and it starts
+   again when its holder answers after the lease (a lake in memory started again is another lake of the same
+   term). A holder is never cut off (invariant 214: nobody else could lead). The door answers only
+   `auth::operator()` (the nodes' admin token, or the program that started the node; never a user's, a
+   superuser's included). Two departures from ADR-072 §8: the flag is `--serve-store` (Delta Sharing has
+   "share"), and the nodes open the store with the admin token, not the nodes' key, which a follower can't read
+   until it opens the store. `harness.py served`: "a follower that loses its holder for 10 s claims no term",
+   "a follower whose holder stops waits, and answers again once it is back", "a lake in memory started again:
+   its follower shows none of the old lake's rows", "a superuser's token is refused".
 300. **A node is started and stopped as an object, and a stop at any point gives back what it took**
    (`node.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
    serves, it drains, makes what it committed durable, checkpoints, ends what it started
@@ -2309,6 +2329,26 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    library's dynamic symbols (only its ABI defined but a dependency's C API, nothing needed unversioned).
    A node in a library prints nothing when all goes well: a slow statement too goes only to `pondra.history`
    (`history::ended`; `inprocess_check.py` p).
+308. **A lake held in memory keeps its catalog there and its bulk on disk past its budget, and none of it
+   outlives the lake** (`memory::Held`): past `PONDRA_MEMORY_LAKE_GB` its new `data/` and `log/` objects go
+   to `pondra-memory-{uid}/{pid}-{hex}` (0700, a lock file held), under `PONDRA_CACHE_DIR`, else the
+   temporary directory unless that is tmpfs, else the user's cache folder. An object is in one tier only:
+   writing it to one takes the other's copy away. The folder goes when the lake is let go, and one whose
+   lock is free is swept by the next spill. A spilled file is read in pieces of 8 MB, each one blocking
+   call (a file's own stream reads 8 KB a call: 1.4x slower). `cargo test --lib memory::`; TPC-H SF5 in a
+   2.5 GB container loads and answers (the build before was killed).
+309. **A lake moves whole or not at all** (`memory::set_location`, `settle`, `node::Move`): `ALTER DATABASE
+   … SET LOCATION` copies every object while the node serves; then its host drains and stops the node,
+   copies again what changed by e-tag and takes away what went, and only then lets the lake in memory go
+   and starts the node on the target, as a new term. A second pass that fails clears the target and starts
+   the node in memory again, saying why in `/stats` (`move_failed`) and to `db.save`. A lake a branch is
+   pinned to doesn't move. `harness.py memorylake`: "every write acknowledged is there once…", "a move
+   whose second pass fails leaves the lake in memory…".
+310. **A published Iceberg table names the place it was published from** (`iceberg::Published::location`):
+   its metadata's paths are absolute, so a lake opened anywhere else (moved, copied) forgets the state and
+   publishes it again whole. A leader publishes once at start when a published table names another place
+   (`iceberg::elsewhere`, from the catalog alone), and loads no manifests otherwise. `harness.py memorylake`:
+   "a published Iceberg table is published again at the target…".
 318. **SQL's plain INSERT never replaces a row of its key** (`constraints::key_check`, `key_check_over`,
    `txn::autocommit`, `txn::ByKey`): an INSERT without ON CONFLICT or OR REPLACE | IGNORE into a table
    with a PRIMARY KEY (not a merge table) is refused 23505, in Postgres's words, when two of its rows
@@ -2678,6 +2718,52 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    beside SASL can't be. `harness.py sso_pg` (a hand-written client, psycopg2's libpq 17, and psql 18
    when there is one); `harness.py keycloak` (psql 18's device flow, approved at Keycloak).
 
+414. **A window counts what it holds** (`held.rs`): every `WindowAggExec` and `BoundedWindowAggExec` is planned
+   between a `HeldInExec`, which counts each batch going in against the query memory (its rows' own slices, the
+   strings their views point to, and the window's own columns), and a `HeldOutExec`, which lets go of each batch as
+   its rows come out (a window gives one row per row, in order), so a window holding more than memory refuses
+   (53200) instead of growing the node until the OS kills it, and one that streams holds only what it holds.
+   What DataFusion keeps inside a window beyond its rows not yet out (the string buffers a long partition's views
+   point into, a frame's rows behind those given out, `WindowAggExec`'s final concatenation) is still uncounted.
+   `harness.py scale`: "a window over all rows past the memory limit refuses…" (answered by growing past its pool
+   without it; killed under a 2 GB cap at SF10).
+415. **A number with an exponent is a whole decimal, and what a query is said to give is what it gives**
+   (`optimize::WholeLiterals`, `query::run_schema`). DataFusion types `1e15` as a decimal of negative scale:
+   Arrow's cast to a float divides by `10^scale` (`CAST(1e15 AS DOUBLE)` was `9.999999999999999e14`) and
+   Parquet has no negative scale (a table made from one couldn't be written). The first analyzer rule makes
+   it the same number at scale 0 (Decimal256 past 38 digits, a float past 76). Anything that defines columns
+   from a query (`CREATE TABLE … AS`, `POST /insert`, a view's or a task's table, `COPY … TO` Delta or
+   Iceberg) or describes them before it runs (Flight's info, a Postgres Describe, the Postgres catalog's
+   views, an empty answer) takes the analyzed schema through `run_schema`, never the planner's
+   `df.schema()`: the analyzer's rules change types the rows then have. `harness.py found`: "a number with
+   an exponent is a whole decimal…" and the bulk door, task, Delta and topic-view checks; `flight`: "the
+   FlightInfo schema of SELECT 1e15 AS x is decimal(16, 0)".
+416. **A sort of strings hands up only its own rows' strings** (`held::LeanExec`, `LeanSorts`): a sort that keeps
+   all its rows and has a `Utf8View` or `BinaryView` column passes its output through `query::compact`
+   (invariant 202). Its `take` and its merge's `interleave` copy views but keep the buffers they point into, so a
+   batch it hands up points into the current batch of every run it merges, and the `SortPreservingMergeExec`
+   above counts those buffers whole: a 10M-row sort of md5 strings on 4 partitions counted 66 MB for about 2 MB of
+   rows and a 256 MB query memory refused it, one run in three. A top-N keeps a few rows and is left alone.
+   `harness.py scale`: "a sort of 10M strings under a 256 MB query memory answers every time…".
+417. **A node stops the query that grew it past its memory line, not the node** (`oom.rs`, `panics::work`): some
+   operators grow without asking the query memory pool (`array_agg`, `median`, `string_agg` over huge groups), so the
+   pool can't refuse them and the OS killed the node. A watch reads the process's resident memory (again before 8 GB/s
+   of growth could pass the line: every 20 ms near it, every second at most) and past `PONDRA_MEMORY_MAX_GB` (85% of the
+   machine's or container's memory; 0 is off, and a host's process has none) stops the oldest client query (`/sql`,
+   `/mcp`, pages, every Postgres statement) that has run 200 ms and started a tenth of the line lower: its future is dropped, it answers 53200, and its transaction
+   fails as after an error. A stop holds the watch 10 s, while the allocator gives the pages back. The cluster's own
+   calls, bulk writes and live queries are never stopped. A pool wrapper that looked only when asked found 1.8–1.9 GB
+   already resident (parked). `harness.py scale`: "a query the pool doesn't see grow (array_agg over 30M rows) is
+   stopped at the node's memory line (53200)…" (a 1 GB line: peak 1,072 MB; 2.1 GB without; looking every second
+   below half the line and stopping only after a second, CI's runner reached 1.75 GB).
+418. **A table read cold tells the planner its columns' distinct values, as one read hot does** (`hot::told`): the
+   cold branch of `HotFiles::scan` gives its Parquet scan's statistics, and each file group's, the catalog's distinct
+   counts (`Known`, from the table's sketch and ranges), where the footers have none. DataFusion bounds a GROUP BY's
+   rows by its keys' distinct counts, so without them a GROUP BY of a 3-value column over a table past the hot
+   budget was sized at every row, and a join built the big side (SF10's `GROUP BY l_returnflag` at 60M rows, its join
+   refused for memory). Rows, bytes, ranges and null counts stay the footers'. `harness.py hot`: "a table read cold
+   sizes a GROUP BY by its column's distinct values (3 groups), and a join builds those".
+
 ## Tests: run these before and after any change
 
 ```bash
@@ -2686,6 +2772,7 @@ cargo test --release --lib [filter]     # unit tests (the tests are the library'
 python3 tools/harness.py all            # upsert, fence/split-brain, bulk insert, reader, crash, load
 python3 tools/gates.py [--prepare]      # the gates (sqllogictest, TPC-H SF1 vs DuckDB, vs Postgres, Nexmark): a row in logs/gates/README.md; exit 1 on a drop
 python3 tools/harness.py guarded        # open nodes and pages from other sites, the row doors and the nodes' routes by grant, a forwarded change as its user, .py files an admin's
+python3 tools/harness.py served         # a lake's store over HTTP (pondra://host:port, --serve-store): followers never lead, wait for their holder, and refuse by name
 python3 tools/surface.py --bin target/release/pondra --check docs/surface.json   # what 1.0 keeps (ADR-068): reports until the freeze, then fails on a name added or gone
 python3 tools/harness.py safety         # panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
 python3 tools/harness.py owned signed guesses   # a program's node answers only it; a lake served with tokens stays signed; failed sign-ins limited per address and name

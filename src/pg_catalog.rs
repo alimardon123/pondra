@@ -422,7 +422,10 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         let (schema, view) = crate::ddl::split(name);
         let cols: Vec<(String, DataType, bool, Option<String>)> = match &every {
             Some(ctx) => match ctx.sql(&format!("SELECT * FROM \"{schema}\".\"{view}\" LIMIT 0")).await {
-                Ok(df) => df.schema().fields().iter().map(|f| (f.name().clone(), f.data_type().clone(), false, None)).collect(),
+                Ok(df) => match crate::query::run_schema(ctx, df.logical_plan()) {
+                    Ok(s) => s.fields().iter().map(|f| (f.name().clone(), f.data_type().clone(), false, None)).collect(),
+                    Err(_) => vec![],
+                },
                 Err(_) => vec![],
             },
             None => vec![],

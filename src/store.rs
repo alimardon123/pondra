@@ -647,6 +647,14 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
         let held = crate::memory::store(&url);
         return Ok((url.clone(), held.clone(), Some((url, held)))); // (DataFusion reads its files at their URLs, as a bucket's)
     }
+    if served(url) {
+        // (the store is the node that holds the lake's, read through its door: `served.rs`; nothing is connected yet)
+        let at = url.trim_start_matches("pondra://").trim_end_matches('/');
+        anyhow::ensure!(!at.is_empty() && !at.contains('/'), "{url}: a node serves one lake, named by pondra://host:port alone");
+        let url = format!("pondra://{at}");
+        let store: Store = Arc::new(Counted(Arc::new(crate::served::Served::new(at))));
+        return Ok((url.clone(), store.clone(), Some((url, store)))); // (the lake and its bucket are one, as in memory)
+    }
     let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
         std::fs::create_dir_all(url)?;
         let dir = std::fs::canonicalize(url)?.to_string_lossy().trim_start_matches(r"\\?\").to_string(); // (Windows verbatim prefix)
@@ -679,6 +687,9 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
 // Lakes held in this process's memory (`memory://`, DuckDB's `:memory:`) live in `memory.rs`, which
 // spills their files to disk past a budget.
 pub use crate::memory::{forget_memory, held_in_memory, in_memory, memory_held, place};
+
+/// Is `url` a lake served by the node that holds it (`pondra://host:port`, ADR-072 §8)?
+pub fn served(url: &str) -> bool { url.starts_with("pondra://") }
 
 /// A lake's bucket, as DataFusion names its store (`s3://bucket`), or None for a folder.
 pub fn bucket_url(url: &str) -> Option<String> {

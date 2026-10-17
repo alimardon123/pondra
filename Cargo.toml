@@ -13,11 +13,12 @@ default = ["server"]
 # command line. Without it the library is the parts a browser build shares (`src/lib.rs`).
 server = ["dep:http", "dep:slatedb", "dep:reqwest", "tokio/full", "dep:axum", "dep:toml", "dep:uuid", "dep:clap", "dep:mimalloc",
           "dep:chrono-tz", "dep:postgres-types", "dep:pgwire", "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:zstd",
-          "dep:object_store", "dep:object_store_df", "dep:glob", "dep:aws-lc-rs", "dep:tokio-rustls",
+          "dep:object_store", "dep:object_store_df", "dep:aws-lc-rs", "dep:tokio-rustls",
           "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tikv-jemallocator", "dep:tower", "dep:http-body-util", "dep:moka"]
 
 [workspace]
 members = ["capi", "launcher"] # (pondra_lib, the C ABI, and the launcher that loads it: `cargo build --workspace` builds them with the program, into one folder; a plain build at the root builds the program alone)
+exclude = ["web"] # (the page form's module: a workspace of its own for wasm32, built by tools/web_build.sh)
 
 [lib]
 doctest = false # (the modules' docs are prose and SQL, not Rust examples)
@@ -71,7 +72,7 @@ crc-fast = "1.10"
 # S3 / R2 / MinIO. SlateDB and our own I/O use object_store 0.14; DataFusion 55 reads through 0.13.
 object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"], optional = true } # (files outside the lake too: ADR-026)
 object_store_df = { package = "object_store", version = "0.13", default-features = false, optional = true }
-glob = { version = "0.3", optional = true } # (a URL's glob: DataFusion splits only paths'; already built for it)
+glob = "0.3" # (a URL's glob: DataFusion splits only paths'; already built for it)
 aws-lc-rs = { version = "1", optional = true } # (secrets sealed with AES-256-GCM: already built for object_store's TLS)
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"], optional = true } # (Kafka clusters over TLS: already built for reqwest)
 rustls-platform-verifier = { version = "0.7", optional = true } # (…checked against the system's certificates, as reqwest does)

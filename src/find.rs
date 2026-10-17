@@ -202,7 +202,7 @@ fn session_for<'a>(lake: &'a Lake, views: &'a [String]) -> BoxFuture<'a, Option<
 fn columns_in<'a>(ctx: &'a SessionContext, named: &'a str) -> BoxFuture<'a, Result<Vec<(String, String)>>> {
     Box::pin(async move {
         let df = crate::query::sql(ctx, &format!("SELECT * FROM {named} LIMIT 0")).await?;
-        Ok(df.schema().fields().iter().map(|f| (f.name().clone(), sql_type(&f.data_type().to_string()))).collect())
+        Ok(crate::query::run_schema(ctx, df.logical_plan())?.fields().iter().map(|f| (f.name().clone(), sql_type(&f.data_type().to_string()))).collect())
     })
 }
 

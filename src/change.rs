@@ -263,8 +263,10 @@ fn qualified(e: &ast::Expr) -> Option<(String, String)> {
 async fn compared_as_keys(lake: &Lake, meta: &TableMeta, sources: &[(String, (String, String))], m: &Merge, upto: u64) -> Result<bool> {
     let cols: Vec<String> = sources.iter().map(|(_, (a, c))| format!("{}.{}", q(a), q(c))).collect();
     let sql = format!("SELECT {} FROM {} LIMIT 0", cols.join(", "), m.source);
-    let df = session(lake, &sql, upto).await?.sql(&sql).await?;
-    let fields = df.schema().fields();
+    let ctx = session(lake, &sql, upto).await?;
+    let df = ctx.sql(&sql).await?;
+    let schema = crate::query::run_schema(&ctx, df.logical_plan())?; // (the types the query gives: a literal's as the analyzer types it)
+    let fields = schema.fields();
     Ok(sources.iter().zip(fields.iter()).all(|((k, _), f)| {
         let key = meta.columns.iter().find(|(c, _)| c == k).map(|(_, t)| crate::query::dtype(t));
         matches!(key, Some(Ok(t)) if same_key_type(&t, f.data_type()))

@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 import harness
 from harness import Node, call
-from tpch import TABLES, queries
+from tpch import TABLES, columns, queries
 
 
 def cpu(pid):
@@ -33,8 +33,7 @@ def load(port, data):
     import io, pyarrow as pa, pyarrow.ipc, pyarrow.parquet as pq
     for t in TABLES:
         table = pq.read_table(os.path.join(data, f"{t}.parquet"))
-        cols = [[f.name, str(f.type).replace("decimal128", "Decimal128").replace("date32[day]", "Date32").replace("int64", "Int64")
-                 .replace("int32", "Int32").replace("string", "Utf8")] for f in table.schema]
+        cols = columns(table.schema)
         call(port, "POST", f"/tables/{t}", json.dumps(cols).encode())
         for seq, batch in enumerate(table.to_batches(max_chunksize=500_000), 1):
             buf = io.BytesIO()

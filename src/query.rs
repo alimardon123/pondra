@@ -6,7 +6,6 @@
 use crate::store::*;
 use anyhow::{bail, Result};
 use datafusion::arrow::array::{ArrayRef, Int64Array, UInt64Array};
-use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -841,26 +840,7 @@ fn keep_held(held: MemoryReservation) {
 pub fn take_held() -> Option<MemoryReservation> { HELD.try_with(|h| h.borrow_mut().take()).ok().flatten() }
 
 pub use crate::answer::{compact, ipc, type_name};
-
-/// A query's union columns planned as their text: every door plans through `sql`, so its schema,
-/// its rows and a table made of it all say Utf8. A query with no union column is returned as it is.
-fn text_unions(df: datafusion::dataframe::DataFrame) -> datafusion::error::Result<datafusion::dataframe::DataFrame> {
-    if !df.schema().fields().iter().any(|f| matches!(f.data_type(), DataType::Union(..))) {
-        return Ok(df);
-    }
-    let exprs: Vec<Expr> = df
-        .schema()
-        .iter()
-        .map(|(qualifier, f)| {
-            let column = Expr::Column(Column::from((qualifier, f)));
-            match f.data_type() {
-                DataType::Union(..) => crate::engine::JSON_TEXT.call(vec![column]).alias_qualified(qualifier.cloned(), f.name()), // (a join's two of one name stay two)
-                _ => column,
-            }
-        })
-        .collect();
-    df.select(exprs)
-}
+pub use crate::engine::sql;
 
 /// An Arrow IPC stream's batches (none for no bytes).
 pub fn read_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
@@ -870,25 +850,14 @@ pub fn read_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
     Ok(datafusion::arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)?.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// What SQL from users may do on a node: queries only. No `COPY … TO` files, no `CREATE EXTERNAL
-/// TABLE` over the node's disk, no session DDL; writes go through `write.rs`, `SET` through pg.rs.
-pub fn read_only() -> datafusion::execution::context::SQLOptions {
-    datafusion::execution::context::SQLOptions::new().with_allow_ddl(false).with_allow_dml(false).with_allow_statements(false)
-}
-
-/// A user's query planned (`read_only`), with a higher-order function's `x -> …` as a lambda
-/// (`friendly::lambdas`: the generic dialect's text keeps it as JSON's arrow, so it is planned from
-/// the tree). A session in another dialect reads its own lambdas, and its own strings: read as the
-/// generic dialect, Databricks' `"a"` became a column.
-pub async fn sql(ctx: &SessionContext, sql: &str) -> Result<datafusion::dataframe::DataFrame> {
-    use datafusion::config::Dialect;
-    let generic = matches!(ctx.state().config().options().sql_parser.dialect, Dialect::Generic);
-    if let Some(stmt) = crate::friendly::lambdas(sql).filter(|_| generic) {
-        let plan = ctx.state().statement_to_plan(stmt).await?;
-        read_only().verify_plan(&plan)?;
-        return Ok(text_unions(ctx.execute_logical_plan(plan).await?)?);
-    }
-    Ok(text_unions(ctx.sql_with_options(sql, read_only()).await?)?)
+/// The schema a plan's rows have as they run: the analyzer's types, not the SQL planner's. The planner
+/// types a literal such as `1e15` as a decimal with a negative scale, which no table can hold; the
+/// analyzer's rules (`optimize::WholeLiterals`, type coercion) type it as the query runs. Only the
+/// analyzer runs here: the optimizer keeps a plan's schema (DataFusion checks it), so a query that is
+/// only described (a table's columns, a Flight or Postgres description) needn't be optimized to be.
+pub fn run_schema(ctx: &SessionContext, plan: &datafusion::logical_expr::LogicalPlan) -> Result<datafusion::common::DFSchemaRef> {
+    let state = ctx.state();
+    Ok(state.analyzer().execute_and_check(plan.clone(), state.config_options(), |_, _| {})?.schema().clone())
 }
 
 /// A table of this lake in a session: `t` in the default schema (`public`), `s.t` in schema `s`,

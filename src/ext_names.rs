@@ -1,9 +1,12 @@
 //! `ext:` names: files and other engines' tables as SQL names them (ADR-026), in every build. Reading them is `ext.rs`'s.
 use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
+use datafusion::datasource::file_format::{csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat, FileFormat};
+use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::sql::sqlparser::ast::{Expr, TableFactor, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Files a query reads as one table: where, in which format, with which options.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -29,6 +32,11 @@ pub fn mentions(sql: &str) -> bool {
     });
     FILES.is_match(sql)
 }
+
+/// The options `file_format` reads for CSV (DuckDB's names).
+pub(crate) const CSV_OPTIONS: &[&str] = &["header", "delim", "sep", "delimiter", "quote", "escape", "comment", "new_line"];
+/// The options every listing of files takes, on a node.
+const LISTING_OPTIONS: &[&str] = &["hive_partitioning", "hive_types", "union_by_name", "columns"];
 
 /// The table a reference to files is: `'s3://…/x.parquet'` or `'sales/*.csv'` (a URL or a path,
 /// its format by extension), or `read_parquet(…)`, `read_csv(…)`, `read_json(…)`, `read_delta(…)`,
@@ -66,11 +74,11 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
         options.insert(name.to_lowercase(), value.with_context(|| format!("{f}: {name} is a value"))?);
     }
     ensure!(!urls.is_empty(), "{f}: which files? {f}('s3://bucket/path/*.{format}')");
-    let known: &[&str] = match format {
-        "csv" => &["header", "delim", "sep", "delimiter", "quote", "escape", "comment", "new_line", "hive_partitioning", "hive_types", "union_by_name", "columns"],
-        "delta" => &["version"],
-        "iceberg" => &["version", "snapshot_from_id", "snapshot_from_timestamp", "allow_moved_paths"],
-        _ => &["hive_partitioning", "hive_types", "union_by_name", "columns"],
+    let known: Vec<&str> = match format {
+        "csv" => [CSV_OPTIONS, LISTING_OPTIONS].concat(),
+        "delta" => vec!["version"],
+        "iceberg" => vec!["version", "snapshot_from_id", "snapshot_from_timestamp", "allow_moved_paths"],
+        _ => LISTING_OPTIONS.to_vec(),
     };
     ensure!(!["delta", "iceberg"].contains(&format) || urls.len() == 1, "{f}: one table at a time");
     if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
@@ -102,6 +110,20 @@ pub(crate) fn format_of(url: &str) -> Result<(String, BTreeMap<String, String>)>
 pub(crate) fn scheme(url: &str) -> Option<&str> {
     let s = url.split_once("://")?.0;
     ["s3", "r2", "gs", "gcs", "az", "azure", "abfs", "abfss", "http", "https", "kafka", "file"].contains(&s).then_some(s)
+}
+
+/// Where a URL's glob starts (`*`, `[`; `?` too, but not in a web address: its query).
+pub(crate) fn glob_at(u: &str) -> Option<usize> {
+    let web = u.starts_with("http");
+    u.char_indices().find(|(_, c)| *c == '*' || *c == '[' || (*c == '?' && !web)).map(|(i, _)| i)
+}
+
+/// A URL as DataFusion lists it, its glob split off (DataFusion splits only paths' globs).
+pub(crate) fn listing_url(u: &str) -> Result<ListingTableUrl> {
+    let Some(at) = glob_at(u).filter(|_| u.split_once("://").is_some_and(|(s, _)| s != "file")) else { return Ok(ListingTableUrl::parse(u)?) };
+    let cut = u[..at].rfind('/').map_or(0, |j| j + 1);
+    let (prefix, glob) = u.split_at(cut);
+    Ok(ListingTableUrl::try_new(url::Url::parse(prefix)?, Some(glob::Pattern::new(glob)?))?)
 }
 
 /// The tables of files named in `sql` (after `routines::expand`).
@@ -187,4 +209,37 @@ pub fn attached_table(all: &[(String, Attached)], parts: &[String]) -> Result<Op
 /// An attached Iceberg catalog's REST endpoint, if it has one.
 pub fn endpoint(a: &Attached) -> Option<String> {
     a.options.get("endpoint").cloned().or_else(|| a.url.starts_with("http").then(|| a.url.clone())).map(|e| e.trim_end_matches('/').to_string())
+}
+
+/// How a Spec's format and options read its files (CSV's options are CSV_OPTIONS, DuckDB's names), on a node and in a page.
+pub(crate) fn file_format(spec: &Spec) -> Result<Arc<dyn FileFormat>> {
+    let o = |k: &str| spec.options.get(k).map(String::as_str);
+    let byte = |k: &str, v: &str| -> Result<u8> { v.bytes().next().filter(|_| v.len() == 1).with_context(|| format!("{k} is one character, not {v:?}")) };
+    Ok(match spec.format.as_str() {
+        "parquet" => Arc::new(ParquetFormat::default()),
+        "json" => Arc::new(JsonFormat::default()),
+        "arrow" => Arc::new(datafusion::datasource::file_format::arrow::ArrowFormat),
+        "csv" => {
+            let mut f = CsvFormat::default().with_has_header(o("header").is_none_or(|h| h != "false"));
+            if let Some(d) = o("delim").or(o("sep")).or(o("delimiter")) {
+                f = f.with_delimiter(byte("delim", d)?);
+            }
+            if let Some(q) = o("quote") {
+                f = f.with_quote(byte("quote", q)?);
+            }
+            if let Some(e) = o("escape") {
+                f = f.with_escape(Some(byte("escape", e)?));
+            }
+            if let Some(c) = o("comment") {
+                f = f.with_comment(Some(byte("comment", c)?)); // (lines starting with it are skipped)
+            }
+            match o("new_line") {
+                None | Some("\n" | "\r\n" | "\\n" | "\\r\\n") => {} // (either, as read)
+                Some("\r" | "\\r") => f = f.with_terminator(Some(b'\r')),
+                Some(t) => bail!("new_line is \\n, \\r\\n or \\r, not {t:?}"),
+            }
+            Arc::new(f)
+        }
+        f => bail!("files as {f}: parquet, csv, json or arrow"),
+    })
 }

@@ -32,7 +32,8 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::parquet::arrow::{arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder}, ProjectionMask};
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{stats::Precision, ScalarValue};
+use datafusion::common::{stats::Precision, ScalarValue, Statistics};
+use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::physical_expr::{DynamicFilterTracking, PhysicalExpr};
 use datafusion::physical_optimizer::pruning::{PruningPredicateBuilder, PruningStatistics};
@@ -549,7 +550,7 @@ impl TableProvider for HotFiles {
             let options = ParquetReadOptions::default().to_listing_options(state.config(), state.table_options().clone());
             let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).with_schema(self.schema.clone());
             let table = ListingTable::try_new(config)?.with_cache(state.runtime_env().cache_manager.get_file_statistic_cache());
-            plans.push(table.scan(state, projection, filters, limit).await?);
+            plans.push(told(table.scan(state, projection, filters, limit).await?, &self.known)?);
         }
         if !special.is_empty() {
             let state = state.as_any().downcast_ref::<datafusion::execution::SessionState>().ok_or_else(|| datafusion::error::DataFusionError::Internal("a session without its state".into()))?;
@@ -605,6 +606,37 @@ pub fn known(stats: &datafusion::common::Statistics, schema: &Schema) -> HashMap
         distinct: c.distinct_count.get_value().copied(),
     };
     schema.fields().iter().zip(&stats.column_statistics).map(|(f, c)| (f.name().clone(), column(f, c))).filter(|(_, k)| k.range.is_some() || k.distinct.is_some()).collect()
+}
+
+/// A table's Parquet files told what the planner knows of its columns' distinct values, as the hot
+/// batches are told. The footers hold no distinct counts, so a GROUP BY over a table read cold was sized
+/// at every input row, and a join built the big side instead of the groups.
+fn told(plan: Arc<dyn ExecutionPlan>, known: &HashMap<String, Known>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    let Some(scan) = plan.downcast_ref::<DataSourceExec>() else { return Ok(plan) };
+    let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>() else { return Ok(plan) };
+    if known.values().all(|k| k.distinct.is_none()) {
+        return Ok(plan);
+    }
+    // (the statistics are the whole table's columns, unprojected: the file groups' and the config's alike)
+    let names: Vec<String> = config.file_source.table_schema().table_schema().fields().iter().map(|f| f.name().clone()).collect();
+    let fill = |stats: &Statistics| {
+        let mut s = stats.clone();
+        let rows = s.num_rows.get_value().copied();
+        for (c, name) in s.column_statistics.iter_mut().zip(&names) {
+            let Some(Known { distinct: Some(d), .. }) = known.get(name) else { continue };
+            let Some(rows) = rows else { continue };
+            if c.distinct_count == Precision::Absent {
+                c.distinct_count = Precision::Inexact((*d).min(rows).max(1));
+            }
+        }
+        s
+    };
+    let groups: Vec<FileGroup> = config.file_groups.iter().map(|g| match g.file_statistics(None) {
+        Some(s) => g.clone().with_statistics(Arc::new(fill(s))),
+        None => g.clone(),
+    }).collect();
+    let built = FileScanConfigBuilder::from(config.clone()).with_file_groups(groups).with_statistics(fill(&config.statistics())).build();
+    Ok(DataSourceExec::from_data_source(built))
 }
 
 /// The hot batches of a scan, as DataFusion's memory source reads them, skipping each batch the

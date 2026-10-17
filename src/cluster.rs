@@ -55,15 +55,36 @@ pub struct Cluster {
     pub shard_runs: std::sync::atomic::AtomicU64, // task shards this node has run (for /stats)
     cut_off: std::sync::atomic::AtomicBool,       // leader: it can't reach the bucket (`keep_alive`)
     others: std::sync::atomic::AtomicBool,        // leader cut off: another node was there meanwhile
+    may_lead: bool, // false: our store is another node's (pondra://), which leads: we never claim a term (`served.rs`)
 }
 
 impl Cluster {
     /// Follow a live leader; lead if nobody leads (or the latest term is ours, and we're coming back
-    /// from our own restart: `coming_back`).
-    pub async fn join(store: &Store, addr: &str, reader: bool) -> Result<Arc<Cluster>> {
+    /// from our own restart: `coming_back`). `may_lead` false: our store is another node's (`pondra://`),
+    /// which leads its lake; we follow it, and wait for it, and never claim a term (invariant 299).
+    pub async fn join(store: &Store, addr: &str, reader: bool, may_lead: bool) -> Result<Arc<Cluster>> {
+        let mut said = false;
         let leader = loop {
-            match latest(store).await? {
+            let latest_term = match latest(store).await {
+                Ok(t) => t,
+                // (the holder went away since it answered: look again, rather than end the node)
+                Err(_) if !may_lead => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            match latest_term {
                 Some(t) if reader => break t, // (we only read anyway)
+                None if reader => break Term { n: 0, addr: String::new(), lock: String::new() },
+                Some(t) if !may_lead && !t.addr.is_empty() && alive(store, &t).await => break t,
+                _ if !may_lead => {
+                    // (the node that serves this store leads it: wait for it, never take its place)
+                    if !std::mem::replace(&mut said, true) {
+                        eprintln!("waiting for the node that serves {store} to lead it");
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
                 // (ours. A term that stepped down is over, and taken again it would look dead to
                 // everyone (`alive`): a new one, below. One we're coming back to after our own restart
                 // is taken back: the exec let go of its lock)
@@ -76,7 +97,6 @@ impl Cluster {
                         break t; // (or someone else just did: look again)
                     }
                 }
-                None if reader => break Term { n: 0, addr: String::new(), lock: String::new() },
                 Some(t) if alive(store, &t).await && !t.addr.is_empty() => break t,
                 Some(t) if alive(store, &t).await => tokio::time::sleep(Duration::from_secs(1)).await, // a `pondra sql` INSERT is recording: wait
                 t => {
@@ -87,9 +107,11 @@ impl Cluster {
             }
         };
         let view = Mutex::new(vec![]); // a follower runs no shards until the leader lists it
-        let last_ok = Mutex::new(Instant::now() + STARTUP); // until we first hear from the leader
+        // (a node that never leads gets no startup grace: a holder that changed under its name shows at
+        // its first answer, not 30 s later, so the restart check in `follow` can fire)
+        let last_ok = Mutex::new(if may_lead { Instant::now() + STARTUP } else { Instant::now() }); // until we first hear from the leader
         let (beats, shard_runs, heard) = (Default::default(), Default::default(), Default::default());
-        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default(), others: Default::default() }))
+        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default(), others: Default::default(), may_lead }))
     }
 
     pub fn is_leader(&self) -> bool { self.leader.addr == self.addr }
@@ -141,7 +163,11 @@ impl Cluster {
     /// its own term, so after a lease this one would look alone, and held every write sent to it
     /// until its client gave up.) A leader alone all along serves what it can, as it always did:
     /// nobody else can lead, and its writes wait for the bucket.
-    pub fn cut_off(&self) -> bool { self.unreached() && (self.others.load(std::sync::atomic::Ordering::Relaxed) || self.nodes().len() > 1) }
+    pub fn cut_off(&self) -> bool {
+        // (a holder never steps aside: it is the store's only copy, and nobody else could lead; a store it
+        // can't reach is for the holder to fix, while its followers wait)
+        !crate::env::flag("PONDRA_SERVE_STORE") && self.unreached() && (self.others.load(std::sync::atomic::Ordering::Relaxed) || self.nodes().len() > 1)
+    }
 
     fn unreached(&self) -> bool { self.cut_off.load(std::sync::atomic::Ordering::Relaxed) }
 
@@ -203,7 +229,7 @@ impl Cluster {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let url = crate::tls::url(&format!("{}/cluster/beat?from={}", self.leader.addr, self.addr));
                 let answer = http().post(url).timeout(Duration::from_secs(2)).send().await;
-                if answer.as_ref().is_ok_and(|r| r.headers().contains_key(CUT_OFF_HEADER)) {
+                if self.may_lead && answer.as_ref().is_ok_and(|r| r.headers().contains_key(CUT_OFF_HEADER)) {
                     // The leader says it can't reach the bucket: no lease to wait out, no peer to
                     // ask. Take the next term once this node has reached the bucket for a few
                     // seconds (claiming needs it): if the bucket was down for everyone, the leader
@@ -227,12 +253,17 @@ impl Cluster {
                         if term != self.leader.n {
                             restart("a new leader answers at the leader's address");
                         }
+                        // (a holder away past the lease may hold another lake now: a lake in memory started
+                        // again claims the same first term, so the term alone doesn't tell them apart)
+                        if !self.may_lead && !self.leader_ok() {
+                            restart("its holder answers again after the lease: it may hold another lake now (a lake in memory started again)");
+                        }
                         *self.view.lock().unwrap() = nodes;
                         *self.last_ok.lock().unwrap() = Instant::now();
                         self.heard.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     // A leader that stepped down is gone for good: the next term at once.
-                    Err(_) if stepped_down(&store, self.leader.n).await => {
+                    Err(_) if self.may_lead && stepped_down(&store, self.leader.n).await => {
                         if !matches!(latest(&store).await, Ok(Some(t)) if t.n > self.leader.n) {
                             claim(&store, self.leader.n + 1, &self.addr).await.ok();
                         }
@@ -241,7 +272,7 @@ impl Cluster {
                     // A member that lost the leader takes over after the lease (if no peer still
                     // hears it). One that never reached it — say, outside the cluster's network —
                     // only once the leader is gone (`alive`): it never deposes a live one.
-                    Err(_) if if self.heard.load(std::sync::atomic::Ordering::Relaxed) { !self.leader_ok() } else { !alive(&store, &self.leader).await } => match latest(&store).await {
+                    Err(_) if self.may_lead && if self.heard.load(std::sync::atomic::Ordering::Relaxed) { !self.leader_ok() } else { !alive(&store, &self.leader).await } => match latest(&store).await {
                         Ok(Some(t)) if t.n > self.leader.n => restart(&format!("term {} has a newer leader", t.n)), // follow it
                         Ok(_) if self.peer_sees_leader().await => {}     // only our link to the leader is down
                         Ok(_) => {

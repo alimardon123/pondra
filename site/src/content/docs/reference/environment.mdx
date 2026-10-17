@@ -77,6 +77,7 @@ writes hands each job the one it needs as `PONDRA_TOKEN`; Pondra itself never re
 | Variable | Default | Meaning |
 |---|---|---|
 | `PONDRA_MEMORY_GB` | a third of the machine's memory | memory for queries, when `--memory-gb` is not given. A sort, join or aggregation that needs more spills to disk. An answer counts in it until it is sent, and one bigger than it is refused with SQLSTATE `53200`, saying so: ask for fewer rows, or write them out with `COPY (…) TO` |
+| `PONDRA_MEMORY_MAX_GB` | 85% of the machine's or container's memory | the memory (GB) past which the node stops the query that grew it (SQLSTATE `53200`) rather than be killed. `0` turns it off |
 | `PONDRA_MEMORY_LAKE_GB` | a quarter of the machine's memory | what a lake held in memory (`connect()`, `:memory:`) keeps in memory. Past it, its new files and log go to a folder of the process's own on disk (under `PONDRA_CACHE_DIR` when set, else the temporary directory, or the user's cache folder where that is held in memory), removed when the lake is closed, instead of the process running out of memory |
 | `PONDRA_QUERIES` | four a core, 16 at least | how many queries a node runs at once. The others wait their turn, in the order they came (`pondra_queries_running` and `pondra_queries_waiting` in [`/metrics`](/pondra/reference/http/)) |
 | `PONDRA_QUEUE_SECS` | `60` | how long a query waits for its turn. Past it, it is refused with SQLSTATE `53300`: try again, or ask another node |
@@ -192,6 +193,10 @@ pondra sql --dir jobs-lake "SELECT count(*) AS n FROM loads"
 A lake on object storage reads its credentials and endpoint from the environment, as each cloud's
 own tools do: `AWS_*` for `s3://` (`AWS_ENDPOINT` for R2 and MinIO), `GOOGLE_*` for `gs://`, and
 `AZURE_*` for `az://`, `abfs://` and `abfss://`. Pondra does not read them any other way.
+
+A lake's store can also be one node's, served to the others: `pondra serve --serve-store` sets
+`PONDRA_SERVE_STORE` for its node, and the other nodes open the lake as `pondra://host:port`. Every node
+of it needs the same admin token, and the node that serves the store is the one that leads the lake.
 
 ## Set by Pondra
 

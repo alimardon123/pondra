@@ -1,0 +1,29 @@
+[package]
+name = "pondra-web"
+version = "0.34.0"
+edition = "2021"
+publish = false
+description = "Pondra in a page: the core's lake-less engine for a browser or Node, through wasm-bindgen (designs/l2-b4-web.md)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pondra = { path = "..", default-features = false }
+wasm-bindgen = "=0.2.128" # (the same version as the wasm-bindgen command line that binds it: tools/web_build.sh checks)
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+# What the core's dependencies need in a page: the clock from JavaScript's Date (std's panics on wasm32-unknown-unknown),
+# random numbers from the browser's crypto.
+chrono = { version = "0.4", default-features = false, features = ["wasmbind", "clock"] }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[profile.release]
+opt-level = "z" # (a page downloads the module: size over speed, measured in the PR)
+lto = true
+codegen-units = 1
+
+[workspace]

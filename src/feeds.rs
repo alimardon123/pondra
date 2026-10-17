@@ -38,8 +38,8 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, topic: &str, options: &s
     }
     // Its columns: the query planned over the topic's (no records needed).
     let schema = crate::query::schema(&crate::kafka_client::columns())?;
-    let plan = over(lake, &feed, datafusion::arrow::record_batch::RecordBatch::new_empty(schema)).await?;
-    let columns: Vec<(String, String)> = plan.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+    let (ctx, plan) = over(lake, &feed, datafusion::arrow::record_batch::RecordBatch::new_empty(schema)).await?;
+    let columns: Vec<(String, String)> = crate::query::run_schema(&ctx, plan.logical_plan())?.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect(); // (the types as the query runs)
     let meta = TableMeta { columns, publish: crate::store::default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (feed_key(name), json(&feed))], &[]).await
 }
@@ -151,8 +151,9 @@ async fn shard(app: App, view: String, p: i32) -> Result<()> {
             continue;
         }
         let batch = crate::kafka_client::batch(&schema, p, &recs)?;
-        let df = over(&lake, &feed, batch).await?;
-        let out_schema = Arc::new(df.schema().as_arrow().clone());
+        let (ctx, df) = over(&lake, &feed, batch).await?;
+        // (the batches the query gives have the types it runs with, as the table's columns do)
+        let out_schema = Arc::new(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow().clone());
         let rows = datafusion::arrow::compute::concat_batches(&out_schema, &df.collect().await?)?;
         let target = crate::query::schema(&lake.cat.get::<TableMeta>(&table_key(&view)).await?.context("the view's table is gone")?.columns)?;
         let rows = crate::query::cast_as(&rows, &target)?;
@@ -165,10 +166,11 @@ async fn shard(app: App, view: String, p: i32) -> Result<()> {
 }
 
 /// The view's query over these records (in its topic's place).
-async fn over(lake: &Lake, feed: &Feed, batch: datafusion::arrow::record_batch::RecordBatch) -> Result<datafusion::prelude::DataFrame> {
+async fn over(lake: &Lake, feed: &Feed, batch: datafusion::arrow::record_batch::RecordBatch) -> Result<(datafusion::prelude::SessionContext, datafusion::prelude::DataFrame)> {
     const HERE: &str = "__pondra_records";
     let sql = feed.sql.replace(&format!("\"{}\"", feed.topic), &format!("\"{HERE}\"")); // (the session never lists the topic)
     let ctx = crate::query::session(lake, &sql, "").await?;
     ctx.register_batch(HERE, batch)?;
-    crate::query::sql(&ctx, &sql).await
+    let df = crate::query::sql(&ctx, &sql).await?;
+    Ok((ctx, df))
 }

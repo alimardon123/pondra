@@ -30,7 +30,8 @@ pub(crate) enum Cmd {
     Serve {
         /// The lake (a folder, or s3://bucket/prefix, its credentials from the AWS_* variables), or
         /// a folder of lakes. Default: this folder. A new or empty one becomes a lake. `:memory:`:
-        /// a lake held in this node's memory, gone when it stops.
+        /// a lake held in this node's memory, gone when it stops. `pondra://host:port`: a lake whose
+        /// store another node serves (`--serve-store`), which leads it.
         path: Option<String>,
         /// For scripts and services, nothing guessed: exactly this lake (made if it isn't there).
         #[arg(long = "lake", alias = "dir", value_name = "LAKE", conflicts_with_all = ["path", "databases"])]
@@ -52,6 +53,10 @@ pub(crate) enum Cmd {
         /// Read-only node: any number can run next to the single writer.
         #[arg(long)]
         reader: bool,
+        /// Serve this lake's store to nodes on other machines, which open it as pondra://host:port. Needs an
+        /// admin token, the same on every node; this node leads the lake. A folder or :memory: only.
+        #[arg(long)]
+        serve_store: bool,
         /// Minimum milliseconds between a node's flushes. 0: flush as soon as the previous flush
         /// is committed (what queued up meanwhile goes together), for the lowest latency.
         #[arg(long, default_value_t = 0)]
@@ -386,7 +391,7 @@ async fn run() -> anyhow::Result<()> {
         return shell::run(&lake).await;
     };
     match cmd {
-        Cmd::Serve { path, dir, databases, default, addr, advertise, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, tls_cert, tls_key, tls_ca, attach: attached, attach_found, stop_with_stdin, python } => {
+        Cmd::Serve { path, dir, databases, default, addr, advertise, reader, serve_store, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, tls_cert, tls_key, tls_ca, attach: attached, attach_found, stop_with_stdin, python } => {
             // The flags that are settings (`env.rs`) are given to the process at once, before anything
             // reads them; its children get them too (a folder of lakes' databases, `pondra lead`).
             let mut given: Vec<(&str, String)> = [("PONDRA_TLS_CERT", tls_cert), ("PONDRA_TLS_KEY", tls_key), ("PONDRA_TLS_CA", tls_ca)]
@@ -394,16 +399,30 @@ async fn run() -> anyhow::Result<()> {
             let token = |flag: Option<String>, var: &str| flag.or_else(|| env::get(var)).filter(|t| !t.is_empty());
             // A lake, or a folder of lakes (each a database: `dbserver.rs`), by what the path holds.
             let (path, dir) = (path.map(|p| store::place(&p)), dir.map(|d| store::place(&d))); // (`:memory:`: in this process's memory)
+            // (a node that serves its lake's store: checked before anything is opened; a folder of lakes is never
+            // served that way, and `--lakes` names none: `served.rs`)
+            let serving = serve_store || env::flag("PONDRA_SERVE_STORE");
+            if databases.is_none() {
+                let lake = dir.clone().or_else(|| path.clone()).unwrap_or_else(|| ".".into());
+                served::checked(&lake, reader, token(admin_token.clone(), "PONDRA_ADMIN_TOKEN").is_some(), serving)?;
+            }
+            if serving {
+                given.push(("PONDRA_SERVE_STORE", "1".to_string())); // (a node's setting, as `--serve-store` is: nodes restarted by it keep it)
+            }
             let (dir, many) = match (dir, databases) {
+                // (a lake another node serves: its place is its URL, and nothing here is made or counted as a folder)
+                (Some(d), _) if store::served(&d) => (d, false),
                 (Some(d), _) => {
                     // (one letter from --lakes: a mix-up is said, never served)
                     anyhow::ensure!(!dbserver::holds_lakes(&d).await?, "{d} holds lakes, each a database: serve them with --lakes {d} (or one of them: --lake {d}/<name>)");
                     (d, false)
                 }
                 (None, Some(f)) => {
+                    anyhow::ensure!(!store::served(&f), "{f} is a lake served by its node: serve it with --lake {f}");
                     anyhow::ensure!(!dbserver::is_lake(&f).await?, "{f} is a lake: serve it with --lake {f} (--lakes is for a folder of lakes)");
                     (f, true)
                 }
+                (None, None) if path.as_deref().is_some_and(store::served) => (path.unwrap_or_default(), false),
                 (None, None) => {
                     let given = path.is_some();
                     let p = path.unwrap_or_else(|| ".".into());
@@ -418,6 +437,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             };
             if many {
+                anyhow::ensure!(!serving, "--serve-store serves one lake's store: serve a lake (--lake), not a folder of them");
                 let one = [(flight.is_some(), "--flight"), (kafka.is_some(), "--kafka"), (kafka_advertise.is_some(), "--kafka-advertise"), (!attached.is_empty(), "--attach"), (advertise.is_some(), "--advertise"), (attach_found.is_some(), "--attach-found")];
                 if let Some((_, flag)) = one.iter().find(|(given, _)| *given) {
                     anyhow::bail!("{dir} holds several lakes, served as databases; {flag} is one lake's (serve that lake: pondra serve {dir}/<name> {flag} …)");

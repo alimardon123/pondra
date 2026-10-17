@@ -215,8 +215,9 @@ fn refused(held: usize, needs: usize) -> anyhow::Error {
 /// The columns of a query that returned no rows, from its plan.
 async fn planned(app: &App, query: &str) -> Result<SchemaRef> {
     let sql = crate::asof::rewrite(query)?.into_owned();
-    let df = crate::query::sql(&crate::query::session(&app.lake, &sql, "").await?, &sql).await?;
-    Ok(Arc::new(df.schema().as_arrow().clone()))
+    let ctx = crate::query::session(&app.lake, &sql, "").await?;
+    let df = crate::query::sql(&ctx, &sql).await?;
+    Ok(Arc::new(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow().clone()))
 }
 
 fn free(session: &str, name: &str) -> Result<()> {

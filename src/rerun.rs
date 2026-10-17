@@ -419,7 +419,8 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
         }
     };
     crate::format::require(lake, 2, "a materialized view that runs its query again (median, count(DISTINCT …), ORDER BY … LIMIT, …)").await?;
-    let columns: Vec<(String, String)> = plan.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+    let ctx = crate::query::session(lake, sql, "").await?; // (the table's columns are the types the query runs with)
+    let columns: Vec<(String, String)> = crate::query::run_schema(&ctx, plan)?.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     if let Some((c, _)) = columns.iter().find(|(c, _)| crate::sys::NAMES.contains(&c.as_str())) {
         bail!("{c} is a system column of the view's own table: name it something else ({c} AS source{c})");
     }

@@ -31,6 +31,7 @@
   harness.py sso_pg              psql 18's sign-in through a provider (POSTGRES 'oauth', OAUTHBEARER): told where it is, a token in, refusals, one way a connection
   harness.py keycloak            single sign-on against a real Keycloak (PONDRA_KEYCLOAK): tokens at every door, the console's flow, pondra login, psql 18
   harness.py safety              panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
+  harness.py served              a lake's store served by its node (pondra://host:port, --serve-store): followers never lead, wait for their holder, refusals
   harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
   harness.py stopped             a run whose node was killed under it: stopped, not running for good
   harness.py variables           DECLARE $day / $day = … from every door, a file's parameters (DECLARE PARAMETER, a .py file's cell), runs and procedures of their own
@@ -3469,6 +3470,26 @@ def scale():
         and q("SELECT max(r) AS r FROM (SELECT row_number() OVER (ORDER BY s, id) AS r FROM big)") == [{"r": 3000000}]
         and q("SELECT count(*) AS n FROM big a JOIN big b ON a.id = b.id") == [{"n": 3000000}]
         and metrics_of(port, headers=owner)["pondra_memory_limit_bytes"] == int(0.05 * (1 << 30)))
+    # A window counts the rows it holds against the query memory (invariant 414): one over every row refuses (53200)
+    # and the node answers after; one that lets rows go answers. Each refusal is kept for the report; the SQLSTATE is
+    # read from its header, since `call` keeps only the status and the words.
+    window_refusals = []
+    def refusal(s):
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=30)
+        c.request("POST", "/sql", s.encode(), owner)
+        r = c.getresponse()
+        body = r.read()
+        if r.status == 200:
+            return None
+        window_refusals.append({"sqlstate": r.getheader("x-pondra-sqlstate"), "error": body[:400].decode(errors="replace")})
+        return window_refusals[-1]
+    win_all = refusal("SELECT max(length(s) + id + k + n) AS m FROM (SELECT s, id, k, count(*) OVER () AS n FROM big)")
+    win_part = refusal("SELECT max(length(s) + k + d) AS m FROM (SELECT s, k, id - avg(id) OVER (PARTITION BY id % 3) AS d FROM big)")
+    checks["a window over all rows past the memory limit refuses (53200) and the node answers after; one that streams answers"] = (
+        win_all is not None and "a window holds more rows" in win_all["error"]
+        and win_part is not None and win_part["sqlstate"] == "53200"
+        and q("SELECT count(*) AS n FROM big") == [{"n": 3000000}]
+        and q("SELECT count(*) AS n FROM (SELECT rank() OVER (PARTITION BY k ORDER BY id) AS r FROM big) WHERE r = 1") == [{"n": 2000000}])
     # A write that runs out of memory retries frugally as a query does: its join's sort-merge spills, and a
     # COPY to a folder leaves no file of the first try behind. Each write's error is kept for the report.
     folder = os.path.join(tempfile.mkdtemp(prefix="pondra-frugal-"), "out")
@@ -3490,9 +3511,109 @@ def scale():
         and call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_parquet('{folder}/*.parquet')".encode(), headers=owner) == [{"n": 3000000}])
     shutil.rmtree(os.path.dirname(folder), ignore_errors=True)
     node.kill()
+    # A sort of 10 M md5 strings under a 256 MB query pool, on four cores: each partition's sort hands up views into its
+    # input's buffers, and the merge above counted those batches whole (66 MB for about 2 MB of rows, so the pool was
+    # refused: `held::LeanExec`). Each answer is checked against the least and greatest md5 of 1..10,000,000 (worked
+    # out in Python). A sort that fails is kept for the report, and the other two still run.
+    sorter = Node(lake, port, memory_gb=0.25, env={"PONDRA_CORES": "4"}).start()
+    sort_errors = []
+    def sort_into(statement):
+        try:
+            call(port, "POST", "/sql", statement.encode(), timeout=600)  # (a 10 M-row sort takes longer than the default 30 s)
+            return True
+        except (RuntimeError, OSError) as e:
+            sort_errors.append(str(e)[:400])
+            return False
+    sort_into("CREATE TABLE ss AS SELECT value AS id, md5(CAST(value AS VARCHAR)) AS k FROM generate_series(1, 10000000)")
+    sorts_answered = [sort_into(f"CREATE TABLE ss_{i} AS SELECT * FROM ss ORDER BY k") for i in (1, 2, 3)]
+    checks["a sort of 10M strings under a 256 MB query memory answers every time (its merge counts only its rows' strings)"] = (
+        all(sorts_answered)
+        and sql(port, "SELECT count(*) AS n, min(k) AS lo, max(k) AS hi FROM ss_3") == [{"n": 10000000, "lo": "0000023f507999464aa2b78875b7e5d6", "hi": "fffffe98d0963d27015c198262d97221"}])
+    for t in ("ss_3", "ss_2", "ss_1", "ss"):
+        sql(port, f"DROP TABLE IF EXISTS {t}")
+    sorter.kill()
+    # A query the pool can't see grow: array_agg over 30M values in three groups holds them outside the query memory
+    # (`oom.rs`). On a node whose line is 1 GB (PONDRA_MEMORY_MAX_GB), the watch stops the oldest query that grew past
+    # it: it answers 53200, the node's peak stays under 1.5 GB (without a line it peaked at 1,941 MB), and the node
+    # answers after. Queries that spill under the 0.5 GB pool stay under the line and aren't stopped: a sort, a GROUP BY
+    # and a full ORDER BY over `big`. Then the same statement over Postgres, and in a transaction over HTTP: the statement
+    # fails the transaction, as an error does (COMMIT answers ROLLBACK; the INSERT before it is gone).
+    import heapq, psycopg
+    line = 1 << 30
+    node = Node(lake, port, memory_gb=0.5, pg=f"127.0.0.1:{port + 10}", env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4"), "PONDRA_MEMORY_MAX_GB": "1"}).start()
+    def answer(s, session=None):  # (status, SQLSTATE, body): the answer, or the refusal as the node sends it
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=600)
+        c.request("POST", "/sql", s.encode(), {"x-pondra-session": session} if session else {})
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode(errors="replace")
+    def rows_of(s):  # the rows, or None: a refusal fails its check, it doesn't end the run
+        status, _, body = answer(s)
+        return json.loads(body) if status == 200 else None
+    def resident_of(pid):
+        return int(open(f"/proc/{pid}/statm").read().split()[1]) * 4096
+    def settle():  # resident memory under the line, 15 s at most (the allocator gives its pages back over ten seconds)
+        t = time.time()
+        while resident_of(node.p.pid) >= line and time.time() - t < 15:
+            time.sleep(0.5)
+        return time.time() - t
+    aggregate = "SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, 30000000) GROUP BY 1"
+    t0 = time.time()
+    status, sqlstate, body = answer(aggregate)
+    agg_seconds = time.time() - t0
+    agg_peak = vm_hwm(node.p.pid)
+    agg_settled = settle()
+    t0 = time.time()
+    after = rows_of("SELECT 1 AS one")
+    after_seconds = time.time() - t0
+    t0 = time.time()
+    sort_rows = rows_of("SELECT max(r) AS r FROM (SELECT row_number() OVER (ORDER BY s, id) AS r FROM big)")
+    sort_seconds = time.time() - t0
+    t0 = time.time()
+    group_rows = rows_of("SELECT count(*) AS g, sum(n) AS n FROM (SELECT s, count(*) AS n FROM big GROUP BY s)")
+    group_seconds = time.time() - t0
+    # The last ten rows of a full sort of the table by (s, id): OFFSET keeps no top-N, so the whole table is sorted.
+    t0 = time.time()
+    order_rows = rows_of("SELECT id, s FROM big ORDER BY s, id OFFSET 2999990")
+    order_seconds = time.time() - t0
+    last_ten = sorted(heapq.nlargest(10, ((f"name-{v % 2000000}", v) for v in range(1, 3000001))))
+    spilled_ok = sort_rows == [{"r": 3000000}] and group_rows == [{"g": 2000000, "n": 3000000}] and order_rows is not None and [(r["s"], r["id"]) for r in order_rows] == last_ten
+    stopped_http = status == 503 and sqlstate == "53200" and "out of memory" in body
+    stopped_count = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    # A stop holds the watch for ten seconds (`oom.rs`): each later attempt waits that out, so its refusal is the watch's
+    # and not the pool's, and the counter says so.
+    time.sleep(11)
+    settle()
+    with psycopg.connect(f"host=127.0.0.1 port={port + 10} user=u dbname=lake", autocommit=True) as c:
+        try:
+            c.execute(aggregate).fetchall()
+            stopped_pg = None
+        except psycopg.Error as e:
+            stopped_pg = (e.sqlstate, "nearly out of memory" in str(e))
+    count_pg = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    time.sleep(11)
+    settle()
+    session = "harness-stopped-txn"
+    answer("CREATE TABLE stopped_tx (id BIGINT)")
+    answer("BEGIN", session)
+    answer("INSERT INTO stopped_tx VALUES (1)", session)
+    tx_status, tx_sqlstate, tx_body = answer(aggregate, session)
+    tx_after = answer("SELECT 1 AS one", session)[1]
+    tx_commit = answer("COMMIT", session)[2]
+    tx_count = rows_of("SELECT count(*) AS n FROM stopped_tx")
+    count_tx = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    memory_line = {"array_agg_http": [status, sqlstate, body[:160]], "array_agg_seconds": round(agg_seconds, 1), "peak_mb": agg_peak >> 20,
+                   "settled_after_s": round(agg_settled, 1), "after_stop_seconds": round(after_seconds, 3), "sort_seconds": round(sort_seconds, 1),
+                   "group_seconds": round(group_seconds, 1), "order_seconds": round(order_seconds, 1), "stopped_count": stopped_count,
+                   "array_agg_postgres": stopped_pg, "stopped_count_after_postgres": count_pg, "transaction": [tx_sqlstate, tx_after, tx_commit.strip()[:60], tx_count],
+                   "stopped_count_after_transaction": count_tx}
+    checks["a query the pool doesn't see grow (array_agg over 30M rows) is stopped at the node's memory line (53200), not the node; the node answers after, and spilling queries under the line aren't stopped"] = (
+        stopped_http and agg_peak < 1.5 * (1 << 30) and after == [{"one": 1}] and spilled_ok and stopped_count == 1
+        and stopped_pg == ("53200", True) and count_pg == 2 and tx_sqlstate == "53200" and "nearly out of memory" in tx_body and count_tx == 3
+        and tx_after == "25P02" and '"transaction":"rollback"' in tx_commit.replace(" ", "") and tx_count == [{"n": 0}])
+    node.kill()
     ok = all(checks.values())
     shown = {q: ("same" if same else "DIFFERENT") + (", by ranges" if r else "") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp, r) in shuffles.items()}
-    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "ok": ok}, indent=1))
+    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "sort_errors": sort_errors, "window_refusals": window_refusals, "memory_line": memory_line, "ok": ok}, indent=1))
     if not ok:
         print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
         sys.exit(1)
@@ -3708,6 +3829,11 @@ def flight():
     }
     checks.update(flight_protocol(fport))  # (the protocol's own actions and RPCs, over gRPC)
     checks.update(flight_schemas(fport))  # (the schema each query announces is the one its stream sends)
+    # A number with an exponent: the schema GetFlightInfo announces is the type its rows come back with (decimal(16, 0), not the planner's decimal(1, -15)).
+    exp_info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": "SELECT 1e15 AS x"})), opts("r"))
+    exp_rows = client.do_get(exp_info.endpoints[0].ticket, options=opts("r")).read_all()
+    checks["the FlightInfo schema of SELECT 1e15 AS x is decimal(16, 0), the type its rows come back with"] = \
+        str(exp_info.schema.field("x").type) == str(exp_rows.schema.field("x").type) == "decimal128(16, 0)" and [str(v) for v in exp_rows.column("x").to_pylist()] == ["1000000000000000"]
     node.kill(); follower.kill()
     ok = all(checks.values())
     follow_ms = round((lag[-1] - sent_at) * 1000) if lag else None
@@ -6415,7 +6541,9 @@ def hot():
     it, a key, and NULL-sensitive filters over a column with a batch of NULLs; every answer the
     model's, and the range, the top-N and the key skip batches (`pondra_hot_batches_skipped_total`).
     Then rows tiered from the log, and eight small files held and merged: a hot table's new files are
-    held as they are written, and a merge's file takes the replaced files' place (`Hot::put`, `Hot::forget`)."""
+    held as they are written, and a merge's file takes the replaced files' place (`Hot::put`, `Hot::forget`).
+    Last, a table read cold (a hot budget no file fits: PONDRA_HOT_GB=0.000001) sizes its GROUP BY by its
+    columns' distinct values (`hot::told`)."""
     import re
     lake = new_lake()
     node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1"}).start()
@@ -6508,6 +6636,27 @@ def hot():
         checks["…and the merged rows answer"] = q("SELECT count(*) AS n, sum(a) AS a FROM m") == [{"n": 400000, "a": sum(range(400000))}]
     finally:
         node.kill()
+        clean_up()
+    # A table read cold is told its columns' distinct values as the hot batches are (`hot::told`): a
+    # GROUP BY over a column of three values is sized at three rows, and a join builds those three, not
+    # the 300,000 input rows. PONDRA_HOT_GB=0.000001 is a budget no file fits (about 1 KB), so every read
+    # takes HotFiles' cold branch; with 0 the hot columns are off and reads never reach it.
+    cold = Node(new_lake(), A.port, env={"PONDRA_HOT_GB": "0.000001"}).start()
+    try:
+        cq = lambda s: call(A.port, "POST", "/sql", s.encode(), headers={"x-pondra-session": "cold-groups-1"})  # (SET is the session's)
+        cq("CREATE TABLE li AS SELECT value AS id, CASE value % 3 WHEN 0 THEN 'A' WHEN 1 THEN 'N' ELSE 'R' END AS flag, value % 50 AS q FROM generate_series(1, 300000)")
+        cq("SET datafusion.explain.show_statistics = true")
+        join = "SELECT count(*) AS n FROM li l JOIN (SELECT flag, avg(q) a FROM li GROUP BY flag) g ON l.flag = g.flag"
+        physical = {r["plan_type"]: r["plan"] for r in cq("EXPLAIN " + join)}.get("physical_plan", "")
+        aggs = [l for l in physical.splitlines() if "AggregateExec" in l and "gby=[flag" in l]
+        joins = [l for l in physical.splitlines() if "HashJoinExec" in l]
+        sized = [re.search(r"expected_rows=(\d+)", l) for l in aggs]
+        got = cq(join)
+        seen["a table read cold, as planned"] = {"aggregates": aggs, "joins": joins, "the join's count": got}
+        checks["a table read cold sizes a GROUP BY by its column's distinct values (3 groups), and a join builds those"] = \
+            bool(aggs) and all(m and m.group(1) == "3" for m in sized) and bool(joins) and all("CollectLeft" in l for l in joins) and got == [{"n": 300000}]
+    finally:
+        cold.kill()
         clean_up()
     ok = all(checks.values())
     print(json.dumps({"hot": checks, "seen": seen, "ok": ok}, indent=1))
@@ -7345,6 +7494,45 @@ def found():
         [{"di": -3, "fi": 4}, {"di": 2, "fi": -2}, {"di": 3, "fi": 2}, {"di": 100, "fi": -4}],
         [{"i": 3, "b": 2}, {"i": 3, "b": 5}, {"i": 7, "b": 8}],
         [{"a": 3, "b": -3}]]
+    # A number with an exponent is a whole decimal (`optimize::WholeLiterals`): CAST(1e15 AS DOUBLE) is 1e15, and a table made from
+    # 1e15 is written to files (Parquet has no negative scale). The table's files are listed by the catalog, after a CHECKPOINT.
+    q("CREATE TABLE exps AS SELECT 1e15 AS x, 6.02e23 AS n")
+    q("CHECKPOINT")
+    listed = subprocess.run([BIN, "catalog", "--dir", lake, "t/"], capture_output=True, text=True).stdout
+    exps_files = next((json.loads(l.split(" ", 1)[1])["files"] for l in listed.splitlines() if l.startswith("t/exps ")), [])
+    seen["exps"] = [len(exps_files), q("SELECT CAST(1e15 AS DOUBLE) AS a, 1e15::double AS b, x, n, CAST(n AS DOUBLE) AS c FROM exps")]
+    checks["a number with an exponent is a whole decimal: CAST(1e15 AS DOUBLE) is 1e15, and a table made from 1e15 is written to files"] = (
+        seen["exps"][0] > 0 and seen["exps"][1] == [{"a": 1e15, "b": 1e15, "x": 1000000000000000, "n": 602000000000000000000000, "c": 6.02e23}])
+    # A materialized view's table takes its columns' types as the query runs, too: 1e15 is a whole decimal there as well.
+    q("CREATE MATERIALIZED VIEW exps_v AS SELECT x, 1e15 AS y FROM exps")
+    q("CHECKPOINT")
+    seen["exps_v"] = q("SELECT y FROM exps_v")
+    checks["a materialized view's column of 1e15 is a whole decimal too: its table is written and reads 1000000000000000"] = seen["exps_v"] == [{"y": 1000000000000000}]
+    # The other ways a table is made from a query take its columns the same way (run_schema): a bulk INSERT into a new
+    # table, a task's target table made when the task is registered, COPY TO a Delta folder (read back by read_delta).
+    call(port, "POST", "/insert/exps_bulk?job=exps-1", b"SELECT 1e15 AS x")
+    seen["exps_bulk"] = q("SELECT x FROM exps_bulk")
+    checks["POST /insert/{t} from SELECT 1e15 AS x into a new table reads 1000000000000000"] = seen["exps_bulk"] == [{"x": 1000000000000000}]
+    q("CREATE TABLE exps_src (id BIGINT)")
+    call(port, "POST", "/tasks/exps_copy", json.dumps({"source": "exps_src", "target": "exps_tgt", "sql": "SELECT id, 1e15 AS y FROM exps_src"}).encode())
+    q("INSERT INTO exps_src VALUES (1)")
+    want = [{"lo": 1000000000000000, "hi": 1000000000000000, "n": 1}]
+    seen["exps_task"] = until(lambda: _try(lambda: q("SELECT min(y) AS lo, max(y) AS hi, count(*) AS n FROM exps_tgt")), want, 30)
+    checks["a task's target table made from 1e15 reads 1000000000000000"] = seen["exps_task"] == want
+    delta = os.path.join(tempfile.mkdtemp(prefix="pondra-exps-"), "delta")
+    copied = subprocess.run([BIN, "sql", "--dir", lake, f"COPY (SELECT 1e15 AS x) TO '{delta}' (FORMAT delta)"], capture_output=True, text=True, env=node.env)
+    back = subprocess.run([BIN, "sql", "--dir", lake, f"SELECT CAST(x AS VARCHAR) AS s, arrow_typeof(x) AS t FROM read_delta('{delta}')"], capture_output=True, text=True, env=node.env)
+    seen["exps_delta"] = [copied.returncode, back.returncode, back.stdout[-300:], back.stderr[-300:]]
+    checks["COPY (SELECT 1e15 AS x) TO a Delta folder reads back 1000000000000000 through read_delta"] = \
+        copied.returncode == 0 and back.returncode == 0 and "| 1000000000000000 " in back.stdout and "Decimal128(16, 0)" in back.stdout
+    # A view fed by a topic (this node's Kafka port): the shard's batches are the types the query runs with, so the view fills.
+    q("CREATE TABLE exps_ticks (id BIGINT)")
+    q("INSERT INTO exps_ticks VALUES (1), (2)")
+    q(f"CREATE SECRET exps_ticks_k (TYPE kafka, SECURITY_PROTOCOL 'PLAINTEXT', SCOPE 'kafka://127.0.0.1:{port + 20}')")
+    q(f"CREATE MATERIALIZED VIEW exps_fed AS SELECT CAST(value->>'id' AS BIGINT) AS id, 1e15 AS y FROM 'kafka://127.0.0.1:{port + 20}/exps_ticks'")
+    want = [{"lo": 1000000000000000, "hi": 1000000000000000, "n": 2}]
+    seen["exps_fed"] = until(lambda: _try(lambda: q("SELECT min(y) AS lo, max(y) AS hi, count(*) AS n FROM exps_fed")), want, 30)
+    checks["a view fed by a topic with 1e15 fills with 1000000000000000 (two records)"] = seen["exps_fed"] == want
     node.kill(); locked.kill()
     ok = all(checks.values())
     print(json.dumps({"found": checks, "ok": ok}, indent=1))
@@ -8910,6 +9098,170 @@ def guarded():
     c.kill()
     ok = all(checks.values())
     print(json.dumps({"guarded": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+def served():
+    """A lake's store served by the node that holds it (ADR-072 §8, invariant 299): `pondra://host:port`
+    opens the store through that node's door, and `--serve-store` makes the holder, which leads the lake.
+    Followers never claim a term; one whose holder stops waits for it and answers again once it is back;
+    a follower killed and started again reads every row; a lake in memory started again shows none of its
+    old rows. Refused by name: a superuser's token at the door, a node without --serve-store, a reader
+    holder, a folder of lakes, a second holder, a pondra:// node with no admin token."""
+    T, R = "adm-" + uuid.uuid4().hex[:12], "rd-" + uuid.uuid4().hex[:12]  # (the nodes' admin token, and a read token)
+    H = {"Authorization": f"Bearer {T}"}
+    P = A.port
+    pa, pb, pc, pd, pe, pm, px = P, P + 1, P + 2, P + 3, P + 4, P + 5, P + 6
+    checks, info = {}, {}
+
+    def mk():  # (a folder of its own, removed when the run exits)
+        d = tempfile.mkdtemp(prefix="pondra-")
+        LAKES.append(d)
+        return d
+
+    def sqlt(port, q, path="/sql"):  # (every call carries the admin token: the nodes are tokened)
+        return call(port, "POST", path, q.encode(), headers=H)
+
+    def answer(port, q):  # (the rows, or the error's text: a node restarting refuses or doesn't answer)
+        try:
+            return sqlt(port, q)
+        except Exception as e:
+            return f"ERROR {e}"
+
+    def count(port, table="t"):
+        r = answer(port, f"SELECT count(*) AS n FROM {table}")
+        return r[0]["n"] if isinstance(r, list) else r
+
+    def door_of(port, token=None):  # (the store's door, read with http.client: its listing is NDJSON)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("GET", "/cluster/store?prefix=", b"", {"Authorization": f"Bearer {token}"} if token else {})
+        r = c.getresponse()
+        return r.status, r.read().decode(errors="replace")
+
+    def term_files(folder):  # (the term records of a lake: a follower writes none)
+        d = os.path.join(folder, "cluster", "term")
+        return {f: open(os.path.join(d, f), "rb").read() for f in sorted(os.listdir(d))} if os.path.isdir(d) else {}
+
+    def start_later(node):  # (a node that waits for its holder doesn't return from start: started in a thread)
+        box = []
+        def run():
+            try:
+                box.append(node.start(tries=1))
+            except Exception as e:
+                box.append(e)
+        threading.Thread(target=run, daemon=True).start()
+        return box
+
+    def refused(args, msg, env=None):  # (a node refused at its start exits non-zero, and says why: `msg` is in what it said)
+        r = subprocess.run([BIN, "serve", *args], timeout=30, capture_output=True, env=env)
+        said = (r.stderr + r.stdout).decode(errors="replace")
+        return {"exit": r.returncode, "match": msg in said, "said": said[-300:]}
+
+    noadmin = {k: v for k, v in os.environ.items() if k != "PONDRA_ADMIN_TOKEN"}
+    drop = os.path.join(mk(), "drop-beats.txt")  # (the followers the holder refuses to answer: PONDRA_DROP_BEATS)
+    open(drop, "w").close()
+    folder = mk()
+    holder_env = {"PONDRA_DROP_BEATS": drop}
+    A_node = Node(folder, pa, admin_token=T, serve_store=True, env=holder_env, tier_secs=1).start()  # (tiered each second: the spread check needs files)
+    cenv, benv = {"PONDRA_CACHE_DIR": mk()}, {"PONDRA_CACHE_DIR": mk()}  # (each follower's SSD tier is its own)
+    B_node = Node(f"pondra://127.0.0.1:{pa}", pb, admin_token=T, env=benv).start()
+    C_node = Node(f"pondra://127.0.0.1:{pa}", pc, admin_token=T, env=cenv).start()
+    checks["the holder's door answers the admin token with 200 (a node's store, listed)"] = door_of(pa, T)[0] == 200
+    checks["the holder leads, and its followers follow it (role on /stats)"] = \
+        call(pa, "GET", "/stats", headers=H)["role"] == "leader" and call(pb, "GET", "/stats", headers=H)["role"] == "follower" and call(pc, "GET", "/stats", headers=H)["role"] == "follower"
+    sqlt(pa, "CREATE TABLE t (k BIGINT, who VARCHAR)")
+    for lo, hi in ((0, 334), (334, 668), (668, 1000)):
+        sqlt(pa, "INSERT INTO t VALUES " + ",".join(f"({i}, 'a')" for i in range(lo, hi)))
+    checks["1,000 rows written on the holder are read on the holder and both followers"] = all(until(lambda p=p: count(p), 1000, 10) == 1000 for p in (pa, pb, pc))
+    sqlt(pc, "INSERT INTO t VALUES " + ",".join(f"({i}, 'c')" for i in range(1000, 1500)))
+    sqlt(pb, "INSERT INTO t VALUES " + ",".join(f"({i}, 'b')" for i in range(1500, 2000)))
+    checks["500 written on each follower (forwarded to the holder): 2,000 on every node"] = all(until(lambda p=p: count(p), 2000, 10) == 2000 for p in (pa, pb, pc))
+    by_who = "SELECT who, count(*) AS n, sum(k) AS s FROM t GROUP BY who ORDER BY who"
+    # (a follower's view of the cluster comes from its first heartbeat: a second or two after it starts)
+    until(lambda: all(len(call(p, "GET", "/stats", headers=H)["nodes"]) == 3 for p in (pa, pb, pc)), True, 20)
+    plain = answer(pb, by_who)
+    spread_before = metrics_of(pb, headers=H)["pondra_spread_queries_total"]
+    spread = call(pb, "POST", "/sql?spread=1", by_who.encode(), headers=H)
+    checks["?spread=1 on a follower answers what it answers alone, and spreads over the three nodes"] = \
+        spread == plain and metrics_of(pb, headers=H)["pondra_spread_queries_total"] > spread_before
+    info["answer"] = plain
+    # A follower that loses its holder for 10 s (its heartbeats refused) claims no term, and the holder
+    # still leads that term when it answers again.
+    terms, term_before = term_files(folder), call(pa, "GET", "/stats", headers=H)["term"]
+    open(drop, "w").write(f"127.0.0.1:{pb}\n127.0.0.1:{pc}\n")
+    time.sleep(10)
+    open(drop, "w").close()
+    checks["a follower that loses its holder for 10 s claims no term: the term records are as they were, the holder leads the same term"] = \
+        term_files(folder) == terms and call(pa, "GET", "/stats", headers=H)["term"] == term_before \
+        and until(lambda: count(pb), 2000, 15) == 2000 and until(lambda: count(pc), 2000, 15) == 2000
+    C_node.kill()
+    C_node = Node(f"pondra://127.0.0.1:{pa}", pc, admin_token=T, env=cenv).start()
+    checks["a follower killed and started again follows its holder and reads every row (2,000)"] = until(lambda: count(pc), 2000, 30) == 2000
+    # The holder stops (SIGTERM: it steps down, and nobody takes a term). Its followers wait for it.
+    A_node.p.send_signal(signal.SIGTERM)
+    A_node.p.wait(timeout=120)
+    time.sleep(5)
+    checks["the holder stopped: its followers stay up, and no follower claims a term"] = B_node.alive() and C_node.alive() and term_files(folder) == terms
+    C_node.kill()
+    C_node = Node(f"pondra://127.0.0.1:{pa}", pc, admin_token=T, env=cenv)
+    box = start_later(C_node)
+    time.sleep(5)
+    checks["a follower killed while its holder is away waits for it (alive, saying so), and does not start on its own"] = \
+        C_node.p is not None and C_node.alive() and f"waiting for pondra://127.0.0.1:{pa} to answer" in open(C_node.log).read() and not box
+    A_node = Node(folder, pa, admin_token=T, serve_store=True, env=holder_env).start()
+    checks["the holder started again leads, and its followers answer every row again within a minute"] = \
+        call(pa, "GET", "/stats", headers=H)["role"] == "leader" and until(lambda: count(pb), 2000, 60) == 2000 and until(lambda: count(pc), 2000, 60) == 2000
+    checks["the follower that waited started once its holder answered"] = until(lambda: bool(box), True, 30) and isinstance(box[0], Node)
+    C_node = box[0] if box and isinstance(box[0], Node) else C_node
+    sqlt(pb, "INSERT INTO t VALUES (2000, 'b')")
+    checks["a write on a follower after that goes through the holder: 2,001 on every node"] = all(until(lambda p=p: count(p), 2001, 20) == 2001 for p in (pa, pb, pc))
+    # A lake in memory: its holder stops, and a new one (a new, empty lake) starts on the same address.
+    M = Node(":memory:", pm, admin_token=T, serve_store=True).start()
+    E = Node(f"pondra://127.0.0.1:{pm}", pe, admin_token=T, env={"PONDRA_CACHE_DIR": mk()}).start()
+    sqlt(pe, "CREATE TABLE m (x BIGINT)")
+    sqlt(pe, "INSERT INTO m VALUES " + ",".join(f"({i})" for i in range(10)))
+    checks["a lake in memory, written and read through its follower"] = until(lambda: count(pe, "m"), 10, 15) == 10
+    M.p.send_signal(signal.SIGTERM)
+    M.p.wait(timeout=120)
+    time.sleep(8)  # (away past the lease: the follower looks again only once it lapses, `follow`)
+    M = Node(":memory:", pm, admin_token=T, serve_store=True).start()
+
+    def gone(port):  # (the old lake's table isn't there, or holds no rows)
+        r = answer(port, "SELECT count(*) AS n FROM m")
+        if isinstance(r, str):
+            return any(w in r for w in ("not found", "no table", "does not exist"))
+        return r == [{"n": 0}]
+    checks["a lake in memory started again: its follower shows none of the old lake's rows"] = until(lambda: gone(pe), True, 60)
+    info["memory follower"] = answer(pe, "SELECT count(*) AS n FROM m")
+    # Refusals: a superuser's token at the door, a node without --serve-store, a reader holder.
+    D = Node(mk(), pd, admin_token=T, read_token=R, serve_store=True).start()
+    sqlt(pd, "CREATE USER su PASSWORD 'su-password-1' SUPERUSER")
+    su = sqlt(pd, "CREATE TOKEN su_t FOR USER su")["token"]
+    d_said = {"no token": door_of(pd), "a read token": door_of(pd, R), "a superuser's token": door_of(pd, su), "the admin token": door_of(pd, T)}
+    info["holder's door refusals"] = {k: [v[0], v[1][:160]] for k, v in d_said.items()}
+    checks["the holder's door: no token 401; a read token refused; a superuser's token 403 saying a user's token can't open it; the admin token 200"] = \
+        d_said["no token"][0] == 401 and d_said["a read token"][0] in (401, 403) and d_said["a superuser's token"][0] == 403 \
+        and "a user's token" in d_said["a superuser's token"][1] and d_said["the admin token"][0] == 200
+    X = Node(mk(), px, admin_token=T).start()  # (a node on its own folder, without --serve-store)
+    checks["a node without --serve-store refuses its store's door, and says how to open it"] = \
+        door_of(px, T)[0] == 403 and "--serve-store" in door_of(px, T)[1]
+    at = f"--addr=127.0.0.1:{px + 10}"  # (a port of its own: nothing here starts, and the refusals come first)
+    refusals = {  # (each named: its command line, and the words its refusal says)
+        "a folder of lakes": refused(["--serve-store", "--lakes", mk(), at, "--admin-token", T], "--serve-store serves one lake's store"),
+        "a reader holder": refused(["--serve-store", "--reader", "--dir", mk(), at, "--admin-token", T], "a --reader never leads"),
+        "an s3 URL": refused(["--serve-store", "--dir", "s3://b/x", at, "--admin-token", T], "reached by its own URL"),
+        "no admin token": refused(["--serve-store", "--dir", mk(), at], "needs --admin-token", env=noadmin),
+        "a pondra:// lake with a path": refused(["--dir", f"pondra://127.0.0.1:{pa}/x", at, "--admin-token", T], "named by pondra://host:port alone"),
+        "a pondra:// lake with no token": refused(["--dir", f"pondra://127.0.0.1:{pa}", at], "admin token its holder has", env=noadmin),
+        "a second holder": refused(Node(folder, px + 11, admin_token=T, serve_store=True).args[2:], "is led by"),
+    }
+    info["refusals"] = refusals
+    checks["refused at the start, exit non-zero and saying why: a folder of lakes, a reader holder, an s3 URL, no admin token, a pondra:// lake with a path or no token, a second holder"] = \
+        all(r["exit"] != 0 and r["match"] for r in refusals.values())
+    for n in (A_node, B_node, C_node, M, E, D, X):
+        n.kill()
+    ok = all(checks.values())
+    print(json.dumps({"served": checks, "ok": ok, "info": info}, indent=1, default=str))
     return ok
 
 
@@ -20596,12 +20948,12 @@ SECS = {"memory": 240, "waits": 99, "sso": 89, "stopped": 87, "guesses": 45, "ba
         "files": 10, "followers": 10, "guarded": 10, "begin": 9, "bykey": 9, "clients": 9, "flows": 9,
         "guard": 9, "hot": 9, "schemas": 9, "temps": 9, "catalogs": 8, "clusters": 8, "columns": 8,
         "fills": 8, "serverless": 8, "alter": 7, "fence": 7, "loads": 7, "safety": 7, "sequences": 7,
-        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60}
+        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60, "served": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -20633,7 +20985,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -20646,7 +20998,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

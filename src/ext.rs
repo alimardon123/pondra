@@ -13,7 +13,7 @@ use crate::store::{json, DataFile, Lake, TableMeta};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
-use datafusion::datasource::file_format::{csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat, FileFormat};
+use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::sql::sqlparser::ast::Value;
 use futures::{StreamExt, TryStreamExt};
@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 
 pub use crate::ext_names::{attached_table, is, names, spec, Attached, Spec};
 pub(crate) use crate::ext_names::{format_of, quoted, scheme};
+use crate::ext_names::{file_format, glob_at, listing_url};
 
 tokio::task_local! {
     /// The caller is the program that started this node (the shell, `connect()` of a lake: `server::owner`),
@@ -212,22 +213,7 @@ fn located(l: &str) -> Result<String> {
 /// An error in words for whoever sent the statement: its causes after it, each said once
 /// (DataFusion repeats a cause's words in its own), files named as SQL named them.
 pub fn said(e: &anyhow::Error) -> String {
-    let mut out = String::new();
-    for c in e.chain().map(|c| c.to_string()) {
-        // Unwrap DataFusion's and Arrow's wrappers, repeatedly, so the inner message — the part a
-        // user can act on — leads, not an engine-internal label.
-        let mut c = c;
-        while let Some(inner) = ["External error: ", "Error during planning: ", "Arrow error: ", "Execution error: "]
-            .iter()
-            .find_map(|p| c.strip_prefix(p))
-        {
-            c = inner.to_string();
-        }
-        if !out.contains(c.trim()) {
-            out += if out.is_empty() { "" } else { ": " };
-            out += &c;
-        }
-    }
+    let out = crate::codes::words(e);
     match crate::auth::shows_code() {
         true => readable(&out),
         false => crate::python::unquoted(&readable(&out)), // (a Python routine's lines, quoted wherever its batch ran: S27)
@@ -551,20 +537,6 @@ fn hive_type(values: &[String]) -> &'static str {
     }
 }
 
-/// Where a URL's glob starts (`*`, `[`; `?` too, but not in a web address: its query).
-fn glob_at(u: &str) -> Option<usize> {
-    let web = u.starts_with("http");
-    u.char_indices().find(|(_, c)| *c == '*' || *c == '[' || (*c == '?' && !web)).map(|(i, _)| i)
-}
-
-/// A URL as DataFusion lists it, its glob split off (DataFusion splits only paths' globs).
-fn listing_url(u: &str) -> Result<ListingTableUrl> {
-    let Some(at) = glob_at(u).filter(|_| scheme(u).is_some_and(|s| s != "file")) else { return Ok(ListingTableUrl::parse(u)?) };
-    let cut = u[..at].rfind('/').map_or(0, |j| j + 1);
-    let (prefix, glob) = u.split_at(cut);
-    Ok(ListingTableUrl::try_new(url::Url::parse(prefix)?, Some(glob::Pattern::new(glob)?))?)
-}
-
 fn url_path(o: &object_store_df::ObjectMeta) -> String { format!("/{}", o.location) }
 
 /// A file as a table's `DataFile`: its rows and exact column ranges when its footer says.
@@ -600,38 +572,6 @@ async fn inferred(format: &dyn FileFormat, state: &dyn datafusion::catalog::Sess
         }
         r => Ok(r?),
     }
-}
-
-fn file_format(spec: &Spec) -> Result<Arc<dyn FileFormat>> {
-    let o = |k: &str| spec.options.get(k).map(String::as_str);
-    let byte = |k: &str, v: &str| -> Result<u8> { v.bytes().next().filter(|_| v.len() == 1).with_context(|| format!("{k} is one character, not {v:?}")) };
-    Ok(match spec.format.as_str() {
-        "parquet" => Arc::new(ParquetFormat::default()),
-        "json" => Arc::new(JsonFormat::default()),
-        "arrow" => Arc::new(datafusion::datasource::file_format::arrow::ArrowFormat),
-        "csv" => {
-            let mut f = CsvFormat::default().with_has_header(o("header").is_none_or(|h| h != "false"));
-            if let Some(d) = o("delim").or(o("sep")).or(o("delimiter")) {
-                f = f.with_delimiter(byte("delim", d)?);
-            }
-            if let Some(q) = o("quote") {
-                f = f.with_quote(byte("quote", q)?);
-            }
-            if let Some(e) = o("escape") {
-                f = f.with_escape(Some(byte("escape", e)?));
-            }
-            if let Some(c) = o("comment") {
-                f = f.with_comment(Some(byte("comment", c)?)); // (lines starting with it are skipped)
-            }
-            match o("new_line") {
-                None | Some("\n" | "\r\n" | "\\n" | "\\r\\n") => {} // (either, as read)
-                Some("\r" | "\\r") => f = f.with_terminator(Some(b'\r')),
-                Some(t) => bail!("new_line is \\n, \\r\\n or \\r, not {t:?}"),
-            }
-            Arc::new(f)
-        }
-        f => bail!("files as {f}: parquet, csv, json or arrow"),
-    })
 }
 
 /// The rows of `files` of an `ext:` table, as `schema`: DataFusion's own readers, without the hot
