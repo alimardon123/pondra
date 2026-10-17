@@ -56,6 +56,9 @@ pub struct Cluster {
     cut_off: std::sync::atomic::AtomicBool,       // leader: it can't reach the bucket (`keep_alive`)
     others: std::sync::atomic::AtomicBool,        // leader cut off: another node was there meanwhile
     may_lead: bool, // false: our store is another node's (pondra://), which leads: we never claim a term (`served.rs`)
+    /// This node serves its lake's store (`--serve-store`, read once at its start): it holds the lake's only copy,
+    /// so it never steps aside (`cut_off`), and its followers reach the store through its door (`served.rs`).
+    pub serves_store: bool,
     /// The term was ours before this process started, and taken back (`coming_back`): its mark is as old as the
     /// restart, so `keep_alive` marks it at once.
     taken_back: bool,
@@ -64,8 +67,9 @@ pub struct Cluster {
 impl Cluster {
     /// Follow a live leader; lead if nobody leads (or the latest term is ours, and we're coming back
     /// from our own restart: `coming_back`). `may_lead` false: our store is another node's (`pondra://`),
-    /// which leads its lake; we follow it, and wait for it, and never claim a term (invariant 299).
-    pub async fn join(store: &Store, addr: &str, reader: bool, may_lead: bool) -> Result<Arc<Cluster>> {
+    /// which leads its lake; we follow it, and wait for it, and never claim a term (invariant 299). `serves_store`
+    /// is the node's own `--serve-store` (`served.rs`), kept for `cut_off`.
+    pub async fn join(store: &Store, addr: &str, reader: bool, may_lead: bool, serves_store: bool) -> Result<Arc<Cluster>> {
         let (mut said, mut taken_back) = (false, false);
         let leader = loop {
             let latest_term = match latest(store).await {
@@ -115,7 +119,7 @@ impl Cluster {
         // its first answer, not 30 s later, so the restart check in `follow` can fire)
         let last_ok = Mutex::new(if may_lead { Instant::now() + STARTUP } else { Instant::now() }); // until we first hear from the leader
         let (beats, shard_runs, heard) = (Default::default(), Default::default(), Default::default());
-        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default(), others: Default::default(), may_lead, taken_back }))
+        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back }))
     }
 
     pub fn is_leader(&self) -> bool { self.leader.addr == self.addr }
@@ -170,7 +174,7 @@ impl Cluster {
     pub fn cut_off(&self) -> bool {
         // (a holder never steps aside: it is the store's only copy, and nobody else could lead; a store it
         // can't reach is for the holder to fix, while its followers wait)
-        !crate::env::flag("PONDRA_SERVE_STORE") && self.unreached() && (self.others.load(std::sync::atomic::Ordering::Relaxed) || self.nodes().len() > 1)
+        !self.serves_store && self.unreached() && (self.others.load(std::sync::atomic::Ordering::Relaxed) || self.nodes().len() > 1)
     }
 
     fn unreached(&self) -> bool { self.cut_off.load(std::sync::atomic::Ordering::Relaxed) }

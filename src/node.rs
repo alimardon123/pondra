@@ -125,7 +125,8 @@ impl Node {
         // (the spill folders of processes that ended, swept beside the start and not on it: a crashed one's may be
         // gigabytes, and a cold start waits for nothing but what serving needs, invariant 182)
         std::thread::spawn(crate::memory::sweep_all);
-        crate::served::checked(&dir, reader, auth.admin_set(), crate::env::flag("PONDRA_SERVE_STORE"))?; // (who may serve or open a store: `served.rs`)
+        let serve_store = crate::env::flag("PONDRA_SERVE_STORE"); // (read once, here: the checks, the cluster and the store's door all take this start's answer)
+        crate::served::checked(&dir, reader, auth.admin_set(), serve_store)?; // (who may serve or open a store: `served.rs`)
         let (_, store, _) = store::open_store(&dir)?;
         let t_start = std::time::Instant::now();
         let tr = |w: &str| store::trace(w, t_start);
@@ -135,10 +136,10 @@ impl Node {
             // (a lake whose node is away, or not up yet: wait for it, as a follower waits for its leader)
             crate::served::wait_up(at.trim_end_matches('/')).await;
         }
-        let cluster = cluster::Cluster::join(&store, &addr, reader, !store::served(&dir)).await?;
+        let cluster = cluster::Cluster::join(&store, &addr, reader, !store::served(&dir), serve_store).await?;
         let leader = cluster.is_leader();
         // (the node that serves its store leads it: its followers' store is in this process, invariant 299)
-        anyhow::ensure!(!crate::env::flag("PONDRA_SERVE_STORE") || leader, "--serve-store: {dir} is led by the node at {}; the node that serves a lake's store leads it (stop that node first)", cluster.leader.addr);
+        anyhow::ensure!(!serve_store || leader, "--serve-store: {dir} is led by the node at {}; the node that serves a lake's store leads it (stop that node first)", cluster.leader.addr);
         if leader {
             // (taken before the trace below, so a stop that follows the trace line finds it)
             let _ = held.term.set((store.clone(), cluster.leader.n)); // (given back by a stop from here on: `Held::stop`)

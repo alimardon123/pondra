@@ -95,10 +95,10 @@ pub fn door(store: Store) -> Router {
 }
 
 /// The store door as a node mounts it: its lake's store, to whoever runs the nodes (their admin token;
-/// a user's, even a superuser's, is not), when it was started with --serve-store; otherwise a door
-/// that says how to open it.
-pub fn door_for(store: Store) -> Router {
-    if crate::env::flag("PONDRA_SERVE_STORE") {
+/// a user's, even a superuser's, is not), when the node serves its store (`serving`, read once at its
+/// start: `Cluster::serves_store`); otherwise a door that says how to open it.
+pub fn door_for(store: Store, serving: bool) -> Router {
+    if serving {
         return door(store).layer(middleware::from_fn(operator_only));
     }
     Router::new().fallback(|| async { refused("this node doesn't serve its lake's store: start it with --serve-store") })
