@@ -6,11 +6,11 @@
 //! the ones that look odd: a path that reaches nothing changes nothing, and only a path element that is NULL or not an
 //! integer where an array is, or a path into a scalar, is refused. `pg_json::operator` plans `-` and `#-` onto these.
 use crate::codes::coded;
-use crate::pg_catalog::{function, marked, texts_out};
+use crate::pg_catalog::{function, marked};
 use crate::pg_json::{index_of, is_integer, lists};
-use crate::pg_json_make::{depth_check, fail, find, in_jsonb_order, json_string, parse, refuse, write, Node};
+use crate::pg_json_make::{as_text, depth_check, fail, find, in_jsonb_order, is_null_at, json_string, parse, per_row, refuse, text_at, write, Node};
 use crate::types::json_refusal;
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringArray};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Int64Type};
 use datafusion::common::Result;
@@ -49,106 +49,112 @@ pub fn register(ctx: &SessionContext) {
 /// `jsonb_set(target, path, new_value [, create])`: the value at the path is replaced, or made when `create` (true
 /// by default) and the path's last step is new.
 fn set_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
-    let (docs, values) = (texts(&a[0])?, texts(&a[2])?);
-    let (docs, values) = (docs.as_string::<i32>(), values.as_string::<i32>());
+    let (docs, values) = (as_text(&a[0])?, as_text(&a[2])?);
     let paths = lists(&a[1]).map_err(fail)?;
     let create = flags(a, 3, n, true)?;
-    rows(n, |i| {
-        let (Some(doc), Some(path), Some(value), Some(create)) = (text_at(docs, i), &paths[i], text_at(values, i), create[i]) else {
-            return Ok(None);
-        };
-        edit_doc(doc, path, Edit::Set { value: parse(value)?, create }).map(Some)
+    per_row(n, |i, out| {
+        let (Some(path), Some(create)) = (&paths[i], create[i]) else { return Ok(false) };
+        if is_null_at(&docs, i) || is_null_at(&values, i) {
+            return Ok(false);
+        }
+        edit_doc(out, text_at(&docs, i), path, Edit::Set { value: parse(text_at(&values, i))?, create })?;
+        Ok(true)
     })
 }
 
 /// `jsonb_insert(target, path, new_value [, insert_after])`: a new member or element at the path; `insert_after` (false
 /// by default) puts an element after the step it names. A key that is there already is refused.
 fn insert_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
-    let (docs, values) = (texts(&a[0])?, texts(&a[2])?);
-    let (docs, values) = (docs.as_string::<i32>(), values.as_string::<i32>());
+    let (docs, values) = (as_text(&a[0])?, as_text(&a[2])?);
     let paths = lists(&a[1]).map_err(fail)?;
     let after = flags(a, 3, n, false)?;
-    rows(n, |i| {
-        let (Some(doc), Some(path), Some(value), Some(after)) = (text_at(docs, i), &paths[i], text_at(values, i), after[i]) else {
-            return Ok(None);
-        };
-        edit_doc(doc, path, Edit::Insert { value: parse(value)?, after }).map(Some)
+    per_row(n, |i, out| {
+        let (Some(path), Some(after)) = (&paths[i], after[i]) else { return Ok(false) };
+        if is_null_at(&docs, i) || is_null_at(&values, i) {
+            return Ok(false);
+        }
+        edit_doc(out, text_at(&docs, i), path, Edit::Insert { value: parse(text_at(&values, i))?, after })?;
+        Ok(true)
     })
 }
 
 /// `jsonb_concat(a, b)`: jsonb's `||`.
 fn concat_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
-    let (lefts, rights) = (texts(&a[0])?, texts(&a[1])?);
-    let (lefts, rights) = (lefts.as_string::<i32>(), rights.as_string::<i32>());
-    rows(n, |i| match (text_at(lefts, i), text_at(rights, i)) {
-        (Some(l), Some(r)) => concat(l, r).map(Some),
-        _ => Ok(None),
+    let (lefts, rights) = (as_text(&a[0])?, as_text(&a[1])?);
+    per_row(n, |i, out| {
+        if is_null_at(&lefts, i) || is_null_at(&rights, i) {
+            return Ok(false);
+        }
+        concat_into(out, text_at(&lefts, i), text_at(&rights, i))?;
+        Ok(true)
     })
 }
 
 /// `jsonb_delete(doc, key)`, `jsonb_delete(doc, index)` and `jsonb_delete(doc, keys)`: `-`, by the right side's type.
 fn delete_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
-    let docs = texts(&a[0])?;
-    let docs = docs.as_string::<i32>();
+    let docs = as_text(&a[0])?;
     if is_integer(a[1].data_type()) {
         let indexes = cast(&a[1], &DataType::Int64)?;
         let indexes = indexes.as_primitive::<Int64Type>();
-        return rows(n, |i| match (text_at(docs, i), indexes.is_valid(i).then(|| indexes.value(i))) {
-            (Some(doc), Some(at)) => delete_index(doc, at).map(Some),
-            _ => Ok(None),
+        return per_row(n, |i, out| {
+            if is_null_at(&docs, i) || indexes.is_null(i) {
+                return Ok(false);
+            }
+            delete_index_into(out, text_at(&docs, i), indexes.value(i))?;
+            Ok(true)
         });
     }
     if matches!(a[1].data_type(), DataType::List(_) | DataType::LargeList(_)) {
         let keys = lists(&a[1]).map_err(fail)?;
-        return rows(n, |i| match (text_at(docs, i), &keys[i]) {
-            (Some(doc), Some(keys)) => {
+        return per_row(n, |i, out| match &keys[i] {
+            Some(keys) if !is_null_at(&docs, i) => {
                 let names: Vec<&str> = keys.iter().flatten().map(String::as_str).collect();
-                delete_keys(doc, &names).map(Some)
+                delete_keys_into(out, text_at(&docs, i), &names)?;
+                Ok(true)
             }
-            _ => Ok(None),
+            _ => Ok(false),
         });
     }
-    let keys = texts(&a[1])?;
-    let keys = keys.as_string::<i32>();
-    rows(n, |i| match (text_at(docs, i), text_at(keys, i)) {
-        (Some(doc), Some(key)) => delete_keys(doc, &[key]).map(Some),
-        _ => Ok(None),
+    let keys = as_text(&a[1])?;
+    per_row(n, |i, out| {
+        if is_null_at(&docs, i) || is_null_at(&keys, i) {
+            return Ok(false);
+        }
+        delete_keys_into(out, text_at(&docs, i), &[text_at(&keys, i)])?;
+        Ok(true)
     })
 }
 
 /// `jsonb_delete_path(doc, path)`: `#-`.
 fn delete_path_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
-    let docs = texts(&a[0])?;
-    let docs = docs.as_string::<i32>();
+    let docs = as_text(&a[0])?;
     let paths = lists(&a[1]).map_err(fail)?;
-    rows(n, |i| match (text_at(docs, i), &paths[i]) {
-        (Some(doc), Some(path)) => edit_doc(doc, path, Edit::Delete).map(Some),
-        _ => Ok(None),
+    per_row(n, |i, out| match &paths[i] {
+        Some(path) if !is_null_at(&docs, i) => {
+            edit_doc(out, text_at(&docs, i), path, Edit::Delete)?;
+            Ok(true)
+        }
+        _ => Ok(false),
     })
 }
 
-fn strip_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
-    let docs = texts(&a[0])?;
-    let docs = docs.as_string::<i32>();
-    rows(n, |i| text_at(docs, i).map(strip_nulls).transpose())
+fn strip_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> { one_doc(a, n, strip_nulls_into) }
+
+fn strip_json_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> { one_doc(a, n, strip_json_into) }
+
+fn pretty_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> { one_doc(a, n, pretty_into) }
+
+/// A function of one document: `body` writes its answer for each document, and the answer is NULL where it is NULL.
+fn one_doc(a: &[ArrayRef], n: usize, body: impl Fn(&mut String, &str) -> Result<()>) -> Result<ArrayRef> {
+    let docs = as_text(&a[0])?;
+    per_row(n, |i, out| {
+        if is_null_at(&docs, i) {
+            return Ok(false);
+        }
+        body(out, text_at(&docs, i))?;
+        Ok(true)
+    })
 }
-
-fn strip_json_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
-    let docs = texts(&a[0])?;
-    let docs = docs.as_string::<i32>();
-    rows(n, |i| text_at(docs, i).map(strip_json).transpose())
-}
-
-fn pretty_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
-    let docs = texts(&a[0])?;
-    let docs = docs.as_string::<i32>();
-    rows(n, |i| text_at(docs, i).map(pretty).transpose())
-}
-
-/// An argument as text, whichever string type it came as.
-fn texts(a: &ArrayRef) -> Result<ArrayRef> { Ok(cast(a, &DataType::Utf8)?) }
-
-fn text_at(s: &StringArray, i: usize) -> Option<&str> { (!s.is_null(i)).then(|| s.value(i)) }
 
 /// An optional boolean argument per row: `default` where the argument is absent. Its NULL is NULL.
 fn flags(a: &[ArrayRef], at: usize, n: usize, default: bool) -> Result<Vec<Option<bool>>> {
@@ -158,12 +164,7 @@ fn flags(a: &[ArrayRef], at: usize, n: usize, default: bool) -> Result<Vec<Optio
     }
 }
 
-/// One value per row: `row(i)` is row `i`'s text, None where it is NULL.
-fn rows(n: usize, row: impl Fn(usize) -> Result<Option<String>>) -> Result<ArrayRef> {
-    Ok(texts_out((0..n).map(row).collect::<Result<Vec<_>>>()?))
-}
-
-// ---- the changes, on one document's text: each returns the answer's text ----
+// ---- the changes, on one document's text: each writes the answer's text into `out` ----
 
 /// What a path does to the value it reaches.
 enum Edit<'a> {
@@ -211,20 +212,20 @@ impl<'a> Edit<'a> {
     }
 }
 
-/// The document with `edit` made at `path`. An empty path is the document itself (as jsonb writes it); a path that
-/// reaches nothing leaves it as it is. A path into a scalar, and a NULL step, are refused.
-fn edit_doc<'a>(doc: &'a str, path: &[Option<String>], edit: Edit<'a>) -> Result<String> {
+/// The document with `edit` made at `path`, written into `out`. An empty path is the document itself (as jsonb writes
+/// it); a path that reaches nothing leaves it as it is. A path into a scalar, and a NULL step, are refused.
+fn edit_doc<'a>(out: &mut String, doc: &'a str, path: &[Option<String>], edit: Edit<'a>) -> Result<()> {
     let mut root = parse(doc)?;
     let steps = path_steps(path)?;
     if steps.is_empty() {
-        return text_of(&root);
+        return text_into(out, &root);
     }
     if !matches!(root, Node::Object(_) | Node::List(_)) {
         let verb = if matches!(edit, Edit::Delete) { "delete" } else { "set" };
         return Err(refuse("22023", format!("cannot {verb} path in scalar")));
     }
     walk(&mut root, &steps, edit)?;
-    text_of(&root)
+    text_into(out, &root)
 }
 
 /// The path's steps as text, borrowed from the path. A NULL step is refused, as Postgres refuses it (22004).
@@ -289,7 +290,7 @@ fn insert_point(len: usize, raw: i64, after: bool) -> usize {
 
 /// `jsonb_concat`: two objects merge (the right one's members win, not deeply); two arrays join; an array with
 /// anything else takes it as one element; anything else makes a two-element array.
-fn concat(left: &str, right: &str) -> Result<String> { text_of(&concat_nodes(parse(left)?, parse(right)?)) }
+fn concat_into(out: &mut String, left: &str, right: &str) -> Result<()> { text_into(out, &concat_nodes(parse(left)?, parse(right)?)) }
 
 fn concat_nodes<'a>(left: Node<'a>, right: Node<'a>) -> Node<'a> {
     match (left, right) {
@@ -318,19 +319,19 @@ fn concat_nodes<'a>(left: Node<'a>, right: Node<'a>) -> Node<'a> {
 
 /// `jsonb_delete(doc, key)` or `(doc, keys)`: an object loses its members with those keys; an array loses the strings
 /// that equal them. A scalar has nothing to delete from.
-fn delete_keys(doc: &str, keys: &[&str]) -> Result<String> {
+fn delete_keys_into(out: &mut String, doc: &str, keys: &[&str]) -> Result<()> {
     let mut node = parse(doc)?;
     match &mut node {
         Node::Object(members) => members.retain(|(key, _)| !keys.contains(&&**key)),
         Node::List(items) => items.retain(|item| !matches!(item, Node::Text(s) if keys.contains(&&**s))),
         _ => return Err(refuse("22023", "cannot delete from scalar")),
     }
-    text_of(&node)
+    text_into(out, &node)
 }
 
 /// `jsonb_delete(doc, index)`: an array loses its element at the index (a negative one counts from the end; past the
 /// end it is unchanged). An object can't take an index.
-fn delete_index(doc: &str, at: i64) -> Result<String> {
+fn delete_index_into(out: &mut String, doc: &str, at: i64) -> Result<()> {
     let mut node = parse(doc)?;
     match &mut node {
         Node::Object(_) => return Err(refuse("22023", "cannot delete from object using integer index")),
@@ -341,14 +342,14 @@ fn delete_index(doc: &str, at: i64) -> Result<String> {
         }
         _ => return Err(refuse("22023", "cannot delete from scalar")),
     }
-    text_of(&node)
+    text_into(out, &node)
 }
 
 /// `jsonb_strip_nulls`: the document with every object member whose value is null left out (array elements stay).
-fn strip_nulls(doc: &str) -> Result<String> {
+fn strip_nulls_into(out: &mut String, doc: &str) -> Result<()> {
     let mut node = parse(doc)?;
     without_nulls(&mut node);
-    text_of(&node)
+    text_into(out, &node)
 }
 
 /// Takes the null members out of every object, in place; a list's nulls stay.
@@ -371,14 +372,13 @@ fn without_nulls(node: &mut Node) {
 
 /// `json_strip_nulls`: the document's tokens copied as written, without the space between them and with every object
 /// member whose value is null left out. A duplicate key is kept, as json keeps it. Invalid text is 22P02.
-fn strip_json(doc: &str) -> Result<String> {
+fn strip_json_into(out: &mut String, doc: &str) -> Result<()> {
     depth_check(doc)?;
     let mut jiter = Jiter::new(doc.as_bytes());
-    let mut out = String::with_capacity(doc.len());
     let peek = jiter.peek().map_err(|_| invalid(doc))?;
-    stripped(&mut jiter, doc, peek, &mut out).ok_or_else(|| invalid(doc))?;
+    stripped(&mut jiter, doc, peek, out).ok_or_else(|| invalid(doc))?;
     jiter.finish().map_err(|_| invalid(doc))?;
-    Ok(out)
+    Ok(())
 }
 
 fn invalid(doc: &str) -> DataFusionError { fail(coded("22P02", json_refusal(doc))) }
@@ -433,22 +433,21 @@ fn stripped(jiter: &mut Jiter, doc: &str, peek: Peek, out: &mut String) -> Optio
 
 const JSON_SPACE: &[char] = &[' ', '\t', '\n', '\r'];
 
-/// `jsonb_pretty`: jsonb's text indented four spaces a level, a member or element to a line, an empty object or
-/// array as `{` and a line and `}`.
-fn pretty(doc: &str) -> Result<String> {
-    let mut out = String::new();
-    pretty_into(&mut out, &parse(doc)?, 0).ok_or_else(overflow)?;
-    Ok(out)
+/// `jsonb_pretty`, written into `out`: jsonb's text indented four spaces a level, a member or element to a line, an
+/// empty object or array as `{` and a line and `}`.
+fn pretty_into(out: &mut String, doc: &str) -> Result<()> {
+    let node = parse(doc)?;
+    pretty_node(out, &node, 0).ok_or_else(overflow)
 }
 
-fn pretty_into(out: &mut String, node: &Node, depth: usize) -> Option<()> {
+fn pretty_node(out: &mut String, node: &Node, depth: usize) -> Option<()> {
     match node {
         Node::List(items) => {
             out.push('[');
             for (k, item) in items.iter().enumerate() {
                 out.push_str(if k == 0 { "\n" } else { ",\n" });
                 indent(out, depth + 1);
-                pretty_into(out, item, depth + 1)?;
+                pretty_node(out, item, depth + 1)?;
             }
             out.push('\n');
             indent(out, depth);
@@ -461,7 +460,7 @@ fn pretty_into(out: &mut String, node: &Node, depth: usize) -> Option<()> {
                 indent(out, depth + 1);
                 json_string(out, name);
                 out.push_str(": ");
-                pretty_into(out, item, depth + 1)?;
+                pretty_node(out, item, depth + 1)?;
             }
             out.push('\n');
             indent(out, depth);
@@ -478,12 +477,8 @@ fn indent(out: &mut String, depth: usize) {
     }
 }
 
-/// jsonb's text for a tree.
-fn text_of(node: &Node) -> Result<String> {
-    let mut out = String::new();
-    write(&mut out, node).ok_or_else(overflow)?;
-    Ok(out)
-}
+/// jsonb's text for a tree, written into `out`.
+fn text_into(out: &mut String, node: &Node) -> Result<()> { write(out, node).ok_or_else(overflow) }
 
 fn overflow() -> DataFusionError { refuse("22003", "value overflows numeric format") }
 
@@ -505,11 +500,34 @@ mod tests {
         }
     }
 
-    fn set(doc: &str, at: &str, value: &str, create: bool) -> Result<String> { edit_doc(doc, &path(at), Edit::Set { value: parse(value)?, create }) }
+    /// The answer a writer makes, as text: the writer runs on an empty String.
+    fn answer(writer: impl FnOnce(&mut String) -> Result<()>) -> Result<String> {
+        let mut out = String::new();
+        writer(&mut out)?;
+        Ok(out)
+    }
 
-    fn insert(doc: &str, at: &str, value: &str, after: bool) -> Result<String> { edit_doc(doc, &path(at), Edit::Insert { value: parse(value)?, after }) }
+    fn set(doc: &str, at: &str, value: &str, create: bool) -> Result<String> {
+        answer(|out| edit_doc(out, doc, &path(at), Edit::Set { value: parse(value)?, create }))
+    }
 
-    fn delete_at(doc: &str, at: &str) -> Result<String> { edit_doc(doc, &path(at), Edit::Delete) }
+    fn insert(doc: &str, at: &str, value: &str, after: bool) -> Result<String> {
+        answer(|out| edit_doc(out, doc, &path(at), Edit::Insert { value: parse(value)?, after }))
+    }
+
+    fn delete_at(doc: &str, at: &str) -> Result<String> { answer(|out| edit_doc(out, doc, &path(at), Edit::Delete)) }
+
+    fn concat(left: &str, right: &str) -> Result<String> { answer(|out| concat_into(out, left, right)) }
+
+    fn delete_keys(doc: &str, keys: &[&str]) -> Result<String> { answer(|out| delete_keys_into(out, doc, keys)) }
+
+    fn delete_index(doc: &str, at: i64) -> Result<String> { answer(|out| delete_index_into(out, doc, at)) }
+
+    fn strip_nulls(doc: &str) -> Result<String> { answer(|out| strip_nulls_into(out, doc)) }
+
+    fn strip_json(doc: &str) -> Result<String> { answer(|out| strip_json_into(out, doc)) }
+
+    fn pretty(doc: &str) -> Result<String> { answer(|out| pretty_into(out, doc)) }
 
     fn strip_json_text(doc: &str) -> String { strip_json(doc).unwrap() }
 

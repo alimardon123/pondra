@@ -7,15 +7,14 @@
 //! `jsonb_text` is jsonb's own output: keys sorted, numbers as `numeric` prints them, and every `jsonb_*` answer goes
 //! through it. `pondra_as_jsonb` and `pondra_jsonb` (types.rs) answer the same way.
 use crate::codes::{coded, Coded};
-use crate::pg_catalog::texts_out;
 use crate::pg_types::MARK;
 use crate::types::json_refusal;
 use crate::pg_values::{interval_text, time_text};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-use datafusion::arrow::array::{Array, ArrayRef, AsArray};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Date32Type, Date64Type, Field, FieldRef, Float32Type, Float64Type, Int16Type, Int32Type,
+    ArrowPrimitiveType, DataType, Date32Type, Date64Type, Decimal128Type, Decimal256Type, Field, FieldRef, Float32Type, Float64Type, Int16Type, Int32Type,
     Int64Type, Int8Type, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit, IntervalYearMonthType, Time32MillisecondType,
     Time32SecondType, Time64MicrosecondType, Time64NanosecondType, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
     TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
@@ -33,6 +32,7 @@ use datafusion::prelude::SessionContext;
 use jiter::{Jiter, Peek};
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Adds the functions to a session. `pg_json::register` calls it, so they are in every session.
@@ -41,9 +41,9 @@ pub fn register(ctx: &SessionContext) {
     let two = || Signature::any(2, Volatility::Immutable);
     let any = || Signature::one_of(vec![TypeSignature::Nullary, TypeSignature::VariadicAny], Volatility::Immutable);
     let functions = vec![
-        make("to_json", one(), "json", |a, n| per_row(n, |i| json_of_row(&a[0], i))),
-        make("row_to_json", one(), "json", |a, n| per_row(n, |i| json_of_row(&a[0], i))),
-        make("to_jsonb", one(), "jsonb", |a, n| as_jsonb(per_row(n, |i| json_of_row(&a[0], i))?)),
+        make("to_json", one(), "json", |a, n| per_row(n, |i, out| json_of_row(&a[0], i, out))),
+        make("row_to_json", one(), "json", |a, n| per_row(n, |i, out| json_of_row(&a[0], i, out))),
+        make("to_jsonb", one(), "jsonb", |a, n| as_jsonb(per_row(n, |i, out| json_of_row(&a[0], i, out))?)),
         make("json_build_object", any(), "json", |a, n| pairs(a, n, " : ", ", ")),
         make("jsonb_build_object", any(), "jsonb", |a, n| as_jsonb(pairs(a, n, " : ", ", ")?)),
         make("json_build_array", any(), "json", array_of),
@@ -243,27 +243,41 @@ pub(crate) fn refuse(code: &'static str, message: impl Into<String>) -> DataFusi
 
 fn null_key() -> DataFusionError { fail(coded("22004", "null value not allowed for object key")) }
 
-/// One text per row: `row(i)` is row `i`'s answer, None where it is NULL.
-fn per_row(n: usize, row: impl Fn(usize) -> Result<Option<String>>) -> Result<ArrayRef> { Ok(texts_out((0..n).map(row).collect::<Result<Vec<_>>>()?)) }
-
-/// Row `i` of an argument as JSON text: None where it is NULL, which the strict functions answer as NULL.
-fn json_of_row(x: &Arg, i: usize) -> Result<Option<String>> {
-    if is_null_at(&x.values, i) {
-        return Ok(None);
-    }
+/// One text per row, for a whole batch: `row(i, out)` writes row `i` into `out` (cleared before each row, so one String
+/// serves the batch) and says false where the row is NULL. Each text is appended to one `StringBuilder`, so no row
+/// makes a String of its own.
+pub(crate) fn per_row(n: usize, mut row: impl FnMut(usize, &mut String) -> Result<bool>) -> Result<ArrayRef> {
     let mut out = String::new();
-    value(&mut out, &x.values, i, x.json)?;
-    Ok(Some(out))
+    let mut answers = StringBuilder::new();
+    for i in 0..n {
+        out.clear();
+        if row(i, &mut out)? {
+            answers.append_value(&out);
+        } else {
+            answers.append_null();
+        }
+    }
+    Ok(Arc::new(answers.finish()))
+}
+
+/// Row `i` of an argument as JSON text, written into `out`: false where it is NULL, which the strict functions answer as
+/// NULL.
+fn json_of_row(x: &Arg, i: usize, out: &mut String) -> Result<bool> {
+    if is_null_at(&x.values, i) {
+        return Ok(false);
+    }
+    value(out, &x.values, i, x.json)?;
+    Ok(true)
 }
 
 /// Whether row `i` of `a` is NULL (a NULL-typed array is all NULL, though it has no validity bitmap).
-fn is_null_at(a: &ArrayRef, i: usize) -> bool { matches!(a.data_type(), DataType::Null) || a.is_null(i) }
+pub(crate) fn is_null_at(a: &ArrayRef, i: usize) -> bool { matches!(a.data_type(), DataType::Null) || a.is_null(i) }
 
 /// Whether a type is one Postgres writes as a composite or an array: never a key, and a line feed in `json_agg`.
 fn is_composite(t: &DataType) -> bool { matches!(t, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..) | DataType::Struct(_) | DataType::Map(..)) }
 
 /// Row `i` of a text column (`a` is Utf8, LargeUtf8 or Utf8View; the callers check).
-fn text_at(a: &ArrayRef, i: usize) -> &str {
+pub(crate) fn text_at(a: &ArrayRef, i: usize) -> &str {
     match a.data_type() {
         DataType::LargeUtf8 => a.as_string::<i64>().value(i),
         DataType::Utf8View => a.as_string_view().value(i),
@@ -272,7 +286,7 @@ fn text_at(a: &ArrayRef, i: usize) -> &str {
 }
 
 /// `a` as text: as it is when it holds text, else cast to Utf8.
-fn as_text(a: &ArrayRef) -> Result<ArrayRef> {
+pub(crate) fn as_text(a: &ArrayRef) -> Result<ArrayRef> {
     Ok(match a.data_type() {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => a.clone(),
         _ => cast(a, &DataType::Utf8)?,
@@ -300,7 +314,9 @@ fn value(out: &mut String, a: &ArrayRef, i: usize, json: bool) -> Result<()> {
         DataType::UInt64 => digits::<UInt64Type>(out, a, i),
         DataType::Float32 => float_json(out, a.as_primitive::<Float32Type>().value(i)),
         DataType::Float64 => float_json(out, a.as_primitive::<Float64Type>().value(i)),
-        DataType::Decimal128(..) | DataType::Decimal256(..) => out.push_str(&display(a, i)),
+        // (the same text Arrow's display gives, from the same formatting, without a formatter per value)
+        DataType::Decimal128(..) => out.push_str(&a.as_primitive::<Decimal128Type>().value_as_string(i)),
+        DataType::Decimal256(..) => out.push_str(&a.as_primitive::<Decimal256Type>().value_as_string(i)),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             let s = text_at(a, i);
             if json {
@@ -328,11 +344,12 @@ fn value(out: &mut String, a: &ArrayRef, i: usize, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// An integer's digits, written into `out` (a String takes them without failing).
 fn digits<T: ArrowPrimitiveType>(out: &mut String, a: &ArrayRef, i: usize)
 where
     T::Native: std::fmt::Display,
 {
-    out.push_str(&a.as_primitive::<T>().value(i).to_string());
+    let _ = write!(out, "{}", a.as_primitive::<T>().value(i));
 }
 
 /// Arrow's text of row `i`, which is what a value of a type this file doesn't write comes to.
@@ -386,24 +403,39 @@ fn plain(digits: &str, exp: i32) -> String {
 /// other characters below 0x20 as `\u00xx`, and nothing else (`/` and non-ASCII stay as they are).
 pub(crate) fn json_string(out: &mut String, s: &str) {
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    // (the bytes that need an escape are all below 0x80, so a byte's position is a character's boundary too: the text
+    // between two escapes is copied in one piece)
+    let mut run = 0;
+    for (at, &b) in s.as_bytes().iter().enumerate() {
+        if b >= 0x20 && b != b'"' && b != b'\\' {
+            continue;
+        }
+        out.push_str(&s[run..at]);
+        run = at + 1;
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x8 => out.push_str("\\b"),
+            0xc => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            _ => {
+                let _ = write!(out, "\\u{:04x}", b);
+            }
         }
     }
+    out.push_str(&s[run..]);
     out.push('"');
 }
 
+/// A date as JSON text. Years 0 to 9999 are written with their four digits here; chrono's `%Y` takes a sign past that,
+/// so other years keep its form.
 fn date(out: &mut String, d: Option<NaiveDate>) {
     match d {
+        Some(d) if (0..=9999).contains(&d.year()) => {
+            let _ = write!(out, "\"{:04}-{:02}-{:02}\"", d.year(), d.month(), d.day());
+        }
         Some(d) => json_string(out, &d.format("%Y-%m-%d").to_string()),
         None => out.push_str("null"),
     }
@@ -515,12 +547,23 @@ fn key(out: &mut String, a: &ArrayRef, i: usize, json: bool) -> Result<()> {
     if json || is_composite(a.data_type()) {
         return Err(fail(coded("22023", "key value must be scalar, not array, composite, or json")));
     }
-    let mut text = String::new();
-    value(&mut text, a, i, false)?;
-    if text.starts_with('"') {
-        out.push_str(&text);
-    } else {
-        json_string(out, &text);
+    match a.data_type() {
+        // (a text key is its own text; a boolean or an integer is its text in quotes, as `value` writes it)
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => json_string(out, text_at(a, i)),
+        DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            out.push('"');
+            value(out, a, i, false)?;
+            out.push('"');
+        }
+        _ => {
+            let mut text = String::new();
+            value(&mut text, a, i, false)?;
+            if text.starts_with('"') {
+                out.push_str(&text);
+            } else {
+                json_string(out, &text);
+            }
+        }
     }
     Ok(())
 }
@@ -534,33 +577,33 @@ fn pairs(a: &[Arg], n: usize, colon: &str, comma: &str) -> Result<ArrayRef> {
             "argument list must have even number of elements\nHINT:  The arguments of json_build_object() must consist of alternating keys and values.",
         )));
     }
-    per_row(n, |i| {
-        let mut out = String::from("{");
+    per_row(n, |i, out| {
+        out.push('{');
         for (k, pair) in a.chunks(2).enumerate() {
             if k > 0 {
                 out.push_str(comma);
             }
-            key(&mut out, &pair[0].values, i, pair[0].json)?;
+            key(out, &pair[0].values, i, pair[0].json)?;
             out.push_str(colon);
-            value(&mut out, &pair[1].values, i, pair[1].json)?;
+            value(out, &pair[1].values, i, pair[1].json)?;
         }
         out.push('}');
-        Ok(Some(out))
+        Ok(true)
     })
 }
 
 /// `json_build_array`: the arguments as `[a, b]`, joined by ", ".
 fn array_of(a: &[Arg], n: usize) -> Result<ArrayRef> {
-    per_row(n, |i| {
-        let mut out = String::from("[");
+    per_row(n, |i, out| {
+        out.push('[');
         for (k, arg) in a.iter().enumerate() {
             if k > 0 {
                 out.push_str(", ");
             }
-            value(&mut out, &arg.values, i, arg.json)?;
+            value(out, &arg.values, i, arg.json)?;
         }
         out.push(']');
-        Ok(Some(out))
+        Ok(true)
     })
 }
 
@@ -601,18 +644,20 @@ fn list_row(list: &ArrayRef, i: usize) -> Result<Option<(ArrayRef, FieldRef)>> {
 /// as a value (never before the first, and never after a NULL), so `json_agg` of rows reads `[{…}, \n {…}]`.
 fn json_agg(a: &[Arg], n: usize) -> Result<ArrayRef> {
     let kinds = cast(&a[1].values, &DataType::Utf8)?;
-    per_row(n, |i| {
-        let Some((elements, item)) = list_row(&a[0].values, i)? else { return Ok(None) };
-        Ok(Some(format!("[{}]", joined(&elements, &item, Kind::of(kinds.as_string::<i32>().value(i))?)?)))
+    per_row(n, |i, out| {
+        let Some((elements, item)) = list_row(&a[0].values, i)? else { return Ok(false) };
+        out.push('[');
+        joined(out, &elements, &item, Kind::of(kinds.as_string::<i32>().value(i))?)?;
+        out.push(']');
+        Ok(true)
     })
 }
 
-/// The elements of one list, joined as `kind` says (see `json_agg`).
-fn joined(elements: &ArrayRef, item: &Field, kind: Kind) -> Result<String> {
+/// The elements of one list, joined as `kind` says (see `json_agg`), written into `out`.
+fn joined(out: &mut String, elements: &ArrayRef, item: &Field, kind: Kind) -> Result<()> {
     let elements = if kind == Kind::Value { elements.clone() } else { as_text(elements)? };
     let lines = kind == Kind::Row || (kind == Kind::Value && !is_scalar(item.data_type()));
     let json = is_json_field(item);
-    let mut out = String::new();
     for j in 0..elements.len() {
         if j > 0 {
             out.push_str(", ");
@@ -620,9 +665,9 @@ fn joined(elements: &ArrayRef, item: &Field, kind: Kind) -> Result<String> {
                 out.push_str("\n ");
             }
         }
-        element(&mut out, &elements, j, kind, json)?;
+        element(out, &elements, j, kind, json)?;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Element `i`: JSON text as it is for `json` and `row` (a text array, see `joined`), a value written by `value`.
@@ -641,14 +686,15 @@ fn is_scalar(t: &DataType) -> bool { !is_composite(t) }
 /// for a NULL list. A NULL key is 22004.
 fn object_agg(a: &[Arg], n: usize) -> Result<ArrayRef> {
     let kinds = cast(&a[1].values, &DataType::Utf8)?;
-    per_row(n, |i| {
-        let Some((pairs, item)) = list_row(&a[0].values, i)? else { return Ok(None) };
-        Ok(Some(object_of(&pairs, &item, Kind::of(kinds.as_string::<i32>().value(i))?)?))
+    per_row(n, |i, out| {
+        let Some((pairs, item)) = list_row(&a[0].values, i)? else { return Ok(false) };
+        object_of(out, &pairs, &item, Kind::of(kinds.as_string::<i32>().value(i))?)?;
+        Ok(true)
     })
 }
 
-/// One row of `pondra_json_object_agg`: its pairs, in order (a duplicate key is kept).
-fn object_of(pairs: &ArrayRef, item: &Field, kind: Kind) -> Result<String> {
+/// One row of `pondra_json_object_agg`, written into `out`: its pairs, in order (a duplicate key is kept).
+fn object_of(out: &mut String, pairs: &ArrayRef, item: &Field, kind: Kind) -> Result<()> {
     let DataType::Struct(fields) = item.data_type() else {
         return Err(fail(coded("22023", "an object aggregate takes a list of pairs (a key and a value)")));
     };
@@ -658,7 +704,7 @@ fn object_of(pairs: &ArrayRef, item: &Field, kind: Kind) -> Result<String> {
     let entries = pairs.as_struct();
     let values = if kind == Kind::Value { entries.column(1).clone() } else { as_text(entries.column(1))? };
     let (keys, value_json) = (entries.column(0), is_json_field(&fields[1]));
-    let mut out = String::from("{ ");
+    out.push_str("{ ");
     for j in 0..entries.len() {
         if j > 0 {
             out.push_str(", ");
@@ -666,30 +712,41 @@ fn object_of(pairs: &ArrayRef, item: &Field, kind: Kind) -> Result<String> {
         if entries.is_null(j) {
             return Err(null_key());
         }
-        key(&mut out, keys, j, is_json_field(&fields[0]))?;
+        key(out, keys, j, is_json_field(&fields[0]))?;
         out.push_str(" : ");
-        element(&mut out, &values, j, kind, value_json)?;
+        element(out, &values, j, kind, value_json)?;
     }
     out.push_str(" }");
-    Ok(out)
+    Ok(())
 }
 
 /// `jsonb_text` of each answer: the jsonb forms of the `jsonb_*` functions. A text that isn't JSON is 22P02.
 fn as_jsonb(texts: ArrayRef) -> Result<ArrayRef> {
     // (a column of text may come as Utf8View, which `as_string` refuses: it panics, and the node answers 500)
     let texts = cast(&texts, &DataType::Utf8)?;
-    let out = texts.as_string::<i32>().iter().map(|t| t.map(jsonb_text).transpose()).collect::<Result<Vec<_>>>()?;
-    Ok(texts_out(out))
+    let texts = texts.as_string::<i32>();
+    per_row(texts.len(), |i, out| {
+        if texts.is_null(i) {
+            return Ok(false);
+        }
+        jsonb_into(out, texts.value(i))?;
+        Ok(true)
+    })
 }
 
 /// `json` (JSON text) as jsonb writes it: an object's keys sorted by length, then bytes, its last duplicate kept;
 /// numbers as Postgres's `numeric` prints them; `, ` and `: ` between members. A text that isn't JSON is 22P02, and
 /// one nested past `MAX_DEPTH` is 54001.
 pub(crate) fn jsonb_text(json: &str) -> Result<String> {
-    let node = parse(json)?;
     let mut out = String::new();
-    write(&mut out, &node).ok_or_else(|| fail(coded("22P02", json_refusal(json))))?;
+    jsonb_into(&mut out, json)?;
     Ok(out)
+}
+
+/// `jsonb_text`, written into `out`.
+pub(crate) fn jsonb_into(out: &mut String, json: &str) -> Result<()> {
+    let node = parse(json)?;
+    write(out, &node).ok_or_else(|| fail(coded("22P02", json_refusal(json))))
 }
 
 /// The most levels of arrays and objects a document may nest. Postgres takes 5,000; the reader and the writer recurse
@@ -972,6 +1029,26 @@ mod tests {
     }
 
     #[test]
+    fn escapes_between_plain_runs_are_written_as_postgres_writes_them() {
+        let mut out = String::new();
+        json_string(&mut out, "é\"x\\y\u{1}\u{8}\u{c}\n\r\t/z");
+        assert_eq!(out, r#""é\"x\\y\u0001\b\f\n\r\t/z""#);
+        out.clear();
+        json_string(&mut out, "");
+        assert_eq!(out, r#""""#);
+    }
+
+    #[test]
+    fn dates_of_years_0_to_9999_are_written_as_chrono_writes_them() {
+        for (year, month, day) in [(0, 1, 1), (1, 1, 1), (999, 3, 4), (9999, 12, 31), (10_000, 1, 1)] {
+            let date_value = NaiveDate::from_ymd_opt(year, month, day).unwrap();
+            let mut out = String::new();
+            date(&mut out, Some(date_value));
+            assert_eq!(out, format!("\"{}\"", date_value.format("%Y-%m-%d")), "year {year}");
+        }
+    }
+
+    #[test]
     fn numbers_keep_their_scale_as_numeric_does() {
         assert_eq!(numeric("1.50e-1").as_deref(), Some("0.150"));
         assert_eq!(numeric("1e2").as_deref(), Some("100"));
@@ -979,6 +1056,12 @@ mod tests {
         assert_eq!(numeric("-12.5").as_deref(), Some("-12.5"));
         assert_eq!(numeric("-0.0").as_deref(), Some("0.0"));
         assert_eq!(numeric("0e5").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn plain_numbers_are_written_as_they_are_except_a_negative_zero() {
+        assert_eq!(jsonb_text("[-0.0, -0, 1.50, -12]").unwrap(), "[0.0, 0, 1.50, -12]");
+        assert_eq!(jsonb_text("[-0.000, 0.5, -0.5, 123.4500]").unwrap(), "[0.000, 0.5, -0.5, 123.4500]");
     }
 
     #[test]
@@ -1042,6 +1125,12 @@ mod tests {
         assert_eq!(one("SELECT json_build_array(1, 'a', NULL)").await, r#"[1, "a", null]"#);
         assert_eq!(one("SELECT jsonb_build_object('bb', 1, 'a', 2)").await, r#"{"a": 2, "bb": 1}"#);
         assert_eq!(one("SELECT jsonb_build_array(1, 'a')").await, r#"[1, "a"]"#);
+    }
+
+    #[tokio::test]
+    async fn keys_of_booleans_and_integers_are_quoted_and_text_keys_escaped() {
+        assert_eq!(one("SELECT json_build_object(true, 1, 5, 2)").await, r#"{"true" : 1, "5" : 2}"#);
+        assert_eq!(one(r#"SELECT json_build_object('a"b', 1)"#).await, r#"{"a\"b" : 1}"#);
     }
 
     #[tokio::test]
