@@ -4,7 +4,8 @@ name: ci slots
 # 2026-10-16: the account's runners are shared with the owner's other work). build.yml's plan makes a
 # pull request's run wait while two others are going (its `-ge 2` says the same): it builds nothing
 # and fails its `waiting for a CI slot` check, holding no runner. Whenever a pull request's build run
-# ends, this starts the oldest waiting ones again, as many as there are free slots. A run is started
+# or the train's (train.yml: one run for the pull requests it merged, which takes a slot too) ends,
+# this starts the oldest waiting ones again, as many as there are free slots. A run is started
 # again only while it is its pull request's newest and its head is still the pull request's, so a
 # newer push is never undone.
 #
@@ -29,7 +30,9 @@ permissions:
 jobs:
   start:
     name: start waiting pull requests
-    if: github.event.workflow_run.event == 'pull_request'
+    if: >-
+      github.event.workflow_run.event == 'pull_request' ||
+      (github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'train')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
@@ -38,8 +41,8 @@ jobs:
     steps:
       - run: |
           r=$GITHUB_REPOSITORY
-          runs=$(gh api "repos/$r/actions/workflows/build.yml/runs?event=pull_request&per_page=100")
-          going=$(jq '[.workflow_runs[] | select(.status != "completed")] | length' <<< "$runs")
+          runs=$(gh api "repos/$r/actions/workflows/build.yml/runs?per_page=100")
+          going=$(jq '[.workflow_runs[] | select(.status != "completed") | select(.event == "pull_request" or (.event == "workflow_dispatch" and .head_branch == "train"))] | length' <<< "$runs")
           free=$((SLOTS - going))
           echo "Pull requests' runs going: $going of $SLOTS."
           [ "$free" -gt 0 ] || exit 0
@@ -47,7 +50,7 @@ jobs:
           # Each open pull request's newest run (a run for another label is skipped: not counted),
           # if it ended red at its head; oldest first.
           waiting=$(jq -r --argjson heads "$heads" '
-            [.workflow_runs[] | select(.conclusion != "skipped" and (.pull_requests | length) > 0)]
+            [.workflow_runs[] | select(.event == "pull_request" and .conclusion != "skipped" and (.pull_requests | length) > 0)]
             | group_by(.pull_requests[0].number) | map(max_by(.id))
             | map(select(.status == "completed" and .conclusion == "failure") | . as $run
                   | select(any($heads[]; .number == $run.pull_requests[0].number and .headRefOid == $run.head_sha)))

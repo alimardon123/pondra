@@ -28,15 +28,23 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, labeled] # (labeled: `ci` or `full-ci` added)
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "all: every platform and check (a release's); main: as a push to main (a train landed); train: as a pull request's ci (the train's run)"
+        type: choice
+        options: [all, main, train]
+        default: all
 
 # A pull request's runs share a group, so a newer push (or `full-ci` added) stops the older run.
 # Main's pushes share one too, without stopping the run that goes: a push waits while it runs, and
 # drops a push that waited before it, so main builds its newest commit, never each merge of a busy
 # hour (the account's runners are shared with the owner's other work, 2026-10-16). A run started by
-# hand (a release's) has a group of its own, as has another label added.
+# hand (a release's) has a group of its own, as has another label added. The train's runs share one
+# (train.yml): a train cut again stops the run of the one before. The run a landed train starts on main
+# is main's.
 concurrency:
-  group: build-${{ github.event.pull_request.number || (github.event_name == 'push' && 'main') || github.run_id }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: build-${{ github.event.pull_request.number || ((github.event_name == 'push' || inputs.mode == 'main') && 'main') || (github.ref == 'refs/heads/train' && 'train') || github.run_id }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/train' }}
 
 jobs:
   # What this run builds. A push to main whose code a pull request's run already built and tested
@@ -60,6 +68,7 @@ jobs:
       linux: ${{ steps.plan.outputs.linux }}
       others: ${{ steps.plan.outputs.others }}
       binary: ${{ steps.plan.outputs.binary }}
+      event: ${{ steps.plan.outputs.event }}
       profile: ${{ steps.plan.outputs.profile }}
       packages: ${{ steps.plan.outputs.packages }}
       unit: ${{ steps.plan.outputs.unit }}
@@ -81,7 +90,8 @@ jobs:
       - id: plan
         env:
           GH_TOKEN: ${{ github.token }}
-          FULL: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          FULL: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          MODE: ${{ inputs.mode }}
           PR: ${{ github.event.pull_request.number }}
         run: |
           # (linux-x64 pinned: ubuntu-latest becomes 26.04 from 2026-10-19; moved on purpose, after a
@@ -95,14 +105,21 @@ jobs:
           # macOS Intel, the slowest build by far (101 minutes on main's run 650), only where a
           # release needs it: a push that changes Cargo.toml's version (the commit a release tags), or a
           # run started by hand (release.yml starts one on a tag of any other commit).
+          # The train's run (train.yml, tools/train.py: lanes' pull requests merged onto main in the branch
+          # \`train\`, tested together) is planned as a pull request's \`ci\` run, and the run it starts on main
+          # once a train lands as a push to main (a push made with the workflow's token starts no run).
+          event=$GITHUB_EVENT_NAME
+          if [ "$GITHUB_REF" = refs/heads/train ] || [ "$MODE" = train ]; then event=pull_request; elif [ "$MODE" = main ]; then event=push; fi
+          if [ "$event" != pull_request ]; then FULL=true; fi
+          echo "event=$event" >> "$GITHUB_OUTPUT"
           release=false
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || { [ "$GITHUB_EVENT_NAME" = push ] && git diff HEAD^1 HEAD -- Cargo.toml | grep -q '^+version = '; }; then release=true; fi
+          if [ "$event" = workflow_dispatch ] || { [ "$event" = push ] && git diff HEAD^1 HEAD -- Cargo.toml | grep -q '^+version = '; }; then release=true; fi
           # (linux-x64 apart: the suite and the tests after the build start once it is built, and
           # never wait for the slowest platform)
           echo "linux=$(jq -c '{include: [.[] | select(.platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
           others=$(jq -c --argjson release "$release" '{include: [.[] | select(.platform != "linux-x64" and ($release or .platform != "macos-x64"))]}' <<< "$platforms")
           echo "others=$others" >> "$GITHUB_OUTPUT"
-          if [ "$GITHUB_EVENT_NAME" = push ]; then
+          if [ "$event" = push ]; then
             # (a run with every package this one would make, `pondra` itself among them)
             run=$(bash tools/ci_build.sh "$GITHUB_SHA" "$(jq -r '[.include[].platform | "pondra-\(.)"] + ["pondra-linux-x64", "pondra-npm"] | join(" ")' <<< "$others")")
             echo "run=$run" >> "$GITHUB_OUTPUT"
@@ -118,7 +135,7 @@ jobs:
           # ships (a release, a bench, the soak, the nightly checks: tools/ci_build.sh and ci_artifact.sh
           # take \`pondra-*\`).
           packages=pondra
-          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ "$FULL" != true ]; then profile=release; packages=pr; fi
+          if [ "$event" = pull_request ] && [ "$FULL" != true ]; then profile=release; packages=pr; fi
           echo "profile=$profile" >> "$GITHUB_OUTPUT"
           echo "packages=$packages" >> "$GITHUB_OUTPUT"
           if [ "$FULL" = true ] && [ "$release" = false ]; then echo "macOS Intel is built on a version commit (the one a release tags) or a run started by hand." >> "$GITHUB_STEP_SUMMARY"; fi
@@ -136,8 +153,11 @@ jobs:
           # repository runs out on a busy day; one call finds that commit.)
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             files=$(git diff --name-only HEAD^1 HEAD)
-          elif [ "$GITHUB_EVENT_NAME" = push ]; then
-            base=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?branch=main&event=push&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // empty') || base=
+          elif [ "$event" = pull_request ]; then # (a train's: its pull requests' against the main it was cut on)
+            base=$(git log -1 --format=%B | sed -n 's/^Train-Base: //p')
+            if [ -n "$base" ] && git fetch -q --depth 1 origin "$base"; then files=$(git diff --name-only "$base" HEAD); else files=ALL; fi
+          elif [ "$event" = push ]; then
+            base=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?branch=main&status=success&per_page=10" --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")][0].head_sha // empty') || base=
             if [ "$base" = "$GITHUB_SHA" ]; then base=$(git rev-parse HEAD^1); fi # (a passed run started again)
             if [ -n "$base" ] && git fetch -q --depth 1 origin "$base"; then files=$(git diff --name-only "$base" HEAD); else files=ALL; fi
           else
@@ -150,8 +170,9 @@ jobs:
           code=false; unit=false; harness=false; docs=false; site=false; deploy=false; full=false
           if has "$bin|$pkg|$self"; then code=true; fi
           if has "$bin|^tests/|^tools/per_node_check\.py\$|$self"; then unit=true; fi
-          # (a check, or what one starts: tools/bench/, tools/cloud/ and tools/soak.py are the benches' and the soak's own)
-          if [ "$code" = true ] || [ "$files" = ALL ] || grep -qE '^tools/[^/]+$' <<< "$(grep -vxF tools/soak.py <<< "$files")"; then harness=true; fi
+          # (a check, or what one starts: tools/bench/, tools/cloud/, tools/soak.py and tools/train*.py are the benches', the
+          # soak's and the merge train's own: train.yml tests the train's)
+          if [ "$code" = true ] || [ "$files" = ALL ] || grep -qE '^tools/[^/]+$' <<< "$(grep -vxE 'tools/(soak|train|train_test)\.py' <<< "$files")"; then harness=true; fi
           if [ "$harness" = true ] || has '^(site/|examples/|docs/(surface\.json|glossary\.md)$)'; then docs=true; fi
           if has '^(site/|brand/)|^\.github/workflows/(build|pages)\.yml$'; then site=true; fi
           # (the page form's module, outside the crate's workspace with a lock file of its own: on main and with
@@ -165,14 +186,14 @@ jobs:
           # (and the upgrade checks on a release's run too: two pull requests that passed apart are checked together
           # before a tag, on the build the tag publishes)
           if [ "$release" = true ]; then upgrade=true; fi
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+          if [ "$event" = pull_request ]; then
             if has "$bin|^python/|^tools/(upgrade_check|history_check|environments_check|backup_check|git_check|project_check|fake_github|sim_r2)\.py\$|^tools/(ci_artifact\.sh|requirements\.txt)\$|^\.github/workflows/(upgrade|build)\.yml\$"; then upgrade=true; fi
             if has '^(src/|Cargo\.(toml|lock)$|python/pondra/client\.py$|js/index\.js$|tools/(resilience_check|faulty_s3|sim_r2|harness)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(resilience|build)\.yml$)'; then resilience=true; fi
             if has '^(src/(shares|sharing|vend|read_delta|delta|ext|scan|audit|server)\.rs$|tools/(sharing_check|sim_r2)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sharing|build)\.yml$)'; then sharing=true; fi
             if has '^(src/(sso|sso_flow|users|auth|pg|flight|kafka|tls|server|dbserver|project)\.rs$|src/console/(core|settings)\.js$|python/pondra/client\.py$|js/index\.js$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)'; then sso=true; fi
           fi
           binary=false
-          if [ "$GITHUB_EVENT_NAME" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ]; then binary=true; fi
+          if [ "$event" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ]; then binary=true; fi
           suite=$(jq -nc --argjson h "$harness" --argjson d "$docs" '{include: ((if $h then [range(1; 4) | {part: "harness, \(.) of 3", shard: "\(.)/3"}] else [] end) + (if $d then [{part: "frames, console, docs, failover"}] else [] end))}')
           printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\nweb=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
             "$binary" "$unit" "$docs" "$suite" "$site" "$web" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
@@ -188,8 +209,9 @@ jobs:
             # pull requests going, this one waits. It builds nothing, its check `waiting for a CI slot`
             # fails, it holds no runner, and ci-slots.yml starts it again when a run ends.
             # (If the API can't be asked, it runs: a slot is never worth a stuck pull request.)
-            going=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?event=pull_request&per_page=100" \
-              --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and .status != \"completed\" and (.pull_requests[0].number // 0) != $PR)] | length") || going=0
+            # (the train's run takes a slot too: tools/train.py cuts one only with a slot free, and it never waits)
+            going=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?per_page=100" \
+              --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and .status != \"completed\") | select((.event == \"pull_request\" and (.pull_requests[0].number // 0) != $PR) or (.event == \"workflow_dispatch\" and .head_branch == \"train\"))] | length") || going=0
             if [ "$going" -ge 2 ]; then
               echo wait=true >> "$GITHUB_OUTPUT"
               echo "Waiting for a CI slot: $going other pull requests' runs are going (two at a time). ci-slots.yml starts this run again when one ends." >> "$GITHUB_STEP_SUMMARY"
@@ -245,7 +267,7 @@ jobs:
           workspaces: web # (its own workspace and target folder; ~/.cargo/bin kept too, wasm-bindgen's command line in it)
           shared-key: web
           cache-on-failure: true
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ needs.plan.outputs.event != 'pull_request' }}
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -284,7 +306,7 @@ jobs:
           cache-on-failure: true # (a failed run keeps what it compiled: the dist profile's dependencies take most of a cold build)
           # (main's caches only: every branch reads them, and a branch's own would push them out of
           # the repository's 10 GB; the dependencies are what is cached, and they rarely change)
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ needs.plan.outputs.event != 'pull_request' }}
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
@@ -301,7 +323,7 @@ jobs:
           AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE: "16"
           # (only builds that ship pay for the startup layout, about 45 s more a link: tools/startup_layout.rs.
           # linux-x64's alone so far: zig's lld has linked it with the script, and arm64's hasn't been tried)
-          PONDRA_STARTUP_LAYOUT: ${{ github.event_name != 'pull_request' && matrix.platform == 'linux-x64' && '1' || '' }}
+          PONDRA_STARTUP_LAYOUT: ${{ needs.plan.outputs.event != 'pull_request' && matrix.platform == 'linux-x64' && '1' || '' }}
         run: |
           if [ "${{ needs.plan.outputs.profile }}" = release ]; then
             cargo build --release --workspace # (for this runner's glibc: a pull request's packages are tried here, never published)
@@ -314,7 +336,7 @@ jobs:
           fi
       - run: python tools/smoke.py "$BIN" # (on this OS: the shell, SQL, and memory read without /proc)
       - name: The startup layout held # (a stale tools/startup.txt, or a build without the script: startup_order.py trace and mark it again)
-        if: matrix.platform == 'linux-x64' && github.event_name != 'pull_request'
+        if: matrix.platform == 'linux-x64' && needs.plan.outputs.event != 'pull_request'
         # (the program 26.6 MB on a0eae4f, 29.1-29.8 on main from dcf17f1 to d514755 as the list aged; a build without
         # the layout, about 95. The library, which the packages run, is reported until main has measured it: 29.5)
         run: python tools/startup_order.py check --bin "$BIN" --lib "$(dirname "$BIN")/libpondra_lib.so" --most-mb 31
@@ -380,16 +402,20 @@ jobs:
         with:
           shared-key: unit
           cache-on-failure: true
-          save-if: ${{ github.event_name != 'pull_request' }} # (main's caches only, as the build's)
+          save-if: ${{ needs.plan.outputs.event != 'pull_request' }} # (main's caches only, as the build's)
       - run: python3 tools/per_node_check.py # (a node leaves nothing of itself in its process: the source alone, ADR-061)
       # The crate's unit tests, and a node in a host's process (two lakes one after the other, and
       # the library's four checks). One command, so the crate's two builds (for its own tests, and
       # for the other two) compile side by side: two commands built them one after the other, 9.6
       # and then 14.3 minutes on main's run 650.
       - run: cargo test --release --lib --test node_twice --test node_library
+      # The core as the page form builds it (web/: no server feature), checked: a module every build has that
+      # called one only a node has broke main's browser build after a pull request merged on Linux's CI alone (#131).
+      - name: The browser's half of the crate compiles (no server feature)
+        run: cargo check --release --lib --no-default-features
       # (on main, the workspace too: the cache this job saves is the one a pull request's linux-x64
       # builds from, in the release profile, and the program and the library need a few crates more)
-      - if: github.event_name != 'pull_request'
+      - if: needs.plan.outputs.event != 'pull_request'
         run: cargo build --release --workspace
 
   # The suite, on linux-x64's very binary, in four parts side by side: the quick correctness suite
@@ -510,7 +536,7 @@ jobs:
   # fixed at once, by whoever merged it. Also in the run's summary, and as an error.
   red:
     needs: [plan, site, web, linux, build, unit, suite, resilience, upgrade, sharing, sso, deploy]
-    if: ${{ always() && github.event_name == 'push' && contains(needs.*.result, 'failure') }}
+    if: ${{ always() && needs.plan.outputs.event == 'push' && contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -525,7 +551,7 @@ jobs:
           failed=$(gh api "repos/$r/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" --jq '.jobs[] | select(.conclusion == "failure") | "- [\(.name)](\(.html_url))"')
           # (main runs only its newest commit, so a run may hold several merges: those since the
           # last run that ran, each said on its pull request once)
-          prev=$(gh api "repos/$r/actions/workflows/build.yml/runs?branch=main&event=push&per_page=30" --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and .conclusion != \"cancelled\" and .conclusion != \"skipped\")][0].head_sha // empty" || true)
+          prev=$(gh api "repos/$r/actions/workflows/build.yml/runs?branch=main&per_page=30" --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and (.event == \"push\" or .event == \"workflow_dispatch\") and .conclusion != \"cancelled\" and .conclusion != \"skipped\")][0].head_sha // empty" || true)
           shas=$([ -n "$prev" ] && gh api "repos/$r/compare/$prev...$GITHUB_SHA" --jq '.commits[].sha' || echo "$GITHUB_SHA")
           prs=$(for s in $shas; do gh api "repos/$r/commits/$s/pulls" --jq '.[0].number // empty' || true; done | sort -un)
           held=$([ "$(wc -w <<< "$prs")" -lt 2 ] || printf ' This run holds the merges of%s (main builds only its newest commit): the one that broke it fixes it.' "$(printf ' #%s' $prs)")

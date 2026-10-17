@@ -3042,7 +3042,13 @@ packages (a minute or two). `cluster-bench.yml`'s default binary (`ci`) is that 
 A pull request's push runs CI only when the pull request is labelled: `ci` builds linux-x64 with
 the suite and the tests after it, and a pull request merges once that passes (the owner,
 2026-10-16); `full-ci` adds the other platforms but macOS Intel, for a change that wants them
-first. Main builds every platform but macOS Intel on its newest commit (a push waits while a run goes,
+first. `train` is for a pull request whose touched checks passed in its lane's sandbox: the merge
+train (`tools/train.py`, `train.yml`) merges up to six of them onto the branch `train`, runs CI once
+for all, and moves main to its tip when that is green (merge commits); a red train runs its failed
+jobs again, then is halved until the pull request that broke it is sent back with a comment. One
+that changes `.github/workflows/` or the version takes `ci`. A pull request's linux-x64 is built in
+the release profile (packages `pr-linux-x64`), its unit tests also compile the crate without
+`server` as the page builds it, and what ships is built on main. Main builds every platform but macOS Intel on its newest commit (a push waits while a run goes,
 and drops one that waited before it; macOS Intel on a version commit, which a release tags, or by
 hand), with deploy.yml when what it tries changes; a platform that
 fails there is commented on the pull request it came from, and that lane fixes it at once. Never
