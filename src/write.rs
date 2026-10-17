@@ -1576,7 +1576,9 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
             if out.is_err() {
                 // Refused or failed (a cast, a query the memory watch stops, a key the table can't take): nothing lands, so the
                 // table goes too, purged: it never held a row the statement answered for, so it isn't kept for UNDROP.
-                Box::pin(on_node_as(app, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name, if_exists: true, purge: true }]), None, false)).await?;
+                if let Err(e) = Box::pin(on_node_as(app, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: name.clone(), if_exists: true, purge: true }]), None, false)).await {
+                    eprintln!("dropping {name}, a CREATE TABLE … AS SELECT that failed: {e:#}"); // (the answer stays the statement's own error)
+                }
             }
             return out;
         }
@@ -1887,7 +1889,10 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
             Box::pin(one_from_cli(dir, Stmt::Define(name.clone(), create_spec(&c, &lake, true).await?))).await?;
             let out = Box::pin(one_from_cli(dir, Stmt::Insert(name.clone(), query))).await;
             if out.is_err() {
-                Box::pin(one_from_cli(dir, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name, if_exists: true, purge: true }]))).await?; // (refused or failed: nothing lands, nor the table; purged: never kept for UNDROP)
+                // (refused or failed: nothing lands, nor the table; purged: never kept for UNDROP. The answer stays the statement's own error)
+                if let Err(e) = Box::pin(one_from_cli(dir, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: name.clone(), if_exists: true, purge: true }]))).await {
+                    eprintln!("dropping {name}, a CREATE TABLE … AS SELECT that failed: {e:#}");
+                }
             }
             out
         }

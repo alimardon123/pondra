@@ -2764,6 +2764,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    refused for memory). Rows, bytes, ranges and null counts stay the footers'. `harness.py hot`: "a table read cold
    sizes a GROUP BY by its column's distinct values (3 groups), and a join builds those".
 
+420. **A `CREATE TABLE … AS SELECT` that fails leaves no table** (`write::run_listed`, `Undo`; `from_cli`). Its table
+   is made first (`Stmt::Define`), so an INSERT of its rows that fails, for any reason, drops it, purged, before the
+   statement answers, and the answer stays the statement's own error. A request stopped before the INSERT answers
+   (the memory watch drops its future: invariant 417) drops it from `Undo`'s `drop`, as its caller. Left there, the
+   user's next try of the fixed statement was refused 42P07. `harness.py objects`: "a CREATE TABLE … AS SELECT that
+   fails leaves no table…" (the old build kept it after a cast's 22P02 and after the watch's stop).
+
 ## Tests: run these before and after any change
 
 ```bash
