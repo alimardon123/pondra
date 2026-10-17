@@ -74,7 +74,7 @@ fn rewritten(plan: &LogicalPlan, config: &dyn OptimizerConfig) -> Result<Option<
     if any_node(plan, differs_by_reading)? {
         return Ok(None);
     }
-    let new = build(window, &keys, calls, config)?;
+    let Ok(new) = build(window, &keys, calls, config) else { return Ok(None) }; // (a rewrite that can't be made leaves the query as it was: refused as before, never another error)
     let same = same_fields(&new, plan);
     Ok(same.then_some(new))
 }
