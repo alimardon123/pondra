@@ -7,7 +7,7 @@
 //! integer where an array is, or a path into a scalar, is refused. `pg_json::operator` plans `-` and `#-` onto these.
 use crate::codes::coded;
 use crate::pg_catalog::{function, marked};
-use crate::pg_json::{index_of, is_integer, lists};
+use crate::pg_json::{index_of, is_integer, is_text, lists, JSON_SPACE};
 use crate::pg_json_make::{as_text, depth_check, fail, find, in_jsonb_order, is_null_at, json_string, parse, per_row, refuse, text_at, write, Node};
 use crate::types::json_refusal;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
@@ -173,7 +173,7 @@ struct Lists {
 
 impl Lists {
     fn of(a: &ArrayRef, n: usize) -> Result<Lists> {
-        let text = matches!(a.data_type(), DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+        let text = is_text(a.data_type());
         if text && n > 0 && (0..n).all(|i| !is_null_at(a, i) && text_at(a, i) == text_at(a, 0)) {
             let once = lists(&a.slice(0, 1)).map_err(fail)?;
             return Ok(Lists { once: once.into_iter().next(), rows: Vec::new() });
@@ -457,8 +457,6 @@ fn stripped(jiter: &mut Jiter, doc: &str, peek: Peek, out: &mut String) -> Optio
     Some(())
 }
 
-const JSON_SPACE: &[char] = &[' ', '\t', '\n', '\r'];
-
 /// `jsonb_pretty`, written into `out`: jsonb's text indented four spaces a level, a member or element to a line, an
 /// empty object or array as `{` and a line and `}`.
 fn pretty_into(out: &mut String, doc: &str) -> Result<()> {
@@ -681,6 +679,22 @@ mod tests {
         assert_eq!(refused(strip_json(r#"{"a":1"#)), "22P02");
         let deep = "[".repeat(10_001) + &"]".repeat(10_001);
         assert_eq!(refused(strip_json(&deep)), "54001", "nested past the limit");
+    }
+
+    #[test]
+    fn json_strip_nulls_passes_over_spaces_around_the_document() {
+        let bare = r#"{"b":[null,{}]}"#;
+        let padded = [
+            r#" {"a":null,"b":[null,{"c":null}]}"#,
+            "\t\n{\"a\":null,\"b\":[null,{\"c\":null}]}",
+            r#"{"a":null,"b":[null,{"c":null}]} "#,
+            "\r\n \t{\"a\":null,\"b\":[null,{\"c\":null}]}\n",
+        ];
+        for doc in padded {
+            assert_eq!(strip_json_text(doc), bare, "{doc:?}");
+        }
+        assert_eq!(strip_json_text(" [null, 1]\n"), "[null,1]");
+        assert_eq!(strip_json_text(" \t1.50 "), "1.50", "a scalar as written");
     }
 
     #[test]
