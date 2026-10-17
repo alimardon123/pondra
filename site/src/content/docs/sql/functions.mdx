@@ -244,6 +244,61 @@ id  user_json         amount_json  name_json
 2   {"name": "bo"}    4.5          "tea"
 ```
 
+### Making JSON
+
+These make JSON from values, and answer what Postgres answers. A document in a column (`JSON` or
+`JSONB`) goes into the result as the document, not as a string.
+
+| Function | Answers |
+|---|---|
+| `to_json(x)`, `to_jsonb(x)` | the value as JSON: a number, a string, a date, a list, or a document |
+| `row_to_json(t)` | a row as an object, one key per column |
+| `json_build_object('k', v, …)`, `jsonb_build_object(…)` | an object from key and value pairs |
+| `json_build_array(v, …)`, `jsonb_build_array(…)` | an array of the values |
+| `json_agg(x)`, `jsonb_agg(x)` | an array of the rows. Takes `ORDER BY`, `FILTER`, `DISTINCT`, `GROUP BY` and `OVER` |
+| `json_object_agg(k, v)`, `jsonb_object_agg(k, v)` | an object from the rows' key and value pairs |
+
+A whole row can be a table, an alias, a CTE or a subquery. `json_agg(t)` answers each row as an
+object keyed by the column names. Give it an `ORDER BY` when the order matters: SQL doesn't order the
+rows of an aggregate that has none.
+
+```sql
+CREATE TABLE people (id BIGINT, name VARCHAR, doc JSON);
+INSERT INTO people VALUES
+  (1, 'ann', '{"tags": ["a", "b"]}'),
+  (2, 'bo', NULL);
+
+SELECT json_agg(t ORDER BY t.id) FROM (SELECT id, name FROM people) t;
+```
+
+```text
+[{"id":1,"name":"ann"}, 
+ {"id":2,"name":"bo"}]
+```
+
+`json_build_object` nests a JSON column's document, and `coalesce` gives an empty array for no rows:
+
+```sql
+SELECT json_build_object('id', id, 'doc', doc) AS row FROM people ORDER BY id;
+
+SELECT json_build_object('items', coalesce(json_agg(t), '[]')) AS answer
+FROM (SELECT id, name FROM people WHERE id > 10) t;
+```
+
+```text
+{"id" : 1, "doc" : {"tags": ["a", "b"]}}
+{"id" : 2, "doc" : null}
+
+{"items" : []}
+```
+
+<Aside type="caution">
+A whole row needs a name for each of its columns: `json_agg(t)` over `(SELECT upper(name) FROM people) t`
+is refused (`0A000`), where Postgres answers it under the key `upper`. Give the item an alias. Over a
+file (`read_csv(…) f`), name the columns in `json_build_object` instead. `DISTINCT` over a `JSON`
+value is refused, as Postgres refuses it (`42883`); a `JSONB` value is fine.
+</Aside>
+
 ## Vectors
 
 A vector is a `FLOAT[]` column. The distance functions take two vectors of the same length and
