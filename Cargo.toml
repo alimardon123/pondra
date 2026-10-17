@@ -18,6 +18,7 @@ server = ["dep:http", "dep:slatedb", "dep:reqwest", "tokio/full", "dep:axum", "d
 
 [workspace]
 members = ["capi", "launcher"] # (pondra_lib, the C ABI, and the launcher that loads it: `cargo build --workspace` builds them with the program, into one folder; a plain build at the root builds the program alone)
+exclude = ["web"] # (the page form's module: a workspace of its own for wasm32, built by tools/web_build.sh)
 
 [lib]
 doctest = false # (the modules' docs are prose and SQL, not Rust examples)
