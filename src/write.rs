@@ -844,6 +844,19 @@ pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::Fi
     Ok(ctx.table("t").await?.schema().fields().iter().cloned().collect::<Vec<_>>())
 }
 
+/// The `sql_types` of a table made from `sql`, whose columns are `names`: the query's output columns in its order, as
+/// the table names them. Those the query takes from a uuid, json or jsonb (or a maker) keep their type, as `CREATE TABLE
+/// … AS` keeps them and a view's table does too (`pg_types::columns`). A query that gives another number of columns
+/// than `names` gives none: a type matched to the wrong name would be a guess. (A view kept as partial rows is no
+/// query's columns: its caller passes none, `finish.rs`.)
+pub async fn query_types(lake: &Lake, sql: &str, names: &[String]) -> BTreeMap<String, String> {
+    let shape = crate::pg_types::columns(lake, sql).await;
+    if shape.types.len() != names.len() {
+        return BTreeMap::new();
+    }
+    names.iter().zip(&shape.types).filter_map(|(n, t)| (*t).map(|t| (n.clone(), t.name().to_string()))).collect()
+}
+
 /// `CREATE TABLE t (a BIGINT, b VARCHAR, PRIMARY KEY (a)) [WITH (publish = 'delta,iceberg',
 /// cluster_by = 'b', merge = 'total:sum', partition_by = 'day(ts)')]` → the table name and its spec. SQL types become Arrow
 /// types the way DataFusion maps them.
@@ -871,9 +884,8 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
             let fields = crate::query::run_schema(&ctx, df.logical_plan())?.fields().iter().cloned().collect::<Vec<_>>();
             match c.columns.is_empty() {
                 true => {
-                    // (a column the query takes from a uuid, json or jsonb is one here too: `CREATE TABLE t2 AS SELECT * FROM t`)
-                    let shape = crate::pg_types::columns(from, &sql).await;
-                    sql_types.extend(fields.iter().zip(&shape.types).filter_map(|(f, t)| (*t).map(|t| (f.name().clone(), t.name().to_string()))));
+                    let names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
+                    sql_types.extend(query_types(from, &sql, &names).await);
                     fields
                 }
                 false => {

@@ -49,14 +49,30 @@ fn check_named(meta: &TableMeta, table: &str, rows: &RecordBatch, sql_names: boo
     Ok(())
 }
 
+/// The session CHECKs, DEFAULTs and expectations are planned in: the functions and operators every session has, Postgres's
+/// JSON ones among them (`pg_json::planned`, with the JSON functions they are built on, as `engine::session` registers
+/// them), and the types' own. So a condition that works in a query works here, and one that doesn't is refused at CREATE,
+/// as Postgres refuses it. Built once: `evaluate` and `breaking` run it as it is; `values` and `validate` take a copy
+/// (`copy`), so what they register is theirs alone.
+static BASE: std::sync::LazyLock<SessionContext> = std::sync::LazyLock::new(|| {
+    let mut ctx = SessionContext::new();
+    datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // (`->` and `->>`: `pg_json` plans only the others)
+    let ctx = crate::pg_json::planned(ctx);
+    crate::types::register(&ctx); // (gen_random_uuid(), uuidv7(), pg_typeof(x))
+    ctx
+});
+
+/// A session with BASE's functions, for what registers functions of its own (`nextval`): what holds the lake must never
+/// go into BASE, which every check shares (invariants 199, 301).
+fn copy() -> SessionContext { SessionContext::new_with_state(BASE.state()) }
+
 /// `expr` over `rows` (their columns by name), a value for each row; None if it doesn't plan
 /// over them alone (a qualified name, a subquery: SQL works it out instead).
 pub fn evaluate(rows: &RecordBatch, expr: &str) -> Result<Option<ArrayRef>> {
     use datafusion::common::DFSchema;
-    static CTX: std::sync::LazyLock<SessionContext> = std::sync::LazyLock::new(SessionContext::new);
     let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
-    let Ok(e) = CTX.parse_sql_expr(expr, &schema) else { return Ok(None) };
-    let Ok(phys) = CTX.create_physical_expr(e, &schema) else { return Ok(None) };
+    let Ok(e) = BASE.parse_sql_expr(expr, &schema) else { return Ok(None) };
+    let Ok(phys) = BASE.create_physical_expr(e, &schema) else { return Ok(None) };
     Ok(Some(phys.evaluate(rows)?.into_array(rows.num_rows())?))
 }
 
@@ -64,10 +80,9 @@ pub fn evaluate(rows: &RecordBatch, expr: &str) -> Result<Option<ArrayRef>> {
 /// (NULL passes, as with Postgres's CHECK). Expectations (`views::Expect`) and tables' CHECKs.
 pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
     use datafusion::common::DFSchema;
-    static CTX: std::sync::LazyLock<SessionContext> = std::sync::LazyLock::new(SessionContext::new);
     let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
-    let expr = CTX.parse_sql_expr(check, &schema)?;
-    let value = CTX.create_physical_expr(expr, &schema)?.evaluate(rows)?.into_array(rows.num_rows())?;
+    let expr = BASE.parse_sql_expr(check, &schema)?;
+    let value = BASE.create_physical_expr(expr, &schema)?.evaluate(rows)?.into_array(rows.num_rows())?;
     let Some(b) = value.as_boolean_opt() else { bail!("CHECK ({check}) is not a condition: it gives {}, not true or false (a condition, such as CHECK (amount > 0))", value.data_type()) };
     Ok(b.iter().map(|v| Some(v == Some(false))).collect())
 }
@@ -93,8 +108,7 @@ pub fn any(meta: &TableMeta) -> bool { !meta.defaults.is_empty() }
 pub async fn values(lake: &crate::store::Lake, meta: &TableMeta, column: &str, n: usize) -> Result<Option<ArrayRef>> {
     let Some(stored) = meta.stored(column) else { return Ok(None) };
     let (Some(expr), Some((_, _, t))) = (meta.defaults.get(stored), meta.live().find(|(s, _, _)| *s == stored)) else { return Ok(None) };
-    let ctx = SessionContext::new();
-    crate::types::register(&ctx); // (gen_random_uuid(), uuidv7())
+    let ctx = copy();
     if crate::seq::calls(expr) {
         crate::seq::register(&ctx, lake.arc()); // (an identity's `nextval('t_id_seq')`)
     }
@@ -106,8 +120,7 @@ pub async fn values(lake: &crate::store::Lake, meta: &TableMeta, column: &str, n
 
 /// A default's expression checked when the table is made: it gives one value of the column's type.
 pub async fn validate(column: &str, sql_type: &str, expr: &str) -> Result<()> {
-    let ctx = SessionContext::new();
-    crate::types::register(&ctx); // (gen_random_uuid(), uuidv7())
+    let ctx = copy();
     let one = |_: &[datafusion::logical_expr::ColumnarValue]| Ok(datafusion::logical_expr::ColumnarValue::Scalar(datafusion::common::ScalarValue::Int64(Some(1))));
     let int = datafusion::arrow::datatypes::DataType::Int64;
     ctx.register_udf(datafusion::prelude::create_udf("nextval", vec![datafusion::arrow::datatypes::DataType::Utf8], int, datafusion::logical_expr::Volatility::Volatile, std::sync::Arc::new(one))); // (its type: the sequence itself is looked for by `seq::named_exist`)
@@ -271,5 +284,13 @@ mod tests {
         assert!(fills_existing(&column("c INT DEFAULT 0")));
         assert!(fills_existing(&column("c INT NOT NULL")));
         assert!(fills_existing(&column("c INT NOT NULL DEFAULT NULL")));
+    }
+
+    #[test]
+    fn the_shared_base_plans_postgres_json_operators() {
+        // (CHECK, DEFAULT and expectations are planned in BASE: its `->>` comes from the JSON functions, as a session's does)
+        let doc: ArrayRef = std::sync::Arc::new(datafusion::arrow::array::StringArray::from(vec!["{\"a\": 1}"]));
+        let rows = RecordBatch::try_from_iter(vec![("doc", doc)]).unwrap();
+        assert!(evaluate(&rows, "doc ->> 'a'").unwrap().is_some());
     }
 }

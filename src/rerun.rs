@@ -424,7 +424,9 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
     if let Some((c, _)) = columns.iter().find(|(c, _)| crate::sys::NAMES.contains(&c.as_str())) {
         bail!("{c} is a system column of the view's own table: name it something else ({c} AS source{c})");
     }
-    let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
+    let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
+    let sql_types = crate::write::query_types(lake, sql, &names).await;
+    let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), sql_types, ..Default::default() };
     let r = Rerun { id: uuid::Uuid::new_v4().to_string(), keys, full, reason, asked, lag_secs, joins };
     let view = View { source: source.into(), sql: sql.into(), emit: None, sessions: None, ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: Some(r) };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (crate::views::view_key(name), json(&view))], &[]).await

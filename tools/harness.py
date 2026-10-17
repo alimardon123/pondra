@@ -16204,6 +16204,7 @@ def jsons():
         check("a materialized view of json_agg(v ORDER BY v) GROUP BY k is filled, then answers what the query answers after an INSERT and after an UPDATE", wholes_materialized)
         check("setup: p (three parents) and c (four children, an orphan, a NULL document)", padding_setup)
         check('a whole row an outer join pads is NULL where Postgres 16 pads it: LEFT (json_agg [null], row_to_json NULL, json_build_object {"c" : null}), RIGHT (json_agg null), coalesce(json_agg ... FILTER) []; HTTP and the port', padding)
+        _jsons_w3(checks, info, port, url)
     finally:
         if node is not None:
             node.kill()
@@ -16214,6 +16215,128 @@ def jsons():
     if not ok:
         sys.exit(1)
     return f"{sum(checks.values())} of {len(checks)} JSON checks"
+
+
+def _jsons_w3(checks, info, port, url):
+    """W3 (PR #131): CHECK, DEFAULT and a materialized view's expectations take the JSON functions and operators (`defaults.rs`:
+    one base session, with the JSON functions `->` and `->>` as every session has them; a view's condition regrouped as
+    Postgres groups it when the view is made, `views.rs`'s `grouped`), and a materialized view's JSON column is typed as
+    CREATE TABLE … AS types its own (`write::query_types`). Every refusal is Postgres 16's SQLSTATE and every row Postgres 16's,
+    taken from the same definitions on TEMP tables of a psql session (the rows the expectations keep: `WHERE (cond) IS NOT FALSE`)."""
+    import psycopg
+
+    def ok(s):
+        """Runs over HTTP: True, or the SQLSTATE the node refused it with."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return True if r.status == 200 else r.getheader("x-pondra-sqlstate")
+
+    def http_rows(s):
+        return call(port, "POST", "/sql", s.encode(), timeout=120)
+
+    def port_rows(s):
+        """psycopg's rows and the type codes of their columns (a jsonb column comes as a dict, 3802)."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            cur = conn.execute(s)
+            return cur.fetchall(), [d.type_code for d in cur.description]
+
+    def port_ok(s):
+        """Runs over the Postgres port: True, or the SQLSTATE it refused the statement with."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            try:
+                conn.execute(s)
+                return True
+            except psycopg.Error as e:
+                return e.sqlstate
+
+    def refused(s, code):
+        """Refused with `code` by HTTP and by the port alike."""
+        return ok(s) == code and port_ok(s) == code
+
+    def run(name, fn):
+        """A check's value: its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def table_check(table, make, good, bad, code, kept):
+        """A table made with a CHECK: a good row written, a bad one refused by `code` over HTTP and the port, and the rows left."""
+        created = ok(make) is True
+        wrote = ok(good) is True
+        return created and wrote and refused(bad, code) and http_rows(f"SELECT id FROM {table} ORDER BY id") == kept
+
+    def c1():
+        return table_check("w3_c1", "CREATE TABLE w3_c1 (id INT, doc JSONB CHECK (doc ? 'id'))",
+                           "INSERT INTO w3_c1 VALUES (1, '{\"id\": 1}')", "INSERT INTO w3_c1 VALUES (2, '{\"a\": 1}')", "23514", [{"id": 1}])
+
+    def c2():
+        return table_check("w3_c2", "CREATE TABLE w3_c2 (id INT, doc JSONB CHECK (jsonb_typeof(doc) = 'object'))",
+                           "INSERT INTO w3_c2 VALUES (1, '{\"a\": 1}')", "INSERT INTO w3_c2 VALUES (2, '[1, 2]')", "23514", [{"id": 1}])
+
+    def c3():
+        created = ok("CREATE TABLE w3_c3 (id INT, doc JSONB DEFAULT jsonb_build_object('a', 1))") is True
+        filled = ok("INSERT INTO w3_c3 (id) VALUES (1)") is True
+        got, codes = port_rows("SELECT doc FROM w3_c3 WHERE id = 1")
+        info["DEFAULT jsonb_build_object('a', 1): the port's rows and type codes (Postgres 16: {'a': 1} as jsonb, 3802)"] = [got, codes]
+        return created and filled and got == [({"a": 1},)] and codes == [3802] and refused("INSERT INTO w3_c3 (id, doc) VALUES (2, 'not json')", "22P02")
+
+    def c4():
+        return table_check("w3_c4", "CREATE TABLE w3_c4 (id INT, doc JSONB CHECK (doc ->> 'id' IS NOT NULL))",
+                           "INSERT INTO w3_c4 VALUES (1, '{\"id\": 1}')", "INSERT INTO w3_c4 VALUES (2, '{\"a\": 1}')", "23514", [{"id": 1}])
+
+    def c5():
+        return table_check("w3_c5", "CREATE TABLE w3_c5 (id INT, doc JSONB CHECK (doc ->> 'a' = 'x'))",
+                           "INSERT INTO w3_c5 VALUES (1, '{\"a\": \"x\"}')", "INSERT INTO w3_c5 VALUES (2, '{\"a\": \"y\"}')", "23514", [{"id": 1}])
+
+    # Two materialized views with an expectation each over the same JSON table: `?` and `->>`, made with the rows there
+    # and then written to. Postgres 16's rows after the two writes: (doc ? 'a') and (doc ->> 'a' = 'x') IS NOT FALSE.
+    def views_setup():
+        made = all(ok(s) is True for s in [
+            "CREATE TABLE w3_ej (id INT, doc JSONB, note TEXT)",
+            "INSERT INTO w3_ej VALUES (1, '{\"a\": 1}', 'one'), (2, '{\"b\": 2}', 'two'), (3, '{\"a\": \"x\", \"c\": 4}', 'three'), "
+            "(4, NULL, 'four'), (5, '{\"a\": \"y\"}', 'five')",
+            "CREATE MATERIALIZED VIEW w3_ev (CONSTRAINT has_a CHECK (doc ? 'a') ON VIOLATION DROP ROW) AS SELECT id, doc FROM w3_ej",
+            "CREATE MATERIALIZED VIEW w3_eq (CONSTRAINT ax CHECK (doc ->> 'a' = 'x') ON VIOLATION DROP ROW) AS SELECT id, doc FROM w3_ej",
+        ])
+        written = ok("INSERT INTO w3_ej VALUES (6, '{\"b\": 1}', 'six'), (7, '{\"a\": 7}', 'seven')") is True
+        return made and written
+
+    ready = []  # (the views' setup, made once: both checks read the same two views)
+
+    def views_ready():
+        if not ready:
+            ready.append(views_setup())
+        return ready[0]
+
+    def view_question():
+        return views_ready() and [r["id"] for r in http_rows("SELECT id FROM w3_ev ORDER BY id")] == [1, 3, 4, 5, 7]
+
+    def view_arrow():
+        return views_ready() and [r[0] for r in port_rows("SELECT id FROM w3_eq ORDER BY id")[0]] == [2, 3, 4, 6]
+
+    def view_json_type():
+        made = all(ok(s) is True for s in [
+            "CREATE TABLE w3_mo_src (id INT, note TEXT)",
+            "INSERT INTO w3_mo_src VALUES (1, 'a'), (2, 'b')",
+            "CREATE MATERIALIZED VIEW w3_mo AS SELECT id, jsonb_build_object('a', id) AS o FROM w3_mo_src",
+        ])
+        rows, codes = port_rows("SELECT id, o FROM w3_mo ORDER BY id")
+        info["materialized view jsonb_build_object AS o: the port's rows and type codes (Postgres 16: 23 and 3802, dicts)"] = [rows, codes]
+        return made and rows == [(1, {"a": 1}), (2, {"a": 2})] and codes == [23, 3802]
+
+    run("W3: CHECK (doc ? 'id') on a JSONB column: CREATE takes it, a row with the key is written, one without refused 23514 by HTTP and the port, and only the good row is there", c1)
+    run("W3: CHECK (jsonb_typeof(doc) = 'object'): CREATE takes it; an object is written, an array refused 23514 by HTTP and the port", c2)
+    run("W3: DEFAULT jsonb_build_object('a', 1) fills {\"a\": 1} as jsonb (3802, a dict over the port); a value that isn't JSON refused 22P02 by both", c3)
+    run("W3: CHECK (doc ->> 'id' IS NOT NULL): CREATE takes it, a row with the key written, one without refused 23514 by HTTP and the port", c4)
+    run("W3: CHECK (doc ->> 'a' = 'x') on a table: CREATE takes it, 'x' written, 'y' refused 23514 by HTTP and the port (the door regroups it)", c5)
+    run("W3: a materialized view's expectation CHECK (doc ? 'a') ON VIOLATION DROP ROW over a JSON column keeps the rows Postgres 16 keeps, before and after writes", view_question)
+    run("W3: a materialized view's expectation CHECK (doc ->> 'a' = 'x') ON VIOLATION DROP ROW keeps the rows Postgres 16 keeps, through the port, after writes", view_arrow)
+    run("W3: a materialized view of jsonb_build_object('a', id) AS o: o is typed jsonb (3802) over psycopg, its rows are dicts, id is int4 (23)", view_json_type)
 
 
 # The sample data the BI tools' statements were captured against (copied from /tmp/claude-0/bi/PREAMBLE.md, "Sample

@@ -49,7 +49,7 @@ PROCESS = {
     "console.rs:SERVER": "the server's page, built into the binary",
     "constraints.rs:TURN": LOCK,
     "copy.rs:MS": SETTING + " (PONDRA_LOAD_RETENTION_SECS)",
-    "defaults.rs:CTX": "a session with no tables, for DEFAULT and CHECK expressions: nothing of a lake",
+    "defaults.rs:BASE": "the functions every session has, with no tables, for CHECK, DEFAULT and expectation expressions: nothing of a lake (what registers one gets a copy)",
     "dbserver.rs:KEY": "the key a lakes server gives its databases' nodes (`client_key`): one a process, made once",
     "delta.rs:ONE": LOCK,
     "library.rs:LIBRARY": "what the process is: a library's, from its first open (ADR-061 §5)",
