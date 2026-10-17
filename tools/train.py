@@ -124,7 +124,7 @@ class Train:
                      and r["head_sha"] == tip), None)
 
     def slots(self):
-        """Going runs that take a slot: a PR's run or the train's. Two may go at once, no more."""
+        """Going runs that take a slot: a PR's run or the train's. SLOTS may go at once (ci-slots.yml), no more."""
         return sum(1 for r in self.runs() if r["status"] != "completed" and (
             r["event"] == "pull_request" or (r["event"] == "workflow_dispatch" and r["head_branch"] == "train")))
 
@@ -289,7 +289,7 @@ class Train:
         git("fetch", "origin", "main")
         if not prs:
             return self.set_riding([])   # nothing queued: no PR may keep riding a train that isn't there
-        if self.slots() >= 2:
+        if self.slots() >= int(os.environ.get("SLOTS") or 3):
             return say("waiting: runs going")
         git("checkout", "-B", "train", "origin/main")
         base = git("rev-parse", "origin/main")

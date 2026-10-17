@@ -93,6 +93,7 @@ jobs:
           FULL: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
           MODE: ${{ inputs.mode }}
           PR: ${{ github.event.pull_request.number }}
+          SLOTS: ${{ vars.CI_SLOTS || 3 }} # (ci-slots.yml says why)
         run: |
           # (linux-x64 pinned: ubuntu-latest becomes 26.04 from 2026-10-19; moved on purpose, after a
           # green run there. macos-13 was retired; Intel images last until 2027.)
@@ -203,22 +204,21 @@ jobs:
           done
           echo "Runs:${runs:- nothing (no check reads what this changes)}$([ "$files" != ALL ] || echo ' (everything: started by hand, or no passed run of main found)')." >> "$GITHUB_STEP_SUMMARY"
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            # At most two pull requests' CI at once (two from 2026-10-03; four from 2026-10-11, for the
-            # month's eight lanes; two again from 2026-10-16, since the account's runners are shared with
-            # the owner's other work; ci-slots.yml's SLOTS says the same): with two older runs of other
-            # pull requests going, this one waits. It builds nothing, its check `waiting for a CI slot`
-            # fails, it holds no runner, and ci-slots.yml starts it again when a run ends.
+            # At most SLOTS pull requests' CI at once (ci-slots.yml says how many and why): with that many
+            # older runs of other pull requests going, this one waits. It builds nothing, its check
+            # `waiting for a CI slot` fails, it holds no runner, and ci-slots.yml starts it again when a
+            # run ends.
             # (If the API can't be asked, it runs: a slot is never worth a stuck pull request.)
             # (the train's run takes a slot too: tools/train.py cuts one only with a slot free, and it never waits)
             going=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?per_page=100" \
               --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and .status != \"completed\") | select((.event == \"pull_request\" and (.pull_requests[0].number // 0) != $PR) or (.event == \"workflow_dispatch\" and .head_branch == \"train\"))] | length") || going=0
-            if [ "$going" -ge 2 ]; then
+            if [ "$going" -ge "$SLOTS" ]; then
               echo wait=true >> "$GITHUB_OUTPUT"
-              echo "Waiting for a CI slot: $going other pull requests' runs are going (two at a time). ci-slots.yml starts this run again when one ends." >> "$GITHUB_STEP_SUMMARY"
+              echo "Waiting for a CI slot: $going other pull requests' runs are going ($SLOTS at a time). ci-slots.yml starts this run again when one ends." >> "$GITHUB_STEP_SUMMARY"
             fi
           fi
 
-  # A pull request over the two at a time: red until it runs, so nobody takes it for passed.
+  # A pull request over the slots: red until it runs, so nobody takes it for passed.
   slot:
     name: waiting for a CI slot
     needs: plan
@@ -226,7 +226,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - run: |
-          echo "::error title=Waiting for a CI slot::Two other pull requests' CI runs are going, and only two run at once. This run starts again by itself when one ends (ci-slots.yml): nothing to do."
+          echo "::error title=Waiting for a CI slot::${{ vars.CI_SLOTS || 3 }} other pull requests' CI runs are going, and only that many run at once. This run starts again by itself when one ends (ci-slots.yml): nothing to do."
           exit 1
 
   # The documentation website, built as pages.yml publishes it with each release, so a page that

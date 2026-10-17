@@ -399,15 +399,33 @@ def main_moved_recut(path):
 
 @case
 def slots_taken(path):
-    """Two other PR runs going: nothing is cut."""
+    """Three other PR runs going (the slots when CI_SLOTS isn't set): nothing is cut."""
     with Scenario(path) as sc:
         sc.open_pr(1, "first", {"a.txt": "one\n"})
         sc.add_run(20, "0" * 40, event="pull_request", branch="pr-x", status="in_progress", conclusion=None)
         sc.add_run(21, "0" * 40, event="pull_request", branch="pr-y", status="queued", conclusion=None)
+        sc.add_run(22, "0" * 40, event="pull_request", branch="pr-z", status="queued", conclusion=None)
         before = sc.state()
         out = sc.step()
-        expect(sc.state() == before and sc.tip() is None, "a train was cut while two runs went")
+        expect(sc.state() == before and sc.tip() is None, "a train was cut while three runs went")
         expect("waiting: runs going" in out, out)
+
+
+@case
+def slots_from_variable(path):
+    """Two other PR runs going: CI_SLOTS = 2 (the workflows' SLOTS) holds the train, the default of three cuts it."""
+    with Scenario(path) as sc:
+        sc.open_pr(1, "first", {"a.txt": "one\n"})
+        sc.add_run(20, "0" * 40, event="pull_request", branch="pr-x", status="in_progress", conclusion=None)
+        sc.add_run(21, "0" * 40, event="pull_request", branch="pr-y", status="queued", conclusion=None)
+        os.environ["SLOTS"] = "2"
+        try:
+            out = sc.step()
+        finally:
+            del os.environ["SLOTS"]
+        expect(sc.tip() is None and "waiting: runs going" in out, out)
+        sc.step()
+        expect(sc.tip() is not None, "no train cut with a slot free")
 
 
 @case

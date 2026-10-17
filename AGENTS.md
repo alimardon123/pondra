@@ -3052,8 +3052,9 @@ the release profile (packages `pr-linux-x64`), its unit tests also compile the c
 and drops one that waited before it; macOS Intel on a version commit, which a release tags, or by
 hand), with deploy.yml when what it tries changes; a platform that
 fails there is commented on the pull request it came from, and that lane fixes it at once. Never
-turn on auto-merge before its run starts. Two pull requests' runs go at once (ci-slots.yml; the
-account's runners are shared with the owner's other work, 2026-10-16), and a run does only what its
+turn on auto-merge before its run starts. Three pull requests' runs go at once (ci-slots.yml; the
+account's runners are shared with the owner's other work, 2026-10-16; three on GitHub Pro, 2026-10-17;
+the repository variable `CI_SLOTS` changes it), and a run does only what its
 change touches (build.yml's `plan`: a change no check reads runs nothing; one that leaves the crate
 alone skips its unit tests).
 
