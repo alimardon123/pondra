@@ -6461,7 +6461,9 @@ def hot():
     it, a key, and NULL-sensitive filters over a column with a batch of NULLs; every answer the
     model's, and the range, the top-N and the key skip batches (`pondra_hot_batches_skipped_total`).
     Then rows tiered from the log, and eight small files held and merged: a hot table's new files are
-    held as they are written, and a merge's file takes the replaced files' place (`Hot::put`, `Hot::forget`)."""
+    held as they are written, and a merge's file takes the replaced files' place (`Hot::put`, `Hot::forget`).
+    Last, a table read cold (a hot budget no file fits: PONDRA_HOT_GB=0.000001) sizes its GROUP BY by its
+    columns' distinct values (`hot::told`)."""
     import re
     lake = new_lake()
     node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1"}).start()
@@ -6554,6 +6556,27 @@ def hot():
         checks["…and the merged rows answer"] = q("SELECT count(*) AS n, sum(a) AS a FROM m") == [{"n": 400000, "a": sum(range(400000))}]
     finally:
         node.kill()
+        clean_up()
+    # A table read cold is told its columns' distinct values as the hot batches are (`hot::told`): a
+    # GROUP BY over a column of three values is sized at three rows, and a join builds those three, not
+    # the 300,000 input rows. PONDRA_HOT_GB=0.000001 is a budget no file fits (about 1 KB), so every read
+    # takes HotFiles' cold branch; with 0 the hot columns are off and reads never reach it.
+    cold = Node(new_lake(), A.port, env={"PONDRA_HOT_GB": "0.000001"}).start()
+    try:
+        cq = lambda s: call(A.port, "POST", "/sql", s.encode(), headers={"x-pondra-session": "cold-groups-1"})  # (SET is the session's)
+        cq("CREATE TABLE li AS SELECT value AS id, CASE value % 3 WHEN 0 THEN 'A' WHEN 1 THEN 'N' ELSE 'R' END AS flag, value % 50 AS q FROM generate_series(1, 300000)")
+        cq("SET datafusion.explain.show_statistics = true")
+        join = "SELECT count(*) AS n FROM li l JOIN (SELECT flag, avg(q) a FROM li GROUP BY flag) g ON l.flag = g.flag"
+        physical = {r["plan_type"]: r["plan"] for r in cq("EXPLAIN " + join)}.get("physical_plan", "")
+        aggs = [l for l in physical.splitlines() if "AggregateExec" in l and "gby=[flag" in l]
+        joins = [l for l in physical.splitlines() if "HashJoinExec" in l]
+        sized = [re.search(r"expected_rows=(\d+)", l) for l in aggs]
+        got = cq(join)
+        seen["a table read cold, as planned"] = {"aggregates": aggs, "joins": joins, "the join's count": got}
+        checks["a table read cold sizes a GROUP BY by its column's distinct values (3 groups), and a join builds those"] = \
+            bool(aggs) and all(m and m.group(1) == "3" for m in sized) and bool(joins) and all("CollectLeft" in l for l in joins) and got == [{"n": 300000}]
+    finally:
+        cold.kill()
         clean_up()
     ok = all(checks.values())
     print(json.dumps({"hot": checks, "seen": seen, "ok": ok}, indent=1))
