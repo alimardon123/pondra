@@ -630,7 +630,7 @@ async fn space(app: &crate::server::App, ns: &str) -> Result<(Vec<String>, std::
     let parts: Vec<&str> = ns.split('\u{1f}').collect();
     let found = spaces(app).await.into_iter().find(|(p, _, _)| *p == parts).ok_or_else(|| missing(&format!("namespace {}", parts.join(".")), "NoSuchNamespaceException"))?;
     if !std::sync::Arc::ptr_eq(&found.1, &app.lake) {
-        crate::users::across(&found.1, &found.0[0]).await.map_err(|e| refused(403, "ForbiddenException", e.to_string()))?;
+        crate::users::across(&found.1, &found.0[0]).await.map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
         if crate::auth::limited().is_some() {
             return Err(refused(403, "ForbiddenException", format!("permission denied: {} is another database: its tables are read through it (the database {})", found.0[0], found.0[0])));
         }
@@ -703,11 +703,14 @@ fn sql_name(app: &crate::server::App, parts: &[String], lake: &std::sync::Arc<La
 /// A statement for the catalog's table changes, run as the caller (DDL: an admin's).
 async fn as_caller(app: &crate::server::App, role: crate::auth::Role, sql: &str) -> Result<(), Refusal> {
     let who = crate::routines::Who { role, files: false, depth: 0 };
-    Box::pin(crate::routines::one(app, sql, who, None)).await.map(|_| ()).map_err(|e| match format!("{e:#}") {
-        e if e.contains("may not") => refused(403, "ForbiddenException", e),
-        e if e.contains("already exists") => refused(409, "AlreadyExistsException", e),
-        e if e.contains("isn't empty") => refused(409, "NamespaceNotEmptyException", e),
-        e => bad(e),
+    Box::pin(crate::routines::one(app, sql, who, None)).await.map(|_| ()).map_err(|e| {
+        let (raw, words) = (format!("{e:#}"), crate::ext::said(&e)); // (the kind by the engine's words, the message as said)
+        match () {
+            _ if raw.contains("may not") => refused(403, "ForbiddenException", words),
+            _ if raw.contains("already exists") => refused(409, "AlreadyExistsException", words),
+            _ if raw.contains("isn't empty") => refused(409, "NamespaceNotEmptyException", words),
+            _ => bad(words),
+        }
     })
 }
 
@@ -721,7 +724,7 @@ async fn create(axum::extract::State(app): axum::extract::State<crate::server::A
     let (parts, lake, schema) = space(&app, &ns).await?;
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the table: {e}")))?;
     let table = asked["name"].as_str().filter(|n| !n.is_empty()).ok_or_else(|| bad("a table without its name".into()))?;
-    let sql = create_sql(&sql_name(&app, &parts, &lake, &schema, table), &asked).map_err(|e| bad(format!("{e:#}")))?;
+    let sql = create_sql(&sql_name(&app, &parts, &lake, &schema, table), &asked).map_err(|e| bad(crate::ext::said(&e)))?;
     as_caller(&app, role, &sql).await?;
     let name = crate::ddl::join(&schema, table);
     for _ in 0..600 {
@@ -909,7 +912,7 @@ async fn load(axum::extract::State(app): axum::extract::State<crate::server::App
     // metadata table `files` of `t`, as Spark does)
     let no_table = || missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException");
     let (_, lake, schema) = space(&app, &ns).await.map_err(|_| no_table())?;
-    crate::auth::check_all(&crate::ddl::join(&schema, &table)).map_err(|e| refused(403, "ForbiddenException", e.to_string()))?; // (a user's: an engine reads the whole files)
+    crate::auth::check_all(&crate::ddl::join(&schema, &table)).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?; // (a user's: an engine reads the whole files)
     Ok(axum::Json(loaded(&lake, &crate::ddl::join(&schema, &table)).await.map_err(|_| no_table())?))
 }
 
@@ -1006,7 +1009,7 @@ fn conflict(message: String) -> Refusal { refused(409, "CommitFailedException", 
 async fn update(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>, body: bytes::Bytes) -> Reply {
     let (parts, lake, schema) = space(&app, &ns).await?;
     let name = crate::ddl::join(&schema, &table);
-    crate::auth::check("insert", &name).map_err(|e| refused(403, "ForbiddenException", e.to_string()))?;
+    crate::auth::check("insert", &name).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
     let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException"))?;
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the commit: {e}")))?;
     let updates = asked["updates"].as_array().cloned().unwrap_or_default();
@@ -1015,7 +1018,7 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::server::A
         requirements(&current["metadata"], &asked)?;
         let target = sql_name(&app, &parts, &lake, &schema, &table);
         let mut sql = match updates.iter().any(|u| u["action"] == "add-schema") {
-            true => schema_sql(&target, &current["metadata"], &asked).map_err(|e| bad(format!("{e:#}")))?,
+            true => schema_sql(&target, &current["metadata"], &asked).map_err(|e| bad(crate::ext::said(&e)))?,
             false => vec![],
         };
         sql.extend(properties_sql(&target, &updates));
@@ -1029,7 +1032,7 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::server::A
                 _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await, // (published on the leader: this node sees it a moment later)
             }
         }
-        return loaded(&lake, &name).await.map(axum::Json).map_err(|e| bad(format!("{e:#}")));
+        return loaded(&lake, &name).await.map(axum::Json).map_err(|e| bad(crate::ext::said(&e)));
     }
     match prepare(&lake, &name, &current, &asked).await? {
         Some(c) => commit(&app, &lake, vec![c]).await.map(axum::Json),
@@ -1052,7 +1055,7 @@ async fn transaction(axum::extract::State(app): axum::extract::State<crate::serv
         }
         let table = id["name"].as_str().unwrap_or_default();
         let name = crate::ddl::join(&schema, table);
-        crate::auth::check("insert", &name).map_err(|e| refused(403, "ForbiddenException", e.to_string()))?;
+        crate::auth::check("insert", &name).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
         let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.join(".")), "NoSuchTableException"))?;
         if let Some(c) = prepare(&lake, &name, &current, change).await? {
             commits.push(c);
@@ -1074,14 +1077,14 @@ async fn prepare(lake: &Lake, name: &str, current: &Value, asked: &Value) -> Res
     let mut c = parse(lake, name, &current["metadata"], asked).await?;
     // (a user's: taking rows out asks DELETE, and a keyed table's rows replace their keys', UPDATE: S11)
     let (replaces, deletes) = (!meta.key.is_empty() && !c.incoming.is_empty(), !c.removed.is_empty() || !c.deletes.is_empty() || !c.equality.is_empty());
-    crate::auth::check_changes(name, replaces, deletes).map_err(|e| refused(403, "ForbiddenException", e.to_string()))?;
-    if done(lake, &c.job()).await.map_err(|e| bad(format!("{e:#}")))? {
+    crate::auth::check_changes(name, replaces, deletes).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
+    if done(lake, &c.job()).await.map_err(|e| bad(crate::ext::said(&e)))? {
         return Ok(None);
     }
-    check(lake, &c).await.map_err(|e| conflict(format!("{e:#}")))?;
+    check(lake, &c).await.map_err(|e| conflict(crate::ext::said(&e)))?;
     if !meta.key.is_empty() {
-        c.deleted = deleted(lake, &c.deletes).await.map_err(|e| bad(format!("{REFUSED}: {e:#}")))?;
-        keyed(lake, name, &meta, &mut c).await.map_err(|e| bad(format!("{REFUSED}: {e:#}")))?;
+        c.deleted = deleted(lake, &c.deletes).await.map_err(|e| bad(format!("{REFUSED}: {}", crate::ext::said(&e))))?;
+        keyed(lake, name, &meta, &mut c).await.map_err(|e| bad(format!("{REFUSED}: {}", crate::ext::said(&e))))?;
         return Ok(Some(c));
     }
     if !c.equality.is_empty() {
@@ -1091,9 +1094,9 @@ async fn prepare(lake: &Lake, name: &str, current: &Value, asked: &Value) -> Res
     if changes && !crate::adopt::fits_as_written(&meta) {
         return Err(bad(format!("{name} has a renamed or dropped column, so other engines append to it; change its rows with Pondra's SQL (DELETE, UPDATE, MERGE)")));
     }
-    c.deleted = deleted(lake, &c.deletes).await.map_err(|e| bad(format!("{REFUSED}: {e:#}")))?;
+    c.deleted = deleted(lake, &c.deletes).await.map_err(|e| bad(format!("{REFUSED}: {}", crate::ext::said(&e))))?;
     if (!c.incoming.is_empty() || changes) && crate::adopt::fits_as_written(&meta) {
-        crate::adopt::footers(lake, name, &meta, &mut c.incoming).await.map_err(|e| bad(format!("{REFUSED}: {e:#}")))?;
+        crate::adopt::footers(lake, name, &meta, &mut c.incoming).await.map_err(|e| bad(format!("{REFUSED}: {}", crate::ext::said(&e))))?;
         c.adopt = true;
     } else if !c.incoming.is_empty() {
         // (the table's own files, written here without system columns: they take a lineage)
@@ -1101,7 +1104,7 @@ async fn prepare(lake: &Lake, name: &str, current: &Value, asked: &Value) -> Res
             let (ctx, query) = incoming(lake, &meta, &c.incoming).await?;
             crate::write::write_files(lake, &ctx, name, &query, &c.job(), None).await
         };
-        c.written = written.await.map_err(|e| bad(format!("{REFUSED}: {e:#}")))?;
+        c.written = written.await.map_err(|e| bad(format!("{REFUSED}: {}", crate::ext::said(&e))))?;
     }
     Ok(Some(c))
 }
@@ -1173,8 +1176,8 @@ async fn commit(app: &crate::server::App, lake: &std::sync::Arc<Lake>, commits: 
         false => crate::write::send(&lake.url, crate::write::Request::Iceberg(commits)).await,
     };
     out.map_err(|e| {
-        let e = format!("{e:#}");
-        match (e.contains(CONFLICT), e.contains(REFUSED)) {
+        let (raw, e) = (format!("{e:#}"), crate::ext::said(&e)); // (the words are matched raw, sent as said)
+        match (raw.contains(CONFLICT), raw.contains(REFUSED)) {
             (true, _) => {
                 let lake = lake.clone();
                 crate::panics::task(async move { futures::future::join_all(files.iter().map(|f| lake.delete(f))).await }); // (never recorded)
@@ -1226,7 +1229,7 @@ async fn parse(lake: &Lake, table: &str, meta: &Value, asked: &Value) -> Result<
     if main != Some(id) {
         return Err(bad("a snapshot not made main (staged): not taken".into()));
     }
-    let home = crate::store::folder_of(lake, table).await.map_err(|e| bad(format!("{e:#}")))?; // (its files' folder: its name, unless it was renamed)
+    let home = crate::store::folder_of(lake, table).await.map_err(|e| bad(crate::ext::said(&e)))?; // (its files' folder: its name, unless it was renamed)
     let under = |uri: &Value, folder: &str| -> Result<String, Refusal> {
         let uri = uri.as_str().unwrap_or_default();
         let at = format!("data/{home}/{folder}{}", if folder.is_empty() { "" } else { "/" });
@@ -1234,7 +1237,7 @@ async fn parse(lake: &Lake, table: &str, meta: &Value, asked: &Value) -> Result<
     };
     let get = |path: String| async move {
         let bytes = lake.store.get(&Path::from(path.as_str())).await.map_err(|e| bad(format!("{path}: {e}")))?.bytes().await.map_err(|e| bad(format!("{path}: {e}")))?;
-        crate::avro::records(&bytes).map_err(|e| bad(format!("{path}: {e:#}")))
+        crate::avro::records(&bytes).map_err(|e| bad(format!("{path}: {}", crate::ext::said(&e))))
     };
     let (mut incoming, mut cleanup, mut removed, mut deletes, mut undeleted, mut equality) = (Vec::<DataFile>::new(), vec![], vec![], Vec::<DataFile>::new(), vec![], vec![]);
     for (i, s) in snapshots.iter().enumerate() {

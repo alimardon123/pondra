@@ -92,7 +92,7 @@ pub async fn live(State(app): State<App>, Query(p): Query<Params>, headers: axum
     }
     match watch(&app, &headers, p.sql.as_deref(), &kind, &body, every, String::new()).await {
         Ok(w) => ([("content-type", "application/x-ndjson")], Body::from_stream(lines(w))).into_response(),
-        Err(e) => (axum::http::StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+        Err(e) => (axum::http::StatusCode::BAD_REQUEST, crate::ext::said(&e)).into_response(),
     }
 }
 
@@ -158,7 +158,7 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
     })
 }
 
-fn error(e: anyhow::Error, tag: &str) -> bytes::Bytes { format!("{{{tag}\"error\":{}}}\n", serde_json::Value::from(format!("{e:#}"))).into() }
+fn error(e: anyhow::Error, tag: &str) -> bytes::Bytes { format!("{{{tag}\"error\":{}}}\n", serde_json::Value::from(crate::ext::said(&e))).into() }
 
 /// The tables `sql` reads here (itself and through its views, the session's too) and the attached
 /// lakes it names.

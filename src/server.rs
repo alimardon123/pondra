@@ -253,7 +253,7 @@ async fn get_file(State(app): State<App>, Path(path): Path<String>, Query(q): Qu
     let found = match q.get("version") {
         Some(id) => match crate::files::version(&app.lake, &path, id).await {
             Ok(b) => Ok((b, id.clone())),
-            Err(e) => return Ok((StatusCode::NOT_FOUND, format!("{e:#}")).into_response()), // (not one of its versions, or gone)
+            Err(e) => return Ok((StatusCode::NOT_FOUND, crate::ext::said(&e)).into_response()), // (not one of its versions, or gone)
         },
         None => app.lake.file(&path).await,
     };
@@ -484,7 +484,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     let who = match req.headers().get(crate::auth::AS_USER).and_then(|v| v.to_str().ok()) {
         Some(user) if who.operator => match crate::users::principal(&app.lake, user).await {
             Ok(p) => p.at("http", from),
-            Err(e) => return (StatusCode::FORBIDDEN, format!("{e:#}")).into_response(),
+            Err(e) => return (StatusCode::FORBIDDEN, crate::ext::said(&e)).into_response(),
         },
         _ => who,
     };
@@ -1142,7 +1142,7 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
         })
     };
     // (rows that can't be read as the table's are the sender's: 22P02, never the node's 500)
-    let (batches, given) = read().map_err(|e| crate::codes::coded("22P02", format!("the rows can't be read as {name}'s: {e:#}")))?;
+    let (batches, given) = read().map_err(|e| crate::codes::coded("22P02", format!("the rows can't be read as {name}'s: {}", crate::ext::said(&e))))?;
     let batch = concat_batches(&schema, &batches)?;
     let batch = match (crate::defaults::any(&meta), given) {
         (false, _) => batch,
@@ -1705,7 +1705,7 @@ struct WatchParams {
 /// `?changes=true`, its changes: UPDATE's and DELETE's too, with the rows' system columns.
 async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query<WatchParams>) -> Response {
     if let Err(e) = crate::auth::check_all(&name) {
-        return (StatusCode::FORBIDDEN, e.to_string()).into_response(); // (a user's: the whole rows)
+        return (StatusCode::FORBIDDEN, crate::ext::said(&e)).into_response(); // (a user's: the whole rows)
     }
     let hwm = app.lake.hwm.subscribe();
     let after = p.after.unwrap_or_else(|| app.lake.visible());

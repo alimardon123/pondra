@@ -4777,6 +4777,15 @@ def columns():
         "a clash": _raises(lambda: q("ALTER TABLE events RENAME COLUMN user TO id")),
         "a system column": _raises(lambda: q("ALTER TABLE events RENAME COLUMN _row_id TO r")),
     }
+    # A column a view reads: refused by name with Postgres's codes (a type change and a rename 0A000, a drop 2BP01).
+    q("CREATE TABLE typed (c INT, d VARCHAR)")
+    q("CREATE VIEW typed_v AS SELECT c, d FROM typed")
+    def refusal(stmt):  # (status, SQLSTATE, message) of a statement refused over HTTP
+        status, head, text = reply(A.port, "POST", "/sql", stmt.encode())
+        return status, head.get("x-pondra-sqlstate"), text
+    typed = [refusal("ALTER TABLE typed ALTER COLUMN c TYPE BIGINT"), refusal("ALTER TABLE typed DROP COLUMN c"), refusal("ALTER TABLE typed RENAME COLUMN c TO k")]
+    checks_typed = [typed[0][1] == "0A000", typed[1][1] == "2BP01", typed[2][1] == "0A000"]
+    refused_by_name = all(s != 200 and "typed_v" in t and "which names its columns: drop it first" in t for s, _, t in typed)
     # (Round 26 renames tables: this one, with its renamed, dropped and widened columns, and back.)
     q("ALTER TABLE events RENAME TO events_renamed")
     want_renamed = [{"n": len(model), "s": sum(r["total"] or 0 for r in model.values())}]
@@ -4795,6 +4804,7 @@ def columns():
         "spread over three nodes == one node": spread == one and call(A.port, "POST", "/sql?spread=1", joined.encode()) == q(joined),
         "a keyed table: renamed, updated, looked up": lookup == [{"id": 1, "name": "ann", "points": 6}] and q("SELECT * FROM users ORDER BY id") == [{"id": 1, "points": 6}, {"id": 2, "points": 7}],
         "the table renamed and back, its columns as they were": renamed == [{"n": len(model), "s": total}],
+        "a column a view reads: its type change refused 0A000, its drop 2BP01, as Postgres": all(checks_typed) and refused_by_name,
         **{f"refused: {k}": v for k, v in refused.items()},
     }
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -6536,6 +6546,12 @@ console.log(JSON.stringify(seen));"""
     shared_after = until(lambda: call(A.port, "GET", "/stats")["live_queries"], 0, 25)
     checks["several on one connection: each line names its query, a change answers only its own, a refused one says why alone, closed ends them all"] = \
         first == [("a", [{"n": 6}]), ("b", [{"n": 1}]), ("bad", "a live qu")] and after == [("b", [{"n": 2}])] and while_open == 2 and shared_after == 0
+    # A live query over a file in the lake's own files/ folder (any reader may read those: no owner's key). Its
+    # error names the file as SQL does, never by its internal ext: name (said, `ext::said`).
+    call(A.port, "PUT", "/files/x.csv", b"id,v\n1,a\n", headers={"content-type": "text/csv"})
+    file_err = _raises_text(lambda: next(db.live(f"SELECT nosuch FROM '{os.path.realpath(lake)}/files/x.csv'")))
+    checks["a live query over a file: its error names the file as SQL does ('…x.csv'), no ext: name"] = \
+        "No field named nosuch" in file_err and "files/x.csv'" in file_err and "ext:" not in file_err
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"live": checks, "ok": ok}, indent=1))
