@@ -1940,7 +1940,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    before its commit), and the old rows it leaves out are those up to that same end. With the end
    behind the entries an attached lake's changed row went missing (336 of 607 reads on main
    2801b4d); with an entry read before a table's first UPDATE and its log read past it, a leader too
-   kept both versions. `harness.py attached` (55 wrong reads on 0.33.0).
+   kept both versions. `harness.py attached` (55 wrong reads on 0.33.0). And a query fixes that end once
+   for every table it reads (`session_at`: this lake's, and each attached lake's after its `settle`), so a
+   self-join or a window read twice sees one commit under ingest: `harness.py tails`' pairs (1,296 wrong of
+   1,562 reads on the build before, 0 now) and `attached` (3 of 429 before, 0 of 418).
 266. **In a protected database, a project's objects change only through an apply by a holder of
    APPLY, and lifting the protection is an admin's, audited** (`protect.rs`, `apply::authorize`,
    ADR-058). `protect::door`, where every statement comes in (`write::on_node_listed`,

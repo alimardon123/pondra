@@ -75,8 +75,8 @@ impl OptimizerRule for WholePartition {
 fn rewritten(plan: &LogicalPlan, config: &dyn OptimizerConfig) -> Result<Option<LogicalPlan>> {
     let LogicalPlan::Window(window) = plan else { return Ok(None) };
     let Some((keys, calls)) = whole(window) else { return Ok(None) };
-    // The input is read twice (`build`). Known limit, not fixed here: each read is planned apart and takes the log's
-    // end when it is planned, so under ingest the two can see different commits, as a self-join can today.
+    // The input is read twice (`build`), both reads at the one end the session fixed (`session_at`, invariant 265),
+    // so under ingest they see the same commit.
     if any_node(plan, differs_by_reading)? {
         return Ok(None);
     }
