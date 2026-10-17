@@ -445,7 +445,7 @@ async fn postgres(s: &Server, tcp: tokio::net::TcpStream) -> Result<()> {
     let (pg, _busy) = match s.node(&name, create).await {
         Ok((_, pg, busy)) => (pg, busy),
         Err(e) => {
-            let text = format!("{e:#}");
+            let text = crate::ext::said(&e); // (the words a client is sent; "does not exist" survives said, so the code reads the same)
             let code = if text.contains("does not exist") { "3D000" } else { "XX000" };
             let fields = [("S", "FATAL"), ("V", "FATAL"), ("C", code), ("M", text.as_str())];
             let body: Vec<u8> = fields.iter().flat_map(|(k, v)| [k.as_bytes(), v.as_bytes(), b"\0"].concat()).chain([0u8]).collect();

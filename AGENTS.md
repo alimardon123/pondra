@@ -548,13 +548,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    order. Answered OUT_OF_ORDER_SEQUENCE, an idempotent librdkafka producer on a follower stopped for
    good ("sequence desynchronization"): `kafka_bench.py --s3 --nodes 3 --steady 30` on `sim_r2.py`
    lost two of its 24 producers in their first seconds without the Kafka door's re-queue.
-30. **A shuffle's scratch folder has the node's own id in it** (`spill::dir`). Two nodes on one
-   machine share a cache directory and name their buckets the same way; without the id they write
+30. **A shuffle's scratch folder has the node's own id in it** (`spill::dir`). Two nodes in one
+   process share its spill folder and name their buckets the same way; without the id they write
    over each other's rows and the answer is quietly wrong. This is what `tools/shuffle_spill.py`
    caught when the id wasn't there.
 31. **A step's buckets are kept, not taken** (`spmd::fetch`, `bucket`): reading one clones it, so
    a step that has to be run again reads the same rows. Everything a job spilled goes when the job
-   ends (`Drop for Job`, `gc`, `?drop=true`), and a dead node's is swept an hour later. A gather's
+   ends (`Drop for Job`, `gc`, `?drop=true`), and a dead process's goes with its spill folder (invariant 419). A gather's
    spill is freed by the guard its response stream holds instead, since nothing retries it.
 32. **Every node splits the same rows the same way.** `spmd::scatter` runs a stage's partitions at
    once, each into buckets of its own, and joins them in partition order at the end; the hash is
@@ -1940,7 +1940,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    before its commit), and the old rows it leaves out are those up to that same end. With the end
    behind the entries an attached lake's changed row went missing (336 of 607 reads on main
    2801b4d); with an entry read before a table's first UPDATE and its log read past it, a leader too
-   kept both versions. `harness.py attached` (55 wrong reads on 0.33.0).
+   kept both versions. `harness.py attached` (55 wrong reads on 0.33.0). And a query fixes that end once
+   for every table it reads (`session_at`: this lake's, and each attached lake's after its `settle`), so a
+   self-join or a window read twice sees one commit under ingest: `harness.py tails`' pairs (1,296 wrong of
+   1,562 reads on the build before, 0 now) and `attached` (3 of 429 before, 0 of 418).
 266. **In a protected database, a project's objects change only through an apply by a holder of
    APPLY, and lifting the protection is an admin's, audited** (`protect.rs`, `apply::authorize`,
    ADR-058). `protect::door`, where every statement comes in (`write::on_node_listed`,
@@ -2137,9 +2140,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    rendered whole. Only a whole body is remembered (`Results`) or handed to the requests that
    waited for the same query; those a streamed run covered run on their own. The Postgres port,
    Flight and MCP let the count go when the answer is made. `harness.py answers_big`: every
-   format's pieces == the whole answer; an answer bigger than a 0.25 GB node's memory refused
+   format's pieces == the whole answer; a text table bigger than a 0.25 GB node's memory refused
    (53200), the node answering after; 3M rows' peak at least half their JSON under rendering them
-   whole (442 MB against 715 when written).
+   whole (442 MB against 715 when written). A door's own query sends its answer from its plan
+   (invariant 421).
 289. **A node runs at most `PONDRA_QUERIES` queries at once** (`server::TURNS`: four a core, 16 at
    least), the rest in the order they asked, and one that waits `PONDRA_QUEUE_SECS` (60) is
    refused (53300: a client asks again, or another node). A query run inside one this task runs (a
@@ -2738,10 +2742,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    strings their views point to, and the window's own columns), and a `HeldOutExec`, which lets go of each batch as
    its rows come out (a window gives one row per row, in order), so a window holding more than memory refuses
    (53200) instead of growing the node until the OS kills it, and one that streams holds only what it holds.
-   What DataFusion keeps inside a window beyond its rows not yet out (the string buffers a long partition's views
-   point into, a frame's rows behind those given out, `WindowAggExec`'s final concatenation) is still uncounted.
-   `harness.py scale`: "a window over all rows past the memory limit refuses…" (answered by growing past its pool
-   without it; killed under a 2 GB cap at SF10).
+   What DataFusion keeps inside a window beyond its rows not yet out (a frame's rows behind those given out,
+   `WindowAggExec`'s final concatenation) is still uncounted; a streaming window's strings are plain (invariant 423).
+   `harness.py scale`: "…one no rewrite takes refuses (53200) and the node answers after…" (answered by growing past
+   its pool without it; killed under a 2 GB cap at SF10). A window over whole partitions is answered instead
+   (invariant 422).
 415. **A number with an exponent is a whole decimal, and what a query is said to give is what it gives**
    (`optimize::WholeLiterals`, `query::run_schema`). DataFusion types `1e15` as a decimal of negative scale:
    Arrow's cast to a float divides by `10^scale` (`CAST(1e15 AS DOUBLE)` was `9.999999999999999e14`) and
@@ -2783,15 +2788,19 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `memory::spill_base`, `memory::Folder`, `spill::dir`). A query's spills (DataFusion's) and a shuffle's go under
    `PONDRA_SPILL_DIR`, else `PONDRA_CACHE_DIR`, else the temporary folder unless it is held in memory (tmpfs: /tmp on
    Fedora and Arch, where a spill frees nothing), then the user's cache folder. A query's go in a folder of the
-   process's own (`pondra-spill-{uid}/{pid}-…`, 0700, its lock file held), and the folders of processes that ended
-   are swept when the next process makes its own: a node killed mid-spill left them for good. A node may spill
+   process's own (`pondra-spill-{uid}/{pid}-…`, the user's folder 0700, its lock file held; a shuffle's in its
+   `shuffle/`), and the folders of processes that ended are swept when the next process makes its own: a node killed
+   mid-spill left them for good. One helper makes every folder that is this user's alone (`memory::own_dir`: the
+   spill folders, and in the temporary folder the term locks of invariant 370 and Python's packages); a shuffle used
+   to share one folder a machine, open to other users and swept by age while its job ran. A node may spill
    `PONDRA_SPILL_GB`, by default the disk's free space when the lake opens less what a lake keeps for itself
    (`store::lake_keeps`, invariant 220), not DataFusion's 100 GB; past it a query is refused with 53100, worded to
    raise `PONDRA_SPILL_GB` (`codes::words`), never DataFusion's `datafusion.runtime.*` (refused: invariant 188), and
    the frugal retry doesn't run it again. `0`: nothing spills. Spills are written uncompressed: on this 4-core VM zstd
    cut a 10M-string sort's spill 2.5× but took 10–24% longer, lz4 5–9%. `harness.py scale`: "a query spills to
    PONDRA_SPILL_DIR, cleans up after, and past PONDRA_SPILL_GB is refused by name (53100)" (a folder not made yet);
-   `memory::tests::sweep_removes_a_folder_whose_process_ended_and_keeps_the_rest`.
+   `memory::tests::sweep_removes_a_folder_whose_process_ended_and_keeps_the_rest`, `own_dir_is_this_users_alone…`,
+   `spill::tests`.
 
 420. **A `CREATE TABLE … AS SELECT` that fails leaves no table** (`write::run_listed`, `Undo`; `from_cli`). Its table
    is made first (`Stmt::Define`), so an INSERT of its rows that fails, for any reason, drops it, purged, before the
@@ -2799,7 +2808,56 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (the memory watch drops its future: invariant 417) drops it from `Undo`'s `drop`, as its caller. Left there, the
    user's next try of the fixed statement was refused 42P07. `harness.py objects`: "a CREATE TABLE … AS SELECT that
    fails leaves no table…" (the old build kept it after a cast's 22P02 and after the watch's stop).
+421. **A big answer goes from its plan as the plan makes it, and a cut one never looks whole** (`query::collect_or_send`,
+   `send_rest`, `PIECES`; `server::sql`, `pieces`). The query an HTTP request sends (`run_query`'s `top`: the one that
+   took the request's turn), in a format that streams and not `EXPLAIN`ed, is armed (`query::arm`); once its batches
+   pass `PONDRA_STREAM_MB` it writes the first piece, hands the body to the door, and pulls the rest of the plan into
+   it two pieces ahead of the client, each batch counted only while it is written. The handler then runs the rest of
+   the request on the queries' runtime with its principal and apply flag (`auth::carried`). A body ends only after its
+   last piece was written (`Handed::ended`): a plan that fails, or a client gone, cuts it, and the client sees an
+   error, never a short answer. An answer half sent is never run again (`frugally`, `App::query`'s retry), never
+   remembered, and the requests that waited for it run on their own. The turn and the quota are held while the client
+   reads, a client that takes no piece for a minute ends it (57014), and its time in `pondra.history` includes
+   the reading. `harness.py answers_big`: 12M rows as CSV past a 0.25 GB node's memory for queries at a peak of 171 MB
+   (the build before refused it, 53200), a cut answer fails its read, an identical query while another is half read
+   answers at once.
+422. **A window over whole partitions that ran out of memory is answered as a GROUP BY joined back to its rows, and
+   only then** (`frugal::WholePartition`, `query::frugal`). A window's held rows refuse with "Resources exhausted"
+   (`held.rs`), which starts the frugal retry; its session carries `pondra_frugal.on` (`frugal::mark`), and only
+   there does the rule turn a window whose every expression is `count`, `sum`, `avg`, `min`, `max`, `bool_and` or
+   `bool_or` over one partition, with no order, FILTER or DISTINCT and the whole partition as its frame, into each
+   partition's aggregates grouped by its keys and joined back on them (NULL equal to NULL), its rows on the side a
+   sort-merge join streams; with no keys, one row cross-joined. The rewrite reads its input twice, so it is refused
+   when anything below it gives other rows when read again (a LIMIT, a fetch, DISTINCT ON, a volatile or correlated
+   expression: `differs_by_reading`), and when its fields would differ; a rewrite that can't be built leaves the
+   query to refuse as before. A query that fits plans exactly as before (TPC-H SF1: the same answers, B/A wall
+   0.99). `harness.py scale`: `count(*) OVER ()` and `avg(id) OVER (PARTITION BY id % 3)` over 3M rows on a 0.05 GB
+   node answer, at a peak of 285 MB (refused before, 53200).
 
+423. **A streaming window holds plain strings, and a merge of spilled runs leaves room beside it** (`held::Windows`,
+   `plain_below`, `views_back`; `store::spill_disk`). A `BoundedWindowAggExec` concatenates a partition's batches, and
+   concatenated views keep every batch's buffers, so below it each view column no partition key or window function
+   reads is cast plain, and cast back above `HeldOutExec` (a key stays a view: the window finds its partitions by its
+   ordering, which a cast hides). Its reservation is spillable, though it never spills, so `FairSpillPool` gives it a
+   share of its own beside the sorts feeding it (an unspillable grow is refused once their shares are full). A merge of
+   spilled runs takes at most `memory_limit / partitions / 32 MB` runs at once (4 to 64; `PONDRA_SPILL_FAN_IN`, 0 for
+   DataFusion's own, no limit): unlimited, each partition's merge reserved the whole pool and the window above it was
+   refused. Fewer runs at once means more passes, so a small node writes more spill (9M long strings: 1.3 GB at 4,
+   1.07 GB unlimited). `harness.py scale`: "a rank() over one partition of 9M long strings streams…" (stopped by the 1 GB
+   watch before) and "a rank() over 3 partitions of 6M long strings…" (a 501 MB peak; refused before, 53200).
+424. **A GROUP BY over medians that ran out of memory is answered from a sort's middle rows, and only then**
+   (`frugal::MiddleRows`, retry-only as invariant 422's rule). DataFusion's median holds every value of its group and
+   can't spill; on the frugal retry each `median(x)` with no DISTINCT, FILTER, ORDER BY or null handling (none over
+   the rule's own `__pondra_middle` column) is worked out apart: its non-NULL values numbered once over all the rows
+   in key then value order, NULLs first (one `row_number`, a sort that spills, then a window that streams; a window per
+   group held each group's rows), each group's first number found by a running sum of the groups' counts, and the one
+   or two in the middle kept by a `FILTER` on the median itself (a filter above the join was pushed into it, and held
+   a group's rows). The other aggregates are one GROUP BY, the medians are joined to it on the keys (NULL equal to
+   NULL; a group whose values are all NULL gets NULL), and ROLLUP, CUBE, GROUPING SETS, or input that reads otherwise
+   again (`differs_by_reading`) are left as they were. The numbering runs through one sorted stream: slow next to
+   the plan it replaces, which couldn't answer. A query that fits plans as before (TPC-H SF1: the same answers, B/A
+   wall 0.98). `harness.py scale`: "a median of 12M values in 3 groups past the memory limit answers…" (3.9 s on a
+   0.05 GB node; refused before, 53200); `frugal::tests::medians_…`.
 ## Tests: run these before and after any change
 
 ```bash

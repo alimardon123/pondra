@@ -69,6 +69,10 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     rules.insert(marked, Arc::new(SubqueriesMarked)); // (before DataFusion's scalar subqueries become joins: it makes one)
     rules.insert(0, Arc::new(InListOfRows)); // (before DataFusion's simplifier meets two lists of one column)
     rules.insert(0, Arc::new(Seconds)); // (before a literal is folded into a timestamp)
+    #[cfg(feature = "server")] // (first: the filters and projections after it see the join it makes; a node's only, like frugal.rs)
+    rules.insert(0, Arc::new(crate::frugal::WholePartition));
+    #[cfg(feature = "server")] // (a node's only, as WholePartition is)
+    rules.insert(0, Arc::new(crate::frugal::MiddleRows));
     rules.push(Arc::new(CheapFirst));
     rules.push(Arc::new(AsyncBelow)); // (last: after COUNT(DISTINCT) became a GROUP BY)
     rules

@@ -23,19 +23,20 @@ fn piece() -> usize {
     crate::env::or::<usize>("PONDRA_SPILL_MB", 64) << 20
 }
 
-/// Where a node keeps what it spills: `pondra-shuffle` under `memory::spill_base` (`PONDRA_SPILL_DIR` or
-/// `--cache-dir`, else the temp dir), one folder per job and node (`<job>-<node id>`), beside DataFusion's
-/// spill folder. The node's own id is in the path because two nodes on one machine share a cache dir, and
-/// they name their buckets the same way — without it they would write over each other's rows.
-/// An empty job names the `pondra-shuffle` folder itself (sweeping and measuring).
-pub fn dir(job: &str) -> PathBuf {
+/// Where a node keeps what it spills: `shuffle` in the process's own spill folder (`store::spill_folder`: this
+/// user's alone, locked while the process lives, swept once it ends), one folder per job and node (`<job>-<node id>`).
+/// The node's own id is in the path because two nodes in one process share that folder, and they name their buckets
+/// the same way: without it they would write over each other's rows (invariant 30). Being the process's, no other
+/// user can read the rows, and nothing sweeps a job while its process lives. An empty job names the `shuffle` folder
+/// itself (measuring). Err when the process has no spill folder.
+pub fn dir(job: &str) -> std::io::Result<PathBuf> {
     crate::per_node!(static ME: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
     let me = ME.get_or(|| uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string());
-    let base = crate::memory::spill_base().join("pondra-shuffle");
-    match job.is_empty() {
+    let base = crate::store::spill_folder()?.join("shuffle");
+    Ok(match job.is_empty() {
         true => base,
         false => base.join(format!("{job}-{me}")),
-    }
+    })
 }
 
 /// One node's rows for one other node, in pieces. Cloning one costs nothing (the pieces are
@@ -256,18 +257,8 @@ impl Drop for Gone {
 
 /// Everything a job spilled here.
 pub fn clear(job: &str) {
-    let _ = std::fs::remove_dir_all(dir(job));
-}
-
-/// What earlier runs left behind (a node that died mid-shuffle), older than an hour.
-pub fn sweep() {
-    let base = dir("");
-    let Ok(entries) = std::fs::read_dir(&base) else { return };
-    for e in entries.flatten() {
-        let old = e.metadata().and_then(|m| m.modified()).map(|t| t.elapsed().unwrap_or_default().as_secs() > 3600);
-        if old.unwrap_or(false) {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
+    if let Ok(path) = dir(job) {
+        let _ = std::fs::remove_dir_all(path);
     }
 }
 
@@ -280,5 +271,27 @@ pub fn held() -> u64 {
             false => e.metadata().map(|m| m.len()).unwrap_or(0),
         }).sum()
     }
-    walk(&dir(""))
+    dir("").map(|base| walk(&base)).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_jobs_folder_is_inside_the_process_spill_folder() {
+        let folder = crate::store::spill_folder().expect("this process's spill folder");
+        let job = dir("j").expect("a job's folder");
+        assert_eq!(job.parent(), Some(folder.join("shuffle").as_path()), "{}", job.display());
+        assert!(job.file_name().unwrap().to_string_lossy().starts_with("j-"), "named by the job and the node's id");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_above_the_process_folder_is_this_users_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = crate::store::spill_folder().expect("this process's spill folder");
+        let user = folder.parent().expect("the user's folder, which holds the process's");
+        assert_eq!(std::fs::metadata(user).unwrap().permissions().mode() & 0o777, 0o700);
+    }
 }

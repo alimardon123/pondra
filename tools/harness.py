@@ -1369,8 +1369,9 @@ def tiering():
 def tails():
     """A table's log tail is kept from one query to the next and extended (`query::Tail`): every
     read equals a model while rows stream into two tables, a keyed one among them; a transaction's
-    reads stay at its snapshot while other reads move the kept tail past it; an added column; and
-    a tiering round moving the table's mark."""
+    reads stay at its snapshot while other reads move the kept tail past it; an added column; a
+    tiering round moving the table's mark; and a query reading one table twice, and two tables one
+    transaction wrote, as of one commit while rows land."""
     lake = new_lake()
     node = Node(lake, A.port, tier_secs=3600).start()
     q = lambda s: sql(A.port, s)
@@ -1419,12 +1420,57 @@ def tails():
     for i in range(60, 70):
         insert(i, x=True)
         check(f"after insert {i}, tiered")
+    # Two tables that one transaction writes in one commit, and a query reading one of them twice:
+    # every read must be as of one commit. Three writers commit a transaction each (BEGIN … COMMIT in
+    # one request); one reader asks as fast as it can. Before the log's end was fixed once per query,
+    # each scan took the newest commit when it was planned, so the two reads could differ.
+    q("CREATE TABLE pa (id BIGINT)")
+    q("CREATE TABLE pb (id BIGINT)")
+    pair_secs, pair_lock, pair_last, pair_stop = 20, threading.Lock(), [0], threading.Event()
+    pair_commits, pair_reads, pair_wrong, pair_errors = [0], [0], [], []
+
+    def pair_writer():
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        while not pair_stop.is_set():
+            with pair_lock:
+                pair_last[0] += 1
+                i = pair_last[0]  # (unique, so each transaction's rows are its own)
+            c.request("POST", "/sql", f"BEGIN; INSERT INTO pa VALUES ({i}); INSERT INTO pb VALUES ({i}); COMMIT".encode())
+            r = c.getresponse()
+            data = r.read()
+            with pair_lock:
+                if r.status == 200:
+                    pair_commits[0] += 1
+                else:
+                    pair_errors.append((r.status, data[:200]))
+
+    def pair_reader():
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        while not pair_stop.is_set():
+            c.request("POST", "/sql", f"SELECT (SELECT sum(id) FROM pa) AS a, (SELECT sum(id) FROM pb) AS b, (SELECT sum(id + 0) FROM pa) AS a2 -- {uuid.uuid4()}".encode())  # (never a remembered answer)
+            r = c.getresponse()
+            body = json.loads(r.read())
+            with pair_lock:
+                pair_reads[0] += 1
+            if r.status != 200 or not body or not (body[0]["a"] == body[0]["b"] == body[0]["a2"]):  # (NULL equals NULL)
+                with pair_lock:
+                    pair_wrong.append(body)
+
+    pair_threads = [threading.Thread(target=pair_writer, daemon=True) for _ in range(3)] + [threading.Thread(target=pair_reader, daemon=True)]
+    [t.start() for t in pair_threads]
+    time.sleep(pair_secs)
+    pair_stop.set()
+    [t.join(60) for t in pair_threads]
+    print(f"tails: pairs: {pair_reads[0]} reads, {pair_commits[0]} commits, {len(pair_wrong)} wrong {pair_wrong[:3]}, {len(pair_errors)} refused {pair_errors[:3]}")
+    pairs_name = f"a table read twice and two tables one transaction wrote read one commit while rows land ({pair_reads[0]} reads, {pair_commits[0]} commits)"
+    pairs_good = not pair_wrong and pair_reads[0] >= 200 and pair_commits[0] >= 500
     node.kill()
     checks = {
         "every read == the model while rows stream in (two tables, one keyed)": not wrong,
         "a transaction reads its snapshot while other reads move past it": held == snapshot == 80,
         "rows from before an added column read it as NULL": added == want_added,
         "decoded log rows go when their table is tiered, with no read since": before_tiering > 0 and after_tiering == 0,
+        pairs_name: pairs_good,
     }
     for name, good in checks.items():
         print(f"tails: {name}: {'OK' if good else 'FAIL'}")
@@ -3487,10 +3533,12 @@ def scale():
         and q("SELECT max(r) AS r FROM (SELECT row_number() OVER (ORDER BY s, id) AS r FROM big)") == [{"r": 3000000}]
         and q("SELECT count(*) AS n FROM big a JOIN big b ON a.id = b.id") == [{"n": 3000000}]
         and metrics_of(port, headers=owner)["pondra_memory_limit_bytes"] == int(0.05 * (1 << 30)))
-    # A window counts the rows it holds against the query memory (invariant 414): one over every row refuses (53200)
-    # and the node answers after; one that lets rows go answers. Each refusal is kept for the report; the SQLSTATE is
-    # read from its header, since `call` keeps only the status and the words.
-    window_refusals = []
+    # A window counts the rows it holds against the query memory (invariant 414), and one no rewrite takes refuses
+    # (53200) and the node answers after. Over whole partitions the frugal retry answers it as each partition's
+    # aggregates in a GROUP BY, joined back to the rows (`frugal.rs`), so no row is held. Their answers are worked out
+    # here from the table's definition (value 1..3,000,000, k = value % 2,000,000, s = 'name-' || k). Each refusal is
+    # kept for the report; the SQLSTATE is read from its header, since `call` keeps only the status and the words.
+    window_refusals, window_errors, window_times = [], {}, {}
     def refusal(s):
         c = http_client.HTTPConnection("127.0.0.1", port, timeout=30)
         c.request("POST", "/sql", s.encode(), owner)
@@ -3500,13 +3548,83 @@ def scale():
             return None
         window_refusals.append({"sqlstate": r.getheader("x-pondra-sqlstate"), "error": body[:400].decode(errors="replace")})
         return window_refusals[-1]
-    win_all = refusal("SELECT max(length(s) + id + k + n) AS m FROM (SELECT s, id, k, count(*) OVER () AS n FROM big)")
-    win_part = refusal("SELECT max(length(s) + k + d) AS m FROM (SELECT s, k, id - avg(id) OVER (PARTITION BY id % 3) AS d FROM big)")
-    checks["a window over all rows past the memory limit refuses (53200) and the node answers after; one that streams answers"] = (
-        win_all is not None and "a window holds more rows" in win_all["error"]
-        and win_part is not None and win_part["sqlstate"] == "53200"
+    def answered(name, s):  # the rows, or None with the error kept; the time it took is kept too
+        t0 = time.time()
+        try:
+            return q(s)
+        except RuntimeError as e:
+            window_errors[name] = str(e)[:400]
+            return None
+        finally:
+            window_times[name] = round(time.time() - t0, 2)
+    sums = {}  # each partition of id % 3: its rows and the sum of its ids
+    for v in range(1, 3000001):
+        n, total = sums.get(v % 3, (0, 0))
+        sums[v % 3] = (n + 1, total + v)
+    avg = {p: total / n for p, (n, total) in sums.items()}
+    want_all = max(5 + len(str(v % 2000000)) + v + v % 2000000 + 3000000 for v in range(1, 3000001))  # (length('name-' || k), k, id, count(*) = 3M)
+    want_part = max(5 + len(str(v % 2000000)) + v % 2000000 + (v - avg[v % 3]) for v in range(1, 3000001))
+    try:
+        open(f"/proc/{node.p.pid}/clear_refs", "w").write("5")  # (the node's peak from here: the windows' own, not the load's)
+    except OSError:
+        pass
+    got_all = answered("count(*) OVER () over every row", "SELECT max(length(s) + id + k + n) AS m FROM (SELECT s, id, k, count(*) OVER () AS n FROM big)")
+    got_part = answered("avg(id) OVER (PARTITION BY id % 3)", "SELECT max(length(s) + k + d) AS m FROM (SELECT s, k, id - avg(id) OVER (PARTITION BY id % 3) AS d FROM big)")
+    win_peak = vm_hwm(node.p.pid)
+    win_refused = refusal("SELECT max(id + n) AS m FROM (SELECT id, last_value(id) OVER (ORDER BY s ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS n FROM big)")
+    checks["a window over all rows past the memory limit answers on the frugal retry (a GROUP BY joined back); one no rewrite takes refuses (53200) and the node answers after; one that streams answers"] = (
+        got_all == [{"m": want_all}]
+        and got_part is not None and abs(got_part[0]["m"] - want_part) <= 1e-6
+        and win_refused is not None and win_refused["sqlstate"] == "53200"  # (its sort may refuse before the window's held rows do)
         and q("SELECT count(*) AS n FROM big") == [{"n": 3000000}]
         and q("SELECT count(*) AS n FROM (SELECT rank() OVER (PARTITION BY k ORDER BY id) AS r FROM big) WHERE r = 1") == [{"n": 2000000}])
+    print(json.dumps({"windows": {"seconds": window_times, "peak_mb": win_peak >> 20, "errors": window_errors, "want": [want_all, want_part], "got": [got_all, got_part], "refused": win_refused}}))
+    # A median holds every value of its group, which DataFusion's can't spill. In the frugal retry (`frugal.rs`,
+    # MiddleRows) a GROUP BY over medians is answered from a sort's middle rows: each group's values numbered in order,
+    # the one or two in the middle kept. Each id is four rows here (a CROSS JOIN of four VALUES): 12 M values in three
+    # groups, and each group's median is worked out from the sorted ids (the group's multiset holds each id four times).
+    median_want = {}
+    for g in range(3):
+        ids_g = range(g or 3, 3000001, 3)  # (ascending, each id once: the ids with id % 3 == g)
+        n = 4 * len(ids_g)
+        median_want[g] = (ids_g[(n // 2 - 1) // 4] + ids_g[(n // 2) // 4]) / 2
+    median_name = "median(id) over 12 M values in 3 groups"
+    got_median = answered(median_name, "SELECT id % 3 AS g, median(id) AS m FROM big CROSS JOIN (VALUES (1), (2), (3), (4)) v(n) GROUP BY id % 3 ORDER BY g")
+    checks[f"a median of 12M values in 3 groups past the memory limit answers on the frugal retry (a sort's middle rows): {window_times[median_name]} s"] = (
+        got_median is not None and [r["g"] for r in got_median] == [0, 1, 2]
+        and all(abs(r["m"] - median_want[r["g"]]) <= 1e-6 for r in got_median))
+    print(json.dumps({"medians": {"seconds": window_times[median_name], "errors": window_errors.get(median_name), "want": median_want, "got": got_median}}))
+    # Two windows over long strings, each on a fresh node of its own, over one lake that a separate `pondra sql` process
+    # loaded (an in-node load would put its own peak into the node's high-water mark). One partition of 9 M strings: the
+    # window's rows wait for the partition's end, and the concatenation kept the strings they point into past it, so a
+    # build without the change is stopped by the 1 GB watch. Three partitions of 6 M, with the pool sized so the sorts
+    # feeding the windows fill their shares: a window's reservation is spillable, so the pool gives it a fair share beside
+    # them (`held.rs`); a build without that refuses it, since an unspillable grow is checked against what the sorts hold.
+    wlake = new_lake()
+    for statement in ("CREATE TABLE ws1 (k BIGINT, s VARCHAR)", "CREATE TABLE ws3 (k BIGINT, s VARCHAR)"):
+        subprocess.run([BIN, "sql", "--dir", wlake, statement], check=True, capture_output=True)
+    long_string = "md5(value::VARCHAR) || md5(value::VARCHAR) || md5(value::VARCHAR)"
+    subprocess.run([BIN, "sql", "--dir", wlake, f"INSERT INTO ws1 SELECT 0, {long_string} FROM generate_series(1, 9000000)"], check=True, capture_output=True, timeout=900)
+    subprocess.run([BIN, "sql", "--dir", wlake, f"INSERT INTO ws3 SELECT value % 3, {long_string} FROM generate_series(1, 6000000)"], check=True, capture_output=True, timeout=900)
+    wport = port + 20
+    def windowed(table, env=None):
+        node = Node(wlake, wport, memory_gb=0.25, env={"PONDRA_CORES": "4", "PONDRA_MEMORY_MAX_GB": "1", **(env or {})}).start()
+        out = {}
+        try:
+            try:
+                out["answer"] = call(wport, "POST", "/sql", f"SELECT count(*) AS n FROM (SELECT rank() OVER (PARTITION BY k ORDER BY s) AS r FROM {table}) t WHERE r = 1".encode(), timeout=900)
+            except RuntimeError as e:
+                out["answer"] = str(e)[:300]
+            out["peak_mb"] = vm_hwm(node.p.pid) >> 20
+        finally:
+            node.kill()
+        return out
+    window_strings = windowed("ws1", {"PONDRA_SPILL_GB": "3"})  # (the spill cap is 3 GB: the check passes or fails the same on any disk with that room)
+    window_share = windowed("ws3")
+    checks[f"a rank() over one partition of 9M long strings streams: 1 answered, its peak {window_strings['peak_mb']} MB under the 1 GB line"] = (
+        window_strings["answer"] == [{"n": 1}] and window_strings["peak_mb"] < 1 << 10)
+    checks[f"a rank() over 3 partitions of 6M long strings, the sorts feeding it filling their shares: 3 answered (the window has a fair share of the pool), its peak {window_share['peak_mb']} MB"] = (
+        window_share["answer"] == [{"n": 3}])
     # A write that runs out of memory retries frugally as a query does: its join's sort-merge spills, and a
     # COPY to a folder leaves no file of the first try behind. Each write's error is kept for the report.
     folder = os.path.join(tempfile.mkdtemp(prefix="pondra-frugal-"), "out")
@@ -3684,7 +3802,7 @@ def scale():
     node.kill()
     ok = all(checks.values())
     shown = {q: ("same" if same else "DIFFERENT") + (", by ranges" if r else "") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp, r) in shuffles.items()}
-    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "sort_errors": sort_errors, "window_refusals": window_refusals, "memory_line": memory_line, "spill": spill_report, "ok": ok}, indent=1))
+    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "sort_errors": sort_errors, "window_refusals": window_refusals, "window_strings": window_strings, "window_share": window_share, "memory_line": memory_line, "spill": spill_report, "ok": ok}, indent=1))
     if not ok:
         print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
         sys.exit(1)
@@ -4705,6 +4823,15 @@ def columns():
         "a clash": _raises(lambda: q("ALTER TABLE events RENAME COLUMN user TO id")),
         "a system column": _raises(lambda: q("ALTER TABLE events RENAME COLUMN _row_id TO r")),
     }
+    # A column a view reads: refused by name with Postgres's codes (a type change and a rename 0A000, a drop 2BP01).
+    q("CREATE TABLE typed (c INT, d VARCHAR)")
+    q("CREATE VIEW typed_v AS SELECT c, d FROM typed")
+    def refusal(stmt):  # (status, SQLSTATE, message) of a statement refused over HTTP
+        status, head, text = reply(A.port, "POST", "/sql", stmt.encode())
+        return status, head.get("x-pondra-sqlstate"), text
+    typed = [refusal("ALTER TABLE typed ALTER COLUMN c TYPE BIGINT"), refusal("ALTER TABLE typed DROP COLUMN c"), refusal("ALTER TABLE typed RENAME COLUMN c TO k")]
+    checks_typed = [typed[0][1] == "0A000", typed[1][1] == "2BP01", typed[2][1] == "0A000"]
+    refused_by_name = all(s != 200 and "typed_v" in t and "which names its columns: drop it first" in t for s, _, t in typed)
     # (Round 26 renames tables: this one, with its renamed, dropped and widened columns, and back.)
     q("ALTER TABLE events RENAME TO events_renamed")
     want_renamed = [{"n": len(model), "s": sum(r["total"] or 0 for r in model.values())}]
@@ -4723,6 +4850,7 @@ def columns():
         "spread over three nodes == one node": spread == one and call(A.port, "POST", "/sql?spread=1", joined.encode()) == q(joined),
         "a keyed table: renamed, updated, looked up": lookup == [{"id": 1, "name": "ann", "points": 6}] and q("SELECT * FROM users ORDER BY id") == [{"id": 1, "points": 6}, {"id": 2, "points": 7}],
         "the table renamed and back, its columns as they were": renamed == [{"n": len(model), "s": total}],
+        "a column a view reads: its type change refused 0A000, its drop 2BP01, as Postgres": all(checks_typed) and refused_by_name,
         **{f"refused: {k}": v for k, v in refused.items()},
     }
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -6464,6 +6592,12 @@ console.log(JSON.stringify(seen));"""
     shared_after = until(lambda: call(A.port, "GET", "/stats")["live_queries"], 0, 25)
     checks["several on one connection: each line names its query, a change answers only its own, a refused one says why alone, closed ends them all"] = \
         first == [("a", [{"n": 6}]), ("b", [{"n": 1}]), ("bad", "a live qu")] and after == [("b", [{"n": 2}])] and while_open == 2 and shared_after == 0
+    # A live query over a file in the lake's own files/ folder (any reader may read those: no owner's key). Its
+    # error names the file as SQL does, never by its internal ext: name (said, `ext::said`).
+    call(A.port, "PUT", "/files/x.csv", b"id,v\n1,a\n", headers={"content-type": "text/csv"})
+    file_err = _raises_text(lambda: next(db.live(f"SELECT nosuch FROM '{os.path.realpath(lake)}/files/x.csv'")))
+    checks["a live query over a file: its error names the file as SQL does ('…x.csv'), no ext: name"] = \
+        "No field named nosuch" in file_err and "files/x.csv'" in file_err and "ext:" not in file_err
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"live": checks, "ok": ok}, indent=1))
@@ -18112,7 +18246,18 @@ def attached():
                 reads[t] = reads.get(t, 0) + 1
                 if not isinstance(r, list) or [x["id"] for x in r] != [1, 2, 3]:
                     wrong.append((t, r))
-    readers = [threading.Thread(target=read, args=(ts,)) for ts in (["t"], firsts)]
+
+    def read_twice():
+        # One table of the attached lake read twice in one query: both reads are as of one commit of
+        # its leader's (`session_at` fixes the attached lake's log end once, as for this lake's own).
+        # Each UPDATE adds 1 to the sum, so two commits never give the same sum.
+        while not stop.is_set():
+            r = _try(lambda: sql(b.port, f"SELECT (SELECT sum(amount) FROM other.t) AS a, (SELECT sum(amount + 0) FROM other.t) AS a2 -- {uuid.uuid4()}"))  # (never a remembered answer)
+            reads["twice"] = reads.get("twice", 0) + 1
+            if not isinstance(r, list) or not r or r[0]["a"] != r[0]["a2"]:  # (NULL equals NULL)
+                wrong.append(("twice", r))
+
+    readers = [threading.Thread(target=read, args=(ts,)) for ts in (["t"], firsts)] + [threading.Thread(target=read_twice)]
     [r.start() for r in readers]
     try:
         for i in range(80):
@@ -18127,11 +18272,12 @@ def attached():
     checks = {
         f"every read of a table of an attached lake while its leader updates, tiers and purges it holds each row once ({reads.get('t', 0)} reads)": reads.get("t", 0) > 50 and not any(t == "t" for t, _ in wrong),
         "…and of tables read while their first UPDATE lands": all(reads.get(t, 0) > 3 for t in firsts) and not any(t in firsts for t, _ in wrong),
+        f"a table of an attached lake read twice in one query while its leader changes it holds one commit ({reads.get('twice', 0)} reads)": reads.get("twice", 0) > 50 and not any(t == "twice" for t, _ in wrong),
     }
     for name, good in checks.items():
         print(f"attached: {name}: {'OK' if good else 'FAIL'}")
     if not all(checks.values()):
-        print(f"attached: {len(wrong)} wrong, {wrong[:5]}")
+        print(f"attached: {len(wrong)} wrong, {wrong[:5]}; read twice: {sum(1 for t, _ in wrong if t == 'twice')} wrong of {reads.get('twice', 0)}, first {[r for t, r in wrong if t == 'twice'][:3]}")
         sys.exit(1)
     return "an attached lake read while its leader changes, tiers and purges rows: every read as of one commit"
 
@@ -18587,7 +18733,10 @@ def answers_big():
     with 53200 and the node answers after. Queries take one of PONDRA_QUERIES' turns: with two turns
     and a second's queue, four slow queries at once answer two at once and refuse the rest with
     53300 (or answer after), and a query run inside a query (PIVOT asks the data) takes no turn of its
-    own, so one turn does for it."""
+    own, so one turn does for it. Past the node's memory an answer streams from its plan as the plan
+    makes it (`query::collect_or_send`): a 12M-row CSV of computed columns (288 MB, past the 256 MB a query
+    may hold) over the 0.25 GB node is read a piece at a time, a text table (never in pieces) of 60M rows is still refused, an answer that is cut short fails its body
+    rather than ending whole, and an identical query doesn't wait for another client's reading."""
     import pyarrow.compute as pc, pyarrow.csv as pacsv, pyarrow.ipc as paipc
     checks = {}
     # 1. The bytes of a streamed answer are the whole answer's.
@@ -18654,8 +18803,9 @@ def answers_big():
             t.num_rows == rows and pc.sum(t.column("a")).as_py() == rows * (rows + 1) // 2 and pc.sum(t.column("b")).as_py() == rows * (rows + 1)
             and back.num_rows == rows and pc.sum(back.column("a")).as_py() == rows * (rows + 1) // 2 and pc.sum(back.column("b")).as_py() == rows * (rows + 1))
         del csv_body, t, arrow
-        status, _, code, text = raw_sql(A.port + 2, "SELECT b1.a, b2.a FROM big b1 CROSS JOIN (SELECT a FROM big LIMIT 20) b2")
-        checks[f"a 60M-row answer over 0.25 GB: refused with 53200 ({code}) by name: {'the answer is bigger than this node' in text.decode(errors='replace')}"] = status != 200 and code == "53200"
+        # (as a text table: a table is never sent in pieces, so it counts in the query memory whole)
+        status, _, code, text = raw_sql(A.port + 2, "SELECT b1.a, b2.a FROM big b1 CROSS JOIN (SELECT a FROM big LIMIT 20) b2", fmt="table")
+        checks[f"a 60M-row answer as a text table (never in pieces) over 0.25 GB: refused with 53200 ({code}) by name: {'the answer is bigger than this node' in text.decode(errors='replace')}"] = status != 200 and code == "53200"
         checks["…and the node answers after: SELECT 1 is 1"] = json.loads(raw_sql(A.port + 2, "SELECT 1 AS one")[3]) == [{"one": 1}]
     finally:
         node.kill()
@@ -18666,6 +18816,88 @@ def answers_big():
         peak_whole = vm_hwm(node.p.pid)
         del body
         checks[f"…in pieces its peak ({peak_json >> 20} MB) is at least half its JSON ({json_size >> 20} MB) under the same answer's rendered whole ({peak_whole >> 20} MB)"] = status == 200 and peak_json + json_size // 2 < peak_whole
+    finally:
+        node.kill()
+
+    # 2b. Past the node's memory, an answer goes from its plan as the plan makes it: 12M rows of CSV over the same 0.25 GB
+    # node, read a piece at a time (each line counted and its first two columns summed as it comes, never the body whole).
+    # The columns are computed, so no buffer is shared with `big` and the answer counts its own bytes: three 8-byte columns
+    # a row, 288 MB, past the 256 MB a query may hold, so a node that collects it refuses it (53200). (Nine million rows
+    # are 216 MB: under the budget, so they would still answer.) `b1.b + b2.a - b2.a` is computed with no zero to fold away.
+    copies = 4
+    node = Node(lake, A.port + 5, memory_gb=0.25).start()
+    try:
+        streamed_rows = rows * copies
+        conn = http_client.HTTPConnection("127.0.0.1", A.port + 5, timeout=900)
+        conn.request("POST", "/sql?format=csv", f"SELECT b1.a + b2.a - b2.a AS a, b1.b + b2.a - b2.a AS b, b2.a AS a2 FROM big b1 CROSS JOIN (SELECT a FROM big LIMIT {copies}) b2".encode())
+        resp = conn.getresponse()
+        lines_read, total, total_b, sums_ok, pending, header = 0, 0, 0, False, b"", True
+        if resp.status == 200:
+            while piece := resp.read(1 << 20):
+                complete, _, pending = (pending + piece).rpartition(b"\n")
+                for line in (complete.split(b"\n") if complete else []):
+                    if header:
+                        header = False
+                        continue
+                    first, second, _ = line.split(b",", 2)
+                    lines_read += 1
+                    total += int(first)
+                    total_b += int(second)
+            sums_ok = total == copies * (rows * (rows + 1) // 2) and total_b == copies * rows * (rows + 1)
+            outcome = f"200, {lines_read:,} rows, sums of a and b right: {sums_ok}"
+        else:
+            text = resp.read().decode(errors="replace")
+            outcome = f"{resp.status} ({resp.getheader('x-pondra-sqlstate')}), refused: {'the answer is bigger than this node' in text}"
+        conn.close()
+        peak_csv = vm_hwm(node.p.pid)
+        checks[f"an answer of {streamed_rows:,} rows, past the node's memory for queries, goes as CSV from its plan at a peak of {peak_csv >> 20} MB: {outcome}; under the 3M-row answer rendered whole ({peak_whole >> 20} MB)"] = (
+            resp.status == 200 and not pending and lines_read == streamed_rows and sums_ok and peak_csv < peak_whole)
+    finally:
+        node.kill()
+
+    # 2c. A cut answer is never a whole one: a CAST that fails at row 2,999,999 of 3M, with every answer in pieces (0).
+    node = Node(lake, A.port + 6, env={"PONDRA_STREAM_MB": "0"}).start()
+    try:
+        conn = http_client.HTTPConnection("127.0.0.1", A.port + 6, timeout=900)
+        conn.request("POST", "/sql", "SELECT CAST(CASE WHEN a = 2999999 THEN 'x' ELSE CAST(a AS VARCHAR) END AS BIGINT) AS v FROM big".encode())
+        resp = conn.getresponse()
+        try:
+            body = resp.read()
+            outcome = f"{resp.status}, read whole ({len(body)} bytes, ends with ']': {body.rstrip().endswith(b']')})"
+            cut = resp.status != 200 or not body.rstrip().endswith(b"]")
+        except Exception as e:  # (a chunked body that ends without its last chunk: IncompleteRead, a reset)
+            outcome = f"{resp.status}, its read raised {type(e).__name__}"
+            cut = True
+        conn.close()
+        checks[f"a cut answer is never a whole one (a CAST that fails at row 2,999,999 of 3M, in pieces): {outcome}"] = cut
+    finally:
+        node.kill()
+
+    # 2d. An identical query doesn't wait for another client's reading: A reads 1 MB of a CSV and stops; B asks the same
+    # and gets every row; then A reads the rest, and it is every row too.
+    node = Node(lake, A.port + 7).start()
+    try:
+        full = "SELECT * FROM big"
+        a = http_client.HTTPConnection("127.0.0.1", A.port + 7, timeout=900)
+        a.request("POST", "/sql?format=csv", full.encode())
+        ra = a.getresponse()
+        head = ra.read(1 << 20)  # (A has read a megabyte, and stops reading)
+        got = {}
+        def ask_b():
+            t0 = time.time()
+            got["status"], _, _, got["body"] = raw_sql(A.port + 7, full, "csv", timeout=45)
+            got["secs"] = time.time() - t0
+        b = threading.Thread(target=ask_b)
+        b.start()
+        b.join(60)
+        b_rows = pacsv.read_csv(io.BytesIO(got["body"])) if got.get("status") == 200 else None
+        b_ok = b_rows is not None and b_rows.num_rows == rows and pc.sum(b_rows.column("a")).as_py() == rows * (rows + 1) // 2
+        got.pop("body", None)
+        rest = ra.read()  # (then A reads the rest)
+        a.close()
+        a_rows = pacsv.read_csv(io.BytesIO(head + rest))
+        a_ok = a_rows.num_rows == rows and pc.sum(a_rows.column("a")).as_py() == rows * (rows + 1) // 2
+        checks[f"an identical query while another's answer is half read runs on its own: {got.get('secs', float('nan')):.1f} s, every row; then the first is read to its end"] = b_ok and a_ok
     finally:
         node.kill()
 

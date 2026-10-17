@@ -576,30 +576,10 @@ crate::per_node!(
 
 /// This user's folder of claim lock files, in the temp folder: per user on macOS and Windows, and
 /// named by the user's id on Linux, where `/tmp` is shared. Made 0700, and used only while it is
-/// ours alone, so no other user can take a lock away (and make a live leader look gone). None: the
-/// claims go on without locks, and the mark decides.
-fn lock_dir() -> Option<PathBuf> { own_temp("pondra-terms") }
-
-/// A folder named `name` in the temp folder that is this user's alone: named by the user's id on
-/// Linux, made 0700, and used only while it is ours alone, so no other user can change what is in
-/// it. None when it isn't ours (the caller decides what that means).
-pub(crate) fn own_temp(name: &str) -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-        let uid = unsafe { libc::getuid() };
-        let dir = std::env::temp_dir().join(format!("{name}-{uid}"));
-        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
-        let m = std::fs::symlink_metadata(&dir).ok()?;
-        (m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0).then_some(dir)
-    }
-    #[cfg(not(unix))]
-    {
-        let dir = std::env::temp_dir().join(name);
-        std::fs::create_dir_all(&dir).ok()?;
-        Some(dir)
-    }
-}
+/// ours alone, so no other user can take a lock away (and make a live leader look gone): `memory::own_dir`.
+/// Its base is the temp folder, never the spill folder: every process on the machine must find the
+/// same one (invariant 370). None: the claims go on without locks, and the mark decides.
+fn lock_dir() -> Option<PathBuf> { crate::memory::own_dir(&std::env::temp_dir(), "pondra-terms").ok() }
 
 /// Where term `t`'s lock file would be here: its id is trusted only as 32 hex characters (it comes
 /// from the bucket, so it must never become a path).

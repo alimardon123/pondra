@@ -1,26 +1,31 @@
 //! What a window holds counts in the query memory (invariant 414). DataFusion's windows keep the rows they still need
 //! with no memory reservation, so `count(*) OVER ()` over 60 M rows grew a node until the OS killed it. Each window sits
 //! between `HeldInExec` (counts each batch going in) and `HeldOutExec` (lets go of each batch as its rows come out), which
-//! share one reservation per partition. Still uncounted: what DataFusion keeps inside a window beyond those rows (the
-//! strings a long partition's views point into, a frame's rows behind those given out, `WindowAggExec`'s concatenation).
+//! share one reservation per partition. A window that streams copies its string columns plain (`plain_below`), so the
+//! strings its views point into are no longer uncounted; still uncounted: what DataFusion keeps inside a window beyond
+//! those rows (a frame's rows behind those given out, `WindowAggExec`'s concatenation, the view columns a partition key
+//! or a function reads, which stay views).
 //! `LeanExec` is the other operator here: a sort's output of strings holds only its own rows' strings (`LeanSorts`).
 use crate::store::memory_limit;
 use datafusion::arrow::array::{Array, AsArray};
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DataFusionError, Result, Statistics};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::expressions::{cast, Column};
+use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::execution_plan::{replace_children_if_necessary, CardinalityEffect};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion::physical_plan::{ChildStats, DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties, StatisticsArgs};
 use futures::StreamExt;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// One partition's bytes in a window: the reservation, and the (rows, bytes) of each batch that went in whose rows haven't
@@ -88,6 +93,7 @@ pub struct Windows;
 
 impl PhysicalOptimizerRule for Windows {
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        let keys = key_columns(&plan)?;
         plan.transform_up(|node| {
             let window = node.is::<WindowAggExec>() || node.is::<BoundedWindowAggExec>();
             let counted = node.children().first().is_some_and(|c| c.is::<HeldInExec>()); // (the rule may meet a plan twice)
@@ -97,10 +103,15 @@ impl PhysicalOptimizerRule for Windows {
             let child = node.children()[0].clone();
             let child_fields = child.schema().fields().len();
             let extra: usize = node.schema().fields()[child_fields..].iter().map(|f| f.data_type().primitive_width().unwrap_or(16)).sum(); // (the window's own columns, a value a row each)
+            // (`WindowAggExec` concatenates once at the end and is counted whole: only a streaming window is changed)
+            let streams = node.downcast_ref::<BoundedWindowAggExec>().is_some_and(|w| !reads_view(w, &child.schema()));
+            let input = if streams { plain_below(&child, &keys)? } else { child.clone() };
+            let uncast = !Arc::ptr_eq(&input, &child);
             let slots = Arc::new(Slots::default());
-            let kid: Arc<dyn ExecutionPlan> = Arc::new(HeldInExec { props: child.properties().clone(), input: child, slots: slots.clone(), extra });
+            let kid: Arc<dyn ExecutionPlan> = Arc::new(HeldInExec { props: input.properties().clone(), input, slots: slots.clone(), extra });
             let w = replace_children_if_necessary(node, vec![kid])?; // (`with_new_children` is deprecated in DataFusion 55.1: the repo's own call, as in `optimize.rs`)
-            Ok(Transformed::yes(Arc::new(HeldOutExec { props: w.properties().clone(), input: w, slots }) as Arc<dyn ExecutionPlan>))
+            let out: Arc<dyn ExecutionPlan> = Arc::new(HeldOutExec { props: w.properties().clone(), input: w, slots });
+            Ok(Transformed::yes(if uncast { views_back(&out, &child.schema())? } else { out }))
         })
         .data()
     }
@@ -112,6 +123,75 @@ impl PhysicalOptimizerRule for Windows {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// The plain type a view column is held as, or None for every other type.
+fn plain(t: &DataType) -> Option<DataType> {
+    match t {
+        DataType::Utf8View => Some(DataType::Utf8),
+        DataType::BinaryView => Some(DataType::Binary),
+        _ => None,
+    }
+}
+
+/// The names of the columns the windows of `plan` read as partition keys. A key stays a view: a projection that casts it
+/// hides the ordering the window finds its partitions by (`get_partition_by_sort_exprs`), and the window fails. The other
+/// columns of an ordering pass through a projection as they are, so an expression of them keeps its order.
+fn key_columns(plan: &Arc<dyn ExecutionPlan>) -> Result<HashSet<String>> {
+    let mut names = HashSet::new();
+    plan.apply(|node| {
+        if let Some(w) = node.downcast_ref::<BoundedWindowAggExec>() {
+            for window in w.window_expr() {
+                for key in window.partition_by() {
+                    names.extend(collect_columns(key).into_iter().map(|c| c.name().to_string()));
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(names)
+}
+
+/// Whether a window function reads a view column of its input as an argument. The function's output takes that column's
+/// type, so such a window keeps its input as it is.
+fn reads_view(window: &BoundedWindowAggExec, input: &Schema) -> bool {
+    window.window_expr().iter().flat_map(|w| w.expressions()).any(|arg| {
+        collect_columns(&arg).iter().any(|c| input.fields().get(c.index()).is_some_and(|f| plain(f.data_type()).is_some()))
+    })
+}
+
+/// `input` with each column cast to the type `types` gives it (names and nullability kept), or `input` itself when no
+/// type changes.
+fn recast(input: &Arc<dyn ExecutionPlan>, types: impl Fn(usize, &Field) -> DataType) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = input.schema();
+    let mut exprs = vec![];
+    let mut changed = false;
+    for (i, f) in schema.fields().iter().enumerate() {
+        let to = types(i, f);
+        changed |= to != *f.data_type();
+        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new(f.name(), i));
+        exprs.push((cast(column, &schema, to)?, f.name().clone()));
+    }
+    if !changed {
+        return Ok(Arc::clone(input));
+    }
+    Ok(Arc::new(ProjectionExec::try_new(exprs, Arc::clone(input))?))
+}
+
+/// A streaming window's input with its string columns plain: each view column that no partition key reads is cast to its
+/// plain type. The window holds the plain copies, so the view buffers of the rows it has let go are not kept (a window
+/// concatenates its partition's batches, and concatenating views keeps every batch's buffers).
+fn plain_below(input: &Arc<dyn ExecutionPlan>, keys: &HashSet<String>) -> Result<Arc<dyn ExecutionPlan>> {
+    recast(input, |_, f| match plain(f.data_type()) {
+        Some(to) if !keys.contains(f.name()) => to,
+        _ => f.data_type().clone(),
+    })
+}
+
+/// A window's output with its columns from the input back in the types they had, so everything above sees the schema it
+/// was planned with.
+fn views_back(out: &Arc<dyn ExecutionPlan>, input: &Schema) -> Result<Arc<dyn ExecutionPlan>> {
+    recast(out, |i, f| if i < input.fields().len() { input.field(i).data_type().clone() } else { f.data_type().clone() })
 }
 
 impl DisplayAs for HeldOutExec {
@@ -177,7 +257,10 @@ impl ExecutionPlan for HeldOutExec {
 
     fn execute(&self, p: usize, ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let held = Arc::new(Mutex::new(Held {
-            reservation: MemoryConsumer::new(format!("Window[{p}]")).register(ctx.memory_pool()),
+            // (A window never spills: its rows wait for the partition's end. It is spillable so the pool gives it a fair
+            // share beside the sorts that feed it. `FairSpillPool` refuses an unspillable grow whenever the sorts' shares are
+            // full, though the window holds little; a spillable one is checked against its own share, and refused past it.)
+            reservation: MemoryConsumer::new(format!("Window[{p}]")).with_can_spill(true).register(ctx.memory_pool()),
             batches: VecDeque::new(),
         }));
         self.slots.0.lock().unwrap().insert(p, held.clone());
@@ -251,8 +334,8 @@ impl ExecutionPlan for HeldInExec {
             let mut h = held.lock().unwrap();
             h.reservation.try_grow(b).map_err(|_| {
                 let message = format!("out of memory: a window holds more rows than this node's memory for queries ({} MB): partition it by more columns, or give the node more memory (--memory-gb)", memory_limit() >> 20);
-                DataFusionError::External(Box::new(crate::codes::Coded("53200", message)))
-            })?; // (the words "out of memory" give 53200 across nodes too; they don't start the frugal retry, which keys on "Resources exhausted")
+                DataFusionError::ResourcesExhausted(message)
+            })?; // ("Resources exhausted" starts the frugal retry (`query::frugally`), where a window over whole partitions is answered as a GROUP BY; the words give 53200 on every door)
             h.batches.push_back((batch.num_rows(), b));
             Ok(batch)
         });
@@ -400,7 +483,7 @@ mod tests {
     async fn refused(ctx: &SessionContext, sql: &str) -> AnyResult<bool> {
         match answer(ctx, sql).await {
             Ok(_) => Ok(false),
-            Err(e) => Ok(anyhow::Error::from(e).chain().any(|c| c.downcast_ref::<crate::codes::Coded>().is_some_and(|c| c.0 == "53200"))),
+            Err(e) => Ok(crate::codes::of(&anyhow::Error::from(e)) == "53200"),
         }
     }
 
@@ -565,6 +648,124 @@ mod tests {
         let plain = session(1, false); // (without the rule, the test bites: some batch points into many)
         plain.register_table("t", Arc::new(table(1, 20_000, DataType::Utf8View)?))?;
         assert!(answer(&plain, sql).await?.iter().any(|b| !lean_batch(b)), "the test would not catch the buffers");
+        Ok(())
+    }
+
+    /// `session` without the window rule: the answers the rule must give back.
+    fn session_plain(partitions: usize) -> SessionContext {
+        let config = SessionConfig::new().with_target_partitions(partitions).with_batch_size(1024);
+        SessionContext::new_with_state(SessionStateBuilder::new().with_config(config).with_default_features().build())
+    }
+
+    /// A table of `n` rows in batches of 1,000 dealt over `partitions`: `id`, `k` (`id % 3`), and two string views of
+    /// random letters, `s` and `v` (`v` the reverse of `s`), 20 to 40 letters each, so each has buffers of its own.
+    fn wide(partitions: usize, n: usize) -> AnyResult<MemTable> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8View, false),
+            Field::new("v", DataType::Utf8View, false),
+        ]));
+        let s = letters(n);
+        let v: Vec<String> = s.iter().rev().cloned().collect();
+        let mut parts = vec![vec![]; partitions];
+        for (b, (ss, vv)) in s.chunks(1000).zip(v.chunks(1000)).enumerate() {
+            let start = (b * 1000) as i64;
+            let end = start + ss.len() as i64;
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from_iter_values(start..end)),
+                Arc::new(Int64Array::from_iter_values((start..end).map(|i| i % 3))),
+                Arc::new(StringViewArray::from(ss.to_vec())),
+                Arc::new(StringViewArray::from(vv.to_vec())),
+            ];
+            parts[b % partitions].push(RecordBatch::try_new(schema.clone(), columns)?);
+        }
+        Ok(MemTable::try_new(schema, parts)?)
+    }
+
+    /// The (id, number) rows of an answer whose first column is `id` and last a number, in order.
+    fn pairs(batches: &[RecordBatch]) -> AnyResult<Vec<(i64, i64)>> {
+        let mut out = vec![];
+        for b in batches {
+            let id = b.column(0).as_primitive::<Int64Type>();
+            let n = cast(b.column(b.num_columns() - 1), &DataType::Int64)?;
+            let n = n.as_primitive::<Int64Type>();
+            out.extend((0..b.num_rows()).map(|i| (id.value(i), n.value(i))));
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn a_streaming_window_gets_plain_strings_and_its_views_back() -> AnyResult<()> {
+        let ctx = session(1, false);
+        ctx.register_table("t", Arc::new(wide(1, 2000)?))?;
+        let plan = planned(&ctx, "SELECT id, k, s, rank() OVER (PARTITION BY k ORDER BY s) AS r FROM t").await?;
+        let below = plan.find("CAST(s@2 AS Utf8)").expect(&plan);
+        let window = plan.find("BoundedWindowAggExec").expect(&plan);
+        let back = plan.find("CAST(s@2 AS Utf8View)").expect(&plan);
+        assert!(back < window && window < below, "{plan}"); // (the cast back above the window, the plain cast below it)
+        assert!(plan.contains("mode=[Sorted]"), "{plan}"); // (no sort added: the key's ordering survives the projection)
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_window_reading_a_view_argument_keeps_its_views() -> AnyResult<()> {
+        let ctx = session(1, false);
+        ctx.register_table("t", Arc::new(wide(1, 2000)?))?;
+        let plan = planned(&ctx, "SELECT id, first_value(s) OVER (PARTITION BY k ORDER BY s) AS f FROM t").await?;
+        assert!(!plan.contains("CAST("), "{plan}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_view_key_stays_a_view_and_its_window_stays_sorted() -> AnyResult<()> {
+        let sql = "SELECT id, v, rank() OVER (PARTITION BY s ORDER BY k) AS r FROM t ORDER BY id";
+        let (on, off) = (session(1, false), session_plain(1));
+        for ctx in [&on, &off] {
+            ctx.register_table("t", Arc::new(wide(1, 4000)?))?;
+        }
+        let plan = planned(&on, sql).await?;
+        assert!(plan.contains("CAST(v@") && !plan.contains("CAST(s@"), "{plan}"); // (`v` is cast, the key `s` is not)
+        assert!(plan.contains("mode=[Sorted]"), "{plan}");
+        assert_eq!(pairs(&answer(&on, sql).await?)?, pairs(&answer(&off, sql).await?)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stacked_windows_keep_the_keys_the_lower_one_orders() -> AnyResult<()> {
+        // (the upper window partitions by `s`, which the lower one orders: `s` must stay a view, or the upper one fails)
+        let sql = "SELECT id, count(*) OVER (PARTITION BY k, s) AS c FROM (SELECT id, k, s, rank() OVER (PARTITION BY k ORDER BY s) AS r FROM t) ORDER BY id";
+        let (on, off) = (session(1, false), session_plain(1));
+        for ctx in [&on, &off] {
+            ctx.register_table("t", Arc::new(wide(1, 4000)?))?;
+        }
+        assert_eq!(pairs(&answer(&on, sql).await?)?, pairs(&answer(&off, sql).await?)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_streaming_window_answers_as_it_did_without_the_rule() -> AnyResult<()> {
+        let sql = "SELECT id, rank() OVER (PARTITION BY k ORDER BY s) AS r FROM t ORDER BY id";
+        let (on, off) = (session(4, false), session_plain(4));
+        for ctx in [&on, &off] {
+            ctx.register_table("t", Arc::new(wide(4, 20_000)?))?; // (20 batches of 1,000 rows)
+        }
+        let (a, b) = (pairs(&answer(&on, sql).await?)?, pairs(&answer(&off, sql).await?)?);
+        assert_eq!(a.len(), 20_000);
+        assert_eq!(a, b);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_second_run_wraps_a_window_once() -> AnyResult<()> {
+        let ctx = session(1, false);
+        ctx.register_table("t", Arc::new(wide(1, 2000)?))?;
+        let plan = ctx.sql("SELECT id, rank() OVER (PARTITION BY k ORDER BY s) AS r FROM t").await?.create_physical_plan().await?;
+        let twice = Windows.optimize(plan, &ConfigOptions::new())?;
+        let text = displayable(twice.as_ref()).indent(true).to_string();
+        assert_eq!(text.matches("HeldInExec").count(), 1, "{text}");
+        assert_eq!(text.matches("HeldOutExec").count(), 1, "{text}");
+        assert_eq!(text.matches("CAST(s@2 AS Utf8)").count(), 1, "{text}");
         Ok(())
     }
 }
