@@ -885,8 +885,9 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
             let sql = q.to_string();
             let ctx = session(from, &sql, "").await?;
             let ctx = if files { ctx.enable_url_table() } else { ctx };
-            // (the types as planned: the analyzer's rules make 1e15 a whole decimal and a float meeting a decimal a float, and the table must hold what the query gives)
-            let fields = crate::query::sql(&ctx, &sql).await?.into_optimized_plan()?.schema().fields().iter().cloned().collect::<Vec<_>>();
+            let df = crate::query::sql(&ctx, &sql).await?;
+            // (the types the query gives: the analyzer's rules make 1e15 a whole decimal and a float meeting a decimal a float, and the table must hold what the query gives)
+            let fields = crate::query::run_schema(&ctx, df.logical_plan())?.fields().iter().cloned().collect::<Vec<_>>();
             match c.columns.is_empty() {
                 true => {
                     // (a column the query takes from a uuid is one here too: `CREATE TABLE t2 AS SELECT * FROM t`)
@@ -1325,7 +1326,7 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
     let target: Vec<(String, DataType)> = match &meta {
         Some(m) => m.live().map(|(s, _, t)| Ok((s.to_string(), crate::query::dtype(t)?))).collect::<Result<_>>()?,
         // (a new table takes the types the query gives as it runs, as `create_spec` does)
-        None => df.clone().into_optimized_plan()?.schema().fields().iter().map(|f| (f.name().clone(), if *f.data_type() == DataType::Utf8View { DataType::Utf8 } else { f.data_type().clone() })).collect(),
+        None => crate::query::run_schema(ctx, df.logical_plan())?.fields().iter().map(|f| (f.name().clone(), if *f.data_type() == DataType::Utf8View { DataType::Utf8 } else { f.data_type().clone() })).collect(),
     };
     ensure!(df.schema().fields().len() <= target.len(), "{} columns given, table {table} has {}", df.schema().fields().len(), target.len());
     let given = df.schema().columns(); // (the table's first columns; any after them are null)

@@ -867,14 +867,15 @@ impl App {
                     crate::query::frugal(&ctx);
                 }
                 let df = crate::query::sql(&ctx, query).await?;
-                let (schema, task) = (Arc::new(df.schema().as_arrow().clone()), Arc::new(df.task_ctx()));
+                let task = Arc::new(df.task_ctx());
                 let (state, logical) = df.into_parts();
                 let logical = state.optimize(&logical)?; // (as `create_physical_plan`, the plan it optimized kept: what its filters were about, `learned.rs`)
                 let plan = state.query_planner().create_physical_plan(&logical, &state).await?;
                 let out = crate::query::collect(plan.clone(), task).await?;
                 crate::history::planned(&logical, &plan); // (its shape; a slow statement's plan, with what each operator did; what it learned)
                 let out = if explained { crate::history::explained(out)? } else { out };
-                anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(schema)] } else { out }) // (no rows: still its columns)
+                // (no rows: still its columns, with the types its batches have, which the physical plan gives: not the planner's)
+                anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(plan.schema())] } else { out })
             };
             let here = std::time::Instant::now();
             let out = crate::query::frugally(run).await?;

@@ -230,7 +230,8 @@ async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> { planned(a
 
 async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> {
     let ctx = crate::query::session(&app.lake, sql, "").await?;
-    Ok(nullable(crate::query::sql(&ctx, &crate::asof::rewrite(sql)?).await?.schema().as_arrow()))
+    let df = crate::query::sql(&ctx, &crate::asof::rewrite(sql)?).await?;
+    Ok(nullable(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow()))
 }
 
 /// A statement's answer, as its ticket names it: a CALL's kept answer, a write's row count, or a

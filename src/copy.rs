@@ -67,8 +67,9 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     };
     if format == "delta" || format == "iceberg" {
         ensure!(!options.contains_key("partition_by"), "COPY … TO as {format}: PARTITION_BY (a partitioned {format} table): not yet");
-        let df = crate::query::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
-        return crate::write_outside::copy_table(lake, df, to, &format, on("append"), on("overwrite")).await; // (a table, not files: ADR-028)
+        let ctx = crate::query::session(lake, &query, "").await?;
+        let df = crate::query::sql(&ctx, &query).await?;
+        return crate::write_outside::copy_table(lake, &ctx, df, to, &format, on("append"), on("overwrite")).await; // (a table, not files: ADR-028)
     }
     ensure!(["parquet", "csv", "json", "arrow"].contains(&format.as_str()), "COPY … TO as {format}: parquet, csv, json, arrow, delta or iceberg");
     ensure!(format == "parquet" || !options.contains_key("compression") && !options.contains_key("row_group_size"), "COPY … TO as {format}: COMPRESSION and ROW_GROUP_SIZE are Parquet's (files are read as they are: not compressed)");

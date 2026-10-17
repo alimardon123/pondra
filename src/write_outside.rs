@@ -42,7 +42,7 @@ const DELTA_WRITES: &[&str] = &["appendOnly", "invariants", "checkConstraints", 
 /// `COPY … TO '<folder>' (FORMAT delta | iceberg)` (ADR-028): a table of that format there, made
 /// if the folder holds none; one that is there takes APPEND (rows added) or OVERWRITE (its rows
 /// replaced), as a folder of files does. Polars' `write_delta` and Spark's `format("delta")`.
-pub async fn copy_table(lake: &Lake, df: datafusion::prelude::DataFrame, to: &str, format: &str, append: bool, overwrite: bool) -> Result<Value> {
+pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, df: datafusion::prelude::DataFrame, to: &str, format: &str, append: bool, overwrite: bool) -> Result<Value> {
     let root = crate::ddl::full(to)?; // (a folder named relatively: from where the node runs; Iceberg's location is absolute)
     let root = root.as_str();
     let (store, dir) = crate::ext::store(lake, &format!("{root}/")).await?;
@@ -57,7 +57,7 @@ pub async fn copy_table(lake: &Lake, df: datafusion::prelude::DataFrame, to: &st
         true => ensure!(append || overwrite, "COPY … TO {to}: a {format} table is there already: APPEND adds to it, OVERWRITE replaces its rows"),
         false => {
             ensure!(there.is_empty(), "COPY … TO {to}: the folder holds files that aren't a {format} table");
-            let columns: Vec<(String, String)> = df.clone().into_optimized_plan()?.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(&crate::write::stored(f.data_type())))).collect(); // (the types as the query runs, not as the planner first typed them)
+            let columns: Vec<(String, String)> = crate::query::run_schema(ctx, df.logical_plan())?.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(&crate::write::stored(f.data_type())))).collect(); // (the types as the query runs, not as the planner first typed them)
             let name = root.rsplit('/').next().unwrap_or("table");
             let now = crate::log::now_ms();
             let (file, body) = match format {

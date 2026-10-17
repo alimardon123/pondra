@@ -3728,6 +3728,11 @@ def flight():
     }
     checks.update(flight_protocol(fport))  # (the protocol's own actions and RPCs, over gRPC)
     checks.update(flight_schemas(fport))  # (the schema each query announces is the one its stream sends)
+    # A number with an exponent: the schema GetFlightInfo announces is the type its rows come back with (decimal(16, 0), not the planner's decimal(1, -15)).
+    exp_info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": "SELECT 1e15 AS x"})), opts("r"))
+    exp_rows = client.do_get(exp_info.endpoints[0].ticket, options=opts("r")).read_all()
+    checks["the FlightInfo schema of SELECT 1e15 AS x is decimal(16, 0), the type its rows come back with"] = \
+        str(exp_info.schema.field("x").type) == str(exp_rows.schema.field("x").type) == "decimal128(16, 0)" and [str(v) for v in exp_rows.column("x").to_pylist()] == ["1000000000000000"]
     node.kill(); follower.kill()
     ok = all(checks.values())
     follow_ms = round((lag[-1] - sent_at) * 1000) if lag else None
@@ -7379,6 +7384,31 @@ def found():
     q("CHECKPOINT")
     seen["exps_v"] = q("SELECT y FROM exps_v")
     checks["a materialized view's column of 1e15 is a whole decimal too: its table is written and reads 1000000000000000"] = seen["exps_v"] == [{"y": 1000000000000000}]
+    # The other ways a table is made from a query take its columns the same way (run_schema): a bulk INSERT into a new
+    # table, a task's target table made when the task is registered, COPY TO a Delta folder (read back by read_delta).
+    call(port, "POST", "/insert/exps_bulk?job=exps-1", b"SELECT 1e15 AS x")
+    seen["exps_bulk"] = q("SELECT x FROM exps_bulk")
+    checks["POST /insert/{t} from SELECT 1e15 AS x into a new table reads 1000000000000000"] = seen["exps_bulk"] == [{"x": 1000000000000000}]
+    q("CREATE TABLE exps_src (id BIGINT)")
+    call(port, "POST", "/tasks/exps_copy", json.dumps({"source": "exps_src", "target": "exps_tgt", "sql": "SELECT id, 1e15 AS y FROM exps_src"}).encode())
+    q("INSERT INTO exps_src VALUES (1)")
+    want = [{"lo": 1000000000000000, "hi": 1000000000000000, "n": 1}]
+    seen["exps_task"] = until(lambda: _try(lambda: q("SELECT min(y) AS lo, max(y) AS hi, count(*) AS n FROM exps_tgt")), want, 30)
+    checks["a task's target table made from 1e15 reads 1000000000000000"] = seen["exps_task"] == want
+    delta = os.path.join(tempfile.mkdtemp(prefix="pondra-exps-"), "delta")
+    copied = subprocess.run([BIN, "sql", "--dir", lake, f"COPY (SELECT 1e15 AS x) TO '{delta}' (FORMAT delta)"], capture_output=True, text=True, env=node.env)
+    back = subprocess.run([BIN, "sql", "--dir", lake, f"SELECT CAST(x AS VARCHAR) AS s, arrow_typeof(x) AS t FROM read_delta('{delta}')"], capture_output=True, text=True, env=node.env)
+    seen["exps_delta"] = [copied.returncode, back.returncode, back.stdout[-300:], back.stderr[-300:]]
+    checks["COPY (SELECT 1e15 AS x) TO a Delta folder reads back 1000000000000000 through read_delta"] = \
+        copied.returncode == 0 and back.returncode == 0 and "| 1000000000000000 " in back.stdout and "Decimal128(16, 0)" in back.stdout
+    # A view fed by a topic (this node's Kafka port): the shard's batches are the types the query runs with, so the view fills.
+    q("CREATE TABLE exps_ticks (id BIGINT)")
+    q("INSERT INTO exps_ticks VALUES (1), (2)")
+    q(f"CREATE SECRET exps_ticks_k (TYPE kafka, SECURITY_PROTOCOL 'PLAINTEXT', SCOPE 'kafka://127.0.0.1:{port + 20}')")
+    q(f"CREATE MATERIALIZED VIEW exps_fed AS SELECT CAST(value->>'id' AS BIGINT) AS id, 1e15 AS y FROM 'kafka://127.0.0.1:{port + 20}/exps_ticks'")
+    want = [{"lo": 1000000000000000, "hi": 1000000000000000, "n": 2}]
+    seen["exps_fed"] = until(lambda: _try(lambda: q("SELECT min(y) AS lo, max(y) AS hi, count(*) AS n FROM exps_fed")), want, 30)
+    checks["a view fed by a topic with 1e15 fills with 1000000000000000 (two records)"] = seen["exps_fed"] == want
     node.kill(); locked.kill()
     ok = all(checks.values())
     print(json.dumps({"found": checks, "ok": ok}, indent=1))

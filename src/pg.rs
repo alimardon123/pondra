@@ -642,8 +642,9 @@ impl Backend {
     /// A query's result columns, without running it.
     async fn schema(&self, sql: &str, user: &str) -> PgWireResult<Arc<Schema>> {
         let sql = crate::asof::rewrite(sql).map_err(user_error)?;
-        let df = crate::query::sql(&self.session(&sql, user).await?, &sql).await.map_err(user_error)?;
-        Ok(Arc::new(df.schema().as_arrow().clone()))
+        let ctx = self.session(&sql, user).await?;
+        let df = crate::query::sql(&ctx, &sql).await.map_err(user_error)?;
+        Ok(Arc::new(crate::query::run_schema(&ctx, df.logical_plan()).map_err(user_error)?.as_arrow().clone()))
     }
 
     /// A session for `sql`; with Postgres's catalog, its functions and its `information_schema`
