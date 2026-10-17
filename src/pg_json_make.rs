@@ -23,11 +23,11 @@ use datafusion::arrow::datatypes::{
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
-use datafusion::common::Result;
+use datafusion::common::{DFSchema, DFSchemaRef, Result};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::expr::{Cast, TryCast};
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
-use datafusion::logical_expr::{ColumnarValue, Expr, LogicalPlan, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, Expr, ExprSchemable, LogicalPlan, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility};
 use datafusion::optimizer::analyzer::AnalyzerRule;
 use datafusion::prelude::SessionContext;
 use jiter::{Jiter, Peek};
@@ -153,8 +153,10 @@ impl ScalarUDFImpl for AsJson {
 
 /// Takes the JSON mark off a cast to text, as an analyzer rule after type coercion (`optimize.rs`). `(doc -> 'a')::text`
 /// is text, as Postgres says, so the port sends it as text and a function quotes it. DataFusion gives a cast its
-/// source's metadata unless the cast's target field has a name or metadata of its own, so each text cast gets a named
-/// target with none. The values are the same; only the mark goes.
+/// source's metadata unless the cast's target field has a name or metadata of its own, so a text cast of a JSON value
+/// gets a named target with none. The values are the same; only the mark goes. Any other cast is left as it is: a
+/// named one is never simplified away, and a plain `CAST(region AS Utf8View)` kept in a scan's projection made the
+/// nodes of a spread query plan apart (`harness.py outside`).
 #[derive(Debug)]
 pub struct AsText;
 
@@ -186,10 +188,11 @@ impl AnalyzerRule for AsText {
             if !any {
                 return Ok(Transformed::no(plan));
             }
+            let schema = input_schema(&plan);
             let names = NamePreserver::new(&plan);
             plan.map_expressions(|e| {
                 let name = names.save(&e);
-                let e = e.transform_up(|e| Ok(unmarked(e)))?;
+                let e = e.transform_up(|e| Ok(unmarked(e, &schema)))?;
                 Ok(e.update_data(|e| name.restore(e)))
             })
         })
@@ -206,14 +209,34 @@ fn text_cast(e: &Expr) -> bool {
     }
 }
 
-/// `e`, with a text cast's target named (so it takes no metadata from its source).
-fn unmarked(e: Expr) -> Transformed<Expr> {
+/// The schema a plan node's expressions are worked out over: its inputs' (a join's both sides), or its own.
+fn input_schema(plan: &LogicalPlan) -> DFSchemaRef {
+    match plan.inputs().as_slice() {
+        [] => plan.schema().clone(),
+        [one] => one.schema().clone(),
+        [first, rest @ ..] => {
+            let mut schema = first.schema().as_ref().clone();
+            for other in rest {
+                schema.merge(other.schema());
+            }
+            Arc::new(schema)
+        }
+    }
+}
+
+/// Whether `e` is JSON text over `schema` (one it can't be worked out over is taken for JSON: unmarked, it is still text).
+fn json_source(e: &Expr, schema: &DFSchema) -> bool {
+    e.to_field(schema).map(|(_, f)| is_json_field(&f)).unwrap_or(true)
+}
+
+/// `e`, with a JSON value's text cast's target named (so it takes no metadata from its source).
+fn unmarked(e: Expr, schema: &DFSchema) -> Transformed<Expr> {
     match e {
-        Expr::Cast(c) if is_text(c.field.data_type()) => {
+        Expr::Cast(c) if is_text(c.field.data_type()) && json_source(&c.expr, schema) => {
             let field = Arc::new(Field::new("text", c.field.data_type().clone(), true));
             Transformed::yes(Expr::Cast(Cast::new_from_field(c.expr, field)))
         }
-        Expr::TryCast(c) if is_text(c.field.data_type()) => {
+        Expr::TryCast(c) if is_text(c.field.data_type()) && json_source(&c.expr, schema) => {
             let field = Arc::new(Field::new("text", c.field.data_type().clone(), true));
             Transformed::yes(Expr::TryCast(TryCast::new_from_field(c.expr, field)))
         }

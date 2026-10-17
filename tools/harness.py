@@ -18009,7 +18009,7 @@ def jsonedits():
     """JSON documents changed in place (`pg_json_edit.rs`, round 35): jsonb_set, jsonb_insert, jsonb_concat, `-` and `#-`
     (jsonb_delete, jsonb_delete_path), jsonb_strip_nulls, json_strip_nulls and jsonb_pretty; and a string cast to an array
     type read as a Postgres array literal ('{a,b}'::text[], CAST('{1,2}' AS INT[]), TEXT[] '{a,b}') by `pg_values.rs`.
-    Each answer equals Postgres 16's (PONDRA_PG16 names it, default the local one under /tmp/pg16-l3), over HTTP and over
+    Each answer equals Postgres 16's (PONDRA_PG16 names it, default the local one under /tmp/pg16-l3), or, with none, its answers recorded in tools/pg16/jsonedits.json (`Pg16`), over HTTP and over
     the Postgres port; what Postgres refuses is refused with the same SQLSTATE by name (42883 for `-` on a json or a
     decimal operand, 22023 for a change into a scalar or a key that is there already, 22004 for a NULL path element,
     22P02 for a path element that isn't an integer where an array is, or text that isn't JSON). Where Pondra reads more
@@ -18051,7 +18051,6 @@ def jsonedits():
     stored in the lake (a new format: an ADR and a format number).
     """
     import csv, psycopg
-    pg_dsn = os.environ.get("PONDRA_PG16", "host=/tmp/pg16-l3 port=55432 user=postgres dbname=postgres")
     # Rows: a document in jsonb's own text (keys in jsonb's order: what jsonb would print), json text with spaces
     # (json keeps what it is given), a count. Row 3 is all NULL; row 4 is a scalar (a change into it is refused).
     rows = [
@@ -18131,12 +18130,7 @@ def jsonedits():
         ("- jsonb on a jsonb column", "SELECT doc - doc FROM j WHERE id = 1", "42883"),
     ]
     checks, info = {}, {}
-    schema = f"jsonedits_{uuid.uuid4().hex[:8]}"
-    pg = psycopg.connect(pg_dsn, autocommit=True)
-    pg.execute(f"CREATE SCHEMA {schema}")
-    pg.execute(f"SET search_path TO {schema}")
-    for s_ in setup:
-        pg.execute(s_)
+    pg16 = Pg16("jsonedits", setup)
     lake = new_lake()
     node = Node(lake, A.port, tier_secs=1, pg=f"127.0.0.1:{A.port + 10}").start()
     try:
@@ -18157,10 +18151,7 @@ def jsonedits():
             return [tuple(row) for row in list(csv.reader(io.StringIO(body)))[1:]]
 
         def pg_rows(text):
-            with pg.cursor() as cur:
-                cur.execute(f"SET search_path TO {schema}")
-                cur.execute(text)
-                return norm([tuple(r) for r in cur.fetchall()])
+            return pg16.rows(text)
 
         def port_rows(text):
             with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as conn:
@@ -18171,7 +18162,7 @@ def jsonedits():
             try:
                 pg_rows(text)
                 return None
-            except psycopg.Error as e:
+            except Pg16Error as e:
                 return e.sqlstate
 
         def port_code(text):
@@ -18208,7 +18199,7 @@ def jsonedits():
             try:
                 pg_rows(text)
                 return None
-            except psycopg.Error as e:
+            except Pg16Error as e:
                 return str(e).splitlines()[0]
 
         def http_or_error(text):  # (a Pondra error is a failed check, not an abort: the rest of the grid still runs)
@@ -18248,7 +18239,7 @@ def jsonedits():
             info[f"known gap: {name} (Postgres 16's answer)"] = {"postgres": rows_text(pg_rows(gap_text)), "pondra": list(_sqlstate_of(A.port, gap_text))[:2] + [str(http_or_error(gap_text))[:120]]}
         # UPDATE … SET doc = doc || …, and an INSERT … SELECT of one, change the same rows as Postgres's, read back.
         for write in ["UPDATE j SET doc = doc || '{\"z\": 1}' WHERE id IN (1, 2)", "INSERT INTO j (id, doc, js, n) SELECT id + 10, doc || '{\"c\": 3}', js, n FROM j WHERE id = 1"]:
-            pg.execute(write)
+            pg16.rows(write)
             sql(A.port, write)
         back = "SELECT id, doc::text, (doc || '{\"d\": 4}')::text FROM j ORDER BY id"
         checks["UPDATE … SET doc = doc || … and INSERT … SELECT: HTTP reads back Postgres 16's rows"] = http_rows(back) == pg_rows(back)
@@ -18268,8 +18259,7 @@ def jsonedits():
         info["known gap: jsonb_set of a json column (Postgres 16: 42883)"] = {"pondra": http_rows(known), "postgres": pg_code(known)}
     finally:
         node.kill()
-        pg.execute(f"DROP SCHEMA {schema} CASCADE")
-        pg.close()
+        pg16.close()
     ok = all(checks.values())
     print(json.dumps({"jsonedits": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
@@ -18288,7 +18278,7 @@ def lateral():
     subquery, a WHERE, GROUP BY and ORDER BY over the lateral's columns, `SELECT *`, a column of the left side
     named like the function's, `JOIN LATERAL … ON`, `random()` read once, and a lateral the rule leaves to
     DataFusion (an aggregate) answering as before. Each answer equals Postgres 16's (PONDRA_PG16 names it,
-    default the local one under /tmp/pg16-l3; ORDER BY exactly), DuckDB's where DuckDB takes the query, and
+    default the local one under /tmp/pg16-l3, or, with none, its answers recorded in tools/pg16/lateral.json (`Pg16`; ORDER BY exactly), DuckDB's where DuckDB takes the query, and
     the same answer on three nodes with `?spread=1`; the Postgres port answers the same rows; and what is
     refused is refused by name with SQLSTATE 0A000.
 
@@ -18301,7 +18291,6 @@ def lateral():
     Postgres 16 and DuckDB take the same forms (their subquery form written as their own set function).
     """
     import csv, duckdb, psycopg
-    pg_dsn = os.environ.get("PONDRA_PG16", "host=/tmp/pg16-l3 port=55432 user=postgres dbname=postgres")
     pondra_setup = ["CREATE TABLE t (id BIGINT, xs BIGINT[], n BIGINT)", "INSERT INTO t VALUES (1, [1, 2, 3], 2), (2, NULL, 1), (3, [], 3)",
                     "INSERT INTO t SELECT value + 3, make_array(value % 5, value % 3, 1), value % 5 + 1 FROM generate_series(1, 20000)",
                     "CREATE TABLE r (id BIGINT, a BIGINT, b BIGINT)", "INSERT INTO r VALUES (1, 1, 5), (2, 3, 4), (3, NULL, 2), (4, 2, 2)",
@@ -18347,12 +18336,7 @@ def lateral():
     random_text = "SELECT count(DISTINCT s.r) AS d, count(*) AS n FROM (SELECT random() AS r, [1, 2, 3] AS xs) s, unnest(s.xs) AS u(x)"
     random_pg = "SELECT count(DISTINCT s.r) AS d, count(*) AS n FROM (SELECT random() AS r, ARRAY[1, 2, 3] AS xs) s, unnest(s.xs) AS u(x)"
     checks, info = {}, {}
-    schema = f"lateral_{uuid.uuid4().hex[:8]}"
-    pg = psycopg.connect(pg_dsn, autocommit=True)
-    pg.execute(f"CREATE SCHEMA {schema}")
-    pg.execute(f"SET search_path TO {schema}")
-    for s_ in pg_setup:
-        pg.execute(s_)
+    pg16 = Pg16("lateral", pg_setup)
     duck = duckdb.connect()
     for s_ in duck_setup:
         duck.execute(s_)
@@ -18374,24 +18358,20 @@ def lateral():
         assert r.status == 200, body[:300]
         return [tuple(row) for row in list(csv.reader(io.StringIO(body)))[1:]]
     def rows_of_pg(text):
-        with pg.cursor() as cur:
-            cur.execute(f"SET search_path TO {schema}")
-            cur.execute(text)
-            return norm([tuple(r) for r in cur.fetchall()])
+        return pg16.rows(text)
     def rows_of_duck(text):
         return norm([tuple(r) for r in duck.execute(text).fetchall()])
     def key(rows):
         return sorted(rows, key=repr)
-    got, want_pg, want_duck, duck_refused = {}, {}, {}, {}
+    got, want_duck, duck_refused = {}, {}, {}
     for name, text, pg_text, ordered in cases:
         pg_text = pg_text or text
         got[name] = rows_of_pondra(text)
-        want_pg[name] = rows_of_pg(pg_text)
         try:
             want_duck[name] = rows_of_duck(duck_text.get(name, text))
         except Exception as e:
             duck_refused[name] = str(e).splitlines()[0][:120]
-        same = (got[name] == want_pg[name]) if ordered else (key(got[name]) == key(want_pg[name]))
+        same = pg16.same(pg_text, got[name], ordered)
         checks[f"{name}: one node == Postgres 16's answer ({len(got[name])} rows)"] = same
         if name in want_duck:
             checks[f"{name}: == DuckDB's answer"] = key(got[name]) == key(want_duck[name])
@@ -18441,12 +18421,108 @@ def lateral():
     checks["three nodes: the lateral queries spread (the query's spread counter rises)"] = all(s for _, s in spread_checks.values())
     for n in nodes:
         n.kill()
-    pg.execute(f"DROP SCHEMA {schema} CASCADE")
-    pg.close()
+    pg16.close()
     ok = all(checks.values())
     print(json.dumps({"lateral": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
         sys.exit(1)
+
+
+class Pg16Error(Exception):
+    """Postgres 16 refused a statement: its SQLSTATE, and its message's first line as str()."""
+
+    def __init__(self, sqlstate, message):
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+class Pg16:
+    """Postgres 16's answers to one section's statements. With a server (PONDRA_PG16 names it; the default is the local
+    one under /tmp/pg16-l3), each statement is asked there, in a schema of its own made by `setup`, and every answer is
+    written to tools/pg16/<section>.json when the section ends. With none (CI has no Postgres), or PONDRA_PG16=recorded,
+    the answers come from that file, and a statement it doesn't hold stops the section: a check never passes by default.
+    Rows are text (a NULL as ""), as the sections compare Pondra's CSV."""
+
+    DEFAULT = "host=/tmp/pg16-l3 port=55432 user=postgres dbname=postgres"
+    BIG = 200  # (an answer of more rows is kept as its digests: the file holds what a check needs, not 60,000 rows)
+
+    def __init__(self, section, setup):
+        import psycopg
+        self.psycopg, self.section = psycopg, section
+        self.path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pg16", f"{section}.json")
+        dsn = os.environ.get("PONDRA_PG16")
+        self.conn = None
+        if dsn != "recorded":
+            try:
+                self.conn = psycopg.connect(dsn or self.DEFAULT, autocommit=True, connect_timeout=5)
+            except psycopg.OperationalError:
+                if dsn:
+                    raise  # (a server named and not there is an error, never a reason to read the file)
+        if self.conn is None:
+            with open(self.path) as f:
+                self.recorded = json.load(f)
+            return
+        self.recorded, self.schema = {}, f"{section}_{uuid.uuid4().hex[:8]}"
+        self.conn.execute(f"CREATE SCHEMA {self.schema}")
+        self.conn.execute(f"SET search_path TO {self.schema}")
+        for s in setup:
+            self.conn.execute(s)
+
+    def answer(self, text):
+        """{"rows": [[text, …], …]} or {"error": [SQLSTATE, message]}."""
+        if self.conn is None:
+            if text not in self.recorded:
+                raise KeyError(f"tools/pg16/{self.section}.json has no answer to {text!r}: run the section with Postgres 16 to record it")
+            return self.recorded[text]
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(f"SET search_path TO {self.schema}")
+                cur.execute(text)
+                # (a write has no rows, and psycopg refuses to fetch them: its answer is no rows)
+                rows = cur.fetchall() if cur.description else []
+                answer = {"rows": [["" if v is None else str(v) for v in r] for r in rows]}
+        except self.psycopg.Error as e:
+            answer = {"error": [e.sqlstate, str(e).splitlines()[0]]}
+        big = len(answer.get("rows", ())) > self.BIG
+        self.recorded[text] = self.digests(answer["rows"]) if big else answer
+        return answer
+
+    @staticmethod
+    def digests(rows):
+        """An answer's row count and SHA-256 digests: of its rows in order, and sorted (for a query with no ORDER BY)."""
+        import hashlib
+        rows = [list(r) for r in rows]
+        sha = lambda rs: hashlib.sha256(json.dumps(rs).encode()).hexdigest()
+        return {"count": len(rows), "ordered": sha(rows), "sorted": sha(sorted(rows, key=repr))}
+
+    def same(self, text, rows, ordered):
+        """Whether `rows` (tuples of text) are Postgres 16's answer to `text`: in its order, or the same rows in any order."""
+        answer = self.answer(text)
+        if "error" in answer:
+            return False
+        want, got = answer if "count" in answer else self.digests(answer["rows"]), self.digests(rows)
+        way = "ordered" if ordered else "sorted"
+        return got["count"] == want["count"] and got[way] == want[way]
+
+    def rows(self, text):
+        """The rows Postgres 16 answers (tuples of text), or Pg16Error when it refuses."""
+        answer = self.answer(text)
+        if "error" in answer:
+            raise Pg16Error(*answer["error"])
+        if "count" in answer:
+            raise KeyError(f"tools/pg16/{self.section}.json keeps {text!r}'s {answer['count']} rows as digests: compare with same()")
+        return [tuple(r) for r in answer["rows"]]
+
+    def close(self):
+        """Drops the schema and writes the answers asked (a live run only)."""
+        if self.conn is None:
+            return
+        self.conn.execute(f"DROP SCHEMA {self.schema} CASCADE")
+        self.conn.close()
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "w") as f:
+            json.dump(self.recorded, f, indent=1, sort_keys=True)
+            f.write("\n")
 
 
 def _sqlstate_of(port, text):
