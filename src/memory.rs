@@ -6,6 +6,11 @@
 //! their version: `PutMode::Update`) stay in memory: they are small, and a local folder can't take
 //! an update.
 //!
+//! What spills is capped as a query's spills are (`store::spill_cap`: `PONDRA_SPILL_GB`, else the disk's
+//! room), each lake on its own, and the room a lake keeps on its disk is kept either way. Past either, the
+//! write is refused by name (53100), and a write that would pass it reserves its bytes first, so writes
+//! racing for the last of the room can't both take it.
+//!
 //! A lake moves out of memory with `set_location` (`ALTER DATABASE … SET LOCATION`, `db.save`): its objects
 //! are copied to the target while the node serves, the host stops the node, `settle` makes the target equal
 //! to the lake as it is then, and the node starts again there. Nothing of the lake is written in place.
@@ -22,7 +27,7 @@ use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -97,19 +102,28 @@ pub struct Held(Arc<Inner>);
 /// which outlive the call that made them.
 #[derive(Debug)]
 struct Inner {
-    mem: InMemory,
-    disk: OnceLock<Disk>, // (made on the first object that spills)
-    sizes: Mutex<HashMap<Path, u64>>, // the bytes of each object in `mem`: every object put there is listed
-    held: AtomicU64, // their sum: what the budget is measured against
+    objects: InMemory,
+    tier: OnceLock<Disk>, // the disk tier (made on the first object that spills)
+    mem: Tally,           // the objects in `objects`: what the budget is measured against
+    disk: Tally,          // the objects in `tier`: what the cap is measured against
+    pending: AtomicU64,   // bytes reserved on disk for spills in flight (`Reserved`), not in `disk` yet
     budget: u64,
+}
+
+/// The objects one tier holds, by path, each with its bytes, and their sum. Every write and delete that moves
+/// an object into or out of a tier notes it here, so each sum is the tier's whole.
+#[derive(Debug, Default)]
+struct Tally {
+    sizes: Mutex<HashMap<Path, u64>>,
+    sum: AtomicU64,
 }
 
 /// The folder spilled objects go to: a `Folder` of this process's own, which goes when the lake does.
 #[derive(Debug)]
 struct Disk {
     store: LocalFileSystem,
-    #[allow(dead_code)] // (nothing reads it: the folder goes with the lake's disk, when its drop runs)
     folder: Folder,
+    cap: Option<u64>, // the most that may spill here (`store::spill_cap`); None where the disk's room can't be told
 }
 
 impl Held {
@@ -118,7 +132,17 @@ impl Held {
 
     /// A lake held in memory, spilling past `budget` bytes of it in memory.
     pub fn with_budget(budget: u64) -> Held {
-        Held(Arc::new(Inner { mem: InMemory::new(), disk: OnceLock::new(), sizes: Default::default(), held: AtomicU64::new(0), budget }))
+        Held(Arc::new(Inner { objects: InMemory::new(), tier: OnceLock::new(), mem: Tally::default(), disk: Tally::default(), pending: AtomicU64::new(0), budget }))
+    }
+
+    /// A lake held in memory whose disk takes at most `cap` bytes of spills (the tests' cap, not the disk's room).
+    #[cfg(test)]
+    fn with_cap(budget: u64, cap: u64) -> Held {
+        let h = Held::with_budget(budget);
+        let mut disk = Disk::make().unwrap();
+        disk.cap = Some(cap);
+        let _ = h.0.tier.set(disk);
+        h
     }
 }
 
@@ -148,43 +172,103 @@ fn spill_failed(e: std::io::Error) -> object_store::Error {
 
 fn read_failed(e: std::io::Error) -> object_store::Error { object_store::Error::Generic { store: "memory", source: format!("reading a lake's file spilled to disk: {e}").into() } }
 
-impl Inner {
-    fn in_mem(&self, at: &Path) -> bool { self.sizes.lock().unwrap_or_else(PoisonError::into_inner).contains_key(at) }
+/// The error a spill is refused with: `what` says which limit it passed. Every refusal ends the same way out.
+fn full(what: String) -> object_store::Error {
+    object_store::Error::Generic { store: "memory", source: format!("{what}: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)").into() }
+}
+
+/// A part's future that fails with a refusal (`Upload::put_part`), without sending the part on.
+fn refused(why: String) -> UploadPart { Box::pin(async move { Err(full(why)) }) }
+
+/// Bytes reserved on disk for a spill in flight (`Inner::reserve`). They count against the cap until the write
+/// lands (the disk's tally takes them over) or the reservation goes; dropping one gives its bytes back.
+#[derive(Debug)]
+struct Reserved {
+    inner: Arc<Inner>,
+    bytes: u64,
+}
+
+impl Reserved {
+    /// Reserves `bytes` more for the same write (a part of a multipart upload), or says why not.
+    fn grow(&mut self, bytes: u64) -> Result<(), String> {
+        let disk = self.inner.tier.get().ok_or("the disk a lake in memory spills to is gone")?;
+        self.inner.claim(disk, bytes)?;
+        self.bytes += bytes;
+        Ok(())
+    }
+
+    /// Gives back what is reserved: once the write has landed (its bytes are in the disk's sum) or has failed.
+    fn release(&mut self) { self.inner.pending.fetch_sub(std::mem::take(&mut self.bytes), SeqCst); }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) { self.release() }
+}
+
+impl Tally {
+    fn has(&self, at: &Path) -> bool { self.sizes.lock().unwrap_or_else(PoisonError::into_inner).contains_key(at) }
 
     fn size(&self, at: &Path) -> Option<u64> { self.sizes.lock().unwrap_or_else(PoisonError::into_inner).get(at).copied() }
 
-    /// Records that `at` now holds `bytes` in memory (`None`: it is not in memory any more), taking off
-    /// the size it had. Returns whether it was in memory before.
+    fn sum(&self) -> u64 { self.sum.load(SeqCst) }
+
+    /// Records that `at` now holds `bytes` (`None`: it is not in this tier any more), taking off the size it had.
+    /// Returns whether it was there before.
     fn note(&self, at: &Path, bytes: Option<u64>) -> bool {
         let mut sizes = self.sizes.lock().unwrap_or_else(PoisonError::into_inner);
         let old = sizes.remove(at);
         if let Some(old) = old {
-            self.held.fetch_sub(old, Relaxed);
+            self.sum.fetch_sub(old, SeqCst);
         }
         if let Some(bytes) = bytes {
             sizes.insert(at.clone(), bytes);
-            self.held.fetch_add(bytes, Relaxed);
+            self.sum.fetch_add(bytes, SeqCst);
         }
         old.is_some()
     }
+}
 
+impl Inner {
     /// Does `at` go to disk when it is written now? Only the bulk of a lake, and only past the budget.
     /// An update stays in memory, where its version is checked.
     fn spills(&self, at: &Path, mode: &PutMode) -> bool {
-        spillable(at) && !matches!(mode, PutMode::Update(_)) && self.held.load(Relaxed) >= self.budget
+        spillable(at) && !matches!(mode, PutMode::Update(_)) && self.mem.sum() >= self.budget
     }
 
     /// The disk tier of this lake, made on the first need.
     fn disk_or_make(&self) -> object_store::Result<&Disk> {
-        if let Some(disk) = self.disk.get() {
+        if let Some(disk) = self.tier.get() {
             return Ok(disk);
         }
         let made = Disk::make()?;
-        Ok(self.disk.get_or_init(|| made)) // (a racing make loses here, and its folder goes with it)
+        Ok(self.tier.get_or_init(|| made)) // (a racing make loses here, and its folder goes with it)
     }
 
     /// The disk tier, if it exists and `at` may be on it.
-    fn disk_of(&self, at: &Path) -> Option<&Disk> { self.disk.get().filter(|_| spillable(at)) }
+    fn disk_of(&self, at: &Path) -> Option<&Disk> { self.tier.get().filter(|_| spillable(at)) }
+
+    /// Adds `bytes` to what is reserved on disk for spills in flight, if the disk has the room and the cap allows
+    /// it; else says why not. The one check for `reserve` and `Reserved::grow`. Checking the sum and then writing
+    /// would let several writes read the same sum and all pass, so the reservation is what stops that. The pending
+    /// bytes are read before the sum (SeqCst): a landing is in the sum before its reservation goes, so the two
+    /// never both miss it.
+    fn claim(&self, disk: &Disk, bytes: u64) -> Result<(), String> {
+        if let Some((free, keep)) = crate::store::short_of_room(&disk.folder.path) {
+            return Err(format!("the disk a lake in memory spills to has {} MB free, and a lake keeps {} MB", free >> 20, keep >> 20));
+        }
+        let fits = |pending: u64| disk.cap.is_none_or(|cap| pending + self.disk.sum() + bytes <= cap);
+        self.pending
+            .fetch_update(SeqCst, SeqCst, |pending| fits(pending).then_some(pending + bytes))
+            .map(|_| ())
+            .map_err(|_| format!("a lake in memory may spill {} MB to disk and holds {} MB there", disk.cap.unwrap_or(0) >> 20, self.disk.sum() >> 20))
+    }
+
+    /// Reserves `bytes` on disk for a write about to land there, refused by name when the disk has no room or
+    /// the cap is passed. The reservation gives them back when it is dropped.
+    fn reserve(self: &Arc<Self>, disk: &Disk, bytes: u64) -> object_store::Result<Reserved> {
+        self.claim(disk, bytes).map_err(full)?;
+        Ok(Reserved { inner: self.clone(), bytes })
+    }
 
     async fn on_disk(&self, at: &Path) -> object_store::Result<bool> {
         let Some(disk) = self.disk_of(at) else { return Ok(false) };
@@ -197,8 +281,8 @@ impl Inner {
 
     /// Takes `at` out of memory, if it is there.
     async fn leave_memory(&self, at: &Path) -> object_store::Result<()> {
-        if self.note(at, None) {
-            self.mem.delete(at).await?;
+        if self.mem.note(at, None) {
+            self.objects.delete(at).await?;
         }
         Ok(())
     }
@@ -208,18 +292,22 @@ impl Inner {
     async fn leave_disk(&self, at: &Path) -> object_store::Result<()> {
         let Some(disk) = self.disk_of(at) else { return Ok(()) };
         match disk.store.delete(at).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                self.disk.note(at, None);
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
 
-    /// `at` was just written to memory (`bytes`) or to disk: the copy in the other tier goes, so a
-    /// read finds the newest one wherever it is.
+    /// `at` was just written to memory or to disk (`bytes`): the copy in the other tier goes, so a read finds
+    /// the newest one wherever it is.
     async fn landed(&self, at: &Path, on_disk: bool, bytes: u64) -> object_store::Result<()> {
         if on_disk {
+            self.disk.note(at, Some(bytes));
             return self.leave_memory(at).await;
         }
-        self.note(at, Some(bytes));
+        self.mem.note(at, Some(bytes));
         self.leave_disk(at).await
     }
 
@@ -233,17 +321,20 @@ impl Inner {
         if matches!(opts.mode, PutMode::Create) && self.on_disk(at).await? {
             return Err(already(at));
         }
-        let put = self.mem.put_opts(at, body, opts).await?;
+        let put = self.objects.put_opts(at, body, opts).await?;
         self.landed(at, false, bytes).await?;
         Ok(put)
     }
 
-    async fn put_disk(&self, at: &Path, body: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
-        if matches!(opts.mode, PutMode::Create) && self.in_mem(at) {
+    async fn put_disk(self: &Arc<Self>, at: &Path, body: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
+        if matches!(opts.mode, PutMode::Create) && self.mem.has(at) {
             return Err(already(at));
         }
-        let put = self.disk_or_make()?.store.put_opts(at, body, opts).await?;
-        self.landed(at, true, 0).await?;
+        let disk = self.disk_or_make()?;
+        let bytes = body.content_length() as u64;
+        let _room = self.reserve(disk, bytes)?; // (held until `landed` has counted the bytes on disk)
+        let put = disk.store.put_opts(at, body, opts).await?;
+        self.landed(at, true, bytes).await?;
         Ok(put)
     }
 }
@@ -253,7 +344,8 @@ impl Disk {
     fn make() -> object_store::Result<Disk> {
         let folder = Folder::make("memory").map_err(spill_failed)?;
         let store = LocalFileSystem::new_with_prefix(&folder.path)?;
-        Ok(Disk { store, folder })
+        let cap = crate::store::spill_cap(Some(&folder.path));
+        Ok(Disk { store, folder, cap })
     }
 }
 
@@ -472,7 +564,8 @@ fn pieces(file: std::fs::File, range: Range<u64>) -> BoxStream<'static, object_s
 }
 
 /// A multipart upload into memory or onto disk. When it completes, the object is where its parts went:
-/// in memory (its bytes count toward the budget), or on disk (its copy in memory goes).
+/// in memory (its bytes count toward the budget), or on disk (its copy in memory goes). On disk, each part's
+/// bytes are reserved before the part is sent on; a refused part ends the upload (`put_part`).
 #[derive(Debug)]
 struct Upload {
     up: Box<dyn MultipartUpload>,
@@ -480,22 +573,47 @@ struct Upload {
     at: Path,
     on_disk: bool,
     bytes: u64,
+    room: Option<Reserved>,  // on disk: the room its parts take, reserved as they come
+    refused: Option<String>, // why a part was refused: every later part, and `complete`, fail with it
 }
 
 #[async_trait::async_trait]
 impl MultipartUpload for Upload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        self.bytes += data.content_length() as u64;
+        if let Some(why) = &self.refused {
+            return refused(why.clone());
+        }
+        let bytes = data.content_length() as u64;
+        if let Some(room) = self.room.as_mut() {
+            if let Err(why) = room.grow(bytes) {
+                // (a part not sent on would leave the local upload's offset behind, so completing it would land a
+                // shifted file: every later part is refused too)
+                self.refused = Some(why.clone());
+                return refused(why);
+            }
+        }
+        self.bytes += bytes;
         self.up.put_part(data)
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
-        let done = self.up.complete().await?;
-        self.inner.landed(&self.at, self.on_disk, self.bytes).await?;
-        Ok(done)
+        if let Some(why) = self.refused.clone() {
+            let _ = self.abort().await; // (the parts sent so far go; the refusal is the answer)
+            return Err(full(why));
+        }
+        let result = match self.up.complete().await {
+            Ok(done) => self.inner.landed(&self.at, self.on_disk, self.bytes).await.map(|()| done),
+            Err(e) => Err(e),
+        };
+        self.room = None; // (landed: the bytes are the disk's; or the upload failed, and they are not)
+        result
     }
 
-    async fn abort(&mut self) -> object_store::Result<()> { self.up.abort().await }
+    async fn abort(&mut self) -> object_store::Result<()> {
+        let done = self.up.abort().await;
+        self.room = None;
+        done
+    }
 }
 
 #[async_trait::async_trait]
@@ -510,15 +628,19 @@ impl ObjectStore for Held {
 
     async fn put_multipart_opts(&self, at: &Path, opts: PutMultipartOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
         let on_disk = self.0.spills(at, &PutMode::Overwrite);
-        let up = match on_disk {
-            true => self.0.disk_or_make()?.store.put_multipart_opts(at, opts).await?,
-            false => self.0.mem.put_multipart_opts(at, opts).await?,
+        let (up, room) = match on_disk {
+            true => {
+                let disk = self.0.disk_or_make()?;
+                let room = self.0.reserve(disk, 0)?; // (the room is checked before the upload starts)
+                (disk.store.put_multipart_opts(at, opts).await?, Some(room))
+            }
+            false => (self.0.objects.put_multipart_opts(at, opts).await?, None),
         };
-        Ok(Box::new(Upload { up, inner: self.0.clone(), at: at.clone(), on_disk, bytes: 0 }))
+        Ok(Box::new(Upload { up, inner: self.0.clone(), at: at.clone(), on_disk, bytes: 0, room, refused: None }))
     }
 
     async fn get_opts(&self, at: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
-        let got = self.0.mem.get_opts(at, opts.clone()).await;
+        let got = self.0.objects.get_opts(at, opts.clone()).await;
         let (Err(object_store::Error::NotFound { .. }), Some(disk)) = (&got, self.0.disk_of(at)) else { return got };
         let mut found = disk.store.get_opts(at, opts).await?;
         // (a file's own stream reads 8 KB a blocking call, which made queries over a spilled lake 1.4x
@@ -543,16 +665,16 @@ impl ObjectStore for Held {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        let mem = self.0.mem.list(prefix);
-        match self.0.disk.get() {
+        let mem = self.0.objects.list(prefix);
+        match self.0.tier.get() {
             Some(disk) => mem.chain(disk.store.list(prefix).try_filter(|m| ready(!hidden(m)))).boxed(),
             None => mem,
         }
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        let mut listed = self.0.mem.list_with_delimiter(prefix).await?;
-        if let Some(disk) = self.0.disk.get() {
+        let mut listed = self.0.objects.list_with_delimiter(prefix).await?;
+        if let Some(disk) = self.0.tier.get() {
             let more = disk.store.list_with_delimiter(prefix).await?;
             listed.objects.extend(more.objects.into_iter().filter(|m| !hidden(m)));
             listed.common_prefixes.extend(more.common_prefixes);
@@ -565,18 +687,20 @@ impl ObjectStore for Held {
 
     async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> object_store::Result<()> {
         let inner = &*self.0;
-        if matches!(opts.mode, CopyMode::Create) && (inner.in_mem(to) || inner.on_disk(to).await?) {
+        if matches!(opts.mode, CopyMode::Create) && (inner.mem.has(to) || inner.on_disk(to).await?) {
             return Err(already(to));
         }
-        match inner.size(from) {
+        // (a copy on disk is a hard link, which takes no room: it only counts what it names)
+        match inner.mem.size(from) {
             Some(bytes) => {
-                inner.mem.copy_opts(from, to, opts).await?;
+                inner.objects.copy_opts(from, to, opts).await?;
                 inner.landed(to, false, bytes).await
             }
             None => {
                 let disk = inner.disk_of(from).ok_or_else(|| missing(from))?;
+                let bytes = inner.disk.size(from).unwrap_or(0);
                 disk.store.copy_opts(from, to, opts).await?;
-                inner.landed(to, true, 0).await
+                inner.landed(to, true, bytes).await
             }
         }
     }
@@ -761,11 +885,11 @@ mod tests {
         h.put(&Path::from("catalog/c"), bytes(1)).await.unwrap(); // 10 bytes: in memory
         for (i, name) in ["data/t/a.parquet", "data/t/b.parquet", "data/t/c.parquet"].iter().enumerate() {
             h.put(&Path::from(*name), bytes(i as u8 + 2)).await.unwrap(); // past the budget: on disk
-            assert!(!h.0.in_mem(&Path::from(*name)));
+            assert!(!h.0.mem.has(&Path::from(*name)));
         }
         assert_eq!(read(&h, "data/t/b.parquet").await, vec![3; 10]);
         h.put(&Path::from("catalog/d"), bytes(9)).await.unwrap(); // the catalog stays in memory past it
-        assert!(h.0.in_mem(&Path::from("catalog/d")));
+        assert!(h.0.mem.has(&Path::from("catalog/d")));
         assert_eq!(read(&h, "catalog/d").await, vec![9; 10]);
         let mut data: Vec<String> = h.list(Some(&Path::from("data"))).map_ok(|m| m.location.to_string()).try_collect().await.unwrap();
         data.sort();
@@ -790,7 +914,7 @@ mod tests {
         for at in ["data/t/a", "catalog/c"] {
             assert!(matches!(h.get(&Path::from(at)).await, Err(object_store::Error::NotFound { .. })), "{at} is deleted");
         }
-        assert_eq!(h.0.held.load(Relaxed), 0);
+        assert_eq!(h.0.mem.sum(), 0);
     }
 
     #[tokio::test]
@@ -798,7 +922,7 @@ mod tests {
         let path = {
             let h = Held::with_budget(0); // every file spills at once
             h.put(&Path::from("data/t/a"), bytes(1)).await.unwrap();
-            let path = h.0.disk.get().unwrap().folder.path.clone();
+            let path = h.0.tier.get().unwrap().folder.path.clone();
             assert!(path.join(LOCK_FILE).exists());
             path
         };
@@ -835,9 +959,9 @@ mod tests {
         let mut up = h.put_multipart_opts(&at, PutMultipartOptions::default()).await.unwrap();
         up.put_part(bytes(4)).await.unwrap();
         up.put_part(bytes(5)).await.unwrap();
-        assert_eq!(h.0.held.load(Relaxed), 0, "counted once it completes");
+        assert_eq!(h.0.mem.sum(), 0, "counted once it completes");
         up.complete().await.unwrap();
-        assert_eq!(h.0.held.load(Relaxed), 20);
+        assert_eq!(h.0.mem.sum(), 20);
         assert_eq!(read(&h, "catalog/m").await, [vec![4; 10], vec![5; 10]].concat());
     }
 
@@ -847,13 +971,66 @@ mod tests {
         let body: Vec<u8> = (0..PIECE as usize * 2 + 5).map(|i| (i % 251) as u8).collect();
         let at = Path::from("data/t/f.parquet");
         h.put(&at, body.clone().into()).await.unwrap();
-        assert!(!h.0.in_mem(&at));
+        assert!(!h.0.mem.has(&at));
         assert_eq!(read(&h, "data/t/f.parquet").await, body);
         let r = PIECE - 3..PIECE * 2 + 2;
         assert_eq!(h.get_range(&at, r.clone()).await.unwrap(), body[r.start as usize..r.end as usize]);
         let got = h.get_opts(&at, GetOptions { range: Some((PIECE + 1..PIECE + 9).into()), ..Default::default() }).await.unwrap();
         assert_eq!(got.range, PIECE + 1..PIECE + 9);
         assert_eq!(got.bytes().await.unwrap(), body[PIECE as usize + 1..PIECE as usize + 9]);
+    }
+
+    #[tokio::test]
+    async fn a_spill_past_the_cap_is_refused_by_name_and_a_delete_gives_its_room_back() {
+        let h = Held::with_cap(0, 15); // every file spills; the disk may take 15 bytes of them
+        h.put(&Path::from("data/t/a"), bytes(1)).await.unwrap(); // 10 bytes: under the cap
+        let err = h.put(&Path::from("data/t/b"), bytes(2)).await.unwrap_err(); // 20 bytes would pass it
+        let text = err.to_string();
+        assert!(text.contains("a lake in memory may spill") && text.contains("PONDRA_SPILL_GB"), "{text}");
+        assert_eq!(crate::codes::of(&anyhow::Error::from(err)), "53100");
+        assert!(matches!(h.get(&Path::from("data/t/b")).await, Err(object_store::Error::NotFound { .. })), "a refused write leaves nothing");
+        h.delete(&Path::from("data/t/a")).await.unwrap(); // gives its 10 bytes back
+        h.put(&Path::from("data/t/b"), bytes(2)).await.unwrap(); // lands now
+        assert_eq!(read(&h, "data/t/b").await, vec![2; 10]);
+        assert_eq!(h.0.disk.sum(), 10);
+    }
+
+    #[tokio::test]
+    async fn a_multipart_upload_past_the_cap_fails_at_the_part_that_passes_it() {
+        let h = Held::with_cap(0, 15);
+        let at = Path::from("data/t/m");
+        let mut up = h.put_multipart_opts(&at, PutMultipartOptions::default()).await.unwrap();
+        up.put_part(bytes(4)).await.unwrap(); // 10 bytes: under the cap
+        assert!(up.put_part(bytes(5)).await.is_err(), "the second part passes the cap");
+        assert!(up.put_part(bytes(6)).await.is_err(), "and so does every part after it");
+        up.abort().await.unwrap();
+        assert!(matches!(h.get(&at).await, Err(object_store::Error::NotFound { .. })), "an aborted upload leaves nothing");
+        assert_eq!(h.0.pending.load(SeqCst), 0, "and gives its room back");
+        let mut again = h.put_multipart_opts(&at, PutMultipartOptions::default()).await.unwrap();
+        again.put_part(bytes(4)).await.unwrap();
+        assert!(again.put_part(bytes(5)).await.is_err());
+        assert!(again.complete().await.is_err(), "a completed upload past the cap is refused too");
+        assert!(matches!(h.get(&at).await, Err(object_store::Error::NotFound { .. })), "and leaves nothing");
+        assert_eq!(h.0.pending.load(SeqCst), 0);
+        assert_eq!(h.0.disk.sum(), 0);
+    }
+
+    #[tokio::test]
+    async fn two_writes_racing_past_the_cap_one_lands_and_one_is_refused() {
+        let h = Held::with_cap(0, 15);
+        let (pa, pb) = (Path::from("data/t/a"), Path::from("data/t/b"));
+        let (a, b) = tokio::join!(h.put(&pa, bytes(1)), h.put(&pb, bytes(2)));
+        assert_eq!([a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(), 1, "one lands, the other is refused");
+        assert_eq!(h.0.disk.sum(), 10);
+    }
+
+    #[tokio::test]
+    async fn a_copy_on_disk_lands_and_is_counted() {
+        let h = Held::with_cap(0, 1000);
+        h.put(&Path::from("data/t/a"), bytes(1)).await.unwrap(); // on disk: 10 bytes
+        h.copy(&Path::from("data/t/a"), &Path::from("data/t/b")).await.unwrap();
+        assert_eq!(read(&h, "data/t/b").await, vec![1; 10]);
+        assert_eq!(h.0.disk.sum(), 20, "the copy's bytes count as the source's did");
     }
 
     #[cfg(target_os = "linux")]

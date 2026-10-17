@@ -497,15 +497,25 @@ pub(crate) fn spill_folder() -> std::io::Result<&'static std::path::Path> {
     }
 }
 
-/// Where DataFusion's spills go, and how much of the disk they may take (`PONDRA_SPILL_GB`). Not the
+/// `PONDRA_SPILL_GB`: how many GB of spills the node may keep on disk. None when unset (a negative setting is none).
+fn spill_gb() -> Option<f64> { crate::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0) }
+
+/// The bytes that may spill under `dir`: `PONDRA_SPILL_GB` when set, else `dir`'s disk's free space less `lake_keeps`; None with no `dir`.
+pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
+    match spill_gb() {
+        Some(gb) => Some((gb * (1u64 << 30) as f64) as u64),
+        None => dir.and_then(space).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
+    }
+}
+
+/// Where DataFusion's spills go, and how much of the disk they may take (`spill_cap`). Not the
 /// OS temp folder, which is held in memory on many Linux systems, where a spill frees nothing. The
 /// folder is the user's own, under the disk with the room (`memory::spill_base`), and folders of
 /// processes that ended are swept from it. The cap is the free space when the lake opens, less the room
 /// a lake keeps, or the setting in GB. `0` turns spilling off: a query that needs it is refused (53200).
 /// A negative setting is no setting.
 fn spill_disk() -> DiskManagerBuilder {
-    let gb = crate::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0);
-    if gb == Some(0.0) {
+    if spill_gb() == Some(0.0) {
         return DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
     }
     let folder = spill_folder().ok();
@@ -518,11 +528,7 @@ fn spill_disk() -> DiskManagerBuilder {
     // (`PONDRA_SPILL_FAN_IN` replaces the formula; 0 is DataFusion's own, no limit.)
     let fan_in = crate::env::parse::<usize>("PONDRA_SPILL_FAN_IN").unwrap_or_else(|| (memory_limit() / partitions() / (32 << 20)).clamp(4, 64));
     let builder = builder.with_max_spill_merge_fan_in(fan_in);
-    let cap = match gb {
-        Some(gb) => Some((gb * (1u64 << 30) as f64) as u64),
-        None => folder.and_then(space).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
-    };
-    match cap {
+    match spill_cap(folder) {
         Some(cap) => builder.with_max_temp_directory_size(cap), // (where the platform can't say, DataFusion's own 100 GB stays)
         None => builder,
     }

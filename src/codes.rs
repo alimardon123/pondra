@@ -115,6 +115,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("this node is stopping") => "57P01",                                           // admin_shutdown (a drain ends a wait)
         _ if has("statement timeout") || has("canceling statement") || has("timed out") => "57014", // query_canceled
         _ if has("used disk space during the spilling") => "53100", // disk_full (a query spilled past PONDRA_SPILL_GB: DataFusion's words, before "out of memory" could match)
+        _ if has("or move the lake to a folder (alter database") => "53100", // a lake in memory past its spill cap or the disk's room (memory::full)
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)
         _ if has("not supported") || has("isn't supported") || has("not implemented") || has("not yet supported") => "0A000", // feature_not_supported
@@ -237,6 +238,9 @@ mod tests {
         assert_eq!(of("canceling statement due to statement timeout"), "57014");
         assert_eq!(of("External error: The used disk space during the spilling process has exceeded the allowable limit of 10.00 MB. Raise PONDRA_SPILL_GB to let it spill more."), "53100");
         assert_eq!(of("Resources exhausted: Memory Exhausted while Sorting (DiskManager is disabled)"), "53200"); // (PONDRA_SPILL_GB=0: nothing spills)
+        // a lake in memory past its spill cap, or the room its disk keeps (memory::full: the same way out for both)
+        assert_eq!(of("Generic memory error: a lake in memory may spill 2 MB to disk and holds 2 MB there: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)"), "53100");
+        assert_eq!(of("Generic memory error: the disk a lake in memory spills to has 3 MB free, and a lake keeps 256 MB: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)"), "53100");
     }
 
     #[test]

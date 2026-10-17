@@ -22774,6 +22774,21 @@ def memorylake():
         checks["a shell on :memory: that spilled leaves no spill folder once it ends"] = spilled and not left
         shutil.rmtree(shell_dir, ignore_errors=True)
         shutil.rmtree(spill_dir, ignore_errors=True)
+        # Past its spill cap (PONDRA_SPILL_GB=2 MB) a lake in memory refuses a load by name (53100: the disk takes what
+        # it may and no more), leaves no table behind (invariant 420), and answers after.
+        capped_dir = new_lake()
+        capped = Node(":memory:", P + 5, env={**env, "PONDRA_SPILL_GB": "0.002", "PONDRA_SPILL_DIR": capped_dir}).start()
+        nodes.append(capped)
+        status, hdrs, text = reply(P + 5, "POST", "/sql", b"CREATE TABLE big AS SELECT value AS n, md5(value::VARCHAR) AS s FROM range(400000)")
+        refused = status != 200 and hdrs.get("x-pondra-sqlstate") == "53100" and "PONDRA_SPILL_GB" in text
+        gone = reply(P + 5, "POST", "/sql", b"SELECT count(*) AS n FROM big")[1].get("x-pondra-sqlstate") == "42P01"
+        answers = sql(P + 5, "SELECT 1 AS one") == [{"one": 1}]
+        sql(P + 5, "CREATE TABLE small (n INT)")
+        sql(P + 5, "INSERT INTO small VALUES (1)")
+        small = [r["n"] for r in sql(P + 5, "SELECT n FROM small")] == [1]
+        checks["past its spill cap a lake in memory refuses a load by name (53100), and answers after"] = refused and gone and answers and small
+        if not checks["past its spill cap a lake in memory refuses a load by name (53100), and answers after"]:
+            print(f"memorylake: the capped load answered {status}: {text[:300]}", file=sys.stderr)
         if not all(checks.values()):
             return False  # (its checks are printed on the way out)
         return f"a lake in memory moved to a folder under {len(acked)} writes ({downtime:.1f} s from the move to its first answer there), then Python's and JavaScript's clients (and the library's, when it is built); {len(checks)} checks"
