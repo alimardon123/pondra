@@ -3361,6 +3361,18 @@ def schemas():
     return f"schemas: lake.schema.table, attached lakes as catalogs, CREATE/DROP SCHEMA, DROP TABLE, CTAS, stored and materialized views in SQL from any node, spread over views, clients list schemas: all {len(checks)} checks pass"
 
 
+def spill_files(folder):
+    """The files under a folder now, as (count, bytes): a file that goes while it is counted is not there."""
+    sizes = []
+    for d, _, names in os.walk(folder):
+        for n in names:
+            try:
+                sizes.append(os.path.getsize(os.path.join(d, n)))
+            except OSError:
+                pass
+    return len(sizes), sum(sizes)
+
+
 def scale():
     """Tables at scale. A partitioned table (`day(ts)`): every file holds one day, INSERTs and
     tiered log rows alike, before and after merges and an ADD COLUMN. Its files pile up past the
@@ -3609,10 +3621,62 @@ def scale():
         stopped_http and agg_peak < 1.5 * (1 << 30) and after == [{"one": 1}] and spilled_ok and stopped_count == 1
         and stopped_pg == ("53200", True) and count_pg == 2 and tx_sqlstate == "53200" and "nearly out of memory" in tx_body and count_tx == 3
         and tx_after == "25P02" and '"transaction":"rollback"' in tx_commit.replace(" ", "") and tx_count == [{"n": 0}])
+    # A sort that needs more than its memory spills to PONDRA_SPILL_DIR, and the spill folder is empty once it answers.
+    # Past PONDRA_SPILL_GB the same sort is refused by name (53100), saying to raise that setting and not DataFusion's
+    # `datafusion.runtime.*`, and the node answers after. The 10 M strings are made again: the sort check above dropped them.
+    node.kill()  # (the memory-line node still holds the port and the lake: this check starts its own)
+    spill_dir = tempfile.mkdtemp(prefix="pondra-spill-")
+    spill_env = {"PONDRA_CORES": "4", "PONDRA_SPILL_DIR": spill_dir}
+    def reply(s, timeout=600):  # (status, SQLSTATE, body) as the node sends it, a refusal included
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode(errors="replace")
+    sorter = Node(lake, port, memory_gb=0.25, env=spill_env).start()
+    made = reply("CREATE TABLE sp_src AS SELECT value AS id, md5(CAST(value AS VARCHAR)) AS k FROM generate_series(1, 10000000)")
+    seen = {"files": 0, "bytes": 0}  # the most files and bytes the spill folder held while the sort ran
+    watching = threading.Event()
+    def watch_spill():
+        while not watching.is_set():
+            n, b = spill_files(spill_dir)
+            seen["files"], seen["bytes"] = max(seen["files"], n), max(seen["bytes"], b)
+            watching.wait(0.2)
+    watcher = threading.Thread(target=watch_spill, daemon=True)
+    watcher.start()
+    try:
+        sorted_to = reply("CREATE TABLE sp_1 AS SELECT * FROM sp_src ORDER BY k")
+    finally:
+        watching.set()
+        watcher.join()
+    left_after = spill_files(spill_dir)
+    sp_1 = sql(port, "SELECT count(*) AS n, min(k) AS lo, max(k) AS hi FROM sp_1") if sorted_to[0] == 200 else None
+    sql(port, "DROP TABLE IF EXISTS sp_1")
+    sorter.kill()
+    capped = Node(lake, port, memory_gb=0.25, env={**spill_env, "PONDRA_SPILL_GB": "0.01"}).start()
+    refused = reply("CREATE TABLE sp_2 AS SELECT * FROM sp_src ORDER BY k")
+    after_refusal = reply("SELECT 1 AS one", timeout=30)
+    try:  # a CREATE TABLE AS makes its table before its rows: a refused one is left empty (as a failed cast leaves it), or not made
+        refused_rows = sql(port, "SELECT count(*) AS n FROM sp_2")
+    except RuntimeError:
+        refused_rows = None
+    spill_report = {"made": made[0], "sort": sorted_to[:2], "files_seen": seen["files"], "bytes_seen": seen["bytes"], "files_after": left_after[0],
+                    "capped": [refused[0], refused[1], refused[2][:300]], "after_refusal": after_refusal[0]}
+    checks["a query spills to PONDRA_SPILL_DIR, cleans up after, and past PONDRA_SPILL_GB is refused by name (53100)"] = (
+        made[0] == 200 and sorted_to[0] == 200 and seen["files"] > 0 and left_after[0] == 0
+        and sp_1 == [{"n": 10000000, "lo": "0000023f507999464aa2b78875b7e5d6", "hi": "fffffe98d0963d27015c198262d97221"}]
+        and refused[0] != 200 and refused[1] == "53100" and "PONDRA_SPILL_GB" in refused[2] and "datafusion.runtime" not in refused[2]
+        and after_refusal[0] == 200 and refused_rows in ([{"n": 0}], None))
+    for t in ("sp_2", "sp_src"):
+        try:
+            sql(port, f"DROP TABLE IF EXISTS {t}")
+        except RuntimeError:
+            pass  # (a table the capped sort never made is none to drop)
+    capped.kill()
+    shutil.rmtree(spill_dir, ignore_errors=True)
     node.kill()
     ok = all(checks.values())
     shown = {q: ("same" if same else "DIFFERENT") + (", by ranges" if r else "") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp, r) in shuffles.items()}
-    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "sort_errors": sort_errors, "window_refusals": window_refusals, "memory_line": memory_line, "ok": ok}, indent=1))
+    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "sort_errors": sort_errors, "window_refusals": window_refusals, "memory_line": memory_line, "spill": spill_report, "ok": ok}, indent=1))
     if not ok:
         print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
         sys.exit(1)

@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
@@ -460,12 +461,39 @@ fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
     }
 }
 
-/// Room a lake on local disk keeps for its own upkeep: a quarter of the disk, 256 MB at most.
-/// Commits wait while less is free (`log::Sequencer`), so the catalog can still flush and
-/// tiering write the files that let the log go: a disk the lake filled to its last byte had
-/// room for neither, and kept a log that never drained.
+/// Room a lake on local disk keeps for its own upkeep: a quarter of the disk, 256 MB at most (of
+/// a disk of `total` bytes). Commits wait while less is free (`log::Sequencer`), so the catalog can
+/// still flush and tiering write the files that let the log go: a disk the lake filled to its last
+/// byte had room for neither, and kept a log that never drained. Spills keep it too.
+fn lake_keeps(total: u64) -> u64 { (total / 4).min(256 << 20) }
+
 pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
-    space(dir).map(|(free, total)| (free, (total / 4).min(256 << 20))).filter(|(free, keep)| free < keep)
+    space(dir).map(|(free, total)| (free, lake_keeps(total))).filter(|(free, keep)| free < keep)
+}
+
+/// Where DataFusion's spills go, and how much of the disk they may take (`PONDRA_SPILL_GB`). Not the
+/// OS temp folder, which is held in memory on many Linux systems, where a spill frees nothing: the
+/// `pondra-spill` folder is on the disk with the room (`memory::spill_base`), and the cap is what that
+/// disk has free less the room a lake keeps, or the setting in GB. `0` turns spilling off: a query
+/// that needs it is refused (53200).
+fn spill_disk() -> DiskManagerBuilder {
+    let gb = crate::env::parse::<f64>("PONDRA_SPILL_GB");
+    if gb == Some(0.0) {
+        return DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
+    }
+    let folder = crate::memory::spill_base().join("pondra-spill");
+    let builder = match std::fs::create_dir_all(&folder) {
+        Ok(()) => DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![folder.clone()])),
+        Err(_) => DiskManagerBuilder::default(), // (no folder there: the OS temp folder, as before)
+    };
+    let cap = match gb {
+        Some(gb) => Some((gb * (1u64 << 30) as f64) as u64),
+        None => space(&folder).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
+    };
+    match cap {
+        Some(cap) => builder.with_max_temp_directory_size(cap), // (where the platform can't say, DataFusion's own 100 GB stays)
+        None => builder,
+    }
 }
 
 pub struct Lake {
@@ -807,14 +835,14 @@ impl Lake {
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
         let local = bucket.is_none() || memory;
         let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(memory_limit()));
-        // (spills go to the OS temp dir; no listing kept past its statement: DataFusion's own
-        // cache of them would hide a file added to a folder outside the lake, ADR-026)
+        // (spills go to `spill_disk`; no listing kept past its statement: DataFusion's own cache of
+        // them would hide a file added to a folder outside the lake, ADR-026)
         // (Parquet footers and files' statistics kept by caches of our own, so `cached_bytes` can say
         // what they hold: DataFusion's own, at its own limits)
         use datafusion::execution::cache::cache_manager::{CacheManagerConfig, DEFAULT_FILE_STATISTICS_MEMORY_LIMIT, DEFAULT_METADATA_CACHE_LIMIT};
         let kept = (Arc::new(Footers::new(DEFAULT_METADATA_CACHE_LIMIT).with_name("DefaultFileMetadataCache")), Arc::new(FileStatistics::new(DEFAULT_FILE_STATISTICS_MEMORY_LIMIT).with_name("DefaultFileStatisticsCache")));
         let caches = CacheManagerConfig::default().with_list_files_cache_limit(0).with_file_metadata_cache(Some(kept.0.clone())).with_file_statistics_cache(Some(kept.1.clone()));
-        let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).with_cache_manager(caches).build_arc()?;
+        let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).with_cache_manager(caches).with_disk_manager_builder(spill_disk()).build_arc()?;
         let disk = bucket.as_ref().filter(|_| !memory).and_then(|_| disk_tier(&url, &store));
         let mut cached_store = None;
         if let Some((bucket_url, held)) = bucket.as_ref().filter(|_| memory) {

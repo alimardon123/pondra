@@ -266,11 +266,12 @@ impl Drop for Disk {
     }
 }
 
-/// Where a spill goes: `PONDRA_CACHE_DIR` when set (with the node's other scratch: `spill.rs`), else the
-/// temporary directory, unless that is itself held in memory (tmpfs: /tmp on Fedora and Arch), where a
-/// spill would free nothing: then the user's cache folder.
-fn spill_base() -> PathBuf {
-    if let Some(dir) = crate::env::get("PONDRA_CACHE_DIR") {
+/// Where a node's spills go: `PONDRA_SPILL_DIR` when set, else `PONDRA_CACHE_DIR` (with the node's other
+/// scratch), else the temporary directory, unless that is itself held in memory (tmpfs: /tmp on Fedora
+/// and Arch), where a spill would free nothing: then the user's cache folder. A lake held in memory
+/// spills here too, and so do a query's spills (`store.rs`) and a shuffle's (`spill.rs`).
+pub(crate) fn spill_base() -> PathBuf {
+    if let Some(dir) = crate::env::get("PONDRA_SPILL_DIR").or_else(|| crate::env::get("PONDRA_CACHE_DIR")) {
         return PathBuf::from(dir);
     }
     let temp = std::env::temp_dir();

@@ -23,13 +23,14 @@ fn piece() -> usize {
     crate::env::or::<usize>("PONDRA_SPILL_MB", 64) << 20
 }
 
-/// Where a node keeps what it spills (`--cache-dir`, else the temp dir): one folder per job and
-/// node. The node's own id is in the path because two nodes on one machine share a cache dir, and
-/// they name their buckets the same way — without it they would write over each other's rows.
+/// Where a node keeps what it spills (`PONDRA_SPILL_DIR` or `--cache-dir`, else the temp dir): one folder
+/// per job and node, beside DataFusion's spills. The node's own id is in the path because two nodes on
+/// one machine share a cache dir, and they name their buckets the same way — without it they would
+/// write over each other's rows.
 pub fn dir(job: &str) -> PathBuf {
     crate::per_node!(static ME: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
     let me = ME.get_or(|| uuid::Uuid::new_v4().as_simple().to_string()[..8].to_string());
-    let base = crate::env::get("PONDRA_CACHE_DIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("pondra-cache"));
+    let base = crate::memory::spill_base().join("pondra-cache");
     base.join("shuffle").join(match job.is_empty() {
         true => String::new(), // (the folder itself: sweeping and measuring)
         false => format!("{job}-{me}"),

@@ -102,6 +102,8 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_SHARING_URL", Node),
     ("PONDRA_SKEW_MB", Node),
     ("PONDRA_SLOW_MS", Node),
+    ("PONDRA_SPILL_DIR", Node),
+    ("PONDRA_SPILL_GB", Node),
     ("PONDRA_SPILL_MB", Node),
     ("PONDRA_SPREAD_MB", Node),
     ("PONDRA_SQL_OPTIONS", Node),
