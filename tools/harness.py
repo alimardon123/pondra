@@ -3361,6 +3361,24 @@ def schemas():
     return f"schemas: lake.schema.table, attached lakes as catalogs, CREATE/DROP SCHEMA, DROP TABLE, CTAS, stored and materialized views in SQL from any node, spread over views, clients list schemas: all {len(checks)} checks pass"
 
 
+LOCK_FILE = ".lock"  # memory.rs's LOCK_FILE: a spill folder's lock, held by its process, not a spilled file
+
+
+def spill_files(folder):
+    """The spilled files under a folder now, as (count, bytes): a file that goes while it is counted is not there.
+    Lock files don't count: each process's folder keeps its own while the process lives."""
+    sizes = []
+    for d, _, names in os.walk(folder):
+        for n in names:
+            if n == LOCK_FILE:
+                continue
+            try:
+                sizes.append(os.path.getsize(os.path.join(d, n)))
+            except OSError:
+                pass
+    return len(sizes), sum(sizes)
+
+
 def scale():
     """Tables at scale. A partitioned table (`day(ts)`): every file holds one day, INSERTs and
     tiered log rows alike, before and after merges and an ADD COLUMN. Its files pile up past the
@@ -3609,10 +3627,64 @@ def scale():
         stopped_http and agg_peak < 1.5 * (1 << 30) and after == [{"one": 1}] and spilled_ok and stopped_count == 1
         and stopped_pg == ("53200", True) and count_pg == 2 and tx_sqlstate == "53200" and "nearly out of memory" in tx_body and count_tx == 3
         and tx_after == "25P02" and '"transaction":"rollback"' in tx_commit.replace(" ", "") and tx_count == [{"n": 0}])
+    # A sort that needs more than its memory spills to PONDRA_SPILL_DIR, and the spill folder is empty once it answers.
+    # Past PONDRA_SPILL_GB the same sort is refused by name (53100), saying to raise that setting and not DataFusion's
+    # `datafusion.runtime.*`, and the node answers after. The 10 M strings are made again: the sort check above dropped them.
+    node.kill()  # (the memory-line node still holds the port and the lake: this check starts its own)
+    spill_top = tempfile.mkdtemp(prefix="pondra-spill-")
+    spill_dir = os.path.join(spill_top, "not", "made", "yet")  # (a folder the node has to make, parents and all)
+    spill_env = {"PONDRA_CORES": "4", "PONDRA_SPILL_DIR": spill_dir}
+    spill_root = os.path.join(spill_dir, f"pondra-spill-{os.getuid()}")  # the user's folder a node makes there (memory::spill_base)
+    def reply(s, timeout=600):  # (status, SQLSTATE, body) as the node sends it, a refusal included
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode(errors="replace")
+    sorter = Node(lake, port, memory_gb=0.25, env=spill_env).start()
+    made = reply("CREATE TABLE sp_src AS SELECT value AS id, md5(CAST(value AS VARCHAR)) AS k FROM generate_series(1, 10000000)")
+    seen = {"files": 0, "bytes": 0}  # the most files and bytes the spill folder held while the sort ran
+    watching = threading.Event()
+    def watch_spill():
+        while not watching.is_set():
+            n, b = spill_files(spill_root)
+            seen["files"], seen["bytes"] = max(seen["files"], n), max(seen["bytes"], b)
+            watching.wait(0.2)
+    watcher = threading.Thread(target=watch_spill, daemon=True)
+    watcher.start()
+    try:
+        sorted_to = reply("CREATE TABLE sp_1 AS SELECT * FROM sp_src ORDER BY k")
+    finally:
+        watching.set()
+        watcher.join()
+    left_after = spill_files(spill_root)
+    sp_1 = sql(port, "SELECT count(*) AS n, min(k) AS lo, max(k) AS hi FROM sp_1") if sorted_to[0] == 200 else None
+    sql(port, "DROP TABLE IF EXISTS sp_1")
+    sorter.kill()
+    capped = Node(lake, port, memory_gb=0.25, env={**spill_env, "PONDRA_SPILL_GB": "0.01"}).start()
+    refused = reply("CREATE TABLE sp_2 AS SELECT * FROM sp_src ORDER BY k")
+    after_refusal = reply("SELECT 1 AS one", timeout=30)
+    try:  # a CREATE TABLE AS makes its table before its rows: a refused one is left empty (as a failed cast leaves it), or not made
+        refused_rows = sql(port, "SELECT count(*) AS n FROM sp_2")
+    except RuntimeError:
+        refused_rows = None
+    spill_report = {"made": made[0], "sort": sorted_to[:2], "files_seen": seen["files"], "bytes_seen": seen["bytes"], "files_after": left_after[0],
+                    "capped": [refused[0], refused[1], refused[2][:300]], "after_refusal": after_refusal[0]}
+    checks["a query spills to PONDRA_SPILL_DIR, cleans up after, and past PONDRA_SPILL_GB is refused by name (53100)"] = (
+        made[0] == 200 and sorted_to[0] == 200 and seen["files"] > 0 and left_after[0] == 0
+        and sp_1 == [{"n": 10000000, "lo": "0000023f507999464aa2b78875b7e5d6", "hi": "fffffe98d0963d27015c198262d97221"}]
+        and refused[0] != 200 and refused[1] == "53100" and "PONDRA_SPILL_GB" in refused[2] and "datafusion.runtime" not in refused[2]
+        and after_refusal[0] == 200 and refused_rows in ([{"n": 0}], None))
+    for t in ("sp_2", "sp_src"):
+        try:
+            sql(port, f"DROP TABLE IF EXISTS {t}")
+        except RuntimeError:
+            pass  # (a table the capped sort never made is none to drop)
+    capped.kill()
+    shutil.rmtree(spill_top, ignore_errors=True)
     node.kill()
     ok = all(checks.values())
     shown = {q: ("same" if same else "DIFFERENT") + (", by ranges" if r else "") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp, r) in shuffles.items()}
-    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "sort_errors": sort_errors, "window_refusals": window_refusals, "memory_line": memory_line, "ok": ok}, indent=1))
+    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "sort_errors": sort_errors, "window_refusals": window_refusals, "memory_line": memory_line, "spill": spill_report, "ok": ok}, indent=1))
     if not ok:
         print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
         sys.exit(1)
@@ -12669,6 +12741,45 @@ def objects():
     checks["an INSERT into a name no table has is refused (42P01, naming it) over HTTP and pondra sql, nothing made; POST /insert/{t} still makes one"] = \
         nope[:2] == (404, "42P01") and "no table nope" in str(nope[2]) and nope_select[1] == "42P01" and nope_read[1] == "42P01" \
         and cli_nope.returncode != 0 and "no table nope" in cli_nope.stdout + cli_nope.stderr and q("SELECT count(*) AS n FROM bulk_made") == [{"n": 1}]
+    # A CREATE TABLE … AS SELECT that fails leaves no table (`write.rs`, `Undo`): a cast's 22P02 over HTTP and pondra sql,
+    # then a query the memory watch stops (53200: its future is dropped mid-request, so only `Undo` drops the table it made)
+    # on a node of its own with a 1 GB line. The same statement, fixed, then answers (no 42P07).
+    ctas_bad = http("CREATE TABLE ctas_bad AS SELECT CAST('x' AS INT) AS a")
+    ctas_read = http("SELECT * FROM ctas_bad")
+    ctas_fixed = http("CREATE TABLE ctas_bad AS SELECT 1 AS a")
+    ctas_rows = q("SELECT a FROM ctas_bad")
+    own = new_lake()  # (a lake of its own, for pondra sql alone)
+    cli_bad = subprocess.run([BIN, "sql", "--dir", own, "CREATE TABLE ctas_cli AS SELECT CAST('x' AS INT) AS a"], capture_output=True, text=True, timeout=120, env=node.env)
+    cli_fixed = subprocess.run([BIN, "sql", "--dir", own, "CREATE TABLE ctas_cli AS SELECT 1 AS a"], capture_output=True, text=True, timeout=120, env=node.env)
+    cli_read = subprocess.run([BIN, "sql", "--dir", own, "SELECT a FROM ctas_cli"], capture_output=True, text=True, timeout=120, env=node.env)
+    big_lake = new_lake()
+    big = Node(big_lake, A.port + 6, memory_gb=0.5, env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4"), "PONDRA_MEMORY_MAX_GB": "1"}).start()  # (as scale's memory-line check starts one)
+    def big_answer(s):  # (status, SQLSTATE, body): the answer, or the refusal as the node sends it
+        c = http_client.HTTPConnection("127.0.0.1", big.port, timeout=600)
+        c.request("POST", "/sql", s.encode())
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode(errors="replace")
+    t0 = time.time()
+    stopped = big_answer("CREATE TABLE ctas_big AS SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, 30000000) GROUP BY 1")
+    stopped_seconds = time.time() - t0
+    t0, gone, probe = time.time(), None, None
+    while time.time() - t0 < 10:  # (the table goes within 10 s of the answer, or it stays)
+        probe = big_answer("SELECT * FROM ctas_big")
+        if probe[1] == "42P01":
+            gone = round(time.time() - t0, 1)
+            break
+        time.sleep(0.5)
+    big_after = _try(lambda: sql(big.port, "SELECT 1 AS one"))
+    big.kill()
+    if not big_lake.startswith("s3://"):
+        shutil.rmtree(big_lake, ignore_errors=True)  # (its node is stopped: its lake goes now)
+    info["ctas"] = {"http_cast": [ctas_bad[0], ctas_bad[1]], "http_read": ctas_read[1], "fixed": [ctas_fixed[0], ctas_rows],
+                    "cli": [cli_bad.returncode, cli_fixed.returncode, (cli_fixed.stdout + cli_fixed.stderr)[-200:], cli_read.returncode, cli_read.stdout[-200:]],
+                    "memory_line": [stopped[0], stopped[1], round(stopped_seconds, 1)], "gone_seconds": gone, "after": big_after}
+    checks["a CREATE TABLE … AS SELECT that fails leaves no table (a cast's 22P02, a query the memory watch stops), and the same statement fixed then answers"] = \
+        ctas_bad[1] == "22P02" and ctas_read[1] == "42P01" and ctas_fixed[0] == 200 and ctas_rows == [{"a": 1}] \
+        and cli_bad.returncode != 0 and cli_fixed.returncode == 0 and "42P07" not in cli_fixed.stdout + cli_fixed.stderr and cli_read.returncode == 0 and "| 1 |" in cli_read.stdout \
+        and stopped[1] == "53200" and gone is not None and big_after == [{"one": 1}]
     # DuckDB's EXPORT DATABASE and IMPORT DATABASE are not Pondra's yet (ADR-071): refused by name
     # with the ways it has (0A000), not with the parser's words.
     exported, imported = http("EXPORT DATABASE 'out'"), http("IMPORT DATABASE 'out'")

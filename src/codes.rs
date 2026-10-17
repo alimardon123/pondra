@@ -40,8 +40,16 @@ pub fn words(e: &anyhow::Error) -> String {
             out += &c;
         }
     }
-    out
+    SPILL_SAYS.iter().fold(out, |out, (from, to)| out.replace(from, to)) // (DataFusion's words for spilling, in the setting Pondra asks for)
 }
+
+/// DataFusion's words for a spill that ran past its cap, and for spilling turned off, said with the
+/// setting a user can change: `PONDRA_SPILL_GB`, not DataFusion's `datafusion.runtime.*` (which Pondra
+/// refuses, invariant 188). The first words stay, so `codes::of` still reads them.
+const SPILL_SAYS: &[(&str, &str)] = &[
+    ("Please try increasing the config: `datafusion.runtime.max_temp_directory_size`.", "Raise PONDRA_SPILL_GB to let it spill more."),
+    ("(DiskManager is disabled)", "(PONDRA_SPILL_GB is 0: nothing spills)"),
+];
 
 /// An error that says its own SQLSTATE.
 #[derive(Debug)]
@@ -106,6 +114,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("lock timeout") || has("could not obtain lock") => "55P03",                    // lock_not_available (a lock wait, or NOWAIT)
         _ if has("this node is stopping") => "57P01",                                           // admin_shutdown (a drain ends a wait)
         _ if has("statement timeout") || has("canceling statement") || has("timed out") => "57014", // query_canceled
+        _ if has("used disk space during the spilling") => "53100", // disk_full (a query spilled past PONDRA_SPILL_GB: DataFusion's words, before "out of memory" could match)
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)
         _ if has("not supported") || has("isn't supported") || has("not implemented") || has("not yet supported") => "0A000", // feature_not_supported
@@ -159,7 +168,7 @@ pub fn grpc(code: &str) -> tonic::Code {
         "42P01" | "42703" | "42883" | "3F000" => tonic::Code::NotFound,
         "42P07" | "23505" => tonic::Code::AlreadyExists,
         "57014" => tonic::Code::DeadlineExceeded,
-        "53200" | "53300" => tonic::Code::ResourceExhausted,
+        "53100" | "53200" | "53300" => tonic::Code::ResourceExhausted,
         "0A000" => tonic::Code::Unimplemented,
         "23514" | "23502" | "25006" | "25P01" | "25P02" | "25P03" => tonic::Code::FailedPrecondition, // (a transaction that isn't open, failed, or idle-ended)
         c if c.starts_with("42") || c.starts_with("22") => tonic::Code::InvalidArgument,
@@ -215,6 +224,8 @@ mod tests {
         assert_eq!(of("could not obtain lock on a row: it is held by another transaction (NOWAIT)"), "55P03");
         assert_eq!(of("this node is stopping: its lock waits end, and its transaction with them"), "57P01");
         assert_eq!(of("canceling statement due to statement timeout"), "57014");
+        assert_eq!(of("External error: The used disk space during the spilling process has exceeded the allowable limit of 10.00 MB. Raise PONDRA_SPILL_GB to let it spill more."), "53100");
+        assert_eq!(of("Resources exhausted: Memory Exhausted while Sorting (DiskManager is disabled)"), "53200"); // (PONDRA_SPILL_GB=0: nothing spills)
     }
 
     #[test]

@@ -98,12 +98,12 @@ struct Inner {
     budget: u64,
 }
 
-/// The folder spilled objects go to, with its lock file held. Dropping it removes the folder.
+/// The folder spilled objects go to: a `Folder` of this process's own, which goes when the lake does.
 #[derive(Debug)]
 struct Disk {
     store: LocalFileSystem,
-    path: PathBuf,
-    lock: Option<std::fs::File>,
+    #[allow(dead_code)] // (nothing reads it: the folder goes with the lake's disk, when its drop runs)
+    folder: Folder,
 }
 
 impl Held {
@@ -243,34 +243,51 @@ impl Inner {
 }
 
 impl Disk {
-    /// A folder of this process's in the temporary directory, with its lock file held. Folders whose
-    /// process has ended are removed first.
+    /// A lake's spill folder, made on the first object that spills.
     fn make() -> object_store::Result<Disk> {
-        let parent = spill_parent().map_err(spill_failed)?;
-        sweep(&parent);
-        let path = parent.join(format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&path).map_err(spill_failed)?;
-        let lock = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path.join(LOCK_FILE)).map_err(spill_failed)?;
-        if lock.try_lock().is_err() {
-            return Err(spill_failed(std::io::Error::other("its lock file is held by another process")));
-        }
-        let store = LocalFileSystem::new_with_prefix(&path)?;
-        Ok(Disk { store, path, lock: Some(lock) })
+        let folder = Folder::make("memory").map_err(spill_failed)?;
+        let store = LocalFileSystem::new_with_prefix(&folder.path)?;
+        Ok(Disk { store, folder })
     }
 }
 
-impl Drop for Disk {
+/// A folder of this process's own under the user's spill folder for one kind of spill (a lake held in
+/// memory's, a query's: `spill_parent`), with its lock file held. The folders of processes that ended are
+/// swept first (`sweep`); dropping this one removes it.
+#[derive(Debug)]
+pub(crate) struct Folder {
+    pub(crate) path: PathBuf,
+    lock: Option<std::fs::File>,
+}
+
+impl Folder {
+    /// A folder of this process's for `kind`, with its lock file held.
+    pub(crate) fn make(kind: &str) -> std::io::Result<Folder> {
+        let parent = spill_parent(kind)?;
+        sweep(&parent);
+        let path = parent.join(format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&path)?;
+        let lock = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path.join(LOCK_FILE))?;
+        if lock.try_lock().is_err() {
+            return Err(std::io::Error::other("its lock file is held by another process"));
+        }
+        Ok(Folder { path, lock: Some(lock) })
+    }
+}
+
+impl Drop for Folder {
     fn drop(&mut self) {
         drop(self.lock.take()); // (Windows can't delete a folder with an open file in it)
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
-/// Where a spill goes: `PONDRA_CACHE_DIR` when set (with the node's other scratch: `spill.rs`), else the
-/// temporary directory, unless that is itself held in memory (tmpfs: /tmp on Fedora and Arch), where a
-/// spill would free nothing: then the user's cache folder.
-fn spill_base() -> PathBuf {
-    if let Some(dir) = crate::env::get("PONDRA_CACHE_DIR") {
+/// Where a node's spills go: `PONDRA_SPILL_DIR` when set, else `PONDRA_CACHE_DIR` (with the node's other
+/// scratch), else the temporary directory, unless that is itself held in memory (tmpfs: /tmp on Fedora
+/// and Arch), where a spill would free nothing: then the user's cache folder. A lake held in memory
+/// spills here too, and so do a query's spills (`store.rs`) and a shuffle's (`spill.rs`).
+pub(crate) fn spill_base() -> PathBuf {
+    if let Some(dir) = crate::env::get("PONDRA_SPILL_DIR").or_else(|| crate::env::get("PONDRA_CACHE_DIR")) {
         return PathBuf::from(dir);
     }
     let temp = std::env::temp_dir();
@@ -296,15 +313,18 @@ fn held_in_ram(dir: &FsPath) -> bool {
     unsafe { libc::statfs(path.as_ptr(), &mut fs) == 0 && matches!(fs.f_type as u32, 0x0102_1994 | 0x8584_58f6) } // (TMPFS_MAGIC, RAMFS_MAGIC)
 }
 
-/// The folder the spill folders go in: this user's, in `spill_base`, made 0700 and used only while it
-/// is ours alone (as the cluster's lock folder is), so no other user can take a lock away or read a
-/// lake's files.
-fn spill_parent() -> std::io::Result<PathBuf> {
+/// The folder the spill folders of `kind` go in (`memory` for a lake held in memory, `spill` for a query's
+/// spills): this user's, in `spill_base`, made 0700 and used only while it is ours alone (as the cluster's
+/// lock folder is), so no other user can take a lock away or read a lake's files. One user's folder per
+/// kind, so a machine's users never share one.
+fn spill_parent(kind: &str) -> std::io::Result<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
         let uid = unsafe { libc::getuid() };
-        let dir = spill_base().join(format!("pondra-memory-{uid}"));
+        let base = spill_base();
+        let _ = std::fs::create_dir_all(&base); // (a PONDRA_SPILL_DIR not made yet: made, parents and all)
+        let dir = base.join(format!("pondra-{kind}-{uid}"));
         let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
         let m = std::fs::symlink_metadata(&dir)?;
         if m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0 {
@@ -314,7 +334,7 @@ fn spill_parent() -> std::io::Result<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        let dir = spill_base().join("pondra-memory");
+        let dir = spill_base().join(format!("pondra-{kind}"));
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }
@@ -692,7 +712,7 @@ mod tests {
         let path = {
             let h = Held::with_budget(0); // every file spills at once
             h.put(&Path::from("data/t/a"), bytes(1)).await.unwrap();
-            let path = h.0.disk.get().unwrap().path.clone();
+            let path = h.0.disk.get().unwrap().folder.path.clone();
             assert!(path.join(LOCK_FILE).exists());
             path
         };
@@ -757,5 +777,31 @@ mod tests {
             assert!(held_in_ram(FsPath::new("/dev/shm")), "/dev/shm is tmpfs");
         }
         assert!(!held_in_ram(FsPath::new(env!("CARGO_MANIFEST_DIR"))), "the checkout is on disk");
+    }
+
+    /// A folder under `parent` with its lock file made, returned open. `old` sets the lock's time two minutes back.
+    fn lock_in(parent: &FsPath, name: &str, old: bool) -> std::fs::File {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(dir.join(LOCK_FILE)).unwrap();
+        if old {
+            lock.set_modified(std::time::SystemTime::now() - Duration::from_secs(120)).unwrap();
+        }
+        lock
+    }
+
+    #[test]
+    fn sweep_removes_a_folder_whose_process_ended_and_keeps_the_rest() {
+        let parent = std::env::temp_dir().join(format!("pondra-sweep-{}", uuid::Uuid::new_v4().simple()));
+        drop(lock_in(&parent, "ended", true)); // its lock is free, and it was last touched two minutes ago
+        let alive = lock_in(&parent, "alive", true); // as old, but its lock is held
+        alive.try_lock().unwrap();
+        drop(lock_in(&parent, "new", false)); // free, but made just now: its lock may not be taken yet
+        sweep(&parent);
+        assert!(!parent.join("ended").exists(), "a folder whose process ended is removed");
+        assert!(parent.join("alive").exists(), "a folder whose lock is held is kept");
+        assert!(parent.join("new").exists(), "a folder made just now is kept");
+        drop(alive);
+        let _ = std::fs::remove_dir_all(&parent);
     }
 }
