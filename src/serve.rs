@@ -70,8 +70,8 @@ impl Point {
         crate::query::schema(&self.names.iter().map(|n| (n.clone(), types[n.as_str()].to_string())).collect::<Vec<_>>())
     }
 
-    /// Which of its columns are uuids (`pg_types`): its table's own, by name.
-    pub fn uuids(&self) -> Vec<bool> { self.names.iter().map(|n| self.meta.uuid(n)).collect() }
+    /// Which types its columns are (`pg_types`: a uuid, json or jsonb): its table's own, by name.
+    pub fn types(&self) -> Vec<Option<crate::pg_types::Ty>> { self.names.iter().map(|n| self.meta.sql_types.get(n).and_then(|t| crate::pg_types::Ty::of(t))).collect() }
 
     /// Its parameters' types (`$1`…, in order), as the key columns they stand for.
     pub fn parameters(&self, sql: &str) -> Vec<datafusion::arrow::datatypes::DataType> {

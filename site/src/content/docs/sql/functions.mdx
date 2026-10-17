@@ -75,8 +75,90 @@ aliases and Spark's names too.
 ## JSON
 
 A JSON document is a `VARCHAR` column, or a `JSON` (or `VARIANT`) column, which holds JSON text.
-Each function takes the document, then a path: keys for
-objects and positions for arrays. A path that isn't there gives `NULL`.
+Operators and functions read it by a path: keys for objects, positions for arrays. A path that
+isn't there gives `NULL`.
+
+`->` answers the value as JSON text, as Postgres and DuckDB do: a string keeps its quotes, an object
+keeps its braces. `->>` answers text: a string without its quotes, and `NULL` for a JSON `null`. Chain
+`->` to go deeper, and end with `->>` to read the value.
+
+| Operator | Answers |
+|---|---|
+| `doc -> 'key'` or `doc -> 0` | the value as JSON text: `"ann"`, `{"d": null}`, `1`. A negative position counts from the end |
+| `doc ->> 'key'` | the value as text, and `NULL` for a JSON `null` |
+| `doc #> '{a,0,b}'` | the value at a path, as JSON text. The path is a text array, or `ARRAY['a', '0', 'b']` |
+| `doc #>> '{a,0,b}'` | the value at a path, as text |
+| `doc @> other` | true if `doc` contains `other`: objects by their keys, arrays by their elements |
+| `other <@ doc` | true if `doc` is contained in `other`: the same as `doc @> other` turned round |
+| `doc ? 'key'` | true if the key exists: an object's key, or a string in an array |
+| `doc ?\| ARRAY['a', 'b']` | true if any of the keys exists |
+| `doc ?& ARRAY['a', 'b']` | true if all of the keys exist |
+
+The operators bind as Postgres binds them, so a comparison needs no parentheses:
+`WHERE doc ->> 'status' = 'open'` reads as `(doc ->> 'status') = 'open'`.
+
+The same operators are functions under Postgres's own names, so SQL written for Postgres runs as it is:
+
+| Operator | Function |
+|---|---|
+| `doc -> key` | `json_object_field(doc, key)`, or `jsonb_object_field(doc, key)` |
+| `doc -> n` | `json_array_element(doc, n)`, or `jsonb_array_element(doc, n)` |
+| `doc @> other` | `jsonb_contains(doc, other)` |
+| `other <@ doc` | `jsonb_contained(other, doc)` |
+| `doc ? key` | `jsonb_exists(doc, key)` |
+| `doc ?\| keys` | `jsonb_exists_any(doc, keys)` |
+| `doc ?& keys` | `jsonb_exists_all(doc, keys)` |
+
+## Reading a document and its elements
+
+Postgres's JSON functions read a document, and some of them expand it into rows. They take `json`
+and `jsonb` values, and text that holds JSON, and the `jsonb` ones answer as `jsonb` prints them.
+
+`jsonb_typeof` and `jsonb_array_length` say what a document holds:
+
+```sql
+CREATE TABLE carts (id BIGINT, doc JSONB);
+INSERT INTO carts VALUES
+  (1, '{"items": [{"sku": "A1", "qty": 2}, {"sku": "B7", "qty": 1}]}'),
+  (2, '{"items": []}');
+
+SELECT id, jsonb_typeof(doc -> 'items') AS kind, jsonb_array_length(doc -> 'items') AS count
+FROM carts;
+```
+
+`jsonb_array_elements` gives one row per element. Call it in the SELECT list, and a row is made for
+each element, none for an empty array:
+
+```sql
+SELECT id, jsonb_array_elements(doc -> 'items') AS item
+FROM carts;
+```
+
+`jsonb_to_recordset` gives one row per object. Name the columns and their types after the alias:
+
+```sql
+SELECT *
+FROM jsonb_to_recordset('[{"sku": "A1", "qty": 2}, {"sku": "B7"}]') AS line(sku TEXT, qty INT);
+```
+
+A call in a `FROM` clause works over literals, as the last example does, and over a column of the same
+query, as Postgres takes it. It makes its rows for each row of the query, with `CROSS JOIN LATERAL` or
+a comma:
+
+```sql
+SELECT carts.id, item.value
+FROM carts
+CROSS JOIN LATERAL jsonb_array_elements(carts.doc -> 'items') AS item;
+```
+
+`LEFT JOIN LATERAL … ON true` keeps a row when the call gives none, for `json_array_elements_text`,
+`jsonb_array_elements_text` and `unnest`. Over `jsonb_array_elements` or `jsonb_each` it is refused by
+name for now: their columns are computed from the rows, and this engine doesn't yet keep such a row
+with NULLs in them.
+A set function over a column of an outer query, in a subquery or `EXISTS`, isn't taken yet and is refused by name: join it in
+that query's `FROM` instead (`FROM t, jsonb_array_elements(t.doc) AS e`), then filter or group there.
+
+The functions below read the same documents. Each takes the document, then a path:
 
 | Function | Returns |
 |---|---|
@@ -90,11 +172,9 @@ objects and positions for arrays. A path that isn't there gives `NULL`.
 | `json_as_text(doc, path…)` | the value as text, whatever its type |
 | `json_contains(doc, path…)` | true if the path exists |
 | `json_length(doc, path…)` | the length of the array or object |
-| `json_object_keys(doc, path…)` | the keys of the object |
+| `json_keys(doc, path…)` | the keys of the object (`json_object_keys` is Postgres's, and expands into rows: see below) |
 | `json_from_scalar(x)` | a JSON value made from a number, text or boolean (cast a decimal to `DOUBLE` first) |
-| `json_union_to_text(v)` | the JSON text of a value from `json_get`, `->` or `json_from_scalar`: a string keeps its quotes |
-| `doc -> path` | the same as `json_get`; chain it: `doc -> 'a' -> 'b'` |
-| `doc ->> path` | the same as `json_as_text` |
+| `json_union_to_text(v)` | the JSON text of a value from `json_get` or `json_from_scalar`: a string keeps its quotes |
 
 ```sql
 CREATE TABLE events (id BIGINT, payload VARCHAR);
@@ -117,14 +197,82 @@ id  name  amount  tags
 2   bo    2.0     0
 ```
 
+Operators read the same kind of document. Each row here is one order:
+
+```sql
+CREATE TABLE orders (id BIGINT, doc JSON);
+INSERT INTO orders VALUES
+  (1, '{"customer": {"name": "ann"}, "items": [{"sku": "tea", "qty": 2}], "note": null}'),
+  (2, '{"customer": {"name": "bo"}, "items": [], "note": "rush"}');
+
+SELECT id,
+       doc -> 'customer' AS customer,
+       doc -> 'customer' ->> 'name' AS name,
+       doc -> 'items' -> 0 -> 'sku' AS first_sku,
+       doc #>> '{items,0,qty}' AS first_qty
+FROM orders
+WHERE doc ->> 'note' IS DISTINCT FROM 'nothing'
+ORDER BY id;
+```
+
+```text
+id  customer          name  first_sku  first_qty
+1   {"name": "ann"}   ann   "tea"      2
+2   {"name": "bo"}    bo    NULL       NULL
+```
+
+```sql
+SELECT id, doc @> '{"customer": {"name": "bo"}}' AS is_bo,
+       doc ? 'note' AS has_note,
+       doc ?| ARRAY['sku', 'items'] AS has_one,
+       doc ?& ARRAY['customer', 'note'] AS has_both
+FROM orders
+ORDER BY id;
+```
+
+```text
+id  is_bo  has_note  has_one  has_both
+1   false  true      true     true
+2   true   true      true     true
+```
+
+```sql
+SELECT id FROM orders WHERE doc ->> 'note' = 'rush';
+```
+
+```text
+id
+2
+```
+
+The same answers by their Postgres names:
+
+```sql
+SELECT jsonb_contains(doc, '{"customer": {"name": "bo"}}') AS is_bo,
+       jsonb_exists_all(doc, ARRAY['customer', 'note']) AS has_both,
+       json_object_field(doc, 'customer') AS customer,
+       jsonb_array_element(doc -> 'items', 0) AS first_item
+FROM orders
+ORDER BY id;
+```
+
+```text
+is_bo  has_both  customer         first_item
+false  true      {"name": "ann"}  {"sku": "tea", "qty": 2}
+true   true      {"name": "bo"}   NULL
+```
+
 <Aside type="caution">
 The typed getters don't convert: `json_get_str` on a number is `NULL`, and `json_get_int` on
 `4.5` is `NULL`. Use `json_get_float` for any number, or `->>` to read anything as text and
 `CAST` it.
 
-`->` and `json_get` answer the value as text, the same text `->>` gives, at every door. So they chain to
-go deeper: `doc -> 'user' -> 'name'`. Use `json_union_to_text` when you want a string's quotes kept, as JSON
-writes them.
+`->` answers JSON text, so a string keeps its quotes: `doc -> 'name'` is `"ann"`, and `doc ->> 'name'`
+is `ann`. A text key reads only an object's member, so on an array `doc -> '0'` is `NULL`; use the
+position `0` instead. `json_get` answers the value as `->>` does.
+
+A text that isn't JSON gives `NULL` from `->`, `->>`, `#>` and `#>>` where they meet it. `@>`,
+`<@`, `?`, `?|` and `?&` read the whole document, so they refuse a text that isn't JSON (`22P02`).
 </Aside>
 
 `json_union_to_text` turns a JSON value into its text, and `json_from_scalar` makes one from a
@@ -144,6 +292,154 @@ id  user_json         amount_json  name_json
 1   {"name": "ann"}   4.5          "tea"
 2   {"name": "bo"}    4.5          "tea"
 ```
+
+### Making JSON
+
+These make JSON from values, and answer what Postgres answers. A document in a column (`JSON` or
+`JSONB`) goes into the result as the document, not as a string.
+
+| Function | Answers |
+|---|---|
+| `to_json(x)`, `to_jsonb(x)` | the value as JSON: a number, a string, a date, a list, or a document |
+| `row_to_json(t)` | a row as an object, one key per column |
+| `json_build_object('k', v, …)`, `jsonb_build_object(…)` | an object from key and value pairs |
+| `json_build_array(v, …)`, `jsonb_build_array(…)` | an array of the values |
+| `json_agg(x)`, `jsonb_agg(x)` | an array of the rows. Takes `ORDER BY`, `FILTER`, `DISTINCT`, `GROUP BY` and `OVER` |
+| `json_object_agg(k, v)`, `jsonb_object_agg(k, v)` | an object from the rows' key and value pairs |
+
+A whole row can be a table, an alias, a CTE or a subquery. `json_agg(t)` answers each row as an
+object keyed by the column names. Give it an `ORDER BY` when the order matters: SQL doesn't order the
+rows of an aggregate that has none. A row an outer join pads with NULLs is NULL, as in Postgres: a
+`LEFT JOIN`'s unmatched right side, a `RIGHT JOIN`'s unmatched left side, both sides of a `FULL JOIN`.
+A row an equi-join matched on one of its columns has that column non-null, so only a matched row whose
+every column is NULL (`ON true`, or a condition on none of its columns) reads NULL where Postgres writes
+an object of NULLs.
+
+```sql
+CREATE TABLE people (id BIGINT, name VARCHAR, doc JSON);
+INSERT INTO people VALUES
+  (1, 'ann', '{"tags": ["a", "b"]}'),
+  (2, 'bo', NULL);
+
+SELECT json_agg(t ORDER BY t.id) FROM (SELECT id, name FROM people) t;
+```
+
+```text
+[{"id":1,"name":"ann"}, 
+ {"id":2,"name":"bo"}]
+```
+
+`json_build_object` nests a JSON column's document, and `coalesce` gives an empty array for no rows:
+
+```sql
+SELECT json_build_object('id', id, 'doc', doc) AS row FROM people ORDER BY id;
+
+SELECT json_build_object('items', coalesce(json_agg(t), '[]')) AS answer
+FROM (SELECT id, name FROM people WHERE id > 10) t;
+```
+
+```text
+{"id" : 1, "doc" : {"tags": ["a", "b"]}}
+{"id" : 2, "doc" : null}
+
+{"items" : []}
+```
+
+<Aside type="caution">
+A whole row needs a name for each of its columns: `json_agg(t)` over `(SELECT upper(name) FROM people) t`
+is refused (`0A000`), where Postgres answers it under the key `upper`. Give the item an alias. Over a
+file (`read_csv(…) f`), name the columns in `json_build_object` instead. `DISTINCT` over a `JSON`
+value is refused, as Postgres refuses it (`42883`); a `JSONB` value is fine.
+</Aside>
+
+### Changing a document
+
+A function that changes a `JSONB` document answers the changed one. The table keeps the document it
+had until an `UPDATE` stores the answer. The functions and their operators are Postgres's:
+
+| Change | Function | Operator |
+|---|---|---|
+| Set the value at a path, or add it | `jsonb_set(doc, path, value)` | |
+| Insert a value before or after a place in an array | `jsonb_insert(doc, path, value, after)` | |
+| Merge two documents: the second one's keys win | `jsonb_concat(a, b)` | `a \|\| b` |
+| Remove a key, an array element or a list of keys | `jsonb_delete(doc, key)` | `doc - key` |
+| Remove the value at a path | `jsonb_delete_path(doc, path)` | `doc #- path` |
+| Remove the null members | `jsonb_strip_nulls(doc)`, or `json_strip_nulls` for `JSON` text | |
+| Write a document out indented | `jsonb_pretty(doc)` | |
+
+A path is a text array such as `'{plan,tier}'`, or `ARRAY['plan', 'tier']`. A step is a key of an object,
+or a position in an array, where a negative position counts from the end.
+
+```sql
+CREATE TABLE profiles (id BIGINT, doc JSONB);
+INSERT INTO profiles VALUES
+  (1, '{"name": "ann", "tags": ["a", "b"], "plan": {"tier": "free", "seats": null}}'),
+  (2, '{"name": "bo", "tags": [], "plan": null}');
+
+UPDATE profiles SET doc = jsonb_set(doc, '{plan,tier}', '"pro"') WHERE id = 1;
+UPDATE profiles SET doc = doc || '{"seen": true}';
+
+SELECT id, doc FROM profiles ORDER BY id;
+```
+
+```text
+id  doc
+1   {"name": "ann", "plan": {"tier": "pro", "seats": null}, "seen": true, "tags": ["a", "b"]}
+2   {"name": "bo", "plan": null, "seen": true, "tags": []}
+```
+
+Keys come out in the order `jsonb` keeps them: shorter keys first, then by their bytes. Then remove a key
+and a path, and drop the nulls:
+
+```sql
+UPDATE profiles SET doc = doc - 'tags' WHERE id = 1;
+UPDATE profiles SET doc = doc #- '{plan,seats}' WHERE id = 1;
+
+SELECT id, jsonb_strip_nulls(doc) AS without_nulls FROM profiles ORDER BY id;
+```
+
+```text
+id  without_nulls
+1   {"name": "ann", "plan": {"tier": "pro"}, "seen": true}
+2   {"name": "bo", "seen": true, "tags": []}
+```
+
+The same functions on a document written in the query:
+
+```sql
+SELECT jsonb_insert('{"tags": ["a", "b"]}', '{tags,1}', '"x"', true)::text AS inserted,
+       jsonb_delete_path('{"plan": {"tier": "free", "seats": 2}}', '{plan,seats}')::text AS removed,
+       jsonb_delete('{"a": 1, "b": 2}', 'b')::text AS deleted;
+```
+
+```text
+inserted                   removed                       deleted
+{"tags": ["a", "b", "x"]}  {"plan": {"tier": "free"}}    {"a": 1}
+```
+
+`jsonb_pretty` writes a document one member to a line, indented by four spaces:
+
+```sql
+SELECT jsonb_pretty(doc) AS indented FROM profiles WHERE id = 2;
+```
+
+```text
+indented
+{
+    "name": "bo",
+    "plan": null,
+    "seen": true,
+    "tags": [
+    ]
+}
+```
+
+<Aside type="caution">
+`||` on two `JSONB` documents merges them, as Postgres does: `doc || '{"seen": true}'` is `jsonb_concat(doc, '{"seen": true}')`.
+
+The planner doesn't yet know a column is `JSON` when it plans `-` and `#-`, so on a `JSON` column they
+answer a change where Postgres refuses it (`42883`). Keep the documents you change in a `JSONB` column.
+</Aside>
 
 ## Vectors
 

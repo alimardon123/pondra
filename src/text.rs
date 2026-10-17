@@ -151,9 +151,39 @@ pub fn is_uuid(s: &str) -> bool {
     s.len() == 36 && s.bytes().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_digit() || (b'a'..=b'f').contains(&b) })
 }
 
+/// The functions that make JSON: the Postgres port traces their arguments (`pg_types`), so a JSON or
+/// whole-row argument is written as JSON.
+pub const JSON_MAKERS: &[&str] = &["to_json", "to_jsonb", "row_to_json", "json_build_object", "jsonb_build_object", "json_build_array",
+    "jsonb_build_array", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg"];
+
+/// Whether `sql` calls a JSON maker (`JSON_MAKERS`), as a name followed by `(`. Only a statement with one has its arguments traced.
+pub fn makes_json(sql: &str) -> bool {
+    static CALL: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(&format!(r"(?i)\b(?:{})\s*\(", JSON_MAKERS.join("|"))).expect("a regex"));
+    CALL.is_match(sql)
+}
+
 /// Could `sql` name a type of one's own, in a cast or one of the enum functions? (Only then is
-/// it parsed for one: the built-in types' names are left alone.)
+/// it parsed for one: the built-in types' names are left alone.) A cast to uuid, json or jsonb,
+/// an array type, a set function (which may read a column: `lateral::functions`), a JSON maker's
+/// call and a `||` that may meet a jsonb document are parsed too.
 pub fn names_a_type(sql: &str) -> bool {
+    if sql.contains("[]") {
+        return true; // (an array type: a string cast to one reads as a Postgres array literal, `pg_values::array_literals`)
+    }
+    // (a set function: one in a FROM that reads a column is LATERAL's, `lateral::functions`; JSON's give a document's
+    // rows, `pg_json_sets::sets`)
+    static SET_FUNCTION: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b(?:generate_series|range|unnest|jsonb?_(?:array_elements(?:_text)?|each(?:_text)?|object_keys|to_record(?:set)?))\s*\(").expect("a regex")
+    });
+    if SET_FUNCTION.is_match(sql) || makes_json(sql) {
+        return true;
+    }
+    // (`||` merges two jsonb documents: a statement with one is read when it may name a table or JSON, since a
+    // `SELECT 'n' || 5` has no document in it and is text's)
+    static TABLE_OR_JSON: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:from|update|into)\b|json").expect("a regex"));
+    if sql.contains("||") && TABLE_OR_JSON.is_match(sql) {
+        return true;
+    }
     static NAMED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?i)(?:::|\bas)\s*"?([a-z_][a-z0-9_]*)"?\s*(?:[.]\s*"?([a-z_][a-z0-9_]*))?|\b(?:enum_(?:range|first|last)|pg_typeof)\s*\(|'(\{?[0-9a-fA-F]{8}-?(?:[0-9a-fA-F]{4}-?){3}[0-9a-fA-F]{12}\}?)'"#).expect("a regex"));
     const BUILT_IN: &[&str] = &["int", "integer", "bigint", "smallint", "tinyint", "int2", "int4", "int8", "hugeint", "ubigint", "uinteger", "usmallint", "utinyint", "float", "float4",
         "float8", "real", "double", "decimal", "numeric", "dec", "text", "varchar", "char", "character", "string", "bpchar", "bool", "boolean", "date", "time", "timestamp", "timestamptz",
@@ -162,6 +192,22 @@ pub fn names_a_type(sql: &str) -> bool {
         _ if c.get(3).is_some() => c.get(3).is_some_and(|s| !is_uuid(s.as_str())), // (`'A0EE…'`: read as a uuid where one is compared with it or written into one)
         (None, _) => true, // (enum_range(…), pg_typeof(…))
         (Some(_), Some(_)) => true,
-        (Some(n), None) => n.as_str().eq_ignore_ascii_case("uuid") || !BUILT_IN.contains(&n.as_str().to_lowercase().as_str()), // (a cast to uuid: written as text)
+        (Some(n), None) => ["uuid", "json", "jsonb"].iter().any(|t| n.as_str().eq_ignore_ascii_case(t)) || !BUILT_IN.contains(&n.as_str().to_lowercase().as_str()), // (a cast to uuid, json or jsonb: written as text)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_concatenation_is_parsed_only_when_it_may_meet_a_document() {
+        for sql in ["SELECT 'n' || 5", "SELECT 'a' || 'b' || 'c'", "SELECT name || 'x'"] {
+            assert!(!names_a_type(sql), "{sql}");
+        }
+        for sql in ["SELECT 'n' || name FROM t", "UPDATE t SET doc = doc || '{}'", "INSERT INTO t SELECT 'a' || 'b'", "SELECT '{}' || '{}'::jsonb", "SELECT to_jsonb(1) || '{}'"] {
+            assert!(names_a_type(sql), "{sql}");
+        }
+        assert!(names_a_type("SELECT json_agg(x) FROM t") && names_a_type("SELECT * FROM generate_series(1, t.n)") && names_a_type("SELECT * FROM jsonb_each(t.doc)") && names_a_type("SELECT '{a}'::text[]"));
+    }
 }

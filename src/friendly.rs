@@ -691,10 +691,7 @@ impl VisitorMut for Friendly {
         match s {
             Statement::CreateTable(c) => {
                 for col in c.columns.iter_mut() {
-                    if matches!(col.data_type, DataType::JSON | DataType::JSONB) {
-                        col.data_type = DataType::Text; // (JSON is text, as VARIANT is: `->`, `->>`, json_get read it)
-                    }
-                    spell(&mut col.data_type);
+                    spell(&mut col.data_type); // (a JSON column keeps its type: `types::rewrite` holds it as text, checked)
                 }
             }
             Statement::AlterTable(a) => {
@@ -1120,7 +1117,6 @@ fn expression(e: &mut Expr) -> Result<()> {
                 }
             }
         }
-        Expr::Cast { data_type, .. } if matches!(data_type, DataType::JSON | DataType::JSONB) => *data_type = DataType::Text,
         Expr::Function(f) => {
             let n = function_name(f);
             let a = args(f);

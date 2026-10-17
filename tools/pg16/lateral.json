@@ -1,0 +1,387 @@
+{
+ "SELECT * FROM r, generate_series(r.a, r.b) AS g": {
+  "rows": [
+   [
+    "1",
+    "1",
+    "5",
+    "1"
+   ],
+   [
+    "1",
+    "1",
+    "5",
+    "2"
+   ],
+   [
+    "1",
+    "1",
+    "5",
+    "3"
+   ],
+   [
+    "1",
+    "1",
+    "5",
+    "4"
+   ],
+   [
+    "1",
+    "1",
+    "5",
+    "5"
+   ],
+   [
+    "2",
+    "3",
+    "4",
+    "3"
+   ],
+   [
+    "2",
+    "3",
+    "4",
+    "4"
+   ],
+   [
+    "4",
+    "2",
+    "2",
+    "2"
+   ]
+  ]
+ },
+ "SELECT count(DISTINCT s.r) AS d, count(*) AS n FROM (SELECT random() AS r, ARRAY[1, 2, 3] AS xs) s, unnest(s.xs) AS u(x)": {
+  "rows": [
+   [
+    "1",
+    "3"
+   ]
+  ]
+ },
+ "SELECT r.id, g FROM r, generate_series(r.a, r.b, 2) AS g": {
+  "rows": [
+   [
+    "1",
+    "1"
+   ],
+   [
+    "1",
+    "3"
+   ],
+   [
+    "1",
+    "5"
+   ],
+   [
+    "2",
+    "3"
+   ],
+   [
+    "4",
+    "2"
+   ]
+  ]
+ },
+ "SELECT s.id, s.x FROM (SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x)) s WHERE s.x > 1": {
+  "count": 18669,
+  "ordered": "96694b0cdd0ac9f3b317de4a3b41b7a2722ef2947d7764b0c2f64336f455ea8e",
+  "sorted": "fec9540f4c4fa3b249ae3a5bacdaebc7263a8134c84438a56c0e0a51a758c010"
+ },
+ "SELECT t.id, (SELECT max(v) FROM (SELECT 1 AS v) w WHERE w.v = t.n) AS m FROM t WHERE t.id <= 3": {
+  "rows": [
+   [
+    "1",
+    ""
+   ],
+   [
+    "2",
+    "1"
+   ],
+   [
+    "3",
+    ""
+   ]
+  ]
+ },
+ "SELECT t.id, g FROM t, generate_series(1, t.n) AS g": {
+  "count": 60006,
+  "ordered": "8fee061893065b9ef7567edb7363b3232d39e613436d5d5cd12f13dd4c3c2b7a",
+  "sorted": "1514954c8aa03f934f21091bb1db8aaeb13ea0216cdc2d93795e0b720e880c8d"
+ },
+ "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s": {
+  "count": 20003,
+  "ordered": "dfff7f73334d7f9157ab46edc107a27e5acc73fda911d76448bff5caaf908a84",
+  "sorted": "4a53c6aceec1246374f18df8a73065ef029d125b45e5fec1e9917aa5b856b063"
+ },
+ "SELECT t.id, u.x FROM t CROSS JOIN LATERAL unnest(t.xs) AS u(x)": {
+  "count": 60003,
+  "ordered": "29d6accb559581ec8bd4e114b10e6b817f772671c3e3543fdba4c4e90d6e55a7",
+  "sorted": "40a158b24a03e8c61747ce2344b8100e78d1f26ba556b33a63f746e46ac31240"
+ },
+ "SELECT t.id, u.x FROM t JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1": {
+  "count": 18669,
+  "ordered": "96694b0cdd0ac9f3b317de4a3b41b7a2722ef2947d7764b0c2f64336f455ea8e",
+  "sorted": "fec9540f4c4fa3b249ae3a5bacdaebc7263a8134c84438a56c0e0a51a758c010"
+ },
+ "SELECT t.id, u.x FROM t LEFT JOIN LATERAL unnest(t.xs) AS u(x) ON true": {
+  "count": 60005,
+  "ordered": "2726171f29115c5f50997daee0f297daecd93f6583103c12c22d5c4aef0aed8a",
+  "sorted": "278ac9f2db2682642853c4a4d5b69a95576ab635963d6c47374659bcd1a75156"
+ },
+ "SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x)": {
+  "count": 60003,
+  "ordered": "29d6accb559581ec8bd4e114b10e6b817f772671c3e3543fdba4c4e90d6e55a7",
+  "sorted": "40a158b24a03e8c61747ce2344b8100e78d1f26ba556b33a63f746e46ac31240"
+ },
+ "SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x) ORDER BY t.id DESC, u.x LIMIT 50": {
+  "rows": [
+   [
+    "20003",
+    "0"
+   ],
+   [
+    "20003",
+    "1"
+   ],
+   [
+    "20003",
+    "2"
+   ],
+   [
+    "20002",
+    "1"
+   ],
+   [
+    "20002",
+    "1"
+   ],
+   [
+    "20002",
+    "4"
+   ],
+   [
+    "20001",
+    "0"
+   ],
+   [
+    "20001",
+    "1"
+   ],
+   [
+    "20001",
+    "3"
+   ],
+   [
+    "20000",
+    "1"
+   ],
+   [
+    "20000",
+    "2"
+   ],
+   [
+    "20000",
+    "2"
+   ],
+   [
+    "19999",
+    "1"
+   ],
+   [
+    "19999",
+    "1"
+   ],
+   [
+    "19999",
+    "1"
+   ],
+   [
+    "19998",
+    "0"
+   ],
+   [
+    "19998",
+    "0"
+   ],
+   [
+    "19998",
+    "1"
+   ],
+   [
+    "19997",
+    "1"
+   ],
+   [
+    "19997",
+    "2"
+   ],
+   [
+    "19997",
+    "4"
+   ],
+   [
+    "19996",
+    "1"
+   ],
+   [
+    "19996",
+    "1"
+   ],
+   [
+    "19996",
+    "3"
+   ],
+   [
+    "19995",
+    "0"
+   ],
+   [
+    "19995",
+    "1"
+   ],
+   [
+    "19995",
+    "2"
+   ],
+   [
+    "19994",
+    "1"
+   ],
+   [
+    "19994",
+    "1"
+   ],
+   [
+    "19994",
+    "2"
+   ],
+   [
+    "19993",
+    "0"
+   ],
+   [
+    "19993",
+    "1"
+   ],
+   [
+    "19993",
+    "1"
+   ],
+   [
+    "19992",
+    "0"
+   ],
+   [
+    "19992",
+    "1"
+   ],
+   [
+    "19992",
+    "4"
+   ],
+   [
+    "19991",
+    "1"
+   ],
+   [
+    "19991",
+    "2"
+   ],
+   [
+    "19991",
+    "3"
+   ],
+   [
+    "19990",
+    "1"
+   ],
+   [
+    "19990",
+    "1"
+   ],
+   [
+    "19990",
+    "2"
+   ],
+   [
+    "19989",
+    "0"
+   ],
+   [
+    "19989",
+    "1"
+   ],
+   [
+    "19989",
+    "1"
+   ],
+   [
+    "19988",
+    "0"
+   ],
+   [
+    "19988",
+    "1"
+   ],
+   [
+    "19988",
+    "2"
+   ],
+   [
+    "19987",
+    "1"
+   ],
+   [
+    "19987",
+    "1"
+   ]
+  ]
+ },
+ "SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x) WHERE u.x > 1": {
+  "count": 18669,
+  "ordered": "96694b0cdd0ac9f3b317de4a3b41b7a2722ef2947d7764b0c2f64336f455ea8e",
+  "sorted": "fec9540f4c4fa3b249ae3a5bacdaebc7263a8134c84438a56c0e0a51a758c010"
+ },
+ "SELECT t.id, u.x, v.y FROM t, LATERAL (SELECT unnest(t.xs) AS x) u CROSS JOIN LATERAL generate_series(1, u.x) AS v(y)": {
+  "count": 80007,
+  "ordered": "d573793eaf2b6392b155229e6ab8e2397071b429b9e3c692d2a34405f9945b75",
+  "sorted": "beaa06b72b4c7b6ca9ce908de74a2555ee08aa6ac5fd060e2cc0ee616be5368d"
+ },
+ "SELECT t.x, u.x AS y FROM tx t, unnest(t.xs) AS u(x)": {
+  "rows": [
+   [
+    "100",
+    "7"
+   ],
+   [
+    "100",
+    "8"
+   ]
+  ]
+ },
+ "SELECT u.x, count(*) AS n FROM t, unnest(t.xs) AS u(x) GROUP BY u.x": {
+  "rows": [
+   [
+    "1",
+    "30668"
+   ],
+   [
+    "4",
+    "4000"
+   ],
+   [
+    "2",
+    "10668"
+   ],
+   [
+    "0",
+    "10666"
+   ],
+   [
+    "3",
+    "4001"
+   ]
+  ]
+ }
+}

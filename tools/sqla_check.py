@@ -744,7 +744,7 @@ def dead_node(_url):
 
 # Two revisions as a user writes them: a table, then a column, an index and a renamed column.
 MIGRATIONS = {
-    "a1": ("""op.create_table("mig_users", sa.Column("id", sa.Integer, primary_key=True), sa.Column("name", sa.String(50), nullable=False))""",
+    "a1": ("""op.create_table("mig_users", sa.Column("id", sa.Integer, sa.Identity(), primary_key=True), sa.Column("name", sa.String(50), nullable=False), sa.Column("prefs", sa.JSON))""",
            """op.drop_table("mig_users")"""),
     "b2": ("""op.add_column("mig_users", sa.Column("email", sa.String(100)))
     op.create_index("mig_users_email", "mig_users", ["email"])
@@ -784,16 +784,17 @@ def alembic_migrations(url, root):
         getattr(command, step)(cfg, target)
         seen.append((f"{step} {target}", *at()))
     md = sqlalchemy.MetaData()
-    Table("mig_users", md, Column("id", Integer, primary_key=True), Column("full_name", String(50), nullable=False),
-          Column("email", String(100)), sqlalchemy.Index("mig_users_email", "email"))
+    Table("mig_users", md, Column("id", Integer, sqlalchemy.Identity(), primary_key=True),
+          Column("full_name", String(50), nullable=False), Column("email", String(100)), Column("prefs", sqlalchemy.JSON),
+          sqlalchemy.Index("mig_users_email", "email"))
     with engine.connect() as c:
         only = {"include_name": lambda name, kind, _parent: kind != "table" or name == "mig_users"}  # (the lake's other tables aside)
         diff = compare_metadata(MigrationContext.configure(c, opts=only), md)
     command.downgrade(cfg, "base")
     engine.dispose()
-    want = [("upgrade a1", ["a1"], ["id", "name"]), ("upgrade head", ["b2"], ["id", "full_name", "email"]),
-            ("downgrade a1", ["a1"], ["id", "name"]), ("downgrade base", [], None),
-            ("upgrade head", ["b2"], ["id", "full_name", "email"])]
+    want = [("upgrade a1", ["a1"], ["id", "name", "prefs"]), ("upgrade head", ["b2"], ["id", "full_name", "prefs", "email"]),
+            ("downgrade a1", ["a1"], ["id", "name", "prefs"]), ("downgrade base", [], None),
+            ("upgrade head", ["b2"], ["id", "full_name", "prefs", "email"])]
     return seen == want and diff == [], {"steps": seen, "autogenerate": [str(d) for d in diff]}
 
 
@@ -935,6 +936,7 @@ def main():
         try:
             import alembic  # noqa: F401
             run.check("http.alembic_upgrade_downgrade_autogenerate", alembic_migrations, f"pondra+http://127.0.0.1:{http}", root)
+            run.check("psycopg.alembic_upgrade_downgrade_autogenerate", alembic_migrations, f"pondra+psycopg://pondra@127.0.0.1:{pg}/lake", root)
             if args.lib:
                 run.check("in_process.alembic_upgrade_downgrade_autogenerate", alembic_migrations, f"pondra:///{root}/lake2", root)
         except ImportError:

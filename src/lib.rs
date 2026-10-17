@@ -33,6 +33,8 @@ mod front;
 mod codes;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod friendly;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the set functions' rewrite: a node's door calls it)
+mod lateral;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod measures;
 mod optimize;
@@ -114,6 +116,10 @@ mod optimize;
 #[cfg(feature = "server")] mod pg_catalog;
 #[cfg(feature = "server")] mod pg_formats;
 #[cfg(feature = "server")] mod pg_functions;
+#[cfg(feature = "server")] mod pg_json;
+#[cfg(feature = "server")] mod pg_json_make;
+#[cfg(feature = "server")] mod pg_json_edit;
+#[cfg(feature = "server")] mod pg_json_sets;
 #[cfg(feature = "server")] mod pg_names;
 #[cfg(feature = "server")] mod pg_text;
 #[cfg(feature = "server")] mod pg_types;

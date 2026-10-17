@@ -79,6 +79,7 @@ pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     let mut rules = Analyzer::new().rules;
     let at = rules.iter().position(|r| r.name() == "type_coercion").unwrap_or(0);
     rules.insert(at, Arc::new(FloatsWin));
+    rules.insert(at, Arc::new(crate::lateral::Lateral)); // (before type coercion, as the analyzer's own: a function's rows of a column, one pass)
     rules.insert(at, Arc::new(WholeLiterals)); // (first: FloatsWin and type coercion see whole decimals)
     rules.push(Arc::new(crate::casts::Rounds)); // (after type coercion: the casts it adds round too)
     rules.push(Arc::new(Runnable)); // (after type coercion: a function's simplifier reads its arguments' types)

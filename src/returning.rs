@@ -20,7 +20,6 @@ use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::sql::sqlparser::ast::{self, Expr, SelectItem, Statement};
-use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use serde_json::Value;
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
@@ -70,10 +69,9 @@ pub fn of(sql: &str) -> Option<Returning> {
     if !sql.as_bytes().windows(9).any(|w| w.eq_ignore_ascii_case(b"returning")) {
         return None; // (nearly every statement: not parsed here)
     }
-    let mut parsed = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
-    let [statement] = &mut parsed[..] else { return None };
+    let mut statement = crate::pg_types::one(sql)?; // (read as the port's traces read it: Postgres's JSON operators too)
     let alias = |a: &Option<ast::TableAlias>| a.as_ref().map(|a| vec![crate::write::ident(&a.name)]);
-    let (kind, items, name, alias) = match statement {
+    let (kind, items, name, alias) = match &mut statement {
         Statement::Insert(i) => {
             let ast::TableObject::TableName(n) = &i.table else { return None };
             let alias = i.table_alias.as_ref().map(|a| vec![crate::write::ident(&a.alias)]);
@@ -93,7 +91,7 @@ pub fn of(sql: &str) -> Option<Returning> {
     let parts: Vec<String> = crate::write::object(&name).split('.').map(String::from).collect();
     let mut names: Vec<Vec<String>> = (0..parts.len()).map(|i| parts[i..].to_vec()).collect();
     names.extend(alias);
-    Some(Returning { write: crate::routines::sql(statement), items, names, kind })
+    Some(Returning { write: crate::routines::sql(&statement), items, names, kind })
 }
 
 impl Returning {

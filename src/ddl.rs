@@ -1184,6 +1184,16 @@ pub(crate) async fn readers(lake: &Lake, name: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Why a column that isn't held as `t` (uuid, json or jsonb) can't become one: its rows were never
+/// checked as `t`. A uuid's words are as they were; JSON's name the type.
+fn not_held(column: &str, t: &str) -> String {
+    if t == "uuid" {
+        return format!("{column} can't become a uuid: a column is a uuid only from when it is made, since the rows there were never checked as uuids (a new UUID column can take them: UPDATE … SET new = {column}::uuid)");
+    }
+    let shown = t.to_uppercase();
+    format!("{column} can't become {shown}: a column is {shown} only from when it is made, since the rows there were never checked as {shown} (a new {shown} column can take them: UPDATE … SET new = {column}::{t})")
+}
+
 /// `ALTER TABLE t RENAME COLUMN a TO b`, `DROP COLUMN a`, `ALTER COLUMN a TYPE BIGINT`: the
 /// catalog changes, the files never do (ADR-022). A column keeps the name it was written under
 /// (`TableMeta::columns`); `names` says what SQL calls it, `dropped` that nothing reads it again.
@@ -1237,9 +1247,9 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
         }
         Change::Type(sql_type) => {
             let (held, declared) = (m.sql_types.get(&stored).cloned(), crate::types::declared(&sql_type)?);
-            if declared.as_deref() == Some("uuid") {
-                if held.as_deref() != Some("uuid") {
-                    return Err(crate::codes::coded("42804", format!("{column} can't become a uuid: a column is a uuid only from when it is made, since the rows there were never checked as uuids (a new UUID column can take them: UPDATE … SET new = {column}::uuid)")));
+            if let Some(t) = declared.as_deref().filter(|t| matches!(*t, "uuid" | "json" | "jsonb")) {
+                if held.as_deref() != Some(t) {
+                    return Err(crate::codes::coded("42804", not_held(column, t)));
                 }
                 return Ok(j!({"table": name, "unchanged": true}));
             }
