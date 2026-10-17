@@ -6,6 +6,7 @@
 //! (`pg_text.rs`, `pg_formats.rs`); this file is only how they meet DataFusion.
 
 use crate::pg_catalog::{function, int_arg, text_arg, texts_out};
+use crate::pg_json::is_text;
 use crate::{pg_formats, pg_text};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, Int32Array, Int64Array};
 use datafusion::arrow::compute::cast;
@@ -198,9 +199,6 @@ fn templates(f: &ColumnarValue, n: usize) -> Result<Option<Vec<Option<String>>>>
     let texts = text_arg(&f.to_array(n)?)?;
     Ok(texts.iter().flatten().all(|t| pg_formats::is_template(t)).then_some(texts))
 }
-
-/// Text, which Postgres's templates read and are written in.
-fn is_text(t: &DataType) -> bool { matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) }
 
 /// A date or a timestamp, which Postgres's `to_char` templates write.
 fn is_moment(t: &DataType) -> bool { matches!(t, DataType::Date32 | DataType::Date64 | DataType::Timestamp(..)) }

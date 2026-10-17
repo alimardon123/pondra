@@ -81,7 +81,8 @@ fn operator(op: &BinaryOperator) -> Option<(&'static str, bool)> {
     })
 }
 
-fn is_text(t: &DataType) -> bool { matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8) }
+/// Text in any of DataFusion's string types: what the JSON functions read as a document's text, from a column or a literal.
+pub(crate) fn is_text(t: &DataType) -> bool { matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8) }
 
 fn is_list(t: &DataType) -> bool { matches!(t, DataType::List(_) | DataType::LargeList(_)) }
 
@@ -418,11 +419,19 @@ fn element<'a>(doc: &'a str, at: i64) -> Option<&'a str> {
     doc.get(start..jiter.current_index()).map(|value| value.trim_matches(JSON_SPACE))
 }
 
+/// A reader of `doc` standing at its container, for the functions that take an array's or an object's items in order.
+/// `known_array` and `known_object` read the bracket where the reader stands, so JSON's spaces in front of it (` [1,2]`)
+/// are passed over first, by `peek`; the reader's offsets stay offsets into `doc`. None unless the document is what
+/// `want` says (`Peek::Array` or `Peek::Object`).
+pub(crate) fn opened(doc: &str, want: Peek) -> Option<Jiter<'_>> {
+    let mut jiter = Jiter::new(doc.as_bytes());
+    (jiter.peek().ok()? == want).then_some(jiter)
+}
+
 /// The number of elements of the array `doc`, read through once more (a negative index counts from the end, as
 /// functions-json does). `Jiter` can't be copied, so the count reads its own reader.
 fn array_len(doc: &str) -> Option<usize> {
-    // (`known_array` reads the bracket where the text starts, so leading spaces are passed over first)
-    let mut jiter = Jiter::new(doc.trim_start_matches(JSON_SPACE).as_bytes());
+    let mut jiter = opened(doc, Peek::Array)?;
     let mut peek = jiter.known_array().ok()?;
     let mut len = 0;
     while let Some(p) = peek {
@@ -1155,6 +1164,49 @@ mod tests {
         assert_eq!(code(&scalar), "22023");
         assert_eq!(scalar.to_string(), "cannot get array length of a scalar", "a JSON null is a scalar");
         assert_eq!(code(&length_of("[").unwrap_err()), "22P02", "text that isn't JSON is refused as JSON text");
+    }
+
+    /// JSON's four spaces in front of a document, or after it, change no answer: the count, the kind and the walks
+    /// are those of the document without them (`opened` passes over the spaces before the bracket).
+    #[test]
+    fn spaces_around_a_document_change_no_answer() {
+        for doc in [" [1, 2]", "\t[1, 2]", "\n[1, 2]", "\r\n \t[1, 2]", "[1, 2] ", " [1, 2]\n\t\r "] {
+            assert_eq!(length_of(doc).unwrap(), 2, "{doc:?}");
+            assert_eq!(array_len(doc), Some(2), "{doc:?}");
+            assert_eq!(kind(doc).unwrap(), "array", "{doc:?}");
+        }
+        assert_eq!(length_of(" []").unwrap(), 0);
+        assert_eq!(length_of(" [[1], {\"a\": [2]}]").unwrap(), 2);
+        assert_eq!(array_len(" {}"), None, "an object is no array");
+        assert_eq!(kind(" \t{\"a\":1}\n").unwrap(), "object");
+    }
+
+    #[test]
+    fn opened_stands_at_the_container_past_spaces_or_says_none() {
+        assert!(opened(" [1]", Peek::Array).is_some());
+        assert!(opened("\n\t{}", Peek::Object).is_some());
+        assert!(opened(" {}", Peek::Array).is_none(), "an object is not the array asked for");
+        assert!(opened("1", Peek::Array).is_none());
+        assert!(opened("  ", Peek::Object).is_none(), "spaces are no document");
+    }
+
+    /// `->` and `#>` (and their `_text` forms, `->>` and `#>>`) walk a document with JSON's spaces around it, and answer
+    /// each value as written, as they do without the spaces.
+    #[test]
+    fn the_walks_pass_over_spaces_around_the_document() {
+        let bare = r#"{"a": {"b": [1, "x"]}}"#;
+        for doc in [" {\"a\": {\"b\": [1, \"x\"]}}", "\t{\"a\": {\"b\": [1, \"x\"]}}\n", "\r\n{\"a\": {\"b\": [1, \"x\"]}} "] {
+            assert_eq!(find(doc, &[Step::Key("a")]), find(bare, &[Step::Key("a")]), "{doc:?}");
+            assert_eq!(find(doc, &[Step::Key("a"), Step::Key("b"), Step::Index(1)]), Some("\"x\""), "{doc:?}");
+            assert_eq!(find(doc, &[Step::Key("a"), Step::Key("b"), Step::Index(-2)]), Some("1"), "{doc:?}");
+            assert_eq!(find(doc, &[Step::Key("a"), Step::Path("b"), Step::Path("0")]), Some("1"), "{doc:?}");
+        }
+        assert_eq!(find(" [1, [2, 3]]", &[Step::Index(1), Step::Index(0)]), Some("2"));
+        assert_eq!(find(" [1, [2, 3]]", &[Step::Index(7)]), None, "past the end is NULL");
+        assert_eq!(extract_of("json_extract_path", Some("\t[1, [2, 3]]"), &[Some("1"), Some("0")], false, false).unwrap().as_deref(), Some("2"));
+        assert_eq!(extract_of("json_extract_path_text", Some(" {\"a\": \"x\"}\n"), &[Some("a")], true, false).unwrap().as_deref(), Some("x"));
+        assert_eq!(extract_of("json_extract_path", Some(" {\"a\": \"x\"}\n"), &[Some("a")], false, false).unwrap().as_deref(), Some("\"x\""));
+        assert_eq!(extract_of("jsonb_extract_path", Some("\n{\"b\":1,\"a\":{\"y\":2,\"x\":1}}"), &[Some("a")], false, true).unwrap().as_deref(), Some(r#"{"x": 1, "y": 2}"#));
     }
 
     #[test]

@@ -14218,6 +14218,72 @@ def remembered():
     return f"{sum(bool(v) for v in checks.values())} of {len(checks)} remembered checks"
 
 
+def _jsonfns_spaces(check, http_answer, http_error, port_answer, conn, info):
+    """JSON's spaces in front of a document, and after it (PR #131): the expanding functions read an array or an object that
+    starts after a space, a tab or a newline as Postgres 16 reads it, json and jsonb alike, over HTTP and the port (names,
+    type codes and rows), and refuse what Postgres refuses, by its SQLSTATE and words. Each expected answer was asked of
+    Postgres 16 on the same text."""
+    CASES = [
+        ("jsonb_array_elements of a literal with a space in front: its items as jsonb", "SELECT * FROM jsonb_array_elements(' [1,2]')",
+         ['value'], [3802], [['1'], ['2']]),
+        ("jsonb_array_elements with a tab and a newline in front and a space after: the same items", "SELECT * FROM jsonb_array_elements('\t[1, 2 ]\n')",
+         ['value'], [3802], [['1'], ['2']]),
+        ("jsonb_array_elements of every kind of item, after a space, as jsonb prints each", "SELECT * FROM jsonb_array_elements(' [1, \"x\", {\"b\":1,\"a\":2,\"a\":3}, null, 1.50]') AS e",
+         ['value'], [3802], [['1'], ['"x"'], ['{"a": 3, "b": 1}'], ['null'], ['1.50']]),
+        ("jsonb_array_elements_text after a space: a JSON null as NULL, an object as jsonb prints it", "SELECT * FROM jsonb_array_elements_text(' [1.50, {\"b\":1,\"a\":2,\"a\":3}, null, \"x\"]')",
+         ['value'], [25], [['1.50'], ['{"a": 3, "b": 1}'], [None], ['x']]),
+        ("json_array_elements_text after a space keeps each element as written", "SELECT * FROM json_array_elements_text(' [1.50, {\"b\":1,\"a\":2,\"a\":3}]')",
+         ['value'], [25], [['1.50'], ['{"b":1,"a":2,"a":3}']]),
+        ("json_array_elements after a space keeps each element as written", "SELECT * FROM json_array_elements(' [1.50, {\"b\":1,\"a\":2,\"a\":3}]')",
+         ['value'], [114], [['1.50'], ['{"b":1,"a":2,"a":3}']]),
+        ("json_array_elements in a SELECT list after a space: named for the function", "SELECT json_array_elements(' [1.50, {\"b\":1,\"a\":2,\"a\":3}]')",
+         ['json_array_elements'], [114], [['1.50'], ['{"b":1,"a":2,"a":3}']]),
+        ("jsonb_array_elements and jsonb_array_elements_text in one SELECT list, after a space and a tab", "SELECT jsonb_array_elements(' [1,\"x\"]'), jsonb_array_elements_text('\t[1,\"x\"]')",
+         ['jsonb_array_elements', 'jsonb_array_elements_text'], [3802, 25], [['1', '1'], ['"x"', 'x']]),
+        ("jsonb_each in FROM after a space: the keys in jsonb's order, the values as jsonb", "SELECT * FROM jsonb_each(' {\"b\": 1, \"a\": {\"x\": 2}}')",
+         ['key', 'value'], [25, 3802], [['a', '{"x": 2}'], ['b', '1']]),
+        ("jsonb_each in FROM after a tab and a newline, with a space after", "SELECT * FROM jsonb_each('\t{\"b\":1,\"a\":{\"x\":2}}\n')",
+         ['key', 'value'], [25, 3802], [['a', '{"x": 2}'], ['b', '1']]),
+        ("jsonb_each_text after a space: a JSON null as NULL", "SELECT * FROM jsonb_each_text(' {\"b\": 1, \"a\": {\"x\": 2}, \"c\": null}')",
+         ['key', 'value'], [25, 25], [['a', '{"x": 2}'], ['b', '1'], ['c', None]]),
+        ("json_each_text after a space keeps the keys' order as written", "SELECT * FROM json_each_text(' {\"b\": 1, \"a\": {\"x\": 2}, \"c\": null}')",
+         ['key', 'value'], [25, 25], [['b', '1'], ['a', '{"x": 2}'], ['c', None]]),
+        ("json_each after a space keeps each value as written", "SELECT * FROM json_each(' {\"b\": 1, \"a\": {\"x\": 2}}')",
+         ['key', 'value'], [25, 114], [['b', '1'], ['a', '{"x": 2}']]),
+        ("jsonb_object_keys after a space, in FROM and in a SELECT list: the keys in jsonb's order", "SELECT * FROM jsonb_object_keys(' {\"b\":1,\"a\":2}')",
+         ['jsonb_object_keys'], [25], [['a'], ['b']]),
+        ("jsonb_object_keys after a newline, with a CRLF and a space after", "SELECT * FROM jsonb_object_keys('\n{\"b\":1,\"a\":2}\r\n ')",
+         ['jsonb_object_keys'], [25], [['a'], ['b']]),
+        ("jsonb_object_keys in a SELECT list after a space", "SELECT jsonb_object_keys(' {\"b\":1,\"a\":2}')",
+         ['jsonb_object_keys'], [25], [['a'], ['b']]),
+        ("json_object_keys after a space keeps the keys as written, duplicates included", "SELECT * FROM json_object_keys(' {\"b\":1,\"a\":2,\"b\":3}')",
+         ['json_object_keys'], [25], [['b'], ['a'], ['b']]),
+        ("jsonb_to_recordset after a space, with a column list, a missing key NULL", "SELECT * FROM jsonb_to_recordset(' [{\"a\":1,\"b\":\"x\"},{\"a\":2}]') AS x(a int, b text)",
+         ['a', 'b'], [23, 25], [[1, 'x'], [2, None]]),
+        ("json_to_recordset after a space, with a column list", "SELECT * FROM json_to_recordset(' [{\"a\":1,\"b\":\"x\"},{\"a\":2}]') AS x(a int, b text)",
+         ['a', 'b'], [23, 25], [[1, 'x'], [2, None]]),
+        ("jsonb_to_recordset after a tab and a newline, with a space after", "SELECT * FROM jsonb_to_recordset('\t[{\"a\":1,\"b\":\"x\"}]\n') AS x(a int, b text)",
+         ['a', 'b'], [23, 25], [[1, 'x']]),
+        ("jsonb_array_length and json_array_length after a space and a newline: the counts", "SELECT jsonb_array_length(' [1,2]'), json_array_length('\n[1,[2,3]] ')",
+         ['jsonb_array_length', 'json_array_length'], [23, 23], [[2, 2]]),
+    ]
+    # (name, sql, SQLSTATE, message): refused with Postgres 16's words, over HTTP and the port.
+    ERRORS = [
+        ("refused: jsonb_array_elements of an object after a space (22023)", 'SELECT jsonb_array_elements(\' {"a":1}\')', "22023", "cannot extract elements from an object"),
+        ("refused: jsonb_each of an array after a space (22023)", "SELECT * FROM jsonb_each(' [1]') AS e", "22023", "cannot call jsonb_each on a non-object"),
+        ("refused: jsonb_object_keys of an array after a space (22023)", "SELECT * FROM jsonb_object_keys(' [1]') AS k", "22023", "cannot call jsonb_object_keys on an array"),
+        ("refused: jsonb_to_recordset of an object after a space (22023)", "SELECT * FROM jsonb_to_recordset(' {}') AS x(a int)", "22023", "cannot call jsonb_to_recordset on a non-array"),
+        ("refused: json_array_elements of a scalar after a space (22023)", "SELECT * FROM json_array_elements(' 1')", "22023", "cannot call json_array_elements on a scalar"),
+    ]
+    for name, s, names, types, rows in CASES:
+        check(f"over HTTP, {name}", lambda s=s, rows=rows: _same(http_answer(s), [[v for v in row if v is not None] for row in rows], info, s))
+    for name, s, names, types, rows in CASES:
+        check(f"over the port, {name}", lambda s=s, names=names, types=types, rows=rows: _same(port_answer(conn, s), (names, types, rows), info, s))
+    for name, s, sqlstate, message in ERRORS:
+        check(f"over HTTP, {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_http(http_error(s), sqlstate, message, info, s))
+        check(f"over the port, {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_port(conn, s, sqlstate, message, info))
+
+
 def jsonfns():
     """Postgres 16's functions that read a JSON document and expand it into rows (ADR-072 phase 2, brief D1). Reading:
     json(b)_typeof, json(b)_array_length, json(b)_extract_path(_text) (`#>` and `#>>` with the keys as the path; NULL where
@@ -14469,6 +14535,7 @@ def jsonfns():
         with psycopg.connect(url, autocommit=True) as conn:
             for name, s, column in OUTER:
                 check(f"over the port, refused by name, naming {column}: {name}", lambda s=s, column=column: outer_port(conn, s, column))
+            _jsonfns_spaces(check, http_answer, http_error, port_answer, conn, info)
         check("json_keys is DataFusion's list of the keys, as written (DuckDB's name; json_object_keys expands)",
               lambda: http_answer("SELECT json_keys('{\"b\":1,\"a\":2}') AS k") == [[["b", "a"]]])
     finally:
@@ -15292,6 +15359,41 @@ WHOLE_PG = {'BUILD': [['{"id" : 1, "doc" : {"a": 1, "b": [1, 2]}}'],
                '"n2764", "n2771", "n2778", "n2785", "n2792", "n2799", "n2806", "n2813", "n2820", "n2827", "n2834", "n2841", "n2848", "n2855", "n2862", '
                '"n2869", "n2876", "n2883", "n2890", "n2897", "n2904", "n2911", "n2918", "n2925", "n2932", "n2939", "n2946", "n2953", "n2960", "n2967", '
                '"n2974", "n2981", "n2988", "n2995"]']]}
+
+
+def _jsons_spaces(check, over_http, over_port, info):
+    """JSON's spaces in front of a literal, and a tab, a newline or CRLF inside or after it (PR #131): -> , ->>, #> and #>>
+    walk a json and a jsonb literal as Postgres 16 walks it, over HTTP (the expression's JSON text) and the port (its text
+    cast). An empty path gives the whole document with the spaces at its ends left out (Postgres's own answer): json keeps
+    the rest of its text as written, jsonb prints as jsonb does. Each expected answer was asked of Postgres 16 on the same text."""
+    J = " \t{\"a\": \"x\", \"b\": [1, 2], \"c\": {\"d\": null}}\n"
+    K = "\r\n {\"k\" :\t\"v\" , \"n\" : 1.50 }  "
+    J_WALKS = [("-> 'a'", '"x"'), ("->> 'a'", "x"), ("#> '{b,0}'", "1"), ("#>> '{b,0}'", "1"), ("-> 'c'", '{"d": null}'),
+               ("->> 'c'", '{"d": null}'), ("#> '{c,d}'", "null"), ("#>> '{c,d}'", None), ("-> 'b' -> -1", "2"),
+               ("#>> '{b,1}'", "2"), ("#> '{b,5}'", None), ("-> 'zz'", None),
+               ("#> '{}'", '{"a": "x", "b": [1, 2], "c": {"d": null}}'), ("#>> '{}'", '{"a": "x", "b": [1, 2], "c": {"d": null}}')]
+    K_JSON = [("-> 'k'", '"v"'), ("->> 'k'", "v"), ("#> '{n}'", "1.50"), ("#>> '{n}'", "1.50"),
+              ("#> '{}'", '{"k" :\t"v" , "n" : 1.50 }'), ("#>> '{}'", '{"k" :\t"v" , "n" : 1.50 }')]
+    K_JSONB = [("-> 'k'", '"v"'), ("->> 'k'", "v"), ("#> '{n}'", "1.50"), ("#>> '{n}'", "1.50"),
+               ("#> '{}'", '{"k": "v", "n": 1.50}'), ("#>> '{}'", '{"k": "v", "n": 1.50}')]
+    CASES = ([(J, typ, e, want) for typ in ("json", "jsonb") for e, want in J_WALKS]
+             + [(K, "json", e, want) for e, want in K_JSON] + [(K, "jsonb", e, want) for e, want in K_JSONB])
+
+    def walks(label, over, cases):
+        """Each case as `over` answers it, against Postgres 16's; the cases that differ are kept in info."""
+        wrong = {}
+        for doc, typ, expr, want in cases:
+            got = over(f"('{doc}'::{typ} {expr})")  # (no document here has a quote to double)
+            if got != want:
+                wrong[f"{typ} {expr} of {doc!r}"] = [got, want]
+        info[f"{label}: walks that differ from Postgres 16 (expression: [got, Postgres's])"] = wrong
+        return not wrong
+
+    check("-> , ->>, #> and #>> over a json and a jsonb literal with JSON's spaces in front and a tab, a newline or CRLF inside or "
+          "after: Postgres 16's answers, over HTTP (the JSON text)",
+          lambda: walks("HTTP", lambda sql: over_http(f"SELECT {sql} AS v"), CASES))
+    check("the same walks over the Postgres port, as its text cast: Postgres 16's answers",
+          lambda: walks("the port", lambda sql: over_port(f"SELECT CAST({sql} AS TEXT) AS v"), CASES))
 
 
 def jsons():
@@ -16160,6 +16262,7 @@ def jsons():
               "(strings, objects, arrays, numbers, a JSON null, a missing key, a negative index, a path into a scalar, a text key on an array)",
               arrow_cases)
         check("a VARIANT column: v -> 'a', v ->> 'a' and v -> 'b' -> 0 answer as a JSON column's do, over HTTP", variant)
+        _jsons_spaces(check, over_http, over_port, info)
         check("the operators in a WHERE clause, and doc ->> 'a' || 'y', with no parentheses: the rows and the text, over HTTP and the port",
               grouping)
         check("the operators in a WHERE clause find the rows they name, over HTTP and the port (a JSON null and an IS NULL unparenthesised)",
@@ -17445,6 +17548,33 @@ def sparksql():
 
 
 
+def _jsonedits_spaces(checks, info, pg_rows, http_rows, port_rows):
+    """JSON's spaces in front of a document (PR #131): jsonb_set edits a document that starts after a space, a tab or a
+    newline, and makers read one (jsonb_build_object, json_build_object, to_jsonb, jsonb_build_array, json_build_array):
+    jsonb takes its text as jsonb prints it, json keeps its text as written. Each statement's answer is Postgres 16's on the
+    same text, over HTTP and over the port."""
+    cases = [
+        ("jsonb_set of a member, in a document with a space, a newline and a tab in front",
+         "SELECT jsonb_set(' \n{\"c\": {\"d\": 1}, \"b\": [1, 2]}\t'::jsonb, '{c,d}', '\"new\"')::text"),
+        ("jsonb_set of an element, in an array with a tab and a newline in front", "SELECT jsonb_set('\t[1, 2]\n'::jsonb, '{1}', '9')::text"),
+        ("jsonb_set made at a new member, in a document with a space in front", "SELECT jsonb_set(' {\"b\": 1}'::jsonb, '{zz}', '[true]', true)::text"),
+        ("jsonb_build_object of a jsonb document with spaces round it: nested as jsonb prints it",
+         "SELECT jsonb_build_object('doc', ' {\"b\":1,\"a\":[2,{\"d\":null,\"c\":3}]} '::jsonb)::text"),
+        ("json_build_object of a json document with spaces round it: nested as written",
+         "SELECT json_build_object('doc', ' {\"b\": 1,  \"a\": [2]}\n'::json)::text"),
+        ("to_jsonb of a json document with a space and a tab in front", "SELECT to_jsonb(' [1, \"x\"]\t'::json)::text"),
+        ("jsonb_build_array of jsonb documents with spaces in front", "SELECT jsonb_build_array(' {\"b\":1,\"a\":2}'::jsonb, '\t[]\n'::jsonb)::text"),
+        ("json_build_array of a json document with a space in front: as written", "SELECT json_build_array(' [1]'::json)::text"),
+    ]
+    for name, text in cases:
+        want = pg_rows(text)
+        got = http_rows(text)
+        checks[f"{name}: HTTP == Postgres 16's answer ({len(want)} rows)"] = got == want
+        checks[f"{name}: the Postgres port == Postgres 16's answer"] = port_rows(text) == want
+        if got != want:
+            info[f"differs: {name}"] = {"pondra": got[:4], "postgres": want[:4]}
+
+
 def jsonedits():
     """JSON documents changed in place (`pg_json_edit.rs`, round 35): jsonb_set, jsonb_insert, jsonb_concat, `-` and `#-`
     (jsonb_delete, jsonb_delete_path), jsonb_strip_nulls, json_strip_nulls and jsonb_pretty; and a string cast to an array
@@ -17702,6 +17832,7 @@ def jsonedits():
         info["nested array literal in Postgres 16"] = rows_text(pg_rows(nested))
         info["refused: nested array literal"] = [status, state, body[:160]]
         checks["a nested array literal is refused by name, SQLSTATE 0A000 (a gap: Postgres answers it)"] = status >= 400 and state == "0A000"
+        _jsonedits_spaces(checks, info, pg_rows, http_rows, port_rows)
         # Known, not yet refused: jsonb_set of a json column (Postgres: no such function).
         known = "SELECT jsonb_set(js, '{a}', '1') FROM j WHERE id = 1"
         info["known gap: jsonb_set of a json column (Postgres 16: 42883)"] = {"pondra": http_rows(known), "postgres": pg_code(known)}

@@ -5,7 +5,7 @@
 //! rows, and each place Postgres refuses a call is refused by Postgres's words and SQLSTATE before anything changes.
 use crate::codes::coded;
 use crate::pg_catalog::{function, text_arg};
-use crate::pg_json::{answer, kind, JSON_SPACE};
+use crate::pg_json::{answer, kind, opened, JSON_SPACE};
 use crate::pg_json_make::fail;
 use crate::pg_types::names_kept;
 use crate::types::json_refusal;
@@ -18,7 +18,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{self, Expr, FunctionArg, LimitClause, Query, Select, SetExpr, Statement, TableAlias, TableAliasColumnDef, TableFactor};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
-use jiter::Jiter;
+use jiter::Peek;
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -242,7 +242,7 @@ fn article(found: &str) -> &'static str {
 
 /// The elements of the array `doc`, as written (each trimmed of JSON's spaces).
 fn elements(doc: &str) -> Option<Vec<&str>> {
-    let mut jiter = Jiter::new(doc.as_bytes());
+    let mut jiter = opened(doc, Peek::Array)?;
     let mut out = vec![];
     let mut peek = jiter.known_array().ok()?;
     while let Some(p) = peek {
@@ -257,7 +257,7 @@ fn elements(doc: &str) -> Option<Vec<&str>> {
 /// The members of the object `doc` with each value as written. JSON keeps every member in its order, duplicates too;
 /// jsonb keeps one per key, the last of a duplicate, in its own order (by length, then bytes).
 fn members(doc: &str, jsonb: bool) -> Option<Vec<(String, &str)>> {
-    let mut jiter = Jiter::new(doc.as_bytes());
+    let mut jiter = opened(doc, Peek::Object)?;
     let mut out = vec![];
     let mut next = jiter.known_object().ok()?.map(str::to_string);
     while let Some(key) = next {
@@ -809,5 +809,37 @@ mod tests {
         assert_eq!(stmt.to_string(), before);
         assert!(!crate::text::names_a_type("SELECT json_keys(doc) FROM t"));
         assert!(crate::text::names_a_type("SELECT * FROM JSONB_EACH(doc)"));
+    }
+
+    /// JSON's spaces around a document change no row: the items, the keys and the values of each expanding function come
+    /// out as they do without the spaces, and a function given an object or an array of the other kind refuses it.
+    #[test]
+    fn spaces_around_a_document_change_no_row() {
+        for doc in [" [1, \"x\"]", "\t[1, \"x\"]", "\n\r \t[1, \"x\"]", "[1, \"x\"]\n ", " [1, \"x\"] \t\r\n"] {
+            assert_eq!(elements(doc), Some(vec!["1", "\"x\""]), "{doc:?}");
+        }
+        assert_eq!(elements(" []"), Some(vec![]));
+        assert_eq!(elements(" {}"), None, "an object is no array");
+
+        let object = " \n{\"b\": 1, \"a\": {\"x\": 2}}";
+        assert_eq!(members(object, false), Some(vec![("b".to_string(), "1"), ("a".to_string(), "{\"x\": 2}")]));
+        assert_eq!(members(object, false), members("{\"b\": 1, \"a\": {\"x\": 2}}", false));
+        assert_eq!(members("\t{\"b\":1,\"a\":2,\"b\":3} ", true), members(r#"{"b":1,"a":2,"b":3}"#, true));
+        assert_eq!(members(" [1]", false), None, "an array is no object");
+
+        let texts = |name: &str, doc: &str| SETS.iter().find(|set| set.name == name).expect("a set").texts_of(doc).expect("rows");
+        assert_eq!(texts("jsonb_array_elements_text", " [1.50, {\"b\":1,\"a\":2,\"a\":3}]"), vec![Some("1.50".to_string()), Some("{\"a\": 3, \"b\": 1}".to_string())]);
+        assert_eq!(texts("json_array_elements_text", "\t[1.50, {\"b\":1,\"a\":2,\"a\":3}]"), vec![Some("1.50".to_string()), Some("{\"b\":1,\"a\":2,\"a\":3}".to_string())]);
+        assert_eq!(texts("jsonb_object_keys", "\n{\"b\":1,\"a\":2}"), vec![Some("a".to_string()), Some("b".to_string())]);
+        assert_eq!(texts("json_object_keys", " {\"b\":1,\"a\":2,\"b\":3}"), vec![Some("b".to_string()), Some("a".to_string()), Some("b".to_string())]);
+        assert_eq!(texts("jsonb_to_recordset", " [{\"a\":1,\"b\":\"x\"}]"), vec![Some("{\"a\": 1, \"b\": \"x\"}".to_string())]);
+        assert!(SETS.iter().find(|set| set.name == "jsonb_object_keys").expect("a set").texts_of(" [1]").is_err(), "an array of keys is refused");
+
+        let pairs = |name: &str, doc: &str| SETS.iter().find(|set| set.name == name).expect("a set").pairs_of(doc).expect("rows");
+        assert_eq!(
+            pairs("jsonb_each_text", " {\"b\": 1, \"a\": {\"x\": 2}}"),
+            vec![("a".to_string(), Some("{\"x\": 2}".to_string())), ("b".to_string(), Some("1".to_string()))]
+        );
+        assert_eq!(pairs("jsonb_each", "\t{\"b\":1,\"a\":{\"x\":2}}\n"), vec![("a".to_string(), Some("{\"x\": 2}".to_string())), ("b".to_string(), Some("1".to_string()))]);
     }
 }

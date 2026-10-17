@@ -7,6 +7,7 @@
 //! `jsonb_text` is jsonb's own output: keys sorted, numbers as `numeric` prints them, and every `jsonb_*` answer goes
 //! through it. `pondra_as_jsonb` and `pondra_jsonb` (types.rs) answer the same way.
 use crate::codes::{coded, Coded};
+use crate::pg_json::is_text;
 use crate::pg_types::MARK;
 use crate::types::json_refusal;
 use crate::pg_values::{interval_text, time_text};
@@ -204,8 +205,6 @@ fn text_cast(e: &Expr) -> bool {
         _ => false,
     }
 }
-
-fn is_text(t: &DataType) -> bool { matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) }
 
 /// `e`, with a text cast's target named (so it takes no metadata from its source).
 fn unmarked(e: Expr) -> Transformed<Expr> {
@@ -1098,6 +1097,17 @@ mod tests {
         assert_eq!(jsonb_text(r#"{"b":{}, "a":[]}"#).unwrap(), r#"{"a": [], "b": {}}"#);
         assert_eq!(jsonb_text("{}").unwrap(), "{}");
         assert_eq!(jsonb_text("[]").unwrap(), "[]");
+    }
+
+    /// jsonb's text of a document with JSON's spaces in front of it or after it is the text of the document without them.
+    #[test]
+    fn jsonb_passes_over_spaces_around_the_document() {
+        assert_eq!(jsonb_text(" {\"b\":1,\"a\":2}").unwrap(), r#"{"a": 2, "b": 1}"#);
+        assert_eq!(jsonb_text("\t[1.0, {\"b\":null,\"a\":[true]}]\n").unwrap(), r#"[1.0, {"a": [true], "b": null}]"#);
+        assert_eq!(jsonb_text("\r\n  {}  ").unwrap(), "{}");
+        assert_eq!(jsonb_text(" [] ").unwrap(), "[]");
+        assert_eq!(jsonb_text(" 1.5 ").unwrap(), "1.5");
+        assert_eq!(jsonb_text("\t\"x\"\n").unwrap(), r#""x""#);
     }
 
     #[test]
