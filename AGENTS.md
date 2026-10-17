@@ -2745,6 +2745,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    above counts those buffers whole: a 10M-row sort of md5 strings on 4 partitions counted 66 MB for about 2 MB of
    rows and a 256 MB query memory refused it, one run in three. A top-N keeps a few rows and is left alone.
    `harness.py scale`: "a sort of 10M strings under a 256 MB query memory answers every time…".
+417. **A node stops the query that grew it past its memory line, not the node** (`oom.rs`, `panics::work`): some
+   operators grow without asking the query memory pool (`array_agg`, `median`, `string_agg` over huge groups), so the
+   pool can't refuse them and the OS killed the node. A watch reads the process's resident memory (every second, every
+   50 ms past half the line) and past `PONDRA_MEMORY_MAX_GB` (85% of the machine's or container's memory; 0 is off, and
+   a host's process has none) stops the oldest client query (`/sql`, `/mcp`, pages, every Postgres statement) that has
+   run a second and started a tenth of the line lower: its future is dropped, it answers 53200, and its transaction
+   fails as after an error. A stop holds the watch 10 s, while the allocator gives the pages back. The cluster's own
+   calls, bulk writes and live queries are never stopped. A pool wrapper that looked only when asked found 1.8–1.9 GB
+   already resident (parked). `harness.py scale`: "a query the pool doesn't see grow (array_agg over 30M rows) is
+   stopped at the node's memory line (53200)…" (a 1 GB line: peak 1,072 MB; 2.1 GB without).
 418. **A table read cold tells the planner its columns' distinct values, as one read hot does** (`hot::told`): the
    cold branch of `HotFiles::scan` gives its Parquet scan's statistics, and each file group's, the catalog's distinct
    counts (`Known`, from the table's sketch and ranges), where the footers have none. DataFusion bounds a GROUP BY's
