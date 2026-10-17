@@ -13,8 +13,9 @@ and then, and what drifts over time measured.
   stopped (SIGTERM: drained, stepping down), the leader killed (kill -9), a follower stopped, a
   follower killed; it starts again a moment later (by default 8 times a run, at most hourly).
 
-  Each minute it writes a line to --timeline: every node's resident memory, the leader's rows not
-  yet tiered and its commit times, the longest a batch waited for its acknowledgement, the lake's
+  Each minute it writes a line to --timeline: every node's resident memory, its queries (running,
+  waiting, finished, failed) and the query memory they hold, the leader's rows not yet tiered and
+  its commit times, the longest a batch waited for its acknowledgement, the lake's
   objects (a folder's; a bucket's every 30 minutes).
 
   At the end the load stops and it checks: every acknowledged batch once and `kv` as the model,
@@ -23,7 +24,8 @@ and then, and what drifts over time measured.
   caches (the hot columns, and what `pondra_cache_bytes` counts), the lower quartile of the last
   tenth of its life within 1.5x of its second tenth's, after the warm-up, plus 64 MB). It reports the
   lake's objects (data files, log segments, the catalog's) and every stop's longest wait.
-  Prints the checks as JSON (and writes them to --out) and exits 1 if one fails.
+  Prints the checks as JSON (and writes them to --out) and exits 1 if one fails. It prices what the
+  bucket was asked and holds at S3's and R2's list prices (tools/prices.py): dollars a month at this load.
 
 --s3: the lake is s3://$PONDRA_BUCKET/soak-<id> (AWS_* point at R2, MinIO or tools/sim_r2.py),
 deleted at the end unless --keep.
@@ -41,6 +43,7 @@ import argparse, collections, json, os, random, shutil, sys, tempfile, threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from upgrade_check import Load, Node, stop_all, until  # noqa: E402  (the same nodes and load)
+from prices import LABEL, OPS, PRICES, dollars_a_month  # noqa: E402  (what the bucket's requests cost)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -64,17 +67,30 @@ def gauges(x):
         return {}
 
 
+def requests_of(g):
+    """A node's object requests so far, {op: count}, from its `gauges`: the ops it reports."""
+    key = lambda op: f'pondra_object_requests_total{{op="{op}"}}'
+    return {op: int(g[key(op)]) for op in OPS if key(op) in g}
+
+
 def objects(lake):
-    """The lake's objects: {"all": n, "data": n, "log": n} (a bucket listed once)."""
+    """The lake's objects: {"all": n, "data": n, "log": n, "catalog": n, "mb": size} (a bucket listed once)."""
     if lake.startswith("s3://"):
         import boto3
         bucket, prefix = lake[5:].split("/", 1)
         s3 = boto3.client("s3", endpoint_url=os.environ.get("AWS_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT"))
-        keys = [o["Key"][len(prefix) + 1:] for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix + "/") for o in page.get("Contents", [])]
+        keys = [(o["Key"][len(prefix) + 1:], o["Size"]) for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix + "/") for o in page.get("Contents", [])]
     else:
-        keys = [os.path.relpath(os.path.join(d, f), lake) for d, _, fs in os.walk(lake) for f in fs]
-    count = collections.Counter(k.split("/")[0] for k in keys)
-    return {"all": len(keys), "data": count["data"], "log": count["log"], "catalog": count["catalog"]}
+        keys = []
+        for d, _, fs in os.walk(lake):
+            for f in fs:
+                path = os.path.join(d, f)
+                try:
+                    keys.append((os.path.relpath(path, lake), os.path.getsize(path)))
+                except OSError:  # (tiering deletes files: one gone since the walk)
+                    pass
+    count = collections.Counter(k.split("/")[0] for k, _ in keys)
+    return {"all": len(keys), "data": count["data"], "log": count["log"], "catalog": count["catalog"], "mb": round(sum(size for _, size in keys) / 2**20, 1)}
 
 
 class Upserts(threading.Thread):
@@ -143,19 +159,30 @@ def main():
     images = lambda x: sum("restarting to rejoin" in line for line in open(x.log, errors="replace")) if os.path.exists(x.log) else 0
     timeline, moves, start = open(A.timeline, "w"), [], time.time()
     kinds = [("leader", "term"), ("leader", "kill"), ("follower", "term"), ("follower", "kill")]
-    next_move, last_list, samples, wrote, mark = start + (secs + 1 if A.steady else every), 0, [], {}, start
+    next_move, last_list, samples, last, mark = start + (secs + 1 if A.steady else every), 0, [], {}, start
     while time.time() - start < secs:
         time.sleep(max(0, mark + (60 if secs > 600 else 10) - time.time()))
         leader = next((x for x in live if role_or(x, role) == "leader"), None)
         stats = leader.get("/stats", timeout=10) if leader else {}
         got = {x.port: gauges(x) for x in live}
-        listed, now_wrote = None, {p: int(g['pondra_object_requests_total{op="write"}']) if 'pondra_object_requests_total{op="write"}' in g else None for p, g in got.items()}
-        # (a node started again counts from 0: its writes since are its count)
-        made = sum(w - (wrote.get(p) or 0) if w >= (wrote.get(p) or 0) else w for p, w in now_wrote.items() if w is not None)
-        span, wrote = time.time() - (samples[-1]["at"] if samples else start), now_wrote
+        for x in live:  # (a mark in each node's log, so its lines can be put beside the timeline's)
+            with open(x.log, "a") as f:
+                f.write(f"--- soak at {round(was['elapsed'] + time.time() - start)} s\n")
+        listed, counts = None, {p: requests_of(g) for p, g in got.items()}
+        # (a node started again counts from 0: its requests since are its count)
+        deltas = collections.Counter()
+        for p, ops in counts.items():
+            for op, n in ops.items():
+                before = last.get((p, op), 0)
+                deltas[op] += (n - before if n >= before else n)
+        span = time.time() - (samples[-1]["at"] if samples else start)
+        last.update({(p, op): n for p, ops in counts.items() for op, n in ops.items()})
+        reported = {op for ops in counts.values() for op in ops}
+        rates = {op: round(deltas[op] / max(span, 1), 1) for op in OPS if op in reported}
+        made = deltas["write"]
         if not A.s3 or time.time() - last_list > 1800:
             listed, last_list = objects(lake), time.time()
-        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
+        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "requests_per_s": rates, "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "queries": {p: [int(g.get(f"pondra_queries_{k}", 0)) for k in ("running", "waiting", "total")] + [int(g.get("pondra_query_errors_total", 0))] for p, g in got.items()}, "query_mb": {p: round(g.get("pondra_memory_reserved_bytes", 0) / 2**20) for p, g in got.items()}, "reads": load.reads[0], "hwm": {x.port: hwm_of(x) for x in live}, "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
                 "untiered_rows": stats.get("untiered_rows"), "commit_ms_p95": stats.get("commit_ms_p95"),
                 "longest_ack_s": load.longest(mark), "acked": sum(load.acked.values()),
                 "torn": len(load.torn), **({"objects": listed} if listed else {})}
@@ -226,6 +253,12 @@ def main():
     end = objects(lake)
     info["objects at the end"] = end
     info["object writes a second (every node)"] = round(sum(s["object_writes_per_s"] for s in samples[1:]) / max(1, len(samples) - 1), 1)
+    rates = {op: round(sum(s["requests_per_s"].get(op, 0) for s in samples[1:]) / max(1, len(samples) - 1), 1) for op in sorted({op for s in samples for op in s.get("requests_per_s", {})})}
+    info["bucket requests a second (every node)"] = rates
+    gb = end.get("mb", 0) / 1024
+    cost = lambda w: {"requests": round(dollars_a_month(rates, 0, w), 2), "storage": round(dollars_a_month({}, gb, w), 2), "total": round(dollars_a_month(rates, gb, w), 2)}
+    # (a build before reads were counted reports none: its requests' price leaves them out, and says so)
+    info["dollars a month (list prices)"] = {"prices": LABEL, "stored_gb": round(gb, 3), **{w: cost(w) for w in PRICES}, **({} if "read" in rates else {"note": "this build doesn't count reads (GET, HEAD): requests leave them out"})}
     info["longest wait for an acknowledgement, s"] = max((s["longest_ack_s"] for s in samples), default=0)
     info["minutes"] = round((time.time() - start) / 60, 1)
     # (followers first: the leader then drains, steps down, and the next leg's nodes lead at once)
@@ -259,6 +292,14 @@ def remove(lake):
         keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
         if keys:
             s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+
+
+def hwm_of(x):
+    """The newest commit a node has heard of (`/stats`), or None: a follower whose stream stopped stays put."""
+    try:
+        return x.get("/stats", timeout=5)["hwm"]
+    except Exception:
+        return None
 
 
 def role_or(x, role):
