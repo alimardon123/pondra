@@ -16204,6 +16204,7 @@ def jsons():
         check("a materialized view of json_agg(v ORDER BY v) GROUP BY k is filled, then answers what the query answers after an INSERT and after an UPDATE", wholes_materialized)
         check("setup: p (three parents) and c (four children, an orphan, a NULL document)", padding_setup)
         check('a whole row an outer join pads is NULL where Postgres 16 pads it: LEFT (json_agg [null], row_to_json NULL, json_build_object {"c" : null}), RIGHT (json_agg null), coalesce(json_agg ... FILTER) []; HTTP and the port', padding)
+        _jsons_w2(check, url, q, info)
     finally:
         if node is not None:
             node.kill()
@@ -16214,6 +16215,118 @@ def jsons():
     if not ok:
         sys.exit(1)
     return f"{sum(checks.values())} of {len(checks)} JSON checks"
+
+
+def _jsons_w2(check, url, q, info):
+    """Brief W2 (PR #131). The Postgres port types a statement's columns from the text its JSON operators read (`pg_types::one`
+    runs `pg_json::text` first), so `doc ? 'a'`, `?|`, `?&` and `@>` send doc as jsonb (3802) under Postgres's name for it; and
+    COPY … TO STDOUT types its columns as RowDescription does, so a binary COPY sends a jsonb's version byte and a uuid's 16
+    bytes. Every expected answer is Postgres 16's on the same rows (a scratch database, dropped after): the rows, the column
+    names and type codes, and the three COPY streams, header and trailer included."""
+    import uuid
+    import psycopg
+
+    def read(sql):
+        """(rows, (name, type code) of each column) through psycopg."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            cur = conn.execute(sql)
+            return cur.fetchall(), [(c.name, c.type_code) for c in cur.description]
+
+    def copied(sql):
+        """The bytes of a COPY … TO STDOUT, as psycopg hands them over."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            with conn.cursor() as cur, cur.copy(sql) as cp:
+                return b"".join(bytes(block) for block in cp)
+
+    def setup():
+        q("CREATE TABLE w2j (id INT PRIMARY KEY, doc JSONB, dj JSON, u UUID, note TEXT)")
+        q("""INSERT INTO w2j (id, doc, dj, u, note) VALUES
+            (1, '{"a": 1}', '{"a": 1, "b": [1, 2]}', '6f1c0a1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b', 'one'),
+            (2, NULL, NULL, NULL, 'two'),
+            (3, '{"a": [true, "s"]}', '[1, {"x": null}]', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'three'),
+            (4, '{"b": 2, "c": {"a": 1}}', '{"c": [3]}', NULL, 'four')""")
+        return read("SELECT count(*) FROM w2j")[0] == [(4,)]
+
+    # (Postgres 16's rows and (name, type code) of each column, for the statement)
+    WHERE = {
+        "SELECT doc FROM w2j WHERE doc ? 'a' ORDER BY id": ([({"a": 1},), ({"a": [True, "s"]},)], [("doc", 3802)]),
+        "SELECT doc FROM w2j WHERE doc ?| array['b', 'zz'] ORDER BY id": ([({"b": 2, "c": {"a": 1}},)], [("doc", 3802)]),
+        "SELECT doc FROM w2j WHERE doc ?& array['b', 'c'] ORDER BY id": ([({"b": 2, "c": {"a": 1}},)], [("doc", 3802)]),
+        "SELECT doc FROM w2j WHERE doc @> '{\"a\": 1}' ORDER BY id": ([({"a": 1},)], [("doc", 3802)]),
+    }
+
+    def where_forms():
+        got = {sql: read(sql) for sql in WHERE}
+        info["WHERE with ?, ?|, ?& and @> (psycopg: rows, (name, type code) of each column)"] = got
+        return all(got[sql] == want for sql, want in WHERE.items())
+
+    def where_others():
+        got = read("SELECT dj, note FROM w2j WHERE doc ? 'a' ORDER BY id")
+        info["a json and a text column of a WHERE on doc (psycopg)"] = got
+        return got == ([({"a": 1, "b": [1, 2]}, "one"), ([1, {"x": None}], "three")], [("dj", 114), ("note", 25)])
+
+    def uuid_others():
+        got = read("SELECT u FROM w2j WHERE doc ?| array['a'] ORDER BY id")
+        info["a uuid column of a WHERE on doc (psycopg)"] = got
+        return got == ([(uuid.UUID("6f1c0a1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b"),), (uuid.UUID("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),)], [("u", 2950)])
+
+    def question_name():
+        got = read("SELECT doc ? 'a' FROM w2j ORDER BY id")
+        info["doc ? 'a' in the select list (psycopg)"] = got
+        return got == ([(True,), (None,), (True,), (False,)], [("?column?", 16)])
+
+    # (Postgres 16's COPY of the same rows: the binary stream as bytes, the text and CSV ones as text)
+    BINARY = bytes.fromhex(
+        "5047434f50590aff0d0a0000000000000000000005000000040000000100000009017b22"
+        "61223a20317d000000157b2261223a20312c202262223a205b312c20325d7d000000106f"
+        "1c0a1e2b3d4e5f8a9b0c1d2e3f4a5b000000036f6e6500050000000400000002ffffffff"
+        "ffffffffffffffff0000000374776f0005000000040000000300000013017b2261223a20"
+        "5b747275652c202273225d7d000000105b312c207b2278223a206e756c6c7d5d00000010"
+        "a0eebc999c0b4ef8bb6d6bb9bd380a110000000574687265650005000000040000000400"
+        "000018017b2262223a20322c202263223a207b2261223a20317d7d0000000a7b2263223a"
+        "205b335d7dffffffff00000004666f7572ffff"
+    )
+    TEXT = "".join(f"{line}\n" for line in [
+        '1\t{"a": 1}\t{"a": 1, "b": [1, 2]}\t6f1c0a1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b\tone',
+        '2\t\\N\t\\N\t\\N\ttwo',
+        '3\t{"a": [true, "s"]}\t[1, {"x": null}]\ta0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\tthree',
+        '4\t{"b": 2, "c": {"a": 1}}\t{"c": [3]}\t\\N\tfour',
+    ]).encode()
+    CSV = "".join(f"{line}\n" for line in [
+        "id,doc,dj,u,note",
+        '1,"{""a"": 1}","{""a"": 1, ""b"": [1, 2]}",6f1c0a1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b,one',
+        "2,,,,two",
+        '3,"{""a"": [true, ""s""]}","[1, {""x"": null}]",a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11,three',
+        '4,"{""b"": 2, ""c"": {""a"": 1}}","{""c"": [3]}",,four',
+    ]).encode()
+
+    def binary_copy():
+        got = copied("COPY w2j TO STDOUT (FORMAT binary)")
+        info["COPY … TO STDOUT (FORMAT binary): the stream, as hex, when it differs from Postgres 16's"] = None if got == BINARY else got.hex()
+        return got == BINARY
+
+    def text_copy():
+        got = copied("COPY w2j TO STDOUT")
+        info["COPY … TO STDOUT (text): the stream, when it differs from Postgres 16's"] = None if got == TEXT else got.decode(errors="replace")
+        return got == TEXT
+
+    def csv_copy():
+        got = copied("COPY w2j TO STDOUT (FORMAT csv, HEADER)")
+        info["COPY … TO STDOUT (csv, header): the stream, when it differs from Postgres 16's"] = None if got == CSV else got.decode(errors="replace")
+        return got == CSV
+
+    check("setup: w2j with a jsonb, a json, a uuid and a text column (four rows, NULLs among them), written over HTTP", setup)
+    check("psycopg: doc ? 'a', doc ?| array[...], doc ?& array[...] and doc @> '...' in a WHERE clause give doc as jsonb (3802) under its "
+          "name, with Postgres 16's rows", where_forms)
+    check("psycopg: a json column (dj, 114) and a text one come with the rows of a WHERE on doc ? 'a', as Postgres 16 has them", where_others)
+    check("psycopg: a uuid column (u, 2950) of a WHERE on doc ?| array[...] comes as uuid, as Postgres 16 has it", uuid_others)
+    check("psycopg: doc ? 'a' in the select list is named ?column? and is boolean (NULL for a NULL document), as Postgres 16 names it",
+          question_name)
+    check("COPY w2j TO STDOUT (FORMAT binary): the whole stream, header and trailer included, is Postgres 16's bytes (jsonb's version "
+          "byte, uuid's 16 bytes, NULLs as -1)", binary_copy)
+    check("COPY w2j TO STDOUT (text) is Postgres 16's stream: the same values, \\N for NULLs, the same escapes", text_copy)
+    check("COPY w2j TO STDOUT (FORMAT csv, HEADER) is Postgres 16's stream: the column names, quoted fields with doubled quotes, "
+          "empty NULLs", csv_copy)
 
 
 # The sample data the BI tools' statements were captured against (copied from /tmp/claude-0/bi/PREAMBLE.md, "Sample
