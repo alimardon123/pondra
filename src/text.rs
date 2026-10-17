@@ -164,14 +164,20 @@ pub fn makes_json(sql: &str) -> bool {
 
 /// Could `sql` name a type of one's own, in a cast or one of the enum functions? (Only then is
 /// it parsed for one: the built-in types' names are left alone.) A cast to uuid, json or jsonb,
-/// an array type, a set function (which may read a column: `lateral::functions`) and a JSON maker's
-/// call are parsed too.
+/// an array type, a set function (which may read a column: `lateral::functions`), a JSON maker's
+/// call and a `||` that may meet a jsonb document are parsed too.
 pub fn names_a_type(sql: &str) -> bool {
     if sql.contains("[]") {
         return true; // (an array type: a string cast to one reads as a Postgres array literal, `pg_values::array_literals`)
     }
     static SET_FUNCTION: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\b(generate_series|range|unnest)\s*\(").expect("a regex"));
     if SET_FUNCTION.is_match(sql) || makes_json(sql) {
+        return true;
+    }
+    // (`||` merges two jsonb documents: a statement with one is read when it may name a table or JSON, since a
+    // `SELECT 'n' || 5` has no document in it and is text's)
+    static TABLE_OR_JSON: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:from|update|into)\b|json").expect("a regex"));
+    if sql.contains("||") && TABLE_OR_JSON.is_match(sql) {
         return true;
     }
     static NAMED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?i)(?:::|\bas)\s*"?([a-z_][a-z0-9_]*)"?\s*(?:[.]\s*"?([a-z_][a-z0-9_]*))?|\b(?:enum_(?:range|first|last)|pg_typeof)\s*\(|'(\{?[0-9a-fA-F]{8}-?(?:[0-9a-fA-F]{4}-?){3}[0-9a-fA-F]{12}\}?)'"#).expect("a regex"));

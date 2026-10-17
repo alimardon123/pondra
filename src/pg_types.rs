@@ -197,11 +197,25 @@ pub async fn rewrite(lake: &Lake, stmt: &mut Statement) -> anyhow::Result<bool> 
     let asks = |e: &Expr| matches!(e, Expr::Function(f) if object(&f.name) == "pg_typeof");
     let spelled = |e: &Expr| string(e).is_some_and(|s| !crate::types::is_uuid(s) && crate::types::uuid_of(s).is_ok());
     let maker = |e: &Expr| matches!(e, Expr::Function(f) if MAKERS.contains(&object(&f.name).as_str()));
-    if !ast::visit_expressions(stmt, |e| if asks(e) || spelled(e) || maker(e) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }).is_break() {
+    let is_concat = |e: &Expr| matches!(e, Expr::BinaryOp { op: ast::BinaryOperator::StringConcat, .. });
+    // (a `||` is read as jsonb's when JSON is in its text, or when a relation it names has a json or jsonb column: plain
+    // text concatenation over other columns reads nothing more than the names it has)
+    let (mut trigger, mut concatenates, mut json) = (false, false, false);
+    let _ = ast::visit_expressions(stmt, |e| {
+        trigger |= asks(e) || spelled(e) || maker(e);
+        concatenates |= is_concat(e);
+        json |= visibly_json(e);
+        ControlFlow::<()>::Continue(())
+    });
+    if !trigger && !concatenates {
         return Ok(false); // (nearly every statement)
     }
     let mut known = Known::new();
     look_up(lake, stmt, &mut known, 0).await;
+    let has_json = known.values().flatten().flatten().any(|(_, t)| matches!(t, Some(Ty::Json | Ty::Jsonb)));
+    if !trigger && !json && !has_json {
+        return Ok(false);
+    }
     rewritten(&known, stmt)
 }
 
@@ -215,8 +229,8 @@ fn rewritten(known: &Known, stmt: &mut Statement) -> anyhow::Result<bool> {
         return Err(refusal);
     }
     let (asked, compared) = (t.typeof_.into_inner(), t.strings.into_inner());
-    let (wraps, rows, aggregates) = (t.wraps.into_inner(), t.rows.into_inner(), t.aggregates.into_inner());
-    if asked.is_empty() && compared.is_empty() && wraps.is_empty() && rows.is_empty() && aggregates.is_empty() {
+    let (wraps, rows, aggregates, concats) = (t.wraps.into_inner(), t.rows.into_inner(), t.aggregates.into_inner(), t.concats.into_inner());
+    if asked.is_empty() && compared.is_empty() && wraps.is_empty() && rows.is_empty() && aggregates.is_empty() && concats.is_empty() {
         return Ok(false);
     }
     // (`pg_typeof(id)` becomes 'uuid', whose own name would be `Utf8("uuid")`: `names_kept` names it as written)
@@ -233,18 +247,27 @@ fn rewritten(known: &Known, stmt: &mut Statement) -> anyhow::Result<bool> {
                 *e = Expr::value(Value::SingleQuotedString(to));
                 changed = true;
             }
-            changed |= change_makers(e, place, &wraps, &rows, &aggregates);
+            changed |= change_makers(e, place, &wraps, &rows, &aggregates, &concats);
             ControlFlow::<()>::Continue(())
         });
         changed
     }))
 }
 
-/// Changes the expression at `place` as the JSON makers' notes say (`Trace::maker`). A node's children are changed before
-/// the node (`visit_expressions_mut`), so an aggregate's arguments are already: the aggregate is rebuilt, then, at the
-/// same place, wrapped if it is a JSON argument of a maker. A whole row is replaced by `pondra_row`. Whether it changed.
-fn change_makers(e: &mut Expr, place: usize, wraps: &[(usize, Ty)], rows: &[(usize, Whole)], aggregates: &[(usize, Kind)]) -> bool {
+/// Changes the expression at `place` as the JSON makers' notes say (`Trace::maker`) and as `||`'s note says (`Trace::concat`).
+/// A node's children are changed before the node (`visit_expressions_mut`), so an aggregate's arguments are already: the
+/// aggregate is rebuilt, then, at the same place, wrapped if it is a JSON argument of a maker. A whole row is replaced by
+/// `pondra_row`. Whether it changed.
+fn change_makers(e: &mut Expr, place: usize, wraps: &[(usize, Ty)], rows: &[(usize, Whole)], aggregates: &[(usize, Kind)], concats: &[usize]) -> bool {
     let mut changed = false;
+    if concats.contains(&place) {
+        // (a `||` that is jsonb's becomes `jsonb_concat` of its two sides: it parses each as text, as Postgres reads them)
+        if let Expr::BinaryOp { left, right, .. } = e {
+            let parts = vec![std::mem::replace(&mut **left, Expr::value(Value::Null)), std::mem::replace(&mut **right, Expr::value(Value::Null))];
+            *e = call("jsonb_concat", parts);
+            changed = true;
+        }
+    }
     if let Some((_, kind)) = aggregates.iter().find(|(p, _)| *p == place) {
         *e = aggregate_expr(std::mem::replace(e, Expr::value(Value::Null)), *kind);
         changed = true;
@@ -497,13 +520,15 @@ struct Trace<'a> {
     rows: RefCell<Vec<(usize, Whole)>>,
     /// The JSON makers' aggregates, by place, with their elements' kind: each is rebuilt over `array_agg`.
     aggregates: RefCell<Vec<(usize, Kind)>>,
+    /// The `||`s that are jsonb's (`concat_rule`), by place: each becomes `jsonb_concat` of its two sides.
+    concats: RefCell<Vec<usize>>,
     /// The first refusal the statement earns (`rewritten` returns it before anything changes).
     refused: RefCell<Option<anyhow::Error>>,
 }
 
 impl<'a> Trace<'a> {
     fn new(known: &'a Known) -> Self {
-        Trace { known, ctes: Default::default(), params: Default::default(), typeof_: Default::default(), strings: Default::default(), wraps: Default::default(), rows: Default::default(), aggregates: Default::default(), refused: Default::default() }
+        Trace { known, ctes: Default::default(), params: Default::default(), typeof_: Default::default(), strings: Default::default(), wraps: Default::default(), rows: Default::default(), aggregates: Default::default(), concats: Default::default(), refused: Default::default() }
     }
 
     /// The columns `stmt` answers: a query's, or a write's RETURNING.
@@ -711,6 +736,8 @@ impl<'a> Trace<'a> {
             // (and `doc #- '{a}'` the document without a part; `b - 'a'` deletes from a jsonb, and json has no `-`)
             Expr::BinaryOp { left, op: ast::BinaryOperator::Arrow | ast::BinaryOperator::HashArrow | ast::BinaryOperator::HashMinus, .. } => self.document(left, rels),
             Expr::BinaryOp { left, op: ast::BinaryOperator::Minus, .. } => self.expr(left, rels).filter(|t| *t == Ty::Jsonb),
+            // (`a || b` is jsonb's when Postgres's operator is: `concat_rule`; any other is text, or refused)
+            Expr::BinaryOp { left, op: ast::BinaryOperator::StringConcat, right } => matches!(self.concat_of(left, right, rels), Ok(true)).then_some(Ty::Jsonb),
             Expr::Function(f) => match object(&f.name).as_str() {
                 "gen_random_uuid" | "uuidv4" | "uuidv7" | "uuid" | "pondra_uuid" => Some(Ty::Uuid),
                 "json_object_field" | "jsonb_object_field" | "json_array_element" | "jsonb_array_element" | "pondra_json_path" => first_arg(f).and_then(|a| self.document(a, rels)),
@@ -731,6 +758,51 @@ impl<'a> Trace<'a> {
 
     /// The type of a JSON operator's document: json or jsonb as the document is, and none for anything else.
     fn document(&self, e: &Expr, rels: &[Rel]) -> Option<Ty> { self.expr(e, rels).filter(|t| matches!(t, Ty::Json | Ty::Jsonb)) }
+
+    /// Which operator `left || right` is, by its operands (`concat_rule`): Ok(true) for jsonb's, Ok(false) for text's, and the
+    /// refusal's words for the operator Postgres lacks.
+    fn concat_of(&self, left: &Expr, right: &Expr, rels: &[Rel]) -> Result<bool, String> { concat_rule(self.operand(left, rels), self.operand(right, rels)) }
+
+    /// One side of a `||`, as Postgres types it for the operator (`concat_rule`).
+    fn operand(&self, e: &Expr, rels: &[Rel]) -> Side {
+        match e {
+            Expr::Value(v) => match &v.value {
+                Value::Null | Value::SingleQuotedString(_) => Side::Untyped,
+                Value::Boolean(_) => Side::Other("boolean"),
+                Value::Number(n, _) => Side::Other(number_type(n)),
+                _ => Side::Unknown,
+            },
+            Expr::Nested(e) => self.operand(e, rels),
+            Expr::UnaryOp { op: ast::UnaryOperator::Minus | ast::UnaryOperator::Plus, expr } => match self.operand(expr, rels) {
+                Side::Other(name) => Side::Other(name),
+                _ => Side::Unknown,
+            },
+            Expr::Cast { data_type, .. } => match scalar_type(data_type) {
+                Some(name) => Side::Other(name),
+                None => self.typed_operand(e, rels),
+            },
+            _ => self.typed_operand(e, rels),
+        }
+    }
+
+    /// A side the trace types by `expr`: a json or jsonb document, a uuid, or none of them (unknown to the trace).
+    fn typed_operand(&self, e: &Expr, rels: &[Rel]) -> Side {
+        match self.expr(e, rels) {
+            Some(t @ (Ty::Json | Ty::Jsonb)) => Side::Document(t),
+            Some(Ty::Uuid) => Side::Other("uuid"),
+            None => Side::Unknown,
+        }
+    }
+
+    /// Notes a `||` that is jsonb's, by place, and refuses one Postgres refuses (`concat_of`, 42883).
+    fn concat(&self, e: &Expr, rels: &[Rel]) {
+        let Expr::BinaryOp { left, op: ast::BinaryOperator::StringConcat, right } = e else { return };
+        match self.concat_of(left, right, rels) {
+            Ok(true) => self.concats.borrow_mut().push(at(e)),
+            Ok(false) => {}
+            Err(words) => self.refuse(coded("42883", words)),
+        }
+    }
 
     /// The type of column `c` (qualified by `q`): only when it is found, and of the same type wherever it is
     /// (a join's USING names it on both sides). Relations whose columns are unknown don't count: the
@@ -934,15 +1006,78 @@ impl ast::Visitor for Makers<'_, '_> {
     fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
         if self.depth == 0 {
             self.trace.maker(e, self.rels);
+            self.trace.concat(e, self.rels);
         }
         ControlFlow::Continue(())
     }
 }
 
-/// Whether an argument already marks its JSON as the maker reads it: a call of `pondra_as_json`, `pondra_as_jsonb` or
-/// `pondra_row`, which a rewrite made. So a second rewrite wraps nothing again.
+/// Whether an argument already marks its JSON as the maker reads it: a call of `pondra_as_json`, `pondra_as_jsonb`,
+/// `pondra_row` or `jsonb_concat` (a `||` a rewrite made), which marks its answer. So a second rewrite wraps nothing again.
 fn is_marked(a: &Expr) -> bool {
-    matches!(a, Expr::Function(f) if ["pondra_as_json", "pondra_as_jsonb", "pondra_row"].contains(&object(&f.name).as_str()))
+    matches!(a, Expr::Function(f) if ["pondra_as_json", "pondra_as_jsonb", "pondra_row", "jsonb_concat"].contains(&object(&f.name).as_str()))
+}
+
+/// One side of a `||`, as Postgres types it for the operator (`Trace::operand`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Side {
+    /// A json or jsonb document, by the trace.
+    Document(Ty),
+    /// A string literal or NULL: an unknown, which takes the other side's type.
+    Untyped,
+    /// A value of a type that is neither (a uuid, an integer literal): the name Postgres gives the type.
+    Other(&'static str),
+    /// Anything the trace can't type (a text column, a function it doesn't know): text, as before.
+    Unknown,
+}
+
+/// What `left || right` is in Postgres 16, by its operands (`jsonedits` checks the table against Postgres): Ok(true) for
+/// jsonb's operator, which `jsonb_concat` answers; Ok(false) for text's, and for a side the trace can't type; and the words
+/// of the 42883 Postgres gives for an operator it lacks (json with json or jsonb, jsonb with a number, a uuid).
+fn concat_rule(left: Side, right: Side) -> Result<bool, String> {
+    use Side::{Document, Other, Untyped};
+    match (left, right) {
+        (Document(Ty::Jsonb), Document(Ty::Jsonb)) | (Document(Ty::Jsonb), Untyped) | (Untyped, Document(Ty::Jsonb)) => Ok(true),
+        (Document(a), Document(b)) => Err(format!("operator does not exist: {} || {}", a.name(), b.name())),
+        (Document(a), Other(b)) => Err(format!("operator does not exist: {} || {b}", a.name())),
+        (Other(a), Document(b)) => Err(format!("operator does not exist: {a} || {}", b.name())),
+        _ => Ok(false),
+    }
+}
+
+/// The name Postgres gives a number literal's type: `1` is an integer, a big one a bigint, `1.5` and `1e3` numeric.
+fn number_type(n: &str) -> &'static str {
+    if n.contains(['.', 'e', 'E']) {
+        "numeric"
+    } else if n.parse::<i32>().is_ok() {
+        "integer"
+    } else if n.parse::<i64>().is_ok() {
+        "bigint"
+    } else {
+        "numeric"
+    }
+}
+
+/// The name Postgres gives a scalar type a cast names (the types a `||` refuses beside json), if it is one of them.
+fn scalar_type(t: &ast::DataType) -> Option<&'static str> {
+    match t {
+        ast::DataType::Int(_) | ast::DataType::Integer(_) => Some("integer"),
+        ast::DataType::BigInt(_) => Some("bigint"),
+        ast::DataType::Boolean | ast::DataType::Bool => Some("boolean"),
+        ast::DataType::Numeric(_) | ast::DataType::Decimal(_) => Some("numeric"),
+        _ => None,
+    }
+}
+
+/// Whether `e` is JSON by its own text: a cast to json or jsonb, a call of one of the JSON functions (`json_type`), or a
+/// document's operator (`->`, `#>`, `#-`). A column's type is the catalog's, so it isn't; `rewrite` reads the catalog for it.
+fn visibly_json(e: &Expr) -> bool {
+    match e {
+        Expr::Cast { data_type, .. } => matches!(of_type(data_type), Some(Ty::Json | Ty::Jsonb)),
+        Expr::Function(f) => json_type(&object(&f.name)).is_some(),
+        Expr::BinaryOp { op: ast::BinaryOperator::Arrow | ast::BinaryOperator::HashArrow | ast::BinaryOperator::HashMinus, .. } => true,
+        _ => false,
+    }
 }
 
 /// The conditions of a FROM's joins (`ON`, an as-of join's match condition), nested joins' too.
@@ -1344,7 +1479,7 @@ mod tests {
 
     #[test]
     fn a_second_rewrite_changes_nothing() {
-        for sql in ["SELECT json_agg(t) FROM t", "SELECT json_build_object('d', doc), json_agg(json_build_object('a', doc)) FROM t", "SELECT coalesce(json_agg(name), '[]') FROM t", "SELECT jsonb_agg(DISTINCT b) FROM s.o", "SELECT json_object_agg(name, doc) FROM t"] {
+        for sql in ["SELECT json_agg(t) FROM t", "SELECT json_build_object('d', doc), json_agg(json_build_object('a', doc)) FROM t", "SELECT coalesce(json_agg(name), '[]') FROM t", "SELECT jsonb_agg(DISTINCT b) FROM s.o", "SELECT json_object_agg(name, doc) FROM t", "SELECT o.b || '{\"c\": 3}' || '{}' FROM s.o AS o", "SELECT json_build_object('d', o.b || '{}') FROM s.o AS o"] {
             let once = rewrite_text(sql);
             assert_eq!(rewrite_text(&once), once, "{sql}");
         }
@@ -1353,5 +1488,68 @@ mod tests {
     #[test]
     fn a_statement_without_makers_stays_as_it_is() {
         assert_eq!(rewrite_text("SELECT name, id, doc FROM t WHERE name = 'x' AND doc IS NOT NULL"), "SELECT name, id, doc FROM t WHERE name = 'x' AND doc IS NOT NULL");
+    }
+
+    /// `left || right` over `t AS x` (x.doc json, x.id uuid, x.name text) and `s.o AS o` (o.b jsonb): changed, or refused.
+    fn concat_of_pair(left: &str, right: &str) -> Result<String, (&'static str, String)> {
+        let k = known();
+        let mut s = one(&format!("SELECT {left} || {right} FROM t AS x, s.o AS o")).unwrap();
+        match rewritten(&k, &mut s) {
+            Ok(_) => Ok(s.to_string()),
+            Err(e) => Err((crate::codes::of(&e), e.to_string())),
+        }
+    }
+
+    #[test]
+    fn concat_of_each_operand_type_as_postgres_has_it() {
+        // jsonb with jsonb, or with an untyped literal or NULL: jsonb's operator, both ways round (a literal the text of no
+        // JSON is 22P02 when it is parsed, as Postgres parses it: `'x'` beside jsonb)
+        for (l, r) in [("o.b", "o.b"), ("o.b", "'{\"c\": 3}'"), ("'{\"c\": 3}'", "o.b"), ("o.b", "NULL"), ("NULL", "o.b"), ("o.b", "'x'"), ("'x'", "o.b")] {
+            assert!(concat_of_pair(l, r).is_ok_and(|s| s.contains("jsonb_concat(")), "{l} || {r}");
+        }
+        // json with an untyped literal, and anything that is text or unknown to the trace: text, as it was
+        for (l, r) in [("x.doc", "'{}'"), ("'{}'", "x.doc"), ("x.doc", "x.name"), ("o.b", "x.name"), ("x.name", "o.b"), ("'x'", "'y'"), ("'x'", "x.id"), ("'x'", "1"), ("x.name", "x.id")] {
+            assert!(concat_of_pair(l, r).is_ok_and(|s| !s.contains("jsonb_concat(")), "{l} || {r}");
+        }
+        // the operators Postgres lacks, with its words
+        for (l, r, words) in [
+            ("x.doc", "x.doc", "operator does not exist: json || json"),
+            ("x.doc", "o.b", "operator does not exist: json || jsonb"),
+            ("o.b", "x.doc", "operator does not exist: jsonb || json"),
+            ("o.b", "1", "operator does not exist: jsonb || integer"),
+            ("1", "o.b", "operator does not exist: integer || jsonb"),
+            ("o.b", "1.5", "operator does not exist: jsonb || numeric"),
+            ("o.b", "TRUE", "operator does not exist: jsonb || boolean"),
+            ("o.b", "CAST(1 AS BIGINT)", "operator does not exist: jsonb || bigint"),
+            ("o.b", "-1", "operator does not exist: jsonb || integer"),
+            ("o.b", "x.id", "operator does not exist: jsonb || uuid"),
+            ("x.id", "o.b", "operator does not exist: uuid || jsonb"),
+            ("x.doc", "x.id", "operator does not exist: json || uuid"),
+            ("x.doc", "CAST(1 AS INT)", "operator does not exist: json || integer"),
+        ] {
+            assert_eq!(concat_of_pair(l, r), Err(("42883", words.to_string())), "{l} || {r}");
+        }
+    }
+
+    #[test]
+    fn concat_nests_and_is_found_in_every_place_a_walk_reaches() {
+        // a chain: both of its operators are jsonb's, the inner one is the left side of the outer
+        assert!(rewrite_text("SELECT o.b || '{\"c\": 3}' || '{\"d\": 4}' FROM s.o AS o").contains("jsonb_concat(jsonb_concat(o.b, '{\"c\": 3}'), '{\"d\": 4}')"));
+        // (each operator is its own: a jsonb with an untyped literal is jsonb's, whatever the literal says, as Postgres takes it)
+        assert_eq!(rewrite_text("SELECT o.b || '{}' || o.b || 'x' FROM s.o AS o").matches("jsonb_concat(").count(), 3);
+        assert_eq!(rewrite_text("SELECT o.b || '{}' FROM s.o AS o").matches("jsonb_concat(").count(), 1);
+        // UPDATE's SET and RETURNING, a WHERE, an INSERT … SELECT, a CTE, a subquery in FROM, a materialized view
+        assert_eq!(rewrite_text("UPDATE s.o AS o SET b = o.b || '{\"x\": 1}' WHERE o.b || '{}' IS NOT NULL RETURNING o.b || '{}'").matches("jsonb_concat(").count(), 3);
+        assert_eq!(rewrite_text("INSERT INTO s.o (b) SELECT o.b || '{\"y\": 2}' FROM s.o AS o").matches("jsonb_concat(").count(), 1);
+        assert!(rewrite_text("WITH c AS (SELECT o.b || '{}' AS d FROM s.o AS o) SELECT d FROM c").contains("jsonb_concat(o.b, '{}')"));
+        assert!(rewrite_text("SELECT d FROM (SELECT o.b || '{}' AS d FROM s.o AS o) AS q").contains("jsonb_concat(o.b, '{}')"));
+        assert!(rewrite_text("CREATE MATERIALIZED VIEW m AS SELECT o.b || '{}' AS d FROM s.o AS o").contains("jsonb_concat(o.b, '{}')"));
+        // a maker's argument: the concatenation is the JSON it nests, wrapped as jsonb's makers wrap one
+        assert!(rewrite_text("SELECT json_build_object('d', o.b || '{}') FROM s.o AS o").contains("pondra_as_jsonb(jsonb_concat(o.b, '{}'))"));
+        // a plain view is changed where it is read, not when it is made; a text concatenation changes nothing
+        assert!(!rewrite_text("CREATE VIEW v AS SELECT o.b || '{}' AS d FROM s.o AS o").contains("jsonb_concat"));
+        assert_eq!(rewrite_text("SELECT x.name || '{}' FROM t AS x"), "SELECT x.name || '{}' FROM t AS x");
+        // a refusal in a WHERE is refused before anything changes
+        assert_eq!(refusal("SELECT x.id FROM t AS x, s.o AS o WHERE x.doc || o.b IS NULL").0, "42883");
     }
 }
