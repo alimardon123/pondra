@@ -201,7 +201,9 @@ fn join(j: Join) -> Result<LogicalPlan> {
     let nulls = if j.join_type == JoinType::Left { NullHandling::PreserveAndExpandEmpty } else { NullHandling::Drop };
     let right = rebuild(&j.right, &bottom, &left, nulls)?;
     let mut top: Vec<Expr> = left.iter().enumerate().map(|(i, (q, f))| Expr::Column(Column::from_name(left_name(i))).alias_qualified(q.cloned(), f.name())).collect();
-    top.extend(j.right.schema().iter().map(|(q, f)| Expr::Column(Column::new(q.cloned(), f.name())).alias_qualified(q.cloned(), f.name())));
+    // The function's columns go up as they are: aliased to their own names, DataFusion's leaf pushdown (`e.value ->> 'k'`,
+    // a struct's field) took the alias for a computed column, added the column beside it and failed on the duplicate.
+    top.extend(j.right.schema().iter().map(|(q, f)| Expr::Column(Column::new(q.cloned(), f.name()))));
     let plan = LogicalPlan::Projection(Projection::try_new(top, Arc::new(right))?);
     Ok(match j.filter {
         Some(f) if j.join_type == JoinType::Inner => LogicalPlan::Filter(Filter::try_new(f, Arc::new(plan))?),
@@ -424,6 +426,15 @@ mod tests {
     }
 
     fn rows(xs: &[&str]) -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() }
+
+    /// A field read, which DataFusion moves toward the scans, over either side of a lateral plans and answers.
+    #[tokio::test]
+    async fn a_field_read_over_either_side_answers() {
+        let ctx = session().await.expect("a session");
+        let sql = "SELECT get_field(s.r, 'a') AS a, get_field(u.x, 'b') AS b FROM (SELECT named_struct('a', 1) AS r, \
+                   make_array(named_struct('b', 2), named_struct('b', 3)) AS xs) s, unnest(s.xs) AS u(x)";
+        assert_eq!(run(&ctx, sql).await.expect("a field of each side"), rows(&["1,2", "1,3"]));
+    }
 
     #[tokio::test]
     async fn implicit_and_explicit_unnest_are_one_pass() {
