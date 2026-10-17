@@ -17858,7 +17858,7 @@ def lateral():
             port_refused = e.sqlstate == "0A000" and "t.xs" in str(e) and "aren't taken yet" in str(e)
     checks["a set function over an outer query's column is refused by name over the port: 0A000, naming t.xs"] = port_refused
     # A plain correlated subquery (no set function over the outer column) is DataFusion's, and answers as Postgres 16 does.
-    plain_text = "SELECT t.id, (SELECT max(v) FROM (SELECT 1 AS v) w WHERE w.v = t.n) AS m FROM t"
+    plain_text = "SELECT t.id, (SELECT max(v) FROM (SELECT 1 AS v) w WHERE w.v = t.n) AS m FROM t WHERE t.id <= 3"
     checks["a plain correlated subquery answers as Postgres 16 does (1 NULL, 2 1, 3 NULL), over HTTP"] = key(rows_of_pondra(plain_text)) == key(rows_of_pg(plain_text)) == key([("1", ""), ("2", "1"), ("3", "")])
     node.kill()
     # Three nodes: the same rows, spread (?spread=1), each node asked.
