@@ -15,11 +15,14 @@ use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use datafusion::datasource::file_format::{csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat, FileFormat};
 use datafusion::datasource::listing::ListingTableUrl;
-use datafusion::sql::sqlparser::ast::{Expr, TableFactor, Value};
+use datafusion::sql::sqlparser::ast::Value;
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+
+pub use crate::ext_names::{attached_table, is, mentions, names, spec, table, Attached, Spec};
+pub(crate) use crate::ext_names::{format_of, quoted, scheme};
 
 tokio::task_local! {
     /// The caller is the program that started this node (the shell, `connect()` of a lake: `server::owner`),
@@ -51,80 +54,6 @@ pub fn listing<F: std::future::Future>(f: F) -> impl std::future::Future<Output 
 pub(crate) fn owner() -> bool { OWNER.try_with(|o| *o).unwrap_or(false) }
 
 // ---------------------------------------------------------------- what a query reads
-
-/// Files a query reads as one table: where, in which format, with which options.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Spec {
-    pub urls: Vec<String>,
-    pub format: String, // parquet, csv, json (one object a line)
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub options: BTreeMap<String, String>,
-}
-
-const PREFIX: &str = "ext:";
-
-pub fn is(name: &str) -> bool { name.starts_with(PREFIX) }
-
-fn name(spec: &Spec) -> String { format!("{PREFIX}{}", B64.encode(serde_json::to_vec(spec).expect("a spec"))) }
-
-pub fn spec(name: &str) -> Option<Spec> { serde_json::from_slice(&B64.decode(name.strip_prefix(PREFIX)?).ok()?).ok() }
-
-/// Might `sql` name files? (A cheap test, before anything is parsed.)
-pub fn mentions(sql: &str) -> bool {
-    static FILES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)'(s3|r2|gs|gcs|az|azure|abfss?|https?)://|\b(from|join|using)\s+'|\b(read_parquet|parquet_scan|read_csv|read_csv_auto|read_json|read_json_auto|read_ndjson|read_arrow|read_delta|read_iceberg|delta_scan|iceberg_scan)\s*\(").expect("a regex")
-    });
-    FILES.is_match(sql)
-}
-
-/// The table a reference to files is: `'s3://…/x.parquet'` or `'sales/*.csv'` (a URL or a path,
-/// its format by extension), or `read_parquet(…)`, `read_csv(…)`, `read_json(…)`, `read_delta(…)`,
-/// `read_iceberg(…)` with URLs or paths and DuckDB's options by name. Pondra's names come first;
-/// DuckDB's (`parquet_scan`, `read_csv_auto`, `read_json_auto`, `read_ndjson`, `delta_scan`,
-/// `iceberg_scan`) are the same (ADR-028). None: not files.
-pub fn table(t: &TableFactor) -> Result<Option<String>> {
-    let TableFactor::Table { name: n, args, .. } = t else { return Ok(None) };
-    let Some(args) = args else {
-        let [part] = &n.0[..] else { return Ok(None) };
-        let Some(id) = part.as_ident().filter(|i| i.quote_style == Some('\'')) else { return Ok(None) }; // (a name in single quotes: files, as DuckDB reads it)
-        let (format, options) = format_of(&id.value)?;
-        return Ok(Some(name(&Spec { urls: vec![id.value.clone()], format, options })));
-    };
-    let f = n.to_string().to_lowercase();
-    let format = match f.as_str() {
-        "read_parquet" | "parquet_scan" => "parquet",
-        "read_csv" | "read_csv_auto" => "csv",
-        "read_json" | "read_json_auto" | "read_ndjson" => "json",
-        "read_arrow" => "arrow",
-        "read_delta" | "delta_scan" => "delta",
-        "read_iceberg" | "iceberg_scan" => "iceberg",
-        _ => return Ok(None),
-    };
-    let (mut urls, mut options) = (vec![], BTreeMap::new());
-    let a = crate::routines::args(&f, &args.args)?;
-    for e in a.given {
-        urls.extend(strings(e).with_context(|| format!("{f}: files are a string or a list of them"))?);
-    }
-    for (name, e) in a.named {
-        let value = match (name.to_lowercase().as_str(), e) {
-            ("columns" | "hive_types", Expr::Dictionary(d)) => d.iter().map(|c| Ok(format!("{} {}", quoted(&c.key.value), literal(&c.value)?))).collect::<Result<Vec<_>>>().map(|c| c.join(", ")),
-            _ => literal(e),
-        };
-        options.insert(name.to_lowercase(), value.with_context(|| format!("{f}: {name} is a value"))?);
-    }
-    ensure!(!urls.is_empty(), "{f}: which files? {f}('s3://bucket/path/*.{format}')");
-    let known: &[&str] = match format {
-        "csv" => &["header", "delim", "sep", "delimiter", "quote", "escape", "comment", "new_line", "hive_partitioning", "hive_types", "union_by_name", "columns"],
-        "delta" => &["version"],
-        "iceberg" => &["version", "snapshot_from_id", "snapshot_from_timestamp", "allow_moved_paths"],
-        _ => &["hive_partitioning", "hive_types", "union_by_name", "columns"],
-    };
-    ensure!(!["delta", "iceberg"].contains(&format) || urls.len() == 1, "{f}: one table at a time");
-    if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
-        bail!("{f} has no option {k}: {}", known.join(", "));
-    }
-    Ok(Some(name(&Spec { urls, format: format.into(), options })))
-}
 
 /// DataFusion's (and Hive's) `CREATE EXTERNAL TABLE t [(columns)] STORED AS PARQUET | CSV | JSON
 /// LOCATION '…' [PARTITIONED BY (…)] [OPTIONS (…)]`: a stored view of the files by that name,
@@ -276,63 +205,7 @@ fn located(l: &str) -> Result<String> {
     })
 }
 
-/// A name as SQL writes it, in double quotes (`"a"`; a quote inside doubled).
-pub(crate) fn quoted(name: &str) -> String { format!("\"{}\"", name.replace('"', "\"\"")) }
-
-fn strings(e: &Expr) -> Option<Vec<String>> {
-    match e {
-        Expr::Array(a) => a.elem.iter().map(|e| literal(e).ok()).collect(),
-        e => Some(vec![literal(e).ok()?]),
-    }
-}
-
-fn literal(e: &Expr) -> Result<String> {
-    match e {
-        Expr::Value(v) => match &v.value {
-            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Ok(s.clone()),
-            Value::Number(n, _) => Ok(n.to_string()),
-            Value::Boolean(b) => Ok(b.to_string()),
-            v => bail!("{v}"),
-        },
-        Expr::Identifier(i) => Ok(i.value.clone()), // (true, false written bare)
-        e => bail!("{e}"),
-    }
-}
-
-/// A file's format by its extension (a glob's too: `*.parquet`).
-pub(crate) fn format_of(url: &str) -> Result<(String, BTreeMap<String, String>)> {
-    if url.starts_with("kafka://") {
-        return Ok(("kafka".into(), BTreeMap::new())); // (a topic)
-    }
-    let path = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
-    let tsv = BTreeMap::from([("delim".to_string(), "\t".to_string())]);
-    Ok(match path.rsplit('.').next().unwrap_or_default() {
-        "parquet" | "pq" => ("parquet".into(), BTreeMap::new()),
-        "csv" => ("csv".into(), BTreeMap::new()),
-        "tsv" => ("csv".into(), tsv),
-        "json" | "ndjson" | "jsonl" => ("json".into(), BTreeMap::new()),
-        "arrow" | "feather" | "ipc" => ("arrow".into(), BTreeMap::new()), // (Arrow's file format: IPC with a footer)
-        "gz" | "zst" | "bz2" | "xz" => bail!("{url}: compressed files aren't read yet: Parquet, CSV, JSON and Arrow as they are"),
-        _ => bail!("{url}: which format? name files by their extension (.parquet, .csv, .json, .arrow), or read them with read_parquet(…), read_csv(…), read_json(…) or read_arrow(…)"),
-    })
-}
-
-/// A URL's scheme, if it names one Pondra reads (not a path on this machine).
-pub(crate) fn scheme(url: &str) -> Option<&str> {
-    let s = url.split_once("://")?.0;
-    ["s3", "r2", "gs", "gcs", "az", "azure", "abfs", "abfss", "http", "https", "kafka", "file"].contains(&s).then_some(s)
-}
-
 // ---------------------------------------------------------------- the table they make
-
-/// The tables of files named in `sql` (after `routines::expand`).
-pub fn names(sql: &str) -> Vec<String> {
-    static NAMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#""(ext:[A-Za-z0-9_-]+)""#).expect("a regex"));
-    let mut out: Vec<String> = NAMES.captures_iter(sql).map(|c| c[1].to_string()).collect();
-    out.sort();
-    out.dedup();
-    out
-}
 
 /// Text (an error, a plan) with each table of files named as SQL named it: `'s3://…'`, or
 /// `read_csv('…', delim => ';')`, not its internal name.
@@ -971,17 +844,6 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
 
 // ---------------------------------------------------------------- other engines' catalogs
 
-/// Another engine's tables, attached (`ATTACH 'url' AS name (TYPE delta | iceberg, …)`): one
-/// table read as `name`, a folder of them as `name.table` and `name.folder.table`, or an Iceberg
-/// REST catalog's as `name.namespace.table`. Kept in the catalog (`o/`): every node reads them.
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Attached {
-    pub kind: String,
-    pub url: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub options: BTreeMap<String, String>,
-}
-
 fn attached_key(n: &str) -> String { format!("o/{n}") }
 
 pub async fn attached(lake: &Lake) -> Result<Vec<(String, Attached)>> {
@@ -990,43 +852,6 @@ pub async fn attached(lake: &Lake) -> Result<Vec<(String, Attached)>> {
 
 /// Is this attached as another engine's tables?
 pub async fn is_attached(lake: &Lake, name: &str) -> Result<bool> { Ok(lake.cat.get::<Attached>(&attached_key(name)).await?.is_some()) }
-
-/// The table of files a name of an attached catalog is (None: not one of theirs).
-pub fn attached_table(all: &[(String, Attached)], parts: &[String]) -> Result<Option<String>> {
-    let Some((_, a)) = all.iter().find(|(n, _)| *n == parts[0]) else { return Ok(None) };
-    let rest = &parts[1..];
-    if a.kind == "kafka" {
-        let [topic] = rest else { bail!("{}: a Kafka cluster's topics are {0}.topic", parts[0]) };
-        return Ok(Some(name(&Spec { urls: vec![format!("{}/{topic}", a.url.trim_end_matches('/'))], format: "kafka".into(), options: BTreeMap::new() })));
-    }
-    if a.kind == "share" {
-        let (schema, t) = match rest {
-            [t] => ("public", t),
-            [s, t] => (s.as_str(), t),
-            _ => bail!("{}: a share's tables are {0}.schema.table", parts[0]),
-        };
-        let options = BTreeMap::from([("share".to_string(), a.options.get("share").cloned().unwrap_or_default()), ("schema".to_string(), schema.to_string()), ("table".to_string(), t.clone())]);
-        return Ok(Some(name(&Spec { urls: vec![a.url.clone()], format: "share".into(), options })));
-    }
-    let endpoint = crate::catalogs::endpoint(a);
-    let spec = match endpoint {
-        Some(endpoint) => {
-            let (ns, t) = match rest {
-                [t] => ("default", t),
-                [ns, t] => (ns.as_str(), t),
-                _ => bail!("{}: a REST catalog's tables are {0}.namespace.table", parts[0]),
-            };
-            let mut options = BTreeMap::from([("namespace".to_string(), ns.to_string()), ("table".to_string(), t.clone())]);
-            if a.options.contains_key("endpoint") {
-                options.insert("warehouse".into(), a.url.clone());
-            }
-            options.insert("catalog".into(), parts[0].clone()); // (the attachment's name: its settings, `catalogs::open`)
-            Spec { urls: vec![endpoint.trim_end_matches('/').to_string()], format: "iceberg".into(), options }
-        }
-        None => Spec { urls: vec![std::iter::once(a.url.trim_end_matches('/')).chain(rest.iter().map(String::as_str)).collect::<Vec<_>>().join("/")], format: a.kind.clone(), options: BTreeMap::new() },
-    };
-    Ok(Some(name(&spec)))
-}
 
 /// The table of files a statement's target is, if it names an attached catalog's table.
 pub async fn outside_target(lake: &Lake, name: &str) -> Result<Option<String>> {

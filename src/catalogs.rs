@@ -9,6 +9,7 @@
 //! their own, `delegated://<id>/…` (`rehome`), never through the bucket's store, so no other
 //! statement, and no file another table names, ever reads with them (invariant 339).
 use crate::ext::{Attached, Spec};
+pub use crate::ext_names::endpoint;
 use crate::store::{DataFile, Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
 use object_store::aws::{AwsAuthorizer, AwsCredential};
@@ -82,11 +83,6 @@ pub async fn signed(lake: &Lake, name: &str, url: &str) -> Result<bool> {
     let Some(secret) = a.options.get("secret").filter(|_| a.options.contains_key("endpoint_type")) else { return Ok(false) };
     aws_keys(lake, secret).await?;
     Ok(true)
-}
-
-/// An attached Iceberg catalog's REST endpoint, if it has one.
-pub fn endpoint(a: &Attached) -> Option<String> {
-    a.options.get("endpoint").cloned().or_else(|| a.url.starts_with("http").then(|| a.url.clone())).map(|e| e.trim_end_matches('/').to_string())
 }
 
 impl Rest {
