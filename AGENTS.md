@@ -2660,6 +2660,24 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    provider, to 5; and Pondra 0.33.0 then refuses it by name". (411 is ADR-074 part 2's: the console's
    redirect.)
 
+413. **psql 18 signs in through the provider, and a connection is asked one way** (`pg.rs`'s
+   `ask_oauth` and `oauth_step`, `sso::oauth_for`, ADR-074 §4a). With `POSTGRES 'oauth'`, the Postgres
+   port asks a user with no password for `OAUTHBEARER` (RFC 7628), then `SCRAM-SHA-256` only so that an
+   older client, which takes it, is refused naming the way out (psql 18 with the issuer, or `POSTGRES
+   'password'`): such a user has no password, so SCRAM never signs it in. This happens when the first
+   provider by name that says so would sign that user in: a user made here, or any name for a `USERS
+   'any'` provider.
+   - With no token, the client is told the provider's discovery document and scopes, then refused 28000.
+   - A token is checked as every token is (invariants 409, 410), and the next message is
+     `AuthenticationOk`, never a `SASLFinal` (libpq refuses one).
+   - A refusal says why.
+
+   A user with a password is asked for SCRAM. Without `'oauth'`, a user with no password is asked for
+   the token as a password, as before. libpq 18 takes the first mechanism it knows, in the server's
+   order, and doesn't fall back: SCRAM first would be SCRAM for psql 18 too, and a password offered
+   beside SASL can't be. `harness.py sso_pg` (a hand-written client, psycopg2's libpq 17, and psql 18
+   when there is one); `harness.py keycloak` (psql 18's device flow, approved at Keycloak).
+
 ## Tests: run these before and after any change
 
 ```bash
@@ -2673,6 +2691,8 @@ python3 tools/harness.py safety         # panics answered as errors, TLS at ever
 python3 tools/harness.py owned signed guesses   # a program's node answers only it; a lake served with tokens stays signed; failed sign-ins limited per address and name
 python3 tools/harness.py sealed         # the admin token as the master key: sealed from the first write, across nodes, rotation, the nodes' key refused
 python3 tools/harness.py first          # a node on the network with no token makes the lake's first user and prints its token once; pondra token; a follower answers no one
+python3 tools/harness.py sso_pg         # psql 18's sign-in through a provider (POSTGRES 'oauth', OAUTHBEARER): told where it is, a token in, refusals, one way a connection
+python3 tools/harness.py keycloak       # single sign-on against a real Keycloak (PONDRA_KEYCLOAK): tokens at every door, realm roles, the console's flow, pondra login, psql 18
 python3 tools/node_check.py             # a node stopped once it serves, or while it starts, gives its term back: the next leads at once
 python3 tools/per_node_check.py         # every static per_node! or said to outlive a node; no task Node::stop can't end; settings only through env.rs
 cargo test --release --test node_twice  # two lakes in one process, one after the other: nothing of the first in the second
