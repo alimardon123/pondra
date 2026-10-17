@@ -49,18 +49,12 @@ fn check_named(meta: &TableMeta, table: &str, rows: &RecordBatch, sql_names: boo
     Ok(())
 }
 
-/// The session CHECKs, DEFAULTs and expectations are planned in: the functions and operators every session has, Postgres's
-/// JSON ones among them (`pg_json::planned`, with the JSON functions they are built on, as `engine::session` registers
-/// them), and the types' own. So a condition that works in a query works here, and one that doesn't is refused at CREATE,
-/// as Postgres refuses it. Built once: `evaluate` and `breaking` run it as it is; `values` and `validate` take a copy
-/// (`copy`), so what they register is theirs alone.
-static BASE: std::sync::LazyLock<SessionContext> = std::sync::LazyLock::new(|| {
-    let mut ctx = SessionContext::new();
-    datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // (`->` and `->>`: `pg_json` plans only the others)
-    let ctx = crate::pg_json::planned(ctx);
-    crate::types::register(&ctx); // (gen_random_uuid(), uuidv7(), pg_typeof(x))
-    ctx
-});
+/// The session CHECKs, DEFAULTs and expectations are planned in: every function a query's session has but the lake's
+/// (`store::functions`, Postgres's JSON operators among them), so a condition that works in a query works here, and one
+/// that doesn't is refused at CREATE, as Postgres refuses it. Built once: `evaluate` and `breaking` run it as it is;
+/// `values` and `validate` take a copy (`copy`), so what they register is theirs alone.
+static BASE: std::sync::LazyLock<SessionContext> =
+    std::sync::LazyLock::new(|| crate::store::functions(datafusion::prelude::SessionConfig::new(), std::sync::Arc::new(Default::default())));
 
 /// A session with BASE's functions, for what registers functions of its own (`nextval`): what holds the lake must never
 /// go into BASE, which every check shares (invariants 199, 301).

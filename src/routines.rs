@@ -55,18 +55,16 @@ pub fn of_macro(args: &Option<Vec<ast::MacroArg>>, def: &ast::MacroDefinition) -
 /// A SQL function's body with its JSON operators grouped as Postgres groups them: the rule a view's query gets from
 /// `path::door` before it is stored (`pg_json::text`). It is done where the routine is read, so the routine a statement
 /// carries (`ddl` waits for it to be kept) is the one kept. A query's body is grouped as text; an expression's
-/// (`RETURN d ->> 'a' = '1'`, which the parser reads as `d ->> ('a' = '1')`) as the one value of a SELECT, and kept as
-/// an expression. A procedure's body isn't: its statements go through the door as they run. Python's code is its own.
+/// (`RETURN d ->> 'a' = '1'`, which the parser reads as `d ->> ('a' = '1')`) as one (`pg_json::expression`). A
+/// procedure's body isn't: its statements go through the door as they run. Python's code is its own.
 pub fn grouped(mut r: Routine) -> Routine {
     if r.kind == Kind::Procedure || r.python() {
         return r;
     }
     if is_query(&r.body) {
         r.body = crate::pg_json::text(&r.body).into_owned();
-    } else if let std::borrow::Cow::Owned(select) = crate::pg_json::text(&format!("SELECT {}", r.body)) {
-        // (less the `?column?` a bare `?` is named as the one item of a select list)
-        let value = select.strip_prefix("SELECT ").map(|v| v.strip_suffix(r#" AS "?column?""#).unwrap_or(v));
-        r.body = value.unwrap_or(r.body.as_str()).to_string();
+    } else {
+        r.body = crate::pg_json::expression(&r.body).into_owned();
     }
     r
 }

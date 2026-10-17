@@ -391,7 +391,7 @@ pub fn constraints(sql: &str) -> Result<Option<(String, Vec<Expect>)>> {
             ["ON", "VIOLATION", "FAIL"] | ["ON", "VIOLATION", "FAIL", "UPDATE"] => OnViolation::Fail,
             _ => bail!("after {} (…): ON VIOLATION DROP ROW, or ON VIOLATION FAIL", word(k)),
         };
-        let check = grouped(&text(start + 1, end - 1));
+        let check = crate::pg_json::expression(&text(start + 1, end - 1)).into_owned(); // (grouped once, here: every write runs it)
         expect.push(Expect { name: name.unwrap_or_else(|| format!("expectation_{}", expect.len() + 1)), check, on });
     }
     if expect.is_empty() {
@@ -400,16 +400,6 @@ pub fn constraints(sql: &str) -> Result<Option<(String, Vec<Expect>)>> {
     let list = if columns.is_empty() { String::new() } else { format!(" ({})", columns.join(", ")) };
     let rest = tokens[solid[close] + 1..].iter().map(|t| t.to_string()).collect::<String>();
     Ok(Some((format!("{}{list}{rest}", text(0, open - 1)), expect)))
-}
-
-/// A condition as Postgres groups its JSON operators (`pg_json::text` over `SELECT (condition)`, the wrapper taken off
-/// again): `doc ->> 'a' = 'x'` is `(doc ->> 'a') = 'x'`, and `doc ? 'a'` is `jsonb_exists(doc, 'a')`. Made once, when the
-/// view is, since every write runs the condition (`defaults::breaking`). Text it leaves alone comes back as it was.
-fn grouped(condition: &str) -> String {
-    let wrapped = format!("SELECT ({})", condition.trim());
-    let read = crate::pg_json::text(&wrapped);
-    let inner = read.strip_prefix("SELECT (").and_then(|s| s.strip_suffix(')'));
-    inner.map_or_else(|| condition.trim().to_string(), str::to_string)
 }
 
 /// A session view's bound: no session still open starts before this (µs).
@@ -1588,17 +1578,4 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
     ])?;
     let mem = |b: RecordBatch| -> Result<std::sync::Arc<dyn datafusion::catalog::TableProvider>> { Ok(std::sync::Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
     Ok(vec![("flows", mem(flows)?), ("expectations", mem(expectations)?)])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::grouped;
-
-    #[test]
-    fn conditions_are_grouped_as_postgres_groups_them() {
-        // (Postgres 16 groups the same text this way: `?` is jsonb_exists, and `->>` binds tighter than `=`)
-        assert_eq!(grouped("doc ? 'a'"), "jsonb_exists(doc, 'a')");
-        assert_eq!(grouped("doc ->> 'a' = 'x'"), "(doc ->> 'a') = 'x'");
-        assert_eq!(grouped("amount > 0"), "amount > 0");
-    }
 }

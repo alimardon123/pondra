@@ -585,6 +585,16 @@ pub fn text(sql: &str) -> Cow<'_, str> {
     grouped.map_or(Cow::Borrowed(sql), Cow::Owned)
 }
 
+/// One expression (a CHECK, an expectation, a SQL function's body) with its JSON operators grouped as `text` groups a
+/// statement's: read as the one value of a SELECT, in parentheses, so a bare `?` is no select item to be named.
+pub fn expression(e: &str) -> Cow<'_, str> {
+    let e = e.trim();
+    match text(&format!("SELECT ({e})")) {
+        Cow::Owned(s) => s.strip_prefix("SELECT (").and_then(|s| s.strip_suffix(')')).map_or(Cow::Borrowed(e), |s| Cow::Owned(s.to_string())),
+        Cow::Borrowed(_) => Cow::Borrowed(e),
+    }
+}
+
 /// The statements with each JSON operator regrouped where Postgres groups it differently. None when none was.
 fn regrouped(mut stmts: Vec<ast::Statement>) -> Option<String> {
     let mut moved = false;
@@ -1070,6 +1080,15 @@ mod tests {
         // (a RETURNING's items are named as a select list's: Postgres 16 names `RETURNING id, doc ? 'a'` id and ?column?)
         assert_eq!(grouped("DELETE FROM t WHERE doc ? 'a' RETURNING id, doc ? 'a'"), r#"DELETE FROM t WHERE jsonb_exists(doc, 'a') RETURNING id, jsonb_exists(doc, 'a') AS "?column?""#);
         assert_eq!(grouped("UPDATE t SET n = 1 RETURNING doc ?| ARRAY['a']"), r#"UPDATE t SET n = 1 RETURNING jsonb_exists_any(doc, ARRAY['a']) AS "?column?""#);
+    }
+
+    #[test]
+    fn an_expression_is_grouped_as_postgres_groups_it() {
+        // (a CHECK's, an expectation's or a SQL function's: Postgres 16 groups the same text this way, and names nothing)
+        assert_eq!(expression("doc ? 'a'"), "jsonb_exists(doc, 'a')");
+        assert_eq!(expression(" doc ->> 'a' = 'x' "), "(doc ->> 'a') = 'x'");
+        assert_eq!(expression("doc ?| ARRAY['a'] AND n > 1"), "jsonb_exists_any(doc, ARRAY['a']) AND n > 1");
+        assert!(matches!(expression("amount > 0"), Cow::Borrowed("amount > 0")), "nothing of JSON's: as written");
     }
 
     #[test]
