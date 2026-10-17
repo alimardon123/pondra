@@ -14,6 +14,7 @@ pub mod intervals;
 pub mod xlsx;
 pub mod answer;
 pub mod engine;
+pub mod page;
 pub mod text;
 pub mod ext_names;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
