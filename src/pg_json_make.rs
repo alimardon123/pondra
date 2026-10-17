@@ -162,6 +162,18 @@ impl AnalyzerRule for AsText {
     }
 
     fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> Result<LogicalPlan> {
+        // (most plans cast nothing to text: they are handed back as they came, never rebuilt)
+        let mut any = false;
+        plan.apply_with_subqueries(|p| {
+            p.apply_expressions(|e| {
+                any = e.exists(|e| Ok(text_cast(e)))?;
+                Ok(if any { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
+            })?;
+            Ok(if any { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
+        })?;
+        if !any {
+            return Ok(plan);
+        }
         plan.transform_up_with_subqueries(|plan| {
             // (most plans cast nothing to text, and are left as they are)
             let mut any = false;

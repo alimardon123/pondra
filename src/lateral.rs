@@ -31,6 +31,18 @@ impl AnalyzerRule for Lateral {
     fn name(&self) -> &str { "pondra_lateral" }
 
     fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> Result<LogicalPlan> {
+        // (most plans have no lateral of this rule's: they are handed back as they came, never rebuilt)
+        let mut ours = false;
+        plan.apply_with_subqueries(|p| {
+            ours = match p {
+                LogicalPlan::Join(j) => takes(j)?,
+                _ => false,
+            };
+            Ok(if ours { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
+        })?;
+        if !ours {
+            return Ok(plan);
+        }
         plan.transform_up_with_subqueries(|plan| {
             let ours = match &plan {
                 LogicalPlan::Join(j) => takes(j)?,
