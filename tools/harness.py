@@ -10290,6 +10290,15 @@ def sso_flow():
             and told["the command line"][0] == 302 and where(told["the command line"][1]).startswith("http://127.0.0.1:45678/back?error=")
             and all(h.get("Set-Cookie") is None for _, h, _ in told.values()))
 
+        # 5b. Starts ask the provider nothing: its discovery document is kept with its keys (M21 of the 10-17 audit:
+        # anyone may start a sign-in, and each start fetched the document).
+        asked_before = dict(srv.idp.stats)
+        starts = [start(P, "acme", to="/")[0] for _ in range(20)]
+        asked = {k: srv.idp.stats[k] - asked_before[k] for k in ("discovery_fetches", "jwks_fetches")}
+        info["20 starts"] = [starts.count(302), asked]
+        checks["20 sign-ins started in a row ask the provider for nothing: its discovery document is kept with its keys"] = \
+            starts == [302] * 20 and asked == {"discovery_fetches": 0, "jwks_fetches": 0}
+
         # 2. The whole flow for ana (made here) ends in the page's address, signed in.
         (_, _, _), (st_cb, h_cb, _) = sign_in("acme")
         frag = fragment(where(h_cb))
@@ -10659,6 +10668,16 @@ def sso_pg():
         checks["one way a connection: bo (a password) is asked for SCRAM and signs in, a name no user has too; ana's token as psycopg's password is refused once she is asked for OAUTHBEARER"] = \
             by_hand(bo, None) == {"asked": ["SCRAM-SHA-256"]} and pg_as(bo, "bo-password-1") == [(7,)] \
             and by_hand(cy, None) == {"asked": ["SCRAM-SHA-256"]} and isinstance(driver, str)
+
+        # 4a. A service's user, with tokens of its own and no password, is still asked for a password (M24 of the 10-17
+        # audit): libpq 18's OAuth can't carry a pt_ token, and its drivers were refused once OAUTHBEARER was asked.
+        made_svc = [sql(q) for q in ("CREATE USER svc", "GRANT SELECT ON t TO svc")]
+        minted = call(P, "POST", "/sql", b"CREATE TOKEN ci FOR USER svc", headers=bearer)
+        svc_t = (minted[0] if isinstance(minted, list) else minted)["token"]
+        svc_asked, svc_read = by_hand("svc", None), pg_as("svc", svc_t)
+        info["svc (tokens, no password) with POSTGRES 'oauth'"] = [made_svc, svc_asked, str(svc_read)[:160]]
+        checks["with POSTGRES 'oauth', svc (a user with a token of its own and no password) is still asked for a password, and its token as psycopg's password reads t"] = \
+            made_svc == [200, 200] and svc_asked == {"asked": "password"} and svc_read == [(7,)]
 
         # 4b. A client before libpq 18 takes SCRAM-SHA-256 from the same list, and is told the way out: psql 18 (or
         # libpq 18) with the issuer, or the provider's POSTGRES 'password'. psycopg2's libpq is 17.

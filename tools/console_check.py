@@ -49,7 +49,7 @@
 Needs: playwright (Chromium at PLAYWRIGHT_BROWSERS_PATH), nbformat, pyarrow; axe-core (npm) for the
 layout part's audit: AXE_JS, or node_modules/axe-core beside this file or in the current folder.
 """
-import argparse, gzip, io, json, os, re, shutil, statistics, subprocess, sys, tempfile, time, urllib.error, urllib.request
+import argparse, gzip, io, json, os, re, shutil, statistics, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -101,7 +101,7 @@ class Page:
 
     def __init__(self, browser, url, scheme="light", size=(1440, 900)):
         self.ctx = browser.new_context(viewport={"width": size[0], "height": size[1]}, color_scheme=scheme, accept_downloads=True)
-        self.ctx.grant_permissions(["clipboard-read", "clipboard-write"], origin=url.split("/#")[0].rstrip("/"))
+        self.ctx.grant_permissions(["clipboard-read", "clipboard-write"], origin="{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(url)))  # (the page's origin, whatever query or fragment its address carries)
         self.p = self.ctx.new_page()
         self.url, self.seen, self.errors = url, [], []
         self.p.on("request", lambda r: self.seen.append(r.url))
@@ -1879,7 +1879,7 @@ def sso_checks(browser, port):
         axe = axe_js()
         found = audit(pg.p, axe) if axe else []
         button.click()
-        back = until(lambda: (row(pg, "sso_things"), row(pg, "other_things"), pg.p.locator("#signin").inner_text(), pg.p.evaluate("location.hash"),
+        back = until(lambda: (row(pg, "sso_things"), row(pg, "other_things"), pg.p.locator("#signin").inner_text(), pg.p.evaluate("location.hash + location.search"),
                               pg.p.locator("#tokenDlg").get_attribute("open")), (1, 0, "ana@acme.com", "", None), 30)
         session = pg.p.evaluate("localStorage.getItem('pondra.token')") or ""
         pg.p.reload()
@@ -1897,13 +1897,27 @@ def sso_checks(browser, port):
         said = no.p.locator("#tokenWhy").inner_text()
         errors += no.errors
         no.ctx.close()
+        # A link that carries a session (the attacker's) or words for the dialog, with no nonce or another one: the page
+        # takes neither, and the address loses them (M20 of the 10-17 audit: login CSRF)
+        planted = {}
+        for name, frag in [("a session, no nonce", f"#pondra_session={session}&pondra_user=eve"),
+                           ("a session, a nonce this tab never kept", f"?pondra_sso=00ff#pondra_session={session}&pondra_user=eve"),
+                           ("words for the dialog", "#pondra_error=Your+password+expired:+type+it+at+evil.example")]:
+            lk = Page(browser, f"http://127.0.0.1:{port}/{frag}")
+            until(lambda: lk.p.locator("#tokenDlg").get_attribute("open") is not None, True)
+            planted[name] = (lk.p.evaluate("localStorage.getItem('pondra.token')"), "evil.example" in lk.p.locator("#tokenWhy").inner_text(),
+                             lk.p.evaluate("location.hash + location.search"), row(lk, "sso_things"))
+            errors += lk.errors
+            lk.ctx.close()
         issuer = srv.issuer.split("/", 3)[2]
         checks = {"with an identity provider, the sign-in dialog offers it (Sign in with Acme); axe finds nothing there": asked is True and offered == 1 and found == [],
                   "the page goes through the provider and comes back signed in as its user, seeing only what it may read, the session out of the address (and after a reload)":
                   back == (1, 0, "ana@acme.com", "", None) and session.startswith("ps_") and again == (1, "ana@acme.com"),
                   "a sign-in the provider refuses comes back to the dialog, saying why": why is True,
+                  "a link carrying a session (with no nonce, or one this tab never kept) or words for the dialog: the page takes neither, signs in as no one, and drops them from the address (login CSRF)":
+                  all(v == (None, False, "", 0) for v in planted.values()),
                   "signing in through a provider: requests went only to the node and the provider; no page errors": went in ([], [issuer]) and errors == []}
-        info = {"asked": asked, "offered": offered, "axe": found, "back": back, "session": session[:3], "again": again, "went": went, "said": said, "errors": errors}
+        info = {"asked": asked, "offered": offered, "axe": found, "back": back, "session": session[:3], "again": again, "went": went, "said": said, "planted": planted, "errors": errors}
         return checks, info
     finally:
         node.kill()

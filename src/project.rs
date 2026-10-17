@@ -409,14 +409,16 @@ fn given(at: &Where, toml: &Toml, env: &str) -> bool {
     at.url.is_some() || lake_of(at, toml, env).is_some() || addressed(toml, env)
 }
 
-/// The token for a node at `base`: `--token`, `PONDRA_TOKEN`, else the one `pondra login` kept for that server.
-fn token_for(at: &Where, base: &str) -> Option<String> {
-    at.token.clone().or_else(|| crate::env::get("PONDRA_TOKEN")).or_else(|| saved(base))
+/// A command's token for a node: `--token`, `PONDRA_TOKEN`, else the one `pondra login` kept for the server at
+/// `url`. Every command that talks to a node finds it this way (`pondra run`, the project's commands, `pondra
+/// workspace`), so a sign-in made once serves them all.
+pub(crate) fn token(given: Option<String>, url: Option<&str>) -> Option<String> {
+    given.or_else(|| crate::env::get("PONDRA_TOKEN")).or_else(|| url.and_then(saved))
 }
 
 /// A node at `base`, as it is. Nothing is started.
 fn node_at(at: &Where, base: String) -> Node {
-    let token = token_for(at, &base);
+    let token = token(at.token.clone(), Some(&base));
     Node { http: reqwest::Client::new(), base, token, owner: at.owner.clone().unwrap_or_default(), child: None }
 }
 
@@ -425,7 +427,7 @@ pub(crate) async fn node(at: &Where, toml: &Toml, env: &str) -> Result<Node> {
     if let Some(lake) = lake_of(at, toml, env) {
         let (mut child, base, owner, log) = crate::shell::start(&lake)?;
         let http = crate::shell::up(&base, &mut child, &log).await?;
-        return Ok(Node { http, base, token: at.token.clone().or_else(|| crate::env::get("PONDRA_TOKEN")), owner, child: Some(child) });
+        return Ok(Node { http, base, token: token(at.token.clone(), None), owner, child: Some(child) });
     }
     match address(at, toml, env) {
         Some(base) => Ok(node_at(at, base)),
@@ -530,7 +532,7 @@ fn logins() -> BTreeMap<String, String> {
 }
 
 /// The token kept for the server that `url` is on (the longest address it starts with).
-pub(crate) fn saved(url: &str) -> Option<String> {
+fn saved(url: &str) -> Option<String> {
     logins().into_iter().filter(|(s, _)| url == s || url.starts_with(&format!("{s}/"))).max_by_key(|(s, _)| s.len()).map(|(_, t)| t)
 }
 
@@ -662,7 +664,9 @@ async fn came_back(listener: &tokio::net::TcpListener) -> Result<BTreeMap<String
     loop {
         let (mut conn, _) = listener.accept().await?;
         let mut head = vec![0u8; 8192];
-        let n = conn.read(&mut head).await.unwrap_or(0);
+        // (a browser may open a connection ahead and send nothing on it: given 2 s, then answered 404, so the one
+        // that carries the code is read next)
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), conn.read(&mut head)).await.ok().and_then(Result::ok).unwrap_or(0);
         let line = String::from_utf8_lossy(&head[..n]).lines().next().unwrap_or_default().to_string();
         let target = line.split(' ').nth(1).unwrap_or_default();
         let query: BTreeMap<String, String> = target.split_once('?').map(|(_, q)| url::form_urlencoded::parse(q.as_bytes()).into_owned().collect()).unwrap_or_default();

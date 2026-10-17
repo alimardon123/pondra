@@ -102,7 +102,7 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236), literals.rs
           (an INSERT's literal rows without a session or a plan: invariant 401), casts.rs (a cast to an integer
           rounds: invariant 293), sso.rs (a company's identity provider signs people in at every door, ADR-074:
-          invariants 409, 410, 412),
+          invariants 409, 410, 412), sso_flow.rs (the browser's and `pondra login`'s way in through it: invariant 411),
           types.rs (enum types: invariant 242), and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
           237–239); learned.rs (what a run learned about its filters, ADR-050: invariant 244);
           environments (ADR-047): branch.rs (`CREATE DATABASE dev CLONE prod`, REFRESH: invariant
@@ -2693,12 +2693,26 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    node that ran it, and within a second elsewhere, as a grant does. `harness.py sso`: "Basic as ana with
    eve's token is refused…", "USERS 'any': cy@acme.com…", "…naming nosuchrole or boss (a login user)…".
 
+411. **A browser's sign-in is finished by a node, and each value the lake signs is of one kind** (`sso_flow.rs`,
+   `users::sign_for`, ADR-074 §5). The flow rides in a cookie the lake's key signs (`pondra_sso`: the database's
+   `/sso/`, HttpOnly, SameSite=Lax, ten minutes), so any node finishes a flow another started and none keeps one.
+   Its redirect address is the one the browser reached (`Peer::origin`: `Host`, HTTP/2's authority, a trusted
+   proxy's or `serve --lakes`'s word), and its ID token is checked as every token is (invariant 409), with the
+   flow's state and nonce and PKCE's verifier. A sign-in ends at a path of the node's or at the command line's
+   loopback address with a challenge, nowhere else. The page takes the session in its fragment only with the nonce
+   its tab kept when it started (`core.js`), so a link can't sign it in as someone else. The command line's code
+   goes there only once the person continues on the node's page, and redeems within a minute only with its
+   verifier. A flow, a code, a share link and a branch's key are signed under labels of their own, sessions bare
+   (`sign_for`, `signed_for`), so none passes for another. The provider's discovery document is kept with its keys
+   (`sso::discovery`), so starting sign-ins asks it nothing. `harness.py sso_flow`: "…never pass for one another…",
+   "…goes only through a page that asks first…", "20 sign-ins started in a row ask the provider for nothing…",
+   "a node serving TLS itself: the start over HTTP/2…"; `console_check.py sso`: "a link carrying a session…".
+
 412. **A lake with an identity provider is never open, and has one only at format 5** (`sso::create`,
    `users::any`). Making one writes `z/signed` in its commit (invariant 379), `users::any` counts
    providers (a list that can't be read counts as signed), and it needs every live node to know format
    5, so a 0.33 node never takes such a lake for open. `upgrade_check.py format`: "…an identity
-   provider, to 5; and Pondra 0.33.0 then refuses it by name". (411 is ADR-074 part 2's: the console's
-   redirect.)
+   provider, to 5; and Pondra 0.33.0 then refuses it by name".
 
 413. **psql 18 signs in through the provider, and a connection is asked one way** (`pg.rs`'s
    `ask_oauth` and `oauth_step`, `sso::oauth_for`, ADR-074 §4a). With `POSTGRES 'oauth'`, the Postgres
@@ -2712,8 +2726,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
      `AuthenticationOk`, never a `SASLFinal` (libpq refuses one).
    - A refusal says why.
 
-   A user with a password is asked for SCRAM. Without `'oauth'`, a user with no password is asked for
-   the token as a password, as before. libpq 18 takes the first mechanism it knows, in the server's
+   A user with a password is asked for SCRAM. A user with tokens of its own (`CREATE TOKEN … FOR USER`), a
+   service's, is asked for one as a password even with `'oauth'` (libpq 18's OAuth can't carry a `pt_` token).
+   Without `'oauth'`, a user with no password is asked for the token as a password, as before. libpq 18 takes the first mechanism it knows, in the server's
    order, and doesn't fall back: SCRAM first would be SCRAM for psql 18 too, and a password offered
    beside SASL can't be. `harness.py sso_pg` (a hand-written client, psycopg2's libpq 17, and psql 18
    when there is one); `harness.py keycloak` (psql 18's device flow, approved at Keycloak).
@@ -2799,6 +2814,7 @@ python3 tools/harness.py safety         # panics answered as errors, TLS at ever
 python3 tools/harness.py owned signed guesses   # a program's node answers only it; a lake served with tokens stays signed; failed sign-ins limited per address and name
 python3 tools/harness.py sealed         # the admin token as the master key: sealed from the first write, across nodes, rotation, the nodes' key refused
 python3 tools/harness.py first          # a node on the network with no token makes the lake's first user and prints its token once; pondra token; a follower answers no one
+python3 tools/harness.py sso sso_flow  # tokens from a provider at every door (409, 410); the browser's and pondra login's way in (411): kinds apart, the command line's confirmation, HTTP/2, starts that ask the provider nothing
 python3 tools/harness.py sso_pg         # psql 18's sign-in through a provider (POSTGRES 'oauth', OAUTHBEARER): told where it is, a token in, refusals, one way a connection
 python3 tools/harness.py keycloak       # single sign-on against a real Keycloak (PONDRA_KEYCLOAK): tokens at every door, realm roles, the console's flow, pondra login, psql 18
 python3 tools/node_check.py             # a node stopped once it serves, or while it starts, gives its term back: the next leads at once

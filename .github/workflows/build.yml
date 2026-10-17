@@ -5,7 +5,8 @@ name: build
 # and alone for the one-line installers (tools/package.py), and the packages installed and tried as
 # users get them (tools/try_packages.sh): linux-x64, linux-arm64, macOS arm64 and Windows, and macOS
 # Intel too on a version commit (the one a release tags) or a run started by hand. The website is
-# built as `pages.yml` publishes it (a pull request's when it changes `site/` or `brand/`). linux-x64
+# built as `pages.yml` publishes it (a pull request's when it changes `site/` or `brand/`), and the page
+# form's module (`web/`) built and checked when it or the core changes. linux-x64
 # is built first, on its own, and the suite then runs on its binary in parts side by side, with the
 # tests that need only it (upgrade, resilience, sharing, sso), while the other platforms finish.
 # A tag's release (release.yml) publishes this run's packages: nothing is built twice, and what
@@ -69,6 +70,7 @@ jobs:
       deploy: ${{ steps.plan.outputs.deploy }}
       wait: ${{ steps.plan.outputs.wait }}
       site: ${{ steps.plan.outputs.site }}
+      web: ${{ steps.plan.outputs.web }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -90,12 +92,12 @@ jobs:
           # macOS Intel, the slowest build by far (101 minutes on main's run 650), only where a
           # release needs it: a push that changes Cargo.toml's version (the commit a release tags), or a
           # run started by hand (release.yml starts one on a tag of any other commit).
-          intel=false
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || { [ "$GITHUB_EVENT_NAME" = push ] && git diff HEAD^1 HEAD -- Cargo.toml | grep -q '^+version = '; }; then intel=true; fi
+          release=false
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || { [ "$GITHUB_EVENT_NAME" = push ] && git diff HEAD^1 HEAD -- Cargo.toml | grep -q '^+version = '; }; then release=true; fi
           # (linux-x64 apart: the suite and the tests after the build start once it is built, and
           # never wait for the slowest platform)
           echo "linux=$(jq -c '{include: [.[] | select(.platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
-          others=$(jq -c --argjson intel "$intel" '{include: [.[] | select(.platform != "linux-x64" and ($intel or .platform != "macos-x64"))]}' <<< "$platforms")
+          others=$(jq -c --argjson release "$release" '{include: [.[] | select(.platform != "linux-x64" and ($release or .platform != "macos-x64"))]}' <<< "$platforms")
           echo "others=$others" >> "$GITHUB_OUTPUT"
           if [ "$GITHUB_EVENT_NAME" = push ]; then
             # (a run with every package this one would make, `pondra` itself among them)
@@ -104,7 +106,7 @@ jobs:
             if [ -n "$run" ]; then echo "Built and tested already: https://github.com/$GITHUB_REPOSITORY/actions/runs/$run" >> "$GITHUB_STEP_SUMMARY"; fi
           fi
           if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`): the pull request merges once it passes, and main builds the other platforms (the label \`full-ci\` builds them here first, but macOS Intel)." >> "$GITHUB_STEP_SUMMARY"; fi
-          if [ "$FULL" = true ] && [ "$intel" = false ]; then echo "macOS Intel is built on a version commit (the one a release tags) or a run started by hand." >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ "$FULL" = true ] && [ "$release" = false ]; then echo "macOS Intel is built on a version commit (the one a release tags) or a run started by hand." >> "$GITHUB_STEP_SUMMARY"; fi
           # What a change touches decides what runs: nothing for one no check reads (docs/ but its
           # surface and glossary, AGENTS.md, the benches', the soak's and other workflows' own files);
           # the unit tests when the crate or its tests change; the harness when the program, its
@@ -137,22 +139,30 @@ jobs:
           if [ "$code" = true ] || [ "$files" = ALL ] || grep -qE '^tools/[^/]+$' <<< "$(grep -vxF tools/soak.py <<< "$files")"; then harness=true; fi
           if [ "$harness" = true ] || has '^(site/|examples/|docs/(surface\.json|glossary\.md)$)'; then docs=true; fi
           if has '^(site/|brand/)|^\.github/workflows/(build|pages)\.yml$'; then site=true; fi
+          # (the page form's module, outside the crate's workspace with a lock file of its own: on main and with
+          # `full-ci` when the core under it or the module changes, so a core change that breaks it is said on its
+          # pull request, `red`, without a pull request's `ci` waiting for a wasm build)
+          web=false
+          if [ "$FULL" = true ] && has "^(src/|web/|tools/web_|Cargo\.(toml|lock)\$)|$self"; then web=true; fi
           if [ "$FULL" = true ] && has '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)'; then deploy=true; fi
           if [ "$FULL" = true ] && { [ "$code" = true ] || [ "$deploy" = true ]; }; then full=true; fi
           upgrade=false; resilience=false; sharing=false; sso=false
+          # (and the upgrade checks on a release's run too: two pull requests that passed apart are checked together
+          # before a tag, on the build the tag publishes)
+          if [ "$release" = true ]; then upgrade=true; fi
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             if has "$bin|^python/|^tools/(upgrade_check|history_check|environments_check|backup_check|git_check|project_check|fake_github|sim_r2)\.py\$|^tools/(ci_artifact\.sh|requirements\.txt)\$|^\.github/workflows/(upgrade|build)\.yml\$"; then upgrade=true; fi
             if has '^(src/|Cargo\.(toml|lock)$|python/pondra/client\.py$|js/index\.js$|tools/(resilience_check|faulty_s3|sim_r2|harness)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(resilience|build)\.yml$)'; then resilience=true; fi
             if has '^(src/(shares|sharing|vend|read_delta|delta|ext|scan|audit|server)\.rs$|tools/(sharing_check|sim_r2)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sharing|build)\.yml$)'; then sharing=true; fi
-            if has '^(src/(sso|sso_flow|users|auth|pg|flight|kafka)\.rs$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)'; then sso=true; fi
+            if has '^(src/(sso|sso_flow|users|auth|pg|flight|kafka|tls|server|dbserver|project)\.rs$|src/console/(core|settings)\.js$|python/pondra/client\.py$|js/index\.js$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)'; then sso=true; fi
           fi
           binary=false
           if [ "$GITHUB_EVENT_NAME" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ]; then binary=true; fi
           suite=$(jq -nc --argjson h "$harness" --argjson d "$docs" '{include: ((if $h then [range(1; 4) | {part: "harness, \(.) of 3", shard: "\(.)/3"}] else [] end) + (if $d then [{part: "frames, console, docs, failover"}] else [] end))}')
-          printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
-            "$binary" "$unit" "$docs" "$suite" "$site" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
+          printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\nweb=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
+            "$binary" "$unit" "$docs" "$suite" "$site" "$web" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
           runs=
-          for k in binary full unit harness docs site upgrade resilience sharing sso deploy; do
+          for k in binary full unit harness docs site web upgrade resilience sharing sso deploy; do
             if [ "${!k}" = true ]; then runs="$runs $k"; fi
           done
           echo "Runs:${runs:- nothing (no check reads what this changes)}$([ "$files" != ALL ] || echo ' (everything: started by hand, or no passed run of main found)')." >> "$GITHUB_STEP_SUMMARY"
@@ -203,6 +213,34 @@ jobs:
       - run: python3 ../tools/brand_check.py --site dist   # (its mark and favicon: brand/'s, ADR-032)
         working-directory: site
 
+  # The page form's module (web/, designs/l2-b4-web.md), built for wasm32 as tools/web_build.sh builds it, and its
+  # requests in Node checked against their answers, its sizes said (tools/web_check.mjs).
+  web:
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.wait != 'true' && needs.plan.outputs.web == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: web # (its own workspace and target folder; ~/.cargo/bin kept too, wasm-bindgen's command line in it)
+          shared-key: web
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: wasm-bindgen's command line, at web/Cargo.lock's version
+        run: |
+          v=$(grep -A1 '^name = "wasm-bindgen"$' web/Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          [ "$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')" = "$v" ] || cargo install wasm-bindgen-cli --version "$v" --locked
+      - run: bash tools/web_build.sh
+      - run: node tools/web_check.mjs --sizes
+
   # linux-x64 first, on its own: the suite and the tests after the build need its packages alone,
   # so they start once it is built, never waiting for the slowest platform.
   linux:
@@ -247,7 +285,7 @@ jobs:
           AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE: "16"
           # (only builds that ship pay for the startup layout, about 45 s more a link: tools/startup_layout.rs.
           # linux-x64's alone so far: zig's lld has linked it with the script, and arm64's hasn't been tried)
-          PONDRA_STARTUP_LAYOUT: ${{ github.event_name == 'push' && matrix.platform == 'linux-x64' && '1' || '' }}
+          PONDRA_STARTUP_LAYOUT: ${{ github.event_name != 'pull_request' && matrix.platform == 'linux-x64' && '1' || '' }}
         run: |
           if [ -n "${{ matrix.zig }}" ]; then
             pip install ziglang cargo-zigbuild
@@ -258,8 +296,9 @@ jobs:
           fi
       - run: python tools/smoke.py "$BIN" # (on this OS: the shell, SQL, and memory read without /proc)
       - name: The startup layout held # (a stale tools/startup.txt, or a build without the script: startup_order.py trace and mark it again)
-        if: matrix.platform == 'linux-x64' && github.event_name == 'push'
-        run: python tools/startup_order.py check --bin "$BIN" --most-mb 32
+        if: matrix.platform == 'linux-x64' && github.event_name != 'pull_request'
+        # (the program 26.6 MB on a0eae4f; the library, which the packages run, is reported until main has measured it)
+        run: python tools/startup_order.py check --bin "$BIN" --lib "$(dirname "$BIN")/libpondra_lib.so" --most-mb 28
       # The pip and npm packages and the installers' archive, installed and tried as on a user's
       # machine: packaging that breaks on an OS (npm is npm.cmd on Windows) shows on a push.
       - run: python tools/package.py --bin "$BIN" --platform ${{ matrix.platform }} --npm-main --out dist && bash tools/try_packages.sh ${{ matrix.platform }}
@@ -439,7 +478,7 @@ jobs:
   # its lane looks, so a platform that only main builds (the pull request merged on Linux alone) is
   # fixed at once, by whoever merged it. Also in the run's summary, and as an error.
   red:
-    needs: [plan, site, linux, build, unit, suite, resilience, upgrade, sharing, sso, deploy]
+    needs: [plan, site, web, linux, build, unit, suite, resilience, upgrade, sharing, sso, deploy]
     if: ${{ always() && github.event_name == 'push' && contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-24.04
     permissions:

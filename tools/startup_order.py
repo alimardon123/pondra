@@ -83,6 +83,20 @@ def start(cmd, port, lake, secs):
     return p
 
 
+def through_library(lake, then):
+    """A Python program that opens `lake` through the library (`pondra.connect()`), asks the first questions as a
+    node's first client does, runs `then`, and closes it."""
+    return (f"import sys, time, pondra\ndb = pondra.connect({lake!r})\n"
+            + "".join(f"db.sql({q!r})" + (".rows()" if q.startswith("SELECT") else "") + "\n" for q in FIRST)
+            + then + "db.close()\n")
+
+
+def library_env(lib):
+    """The environment that loads `lib` (`PONDRA_LIBRARY`) and this repository's Python client."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return dict(os.environ, PONDRA_LIBRARY=lib, PYTHONPATH=os.path.join(here, "..", "python"))
+
+
 def trace(a):
     names = set()
     with tempfile.TemporaryDirectory(prefix="pondra-startup-") as tmp:
@@ -98,12 +112,8 @@ def trace(a):
         print(f"program: {len(names)} functions", file=sys.stderr)
         if a.lib:
             out = f"{tmp}/library.cg"
-            here = os.path.dirname(os.path.abspath(__file__))
-            code = (f"import time, pondra\ndb = pondra.connect({tmp + '/lake2'!r})\n"
-                    + "".join(f"db.sql({q!r})" + (".rows()" if q.startswith("SELECT") else "") + "\n" for q in FIRST)
-                    + "time.sleep(5)\ndb.close()\n")
-            env = dict(os.environ, PONDRA_LIBRARY=a.lib, PYTHONPATH=os.path.join(here, "..", "python"))
-            subprocess.run(grind + [f"--callgrind-out-file={out}", sys.executable, "-c", code], env=env, check=True, timeout=1200,
+            code = through_library(tmp + "/lake2", "time.sleep(5)\n")
+            subprocess.run(grind + [f"--callgrind-out-file={out}", sys.executable, "-c", code], env=library_env(a.lib), check=True, timeout=1200,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             lib = ran(out) & defined(a.lib)
             print(f"library: {len(lib)} functions", file=sys.stderr)
@@ -178,6 +188,20 @@ def placed(binary, names):
     return inside / 2**20, outside / 2**20
 
 
+def library_code(lib, lake):
+    """MB of the library's code resident in a Python process that opened `lake` through it and asked the first
+    questions, measured as the program's is (`resident_code`), while the process waits."""
+    code = through_library(lake, "time.sleep(3)\nprint('ready', flush=True)\nsys.stdin.read()\n")
+    p = subprocess.Popen([sys.executable, "-c", code], env=library_env(lib), stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        if p.stdout.readline().strip() != "ready":
+            sys.exit("the library didn't answer its first questions through pondra.connect()")
+        return resident_code(p.pid, lib)
+    finally:
+        p.stdin.close()
+        p.wait(60)
+
+
 def check(a):
     with tempfile.TemporaryDirectory(prefix="pondra-startup-") as tmp:
         port = free_port()
@@ -189,7 +213,9 @@ def check(a):
         rss = int(open(f"/proc/{p.pid}/status").read().split("VmRSS:")[1].split()[0]) / 1024
         p.stdin.close()
         p.wait(60)
-    report = {"resident_code_mb": round(code, 1), "rss_mb": round(rss, 1)}
+        report = {"resident_code_mb": round(code, 1), "rss_mb": round(rss, 1)}
+        if a.lib:
+            report["library_resident_code_mb"] = round(library_code(a.lib, f"{tmp}/lake2"), 1)
     if a.list:
         inside, outside = placed(a.bin, patterns(a.list))
         report["listed_mb_in_startup"] = round(inside, 1)
@@ -212,6 +238,7 @@ if __name__ == "__main__":
     m.add_argument("--list", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "startup.txt"))
     c = sub.add_parser("check")
     c.add_argument("--bin", required=True)
+    c.add_argument("--lib", help="also report the library's (pondra_lib) resident code, opened through pondra.connect()")
     c.add_argument("--most-mb", type=float)
     c.add_argument("--list", help="also say where the listed functions landed (needs an unstripped build)")
     a = ap.parse_args()

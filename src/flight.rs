@@ -387,15 +387,8 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
         while let Some(queued) = acks_rx.recv().await {
             let acked = match queued {
                 Ok((ack, batch, src)) => {
-                    let mut ack = ack.await.map_err(status);
-                    // Overtaken by the batch after it (flushes can race on the way to the leader):
-                    // its predecessor is committed by now, so it goes again.
-                    for _ in 0..100 {
-                        match &ack {
-                            Ok(a) if a.conflict => ack = async { log.queue(table.clone(), src.clone(), batch.clone()).await?.await }.await.map_err(status),
-                            _ => break,
-                        }
-                    }
+                    // (overtaken by the batch after it on the way to the leader, it goes again: `Log::sent_again`)
+                    let ack = log.sent_again(ack.await, &table, &src, &batch).await.map_err(status);
                     ack.map(|a| {
                         let mut a = serde_json::to_value(a).unwrap_or_default();
                         a["rows"] = batch.num_rows().into();

@@ -467,17 +467,9 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
     async move {
         let mut first = None;
         for (ack, src, rows) in acks {
-            let mut ack = ack.await;
-            // Overtaken on its way to the leader by the batch after it (a follower's flushes race:
-            // invariant 29). This response is written only after the ones before it, so the batch
-            // before this one is committed by now, and this one goes again. Answered out of order, an
-            // idempotent producer stops for good (librdkafka: "sequence desynchronization").
-            for _ in 0..100 {
-                match &ack {
-                    Ok(Ack { conflict: true, .. }) => ack = async { log.queue(table.clone(), src.clone(), rows.clone()).await?.await }.await,
-                    _ => break,
-                }
-            }
+            // (overtaken on its way to the leader by the batch after it, it goes again: `Log::sent_again`.
+            // Answered out of order, an idempotent producer stops for good: librdkafka's "sequence desynchronization")
+            let ack = log.sent_again(ack.await, &table, &src, &rows).await;
             match ack {
                 Ok(Ack { conflict: true, .. }) => return (OUT_OF_ORDER_SEQUENCE, -1, None),
                 Ok(Ack { duplicate: true, .. }) => {} // a retry of a committed batch: success

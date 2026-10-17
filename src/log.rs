@@ -273,6 +273,21 @@ impl Log {
         self.queue(table, src, batch).await?.await
     }
 
+    /// `ack`, or, when it says the batch was overtaken on its way to the leader by the one after it (a
+    /// follower's flushes race: invariant 29), the batch sent again: its predecessor is committed by the time
+    /// this answer is read, so it goes through at once. A conflict that stays is a real gap, tried again for
+    /// at most 5 s with a pause that doubles from 10 ms, so it costs a dozen flushes (each over 64 KB writes
+    /// a segment), never a hundred. The doors that pipeline (Kafka's, Flight's) read their answers in order.
+    pub async fn sent_again(&self, mut ack: Result<Ack>, table: &str, src: &Src, batch: &RecordBatch) -> Result<Ack> {
+        let (mut pause, until) = (Duration::ZERO, Instant::now() + Duration::from_secs(5));
+        while matches!(&ack, Ok(a) if a.conflict) && Instant::now() < until {
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).clamp(Duration::from_millis(10), Duration::from_secs(1));
+            ack = self.append(table.to_string(), src.clone(), batch.clone()).await;
+        }
+        ack
+    }
+
     /// Queue rows now and get their ack later: rows queued one after another commit in that
     /// order, so a client can have several batches in flight (the Kafka protocol does).
     pub async fn queue(&self, table: String, src: Src, batch: RecordBatch) -> Result<impl std::future::Future<Output = Result<Ack>> + use<>> {
