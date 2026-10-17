@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// What the lake's key signs a node's link for (`users::sign_for`).
+const LINK: &str = "share-link";
+
 /// How long a link lasts: `PONDRA_SHARE_URL_SECS` (900, at most a week: S3's limit).
 pub fn secs() -> u64 { crate::env::or::<u64>("PONDRA_SHARE_URL_SECS", 900).clamp(1, 7 * 86400) }
 
@@ -25,7 +28,7 @@ pub async fn links(lake: &Lake, base: &str, keys: &[String], who: &str) -> Resul
             let payload = B64U.encode(serde_json::to_vec(&serde_json::json!({"k": k, "x": until, "r": who}))?);
             // (`sp`, a signed permission as Azure's links carry it: Delta's kernel reads an http link
             // as a link only when it has one of the clouds' signature parameters)
-            out.push(format!("{base}/files/{payload}?sp=r&sig={}", crate::users::sign(lake, payload.as_bytes()).await?));
+            out.push(format!("{base}/files/{payload}?sp=r&sig={}", crate::users::sign_for(lake, LINK, payload.as_bytes()).await?));
         }
         return Ok((out, until));
     };
@@ -56,7 +59,7 @@ fn signer(scheme: &str, bucket: &str) -> Result<Arc<dyn Signer>> {
 /// What a node's link names (the object, and who it was made for), if it was signed here and
 /// hasn't ended.
 pub async fn opened(lake: &Lake, payload: &str, sig: &str) -> Result<(String, String)> {
-    let want = crate::users::sign(lake, payload.as_bytes()).await?;
+    let want = crate::users::sign_for(lake, LINK, payload.as_bytes()).await?;
     ensure!(aws_lc_rs::constant_time::verify_slices_are_equal(want.as_bytes(), sig.as_bytes()).is_ok(), "a link that wasn't made here");
     let v: serde_json::Value = serde_json::from_slice(&B64U.decode(payload)?)?;
     ensure!(v["x"].as_u64().unwrap_or(0) > crate::log::now_ms(), "this link has ended: ask the sharing server for the table's files again");

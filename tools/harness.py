@@ -10332,6 +10332,26 @@ def sso_flow():
         checks["USERS 'any': cy@acme.com, with no user made here, signs in through staff with groups [analysts], and its session reads t (analysts are granted SELECT on t) and /whoami names cy"] = (
             made_staff == 200 and cy_session.startswith("ps_") and read_as(cy_session) == (200, [{"x": 1}]) and who_as(cy_session) == (200, cy))
 
+        # 3b. A flow's cookie, a code and a session never pass for one another (H1 of the 10-17 audit): before, the
+        # cookie posted as a code signed in no one at all, a code was a session for its minute, and a session posted
+        # as a code came back renewed.
+        as_json = {"content-type": "application/json"}
+        _, h_flow, _ = start(P, "staff", to="/")
+        flow_value = cookie_of(h_flow).split("=", 1)[1] if cookie_of(h_flow) else ""
+        cookie_as_code = reply(P, "POST", "/sso/token", json.dumps({"code": "pc_" + flow_value}).encode(), headers=as_json)
+        cy_verifier, cy_challenge = pkce()
+        as_user(cy, ["analysts"])
+        (_, _, _), (_, h_cy_code, _) = sign_in("staff", to="http://127.0.0.1:45678/", challenge=cy_challenge)
+        cy_code = (urllib.parse.parse_qs(urllib.parse.urlsplit(where(h_cy_code)).query).get("code") or [""])[0]
+        code_as_session = read_as("ps_" + cy_code[3:])
+        session_as_code = reply(P, "POST", "/sso/token", json.dumps({"code": "pc_" + cy_session[3:]}).encode(), headers=as_json)
+        code_redeemed = reply(P, "POST", "/sso/token", json.dumps({"code": cy_code, "verifier": cy_verifier}).encode(), headers=as_json)
+        info["kinds swapped (H1)"] = {"a flow's cookie as a code": cookie_as_code[0], "a code as a session": code_as_session[0],
+                                      "a session as a code": session_as_code[0], "the code itself": code_redeemed[0]}
+        checks["a flow's cookie, a code and a session never pass for one another (USERS 'any'): the cookie posted as a code is 401, a code used as a session (ps_) is 401, a session posted as a code (pc_) is 401, and the code itself still redeems"] = (
+            flow_value != "" and cookie_as_code[0] == 401 and cy_code.startswith("pc_") and code_as_session[0] == 401
+            and session_as_code[0] == 401 and code_redeemed[0] == 200)
+
         # 4. Flight: the same user's provider token in the handshake.
         flown = flight_as(cy, token_for(cy, {"groups": ["analysts"]}))
         info["Flight as cy (the rows, or the refusal)"] = flown if isinstance(flown, str) else [list(r) for r in flown]

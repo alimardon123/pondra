@@ -953,8 +953,20 @@ pub async fn node_key_made(lake: &Lake) -> Option<String> {
 /// How long a signed-in session lasts: `PONDRA_SESSION_HOURS` (12).
 fn session_ms() -> u64 { crate::env::parse::<f64>("PONDRA_SESSION_HOURS").map_or(12 * 3_600_000, |h| (h * 3_600_000.0) as u64) }
 
-/// `data` signed with the lake's key (base64url): what `vend.rs` puts in a file's link.
-pub async fn sign(lake: &Lake, data: &[u8]) -> Result<String> { Ok(B64U.encode(hmac256(&B64.decode(keys(lake).await?.session)?, data))) }
+/// `data` signed with the lake's key (base64url).
+async fn sign(lake: &Lake, data: &[u8]) -> Result<String> { Ok(B64U.encode(hmac256(&B64.decode(keys(lake).await?.session)?, data))) }
+
+/// `data` signed with the lake's key for one purpose: a sign-in's flow or code (`sso_flow.rs`), a share's link
+/// (`vend.rs`), a branch's key (`branch.rs`). The purpose is signed with it, so a value made for one is never
+/// taken for another, nor for a session, which alone is signed bare (`ps_`). Signed alike, a flow's cookie, a
+/// command line's code and a session each passed for the others (H1 of the 10-17 audit).
+pub async fn sign_for(lake: &Lake, purpose: &str, data: &[u8]) -> Result<String> { sign(lake, &labelled(purpose, data)).await }
+
+/// `payload` (base64url JSON) if `sig` is the lake's key's signature of it for `purpose` (`sign_for`).
+pub async fn signed_for(lake: &Lake, purpose: &str, payload: &str, sig: &str) -> Option<Value> { verified(lake, &labelled(purpose, payload.as_bytes()), payload, sig).await }
+
+/// A purpose and the data signed for it. A session's payload is base64url, which holds no newline, so none is ever one.
+fn labelled(purpose: &str, data: &[u8]) -> Vec<u8> { [purpose.as_bytes(), b"\n", data].concat() }
 
 /// A session for `user`: `ps_<payload>.<signature>`, checked by any node with the lake's key.
 pub async fn session(lake: &Lake, user: &str) -> Result<(String, u64)> { signed_session(lake, j!({"u": user})).await }
@@ -972,17 +984,18 @@ async fn signed_session(lake: &Lake, mut payload: Value) -> Result<(String, u64)
     Ok((format!("ps_{payload}.{sig}"), until))
 }
 
-/// `payload` if `sig` is the lake's key's signature of it (a session's, or a sign-in flow's: `sso_flow.rs`).
-pub async fn signed_by_lake(lake: &Lake, payload: &str, sig: &str) -> Option<Value> {
+/// `payload` (base64url JSON) if `sig` is the lake's key's signature of `data`: `payload` itself for a session,
+/// `labelled` for anything else.
+async fn verified(lake: &Lake, data: &[u8], payload: &str, sig: &str) -> Option<Value> {
     let key = B64.decode(keys(lake).await.ok()?.session).ok()?;
-    hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, &key), payload.as_bytes(), &B64U.decode(sig).ok()?).ok()?;
+    hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, &key), data, &B64U.decode(sig).ok()?).ok()?;
     serde_json::from_slice(&B64U.decode(payload).ok()?).ok()
 }
 
 /// Whom a session signs in: its user, or what its provider's sign-in claimed while that provider is there.
 async fn session_principal(lake: &Lake, token: &str) -> Option<Principal> {
     let (payload, sig) = token.strip_prefix("ps_")?.split_once('.')?;
-    let v = signed_by_lake(lake, payload, sig).await?;
+    let v = verified(lake, payload.as_bytes(), payload, sig).await?;
     let (until, user) = (v["x"].as_u64()?, v["u"].as_str()?);
     if until <= crate::log::now_ms() {
         return None;
@@ -1112,6 +1125,7 @@ pub async fn principal(lake: &Lake, user: &str) -> Result<Principal> { principal
 /// role), or one the provider vouches for (`USERS 'any'`) with public's grants; and, with either, the
 /// roles here that its roles claim names.
 pub async fn claimed(lake: &Lake, c: &crate::sso::Claimed) -> Result<Principal> {
+    ensure!(!c.user.is_empty(), "it names no user");
     ensure!(!BUILT_IN.contains(&c.user.as_str()), "it names {}, a token's name, which no identity provider signs in as", c.user);
     match lake.cat.get::<User>(&user_key(&c.user)).await? {
         Some(u) => ensure!(u.login, "{} is a role, and no one signs in as a role", c.user),
