@@ -451,7 +451,7 @@ SELECT name, definition FROM pondra.objects WHERE kind = 'index';
 it applies all or nothing, and a `job` id makes a retry a no-op. A row keeps its `_row_id` through a
 change. `MERGE` answers with the rows `updated`, `deleted` and `inserted`; a target row that matches
 two source rows is an error. `UPDATE … FROM` and `DELETE … USING` join the table to another one, and
-`ON CONFLICT` answers as `MERGE` does. In `DO UPDATE SET`, `t.column` is the row that is there and
+`ON CONFLICT` answers as `MERGE` does. `SET column = DEFAULT` sets the column's default (NULL when it has none), in an `UPDATE`, a `MERGE` and `DO UPDATE SET`. In `DO UPDATE SET`, `t.column` is the row that is there and
 `excluded.column` is the row you sent. MySQL's `ON DUPLICATE KEY UPDATE` is refused by name.
 
 ```sql

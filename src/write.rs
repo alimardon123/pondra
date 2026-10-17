@@ -276,7 +276,11 @@ impl Stmt {
     fn change_sql(&self) -> Option<String> {
         let w = |cond: &Option<String>| cond.as_ref().map(|c| format!(" WHERE {c}")).unwrap_or_default();
         match self {
-            Stmt::Update(t, set, cond) => Some(format!("UPDATE {} SET {}{}", sql_name(t), set.iter().map(|(c, e)| format!("\"{c}\" = ({e})")).collect::<Vec<_>>().join(", "), w(cond))),
+            // (a DEFAULT is written bare: `(DEFAULT)` would be read as a column, `rows_sql` takes the word)
+            Stmt::Update(t, set, cond) => Some(format!("UPDATE {} SET {}{}", sql_name(t), set.iter().map(|(c, e)| match crate::defaults::is_word(e) {
+                true => format!("\"{c}\" = DEFAULT"),
+                false => format!("\"{c}\" = ({e})"),
+            }).collect::<Vec<_>>().join(", "), w(cond))),
             Stmt::Delete(t, cond) => Some(format!("DELETE FROM {}{}", sql_name(t), w(cond))),
             Stmt::Merge(m) => Some(m.sql.clone()),
             Stmt::Insert(t, query) => Some(format!("INSERT INTO {} {query}", sql_name(t))), // (its rows checked: `constraints.rs`)
@@ -1042,9 +1046,9 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
         Stmt::Update(t, set, cond) => {
             if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", "merge tables combine rows per key: INSERT into them instead of UPDATE")); }
             ensure!(set.iter().all(|(c, _)| !meta.key.contains(c) && meta.columns.iter().any(|(n, _)| n == c)), "UPDATE sets existing non-key columns");
-            crate::seq::check_set(meta, &set.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
+            crate::seq::check_set(meta, &set.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>())?; // (SET c = DEFAULT is Postgres's for an ALWAYS identity too)
             let pick = |c: &str| match set.iter().find(|(s, _)| s == c) {
-                Some((_, e)) => format!("({e})"),
+                Some((_, e)) => format!("({})", crate::defaults::value(meta, c, e)),
                 None => q(c), // (`_deleted` too: an updated row keeps its own, as `change::select_as` does)
             };
             Ok(select(&pick, t, cond))
@@ -1127,10 +1131,10 @@ fn distinct_names(q: &mut ast::Query) {
 }
 
 /// Is this `VALUES` item the word DEFAULT (the column's default, or NULL)?
-fn is_default(e: &ast::Expr) -> bool { matches!(e, ast::Expr::Identifier(i) if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("default")) }
+fn is_default(e: &ast::Expr) -> bool { matches!(e, ast::Expr::Identifier(i) if i.quote_style.is_none() && crate::defaults::is_word(&i.value)) }
 
 /// `INSERT INTO t VALUES (…, DEFAULT, …)`: the query says DEFAULT somewhere.
-fn says_default(q: &ast::Query) -> bool { matches!(q.body.as_ref(), ast::SetExpr::Values(v) if v.rows.iter().any(|r| r.iter().any(is_default))) }
+pub(crate) fn says_default(q: &ast::Query) -> bool { matches!(q.body.as_ref(), ast::SetExpr::Values(v) if v.rows.iter().any(|r| r.iter().any(is_default))) }
 
 /// `INSERT INTO table (names) query` as a query of all its `columns`, in order (`whole_rows`; a
 /// temporary table's too, `temp.rs`).
@@ -1792,7 +1796,7 @@ pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> 
     let lake = other.as_deref().unwrap_or(lake);
     let meta = lake.cat.get::<TableMeta>(&table_key(&table)).await?;
     if let (Stmt::Update(_, set, _), Some(m)) = (stmt, &meta) {
-        crate::seq::check_set(&m.logical(), &set.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
+        crate::seq::check_set(&m.logical(), &set.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
     }
     // (a table with an enforced UNIQUE: every write is checked on the leader, `constraints.rs`; a
     // keyed table's plain INSERT too, since its key must be new)
