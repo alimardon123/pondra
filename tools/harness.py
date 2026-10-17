@@ -6708,7 +6708,7 @@ def temps():
     shown = [rows("SHOW CREATE VIEW mine"), rows("SHOW CREATE TABLE picked"), _raises_text(lambda: rows("SHOW CREATE VIEW mine", other))]
     checks["SHOW CREATE of a session's temporary view or table makes it again, over HTTP and Postgres; another session's isn't shown"] = \
         shown[0][0]["definition"].startswith("CREATE TEMPORARY VIEW mine AS SELECT") and "picked" in shown[0][0]["definition"] and \
-        shown[1][0]["definition"].startswith("CREATE TEMPORARY TABLE picked (id BIGINT, note ") and "no view mine" in shown[2] and \
+        shown[1][0]["definition"].startswith("CREATE TEMPORARY TABLE picked (\n  id BIGINT,\n  note ") and "no view mine" in shown[2] and \
         shown_pg[0][0] == "CREATE TEMPORARY VIEW tv1 AS SELECT a FROM t1;"
     session = db.session
     db.close()
@@ -6735,8 +6735,10 @@ def _temps_typed(checks, port):
     Postgres prints it (an upper-case uuid in lower case, JSON as written). A temporary view is read with the door's
     rewrites, as a stored view is: its `||` over jsonb merges the objects, as Postgres does, not the two texts joined.
     A Postgres connection's temporary table sends its uuid column as a uuid (`pg_types::of`). SHOW CREATE gives each
-    column's type. Every expected answer is Postgres 16's, from a probe of these statements on /tmp/pg16-l3."""
+    column's type. Its NOT NULL, DEFAULT and CHECK are kept and checked as a lake table's are (`temp::create`, `temp::apply`),
+    and a write a DEFAULT leaves out takes it. Every expected answer is Postgres 16's, from a probe of these statements on /tmp/pg16-l3."""
     import psycopg
+    before = len(checks)  # (this function's checks are the last ones: what fails is printed below)
     db = _client(port)
 
     def refused(s):  # (SQLSTATE and words of the error a statement gets over HTTP; None when it is taken)
@@ -6780,8 +6782,38 @@ def _temps_typed(checks, port):
             port_refused = None
         except psycopg.Error as e:
             port_refused = e.sqlstate
+        pg.execute("CREATE TEMP TABLE tpn (a INT NOT NULL)")  # (NOT NULL over the port, and the catalog, in this connection)
+        try:
+            pg.execute("INSERT INTO tpn (a) VALUES (NULL)")
+            port_not_null = None
+        except psycopg.Error as e:
+            port_not_null = e.sqlstate
+        port_nullable = pg.execute("SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name = 'tpn' ORDER BY ordinal_position").fetchall()
+    # NOT NULL, DEFAULT and CHECK: Postgres 16's SQLSTATEs (None: taken), the refused statements writing nothing, the rows
+    db.sql("CREATE TEMP TABLE tcons (a INT NOT NULL, b INT DEFAULT 7, c INT CHECK (c > 0), d TEXT DEFAULT 'x' || 'y')")
+    cons = [
+        ("INSERT INTO tcons (a) VALUES (NULL)", "23502"),
+        ("INSERT INTO tcons (a, c) VALUES (1, -5)", "23514"),
+        ("INSERT INTO tcons (a) VALUES (2)", None),
+        ("INSERT INTO tcons VALUES (3, DEFAULT, 5, DEFAULT)", None),
+        ("INSERT INTO tcons (a, c) SELECT 4, 6", None),
+        ("INSERT INTO tcons (b) SELECT 1", "23502"),
+        ("UPDATE tcons SET a = NULL WHERE a = 2", "23502"),
+        ("UPDATE tcons SET c = -1 WHERE a = 2", "23514"),
+    ]
+    cons_got = [refused(s) for s, _ in cons]
+    cons_ok = all((g is None) if want is None else (g is not None and g[0] == want) for g, (_, want) in zip(cons_got, cons))
+    cons_back = [(r["a"], r["b"], r["c"], r["d"]) for r in db.sql("SELECT a, b, c, d FROM tcons ORDER BY a").rows()]
+    shown_cons = db.sql("SHOW CREATE TABLE tcons").rows()[0]["definition"]
+    cons_info = {"got": cons_got, "rows": cons_back, "shown": shown_cons, "port": [port_not_null, port_nullable]}
+    checks["a temporary table's NOT NULL and CHECK refuse what a lake table's do (SQLSTATE 23502, 23514; nothing written), and a DEFAULT fills what a write leaves out"] = \
+        cons_ok and cons_back == [(2, 7, None, "xy"), (3, 7, 5, "xy"), (4, 7, 6, "xy")]
+    checks["SHOW CREATE of a temporary table keeps NOT NULL, DEFAULT and CHECK"] = \
+        shown_cons.startswith("CREATE TEMPORARY TABLE tcons") and "NOT NULL" in shown_cons and "DEFAULT 7" in shown_cons and "CHECK (" in shown_cons
+    checks["a Postgres connection's temporary table: NOT NULL refused 23502, and the catalog says the column is NOT NULL, with no _deleted"] = \
+        port_not_null == "23502" and port_nullable == [("a", "NO")]
     db.close()
-    info = {"refusals": got, "back": back, "count": count, "merged": merged, "shown": shown, "port": [repr(row), port_refused]}
+    info = {"refusals": got, "back": back, "count": count, "merged": merged, "shown": shown, "port": [repr(row), port_refused], "constraints": cons_info}
     checks["a temporary table's uuid, JSON, JSONB and VARCHAR(n) columns refuse what they can't hold by INSERT, INSERT … SELECT and UPDATE (Postgres's SQLSTATE and words, nothing written), and keep a good value as Postgres prints it"] = \
         refusals_ok and back == [{"doc": '{"a": 1, "b": 2}', "j": "[1, 2]", "u": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "v": "abc"}] and count == [{"n": 1}]
     checks["a temporary view's || over a temporary table's jsonb merges the objects, as Postgres does (not the two texts joined)"] = \
@@ -6790,7 +6822,7 @@ def _temps_typed(checks, port):
         all(w in shown for w in ("doc JSONB", "j JSON", "u UUID", "v VARCHAR(3)"))
     checks["a Postgres connection's temporary table: an upper-case uuid reads back as a uuid, a bad JSON is refused 22P02"] = \
         type(row[0]).__name__ == "UUID" and str(row[0]) == "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" and row[1] == {"a": 1} and port_refused == "22P02"
-    if not all(checks[k] for k in list(checks)[-4:]):
+    if not all(list(checks.values())[before:]):
         print(json.dumps(info, indent=1, default=str))
 
 

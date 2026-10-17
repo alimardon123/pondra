@@ -69,7 +69,7 @@ enum TableSpec {
 
 /// A table's definition refused: invalid_table_definition (42P16) unless the error says its own
 /// code, never an internal error (XX000, which HTTP answers 500).
-fn definition(e: anyhow::Error) -> anyhow::Error {
+pub(crate) fn definition(e: anyhow::Error) -> anyhow::Error {
     match crate::codes::of(&e) {
         "XX000" => crate::codes::coded("42P16", format!("{e:#}")),
         _ => e,
@@ -124,18 +124,13 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text (a column of the table, of type VARCHAR)");
         }
         for (c, expr) in &defaults {
-            let t = &columns.iter().find(|(n, _)| n == c).expect("a column").1;
             ensure!(!identity.contains_key(c), "{c} is an identity column: its values come from its sequence, not a DEFAULT");
-            crate::defaults::validate(c, t, expr).await?;
             crate::seq::named_exist(lake, expr).await?; // (DEFAULT nextval('s'): s is there)
         }
         if let Some((c, t)) = columns.iter().find(|(c, t)| identity.contains_key(c) && !["Int16", "Int32", "Int64"].contains(&t.as_str())) {
             bail!("{c} is an identity column: it counts in smallint, integer or bigint, not {t}");
         }
-        let empty = RecordBatch::new_empty(schema(&columns)?);
-        for (n, c) in &checks {
-            crate::defaults::breaking(&empty, c).with_context(|| format!("CONSTRAINT {n} CHECK ({c})"))?; // (a condition over its columns)
-        }
+        crate::defaults::definition(&columns, &defaults, &checks).await?; // (a DEFAULT, a CHECK: as a temporary table's are)
         Ok((retention, columns, ttl))
     }
     .await

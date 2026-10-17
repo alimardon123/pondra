@@ -362,6 +362,29 @@ async fn log_rows(lake: &Lake, metas: &[(String, TableMeta)]) -> Result<BTreeMap
     Ok(out)
 }
 
+/// A table's columns as Postgres's catalog shows them: name, type, NOT NULL and the default it shows. A keyed table's
+/// `_deleted` is left out, as `SELECT *` leaves it out. A lake table's and a temporary table's alike.
+fn table_columns(l: &TableMeta) -> Vec<(String, DataType, bool, Option<String>)> {
+    let shown = |c: &String| c != "_deleted" || l.key.is_empty(); // (as `SELECT *` shows it)
+    l.columns.iter().filter(|(c, _)| shown(c)).map(|(c, t)| {
+        let t = crate::query::dtype(t).unwrap_or(DataType::Utf8);
+        // (an identity column's default is its sequence: Postgres keeps no default for it in its catalog)
+        let default = l.defaults.get(c).filter(|_| !l.identity.contains_key(c)).map(|d| shown_default(d, &t));
+        (c.clone(), t, l.not_null.contains(c), default)
+    }).collect()
+}
+
+/// The columns whose type their Arrow type doesn't say: a uuid, JSON, JSONB or VARCHAR(n) column (`types.rs`), as
+/// Postgres types them. Enum columns are the lake's own (`lakes`).
+fn held_types(l: &TableMeta) -> impl Iterator<Item = (String, (u32, i32))> + '_ {
+    l.sql_types.iter().filter_map(|(c, t)| match t.as_str() {
+        "uuid" => Some((c.clone(), (UUID, -1))),
+        "json" => Some((c.clone(), (JSON, -1))),
+        "jsonb" => Some((c.clone(), (JSONB, -1))),
+        t => crate::types::length(t).map(|n| (c.clone(), (1043, n as i32 + 4))),
+    })
+}
+
 async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<Lakes> {
     let schemas = crate::ddl::schemas(lake).await?;
     // (a materialized view's query as it was written: `pg_matviews.definition` and `pg_get_viewdef`, as `View::query` gives it)
@@ -383,13 +406,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         }
         let (schema, table) = crate::ddl::split(name);
         let l = m.described(); // (a view that finishes its answers: those columns)
-        let shown = |c: &String| c != "_deleted" || l.key.is_empty(); // (as `SELECT *` shows it)
-        let cols = l.columns.iter().filter(|(c, _)| shown(c)).map(|(c, t)| {
-            let t = crate::query::dtype(t).unwrap_or(DataType::Utf8);
-            // (an identity column's default is its sequence: Postgres keeps no default for it in its catalog)
-            let default = l.defaults.get(c).filter(|_| !l.identity.contains_key(c)).map(|d| shown_default(d, &t));
-            (c.clone(), t, l.not_null.contains(c), default)
-        }).collect();
+        let cols = table_columns(&l);
         let (rows, bytes) = m.files.iter().fold((0, 0), |(r, b), f| (r + f.rows, b + f.bytes));
         let sealed = m.sealed.clone().unwrap_or_default();
         let kind = if mvs.contains_key(name) { 'm' } else { 'r' };
@@ -399,13 +416,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
             let t = oid("ty", e.of.as_deref()?);
             types.iter().any(|x| x.oid == t).then(|| (c.clone(), (t, -1)))
         });
-        let held = l.sql_types.iter().filter_map(|(c, t)| match t.as_str() {
-            "uuid" => Some((c.clone(), (UUID, -1))),
-            "json" => Some((c.clone(), (JSON, -1))),
-            "jsonb" => Some((c.clone(), (JSONB, -1))),
-            t => crate::types::length(t).map(|n| (c.clone(), (1043, n as i32 + 4))),
-        });
-        let typed = enums.chain(held).collect();
+        let typed = enums.chain(held_types(&l)).collect();
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = l.columns.iter().filter_map(|(c, _)| Some((c.clone(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
         rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: mvs.get(name).cloned(), identity: l.identity.clone(), constraints: l.constraints.clone(), checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
@@ -449,9 +460,9 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
     }
     // The session's own temporary tables and views, in its temporary schema (as Postgres has them).
     let (temp_tables, temp_views) = crate::temp::listed();
-    for (name, cols) in temp_tables {
-        let cols = cols.iter().map(|(c, t)| (c.clone(), crate::query::dtype(t).unwrap_or(DataType::Utf8), false, None)).collect();
-        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'r', columns: cols, key: vec![], sql: None, identity: Default::default(), constraints: vec![], checks: vec![], typed: BTreeMap::new(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });
+    for (name, meta) in temp_tables {
+        // (a temporary table is shown as a lake table is: its key, NOT NULL, defaults and checks)
+        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'r', columns: table_columns(&meta), key: meta.key.clone(), sql: None, identity: Default::default(), constraints: vec![], checks: meta.checks.clone(), typed: held_types(&meta).collect(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });
     }
     for (name, sql) in temp_views {
         rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'v', columns: vec![], key: vec![], sql: Some(sql), identity: Default::default(), constraints: vec![], checks: vec![], typed: BTreeMap::new(), comment: None, comments: BTreeMap::new(), rows: 0, bytes: 0 });

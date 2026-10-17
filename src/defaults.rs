@@ -81,6 +81,21 @@ pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
     Ok(b.iter().map(|v| Some(v == Some(false))).collect())
 }
 
+/// A table's DEFAULTs and CHECKs, checked as its CREATE checks them: a default gives one value of its column's type,
+/// and a CHECK is a condition over the table's columns. A lake table's CREATE (`write::create_table`) and a temporary
+/// table's (`temp::create`) make the same calls, so both refuse the same definitions.
+pub async fn definition(columns: &[(String, String)], defaults: &std::collections::BTreeMap<String, String>, checks: &[(String, String)]) -> Result<()> {
+    for (c, expr) in defaults {
+        let t = &columns.iter().find(|(n, _)| n == c).with_context(|| format!("column \"{c}\" does not exist"))?.1;
+        validate(c, t, expr).await?;
+    }
+    let empty = RecordBatch::new_empty(crate::query::schema(columns)?);
+    for (n, c) in checks {
+        breaking(&empty, c).with_context(|| format!("CONSTRAINT {n} CHECK ({c})"))?;
+    }
+    Ok(())
+}
+
 /// A bulk INSERT's rows (under their stored names), checked as they stream into files.
 pub fn checked(rows: datafusion::execution::SendableRecordBatchStream, meta: &Option<TableMeta>, table: &str) -> datafusion::execution::SendableRecordBatchStream {
     use futures::StreamExt;
