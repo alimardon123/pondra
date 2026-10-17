@@ -3546,8 +3546,8 @@ def scale():
     subprocess.run([BIN, "sql", "--dir", wlake, f"INSERT INTO ws1 SELECT 0, {long_string} FROM generate_series(1, 9000000)"], check=True, capture_output=True, timeout=900)
     subprocess.run([BIN, "sql", "--dir", wlake, f"INSERT INTO ws3 SELECT value % 3, {long_string} FROM generate_series(1, 6000000)"], check=True, capture_output=True, timeout=900)
     wport = port + 20
-    def windowed(table):
-        node = Node(wlake, wport, memory_gb=0.25, env={"PONDRA_CORES": "4", "PONDRA_MEMORY_MAX_GB": "1"}).start()
+    def windowed(table, env=None):
+        node = Node(wlake, wport, memory_gb=0.25, env={"PONDRA_CORES": "4", "PONDRA_MEMORY_MAX_GB": "1", **(env or {})}).start()
         out = {}
         try:
             try:
@@ -3558,7 +3558,7 @@ def scale():
         finally:
             node.kill()
         return out
-    window_strings = windowed("ws1")
+    window_strings = windowed("ws1", {"PONDRA_SPILL_GB": "3"})  # (the spill cap is 3 GB: the check passes or fails the same on any disk with that room)
     window_share = windowed("ws3")
     checks[f"a rank() over one partition of 9M long strings streams: 1 answered, its peak {window_strings['peak_mb']} MB under the 1 GB line"] = (
         window_strings["answer"] == [{"n": 1}] and window_strings["peak_mb"] < 1 << 10)
