@@ -1,8 +1,9 @@
 //! Planning rules Pondra adds to DataFusion's, and the engine settings it starts from.
-use datafusion::arrow::datatypes::{i256, DataType};
+use datafusion::arrow::datatypes::{i256, DataType, Field};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchema, NullEquality, Result, ScalarValue};
 use datafusion::logical_expr::utils::{can_hash, conjunction, disjunction, find_valid_equijoin_key_pair, split_binary, split_conjunction};
+use datafusion::logical_expr::logical_plan::Values;
 use datafusion::logical_expr::{ExprSchemable, build_join_schema, Aggregate, Expr, Filter, Join, JoinConstraint, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, Projection, SubqueryAlias};
 use datafusion::optimizer::{analyzer::{Analyzer, AnalyzerRule}, optimizer::ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 use datafusion::common::config::ConfigOptions;
@@ -159,25 +160,50 @@ impl AnalyzerRule for WholeLiterals {
             let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan); // (a column keeps the name its expression gave it)
             let t = plan.map_expressions(|e| {
                 let name = names.save(&e);
-                Ok(e.transform_up(|e| match e {
-                    Expr::Literal(v, m) => Ok(match whole(&v) {
-                        Some(w) => Transformed::yes(Expr::Literal(w, m)),
-                        None => Transformed::no(Expr::Literal(v, m)),
-                    }),
-                    e => Ok(Transformed::no(e)),
-                })?
-                .update_data(|e| name.restore(e)))
+                Ok(Transformed::yes(name.restore(whole_literals(e)?))) // (`has`: this node holds a whole literal, so it changes)
             })?;
-            if t.transformed { t.map_data(|p| p.recompute_schema()) } else { Ok(t) } // (a node above reads the types its columns have now)
+            if t.transformed { t.map_data(settled) } else { Ok(t) } // (a node above reads the types its columns have now)
         })
         .data()
     }
 }
 
+/// A plan node once its expressions changed, with the schema they now give. DataFusion keeps a VALUES node's schema as
+/// it was (`recompute_schema` says it isn't clear why), so a VALUES is typed again as DataFusion types one
+/// (`LogicalPlanBuilder::values`: the widest type of each column, the rows cast to it), under the names it had.
+fn settled(plan: LogicalPlan) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::Values(old) => {
+            let typed = match LogicalPlanBuilder::values(old.values)?.build()? {
+                LogicalPlan::Values(typed) => typed,
+                _ => unreachable!("LogicalPlanBuilder::values makes a VALUES list"),
+            };
+            let fields: Vec<Field> = typed.schema.fields().iter().zip(old.schema.fields().iter()).map(|(t, o)| Field::new(o.name(), t.data_type().clone(), t.is_nullable())).collect();
+            let schema = DFSchema::from_unqualified_fields(fields.into(), old.schema.metadata().clone())?;
+            Ok(LogicalPlan::Values(Values { schema: Arc::new(schema), values: typed.values }))
+        }
+        plan => plan.recompute_schema(),
+    }
+}
+
+/// `whole` for every literal of an expression, as `WholeLiterals` gives a plan's. For an expression
+/// that plans with no analyzer of its own (a DEFAULT or a CHECK, a Python table function's arguments,
+/// a literal read by `literals.rs`), so `1e15` is the same number there as in a planned query.
+pub(crate) fn whole_literals(e: Expr) -> Result<Expr> {
+    e.transform_up(|e| match e {
+        Expr::Literal(v, m) => Ok(match whole(&v) {
+            Some(w) => Transformed::yes(Expr::Literal(w, m)),
+            None => Transformed::no(Expr::Literal(v, m)),
+        }),
+        e => Ok(Transformed::no(e)),
+    })
+    .data()
+}
+
 /// The whole number a decimal literal with a negative scale stands for, at scale 0 (a NULL of that
 /// type too). `None` for any other literal, and for a float's text that won't parse: those stay as
 /// they were.
-fn whole(v: &ScalarValue) -> Option<ScalarValue> {
+pub(crate) fn whole(v: &ScalarValue) -> Option<ScalarValue> {
     let (digits, k) = match v {
         ScalarValue::Decimal128(_, p, s) | ScalarValue::Decimal256(_, p, s) if *s < 0 => (u32::from(*p), u32::from(s.unsigned_abs())),
         _ => return None,
@@ -239,7 +265,7 @@ impl AnalyzerRule for FloatsWin {
                     let name = names.save(&e);
                     Ok(e.transform_up(|e| expr_floats(e, &schema))?.update_data(|e| name.restore(e)))
                 })?;
-                if t.transformed { t.map_data(|p| p.recompute_schema()) } else { Ok(t) } // (a node above reads the types its columns have now)
+                if t.transformed { t.map_data(settled) } else { Ok(t) } // (a node above reads the types its columns have now)
             })
         })
         .data()

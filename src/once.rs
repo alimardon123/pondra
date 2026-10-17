@@ -267,7 +267,7 @@ async fn planned(lake: &Lake, source: &str, o: &Once) -> Result<Planned> {
     let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(&o.time, t, true)]));
     let df = datafusion::common::DFSchema::try_from(schema.as_ref().clone())?;
     let ctx = crate::query::session(lake, "", "").await?;
-    let e = ctx.parse_sql_expr(&o.bucket, &df)?;
+    let e = ctx.parse_sql_expr(&o.bucket, &df).and_then(crate::optimize::whole_literals)?;
     let p = (ctx.create_physical_expr(e, &df)?, schema);
     PLANNED.lock().unwrap().insert(key, p.clone());
     Ok(p)

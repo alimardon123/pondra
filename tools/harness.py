@@ -7806,6 +7806,31 @@ def found():
     want = [{"lo": 1000000000000000, "hi": 1000000000000000, "n": 2}]
     seen["exps_fed"] = until(lambda: _try(lambda: q("SELECT min(y) AS lo, max(y) AS hi, count(*) AS n FROM exps_fed")), want, 30)
     checks["a view fed by a topic with 1e15 fills with 1000000000000000 (two records)"] = seen["exps_fed"] == want
+    # 1e15 is the whole number on every path that reads a literal (`optimize::whole_literals`, invariant 415): the fast INSERT of
+    # VALUES (`literals.rs`), a session's DECLARE (`vars.rs`), a DEFAULT and a one-key UPDATE's value (`defaults.rs`, `txn.rs`).
+    # (Each step is `_try`: on a build without the fix a step fails, and its check is false, not the harness.)
+    _try(lambda: q("CREATE TABLE e (d DOUBLE, n DECIMAL(20, 0), b BIGINT)"))
+    _try(lambda: q("INSERT INTO e VALUES (1e15, 1e15, 1e15)"))
+    _try(lambda: q("INSERT INTO e SELECT 1e15, 1e15, 1e15"))
+    seen["e_rows"] = _try(lambda: q("SELECT d, n, b, d = 1000000000000000.0 AS exact FROM e ORDER BY b"))
+    checks["INSERT … VALUES (1e15) and INSERT … SELECT 1e15 store the same whole number: a DOUBLE exactly 1e15, a DECIMAL and a BIGINT too"] = \
+        seen["e_rows"] == [{"d": 1e15, "n": 1000000000000000, "b": 1000000000000000, "exact": True}] * 2
+    found_s = {"x-pondra-session": "harness-found-1e15"}
+    qs = lambda t: call(port, "POST", "/sql", t.encode(), headers=found_s)
+    _try(lambda: qs("DECLARE $x = 1e15"))
+    _try(lambda: qs("CREATE TABLE e2 AS SELECT $x AS x"))
+    seen["e2"] = _try(lambda: qs("SELECT x = 1e15 AS same FROM e2"))
+    checks["DECLARE $x = 1e15, then CREATE TABLE e2 AS SELECT $x AS x writes (no Parquet error), and x = 1e15 is true"] = \
+        seen["e2"] == [{"same": True}]
+    _try(lambda: q("CREATE TABLE ek (k BIGINT PRIMARY KEY, d DOUBLE)"))
+    _try(lambda: q("INSERT INTO ek VALUES (1, 2.5)"))
+    _try(lambda: q("UPDATE ek SET d = 1e15 WHERE k = 1"))
+    seen["ek"] = _try(lambda: q("SELECT d FROM ek"))
+    checks["UPDATE of a keyed table's DOUBLE to 1e15 by its key reads exactly 1e15"] = seen["ek"] == [{"d": 1e15}]
+    _try(lambda: q("CREATE TABLE ed (id BIGINT, d DOUBLE DEFAULT 1e15)"))
+    _try(lambda: q("INSERT INTO ed (id) VALUES (1)"))
+    seen["ed"] = _try(lambda: q("SELECT d FROM ed"))
+    checks["a column DEFAULT 1e15 on a DOUBLE reads exactly 1e15"] = seen["ed"] == [{"d": 1e15}]
     node.kill(); locked.kill()
     ok = all(checks.values())
     print(json.dumps({"found": checks, "ok": ok}, indent=1))

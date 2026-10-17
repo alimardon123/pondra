@@ -328,7 +328,10 @@ async fn folded(lake: &crate::store::Lake, sql: &str) -> Option<Vec<RecordBatch>
     if sql.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"from")) {
         return None; // (a table or a subquery's)
     }
-    let plan = lake.session_with(1).state().create_logical_plan(sql).await.ok()?;
+    let state = lake.session_with(1).state();
+    let plan = state.create_logical_plan(sql).await.ok()?;
+    // (the analyzer runs as a query's does: `WholeLiterals` and type coercion, so `1e15` is the number a query gives; `query::run_schema` says the same)
+    let plan = state.analyzer().execute_and_check(plan, state.config_options(), |_, _| {}).ok()?;
     let simplifier = ExprSimplifier::new(SimplifyContext::builder().with_current_time().build());
     let literal = |e: &Expr| match simplifier.simplify(e.clone().unalias()).ok()? {
         Expr::Literal(v, _) => Some(v),
