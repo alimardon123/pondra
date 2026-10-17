@@ -895,7 +895,7 @@ pub(crate) fn write(out: &mut String, node: &Node) -> Option<()> {
     match node {
         Node::Null => out.push_str("null"),
         Node::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Node::Number(text) => out.push_str(&numeric(text)?),
+        Node::Number(text) => number_into(out, text)?,
         Node::Text(s) => json_string(out, s),
         Node::List(items) => {
             out.push('[');
@@ -925,6 +925,19 @@ pub(crate) fn write(out: &mut String, node: &Node) -> Option<()> {
 
 /// The most digits a shift may make (`numeric` holds 131,072 before its point); a larger exponent is refused.
 const MAX_SHIFT: u64 = 131_072;
+
+/// A JSON number as jsonb writes it, into `out`. A plain number (no exponent, at most `MAX_SHIFT` bytes) is written as
+/// it is, since `numeric` prints such a number as written, except that a zero loses its sign (`numeric` has no `-0`).
+/// Anything else goes through `numeric`.
+fn number_into(out: &mut String, json: &str) -> Option<()> {
+    if json.len() as u64 <= MAX_SHIFT && !json.contains(['e', 'E']) {
+        let zero = json.bytes().all(|b| b == b'-' || b == b'.' || b == b'0');
+        out.push_str(if zero { json.trim_start_matches('-') } else { json });
+        return Some(());
+    }
+    out.push_str(&numeric(json)?);
+    Some(())
+}
 
 /// A JSON number's text as Postgres's `numeric` prints it: plain digits, never an exponent. Its scale is the digits
 /// after the point less the exponent, never below 0 (`1.50e-1` is `0.150`, `1e2` is `100`), and a zero has no sign.

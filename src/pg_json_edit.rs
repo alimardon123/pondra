@@ -671,6 +671,27 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_is_taken_to_10000_levels_and_refused_past_it() {
+        // (an 8 MB thread, as a request has: the reader, the edit and the writer each recurse once per level)
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                use crate::pg_json_make::MAX_DEPTH;
+                let nested = |n: usize| format!("{}0{}", "[".repeat(n), "]".repeat(n));
+                // the path's last step names the innermost array's element
+                let at = vec![Some("0".to_string()); MAX_DEPTH];
+                let answer_of = format!("{}9{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+                let edited = answer(|out| edit_doc(out, &nested(MAX_DEPTH), &at, Edit::Set { value: parse("9")?, create: true }));
+                assert_eq!(edited.unwrap(), answer_of);
+                let past = answer(|out| edit_doc(out, &nested(MAX_DEPTH + 1), &at, Edit::Delete));
+                assert_eq!(refused(past), "54001", "nested past the limit");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn the_functions_are_named_as_postgres_names_them() {
         let names: Vec<&str> = FUNCTIONS.iter().map(|f| f.name()).collect();
         for name in ["jsonb_set", "jsonb_insert", "jsonb_concat", "jsonb_delete", "jsonb_delete_path", "jsonb_strip_nulls", "json_strip_nulls", "jsonb_pretty"] {
