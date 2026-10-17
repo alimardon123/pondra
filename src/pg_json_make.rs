@@ -1,16 +1,15 @@
 //! Postgres's functions that make JSON from values: `to_json`, `to_jsonb`, `row_to_json`, `json_build_object`,
 //! `jsonb_build_object`, `json_build_array`, `jsonb_build_array`, and the scalar forms of the aggregates
 //! (`pondra_json_agg(list, kind)` is what a later step makes `json_agg(x)` into: `array_agg(x)` and the kind of its
-//! elements). Each answer is text marked as JSON (`pg_types::MARK`: "json", or "jsonb" for the `jsonb_*` ones),
+//! elements). Each answer is text marked as JSON (`pg_functions::MARK`: "json", or "jsonb" for the `jsonb_*` ones),
 //! so the port sends it as json, and a function given another's answer writes it as it is. Text without the mark is a
 //! string and is quoted. The text is Postgres 16's, down to the spaces and the digits of a float (`json.c`, `jsonb.c`).
 //! `jsonb_text` is jsonb's own output: keys sorted, numbers as `numeric` prints them, and every `jsonb_*` answer goes
 //! through it. `pondra_as_jsonb` and `pondra_jsonb` (types.rs) answer the same way.
 use crate::codes::{coded, Coded};
-use crate::pg_json::is_text;
-use crate::pg_types::MARK;
-use crate::types::json_refusal;
-use crate::pg_values::{interval_text, time_text};
+use crate::pg_functions::MARK;
+use crate::pg_json::{is_text, json_refusal};
+use crate::pg_text::{interval_text, time_text};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
 use datafusion::arrow::compute::cast;
@@ -36,7 +35,7 @@ use std::cmp::Ordering;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-/// Adds the functions to a session. `pg_json::register` calls it, so they are in every session.
+/// Adds the functions to a session. `pg_json::register` calls it, so they are in every session (`engine::session`).
 pub fn register(ctx: &SessionContext) {
     let one = || Signature::any(1, Volatility::Immutable);
     let two = || Signature::any(2, Volatility::Immutable);

@@ -4,11 +4,10 @@
 //! comes in (`sets`), a call in a SELECT list becomes `unnest` of that list, a call in a FROM a derived table of its
 //! rows, and each place Postgres refuses a call is refused by Postgres's words and SQLSTATE before anything changes.
 use crate::codes::coded;
-use crate::pg_catalog::{function, text_arg};
-use crate::pg_json::{answer, kind, opened, JSON_SPACE};
+use crate::pg_functions::{function, text_arg};
+use crate::pg_json::{answer, json_refusal, kind, opened, JSON_SPACE};
 use crate::pg_json_make::fail;
-use crate::pg_types::names_kept;
-use crate::types::json_refusal;
+use crate::text::names_kept;
 use datafusion::arrow::array::{ArrayRef, ListArray, StringArray, StructArray};
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields};

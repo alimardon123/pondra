@@ -14,13 +14,14 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::sql::sqlparser::ast::{self, Expr, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value, Visit, VisitMut, WildcardAdditionalOptions};
+use datafusion::sql::sqlparser::ast::{self, Expr, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value, Visit, WildcardAdditionalOptions};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 
 use crate::codes::coded;
+use crate::pg_functions::MARK;
 use crate::pg_names;
 use crate::store::{table_key, Lake};
-use crate::text::{ident, object};
+use crate::text::{at, ident, names_kept, object};
 
 // The JSON makers: the functions that make JSON from values (`pg_json_make.rs`). A statement that calls one has its
 // arguments changed where SQL comes in (`rewritten`): a JSON argument is marked as its type prints it, a whole row is
@@ -61,9 +62,6 @@ struct Whole {
 /// The first character of an item's name when the item has no name of its own (an expression, which Postgres names by
 /// its function or gives `?column?`). No identifier holds a NUL, so a lookup never finds such a name; the text follows it.
 const UNNAMED: char = '\0';
-
-/// The field metadata that marks an answer's uuid column: the port reads it, other doors pass it by.
-pub const MARK: &str = "pg_type";
 
 /// A Postgres type the lake holds as text, which the port names: `TableMeta::sql_types`' "uuid", "json" and
 /// "jsonb". A column of one is sent as that type, so drivers hand its values over as theirs.
@@ -366,69 +364,6 @@ fn unnamed(e: Expr) -> ast::FunctionArg { ast::FunctionArg::Unnamed(ast::Functio
 fn lit(s: &str) -> Expr { Expr::value(Value::SingleQuotedString(s.to_string())) }
 
 fn quoted(s: &str) -> ast::Ident { ast::Ident::with_quote('"', s) }
-
-/// An expression's place in its statement, which tells it from another of the same text.
-fn at(e: &Expr) -> usize { std::ptr::from_ref(e) as usize }
-
-/// Runs `change` over `stmt`, then gives each item it changed that has no alias (in a SELECT, or a RETURNING)
-/// its text as written for a name, so a change made where SQL comes in never renames a column:
-/// `SELECT json_agg(t) FROM t` still answers `json_agg(t)`. Items are found by their places, so `change` must
-/// change expressions where they are (moving a query is fine; a query it clones is new to it). Whether
-/// `change` changed anything.
-pub(crate) fn names_kept(stmt: &mut Statement, change: impl FnOnce(&mut Statement) -> bool) -> bool {
-    let mut written = HashMap::new();
-    let _ = stmt.visit(&mut Items(|item: &mut SelectItem| {
-        if let SelectItem::UnnamedExpr(e) = item {
-            written.insert(at(e), e.to_string());
-        }
-    }));
-    if !change(stmt) {
-        return false;
-    }
-    let _ = stmt.visit(&mut Items(|item: &mut SelectItem| {
-        if let SelectItem::UnnamedExpr(e) = item {
-            if let Some(text) = written.get(&at(e)).filter(|text| **text != e.to_string()) {
-                let expr = std::mem::replace(e, Expr::value(Value::Null));
-                *item = SelectItem::ExprWithAlias { expr, alias: ast::Ident::with_quote('"', text.clone()) };
-            }
-        }
-    }));
-    true
-}
-
-/// Calls its function with each item of every query in a statement (both sides of a UNION) and of every
-/// RETURNING.
-struct Items<F>(F);
-
-impl<F: FnMut(&mut SelectItem)> ast::VisitorMut for Items<F> {
-    type Break = ();
-
-    fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
-        fn items(body: &mut SetExpr, f: &mut impl FnMut(&mut SelectItem)) {
-            match body {
-                SetExpr::Select(s) => s.projection.iter_mut().for_each(f),
-                SetExpr::SetOperation { left, right, .. } => {
-                    items(left, f);
-                    items(right, f);
-                }
-                _ => {} // (a query in parentheses is a query of its own: this visits it too)
-            }
-        }
-        items(&mut q.body, &mut self.0);
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_statement(&mut self, s: &mut Statement) -> ControlFlow<()> {
-        let returning = match s {
-            Statement::Insert(i) => i.returning.as_mut(),
-            Statement::Update(u) => u.returning.as_mut(),
-            Statement::Delete(d) => d.returning.as_mut(),
-            _ => None,
-        };
-        returning.into_iter().flatten().for_each(&mut self.0);
-        ControlFlow::Continue(())
-    }
-}
 
 /// `sql` parsed, with the columns of every table and view it names. None for one with nothing to trace:
 /// a query of Postgres's catalog (never a uuid there), or one that doesn't parse as one statement.
@@ -1331,44 +1266,6 @@ mod tests {
         // (`#-` answers its document's type; `-` only a jsonb's: a number minus a number is no document)
         assert_eq!(cols("SELECT doc #- '{a}', b #- '{a}', b - 'a', name #- '{a}', doc - 'a', id - 1 FROM t, s.o"), [Some(Ty::Json), Some(Ty::Jsonb), Some(Ty::Jsonb), None, None, None]);
         assert_eq!(cols("SELECT jsonb_pretty(b), json_typeof(doc), upper(name) FROM t, s.o"), [None, None, None]);
-    }
-
-    #[test]
-    fn names_kept_by_place() {
-        // (every `upper(…)` becomes 'x': the items it changed keep their names, the others are as they were)
-        let upper = |s: &mut Statement| {
-            let mut changed = false;
-            let _ = ast::visit_expressions_mut(s, |e| {
-                if matches!(e, Expr::Function(f) if object(&f.name) == "upper") {
-                    *e = Expr::value(Value::SingleQuotedString("x".into()));
-                    changed = true;
-                }
-                ControlFlow::<()>::Continue(())
-            });
-            changed
-        };
-        let kept = |sql: &str| {
-            let mut s = one(sql).unwrap();
-            let changed = names_kept(&mut s, upper);
-            (changed, s.to_string())
-        };
-        assert_eq!(
-            kept("SELECT upper(a), upper(a) AS b, lower(a), (SELECT upper(a) FROM t) FROM t UNION ALL SELECT upper(a), 'y', 'z', 'w' FROM t"),
-            (true, r#"SELECT 'x' AS "upper(a)", 'x' AS b, lower(a), (SELECT 'x' AS "upper(a)" FROM t) AS "(SELECT upper(a) FROM t)" FROM t UNION ALL SELECT 'x' AS "upper(a)", 'y', 'z', 'w' FROM t"#.to_string())
-        );
-        assert_eq!(kept("WITH c AS (SELECT upper(a) FROM t) SELECT * FROM c"), (true, r#"WITH c AS (SELECT 'x' AS "upper(a)" FROM t) SELECT * FROM c"#.to_string()));
-        assert_eq!(kept("UPDATE t SET a = upper(b) RETURNING upper(a), a"), (true, r#"UPDATE t SET a = 'x' RETURNING 'x' AS "upper(a)", a"#.to_string()));
-        assert_eq!(kept("INSERT INTO t SELECT upper(a) FROM s RETURNING upper(a)"), (true, r#"INSERT INTO t SELECT 'x' AS "upper(a)" FROM s RETURNING 'x' AS "upper(a)""#.to_string()));
-        assert_eq!(kept("SELECT lower(a) FROM t"), (false, "SELECT lower(a) FROM t".to_string()));
-        // (a name holding a double quote is written so it reads back as itself)
-        let (_, text) = kept(r#"SELECT upper("A") FROM t"#);
-        match &one(&text).unwrap() {
-            Statement::Query(q) => match &*q.body {
-                SetExpr::Select(s) => assert!(matches!(&s.projection[0], SelectItem::ExprWithAlias { alias, .. } if alias.value == r#"upper("A")"#), "{text}"),
-                _ => panic!("{text}"),
-            },
-            _ => panic!("{text}"),
-        }
     }
 
     #[test]

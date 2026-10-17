@@ -2,22 +2,110 @@
 //! array bounds (Grafana, pgjdbc), `format` (Metabase), `quote_*` and `parse_ident` (Grafana),
 //! `to_char`, `to_date` and `to_timestamp` with Postgres's templates (Superset, Metabase), and
 //! `generate_series` over any integers (DataFusion's takes only BIGINT). Registered in every session
-//! (`Lake::made`); the catalog's own are `pg_catalog.rs`'s. The text and templates follow Postgres 16
+//! (`engine::session`); the catalog's own are `pg_catalog.rs`'s. The text and templates follow Postgres 16
 //! (`pg_text.rs`, `pg_formats.rs`); this file is only how they meet DataFusion.
 
-use crate::pg_catalog::{function, int_arg, text_arg, texts_out};
 use crate::pg_json::is_text;
 use crate::{pg_formats, pg_text};
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, Int32Array, Int64Array};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, Int32Array, Int64Array, StringArray};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, TimeUnit};
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl, TableProvider};
 use datafusion::common::{exec_err, Result, ScalarValue};
 use datafusion::config::ConfigOptions;
 use datafusion::execution::FunctionRegistry;
-use datafusion::logical_expr::{ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility};
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
+
+// ---------------------------------------------------------------- the builder
+// (how a function meets DataFusion: every Postgres function the core registers is made with these)
+
+/// The field metadata that marks an answer's column with its Postgres type (`uuid`, `json`, `jsonb`): the port reads it, other doors pass it by.
+pub const MARK: &str = "pg_type";
+
+type Body = dyn Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync;
+
+/// A function Postgres's catalog queries call, any arguments; `returns` from the arguments' types.
+struct PgFn {
+    name: &'static str,
+    signature: Signature,
+    returns: fn(&[DataType]) -> DataType,
+    body: Arc<Body>,
+    marks: Option<&'static str>, // the Postgres type its answers' column is marked with (`MARK`): "json"
+    follows: bool, // (no fixed mark: the answers are JSON when the first argument is, as `->` is)
+}
+
+impl std::fmt::Debug for PgFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "PgFn({})", self.name) }
+}
+impl PartialEq for PgFn {
+    fn eq(&self, o: &Self) -> bool { self.name == o.name }
+}
+impl Eq for PgFn {}
+impl std::hash::Hash for PgFn {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) { self.name.hash(h) }
+}
+
+impl ScalarUDFImpl for PgFn {
+    fn name(&self) -> &str { self.name }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, args: &[DataType]) -> datafusion::error::Result<DataType> { Ok((self.returns)(args)) }
+    // (the mark rides on the field the function returns, so a projection of it keeps it: the port sends json as json)
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> datafusion::error::Result<FieldRef> {
+        let types: Vec<DataType> = args.arg_fields.iter().map(|f| f.data_type().clone()).collect();
+        let field = Field::new(self.name, (self.returns)(&types), true);
+        let mark = match self.marks {
+            Some(mark) => Some(mark.to_string()),
+            None if self.follows => first_json_mark(args.arg_fields),
+            None => None,
+        };
+        Ok(Arc::new(match mark {
+            Some(mark) => field.with_metadata([(MARK.to_string(), mark)].into()),
+            None => field,
+        }))
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        let n = args.number_rows;
+        let arrays = args.args.iter().map(|a| a.to_array(n)).collect::<datafusion::error::Result<Vec<_>>>()?;
+        Ok(ColumnarValue::Array((self.body)(&arrays, n)?))
+    }
+}
+
+/// A function of Postgres's over whole columns: `body` gets every argument as an array of the rows' values.
+pub(crate) fn function(name: &'static str, signature: Signature, returns: fn(&[DataType]) -> DataType, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
+    marked(name, signature, returns, None, body)
+}
+
+/// `function`, whose answers are JSON text marked `mark` ("json" or "jsonb"): the column they make is sent as that type.
+pub(crate) fn marked(name: &'static str, signature: Signature, returns: fn(&[DataType]) -> DataType, mark: Option<&'static str>, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
+    ScalarUDF::new_from_impl(PgFn { name, signature, returns, body: Arc::new(body), marks: mark, follows: false })
+}
+
+/// `function`, whose answers are JSON exactly when its first argument is (`doc -> 'a'` of a JSON column is JSON, of a
+/// text one text, as Postgres has the operator for JSON only): the mark is the first argument's, if it is JSON's.
+pub(crate) fn follows_json(name: &'static str, signature: Signature, returns: fn(&[DataType]) -> DataType, body: impl Fn(&[ArrayRef], usize) -> datafusion::error::Result<ArrayRef> + Send + Sync + 'static) -> ScalarUDF {
+    ScalarUDF::new_from_impl(PgFn { name, signature, returns, body: Arc::new(body), marks: None, follows: true })
+}
+
+/// The JSON mark of a function's first argument, if it has one (`json` or `jsonb`).
+fn first_json_mark(arg_fields: &[FieldRef]) -> Option<String> {
+    let mark = arg_fields.first()?.metadata().get(MARK)?;
+    matches!(mark.as_str(), "json" | "jsonb").then(|| mark.clone())
+}
+
+/// An argument as text (NULL where it is), whatever string or number type it came as.
+pub(crate) fn text_arg(a: &ArrayRef) -> datafusion::error::Result<Vec<Option<String>>> {
+    let c = datafusion::arrow::compute::cast(a, &DataType::Utf8)?;
+    Ok(c.as_string::<i32>().iter().map(|v| v.map(str::to_string)).collect())
+}
+
+pub(crate) fn int_arg(a: &ArrayRef) -> datafusion::error::Result<Vec<Option<i64>>> {
+    let c = datafusion::arrow::compute::cast(a, &DataType::Int64)?;
+    Ok(c.as_primitive::<datafusion::arrow::datatypes::Int64Type>().iter().collect())
+}
+
+pub(crate) fn texts_out(v: impl IntoIterator<Item = Option<String>>) -> ArrayRef { Arc::new(StringArray::from_iter(v)) }
 
 pub fn register(ctx: &SessionContext) {
     for name in ["generate_series", "range"] {

@@ -1,15 +1,13 @@
 //! Postgres's JSON operators on JSON text (round 35): `->` (a value as JSON text), `#>` and `#>>` (a path), `@>` and
 //! `<@` (containment), `?`, `?|` and `?&` (existence). datafusion-functions-json reads a path as one key and plans none
-//! of the others, so they are planned here, ahead of its planner (`Lake::made`), when the left side is text. `->>` and
+//! of the others, so they are planned here, ahead of its planner (`engine::session`), when the left side is text. `->>` and
 //! every operator on another type keep the planning they have. The answers follow Postgres 16: a document's text is
 //! kept as written (`types.rs`), so `->` and `#>` answer the value's text as the document has it. Text that isn't JSON
 //! answers NULL where a walk meets it; `@>`, `<@`, `?`, `?|` and `?&` read the whole document and refuse it (22P02).
 //! `text` groups the operators the way Postgres does, where SQL comes in (`path::door`).
-use crate::pg_catalog::{follows_json, function, marked, text_arg, texts_out};
+use crate::pg_functions::{follows_json, function, marked, text_arg, texts_out, MARK};
 use crate::pg_json_make::{fail, jsonb_text, refuse};
-use crate::pg_types::MARK;
-use crate::pg_values::array_literal;
-use crate::types::{is_json, json_of, json_refusal};
+use crate::pg_text::array_literal;
 use datafusion::arrow::array::{Array, ArrayAccessor, ArrayRef, AsArray, BooleanArray, Int32Array, StringArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type};
@@ -28,7 +26,7 @@ use std::borrow::Cow;
 use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
 
-/// The engine's session (`engine::session`) with Postgres's JSON at the node (`Lake::made`): its operators (`#>`, `#>>`,
+/// The engine's session (`engine::session`) with Postgres's JSON in every session: its operators (`#>`, `#>>`,
 /// `@>`, `?|`, …) planned ahead of the engine's planners, functions-json's among them; a text cast's JSON mark taken off
 /// after type coercion (`pg_json_make::AsText`); and the functions they call.
 pub fn planned(ctx: SessionContext) -> SessionContext {
@@ -83,6 +81,24 @@ fn operator(op: &BinaryOperator) -> Option<(&'static str, bool)> {
 
 /// Text in any of DataFusion's string types: what the JSON functions read as a document's text, from a column or a literal.
 pub(crate) fn is_text(t: &DataType) -> bool { matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8) }
+
+/// `s` parses as JSON (`json` and `jsonb` alike): its syntax is checked, nothing is built.
+pub fn is_json(s: &str) -> bool { serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok() }
+
+/// Postgres's words for a value that isn't JSON, which it quotes as far as 60 characters (jsonb's
+/// refusals say `type json` too).
+pub(crate) fn json_refusal(s: &str) -> String {
+    let head: String = s.chars().take(60).collect();
+    format!("invalid input syntax for type json: \"{head}\"")
+}
+
+/// `s` as JSON text the lake keeps: itself when it parses as JSON, else Postgres's refusal (22P02).
+pub fn json_of(s: &str) -> anyhow::Result<String> {
+    match is_json(s) {
+        true => Ok(s.to_string()),
+        false => Err(crate::codes::coded("22P02", json_refusal(s))),
+    }
+}
 
 fn is_list(t: &DataType) -> bool { matches!(t, DataType::List(_) | DataType::LargeList(_)) }
 

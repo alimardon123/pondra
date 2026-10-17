@@ -1003,7 +1003,7 @@ impl postgres_types::ToSql for PgInterval {
 
 impl pgwire::types::ToSqlText for PgInterval {
     fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        out.extend_from_slice(crate::pg_values::interval_text(self.months, self.days, self.micros).as_bytes());
+        out.extend_from_slice(crate::pg_text::interval_text(self.months, self.days, self.micros).as_bytes());
         Ok(postgres_types::IsNull::No)
     }
 }
@@ -1025,7 +1025,7 @@ impl postgres_types::ToSql for PgTime {
 
 impl pgwire::types::ToSqlText for PgTime {
     fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        out.extend_from_slice(crate::pg_values::time_text(self.0).as_bytes());
+        out.extend_from_slice(crate::pg_text::time_text(self.0).as_bytes());
         Ok(postgres_types::IsNull::No)
     }
 }

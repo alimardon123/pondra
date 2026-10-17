@@ -36,6 +36,7 @@
 //! every door refuses a longer value (`check`: 22001), but for trailing spaces, which Postgres
 //! takes and cuts (kept here). Its length only grows (`ALTER COLUMN … TYPE VARCHAR(m)`, m ≥ n, or
 //! to plain text); a column holding text gets none, since its rows were never checked against one.
+use crate::pg_json::{is_json, json_of, json_refusal};
 use crate::store::{json, table_key, Lake, TableMeta};
 use crate::write::Stmt;
 use anyhow::{ensure, Context, Result};
@@ -373,24 +374,6 @@ fn refused_uuid(column: &str, s: &str) -> String {
     }
 }
 
-/// `s` parses as JSON (`json` and `jsonb` alike): its syntax is checked, nothing is built.
-pub fn is_json(s: &str) -> bool { serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok() }
-
-/// Postgres's words for a value that isn't JSON, which it quotes as far as 60 characters (jsonb's
-/// refusals say `type json` too).
-pub(crate) fn json_refusal(s: &str) -> String {
-    let head: String = s.chars().take(60).collect();
-    format!("invalid input syntax for type json: \"{head}\"")
-}
-
-/// `s` as JSON text the lake keeps: itself when it parses as JSON, else Postgres's refusal (22P02).
-pub fn json_of(s: &str) -> Result<String> {
-    match is_json(s) {
-        true => Ok(s.to_string()),
-        false => Err(crate::codes::coded("22P02", json_refusal(s))),
-    }
-}
-
 /// Why a value of a column held as `t` is refused, with its message and SQLSTATE; None when it is taken.
 /// The column's name is the one the message gives.
 fn refusal(t: &str, column: &str, v: &str) -> Option<(String, &'static str)> {
@@ -683,7 +666,7 @@ impl datafusion::logical_expr::ScalarUDFImpl for Made {
     fn return_field_from_args(&self, _: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<datafusion::arrow::datatypes::FieldRef> {
         let field = datafusion::arrow::datatypes::Field::new(self.name, DataType::Utf8, true);
         Ok(std::sync::Arc::new(match self.mark {
-            Some(mark) => field.with_metadata([(crate::pg_types::MARK.to_string(), mark.to_string())].into()),
+            Some(mark) => field.with_metadata([(crate::pg_functions::MARK.to_string(), mark.to_string())].into()),
             None => field,
         }))
     }
