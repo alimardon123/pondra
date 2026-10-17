@@ -272,7 +272,7 @@ async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
     let sql = crate::routines::expand(&app.lake, sql).await.map_err(status)?;
     let stmt = crate::write::parse(&sql).ok_or_else(|| Status::invalid_argument("not a write statement"))?;
     let done = crate::audit::statement(app, &sql, async {
-        app.auth.allows(role, &stmt).map_err(|e| Status::permission_denied(e.to_string()))?;
+        app.auth.allows(role, &stmt).map_err(|e| Status::permission_denied(crate::ext::said(&e)))?;
         crate::write::on_node(app, stmt, None).await.map_err(status)
     });
     Ok(done.await?["rows"].as_i64().unwrap_or(0))
@@ -358,7 +358,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
         // (a keyed table's rows replace their keys', and rows marked _deleted delete them: S11)
         let named = crate::auth::catalog_name(&table);
         let load = |b: &RecordBatch| match &who {
-            Some(w) => crate::auth::WHO.sync_scope(w.clone(), || crate::auth::check_load(m, &named, b)).map_err(|e| Status::permission_denied(e.to_string())),
+            Some(w) => crate::auth::WHO.sync_scope(w.clone(), || crate::auth::check_load(m, &named, b).map_err(|e| Status::permission_denied(crate::ext::said(&e)))), // (said as the writer's scope says it: `shows_code`)
             None => Ok(()),
         };
         let mut i = 0;
@@ -607,7 +607,7 @@ impl FlightSqlService for Sql {
         };
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(Status::from).peekable();
         let mut exists = self.0.lake.cat.get::<TableMeta>(&table_key(&table)).await.map_err(status)?.is_some();
-        crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(e.to_string()))?; // (the row doors' one check)
+        crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(crate::ext::said(&e)))?; // (the row doors' one check)
         // ADBC's modes: create (fail if there), append (fail if not), replace, create_append.
         use arrow_flight::sql::{TableExistsOption as IfThere, TableNotExistOption as IfNot};
         let options = cmd.table_definition_options.unwrap_or_default();
@@ -656,7 +656,7 @@ impl FlightSqlService for Sql {
             [t, p, s] => (t.clone(), p.clone(), s.parse().map_err(|_| Status::invalid_argument("the first seq is a number"))?),
             _ => return Err(Status::invalid_argument("DoPut to a path: [table] or [table, producer, first seq]")),
         };
-        crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(e.to_string()))?; // (the row doors' one check)
+        crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(crate::ext::said(&e)))?; // (the row doors' one check)
         let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(input.map_err(Into::into)).map_err(Status::from);
         Ok(Response::new(append(&self.0, table, producer, seq, batches)?))
     }
@@ -777,7 +777,7 @@ impl FlightService for Door {
                 (Some(sql), _) => plan_schema(app, sql).await.map_err(status)?,
                 (None, Some(table)) => {
                     // Its schema names every column: a user needs SELECT on all of them, as its log stream does (checked before the table is looked up, so an unreadable one isn't told apart).
-                    crate::auth::check_all(&crate::auth::catalog_name(table)).map_err(|e| Status::permission_denied(e.to_string()))?;
+                    crate::auth::check_all(&crate::auth::catalog_name(table)).map_err(|e| Status::permission_denied(crate::ext::said(&e)))?;
                     let meta: TableMeta = app.lake.cat.get(&table_key(table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
                     let full = crate::query::schema(&meta.logical_columns()).map_err(status)?;
                     let pick = json.columns.iter().flatten().filter_map(|c| full.index_of(c).ok()).collect::<Vec<_>>();
@@ -811,7 +811,7 @@ impl FlightService for Door {
                     Ok(Response::new(send(schema, batches)))
                 }
                 (None, Some(table)) => {
-                    crate::auth::check_all(&crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(e.to_string()))?; // (a stream of rows: every column, as `/watch` needs)
+                    crate::auth::check_all(&crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(crate::ext::said(&e)))?; // (a stream of rows: every column, as `/watch` needs)
                     Ok(Response::new(log_stream(app.clone(), table, json.after, json.columns, json.follow).await?))
                 }
                 _ => Err(Status::invalid_argument("{\"sql\": …} or {\"table\": …}")),

@@ -8153,6 +8153,51 @@ def first():
 
 # ---------------------------------------------------------------- round 29, part 2 (ADR-035)
 
+def _users_mcp_errors(checks, port, admin, names):
+    """MCP words a failed call's error as every door does (`ext::said`): ann, granted some tables, reads a
+    failed CALL's or a Python function's error without a routine's code (S27), and a file's name as SQL names
+    it, never by its internal `ext:` name; an admin reads all of it. Run after users()'s S27 checks: it uses
+    the procedures trips() and trips_py() and the function trips_fn() made there. `admin` is the admin's
+    Basic header, `names` are (ann, boss)."""
+    import http.server, socketserver
+    ann, boss = names
+    token = {u: call(port, "POST", "/sql", f"CREATE TOKEN mcp_{u} FOR USER {u}".encode(), headers={"Authorization": admin})["token"] for u in (ann, boss)}
+
+    def mcp_text(who, name, args):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}).encode()
+        out = call(port, "POST", "/mcp", body, headers={"Authorization": f"Bearer {token[who]}", "content-type": "application/json"})
+        return out["result"]["content"][0]["text"]  # (a failed tool is its result, its text the error: `isError`)
+
+    sql = {who: mcp_text(who, "write", {"sql": "CALL trips()"}) for who in (ann, boss)}
+    py = {who: mcp_text(who, "write", {"sql": "CALL trips_py()"}) for who in (ann, boss)}
+    checks["MCP words errors as every door does: ann's failed CALLs name statement 2 and line 3 without their text, boss's quote them (S27 at MCP)"] = \
+        "statement 2" in sql[ann] and "hidden_marker_q" not in sql[ann] and "hidden_marker_q" in sql[boss] \
+        and "line 3" in py[ann] and "hidden_marker_p" not in py[ann] and "hidden_marker_p" in py[boss]
+    fn = {who: mcp_text(who, "query", {"sql": "SELECT item, sum(trips_fn(id)) AS s FROM sales.orders GROUP BY item"}) for who in (ann, boss)}
+    checks["…a Python function's error through MCP's query: ann's names line 3 without its code, boss's quotes it (S27 at MCP)"] = \
+        "line 3" in fn[ann] and "hidden_marker_f" not in fn[ann] and "hidden_marker_f" in fn[boss]
+    # A file that fails names it as SQL does: ann reads a CSV over HTTP, through a secret that covers it (granted to ann)
+    folder = tempfile.mkdtemp(prefix="pondra-mcp-")
+    with open(os.path.join(folder, "data.csv"), "w") as f:
+        f.write("id,item\n1,tea\n2,cake\n")
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=folder, **k)
+        def log_message(self, *a):
+            pass
+    web = socketserver.TCPServer(("127.0.0.1", 0), Quiet)
+    threading.Thread(target=web.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{web.server_address[1]}/data.csv"
+        call(port, "POST", "/sql", f"CREATE SECRET mcp_web (TYPE http, BEARER_TOKEN 'x', SCOPE 'http://127.0.0.1:{web.server_address[1]}')".encode(), headers={"Authorization": admin})
+        call(port, "POST", "/sql", f"GRANT USAGE ON SECRET mcp_web TO {ann}".encode(), headers={"Authorization": admin})
+        file_error = mcp_text(ann, "query", {"sql": f"SELECT nope FROM read_csv('{url}')"})  # (no such column: the planner names the file's fields)
+    finally:
+        web.shutdown()
+        web.server_close()
+    checks["…an error naming a file shows it by its SQL name, never ext:…"] = "ext:" not in file_error and url in file_error
+
+
 def users():
     """Users, roles and grants (ADR-035 §2): made in SQL; signed in at every door — HTTP (a password,
     a token, a session), Postgres (SCRAM; a token-only user's token), Kafka (SASL/PLAIN), Flight (a
@@ -8278,6 +8323,7 @@ def users():
         "statement 2" in str(failed["sql"]) and "hidden_marker_q" not in str(failed["sql"]) and "hidden_marker_q" in str(failed["sql_boss"]) \
         and "line 3" in str(failed["py"]) and "hidden_marker_p" not in str(failed["py"]) and "hidden_marker_p" in str(failed["py_boss"]) \
         and "line 3" in str(failed["fn"]) and "hidden_marker_f" not in str(failed["fn"]) and "hidden_marker_f" in str(failed["fn_boss"])
+    _users_mcp_errors(checks, A.port, boss, ("ann", "boss"))
     # Tokens and sessions
     tok = as_(A.port, boss, "CREATE TOKEN ci FOR USER svc")
     short = as_(A.port, boss, "CREATE TOKEN brief FOR USER svc EXPIRES IN '1 second'")
