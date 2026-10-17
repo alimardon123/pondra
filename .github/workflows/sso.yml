@@ -11,6 +11,10 @@ name: sso
 # signs people in changes. By hand too.
 on:
   workflow_call:
+    inputs:
+      artifact: # (build.yml's packages of linux-x64: pondra-linux-x64, or pr-linux-x64 for a pull request's release-profile build)
+        type: string
+        default: pondra-linux-x64
   workflow_dispatch:
 
 permissions:
@@ -43,11 +47,11 @@ jobs:
           sudo curl -fsSo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
           sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-18 libpq-oauth > /dev/null
-      # (Called from build.yml: its run's own packages, with no API call. By hand: a build run's.)
+      # (Called from build.yml: its run's own packages, with no API call, whatever started that run. By hand: a build run's.)
       - uses: actions/download-artifact@v7
-        if: github.event_name != 'workflow_dispatch'
+        if: inputs.artifact
         with:
-          name: pondra-linux-x64
+          name: ${{ inputs.artifact }}
           path: dist
       - name: This commit's Linux binary (the build workflow's)
         run: |
