@@ -229,10 +229,12 @@ impl Tally {
 }
 
 impl Inner {
-    /// Does `at` go to disk when it is written now? Only the bulk of a lake, and only past the budget.
-    /// An update stays in memory, where its version is checked.
-    fn spills(&self, at: &Path, mode: &PutMode) -> bool {
-        spillable(at) && !matches!(mode, PutMode::Update(_)) && self.mem.sum() >= self.budget
+    /// Does `at`, of `bytes`, go to disk when it is written now? Only the bulk of a lake, and only what
+    /// would take its memory past the budget: a load's first file bigger than the budget went to memory
+    /// whole. An upload, whose size isn't known yet, goes to disk once the budget is reached. An update
+    /// stays in memory, where its version is checked.
+    fn spills(&self, at: &Path, mode: &PutMode, bytes: u64) -> bool {
+        spillable(at) && !matches!(mode, PutMode::Update(_)) && self.mem.sum() + bytes.max(1) > self.budget
     }
 
     /// The disk tier of this lake, made on the first need.
@@ -619,7 +621,7 @@ impl MultipartUpload for Upload {
 #[async_trait::async_trait]
 impl ObjectStore for Held {
     async fn put_opts(&self, at: &Path, body: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
-        if self.0.spills(at, &opts.mode) {
+        if self.0.spills(at, &opts.mode, body.content_length() as u64) {
             self.0.put_disk(at, body, opts).await
         } else {
             self.0.put_mem(at, body, opts).await
@@ -627,7 +629,7 @@ impl ObjectStore for Held {
     }
 
     async fn put_multipart_opts(&self, at: &Path, opts: PutMultipartOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
-        let on_disk = self.0.spills(at, &PutMode::Overwrite);
+        let on_disk = self.0.spills(at, &PutMode::Overwrite, 0);
         let (up, room) = match on_disk {
             true => {
                 let disk = self.0.disk_or_make()?;
@@ -962,6 +964,18 @@ mod tests {
         dirs.sort();
         assert_eq!(dirs, ["catalog", "data"]);
         assert!(root.objects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_file_that_would_pass_the_budget_goes_to_disk() {
+        let h = Held::with_budget(15);
+        h.put(&Path::from("data/t/a.parquet"), bytes(1)).await.unwrap(); // 10 of 15: in memory
+        h.put(&Path::from("data/t/b.parquet"), bytes(2)).await.unwrap(); // 20 would pass it: on disk
+        assert!(h.0.mem.has(&Path::from("data/t/a.parquet")) && !h.0.mem.has(&Path::from("data/t/b.parquet")));
+        let first = Held::with_budget(5);
+        first.put(&Path::from("data/t/a.parquet"), bytes(1)).await.unwrap(); // a first file bigger than the budget
+        assert!(!first.0.mem.has(&Path::from("data/t/a.parquet")));
+        assert_eq!(read(&first, "data/t/a.parquet").await, vec![1; 10]);
     }
 
     #[tokio::test]
