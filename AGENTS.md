@@ -2827,6 +2827,19 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    refused. Fewer runs at once means more passes, so a small node writes more spill (9M long strings: 1.3 GB at 4,
    1.07 GB unlimited). `harness.py scale`: "a rank() over one partition of 9M long strings streams…" (stopped by the 1 GB
    watch before) and "a rank() over 3 partitions of 6M long strings…" (a 501 MB peak; refused before, 53200).
+424. **A GROUP BY over medians that ran out of memory is answered from a sort's middle rows, and only then**
+   (`frugal::MiddleRows`, retry-only as invariant 422's rule). DataFusion's median holds every value of its group and
+   can't spill; on the frugal retry each `median(x)` with no DISTINCT, FILTER, ORDER BY or null handling (none over
+   the rule's own `__pondra_middle` column) is worked out apart: its non-NULL values numbered once over all the rows
+   in key then value order, NULLs first (one `row_number`, a sort that spills, then a window that streams; a window per
+   group held each group's rows), each group's first number found by a running sum of the groups' counts, and the one
+   or two in the middle kept by a `FILTER` on the median itself (a filter above the join was pushed into it, and held
+   a group's rows). The other aggregates are one GROUP BY, the medians are joined to it on the keys (NULL equal to
+   NULL; a group whose values are all NULL gets NULL), and ROLLUP, CUBE, GROUPING SETS, or input that reads otherwise
+   again (`differs_by_reading`) are left as they were. The numbering runs through one sorted stream: slow next to
+   the plan it replaces, which couldn't answer. A query that fits plans as before (TPC-H SF1: the same answers, B/A
+   wall 0.98). `harness.py scale`: "a median of 12M values in 3 groups past the memory limit answers…" (3.9 s on a
+   0.05 GB node; refused before, 53200); `frugal::tests::medians_…`.
 ## Tests: run these before and after any change
 
 ```bash
