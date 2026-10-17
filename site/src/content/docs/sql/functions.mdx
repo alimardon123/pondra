@@ -141,9 +141,20 @@ SELECT *
 FROM jsonb_to_recordset('[{"sku": "A1", "qty": 2}, {"sku": "B7"}]') AS line(sku TEXT, qty INT);
 ```
 
-A call in a `FROM` clause works over literals, as the last example does. A call that reads a column
-of the same query needs `LATERAL`, which isn't taken yet: call it in the SELECT list instead, as the
-second example does.
+A call in a `FROM` clause works over literals, as the last example does, and over a column of the same
+query, as Postgres takes it. It makes its rows for each row of the query, with `CROSS JOIN LATERAL` or
+a comma:
+
+```sql
+SELECT carts.id, item.value
+FROM carts
+CROSS JOIN LATERAL jsonb_array_elements(carts.doc -> 'items') AS item;
+```
+
+`LEFT JOIN LATERAL … ON true` keeps a row when the call gives none, for `json_array_elements_text`,
+`jsonb_array_elements_text` and `unnest`. Over `jsonb_array_elements` or `jsonb_each` it is refused by
+name for now: their columns are computed from the rows, and this engine doesn't yet keep such a row
+with NULLs in them.
 
 The functions below read the same documents. Each takes the document, then a path:
 

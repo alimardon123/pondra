@@ -78,7 +78,7 @@ fn takes(j: &Join) -> Result<bool> {
         return Ok(false);
     }
     if j.join_type == JoinType::Left && !(padded(j) && one_unnest(&chain)) {
-        return not_impl_err!("LEFT JOIN LATERAL over {} is not supported yet: a single unnest or set function, ON true", name_of(&j.right));
+        return not_impl_err!("LEFT JOIN LATERAL over {} is not supported yet: it takes ON true, and one unnest or set function whose columns are its own, unchanged", name_of(&j.right));
     }
     Ok(true)
 }

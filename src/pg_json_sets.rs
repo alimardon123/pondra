@@ -492,44 +492,32 @@ impl Scan {
         self.from(s)
     }
 
-    /// The FROM calls: each must read no column (LATERAL isn't taken yet), and a record's columns must be named.
+    /// The FROM calls: a record's columns must be named (42601), and WITH ORDINALITY isn't taken yet. A call that reads a
+    /// column of the FROM is written as a LATERAL subquery by `Rewrite::table`, as Postgres takes it.
     fn from(&mut self, s: &Select) -> anyhow::Result<()> {
-        let table = match s.from.first().map(|t| &t.relation) {
-            Some(TableFactor::Table { name, .. }) => name.to_string(),
-            _ => "t".to_string(),
-        };
         for twj in &s.from {
             for factor in std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation)) {
-                self.factor(factor, &table)?;
+                self.factor(factor)?;
             }
         }
         Ok(())
     }
 
-    fn factor(&mut self, factor: &TableFactor, table: &str) -> anyhow::Result<()> {
-        match factor {
-            TableFactor::Table { name, args: Some(args), alias, with_ordinality, .. } => {
-                let Some(set) = set_of(name) else { return Ok(()) };
-                self.found = true;
-                let call = call_text(name, &args.args);
-                if *with_ordinality {
-                    return Err(coded("0A000", format!("WITH ORDINALITY isn't taken yet: {call}")));
-                }
-                if look(&args.args, is_column).is_some() {
-                    return Err(coded("0A000", format!("{call} in FROM needs LATERAL, not yet: call it in the SELECT list (SELECT {call} FROM {table})")));
-                }
-                if set.records() {
-                    record_columns(alias.as_ref())?;
-                }
-                Ok(())
-            }
-            TableFactor::Function { name, args, .. } if set_of(name).is_some() => {
-                self.found = true;
-                let call = call_text(name, args);
-                Err(coded("0A000", format!("{call} in FROM with LATERAL isn't taken yet: call it in the SELECT list (SELECT {call} FROM {table})")))
-            }
-            _ => Ok(()),
+    fn factor(&mut self, factor: &TableFactor) -> anyhow::Result<()> {
+        let (name, args, alias, with_ordinality) = match factor {
+            TableFactor::Table { name, args: Some(args), alias, with_ordinality, .. } => (name, &args.args, alias, *with_ordinality),
+            TableFactor::Function { name, args, alias, with_ordinality, .. } => (name, args, alias, *with_ordinality),
+            _ => return Ok(()),
+        };
+        let Some(set) = set_of(name) else { return Ok(()) };
+        self.found = true;
+        if with_ordinality {
+            return Err(coded("0A000", format!("WITH ORDINALITY isn't taken yet: {}", call_text(name, args))));
         }
+        if set.records() {
+            record_columns(alias.as_ref())?;
+        }
+        Ok(())
     }
 
     /// Checks one expression: a call Postgres refuses where it stands, then the calls inside it are placed.
@@ -585,23 +573,31 @@ impl ast::VisitorMut for Rewrite {
 
 impl Rewrite {
     fn table(&mut self, factor: &mut TableFactor) {
-        let TableFactor::Table { name, args: Some(args), alias, .. } = factor else { return };
-        let Some(set) = set_of(name) else { return };
-        match derived(set, &args.args, alias.as_ref()) {
-            Ok(table) => *factor = table,
-            Err(e) => {
+        let made = match &*factor {
+            TableFactor::Table { name, args: Some(args), alias, .. } => set_of(name).map(|set| derived(set, &args.args, alias.as_ref(), reads(&args.args))),
+            TableFactor::Function { name, args, alias, .. } => set_of(name).map(|set| derived(set, args, alias.as_ref(), reads(args))),
+            _ => None,
+        };
+        match made {
+            Some(Ok(table)) => *factor = table,
+            Some(Err(e)) => {
                 if self.failed.is_none() {
                     self.failed = Some(e);
                 }
             }
+            None => {}
         }
     }
 }
 
+/// Whether a call's arguments read a column of the FROM: such a call is LATERAL, as Postgres takes it.
+fn reads(args: &Vec<FunctionArg>) -> bool { look(args, is_column).is_some() }
+
 /// A FROM call as the derived table of its rows, with the names Postgres gives them: `value` for the elements, the
 /// alias's name for the keys (or the function's), `key` and `value` for each member, and a record's columns named by
 /// the alias's column definitions. The derived table takes the alias, and its column list when a non-record has one.
-fn derived(set: &Set, args: &[FunctionArg], alias: Option<&TableAlias>) -> anyhow::Result<TableFactor> {
+/// `reads`: the arguments read a column, so the table is LATERAL (the rows are made from each row of the FROM before it).
+fn derived(set: &Set, args: &[FunctionArg], alias: Option<&TableAlias>, reads: bool) -> anyhow::Result<TableFactor> {
     let list = format!("{}({})", set.list, args.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
     let name = alias.map_or_else(|| ast::Ident::new(set.name), |a| a.name.clone());
     let body = match set.how {
@@ -622,7 +618,7 @@ fn derived(set: &Set, args: &[FunctionArg], alias: Option<&TableAlias>) -> anyho
         false => alias.map_or_else(Vec::new, |a| a.columns.iter().map(|c| TableAliasColumnDef { name: c.name.clone(), data_type: None }).collect()),
     };
     Ok(TableFactor::Derived {
-        lateral: false,
+        lateral: reads,
         subquery: parse(&body)?,
         alias: Some(TableAlias { explicit: true, name, columns, at: None }),
         sample: None,
@@ -772,11 +768,25 @@ mod tests {
         assert!(refusal("INSERT INTO t (id) VALUES (jsonb_array_elements('[1]')::text::int)").contains("in VALUES isn't taken yet"));
     }
 
+    /// A FROM call that reads a column of the FROM is LATERAL, as Postgres takes it: written once here, planned by
+    /// `lateral.rs` (which refuses a LEFT JOIN over a call whose outputs aren't its unnest's own, by name).
+    #[test]
+    fn from_calls_reading_a_column_are_lateral() {
+        let implicit = rewritten("SELECT * FROM t, jsonb_array_elements(t.doc) e").unwrap();
+        assert!(implicit.contains("LATERAL (SELECT pondra_as_jsonb(unnest(pondra_jsonb_array_elements(t.doc))) AS value) AS e"), "{implicit}");
+        let cross = rewritten("SELECT * FROM t CROSS JOIN LATERAL jsonb_each(t.doc) AS kv").unwrap();
+        assert!(cross.contains("CROSS JOIN LATERAL (SELECT get_field(s, 'key') AS key"), "{cross}");
+        let left = rewritten("SELECT * FROM t LEFT JOIN LATERAL json_array_elements_text(t.doc) AS x ON true").unwrap();
+        assert!(left.contains("LEFT JOIN LATERAL (SELECT unnest(pondra_json_array_elements_text(t.doc)) AS value) AS x ON true"), "{left}");
+        let record = rewritten("SELECT * FROM t CROSS JOIN LATERAL jsonb_to_recordset(t.doc) AS r(a int, b text)").unwrap();
+        assert!(record.contains("CAST(e ->> 'a' AS INT) AS \"a\""), "{record}");
+        assert!(record.contains("LATERAL (SELECT CAST(e ->> 'a' AS INT)"), "{record}");
+        let constant = rewritten("SELECT * FROM jsonb_array_elements('[1]') e").unwrap();
+        assert!(!constant.contains("LATERAL"), "{constant}");
+    }
+
     #[test]
     fn lateral_and_record_errors() {
-        let lateral = refusal("SELECT * FROM t, jsonb_array_elements(t.doc) e");
-        assert!(lateral.contains("jsonb_array_elements(t.doc) in FROM needs LATERAL, not yet"), "{lateral}");
-        assert!(lateral.contains("(SELECT jsonb_array_elements(t.doc) FROM t)"), "{lateral}");
         assert!(refusal("SELECT * FROM jsonb_array_elements('[1]') WITH ORDINALITY AS e").contains("WITH ORDINALITY isn't taken yet"));
         let record = refusal("SELECT * FROM jsonb_to_recordset('[{\"a\":1}]') AS x(a, b)");
         assert!(record.contains("a column definition list is required"), "{record}");
