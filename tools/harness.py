@@ -13297,6 +13297,17 @@ WHOLE_PG = {'BUILD': [['{"id" : 1, "doc" : {"a": 1, "b": [1, 2]}}'],
                 ' {"id":3,"name":"cy","k":2,"doc":null,"docb":null}, \n'
                 ' {"id":4,"name":"dee","k":2,"doc":[1, "x"],"docb":{"b": {"x": 2, "y": 1}}}, \n'
                 ' {"id":5,"name":"eve","k":3,"doc":"str","docb":[]}]']],
+ 'PAD_LEFT_AGG': [['1', '[{"id":10,"pid":1,"label":"a","doc":{"x": 1}}, \n {"id":11,"pid":1,"label":"b","doc":null}]'],
+                  ['2', '[{"id":12,"pid":2,"label":"c","doc":[1]}]'],
+                  ['3', '[null]']],
+ 'PAD_LEFT_ROWS': [['1', '{"id":10,"pid":1,"label":"a","doc":{"x": 1}}'], ['1', '{"id":11,"pid":1,"label":"b","doc":null}'],
+                   ['2', '{"id":12,"pid":2,"label":"c","doc":[1]}'], ['3', '']],
+ 'PAD_LEFT_COALESCE': [['1', '[{"id":10,"pid":1,"label":"a","doc":{"x": 1}}, \n {"id":11,"pid":1,"label":"b","doc":null}]'],
+                       ['2', '[{"id":12,"pid":2,"label":"c","doc":[1]}]'], ['3', '[]']],
+ 'PAD_LEFT_BUILD': [['1', '{"c" : {"id":10,"pid":1,"label":"a","doc":{"x": 1}}}'], ['1', '{"c" : {"id":11,"pid":1,"label":"b","doc":null}}'],
+                    ['2', '{"c" : {"id":12,"pid":2,"label":"c","doc":[1]}}'], ['3', '{"c" : null}']],
+ 'PAD_RIGHT_AGG': [['[{"id":1,"name":"ann"}, \n {"id":1,"name":"ann"}, \n {"id":2,"name":"bob"}, null]']],
+ 'PAD_RIGHT_GROUP': [['10', '[{"id":1,"name":"ann"}]'], ['11', '[{"id":1,"name":"ann"}]'], ['12', '[{"id":2,"name":"bob"}]'], ['13', '[null]']],
  'AGG_SUBQUERY': [['[{"id":1,"name":"ann"}, \n {"id":2,"name":"bob"}]']],
  'AGG_CTE': [['[{"id":1,"name":"ann","doc":{"a": 1, "b": [1, 2]}}, \n'
               ' {"id":2,"name":"bob","doc":{"c": null}}, \n'
@@ -14023,6 +14034,29 @@ def jsons():
                 and pg_same("json_agg in a scalar subquery, HTTP", http_cells(scalar, ["v"]), "SCALAR")
                 and pg_same("json_agg in a scalar subquery, the port", port_cells(as_text(scalar)), "SCALAR"))
 
+    def padding_setup():
+        """The tables the outer-join checks read (WHOLE_PG's PAD_*): p, three parents, and c, four children: two of parent 1, one of
+        parent 2 and an orphan (pid 9); c 11 has a NULL document, and parent 3 has no children."""
+        q("CREATE TABLE p (id INT PRIMARY KEY, name TEXT)")
+        q("INSERT INTO p (id, name) VALUES (1, 'ann'), (2, 'bob'), (3, 'cy')")
+        q("CREATE TABLE c (id INT PRIMARY KEY, pid INT, label TEXT, doc JSON)")
+        q("INSERT INTO c (id, pid, label, doc) VALUES (10, 1, 'a', '{\"x\": 1}'), (11, 1, 'b', NULL), (12, 2, 'c', '[1]'), (13, 9, 'orphan', NULL)")
+        return q("SELECT count(*) AS n FROM c")[0]["n"] == 4
+
+    def padding():
+        """A whole row of a table an outer join pads with NULLs is NULL where Postgres 16 pads it: a LEFT JOIN's unmatched child
+        (parent 3 has none: json_agg gives [null], row_to_json NULL, json_build_object {"c" : null}), a RIGHT JOIN's unmatched
+        parent (c 13's, json_agg's null), and coalesce(json_agg ... FILTER) keeps its []. Over HTTP and the port, against WHOLE_PG."""
+        queries = [("PAD_LEFT_AGG", "SELECT p.id AS id, (json_agg(c ORDER BY c.id))::text AS cs FROM p LEFT JOIN c ON c.pid = p.id GROUP BY p.id ORDER BY p.id", ["id", "cs"]),
+                   ("PAD_LEFT_ROWS", "SELECT p.id AS id, (row_to_json(c))::text AS j FROM p LEFT JOIN c ON c.pid = p.id ORDER BY p.id, c.id", ["id", "j"]),
+                   ("PAD_LEFT_COALESCE", "SELECT p.id AS id, (coalesce(json_agg(c ORDER BY c.id) FILTER (WHERE c.id IS NOT NULL), '[]'))::text AS cs FROM p LEFT JOIN c ON c.pid = p.id GROUP BY p.id ORDER BY p.id", ["id", "cs"]),
+                   ("PAD_LEFT_BUILD", "SELECT p.id AS id, (json_build_object('c', c))::text AS j FROM p LEFT JOIN c ON c.pid = p.id ORDER BY p.id, c.id", ["id", "j"]),
+                   ("PAD_RIGHT_AGG", "SELECT (json_agg(p ORDER BY c.id))::text AS ps FROM p RIGHT JOIN c ON c.pid = p.id", ["ps"]),
+                   ("PAD_RIGHT_GROUP", "SELECT c.id AS id, (json_agg(p))::text AS ps FROM p RIGHT JOIN c ON c.pid = p.id GROUP BY c.id ORDER BY c.id", ["id", "ps"])]
+        http = [pg_same(f"{name}, HTTP", http_cells(sql, names), name) for name, sql, names in queries]
+        ported = [pg_same(f"{name}, the port", port_cells(sql), name) for name, sql, _ in queries]
+        return all(http) and all(ported)
+
     def wholes_refusals():
         """A whole row Pondra can't make is refused by name with its SQLSTATE, over HTTP and the port: a subquery's item with no name
         (Postgres answers it, keyed 'upper'), a file's columns, DISTINCT over json (42883) and a json key (22023)."""
@@ -14424,6 +14458,8 @@ def jsons():
         check("a whole row Pondra can't make is refused by name: 0A000 for an unnamed item and a file's columns, 42883 for DISTINCT over json, 22023 for a json key", wholes_refusals)
         check("json_agg over 3,000 rows in seven groups, on three nodes (spread=1) and one (spread=0): equal to each other and to Postgres 16's text", wholes_spread)
         check("a materialized view of json_agg(v ORDER BY v) GROUP BY k is filled, then answers what the query answers after an INSERT and after an UPDATE", wholes_materialized)
+        check("setup: p (three parents) and c (four children, an orphan, a NULL document)", padding_setup)
+        check('a whole row an outer join pads is NULL where Postgres 16 pads it: LEFT (json_agg [null], row_to_json NULL, json_build_object {"c" : null}), RIGHT (json_agg null), coalesce(json_agg ... FILTER) []; HTTP and the port', padding)
     finally:
         if node is not None:
             node.kill()

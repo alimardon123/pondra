@@ -55,10 +55,12 @@ impl Kind {
     }
 }
 
-/// A relation an argument names as a whole row: the name its columns are qualified by, and its columns.
+/// A relation an argument names as a whole row: the name its columns are qualified by, its columns, and whether an
+/// outer join pads it with NULLs (`Rel::padded`).
 struct Whole {
     name: String,
     cols: Cols,
+    padded: bool,
 }
 
 /// The first character of an item's name when the item has no name of its own (an expression, which Postgres names by
@@ -264,13 +266,32 @@ fn change_makers(e: &mut Expr, place: usize, wraps: &[(usize, Ty)], rows: &[(usi
 }
 
 /// `pondra_row('a', "t"."a", 'b', "t"."b", …)`: a whole row's columns in order, each JSON one as its type prints it.
+/// A row an outer join padded is NULL, as Postgres reads it: `pondra_as_json(CASE WHEN "t"."a" IS NULL AND … THEN NULL ELSE pondra_row(…) END)`.
+/// A row an equi-join matched on one of its columns has that column non-null, so only a matched row whose every column is
+/// NULL (`ON true`, or a condition on none of its columns) reads NULL where Postgres writes an object of NULLs.
 fn row_expr(w: &Whole) -> Expr {
-    let args = w.cols.iter().flat_map(|(col, ty)| {
-        let column = Expr::CompoundIdentifier(vec![quoted(&w.name), quoted(col)]);
-        [lit(col), wrap_json(column, *ty)]
-    });
-    call("pondra_row", args.collect())
+    let args = w.cols.iter().flat_map(|(col, ty)| [lit(col), wrap_json(column_of(&w.name, col), *ty)]);
+    let row = call("pondra_row", args.collect());
+    let all_null = w.cols.iter().map(|(col, _)| Expr::IsNull(Box::new(column_of(&w.name, col)))).reduce(|a, b| Expr::BinaryOp { left: Box::new(a), op: ast::BinaryOperator::And, right: Box::new(b) });
+    match all_null {
+        // A CASE makes a field of its own, without the JSON mark the row's text carries, and a function given unmarked text
+        // quotes it (`row_to_json` would answer a string). `pondra_as_json` passes the text through and marks it again.
+        Some(condition) if w.padded => call(
+            "pondra_as_json",
+            vec![Expr::Case {
+                case_token: ast::helpers::attached_token::AttachedToken::empty(),
+                end_token: ast::helpers::attached_token::AttachedToken::empty(),
+                operand: None,
+                conditions: vec![ast::CaseWhen { condition, result: Expr::value(Value::Null) }],
+                else_result: Some(Box::new(row)),
+            }],
+        ),
+        _ => row,
+    }
 }
+
+/// `"name"."col"`: a column of a relation, qualified as the statement names it.
+fn column_of(name: &str, col: &str) -> Expr { Expr::CompoundIdentifier(vec![quoted(name), quoted(col)]) }
 
 /// `json_agg(x …)` as `pondra_json_agg(array_agg(x …), 'kind')`, and `json_object_agg(k, v …)` as
 /// `pondra_json_object_agg(array_agg(named_struct('k', k, 'v', v) …), 'kind')`; `jsonb` forms alike. The call's own clauses
@@ -444,10 +465,24 @@ async fn of(lake: &Lake, name: &str, known: &mut Known, depth: usize) -> Option<
     Trace::new(known).statement(&stmt)
 }
 
-/// One relation of a FROM: the names its columns may be qualified by, and its columns.
+/// One relation of a FROM: the names its columns may be qualified by, its columns, and whether an outer join pads it
+/// with NULLs (`padding`).
 struct Rel {
     names: Vec<String>,
     cols: Option<Cols>,
+    padded: bool,
+}
+
+/// Which relations a join pads with NULLs, as Postgres's outer joins do: the joined relation (LEFT), every relation before
+/// it in the same FROM (RIGHT), or both (FULL). Returns (the joined relation, the ones before it). Inner, cross, semi and
+/// anti joins pad nothing.
+fn padding(op: &ast::JoinOperator) -> (bool, bool) {
+    match op {
+        ast::JoinOperator::Left(_) | ast::JoinOperator::LeftOuter(_) => (true, false),
+        ast::JoinOperator::Right(_) | ast::JoinOperator::RightOuter(_) => (false, true),
+        ast::JoinOperator::FullOuter(_) => (true, true),
+        _ => (false, false),
+    }
 }
 
 /// A statement's walk, over the relations `known` describes.
@@ -483,7 +518,7 @@ impl<'a> Trace<'a> {
             Statement::Insert(i) => {
                 let ast::TableObject::TableName(n) = &i.table else { return None };
                 let (names, cols) = self.table(n);
-                let into = Rel { names: i.table_alias.as_ref().map_or(names, |a| vec![ident(&a.alias)]), cols };
+                let into = Rel { names: i.table_alias.as_ref().map_or(names, |a| vec![ident(&a.alias)]), cols, padded: false };
                 if let Some(source) = &i.source {
                     self.inserted(source, &i.columns, &into);
                 }
@@ -596,30 +631,43 @@ impl<'a> Trace<'a> {
         }
     }
 
+    /// The relations of a FROM, each with whether an outer join pads it (`padding`): the joined relation of a LEFT join, the
+    /// relations before it in the same FROM for a RIGHT one, both sides of a FULL one. A nested join passes its own padding
+    /// down to the relations inside it.
     fn from(&self, from: &[TableWithJoins]) -> Vec<Rel> {
         let mut rels = vec![];
         for t in from {
-            self.factor(&t.relation, &mut rels);
-            t.joins.iter().for_each(|j| self.factor(&j.relation, &mut rels));
+            let start = rels.len();
+            self.factor(&t.relation, false, &mut rels);
+            for j in &t.joins {
+                let (joined, before) = padding(&j.join_operator);
+                if before {
+                    rels[start..].iter_mut().for_each(|r| r.padded = true);
+                }
+                self.factor(&j.relation, joined, &mut rels);
+            }
         }
         rels
     }
 
-    fn factor(&self, f: &TableFactor, rels: &mut Vec<Rel>) {
+    fn factor(&self, f: &TableFactor, padded: bool, rels: &mut Vec<Rel>) {
         let (names, cols, alias) = match f {
             TableFactor::Table { name, alias, args: None, .. } => {
                 let (names, cols) = self.table(name);
                 (names, cols, alias)
             }
             TableFactor::Derived { subquery, alias, .. } => (vec![], self.query(subquery), alias),
-            TableFactor::NestedJoin { table_with_joins, .. } => return rels.extend(self.from(std::slice::from_ref(table_with_joins))),
+            TableFactor::NestedJoin { table_with_joins, .. } => {
+                let inner = self.from(std::slice::from_ref(table_with_joins));
+                return rels.extend(inner.into_iter().map(|r| Rel { padded: r.padded || padded, ..r }));
+            }
             // (a table function or a file read by name: its columns are unknown, but its alias still names it)
             TableFactor::Table { alias, .. } | TableFactor::Function { alias, .. } | TableFactor::TableFunction { alias, .. } => (vec![], None, alias),
             _ => (vec![], None, &None),
         };
         rels.push(match alias {
-            Some(a) => Rel { names: vec![ident(&a.name)], cols: cols.map(|c| renamed(c, &a.columns)) },
-            None => Rel { names, cols },
+            Some(a) => Rel { names: vec![ident(&a.name)], cols: cols.map(|c| renamed(c, &a.columns)), padded },
+            None => Rel { names, cols, padded },
         });
     }
 
@@ -857,7 +905,7 @@ impl<'a> Trace<'a> {
         if let Some((col, _)) = cols.iter().find(|(c, _)| c.starts_with(UNNAMED)) {
             return Some(Err(format!("needs a name for each of {name}'s columns: give {} an alias", &col[UNNAMED.len_utf8()..])));
         }
-        Some(Ok(Whole { name, cols }))
+        Some(Ok(Whole { name, cols, padded: rel.padded }))
     }
 
     /// Keeps the first refusal: the statement fails with it, and nothing is changed.
@@ -1260,6 +1308,28 @@ mod tests {
         assert!(view.contains(r#"pondra_json_agg(array_agg(pondra_row('id', "x"."id", 'name', "x"."name")), 'row') AS j"#), "{view}");
         let plain = rewrite_text("CREATE VIEW v AS SELECT json_agg(name) AS names FROM t");
         assert!(plain.contains("json_agg(name) AS names") && !plain.contains("pondra_"), "{plain}");
+    }
+
+    #[test]
+    fn a_row_an_outer_join_pads_is_null_where_postgres_pads_it() {
+        // (LEFT pads its joined side, RIGHT the sides before it, FULL both; an inner join's row is an object as before)
+        let left = rewrite_text("SELECT json_agg(c), json_agg(t) FROM t LEFT JOIN s.o AS c ON c.ref = t.id");
+        assert!(left.contains(r#"pondra_as_json(CASE WHEN "c"."id" IS NULL AND "c"."ref" IS NULL AND "c"."b" IS NULL THEN NULL ELSE pondra_row("#), "{left}");
+        assert_eq!(left.matches("CASE WHEN").count(), 1, "{left}");
+        let right = rewrite_text("SELECT json_agg(t) FROM t RIGHT JOIN s.o AS c ON c.ref = t.id");
+        assert!(right.contains(r#"pondra_as_json(CASE WHEN "t"."id" IS NULL AND "t"."name" IS NULL AND "t"."parent" IS NULL AND "t"."doc" IS NULL THEN NULL ELSE pondra_row("#), "{right}");
+        assert!(!rewrite_text("SELECT json_agg(c) FROM t RIGHT JOIN s.o AS c ON c.ref = t.id").contains("CASE"));
+        let full = rewrite_text("SELECT json_agg(t), json_agg(c) FROM t FULL JOIN s.o AS c ON c.ref = t.id");
+        assert_eq!(full.matches("CASE WHEN").count(), 2, "{full}");
+        let inner = rewrite_text("SELECT json_agg(c) FROM t JOIN s.o AS c ON c.ref = t.id");
+        assert!(!inner.contains("CASE") && inner.contains(r#"pondra_row('id', "c"."id", 'ref', "c"."ref", 'b', pondra_as_jsonb("c"."b"))"#), "{inner}");
+        // (a join in parentheses passes the outer join's padding to both of its relations)
+        let nested = rewrite_text("SELECT json_agg(c), json_agg(u) FROM t LEFT JOIN (s.o AS c JOIN t AS u ON u.id = c.ref) ON c.ref = t.id");
+        assert_eq!(nested.matches("CASE WHEN").count(), 2, "{nested}");
+        let sub = rewrite_text("SELECT json_agg(x) FROM t LEFT JOIN (SELECT id, name FROM t) AS x ON x.id = t.id");
+        assert!(sub.contains(r#"pondra_as_json(CASE WHEN "x"."id" IS NULL AND "x"."name" IS NULL THEN NULL ELSE pondra_row('id', "x"."id", 'name', "x"."name") END)"#), "{sub}");
+        let once = rewrite_text("SELECT json_agg(c) FROM t LEFT JOIN s.o AS c ON c.ref = t.id");
+        assert_eq!(rewrite_text(&once), once);
     }
 
     #[test]

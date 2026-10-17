@@ -260,7 +260,11 @@ These make JSON from values, and answer what Postgres answers. A document in a c
 
 A whole row can be a table, an alias, a CTE or a subquery. `json_agg(t)` answers each row as an
 object keyed by the column names. Give it an `ORDER BY` when the order matters: SQL doesn't order the
-rows of an aggregate that has none.
+rows of an aggregate that has none. A row an outer join pads with NULLs is NULL, as in Postgres: a
+`LEFT JOIN`'s unmatched right side, a `RIGHT JOIN`'s unmatched left side, both sides of a `FULL JOIN`.
+A row an equi-join matched on one of its columns has that column non-null, so only a matched row whose
+every column is NULL (`ON true`, or a condition on none of its columns) reads NULL where Postgres writes
+an object of NULLs.
 
 ```sql
 CREATE TABLE people (id BIGINT, name VARCHAR, doc JSON);
