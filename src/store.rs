@@ -908,17 +908,24 @@ impl Lake {
         // reads — the leader's, a new node's, a reader's without a live leader — are local.
         let cache = disk.as_ref().map(|d| d.dir.with_extension("catalog"));
         let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
-        let cat = match writer {
-            true => Catalog::writer(store.clone(), cache, local).await?,
-            false => match Catalog::opened(store.clone(), streamed, cache).await {
-                Ok(cat) => cat,
-                // (no catalog at all: say so, rather than the database's own words for it)
-                Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
-                    None => anyhow::bail!("{url} {}: start one there (`pondra {url}`, or `pondra serve --dir {url}`), or make a table in it", Lake::NO_LAKE),
-                    Some(_) => return Err(e),
+        let opening = async {
+            Ok::<_, anyhow::Error>(match writer {
+                true => Catalog::writer(store.clone(), cache, local).await?,
+                false => match Catalog::opened(store.clone(), streamed, cache).await {
+                    Ok(cat) => cat,
+                    // (no catalog at all: say so, rather than the database's own words for it)
+                    Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
+                        None => anyhow::bail!("{url} {}: start one there (`pondra {url}`, or `pondra serve --dir {url}`), or make a table in it", Lake::NO_LAKE),
+                        Some(_) => return Err(e),
+                    },
                 },
-            },
+            })
         };
+        // (the place's torn check runs beside the catalog's opening, so a bucket pays no extra round trip; `join`
+        // and not `try_join`: a failure of one must not drop the other half way, with SlateDB's tasks still running)
+        let (torn, cat) = tokio::join!(crate::memory::refuse_torn(&store, &url), opening);
+        torn?;
+        let cat = cat?;
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)

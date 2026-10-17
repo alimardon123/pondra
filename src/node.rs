@@ -152,8 +152,9 @@ impl Node {
         // so their reads are as fresh as a follower's instead of waiting for catalog polls.
         let streamed = !leader && !cluster.leader.addr.is_empty() && (!reader || cluster.leader_alive().await);
         let lake = match store::Lake::open(&dir, leader, streamed).await {
-            // (a lake a newer Pondra wrote: this binary must not lead or serve it, nor hold the term)
-            Err(e) if e.downcast_ref::<format::Newer>().is_some() => {
+            // (a lake a newer Pondra wrote, or a place a move didn't finish: this binary must not lead or serve it,
+            // nor hold the term; and a restart would find the same place again)
+            Err(e) if e.downcast_ref::<format::Newer>().is_some() || crate::memory::torn(&e) => {
                 if leader {
                     cluster::release(&store, cluster.leader.n).await;
                 }

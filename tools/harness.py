@@ -22596,6 +22596,21 @@ def memorylake():
         status, _, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{busy}'".encode())
         checks["a folder holding other things is refused, and no part of the lake is written there"] = (
             status != 200 and "holds other things" in text and not lake_objects(busy, "catalog/") and not lake_objects(busy, "data/"))
+        # A place a move didn't finish (its _moving mark is there, written first) is refused by name, by SET LOCATION
+        # and by a node opening it: a copy that stopped half way never looks like a lake.
+        torn_place = new_lake()
+        put_object(torn_place, "_moving", b'{"from": "memory://torn", "pid": 1, "started_ms": 0}')
+        put_object(torn_place, "catalog/x", b"half a copy")
+        status, hdrs, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{torn_place}'".encode())
+        torn_node = Node(torn_place, P + 6)
+        try:
+            torn_node.start(tries=1)
+        except RuntimeError:
+            pass  # (it stopped at once: a node opening a torn place says why and exits)
+        torn_log = open(torn_node.log).read() if os.path.exists(torn_node.log) else ""
+        checks["a place where a move didn't finish (its _moving mark) is refused by name, by SET LOCATION and by a node opening it"] = (
+            status != 200 and hdrs.get("x-pondra-sqlstate") == "55000" and "_moving" in text
+            and torn_node.p is not None and not torn_node.alive() and "_moving" in torn_log)
 
         # The move, under writes.
         wt = threading.Thread(target=writer, daemon=True)
@@ -22628,7 +22643,7 @@ def memorylake():
         checks["a task keeps ticking after the move"] = more(lambda: sql(P, "SELECT count(*) AS n FROM ticks")[0]["n"], ticks_before)
         checks["the lake's objects are at the target: catalog, tiered files and the file"] = (
             bool(lake_objects(target, "catalog/")) and any(k.endswith(".parquet") for k in lake_objects(target, "data/orders/"))
-            and bool(lake_objects(target, "files/notes/")))
+            and bool(lake_objects(target, "files/notes/")) and not os.path.exists(os.path.join(target, "_moving")))
         status, hdrs, _ = reply(P, "POST", "/sql", f"ALTER DATABASE {target_name} SET LOCATION '{new_lake()}'".encode())
         checks["a lake on disk is not moved this way (0A000)"] = status != 200 and hdrs.get("x-pondra-sqlstate") == "0A000"
         # The Iceberg table is published again where the lake is now: its newest metadata names the target, no
@@ -22687,7 +22702,7 @@ def memorylake():
         bad_stats = {"move_failed": why}
         checks["a move whose second pass fails leaves the lake in memory with every row, says why in /stats, and nothing at the target"] = (
             back and bool(bad_stats.get("move_failed")) and sql(P + 4, "SELECT v FROM kept ORDER BY v") == [{"v": 1}, {"v": 2}, {"v": 3}]
-            and not lake_objects(bad_target, "catalog/") and not lake_objects(bad_target, "data/"))
+            and not lake_objects(bad_target, "catalog/") and not lake_objects(bad_target, "data/") and not os.path.exists(os.path.join(bad_target, "_moving")))
         said = ""
         try:
             _client(P + 4).save(new_lake())

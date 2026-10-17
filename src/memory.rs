@@ -706,9 +706,29 @@ impl ObjectStore for Held {
     }
 }
 
+/// The mark a move writes at its target first and takes away last, so a place it didn't finish is never taken
+/// for a lake: a copy of one with no mark would open as a lake that is missing things. A lake's own objects are
+/// under `catalog/`, `data/`, `log/`, `files/` and the like, so this name is never one of them.
+const MOVING: &str = "_moving";
+
 /// The objects a move copied, by path, each with the e-tag it had in the lake when it was read. Pass 2
 /// copies what has changed since: the target's e-tags are its own, so only the lake's can say.
 pub type Copied = BTreeMap<String, Option<String>>;
+
+/// Refuses a place a move didn't finish (its `MOVING` mark is there), by name: a move to it, or a node opening
+/// it (`store.rs`'s `Lake::open` runs this beside the catalog's own opening, so a bucket pays no extra trip).
+pub async fn refuse_torn(store: &Store, place: &str) -> anyhow::Result<()> {
+    match store.head(&Path::from(MOVING)).await {
+        Ok(_) => Err(crate::codes::coded("55000", format!("a move to {place} didn't finish (its {MOVING} mark is there): remove what is there, or move elsewhere"))),
+        Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Is `e` the refusal `refuse_torn` makes of a place a move didn't finish?
+pub fn torn(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<crate::codes::Coded>().is_some_and(|c| c.0 == "55000" && c.1.contains(MOVING)))
+}
 
 /// `ALTER DATABASE b SET LOCATION 'dir'` (ADR-072 §7, `db.save`): a lake held in this process's memory moves
 /// to a folder or a bucket and goes on there, the same node and port, its tasks running. Every check passes
@@ -725,10 +745,15 @@ pub async fn set_location(lake: &Lake, database: &str, to: &str) -> anyhow::Resu
     anyhow::ensure!(crate::node::movable(), "this node can't move its lake: it was started without a host that restarts it");
     let to = crate::ddl::full(to)?;
     crate::backup::apart(lake, &to)?;
-    anyhow::ensure!(crate::backup::empty(&to).await?, "{to} holds other things: move into a new place (or an empty folder)");
     crate::ext::reach_place(lake, &to).await?; // (a bucket: the secret whose scope covers it)
     let dest = crate::store::open_store(&to)?.1;
-    let metas: Vec<ObjectMeta> = lake.store.list(None).try_collect().await.context("listing the lake")?;
+    refuse_torn(&dest, &to).await?; // (a move that didn't finish there: named, before the place is called holding other things)
+    anyhow::ensure!(crate::backup::empty(&to).await?, "{to} holds other things: move into a new place (or an empty folder)");
+    let metas: Vec<ObjectMeta> = lake.store.list(None).try_collect().await.context("listing the lake")?; // (before the mark: a failure here leaves the place as it was)
+    // The mark goes first of the copies, alone (`Create`: a mark already there is another move's). From here on,
+    // whatever stops this move leaves a place refused by name, never a copy that looks like a lake.
+    let mark = serde_json::json!({"from": lake.url, "pid": std::process::id(), "started_ms": crate::log::now_ms()});
+    dest.put_opts(&Path::from(MOVING), serde_json::to_vec(&mark)?.into(), PutOptions { mode: PutMode::Create, ..Default::default() }).await.context("marking the place")?;
     let done: Vec<anyhow::Result<Option<(String, Option<String>, u64)>>> = futures::stream::iter(metas)
         .map(|meta| {
             let (from, dest) = (lake.store.clone(), dest.clone());
@@ -754,10 +779,11 @@ pub async fn set_location(lake: &Lake, database: &str, to: &str) -> anyhow::Resu
         }
     }
     if let Some(e) = failed {
-        clear(&dest).await;
-        return Err(e.context(format!("copying the lake to {to}")));
+        return Err(cleared(&dest, &to, e.context(format!("copying the lake to {to}"))).await);
     }
-    crate::node::move_lake(crate::node::Move { from: lake.url.clone(), to: to.clone(), copied })?;
+    if let Err(e) = crate::node::move_lake(crate::node::Move { from: lake.url.clone(), to: to.clone(), copied }) {
+        return Err(cleared(&dest, &to, e).await); // (no host took the move: the copies go, and the mark with them)
+    }
     // (answered once the host has begun to stop the node: a statement sent next waits for the move, rather
     // than being answered by the node it is about to leave)
     for _ in 0..5000 {
@@ -793,12 +819,44 @@ async fn copy_at(from: &Store, to: &Store, at: &Path, create: bool) -> anyhow::R
     Ok(Some((e_tag, size)))
 }
 
-/// Takes away every object at the target, so a move that failed leaves it as it was: empty, as pass 1 found
-/// it. A listing, not what the copies named: a failed copy may have written part of an object.
-async fn clear(dest: &Store) {
-    let listed: Vec<Path> = dest.list(None).map_ok(|meta| meta.location).try_collect().await.unwrap_or_default();
-    for at in listed {
-        let _ = dest.delete(&at).await;
+/// Takes away what is at the target, so a move that failed leaves the place as pass 1 found it: empty. A listing,
+/// not what the copies named: a failed copy may have written part of an object. The mark goes last, and only once
+/// everything else is gone (a listing returns it first, a local folder in any order): a copy without its mark would
+/// look like a lake, and one with it is refused by name. A failure keeps the mark and says how many objects are left.
+async fn clear(dest: &Store) -> anyhow::Result<()> {
+    let listed: Vec<Path> = dest.list(None).map_ok(|meta| meta.location).try_collect().await.context("listing the place to clear it (none of it is taken away)")?;
+    let mark = Path::from(MOVING);
+    let (others, marked): (Vec<Path>, Vec<Path>) = listed.into_iter().partition(|at| *at != mark);
+    let (mut left, mut first): (usize, Option<object_store::Error>) = (0, None);
+    for at in &others {
+        if let Err(e) = take_away(dest, at).await {
+            left += 1;
+            first = first.or(Some(e));
+        }
+    }
+    if let Some(e) = first {
+        return Err(anyhow::Error::from(e).context(format!("{} of its objects couldn't be taken away (its {MOVING} mark stays)", left + marked.len())));
+    }
+    for at in &marked {
+        take_away(dest, at).await.with_context(|| format!("its {MOVING} mark couldn't be taken away"))?;
+    }
+    Ok(())
+}
+
+/// Takes `at` away. One that is gone already is taken away too: a delete that finds it gone is no failure.
+async fn take_away(dest: &Store, at: &Path) -> object_store::Result<()> {
+    match dest.delete(at).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The error a move that failed ends with: `e`, and, when the target can't be cleared either, that too. Its mark
+/// stays then, so the place is refused by name until someone clears it.
+async fn cleared(dest: &Store, to: &str, e: anyhow::Error) -> anyhow::Error {
+    match clear(dest).await {
+        Ok(()) => e,
+        Err(c) => e.context(format!("{to} couldn't be cleared after it ({c:#})")),
     }
 }
 
@@ -819,8 +877,9 @@ pub async fn settle(m: &crate::node::Move) -> anyhow::Result<()> {
     let from = MEMORY.lock().unwrap_or_else(PoisonError::into_inner).get(m.from.trim_end_matches('/')).cloned().context("the lake to move is no longer in memory")?;
     let dest = crate::store::open_store(&m.to)?.1;
     if let Err(e) = settle_into(&from, &dest, m).await {
-        // (a failed second pass leaves the lake in memory, whole, and nothing of the move at the target)
-        clear(&dest).await;
+        // (a failed second pass leaves the lake in memory, whole, and nothing of the move at the target: or its
+        // mark, when the target can't be cleared either, which refuses the place by name)
+        let e = cleared(&dest, &m.to, e).await;
         if !m.to.contains("://") {
             prune_empty(FsPath::new(&m.to)); // (a folder keeps the folders its objects were in)
         }
@@ -860,13 +919,15 @@ async fn settle_into(from: &Store, dest: &Store, m: &crate::node::Move) -> anyho
         .map_ok(|meta| meta.location)
         .try_filter(|at| {
             let key: &str = at.as_ref();
-            ready(!keep.contains(key))
+            ready(!keep.contains(key) && key != MOVING) // (the mark is in no lake's keep: it goes last, below)
         })
         .try_collect()
         .await?;
     for at in &stale {
         dest.delete(at).await?;
     }
+    // The mark goes last: until then a copy that hasn't caught up is refused by name, never taken for a lake.
+    take_away(dest, &Path::from(MOVING)).await?;
     Ok(())
 }
 
@@ -1126,6 +1187,59 @@ mod tests {
         assert!(!bare.exists(), "a folder with no lock file, a minute old, is removed");
         assert!(parent.join("new").exists(), "a folder made just now is kept");
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// A folder of this test's, not made yet (`open_store` makes it), and its store: a move's target.
+    fn target(name: &str) -> (PathBuf, Store) {
+        let folder = std::env::temp_dir().join(format!("pondra-move-{name}-{}", uuid::Uuid::new_v4().simple()));
+        let (_, store, _) = crate::store::open_store(folder.to_str().unwrap()).unwrap();
+        (folder, store)
+    }
+
+    #[tokio::test]
+    async fn settle_takes_the_mark_away_last_and_leaves_the_lake_whole() {
+        let lake = format!("memory://mc-{}", uuid::Uuid::new_v4().simple());
+        let from = store(&lake);
+        let objects = ["catalog/manifest", "data/t/a.parquet", "files/notes/a.txt"];
+        for at in objects {
+            from.put(&Path::from(at), bytes(1)).await.unwrap();
+        }
+        let (folder, dest) = target("settle");
+        dest.put(&Path::from(MOVING), bytes(9)).await.unwrap(); // (as a move's first step leaves it)
+        let to = folder.to_str().unwrap().to_string();
+        settle(&crate::node::Move { from: lake, to, copied: Copied::new() }).await.unwrap();
+        let mut at: Vec<String> = dest.list(None).map_ok(|meta| meta.location.to_string()).try_collect().await.unwrap();
+        at.sort();
+        assert_eq!(at, objects, "every object of the lake, and no mark");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[tokio::test]
+    async fn a_place_a_move_didnt_finish_is_refused_by_name() {
+        let (folder, dest) = target("torn");
+        let place = folder.to_str().unwrap().to_string();
+        refuse_torn(&dest, &place).await.expect("a place with no mark is no torn place");
+        dest.put(&Path::from(MOVING), bytes(1)).await.unwrap();
+        let e = refuse_torn(&dest, &place).await.unwrap_err();
+        assert_eq!(crate::codes::of(&e), "55000");
+        assert!(torn(&e), "the refusal is the torn place's");
+        let words = format!("{e:#}");
+        assert!(words.contains(&place) && words.contains(MOVING), "{words}");
+        assert!(!torn(&anyhow::anyhow!("{place} holds other things")), "another error is not");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[tokio::test]
+    async fn clear_takes_everything_away_the_mark_too() {
+        let (folder, dest) = target("clear");
+        dest.put(&Path::from(MOVING), bytes(1)).await.unwrap();
+        for at in ["catalog/manifest", "data/t/a.parquet"] {
+            dest.put(&Path::from(at), bytes(2)).await.unwrap();
+        }
+        clear(&dest).await.unwrap();
+        let left: Vec<String> = dest.list(None).map_ok(|meta| meta.location.to_string()).try_collect().await.unwrap();
+        assert!(left.is_empty(), "{left:?}");
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]
