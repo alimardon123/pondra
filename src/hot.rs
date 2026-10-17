@@ -93,7 +93,7 @@ impl Hot {
     /// watches the process itself rather than only its own budget, and drops the columns nobody
     /// has read lately until the node is under the line again.
     pub fn watch(self: &Arc<Self>) {
-        let (hot, Some(ram)) = (self.clone(), crate::store::ram()) else { return };
+        let (hot, Some(ram)) = (Arc::downgrade(self), crate::store::ram()) else { return }; // (weak: it ends with its lake)
         if !self.on() {
             return;
         }
@@ -101,6 +101,7 @@ impl Hot {
             let line = ram / 5 * 3; // three fifths of the machine
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
+                let Some(hot) = hot.upgrade() else { return };
                 if let Some(rss) = crate::store::resident() {
                     if rss > line {
                         hot.trim(rss - line);

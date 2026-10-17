@@ -39,6 +39,8 @@ pub struct Provider {
     pub scopes: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub postgres_oauth: bool, // (POSTGRES 'oauth': the Postgres port asks its users for OAUTHBEARER, psql 18's, not a password)
 }
 
 impl Provider {
@@ -55,6 +57,7 @@ impl Provider {
         o.push(format!("USERS {}", q(if self.any { "any" } else { "listed" })));
         o.push(format!("SCOPES {}", q(&self.scopes)));
         o.extend(self.label.as_deref().map(|l| format!("LABEL {}", q(l))));
+        o.extend(self.postgres_oauth.then(|| "POSTGRES 'oauth'".to_string()));
         format!("CREATE IDENTITY PROVIDER {name} ({})", o.join(", "))
     }
 }
@@ -81,7 +84,7 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     })
 }
 
-const OPTIONS: &str = "ISSUER, CLIENT_ID, AUDIENCE, SECRET, USER_CLAIM, ROLES_CLAIM, USERS, SCOPES, LABEL";
+const OPTIONS: &str = "ISSUER, CLIENT_ID, AUDIENCE, SECRET, USER_CLAIM, ROLES_CLAIM, USERS, SCOPES, LABEL, POSTGRES";
 
 fn parse(mut w: Words) -> Result<crate::users::Change> {
     use crate::users::Change;
@@ -165,6 +168,13 @@ fn made(mut given: HashMap<String, Vec<String>>) -> Result<Provider> {
     let scopes = one("scopes")?.unwrap_or_else(|| "openid email profile".into());
     ensure!(scopes.split_whitespace().any(|s| s == "openid"), "SCOPES '{scopes}': OpenID Connect's sign-in needs openid among them");
     let label = one("label")?;
+    // (one way to sign in a connection, as Postgres's pg_hba has it: libpq 18 asked for OAUTHBEARER doesn't
+    // fall back to a password, and older drivers can't take it, so asking for it is the admin's choice)
+    let postgres_oauth = match one("postgres")?.as_deref().map(str::to_lowercase).as_deref() {
+        None | Some("password") => false,
+        Some("oauth") => true,
+        Some(other) => bail!("POSTGRES '{other}': 'password' (a driver sends the provider's token as its password) or 'oauth' (psql 18 gets a token itself, through OAUTHBEARER)"),
+    };
     for c in [Some(&user_claim), roles_claim.as_ref()].into_iter().flatten() {
         ensure!(!c.is_empty() && c.len() <= 64, "a claim's name is at most 64 characters");
     }
@@ -172,11 +182,11 @@ fn made(mut given: HashMap<String, Vec<String>>) -> Result<Provider> {
     let mut rest: Vec<String> = given.into_keys().map(|k| k.to_uppercase()).collect();
     rest.sort();
     ensure!(rest.is_empty(), "{}: not an identity provider's option ({OPTIONS})", rest.join(", "));
-    Ok(Provider { issuer, client_id, audience, secret, user_claim, roles_claim, any, scopes, label })
+    Ok(Provider { issuer, client_id, audience, secret, user_claim, roles_claim, any, scopes, label, postgres_oauth })
 }
 
 /// May a provider be reached at `url`: https, or http on this machine (tests, a provider beside the node)?
-fn reachable(url: &str) -> bool {
+pub(crate) fn reachable(url: &str) -> bool {
     match reqwest::Url::parse(url) {
         Ok(u) if u.scheme() == "https" => u.host().is_some(),
         Ok(u) if u.scheme() == "http" => matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")),
@@ -267,6 +277,28 @@ pub async fn resource(lake: &Lake, resource: &str) -> Option<Value> {
 /// for a password, which may be such a token.
 pub async fn anyone(lake: &Lake) -> bool { all(lake).await.is_ok_and(|a| a.iter().any(|(_, p)| p.any)) }
 
+/// The provider the Postgres port asks a name with no password to sign in through with OAUTHBEARER: the
+/// first, by name, that says `POSTGRES 'oauth'` and would sign it in (`listed`: a user made here; else
+/// only `USERS 'any'`). Its issuer and scopes, as psql 18 is told them (RFC 7628's error).
+pub async fn oauth_for(lake: &Lake, listed: bool) -> Option<(String, String)> {
+    let all = all(lake).await.ok()?;
+    let (_, p) = all.iter().find(|(_, p)| p.postgres_oauth && (listed || p.any))?;
+    Some((p.issuer.trim_end_matches('/').to_string(), p.scopes.clone()))
+}
+
+/// OAUTHBEARER's first message (RFC 7628, from Kafka's clients and psql 18): `n,,` then
+/// `\x01auth=Bearer <token>\x01\x01`. None: not that message, or one with no `auth` (psql 18 asks with
+/// `auth=` empty first, to be told where the provider is).
+pub fn bearer(message: &[u8]) -> Option<String> {
+    if !(message.starts_with(b"n,") || message.starts_with(b"y,")) {
+        return None;
+    }
+    let text = std::str::from_utf8(message).ok()?;
+    let value = text.split('\x01').find_map(|kv| kv.strip_prefix("auth="))?;
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim().to_string())
+}
+
 // ---------------------------------------------------------------- a token checked
 
 /// The longest token taken: an ID token with many groups is a few KB.
@@ -330,7 +362,7 @@ pub async fn why(lake: &Lake, token: &str) -> Option<String> {
 }
 
 /// Whom each provider of the token's issuer whose checks pass says it names, in name order (never none).
-async fn checked(providers: &[(String, Provider)], token: &str, now: f64) -> Result<Vec<Claimed>> {
+pub(crate) async fn checked(providers: &[(String, Provider)], token: &str, now: f64) -> Result<Vec<Claimed>> {
     let mut parts = token.splitn(3, '.');
     let (h, c, s) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
     let part = |p: &str, what: &str| -> Result<Value> {
@@ -385,12 +417,21 @@ fn claimed(name: &str, p: &Provider, c: &Value, exp: f64) -> Result<Claimed> {
         };
         ensure!(verified, "its email ({user}) isn't verified by identity provider {name}");
     }
-    let roles: Vec<String> = match p.roles_claim.as_deref().map(|r| &c[r]) {
+    let roles: Vec<String> = match p.roles_claim.as_deref().map(|r| claim(c, r)) {
         Some(Value::Array(all)) => all.iter().filter_map(Value::as_str).map(String::from).collect(),
         Some(Value::String(s)) => s.split_whitespace().map(String::from).collect(),
         _ => vec![],
     };
     Ok(Claimed { user: user.to_lowercase(), roles: roles.into_iter().take(64).collect(), provider: name.into(), any: p.any, expires_ms: (exp * 1000.0) as u64 })
+}
+
+/// A claim by its name or, when no claim has that name, by a path of names: Keycloak's realm roles are
+/// `realm_access.roles`. The whole name is looked for first, since Auth0's claims are URLs, dots and all.
+fn claim<'a>(c: &'a Value, name: &str) -> &'a Value {
+    match &c[name] {
+        Value::Null => name.split('.').fold(c, |v, k| &v[k]),
+        v => v,
+    }
 }
 
 // ---------------------------------------------------------------- the providers' keys
@@ -488,18 +529,24 @@ fn remember(issuer: &str, found: Result<Vec<Jwk>>) {
     }
 }
 
+/// An issuer's discovery document, checked to name the issuer exactly as its tokens do.
+pub(crate) async fn discovery(issuer: &str) -> Result<Value> {
+    let doc = get_json(&format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'))).await?;
+    ensure!(doc["issuer"].as_str() == Some(issuer), "its discovery document names issuer {}, not {issuer} (its tokens must name the issuer the document does)", doc["issuer"]);
+    Ok(doc)
+}
+
 /// An issuer's keys, from its discovery document's `jwks_uri` (OpenID Connect Discovery: the document
 /// must name the issuer exactly as its tokens do).
 async fn fetch(issuer: &str) -> Result<Vec<Jwk>> {
-    let doc = get_json(&format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'))).await?;
-    ensure!(doc["issuer"].as_str() == Some(issuer), "its discovery document names issuer {}, not {issuer} (its tokens must name the issuer the document does)", doc["issuer"]);
+    let doc = discovery(issuer).await?;
     let uri = doc["jwks_uri"].as_str().context("its discovery document has no jwks_uri")?;
     let keys = jwks(&get_json(uri).await?);
     ensure!(!keys.is_empty(), "{uri} has no RSA or EC key for signatures");
     Ok(keys)
 }
 
-async fn get_json(url: &str) -> Result<Value> {
+pub(crate) async fn get_json(url: &str) -> Result<Value> {
     ensure!(reachable(url), "{url}: a provider is asked over https (http only on this machine)");
     let mut r = crate::ext::web().get(url).timeout(Duration::from_secs(10)).send().await.with_context(|| url.to_string())?;
     ensure!(r.status().is_success(), "{url} answered {}", r.status());
@@ -636,8 +683,9 @@ mod tests {
             Some(crate::write::Stmt::Invalid(e)) => j!({"error": e}),
             _ => j!(null),
         };
-        let c = p("CREATE IDENTITY PROVIDER okta (ISSUER 'https://acme.okta.com', CLIENT_ID '0oa1', AUDIENCE ('api://pondra', 'b'), ROLES_CLAIM 'groups', USERS 'any')");
+        let c = p("CREATE IDENTITY PROVIDER okta (ISSUER 'https://acme.okta.com', CLIENT_ID '0oa1', AUDIENCE ('api://pondra', 'b'), ROLES_CLAIM 'groups', USERS 'any', POSTGRES 'oauth')");
         assert_eq!((c["do"].as_str(), c["provider"]["any"].as_bool(), c["provider"]["audience"][1].as_str(), c["provider"]["user_claim"].as_str()), (Some("create_provider"), Some(true), Some("b"), Some("email")));
+        assert_eq!(c["provider"]["postgres_oauth"], true);
         let back = Provider::deserialize(&c["provider"]).unwrap();
         assert_eq!(p(&back.sql("okta"))["provider"], c["provider"]); // (its statement makes it again)
         assert_eq!(p("create or replace identity provider g (issuer = 'http://127.0.0.1:9100', client_id = 'x')")["replace"], true);
@@ -648,11 +696,30 @@ mod tests {
             ("CREATE IDENTITY PROVIDER o (ISSUER 'https://i', CLIENT_ID 'x', COLOUR 'red')", "COLOUR"),
             ("CREATE IDENTITY PROVIDER o (ISSUER 'https://i', CLIENT_ID 'x', USERS 'all')", "listed"),
             ("CREATE IDENTITY PROVIDER o (ISSUER 'https://i', CLIENT_ID 'x', SCOPES 'email')", "openid"),
+            ("CREATE IDENTITY PROVIDER o (ISSUER 'https://i', CLIENT_ID 'x', POSTGRES 'scram')", "'password'"),
             ("ALTER IDENTITY PROVIDER o SET (LABEL 'x')", "CREATE OR REPLACE"),
         ] {
             assert!(p(sql)["error"].as_str().unwrap_or_default().contains(says), "{sql}: {}", p(sql));
         }
         assert_eq!(p("CREATE USER ann"), j!(null)); // (users' own)
         assert!(shaped("eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJ4In0.c2ln") && !shaped("pt_abc") && !shaped("eyJ.a") && !shaped("a password with spaces"));
+        assert!(!p("CREATE IDENTITY PROVIDER g (ISSUER 'https://i', CLIENT_ID 'x', POSTGRES 'password')")["provider"].as_object().unwrap().contains_key("postgres_oauth"));
+    }
+
+    #[test]
+    fn claims() {
+        let c = j!({"groups": ["a"], "realm_access": {"roles": ["r"]}, "https://acme.com/roles": ["u"]});
+        assert_eq!((claim(&c, "groups"), claim(&c, "realm_access.roles"), claim(&c, "https://acme.com/roles")), (&j!(["a"]), &j!(["r"]), &j!(["u"])));
+        assert_eq!(claim(&c, "realm_access.nope"), &Value::Null);
+    }
+
+    #[test]
+    fn bearers() {
+        // (RFC 7628's first message: Kafka's clients and psql 18; psql's first asks with `auth=` empty)
+        assert_eq!(bearer(b"n,,\x01auth=Bearer eyJ.a.b\x01\x01").as_deref(), Some("eyJ.a.b"));
+        assert_eq!(bearer(b"n,a=ana,\x01host=h\x01auth=bearer t\x01\x01").as_deref(), Some("t"));
+        assert_eq!(bearer(b"n,,\x01auth=\x01\x01"), None);
+        assert_eq!(bearer(b"\0ana\0secret"), None); // (PLAIN's)
+        assert_eq!(bearer(b"n,,\x01auth=Basic YQ==\x01\x01"), None);
     }
 }

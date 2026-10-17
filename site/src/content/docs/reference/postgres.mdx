@@ -24,7 +24,7 @@ pondra serve lake --pg 127.0.0.1:5432
 |---|---|
 | host, port | the address of `--pg` |
 | database | any name on a node that serves one lake. `SELECT current_database()` gives the lake's name. On a [folder of lakes](/pondra/guides/server/), the database in the connection picks the lake |
-| user, password | with no tokens set and no user who signs in, anything. Otherwise a [user](/pondra/guides/security/#users-roles-and-grants) and its password, signed in with SCRAM-SHA-256 as Postgres does it (a user with only tokens gives one as its password); or `reader`, `writer` or `admin` and that role's token |
+| user, password | with no tokens set and no user who signs in, anything. Otherwise a [user](/pondra/guides/security/#users-roles-and-grants) and its password, signed in with SCRAM-SHA-256 as Postgres does it (a user with only tokens gives one as its password); or `reader`, `writer` or `admin` and that role's token. With an [identity provider](/pondra/guides/single-sign-on/), a user with no password gives the provider's token as its password, or, when the provider says `POSTGRES 'oauth'`, signs in with OAuth (`OAUTHBEARER`: psql 18's `oauth_issuer` and `oauth_client_id`) |
 | SSL | with a certificate (`--tls-cert`, `--tls-key`), `sslmode=require` from other machines (`prefer` works too: it takes TLS when the node offers it). `sslmode=disable` works from this machine only: a plain connection from another machine gets `FATAL 28000` and the reason. Without a certificate, `sslmode=require` is refused. See [TLS](/pondra/guides/security/#tls) |
 
 `SELECT version()` answers `PostgreSQL 16.0 (Pondra on Apache DataFusion)`, and `SHOW server_version` answers `16.0`.

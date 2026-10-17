@@ -26,10 +26,12 @@ for _ in $(seq ${WAIT_MINUTES:-75}); do
     echo "pondra-$platform from https://github.com/$repo/actions/runs/$run:" && ls dist
     exit 0
   fi
-  # (a pull request labelled `ci` builds linux-x64 alone: build.yml's `plan` has made its jobs, and not this one)
+  # (a run that doesn't build this platform: a pull request's `ci` builds linux-x64 alone, its
+  # `full-ci` all but macOS Intel, and main builds macOS Intel only on a version commit or by hand.
+  # build.yml's `plan` has made its jobs, and not this one)
   jobs=$([ -n "$run" ] && gh api "repos/$repo/actions/runs/$run/jobs" --jq '.jobs[] | "\(.name) \(.status)"' 2>/dev/null || true)
   if grep -qx 'plan completed' <<< "$jobs" && grep -q '^linux-x64' <<< "$jobs" && ! grep -q "^$platform " <<< "$jobs"; then
-    echo "::error::build run $run builds linux-x64 alone: the label full-ci on the pull request builds $platform" && exit 1
+    echo "::error::build run $run doesn't build $platform: a pull request's full-ci builds all but macos-x64, and the build workflow started by hand builds every platform" && exit 1
   fi
   if [ -n "$run" ] && [ "$status" = completed ]; then
     echo "::error::build run $run of $sha ended without pondra-$platform's packages" && exit 1

@@ -142,7 +142,7 @@ fn lines(w: Watch) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::
                 true => crate::users::principal(&w.app.lake, &w.who.name).await.unwrap_or_else(|_| crate::auth::Principal { name: w.who.name.clone(), role: crate::auth::Role::None, access: Some(Default::default()), door: "http", from: None, operator: false }), // (gone: nothing)
                 false => w.who.clone(),
             };
-            let rows = crate::temp::SESSION.scope(w.session.clone(), crate::auth::WHO.scope(who, w.app.query(&w.sql, None))).await.and_then(|b| crate::server::render(&b, None));
+            let rows = crate::temp::SESSION.scope(w.session.clone(), crate::auth::WHO.scope(who, w.app.query(&w.sql, None))).await.and_then(|b| crate::answer::render(&b, None, crate::pages::keep));
             let rows = match rows {
                 Ok(r) => r,
                 Err(e) => return Some((Ok(error(e, &w.tag)), None)),

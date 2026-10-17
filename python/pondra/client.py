@@ -62,6 +62,19 @@ def _pyarrow(what):
         raise ImportError(f"{what} needs pyarrow: pip install pyarrow (rows() works without it)") from None
 
 
+def _saved_login(url):
+    """The token `pondra login` kept for the server `url` is on: the longest saved server that `url` equals
+    or starts with and then `/` (as the command line's `project::saved` picks it). None: no file, or none for it."""
+    try:
+        home = os.environ.get("PONDRA_HOME") or os.path.join(os.path.expanduser("~"), ".pondra")
+        with open(os.path.join(home, "login.json")) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return None
+    hits = [(server, token) for server, token in saved.items() if url == server or url.startswith(server + "/")] if isinstance(saved, dict) else []
+    return max(hits, key=lambda hit: len(hit[0]))[1] if hits else None
+
+
 def _json_rows(out):
     """The node's JSON rows (it leaves out nulls: they come back as None)."""
     rows = json.loads(out)
@@ -179,6 +192,8 @@ class Pondra:
         a transaction, temporary tables, settings, variables — every request goes to it alone."""
         global _last
         urls = [u.strip().rstrip("/") for u in (url.split(",") if isinstance(url, str) else url) if u.strip()]
+        if not (token or user or password):  # (signed in with `pondra login`: its token for this server, if it kept one)
+            token = next((t for t in map(_saved_login, urls) if t), None)
         self.urls, self.url, self.token, self.timeout, self.retry_secs = urls, urls[0], token, timeout, retry_secs
         self._held = None  # the node holding this connection's session, while one does (`x-pondra-session: held`)
         self._reached = False  # (a node has answered: one that is gone now is waited for, not before)
@@ -670,6 +685,18 @@ class Pondra:
             raise
         self._run("COMMIT")
 
+    def save(self, target):
+        """Moves a lake held in memory to `target` (a folder, or a bucket's URL) and goes on over it there:
+        its tables, views, tasks and history as they are, the same connection. Statements wait while it
+        moves, and a lake that isn't in memory is refused (`ALTER DATABASE … SET LOCATION`)."""
+        name = self._run("SELECT current_database() AS d").rows()[0]["d"].replace('"', '""')  # (SQL's quoting)
+        target = os.fspath(target).replace("'", "''")
+        self._run(f"ALTER DATABASE \"{name}\" SET LOCATION '{target}'")
+        self._run("SELECT 1")  # (its retries wait out the move: the node starts again on the target)
+        failed = json.loads(self._call("GET", "/stats")).get("move_failed")  # (a move that failed: the lake stays in memory)
+        if failed:
+            raise RuntimeError(f"the lake stays in memory: {failed}")
+
     def close(self):
         """End this connection's session (its temporary tables and views), and close the node
         `connect()` started for it: in this process when no other connection is open to it (and a lake
@@ -955,7 +982,7 @@ def _child(dir="lake", port=None, token=None, flags=(), timeout=120, python=True
         env = {**os.environ, **(env or {}), "PONDRA_OWNER_KEY": owner, "PYTHONPATH": os.pathsep.join(p for p in (here, os.environ.get("PYTHONPATH")) if p)}
         proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err, env=env)
     db = Pondra(f"http://127.0.0.1:{port}", token, retry_secs=0)
-    db.process, db.owner, deadline = proc, owner, time.time() + timeout
+    db.process, db.owner, db.token, deadline = proc, owner, token, time.time() + timeout  # (its key, never a token `pondra login` kept)
     while True:
         try:
             stats = db._call("GET", "/stats")

@@ -11,7 +11,7 @@ use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 use datafusion::arrow::compute::concat_batches;
-use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{self, Statement};
@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+pub use crate::text::{first_word, head, ident, object};
 
 // ---------------------------------------------------------------- tables
 
@@ -403,15 +404,6 @@ pub fn cluster_names(e: &ast::Expr) -> Vec<String> {
     }
 }
 
-/// A name as SQL resolves it: its parts, unquoted ones in lower case, joined by dots.
-pub fn object(n: &ast::ObjectName) -> String {
-    let part = |p: &ast::ObjectNamePart| p.as_ident().map(ident).unwrap_or_else(|| p.to_string());
-    n.0.iter().map(part).collect::<Vec<_>>().join(".")
-}
-
-/// One part of a name: as written if quoted, else in lower case.
-pub fn ident(i: &ast::Ident) -> String { if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() } }
-
 /// A name in SQL, each part quoted as it is: `"t"`, `"schema"."t"`, `"lake"."schema"."t"`.
 pub fn sql_name(name: &str) -> String {
     name.split('.').map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(".")
@@ -566,6 +558,11 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(c) = (head == "alter").then(|| DB_REFRESH.captures(first_word(sql))).flatten() {
         let tables = c[2].split(',').map(|t| name(t.trim())).filter(|t| !t.is_empty()).collect();
         return Some(Stmt::Ddl(vec![Ddl::Refresh { database: Some(name(&c[1])), tables }]));
+    }
+    // `ALTER DATABASE b SET LOCATION 'dir'`: a lake held in memory moves there, and goes on there (`memory.rs`).
+    static DB_LOCATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+SET\s+LOCATION\s+'((?:[^']|'')*)'\s*;?\s*$"#).expect("a regex"));
+    if let Some(c) = (head == "alter").then(|| DB_LOCATION.captures(first_word(sql))).flatten() {
+        return Some(Stmt::Ddl(vec![Ddl::SetLocation { database: name(&c[1]), to: c[2].replace("''", "'") }]));
     }
     // `ALTER DATABASE b SET (protected = true | false)`: a database's protection (ADR-058: `protect.rs`).
     static DB_PROTECT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+DATABASE\s+([\w"-]+)\s+SET\s*\(\s*protected\s*=\s*(true|false)\s*\)\s*;?\s*$"#).expect("a regex"));
@@ -808,32 +805,6 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     })
 }
 
-/// `CREATE TABLE t (a BIGINT, b VARCHAR, PRIMARY KEY (a)) [WITH (publish = 'delta,iceberg',
-/// cluster_by = 'b', merge = 'total:sum', partition_by = 'day(ts)')]` → the table name and its spec. SQL types become Arrow
-/// types the way DataFusion maps them.
-/// With `AS SELECT`, the columns are the query's (run over `from`'s tables; `files`: local files
-/// too, for `pondra sql` on its own machine), or those it names (`CREATE TABLE t (a INT, b
-/// VARCHAR) AS VALUES …`: the query's columns by position).
-/// `sql` from its first word on: past leading whitespace and comments (`-- …`, `/* … */`).
-pub fn first_word(sql: &str) -> &str {
-    let mut s = sql.trim_start();
-    loop {
-        if let Some(rest) = s.strip_prefix("--") {
-            s = rest.find('\n').map_or("", |i| &rest[i + 1..]).trim_start();
-        } else if let Some(rest) = s.strip_prefix("/*") {
-            s = rest.find("*/").map_or("", |i| &rest[i + 2..]).trim_start();
-        } else {
-            return s;
-        }
-    }
-}
-
-/// The statement's first word, lowercased (`create` for `CREATE TABLE …`, past comments): what a
-/// statement's own regexes are looked at for, so a query compiles none of them.
-pub fn head(sql: &str) -> String {
-    first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_ascii_lowercase()
-}
-
 /// The type an ADD COLUMN passes on: a type the lake checks (uuid, JSON, VARCHAR(n)) keeps its own
 /// spelling, so the AddColumn branch holds it as text and records it (`types::sql_type`); any
 /// other is as DataFusion plans it (`sql_type`).
@@ -873,6 +844,12 @@ pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::Fi
     Ok(ctx.table("t").await?.schema().fields().iter().cloned().collect::<Vec<_>>())
 }
 
+/// `CREATE TABLE t (a BIGINT, b VARCHAR, PRIMARY KEY (a)) [WITH (publish = 'delta,iceberg',
+/// cluster_by = 'b', merge = 'total:sum', partition_by = 'day(ts)')]` → the table name and its spec. SQL types become Arrow
+/// types the way DataFusion maps them.
+/// With `AS SELECT`, the columns are the query's (run over `from`'s tables; `files`: local files
+/// too, for `pondra sql` on its own machine), or those it names (`CREATE TABLE t (a INT, b
+/// VARCHAR) AS VALUES …`: the query's columns by position).
 pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Result<String> {
     let (as_text, mut enums, mut sql_types) = crate::types::columns(from, &c.columns).await?; // (an enum or a uuid column holds text: `types.rs`)
     let declared = || declared_of(&as_text);
@@ -981,15 +958,7 @@ pub async fn define(app: &crate::server::App, name: &str, spec: &str) -> Result<
     Ok(out)
 }
 
-/// How a SQL type is kept: strings as Utf8; timestamps in microseconds, as Iceberg, Delta, Spark
-/// and Postgres keep them.
-pub fn stored(t: &DataType) -> DataType {
-    match t {
-        DataType::Utf8View | DataType::LargeUtf8 => DataType::Utf8,
-        DataType::Timestamp(_, tz) => DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
-        t => t.clone(),
-    }
-}
+pub use crate::answer::stored;
 
 /// `ALTER TABLE t ADD COLUMN c TYPE`: the table's definition with the new column at the end, sent
 /// like a CREATE TABLE (the leader adds it; old rows read it as null). None: IF NOT EXISTS, and it does.
@@ -1301,9 +1270,15 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
     if recorded(lake, job).await? {
         return Ok(None);
     }
-    in_order(ctx);
-    let df = crate::query::sql(ctx, &crate::asof::rewrite(query)?).await?;
-    let (columns, files) = write_rows(lake, ctx, table, df, stamp).await?;
+    // (out of memory, once more frugally: the first try's files are never recorded, and the orphan sweep takes them)
+    let (columns, files) = crate::query::frugally(|frugal| async move {
+        if frugal {
+            crate::query::frugal(ctx);
+        }
+        in_order(ctx);
+        let df = crate::query::sql(ctx, &crate::asof::rewrite(query)?).await?;
+        write_rows(lake, ctx, table, df, stamp).await
+    }).await?;
     Ok(Some(Files { table: table.into(), job: job.into(), columns, files }))
 }
 
@@ -2111,6 +2086,7 @@ pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
 pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>, d: crate::ddl::Ddl) -> Result<Value> {
     match d {
         crate::ddl::Ddl::Refresh { database, tables } => crate::branch::refresh(lake, seq, lock, database, tables).await,
+        crate::ddl::Ddl::SetLocation { database, to } => crate::memory::set_location(lake, &database, &to).await, // (copies outside the lake's lock: `memory.rs`)
         d @ (crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. }) => crate::backup::statement(lake, lock, d).await,
         d => {
             let _guard = lock.lock().await;

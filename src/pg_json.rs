@@ -17,6 +17,7 @@ use datafusion::common::{DFSchema, Result, ScalarValue};
 use datafusion::logical_expr::expr::{Alias, ScalarFunction};
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
 use datafusion::logical_expr::{Expr, ExprSchemable, ScalarUDF, Signature, Volatility};
+use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{self, BinaryOperator, VisitMut, VisitorMut};
 use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
@@ -26,6 +27,18 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
+
+/// The engine's session (`engine::session`) with Postgres's JSON at the node (`Lake::made`): its operators (`#>`, `#>>`,
+/// `@>`, `?|`, …) planned ahead of the engine's planners, functions-json's among them; a text cast's JSON mark taken off
+/// after type coercion (`pg_json_make::AsText`); and the functions they call.
+pub fn planned(ctx: SessionContext) -> SessionContext {
+    let mut state = SessionStateBuilder::new_from_existing(ctx.state());
+    state.expr_planners().get_or_insert_with(Vec::new).insert(0, planner());
+    let ctx = SessionContext::new_with_state(state.build());
+    ctx.add_analyzer_rule(Arc::new(crate::pg_json_make::AsText));
+    register(&ctx);
+    ctx
+}
 
 pub fn planner() -> Arc<dyn ExprPlanner> { Arc::new(Operators) }
 

@@ -35,6 +35,10 @@ pub enum Command {
         /// Sign in as a user instead: its password is asked for (or PONDRA_PASSWORD).
         #[arg(long)]
         user: Option<String>,
+        /// The identity provider to sign in through, when the server has several (with neither --token
+        /// nor --user, a server with one signs in through it, in the browser).
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// Start a branch: a Git branch and a database of the same name, prod's data with no file
     /// copied (pondra branch add-discounts). With no name, the branches; -d NAME drops one.
@@ -526,7 +530,7 @@ fn logins() -> BTreeMap<String, String> {
 }
 
 /// The token kept for the server that `url` is on (the longest address it starts with).
-fn saved(url: &str) -> Option<String> {
+pub(crate) fn saved(url: &str) -> Option<String> {
     logins().into_iter().filter(|(s, _)| url == s || url.starts_with(&format!("{s}/"))).max_by_key(|(s, _)| s.len()).map(|(_, t)| t)
 }
 
@@ -577,7 +581,7 @@ fn sign_in_dbs(toml: &Toml, base: &str) -> Vec<String> {
 }
 
 /// `pondra login [URL]`: a token kept for one server, or for each server pondra.toml names.
-async fn login(url: Option<String>, project: &str, token: Option<String>, user: Option<String>) -> Result<String> {
+async fn login(url: Option<String>, project: &str, token: Option<String>, user: Option<String>, provider: Option<String>) -> Result<String> {
     let toml = read_toml(Path::new(project))?;
     let bases = match url {
         Some(u) => vec![u.trim_end_matches('/').to_string()],
@@ -590,7 +594,7 @@ async fn login(url: Option<String>, project: &str, token: Option<String>, user: 
     let mut said = vec![];
     for base in bases {
         let dbs = sign_in_dbs(&toml, &base);
-        said.push(sign_in(&base, &dbs, token.clone(), user.clone()).await.with_context(|| format!("signing in to {base}"))?);
+        said.push(sign_in(&base, &dbs, token.clone(), user.clone(), provider.as_deref()).await.with_context(|| format!("signing in to {base}"))?);
     }
     Ok(said.join("\n"))
 }
@@ -598,13 +602,16 @@ async fn login(url: Option<String>, project: &str, token: Option<String>, user: 
 /// Signs in to the server at `base` and keeps its token under `base`, so every database there finds it. A
 /// server with several databases and no default answers 404 at its root: the sign-in then goes to the first of
 /// `dbs` that answers.
-async fn sign_in(base: &str, dbs: &[String], token: Option<String>, user: Option<String>) -> Result<String> {
+async fn sign_in(base: &str, dbs: &[String], token: Option<String>, user: Option<String>, provider: Option<&str>) -> Result<String> {
     let http = reqwest::Client::new();
     let api = answering(&http, base, dbs).await?;
     let token = match (token, user) {
         (Some(t), _) => t,
         (None, Some(u)) => password_token(&http, &api, base, &u).await?,
-        (None, None) => ask(&format!("token for {base}: "), true)?,
+        (None, None) => match browser_token(&http, &api, provider).await? {
+            Some(t) => t,
+            None => ask(&format!("token for {base}: "), true)?,
+        },
     };
     let r = http.get(format!("{api}/whoami")).bearer_auth(&token).send().await.with_context(|| format!("{base} doesn't answer"))?;
     ensure!(r.status().is_success(), "{}", r.text().await?.trim());
@@ -613,6 +620,79 @@ async fn sign_in(base: &str, dbs: &[String], token: Option<String>, user: Option
     keep_login(base, token)?;
     let who = me["user"].as_str().filter(|u| !u.is_empty()).map(|u| format!("{u}, ")).unwrap_or_default();
     Ok(format!("signed in to {base} ({who}{})", me["role"].as_str().unwrap_or_default()))
+}
+
+/// A session through the server's identity provider (ADR-074 §6), when it has one (or `provider` names one):
+/// the browser goes to the provider and back to this process's own loopback address (RFC 8252), with a code
+/// that only the verifier made here redeems (`POST /sso/token`). None: the server has no provider.
+async fn browser_token(http: &reqwest::Client, api: &str, provider: Option<&str>) -> Result<Option<String>> {
+    let listed: Value = http.get(format!("{api}/sso")).send().await?.json().await.unwrap_or_default();
+    let names: Vec<&str> = listed["providers"].as_array().into_iter().flatten().filter_map(|p| p["name"].as_str()).collect();
+    let name = match (provider, names.as_slice()) {
+        (Some(p), _) if names.contains(&p) => p,
+        (Some(p), _) => bail!("{api} has no identity provider {p}{}", if names.is_empty() { String::new() } else { format!(" ({})", names.join(", ")) }),
+        (None, []) => return Ok(None),
+        (None, [one]) => one,
+        (None, many) => bail!("which identity provider? pondra login --provider {} ({})", many[0], many.join(", ")),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let back = format!("http://127.0.0.1:{}/", listener.local_addr()?.port());
+    let mut secret = [0u8; 32];
+    aws_lc_rs::rand::fill(&mut secret).map_err(|_| anyhow::anyhow!("no randomness"))?;
+    let verifier = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, secret);
+    let challenge = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, verifier.as_bytes()));
+    let mut start = reqwest::Url::parse(&format!("{api}/sso/{name}/start"))?;
+    start.query_pairs_mut().append_pair("to", &back).append_pair("challenge", &challenge);
+    eprintln!("signing in through {name} in your browser: {start}");
+    open_browser(start.as_str());
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(300), came_back(&listener)).await.context("no sign-in within five minutes")??;
+    if let Some(e) = answer.get("error") {
+        bail!("{e}");
+    }
+    let code = answer.get("code").context("the sign-in came back with no code")?;
+    let r = http.post(format!("{api}/sso/token")).json(&json!({"code": code, "verifier": verifier})).send().await?;
+    ensure!(r.status().is_success(), "{}", r.text().await?.trim());
+    Ok(Some(r.json::<Value>().await?["token"].as_str().context("no token")?.to_string()))
+}
+
+/// The query the browser comes back to this process's loopback address with (a code, or an error), answered
+/// with a page saying so. Anything else asked of it (a browser's icon) is a 404, and the wait goes on.
+async fn came_back(listener: &tokio::net::TcpListener) -> Result<BTreeMap<String, String>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let (mut conn, _) = listener.accept().await?;
+        let mut head = vec![0u8; 8192];
+        let n = conn.read(&mut head).await.unwrap_or(0);
+        let line = String::from_utf8_lossy(&head[..n]).lines().next().unwrap_or_default().to_string();
+        let target = line.split(' ').nth(1).unwrap_or_default();
+        let query: BTreeMap<String, String> = target.split_once('?').map(|(_, q)| url::form_urlencoded::parse(q.as_bytes()).into_owned().collect()).unwrap_or_default();
+        if !line.starts_with("GET /") || !(query.contains_key("code") || query.contains_key("error")) {
+            let _ = conn.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+            continue;
+        }
+        let said = match query.get("error") {
+            Some(e) => e.replace('&', "&amp;").replace('<', "&lt;"), // ("not signed in through …: why")
+            None => "Signed in. You can close this tab and go back to the terminal.".to_string(),
+        };
+        let page = format!("<!doctype html><meta charset=utf-8><title>Pondra</title><p style=\"font:16px system-ui;margin:3em\">{said}</p>");
+        let _ = conn.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}", page.len()).as_bytes()).await;
+        return Ok(query);
+    }
+}
+
+/// Opens `url` in the user's browser: `PONDRA_BROWSER` (a program given the URL), else the system's own way.
+/// When none opens, the URL printed above is the way.
+fn open_browser(url: &str) {
+    let (program, args): (String, Vec<&str>) = match crate::env::get("PONDRA_BROWSER") {
+        Some(b) => (b, vec![url]),
+        None if cfg!(target_os = "macos") => ("open".into(), vec![url]),
+        None if cfg!(windows) => ("rundll32".into(), vec!["url.dll,FileProtocolHandler", url]), // (not `cmd /c start`: cmd reads `&` as its own)
+        None => ("xdg-open".into(), vec![url]),
+    };
+    let spawned = std::process::Command::new(&program).args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+    if let Err(e) = spawned {
+        eprintln!("({program} didn't open: {e}; open the address above yourself)");
+    }
 }
 
 /// The token a user's password gets at `api`: asked for (or PONDRA_PASSWORD), then `POST /login`.
@@ -742,7 +822,7 @@ pub async fn command(cmd: Command) -> Result<()> {
 async fn run(cmd: Command) -> Result<(String, bool)> {
     match cmd {
         Command::Init { dir, name } => init(dir.as_deref().unwrap_or("."), name).map(|s| (s, true)),
-        Command::Login { url, project, token, user } => login(url, &project, token, user).await.map(|s| (s + "\n", true)),
+        Command::Login { url, project, token, user, provider } => login(url, &project, token, user, provider).await.map(|s| (s + "\n", true)),
         Command::Branch { name, from, delete, at } => branch_cmd(&at, name, from, delete).await,
         Command::Plan { target, at, prune } => apply_env(&at.with(target), Run { apply: false, test: false, prune, fresh: false }).await,
         Command::Status { target, at } => status_env(&at.with(target)).await,

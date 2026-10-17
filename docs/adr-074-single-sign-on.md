@@ -1,6 +1,6 @@
 # ADR-074: Single sign-on, through every door
 
-**Date:** 2026-10-13 · **Status:** accepted; part 1 built (the owner chose "Sign-on first" on 10-13 at 10:27:
+**Date:** 2026-10-13 · **Status:** accepted; parts 1 to 3 built (the owner chose "Sign-on first" on 10-13 at 10:27:
 "The security lane builds single sign-on by the freeze; filters and masks come right after 1.0") ·
 **Builds on:** ADR-035 (users, roles, grants; one check at every door), ADR-058 (a lake's own keys,
 sealed), ADR-039 (a lake's format), ADR-049 (one registry of kinds), invariants 176, 177, 372, 376,
@@ -46,7 +46,8 @@ CREATE IDENTITY PROVIDER okta (
   ROLES_CLAIM 'groups',          -- optional: a claim whose values are roles (none)
   USERS 'listed',                -- optional: 'listed' (only users made here) or 'any'
   SCOPES 'openid email profile', -- optional: what the console asks for
-  LABEL 'Okta'                   -- optional: the console's button
+  LABEL 'Okta',                  -- optional: the console's button
+  POSTGRES 'password'            -- optional: 'password' (a driver sends the token as its password) or 'oauth' (psql 18's OAUTHBEARER)
 );
 DROP IDENTITY PROVIDER okta;
 COMMENT ON IDENTITY PROVIDER okta IS '…';
@@ -98,7 +99,8 @@ and the leader isn't asked.
   made first. It is for the company's own provider: at one anyone may sign up to (Google's
   `accounts.google.com`, a public Auth0 tenant), every account there gets in, so use `'listed'` there.
 - **`ROLES_CLAIM`**: each of the claim's values (a list, or words in a string) that names a role here
-  makes the person a member of it for that sign-in. Values naming no role are ignored. So IT keeps
+  makes the person a member of it for that sign-in. A claim no token has by that name is looked for as
+  a path (`realm_access.roles`, where Keycloak keeps a realm's roles). Values naming no role are ignored. So IT keeps
   who is in which group, and an admin grants to the roles. A claimed role that is a superuser's makes
   a superuser, as membership does today.
 - **Several providers of one issuer** (another application's `CLIENT_ID`, another user claim, one
@@ -124,8 +126,8 @@ Then a few lines at the doors that choose how to ask:
 
 - **Postgres** asks for a cleartext password (in TLS from another machine) when the user has no
   password (only tokens, or none and a provider takes `'any'`): today's rule for a service's user.
-  A user with a password still signs in with SCRAM. `psql` 18's `OAUTHBEARER` comes in §6's third
-  part.
+  A user with a password still signs in with SCRAM. With `POSTGRES 'oauth'`, the Postgres port asks
+  that user for `OAUTHBEARER` instead (§4a).
 - **Kafka** takes the SASL mechanism `OAUTHBEARER` beside `PLAIN` (RFC 7628's
   `n,,\x01auth=Bearer <token>\x01\x01`), so `sasl.oauthbearer.method=oidc` clients work as they do
   with Confluent.
@@ -134,6 +136,37 @@ Then a few lines at the doors that choose how to ask:
 
 A failed sign-in is refused, audited and counted as any failed sign-in is (invariant 381; a bearer
 token isn't counted, as today).
+
+### 4a. psql 18 signs in through the provider (invariant 413)
+
+Postgres 18 added the SASL mechanism `OAUTHBEARER` (RFC 7628), and `psql` 18 fetches its own token
+through the provider's device flow (RFC 8628) when it is given `oauth_issuer` and `oauth_client_id`.
+The client has no token at first. It sends `auth=` empty, is told the provider's discovery document
+and scopes in RFC 7628's error (`{"status": "invalid_token", "openid-configuration": …, "scope": …}`),
+answers `\x01`, and is refused. Then it runs the device flow and connects again with
+`auth=Bearer <token>`. That token is checked as every token is (§2), it signs in the user it names
+(§3), and the next message is `AuthenticationOk`, with no `SASLFinal`, since libpq refuses one.
+
+Asking for it is a choice, the provider's `POSTGRES 'oauth'`. One way a connection, as Postgres's own
+`pg_hba` has it, was measured against psql 18.6 and libpq 17:
+
+- libpq 18 takes the first mechanism it can use, in the server's order. So `[SCRAM-SHA-256,
+  OAUTHBEARER]` is SCRAM even with `oauth_issuer` set.
+- `[OAUTHBEARER, SCRAM-SHA-256]` without them is an error, not a fall back to SCRAM ("server requires
+  OAuth authentication, but oauth_issuer and oauth_client_id are not both set"). psycopg 3.3 on libpq 18
+  says the same. libpq 17 picks SCRAM.
+- Cleartext and SASL can't be offered together.
+
+So a user with a password is always asked for SCRAM. A user with no password is asked for
+`[OAUTHBEARER, SCRAM-SHA-256]` when the first provider by name that says `POSTGRES 'oauth'` would sign
+it in (a user made here, or any name for a `USERS 'any'` provider). libpq 18 takes `OAUTHBEARER`. A
+client before it (libpq 17, pgjdbc, Npgsql) takes SCRAM, and its first message is refused at once,
+saying the way out: psql 18 or another libpq 18 client with the issuer, or the provider's
+`POSTGRES 'password'`. Offered alone, `OAUTHBEARER` left those clients saying only "none of the
+server's SASL authentication mechanisms are supported". SCRAM never signs such a user in, since it has
+no password. Otherwise it is asked for a password, the token pasted as it, as today. That keeps BI
+tools and older drivers working by default. A provider whose users sign in with psql 18 says
+`'oauth'`, and its users' drivers then need libpq 18's OAuth too.
 
 ### 5. The console's redirect (invariant 411)
 
@@ -153,11 +186,21 @@ needs a client secret) and no provider token is ever kept in the browser:
    to the page in the URL's fragment (which no server sees) on a redirect to the path it started from.
    The page keeps it as it keeps `/login`'s.
 
-The redirect URI the provider is told is the node's own: `--advertise`'s address, else the request's
-`Host` (checked as invariant 372 checks it), plus `/sso/callback`; behind `pondra serve --lakes`,
-`/db/{name}/sso/callback`. Any node of the lake can finish a flow another started: the cookie is
-signed with the lake's key, and nothing is kept on a node. `to` is only a path on this node (it starts
-with one `/`), or for the command line a loopback address (§6).
+The redirect URI the provider is told is the address the browser used, plus `/sso/callback`: the
+request's scheme and `Host` (checked as invariant 372 checks it); from a proxy in
+`PONDRA_TRUSTED_PROXIES`, its `X-Forwarded-Proto` and `X-Forwarded-Host`; behind `pondra serve
+--lakes`, the address the server names in `x-pondra-origin` with its key (as invariant 381's
+`x-pondra-client`), `/db/{name}` included. The cookie's `Path` is that `/sso/`, so it goes to one
+database only. Any node of the lake can finish a flow another started: the cookie is signed with the
+lake's key, and nothing is kept on a node. `to` is only a path on this node (it starts with one `/`),
+or for the command line a loopback address with a port (§6); anything else is refused at the start.
+A sign-in that fails, at the start (no such provider, its discovery unreachable) or at the callback (the
+provider refused, a check failed), ends where it would have: the page gets `#pondra_error=…` and its
+sign-in dialog says why; the command line gets `?error=…` and prints it.
+
+A session a provider's token made names its provider and claimed roles, and ends with the provider:
+`DROP IDENTITY PROVIDER` refuses its sessions at once, and a USERS 'any' user's session keeps its
+claimed roles.
 
 ### 6. In three parts, by the freeze
 
@@ -166,13 +209,20 @@ with one `/`), or for the command line a loopback address (§6).
    lake's format (§7). `harness.py sso` is the doors check for signing in (HTTP's Bearer and Basic,
    Postgres, Kafka's PLAIN and OAUTHBEARER, Flight, MCP): the doors matrix runs on an open node, which
    a provider would close.
-2. **The console and the command line** (by 10-24): §5; `pondra login <url>` opens the browser to
-   `/sso/{provider}/start?to=http://127.0.0.1:<port>/` (a loopback redirect, RFC 8252), keeps the
-   session in the user's own file (`0600`), and the shell, `pondra sql`, the project commands and
-   Python's and JavaScript's `connect(url)` use it when given no token.
-3. **What finishes it** (by 10-29): Postgres's `OAUTHBEARER` for `psql` 18's device flow; a reference
-   page and a guide (Okta, Entra ID, Google, Keycloak); a run against a real provider (Keycloak in a
-   container in `deploy.yml`).
+2. **The console and the command line** (by 10-24): §5; `pondra login [url] [--provider name]`,
+   given no token or user, opens the browser (`PONDRA_BROWSER`, else the system's) to
+   `/sso/{provider}/start?to=http://127.0.0.1:<port>/&challenge=…` (a loopback redirect, RFC 8252,
+   with a PKCE challenge of its own). The callback sends the browser there with a code (`pc_…`, a
+   minute) that only the command line's verifier redeems, at `POST /sso/token`, so no session sits in
+   a browser's history. It keeps the session in `$PONDRA_HOME/login.json` (`~/.pondra`, `0600`), and
+   `pondra run`, the project commands and Python's and JavaScript's clients (`connect(url)`) use it
+   for that server when given no token; a node a program starts never does. Several providers and no
+   `--provider` is refused, naming them.
+3. **What finishes it** (by 10-29): Postgres's `OAUTHBEARER` for `psql` 18's device flow (§4a); a reference
+   page and a guide (Okta, Entra ID, Google, Keycloak); a run against a real provider. That run is
+   `harness.py keycloak`, against Keycloak 26.8 in a container (`.github/workflows/sso.yml`, which build.yml
+   calls when what signs people in changes): its tokens at every door, `USERS 'any'` with its realm roles, the
+   console's flow through its login page, `pondra login`, and psql 18's device flow approved as a person would.
 
 ### 7. Never open, and only once every node knows it (invariant 412)
 

@@ -60,7 +60,7 @@ is `designs/one-month-to-1-0.md` in the project's files). Rounds 17 to 34 are re
 |---|---|
 | Wednesdays (10-14, 10-21, 10-28) | 0.34.0, 0.35.0, 0.36.0: whatever is green on main |
 | **10-31** | **Feature freeze**: fixes, reviews, measurements and docs only from here |
-| 11-01 to 11-06 | The 1.0 review: every area reviewed again, every door tried as a new user would, the security review, the docs finished, the console's last fixes |
+| 11-01 to 11-06 | The 1.0 review, once every feature works (above all one core with its forms and APIs: ADR-072), from scratch (the owner, 10-16): architecture, design, security and the code reviewed again, and simplified so the parts work together: modular, flexible, one reusable part in every place over copies, easy to add, swap or remove for maintainers and customers alike, still one small binary; every door tried as a new user would; the docs finished; the console's last fixes |
 | 11-06 | 1.0.0-rc.1, then the 24-hour soak on R2, the cluster bench, the gates and the upgrade check |
 | **11-11** | **1.0.0** |
 
@@ -82,7 +82,8 @@ keeps that list, each finding goes to the lane owning its files, and a limit kep
 user meets it. On 10-31 every row not proven and every finding still open is listed for the owner.
 
 **Every pull request:** its lane's files only (shared files take additions, not edits); `ci` while
-iterating and `full-ci` once before merging; the gates (`tools/gates.py`) hold or improve; an engine
+iterating, and it merges once that passes (main builds the other platforms, and a red one there is
+its lane's to fix at once); the gates (`tools/gates.py`) hold or improve; an engine
 or read-path change keeps TPC-H's 22 and TPC-DS's 99 answers and is no slower; a new feature works
 from every door or is refused by name; a one-page review; its ADR when it is a design.
 

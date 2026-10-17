@@ -80,7 +80,8 @@ jobs:
             $([ "$legs" -gt 1 ] && [ "$LEG" -eq "$legs" ] && echo --steady)
       - name: The nodes' logs, beside the results
         if: always()
-        run: mkdir -p logs && cp /tmp/pondra-soak-*/*.log logs/ 2>/dev/null || true
+        # (soak-logs/, not logs/: that is the repository's own folder, and its 900 files went into the artifact)
+        run: mkdir -p soak-logs && cp /tmp/pondra-soak-*/*.log soak-logs/ 2>/dev/null || true
       - uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -90,6 +91,6 @@ jobs:
             soak.json
             soak-timeline.jsonl
             soak-state.json
-            logs/
+            soak-logs/
           retention-days: 30
           if-no-files-found: ignore

@@ -43,6 +43,7 @@ type Expr = Arc<dyn PhysicalExpr>;
 
 /// The SQL with each `ASOF JOIN … MATCH_CONDITION (…) [ON …]` turned into a LEFT JOIN on its
 /// keys whose condition carries the marker; as it was if it has none.
+#[cfg(feature = "server")]
 pub fn rewrite(sql: &str) -> anyhow::Result<Cow<'_, str>> {
     Ok(match as_of(sql)? {
         Cow::Borrowed(s) => crate::sys::hide(s), // (and `*` without the system columns)
@@ -169,7 +170,7 @@ pub fn as_of(sql: &str) -> anyhow::Result<Cow<'_, str>> {
         return Err(e);
     }
     Ok(match v.0 {
-        true => Cow::Owned(stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n")),
+        true => Cow::Owned(stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n")),
         false => Cow::Borrowed(sql),
     })
 }

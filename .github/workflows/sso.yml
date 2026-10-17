@@ -1,0 +1,82 @@
+name: sso
+
+# Single sign-on (ADR-074) against what a company runs: a real Keycloak in a container, and psql 18
+# from Postgres's own repository. tools/harness.py keycloak signs people in at every door with
+# Keycloak's tokens, through the console's flow, `pondra login` and psql 18's device flow;
+# harness.py sso_pg runs psql 18's device flow against the stand-in provider too (the suite runs
+# it without psql). It runs the binary the build workflow made for this commit: nothing is
+# compiled here.
+#
+# build.yml calls it once a pull request's build is done (the label `ci` or `full-ci`) and what
+# signs people in changes. By hand too.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  actions: read # (the build run's packages)
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  check:
+    name: sso
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Keycloak, started first (it takes half a minute)
+        run: |
+          docker run -d --name keycloak -p 127.0.0.1:8180:8080 \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            quay.io/keycloak/keycloak:26.8.1 start-dev
+      - run: pip install -r tools/requirements.txt
+      - name: psql 18 and its OAuth module
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-18 libpq-oauth > /dev/null
+      # (Called from build.yml: its run's own packages, with no API call. By hand: a build run's.)
+      - uses: actions/download-artifact@v7
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          name: pondra-linux-x64
+          path: dist
+      - name: This commit's Linux binary (the build workflow's)
+        run: |
+          [ -f dist/pondra-linux-x64.tar.gz ] || bash tools/ci_artifact.sh linux-x64 "$SHA"
+          mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
+      - name: Keycloak answering
+        run: |
+          for _ in $(seq 120); do
+            curl -sf http://127.0.0.1:8180/realms/master/.well-known/openid-configuration > /dev/null && exit 0
+            sleep 1
+          done
+          docker logs keycloak | tail -40
+          exit 1
+      - name: Against Keycloak, and psql 18 against the stand-in
+        env:
+          PONDRA_BIN: ${{ github.workspace }}/bin/pondra
+          PONDRA_PSQL: /usr/lib/postgresql/18/bin/psql
+        run: |
+          python3 tools/harness.py keycloak
+          python3 tools/harness.py sso_pg
+      - name: The nodes' and Keycloak's logs, when a check failed
+        if: failure()
+        run: |
+          docker logs keycloak > keycloak.log 2>&1 || true
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sso-logs
+          path: |
+            /tmp/pondra-*.stderr
+            keycloak.log
+          if-no-files-found: ignore

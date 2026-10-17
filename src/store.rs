@@ -9,7 +9,6 @@ use bytes::Bytes;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
-use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
@@ -645,7 +644,7 @@ pub fn reach_of(url: &str) -> Option<Reach> {
 pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
     if in_memory(url) {
         let url = url.trim_end_matches('/').to_string();
-        let held = MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(url.clone()).or_insert_with(|| Arc::new(Counted(Arc::new(object_store::memory::InMemory::new())))).clone();
+        let held = crate::memory::store(&url);
         return Ok((url.clone(), held.clone(), Some((url, held)))); // (DataFusion reads its files at their URLs, as a bucket's)
     }
     let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
@@ -677,31 +676,9 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     Ok((url.trim_end_matches('/').to_string(), Arc::new(Counted(store)), Some((root, Arc::new(Counted(whole)) as Store))))
 }
 
-/// Lakes held in this process's memory (`memory://name`, DuckDB's `:memory:`), by place: every open
-/// of one here is the same store until `forget_memory`, so a node that restarts in place finds its
-/// lake as it left it. Nothing of one is on disk, and no other process reaches it. (Not `per_node!`:
-/// a restart in place resets those.)
-static MEMORY: std::sync::LazyLock<Mutex<HashMap<String, Store>>> = std::sync::LazyLock::new(Default::default);
-
-/// Is `url` a lake held in this process's memory?
-pub fn in_memory(url: &str) -> bool { url.starts_with("memory://") }
-
-/// Is a lake held in this process's memory at `url`? (Opening one there makes it.)
-pub fn memory_held(url: &str) -> bool { MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(url.trim_end_matches('/')) }
-
-/// Is `store` a lake held in this process's memory? Every open of one gives the same store.
-pub fn held_in_memory(store: &Store) -> bool { MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().any(|s| Arc::ptr_eq(s, store)) }
-
-/// A lake's place as given: `:memory:` (DuckDB's word) is a new lake in this process's memory.
-pub fn place(lake: &str) -> String {
-    match lake {
-        ":memory:" => format!("memory://{}", uuid::Uuid::new_v4().simple()),
-        _ => lake.to_string(),
-    }
-}
-
-/// Let a lake in memory go (the library's close, once its node has stopped): its memory with it.
-pub fn forget_memory(url: &str) { MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(url.trim_end_matches('/')); }
+// Lakes held in this process's memory (`memory://`, DuckDB's `:memory:`) live in `memory.rs`, which
+// spills their files to disk past a budget.
+pub use crate::memory::{forget_memory, held_in_memory, in_memory, memory_held, place};
 
 /// A lake's bucket, as DataFusion names its store (`s3://bucket`), or None for a folder.
 pub fn bucket_url(url: &str) -> Option<String> {
@@ -712,7 +689,7 @@ pub fn bucket_url(url: &str) -> Option<String> {
 /// A lake's store, counting the requests that cost the most and meet a bucket's rate limits
 /// (S3: 3,500 writes a second per prefix): writes, lists and deletes (`GET /metrics`).
 #[derive(Debug)]
-struct Counted(Store);
+pub(crate) struct Counted(pub(crate) Store);
 
 impl std::fmt::Display for Counted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
@@ -742,6 +719,11 @@ impl ObjectStore for Counted {
     fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
         crate::metrics::add(&crate::metrics::OBJECT_LISTS, 1);
         self.0.list(prefix)
+    }
+    // (forwarded: the store's own offset, not the trait's default that lists everything)
+    fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        crate::metrics::add(&crate::metrics::OBJECT_LISTS, 1);
+        self.0.list_with_offset(prefix, offset)
     }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
         crate::metrics::add(&crate::metrics::OBJECT_LISTS, 1);
@@ -854,7 +836,7 @@ impl Lake {
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
-            crate::panics::spawn(lake.clone().commits(writes));
+            crate::panics::spawn(Lake::commits(Arc::downgrade(&lake), writes)); // (weak: a lake opened in a process goes when its last handle does)
         }
         Ok(lake)
     }
@@ -864,22 +846,26 @@ impl Lake {
     /// `replicas - 1` member followers hold it, whichever comes first. It reaches the bucket a
     /// moment later either way. A write that fails to reach the bucket (a newer leader fenced
     /// us out) has an unknown outcome: restart and rejoin; the restart reloads the state.
-    async fn commits(self: Arc<Self>, mut writes: mpsc::UnboundedReceiver<Write>) {
+    /// Both loops hold the lake weakly: the writes' sender is the lake's own (`Catalog::writes`), so
+    /// a strong hold would keep a lake opened in a process (a backup taken in it) for ever.
+    async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>) {
         let (to_bucket, mut in_bucket) = mpsc::unbounded_channel::<(Arc<WriteHandle>, u64)>();
-        let lake = self.clone();
+        let lake = me.clone();
         crate::panics::spawn(async move {
             while let Some((handle, id)) = in_bucket.recv().await {
                 if let Err(e) = handle.await_durable().await {
                     eprintln!("catalog commit failed: {e}");
                     crate::cluster::restart("a catalog commit failed");
                 }
+                let Some(lake) = lake.upgrade() else { return };
                 lake.cat.durable.send_replace(id);
                 lake.cat.send(Frame::Durable(id));
             }
         });
-        let cat = &self.cat;
-        let need = cat.replicas.saturating_sub(1);
         while let Some((handle, d, done)) = writes.recv().await {
+            let Some(lake) = me.upgrade() else { return };
+            let cat = &lake.cat;
+            let need = cat.replicas.saturating_sub(1);
             if need > 0 {
                 cat.send(Frame::Change(d.clone())); // followers keep it and say so
             }
@@ -1080,29 +1066,14 @@ impl Lake {
         ctx
     }
 
-    /// A session made from nothing, with everything every query's session has.
+    /// A session made from nothing, with everything every query's session has: the engine's (`engine::session`) and
+    /// the node's own functions.
     fn made(&self, partitions: usize) -> SessionContext {
-        let config = crate::optimize::config(SessionConfig::new().with_information_schema(true).with_target_partitions(partitions)
-            .with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::ddl::PUBLIC));
-        let state = SessionStateBuilder::new().with_config(config).with_runtime_env(self.rt.clone()).with_default_features();
-        let mut state = state.with_analyzer_rules(crate::optimize::analyzer_rules()).with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
-        state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::files::planner());
-        state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::intervals::planner()); // (n * INTERVAL '37 seconds') // (SUBSTRING of bytes too)
-        state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::pg_json::planner()); // (#>, #>>, @>, ?|: Postgres's JSON operators, ahead of functions-json's)
-        let mut ctx = SessionContext::new_with_state(state.build());
-        spark(&ctx); // format_string, pmod, parse_url, …
-        datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
-        crate::query::register_json_text(&ctx); // pondra_json_text(x): a union (json_get's answer) as its text
+        let config = SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::ddl::PUBLIC);
+        let ctx = crate::pg_json::planned(crate::engine::session(config, self.rt.clone())); // (Postgres's JSON operators and functions)
         crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
-        crate::asof::register(&ctx); // (ASOF JOIN's marker)
-        crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
-        crate::avg::register(&ctx); // avg(DECIMAL): rounded at its last place
-        crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
-        crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
-        crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
         crate::types::register(&ctx); // gen_random_uuid(), uuidv7(), pg_typeof(x)
         crate::pg_functions::register(&ctx); // format(), array_upper(), to_char(ts, 'YYYY-MM'): what Postgres's clients send
-        crate::pg_json::register(&ctx); // jsonb_contains(…), json_object_field(…), pondra_json_path(…): the names the operators call, by Postgres's where it has them
         crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
         ctx
     }
@@ -2245,17 +2216,23 @@ fn fatal(e: slatedb::Error) -> anyhow::Error {
 /// Test hook: `PONDRA_CRASH=after_seg_put:0.05,after_parquet_put:0.2` aborts the process at
 /// that point with that probability, to prove crashes never lose or duplicate rows.
 pub fn maybe_crash(point: &str) {
-    let Some(spec) = crate::env::get("PONDRA_CRASH") else { return };
-    for (name, prob) in spec.split(',').filter_map(|p| p.split_once(':')) {
-        let roll = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1e6;
-        if name == point && roll < prob.parse().unwrap_or(0.0) {
-            if crate::library::on() {
-                panic!("PONDRA_CRASH at {point}"); // (a library's node fails, its host stays: a vital loop's panic)
-            }
-            eprintln!("PONDRA_CRASH: aborting at {point}");
-            std::process::abort();
+    if crash_rolled(point) {
+        if crate::library::on() {
+            panic!("PONDRA_CRASH at {point}"); // (a library's node fails, its host stays: a vital loop's panic)
         }
+        eprintln!("PONDRA_CRASH: aborting at {point}");
+        std::process::abort();
     }
+}
+
+/// Whether `PONDRA_CRASH` names `point` and its roll comes up: `maybe_crash`'s test, for a point that
+/// fails an operation (`memory::settle`'s second pass) rather than the process.
+pub fn crash_rolled(point: &str) -> bool {
+    let Some(spec) = crate::env::get("PONDRA_CRASH") else { return false };
+    spec.split(',').filter_map(|p| p.split_once(':')).any(|(name, prob)| {
+        let roll = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1e6;
+        name == point && roll < prob.parse().unwrap_or(0.0)
+    })
 }
 
 /// How many partitions a query runs in here: one per core (`PONDRA_CORES` stands for another
@@ -2269,45 +2246,6 @@ pub fn partitions() -> usize {
         let cores = crate::env::parse("PONDRA_CORES").unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
         cores.min(memory_limit() / (24 << 20)).max(2)
     })
-}
-
-/// Spark's functions whose names DataFusion doesn't have (`format_string`, `pmod`, `parse_url`,
-/// `sha2`, `collect_list`, …: PySpark's vocabulary in SQL). Where both have a name, DataFusion's
-/// stays, so no answer changes, and Spark's is there under a name of its own (`spark_floor`):
-/// `spark_sql('…')` calls it where Spark SQL names `floor` (`sparksql.rs`).
-fn spark(ctx: &SessionContext) {
-    let more = SPARK.get_or_init(|| spark_of(ctx));
-    more.scalar.iter().chain(&more.shared).for_each(|f| { ctx.register_udf(f.clone()); });
-    more.aggregate.iter().for_each(|f| { ctx.register_udaf(f.clone()); });
-}
-
-pub struct Spark {
-    scalar: Vec<datafusion::logical_expr::ScalarUDF>,
-    aggregate: Vec<datafusion::logical_expr::AggregateUDF>,
-    shared: Vec<datafusion::logical_expr::ScalarUDF>, // (Spark's of the names both have, renamed)
-    pub names: std::collections::HashMap<String, String>, // a name both have (or its alias) → Spark's here
-}
-
-static SPARK: std::sync::OnceLock<Spark> = std::sync::OnceLock::new();
-
-/// Spark's functions as every session has them (worked out once, against the first session's
-/// names: DataFusion's own, nothing else yet).
-pub fn spark_functions() -> &'static Spark {
-    SPARK.get_or_init(|| spark_of(&SessionContext::new()))
-}
-
-fn spark_of(ctx: &SessionContext) -> Spark {
-    use datafusion::execution::FunctionRegistry;
-    let new = |name: &str, aliases: &[String]| std::iter::once(name).chain(aliases.iter().map(String::as_str)).all(|n| ctx.udf(n).is_err() && ctx.udaf(n).is_err() && ctx.udwf(n).is_err());
-    let (scalar, shared): (Vec<_>, Vec<_>) = datafusion_spark::all_default_scalar_functions().into_iter().partition(|f| new(f.name(), f.aliases()));
-    let aggregate = datafusion_spark::all_default_aggregate_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
-    let names = shared.iter().flat_map(|f| std::iter::once(f.name().to_string()).chain(f.aliases().iter().cloned()).map(|n| (n, format!("spark_{}", f.name())))).collect();
-    Spark {
-        scalar: scalar.iter().map(|f| f.as_ref().clone()).collect(),
-        aggregate: aggregate.map(|f| f.as_ref().clone()).collect(),
-        shared: shared.iter().map(crate::sparksql::renamed).collect(),
-        names,
-    }
 }
 
 #[cfg(test)]
@@ -2350,6 +2288,27 @@ mod tests {
         assert!(cat.write(vec![("t/b".into(), b"2".to_vec())], &[]).await.is_err());
         assert!(cat.get_raw("d/1").await.is_err());
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A lake a process opens to write (a backup taken in it: `backup::take_here`) is let go with its
+    /// last handle: the loops `Lake::open` starts hold it weakly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lake_opened_to_write_goes_with_its_last_handle() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-dropped-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        lake.cat.commit(vec![("t/a".into(), b"1".to_vec())], &[]).await?;
+        lake.cat.close().await?;
+        let gone = Arc::downgrade(&lake);
+        drop(lake);
+        for _ in 0..100 {
+            if gone.upgrade().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gone.upgrade().is_none(), "the lake is still held");
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }

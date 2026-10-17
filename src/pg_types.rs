@@ -22,18 +22,13 @@ use crate::pg_names;
 use crate::store::{table_key, Lake};
 use crate::write::{ident, object};
 
-/// The JSON makers: the functions that make JSON from values (`pg_json_make.rs`). A statement that calls one has its
-/// arguments changed where SQL comes in (`rewritten`): a JSON argument is marked as its type prints it, a whole row is
-/// made of its columns, and an aggregate is `pondra_json_agg` over `array_agg`. `makes_json` is the check that lets a
-/// statement without one pass.
-const MAKERS: &[&str] = &["to_json", "to_jsonb", "row_to_json", "json_build_object", "jsonb_build_object", "json_build_array",
-    "jsonb_build_array", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg"];
-
-/// Whether `sql` calls a JSON maker (`MAKERS`), as a name followed by `(`. Only a statement with one has its arguments traced.
-pub fn makes_json(sql: &str) -> bool {
-    static CALL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(&format!(r"(?i)\b(?:{})\s*\(", MAKERS.join("|"))).expect("a regex"));
-    CALL.is_match(sql)
-}
+// The JSON makers: the functions that make JSON from values (`pg_json_make.rs`). A statement that calls one has its
+// arguments changed where SQL comes in (`rewritten`): a JSON argument is marked as its type prints it, a whole row is
+// made of its columns, and an aggregate is `pondra_json_agg` over `array_agg`. `text::makes_json` is the check that lets
+// a statement without one pass.
+use crate::text::JSON_MAKERS as MAKERS;
+#[cfg(test)]
+use crate::text::makes_json;
 
 /// What a maker's argument is, for the JSON it writes. A whole row is `Row`, a JSON value `Json` (wrapped as its type prints
 /// it), anything else `Value`. An aggregate's elements are written by it: `json` and `row` elements are JSON text already.

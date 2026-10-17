@@ -279,17 +279,6 @@ fn sasl_handshake(r: &mut Rd) -> Result<Vec<u8>> {
     Ok(w)
 }
 
-/// OAUTHBEARER's first message (RFC 7628): `n,,` then `\x01auth=Bearer <token>\x01\x01`. None: PLAIN's.
-fn bearer(auth: &[u8]) -> Option<String> {
-    if !(auth.starts_with(b"n,") || auth.starts_with(b"y,")) {
-        return None;
-    }
-    let text = std::str::from_utf8(auth).ok()?;
-    let value = text.split('\x01').find_map(|kv| kv.strip_prefix("auth="))?;
-    let (scheme, token) = value.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim().to_string())
-}
-
 /// SASL/PLAIN: "\0user\0password": a user and its password (or one of its tokens), or a role's
 /// name (`reader`, `writer`, `admin`) and its token (`users::sign_in`). As on HTTP, a password crosses
 /// only TLS from another machine, a token may under `PONDRA_TLS=optional` (`tls::may_send_password`), and
@@ -302,7 +291,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, peer: &c
         _ => (String::new(), String::new()),
     };
     let ip = Some(peer.addr.ip());
-    let token = bearer(&auth);
+    let token = crate::sso::bearer(&auth); // (OAUTHBEARER's; None: PLAIN's)
     let refused = if app.open().await {
         *who = crate::auth::Principal::of(Role::Admin).at("kafka", who.from);
         None
@@ -424,15 +413,15 @@ fn ready(o: Outcome) -> BoxFuture<'static, Outcome> { async move { o }.boxed() }
 
 /// Queue one partition's record batches in the log, in order. An idempotent producer's batch is
 /// exactly-once: its (producer id, sequence) become a Pondra producer and seq, and `prev` makes
-/// a batch that overtook its predecessor fail (OUT_OF_ORDER_SEQUENCE; the client resends it).
+/// a batch that overtook its predecessor go again once that one is in (OUT_OF_ORDER_SEQUENCE
+/// only if it never comes).
 async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &TableMeta, records: &[u8]) -> BoxFuture<'static, Outcome> {
     let invalid = |e: anyhow::Error| {
         eprintln!("kafka: a record for {table} refused: {e:#}"); // (librdkafka shows only the code; this says why)
         ready((INVALID_RECORD, -1, Some(format!("{e:#}"))))
     };
-    let log = match app.log() {
-        Ok(log) => log,
-        Err(e) => return ready((POLICY_VIOLATION, -1, Some(e.to_string()))),
+    let Some(log) = app.log.clone() else {
+        return ready((POLICY_VIOLATION, -1, Some("read-only node".into())));
     };
     let batches = match decode_batches(records) {
         Ok(b) => b,
@@ -469,15 +458,27 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
             }
             false => Src { producer: String::new(), seq: 0, prev: None }, // at-least-once, as in Kafka
         };
-        match log.queue(table.to_string(), src, rows).await {
-            Ok(ack) => acks.push(ack),
+        match log.queue(table.to_string(), src.clone(), rows.clone()).await {
+            Ok(ack) => acks.push((ack, src, rows)),
             Err(e) => return ready(failed(&e)),
         }
     }
+    let table = table.to_string();
     async move {
         let mut first = None;
-        for ack in acks {
-            match ack.await {
+        for (ack, src, rows) in acks {
+            let mut ack = ack.await;
+            // Overtaken on its way to the leader by the batch after it (a follower's flushes race:
+            // invariant 29). This response is written only after the ones before it, so the batch
+            // before this one is committed by now, and this one goes again. Answered out of order, an
+            // idempotent producer stops for good (librdkafka: "sequence desynchronization").
+            for _ in 0..100 {
+                match &ack {
+                    Ok(Ack { conflict: true, .. }) => ack = async { log.queue(table.clone(), src.clone(), rows.clone()).await?.await }.await,
+                    _ => break,
+                }
+            }
+            match ack {
                 Ok(Ack { conflict: true, .. }) => return (OUT_OF_ORDER_SEQUENCE, -1, None),
                 Ok(Ack { duplicate: true, .. }) => {} // a retry of a committed batch: success
                 Ok(a) => first = first.or(Some(crate::log::ord(a.seg, a.row) as i64)),

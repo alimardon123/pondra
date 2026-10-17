@@ -81,7 +81,6 @@ pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     rules.insert(at, Arc::new(FloatsWin));
     rules.insert(at, Arc::new(crate::lateral::Lateral)); // (before type coercion, as the analyzer's own: a function's rows of a column, one pass)
     rules.push(Arc::new(crate::casts::Rounds)); // (after type coercion: the casts it adds round too)
-    rules.push(Arc::new(crate::pg_json_make::AsText)); // (a text cast's answer is text, not the JSON it casts: its mark goes)
     rules.push(Arc::new(Runnable)); // (after type coercion: a function's simplifier reads its arguments' types)
     rules
 }
@@ -326,8 +325,18 @@ impl datafusion::logical_expr::ScalarUDFImpl for Zoned {
     }
 }
 
+/// A time of day without seconds (`'2024-05-01 10:30'`, `'…T10:30+02'`), with them (`10:30:00`):
+/// Postgres, DuckDB, Snowflake and Spark read the first as the second; Arrow's parser wants the
+/// seconds. None: `s` is something else, left as it is.
+pub fn seconds(s: &str) -> Option<String> {
+    static HHMM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^(\s*\d{4}-\d{1,2}-\d{1,2}[T ]\d{1,2}:\d{2})(\s*(?:[Zz]|[+-]\d{1,2}(?::?\d{2})?|[A-Za-z][\w/+-]*)?\s*)$").expect("a regex")
+    });
+    HHMM.captures(s).map(|c| format!("{}:00{}", &c[1], &c[2]))
+}
+
 /// `CAST('2024-05-01 10:30' AS TIMESTAMP)`, `TIMESTAMP '…'`, `ts > '2024-05-01 10:30'`: text
-/// that DataFusion will parse as a timestamp, given its seconds if it has none (`query::seconds`),
+/// that DataFusion will parse as a timestamp, given its seconds if it has none (`seconds`),
 /// before the literal is folded.
 #[derive(Debug)]
 struct Seconds;
@@ -339,7 +348,7 @@ impl OptimizerRule for Seconds {
     fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
         use datafusion::common::ScalarValue;
         let fixed = |e: &Expr| match e {
-            Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)), _) => crate::query::seconds(s).map(|s| Box::new(Expr::Literal(ScalarValue::Utf8(Some(s)), None))),
+            Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)), _) => seconds(s).map(|s| Box::new(Expr::Literal(ScalarValue::Utf8(Some(s)), None))),
             _ => None,
         };
         plan.map_expressions(|e| e.transform_up(|e| Ok(match e {
@@ -875,6 +884,8 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
     rules.insert(at + 2, Arc::new(SharedBuilds)); // (after both: a HAVING's few groups and an as-of join are theirs)
     let end = rules.iter().position(|r| r.name() == "SanityCheckPlan").unwrap_or(rules.len());
+    // (the hot columns are the node's)
+    #[cfg(feature = "server")]
     rules.insert(end, Arc::new(crate::hot::TopFirst)); // (after DataFusion's own sort pushdown)
     rules.insert(end, Arc::new(MinMaxBounds)); // (after the filters are pushed down)
     let filters = rules.iter().position(|r| r.name() == "FilterPushdown").unwrap_or(0);
@@ -2050,6 +2061,18 @@ fn number(v: &datafusion::common::ScalarValue) -> Option<f64> {
     }.into()).filter(|n: &f64| n.is_finite())
 }
 
+/// The share of its table's rows a run measured for a filter (`learned.rs`). Only a node learns them:
+/// elsewhere a filter is counted by DataFusion's own estimates alone.
+#[cfg(feature = "server")]
+fn learned_share(table: &datafusion::common::TableReference, predicate: &Expr) -> Option<f64> {
+    crate::learned::share(table, predicate)
+}
+
+#[cfg(not(feature = "server"))]
+fn learned_share(_: &datafusion::common::TableReference, _: &Expr) -> Option<f64> {
+    None
+}
+
 /// How big a join input is, as well as anything here can say: a table's own count from the
 /// catalog, scaled by the filters above it (`kept`), and the column bounds that came with it.
 /// `None` where nothing knows — then the joins are left in the order the query wrote them.
@@ -2069,7 +2092,7 @@ fn size(plan: &LogicalPlan) -> Option<Size> {
         LogicalPlan::Filter(f) => {
             let input = size(&f.input)?;
             if let LogicalPlan::TableScan(s) = f.input.as_ref() {
-                if let Some(share) = crate::learned::share(&s.table_name, &f.predicate) {
+                if let Some(share) = learned_share(&s.table_name, &f.predicate) {
                     return Some(Size { learned: true, ..input.cut((input.rows as f64 * share).ceil() as u64) }); // (a share a run measured: `learned.rs`)
                 }
             }

@@ -12,6 +12,31 @@ pub mod avg;
 pub mod casts;
 pub mod intervals;
 pub mod xlsx;
+pub mod answer;
+pub mod engine;
+pub mod text;
+pub mod ext_names;
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+mod asof;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod sparksql;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod past;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod diff;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod expander;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod front;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod codes;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod friendly;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the set functions' rewrite: a node's door calls it)
+mod lateral;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod measures;
+mod optimize;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
 // Feature `server`, on by default; every module the node is made of is one of these.
@@ -24,13 +49,11 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod branch;
 #[cfg(feature = "server")] mod bridge;
 #[cfg(feature = "server")] mod rerun;
-#[cfg(feature = "server")] mod asof;
 #[cfg(feature = "server")] mod auth;
 #[cfg(feature = "server")] mod budget;
 #[cfg(feature = "server")] mod cache;
 #[cfg(feature = "server")] mod catalogs;
 #[cfg(feature = "server")] mod change;
-#[cfg(feature = "server")] mod codes;
 #[cfg(feature = "server")] mod copy;
 #[cfg(feature = "server")] mod cursors;
 #[cfg(feature = "server")] mod guard;
@@ -45,8 +68,6 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod feeds;
 #[cfg(feature = "server")] mod files;
 #[cfg(feature = "server")] mod format;
-#[cfg(feature = "server")] mod friendly;
-#[cfg(feature = "server")] mod lateral;
 #[cfg(feature = "server")] mod flight;
 #[cfg(feature = "server")] mod fresh;
 #[cfg(feature = "server")] mod find;
@@ -64,6 +85,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod live;
 #[cfg(feature = "server")] mod locks;
 #[cfg(feature = "server")] mod serve;
+#[cfg(feature = "server")] mod served;
 #[cfg(feature = "server")] mod settings;
 #[cfg(feature = "server")] mod shares;
 #[cfg(feature = "server")] mod sharing;
@@ -74,16 +96,14 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod drain;
 #[cfg(feature = "server")] mod log;
 #[cfg(feature = "server")] mod manifest;
-#[cfg(feature = "server")] mod measures;
+#[cfg(feature = "server")] pub mod memory;
 #[cfg(feature = "server")] mod objects;
 #[cfg(feature = "server")] mod once;
 #[cfg(feature = "server")] mod metrics;
 #[cfg(feature = "server")] pub mod node;
 #[cfg(feature = "server")] pub mod library;
-#[cfg(feature = "server")] mod optimize;
 #[cfg(feature = "server")] mod pages;
 #[cfg(feature = "server")] mod panics;
-#[cfg(feature = "server")] mod past;
 #[cfg(feature = "server")] mod tls;
 #[cfg(feature = "server")] mod txn;
 #[cfg(feature = "server")] mod returning;
@@ -116,13 +136,13 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod skew;
 #[cfg(feature = "server")] mod replica;
 #[cfg(feature = "server")] mod routines;
+#[cfg(feature = "server")] mod host;
 #[cfg(feature = "server")] mod scan;
 #[cfg(feature = "server")] mod script;
 #[cfg(feature = "server")] mod seq;
 #[cfg(feature = "server")] mod server;
 #[cfg(feature = "server")] mod service;
 #[cfg(feature = "server")] mod spill;
-#[cfg(feature = "server")] mod sparksql;
 #[cfg(feature = "server")] mod spmd;
 #[cfg(feature = "server")] mod status;
 #[cfg(feature = "server")] mod store;
@@ -134,6 +154,7 @@ pub mod xlsx;
 #[cfg(feature = "server")] mod udf;
 #[cfg(feature = "server")] mod users;
 #[cfg(feature = "server")] mod sso;
+#[cfg(feature = "server")] mod sso_flow;
 #[cfg(feature = "server")] mod vend;
 #[cfg(feature = "server")] mod vars;
 #[cfg(feature = "server")] mod views;

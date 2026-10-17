@@ -542,7 +542,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    operators are refused until the analysis knows them.
 29. **Flushes reach the sequencer in the order they were cut** (`log::send`'s turn), so a
    producer's pipelined batches commit in order. Over HTTP from a follower they may still
-   overtake each other; a door that pipelines (Flight) re-queues a batch refused as out of order.
+   overtake each other; a door that pipelines (Flight, Kafka) re-queues a batch refused as out of
+   order. Answered OUT_OF_ORDER_SEQUENCE, an idempotent librdkafka producer on a follower stopped for
+   good ("sequence desynchronization"): `kafka_bench.py --s3 --nodes 3 --steady 30` on `sim_r2.py`
+   lost two of its 24 producers in their first seconds without the Kafka door's re-queue.
 30. **A shuffle's scratch folder has the node's own id in it** (`spill::dir`). Two nodes on one
    machine share a cache directory and name their buckets the same way; without the id they write
    over each other's rows and the answer is quietly wrong. This is what `tools/shuffle_spill.py`
@@ -2178,6 +2181,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the key written. Spark's `DIV` drops the fraction before its cast (`sparksql`). `harness.py found`:
    "a cast of a decimal to an integer rounds…"; `pkey`: "a MERGE that compares a key in another
    type…" (a MERGE wrote 7002.5 as 7002, an INSERT as 7003).
+294. **A loop a lake starts holds it weakly** (`Lake::commits`, `Hot::watch`): the catalog's writes and
+   their durability upgrade a `Weak<Lake>` for each write, the hot columns' watch a `Weak<Hot>` each
+   round, and each ends when what it holds is gone. The writes' sender is the lake's own
+   (`Catalog::writes`), so a loop holding the lake strongly kept a lake a process opened to write (a
+   backup taken in it: `backup::take_here`) for the process's life, its catalog never closed.
+   `cargo test --lib store::tests::a_lake_opened_to_write_goes`.
 295. **SQL answers with the optimizer off** (`optimize::Runnable`, the last analyzer rule): under
    `datafusion.optimizer.max_passes = 0` every scalar function is replaced by what its simplifier
    makes of it, as the optimizer would. `arrow_cast`, `coalesce` and `nvl2` run only as that CAST or
@@ -2651,6 +2660,24 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    provider, to 5; and Pondra 0.33.0 then refuses it by name". (411 is ADR-074 part 2's: the console's
    redirect.)
 
+413. **psql 18 signs in through the provider, and a connection is asked one way** (`pg.rs`'s
+   `ask_oauth` and `oauth_step`, `sso::oauth_for`, ADR-074 §4a). With `POSTGRES 'oauth'`, the Postgres
+   port asks a user with no password for `OAUTHBEARER` (RFC 7628), then `SCRAM-SHA-256` only so that an
+   older client, which takes it, is refused naming the way out (psql 18 with the issuer, or `POSTGRES
+   'password'`): such a user has no password, so SCRAM never signs it in. This happens when the first
+   provider by name that says so would sign that user in: a user made here, or any name for a `USERS
+   'any'` provider.
+   - With no token, the client is told the provider's discovery document and scopes, then refused 28000.
+   - A token is checked as every token is (invariants 409, 410), and the next message is
+     `AuthenticationOk`, never a `SASLFinal` (libpq refuses one).
+   - A refusal says why.
+
+   A user with a password is asked for SCRAM. Without `'oauth'`, a user with no password is asked for
+   the token as a password, as before. libpq 18 takes the first mechanism it knows, in the server's
+   order, and doesn't fall back: SCRAM first would be SCRAM for psql 18 too, and a password offered
+   beside SASL can't be. `harness.py sso_pg` (a hand-written client, psycopg2's libpq 17, and psql 18
+   when there is one); `harness.py keycloak` (psql 18's device flow, approved at Keycloak).
+
 ## Tests: run these before and after any change
 
 ```bash
@@ -2664,6 +2691,8 @@ python3 tools/harness.py safety         # panics answered as errors, TLS at ever
 python3 tools/harness.py owned signed guesses   # a program's node answers only it; a lake served with tokens stays signed; failed sign-ins limited per address and name
 python3 tools/harness.py sealed         # the admin token as the master key: sealed from the first write, across nodes, rotation, the nodes' key refused
 python3 tools/harness.py first          # a node on the network with no token makes the lake's first user and prints its token once; pondra token; a follower answers no one
+python3 tools/harness.py sso_pg         # psql 18's sign-in through a provider (POSTGRES 'oauth', OAUTHBEARER): told where it is, a token in, refusals, one way a connection
+python3 tools/harness.py keycloak       # single sign-on against a real Keycloak (PONDRA_KEYCLOAK): tokens at every door, realm roles, the console's flow, pondra login, psql 18
 python3 tools/node_check.py             # a node stopped once it serves, or while it starts, gives its term back: the next leads at once
 python3 tools/per_node_check.py         # every static per_node! or said to outlive a node; no task Node::stop can't end; settings only through env.rs
 cargo test --release --test node_twice  # two lakes in one process, one after the other: nothing of the first in the second
@@ -2816,8 +2845,16 @@ failover on its own binary, and dry-runs the release's npm publish (`tools/npm_p
 run, refuses one that failed or a tag that isn't Cargo.toml's version, and publishes the run's
 packages (a minute or two). `cluster-bench.yml`'s default binary (`ci`) is that run's too.
 A pull request's push runs CI only when the pull request is labelled: `ci` builds linux-x64 with
-the suite, `full-ci` all five platforms with deploy.yml; add `full-ci` once before merging, and
-never turn on auto-merge before that run starts. Main builds all five on every push.
+the suite and the tests after it, and a pull request merges once that passes (the owner,
+2026-10-16); `full-ci` adds the other platforms but macOS Intel, for a change that wants them
+first. Main builds every platform but macOS Intel on its newest commit (a push waits while a run goes,
+and drops one that waited before it; macOS Intel on a version commit, which a release tags, or by
+hand), with deploy.yml when what it tries changes; a platform that
+fails there is commented on the pull request it came from, and that lane fixes it at once. Never
+turn on auto-merge before its run starts. Two pull requests' runs go at once (ci-slots.yml; the
+account's runners are shared with the owner's other work, 2026-10-16), and a run does only what its
+change touches (build.yml's `plan`: a change no check reads runs nothing; one that leaves the crate
+alone skips its unit tests).
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
 
@@ -2852,6 +2889,14 @@ Practical notes for an agent working here:
   two or three threads at once. Planned work, a robust core and the APIs come first and the UI at
   the end, so build APIs flexible and reliable enough that a UI is easy to build and fix. Fast and
   token-lean, still well tested, reviewed and bug free.
+- **Small pieces, each brief reviewed first (the owner, 2026-10-16).** A thread works in small pieces.
+  Before a brief goes to a Haiku worker, a separate Opus reviewer, given only the brief and the code it
+  touches, checks that it is flawless and keeps the principles (modular, flexible, fast and light, one
+  part reused wherever it is needed, easy to change); the thread fixes the brief first. Workers run side
+  by side, each on a small branch off the thread's task branch; the thread reviews each result as hard,
+  and merges it into the task branch only when it is right. CI runs on the task branch as a whole, not
+  on each piece, and the thread works on the next piece while it runs. Token-lean, the highest quality,
+  and fast: all three.
 - Never rebuild the binary while a test suite is running (tests exec `argv[0]` when a node restarts).
 - Test runs delete their lakes when they exit (`harness.new_lake`; `--keep` or `PONDRA_KEEP=1`
   keeps them). The owner's R2 free tier is 10 GB: after R2 runs, `tools/clean_bucket.py --bucket

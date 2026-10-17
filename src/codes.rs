@@ -6,6 +6,7 @@
 //! the rest are known by their words; anything else is XX000 (internal_error), as in Postgres.
 
 /// The SQLSTATE of an error.
+#[cfg(feature = "server")]
 pub fn of(e: &anyhow::Error) -> &'static str {
     if let Some(v) = e.chain().find_map(|c| c.downcast_ref::<crate::views::Violation>()) {
         return v.1; // check_violation (a table's CHECK, a view's expectation), or an enum's invalid_text_representation
@@ -123,6 +124,7 @@ pub fn http(code: &str) -> u16 {
 }
 
 /// The gRPC status nearest a SQLSTATE (Flight SQL's errors).
+#[cfg(feature = "server")]
 pub fn grpc(code: &str) -> tonic::Code {
     match code {
         "40001" => tonic::Code::Aborted,

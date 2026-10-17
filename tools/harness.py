@@ -27,6 +27,9 @@
   harness.py first               a node on the network with no token makes the lake's first user and prints its token once; pondra token
   harness.py sealed              the lake's keys and secrets sealed by an admin token alone: nodes, rotation, short tokens
   harness.py sso                 identity providers: CREATE IDENTITY PROVIDER, JWTs at every door, refusals, USERS 'any', keys fetched and dropped
+  harness.py sso_flow            single sign-on's browser way in: the flow to a provider and back, refusals, pondra login, the clients with no token
+  harness.py sso_pg              psql 18's sign-in through a provider (POSTGRES 'oauth', OAUTHBEARER): told where it is, a token in, refusals, one way a connection
+  harness.py keycloak            single sign-on against a real Keycloak (PONDRA_KEYCLOAK): tokens at every door, the console's flow, pondra login, psql 18
   harness.py safety              panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
   harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
   harness.py stopped             a run whose node was killed under it: stopped, not running for good
@@ -3456,18 +3459,40 @@ def scale():
     # to sort-merge (hash joins can't spill), and the node stays up. As on a 4-core machine
     # (GitHub's runners), where each partition's sort kept 10 MB aside and the merge above the
     # sorts found the budget gone: a partition per 24 MB at most.
-    node = Node(lake, port, memory_gb=0.05, env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4")}).start()
+    owner = {"x-pondra-owner": "frugal-owner-key-0123"}  # (this node's program: it may write a file on this machine)
+    node = Node(lake, port, memory_gb=0.05, env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4"), "PONDRA_OWNER_KEY": "frugal-owner-key-0123"}).start()
+    q = lambda s, p=port: call(p, "POST", "/sql", s.encode(), headers=owner)  # (with an owner key a node answers its program's requests only)
     q("CREATE TABLE big (id BIGINT, k BIGINT, s VARCHAR)")
     q("INSERT INTO big SELECT value, value % 2000000, 'name-' || (value % 2000000) FROM generate_series(1, 3000000)")
     checks["over the memory limit: aggregation, sort, join"] = (
         q("SELECT count(*) AS g, sum(n) AS n FROM (SELECT s, count(*) AS n FROM big GROUP BY s)") == [{"g": 2000000, "n": 3000000}]
         and q("SELECT max(r) AS r FROM (SELECT row_number() OVER (ORDER BY s, id) AS r FROM big)") == [{"r": 3000000}]
         and q("SELECT count(*) AS n FROM big a JOIN big b ON a.id = b.id") == [{"n": 3000000}]
-        and metrics_of(port)["pondra_memory_limit_bytes"] == int(0.05 * (1 << 30)))
+        and metrics_of(port, headers=owner)["pondra_memory_limit_bytes"] == int(0.05 * (1 << 30)))
+    # A write that runs out of memory retries frugally as a query does: its join's sort-merge spills, and a
+    # COPY to a folder leaves no file of the first try behind. Each write's error is kept for the report.
+    folder = os.path.join(tempfile.mkdtemp(prefix="pondra-frugal-"), "out")
+    write_errors = []
+    def written(s):
+        try:
+            call(port, "POST", "/sql", s.encode(), headers=owner)
+            return True
+        except RuntimeError as e:
+            write_errors.append(str(e)[:400])
+            return False
+    join = "SELECT a.id, b.k FROM big a JOIN big b ON a.id = b.id"
+    checks["over the memory limit, writes retry frugally too: CREATE TABLE … AS, INSERT … SELECT, COPY … TO"] = (
+        written(f"CREATE TABLE j AS {join}")
+        and q("SELECT count(*) AS n FROM j") == [{"n": 3000000}]
+        and written(f"INSERT INTO j {join}")
+        and q("SELECT count(*) AS n FROM j") == [{"n": 6000000}]
+        and written(f"COPY ({join}) TO '{folder}/' (FORMAT parquet)")
+        and call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_parquet('{folder}/*.parquet')".encode(), headers=owner) == [{"n": 3000000}])
+    shutil.rmtree(os.path.dirname(folder), ignore_errors=True)
     node.kill()
     ok = all(checks.values())
     shown = {q: ("same" if same else "DIFFERENT") + (", by ranges" if r else "") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp, r) in shuffles.items()}
-    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "ok": ok}, indent=1))
+    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "ok": ok}, indent=1))
     if not ok:
         print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
         sys.exit(1)
@@ -9660,6 +9685,952 @@ def sso():
         fake_idp.stop(srv)
     ok = all(checks.values())
     print(json.dumps({"sso": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+def sso_flow():
+    """Single sign-on's browser way in (ADR-074 §5–6, invariant 411, src/sso_flow.rs): the node finishes the flow
+    itself, so a browser, `pondra login` and the clients sign in through a provider with no provider token in a
+    page. The flow starts at /sso/{provider}/start (a 302 to the provider, the flow in a cookie the lake's key
+    signs); the provider sends the browser back to /sso/callback with a code; the node exchanges the code, checks
+    the ID token (its state, its nonce, its signature) and answers a session in the address's fragment, or the
+    reason it failed. The provider is tools/fake_idp.py (its /_test/next says what the next flow does). The browser
+    is urllib with redirects not followed, carrying the flow's cookie by hand."""
+    import base64, hashlib, pathlib, stat, urllib.error, urllib.parse, urllib.request
+    import adbc_driver_flightsql.dbapi as adbc
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import fake_idp
+    repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    P, PG, FLIGHT, SRV, SRV_PG = A.port, A.port + 13, A.port + 33, A.port + 12, A.port + 14  # (ports no other section takes)
+    token = "sso-flow-admin-1"
+    bearer = lambda t: {"Authorization": f"Bearer {t}"}
+    ana, cy, bo = "ana@acme.com", "cy@acme.com", "bo@acme.com"
+    checks, info, started, procs = {}, {}, [], []
+    srv = fake_idp.start(0)
+    issuer = srv.issuer
+    secured = None  # (a second stand-in, with a client secret: check 8)
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None  # a redirect comes back as an answer, its Location read and never followed
+
+    browser = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)  # this machine only
+
+    def get(url, cookie=None, method="GET", body=None):
+        """(status, headers, text) of a request the browser makes; a redirect comes back as it is."""
+        headers = {"Cookie": cookie} if cookie else {}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        try:
+            with browser.open(urllib.request.Request(url, data=body, method=method, headers=headers), timeout=30) as r:
+                return r.status, r.headers, r.read().decode(errors="replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read().decode(errors="replace")
+
+    def idp(path, body):
+        """One of the stand-in's test routes (POST /_test/…): its status."""
+        return get(issuer + path, method="POST", body=json.dumps(body).encode())[0]
+
+    def as_user(email, groups=None):
+        """Who the stand-in signs in next (its /_test/user)."""
+        return idp("/_test/user", {"sub": email, "email": email, "email_verified": True, **({"groups": groups} if groups else {})})
+
+    def cookie_of(headers):
+        """The flow's cookie as the browser sends it back: name=value ('' when none is set)."""
+        set_cookie = headers.get("Set-Cookie") or ""
+        return set_cookie.split(";")[0] if set_cookie.startswith("pondra_sso=") else ""
+
+    def where(headers):
+        """A redirect's Location ('' when there is none)."""
+        return headers.get("Location") or ""
+
+    def fragment(location):
+        """What the page gets in the address's fragment: pondra_session, pondra_user, pondra_error."""
+        return {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlsplit(location).fragment).items()}
+
+    def start(port, provider, to="/", challenge=None, prefix=""):
+        """GET {prefix}/sso/{provider}/start: (status, headers, text)."""
+        q = {"to": to, **({"challenge": challenge} if challenge else {})}
+        return get(f"http://127.0.0.1:{port}{prefix}/sso/{provider}/start?{urllib.parse.urlencode(q)}")
+
+    def sign_in(provider, to="/", challenge=None, port=P, prefix=""):
+        """The browser's whole way through a provider: start (the flow's cookie kept), the provider (which signs its
+        test user in at once and redirects back), then the node's callback with the cookie. (the start's answer,
+        the callback's answer)."""
+        st, h, _ = start(port, provider, to=to, challenge=challenge, prefix=prefix)
+        cookie = cookie_of(h)
+        _, back, _ = get(where(h))
+        return (st, h, cookie), get(where(back), cookie=cookie)
+
+    def read_as(bearer_token, port=P, prefix="", sql="SELECT x FROM t"):
+        """(status, the rows, or the refusal's text) of a query with a Bearer token, over HTTP."""
+        st, _, text = reply(port, "POST", f"{prefix}/sql", sql.encode(), headers=bearer(bearer_token))
+        return st, (json.loads(text) if st == 200 else text)
+
+    def who_as(bearer_token, port=P, prefix=""):
+        """(status, the user /whoami names, or the refusal's text)."""
+        st, _, text = reply(port, "GET", f"{prefix}/whoami", headers=bearer(bearer_token))
+        return st, (json.loads(text)["user"] if st == 200 else text)
+
+    def token_for(email, claims=None):
+        """A token of the stand-in's naming `email`, for pondra's audience."""
+        return srv.idp.mint({"ttl": 3600, "claims": {"aud": "pondra", "email": email, "email_verified": True, **(claims or {})}})
+
+    def flight_as(user, password, sql="SELECT x FROM t"):
+        """The rows over Flight SQL (ADBC's Basic handshake), or the error's text."""
+        try:
+            conn = adbc.connect(f"grpc://127.0.0.1:{FLIGHT}", db_kwargs={"username": user, "password": password})
+            try:
+                cur = conn.cursor()
+                cur.execute(sql)
+                rows = cur.fetchall()
+                cur.close()
+                return rows
+            finally:
+                conn.close()
+        except Exception as e:
+            return str(e).strip()
+
+    def pkce():
+        """(a PKCE verifier, its S256 challenge), as RFC 7636 makes them."""
+        verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+        return verifier, base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+    def login_env(home):
+        """The environment of a `pondra login`: its own PONDRA_HOME, and a browser that follows the redirects."""
+        env = {**os.environ, "PONDRA_HOME": home, "PONDRA_BROWSER": browser_at(home)}
+        env.pop("PONDRA_TOKEN", None)
+        return env
+
+    def browser_at(folder):
+        """A PONDRA_BROWSER program: it is given the URL, follows its redirects as a browser does (cookies kept) to the
+        command line's loopback address, and asks for that, so the command line gets its code."""
+        at = os.path.join(folder, "browser.py")
+        with open(at, "w") as f:
+            f.write(BROWSER.replace("PYTHON", sys.executable))
+        os.chmod(at, 0o755)
+        return at
+
+    lake = new_lake()
+    try:
+        node = Node(lake, P, admin_token=token, pg=f"127.0.0.1:{PG}", flight=f"127.0.0.1:{FLIGHT}").start()
+        started.append(node)
+        setup = [reply(P, "POST", "/sql", q.encode(), headers=bearer(token))[0] for q in (
+            "CREATE TABLE t (x INT)", "INSERT INTO t VALUES (1)", "CREATE ROLE analysts", "GRANT SELECT ON t TO analysts",
+            f'CREATE USER "{ana}"', f'GRANT SELECT ON t TO "{ana}"',
+            f"CREATE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), ROLES_CLAIM 'groups')")]
+        info["setup (statuses)"] = setup
+        checks["setup: t holds a row, ana@acme.com is made and granted SELECT on t, and identity provider acme is made (every statement 200)"] = setup == [200] * 7
+
+        # 1. The start: the provider's authorize with the flow's parameters, and the cookie that carries the flow.
+        st, h, _ = start(P, "acme", to="/")
+        at = urllib.parse.urlsplit(where(h))
+        q = {k: v[0] for k, v in urllib.parse.parse_qs(at.query).items()}
+        cookie_attrs = h.get("Set-Cookie") or ""
+        info["start"] = {"status": st, "location": where(h)[:300], "Set-Cookie": cookie_attrs}
+        checks["start: a 302 to the provider's authorize with response_type=code, client_id pondra, redirect_uri the node's /sso/callback, scope with openid, a state, a nonce and S256 PKCE; a cookie pondra_sso, HttpOnly, SameSite=Lax, Path=/sso/, Max-Age=600, not Secure over http"] = (
+            st == 302 and f"{at.scheme}://{at.netloc}{at.path}" == issuer + "/authorize" and q.get("response_type") == "code" and q.get("client_id") == "pondra"
+            and q.get("redirect_uri") == f"http://127.0.0.1:{P}/sso/callback" and "openid" in q.get("scope", "").split() and bool(q.get("state")) and bool(q.get("nonce"))
+            and q.get("code_challenge_method") == "S256" and len(q.get("code_challenge", "")) == 43
+            and cookie_attrs.startswith("pondra_sso=") and "Path=/sso/" in cookie_attrs and "Max-Age=600" in cookie_attrs and "HttpOnly" in cookie_attrs
+            and "SameSite=Lax" in cookie_attrs and "Secure" not in cookie_attrs)
+
+        # 1b. A redirect URI no request can steer: x-pondra-origin without the server's key, or X-Forwarded-Host from an
+        # address that isn't a trusted proxy, leaves it the node's own.
+        forged = {}
+        for name, hdr in (("x-pondra-origin", {"x-pondra-origin": "not-the-key https://evil.example"}),
+                          ("X-Forwarded-Host", {"X-Forwarded-Host": "evil.example", "X-Forwarded-Proto": "https"})):
+            try:
+                with browser.open(urllib.request.Request(f"http://127.0.0.1:{P}/sso/acme/start?to=%2F", headers=hdr), timeout=30) as r:
+                    loc = r.headers.get("Location") or ""
+            except urllib.error.HTTPError as e:
+                loc = e.headers.get("Location") or ""
+            forged[name] = urllib.parse.parse_qs(urllib.parse.urlsplit(loc).query).get("redirect_uri", [""])[0]
+        info["forged origins: redirect_uri"] = forged
+        checks["a redirect URI no request can steer: x-pondra-origin without the server's key, or X-Forwarded-Host from no trusted proxy, leaves it the node's own"] = \
+            all(v == f"http://127.0.0.1:{P}/sso/callback" for v in forged.values())
+
+        # 5. Refused at the start: nothing set, and a 400 saying why.
+        refused = {
+            "to=//evil.com/": start(P, "acme", to="//evil.com/"),
+            "to=https://evil.com/": start(P, "acme", to="https://evil.com/"),
+            "to=http://127.0.0.1/ (no port)": start(P, "acme", to="http://127.0.0.1/", challenge=pkce()[1]),
+            "a loopback to without a challenge": start(P, "acme", to="http://127.0.0.1:45678/"),
+        }
+        info["refused at start"] = {w: [st, h.get("Set-Cookie"), t[:140]] for w, (st, h, t) in refused.items()}
+        # (a sign-in that can't start, ending where it may: the page, or the command line, hears why there)
+        told = {"the page": start(P, "nope", to="/"), "the command line": start(P, "nope", to="http://127.0.0.1:45678/back", challenge=pkce()[1])}
+        info["told at start"] = {w: [st, where(h)[:120], h.get("Set-Cookie")] for w, (st, h, _) in told.items()}
+        checks["refused at the start with 400 and no cookie set: to=//evil.com/, to=https://evil.com/, a loopback to with no port, a loopback to with no challenge; an unknown provider sends the page to /#pondra_error=… and the command line to its address's ?error=…, no cookie set"] = (
+            all(st == 400 and h.get("Set-Cookie") is None for st, h, _ in refused.values())
+            and told["the page"][0] == 302 and "no identity provider nope" in fragment(where(told["the page"][1])).get("pondra_error", "")
+            and told["the command line"][0] == 302 and where(told["the command line"][1]).startswith("http://127.0.0.1:45678/back?error=")
+            and all(h.get("Set-Cookie") is None for _, h, _ in told.values()))
+
+        # 2. The whole flow for ana (made here) ends in the page's address, signed in.
+        (_, _, _), (st_cb, h_cb, _) = sign_in("acme")
+        frag = fragment(where(h_cb))
+        session = frag.get("pondra_session", "")
+        info["ana's flow"] = {"callback": st_cb, "location": where(h_cb)[:80], "pondra_user": frag.get("pondra_user"), "Set-Cookie": h_cb.get("Set-Cookie")}
+        checks["the whole flow for ana@acme.com (made here) ends at /#pondra_session=…: the session reads t over HTTP and /whoami names ana, and the cookie is cleared"] = (
+            st_cb == 302 and where(h_cb).startswith("/#pondra_session=ps_") and frag.get("pondra_user") == ana
+            and read_as(session) == (200, [{"x": 1}]) and who_as(session) == (200, ana) and "Max-Age=0" in (h_cb.get("Set-Cookie") or ""))
+
+        # 6. Refused at the callback, from the browser's side: no cookie, a tampered one, another flow's state.
+        no_cookie = get(f"http://127.0.0.1:{P}/sso/callback?code=x&state=y")
+        _, h6, _ = start(P, "acme", to="/")
+        payload, sig = cookie_of(h6).split("=", 1)[1].split(".")
+        spoiled = f"pondra_sso={payload[:10]}{'A' if payload[10] != 'A' else 'B'}{payload[11:]}.{sig}"
+        tampered = get(f"http://127.0.0.1:{P}/sso/callback?code=x&state=y", cookie=spoiled)
+        _, h6b, _ = start(P, "acme", to="/")
+        other_state = get(f"http://127.0.0.1:{P}/sso/callback?code=x&state=not-this-flows", cookie=cookie_of(h6b))
+        info["callback refusals"] = {"no cookie": no_cookie[0], "tampered": tampered[0], "another state": [other_state[0], fragment(where(other_state[1])).get("pondra_error")]}
+        checks["refused at the callback: no cookie (400), a tampered cookie (400), and a state that isn't the cookie's (302 to #pondra_error, naming the state)"] = (
+            no_cookie[0] == 400 and tampered[0] == 400 and other_state[0] == 302 and "state" in fragment(where(other_state[1])).get("pondra_error", ""))
+
+        # 7. Refused from the provider's side: a nonce that isn't the flow's, the provider's own refusal, and a user made nowhere.
+        idp("/_test/next", {"nonce": "x"})
+        (_, _, _), (_, h_nonce, _) = sign_in("acme")
+        idp("/_test/next", {"error": "access_denied"})
+        (_, _, _), (_, h_denied, _) = sign_in("acme")
+        as_user(bo)
+        (_, _, _), (_, h_bo, _) = sign_in("acme")
+        as_user(ana)
+        said = {w: fragment(where(h)).get("pondra_error", "") for w, h in (("nonce", h_nonce), ("refused", h_denied), ("nowhere", h_bo))}
+        info["refused by the provider, or for a user made nowhere"] = said
+        checks["refused at the callback, from the provider's side: a nonce that isn't the flow's (#pondra_error naming nonce), the provider's access_denied (naming it), and a user made nowhere under USERS 'listed' (naming bo@acme.com)"] = (
+            "nonce" in said["nonce"] and "access_denied" in said["refused"] and "no user bo@acme.com here" in said["nowhere"])
+
+        # 3. USERS 'any': a second provider, the same issuer, that anyone it vouches for signs in with the roles its claim names.
+        made_staff = reply(P, "POST", "/sql", f"CREATE IDENTITY PROVIDER staff (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), USERS 'any', ROLES_CLAIM 'groups')".encode(), headers=bearer(token))[0]
+        as_user(cy, ["analysts"])
+        (_, _, _), (_, h_cy, _) = sign_in("staff")
+        cy_session = fragment(where(h_cy)).get("pondra_session", "")
+        checks["USERS 'any': cy@acme.com, with no user made here, signs in through staff with groups [analysts], and its session reads t (analysts are granted SELECT on t) and /whoami names cy"] = (
+            made_staff == 200 and cy_session.startswith("ps_") and read_as(cy_session) == (200, [{"x": 1}]) and who_as(cy_session) == (200, cy))
+
+        # 4. Flight: the same user's provider token in the handshake.
+        flown = flight_as(cy, token_for(cy, {"groups": ["analysts"]}))
+        info["Flight as cy (the rows, or the refusal)"] = flown if isinstance(flown, str) else [list(r) for r in flown]
+        checks["Flight: cy's provider token in the handshake (Basic cy@acme.com:<token>) gives a session that reads t"] = flown == [(1,)]
+
+        # 12. Two providers: `pondra login` without --provider is refused, naming both; with --provider it signs in.
+        home, project = tempfile.mkdtemp(prefix="pondra-home-"), tempfile.mkdtemp(prefix="pondra-project-")
+        url = f"http://127.0.0.1:{P}"
+        two = subprocess.run([BIN, "login", url, "--project", project], env=login_env(home), capture_output=True, text=True, timeout=120)
+        as_user(ana)
+        with_provider = subprocess.run([BIN, "login", url, "--project", project, "--provider", "acme"], env=login_env(home), capture_output=True, text=True, timeout=120)
+        info["pondra login with two providers"] = {"no --provider": [two.returncode, two.stderr.strip()[-240:]], "--provider acme": [with_provider.returncode, (with_provider.stdout + with_provider.stderr).strip()[-240:]]}
+        checks["pondra login with two providers and no --provider is refused, naming both (acme, staff); with --provider acme it signs in as ana"] = (
+            two.returncode != 0 and "acme" in two.stderr and "staff" in two.stderr and with_provider.returncode == 0 and "ana@acme.com" in with_provider.stdout + with_provider.stderr)
+
+        # 3 (continued): dropped, cy's session is refused, as is any token of the provider's.
+        reply(P, "POST", "/sql", b"DROP IDENTITY PROVIDER staff", headers=bearer(token))
+        after_read, after_who = read_as(cy_session), who_as(cy_session)
+        info["cy's session after DROP staff"] = [after_read[0], after_who[0]]
+        checks["after DROP IDENTITY PROVIDER staff, cy's session is 401 (reading t and /whoami alike)"] = after_read[0] == 401 and after_who[0] == 401
+
+        # 8. A client secret: the provider names a secret that holds it; the stand-in asks for it.
+        reply(P, "POST", "/sql", b"CREATE SECRET s (TYPE generic, CLIENT_SECRET 's3cret-flow')", headers=bearer(token))
+        secured = fake_idp.start(0, client_secret="s3cret-flow")
+        made_secured = reply(P, "POST", "/sql", f"CREATE IDENTITY PROVIDER secured (ISSUER '{secured.issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), SECRET 's')".encode(), headers=bearer(token))[0]
+        (_, _, _), (_, h_sec, _) = sign_in("secured")
+        sec_session = fragment(where(h_sec)).get("pondra_session", "")
+        reply(P, "POST", "/sql", b"CREATE OR REPLACE SECRET s (TYPE generic, CLIENT_SECRET 'a-wrong-secret')", headers=bearer(token))
+        (_, _, _), (_, h_wrong, _) = sign_in("secured")
+        wrong_said = fragment(where(h_wrong)).get("pondra_error", "")
+        info["client secret: the wrong one's error"] = wrong_said[:200]
+        checks["a client secret: a provider with SECRET 's' (the stand-in started with that client_secret) signs ana in and its session reads t; with the secret replaced by a wrong one, the flow ends at #pondra_error naming invalid_client"] = (
+            made_secured == 200 and sec_session.startswith("ps_") and read_as(sec_session) == (200, [{"x": 1}]) and "invalid_client" in wrong_said)
+        reply(P, "POST", "/sql", b"DROP IDENTITY PROVIDER secured", headers=bearer(token))
+        fake_idp.stop(secured)
+        secured = None
+
+        # 9. The command line's code: a loopback address and a challenge; only the verifier redeems it.
+        as_user(ana)
+        verifier, challenge = pkce()
+        back = "http://127.0.0.1:45678/"
+        (_, _, _), (_, h_code, _) = sign_in("acme", to=back, challenge=challenge)
+        loc = where(h_code)
+        code = (urllib.parse.parse_qs(urllib.parse.urlsplit(loc).query).get("code") or [""])[0]
+        json_type = {"content-type": "application/json"}
+        bad = reply(P, "POST", "/sso/token", json.dumps({"code": code, "verifier": pkce()[0]}).encode(), headers=json_type)
+        good = reply(P, "POST", "/sso/token", json.dumps({"code": code, "verifier": verifier}).encode(), headers=json_type)
+        cli_session = json.loads(good[2]).get("token", "") if good[0] == 200 else ""
+        info["command line"] = {"location": loc[:80], "another verifier": bad[0], "the right one": good[0]}
+        checks["the command line's code: a loopback to with a challenge ends at http://127.0.0.1:PORT/?code=pc_…; POST /sso/token with another verifier is 401; with the right one it gives a session that reads t"] = (
+            loc.startswith(back + "?code=pc_") and bad[0] == 401 and good[0] == 200 and read_as(cli_session) == (200, [{"x": 1}]))
+
+        # 10. Behind `pondra serve --lakes`: the database's own node, its own provider, the path prefix in the flow.
+        folder = new_lake()
+        subprocess.run([BIN, "sql", "--dir", os.path.join(folder, "idp"), "CREATE TABLE t AS SELECT 1 AS x"], check=True, capture_output=True)
+        lakes_log = open(os.path.join(tempfile.gettempdir(), f"pondra-{SRV}-sso-flow.stderr"), "w")  # (CI keeps it when a check fails)
+        lakes = subprocess.Popen([BIN, "serve", "--lakes", folder, "--addr", f"127.0.0.1:{SRV}", "--pg", f"127.0.0.1:{SRV_PG}"], stdout=subprocess.DEVNULL, stderr=lakes_log)
+        procs.append(lakes)
+        until(lambda: _try(lambda: call(SRV, "GET", "/databases") is not None), True, 60)
+        made_boss = reply(SRV, "POST", "/db/idp/sql", b"CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")[0]
+        boss = {"Authorization": "Basic " + base64.b64encode(b"boss:boss-password-1").decode()}
+        db_made = [reply(SRV, "POST", "/db/idp/sql", q.encode(), headers=boss)[0] for q in (
+            f'CREATE USER "{ana}"', f'GRANT SELECT ON t TO "{ana}"', f"CREATE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'))")]
+        as_user(ana)
+        (st_d, h_d, _), (_, h_db, _) = sign_in("acme", to="/db/idp/", port=SRV, prefix="/db/idp")
+        redirect = (urllib.parse.parse_qs(urllib.parse.urlsplit(where(h_d)).query).get("redirect_uri") or [""])[0]
+        db_session = fragment(where(h_db)).get("pondra_session", "")
+        info["pondra serve --lakes: the flow"] = {"redirect_uri": redirect, "Set-Cookie": h_d.get("Set-Cookie"), "location": where(h_db)[:60]}
+        checks["behind pondra serve --lakes, the flow at /db/idp/sso/acme/start has redirect_uri http://127.0.0.1:S/db/idp/sso/callback and cookie Path=/db/idp/sso/, and its session reads t at /db/idp/ (the provider made in that database)"] = (
+            made_boss == 200 and db_made == [200, 200, 200] and st_d == 302 and redirect == f"http://127.0.0.1:{SRV}/db/idp/sso/callback"
+            and "Path=/db/idp/sso/" in (h_d.get("Set-Cookie") or "") and read_as(db_session, port=SRV, prefix="/db/idp") == (200, [{"x": 1}]))
+        lakes.send_signal(signal.SIGTERM)
+        lakes.wait(timeout=120)
+        procs.remove(lakes)
+
+        # 11. `pondra login` with its one provider (acme): the browser's session kept in $PONDRA_HOME, then read by
+        # `pondra run`, the Python client and the JavaScript client, with no token given.
+        as_user(ana)
+        home = tempfile.mkdtemp(prefix="pondra-home-")
+        login = subprocess.run([BIN, "login", url, "--project", project], env=login_env(home), capture_output=True, text=True, timeout=120)
+        kept_at = os.path.join(home, "login.json")
+        kept = json.load(open(kept_at)) if os.path.exists(kept_at) else {}
+        kept_mode = stat.S_IMODE(os.stat(kept_at).st_mode) if os.path.exists(kept_at) else None
+        q_sql = os.path.join(project, "q.sql")
+        with open(q_sql, "w") as f:
+            f.write("SELECT x FROM t;\n")
+        env = login_env(home)
+        run = subprocess.run([BIN, "run", q_sql, "--url", url], env=env, cwd=project, capture_output=True, text=True, timeout=120)
+        py_code = "import json, sys; sys.path.insert(0, " + repr(os.path.join(repo, "python")) + "); import pondra; " \
+            "db = pondra.connect(" + repr(url) + ", echo=False); print(json.dumps(db.sql('SELECT x FROM t').rows()))"
+        py = subprocess.run([sys.executable, "-c", py_code], env=env, capture_output=True, text=True, timeout=120)
+        node = shutil.which("node")
+        js = None
+        if node:
+            js_code = "import { Pondra } from " + json.dumps(pathlib.Path(repo, "js", "index.js").resolve().as_uri()) + "; const db = new Pondra(" + json.dumps(url) + "); " \
+                "console.log(JSON.stringify(await db.sql('SELECT x FROM t')));"
+            js = subprocess.run([node, "--input-type=module", "-e", js_code], env=env, capture_output=True, text=True, timeout=120)
+        info["pondra login"] = {"returncode": login.returncode, "said": (login.stdout + login.stderr).strip()[-240:], "mode": kept_mode, "keys": list(kept)}
+        info["readers with no token"] = {"pondra run": [run.returncode, run.stdout.strip()[-120:]], "python": [py.returncode, py.stdout.strip()[-120:], py.stderr.strip()[-200:]],
+                                         "javascript": None if js is None else [js.returncode, js.stdout.strip()[-120:], js.stderr.strip()[-200:]]}
+        checks["pondra login http://127.0.0.1:P (one provider, the browser sent back in by its PONDRA_BROWSER) signs in and says so: 'signed in to … (ana@acme.com, …)'"] = \
+            login.returncode == 0 and f"signed in to {url} (ana@acme.com" in login.stdout + login.stderr
+        checks["pondra login keeps a ps_ session for the server in login.json, mode 0600"] = \
+            kept_mode == 0o600 and str(kept.get(url, "")).startswith("ps_")
+        checks["pondra run q.sql --url reads t with no token (the saved session)"] = run.returncode == 0 and "1" in run.stdout
+        checks["pondra.Pondra(the server) with that PONDRA_HOME reads t with no token (Python)"] = py.returncode == 0 and json.loads(py.stdout.strip() or "null") == [{"x": 1}]
+        if js is not None:
+            checks["the JavaScript client (new Pondra(the server)) with that PONDRA_HOME reads t with no token"] = js.returncode == 0 and json.loads(js.stdout.strip() or "null") == [{"x": 1}]
+        else:
+            info["javascript"] = "node isn't on this machine: not run"
+
+        # 12 is above (it needs two providers); `pondra login` with one is the check above.
+    finally:
+        for n in started:
+            n.kill()
+        for p in procs:
+            if p.poll() is None:
+                p.send_signal(signal.SIGTERM)
+                p.wait(timeout=120)
+        if secured is not None:
+            fake_idp.stop(secured)
+        fake_idp.stop(srv)
+    ok = all(checks.values())
+    print(json.dumps({"sso_flow": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+BROWSER = '''#!PYTHON
+import http.cookiejar, urllib.error, urllib.parse, urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect, urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+url = __import__("sys").argv[1]
+for _ in range(10):
+    try:
+        opener.open(url, timeout=30).read()
+        break
+    except urllib.error.HTTPError as e:
+        if e.code not in (301, 302, 303, 307, 308):
+            raise
+        url = urllib.parse.urljoin(url, e.headers["Location"])
+'''
+
+
+def sso_pg():
+    """psql 18's sign-in through a provider (ADR-074 §6's third part, invariant 413, src/pg.rs): with POSTGRES 'oauth', the
+    Postgres port asks a user with no password (or, for a USERS 'any' provider, a name no user has) for OAUTHBEARER
+    (RFC 7628) instead of a password, with SCRAM-SHA-256 after it only so that a client before libpq 18 is told the way
+    out. A client with no token is told where the provider is (the error's
+    openid-configuration and scope) and refused, a token goes straight to AuthenticationOk (no SASLFinal: libpq refuses
+    one), a refused token says why. One way a connection, as pg_hba has it: a user with a password still signs in with
+    SCRAM, and the default (POSTGRES 'password') still asks for the token as a password. A hand-written client speaks the
+    exchange; psql 18 itself, when there is one (PONDRA_PSQL, else psql on the PATH), runs the device flow against
+    tools/fake_idp.py."""
+    import socket, struct, shutil
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import fake_idp
+    import psycopg
+    P, PG = A.port, A.port + 13
+    token = "sso-pg-admin-token-1"
+    bearer = {"Authorization": f"Bearer {token}"}
+    ana, eve, cy, bo = "ana@acme.com", "eve@acme.com", "cy@acme.com", "bo"
+    srv = fake_idp.start(0)
+    issuer = srv.issuer
+    discovery = issuer + "/.well-known/openid-configuration"
+    checks, info, started = {}, {}, []
+    OFFERED = ["OAUTHBEARER", "SCRAM-SHA-256"]  # (libpq 18 takes the first it knows; an older client, SCRAM)
+
+    def token_for(email, **body):
+        return srv.idp.mint({"ttl": 3600, "claims": {"aud": "api://pondra", "email": email, "email_verified": True}, **body})
+
+    def sql(q):
+        st, _, text = reply(P, "POST", "/sql", q.encode(), headers=bearer)
+        return st if st == 200 else (st, text[:200])
+
+    def by_hand(user, tok, query=None, choose="OAUTHBEARER", port=None):
+        """OAUTHBEARER as psql 18 speaks it, written out: what the port asked for, and what came of it. With
+        choose="SCRAM-SHA-256", the mechanism a client before libpq 18 takes from the same list."""
+        s = socket.create_connection(("127.0.0.1", port or PG), timeout=10)
+        def take(n):
+            got = b""
+            while len(got) < n:
+                more = s.recv(n - len(got))
+                if not more:
+                    raise EOFError("the port hung up")
+                got += more
+            return got
+        def read():
+            kind = take(1)
+            return kind, take(struct.unpack("!I", take(4))[0] - 4)
+        def send(kind, body):
+            s.sendall(kind + struct.pack("!I", len(body) + 4) + body)
+        def fields(body):  # an ErrorResponse's fields: severity, code, message
+            return {f[:1].decode(): f[1:].decode() for f in body.split(b"\0") if f}
+        try:
+            hello = struct.pack("!I", 196608) + f"user\0{user}\0database\0lake\0\0".encode()
+            s.sendall(struct.pack("!I", len(hello) + 4) + hello)
+            kind, body = read()
+            code = struct.unpack("!I", body[:4])[0]
+            asked = {3: "password", 10: [m.decode() for m in body[4:].split(b"\0") if m]}.get(code, code)
+            out = {"asked": asked}
+            if asked != OFFERED:
+                return out
+            if choose == "SCRAM-SHA-256":  # (a client first message, n,,n=,r=: the port answers it with an error)
+                first = b"n,,n=,r=abcdefghijklmnop"
+                send(b"p", b"SCRAM-SHA-256\0" + struct.pack("!i", len(first)) + first)
+                kind, body = read()
+                out["error" if kind == b"E" else "then"] = fields(body) if kind == b"E" else kind.decode()
+                return out
+            data = b"n,,\x01auth=" + (f"Bearer {tok}".encode() if tok else b"") + b"\x01\x01"
+            send(b"p", b"OAUTHBEARER\0" + struct.pack("!i", len(data)) + data)
+            kind, body = read()
+            if kind == b"R" and struct.unpack("!I", body[:4])[0] == 11:  # told where the provider is: answer \x01, as psql does
+                out["told"] = json.loads(body[4:])
+                send(b"p", b"\x01")
+                kind, body = read()
+            if kind == b"E":
+                out["error"] = fields(body)
+                return out
+            out["then"] = struct.unpack("!I", body[:4])[0] if kind == b"R" else kind.decode()  # (0: AuthenticationOk)
+            while kind != b"Z":
+                kind, body = read()
+            if query:  # the simple protocol: its rows as text, until ReadyForQuery
+                send(b"Q", query.encode() + b"\0")
+                out["rows"] = []
+                while (got := read())[0] != b"Z":
+                    kind, body = got
+                    if kind == b"E":
+                        out["error"] = fields(body)
+                    if kind == b"D":
+                        at, row = 2, []
+                        for _ in range(struct.unpack("!H", body[:2])[0]):
+                            ln = struct.unpack("!i", body[at:at + 4])[0]
+                            row.append(body[at + 4:at + 4 + ln].decode() if ln >= 0 else None)
+                            at += 4 + max(ln, 0)
+                        out["rows"].append(row)
+            return out
+        except (OSError, EOFError) as e:
+            return {"failed": str(e)}
+        finally:
+            s.close()
+
+    def pg_as(user, password, query="SELECT x FROM t"):
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={PG} user={user} password={password} dbname=lake connect_timeout=10") as conn:
+                return conn.execute(query).fetchall()
+        except psycopg.Error as e:
+            return str(e).strip()
+
+    def find_psql():
+        """psql 18 or later (the first with OAUTHBEARER): PONDRA_PSQL, else psql on the PATH; None without one."""
+        for exe in [os.environ.get("PONDRA_PSQL"), shutil.which("psql")]:
+            if exe:
+                try:
+                    said = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10).stdout
+                    if int(said.split()[-1].split(".")[0]) >= 18:
+                        return exe
+                except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+                    pass
+        return None
+
+    lake = new_lake()
+    try:
+        node = Node(lake, P, admin_token=token, pg=f"127.0.0.1:{PG}").start()
+        started.append(node)
+        setup = [sql(q) for q in (
+            f"CREATE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'))",
+            f'CREATE USER "{ana}"', f'CREATE USER "{eve}"', f"CREATE USER {bo} PASSWORD 'bo-password-1'",
+            "CREATE TABLE t (x INT)", "INSERT INTO t VALUES (7)", f'GRANT SELECT ON t TO "{ana}"', f"GRANT SELECT ON t TO {bo}")]
+        info["setup"] = setup
+        ana_t = token_for(ana)
+
+        # 1. By default (POSTGRES 'password'), as part 1 left it: ana, with no password, is asked for one, and her token is it.
+        checks["by default, a user with no password is asked for a password, and her provider's token signs her in"] = \
+            setup == [200] * len(setup) and by_hand(ana, None) == {"asked": "password"} and pg_as(ana, ana_t) == [(7,)]
+
+        # 2. With POSTGRES 'oauth': OAUTHBEARER first, told where the provider is, then refused; a token signs straight in.
+        info["oauth"] = sql(f"CREATE OR REPLACE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), POSTGRES 'oauth')")
+        shown = call(P, "POST", "/sql", b"SHOW CREATE IDENTITY PROVIDER acme", headers=bearer)[0]["definition"]
+        empty = by_hand(ana, None)
+        info["no token yet"] = empty
+        checks["with POSTGRES 'oauth' (shown by SHOW CREATE), ana is asked for OAUTHBEARER (SCRAM-SHA-256 after it, for older clients); with no token she is told the provider's discovery document and scopes, then refused 28000"] = \
+            "POSTGRES 'oauth'" in shown and empty.get("asked") == OFFERED \
+            and empty.get("told") == {"status": "invalid_token", "openid-configuration": discovery, "scope": "openid email profile"} \
+            and empty.get("error", {}).get("C") == "28000"
+        signed_in = by_hand(ana, ana_t, "SELECT x FROM t")
+        info["her token"] = signed_in
+        checks["her token signs her in: AuthenticationOk with no SASLFinal (libpq refuses one), and she reads t"] = \
+            signed_in.get("then") == 0 and "told" not in signed_in and signed_in.get("rows") == [["7"]]
+
+        # 3. Refused, saying why, after being told where the provider is.
+        refused = {"eve's token as ana": by_hand(ana, token_for(eve)), "a stranger's key": by_hand(ana, token_for(ana, sign_with="stranger")),
+                   "expired": by_hand(ana, token_for(ana, ttl=-600)), "not a token": by_hand(ana, "pt_nope")}
+        info["refused"] = refused
+        checks["refused with 28000, each saying why (another user's token, a stranger's key, an expired one, not a token at all), told where the provider is first"] = \
+            all(r.get("told", {}).get("openid-configuration") == discovery and r.get("error", {}).get("C") == "28000" for r in refused.values()) \
+            and "doesn't sign in ana@acme.com" in refused["eve's token as ana"]["error"]["M"] \
+            and "isn't its issuer's" in refused["a stranger's key"]["error"]["M"] and "expired" in refused["expired"]["error"]["M"]
+
+        # 4. One way a connection: a user with a password still signs in with SCRAM; a name no user has, with no
+        # USERS 'any' provider, too; and a driver that sends the token as its password can't, once OAUTHBEARER is asked.
+        driver = pg_as(ana, ana_t)
+        info["psycopg with the token as the password"] = driver
+        checks["one way a connection: bo (a password) is asked for SCRAM and signs in, a name no user has too; ana's token as psycopg's password is refused once she is asked for OAUTHBEARER"] = \
+            by_hand(bo, None) == {"asked": ["SCRAM-SHA-256"]} and pg_as(bo, "bo-password-1") == [(7,)] \
+            and by_hand(cy, None) == {"asked": ["SCRAM-SHA-256"]} and isinstance(driver, str)
+
+        # 4b. A client before libpq 18 takes SCRAM-SHA-256 from the same list, and is told the way out: psql 18 (or
+        # libpq 18) with the issuer, or the provider's POSTGRES 'password'. psycopg2's libpq is 17.
+        older = by_hand(ana, None, choose="SCRAM-SHA-256")
+        info["a client choosing SCRAM"] = older
+        try:
+            import psycopg2
+            info["psycopg2's libpq"] = psycopg2.__libpq_version__
+            try:
+                psycopg2.connect(f"host=127.0.0.1 port={PG} user={ana} password={ana_t} dbname=lake connect_timeout=10").close()
+                old_said = "signed in"
+            except psycopg2.Error as e:
+                old_said = str(e).strip()
+        except ImportError:
+            old_said = None
+        info["psycopg2 (libpq 17)"] = old_said
+        way_out = lambda said: isinstance(said, str) and "psql 18" in said and f"oauth_issuer={issuer}" in said and "POSTGRES 'password'" in said
+        checks["a client before libpq 18 (psycopg2's libpq 17) takes SCRAM-SHA-256 and is refused 28000, told the way out: psql 18 with the issuer, or POSTGRES 'password'"] = \
+            older.get("error", {}).get("C") == "28000" and way_out(older["error"].get("M")) and (old_said is None or way_out(old_said))
+
+        # 5. A USERS 'any' provider that says POSTGRES 'oauth' asks a name no user has for OAUTHBEARER; the listed one
+        # (acme, first by name) still answers for ana.
+        info["staff"] = sql(f"CREATE IDENTITY PROVIDER staff (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), USERS 'any', POSTGRES 'oauth')")
+        cy_in = by_hand(cy, token_for(cy), "SELECT 1")
+        info["cy"] = cy_in
+        checks["with a USERS 'any' provider saying POSTGRES 'oauth', a name no user has (cy) is asked for OAUTHBEARER and signs in with its token; ana still does"] = \
+            cy_in.get("asked") == OFFERED and cy_in.get("rows") == [["1"]] and by_hand(ana, ana_t, "SELECT x FROM t").get("rows") == [["7"]]
+
+        # 5b. Through a folder of lakes (pondra serve --lakes): the server passes the exchange on to the database's node
+        # as it is, after the startup message.
+        folder, lp = new_lake(), P + 40
+        config = tempfile.mkdtemp(prefix="pondra-sso-pg-config-")
+        with open(f"/tmp/pondra-{lp}-sso-pg.stderr", "w") as log:
+            lakes = subprocess.Popen([BIN, "serve", "--lakes", folder, "--addr", f"127.0.0.1:{lp}", "--pg", f"127.0.0.1:{lp + 1}", "--admin-token", token],
+                                     stdout=subprocess.DEVNULL, stderr=log, env={**os.environ, "PONDRA_CONFIG_DIR": config})
+        try:
+            def made():
+                try:
+                    return reply(lp, "POST", "/sql", f"CREATE IDENTITY PROVIDER acme (ISSUER '{issuer}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), POSTGRES 'oauth')".encode(), headers=bearer)[0]
+                except OSError:
+                    return None  # (the server not up yet)
+            there = [until(made, 200, 60)] + [reply(lp, "POST", "/sql", q.encode(), headers=bearer)[0] for q in (
+                f'CREATE USER "{ana}"', "CREATE TABLE t (x INT)", "INSERT INTO t VALUES (8)", f'GRANT SELECT ON t TO "{ana}"')]
+            told, signed = by_hand(ana, None, port=lp + 1), by_hand(ana, ana_t, "SELECT x FROM t", port=lp + 1)
+            info["through a folder of lakes"] = {"setup": there, "no token": told, "her token": signed}
+            checks["through pondra serve --lakes, the exchange passes on to the database's node: told where the provider is, then her token signs her in"] = \
+                there == [200] * 5 and told.get("asked") == OFFERED and told.get("told", {}).get("openid-configuration") == discovery \
+                and told.get("error", {}).get("C") == "28000" and signed.get("then") == 0 and signed.get("rows") == [["8"]]
+        finally:
+            lakes.send_signal(signal.SIGTERM)
+            lakes.wait(timeout=60)
+            shutil.rmtree(config, ignore_errors=True)
+
+        # 6. psql 18 itself: the device flow against the provider, then the query.
+        psql = find_psql()
+        info["psql"] = psql or "no psql 18 here (PONDRA_PSQL names one): its check is left out"
+        if psql:
+            asked_before = srv.idp.stats["device_requests"]
+            env = {**os.environ, "PGOAUTHDEBUG": "UNSAFE"}  # (an http issuer: the stand-in provider, on this machine)
+            env.pop("PGPASSWORD", None)
+            ran = subprocess.run([psql, f"host=127.0.0.1 port={PG} dbname=lake user={ana} oauth_issuer={issuer} oauth_client_id=pondra-cli",
+                                  "-At", "-c", "SELECT x FROM t"], capture_output=True, text=True, timeout=60, env=env)
+            info["psql 18"] = {"exit": ran.returncode, "out": ran.stdout.strip(), "err": ran.stderr.strip()[-400:]}
+            checks["psql 18 signs ana in through the provider's device flow (oauth_issuer, oauth_client_id) and reads t"] = \
+                ran.returncode == 0 and ran.stdout.strip() == "7" and srv.idp.stats["device_requests"] == asked_before + 1
+    finally:
+        for n in started:
+            n.kill()
+        fake_idp.stop(srv)
+    ok = all(checks.values())
+    print(json.dumps({"sso_pg": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+KC_BROWSER = '''#!PYTHON
+"""The browser `pondra login` runs (PONDRA_BROWSER, given the sign-in's address): it opens the address, posts Keycloak's
+login form with KC_USER and KC_PASSWORD, and follows the redirects on to the command line's loopback address. Keycloak's
+cookies are Secure, so the cookie policy sends them back over http://127.0.0.1 too (a secure context, in a browser)."""
+import html, http.cookiejar, os, re, sys, traceback, urllib.parse, urllib.request
+here = os.path.dirname(os.path.abspath(__file__))
+
+
+class Loopback(http.cookiejar.DefaultCookiePolicy):
+    def return_ok_secure(self, cookie, request):
+        return True
+
+
+try:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar(Loopback())))
+    r = opener.open(sys.argv[1], timeout=30)
+    page, at = r.read().decode(errors="replace"), r.geturl()
+    action = re.search(r'<form[^>]*action="([^"]+)"', page)
+    if 'name="username"' in page and action:
+        fields = dict(re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', page))
+        fields.update(username=os.environ["KC_USER"], password=os.environ["KC_PASSWORD"])
+        opener.open(urllib.request.Request(urllib.parse.urljoin(at, html.unescape(action.group(1))), data=urllib.parse.urlencode(fields).encode()), timeout=30).read()
+except Exception:
+    with open(os.path.join(here, "browser.log"), "a") as f:
+        f.write(traceback.format_exc())
+    raise
+'''
+
+
+def keycloak():
+    """Single sign-on against a real Keycloak (an OpenID Connect provider, ADR-074), not tools/fake_idp.py: the realm
+    `pondra-check` is made through Keycloak's admin REST API (PONDRA_KEYCLOAK, its admin PONDRA_KEYCLOAK_ADMIN), and
+    Pondra's identity providers point at it. Checked: Bearer tokens at /whoami and /sql (a listed user, USERS 'any' with
+    Keycloak's realm roles, a user with no role; another issuer's and another audience's tokens refused), Postgres with
+    the token as the password, Flight SQL, the console's flow (a scripted browser through Keycloak's login form, the
+    session in the address's fragment), `pondra login --provider` with a PONDRA_BROWSER that signs in at Keycloak, and
+    psql 18's device flow. Not part of `all`: it needs Keycloak running, and psql 18 for its last check."""
+    import html, http.cookiejar, urllib.error, urllib.parse, urllib.request
+    import adbc_driver_flightsql.dbapi as adbc
+    import psycopg
+    KC = os.environ.get("PONDRA_KEYCLOAK", "http://127.0.0.1:8180").rstrip("/")
+    admin_name, _, admin_pass = os.environ.get("PONDRA_KEYCLOAK_ADMIN", "admin:admin").partition(":")
+    REALM = "pondra-check"
+    ISSUER = f"{KC}/realms/{REALM}"
+    P, PG, FLIGHT = A.port, A.port + 13, A.port + 33  # (ports no other section takes)
+    token = "kc-admin-token-1"
+    bearer = lambda t: {"Authorization": f"Bearer {t}"}
+    ana, cy, eve = "ana@acme.com", "cy@acme.com", "eve@acme.com"
+    checks, info, started = {}, {}, []
+    plain = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # (no proxy: Keycloak is on this machine)
+
+    try:
+        plain.open(f"{KC}/realms/master/.well-known/openid-configuration", timeout=10).read()
+    except (urllib.error.URLError, OSError):
+        print(f"no Keycloak answers at {KC} (its master realm's discovery document): start one, or set PONDRA_KEYCLOAK")
+        return False
+
+    def kc_call(method, path, body=None, form=None, auth=None):
+        """(status, the JSON or the text) of a request to Keycloak: a form is sent form-encoded, a body as JSON."""
+        headers = {"Authorization": f"Bearer {auth}"} if auth else {}
+        data = None
+        if form is not None:
+            data, headers["Content-Type"] = urllib.parse.urlencode(form).encode(), "application/x-www-form-urlencoded"
+        elif body is not None:
+            data, headers["Content-Type"] = json.dumps(body).encode(), "application/json"
+        try:
+            with plain.open(urllib.request.Request(KC + path, data=data, method=method, headers=headers), timeout=30) as r:
+                text = r.read().decode(errors="replace")
+                return r.status, (json.loads(text) if text.strip().startswith(("{", "[")) else text)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode(errors="replace")
+
+    st, tok = kc_call("POST", "/realms/master/protocol/openid-connect/token",
+                      form={"grant_type": "password", "client_id": "admin-cli", "username": admin_name, "password": admin_pass})
+    if st != 200:
+        print(f"Keycloak's admin ({admin_name}, from PONDRA_KEYCLOAK_ADMIN) can't sign in to its master realm: {st} {str(tok)[:200]}")
+        return False
+    admin = tok["access_token"]
+
+    # The realm, as kc_setup.py makes it: users ana, cy (realm role analysts) and eve, each with the password name-pass-1;
+    # the pondra client (confidential, the secret kc-secret-1) and pondra-cli (public, the device grant), both with the
+    # audience api://pondra in their access tokens.
+    audience = {"name": "pondra audience", "protocol": "openid-connect", "protocolMapper": "oidc-audience-mapper",
+                "config": {"included.custom.audience": "api://pondra", "access.token.claim": "true", "id.token.claim": "false", "introspection.token.claim": "true"}}
+    person = lambda name, roles=(): {"username": name, "email": f"{name}@acme.com", "emailVerified": True, "enabled": True, "firstName": name.title(), "lastName": "Acme",
+                                     "credentials": [{"type": "password", "value": f"{name}-pass-1", "temporary": False}], "realmRoles": list(roles)}
+    realm = {
+        "realm": REALM, "enabled": True, "sslRequired": "none",
+        "roles": {"realm": [{"name": "analysts"}]},
+        "users": [person("ana"), person("cy", ["analysts"]), person("eve")],
+        "clients": [
+            {"clientId": "pondra", "enabled": True, "publicClient": False, "secret": "kc-secret-1", "standardFlowEnabled": True, "directAccessGrantsEnabled": True,
+             "redirectUris": [f"http://127.0.0.1:{P}/sso/callback"], "webOrigins": [], "consentRequired": False, "protocolMappers": [audience]},
+            {"clientId": "pondra-cli", "enabled": True, "publicClient": True, "standardFlowEnabled": False, "directAccessGrantsEnabled": True,
+             "attributes": {"oauth2.device.authorization.grant.enabled": "true"}, "consentRequired": False, "protocolMappers": [audience]},
+        ],
+    }
+
+    def token_of(label, client, email, secret=None):
+        """Keycloak's password grant for email's user (the realm's password is name-pass-1): its access token, or '' with
+        the refusal kept in info."""
+        name = email.split("@")[0]
+        form = {"grant_type": "password", "client_id": client, "username": name, "password": f"{name}-pass-1", "scope": "openid email"}
+        if secret:
+            form["client_secret"] = secret
+        st, answer = kc_call("POST", f"/realms/{REALM}/protocol/openid-connect/token", form=form)
+        if st != 200:
+            info.setdefault("tokens Keycloak refused", {})[label] = [st, str(answer)[:200]]
+            return ""
+        return answer["access_token"]
+
+    def who_as(bearer_token):
+        """(status, the user /whoami names, or the refusal's text)."""
+        st, _, text = reply(P, "GET", "/whoami", headers=bearer(bearer_token))
+        return st, (json.loads(text)["user"] if st == 200 else text)
+
+    def sql_as(bearer_token, sql="SELECT x FROM t"):
+        """(status, the rows, or the refusal's text) of a query with a Bearer token, over HTTP."""
+        st, _, text = reply(P, "POST", "/sql", sql.encode(), headers=bearer(bearer_token))
+        return st, (json.loads(text) if st == 200 else text)
+
+    def pg_as(user, password, query="SELECT x FROM t"):
+        """The rows psycopg gets as user with password, or the error's text."""
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={PG} user={user} password={password} dbname=lake connect_timeout=10") as conn:
+                return conn.execute(query).fetchall()
+        except psycopg.Error as e:
+            return str(e).strip()
+
+    def flight_as(user, password, sql="SELECT x FROM t"):
+        """The rows over Flight SQL (ADBC's Basic handshake), or the error's text."""
+        try:
+            conn = adbc.connect(f"grpc://127.0.0.1:{FLIGHT}", db_kwargs={"username": user, "password": password})
+            try:
+                cur = conn.cursor()
+                cur.execute(sql)
+                rows = cur.fetchall()
+                cur.close()
+                return rows
+            finally:
+                conn.close()
+        except Exception as e:
+            return str(e).strip()
+
+    class Loopback(http.cookiejar.DefaultCookiePolicy):
+        def return_ok_secure(self, cookie, request):
+            return True  # (Keycloak's cookies are Secure: a browser sends them back to http://127.0.0.1 too, a secure context)
+
+    class Recording(urllib.request.HTTPRedirectHandler):
+        """A redirect followed as a browser follows it, each address it is sent to kept in `sent`."""
+        def __init__(self, sent):
+            self.sent = sent
+
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            self.sent.append(newurl)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    def opener_for(sent):
+        """A browser on this machine: cookies kept, redirects followed (each address into `sent`)."""
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}), Recording(sent), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar(Loopback())))
+
+    def form_of(page):
+        """The page's first form's action (unescaped), and the inputs that have a value."""
+        m = re.search(r'<form[^>]*action="([^"]+)"', page)
+        return (html.unescape(m.group(1)) if m else None), dict(re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', page))
+
+    def keycloak_login(opener, url, email):
+        """Opens url, which the redirects lead to Keycloak's login form, and posts the form with email's user and password
+        as a person would (a consent form gets its Yes): the (address, text) the browser ends on."""
+        name = email.split("@")[0]
+        r = opener.open(url, timeout=30)
+        page, at = r.read().decode(errors="replace"), r.geturl()
+        action, fields = form_of(page)
+        if 'name="username"' not in page or not action:
+            return at, page  # (no login form: where the redirects ended)
+        fields.update(username=name, password=f"{name}-pass-1")
+        r = opener.open(urllib.request.Request(urllib.parse.urljoin(at, action), data=urllib.parse.urlencode(fields).encode()), timeout=30)
+        page, at = r.read().decode(errors="replace"), r.geturl()
+        action, fields = form_of(page)
+        if 'name="accept"' in page and action:
+            fields["accept"] = "Yes"
+            r = opener.open(urllib.request.Request(urllib.parse.urljoin(at, action), data=urllib.parse.urlencode(fields).encode()), timeout=30)
+            page, at = r.read().decode(errors="replace"), r.geturl()
+        return at, page
+
+    def find_psql():
+        """psql 18 or later (the first with OAUTHBEARER): PONDRA_PSQL, else psql on the PATH; None without one."""
+        for exe in [os.environ.get("PONDRA_PSQL"), shutil.which("psql")]:
+            if exe:
+                try:
+                    said = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10).stdout
+                    if int(said.split()[-1].split(".")[0]) >= 18:
+                        return exe
+                except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+                    pass
+        return None
+
+    lake = new_lake()
+    try:
+        kc_call("DELETE", f"/admin/realms/{REALM}", auth=admin)  # (left by an earlier run: none is not an error)
+        info["realm (status)"] = kc_call("POST", "/admin/realms", body=realm, auth=admin)[0]
+        node = Node(lake, P, admin_token=token, pg=f"127.0.0.1:{PG}", flight=f"127.0.0.1:{FLIGHT}").start()
+        started.append(node)
+        # The client secret is a secret the provider names (SECRET), not an option of the provider.
+        setup = [reply(P, "POST", "/sql", q.encode(), headers=bearer(token))[0] for q in (
+            "CREATE TABLE t (x INT)", "INSERT INTO t VALUES (7)", "CREATE ROLE analysts", "GRANT SELECT ON t TO analysts",
+            f'CREATE USER "{ana}"', f'GRANT SELECT ON t TO "{ana}"',
+            "CREATE SECRET kc_client (TYPE generic, CLIENT_SECRET 'kc-secret-1')",
+            f"CREATE IDENTITY PROVIDER kc (ISSUER '{ISSUER}', CLIENT_ID 'pondra', SECRET 'kc_client', AUDIENCE ('api://pondra'), LABEL 'Keycloak')",
+            f"CREATE IDENTITY PROVIDER kcstaff (ISSUER '{ISSUER}', CLIENT_ID 'pondra', AUDIENCE ('api://pondra'), USERS 'any', ROLES_CLAIM 'realm_access.roles')")]
+        info["setup (statuses)"] = setup
+        checks["setup: Keycloak's realm pondra-check is made, t holds a row, ana@acme.com is made and granted SELECT on t, and identity providers kc and kcstaff are made (every statement 200)"] = (
+            info["realm (status)"] == 201 and setup == [200] * 9)
+
+        # 1. Keycloak's access tokens as Bearer tokens: ana's, from the pondra client (with its secret) and from pondra-cli.
+        ana_t = token_of("ana (pondra)", "pondra", ana, "kc-secret-1")
+        ana_cli = token_of("ana (pondra-cli)", "pondra-cli", ana)
+        seen_ana = {"pondra": (who_as(ana_t), sql_as(ana_t)), "pondra-cli": (who_as(ana_cli), sql_as(ana_cli))}
+        info["ana's tokens: /whoami and SELECT x FROM t"] = seen_ana
+        checks["a Bearer token from Keycloak's password grant: ana's, from the pondra client and from pondra-cli, is named by /whoami as ana@acme.com and reads t (SELECT x FROM t answers [{\"x\": 7}])"] = all(
+            w == (200, ana) and s == (200, [{"x": 7}]) for w, s in seen_ana.values())
+
+        # 2. USERS 'any' with Keycloak's realm roles: cy, made nowhere here, is named by the role analysts; eve has none.
+        cy_t = token_of("cy (pondra)", "pondra", cy, "kc-secret-1")
+        eve_t = token_of("eve (pondra)", "pondra", eve, "kc-secret-1")
+        cy_seen, eve_seen = (who_as(cy_t), sql_as(cy_t)), (who_as(eve_t), sql_as(eve_t))
+        info["USERS 'any' (kcstaff, ROLES_CLAIM realm_access.roles): cy has realm role analysts, eve none"] = {"cy": cy_seen, "eve": eve_seen}
+        checks["USERS 'any' with ROLES_CLAIM 'realm_access.roles': cy@acme.com, made nowhere here, with Keycloak's realm role analysts, is named by /whoami and reads t as ana does; eve@acme.com, with no role, is signed in (/whoami 200) and her SELECT of t is refused"] = (
+            cy_seen == ((200, cy), (200, [{"x": 7}])) and eve_seen[0] == (200, eve) and eve_seen[1][0] != 200)
+
+        # 3. Refused with 401: the master realm's admin token (another issuer), and ana's token from pondra-check's admin-cli
+        # (no api://pondra audience).
+        admin_cli_ana = token_of("ana (admin-cli, pondra-check)", "admin-cli", ana)
+        refusals = {name: (who_as(t), sql_as(t)) for name, t in {"the master realm's admin token": admin, "ana's token from pondra-check's admin-cli": admin_cli_ana}.items()}
+        info["refused tokens: /whoami and SELECT"] = refusals
+        checks["refused with 401 at /whoami and /sql: the master realm's admin token (another issuer) and ana's token from pondra-check's admin-cli (no api://pondra audience)"] = bool(admin_cli_ana) and all(
+            w[0] == 401 and s[0] == 401 for w, s in refusals.values())
+
+        # 4. Postgres: the token is the password (the default, POSTGRES 'password').
+        pg_default = pg_as(ana, ana_t)
+        info["Postgres, the default: psycopg as ana with her token as the password"] = pg_default
+        checks["Postgres (the default, POSTGRES 'password'): psycopg as ana@acme.com with her Keycloak access token as the password reads [(7,)]"] = pg_default == [(7,)]
+
+        # 5. Flight SQL: the same token in ADBC's Basic handshake.
+        fl = flight_as(ana, ana_t)
+        info["Flight SQL (ADBC): ana with her token as the password"] = fl if isinstance(fl, str) else [list(r) for r in fl]
+        checks["Flight SQL: ana@acme.com with her Keycloak access token as the password (ADBC's Basic handshake) reads [(7,)]"] = fl == [(7,)]
+
+        # 6. The console's flow: a browser through Keycloak's login form, the node's callback, the session in the fragment.
+        sent = []
+        try:
+            at = keycloak_login(opener_for(sent), f"http://127.0.0.1:{P}/sso/kc/start?to=%2F", ana)[0]
+        except (urllib.error.URLError, OSError) as e:
+            at = str(e)
+        hits = [u for u in sent if "pondra_session=" in urllib.parse.urlsplit(u).fragment]
+        session = (urllib.parse.parse_qs(urllib.parse.urlsplit(hits[0]).fragment).get("pondra_session") or [""])[0] if hits else ""
+        info["the console's flow: the addresses the browser was sent to, and where it ended"] = {"sent": [u[:140] for u in sent], "ended": at[:120], "pondra_session": session[:12]}
+        checks["the console's flow: a browser opened at /sso/kc/start?to=%2F, Keycloak's login form posted for ana, the node's callback sends it to /#pondra_session=ps_…, and that session's /whoami names ana@acme.com"] = (
+            session.startswith("ps_") and who_as(session) == (200, ana))
+
+        # 7. `pondra login --provider kc`: the PONDRA_BROWSER signs in at Keycloak and follows the redirect to the loopback address.
+        home, project = tempfile.mkdtemp(prefix="pondra-home-"), tempfile.mkdtemp(prefix="pondra-project-")
+        browser = os.path.join(home, "browser.py")
+        with open(browser, "w") as f:
+            f.write(KC_BROWSER.replace("PYTHON", sys.executable))
+        os.chmod(browser, 0o755)
+        base = f"http://127.0.0.1:{P}"
+        env = {**os.environ, "PONDRA_HOME": home, "PONDRA_BROWSER": browser, "KC_USER": "ana", "KC_PASSWORD": "ana-pass-1"}
+        env.pop("PONDRA_TOKEN", None)
+        try:
+            login = subprocess.run([BIN, "login", base, "--project", project, "--provider", "kc"], env=env, capture_output=True, text=True, timeout=120)
+            code, said = login.returncode, (login.stdout + login.stderr).strip()
+        except subprocess.TimeoutExpired:
+            code, said = None, "no sign-in within two minutes"
+        kept = {}
+        if os.path.exists(os.path.join(home, "login.json")):
+            with open(os.path.join(home, "login.json")) as f:
+                kept = json.load(f)
+        kept_session = kept.get(base, "")
+        log_text = None
+        if os.path.exists(os.path.join(home, "browser.log")):
+            with open(os.path.join(home, "browser.log")) as f:
+                log_text = f.read()[-400:]
+        info["pondra login http://127.0.0.1:P --provider kc (PONDRA_BROWSER signs in at Keycloak)"] = {"exit": code, "said": said[-240:], "login.json keys": list(kept), "browser.log": log_text}
+        checks["pondra login http://127.0.0.1:P --provider kc, with a PONDRA_BROWSER that signs in at Keycloak: exit 0, its output names ana@acme.com, and login.json holds a session that /whoami names ana@acme.com"] = (
+            code == 0 and ana in said and kept_session.startswith("ps_") and who_as(kept_session) == (200, ana))
+
+        # 8. psql 18 through Keycloak's device flow: libpq prints the prompt, the scripted browser approves it as ana.
+        psql = find_psql()
+        info["psql 18"] = psql or "no psql 18 here (PONDRA_PSQL names one): its check is left out"
+        if psql:
+            st_oauth = reply(P, "POST", "/sql", f"CREATE OR REPLACE IDENTITY PROVIDER kc (ISSUER '{ISSUER}', CLIENT_ID 'pondra', SECRET 'kc_client', AUDIENCE ('api://pondra'), LABEL 'Keycloak', POSTGRES 'oauth')".encode(), headers=bearer(token))[0]
+            env_psql = {**os.environ, "PGOAUTHDEBUG": "UNSAFE"}  # (an http issuer: Keycloak on this machine)
+            env_psql.pop("PGPASSWORD", None)
+            proc = subprocess.Popen([psql, f"host=127.0.0.1 port={PG} dbname=lake user={ana} oauth_issuer={ISSUER} oauth_client_id=pondra-cli", "-At", "-c", "SELECT x FROM t"],
+                                    env=env_psql, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            lines, prompt = [], {}
+
+            def read_stderr():
+                """psql's stderr line by line; the device flow's prompt (Visit URL and enter the code: CODE) is kept."""
+                for line in proc.stderr:
+                    lines.append(line.rstrip())
+                    m = re.search(r"Visit (\S+) and enter the code: (\S+)", line)
+                    if m and not prompt:
+                        prompt.update(url=m.group(1), code=m.group(2))
+
+            reader = threading.Thread(target=read_stderr, daemon=True)
+            reader.start()
+            approved = None
+            deadline = time.time() + 60  # (the prompt, or psql's end, within a minute)
+            while not prompt and proc.poll() is None and time.time() < deadline:
+                time.sleep(0.2)
+            if prompt:
+                parts = urllib.parse.urlsplit(prompt["url"])
+                verify = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode({"user_code": prompt["code"]}), ""))
+                try:
+                    approved = keycloak_login(opener_for([]), verify, ana)[0]
+                except (urllib.error.URLError, OSError) as e:
+                    approved = str(e)
+            else:
+                proc.kill()
+            try:
+                ran = proc.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                ran = None
+            reader.join(5)
+            out = proc.stdout.read()
+            info["psql 18: the device flow"] = {"CREATE OR REPLACE … POSTGRES 'oauth' (status)": st_oauth, "prompt": prompt, "approved at": approved,
+                                                "exit": ran, "out": out.strip(), "stderr tail": "\n".join(lines[-6:])[-600:]}
+            checks["psql 18 signs ana in through Keycloak's device flow (oauth_issuer, oauth_client_id=pondra-cli, POSTGRES 'oauth') and reads t: exit 0 and 7"] = (
+                st_oauth == 200 and ran == 0 and out.strip() == "7")
+    finally:
+        for n in started:
+            n.kill()
+        try:
+            kc_call("DELETE", f"/admin/realms/{REALM}", auth=admin)
+        except Exception:
+            pass  # (ignore errors: the realm is removed when it can be)
+    ok = all(checks.values())
+    print(json.dumps({"keycloak": checks, "ok": ok, "info": info}, indent=1, default=str))
     return ok
 
 
@@ -17815,6 +18786,7 @@ def doors():
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
     import pondra
     lake = new_lake()
+    lake_db = os.path.basename(lake.rstrip("/")).lower()  # (the database's name: its folder's last part, as `lake_name` makes it)
     pgp, fp = A.port + 2000, A.port + 30
     node = Node(lake, A.port, pg=f"127.0.0.1:{pgp}", flight=f"127.0.0.1:{fp}", tier_secs=0.5).start()
     q = lambda s: sql(A.port, s)
@@ -17875,6 +18847,7 @@ def doors():
             "a Git folder's status": (["SELECT path, change FROM pondra.git_status('d_git')"], lambda r: r[-1] == [["a.sql", "added"]]),
             "a backup": ([f"BACKUP DATABASE TO '{backups}/door{i}'"], lambda r: backed(f"{backups}/door{i}")),
             "a write to a backup refused, 25006": ([f"INSERT INTO d_bk.d_log VALUES ('door{i}', {i})"], lambda r: r == "25006"),
+            "SET LOCATION of a lake on disk, 0A000": ([f"ALTER DATABASE \"{lake_db}\" SET LOCATION '{backups}/moved{i}'"], lambda r: r == "0A000"),
         }
     def rows_of(x):
         return [list(r.values()) if isinstance(r, dict) else list(r) for r in x] if isinstance(x, list) else x
@@ -17943,8 +18916,8 @@ def doors():
                 r = json.loads(urllib.request.urlopen(urllib.request.Request(mcp, data=body, headers={"content-type": "application/json", "mcp-session-id": sid}), timeout=60).read())["result"]
                 text = r["content"][0]["text"]
                 if r["isError"]:
-                    m = re.search(r"\b(\d{2}[0-9A-Z]\d{2})\b", text)
-                    return m.group(1) if m and m.group(1) in ("23514", "42P01", "40001", "25P02", "25006") else "refused: " + text[:160]
+                    code = next((c for c in re.findall(r"\b([0-9][0-9A-Z]{4})\b", text) if c in ("23514", "42P01", "40001", "25P02", "25006", "0A000")), None)
+                    return code or "refused: " + text[:160]
                 got = json.loads(text)
                 out.append(rows_of(got["rows"]) if isinstance(got, dict) and "rows" in got else None)
         finally:
@@ -17982,7 +18955,7 @@ finally {{ await db.close?.(); }}"""
         return out
     # The shell prints its errors without a SQLSTATE (the header `x-pondra-sqlstate` carries it), so the
     # codes this matrix checks are named by the words of their messages.
-    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01"), ("is a backup, so it is read-only", "25006")]
+    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01"), ("is a backup, so it is read-only", "25006"), ("SET LOCATION moves a lake held in memory", "0A000")]
     def via_cli(stmts):
         # The shell on the lake, one process for the feature's statements: one session (`shell.rs`). It has no
         # `--url`, so it starts a node on the lake, which joins this one as a follower; its own address is an
@@ -19258,18 +20231,305 @@ def pkey():
     return f"{sum(checks.values())} of {len(checks)} PRIMARY KEY checks"
 
 
-# About how long each section of `all` takes, in seconds, on a machine like CI's runners (`all`
-# prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs the
-# suite in parts side by side that end together. A section not listed counts as 5 s.
-SECS = {"memory": 255, "cursors": 15, "prepared": 15, "owned": 20, "signed": 20, "sso": 83, "guesses": 30, "stopped": 78, "clouds": 66, "functions": 50, "server": 43, "crash": 36, "across": 33, "serverless": 32, "kafkas": 29, "finals": 29,
-        "found": 26, "alter": 24, "outside": 20, "load": 20, "loads": 30, "kafka": 19, "live": 19, "clusters": 17, "scale": 16, "guard": 15, "workspace": 15,
-        "users": 15, "find": 15, "measures": 120, "facts": 90, "sealed": 60, "procedures": 14, "reader": 14, "schemas": 13, "followers": 13, "clients": 12, "files": 12, "ids": 12, "history": 12,
-        "learn": 12, "upsert": 11, "sessions": 11, "objects": 11, "columns": 10, "catalogs": 12, "attached": 10, "use_path": 40, "first": 30, "answers_big": 15, "dialects": 20, "ddlgaps": 40, "sqla": 30, "unique_doors": 60, "pkey": 60}
+def memorylake():
+    """A lake held in this process's memory moves to a folder and goes on there (`memory.rs`, the design's
+    l2-memory-spill-and-save §2): `ALTER DATABASE <name> SET LOCATION '<place>'`, and `db.save(target)` in
+    Python and JavaScript, which is that statement and the wait. The node keeps its port and all of the
+    lake: tables, views, a materialized view, a sequence, a task that keeps ticking, the lake's files. A
+    write sent while it moves waits (503 with Retry-After, or 57P03, which the clients ask again on), so
+    none is lost or doubled. The lake's objects are at the target, where another node opens them. The lake
+    spills to disk past a 10 KB budget here, so its spilled files move too. Refused by name: a database
+    that isn't this one, a folder holding other things (nothing of the lake is written there), a lake on
+    disk (0A000). The library's `pondra.connect()` in this process is moved the same way when it is built. A
+    published Iceberg table is published again at the new place; a move whose second pass fails leaves the lake
+    in memory with every row (and says so in /stats and to db.save); BACKUP of a lake in memory runs here."""
+    import pathlib
+    P, nodes, checks = A.port, [], {}
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    env = {"PONDRA_MEMORY_LAKE_GB": "0.00001"}  # (about 10 KB: past it a lake's files spill to a folder, and move too)
+    acked, errors, quit_writing = [], [], threading.Event()
+
+    def lake_now(port):
+        """The lake a node serves (`/stats`), or None while no node answers."""
+        try:
+            return call(port, "GET", "/stats", timeout=2)["lake"]
+        except Exception:
+            return None
+
+    def answers(port):
+        """What the lake holds, without the writes made under the move ('w') and the 'post' group added after it."""
+        return {
+            "orders": sql(port, "SELECT _row_id, _version, k, n FROM orders WHERE k <> 'w' ORDER BY _row_id, n"),
+            "big": sql(port, "SELECT k, n FROM big WHERE k <> 'w' ORDER BY n, k"),
+            "totals": sql(port, "SELECT k, c, s FROM totals WHERE k <> 'w' ORDER BY k"),
+            "file": call(port, "GET", "/files/notes/a.txt"),
+        }
+
+    def pub_metadata(folder):
+        """The newest Iceberg metadata file of the table `pub` in a folder (highest N), or None."""
+        d = os.path.join(folder, "data", "pub", "metadata")
+        names = [n for n in os.listdir(d) if n.startswith("v") and n.endswith(".metadata.json")] if os.path.isdir(d) else []
+        return os.path.join(d, max(names, key=lambda n: int(n[1:].split(".")[0]))) if names else None
+
+    def pub_at_target(folder):
+        """Whether the newest metadata of `pub` names `folder` (and no memory:// path is left in it)."""
+        path = pub_metadata(folder)
+        try:
+            text = open(path).read() if path else ""
+            return bool(text) and json.loads(text)["location"].startswith(os.path.realpath(folder)) and "memory://" not in text
+        except (OSError, ValueError, KeyError):
+            return False
+
+    def pub_rows_at(folder):
+        """The rows PyIceberg reads from `pub`'s newest metadata at `folder`; None when PyIceberg isn't there."""
+        try:
+            from pyiceberg.table import StaticTable
+        except ImportError:
+            return None
+        try:
+            return StaticTable.from_metadata(pub_metadata(folder)).scan().to_arrow().num_rows
+        except Exception as e:  # (a check that fails, not the section: what PyIceberg said is shown)
+            print(f"memorylake: PyIceberg couldn't read pub at {folder}: {e!r}"[:400], file=sys.stderr)
+            return -1
+
+    def more(f, before, secs=20):
+        """Whether f() comes above `before` within `secs` (a task's ticks, polled)."""
+        deadline = time.time() + secs
+        while time.time() < deadline:
+            if f() > before:
+                return True
+            time.sleep(0.5)
+        return False
+
+    def writer():
+        """One client writing a row every 5 ms, through the move: each acknowledged row is kept."""
+        db = _client(P)
+        i = 0
+        while not quit_writing.is_set():
+            try:
+                db.sql(f"INSERT INTO orders VALUES ('w', {10000 + i})")
+                acked.append(10000 + i)
+            except Exception as e:
+                errors.append(repr(e)[:200])
+            i += 1
+            time.sleep(0.005)
+
+    try:
+        node = Node(":memory:", P, env=env).start()
+        nodes.append(node)
+        name = call(P, "GET", "/stats")["lake"]  # (a lake in memory is named by its id)
+        sql(P, "CREATE TABLE orders (k VARCHAR, n BIGINT)")
+        for i in range(30):
+            sql(P, f"INSERT INTO orders VALUES ('{'ab'[i % 2]}', {i})")
+        sql(P, "UPDATE orders SET n = 100 WHERE n = 4")
+        call(P, "POST", "/tier", timeout=600)  # (tiered: the lake holds files, which spill past the budget)
+        sql(P, "INSERT INTO orders VALUES ('c', 31)")
+        sql(P, "CREATE VIEW big AS SELECT k, n FROM orders WHERE n > 5")
+        sql(P, "CREATE MATERIALIZED VIEW totals AS SELECT k, count(*) AS c, sum(n) AS s FROM orders GROUP BY k")
+        sql(P, "CREATE SEQUENCE ids")
+        sql(P, "CREATE TABLE ticks (at TIMESTAMP)")
+        sql(P, "CREATE TABLE pub (id BIGINT, v VARCHAR) WITH (publish = 'iceberg')")
+        sql(P, "INSERT INTO pub VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')")
+        call(P, "POST", "/tier", timeout=600)  # (tiered and published: its Iceberg metadata names the lake's place now)
+        sql(P, "CREATE PROCEDURE mark() LANGUAGE sql AS $$ INSERT INTO ticks SELECT now() $$")
+        sql(P, "CREATE TASK tick SCHEDULE '1 second' AS CALL mark()")
+        call(P, "PUT", "/files/notes/a.txt", b"hello lake\n")
+        time.sleep(2)
+        before = answers(P)
+        seq_before = sql(P, "SELECT nextval('ids') AS v")[0]["v"]
+        ticks_before = sql(P, "SELECT count(*) AS n FROM ticks")[0]["n"]
+
+        # Refusals, before anything moves.
+        status, _, text = reply(P, "POST", "/sql", f"ALTER DATABASE nosuchdb SET LOCATION '{new_lake()}'".encode())
+        checks["a database that isn't this one is refused, and the answer names this one"] = status != 200 and name in text
+        busy = new_lake()
+        put_object(busy, "notes.txt", b"not a lake")
+        status, _, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{busy}'".encode())
+        checks["a folder holding other things is refused, and no part of the lake is written there"] = (
+            status != 200 and "holds other things" in text and not lake_objects(busy, "catalog/") and not lake_objects(busy, "data/"))
+
+        # The move, under writes.
+        wt = threading.Thread(target=writer, daemon=True)
+        wt.start()
+        t_end = time.time() + 30
+        while len(acked) < 20 and time.time() < t_end:
+            time.sleep(0.1)
+        target = new_lake()
+        target_name = os.path.basename(target.rstrip("/")).lower()  # (the lake's name in a folder: its last part)
+        t0 = time.time()
+        status, _, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{target}'".encode())
+        moved = status == 200 and '"moving"' in text
+        served = until(lambda: lake_now(P), target_name, 60)  # the same port serves the target once the node starts again
+        downtime = time.time() - t0
+        quit_writing.set()
+        wt.join(60)  # (its last request is answered first: every row it was told went in is in `acked`)
+        checks["the move answers at once, and the same port serves the target"] = moved and served == target_name
+        if not checks["the move answers at once, and the same port serves the target"]:
+            print(f"memorylake: the move answered {status}: {text[:300]}", file=sys.stderr)
+            return False  # (the checks are printed on the way out)
+        checks[f"no write failed while the lake moved ({downtime:.1f} s from the move to its first answer on the target)"] = not errors and downtime < 30 and len(acked) > 20
+        stored = [r["n"] for r in sql(P, "SELECT n FROM orders WHERE k = 'w' ORDER BY n")]
+        checks[f"every write acknowledged is there once ({len(acked)} writes, none doubled)"] = stored == sorted(acked)
+        checks["the tables, the views, the materialized view and the file are as they were"] = answers(P) == before
+        seq_after = sql(P, "SELECT nextval('ids') AS v")[0]["v"]
+        checks["a sequence goes on past its last value"] = seq_after > seq_before
+        sql(P, "INSERT INTO orders VALUES ('post', 999)")
+        got = until(lambda: [(r["c"], r["s"]) for r in sql(P, "SELECT c, s FROM totals WHERE k = 'post'")], [(1, 999)], 20)
+        checks["a materialized view on the target takes a write made after the move"] = got == [(1, 999)]
+        checks["a task keeps ticking after the move"] = more(lambda: sql(P, "SELECT count(*) AS n FROM ticks")[0]["n"], ticks_before)
+        checks["the lake's objects are at the target: catalog, tiered files and the file"] = (
+            bool(lake_objects(target, "catalog/")) and any(k.endswith(".parquet") for k in lake_objects(target, "data/orders/"))
+            and bool(lake_objects(target, "files/notes/")))
+        status, hdrs, _ = reply(P, "POST", "/sql", f"ALTER DATABASE {target_name} SET LOCATION '{new_lake()}'".encode())
+        checks["a lake on disk is not moved this way (0A000)"] = status != 200 and hdrs.get("x-pondra-sqlstate") == "0A000"
+        # The Iceberg table is published again where the lake is now: its newest metadata names the target, no
+        # memory:// path is left in it, and PyIceberg reads its rows there.
+        pub_moved = until(lambda: pub_at_target(target), True, 20)
+        pub_rows = pub_rows_at(target)
+        checks["a published Iceberg table is published again at the target (its metadata names the target, PyIceberg reads its rows)"] = pub_moved and pub_rows in (5, None)
+
+        # Stopped, and opened again from the target by another node: the same lake.
+        final = answers(P)
+        node.p.send_signal(signal.SIGTERM)
+        stopped_ok = node.p.wait(60) == 0
+        reopened = Node(target, P + 1).start()
+        nodes.append(reopened)
+        stored_again = [r["n"] for r in sql(P + 1, "SELECT n FROM orders WHERE k = 'w' ORDER BY n")]
+        checks["stopped, and opened again from the target: the same rows, files and writes"] = (
+            stopped_ok and answers(P + 1) == final and stored_again == sorted(acked))
+
+        # Python: db.save(target) on a memory node of its own.
+        py = Node(":memory:", P + 2, env=env).start()
+        nodes.append(py)
+        db = _client(P + 2)
+        db.sql("CREATE TABLE pts (v BIGINT)")
+        db.sql("INSERT INTO pts VALUES (1), (2), (3)")
+        # BACKUP of a lake in memory runs in this process: the backup reads back its rows (ADR-070, invariant 62).
+        backed = new_lake()
+        sql(P + 2, "BACKUP DATABASE TO '" + backed + "'")
+        listed = os.listdir(os.path.join(backed, "_backups")) if os.path.isdir(os.path.join(backed, "_backups")) else []
+        sql(P + 2, f"ATTACH '{backed}' AS bk")
+        bk_rows = sql(P + 2, "SELECT count(*) AS n FROM bk.pts")[0]["n"]
+        sql(P + 2, "DETACH bk")
+        checks["BACKUP of a lake in memory runs in this process, and the backup reads back its rows"] = any(f.endswith(".json.zst") for f in listed) and bk_rows == 3
+        t3 = new_lake()
+        db.save(t3)
+        db.sql("INSERT INTO pts VALUES (4)")
+        py_rows = [str(r["v"]) for r in db.sql("SELECT v FROM pts ORDER BY v").rows()]
+        checks["db.save(target) in Python: the lake there, and the same connection goes on"] = py_rows == ["1", "2", "3", "4"] and bool(lake_objects(t3, "catalog/"))
+
+        # A move whose second pass fails (PONDRA_CRASH=move_settle:1, a full disk's stand-in): the lake stays in memory,
+        # whole, says why in /stats, and the target is left empty; db.save says so too.
+        bad = Node(":memory:", P + 4, env={**env, "PONDRA_CRASH": "move_settle:1"}).start()
+        nodes.append(bad)
+        sql(P + 4, "CREATE TABLE kept (v BIGINT)")
+        sql(P + 4, "INSERT INTO kept VALUES (1), (2), (3)")
+        bad_name = call(P + 4, "GET", "/stats")["lake"]
+        bad_target = new_lake()
+        reply(P + 4, "POST", "/sql", f"ALTER DATABASE \"{bad_name}\" SET LOCATION '{bad_target}'".encode())
+        def failed_why():
+            """Why the move failed, once the node serves again and says so (/stats), else None."""
+            try:
+                return call(P + 4, "GET", "/stats", timeout=2).get("move_failed")
+            except Exception:
+                return None
+        why = until(lambda: bool(failed_why()), True, 60) and failed_why()
+        back = lake_now(P + 4) == bad_name
+        bad_stats = {"move_failed": why}
+        checks["a move whose second pass fails leaves the lake in memory with every row, says why in /stats, and nothing at the target"] = (
+            back and bool(bad_stats.get("move_failed")) and sql(P + 4, "SELECT v FROM kept ORDER BY v") == [{"v": 1}, {"v": 2}, {"v": 3}]
+            and not lake_objects(bad_target, "catalog/") and not lake_objects(bad_target, "data/"))
+        said = ""
+        try:
+            _client(P + 4).save(new_lake())
+        except Exception as e:
+            said = str(e)
+        checks["…and db.save raises, saying so"] = "stays in memory" in said
+
+        # JavaScript: db.save(target) from a script of its own, on a memory node of its own.
+        if not shutil.which("node"):
+            checks["(skipped: node isn't on PATH, so the JavaScript check didn't run)"] = True
+        if shutil.which("node"):
+            js_node = Node(":memory:", P + 3, env=env).start()
+            nodes.append(js_node)
+            sql(P + 3, "CREATE TABLE js (v BIGINT)")
+            sql(P + 3, "INSERT INTO js VALUES (7)")
+            t4 = new_lake()
+            module = pathlib.Path(root, "js", "index.js").resolve().as_uri()
+            code = "\n".join([
+                f"import {{ connect }} from {json.dumps(module)};",
+                f"const db = connect({json.dumps(f'http://127.0.0.1:{P + 3}')});",
+                f"await db.save({json.dumps(t4)});",
+                'console.log(JSON.stringify(await db.sql("SELECT v FROM js")));',
+                "process.exit(0);",
+            ])
+            ran = subprocess.run(["node", "--input-type=module", "-e", code], capture_output=True, text=True, timeout=120)
+            try:
+                js_rows = json.loads(ran.stdout.strip().splitlines()[-1]) if ran.returncode == 0 else None
+            except (ValueError, IndexError):
+                js_rows = None
+            got_js = [str(r.get("v")) for r in js_rows] if isinstance(js_rows, list) and all(isinstance(r, dict) for r in js_rows) else None
+            checks["db.save(target) in JavaScript: the lake there, and the same connection goes on"] = got_js == ["7"] and bool(lake_objects(t4, "catalog/"))
+            if not got_js:
+                print((ran.stdout + ran.stderr)[-500:], file=sys.stderr)
+
+        # The library in this process: pondra.connect() and its save, when the library is built.
+        lib = os.environ.get("PONDRA_LIBRARY") or os.path.join(root, "target", "release", {"darwin": "libpondra_lib.dylib", "win32": "pondra_lib.dll"}.get(sys.platform, "libpondra_lib.so"))
+        if not os.path.exists(lib):
+            checks["(skipped: the library isn't built, so pondra.connect() in this process didn't run)"] = True
+        if os.path.exists(lib):
+            t5 = new_lake()
+            code = "\n".join([
+                "import json, sys",
+                f"sys.path.insert(0, {json.dumps(os.path.join(root, 'python'))})",
+                "import pondra",
+                "db = pondra.connect()",
+                'db.sql("CREATE TABLE t (v BIGINT)")',
+                'db.sql("INSERT INTO t VALUES (1), (2)")',
+                f"db.save({json.dumps(t5)})",
+                'db.sql("INSERT INTO t VALUES (3)")',
+                'print(json.dumps([r["v"] for r in db.sql("SELECT v FROM t ORDER BY v").rows()]))',
+                "db.close()",
+            ])
+            ran = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=180,
+                                 env={**os.environ, **env, "PONDRA_LIBRARY": os.path.abspath(lib)})
+            try:
+                inproc = json.loads(ran.stdout.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                inproc = None
+            checks["pondra.connect() in this process: save(target) moves the lake, and the handle goes on"] = (
+                isinstance(inproc, list) and [str(v) for v in inproc] == ["1", "2", "3"] and bool(lake_objects(t5, "catalog/")))
+            if ran.returncode != 0:
+                print((ran.stdout + ran.stderr)[-500:], file=sys.stderr)
+        if not all(checks.values()):
+            return False  # (its checks are printed on the way out)
+        return f"a lake in memory moved to a folder under {len(acked)} writes ({downtime:.1f} s from the move to its first answer there), then Python's and JavaScript's clients (and the library's, when it is built); {len(checks)} checks"
+    finally:
+        quit_writing.set()
+        for n in nodes:
+            n.kill()
+        for name_, good in checks.items():
+            print(f"memorylake: {name_}: {'OK' if good else 'FAIL'}")
+
+
+# About how long each section of `all` takes, in seconds, on CI's runner (main's build run 650,
+# 2026-10-13: `all` prints each one's time as it goes): `--shard K/N` deals the sections out by
+# it, so CI runs the suite in parts side by side that end together. A section not listed
+# counts as 5 s (sso_flow and sso_pg came after that run: their 15 and 20 are guesses).
+SECS = {"memory": 240, "waits": 99, "sso": 89, "stopped": 87, "guesses": 45, "backpressure": 39,
+        "functions": 38, "server": 34, "doors": 33, "crash": 32, "kafkas": 31, "finals": 28, "pace": 27,
+        "found": 23, "clouds": 21, "kafka": 21, "load": 20, "live": 17, "refreshed": 15, "sso_flow": 15, "sso_pg": 20,
+        "users": 14, "workspace": 14, "reader": 13, "scale": 12, "sealed": 12, "answers_big": 11,
+        "cursors": 11, "find": 11, "history": 11, "objects": 11, "procedures": 11, "sessions": 11,
+        "files": 10, "followers": 10, "guarded": 10, "begin": 9, "bykey": 9, "clients": 9, "flows": 9,
+        "guard": 9, "hot": 9, "schemas": 9, "temps": 9, "catalogs": 8, "clusters": 8, "columns": 8,
+        "fills": 8, "serverless": 8, "alter": 7, "fence": 7, "loads": 7, "safety": 7, "sequences": 7,
+        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, jsons, jsonedits, colnames, bi, remembered, sparksql, lateral, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -19301,7 +20561,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "jsons", "jsonedits", "colnames", "bi", "remembered", "sparksql", "lateral", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -19314,7 +20574,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "jsons": jsons, "jsonedits": jsonedits, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "lateral": lateral, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

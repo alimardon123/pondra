@@ -33,7 +33,7 @@ console.log(await db.sql("SELECT 1 AS one"));
 
 `target` says what to connect to:
 
-- **Nothing, or `":memory:"`** (as DuckDB spells it): a new lake held in this process's memory, gone at `close()`.
+- **Nothing, or `":memory:"`** (as DuckDB spells it): a new lake held in this process's memory, gone at `close()` (past `PONDRA_MEMORY_LAKE_GB` its files go to a folder of its own on disk, removed then too). `await db.save('lake')` (or a bucket's URL) keeps it: the lake moves there and the connection goes on over it (`ALTER DATABASE … SET LOCATION`); a move that fails rejects, saying the lake stays in memory.
 - **A folder, or a bucket's URL** (`s3://`, `gs://`, `az://`): that lake. Its node runs in this process (Node, Bun,
   Deno), through the library the package ships, so there is no second process to start. Its SQL may read and write
   files on this machine, and Python's functions and procedures run with a Python here that has the `pondra` package
