@@ -251,8 +251,8 @@ impl ExecutionPlan for HeldInExec {
             let mut h = held.lock().unwrap();
             h.reservation.try_grow(b).map_err(|_| {
                 let message = format!("out of memory: a window holds more rows than this node's memory for queries ({} MB): partition it by more columns, or give the node more memory (--memory-gb)", memory_limit() >> 20);
-                DataFusionError::External(Box::new(crate::codes::Coded("53200", message)))
-            })?; // (the words "out of memory" give 53200 across nodes too; they don't start the frugal retry, which keys on "Resources exhausted")
+                DataFusionError::ResourcesExhausted(message)
+            })?; // ("Resources exhausted" starts the frugal retry (`query::frugally`), where a window over whole partitions is answered as a GROUP BY; the words give 53200 on every door)
             h.batches.push_back((batch.num_rows(), b));
             Ok(batch)
         });
@@ -400,7 +400,7 @@ mod tests {
     async fn refused(ctx: &SessionContext, sql: &str) -> AnyResult<bool> {
         match answer(ctx, sql).await {
             Ok(_) => Ok(false),
-            Err(e) => Ok(anyhow::Error::from(e).chain().any(|c| c.downcast_ref::<crate::codes::Coded>().is_some_and(|c| c.0 == "53200"))),
+            Err(e) => Ok(crate::codes::of(&anyhow::Error::from(e)) == "53200"),
         }
     }
 

@@ -3487,10 +3487,12 @@ def scale():
         and q("SELECT max(r) AS r FROM (SELECT row_number() OVER (ORDER BY s, id) AS r FROM big)") == [{"r": 3000000}]
         and q("SELECT count(*) AS n FROM big a JOIN big b ON a.id = b.id") == [{"n": 3000000}]
         and metrics_of(port, headers=owner)["pondra_memory_limit_bytes"] == int(0.05 * (1 << 30)))
-    # A window counts the rows it holds against the query memory (invariant 414): one over every row refuses (53200)
-    # and the node answers after; one that lets rows go answers. Each refusal is kept for the report; the SQLSTATE is
-    # read from its header, since `call` keeps only the status and the words.
-    window_refusals = []
+    # A window counts the rows it holds against the query memory (invariant 414), and one no rewrite takes refuses
+    # (53200) and the node answers after. Over whole partitions the frugal retry answers it as each partition's
+    # aggregates in a GROUP BY, joined back to the rows (`frugal.rs`), so no row is held. Their answers are worked out
+    # here from the table's definition (value 1..3,000,000, k = value % 2,000,000, s = 'name-' || k). Each refusal is
+    # kept for the report; the SQLSTATE is read from its header, since `call` keeps only the status and the words.
+    window_refusals, window_errors, window_times = [], {}, {}
     def refusal(s):
         c = http_client.HTTPConnection("127.0.0.1", port, timeout=30)
         c.request("POST", "/sql", s.encode(), owner)
@@ -3500,13 +3502,37 @@ def scale():
             return None
         window_refusals.append({"sqlstate": r.getheader("x-pondra-sqlstate"), "error": body[:400].decode(errors="replace")})
         return window_refusals[-1]
-    win_all = refusal("SELECT max(length(s) + id + k + n) AS m FROM (SELECT s, id, k, count(*) OVER () AS n FROM big)")
-    win_part = refusal("SELECT max(length(s) + k + d) AS m FROM (SELECT s, k, id - avg(id) OVER (PARTITION BY id % 3) AS d FROM big)")
-    checks["a window over all rows past the memory limit refuses (53200) and the node answers after; one that streams answers"] = (
-        win_all is not None and "a window holds more rows" in win_all["error"]
-        and win_part is not None and win_part["sqlstate"] == "53200"
+    def answered(name, s):  # the rows, or None with the error kept; the time it took is kept too
+        t0 = time.time()
+        try:
+            return q(s)
+        except RuntimeError as e:
+            window_errors[name] = str(e)[:400]
+            return None
+        finally:
+            window_times[name] = round(time.time() - t0, 2)
+    sums = {}  # each partition of id % 3: its rows and the sum of its ids
+    for v in range(1, 3000001):
+        n, total = sums.get(v % 3, (0, 0))
+        sums[v % 3] = (n + 1, total + v)
+    avg = {p: total / n for p, (n, total) in sums.items()}
+    want_all = max(5 + len(str(v % 2000000)) + v + v % 2000000 + 3000000 for v in range(1, 3000001))  # (length('name-' || k), k, id, count(*) = 3M)
+    want_part = max(5 + len(str(v % 2000000)) + v % 2000000 + (v - avg[v % 3]) for v in range(1, 3000001))
+    try:
+        open(f"/proc/{node.p.pid}/clear_refs", "w").write("5")  # (the node's peak from here: the windows' own, not the load's)
+    except OSError:
+        pass
+    got_all = answered("count(*) OVER () over every row", "SELECT max(length(s) + id + k + n) AS m FROM (SELECT s, id, k, count(*) OVER () AS n FROM big)")
+    got_part = answered("avg(id) OVER (PARTITION BY id % 3)", "SELECT max(length(s) + k + d) AS m FROM (SELECT s, k, id - avg(id) OVER (PARTITION BY id % 3) AS d FROM big)")
+    win_peak = vm_hwm(node.p.pid)
+    win_refused = refusal("SELECT max(id + n) AS m FROM (SELECT id, last_value(id) OVER (ORDER BY s ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS n FROM big)")
+    checks["a window over all rows past the memory limit answers on the frugal retry (a GROUP BY joined back); one no rewrite takes refuses (53200) and the node answers after; one that streams answers"] = (
+        got_all == [{"m": want_all}]
+        and got_part is not None and abs(got_part[0]["m"] - want_part) <= 1e-6
+        and win_refused is not None and win_refused["sqlstate"] == "53200" and "a window holds more rows" in win_refused["error"]
         and q("SELECT count(*) AS n FROM big") == [{"n": 3000000}]
         and q("SELECT count(*) AS n FROM (SELECT rank() OVER (PARTITION BY k ORDER BY id) AS r FROM big) WHERE r = 1") == [{"n": 2000000}])
+    print(json.dumps({"windows": {"seconds": window_times, "peak_mb": win_peak >> 20, "errors": window_errors, "want": [want_all, want_part], "got": [got_all, got_part], "refused": win_refused}}))
     # A write that runs out of memory retries frugally as a query does: its join's sort-merge spills, and a
     # COPY to a folder leaves no file of the first try behind. Each write's error is kept for the report.
     folder = os.path.join(tempfile.mkdtemp(prefix="pondra-frugal-"), "out")

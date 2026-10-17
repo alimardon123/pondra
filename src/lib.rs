@@ -70,6 +70,7 @@ mod optimize;
 #[cfg(feature = "server")] mod format;
 #[cfg(feature = "server")] mod flight;
 #[cfg(feature = "server")] mod fresh;
+#[cfg(feature = "server")] mod frugal;
 #[cfg(feature = "server")] mod find;
 #[cfg(feature = "server")] mod git;
 #[cfg(feature = "server")] mod hot;

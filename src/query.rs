@@ -1216,13 +1216,14 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
 /// Whether a query ran out of memory (DataFusion's "Resources exhausted": 53200).
 pub fn exhausted(e: &anyhow::Error) -> bool { format!("{e:#}").contains("Resources exhausted") }
 
-/// A session made to run frugally: hash joins as sort-merge joins (hash joins can't spill), and sorts
-/// keeping 1 MB aside to merge.
+/// A session made to run frugally: hash joins as sort-merge joins (hash joins can't spill), sorts
+/// keeping 1 MB aside to merge, and the rewrites in `frugal.rs` (a window over whole partitions as a GROUP BY).
 pub fn frugal(ctx: &SessionContext) {
     let state = ctx.state_ref();
     let mut state = state.write();
     let o = state.config_mut().options_mut();
     (o.optimizer.prefer_hash_join, o.execution.sort_spill_reservation_bytes) = (false, 1 << 20);
+    crate::frugal::mark(o);
 }
 
 /// Run `work`, and once more frugally (`work(true)`, which makes its session with `frugal`) when it ran
