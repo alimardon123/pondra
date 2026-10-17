@@ -522,6 +522,10 @@ impl<'a> Trace<'a> {
                 self.item_makers(d.returning.as_deref().unwrap_or_default(), &rels);
                 self.items(d.returning.as_deref()?, &rels)
             }
+            // (A materialized view and `CREATE TABLE … AS` run their query when made and when refreshed, so their
+            // makers change now. A plain view is read as it was made, and changed where it is read: `expand_stored`.)
+            Statement::CreateView(v) if v.materialized => self.query(&v.query),
+            Statement::CreateTable(t) => self.query(t.query.as_deref()?),
             _ => None,
         }
     }
@@ -1245,6 +1249,17 @@ mod tests {
     #[test]
     fn a_maker_in_a_where_is_changed() {
         assert_eq!(rewrite_text("SELECT id FROM t WHERE json_build_object('d', doc)::text <> '{}'"), "SELECT id FROM t WHERE json_build_object('d', pondra_as_json(doc))::TEXT <> '{}'");
+    }
+
+    #[test]
+    fn a_table_or_materialized_view_made_from_a_query_changes_its_makers() {
+        // (both run their query when they are made, so their makers change then; a plain view is changed where it is read)
+        let made = rewrite_text("CREATE TABLE d AS SELECT name, json_agg(name) AS names FROM t GROUP BY name");
+        assert!(made.contains("pondra_json_agg(array_agg(name), 'value') AS names") && !made.contains("json_agg(name)"), "{made}");
+        let view = rewrite_text("CREATE MATERIALIZED VIEW m AS SELECT json_agg(x) AS j FROM (SELECT id, name FROM t) x");
+        assert!(view.contains(r#"pondra_json_agg(array_agg(pondra_row('id', "x"."id", 'name', "x"."name")), 'row') AS j"#), "{view}");
+        let plain = rewrite_text("CREATE VIEW v AS SELECT json_agg(name) AS names FROM t");
+        assert!(plain.contains("json_agg(name) AS names") && !plain.contains("pondra_"), "{plain}");
     }
 
     #[test]
