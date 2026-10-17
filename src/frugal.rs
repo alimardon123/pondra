@@ -189,9 +189,9 @@ fn same_fields(a: &LogicalPlan, b: &LogicalPlan) -> bool {
 }
 
 /// A GROUP BY over medians, answered in a frugal session from a sort's middle rows. A median holds every value of its
-/// group, and DataFusion's can't spill; a sort can. So each median's values are numbered in order (a window), the one or
-/// two in the middle are kept, and their median is the group's (`median_rows`). It runs before `WholePartition`, so a
-/// window a rewrite leaves for it is answered in the same pass.
+/// group, and DataFusion's can't spill; a sort can. So every value is numbered in key and value order (one `row_number`
+/// over all the rows, which streams), the one or two in each group's middle are kept, and their median is the group's
+/// (`median_rows`). Its windows are ordered, so `WholePartition` leaves them alone.
 #[derive(Debug)]
 pub struct MiddleRows;
 
