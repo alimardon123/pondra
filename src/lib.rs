@@ -116,6 +116,8 @@ mod optimize;
 #[cfg(feature = "server")] mod skew;
 #[cfg(feature = "server")] mod replica;
 #[cfg(feature = "server")] mod routines;
+#[cfg(feature = "server")] mod front;
+#[cfg(feature = "server")] mod host;
 #[cfg(feature = "server")] mod scan;
 #[cfg(feature = "server")] mod script;
 #[cfg(feature = "server")] mod seq;

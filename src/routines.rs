@@ -564,7 +564,7 @@ pub async fn prepare(lake: &Lake, sql: &str, params: &HashMap<String, Value>, vi
         },
     };
     let sql = crate::path::door(lake, &sql, &views.keys().cloned().collect()).await?; // (the session's search path: `path.rs`; a client's frames are views, not tables)
-    expand_with(lake, &sql, views).await
+    crate::front::expand(lake, &sql, views).await
 }
 
 /// Is `sql` a `CREATE` of a task, procedure, function or macro? Its `$name`s are its own
@@ -702,7 +702,7 @@ fn parse_expr(sql: &str) -> Result<Expr> { Ok(Parser::new(&GenericDialect {}).tr
 
 fn parse_query(sql: &str) -> Result<ast::Query> { Ok(*Parser::new(&GenericDialect {}).try_with_sql(sql)?.parse_query()?) }
 
-fn text(stmts: &[Statement]) -> String { stmts.iter().map(sql).collect::<Vec<_>>().join(";\n") }
+pub(crate) fn text(stmts: &[Statement]) -> String { stmts.iter().map(sql).collect::<Vec<_>>().join(";\n") }
 
 /// A statement as SQL text again. sqlparser writes `- -3` (or `- $x`, `$x` bound to -3) as `--3`,
 /// which reads back as a comment, so a minus before anything written with a minus first gets
@@ -738,81 +738,21 @@ pub fn sql(s: &Statement) -> String {
 /// and a spread query see full names. Stored SQL is read with `expand_stored` instead.
 pub async fn expand(lake: &Lake, sql: &str) -> Result<String> {
     let sql = crate::path::door(lake, sql, &std::collections::HashSet::new()).await?;
-    expand_with(lake, &sql, &HashMap::new()).await
+    crate::front::expand(lake, &sql, &HashMap::new()).await
 }
 
 /// `expand` for SQL that is already stored (a view's, a file's query): read as it was made, without
 /// the session's path. A view made under `USE crm` kept `crm.t` when it was made; one made without a
 /// path reads `t` as public, whoever reads it. Its `current_schema()` and the like are its reader's
 /// (`path::currents`), as Postgres reads a view's.
-pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { expand_with(lake, &crate::path::currents(lake, sql), &HashMap::new()).await }
-
-async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) -> Result<String> {
-    let sql = &crate::vars::parameters_in(lake, sql).await?; // (`pondra.parameters('etl/orders.sql')`: a file's parameters, as rows)
-    let sql = &crate::find::functions_in(lake, sql).await?; // (`pondra.find('revenue')`: the catalog searched, as rows)
-    let sql = &crate::git::status_in(lake, sql).await?; // (`pondra.git_status('sales')`: a Git folder's local changes, as rows)
-    if let Some(q) = show(sql) {
-        return Ok(q);
-    }
-    if let Some(q) = crate::objects::show_create(lake, sql).await? {
-        return Ok(q); // (`SHOW CREATE TABLE t`: the statements that make it again)
-    }
-    if let Some(q) = crate::friendly::summarize(lake, sql).await? {
-        return Ok(q);
-    }
-    let sql = &crate::past::restore(lake, sql).await?.unwrap_or_else(|| sql.to_string()); // (`RESTORE TABLE t TO VERSION AS OF n`: a MERGE, ADR-043)
-    let sql = &crate::sparksql::inline(sql)?; // (`spark_sql('…')`: Spark SQL as Pondra's, then expanded as any)
-    let sql = &crate::branch::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
-    let sql = &crate::past::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
-    let sql = &crate::friendly::text(sql)?.into_owned(); // (`PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON: as SQL that parses)
-    let marked = crate::measures::text(sql); // (`sum(x) AS MEASURE revenue`: an alias that parses, ADR-065 §3)
-    let sql: &str = &marked;
-    let all = listed(lake).await?;
-    let outside = crate::ext::attached(lake).await?;
-    let named = |n: &String| crate::ddl::mentions(sql, n);
-    let expands = all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) || views.keys().any(named) || FROM_FIRST.is_match(sql) || crate::ext::mentions(sql)
-        || outside.iter().any(|(n, _)| named(n)) || sql.contains("pondra_at(");
-    let as_written = || Ok(named_apart(sql).unwrap_or_else(|| sql.to_string()));
-    let measured = crate::measures::wanted(lake, sql).await?; // (a view with measures read, or a measure named)
-    if !expands && !measured && !crate::friendly::wanted(sql) && !crate::types::wanted(sql) {
-        return as_written();
-    }
-    // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
-    static LEADING_FROM: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*from\b").expect("a regex"));
-    let parsed = Parser::parse_sql(&GenericDialect {}, sql).or_else(|e| match LEADING_FROM.is_match(sql) {
-        true => Parser::parse_sql(&GenericDialect {}, &format!("SELECT * {sql}")),
-        false => Err(e),
-    });
-    let Ok(mut stmts) = parsed else { return if expands { Ok(sql.to_string()) } else { as_written() } };
-    // Measures first, at the query's own grain (ADR-065 §3): what they put in (a view's FROM, its macros) is expanded below.
-    let expands = (measured && crate::measures::rewrite(lake, sql, &mut stmts).await?) || expands;
-    let columns = match expands {
-        true => columns(lake, &stmts, &all).await?,
-        false => HashMap::new(),
-    };
-    for s in stmts.iter_mut().filter(|_| expands) {
-        if !matches!(s, Statement::CreateMacro { .. } | Statement::CreateFunction(_) | Statement::CreateView(ast::CreateView { materialized: false, .. })) {
-            if let ControlFlow::Break(e) = s.visit(&mut Expander { lake, all: &all, views, outside: &outside, depth: 0, own: 0, columns: &columns, scopes: vec![] }) {
-                return Err(e);
-            }
-        }
-    }
-    let typed = crate::types::rewrite(lake, &mut stmts).await?; // (`'sad'::mood`, `enum_range(NULL::mood)`: an enum's casts as text)
-    // DuckDB's and Snowflake's forms (`friendly.rs`): a text sent on as it was when none is in it
-    let friendly = crate::friendly::rewrite(lake, &mut stmts).await?;
-    if !expands && !friendly && !typed {
-        return as_written();
-    }
-    Ok(text(&stmts))
-}
+pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { crate::front::expand(lake, &crate::path::currents(lake, sql), &HashMap::new()).await }
 
 /// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS`, `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS`,
 /// `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS`
 /// (`[LIKE 'pattern']`; shares and recipients: `show_shares`): this lake's own, from `pondra.routines`, `pondra.tasks`, `pondra.tables`,
 /// `information_schema.schemata`, `secrets()`, `pondra.users` and `pondra.grants`, as Snowflake has them. (`SHOW FUNCTIONS` is every function a query may call,
 /// as DataFusion lists them: its own, and the Python ones; `SHOW TABLES` is DataFusion's.)
-fn show(sql: &str) -> Option<String> {
+pub(crate) fn show(sql: &str) -> Option<String> {
     // (SHOW, and DESCRIBE / DESC SHARE: the only words the regexes below can start with; any other statement skips them.)
     if !matches!(crate::write::head(sql).as_str(), "show" | "describe" | "desc") {
         return None;
@@ -857,7 +797,7 @@ fn show_shares(sql: &str) -> Option<String> {
 }
 
 /// A query that may start with FROM (DuckDB's `FROM t`, alone or as a subquery, a CTE or a view's).
-static FROM_FIRST: std::sync::LazyLock<regex::Regex> =
+pub(crate) static FROM_FIRST: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)(?:^|[(;]|\bas)\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*from\b").expect("a regex"));
 
 /// DuckDB's `FROM t` with no SELECT is `SELECT * FROM t` (DataFusion took it as no columns at all).
@@ -880,7 +820,7 @@ fn select_star(body: &mut ast::SetExpr) {
 
 /// `sql` with its answers' columns named apart (`output_names`), if any needed it; else None, and
 /// the text is left as written.
-fn named_apart(sql: &str) -> Option<String> {
+pub(crate) fn named_apart(sql: &str) -> Option<String> {
     static MAY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)\bselect\b.*(?:::|\bcast\s*\(|,)").expect("a regex"));
     if sql.len() > 64 << 10 || !MAY.is_match(sql) && !VALUES_SUB.is_match(sql) {
         return None; // (a SELECT with more than one column or a cast, or VALUES with a subquery; not a long INSERT's rows)
@@ -1237,15 +1177,15 @@ fn scalar_body(body: &str) -> Result<Expr> {
 /// A body's statement without the `;` that may end it.
 fn query_text(body: &str) -> &str { body.trim().trim_end_matches(';').trim_end() }
 
-struct Expander<'a> {
-    lake: &'a Lake,
-    all: &'a HashMap<String, Routine>,
-    views: &'a HashMap<String, String>, // (a request's own: `FROM name` is its query)
-    outside: &'a [(String, crate::ext::Attached)], // other engines' tables attached (`ext.rs`)
-    depth: usize,
-    own: usize, // (an INSERT's own VALUES: `values_apart`)
-    columns: &'a HashMap<String, Vec<String>>, // (the lake's tables named, for an argument's columns: `owner`)
-    scopes: Vec<Option<Scope<'a>>>, // (each query's FROM around a call, innermost last; None: a UNION's)
+pub(crate) struct Expander<'a> {
+    pub(crate) name: &'a str, // (this lake's name: three-part names)
+    pub(crate) all: &'a HashMap<String, Routine>,
+    pub(crate) views: &'a HashMap<String, String>, // (a request's own: `FROM name` is its query)
+    pub(crate) outside: &'a [(String, crate::ext::Attached)], // other engines' tables attached (`ext.rs`)
+    pub(crate) depth: usize,
+    pub(crate) own: usize, // (an INSERT's own VALUES: `values_apart`)
+    pub(crate) columns: &'a HashMap<String, Vec<String>>, // (the lake's tables named, for an argument's columns: `owner`)
+    pub(crate) scopes: Vec<Option<Scope<'a>>>, // (each query's FROM around a call, innermost last; None: a UNION's)
 }
 
 /// A FROM's relations, and the columns its joins' USING (or NATURAL: `*`) make one.
@@ -1261,7 +1201,7 @@ impl<'a> Expander<'a> {
         let columns = self.columns;
         let one = |f: &TableFactor| match f {
             TableFactor::Table { name, alias, args: None, .. } => {
-                let local = crate::ddl::local(self.lake, &object(name)).filter(|n| !ctes.contains(n));
+                let local = crate::ddl::local_in(self.name, &object(name)).filter(|n| !ctes.contains(n));
                 (Some(alias.as_ref().map_or_else(|| name.clone(), |a| ast::ObjectName::from(vec![a.name.clone()]))), local.and_then(|n| columns.get(&n)).map(Vec::as_slice))
             }
             TableFactor::Table { alias, .. } | TableFactor::Derived { alias, .. } | TableFactor::Function { alias, .. } | TableFactor::UNNEST { alias, .. } => {
@@ -1325,7 +1265,7 @@ impl<'a> Expander<'a> {
     }
 
     fn find(&self, name: &ast::ObjectName, kind: Kind) -> Option<(String, &Routine)> {
-        let name = crate::ddl::local(self.lake, &object(name))?;
+        let name = crate::ddl::local_in(self.name, &object(name))?;
         self.all.get(&name).filter(|r| r.kind == kind).map(|r| (name, r))
     }
 
@@ -1398,14 +1338,15 @@ const LARGEST: usize = 100_000;
 
 /// The columns of the lake's tables that `stmts` and the SQL functions' bodies read, by name,
 /// when a function reads a table: what an argument's columns are told apart by (`Expander::owner`).
-async fn columns(lake: &Lake, stmts: &[Statement], all: &HashMap<String, Routine>) -> Result<HashMap<String, Vec<String>>> {
+pub(crate) async fn columns<H: crate::front::Host>(host: &H, stmts: &[Statement], all: &HashMap<String, Routine>) -> Result<HashMap<String, Vec<String>>> {
+    let name = host.name();
     let reading: Vec<&Routine> = all.values().filter(|r| r.kind != Kind::Procedure && !r.python() && crate::ddl::mentions(&r.body, "from")).collect();
     if reading.is_empty() {
         return Ok(HashMap::new());
     }
     let mut names = std::collections::BTreeSet::new();
     let mut add = |n: &ast::ObjectName| {
-        names.extend(crate::ddl::local(lake, &object(n)));
+        names.extend(crate::ddl::local_in(&name, &object(n)));
         ControlFlow::<()>::Continue(())
     };
     for s in stmts {
@@ -1416,14 +1357,7 @@ async fn columns(lake: &Lake, stmts: &[Statement], all: &HashMap<String, Routine
             let _ = ast::visit_relations(&q, &mut add);
         }
     }
-    let mut out = HashMap::new();
-    for n in names {
-        if let Some(m) = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&n)).await? {
-            let m = m.logical();
-            out.insert(n, m.columns.into_iter().map(|(c, _)| c).chain(crate::sys::NAMES.map(String::from)).collect());
-        }
-    }
-    Ok(out)
+    host.columns(names).await
 }
 
 /// Each argument cast to its parameter's type, if it has one.
@@ -1576,7 +1510,7 @@ impl VisitorMut for Expander<'_> {
                 Ok(None) => {}
             }
         }
-        match crate::past::table_factor(self.lake, t) {
+        match crate::past::table_factor(self.name, t) {
             Ok(true) => return ControlFlow::Continue(()),
             Err(e) => return ControlFlow::Break(e),
             Ok(false) => {}
