@@ -15679,8 +15679,21 @@ def jsonedits():
     are answer-side only), so `-` and `#-` on a json or jsonb COLUMN are not refused as Postgres refuses them (`js - 'a'`
     answers a delete, `doc - 1.5` and `doc - doc` arithmetic's error); jsonb_set of a json column is answered (Postgres:
     42883). A `-` on a json or jsonb value made by a function (json_build_object, jsonb_build_object) is refused by name.
-    Measured (`bench`, 1,000,000 rows of `(id BIGINT, doc JSONB)`, median of 7 runs after a warm-up): recorded in the
-    commit message and the report, not here.
+    Measured (1,000,000 rows of `(id BIGINT, doc JSONB)`, each `{"id": i, "name": "n<i>", "tags": ["a", "b", "c"],
+    "nested": {"k": i}}`; median of 7 timed runs after one warm-up, each run's text unique so that no answer is
+    remembered; 4 vCPUs shared with other builds, load 6 to 8, so compare the ratios, not the seconds):
+        count(jsonb_set(doc, '{name}', '"x"'))    Pondra 1.67 s   Postgres 16 0.46 s
+        count(jsonb_concat(doc, '{"z": 1}'))      Pondra 1.75 s   Postgres 16 `doc || …` 0.55 s   DuckDB json_merge_patch 0.47 s
+        count(doc - 'tags')                       Pondra 1.38 s   Postgres 16 0.31 s
+        the same with the answer as text (what Pondra's functions always return; Postgres prints its jsonb here):
+        sum(length(jsonb_set …)), concat, - ::    Pondra 1.72 / 1.80 / 1.33 s   Postgres 0.90 / 1.06 / 0.64 s   DuckDB 0.50 s
+        references: Pondra count(json_get_str(doc, 'name')) 0.11 s (one member read); jsonb_strip_nulls, the tree
+        path, 1.77 s; json_strip_nulls, which copies tokens, 0.63 s.
+    Why Pondra is slower: a jsonb function here parses each document into a tree of strings and maps and prints it
+    again, whatever the edit (strip_nulls costs what set costs). Postgres edits binary jsonb and never prints it for a
+    count. What it would take, not done: copy the untouched bytes and re-encode only the path changed (the token walk
+    json_strip_nulls uses, which is 2.8× faster here), and, to match counts, a binary jsonb stored in the lake (a new
+    format: an ADR and a format number).
     """
     import csv, psycopg
     pg_dsn = os.environ.get("PONDRA_PG16", "host=/tmp/pg16-l3 port=55432 user=postgres dbname=postgres")
@@ -15724,6 +15737,7 @@ def jsonedits():
         ("json_strip_nulls of json text", "SELECT id, json_strip_nulls(js)::text FROM j ORDER BY id"),
         ("jsonb_pretty", "SELECT id, jsonb_pretty(doc) FROM j WHERE id IN (1, 2) ORDER BY id"),
         ("jsonb_pretty of a scalar", "SELECT id, jsonb_pretty(doc) FROM j WHERE id = 4"),
+        ("jsonb_pretty of empty containers", "SELECT jsonb_pretty('{\"tags\": [], \"o\": {}, \"n\": [[], {\"x\": []}]}'::jsonb)"),
         ("array literals in casts", "SELECT array_to_string('{a,b}'::text[], '|'), array_to_string(CAST('{1,2}' AS INT[]), '|'), array_to_string('{}'::text[], '|')"),
         ("array literal with quotes and an escape", "SELECT array_to_string('{\"a b\",\"c\\\"d\"}'::text[], '|')"),
     ]
