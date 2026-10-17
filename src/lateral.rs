@@ -7,7 +7,7 @@
 //! t.n)` takes literals only) as the LATERAL subqueries it can.
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
-use datafusion::common::{not_impl_err, plan_err, Column, DFSchema, NullHandling, Result, ScalarValue, UnnestOptions};
+use datafusion::common::{not_impl_err, plan_err, Column, DFSchema, DataFusionError, NullHandling, Result, ScalarValue, UnnestOptions};
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::{Expr, Filter, Join, JoinType, LogicalPlan, Projection, SubqueryAlias, Unnest};
 use datafusion::optimizer::analyzer::AnalyzerRule;
@@ -41,9 +41,10 @@ impl AnalyzerRule for Lateral {
             Ok(if ours { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
         })?;
         if !ours {
+            stray_outer(&plan)?;
             return Ok(plan);
         }
-        plan.transform_up_with_subqueries(|plan| {
+        let plan = plan.transform_up_with_subqueries(|plan| {
             let ours = match &plan {
                 LogicalPlan::Join(j) => takes(j)?,
                 _ => false,
@@ -56,8 +57,48 @@ impl AnalyzerRule for Lateral {
                 plan => Ok(Transformed::no(plan)),
             }
         })
-        .data()
+        .data()?;
+        stray_outer(&plan)?;
+        Ok(plan)
     }
+}
+
+/// Refuses a function's rows over a column of an outer query, as in `(SELECT count(*) FROM
+/// jsonb_array_elements(t.doc))` or `EXISTS (SELECT 1 FROM unnest(t.xs) …)`. The rule above has already
+/// turned the outer references of each join it takes into columns of the left side, so an outer
+/// reference left under an `Unnest` is one DataFusion's physical planner can't run: it would fail with
+/// its own words. Looks at subqueries too, since that is where these sit.
+fn stray_outer(plan: &LogicalPlan) -> Result<()> {
+    let mut outer: Vec<String> = vec![];
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::Unnest(u) = node {
+            u.input.apply(|under| {
+                if let LogicalPlan::Projection(p) = under {
+                    for e in &p.expr {
+                        e.apply(|e| {
+                            if let Expr::OuterReferenceColumn(_, c) = e {
+                                let name = c.to_string();
+                                if !outer.contains(&name) {
+                                    outer.push(name);
+                                }
+                            }
+                            Ok(TreeNodeRecursion::Continue)
+                        })?;
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    if outer.is_empty() {
+        return Ok(());
+    }
+    let message = format!(
+        "a function's rows over a column of an outer query (in a subquery: {}) aren't taken yet: join them in that query's FROM, as FROM t, jsonb_array_elements(t.doc) AS e, then filter or group there",
+        outer.join(", ")
+    );
+    Err(DataFusionError::External(Box::new(crate::codes::Coded("0A000", message))))
 }
 
 /// Whether a join is a lateral over a function's rows that this rule rewrites. A LEFT one that one
@@ -426,6 +467,24 @@ mod tests {
         let err = run(&ctx, "SELECT t.id, u.x FROM t LEFT JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1").await.expect_err("refused");
         let text = err.to_string();
         assert!(text.contains("LEFT JOIN LATERAL") && text.contains("not supported"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_set_function_over_an_outer_column_is_refused_by_name() {
+        let ctx = session().await.expect("a session");
+        for sql in ["SELECT t.id, (SELECT count(*) FROM unnest(t.xs)) FROM t", "SELECT t.id FROM t WHERE EXISTS (SELECT 1 FROM unnest(t.xs) e WHERE e = 2)"] {
+            let err = run(&ctx, sql).await.expect_err(sql);
+            let words = crate::codes::words(&err);
+            assert_eq!(crate::codes::of(&err), "0A000", "{sql}");
+            assert!(words.contains("t.xs") && words.contains("aren't taken yet"), "{sql}: {words}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plain_correlated_subquery_is_as_before() {
+        let ctx = session().await.expect("a session");
+        let got = run(&ctx, "SELECT t.id, (SELECT max(v) FROM (SELECT 1 AS v) w WHERE w.v = t.n) AS m FROM t").await.expect("a correlated subquery");
+        assert_eq!(got, rows(&["1,", "2,1", "3,"]));
     }
 
     #[test]

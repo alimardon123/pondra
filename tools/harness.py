@@ -14338,6 +14338,26 @@ def jsonfns():
                 check(f"over the port, refused: {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_port(conn, s, sqlstate, message, info))
         for name, s, sqlstate, message in NOT_YET:
             check(f"over HTTP, refused by name: {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_http(http_error(s), sqlstate, message, info, s))
+        # A set function over an outer query's column, in a subquery or EXISTS: Postgres answers these, Pondra refuses them
+        # by name (0A000, the column named), over HTTP and over the port.
+        # (EXISTS writes the element as e.value: a bare e, a scalar set function's alias, is a schema error here, as before
+        # this check, so the refusal would never be reached; Postgres takes both.)
+        OUTER = [("a count over an outer column", "SELECT id, (SELECT count(*) FROM jsonb_array_elements(t.doc)) FROM docs AS t", "t.doc"),
+                 ("EXISTS over an outer column", "SELECT id FROM docs AS t WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(t.doc) e WHERE e.value ->> 'k' = 'x')", "t.doc")]
+        def outer_http(s, column):
+            code, body = http_error(s)
+            return code == "0A000" and column in body and "aren't taken yet" in body
+        def outer_port(conn, s, column):
+            try:
+                conn.execute(s)
+            except psycopg.Error as e:
+                return e.sqlstate == "0A000" and column in str(e) and "aren't taken yet" in str(e)
+            return False
+        for name, s, column in OUTER:
+            check(f"over HTTP, refused by name, naming {column}: {name}", lambda s=s, column=column: outer_http(s, column))
+        with psycopg.connect(url, autocommit=True) as conn:
+            for name, s, column in OUTER:
+                check(f"over the port, refused by name, naming {column}: {name}", lambda s=s, column=column: outer_port(conn, s, column))
         check("json_keys is DataFusion's list of the keys, as written (DuckDB's name; json_object_keys expands)",
               lambda: http_answer("SELECT json_keys('{\"b\":1,\"a\":2}') AS k") == [[["b", "a"]]])
     finally:
@@ -17694,6 +17714,21 @@ def lateral():
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pgp:
         via_port = norm([tuple(r) for r in pgp.execute(cases[4][1]).fetchall()])
     checks["the Postgres port answers the same rows as HTTP ('two laterals chained')"] = key(via_port) == key(got["two laterals chained"])
+    # A set function over an outer query's column, in a subquery: Postgres answers it (3, 0, 0, 1), Pondra refuses it by name.
+    outer_text = "SELECT id, (SELECT count(*) FROM unnest(t.xs)) FROM t"
+    status, state, body = _sqlstate_of(A.port, outer_text)
+    info["refused: unnest over an outer column (HTTP)"] = [status, state, body[:300]]
+    checks["a set function over an outer query's column is refused by name over HTTP: 0A000, naming t.xs"] = status >= 400 and state == "0A000" and "t.xs" in body and "aren't taken yet" in body
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pgo:
+        try:
+            pgo.execute(outer_text)
+            port_refused = False
+        except psycopg.Error as e:
+            port_refused = e.sqlstate == "0A000" and "t.xs" in str(e) and "aren't taken yet" in str(e)
+    checks["a set function over an outer query's column is refused by name over the port: 0A000, naming t.xs"] = port_refused
+    # A plain correlated subquery (no set function over the outer column) is DataFusion's, and answers as Postgres 16 does.
+    plain_text = "SELECT t.id, (SELECT max(v) FROM (SELECT 1 AS v) w WHERE w.v = t.n) AS m FROM t"
+    checks["a plain correlated subquery answers as Postgres 16 does (1 NULL, 2 1, 3 NULL), over HTTP"] = key(rows_of_pondra(plain_text)) == key(rows_of_pg(plain_text)) == key([("1", ""), ("2", "1"), ("3", "")])
     node.kill()
     # Three nodes: the same rows, spread (?spread=1), each node asked.
     spread_before = None

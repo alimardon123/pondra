@@ -155,6 +155,8 @@ CROSS JOIN LATERAL jsonb_array_elements(carts.doc -> 'items') AS item;
 `jsonb_array_elements_text` and `unnest`. Over `jsonb_array_elements` or `jsonb_each` it is refused by
 name for now: their columns are computed from the rows, and this engine doesn't yet keep such a row
 with NULLs in them.
+A set function over a column of an outer query, in a subquery or `EXISTS`, isn't taken yet and is refused by name: join it in
+that query's `FROM` instead (`FROM t, jsonb_array_elements(t.doc) AS e`), then filter or group there.
 
 The functions below read the same documents. Each takes the document, then a path:
 
