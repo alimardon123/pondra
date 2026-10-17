@@ -9,7 +9,7 @@
 //! (`pg_names`), which `typed` keeps in the schema's metadata beside the mark: a statement is parsed once.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -466,6 +466,53 @@ async fn look_up(lake: &Lake, stmt: &Statement, known: &mut Known, depth: usize)
             known.insert(name, cols);
         }
     }
+}
+
+/// The lower-case names of the columns of the relations `stmt` names, for `pg_json_sets::sets`. None when a relation's
+/// columns aren't known here (a CTE, a file, a table function), or when a FROM item names no relation at all (a derived
+/// table, a CTE): either may have a column of any name. A JSON call in a FROM is a call, not a relation, and is left out.
+pub(crate) async fn columns_named(lake: &Lake, stmt: &Statement) -> Option<HashSet<String>> {
+    if !names_its_columns(stmt) {
+        return None;
+    }
+    let mut known = Known::new();
+    look_up(lake, stmt, &mut known, 0).await;
+    let mut names = HashSet::new();
+    for (name, cols) in &known {
+        if crate::pg_json_sets::is_set_name(name) {
+            continue;
+        }
+        names.extend(cols.as_ref()?.iter().map(|(column, _)| column.to_lowercase()));
+    }
+    Some(names)
+}
+
+/// Whether every FROM item of `stmt` is a table, a view or a call (`TableFactor::Table`, or a LATERAL JSON call), and no
+/// query has a WITH: a derived table, a CTE or a function of another kind hides columns that `look_up` can't see.
+fn names_its_columns(stmt: &Statement) -> bool {
+    struct Named;
+    impl ast::Visitor for Named {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if q.with.is_some() {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+            // (LATERAL makes a call a `Function` factor, so a JSON call written CROSS JOIN LATERAL is one too)
+            let json_call = matches!(factor, TableFactor::Function { name, .. } if crate::pg_json_sets::is_set_name(&name.to_string()));
+            if json_call || matches!(factor, TableFactor::Table { .. }) {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        }
+    }
+    Visit::visit(stmt, &mut Named).is_continue()
 }
 
 async fn of(lake: &Lake, name: &str, known: &mut Known, depth: usize) -> Option<Cols> {
@@ -1412,6 +1459,14 @@ mod tests {
         assert_eq!(rewrite_text("SELECT to_json(u), row_to_json(u) FROM t AS u"), format!(r#"SELECT to_json({r}) AS "to_json(u)", row_to_json({r}) AS "row_to_json(u)" FROM t AS u"#, r = t_row("u")));
         assert_eq!(rewrite_text("SELECT json_agg(x) FROM (SELECT id, name FROM t) x"), r#"SELECT pondra_json_agg(array_agg(pondra_row('id', "x"."id", 'name', "x"."name")), 'row') AS "json_agg(x)" FROM (SELECT id, name FROM t) x"#);
         assert_eq!(rewrite_text("WITH c AS (SELECT id, doc FROM t) SELECT to_json(c) FROM c"), r#"WITH c AS (SELECT id, doc FROM t) SELECT to_json(pondra_row('id', "c"."id", 'doc', pondra_as_json("c"."doc"))) AS "to_json(c)" FROM c"#);
+    }
+
+    /// A LATERAL JSON call in a FROM is a call, not a relation: the columns of the others are known beside it, so a bare
+    /// value name is still rewritten (`pg_json_sets::sets`). Another LATERAL function is not one of those calls.
+    #[test]
+    fn a_lateral_json_call_is_a_call_not_a_relation() {
+        assert!(names_its_columns(&one("SELECT e FROM t CROSS JOIN LATERAL jsonb_array_elements(t.doc) e").unwrap()));
+        assert!(!names_its_columns(&one("SELECT e FROM t CROSS JOIN LATERAL generate_series(1, 2) e").unwrap()));
     }
 
     #[test]

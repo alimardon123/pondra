@@ -19,7 +19,7 @@ use datafusion::sql::sqlparser::ast::{self, Expr, FunctionArg, LimitClause, Quer
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use jiter::Peek;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -287,6 +287,9 @@ fn set_of(name: &ast::ObjectName) -> Option<&'static Set> {
     let [ast::ObjectNamePart::Identifier(ident)] = name.0.as_slice() else { return None };
     SETS.iter().find(|set| set.name.eq_ignore_ascii_case(&ident.value))
 }
+
+/// Whether `name` is one of the set-returning JSON functions: a FROM item of that name is a call, not a relation.
+pub fn is_set_name(name: &str) -> bool { SETS.iter().any(|set| set.name == name) }
 
 /// The set call `e` is with its arguments, if it is one.
 fn call_of(e: &Expr) -> Option<(&'static Set, Vec<Expr>)> {
@@ -665,10 +668,155 @@ fn parse(sql: &str) -> anyhow::Result<Box<Query>> {
     Ok(parser.parse_query()?)
 }
 
+/// The name a FROM item's rows are known by, when its rows are values: the JSON calls that answer one element each
+/// (`Elements`, `ElementsText`). The name is the alias, folded as Postgres folds names, or the function's own name. Its
+/// rows are a column called `value`, so a bare use of the name in its SELECT is `name.value`. An alias with a column list
+/// renames that column, so it has no such name (a bare use stays as it is).
+fn value_alias(factor: &TableFactor) -> Option<String> {
+    let (name, alias) = match factor {
+        TableFactor::Table { name, args: Some(_), alias, .. } | TableFactor::Function { name, alias, .. } => (name, alias),
+        _ => return None,
+    };
+    let set = set_of(name).filter(|set| matches!(set.how, How::Elements | How::ElementsText))?;
+    match alias {
+        None => Some(set.name.to_string()),
+        Some(alias) if alias.columns.is_empty() => Some(fold(&alias.name)),
+        Some(_) => None,
+    }
+}
+
+/// The value names of a SELECT's FROM.
+fn value_aliases(s: &Select) -> Vec<String> {
+    s.from.iter().flat_map(|twj| std::iter::once(&twj.relation).chain(twj.joins.iter().map(|join| &join.relation))).filter_map(value_alias).collect()
+}
+
+/// The value names of a query's body, when the body is one SELECT. Its ORDER BY is the query's own, so it sees them; a set
+/// operation's ORDER BY names output columns only.
+fn body_aliases(body: &SetExpr) -> Vec<String> {
+    match body {
+        SetExpr::Select(s) => value_aliases(s),
+        _ => vec![],
+    }
+}
+
+/// The value names in scope where a walk stands: those of the innermost query or SELECT, never an outer one's. A
+/// subquery's bare use of an outer name is an outer reference, which `lateral.rs` refuses, so it is left as it is.
+/// Both walks of a bare name (`Bare` writes it, `Found` says whether there is one) enter and leave their scopes here,
+/// so what a scope holds is written once.
+#[derive(Default)]
+struct Scopes(Vec<Vec<String>>);
+
+impl Scopes {
+    /// Enters a query: its body's value names, when the body is one SELECT (its ORDER BY sees them).
+    fn enter_query(&mut self, q: &Query) { self.0.push(body_aliases(&q.body)); }
+
+    /// Enters a SELECT: the value names of its FROM.
+    fn enter_select(&mut self, s: &Select) { self.0.push(value_aliases(s)); }
+
+    /// Leaves the query or SELECT entered last.
+    fn leave(&mut self) { self.0.pop(); }
+
+    fn value(&self, ident: &ast::Ident) -> bool { self.0.last().is_some_and(|names| names.contains(&fold(ident))) }
+
+    /// The identifier `e` is, when it is a value name in scope (before the FROM's columns are checked: `Bare` does that).
+    fn bare(&self, e: &Expr) -> Option<ast::Ident> {
+        let Expr::Identifier(ident) = e else { return None };
+        self.value(ident).then(|| ident.clone())
+    }
+}
+
+/// Writes a bare value name as `name.value`, where SQL's scoping gives it that meaning (`sets`). A bare name is a column of
+/// the FROM first, so a name that some relation has as a column is left alone: `columns` holds the lower-case names.
+struct Bare<'a> {
+    columns: &'a HashSet<String>,
+    scopes: Scopes,
+}
+
+impl Bare<'_> {
+    /// The identifier `e` is, when it is a bare value name this rewrites.
+    fn bare(&self, e: &Expr) -> Option<ast::Ident> {
+        self.scopes.bare(e).filter(|ident| !self.columns.contains(&fold(ident).to_lowercase()))
+    }
+}
+
+impl ast::VisitorMut for Bare<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
+        self.scopes.enter_query(q);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &mut Query) -> ControlFlow<()> {
+        self.scopes.leave();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, s: &mut Select) -> ControlFlow<()> {
+        self.scopes.enter_select(s);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_select(&mut self, _: &mut Select) -> ControlFlow<()> {
+        self.scopes.leave();
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        if let Some(ident) = self.bare(e) {
+            *e = Expr::CompoundIdentifier(vec![ident, ast::Ident::new("value")]);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether a SELECT of a statement has a value name written bare (`bare_aliases`).
+#[derive(Default)]
+struct Found {
+    scopes: Scopes,
+}
+
+impl ast::Visitor for Found {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+        self.scopes.enter_query(q);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+        self.scopes.leave();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, s: &Select) -> ControlFlow<()> {
+        self.scopes.enter_select(s);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_select(&mut self, _: &Select) -> ControlFlow<()> {
+        self.scopes.leave();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        match self.scopes.bare(e) {
+            Some(_) => ControlFlow::Break(()),
+            None => ControlFlow::Continue(()),
+        }
+    }
+}
+
+/// Whether some SELECT of `stmt` has a value name of a JSON call written bare, as `e` and not `e.value`. `types::rewrite`
+/// asks the catalog for the columns only for such a statement.
+pub fn bare_aliases(stmt: &Statement) -> bool { ast::Visit::visit(stmt, &mut Found::default()).is_break() }
+
 /// Rewrites a statement's set-returning calls where SQL comes in (`types::rewrite`), and whether it changed any. What
 /// Postgres refuses, and what this engine doesn't take yet, is refused before anything changes. The names of changed
-/// SELECT items are kept as written (`names_kept`).
-pub fn sets(stmt: &mut Statement) -> anyhow::Result<bool> {
+/// SELECT items are kept as written (`names_kept`). `columns` are the lower-case names of the columns the statement's
+/// relations have (`pg_types::columns_named`): a bare value name (`bare_aliases`) is written `name.value` unless one of
+/// them is that name. When they are unknown (None), no bare name is written.
+pub fn sets(stmt: &mut Statement, columns: Option<&HashSet<String>>) -> anyhow::Result<bool> {
     let mut scan = Scan::default();
     if let ControlFlow::Break(e) = ast::Visit::visit(&*stmt, &mut scan) {
         return Err(e);
@@ -678,6 +826,9 @@ pub fn sets(stmt: &mut Statement) -> anyhow::Result<bool> {
     }
     let mut rewrite = Rewrite::default();
     names_kept(stmt, |s| {
+        if let Some(columns) = columns {
+            let _ = ast::VisitMut::visit(s, &mut Bare { columns, scopes: Scopes::default() });
+        }
         let _ = ast::VisitMut::visit(s, &mut rewrite);
         true
     });
@@ -691,12 +842,16 @@ pub fn sets(stmt: &mut Statement) -> anyhow::Result<bool> {
 mod tests {
     use super::*;
 
-    /// The statement after `sets`, as text, or the refusal.
-    fn rewritten(sql: &str) -> anyhow::Result<String> {
+    /// The statement after `sets` with the columns it is given, as text, or the refusal.
+    fn rewritten_with(sql: &str, columns: Option<&[&str]>) -> anyhow::Result<String> {
         let mut stmt = Parser::parse_sql(&GenericDialect {}, sql)?.remove(0);
-        sets(&mut stmt)?;
+        let columns: Option<HashSet<String>> = columns.map(|names| names.iter().map(|name| name.to_string()).collect());
+        sets(&mut stmt, columns.as_ref())?;
         Ok(stmt.to_string())
     }
+
+    /// The statement after `sets`, as text, or the refusal (no columns known).
+    fn rewritten(sql: &str) -> anyhow::Result<String> { rewritten_with(sql, None) }
 
     fn refusal(sql: &str) -> String { rewritten(sql).expect_err("refused").to_string() }
 
@@ -801,14 +956,57 @@ mod tests {
         assert!(rewritten("SELECT CASE WHEN (SELECT true FROM (SELECT jsonb_array_elements('[1]') AS x) s) THEN 1 END").is_ok());
     }
 
+    /// A bare value name is its value where SQL's scoping says so: in a FROM set call's own SELECT, ORDER BY included, and
+    /// not where a relation has a column of that name, nor for a function whose rows are records.
+    #[test]
+    fn a_bare_value_name_is_its_value() {
+        let filter = rewritten_with("SELECT t.id FROM t, jsonb_array_elements(t.doc) AS e WHERE e ->> 'k' = 'x'", Some(&["id", "doc"])).unwrap();
+        assert!(filter.contains("e.value ->> 'k' = 'x'"), "{filter}");
+        let item = rewritten_with("SELECT e FROM jsonb_array_elements('[1,2]') e", Some(&[])).unwrap();
+        assert!(item.contains("e.value AS \"e\""), "{item}"); // (the item keeps its name, as Postgres names it)
+        let order = rewritten_with("SELECT 1 FROM jsonb_array_elements('[1]') e ORDER BY e", Some(&[])).unwrap();
+        assert!(order.contains("ORDER BY e.value"), "{order}");
+        let exists = rewritten_with("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(t.doc) e WHERE e ->> 'k' = 'x')", Some(&["id", "doc"])).unwrap();
+        assert!(exists.contains("e.value ->> 'k' = 'x'"), "{exists}");
+        let shadowed = rewritten_with("SELECT e FROM t, jsonb_array_elements(t.doc) AS e", Some(&["e", "doc"])).unwrap();
+        assert!(!shadowed.contains("e.value"), "{shadowed}");
+        let unknown = rewritten_with("SELECT e FROM jsonb_array_elements('[1]') e WHERE e ->> 'k' = 'x'", None).unwrap();
+        assert!(!unknown.contains("e.value") && unknown.contains("e ->> 'k'"), "{unknown}");
+        let record = rewritten_with("SELECT e FROM jsonb_each('{\"a\":1}') AS e", Some(&[])).unwrap();
+        assert!(!record.contains("e.value"), "{record}");
+        let listed = rewritten_with("SELECT e FROM jsonb_array_elements('[1]') AS e(x)", Some(&[])).unwrap();
+        assert!(!listed.contains("e.value"), "{listed}"); // (the column list renames the value's column)
+        let default = rewritten_with("SELECT jsonb_array_elements FROM jsonb_array_elements('[1]')", Some(&[])).unwrap();
+        assert!(default.contains("jsonb_array_elements.value AS \"jsonb_array_elements\""), "{default}");
+    }
+
+    #[test]
+    fn a_bare_value_name_is_found_before_the_catalog_is_asked() {
+        let parse = |sql: &str| Parser::parse_sql(&GenericDialect {}, sql).expect("parses").remove(0);
+        assert!(bare_aliases(&parse("SELECT e FROM jsonb_array_elements('[1]') e")));
+        assert!(bare_aliases(&parse("SELECT 1 FROM t, jsonb_array_elements_text(t.doc) WHERE jsonb_array_elements_text IS NULL")));
+        assert!(!bare_aliases(&parse("SELECT e.value FROM jsonb_array_elements('[1]') e")));
+        assert!(!bare_aliases(&parse("SELECT e FROM jsonb_each('{}') e")));
+        assert!(!bare_aliases(&parse("SELECT e FROM t")));
+    }
+
     #[test]
     fn statements_without_calls_stay_as_they_are() {
         let mut stmt = Parser::parse_sql(&GenericDialect {}, "SELECT json_keys(doc), json_extract_path(doc, 'a') FROM t").unwrap().remove(0);
         let before = stmt.to_string();
-        assert!(!sets(&mut stmt).unwrap());
+        assert!(!sets(&mut stmt, None).unwrap());
         assert_eq!(stmt.to_string(), before);
         assert!(!crate::text::names_a_type("SELECT json_keys(doc) FROM t"));
         assert!(crate::text::names_a_type("SELECT * FROM JSONB_EACH(doc)"));
+    }
+
+    /// `text.rs` keeps its own pattern of these names (it is in every build, and this module is the server's): a name added
+    /// to `SETS` that the pattern doesn't name would be read as a plain query.
+    #[test]
+    fn the_gate_names_every_set_function() {
+        for set in SETS.iter() {
+            assert!(crate::text::names_a_type(&format!("SELECT * FROM {}('[]')", set.name)), "{}", set.name);
+        }
     }
 
     /// JSON's spaces around a document change no row: the items, the keys and the values of each expanding function come

@@ -14525,6 +14525,62 @@ def _jsonfns_spaces(check, http_answer, http_error, port_answer, conn, info):
         check(f"over the port, {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_port(conn, s, sqlstate, message, info))
 
 
+def _outer_refused_http(http_error, s, column):
+    """A set function over an outer query's column is refused by name over HTTP: 0A000, with the column named."""
+    code, body = http_error(s)
+    return code == "0A000" and column in body and "aren't taken yet" in body
+
+
+def _outer_refused_port(conn, s, column):
+    """The same refusal over the Postgres port."""
+    import psycopg
+    try:
+        conn.execute(s)
+    except psycopg.Error as e:
+        return e.sqlstate == "0A000" and column in str(e) and "aren't taken yet" in str(e)
+    return False
+
+
+def _jsonfns_bare_names(check, http_answer, http_error, port_answer, conn, info):
+    """A JSON call's rows named bare, as Postgres 16 reads a name no column has (D4): the name is the row's value, so
+    `e ->> 'k'` and `SELECT e` work as `e.value` does, over HTTP and the port. Each expected answer was asked of Postgres 16
+    on the same rows (a temporary table of the section's own). An object's elements are an error, so each statement reads
+    only the rows that are arrays, or has the WHERE that keeps the others out. A bare e in an EXISTS over an outer column is
+    refused by name, as the e.value form is: Postgres answers both."""
+    CASES = [
+        ("bare name: e ->> 'sku' in a SELECT list, over a FROM call that reads a column (the element is the value)", "SELECT d.id, e ->> 'sku' AS sku FROM docs d, jsonb_array_elements(d.doc -> 'items') AS e ORDER BY 1, 2",
+         ['id', 'sku'], [23, 25],
+         [[1, 'A1'], [1, 'B7']]),
+        ("bare name: e ->> 'sku' in a WHERE, its value compared", "SELECT d.id FROM docs d, jsonb_array_elements(d.doc -> 'items') AS e WHERE e ->> 'sku' = 'B7'",
+         ['id'], [23],
+         [[1]]),
+        ("bare name: e ->> 'sku' in a WHERE, over a CROSS JOIN LATERAL call (its rows are the value too)", "SELECT d.id FROM docs d CROSS JOIN LATERAL jsonb_array_elements(d.doc -> 'items') AS e WHERE e ->> 'sku' = 'B7'",
+         ['id'], [23],
+         [[1]]),
+        ("bare name: SELECT e of a constant array, its column named e and holding the jsonb value", "SELECT e FROM jsonb_array_elements('[1,\"a\",null]') e",
+         ['e'], [3802],
+         [['1'], ['"a"'], ['null']]),
+        ("bare name: a function's name is its value's name: SELECT jsonb_array_elements FROM jsonb_array_elements(...)", "SELECT jsonb_array_elements FROM jsonb_array_elements('[1]')",
+         ['jsonb_array_elements'], [3802],
+         [['1']]),
+        ("bare name: jsonb_array_elements_text's bare name compared in a WHERE of a column's array", "SELECT count(*) FROM docs d, jsonb_array_elements_text(d.doc) x WHERE d.id = 4 AND x = 'x'",
+         ['count'], [20],
+         [[1]]),
+        ("bare name: a column named e beats a JSON call's bare name e, as Postgres resolves it", "SELECT e FROM (SELECT 7 AS e) s, jsonb_array_elements('[1]') e",
+         ['e'], [23],
+         [[7]]),
+    ]
+    for name, s, names, types, rows in CASES:
+        check(f"over HTTP, {name}", lambda s=s, rows=rows: _same(http_answer(s), [[v for v in row if v is not None] for row in rows], info, s))
+    for name, s, names, types, rows in CASES:
+        check(f"over the port, {name}", lambda s=s, names=names, types=types, rows=rows: _same(port_answer(conn, s), (names, types, rows), info, s))
+    outer = "SELECT id FROM docs AS t WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(t.doc) e WHERE e ->> 'k' = 'x')"
+    check("over HTTP, refused by name, naming t.doc: EXISTS over an outer column, written with the bare name e",
+          lambda: _outer_refused_http(http_error, outer, "t.doc"))
+    check("over the port, refused by name, naming t.doc: EXISTS over an outer column, written with the bare name e",
+          lambda: _outer_refused_port(conn, outer, "t.doc"))
+
+
 def jsonfns():
     """Postgres 16's functions that read a JSON document and expand it into rows (ADR-072 phase 2, brief D1). Reading:
     json(b)_typeof, json(b)_array_length, json(b)_extract_path(_text) (`#>` and `#>>` with the keys as the path; NULL where
@@ -14758,25 +14814,16 @@ def jsonfns():
             check(f"over HTTP, refused by name: {name}", lambda s=s, sqlstate=sqlstate, message=message: _refused_http(http_error(s), sqlstate, message, info, s))
         # A set function over an outer query's column, in a subquery or EXISTS: Postgres answers these, Pondra refuses them
         # by name (0A000, the column named), over HTTP and over the port.
-        # (EXISTS writes the element as e.value: a bare e, a scalar set function's alias, is a schema error here, as before
-        # this check, so the refusal would never be reached; Postgres takes both.)
+        # (The rows write the element as e.value. A bare e is the same refusal: _jsonfns_bare_names checks it.)
         OUTER = [("a count over an outer column", "SELECT id, (SELECT count(*) FROM jsonb_array_elements(t.doc)) FROM docs AS t", "t.doc"),
                  ("EXISTS over an outer column", "SELECT id FROM docs AS t WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(t.doc) e WHERE e.value ->> 'k' = 'x')", "t.doc")]
-        def outer_http(s, column):
-            code, body = http_error(s)
-            return code == "0A000" and column in body and "aren't taken yet" in body
-        def outer_port(conn, s, column):
-            try:
-                conn.execute(s)
-            except psycopg.Error as e:
-                return e.sqlstate == "0A000" and column in str(e) and "aren't taken yet" in str(e)
-            return False
         for name, s, column in OUTER:
-            check(f"over HTTP, refused by name, naming {column}: {name}", lambda s=s, column=column: outer_http(s, column))
+            check(f"over HTTP, refused by name, naming {column}: {name}", lambda s=s, column=column: _outer_refused_http(http_error, s, column))
         with psycopg.connect(url, autocommit=True) as conn:
             for name, s, column in OUTER:
-                check(f"over the port, refused by name, naming {column}: {name}", lambda s=s, column=column: outer_port(conn, s, column))
+                check(f"over the port, refused by name, naming {column}: {name}", lambda s=s, column=column: _outer_refused_port(conn, s, column))
             _jsonfns_spaces(check, http_answer, http_error, port_answer, conn, info)
+            _jsonfns_bare_names(check, http_answer, http_error, port_answer, conn, info)
         check("json_keys is DataFusion's list of the keys, as written (DuckDB's name; json_object_keys expands)",
               lambda: http_answer("SELECT json_keys('{\"b\":1,\"a\":2}') AS k") == [[["b", "a"]]])
         checks.update(_jsonfns_params(port, pg, info))  # (the parameters and results of SQL functions and procedures, W5)
