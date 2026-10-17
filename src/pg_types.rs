@@ -469,6 +469,10 @@ async fn look_up(lake: &Lake, stmt: &Statement, known: &mut Known, depth: usize)
 }
 
 async fn of(lake: &Lake, name: &str, known: &mut Known, depth: usize) -> Option<Cols> {
+    if let Some(cols) = crate::temp::columns_of(name) {
+        // (a session's temporary table shadows a lake table of its name, so its own columns and types come first)
+        return Some(cols.into_iter().map(|(c, t)| (c, t.as_deref().and_then(Ty::of))).collect());
+    }
     let (other, local) = crate::ddl::resolve(lake, name).await.ok()?;
     let lake = other.as_deref().unwrap_or(lake);
     if let Ok(Some(m)) = lake.cat.meta(&table_key(&local)).await {

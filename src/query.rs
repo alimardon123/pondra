@@ -886,7 +886,11 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     crate::udf::register(lake, &ctx).await?; // the lake's own functions (`POST /functions/…`)
     crate::pyfn::register(lake, &ctx).await?; // …and its Python functions (`CREATE FUNCTION … LANGUAGE python`)
     let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)
-    let temps = crate::temp::views(sql); // (the session's own: over the lake's of the same name)
+    let mut temps = crate::temp::views(sql); // (the session's own: over the lake's of the same name)
+    for (_, v) in temps.iter_mut() {
+        let expanded = crate::routines::expand_stored(lake, v).await?; // (read as a stored view is: the door's rewrites, with the tables' types now; the text was kept as written)
+        *v = expanded;
+    }
     let seen = temps.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
     let mut views = stored_views(lake, &seen, listing).await?; // (their tables are wanted too)
     views.retain(|(n, _)| !temps.iter().any(|(m, _)| m == n));

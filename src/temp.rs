@@ -78,11 +78,12 @@ pub fn listed() -> (Vec<(String, Vec<(String, String)>)>, Vec<(String, String)>)
 /// The statement that makes one of the current session's temporary views or tables again, and its
 /// kind (`SHOW CREATE`: the session's come first, as `pg_temp` is first on Postgres's path).
 pub fn made(name: &str) -> Option<(&'static str, String)> {
-    use crate::objects::{ident, list_sql, sql_type};
+    use crate::objects::{ident, list_sql};
     peek(&current()?, |x| match (x.views.get(name), x.tables.get(name)) {
         (Some(sql), _) => Some(("view", format!("CREATE TEMPORARY VIEW {} AS {sql}", ident(name)))),
         (None, Some(t)) => {
-            let mut parts: Vec<String> = t.columns.iter().map(|(c, ty)| format!("{} {}", ident(c), sql_type(ty))).collect();
+            let meta = t.meta();
+            let mut parts: Vec<String> = t.columns.iter().map(|(c, ty)| format!("{} {}", ident(c), crate::types::shown(&meta, c, ty))).collect(); // (a uuid or VARCHAR(n) column's own type)
             parts.extend((!t.key.is_empty()).then(|| format!("PRIMARY KEY ({})", list_sql(&t.key))));
             Some(("table", format!("CREATE TEMPORARY TABLE {} ({})", ident(name), parts.join(", "))))
         }
@@ -98,11 +99,14 @@ struct Table {
     next: i64,                      // the next row id
     version: i64,                   // the last change's number (its rows' `_version`)
     key: Vec<String>,               // the PRIMARY KEY's columns: no two rows repeat them, none is NULL
+    sql_types: std::collections::BTreeMap<String, String>, // the columns held as text that SQL types them (uuid, json, jsonb, varchar(n)): every write checks them
 }
 
 impl Table {
     fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::query::schema(&[self.columns.clone(), crate::sys::columns()].concat()) }
     fn bytes(&self) -> usize { self.rows.iter().map(|b| b.get_array_memory_size()).sum() }
+    /// The table as a lake table's writes see it (`defaults::check`, the change path): its columns, types and key.
+    fn meta(&self) -> TableMeta { TableMeta { columns: self.columns.clone(), sql_types: self.sql_types.clone(), key: self.key.clone(), ids: true, ..Default::default() } }
 }
 
 #[derive(Default)]
@@ -250,6 +254,12 @@ pub fn own(stmt: &Stmt) -> bool {
     }
 }
 
+/// The columns of the current session's temporary table `name`, with the SQL type each holds as text, if there is one
+/// (`pg_types::of` reads them before a lake table of the name: a temporary table shadows it).
+pub fn columns_of(name: &str) -> Option<Vec<(String, Option<String>)>> {
+    peek(&current()?, |x| x.tables.get(name).map(|t| t.columns.iter().map(|(c, _)| (c.clone(), t.sql_types.get(c).cloned())).collect()))
+}
+
 /// The session's temporary tables `text` names, as tables of `ctx` (over the lake's of the same
 /// name), with their system columns if `text` names one.
 pub fn register(ctx: &SessionContext, text: &str) -> Result<()> {
@@ -370,7 +380,8 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
     let columns: Vec<(String, String)> = serde_json::from_value(spec["columns"].clone())?;
     let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::write::stored(&crate::query::dtype(t)?))))).collect::<Result<Vec<_>>>()?;
     ensure!(columns.iter().all(|(c, _)| !crate::sys::NAMES.contains(&c.as_str())), "{}: system columns (every table has them)", crate::sys::NAMES.join(", "));
-    with(s, true, |x| Ok(x.tables.insert(name.clone(), Table { columns, rows: vec![], next: 1, version: 0, key })))?;
+    let sql_types: std::collections::BTreeMap<String, String> = serde_json::from_value(spec["sql_types"].clone()).unwrap_or_default(); // (a uuid, JSON or VARCHAR(n) column: its values checked as a lake table's are)
+    with(s, true, |x| Ok(x.tables.insert(name.clone(), Table { columns, rows: vec![], next: 1, version: 0, key, sql_types })))?;
     let rows = match &c.query {
         Some(q) => insert(app, s, &name, None, &q.to_string(), files).await?["rows"].clone(),
         None => j!(0),
@@ -380,17 +391,17 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
 
 /// `INSERT INTO name [(columns)] query`.
 async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query: &str, files: bool) -> Result<Value> {
-    let columns = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| t.columns.clone()).with_context(|| format!("no temporary table {name}"))?;
+    let meta = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(Table::meta).with_context(|| format!("no temporary table {name}"))?;
     let query = match names {
         Some(n) => {
-            let all: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
+            let all: Vec<String> = meta.columns.iter().map(|(c, _)| c.clone()).collect();
             crate::write::rows_for(name, &all, if n.is_empty() { &all } else { n }, query, &|_| None)? // (no names: `VALUES (1, DEFAULT)`)
         }
         None => query.to_string(),
     };
     let ctx = crate::query::session(&app.lake, &query, "").await?;
     let ctx = if files { ctx.enable_url_table() } else { ctx };
-    let batch = crate::write::rows(&ctx, &TableMeta { columns, ..Default::default() }, &query).await?;
+    let batch = crate::write::rows(&ctx, &meta, &query).await?;
     let n = batch.num_rows();
     apply(s, name, HashSet::new(), vec![batch])?;
     Ok(j!({"rows": n}))
@@ -398,8 +409,7 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
 
 /// UPDATE, DELETE or MERGE: what changes, worked out as for a lake table, applied here.
 async fn change(app: &App, s: &str, name: &str, stmt: &Stmt) -> Result<Value> {
-    let (columns, key) = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.columns.clone(), t.key.clone())).with_context(|| format!("no temporary table {name}"))?;
-    let meta = TableMeta { columns, ids: true, key, ..Default::default() }; // (a key: an ON CONFLICT without a column list is on it)
+    let meta = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(Table::meta).with_context(|| format!("no temporary table {name}"))?; // (its key: an ON CONFLICT without a column list is on it)
     let (old, new) = crate::change::rows_of(&app.lake, name, &meta, stmt, app.lake.visible()).await?;
     let count = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
     let inserted: usize = new.iter().map(|b| b.column_by_name(crate::sys::ROW_ID).map_or(b.num_rows(), |c| c.null_count())).sum();
@@ -424,6 +434,7 @@ fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<RecordBatch>) -> Resu
             rows.push(datafusion::arrow::compute::filter_record_batch(b, &keep)?);
         }
         let schema = t.schema()?;
+        let meta = t.meta();
         let (version, n) = (t.version + 1, t.columns.len());
         for b in new.iter().filter(|b| b.num_rows() > 0) {
             let len = b.num_rows();
@@ -441,7 +452,9 @@ fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<RecordBatch>) -> Resu
             let mut columns: Vec<ArrayRef> = b.columns()[..n].to_vec();
             columns.extend([Arc::new(Int64Array::from(ids)) as ArrayRef, Arc::new(Int64Array::from(vec![version; len])), time(created), time(vec![now; len])]);
             let columns = columns.iter().zip(schema.fields()).map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type())).collect::<Result<_, _>>()?; // (as the table's types)
-            rows.push(RecordBatch::try_new(schema.clone(), columns)?);
+            let batch = RecordBatch::try_new(schema.clone(), columns)?;
+            crate::defaults::check(&meta, name, &batch)?; // (every write lands here: a value its column can't hold is refused as a lake table refuses it)
+            rows.push(batch);
         }
         check_key(name, &t.columns, &t.key, &rows)?;
         let bytes: usize = rows.iter().map(|b| b.get_array_memory_size()).sum();
@@ -476,4 +489,30 @@ fn check_key(name: &str, columns: &[(String, String)], key: &[String], rows: &[R
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_temporary_table_keeps_its_types_for_its_writes_and_its_shape() {
+        // (the session's state is set directly: `with` starts the reaper, which needs a runtime a plain test doesn't have)
+        let s = "unit-temp-types";
+        let table = Table {
+            columns: vec![("u".into(), "Utf8".into()), ("v".into(), "Utf8".into()), ("n".into(), "Int64".into())],
+            rows: vec![],
+            next: 1,
+            version: 0,
+            key: vec![],
+            sql_types: std::collections::BTreeMap::from([("u".to_string(), "uuid".to_string()), ("v".to_string(), "varchar(3)".to_string())]),
+        };
+        SESSIONS.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), table);
+        SESSION.sync_scope(Some(s.to_string()), || {
+            assert_eq!(columns_of("tt"), Some(vec![("u".to_string(), Some("uuid".to_string())), ("v".to_string(), Some("varchar(3)".to_string())), ("n".to_string(), None)]));
+            assert_eq!(columns_of("other"), None, "a name with no temporary table of the session's is left to the lake");
+            assert_eq!(made("tt"), Some(("table", "CREATE TEMPORARY TABLE tt (u UUID, v VARCHAR(3), n BIGINT)".to_string())), "SHOW CREATE gives each column's own type");
+        });
+        SESSIONS.lock().unwrap().remove(s);
+    }
 }
