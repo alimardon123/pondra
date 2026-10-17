@@ -6545,6 +6545,7 @@ def temps():
     time.sleep(6.5)
     idled = _raises_text(lambda: idle.sql("SELECT * FROM soon").rows())
     checks["close() ends a session; so does idleness (PONDRA_SESSION_IDLE_SECS)"] = "picked" in closed and "soon" in idled
+    _temps_typed(checks, A.port)  # (typed columns and checks, temporary views' rewrites, a Postgres connection's uuids: Postgres 16's answers)
     [n.kill() for n in nodes]
     ok = all(checks.values())
     print(json.dumps({"temps": checks, "ok": ok}, indent=1))
@@ -6552,6 +6553,72 @@ def temps():
         print(got, before, joined, spread, cached, shadow, unseen, no_session, lake_view, mine, gone, shown, shown_pg, closed, idled)
         sys.exit(1)
     return f"temps: a session's own tables and views, every statement, on its node: all {len(checks)} checks pass"
+
+
+def _temps_typed(checks, port):
+    """A temporary table keeps its typed columns and checks every write as a lake table does (`temp::apply`, through
+    `defaults::check`, invariant 130): a JSON, JSONB, UUID or VARCHAR(n) value its column can't hold is refused by INSERT,
+    INSERT … SELECT and UPDATE with Postgres 16's SQLSTATE and words, and nothing is written; a good one reads back as
+    Postgres prints it (an upper-case uuid in lower case, JSON as written). A temporary view is read with the door's
+    rewrites, as a stored view is: its `||` over jsonb merges the objects, as Postgres does, not the two texts joined.
+    A Postgres connection's temporary table sends its uuid column as a uuid (`pg_types::of`). SHOW CREATE gives each
+    column's type. Every expected answer is Postgres 16's, from a probe of these statements on /tmp/pg16-l3."""
+    import psycopg
+    db = _client(port)
+
+    def refused(s):  # (SQLSTATE and words of the error a statement gets over HTTP; None when it is taken)
+        try:
+            db.sql(s)
+            return None
+        except Exception as e:
+            return getattr(e, "sqlstate", None), str(e)
+
+    db.sql("CREATE TEMP TABLE tdocs (doc JSONB, j JSON, u UUID, v VARCHAR(3))")
+    db.sql("INSERT INTO tdocs VALUES ('{\"a\": 1, \"b\": 2}', '[1, 2]', 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', 'abc')")
+    # (statement, Postgres's SQLSTATE, the words Postgres gives. The UPDATEs match the row: a change is checked for the rows it writes,
+    # and Postgres refuses a bad literal even when no row matches, which this check doesn't ask of Pondra)
+    cases = [
+        ("INSERT INTO tdocs (doc) VALUES ('{bad')", "22P02", "invalid input syntax for type json"),
+        ("INSERT INTO tdocs (j) VALUES ('[1,')", "22P02", "invalid input syntax for type json"),
+        ("INSERT INTO tdocs (u) VALUES ('not-a-uuid')", "22P02", 'invalid input syntax for type uuid: "not-a-uuid"'),
+        ("INSERT INTO tdocs (v) VALUES ('abcd')", "22001", "value too long for type character varying(3)"),
+        ("INSERT INTO tdocs (doc) SELECT '{bad'", "22P02", "invalid input syntax for type json"),
+        ("INSERT INTO tdocs (u) SELECT 'not-a-uuid'", "22P02", 'invalid input syntax for type uuid: "not-a-uuid"'),
+        ("INSERT INTO tdocs (v) SELECT 'abcd'", "22001", "value too long for type character varying(3)"),
+        ("UPDATE tdocs SET doc = '{bad' WHERE v = 'abc'", "22P02", "invalid input syntax for type json"),
+        ("UPDATE tdocs SET u = 'not-a-uuid' WHERE v = 'abc'", "22P02", 'invalid input syntax for type uuid: "not-a-uuid"'),
+        ("UPDATE tdocs SET v = 'abcd' WHERE v = 'abc'", "22001", "value too long for type character varying(3)"),
+    ]
+    got = [refused(s) for s, _, _ in cases]
+    refusals_ok = all(g is not None and g[0] == code and words in g[1] for g, (_, code, words) in zip(got, cases))
+    back = db.sql("SELECT doc, j, u, v FROM tdocs").rows()
+    count = db.sql("SELECT count(*) AS n FROM tdocs").rows()
+    db.sql("CREATE TEMP TABLE tjson (doc JSONB)")
+    db.sql("INSERT INTO tjson VALUES ('{\"a\": 1}'), ('{\"b\": 2, \"a\": 1}')")
+    db.sql("CREATE TEMP VIEW tcat AS SELECT doc || '{\"a\": 9}'::jsonb AS m FROM tjson")
+    merged = sorted(r["m"] for r in db.sql("SELECT m FROM tcat").rows())
+    shown = db.sql("SHOW CREATE TABLE tdocs").rows()[0]["definition"]
+    with psycopg.connect(f"host=127.0.0.1 port={port + 10} user=u dbname=lake", autocommit=True) as pg:
+        pg.execute("CREATE TEMP TABLE tport (u UUID, doc JSONB)")
+        pg.execute("INSERT INTO tport VALUES ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', '{\"a\": 1}')")
+        row = pg.execute("SELECT u, doc FROM tport").fetchone()
+        try:
+            pg.execute("INSERT INTO tport (doc) VALUES ('{bad')")
+            port_refused = None
+        except psycopg.Error as e:
+            port_refused = e.sqlstate
+    db.close()
+    info = {"refusals": got, "back": back, "count": count, "merged": merged, "shown": shown, "port": [repr(row), port_refused]}
+    checks["a temporary table's uuid, JSON, JSONB and VARCHAR(n) columns refuse what they can't hold by INSERT, INSERT … SELECT and UPDATE (Postgres's SQLSTATE and words, nothing written), and keep a good value as Postgres prints it"] = \
+        refusals_ok and back == [{"doc": '{"a": 1, "b": 2}', "j": "[1, 2]", "u": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "v": "abc"}] and count == [{"n": 1}]
+    checks["a temporary view's || over a temporary table's jsonb merges the objects, as Postgres does (not the two texts joined)"] = \
+        merged == ['{"a": 9, "b": 2}', '{"a": 9}']
+    checks["SHOW CREATE of a temporary table gives each column's own type (UUID, JSON, JSONB, VARCHAR(n))"] = \
+        all(w in shown for w in ("doc JSONB", "j JSON", "u UUID", "v VARCHAR(3)"))
+    checks["a Postgres connection's temporary table: an upper-case uuid reads back as a uuid, a bad JSON is refused 22P02"] = \
+        type(row[0]).__name__ == "UUID" and str(row[0]) == "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" and row[1] == {"a": 1} and port_refused == "22P02"
+    if not all(checks[k] for k in list(checks)[-4:]):
+        print(json.dumps(info, indent=1, default=str))
 
 
 def across():
