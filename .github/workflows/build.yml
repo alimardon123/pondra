@@ -11,10 +11,11 @@ name: build
 # tests that need only it (upgrade, resilience, sharing, sso), while the other platforms finish.
 # A tag's release (release.yml) publishes this run's packages: nothing is built twice, and what
 # the suite tested is what ships. A pull request's push runs nothing (its thread builds and tests
-# where it works), unless the pull request asks: the label `ci` builds linux-x64 with the suite, and
-# the pull request merges once that passes (the owner, 2026-10-16). Its other platforms first build
-# on main, and a failure there is said on the pull request (`red`, below) for its lane to fix at
-# once; `full-ci` builds them (but macOS Intel) before the merge, for a change that wants them.
+# where it works), unless the pull request asks: the label `ci` builds linux-x64 (in the release
+# profile, for the runner's glibc) with the suite, and the pull request merges once that passes (the
+# owner, 2026-10-16). Its other platforms first build on main, and a failure there is said on the pull
+# request (`red`, below) for its lane to fix at once; `full-ci` builds them (but macOS Intel) before
+# the merge, for a change that wants them.
 # Decided from the labels alone, so a push that asks for nothing never waits for a runner to say so;
 # a newer push stops the older run.
 # Two pull requests' runs go at once (the account's runners are shared with the owner's other work,
@@ -59,6 +60,7 @@ jobs:
       linux: ${{ steps.plan.outputs.linux }}
       others: ${{ steps.plan.outputs.others }}
       binary: ${{ steps.plan.outputs.binary }}
+      profile: ${{ steps.plan.outputs.profile }}
       unit: ${{ steps.plan.outputs.unit }}
       docs: ${{ steps.plan.outputs.docs }}
       suite: ${{ steps.plan.outputs.suite }}
@@ -106,6 +108,13 @@ jobs:
             if [ -n "$run" ]; then echo "Built and tested already: https://github.com/$GITHUB_REPOSITORY/actions/runs/$run" >> "$GITHUB_STEP_SUMMARY"; fi
           fi
           if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`): the pull request merges once it passes, and main builds the other platforms (the label \`full-ci\` builds them here first, but macOS Intel)." >> "$GITHUB_STEP_SUMMARY"; fi
+          # A pull request's linux-x64 alone (\`ci\`) is built in the release profile, for this runner's
+          # glibc: the dist profile's one codegen unit and thin LTO took 23 of a run's 43 minutes (median of
+          # 26 runs, 10-14 to 10-17), and the release profile's dependencies are the ones the unit tests
+          # cache. What ships is still built as it ships, and its suite run, on main and with \`full-ci\`.
+          profile=dist
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ "$FULL" != true ]; then profile=release; fi
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
           if [ "$FULL" = true ] && [ "$release" = false ]; then echo "macOS Intel is built on a version commit (the one a release tags) or a run started by hand." >> "$GITHUB_STEP_SUMMARY"; fi
           # What a change touches decides what runs: nothing for one no check reads (docs/ but its
           # surface and glossary, AGENTS.md, the benches', the soak's and other workflows' own files);
@@ -254,7 +263,7 @@ jobs:
       run:
         shell: bash
     env:
-      BIN: target/${{ matrix.target }}/dist/pondra${{ matrix.exe }}
+      BIN: ${{ needs.plan.outputs.profile == 'release' && 'target/release/pondra' || format('target/{0}/dist/pondra{1}', matrix.target, matrix.exe) }}
     steps: &build # (every platform's, `build` below too)
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -263,8 +272,9 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # (the key it had when every platform was the job `build`: main's caches stay theirs)
-          shared-key: build
+          # (the key it had when every platform was the job `build`: main's caches stay theirs; the
+          # release profile's are the unit tests')
+          shared-key: ${{ needs.plan.outputs.profile == 'release' && 'unit' || 'build' }}
           cache-on-failure: true # (a failed run keeps what it compiled: the dist profile's dependencies take most of a cold build)
           # (main's caches only: every branch reads them, and a branch's own would push them out of
           # the repository's 10 GB; the dependencies are what is cached, and they rarely change)
@@ -287,7 +297,9 @@ jobs:
           # linux-x64's alone so far: zig's lld has linked it with the script, and arm64's hasn't been tried)
           PONDRA_STARTUP_LAYOUT: ${{ github.event_name != 'pull_request' && matrix.platform == 'linux-x64' && '1' || '' }}
         run: |
-          if [ -n "${{ matrix.zig }}" ]; then
+          if [ "${{ needs.plan.outputs.profile }}" = release ]; then
+            cargo build --release --workspace # (for this runner's glibc: a pull request's packages are tried here, never published)
+          elif [ -n "${{ matrix.zig }}" ]; then
             pip install ziglang cargo-zigbuild
             # (zig's linker says, on every build, that it ignores the -Wl,-O1 rustc passes it: not a warning of ours)
             RUSTFLAGS="-A linker_messages" cargo zigbuild --profile dist --target ${{ matrix.zig }} --workspace
@@ -304,7 +316,7 @@ jobs:
       # machine: packaging that breaks on an OS (npm is npm.cmd on Windows) shows on a push.
       - run: python tools/package.py --bin "$BIN" --platform ${{ matrix.platform }} --npm-main --out dist && bash tools/try_packages.sh ${{ matrix.platform }}
       - name: The Linux wheel on glibc 2.17 (CentOS 7) and on Ubuntu 22.04
-        if: matrix.platform == 'linux-x64'
+        if: matrix.platform == 'linux-x64' && needs.plan.outputs.profile == 'dist'
         run: |
           docker run --rm -v "$PWD":/w -w /w quay.io/pypa/manylinux2014_x86_64 bash -c \
             "/opt/python/cp311-cp311/bin/python -m pip install -q --only-binary=:all: dist/*.whl 'pyarrow<19' && /opt/python/cp311-cp311/bin/python tools/package_check.py"
@@ -369,6 +381,10 @@ jobs:
       # for the other two) compile side by side: two commands built them one after the other, 9.6
       # and then 14.3 minutes on main's run 650.
       - run: cargo test --release --lib --test node_twice --test node_library
+      # (on main, the workspace too: the cache this job saves is the one a pull request's linux-x64
+      # builds from, in the release profile, and the program and the library need a few crates more)
+      - if: github.event_name != 'pull_request'
+        run: cargo build --release --workspace
 
   # The suite, on linux-x64's very binary, in four parts side by side: the quick correctness suite
   # (upserts, split brain, crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on
