@@ -322,7 +322,9 @@ fn spill_parent(kind: &str) -> std::io::Result<PathBuf> {
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
         let uid = unsafe { libc::getuid() };
-        let dir = spill_base().join(format!("pondra-{kind}-{uid}"));
+        let base = spill_base();
+        let _ = std::fs::create_dir_all(&base); // (a PONDRA_SPILL_DIR not made yet: made, parents and all)
+        let dir = base.join(format!("pondra-{kind}-{uid}"));
         let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
         let m = std::fs::symlink_metadata(&dir)?;
         if m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0 {

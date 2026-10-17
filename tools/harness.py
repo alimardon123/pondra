@@ -3631,7 +3631,8 @@ def scale():
     # Past PONDRA_SPILL_GB the same sort is refused by name (53100), saying to raise that setting and not DataFusion's
     # `datafusion.runtime.*`, and the node answers after. The 10 M strings are made again: the sort check above dropped them.
     node.kill()  # (the memory-line node still holds the port and the lake: this check starts its own)
-    spill_dir = tempfile.mkdtemp(prefix="pondra-spill-")
+    spill_top = tempfile.mkdtemp(prefix="pondra-spill-")
+    spill_dir = os.path.join(spill_top, "not", "made", "yet")  # (a folder the node has to make, parents and all)
     spill_env = {"PONDRA_CORES": "4", "PONDRA_SPILL_DIR": spill_dir}
     spill_root = os.path.join(spill_dir, f"pondra-spill-{os.getuid()}")  # the user's folder a node makes there (memory::spill_base)
     def reply(s, timeout=600):  # (status, SQLSTATE, body) as the node sends it, a refusal included
@@ -3679,7 +3680,7 @@ def scale():
         except RuntimeError:
             pass  # (a table the capped sort never made is none to drop)
     capped.kill()
-    shutil.rmtree(spill_dir, ignore_errors=True)
+    shutil.rmtree(spill_top, ignore_errors=True)
     node.kill()
     ok = all(checks.values())
     shown = {q: ("same" if same else "DIFFERENT") + (", by ranges" if r else "") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp, r) in shuffles.items()}

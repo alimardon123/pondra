@@ -2764,6 +2764,20 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    refused for memory). Rows, bytes, ranges and null counts stay the footers'. `harness.py hot`: "a table read cold
    sizes a GROUP BY by its column's distinct values (3 groups), and a join builds those".
 
+419. **A node spills to a disk with room, as much as it has room for, and says so by name past it** (`store::spill_disk`,
+   `memory::spill_base`, `memory::Folder`, `spill::dir`). A query's spills (DataFusion's) and a shuffle's go under
+   `PONDRA_SPILL_DIR`, else `PONDRA_CACHE_DIR`, else the temporary folder unless it is held in memory (tmpfs: /tmp on
+   Fedora and Arch, where a spill frees nothing), then the user's cache folder. A query's go in a folder of the
+   process's own (`pondra-spill-{uid}/{pid}-…`, 0700, its lock file held), and the folders of processes that ended
+   are swept when the next process makes its own: a node killed mid-spill left them for good. A node may spill
+   `PONDRA_SPILL_GB`, by default the disk's free space when the lake opens less what a lake keeps for itself
+   (`store::lake_keeps`, invariant 220), not DataFusion's 100 GB; past it a query is refused with 53100, worded to
+   raise `PONDRA_SPILL_GB` (`codes::words`), never DataFusion's `datafusion.runtime.*` (refused: invariant 188), and
+   the frugal retry doesn't run it again. `0`: nothing spills. Spills are written uncompressed: on this 4-core VM zstd
+   cut a 10M-string sort's spill 2.5× but took 10–24% longer, lz4 5–9%. `harness.py scale`: "a query spills to
+   PONDRA_SPILL_DIR, cleans up after, and past PONDRA_SPILL_GB is refused by name (53100)" (a folder not made yet);
+   `memory::tests::sweep_removes_a_folder_whose_process_ended_and_keeps_the_rest`.
+
 420. **A `CREATE TABLE … AS SELECT` that fails leaves no table** (`write::run_listed`, `Undo`; `from_cli`). Its table
    is made first (`Stmt::Define`), so an INSERT of its rows that fails, for any reason, drops it, purged, before the
    statement answers, and the answer stays the statement's own error. A request stopped before the INSERT answers
