@@ -50,10 +50,10 @@ pub fn register(ctx: &SessionContext) {
 /// by default) and the path's last step is new.
 fn set_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
     let (docs, values) = (as_text(&a[0])?, as_text(&a[2])?);
-    let paths = lists(&a[1]).map_err(fail)?;
+    let paths = Lists::of(&a[1], n)?;
     let create = flags(a, 3, n, true)?;
     per_row(n, |i, out| {
-        let (Some(path), Some(create)) = (&paths[i], create[i]) else { return Ok(false) };
+        let (Some(path), Some(create)) = (paths.at(i), create[i]) else { return Ok(false) };
         if is_null_at(&docs, i) || is_null_at(&values, i) {
             return Ok(false);
         }
@@ -66,10 +66,10 @@ fn set_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
 /// by default) puts an element after the step it names. A key that is there already is refused.
 fn insert_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
     let (docs, values) = (as_text(&a[0])?, as_text(&a[2])?);
-    let paths = lists(&a[1]).map_err(fail)?;
+    let paths = Lists::of(&a[1], n)?;
     let after = flags(a, 3, n, false)?;
     per_row(n, |i, out| {
-        let (Some(path), Some(after)) = (&paths[i], after[i]) else { return Ok(false) };
+        let (Some(path), Some(after)) = (paths.at(i), after[i]) else { return Ok(false) };
         if is_null_at(&docs, i) || is_null_at(&values, i) {
             return Ok(false);
         }
@@ -105,8 +105,8 @@ fn delete_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
         });
     }
     if matches!(a[1].data_type(), DataType::List(_) | DataType::LargeList(_)) {
-        let keys = lists(&a[1]).map_err(fail)?;
-        return per_row(n, |i, out| match &keys[i] {
+        let keys = Lists::of(&a[1], n)?;
+        return per_row(n, |i, out| match keys.at(i) {
             Some(keys) if !is_null_at(&docs, i) => {
                 let names: Vec<&str> = keys.iter().flatten().map(String::as_str).collect();
                 delete_keys_into(out, text_at(&docs, i), &names)?;
@@ -128,8 +128,8 @@ fn delete_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
 /// `jsonb_delete_path(doc, path)`: `#-`.
 fn delete_path_body(a: &[ArrayRef], n: usize) -> Result<ArrayRef> {
     let docs = as_text(&a[0])?;
-    let paths = lists(&a[1]).map_err(fail)?;
-    per_row(n, |i, out| match &paths[i] {
+    let paths = Lists::of(&a[1], n)?;
+    per_row(n, |i, out| match paths.at(i) {
         Some(path) if !is_null_at(&docs, i) => {
             edit_doc(out, text_at(&docs, i), path, Edit::Delete)?;
             Ok(true)
@@ -161,6 +161,32 @@ fn flags(a: &[ArrayRef], at: usize, n: usize, default: bool) -> Result<Vec<Optio
     match a.get(at) {
         None => Ok(vec![Some(default); n]),
         Some(flag) => Ok(cast(flag, &DataType::Boolean)?.as_boolean().iter().collect()),
+    }
+}
+
+/// A path, or a list of keys, for each row, read as `lists` reads a batch. A literal (text that is the same in every row,
+/// as `'{name}'` is) is read once: `lists` over the batch copied and read it a row at a time, a sixth of jsonb_set's time.
+struct Lists {
+    once: Option<Option<Vec<Option<String>>>>,
+    rows: Vec<Option<Vec<Option<String>>>>,
+}
+
+impl Lists {
+    fn of(a: &ArrayRef, n: usize) -> Result<Lists> {
+        let text = matches!(a.data_type(), DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+        if text && n > 0 && (0..n).all(|i| !is_null_at(a, i) && text_at(a, i) == text_at(a, 0)) {
+            let once = lists(&a.slice(0, 1)).map_err(fail)?;
+            return Ok(Lists { once: once.into_iter().next(), rows: Vec::new() });
+        }
+        Ok(Lists { once: None, rows: lists(a).map_err(fail)? })
+    }
+
+    /// The path or the keys of row `i`: None where the argument is NULL.
+    fn at(&self, i: usize) -> &Option<Vec<Option<String>>> {
+        match &self.once {
+            Some(once) => once,
+            None => &self.rows[i],
+        }
     }
 }
 
@@ -689,6 +715,27 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn a_literal_path_is_read_once_and_a_column_of_paths_row_by_row() {
+        use datafusion::arrow::array::StringArray;
+        use std::sync::Arc;
+        // (Postgres 16: jsonb_set at '{a}' is {"a": 9, "b": 2}, at '{b}' is {"a": 1, "b": 9}, and a NULL path is NULL)
+        let docs: ArrayRef = Arc::new(StringArray::from(vec![r#"{"a": 1, "b": 2}"#; 3]));
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["9"; 3]));
+        let column: ArrayRef = Arc::new(StringArray::from(vec![Some("{a}"), None, Some("{b}")]));
+        let edited = set_body(&[docs.clone(), column, values.clone()], 3).unwrap();
+        let edited = edited.as_string::<i32>();
+        assert_eq!(edited.value(0), r#"{"a": 9, "b": 2}"#);
+        assert!(edited.is_null(1));
+        assert_eq!(edited.value(2), r#"{"a": 1, "b": 9}"#);
+        let literal: ArrayRef = Arc::new(StringArray::from(vec!["{b}"; 3]));
+        let edited = set_body(&[docs, literal, values], 3).unwrap();
+        let edited = edited.as_string::<i32>();
+        for i in 0..3 {
+            assert_eq!(edited.value(i), r#"{"a": 1, "b": 9}"#, "row {i}");
+        }
     }
 
     #[test]

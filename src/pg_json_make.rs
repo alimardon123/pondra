@@ -770,8 +770,12 @@ fn read_whole(json: &str) -> Option<Node<'_>> {
 }
 
 /// Refuses a document nested past `MAX_DEPTH` levels, before anything is read: a bracket inside a string doesn't count,
-/// and a text's escapes are skipped. The byte scan is a few lines and costs less than the reading it guards.
+/// and a text's escapes are skipped. A level takes a byte, so a text of `MAX_DEPTH` bytes or fewer can't nest that deep
+/// and isn't scanned (a scan of an 80-byte document cost a fifth of reading it).
 pub(crate) fn depth_check(json: &str) -> Result<()> {
+    if json.len() <= MAX_DEPTH {
+        return Ok(());
+    }
     let mut depth = 0usize;
     let mut in_text = false;
     let mut escaped = false;
@@ -835,7 +839,9 @@ fn as_written<'a>(doc: &'a str, at: usize, decoded: &str) -> Cow<'a, str> {
     let rest = doc.get(at..).unwrap_or("");
     let Some(open) = rest.find('"') else { return Cow::Owned(decoded.to_string()) };
     let text = &rest[open + 1..];
-    match text.find(['"', '\\']) {
+    // (the quote and the backslash are ASCII, so the first byte of either is where its char is; a byte search is
+    // faster than a search for either char)
+    match text.bytes().position(|b| b == b'"' || b == b'\\') {
         Some(end) if text.as_bytes()[end] == b'"' => Cow::Borrowed(&text[..end]),
         _ => Cow::Owned(decoded.to_string()),
     }
@@ -1075,6 +1081,13 @@ mod tests {
     fn plain_numbers_are_written_as_they_are_except_a_negative_zero() {
         assert_eq!(jsonb_text("[-0.0, -0, 1.50, -12]").unwrap(), "[0.0, 0, 1.50, -12]");
         assert_eq!(jsonb_text("[-0.000, 0.5, -0.5, 123.4500]").unwrap(), "[0.000, 0.5, -0.5, 123.4500]");
+    }
+
+    #[test]
+    fn a_key_of_more_bytes_sorts_after_a_shorter_one() {
+        // (Postgres 16: a key's length in bytes comes first, then its bytes: "é" is 2 bytes, as "ab" is)
+        assert_eq!(jsonb_text(r#"{"é":1,"ab":2}"#).unwrap(), r#"{"ab": 2, "é": 1}"#);
+        assert_eq!(jsonb_text(r#"{"ééé":1,"zz":2,"é":3}"#).unwrap(), r#"{"zz": 2, "é": 3, "ééé": 1}"#);
     }
 
     #[test]
