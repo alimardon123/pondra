@@ -28,7 +28,7 @@ use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
 use arrow_flight::sql::{Any, ActionBeginTransactionRequest, ActionBeginTransactionResult, ActionEndTransactionRequest, CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables, CommandStatementIngest, CommandStatementQuery, CommandStatementUpdate, EndTransaction, ProstMessageExt, SqlInfo, SqlSupportedTransaction, TicketStatementQuery};
 use arrow_flight::{Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket};
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::{Stream, StreamExt, TryStreamExt};
 use prost::Message;
@@ -204,11 +204,57 @@ fn send(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
     Box::pin(FlightDataEncoderBuilder::new().with_schema(schema).build(stream).map_err(Status::from))
 }
 
-/// The same schema with every column nullable. The plan's nullability and the run's differ where the
-/// optimizer folds an expression (`upper('x')` becomes a literal, never NULL), and clients compare the two.
-fn nullable(schema: &Schema) -> Schema {
-    let fields = schema.fields().iter().map(|f| f.as_ref().clone().with_nullable(true)).collect::<Vec<_>>();
+/// The schema Flight announces for a statement and streams its batches in: each field as the encoder sends
+/// it (`sent_field`), and every column nullable. The plan's nullability and the run's differ where the
+/// optimizer folds an expression (`upper('x')` becomes a literal, never NULL), and where the plan says NOT
+/// NULL the run gives NULL (a scalar subquery takes its inner field's nullability: `SELECT (SELECT 1 WHERE
+/// false)`); table scans are nullable anyway (`query::schema`). Clients compare the two, so both say this.
+fn announced(schema: &Schema) -> Schema {
+    let fields = schema.fields().iter().map(|f| sent_field(f).with_nullable(true)).collect::<Vec<_>>();
     Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+/// A field as the encoder sends it (arrow-flight's `prepare_field_for_flight`, in its default, hydrated form):
+/// a dictionary is its values' type, at any depth. Its name, nullability and metadata stay as they are.
+fn sent_field(f: &Field) -> Field { Field::new(f.name(), sent_type(f.data_type()), f.is_nullable()).with_metadata(f.metadata().clone()) }
+
+fn sent_type(t: &DataType) -> DataType {
+    match t {
+        DataType::Dictionary(_, values) => sent_type(values),
+        DataType::List(f) => DataType::List(Arc::new(sent_field(f))),
+        DataType::LargeList(f) => DataType::LargeList(Arc::new(sent_field(f))),
+        DataType::ListView(f) => DataType::ListView(Arc::new(sent_field(f))),
+        DataType::LargeListView(f) => DataType::LargeListView(Arc::new(sent_field(f))),
+        DataType::FixedSizeList(f, n) => DataType::FixedSizeList(Arc::new(sent_field(f)), *n),
+        DataType::Map(f, sorted) => DataType::Map(Arc::new(sent_field(f)), *sorted),
+        DataType::Struct(fields) => DataType::Struct(fields.iter().map(|f| sent_field(f)).collect()),
+        DataType::Union(fields, mode) => DataType::Union(fields.iter().map(|(id, f)| (id, Arc::new(sent_field(f)))).collect(), *mode),
+        DataType::RunEndEncoded(run_ends, values) => DataType::RunEndEncoded(run_ends.clone(), Arc::new(sent_field(values))),
+        other => other.clone(),
+    }
+}
+
+/// The schema a statement's batches are announced with: `announced` of the first batch's, or no columns.
+fn first_announced(batches: &[RecordBatch]) -> Schema { announced(&batches.first().map_or_else(|| Arc::new(Schema::empty()), |b| b.schema())) }
+
+/// Each batch taken to the announced schema: a column cast to its field's type (a dictionary to its values,
+/// as the encoder sends it), so `RecordBatch::try_new` takes it and the stream says what the info said.
+fn conform(schema: &SchemaRef, batches: Vec<RecordBatch>) -> anyhow::Result<Vec<RecordBatch>> {
+    batches
+        .iter()
+        .map(|b| -> anyhow::Result<RecordBatch> {
+            let columns = b
+                .columns()
+                .iter()
+                .zip(schema.fields())
+                .map(|(c, f)| match c.data_type() == f.data_type() {
+                    true => Ok(c.clone()),
+                    false => datafusion::arrow::compute::cast(c, f.data_type()),
+                })
+                .collect::<Result<Vec<datafusion::arrow::array::ArrayRef>, datafusion::arrow::error::ArrowError>>()?;
+            Ok(RecordBatch::try_new(schema.clone(), columns)?)
+        })
+        .collect()
 }
 
 /// Run a query (spread over the cluster when it pays), with its schema. The batches take that schema,
@@ -216,11 +262,8 @@ fn nullable(schema: &Schema) -> Schema {
 async fn query(app: &App, sql: &str) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
     let sql = &crate::routines::expand(&app.lake, sql).await?; // (macros: ADR-023)
     let batches = crate::audit::statement(app, sql, app.query(sql, None)).await?;
-    let schema = match batches.first() {
-        Some(b) => Arc::new(nullable(&b.schema())),
-        None => Arc::new(planned(app, sql).await?),
-    };
-    let batches = batches.into_iter().map(|b| RecordBatch::try_new(schema.clone(), b.columns().to_vec())).collect::<Result<Vec<_>, _>>()?;
+    let schema = Arc::new(if batches.is_empty() { planned(app, sql).await? } else { first_announced(&batches) });
+    let batches = conform(&schema, batches)?;
     Ok((schema, batches))
 }
 
@@ -231,22 +274,52 @@ async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> { planned(a
 async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> {
     let ctx = crate::query::session(&app.lake, sql, "").await?;
     let df = crate::query::sql(&ctx, &crate::asof::rewrite(sql)?).await?;
-    Ok(nullable(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow()))
+    Ok(announced(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow()))
 }
+
+/// A write's answer, as its ticket and its flight's info give it: one row, `rows`, the count written.
+fn rows_schema() -> Schema { Schema::new(vec![Field::new("rows", DataType::Int64, false)]) }
 
 /// A statement's answer, as its ticket names it: a CALL's kept answer, a write's row count, or a
 /// query run now.
 async fn answer(app: &App, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
     if let Some(id) = sql.strip_prefix("kept:") {
         let Some((batches, _)) = KEPT.lock().unwrap().remove(id) else { return Err(Status::not_found("that answer was read already, or is gone")) };
-        let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
-        return Ok((schema, batches));
+        let schema = Arc::new(first_announced(&batches));
+        return Ok((schema.clone(), conform(&schema, batches).map_err(status)?));
     }
     if let Some(n) = sql.strip_prefix("rows:").and_then(|n| n.parse::<i64>().ok()) {
-        let batch = RecordBatch::try_from_iter([("rows", Arc::new(datafusion::arrow::array::Int64Array::from(vec![n])) as _)]).map_err(status)?;
-        return Ok((batch.schema(), vec![batch]));
+        let schema = Arc::new(announced(&rows_schema()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![n]))]).map_err(status)?;
+        return Ok((schema, vec![batch]));
     }
     query(app, sql).await.map_err(status)
+}
+
+/// A statement's work, as a request's: in the transaction the call names (`txn`, checked first), as its
+/// caller (`auth::carried`, which a spawned task would lose), and through `panics::work`, where the memory
+/// watch (`oom.rs`) may stop a query that grew the node, and a long one moves to the queries' runtime
+/// (invariant 231). A statement the node stopped for memory fails its transaction, as on HTTP and Postgres.
+async fn worked<T: Send + 'static>(txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>> + Send + 'static) -> Result<T, Status> {
+    let session = txn.map(in_txn).transpose()?;
+    let failing = session.clone();
+    let f = crate::auth::carried(async move {
+        match session {
+            Some(s) => crate::temp::SESSION.scope(Some(s), f).await,
+            None => f.await,
+        }
+    });
+    match crate::panics::work(true, f).await {
+        Ok(out) => out,
+        Err(m) => {
+            if m == crate::oom::OOM {
+                if let Some(s) = failing {
+                    crate::temp::SESSION.sync_scope(Some(s), || crate::txn::failed(&m));
+                }
+            }
+            Err(status(anyhow::anyhow!(m)))
+        }
+    }
 }
 
 crate::per_node!(
@@ -530,12 +603,13 @@ impl FlightSqlService for Sql {
         if crate::routines::runs_procedure(&q.query) || crate::returning::of(&q.query).is_some() {
             // A CALL (or DO), or a write with RETURNING: run now, as every door runs one; the ticket reads back what it answered.
             let who = crate::routines::Who { role, files: false, depth: 0 };
-            let out = within(txn, async { crate::routines::one(&self.0, &q.query, who, None).await.map_err(status) }).await?;
+            let (app, sql) = (self.0.clone(), q.query.clone());
+            let out = worked(txn, async move { crate::routines::one(&app, &sql, who, None).await.map_err(status) }).await?;
             let batches = match out {
                 crate::routines::Outcome::Rows(b) => b,
                 crate::routines::Outcome::Done(_) => vec![RecordBatch::try_from_iter([("rows", Arc::new(datafusion::arrow::array::Int64Array::from(vec![0])) as _)]).map_err(status)?],
             };
-            let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
+            let schema = first_announced(&batches);
             let id = uuid::Uuid::new_v4().simple().to_string();
             let mut kept = KEPT.lock().unwrap();
             kept.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(600));
@@ -545,10 +619,10 @@ impl FlightSqlService for Sql {
         }
         if crate::write::parse(&q.query).is_some() {
             // A write sent as a query (DB-API's `execute`): done now; the ticket reads back the count.
-            let rows = within(txn, write(&self.0, role, &q.query)).await?;
-            let schema = Schema::new(vec![datafusion::arrow::datatypes::Field::new("rows", datafusion::arrow::datatypes::DataType::Int64, false)]);
+            let (app, sql) = (self.0.clone(), q.query.clone());
+            let rows = worked(txn, async move { write(&app, role, &sql).await }).await?;
             let ticket = TicketStatementQuery { statement_handle: format!("rows:{rows}").into_bytes().into() };
-            return info(&schema, ticket.as_any().encode_to_vec(), req.into_inner());
+            return info(&announced(&rows_schema()), ticket.as_any().encode_to_vec(), req.into_inner());
         }
         let schema = within(txn, async { plan_schema(&self.0, &q.query).await.map_err(status) }).await?;
         let ticket = TicketStatementQuery { statement_handle: handle(&q.query, txn).into() };
@@ -559,7 +633,8 @@ impl FlightSqlService for Sql {
         allowed(&self.0, &req, Role::Read)?;
         let (txn, sql) = unhandle(&t.statement_handle);
         let sql = String::from_utf8(sql.to_vec()).map_err(status)?;
-        let (schema, batches) = within(txn, answer(&self.0, &sql)).await?;
+        let app = self.0.clone();
+        let (schema, batches) = worked(txn, async move { answer(&app, &sql).await }).await?;
         Ok(Response::new(send(schema, batches)))
     }
 
@@ -580,9 +655,10 @@ impl FlightSqlService for Sql {
         };
         let session = in_txn(&q.transaction_id)?;
         // (no statement text: COMMIT and ROLLBACK take none, only BEGIN's modes do)
-        let out = crate::temp::SESSION.scope(Some(session.clone()), crate::txn::command(&self.0, word, "")).await;
+        let app = self.0.clone();
+        let out = worked(Some(&q.transaction_id[..]), async move { crate::txn::command(&app, word, "").await.map_err(status) }).await;
         crate::temp::end(&session); // (the session ends with its transaction, committed or not)
-        let (tag, _) = out.map_err(status)?;
+        let (tag, _) = out?;
         if word == "COMMIT" && tag == "ROLLBACK" {
             // (a failed transaction's COMMIT rolls back, as in Postgres: a client must learn it did not commit)
             return Err(status(crate::codes::coded("25P02", "the transaction had failed, so it was rolled back, not committed")));
@@ -592,7 +668,8 @@ impl FlightSqlService for Sql {
 
     async fn do_put_statement_update(&self, cmd: CommandStatementUpdate, req: Request<PeekableFlightDataStream>) -> Result<i64, Status> {
         let role = allowed(&self.0, &req, Role::Write)?;
-        within(cmd.transaction_id.as_deref(), write(&self.0, role, &cmd.query)).await
+        let (app, sql) = (self.0.clone(), cmd.query.clone());
+        worked(cmd.transaction_id.as_deref(), async move { write(&app, role, &sql).await }).await
     }
 
     async fn do_put_statement_ingest(&self, cmd: CommandStatementIngest, req: Request<PeekableFlightDataStream>) -> Result<i64, Status> {
@@ -757,10 +834,12 @@ impl FlightService for Door {
             let app = &self.0 .0;
             allowed(app, &req, Role::Read)?;
             let mut infos = vec![];
-            for (key, meta) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k) && crate::auth::check("select", &k[2..]).is_ok()) {
+            for (key, _) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k) && crate::auth::check("select", &k[2..]).is_ok()) {
                 let table = &key[2..];
-                let ticket = serde_json::json!({"sql": format!("SELECT * FROM {}", crate::write::sql_name(table))}).to_string();
-                let schema = crate::query::schema(&meta.logical_columns()).map_err(status)?;
+                // (the schema its ticket streams, planned as DoGet runs it: a table's strings are Utf8View, not the table's Utf8)
+                let sql = format!("SELECT * FROM {}", crate::write::sql_name(table));
+                let ticket = serde_json::json!({"sql": sql}).to_string();
+                let schema = plan_schema(app, &sql).await.map_err(status)?;
                 infos.push(Ok(FlightInfo::new().try_with_schema(&schema).map_err(status)?.with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(ticket))).with_descriptor(FlightDescriptor::new_path(vec![table.to_string()]))));
             }
             Ok(Response::new(Box::pin(futures::stream::iter(infos)) as Self::ListFlightsStream))
@@ -807,7 +886,8 @@ impl FlightService for Door {
             allowed(app, &req, Role::Read)?;
             match (json.sql, json.table) {
                 (Some(sql), _) => {
-                    let (schema, batches) = query(app, &sql).await.map_err(status)?;
+                    let app = app.clone();
+                    let (schema, batches) = worked(None, async move { query(&app, &sql).await.map_err(status) }).await?;
                     Ok(Response::new(send(schema, batches)))
                 }
                 (None, Some(table)) => {
@@ -841,5 +921,74 @@ impl FlightService for Door {
 
     async fn do_exchange(&self, _req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoExchangeStream>, Status> {
         Err(Status::unimplemented("DoExchange: Pondra doesn't take it; DoGet and DoPut are its streams"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{ArrayRef, StringArray, StringViewArray};
+    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::datatypes::Fields;
+    use futures::TryStreamExt;
+
+    fn dictionary() -> DataType { DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)) }
+
+    #[test]
+    fn announced_maps_dictionaries_to_their_values_at_any_depth() {
+        let dict = dictionary();
+        let schema = Schema::new(vec![
+            Field::new("d", dict.clone(), false),
+            Field::new("l", DataType::List(Arc::new(Field::new("item", dict.clone(), false))), false),
+            Field::new("s", DataType::Struct(Fields::from(vec![Field::new("k", dict.clone(), true)])), false),
+            Field::new("v", DataType::Utf8View, true),
+        ]);
+        let out = announced(&schema);
+        assert_eq!(out.field(0), &Field::new("d", DataType::Utf8, true));
+        assert_eq!(out.field(1), &Field::new("l", DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))), true));
+        assert_eq!(out.field(2), &Field::new("s", DataType::Struct(Fields::from(vec![Field::new("k", DataType::Utf8, true)])), true));
+        assert_eq!(out.field(3), &Field::new("v", DataType::Utf8View, true));
+    }
+
+    #[test]
+    fn announced_keeps_names_metadata_and_the_schema_metadata() {
+        let field = Field::new("a", DataType::Int64, false).with_metadata([("k".to_string(), "v".to_string())].into());
+        let schema = Schema::new_with_metadata(vec![field], [("s".to_string(), "t".to_string())].into());
+        let out = announced(&schema);
+        assert_eq!(out.field(0), &Field::new("a", DataType::Int64, true).with_metadata([("k".to_string(), "v".to_string())].into()));
+        assert_eq!(out.metadata(), schema.metadata());
+    }
+
+    #[test]
+    fn conform_takes_a_dictionary_batch_to_its_announced_schema() -> anyhow::Result<()> {
+        let dict = dictionary();
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("d", dict.clone(), false)])), vec![cast(&strings, &dict)?])?;
+        let schema = Arc::new(announced(&batch.schema()));
+        let out = conform(&schema, vec![batch])?;
+        assert_eq!(out[0].schema().as_ref(), schema.as_ref());
+        assert_eq!(out[0].column(0).data_type(), &DataType::Utf8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_encoder_streams_the_types_announced_says() -> anyhow::Result<()> {
+        use arrow_flight::encode::FlightDataEncoderBuilder;
+        let dict = dictionary();
+        let schema = Arc::new(Schema::new(vec![Field::new("d", dict.clone(), false), Field::new("s", DataType::Utf8View, false)]));
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let view: ArrayRef = Arc::new(StringViewArray::from(vec!["x", "y"]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![cast(&strings, &dict)?, view])?;
+        let sent: Vec<FlightData> = FlightDataEncoderBuilder::new()
+            .with_schema(schema.clone())
+            .build(futures::stream::iter(vec![Ok::<_, arrow_flight::error::FlightError>(batch)]))
+            .try_collect()
+            .await?;
+        // (the names and types the encoder sends, as a client decodes them, against `announced`'s; nullability is
+        // `announced`'s own rule, tested above)
+        let streamed = arrow_flight::utils::flight_data_to_batches(&sent)?;
+        let names_and_types = |s: &Schema| s.fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect::<Vec<_>>();
+        assert_eq!(names_and_types(streamed[0].schema().as_ref()), names_and_types(&announced(&schema)));
+        Ok(())
     }
 }

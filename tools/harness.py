@@ -3555,10 +3555,11 @@ def scale():
     # it: it answers 53200, the node's peak stays under 1.5 GB (without a line it peaked at 1,941 MB), and the node
     # answers after. Queries that spill under the 0.5 GB pool stay under the line and aren't stopped: a sort, a GROUP BY
     # and a full ORDER BY over `big`. Then the same statement over Postgres, and in a transaction over HTTP: the statement
-    # fails the transaction, as an error does (COMMIT answers ROLLBACK; the INSERT before it is gone).
+    # fails the transaction, as an error does (COMMIT answers ROLLBACK; the INSERT before it is gone). Over Flight the same
+    # statement is stopped too (`_flight_memory_stop`, after the transaction).
     import heapq, psycopg
     line = 1 << 30
-    node = Node(lake, port, memory_gb=0.5, pg=f"127.0.0.1:{port + 10}", env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4"), "PONDRA_MEMORY_MAX_GB": "1"}).start()
+    node = Node(lake, port, memory_gb=0.5, pg=f"127.0.0.1:{port + 10}", flight=f"127.0.0.1:{port + 30}", env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4"), "PONDRA_MEMORY_MAX_GB": "1"}).start()
     def answer(s, session=None):  # (status, SQLSTATE, body): the answer, or the refusal as the node sends it
         c = http_client.HTTPConnection("127.0.0.1", port, timeout=600)
         c.request("POST", "/sql", s.encode(), {"x-pondra-session": session} if session else {})
@@ -3628,6 +3629,7 @@ def scale():
         stopped_http and agg_peak < 1.5 * (1 << 30) and after == [{"one": 1}] and spilled_ok and stopped_count == 1
         and stopped_pg == ("53200", True) and count_pg == 2 and tx_sqlstate == "53200" and "nearly out of memory" in tx_body and count_tx == 3
         and tx_after == "25P02" and '"transaction":"rollback"' in tx_commit.replace(" ", "") and tx_count == [{"n": 0}])
+    checks.update(_flight_memory_stop(port + 30, aggregate, lambda: metrics_of(port).get("pondra_queries_stopped_for_memory_total"), settle))  # (the same stop over Flight)
     # A sort that needs more than its memory spills to PONDRA_SPILL_DIR, and the spill folder is empty once it answers.
     # Past PONDRA_SPILL_GB the same sort is refused by name (53100), saying to raise that setting and not DataFusion's
     # `datafusion.runtime.*`, and the node answers after. The 10 M strings are made again: the sort check above dropped them.
@@ -3776,7 +3778,8 @@ def flight_schemas(fport):
     import adbc_driver_flightsql.dbapi as adbc
     queries = ["SELECT upper('x')", "SELECT 1 + 1", "SELECT 'a' || 'b' AS ab", "SELECT now()", "SELECT CASE WHEN 1 = 1 THEN 'y' END",
                "SELECT user, amount FROM ev", "SELECT count(*) AS n FROM ev", "SELECT user FROM ev WHERE amount < 0",
-               "SELECT coalesce(user, 'z') AS u FROM ev", "SELECT 'a' AS x UNION ALL SELECT NULL", """SELECT json_get_str('{"a": "x"}', 'a')"""]
+               "SELECT coalesce(user, 'z') AS u FROM ev", "SELECT 'a' AS x UNION ALL SELECT NULL", """SELECT json_get_str('{"a": "x"}', 'a')""",
+               "SELECT arrow_cast('a', 'Dictionary(Int32, Utf8)') AS d"]
     opts = fl.FlightCallOptions(headers=[(b"authorization", b"Bearer r")])
     client = fl.FlightClient(f"grpc://127.0.0.1:{fport}")
     conn = adbc.connect(f"grpc://127.0.0.1:{fport}", db_kwargs={"adbc.flight.sql.authorization_header": "Bearer r"}, autocommit=True)
@@ -3801,6 +3804,42 @@ def flight_schemas(fport):
     if bad:
         print("schemas that disagree, or queries ADBC fails:", bad, file=sys.stderr)
     return {"every query's announced schema is its stream's (folded constants too), over Flight and ADBC": not bad}
+
+
+def _flight_announced(client, opts):
+    """list_flights announces what its ticket streams: the `ev` table's flight (`SELECT * FROM ev`, whose strings are
+    Utf8View) has the schema DoGet sends for its ticket, metadata included. Pondra's tables have no dictionary columns,
+    so the dictionary part of the check is `flight_schemas`' query. Returns the check."""
+    flights = [f for f in client.list_flights(options=opts("r")) if f.descriptor.path and f.descriptor.path[0].decode() == "ev"]
+    streamed = client.do_get(flights[0].endpoints[0].ticket, options=opts("r")).read_all().schema if len(flights) == 1 else None
+    return {"list_flights announces what its ticket streams (Utf8View strings, dictionaries as their values)": len(flights) == 1 and flights[0].schema.equals(streamed, check_metadata=True)}
+
+
+def _flight_memory_stop(fport, aggregate, stopped, settle):
+    """Over Flight, the statement the memory line stops over HTTP and Postgres is stopped too: resource exhausted, with the
+    node's "out of memory" (53200, as Postgres 16 names out_of_memory), its stopped-for-memory counter one more, and the node
+    answers `SELECT 1` after. `stopped` reads that counter; the watch's ten-second hold is waited out first, as scale does.
+    Returns the check."""
+    import pyarrow.flight as fl
+    client = fl.FlightClient(f"grpc://127.0.0.1:{fport}")
+    before = stopped() or 0
+    time.sleep(11)
+    settle()
+    try:
+        info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": aggregate})))
+        client.do_get(info.endpoints[0].ticket).read_all()
+        text = "answered"
+    except Exception as e:  # (pyarrow raises the gRPC status as its own error: the text carries the status and the message)
+        text = str(e)
+    stopped_here = bool(re.search(r"resource[ _]exhausted", text, re.I)) and "out of memory" in text
+    counted = (stopped() or 0) == before + 1
+    settle()
+    try:  # (a refusal fails the check, it doesn't end the run: as `rows_of` does over HTTP)
+        after = client.do_get(fl.Ticket(json.dumps({"sql": "SELECT 1 AS one"}))).read_all().to_pylist()
+    except Exception:
+        after = None
+    return {"a query the pool doesn't see grow (array_agg over 30M rows) is stopped at the node's memory line (53200), not the node, and over Flight: stopped for memory (resource exhausted, out of memory), the node answering after":
+            stopped_here and counted and after == [{"one": 1}]}
 
 
 def flight():
@@ -3901,6 +3940,7 @@ def flight():
     }
     checks.update(flight_protocol(fport))  # (the protocol's own actions and RPCs, over gRPC)
     checks.update(flight_schemas(fport))  # (the schema each query announces is the one its stream sends)
+    checks.update(_flight_announced(client, opts))  # (list_flights' schema is the one its ticket streams)
     # A number with an exponent: the schema GetFlightInfo announces is the type its rows come back with (decimal(16, 0), not the planner's decimal(1, -15)).
     exp_info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": "SELECT 1e15 AS x"})), opts("r"))
     exp_rows = client.do_get(exp_info.endpoints[0].ticket, options=opts("r")).read_all()
